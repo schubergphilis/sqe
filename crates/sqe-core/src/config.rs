@@ -2125,6 +2125,12 @@ pub struct PolicyConfig {
     /// changes every masked digest, so the same key must persist across
     /// coordinator restarts and across all coordinators in an HA setup.
     ///
+    /// This applies to Ranger `MASK_HASH` and OPA `hash` column masks alike.
+    /// We warn rather than reject on `engine = ranger` + empty key (issue #37):
+    /// default-denying Hash without a key is the stronger control but is
+    /// breaking for deployments already relying on the unkeyed behaviour, so it
+    /// is deferred. Setting this key is the recommended hardening step.
+    ///
     /// Can be set via the `SQE_POLICY__MASK_KEY` environment variable.
     #[serde(default)]
     pub mask_key: String,
@@ -2213,7 +2219,15 @@ pub struct RangerPolicyConfig {
     /// Maximum cached `ResolvedPolicy` entries.
     #[serde(default = "default_ranger_policy_cache_max_entries")]
     pub cache_max_entries: u64,
-    /// Cache TTL in seconds.
+    /// Cache TTL in seconds for resolved row-filter / data-mask policies.
+    ///
+    /// Masks and filters edited directly in Ranger Admin (the normal authoring
+    /// path) are not honored until this TTL elapses, leaving a bounded
+    /// over-permissive window of up to `cache_ttl_secs`. This is asymmetric with
+    /// the tag path, which re-fetches the column->tags map every call. A future
+    /// improvement is `lastKnownVersion` / HTTP-304 polling so external edits
+    /// are picked up promptly without a short TTL; until then, lower this value
+    /// if prompt propagation of Admin-side edits matters more than fetch load.
     #[serde(default = "default_ranger_policy_cache_ttl_secs")]
     pub cache_ttl_secs: u64,
     /// Consecutive failures before the circuit breaker opens.
@@ -2899,6 +2913,46 @@ impl SqeConfig {
                 self.catalog.parquet_compression,
                 valid_compressions.join(", ")
             ));
+        }
+
+        // Ranger policy engine: numeric fields that silently break the store at
+        // zero. A zero timeout yields an HTTP client that fails every fetch
+        // (deny-all); a zero breaker threshold opens the circuit on the first
+        // failure and denies permanently. Both are misconfigurations, not
+        // tuning choices, so fail fast rather than fail closed forever.
+        if self.policy.engine == PolicyEngine::Ranger {
+            if self.policy.ranger.timeout_secs == 0 {
+                errors.push(
+                    "policy.ranger.timeout_secs must be >= 1 (0 yields a zero-timeout \
+                     HTTP client that fails every Ranger fetch and denies all queries)"
+                        .to_string(),
+                );
+            }
+            if self.policy.ranger.breaker_failure_threshold == 0 {
+                errors.push(
+                    "policy.ranger.breaker_failure_threshold must be >= 1 (0 opens the \
+                     circuit breaker on the first failure and denies permanently)"
+                        .to_string(),
+                );
+            }
+        }
+
+        // Table metadata cache vs. fine-grained policy. The column->tags map
+        // that drives tag masks and tag row-filters is read from the table
+        // metadata cache. With the cache disabled (ttl_secs = 0 ->
+        // max_capacity(0)), every tag lookup misses, and the rewriter now
+        // fails CLOSED on an unknown tag state (see TagSource::column_tags).
+        // The result under a policy engine is that every query is denied. Reject
+        // the misconfig at load time rather than denying every query at runtime.
+        if self.policy.engine != PolicyEngine::Passthrough
+            && self.catalog.metadata_cache_ttl_secs == 0
+        {
+            errors.push(
+                "catalog.metadata_cache_ttl_secs must be >= 1 when policy.engine \
+                 enforces fine-grained policy (0 disables the table metadata cache, \
+                 so tag lookups always miss and deny)"
+                    .to_string(),
+            );
         }
 
         // Distributed-mode worker secret is required unless explicitly waived.
@@ -5430,6 +5484,84 @@ otlp_endpoint = ""
         config.query.per_user_memory_budget = "0".to_string();
         // "0" disables the gate, so the size relationship is irrelevant.
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_ranger_zero_timeout() {
+        let mut config = valid_config();
+        config.policy.engine = PolicyEngine::Ranger;
+        config.policy.ranger.url = "http://ranger:6080".to_string();
+        config.policy.ranger.service_name = "hive".to_string();
+        config.policy.ranger.timeout_secs = 0;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("policy.ranger.timeout_secs"),
+            "expected zero-timeout guard, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_ranger_zero_breaker_threshold() {
+        let mut config = valid_config();
+        config.policy.engine = PolicyEngine::Ranger;
+        config.policy.ranger.url = "http://ranger:6080".to_string();
+        config.policy.ranger.service_name = "hive".to_string();
+        config.policy.ranger.breaker_failure_threshold = 0;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("policy.ranger.breaker_failure_threshold"),
+            "expected zero-threshold guard, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_ranger_guards_do_not_fire_for_other_engines() {
+        // The Ranger numeric guards must not affect non-Ranger deployments.
+        let mut config = valid_config();
+        config.policy.ranger.timeout_secs = 0;
+        config.policy.ranger.breaker_failure_threshold = 0;
+        // engine stays at its default (not Ranger), so these zeros are ignored.
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_zero_metadata_cache_ttl_under_policy_engine() {
+        // A disabled table metadata cache (ttl=0) makes every tag lookup miss,
+        // and the rewriter now fails closed on an unknown tag state, denying
+        // every query. Reject the misconfig at load time under a policy engine.
+        let mut config = valid_config();
+        config.policy.engine = PolicyEngine::Ranger;
+        config.policy.ranger.url = "http://ranger:6080".to_string();
+        config.policy.ranger.service_name = "hive".to_string();
+        config.catalog.metadata_cache_ttl_secs = 0;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("catalog.metadata_cache_ttl_secs"),
+            "expected metadata-cache-ttl guard, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_zero_metadata_cache_ttl_allowed_under_passthrough() {
+        // Passthrough applies no policy, so a disabled metadata cache is a
+        // legitimate tuning choice (no tag lookups happen).
+        let mut config = valid_config();
+        config.policy.engine = PolicyEngine::Passthrough;
+        config.catalog.metadata_cache_ttl_secs = 0;
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_zero_metadata_cache_ttl_under_inmemory_engine() {
+        // The guard fires for any non-passthrough engine, not just Ranger.
+        let mut config = valid_config();
+        config.policy.engine = PolicyEngine::InMemory;
+        config.catalog.metadata_cache_ttl_secs = 0;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("catalog.metadata_cache_ttl_secs"),
+            "expected metadata-cache-ttl guard under in-memory engine, got: {err}"
+        );
     }
 }
 

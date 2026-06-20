@@ -351,6 +351,11 @@ impl MaintenanceHandler {
                 status: audit_status.to_string(),
                 client_ip: None,
                 tables_touched: vec![target.to_string()],
+                // Maintenance procedures carry no policy decision.
+                row_filters_applied: 0,
+                columns_masked: Vec::new(),
+                columns_restricted: Vec::new(),
+                policy_denied: false,
             });
         }
         warn!(

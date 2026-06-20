@@ -5,7 +5,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use datafusion::logical_expr::{lit, Expr};
@@ -14,6 +14,7 @@ use reqwest::Client;
 use serde::Deserialize;
 use sqe_core::config::RangerPolicyConfig;
 use sqe_core::{SecretString, SessionUser};
+use sqe_metrics::MetricsRegistry;
 use tracing::{debug, warn};
 
 use crate::policy_breaker::PolicyCircuitBreaker;
@@ -117,6 +118,19 @@ pub(crate) struct RowFilterInfo {
 
 // --- RangerStore struct, constructor, and download fetch ---
 
+/// PolicyType discriminators in the Ranger bundle JSON (`policyType` field).
+/// 0 = access (not enforced here), 1 = DATAMASK, 2 = ROWFILTER.
+const POLICY_TYPE_DATAMASK: i32 = 1;
+const POLICY_TYPE_ROWFILTER: i32 = 2;
+
+/// Ranger `dataMaskType` discriminator for an operator-authored masking
+/// expression. Shared by `map_mask` and `resolve_tag_policies` so the resource
+/// path and the tag path agree on the CUSTOM special-case.
+const MASK_TYPE_CUSTOM: &str = "CUSTOM";
+
+/// Single, constant key for the user-independent ServicePolicies bundle cache.
+const BUNDLE_KEY: &str = "__bundle__";
+
 /// Fine-grained policy store backed by a `hive`-type Ranger service.
 pub struct RangerStore {
     client: Client,
@@ -125,7 +139,14 @@ pub struct RangerStore {
     admin_user: String,
     admin_password: SecretString,
     cache: Cache<String, ResolvedPolicy>,
+    /// Cache of the raw, user-independent ServicePolicies bundle under a single
+    /// `BUNDLE_KEY`. The bundle is the same for every user, so caching it here
+    /// (with the same TTL as the per-user `cache`) avoids re-downloading and
+    /// re-parsing it on every query and every tagged table. `Arc` keeps the
+    /// moka `get`/`insert` clones cheap.
+    bundle_cache: Cache<&'static str, Arc<ServicePolicies>>,
     breaker: Arc<PolicyCircuitBreaker>,
+    metrics: Option<Arc<MetricsRegistry>>,
 }
 
 impl RangerStore {
@@ -152,22 +173,78 @@ impl RangerStore {
                 .time_to_live(Duration::from_secs(cfg.cache_ttl_secs))
                 .max_capacity(cfg.cache_max_entries)
                 .build(),
+            bundle_cache: Cache::builder()
+                .time_to_live(Duration::from_secs(cfg.cache_ttl_secs))
+                .max_capacity(1)
+                .build(),
             breaker: Arc::new(PolicyCircuitBreaker::new(
                 "Ranger",
                 cfg.breaker_failure_threshold,
                 Duration::from_secs(cfg.breaker_recovery_secs),
             )),
+            metrics: None,
         })
+    }
+
+    /// Attach a metrics registry. Mirrors `OpaStore::with_metrics`: resolve
+    /// latency, cache hit/miss, and circuit-breaker state are recorded under the
+    /// shared `sqe_policy_*` series, all labelled `backend="ranger"`.
+    #[must_use = "with_metrics consumes self; bind the returned store"]
+    pub fn with_metrics(mut self, metrics: Arc<MetricsRegistry>) -> Self {
+        self.metrics = Some(metrics);
+        self
+    }
+
+    /// Record fetch latency + current breaker state. Mirrors
+    /// `OpaStore::record_metric`. `status` is `"ok"` or `"err"`; the breaker
+    /// state gauge always reflects the current `state_code()` so a breaker-open
+    /// deny-all is visible even when every query fails closed.
+    fn record_metric(&self, started: Instant, status: &'static str) {
+        if let Some(metrics) = &self.metrics {
+            metrics
+                .policy_resolve_duration_seconds
+                .with_label_values(&["ranger", status])
+                .observe(started.elapsed().as_secs_f64());
+            metrics
+                .policy_circuit_breaker_state
+                .with_label_values(&["ranger"])
+                .set(self.breaker.state_code() as f64);
+        }
+    }
+
+    fn record_cache_hit(&self) {
+        if let Some(metrics) = &self.metrics {
+            metrics
+                .policy_cache_hits_total
+                .with_label_values(&["ranger"])
+                .inc();
+        }
+    }
+
+    fn record_cache_miss(&self) {
+        if let Some(metrics) = &self.metrics {
+            metrics
+                .policy_cache_misses_total
+                .with_label_values(&["ranger"])
+                .inc();
+        }
     }
 
     /// Fetch the full policy bundle. Fail-closed: any transport/parse error
     /// trips the breaker and returns Err so the caller denies.
     // TODO(phase2): lastKnownVersion + HTTP 304 incremental refresh.
     async fn fetch_bundle(&self) -> sqe_core::Result<ServicePolicies> {
+        // Breaker-open path: mirror OpaStore, which records NOTHING here. The
+        // call that trips the breaker (a failed fetch below) already sets the
+        // state gauge via record_metric, so the gauge reads `open` without a
+        // recording point here. Adding one would push a 0-second sample into the
+        // resolve-duration histogram on every query during an outage, skewing
+        // p50/p99 toward zero exactly when the metric is being read.
         self.breaker.check().map_err(|e| {
             sqe_core::error::SqeError::Execution(format!("Ranger unavailable: {e}"))
         })?;
 
+        let started = Instant::now();
         let resp = self
             .client
             .get(&self.download_url)
@@ -176,11 +253,13 @@ impl RangerStore {
             .await
             .map_err(|e| {
                 self.breaker.record_failure();
+                self.record_metric(started, "err");
                 sqe_core::error::SqeError::Execution(format!("Ranger download failed: {e}"))
             })?;
 
         if !resp.status().is_success() {
             self.breaker.record_failure();
+            self.record_metric(started, "err");
             return Err(sqe_core::error::SqeError::Execution(format!(
                 "Ranger download returned status {}",
                 resp.status()
@@ -189,9 +268,27 @@ impl RangerStore {
 
         let bundle: ServicePolicies = resp.json().await.map_err(|e| {
             self.breaker.record_failure();
+            self.record_metric(started, "err");
             sqe_core::error::SqeError::Execution(format!("Failed to parse Ranger bundle: {e}"))
         })?;
         self.breaker.record_success();
+        self.record_metric(started, "ok");
+        Ok(bundle)
+    }
+
+    /// Return the ServicePolicies bundle, served from the bundle cache when
+    /// fresh. On a cache miss, downloads + parses via `fetch_bundle` and stores
+    /// the result. The bundle is user-independent, so a single cached copy is
+    /// shared across every `resolve` / `resolve_tags` call within the TTL.
+    ///
+    /// Fail-closed is preserved: a fetch error propagates (`?`) and is NEVER
+    /// cached, so the next caller retries (subject to the circuit breaker).
+    async fn cached_bundle(&self) -> sqe_core::Result<Arc<ServicePolicies>> {
+        if let Some(bundle) = self.bundle_cache.get(BUNDLE_KEY).await {
+            return Ok(bundle);
+        }
+        let bundle = Arc::new(self.fetch_bundle().await?);
+        self.bundle_cache.insert(BUNDLE_KEY, bundle.clone()).await;
         Ok(bundle)
     }
 }
@@ -253,7 +350,12 @@ fn item_matches(
     let matched =
         users.iter().any(|u| u == &user.username) || roles.iter().any(|r| user.roles.contains(r));
     if !matched && !groups.is_empty() {
-        warn!(
+        // Group-bound items are not enforced by design (SQE matches token roles
+        // only). This fires inside the per-item resolution loop on every cache
+        // miss for every user, so it is logged at `debug!` rather than `warn!`
+        // to avoid a WARN burst from a bundle with many group-bound items. The
+        // behaviour is unchanged: the item is still skipped (not enforced).
+        debug!(
             ?groups,
             "Ranger policy item is group-bound; SQE does not enforce group bindings (Phase 2) — policy item skipped"
         );
@@ -270,7 +372,7 @@ fn map_mask(info: &DataMaskInfo, column: &str, identity: &SessionIdentity) -> Re
         "MASK_NULL" => Ok(Some(MaskType::Nullify)),
         "MASK_NONE" => Ok(None),
         "MASK_HASH" => Ok(Some(MaskType::Hash)),
-        "CUSTOM" => {
+        MASK_TYPE_CUSTOM => {
             let expr_str = info.value_expr.as_deref().ok_or(())?;
             // Ranger CUSTOM masks use `{col}` as the column placeholder.
             // Substitute with the real column name so the parsed Expr references
@@ -339,8 +441,22 @@ fn resolve_from_bundle(
         // Data-mask policy (policyType 1). A datamask policy's `column`
         // resource can list several columns that all receive the same mask;
         // iterate ALL of them so multi-column policies don't leak.
-        if p.policy_type == 1 {
+        if p.policy_type == POLICY_TYPE_DATAMASK {
             let Some(col_res) = p.resources.get("column") else { continue };
+            if col_res.is_excludes {
+                // "mask all columns EXCEPT these" cannot be honored on the
+                // resource path: the column complement needs the table schema,
+                // which is not available here. Treating excludes as includes
+                // (the previous behavior) left every intended-masked column raw.
+                // Fail closed: deny the table.
+                warn!(
+                    table = %table,
+                    policy_id = p.id,
+                    "datamask policy uses column isExcludes (unsupported); denying table (fail-closed)"
+                );
+                policy.row_filters.push(lit(false));
+                continue;
+            }
             for column in &col_res.values {
                 for item in &p.data_mask_policy_items {
                     if !item_matches(&item.users, &item.roles, &item.groups, user) {
@@ -367,7 +483,7 @@ fn resolve_from_bundle(
         }
 
         // Row-filter policy (policyType 2)
-        if p.policy_type == 2 {
+        if p.policy_type == POLICY_TYPE_ROWFILTER {
             for item in &p.row_filter_policy_items {
                 if !item_matches(&item.users, &item.roles, &item.groups, user) {
                     continue;
@@ -376,8 +492,10 @@ fn resolve_from_bundle(
                     match parse_sql_predicate(expr_str, &identity) {
                         Ok(expr) => policy.row_filters.push(expr),
                         Err(e) => {
+                            // Do not log `expr_str`: a row-filter body routinely
+                            // embeds sensitive literals (e.g. region = 'EU'). The
+                            // expression lives in Ranger; log only that it failed.
                             warn!(
-                                filter = %expr_str,
                                 error = %e,
                                 "unparseable Ranger row filter; denying (fail-closed)"
                             );
@@ -462,7 +580,7 @@ pub(crate) fn resolve_tag_policies(
             }
 
             // policyType 1: datamask
-            if p.policy_type == 1 {
+            if p.policy_type == POLICY_TYPE_DATAMASK {
                 for item in &p.data_mask_policy_items {
                     if !item_matches(&item.users, &item.roles, &item.groups, &user) {
                         continue;
@@ -472,7 +590,7 @@ pub(crate) fn resolve_tag_policies(
                     // Store the raw template as TagMaskSpec::Custom; merge_tag_masks
                     // performs the substitution and parses the expression per column.
                     // On parse failure the rewriter restricts the column (fail-closed).
-                    if item.data_mask_info.data_mask_type == "CUSTOM" {
+                    if item.data_mask_info.data_mask_type == MASK_TYPE_CUSTOM {
                         if let Some(template) = &item.data_mask_info.value_expr {
                             masks.insert(tag_value.clone(), TagMaskSpec::Custom(template.clone()));
                         } else {
@@ -508,7 +626,7 @@ pub(crate) fn resolve_tag_policies(
             }
 
             // policyType 2: rowfilter
-            if p.policy_type == 2 {
+            if p.policy_type == POLICY_TYPE_ROWFILTER {
                 for item in &p.row_filter_policy_items {
                     if !item_matches(&item.users, &item.roles, &item.groups, &user) {
                         continue;
@@ -517,9 +635,9 @@ pub(crate) fn resolve_tag_policies(
                         match parse_sql_predicate(expr_str, identity) {
                             Ok(expr) => filters.push((tag_value.clone(), expr)),
                             Err(e) => {
+                                // Do not log the filter body (may carry literals).
                                 warn!(
                                     tag = %tag_value,
-                                    filter = %expr_str,
                                     error = %e,
                                     "unparseable Ranger tag row filter; denying (fail-closed)"
                                 );
@@ -553,9 +671,11 @@ impl PolicyStore for RangerStore {
     ) -> sqe_core::Result<ResolvedPolicy> {
         let key = cache_key(user, table_name, namespace);
         if let Some(cached) = self.cache.get(&key).await {
+            self.record_cache_hit();
             return Ok(cached);
         }
-        let bundle = self.fetch_bundle().await?;
+        self.record_cache_miss();
+        let bundle = self.cached_bundle().await?;
         let policy = resolve_from_bundle(&bundle, user, table_name, namespace);
         self.cache.insert(key, policy.clone()).await;
         Ok(policy)
@@ -590,7 +710,7 @@ impl PolicyStore for RangerStore {
             );
         }
 
-        let bundle = match self.fetch_bundle().await {
+        let bundle = match self.cached_bundle().await {
             Ok(b) => b,
             Err(e) => {
                 warn!(
@@ -622,6 +742,9 @@ impl PolicyStore for RangerStore {
 
     fn invalidate_all(&self) {
         self.cache.invalidate_all();
+        // Also drop the shared bundle so a manual refresh does not serve a stale
+        // bundle until its TTL elapses.
+        self.bundle_cache.invalidate_all();
     }
 }
 
@@ -691,6 +814,91 @@ mod tests {
         // from_config must succeed even with an empty URL (no network call).
         let store = RangerStore::from_config(&cfg);
         assert!(store.is_ok(), "from_config failed: {:?}", store.err());
+    }
+
+    /// Fix 1: a fetch failure trips the breaker and the breaker-state gauge must
+    /// read `open` (2). With no metrics wired the OPA-style record calls are
+    /// no-ops; here we attach a registry and assert the gauge after a forced
+    /// failure. `breaker_failure_threshold = 1` so a single failed download
+    /// opens the breaker. The download URL is an unroutable address so the HTTP
+    /// send fails fast (records a failure + records the "err" metric).
+    #[tokio::test]
+    async fn breaker_open_sets_state_gauge_for_ranger() {
+        let cfg = RangerPolicyConfig {
+            // RFC 5737 TEST-NET-1, unroutable; with a short timeout the send fails fast.
+            url: "http://192.0.2.1:6080".to_string(),
+            timeout_secs: 1,
+            breaker_failure_threshold: 1,
+            ..RangerPolicyConfig::default()
+        };
+        let metrics = Arc::new(MetricsRegistry::new());
+        let store = RangerStore::from_config(&cfg).unwrap().with_metrics(metrics.clone());
+
+        // First fetch fails (transport error) -> record_failure opens the
+        // breaker (threshold 1) and record_metric writes the gauge.
+        let err = store.fetch_bundle().await;
+        assert!(err.is_err(), "fetch against unroutable URL must fail");
+
+        let gauge = metrics
+            .policy_circuit_breaker_state
+            .with_label_values(&["ranger"])
+            .get();
+        assert_eq!(
+            gauge, 2.0,
+            "breaker must be open (gauge=2) after a fetch failure tripped it"
+        );
+
+        // The duration histogram must have at least one observation labelled err.
+        let observed = metrics
+            .policy_resolve_duration_seconds
+            .with_label_values(&["ranger", "err"])
+            .get_sample_count();
+        assert!(observed >= 1, "fetch failure must record a resolve-duration sample");
+    }
+
+    /// Fix 1: per-user cache hit/miss counters increment via `resolve`. We seed
+    /// the per-user cache directly so the hit path is taken without any network
+    /// call (the miss path would hit `cached_bundle`/`fetch_bundle`).
+    #[tokio::test]
+    async fn cache_hit_counter_increments_on_ranger() {
+        let metrics = Arc::new(MetricsRegistry::new());
+        let store = RangerStore::from_config(&RangerPolicyConfig::default())
+            .unwrap()
+            .with_metrics(metrics.clone());
+
+        let u = user("alice", &["analyst"]);
+        let key = cache_key(&u, "orders", "sales");
+        store.cache.insert(key, ResolvedPolicy::default()).await;
+
+        let _ = store.resolve(&u, "orders", "sales").await.unwrap();
+        let hits = metrics
+            .policy_cache_hits_total
+            .with_label_values(&["ranger"])
+            .get();
+        assert_eq!(hits, 1, "a warm per-user cache entry must record one hit");
+    }
+
+    /// `cached_bundle` serves a warm bundle from the cache without re-fetching.
+    /// We seed the bundle cache directly (no HTTP), then assert the returned Arc
+    /// is pointer-identical to the seeded one -- proving the cache hit path is
+    /// taken and `fetch_bundle` (which would fail on the empty URL) is skipped.
+    #[tokio::test]
+    async fn cached_bundle_serves_warm_copy_without_fetch() {
+        let store = RangerStore::from_config(&RangerPolicyConfig::default()).unwrap();
+        let seeded: Arc<ServicePolicies> = Arc::new(serde_json::from_str(BUNDLE).unwrap());
+        store
+            .bundle_cache
+            .insert(BUNDLE_KEY, seeded.clone())
+            .await;
+
+        let got = store
+            .cached_bundle()
+            .await
+            .expect("warm bundle must be served from cache");
+        assert!(
+            Arc::ptr_eq(&seeded, &got),
+            "cached_bundle must return the cached Arc, not a re-fetched copy"
+        );
     }
 
     fn user(name: &str, roles: &[&str]) -> SessionUser {
@@ -798,6 +1006,31 @@ mod tests {
         assert!(
             !policy.column_masks.contains_key("amount"),
             "restricted column must not also carry a mask"
+        );
+    }
+
+    #[test]
+    fn datamask_column_isexcludes_denies_failclosed() {
+        // A datamask policy authored as "mask all columns EXCEPT these"
+        // (column.isExcludes = true) cannot be honored on the resource path
+        // (no schema for the complement). The previous code read the values as
+        // an include list, leaving every intended-masked column raw. It must
+        // now fail closed: deny the table.
+        let mut bundle: ServicePolicies = serde_json::from_str(BUNDLE).unwrap();
+        bundle.policies[0].resources.get_mut("column").unwrap().is_excludes = true;
+        let policy = resolve_from_bundle(
+            &bundle,
+            &user("alice", &["analyst"]),
+            "orders",
+            "sales",
+        );
+        assert!(
+            policy.row_filters.contains(&lit(false)),
+            "column isExcludes datamask must inject a deny (lit(false)) row filter"
+        );
+        assert!(
+            policy.column_masks.is_empty(),
+            "excludes datamask must not be treated as an include list"
         );
     }
 
@@ -1113,6 +1346,61 @@ mod tests {
         assert!(
             unmappable.contains("PII"),
             "CUSTOM mask with no value_expr must be unmappable (fail-closed)"
+        );
+    }
+
+    // --- tagPolicies live-sample validation (HIGH-tagpolicies-shape-unvalidated) ---
+
+    /// Placeholder bundle for the live-capture validation. Ships as an empty
+    /// `tagPolicies` block (valid JSON) so this file compiles before the real
+    /// capture exists. During the Ranger-backend validation run, replace
+    /// `src/testdata/tag_bundle_live_sample.json` with a bundle captured from a
+    /// real Ranger (`GET /service/plugins/policies/download/<service>`) that
+    /// carries at least one tag-linked datamask and one tag-linked rowfilter,
+    /// then remove the `#[ignore]` below and adjust the constants to match the
+    /// capture.
+    const TAG_BUNDLE_LIVE_SAMPLE: &str = include_str!("testdata/tag_bundle_live_sample.json");
+
+    /// Expected identity/tag the captured sample must resolve a non-empty result
+    /// for. Whoever drops in the real capture aligns these with the policies in
+    /// it (role bound to the datamask/rowfilter items, tag on the resources).
+    const LIVE_SAMPLE_ROLE: &str = "engineer";
+    const LIVE_SAMPLE_TAG: &str = "PII";
+
+    /// HIGH-tagpolicies-shape-unvalidated: deserialize a bundle captured from a
+    /// LIVE Ranger and assert `resolve_tag_policies` returns a non-empty result
+    /// (at least one mask OR one row filter). The whole tag-masking path is
+    /// currently validated only against a hand-authored `TAG_BUNDLE` fixture
+    /// whose shape is flagged unconfirmed (`TODO(phase3)` at the top of this
+    /// file). If the live `tagPolicies` JSON differs, `bundle.tag_policies`
+    /// deserializes to `None` and this test fails, surfacing the shape drift
+    /// instead of silently returning raw PII columns.
+    ///
+    /// `#[ignore]`-d until `tag_bundle_live_sample.json` is replaced with a real
+    /// capture during the Ranger-backend validation run. Dropping in the JSON
+    /// and removing `#[ignore]` makes this an active gate; no code change needed.
+    #[test]
+    #[ignore = "pending a real tagPolicies capture; see testdata/tag_bundle_live_sample.json"]
+    fn resolve_tag_policies_against_live_sample() {
+        let sp: ServicePolicies = serde_json::from_str(TAG_BUNDLE_LIVE_SAMPLE)
+            .expect("captured live sample must be valid ServicePolicies JSON");
+        assert!(
+            sp.tag_policies.is_some(),
+            "live bundle must deserialize a tagPolicies block (None means the \
+             shape drifted and tag masking would silently no-op)"
+        );
+
+        let tags: HashSet<String> = [LIVE_SAMPLE_TAG.to_string()].into_iter().collect();
+        let id = SessionIdentity {
+            username: "live-sample-user".into(),
+            roles: vec![LIVE_SAMPLE_ROLE.into()],
+            ..Default::default()
+        };
+        let (masks, filters, _unmappable) = resolve_tag_policies(&sp, &id, &tags);
+        assert!(
+            !masks.is_empty() || !filters.is_empty(),
+            "live tagPolicies capture must yield at least one mask or row filter; \
+             got empty (shape mismatch or wrong role/tag constants)"
         );
     }
 }

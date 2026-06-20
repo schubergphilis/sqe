@@ -65,7 +65,14 @@ impl PolicyCircuitBreaker {
                 }
                 Err(format!("{} circuit breaker is open", self.name))
             }
-            STATE_HALF_OPEN => Ok(()),
+            // Already half-open: a probe is in flight (admitted by the CAS
+            // winner in the STATE_OPEN arm above). Deny every other concurrent
+            // caller until that probe resolves, so only ONE probe hits the
+            // backend instead of a thundering herd. Still fail-closed.
+            STATE_HALF_OPEN => Err(format!(
+                "{} circuit breaker is half-open (probe in flight)",
+                self.name
+            )),
             _ => Ok(()),
         }
     }
@@ -165,5 +172,55 @@ mod tests {
         assert_eq!(b.state_code(), 1);
         b.record_failure(); // probe fails -> reopen
         assert_eq!(b.state_code(), 2);
+    }
+
+    #[test]
+    fn half_open_admits_only_the_cas_winner() {
+        let b = PolicyCircuitBreaker::new("Test", 1, std::time::Duration::from_millis(0));
+        b.record_failure(); // opens
+        // First check after recovery elapses wins the OPEN->HALF_OPEN CAS and
+        // is the single admitted probe.
+        assert!(b.check().is_ok(), "CAS winner must be admitted");
+        assert_eq!(b.state_code(), 1, "now half-open");
+        // Every subsequent caller while half-open is denied (no thundering herd
+        // of probes) and stays fail-closed until the probe resolves.
+        assert!(b.check().is_err(), "second concurrent caller must be denied");
+        assert!(b.check().is_err(), "third concurrent caller must be denied");
+        assert_eq!(b.state_code(), 1, "still half-open, probe still in flight");
+    }
+
+    #[test]
+    fn half_open_concurrent_callers_only_one_ok() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let b = Arc::new(PolicyCircuitBreaker::new(
+            "Test",
+            1,
+            std::time::Duration::from_millis(0),
+        ));
+        b.record_failure(); // opens; recovery_timeout=0 so the next check probes
+
+        let ok_count = Arc::new(AtomicU32::new(0));
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let b = Arc::clone(&b);
+            let ok_count = Arc::clone(&ok_count);
+            handles.push(std::thread::spawn(move || {
+                if b.check().is_ok() {
+                    ok_count.fetch_add(1, Ordering::SeqCst);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        // Exactly one caller wins the OPEN->HALF_OPEN CAS and gets Ok; the rest
+        // are denied. Without the half-open gate, all 16 would get Ok.
+        assert_eq!(
+            ok_count.load(Ordering::SeqCst),
+            1,
+            "exactly one probe must be admitted in half-open"
+        );
     }
 }

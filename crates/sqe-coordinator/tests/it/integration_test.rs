@@ -548,6 +548,10 @@ fn test_audit_logger_noop() {
         status: "success".to_string(),
         client_ip: None,
         tables_touched: Vec::new(),
+        row_filters_applied: 0,
+        columns_masked: Vec::new(),
+        columns_restricted: Vec::new(),
+        policy_denied: false,
     };
     logger.log(&entry); // Should not panic
 }

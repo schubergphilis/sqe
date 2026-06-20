@@ -18,8 +18,8 @@ pub use attach::{
 };
 pub use catalog_qualifiers::{extract_catalog_qualifiers, extract_catalog_qualifiers_from_sql};
 pub use classifier::{
-    parse_and_classify, parse_and_classify_typed, CheckAccessParams, ShowGrantsTarget,
-    StatementKind,
+    parse_and_classify, parse_and_classify_typed, CheckAccessParams, ShowEffectivePolicyParams,
+    ShowGrantsTarget, StatementKind,
 };
 pub use ddl::{try_parse_ref_ddl, BranchRetention, RefDdl};
 pub use partition::normalize_partitioned_by;

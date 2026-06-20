@@ -26,7 +26,10 @@ use sqe_core::SessionUser;
 
 use crate::policy_expr::parse_sql_predicate;
 use crate::session_udf::SessionIdentity;
-use crate::{MaskType, NoopTagSource, PolicyEnforcer, PolicyStore, ResolvedPolicy, TagMaskSpec, TagSource};
+use crate::{
+    MaskType, NoopTagSource, PolicyEnforcer, PolicySummary, PolicyStore, ResolvedPolicy,
+    TagMaskSpec, TagSource,
+};
 
 /// Plan-rewriting policy enforcer. Uses a PolicyStore to resolve policies
 /// and rewrites the LogicalPlan accordingly.
@@ -74,12 +77,11 @@ impl PolicyEnforcer for PolicyPlanRewriter {
         &self,
         user: &SessionUser,
         plan: LogicalPlan,
-    ) -> sqe_core::Result<LogicalPlan> {
+    ) -> sqe_core::Result<(LogicalPlan, PolicySummary)> {
         let store = self.store.clone();
         let mask_key = self.mask_key.clone();
         let tag_source = self.tag_source.clone();
         let username = user.username.clone();
-        let _roles = user.roles.clone();
         let user_clone = user.clone();
 
         // Collect all TableScan nodes (keyed by their stringified reference,
@@ -88,9 +90,30 @@ impl PolicyEnforcer for PolicyPlanRewriter {
         // multi-level Iceberg namespaces survive instead of being lost to a
         // naive split on '.' (issue #205).
         let mut table_refs: HashMap<String, datafusion::common::TableReference> = HashMap::new();
+        // Defense-in-depth for the `view-bypass-policy` finding. DataFusion 54
+        // inlines views into their base scans at `ctx.sql` planning time, so the
+        // rewriter normally sees the governed base `TableScan`. But a scan whose
+        // provider is still a `ViewTable` (a hand-built scan, or any residual
+        // un-inlined view) would be keyed by the VIEW name, whose policy is
+        // usually empty, leaking the base table raw. Mark such scans for a
+        // fail-closed deny rather than trusting the view-name policy.
+        let mut view_scans: HashSet<String> = HashSet::new();
         plan.apply(|node| {
             if let LogicalPlan::TableScan(scan) = node {
                 let table_name = scan.table_name.to_string();
+                if let Ok(provider) =
+                    datafusion::datasource::source_as_provider(&scan.source)
+                {
+                    // TableProvider has `Any` as a supertrait but no `as_any()`
+                    // method; upcast the reference to downcast to ViewTable.
+                    let any_provider: &dyn std::any::Any = provider.as_ref();
+                    if any_provider
+                        .downcast_ref::<datafusion::datasource::ViewTable>()
+                        .is_some()
+                    {
+                        view_scans.insert(table_name.clone());
+                    }
+                }
                 table_refs
                     .entry(table_name)
                     .or_insert_with(|| scan.table_name.clone());
@@ -102,6 +125,19 @@ impl PolicyEnforcer for PolicyPlanRewriter {
         // Resolve policies for all tables
         let mut table_policies: HashMap<String, ResolvedPolicy> = HashMap::new();
         for (table_name, table_ref) in &table_refs {
+            // Un-inlined view scan: deny rather than govern by the (ungoverned)
+            // view name. See `view_scans` above.
+            if view_scans.contains(table_name) {
+                warn!(
+                    user = %username,
+                    table = %table_name,
+                    "Un-inlined view scan reached the rewriter; denying access (fail-closed)"
+                );
+                let mut deny = ResolvedPolicy::default();
+                deny.row_filters.push(lit(false));
+                table_policies.insert(table_name.clone(), deny);
+                continue;
+            }
             // Derive the (namespace, table) policy key from the structured
             // reference. This MUST match the write path's scheme
             // (write_handler.rs keys by `namespace().last()`), otherwise
@@ -120,6 +156,21 @@ impl PolicyEnforcer for PolicyPlanRewriter {
                 table_policies.insert(table_name.clone(), deny);
                 continue;
             };
+
+            // Diagnostic: log the EXACT (database, table) lookup keys sent to the
+            // policy store. `namespace` here is the flattened last dotted
+            // component of the schema (see `resolve_policy_key`), which is what
+            // Ranger `database` resource values must match. When a policy silently
+            // does not fire, operators compare `lookup_database` against the
+            // Ranger policy resource to catch a multi-level-namespace mismatch
+            // (e.g. schema "ns1.ns2" flattens to "ns2"). No row values are logged.
+            debug!(
+                user = %username,
+                full_ref = %table_name,
+                lookup_database = %namespace,
+                lookup_table = %table,
+                "Resolving policy with flattened lookup keys"
+            );
 
             match store.resolve(&user_clone, &table, &namespace).await {
                 Ok(mut policy) => {
@@ -153,40 +204,77 @@ impl PolicyEnforcer for PolicyPlanRewriter {
                         }
                         _ => Vec::new(),
                     };
-                    let col_tags = tag_source.column_tags(catalog, &ns_path, table_ref.table());
+                    // Reserved virtual schemas (information_schema, the `system`
+                    // / `datafusion` catalogs) are served by in-memory providers
+                    // that are NEVER inserted into the table metadata cache, so
+                    // `column_tags` would always return None for them. They also
+                    // cannot host an Iceberg table (DataFusion/SQE reserve these
+                    // names), so they carry no tags by construction. Treat them
+                    // as known-no-tags rather than letting the fail-closed None
+                    // branch deny every information_schema query (which dbt and
+                    // SHOW COLUMNS / SHOW CREATE TABLE issue constantly).
+                    let tag_lookup = if is_reserved_virtual_ref(table_ref) {
+                        Some(HashMap::new())
+                    } else {
+                        tag_source.column_tags(catalog, &ns_path, table_ref.table())
+                    };
 
-                    if !col_tags.is_empty() {
-                        let all_tags: HashSet<String> =
-                            col_tags.values().flatten().cloned().collect();
-
-                        if !all_tags.is_empty() {
-                            let (tag_masks_by_tag, tag_filters, unmappable_tags) =
-                                store.resolve_tags(&user_clone, &all_tags).await;
-
-                            debug!(
+                    match tag_lookup {
+                        // Tag state UNKNOWN (cache miss / disabled cache /
+                        // unreadable metadata). Fail CLOSED exactly like the
+                        // resolve-failure path below: a tag mask or tag
+                        // row-filter may exist that we cannot see, so denying
+                        // is the only safe answer. Skipping tag work here would
+                        // silently bypass a security control.
+                        None => {
+                            warn!(
                                 user = %username,
                                 table = %table_name,
-                                tag_masks = tag_masks_by_tag.len(),
-                                tag_filters = tag_filters.len(),
-                                unmappable_tags = unmappable_tags.len(),
-                                "Resolved tag-based policies"
+                                namespace = %namespace,
+                                "Tag state unknown (cache miss or disabled); denying access"
                             );
-
-                            let identity = SessionIdentity {
-                                username: user_clone.username.clone(),
-                                roles: user_clone.roles.clone(),
-                                database: None,
-                                schema: None,
-                            };
-                            merge_tag_masks(
-                                &mut policy,
-                                &col_tags,
-                                &tag_masks_by_tag,
-                                tag_filters,
-                                &unmappable_tags,
-                                &identity,
-                            );
+                            let mut deny = ResolvedPolicy::default();
+                            deny.row_filters.push(lit(false));
+                            policy = deny;
                         }
+                        // Known: at least one column carries tags. Resolve tag
+                        // policies and merge them into the resolved policy.
+                        Some(col_tags) if !col_tags.is_empty() => {
+                            let all_tags: HashSet<String> =
+                                col_tags.values().flatten().cloned().collect();
+
+                            if !all_tags.is_empty() {
+                                let (tag_masks_by_tag, tag_filters, unmappable_tags) =
+                                    store.resolve_tags(&user_clone, &all_tags).await;
+
+                                debug!(
+                                    user = %username,
+                                    table = %table_name,
+                                    tag_masks = tag_masks_by_tag.len(),
+                                    tag_filters = tag_filters.len(),
+                                    unmappable_tags = unmappable_tags.len(),
+                                    "Resolved tag-based policies"
+                                );
+
+                                let identity = SessionIdentity {
+                                    username: user_clone.username.clone(),
+                                    roles: user_clone.roles.clone(),
+                                    database: None,
+                                    schema: None,
+                                };
+                                merge_tag_masks(
+                                    &mut policy,
+                                    &col_tags,
+                                    &tag_masks_by_tag,
+                                    tag_filters,
+                                    &unmappable_tags,
+                                    &identity,
+                                );
+                            }
+                        }
+                        // Known: no tags on this table. Proceed with the
+                        // resource-path policy unchanged, no tag work.
+                        Some(_) => {}
                     }
 
                     table_policies.insert(table_name.clone(), policy);
@@ -205,6 +293,16 @@ impl PolicyEnforcer for PolicyPlanRewriter {
                 }
             }
         }
+
+        // Summarise what the resolved policies do, for the audit log. Folded
+        // out of `table_policies` here (we hold every ResolvedPolicy) so the
+        // coordinator can record per-query masked/restricted/denied state
+        // instead of a bare `status:"success"` with zero rows. `denied` is true
+        // when any scan carries a deny-all `lit(false)` row filter (resolve
+        // failure, breaker-open, unknown-tag state, or an un-inlined view scan);
+        // those sentinels are NOT counted in `row_filters_applied`. A restricted
+        // column is NOT a deny: it stays in the schema as a forced NULL.
+        let summary = summarise_policies(&table_policies);
 
         // Rewrite the plan
         let rewritten = plan
@@ -242,30 +340,40 @@ impl PolicyEnforcer for PolicyPlanRewriter {
                             })?;
                         }
 
-                        // 2. Apply column masks and/or restrictions via a
-                        //    projection that drops restricted columns, masks
-                        //    masked columns, and passes the rest through with
-                        //    their real (qualified) column reference.
+                        // 2. Apply column masks and restrictions via a
+                        //    projection. A RESTRICTED column is kept in the
+                        //    schema but forced to a typed NULL (restriction is a
+                        //    forced Nullify), so `SELECT *` and any reference to
+                        //    it resolve and the raw value is never returned.
+                        //    Dropping the column (the old behavior) made any
+                        //    outer reference fail with FieldNotFound. A MASKED
+                        //    column gets its mask expression; everything else
+                        //    passes through with its real (qualified) reference.
+                        //    Restriction wins over a mask on the same column.
                         if !policy.column_masks.is_empty()
                             || !policy.restricted_columns.is_empty()
                         {
                             let schema = builder.schema().clone();
                             let exprs: Vec<Expr> = schema
                                 .iter()
-                                .filter(|(_q, f)| {
-                                    !policy.restricted_columns.contains(f.name())
-                                })
                                 .map(|(qualifier, field)| {
                                     let name = field.name();
-                                    if let Some(mask) = policy.column_masks.get(name) {
-                                        // Alias the mask expr to the column's
-                                        // QUALIFIED name so the output field
-                                        // keeps the scan's qualifier. A bare
-                                        // `.alias(name)` produces an unqualified
-                                        // field, which breaks the user's outer
-                                        // `SELECT t.col` reference (planned
-                                        // against the qualified scan) with
-                                        // "No field named <qualified>.col".
+                                    // Alias mask/null exprs to the column's
+                                    // QUALIFIED name so the output field keeps
+                                    // the scan's qualifier. A bare `.alias(name)`
+                                    // produces an unqualified field, which breaks
+                                    // the user's outer `SELECT t.col` reference
+                                    // (planned against the qualified scan) with
+                                    // "No field named <qualified>.col".
+                                    if policy.restricted_columns.contains(name) {
+                                        apply_mask(
+                                            name,
+                                            field.data_type(),
+                                            &MaskType::Nullify,
+                                            mask_key.clone(),
+                                        )
+                                        .alias_qualified(qualifier.cloned(), name.clone())
+                                    } else if let Some(mask) = policy.column_masks.get(name) {
                                         apply_mask(
                                             name,
                                             field.data_type(),
@@ -309,8 +417,106 @@ impl PolicyEnforcer for PolicyPlanRewriter {
                 sqe_core::error::SqeError::Execution(format!("Plan rewrite failed: {e}"))
             })?;
 
-        Ok(rewritten.data)
+        Ok((rewritten.data, summary))
     }
+}
+
+/// Fold the per-table resolved policies into a single audit summary.
+///
+/// `denied` is true when any policy injected a deny-all `lit(false)` row filter
+/// (resolve failure, breaker-open, unknown-tag state, or a column-isExcludes
+/// datamask). The `lit(false)` sentinel is excluded from `row_filters_applied`
+/// so the count reflects real, user-visible row filters only. Masked and
+/// restricted column names are deduplicated and sorted for stable audit output.
+fn summarise_policies(table_policies: &HashMap<String, ResolvedPolicy>) -> PolicySummary {
+    let deny = lit(false);
+    let mut row_filters_applied = 0usize;
+    let mut masked: HashSet<String> = HashSet::new();
+    let mut restricted: HashSet<String> = HashSet::new();
+    let mut denied = false;
+
+    for policy in table_policies.values() {
+        for f in &policy.row_filters {
+            if f == &deny {
+                denied = true;
+            } else {
+                row_filters_applied += 1;
+            }
+        }
+        for col in policy.column_masks.keys() {
+            masked.insert(col.clone());
+        }
+        for col in &policy.restricted_columns {
+            restricted.insert(col.clone());
+        }
+    }
+
+    let mut columns_masked: Vec<String> = masked.into_iter().collect();
+    columns_masked.sort();
+    let mut columns_restricted: Vec<String> = restricted.into_iter().collect();
+    columns_restricted.sort();
+
+    PolicySummary {
+        row_filters_applied,
+        columns_masked,
+        columns_restricted,
+        denied,
+    }
+}
+
+/// Resolve the effective policy for a single (user, table) pair for the
+/// `SHOW EFFECTIVE POLICY` diagnostic, mirroring the per-table resolution the
+/// `PlanRewriter` performs at query time.
+///
+/// The flow matches the rewriter exactly: `store.resolve()` for the resource
+/// policy, then (when `col_tags` is non-empty) `store.resolve_tags()` followed
+/// by `merge_tag_masks` with the same precedence contract. The caller supplies
+/// `col_tags` (the table's `column -> tags` map, read from the loaded Iceberg
+/// metadata) rather than threading the rewriter's `TagSource` cache. On a
+/// resolve failure this returns the same deny-all sentinel (`lit(false)` row
+/// filter) the rewriter would inject, so the diagnostic never under-reports.
+///
+/// `namespace`/`table` must be the SAME flattened policy key the rewriter uses
+/// (`resolve_policy_key` -> last dotted namespace component), or the diagnostic
+/// would describe a different policy than enforcement applies.
+pub async fn resolve_effective_policy(
+    store: &dyn PolicyStore,
+    user: &sqe_core::session::SessionUser,
+    table: &str,
+    namespace: &str,
+    col_tags: &HashMap<String, Vec<String>>,
+) -> ResolvedPolicy {
+    let mut policy = match store.resolve(user, table, namespace).await {
+        Ok(p) => p,
+        Err(_) => {
+            // Same deny-all sentinel the rewriter injects on resolve failure.
+            let mut deny = ResolvedPolicy::default();
+            deny.row_filters.push(lit(false));
+            return deny;
+        }
+    };
+
+    let all_tags: HashSet<String> = col_tags.values().flatten().cloned().collect();
+    if !all_tags.is_empty() {
+        let (tag_masks_by_tag, tag_filters, unmappable_tags) =
+            store.resolve_tags(user, &all_tags).await;
+        let identity = SessionIdentity {
+            username: user.username.clone(),
+            roles: user.roles.clone(),
+            database: None,
+            schema: None,
+        };
+        merge_tag_masks(
+            &mut policy,
+            col_tags,
+            &tag_masks_by_tag,
+            tag_filters,
+            &unmappable_tags,
+            &identity,
+        );
+    }
+
+    policy
 }
 
 /// Merge tag-derived masks and row filters into an existing `ResolvedPolicy`.
@@ -385,10 +591,12 @@ pub(crate) fn merge_tag_masks(
                             policy.column_masks.insert(column.clone(), MaskType::Custom(expr));
                         }
                         Err(e) => {
+                            // Do not log `template`: a CUSTOM mask body can embed
+                            // sensitive literals or keyed values. Column + tag are
+                            // enough to locate the offending Ranger policy.
                             warn!(
                                 column = %column,
                                 tag = %tag,
-                                template = %template,
                                 error = %e,
                                 "CUSTOM tag mask expression failed to parse; \
                                  restricting column (fail-closed)"
@@ -422,6 +630,40 @@ pub(crate) fn merge_tag_masks(
 ///
 /// Returns `None` when no table component can be determined. The caller
 /// treats `None` as fail-closed (deny all rows) rather than passthrough.
+/// True when `table_ref` names a reserved, virtual (non-Iceberg) relation that
+/// cannot carry Iceberg column tags and is never present in the table metadata
+/// cache: `information_schema.*` (DataFusion reserves this schema in every
+/// catalog), and anything under the reserved `system` / `datafusion` catalogs.
+///
+/// These names cannot be used for a user Iceberg table (DataFusion reserves the
+/// schema; the coordinator reserves the catalog names), so skipping the tag
+/// lookup here introduces no governance bypass: a real Iceberg table can never
+/// match. The resource policy (`store.resolve`) still runs for these refs.
+///
+/// `pg_catalog` is intentionally NOT matched: SQE does not register it as a
+/// virtual provider, so a user namespace named `pg_catalog` must still be tag-
+/// governed.
+fn is_reserved_virtual_ref(table_ref: &datafusion::common::TableReference) -> bool {
+    // Reserved catalogs (cannot host a user Iceberg table).
+    if let Some(cat) = table_ref.catalog() {
+        if cat.eq_ignore_ascii_case("system") || cat.eq_ignore_ascii_case("datafusion") {
+            return true;
+        }
+    }
+    // information_schema is reserved in every catalog. Match on the LAST schema
+    // component so `cat.information_schema.tables` (qualified) and
+    // `information_schema.tables` (bare) both match.
+    matches!(
+        table_ref.schema(),
+        Some(schema)
+            if schema
+                .rsplit('.')
+                .next()
+                .unwrap_or(schema)
+                .eq_ignore_ascii_case("information_schema")
+    )
+}
+
 fn resolve_policy_key(
     table_ref: &datafusion::common::TableReference,
 ) -> Option<(String, String)> {
@@ -553,6 +795,46 @@ fn apply_mask(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── summarise_policies (audit summary) tests ──────────────────────────────
+
+    #[test]
+    fn summary_counts_masks_filters_and_restrictions() {
+        let mut policy = ResolvedPolicy::default();
+        policy.row_filters.push(col("region").eq(lit("EU")));
+        policy.column_masks.insert("ssn".to_string(), MaskType::Hash);
+        policy.column_masks.insert("salary".to_string(), MaskType::Nullify);
+        policy.restricted_columns.push("notes".to_string());
+        let mut table_policies = HashMap::new();
+        table_policies.insert("sales.orders".to_string(), policy);
+
+        let s = summarise_policies(&table_policies);
+        assert_eq!(s.row_filters_applied, 1);
+        assert_eq!(s.columns_masked, vec!["salary".to_string(), "ssn".to_string()]);
+        assert_eq!(s.columns_restricted, vec!["notes".to_string()]);
+        assert!(!s.denied, "a real row filter is not a deny");
+    }
+
+    #[test]
+    fn summary_marks_denied_on_deny_all_filter() {
+        let mut policy = ResolvedPolicy::default();
+        policy.row_filters.push(lit(false));
+        let mut table_policies = HashMap::new();
+        table_policies.insert("sales.orders".to_string(), policy);
+
+        let s = summarise_policies(&table_policies);
+        assert!(s.denied, "lit(false) deny-all must set denied=true");
+        assert_eq!(
+            s.row_filters_applied, 0,
+            "the deny-all sentinel must not be counted as a real row filter"
+        );
+    }
+
+    #[test]
+    fn summary_default_when_no_policies() {
+        let table_policies: HashMap<String, ResolvedPolicy> = HashMap::new();
+        assert_eq!(summarise_policies(&table_policies), PolicySummary::default());
+    }
 
     // ── merge_tag_masks precedence tests ──────────────────────────────────────
 
@@ -889,6 +1171,60 @@ mod tests {
         assert_eq!(resolve_policy_key(&r), None);
     }
 
+    // ── is_reserved_virtual_ref ──────────────────────────────────
+    // Reserved virtual relations are skipped from the tag lookup so an
+    // unknown tag state never denies information_schema / system queries.
+    // The skip must be tight: a real Iceberg ref must never match.
+
+    #[test]
+    fn reserved_ref_matches_bare_information_schema() {
+        let r = datafusion::common::TableReference::partial("information_schema", "tables");
+        assert!(is_reserved_virtual_ref(&r));
+    }
+
+    #[test]
+    fn reserved_ref_matches_qualified_information_schema() {
+        let r =
+            datafusion::common::TableReference::full("cat", "information_schema", "columns");
+        assert!(is_reserved_virtual_ref(&r));
+    }
+
+    #[test]
+    fn reserved_ref_matches_system_and_datafusion_catalogs() {
+        let sys = datafusion::common::TableReference::full("system", "runtime", "queries");
+        assert!(is_reserved_virtual_ref(&sys));
+        let df = datafusion::common::TableReference::full("datafusion", "info", "version");
+        assert!(is_reserved_virtual_ref(&df));
+    }
+
+    #[test]
+    fn reserved_ref_does_not_match_real_iceberg_table() {
+        // A normal user table must be tag-governed.
+        let r = datafusion::common::TableReference::full("cat", "ns1.ns2", "employees");
+        assert!(!is_reserved_virtual_ref(&r));
+        // Bare and two-part user tables too.
+        assert!(!is_reserved_virtual_ref(&datafusion::common::TableReference::bare("employees")));
+        assert!(!is_reserved_virtual_ref(&datafusion::common::TableReference::partial(
+            "hr", "employees"
+        )));
+    }
+
+    #[test]
+    fn reserved_ref_does_not_match_namespace_ending_in_runtime() {
+        // The fix keys on reserved CATALOG names, not on the last namespace
+        // component, so a user namespace ending in "runtime" is NOT a bypass.
+        let r = datafusion::common::TableReference::full("cat", "app.runtime", "events");
+        assert!(!is_reserved_virtual_ref(&r));
+    }
+
+    #[test]
+    fn reserved_ref_does_not_match_pg_catalog() {
+        // SQE does not register pg_catalog as a virtual provider, so a user
+        // namespace named pg_catalog must still be tag-governed.
+        let r = datafusion::common::TableReference::partial("pg_catalog", "pg_class");
+        assert!(!is_reserved_virtual_ref(&r));
+    }
+
     #[test]
     fn test_apply_mask_custom_returns_provided_expr() {
         let custom_expr = datafusion::logical_expr::lit("REDACTED");
@@ -953,7 +1289,7 @@ mod tests {
             roles: vec![],
         };
 
-        let rewritten = rewriter
+        let (rewritten, _summary) = rewriter
             .evaluate(&user, scan)
             .await
             .expect("rewrite with sibling-referencing CUSTOM mask must succeed");
@@ -963,5 +1299,70 @@ mod tests {
             rendered.contains("department"),
             "rewritten plan must reference the sibling column, got:\n{rendered}"
         );
+    }
+
+    // ── resolve_effective_policy (SHOW EFFECTIVE POLICY diagnostic) ───────
+    // The diagnostic must report the SAME resolution the rewriter applies:
+    // resource policy from store.resolve, plus tag-merged masks/filters.
+
+    fn diag_user(roles: &[&str]) -> sqe_core::session::SessionUser {
+        sqe_core::session::SessionUser {
+            username: "alice".to_string(),
+            roles: roles.iter().map(|r| r.to_string()).collect(),
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_effective_policy_surfaces_resource_masks_and_filters() {
+        let store = crate::policy_store::InMemoryPolicyStore::new();
+        let mut p = ResolvedPolicy::default();
+        p.column_masks.insert("ssn".to_string(), MaskType::Hash);
+        p.row_filters.push(col("region").eq(lit("EU")));
+        p.restricted_columns.push("notes".to_string());
+        store.add_table_policy("hr", "employees", p).await;
+
+        let got = resolve_effective_policy(
+            &store,
+            &diag_user(&[]),
+            "employees",
+            "hr",
+            &HashMap::new(),
+        )
+        .await;
+
+        assert!(matches!(got.column_masks.get("ssn"), Some(MaskType::Hash)));
+        assert_eq!(got.row_filters.len(), 1);
+        assert_eq!(got.restricted_columns, vec!["notes".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn resolve_effective_policy_no_policy_is_empty_passthrough() {
+        let store = crate::policy_store::InMemoryPolicyStore::new();
+        let got = resolve_effective_policy(
+            &store,
+            &diag_user(&[]),
+            "orders",
+            "sales",
+            &HashMap::new(),
+        )
+        .await;
+        assert!(got.column_masks.is_empty());
+        assert!(got.row_filters.is_empty());
+        assert!(got.restricted_columns.is_empty());
+    }
+
+    #[tokio::test]
+    async fn resolve_effective_policy_matches_rewriter_key_via_namespace() {
+        // The store keys on "{namespace}.{table}"; the caller must pass the
+        // last namespace component (as resolve_policy_key derives), so a policy
+        // registered under "ns2" is found when the table is cat.ns1.ns2.t.
+        let store = crate::policy_store::InMemoryPolicyStore::new();
+        let mut p = ResolvedPolicy::default();
+        p.column_masks.insert("email".to_string(), MaskType::Nullify);
+        store.add_table_policy("ns2", "t", p).await;
+
+        let got =
+            resolve_effective_policy(&store, &diag_user(&[]), "t", "ns2", &HashMap::new()).await;
+        assert!(matches!(got.column_masks.get("email"), Some(MaskType::Nullify)));
     }
 }

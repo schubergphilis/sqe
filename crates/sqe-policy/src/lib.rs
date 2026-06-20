@@ -19,8 +19,32 @@ use async_trait::async_trait;
 use datafusion::logical_expr::{Expr, LogicalPlan};
 use sqe_core::SessionUser;
 
+/// What a single `evaluate()` call did, summarised for the audit log.
+///
+/// Aggregated across every scanned table in the plan. Populated by the
+/// `PolicyPlanRewriter` from the resolved policies it injected; the
+/// `PassthroughEnforcer` returns the default (all-zero, not denied). The
+/// coordinator copies these counts/names into the `AuditEntry` so an operator
+/// can answer "was user X's access to table T filtered, masked, restricted, or
+/// denied" instead of seeing a bare `status:"success"` with zero rows.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PolicySummary {
+    /// Total row-filter expressions injected across all scans (excludes the
+    /// `lit(false)` deny-all sentinel, which is reflected in `denied`).
+    pub row_filters_applied: usize,
+    /// Names of columns that were masked (sorted, deduplicated).
+    pub columns_masked: Vec<String>,
+    /// Names of columns that were restricted/dropped (sorted, deduplicated).
+    pub columns_restricted: Vec<String>,
+    /// True when at least one scan was denied (a deny-all `lit(false)` row
+    /// filter was injected: resolve failure, breaker-open, unknown-tag state,
+    /// or fully-restricted table).
+    pub denied: bool,
+}
+
 /// Policy enforcement trait. Implementations receive a user and a logical plan,
-/// and return a (possibly rewritten) plan with security filters applied.
+/// and return a (possibly rewritten) plan with security filters applied, plus a
+/// [`PolicySummary`] describing what was applied (for the audit log).
 ///
 /// The evaluate() call sits in the query pipeline between planning and
 /// optimization. This means:
@@ -35,7 +59,7 @@ pub trait PolicyEnforcer: Send + Sync {
         &self,
         user: &SessionUser,
         plan: LogicalPlan,
-    ) -> sqe_core::Result<LogicalPlan>;
+    ) -> sqe_core::Result<(LogicalPlan, PolicySummary)>;
 }
 
 /// No-op enforcer that returns the plan unchanged. Used when policy
@@ -48,8 +72,8 @@ impl PolicyEnforcer for PassthroughEnforcer {
         &self,
         _user: &SessionUser,
         plan: LogicalPlan,
-    ) -> sqe_core::Result<LogicalPlan> {
-        Ok(plan)
+    ) -> sqe_core::Result<(LogicalPlan, PolicySummary)> {
+        Ok((plan, PolicySummary::default()))
     }
 }
 
@@ -205,9 +229,10 @@ mod tests {
         let plan = empty_plan();
         // We compare the debug representation since LogicalPlan doesn't implement PartialEq.
         let before = format!("{plan:?}");
-        let result = enforcer.evaluate(&user, plan).await.unwrap();
+        let (result, summary) = enforcer.evaluate(&user, plan).await.unwrap();
         let after = format!("{result:?}");
         assert_eq!(before, after);
+        assert_eq!(summary, PolicySummary::default());
     }
 
     #[tokio::test]
@@ -216,7 +241,7 @@ mod tests {
         let admin = make_user("admin", &["superuser", "admin", "data_owner"]);
         let plan = empty_plan();
         let before = format!("{plan:?}");
-        let result = enforcer.evaluate(&admin, plan).await.unwrap();
+        let (result, _summary) = enforcer.evaluate(&admin, plan).await.unwrap();
         assert_eq!(before, format!("{result:?}"));
     }
 
@@ -226,8 +251,17 @@ mod tests {
         let guest = make_user("guest", &[]);
         let plan = empty_plan();
         let before = format!("{plan:?}");
-        let result = enforcer.evaluate(&guest, plan).await.unwrap();
+        let (result, _summary) = enforcer.evaluate(&guest, plan).await.unwrap();
         assert_eq!(before, format!("{result:?}"));
+    }
+
+    #[test]
+    fn test_policy_summary_default_is_not_denied() {
+        let s = PolicySummary::default();
+        assert_eq!(s.row_filters_applied, 0);
+        assert!(s.columns_masked.is_empty());
+        assert!(s.columns_restricted.is_empty());
+        assert!(!s.denied);
     }
 
     // ResolvedPolicy default is empty (allow-all passthrough)
