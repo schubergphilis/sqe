@@ -6,6 +6,7 @@
 #   ./run.sh             # deploy -> denied -> grant -> succeeds -> destroy
 #   ./run.sh --keep      # same, but leave SQE up and the stack deployed
 #   ./run.sh --destroy   # just tear down (compose down + drop table + cdk destroy)
+#   ./run.sh --check     # same as default, plus assert the deny/grant invariants before teardown
 #
 # Prereqs: Docker, Node + npx, AWS CLI v2, and AWS credentials for the target
 # account (set AWS_PROFILE, or have AWS_* env vars). The caller must be a Lake
@@ -21,12 +22,13 @@ cd "$(dirname "$0")"
 . ../_shared/lib.sh
 
 DB="sqe_lf_quickstart"
-KEEP=0; DESTROY_ONLY=0
+KEEP=0; DESTROY_ONLY=0; CHECK=0
 for a in "$@"; do
   case "$a" in
     --keep) KEEP=1 ;;
     --destroy) DESTROY_ONLY=1 ;;
-    *) die "unknown arg: $a (use --keep or --destroy)" ;;
+    --check) CHECK=1 ;;
+    *) die "unknown arg: $a (use --keep, --destroy, or --check)" ;;
   esac
 done
 
@@ -138,6 +140,29 @@ ok "captured to $OUT"
 if [ "$KEEP" -eq 1 ]; then
   echo; ok "left running (--keep). Flight grpc://localhost:${SQE_FLIGHT_PORT:-60051}."
   echo "    Tear down with: ./run.sh --destroy"
+  exit 0
+fi
+
+if [ "$CHECK" -eq 1 ]; then
+  step "checking invariants (reusing the captured Phase A / Phase B output)"
+  # The point of this scenario is the deny-then-grant flip, so assert it both
+  # ways from the two captured phases (no re-run: the grant is already applied,
+  # so a re-run could not reproduce the pre-grant denial).
+  #
+  # Phase A (before the grant): Lake Formation denies CREATE TABLE. OUTPUT.md
+  # shows the LF-specific message, which is more precise than bare AccessDenied.
+  assert_contains     "Phase A: Lake Formation denies CREATE TABLE" "$PHASE_A" "Insufficient Lake Formation permission"
+  assert_contains     "Phase A: error names Create Table"           "$PHASE_A" "Required Create Table on $DB"
+  # Phase B (after the grant): the same statements succeed and the aggregate
+  # comes back (purchase -> 55.25, click -> 2.25) with no engine error. Do NOT
+  # assert_not_contains 'error' on Phase A -- that phase is an error by design.
+  assert_contains     "Phase B: aggregate shows purchase total"     "$PHASE_B" "55.25"
+  assert_contains     "Phase B: aggregate shows click total"        "$PHASE_B" "2.25"
+  assert_not_contains "Phase B: run has no error after the grant"   "$PHASE_B" "error"
+  # Tear down before check_summary: check_summary dies on a failed assertion, so
+  # summarizing first would leak the deployed bucket + LF-governed database.
+  destroy
+  check_summary
   exit 0
 fi
 destroy
