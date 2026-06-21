@@ -91,16 +91,16 @@ This adds a coordinator (Flight SQL on `60051`) and two workers (internal
 ### Run
 
 ```bash
-./scripts/distributed-test.sh
+scripts/test.sh scenario distributed
 ```
 
-The script builds `sqe-cli`, runs SQL over Flight on `60051`, and verifies
+The scenario builds `sqe-cli`, runs SQL over Flight on `60051`, and verifies
 worker dispatch through `system.runtime.tasks` (proving fragments actually
 reach the workers rather than silently falling back to local execution).
 
 ### Expected output
 
-The script runs a sequence of SQL statements over Flight on `60051` and prints
+The scenario runs a sequence of SQL statements over Flight on `60051` and prints
 a pass line per check, ending with the worker-dispatch verification. The
 single-node Flight path (auth, CTAS, SELECT against live Polaris) was re-run
 this round through the TVF integration tests (3/3, 23.6s); the distributed
@@ -111,7 +111,8 @@ harness is covered by the suite and the committed benchmark baselines
 
 - `crates/sqe-coordinator/tests/integration_test.rs::test_distributed_select`
   (ignored by default; needs workers listening on `:50052`).
-- `scripts/distributed-test.sh`: full coordinator + worker harness.
+- `quickstart/distributed` (run via `scripts/test.sh scenario distributed`):
+  full coordinator + worker harness.
 - `scripts/concurrent-test.sh`: N parallel Flight clients, cache behaviour.
 
 ## Notes

@@ -446,16 +446,15 @@ heartbeat_interval_secs = 5
 memory_limit = "512MB"
 ```
 
-Bringing up the distributed stack composes both files:
+Bringing up the distributed stack composes both files. The `distributed`
+quickstart scenario wraps the three steps (compose up, bootstrap Polaris, run
+the checks):
 
 ```bash
-docker compose -f docker-compose.test.yml \
-               -f docker-compose.distributed.yml up --build -d
-./scripts/bootstrap-distributed.sh
-./scripts/distributed-test.sh
+scripts/test.sh scenario distributed
 ```
 
-The distributed test script runs 14 assertions: basic connectivity, system.runtime.nodes (verifying the coordinator sees both workers), query history, catalog metadata, table creation, distributed execution, the result cache, Trino HTTP compatibility, and information_schema. It is not a benchmark. It is a smoke test that the distributed topology works end-to-end.
+The distributed scenario runs the same checks the old standalone script did: basic connectivity, system.runtime.nodes (verifying the coordinator sees both workers), query history, catalog metadata, table creation, distributed execution, the result cache, Trino HTTP compatibility, and information_schema. It is not a benchmark. It is a smoke test that the distributed topology works end-to-end.
 
 The concurrent load test script (`scripts/concurrent-test.sh`) goes further. It launches N parallel clients (default 10, configurable up to 50 or more) each running queries against the coordinator simultaneously. It measures per-query latency, tracks pass/fail rates, and queries `system.runtime.tasks` afterward to verify that work was actually distributed across both workers.
 

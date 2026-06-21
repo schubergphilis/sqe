@@ -15,6 +15,10 @@ SELF_CONTAINED=(polaris-keycloak-client-id polaris-keycloak-user-token \
   polaris-ranger-keycloak nessie unity-oss embedded-files \
   embedded-sqlite-catalog attach-catalogs quack observability benchmark)
 
+# run_scenario is generic: any quickstart/<name>/run.sh --check works here,
+# including the heavy `distributed` scenario (coordinator + 2 workers). That one
+# is deliberately absent from SELF_CONTAINED, so it never runs under `all`/`ci`;
+# invoke it explicitly with `scripts/test.sh scenario distributed`.
 run_scenario() {
   local name=$1 dir="$ROOT_DIR/quickstart/$1"
   [ -d "$dir" ] || { echo "no such scenario: $name" >&2; return 2; }
