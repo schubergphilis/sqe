@@ -109,6 +109,7 @@
 
 - [Lineage (OpenLineage)](./operations/openlineage.md)
 - [Runtime catalog management (ATTACH / DETACH / SECRETS)](./operations/catalogs.md)
+- [Audit Logging (OCSF)](./operations/audit-logging.md)
 - [Web UI](./operations/web-ui.md)
 - [On-Call Runbook](./operations/runbook.md)
 
