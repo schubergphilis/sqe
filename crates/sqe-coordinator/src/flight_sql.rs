@@ -366,6 +366,10 @@ pub struct SqeFlightSqlService {
     rate_limiter: Option<Arc<crate::rate_limiter::QueryRateLimiter>>,
     auth_rate_limiter: Option<Arc<crate::rate_limiter::AuthRateLimiter>>,
     metadata_rate_limiter: Option<Arc<crate::rate_limiter::MetadataRateLimiter>>,
+    /// Audit logger inherited from the `QueryHandler`. Used to emit
+    /// `AuditKind::Auth` events on handshake success/failure and on
+    /// per-request bearer/session validation failures.
+    audit: Option<Arc<sqe_metrics::audit::AuditLogger>>,
     /// Parameter bindings for outstanding prepared statements.
     ///
     /// Keyed by `(authenticated session id, encoded statement handle)` so one
@@ -405,6 +409,7 @@ impl SqeFlightSqlService {
     ) -> Self {
         let worker_secret = config.coordinator.worker_secret.clone();
         let query_tracker = Arc::clone(query_handler.query_tracker());
+        let audit = query_handler.audit().cloned();
         Self {
             session_manager,
             query_handler,
@@ -416,6 +421,7 @@ impl SqeFlightSqlService {
             rate_limiter: None,
             auth_rate_limiter: None,
             metadata_rate_limiter: None,
+            audit,
             prepared_params: Arc::new(
                 moka::future::Cache::builder()
                     .max_capacity(PREPARED_PARAMS_MAX_ENTRIES)
@@ -467,6 +473,76 @@ impl SqeFlightSqlService {
         self
     }
 
+    /// Emit an OCSF Authentication audit event (class_uid 3002).
+    ///
+    /// Called from `do_handshake` and `get_session_from_request` at every
+    /// authentication outcome. Credential material (passwords, raw tokens) is
+    /// NEVER included in the event; the `message` field carries only a static,
+    /// non-sensitive reason string.
+    fn emit_auth_event(
+        &self,
+        outcome: sqe_metrics::audit::Outcome,
+        actor: sqe_metrics::audit::Actor,
+        client_ip: Option<String>,
+        session_id: Option<String>,
+    ) {
+        if let Some(ref audit) = self.audit {
+            let event = sqe_metrics::audit::AuditEvent {
+                time: chrono::Utc::now(),
+                kind: sqe_metrics::audit::AuditKind::Auth,
+                actor,
+                outcome,
+                resources: vec![],
+                policy: None,
+                timing: None,
+                stats: None,
+                query: None,
+                session_id,
+                client_ip,
+                integrity: sqe_metrics::audit::Integrity::default(),
+            };
+            audit.log_event(event);
+        }
+    }
+
+    /// Emit a Session lifecycle event (OCSF Authorize Session 3003).
+    ///
+    /// Called ONLY from `do_handshake` on a successful password-credential
+    /// exchange. The JWT bearer path (`get_session_from_request`) deliberately
+    /// does NOT call this function: it mints a new ephemeral session UUID on
+    /// every RPC, so emitting a Session event there would produce one event per
+    /// query rather than one per login. Auth events record authentication
+    /// attempts; Session events record the establishment of a named interactive
+    /// session. A fresh handshake produces both; a per-request JWT bearer
+    /// produces only an Auth event.
+    ///
+    /// Only emitted on success; eviction and expiry are not yet tracked
+    /// (no AuditLogger path from SessionManager without a second wiring).
+    fn emit_session_event(
+        &self,
+        actor: sqe_metrics::audit::Actor,
+        client_ip: Option<String>,
+        session_id: Option<String>,
+    ) {
+        if let Some(ref audit) = self.audit {
+            let event = sqe_metrics::audit::AuditEvent {
+                time: chrono::Utc::now(),
+                kind: sqe_metrics::audit::AuditKind::Session,
+                actor,
+                outcome: sqe_metrics::audit::Outcome::Success,
+                resources: vec![],
+                policy: None,
+                timing: None,
+                stats: None,
+                query: None,
+                session_id,
+                client_ip,
+                integrity: sqe_metrics::audit::Integrity::default(),
+            };
+            audit.log_event(event);
+        }
+    }
+
     /// Resolve the source IP for audit and rate-limit purposes.
     ///
     /// Issue #74: `x-forwarded-for` is honoured only when the request's
@@ -499,12 +575,26 @@ impl SqeFlightSqlService {
         let metadata = request.metadata();
         let client_ip = self.extract_client_ip(request);
 
-        let auth = metadata
-            .get("authorization")
-            .ok_or_else(|| {
+        let auth = match metadata.get("authorization") {
+            Some(v) => v,
+            None => {
                 debug!(client_ip = %client_ip, "Request missing authorization header");
-                Status::unauthenticated("No authorization header")
-            })?
+                self.emit_auth_event(
+                    sqe_metrics::audit::Outcome::Failure {
+                        error_type: Some("AuthFailed".to_string()),
+                        error_code: Some("UNAUTHENTICATED".to_string()),
+                        message: Some("No authorization header".to_string()),
+                    },
+                    sqe_metrics::audit::Actor::from_parts(
+                        "unknown".to_string(), None, None, vec![], vec![],
+                    ),
+                    Some(client_ip.clone()),
+                    None,
+                );
+                return Err(Status::unauthenticated("No authorization header"));
+            }
+        };
+        let auth = auth
             .to_str()
             .map_err(|e| Status::internal(format!("Invalid authorization header: {e}")))?;
 
@@ -517,7 +607,9 @@ impl SqeFlightSqlService {
 
         let token = &auth[bearer_prefix.len()..];
 
-        // Try session lookup first (handshake flow)
+        // Try session lookup first (handshake flow). Session reuse is NOT an
+        // auth establishment event; the auth event was already emitted when the
+        // session was created via do_handshake or JWT validation below.
         if let Some(session) = self.session_manager.get_session(token) {
             debug!(
                 username = %session.user.username,
@@ -537,28 +629,75 @@ impl SqeFlightSqlService {
                 bearer_token: Some(sqe_core::SecretString::new(token.to_string())),
                 ..Default::default()
             };
-            let session = self
+            match self
                 .session_manager
                 .authenticate_credentials(&credentials)
                 .await
-                .map_err(|e| {
+            {
+                Ok(session) => {
+                    debug!(
+                        username = %session.user.username,
+                        client_ip = %client_ip,
+                        session_id = %session.id,
+                        "Flight: authenticated via validated JWT bearer token"
+                    );
+                    let jwt_actor = sqe_metrics::audit::Actor::from_parts(
+                        session.user.username.clone(),
+                        session.user.subject.clone(),
+                        session.user.email.clone(),
+                        session.user.roles.clone(),
+                        session.user.groups.clone(),
+                    );
+                    self.emit_auth_event(
+                        sqe_metrics::audit::Outcome::Success,
+                        jwt_actor,
+                        Some(client_ip),
+                        Some(session.id.clone()),
+                    );
+                    // No Session event here: authenticate_credentials mints a
+                    // new session on every JWT bearer call (no dedup by token),
+                    // so emitting Session here would fire per-request rather
+                    // than per-session-establishment. Session events (OCSF 3003)
+                    // are only emitted on do_handshake(), which is the single
+                    // true session-establishment gate for interactive clients.
+                    return Ok(session);
+                }
+                Err(e) => {
                     warn!(
                         client_ip = %client_ip,
                         error = %e,
                         "Flight: JWT bearer token validation failed"
                     );
-                    Status::unauthenticated("Invalid or expired bearer token")
-                })?;
-            debug!(
-                username = %session.user.username,
-                client_ip = %client_ip,
-                session_id = %session.id,
-                "Flight: authenticated via validated JWT bearer token"
-            );
-            return Ok(session);
+                    self.emit_auth_event(
+                        sqe_metrics::audit::Outcome::Failure {
+                            error_type: Some("AuthFailed".to_string()),
+                            error_code: Some("INVALID_TOKEN".to_string()),
+                            message: Some("Invalid or expired bearer token".to_string()),
+                        },
+                        sqe_metrics::audit::Actor::from_parts(
+                            "unknown".to_string(), None, None, vec![], vec![],
+                        ),
+                        Some(client_ip),
+                        None,
+                    );
+                    return Err(Status::unauthenticated("Invalid or expired bearer token"));
+                }
+            }
         }
 
         warn!(client_ip = %client_ip, "Invalid or expired session token");
+        self.emit_auth_event(
+            sqe_metrics::audit::Outcome::Failure {
+                error_type: Some("AuthFailed".to_string()),
+                error_code: Some("INVALID_SESSION".to_string()),
+                message: Some("Invalid or expired session token".to_string()),
+            },
+            sqe_metrics::audit::Actor::from_parts(
+                "unknown".to_string(), None, None, vec![], vec![],
+            ),
+            Some(client_ip),
+            None,
+        );
         Err(Status::unauthenticated("Invalid or expired session token"))
     }
 
@@ -836,6 +975,18 @@ impl FlightSqlService for SqeFlightSqlService {
                 // turn the handler into a JWT enumeration oracle.
                 // Issue #38.
                 warn!(username = username, client_ip = %client_ip, error = %e, "Authentication failed");
+                self.emit_auth_event(
+                    sqe_metrics::audit::Outcome::Failure {
+                        error_type: Some("AuthFailed".to_string()),
+                        error_code: Some("INVALID_CREDENTIALS".to_string()),
+                        message: Some("Authentication failed".to_string()),
+                    },
+                    sqe_metrics::audit::Actor::from_parts(
+                        username.to_string(), None, None, vec![], vec![],
+                    ),
+                    Some(client_ip.clone()),
+                    None,
+                );
                 return Err(Status::unauthenticated("authentication failed"));
             }
             Err(_) => {
@@ -843,6 +994,18 @@ impl FlightSqlService for SqeFlightSqlService {
                     metrics.auth_attempts_total.with_label_values(&["oidc", "failed"]).inc();
                 }
                 warn!(username = username, "Handshake timed out after 30s");
+                self.emit_auth_event(
+                    sqe_metrics::audit::Outcome::Failure {
+                        error_type: Some("AuthFailed".to_string()),
+                        error_code: Some("TIMEOUT".to_string()),
+                        message: Some("Authentication timed out".to_string()),
+                    },
+                    sqe_metrics::audit::Actor::from_parts(
+                        username.to_string(), None, None, vec![], vec![],
+                    ),
+                    Some(client_ip.clone()),
+                    None,
+                );
                 return Err(Status::deadline_exceeded("Authentication timed out"));
             }
         };
@@ -851,6 +1014,24 @@ impl FlightSqlService for SqeFlightSqlService {
             username = username,
             session_id = %session.id,
             "Handshake authentication successful"
+        );
+        let handshake_actor = sqe_metrics::audit::Actor::from_parts(
+            session.user.username.clone(),
+            session.user.subject.clone(),
+            session.user.email.clone(),
+            session.user.roles.clone(),
+            session.user.groups.clone(),
+        );
+        self.emit_auth_event(
+            sqe_metrics::audit::Outcome::Success,
+            handshake_actor.clone(),
+            Some(client_ip.clone()),
+            Some(session.id.clone()),
+        );
+        self.emit_session_event(
+            handshake_actor,
+            Some(client_ip),
+            Some(session.id.clone()),
         );
 
         let result = HandshakeResponse {

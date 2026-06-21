@@ -46,6 +46,9 @@ fn analyst() -> SessionUser {
     SessionUser {
         username: "alice".into(),
         roles: vec!["analyst".into()],
+        subject: None,
+        email: None,
+        groups: vec![],
     }
 }
 
@@ -105,6 +108,9 @@ async fn non_matching_user_gets_empty_policy() {
     let bob = SessionUser {
         username: "bob".into(),
         roles: vec!["engineer".into()],
+        subject: None,
+        email: None,
+        groups: vec![],
     };
     let policy = store.resolve(&bob, "orders", "sales").await.unwrap();
     assert!(policy.column_masks.is_empty());

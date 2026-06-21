@@ -209,10 +209,6 @@ async fn async_main() -> anyhow::Result<()> {
 
     // Initialize metrics
     let metrics = Arc::new(sqe_metrics::MetricsRegistry::new());
-    let audit = Arc::new(
-        sqe_metrics::audit::AuditLogger::new(&config.metrics.audit_log_path)
-            .map_err(|e| anyhow::anyhow!(e))?,
-    );
 
     // Start metrics server
     sqe_metrics::server::start_metrics_server(metrics.clone(), config.metrics.prometheus_port);
@@ -245,6 +241,41 @@ async fn async_main() -> anyhow::Result<()> {
         metadata_cache_ttl_secs = config.catalog.metadata_cache_ttl_secs,
         "Initialized global table metadata cache (shared across all sessions)"
     );
+
+    // Build the audit logger after the table cache so we can wire GDPR tag
+    // masking via CacheTagSource (which needs the cache). The logger is built
+    // here as a plain value and Arc-wrapped at the end so `.with_gdpr()` can
+    // be called as a builder method before sharing.
+    //
+    // `audit_salt` is derived once at startup from a random UUID. It is stable
+    // within a deployment (not across restarts or replicas) so tokens from the
+    // same column remain correlatable within a log file. Not secret-grade.
+    let audit_salt = uuid::Uuid::new_v4().to_string();
+    let audit_logger = sqe_metrics::audit::AuditLogger::with_config(
+        &config.metrics.audit_log_path,
+        sqe_coordinator::parse_audit_format(&config.metrics.audit.format),
+    )
+    .map_err(|e| anyhow::anyhow!(e))?;
+
+    let audit_logger = if !config.metrics.audit.gdpr_tags.is_empty() {
+        let tag_src = Arc::new(sqe_coordinator::tag_source_impl::CacheTagSource::new(
+            Arc::new(table_cache.clone()),
+        ));
+        let adapter = Arc::new(sqe_coordinator::audit_tag_adapter::AuditTagAdapter(tag_src));
+        audit_logger.with_gdpr(
+            config.metrics.audit.gdpr_tags.clone(),
+            sqe_coordinator::parse_gdpr_mode(&config.metrics.audit.gdpr_identifier_mode),
+            audit_salt,
+            adapter,
+        )
+    } else {
+        audit_logger
+    };
+    let audit = Arc::new(audit_logger);
+
+    // Guard + self-audit the superdebug_log_results escape hatch.
+    // No-op when the flag is false (the default).
+    sqe_coordinator::maybe_warn_superdebug(&audit, &config);
 
     // AUTH-01: build the enforcer + store from config.policy.engine.
     // table_cache is passed so the rewriter can wire CacheTagSource for

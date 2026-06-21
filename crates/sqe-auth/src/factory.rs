@@ -44,6 +44,9 @@ pub async fn build_auth_chain(config: &AuthConfig) -> sqe_core::Result<AuthChain
                     client_id,
                     client_secret,
                     roles_claim,
+                    subject_claim,
+                    email_claim,
+                    groups_claim,
                 } => {
                     info!(
                         index = i,
@@ -55,6 +58,9 @@ pub async fn build_auth_chain(config: &AuthConfig) -> sqe_core::Result<AuthChain
                         client_id: client_id.clone(),
                         client_secret: client_secret.clone(),
                         roles_claim: roles_claim.clone(),
+                        subject_claim: subject_claim.clone(),
+                        email_claim: email_claim.clone(),
+                        groups_claim: groups_claim.clone(),
                         accept_invalid_certs: config.should_skip_tls_verify(),
                     };
                     let provider = OidcPasswordProvider::new(oidc_config).map_err(|e| {
@@ -129,6 +135,9 @@ pub async fn build_auth_chain(config: &AuthConfig) -> sqe_core::Result<AuthChain
                     audience,
                     user_claim,
                     roles_claim,
+                    subject_claim,
+                    email_claim,
+                    groups_claim,
                     allow_unbounded_audience,
                     allow_insecure_jwks,
                 } => {
@@ -143,6 +152,9 @@ pub async fn build_auth_chain(config: &AuthConfig) -> sqe_core::Result<AuthChain
                         audience: audience.clone(),
                         user_claim: user_claim.clone(),
                         roles_claim: roles_claim.clone(),
+                        subject_claim: subject_claim.clone(),
+                        email_claim: email_claim.clone(),
+                        groups_claim: groups_claim.clone(),
                         accept_invalid_certs: config.should_skip_tls_verify(),
                         allow_unbounded_audience: *allow_unbounded_audience,
                         allow_insecure_jwks: *allow_insecure_jwks,
@@ -312,6 +324,9 @@ mod tests {
                 client_id: "sqe".to_string(),
                 client_secret: "secret".to_string(),
                 roles_claim: "realm_access.roles".to_string(),
+                subject_claim: "sub".to_string(),
+                email_claim: String::new(),
+                groups_claim: String::new(),
             }],
             role_mappings: HashMap::new(),
             external: None,
@@ -344,6 +359,9 @@ mod tests {
                     client_id: "sqe".to_string(),
                     client_secret: "secret".to_string(),
                     roles_claim: "realm_access.roles".to_string(),
+                    subject_claim: "sub".to_string(),
+                    email_claim: String::new(),
+                    groups_claim: String::new(),
                 },
                 AuthProviderConfig::Anonymous {
                     user: "fallback".to_string(),

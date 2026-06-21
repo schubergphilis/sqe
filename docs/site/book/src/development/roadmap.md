@@ -56,7 +56,7 @@ SQL write operations and catalog DDL.
 - `CREATE SCHEMA` / `DROP SCHEMA`
 - `DROP TABLE` / `DROP TABLE IF EXISTS`
 - Parquet writer (to S3 via Iceberg)
-- Audit logging (JSONL)
+- Audit logging (JSONL, OCSF): canonical `AuditEvent`, OCSF class mapping, tamper-evident hash chain, GDPR-tag masking, identity enrichment
 - OpenTelemetry export (OTLP/gRPC)
 - Trino-compatible HTTP endpoint
 

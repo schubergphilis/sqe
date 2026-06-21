@@ -49,6 +49,14 @@ pub struct Identity {
     pub user_id: String,
     pub display_name: String,
     pub roles: Vec<String>,
+    /// JWT `sub` claim extracted from the token, when available.
+    /// Distinct from `user_id` which may use a custom `user_claim`.
+    pub subject: Option<String>,
+    /// Email address extracted from the token, when `email_claim` is configured.
+    pub email: Option<String>,
+    /// Group memberships extracted from the token, when `groups_claim` is configured.
+    /// Separate from `roles`: different claim path, different semantics.
+    pub groups: Vec<String>,
     pub catalog_token: Option<SecretString>,
     /// Refresh token for obtaining new access tokens without re-authentication.
     /// Only populated by providers that support token refresh (e.g. OIDC password grant).
@@ -196,6 +204,9 @@ mod tests {
             user_id: "alice".to_string(),
             display_name: "Alice".to_string(),
             roles: vec!["analyst".to_string()],
+            subject: None,
+            email: None,
+            groups: vec![],
             catalog_token: Some(SecretString::new("ey-very-secret-jwt-value".to_string())),
             refresh_token: Some(SecretString::new("very-secret-refresh-token".to_string())),
             expires_at: None,

@@ -808,6 +808,17 @@ pub enum AuthProviderConfig {
         /// Default: `"realm_access.roles"`.
         #[serde(default = "default_roles_claim")]
         roles_claim: String,
+        /// JWT claim for the subject identifier (`sub`). Default: `"sub"`.
+        /// Distinct from `user_claim`/`user_id`; used to populate `Identity::subject`.
+        #[serde(default = "default_user_claim")]
+        subject_claim: String,
+        /// JWT claim path for the user's email address. Empty string disables extraction.
+        #[serde(default)]
+        email_claim: String,
+        /// Dot-separated JSON path to the groups array in the JWT payload.
+        /// Empty string disables extraction. Separate from `roles_claim`.
+        #[serde(default)]
+        groups_claim: String,
     },
     /// Generic OAuth2 client_credentials grant (e.g. Polaris service token).
     ClientCredentials {
@@ -846,7 +857,7 @@ pub enum AuthProviderConfig {
         /// Expected issuer (`iss` claim). Optional.
         #[serde(default)]
         issuer: Option<String>,
-        /// Expected audience (`aud` claim). Required by default — see
+        /// Expected audience (`aud` claim). Required by default; see
         /// `allow_unbounded_audience` for the explicit opt-out. Without
         /// audience binding, any JWT signed by the configured JWKS issuer
         /// would be accepted (confused-deputy across SaaS apps sharing
@@ -859,6 +870,17 @@ pub enum AuthProviderConfig {
         /// Dot-separated JSON path to roles. Default: `"realm_access.roles"`.
         #[serde(default = "default_roles_claim")]
         roles_claim: String,
+        /// JWT claim for the subject identifier (`sub`). Default: `"sub"`.
+        /// Distinct from `user_claim`/`user_id`; used to populate `Identity::subject`.
+        #[serde(default = "default_user_claim")]
+        subject_claim: String,
+        /// JWT claim path for the user's email address. Empty string disables extraction.
+        #[serde(default)]
+        email_claim: String,
+        /// Dot-separated JSON path to the groups array in the JWT payload.
+        /// Empty string disables extraction. Separate from `roles_claim`.
+        #[serde(default)]
+        groups_claim: String,
         /// Explicit opt-in to accept tokens with any audience. Default
         /// `false`: a missing/empty `audience` then errors at startup.
         /// Setting `true` acknowledges that tokens issued for any service
@@ -2274,6 +2296,50 @@ fn default_ranger_policy_cache_ttl_secs() -> u64 {
     30
 }
 
+/// Audit-log output configuration. Nested under `[metrics.audit]` in config files
+/// and via `SQE_METRICS__AUDIT__*` env overrides.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct AuditConfig {
+    /// Output format: "native" (canonical AuditEvent JSON), "ocsf", or "both".
+    #[serde(default = "default_audit_format")]
+    pub format: String,
+    /// Tag names that mark a column as GDPR-sensitive. Any column in a queried
+    /// Iceberg table whose tag set intersects this list has its identifier and
+    /// adjacent literal values removed from the logged SQL text. Empty list
+    /// disables GDPR column masking. Consumed at startup by the coordinator to
+    /// configure GDPR masking on the audit writer thread.
+    #[serde(default)]
+    pub gdpr_tags: Vec<String>,
+    /// How tagged column identifiers appear after masking: "tokenize" | "drop" | "keep".
+    /// "tokenize" replaces the identifier with a stable per-column token so log
+    /// lines remain correlatable without leaking the column name. Consumed at
+    /// startup alongside `gdpr_tags`.
+    #[serde(default = "default_gdpr_identifier_mode")]
+    pub gdpr_identifier_mode: String,
+    /// Log full result sets for debugging. NEVER enable in production.
+    #[serde(default)]
+    pub superdebug_log_results: bool,
+}
+
+fn default_audit_format() -> String {
+    "native".to_string()
+}
+
+fn default_gdpr_identifier_mode() -> String {
+    "tokenize".to_string()
+}
+
+impl Default for AuditConfig {
+    fn default() -> Self {
+        Self {
+            format: default_audit_format(),
+            gdpr_tags: Vec::new(),
+            gdpr_identifier_mode: default_gdpr_identifier_mode(),
+            superdebug_log_results: false,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct MetricsConfig {
     #[serde(default = "default_prometheus_port")]
@@ -2295,6 +2361,9 @@ pub struct MetricsConfig {
     /// WARN. Leave off to keep only /healthz, /readyz, /api/v1/status.
     #[serde(default)]
     pub web_ui: bool,
+    /// Audit-log format and GDPR knobs. See `AuditConfig` for field docs.
+    #[serde(default)]
+    pub audit: AuditConfig,
 }
 
 fn default_trace_sample_rate() -> f64 {
@@ -2310,6 +2379,7 @@ impl Default for MetricsConfig {
             trace_sample_rate: default_trace_sample_rate(),
             openlineage: OpenLineageConfig::default(),
             web_ui: false,
+            audit: AuditConfig::default(),
         }
     }
 }
@@ -3211,6 +3281,11 @@ impl SqeConfig {
         env_override_u16("SQE_METRICS__PROMETHEUS_PORT", &mut self.metrics.prometheus_port);
         env_override_str("SQE_METRICS__OTLP_ENDPOINT", &mut self.metrics.otlp_endpoint);
         env_override_str("SQE_METRICS__AUDIT_LOG_PATH", &mut self.metrics.audit_log_path);
+        env_override_str("SQE_METRICS__AUDIT__FORMAT", &mut self.metrics.audit.format);
+        env_override_bool(
+            "SQE_METRICS__AUDIT__SUPERDEBUG_LOG_RESULTS",
+            &mut self.metrics.audit.superdebug_log_results,
+        );
 
         // Metrics: OpenLineage
         env_override_bool(
@@ -3591,6 +3666,9 @@ mod tests {
             client_id: "sqe".to_string(),
             client_secret: "super-secret-value".to_string(),
             roles_claim: "realm_access.roles".to_string(),
+            subject_claim: "sub".to_string(),
+            email_claim: String::new(),
+            groups_claim: String::new(),
         };
         let dbg = format!("{cfg:?}");
         assert!(!dbg.contains("super-secret-value"), "leaked secret: {dbg}");
@@ -4487,6 +4565,7 @@ type = "aws"
                 client_id,
                 client_secret,
                 roles_claim,
+                ..
             } => {
                 assert_eq!(token_url, "https://idp.example.com/token");
                 assert_eq!(client_id, "sqe");
@@ -4516,6 +4595,87 @@ type = "aws"
                 assert_eq!(roles_claim, "realm_access.roles");
             }
             other => panic!("Expected OidcPassword, got: {other:?}"),
+        }
+    }
+
+    /// Task 9: subject_claim/email_claim/groups_claim must round-trip through
+    /// TOML for both `oidc_password` and `bearer_token` variants.
+    /// When omitted, email_claim and groups_claim default to empty string;
+    /// subject_claim defaults to "sub".
+    #[test]
+    fn auth_provider_config_claim_fields_toml_round_trip() {
+        // Case 1: explicit values in oidc_password
+        let with_claims = r#"
+            type = "oidc_password"
+            token_url = "https://idp.example.com/token"
+            client_id = "sqe"
+            email_claim = "email"
+            groups_claim = "groups"
+        "#;
+        let config: AuthProviderConfig = toml::from_str(with_claims).unwrap();
+        match config {
+            AuthProviderConfig::OidcPassword {
+                email_claim,
+                groups_claim,
+                subject_claim,
+                ..
+            } => {
+                assert_eq!(email_claim, "email", "email_claim should be 'email'");
+                assert_eq!(groups_claim, "groups", "groups_claim should be 'groups'");
+                assert_eq!(subject_claim, "sub", "subject_claim should default to 'sub'");
+            }
+            other => panic!("Expected OidcPassword, got: {other:?}"),
+        }
+
+        // Case 2: omitted claim fields default to empty (oidc_password)
+        let omitted_claims = r#"
+            type = "oidc_password"
+            token_url = "https://idp.example.com/token"
+            client_id = "sqe"
+        "#;
+        let config: AuthProviderConfig = toml::from_str(omitted_claims).unwrap();
+        match config {
+            AuthProviderConfig::OidcPassword {
+                email_claim,
+                groups_claim,
+                subject_claim,
+                ..
+            } => {
+                assert_eq!(email_claim, "", "email_claim should default to empty");
+                assert_eq!(groups_claim, "", "groups_claim should default to empty");
+                assert_eq!(subject_claim, "sub", "subject_claim should default to 'sub'");
+            }
+            other => panic!("Expected OidcPassword, got: {other:?}"),
+        }
+
+        // Case 3: explicit values in bearer_token
+        let bearer_with_claims = r#"
+            type = "bearer_token"
+            jwks_url = "https://idp.example.com/.well-known/jwks.json"
+            allow_insecure_jwks = true
+            allow_unbounded_audience = true
+            email_claim = "email"
+            groups_claim = "groups"
+        "#;
+        let config: AuthProviderConfig = toml::from_str(bearer_with_claims).unwrap();
+        match config {
+            AuthProviderConfig::BearerToken {
+                email_claim,
+                groups_claim,
+                subject_claim,
+                ..
+            } => {
+                assert_eq!(email_claim, "email", "bearer email_claim should be 'email'");
+                assert_eq!(
+                    groups_claim, "groups",
+                    "bearer groups_claim should be 'groups'"
+                );
+                assert_eq!(
+                    subject_claim, "sub",
+                    "bearer subject_claim should default to 'sub'"
+                );
+            }
+            other => panic!("Expected BearerToken, got: {other:?}"),
         }
     }
 
@@ -4920,6 +5080,9 @@ otlp_endpoint = ""
                 client_id: "sqe".to_string(),
                 client_secret: "toml-secret".to_string(),
                 roles_claim: "realm_access.roles".to_string(),
+                subject_claim: "sub".to_string(),
+                email_claim: String::new(),
+                groups_claim: String::new(),
             },
             AuthProviderConfig::ClientCredentials {
                 token_endpoint: "http://polaris:8181/oauth/tokens".to_string(),
@@ -5640,5 +5803,14 @@ mod ranger_config_tests {
         assert_eq!(c.service_name, "hive");
         assert_eq!(c.admin_user, "admin");
         assert_eq!(c.cache_ttl_secs, 30);
+    }
+
+    #[test]
+    fn audit_config_defaults_are_back_compatible() {
+        let c = AuditConfig::default();
+        assert_eq!(c.format, "native");
+        assert!(c.gdpr_tags.is_empty());
+        assert_eq!(c.gdpr_identifier_mode, "tokenize");
+        assert!(!c.superdebug_log_results);
     }
 }
