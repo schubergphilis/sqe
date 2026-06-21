@@ -6,6 +6,7 @@
 #   ./run.sh             # cdk deploy -> up -> queries -> down -> empty -> cdk destroy
 #   ./run.sh --keep      # leave SQE up and the bucket deployed
 #   ./run.sh --destroy   # just tear down
+#   ./run.sh --check     # same as default, plus assert the key invariants before teardown
 #
 # Prereqs: Docker, Node + npx, AWS CLI v2, AWS credentials (AWS_PROFILE or
 # AWS_* env), and a cdk-bootstrapped account.
@@ -13,12 +14,13 @@ set -euo pipefail
 cd "$(dirname "$0")"
 . ../_shared/lib.sh
 
-KEEP=0; DESTROY_ONLY=0
+KEEP=0; DESTROY_ONLY=0; CHECK=0
 for a in "$@"; do
   case "$a" in
     --keep) KEEP=1 ;;
     --destroy) DESTROY_ONLY=1 ;;
-    *) die "unknown arg: $a (use --keep or --destroy)" ;;
+    --check) CHECK=1 ;;
+    *) die "unknown arg: $a (use --keep, --destroy, or --check)" ;;
   esac
 done
 
@@ -69,6 +71,11 @@ ok "sqe healthy"
 
 OUT=OUTPUT.md
 step "running create/write/read round-trip, capturing to $OUT"
+# `|| true` so a failing query (--stop-on-error returns non-zero) does not abort
+# the script under `set -e` -- we still want to capture the output, assert on it,
+# and tear the stack down rather than leak it.
+QUERY_OUT="$(docker compose exec -T -e SQE_PASSWORD=anonymous sqe \
+  sqe-cli --port 50051 --user anonymous --file /queries.sql --stop-on-error 2>&1 || true)"
 {
   echo "# Captured output"
   echo
@@ -78,14 +85,29 @@ step "running create/write/read round-trip, capturing to $OUT"
   echo
   echo '`sqe-cli --user anonymous --file queries.sql` over Flight SQL:'
   echo '```'
-  docker compose exec -T -e SQE_PASSWORD=anonymous sqe \
-    sqe-cli --port 50051 --user anonymous --file /queries.sql --stop-on-error 2>&1
+  echo "$QUERY_OUT"
   echo '```'
 } | tee "$OUT"
 ok "captured to $OUT"
 
 if [ "$KEEP" -eq 1 ]; then
   echo; ok "left running (--keep). Tear down with: ./run.sh --destroy"
+  exit 0
+fi
+
+if [ "$CHECK" -eq 1 ]; then
+  step "checking invariants (reusing the captured queries.sql output)"
+  # OUTPUT.md shows the aggregate over the round-trip: purchase -> 55.25, click
+  # -> 2.25, and no engine error. The DDL lines emit (0 rows), so assert on the
+  # row-value markers, never assert_not_empty.
+  assert_contains     "s3tables aggregate shows purchase total" "$QUERY_OUT" "55.25"
+  assert_contains     "s3tables aggregate shows click total"    "$QUERY_OUT" "2.25"
+  assert_contains     "s3tables aggregate shows purchase row"   "$QUERY_OUT" "purchase"
+  assert_not_contains "s3tables run has no error"               "$QUERY_OUT" "error"
+  # Tear down before check_summary: check_summary dies on a failed assertion, so
+  # summarizing first would leak the deployed S3 Tables bucket.
+  destroy
+  check_summary
   exit 0
 fi
 destroy
