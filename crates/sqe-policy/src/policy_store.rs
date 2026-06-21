@@ -132,6 +132,9 @@ mod tests {
         let user = SessionUser {
             username: "alice".to_string(),
             roles: vec![],
+            subject: None,
+            email: None,
+            groups: vec![],
         };
         let resolved = store.resolve(&user, "employees", "hr").await.unwrap();
         assert_eq!(resolved.restricted_columns, vec!["ssn"]);
@@ -143,6 +146,9 @@ mod tests {
         let user = SessionUser {
             username: "alice".to_string(),
             roles: vec![],
+            subject: None,
+            email: None,
+            groups: vec![],
         };
         let resolved = store.resolve(&user, "orders", "sales").await.unwrap();
         assert!(resolved.row_filters.is_empty());
@@ -162,6 +168,9 @@ mod tests {
         let user = SessionUser {
             username: "bob".to_string(),
             roles: vec!["analyst".to_string()],
+            subject: None,
+            email: None,
+            groups: vec![],
         };
         let resolved = store.resolve(&user, "employees", "hr").await.unwrap();
         assert_eq!(resolved.restricted_columns, vec!["salary"]);
@@ -179,6 +188,9 @@ mod tests {
         let user = SessionUser {
             username: "charlie".to_string(),
             roles: vec!["viewer".to_string()],
+            subject: None,
+            email: None,
+            groups: vec![],
         };
         let resolved = store.resolve(&user, "employees", "hr").await.unwrap();
         assert!(resolved.restricted_columns.is_empty());
@@ -203,6 +215,9 @@ mod tests {
         let user = SessionUser {
             username: "dave".to_string(),
             roles: vec!["analyst".to_string()],
+            subject: None,
+            email: None,
+            groups: vec![],
         };
         let resolved = store.resolve(&user, "employees", "hr").await.unwrap();
         // Table-specific policy wins; salary should NOT be restricted, ssn and dob should be
@@ -224,6 +239,9 @@ mod tests {
         let user = SessionUser {
             username: "eve".to_string(),
             roles: vec!["viewer".to_string(), "analyst".to_string()],
+            subject: None,
+            email: None,
+            groups: vec![],
         };
         let resolved = store.resolve(&user, "employees", "hr").await.unwrap();
         assert_eq!(resolved.restricted_columns, vec!["salary"]);
@@ -251,6 +269,9 @@ mod tests {
         let user = SessionUser {
             username: "frank".to_string(),
             roles: vec!["analyst".to_string(), "restricted".to_string()],
+            subject: None,
+            email: None,
+            groups: vec![],
         };
         let resolved = store.resolve(&user, "employees", "hr").await.unwrap();
         // Union of both role policies, deduped.
@@ -285,10 +306,16 @@ mod tests {
         let forward = SessionUser {
             username: "u1".to_string(),
             roles: vec!["a".to_string(), "b".to_string()],
+            subject: None,
+            email: None,
+            groups: vec![],
         };
         let reverse = SessionUser {
             username: "u2".to_string(),
             roles: vec!["b".to_string(), "a".to_string()],
+            subject: None,
+            email: None,
+            groups: vec![],
         };
         let mut f = store
             .resolve(&forward, "t", "ns")
@@ -312,6 +339,9 @@ mod tests {
         let user = SessionUser {
             username: "alice".to_string(),
             roles: vec![],
+            subject: None,
+            email: None,
+            groups: vec![],
         };
         let resolved = store.resolve(&user, "t", "ns").await.unwrap();
         assert!(resolved.row_filters.is_empty());

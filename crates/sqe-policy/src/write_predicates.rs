@@ -148,6 +148,9 @@ mod tests {
         SessionUser {
             username: name.to_string(),
             roles: vec![],
+            subject: None,
+            email: None,
+            groups: vec![],
         }
     }
 

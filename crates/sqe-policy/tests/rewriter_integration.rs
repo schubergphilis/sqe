@@ -32,6 +32,9 @@ fn user(name: &str, roles: &[&str]) -> SessionUser {
     SessionUser {
         username: name.to_string(),
         roles: roles.iter().map(|r| r.to_string()).collect(),
+        subject: None,
+        email: None,
+        groups: vec![],
     }
 }
 
