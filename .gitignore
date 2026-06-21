@@ -32,3 +32,6 @@ docs/neuw84-submission/
 
 # Generated mdBook output (build-dir resolves here; docs.getsqe.com builds from the docs-website repo)
 /docs/target/
+
+# Subagent-driven-development scratch (ledger, briefs, reports)
+.superpowers/
