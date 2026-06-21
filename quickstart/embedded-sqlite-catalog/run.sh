@@ -6,14 +6,17 @@
 #
 #   ./run.sh            # create+write (process 1), then reopen+read (process 2)
 #   ./run.sh --clean    # delete the local ./warehouse first, then run
+#   ./run.sh --check    # run, then assert the persisted read returns the rows
 set -euo pipefail
 cd "$(dirname "$0")"
 . ../_shared/lib.sh
 
+CHECK=0
 for a in "$@"; do
   case "$a" in
     --clean) rm -rf warehouse ;;
-    *) die "unknown arg: $a (use --clean)" ;;
+    --check) CHECK=1 ;;
+    *) die "unknown arg: $a (use --clean or --check)" ;;
   esac
 done
 
@@ -53,3 +56,20 @@ step "process 1: create + write; process 2: reopen + read (capturing to $OUT)"
   echo '```'
 } | tee "$OUT"
 ok "captured to $OUT. The catalog persists in ./warehouse; re-run to query again, or ./run.sh --clean to reset."
+
+if [ "$CHECK" -eq 1 ]; then
+  step "checking invariants (a separate process reopens the persisted warehouse)"
+
+  # Process 2: a fresh embedded invocation reopens the same SQLite-backed
+  # warehouse and reads back what process 1 wrote. Bare SELECT aggregate, so
+  # assert on the persisted purchase total from OUTPUT.md.
+  read_out=$(docker run --rm --entrypoint sqe-cli -v "$WH":/data/wh \
+    "$IMG" --embedded --warehouse /data/wh \
+    -e "SELECT kind, COUNT(*) AS n, ROUND(SUM(amount),2) AS total FROM iceberg.demo.events GROUP BY kind ORDER BY total DESC" 2>&1)
+  assert_not_empty   "persisted read returns rows"        "$read_out"
+  assert_contains    "persisted read shows purchase total" "$read_out" "55.25"
+  assert_not_contains "persisted read has no error"        "$read_out" "error"
+
+  check_summary
+  exit 0
+fi

@@ -6,14 +6,17 @@
 #
 #   ./run.sh            # seed two catalogs, then attach both + cross-catalog JOIN
 #   ./run.sh --clean    # reset ./catalogs first
+#   ./run.sh --check    # run, then assert the cross-catalog JOIN returns rows
 set -euo pipefail
 cd "$(dirname "$0")"
 . ../_shared/lib.sh
 
+CHECK=0
 for a in "$@"; do
   case "$a" in
     --clean) rm -rf catalogs ;;
-    *) die "unknown arg: $a (use --clean)" ;;
+    --check) CHECK=1 ;;
+    *) die "unknown arg: $a (use --clean or --check)" ;;
   esac
 done
 
@@ -52,3 +55,22 @@ step "seeding two catalogs, then attaching both for a cross-catalog JOIN (-> $OU
   echo '```'
 } | tee "$OUT"
 ok "captured to $OUT. Both catalogs persist under ./catalogs; ./run.sh --clean to reset."
+
+if [ "$CHECK" -eq 1 ]; then
+  step "checking invariants (re-running the cross-catalog JOIN over both warehouses)"
+
+  # Attach both warehouses and JOIN sales.orders against ref.regions. Bare SELECT
+  # aggregate, so assert on the region name and total from OUTPUT.md.
+  join_out=$(docker run --rm --entrypoint sqe-cli -v "$S":/d/sales -v "$R":/d/ref \
+    "$IMG" --embedded --catalog sales=/d/sales --catalog ref=/d/ref \
+    -e "SELECT r.name, COUNT(*) AS n, ROUND(SUM(o.amount),2) AS total \
+        FROM sales.public.orders o JOIN ref.public.regions r ON o.region_id = r.region_id \
+        GROUP BY r.name ORDER BY total DESC" 2>&1)
+  assert_not_empty   "cross-catalog JOIN returns rows"   "$join_out"
+  assert_contains    "JOIN resolves the EU region"       "$join_out" "EU"
+  assert_contains    "JOIN sums the EU total"            "$join_out" "49.25"
+  assert_not_contains "JOIN has no error"                "$join_out" "error"
+
+  check_summary
+  exit 0
+fi
