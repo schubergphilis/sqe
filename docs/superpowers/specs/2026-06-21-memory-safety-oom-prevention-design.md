@@ -28,7 +28,9 @@ Guarantee that no query can OOM a worker or the coordinator, holding at roughly 
 - Spill on every pipeline breaker: hash-join build, hash aggregate, sort (including the sort-on-write `can_spill=false` fix), and the shuffle receiver buffers.
 - A per-query minimum memory floor plus a minimal admission cap (floor availability and max-concurrent), nothing more.
 - A fail-query-not-cluster error path with clean resource reclaim and an audit event.
-- Observability: node memory utilization, bytes spilled, queries killed by memory, admissions rejected.
+- Metrics and structured logging: node memory utilization, bytes spilled, queries killed by memory, admissions rejected, plus structured log lines and OCSF audit events on kills and rejections.
+- Web interface surfacing of the above, extending the existing web UI (`2026-06-01-sqe-web-ui-design.md`): cluster memory and pressure, per-query memory and spill, admission state.
+- Fully configurable through the existing `QueryConfig`, with auto-tuned defaults that preserve today's behavior and add no overhead to small or uncontended deployments.
 
 ### Out of scope (deferred)
 
@@ -83,9 +85,26 @@ These are SQE variants over SQE's own `SqeError` surface, not Ballista's enum im
 
 Critical correctness rule, drawn directly from the Ballista failure that decided its wind-down: a query-level error must never be misclassified as a node failure. In Ballista, a task `InvalidArgument` evicted the whole executor and degraded the cluster. Here, `MemoryExhausted` fails one query and leaves the node serving, and only the shuffle-data-loss class is allowed to count against a node.
 
-### 6. Observability
+### 6. Observability (metrics, logging, web interface)
 
-Prometheus gauges and counters via `sqe-metrics`: node memory utilization, bytes spilled, queries killed by memory, admissions rejected. EXPLAIN ANALYZE already surfaces `spill_count`, `spilled_bytes`, and `spilled_rows` (`sqe-coordinator/src/explain.rs`); this lifts them to cluster telemetry. The per-query and per-stage telemetry shapes (akin to Ballista's `QueryStageSummary` and `TaskSummary`) extend the existing web UI spec (`2026-06-01-sqe-web-ui-design.md`) rather than introducing a new UI here.
+Observability is a first-class deliverable of this spec, in three layers over one shared data source. The `NodeMemoryGovernor`, `AdmissionGate`, and `QueryAbortPath` each emit a small, well-defined set of counters and events; metrics, logs, and the web UI are three renderings of that one source, not three parallel data paths. This reuses the pressure model already in `sqe-coordinator/src/memory.rs` (the 85 to 95 percent high-pressure band) and the existing `coordinator_memory_limit_bytes` gauge.
+
+Metrics (Prometheus via `sqe-metrics`):
+- Gauges: node memory pool used and limit bytes, utilization fraction, pressure level, current admitted concurrency, admission queue depth, open spill files.
+- Counters: bytes spilled total, queries killed by memory total, admissions rejected total, stage-plan-cache hits and misses.
+EXPLAIN ANALYZE already surfaces `spill_count`, `spilled_bytes`, and `spilled_rows` (`sqe-coordinator/src/explain.rs`); these are the per-query view, now lifted to cluster-level gauges and counters.
+
+Logging:
+- A structured warn line on every memory kill (query id, user, node, operator, bytes requested versus available, bytes spilled, reason), mirrored as an OCSF audit event.
+- A structured info line on admission rejection (reason, current concurrency, queue depth) and on first spill per query (so spill onset is visible without per-batch noise).
+- Log volume is bounded by being per-query-event, not per-batch, so high concurrency does not flood the log.
+
+Web interface (extends `2026-06-01-sqe-web-ui-design.md`, rendered from the same data):
+- A cluster memory panel: per-node utilization and pressure level, total bytes spilled, open spill files.
+- The query list gains memory-used, spilled-bytes, and state (running, spilling, killed) columns.
+- An admission view: current concurrency against the cap, queue depth, recent rejections.
+- A killed-queries view: recent memory kills with reason and bytes.
+- Per-query detail gains stage-level memory and spill, using telemetry shapes adapted from Ballista's `QueryStageSummary` and `TaskSummary`, which map onto SQE's `QueryRecord`, `FragmentInfo`, and `WorkerState`. The UI is a rendering layer; the data contract is defined here.
 
 ### 7. EncodedStagePlanCache (concurrency hot-path)
 
@@ -106,6 +125,28 @@ At 100 to 300 concurrent queries with multi-stage plans, the coordinator re-seri
 - Clear client message plus an OCSF audit event with query id, user, bytes spilled, and kill reason.
 - Coordinator parity. The coordinator final stage is a governed node; final-stage exhaustion fails the one query identically and never the process.
 
+## Configuration and small-deployment behavior
+
+Guiding principle: no new mandatory configuration, sensible auto-tuned defaults, and every mechanism is pressure-triggered, so a small or uncontended deployment pays nothing and behaves exactly as it does today. The machinery only activates when memory is actually scarce or concurrency is actually high.
+
+All knobs extend the existing `QueryConfig` (kebab-case TOML, `crates/sqe-core/src/config.rs`), which already carries `max-concurrent-queries`, `max-concurrent-per-user`, `per-user-memory-budget`, and `max-query-memory`. New fields, each `#[serde(default)]`:
+
+- `memory-headroom-fraction`. Fraction of node memory held back from the pool. Default auto-derives the pool size from the detected cgroup or container memory limit minus this headroom, so a worker pod sizes itself without operator input.
+- `per-query-memory-floor`. The guaranteed minimum reservation. Default `0` means auto: derive from pool size and the concurrency cap, with a small absolute minimum. Operators can pin an absolute value for predictable clusters.
+- `spill-enabled` (default true) and `spill-dir`. The local scratch path for spill and disk-backed shuffle. Default is the system temp dir; production sets it to the NVMe mount. Provisioned by Rafael's Helm and operator work.
+- `stage-plan-cache-entries`. Bounded entry count for `EncodedStagePlanCache`. Default small; `0` disables, so the cache never grows on a tiny install.
+
+The reused fields keep their current defaults, so existing config files are unchanged and valid.
+
+How small usage stays unaffected, mechanism by mechanism:
+
+- `NodeMemoryGovernor`. The shared pool is the `FairSpillPool` SQE already runs; this spec adds the floor and admission accounting around it. With RAM well above working set, the ceiling is never hit, so the governor is a few atomic counters on the reservation path and nothing more.
+- `AdmissionGate`. When concurrency is below the cap and the floor is available, `try_admit` is a fast pass-through with no queueing. Queueing only happens under genuine pressure.
+- `SpillableShuffleReceiver`. Stays in-memory until a partition buffer exceeds budget. On a small or uncontended run it never spills, so behavior is byte-for-byte identical to today's in-memory shuffle.
+- `EncodedStagePlanCache`. Bounded and optional. Disabled or tiny on small installs, where the dispatch path is not hot anyway.
+
+Two documented profiles ship as guidance, not as required config: a default single-node or development profile (today's behavior, mechanisms dormant) and a production cluster profile (explicit caps, NVMe spill dir, floor pinned), with recommended values for Chameleon worker pods.
+
 ## Ballista learnings applied
 
 The guiding rule: take every smart idea, make each one SQE's own. The prior attempt to adopt Ballista wholesale pulled SQE away from its own backend, codec, scheduler, and per-task STS credential model, because Ballista welds its scheduler to its executor and shuffle protocol. Lifting patterns into our existing types costs none of that. Source references below point into Ballista 53 and `docs/ballista-evaluation-learnings.md` for whoever implements each.
@@ -123,9 +164,9 @@ Adopted in spirit, lightly, because disk-backed shuffle enables them and subsyst
 - Resolved/UnResolved stage state (`ballista-scheduler/src/state/execution_stage.rs`). Modeling "inputs not yet ready" as a first-class, `resolvable()`-gated state. With shuffle now materializable, a downstream stage's inputs being ready or not becomes explicit, which both the `AdmissionGate` (do not seat a stage whose inputs are not ready) and future stage retry can use. We note the state shape now; we do not build the full machine in this spec.
 - Per-partition attempt tracking (`Vec<usize>` of failure counts alongside the task list). The structure the `counts_to_failure` flag will drive in subsystem D. SQE's existing `FragmentInfo` is the place to adopt the shape when D lands.
 
-Deferred to the web UI spec (`2026-06-01-sqe-web-ui-design.md`), data contract noted here:
+Adopted for the web interface (built in this spec against the framework from `2026-06-01-sqe-web-ui-design.md`):
 
-- The REST observability shapes (`JobResponse`, `QueryStageSummary`, `TaskSummary`, `ExecutorResponse` with per-stage task duration and input-row percentiles) map almost one-to-one onto SQE's `QueryRecord`, `FragmentInfo`, and `WorkerState`. Component 6's memory and spill telemetry should populate these shapes so the future UI is a rendering layer, not a new data path. The DOT/SVG stage-graph export is a low-effort plan-visualization add for that UI.
+- The REST observability shapes (`JobResponse`, `QueryStageSummary`, `TaskSummary`, `ExecutorResponse` with per-stage task duration and input-row percentiles) map almost one-to-one onto SQE's `QueryRecord`, `FragmentInfo`, and `WorkerState`. Component 6 populates these shapes so the UI is a rendering layer, not a new data path. The DOT/SVG stage-graph export is a low-effort plan-visualization add for the per-query detail view.
 
 Deliberately not taken:
 
@@ -139,6 +180,8 @@ Deliberately not taken:
 - Concurrency soak (the headline gate). 100 to 300 concurrent queries on a memory-constrained cluster, asserting zero process OOM-kills (no SIGKILL); every query either completes or fails with a typed error.
 - Blast-radius. One deliberately oversized query among many small ones, asserting only the big one fails and all small ones complete.
 - Leak check. After kills, spill files are deleted and pool reservations are back to zero.
+- Small-deployment no-regression. With default config on a single node and RAM well above working set, assert no spill occurs, admission never queues, results and timings match a pre-change baseline, and the added per-reservation overhead is negligible. The guarantee that small usage is unaffected must be tested, not assumed.
+- Configuration. Auto-tuned defaults derive a sane pool size and floor from a simulated cgroup memory limit; existing config files remain valid; `stage-plan-cache-entries = 0` and `spill-enabled = false` behave as documented.
 
 ## Success criteria
 
