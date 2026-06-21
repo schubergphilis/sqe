@@ -1287,6 +1287,9 @@ mod tests {
         let user = SessionUser {
             username: "bob".to_string(),
             roles: vec![],
+            subject: None,
+            email: None,
+            groups: vec![],
         };
 
         let (rewritten, _summary) = rewriter
@@ -1309,6 +1312,9 @@ mod tests {
         sqe_core::session::SessionUser {
             username: "alice".to_string(),
             roles: roles.iter().map(|r| r.to_string()).collect(),
+            subject: None,
+            email: None,
+            groups: vec![],
         }
     }
 

@@ -908,6 +908,9 @@ mod tests {
         SessionUser {
             username: name.to_string(),
             roles: roles.iter().map(|s| s.to_string()).collect(),
+            subject: None,
+            email: None,
+            groups: vec![],
         }
     }
 
