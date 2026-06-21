@@ -4,14 +4,17 @@
 #
 #   ./run.sh             # up -> queries -> assert metrics scraped -> capture
 #   ./run.sh --down      # tear everything down
+#   ./run.sh --check     # up -> queries -> assert metrics scraped (exit code)
 set -euo pipefail
 cd "$(dirname "$0")"
 . ../_shared/lib.sh
 
+CHECK=0
 for a in "$@"; do
   case "$a" in
     --down) require docker; step "tearing down"; docker compose down -v; ok "done"; exit 0 ;;
-    *) die "unknown arg: $a (use --down)" ;;
+    --check) CHECK=1 ;;
+    *) die "unknown arg: $a (use --down or --check)" ;;
   esac
 done
 
@@ -68,5 +71,27 @@ q() { curl -s "$VM/api/v1/query?query=$1" 2>/dev/null | python3 -c "import sys,j
   echo "Grafana (admin/admin): $GRAFANA  -- the provisioned \"SQE Overview\" dashboard"
 } | tee "$OUT"
 ok "captured to $OUT"
+
+if [ "$CHECK" -eq 1 ]; then
+  step "checking invariants (SQE raw /metrics + VictoriaMetrics scrape target)"
+
+  # Load-bearing: SQE's own /metrics endpoint exposes the sqe_* family. This is
+  # reliable the moment the coordinator is up. sqe_rows_returned_total is the
+  # metric the demo queries above increment (see OUTPUT.md).
+  raw_out=$(docker compose exec -T sqe sh -lc "curl -s http://localhost:9090/metrics | grep -E '^sqe_'" 2>&1)
+  assert_not_empty "SQE exposes sqe_* metrics"          "$raw_out"
+  assert_contains  "raw /metrics has sqe_rows_returned_total" "$raw_out" "sqe_rows_returned_total"
+  assert_contains  "raw /metrics has sqe_active_sessions"     "$raw_out" "sqe_active_sessions"
+
+  # End-to-end proof: VictoriaMetrics has scraped the coordinator (up == 1). The
+  # poll above already waited for the sample; treat this as a softer end-to-end
+  # confirmation alongside the load-bearing raw check.
+  up_out=$(q 'up%7Bjob%3D%22sqe-coordinator%22%7D')
+  assert_contains "VictoriaMetrics scrapes sqe-coordinator (up=1)" "$up_out" "1"
+
+  check_summary
+  exit 0
+fi
+
 echo
 ok "done. Grafana $GRAFANA, VictoriaMetrics $VM. Tear down: ./run.sh --down"
