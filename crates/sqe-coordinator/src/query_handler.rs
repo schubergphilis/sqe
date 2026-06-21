@@ -1511,11 +1511,13 @@ impl QueryHandler {
             // chain stamping. No secrets travel in GRANT/REVOKE SQL so the
             // redacted-legacy path is not required for these statement kinds.
             //
-            // All other statement kinds (DDL, DML, admin) remain on the legacy
-            // log(&AuditEntry) path. That path applies PII redaction before
-            // writing, which is critical for CREATE SECRET statements that carry
-            // bearer tokens in their SQL text. Migrating those kinds is a
-            // separate task once caller-side redaction for log_event is in place.
+            // Secret-bearing kinds (CREATE/DROP/SHOW SECRET, ATTACH, DETACH)
+            // stay on the legacy log(&AuditEntry) path: it applies PII redaction
+            // before writing, which is critical for statements that carry bearer
+            // tokens or credentials in their SQL text. All other DDL/DML/admin
+            // kinds emit canonical AuditEvents via log_event (the worker thread
+            // redacts query text there too); DML maps to Query, the rest to
+            // AdminDdl.
             if matches!(&kind, StatementKind::Query(_)) {
                 let ps = policy_summary.unwrap_or_default();
 
