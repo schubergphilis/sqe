@@ -80,6 +80,7 @@
 - [x] dbt adapter (dbt-sqe via ADBC Flight SQL)
 - [x] OpenTelemetry + Prometheus + JSON audit log + `system.runtime.queries` virtual table
 - [x] OCSF audit logging (sub-project A): canonical `AuditEvent` + OCSF class mapping (6005/3002/3003/3001/3004), identity enrichment (subject/email/groups claims), GDPR-tag masking (tokenize/drop/keep modes), tamper-evident hash chain. Policy-decision recorded on query event (deny outcome); circuit-breaker events deferred. See `docs/site/book/src/operations/audit-logging.md`.
+- [x] SIEM export (sub-project B): canonical coverage extended to Flight streaming SELECTs + DML/DDL; durable OCSF JSONL spool; background OTLP shipper with seq-cursor at-least-once delivery; OCSF->LogRecord mapping with indexed attributes; five export metrics. Deferred: spool rotation/retention (only `max_spool_bytes` WARN), Kafka target. See `docs/site/book/src/operations/audit-logging.md`.
 - [x] OpenLineage 2-0-2 emitter (`sqe-lineage` crate; column-level lineage on INSERT/CTAS/MERGE/UPDATE/DELETE/DDL; file + HTTP sinks; disk-spool fallback; off by default). See `docs/book/src/operations/openlineage.md`.
 - [x] OSS release preparation (Apache 2.0, CONTRIBUTING.md, docs)
 
