@@ -27,6 +27,13 @@ pub struct OidcPasswordProviderConfig {
     /// Dot-separated JSON path to the roles array in the JWT payload.
     /// Default: `"realm_access.roles"` (Keycloak convention).
     pub roles_claim: String,
+    /// JWT claim to extract as the canonical subject identifier.
+    /// Default: `"sub"`. Set to empty to disable subject extraction.
+    pub subject_claim: String,
+    /// JWT claim to extract as the email address. Default: `""` (disabled).
+    pub email_claim: String,
+    /// Dot-separated JSON path to the groups array. Default: `""` (disabled).
+    pub groups_claim: String,
     /// Whether to skip TLS certificate verification (dev/test only).
     pub accept_invalid_certs: bool,
 }
@@ -38,6 +45,9 @@ impl Default for OidcPasswordProviderConfig {
             client_id: String::new(),
             client_secret: String::new(),
             roles_claim: "realm_access.roles".to_string(),
+            subject_claim: "sub".to_string(),
+            email_claim: String::new(),
+            groups_claim: String::new(),
             accept_invalid_certs: false,
         }
     }
@@ -182,6 +192,18 @@ impl OidcPasswordProvider {
         claims.get("sub").and_then(|v| v.as_str()).map(String::from)
     }
 
+    /// Extract a scalar string claim by dot-separated path from a JWT payload.
+    ///
+    /// Returns `None` when the path is missing or the value is not a string.
+    fn extract_claim_str(access_token: &str, claim_path: &str) -> Option<String> {
+        let claims = Self::decode_jwt_payload(access_token)?;
+        let mut current = &claims;
+        for segment in claim_path.split('.') {
+            current = current.get(segment)?;
+        }
+        current.as_str().map(String::from)
+    }
+
     /// Extract roles from a JWT payload using a dot-separated claim path.
     ///
     /// For example, `"realm_access.roles"` navigates to `{"realm_access": {"roles": [...]}}`.
@@ -270,6 +292,24 @@ impl AuthProvider for OidcPasswordProvider {
         let roles =
             Self::extract_roles_from_claim(&token_response.access_token, &self.config.roles_claim);
 
+        let subject = if self.config.subject_claim.is_empty() {
+            None
+        } else {
+            Self::extract_claim_str(&token_response.access_token, &self.config.subject_claim)
+        };
+
+        let email = if self.config.email_claim.is_empty() {
+            None
+        } else {
+            Self::extract_claim_str(&token_response.access_token, &self.config.email_claim)
+        };
+
+        let groups = if self.config.groups_claim.is_empty() {
+            vec![]
+        } else {
+            Self::extract_roles_from_claim(&token_response.access_token, &self.config.groups_claim)
+        };
+
         let expires_at = chrono::Utc::now()
             .checked_add_signed(chrono::Duration::seconds(token_response.expires_in as i64));
 
@@ -277,6 +317,9 @@ impl AuthProvider for OidcPasswordProvider {
             user_id: user_id.clone(),
             display_name: user_id,
             roles,
+            subject,
+            email,
+            groups,
             catalog_token: Some(sqe_core::SecretString::new(token_response.access_token)),
             refresh_token: token_response.refresh_token.map(sqe_core::SecretString::new),
             expires_at,
@@ -459,6 +502,9 @@ mod tests {
             client_id: "sqe".to_string(),
             client_secret: "secret".to_string(),
             roles_claim: "realm_access.roles".to_string(),
+            subject_claim: "sub".to_string(),
+            email_claim: String::new(),
+            groups_claim: String::new(),
             accept_invalid_certs: false,
         };
         assert!(OidcPasswordProvider::new(config).is_ok());

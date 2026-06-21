@@ -46,6 +46,15 @@ pub struct BearerTokenProviderConfig {
     /// Dot-separated JSON path to the roles array in the JWT payload.
     /// Default: `"realm_access.roles"`.
     pub roles_claim: String,
+    /// JWT claim to extract as the canonical subject identifier.
+    /// Default: `"sub"`. Set to empty to disable subject extraction.
+    pub subject_claim: String,
+    /// JWT claim to extract as the email address. Default: `""` (disabled).
+    /// Set to `"email"` (or a custom path) to populate `Identity.email`.
+    pub email_claim: String,
+    /// Dot-separated JSON path to the groups array in the JWT payload.
+    /// Default: `""` (disabled). Separate from `roles_claim`.
+    pub groups_claim: String,
     /// Accept invalid TLS certificates (self-signed, expired, wrong hostname).
     /// Set `true` for development/Docker environments with self-signed certs.
     pub accept_invalid_certs: bool,
@@ -72,6 +81,9 @@ impl Default for BearerTokenProviderConfig {
             audience: None,
             user_claim: "sub".to_string(),
             roles_claim: "realm_access.roles".to_string(),
+            subject_claim: "sub".to_string(),
+            email_claim: String::new(),
+            groups_claim: String::new(),
             accept_invalid_certs: false,
             allow_unbounded_audience: false,
             allow_insecure_jwks: false,
@@ -475,9 +487,16 @@ impl BearerTokenProvider {
             .map(String::from)
     }
 
-    /// Extract roles from JWT claims using the configured `roles_claim` path.
-    fn extract_roles(claims: &serde_json::Value, roles_claim: &str) -> Vec<String> {
-        Self::extract_claim_by_path(claims, roles_claim)
+    /// Extract a string list from JWT claims using a dot-separated path.
+    ///
+    /// Returns an empty `Vec` when `path` is empty or the claim is missing/not
+    /// an array. Used by both `extract_roles` and groups extraction so they
+    /// share one traversal helper (DRY).
+    pub(crate) fn extract_string_list(claims: &serde_json::Value, path: &str) -> Vec<String> {
+        if path.is_empty() {
+            return Vec::new();
+        }
+        Self::extract_claim_by_path(claims, path)
             .and_then(|v| v.as_array())
             .map(|arr| {
                 arr.iter()
@@ -485,6 +504,11 @@ impl BearerTokenProvider {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// Extract roles from JWT claims using the configured `roles_claim` path.
+    fn extract_roles(claims: &serde_json::Value, roles_claim: &str) -> Vec<String> {
+        Self::extract_string_list(claims, roles_claim)
     }
 
     /// Detect if the credentials contain a JWT meant for this provider.
@@ -536,6 +560,20 @@ impl AuthProvider for BearerTokenProvider {
 
         let roles = Self::extract_roles(claims, &self.config.roles_claim);
 
+        let subject = Self::extract_claim_by_path(claims, &self.config.subject_claim)
+            .and_then(|v| v.as_str())
+            .map(String::from);
+
+        let email = if self.config.email_claim.is_empty() {
+            None
+        } else {
+            Self::extract_claim_by_path(claims, &self.config.email_claim)
+                .and_then(|v| v.as_str())
+                .map(String::from)
+        };
+
+        let groups = Self::extract_string_list(claims, &self.config.groups_claim);
+
         // Read JWT `exp` (Unix seconds) so the session expires when the bearer
         // actually expires, not on a hard-coded 1h. Issue #26.
         let expires_at = claims
@@ -553,6 +591,9 @@ impl AuthProvider for BearerTokenProvider {
             user_id: user_id.clone(),
             display_name: user_id,
             roles,
+            subject,
+            email,
+            groups,
             catalog_token: Some(sqe_core::SecretString::new(token)),
             refresh_token: None,
             expires_at,
@@ -672,6 +713,9 @@ fGaGdPurwOnXPCbnSxiTHsQWwcx2KhPWpUsg/msrL8LU3DRravWV
             audience: None,
             user_claim: "sub".to_string(),
             roles_claim: "realm_access.roles".to_string(),
+            subject_claim: "sub".to_string(),
+            email_claim: String::new(),
+            groups_claim: String::new(),
             accept_invalid_certs: false,
             allow_unbounded_audience: true,
             // Tests serve JWKS over a local http listener; opt in explicitly.
@@ -1364,6 +1408,9 @@ fGaGdPurwOnXPCbnSxiTHsQWwcx2KhPWpUsg/msrL8LU3DRravWV
             user_id: "alice".to_string(),
             display_name: "Alice".to_string(),
             roles: vec!["admin".to_string()],
+            subject: None,
+            email: None,
+            groups: vec![],
             catalog_token: Some(sqe_core::SecretString::new("the-jwt-token".to_string())),
             refresh_token: None,
             expires_at: None,
@@ -1390,6 +1437,9 @@ fGaGdPurwOnXPCbnSxiTHsQWwcx2KhPWpUsg/msrL8LU3DRravWV
             user_id: "alice".to_string(),
             display_name: "Alice".to_string(),
             roles: vec![],
+            subject: None,
+            email: None,
+            groups: vec![],
             catalog_token: None,
             refresh_token: None,
             expires_at: None,
@@ -1414,6 +1464,9 @@ fGaGdPurwOnXPCbnSxiTHsQWwcx2KhPWpUsg/msrL8LU3DRravWV
             audience: Some("sqe".to_string()),
             user_claim: "sub".to_string(),
             roles_claim: "realm_access.roles".to_string(),
+            subject_claim: "sub".to_string(),
+            email_claim: String::new(),
+            groups_claim: String::new(),
             accept_invalid_certs: false,
             allow_unbounded_audience: false,
             allow_insecure_jwks: true,
@@ -1531,5 +1584,31 @@ fGaGdPurwOnXPCbnSxiTHsQWwcx2KhPWpUsg/msrL8LU3DRravWV
             ..Default::default()
         };
         assert!(BearerTokenProvider::new(config).is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // extract_string_list and email/groups extraction
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn extracts_email_and_groups_when_claims_configured() {
+        let claims = serde_json::json!({
+            "sub": "u-42",
+            "email": "alice@corp.example",
+            "groups": ["hr", "finance"],
+            "realm_access": { "roles": ["analyst"] }
+        });
+        let email = BearerTokenProvider::extract_claim_by_path(&claims, "email")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        assert_eq!(email, Some("alice@corp.example".to_string()));
+        let groups = BearerTokenProvider::extract_string_list(&claims, "groups");
+        assert_eq!(groups, vec!["hr".to_string(), "finance".to_string()]);
+    }
+
+    #[test]
+    fn empty_groups_claim_yields_no_groups() {
+        let claims = serde_json::json!({ "sub": "u-1" });
+        assert!(BearerTokenProvider::extract_string_list(&claims, "").is_empty());
     }
 }
