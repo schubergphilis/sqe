@@ -130,8 +130,12 @@ cargo-check-features:
     # SQL catalog axes (PostgreSQL and SQLite split for tls-rustls reasons).
     - cargo check -p sqe-catalog --no-default-features --features rest,sql-postgres
     - cargo check -p sqe-catalog --no-default-features --features rest,sql-sqlite
-    # Delta read add-on. Slim REST + delta is the embedded mode build.
-    - cargo check -p sqe-catalog --no-default-features --features rest,delta
+    # Delta read add-on REMOVED for the DataFusion 54 bump: deltalake-core
+    # 0.32.1 pins DataFusion 53.1 and has no DF 54 release, so the `delta`
+    # feature and its deltalake-core dependency are commented out in
+    # crates/sqe-catalog/Cargo.toml. Restore this axis together with that
+    # feature once delta-rs ships DF 54 support.
+    # - cargo check -p sqe-catalog --no-default-features --features rest,delta
     # No-features sanity check. Compiles, even if no backend is wired.
     - cargo check -p sqe-catalog --no-default-features
   rules:
