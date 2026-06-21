@@ -580,10 +580,11 @@ async fn async_main() -> anyhow::Result<()> {
     if sqe_coordinator::mode::warns_unauthenticated_workers(&config.coordinator) {
         tracing::warn!("WARNING: coordinator.allow_unauthenticated_workers = true with an empty coordinator.worker_secret -- any client reachable on the cluster network can register as a worker and receive user bearer tokens. Set worker_secret for production.");
     }
-    // WEB-01: the web UI / JSON API serve on the health port over 0.0.0.0 with
-    // NO authentication. It now defaults off; warn loudly when explicitly on.
+    // WEB-01: the web UI / JSON API serve on the health port (0.0.0.0).
+    // Routes are gated behind bearer + admin auth (see web_auth::require_admin_bearer).
+    // Warn so operators know the surface is active.
     if config.metrics.web_ui {
-        tracing::warn!("WARNING: metrics.web_ui = true -- the ops dashboard and /api/v1/* endpoints are served on the health port (0.0.0.0) with NO authentication. Anyone able to reach that port sees cluster/query metadata. Network-gate it tightly or leave web_ui = false.");
+        tracing::warn!("WARNING: metrics.web_ui = true -- the ops dashboard and /api/v1/* endpoints are served on the health port (0.0.0.0). Routes require a valid admin bearer token. Network-gate the health port or leave web_ui = false.");
     }
 
     // Priority: --mode flag > SQE_MODE env > config file mode
