@@ -1865,7 +1865,14 @@ impl QueryHandler {
         );
 
         match self.open_stream(session, sql, &query_id, start).await {
-            Ok((schema, inner_stream, final_plan, tt_cleanup, tables_touched, policy_summary)) => {
+            Ok((schema, inner_stream, final_plan, tt_cleanup, tables_touched, policy_summary, audit_resources)) => {
+                let actor = sqe_metrics::audit::Actor::from_parts(
+                    session.user.username.clone(),
+                    session.user.subject.clone(),
+                    session.user.email.clone(),
+                    session.user.roles.clone(),
+                    session.user.groups.clone(),
+                );
                 let finalizer = crate::streaming::StreamFinalizer {
                     tracker: Arc::clone(&self.query_tracker),
                     metrics: self.metrics.clone(),
@@ -1883,6 +1890,8 @@ impl QueryHandler {
                     tables_touched,
                     policy_summary,
                     profile_mode: self.profile_mode,
+                    actor,
+                    resources: audit_resources,
                 };
 
                 let tracked = crate::streaming::TrackedRecordBatchStream::with_permits_reservation_and_cancel_token(
@@ -1939,6 +1948,7 @@ impl QueryHandler {
         TimeTravelCleanup,
         Vec<String>,
         sqe_policy::PolicySummary,
+        Vec<sqe_metrics::audit::Resource>,
     )> {
         let (ctx, session_catalog) = self.create_session_context(session).await?;
 
@@ -1966,6 +1976,21 @@ impl QueryHandler {
         let (enforced_plan, policy_summary) =
             self.policy_enforcer.evaluate(&session.user, plan).await?;
         debug!("Policy-enforced plan (streaming): {:?}", enforced_plan);
+        // Compute the structured resource list from the logical plan now,
+        // before it is consumed by `execute_logical_plan`. The streaming
+        // finalizer needs these to emit a canonical `AuditEvent`; there is
+        // no opportunity to recover the logical plan later in the pipeline.
+        let effective_catalog_buf: Option<String> = if session.default_catalog.is_none() {
+            Some(self.config.resolve_default_catalog())
+        } else {
+            None
+        };
+        let default_catalog_str: Option<&str> = session
+            .default_catalog
+            .as_deref()
+            .or(effective_catalog_buf.as_deref());
+        let audit_resources =
+            crate::audit_resources::resources_from_plan(&enforced_plan, default_catalog_str);
         let tables_touched = sqe_lineage::extract::extract_table_names(&enforced_plan);
 
         let enforced_df = ctx
@@ -2022,7 +2047,7 @@ impl QueryHandler {
         let stream = execute_stream(Arc::clone(&final_plan), ctx.task_ctx())
             .map_err(|e| SqeError::Execution(format!("Query execution failed: {e}")))?;
 
-        Ok((schema, stream, final_plan, tt_cleanup, tables_touched, policy_summary))
+        Ok((schema, stream, final_plan, tt_cleanup, tables_touched, policy_summary, audit_resources))
     }
 
     /// Return the schema for a SQL statement without executing it.
