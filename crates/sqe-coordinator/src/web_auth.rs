@@ -25,6 +25,7 @@ use axum::{
 };
 use sqe_auth::{AuthProvider, FlightCredentials, Identity};
 use sqe_core::SecretString;
+use sqe_metrics::audit::{Actor, AuditEvent, AuditKind, AuditLogger, Integrity, Outcome, QueryInfo};
 
 /// Reason a bearer-admin guard check failed.
 #[derive(Debug, PartialEq, Eq)]
@@ -75,6 +76,83 @@ pub async fn bearer_admin_identity(
 pub trait BearerAdminState: Send + Sync + 'static {
     fn bearer_provider(&self) -> Option<&Arc<dyn AuthProvider>>;
     fn auth_config(&self) -> Option<&sqe_core::config::AuthConfig>;
+    /// Returns the audit logger for emitting dashboard-access events, if wired.
+    fn audit(&self) -> Option<&Arc<AuditLogger>>;
+}
+
+/// Build an `AuditEvent` for a dashboard access attempt.
+///
+/// Called from `require_admin_bearer` after the guard result is known.
+/// The bearer token is NEVER included: only the resolved identity fields
+/// (on success) or a placeholder actor (on denial) are recorded.
+///
+/// `client_ip` is `None` for now because the health router is served
+/// without `into_make_service_with_connect_info`; wired in Phase C2.
+pub fn dashboard_audit_event(
+    result: &Result<Identity, GuardReject>,
+    client_ip: Option<String>,
+) -> AuditEvent {
+    let (actor, outcome) = match result {
+        Ok(identity) => {
+            let actor = Actor::from_parts(
+                identity.user_id.clone(),
+                identity.subject.clone(),
+                identity.email.clone(),
+                identity.roles.clone(),
+                identity.groups.clone(),
+            );
+            (actor, Outcome::Success)
+        }
+        Err(GuardReject::Unauthorized) => {
+            let actor = Actor::from_parts(
+                "unknown".into(),
+                None,
+                None,
+                vec![],
+                vec![],
+            );
+            let outcome = Outcome::Failure {
+                error_type: Some("DashboardAccessDenied".into()),
+                error_code: None,
+                message: Some("missing or invalid bearer token".into()),
+            };
+            (actor, outcome)
+        }
+        Err(GuardReject::Forbidden) => {
+            let actor = Actor::from_parts(
+                "unknown".into(),
+                None,
+                None,
+                vec![],
+                vec![],
+            );
+            let outcome = Outcome::Failure {
+                error_type: Some("DashboardAccessDenied".into()),
+                error_code: None,
+                message: Some("admin role required".into()),
+            };
+            (actor, outcome)
+        }
+    };
+
+    AuditEvent {
+        time: chrono::Utc::now(),
+        kind: AuditKind::Auth,
+        actor,
+        outcome,
+        resources: vec![],
+        policy: None,
+        timing: None,
+        stats: None,
+        query: Some(QueryInfo {
+            text: Some("dashboard_access".into()),
+            query_hash: String::new(),
+            statement_type: "dashboard_access".into(),
+        }),
+        session_id: None,
+        client_ip,
+        integrity: Integrity::default(),
+    }
 }
 
 /// Axum middleware that gates a route group behind bearer + admin auth.
@@ -106,8 +184,19 @@ where
         .headers()
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok());
-    match bearer_admin_identity(provider, auth_cfg, header).await {
-        Ok(_identity) => next.run(request).await,
+    let result = bearer_admin_identity(provider, auth_cfg, header).await;
+
+    // Emit an audit event when a logger is present. client_ip is None until
+    // Phase C2 wires connect_info into the health router.
+    if let Some(audit) = state.audit() {
+        audit.log_event(dashboard_audit_event(&result, None));
+    }
+
+    match result {
+        Ok(identity) => {
+            let _ = identity;
+            next.run(request).await
+        }
         Err(GuardReject::Unauthorized) => {
             (StatusCode::UNAUTHORIZED, "unauthorized").into_response()
         }
@@ -195,5 +284,120 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(id.roles, vec!["admin".to_string()]);
+    }
+
+    // ── Audit emit tests ──────────────────────────────────────────────────────
+
+    /// Helper: write one event via `dashboard_audit_event`, flush, read back JSONL.
+    fn write_and_read(
+        result: Result<sqe_auth::Identity, GuardReject>,
+    ) -> (sqe_metrics::audit::AuditLogger, std::path::PathBuf, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("audit.jsonl");
+        let logger =
+            sqe_metrics::audit::AuditLogger::new(path.to_str().unwrap()).expect("audit logger");
+        let event = dashboard_audit_event(&result, None);
+        logger.log_event(event);
+        logger.flush();
+        (logger, path, dir)
+    }
+
+    fn admin_identity() -> sqe_auth::Identity {
+        sqe_auth::Identity {
+            user_id: "alice".into(),
+            display_name: "alice".into(),
+            roles: vec!["admin".into()],
+            subject: Some("sub-alice".into()),
+            email: Some("alice@corp.example".into()),
+            groups: vec!["ops".into()],
+            catalog_token: None,
+            refresh_token: None,
+            expires_at: None,
+        }
+    }
+
+    #[test]
+    fn audit_success_emits_auth_event_with_username() {
+        let result: Result<sqe_auth::Identity, GuardReject> = Ok(admin_identity());
+        let (_logger, path, _dir) = write_and_read(result);
+        let content = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 1, "expected exactly one audit line; got: {content}");
+        let v: serde_json::Value =
+            serde_json::from_str(lines[0]).expect("line must be valid JSON");
+        // kind must be "auth" (OCSF Authentication)
+        assert_eq!(
+            v["kind"].as_str(),
+            Some("auth"),
+            "kind must be 'auth'; got: {v}"
+        );
+        // status must be "success" (from Outcome::Success serialization)
+        assert_eq!(
+            v["status"].as_str(),
+            Some("success"),
+            "status must be 'success'; got: {v}"
+        );
+        // actor.username must be the admin's user_id
+        assert_eq!(
+            v["actor"]["username"].as_str(),
+            Some("alice"),
+            "actor.username must be 'alice'; got: {v}"
+        );
+        // No bearer token in the event (the token is never put in the event struct)
+        assert!(
+            !content.contains("Bearer"),
+            "bearer token must not appear in audit line: {content}"
+        );
+        assert!(
+            !content.contains("tok"),
+            "bearer token value must not appear in audit line: {content}"
+        );
+    }
+
+    #[test]
+    fn audit_unauthorized_emits_failure_with_reason() {
+        let result: Result<sqe_auth::Identity, GuardReject> = Err(GuardReject::Unauthorized);
+        let (_logger, path, _dir) = write_and_read(result);
+        let content = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 1, "expected exactly one audit line; got: {content}");
+        let v: serde_json::Value =
+            serde_json::from_str(lines[0]).expect("line must be valid JSON");
+        assert_eq!(v["kind"].as_str(), Some("auth"), "kind must be 'auth'; got: {v}");
+        assert_eq!(v["status"].as_str(), Some("failure"), "status must be 'failure'; got: {v}");
+        assert_eq!(
+            v["error_type"].as_str(),
+            Some("DashboardAccessDenied"),
+            "error_type must be 'DashboardAccessDenied'; got: {v}"
+        );
+        // Denial reason must be present and non-sensitive
+        let msg = v["message"].as_str().unwrap_or("");
+        assert!(
+            msg.contains("bearer"),
+            "message must mention bearer; got: {msg}"
+        );
+        // No bearer token in the event
+        assert!(
+            !content.contains("Bearer "),
+            "bearer scheme must not appear in audit line: {content}"
+        );
+    }
+
+    #[test]
+    fn audit_forbidden_emits_failure_admin_role_reason() {
+        let result: Result<sqe_auth::Identity, GuardReject> = Err(GuardReject::Forbidden);
+        let (_logger, path, _dir) = write_and_read(result);
+        let content = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 1, "expected exactly one audit line; got: {content}");
+        let v: serde_json::Value =
+            serde_json::from_str(lines[0]).expect("line must be valid JSON");
+        assert_eq!(v["kind"].as_str(), Some("auth"), "kind must be 'auth'; got: {v}");
+        assert_eq!(v["status"].as_str(), Some("failure"), "status must be 'failure'; got: {v}");
+        let msg = v["message"].as_str().unwrap_or("");
+        assert!(
+            msg.contains("admin"),
+            "message must mention admin role; got: {msg}"
+        );
     }
 }
