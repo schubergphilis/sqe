@@ -213,6 +213,10 @@ pub struct AuditLogger {
     /// Shared with the worker thread. `None` until `with_gdpr` is called;
     /// the worker reads a snapshot each time it processes events.
     gdpr: Arc<Mutex<Option<GdprConfig>>>,
+    /// Optional additional OCSF spool sink added via `with_export_spool`.
+    /// Shared with the worker; set once at startup before the logger is used.
+    /// Written to for every canonical `Event` message, independent of `AuditFormat`.
+    spool_sink: Arc<Mutex<Option<OcsfJsonlSink>>>,
 }
 
 /// Derive the OCSF file path from the native path.
@@ -265,6 +269,7 @@ impl AuditLogger {
                 tx: None,
                 worker: Mutex::new(None),
                 gdpr: Arc::new(Mutex::new(None)),
+                spool_sink: Arc::new(Mutex::new(None)),
             });
         }
 
@@ -305,6 +310,8 @@ impl AuditLogger {
         let path_owned = path.to_string();
         let gdpr: Arc<Mutex<Option<GdprConfig>>> = Arc::new(Mutex::new(None));
         let gdpr_worker = Arc::clone(&gdpr);
+        let spool_sink: Arc<Mutex<Option<OcsfJsonlSink>>> = Arc::new(Mutex::new(None));
+        let spool_sink_worker = Arc::clone(&spool_sink);
         let (tx, rx) = mpsc::channel::<AuditMsg>();
         let worker = std::thread::Builder::new()
             .name("sqe-audit-writer".to_string())
@@ -348,6 +355,7 @@ impl AuditLogger {
                                             &mut native_sink,
                                             native_events,
                                             &mut ocsf_sink,
+                                            &mut spool_sink_worker.lock().unwrap(),
                                             &mut chain,
                                             *e,
                                             gdpr_snap.as_ref(),
@@ -388,6 +396,7 @@ impl AuditLogger {
                                             &mut native_sink,
                                             native_events,
                                             &mut ocsf_sink,
+                                            &mut spool_sink_worker.lock().unwrap(),
                                             &mut chain,
                                             &mut batch,
                                             gdpr_snap.as_ref(),
@@ -409,6 +418,7 @@ impl AuditLogger {
                                             &mut native_sink,
                                             native_events,
                                             &mut ocsf_sink,
+                                            &mut spool_sink_worker.lock().unwrap(),
                                             &mut chain,
                                             &mut batch,
                                             gdpr_snap.as_ref(),
@@ -425,6 +435,7 @@ impl AuditLogger {
                                     &mut native_sink,
                                     native_events,
                                     &mut ocsf_sink,
+                                    &mut spool_sink_worker.lock().unwrap(),
                                     &mut chain,
                                     &mut batch,
                                     gdpr_snap.as_ref(),
@@ -448,6 +459,7 @@ impl AuditLogger {
             tx: Some(tx),
             worker: Mutex::new(Some(worker)),
             gdpr,
+            spool_sink,
         })
     }
 
@@ -572,10 +584,12 @@ impl AuditLogger {
     ///   which internally calls `redact_pii` as its step 3.
     /// - When `gdpr` is `None`: `redact_pii` runs unconditionally via
     ///   `redact_event_query`, matching the legacy `log()` redaction contract.
+    #[allow(clippy::too_many_arguments)]
     fn write_event(
         native_sink: &mut NativeJsonlSink,
         native_events: bool,
         ocsf_sink: &mut Option<OcsfJsonlSink>,
+        spool_sink: &mut Option<OcsfJsonlSink>,
         chain: &mut HashChain,
         mut event: AuditEvent,
         gdpr: Option<&GdprSnap>,
@@ -597,15 +611,24 @@ impl AuditLogger {
                 tracing::error!("AUDIT: write failed for '{path}': {e}");
             }
         }
+        // Export spool: written after chain.stamp so metadata.sequence is present.
+        // Active regardless of AuditFormat.
+        if let Some(sink) = spool_sink.as_mut() {
+            if let Err(e) = sink.write_line(&event) {
+                tracing::error!("AUDIT: spool write failed for '{path}': {e}");
+            }
+        }
     }
 
     /// Write a batch of canonical `AuditEvent` records to active sinks with chain stamping.
     ///
     /// See `write_event` for the `native_events` and `gdpr` semantics.
+    #[allow(clippy::too_many_arguments)]
     fn write_events(
         native_sink: &mut NativeJsonlSink,
         native_events: bool,
         ocsf_sink: &mut Option<OcsfJsonlSink>,
+        spool_sink: &mut Option<OcsfJsonlSink>,
         chain: &mut HashChain,
         batch: &mut [AuditEvent],
         gdpr: Option<&GdprSnap>,
@@ -626,6 +649,13 @@ impl AuditLogger {
             if let Some(sink) = ocsf_sink.as_mut() {
                 if let Err(e) = sink.write_line(event) {
                     tracing::error!("AUDIT: write failed for '{path}': {e}");
+                }
+            }
+            // Export spool: written after chain.stamp so metadata.sequence is present.
+            // Active regardless of AuditFormat.
+            if let Some(sink) = spool_sink.as_mut() {
+                if let Err(e) = sink.write_line(event) {
+                    tracing::error!("AUDIT: spool write failed for '{path}': {e}");
                 }
             }
         }
@@ -672,6 +702,24 @@ impl AuditLogger {
             }
         }
         self
+    }
+
+    /// Attach an additional OCSF JSONL spool file.
+    ///
+    /// Every canonical event written via `log_event` is also written to `spool_path`
+    /// in OCSF format, regardless of the `AuditFormat` passed to `with_config`. The
+    /// spool file is the source consumed by `OtlpLogShipper` for SIEM export.
+    ///
+    /// Must be called before the logger is shared or any events are logged.
+    /// The spool file is opened in append mode; it is created if it does not exist.
+    /// Errors opening the file are returned and the logger is not modified.
+    pub fn with_export_spool(self, spool_path: &str) -> Result<Self, String> {
+        let file = open_sink_file(std::path::Path::new(spool_path))?;
+        let sink = OcsfJsonlSink::from_writer(Box::new(file));
+        if let Ok(mut guard) = self.spool_sink.lock() {
+            *guard = Some(sink);
+        }
+        Ok(self)
     }
 
     /// Log an `AuditEntry` (legacy path). Redaction runs here before the entry
@@ -1243,6 +1291,59 @@ mod tests {
         assert!(
             !content.contains("topsecret"),
             "free-form literal from unknown-state resource survived fail-closed strip: {content}"
+        );
+    }
+
+    /// Verifies `with_export_spool`: a canonical event written via `log_event` appears
+    /// in both the primary (native format) file and the spool (OCSF format) file.
+    ///
+    /// The spool must contain a valid OCSF record with `class_uid` and a stamped
+    /// `metadata.sequence` value, confirming the spool is written AFTER `chain.stamp`.
+    #[test]
+    fn with_export_spool_writes_ocsf_to_spool_and_native_to_primary() {
+        let dir = tempfile::tempdir().unwrap();
+        let native_path = dir.path().join("audit.jsonl");
+        let spool_path = dir.path().join("audit.spool.jsonl");
+
+        let logger = AuditLogger::with_config(
+            native_path.to_str().unwrap(),
+            crate::audit::AuditFormat::Native,
+        )
+        .unwrap()
+        .with_export_spool(spool_path.to_str().unwrap())
+        .unwrap();
+
+        logger.log_event(crate::audit::sample_query_event());
+        logger.flush();
+
+        // Primary file: native JSON with kind and integrity hash.
+        let native = std::fs::read_to_string(&native_path).unwrap();
+        assert!(
+            native.contains("\"kind\":\"query\""),
+            "native file must contain canonical event; got: {native}"
+        );
+        assert!(
+            native.contains("\"hash\":"),
+            "native file must contain integrity hash; got: {native}"
+        );
+
+        // Spool file: OCSF format with class_uid and stamped metadata.sequence.
+        let spool = std::fs::read_to_string(&spool_path).unwrap();
+        let spool_line = spool.lines().next().expect("spool must have at least one line");
+        let v: serde_json::Value = serde_json::from_str(spool_line)
+            .unwrap_or_else(|e| panic!("spool line is not valid JSON: {e}\n{spool_line}"));
+
+        assert_eq!(
+            v.get("class_uid").and_then(|c| c.as_i64()),
+            Some(6005),
+            "spool must contain OCSF class_uid 6005 (datastore_activity); got: {v}"
+        );
+        let seq = v
+            .pointer("/metadata/sequence")
+            .and_then(|s| s.as_u64());
+        assert!(
+            seq.is_some(),
+            "spool line must contain metadata.sequence (written after chain.stamp); got: {v}"
         );
     }
 }
