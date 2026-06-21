@@ -1,6 +1,50 @@
 # Testing
 
-## Test Structure
+SQE has two test tiers, both reached through one entry point: `scripts/test.sh`.
+
+| Tier | What it proves | Stack | Entry point |
+|---|---|---|---|
+| **Tier 1 -- engine integration** | The query engine is correct: SQL semantics, joins, DDL/DML, auth, distributed dispatch | One shared `docker-compose.test.yml` (Polaris in-memory + RustFS) | `scripts/test.sh engine` |
+| **Tier 2 -- scenarios** | Each documented use-case works end to end from a clean state | One stack per scenario (a quickstart's own `docker-compose.yml`) | `scripts/test.sh scenario <name>` |
+
+Tier 1 is `cargo` tests against a single lightweight stack. Tier 2 runs the quickstarts: every `quickstart/<name>/run.sh --check` brings up that scenario's stack, runs its demo queries, and asserts the invariants that make the scenario correct.
+
+## How to run
+
+```bash
+# Tier 1: engine integration tests (cargo, shared test stack)
+scripts/test.sh engine
+scripts/test.sh engine test_simple_select   # single test by name
+
+# Tier 2: scenario tests
+scripts/test.sh scenario nessie              # one scenario
+scripts/test.sh scenario all                 # every self-contained scenario
+
+# Tier 1 + all self-contained scenarios (what CI runs)
+scripts/test.sh ci
+```
+
+`scripts/test.sh engine` delegates to `scripts/integration-test.sh`; any trailing argument is passed through as a test-name filter. `scripts/test.sh scenario <name>` runs `quickstart/<name>/run.sh --check`. You can also run a quickstart directly:
+
+```bash
+cd quickstart/nessie
+cp .env.example .env
+./run.sh --check        # up -> queries -> assert invariants
+./run.sh                # up -> queries -> capture OUTPUT.md (no assertions)
+./run.sh --down         # tear the stack down
+```
+
+The `distributed` scenario is heavy (it builds the SQE image and runs four containers plus Polaris and RustFS), so it is deliberately absent from the self-contained set and never runs under `all` or `ci`. Invoke it explicitly:
+
+```bash
+scripts/test.sh scenario distributed
+```
+
+## Tier 1: engine integration
+
+Tier 1 covers the engine itself. Unit tests run with no external dependencies; integration and SQL-compat tests run against the shared `docker-compose.test.yml` stack (Polaris in-memory + RustFS).
+
+### Test structure
 
 ```
 crates/
@@ -35,27 +79,7 @@ crates/
     └── executor.rs            # 3 unit tests (S3 URL parsing)
 ```
 
-## Running Tests
-
-```bash
-# All workspace tests (fast -- unit tests only)
-cargo test --workspace
-
-# Specific crate
-cargo test -p sqe-sql
-cargo test -p sqe-coordinator
-
-# Specific test
-cargo test -p sqe-coordinator -- mode
-
-# Integration tests (require test stack)
-cargo test --workspace -- --ignored
-
-# With output
-cargo test --workspace -- --nocapture
-```
-
-## Unit Tests
+### Unit tests
 
 Unit tests run without external dependencies. They test:
 
@@ -73,11 +97,19 @@ Unit tests run without external dependencies. They test:
 - **Metrics** -- counter increment, histogram observation
 - **Audit** -- JSONL serialization, file writing, no-op mode
 
-## Integration Tests
+Run them directly with `cargo`:
 
-Integration tests live in `crates/sqe-coordinator/tests/integration_test.rs` and require a running test stack (Polaris, S3-compatible storage). They are marked `#[ignore]` and run with `--ignored`.
+```bash
+cargo test --workspace          # all workspace unit tests (fast, no stack)
+cargo test -p sqe-sql           # one crate
+cargo test -p sqe-coordinator -- mode   # one test
+```
 
-### Test inventory (45 tests)
+### Integration tests
+
+Integration tests live in `crates/sqe-coordinator/tests/integration_test.rs` and require the shared test stack (Polaris, RustFS). They are marked `#[ignore]` and run via `scripts/test.sh engine`, which starts the stack, bootstraps it, and runs the ignored tests.
+
+#### Test inventory (45 tests)
 
 | Category | Tests | What they validate |
 |---|---|---|
@@ -94,31 +126,19 @@ Integration tests live in `crates/sqe-coordinator/tests/integration_test.rs` and
 | **Distributed** | `test_distributed_select`, `test_local_fallback_without_workers` | Coordinator-to-worker scan, graceful fallback to local mode |
 | **Trino compat** | `test_trino_http_query` | Query via Trino HTTP protocol adapter |
 
-### Running Integration Tests
+The `docker-compose.test.yml` stack runs a coordinator with no worker behind it. `test_distributed_select` intentionally fails when no worker listens on `:50052` (issue #122, where local fallback masked distributed dispatch bugs), so full distributed coverage is exercised by the `distributed` scenario (`scripts/test.sh scenario distributed`) on `docker-compose.distributed.yml`, not by this stack.
 
-The lightweight test stack is the primary way to run integration tests:
+#### Running a single integration test
 
 ```bash
-# Start the lightweight test stack (Polaris in-memory + RustFS)
-docker compose -f docker-compose.test.yml up -d
-
-# Bootstrap (idempotent: creates buckets, warehouse, namespaces)
-./scripts/bootstrap-test.sh
-
-# Run all integration tests
-./scripts/integration-test.sh
-
-# Run a single test by name
-./scripts/integration-test.sh test_simple_select
+scripts/test.sh engine test_simple_select
 ```
 
-The test config is at `tests/sqe-test.toml` and uses `token_endpoint` (client_credentials mode) against Polaris's built-in OAuth.
+### SQL compatibility tests
 
-## SQL Compatibility Tests
+SQL compatibility tests live in `crates/sqe-coordinator/tests/sql_compat_test.rs`. These 5 tests validate SQL semantic correctness beyond what the integration tests cover. They focus on edge cases in SQL behavior that must match ANSI SQL or Trino semantics, so queries migrating from another engine behave the same way.
 
-SQL compatibility tests live in `crates/sqe-coordinator/tests/sql_compat_test.rs`. These 5 tests validate SQL semantic correctness beyond what the integration tests cover -- they focus on edge cases in SQL behavior that must match ANSI SQL or Trino semantics to avoid surprises for users migrating queries.
-
-The SQL compat tests use the same test stack and configuration as the integration tests. They are also marked `#[ignore]` and run as part of `./scripts/integration-test.sh`.
+The SQL compat tests use the same test stack and configuration as the integration tests. They are also marked `#[ignore]` and run as part of `scripts/test.sh engine`.
 
 Each `.sql` file under `crates/sqe-coordinator/tests/sql/` is one `#[tokio::test]` registered in `sql_compat_test.rs`. The files use a simple block format and rely on CTEs rather than fixture tables, so each block is self-contained:
 
@@ -156,7 +176,7 @@ Most join, aggregation, view, and window integration tests share two fixture tab
 | 30 | Executive   | 1000000.00 |
 | 40 | HR          | 150000.00  |
 
-## Test Configuration
+### Test configuration
 
 ```toml
 # tests/sqe-test.toml
@@ -181,30 +201,80 @@ s3_region = "us-east-1"
 s3_path_style = true
 ```
 
-## Benchmark Testing
+The config uses `token_endpoint` (client_credentials mode) against Polaris's built-in OAuth.
 
-Beyond unit and integration tests, SQE ships with `sqe-bench`, a benchmark CLI that validates SQL correctness and measures performance across industry-standard query suites.
+## Tier 2: scenario tests
 
-Benchmark tests differ from integration tests in scope and purpose:
+Tier 2 runs the quickstarts as tests. Each `quickstart/<name>/` directory is a self-contained use-case: it brings up everything the scenario needs, runs a few demo queries, and captures the real output. The quickstarts are the user-facing source of truth for "how do I run SQE for X," and they double as a validation base.
 
-| | Integration tests | Benchmark tests |
-|---|---|---|
-| Data | Synthetic fixtures (small) | TPC/SSB scale factor data (GB scale) |
-| Queries | Targeted feature tests | Full benchmark query suites (22-99 queries) |
-| Validation | Pass/fail assertions | PASS / DIFF / FAIL / SKIP / ERROR with timing |
-| Purpose | Regression detection | SQL correctness + performance tracking |
+### How a scenario asserts
 
-### Quick benchmark run
+Every `run.sh` supports three modes:
 
 ```bash
-# Generate TPC-H data at scale factor 1
-cargo run -p sqe-bench -- generate tpch --scale 1 --output ./data
+./run.sh          # up -> queries -> capture OUTPUT.md
+./run.sh --check  # up -> queries -> assert the scenario's invariants
+./run.sh --down   # tear the stack down (some embedded scenarios use --clean)
+```
 
-# Load into SQE (requires running stack)
+`--check` runs the same demo queries the plain run captures, then asserts the invariants that define correctness for that scenario. The assertion vocabulary lives in `quickstart/_shared/lib.sh`, shared by every scenario:
+
+- `assert_contains <label> <output> <substring>` -- output must contain a value (case-insensitive)
+- `assert_not_empty <label> <output>` -- output is non-empty and not `0 rows`
+- `assert_not_contains <label> <output> <substring>` -- output must not contain a value (for example `error`)
+- `check_summary` -- prints the pass/fail totals and exits non-zero if any assertion failed
+
+For example, the `nessie` scenario asserts that the catalog shows the demo namespace, that the purchase total reads back as `55.25`, and that the run produced no `error` line.
+
+### OUTPUT.md and --check: one scenario, no drift
+
+Each quickstart commits an `OUTPUT.md`: the captured output of a real run, shown in the quickstart README and the docs. The same scenario and the same `queries.sql` produce both the committed evidence and the asserted invariants. A plain `./run.sh` captures `OUTPUT.md`; `./run.sh --check` re-runs the same query file and asserts against it. Because both come from one scenario over one query file, the documented output and the tested behavior cannot drift: changing the queries changes both at once.
+
+### Scenario catalog
+
+Scenarios fall into three buckets. The 11 self-contained scenarios run under `scenario all` and `ci`. The `distributed` scenario has its own overlay stack and runs on demand only. The 3 cloud-gated AWS scenarios need real cloud credentials and run only through the manual `scenario-test-aws` CI job.
+
+| Scenario | What it covers | Category |
+|---|---|---|
+| `polaris-keycloak-client-id` | Polaris + Keycloak; SQE mints user tokens via the OIDC password grant (client credentials) | self-contained |
+| `polaris-keycloak-user-token` | Same stack; clients bring a pre-minted Keycloak token (`--token`), SQE validates and passes it through | self-contained |
+| `polaris-ranger-keycloak` | Polaris + Apache Ranger access control: SQE writes GRANT/REVOKE to Ranger, Polaris enforces, column masks match Spark and Kyuubi byte for byte | self-contained |
+| `nessie` | Project Nessie as the Iceberg REST catalog (auth-less, anonymous SQE) | self-contained |
+| `unity-oss` | Unity Catalog OSS over Iceberg REST (read-only upstream; catalog-browse demo) | self-contained |
+| `embedded-files` | Read local and remote files directly with the `read_*` TVFs (no server, no catalog) | self-contained |
+| `embedded-sqlite-catalog` | Local persistent Iceberg catalog backed by SQLite (no server) | self-contained |
+| `attach-catalogs` | Attach multiple persistent catalogs in embedded mode plus a cross-catalog JOIN | self-contained |
+| `quack` | SQE's DuckDB Quack RPC, both ways: a DuckDB CLI queries SQE, and SQE's `quack_query()` pulls from a DuckDB server | self-contained |
+| `observability` | Scrape SQE's Prometheus metrics with VictoriaMetrics + Grafana (provisioned dashboard) | self-contained |
+| `benchmark` | Generate, load, and run TPC-H / TPC-DS / SSB against SQE with per-query timings (`sqe-bench`) | self-contained |
+| `distributed` | A real cluster: coordinator + two stateless DataFusion workers over Arrow Flight, querying Polaris + RustFS (worker dispatch, system tables, query history, CTAS round-trip, result cache, Trino HTTP) | own stack, on-demand |
+| `aws-glue` | AWS Glue Data Catalog; CDK bootstrap and teardown, SQE creates the database | cloud-gated |
+| `aws-s3-tables` | AWS S3 Tables (managed Iceberg); CDK bootstrap and teardown, SQE creates the namespace | cloud-gated |
+| `glue-lake-formation` | Glue database governed by Lake Formation: SQE denied until an explicit LF grant, then succeeds (table/DB-level gating, not column or row masking) | cloud-gated |
+
+The `distributed` scenario replaces the retired standalone distributed test script: it brings up `docker-compose.test.yml` plus the `docker-compose.distributed.yml` overlay (which adds the coordinator and workers and inherits Polaris, RustFS, and Postgres), bootstraps Polaris, and asserts the distributed invariants through the same `_shared/lib.sh` helpers.
+
+The AWS `run.sh` scripts do not yet support `--check`; the `scenario-test-aws` job invokes their default deploy, verify, and destroy flow directly. Adding a `--check` mode to the AWS scenarios is a follow-up.
+
+## CI
+
+| Job | Tier | Runs | When |
+|---|---|---|---|
+| `integration-test` | Tier 1 | `scripts/integration-test.sh` | Scheduled pipelines, merge-to-main push; manual (non-blocking) on MR pipelines |
+| `scenario-test` | Tier 2 | `scripts/test.sh scenario all` (11 self-contained) | Scheduled pipelines and merge-to-main push (on changes to `quickstart/`, `crates/`, `scripts/test.sh`, or compose files); manual (non-blocking) on matching MR pipelines |
+| `scenario-test-aws` | Tier 2 (cloud) | the three AWS quickstart `run.sh` flows | Manual only; gated on `RUN_AWS_SCENARIOS=1` and AWS credentials, never automatic |
+
+All three jobs run docker-in-docker (a `docker:24-dind` sidecar) so each can stand up its own compose stack. `scenario-test` skips the heavy `distributed` scenario; run it on demand with `scripts/test.sh scenario distributed`. The AWS scenarios cost real money against a real account, which is why they are manual and credential-gated.
+
+## Benchmark testing
+
+`sqe-bench` validates SQL correctness and measures performance across industry-standard query suites. The `benchmark` scenario (`scripts/test.sh scenario benchmark`) wraps a generate, load, and run cycle, but the benchmark CLI also runs standalone:
+
+```bash
+# Generate, load, and run TPC-H at scale factor 1 (requires a running stack)
+cargo run -p sqe-bench -- generate tpch --scale 1 --output ./data
 cargo run -p sqe-bench -- load tpch --scale 1 --data ./data \
   --host localhost --port 60051 --username root --password ""
-
-# Run all 22 TPC-H queries
 cargo run -p sqe-bench -- test tpch --scale 1 \
   --host localhost --port 60051 --username root --password ""
 
@@ -212,29 +282,6 @@ cargo run -p sqe-bench -- test tpch --scale 1 \
 ./scripts/benchmark-test.sh tpch
 ```
 
-### Supported benchmarks
+Benchmark tests differ from integration tests in scope: GB-scale TPC/SSB data instead of small fixtures, full query suites (22 to 99 queries) instead of targeted feature tests, and PASS / DIFF / FAIL / SKIP / ERROR timing reports instead of pass/fail assertions. TPC-H at SF1 runs as a post-merge smoke test; the full suite runs nightly. JSON reports land in `benchmarks/results/` and are archived as CI artifacts for regression tracking.
 
-| Benchmark | Queries | Notes |
-|-----------|---------|-------|
-| `tpch` | 22 | Standard first check for any SQL engine |
-| `tpcds` | 99 | Complex SQL: correlated subqueries, window functions, GROUPING SETS |
-| `ssb` | 13 | Fast smoke test: denormalized star schema |
-| `tpcc` | 8 | OLTP reads; write queries skip until DELETE/MERGE land |
-| `tpce` | 11 | Brokerage OLTP reads |
-| `tpcbb` | 10 | SQL-only subset over TPC-DS data |
-
-### Benchmark test in CI
-
-TPC-H at SF1 runs as a post-merge smoke test. The full suite (TPC-H + TPC-DS + SSB) runs nightly. JSON reports are written to `benchmarks/results/` and archived as CI artifacts for regression tracking.
-
-```bash
-# CI smoke test (TPC-H SF1 only, fails on any ERROR or FAIL)
-./scripts/benchmark-test.sh tpch
-
-# Nightly full suite
-./scripts/benchmark-test.sh tpch
-./scripts/benchmark-test.sh tpcds
-./scripts/benchmark-test.sh ssb
-```
-
-For full documentation of benchmark commands, scale factors, result formats, and how to add new benchmarks, see [Benchmark Suite](../features/benchmarks.md).
+For benchmark commands, scale factors, result formats, and how to add a benchmark, see [Benchmark Suite](../features/benchmarks.md).
