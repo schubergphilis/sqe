@@ -1,11 +1,10 @@
 ---
 title: About SQE - Sovereign Query Engine
 description: SQE started as a fork of Trino with end-to-end authentication instead of service accounts. Built at Schuberg Philis by Jacob Verhoeks & Rafael Herrero, it's the open-source engine at the heart of a sovereign data platform.
+eyebrow: About SQE
+heroTitle: Make the query the identity.
+heroLede: SQE started as a fork of Trino with one stubborn idea, end-to-end authentication instead of shared service accounts. Every query should run as the person who issued it, not as a coordinator service account, not as a service principal.
 ---
-
-# Make the query the identity.
-
-SQE started as a fork of **Trino** with one stubborn idea: end-to-end authentication instead of shared service accounts. Every query should run as the person who issued it, not as `trino-coordinator`, not as a service principal.
 
 ## Origin: From a Trino fork to a Rust engine
 
