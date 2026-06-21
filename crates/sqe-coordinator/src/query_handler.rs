@@ -1299,8 +1299,10 @@ impl QueryHandler {
             }
             _ => Vec::new(),
         };
+        // Hoist plan metrics so they are in scope at the audit emit site below,
+        // regardless of whether the query succeeded or failed.
+        let pm = plan_metrics.lock().unwrap_or_else(|e| e.into_inner()).clone();
         if result.is_ok() {
-            let pm = plan_metrics.lock().unwrap_or_else(|e| e.into_inner()).clone();
             self.query_tracker.complete(
                 &query_id,
                 rows,
@@ -1411,13 +1413,20 @@ impl QueryHandler {
         // path. Upgrading that site is a follow-on task (its `tables_touched`
         // feeds query_cache invalidation, so a format change there needs a
         // separate review).
-        let _effective_catalog: String;
-        let default_catalog: Option<&str> = if let Some(ref c) = session.default_catalog {
-            Some(c.as_str())
+        // `effective_catalog_buf` owns the resolved catalog string when the
+        // session does not carry an explicit default. The borrow `default_catalog`
+        // points into either the session string or this buffer; keeping them
+        // separate makes the lifetime explicit rather than hiding it behind an
+        // underscore-prefixed "unused" variable.
+        let effective_catalog_buf: Option<String> = if session.default_catalog.is_none() {
+            Some(self.config.resolve_default_catalog())
         } else {
-            _effective_catalog = self.config.resolve_default_catalog();
-            Some(_effective_catalog.as_str())
+            None
         };
+        let default_catalog: Option<&str> = session
+            .default_catalog
+            .as_deref()
+            .or(effective_catalog_buf.as_deref());
         let audit_resources: Vec<sqe_metrics::audit::Resource> = match captured_plan.as_ref() {
             Some(sqe_lineage::PlanOrHint::Plan(p)) => {
                 crate::audit_resources::resources_from_plan(p.as_ref(), default_catalog)
@@ -1484,27 +1493,110 @@ impl QueryHandler {
         }
 
         if let Some(ref audit) = self.audit {
-            // Copy the policy-decision summary (if the path produced one) into
-            // the audit entry so a deny-all / masked / filtered query is no
-            // longer indistinguishable from a bare success.
-            let ps = policy_summary.unwrap_or_default();
-            audit.log(&sqe_metrics::audit::AuditEntry {
-                timestamp: chrono::Utc::now().to_rfc3339(),
-                username: session.user.username.clone(),
-                session_id: Some(session.id.clone()),
-                query_hash: sqe_metrics::audit::query_hash(sql),
-                query_text: Some(sql.to_string()),
-                statement_type: kind_name,
-                duration_ms: duration.as_millis() as u64,
-                rows_returned: rows,
-                status: status.to_string(),
-                client_ip: None,
-                tables_touched: tables_touched.clone(),
-                row_filters_applied: ps.row_filters_applied,
-                columns_masked: ps.columns_masked,
-                columns_restricted: ps.columns_restricted,
-                policy_denied: ps.denied,
-            });
+            // Route SELECT/DQL (StatementKind::Query) through the canonical
+            // AuditEvent path so the event carries a fully-populated Actor,
+            // structured Resource list, and typed policy/timing/stats blocks.
+            //
+            // All other statement kinds (DDL, DML, admin) remain on the legacy
+            // log(&AuditEntry) path. That path applies PII redaction before
+            // writing, which is critical for CREATE SECRET statements that carry
+            // bearer tokens in their SQL text. Migrating those kinds is a
+            // separate task once caller-side redaction for log_event is in place.
+            if matches!(&kind, StatementKind::Query(_)) {
+                let ps = policy_summary.unwrap_or_default();
+
+                let outcome = match &result {
+                    Ok(_) => sqe_metrics::audit::Outcome::Success,
+                    Err(e) => sqe_metrics::audit::Outcome::Failure {
+                        error_type: Some(e.error_code().trino_error_type().to_string()),
+                        error_code: Some(e.error_code().name().to_string()),
+                        message: Some(e.client_message()),
+                    },
+                };
+
+                let policy = if ps.row_filters_applied > 0
+                    || !ps.columns_masked.is_empty()
+                    || !ps.columns_restricted.is_empty()
+                    || ps.denied
+                {
+                    Some(sqe_metrics::audit::PolicyAudit {
+                        row_filters_applied: ps.row_filters_applied,
+                        columns_masked: ps.columns_masked,
+                        columns_restricted: ps.columns_restricted,
+                        denied: ps.denied,
+                    })
+                } else {
+                    None
+                };
+
+                let actor = sqe_metrics::audit::Actor::from_parts(
+                    session.user.username.clone(),
+                    session.user.subject.clone(),
+                    session.user.email.clone(),
+                    session.user.roles.clone(),
+                    session.user.groups.clone(),
+                );
+
+                let event = sqe_metrics::audit::AuditEvent {
+                    time: chrono::Utc::now(),
+                    kind: sqe_metrics::audit::AuditKind::Query,
+                    actor,
+                    outcome,
+                    resources: audit_resources,
+                    policy,
+                    timing: Some(sqe_metrics::audit::Timing {
+                        duration_ms: duration.as_millis() as u64,
+                        // queued_ms and planning_ms are tracked by QueryTracker
+                        // but no per-id getter is exposed at this call site.
+                        // They default to 0 here; a follow-up can expose a
+                        // QueryTracker::timing_for(id) if needed.
+                        queued_ms: 0,
+                        planning_ms: 0,
+                        execution_ms,
+                    }),
+                    stats: Some(sqe_metrics::audit::QueryStats {
+                        rows_returned: rows,
+                        bytes_scanned: pm.bytes_scanned,
+                        rows_scanned: pm.rows_scanned,
+                        spill_bytes: pm.spill_bytes,
+                        peak_memory_bytes: pm.peak_memory_bytes,
+                    }),
+                    query: Some(sqe_metrics::audit::QueryInfo {
+                        // Pass sql text directly. The worker thread (apply_gdpr_masking
+                        // in the logger) will apply GDPR/PII masking before the event
+                        // reaches the sink, matching the redaction contract for log_event.
+                        // Do NOT double-redact here (no redact_pii call at this site).
+                        text: Some(sql.to_string()),
+                        query_hash: sqe_metrics::audit::query_hash(sql),
+                        statement_type: kind_name,
+                    }),
+                    session_id: Some(session.id.clone()),
+                    client_ip: None,
+                    integrity: sqe_metrics::audit::Integrity::default(),
+                };
+                audit.log_event(event);
+            } else {
+                // Legacy path for DDL, DML, admin statements.
+                // PII redaction runs inside log() before the entry is queued.
+                let ps = policy_summary.unwrap_or_default();
+                audit.log(&sqe_metrics::audit::AuditEntry {
+                    timestamp: chrono::Utc::now().to_rfc3339(),
+                    username: session.user.username.clone(),
+                    session_id: Some(session.id.clone()),
+                    query_hash: sqe_metrics::audit::query_hash(sql),
+                    query_text: Some(sql.to_string()),
+                    statement_type: kind_name,
+                    duration_ms: duration.as_millis() as u64,
+                    rows_returned: rows,
+                    status: status.to_string(),
+                    client_ip: None,
+                    tables_touched: tables_touched.clone(),
+                    row_filters_applied: ps.row_filters_applied,
+                    columns_masked: ps.columns_masked,
+                    columns_restricted: ps.columns_restricted,
+                    policy_denied: ps.denied,
+                });
+            }
         }
 
         // Slow query warning
