@@ -114,3 +114,74 @@ passes clean. One lint fixed: replaced `.or_else(|| effective_catalog_buf.as_der
 None. The branching approach cleanly separates the safe migration path from the pending
 caller-side redaction work for `log_event`. queued_ms and planning_ms default to 0 as
 specified; a follow-up can expose `QueryTracker::timing_for(id)` if needed.
+
+## Fix (PII redaction + Query e2e)
+
+### Finding 1: unconditional redact_pii on log_event
+
+The fix adds a private `redact_event_query` method to `AuditLogger` in
+`crates/sqe-metrics/src/audit/logger.rs`. The method applies `redact_pii` to
+`event.query.text` when `query` and `text` are `Some`. Both `write_event` and
+`write_events` are updated with an `else` branch:
+
+```rust
+if let Some(g) = gdpr {
+    Self::apply_gdpr_masking(&mut event, g);
+} else {
+    Self::redact_event_query(&mut event);
+}
+```
+
+`redact_pii` now runs exactly once in every code path:
+- GDPR on: inside `apply_gdpr_masking` (step 3 of its masking order, unchanged).
+- GDPR off: via `redact_event_query` (the previously missing case).
+
+Both run before `chain.stamp`, so the chain hash covers redacted bytes and no
+sink ever sees raw PII. The GDPR-on output bytes are byte-identical to pre-fix
+(no double-redaction, no ordering change).
+
+### Finding 2: Query-path e2e test
+
+Added `audit_select_query_emits_canonical_event_and_redacts_pii` to
+`crates/sqe-coordinator/tests/it/audit_e2e_test.rs`. The test:
+
+- Wires a MockServer responding to `/v1/config` and `/v1/namespaces` so that
+  `create_session_context` succeeds without Docker.
+- Adds `make_fixture_with_url(url)` helper alongside the existing `make_fixture`.
+- Drives `QueryHandler::execute` with a `SELECT table_name FROM
+  information_schema.tables WHERE table_name = 'leak@example.com'`. The
+  `information_schema.tables` virtual table is built into DataFusion; the WHERE
+  clause never matches any real table but the PII literal travels through the
+  SQL text path.
+- Flushes and reads the JSONL file, asserting:
+  1. `entry["kind"] == "query"` (canonical AuditEvent, not flat AuditEntry).
+  2. `entry["actor"]["username"] == "auditor"` (session username).
+  3. `entry["resources"].is_array()` (structured resource list from the
+     `information_schema.tables` TableScan).
+  4. `entry["statement_type"].is_null()` (field lives under `query.statement_type`
+     in AuditEvent, not at top level; flat AuditEntry has it at top level).
+  5. `raw_content` does not contain `"leak@example.com"` (direct PII regression guard).
+
+Distinguishing field note: `AuditEvent` serializes with a top-level `"status"` field
+(from `#[serde(flatten)]` on `Outcome` with `#[serde(tag = "status")]`), so `"status"`
+is NOT the distinguishing field. The actual distinguishing field is `"kind"`, which only
+`AuditEvent` carries. `AuditEntry` has `"statement_type"` at top level, which `AuditEvent`
+does not.
+
+### Finding 3: comment fix
+
+Updated the inline comment in `query_handler.rs` at the `query.text` assignment. Previous
+comment claimed the worker "will apply GDPR/PII masking" unconditionally. Corrected to:
+"The worker thread always applies `redact_pii` to `query.text` before chain stamping.
+When GDPR config is active, GDPR-tag masking runs additionally via `apply_gdpr_masking`.
+Do NOT redact here: caller-side redaction would double-apply."
+
+### Covering test results
+
+- `cargo test -p sqe-metrics`: 78 passed (includes new
+  `log_event_redacts_pii_without_gdpr_config`), 0 failed.
+- `cargo test -p sqe-coordinator audit`: 7 passed (includes new
+  `audit_select_query_emits_canonical_event_and_redacts_pii`), 1 ignored
+  (pre-existing Docker-requiring test), 0 failed.
+- `cargo clippy -p sqe-metrics -p sqe-coordinator --all-targets --all-features
+  -- -D warnings`: clean.
