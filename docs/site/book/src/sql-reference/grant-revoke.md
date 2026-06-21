@@ -126,24 +126,37 @@ The structural difference: SQE keeps policy in-engine, plan-rewritten before opt
 
 ## Backends
 
-`PolicyStore` is pluggable. Three implementations ship today:
+Two orthogonal settings control access control, and both default to off:
 
-| Backend | Use case | Where it lives |
+`[access_control] backend` decides where GRANT/REVOKE are stored and resolved:
+
+| `backend` | Use case | Where it lives |
 |---|---|---|
-| `InMemory` | Single-node dev, tests. Grants stored in a hash map. | `crates/sqe-policy/src/in_memory_store.rs` |
-| `Postgres` | Cluster mode default. Grants persisted in a tenant-scoped table. | `crates/sqe-policy/src/postgres_store.rs` |
-| `OPA` (Open Policy Agent) | Rego-based policy. The store sends the resolved query plan + identity to OPA, OPA returns row filters / column masks as JSON. | `crates/sqe-policy/src/opa_store.rs` |
-| `Cedar` | AWS Cedar-language policy. Same shape as OPA. | `crates/sqe-policy/src/cedar_store.rs` |
+| `none` (default) | OSS default. GRANT/REVOKE parse but are not enforced. | n/a |
+| `polaris` | Grants resolved from Apache Polaris (`PRINCIPAL` / `PRINCIPAL_ROLE` / `CATALOG_ROLE`). | `crates/sqe-policy/src/grants/polaris.rs` |
+| `ranger` | Grants written to Ranger Admin via the Polaris embedded authorizer. | `crates/sqe-policy/src/grants/ranger.rs` |
+| `chameleon` | Schuberg Philis platform API (`GROUP` / `USER` grantees). | platform API client |
 
-Pick a backend in `[security.policy]` of the engine config:
+`[policy] engine` decides how row filters and column masks are evaluated:
+
+| `engine` | Use case | Where it lives |
+|---|---|---|
+| `passthrough` (default) | No enforcement. Plans returned unmodified. | `PassthroughEnforcer` |
+| `in-memory` | Single-node dev and tests. Policies in a hash map. | `crates/sqe-policy/src/policy_store.rs` |
+| `ranger` | Apache Ranger fine-grained policies (row-filter + data-mask), requires `[policy.ranger].url`. | `crates/sqe-policy/src/ranger_store.rs` |
+| `opa` / `cedar` | Defined in config but not yet wired (selecting them errors today). | `crates/sqe-policy/src/opa.rs` (OPA) |
+
+Configure them in the engine TOML:
 
 ```toml
-[security.policy]
-backend = "postgres"        # or "opa", "cedar", "in_memory"
-url = "postgres://policy_db"
+[access_control]
+backend = "ranger"          # none (default) | polaris | ranger | chameleon
+
+[policy]
+engine = "ranger"           # passthrough (default) | in-memory | ranger
 ```
 
-OPA / Cedar add a network round trip per query but let the security team author policy in their language of choice.
+A default OSS deployment leaves both at their defaults and runs the open Iceberg SQL surface with grants parsed but unenforced.
 
 ## Why plan rewriting, not connector hooks
 
