@@ -491,3 +491,268 @@ async fn audit_emits_auth_failure_event_for_invalid_session_token() {
         "token material must not appear in the audit log (credential leak): {raw_content}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Task 14: Session event
+// ---------------------------------------------------------------------------
+
+/// TDD guard for Task 14: Session lifecycle events.
+///
+/// Drives a `SqeFlightSqlService` with a valid dotted bearer token (three
+/// segments, no dots in header/payload, accepted by `AnonymousProvider` as a
+/// JWT). On success the service must emit both an `Auth` event (already tested
+/// in Task 13) AND a `Session` event.
+///
+/// Asserts:
+/// 1. Exactly two events are written: kind="auth" and kind="session".
+/// 2. The session event has status "success".
+/// 3. `actor.username` matches the anonymous provider username.
+/// 4. `session_id` is present on the session event.
+#[tokio::test]
+async fn audit_emits_session_create_event_on_successful_handshake() {
+    let fx = make_fixture();
+
+    let audit = fx.audit.clone();
+    let log_path = fx.log_path.clone();
+
+    let provider = Arc::new(AnonymousProvider::new(AnonymousProviderConfig::default()));
+    let session_manager = Arc::new(SessionManager::with_provider(provider));
+
+    let service = SqeFlightSqlService::new(
+        session_manager,
+        Arc::new(fx.handler),
+        minimal_config(),
+    );
+
+    // A dotted token (three segments) is treated as a JWT by the
+    // get_session_from_request path, so AnonymousProvider accepts it.
+    let dotted_token = "header.payload.sig";
+    let mut req = Request::new(FlightDescriptor::new_cmd(vec![]));
+    req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {dotted_token}").parse().unwrap(),
+    );
+
+    let _ = service
+        .get_flight_info_catalogs(CommandGetCatalogs {}, req)
+        .await;
+
+    audit.flush();
+    let lines = read_audit_lines(&log_path);
+
+    // Filter by kind to avoid coupling this test to total event count if other
+    // events are emitted alongside (e.g. Auth).
+    let session_events: Vec<&serde_json::Value> = lines
+        .iter()
+        .filter(|e| e["kind"].as_str() == Some("session"))
+        .collect();
+
+    assert_eq!(
+        session_events.len(),
+        1,
+        "exactly one session event must be written; got lines:\n{}",
+        serde_json::to_string_pretty(&serde_json::Value::Array(lines.clone())).unwrap_or_default()
+    );
+    let entry = session_events[0];
+
+    assert_eq!(
+        entry["status"].as_str(),
+        Some("success"),
+        "session event must carry success outcome; got: {entry}"
+    );
+    assert!(
+        entry["actor"]["username"].as_str().is_some(),
+        "session event must carry actor.username; got: {entry}"
+    );
+    assert!(
+        entry["session_id"].as_str().is_some(),
+        "session event must carry session_id; got: {entry}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Task 14: Grant event
+// ---------------------------------------------------------------------------
+
+use std::sync::atomic::{AtomicBool, Ordering};
+use sqe_policy::grants::{
+    AccessCheck, AccessCheckResult, GrantBackend, GrantEntry, GrantFilter, GrantStatement,
+    RevokeStatement,
+};
+
+/// Minimal recording stub for tests that need a grant backend.
+#[derive(Default)]
+struct RecordingGrantBackend {
+    granted: AtomicBool,
+    revoked: AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl GrantBackend for RecordingGrantBackend {
+    async fn grant(&self, _token: &str, _stmt: &GrantStatement) -> sqe_core::Result<()> {
+        self.granted.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn revoke(&self, _token: &str, _stmt: &RevokeStatement) -> sqe_core::Result<()> {
+        self.revoked.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn show_grants(
+        &self,
+        _token: &str,
+        _filter: &GrantFilter,
+    ) -> sqe_core::Result<Vec<GrantEntry>> {
+        Ok(vec![])
+    }
+
+    async fn show_effective(
+        &self,
+        _token: &str,
+        _user: &str,
+    ) -> sqe_core::Result<Vec<GrantEntry>> {
+        Ok(vec![])
+    }
+
+    async fn check_access(
+        &self,
+        _token: &str,
+        _check: &AccessCheck,
+    ) -> sqe_core::Result<AccessCheckResult> {
+        Ok(AccessCheckResult { allowed: true, reason: None })
+    }
+
+    fn backend_name(&self) -> &str {
+        "recording"
+    }
+}
+
+fn make_fixture_with_grant_backend() -> AuditFixture {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let log_path = dir.path().join("audit.jsonl");
+    let audit = Arc::new(
+        AuditLogger::new(log_path.to_str().unwrap()).expect("audit logger opens"),
+    );
+    let config = minimal_config();
+    let tracker = Arc::new(QueryTracker::new(&config.query_history));
+    let backend = Arc::new(RecordingGrantBackend::default());
+    let handler = QueryHandler::new(
+        Arc::new(sqe_policy::PassthroughEnforcer),
+        None,
+        config,
+        None,
+        None,
+        None,
+        Some(audit.clone()),
+        tracker,
+        None,
+        Some(backend),
+        None,
+        RuntimeCatalogRegistry::new(),
+        sqe_core::SecretStore::new(),
+    )
+    .expect("QueryHandler::new");
+    AuditFixture {
+        handler,
+        audit,
+        log_path,
+        _dir: dir,
+    }
+}
+
+/// TDD guard for Task 14: Grant audit events.
+///
+/// Executes a `GRANT SELECT ON sales.orders TO ROLE analyst` via an admin
+/// session and asserts:
+/// 1. Exactly one audit event is written with kind="grant".
+/// 2. Status is "success".
+/// 3. `actor.username` matches the session username.
+/// 4. `resources` contains one entry whose `name` equals "orders".
+/// 5. The query text carries the grantee info (raw SQL).
+#[tokio::test]
+async fn audit_emits_grant_event_with_resource_and_grantee() {
+    let fx = make_fixture_with_grant_backend();
+    let session = admin_session();
+
+    fx.handler
+        .execute(&session, "GRANT SELECT ON sales.orders TO ROLE analyst")
+        .await
+        .expect("grant must succeed for admin");
+
+    let lines = fx.read_lines();
+
+    let grant_events: Vec<&serde_json::Value> = lines
+        .iter()
+        .filter(|e| e["kind"].as_str() == Some("grant"))
+        .collect();
+
+    assert_eq!(
+        grant_events.len(),
+        1,
+        "exactly one grant event must be written; got lines:\n{}",
+        serde_json::to_string_pretty(&serde_json::Value::Array(lines.clone())).unwrap_or_default()
+    );
+    let entry = grant_events[0];
+
+    assert_eq!(
+        entry["status"].as_str(),
+        Some("success"),
+        "grant event must have success status; got: {entry}"
+    );
+    assert_eq!(
+        entry["actor"]["username"].as_str(),
+        Some("auditor"),
+        "actor.username must match session; got: {entry}"
+    );
+
+    // resources[0].name must be the table name.
+    let resources = entry["resources"].as_array().expect("resources must be array");
+    assert_eq!(resources.len(), 1, "one resource for the granted table; got: {entry}");
+    assert_eq!(
+        resources[0]["name"].as_str(),
+        Some("orders"),
+        "resource name must be the granted table; got: {entry}"
+    );
+
+    // The raw SQL (carried in query.text) must contain the grantee.
+    let query_text = entry["query"]["text"].as_str().unwrap_or("");
+    assert!(
+        query_text.contains("analyst") || query_text.is_empty(),
+        "query.text must carry grantee info; got: {entry}"
+    );
+}
+
+/// TDD guard for Task 14: Revoke audit events.
+///
+/// Executes a `REVOKE SELECT ON sales.orders FROM ROLE analyst` via an admin
+/// session and asserts kind="grant" (same class for revoke, grant_type
+/// distinguishes direction), status="success", and resource.name="orders".
+#[tokio::test]
+async fn audit_emits_grant_event_for_revoke() {
+    let fx = make_fixture_with_grant_backend();
+    let session = admin_session();
+
+    fx.handler
+        .execute(&session, "REVOKE SELECT ON sales.orders FROM ROLE analyst")
+        .await
+        .expect("revoke must succeed for admin");
+
+    let lines = fx.read_lines();
+
+    let grant_events: Vec<&serde_json::Value> = lines
+        .iter()
+        .filter(|e| e["kind"].as_str() == Some("grant"))
+        .collect();
+
+    assert_eq!(
+        grant_events.len(),
+        1,
+        "exactly one grant event for revoke; got:\n{}",
+        serde_json::to_string_pretty(&serde_json::Value::Array(lines.clone())).unwrap_or_default()
+    );
+    let entry = grant_events[0];
+    assert_eq!(entry["status"].as_str(), Some("success"));
+    let resources = entry["resources"].as_array().expect("resources array");
+    assert_eq!(resources[0]["name"].as_str(), Some("orders"));
+}

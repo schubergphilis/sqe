@@ -1505,6 +1505,12 @@ impl QueryHandler {
             // AuditEvent path so the event carries a fully-populated Actor,
             // structured Resource list, and typed policy/timing/stats blocks.
             //
+            // GRANT/REVOKE are routed through the canonical AuditKind::Grant
+            // path (Task 14). The raw SQL text in query.text carries grantee
+            // info; the worker thread's redact_pii pass sanitises it before
+            // chain stamping. No secrets travel in GRANT/REVOKE SQL so the
+            // redacted-legacy path is not required for these statement kinds.
+            //
             // All other statement kinds (DDL, DML, admin) remain on the legacy
             // log(&AuditEntry) path. That path applies PII redaction before
             // writing, which is critical for CREATE SECRET statements that carry
@@ -1584,6 +1590,72 @@ impl QueryHandler {
                     integrity: sqe_metrics::audit::Integrity::default(),
                 };
                 audit.log_event(event);
+            } else if matches!(&kind, StatementKind::Grant(_) | StatementKind::Revoke(_)) {
+                // Canonical path for GRANT/REVOKE (Task 14, OCSF Account Change 3001).
+                // Build a Resource from the parsed grant statement so the target object
+                // is structured. The raw SQL travels in query.text where the worker
+                // thread's redact_pii pass handles sanitisation.
+                let grant_resources = kind
+                    .statement()
+                    .and_then(|ast_stmt| Self::extract_grant_statement(ast_stmt).ok())
+                    .map(|gs| {
+                        let name = gs.table
+                            .clone()
+                            .or_else(|| gs.namespace.clone())
+                            .or_else(|| gs.catalog.clone())
+                            .unwrap_or_else(|| "*".to_string());
+                        vec![sqe_metrics::audit::Resource {
+                            catalog: gs.catalog,
+                            namespace: gs.namespace
+                                .map(|n| vec![n])
+                                .unwrap_or_default(),
+                            name,
+                            object_type: sqe_metrics::audit::ObjectType::Table,
+                        }]
+                    })
+                    .unwrap_or_default();
+
+                let grant_outcome = match &result {
+                    Ok(_) => sqe_metrics::audit::Outcome::Success,
+                    Err(e) => sqe_metrics::audit::Outcome::Failure {
+                        error_type: Some(e.error_code().trino_error_type().to_string()),
+                        error_code: Some(e.error_code().name().to_string()),
+                        message: Some(e.client_message()),
+                    },
+                };
+
+                let grant_actor = sqe_metrics::audit::Actor::from_parts(
+                    session.user.username.clone(),
+                    session.user.subject.clone(),
+                    session.user.email.clone(),
+                    session.user.roles.clone(),
+                    session.user.groups.clone(),
+                );
+
+                let grant_event = sqe_metrics::audit::AuditEvent {
+                    time: chrono::Utc::now(),
+                    kind: sqe_metrics::audit::AuditKind::Grant,
+                    actor: grant_actor,
+                    outcome: grant_outcome,
+                    resources: grant_resources,
+                    policy: None,
+                    timing: Some(sqe_metrics::audit::Timing {
+                        duration_ms: duration.as_millis() as u64,
+                        queued_ms: 0,
+                        planning_ms: 0,
+                        execution_ms: 0,
+                    }),
+                    stats: None,
+                    query: Some(sqe_metrics::audit::QueryInfo {
+                        text: Some(sql.to_string()),
+                        query_hash: sqe_metrics::audit::query_hash(sql),
+                        statement_type: kind_name,
+                    }),
+                    session_id: Some(session.id.clone()),
+                    client_ip: None,
+                    integrity: sqe_metrics::audit::Integrity::default(),
+                };
+                audit.log_event(grant_event);
             } else {
                 // Legacy path for DDL, DML, admin statements.
                 // PII redaction runs inside log() before the entry is queued.

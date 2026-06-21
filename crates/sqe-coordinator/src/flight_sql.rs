@@ -505,6 +505,42 @@ impl SqeFlightSqlService {
         }
     }
 
+    /// Emit a Session lifecycle event (OCSF Authorize Session 3003).
+    ///
+    /// Called alongside `emit_auth_event` on every successful credential
+    /// exchange (handshake and JWT bearer). Auth events record the
+    /// authentication attempt; Session events record the resulting session
+    /// establishment. The two events are distinct: a replayed session token
+    /// produces no Session event (it doesn't create a new session), while a
+    /// fresh handshake produces both.
+    ///
+    /// Only emitted on success; eviction and expiry are not yet tracked
+    /// (no AuditLogger path from SessionManager without a second wiring).
+    fn emit_session_event(
+        &self,
+        actor: sqe_metrics::audit::Actor,
+        client_ip: Option<String>,
+        session_id: Option<String>,
+    ) {
+        if let Some(ref audit) = self.audit {
+            let event = sqe_metrics::audit::AuditEvent {
+                time: chrono::Utc::now(),
+                kind: sqe_metrics::audit::AuditKind::Session,
+                actor,
+                outcome: sqe_metrics::audit::Outcome::Success,
+                resources: vec![],
+                policy: None,
+                timing: None,
+                stats: None,
+                query: None,
+                session_id,
+                client_ip,
+                integrity: sqe_metrics::audit::Integrity::default(),
+            };
+            audit.log_event(event);
+        }
+    }
+
     /// Resolve the source IP for audit and rate-limit purposes.
     ///
     /// Issue #74: `x-forwarded-for` is honoured only when the request's
@@ -603,15 +639,21 @@ impl SqeFlightSqlService {
                         session_id = %session.id,
                         "Flight: authenticated via validated JWT bearer token"
                     );
+                    let jwt_actor = sqe_metrics::audit::Actor::from_parts(
+                        session.user.username.clone(),
+                        session.user.subject.clone(),
+                        session.user.email.clone(),
+                        session.user.roles.clone(),
+                        session.user.groups.clone(),
+                    );
                     self.emit_auth_event(
                         sqe_metrics::audit::Outcome::Success,
-                        sqe_metrics::audit::Actor::from_parts(
-                            session.user.username.clone(),
-                            session.user.subject.clone(),
-                            session.user.email.clone(),
-                            session.user.roles.clone(),
-                            session.user.groups.clone(),
-                        ),
+                        jwt_actor.clone(),
+                        Some(client_ip.clone()),
+                        Some(session.id.clone()),
+                    );
+                    self.emit_session_event(
+                        jwt_actor,
                         Some(client_ip),
                         Some(session.id.clone()),
                     );
@@ -970,15 +1012,21 @@ impl FlightSqlService for SqeFlightSqlService {
             session_id = %session.id,
             "Handshake authentication successful"
         );
+        let handshake_actor = sqe_metrics::audit::Actor::from_parts(
+            session.user.username.clone(),
+            session.user.subject.clone(),
+            session.user.email.clone(),
+            session.user.roles.clone(),
+            session.user.groups.clone(),
+        );
         self.emit_auth_event(
             sqe_metrics::audit::Outcome::Success,
-            sqe_metrics::audit::Actor::from_parts(
-                session.user.username.clone(),
-                session.user.subject.clone(),
-                session.user.email.clone(),
-                session.user.roles.clone(),
-                session.user.groups.clone(),
-            ),
+            handshake_actor.clone(),
+            Some(client_ip.clone()),
+            Some(session.id.clone()),
+        );
+        self.emit_session_event(
+            handshake_actor,
             Some(client_ip),
             Some(session.id.clone()),
         );
