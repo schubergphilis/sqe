@@ -253,9 +253,10 @@ scenario-test:
 # RUN_AWS_SCENARIOS gates the body so an accidental trigger without creds is a
 # clear no-op rather than a half-deployed stack.
 #
-# The AWS run.sh scripts do not yet support `--check`; this job invokes their
-# default deploy -> verify -> destroy flow directly. Adding a `--check` mode to
-# the AWS scenarios (and folding them into scripts/test.sh) is a follow-up.
+# The AWS run.sh scripts support `--check`: each runs its deploy -> round-trip
+# flow, asserts the OUTPUT-derived invariants, and tears the resources back down
+# (the assertions run before teardown, so a failed assertion still cleans up the
+# stack). This job invokes them with `--check` so the gated run actually asserts.
 scenario-test-aws:
   stage: test
   image: docker:24
@@ -274,7 +275,8 @@ scenario-test-aws:
     # NOTE: run.sh uses `aws configure export-credentials` (AWS CLI v2 only).
     # Alpine's `aws-cli` apk package is v1 and lacks that subcommand, so a real
     # runner for this job must provide AWS CLI v2 (custom image or v2 install
-    # step). Wiring v2 is part of the AWS --check follow-up; this is a skeleton.
+    # step). Wiring AWS CLI v2 into a real runner image is the remaining piece;
+    # this is a skeleton.
     - apk add --no-cache bash curl docker-compose aws-cli nodejs npm python3
   script:
     - |
@@ -284,9 +286,9 @@ scenario-test-aws:
       fi
     # Fail fast with a clear message if the AWS credentials are not wired.
     - 'test -n "${AWS_ACCESS_KEY_ID:-}" || { echo "ERROR: AWS_ACCESS_KEY_ID not set. Configure AWS_* CI/CD variables before triggering this job."; exit 1; }'
-    - ( cd quickstart/aws-glue && ./run.sh )
-    - ( cd quickstart/aws-s3-tables && ./run.sh )
-    - ( cd quickstart/glue-lake-formation && ./run.sh )
+    - ( cd quickstart/aws-glue && ./run.sh --check )
+    - ( cd quickstart/aws-s3-tables && ./run.sh --check )
+    - ( cd quickstart/glue-lake-formation && ./run.sh --check )
   rules:
     - when: manual
       allow_failure: true
