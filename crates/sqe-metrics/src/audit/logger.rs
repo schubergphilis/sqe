@@ -529,14 +529,6 @@ impl AuditLogger {
 
         if !masked_cols.is_empty() {
             out = mask_gdpr_columns(&out, &masked_cols, *mode, salt);
-            // If `email` is a masked column, also clear the actor.email field
-            // so the identifier does not leak through the structured audit
-            // fields (the JSON key "email" would otherwise survive in the
-            // serialized actor object).
-            let has_email_col = masked_cols.iter().any(|c| c.eq_ignore_ascii_case("email"));
-            if has_email_col {
-                event.actor.email = None;
-            }
         }
 
         // Always apply PII pattern redaction.
@@ -1069,8 +1061,27 @@ mod tests {
         logger.log_event(ev);
         logger.flush();
         let content = std::fs::read_to_string(&path).unwrap();
-        assert!(!content.contains("alice@x.io"), "GDPR value leaked: {content}");
-        assert!(!content.contains("email"), "GDPR identifier leaked: {content}");
+        // Parse the written line as JSON so we can check the right fields.
+        let line = content.lines().next().expect("at least one line written");
+        let v: serde_json::Value = serde_json::from_str(line)
+            .unwrap_or_else(|e| panic!("line is not valid JSON: {e}\n{line}"));
+        // The query text must not contain the GDPR column identifier or its value.
+        let query_text = v["query"]["text"].as_str().unwrap_or("");
+        assert!(
+            !query_text.contains("alice@x.io"),
+            "GDPR value leaked in query.text: {query_text}"
+        );
+        assert!(
+            !query_text.contains("email"),
+            "GDPR column identifier leaked in query.text: {query_text}"
+        );
+        // Actor identity must be preserved: GDPR masking applies only to queried
+        // table columns, not to the authenticated user's own identity.
+        let actor_email = v["actor"]["email"].as_str().unwrap_or("");
+        assert_eq!(
+            actor_email, "alice@corp.example",
+            "actor.email must survive GDPR masking (OCSF accountability requirement)"
+        );
     }
 
     #[test]
