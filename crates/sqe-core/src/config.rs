@@ -2340,6 +2340,62 @@ impl Default for AuditConfig {
     }
 }
 
+/// OTLP audit export configuration. Nested under `[metrics.audit_export]` in
+/// config files and via `SQE_METRICS__AUDIT_EXPORT__*` env overrides.
+///
+/// Disabled by default (`enabled = false`) to preserve existing behavior.
+/// When enabled, audit events are spooled to `spool_path` and flushed to the
+/// configured OTLP endpoint in batches.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct AuditExportConfig {
+    /// Enable the OTLP audit exporter. Default: false.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Export target. Currently only "otlp" is supported. Default: "otlp".
+    #[serde(default = "default_export_target")]
+    pub target: String,
+    /// OTLP endpoint URL for audit log export (e.g. "http://collector:4317").
+    #[serde(default)]
+    pub otlp_endpoint: String,
+    /// Path for the on-disk spool used to buffer events before export.
+    #[serde(default)]
+    pub spool_path: String,
+    /// Maximum number of events per export batch. Default: 512.
+    #[serde(default = "default_export_batch_max")]
+    pub batch_max: usize,
+    /// Flush interval in milliseconds. Default: 2000.
+    #[serde(default = "default_export_flush_ms")]
+    pub flush_interval_ms: u64,
+    /// Maximum spool size in bytes before back-pressure applies. Default: 1 GiB.
+    #[serde(default = "default_export_max_spool")]
+    pub max_spool_bytes: u64,
+    /// Where to start replaying the spool on restart: "now" skips historical
+    /// events; "beginning" replays from the oldest spooled event. Default: "now".
+    #[serde(default = "default_export_start_at")]
+    pub start_at: String,
+}
+
+fn default_export_target() -> String { "otlp".into() }
+fn default_export_batch_max() -> usize { 512 }
+fn default_export_flush_ms() -> u64 { 2000 }
+fn default_export_max_spool() -> u64 { 1_073_741_824 }
+fn default_export_start_at() -> String { "now".into() }
+
+impl Default for AuditExportConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            target: default_export_target(),
+            otlp_endpoint: String::new(),
+            spool_path: String::new(),
+            batch_max: default_export_batch_max(),
+            flush_interval_ms: default_export_flush_ms(),
+            max_spool_bytes: default_export_max_spool(),
+            start_at: default_export_start_at(),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct MetricsConfig {
     #[serde(default = "default_prometheus_port")]
@@ -2364,6 +2420,9 @@ pub struct MetricsConfig {
     /// Audit-log format and GDPR knobs. See `AuditConfig` for field docs.
     #[serde(default)]
     pub audit: AuditConfig,
+    /// OTLP audit export configuration. See `AuditExportConfig` for field docs.
+    #[serde(default)]
+    pub audit_export: AuditExportConfig,
 }
 
 fn default_trace_sample_rate() -> f64 {
@@ -2380,6 +2439,7 @@ impl Default for MetricsConfig {
             openlineage: OpenLineageConfig::default(),
             web_ui: false,
             audit: AuditConfig::default(),
+            audit_export: AuditExportConfig::default(),
         }
     }
 }
@@ -3285,6 +3345,20 @@ impl SqeConfig {
         env_override_bool(
             "SQE_METRICS__AUDIT__SUPERDEBUG_LOG_RESULTS",
             &mut self.metrics.audit.superdebug_log_results,
+        );
+
+        // Metrics: AuditExport
+        env_override_bool(
+            "SQE_METRICS__AUDIT_EXPORT__ENABLED",
+            &mut self.metrics.audit_export.enabled,
+        );
+        env_override_str(
+            "SQE_METRICS__AUDIT_EXPORT__OTLP_ENDPOINT",
+            &mut self.metrics.audit_export.otlp_endpoint,
+        );
+        env_override_str(
+            "SQE_METRICS__AUDIT_EXPORT__SPOOL_PATH",
+            &mut self.metrics.audit_export.spool_path,
         );
 
         // Metrics: OpenLineage
@@ -5812,5 +5886,16 @@ mod ranger_config_tests {
         assert!(c.gdpr_tags.is_empty());
         assert_eq!(c.gdpr_identifier_mode, "tokenize");
         assert!(!c.superdebug_log_results);
+    }
+
+    #[test]
+    fn audit_export_config_defaults() {
+        let c = AuditExportConfig::default();
+        assert!(!c.enabled);
+        assert_eq!(c.target, "otlp");
+        assert_eq!(c.batch_max, 512);
+        assert_eq!(c.flush_interval_ms, 2000);
+        assert_eq!(c.start_at, "now");
+        assert_eq!(c.max_spool_bytes, 1_073_741_824);
     }
 }
