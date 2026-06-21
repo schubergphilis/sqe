@@ -96,6 +96,61 @@ def load_runs():
     return runs
 
 
+# ── Run quality filter ───────────────────────────────────────────────────────
+
+def _summary_counts(run):
+    """Return (total, passed, failed, errored) for a run.
+
+    Prefer the explicit summary fields; fall back to counting queries by
+    status when a field is missing, mirroring how the rest of the script
+    treats summary vs queries.
+    """
+    summary = run.get("summary", {})
+    queries = run.get("queries", [])
+    total = summary.get("total")
+    if total is None:
+        total = len(queries)
+    passed = summary.get("pass")
+    if passed is None:
+        passed = sum(1 for q in queries if q.get("status") == "pass")
+    failed = summary.get("fail")
+    if failed is None:
+        failed = sum(1 for q in queries if q.get("status") == "fail")
+    errored = summary.get("error")
+    if errored is None:
+        errored = sum(1 for q in queries if q.get("status") == "error")
+    return total, passed, failed, errored
+
+
+def clean_full_runs(runs):
+    """Keep only runs that ran the full suite with every query passing.
+
+    Incomplete runs (fewer queries than the suite's max) and skip-heavy runs
+    (full count but many SKIPPED queries, so near-zero duration) plot as
+    artificially fast downward outliers on the duration charts. We compute the
+    full query count as the max total seen across the given runs, then keep a
+    run only when its duration is positive, it ran the full count, and every
+    query passed with no failures or errors. This mirrors the interactive
+    getsqe aggregator filter.
+    """
+    if not runs:
+        return runs
+    full_count = max(_summary_counts(r)[0] for r in runs)
+    clean = []
+    for r in runs:
+        total, passed, failed, errored = _summary_counts(r)
+        duration = r["summary"].get("total_duration_ms", 0)
+        if (
+            duration > 0
+            and total == full_count
+            and passed == total
+            and (failed in (0, None))
+            and (errored in (0, None))
+        ):
+            clean.append(r)
+    return clean
+
+
 # ── Plot helpers ────────────────────────────────────────────────────────────
 
 def _setup_time_axis(ax):
@@ -105,6 +160,11 @@ def _setup_time_axis(ax):
 
 
 def plot_total_duration(suite, scale, runs, out: Path):
+    # Duration chart: only full-suite all-pass runs, so partial and skip-heavy
+    # runs do not show up as artificially fast downward outliers.
+    runs = clean_full_runs(runs)
+    if not runs:
+        return
     times = [r["ts"] for r in runs]
     secs = [r["summary"].get("total_duration_ms", 0) / 1000.0 for r in runs]
 
@@ -215,7 +275,8 @@ def plot_cross_scale(suite, runs_by_scale, out: Path):
     colors = {"sf0.1": "#1f77b4", "sf1": "#ff7f0e", "sf10": "#2ca02c"}
     plotted_any = False
     for scale in HEADLINE_SCALES:
-        runs = runs_by_scale.get(scale, [])
+        # Duration chart: same full-suite all-pass filter as the per-scale total.
+        runs = clean_full_runs(runs_by_scale.get(scale, []))
         if not runs:
             continue
         times = [r["ts"] for r in runs]
