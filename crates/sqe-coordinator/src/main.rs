@@ -273,6 +273,10 @@ async fn async_main() -> anyhow::Result<()> {
     };
     let audit = Arc::new(audit_logger);
 
+    // Guard + self-audit the superdebug_log_results escape hatch.
+    // No-op when the flag is false (the default).
+    sqe_coordinator::maybe_warn_superdebug(&audit, &config);
+
     // AUTH-01: build the enforcer + store from config.policy.engine.
     // table_cache is passed so the rewriter can wire CacheTagSource for
     // tag-based column masking (Task 4). A clone is taken here; the original
