@@ -24,6 +24,9 @@ require docker
 IMG="${SQE_IMAGE:-sqe-quickstart:latest}"
 docker image inspect "$IMG" >/dev/null 2>&1 || die "image $IMG not found. Build it: (cd ../polaris-keycloak-client-id && docker compose build sqe) or set SQE_IMAGE."
 
+# --check must be re-runnable, so it always starts from clean catalogs.
+# Interactive ./run.sh keeps the persisted catalogs; use --clean to reset.
+[ "${CHECK:-0}" = 1 ] && rm -rf catalogs
 mkdir -p catalogs/sales catalogs/ref
 S="$PWD/catalogs/sales" R="$PWD/catalogs/ref"
 
