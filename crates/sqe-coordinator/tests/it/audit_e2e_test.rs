@@ -573,18 +573,18 @@ async fn audit_jwt_path_emits_auth_not_session() {
     );
 }
 
-/// Unit-level guard that `emit_session_event` writes a well-formed Session
-/// event. This exercises the helper directly since `do_handshake` requires
-/// gRPC server machinery to invoke end-to-end.
+/// Unit-level guard that the AuditLogger round-trips a Session event correctly.
+/// Constructs an `AuditEvent` with `kind=Session` and logs it directly via
+/// `audit.log_event`, then reads back the JSONL and asserts the serialized
+/// fields. This does NOT exercise `do_handshake` or `emit_session_event`
+/// (both require gRPC server machinery). The handshake-vs-JWT cardinality
+/// contract is covered by `audit_jwt_path_emits_auth_not_session`.
 ///
 /// Asserts kind="session", status="success", actor.username, and session_id.
 #[tokio::test]
-async fn audit_emits_session_create_event_on_successful_handshake() {
-    // Re-use the flight service fixture: construct a service with an audit
-    // logger and invoke emit_session_event by inspecting the written log.
-    // Because do_handshake calls authenticate_credentials + emit_session_event,
-    // we verify the helper output shape via a SessionManager round-trip: create
-    // a session manually and check what the helper writes.
+async fn audit_logger_round_trips_session_event() {
+    // Construct an AuditLogger backed by a tempfile and log a Session event
+    // directly to verify the serialization round-trip.
     let dir = tempfile::tempdir().expect("tempdir");
     let log_path = dir.path().join("audit.jsonl");
     let audit = Arc::new(
@@ -648,7 +648,6 @@ async fn audit_emits_session_create_event_on_successful_handshake() {
 // Task 14: Grant event
 // ---------------------------------------------------------------------------
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use sqe_policy::grants::{
     AccessCheck, AccessCheckResult, GrantBackend, GrantEntry, GrantFilter, GrantStatement,
     RevokeStatement,
@@ -656,20 +655,15 @@ use sqe_policy::grants::{
 
 /// Minimal recording stub for tests that need a grant backend.
 #[derive(Default)]
-struct RecordingGrantBackend {
-    granted: AtomicBool,
-    revoked: AtomicBool,
-}
+struct RecordingGrantBackend;
 
 #[async_trait::async_trait]
 impl GrantBackend for RecordingGrantBackend {
     async fn grant(&self, _token: &str, _stmt: &GrantStatement) -> sqe_core::Result<()> {
-        self.granted.store(true, Ordering::SeqCst);
         Ok(())
     }
 
     async fn revoke(&self, _token: &str, _stmt: &RevokeStatement) -> sqe_core::Result<()> {
-        self.revoked.store(true, Ordering::SeqCst);
         Ok(())
     }
 
@@ -710,7 +704,7 @@ fn make_fixture_with_grant_backend() -> AuditFixture {
     );
     let config = minimal_config();
     let tracker = Arc::new(QueryTracker::new(&config.query_history));
-    let backend = Arc::new(RecordingGrantBackend::default());
+    let backend = Arc::new(RecordingGrantBackend);
     let handler = QueryHandler::new(
         Arc::new(sqe_policy::PassthroughEnforcer),
         None,
@@ -790,10 +784,14 @@ async fn audit_emits_grant_event_with_resource_and_grantee() {
     );
 
     // The raw SQL (carried in query.text) must contain the grantee.
-    let query_text = entry["query"]["text"].as_str().unwrap_or("");
+    // `unwrap_or("")` is intentionally avoided here: if query.text is absent
+    // the assertion must fail, not silently pass.
+    let query_text = entry["query"]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("query.text must be present in the grant event; got: {entry}"));
     assert!(
-        query_text.contains("analyst") || query_text.is_empty(),
-        "query.text must carry grantee info; got: {entry}"
+        query_text.contains("analyst"),
+        "query.text must carry the grantee name 'analyst'; got query.text={query_text:?}, entry={entry}"
     );
 }
 
