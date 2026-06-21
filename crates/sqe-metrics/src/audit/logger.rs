@@ -493,9 +493,11 @@ impl AuditLogger {
     ///    - `None`: set a `fallback` flag (unknown tag state, must fail closed).
     /// 2. If any masked columns found, run `mask_gdpr_columns`.
     /// 3. Always run `redact_pii` (belt-and-suspenders for known PII patterns).
-    /// 4. If `fallback` is set and no columns were matched, run
-    ///    `strip_sql_literals` (conservative: unknown tag state may hide a GDPR
-    ///    column mask we cannot see).
+    /// 4. If `fallback` is set (ANY resource had unknown tag state), run
+    ///    `strip_sql_literals` unconditionally. This is the fail-closed contract:
+    ///    a free-form literal from the unknown resource must not survive even when
+    ///    other resources returned known GDPR columns. `strip_sql_literals` is
+    ///    idempotent; running it after `mask_gdpr_columns` is safe.
     fn apply_gdpr_masking(event: &mut AuditEvent, gdpr: &GdprSnap) {
         let (tags, mode, salt, lookup) = gdpr;
         let Some(ref mut query) = event.query else {
@@ -534,9 +536,11 @@ impl AuditLogger {
         // Always apply PII pattern redaction.
         out = redact_pii(&out);
 
-        // If any resource had unknown tag state and no columns were masked,
-        // strip all literals as the conservative fail-closed path.
-        if fallback && masked_cols.is_empty() {
+        // If any resource had unknown tag state, strip all literals as the
+        // conservative fail-closed path. This runs regardless of whether known
+        // GDPR columns were also masked: a free-form literal belonging to the
+        // unknown resource must not survive in either case.
+        if fallback {
             out = strip_sql_literals(&out);
         }
 
@@ -680,7 +684,8 @@ impl AuditLogger {
         };
 
         // Redaction runs on the caller side, before the entry is queued.
-        // Task 7 will add redaction for the `log_event` path.
+        // For `log_event`, the worker thread applies `redact_pii` (and GDPR
+        // masking when configured) before writing to any sink.
         let redacted = if entry.query_text.is_some() {
             AuditEntry {
                 query_text: entry.query_text.as_deref().map(redact_pii),
@@ -724,9 +729,9 @@ impl AuditLogger {
         }
     }
 
-    /// Log a canonical `AuditEvent` directly. Redaction (Task 7) is not yet
-    /// applied here; callers are responsible for sanitising PII before calling
-    /// this method.
+    /// Log a canonical `AuditEvent` directly. The worker thread applies
+    /// `redact_pii` unconditionally and GDPR masking when configured before
+    /// writing to any sink. Callers do not need to pre-sanitise the event.
     pub fn log_event(&self, event: AuditEvent) {
         let Some(ref tx) = self.tx else {
             return;
@@ -1166,5 +1171,78 @@ mod tests {
         logger.flush();
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(!content.contains("123-45-6789"), "literal survived unknown-tag fallback: {content}");
+    }
+
+    /// Regression test for the fail-open GDPR masking bug (MUST-FIX 1).
+    ///
+    /// Scenario: resource A returns `Some({"email": ["gdpr"]})` (known GDPR column)
+    /// and resource B returns `None` (unknown tag state). The query text contains a
+    /// free-form literal tied to resource B that is NOT an email, SSN, phone, or card
+    /// (so `redact_pii` alone would not catch it). Under the buggy guard
+    /// `fallback && masked_cols.is_empty()`, `masked_cols` is non-empty (from A), so
+    /// the condition is false and `strip_sql_literals` is skipped -- the literal
+    /// `'topsecret'` survives to the log. After the fix (`if fallback`), the strip
+    /// always runs when any resource is unknown, regardless of masked_cols.
+    ///
+    /// This test MUST fail on the old `&& masked_cols.is_empty()` guard and pass
+    /// after the fix.
+    #[test]
+    fn gdpr_fail_closed_on_mixed_known_and_unknown_resources() {
+        use std::collections::HashMap;
+        struct MixedStub;
+        impl crate::audit::TagLookup for MixedStub {
+            fn column_tags(&self, _c: Option<&str>, _n: &[String], table: &str) -> Option<HashMap<String, Vec<String>>> {
+                if table == "a" {
+                    let mut m = HashMap::new();
+                    m.insert("email".to_string(), vec!["gdpr".to_string()]);
+                    Some(m)
+                } else {
+                    // table "b" has unknown tag state: triggers the fallback path.
+                    None
+                }
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let logger = AuditLogger::with_config(path.to_str().unwrap(), crate::audit::AuditFormat::Native)
+            .unwrap()
+            .with_gdpr(
+                vec!["gdpr".into()],
+                crate::audit::GdprIdentifierMode::Tokenize,
+                "salt".into(),
+                std::sync::Arc::new(MixedStub),
+            );
+        let mut ev = crate::audit::sample_query_event();
+        ev.resources = vec![
+            crate::audit::Resource {
+                catalog: None,
+                namespace: vec!["hr".into()],
+                name: "a".into(),
+                object_type: crate::audit::ObjectType::Table,
+            },
+            crate::audit::Resource {
+                catalog: None,
+                namespace: vec!["ops".into()],
+                name: "b".into(),
+                object_type: crate::audit::ObjectType::Table,
+            },
+        ];
+        // The literal 'topsecret' is tied to table b (unknown state). It is NOT
+        // an email, SSN, phone, card, or secret-keyword, so redact_pii alone will
+        // not catch it. The fail-closed strip must remove it.
+        ev.query = Some(crate::audit::QueryInfo {
+            text: Some(
+                "SELECT a.id FROM a JOIN b ON a.id = b.id WHERE b.note = 'topsecret'".into(),
+            ),
+            query_hash: "h".into(),
+            statement_type: "query".into(),
+        });
+        logger.log_event(ev);
+        logger.flush();
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !content.contains("topsecret"),
+            "free-form literal from unknown-state resource survived fail-closed strip: {content}"
+        );
     }
 }

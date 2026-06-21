@@ -1,7 +1,8 @@
 # Audit Logging
 
-SQE writes a tamper-evident audit log that records every query execution, authentication
-event, session lifecycle change, permission grant or revoke, and catalog DDL operation.
+SQE writes a tamper-evident audit log for authentication events, session lifecycle
+changes, permission grants and revokes, catalog DDL, and a subset of query executions
+(see [Coverage in this release](#coverage-in-this-release) below).
 The log is append-only JSONL (one JSON object per line). Each record carries an integrity
 block that lets offline tooling detect modification or truncation.
 
@@ -203,6 +204,28 @@ whether the statement is the direct SQL text or arrives via a prepared statement
 does not catch free-form sensitive literals such as `WHERE patient_id = 'P-998877'`.
 For that, GDPR column masking (see above) strips all literals adjacent to tagged
 columns, and the fail-closed path strips all literals when tag state is unknown.
+
+## Coverage in this release
+
+Not every statement produces a canonical `AuditEvent` written to the OCSF file. The
+table below describes what is covered.
+
+| Path | Sink | Format |
+|------|------|--------|
+| Buffered `execute` SELECTs (Trino-compat, quack-server, Flight prepared statements, Flight ticket statements) | OCSF file + native sink | Canonical `AuditEvent` with structured Actor and resources |
+| GRANT / REVOKE | OCSF file + native sink | Canonical `AuditEvent` |
+| Authentication events | OCSF file + native sink | Canonical `AuditEvent` |
+| Session lifecycle events | OCSF file + native sink | Canonical `AuditEvent` |
+| Flight SQL streaming SELECTs | Native sink only | Legacy flat `AuditEntry` (username + unqualified `tables_touched`, no structured resources) |
+| DML / DDL (including CREATE SECRET) | Native sink only | Legacy flat `AuditEntry` |
+
+Flight SQL streaming SELECTs and DML/DDL are recorded as legacy flat `AuditEntry`
+records in the native sink. They do NOT appear in the OCSF file in this release.
+Full canonical and OCSF coverage of the streaming path is a follow-up item.
+
+The legacy `AuditEntry` format is flat JSON. It carries username, statement type,
+duration, status, and `tables_touched` (unqualified table names), but not structured
+resources, actor email, groups, or policy decision fields.
 
 ## Never-log-result-rows policy
 
