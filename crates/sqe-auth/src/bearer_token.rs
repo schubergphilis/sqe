@@ -560,9 +560,13 @@ impl AuthProvider for BearerTokenProvider {
 
         let roles = Self::extract_roles(claims, &self.config.roles_claim);
 
-        let subject = Self::extract_claim_by_path(claims, &self.config.subject_claim)
-            .and_then(|v| v.as_str())
-            .map(String::from);
+        let subject = if self.config.subject_claim.is_empty() {
+            None
+        } else {
+            Self::extract_claim_by_path(claims, &self.config.subject_claim)
+                .and_then(|v| v.as_str())
+                .map(String::from)
+        };
 
         let email = if self.config.email_claim.is_empty() {
             None

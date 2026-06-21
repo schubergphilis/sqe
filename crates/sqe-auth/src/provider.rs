@@ -55,7 +55,7 @@ pub struct Identity {
     /// Email address extracted from the token, when `email_claim` is configured.
     pub email: Option<String>,
     /// Group memberships extracted from the token, when `groups_claim` is configured.
-    /// Separate from `roles` — different claim path, different semantics.
+    /// Separate from `roles`: different claim path, different semantics.
     pub groups: Vec<String>,
     pub catalog_token: Option<SecretString>,
     /// Refresh token for obtaining new access tokens without re-authentication.
