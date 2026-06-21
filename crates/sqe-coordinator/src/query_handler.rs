@@ -1656,9 +1656,19 @@ impl QueryHandler {
                     integrity: sqe_metrics::audit::Integrity::default(),
                 };
                 audit.log_event(grant_event);
-            } else {
-                // Legacy path for DDL, DML, admin statements.
-                // PII redaction runs inside log() before the entry is queued.
+            } else if matches!(
+                &kind,
+                StatementKind::CreateSecret(_)
+                    | StatementKind::DropSecret(_)
+                    | StatementKind::ShowSecrets
+                    | StatementKind::Attach(_)
+                    | StatementKind::Detach(_)
+            ) {
+                // Secret-bearing statements stay on the redacted legacy path.
+                // PII redaction runs inside log() before the entry is written.
+                // Never route these through log_event: the legacy path is the
+                // established redaction contract for bearer tokens and catalog
+                // credentials embedded in SQL text.
                 let ps = policy_summary.unwrap_or_default();
                 audit.log(&sqe_metrics::audit::AuditEntry {
                     timestamp: chrono::Utc::now().to_rfc3339(),
@@ -1677,6 +1687,65 @@ impl QueryHandler {
                     columns_restricted: ps.columns_restricted,
                     policy_denied: ps.denied,
                 });
+            } else {
+                // Canonical path for DDL, DML, and admin statements.
+                // Non-secret SQL travels through log_event; the worker thread
+                // applies redact_pii before chain-stamping and writing.
+                let audit_kind = if matches!(
+                    &kind,
+                    StatementKind::Insert(_)
+                        | StatementKind::Ctas(_)
+                        | StatementKind::Merge(_)
+                        | StatementKind::Delete(_)
+                        | StatementKind::Update(_)
+                        | StatementKind::Truncate(_)
+                ) {
+                    sqe_metrics::audit::AuditKind::Query
+                } else {
+                    sqe_metrics::audit::AuditKind::AdminDdl
+                };
+
+                let ddl_outcome = match &result {
+                    Ok(_) => sqe_metrics::audit::Outcome::Success,
+                    Err(e) => sqe_metrics::audit::Outcome::Failure {
+                        error_type: Some(e.error_code().trino_error_type().to_string()),
+                        error_code: Some(e.error_code().name().to_string()),
+                        message: Some(e.client_message()),
+                    },
+                };
+
+                let ddl_actor = sqe_metrics::audit::Actor::from_parts(
+                    session.user.username.clone(),
+                    session.user.subject.clone(),
+                    session.user.email.clone(),
+                    session.user.roles.clone(),
+                    session.user.groups.clone(),
+                );
+
+                let ddl_event = sqe_metrics::audit::AuditEvent {
+                    time: chrono::Utc::now(),
+                    kind: audit_kind,
+                    actor: ddl_actor,
+                    outcome: ddl_outcome,
+                    resources: audit_resources,
+                    policy: None,
+                    timing: Some(sqe_metrics::audit::Timing {
+                        duration_ms: duration.as_millis() as u64,
+                        queued_ms: 0,
+                        planning_ms: 0,
+                        execution_ms: 0,
+                    }),
+                    stats: None,
+                    query: Some(sqe_metrics::audit::QueryInfo {
+                        text: Some(sql.to_string()),
+                        query_hash: sqe_metrics::audit::query_hash(sql),
+                        statement_type: kind_name,
+                    }),
+                    session_id: Some(session.id.clone()),
+                    client_ip: None,
+                    integrity: sqe_metrics::audit::Integrity::default(),
+                };
+                audit.log_event(ddl_event);
             }
         }
 

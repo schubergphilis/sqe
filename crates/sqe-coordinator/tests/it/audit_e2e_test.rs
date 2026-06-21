@@ -953,3 +953,116 @@ async fn streaming_select_emits_canonical_query_event() {
         "integrity.seq must be a u64; got: {v}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Task 3: DDL and DML migrate to canonical AuditEvent
+// ---------------------------------------------------------------------------
+
+/// TDD guard for Task 3: DDL statements emit a canonical `AuditEvent` with
+/// `kind == "admin_ddl"`, not the legacy flat `AuditEntry`.
+///
+/// A `DROP TABLE` is used because it requires only the parser (no catalog
+/// connection needed to parse the statement), and a parser-level failure still
+/// runs through the full audit dispatch block, emitting a Failure-outcome
+/// canonical event. The test asserts:
+///
+/// 1. `kind` == "admin_ddl" (canonical AuditEvent, not legacy flat entry).
+/// 2. `actor.username` == "auditor" (Actor populated from session).
+/// 3. No top-level `statement_type` (legacy AuditEntry artifact absent).
+/// 4. `integrity.seq` is a u64 (hash-chain populated by the logger).
+#[tokio::test]
+async fn ddl_emits_canonical_admin_ddl_event() {
+    let fx = make_fixture();
+    let session = admin_session();
+
+    // DROP TABLE will fail at execution (no catalog), but the audit block
+    // still runs. A Failure-outcome canonical AuditEvent is emitted.
+    let _ = fx
+        .handler
+        .execute(&session, "DROP TABLE IF EXISTS myns.mytable")
+        .await;
+
+    let lines = fx.read_lines();
+    assert_eq!(
+        lines.len(),
+        1,
+        "exactly one audit line written for DDL; got:\n{}",
+        serde_json::to_string_pretty(&serde_json::Value::Array(lines.clone())).unwrap_or_default()
+    );
+    let entry = &lines[0];
+
+    // 1. canonical AuditEvent kind discriminant must be "admin_ddl"
+    assert_eq!(
+        entry["kind"].as_str(),
+        Some("admin_ddl"),
+        "DDL must emit a canonical AuditEvent with kind=admin_ddl; got: {entry}"
+    );
+
+    // 2. actor.username must match the session username
+    assert_eq!(
+        entry["actor"]["username"].as_str(),
+        Some("auditor"),
+        "actor.username must be populated from the session; got: {entry}"
+    );
+
+    // 3. no top-level statement_type (that is the legacy AuditEntry shape)
+    assert!(
+        entry["statement_type"].is_null(),
+        "top-level statement_type must NOT appear in a canonical AuditEvent; got: {entry}"
+    );
+
+    // 4. hash-chain integrity.seq must be a u64
+    assert!(
+        entry["integrity"]["seq"].is_u64(),
+        "integrity.seq must be a u64; got: {entry}"
+    );
+}
+
+/// TDD guard for Task 3: `CREATE SECRET` statements stay on the redacted legacy
+/// `log(&AuditEntry)` path after the DDL/DML migration. The legacy path applies
+/// PII redaction before the line is written, which is the established contract
+/// for secret SQL.
+///
+/// Asserts:
+///
+/// 1. The raw bearer token does NOT appear anywhere in the written file.
+/// 2. The written line has `statement_type` at TOP LEVEL (legacy flat shape).
+/// 3. The written line does NOT have a top-level `kind` field (canonical shape
+///    is NOT used for secrets).
+#[tokio::test]
+async fn create_secret_stays_redacted_legacy_after_ddl_migration() {
+    let fx = make_fixture();
+    let session = admin_session();
+
+    fx.handler
+        .execute(
+            &session,
+            "CREATE SECRET task3_guard (TYPE bearer, TOKEN 'task3_secret_material_xyz')",
+        )
+        .await
+        .expect("create secret must succeed");
+
+    let lines = fx.read_lines();
+    assert_eq!(lines.len(), 1, "exactly one audit line written");
+    let entry = &lines[0];
+
+    // 1. The raw token must NOT appear in the file (redaction contract).
+    let raw_content = std::fs::read_to_string(&fx.log_path).expect("audit file readable");
+    assert!(
+        !raw_content.contains("task3_secret_material_xyz"),
+        "raw bearer token must not appear in audit log after DDL migration: {raw_content}"
+    );
+
+    // 2. The line carries top-level `statement_type` (legacy flat AuditEntry shape).
+    assert_eq!(
+        entry["statement_type"].as_str(),
+        Some("create_secret"),
+        "CREATE SECRET must remain on legacy path with top-level statement_type; got: {entry}"
+    );
+
+    // 3. The line does NOT carry a top-level `kind` field (not a canonical AuditEvent).
+    assert!(
+        entry["kind"].is_null(),
+        "CREATE SECRET must NOT be emitted as a canonical AuditEvent (kind must be absent); got: {entry}"
+    );
+}
