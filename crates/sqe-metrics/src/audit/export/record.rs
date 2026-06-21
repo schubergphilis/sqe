@@ -5,6 +5,7 @@ use serde_json::Value;
 pub enum Severity {
     Info,
     Warn,
+    /// Maps to OTel `Severity::Error` (level 17) when emitting OTLP log records.
     Error,
 }
 

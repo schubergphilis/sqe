@@ -477,6 +477,51 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
+    // TEST: StartAt::Now with a fresh cursor does NOT backfill existing records;
+    //       a record appended AFTER construction IS shipped on the next pass.
+    // ---------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn start_at_now_fresh_cursor_no_backfill_then_ships_new() {
+        let dir = tempdir().unwrap();
+        let spool = dir.path().join("audit.jsonl");
+        let cursor_path = dir.path().join("audit.cursor");
+
+        // Pre-populate the spool with seqs 1, 2, 3 (the "backlog").
+        write_spool(&spool, &[1, 2, 3]);
+
+        let stub = StubExporter::new(false);
+        let mut shipper = make_shipper(
+            spool.clone(),
+            cursor_path.clone(),
+            stub.clone(),
+            10,
+            StartAt::Now,
+        );
+
+        // First pass: cursor was fresh + StartAt::Now, so the backlog is NOT shipped.
+        let o1 = shipper.ship_once().await;
+        assert!(!o1.failed, "ship_once should not fail");
+        assert_eq!(o1.shipped, 0, "StartAt::Now must not backfill existing records");
+        assert!(
+            stub.shipped.lock().unwrap().is_empty(),
+            "no records should be shipped on the first pass with StartAt::Now"
+        );
+
+        // Append a new record (seq 4) AFTER the shipper was constructed.
+        write_spool(&spool, &[4]);
+
+        // Second pass: only seq 4 (the new record) should be shipped.
+        let o2 = shipper.ship_once().await;
+        assert!(!o2.failed);
+        assert_eq!(o2.shipped, 1, "only the post-construction record should be shipped");
+        assert_eq!(o2.advanced_to, 4);
+
+        let seqs = stub.shipped.lock().unwrap().clone();
+        assert_eq!(seqs, vec![4], "seqs 1-3 must not be shipped; only seq 4");
+    }
+
+    // ---------------------------------------------------------------------------
     // TEST: half-written last line is NOT shipped this pass
     // ---------------------------------------------------------------------------
 
