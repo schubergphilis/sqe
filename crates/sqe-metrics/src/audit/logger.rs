@@ -349,7 +349,7 @@ impl AuditLogger {
                                             &path_owned,
                                         );
                                         batch.clear();
-                                        Self::flush_sinks(&mut native_sink, &mut ocsf_sink, &path_owned);
+                                        Self::flush_sinks(&mut native_sink, &mut ocsf_sink, &mut spool_sink_worker.lock().unwrap(), &path_owned);
                                         // Now stamp and write the canonical event.
                                         Self::write_event(
                                             &mut native_sink,
@@ -361,7 +361,7 @@ impl AuditLogger {
                                             gdpr_snap.as_ref(),
                                             &path_owned,
                                         );
-                                        Self::flush_sinks(&mut native_sink, &mut ocsf_sink, &path_owned);
+                                        Self::flush_sinks(&mut native_sink, &mut ocsf_sink, &mut spool_sink_worker.lock().unwrap(), &path_owned);
                                     }
                                     AuditMsg::Flush(ack) => {
                                         Self::write_legacy_batch(
@@ -371,7 +371,7 @@ impl AuditLogger {
                                             &path_owned,
                                         );
                                         batch.clear();
-                                        Self::flush_sinks(&mut native_sink, &mut ocsf_sink, &path_owned);
+                                        Self::flush_sinks(&mut native_sink, &mut ocsf_sink, &mut spool_sink_worker.lock().unwrap(), &path_owned);
                                         let _ = ack.send(());
                                     }
                                 }
@@ -383,7 +383,7 @@ impl AuditLogger {
                                     &batch,
                                     &path_owned,
                                 );
-                                Self::flush_sinks(&mut native_sink, &mut ocsf_sink, &path_owned);
+                                Self::flush_sinks(&mut native_sink, &mut ocsf_sink, &mut spool_sink_worker.lock().unwrap(), &path_owned);
                             }
                         }
                         AuditMsg::Event(event) => {
@@ -403,7 +403,7 @@ impl AuditLogger {
                                             &path_owned,
                                         );
                                         batch.clear();
-                                        Self::flush_sinks(&mut native_sink, &mut ocsf_sink, &path_owned);
+                                        Self::flush_sinks(&mut native_sink, &mut ocsf_sink, &mut spool_sink_worker.lock().unwrap(), &path_owned);
                                         // Process this legacy entry immediately.
                                         Self::write_legacy_batch(
                                             &mut native_sink,
@@ -411,7 +411,7 @@ impl AuditLogger {
                                             &[*e],
                                             &path_owned,
                                         );
-                                        Self::flush_sinks(&mut native_sink, &mut ocsf_sink, &path_owned);
+                                        Self::flush_sinks(&mut native_sink, &mut ocsf_sink, &mut spool_sink_worker.lock().unwrap(), &path_owned);
                                     }
                                     AuditMsg::Flush(ack) => {
                                         Self::write_events(
@@ -425,7 +425,7 @@ impl AuditLogger {
                                             &path_owned,
                                         );
                                         batch.clear();
-                                        Self::flush_sinks(&mut native_sink, &mut ocsf_sink, &path_owned);
+                                        Self::flush_sinks(&mut native_sink, &mut ocsf_sink, &mut spool_sink_worker.lock().unwrap(), &path_owned);
                                         let _ = ack.send(());
                                     }
                                 }
@@ -441,16 +441,16 @@ impl AuditLogger {
                                     gdpr_snap.as_ref(),
                                     &path_owned,
                                 );
-                                Self::flush_sinks(&mut native_sink, &mut ocsf_sink, &path_owned);
+                                Self::flush_sinks(&mut native_sink, &mut ocsf_sink, &mut spool_sink_worker.lock().unwrap(), &path_owned);
                             }
                         }
                         AuditMsg::Flush(ack) => {
-                            Self::flush_sinks(&mut native_sink, &mut ocsf_sink, &path_owned);
+                            Self::flush_sinks(&mut native_sink, &mut ocsf_sink, &mut spool_sink_worker.lock().unwrap(), &path_owned);
                             let _ = ack.send(());
                         }
                     }
                 }
-                Self::flush_sinks(&mut native_sink, &mut ocsf_sink, &path_owned);
+                Self::flush_sinks(&mut native_sink, &mut ocsf_sink, &mut spool_sink_worker.lock().unwrap(), &path_owned);
             })
             .map_err(|e| format!("Failed to start audit writer thread: {e}"))?;
 
@@ -664,6 +664,7 @@ impl AuditLogger {
     fn flush_sinks(
         native_sink: &mut NativeJsonlSink,
         ocsf_sink: &mut Option<OcsfJsonlSink>,
+        spool_sink: &mut Option<OcsfJsonlSink>,
         path: &str,
     ) {
         if let Err(e) = native_sink.flush() {
@@ -672,6 +673,11 @@ impl AuditLogger {
         if let Some(sink) = ocsf_sink.as_mut() {
             if let Err(e) = sink.flush() {
                 tracing::error!("AUDIT: flush failed for '{path}': {e}");
+            }
+        }
+        if let Some(sink) = spool_sink.as_mut() {
+            if let Err(e) = sink.flush() {
+                tracing::error!("AUDIT: spool flush failed for '{path}': {e}");
             }
         }
     }
@@ -715,7 +721,11 @@ impl AuditLogger {
     /// Errors opening the file are returned and the logger is not modified.
     pub fn with_export_spool(self, spool_path: &str) -> Result<Self, String> {
         let file = open_sink_file(std::path::Path::new(spool_path))?;
-        let sink = OcsfJsonlSink::from_writer(Box::new(file));
+        // BufWriter ensures that flush_sinks -> sink.flush() is the mechanism that
+        // makes records durable. Without BufWriter, writes bypass the user-space
+        // buffer and the flush call becomes a no-op, which means the test would pass
+        // even if flush_sinks never flushed the spool.
+        let sink = OcsfJsonlSink::from_writer(Box::new(std::io::BufWriter::new(file)));
         if let Ok(mut guard) = self.spool_sink.lock() {
             *guard = Some(sink);
         }
@@ -1294,10 +1304,15 @@ mod tests {
         );
     }
 
-    /// Verifies `with_export_spool`: a canonical event written via `log_event` appears
-    /// in both the primary (native format) file and the spool (OCSF format) file.
+    /// Verifies `with_export_spool`: a canonical event written via `log_event` is
+    /// readable from the spool file AFTER an explicit `flush()` call while the
+    /// logger is still alive.
     ///
-    /// The spool must contain a valid OCSF record with `class_uid` and a stamped
+    /// The spool sink is backed by a `BufWriter`, so `flush()` is the ONLY mechanism
+    /// that makes records durable before the logger is dropped. This test must fail
+    /// if `flush_sinks` does not flush the spool sink.
+    ///
+    /// The spool must also contain a valid OCSF record with `class_uid` and a stamped
     /// `metadata.sequence` value, confirming the spool is written AFTER `chain.stamp`.
     #[test]
     fn with_export_spool_writes_ocsf_to_spool_and_native_to_primary() {
@@ -1314,6 +1329,11 @@ mod tests {
         .unwrap();
 
         logger.log_event(crate::audit::sample_query_event());
+
+        // Explicit flush() while the logger is still alive. The spool is backed by
+        // BufWriter, so the record is not on disk yet. flush() must flush the spool
+        // BufWriter. Do NOT drop `logger` before reading - that would prove drop
+        // flushes, not flush().
         logger.flush();
 
         // Primary file: native JSON with kind and integrity hash.
@@ -1328,7 +1348,12 @@ mod tests {
         );
 
         // Spool file: OCSF format with class_uid and stamped metadata.sequence.
+        // Read while `logger` is still alive to prove flush() made the record durable.
         let spool = std::fs::read_to_string(&spool_path).unwrap();
+        assert!(
+            !spool.is_empty(),
+            "spool must be non-empty after flush() while logger is alive (flush_sinks must flush the spool BufWriter)"
+        );
         let spool_line = spool.lines().next().expect("spool must have at least one line");
         let v: serde_json::Value = serde_json::from_str(spool_line)
             .unwrap_or_else(|e| panic!("spool line is not valid JSON: {e}\n{spool_line}"));
@@ -1345,5 +1370,8 @@ mod tests {
             seq.is_some(),
             "spool line must contain metadata.sequence (written after chain.stamp); got: {v}"
         );
+
+        // `logger` is still live here - the spool was made readable by flush(), not by drop.
+        drop(logger);
     }
 }
