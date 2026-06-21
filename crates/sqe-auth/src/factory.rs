@@ -55,6 +55,9 @@ pub async fn build_auth_chain(config: &AuthConfig) -> sqe_core::Result<AuthChain
                         client_id: client_id.clone(),
                         client_secret: client_secret.clone(),
                         roles_claim: roles_claim.clone(),
+                        subject_claim: "sub".to_string(),
+                        email_claim: String::new(),
+                        groups_claim: String::new(),
                         accept_invalid_certs: config.should_skip_tls_verify(),
                     };
                     let provider = OidcPasswordProvider::new(oidc_config).map_err(|e| {
@@ -143,6 +146,9 @@ pub async fn build_auth_chain(config: &AuthConfig) -> sqe_core::Result<AuthChain
                         audience: audience.clone(),
                         user_claim: user_claim.clone(),
                         roles_claim: roles_claim.clone(),
+                        subject_claim: "sub".to_string(),
+                        email_claim: String::new(),
+                        groups_claim: String::new(),
                         accept_invalid_certs: config.should_skip_tls_verify(),
                         allow_unbounded_audience: *allow_unbounded_audience,
                         allow_insecure_jwks: *allow_insecure_jwks,
