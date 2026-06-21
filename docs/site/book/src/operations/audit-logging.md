@@ -207,25 +207,167 @@ columns, and the fail-closed path strips all literals when tag state is unknown.
 
 ## Coverage in this release
 
-Not every statement produces a canonical `AuditEvent` written to the OCSF file. The
-table below describes what is covered.
+The table below describes what produces a canonical `AuditEvent` written to the
+OCSF spool and OCSF file.
 
 | Path | Sink | Format |
 |------|------|--------|
 | Buffered `execute` SELECTs (Trino-compat, quack-server, Flight prepared statements, Flight ticket statements) | OCSF file + native sink | Canonical `AuditEvent` with structured Actor and resources |
+| Flight SQL streaming SELECTs | OCSF file + native sink | Canonical `AuditEvent` with structured Actor and resources |
+| DML / DDL (INSERT INTO, CTAS, DELETE, UPDATE, MERGE, CREATE TABLE, ALTER TABLE, DROP TABLE, etc.) | OCSF file + native sink | Canonical `AuditEvent` |
 | GRANT / REVOKE | OCSF file + native sink | Canonical `AuditEvent` |
 | Authentication events | OCSF file + native sink | Canonical `AuditEvent` |
 | Session lifecycle events | OCSF file + native sink | Canonical `AuditEvent` |
-| Flight SQL streaming SELECTs | Native sink only | Legacy flat `AuditEntry` (username + unqualified `tables_touched`, no structured resources) |
-| DML / DDL (including CREATE SECRET) | Native sink only | Legacy flat `AuditEntry` |
+| Secret-bearing statements (CREATE SECRET, DROP SECRET, SHOW SECRETS, ATTACH, DETACH) | Native sink only | Legacy flat `AuditEntry` (redacted path; credentials never reach canonical form) |
 
-Flight SQL streaming SELECTs and DML/DDL are recorded as legacy flat `AuditEntry`
-records in the native sink. They do NOT appear in the OCSF file in this release.
-Full canonical and OCSF coverage of the streaming path is a follow-up item.
+Secret-bearing statements stay on the redacted legacy path. Routing them through the
+canonical path would risk writing credential literals to the OCSF file before
+redaction applies. The legacy path runs redaction inline, so bearer tokens and
+catalog credentials embedded in SQL text are stripped before any byte is written.
 
 The legacy `AuditEntry` format is flat JSON. It carries username, statement type,
 duration, status, and `tables_touched` (unqualified table names), but not structured
 resources, actor email, groups, or policy decision fields.
+
+## Exporting to a SIEM (OTLP)
+
+SQE ships a background exporter that tails the OCSF spool and forwards records to any
+OTLP-compatible collector (OpenTelemetry Collector, Grafana Alloy, Datadog Agent, etc.).
+The exporter is off by default.
+
+### Config block
+
+```toml
+[metrics.audit_export]
+enabled          = false          # set to true to activate
+target           = "otlp"         # only "otlp" is supported; "kafka" is reserved but not built
+otlp_endpoint    = ""             # e.g. "http://otel-collector:4317"; empty -> falls back to metrics.otlp_endpoint
+spool_path       = ""             # empty -> <audit_log_path>.ocsf.spool.jsonl
+batch_max        = 512            # maximum records per OTLP export batch
+flush_interval_ms = 2000          # shipper poll interval in milliseconds
+max_spool_bytes  = 1073741824     # 1 GiB; spool size above this emits a WARN
+start_at         = "now"          # "now" (default) | "beginning"
+```
+
+All keys are optional. The defaults shown are the production-safe values.
+
+#### `enabled`
+
+`false` by default. Setting to `true` activates the OTLP exporter and the spool
+writer. Disabling (`false`) leaves the rest of the audit stack unchanged: the OCSF
+file is still written when `format = "ocsf"` or `format = "both"`, and the hash
+chain is unaffected. The export spool is a separate file.
+
+#### `target`
+
+Only `"otlp"` is implemented. `"kafka"` is reserved for a future release. Configuring
+any other value logs a warning and the exporter does not start.
+
+#### `otlp_endpoint`
+
+The OTLP/gRPC endpoint URL for the collector. If empty, the exporter falls back to
+`metrics.otlp_endpoint`. If both are empty the server logs a warning at startup and
+the exporter does not start.
+
+#### `spool_path`
+
+Path to the OCSF JSONL spool file that buffers events before export. If empty, the
+path is derived from `audit_log_path` by replacing the extension with
+`.ocsf.spool.jsonl` (e.g. `audit.jsonl` -> `audit.ocsf.spool.jsonl`). The file is
+created on startup if it does not exist.
+
+The export spool is independent of the `format` setting. When `audit_export.enabled =
+true`, every canonical event written via `log_event` goes to the spool regardless of
+whether `format` is `native`, `ocsf`, or `both`.
+
+#### `batch_max`
+
+Maximum number of OCSF records sent in a single OTLP export call. Default: 512.
+
+#### `flush_interval_ms`
+
+How often the background shipper polls the spool for new records. Default: 2000 ms.
+Lower values reduce latency to the SIEM at the cost of more frequent OTLP calls.
+
+#### `max_spool_bytes`
+
+Spool size threshold in bytes. When the spool file exceeds this value the exporter
+emits a `WARN` log. The exporter continues and queries are never blocked. Default:
+1 073 741 824 (1 GiB). Spool rotation and automatic pruning are not implemented in
+this release; size management is left to the operator.
+
+#### `start_at`
+
+Controls where the shipper starts on the first run, when no cursor file exists.
+
+| Value | Behavior |
+|-------|----------|
+| `"now"` | Scan the spool to its current tail and advance the cursor there without shipping. Historical records are not replayed. New records written after startup are shipped. Default. |
+| `"beginning"` | Ship from the oldest record in the spool. Use after moving the spool or recovering from a cursor loss. |
+
+On subsequent restarts the persisted cursor (`<spool_path>.cursor`) always wins.
+`start_at` is not re-applied when a cursor file exists. This guarantees at-least-once
+delivery: a restart resumes exactly where the last successful export acked.
+
+### Behavior and durability
+
+The exporter provides at-least-once delivery. Records are never removed from the spool.
+The background shipper tails the spool from the byte offset recorded in the cursor file,
+batches up to `batch_max` records, sends them to the collector, and advances the cursor
+only after the collector returns a successful ack.
+
+A collector outage grows the spool. Queries continue without delay. When the collector
+recovers, the shipper replays from the last cursor position.
+
+The exporter uses a dedicated OTLP log pipeline. It is not connected to the
+`trace_sample_rate` tracing bridge, so audit records are never sampled or dropped by
+the trace sampler.
+
+### OTLP record mapping
+
+Each spool line (one OCSF JSON object) becomes one `LogRecord` in the OTLP batch:
+
+| OTLP field | Value |
+|------------|-------|
+| `body` | Full OCSF JSON text of the record |
+| `severity_number` | `INFO` for `status_id = 1` (success); `WARN` for `status_id = 2` (failure) |
+| `timestamp` | OCSF `time` field (millisecond epoch converted to nanoseconds) |
+| `observed_timestamp` | Wall clock at ship time |
+
+Indexed attributes set on every record:
+
+| Attribute | Type | Source |
+|-----------|------|--------|
+| `ocsf.class_uid` | int | OCSF `class_uid` (e.g. 6005 for Datastore Activity) |
+| `ocsf.category_uid` | int | OCSF `category_uid` |
+| `audit.kind` | string | Human-readable class label (e.g. `"datastore_activity"`, `"authentication"`) |
+| `audit.status_id` | int | OCSF `status_id` (1 = success, 2 = failure) |
+| `user.name` | string | `actor.user.name` from the OCSF record |
+| `audit.seq` | int | `metadata.sequence` from the OCSF record (the hash-chain sequence number) |
+
+SIEM queries that filter on any of these attributes avoid parsing the full body.
+
+### Export metrics
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `sqe_audit_export_records_total{status}` | Counter | Records shipped, labeled `status="ok"` or `status="error"` |
+| `sqe_audit_export_batch_failures_total` | Counter | OTLP export calls that returned an error |
+| `sqe_audit_export_spool_lag_bytes` | Gauge | Bytes between the cursor offset and the current end of spool |
+| `sqe_audit_export_cursor_seq` | Gauge | Last sequence number successfully acked |
+| `sqe_audit_export_last_success_timestamp` | Gauge | Unix timestamp of the last successful export |
+
+`sqe_audit_export_spool_lag_bytes = 0` means the shipper is caught up. A rising value
+while `sqe_audit_export_batch_failures_total` is also rising points to a collector
+connectivity problem.
+
+### Deferred
+
+- **Spool rotation and retention.** Only a bounded-growth `WARN` at `max_spool_bytes`
+  is implemented. Rotation, age-based pruning, and size-capped compaction are not
+  built yet.
+- **Kafka target.** The `target = "kafka"` config key is reserved. It is not
+  implemented in this release.
 
 ## Never-log-result-rows policy
 
