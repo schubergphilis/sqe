@@ -5,14 +5,17 @@
 #   ./run.sh                       # tpch at SF0.01 (default, finishes in seconds)
 #   BENCH=ssb SCALE=0.1 ./run.sh   # pick a suite (tpch|ssb|tpcds) and scale factor
 #   ./run.sh --down                # tear everything down
+#   ./run.sh --check               # generate+load+test, then assert no failed queries
 set -euo pipefail
 cd "$(dirname "$0")"
 . ../_shared/lib.sh
 
+CHECK=0
 for a in "$@"; do
   case "$a" in
     --down) require docker; step "tearing down"; docker compose --profile bench down -v; ok "done"; exit 0 ;;
-    *) die "unknown arg: $a (use --down)" ;;
+    --check) CHECK=1 ;;
+    *) die "unknown arg: $a (use --down or --check)" ;;
   esac
 done
 
@@ -65,7 +68,27 @@ bench test "$BENCH" --scale "$SCALE" --host sqe --port 50051 --catalog "$CATALOG
   grep -vE '^\s*Loading |^\s*Done: |connecting to |Report written to:' "$RUN_LOG" || cat "$RUN_LOG"
   echo '```'
 } > "$OUT"
-rm -f "$RUN_LOG"
 ok "captured to $OUT"
+
+if [ "$CHECK" -eq 1 ]; then
+  step "checking invariants (asserting on the already-captured test run, no re-run)"
+
+  # Reuse the test output captured in $RUN_LOG -- do NOT re-run the pipeline. The
+  # suite prints a human summary line and a machine-parseable BENCH_SUMMARY. The
+  # summary literally contains the words "fail"/"error"/"diff" (as "0 fail, 0
+  # diff, ... 0 error"), so assert on the POSITIVE clean-run phrase rather than
+  # assert_not_contains, which would match those zero-count tokens. We do not
+  # hardcode the query count (BENCH/SCALE are env-configurable).
+  run_out=$(cat "$RUN_LOG")
+  assert_contains "benchmark reports a results summary" "$run_out" "pass,"
+  assert_contains "no failed/diff/skip/error queries"   "$run_out" "0 fail, 0 diff, 0 skip, 0 error"
+  assert_contains "machine-parseable BENCH_SUMMARY line emitted" "$run_out" "BENCH_SUMMARY:"
+
+  rm -f "$RUN_LOG"
+  check_summary
+  exit 0
+fi
+
+rm -f "$RUN_LOG"
 echo
 ok "done. Try another suite: BENCH=ssb SCALE=0.1 ./run.sh    Tear down: ./run.sh --down"

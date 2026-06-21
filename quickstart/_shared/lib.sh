@@ -44,3 +44,51 @@ cap() {
     "$@"
   fi
 }
+
+# --- Assertions (for run.sh --check mode) -----------------------------------
+# Promoted from scripts/distributed-test.sh so quickstarts + distributed share
+# one assertion vocabulary. Counters are global; call check_summary at the end.
+CHECK_PASS=0
+CHECK_FAIL=0
+
+# assert_contains <label> <output> <expected-substring>  (case-insensitive)
+assert_contains() {
+  local label=$1 output=$2 expected=$3
+  if printf '%s' "$output" | grep -qi -- "$expected"; then
+    ok "$label"; CHECK_PASS=$((CHECK_PASS + 1))
+  else
+    warn "$label (expected to contain '$expected')"
+    printf '       got: %s\n' "$(printf '%s' "$output" | head -3)"
+    CHECK_FAIL=$((CHECK_FAIL + 1))
+  fi
+}
+
+# assert_not_empty <label> <output>  (non-empty and not "0 rows")
+assert_not_empty() {
+  local label=$1 output=$2
+  if [ -n "$output" ] && ! printf '%s' "$output" | grep -q "0 rows"; then
+    ok "$label"; CHECK_PASS=$((CHECK_PASS + 1))
+  else
+    warn "$label (empty result)"; CHECK_FAIL=$((CHECK_FAIL + 1))
+  fi
+}
+
+# assert_not_contains <label> <output> <forbidden-substring>
+assert_not_contains() {
+  local label=$1 output=$2 forbidden=$3
+  if printf '%s' "$output" | grep -qi -- "$forbidden"; then
+    warn "$label (should NOT contain '$forbidden')"
+    printf '       got: %s\n' "$(printf '%s' "$output" | head -3)"
+    CHECK_FAIL=$((CHECK_FAIL + 1))
+  else
+    ok "$label"; CHECK_PASS=$((CHECK_PASS + 1))
+  fi
+}
+
+# check_summary — print totals and exit non-zero if any assertion failed.
+check_summary() {
+  echo
+  step "checks: ${CHECK_PASS} passed, ${CHECK_FAIL} failed"
+  [ "$CHECK_FAIL" -eq 0 ] || die "${CHECK_FAIL} assertion(s) failed"
+  ok "all checks passed"
+}

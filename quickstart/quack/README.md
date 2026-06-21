@@ -66,6 +66,7 @@ cd quickstart/quack
 cp .env.example .env
 ./run.sh             # up -> GET / probe -> DuckDB round-trip (if duckdb on PATH) -> capture
 ./run.sh --down      # tear down
+./run.sh --check     # up -> probe -> (round-trip if duckdb) -> assert invariants
 ```
 
 ## Enabling Quack
@@ -179,11 +180,18 @@ a dev-only stack (no IdP), exactly like the `nessie` quickstart.
 
 ## How it is tested
 
-`run.sh` brings the stack up, asserts the `GET /` probe, then (with a local
-duckdb 1.5.3) seeds `nessie.demo.events` and has DuckDB query it over Quack,
-capturing the aggregated result to [`OUTPUT.md`](./OUTPUT.md). Validated
-2026-06-07 from a clean state. The connection -> prepare -> result-chunk path is
-also covered by the engine's tests:
+`./run.sh --check` asserts the invariants in `run.sh`:
+
+- the `GET /` probe identifies the endpoint (the response contains
+  `DuckDB Quack RPC endpoint`), which is the always-on server-side check,
+- if a quack-capable `duckdb` CLI was on PATH, the DuckDB round-trip reads the
+  purchase total `55.25` over Quack. A missing duckdb does not false-fail: the
+  round-trip assertion is skipped with a warning and the probe check still runs.
+
+The demo run captures the aggregated round-trip result to
+[`OUTPUT.md`](./OUTPUT.md). Validated 2026-06-07 from a clean state with duckdb
+1.5.3. The connection -> prepare -> result-chunk path is also covered by the
+engine's tests:
 
 - `crates/sqe-coordinator/tests/quack_e2e.rs::quack_select_one_round_trip`
 - `sqe-quack-server/tests/` (connection lifecycle, auth rejection)

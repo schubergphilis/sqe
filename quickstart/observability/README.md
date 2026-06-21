@@ -32,7 +32,9 @@ just to generate real metrics; the focus here is the monitoring pipeline.
 ```bash
 cd quickstart/observability
 cp .env.example .env
-./run.sh
+./run.sh             # up -> queries -> assert metrics scraped -> capture
+./run.sh --down      # tear everything down
+./run.sh --check     # up -> queries -> assert SQE metrics are scraped
 ```
 
 `run.sh` brings the stack up, runs `queries.sql` a few times to generate metrics,
@@ -41,10 +43,10 @@ captures them to [`OUTPUT.md`](./OUTPUT.md). Open Grafana at
 `http://localhost:13000` (admin / admin) for the **SQE Overview** dashboard. Tear
 down with `./run.sh --down`.
 
-## How the pipeline fits together
+## How it works
 
 ```
-sqe (:9090/metrics)  --scrape 5s-->  victoriametrics (:8428)  <--query--  grafana (:3000)
+sqe (:9090/metrics)  -- scrape 5s -->  victoriametrics (:8428)  <-- query --  grafana (:3000)
 ```
 
 - **SQE** serves Prometheus text metrics at `/metrics` on `prometheus_port`
@@ -57,6 +59,40 @@ sqe (:9090/metrics)  --scrape 5s-->  victoriametrics (:8428)  <--query--  grafan
 A few of the metrics SQE exposes: `sqe_rows_returned_total`, `sqe_active_sessions`,
 `sqe_cache_hits_total` / `sqe_cache_misses_total`, `sqe_files_pruned_minmax_total`,
 `sqe_coordinator_memory_used_bytes`, `sqe_s3_requests_total` / `sqe_s3_bytes_read_total`.
+
+## Configuration explained
+
+### `sqe.toml` (the metrics source)
+
+```toml
+[metrics]
+prometheus_port = 9090
+```
+
+`prometheus_port` is the only line this scenario cares about: it is where SQE
+serves the Prometheus text exposition (`/metrics`). It is separate from the
+`/healthz` port (9091). The rest of `sqe.toml` is a minimal queryable SQE
+(Nessie catalog over RustFS, `anonymous` auth) whose only job here is to emit
+real counters; it mirrors the [`nessie`](../nessie/) quickstart's config.
+
+### `observability/scrape.yml` (VictoriaMetrics)
+
+The scrape config defines the `sqe-coordinator` job that polls `sqe:9090` every
+5 seconds. `up{job="sqe-coordinator"}` is `1` when the scrape succeeds, which is
+the end-to-end proof the pipeline works.
+
+### Grafana provisioning (`observability/`)
+
+- `grafana-datasource.yml` registers VictoriaMetrics as the default datasource
+  (so the dashboard queries resolve without manual setup).
+- `grafana-dashboards.yml` tells Grafana to load dashboards from disk.
+- `sqe-dashboard.json` is the provisioned **SQE Overview** dashboard (query rate,
+  cache hit/miss, sessions, scan pruning, coordinator memory).
+
+### `.env.example`
+
+Offset host ports for the four web/UI surfaces: `VM_PORT` (VictoriaMetrics
+`18428`), `GRAFANA_PORT` (`13000`), plus the SQE Flight port. Defaults work as-is.
 
 ## Output
 
@@ -71,9 +107,17 @@ sqe_active_sessions                     = <n>
 
 ## How it is tested
 
-`run.sh` runs queries, then queries the VictoriaMetrics API for
-`up{job="sqe-coordinator"}` and `sqe_*` counters, asserting SQE is scraped, and
-captures a sample of the raw `/metrics`. Validated 2026-06-07.
+`./run.sh --check` runs queries to generate metrics, then asserts the invariants
+in `run.sh`:
+
+- SQE's own `/metrics` endpoint exposes the `sqe_*` family (non-empty), and
+  specifically `sqe_rows_returned_total` and `sqe_active_sessions` (the
+  load-bearing check, reliable the moment the coordinator is up),
+- VictoriaMetrics has scraped the coordinator: `up{job="sqe-coordinator"}` is
+  `1` (the end-to-end proof the scrape pipeline works).
+
+The check polls VictoriaMetrics until a real SQE sample lands before asserting,
+so the scrape has actually happened. Validated 2026-06-07.
 
 ## Gotchas
 

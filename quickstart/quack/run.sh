@@ -6,14 +6,17 @@
 #
 #   ./run.sh             # up -> GET / probe -> (DuckDB round-trip if available) -> capture
 #   ./run.sh --down      # tear everything down
+#   ./run.sh --check     # up -> probe -> (round-trip) -> assert key invariants
 set -euo pipefail
 cd "$(dirname "$0")"
 . ../_shared/lib.sh
 
+CHECK=0
 for a in "$@"; do
   case "$a" in
     --down) require docker; step "tearing down"; docker compose down -v; ok "done"; exit 0 ;;
-    *) die "unknown arg: $a (use --down)" ;;
+    --check) CHECK=1 ;;
+    *) die "unknown arg: $a (use --down or --check)" ;;
   esac
 done
 
@@ -91,5 +94,25 @@ step "capturing to $OUT"
   echo '```'
 } | tee "$OUT"
 ok "captured to $OUT"
+
+if [ "$CHECK" -eq 1 ]; then
+  step "checking invariants (reusing the GET / probe and the round-trip result)"
+
+  # The server identification is always available once the stack is up.
+  assert_contains "Quack endpoint identifies itself" "$IDENT" "DuckDB Quack RPC endpoint"
+
+  # The DuckDB client round-trip only ran if a quack-capable duckdb CLI was on
+  # PATH (and the nightly extension fetch succeeded). Assert on its result only
+  # when present, so a missing/unavailable duckdb does not false-fail.
+  if [ -n "$ROUNDTRIP" ]; then
+    assert_contains "DuckDB round-trip reads the purchase total" "$ROUNDTRIP" "55.25"
+  else
+    warn "duckdb round-trip skipped (no quack-capable duckdb CLI) -- probe-only check"
+  fi
+
+  check_summary
+  exit 0
+fi
+
 echo
 ok "done. Quack endpoint: $QUACK   Tear down: ./run.sh --down"

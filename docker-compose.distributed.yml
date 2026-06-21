@@ -3,10 +3,10 @@
 # Extends docker-compose.test.yml with coordinator + 2 workers.
 # Uses the same Polaris + RustFS as the integration test stack.
 #
-# Usage:
+# Usage (the quickstart/distributed scenario wraps all three steps):
 #   docker compose -f docker-compose.test.yml -f docker-compose.distributed.yml up --build -d
-#   ./scripts/bootstrap-test.sh
-#   ./scripts/distributed-test.sh
+#   ./scripts/bootstrap-distributed.sh
+#   scripts/test.sh scenario distributed   # or: quickstart/distributed/run.sh --check
 
 services:
   # ── SQE Coordinator ────────────────────────────────────────
