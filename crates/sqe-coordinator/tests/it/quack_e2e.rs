@@ -98,6 +98,9 @@ async fn quack_select_one_round_trip() {
             user_id: session.user.username.clone(),
             display_name: session.user.username.clone(),
             roles: session.user.roles.clone(),
+            subject: None,
+            email: None,
+            groups: Vec::new(),
             // Catalog calls executed mid-query use the Polaris bearer so
             // they appear as the authenticated user. This is the same
             // forward-the-token convention Flight SQL uses.
