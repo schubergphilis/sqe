@@ -23,11 +23,11 @@ gantt
     section Shipped
     Phase 2c - dbt Compatibility :done, p2c, 2026-03, 2026-04
     Phase 5 - Pluggable Catalogs :done, p5, 2026-04, 2026-05
+    Phase 6 - Security Policies  :done, p6, 2026-05, 2026-06
     Phase 7 - Iceberg V3         :done, p7, 2026-04, 2026-05
     Phase 9 - OpenLineage        :done, p9, 2026-05, 2026-05
 
     section Next
-    Phase 6 - Security Policies  :p6, 2026-05, 2026-07
     Phase 8 - Trino Decommission :p8, 2026-07, 2026-09
 ```
 
@@ -221,16 +221,24 @@ Multi-cloud storage via `object_store`: S3 (+ endpoint override for R2, Ceph, Ga
 
 ---
 
-## Phase 6 - Security Policies (Planned)
+## Phase 6 - Security Policies (Shipped, off by default)
 
-Fine-grained access control via LogicalPlan rewriting.
+Fine-grained access control via LogicalPlan rewriting. Implemented and pluggable, and **off by default**: the policy engine defaults to `passthrough` and `access_control.backend` defaults to `none`, so enforcement is opt-in. See [GRANT and REVOKE](../sql-reference/grant-revoke.md) for the SQL surface, backends, and known gaps.
 
-- `PolicyEnforcer` implementations (OPA via Rego, Cedar)
+Shipped:
+
+- Plan-rewriting `PolicyEnforcer` (row filters and column masks injected before optimization)
 - `GRANT/REVOKE` with `ROWS WHERE` and `MASKED WITH`
-- `SHOW GRANTS` / `SHOW EFFECTIVE POLICY`
+- `SHOW GRANTS` / `SHOW EFFECTIVE GRANTS` / `CHECK ACCESS`
 - Column restriction (invisible columns)
 - Policy caching with TTL (moka)
 - No-information-leakage model (PostgreSQL RLS style)
+- Wired backends: Apache Ranger (production) and an in-memory store (dev / tests)
+
+Not yet wired:
+
+- OPA (Rego) and Cedar policy engines are present as configuration options but remain experimental
+- See the "Known gaps" in [GRANT and REVOKE](../sql-reference/grant-revoke.md) for SQL-surface limits (no `WITH GRANT OPTION`, table-level INSERT only, scalar-only masks)
 
 ---
 

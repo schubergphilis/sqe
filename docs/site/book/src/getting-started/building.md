@@ -40,6 +40,8 @@ Binaries are placed in `target/release/` (or `target/debug/`):
 - `sqe-server`: the server binary (coordinator or worker)
 - `sqe-cli`: the SQL CLI client
 
+`sqe-server` is the supported entrypoint for both roles: it takes `--config <path>` and `--mode coordinator|worker`, and it is the binary shipped in the Docker image and run by the Helm chart. The `sqe-coordinator` crate also produces an older coordinator-only binary of the same name that takes the config path as a positional argument and has no worker mode; prefer `sqe-server`.
+
 ## Test
 
 ```bash

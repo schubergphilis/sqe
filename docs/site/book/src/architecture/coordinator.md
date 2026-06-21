@@ -45,7 +45,7 @@ The coordinator classifies every SQL statement and routes it to the appropriate 
 | `DELETE FROM` | `handle_delete` | CoW: scan affected files, filter, rewrite via `rewrite_files()` |
 | `UPDATE` | `handle_update` | CoW: scan affected files, apply SET, rewrite via `rewrite_files()` |
 | `MERGE INTO` | `handle_merge` | CoW: full outer join, classify rows, rewrite via `rewrite_files()` |
-| `GRANT/REVOKE` | Policy (Phase 5) | Not yet implemented |
+| `GRANT/REVOKE` | Policy backend | Parsed always; enforced when an access-control backend is configured (default `none`). See [GRANT and REVOKE](../sql-reference/grant-revoke.md). |
 
 ## Session Context
 

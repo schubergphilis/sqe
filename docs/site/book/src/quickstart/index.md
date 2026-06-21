@@ -1,4 +1,6 @@
-# Quickstart
+# Quickstart Recipes
+
+This is the per-catalog recipe collection: one runnable quickstart per backend and use case. For the single get-running-in-5-minutes walkthrough, see [Getting Started > Quickstart](../getting-started/quickstart.md).
 
 Each quickstart is a self-contained directory you can run end to end. It brings
 up everything the use-case needs, runs a few useful queries, and captures the
