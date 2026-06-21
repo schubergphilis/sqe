@@ -4,14 +4,17 @@
 #
 #   ./run.sh             # up -> bootstrap -> mint token -> query -> capture
 #   ./run.sh --down      # tear everything down
+#   ./run.sh --check     # up -> mint token -> query -> assert key invariants
 set -euo pipefail
 cd "$(dirname "$0")"
 . ../_shared/lib.sh
 
+CHECK=0
 for a in "$@"; do
   case "$a" in
     --down) require docker; step "tearing down"; docker compose down -v; ok "done"; exit 0 ;;
-    *) die "unknown arg: $a (use --down)" ;;
+    --check) CHECK=1 ;;
+    *) die "unknown arg: $a (use --down or --check)" ;;
   esac
 done
 
@@ -71,6 +74,30 @@ step "querying SQE with --token, capturing to $OUT"
   echo '```'
 } | tee "$OUT"
 ok "captured to $OUT"
+
+if [ "$CHECK" -eq 1 ]; then
+  step "checking invariants (reusing the minted tokens and the same Flight SQL calls)"
+
+  # adminuser token: full create/write/read via --file. Output mixes SHOW SCHEMAS
+  # with (0 rows) DDL lines and the final aggregate, so assert on markers.
+  admin_out=$(docker compose exec -T sqe sqe-cli --port 50051 --token "$ADMTOK" --file /queries.sql --stop-on-error 2>&1)
+  assert_contains    "adminuser token sees the demo schema"   "$admin_out" "demo"
+  assert_contains    "adminuser token reads the purchase total" "$admin_out" "55.25"
+  assert_not_contains "adminuser token run has no error"       "$admin_out" "error"
+
+  # testuser token: a clean bare SELECT returns the 4 rows adminuser wrote. The
+  # 403 INSERT and invalid-token cases from the capture are deliberately NOT
+  # re-run here -- they print "Error:" by design and would false-fail an
+  # error-absence assert.
+  testuser_out=$(docker compose exec -T sqe sqe-cli --port 50051 --token "$TESTTOK" \
+    -e "SELECT COUNT(*) AS rows FROM quickstart.demo.events" 2>&1)
+  assert_not_empty   "testuser token reads the events table"  "$testuser_out"
+  assert_contains    "testuser token counts 4 rows"           "$testuser_out" "4"
+  assert_not_contains "testuser token SELECT has no error"    "$testuser_out" "error"
+
+  check_summary
+  exit 0
+fi
 
 echo
 ok "done. Flight grpc://localhost:${SQE_FLIGHT_PORT:-60051}, Keycloak $KC. Tear down: ./run.sh --down"

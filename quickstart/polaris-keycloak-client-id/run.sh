@@ -13,11 +13,13 @@ cd "$(dirname "$0")"
 . ../_shared/lib.sh
 
 WITH_TESTS=0
+CHECK=0
 for a in "$@"; do
   case "$a" in
     --down) require docker; step "tearing down"; docker compose down -v; ok "done"; exit 0 ;;
     --with-tests) WITH_TESTS=1 ;;
-    *) die "unknown arg: $a (use --down or --with-tests)" ;;
+    --check) CHECK=1 ;;
+    *) die "unknown arg: $a (use --down, --with-tests or --check)" ;;
   esac
 done
 
@@ -55,6 +57,31 @@ step "running demo queries, capturing to $OUT"
   echo '```'
 } | tee "$OUT"
 ok "captured to $OUT"
+
+if [ "$CHECK" -eq 1 ]; then
+  step "checking invariants (reusing the two sqe-cli Flight SQL invocations)"
+
+  # adminuser: full create/write/read path via --file. The output mixes the
+  # SHOW SCHEMAS result, three (0 rows) lines from DROP/CREATE/INSERT, and the
+  # final aggregate -- so we assert on specific markers, not non-emptiness.
+  admin_out=$(docker compose exec -T -e SQE_PASSWORD=adminuser123 sqe \
+    sqe-cli --port 50051 --user adminuser --file /queries.sql --stop-on-error 2>&1)
+  assert_contains    "adminuser sees the demo schema"        "$admin_out" "demo"
+  assert_contains    "adminuser reads the purchase total"    "$admin_out" "55.25"
+  assert_not_contains "adminuser run has no error"           "$admin_out" "error"
+
+  # testuser (table_reader only): the lower-privileged identity still reads the
+  # table adminuser wrote. Bare SELECT, so non-emptiness is a safe check here.
+  testuser_out=$(docker compose exec -T -e SQE_PASSWORD=testuser123 sqe \
+    sqe-cli --port 50051 --user testuser \
+    -e "SELECT kind, COUNT(*) AS n FROM quickstart.demo.events GROUP BY kind ORDER BY kind" 2>&1)
+  assert_not_empty   "testuser reads the events table"       "$testuser_out"
+  assert_contains    "testuser sees the click + purchase rows" "$testuser_out" "purchase"
+  assert_not_contains "testuser run has no error"            "$testuser_out" "error"
+
+  check_summary
+  exit 0
+fi
 
 if [ "$WITH_TESTS" -eq 1 ]; then
   step "running gated Keycloak integration tests (host, against localhost:${KEYCLOAK_PORT:-28080})"

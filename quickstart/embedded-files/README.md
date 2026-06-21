@@ -32,15 +32,19 @@ remote reads.
 
 ```bash
 cd quickstart/embedded-files
-./run.sh
+./run.sh             # run queries -> capture output
+./run.sh --check     # run queries, then assert the key invariants
 ```
 
 `run.sh` queries the local files and a remote one, capturing the result to
-[`OUTPUT.md`](./OUTPUT.md). Nothing persists: the `--memory` engine is ephemeral.
+[`OUTPUT.md`](./OUTPUT.md). Nothing persists: the `--memory` engine is
+ephemeral, so there is no `--down`: nothing is left running.
 
-## The commands
+## Configuration explained
 
-The wrapper runs the embedded CLI in the SQE image with `./data` mounted:
+This scenario has no config file. The configuration is the `sqe-cli` flags plus
+the three sample files in [`data/`](./data/). The wrapper runs the embedded CLI
+in the SQE image with `./data` mounted read-only:
 
 ```bash
 sqe() { docker run --rm --entrypoint sqe-cli -v "$PWD/data":/data:ro \
@@ -110,10 +114,17 @@ Captured from a clean run (`./run.sh`), committed in [`OUTPUT.md`](./OUTPUT.md):
 
 ## How it is tested
 
-`run.sh` exercises `read_csv`, `read_json`, `read_parquet` on local files, a
-cross-format join, and a remote HTTPS read, and captures the output. The local
-Parquet path mirrors the `test_read_parquet_local_file` integration test. Last
-validated 2026-06-06.
+`./run.sh --check` re-runs two of the queries and asserts the invariants in
+`run.sh`:
+
+- the local `read_parquet` aggregate returns rows, shows the purchase total
+  `55.25`, and contains no `error` (the local file path works),
+- the remote `read_parquet` over HTTPS returns the expected `1000`-row count and
+  no `error` (the object-store layer reaches an HTTPS URL).
+
+The full demo additionally exercises `read_csv`, `read_json`, and a cross-format
+join. The local Parquet path mirrors the `test_read_parquet_local_file`
+integration test. Last validated 2026-06-06.
 
 ## Gotchas
 

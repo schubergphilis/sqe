@@ -4,14 +4,17 @@
 #
 #   ./run.sh             # up -> queries -> capture
 #   ./run.sh --down      # tear everything down
+#   ./run.sh --check     # up -> queries -> assert key invariants
 set -euo pipefail
 cd "$(dirname "$0")"
 . ../_shared/lib.sh
 
+CHECK=0
 for a in "$@"; do
   case "$a" in
     --down) require docker; step "tearing down"; docker compose down -v; ok "done"; exit 0 ;;
-    *) die "unknown arg: $a (use --down)" ;;
+    --check) CHECK=1 ;;
+    *) die "unknown arg: $a (use --down or --check)" ;;
   esac
 done
 
@@ -40,6 +43,21 @@ step "running demo queries as the anonymous user, capturing to $OUT"
   echo '```'
 } | tee "$OUT"
 ok "captured to $OUT"
+
+if [ "$CHECK" -eq 1 ]; then
+  step "checking invariants (reusing the same --file Flight SQL call)"
+
+  # The full create-namespace/table/insert/show/read path. Output mixes (0 rows)
+  # DDL lines, SHOW SCHEMAS, and the final aggregate, so assert on markers.
+  out=$(docker compose exec -T -e SQE_PASSWORD=anonymous sqe \
+    sqe-cli --port 50051 --user anonymous --file /queries.sql --stop-on-error 2>&1)
+  assert_contains    "Nessie shows the demo namespace"  "$out" "demo"
+  assert_contains    "reads the purchase total"         "$out" "55.25"
+  assert_not_contains "run has no error"                "$out" "error"
+
+  check_summary
+  exit 0
+fi
 
 echo
 ok "done. Flight grpc://localhost:${SQE_FLIGHT_PORT:-60051}, Nessie http://localhost:${NESSIE_PORT:-19120}/api/v2/config. Tear down: ./run.sh --down"

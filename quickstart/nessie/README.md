@@ -38,7 +38,9 @@ manage. For the auth story (real identities, RBAC, token passthrough) see the
 ```bash
 cd quickstart/nessie
 cp .env.example .env
-./run.sh
+./run.sh             # up -> queries -> capture output
+./run.sh --down      # tear everything down
+./run.sh --check     # up -> queries -> assert key invariants
 ```
 
 `run.sh` brings the stack up and runs [`queries.sql`](./queries.sql) as the
@@ -54,6 +56,19 @@ docker compose exec -e SQE_PASSWORD=anonymous sqe \
 
 Endpoints: Flight SQL `grpc://localhost:60051`, Nessie API
 `http://localhost:19120/api/v2/config`.
+
+## How it works
+
+SQE has one Iceberg REST client, and Nessie speaks the Iceberg REST protocol, so
+SQE talks to it through the identical code path it uses for Polaris. SQE issues
+the `GET /v1/config?warehouse=...` handshake against Nessie's `/iceberg` mount,
+reads back the catalog prefix Nessie returns (`main|warehouse`, the branch +
+warehouse), then lists, creates, and commits over the same protocol.
+
+Nessie owns the table metadata (in-memory version store here) and hands table
+locations back to SQE. SQE reads and writes the actual Iceberg data files
+directly on RustFS with its own `[storage]` S3 credentials. The query path is:
+client -> SQE (anonymous) -> Nessie for metadata -> RustFS for data.
 
 ## Configuration explained
 
@@ -114,8 +129,16 @@ The anonymous user creates a namespace (SQE maps `CREATE SCHEMA` to an Iceberg
 
 ## How it is tested
 
-`run.sh` asserts the full create/write/read flow against Nessie succeeds and
-captures the output. The same `rest` client is exercised by the live test
+`./run.sh --check` re-runs the full create/write/read flow against Nessie
+(`queries.sql` over Flight as the anonymous user) and asserts the invariants in
+`run.sh`:
+
+- the output shows the `demo` namespace (so `CREATE SCHEMA` mapped to an Iceberg
+  `create_namespace` and the catalog round-tripped),
+- it reads back the purchase total `55.25` (so the write and read both worked),
+- the run contains no `error`.
+
+The same `rest` client is also exercised by the live test
 `nessie::nessie_namespace_round_trip` in the `sqe-catalog` integration suite
 (`backends_integration.rs`). Last validated 2026-06-06.
 

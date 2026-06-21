@@ -31,8 +31,12 @@ second (a fresh invocation) reads it back, proving on-disk persistence.
 ```bash
 cd quickstart/embedded-sqlite-catalog
 ./run.sh            # process 1 writes, process 2 (separate) reads
-./run.sh --clean    # reset ./warehouse first
+./run.sh --clean    # reset ./warehouse first, then run
+./run.sh --check    # run, then assert the persisted read returns the rows
 ```
+
+There is no long-running stack here, so there is no `--down`; `--clean` deletes
+`./warehouse` to start from an empty catalog.
 
 By hand:
 
@@ -54,12 +58,37 @@ multi-statement script.
 
 ## How it works
 
+Embedded mode runs the whole engine inside the `sqe-cli` process: DataFusion,
+the Iceberg writers, and a catalog, with no coordinator, workers, or network
+listeners. `--warehouse <dir>` attaches a catalog whose metadata is a `sqe.db`
+SQLite file at `<dir>` and whose data files (Iceberg metadata + Parquet) live
+next to it under `<dir>/iceberg`.
+
+The persistence proof is the two-process flow: process 1 creates the table and
+inserts the rows, then exits. Process 2 is a separate `sqe-cli` invocation that
+opens the same warehouse and reads the rows back. The data survives because it
+is on disk in the SQLite catalog plus the Iceberg files, not in process memory.
+
+## Configuration explained
+
+This scenario has no config file. The configuration is the `sqe-cli` flags plus
+the SQL in `queries-init.sql`.
+
 | Flag | What it does |
 |---|---|
-| `--embedded` | Run the engine in-process; no coordinator/workers/listeners. |
-| `--warehouse <dir>` | Persistent SQLite Iceberg catalog named `iceberg` at `<dir>` (`sqe.db` + Iceberg data). Survives the process. |
-| `--memory` | (the other mode) no catalog, session-only -- see `embedded-files`. |
-| `--catalog name=PATH` | Attach several named persistent catalogs at once -- see `attach-catalogs`. |
+| `--embedded` | Run the engine in-process; no coordinator, workers, or listeners. |
+| `--warehouse <dir>` | Attach a persistent SQLite Iceberg catalog named `iceberg` at `<dir>` (`sqe.db` + Iceberg data under `iceberg/`). It survives the process. |
+| `--file PATH` | Run a multi-statement SQL script (the seed step uses this). |
+| `-e "SQL"` | Run a single statement and print the result (the read step uses this). |
+| `--stop-on-error` | Abort on the first failing statement instead of continuing. |
+
+`--warehouse` names the catalog `iceberg`, so tables resolve as
+`iceberg.<namespace>.<table>`. It is mutually exclusive with `--memory` (no
+catalog, session-only, see `embedded-files`) and `--catalog NAME=PATH` (attach
+several named catalogs at once, see `attach-catalogs`).
+
+`queries-init.sql` creates `iceberg.demo.events` and inserts four rows. The read
+step in process 2 aggregates them by `kind`.
 
 ## Output
 
@@ -79,8 +108,17 @@ Captured from a clean run (`./run.sh --clean`), in [`OUTPUT.md`](./OUTPUT.md):
 
 ## How it is tested
 
-`run.sh` writes in one process and reads in a second, asserting the rows survive,
-and lists the on-disk `sqe.db` + `iceberg/`. Validated 2026-06-06.
+`./run.sh --check` opens the persisted warehouse in a fresh process (the same
+read process 2 runs) and asserts the invariants in `run.sh`:
+
+- the persisted read returns rows (not empty, not `0 rows`),
+- it shows the purchase total `55.25` (the rows process 1 wrote survived the
+  process exit),
+- the read contains no `error`.
+
+That is the whole point of the scenario: a second, separate invocation sees what
+the first wrote. The demo run also lists the on-disk `sqe.db` + `iceberg/` to
+show where the catalog lives. Validated 2026-06-06.
 
 ## Gotchas
 

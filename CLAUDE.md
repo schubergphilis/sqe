@@ -130,9 +130,8 @@ Benchmark JSON results in `benchmarks/results/` are **committed to the repo** fo
 # Quick smoke test: TPC-H SF1 single-node
 BENCH_SCALE=1 ./scripts/benchmark-test.sh tpch
 
-# Distributed test: requires docker-compose stack
-docker compose -f docker-compose.test.yml -f docker-compose.distributed.yml up --build -d
-./scripts/distributed-test.sh
+# Distributed test: coordinator + 2 workers (heavy; brings up its own stack)
+scripts/test.sh scenario distributed
 ```
 
 ## After Completing Work

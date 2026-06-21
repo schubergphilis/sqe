@@ -5,14 +5,17 @@
 #
 #   ./run.sh
 #   ./run.sh --down
+#   ./run.sh --check
 set -euo pipefail
 cd "$(dirname "$0")"
 . ../_shared/lib.sh
 
+CHECK=0
 for a in "$@"; do
   case "$a" in
     --down) require docker; step "tearing down"; docker compose down -v; ok "done"; exit 0 ;;
-    *) die "unknown arg: $a (use --down)" ;;
+    --check) CHECK=1 ;;
+    *) die "unknown arg: $a (use --down or --check)" ;;
   esac
 done
 
@@ -48,5 +51,23 @@ step "browsing the Unity catalog via SQE, capturing to $OUT"
   echo '```'
 } | tee "$OUT"
 ok "captured to $OUT"
+
+if [ "$CHECK" -eq 1 ]; then
+  step "checking invariants (reusing the browse query against Unity over Iceberg REST)"
+
+  # Unity OSS's Iceberg REST is read-only and does NOT serve the bundled table
+  # for SELECT (see queries.sql + OUTPUT.md: SELECT returns "not found"). So the
+  # invariant is the metadata browse: the `default` namespace and the
+  # `marksheet_uniform` table are enumerable. We do NOT assert SELECT rows.
+  browse_out=$(docker compose exec -T -e SQE_PASSWORD=x sqe \
+    sqe-cli --port 50051 --user anonymous --file /queries.sql 2>&1)
+  assert_contains    "Unity exposes the default namespace"   "$browse_out" "default"
+  assert_contains    "Unity lists the marksheet_uniform table" "$browse_out" "marksheet_uniform"
+  assert_not_contains "browse has no error"                  "$browse_out" "error"
+
+  check_summary
+  exit 0
+fi
+
 echo
 ok "done. Unity API http://localhost:${UNITY_PORT:-18181}, Flight grpc://localhost:${SQE_FLIGHT_PORT:-60051}. Tear down: ./run.sh --down"
