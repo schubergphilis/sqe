@@ -49,6 +49,8 @@ and there is nothing to add to `/etc/hosts`.
 cd quickstart/polaris-keycloak-client-id
 cp .env.example .env          # defaults work as-is; edit to change secrets/ports
 ./run.sh                      # up -> bootstrap -> queries -> capture output
+./run.sh --down               # tear everything down
+./run.sh --check              # up -> bootstrap -> queries -> assert key invariants
 ```
 
 `run.sh` brings the stack up, waits for health, runs the bootstrap, executes
@@ -202,8 +204,12 @@ Captured from a clean run (`./run.sh`), committed in
 
 Two layers, both run from a clean state:
 
-1. **The demo path** above: `run.sh` asserts the queries succeed for two users
-   with different roles and captures the output.
+1. **The demo path** (`./run.sh --check`): re-runs the two `sqe-cli` Flight SQL
+   invocations and asserts that adminuser sees the `demo` schema and reads the
+   purchase total `55.25` with no `error`, and that testuser reads the events
+   table (the `purchase`/`click` rows) with no `error`. That confirms both
+   users authenticate via their own minted tokens and Polaris applies their
+   roles.
 2. **The repo's gated integration tests**: the `test_keycloak_*` tests in the
    `sqe-coordinator` integration suite (`integration_test.rs`) (specifically
    `test_keycloak_auth_with_test_users` and `test_keycloak_token_refresh`).

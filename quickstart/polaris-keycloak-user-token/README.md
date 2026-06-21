@@ -17,14 +17,40 @@ OIDC dance, a CI job with a service-account token, a gateway that injects the
 user's JWT. If instead you want SQE to mint tokens from a username + password,
 use the [`polaris-keycloak-client-id`](../polaris-keycloak-client-id/) quickstart.
 
-## Same stack, one config difference
+## What you get
+
+The same Docker stack as [`polaris-keycloak-client-id`](../polaris-keycloak-client-id/):
+Keycloak (realm `iceberg`, three users), Polaris federated to Keycloak, RustFS
+storage, the one-shot setup jobs, and SQE. See that quickstart's "What you get"
+for the full service table. The only difference is SQE's auth provider, covered
+below.
+
+## How it works
+
+The client authenticates the user out-of-band (or already holds the user's
+token) and sends it to SQE with `--token`. SQE does not call Keycloak's token
+endpoint and holds no client secret. It fetches the realm's signing keys (JWKS)
+once, then for each incoming token verifies the signature, the `iss` claim, and
+expiry, and passes the validated token straight through to Polaris. Polaris maps
+`preferred_username` to a principal and applies that principal's roles.
+
+```
+client (--token <jwt>) -> SQE (validate against realm JWKS) -> Polaris -> RustFS
+```
+
+SQE is a pure validator here. The contrast with the client-id quickstart is the
+token's origin: there SQE mints it from a password; here the caller brings it.
+
+## Configuration explained
 
 This quickstart uses the **exact same** Docker stack and shared assets
 (`_shared/keycloak/realm-iceberg.json`, `_shared/polaris/bootstrap.sh`) as
 [`polaris-keycloak-client-id`](../polaris-keycloak-client-id/). See that README
-for the service table, ports, the realm, and the Polaris federation config.
+for the service table, ports, the realm, the `.env`, and the Polaris federation
+config: all of it is annotated there and identical here.
 
-The only difference is the SQE auth provider in [`sqe.toml`](./sqe.toml):
+The only difference, and the whole point of this scenario, is the SQE auth
+provider in [`sqe.toml`](./sqe.toml):
 
 ```toml
 [[auth.providers]]
@@ -54,7 +80,9 @@ Prerequisites for the full list.
 ```bash
 cd quickstart/polaris-keycloak-user-token
 cp .env.example .env
-./run.sh
+./run.sh             # up -> mint token -> query with --token -> capture
+./run.sh --down      # tear everything down
+./run.sh --check     # up -> mint token -> query -> assert key invariants
 ```
 
 `run.sh` brings the stack up, then mints a token from Keycloak's **public**
@@ -108,9 +136,19 @@ $ sqe-cli --token not.a.real.jwt -e "SELECT 1"
 
 ## How it is tested
 
-`run.sh` asserts three behaviors and captures them: a valid token authorizes
-the full read/write flow, a reader token is allowed to read but denied a write
-(Polaris RBAC), and a malformed token is rejected by SQE's JWKS validation
+`./run.sh --check` mints the same tokens and re-runs the queries, asserting the
+invariants in `run.sh`:
+
+- the **adminuser** token authorizes the full create/write/read flow: the output
+  shows the `demo` schema, reads the purchase total `55.25`, and has no `error`,
+- the **testuser** token reads the events table and counts the 4 rows adminuser
+  wrote, with no `error`.
+
+The 403-on-write and invalid-token cases are captured in the demo run (they print
+`Error:` by design) but deliberately not re-asserted in `--check`, which would
+false-fail an error-absence assertion. The full demo shows all three behaviors:
+a valid token authorizes read/write, a reader token reads but is denied a write
+by Polaris RBAC, and a malformed token is rejected by SQE's JWKS validation
 before reaching the catalog. Last validated 2026-06-06.
 
 ## Gotchas
