@@ -30,6 +30,7 @@ pub mod scheduler;
 pub mod streaming;
 pub mod suggest_bloom;
 pub mod session_manager;
+pub mod web_auth;
 pub mod web_ui;
 pub mod worker_registry;
 pub mod write_handler;
