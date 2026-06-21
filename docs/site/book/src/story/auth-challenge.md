@@ -4,7 +4,7 @@ The core design constraint that drove us to build SQE: **no service account**.
 
 ## The Problem with Service Accounts
 
-In a typical data platform, the query engine authenticates to the catalog and storage with a **service account** — a single identity with broad permissions. The engine then enforces per-user access control internally.
+In a typical data platform, the query engine authenticates to the catalog and storage with a **service account**, a single identity with broad permissions. The engine then enforces per-user access control internally.
 
 ```mermaid
 sequenceDiagram
@@ -23,10 +23,10 @@ sequenceDiagram
 ```
 
 This means:
-- **Polaris sees one identity** for all queries — audit logs show the service account, not the actual user
-- **S3 access is all-or-nothing** — the service account can read everything, security depends entirely on the engine enforcing it correctly
-- **Credential rotation** is a blast-radius event — rotating the service account key affects all users simultaneously
-- **Compliance gap** — auditors want to see that *Alice* read table X, not that *sqe-service-account* did
+- **Polaris sees one identity** for all queries: audit logs show the service account, not the actual user
+- **S3 access is all-or-nothing**: the service account can read everything, security depends entirely on the engine enforcing it correctly
+- **Credential rotation** is a blast-radius event: rotating the service account key affects all users simultaneously
+- **Compliance gap**: auditors want to see that *Alice* read table X, not that *sqe-service-account* did
 
 ## SQE's Approach: Bearer Token Passthrough
 
@@ -82,7 +82,7 @@ graph TB
     P -->|bob's token| S3B[S3: bob sees<br/>tables A, B only]
 ```
 
-Polaris enforces catalog-level access control based on the token. If Alice has access to tables A, B, C but Bob only has access to A and B, this is enforced at the catalog level — SQE doesn't need to duplicate this logic.
+Polaris enforces catalog-level access control based on the token. If Alice has access to tables A, B, C but Bob only has access to A and B, this is enforced at the catalog level. SQE doesn't need to duplicate this logic.
 
 ## Token Lifecycle
 

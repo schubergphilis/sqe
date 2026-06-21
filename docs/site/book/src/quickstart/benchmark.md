@@ -15,11 +15,11 @@ test. The default is TPC-H at scale factor 0.01, which completes in seconds.
 
 The run has three phases:
 
-1. **Generate** — `sqe-bench generate` writes the suite's tables as Parquet
+1. **Generate**: `sqe-bench generate` writes the suite's tables as Parquet
    files to a shared Docker volume.
-2. **Load** — `sqe-bench load` issues one `CREATE TABLE … AS SELECT * FROM read_parquet(…)` per table. The coordinator reads the Parquet from the shared
+2. **Load**: `sqe-bench load` issues one `CREATE TABLE … AS SELECT * FROM read_parquet(…)` per table. The coordinator reads the Parquet from the shared
    volume; tables land in the Nessie catalog.
-3. **Test** — `sqe-bench test` runs every `.sql` in the suite over Flight SQL
+3. **Test**: `sqe-bench test` runs every `.sql` in the suite over Flight SQL
    and reports pass / fail / error plus a per-query timing table.
 
 `sqe-bench` is a separate image built from `Dockerfile.bench`. Both images build
@@ -27,7 +27,7 @@ from this repo on first run if absent.
 
 ## What it demonstrates
 
-- All three `sqe-bench` phases — generate, load, and test — running end to end.
+- All three `sqe-bench` phases, generate, load, and test, running end to end.
 - TPC-H (default, SF0.01): all 22 queries pass with per-query timings.
 - Configurable suite (`BENCH=ssb`, `BENCH=tpcds`) and scale factor
   (`SCALE=0.1`, `SCALE=1`).
@@ -40,7 +40,7 @@ from this repo on first run if absent.
 
 Full config, `docker compose`, suite SQL, and captured output are in the repo:
 
-**→ [quickstart/benchmark/](https://github.com/schubergphilis/sqe/tree/main/quickstart/benchmark/)**
+**See: [quickstart/benchmark/](https://github.com/schubergphilis/sqe/tree/main/quickstart/benchmark/)**
 
 ```bash
 cd quickstart/benchmark

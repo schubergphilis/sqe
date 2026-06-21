@@ -18,7 +18,7 @@ password and holds no client secret.
   Keycloak, Polaris, RustFS, and SQE on one network.
 - The only difference is SQE's auth provider: `bearer_token` instead of
   `oidc_password`. SQE fetches the realm's signing keys once from the JWKS
-  endpoint, then verifies every incoming token locally — no call to Keycloak's
+  endpoint, then verifies every incoming token locally: no call to Keycloak's
   token endpoint, no client secret.
 - `run.sh` mints a token from Keycloak's public client (standing in for an
   upstream app) and queries SQE with `--token`.
@@ -40,7 +40,7 @@ password and holds no client secret.
 
 Full config, `docker compose`, queries, and captured output are in the repo:
 
-**→ [quickstart/polaris-keycloak-user-token/](https://github.com/schubergphilis/sqe/tree/main/quickstart/polaris-keycloak-user-token/)**
+**See: [quickstart/polaris-keycloak-user-token/](https://github.com/schubergphilis/sqe/tree/main/quickstart/polaris-keycloak-user-token/)**
 
 ```bash
 cd quickstart/polaris-keycloak-user-token

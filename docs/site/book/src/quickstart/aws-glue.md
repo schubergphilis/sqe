@@ -27,14 +27,14 @@ at the end, so the quickstart leaves nothing behind in your account.
   `CREATE TABLE`. By creating the database itself, SQE avoids that. See the
   [glue-lake-formation quickstart](./glue-lake-formation.md) for the governed
   variant.
-- `run.sh` runs the full loop: CDK deploy → start SQE → run queries → capture
-  output → drop the Glue database → CDK destroy.
+- `run.sh` runs the full loop: CDK deploy, then start SQE, then run queries, then capture
+  output, then drop the Glue database, then CDK destroy.
 
 ## What it demonstrates
 
 - SQE connecting to AWS Glue as a non-REST Iceberg catalog with S3 storage.
-- Full create/write/read round-trip: `CREATE SCHEMA` → `CREATE TABLE` →
-  `INSERT` → `SELECT … GROUP BY`, all against live Glue + S3.
+- Full create/write/read round-trip: `CREATE SCHEMA`, then `CREATE TABLE`, then
+  `INSERT`, then `SELECT … GROUP BY`, all against live Glue + S3.
 - Clean teardown: the S3 bucket (and all Iceberg data) and the Glue database are
   removed; no resources left in the account.
 
@@ -44,7 +44,7 @@ at the end, so the quickstart leaves nothing behind in your account.
 
 Full config, CDK stack, `docker compose`, queries, and captured output are in the repo:
 
-**→ [quickstart/aws-glue/](https://github.com/schubergphilis/sqe/tree/main/quickstart/aws-glue/)**
+**See: [quickstart/aws-glue/](https://github.com/schubergphilis/sqe/tree/main/quickstart/aws-glue/)**
 
 ```bash
 cd quickstart/aws-glue

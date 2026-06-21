@@ -21,17 +21,17 @@ end, so the quickstart leaves nothing behind in your account.
 - **SQE** uses the `s3tables` catalog backend, configured with the table bucket
   ARN. The bucket ARN and your AWS region are injected at runtime by `run.sh`.
 - AWS IAM credentials (via `AWS_PROFILE` or environment variables) authenticate
-  all catalog and storage operations — no separate identity provider.
+  all catalog and storage operations, no separate identity provider.
 - SQE creates the namespace itself with `CREATE SCHEMA`, which makes the calling
   principal its owner and avoids Lake Formation permission conflicts.
-- `run.sh` runs the full loop: CDK deploy → start SQE → run queries → capture
-  output → delete table and namespace → CDK destroy.
+- `run.sh` runs the full loop: CDK deploy, then start SQE, then run queries, then capture
+  output, then delete table and namespace, then CDK destroy.
 
 ## What it demonstrates
 
 - SQE connecting to AWS S3 Tables as a managed, non-REST Iceberg catalog.
-- Full create/write/read round-trip: `CREATE SCHEMA` → `CREATE TABLE` →
-  `INSERT` → `SELECT … GROUP BY`, all against live S3 Tables.
+- Full create/write/read round-trip: `CREATE SCHEMA`, then `CREATE TABLE`, then
+  `INSERT`, then `SELECT … GROUP BY`, all against live S3 Tables.
 - Clean teardown: the table bucket, namespace, and table are all removed; no
   resources left in the account.
 
@@ -41,7 +41,7 @@ end, so the quickstart leaves nothing behind in your account.
 
 Full config, CDK stack, `docker compose`, queries, and captured output are in the repo:
 
-**→ [quickstart/aws-s3-tables/](https://github.com/schubergphilis/sqe/tree/main/quickstart/aws-s3-tables/)**
+**See: [quickstart/aws-s3-tables/](https://github.com/schubergphilis/sqe/tree/main/quickstart/aws-s3-tables/)**
 
 ```bash
 cd quickstart/aws-s3-tables

@@ -5,7 +5,7 @@ This is the per-catalog recipe collection: one runnable quickstart per backend a
 Each quickstart is a self-contained directory you can run end to end. It brings
 up everything the use-case needs, runs a few useful queries, and captures the
 real output as committed evidence. These pages describe each one at a high
-level — what it shows and how it works — and link to the repo for the full
+level, what it shows and how it works, and link to the repo for the full
 config, compose files, queries, and captured output.
 
 These are the **user-facing source of truth for "how do I run SQE for X."** The

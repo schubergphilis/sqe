@@ -102,7 +102,7 @@ Connection conn = DriverManager.getConnection(url, props);
 
 - The Trino endpoint returns results as JSON (Trino wire format), not Arrow. For maximum performance, use Flight SQL.
 - Prepared statements are not supported via the Trino protocol.
-- Transaction control (`START TRANSACTION`, `COMMIT`) is not supported — queries execute in auto-commit mode.
+- Transaction control (`START TRANSACTION`, `COMMIT`) is not supported. Queries execute in auto-commit mode.
 - Type mapping covers common types; complex nested types may differ from native Trino behavior.
 
 ## Flight SQL vs Trino HTTP

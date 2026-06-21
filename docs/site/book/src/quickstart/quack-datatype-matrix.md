@@ -37,26 +37,26 @@ How DuckDB, Arrow/DataFusion, SQE's `LogicalTypeId`, and Iceberg primitive types
 | `MAP<K, V>` | `Map` | `Map` + `ExtraTypeInfo::List { child: STRUCT(key, value) }` | `map<K, V>` | ✅ DuckDB stores MAP as LIST<STRUCT<key,value>>; we reuse the LIST vector layout and stamp the parent type id as Map |
 | `ARRAY<T, N>` (fixed) | `FixedSizeList` | `Array` + `ExtraTypeInfo::Array { child, size }` | (none) | ✅ fields 103 (array_size) + 104 (child vector with size*count elements); size=0 honors WritePropertyWithDefault elision |
 | `UNION` | `Union` (dense or sparse) | `Union` + `ExtraTypeInfo::Struct { fields }` (tag-prefixed) | (none) | ⚠️ codec verified by unit test: DuckDB's `LogicalType::UNION` factory builds a StructTypeInfo with a UTINYINT "tag" prepended to members, so we reuse the STRUCT wire layout and stamp the parent id as `Union`. DataFusion doesn't emit `UnionArray` in practice; Arrow bridge mapping is deferred. |
-| `ENUM` | `Dictionary(Int8/16/32/64 or UInt8/16/32/64, Utf8/LargeUtf8)` | `Enum` + `ExtraTypeInfo::Enum { values }` | (none, project as `string`) | ⚠️ wire codec verified by unit tests (hand-written EnumTypeInfo: fields 200=values_count u64, 201=string list; per-row indices narrow to u8/u16/u32 by dict-size tier). DataFusion's SQL planner rejects the `ENUM(...)` type literal and doesn't dictionary-encode repeated strings, so end-to-end SQL exercising it via DataFusion isn't currently possible — the path is ready for non-DataFusion engines or future DataFusion support |
+| `ENUM` | `Dictionary(Int8/16/32/64 or UInt8/16/32/64, Utf8/LargeUtf8)` | `Enum` + `ExtraTypeInfo::Enum { values }` | (none, project as `string`) | ⚠️ wire codec verified by unit tests (hand-written EnumTypeInfo: fields 200=values_count u64, 201=string list; per-row indices narrow to u8/u16/u32 by dict-size tier). DataFusion's SQL planner rejects the `ENUM(...)` type literal and doesn't dictionary-encode repeated strings, so end-to-end SQL exercising it via DataFusion isn't currently possible. The path is ready for non-DataFusion engines or future DataFusion support |
 
 ## Parameterised types
 
 DuckDB's `LogicalType` carries optional `ExtraTypeInfo` on the wire (field 101 of the `LogicalType` object). Wave 2a added the framework plus the `DECIMAL` variant; the remaining variants still surface as `WireError::UnsupportedExtraTypeInfo`:
 
-- `DECIMAL(p, s)` — ✅ encoded via `ExtraTypeInfo::Decimal { precision, scale }`. Storage tier follows DuckDB: precision 1-4 -> i16, 5-9 -> i32, 10-18 -> i64, 19-38 -> i128.
-- `LIST<T>` — ✅ encoded via `ExtraTypeInfo::List { child }`. Recursive child type, child element vector under field 106.
-- `STRUCT(...)` — ✅ encoded via `ExtraTypeInfo::Struct { fields }`. Pair entries with field 0 (name) + field 1 (LogicalType).
-- `MAP<K, V>` — ✅ reuses `ExtraTypeInfo::List { child: STRUCT(key, value) }` per DuckDB's internal `LogicalType::MAP` factory; no separate `MapTypeInfo`.
-- `ARRAY<T, N>` — ✅ encoded via `ExtraTypeInfo::Array { child, size }`. Field 200 (child_type, WriteProperty) + field 201 (size, WritePropertyWithDefault default 0).
-- `ENUM` — ✅ encoded via `ExtraTypeInfo::Enum { values }`. Custom serializer: field 200 (values_count u64, `WriteProperty`) + field 201 (`WriteList<string>`). Per-row index width follows DuckDB's `EnumTypeInfo::DictType`: <=256 entries -> u8, <=65536 -> u16, otherwise u32.
-- `UNION` — ✅ codec routes through STRUCT's wire layout. DuckDB models `UNION(members)` as a StructTypeInfo with a UTINYINT tag prepended to the members, so no new ExtraTypeInfo variant is needed. Arrow bridge mapping is deferred because DataFusion never emits `UnionArray`.
-- User-defined types — not implemented.
+- `DECIMAL(p, s)`: ✅ encoded via `ExtraTypeInfo::Decimal { precision, scale }`. Storage tier follows DuckDB: precision 1-4 -> i16, 5-9 -> i32, 10-18 -> i64, 19-38 -> i128.
+- `LIST<T>`: ✅ encoded via `ExtraTypeInfo::List { child }`. Recursive child type, child element vector under field 106.
+- `STRUCT(...)`: ✅ encoded via `ExtraTypeInfo::Struct { fields }`. Pair entries with field 0 (name) + field 1 (LogicalType).
+- `MAP<K, V>`: ✅ reuses `ExtraTypeInfo::List { child: STRUCT(key, value) }` per DuckDB's internal `LogicalType::MAP` factory; no separate `MapTypeInfo`.
+- `ARRAY<T, N>`: ✅ encoded via `ExtraTypeInfo::Array { child, size }`. Field 200 (child_type, WriteProperty) + field 201 (size, WritePropertyWithDefault default 0).
+- `ENUM`: ✅ encoded via `ExtraTypeInfo::Enum { values }`. Custom serializer: field 200 (values_count u64, `WriteProperty`) + field 201 (`WriteList<string>`). Per-row index width follows DuckDB's `EnumTypeInfo::DictType`: <=256 entries -> u8, <=65536 -> u16, otherwise u32.
+- `UNION`: ✅ codec routes through STRUCT's wire layout. DuckDB models `UNION(members)` as a StructTypeInfo with a UTINYINT tag prepended to the members, so no new ExtraTypeInfo variant is needed. Arrow bridge mapping is deferred because DataFusion never emits `UnionArray`.
+- User-defined types: not implemented.
 
-The full parameterised-type family is wired in the codec, **in both directions**. Forward (Arrow -> DataChunk) handles every type DataFusion emits; reverse (DataChunk -> Arrow) handles every type a remote DuckDB returns through the `quack_query()` TVF — LIST, STRUCT, MAP, ARRAY, ENUM (as `Dictionary(UIntX, Utf8)`), and arbitrarily deep compositions like `STRUCT(tags VARCHAR[], counts MAP(VARCHAR, INT))`. The remaining gaps are upstream (DataFusion's planner rejecting certain SQL syntax) or low-traffic enough to defer (Arrow bridge for UNION's `UnionArray`, which DataFusion does not emit in practice).
+The full parameterised-type family is wired in the codec, **in both directions**. Forward (Arrow -> DataChunk) handles every type DataFusion emits; reverse (DataChunk -> Arrow) handles every type a remote DuckDB returns through the `quack_query()` TVF: LIST, STRUCT, MAP, ARRAY, ENUM (as `Dictionary(UIntX, Utf8)`), and arbitrarily deep compositions like `STRUCT(tags VARCHAR[], counts MAP(VARCHAR, INT))`. The remaining gaps are upstream (DataFusion's planner rejecting certain SQL syntax) or low-traffic enough to defer (Arrow bridge for UNION's `UnionArray`, which DataFusion does not emit in practice).
 
 ExtraTypeInfo wire layout (verified against DuckDB v1.5.3 generated serializer):
-- Base field 100 (u8): `ExtraTypeInfoType` discriminant — `WriteProperty`, always written.
-- Base field 101 (string): `alias` — `WritePropertyWithDefault`, omitted when "".
+- Base field 100 (u8): `ExtraTypeInfoType` discriminant, `WriteProperty`, always written.
+- Base field 101 (string): `alias`, `WritePropertyWithDefault`, omitted when "".
 - Base field 102: deleted; readers tolerate but writers never emit.
 - Base field 103 (`unique_ptr<ExtensionTypeInfo>`): `WritePropertyWithDefault`, omitted when null. Unsupported in the codec.
 - Subclass fields per variant. For `DECIMAL`: field 200 (width, u8, `WritePropertyWithDefault` default 0) and field 201 (scale, u8, `WritePropertyWithDefault` default 0). Scale 0 is the common case and omits field 201 entirely.
@@ -108,7 +108,7 @@ In addition to serving Quack RPC, SQE can act as a Quack client and pull rows fr
   SELECT * FROM quack_query('quack:remote-duckdb:9495', 'remote-secret', 'SELECT * FROM colors');
   ```
 
-This is symmetric to DuckDB's own `quack_query` built-in. Composing the two lets a single DuckDB CLI session route queries through sqe-server, which itself fetches from a remote DuckDB — useful for federated reads or for treating DuckDB as an execution backend for specific workloads.
+This is symmetric to DuckDB's own `quack_query` built-in. Composing the two lets a single DuckDB CLI session route queries through sqe-server, which itself fetches from a remote DuckDB, useful for federated reads or for treating DuckDB as an execution backend for specific workloads.
 
 ### Federation: Iceberg + Quack in one query
 
@@ -128,10 +128,10 @@ JOIN quack_query(
 
 Live-verified shapes:
 
-- INNER JOIN (Iceberg ↔ Quack) on matching keys.
+- INNER JOIN (Iceberg and Quack) on matching keys.
 - COUNT/SUM aggregation across the join.
 - UNION ALL of Iceberg rows with Quack rows (same projected schema).
 - CROSS JOIN with DECIMAL preserved end-to-end.
 - Filter/projection from either side.
 
-DataFusion plans each query end-to-end; the Iceberg scan reads Parquet from object storage and the Quack TVF round-trips Arrow batches over HTTP/Quack — both feed into the same execution plan.
+DataFusion plans each query end-to-end; the Iceberg scan reads Parquet from object storage and the Quack TVF round-trips Arrow batches over HTTP/Quack. Both feed into the same execution plan.

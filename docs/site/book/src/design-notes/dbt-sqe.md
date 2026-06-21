@@ -84,14 +84,14 @@ Two Paths to dbt Compatibility
 
 PATH A: Native dbt-sqe adapter ✅ IMPLEMENTED
 ──────────────────────────────────────────────
-Custom dbt adapter plugin at adapters/dbt-sqe/ — talks to SQE via ADBC Flight SQL.
+Custom dbt adapter plugin at adapters/dbt-sqe/. Talks to SQE via ADBC Flight SQL.
 
   dbt Core ←→ dbt-sqe adapter (Python) ←→ ADBC Flight SQL ←→ SQE
 
 Why this was chosen:
   + Full control over SQL generation and materialization macros
   + No Trino baggage or protocol translation overhead
-  + Arrow-native wire format (ADBC) — no JDBC serialization
+  + Arrow-native wire format (ADBC), no JDBC serialization
   + Can tailor materializations to Iceberg-specific capabilities
   + Clean, minimal dependency chain
 
@@ -299,7 +299,7 @@ The system SHALL support renaming tables within a namespace.
 FILE: openspec/changes/phase-2c-dbt/proposal.md
 ================================================================================
 
-# Proposal: Phase 2c — dbt Core Compatibility
+# Proposal: Phase 2c, dbt Core Compatibility
 
 ## Summary
 
@@ -312,15 +312,15 @@ transformation layer on top of SQE.
 dbt is the standard transformation tool for analytics engineering. Without dbt
 support, SQE is limited to read-only analytical queries. With it, SQE becomes
 a full data transformation platform: ingest via Polaris, transform via dbt,
-query via BI tools — all through the same engine with the same auth model.
+query via BI tools, all through the same engine with the same auth model.
 
 ## What Changes
 
 ### SQE Engine (Rust)
 
 1. **Write path** (sqe-catalog + sqe-coordinator):
-   - CTAS: parse → execute query → write Parquet via iceberg-rust writer →
-     commit to Polaris
+   - CTAS: parse, then execute query, then write Parquet via iceberg-rust
+     writer, then commit to Polaris
    - CREATE OR REPLACE: new snapshot replacing all data
    - INSERT INTO SELECT: append to existing table
    - MERGE INTO: read-modify-write cycle with Iceberg atomic commits
@@ -339,7 +339,7 @@ query via BI tools — all through the same engine with the same auth model.
 
 3. **dbt-sqe** Python package:
    - Connection via `adbc_driver_flightsql.dbapi`
-   - Credential passthrough (username/password → Flight SQL handshake)
+   - Credential passthrough (username/password to Flight SQL handshake)
    - SQLAdapter subclass with Iceberg-aware materializations
    - Macros for: table, view, incremental (append, delete+insert, merge)
    - Seeds via batch INSERT
@@ -347,9 +347,9 @@ query via BI tools — all through the same engine with the same auth model.
 
 ## Dependencies
 
-- Phase 1 (query engine + auth + Flight SQL) — ✅ complete
-- Phase 2 (views + write path basics) — ✅ complete
-- iceberg-rust write support (RisingWave fork with rewrite_files()) — ✅ available
+- Phase 1 (query engine + auth + Flight SQL): ✅ complete
+- Phase 2 (views + write path basics): ✅ complete
+- iceberg-rust write support (RisingWave fork with rewrite_files()): ✅ available
 
 ## Success Criteria
 
@@ -375,14 +375,14 @@ materialization.
 ## Rollback Strategy
 
 dbt-sqe is an independent Python package. SQE write-path additions are
-backwards-compatible — existing read-only queries are unaffected.
+backwards-compatible. Existing read-only queries are unaffected.
 
 
 ================================================================================
 FILE: openspec/changes/phase-2c-dbt/design.md
 ================================================================================
 
-# Design: Phase 2c — dbt Core Compatibility
+# Design: Phase 2c, dbt Core Compatibility
 
 ## dbt-sqe Adapter Architecture
 
@@ -499,10 +499,10 @@ impl TableProvider for InfoSchemaTablesProvider {
 ```
 
 Similar providers for:
-- `information_schema.columns` → Iceberg schema → column details
-- `information_schema.schemata` → Polaris namespaces
+- `information_schema.columns` maps to Iceberg schema for column details
+- `information_schema.schemata` maps to Polaris namespaces
 
-These benefit from the L1 catalog cache — repeated metadata queries within
+These benefit from the L1 catalog cache. Repeated metadata queries within
 a dbt run (which can be hundreds) are served from cache.
 
 ## Write Path in SQE
@@ -626,7 +626,7 @@ CREATE OR REPLACE VIEW {{ this }} AS (
 )
 ```
 
-## Type Mapping: Arrow ↔ Iceberg ↔ dbt
+## Type Mapping: Arrow to Iceberg to dbt
 
 ┌──────────────────┬──────────────────┬──────────────────┐
 │ Arrow Type        │ Iceberg Type     │ dbt Type         │
@@ -649,10 +649,10 @@ CREATE OR REPLACE VIEW {{ this }} AS (
 ## Interaction with Caching (Phase 2b)
 
 dbt runs are particularly cache-friendly:
-- Same tables referenced many times across models → L1/L2/L3 hot
-- Sequential model execution → previous model's output cached for next
-- `dbt test` queries same tables as `dbt run` → L5 result cache hits
-- Metadata-heavy workflow → information_schema backed by L1 catalog cache
+- Same tables referenced many times across models keep L1/L2/L3 hot
+- Sequential model execution means previous model's output is cached for next
+- `dbt test` queries same tables as `dbt run`, giving L5 result cache hits
+- Metadata-heavy workflow uses information_schema backed by L1 catalog cache
 
 Expected impact: a dbt run with 50 models that would take 10 minutes without
 caching could drop to 3-4 minutes with warm L2/L3/L4 caches.
@@ -662,7 +662,7 @@ caching could drop to 3-4 minutes with warm L2/L3/L4 caches.
 dbt runs as the authenticated user. Policy enforcement applies:
 - If `analyst` role can't see column `ssn`, dbt models selecting `*` from
   that table won't include `ssn` in the output
-- CTAS respects the user's visible schema — the new table only contains
+- CTAS respects the user's visible schema. The new table only contains
   columns the user can see
 - MERGE operates on the user's view of the data
 
@@ -673,15 +673,15 @@ This is consistent and correct: dbt transforms what the user can see.
 FILE: openspec/changes/phase-2c-dbt/tasks.md
 ================================================================================
 
-# Tasks: Phase 2c — dbt Core Compatibility
+# Tasks: Phase 2c, dbt Core Compatibility
 
-## Phase 2c.1 — Write Path: DDL (sqe-sql + sqe-coordinator + sqe-catalog)
+## Phase 2c.1, Write Path DDL (sqe-sql + sqe-coordinator + sqe-catalog)
 
 - [x] 2c.1.1 Parse CTAS: CREATE [OR REPLACE] TABLE ... AS SELECT
 - [x] 2c.1.2 Parse DROP TABLE [IF EXISTS]
 - [x] 2c.1.3 Parse ALTER TABLE ... RENAME TO
 - [x] 2c.1.4 Parse CREATE SCHEMA / DROP SCHEMA
-- [x] 2c.1.5 Implement CTAS execution: query → infer schema → create table → write → commit
+- [x] 2c.1.5 Implement CTAS execution: query, then infer schema, then create table, then write, then commit
 - [x] 2c.1.6 Implement CREATE OR REPLACE TABLE: DROP IF EXISTS + CTAS
 - [x] 2c.1.7 Implement DROP TABLE: Polaris REST catalog via iceberg-rust
 - [x] 2c.1.8 Implement ALTER TABLE RENAME: Polaris REST catalog via iceberg-rust
@@ -689,12 +689,12 @@ FILE: openspec/changes/phase-2c-dbt/tasks.md
 - [ ] 2c.1.10 Integration test: CTAS creates Iceberg table readable by subsequent SELECT
 - [ ] 2c.1.11 Integration test: CREATE OR REPLACE atomically swaps table contents
 
-## Phase 2c.2 — Write Path: DML (sqe-sql + sqe-coordinator + sqe-catalog)
+## Phase 2c.2, Write Path DML (sqe-sql + sqe-coordinator + sqe-catalog)
 
 - [x] 2c.2.1 Parse INSERT INTO ... SELECT
 - [x] 2c.2.2 Parse DELETE FROM ... WHERE
 - [x] 2c.2.3 Parse MERGE INTO ... USING ... ON ... WHEN MATCHED/NOT MATCHED
-- [x] 2c.2.4 Implement INSERT INTO: execute SELECT → write new data files → fast_append commit
+- [x] 2c.2.4 Implement INSERT INTO: execute SELECT, then write new data files, then fast_append commit
 - [x] 2c.2.5 Implement DELETE FROM: CoW via rewrite_files() (RisingWave iceberg-rust fork)
 - [x] 2c.2.6 Implement UPDATE: CoW via rewrite_files() with CASE WHEN rewriting
 - [x] 2c.2.7 Implement MERGE INTO: CoW via FULL OUTER JOIN + rewrite_files()
@@ -702,7 +702,7 @@ FILE: openspec/changes/phase-2c-dbt/tasks.md
 - [ ] 2c.2.9 Integration test: DELETE FROM removes matching rows
 - [ ] 2c.2.10 Integration test: MERGE INTO updates existing + inserts new
 
-## Phase 2c.3 — information_schema (sqe-coordinator)
+## Phase 2c.3, information_schema (sqe-coordinator)
 
 - [x] 2c.3.1 Implement InfoSchemaTablesProvider (virtual TableProvider)
 - [x] 2c.3.2 Implement InfoSchemaColumnsProvider
@@ -711,7 +711,7 @@ FILE: openspec/changes/phase-2c-dbt/tasks.md
 - [ ] 2c.3.5 Integration test: SELECT * FROM information_schema.tables WHERE table_schema = 'x'
 - [ ] 2c.3.6 Integration test: information_schema respects user access (different results per user)
 
-## Phase 2c.4 — dbt-sqe Adapter (Python)
+## Phase 2c.4, dbt-sqe Adapter (Python)
 
 Location: `adapters/dbt-sqe/`
 
@@ -719,7 +719,7 @@ Location: `adapters/dbt-sqe/`
 - [x] 2c.4.2 Implement SQEConnectionManager (ADBC Flight SQL connect)
 - [x] 2c.4.3 Implement SQECredentials (host, port, user, password, database/catalog, schema)
 - [x] 2c.4.4 Implement SQEAdapter (list_relations, get_columns, create/drop schema, rename)
-- [x] 2c.4.5 Implement SQEColumn (Arrow ↔ dbt type mapping)
+- [x] 2c.4.5 Implement SQEColumn (Arrow to dbt type mapping)
 - [x] 2c.4.6 Implement SQERelation (Iceberg table/view relation handling)
 - [x] 2c.4.7 Implement table materialization macro
 - [x] 2c.4.8 Implement view materialization macro
@@ -730,7 +730,7 @@ Location: `adapters/dbt-sqe/`
 - [x] 2c.4.13 Implement catalog generation macro (for dbt docs)
 - [ ] 2c.4.14 Implement snapshot materialization (SCD Type 2 via MERGE)
 
-## Phase 2c.5 — End-to-End dbt Testing
+## Phase 2c.5, End-to-End dbt Testing
 
 - [ ] 2c.5.1 Create sample dbt project with staging + marts models
 - [ ] 2c.5.2 Test: `dbt debug` connects successfully
@@ -738,11 +738,11 @@ Location: `adapters/dbt-sqe/`
 - [ ] 2c.5.4 Test: `dbt run` with table materialization
 - [ ] 2c.5.5 Test: `dbt run` with view materialization
 - [ ] 2c.5.6 Test: `dbt run` with incremental (append)
-- [ ] 2c.5.7 Test: `dbt run` with incremental (merge) — blocked on MERGE
-- [ ] 2c.5.8 Test: `dbt run` with incremental (delete+insert) — blocked on DELETE
+- [ ] 2c.5.7 Test: `dbt run` with incremental (merge): blocked on MERGE
+- [ ] 2c.5.8 Test: `dbt run` with incremental (delete+insert): blocked on DELETE
 - [ ] 2c.5.9 Test: `dbt run --full-refresh` with CREATE OR REPLACE
 - [ ] 2c.5.10 Test: `dbt test` runs assertion queries
 - [ ] 2c.5.11 Test: `dbt docs generate` produces catalog JSON
-- [ ] 2c.5.12 Test: `dbt snapshot` creates SCD Type 2 table — blocked on MERGE
+- [ ] 2c.5.12 Test: `dbt snapshot` creates SCD Type 2 table: blocked on MERGE
 - [ ] 2c.5.13 Test: dbt run with different users sees policy-filtered results
 - [ ] 2c.5.14 Test: concurrent dbt runs from different users don't conflict

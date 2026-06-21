@@ -20,7 +20,7 @@ For the longitudinal view (every benchmark JSON in `benchmarks/results/` plotted
 - **TPC-H and SSB** validate the analytical core: joins, aggregates, GROUP BY, ORDER BY, date arithmetic. TPC-H is the standard first check for any SQL engine.
 - **TPC-DS** is the hardest. Its 99 queries exercise correlated subqueries, CTEs, window functions, GROUPING SETS, and complex multi-table joins. Passing TPC-DS well means the engine handles real analytical workloads.
 - **TPC-C and TPC-E** cover OLTP patterns: point lookups, small aggregates, indexed access by key ranges, plus write operations (DELETE, UPDATE) exercised via Copy-on-Write.
-- **TPC-BB** exercises semi-structured data alongside the TPC-DS schema — useful for validating string functions and JSON handling.
+- **TPC-BB** exercises semi-structured data alongside the TPC-DS schema, useful for validating string functions and JSON handling.
 
 ## Generating Data
 
@@ -72,7 +72,7 @@ Files are split at 128 MB for parallelism. Output is structured as:
 
 ## Loading Data
 
-The `load` command connects to SQE and creates Iceberg tables using `read_parquet()` + CTAS. No intermediate format conversion is needed — Parquet files are read directly and written as Iceberg.
+The `load` command connects to SQE and creates Iceberg tables using `read_parquet()` + CTAS. No intermediate format conversion is needed. Parquet files are read directly and written as Iceberg.
 
 ```bash
 # Load TPC-H from local disk
@@ -169,11 +169,11 @@ cargo run -p sqe-bench -- test tpch --scale 1 \
 |--------|---------|
 | `PASS` | Result matches expected output exactly (within numeric tolerance) |
 | `DIFF` | Result matches in shape but has minor differences (e.g., decimal precision) |
-| `FAIL` | Result is wrong — wrong rows, wrong values, wrong schema |
+| `FAIL` | Result is wrong: wrong rows, wrong values, wrong schema |
 | `SKIP` | Query requires an unimplemented feature; counted but not failed |
 | `ERROR` | Query failed to execute (engine error, timeout, crash) |
 
-`DIFF` is not treated as a failure in CI — it is a signal for investigation. Decimal precision differences are expected when comparing float-heavy aggregates across different engines.
+`DIFF` is not treated as a failure in CI. It is a signal for investigation. Decimal precision differences are expected when comparing float-heavy aggregates across different engines.
 
 Queries can declare their requirements in a header comment:
 
@@ -249,7 +249,7 @@ JSON reports are machine-readable and suitable for tracking regressions over tim
 
 Benchmark JSON results are committed to `benchmarks/results/` for historical comparison. This enables tracking performance regressions and improvements across releases.
 
-### TPC-H SF1 — Historical Comparison (Apr 2 baseline vs. Apr 6 streaming execution)
+### TPC-H SF1: Historical Comparison (Apr 2 baseline vs. Apr 6 streaming execution)
 
 After implementing the streaming execution engine (coordinator spill-to-disk, late materialization, file-level pruning, S3 I/O pipeline, distributed execution), TPC-H SF1 improved 3.1x on a distributed cluster (coordinator + 2 workers) compared to the single-node baseline:
 
@@ -284,12 +284,12 @@ TOTAL             37.5s                12.0s     3.1x
 
 Key observations:
 
-- **Metadata-light queries** (q11, q13, q16, q22) see 6-8x speedup — footer cache, file pruning, and scan distribution eliminate I/O overhead
-- **Scan-heavy queries** (q01, q03, q07) see 2-2.5x speedup — proportional to worker count (2 workers)
-- **q18** (the hardest TPC-H query) improved from 3.19s to 0.74s (4.3x) — benefits from distributed aggregation across workers
-- **Single-node with 512MB spill**: 21/22 pass — only q18 fails due to DataFusion hash aggregate memory limitation (DF#17334). With 1GB+ memory or with workers, all 22 pass.
+- **Metadata-light queries** (q11, q13, q16, q22) see 6-8x speedup: footer cache, file pruning, and scan distribution eliminate I/O overhead
+- **Scan-heavy queries** (q01, q03, q07) see 2-2.5x speedup, proportional to worker count (2 workers)
+- **q18** (the hardest TPC-H query) improved from 3.19s to 0.74s (4.3x), benefiting from distributed aggregation across workers
+- **Single-node with 512MB spill**: 21/22 pass. Only q18 fails due to DataFusion hash aggregate memory limitation (DF#17334). With 1GB+ memory or with workers, all 22 pass.
 
-### Full Benchmark Matrix (Apr 7, 2026 — SF1)
+### Full Benchmark Matrix (Apr 7, 2026, SF1)
 
 | Suite (queries) | single-512mb | single-8gb | distributed-2w |
 |---|---|---|---|
@@ -304,17 +304,17 @@ Key observations:
 
 | Config | Sort Spills | Bytes Spilled | Analysis |
 |---|---|---|---|
-| single-512mb | 30 | 1.1 GB | TPC-DS complex sorts spill to disk. 92/99 pass — spill works. |
+| single-512mb | 30 | 1.1 GB | TPC-DS complex sorts spill to disk. 92/99 pass, spill works. |
 | single-8gb | 128 | 27.7 GB | Mostly TPC-E (33-table joins). More spills because more queries run to completion. |
 | distributed-2w | 3 | 49 MB | Near-zero spill. Workers absorb scan/aggregation work. |
 
-The counterintuitive finding: 8GB spills *more* than 512MB. This is because 8GB successfully runs TPC-E queries that 512MB cannot — those TPC-E queries involve massive multi-table joins that produce 27GB of intermediate sorted data. With 512MB, the same queries OOM before reaching the spill point.
+The counterintuitive finding: 8GB spills *more* than 512MB. This is because 8GB successfully runs TPC-E queries that 512MB cannot. Those TPC-E queries involve massive multi-table joins that produce 27GB of intermediate sorted data. With 512MB, the same queries OOM before reaching the spill point.
 
 With distribution (2 workers), spill drops to 49MB. Workers handle scan and partial aggregation; the coordinator only merges small result sets.
 
 ### Scheduler observations
 
-At SF1, all distributed queries ran locally on the coordinator (`scheduler_decisions{local}=120+`). This is correct — SF1 tables have 1-2 data files each, below the distribution threshold (default: 4 files). The 2.5x speedup comes from streaming execution improvements (spill, scan planning), not from worker distribution. To observe actual worker distribution, run at SF10+ where tables have 10+ files.
+At SF1, all distributed queries ran locally on the coordinator (`scheduler_decisions{local}=120+`). This is correct: SF1 tables have 1-2 data files each, below the distribution threshold (default: 4 files). The 2.5x speedup comes from streaming execution improvements (spill, scan planning), not from worker distribution. To observe actual worker distribution, run at SF10+ where tables have 10+ files.
 
 ### TPC-E: the outlier
 
@@ -326,10 +326,10 @@ TPC-E has the lowest pass rate (56-72%) across all configs:
 ### Metrics gaps
 
 Several Phase A/B metrics show 0 because the increment calls are not yet wired into the execution path (the infrastructure exists but `metric.inc()` calls are missing):
-- Footer cache hits/misses — `FooterCache` not wired into `IcebergScanExec`
-- File pruning counts — `PruningPredicate` built but counter not incremented
-- Late materialization bytes — RowFilter wired but byte tracking not connected
-- Time to first row — histogram registered but not observed
+- Footer cache hits/misses: `FooterCache` not wired into `IcebergScanExec`
+- File pruning counts: `PruningPredicate` built but counter not incremented
+- Late materialization bytes: RowFilter wired but byte tracking not connected
+- Time to first row: histogram registered but not observed
 
 These are wiring tasks for the next iteration.
 
@@ -338,11 +338,11 @@ These are wiring tasks for the next iteration.
 The benchmark harness can run the same suite against a real Trino on the same
 data, so you can compare SQE and Trino directly. There are two modes:
 
-- **Correctness parity** — `--compare-trino` diffs SQE's results against
+- **Correctness parity**: `--compare-trino` diffs SQE's results against
   Trino's row-for-row. This is how SQL correctness is validated at scale, not
   just timing. Small decimal differences on float-heavy aggregates are expected
   and flagged for investigation rather than treated as failures.
-- **Timing** — the same run records per-query wall-clock for both engines, so a
+- **Timing**: the same run records per-query wall-clock for both engines, so a
   head-to-head speed comparison falls out of the parity run.
 
 SQE's own distributed execution path (coordinator + workers, spill-to-disk,
