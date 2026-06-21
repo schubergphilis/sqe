@@ -18,7 +18,7 @@ SQE-specific security extensions on top of the SQL standard `GRANT` / `REVOKE`. 
 
 These extensions are parsed in `crates/sqe-sql/src/classifier.rs` (pre-parser scan) and enforced by the policy engine in `crates/sqe-policy/`. The plan rewriter injects row filters above `TableScan` and substitutes column masks before DataFusion's optimizer runs, so the optimizer cannot push user predicates through a mask.
 
-The full design lives in [`docs/openspec.md`](../../../openspec.md). This page is the SQL surface reference.
+This page is the SQL surface reference.
 
 ## Privileges
 
@@ -119,7 +119,7 @@ Useful in scripts that want to bail out before a long-running query if the user 
 | Row filters | `GRANT ... ROWS WHERE` | external (Ranger) | external (Ranger) | no |
 | `SHOW EFFECTIVE GRANTS` | yes | no | no | no |
 | `CHECK ACCESS` (pre-flight) | yes | no | no | no |
-| Per-user OIDC bearer to storage | yes | no (service account) | no (service account) | no |
+| Per-user OIDC bearer to storage | yes (catalog + writes; reads use the configured storage key) | no (service account) | no (service account) | no |
 | Plan-level enforcement | yes (rewriter) | external middleware | external middleware | no |
 
 The structural difference: SQE keeps policy in-engine, plan-rewritten before optimization, and tied to the per-query bearer token. Trino and Spark push the responsibility to Apache Ranger, which lives outside the engine and intercepts at the connector boundary.
@@ -147,7 +147,7 @@ OPA / Cedar add a network round trip per query but let the security team author 
 
 ## Why plan rewriting, not connector hooks
 
-A short rationale (full reasoning in [`docs/openspec.md`](../../../openspec.md)):
+A short rationale:
 
 1. **Optimization safety**: filters added above `TableScan` survive predicate pushdown but cannot be eliminated. Connector-level hooks run after planning and can be bypassed by a clever WHERE clause.
 2. **Information leakage**: a user querying `column_that_is_masked = 'secret'` gets zero rows, exactly as if the column did not exist. PostgreSQL RLS uses the same model.

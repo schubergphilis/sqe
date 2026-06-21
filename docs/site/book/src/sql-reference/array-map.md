@@ -163,7 +163,7 @@ WHERE order_id > 100 AND tag LIKE 'priority_%';
 
 ## Lambda functions
 
-DataFusion's parser does not support lambda syntax (`x -> x + 1`). Trino, Spark, DuckDB do. The audit rows in [`features.md`](../../../features.md) note this. Workarounds:
+DataFusion's parser does not support lambda syntax (`x -> x + 1`). Trino, Spark, DuckDB do. The audit rows in the [feature comparison](https://getsqe.com/compare/features) note this. Workarounds:
 
 - Pre-compute via a CTE plus `unnest`.
 - Use `map_filter` / `transform` from `datafusion-functions-nested` once parser support lands upstream.

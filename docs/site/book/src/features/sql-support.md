@@ -185,5 +185,5 @@ EXPLAIN FULL SELECT * FROM orders WHERE amount > 100;
 | UPDATE | Yes (CoW) | Yes | Yes |
 | Views | Yes | Yes | Yes |
 | Arrow-native wire format | Yes | No (JSON) | No (Thrift) |
-| Row-level security | Planned | Plugin | Ranger |
+| Row-level security | [Yes (plan-rewritten, pluggable, off by default)](../sql-reference/grant-revoke.md) | Plugin | Ranger |
 | Bearer token passthrough | Yes | No | No |
