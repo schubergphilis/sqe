@@ -193,6 +193,105 @@ integration-test:
       allow_failure: true
   timeout: 1h
 
+# ── Quickstart scenario tests (Tier 2) ─────────────────────────
+# Tier 2 of scripts/test.sh: runs every SELF_CONTAINED quickstart through its
+# run.sh --check. Each scenario brings up its own docker-compose stack (Polaris,
+# Nessie, Unity, etc.) and asserts the demo invariants with the shared
+# _shared/lib.sh helpers. Mirrors the integration-test docker-in-docker setup:
+# same image, same dind service, same Alpine toolchain install. The heavy
+# `distributed` scenario is deliberately NOT in the self-contained set, so it
+# does not run here; invoke it on demand with `scripts/test.sh scenario
+# distributed`. Generous timeout: each scenario builds or pulls images.
+scenario-test:
+  stage: test
+  image: docker:24
+  services:
+    - name: docker:24-dind
+      alias: docker
+      command: ["--tls=false", "--host=tcp://0.0.0.0:2375"]
+  variables:
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_TLS_CERTDIR: ""
+    DOCKER_DRIVER: overlay2
+  before_script:
+    # Same Alpine toolchain as integration-test: the embedded-* scenarios build
+    # sqe-cli, and several scenarios drive the stack with bash/curl/python3.
+    - apk add --no-cache bash curl docker-compose rust cargo cmake protobuf-dev openssl-dev pkgconfig clang mold python3
+  script:
+    - ./scripts/test.sh scenario all
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+    # Path-matching MR pipelines: opt-in (manual) and non-blocking, like
+    # integration-test. `scenario all` builds several SQE images, so a touched
+    # quickstart file must not silently spend the better part of an hour.
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes:
+        - quickstart/**/*
+        - crates/**/*
+        - scripts/test.sh
+        - docker-compose*.yml
+      when: manual
+      allow_failure: true
+    - if: '$CI_COMMIT_BRANCH == "main" && $CI_PIPELINE_SOURCE == "push"'
+      changes:
+        - quickstart/**/*
+        - crates/**/*
+        - scripts/test.sh
+        - docker-compose*.yml
+  timeout: 2h
+
+# ── AWS cloud-backed scenario tests (opt-in, needs AWS creds) ──
+# Runs the AWS quickstarts (aws-glue, aws-s3-tables, glue-lake-formation) end to
+# end: each run.sh CDK-deploys throwaway Glue / S3 Tables / Lake Formation
+# resources, drives a create/write/read round-trip through SQE, then tears the
+# resources back down. These cost real money and touch a real AWS account, so
+# the job is `when: manual` only and never runs automatically.
+#
+# Prerequisites (set as protected/masked CI/CD variables before triggering):
+#   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION (and AWS_SESSION_TOKEN
+#   for assumed-role creds). The target account must be `cdk bootstrap`-ed once.
+# RUN_AWS_SCENARIOS gates the body so an accidental trigger without creds is a
+# clear no-op rather than a half-deployed stack.
+#
+# The AWS run.sh scripts do not yet support `--check`; this job invokes their
+# default deploy -> verify -> destroy flow directly. Adding a `--check` mode to
+# the AWS scenarios (and folding them into scripts/test.sh) is a follow-up.
+scenario-test-aws:
+  stage: test
+  image: docker:24
+  services:
+    - name: docker:24-dind
+      alias: docker
+      command: ["--tls=false", "--host=tcp://0.0.0.0:2375"]
+  variables:
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_TLS_CERTDIR: ""
+    DOCKER_DRIVER: overlay2
+    # Opt-in switch. The job is manual; this guards the body too.
+    RUN_AWS_SCENARIOS: "1"
+  before_script:
+    # AWS scenarios need the AWS CLI, Node/npx (CDK), and Docker, plus bash.
+    # NOTE: run.sh uses `aws configure export-credentials` (AWS CLI v2 only).
+    # Alpine's `aws-cli` apk package is v1 and lacks that subcommand, so a real
+    # runner for this job must provide AWS CLI v2 (custom image or v2 install
+    # step). Wiring v2 is part of the AWS --check follow-up; this is a skeleton.
+    - apk add --no-cache bash curl docker-compose aws-cli nodejs npm python3
+  script:
+    - |
+      if [ "${RUN_AWS_SCENARIOS:-0}" != "1" ]; then
+        echo "RUN_AWS_SCENARIOS != 1; skipping AWS scenarios (set the variable to opt in)."
+        exit 0
+      fi
+    # Fail fast with a clear message if the AWS credentials are not wired.
+    - 'test -n "${AWS_ACCESS_KEY_ID:-}" || { echo "ERROR: AWS_ACCESS_KEY_ID not set. Configure AWS_* CI/CD variables before triggering this job."; exit 1; }'
+    - ( cd quickstart/aws-glue && ./run.sh )
+    - ( cd quickstart/aws-s3-tables && ./run.sh )
+    - ( cd quickstart/glue-lake-formation && ./run.sh )
+  rules:
+    - when: manual
+      allow_failure: true
+  timeout: 2h
+
 # ── Iceberg matrix score regression guard ─────────────────────
 # Runs `cargo xtask matrix-report --min-percent N` where N is the current
 # baseline. If the committed docs/iceberg-matrix-state.json drops below the
