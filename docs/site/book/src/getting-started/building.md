@@ -37,8 +37,8 @@ cargo build --release --bin sqe-server --bin sqe-cli
 ```
 
 Binaries are placed in `target/release/` (or `target/debug/`):
-- `sqe-server` — the server binary (coordinator or worker)
-- `sqe-cli` — the SQL CLI client
+- `sqe-server`: the server binary (coordinator or worker)
+- `sqe-cli`: the SQL CLI client
 
 ## Test
 

@@ -108,17 +108,17 @@ Configuration:
 otlp_endpoint = "http://otel-collector:4317"
 ```
 
-When the endpoint is empty (default), SQE falls back to structured JSON logs on stdout — no external dependency required.
+When the endpoint is empty (default), SQE falls back to structured JSON logs on stdout, no external dependency required.
 
 ### Trace Spans
 
 Key spans emitted:
-- `sqe.query.execute` — full query lifecycle
-- `sqe.query.plan` — SQL parsing and planning
-- `sqe.policy.evaluate` — policy enforcement
-- `sqe.flight.do_get` — result streaming
-- `sqe.auth.handshake` — authentication
-- `sqe.worker.scan` — worker scan execution
+- `sqe.query.execute`: full query lifecycle
+- `sqe.query.plan`: SQL parsing and planning
+- `sqe.policy.evaluate`: policy enforcement
+- `sqe.flight.do_get`: result streaming
+- `sqe.auth.handshake`: authentication
+- `sqe.worker.scan`: worker scan execution
 
 ## Audit Log
 

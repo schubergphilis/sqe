@@ -24,9 +24,9 @@ No server, no Polaris, no catalog service.
 
 ## What it demonstrates
 
-- Data written in one process is readable by a separate, subsequent process —
+- Data written in one process is readable by a separate, subsequent process:
   on-disk persistence via SQLite + Iceberg.
-- The full local Iceberg lifecycle: `CREATE SCHEMA` → `CREATE TABLE` → `INSERT`
+- The full local Iceberg lifecycle: `CREATE SCHEMA`, then `CREATE TABLE`, then `INSERT`
   in process 1; `SELECT` in process 2.
 - The difference between `--memory` (session-only) and `--warehouse` (persistent).
 
@@ -36,7 +36,7 @@ No server, no Polaris, no catalog service.
 
 Full queries and captured output are in the repo:
 
-**→ [quickstart/embedded-sqlite-catalog/](https://github.com/schubergphilis/sqe/tree/main/quickstart/embedded-sqlite-catalog/)**
+**See: [quickstart/embedded-sqlite-catalog/](https://github.com/schubergphilis/sqe/tree/main/quickstart/embedded-sqlite-catalog/)**
 
 ```bash
 cd quickstart/embedded-sqlite-catalog

@@ -35,7 +35,7 @@ A selection of the metrics SQE exposes: `sqe_rows_returned_total`,
 
 ## What it demonstrates
 
-- The full Prometheus → VictoriaMetrics → Grafana scrape pipeline against a live
+- The full Prometheus to VictoriaMetrics to Grafana scrape pipeline against a live
   SQE instance.
 - SQE's `prometheus_port` config and the metrics it exposes out of the box.
 - The provisioned **SQE Overview** Grafana dashboard.
@@ -48,7 +48,7 @@ A selection of the metrics SQE exposes: `sqe_rows_returned_total`,
 
 Full config, `docker compose`, dashboard, and captured output are in the repo:
 
-**→ [quickstart/observability/](https://github.com/schubergphilis/sqe/tree/main/quickstart/observability/)**
+**See: [quickstart/observability/](https://github.com/schubergphilis/sqe/tree/main/quickstart/observability/)**
 
 ```bash
 cd quickstart/observability

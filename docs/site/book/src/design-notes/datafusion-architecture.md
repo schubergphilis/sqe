@@ -75,7 +75,7 @@ SHOW EFFECTIVE POLICY FOR CURRENT_USER ON table;
 - Register a `CustomStatementHandler` trait in the coordinator that intercepts non-query statements and routes them to the policy backend or Polaris catalog
 - Security DDL handlers are stub/unimplemented until the policy phase
 
-### 2.2 Authentication — Keycloak OIDC Passthrough
+### 2.2 Authentication: Keycloak OIDC Passthrough
 
 This mirrors your Trino DCAF branch logic, ported to Rust:
 
@@ -99,7 +99,7 @@ On every catalog/S3 call:
 ```
 
 **Key design decisions:**
-- No fixed service account — every query runs as the authenticated user
+- No fixed service account: every query runs as the authenticated user
 - Token is propagated to workers via plan fragment metadata (Arrow Flight headers)
 - Workers attach the bearer token to their own iceberg-rust catalog calls
 - Refresh is coordinator-side only; workers get fresh tokens per-fragment
@@ -137,7 +137,7 @@ Worker (Executor)
 **Scaling model:**
 - Workers are stateless, horizontally scalable (K8s Deployment)
 - Coordinator can run HA with leader election (etcd or K8s lease)
-- For PB queries: coordinator splits by Iceberg partition spec → manifest → data file groups
+- For PB queries: coordinator splits by Iceberg partition spec, then manifest, then data file groups
 - Backpressure via Arrow Flight flow control
 
 ### 2.4 Iceberg Integration (iceberg-rust)
@@ -167,14 +167,14 @@ impl TableProvider for SovereignIcebergProvider {
 - V3 manifests with delete file content (Puffin-based deletion vectors)
 - Row lineage tracking for data governance
 - Default values for NULL handling (initial-default + write-default)
-- No blockers — build directly on 0.8.0+
+- No blockers: build directly on 0.8.0+
 
 **Views:**
 - Iceberg REST catalog supports `POST /v1/namespaces/{ns}/views`
-- Implement as `CREATE VIEW` → serialize SQL to Polaris view representation
+- Implement as `CREATE VIEW`, serializing SQL to Polaris view representation
 - On read: resolve view SQL, parse, and inline into the query plan
 
-### 2.5 Security — Future Phase (OPA or similar)
+### 2.5 Security: Future Phase (OPA or similar)
 
 Column-level and row-level security via OPA plan rewriting is a planned future extension. The architecture will support a `PolicyEnforcer` trait on the coordinator that rewrites the `LogicalPlan` before optimization (injecting row filters, column masks, projection stripping). This is intentionally deferred to keep the initial scope focused on the core query path.
 
@@ -196,18 +196,18 @@ struct PassthroughEnforcer;
 
 The custom SQL extensions (`GRANT`, `REVOKE`, `SHOW GRANTS`) will also be deferred until this phase, as they depend on having a policy backend to write to.
 
-### 2.6 JDBC Access — Arrow Flight SQL
+### 2.6 JDBC Access: Arrow Flight SQL
 
 **Primary interface:** Arrow Flight SQL (JDBC driver already exists: `org.apache.arrow.flight.sql.FlightSqlClient`)
 
 - Standard JDBC apps (DBeaver, Tableau, dbt) connect via Arrow Flight SQL JDBC driver
-- Wire format is Arrow IPC — zero-copy where possible, columnar-native
+- Wire format is Arrow IPC: zero-copy where possible, columnar-native
 - Supports `getTables`, `getSchemas`, `getCatalogs` metadata calls
 - Prepared statements map to DataFusion's `LogicalPlan` caching
 
 **Trino wire compatibility (optional, lower priority):**
 - Trino uses a custom HTTP REST protocol (v1/statement)
-- Implement as a thin HTTP adapter that translates Trino wire → internal DataFusion plan
+- Implement as a thin HTTP adapter that translates Trino wire into internal DataFusion plan
 - Scope: `POST /v1/statement`, `GET /v1/statement/{id}/{token}`, `DELETE`
 - Enables existing Trino clients/dashboards to connect without driver changes
 - Consider: is this worth the maintenance cost vs. migrating clients to Flight SQL?
@@ -270,7 +270,7 @@ sovereign-query-engine/
 | Query engine | DataFusion | Extensible, Rust-native, Arrow-native, active community |
 | Distribution | Ballista (forked) | Arrow Flight transport, scheduler model, but needs auth extension |
 | Iceberg | iceberg-rust 0.8.0+ | Rust-native, V3 metadata shipped, REST catalog, DataFusion integration |
-| Auth | Keycloak OIDC | Your existing IdP, password grant → bearer passthrough |
+| Auth | Keycloak OIDC | Your existing IdP, password grant to bearer passthrough |
 | Fine-grained security | Deferred (OPA/Cedar) | Architecture has `PolicyEnforcer` trait hook; plug in later |
 | JDBC | Arrow Flight SQL | Standard driver, columnar wire format, metadata API |
 | Storage | S3 / MinIO | Your existing object store |
@@ -281,39 +281,39 @@ sovereign-query-engine/
 
 ## 5. Implementation Phases
 
-### Phase 1 — Single-node proof of concept (4-6 weeks)
+### Phase 1: Single-node proof of concept (4-6 weeks)
 - DataFusion + iceberg-rust 0.8.0 reading tables via Polaris REST (v3 native)
 - Keycloak OIDC token acquisition and passthrough
 - Arrow Flight SQL server (single node, no distribution)
 - Basic JDBC connectivity (DBeaver test)
 - Goal: `SELECT * FROM iceberg_table WHERE x = 1` works end-to-end with user auth
 
-### Phase 2 — Views & write path (3-4 weeks)
-- Iceberg views (CREATE VIEW → Polaris REST, inline resolution on read)
+### Phase 2: Views & write path (3-4 weeks)
+- Iceberg views (CREATE VIEW to Polaris REST, inline resolution on read)
 - INSERT INTO via iceberg-rust 0.8.0 partitioned writer
 - Manifest caching for metadata performance
 - Audit logging (structured JSON query log)
 
-### Phase 3 — Distributed execution (4-6 weeks)
+### Phase 3: Distributed execution (4-6 weeks)
 - Ballista-derived scheduler + worker model
 - Auth context propagation via Flight metadata
 - Partition-aware query splitting (Iceberg manifest-level)
 - Multi-worker execution with result aggregation
 - Backpressure and failure handling
 
-### Phase 4 — Production hardening (4-6 weeks)
+### Phase 4: Production hardening (4-6 weeks)
 - Prometheus metrics + OTel tracing
 - TPC-H benchmarking
 - Helm chart + CI/CD
 - Trino wire compat (if needed)
 
-### Phase 5 — Security & policy (future)
+### Phase 5: Security & policy (future)
 - OPA (or Cedar) integration with plan rewriting
 - Column masks, row filters
 - Custom SQL: `GRANT`, `REVOKE`, `SHOW GRANTS`
 - Policy-based column redaction
 
-### Phase 6 — Scale validation
+### Phase 6: Scale validation
 - TPC-DS at TB/PB scale
 - Concurrent query workloads
 - Worker auto-scaling
@@ -322,17 +322,17 @@ sovereign-query-engine/
 
 | Risk | Impact | Mitigation |
 |---|---|---|
-| iceberg-rust v3 | ✅ Resolved | Shipped in v0.8.0 (Jan 2026) — V3 metadata, manifests, delete file content |
+| iceberg-rust v3 | ✅ Resolved | Shipped in v0.8.0 (Jan 2026): V3 metadata, manifests, delete file content |
 | Ballista maintenance uncertain | Fork divergence | Keep fork minimal; upstream what you can |
 | Trino compat complexity | Scope creep | Make it optional; Flight SQL is the primary interface |
 | PB-scale partition planning | Coordinator bottleneck | Stream manifest processing; hierarchical planning |
-| DataFusion write path maturity | May need contrib | v0.8.0 added INSERT INTO partitioned + fanout writers — evaluate gaps |
+| DataFusion write path maturity | May need contrib | v0.8.0 added INSERT INTO partitioned + fanout writers; evaluate gaps |
 
 ## 7. Relation to Existing Trino Patches (DCAF branch)
 
 Your Trino DCAF branch proves three things that directly inform this design:
-1. **User-scoped token passthrough works** with Polaris — the catalog respects per-user bearer tokens
-2. **Keycloak password grant → OIDC → catalog** is a viable auth flow
+1. **User-scoped token passthrough works** with Polaris: the catalog respects per-user bearer tokens
+2. **Keycloak password grant to OIDC to catalog** is a viable auth flow
 3. **The catalog + S3 access pattern** is well-understood and tested
 
-SQE is essentially a clean-room rebuild of this proven pattern in a Rust-native, DataFusion-based engine where you control the full stack — no more patching a Java monolith to get the auth model you need. With iceberg-rust 0.8.0 shipping V3 metadata support and improved DataFusion integration (partitioned inserts, fanout writers), the Rust ecosystem is now mature enough to build this on.
+SQE is essentially a clean-room rebuild of this proven pattern in a Rust-native, DataFusion-based engine where you control the full stack. No more patching a Java monolith to get the auth model you need. With iceberg-rust 0.8.0 shipping V3 metadata support and improved DataFusion integration (partitioned inserts, fanout writers), the Rust ecosystem is now mature enough to build this on.

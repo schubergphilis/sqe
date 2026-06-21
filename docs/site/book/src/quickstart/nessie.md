@@ -7,8 +7,8 @@ description: "Run SQE against Project Nessie. Nessie speaks the Iceberg REST pro
 # Project Nessie (Iceberg REST catalog)
 
 [Project Nessie](https://projectnessie.org/) is a transactional, git-like
-catalog for Iceberg tables. It exposes the Iceberg REST protocol — the same
-surface as Polaris — so SQE talks to it through the identical `rest` catalog
+catalog for Iceberg tables. It exposes the Iceberg REST protocol, the same
+surface as Polaris, so SQE talks to it through the identical `rest` catalog
 code path. Swapping Polaris for Nessie is a one-line config change.
 
 This quickstart is about the catalog, not auth. Nessie runs auth-less and SQE
@@ -22,7 +22,7 @@ the full auth story (real identities, RBAC, token passthrough) see the
   protocol at its `/iceberg` mount point.
 - **RustFS** provides S3-compatible warehouse storage. A one-shot `bucket-init`
   container creates the warehouse bucket on startup.
-- **SQE** uses the `anonymous` auth provider — every connection is accepted as a
+- **SQE** uses the `anonymous` auth provider: every connection is accepted as a
   single anonymous identity. This mode logs a security warning on startup and
   should not be used in production.
 - The `polaris_url` in SQE's catalog config simply points at Nessie's `/iceberg`
@@ -32,9 +32,9 @@ the full auth story (real identities, RBAC, token passthrough) see the
 ## What it demonstrates
 
 - SQE connecting to Nessie as an Iceberg REST catalog with no auth configuration.
-- Full create/write/read round-trip: `CREATE SCHEMA` → `CREATE TABLE` →
-  `INSERT` → `SELECT … GROUP BY`.
-- The same `rest` catalog code path works against both Polaris and Nessie — the
+- Full create/write/read round-trip: `CREATE SCHEMA`, then `CREATE TABLE`, then
+  `INSERT`, then `SELECT … GROUP BY`.
+- The same `rest` catalog code path works against both Polaris and Nessie. The
   catalog is swappable by config.
 
 **Status:** validated (2026-06-06).
@@ -43,7 +43,7 @@ the full auth story (real identities, RBAC, token passthrough) see the
 
 Full config, `docker compose`, queries, and captured output are in the repo:
 
-**→ [quickstart/nessie/](https://github.com/schubergphilis/sqe/tree/main/quickstart/nessie/)**
+**See: [quickstart/nessie/](https://github.com/schubergphilis/sqe/tree/main/quickstart/nessie/)**
 
 ```bash
 cd quickstart/nessie

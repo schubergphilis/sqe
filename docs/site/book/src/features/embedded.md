@@ -2,7 +2,7 @@
 
 SQE can run the full query engine in-process, with no server and no network.
 `sqe-cli` in embedded mode starts DataFusion, the Iceberg reader, and the same
-SQL planner locally — inside the CLI process. This is the fastest path for
+SQL planner locally, inside the CLI process. This is the fastest path for
 querying a warehouse from a laptop, a CI job, or a script.
 
 Four warehouse modes:

@@ -18,7 +18,7 @@ GROUP BY 1, 2;
 
 Flow:
 1. Parse SQL, extract target table name and SELECT query
-2. Execute SELECT → get Arrow RecordBatches
+2. Execute SELECT to get Arrow RecordBatches
 3. Convert Arrow schema to Iceberg schema
 4. Create table in Polaris catalog
 5. Write RecordBatches as Parquet files to S3
@@ -48,7 +48,7 @@ GROUP BY 1, 2;
 
 Flow:
 1. Parse SQL, extract target table and SELECT query
-2. Execute SELECT → get Arrow RecordBatches
+2. Execute SELECT to get Arrow RecordBatches
 3. Write RecordBatches as Parquet files to S3
 4. Commit data files to Iceberg via AppendAction (new snapshot)
 

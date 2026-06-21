@@ -22,7 +22,7 @@ graph TB
 
 ## Scan Task
 
-The coordinator sends workers a `ScanTask` — a lightweight JSON message containing everything the worker needs:
+The coordinator sends workers a `ScanTask`, a lightweight JSON message containing everything the worker needs:
 
 ```json
 {
@@ -60,7 +60,7 @@ stateDiagram-v2
 - Health checks run every **5 seconds** via Flight `Action("health_check")`
 - A worker is marked **unhealthy** after **3 consecutive failures**
 - Unhealthy workers are excluded from query scheduling
-- Recovery is automatic — a healthy response resets the failure counter
+- Recovery is automatic: a healthy response resets the failure counter
 
 ## Scaling
 

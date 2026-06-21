@@ -10,7 +10,7 @@ Returns the logical and physical query plan without executing the query.
 EXPLAIN SELECT * FROM orders WHERE amount > 100;
 ```
 
-**Output:** Two rows — `logical_plan` and `physical_plan` — each containing a
+**Output:** Two rows, `logical_plan` and `physical_plan`, each containing a
 text representation of the plan tree. The plan shown is the **policy-enforced**
 plan: any row filters or column masks applied by the security layer are visible.
 
@@ -32,7 +32,7 @@ are NULL for operators that do not expose DataFusion metrics.
 
 ## EXPLAIN FULL
 
-Returns the plan enriched with Iceberg table statistics — without executing the query.
+Returns the plan enriched with Iceberg table statistics, without executing the query.
 
 ```sql
 EXPLAIN FULL SELECT * FROM large_table WHERE region = 'EU';
@@ -51,7 +51,7 @@ DataFusion's cardinality analysis where available; file columns are NULL.
 
 ## Notes
 
-- All three variants apply policy enforcement — the plan reflects what will
+- All three variants apply policy enforcement. The plan reflects what will
   actually execute for the authenticated user.
 - `EXPLAIN FULL` on non-Iceberg tables (e.g., `information_schema`) returns
   NULL for all statistics columns without error.

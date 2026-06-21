@@ -31,13 +31,13 @@ The coordinator classifies every SQL statement and routes it to the appropriate 
 
 | Statement | Handler | Description |
 |---|---|---|
-| `SELECT` | `execute_query` | Plan → policy enforce → execute → stream results |
+| `SELECT` | `execute_query` | Plan, then policy enforce, then execute, then stream results |
 | `SHOW CATALOGS` | `handle_show_catalogs` | Returns warehouse name |
 | `SHOW SCHEMAS` | `handle_show_schemas` | Lists namespaces from Polaris |
 | `SHOW TABLES` | `handle_show_tables` | Lists tables in namespace(s) |
-| `CREATE TABLE AS SELECT` | `handle_ctas` | Execute SELECT → write Parquet → commit to Iceberg |
-| `INSERT INTO` | `handle_insert` | Execute SELECT → append Parquet → commit |
-| `CREATE VIEW` | `handle_create_view` | Plan SELECT for schema validation → store in catalog |
+| `CREATE TABLE AS SELECT` | `handle_ctas` | Execute SELECT, then write Parquet, then commit to Iceberg |
+| `INSERT INTO` | `handle_insert` | Execute SELECT, then append Parquet, then commit |
+| `CREATE VIEW` | `handle_create_view` | Plan SELECT for schema validation, then store in catalog |
 | `DROP TABLE` | `catalog_ops.drop_table` | Forward to Polaris REST |
 | `CREATE SCHEMA` | `catalog_ops.create_schema` | Create namespace in Polaris |
 | `DROP SCHEMA` | `catalog_ops.drop_schema` | Drop namespace from Polaris |
@@ -69,4 +69,4 @@ sequenceDiagram
     SC-->>DF: TableProvider (Iceberg scan)
 ```
 
-This means two users running the same query may see different tables, schemas, or data — depending on what Polaris grants them.
+This means two users running the same query may see different tables, schemas, or data, depending on what Polaris grants them.
