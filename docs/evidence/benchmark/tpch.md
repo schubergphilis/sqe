@@ -2,7 +2,7 @@
 
 22-query decision-support benchmark. The most widely benchmarked SQL workload; SQE's primary comparison target against Trino.
 
-The May 2026 SF1 run sits at 19.3s vs Trino 465's 26.6s on the same machine and storage. The path here was not linear: q01 / q15 swung up and down as the planner learned and unlearned bits of statistics, and the runtime-filter pushdown work in mid-April moved q06 / q07 / q14 from the warm orange zone to the pale yellow you see in the late-April part of the heatmap.
+The canonical SF1 headline is 16.8s vs Trino 465's 26.7s, a 1.6x result (see the [book Results table](../../site/book/src/features/benchmarks.md#results-sf1-vs-trino-465)). An earlier May 2026 run sat at 19.3s vs 26.6s on the same machine and storage; the path here was not linear. q01 / q15 swung up and down as the planner learned and unlearned bits of statistics, and the runtime-filter pushdown work in mid-April moved q06 / q07 / q14 from the warm orange zone to the pale yellow you see in the late-April part of the heatmap.
 
 ## Cross-scale
 

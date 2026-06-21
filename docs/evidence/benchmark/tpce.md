@@ -2,7 +2,7 @@
 
 11 queries from the financial-trading workload. Heavy on date-range filters, point lookups against trade-history tables, and aggregations across many small dimension tables.
 
-The 7.8x speedup vs Trino at SF1 (10.4s vs 138.8s) is the second-largest of any suite. Most of the gap is Trino's planning overhead per query: TPC-E's per-query latency targets are short, and Trino spends a non-trivial chunk of the run wall-time on plan compilation.
+The latest SF1 run (2026-06-12) is 9.3s vs Trino 465's 172.0s, an 18.5x speedup. It is the largest gap of any of the seven suites. Most of the gap is Trino's planning overhead per query: TPC-E's per-query latency targets are short, and Trino spends a non-trivial chunk of the run wall-time on plan compilation. TPC-E is also the suite that historically needed the most work, joining across 33 tables with IN-subquery patterns DataFusion cannot always decorrelate.
 
 ## Cross-scale
 
