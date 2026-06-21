@@ -52,16 +52,24 @@ Design docs use the **openspec** format with three tiers per phase:
 - `specs/` -- GIVEN/WHEN/THEN requirement scenarios per domain (e.g., `sql-extensions/spec.md`, `security-policy/spec.md`)
 
 Key docs:
-- `docs/datafusion-architecture.md` -- Overall SQE architecture, component breakdown, tech choices, implementation phases
-- `docs/openspec.md` -- Phase 5 policy SQL extensions (parser, policy store, plan rewriter, coordinator integration)
-- `docs/dbt-sqe.md` -- Phase 2c dbt compatibility (write path, information_schema, dbt-sqe adapter)
+- `docs/site/book/src/design-notes/datafusion-architecture.md` -- Overall SQE architecture, component breakdown, tech choices, implementation phases
+- `docs/internal/process/openspec.md` -- Phase 5 policy SQL extensions (parser, policy store, plan rewriter, coordinator integration)
+- `docs/site/book/src/design-notes/dbt-sqe.md` -- Phase 2c dbt compatibility (write path, information_schema, dbt-sqe adapter)
+
+The `docs/` tree splits into three zones:
+
+- `docs/site/` -- published content (book -> docs.getsqe.com; plus ebook, blog, compare). The book at `docs/site/book/` is the canonical reference, and design history is published under `docs/site/book/src/design-notes/`.
+- `docs/internal/` -- working history (specs, plans, reviews, audit, prompts, process). Never published.
+- `docs/evidence/` -- generated data artifacts (benchmark charts, perf explains, matrix/perf JSON).
+
+Invariant: `docs/site/` must be publish-clean (no secrets). A later task adds a leak-scan to enforce it.
 
 ## Implementation Phases
 
 1. **Phase 1** -- Single-node: DataFusion + iceberg-rust + OIDC auth + Flight SQL
 2. **Phase 2** -- Views, INSERT INTO, manifest caching, audit logging
 3. **Phase 2c** -- dbt compatibility: write path (CTAS, MERGE, DELETE), information_schema, dbt-sqe adapter
-4. **Phase 3** -- Distributed execution: bespoke scheduler + stateless DataFusion workers (Ballista was evaluated and wound down; see `docs/ballista-evaluation-learnings.md`)
+4. **Phase 3** -- Distributed execution: bespoke scheduler + stateless DataFusion workers (Ballista was evaluated and wound down; see `docs/site/book/src/design-notes/ballista-evaluation-learnings.md`)
 5. **Phase 4** -- Production hardening: metrics, benchmarks, Helm, Trino compat
 6. **Phase 5** -- Security: OPA/Cedar policy engine, GRANT/REVOKE SQL, column masks, row filters
 
@@ -140,7 +148,7 @@ This ensures the project state is always visible to anyone reading the repo.
 
 ## Writing Style (Ebook, Blog, Docs)
 
-All publications (ebook chapters in `docs/ebook/chapters/`, blog posts in `docs/blog/`, and documentation) MUST follow Jacob's voice from `docs/ebook/voice.md`. Key rules:
+All publications (ebook chapters in `docs/site/ebook/chapters/`, blog posts in `docs/site/blog/`, and documentation) MUST follow Jacob's voice from `docs/site/ebook/voice.md`. Key rules:
 
 ### Forbidden Characters
 - **NEVER use emdash** (`—` U+2014). Replace with periods, commas, colons, or restructured sentences.
@@ -170,4 +178,4 @@ All publications (ebook chapters in `docs/ebook/chapters/`, blog posts in `docs/
 - Code examples must compile or be clearly marked as pseudocode.
 
 ### Before Committing Any Publication
-Run this check: `grep -rn '—' docs/ebook/chapters/ docs/blog/` — must return zero hits in prose (OK in frontmatter `description` fields and inside code/tree-diagram blocks).
+Run this check: `grep -rn '—' docs/site/ebook/chapters/ docs/site/blog/` — must return zero hits in prose (OK in frontmatter `description` fields and inside code/tree-diagram blocks).

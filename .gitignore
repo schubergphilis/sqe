@@ -29,3 +29,6 @@ log*.txt
 
 # External submission scratch dirs (e.g. icebergmatrix.org submission JSON)
 docs/neuw84-submission/
+
+# Generated mdBook output (build-dir resolves here; docs.getsqe.com builds from the docs-website repo)
+/docs/target/
