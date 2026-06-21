@@ -648,15 +648,16 @@ impl SqeFlightSqlService {
                     );
                     self.emit_auth_event(
                         sqe_metrics::audit::Outcome::Success,
-                        jwt_actor.clone(),
-                        Some(client_ip.clone()),
-                        Some(session.id.clone()),
-                    );
-                    self.emit_session_event(
                         jwt_actor,
                         Some(client_ip),
                         Some(session.id.clone()),
                     );
+                    // No Session event here: authenticate_credentials mints a
+                    // new session on every JWT bearer call (no dedup by token),
+                    // so emitting Session here would fire per-request rather
+                    // than per-session-establishment. Session events (OCSF 3003)
+                    // are only emitted on do_handshake(), which is the single
+                    // true session-establishment gate for interactive clients.
                     return Ok(session);
                 }
                 Err(e) => {
