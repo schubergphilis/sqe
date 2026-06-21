@@ -331,31 +331,45 @@ impl MaintenanceHandler {
         }
 
         let target = call.target_label();
-        let audit_status = "denied";
         if let Some(ref audit) = self.audit {
-            audit.log(&sqe_metrics::audit::AuditEntry {
-                timestamp: chrono::Utc::now().to_rfc3339(),
-                username: session.user.username.clone(),
+            // Canonical AdminDdl event: denial of a maintenance procedure.
+            // The maintenance handler has the session identity, so we build
+            // a full Actor. No bearer tokens travel in procedure SQL text,
+            // so log_event is safe here (no secret redaction needed).
+            let deny_actor = sqe_metrics::audit::Actor::from_parts(
+                session.user.username.clone(),
+                session.user.subject.clone(),
+                session.user.email.clone(),
+                session.user.roles.clone(),
+                session.user.groups.clone(),
+            );
+            audit.log_event(sqe_metrics::audit::AuditEvent {
+                time: chrono::Utc::now(),
+                kind: sqe_metrics::audit::AuditKind::AdminDdl,
+                actor: deny_actor,
+                outcome: sqe_metrics::audit::Outcome::Failure {
+                    error_type: Some("AdminGateDenied".to_string()),
+                    error_code: None,
+                    message: Some(format!(
+                        "user '{}' lacks write privilege on '{target}'",
+                        session.user.username
+                    )),
+                },
+                resources: vec![],
+                policy: None,
+                timing: None,
+                stats: None,
+                query: Some(sqe_metrics::audit::QueryInfo {
+                    text: Some(format!("CALL system.{}('{target}')", call.name())),
+                    query_hash: sqe_metrics::audit::query_hash(&format!(
+                        "CALL system.{}({target})",
+                        call.name(),
+                    )),
+                    statement_type: "procedure".to_string(),
+                }),
                 session_id: Some(session.id.clone()),
-                query_hash: sqe_metrics::audit::query_hash(&format!(
-                    "CALL system.{}({target})",
-                    call.name(),
-                )),
-                query_text: Some(format!(
-                    "CALL system.{}('{target}')",
-                    call.name(),
-                )),
-                statement_type: "procedure".to_string(),
-                duration_ms: 0,
-                rows_returned: 0,
-                status: audit_status.to_string(),
                 client_ip: None,
-                tables_touched: vec![target.to_string()],
-                // Maintenance procedures carry no policy decision.
-                row_filters_applied: 0,
-                columns_masked: Vec::new(),
-                columns_restricted: Vec::new(),
-                policy_denied: false,
+                integrity: sqe_metrics::audit::Integrity::default(),
             });
         }
         warn!(
