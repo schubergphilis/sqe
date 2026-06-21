@@ -72,8 +72,7 @@ struct HealthState {
     bearer_provider: Option<Arc<dyn sqe_auth::AuthProvider>>,
     /// Auth config for admin-role check in the web_ui guard. `None` in `run_worker` and tests.
     auth_cfg: Option<sqe_core::config::AuthConfig>,
-    /// Audit logger wired for Task 2 (audit-on-access). `None` in `run_worker` and tests.
-    #[allow(dead_code)] // read in Task 2
+    /// Audit logger wired for dashboard-access events. `None` in `run_worker` and tests.
     audit: Option<Arc<sqe_metrics::audit::AuditLogger>>,
 }
 
@@ -84,6 +83,10 @@ impl sqe_coordinator::web_auth::BearerAdminState for HealthState {
 
     fn auth_config(&self) -> Option<&sqe_core::config::AuthConfig> {
         self.auth_cfg.as_ref()
+    }
+
+    fn audit(&self) -> Option<&Arc<sqe_metrics::audit::AuditLogger>> {
+        self.audit.as_ref()
     }
 }
 
@@ -788,30 +791,6 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
     // is moved into QueryHandler::new below.
     let sampler_tracker = query_tracker.clone();
 
-    // Health server (start early so probes work during init)
-    let health_state = Arc::new(HealthState {
-        ready: ready.clone(),
-        started_at,
-        role: "coordinator",
-        worker_registry: if distributed {
-            Some(worker_registry.clone())
-        } else {
-            None
-        },
-        query_tracker: Some(query_tracker.clone()),
-        web_ui: config.metrics.web_ui,
-        catalog_url: config.catalog.catalog_url.clone(),
-        node_info: Some(node_info),
-        metrics_history: metrics_history.clone(),
-        // auth_chain is already built above; reuse it for the web_ui guard.
-        bearer_provider: Some(Arc::clone(&auth_chain) as Arc<dyn sqe_auth::AuthProvider>),
-        auth_cfg: Some(config.auth.clone()),
-        // audit logger is built after the health server starts (line ~908);
-        // Task 2 will thread it through once the field ordering is resolved.
-        audit: None,
-    });
-    start_health_server(health_port, health_state);
-
     // Metrics & audit
     let metrics = Arc::new(sqe_metrics::MetricsRegistry::new());
 
@@ -983,6 +962,32 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
         };
 
     let audit = Arc::new(audit_logger);
+
+    // Health server. Started here (after audit init) so the audit logger can be
+    // threaded into HealthState and dashboard-access events are captured from
+    // the first request. Probes (/healthz, /readyz) are still served immediately
+    // after coordinator startup; the only change vs. the pre-Task-2 placement is
+    // that the health server starts a few ms later (after audit file open).
+    let health_state = Arc::new(HealthState {
+        ready: ready.clone(),
+        started_at,
+        role: "coordinator",
+        worker_registry: if distributed {
+            Some(worker_registry.clone())
+        } else {
+            None
+        },
+        query_tracker: Some(query_tracker.clone()),
+        web_ui: config.metrics.web_ui,
+        catalog_url: config.catalog.catalog_url.clone(),
+        node_info: Some(node_info),
+        metrics_history: metrics_history.clone(),
+        // auth_chain is already built above; reuse it for the web_ui guard.
+        bearer_provider: Some(Arc::clone(&auth_chain) as Arc<dyn sqe_auth::AuthProvider>),
+        auth_cfg: Some(config.auth.clone()),
+        audit: Some(Arc::clone(&audit)),
+    });
+    start_health_server(health_port, health_state);
 
     // Spawn the OTLP audit shipper when export is enabled.
     let shipper_shutdown_tx = if let Some(ref spool_path) = shipper_spool_path {
