@@ -351,7 +351,7 @@ SIEM queries that filter on any of these attributes avoid parsing the full body.
 
 | Metric | Type | Description |
 |--------|------|-------------|
-| `sqe_audit_export_records_total{status}` | Counter | Records shipped, labeled `status="ok"` or `status="error"` |
+| `sqe_audit_export_records_total{status}` | Counter | Records shipped, labeled `status="success"` or `status="failure"` |
 | `sqe_audit_export_batch_failures_total` | Counter | OTLP export calls that returned an error |
 | `sqe_audit_export_spool_lag_bytes` | Gauge | Bytes between the cursor offset and the current end of spool |
 | `sqe_audit_export_cursor_seq` | Gauge | Last sequence number successfully acked |
