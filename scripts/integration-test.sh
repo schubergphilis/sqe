@@ -36,8 +36,9 @@ echo "Running integration tests..."
 # test_distributed_select intentionally fails when no worker is listening on
 # :50052 (issue #122 — local-fallback masking distributed dispatch bugs).
 # This script targets docker-compose.test.yml, which doesn't include a worker;
-# distributed coverage is exercised by scripts/distributed-test.sh on
-# docker-compose.distributed.yml. Skip the test here unless the caller passes
+# distributed coverage is exercised by the quickstart/distributed scenario
+# (scripts/test.sh scenario distributed) on docker-compose.distributed.yml.
+# Skip the test here unless the caller passes
 # their own filter args ($# > 0 implies an explicit test name was selected).
 SKIP_ARGS=()
 if [ "$#" -eq 0 ]; then
