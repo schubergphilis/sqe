@@ -2,7 +2,7 @@
 
 Eight read queries derived from the TPC-C OLTP transactions. SQE does not run the full OLTP benchmark (no row-level transactions, no order-line latency targets); we run the SELECTs that the transactions perform after their writes commit.
 
-The 9.6x speedup vs Trino at SF1 reflects how well DataFusion's vectorised scan outperforms Trino's Hive connector on point lookups against small Iceberg tables.
+The latest SF1 run (2026-06-12) is 0.41s vs Trino 465's 2.65s, a 6.5x speedup. The gap reflects how well DataFusion's vectorised scan outperforms Trino's Hive connector on point lookups against small Iceberg tables.
 
 ## Cross-scale
 

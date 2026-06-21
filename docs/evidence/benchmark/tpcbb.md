@@ -2,7 +2,7 @@
 
 10 queries from the BigBench mixed-workload benchmark. A blend of structured analytics, semi-structured (JSON), and unstructured (text) operations against a retail data warehouse schema.
 
-The 5.5x speedup vs Trino at SF1 reflects the structured-query subset; the JSON queries are where the gap is largest because Trino's JSON connector materialises strings that DataFusion can scan as columnar.
+The latest SF1 run (2026-06-12) is 28.0s vs Trino 465's 255.7s, a 9.1x speedup, the second-largest gap after TPC-E. The structured-query subset drives most of it; the JSON queries widen the gap further because Trino's JSON connector materialises strings that DataFusion can scan as columnar.
 
 ## Cross-scale
 

@@ -2,7 +2,7 @@
 
 43 queries against a single wide `hits` table. Designed for log analytics use cases (HTTP access logs, mobile event logs); heavy on string filters, point lookups, and counts over fixed columns.
 
-This is the suite where SQE's caching layers shine: bloom filters on the few high-cardinality columns + manifest-level min/max stats + footer cache means most queries become "skip 99% of files, scan 1, return". The 4.6x speedup vs Trino at SF1 is the largest gap of any of the seven suites.
+This is the suite where SQE's caching layers shine: bloom filters on the few high-cardinality columns + manifest-level min/max stats + footer cache means most queries become "skip 99% of files, scan 1, return". The latest SF1 run (2026-06-12) sits at 1.3s vs Trino 465's 4.46s, a 3.4x speedup over the 43-query suite.
 
 ## Cross-scale
 
@@ -18,7 +18,7 @@ This is the suite where SQE's caching layers shine: bloom filters on the few hig
 
 ## SF1
 
-The headline scale. Total run sits at 1.7s; Trino takes 6.3s on the same data.
+The headline scale. The latest run sits at 1.3s; Trino takes 4.46s on the same data. Same numbers as the [book Results table](../../site/book/src/features/benchmarks.md#results-sf1-vs-trino-465).
 
 ![ClickBench SF1 total](./charts/clickbench-sf1-total.png)
 
