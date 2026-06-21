@@ -7,10 +7,19 @@
 # CLI built locally, the same commands work with `sqe-cli` instead of the
 # docker run wrapper.
 #
-#   ./run.sh
+#   ./run.sh           # run queries, capture to OUTPUT.md
+#   ./run.sh --check   # run queries, then assert the key invariants
 set -euo pipefail
 cd "$(dirname "$0")"
 . ../_shared/lib.sh
+
+CHECK=0
+for a in "$@"; do
+  case "$a" in
+    --check) CHECK=1 ;;
+    *) die "unknown arg: $a (use --check)" ;;
+  esac
+done
 
 require docker
 IMG="${SQE_IMAGE:-sqe-quickstart:latest}"
@@ -54,5 +63,25 @@ step "querying local + remote files with the embedded engine, capturing to $OUT"
   echo '```'
 } | tee "$OUT"
 ok "captured to $OUT"
+
+if [ "$CHECK" -eq 1 ]; then
+  step "checking invariants (reusing the embedded sqe() runner)"
+
+  # Local Parquet read returns the three event kinds with the totals from
+  # OUTPUT.md (click 2.25, purchase 55.25, refund -5.0) and no engine error.
+  parquet_out=$(sqe -e "SELECT kind, ROUND(SUM(amount),2) AS total FROM read_parquet('/data/events.parquet') GROUP BY kind ORDER BY kind" 2>&1)
+  assert_not_empty   "read_parquet returns rows"            "$parquet_out"
+  assert_not_contains "read_parquet has no error"           "$parquet_out" "error"
+  assert_contains    "read_parquet shows purchase total"    "$parquet_out" "55.25"
+
+  # Remote Parquet over HTTPS returns the expected 1000-row count.
+  remote_out=$(sqe -e "SELECT COUNT(*) AS rows FROM read_parquet('$REMOTE')" 2>&1)
+  assert_not_contains "remote read_parquet has no error"    "$remote_out" "error"
+  assert_contains    "remote read_parquet returns 1000 rows" "$remote_out" "1000"
+
+  check_summary
+  exit 0
+fi
+
 echo
 ok "done. Embedded mode leaves nothing behind (ephemeral --memory engine)."
