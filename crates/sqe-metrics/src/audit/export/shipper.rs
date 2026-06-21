@@ -4,6 +4,24 @@ use std::sync::Arc;
 
 use crate::audit::export::{ocsf_to_ship_record, LogShipExporter, SeqCursor, ShipRecord};
 
+/// Prometheus metric handles updated by the shipper on each pass.
+///
+/// All fields are `Option` so the shipper compiles and runs without a metrics
+/// registry attached (e.g. in unit tests that do not wire Prometheus).
+#[derive(Clone, Default)]
+pub struct ShipperMetrics {
+    /// `sqe_audit_export_records_total{status}` counter vec.
+    pub records_total: Option<prometheus::IntCounterVec>,
+    /// `sqe_audit_export_batch_failures_total` counter.
+    pub batch_failures_total: Option<prometheus::IntCounter>,
+    /// `sqe_audit_export_spool_lag_bytes` gauge.
+    pub spool_lag_bytes: Option<prometheus::Gauge>,
+    /// `sqe_audit_export_cursor_seq` gauge.
+    pub cursor_seq: Option<prometheus::Gauge>,
+    /// `sqe_audit_export_last_success_timestamp` gauge.
+    pub last_success_timestamp: Option<prometheus::Gauge>,
+}
+
 /// Where to start reading on a fresh cursor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StartAt {
@@ -43,6 +61,9 @@ pub struct OtlpLogShipper {
     /// `max_spool_bytes`.
     spool_warn_emitted: bool,
     flush_interval_ms: u64,
+    /// Optional Prometheus metric handles. `None` in tests and when the
+    /// coordinator does not wire a registry (e.g. disabled path).
+    metrics: ShipperMetrics,
 }
 
 impl OtlpLogShipper {
@@ -89,7 +110,17 @@ impl OtlpLogShipper {
             committed_offset,
             spool_warn_emitted: false,
             flush_interval_ms,
+            metrics: ShipperMetrics::default(),
         }
+    }
+
+    /// Attach Prometheus metric handles. Call before `run`.
+    ///
+    /// When not called (or called with a default `ShipperMetrics`), the shipper
+    /// operates normally but does not update any metrics.
+    pub fn with_metrics(mut self, m: ShipperMetrics) -> Self {
+        self.metrics = m;
+        self
     }
 
     /// Scan the spool linearly to find the byte offset after the last complete
@@ -253,6 +284,9 @@ impl OtlpLogShipper {
 
             let outcome = self.ship_once().await;
 
+            // Update Prometheus metrics after each pass.
+            self.update_metrics(&outcome);
+
             if outcome.failed {
                 tracing::warn!(
                     backoff_ms,
@@ -288,6 +322,43 @@ impl OtlpLogShipper {
                     if *shutdown.borrow() { break; }
                 }
             }
+        }
+    }
+
+    /// Update Prometheus metrics from a `ShipOutcome`.
+    fn update_metrics(&self, outcome: &ShipOutcome) {
+        let m = &self.metrics;
+
+        if outcome.failed {
+            if let Some(ref c) = m.batch_failures_total {
+                c.inc();
+            }
+            if let Some(ref cv) = m.records_total {
+                cv.with_label_values(&["failure"]).inc_by(0);
+            }
+        } else if outcome.shipped > 0 {
+            if let Some(ref cv) = m.records_total {
+                cv.with_label_values(&["success"])
+                    .inc_by(outcome.shipped as u64);
+            }
+            if let Some(ref g) = m.cursor_seq {
+                g.set(outcome.advanced_to as f64);
+            }
+            if let Some(ref g) = m.last_success_timestamp {
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs_f64();
+                g.set(ts);
+            }
+        }
+
+        // Spool lag: file size minus committed offset.
+        if let Some(ref g) = m.spool_lag_bytes {
+            let lag = std::fs::metadata(&self.spool_path)
+                .map(|m| m.len().saturating_sub(self.committed_offset) as f64)
+                .unwrap_or(0.0);
+            g.set(lag);
         }
     }
 }

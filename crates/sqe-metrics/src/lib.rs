@@ -97,6 +97,13 @@ pub struct MetricsRegistry {
     pub policy_cache_hits_total: IntCounterVec,
     pub policy_cache_misses_total: IntCounterVec,
     pub policy_circuit_breaker_state: GaugeVec,
+
+    // Audit export (OTLP shipper) metrics
+    pub audit_export_records_total: IntCounterVec,
+    pub audit_export_batch_failures_total: IntCounter,
+    pub audit_export_spool_lag_bytes: Gauge,
+    pub audit_export_cursor_seq: Gauge,
+    pub audit_export_last_success_timestamp: Gauge,
 }
 
 impl MetricsRegistry {
@@ -500,6 +507,55 @@ impl MetricsRegistry {
             .register(Box::new(write_orphan_files_total.clone()))
             .unwrap();
 
+        // Audit export (OTLP shipper) metrics
+        let audit_export_records_total = IntCounterVec::new(
+            Opts::new(
+                "sqe_audit_export_records_total",
+                "Total audit records shipped by status (success or failure)",
+            ),
+            &["status"],
+        )
+        .unwrap();
+        registry
+            .register(Box::new(audit_export_records_total.clone()))
+            .unwrap();
+
+        let audit_export_batch_failures_total = IntCounter::new(
+            "sqe_audit_export_batch_failures_total",
+            "Total failed audit export batch attempts",
+        )
+        .unwrap();
+        registry
+            .register(Box::new(audit_export_batch_failures_total.clone()))
+            .unwrap();
+
+        let audit_export_spool_lag_bytes = Gauge::new(
+            "sqe_audit_export_spool_lag_bytes",
+            "Bytes in the audit spool not yet shipped (file size minus committed offset)",
+        )
+        .unwrap();
+        registry
+            .register(Box::new(audit_export_spool_lag_bytes.clone()))
+            .unwrap();
+
+        let audit_export_cursor_seq = Gauge::new(
+            "sqe_audit_export_cursor_seq",
+            "Sequence number of the last successfully acked audit export record",
+        )
+        .unwrap();
+        registry
+            .register(Box::new(audit_export_cursor_seq.clone()))
+            .unwrap();
+
+        let audit_export_last_success_timestamp = Gauge::new(
+            "sqe_audit_export_last_success_timestamp",
+            "Unix timestamp (seconds) of the last successful audit export batch",
+        )
+        .unwrap();
+        registry
+            .register(Box::new(audit_export_last_success_timestamp.clone()))
+            .unwrap();
+
         Self {
             registry,
             query_count,
@@ -551,6 +607,11 @@ impl MetricsRegistry {
             policy_cache_misses_total,
             policy_circuit_breaker_state,
             write_orphan_files_total,
+            audit_export_records_total,
+            audit_export_batch_failures_total,
+            audit_export_spool_lag_bytes,
+            audit_export_cursor_seq,
+            audit_export_last_success_timestamp,
         }
     }
 }
