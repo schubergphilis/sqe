@@ -1400,12 +1400,31 @@ impl QueryHandler {
             }
         }
 
-        let tables_touched: Vec<String> = match captured_plan.as_ref() {
+        // Resolve resources from the plan using structured TableReferences so
+        // audit entries carry fully-qualified `catalog.ns.table` names.
+        // `session.default_catalog` fills missing catalog components for Bare
+        // and Partial references; when absent, `config.query.default_catalog`
+        // is the fallback.
+        //
+        // NOTE: the streaming path (execute_stream, ~line 1777) still uses
+        // `sqe_lineage::extract::extract_table_names` for the tracker/cache
+        // path. Upgrading that site is a follow-on task (its `tables_touched`
+        // feeds query_cache invalidation, so a format change there needs a
+        // separate review).
+        let _effective_catalog: String;
+        let default_catalog: Option<&str> = if let Some(ref c) = session.default_catalog {
+            Some(c.as_str())
+        } else {
+            _effective_catalog = self.config.resolve_default_catalog();
+            Some(_effective_catalog.as_str())
+        };
+        let audit_resources: Vec<sqe_metrics::audit::Resource> = match captured_plan.as_ref() {
             Some(sqe_lineage::PlanOrHint::Plan(p)) => {
-                sqe_lineage::extract::extract_table_names(p.as_ref())
+                crate::audit_resources::resources_from_plan(p.as_ref(), default_catalog)
             }
             _ => Vec::new(),
         };
+        let tables_touched: Vec<String> = audit_resources.iter().map(|r| r.fqn()).collect();
 
         if ol_emit {
             if let Some(ref obs) = self.lineage {
