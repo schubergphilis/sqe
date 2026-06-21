@@ -7,7 +7,7 @@ description: "Run SQE's engine in-process with sqe-cli --embedded and query CSV,
 # Embedded: query local and remote files
 
 SQE's engine runs in-process. `sqe-cli --embedded --memory` starts the query
-engine and the file-reader table-valued functions in a single binary — no
+engine and the file-reader table-valued functions in a single binary: no
 coordinator, no workers, no network listeners, no catalog. The `read_csv`,
 `read_json`, and `read_parquet` TVFs read files directly, whether they live on
 local disk or behind an HTTPS URL.
@@ -18,11 +18,11 @@ bring up; this quickstart just runs the CLI.
 ## How it works
 
 - `--embedded` runs the engine in-process. `--memory` disables the persistent
-  catalog — the session is ephemeral and nothing is written to disk.
+  catalog: the session is ephemeral and nothing is written to disk.
 - Sample data files (CSV, JSON, Parquet) in the `data/` directory are mounted
   into the container at runtime.
 - `read_csv`, `read_json`, and `read_parquet` accept a local path, an `https://`
-  URL, or an `s3://` URI — the same object-store layer backs all three.
+  URL, or an `s3://` URI. The same object-store layer backs all three.
 - `run.sh` exercises local CSV aggregation, a cross-format JOIN (CSV + Parquet),
   and a remote HTTPS Parquet read, and captures the output.
 
@@ -41,7 +41,7 @@ bring up; this quickstart just runs the CLI.
 
 Full sample data, queries, and captured output are in the repo:
 
-**→ [quickstart/embedded-files/](https://github.com/schubergphilis/sqe/tree/main/quickstart/embedded-files/)**
+**See: [quickstart/embedded-files/](https://github.com/schubergphilis/sqe/tree/main/quickstart/embedded-files/)**
 
 ```bash
 cd quickstart/embedded-files

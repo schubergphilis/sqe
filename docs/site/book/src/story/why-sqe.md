@@ -12,7 +12,7 @@ Our data platform runs on **Apache Iceberg** tables stored in S3, cataloged by *
 
 ## Why Not Trino?
 
-We started with **Trino** — the industry-standard SQL engine for data lakehouses. It works, but:
+We started with **Trino**, the industry-standard SQL engine for data lakehouses. It works, but:
 
 | Challenge | Detail |
 |---|---|
@@ -44,12 +44,12 @@ graph TB
 
 **Apache DataFusion** is a Rust-native query engine that gives us:
 
-- **Extensible query planning** — we can inject security filters into the `LogicalPlan` before optimization, which is exactly where row filters and column masks need to go
-- **iceberg-rust integration** — native Rust Iceberg library, no JNI bridge, no serialization overhead
-- **Per-query context** — each query gets its own `SessionContext` with the user's bearer token. No shared service account.
-- **Single binary** — the coordinator and worker ship as one ~50MB binary. Starts in milliseconds.
-- **No GC** — predictable latency, no stop-the-world pauses during large scans
+- **Extensible query planning**: we can inject security filters into the `LogicalPlan` before optimization, which is exactly where row filters and column masks need to go
+- **iceberg-rust integration**: native Rust Iceberg library, no JNI bridge, no serialization overhead
+- **Per-query context**: each query gets its own `SessionContext` with the user's bearer token. No shared service account.
+- **Single binary**: the coordinator and worker ship as one ~50MB binary. Starts in milliseconds.
+- **No GC**: predictable latency, no stop-the-world pauses during large scans
 
 ## The Name
 
-**Sovereign** — because every query runs with the identity and permissions of the user who submitted it. No service account intermediary. No privilege escalation. The user's token is sovereign.
+**Sovereign**: because every query runs with the identity and permissions of the user who submitted it. No service account intermediary. No privilege escalation. The user's token is sovereign.

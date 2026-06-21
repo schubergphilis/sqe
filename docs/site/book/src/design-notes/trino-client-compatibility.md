@@ -50,41 +50,41 @@ Rating: ✅ works | ⚠️ partial (with workaround) | ❌ broken | ⏭️ not t
 - [x] `SELECT 1+1 AS result` succeeds with column alias
 
 **Trino Date/Time Functions (compat UDFs):**
-- [x] `now()` — returns current timestamp
-- [x] `year(CAST('2024-01-15' AS DATE))` — returns 2024
-- [x] `month(CAST('2024-03-15' AS DATE))` — returns 3
-- [x] `day_of_week(CAST('2024-01-15' AS DATE))` — returns day number
-- [x] `date_format(now(), '%Y-%m-%d')` — MySQL format codes work
-- [x] `date_trunc('month', ...)` — native DataFusion
+- [x] `now()`: returns current timestamp
+- [x] `year(CAST('2024-01-15' AS DATE))`: returns 2024
+- [x] `month(CAST('2024-03-15' AS DATE))`: returns 3
+- [x] `day_of_week(CAST('2024-01-15' AS DATE))`: returns day number
+- [x] `date_format(now(), '%Y-%m-%d')`: MySQL format codes work
+- [x] `date_trunc('month', ...)`: native DataFusion
 
 **String Functions:**
-- [x] `upper(concat('hello', ' ', 'world'))` — HELLO WORLD
-- [x] `length('hello')` — 5
-- [x] `substr('hello world', 1, 5)` — hello
-- [x] `replace('hello', 'l', 'r')` — herro
-- [x] `trim('  hello  ')` — hello
+- [x] `upper(concat('hello', ' ', 'world'))`: HELLO WORLD
+- [x] `length('hello')`: 5
+- [x] `substr('hello world', 1, 5)`: hello
+- [x] `replace('hello', 'l', 'r')`: herro
+- [x] `trim('  hello  ')`: hello
 
 **Conditional / Type:**
-- [x] `CASE WHEN 1=1 THEN 'yes' ELSE 'no' END` — yes
-- [x] `COALESCE(NULL, 42)` — 42
-- [x] `NULLIF(1, 1)` — NULL
-- [x] `GREATEST(1,2,3), LEAST(1,2,3)` — 3, 1
-- [x] `typeof(42)` — Int64
-- [x] `TRY_CAST('abc' AS INTEGER)` — NULL
+- [x] `CASE WHEN 1=1 THEN 'yes' ELSE 'no' END`: yes
+- [x] `COALESCE(NULL, 42)`: 42
+- [x] `NULLIF(1, 1)`: NULL
+- [x] `GREATEST(1,2,3), LEAST(1,2,3)`: 3, 1
+- [x] `typeof(42)`: Int64
+- [x] `TRY_CAST('abc' AS INTEGER)`: NULL
 
 **Math:**
-- [x] `abs(-5), sqrt(16.0)` — 5, 4.0
-- [x] `round(3.14159, 2)` — 3.14
-- [x] `pi()` — 3.14159...
-- [x] `random()` — random float
+- [x] `abs(-5), sqrt(16.0)`: 5, 4.0
+- [x] `round(3.14159, 2)`: 3.14
+- [x] `pi()`: 3.14159...
+- [x] `random()`: random float
 
 **JSON:**
-- [x] `json_format('{"a":1}')` — formatted JSON string
+- [x] `json_format('{"a":1}')`: formatted JSON string
 
 **Known failures:**
-- [ ] `VALUES` clause — `SELECT count(*) FROM (VALUES 1,2,3) AS t(x)` fails (DataFusion parses but Trino endpoint doesn't handle inline VALUES)
-- [ ] Error detail — bad SQL returns generic `Query execution failed` instead of the underlying parse error message
-- [x] Missing table — correctly returns error with table name: `table 'test_warehouse.default.nonexistent_table' not found`
+- [ ] `VALUES` clause: `SELECT count(*) FROM (VALUES 1,2,3) AS t(x)` fails (DataFusion parses but Trino endpoint doesn't handle inline VALUES)
+- [ ] Error detail: bad SQL returns generic `Query execution failed` instead of the underlying parse error message
+- [x] Missing table: correctly returns error with table name: `table 'test_warehouse.default.nonexistent_table' not found`
 
 **Results:** 26/28 pass. Core SQL functions, metadata, and Trino compat UDFs all work correctly over the Trino HTTP protocol.
 
@@ -139,7 +139,7 @@ trino --server http://localhost:8080 --user admin --catalog iceberg --schema tpc
 
 **Test cases:**
 - [ ] Create Trino connection in DBeaver
-- [ ] Schema browser shows catalogs → schemas → tables
+- [ ] Schema browser shows catalogs, then schemas, then tables
 - [ ] Column metadata displays correctly
 - [ ] Query editor runs SELECT queries
 - [ ] Result grid displays data correctly

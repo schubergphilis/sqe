@@ -8,9 +8,9 @@ Row-level write operations (MERGE INTO, DELETE FROM, UPDATE) are **implemented**
 
 SQE needed row-level mutations to be a viable Trino replacement:
 
-- **MERGE INTO** — the most common pattern for incremental data pipelines (upserts). Required by dbt incremental models.
-- **DELETE FROM** — GDPR right-to-erasure, data corrections, partition cleanup.
-- **UPDATE** — in-place corrections without full table rewrites.
+- **MERGE INTO**: the most common pattern for incremental data pipelines (upserts). Required by dbt incremental models.
+- **DELETE FROM**: GDPR right-to-erasure, data corrections, partition cleanup.
+- **UPDATE**: in-place corrections without full table rewrites.
 
 ## Current State (as of 2026-04-01)
 
@@ -22,9 +22,9 @@ SQE needed row-level mutations to be a viable Trino replacement:
 | Statement classification & routing | ✅ `StatementKind::Merge`, `Delete`, `Update` routed in classifier |
 | Query execution (SELECT part of MERGE) | ✅ DataFusion handles the join/match logic |
 | Append writes via `FastAppendAction` | ✅ Used by INSERT INTO and CTAS |
-| **DELETE FROM via CoW** | ✅ `delete_handler.rs` — rewrite_files() |
-| **UPDATE via CoW** | ✅ `update_handler.rs` — rewrite_files() |
-| **MERGE INTO via CoW** | ✅ `merge_handler.rs` — rewrite_files() |
+| **DELETE FROM via CoW** | ✅ `delete_handler.rs`, rewrite_files() |
+| **UPDATE via CoW** | ✅ `update_handler.rs`, rewrite_files() |
+| **MERGE INTO via CoW** | ✅ `merge_handler.rs`, rewrite_files() |
 | Schema inference | ✅ `QueryHandler::get_schema()` |
 | Per-session catalog with bearer token | ✅ `SessionCatalog` with Polaris passthrough |
 | Integration tests (all three operations) | ✅ Against Polaris + MinIO |
@@ -180,19 +180,19 @@ MERGE INTO target USING source ON condition
 
 ### Integration Tests (require Polaris + MinIO)
 
-- DELETE FROM with WHERE clause → verify rows removed
-- DELETE FROM without WHERE → verify table emptied
-- UPDATE SET → verify values changed
-- MERGE with WHEN MATCHED THEN UPDATE → verify upsert
-- MERGE with WHEN MATCHED THEN DELETE → verify conditional delete
-- MERGE with WHEN NOT MATCHED THEN INSERT → verify new rows added
-- Concurrent MERGE operations → verify conflict detection
-- MERGE with schema mismatch → verify error handling
+- DELETE FROM with WHERE clause, then verify rows removed
+- DELETE FROM without WHERE, then verify table emptied
+- UPDATE SET, then verify values changed
+- MERGE with WHEN MATCHED THEN UPDATE, then verify upsert
+- MERGE with WHEN MATCHED THEN DELETE, then verify conditional delete
+- MERGE with WHEN NOT MATCHED THEN INSERT, then verify new rows added
+- Concurrent MERGE operations, then verify conflict detection
+- MERGE with schema mismatch, then verify error handling
 
 ### dbt Compatibility Tests
 
-- `dbt run` with `incremental` materialization strategy → MERGE INTO
-- `dbt run` with `delete+insert` strategy → DELETE + INSERT
+- `dbt run` with `incremental` materialization strategy maps to MERGE INTO
+- `dbt run` with `delete+insert` strategy maps to DELETE + INSERT
 - Verify `dbt test` passes after incremental runs
 
 ## Acceptance Criteria
@@ -211,7 +211,7 @@ MERGE INTO target USING source ON condition
 
 ## Rollback Strategy
 
-Each operation is a single Iceberg snapshot commit. Rollback = revert to previous snapshot via Polaris REST API. No partial state is possible — Iceberg's snapshot isolation guarantees atomicity.
+Each operation is a single Iceberg snapshot commit. Rollback = revert to previous snapshot via Polaris REST API. No partial state is possible. Iceberg's snapshot isolation guarantees atomicity.
 
 If the feature is unstable, the `StatementKind::Merge/Delete` arms in `query_handler.rs` can be reverted to `NotImplemented` in a single commit.
 
@@ -221,7 +221,7 @@ All three operations (DELETE, UPDATE, MERGE INTO) were implemented using the Ris
 
 ## Remaining Action Items
 
-- [ ] **Watch** upstream iceberg-rust Epic #2186 for `OverwriteAction` — migrate from RisingWave fork to official crate when available
+- [ ] **Watch** upstream iceberg-rust Epic #2186 for `OverwriteAction`: migrate from RisingWave fork to official crate when available
 - [x] ~~Implement DELETE FROM~~ (done)
 - [x] ~~Implement UPDATE~~ (done)
 - [x] ~~Implement MERGE INTO~~ (done)

@@ -14,9 +14,9 @@ graph TB
     end
 ```
 
-- **Base:** `debian:bookworm-slim` (~80MB) — provides glibc, OpenSSL, CA certificates
+- **Base:** `debian:bookworm-slim` (~80MB), provides glibc, OpenSSL, CA certificates
 - **User:** Non-root `sqe` (UID 1000)
-- **Entrypoint:** `sqe-server` — the mode is selected via `--mode` flag or `SQE_MODE` env var
+- **Entrypoint:** `sqe-server`, the mode is selected via `--mode` flag or `SQE_MODE` env var
 
 ## Build
 
@@ -73,7 +73,7 @@ docker run --rm -it --network host \
   sqe:latest sqe-cli --host localhost --port 50051 --user alice
 ```
 
-Note: when using `docker exec`, `sqe-cli` connects to `localhost:50051` by default — which is the coordinator running in the same container.
+Note: when using `docker exec`, `sqe-cli` connects to `localhost:50051` by default, which is the coordinator running in the same container.
 
 ## Docker Compose
 
@@ -118,5 +118,5 @@ services:
 | **Version skew** | Coordinator, workers, and CLI are always the same build |
 | **CI/CD** | One image to build, scan, and promote |
 | **K8s simplicity** | Same `image:` field, different `--mode` arg |
-| **Debugging** | `kubectl exec` into any pod → `sqe-cli` is right there |
-| **Size overhead** | Minimal — both roles share 95% of their code |
+| **Debugging** | `kubectl exec` into any pod, and `sqe-cli` is right there |
+| **Size overhead** | Minimal: both roles share 95% of their code |

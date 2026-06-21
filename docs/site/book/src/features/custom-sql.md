@@ -1,6 +1,6 @@
 # Custom SQL Extensions
 
-SQE extends standard SQL with statements for security policy management. These are parsed by wrapping `sqlparser-rs` — we don't fork the parser.
+SQE extends standard SQL with statements for security policy management. These are parsed by wrapping `sqlparser-rs`. We don't fork the parser.
 
 > **Status:** Parser extensions are designed (Phase 5). The parser currently recognizes `GRANT` and `REVOKE` as standard SQL but does not yet handle the custom `ROWS WHERE` and `MASKED WITH` clauses.
 

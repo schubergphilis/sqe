@@ -1,6 +1,6 @@
 # Security & Policy
 
-SQE enforces fine-grained security through **LogicalPlan rewriting** — injecting row filters and column masks into the query plan before DataFusion's optimizer runs.
+SQE enforces fine-grained security through **LogicalPlan rewriting**, injecting row filters and column masks into the query plan before DataFusion's optimizer runs.
 
 > **Status:** The policy enforcement framework is designed and stubbed (Phase 5). Currently, a `PassthroughEnforcer` is active, which returns plans unmodified.
 
@@ -21,9 +21,9 @@ graph TB
 ```
 
 This approach means:
-- **Row filters** are transparent — the user doesn't know they exist
-- **Column masks** block predicate pushdown on raw values — you can't `WHERE ssn = '123-45-6789'` to probe masked data
-- **Denied columns** are invisible — they don't appear in `SELECT *`, not as errors
+- **Row filters** are transparent. The user doesn't know they exist
+- **Column masks** block predicate pushdown on raw values. You can't `WHERE ssn = '123-45-6789'` to probe masked data
+- **Denied columns** are invisible. They don't appear in `SELECT *`, not as errors
 - **The optimizer can push user predicates through row filters** but not through column masks
 
 ## Policy Enforcer Trait
@@ -40,9 +40,9 @@ pub trait PolicyEnforcer: Send + Sync {
 ```
 
 Implementations:
-- **PassthroughEnforcer** — returns plan unchanged (current default)
-- **OPA Enforcer** — queries Open Policy Agent for policies (planned)
-- **Cedar Enforcer** — evaluates AWS Cedar policies locally (planned)
+- **PassthroughEnforcer**: returns plan unchanged (current default)
+- **OPA Enforcer**: queries Open Policy Agent for policies (planned)
+- **Cedar Enforcer**: evaluates AWS Cedar policies locally (planned)
 
 ## Planned SQL Extensions
 

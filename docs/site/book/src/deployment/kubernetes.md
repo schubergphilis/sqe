@@ -49,7 +49,7 @@ helm install sqe deploy/helm/sqe/ \
   --set secrets.SQE_STORAGE__S3_SECRET_KEY=minioadmin
 ```
 
-Workers are **disabled by default** — the coordinator runs queries locally.
+Workers are **disabled by default**. The coordinator runs queries locally.
 
 ### Distributed (production)
 
@@ -202,7 +202,7 @@ kubectl logs deploy/sqe-coordinator -f
 kubectl logs deploy/sqe-worker -f
 ```
 
-Logs are structured JSON — pipe to `jq` for readability:
+Logs are structured JSON. Pipe to `jq` for readability:
 ```bash
 kubectl logs deploy/sqe-coordinator | jq .
 ```

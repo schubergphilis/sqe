@@ -11,7 +11,7 @@ SQLite-backed Iceberg catalogs in one in-process session. Each catalog shows up
 under its name in 3-part SQL identifiers (`name.namespace.table`), and a single
 query can JOIN across them. No server, no catalog service.
 
-Useful for local analysis that spans more than one warehouse — for example, a
+Useful for local analysis that spans more than one warehouse, for example a
 `sales` catalog and a `ref` (reference-data) catalog, joined in one query.
 
 ## How it works
@@ -38,7 +38,7 @@ Useful for local analysis that spans more than one warehouse — for example, a
 
 Full seed scripts and captured output are in the repo:
 
-**→ [quickstart/attach-catalogs/](https://github.com/schubergphilis/sqe/tree/main/quickstart/attach-catalogs/)**
+**See: [quickstart/attach-catalogs/](https://github.com/schubergphilis/sqe/tree/main/quickstart/attach-catalogs/)**
 
 ```bash
 cd quickstart/attach-catalogs
