@@ -95,7 +95,7 @@ sequenceDiagram
 
 ## Single-Node vs Distributed
 
-SQE starts in **single-node mode** by default — the coordinator executes queries locally using DataFusion. No workers needed.
+SQE starts in **single-node mode** by default. The coordinator executes queries locally using DataFusion. No workers needed.
 
 For larger deployments, enable workers:
 

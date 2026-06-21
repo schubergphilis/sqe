@@ -1,4 +1,4 @@
-# SQE — Sovereign Query Engine
+# SQE: Sovereign Query Engine
 
 **SQE** is a Rust-based distributed SQL query engine for [Apache Iceberg](https://iceberg.apache.org/) tables. It replaces a patched Trino fork with a purpose-built engine based on [Apache DataFusion](https://datafusion.apache.org/) and [iceberg-rust](https://github.com/apache/iceberg-rust).
 

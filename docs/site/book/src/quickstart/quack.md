@@ -11,16 +11,16 @@ and query a remote engine as though it were a local database.
 
 SQE speaks Quack **both ways**:
 
-- **As a server** — a DuckDB client queries SQE's catalogs over the Quack
+- **As a server**: a DuckDB client queries SQE's catalogs over the Quack
   endpoint (`quack_port` in the coordinator config).
-- **As a client** — SQE's `quack_query()` table function pulls rows from a
+- **As a client**: SQE's `quack_query()` table function pulls rows from a
   remote Quack endpoint (another SQE instance, or a DuckDB running
   `quack_serve`).
 
 ## How it works
 
 - The stack is a queryable SQE with a Nessie catalog and RustFS warehouse
-  storage — the same base as the [Nessie quickstart](./nessie.md) — plus the
+  storage, the same base as the [Nessie quickstart](./nessie.md), plus the
   Quack endpoint enabled on the coordinator.
 - Setting `quack_port` in the coordinator config is all that is needed to enable
   the endpoint. It serves a `GET /` identification probe and a `POST /quack`
@@ -30,7 +30,7 @@ SQE speaks Quack **both ways**:
   query it over Quack via the `quack_query()` table function.
 - The reverse direction (SQE as a Quack client, pulling from a DuckDB
   `quack_serve` instance) is documented in the repo README and verified
-  separately — SQE's `quack_query()` function is available on every session.
+  separately. SQE's `quack_query()` function is available on every session.
 
 Note that Quack is a **pre-release protocol**: DuckDB plans to stabilize it
 around v2.0, and the client extension ships from `core_nightly`. The round-trip
@@ -51,7 +51,7 @@ works today (validated with duckdb 1.5.3) but is not a stable surface yet.
 
 Full config, `docker compose`, queries, and captured output are in the repo:
 
-**→ [quickstart/quack/](https://github.com/schubergphilis/sqe/tree/main/quickstart/quack/)**
+**See: [quickstart/quack/](https://github.com/schubergphilis/sqe/tree/main/quickstart/quack/)**
 
 ```bash
 cd quickstart/quack

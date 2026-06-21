@@ -50,7 +50,7 @@ graph LR
 
 ## Migration Path
 
-SQE includes an optional **Trino-compatible HTTP endpoint** (`/v1/statement`) that speaks enough of the Trino wire protocol to support existing dashboards and tools during the migration period. This is not a full Trino emulation — it covers `SELECT`, `SHOW`, and basic DDL, enough to keep things running while teams migrate to Flight SQL.
+SQE includes an optional **Trino-compatible HTTP endpoint** (`/v1/statement`) that speaks enough of the Trino wire protocol to support existing dashboards and tools during the migration period. This is not a full Trino emulation. It covers `SELECT`, `SHOW`, and basic DDL, enough to keep things running while teams migrate to Flight SQL.
 
 ```mermaid
 timeline

@@ -20,12 +20,12 @@ succeeding.
   LF-governed Glue database. Because CloudFormation creates the database, Lake
   Formation governs it with no permissions granted by default.
 - **Phase A**: `run.sh` starts SQE and runs `queries.sql`. `CREATE TABLE` fails
-  with an LF `AccessDeniedException` — the principal has no LF permission on the
+  with an LF `AccessDeniedException`: the principal has no LF permission on the
   database.
 - **Grant**: `run.sh` calls `aws lakeformation grant-permissions` to give the
   principal `CREATE_TABLE`, `ALTER`, `DROP`, and `DESCRIBE` on the database.
 - **Phase B**: `run.sh` restarts SQE (to flush any cached state) and runs the
-  same queries. `CREATE TABLE` → `INSERT` → `SELECT` all succeed.
+  same queries. `CREATE TABLE`, then `INSERT`, then `SELECT` all succeed.
 - CDK destroy removes the database, bucket, and LF grant. Nothing is left behind.
 
 Note the boundary: this quickstart demonstrates **table- and database-level** LF
@@ -38,8 +38,8 @@ masking is a separate policy engine (OPA/Cedar plan rewriting).
 
 - LF enforcement in action: `CREATE TABLE` denied before the grant, succeeding
   after.
-- The deny → grant → succeed arc captured in a single `run.sh` run.
-- Full create/write/read round-trip in Phase B: `CREATE TABLE` → `INSERT` →
+- The deny, grant, succeed arc captured in a single `run.sh` run.
+- Full create/write/read round-trip in Phase B: `CREATE TABLE`, then `INSERT`, then
   `SELECT … GROUP BY`.
 - Clean teardown: no stack, database, bucket, or LF grants left in the account.
 
@@ -49,7 +49,7 @@ masking is a separate policy engine (OPA/Cedar plan rewriting).
 
 Full config, CDK stack, `docker compose`, queries, and captured output are in the repo:
 
-**→ [quickstart/glue-lake-formation/](https://github.com/schubergphilis/sqe/tree/main/quickstart/glue-lake-formation/)**
+**See: [quickstart/glue-lake-formation/](https://github.com/schubergphilis/sqe/tree/main/quickstart/glue-lake-formation/)**
 
 ```bash
 cd quickstart/glue-lake-formation

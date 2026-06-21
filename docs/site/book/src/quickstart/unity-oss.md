@@ -34,7 +34,7 @@ the boundary. For full read and write against an Iceberg REST catalog, use the
 - Catalog enumeration: `SHOW SCHEMAS` and `SHOW TABLES` return the Unity
   namespace and bundled table.
 - The read boundary: a `SELECT` on the bundled table is denied by Unity OSS (not
-  a SQE limitation — SQE's REST path is the same one that does full read/write
+  a SQE limitation; SQE's REST path is the same one that does full read/write
   against Polaris and Nessie).
 
 **Status:** validated (2026-06-06).
@@ -43,7 +43,7 @@ the boundary. For full read and write against an Iceberg REST catalog, use the
 
 Full config, `docker compose`, queries, and captured output are in the repo:
 
-**→ [quickstart/unity-oss/](https://github.com/schubergphilis/sqe/tree/main/quickstart/unity-oss/)**
+**See: [quickstart/unity-oss/](https://github.com/schubergphilis/sqe/tree/main/quickstart/unity-oss/)**
 
 ```bash
 cd quickstart/unity-oss

@@ -58,9 +58,9 @@ Keycloak OIDC authentication.
 
 | Module | Contents |
 |---|---|
-| `authenticator.rs` | `Authenticator` — ROPC grant, token refresh, background refresh task |
-| `keycloak.rs` | `KeycloakClient` — HTTP calls to Keycloak token endpoint, role extraction |
-| `token_cache.rs` | `TokenCache` — DashMap of session → cached tokens, expiry tracking |
+| `authenticator.rs` | `Authenticator`: ROPC grant, token refresh, background refresh task |
+| `keycloak.rs` | `KeycloakClient`: HTTP calls to Keycloak token endpoint, role extraction |
+| `token_cache.rs` | `TokenCache`: DashMap of session to cached tokens, expiry tracking |
 
 ### sqe-catalog
 
@@ -68,10 +68,10 @@ Iceberg REST catalog client (wraps iceberg-rust).
 
 | Module | Contents |
 |---|---|
-| `rest_catalog.rs` | `SessionCatalog` — per-user catalog with bearer token, namespace/table ops |
-| `catalog_provider.rs` | `SqeCatalogProvider` — DataFusion `CatalogProvider` bridge |
-| `schema_provider.rs` | `SqeSchemaProvider` — DataFusion `SchemaProvider` for Iceberg namespaces |
-| `table_provider.rs` | Iceberg → DataFusion `TableProvider` |
+| `rest_catalog.rs` | `SessionCatalog`: per-user catalog with bearer token, namespace/table ops |
+| `catalog_provider.rs` | `SqeCatalogProvider`: DataFusion `CatalogProvider` bridge |
+| `schema_provider.rs` | `SqeSchemaProvider`: DataFusion `SchemaProvider` for Iceberg namespaces |
+| `table_provider.rs` | Iceberg to DataFusion `TableProvider` |
 | `credential_vending.rs` | Extract S3 credentials from Polaris table load response |
 | `iceberg_scan.rs` | Iceberg scan configuration |
 | `info_schema.rs` | Virtual `information_schema` (tables, schemata, columns) |
@@ -82,7 +82,7 @@ SQL parsing and statement classification.
 
 | Module | Contents |
 |---|---|
-| `classifier.rs` | `parse_and_classify(sql)` → `StatementKind`, routes all SQL statement types |
+| `classifier.rs` | `parse_and_classify(sql)` to `StatementKind`, routes all SQL statement types |
 
 ### sqe-policy
 
@@ -98,8 +98,8 @@ Distributed query planning.
 
 | Module | Contents |
 |---|---|
-| `scan_task.rs` | `ScanTask` — serializable message from coordinator to worker |
-| `splitter.rs` | `split_files()` — divide data files across workers |
+| `scan_task.rs` | `ScanTask`: serializable message from coordinator to worker |
+| `splitter.rs` | `split_files()`: divide data files across workers |
 
 ### sqe-coordinator
 
@@ -107,10 +107,10 @@ The coordinator: SQL routing, session management, write handling.
 
 | Module | Contents |
 |---|---|
-| `flight_sql.rs` | `SqeFlightSqlService` — Arrow Flight SQL server (735 lines) |
-| `query_handler.rs` | `QueryHandler` — central query routing and execution (596 lines) |
-| `session_manager.rs` | `SessionManager` — session lifecycle, token refresh integration |
-| `worker_registry.rs` | `WorkerRegistry` — worker discovery, health checking |
+| `flight_sql.rs` | `SqeFlightSqlService`: Arrow Flight SQL server (735 lines) |
+| `query_handler.rs` | `QueryHandler`: central query routing and execution (596 lines) |
+| `session_manager.rs` | `SessionManager`: session lifecycle, token refresh integration |
+| `worker_registry.rs` | `WorkerRegistry`: worker discovery, health checking |
 | `catalog_ops.rs` | DDL operations (DROP TABLE, CREATE/DROP SCHEMA) |
 | `write_handler.rs` | CTAS and INSERT INTO handling |
 | `writer.rs` | Parquet file writing to S3 |
@@ -124,8 +124,8 @@ Stateless scan executor.
 
 | Module | Contents |
 |---|---|
-| `executor.rs` | `execute_scan(ScanTask)` — read Parquet from S3, return Arrow batches |
-| `flight_service.rs` | `WorkerFlightService` — Flight server for receiving scan tasks |
+| `executor.rs` | `execute_scan(ScanTask)`: read Parquet from S3, return Arrow batches |
+| `flight_service.rs` | `WorkerFlightService`: Flight server for receiving scan tasks |
 
 ### sqe-cli
 
@@ -135,8 +135,8 @@ Interactive SQL client.
 |---|---|
 | `main.rs` | CLI argument parsing (clap), REPL loop, auth flow |
 | `client.rs` | `SqlClient` trait, `QueryResult` type |
-| `flight.rs` | `FlightClient` — Flight SQL client with handshake and token auth |
-| `http.rs` | `HttpClient` — Trino HTTP protocol client |
+| `flight.rs` | `FlightClient`: Flight SQL client with handshake and token auth |
+| `http.rs` | `HttpClient`: Trino HTTP protocol client |
 | `display.rs` | Output formatting: ASCII table, CSV, JSON |
 
 ### sqe-metrics
@@ -145,9 +145,9 @@ Observability stack.
 
 | Module | Contents |
 |---|---|
-| `lib.rs` | `MetricsRegistry` — Prometheus counters, histograms, gauges |
+| `lib.rs` | `MetricsRegistry`: Prometheus counters, histograms, gauges |
 | `server.rs` | Prometheus HTTP `/metrics` endpoint (axum) |
-| `audit.rs` | `AuditLogger` — JSONL audit log writer |
+| `audit.rs` | `AuditLogger`: JSONL audit log writer |
 | `otel.rs` | OpenTelemetry init (traces, metrics, logs via OTLP/gRPC) |
 
 ### sqe-trino-compat
@@ -157,8 +157,8 @@ Trino wire protocol compatibility layer.
 | Module | Contents |
 |---|---|
 | `server.rs` | Trino HTTP server (`/v1/statement` endpoint) |
-| `protocol.rs` | RecordBatch → Trino JSON response serialization |
-| `types.rs` | Arrow → Trino type mapping |
+| `protocol.rs` | RecordBatch to Trino JSON response serialization |
+| `types.rs` | Arrow to Trino type mapping |
 
 ## Key External Dependencies
 

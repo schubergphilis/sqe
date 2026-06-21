@@ -345,7 +345,7 @@ Complete migration from Trino DCAF fork.
 
 - Full Trino wire protocol compatibility for remaining tools
 - Dashboard migration playbook (Superset, Grafana, etc.)
-- JDBC driver migration guide (Trino JDBC → Flight SQL JDBC)
+- JDBC driver migration guide (Trino JDBC to Flight SQL JDBC)
 - Performance parity validation (benchmark comparison)
 - Runbook for operators
 - Trino fork sunset and decommission

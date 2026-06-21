@@ -74,7 +74,7 @@ For S3 paths, globbing is applied to the key prefix after the bucket name.
 
 ## Using with CTAS for data loading
 
-The primary use case for `read_parquet()` is ingesting external Parquet data into Iceberg tables via CTAS. This avoids an intermediate format conversion step — the Parquet files are read directly and written as Iceberg data files in one operation.
+The primary use case for `read_parquet()` is ingesting external Parquet data into Iceberg tables via CTAS. This avoids an intermediate format conversion step. The Parquet files are read directly and written as Iceberg data files in one operation.
 
 ```sql
 -- Load TPC-H lineitem from local disk

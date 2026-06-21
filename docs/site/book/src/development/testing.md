@@ -183,14 +183,14 @@ s3_path_style = true
 
 ## Benchmark Testing
 
-Beyond unit and integration tests, SQE ships with `sqe-bench` — a benchmark CLI that validates SQL correctness and measures performance across industry-standard query suites.
+Beyond unit and integration tests, SQE ships with `sqe-bench`, a benchmark CLI that validates SQL correctness and measures performance across industry-standard query suites.
 
 Benchmark tests differ from integration tests in scope and purpose:
 
 | | Integration tests | Benchmark tests |
 |---|---|---|
 | Data | Synthetic fixtures (small) | TPC/SSB scale factor data (GB scale) |
-| Queries | Targeted feature tests | Full benchmark query suites (22–99 queries) |
+| Queries | Targeted feature tests | Full benchmark query suites (22-99 queries) |
 | Validation | Pass/fail assertions | PASS / DIFF / FAIL / SKIP / ERROR with timing |
 | Purpose | Regression detection | SQL correctness + performance tracking |
 
@@ -218,7 +218,7 @@ cargo run -p sqe-bench -- test tpch --scale 1 \
 |-----------|---------|-------|
 | `tpch` | 22 | Standard first check for any SQL engine |
 | `tpcds` | 99 | Complex SQL: correlated subqueries, window functions, GROUPING SETS |
-| `ssb` | 13 | Fast smoke test — denormalized star schema |
+| `ssb` | 13 | Fast smoke test: denormalized star schema |
 | `tpcc` | 8 | OLTP reads; write queries skip until DELETE/MERGE land |
 | `tpce` | 11 | Brokerage OLTP reads |
 | `tpcbb` | 10 | SQL-only subset over TPC-DS data |

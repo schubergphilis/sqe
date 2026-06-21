@@ -1,6 +1,6 @@
 # Security & Policy
 
-SQE enforces fine-grained security through **LogicalPlan rewriting** — injecting row filters and column masks into the query plan before DataFusion's optimizer runs.
+SQE enforces fine-grained security through **LogicalPlan rewriting**, injecting row filters and column masks into the query plan before DataFusion's optimizer runs.
 
 > **Status:** The plan-rewriting policy enforcer is implemented and pluggable, and it is **off by default**. The default policy engine is `passthrough` (`PassthroughEnforcer`), which returns plans unmodified, so enforcement is opt-in. The shipped, wired enforcement backend is Apache Ranger (with an in-memory store for dev and tests); OPA and Cedar are experimental and not yet wired. A default open-source deployment runs without any of this. See [GRANT and REVOKE](../sql-reference/grant-revoke.md) for the SQL surface and the Chameleon / SBP note.
 
@@ -21,9 +21,9 @@ graph TB
 ```
 
 This approach means:
-- **Row filters** are transparent — the user doesn't know they exist
-- **Column masks** block predicate pushdown on raw values — you can't `WHERE ssn = '123-45-6789'` to probe masked data
-- **Denied columns** are invisible — they don't appear in `SELECT *`, not as errors
+- **Row filters** are transparent. The user doesn't know they exist
+- **Column masks** block predicate pushdown on raw values. You can't `WHERE ssn = '123-45-6789'` to probe masked data
+- **Denied columns** are invisible. They don't appear in `SELECT *`, not as errors
 - **The optimizer can push user predicates through row filters** but not through column masks
 
 ## Policy Enforcer Trait
