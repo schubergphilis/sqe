@@ -1,3 +1,4 @@
+pub mod export;
 mod chain;
 mod event;
 mod logger;
@@ -6,6 +7,7 @@ mod redact;
 mod sink;
 mod tag_lookup;
 
+pub use export::SeqCursor;
 pub use chain::{verify_chain, ChainError, HashChain};
 pub use event::{
     Actor, AuditEvent, AuditKind, Integrity, ObjectType, Outcome, PolicyAudit, QueryInfo,
