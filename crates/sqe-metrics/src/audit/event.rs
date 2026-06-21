@@ -149,6 +149,22 @@ pub struct AuditEvent {
     pub integrity: Integrity,
 }
 
+impl Actor {
+    /// Construct an `Actor` from the session user's identity fields.
+    ///
+    /// All optional fields accept `None` when the underlying identity provider
+    /// did not supply them (e.g. a token without an `email` claim).
+    pub fn from_parts(
+        username: String,
+        subject: Option<String>,
+        email: Option<String>,
+        roles: Vec<String>,
+        groups: Vec<String>,
+    ) -> Self {
+        Self { username, subject, email, roles, groups }
+    }
+}
+
 /// Shared test fixture: a minimal valid Query event for use across test modules.
 #[cfg(test)]
 pub(crate) fn sample_query_event() -> AuditEvent {
@@ -225,6 +241,22 @@ mod tests {
             client_ip: Some("10.0.0.1".into()),
             integrity: Integrity::default(),
         }
+    }
+
+    #[test]
+    fn actor_from_parts_populates_all_fields() {
+        let a = Actor::from_parts(
+            "alice".into(),
+            Some("u1".into()),
+            Some("a@x.io".into()),
+            vec!["r".into()],
+            vec!["g".into()],
+        );
+        assert_eq!(a.username, "alice");
+        assert_eq!(a.subject, Some("u1".to_string()));
+        assert_eq!(a.email, Some("a@x.io".to_string()));
+        assert_eq!(a.roles, vec!["r".to_string()]);
+        assert_eq!(a.groups, vec!["g".to_string()]);
     }
 
     #[test]
