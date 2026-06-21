@@ -1562,10 +1562,11 @@ impl QueryHandler {
                         peak_memory_bytes: pm.peak_memory_bytes,
                     }),
                     query: Some(sqe_metrics::audit::QueryInfo {
-                        // Pass sql text directly. The worker thread (apply_gdpr_masking
-                        // in the logger) will apply GDPR/PII masking before the event
-                        // reaches the sink, matching the redaction contract for log_event.
-                        // Do NOT double-redact here (no redact_pii call at this site).
+                        // Pass sql text directly. The worker thread always applies
+                        // redact_pii to query.text before chain stamping and writing.
+                        // When GDPR config is active, GDPR-tag masking runs additionally
+                        // via apply_gdpr_masking (which calls redact_pii internally).
+                        // Do NOT redact here: caller-side redaction would double-apply.
                         text: Some(sql.to_string()),
                         query_hash: sqe_metrics::audit::query_hash(sql),
                         statement_type: kind_name,

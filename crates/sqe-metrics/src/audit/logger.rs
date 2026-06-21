@@ -543,14 +543,31 @@ impl AuditLogger {
         query.text = Some(out);
     }
 
+    /// Apply `redact_pii` to `event.query.text` when no GDPR masking is active.
+    ///
+    /// When GDPR masking IS active, `apply_gdpr_masking` runs `redact_pii`
+    /// internally (step 3 of its masking order). This method covers the
+    /// complementary case so that `redact_pii` runs unconditionally on every
+    /// `log_event` path, matching the redaction contract of the legacy `log()` path.
+    fn redact_event_query(event: &mut AuditEvent) {
+        if let Some(ref mut query) = event.query {
+            if let Some(ref text) = query.text.clone() {
+                query.text = Some(redact_pii(text));
+            }
+        }
+    }
+
     /// Write a single canonical `AuditEvent` to active sinks with chain stamping.
     ///
     /// `native_events` controls whether the event is also written to `native_sink`
     /// (native JSON format). When false (Ocsf-only mode), only the OCSF sink
     /// receives canonical events; `native_sink` still handles legacy flat entries.
     ///
-    /// `gdpr`, when `Some`, applies GDPR masking and PII redaction BEFORE chain
-    /// stamping so the chain covers the redacted bytes.
+    /// Redaction order (applied before chain stamping so the chain covers redacted bytes):
+    /// - When `gdpr` is `Some`: GDPR-tag masking runs via `apply_gdpr_masking`,
+    ///   which internally calls `redact_pii` as its step 3.
+    /// - When `gdpr` is `None`: `redact_pii` runs unconditionally via
+    ///   `redact_event_query`, matching the legacy `log()` redaction contract.
     fn write_event(
         native_sink: &mut NativeJsonlSink,
         native_events: bool,
@@ -562,6 +579,8 @@ impl AuditLogger {
     ) {
         if let Some(g) = gdpr {
             Self::apply_gdpr_masking(&mut event, g);
+        } else {
+            Self::redact_event_query(&mut event);
         }
         chain.stamp(&mut event);
         if native_events {
@@ -591,6 +610,8 @@ impl AuditLogger {
         for event in batch.iter_mut() {
             if let Some(g) = gdpr {
                 Self::apply_gdpr_masking(event, g);
+            } else {
+                Self::redact_event_query(event);
             }
             chain.stamp(event);
             if native_events {
@@ -1081,6 +1102,48 @@ mod tests {
         assert_eq!(
             actor_email, "alice@corp.example",
             "actor.email must survive GDPR masking (OCSF accountability requirement)"
+        );
+    }
+
+    /// Regression guard for the PII redaction regression fixed in this commit.
+    ///
+    /// Without GDPR config (`with_gdpr` not called), `log_event` must STILL
+    /// apply `redact_pii` to `query.text` before writing. Prior to the fix,
+    /// the redact_pii call was inside `apply_gdpr_masking` which was only
+    /// invoked when GDPR was configured, so deployments without GDPR leaked
+    /// email/SSN/phone/card literals from WHERE clauses to the audit log.
+    #[test]
+    fn log_event_redacts_pii_without_gdpr_config() {
+        let (_dir, path) = fresh_audit_path("sqe-audit-log-event-pii.jsonl");
+        let path_str = path.to_str().unwrap();
+
+        // No .with_gdpr() call: GDPR masking is NOT configured.
+        let logger = AuditLogger::with_config(path_str, crate::audit::AuditFormat::Native).unwrap();
+
+        let mut ev = crate::audit::sample_query_event();
+        ev.query = Some(crate::audit::QueryInfo {
+            text: Some("SELECT id FROM users WHERE email = 'leak@example.com'".into()),
+            query_hash: "h".into(),
+            statement_type: "query".into(),
+        });
+        logger.log_event(ev);
+        logger.flush();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let line = content.lines().next().expect("at least one line written");
+        let v: serde_json::Value = serde_json::from_str(line)
+            .unwrap_or_else(|e| panic!("line is not valid JSON: {e}\n{line}"));
+
+        // PII must not appear in the written audit line.
+        assert!(
+            !content.contains("leak@example.com"),
+            "PII leaked in audit log (no-GDPR path): {content}"
+        );
+        // redact_pii replaces emails with [EMAIL].
+        let query_text = v["query"]["text"].as_str().unwrap_or("");
+        assert!(
+            query_text.contains("[EMAIL]"),
+            "redact_pii must replace email with [EMAIL], got: {query_text}"
         );
     }
 
