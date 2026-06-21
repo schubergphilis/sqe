@@ -828,3 +828,128 @@ async fn audit_emits_grant_event_for_revoke() {
     let resources = entry["resources"].as_array().expect("resources array");
     assert_eq!(resources[0]["name"].as_str(), Some("orders"));
 }
+
+/// TDD guard for Task 2: streaming SELECT migrates to canonical `AuditEvent`.
+///
+/// Builds a `StreamFinalizer` wired to a real `AuditLogger`, sets an `Actor`
+/// with a known username and a non-empty `resources` list, drives the success
+/// finalization path, flushes, reads the JSONL line, and asserts it is a
+/// canonical `AuditEvent` - not the legacy flat `AuditEntry`.
+///
+/// Assertions mirror the brief's required test contract:
+/// 1. `kind` == "query" (canonical AuditEvent discriminant)
+/// 2. `actor.username` == "auditor" (Actor field populated from session)
+/// 3. `resources` is a non-empty array (Resource list threaded through)
+/// 4. No top-level `statement_type` field (was top-level in AuditEntry)
+/// 5. `integrity.seq` is a u64 (hash-chain populated by the logger)
+#[tokio::test]
+async fn streaming_select_emits_canonical_query_event() {
+    use arrow_array::{Int64Array, RecordBatch};
+    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+    use datafusion::prelude::SessionContext;
+    use futures::StreamExt;
+    use sqe_coordinator::streaming::{StreamFinalizer, TrackedRecordBatchStream};
+    use sqe_coordinator::query_tracker::QueryTracker;
+    use sqe_core::QueryHistoryConfig;
+    use sqe_metrics::audit::{Actor, AuditLogger, ObjectType, Resource};
+    use std::sync::Arc;
+
+    // Build a trivial physical plan via SessionContext (mirrors the inline test).
+    let ctx = SessionContext::new();
+    let df = ctx.sql("SELECT 1 AS x").await.unwrap();
+    let schema: std::sync::Arc<arrow_schema::Schema> =
+        std::sync::Arc::new(df.schema().as_arrow().clone());
+    let plan = df.create_physical_plan().await.unwrap();
+    let runtime = ctx.runtime_env();
+
+    let tracker = Arc::new(QueryTracker::new(&QueryHistoryConfig {
+        max_entries: 128,
+        ttl_secs: 60,
+    }));
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("audit.jsonl");
+    let audit = Arc::new(AuditLogger::new(path.to_str().unwrap()).unwrap());
+
+    // Construct a StreamFinalizer with a known Actor and non-empty resources.
+    let fin = StreamFinalizer {
+        tracker: Arc::clone(&tracker),
+        metrics: None,
+        audit: Some(Arc::clone(&audit)),
+        query_id: uuid::Uuid::now_v7(),
+        username: "auditor".to_string(),
+        session_id: "sess-streaming-1".to_string(),
+        sql: "SELECT 1 AS x".to_string(),
+        kind_name: "Query".to_string(),
+        plan,
+        runtime,
+        start: std::time::Instant::now(),
+        slow_query_threshold_secs: 0,
+        sql_length: 14,
+        tables_touched: vec!["polaris.public.orders".to_string()],
+        policy_summary: sqe_policy::PolicySummary::default(),
+        profile_mode: sqe_core::ProfileMode::Off,
+        actor: Actor::from_parts(
+            "auditor".to_string(),
+            Some("sub-001".to_string()),
+            Some("auditor@example.com".to_string()),
+            vec!["analyst".to_string()],
+            vec![],
+        ),
+        resources: vec![Resource {
+            catalog: Some("polaris".to_string()),
+            namespace: vec!["public".to_string()],
+            name: "orders".to_string(),
+            object_type: ObjectType::Table,
+        }],
+    };
+
+    let qid = fin.query_id;
+    tracker.start(qid, "auditor", None, "SELECT 1 AS x", "sess-streaming-1", None, vec![]);
+
+    // Drive the success path: create a single-batch stream and drain it.
+    let arr = Int64Array::from_iter_values(0..5);
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(arr)],
+    )
+    .unwrap();
+    let s = futures::stream::iter(vec![Ok(batch)]);
+    let inner: datafusion::physical_plan::SendableRecordBatchStream =
+        Box::pin(RecordBatchStreamAdapter::new(Arc::clone(&schema), s));
+    let mut stream = TrackedRecordBatchStream::new(inner, fin, None);
+    while let Some(b) = stream.next().await {
+        let _ = b.unwrap();
+    }
+    drop(stream);
+    audit.flush();
+
+    let content = std::fs::read_to_string(&path).unwrap();
+    assert!(!content.is_empty(), "audit file must have content after flush");
+    let line = content.lines().next().expect("at least one line in audit file");
+    let v: serde_json::Value = serde_json::from_str(line).unwrap();
+
+    // 1. canonical AuditEvent discriminant
+    assert_eq!(v["kind"], "query", "expected kind=query, got: {v}");
+    // 2. Actor field populated from session
+    assert_eq!(v["actor"]["username"], "auditor", "expected actor.username=auditor, got: {v}");
+    // 3. non-empty resources array (we set one resource above)
+    assert!(
+        v["resources"].is_array(),
+        "AuditEvent must carry a structured resources array; got: {v}"
+    );
+    assert!(
+        !v["resources"].as_array().unwrap().is_empty(),
+        "resources array must be non-empty; got: {v}"
+    );
+    // 4. no top-level statement_type (legacy AuditEntry artifact)
+    assert!(
+        v.get("statement_type").is_none() || v["statement_type"].is_null(),
+        "top-level statement_type must not appear in canonical AuditEvent; got: {v}"
+    );
+    // 5. hash-chain integrity.seq populated
+    assert!(
+        v["integrity"]["seq"].is_u64(),
+        "integrity.seq must be a u64; got: {v}"
+    );
+}
