@@ -32,7 +32,7 @@ token_endpoint = "http://localhost:18181/api/catalog/v1/oauth/tokens"
 client_id      = "root"
 
 [catalog]
-polaris_url = "http://localhost:18181/api/catalog"
+catalog_url = "http://localhost:18181/api/catalog"
 warehouse   = "test_warehouse"
 
 [storage]

@@ -88,7 +88,7 @@ is missing or the spill dir points outside it.
 - Secret mismatch: set `workerSecret` once and let the chart inject the same
   value into both tiers. `helm upgrade <release> deploy/helm/sqe --reuse-values
   --set workerSecret.value=<shared>` (or point both at the same
-  `workerSecret.existingSecret`). See `docs/deployment.md` ISSUE-218.
+  `workerSecret.existingSecret`). See [Kubernetes & Helm](../deployment/kubernetes.md) ISSUE-218.
 - OOMKilled: lower `config.worker.memory_limit` to ~75% of the pod limit, or
   raise the pod limit. Roll the workers.
 - Spill on read-only root: confirm the `/tmp` emptyDir mount exists and
@@ -204,7 +204,7 @@ the curl above.
 
 **Symptom.** Coordinator pod restarts with `OOMKilled`, or queries slow down
 and start spilling heavily. Client sessions drop on restart (state is
-process-local; see section on HA in `docs/deployment.md`).
+process-local; see [Kubernetes & Helm](../deployment/kubernetes.md)).
 
 **Likely cause.** A large result set, a heavy single-node plan, or many
 concurrent queries pushed the coordinator past its engine memory limit. Spill

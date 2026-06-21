@@ -259,7 +259,7 @@ warehouse = "s3://my-bucket/warehouse"
 Run with the right AWS credentials:
 
 ```bash
-AWS_PROFILE=my-profile ./target/release/sqe-coordinator ~/sqe-config.toml
+AWS_PROFILE=my-profile ./target/release/sqe-server --config ~/sqe-config.toml
 ```
 
 The AWS SDK reads `AWS_PROFILE`, `AWS_ACCESS_KEY_ID`, `AWS_REGION`,

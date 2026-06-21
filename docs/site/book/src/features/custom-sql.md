@@ -2,7 +2,7 @@
 
 SQE extends standard SQL with statements for security policy management. These are parsed by wrapping `sqlparser-rs` — we don't fork the parser.
 
-> **Status:** Parser extensions are designed (Phase 5). The parser currently recognizes `GRANT` and `REVOKE` as standard SQL but does not yet handle the custom `ROWS WHERE` and `MASKED WITH` clauses.
+> **Status:** Shipped. The parser handles the custom `ROWS WHERE` and `MASKED WITH` clauses and the policy engine enforces them via plan rewriting. Enforcement is **off by default** (`policy.engine = passthrough`, `access_control.backend = none`), so a default open-source deployment runs without it. See [GRANT and REVOKE](../sql-reference/grant-revoke.md) for the full SQL surface, backends, and known gaps.
 
 ## Policy Statements
 
@@ -54,8 +54,8 @@ REVOKE SELECT ON schema.table FROM ROLE role_name;
 -- All grants on a table
 SHOW GRANTS ON schema.table;
 
--- Effective policy for a role (combines all grants, resolves conflicts)
-SHOW EFFECTIVE POLICY ON schema.table FOR ROLE analyst;
+-- Effective grants for a user (combines all grants, resolves role inheritance)
+SHOW EFFECTIVE GRANTS FOR USER "alice";
 ```
 
 ## Parser Strategy
@@ -84,8 +84,8 @@ pub enum StatementKind {
     Query,          // SELECT
     Ctas,           // CREATE TABLE AS SELECT
     Insert,         // INSERT INTO
-    Merge,          // MERGE INTO (planned)
-    Delete,         // DELETE FROM (planned)
+    Merge,          // MERGE INTO
+    Delete,         // DELETE FROM
     Drop,           // DROP TABLE/VIEW
     Rename,         // ALTER TABLE RENAME
     CreateView,     // CREATE VIEW

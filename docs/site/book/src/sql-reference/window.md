@@ -144,7 +144,7 @@ The `, 0` argument fills the first row (where there is no predecessor) with zero
 
 - `QUALIFY` clause (filtering on window-function output without a subquery). DataFusion's parser does not accept `QUALIFY`. Workaround: wrap the SELECT and filter in an outer query, as in the "Top N per group" example above.
 
-The audit row lives in [`features.md`](../../../features.md). Tracked upstream as a parser enhancement.
+The audit row lives in the [feature comparison](https://getsqe.com/compare/features). Tracked upstream as a parser enhancement.
 
 ## Performance notes
 

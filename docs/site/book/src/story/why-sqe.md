@@ -5,7 +5,7 @@
 Our data platform runs on **Apache Iceberg** tables stored in S3, cataloged by **Apache Polaris** (Iceberg REST Catalog), with authentication through **Keycloak OIDC**. We need a SQL query engine that can:
 
 1. Authenticate users through Keycloak
-2. Pass the user's bearer token through to Polaris and S3 (no service account)
+2. Pass the user's bearer token through to Polaris and on the write path (no service account). Read-path S3 access currently uses the configured `[storage]` credentials; per-user read vending is on the roadmap (see [S3 credential vending](../design-notes/s3vending.md))
 3. Enforce fine-grained security (row filters, column masks) per user
 4. Support full SQL for analytics, dbt transformations, and ad-hoc queries
 5. Run on Kubernetes with minimal operational overhead
@@ -33,7 +33,7 @@ graph TB
 
     subgraph "New: SQE"
         C[SQE Coordinator<br/>Rust binary] -->|user bearer token| P2[Polaris]
-        W[SQE Workers] -->|user credentials| S2[S3]
+        W[SQE Workers] -->|"writes: user creds, reads: storage key"| S2[S3]
         C --> W
     end
 
@@ -53,3 +53,5 @@ graph TB
 ## The Name
 
 **Sovereign** — because every query runs with the identity and permissions of the user who submitted it. No service account intermediary. No privilege escalation. The user's token is sovereign.
+
+The scope is precise. The user's bearer token reaches the Polaris catalog (metadata) and the write path per user. The read path currently reads S3 with the configured `[storage]` credentials; per-user read-credential vending is on the roadmap (see [S3 credential vending](../design-notes/s3vending.md)). Catalog permissions and the plan-rewriting policy engine still gate what each user can see, so identity drives authorization even where the read path shares a storage key.

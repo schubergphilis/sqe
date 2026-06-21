@@ -76,7 +76,7 @@
 
 ---
 
-# Quickstart
+# Quickstart Recipes
 
 - [Overview](./quickstart/index.md)
 - [Polaris + Keycloak (client credentials)](./quickstart/polaris-keycloak-client-id.md)
