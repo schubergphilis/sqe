@@ -17,7 +17,7 @@ graph LR
 
 ## Key Properties
 
-- **No service account** — every query runs as the authenticated user. Bearer tokens pass through from client to Polaris catalog and S3 storage.
+- **No service account.** Every query runs as the authenticated user. The user's bearer token passes through to the Polaris catalog (metadata) and on the write path. Read-path S3 access currently uses the configured `[storage]` credentials; per-user read-credential vending is on the roadmap (see [S3 credential vending](./design-notes/s3vending.md)).
 - **Arrow-native** — columnar data flows from Parquet files through the entire query pipeline to the client. No row-based serialization anywhere.
 - **Iceberg-native** — built on iceberg-rust, not a connector bolted onto a generic engine. Partition pruning, metadata caching, and Iceberg v3 support are first-class.
 - **Fine-grained security** — row filters and column masks enforced at the logical plan level, before the optimizer runs. Invisible columns, transparent row filtering, no information leakage.

@@ -10,7 +10,7 @@ SQE is built on the [iceberg-rust](https://github.com/apache/iceberg-rust) libra
 - **Parquet**: 58
 - **Iceberg table format**: V2 and V3. V3 features verified end-to-end (TIMESTAMP_NS, column defaults, equality-delete UPDATE on identifier-fields, partition evolution).
 
-The matrix score against [icebergmatrix.org](https://icebergmatrix.org) is 167/189 (88.4%), placing SQE fifth on the public scoreboard behind only Spark distributions (EMR, AWS Glue, OSS Spark, Dataproc). See [iceberg-matrix.md](../../../iceberg-matrix.md) for the per-cell breakdown and [iceberg-matrix-compare.md](../../../iceberg-matrix-compare.md) for the side-by-side V2/V3 comparison against every other engine on the public scoreboard.
+The matrix score against [icebergmatrix.org](https://icebergmatrix.org) is 167/189 (88.4%), placing SQE fifth on the public scoreboard behind only Spark distributions (EMR, AWS Glue, OSS Spark, Dataproc). See [getsqe.com/compare/iceberg](https://getsqe.com/compare/iceberg) for the per-cell breakdown and the side-by-side V2/V3 comparison against every other engine on the public scoreboard.
 
 ## Architecture
 
@@ -116,7 +116,7 @@ Read-side optimizations:
 - **Partition pruning**: Iceberg manifest stats skip whole partitions that cannot match the query predicate.
 - **Column projection**: only requested columns leave Parquet.
 - **Predicate pushdown**: filters land at the row group level, the page-index level, and the Parquet `RowFilter`.
-- **Runtime filter pushdown**: Phase P shipped a `DynamicPredicate` API that absorbs DataFusion 53 hash-join build-side runtime filters into the same pruning surface. SF10 TPC-H lineitem-heavy queries saw `q06 -51%`, `q07 -31%`, `q14 -33%`. Engineering log at [`docs/features/runtime-filter-pushdown.md`](../../../features/runtime-filter-pushdown.md).
+- **Runtime filter pushdown**: Phase P shipped a `DynamicPredicate` API that absorbs DataFusion 53 hash-join build-side runtime filters into the same pruning surface. SF10 TPC-H lineitem-heavy queries saw `q06 -51%`, `q07 -31%`, `q14 -33%`. Engineering log at [Runtime filter pushdown](../design-notes/runtime-filter-pushdown.md).
 - **Bloom filter consultation**: `write.parquet.bloom-filter-columns` lands bloom offsets in the file footer; DataFusion consults them automatically for literal equality predicates at scan time.
 - **5-layer caching**: REST catalog cache, table metadata cache, manifest cache, SessionContext cache, OAuth token cache. Warm queries hit sub-millisecond planning.
 
