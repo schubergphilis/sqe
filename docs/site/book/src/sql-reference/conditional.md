@@ -100,4 +100,4 @@ Snowflake's `DECODE(expr, search1, result1, ..., default)` is a multi-way condit
 1. The name collides with DataFusion's built-in `decode(input, encoding)`, which decodes base64 / hex strings to binary. Registering a Snowflake-style DECODE under the same name would shadow the encoding helper and break any existing callsite.
 2. `CASE WHEN expr IS NOT DISTINCT FROM s1 THEN r1 ... END` covers the same ground in standard SQL. (`IS NOT DISTINCT FROM` treats NULL = NULL as true.)
 
-The audit row lives in [`features.md`](../../../features.md) so the conflict is visible.
+The audit row lives in the [feature comparison](https://getsqe.com/compare/features) so the conflict is visible.

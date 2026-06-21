@@ -18,7 +18,7 @@ SQE-specific security extensions on top of the SQL standard `GRANT` / `REVOKE`. 
 
 These extensions are parsed in `crates/sqe-sql/src/classifier.rs` (pre-parser scan) and enforced by the policy engine in `crates/sqe-policy/`. The plan rewriter injects row filters above `TableScan` and substitutes column masks before DataFusion's optimizer runs, so the optimizer cannot push user predicates through a mask.
 
-The full design lives in [`docs/openspec.md`](../../../openspec.md). This page is the SQL surface reference.
+This page is the SQL surface reference.
 
 ## Privileges
 
@@ -119,35 +119,48 @@ Useful in scripts that want to bail out before a long-running query if the user 
 | Row filters | `GRANT ... ROWS WHERE` | external (Ranger) | external (Ranger) | no |
 | `SHOW EFFECTIVE GRANTS` | yes | no | no | no |
 | `CHECK ACCESS` (pre-flight) | yes | no | no | no |
-| Per-user OIDC bearer to storage | yes | no (service account) | no (service account) | no |
+| Per-user OIDC bearer to storage | yes (catalog + writes; reads use the configured storage key) | no (service account) | no (service account) | no |
 | Plan-level enforcement | yes (rewriter) | external middleware | external middleware | no |
 
 The structural difference: SQE keeps policy in-engine, plan-rewritten before optimization, and tied to the per-query bearer token. Trino and Spark push the responsibility to Apache Ranger, which lives outside the engine and intercepts at the connector boundary.
 
 ## Backends
 
-`PolicyStore` is pluggable. Three implementations ship today:
+Two orthogonal settings control access control, and both default to off:
 
-| Backend | Use case | Where it lives |
+`[access_control] backend` decides where GRANT/REVOKE are stored and resolved:
+
+| `backend` | Use case | Where it lives |
 |---|---|---|
-| `InMemory` | Single-node dev, tests. Grants stored in a hash map. | `crates/sqe-policy/src/in_memory_store.rs` |
-| `Postgres` | Cluster mode default. Grants persisted in a tenant-scoped table. | `crates/sqe-policy/src/postgres_store.rs` |
-| `OPA` (Open Policy Agent) | Rego-based policy. The store sends the resolved query plan + identity to OPA, OPA returns row filters / column masks as JSON. | `crates/sqe-policy/src/opa_store.rs` |
-| `Cedar` | AWS Cedar-language policy. Same shape as OPA. | `crates/sqe-policy/src/cedar_store.rs` |
+| `none` (default) | OSS default. GRANT/REVOKE parse but are not enforced. | n/a |
+| `polaris` | Grants resolved from Apache Polaris (`PRINCIPAL` / `PRINCIPAL_ROLE` / `CATALOG_ROLE`). | `crates/sqe-policy/src/grants/polaris.rs` |
+| `ranger` | Grants written to Ranger Admin via the Polaris embedded authorizer. | `crates/sqe-policy/src/grants/ranger.rs` |
+| `chameleon` | Schuberg Philis platform API (`GROUP` / `USER` grantees). | platform API client |
 
-Pick a backend in `[security.policy]` of the engine config:
+`[policy] engine` decides how row filters and column masks are evaluated:
+
+| `engine` | Use case | Where it lives |
+|---|---|---|
+| `passthrough` (default) | No enforcement. Plans returned unmodified. | `PassthroughEnforcer` |
+| `in-memory` | Single-node dev and tests. Policies in a hash map. | `crates/sqe-policy/src/policy_store.rs` |
+| `ranger` | Apache Ranger fine-grained policies (row-filter + data-mask), requires `[policy.ranger].url`. | `crates/sqe-policy/src/ranger_store.rs` |
+| `opa` / `cedar` | Defined in config but not yet wired (selecting them errors today). | `crates/sqe-policy/src/opa.rs` (OPA) |
+
+Configure them in the engine TOML:
 
 ```toml
-[security.policy]
-backend = "postgres"        # or "opa", "cedar", "in_memory"
-url = "postgres://policy_db"
+[access_control]
+backend = "ranger"          # none (default) | polaris | ranger | chameleon
+
+[policy]
+engine = "ranger"           # passthrough (default) | in-memory | ranger
 ```
 
-OPA / Cedar add a network round trip per query but let the security team author policy in their language of choice.
+A default OSS deployment leaves both at their defaults and runs the open Iceberg SQL surface with grants parsed but unenforced.
 
 ## Why plan rewriting, not connector hooks
 
-A short rationale (full reasoning in [`docs/openspec.md`](../../../openspec.md)):
+A short rationale:
 
 1. **Optimization safety**: filters added above `TableScan` survive predicate pushdown but cannot be eliminated. Connector-level hooks run after planning and can be bypassed by a clever WHERE clause.
 2. **Information leakage**: a user querying `column_that_is_masked = 'secret'` gets zero rows, exactly as if the column did not exist. PostgreSQL RLS uses the same model.
