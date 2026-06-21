@@ -47,6 +47,7 @@ pub fn to_ocsf(event: &AuditEvent) -> Value {
             "product": { "name": "SQE", "vendor_name": "SQE" },
             "version": "1.3.0",
             "uid": event.integrity.hash,
+            "sequence": event.integrity.seq,
         },
         "actor": { "user": user },
         "unmapped": Value::Object(unmapped),
@@ -121,6 +122,15 @@ mod tests {
         ev.outcome = Outcome::Failure { error_type: Some("PlanError".into()), error_code: Some("E1".into()), message: Some("bad".into()) };
         let v = to_ocsf(&ev);
         assert_eq!(v["status_id"], 2);
+    }
+
+    #[test]
+    fn ocsf_carries_integrity_seq_in_metadata_sequence() {
+        use crate::audit::*;
+        let mut ev = sample_query_event();
+        ev.integrity.seq = 42;
+        let v = to_ocsf(&ev);
+        assert_eq!(v["metadata"]["sequence"], 42);
     }
 
     #[test]
