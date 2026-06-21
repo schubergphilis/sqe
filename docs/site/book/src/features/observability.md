@@ -1,6 +1,6 @@
 # Observability
 
-SQE provides comprehensive observability through Prometheus metrics, OpenTelemetry traces/logs, and structured audit logging.
+SQE provides full observability through Prometheus metrics, OpenTelemetry traces/logs, and structured audit logging.
 
 ## Metrics (Prometheus)
 

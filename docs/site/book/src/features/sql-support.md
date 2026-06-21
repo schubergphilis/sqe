@@ -1,6 +1,6 @@
 # SQL Support
 
-SQE inherits DataFusion's comprehensive SQL support and adds Iceberg-specific operations.
+SQE inherits DataFusion's broad SQL support and adds Iceberg-specific operations.
 
 ## Query Language
 

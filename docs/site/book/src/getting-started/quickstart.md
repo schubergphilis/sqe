@@ -1,13 +1,50 @@
 # Quickstart
 
-Get SQE running locally in under 5 minutes.
+Get SQE running locally in under 5 minutes. Start embedded (no server, no
+catalog, no auth), then move to the full coordinator + workers setup when you
+need a cluster.
 
-## Prerequisites
+## Embedded mode (fastest)
+
+The embedded CLI runs an in-process DataFusion engine. No coordinator, no
+Polaris, no Keycloak, no network listeners. You only need Rust.
+
+```bash
+# Install the CLI (Rust 1.85+: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh)
+cargo install --path crates/sqe-cli
+
+# Start an embedded session (persistent Iceberg catalog under ~/.sqe/warehouse)
+sqe-cli --embedded
+```
+
+Query local and remote files directly:
+
+```sql
+sqe> SELECT * FROM '/data/sales.parquet' LIMIT 5;
+sqe> SELECT * FROM read_csv('s3://bucket/orders.tsv.gz');
+sqe> SELECT * FROM read_delta('/data/delta/sales', version => '5');
+```
+
+Or run a single query without entering the shell:
+
+```bash
+sqe-cli --embedded -e "SELECT COUNT(*) FROM read_parquet('data.parquet')"
+```
+
+Full embedded reference: [Using the CLI](./cli.md).
+
+## Production / cluster setup
+
+The cluster path runs a coordinator (plus optional workers) against a real
+catalog and storage with OIDC auth. It is what you deploy for shared,
+multi-user, secured access.
+
+### Prerequisites
 
 - **Rust** 1.85+ (`curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`)
 - A running data platform stack: **Keycloak**, **Polaris**, **MinIO/S3** (see the quickstart stack in `data-platform/quickstart/full/`)
 
-## 1. Clone and Build
+### 1. Clone and Build
 
 ```bash
 git clone https://github.com/schuberg/sqe.git
@@ -20,7 +57,7 @@ Or use the build script:
 ./scripts/build.sh release
 ```
 
-## 2. Configure
+### 2. Configure
 
 Copy the example config and adjust for your environment:
 
@@ -47,7 +84,7 @@ s3_access_key = "minioadmin"                    # Or set via SQE_STORAGE__S3_ACC
 s3_secret_key = "minioadmin"                    # Or set via SQE_STORAGE__S3_SECRET_KEY
 ```
 
-## 3. Start the Server
+### 3. Start the Server
 
 ```bash
 # Single-node coordinator (default mode)
@@ -62,7 +99,7 @@ INFO Prometheus metrics on port 9090
 INFO SQE coordinator listening on 0.0.0.0:50051
 ```
 
-## 4. Connect with the CLI
+### 4. Connect with the CLI
 
 ```bash
 ./target/release/sqe-cli --host localhost --port 50051
@@ -92,7 +129,7 @@ sqe> SELECT * FROM raw.orders LIMIT 5;
 (5 rows)
 ```
 
-## 5. Run a Single Query
+### 5. Run a Single Query
 
 ```bash
 ./target/release/sqe-cli -H localhost -p 50051 -u alice -e "SELECT COUNT(*) FROM raw.orders;"
@@ -105,7 +142,7 @@ export SQE_PASSWORD=secret
 ./target/release/sqe-cli -e "SHOW TABLES IN raw;"
 ```
 
-## Health Check
+### Health Check
 
 ```bash
 curl http://localhost:9091/healthz   # → ok

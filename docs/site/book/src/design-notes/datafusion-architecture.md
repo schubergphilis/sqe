@@ -158,7 +158,7 @@ struct SovereignIcebergProvider {
 impl TableProvider for SovereignIcebergProvider {
     // Schema from Iceberg metadata
     // scan() → IcebergScan with predicate pushdown to manifest filtering
-    // supports_filters_pushdown() → leverages partition pruning
+    // supports_filters_pushdown() → uses partition pruning
 }
 ```
 

@@ -116,8 +116,18 @@ prefetch_buffer = "32MB"        # Prefetch buffer for overlapping footer reads
 # coalesce_threshold and footer_cache_size are documented in
 # architecture/streaming-execution.md alongside the S3 I/O pipeline.
 
+# Access control and policy are two independent axes. See
+# [GRANT and REVOKE](../sql-reference/grant-revoke.md) for the full model.
+
+[access_control]
+# Where GRANT/REVOKE are stored and resolved.
+backend = "none"                # none (default) | polaris | ranger | chameleon
+
 [policy]
-engine = "passthrough"          # "passthrough" (only option currently; "opa", "cedar" planned)
+# Fine-grained enforcement engine (row filters + column masks).
+# Wired: passthrough (default), in-memory, ranger.
+# opa and cedar are defined but not yet wired; selecting them errors at startup.
+engine = "passthrough"
 
 [session]
 idle_timeout_secs = 900         # 15 min — sessions idle longer are expired

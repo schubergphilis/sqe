@@ -100,6 +100,8 @@ imagePullSecrets: []
 
 ### Coordinator
 
+The coordinator runs as a single replica and is a single point of failure: a restart drops in-flight queries and process-local session state. Coordinator high availability is on the roadmap.
+
 ```yaml
 coordinator:
   replicas: 1

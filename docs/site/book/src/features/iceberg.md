@@ -4,7 +4,7 @@ SQE is built on the [iceberg-rust](https://github.com/apache/iceberg-rust) libra
 
 ## Iceberg version
 
-- **iceberg-rust**: SQE-rebased fork of [risingwavelabs/iceberg-rust](https://github.com/risingwavelabs/iceberg-rust) `dev_rebase_main_20260303` at commit `645f02a4b533`, vendored at `vendor/iceberg-rust/`. Provides `RewriteFilesAction` / `OverwriteFilesAction` (Copy-on-Write DELETE/UPDATE), `PositionDeleteFileWriter` (Merge-on-Read position deletes), and `DeletionVectorWriter` (Iceberg V3) on top of upstream v0.9.0.
+- **iceberg-rust**: SQE-rebased fork of [risingwavelabs/iceberg-rust](https://github.com/risingwavelabs/iceberg-rust) `dev_rebase_main_20260303` at commit `c034b19105fa`, vendored at `vendor/iceberg-rust/`. Provides `RewriteFilesAction` / `OverwriteFilesAction` (Copy-on-Write DELETE/UPDATE), `PositionDeleteFileWriter` (Merge-on-Read position deletes), and `DeletionVectorWriter` (Iceberg V3) on top of upstream v0.9.0.
 - **DataFusion**: 53.0
 - **Arrow**: 58
 - **Parquet**: 58

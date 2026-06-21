@@ -126,7 +126,7 @@ LIMIT 20;
 
 ## Implementation
 
-`read_parquet()` is registered in `sqe-catalog` (or `sqe-functions`) as a DataFusion `TableFunction`. On each invocation:
+`read_parquet()` is registered in `sqe-catalog` as a DataFusion `TableFunction`. On each invocation:
 
 1. The path argument is parsed to detect `s3://` vs local (`/` or `file://`) paths.
 2. For S3: an `AmazonS3Builder` is constructed from the inline named parameters, with fallback to the `StorageConfig` from `sqe-core` for any omitted fields.

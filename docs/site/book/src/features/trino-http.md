@@ -21,9 +21,8 @@ The Trino HTTP listener runs alongside Flight SQL. The default port is `8080`
 (the test/distributed compose files map it to `28080`):
 
 ```toml
-[trino_compat]
-enabled = true
-port    = 8080
+[coordinator]
+trino_http_port = 8080    # 0 to disable
 ```
 
 ### Run
