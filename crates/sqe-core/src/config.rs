@@ -808,6 +808,17 @@ pub enum AuthProviderConfig {
         /// Default: `"realm_access.roles"`.
         #[serde(default = "default_roles_claim")]
         roles_claim: String,
+        /// JWT claim for the subject identifier (`sub`). Default: `"sub"`.
+        /// Distinct from `user_claim`/`user_id`; used to populate `Identity::subject`.
+        #[serde(default = "default_user_claim")]
+        subject_claim: String,
+        /// JWT claim path for the user's email address. Empty string disables extraction.
+        #[serde(default)]
+        email_claim: String,
+        /// Dot-separated JSON path to the groups array in the JWT payload.
+        /// Empty string disables extraction. Separate from `roles_claim`.
+        #[serde(default)]
+        groups_claim: String,
     },
     /// Generic OAuth2 client_credentials grant (e.g. Polaris service token).
     ClientCredentials {
@@ -846,7 +857,7 @@ pub enum AuthProviderConfig {
         /// Expected issuer (`iss` claim). Optional.
         #[serde(default)]
         issuer: Option<String>,
-        /// Expected audience (`aud` claim). Required by default — see
+        /// Expected audience (`aud` claim). Required by default; see
         /// `allow_unbounded_audience` for the explicit opt-out. Without
         /// audience binding, any JWT signed by the configured JWKS issuer
         /// would be accepted (confused-deputy across SaaS apps sharing
@@ -859,6 +870,17 @@ pub enum AuthProviderConfig {
         /// Dot-separated JSON path to roles. Default: `"realm_access.roles"`.
         #[serde(default = "default_roles_claim")]
         roles_claim: String,
+        /// JWT claim for the subject identifier (`sub`). Default: `"sub"`.
+        /// Distinct from `user_claim`/`user_id`; used to populate `Identity::subject`.
+        #[serde(default = "default_user_claim")]
+        subject_claim: String,
+        /// JWT claim path for the user's email address. Empty string disables extraction.
+        #[serde(default)]
+        email_claim: String,
+        /// Dot-separated JSON path to the groups array in the JWT payload.
+        /// Empty string disables extraction. Separate from `roles_claim`.
+        #[serde(default)]
+        groups_claim: String,
         /// Explicit opt-in to accept tokens with any audience. Default
         /// `false`: a missing/empty `audience` then errors at startup.
         /// Setting `true` acknowledges that tokens issued for any service
@@ -3638,6 +3660,9 @@ mod tests {
             client_id: "sqe".to_string(),
             client_secret: "super-secret-value".to_string(),
             roles_claim: "realm_access.roles".to_string(),
+            subject_claim: "sub".to_string(),
+            email_claim: String::new(),
+            groups_claim: String::new(),
         };
         let dbg = format!("{cfg:?}");
         assert!(!dbg.contains("super-secret-value"), "leaked secret: {dbg}");
@@ -4534,6 +4559,7 @@ type = "aws"
                 client_id,
                 client_secret,
                 roles_claim,
+                ..
             } => {
                 assert_eq!(token_url, "https://idp.example.com/token");
                 assert_eq!(client_id, "sqe");
@@ -4563,6 +4589,87 @@ type = "aws"
                 assert_eq!(roles_claim, "realm_access.roles");
             }
             other => panic!("Expected OidcPassword, got: {other:?}"),
+        }
+    }
+
+    /// Task 9: subject_claim/email_claim/groups_claim must round-trip through
+    /// TOML for both `oidc_password` and `bearer_token` variants.
+    /// When omitted, email_claim and groups_claim default to empty string;
+    /// subject_claim defaults to "sub".
+    #[test]
+    fn auth_provider_config_claim_fields_toml_round_trip() {
+        // Case 1: explicit values in oidc_password
+        let with_claims = r#"
+            type = "oidc_password"
+            token_url = "https://idp.example.com/token"
+            client_id = "sqe"
+            email_claim = "email"
+            groups_claim = "groups"
+        "#;
+        let config: AuthProviderConfig = toml::from_str(with_claims).unwrap();
+        match config {
+            AuthProviderConfig::OidcPassword {
+                email_claim,
+                groups_claim,
+                subject_claim,
+                ..
+            } => {
+                assert_eq!(email_claim, "email", "email_claim should be 'email'");
+                assert_eq!(groups_claim, "groups", "groups_claim should be 'groups'");
+                assert_eq!(subject_claim, "sub", "subject_claim should default to 'sub'");
+            }
+            other => panic!("Expected OidcPassword, got: {other:?}"),
+        }
+
+        // Case 2: omitted claim fields default to empty (oidc_password)
+        let omitted_claims = r#"
+            type = "oidc_password"
+            token_url = "https://idp.example.com/token"
+            client_id = "sqe"
+        "#;
+        let config: AuthProviderConfig = toml::from_str(omitted_claims).unwrap();
+        match config {
+            AuthProviderConfig::OidcPassword {
+                email_claim,
+                groups_claim,
+                subject_claim,
+                ..
+            } => {
+                assert_eq!(email_claim, "", "email_claim should default to empty");
+                assert_eq!(groups_claim, "", "groups_claim should default to empty");
+                assert_eq!(subject_claim, "sub", "subject_claim should default to 'sub'");
+            }
+            other => panic!("Expected OidcPassword, got: {other:?}"),
+        }
+
+        // Case 3: explicit values in bearer_token
+        let bearer_with_claims = r#"
+            type = "bearer_token"
+            jwks_url = "https://idp.example.com/.well-known/jwks.json"
+            allow_insecure_jwks = true
+            allow_unbounded_audience = true
+            email_claim = "email"
+            groups_claim = "groups"
+        "#;
+        let config: AuthProviderConfig = toml::from_str(bearer_with_claims).unwrap();
+        match config {
+            AuthProviderConfig::BearerToken {
+                email_claim,
+                groups_claim,
+                subject_claim,
+                ..
+            } => {
+                assert_eq!(email_claim, "email", "bearer email_claim should be 'email'");
+                assert_eq!(
+                    groups_claim, "groups",
+                    "bearer groups_claim should be 'groups'"
+                );
+                assert_eq!(
+                    subject_claim, "sub",
+                    "bearer subject_claim should default to 'sub'"
+                );
+            }
+            other => panic!("Expected BearerToken, got: {other:?}"),
         }
     }
 
@@ -4967,6 +5074,9 @@ otlp_endpoint = ""
                 client_id: "sqe".to_string(),
                 client_secret: "toml-secret".to_string(),
                 roles_claim: "realm_access.roles".to_string(),
+                subject_claim: "sub".to_string(),
+                email_claim: String::new(),
+                groups_claim: String::new(),
             },
             AuthProviderConfig::ClientCredentials {
                 token_endpoint: "http://polaris:8181/oauth/tokens".to_string(),
