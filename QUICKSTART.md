@@ -300,17 +300,17 @@ faster. This is expected.
 
 ## Where to go from here
 
-- **`docs/catalogs.md`**: per-backend reference (full TOML schema,
+- **`docs/site/book/src/getting-started/catalogs.md`**: per-backend reference (full TOML schema,
   cargo features, AWS bucket ARN format).
-- **`docs/datafusion-architecture.md`**: how SQE composes
+- **`docs/site/book/src/design-notes/datafusion-architecture.md`**: how SQE composes
   DataFusion, iceberg-rust, and Arrow Flight.
-- **`docs/features/runtime-filter-pushdown.md`**: engineering log
+- **`docs/site/book/src/design-notes/runtime-filter-pushdown.md`**: engineering log
   of the runtime filter work, including the eight failed attempts
   and what the bench data showed.
-- **`docs/dbt-sqe.md`**: dbt adapter reference, including the
+- **`docs/site/book/src/design-notes/dbt-sqe.md`**: dbt adapter reference, including the
   Trino-compat function shims.
 - **`vendor/iceberg-rust/README.md`**: vendored crates, SQE-only
   patches, alignment plan with upstream.
-- **`docs/ebook/`**: the long-form story of how SQE got built. Read
+- **`docs/site/ebook/`**: the long-form story of how SQE got built. Read
   chapter 06 ("The Catalog Is the API") and chapter 06b ("Speaking
   to Many Catalogs") for the catalog story end-to-end.

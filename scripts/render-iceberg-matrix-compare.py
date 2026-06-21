@@ -2,8 +2,8 @@
 
 Fetches platform support files from the upstream public matrix repo
 (`Neuw84/iceberg-matrix`) using the `gh` CLI, joins them with our local
-`docs/iceberg-matrix-state.json`, and writes a side-by-side comparison
-table to `docs/iceberg-matrix-compare.md`.
+`docs/evidence/iceberg-matrix-state.json`, and writes a side-by-side comparison
+table to `docs/internal/design-archive/iceberg-matrix-compare.md`.
 
 Run from the repo root:
 
@@ -21,7 +21,7 @@ import sys
 from collections import OrderedDict
 
 DATA_DIR = '/tmp/iceberg-matrix-data'
-OUT = 'docs/iceberg-matrix-compare.md'
+OUT = 'docs/internal/design-archive/iceberg-matrix-compare.md'
 UPSTREAM_REPO = 'Neuw84/iceberg-matrix'
 UPSTREAM_DATA_PATH = 'src/data/platforms'
 UPSTREAM_FEATURES = 'src/data/features.json'
@@ -173,7 +173,7 @@ def load_data():
                 if pid in platforms:
                     platforms[pid]['support'][cell_id] = cell
 
-    sqe = json.load(open('docs/iceberg-matrix-state.json'))
+    sqe = json.load(open('docs/evidence/iceberg-matrix-state.json'))
     platforms['sqe'] = {'name': sqe['platform']['name'], 'support': sqe['support']}
     return features, feat_by_id, platforms
 
@@ -264,8 +264,8 @@ def main():
                'scoreboard at [icebergmatrix.org](https://icebergmatrix.org). '
                'Source rubric: [Neuw84/iceberg-matrix]'
                '(https://github.com/Neuw84/iceberg-matrix). SQE data lives in '
-               '[`docs/iceberg-matrix-state.json`](./iceberg-matrix-state.json) '
-               'and is rendered in detail in [`docs/iceberg-matrix.md`]'
+               '[`docs/evidence/iceberg-matrix-state.json`](../../evidence/iceberg-matrix-state.json) '
+               'and is rendered in detail in [`docs/internal/design-archive/iceberg-matrix.md`]'
                '(./iceberg-matrix.md).')
     out.append('')
     out.append('Each cell shows V2/V3 status. Glyphs:')
@@ -323,21 +323,21 @@ def main():
                'platform JSONs at '
                '[`Neuw84/iceberg-matrix/src/data/platforms/`]'
                '(https://github.com/Neuw84/iceberg-matrix/tree/main/src/data/platforms); '
-               'SQE caveats live in [`docs/iceberg-matrix-state.json`](./iceberg-matrix-state.json).')
+               'SQE caveats live in [`docs/evidence/iceberg-matrix-state.json`](../../evidence/iceberg-matrix-state.json).')
     out.append('')
     out.append('## SQE specifics')
     out.append('')
     out.append('Every SQE cell maps to a concrete file path or test name in the repo. '
                'The full per-cell evidence and notes live in '
-               '[`docs/iceberg-matrix.md`](./iceberg-matrix.md). The matrix engineering '
+               '[`docs/internal/design-archive/iceberg-matrix.md`](./iceberg-matrix.md). The matrix engineering '
                'history sits in chapters 16b ("The Matrix and the Quiet Bug") and 16c '
-               '("Following Through") of the ebook in `docs/ebook/`.')
+               '("Following Through") of the ebook in `docs/site/ebook/`.')
     out.append('')
     out.append('Regenerate this comparison: '
                '`python3 scripts/render-iceberg-matrix-compare.py`. The script '
                'fetches the latest platform JSONs from '
                '`Neuw84/iceberg-matrix` via `gh api` and joins them with our '
-               'own `docs/iceberg-matrix-state.json`.')
+               'own `docs/evidence/iceberg-matrix-state.json`.')
     out.append('')
 
     open(OUT, 'w').write('\n'.join(out))
