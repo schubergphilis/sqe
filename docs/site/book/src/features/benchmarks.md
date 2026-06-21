@@ -22,6 +22,50 @@ For the longitudinal view (every benchmark JSON in `benchmarks/results/` plotted
 - **TPC-C and TPC-E** cover OLTP patterns: point lookups, small aggregates, indexed access by key ranges, plus write operations (DELETE, UPDATE) exercised via Copy-on-Write.
 - **TPC-BB** exercises semi-structured data alongside the TPC-DS schema, useful for validating string functions and JSON handling.
 
+## Results (SF1, vs Trino 465)
+
+The numbers below are the latest SF1 run, as of 2026-06-12, against Trino 465 on identical Iceberg tables and S3 storage. All 222 queries pass (222/222). SQE wins six of seven suites at SF1.
+
+| Suite | SQE | Trino | Speedup | Pass |
+|---|---|---|---|---|
+| TPC-E (11) | 9.3s | 172.0s | 18.5x | 11/11 |
+| TPC-BB (10) | 28.0s | 255.7s | 9.1x | 10/10 |
+| TPC-C (8 read) | 0.41s | 2.65s | 6.5x | 8/8 |
+| TPC-DS (99) | 13.4s | 45.6s | 3.4x | 93/99 |
+| ClickBench (43) | 1.3s | 4.46s | 3.4x | 43/43 |
+| TPC-H (22) | 16.8s | 26.7s | 1.6x | 22/22 |
+| SSB (13) | 8.3s | 5.8s | 0.70x | 13/13 |
+
+Run-to-run variance is real, so treat each figure as approximate. The rank order is stable across the last month of runs.
+
+### Where SQE trails
+
+SSB is the one suite SQE loses at SF1: 8.3s against Trino's 5.8s, a 0.70x result. SSB is a denormalized star schema built for fast star-join filtering. Trino ships build-side key sets (bloom filters) into its scans, which prunes the `lineorder` fact table before it is read. SQE's equivalent, shipping build-side key sets to distributed workers, is in progress. The `lineorder` fact has a uniform foreign-key distribution that defeats row-group min/max pruning, so the runtime filter only helps at row level today.
+
+TPC-DS has the most misses at SF1 (93/99). The six gaps are GROUPING SETS edge cases around grand-total row presence; they are the same six since March, not new regressions. TPC-E passes 11/11 but is the suite that historically needed the most work: it joins across 33 tables and uses IN-subquery patterns that DataFusion cannot always decorrelate, so deep-join queries dominate its run time.
+
+The SF1 wins are decisive. At SF10 the picture narrows. On the level rig (Trino 481, totals across runs, single-node / distributed-2-worker / Trino range):
+
+| Suite | SQE single-node | SQE distributed 2w | Trino 481 |
+|---|---|---|---|
+| TPC-H | 130.5s | 95.5s | 106.4s - 138.6s |
+| SSB | 42.0s | 53.6s | 28.0s - 41.1s |
+| TPC-DS | 543.9s | 338.3s | 328.4s - 468.0s |
+
+At SF10, TPC-H distributed (95.5s) lands inside Trino's range, roughly par to ahead. TPC-DS distributed (338.3s) sits inside Trino's range, close. SSB still trails at SF10, the same pattern as SF1. These are SF10 figures on a single rig, not the canonical SF1 results above.
+
+### How it is validated
+
+Timing data is only as good as the result data behind it. Two layers of validation run before any number is trusted.
+
+The first layer is differential validation against Trino. `sqe-bench compare <suite>` runs every query against SQE (Flight SQL) and Trino (HTTP) on the same Iceberg tables and diffs the result rows. A row-count or value mismatch fails the query. A query that returns zero rows on both engines is reported as vacuous, not a match: agreement on nothing validates nothing.
+
+The second layer is an independent data oracle. DuckDB's official `dsdgen` output loads side by side with the generated parquet, with per-table row counts and per-column null fractions checked, and all queries run against both datasets inside DuckDB. A query that returns rows on official data and none on ours is a generator-fidelity bug, found without either SQL engine in the loop.
+
+The oracle earned its keep. It flagged 16 vacuous TPC-DS queries as generator gaps rather than engine bugs, and it settled the one genuine engine disagreement in SQE's favor: TPC-DS q75 differs by two rows because Trino's `DECIMAL(17,2)` division rounds two ratios up past a `< 0.9` filter and drops them. DuckDB matches SQE exactly. The benchmark that looked like an SQE failure was a Trino rounding bug.
+
+For the longitudinal view across every committed run, see the [benchmark history](https://getsqe.com/performance) on getsqe.com.
+
 ## Generating Data
 
 The `generate` command produces Parquet files on local disk or S3. Data is deterministic (seeded) so results are reproducible.
@@ -191,7 +235,7 @@ Any query with `-- requires:` will be `SKIP`ped if SQE does not support that fea
 ### Terminal output
 
 ```
-TPC-H SF1 — Flight SQL (localhost:50051)
+TPC-H SF1 - Flight SQL (localhost:50051)
 ─────────────────────────────────────────
 q01  PASS   1.23s   6001215 rows
 q02  PASS   0.45s       460 rows
@@ -247,107 +291,23 @@ JSON reports are machine-readable and suitable for tracking regressions over tim
 
 ## Historical Performance Tracking
 
-Benchmark JSON results are committed to `benchmarks/results/` for historical comparison. This enables tracking performance regressions and improvements across releases.
-
-### TPC-H SF1: Historical Comparison (Apr 2 baseline vs. Apr 6 streaming execution)
-
-After implementing the streaming execution engine (coordinator spill-to-disk, late materialization, file-level pruning, S3 I/O pipeline, distributed execution), TPC-H SF1 improved 3.1x on a distributed cluster (coordinator + 2 workers) compared to the single-node baseline:
-
-```
-Query   Apr 2 (single-node)   Apr 6 (distributed)   Speedup
-────────────────────────────────────────────────────────────
-q01               3.21s                1.29s     2.5x
-q02               0.89s                0.27s     3.3x
-q03               2.23s                0.94s     2.4x
-q04               1.14s                0.32s     3.6x
-q05               1.89s                0.55s     3.4x
-q06               1.13s                0.30s     3.7x
-q07               2.07s                0.85s     2.4x
-q08               1.81s                0.54s     3.4x
-q09               1.78s                0.60s     3.0x
-q10               2.47s                0.63s     3.9x
-q11               0.74s                0.11s     6.8x
-q12               1.71s                0.57s     3.0x
-q13               1.10s                0.18s     6.1x
-q14               1.46s                0.55s     2.7x
-q15               2.24s                0.72s     3.1x
-q16               0.75s                0.10s     7.4x
-q17               1.89s                0.63s     3.0x
-q18               3.19s                0.74s     4.3x
-q19               1.68s                0.79s     2.1x
-q20               1.39s                0.53s     2.6x
-q21               2.11s                0.68s     3.1x
-q22               0.67s                0.09s     7.7x
-────────────────────────────────────────────────────────────
-TOTAL             37.5s                12.0s     3.1x
-```
-
-Key observations:
-
-- **Metadata-light queries** (q11, q13, q16, q22) see 6-8x speedup: footer cache, file pruning, and scan distribution eliminate I/O overhead
-- **Scan-heavy queries** (q01, q03, q07) see 2-2.5x speedup, proportional to worker count (2 workers)
-- **q18** (the hardest TPC-H query) improved from 3.19s to 0.74s (4.3x), benefiting from distributed aggregation across workers
-- **Single-node with 512MB spill**: 21/22 pass. Only q18 fails due to DataFusion hash aggregate memory limitation (DF#17334). With 1GB+ memory or with workers, all 22 pass.
-
-### Full Benchmark Matrix (Apr 7, 2026, SF1)
-
-| Suite (queries) | single-512mb | single-8gb | distributed-2w |
-|---|---|---|---|
-| TPC-H (22) | 21/22 (29.6s) | 22/22 (28.6s) | 22/22 (13.5s) |
-| TPC-DS (99) | 92/99 (94.1s) | 99/99 (99.4s) | 98/99 (36.1s) |
-| SSB (13) | 4/13 (14.4s) | 13/13 (14.3s) | 13/13 (5.3s) |
-| TPC-C (17) | 17/17 (21.5s) | 17/17 (22.0s) | 17/17 (8.6s) |
-| TPC-E (18) | 12/18 (8.4s) | 13/18 (127.4s) | 10/18 (56.0s) |
-| **Total (169)** | **146 (86%)** | **164 (97%)** | **162 (96%)** |
-
-### Spill behavior across configs
-
-| Config | Sort Spills | Bytes Spilled | Analysis |
-|---|---|---|---|
-| single-512mb | 30 | 1.1 GB | TPC-DS complex sorts spill to disk. 92/99 pass, spill works. |
-| single-8gb | 128 | 27.7 GB | Mostly TPC-E (33-table joins). More spills because more queries run to completion. |
-| distributed-2w | 3 | 49 MB | Near-zero spill. Workers absorb scan/aggregation work. |
-
-The counterintuitive finding: 8GB spills *more* than 512MB. This is because 8GB successfully runs TPC-E queries that 512MB cannot. Those TPC-E queries involve massive multi-table joins that produce 27GB of intermediate sorted data. With 512MB, the same queries OOM before reaching the spill point.
-
-With distribution (2 workers), spill drops to 49MB. Workers handle scan and partial aggregation; the coordinator only merges small result sets.
-
-### Scheduler observations
-
-At SF1, all distributed queries ran locally on the coordinator (`scheduler_decisions{local}=120+`). This is correct: SF1 tables have 1-2 data files each, below the distribution threshold (default: 4 files). The 2.5x speedup comes from streaming execution improvements (spill, scan planning), not from worker distribution. To observe actual worker distribution, run at SF10+ where tables have 10+ files.
-
-### TPC-E: the outlier
-
-TPC-E has the lowest pass rate (56-72%) across all configs:
-- 5 queries blocked by DataFusion's IN(subquery) limitation (cannot decorrelate)
-- Deep join chains across 33 tables produce massive intermediate results
-- Some queries timeout at 600s after spilling 27GB
-
-### Metrics gaps
-
-Several Phase A/B metrics show 0 because the increment calls are not yet wired into the execution path (the infrastructure exists but `metric.inc()` calls are missing):
-- Footer cache hits/misses: `FooterCache` not wired into `IcebergScanExec`
-- File pruning counts: `PruningPredicate` built but counter not incremented
-- Late materialization bytes: RowFilter wired but byte tracking not connected
-- Time to first row: histogram registered but not observed
-
-These are wiring tasks for the next iteration.
+Benchmark JSON results are committed to `benchmarks/results/` for historical comparison. This enables tracking performance regressions and improvements across releases. The committed JSONs feed the per-suite, per-scale, per-query timeline on [getsqe.com/performance](https://getsqe.com/performance); refer there for the longitudinal view of how each suite moved across the optimization work.
 
 ## Comparing against Trino
 
 The benchmark harness can run the same suite against a real Trino on the same
-data, so you can compare SQE and Trino directly. There are two modes:
+data, so you can compare SQE and Trino directly. The [Results section](#results-sf1-vs-trino-465)
+above is the output of exactly this run at SF1. There are two modes:
 
 - **Correctness parity**: `--compare-trino` diffs SQE's results against
   Trino's row-for-row. This is how SQL correctness is validated at scale, not
-  just timing. Small decimal differences on float-heavy aggregates are expected
-  and flagged for investigation rather than treated as failures.
+  just timing. A row-count or value mismatch fails the query. A query that
+  returns zero rows on both engines is reported as vacuous, not a match, because
+  agreement on nothing validates nothing. Small decimal differences on
+  float-heavy aggregates are flagged for investigation rather than treated as
+  failures.
 - **Timing**: the same run records per-query wall-clock for both engines, so a
   head-to-head speed comparison falls out of the parity run.
-
-SQE's own distributed execution path (coordinator + workers, spill-to-disk,
-late materialization, file-level pruning) gives a measured ~3.1× speedup over
-single-node on TPC-H SF1, with metadata-light queries seeing more.
 
 Run a comparison yourself and see the captured numbers in the benchmark
 quickstart: [Benchmarks: TPC-H / TPC-DS / SSB](../quickstart/benchmark.md), or
@@ -359,7 +319,7 @@ in the repo under
 All three scripts support automated use without a TTY:
 
 ```bash
-# Generate data once (idempotent — skip if files exist)
+# Generate data once (idempotent - skip if files exist)
 ./scripts/benchmark-generate-all.sh
 
 # Load all benchmarks
