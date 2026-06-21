@@ -73,13 +73,23 @@ At query dispatch: a floor-availability check plus a max-concurrent cap, express
 
 ### 5. QueryAbortPath (failure-taxonomy-driven)
 
-A typed failure taxonomy modeled on Ballista's reason enum, where each variant tags `retryable` and `counts_to_failure`. Initial variants: `MemoryExhausted` (mid-flight, not retryable as-is, reduce scope) and `Rejected` (admission, retryable later). Cancellation signals all of the query's tasks across workers; each releases pool reservations and deletes spill files, with cleanup guaranteed on panic via drop guards. The client receives a clear typed message and an OCSF audit event records the kill (query id, user, bytes spilled, reason).
+A typed failure taxonomy whose shape is adapted from Ballista's reason enum (`ballista-core/src/error.rs`), where each variant tags `retryable` and `counts_to_failure`. Ballista's value was separating three classes that the eviction bug had blurred; SQE adopts the same three-way split because the disk-backed shuffle (component 3) makes all three real:
 
-Critical correctness rule, drawn directly from the Ballista failure that decided its wind-down: a query-level memory error must never be misclassified as a node failure. In Ballista, a task `InvalidArgument` evicted the whole executor and degraded the cluster. Here, `MemoryExhausted` fails one query and leaves the node serving.
+- Transient I/O. A spill-disk write or read failure, a Flight stream hiccup fetching a spilled partition. Retryable, does not count toward any cap on its own.
+- Query-level. `MemoryExhausted` (mid-flight, not retryable as-is, reduce scope) and `Rejected` (admission, retryable later). Fails one query, never the node.
+- Shuffle-data-loss. A worker holding spilled or materialized shuffle partitions becomes unreachable. Retryable by re-running the producing stage. This class only exists once shuffle is disk-backed, and modeling it now is what lets subsystem D add stage retry without reshaping the error type.
+
+These are SQE variants over SQE's own `SqeError` surface, not Ballista's enum imported. Cancellation signals all of the query's tasks across workers; each releases pool reservations and deletes spill files, with cleanup guaranteed on panic via drop guards. The client receives a clear typed message and an OCSF audit event records the kill (query id, user, bytes spilled, reason).
+
+Critical correctness rule, drawn directly from the Ballista failure that decided its wind-down: a query-level error must never be misclassified as a node failure. In Ballista, a task `InvalidArgument` evicted the whole executor and degraded the cluster. Here, `MemoryExhausted` fails one query and leaves the node serving, and only the shuffle-data-loss class is allowed to count against a node.
 
 ### 6. Observability
 
 Prometheus gauges and counters via `sqe-metrics`: node memory utilization, bytes spilled, queries killed by memory, admissions rejected. EXPLAIN ANALYZE already surfaces `spill_count`, `spilled_bytes`, and `spilled_rows` (`sqe-coordinator/src/explain.rs`); this lifts them to cluster telemetry. The per-query and per-stage telemetry shapes (akin to Ballista's `QueryStageSummary` and `TaskSummary`) extend the existing web UI spec (`2026-06-01-sqe-web-ui-design.md`) rather than introducing a new UI here.
+
+### 7. EncodedStagePlanCache (concurrency hot-path)
+
+At 100 to 300 concurrent queries with multi-stage plans, the coordinator re-serializes physical stage plans on every fragment dispatch. That is CPU and allocation churn on the hottest path exactly when the node is busiest, and the allocation pressure works against the memory guarantee. Adapted from Ballista's encoded-stage-plan memoization: cache the serialized physical plan per stage so re-binding a stage's tasks reuses the encoding instead of re-encoding per fragment. SQE's version keys on our own stage identity and lives next to the existing `channel_pool` and dispatch path (`sqe-coordinator/src/distributed_scan.rs`), reusing our codec rather than Ballista's datafusion-proto default. This is the one borrowed idea that is a throughput lever rather than a safety mechanism, included because dispatch overhead under high concurrency is part of "without interference."
 
 ## Query lifecycle under memory pressure
 
@@ -91,22 +101,35 @@ Prometheus gauges and counters via `sqe-metrics`: node memory utilization, bytes
 
 ## Error handling
 
-- Typed errors with distinct remediation. `MemoryExhausted` (mid-flight, reduce query scope) is separate from `Rejected` (admission, retry later). Both carry node, operator, and requested-versus-available bytes. Each variant carries `retryable` and `counts_to_failure` flags.
+- Typed errors with distinct remediation, in the three classes from component 5. Transient I/O (spill or shuffle-fetch hiccup) retries silently. Query-level: `MemoryExhausted` (mid-flight, reduce query scope) is separate from `Rejected` (admission, retry later); both carry node, operator, and requested-versus-available bytes. Shuffle-data-loss retries the producing stage. Each variant carries `retryable` and `counts_to_failure` flags, and only shuffle-data-loss may count against a node.
 - Deterministic cleanup. Cancellation signals the query's tasks across all workers; each releases pool reservations and deletes spill files. Drop guards run cleanup even on panic, so a killed query never leaks memory or scratch disk.
 - Clear client message plus an OCSF audit event with query id, user, bytes spilled, and kill reason.
 - Coordinator parity. The coordinator final stage is a governed node; final-stage exhaustion fails the one query identically and never the process.
 
 ## Ballista learnings applied
 
-From `docs/ballista-evaluation-learnings.md`:
+The guiding rule: take every smart idea, make each one SQE's own. The prior attempt to adopt Ballista wholesale pulled SQE away from its own backend, codec, scheduler, and per-task STS credential model, because Ballista welds its scheduler to its executor and shuffle protocol. Lifting patterns into our existing types costs none of that. Source references below point into Ballista 53 and `docs/ballista-evaluation-learnings.md` for whoever implements each.
 
-- Disk-materialized shuffle. Ballista executors write shuffle partitions to local disk and serve them over Flight. Adopted as the on-disk format and spill model for `SpillableShuffleReceiver`, kept hybrid rather than always-on.
-- Failure taxonomy enum with `retryable` and `counts_to_failure`. Adopted as the shape of the `QueryAbortPath` error type from day one, so subsystem D slots in cleanly.
-- The cautionary anti-pattern. Ballista evicting a whole executor on a query-level error is the exact failure the blast-radius rule forbids.
-- Task slots. Borrowed as the concurrency-cap unit in `AdmissionGate`, while keeping SQE's superior `WeightedScheduler` for placement.
-- Observability response shapes. Noted as a future hook for the existing web UI spec, not built here.
+Adopted as core in this spec, each re-expressed over SQE types:
 
-We borrow patterns, not the framework. The prior attempt to adopt Ballista pulled SQE away from its own backend, codec, and per-task STS credential model. Lifting these patterns costs none of that.
+- Disk-materialized shuffle (`ballista-scheduler`, executor shuffle path). Ballista writes shuffle partitions to local disk as Arrow IPC and serves them over Flight, always. SQE adapts the on-disk format and the serve-over-Flight idea into `SpillableShuffleReceiver`, but stays memory-first and spills only under pressure, so the common path keeps in-memory streaming latency. Ballista's always-materialize default is exactly what we do not copy.
+- Failure taxonomy with `retryable` and `counts_to_failure` (`ballista-core/src/error.rs`). Ballista separated transient I/O, query-level, and shuffle-data-loss. SQE adopts the three-way split as variants over our own `SqeError`, not their enum, because disk-backed shuffle makes all three real here.
+- The eviction anti-pattern (the bug that decided the wind-down). A query-level error must never be misclassified as node failure. This is the blast-radius rule, stated as a hard correctness constraint rather than a borrowed feature.
+- Task slots as the admission unit. Borrowed only as the concurrency-cap concept in `AdmissionGate`. SQE keeps its `WeightedScheduler` (least-loaded bin-packing), which the eval found ahead of Ballista 53's Bias and RoundRobin slot-binding, so we account memory floors and slots, not slots alone.
+- Encoded-stage-plan memoization. Re-expressed as `EncodedStagePlanCache` over SQE's stage identity and codec, a throughput lever for the high-concurrency dispatch path.
+
+Adopted in spirit, lightly, because disk-backed shuffle enables them and subsystem D will build on them:
+
+- Resolved/UnResolved stage state (`ballista-scheduler/src/state/execution_stage.rs`). Modeling "inputs not yet ready" as a first-class, `resolvable()`-gated state. With shuffle now materializable, a downstream stage's inputs being ready or not becomes explicit, which both the `AdmissionGate` (do not seat a stage whose inputs are not ready) and future stage retry can use. We note the state shape now; we do not build the full machine in this spec.
+- Per-partition attempt tracking (`Vec<usize>` of failure counts alongside the task list). The structure the `counts_to_failure` flag will drive in subsystem D. SQE's existing `FragmentInfo` is the place to adopt the shape when D lands.
+
+Deferred to the web UI spec (`2026-06-01-sqe-web-ui-design.md`), data contract noted here:
+
+- The REST observability shapes (`JobResponse`, `QueryStageSummary`, `TaskSummary`, `ExecutorResponse` with per-stage task duration and input-row percentiles) map almost one-to-one onto SQE's `QueryRecord`, `FragmentInfo`, and `WorkerState`. Component 6's memory and spill telemetry should populate these shapes so the future UI is a rendering layer, not a new data path. The DOT/SVG stage-graph export is a low-effort plan-visualization add for that UI.
+
+Deliberately not taken:
+
+- Ballista's slot-binding policies (ours are better), its lack of scan locality, and its absence of speculative/straggler handling. Straggler handling is a real gap in both systems and is called out as future work to solve on SQE's own terms, not in this spec.
 
 ## Testing strategy
 
