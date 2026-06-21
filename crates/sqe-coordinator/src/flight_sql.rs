@@ -507,12 +507,14 @@ impl SqeFlightSqlService {
 
     /// Emit a Session lifecycle event (OCSF Authorize Session 3003).
     ///
-    /// Called alongside `emit_auth_event` on every successful credential
-    /// exchange (handshake and JWT bearer). Auth events record the
-    /// authentication attempt; Session events record the resulting session
-    /// establishment. The two events are distinct: a replayed session token
-    /// produces no Session event (it doesn't create a new session), while a
-    /// fresh handshake produces both.
+    /// Called ONLY from `do_handshake` on a successful password-credential
+    /// exchange. The JWT bearer path (`get_session_from_request`) deliberately
+    /// does NOT call this function: it mints a new ephemeral session UUID on
+    /// every RPC, so emitting a Session event there would produce one event per
+    /// query rather than one per login. Auth events record authentication
+    /// attempts; Session events record the establishment of a named interactive
+    /// session. A fresh handshake produces both; a per-request JWT bearer
+    /// produces only an Auth event.
     ///
     /// Only emitted on success; eviction and expiry are not yet tracked
     /// (no AuditLogger path from SessionManager without a second wiring).
