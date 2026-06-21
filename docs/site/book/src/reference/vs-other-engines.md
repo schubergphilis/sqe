@@ -19,7 +19,7 @@ Choose Trino when you need its breadth: a wide connector catalog beyond Iceberg,
 
 Choose SQE when per-user identity to the catalog and storage matters, when JVM start time and GC pauses fight your autoscaling, or when maintaining a patched Trino fork for token passthrough is a cost you want to drop. See [Why SQE](../story/why-sqe.md) for the full account of that migration, and [GRANT and REVOKE](../sql-reference/grant-revoke.md#comparison) for the security comparison.
 
-A note on performance: SQE's stated parity goal is within 2x of Trino on TPC-H SF100 (a roadmap target, [Roadmap, Phase 10](../development/roadmap.md#phase-10---performance--reliability-testing-planned)). The benchmark numbers published in the roadmap are SQE measured against itself across scale and topology, not a head-to-head against Trino on identical data. Treat the parity claim as a goal, and measure on your workload.
+A note on performance: at SF1, SQE wins six of seven benchmark suites head-to-head against Trino 465 on identical Iceberg tables and S3 storage, with all 222 queries differentially validated. The one suite it loses is SSB (0.70x), where Trino's build-side key-set shipping prunes the fact table better than SQE's does today. The full table and method are on the [benchmark page](../features/benchmarks.md#results-sf1-vs-trino-465). At SF10 the gap narrows: TPC-H distributed lands roughly par to ahead of Trino, TPC-DS distributed sits inside Trino's range, and SSB still trails. Looking further out, SQE's stated parity goal is within 2x of Trino on TPC-H SF100 (a roadmap target, [Roadmap, Phase 10](../development/roadmap.md#phase-10---performance--reliability-testing-planned)). Treat the SF100 parity claim as a goal, and measure on your workload.
 
 ## SQE vs DuckDB
 

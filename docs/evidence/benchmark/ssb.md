@@ -28,7 +28,7 @@ SSB was the first benchmark to break when SQE's runtime-filter work shipped beca
 
 ## SF10
 
-Four runs. The headline 1.4x speedup vs Trino on this scale is the result of dynamic-filter pushdown plus star-schema join reordering.
+SSB still trails Trino at SF10, the same pattern as SF1. On the level rig (Trino 481), SQE runs 42.0s single-node and 53.6s distributed-2-worker against Trino's 28.0s - 41.1s range. The remaining gap is build-side key-set (bloom filter) selectivity that a serialized range predicate cannot carry to a worker; shipping the key sets to workers is the open work. Dynamic-filter pushdown plus star-schema join reordering closed part of the gap but not all of it.
 
 ![SSB SF10 total](./charts/ssb-sf10-total.png)
 
