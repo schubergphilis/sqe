@@ -2303,11 +2303,17 @@ pub struct AuditConfig {
     /// Output format: "native" (canonical AuditEvent JSON), "ocsf", or "both".
     #[serde(default = "default_audit_format")]
     pub format: String,
-    /// GDPR-tagged fields to mask. Reserved for Task 8 - currently unused.
+    /// Tag names that mark a column as GDPR-sensitive. Any column in a queried
+    /// Iceberg table whose tag set intersects this list has its identifier and
+    /// adjacent literal values removed from the logged SQL text. Empty list
+    /// disables GDPR column masking. Consumed at startup by the coordinator to
+    /// configure GDPR masking on the audit writer thread.
     #[serde(default)]
     pub gdpr_tags: Vec<String>,
-    /// How tagged identifiers are handled: "tokenize" | "drop" | "keep".
-    /// Reserved for Task 8 - currently unused.
+    /// How tagged column identifiers appear after masking: "tokenize" | "drop" | "keep".
+    /// "tokenize" replaces the identifier with a stable per-column token so log
+    /// lines remain correlatable without leaking the column name. Consumed at
+    /// startup alongside `gdpr_tags`.
     #[serde(default = "default_gdpr_identifier_mode")]
     pub gdpr_identifier_mode: String,
     /// Log full result sets for debugging. NEVER enable in production.
