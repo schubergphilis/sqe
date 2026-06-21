@@ -1,0 +1,62 @@
+# Quickstart card metadata: titles, blurbs, grouping, and the experimental flag.
+# Single source of truth for both the /quickstart index and the
+# /quickstart/<name> detail pages. The docsUrl()/repoUrl() helpers stay in code.
+# The page BODY (Goals/Result) is synced + sanitized from source; this is just
+# titles/blurbs/grouping.
+
+groups:
+  - key: Catalog + authentication
+    blurb: Full Iceberg catalogs with real identity, in local Docker.
+    items:
+      - name: polaris-keycloak-client-id
+        title: Polaris + Keycloak (client credentials)
+        blurb: SQE mints each user's token via the OIDC password grant, then passes it through to Polaris.
+      - name: polaris-keycloak-user-token
+        title: Polaris + Keycloak (user token)
+        blurb: Clients bring a pre-minted Keycloak token; SQE validates it and passes it through.
+      - name: nessie
+        title: Project Nessie
+        blurb: "Nessie as the Iceberg REST catalog, auth-less, anonymous SQE."
+      - name: unity-oss
+        title: Unity Catalog OSS
+        blurb: Unity Catalog OSS over Iceberg REST (read-only; catalog-browse demo).
+  - key: AWS managed catalogs
+    blurb: Managed AWS catalogs, bootstrapped and torn down with CDK.
+    items:
+      - name: aws-s3-tables
+        title: AWS S3 Tables
+        blurb: Managed Iceberg; CDK bootstrap + teardown; SQE creates the namespace and round-trips.
+      - name: aws-glue
+        title: AWS Glue Data Catalog
+        blurb: Glue + S3; SQE creates the database and does a full create / write / read round-trip.
+      - name: glue-lake-formation
+        title: AWS Glue + Lake Formation
+        blurb: "Lake-Formation-governed Glue: denied until an explicit LF grant, then succeeds."
+  - key: Embedded
+    blurb: "One binary, no server, DuckDB-shaped local SQL."
+    items:
+      - name: embedded-files
+        title: Query local & remote files
+        blurb: Read CSV / JSON / Parquet directly with the read_* table functions. No server, no catalog.
+      - name: embedded-sqlite-catalog
+        title: Persistent local catalog (SQLite)
+        blurb: A persistent, SQLite-backed Iceberg catalog on local disk.
+      - name: attach-catalogs
+        title: Attach multiple catalogs
+        blurb: Attach several persistent catalogs in one session and JOIN across them.
+      - name: quack
+        title: Quack (DuckDB wire protocol)
+        blurb: SQE's DuckDB Quack RPC endpoint, both directions.
+        experimental: true
+  - key: Operations
+    blurb: Run SQE like you mean it.
+    items:
+      - name: observability
+        title: "Observability: metrics + Grafana"
+        blurb: Scrape SQE's Prometheus metrics with VictoriaMetrics and visualise them in Grafana.
+  - key: Benchmarks
+    blurb: Measure it yourself.
+    items:
+      - name: benchmark
+        title: TPC-H / TPC-DS / SSB
+        blurb: Generate, load, and run the TPC suites against SQE with per-query timings.
