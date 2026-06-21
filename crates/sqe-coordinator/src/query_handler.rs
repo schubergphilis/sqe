@@ -287,6 +287,14 @@ impl QueryHandler {
         &self.write_handler
     }
 
+    /// Returns the audit logger, if one was wired at construction time.
+    ///
+    /// Used by `SqeFlightSqlService` to emit `AuditKind::Auth` events from the
+    /// auth path without duplicating the logger reference.
+    pub fn audit(&self) -> Option<&Arc<sqe_metrics::audit::AuditLogger>> {
+        self.audit.as_ref()
+    }
+
     /// Return the cached per-session [`SessionCatalog`] for the given session.
     ///
     /// This is the same catalog instance that backs the user's queries —

@@ -19,12 +19,18 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use arrow_flight::sql::server::FlightSqlService;
+use arrow_flight::sql::CommandGetCatalogs;
+use arrow_flight::FlightDescriptor;
 use serde_json::Value;
-use sqe_coordinator::{query_tracker::QueryTracker, QueryHandler, RuntimeCatalogRegistry};
+use sqe_auth::{AnonymousProvider, AnonymousProviderConfig};
+use sqe_coordinator::flight_sql::SqeFlightSqlService;
+use sqe_coordinator::{query_tracker::QueryTracker, QueryHandler, RuntimeCatalogRegistry, SessionManager};
 use sqe_core::{SecretStore, Session, SqeConfig};
 use sqe_metrics::audit::AuditLogger;
 use sqe_policy::PassthroughEnforcer;
 use tempfile::TempDir;
+use tonic::Request;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -385,4 +391,103 @@ async fn audit_logs_denied_admin_call_as_error() {
     assert_eq!(entry["status"], "error");
     assert_eq!(entry["statement_type"], "create_secret");
     assert_eq!(entry["username"], "auditor");
+}
+
+/// TDD guard for Task 13: Authentication audit events.
+///
+/// Drives a `SqeFlightSqlService` with an invalid session token (not in the
+/// session map, no dots so it is not treated as a JWT). Asserts that:
+///
+/// 1. An `AuditKind::Auth` event with status "failure" lands in the log.
+/// 2. The raw token string does NOT appear anywhere in the audit file
+///    (no credential leakage, per the CRITICAL constraint in the task brief).
+/// 3. The event carries `error_type == "AuthFailed"`.
+/// 4. `actor.username` is "unknown" (no identity available for a bad token).
+///
+/// `client_ip` is soft-asserted: a synthetic `tonic::Request` has no peer
+/// address, so the field is present but may be an empty string or absent.
+#[tokio::test]
+async fn audit_emits_auth_failure_event_for_invalid_session_token() {
+    let fx = make_fixture();
+
+    // Extract the parts we need before partially moving the fixture.
+    let audit = fx.audit.clone();
+    let log_path = fx.log_path.clone();
+
+    // Build a SessionManager with an anonymous provider. Any JWT validation
+    // attempt will succeed via anonymous, but a plain non-JWT token (no dots)
+    // goes through the session-lookup path, finds nothing, and falls through
+    // to the INVALID_SESSION failure branch.
+    let provider = Arc::new(AnonymousProvider::new(AnonymousProviderConfig::default()));
+    let session_manager = Arc::new(SessionManager::with_provider(provider));
+
+    // Construct the service using the fixture's QueryHandler. The handler was
+    // built with a tempfile-backed AuditLogger, so `query_handler.audit()`
+    // returns Some(...). SqeFlightSqlService::new clones it via audit().
+    let service = SqeFlightSqlService::new(
+        session_manager,
+        Arc::new(fx.handler),
+        minimal_config(),
+    );
+
+    // Craft a request with an invalid Bearer token (no dots, so NOT treated
+    // as a JWT; not in the session map; triggers the INVALID_SESSION branch).
+    let bogus_token = "not-a-real-session-token-xyzzy";
+    let mut req = Request::new(FlightDescriptor::new_cmd(vec![]));
+    req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {bogus_token}").parse().unwrap(),
+    );
+
+    // The call fails with unauthenticated. We don't care about the error, only
+    // that the audit event was written.
+    let _ = service
+        .get_flight_info_catalogs(CommandGetCatalogs {}, req)
+        .await;
+
+    // Flush and read the audit log.
+    audit.flush();
+    let lines = read_audit_lines(&log_path);
+
+    // --- Assertion 1: exactly one auth event was written ---
+    assert_eq!(
+        lines.len(),
+        1,
+        "expected exactly one audit line for the failed auth; got:\n{}",
+        serde_json::to_string_pretty(&serde_json::Value::Array(lines.clone())).unwrap_or_default()
+    );
+    let entry = &lines[0];
+
+    // --- Assertion 2: the event is an Auth kind with failure status ---
+    assert_eq!(
+        entry["kind"].as_str(),
+        Some("auth"),
+        "audit event must have kind 'auth'; got: {entry}"
+    );
+    assert_eq!(
+        entry["status"].as_str(),
+        Some("failure"),
+        "outcome must be failure; got: {entry}"
+    );
+
+    // --- Assertion 3: error_type carries the reason ---
+    assert_eq!(
+        entry["error_type"].as_str(),
+        Some("AuthFailed"),
+        "error_type must be 'AuthFailed'; got: {entry}"
+    );
+
+    // --- Assertion 4: actor username is 'unknown', not the token ---
+    assert_eq!(
+        entry["actor"]["username"].as_str(),
+        Some("unknown"),
+        "actor.username must be 'unknown' for an unidentified caller; got: {entry}"
+    );
+
+    // --- Critical: the raw token must NOT appear anywhere in the file ---
+    let raw_content = std::fs::read_to_string(&fx.log_path).expect("audit file readable");
+    assert!(
+        !raw_content.contains(bogus_token),
+        "token material must not appear in the audit log (credential leak): {raw_content}"
+    );
 }
