@@ -25,14 +25,35 @@ quickstart/
     polaris/bootstrap.sh
     lib.sh
   <name>/
-    README.md               frontmatter + why / how / config / run / output / tested / gotchas
+    README.md               the gold-standard structure (checklist below)
     docker-compose.yml       runnable standalone; mounts _shared/ assets
     sqe.toml or CLI flags    the annotated config
-    run.sh                   up -> bootstrap -> queries -> capture -> (down)
+    run.sh                   up -> bootstrap -> queries -> capture -> (down), plus --check
     queries.sql              the demo queries
     OUTPUT.md                captured real output
     .env.example             defaults (offset ports, placeholder secrets)
 ```
+
+## What every README has
+
+Every quickstart README follows the same structure, so a new user always knows
+where to look. The checklist, in order:
+
+1. **Frontmatter** (`slug`, `title`, `description`) + an H1 and a lead paragraph
+   before the first `##` (the docs.getsqe.com sync reads these).
+2. **What you get** -- the scenario and the use-case (when and why you pick it).
+3. **Prerequisites**.
+4. **Run it** -- the exact commands: `./run.sh`, `./run.sh --down` (or `--clean`
+   for the no-stack embedded ones), and `./run.sh --check` (the assert mode,
+   where the scenario has one).
+5. **How it works** -- the flow that matters for this scenario (auth, data path,
+   catalog federation, embedded, metrics).
+6. **Configuration explained** -- every config file the scenario uses, annotated:
+   `sqe.toml` (or the CLI flags), `.env(.example)`, `docker-compose.yml`, and any
+   `_shared` assets it mounts. This is the section that makes it a starting point.
+7. **Output** -- what a correct run produces (mirrors `OUTPUT.md`).
+8. **How it is tested** -- the `--check` invariants: what "correct" means here.
+9. **Gotchas**.
 
 Run any of them with:
 
@@ -53,6 +74,7 @@ validated from a clean state.
 |---|---|---|
 | [`polaris-keycloak-client-id`](./polaris-keycloak-client-id/) | Polaris + Keycloak; SQE mints user tokens via the OIDC password grant (client credentials) | **validated 2026-06-06** |
 | [`polaris-keycloak-user-token`](./polaris-keycloak-user-token/) | Same stack; clients bring a pre-minted Keycloak token (`--token`), SQE validates + passes it through | **validated 2026-06-06** |
+| [`polaris-ranger-keycloak`](./polaris-ranger-keycloak/) | Polaris + Apache Ranger access control: SQE writes GRANT/REVOKE to Ranger, Polaris enforces, column masks match Spark + Kyuubi byte-for-byte | test harness (`test.sh` + `parity-test.sh`) |
 | [`nessie`](./nessie/) | Project Nessie as the Iceberg REST catalog (auth-less, anonymous SQE) | **validated 2026-06-06** |
 | [`unity-oss`](./unity-oss/) | Unity Catalog OSS over Iceberg REST (read-only upstream; catalog-browse demo) | **validated 2026-06-06** |
 
@@ -78,6 +100,7 @@ validated from a clean state.
 | Quickstart | What it shows | Status |
 |---|---|---|
 | [`observability`](./observability/) | Scrape SQE's Prometheus metrics with VictoriaMetrics + Grafana (provisioned "SQE Overview" dashboard) | **validated 2026-06-07** |
+| [`distributed`](./distributed/) | A real cluster: coordinator + two stateless DataFusion workers over Arrow Flight, querying Polaris + RustFS (worker dispatch, system tables, query history) | `--check` harness (on-demand) |
 
 ### E. Benchmarks
 

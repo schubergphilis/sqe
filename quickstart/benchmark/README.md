@@ -36,12 +36,14 @@ cp .env.example .env
 BENCH=ssb   SCALE=0.1 ./run.sh  # other suite / larger scale
 BENCH=tpcds SCALE=1   ./run.sh
 ./run.sh --down                 # tear everything down
+./run.sh --check                # generate+load+test, then assert no failed queries
 ```
 
 `run.sh` brings the stack up, then runs the three `sqe-bench` phases and captures
-the timing table to [`OUTPUT.md`](./OUTPUT.md).
+the timing table to [`OUTPUT.md`](./OUTPUT.md). `BENCH` and `SCALE` are honored
+by `--check` too, so `BENCH=ssb SCALE=0.1 ./run.sh --check` asserts that suite.
 
-## How the three phases work
+## How it works
 
 ```
 sqe-bench generate  ->  Parquet on the shared bench-data volume
@@ -59,6 +61,43 @@ sqe-bench test      ->  runs benchmarks/queries/<suite>/*.sql over Flight SQL, t
   chosen scale, a query "passes" by executing cleanly (this is a smoke + timing
   run, not a correctness gate).
 
+## Configuration explained
+
+### `sqe.toml` (the engine)
+
+A minimal Nessie-over-RustFS SQE (the same catalog config as the
+[`nessie`](../nessie/) quickstart), with one line that matters for benchmarks:
+
+```toml
+[storage.tvf]
+allow_local_paths = true
+```
+
+- `[storage.tvf] allow_local_paths = true` lets the coordinator's `read_parquet`
+  TVF read the generated Parquet off the shared `bench-data` volume (a local
+  path inside the container). That gate is a security control: it blocks
+  `read_parquet('/etc/shadow')` and metadata-endpoint pivots. It is on here only
+  because the data is staged on a local volume; leave it off in production and
+  stage data in object storage.
+- `[catalogs.nessie]` points at Nessie's `/iceberg` mount; the loaded tables
+  resolve as `nessie.<suite>_sf<scale>.<table>`.
+- Auth is the `anonymous` dev provider, so `sqe-bench` connects with
+  `--username anonymous --password anonymous` and SQE mints a token.
+
+### `.env.example`
+
+`BENCH` (`tpch` | `ssb` | `tpcds`) and `SCALE` (the scale factor) are read by
+`run.sh`, overridable inline. Also sets the RustFS credentials, the offset host
+ports, and `SQE_IMAGE`.
+
+### `docker-compose.yml`
+
+Brings up RustFS + Nessie + the coordinator, and a one-shot `sqe-bench` service
+(built from `Dockerfile.bench`, behind a compose profile) that runs
+generate/load/test. The `bench-data` volume is mounted into both the coordinator
+and `sqe-bench` at the same path so the coordinator can read what the generator
+wrote.
+
 ## Output
 
 From a clean run of the default (`./run.sh`), captured in [`OUTPUT.md`](./OUTPUT.md):
@@ -71,8 +110,16 @@ BENCH_SUMMARY:tpch:22:0:0:0:0:22:378
 
 ## How it is tested
 
-`run.sh` runs generate -> load -> test for TPC-H SF0.01 from a clean state and
-captures the timing table. Validated 2026-06-07 (22/22 pass).
+`./run.sh --check` runs the full generate -> load -> test pipeline and asserts
+the invariants in `run.sh`, against the already-captured test output (no re-run):
+
+- the suite prints a results summary line (`... pass, ...`),
+- there are no failed, diffing, skipped, or errored queries
+  (`0 fail, 0 diff, 0 skip, 0 error`),
+- the machine-parseable `BENCH_SUMMARY:` line is emitted.
+
+The check does not hardcode a query count, so it works for any `BENCH` / `SCALE`.
+Validated 2026-06-07 (TPC-H SF0.01, 22/22 pass).
 
 ## Getting a JSON report on the host
 

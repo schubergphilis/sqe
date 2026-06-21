@@ -38,27 +38,68 @@ quickstart leaves nothing behind.
 ```bash
 cd quickstart/aws-s3-tables
 cp .env.example .env          # set AWS_PROFILE / AWS_REGION
-./run.sh
+./run.sh                      # deploy -> queries -> capture -> tear down
+./run.sh --keep               # same, but leave SQE up and the bucket deployed
+./run.sh --destroy            # just tear down (empty + delete the table bucket)
 ```
 
 `run.sh`: `cdk deploy` (table bucket) -> start SQE -> run [`queries.sql`](./queries.sql)
 (create namespace + table, insert, aggregate) -> capture [`OUTPUT.md`](./OUTPUT.md)
--> delete the table + namespace -> `cdk destroy`. `--keep` leaves it up; `--destroy`
-tears down.
+-> delete the table + namespace -> `cdk destroy`. There is no `--check` mode (the
+run asserts the queries succeed, then destroys the live AWS resources). `--keep`
+leaves it up; `--destroy` runs the teardown on its own.
 
-## Configuration
+## How it works
+
+S3 Tables is AWS's managed Iceberg product, and it bundles the catalog and the
+storage into one service. You create a *table bucket* and namespaces + tables
+live inside it; there is no separate Glue database or S3 warehouse bucket to
+wire up. SQE talks to it over the AWS SDK with the IAM credentials passed into
+the container env (resolved from your `AWS_PROFILE` by `run.sh`).
+
+S3 Tables is a non-REST catalog backend, the same code path as Glue. SQE creates
+the namespace itself via `CREATE SCHEMA`, which makes the calling principal its
+owner, then creates the table, inserts, and reads back, all through the S3
+Tables API.
+
+## Configuration explained
+
+### `sqe.toml` (the engine, templated)
+
+`run.sh` copies `sqe.toml` to `sqe.toml.local`, substitutes
+`__TABLE_BUCKET_ARN__` and `__REGION__` from the CDK outputs, and compose mounts
+the result. The catalog block:
 
 ```toml
 [catalog.backend]
 type = "s3tables"
-table_bucket_arn = "arn:aws:s3tables:<region>:<account>:bucket/<name>"  # run.sh fills this in
+table_bucket_arn = "__TABLE_BUCKET_ARN__"   # arn:aws:s3tables:REGION:ACCOUNT:bucket/NAME
 ```
 
-The s3tables backend registers under the SQL catalog name `iceberg`, so tables
-are `iceberg.<namespace>.<table>`. SQE creates the namespace itself
-(`CREATE SCHEMA`), which makes the caller its owner -- the same Lake-Formation-safe
-pattern as the [aws-glue](../aws-glue/) quickstart. Auth is the `anonymous` dev
-provider (S3 Tables authenticates via AWS IAM).
+- `type = "s3tables"` selects the managed S3 Tables backend. It registers under
+  the legacy SQL catalog name `iceberg`, so tables are
+  `iceberg.<namespace>.<table>`.
+- `table_bucket_arn` is the only catalog coordinate it needs, because S3 Tables
+  is metadata + storage in one. The CDK stack creates the bucket and `run.sh`
+  fills the ARN in.
+- `[catalog] polaris_url = "https://placeholder.invalid"` is the legacy
+  single-catalog block the deserialiser still requires; the s3tables backend
+  ignores it.
+- `[storage] s3_region = "__REGION__"` is all the storage config needed: S3
+  Tables manages its own storage, so there is no endpoint or bucket to set.
+- Auth is the `anonymous` dev provider; S3 Tables authenticates via AWS IAM.
+
+### `.env.example`
+
+`AWS_PROFILE` / `AWS_REGION` (whose credentials and which region), the offset
+host ports, and `SQE_IMAGE` (must include the non-REST write fix that S3 Tables
+needs).
+
+### `docker-compose.yml`
+
+Runs only the SQE coordinator, passes the resolved AWS credentials into the
+container env, mounts `sqe.toml.local` + `queries.sql`, and exposes the offset
+Flight SQL / Trino HTTP ports.
 
 ## Output
 
