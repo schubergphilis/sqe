@@ -249,6 +249,7 @@ impl SessionManager {
             token_expiry,
             identity.roles.clone(),
         )
+        .with_identity(identity.subject.clone(), identity.email.clone(), identity.groups.clone())
     }
 
     /// Look up a session by its ID (bearer token).
@@ -931,6 +932,9 @@ mod tests {
                     user_id: self.user_id.clone(),
                     display_name: self.user_id.clone(),
                     roles: vec!["analyst".to_string()],
+                    subject: None,
+                    email: None,
+                    groups: Vec::new(),
                     catalog_token: Some(t.clone()),
                     refresh_token: None,
                     expires_at: None,

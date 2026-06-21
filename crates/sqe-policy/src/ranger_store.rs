@@ -560,6 +560,9 @@ pub(crate) fn resolve_tag_policies(
     let user = SessionUser {
         username: identity.username.clone(),
         roles: identity.roles.clone(),
+        subject: None,
+        email: None,
+        groups: Vec::new(),
     };
 
     for p in &tag_bundle.policies {

@@ -3657,6 +3657,9 @@ impl QueryHandler {
             sqe_core::session::SessionUser {
                 username: target_user.to_string(),
                 roles: Vec::new(),
+                subject: None,
+                email: None,
+                groups: Vec::new(),
             }
         };
 
