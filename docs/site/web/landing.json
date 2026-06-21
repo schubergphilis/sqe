@@ -1,0 +1,263 @@
+{
+  "heroEyebrow": "Sovereign Query Engine",
+  "heroTitle": "Iceberg-first SQL that scales.",
+  "heroLede": "Run SQE embedded as one binary on your laptop, or distributed across a cluster of stateless workers behind Arrow Flight SQL or Trino HTTP. Same SQL surface, same Iceberg semantics, same identity model. Every query runs as the authenticated user, <strong>no service account, no shared root.</strong>",
+  "heroNote": "Build from source: <code>cargo install --path crates/sqe-cli</code>, Apache-2.0, Rust, no JVM.",
+  "features": [
+    {
+      "title": "One binary, two modes",
+      "body": "Embedded single-process engine <em>and</em> distributed coordinator + stateless workers, the same SQL surface, the same binary."
+    },
+    {
+      "title": "Native Iceberg V2 + V3",
+      "body": "Read <em>and</em> write, not read-only. Position &amp; equality deletes, merge-on-read, copy-on-write, schema evolution."
+    },
+    {
+      "title": "Per-query identity",
+      "body": "OIDC password grant; the user's bearer token is passed through to the catalog and S3 on <em>every</em> query."
+    },
+    {
+      "title": "Policy as plan rewriting",
+      "body": "Row filters and column masks via OPA or Cedar, enforced at the LogicalPlan layer before the optimizer runs."
+    },
+    {
+      "title": "7 catalog backends",
+      "body": "Polaris, Nessie, Unity Catalog OSS, AWS Glue, S3 Tables, Hive Metastore, JDBC, plus Hadoop storage. Multi-cloud."
+    },
+    {
+      "title": "Two wire protocols",
+      "body": "Arrow Flight SQL and Trino HTTP from the same coordinator. Connect existing Trino clients unchanged."
+    },
+    {
+      "title": "Rust, no JVM",
+      "body": "Sub-second cold start. A C++/DuckDB-class footprint with a distributed story the JVM engines charge for."
+    },
+    {
+      "title": "Column-level lineage",
+      "body": "Native OpenLineage 2-0-2 emitter with column-level lineage on writes. File and HTTP sinks, disk-spool fallback."
+    }
+  ],
+  "compareHead": [
+    "",
+    "SQE",
+    "Trino",
+    "DuckDB"
+  ],
+  "compareRows": [
+    {
+      "label": "Embedded mode (one binary)",
+      "cells": [
+        {
+          "t": "yes",
+          "tone": "yes"
+        },
+        {
+          "t": "no",
+          "tone": "no"
+        },
+        {
+          "t": "yes",
+          "tone": "yes"
+        }
+      ]
+    },
+    {
+      "label": "Distributed mode",
+      "cells": [
+        {
+          "t": "yes",
+          "tone": "yes"
+        },
+        {
+          "t": "yes",
+          "tone": "yes"
+        },
+        {
+          "t": "no",
+          "tone": "no"
+        }
+      ]
+    },
+    {
+      "label": "Iceberg V2 + V3 read + write",
+      "cells": [
+        {
+          "t": "native",
+          "tone": "emph"
+        },
+        {
+          "t": "V2 + partial V3"
+        },
+        {
+          "t": "read-only"
+        }
+      ]
+    },
+    {
+      "label": "Per-query OIDC passthrough",
+      "cells": [
+        {
+          "t": "yes",
+          "tone": "yes"
+        },
+        {
+          "t": "service acct only"
+        },
+        {
+          "t": "n/a"
+        }
+      ]
+    },
+    {
+      "label": "OPA / Cedar at LogicalPlan",
+      "cells": [
+        {
+          "t": "yes",
+          "tone": "yes"
+        },
+        {
+          "t": "no",
+          "tone": "no"
+        },
+        {
+          "t": "no",
+          "tone": "no"
+        }
+      ]
+    },
+    {
+      "label": "Multi-catalog in one engine",
+      "cells": [
+        {
+          "t": "7 backends",
+          "tone": "emph"
+        },
+        {
+          "t": "one at a time"
+        },
+        {
+          "t": "per-extension"
+        }
+      ]
+    },
+    {
+      "label": "Wire protocols",
+      "cells": [
+        {
+          "t": "Flight SQL + Trino"
+        },
+        {
+          "t": "Trino HTTP"
+        },
+        {
+          "t": "extension"
+        }
+      ]
+    },
+    {
+      "label": "Runtime",
+      "cells": [
+        {
+          "t": "Rust, no JVM",
+          "tone": "emph"
+        },
+        {
+          "t": "JVM"
+        },
+        {
+          "t": "C++"
+        }
+      ]
+    },
+    {
+      "label": "Cold start",
+      "cells": [
+        {
+          "t": "sub-second",
+          "tone": "yes"
+        },
+        {
+          "t": "tens of seconds"
+        },
+        {
+          "t": "sub-second",
+          "tone": "yes"
+        }
+      ]
+    },
+    {
+      "label": "OpenLineage emitter",
+      "cells": [
+        {
+          "t": "native, column-level",
+          "tone": "emph"
+        },
+        {
+          "t": "plugin"
+        },
+        {
+          "t": "no",
+          "tone": "no"
+        }
+      ]
+    }
+  ],
+  "bench": [
+    {
+      "suite": "TPC-H (22)",
+      "sqe": "16.8s",
+      "trino": "26.7s",
+      "speedup": "1.6x",
+      "pass": "22/22",
+      "win": true
+    },
+    {
+      "suite": "SSB (13)",
+      "sqe": "8.3s",
+      "trino": "5.8s",
+      "speedup": "0.70x slower",
+      "pass": "13/13",
+      "win": false
+    },
+    {
+      "suite": "TPC-DS (99)",
+      "sqe": "13.4s",
+      "trino": "45.6s",
+      "speedup": "3.4x",
+      "pass": "93/99",
+      "win": true
+    },
+    {
+      "suite": "TPC-C (8 read)",
+      "sqe": "0.41s",
+      "trino": "2.65s",
+      "speedup": "6.5x",
+      "pass": "8/8",
+      "win": true
+    },
+    {
+      "suite": "TPC-E (11)",
+      "sqe": "9.3s",
+      "trino": "172.0s",
+      "speedup": "18.5x",
+      "pass": "11/11",
+      "win": true
+    },
+    {
+      "suite": "TPC-BB (10)",
+      "sqe": "28.0s",
+      "trino": "255.7s",
+      "speedup": "9.1x",
+      "pass": "10/10",
+      "win": true
+    },
+    {
+      "suite": "ClickBench (43)",
+      "sqe": "1.3s",
+      "trino": "4.46s",
+      "speedup": "3.4x",
+      "pass": "43/43",
+      "win": true
+    }
+  ]
+}

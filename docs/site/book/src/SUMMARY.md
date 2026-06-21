@@ -20,6 +20,7 @@
 - [Authentication Flow](./architecture/auth-flow.md)
 - [Security & Policy](./architecture/security.md)
 - [Streaming Execution](./architecture/streaming-execution.md)
+- [Security and trust model](./architecture/security-model.md)
 - [Research Papers](./architecture/research-papers.md)
 
 ---
@@ -66,9 +67,18 @@
 
 ---
 
+# Reference
+
+- [Limitations and Known Gaps](./reference/limitations.md)
+- [SQL at a glance](./reference/sql-cheatsheet.md)
+- [SQE vs Trino, DuckDB, Spark](./reference/vs-other-engines.md)
+
+---
+
 # Getting Started
 
 - [Quickstart](./getting-started/quickstart.md)
+- [Connecting clients](./getting-started/connecting.md)
 - [Catalog backends](./getting-started/catalogs.md)
 - [Storage backends (S3 / R2 / GCS / ADLS / HTTPS / hf://)](./getting-started/storage-backends.md)
 - [Building from Source](./getting-started/building.md)
@@ -76,7 +86,7 @@
 
 ---
 
-# Quickstart
+# Quickstart Recipes
 
 - [Overview](./quickstart/index.md)
 - [Polaris + Keycloak (client credentials)](./quickstart/polaris-keycloak-client-id.md)
@@ -100,6 +110,7 @@
 # Deployment
 
 - [Configuration](./deployment/configuration.md)
+- [Sizing and capacity](./deployment/sizing.md)
 - [Docker](./deployment/docker.md)
 - [Kubernetes & Helm](./deployment/kubernetes.md)
 

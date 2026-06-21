@@ -282,4 +282,4 @@ Catalogs name tables; storage holds bytes. Iceberg already separates these in th
 - `crates/sqe-catalog/src/lazy_object_store.rs`: V10's lazy HTTPS object-store registry.
 - `crates/sqe-catalog/src/iceberg_storage.rs`: catalog-backed storage credential resolution (vended creds vs static `[storage]`).
 - Workspace `Cargo.toml` line 37: `object_store = { ..., features = ["aws", "http", "azure", "gcp"] }`.
-- The DuckDB-comparison audit row for backends lives in [`docs/duckdb-comparision.md`](../../../duckdb-comparision.md).
+- The DuckDB-comparison audit row for backends lives at [getsqe.com/compare/duckdb](https://getsqe.com/compare/duckdb).

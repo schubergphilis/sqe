@@ -54,6 +54,8 @@ graph TB
 
 The catalog backend is selectable at runtime. Polaris is the primary target and the only one verified end-to-end for production write paths today. Nessie, AWS Glue, AWS S3 Tables, Unity Catalog OSS, Hive Metastore, JDBC (Postgres), and Hadoop storage-only are all reachable through the same `iceberg::Catalog` trait, with live integration tests in `crates/sqe-catalog/tests/backends_integration.rs`. AWS endpoints share the OSS Iceberg REST code path through the `aws-sigv4` cargo feature on the vendored `iceberg-catalog-rest` crate. See [features/iceberg.md](../features/iceberg.md) for the catalog-by-catalog state.
 
+The coordinator currently runs as a single replica. It is a single point of failure: a restart drops in-flight queries and session state, which is process-local. Workers are stateless and scale horizontally. Coordinator high availability is on the roadmap. See [Kubernetes & Helm](../deployment/kubernetes.md) for the deployment topology.
+
 ## Request Flow
 
 A query flows through SQE in these stages:

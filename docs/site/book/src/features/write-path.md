@@ -137,7 +137,7 @@ Flow:
 
 ### Iceberg Dependency
 
-Row-level writes depend on the [risingwavelabs/iceberg-rust](https://github.com/risingwavelabs/iceberg-rust) fork (rev `1978911ec4`) which provides the `rewrite_files()` transaction support not yet available in upstream iceberg-rust. When upstream ships `OverwriteAction`, the dependency can be migrated back to the official crate.
+Row-level writes depend on the [risingwavelabs/iceberg-rust](https://github.com/risingwavelabs/iceberg-rust) fork (branch `dev_rebase_main_20260303` at commit `c034b19105fa`, vendored at `vendor/iceberg-rust/`) which provides the `rewrite_files()` transaction support not yet available in upstream iceberg-rust. When upstream ships `OverwriteAction`, the dependency can be migrated back to the official crate.
 
 ## dbt Compatibility
 

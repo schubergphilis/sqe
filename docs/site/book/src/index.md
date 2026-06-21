@@ -17,11 +17,11 @@ graph LR
 
 ## Key Properties
 
-- **No service account**: every query runs as the authenticated user. Bearer tokens pass through from client to Polaris catalog and S3 storage.
-- **Arrow-native**: columnar data flows from Parquet files through the entire query pipeline to the client. No row-based serialization anywhere.
-- **Iceberg-native**: built on iceberg-rust, not a connector bolted onto a generic engine. Partition pruning, metadata caching, and Iceberg v3 support are first-class.
-- **Fine-grained security**: row filters and column masks enforced at the logical plan level, before the optimizer runs. Invisible columns, transparent row filtering, no information leakage.
-- **Rust performance**: single binary, no JVM, no GC pauses, predictable memory usage, fast startup.
+- **No service account.** Every query runs as the authenticated user. The user's bearer token passes through to the Polaris catalog (metadata) and on the write path. Read-path S3 access currently uses the configured `[storage]` credentials; per-user read-credential vending is on the roadmap (see [S3 credential vending](./design-notes/s3vending.md)).
+- **Arrow-native** — columnar data flows from Parquet files through the entire query pipeline to the client. No row-based serialization anywhere.
+- **Iceberg-native** — built on iceberg-rust, not a connector bolted onto a generic engine. Partition pruning, metadata caching, and Iceberg v3 support are first-class.
+- **Fine-grained security** — row filters and column masks enforced at the logical plan level, before the optimizer runs. Invisible columns, transparent row filtering, no information leakage.
+- **Rust performance** — single binary, no JVM, no GC pauses, predictable memory usage, fast startup.
 
 ## Quick Start (embedded, no server)
 
@@ -41,10 +41,10 @@ Full embedded reference: [Using the CLI](./getting-started/cli.md). DuckDB compa
 
 ```bash
 # Build
-cargo build --release --bin sqe-coordinator --bin sqe-cli
+cargo build --release --bin sqe-server --bin sqe-cli
 
-# Start coordinator
-SQE_CONFIG=sqe.toml ./target/release/sqe-coordinator
+# Start coordinator (sqe-server runs as coordinator by default)
+SQE_CONFIG=sqe.toml ./target/release/sqe-server
 
 # Connect
 ./target/release/sqe-cli --host localhost --port 50051
@@ -52,4 +52,4 @@ SQE_CONFIG=sqe.toml ./target/release/sqe-coordinator
 
 ## Project Status
 
-SQE is production-ready against Apache Iceberg. The cluster mode runs distributed (coordinator + stateless workers) with OIDC bearer-token passthrough, Polaris / Nessie / Glue / HMS / S3 Tables / JDBC / Hadoop catalogs, and 167/189 (88.4%) on the public Iceberg matrix scoreboard. The embedded mode (V8 through V12.1) adds DuckDB-style file-format TVFs (`read_csv`, `read_json`, `read_delta`), HuggingFace `hf://` URLs, and a single-binary CLI for laptop analytics.
+SQE is production-ready for the data path against Apache Iceberg; the coordinator currently runs as a single replica (a single point of failure), and coordinator HA is on the roadmap (see [Kubernetes & Helm](./deployment/kubernetes.md)). The cluster mode runs distributed (coordinator + stateless workers) with OIDC bearer-token passthrough, Polaris / Nessie / Glue / HMS / S3 Tables / JDBC / Hadoop catalogs, and 167/189 (88.4%) on the public Iceberg matrix scoreboard. The embedded mode (V8 through V12.1) adds DuckDB-style file-format TVFs (`read_csv`, `read_json`, `read_delta`), HuggingFace `hf://` URLs, and a single-binary CLI for laptop analytics.

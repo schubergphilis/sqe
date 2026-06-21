@@ -80,4 +80,4 @@ Some functions appear in the dialect comparison columns as missing. The reasonin
 - **`postgres_table_scanner`, `mysql_table_scanner`, `sqlite_scanner`**: out of scope. SQE is Iceberg-first; if you need a non-Iceberg engine, query it where it lives.
 - **`spatial`, `vss`, `fts`, `excel`**: niche. Use a tool built for the job (PostGIS, a vector DB, an FTS engine).
 
-The full DuckDB-comparison audit lives at [`duckdb-comparision.md`](../../../duckdb-comparision.md). The Trino-comparison audit lives at [`trino-compatibility.md`](../../../trino-compatibility.md).
+The full DuckDB-comparison audit lives at [getsqe.com/compare/duckdb](https://getsqe.com/compare/duckdb). The Trino-comparison audit lives at [getsqe.com/compare/trino](https://getsqe.com/compare/trino).
