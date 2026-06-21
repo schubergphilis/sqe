@@ -62,6 +62,14 @@ pub struct Session {
 pub struct SessionUser {
     pub username: String,
     pub roles: Vec<String>,
+    /// JWT `sub` claim forwarded from the auth provider's `Identity`.
+    /// Distinct from `username` which may use a custom `user_claim`.
+    pub subject: Option<String>,
+    /// Email address forwarded from the auth provider's `Identity`.
+    pub email: Option<String>,
+    /// Group memberships forwarded from the auth provider's `Identity`.
+    /// Separate from `roles`: different claim path, different semantics.
+    pub groups: Vec<String>,
 }
 
 impl Session {
@@ -75,7 +83,7 @@ impl Session {
         let now = Utc::now();
         Self {
             id: Uuid::new_v4().to_string(),
-            user: SessionUser { username, roles },
+            user: SessionUser { username, roles, subject: None, email: None, groups: Vec::new() },
             access_token,
             refresh_token,
             token_expiry,
@@ -139,6 +147,18 @@ impl Session {
     #[must_use = "with_source consumes self; bind the returned Session"]
     pub fn with_source(mut self, source: Option<String>) -> Self {
         self.source = source;
+        self
+    }
+
+    /// Enrich the session with identity fields from the auth provider.
+    ///
+    /// Called once after `Session::new` on the auth path so existing call
+    /// sites that do not pass enriched identity data keep compiling unchanged.
+    #[must_use = "with_identity consumes self; bind the returned Session"]
+    pub fn with_identity(mut self, subject: Option<String>, email: Option<String>, groups: Vec<String>) -> Self {
+        self.user.subject = subject;
+        self.user.email = email;
+        self.user.groups = groups;
         self
     }
 
@@ -295,6 +315,15 @@ mod tests {
         );
         assert_eq!(session.token_expiry(), new_expiry);
         assert_ne!(session.token_expiry(), original_expiry);
+    }
+
+    #[test]
+    fn session_carries_enriched_identity() {
+        let s = Session::new("alice".into(), SecretString::new("t".into()), None, Utc::now(), vec!["analyst".into()])
+            .with_identity(Some("u-1".into()), Some("alice@x.io".into()), vec!["hr".into()]);
+        assert_eq!(s.user.subject.as_deref(), Some("u-1"));
+        assert_eq!(s.user.email.as_deref(), Some("alice@x.io"));
+        assert_eq!(s.user.groups, vec!["hr".to_string()]);
     }
 
     #[test]

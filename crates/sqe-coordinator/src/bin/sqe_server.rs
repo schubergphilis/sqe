@@ -773,10 +773,6 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
 
     // Metrics & audit
     let metrics = Arc::new(sqe_metrics::MetricsRegistry::new());
-    let audit = Arc::new(
-        sqe_metrics::audit::AuditLogger::new(&config.metrics.audit_log_path)
-            .map_err(|e| anyhow::anyhow!(e))?,
-    );
 
     sqe_metrics::server::start_metrics_server(metrics.clone(), config.metrics.prometheus_port);
     tracing::info!("Prometheus metrics on port {}", config.metrics.prometheus_port);
@@ -904,6 +900,36 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
         metadata_cache_ttl_secs = config.catalog.metadata_cache_ttl_secs,
         "Initialized global table metadata cache (shared across all sessions)"
     );
+
+    // Build the audit logger after the table cache so GDPR tag masking can be
+    // wired via CacheTagSource. Salt is derived once at startup (stable within
+    // a deployment, not across restarts/replicas, not secret-grade).
+    let audit_salt = uuid::Uuid::new_v4().to_string();
+    let audit_logger = sqe_metrics::audit::AuditLogger::with_config(
+        &config.metrics.audit_log_path,
+        sqe_coordinator::parse_audit_format(&config.metrics.audit.format),
+    )
+    .map_err(|e| anyhow::anyhow!(e))?;
+
+    let audit_logger = if !config.metrics.audit.gdpr_tags.is_empty() {
+        let tag_src = Arc::new(sqe_coordinator::tag_source_impl::CacheTagSource::new(
+            Arc::new(table_cache.clone()),
+        ));
+        let adapter = Arc::new(sqe_coordinator::audit_tag_adapter::AuditTagAdapter(tag_src));
+        audit_logger.with_gdpr(
+            config.metrics.audit.gdpr_tags.clone(),
+            sqe_coordinator::parse_gdpr_mode(&config.metrics.audit.gdpr_identifier_mode),
+            audit_salt,
+            adapter,
+        )
+    } else {
+        audit_logger
+    };
+    let audit = Arc::new(audit_logger);
+
+    // Guard + self-audit the superdebug_log_results escape hatch.
+    // No-op when the flag is false (the default).
+    sqe_coordinator::maybe_warn_superdebug(&audit, &config);
 
     // AUTH-01: build the enforcer + store from config.policy.engine.
     // table_cache is passed so the rewriter can wire CacheTagSource for

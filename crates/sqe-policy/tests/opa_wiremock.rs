@@ -22,6 +22,9 @@ fn user() -> SessionUser {
     SessionUser {
         username: "alice".to_string(),
         roles: vec!["analyst".to_string()],
+        subject: None,
+        email: None,
+        groups: vec![],
     }
 }
 
