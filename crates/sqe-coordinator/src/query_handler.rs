@@ -1655,7 +1655,7 @@ impl QueryHandler {
                         statement_type: kind_name,
                     }),
                     session_id: Some(session.id.clone()),
-                    client_ip: None,
+                    client_ip: client_ip.clone(),
                     integrity: sqe_metrics::audit::Integrity::default(),
                 };
                 audit.log_event(grant_event);
@@ -1745,7 +1745,7 @@ impl QueryHandler {
                         statement_type: kind_name,
                     }),
                     session_id: Some(session.id.clone()),
-                    client_ip: None,
+                    client_ip: client_ip.clone(),
                     integrity: sqe_metrics::audit::Integrity::default(),
                 };
                 audit.log_event(ddl_event);
@@ -1965,6 +1965,7 @@ impl QueryHandler {
                     profile_mode: self.profile_mode,
                     actor,
                     resources: audit_resources,
+                    client_ip: client_ip.clone(),
                 };
 
                 let tracked = crate::streaming::TrackedRecordBatchStream::with_permits_reservation_and_cancel_token(
