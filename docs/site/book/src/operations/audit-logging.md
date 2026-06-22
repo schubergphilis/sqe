@@ -446,9 +446,11 @@ record is serialised for the dashboard wire format.
 executions, streaming SELECT finalisers, DML/DDL completions, and GRANT/REVOKE
 statements. The dashboard displays the value directly from `QueryRecord.client_ip`.
 
-Dashboard-access audit events (`kind: auth`) do not yet carry `client_ip` because the
-health port is not served with `into_make_service_with_connect_info`. This is a known
-gap and will be addressed in a follow-up.
+Dashboard-access audit events (`kind: auth`) carry `client_ip` when the peer address
+is available. The health server is served with `into_make_service_with_connect_info`,
+so `ConnectInfo<SocketAddr>` is always present for real TCP connections. If
+`[security] trusted_proxies` is configured, the XFF header is honoured with the same
+rightmost-untrusted-hop rule used by the Flight SQL and Quack paths.
 
 ### Field consistency
 

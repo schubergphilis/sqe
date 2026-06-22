@@ -72,6 +72,10 @@ struct HealthState {
     bearer_provider: Option<Arc<dyn sqe_auth::AuthProvider>>,
     /// Auth config for admin-role check in the web_ui guard. `None` in `run_worker` and tests.
     auth_cfg: Option<sqe_core::config::AuthConfig>,
+    /// Security config for client-IP resolution in the web_ui guard.
+    /// Used to honour X-Forwarded-For from trusted proxies, mirroring the Flight
+    /// SQL path. `None` in `run_worker` and tests (degrades to peer-wins).
+    security_cfg: Option<sqe_core::config::SecurityConfig>,
     /// Audit logger wired for dashboard-access events. `None` in `run_worker` and tests.
     audit: Option<Arc<sqe_metrics::audit::AuditLogger>>,
     /// Counter incremented for anonymous (Unauthorized) dashboard denials instead
@@ -123,6 +127,24 @@ impl sqe_coordinator::web_auth::BearerAdminState for HealthState {
     fn note_dashboard_success(&self) {
         if let Some(c) = &self.dashboard_success {
             c.inc();
+        }
+    }
+
+    fn resolve_client_ip(&self, peer: Option<&str>, xff: Option<&str>) -> Option<String> {
+        match &self.security_cfg {
+            Some(sec) => {
+                let resolved = sec.resolve_client_ip(peer, xff);
+                // resolve_client_ip returns "unknown" when peer is None; map that
+                // back to None so we don't pollute audit events with a literal
+                // "unknown" string.
+                if resolved == "unknown" {
+                    None
+                } else {
+                    Some(resolved)
+                }
+            }
+            // No security config wired (run_worker / tests): fall back to peer-wins.
+            None => peer.map(|p| p.to_string()),
         }
     }
 }
@@ -413,7 +435,14 @@ fn start_health_server(port: u16, state: Arc<HealthState>) {
             .await
             .expect("Failed to bind health server");
         tracing::info!("Health endpoints on port {port} (/healthz, /readyz, /api/v1/status)");
-        axum::serve(listener, app).await.unwrap_or_else(|e| tracing::error!(error = %e, "Health server terminated unexpectedly"));
+        // Serve with connect-info so the dashboard-access guard can extract the
+        // peer TCP address for client_ip in audit events.
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap_or_else(|e| tracing::error!(error = %e, "Health server terminated unexpectedly"));
     });
 }
 
@@ -1022,6 +1051,9 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
         // auth_chain is already built above; reuse it for the web_ui guard.
         bearer_provider: Some(Arc::clone(&auth_chain) as Arc<dyn sqe_auth::AuthProvider>),
         auth_cfg: Some(config.auth.clone()),
+        // Thread the security config so the dashboard guard honours
+        // trusted_proxies for XFF resolution, matching the Flight SQL path.
+        security_cfg: Some(config.security.clone()),
         audit: Some(Arc::clone(&audit)),
         anonymous_denied: Some(metrics.dashboard_auth_anonymous_denied_total.clone()),
         dashboard_success: Some(metrics.dashboard_auth_success_total.clone()),
@@ -1408,6 +1440,7 @@ async fn run_worker(config: SqeConfig) -> anyhow::Result<()> {
         metrics_history: None,
         bearer_provider: None,
         auth_cfg: None,
+        security_cfg: None,
         audit: None,
         anonymous_denied: None,
         dashboard_success: None,
@@ -1779,6 +1812,7 @@ mod tests {
             metrics_history: None,
             bearer_provider: None,
             auth_cfg: None,
+            security_cfg: None,
             audit: None,
             anonymous_denied: None,
             dashboard_success: None,
@@ -1805,6 +1839,7 @@ mod tests {
             metrics_history: None,
             bearer_provider: None,
             auth_cfg: None,
+            security_cfg: None,
             audit: None,
             anonymous_denied: None,
             dashboard_success: None,
@@ -1837,6 +1872,7 @@ mod tests {
             metrics_history: None,
             bearer_provider: None,
             auth_cfg: None,
+            security_cfg: None,
             audit: None,
             anonymous_denied: None,
             dashboard_success: None,
@@ -1866,6 +1902,7 @@ mod tests {
             metrics_history: None,
             bearer_provider: None,
             auth_cfg: None,
+            security_cfg: None,
             audit: None,
             anonymous_denied: None,
             dashboard_success: None,
@@ -1894,6 +1931,7 @@ mod tests {
             metrics_history: None,
             bearer_provider: None,
             auth_cfg: None,
+            security_cfg: None,
             audit: None,
             anonymous_denied: None,
             dashboard_success: None,
@@ -1958,6 +1996,7 @@ mod tests {
             metrics_history: None,
             bearer_provider: None,
             auth_cfg: None,
+            security_cfg: None,
             audit: None,
             anonymous_denied: None,
             dashboard_success: None,
@@ -1988,6 +2027,7 @@ mod tests {
             metrics_history: None,
             bearer_provider: None,
             auth_cfg: None,
+            security_cfg: None,
             audit: None,
             anonymous_denied: None,
             dashboard_success: None,
@@ -2019,6 +2059,7 @@ mod tests {
             metrics_history: None,
             bearer_provider: None,
             auth_cfg: None,
+            security_cfg: None,
             audit: None,
             anonymous_denied: None,
             dashboard_success: None,
@@ -2058,6 +2099,7 @@ mod tests {
             metrics_history: Some(hist),
             bearer_provider: None,
             auth_cfg: None,
+            security_cfg: None,
             audit: None,
             anonymous_denied: None,
             dashboard_success: None,
@@ -2141,6 +2183,7 @@ mod tests {
             metrics_history: None,
             bearer_provider: Some(provider),
             auth_cfg: Some(auth_cfg),
+            security_cfg: None,
             audit: None,
             anonymous_denied: None,
             dashboard_success: None,
@@ -2235,6 +2278,7 @@ mod tests {
             metrics_history: None,
             bearer_provider: None,
             auth_cfg: None,
+            security_cfg: None,
             audit: None,
             anonymous_denied: None,
             dashboard_success: Some(counter),
