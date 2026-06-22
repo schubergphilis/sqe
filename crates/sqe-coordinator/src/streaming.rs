@@ -151,6 +151,10 @@ pub struct StreamFinalizer {
     /// only place the logical plan is in scope) so the streaming finalizer
     /// can emit a complete `AuditEvent` without re-planning.
     pub resources: Vec<sqe_metrics::audit::Resource>,
+    /// Source IP of the Flight SQL client that submitted this query. Threaded
+    /// from the `execute_stream` parameter so every streaming audit event
+    /// (success, error, cancel) carries the originating address.
+    pub client_ip: Option<String>,
 }
 
 impl StreamFinalizer {
@@ -258,7 +262,7 @@ impl StreamFinalizer {
                     statement_type: "query".to_string(),
                 }),
                 session_id: Some(self.session_id.clone()),
-                client_ip: None,
+                client_ip: self.client_ip.clone(),
                 integrity: Default::default(),
             };
             audit.log_event(event);
@@ -332,7 +336,7 @@ impl StreamFinalizer {
                     statement_type: "query".to_string(),
                 }),
                 session_id: Some(self.session_id.clone()),
-                client_ip: None,
+                client_ip: self.client_ip.clone(),
                 integrity: Default::default(),
             };
             audit.log_event(event);
@@ -391,7 +395,7 @@ impl StreamFinalizer {
                     statement_type: "query".to_string(),
                 }),
                 session_id: Some(self.session_id.clone()),
-                client_ip: None,
+                client_ip: self.client_ip.clone(),
                 integrity: Default::default(),
             };
             audit.log_event(event);
@@ -715,6 +719,7 @@ mod tests {
             profile_mode: ProfileMode::Off,
             actor: sqe_metrics::audit::Actor::default(),
             resources: Vec::new(),
+            client_ip: None,
         }
     }
 
@@ -974,6 +979,49 @@ mod tests {
         // Small profiles pass through untouched.
         let small = "elapsed_ms=1\nProjectionExec".to_string();
         assert_eq!(truncate_profile(small.clone()), small);
+    }
+
+    /// Task 4 TDD guard: `StreamFinalizer` carries `client_ip` into the success
+    /// audit event.
+    ///
+    /// Builds a `StreamFinalizer` with `client_ip: Some("10.9.9.9".into())`,
+    /// wires it to a tempfile `AuditLogger`, drives the success finalize path,
+    /// and asserts the written JSONL line has `client_ip == "10.9.9.9"`.
+    ///
+    /// RED before the field and emit-branch are added (emits `null`).
+    /// GREEN after implementation.
+    #[tokio::test]
+    async fn streaming_finalizer_carries_client_ip_to_audit_event() {
+        let (plan, schema, runtime) = trivial_plan().await;
+        let tracker = test_tracker();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let audit = Arc::new(
+            sqe_metrics::audit::AuditLogger::new(path.to_str().unwrap()).unwrap(),
+        );
+
+        let mut fin = test_finalizer(Arc::clone(&tracker), plan, runtime);
+        fin.audit = Some(Arc::clone(&audit));
+        fin.client_ip = Some("10.9.9.9".to_string());
+        let qid = fin.query_id;
+        tracker.start(qid, "test-user", None, "SELECT 1", "test-session", None, vec![]);
+
+        let inner = fixed_stream(Arc::clone(&schema), vec![sample_batch(1)]);
+        let mut stream = TrackedRecordBatchStream::new(inner, fin, None);
+        while let Some(b) = stream.next().await {
+            let _ = b.unwrap();
+        }
+        drop(stream);
+        audit.flush();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(content.lines().next().unwrap()).unwrap();
+        assert_eq!(
+            v["client_ip"].as_str(),
+            Some("10.9.9.9"),
+            "streaming audit event must carry client_ip; got: {v}"
+        );
     }
 
     #[tokio::test]
