@@ -104,6 +104,12 @@ pub struct MetricsRegistry {
     pub audit_export_spool_lag_bytes: Gauge,
     pub audit_export_cursor_seq: Gauge,
     pub audit_export_last_success_timestamp: Gauge,
+
+    // Dashboard auth metrics
+    /// Anonymous dashboard denial counter -- incremented instead of writing an
+    /// audit line when no bearer token is present (Unauthorized). Prevents
+    /// health-port probe flood from polluting the audit spool and SIEM.
+    pub dashboard_auth_anonymous_denied_total: IntCounter,
 }
 
 impl MetricsRegistry {
@@ -556,6 +562,16 @@ impl MetricsRegistry {
             .register(Box::new(audit_export_last_success_timestamp.clone()))
             .unwrap();
 
+        let dashboard_auth_anonymous_denied_total = IntCounter::new(
+            "sqe_dashboard_auth_anonymous_denied_total",
+            "Anonymous dashboard access denials (no bearer token / invalid scheme). \
+             These are NOT written to the audit spool.",
+        )
+        .unwrap();
+        registry
+            .register(Box::new(dashboard_auth_anonymous_denied_total.clone()))
+            .unwrap();
+
         Self {
             registry,
             query_count,
@@ -612,6 +628,7 @@ impl MetricsRegistry {
             audit_export_spool_lag_bytes,
             audit_export_cursor_seq,
             audit_export_last_success_timestamp,
+            dashboard_auth_anonymous_denied_total,
         }
     }
 }
@@ -777,8 +794,9 @@ mod tests {
         metrics.sorts_stripped_total.with_label_values(&["adaptive", "memory_pressure"]).inc_by(0);
         // Write-path orphan cleanup (COORD-06)
         metrics.write_orphan_files_total.with_label_values(&["ctas", "leaked"]).inc_by(0);
-        // 17 original + 14 streaming + 7 new (S3 + auth) + 1 adaptive sort = 39 minimum
-        assert!(metrics.registry.gather().len() >= 39);
+        metrics.dashboard_auth_anonymous_denied_total.inc_by(0);
+        // 17 original + 14 streaming + 7 new (S3 + auth) + 1 adaptive sort + 1 dashboard = 40 minimum
+        assert!(metrics.registry.gather().len() >= 40);
     }
 
     #[test]
