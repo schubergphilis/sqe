@@ -88,31 +88,29 @@ async fn rewrite_data_files_returns_summary() {
 
     let table = "default.maint_rewrite_test";
     let _ = handler
-        .execute(&session, &format!("DROP TABLE IF EXISTS {table}"))
+        .execute(&session, &format!("DROP TABLE IF EXISTS {table}"), None)
         .await;
     handler
         .execute(
             &session,
-            &format!("CREATE TABLE {table} (id BIGINT, v VARCHAR)"),
-        )
+            &format!("CREATE TABLE {table} (id BIGINT, v VARCHAR)"), None)
         .await
         .expect("CREATE");
     handler
-        .execute(&session, &format!("INSERT INTO {table} VALUES (1, 'a'), (2, 'b')"))
+        .execute(&session, &format!("INSERT INTO {table} VALUES (1, 'a'), (2, 'b')"), None)
         .await
         .expect("INSERT");
 
     let batches = handler
         .execute(
             &session,
-            &format!("CALL system.rewrite_data_files(table => '{table}')"),
-        )
+            &format!("CALL system.rewrite_data_files(table => '{table}')"), None)
         .await
         .expect("rewrite_data_files");
     assert!(!batches.is_empty(), "rewrite_data_files should return a summary batch");
 
     let _ = handler
-        .execute(&session, &format!("DROP TABLE IF EXISTS {table}"))
+        .execute(&session, &format!("DROP TABLE IF EXISTS {table}"), None)
         .await;
 }
 
@@ -146,13 +144,12 @@ async fn rewrite_data_files_actually_compacts_parquet() {
     let table = "default.maint_rewrite_compaction_test";
 
     let _ = handler
-        .execute(&session, &format!("DROP TABLE IF EXISTS {table}"))
+        .execute(&session, &format!("DROP TABLE IF EXISTS {table}"), None)
         .await;
     handler
         .execute(
             &session,
-            &format!("CREATE TABLE {table} (id BIGINT, v VARCHAR)"),
-        )
+            &format!("CREATE TABLE {table} (id BIGINT, v VARCHAR)"), None)
         .await
         .expect("CREATE");
 
@@ -165,8 +162,7 @@ async fn rewrite_data_files_actually_compacts_parquet() {
         handler
             .execute(
                 &session,
-                &format!("INSERT INTO {table} VALUES ({i}, '{v}')"),
-            )
+                &format!("INSERT INTO {table} VALUES ({i}, '{v}')"), None)
             .await
             .unwrap_or_else(|e| panic!("INSERT #{i} failed: {e}"));
     }
@@ -177,8 +173,7 @@ async fn rewrite_data_files_actually_compacts_parquet() {
     let pre_files = handler
         .execute(
             &session,
-            "SELECT COUNT(*) FROM table_files('default', 'maint_rewrite_compaction_test')",
-        )
+            "SELECT COUNT(*) FROM table_files('default', 'maint_rewrite_compaction_test')", None)
         .await
         .expect("table_files pre-rewrite");
     let pre_count = extract_count(&pre_files);
@@ -197,8 +192,7 @@ async fn rewrite_data_files_actually_compacts_parquet() {
                    table => '{table}', \
                    min_input_files => 5, \
                    target_file_size_bytes => 1073741824)"
-            ),
-        )
+            ), None)
         .await
         .expect("rewrite_data_files compaction call");
     assert!(!summary.is_empty(), "summary batch must be returned");
@@ -230,7 +224,7 @@ async fn rewrite_data_files_actually_compacts_parquet() {
 
     // Row preservation: the SELECT COUNT(*) before and after must match.
     let post_rows = handler
-        .execute(&session, &format!("SELECT COUNT(*) FROM {table}"))
+        .execute(&session, &format!("SELECT COUNT(*) FROM {table}"), None)
         .await
         .expect("SELECT COUNT(*) post-rewrite");
     let post_count = extract_count(&post_rows);
@@ -246,8 +240,7 @@ async fn rewrite_data_files_actually_compacts_parquet() {
     let post_files = handler
         .execute(
             &session,
-            "SELECT COUNT(*) FROM table_files('default', 'maint_rewrite_compaction_test')",
-        )
+            "SELECT COUNT(*) FROM table_files('default', 'maint_rewrite_compaction_test')", None)
         .await
         .expect("table_files post-rewrite");
     let post_files_n = extract_count(&post_files);
@@ -257,7 +250,7 @@ async fn rewrite_data_files_actually_compacts_parquet() {
     );
 
     let _ = handler
-        .execute(&session, &format!("DROP TABLE IF EXISTS {table}"))
+        .execute(&session, &format!("DROP TABLE IF EXISTS {table}"), None)
         .await;
 }
 
@@ -278,32 +271,31 @@ async fn expire_snapshots_retain_last_commits() {
 
     let table = "default.maint_expire_test";
     let _ = handler
-        .execute(&session, &format!("DROP TABLE IF EXISTS {table}"))
+        .execute(&session, &format!("DROP TABLE IF EXISTS {table}"), None)
         .await;
     handler
-        .execute(&session, &format!("CREATE TABLE {table} (id BIGINT)"))
+        .execute(&session, &format!("CREATE TABLE {table} (id BIGINT)"), None)
         .await
         .expect("CREATE");
     handler
-        .execute(&session, &format!("INSERT INTO {table} VALUES (1)"))
+        .execute(&session, &format!("INSERT INTO {table} VALUES (1)"), None)
         .await
         .expect("INSERT 1");
     handler
-        .execute(&session, &format!("INSERT INTO {table} VALUES (2)"))
+        .execute(&session, &format!("INSERT INTO {table} VALUES (2)"), None)
         .await
         .expect("INSERT 2");
 
     let batches = handler
         .execute(
             &session,
-            &format!("CALL system.expire_snapshots(table => '{table}', retain_last => 1)"),
-        )
+            &format!("CALL system.expire_snapshots(table => '{table}', retain_last => 1)"), None)
         .await
         .expect("expire_snapshots");
     assert!(!batches.is_empty(), "expire_snapshots should return a summary batch");
 
     let _ = handler
-        .execute(&session, &format!("DROP TABLE IF EXISTS {table}"))
+        .execute(&session, &format!("DROP TABLE IF EXISTS {table}"), None)
         .await;
 }
 
@@ -314,22 +306,21 @@ async fn remove_orphan_files_respects_default_threshold() {
 
     let table = "default.maint_orphan_test";
     let _ = handler
-        .execute(&session, &format!("DROP TABLE IF EXISTS {table}"))
+        .execute(&session, &format!("DROP TABLE IF EXISTS {table}"), None)
         .await;
     handler
-        .execute(&session, &format!("CREATE TABLE {table} (id BIGINT)"))
+        .execute(&session, &format!("CREATE TABLE {table} (id BIGINT)"), None)
         .await
         .expect("CREATE");
     handler
-        .execute(&session, &format!("INSERT INTO {table} VALUES (42)"))
+        .execute(&session, &format!("INSERT INTO {table} VALUES (42)"), None)
         .await
         .expect("INSERT");
 
     let batches = handler
         .execute(
             &session,
-            &format!("CALL system.remove_orphan_files(table => '{table}')"),
-        )
+            &format!("CALL system.remove_orphan_files(table => '{table}')"), None)
         .await
         .expect("remove_orphan_files");
     assert!(!batches.is_empty());
@@ -351,7 +342,7 @@ async fn remove_orphan_files_respects_default_threshold() {
     );
 
     let _ = handler
-        .execute(&session, &format!("DROP TABLE IF EXISTS {table}"))
+        .execute(&session, &format!("DROP TABLE IF EXISTS {table}"), None)
         .await;
 }
 
@@ -362,29 +353,28 @@ async fn rewrite_manifests_commits_and_returns_summary() {
 
     let table = "default.maint_rewrite_manifests_test";
     let _ = handler
-        .execute(&session, &format!("DROP TABLE IF EXISTS {table}"))
+        .execute(&session, &format!("DROP TABLE IF EXISTS {table}"), None)
         .await;
     handler
-        .execute(&session, &format!("CREATE TABLE {table} (id BIGINT)"))
+        .execute(&session, &format!("CREATE TABLE {table} (id BIGINT)"), None)
         .await
         .expect("CREATE");
     handler
-        .execute(&session, &format!("INSERT INTO {table} VALUES (1), (2), (3)"))
+        .execute(&session, &format!("INSERT INTO {table} VALUES (1), (2), (3)"), None)
         .await
         .expect("INSERT");
 
     let batches = handler
         .execute(
             &session,
-            &format!("CALL system.rewrite_manifests(table => '{table}')"),
-        )
+            &format!("CALL system.rewrite_manifests(table => '{table}')"), None)
         .await
         .expect("rewrite_manifests");
     assert!(!batches.is_empty());
 
     // Data readability must be preserved after the rewrite.
     let post = handler
-        .execute(&session, &format!("SELECT COUNT(*) FROM {table}"))
+        .execute(&session, &format!("SELECT COUNT(*) FROM {table}"), None)
         .await
         .expect("SELECT COUNT after rewrite");
     let count_col = post[0].column(0);
@@ -396,7 +386,7 @@ async fn rewrite_manifests_commits_and_returns_summary() {
     assert_eq!(count, 3, "row count must be preserved after rewrite_manifests");
 
     let _ = handler
-        .execute(&session, &format!("DROP TABLE IF EXISTS {table}"))
+        .execute(&session, &format!("DROP TABLE IF EXISTS {table}"), None)
         .await;
 }
 
@@ -420,8 +410,7 @@ async fn read_only_user_rejected_with_audit() {
     let err = handler
         .execute(
             &readonly,
-            "CALL system.rewrite_data_files(table => 'default.any_table')",
-        )
+            "CALL system.rewrite_data_files(table => 'default.any_table')", None)
         .await
         .expect_err("read-only user should be denied");
     let msg = err.to_string();

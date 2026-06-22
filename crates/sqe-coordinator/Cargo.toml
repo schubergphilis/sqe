@@ -86,6 +86,7 @@ opentelemetry = { workspace = true }
 tracing-opentelemetry = { workspace = true }
 
 [dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
 toml = { workspace = true }
 sqe-core = { path = "../sqe-core" }
 sqe-auth = { path = "../sqe-auth" }
