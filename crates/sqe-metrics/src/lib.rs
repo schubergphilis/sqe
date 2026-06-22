@@ -97,6 +97,19 @@ pub struct MetricsRegistry {
     pub policy_cache_hits_total: IntCounterVec,
     pub policy_cache_misses_total: IntCounterVec,
     pub policy_circuit_breaker_state: GaugeVec,
+
+    // Audit export (OTLP shipper) metrics
+    pub audit_export_records_total: IntCounterVec,
+    pub audit_export_batch_failures_total: IntCounter,
+    pub audit_export_spool_lag_bytes: Gauge,
+    pub audit_export_cursor_seq: Gauge,
+    pub audit_export_last_success_timestamp: Gauge,
+
+    // Dashboard auth metrics
+    /// Anonymous dashboard denial counter -- incremented instead of writing an
+    /// audit line when no bearer token is present (Unauthorized). Prevents
+    /// health-port probe flood from polluting the audit spool and SIEM.
+    pub dashboard_auth_anonymous_denied_total: IntCounter,
 }
 
 impl MetricsRegistry {
@@ -500,6 +513,65 @@ impl MetricsRegistry {
             .register(Box::new(write_orphan_files_total.clone()))
             .unwrap();
 
+        // Audit export (OTLP shipper) metrics
+        let audit_export_records_total = IntCounterVec::new(
+            Opts::new(
+                "sqe_audit_export_records_total",
+                "Total audit records shipped by status (success or failure)",
+            ),
+            &["status"],
+        )
+        .unwrap();
+        registry
+            .register(Box::new(audit_export_records_total.clone()))
+            .unwrap();
+
+        let audit_export_batch_failures_total = IntCounter::new(
+            "sqe_audit_export_batch_failures_total",
+            "Total failed audit export batch attempts",
+        )
+        .unwrap();
+        registry
+            .register(Box::new(audit_export_batch_failures_total.clone()))
+            .unwrap();
+
+        let audit_export_spool_lag_bytes = Gauge::new(
+            "sqe_audit_export_spool_lag_bytes",
+            "Bytes in the audit spool not yet shipped (file size minus committed offset)",
+        )
+        .unwrap();
+        registry
+            .register(Box::new(audit_export_spool_lag_bytes.clone()))
+            .unwrap();
+
+        let audit_export_cursor_seq = Gauge::new(
+            "sqe_audit_export_cursor_seq",
+            "Sequence number of the last successfully acked audit export record",
+        )
+        .unwrap();
+        registry
+            .register(Box::new(audit_export_cursor_seq.clone()))
+            .unwrap();
+
+        let audit_export_last_success_timestamp = Gauge::new(
+            "sqe_audit_export_last_success_timestamp",
+            "Unix timestamp (seconds) of the last successful audit export batch",
+        )
+        .unwrap();
+        registry
+            .register(Box::new(audit_export_last_success_timestamp.clone()))
+            .unwrap();
+
+        let dashboard_auth_anonymous_denied_total = IntCounter::new(
+            "sqe_dashboard_auth_anonymous_denied_total",
+            "Anonymous dashboard access denials (no bearer token / invalid scheme). \
+             These are NOT written to the audit spool.",
+        )
+        .unwrap();
+        registry
+            .register(Box::new(dashboard_auth_anonymous_denied_total.clone()))
+            .unwrap();
+
         Self {
             registry,
             query_count,
@@ -551,6 +623,12 @@ impl MetricsRegistry {
             policy_cache_misses_total,
             policy_circuit_breaker_state,
             write_orphan_files_total,
+            audit_export_records_total,
+            audit_export_batch_failures_total,
+            audit_export_spool_lag_bytes,
+            audit_export_cursor_seq,
+            audit_export_last_success_timestamp,
+            dashboard_auth_anonymous_denied_total,
         }
     }
 }
@@ -716,8 +794,9 @@ mod tests {
         metrics.sorts_stripped_total.with_label_values(&["adaptive", "memory_pressure"]).inc_by(0);
         // Write-path orphan cleanup (COORD-06)
         metrics.write_orphan_files_total.with_label_values(&["ctas", "leaked"]).inc_by(0);
-        // 17 original + 14 streaming + 7 new (S3 + auth) + 1 adaptive sort = 39 minimum
-        assert!(metrics.registry.gather().len() >= 39);
+        metrics.dashboard_auth_anonymous_denied_total.inc_by(0);
+        // 17 original + 14 streaming + 7 new (S3 + auth) + 1 adaptive sort + 1 dashboard = 40 minimum
+        assert!(metrics.registry.gather().len() >= 40);
     }
 
     #[test]

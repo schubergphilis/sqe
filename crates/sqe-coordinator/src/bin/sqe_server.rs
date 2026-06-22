@@ -68,6 +68,35 @@ struct HealthState {
     node_info: Option<sqe_coordinator::web_ui::NodeInfo>,
     /// Populated in `run_coordinator`; `None` in `run_worker` and tests.
     metrics_history: Option<Arc<sqe_coordinator::metrics_history::MetricsHistory>>,
+    /// Bearer auth provider for the web_ui guard. `None` in `run_worker` and tests.
+    bearer_provider: Option<Arc<dyn sqe_auth::AuthProvider>>,
+    /// Auth config for admin-role check in the web_ui guard. `None` in `run_worker` and tests.
+    auth_cfg: Option<sqe_core::config::AuthConfig>,
+    /// Audit logger wired for dashboard-access events. `None` in `run_worker` and tests.
+    audit: Option<Arc<sqe_metrics::audit::AuditLogger>>,
+    /// Counter incremented for anonymous (Unauthorized) dashboard denials instead
+    /// of writing an audit line. `None` in `run_worker` and tests.
+    anonymous_denied: Option<prometheus::IntCounter>,
+}
+
+impl sqe_coordinator::web_auth::BearerAdminState for HealthState {
+    fn bearer_provider(&self) -> Option<&Arc<dyn sqe_auth::AuthProvider>> {
+        self.bearer_provider.as_ref()
+    }
+
+    fn auth_config(&self) -> Option<&sqe_core::config::AuthConfig> {
+        self.auth_cfg.as_ref()
+    }
+
+    fn audit(&self) -> Option<&Arc<sqe_metrics::audit::AuditLogger>> {
+        self.audit.as_ref()
+    }
+
+    fn on_anonymous_denial(&self) {
+        if let Some(c) = &self.anonymous_denied {
+            c.inc();
+        }
+    }
 }
 
 async fn healthz() -> &'static str {
@@ -316,23 +345,40 @@ async fn dashboard() -> Response {
         .into_response()
 }
 
-fn start_health_server(port: u16, state: Arc<HealthState>) {
-    let mut app = Router::new()
+/// Build the health server router. Extracted so tests can drive it directly.
+///
+/// `/healthz`, `/readyz`, and `/api/v1/status` are always ungated -- they
+/// serve k8s liveness/readiness probes and LB health checks. The `web_ui`
+/// route group (dashboard + JSON API) is gated behind bearer + admin auth via
+/// `route_layer` applied only to that sub-router.
+fn build_health_router(state: Arc<HealthState>) -> Router {
+    let open = Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
         .route("/api/v1/status", get(cluster_status));
 
-    if state.web_ui {
-        app = app
+    let app = if state.web_ui {
+        let web = Router::new()
             .route("/", get(dashboard))
             .route("/api/v1/overview", get(api_overview))
             .route("/api/v1/queries", get(api_queries))
             .route("/api/v1/queries/{id}", get(api_query_detail))
             .route("/api/v1/workers", get(api_workers))
-            .route("/api/v1/metrics/history", get(api_metrics_history));
-    }
+            .route("/api/v1/metrics/history", get(api_metrics_history))
+            .route_layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                sqe_coordinator::web_auth::require_admin_bearer::<HealthState>,
+            ));
+        open.merge(web)
+    } else {
+        open
+    };
 
-    let app = app.with_state(state);
+    app.with_state(state)
+}
+
+fn start_health_server(port: u16, state: Arc<HealthState>) {
+    let app = build_health_router(state);
 
     tokio::spawn(async move {
         let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}"))
@@ -474,7 +520,7 @@ impl TrinoQueryExecutor for QueryHandlerAdapter {
         self.rate_limiter
             .check(&session.user.username)
             .map_err(|e| sqe_core::SqeError::Execution(format!("rate limit: {e}")))?;
-        self.handler.execute(session, sql).await
+        self.handler.execute(session, sql, None).await
     }
 }
 
@@ -546,10 +592,11 @@ async fn async_main() -> anyhow::Result<()> {
     if sqe_coordinator::mode::warns_unauthenticated_workers(&config.coordinator) {
         tracing::warn!("WARNING: coordinator.allow_unauthenticated_workers = true with an empty coordinator.worker_secret -- any client reachable on the cluster network can register as a worker and receive user bearer tokens. Set worker_secret for production.");
     }
-    // WEB-01: the web UI / JSON API serve on the health port over 0.0.0.0 with
-    // NO authentication. It now defaults off; warn loudly when explicitly on.
+    // WEB-01: the web UI / JSON API serve on the health port (0.0.0.0).
+    // Routes are gated behind bearer + admin auth (see web_auth::require_admin_bearer).
+    // Warn so operators know the surface is active.
     if config.metrics.web_ui {
-        tracing::warn!("WARNING: metrics.web_ui = true -- the ops dashboard and /api/v1/* endpoints are served on the health port (0.0.0.0) with NO authentication. Anyone able to reach that port sees cluster/query metadata. Network-gate it tightly or leave web_ui = false.");
+        tracing::warn!("WARNING: metrics.web_ui = true -- the ops dashboard and /api/v1/* endpoints are served on the health port (0.0.0.0). Routes require a valid admin bearer token. Network-gate the health port or leave web_ui = false.");
     }
 
     // Priority: --mode flag > SQE_MODE env > config file mode
@@ -753,24 +800,6 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
     // is moved into QueryHandler::new below.
     let sampler_tracker = query_tracker.clone();
 
-    // Health server (start early so probes work during init)
-    let health_state = Arc::new(HealthState {
-        ready: ready.clone(),
-        started_at,
-        role: "coordinator",
-        worker_registry: if distributed {
-            Some(worker_registry.clone())
-        } else {
-            None
-        },
-        query_tracker: Some(query_tracker.clone()),
-        web_ui: config.metrics.web_ui,
-        catalog_url: config.catalog.catalog_url.clone(),
-        node_info: Some(node_info),
-        metrics_history: metrics_history.clone(),
-    });
-    start_health_server(health_port, health_state);
-
     // Metrics & audit
     let metrics = Arc::new(sqe_metrics::MetricsRegistry::new());
 
@@ -925,7 +954,118 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
     } else {
         audit_logger
     };
+
+    // Attach the OCSF export spool when audit export is enabled.
+    let (audit_logger, shipper_spool_path) =
+        if config.metrics.audit_export.enabled && config.metrics.audit_export.target == "otlp" {
+            let spool = sqe_coordinator::derive_spool_path(
+                &config.metrics.audit_export.spool_path,
+                &config.metrics.audit_log_path,
+            );
+            let logger = audit_logger
+                .with_export_spool(&spool)
+                .map_err(|e| anyhow::anyhow!("audit export: failed to open spool file: {e}"))?;
+            (logger, Some(spool))
+        } else {
+            (audit_logger, None)
+        };
+
     let audit = Arc::new(audit_logger);
+
+    // Health server. Started here (after audit init) so the audit logger can be
+    // threaded into HealthState and dashboard-access events are captured from
+    // the first request. Probes (/healthz, /readyz) are still served immediately
+    // after coordinator startup; the only change vs. the pre-Task-2 placement is
+    // that the health server starts a few ms later (after audit file open).
+    let health_state = Arc::new(HealthState {
+        ready: ready.clone(),
+        started_at,
+        role: "coordinator",
+        worker_registry: if distributed {
+            Some(worker_registry.clone())
+        } else {
+            None
+        },
+        query_tracker: Some(query_tracker.clone()),
+        web_ui: config.metrics.web_ui,
+        catalog_url: config.catalog.catalog_url.clone(),
+        node_info: Some(node_info),
+        metrics_history: metrics_history.clone(),
+        // auth_chain is already built above; reuse it for the web_ui guard.
+        bearer_provider: Some(Arc::clone(&auth_chain) as Arc<dyn sqe_auth::AuthProvider>),
+        auth_cfg: Some(config.auth.clone()),
+        audit: Some(Arc::clone(&audit)),
+        anonymous_denied: Some(metrics.dashboard_auth_anonymous_denied_total.clone()),
+    });
+    start_health_server(health_port, health_state);
+
+    // Spawn the OTLP audit shipper when export is enabled.
+    let shipper_shutdown_tx = if let Some(ref spool_path) = shipper_spool_path {
+        let ae = &config.metrics.audit_export;
+
+        let endpoint = if !ae.otlp_endpoint.is_empty() {
+            ae.otlp_endpoint.clone()
+        } else if !config.metrics.otlp_endpoint.is_empty() {
+            config.metrics.otlp_endpoint.clone()
+        } else {
+            tracing::warn!(
+                "audit export: no OTLP endpoint configured \
+                 (audit_export.otlp_endpoint and metrics.otlp_endpoint are both empty); \
+                 shipper will not start"
+            );
+            String::new()
+        };
+
+        if endpoint.is_empty() {
+            None
+        } else {
+            match sqe_metrics::audit::export::OtlpExporter::new(&endpoint) {
+                Err(e) => {
+                    tracing::warn!(error = %e, "audit export: failed to build OtlpExporter; shipper will not start");
+                    None
+                }
+                Ok(exporter) => {
+                    let cursor_path = format!("{spool_path}.cursor");
+                    let shipper_metrics = sqe_metrics::audit::export::ShipperMetrics {
+                        records_total: Some(metrics.audit_export_records_total.clone()),
+                        batch_failures_total: Some(metrics.audit_export_batch_failures_total.clone()),
+                        spool_lag_bytes: Some(metrics.audit_export_spool_lag_bytes.clone()),
+                        cursor_seq: Some(metrics.audit_export_cursor_seq.clone()),
+                        last_success_timestamp: Some(metrics.audit_export_last_success_timestamp.clone()),
+                    };
+                    let shipper = sqe_metrics::audit::export::OtlpLogShipper::new(
+                        std::path::PathBuf::from(spool_path),
+                        std::path::PathBuf::from(&cursor_path),
+                        std::sync::Arc::new(exporter),
+                        ae.batch_max,
+                        ae.max_spool_bytes,
+                        sqe_coordinator::parse_start_at(&ae.start_at),
+                        ae.flush_interval_ms,
+                    )
+                    .with_metrics(shipper_metrics);
+
+                    let (tx, rx) = tokio::sync::watch::channel(false);
+                    tokio::spawn(shipper.run(rx));
+                    tracing::info!(
+                        spool = %spool_path,
+                        endpoint = %endpoint,
+                        "Started audit OTLP shipper"
+                    );
+                    Some(tx)
+                }
+            }
+        }
+    } else {
+        if config.metrics.audit_export.enabled
+            && config.metrics.audit_export.target != "otlp"
+        {
+            tracing::warn!(
+                target = %config.metrics.audit_export.target,
+                "audit export: unknown target; only \"otlp\" is supported; shipper will not start"
+            );
+        }
+        None
+    };
 
     // Guard + self-audit the superdebug_log_results escape hatch.
     // No-op when the flag is false (the default).
@@ -1178,7 +1318,7 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
         tracing::info!("SQE coordinator listening on {addr} (plaintext)");
     }
 
-    server_builder
+    let serve_result = server_builder
         .add_service(
             arrow_flight::flight_service_server::FlightServiceServer::new(flight_service),
         )
@@ -1186,8 +1326,14 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
             addr,
             shutdown_with_drain(ready.clone(), config.coordinator.shutdown_drain_secs),
         )
-        .await?;
+        .await;
 
+    // Signal the audit shipper to stop now that the server has exited.
+    if let Some(tx) = shipper_shutdown_tx {
+        let _ = tx.send(true);
+    }
+
+    serve_result?;
     tracing::info!("SQE coordinator shut down");
     Ok(())
 }
@@ -1219,6 +1365,10 @@ async fn run_worker(config: SqeConfig) -> anyhow::Result<()> {
         catalog_url: config.catalog.catalog_url.clone(),
         node_info: None,
         metrics_history: None,
+        bearer_provider: None,
+        auth_cfg: None,
+        audit: None,
+        anonymous_denied: None,
     });
     start_health_server(health_port, health_state);
 
@@ -1584,6 +1734,10 @@ mod tests {
             catalog_url: String::new(),
             node_info: None,
             metrics_history: None,
+            bearer_provider: None,
+            auth_cfg: None,
+            audit: None,
+            anonymous_denied: None,
         });
 
         let Json(status) = cluster_status(axum::extract::State(state)).await;
@@ -1604,6 +1758,10 @@ mod tests {
             catalog_url: String::new(),
             node_info: None,
             metrics_history: None,
+            bearer_provider: None,
+            auth_cfg: None,
+            audit: None,
+            anonymous_denied: None,
         });
 
         let Json(status) = cluster_status(axum::extract::State(state)).await;
@@ -1630,6 +1788,10 @@ mod tests {
             catalog_url: String::new(),
             node_info: None,
             metrics_history: None,
+            bearer_provider: None,
+            auth_cfg: None,
+            audit: None,
+            anonymous_denied: None,
         });
 
         let Json(status) = cluster_status(axum::extract::State(state)).await;
@@ -1653,6 +1815,10 @@ mod tests {
             catalog_url: String::new(),
             node_info: None,
             metrics_history: None,
+            bearer_provider: None,
+            auth_cfg: None,
+            audit: None,
+            anonymous_denied: None,
         });
 
         let response = readyz(axum::extract::State(state)).await;
@@ -1675,6 +1841,10 @@ mod tests {
             catalog_url: "http://192.0.2.1:1".to_string(),
             node_info: None,
             metrics_history: None,
+            bearer_provider: None,
+            auth_cfg: None,
+            audit: None,
+            anonymous_denied: None,
         });
 
         let response = readyz(axum::extract::State(state)).await;
@@ -1733,6 +1903,10 @@ mod tests {
             catalog_url: String::new(),
             node_info: None,
             metrics_history: None,
+            bearer_provider: None,
+            auth_cfg: None,
+            audit: None,
+            anonymous_denied: None,
         });
 
         let response = readyz(axum::extract::State(state)).await;
@@ -1757,6 +1931,10 @@ mod tests {
             catalog_url: String::new(),
             node_info: None,
             metrics_history: None,
+            bearer_provider: None,
+            auth_cfg: None,
+            audit: None,
+            anonymous_denied: None,
         });
 
         let Json(items) = api_queries(
@@ -1782,6 +1960,10 @@ mod tests {
             catalog_url: String::new(),
             node_info: None,
             metrics_history: None,
+            bearer_provider: None,
+            auth_cfg: None,
+            audit: None,
+            anonymous_denied: None,
         });
         let Json(resp) = api_metrics_history(axum::extract::State(state)).await;
         assert_eq!(resp.bucket_seconds, sqe_coordinator::metrics_history::BUCKET_SECS);
@@ -1815,11 +1997,145 @@ mod tests {
             catalog_url: String::new(),
             node_info: None,
             metrics_history: Some(hist),
+            bearer_provider: None,
+            auth_cfg: None,
+            audit: None,
+            anonymous_denied: None,
         });
         let Json(resp) = api_metrics_history(axum::extract::State(state)).await;
         assert_eq!(resp.bucket_seconds, sqe_coordinator::metrics_history::BUCKET_SECS);
         assert!(!resp.buckets.is_empty());
         // 3 samples at 0, 10_000, 20_000 ms all fall in the same 900-s bucket
         assert_eq!(resp.buckets.len(), 1);
+    }
+
+    // ── Route-level bearer + admin guard tests ─────────────────────────────────
+    //
+    // These tests drive `build_health_router` directly via `tower::ServiceExt::oneshot`
+    // to assert that:
+    //   - `/healthz` is always open (no token needed)
+    //   - web_ui routes require a valid admin bearer token
+    //   - missing token -> 401, non-admin token -> 403, admin token -> 200
+
+    struct StubAuthProvider {
+        admin_roles: Vec<String>,
+    }
+
+    #[async_trait::async_trait]
+    impl sqe_auth::AuthProvider for StubAuthProvider {
+        async fn authenticate(
+            &self,
+            creds: &sqe_auth::FlightCredentials,
+        ) -> Result<sqe_auth::Identity, sqe_auth::AuthError> {
+            let token = creds
+                .bearer_token
+                .as_ref()
+                .map(|t| t.expose().to_string())
+                .unwrap_or_default();
+            // "admin-tok" -> admin; "user-tok" -> non-admin; anything else -> fail
+            match token.as_str() {
+                "admin-tok" => Ok(sqe_auth::Identity {
+                    user_id: "admin".into(),
+                    display_name: "Admin".into(),
+                    roles: self.admin_roles.clone(),
+                    subject: None,
+                    email: None,
+                    groups: vec![],
+                    catalog_token: None,
+                    refresh_token: None,
+                    expires_at: None,
+                }),
+                "user-tok" => Ok(sqe_auth::Identity {
+                    user_id: "user".into(),
+                    display_name: "User".into(),
+                    roles: vec!["analyst".into()],
+                    subject: None,
+                    email: None,
+                    groups: vec![],
+                    catalog_token: None,
+                    refresh_token: None,
+                    expires_at: None,
+                }),
+                _ => Err(sqe_auth::AuthError::AuthFailed("bad token".into())),
+            }
+        }
+    }
+
+    fn make_guarded_state() -> Arc<HealthState> {
+        let provider: Arc<dyn sqe_auth::AuthProvider> = Arc::new(StubAuthProvider {
+            admin_roles: vec!["sqe-admin".into()],
+        });
+        let mut auth_cfg: sqe_core::config::AuthConfig =
+            toml::from_str("").expect("empty auth config");
+        auth_cfg.admin_roles = vec!["sqe-admin".into()];
+        Arc::new(HealthState {
+            ready: Arc::new(AtomicBool::new(true)),
+            started_at: Instant::now(),
+            role: "coordinator",
+            worker_registry: None,
+            query_tracker: None,
+            web_ui: true,
+            catalog_url: String::new(),
+            node_info: None,
+            metrics_history: None,
+            bearer_provider: Some(provider),
+            auth_cfg: Some(auth_cfg),
+            audit: None,
+            anonymous_denied: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn healthz_open_without_token() {
+        use tower::ServiceExt;
+        let state = make_guarded_state();
+        let app = build_health_router(state);
+        let req = axum::http::Request::builder()
+            .uri("/healthz")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn web_ui_queries_no_token_is_401() {
+        use tower::ServiceExt;
+        let state = make_guarded_state();
+        let app = build_health_router(state);
+        let req = axum::http::Request::builder()
+            .uri("/api/v1/queries")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn web_ui_queries_non_admin_bearer_is_403() {
+        use tower::ServiceExt;
+        let state = make_guarded_state();
+        let app = build_health_router(state);
+        let req = axum::http::Request::builder()
+            .uri("/api/v1/queries")
+            .header("Authorization", "Bearer user-tok")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn web_ui_queries_admin_bearer_is_200() {
+        use tower::ServiceExt;
+        let state = make_guarded_state();
+        let app = build_health_router(state);
+        let req = axum::http::Request::builder()
+            .uri("/api/v1/queries")
+            .header("Authorization", "Bearer admin-tok")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
     }
 }

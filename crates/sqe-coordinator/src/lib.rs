@@ -30,6 +30,7 @@ pub mod scheduler;
 pub mod streaming;
 pub mod suggest_bloom;
 pub mod session_manager;
+pub mod web_auth;
 pub mod web_ui;
 pub mod worker_registry;
 pub mod write_handler;
@@ -132,6 +133,69 @@ pub fn maybe_warn_superdebug(audit: &sqe_metrics::audit::AuditLogger, config: &s
         integrity: sqe_metrics::audit::Integrity::default(),
     };
     audit.log_event(event);
+}
+
+/// Derive the spool path for the audit export pipeline.
+///
+/// When `configured_spool_path` is non-empty it is used directly.
+/// Otherwise the spool is placed adjacent to the main audit log:
+/// `<audit_log_path>.ocsf.spool.jsonl`.
+pub fn derive_spool_path(configured_spool_path: &str, audit_log_path: &str) -> String {
+    if !configured_spool_path.is_empty() {
+        configured_spool_path.to_string()
+    } else {
+        format!("{audit_log_path}.ocsf.spool.jsonl")
+    }
+}
+
+/// Parse the `audit_export.start_at` config string into a `StartAt` enum.
+///
+/// Accepts "beginning" (case-insensitive). Anything else (including the
+/// default "now") maps to `StartAt::Now`.
+pub fn parse_start_at(s: &str) -> sqe_metrics::audit::export::StartAt {
+    if s.eq_ignore_ascii_case("beginning") {
+        sqe_metrics::audit::export::StartAt::Beginning
+    } else {
+        sqe_metrics::audit::export::StartAt::Now
+    }
+}
+
+#[cfg(test)]
+mod spool_path_tests {
+    use super::{derive_spool_path, parse_start_at};
+    use sqe_metrics::audit::export::StartAt;
+
+    #[test]
+    fn derive_spool_path_uses_configured_when_set() {
+        let result = derive_spool_path("/custom/spool.jsonl", "/var/log/audit.jsonl");
+        assert_eq!(result, "/custom/spool.jsonl");
+    }
+
+    #[test]
+    fn derive_spool_path_defaults_to_audit_log_adjacent() {
+        let result = derive_spool_path("", "/var/log/sqe-audit.jsonl");
+        assert_eq!(result, "/var/log/sqe-audit.jsonl.ocsf.spool.jsonl");
+    }
+
+    #[test]
+    fn derive_spool_path_both_empty_gives_relative_path() {
+        let result = derive_spool_path("", "");
+        assert_eq!(result, ".ocsf.spool.jsonl");
+    }
+
+    #[test]
+    fn parse_start_at_now_default() {
+        assert_eq!(parse_start_at("now"), StartAt::Now);
+        assert_eq!(parse_start_at(""), StartAt::Now);
+        assert_eq!(parse_start_at("unknown"), StartAt::Now);
+    }
+
+    #[test]
+    fn parse_start_at_beginning_case_insensitive() {
+        assert_eq!(parse_start_at("beginning"), StartAt::Beginning);
+        assert_eq!(parse_start_at("BEGINNING"), StartAt::Beginning);
+        assert_eq!(parse_start_at("Beginning"), StartAt::Beginning);
+    }
 }
 
 /// Test-only re-exports used by integration tests under `tests/`.

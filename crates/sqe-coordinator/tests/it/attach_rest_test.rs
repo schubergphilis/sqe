@@ -146,7 +146,7 @@ async fn attach_rest_catalog_succeeds() {
     let sql = format!(
         "ATTACH '{url}' AS remote_cat (TYPE iceberg_rest, WAREHOUSE 'test-wh')"
     );
-    let result = handler.execute(&session, &sql).await;
+    let result = handler.execute(&session, &sql, None).await;
     assert!(result.is_ok(), "ATTACH should succeed: {:?}", result.err());
     assert_eq!(result.unwrap().iter().map(|b| b.num_rows()).sum::<usize>(), 0);
 }
@@ -163,10 +163,10 @@ async fn attach_rest_duplicate_name_errors() {
     let sql = format!(
         "ATTACH '{url}' AS dup_cat (TYPE iceberg_rest, WAREHOUSE 'wh')"
     );
-    handler.execute(&session, &sql).await.expect("first attach");
+    handler.execute(&session, &sql, None).await.expect("first attach");
 
     let err = handler
-        .execute(&session, &sql)
+        .execute(&session, &sql, None)
         .await
         .expect_err("second attach with same name should fail");
 
@@ -188,11 +188,11 @@ async fn attach_then_detach_then_reattach() {
     let attach_sql = format!(
         "ATTACH '{url}' AS cycle_cat (TYPE iceberg_rest, WAREHOUSE 'wh')"
     );
-    handler.execute(&session, &attach_sql).await.expect("first attach");
-    handler.execute(&session, "DETACH cycle_cat").await.expect("detach");
+    handler.execute(&session, &attach_sql, None).await.expect("first attach");
+    handler.execute(&session, "DETACH cycle_cat", None).await.expect("detach");
 
     // After DETACH the name is free; a second ATTACH must succeed.
-    handler.execute(&session, &attach_sql).await.expect("second attach after detach");
+    handler.execute(&session, &attach_sql, None).await.expect("second attach after detach");
 }
 
 #[tokio::test]
@@ -201,7 +201,7 @@ async fn detach_unknown_catalog_errors() {
     let session = dummy_session();
 
     let err = handler
-        .execute(&session, "DETACH nobody")
+        .execute(&session, "DETACH nobody", None)
         .await
         .expect_err("detaching unknown catalog should fail");
 
@@ -229,14 +229,14 @@ async fn attach_with_bearer_secret_ref() {
     let url = server.uri();
 
     handler
-        .execute(&session, "CREATE SECRET rest_tok (TYPE bearer, TOKEN 'my_bearer')")
+        .execute(&session, "CREATE SECRET rest_tok (TYPE bearer, TOKEN 'my_bearer')", None)
         .await
         .expect("create secret");
 
     let sql = format!(
         "ATTACH '{url}' AS secret_cat (TYPE iceberg_rest, WAREHOUSE 'wh', SECRET rest_tok)"
     );
-    handler.execute(&session, &sql).await.expect("attach with secret ref");
+    handler.execute(&session, &sql, None).await.expect("attach with secret ref");
 }
 
 #[tokio::test]
@@ -249,21 +249,20 @@ async fn drop_secret_blocked_while_catalog_attached() {
     let url = server.uri();
 
     handler
-        .execute(&session, "CREATE SECRET guard_tok (TYPE bearer, TOKEN 'tok')")
+        .execute(&session, "CREATE SECRET guard_tok (TYPE bearer, TOKEN 'tok')", None)
         .await
         .expect("create secret");
 
     handler
         .execute(
             &session,
-            &format!("ATTACH '{url}' AS guarded (TYPE iceberg_rest, WAREHOUSE 'wh', SECRET guard_tok)"),
-        )
+            &format!("ATTACH '{url}' AS guarded (TYPE iceberg_rest, WAREHOUSE 'wh', SECRET guard_tok)"), None)
         .await
         .expect("attach");
 
     // The secret is in use — DROP must fail.
     let err = handler
-        .execute(&session, "DROP SECRET guard_tok")
+        .execute(&session, "DROP SECRET guard_tok", None)
         .await
         .expect_err("drop while in-use should fail");
 
@@ -282,7 +281,7 @@ async fn drop_secret_succeeds_after_detach() {
     let url = server.uri();
 
     handler
-        .execute(&session, "CREATE SECRET free_tok (TYPE bearer, TOKEN 'tok')")
+        .execute(&session, "CREATE SECRET free_tok (TYPE bearer, TOKEN 'tok')", None)
         .await
         .expect("create");
 
@@ -291,21 +290,20 @@ async fn drop_secret_succeeds_after_detach() {
             &session,
             &format!(
                 "ATTACH '{url}' AS free_cat (TYPE iceberg_rest, WAREHOUSE 'wh', SECRET free_tok)"
-            ),
-        )
+            ), None)
         .await
         .expect("attach");
 
-    handler.execute(&session, "DETACH free_cat").await.expect("detach");
+    handler.execute(&session, "DETACH free_cat", None).await.expect("detach");
 
     // Secret is no longer in use — DROP must now succeed.
     handler
-        .execute(&session, "DROP SECRET free_tok")
+        .execute(&session, "DROP SECRET free_tok", None)
         .await
         .expect("drop after detach should succeed");
 
     // Confirm it is gone.
-    let batches = handler.execute(&session, "SHOW SECRETS").await.unwrap();
+    let batches = handler.execute(&session, "SHOW SECRETS", None).await.unwrap();
     let total: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(total, 0, "secret store should be empty after drop");
 }
@@ -327,7 +325,7 @@ async fn attach_rejected_without_admin_role() {
         "ATTACH '{url}' AS forbidden (TYPE iceberg_rest, WAREHOUSE 'wh')"
     );
     let err = handler
-        .execute(&session, &sql)
+        .execute(&session, &sql, None)
         .await
         .expect_err("non-admin must not ATTACH");
 
@@ -348,14 +346,13 @@ async fn detach_rejected_without_admin_role() {
     handler
         .execute(
             &admin,
-            &format!("ATTACH '{url}' AS keep_it (TYPE iceberg_rest, WAREHOUSE 'wh')"),
-        )
+            &format!("ATTACH '{url}' AS keep_it (TYPE iceberg_rest, WAREHOUSE 'wh')"), None)
         .await
         .expect("admin attaches");
 
     let non_admin = session_with_roles(vec![]);
     let err = handler
-        .execute(&non_admin, "DETACH keep_it")
+        .execute(&non_admin, "DETACH keep_it", None)
         .await
         .expect_err("non-admin must not DETACH");
 

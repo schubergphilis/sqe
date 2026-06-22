@@ -162,8 +162,7 @@ async fn audit_logs_create_secret_with_redacted_token() {
     fx.handler
         .execute(
             &session,
-            "CREATE SECRET my_audit_tok (TYPE bearer, TOKEN 'super_secret_value_xyz')",
-        )
+            "CREATE SECRET my_audit_tok (TYPE bearer, TOKEN 'super_secret_value_xyz')", None)
         .await
         .expect("create secret");
 
@@ -190,15 +189,15 @@ async fn audit_logs_show_and_drop_secret_each_emit_one_line() {
     let session = admin_session();
 
     fx.handler
-        .execute(&session, "CREATE SECRET tmp_tok (TYPE bearer, TOKEN 'x')")
+        .execute(&session, "CREATE SECRET tmp_tok (TYPE bearer, TOKEN 'x')", None)
         .await
         .expect("create");
     fx.handler
-        .execute(&session, "SHOW SECRETS")
+        .execute(&session, "SHOW SECRETS", None)
         .await
         .expect("show");
     fx.handler
-        .execute(&session, "DROP SECRET tmp_tok")
+        .execute(&session, "DROP SECRET tmp_tok", None)
         .await
         .expect("drop");
 
@@ -220,7 +219,7 @@ async fn audit_logs_failed_create_with_error_status() {
 
     let _ = fx
         .handler
-        .execute(&session, "CREATE SECRET bad (TYPE bearer)")
+        .execute(&session, "CREATE SECRET bad (TYPE bearer)", None)
         .await
         .expect_err("missing TOKEN should fail");
 
@@ -250,9 +249,9 @@ async fn audit_logs_attach_and_detach_against_mock_rest() {
     let attach_sql = format!(
         "ATTACH '{url}' AS audit_cat (TYPE iceberg_rest, WAREHOUSE 'wh')"
     );
-    fx.handler.execute(&session, &attach_sql).await.expect("attach");
+    fx.handler.execute(&session, &attach_sql, None).await.expect("attach");
     fx.handler
-        .execute(&session, "DETACH audit_cat")
+        .execute(&session, "DETACH audit_cat", None)
         .await
         .expect("detach");
 
@@ -320,8 +319,7 @@ async fn audit_select_query_emits_canonical_event_and_redacts_pii() {
         .handler
         .execute(
             &session,
-            "SELECT table_name FROM information_schema.tables WHERE table_name = 'leak@example.com'",
-        )
+            "SELECT table_name FROM information_schema.tables WHERE table_name = 'leak@example.com'", None)
         .await;
 
     // The query may return zero rows or fail on edge cases. Either way the audit
@@ -381,7 +379,7 @@ async fn audit_logs_denied_admin_call_as_error() {
 
     let _ = fx
         .handler
-        .execute(&session, "CREATE SECRET nope (TYPE bearer, TOKEN 'x')")
+        .execute(&session, "CREATE SECRET nope (TYPE bearer, TOKEN 'x')", None)
         .await
         .expect_err("non-admin must be denied");
 
@@ -744,7 +742,7 @@ async fn audit_emits_grant_event_with_resource_and_grantee() {
     let session = admin_session();
 
     fx.handler
-        .execute(&session, "GRANT SELECT ON sales.orders TO ROLE analyst")
+        .execute(&session, "GRANT SELECT ON sales.orders TO ROLE analyst", None)
         .await
         .expect("grant must succeed for admin");
 
@@ -806,7 +804,7 @@ async fn audit_emits_grant_event_for_revoke() {
     let session = admin_session();
 
     fx.handler
-        .execute(&session, "REVOKE SELECT ON sales.orders FROM ROLE analyst")
+        .execute(&session, "REVOKE SELECT ON sales.orders FROM ROLE analyst", None)
         .await
         .expect("revoke must succeed for admin");
 
@@ -827,4 +825,393 @@ async fn audit_emits_grant_event_for_revoke() {
     assert_eq!(entry["status"].as_str(), Some("success"));
     let resources = entry["resources"].as_array().expect("resources array");
     assert_eq!(resources[0]["name"].as_str(), Some("orders"));
+}
+
+/// TDD guard for Task 2: streaming SELECT migrates to canonical `AuditEvent`.
+///
+/// Builds a `StreamFinalizer` wired to a real `AuditLogger`, sets an `Actor`
+/// with a known username and a non-empty `resources` list, drives the success
+/// finalization path, flushes, reads the JSONL line, and asserts it is a
+/// canonical `AuditEvent` - not the legacy flat `AuditEntry`.
+///
+/// Assertions mirror the brief's required test contract:
+/// 1. `kind` == "query" (canonical AuditEvent discriminant)
+/// 2. `actor.username` == "auditor" (Actor field populated from session)
+/// 3. `resources` is a non-empty array (Resource list threaded through)
+/// 4. No top-level `statement_type` field (was top-level in AuditEntry)
+/// 5. `integrity.seq` is a u64 (hash-chain populated by the logger)
+#[tokio::test]
+async fn streaming_select_emits_canonical_query_event() {
+    use arrow_array::{Int64Array, RecordBatch};
+    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+    use datafusion::prelude::SessionContext;
+    use futures::StreamExt;
+    use sqe_coordinator::streaming::{StreamFinalizer, TrackedRecordBatchStream};
+    use sqe_coordinator::query_tracker::QueryTracker;
+    use sqe_core::QueryHistoryConfig;
+    use sqe_metrics::audit::{Actor, AuditLogger, ObjectType, Resource};
+    use std::sync::Arc;
+
+    // Build a trivial physical plan via SessionContext (mirrors the inline test).
+    let ctx = SessionContext::new();
+    let df = ctx.sql("SELECT 1 AS x").await.unwrap();
+    let schema: std::sync::Arc<arrow_schema::Schema> =
+        std::sync::Arc::new(df.schema().as_arrow().clone());
+    let plan = df.create_physical_plan().await.unwrap();
+    let runtime = ctx.runtime_env();
+
+    let tracker = Arc::new(QueryTracker::new(&QueryHistoryConfig {
+        max_entries: 128,
+        ttl_secs: 60,
+    }));
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("audit.jsonl");
+    let audit = Arc::new(AuditLogger::new(path.to_str().unwrap()).unwrap());
+
+    // Construct a StreamFinalizer with a known Actor and non-empty resources.
+    let fin = StreamFinalizer {
+        tracker: Arc::clone(&tracker),
+        metrics: None,
+        audit: Some(Arc::clone(&audit)),
+        query_id: uuid::Uuid::now_v7(),
+        username: "auditor".to_string(),
+        session_id: "sess-streaming-1".to_string(),
+        sql: "SELECT 1 AS x".to_string(),
+        kind_name: "Query".to_string(),
+        plan,
+        runtime,
+        start: std::time::Instant::now(),
+        slow_query_threshold_secs: 0,
+        sql_length: 14,
+        tables_touched: vec!["polaris.public.orders".to_string()],
+        policy_summary: sqe_policy::PolicySummary::default(),
+        profile_mode: sqe_core::ProfileMode::Off,
+        actor: Actor::from_parts(
+            "auditor".to_string(),
+            Some("sub-001".to_string()),
+            Some("auditor@example.com".to_string()),
+            vec!["analyst".to_string()],
+            vec![],
+        ),
+        resources: vec![Resource {
+            catalog: Some("polaris".to_string()),
+            namespace: vec!["public".to_string()],
+            name: "orders".to_string(),
+            object_type: ObjectType::Table,
+        }],
+        client_ip: None,
+    };
+
+    let qid = fin.query_id;
+    tracker.start(qid, "auditor", None, "SELECT 1 AS x", "sess-streaming-1", None, vec![]);
+
+    // Drive the success path: create a single-batch stream and drain it.
+    let arr = Int64Array::from_iter_values(0..5);
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(arr)],
+    )
+    .unwrap();
+    let s = futures::stream::iter(vec![Ok(batch)]);
+    let inner: datafusion::physical_plan::SendableRecordBatchStream =
+        Box::pin(RecordBatchStreamAdapter::new(Arc::clone(&schema), s));
+    let mut stream = TrackedRecordBatchStream::new(inner, fin, None);
+    while let Some(b) = stream.next().await {
+        let _ = b.unwrap();
+    }
+    drop(stream);
+    audit.flush();
+
+    let content = std::fs::read_to_string(&path).unwrap();
+    assert!(!content.is_empty(), "audit file must have content after flush");
+    let line = content.lines().next().expect("at least one line in audit file");
+    let v: serde_json::Value = serde_json::from_str(line).unwrap();
+
+    // 1. canonical AuditEvent discriminant
+    assert_eq!(v["kind"], "query", "expected kind=query, got: {v}");
+    // 2. Actor field populated from session
+    assert_eq!(v["actor"]["username"], "auditor", "expected actor.username=auditor, got: {v}");
+    // 3. non-empty resources array (we set one resource above)
+    assert!(
+        v["resources"].is_array(),
+        "AuditEvent must carry a structured resources array; got: {v}"
+    );
+    assert!(
+        !v["resources"].as_array().unwrap().is_empty(),
+        "resources array must be non-empty; got: {v}"
+    );
+    // 4. no top-level statement_type (legacy AuditEntry artifact)
+    assert!(
+        v.get("statement_type").is_none() || v["statement_type"].is_null(),
+        "top-level statement_type must not appear in canonical AuditEvent; got: {v}"
+    );
+    // 5. hash-chain integrity.seq populated
+    assert!(
+        v["integrity"]["seq"].is_u64(),
+        "integrity.seq must be a u64; got: {v}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Task 3: DDL and DML migrate to canonical AuditEvent
+// ---------------------------------------------------------------------------
+
+/// TDD guard for Task 3: DDL statements emit a canonical `AuditEvent` with
+/// `kind == "admin_ddl"`, not the legacy flat `AuditEntry`.
+///
+/// A `DROP TABLE` is used because it requires only the parser (no catalog
+/// connection needed to parse the statement), and a parser-level failure still
+/// runs through the full audit dispatch block, emitting a Failure-outcome
+/// canonical event. The test asserts:
+///
+/// 1. `kind` == "admin_ddl" (canonical AuditEvent, not legacy flat entry).
+/// 2. `actor.username` == "auditor" (Actor populated from session).
+/// 3. No top-level `statement_type` (legacy AuditEntry artifact absent).
+/// 4. `integrity.seq` is a u64 (hash-chain populated by the logger).
+#[tokio::test]
+async fn ddl_emits_canonical_admin_ddl_event() {
+    let fx = make_fixture();
+    let session = admin_session();
+
+    // DROP TABLE will fail at execution (no catalog), but the audit block
+    // still runs. A Failure-outcome canonical AuditEvent is emitted.
+    let _ = fx
+        .handler
+        .execute(&session, "DROP TABLE IF EXISTS myns.mytable", None)
+        .await;
+
+    let lines = fx.read_lines();
+    assert_eq!(
+        lines.len(),
+        1,
+        "exactly one audit line written for DDL; got:\n{}",
+        serde_json::to_string_pretty(&serde_json::Value::Array(lines.clone())).unwrap_or_default()
+    );
+    let entry = &lines[0];
+
+    // 1. canonical AuditEvent kind discriminant must be "admin_ddl"
+    assert_eq!(
+        entry["kind"].as_str(),
+        Some("admin_ddl"),
+        "DDL must emit a canonical AuditEvent with kind=admin_ddl; got: {entry}"
+    );
+
+    // 2. actor.username must match the session username
+    assert_eq!(
+        entry["actor"]["username"].as_str(),
+        Some("auditor"),
+        "actor.username must be populated from the session; got: {entry}"
+    );
+
+    // 3. no top-level statement_type (that is the legacy AuditEntry shape)
+    assert!(
+        entry["statement_type"].is_null(),
+        "top-level statement_type must NOT appear in a canonical AuditEvent; got: {entry}"
+    );
+
+    // 4. hash-chain integrity.seq must be a u64
+    assert!(
+        entry["integrity"]["seq"].is_u64(),
+        "integrity.seq must be a u64; got: {entry}"
+    );
+}
+
+/// TDD guard for Task 3: `CREATE SECRET` statements stay on the redacted legacy
+/// `log(&AuditEntry)` path after the DDL/DML migration. The legacy path applies
+/// PII redaction before the line is written, which is the established contract
+/// for secret SQL.
+///
+/// Asserts:
+///
+/// 1. The raw bearer token does NOT appear anywhere in the written file.
+/// 2. The written line has `statement_type` at TOP LEVEL (legacy flat shape).
+/// 3. The written line does NOT have a top-level `kind` field (canonical shape
+///    is NOT used for secrets).
+#[tokio::test]
+async fn create_secret_stays_redacted_legacy_after_ddl_migration() {
+    let fx = make_fixture();
+    let session = admin_session();
+
+    fx.handler
+        .execute(
+            &session,
+            "CREATE SECRET task3_guard (TYPE bearer, TOKEN 'task3_secret_material_xyz')", None)
+        .await
+        .expect("create secret must succeed");
+
+    let lines = fx.read_lines();
+    assert_eq!(lines.len(), 1, "exactly one audit line written");
+    let entry = &lines[0];
+
+    // 1. The raw token must NOT appear in the file (redaction contract).
+    let raw_content = std::fs::read_to_string(&fx.log_path).expect("audit file readable");
+    assert!(
+        !raw_content.contains("task3_secret_material_xyz"),
+        "raw bearer token must not appear in audit log after DDL migration: {raw_content}"
+    );
+
+    // 2. The line carries top-level `statement_type` (legacy flat AuditEntry shape).
+    assert_eq!(
+        entry["statement_type"].as_str(),
+        Some("create_secret"),
+        "CREATE SECRET must remain on legacy path with top-level statement_type; got: {entry}"
+    );
+
+    // 3. The line does NOT carry a top-level `kind` field (not a canonical AuditEvent).
+    assert!(
+        entry["kind"].is_null(),
+        "CREATE SECRET must NOT be emitted as a canonical AuditEvent (kind must be absent); got: {entry}"
+    );
+}
+
+/// TDD guard for sub-project C Task 3: per-request `client_ip` threads into
+/// the Query `AuditEvent`.
+///
+/// Drives `QueryHandler::execute` with `client_ip: Some("10.1.2.3".into())`
+/// and asserts the written canonical `AuditEvent` line carries
+/// `client_ip == "10.1.2.3"`. The query is a SELECT against the built-in
+/// `information_schema.tables` virtual table (no Iceberg catalog required once
+/// the fixture's catalog URL satisfies the `/v1/config` probe).
+///
+/// RED: before the param is added, the call will fail to compile (wrong arity).
+/// GREEN: after the param is accepted and threaded to the audit event.
+#[tokio::test]
+async fn execute_threads_client_ip_into_query_audit_event() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/config"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(r#"{"overrides":{},"defaults":{}}"#),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1/namespaces"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(r#"{"namespaces":[]}"#),
+        )
+        .mount(&server)
+        .await;
+
+    let fx = make_fixture_with_url(&server.uri());
+    let session = admin_session();
+
+    let _ = fx
+        .handler
+        .execute(
+            &session,
+            "SELECT table_name FROM information_schema.tables",
+            Some("10.1.2.3".to_string()),
+        )
+        .await;
+
+    let lines = fx.read_lines();
+    assert_eq!(
+        lines.len(),
+        1,
+        "exactly one audit line written; got:\n{}",
+        serde_json::to_string_pretty(&serde_json::Value::Array(lines.clone())).unwrap_or_default()
+    );
+    let entry = &lines[0];
+
+    // Must be a canonical AuditEvent.
+    assert_eq!(
+        entry["kind"].as_str(),
+        Some("query"),
+        "written line must be canonical AuditEvent (kind: query); got: {entry}"
+    );
+
+    // client_ip must be threaded through from the caller.
+    assert_eq!(
+        entry["client_ip"].as_str(),
+        Some("10.1.2.3"),
+        "client_ip must equal the value passed to execute(); got: {entry}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Task 4 (folded-in): Grant and DDL audit events carry client_ip
+// ---------------------------------------------------------------------------
+
+/// TDD guard for Task 4 (Grant branch): `client_ip` passed to `execute()`
+/// appears in the GRANT audit event.
+///
+/// RED before the `client_ip: None` -> `client_ip.clone()` fix in
+/// `query_handler.rs` ~1658.
+/// GREEN after.
+#[tokio::test]
+async fn grant_audit_event_carries_client_ip() {
+    let fx = make_fixture_with_grant_backend();
+    let session = admin_session();
+
+    fx.handler
+        .execute(
+            &session,
+            "GRANT SELECT ON sales.orders TO ROLE analyst",
+            Some("192.168.1.100".to_string()),
+        )
+        .await
+        .expect("grant must succeed for admin");
+
+    let lines = fx.read_lines();
+    let grant_events: Vec<&serde_json::Value> = lines
+        .iter()
+        .filter(|e| e["kind"].as_str() == Some("grant"))
+        .collect();
+
+    assert_eq!(grant_events.len(), 1, "exactly one grant event; got lines:\n{}",
+        serde_json::to_string_pretty(&serde_json::Value::Array(lines.clone())).unwrap_or_default());
+
+    let entry = grant_events[0];
+    assert_eq!(
+        entry["client_ip"].as_str(),
+        Some("192.168.1.100"),
+        "grant audit event must carry client_ip; got: {entry}"
+    );
+}
+
+/// TDD guard for Task 4 (DDL branch): `client_ip` passed to `execute()`
+/// appears in the DDL (admin_ddl) audit event.
+///
+/// RED before the `client_ip: None` -> `client_ip.clone()` fix in
+/// `query_handler.rs` ~1748.
+/// GREEN after.
+#[tokio::test]
+async fn ddl_audit_event_carries_client_ip() {
+    let fx = make_fixture();
+    let session = admin_session();
+
+    // DROP TABLE fails at execution (no catalog) but the audit block still
+    // runs, emitting a Failure-outcome canonical AuditEvent.
+    let _ = fx
+        .handler
+        .execute(
+            &session,
+            "DROP TABLE IF EXISTS myns.mytable",
+            Some("10.20.30.40".to_string()),
+        )
+        .await;
+
+    let lines = fx.read_lines();
+    assert_eq!(
+        lines.len(),
+        1,
+        "exactly one audit line for DDL; got:\n{}",
+        serde_json::to_string_pretty(&serde_json::Value::Array(lines.clone())).unwrap_or_default()
+    );
+    let entry = &lines[0];
+
+    assert_eq!(
+        entry["kind"].as_str(),
+        Some("admin_ddl"),
+        "DDL must emit kind=admin_ddl; got: {entry}"
+    );
+    assert_eq!(
+        entry["client_ip"].as_str(),
+        Some("10.20.30.40"),
+        "DDL audit event must carry client_ip; got: {entry}"
+    );
 }

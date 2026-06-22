@@ -737,6 +737,7 @@ impl SqeFlightSqlService {
         &self,
         session: &sqe_core::Session,
         sql: &str,
+        client_ip: Option<String>,
     ) -> Result<Response<FlightStream>, Status> {
         // Classify through the pre-parse pipeline (strips FOR INCREMENTAL /
         // VERSION AS OF, rewrites Hive `PARTITIONED BY` -> sqlparser `PARTITION
@@ -751,7 +752,7 @@ impl SqeFlightSqlService {
         if matches!(kind, StatementKind::Query(_)) {
             let (schema, stream) = self
                 .query_handler
-                .execute_stream(session, sql)
+                .execute_stream(session, sql, client_ip)
                 .await
                 .map_err(|e| sqe_error_to_status(&e, None))?;
 
@@ -770,7 +771,7 @@ impl SqeFlightSqlService {
 
         let batches = self
             .query_handler
-            .execute(session, sql)
+            .execute(session, sql, client_ip)
             .await
             .map_err(|e| sqe_error_to_status(&e, None))?;
         self.batches_to_stream(batches)
@@ -1128,7 +1129,8 @@ impl FlightSqlService for SqeFlightSqlService {
         let sql_str = std::str::from_utf8(sql)
             .map_err(|e| Status::internal(format!("Invalid statement handle: {e}")))?;
 
-        self.run_sql_into_flight_response(&session, sql_str).await
+        let client_ip = Some(self.extract_client_ip(&request));
+        self.run_sql_into_flight_response(&session, sql_str, client_ip).await
     }
 
     /// Handle fallback do_get for tickets that don't match known Flight SQL types.
@@ -1149,7 +1151,8 @@ impl FlightSqlService for SqeFlightSqlService {
                 "do_get_fallback executing query"
             );
 
-            return self.run_sql_into_flight_response(&session, &fetch.handle).await;
+            let client_ip = Some(self.extract_client_ip(&request));
+            return self.run_sql_into_flight_response(&session, &fetch.handle, client_ip).await;
         }
 
         Err(Status::unimplemented(format!(
@@ -1243,9 +1246,10 @@ impl FlightSqlService for SqeFlightSqlService {
         };
 
         // Use query handler to list schemas via the session catalog
+        let client_ip = Some(self.extract_client_ip(&request));
         let batches = self
             .query_handler
-            .execute(&session, "SHOW SCHEMAS")
+            .execute(&session, "SHOW SCHEMAS", client_ip)
             .await
             .map_err(|e| sqe_error_to_status(&e, None))?;
 
@@ -1593,7 +1597,8 @@ impl FlightSqlService for SqeFlightSqlService {
             "Executing prepared statement"
         );
 
-        self.run_sql_into_flight_response(&session, &sql).await
+        let client_ip = Some(self.extract_client_ip(&request));
+        self.run_sql_into_flight_response(&session, &sql, client_ip).await
     }
 
     async fn do_get_table_types(
@@ -1846,9 +1851,10 @@ impl FlightSqlService for SqeFlightSqlService {
         request: Request<PeekableFlightDataStream>,
     ) -> Result<i64, Status> {
         let session = self.get_session_from_request(&request).await?;
+        let client_ip = Some(self.extract_client_ip(&request));
         let batches = self
             .query_handler
-            .execute(&session, &ticket.query)
+            .execute(&session, &ticket.query, client_ip)
             .await
             .map_err(|e| sqe_error_to_status(&e, None))?;
 
@@ -1954,6 +1960,7 @@ impl FlightSqlService for SqeFlightSqlService {
         request: Request<PeekableFlightDataStream>,
     ) -> Result<i64, Status> {
         let session = self.get_session_from_request(&request).await?;
+        let client_ip = Some(self.extract_client_ip(&request));
 
         // Decode the SQL from the prepared statement handle
         let fetch: FetchResults =
@@ -1962,7 +1969,7 @@ impl FlightSqlService for SqeFlightSqlService {
 
         let batches = self
             .query_handler
-            .execute(&session, &fetch.handle)
+            .execute(&session, &fetch.handle, client_ip)
             .await
             .map_err(|e| sqe_error_to_status(&e, None))?;
 

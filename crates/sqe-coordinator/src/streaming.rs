@@ -141,9 +141,37 @@ pub struct StreamFinalizer {
     /// logged under the `query_profile` target, and stored on the tracker
     /// record.
     pub profile_mode: ProfileMode,
+    /// Identity of the authenticated user who issued this query. Carried into
+    /// the canonical `AuditEvent` actor field so the SIEM record contains
+    /// the full structured identity rather than a bare username string.
+    pub actor: sqe_metrics::audit::Actor,
+    /// Structured resource list extracted from the logical plan before it was
+    /// handed to DataFusion for optimization. Each entry names a catalog
+    /// table or view the query touches. Threaded here from `open_stream` (the
+    /// only place the logical plan is in scope) so the streaming finalizer
+    /// can emit a complete `AuditEvent` without re-planning.
+    pub resources: Vec<sqe_metrics::audit::Resource>,
+    /// Source IP of the Flight SQL client that submitted this query. Threaded
+    /// from the `execute_stream` parameter so every streaming audit event
+    /// (success, error, cancel) carries the originating address.
+    pub client_ip: Option<String>,
 }
 
 impl StreamFinalizer {
+    /// Map the policy decision summary into the canonical audit type.
+    ///
+    /// `PolicySummary` lives in `sqe-policy`; `PolicyAudit` lives in
+    /// `sqe-metrics`. They carry the same fields but the crate boundary
+    /// means we convert here rather than deriving `From` across the boundary.
+    fn policy_summary_to_audit(&self) -> sqe_metrics::audit::PolicyAudit {
+        sqe_metrics::audit::PolicyAudit {
+            row_filters_applied: self.policy_summary.row_filters_applied,
+            columns_masked: self.policy_summary.columns_masked.clone(),
+            columns_restricted: self.policy_summary.columns_restricted.clone(),
+            denied: self.policy_summary.denied,
+        }
+    }
+
     /// Render, log, and store the per-operator profile for this query.
     /// Called from the success and error finalization paths once the
     /// decision to profile has been made.
@@ -212,25 +240,32 @@ impl StreamFinalizer {
         self.record_spill_metrics();
 
         if let Some(ref audit) = self.audit {
-            audit.log(&sqe_metrics::audit::AuditEntry {
-                timestamp: chrono::Utc::now().to_rfc3339(),
-                username: self.username.clone(),
+            let policy = self.policy_summary_to_audit();
+            let event = sqe_metrics::audit::AuditEvent {
+                time: chrono::Utc::now(),
+                kind: sqe_metrics::audit::AuditKind::Query,
+                actor: self.actor.clone(),
+                outcome: sqe_metrics::audit::Outcome::Success,
+                resources: self.resources.clone(),
+                policy: Some(policy),
+                timing: Some(sqe_metrics::audit::Timing {
+                    duration_ms: execution_ms,
+                    ..Default::default()
+                }),
+                stats: Some(sqe_metrics::audit::QueryStats {
+                    rows_returned: rows,
+                    ..Default::default()
+                }),
+                query: Some(sqe_metrics::audit::QueryInfo {
+                    text: Some(self.sql.clone()),
+                    query_hash: sqe_metrics::audit::query_hash(&self.sql),
+                    statement_type: "query".to_string(),
+                }),
                 session_id: Some(self.session_id.clone()),
-                query_hash: sqe_metrics::audit::query_hash(&self.sql),
-                query_text: Some(self.sql.clone()),
-                statement_type: self.kind_name.clone(),
-                duration_ms: execution_ms,
-                rows_returned: rows,
-                status: "success".to_string(),
-                client_ip: None,
-                tables_touched: self.tables_touched.clone(),
-                // Policy-decision summary captured at query start (see
-                // `StreamFinalizer::policy_summary`).
-                row_filters_applied: self.policy_summary.row_filters_applied,
-                columns_masked: self.policy_summary.columns_masked.clone(),
-                columns_restricted: self.policy_summary.columns_restricted.clone(),
-                policy_denied: self.policy_summary.denied,
-            });
+                client_ip: self.client_ip.clone(),
+                integrity: Default::default(),
+            };
+            audit.log_event(event);
         }
 
         let elapsed_secs = duration.as_secs();
@@ -275,25 +310,36 @@ impl StreamFinalizer {
         self.record_spill_metrics();
 
         if let Some(ref audit) = self.audit {
-            audit.log(&sqe_metrics::audit::AuditEntry {
-                timestamp: chrono::Utc::now().to_rfc3339(),
-                username: self.username.clone(),
+            let policy = self.policy_summary_to_audit();
+            let event = sqe_metrics::audit::AuditEvent {
+                time: chrono::Utc::now(),
+                kind: sqe_metrics::audit::AuditKind::Query,
+                actor: self.actor.clone(),
+                outcome: sqe_metrics::audit::Outcome::Failure {
+                    error_type: Some(err.error_code().trino_error_type().to_string()),
+                    error_code: Some(err.error_code().name().to_string()),
+                    message: Some(err.client_message()),
+                },
+                resources: self.resources.clone(),
+                policy: Some(policy),
+                timing: Some(sqe_metrics::audit::Timing {
+                    duration_ms: duration.as_millis() as u64,
+                    ..Default::default()
+                }),
+                stats: Some(sqe_metrics::audit::QueryStats {
+                    rows_returned: rows,
+                    ..Default::default()
+                }),
+                query: Some(sqe_metrics::audit::QueryInfo {
+                    text: Some(self.sql.clone()),
+                    query_hash: sqe_metrics::audit::query_hash(&self.sql),
+                    statement_type: "query".to_string(),
+                }),
                 session_id: Some(self.session_id.clone()),
-                query_hash: sqe_metrics::audit::query_hash(&self.sql),
-                query_text: Some(self.sql.clone()),
-                statement_type: self.kind_name.clone(),
-                duration_ms: duration.as_millis() as u64,
-                rows_returned: rows,
-                status: "error".to_string(),
-                client_ip: None,
-                tables_touched: self.tables_touched.clone(),
-                // Policy-decision summary captured at query start (see
-                // `StreamFinalizer::policy_summary`).
-                row_filters_applied: self.policy_summary.row_filters_applied,
-                columns_masked: self.policy_summary.columns_masked.clone(),
-                columns_restricted: self.policy_summary.columns_restricted.clone(),
-                policy_denied: self.policy_summary.denied,
-            });
+                client_ip: self.client_ip.clone(),
+                integrity: Default::default(),
+            };
+            audit.log_event(event);
         }
 
         // Failures always profile when the feature is on at all: a failed
@@ -319,25 +365,40 @@ impl StreamFinalizer {
         }
 
         if let Some(ref audit) = self.audit {
-            audit.log(&sqe_metrics::audit::AuditEntry {
-                timestamp: chrono::Utc::now().to_rfc3339(),
-                username: self.username.clone(),
+            let policy = self.policy_summary_to_audit();
+            let event = sqe_metrics::audit::AuditEvent {
+                time: chrono::Utc::now(),
+                kind: sqe_metrics::audit::AuditKind::Query,
+                actor: self.actor.clone(),
+                // Cancellation is a client-driven interruption, not a server
+                // error. We map it to Failure with a dedicated error code so
+                // SIEM tools can distinguish cancelled-by-client from
+                // failed-with-error. The legacy path emitted status:"cancelled".
+                outcome: sqe_metrics::audit::Outcome::Failure {
+                    error_type: None,
+                    error_code: Some("QUERY_CANCELLED".to_string()),
+                    message: Some("Query was cancelled by the client".to_string()),
+                },
+                resources: self.resources.clone(),
+                policy: Some(policy),
+                timing: Some(sqe_metrics::audit::Timing {
+                    duration_ms: duration.as_millis() as u64,
+                    ..Default::default()
+                }),
+                stats: Some(sqe_metrics::audit::QueryStats {
+                    rows_returned: rows,
+                    ..Default::default()
+                }),
+                query: Some(sqe_metrics::audit::QueryInfo {
+                    text: Some(self.sql.clone()),
+                    query_hash: sqe_metrics::audit::query_hash(&self.sql),
+                    statement_type: "query".to_string(),
+                }),
                 session_id: Some(self.session_id.clone()),
-                query_hash: sqe_metrics::audit::query_hash(&self.sql),
-                query_text: Some(self.sql.clone()),
-                statement_type: self.kind_name.clone(),
-                duration_ms: duration.as_millis() as u64,
-                rows_returned: rows,
-                status: "cancelled".to_string(),
-                client_ip: None,
-                tables_touched: self.tables_touched.clone(),
-                // Policy-decision summary captured at query start (see
-                // `StreamFinalizer::policy_summary`).
-                row_filters_applied: self.policy_summary.row_filters_applied,
-                columns_masked: self.policy_summary.columns_masked.clone(),
-                columns_restricted: self.policy_summary.columns_restricted.clone(),
-                policy_denied: self.policy_summary.denied,
-            });
+                client_ip: self.client_ip.clone(),
+                integrity: Default::default(),
+            };
+            audit.log_event(event);
         }
     }
 }
@@ -656,6 +717,9 @@ mod tests {
             tables_touched: Vec::new(),
             policy_summary: sqe_policy::PolicySummary::default(),
             profile_mode: ProfileMode::Off,
+            actor: sqe_metrics::audit::Actor::default(),
+            resources: Vec::new(),
+            client_ip: None,
         }
     }
 
@@ -711,9 +775,16 @@ mod tests {
         assert_eq!(record.output_rows, 35);
     }
 
-    /// Fix 2 (streaming path): a masked / filtered / denied SELECT records the
-    /// policy-decision fields in its audit entry. The streaming finalizer copies
-    /// the `policy_summary` it was built with into the AuditEntry on success.
+    /// Task 2 conversion: a masked / filtered / denied SELECT records the
+    /// policy-decision fields in its canonical audit event. The streaming
+    /// finalizer copies `policy_summary` into `AuditEvent.policy` on success.
+    ///
+    /// Converted from the legacy flat `AuditEntry` assertions (which checked
+    /// top-level `row_filters_applied`, `columns_masked`, `columns_restricted`,
+    /// and `policy_denied`) to canonical `AuditEvent` assertions under the
+    /// nested `policy` key. The `policy_denied` field was renamed `denied` in
+    /// `PolicyAudit`. No logic changed: same policy summary, same stream, same
+    /// finalizer path.
     #[tokio::test]
     async fn audit_entry_records_policy_summary_on_streaming_success() {
         let (plan, schema, runtime) = trivial_plan().await;
@@ -744,10 +815,17 @@ mod tests {
         audit.flush();
 
         let content = std::fs::read_to_string(&path).unwrap();
-        assert!(content.contains("\"row_filters_applied\":1"), "got: {content}");
-        assert!(content.contains("\"columns_masked\":[\"ssn\"]"), "got: {content}");
-        assert!(content.contains("\"columns_restricted\":[\"notes\"]"), "got: {content}");
-        assert!(content.contains("\"policy_denied\":false"), "got: {content}");
+        let v: serde_json::Value = serde_json::from_str(content.lines().next().unwrap()).unwrap();
+        // canonical AuditEvent discriminant
+        assert_eq!(v["kind"], "query", "got: {v}");
+        // policy fields nested under "policy" key (Task 2 migration)
+        assert_eq!(v["policy"]["row_filters_applied"], 1, "got: {v}");
+        assert_eq!(v["policy"]["columns_masked"], serde_json::json!(["ssn"]), "got: {v}");
+        assert_eq!(v["policy"]["columns_restricted"], serde_json::json!(["notes"]), "got: {v}");
+        assert_eq!(v["policy"]["denied"], false, "got: {v}");
+        // legacy top-level field must no longer exist
+        assert!(v.get("policy_denied").is_none() || v["policy_denied"].is_null(), "got: {v}");
+        assert!(v.get("row_filters_applied").is_none() || v["row_filters_applied"].is_null(), "got: {v}");
     }
 
     #[tokio::test]
@@ -901,6 +979,49 @@ mod tests {
         // Small profiles pass through untouched.
         let small = "elapsed_ms=1\nProjectionExec".to_string();
         assert_eq!(truncate_profile(small.clone()), small);
+    }
+
+    /// Task 4 TDD guard: `StreamFinalizer` carries `client_ip` into the success
+    /// audit event.
+    ///
+    /// Builds a `StreamFinalizer` with `client_ip: Some("10.9.9.9".into())`,
+    /// wires it to a tempfile `AuditLogger`, drives the success finalize path,
+    /// and asserts the written JSONL line has `client_ip == "10.9.9.9"`.
+    ///
+    /// RED before the field and emit-branch are added (emits `null`).
+    /// GREEN after implementation.
+    #[tokio::test]
+    async fn streaming_finalizer_carries_client_ip_to_audit_event() {
+        let (plan, schema, runtime) = trivial_plan().await;
+        let tracker = test_tracker();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let audit = Arc::new(
+            sqe_metrics::audit::AuditLogger::new(path.to_str().unwrap()).unwrap(),
+        );
+
+        let mut fin = test_finalizer(Arc::clone(&tracker), plan, runtime);
+        fin.audit = Some(Arc::clone(&audit));
+        fin.client_ip = Some("10.9.9.9".to_string());
+        let qid = fin.query_id;
+        tracker.start(qid, "test-user", None, "SELECT 1", "test-session", None, vec![]);
+
+        let inner = fixed_stream(Arc::clone(&schema), vec![sample_batch(1)]);
+        let mut stream = TrackedRecordBatchStream::new(inner, fin, None);
+        while let Some(b) = stream.next().await {
+            let _ = b.unwrap();
+        }
+        drop(stream);
+        audit.flush();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(content.lines().next().unwrap()).unwrap();
+        assert_eq!(
+            v["client_ip"].as_str(),
+            Some("10.9.9.9"),
+            "streaming audit event must carry client_ip; got: {v}"
+        );
     }
 
     #[tokio::test]
