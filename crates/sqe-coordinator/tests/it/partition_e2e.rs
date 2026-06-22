@@ -18,7 +18,7 @@ async fn row_count(
     table: &str,
 ) -> i64 {
     let batches = handler
-        .execute(session, &format!("SELECT COUNT(*) FROM {table}"))
+        .execute(session, &format!("SELECT COUNT(*) FROM {table}"), None)
         .await
         .expect("count select");
     batches[0]
@@ -36,10 +36,10 @@ async fn reset_table(
     create_sql: &str,
 ) {
     let _ = handler
-        .execute(session, &format!("DROP TABLE IF EXISTS {fq_table}"))
+        .execute(session, &format!("DROP TABLE IF EXISTS {fq_table}"), None)
         .await;
     handler
-        .execute(session, create_sql)
+        .execute(session, create_sql, None)
         .await
         .expect("CREATE TABLE");
 }
@@ -73,8 +73,7 @@ async fn create_table_partitioned_by_identity() {
     handler
         .execute(
             &session,
-            &format!("INSERT INTO {fq} VALUES (1, 'eu', 10), (2, 'us', 20)"),
-        )
+            &format!("INSERT INTO {fq} VALUES (1, 'eu', 10), (2, 'us', 20)"), None)
         .await
         .expect("INSERT");
 
@@ -90,7 +89,7 @@ async fn create_table_partitioned_by_identity() {
     assert_eq!(eu_count, 1, "predicate on partition column returns 1 row");
 
     let _ = handler
-        .execute(&session, &format!("DROP TABLE IF EXISTS {fq}"))
+        .execute(&session, &format!("DROP TABLE IF EXISTS {fq}"), None)
         .await;
 }
 
@@ -124,8 +123,7 @@ async fn create_table_partitioned_by_day_transform() {
                  (1, TIMESTAMP '2026-04-26 10:00:00', 10), \
                  (2, TIMESTAMP '2026-04-27 11:00:00', 20), \
                  (3, TIMESTAMP '2026-04-26 23:30:00', 30)"
-            ),
-        )
+            ), None)
         .await
         .expect("INSERT");
 
@@ -133,7 +131,7 @@ async fn create_table_partitioned_by_day_transform() {
     assert_eq!(total, 3, "day-partitioned INSERT round-trip");
 
     let _ = handler
-        .execute(&session, &format!("DROP TABLE IF EXISTS {fq}"))
+        .execute(&session, &format!("DROP TABLE IF EXISTS {fq}"), None)
         .await;
 }
 
@@ -164,8 +162,7 @@ async fn create_table_partitioned_by_bucket_transform() {
             &session,
             &format!(
                 "INSERT INTO {fq} VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd')"
-            ),
-        )
+            ), None)
         .await
         .expect("INSERT");
 
@@ -173,7 +170,7 @@ async fn create_table_partitioned_by_bucket_transform() {
     assert_eq!(total, 4, "bucket-partitioned INSERT round-trip");
 
     let _ = handler
-        .execute(&session, &format!("DROP TABLE IF EXISTS {fq}"))
+        .execute(&session, &format!("DROP TABLE IF EXISTS {fq}"), None)
         .await;
 }
 
@@ -205,8 +202,7 @@ async fn create_table_partitioned_by_truncate_transform() {
             &format!(
                 "INSERT INTO {fq} VALUES \
                  ('alpha', 1), ('alphabet', 2), ('beta', 3)"
-            ),
-        )
+            ), None)
         .await
         .expect("INSERT");
 
@@ -214,7 +210,7 @@ async fn create_table_partitioned_by_truncate_transform() {
     assert_eq!(total, 3, "truncate-partitioned INSERT round-trip");
 
     let _ = handler
-        .execute(&session, &format!("DROP TABLE IF EXISTS {fq}"))
+        .execute(&session, &format!("DROP TABLE IF EXISTS {fq}"), None)
         .await;
 }
 
@@ -248,8 +244,7 @@ async fn create_table_partitioned_by_multiple_transforms() {
                  (1, TIMESTAMP '2026-04-26 10:00:00', 'eu'), \
                  (2, TIMESTAMP '2026-04-26 11:00:00', 'us'), \
                  (3, TIMESTAMP '2026-04-27 12:00:00', 'eu')"
-            ),
-        )
+            ), None)
         .await
         .expect("INSERT");
 
@@ -257,7 +252,7 @@ async fn create_table_partitioned_by_multiple_transforms() {
     assert_eq!(total, 3, "3-field composite partition spec round-trips");
 
     let _ = handler
-        .execute(&session, &format!("DROP TABLE IF EXISTS {fq}"))
+        .execute(&session, &format!("DROP TABLE IF EXISTS {fq}"), None)
         .await;
 }
 
@@ -290,8 +285,7 @@ async fn create_table_partitioned_by_day_on_v3_table() {
                 "INSERT INTO {fq} VALUES \
                  (1, TIMESTAMP '2026-04-26 10:00:00.123456789', 10), \
                  (2, TIMESTAMP '2026-04-27 11:00:00.987654321', 20)"
-            ),
-        )
+            ), None)
         .await
         .expect("INSERT");
 
@@ -299,7 +293,7 @@ async fn create_table_partitioned_by_day_on_v3_table() {
     assert_eq!(total, 2, "V3 partitioned-by-day INSERT round-trip");
 
     let _ = handler
-        .execute(&session, &format!("DROP TABLE IF EXISTS {fq}"))
+        .execute(&session, &format!("DROP TABLE IF EXISTS {fq}"), None)
         .await;
 }
 
@@ -316,7 +310,7 @@ async fn unsupported_partition_transform_returns_error() {
     let fq = format!("{ns}.{name}");
 
     let _ = handler
-        .execute(&session, &format!("DROP TABLE IF EXISTS {fq}"))
+        .execute(&session, &format!("DROP TABLE IF EXISTS {fq}"), None)
         .await;
 
     let err = handler
@@ -325,8 +319,7 @@ async fn unsupported_partition_transform_returns_error() {
             &format!(
                 "CREATE TABLE {fq} (id BIGINT, ts TIMESTAMP) \
                  PARTITIONED BY (random(ts))"
-            ),
-        )
+            ), None)
         .await
         .expect_err("random() is not a valid Iceberg transform");
 
@@ -349,7 +342,7 @@ async fn unknown_partition_column_returns_error() {
     let fq = format!("{ns}.{name}");
 
     let _ = handler
-        .execute(&session, &format!("DROP TABLE IF EXISTS {fq}"))
+        .execute(&session, &format!("DROP TABLE IF EXISTS {fq}"), None)
         .await;
 
     let err = handler
@@ -357,8 +350,7 @@ async fn unknown_partition_column_returns_error() {
             &session,
             &format!(
                 "CREATE TABLE {fq} (id BIGINT) PARTITIONED BY (region)"
-            ),
-        )
+            ), None)
         .await
         .expect_err("region column is not declared in the schema");
 

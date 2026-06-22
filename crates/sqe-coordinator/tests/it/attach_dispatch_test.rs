@@ -77,7 +77,7 @@ async fn create_bearer_secret_succeeds() {
     let session = dummy_session();
 
     let result = handler
-        .execute(&session, "CREATE SECRET my_tok (TYPE bearer, TOKEN 'abc123')")
+        .execute(&session, "CREATE SECRET my_tok (TYPE bearer, TOKEN 'abc123')", None)
         .await;
 
     assert!(result.is_ok(), "unexpected error: {:?}", result);
@@ -95,7 +95,7 @@ async fn create_aws_secret_all_optional_fields() {
         SECRET_ACCESS_KEY 'very_secret', \
         REGION 'eu-west-1'\
     )";
-    let result = handler.execute(&session, sql).await;
+    let result = handler.execute(&session, sql, None).await;
     assert!(result.is_ok(), "unexpected error: {:?}", result);
 }
 
@@ -105,7 +105,7 @@ async fn create_basic_secret_succeeds() {
     let session = dummy_session();
 
     let sql = "CREATE SECRET svc_acct (TYPE basic, USERNAME 'admin', PASSWORD 'p@ss')";
-    let result = handler.execute(&session, sql).await;
+    let result = handler.execute(&session, sql, None).await;
     assert!(result.is_ok(), "unexpected error: {:?}", result);
 }
 
@@ -115,12 +115,12 @@ async fn create_duplicate_secret_errors() {
     let session = dummy_session();
 
     handler
-        .execute(&session, "CREATE SECRET dup (TYPE bearer, TOKEN 'tok1')")
+        .execute(&session, "CREATE SECRET dup (TYPE bearer, TOKEN 'tok1')", None)
         .await
         .expect("first create");
 
     let err = handler
-        .execute(&session, "CREATE SECRET dup (TYPE bearer, TOKEN 'tok2')")
+        .execute(&session, "CREATE SECRET dup (TYPE bearer, TOKEN 'tok2')", None)
         .await
         .expect_err("second create should fail");
 
@@ -135,7 +135,7 @@ async fn create_bearer_missing_token_errors() {
     let session = dummy_session();
 
     let err = handler
-        .execute(&session, "CREATE SECRET bad (TYPE bearer)")
+        .execute(&session, "CREATE SECRET bad (TYPE bearer)", None)
         .await
         .expect_err("missing TOKEN should fail");
 
@@ -152,7 +152,7 @@ async fn show_secrets_empty_returns_zero_rows() {
     let handler = make_handler(SecretStore::new(), RuntimeCatalogRegistry::new());
     let session = dummy_session();
 
-    let batches = handler.execute(&session, "SHOW SECRETS").await.unwrap();
+    let batches = handler.execute(&session, "SHOW SECRETS", None).await.unwrap();
     let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(total_rows, 0);
 }
@@ -178,7 +178,7 @@ async fn show_secrets_lists_name_and_type_not_value() {
 
     let handler = make_handler(secrets, RuntimeCatalogRegistry::new());
     let session = dummy_session();
-    let batches = handler.execute(&session, "SHOW SECRETS").await.unwrap();
+    let batches = handler.execute(&session, "SHOW SECRETS", None).await.unwrap();
 
     let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(total_rows, 2, "expected 2 secrets listed");
@@ -216,17 +216,17 @@ async fn drop_secret_removes_from_store() {
     let session = dummy_session();
 
     handler
-        .execute(&session, "CREATE SECRET ephemeral (TYPE bearer, TOKEN 'tok')")
+        .execute(&session, "CREATE SECRET ephemeral (TYPE bearer, TOKEN 'tok')", None)
         .await
         .unwrap();
 
     handler
-        .execute(&session, "DROP SECRET ephemeral")
+        .execute(&session, "DROP SECRET ephemeral", None)
         .await
         .expect("drop should succeed");
 
     // After drop, SHOW SECRETS should be empty again.
-    let batches = handler.execute(&session, "SHOW SECRETS").await.unwrap();
+    let batches = handler.execute(&session, "SHOW SECRETS", None).await.unwrap();
     let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(total_rows, 0);
 }
@@ -237,7 +237,7 @@ async fn drop_missing_secret_errors() {
     let session = dummy_session();
 
     let err = handler
-        .execute(&session, "DROP SECRET nonexistent")
+        .execute(&session, "DROP SECRET nonexistent", None)
         .await
         .expect_err("drop of unknown secret should fail");
 
@@ -277,7 +277,7 @@ async fn drop_secret_in_use_by_attached_catalog_errors() {
     let session = dummy_session();
 
     let err = handler
-        .execute(&session, "DROP SECRET mytoken")
+        .execute(&session, "DROP SECRET mytoken", None)
         .await
         .expect_err("drop of in-use secret should fail");
 
@@ -296,7 +296,7 @@ async fn create_secret_rejected_without_admin_role() {
     let session = session_with_roles(vec!["analyst".to_string()]);
 
     let err = handler
-        .execute(&session, "CREATE SECRET denied_tok (TYPE bearer, TOKEN 'tok')")
+        .execute(&session, "CREATE SECRET denied_tok (TYPE bearer, TOKEN 'tok')", None)
         .await
         .expect_err("non-admin must not create secrets");
 
@@ -310,13 +310,13 @@ async fn drop_secret_rejected_without_admin_role() {
     let handler = make_handler(SecretStore::new(), RuntimeCatalogRegistry::new());
     let admin = dummy_session();
     handler
-        .execute(&admin, "CREATE SECRET to_drop (TYPE bearer, TOKEN 'tok')")
+        .execute(&admin, "CREATE SECRET to_drop (TYPE bearer, TOKEN 'tok')", None)
         .await
         .expect("admin creates secret");
 
     let non_admin = session_with_roles(vec![]);
     let err = handler
-        .execute(&non_admin, "DROP SECRET to_drop")
+        .execute(&non_admin, "DROP SECRET to_drop", None)
         .await
         .expect_err("non-admin must not drop secrets");
 
