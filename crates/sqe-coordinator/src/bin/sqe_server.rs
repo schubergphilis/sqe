@@ -520,7 +520,7 @@ impl TrinoQueryExecutor for QueryHandlerAdapter {
         self.rate_limiter
             .check(&session.user.username)
             .map_err(|e| sqe_core::SqeError::Execution(format!("rate limit: {e}")))?;
-        self.handler.execute(session, sql).await
+        self.handler.execute(session, sql, None).await
     }
 }
 

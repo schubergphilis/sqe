@@ -563,6 +563,7 @@ impl QueryHandler {
         &self,
         session: &Session,
         sql: &str,
+        client_ip: Option<String>,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         // Memory pressure admission control: reject new queries when the
         // coordinator's FairSpillPool is >95% utilized (Red).
@@ -712,7 +713,7 @@ impl QueryHandler {
             session.source.as_deref(),
             sql,
             &session.id,
-            None, // client_ip — populated by caller if available
+            client_ip.as_deref(),
             session.user.roles.clone(),
         );
 
@@ -1588,7 +1589,7 @@ impl QueryHandler {
                         statement_type: kind_name,
                     }),
                     session_id: Some(session.id.clone()),
-                    client_ip: None,
+                    client_ip: client_ip.clone(),
                     integrity: sqe_metrics::audit::Integrity::default(),
                 };
                 audit.log_event(event);
@@ -1802,6 +1803,7 @@ impl QueryHandler {
         &self,
         session: &Session,
         sql: &str,
+        client_ip: Option<String>,
     ) -> sqe_core::Result<(SchemaRef, SendableRecordBatchStream)> {
         // --- Admission control -------------------------------------------------
         let pressure = crate::memory::check_pressure(&self.runtime.memory_pool);
@@ -1931,7 +1933,7 @@ impl QueryHandler {
             session.source.as_deref(),
             sql,
             &session.id,
-            None,
+            client_ip.as_deref(),
             session.user.roles.clone(),
         );
 
