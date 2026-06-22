@@ -369,6 +369,98 @@ connectivity problem.
 - **Kafka target.** The `target = "kafka"` config key is reserved. It is not
   implemented in this release.
 
+## Operator dashboard gate
+
+When `[metrics] web_ui = true` (default: `false`), the operator dashboard is enabled
+on the health port. The dashboard exposes live query state, worker health, and
+performance counters to authenticated admins. It requires a bearer token and an admin
+role before it serves any content.
+
+### Which routes are gated
+
+| Route | Auth required |
+|-------|--------------|
+| `/` (dashboard HTML) | Bearer + admin role |
+| `/api/v1/overview` | Bearer + admin role |
+| `/api/v1/queries` | Bearer + admin role |
+| `/api/v1/queries/{id}` | Bearer + admin role |
+| `/api/v1/workers` | Bearer + admin role |
+| `/api/v1/metrics/history` | Bearer + admin role |
+| `/healthz` | Open (no auth) |
+| `/readyz` | Open (no auth) |
+| `/api/v1/status` | Open (no auth) |
+
+The three open endpoints serve Kubernetes liveness/readiness probes and load-balancer
+health checks. They must not require credentials.
+
+### Role check
+
+The admin role list is `auth.admin_roles`. The same list gates coordinator DDL
+(CREATE/DROP/ALTER TABLE). A token that validates but holds none of the listed roles
+gets a `403 Forbidden`. An empty `admin_roles` list is fail-closed: every caller
+receives `403`, because `has_admin_role` returns `false` when the configured list is
+empty. Operators must configure at least one role to grant anyone dashboard access.
+
+### Audit behavior
+
+Dashboard access attempts produce an OCSF Authentication event (`kind: auth`).
+
+Two cases produce an audit line:
+
+- **Access granted** (`200 OK`): an `auth` event with `status: success`, the actor's
+  `username`, `roles`, and any `subject`/`email`/`groups` claims carried in the token.
+- **Admin role missing** (`403 Forbidden`): an `auth` event with `status: failure`,
+  `error_type: DashboardAccessDenied`, and the actual principal named in
+  `actor.username` (not "unknown").
+
+One case does NOT produce an audit line:
+
+- **No token or wrong scheme** (`401 Unauthorized`): no principal was established, so
+  no audit line is written. The counter
+  `sqe_dashboard_auth_anonymous_denied_total` is incremented instead. This prevents
+  k8s probe traffic from flooding the audit spool and the downstream SIEM.
+
+The bearer token value is never placed in any audit field.
+
+### What the dashboard shows
+
+Authenticated admins see per-query records populated from the in-memory tracker. Each
+record includes:
+
+- `username` and `roles` of the submitting user.
+- `client_ip` of the submitting client, when available.
+- SQL text after `redact_pii` masking. Known PII patterns (emails, SSNs, phone
+  numbers, card numbers, secret-keyword literals) are replaced with bracketed
+  placeholders before the value leaves the query layer. Raw SQL is never placed in
+  the response.
+
+The `redact_pii` pass runs at record assembly time, not at query admission time, so
+the stored text in the tracker is the original SQL. Masking is applied every time a
+record is serialised for the dashboard wire format.
+
+### `client_ip` threading
+
+`client_ip` is threaded end to end through the query path. The `execute` and
+`execute_stream` functions accept `client_ip: Option<String>`. The value is stored in
+`QueryRecord` by the query tracker and carried into audit events for buffered
+executions, streaming SELECT finalisers, DML/DDL completions, and GRANT/REVOKE
+statements. The dashboard displays the value directly from `QueryRecord.client_ip`.
+
+Dashboard-access audit events (`kind: auth`) carry `client_ip` when the peer address
+is available. The health server is served with `into_make_service_with_connect_info`,
+so `ConnectInfo<SocketAddr>` is always present for real TCP connections. If
+`[security] trusted_proxies` is configured, the XFF header is honoured with the same
+rightmost-untrusted-hop rule used by the Flight SQL and Quack paths.
+
+### Field consistency
+
+Audit and trace emit sites use the following canonical field names:
+
+- `username` (actor identifier)
+- `session_id` (session correlation)
+- `query_id` (per-query tracing field)
+- `client_ip` (source address)
+
 ## Never-log-result-rows policy
 
 Result rows are never written to any audit sink. `AuditEvent` has no field for result
