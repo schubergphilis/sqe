@@ -1024,6 +1024,114 @@ mod tests {
         );
     }
 
+    /// `StreamFinalizer` carries `client_ip` into the audit event on the
+    /// error finalize path (`on_error`).
+    ///
+    /// Builds a finalizer with `client_ip: Some("10.9.9.9".into())`, wires an
+    /// `AuditLogger`, drives the error path via a stream that emits one error,
+    /// and asserts the written JSONL line has `client_ip == "10.9.9.9"` and
+    /// `outcome.error_code` set (indicating failure).
+    #[tokio::test]
+    async fn streaming_finalizer_carries_client_ip_to_audit_event_on_error() {
+        use datafusion::error::DataFusionError;
+
+        let (plan, schema, runtime) = trivial_plan().await;
+        let tracker = test_tracker();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit_error.jsonl");
+        let audit = Arc::new(
+            sqe_metrics::audit::AuditLogger::new(path.to_str().unwrap()).unwrap(),
+        );
+
+        let mut fin = test_finalizer(Arc::clone(&tracker), plan, runtime);
+        fin.audit = Some(Arc::clone(&audit));
+        fin.client_ip = Some("10.9.9.9".to_string());
+        let qid = fin.query_id;
+        tracker.start(qid, "test-user", None, "SELECT 1", "test-session", None, vec![]);
+
+        let s = futures::stream::iter(vec![
+            Err(DataFusionError::Execution("boom".to_string())),
+        ]);
+        let inner: SendableRecordBatchStream =
+            Box::pin(RecordBatchStreamAdapter::new(Arc::clone(&schema), s));
+        let mut stream = TrackedRecordBatchStream::new(inner, fin, None);
+
+        let err = stream.next().await.unwrap();
+        assert!(err.is_err(), "stream must yield the error");
+        drop(stream);
+        audit.flush();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(content.lines().next().unwrap()).unwrap();
+        assert_eq!(
+            v["client_ip"].as_str(),
+            Some("10.9.9.9"),
+            "error audit event must carry client_ip; got: {v}"
+        );
+        // The JSONL serializer flattens outcome: status + error_code at top level.
+        assert_eq!(
+            v["status"].as_str(),
+            Some("failure"),
+            "error audit event must have status == failure; got: {v}"
+        );
+        assert!(
+            v["error_code"].is_string(),
+            "error audit event must have a top-level error_code; got: {v}"
+        );
+    }
+
+    /// `StreamFinalizer` carries `client_ip` into the audit event on the
+    /// cancel finalize path (`on_cancel`).
+    ///
+    /// Builds a finalizer with `client_ip: Some("10.9.9.9".into())`, wires an
+    /// `AuditLogger`, drives the cancel path by dropping the stream mid-flight,
+    /// and asserts the written JSONL line has `client_ip == "10.9.9.9"` and
+    /// `outcome.error_code == "QUERY_CANCELLED"`.
+    #[tokio::test]
+    async fn streaming_finalizer_carries_client_ip_to_audit_event_on_cancel() {
+        let (plan, schema, runtime) = trivial_plan().await;
+        let tracker = test_tracker();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit_cancel.jsonl");
+        let audit = Arc::new(
+            sqe_metrics::audit::AuditLogger::new(path.to_str().unwrap()).unwrap(),
+        );
+
+        let mut fin = test_finalizer(Arc::clone(&tracker), plan, runtime);
+        fin.audit = Some(Arc::clone(&audit));
+        fin.client_ip = Some("10.9.9.9".to_string());
+        let qid = fin.query_id;
+        tracker.start(qid, "test-user", None, "SELECT 1", "test-session", None, vec![]);
+
+        // Drop the stream after one batch to trigger the cancel path.
+        let inner = fixed_stream(Arc::clone(&schema), vec![sample_batch(1), sample_batch(1)]);
+        let mut stream = TrackedRecordBatchStream::new(inner, fin, None);
+        let _first = stream.next().await.unwrap().unwrap();
+        drop(stream);
+        audit.flush();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(content.lines().next().unwrap()).unwrap();
+        assert_eq!(
+            v["client_ip"].as_str(),
+            Some("10.9.9.9"),
+            "cancel audit event must carry client_ip; got: {v}"
+        );
+        // The JSONL serializer flattens outcome: status + error_code at top level.
+        assert_eq!(
+            v["status"].as_str(),
+            Some("failure"),
+            "cancel audit event must have status == failure; got: {v}"
+        );
+        assert_eq!(
+            v["error_code"].as_str(),
+            Some("QUERY_CANCELLED"),
+            "cancel audit event must have error_code == QUERY_CANCELLED; got: {v}"
+        );
+    }
+
     #[tokio::test]
     async fn idle_timeout_surfaces_error_not_empty_success() {
         let (plan, schema, runtime) = trivial_plan().await;

@@ -1064,6 +1064,7 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
             } else {
                 Some(
                     moka::sync::Cache::builder()
+                        .max_capacity(1024)
                         .time_to_live(std::time::Duration::from_secs(window))
                         .build(),
                 )
