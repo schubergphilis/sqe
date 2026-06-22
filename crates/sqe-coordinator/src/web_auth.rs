@@ -86,6 +86,20 @@ pub trait BearerAdminState: Send + Sync + 'static {
     /// Called when an anonymous (Unauthorized) denial occurs. Implementors
     /// should increment a counter metric. The default is a no-op.
     fn on_anonymous_denial(&self) {}
+    /// Returns `true` and records the principal when an audit-success line is due
+    /// (first access within the dedup window, or window == 0). Returns `false`
+    /// for subsequent requests by the same principal within the window.
+    ///
+    /// The default implementation always returns `true` so test doubles and
+    /// `run_worker` paths preserve per-request behavior.
+    fn should_emit_success_audit(&self, _principal: &str) -> bool {
+        true
+    }
+    /// Increments the `sqe_dashboard_auth_success_total` counter. Called on
+    /// every successful auth, including within-window suppressed hits.
+    ///
+    /// The default implementation is a no-op; `HealthState` overrides it.
+    fn note_dashboard_success(&self) {}
 }
 
 /// Build an `AuditEvent` for a dashboard access attempt by an identified
@@ -204,12 +218,26 @@ where
     // Forbidden). Anonymous denials (Unauthorized) write NO audit line:
     // they bump a counter instead to prevent health-port probe flood from
     // saturating the audit spool and SIEM.
+    //
+    // For Success: always increment the success counter; emit the audit line
+    // only if `should_emit_success_audit` says so (dedup window).
+    // For Forbidden: always emit the audit line (unchanged; low volume, security signal).
     match &result {
         Err((GuardReject::Unauthorized, _)) => {
             tracing::debug!("dashboard: anonymous denial (no bearer token or invalid scheme)");
             state.on_anonymous_denial();
         }
-        _ => {
+        Ok(identity) => {
+            state.note_dashboard_success();
+            if state.should_emit_success_audit(&identity.user_id) {
+                if let Some(audit) = state.audit() {
+                    if let Some(event) = dashboard_audit_event(&result, None) {
+                        audit.log_event(event);
+                    }
+                }
+            }
+        }
+        Err((GuardReject::Forbidden, _)) => {
             if let Some(audit) = state.audit() {
                 if let Some(event) = dashboard_audit_event(&result, None) {
                     audit.log_event(event);
@@ -475,5 +503,197 @@ mod tests {
                 assert!(!s.contains("tok"), "token value must not appear: {s}");
             }
         }
+    }
+
+    // ── Dedup / coalesce tests ─────────────────────────────────────────────
+
+    use std::sync::atomic::{AtomicU64, Ordering as AOrdering};
+
+    /// Minimal state stub for dedup tests. Uses a moka cache (window > 0) or
+    /// always-emit path (window == 0) -- same logic as HealthState will use.
+    struct DedupState {
+        /// None means window == 0 (no dedup).
+        cache: Option<moka::sync::Cache<String, ()>>,
+        /// Counts `note_dashboard_success` calls.
+        success_count: Arc<AtomicU64>,
+        audit: Arc<AuditLogger>,
+    }
+
+    impl DedupState {
+        fn new_with_window(window_secs: u64, audit: Arc<AuditLogger>) -> Self {
+            let cache = if window_secs == 0 {
+                None
+            } else {
+                Some(
+                    moka::sync::Cache::builder()
+                        .time_to_live(std::time::Duration::from_secs(window_secs))
+                        .build(),
+                )
+            };
+            Self {
+                cache,
+                success_count: Arc::new(AtomicU64::new(0)),
+                audit,
+            }
+        }
+    }
+
+    impl BearerAdminState for DedupState {
+        fn bearer_provider(&self) -> Option<&Arc<dyn sqe_auth::AuthProvider>> {
+            None
+        }
+        fn auth_config(&self) -> Option<&sqe_core::config::AuthConfig> {
+            None
+        }
+        fn audit(&self) -> Option<&Arc<AuditLogger>> {
+            Some(&self.audit)
+        }
+        fn should_emit_success_audit(&self, principal: &str) -> bool {
+            match &self.cache {
+                None => true, // window == 0: always emit
+                Some(cache) => {
+                    if cache.contains_key(principal) {
+                        false
+                    } else {
+                        cache.insert(principal.to_string(), ());
+                        true
+                    }
+                }
+            }
+        }
+        fn note_dashboard_success(&self) {
+            self.success_count.fetch_add(1, AOrdering::Relaxed);
+        }
+    }
+
+    fn make_audit_logger() -> (Arc<AuditLogger>, std::path::PathBuf, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("dedup_audit.jsonl");
+        let logger = AuditLogger::new(path.to_str().unwrap()).expect("audit logger");
+        (Arc::new(logger), path, dir)
+    }
+
+    fn emit_success(state: &DedupState, identity: &sqe_auth::Identity) {
+        let result: Result<sqe_auth::Identity, (GuardReject, Option<sqe_auth::Identity>)> =
+            Ok(identity.clone());
+        state.note_dashboard_success();
+        if state.should_emit_success_audit(&identity.user_id) {
+            if let Some(event) = dashboard_audit_event(&result, None) {
+                state.audit.log_event(event);
+            }
+        }
+    }
+
+    fn emit_forbidden(state: &DedupState, identity: &sqe_auth::Identity) {
+        let result: Result<sqe_auth::Identity, (GuardReject, Option<sqe_auth::Identity>)> =
+            Err((GuardReject::Forbidden, Some(identity.clone())));
+        if let Some(event) = dashboard_audit_event(&result, None) {
+            state.audit.log_event(event);
+        }
+    }
+
+    /// Same principal authenticated twice within the window -> exactly ONE
+    /// auth-success audit line written; the success counter reflects 2.
+    #[test]
+    fn same_principal_within_window_deduped() {
+        let (logger, path, _dir) = make_audit_logger();
+        let state = DedupState::new_with_window(300, Arc::clone(&logger));
+        let alice = admin_identity();
+
+        emit_success(&state, &alice);
+        emit_success(&state, &alice);
+
+        logger.flush();
+        let content = std::fs::read_to_string(&path).unwrap_or_default();
+        let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(
+            lines.len(),
+            1,
+            "same principal within window: expected 1 audit line, got {}; content: {content}",
+            lines.len()
+        );
+        assert_eq!(
+            state.success_count.load(AOrdering::Relaxed),
+            2,
+            "success counter must reflect both requests"
+        );
+    }
+
+    /// Two distinct principals -> two audit lines.
+    #[test]
+    fn distinct_principals_both_emit() {
+        let (logger, path, _dir) = make_audit_logger();
+        let state = DedupState::new_with_window(300, Arc::clone(&logger));
+        let alice = admin_identity();
+        let bob = sqe_auth::Identity {
+            user_id: "bob".into(),
+            display_name: "bob".into(),
+            roles: vec!["admin".into()],
+            subject: None,
+            email: None,
+            groups: vec![],
+            catalog_token: None,
+            refresh_token: None,
+            expires_at: None,
+        };
+
+        emit_success(&state, &alice);
+        emit_success(&state, &bob);
+
+        logger.flush();
+        let content = std::fs::read_to_string(&path).unwrap_or_default();
+        let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(
+            lines.len(),
+            2,
+            "two distinct principals: expected 2 audit lines, got {}; content: {content}",
+            lines.len()
+        );
+        assert_eq!(state.success_count.load(AOrdering::Relaxed), 2);
+    }
+
+    /// Window == 0 -> every request emits an audit line (no dedup).
+    #[test]
+    fn window_zero_emits_every_request() {
+        let (logger, path, _dir) = make_audit_logger();
+        let state = DedupState::new_with_window(0, Arc::clone(&logger));
+        let alice = admin_identity();
+
+        emit_success(&state, &alice);
+        emit_success(&state, &alice);
+        emit_success(&state, &alice);
+
+        logger.flush();
+        let content = std::fs::read_to_string(&path).unwrap_or_default();
+        let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(
+            lines.len(),
+            3,
+            "window=0: expected 3 audit lines (no dedup), got {}; content: {content}",
+            lines.len()
+        );
+    }
+
+    /// Forbidden always emits an audit line regardless of the dedup window.
+    #[test]
+    fn forbidden_always_emits_regardless_of_window() {
+        let (logger, path, _dir) = make_audit_logger();
+        let state = DedupState::new_with_window(300, Arc::clone(&logger));
+        let bob = non_admin_identity();
+
+        emit_forbidden(&state, &bob);
+        emit_forbidden(&state, &bob);
+
+        logger.flush();
+        let content = std::fs::read_to_string(&path).unwrap_or_default();
+        let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(
+            lines.len(),
+            2,
+            "Forbidden must always emit; expected 2 lines, got {}; content: {content}",
+            lines.len()
+        );
+        // Success counter unchanged (Forbidden is not a success).
+        assert_eq!(state.success_count.load(AOrdering::Relaxed), 0);
     }
 }
