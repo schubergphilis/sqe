@@ -27,7 +27,7 @@ impl CoordinatorExecutor {
 impl QueryExecutor for CoordinatorExecutor {
     async fn execute(&self, session: &Session, sql: &str) -> Result<Vec<RecordBatch>, QueryError> {
         self.query_handler
-            .execute(session, sql)
+            .execute(session, sql, None)
             .await
             .map_err(sqe_error_to_query_error)
     }
