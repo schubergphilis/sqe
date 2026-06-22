@@ -74,6 +74,9 @@ struct HealthState {
     auth_cfg: Option<sqe_core::config::AuthConfig>,
     /// Audit logger wired for dashboard-access events. `None` in `run_worker` and tests.
     audit: Option<Arc<sqe_metrics::audit::AuditLogger>>,
+    /// Counter incremented for anonymous (Unauthorized) dashboard denials instead
+    /// of writing an audit line. `None` in `run_worker` and tests.
+    anonymous_denied: Option<prometheus::IntCounter>,
 }
 
 impl sqe_coordinator::web_auth::BearerAdminState for HealthState {
@@ -87,6 +90,12 @@ impl sqe_coordinator::web_auth::BearerAdminState for HealthState {
 
     fn audit(&self) -> Option<&Arc<sqe_metrics::audit::AuditLogger>> {
         self.audit.as_ref()
+    }
+
+    fn on_anonymous_denial(&self) {
+        if let Some(c) = &self.anonymous_denied {
+            c.inc();
+        }
     }
 }
 
@@ -986,6 +995,7 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
         bearer_provider: Some(Arc::clone(&auth_chain) as Arc<dyn sqe_auth::AuthProvider>),
         auth_cfg: Some(config.auth.clone()),
         audit: Some(Arc::clone(&audit)),
+        anonymous_denied: Some(metrics.dashboard_auth_anonymous_denied_total.clone()),
     });
     start_health_server(health_port, health_state);
 
@@ -1358,6 +1368,7 @@ async fn run_worker(config: SqeConfig) -> anyhow::Result<()> {
         bearer_provider: None,
         auth_cfg: None,
         audit: None,
+        anonymous_denied: None,
     });
     start_health_server(health_port, health_state);
 
@@ -1726,6 +1737,7 @@ mod tests {
             bearer_provider: None,
             auth_cfg: None,
             audit: None,
+            anonymous_denied: None,
         });
 
         let Json(status) = cluster_status(axum::extract::State(state)).await;
@@ -1749,6 +1761,7 @@ mod tests {
             bearer_provider: None,
             auth_cfg: None,
             audit: None,
+            anonymous_denied: None,
         });
 
         let Json(status) = cluster_status(axum::extract::State(state)).await;
@@ -1778,6 +1791,7 @@ mod tests {
             bearer_provider: None,
             auth_cfg: None,
             audit: None,
+            anonymous_denied: None,
         });
 
         let Json(status) = cluster_status(axum::extract::State(state)).await;
@@ -1804,6 +1818,7 @@ mod tests {
             bearer_provider: None,
             auth_cfg: None,
             audit: None,
+            anonymous_denied: None,
         });
 
         let response = readyz(axum::extract::State(state)).await;
@@ -1829,6 +1844,7 @@ mod tests {
             bearer_provider: None,
             auth_cfg: None,
             audit: None,
+            anonymous_denied: None,
         });
 
         let response = readyz(axum::extract::State(state)).await;
@@ -1890,6 +1906,7 @@ mod tests {
             bearer_provider: None,
             auth_cfg: None,
             audit: None,
+            anonymous_denied: None,
         });
 
         let response = readyz(axum::extract::State(state)).await;
@@ -1917,6 +1934,7 @@ mod tests {
             bearer_provider: None,
             auth_cfg: None,
             audit: None,
+            anonymous_denied: None,
         });
 
         let Json(items) = api_queries(
@@ -1945,6 +1963,7 @@ mod tests {
             bearer_provider: None,
             auth_cfg: None,
             audit: None,
+            anonymous_denied: None,
         });
         let Json(resp) = api_metrics_history(axum::extract::State(state)).await;
         assert_eq!(resp.bucket_seconds, sqe_coordinator::metrics_history::BUCKET_SECS);
@@ -1981,6 +2000,7 @@ mod tests {
             bearer_provider: None,
             auth_cfg: None,
             audit: None,
+            anonymous_denied: None,
         });
         let Json(resp) = api_metrics_history(axum::extract::State(state)).await;
         assert_eq!(resp.bucket_seconds, sqe_coordinator::metrics_history::BUCKET_SECS);
@@ -2061,6 +2081,7 @@ mod tests {
             bearer_provider: Some(provider),
             auth_cfg: Some(auth_cfg),
             audit: None,
+            anonymous_denied: None,
         })
     }
 
