@@ -183,9 +183,10 @@ pub const DASHBOARD_HTML: &str = include_str!("web_ui/dashboard.html");
 
 /// WEB-02 (updated C1): username, roles, client_ip, and SQL text are now
 /// exposed on these routes because all dashboard endpoints are admin-gated
-/// (bearer token + "sqe-admin" role required, sub-project C task 1). The raw
-/// SQL is NEVER placed in the DTO. The `sql` field always contains the output
-/// of `redact_pii`, which replaces known PII patterns (email, phone, SSN,
+/// (bearer token + a role from `auth.admin_roles` required, default:
+/// `service_admin` / `catalog_admin`, sub-project C task 1). The raw SQL is
+/// NEVER placed in the DTO. The `sql` field always contains the output of
+/// `redact_pii`, which replaces known PII patterns (email, phone, SSN,
 /// card numbers, secret keywords) with bracketed placeholders before the
 /// value leaves this layer.
 fn sql_digest(sql: &str) -> String {
@@ -250,7 +251,7 @@ fn to_list_item(r: &QueryRecord) -> QueryListItem {
         spill_bytes: r.spill_bytes,
         peak_memory_bytes: r.peak_memory_bytes,
         error_type: r.error_type.clone(),
-        error_message: r.error_message.clone(),
+        error_message: r.error_message.as_deref().map(redact_pii),
     }
 }
 
@@ -669,5 +670,34 @@ mod tests {
         // sql must be redact_pii output: email replaced, raw literal absent.
         assert!(item.sql.contains("[EMAIL]"), "expected [EMAIL] in sql, got: {}", item.sql);
         assert!(!item.sql.contains("a@b.com"), "raw email must not appear in sql, got: {}", item.sql);
+    }
+
+    /// error_message is passed through redact_pii so PII in engine error
+    /// text does not leak to the dashboard caller.
+    #[tokio::test]
+    async fn error_message_is_redacted_in_dto() {
+        let t = tracker();
+        let id = Uuid::now_v7();
+        t.start(id, "bob", None, "SELECT 1", "s1", None, vec![]);
+        // Simulate a failed query whose error message contains an email address.
+        let err = sqe_core::SqeError::Execution(
+            "constraint violation for user 'a@b.com'".to_string(),
+        );
+        t.failed(&id, &err);
+
+        let list = query_list(&t, None, 100);
+        assert_eq!(list.len(), 1);
+        let item = &list[0];
+
+        // The DTO must contain the redacted placeholder, not the raw address.
+        let msg = item.error_message.as_deref().expect("error_message present");
+        assert!(
+            msg.contains("[EMAIL]"),
+            "expected [EMAIL] in error_message, got: {msg}"
+        );
+        assert!(
+            !msg.contains("a@b.com"),
+            "raw email must not appear in error_message, got: {msg}"
+        );
     }
 }
