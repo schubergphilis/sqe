@@ -371,7 +371,7 @@ connectivity problem.
 
 ## Operator dashboard gate
 
-When `[server] web_ui = true` (default: `false`), the operator dashboard is enabled
+When `[metrics] web_ui = true` (default: `false`), the operator dashboard is enabled
 on the health port. The dashboard exposes live query state, worker health, and
 performance counters to authenticated admins. It requires a bearer token and an admin
 role before it serves any content.
@@ -397,8 +397,9 @@ health checks. They must not require credentials.
 
 The admin role list is `auth.admin_roles`. The same list gates coordinator DDL
 (CREATE/DROP/ALTER TABLE). A token that validates but holds none of the listed roles
-gets a `403 Forbidden`. An empty `admin_roles` list bypasses the role check; a
-bearer token is still required.
+gets a `403 Forbidden`. An empty `admin_roles` list is fail-closed: every caller
+receives `403`, because `has_admin_role` returns `false` when the configured list is
+empty. Operators must configure at least one role to grant anyone dashboard access.
 
 ### Audit behavior
 
