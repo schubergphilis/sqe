@@ -900,6 +900,7 @@ async fn streaming_select_emits_canonical_query_event() {
             name: "orders".to_string(),
             object_type: ObjectType::Table,
         }],
+        client_ip: None,
     };
 
     let qid = fin.query_id;
@@ -1128,5 +1129,89 @@ async fn execute_threads_client_ip_into_query_audit_event() {
         entry["client_ip"].as_str(),
         Some("10.1.2.3"),
         "client_ip must equal the value passed to execute(); got: {entry}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Task 4 (folded-in): Grant and DDL audit events carry client_ip
+// ---------------------------------------------------------------------------
+
+/// TDD guard for Task 4 (Grant branch): `client_ip` passed to `execute()`
+/// appears in the GRANT audit event.
+///
+/// RED before the `client_ip: None` -> `client_ip.clone()` fix in
+/// `query_handler.rs` ~1658.
+/// GREEN after.
+#[tokio::test]
+async fn grant_audit_event_carries_client_ip() {
+    let fx = make_fixture_with_grant_backend();
+    let session = admin_session();
+
+    fx.handler
+        .execute(
+            &session,
+            "GRANT SELECT ON sales.orders TO ROLE analyst",
+            Some("192.168.1.100".to_string()),
+        )
+        .await
+        .expect("grant must succeed for admin");
+
+    let lines = fx.read_lines();
+    let grant_events: Vec<&serde_json::Value> = lines
+        .iter()
+        .filter(|e| e["kind"].as_str() == Some("grant"))
+        .collect();
+
+    assert_eq!(grant_events.len(), 1, "exactly one grant event; got lines:\n{}",
+        serde_json::to_string_pretty(&serde_json::Value::Array(lines.clone())).unwrap_or_default());
+
+    let entry = grant_events[0];
+    assert_eq!(
+        entry["client_ip"].as_str(),
+        Some("192.168.1.100"),
+        "grant audit event must carry client_ip; got: {entry}"
+    );
+}
+
+/// TDD guard for Task 4 (DDL branch): `client_ip` passed to `execute()`
+/// appears in the DDL (admin_ddl) audit event.
+///
+/// RED before the `client_ip: None` -> `client_ip.clone()` fix in
+/// `query_handler.rs` ~1748.
+/// GREEN after.
+#[tokio::test]
+async fn ddl_audit_event_carries_client_ip() {
+    let fx = make_fixture();
+    let session = admin_session();
+
+    // DROP TABLE fails at execution (no catalog) but the audit block still
+    // runs, emitting a Failure-outcome canonical AuditEvent.
+    let _ = fx
+        .handler
+        .execute(
+            &session,
+            "DROP TABLE IF EXISTS myns.mytable",
+            Some("10.20.30.40".to_string()),
+        )
+        .await;
+
+    let lines = fx.read_lines();
+    assert_eq!(
+        lines.len(),
+        1,
+        "exactly one audit line for DDL; got:\n{}",
+        serde_json::to_string_pretty(&serde_json::Value::Array(lines.clone())).unwrap_or_default()
+    );
+    let entry = &lines[0];
+
+    assert_eq!(
+        entry["kind"].as_str(),
+        Some("admin_ddl"),
+        "DDL must emit kind=admin_ddl; got: {entry}"
+    );
+    assert_eq!(
+        entry["client_ip"].as_str(),
+        Some("10.20.30.40"),
+        "DDL audit event must carry client_ip; got: {entry}"
     );
 }
