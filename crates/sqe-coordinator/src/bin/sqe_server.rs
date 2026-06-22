@@ -77,6 +77,14 @@ struct HealthState {
     /// Counter incremented for anonymous (Unauthorized) dashboard denials instead
     /// of writing an audit line. `None` in `run_worker` and tests.
     anonymous_denied: Option<prometheus::IntCounter>,
+    /// Counter incremented on every successful dashboard auth, including
+    /// within-window deduplicated hits that do not write an audit line.
+    /// `None` in `run_worker` and tests.
+    dashboard_success: Option<prometheus::IntCounter>,
+    /// Moka TTL cache keyed by principal. A hit means the principal was already
+    /// audited within the current window; skip the audit line but still count.
+    /// `None` means no dedup (window == 0 or run_worker/tests).
+    success_audit_dedup: Option<moka::sync::Cache<String, ()>>,
 }
 
 impl sqe_coordinator::web_auth::BearerAdminState for HealthState {
@@ -94,6 +102,26 @@ impl sqe_coordinator::web_auth::BearerAdminState for HealthState {
 
     fn on_anonymous_denial(&self) {
         if let Some(c) = &self.anonymous_denied {
+            c.inc();
+        }
+    }
+
+    fn should_emit_success_audit(&self, principal: &str) -> bool {
+        match &self.success_audit_dedup {
+            None => true, // window == 0 or not wired: always emit
+            Some(cache) => {
+                if cache.contains_key(principal) {
+                    false
+                } else {
+                    cache.insert(principal.to_string(), ());
+                    true
+                }
+            }
+        }
+    }
+
+    fn note_dashboard_success(&self) {
+        if let Some(c) = &self.dashboard_success {
             c.inc();
         }
     }
@@ -996,6 +1024,19 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
         auth_cfg: Some(config.auth.clone()),
         audit: Some(Arc::clone(&audit)),
         anonymous_denied: Some(metrics.dashboard_auth_anonymous_denied_total.clone()),
+        dashboard_success: Some(metrics.dashboard_auth_success_total.clone()),
+        success_audit_dedup: {
+            let window = config.metrics.audit.dashboard_access_audit_window_secs;
+            if window == 0 {
+                None
+            } else {
+                Some(
+                    moka::sync::Cache::builder()
+                        .time_to_live(std::time::Duration::from_secs(window))
+                        .build(),
+                )
+            }
+        },
     });
     start_health_server(health_port, health_state);
 
@@ -1369,6 +1410,8 @@ async fn run_worker(config: SqeConfig) -> anyhow::Result<()> {
         auth_cfg: None,
         audit: None,
         anonymous_denied: None,
+        dashboard_success: None,
+        success_audit_dedup: None,
     });
     start_health_server(health_port, health_state);
 
@@ -1738,6 +1781,8 @@ mod tests {
             auth_cfg: None,
             audit: None,
             anonymous_denied: None,
+            dashboard_success: None,
+            success_audit_dedup: None,
         });
 
         let Json(status) = cluster_status(axum::extract::State(state)).await;
@@ -1762,6 +1807,8 @@ mod tests {
             auth_cfg: None,
             audit: None,
             anonymous_denied: None,
+            dashboard_success: None,
+            success_audit_dedup: None,
         });
 
         let Json(status) = cluster_status(axum::extract::State(state)).await;
@@ -1792,6 +1839,8 @@ mod tests {
             auth_cfg: None,
             audit: None,
             anonymous_denied: None,
+            dashboard_success: None,
+            success_audit_dedup: None,
         });
 
         let Json(status) = cluster_status(axum::extract::State(state)).await;
@@ -1819,6 +1868,8 @@ mod tests {
             auth_cfg: None,
             audit: None,
             anonymous_denied: None,
+            dashboard_success: None,
+            success_audit_dedup: None,
         });
 
         let response = readyz(axum::extract::State(state)).await;
@@ -1845,6 +1896,8 @@ mod tests {
             auth_cfg: None,
             audit: None,
             anonymous_denied: None,
+            dashboard_success: None,
+            success_audit_dedup: None,
         });
 
         let response = readyz(axum::extract::State(state)).await;
@@ -1907,6 +1960,8 @@ mod tests {
             auth_cfg: None,
             audit: None,
             anonymous_denied: None,
+            dashboard_success: None,
+            success_audit_dedup: None,
         });
 
         let response = readyz(axum::extract::State(state)).await;
@@ -1935,6 +1990,8 @@ mod tests {
             auth_cfg: None,
             audit: None,
             anonymous_denied: None,
+            dashboard_success: None,
+            success_audit_dedup: None,
         });
 
         let Json(items) = api_queries(
@@ -1964,6 +2021,8 @@ mod tests {
             auth_cfg: None,
             audit: None,
             anonymous_denied: None,
+            dashboard_success: None,
+            success_audit_dedup: None,
         });
         let Json(resp) = api_metrics_history(axum::extract::State(state)).await;
         assert_eq!(resp.bucket_seconds, sqe_coordinator::metrics_history::BUCKET_SECS);
@@ -2001,6 +2060,8 @@ mod tests {
             auth_cfg: None,
             audit: None,
             anonymous_denied: None,
+            dashboard_success: None,
+            success_audit_dedup: None,
         });
         let Json(resp) = api_metrics_history(axum::extract::State(state)).await;
         assert_eq!(resp.bucket_seconds, sqe_coordinator::metrics_history::BUCKET_SECS);
@@ -2082,6 +2143,8 @@ mod tests {
             auth_cfg: Some(auth_cfg),
             audit: None,
             anonymous_denied: None,
+            dashboard_success: None,
+            success_audit_dedup: None,
         })
     }
 

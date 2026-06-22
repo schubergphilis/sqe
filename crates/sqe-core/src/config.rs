@@ -2319,6 +2319,16 @@ pub struct AuditConfig {
     /// Log full result sets for debugging. NEVER enable in production.
     #[serde(default)]
     pub superdebug_log_results: bool,
+    /// Coalesce dashboard auth-SUCCESS audit events per principal.
+    ///
+    /// Within each window, at most ONE audit line is written per principal;
+    /// subsequent hits increment the `sqe_dashboard_auth_success_total` counter
+    /// but do NOT write a second audit line.  Set to 0 to disable dedup and
+    /// audit every request (restores pre-coalesce behavior).
+    ///
+    /// Default: 300 seconds.
+    #[serde(default = "default_dashboard_access_audit_window_secs")]
+    pub dashboard_access_audit_window_secs: u64,
 }
 
 fn default_audit_format() -> String {
@@ -2329,6 +2339,10 @@ fn default_gdpr_identifier_mode() -> String {
     "tokenize".to_string()
 }
 
+fn default_dashboard_access_audit_window_secs() -> u64 {
+    300
+}
+
 impl Default for AuditConfig {
     fn default() -> Self {
         Self {
@@ -2336,6 +2350,7 @@ impl Default for AuditConfig {
             gdpr_tags: Vec::new(),
             gdpr_identifier_mode: default_gdpr_identifier_mode(),
             superdebug_log_results: false,
+            dashboard_access_audit_window_secs: default_dashboard_access_audit_window_secs(),
         }
     }
 }
@@ -3345,6 +3360,10 @@ impl SqeConfig {
         env_override_bool(
             "SQE_METRICS__AUDIT__SUPERDEBUG_LOG_RESULTS",
             &mut self.metrics.audit.superdebug_log_results,
+        );
+        env_override_u64(
+            "SQE_METRICS__AUDIT__DASHBOARD_ACCESS_AUDIT_WINDOW_SECS",
+            &mut self.metrics.audit.dashboard_access_audit_window_secs,
         );
 
         // Metrics: AuditExport
