@@ -15,10 +15,11 @@
 //! `/healthz`, `/readyz`, and `/api/v1/status` are NOT gated: they are
 //! attached to the router before the `route_layer` is applied.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::{
-    extract::{Request, State},
+    extract::{ConnectInfo, Request, State},
     http::StatusCode,
     middleware::Next,
     response::{IntoResponse, Response},
@@ -86,6 +87,34 @@ pub trait BearerAdminState: Send + Sync + 'static {
     /// Called when an anonymous (Unauthorized) denial occurs. Implementors
     /// should increment a counter metric. The default is a no-op.
     fn on_anonymous_denial(&self) {}
+    /// Returns `true` and records the principal when an audit-success line is due
+    /// (first access within the dedup window, or window == 0). Returns `false`
+    /// for subsequent requests by the same principal within the window.
+    ///
+    /// The default implementation always returns `true` so test doubles and
+    /// `run_worker` paths preserve per-request behavior.
+    fn should_emit_success_audit(&self, _principal: &str) -> bool {
+        true
+    }
+    /// Increments the `sqe_dashboard_auth_success_total` counter. Called on
+    /// every successful auth, including within-window suppressed hits.
+    ///
+    /// The default implementation is a no-op; `HealthState` overrides it.
+    fn note_dashboard_success(&self) {}
+    /// Resolve the client IP from the TCP peer address and optional
+    /// `X-Forwarded-For` header, applying the same precedence as the Flight
+    /// SQL path: honour XFF only when the peer is a trusted proxy, otherwise
+    /// return the raw peer address.
+    ///
+    /// The default implementation ignores XFF (peer-wins, no proxy trust).
+    /// `HealthState` overrides this to delegate to
+    /// `SecurityConfig::resolve_client_ip`, which applies the configured
+    /// `trusted_proxies` list.
+    fn resolve_client_ip(&self, peer: Option<&str>, xff: Option<&str>) -> Option<String> {
+        // Default: no XFF honoring. Use peer directly.
+        let _ = xff;
+        peer.map(|p| p.to_string())
+    }
 }
 
 /// Build an `AuditEvent` for a dashboard access attempt by an identified
@@ -96,8 +125,10 @@ pub trait BearerAdminState: Send + Sync + 'static {
 /// The bearer token is NEVER included: only the resolved identity fields
 /// (on success or Forbidden) are recorded.
 ///
-/// `client_ip` is `None` for now because the health router is served
-/// without `into_make_service_with_connect_info`; wired in Phase C2.
+/// `client_ip` is `Some` when the health router is served with
+/// `into_make_service_with_connect_info` and a `ConnectInfo<SocketAddr>`
+/// extension is present on the request. It is `None` for test callers that
+/// do not supply `ConnectInfo` (graceful degradation).
 pub fn dashboard_audit_event(
     result: &Result<Identity, (GuardReject, Option<Identity>)>,
     client_ip: Option<String>,
@@ -194,6 +225,30 @@ where
             return (StatusCode::UNAUTHORIZED, "auth not configured").into_response();
         }
     };
+
+    // Extract the TCP peer address from the ConnectInfo extension. This is
+    // present only when the server was started with
+    // `into_make_service_with_connect_info::<SocketAddr>()`. Callers (tests,
+    // worker path) that do not supply ConnectInfo get None here; the IP
+    // resolution degrades gracefully to None in that case.
+    let peer: Option<String> = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ci| ci.0.to_string());
+
+    // Extract the X-Forwarded-For header, if present.
+    let xff: Option<String> = request
+        .headers()
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+
+    // Resolve the client IP using the state's configured proxy trust list.
+    // `resolve_client_ip` on the trait defaults to peer-wins (no XFF);
+    // HealthState overrides this to call SecurityConfig::resolve_client_ip.
+    let client_ip: Option<String> =
+        state.resolve_client_ip(peer.as_deref(), xff.as_deref());
+
     let header = request
         .headers()
         .get(axum::http::header::AUTHORIZATION)
@@ -204,14 +259,31 @@ where
     // Forbidden). Anonymous denials (Unauthorized) write NO audit line:
     // they bump a counter instead to prevent health-port probe flood from
     // saturating the audit spool and SIEM.
+    //
+    // For Success: always increment the success counter; emit the audit line
+    // only if `should_emit_success_audit` says so (dedup window).
+    // For Forbidden: always emit the audit line (unchanged; low volume, security signal).
     match &result {
         Err((GuardReject::Unauthorized, _)) => {
-            tracing::debug!("dashboard: anonymous denial (no bearer token or invalid scheme)");
+            tracing::debug!(
+                client_ip = client_ip.as_deref().unwrap_or("unknown"),
+                "dashboard: anonymous denial (no bearer token or invalid scheme)"
+            );
             state.on_anonymous_denial();
         }
-        _ => {
+        Ok(identity) => {
+            state.note_dashboard_success();
+            if state.should_emit_success_audit(&identity.user_id) {
+                if let Some(audit) = state.audit() {
+                    if let Some(event) = dashboard_audit_event(&result, client_ip.clone()) {
+                        audit.log_event(event);
+                    }
+                }
+            }
+        }
+        Err((GuardReject::Forbidden, _)) => {
             if let Some(audit) = state.audit() {
-                if let Some(event) = dashboard_audit_event(&result, None) {
+                if let Some(event) = dashboard_audit_event(&result, client_ip.clone()) {
                     audit.log_event(event);
                 }
             }
@@ -475,5 +547,396 @@ mod tests {
                 assert!(!s.contains("tok"), "token value must not appear: {s}");
             }
         }
+    }
+
+    // ── Dedup / coalesce tests ─────────────────────────────────────────────
+
+    use std::sync::atomic::{AtomicU64, Ordering as AOrdering};
+
+    /// Minimal state stub for dedup tests. Uses a moka cache (window > 0) or
+    /// always-emit path (window == 0) -- same logic as HealthState will use.
+    struct DedupState {
+        /// None means window == 0 (no dedup).
+        cache: Option<moka::sync::Cache<String, ()>>,
+        /// Counts `note_dashboard_success` calls.
+        success_count: Arc<AtomicU64>,
+        audit: Arc<AuditLogger>,
+    }
+
+    impl DedupState {
+        fn new_with_window(window_secs: u64, audit: Arc<AuditLogger>) -> Self {
+            let cache = if window_secs == 0 {
+                None
+            } else {
+                Some(
+                    moka::sync::Cache::builder()
+                        .time_to_live(std::time::Duration::from_secs(window_secs))
+                        .build(),
+                )
+            };
+            Self {
+                cache,
+                success_count: Arc::new(AtomicU64::new(0)),
+                audit,
+            }
+        }
+    }
+
+    impl BearerAdminState for DedupState {
+        fn bearer_provider(&self) -> Option<&Arc<dyn sqe_auth::AuthProvider>> {
+            None
+        }
+        fn auth_config(&self) -> Option<&sqe_core::config::AuthConfig> {
+            None
+        }
+        fn audit(&self) -> Option<&Arc<AuditLogger>> {
+            Some(&self.audit)
+        }
+        fn should_emit_success_audit(&self, principal: &str) -> bool {
+            match &self.cache {
+                None => true, // window == 0: always emit
+                Some(cache) => {
+                    if cache.contains_key(principal) {
+                        false
+                    } else {
+                        cache.insert(principal.to_string(), ());
+                        true
+                    }
+                }
+            }
+        }
+        fn note_dashboard_success(&self) {
+            self.success_count.fetch_add(1, AOrdering::Relaxed);
+        }
+    }
+
+    fn make_audit_logger() -> (Arc<AuditLogger>, std::path::PathBuf, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("dedup_audit.jsonl");
+        let logger = AuditLogger::new(path.to_str().unwrap()).expect("audit logger");
+        (Arc::new(logger), path, dir)
+    }
+
+    fn emit_success(state: &DedupState, identity: &sqe_auth::Identity) {
+        let result: Result<sqe_auth::Identity, (GuardReject, Option<sqe_auth::Identity>)> =
+            Ok(identity.clone());
+        state.note_dashboard_success();
+        if state.should_emit_success_audit(&identity.user_id) {
+            if let Some(event) = dashboard_audit_event(&result, None) {
+                state.audit.log_event(event);
+            }
+        }
+    }
+
+    fn emit_forbidden(state: &DedupState, identity: &sqe_auth::Identity) {
+        let result: Result<sqe_auth::Identity, (GuardReject, Option<sqe_auth::Identity>)> =
+            Err((GuardReject::Forbidden, Some(identity.clone())));
+        if let Some(event) = dashboard_audit_event(&result, None) {
+            state.audit.log_event(event);
+        }
+    }
+
+    /// Same principal authenticated twice within the window -> exactly ONE
+    /// auth-success audit line written; the success counter reflects 2.
+    #[test]
+    fn same_principal_within_window_deduped() {
+        let (logger, path, _dir) = make_audit_logger();
+        let state = DedupState::new_with_window(300, Arc::clone(&logger));
+        let alice = admin_identity();
+
+        emit_success(&state, &alice);
+        emit_success(&state, &alice);
+
+        logger.flush();
+        let content = std::fs::read_to_string(&path).unwrap_or_default();
+        let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(
+            lines.len(),
+            1,
+            "same principal within window: expected 1 audit line, got {}; content: {content}",
+            lines.len()
+        );
+        assert_eq!(
+            state.success_count.load(AOrdering::Relaxed),
+            2,
+            "success counter must reflect both requests"
+        );
+    }
+
+    /// Two distinct principals -> two audit lines.
+    #[test]
+    fn distinct_principals_both_emit() {
+        let (logger, path, _dir) = make_audit_logger();
+        let state = DedupState::new_with_window(300, Arc::clone(&logger));
+        let alice = admin_identity();
+        let bob = sqe_auth::Identity {
+            user_id: "bob".into(),
+            display_name: "bob".into(),
+            roles: vec!["admin".into()],
+            subject: None,
+            email: None,
+            groups: vec![],
+            catalog_token: None,
+            refresh_token: None,
+            expires_at: None,
+        };
+
+        emit_success(&state, &alice);
+        emit_success(&state, &bob);
+
+        logger.flush();
+        let content = std::fs::read_to_string(&path).unwrap_or_default();
+        let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(
+            lines.len(),
+            2,
+            "two distinct principals: expected 2 audit lines, got {}; content: {content}",
+            lines.len()
+        );
+        assert_eq!(state.success_count.load(AOrdering::Relaxed), 2);
+    }
+
+    /// Window == 0 -> every request emits an audit line (no dedup).
+    #[test]
+    fn window_zero_emits_every_request() {
+        let (logger, path, _dir) = make_audit_logger();
+        let state = DedupState::new_with_window(0, Arc::clone(&logger));
+        let alice = admin_identity();
+
+        emit_success(&state, &alice);
+        emit_success(&state, &alice);
+        emit_success(&state, &alice);
+
+        logger.flush();
+        let content = std::fs::read_to_string(&path).unwrap_or_default();
+        let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(
+            lines.len(),
+            3,
+            "window=0: expected 3 audit lines (no dedup), got {}; content: {content}",
+            lines.len()
+        );
+    }
+
+    /// Forbidden always emits an audit line regardless of the dedup window.
+    #[test]
+    fn forbidden_always_emits_regardless_of_window() {
+        let (logger, path, _dir) = make_audit_logger();
+        let state = DedupState::new_with_window(300, Arc::clone(&logger));
+        let bob = non_admin_identity();
+
+        emit_forbidden(&state, &bob);
+        emit_forbidden(&state, &bob);
+
+        logger.flush();
+        let content = std::fs::read_to_string(&path).unwrap_or_default();
+        let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(
+            lines.len(),
+            2,
+            "Forbidden must always emit; expected 2 lines, got {}; content: {content}",
+            lines.len()
+        );
+        // Success counter unchanged (Forbidden is not a success).
+        assert_eq!(state.success_count.load(AOrdering::Relaxed), 0);
+    }
+
+    // ── TDD: client_ip carried in dashboard-access audit events ───────────
+
+    /// Success audit event carries client_ip when provided.
+    #[test]
+    fn audit_success_carries_client_ip() {
+        let result: Result<sqe_auth::Identity, (GuardReject, Option<sqe_auth::Identity>)> =
+            Ok(admin_identity());
+        let event = dashboard_audit_event(&result, Some("203.0.113.42".into()))
+            .expect("success must produce an event");
+        assert_eq!(
+            event.client_ip.as_deref(),
+            Some("203.0.113.42"),
+            "client_ip must be threaded into the audit event"
+        );
+        // Verify it serialises correctly.
+        let s = serde_json::to_string(&event).unwrap();
+        assert!(
+            s.contains("203.0.113.42"),
+            "client_ip must appear in serialised event: {s}"
+        );
+    }
+
+    /// Forbidden audit event carries client_ip when provided.
+    #[test]
+    fn audit_forbidden_carries_client_ip() {
+        let result: Result<sqe_auth::Identity, (GuardReject, Option<sqe_auth::Identity>)> =
+            Err((GuardReject::Forbidden, Some(non_admin_identity())));
+        let event = dashboard_audit_event(&result, Some("10.0.0.99".into()))
+            .expect("Forbidden must produce an event");
+        assert_eq!(
+            event.client_ip.as_deref(),
+            Some("10.0.0.99"),
+            "client_ip must be threaded into the Forbidden audit event"
+        );
+    }
+
+    /// Success audit event with None client_ip still writes an event (graceful-None).
+    #[test]
+    fn audit_success_graceful_none_client_ip() {
+        let result: Result<sqe_auth::Identity, (GuardReject, Option<sqe_auth::Identity>)> =
+            Ok(admin_identity());
+        let event = dashboard_audit_event(&result, None)
+            .expect("success must produce an event even with no client_ip");
+        assert!(
+            event.client_ip.is_none(),
+            "client_ip must be None when not provided"
+        );
+    }
+
+    /// `require_admin_bearer` emits an audit event with client_ip when ConnectInfo
+    /// is present in the request extensions (router oneshot with ConnectInfo set).
+    #[tokio::test]
+    async fn require_admin_bearer_emits_client_ip_on_success() {
+        use axum::{Router, routing::get};
+        use tower::ServiceExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("ci_audit.jsonl");
+        let logger = Arc::new(
+            sqe_metrics::audit::AuditLogger::new(path.to_str().unwrap()).expect("audit logger"),
+        );
+
+        let provider: Arc<dyn sqe_auth::AuthProvider> =
+            Arc::new(StubProvider { roles: vec!["admin".into()], ok: true });
+
+        struct CiState {
+            provider: Arc<dyn sqe_auth::AuthProvider>,
+            auth_cfg: sqe_core::config::AuthConfig,
+            audit: Arc<sqe_metrics::audit::AuditLogger>,
+        }
+
+        impl BearerAdminState for CiState {
+            fn bearer_provider(&self) -> Option<&Arc<dyn sqe_auth::AuthProvider>> {
+                Some(&self.provider)
+            }
+            fn auth_config(&self) -> Option<&sqe_core::config::AuthConfig> {
+                Some(&self.auth_cfg)
+            }
+            fn audit(&self) -> Option<&Arc<sqe_metrics::audit::AuditLogger>> {
+                Some(&self.audit)
+            }
+        }
+
+        let state = Arc::new(CiState {
+            provider,
+            auth_cfg: auth_cfg(&["admin"]),
+            audit: Arc::clone(&logger),
+        });
+
+        let app = Router::new()
+            .route("/guarded", get(|| async { "ok" }))
+            .route_layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                require_admin_bearer::<CiState>,
+            ))
+            .with_state(state);
+
+        // Build a request with ConnectInfo set in extensions.
+        let peer: std::net::SocketAddr = "203.0.113.7:54321".parse().unwrap();
+        let mut req = axum::http::Request::builder()
+            .uri("/guarded")
+            .header("Authorization", "Bearer tok")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(peer));
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+
+        logger.flush();
+        let content = std::fs::read_to_string(&path).unwrap_or_default();
+        assert!(
+            !content.trim().is_empty(),
+            "audit logger must have written a line"
+        );
+        let v: serde_json::Value = serde_json::from_str(content.lines().next().unwrap())
+            .expect("valid JSON");
+        assert_eq!(
+            v["client_ip"].as_str(),
+            Some("203.0.113.7:54321"),
+            "audit event must carry the ConnectInfo peer IP; got: {v}"
+        );
+    }
+
+    /// `require_admin_bearer` emits an audit event with client_ip when ConnectInfo
+    /// is present and the outcome is Forbidden.
+    #[tokio::test]
+    async fn require_admin_bearer_emits_client_ip_on_forbidden() {
+        use axum::{Router, routing::get};
+        use tower::ServiceExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("ci_forbidden_audit.jsonl");
+        let logger = Arc::new(
+            sqe_metrics::audit::AuditLogger::new(path.to_str().unwrap()).expect("audit logger"),
+        );
+
+        // Provider returns a non-admin identity.
+        let provider: Arc<dyn sqe_auth::AuthProvider> =
+            Arc::new(StubProvider { roles: vec!["analyst".into()], ok: true });
+
+        struct CiForbiddenState {
+            provider: Arc<dyn sqe_auth::AuthProvider>,
+            auth_cfg: sqe_core::config::AuthConfig,
+            audit: Arc<sqe_metrics::audit::AuditLogger>,
+        }
+
+        impl BearerAdminState for CiForbiddenState {
+            fn bearer_provider(&self) -> Option<&Arc<dyn sqe_auth::AuthProvider>> {
+                Some(&self.provider)
+            }
+            fn auth_config(&self) -> Option<&sqe_core::config::AuthConfig> {
+                Some(&self.auth_cfg)
+            }
+            fn audit(&self) -> Option<&Arc<sqe_metrics::audit::AuditLogger>> {
+                Some(&self.audit)
+            }
+        }
+
+        let state = Arc::new(CiForbiddenState {
+            provider,
+            auth_cfg: auth_cfg(&["admin"]),
+            audit: Arc::clone(&logger),
+        });
+
+        let app = Router::new()
+            .route("/guarded", get(|| async { "ok" }))
+            .route_layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                require_admin_bearer::<CiForbiddenState>,
+            ))
+            .with_state(state);
+
+        let peer: std::net::SocketAddr = "192.0.2.55:44444".parse().unwrap();
+        let mut req = axum::http::Request::builder()
+            .uri("/guarded")
+            .header("Authorization", "Bearer tok")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(peer));
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::FORBIDDEN);
+
+        logger.flush();
+        let content = std::fs::read_to_string(&path).unwrap_or_default();
+        assert!(
+            !content.trim().is_empty(),
+            "Forbidden must write an audit line"
+        );
+        let v: serde_json::Value = serde_json::from_str(content.lines().next().unwrap())
+            .expect("valid JSON");
+        assert_eq!(
+            v["client_ip"].as_str(),
+            Some("192.0.2.55:44444"),
+            "Forbidden audit event must carry the ConnectInfo peer IP; got: {v}"
+        );
     }
 }

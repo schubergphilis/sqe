@@ -110,6 +110,11 @@ pub struct MetricsRegistry {
     /// audit line when no bearer token is present (Unauthorized). Prevents
     /// health-port probe flood from polluting the audit spool and SIEM.
     pub dashboard_auth_anonymous_denied_total: IntCounter,
+    /// Auth-success counter for dashboard requests. Incremented on EVERY
+    /// successful admin bearer check, including within-window deduplicated
+    /// requests that do not write an audit line. This keeps access observable
+    /// in Prometheus even when the audit-coalesce window suppresses the line.
+    pub dashboard_auth_success_total: IntCounter,
 }
 
 impl MetricsRegistry {
@@ -572,6 +577,17 @@ impl MetricsRegistry {
             .register(Box::new(dashboard_auth_anonymous_denied_total.clone()))
             .unwrap();
 
+        let dashboard_auth_success_total = IntCounter::new(
+            "sqe_dashboard_auth_success_total",
+            "Successful admin bearer authentications for dashboard requests. \
+             Incremented on every success, including within-window deduplicated \
+             requests that do not write an audit line.",
+        )
+        .unwrap();
+        registry
+            .register(Box::new(dashboard_auth_success_total.clone()))
+            .unwrap();
+
         Self {
             registry,
             query_count,
@@ -629,6 +645,7 @@ impl MetricsRegistry {
             audit_export_cursor_seq,
             audit_export_last_success_timestamp,
             dashboard_auth_anonymous_denied_total,
+            dashboard_auth_success_total,
         }
     }
 }
