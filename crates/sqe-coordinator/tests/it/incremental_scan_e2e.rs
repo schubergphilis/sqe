@@ -179,14 +179,13 @@ async fn incremental_scan_three_snapshots_returns_45_rows() {
     let table = format!("{ns}.orders");
 
     let _ = handler
-        .execute(&session, &format!("CREATE SCHEMA {ns}"))
+        .execute(&session, &format!("CREATE SCHEMA {ns}"), None)
         .await
         .expect("create schema");
     handler
         .execute(
             &session,
-            &format!("CREATE TABLE {table} (id BIGINT, val VARCHAR)"),
-        )
+            &format!("CREATE TABLE {table} (id BIGINT, val VARCHAR)"), None)
         .await
         .expect("create table");
 
@@ -204,8 +203,7 @@ async fn incremental_scan_three_snapshots_returns_45_rows() {
                     .map(|i| format!("({i}, 'a')"))
                     .collect::<Vec<_>>()
                     .join(", ")
-            ),
-        )
+            ), None)
         .await
         .expect("insert 10");
 
@@ -219,8 +217,7 @@ async fn incremental_scan_three_snapshots_returns_45_rows() {
                     .map(|i| format!("({i}, 'b')"))
                     .collect::<Vec<_>>()
                     .join(", ")
-            ),
-        )
+            ), None)
         .await
         .expect("insert 15");
 
@@ -234,8 +231,7 @@ async fn incremental_scan_three_snapshots_returns_45_rows() {
                     .map(|i| format!("({i}, 'c')"))
                     .collect::<Vec<_>>()
                     .join(", ")
-            ),
-        )
+            ), None)
         .await
         .expect("insert 20");
 
@@ -246,8 +242,7 @@ async fn incremental_scan_three_snapshots_returns_45_rows() {
             &session,
             &format!(
                 "SELECT snapshot_id FROM table_snapshots('{ns}', 'orders') ORDER BY timestamp_ms"
-            ),
-        )
+            ), None)
         .await
         .expect("query snapshots");
     let mut ids: Vec<i64> = Vec::new();
@@ -268,7 +263,7 @@ async fn incremental_scan_three_snapshots_returns_45_rows() {
         "SELECT count(*) FROM {table} FOR INCREMENTAL BETWEEN SNAPSHOT {s0} AND SNAPSHOT {s3}"
     );
     let result = handler
-        .execute(&session, &sql)
+        .execute(&session, &sql, None)
         .await
         .expect("incremental SELECT count(*)");
     let total_rows: usize = result.iter().map(|b| b.num_rows()).sum();
@@ -294,19 +289,18 @@ async fn incremental_scan_meta_columns_are_populated() {
     let table = format!("{ns}.events");
 
     handler
-        .execute(&session, &format!("CREATE SCHEMA {ns}"))
+        .execute(&session, &format!("CREATE SCHEMA {ns}"), None)
         .await
         .expect("create schema");
     handler
         .execute(
             &session,
-            &format!("CREATE TABLE {table} (id BIGINT)"),
-        )
+            &format!("CREATE TABLE {table} (id BIGINT)"), None)
         .await
         .expect("create table");
 
     handler
-        .execute(&session, &format!("INSERT INTO {table} VALUES (1), (2), (3)"))
+        .execute(&session, &format!("INSERT INTO {table} VALUES (1), (2), (3)"), None)
         .await
         .expect("insert 3");
 
@@ -315,8 +309,7 @@ async fn incremental_scan_meta_columns_are_populated() {
             &session,
             &format!(
                 "SELECT snapshot_id FROM table_snapshots('{ns}', 'events') ORDER BY timestamp_ms"
-            ),
-        )
+            ), None)
         .await
         .expect("query snapshots");
     let s3 = batches[0]
@@ -331,7 +324,7 @@ async fn incremental_scan_meta_columns_are_populated() {
          FOR INCREMENTAL BETWEEN SNAPSHOT 0 AND SNAPSHOT {s3} ORDER BY _change_ordinal"
     );
     let result = handler
-        .execute(&session, &sql)
+        .execute(&session, &sql, None)
         .await
         .expect("incremental meta SELECT");
     let total: usize = result.iter().map(|b| b.num_rows()).sum();

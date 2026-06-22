@@ -162,8 +162,7 @@ async fn audit_logs_create_secret_with_redacted_token() {
     fx.handler
         .execute(
             &session,
-            "CREATE SECRET my_audit_tok (TYPE bearer, TOKEN 'super_secret_value_xyz')",
-        )
+            "CREATE SECRET my_audit_tok (TYPE bearer, TOKEN 'super_secret_value_xyz')", None)
         .await
         .expect("create secret");
 
@@ -190,15 +189,15 @@ async fn audit_logs_show_and_drop_secret_each_emit_one_line() {
     let session = admin_session();
 
     fx.handler
-        .execute(&session, "CREATE SECRET tmp_tok (TYPE bearer, TOKEN 'x')")
+        .execute(&session, "CREATE SECRET tmp_tok (TYPE bearer, TOKEN 'x')", None)
         .await
         .expect("create");
     fx.handler
-        .execute(&session, "SHOW SECRETS")
+        .execute(&session, "SHOW SECRETS", None)
         .await
         .expect("show");
     fx.handler
-        .execute(&session, "DROP SECRET tmp_tok")
+        .execute(&session, "DROP SECRET tmp_tok", None)
         .await
         .expect("drop");
 
@@ -220,7 +219,7 @@ async fn audit_logs_failed_create_with_error_status() {
 
     let _ = fx
         .handler
-        .execute(&session, "CREATE SECRET bad (TYPE bearer)")
+        .execute(&session, "CREATE SECRET bad (TYPE bearer)", None)
         .await
         .expect_err("missing TOKEN should fail");
 
@@ -250,9 +249,9 @@ async fn audit_logs_attach_and_detach_against_mock_rest() {
     let attach_sql = format!(
         "ATTACH '{url}' AS audit_cat (TYPE iceberg_rest, WAREHOUSE 'wh')"
     );
-    fx.handler.execute(&session, &attach_sql).await.expect("attach");
+    fx.handler.execute(&session, &attach_sql, None).await.expect("attach");
     fx.handler
-        .execute(&session, "DETACH audit_cat")
+        .execute(&session, "DETACH audit_cat", None)
         .await
         .expect("detach");
 
@@ -320,8 +319,7 @@ async fn audit_select_query_emits_canonical_event_and_redacts_pii() {
         .handler
         .execute(
             &session,
-            "SELECT table_name FROM information_schema.tables WHERE table_name = 'leak@example.com'",
-        )
+            "SELECT table_name FROM information_schema.tables WHERE table_name = 'leak@example.com'", None)
         .await;
 
     // The query may return zero rows or fail on edge cases. Either way the audit
@@ -381,7 +379,7 @@ async fn audit_logs_denied_admin_call_as_error() {
 
     let _ = fx
         .handler
-        .execute(&session, "CREATE SECRET nope (TYPE bearer, TOKEN 'x')")
+        .execute(&session, "CREATE SECRET nope (TYPE bearer, TOKEN 'x')", None)
         .await
         .expect_err("non-admin must be denied");
 
@@ -744,7 +742,7 @@ async fn audit_emits_grant_event_with_resource_and_grantee() {
     let session = admin_session();
 
     fx.handler
-        .execute(&session, "GRANT SELECT ON sales.orders TO ROLE analyst")
+        .execute(&session, "GRANT SELECT ON sales.orders TO ROLE analyst", None)
         .await
         .expect("grant must succeed for admin");
 
@@ -806,7 +804,7 @@ async fn audit_emits_grant_event_for_revoke() {
     let session = admin_session();
 
     fx.handler
-        .execute(&session, "REVOKE SELECT ON sales.orders FROM ROLE analyst")
+        .execute(&session, "REVOKE SELECT ON sales.orders FROM ROLE analyst", None)
         .await
         .expect("revoke must succeed for admin");
 
@@ -902,6 +900,7 @@ async fn streaming_select_emits_canonical_query_event() {
             name: "orders".to_string(),
             object_type: ObjectType::Table,
         }],
+        client_ip: None,
     };
 
     let qid = fin.query_id;
@@ -979,7 +978,7 @@ async fn ddl_emits_canonical_admin_ddl_event() {
     // still runs. A Failure-outcome canonical AuditEvent is emitted.
     let _ = fx
         .handler
-        .execute(&session, "DROP TABLE IF EXISTS myns.mytable")
+        .execute(&session, "DROP TABLE IF EXISTS myns.mytable", None)
         .await;
 
     let lines = fx.read_lines();
@@ -1037,8 +1036,7 @@ async fn create_secret_stays_redacted_legacy_after_ddl_migration() {
     fx.handler
         .execute(
             &session,
-            "CREATE SECRET task3_guard (TYPE bearer, TOKEN 'task3_secret_material_xyz')",
-        )
+            "CREATE SECRET task3_guard (TYPE bearer, TOKEN 'task3_secret_material_xyz')", None)
         .await
         .expect("create secret must succeed");
 
@@ -1064,5 +1062,156 @@ async fn create_secret_stays_redacted_legacy_after_ddl_migration() {
     assert!(
         entry["kind"].is_null(),
         "CREATE SECRET must NOT be emitted as a canonical AuditEvent (kind must be absent); got: {entry}"
+    );
+}
+
+/// TDD guard for sub-project C Task 3: per-request `client_ip` threads into
+/// the Query `AuditEvent`.
+///
+/// Drives `QueryHandler::execute` with `client_ip: Some("10.1.2.3".into())`
+/// and asserts the written canonical `AuditEvent` line carries
+/// `client_ip == "10.1.2.3"`. The query is a SELECT against the built-in
+/// `information_schema.tables` virtual table (no Iceberg catalog required once
+/// the fixture's catalog URL satisfies the `/v1/config` probe).
+///
+/// RED: before the param is added, the call will fail to compile (wrong arity).
+/// GREEN: after the param is accepted and threaded to the audit event.
+#[tokio::test]
+async fn execute_threads_client_ip_into_query_audit_event() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/config"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(r#"{"overrides":{},"defaults":{}}"#),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1/namespaces"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(r#"{"namespaces":[]}"#),
+        )
+        .mount(&server)
+        .await;
+
+    let fx = make_fixture_with_url(&server.uri());
+    let session = admin_session();
+
+    let _ = fx
+        .handler
+        .execute(
+            &session,
+            "SELECT table_name FROM information_schema.tables",
+            Some("10.1.2.3".to_string()),
+        )
+        .await;
+
+    let lines = fx.read_lines();
+    assert_eq!(
+        lines.len(),
+        1,
+        "exactly one audit line written; got:\n{}",
+        serde_json::to_string_pretty(&serde_json::Value::Array(lines.clone())).unwrap_or_default()
+    );
+    let entry = &lines[0];
+
+    // Must be a canonical AuditEvent.
+    assert_eq!(
+        entry["kind"].as_str(),
+        Some("query"),
+        "written line must be canonical AuditEvent (kind: query); got: {entry}"
+    );
+
+    // client_ip must be threaded through from the caller.
+    assert_eq!(
+        entry["client_ip"].as_str(),
+        Some("10.1.2.3"),
+        "client_ip must equal the value passed to execute(); got: {entry}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Task 4 (folded-in): Grant and DDL audit events carry client_ip
+// ---------------------------------------------------------------------------
+
+/// TDD guard for Task 4 (Grant branch): `client_ip` passed to `execute()`
+/// appears in the GRANT audit event.
+///
+/// RED before the `client_ip: None` -> `client_ip.clone()` fix in
+/// `query_handler.rs` ~1658.
+/// GREEN after.
+#[tokio::test]
+async fn grant_audit_event_carries_client_ip() {
+    let fx = make_fixture_with_grant_backend();
+    let session = admin_session();
+
+    fx.handler
+        .execute(
+            &session,
+            "GRANT SELECT ON sales.orders TO ROLE analyst",
+            Some("192.168.1.100".to_string()),
+        )
+        .await
+        .expect("grant must succeed for admin");
+
+    let lines = fx.read_lines();
+    let grant_events: Vec<&serde_json::Value> = lines
+        .iter()
+        .filter(|e| e["kind"].as_str() == Some("grant"))
+        .collect();
+
+    assert_eq!(grant_events.len(), 1, "exactly one grant event; got lines:\n{}",
+        serde_json::to_string_pretty(&serde_json::Value::Array(lines.clone())).unwrap_or_default());
+
+    let entry = grant_events[0];
+    assert_eq!(
+        entry["client_ip"].as_str(),
+        Some("192.168.1.100"),
+        "grant audit event must carry client_ip; got: {entry}"
+    );
+}
+
+/// TDD guard for Task 4 (DDL branch): `client_ip` passed to `execute()`
+/// appears in the DDL (admin_ddl) audit event.
+///
+/// RED before the `client_ip: None` -> `client_ip.clone()` fix in
+/// `query_handler.rs` ~1748.
+/// GREEN after.
+#[tokio::test]
+async fn ddl_audit_event_carries_client_ip() {
+    let fx = make_fixture();
+    let session = admin_session();
+
+    // DROP TABLE fails at execution (no catalog) but the audit block still
+    // runs, emitting a Failure-outcome canonical AuditEvent.
+    let _ = fx
+        .handler
+        .execute(
+            &session,
+            "DROP TABLE IF EXISTS myns.mytable",
+            Some("10.20.30.40".to_string()),
+        )
+        .await;
+
+    let lines = fx.read_lines();
+    assert_eq!(
+        lines.len(),
+        1,
+        "exactly one audit line for DDL; got:\n{}",
+        serde_json::to_string_pretty(&serde_json::Value::Array(lines.clone())).unwrap_or_default()
+    );
+    let entry = &lines[0];
+
+    assert_eq!(
+        entry["kind"].as_str(),
+        Some("admin_ddl"),
+        "DDL must emit kind=admin_ddl; got: {entry}"
+    );
+    assert_eq!(
+        entry["client_ip"].as_str(),
+        Some("10.20.30.40"),
+        "DDL audit event must carry client_ip; got: {entry}"
     );
 }
