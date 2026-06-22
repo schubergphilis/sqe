@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use uuid::Uuid;
 
 use crate::query_tracker::{QueryRecord, QueryState, QueryTracker};
+use sqe_metrics::audit::redact_pii;
 
 // ── Overview endpoint ──────────────────────────────────────────
 
@@ -180,12 +181,13 @@ pub fn overview(node: &NodeInfo, uptime_seconds: u64, cpu_cores: usize, tracker:
 /// The dashboard single-page app, embedded at compile time.
 pub const DASHBOARD_HTML: &str = include_str!("web_ui/dashboard.html");
 
-/// WEB-02: the raw SQL statement and submitting username are NOT exposed on
-/// this unauthenticated, network-gated endpoint. SQL routinely embeds literal
-/// PII and secrets in predicates/inserts (`WHERE email = '...'`, presigned
-/// URLs, tokens), and usernames are capability-adjacent. Instead the list
-/// surfaces a stable SHA-256 digest of the SQL so operators can correlate and
-/// group identical statements without reading their contents.
+/// WEB-02 (updated C1): username, roles, client_ip, and SQL text are now
+/// exposed on these routes because all dashboard endpoints are admin-gated
+/// (bearer token + "sqe-admin" role required, sub-project C task 1). The raw
+/// SQL is NEVER placed in the DTO. The `sql` field always contains the output
+/// of `redact_pii`, which replaces known PII patterns (email, phone, SSN,
+/// card numbers, secret keywords) with bracketed placeholders before the
+/// value leaves this layer.
 fn sql_digest(sql: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(sql.as_bytes());
@@ -198,9 +200,19 @@ pub struct QueryListItem {
     pub query_id: String,
     pub state: String,
     pub source: Option<String>,
-    /// SHA-256 hex digest of the SQL text. The raw SQL and the submitting
-    /// username are deliberately omitted (WEB-02).
+    /// SHA-256 hex digest of the raw SQL text. Kept for correlation and
+    /// grouping of identical statements. See also `sql`.
     pub sql_hash: String,
+    /// SQL text after `redact_pii` masking. Raw SQL is never placed here.
+    /// Exposed because the route is admin-gated (WEB-02 / C1).
+    pub sql: String,
+    /// Identity of the submitting user. Exposed because the route is
+    /// admin-gated (WEB-02 / C1).
+    pub username: String,
+    /// Roles held by the submitting user at query time.
+    pub roles: Vec<String>,
+    /// Source IP of the submitting client, if available.
+    pub client_ip: Option<String>,
     pub created: String,
     pub started: Option<String>,
     pub ended: Option<String>,
@@ -222,6 +234,10 @@ fn to_list_item(r: &QueryRecord) -> QueryListItem {
         state: r.state.to_string(),
         source: r.source.clone(),
         sql_hash: sql_digest(&r.sql),
+        sql: redact_pii(&r.sql),
+        username: r.user.clone(),
+        roles: r.roles.clone(),
+        client_ip: r.client_ip.clone(),
         created: r.created.to_rfc3339(),
         started: r.started.map(|t| t.to_rfc3339()),
         ended: r.ended.map(|t| t.to_rfc3339()),
@@ -280,9 +296,9 @@ pub struct FragmentDto {
 pub struct QueryDetail {
     #[serde(flatten)]
     pub summary: QueryListItem,
-    // session_id / client_ip / roles are deliberately NOT exposed: this endpoint
-    // has no auth (network-gated) and those are capability/PII-adjacent. The
-    // dashboard does not render them either.
+    // username, roles, client_ip, and redacted SQL are carried in `summary`
+    // (QueryListItem) because the routes are admin-gated (WEB-02 / C1).
+    // session_id is not exposed (internal correlation identifier only).
     pub tables_touched: Vec<String>,
     pub error_code: Option<String>,
     pub fragments: Vec<FragmentDto>,
@@ -413,9 +429,10 @@ mod tests {
         assert_eq!(list.len(), 2);
         // id2 was created after id1, so it sorts first.
         assert_eq!(list[0].query_id, id2.to_string());
-        // WEB-02: the username is not exposed; the SQL is surfaced only as a hash.
         assert_eq!(list[0].state, "QUEUED");
         assert_eq!(list[0].sql_hash, sql_digest("SELECT 2"));
+        // Admin-gated routes expose username (WEB-02 / C1).
+        assert_eq!(list[0].username, "bob");
     }
 
     #[tokio::test]
@@ -428,10 +445,9 @@ mod tests {
 
         let running = query_list(&t, Some("running"), 100);
         assert_eq!(running.len(), 1);
-        // WEB-02: raw SQL must not be present anywhere in the serialized DTO.
+        // Raw SQL must not appear in the DTO; redact_pii replaces PII patterns.
         let json = serde_json::to_string(&running[0]).unwrap();
-        assert!(!json.contains("jane@x.com"), "raw SQL leaked: {json}");
-        assert!(!json.contains("\"user\""), "username leaked: {json}");
+        assert!(!json.contains("jane@x.com"), "raw email must not appear in serialized DTO: {json}");
         assert_eq!(running[0].sql_hash, sql_digest(sql));
 
         let finished = query_list(&t, Some("finished"), 100);
@@ -480,7 +496,8 @@ mod tests {
 
         let detail = query_detail(&t, &id).expect("detail present");
         assert_eq!(detail.summary.query_id, id.to_string());
-        // WEB-02: detail summary no longer carries the username.
+        // Admin-gated: username is now in the summary (WEB-02 / C1).
+        assert_eq!(detail.summary.username, "alice");
         assert_eq!(detail.summary.sql_hash, sql_digest("SELECT *"));
         assert_eq!(detail.fragments.len(), 1);
         assert_eq!(detail.fragments[0].worker_url, "http://w1:50052");
@@ -630,5 +647,27 @@ mod tests {
         node.memory_limit = None;
         let dto = overview(&node, 0, 1, &t);
         assert_eq!(dto.resources.memory_limit_bytes, 0);
+    }
+
+    /// TDD: admin-gated DTOs expose username, roles, client_ip, and redacted SQL.
+    /// The `sql` field must contain the redact_pii placeholder for an email and
+    /// must NOT contain the raw email literal.
+    #[tokio::test]
+    async fn to_list_item_exposes_admin_fields_with_redacted_sql() {
+        let t = tracker();
+        let id = Uuid::now_v7();
+        let sql = "SELECT * FROM users WHERE email = 'a@b.com'";
+        t.start(id, "alice", None, sql, "s1", Some("10.0.0.7"), vec!["admin".to_string()]);
+
+        let list = query_list(&t, None, 100);
+        assert_eq!(list.len(), 1);
+        let item = &list[0];
+
+        assert_eq!(item.username, "alice");
+        assert_eq!(item.roles, vec!["admin".to_string()]);
+        assert_eq!(item.client_ip, Some("10.0.0.7".to_string()));
+        // sql must be redact_pii output: email replaced, raw literal absent.
+        assert!(item.sql.contains("[EMAIL]"), "expected [EMAIL] in sql, got: {}", item.sql);
+        assert!(!item.sql.contains("a@b.com"), "raw email must not appear in sql, got: {}", item.sql);
     }
 }

@@ -563,6 +563,7 @@ impl QueryHandler {
         &self,
         session: &Session,
         sql: &str,
+        client_ip: Option<String>,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         // Memory pressure admission control: reject new queries when the
         // coordinator's FairSpillPool is >95% utilized (Red).
@@ -712,7 +713,7 @@ impl QueryHandler {
             session.source.as_deref(),
             sql,
             &session.id,
-            None, // client_ip — populated by caller if available
+            client_ip.as_deref(),
             session.user.roles.clone(),
         );
 
@@ -1511,11 +1512,13 @@ impl QueryHandler {
             // chain stamping. No secrets travel in GRANT/REVOKE SQL so the
             // redacted-legacy path is not required for these statement kinds.
             //
-            // All other statement kinds (DDL, DML, admin) remain on the legacy
-            // log(&AuditEntry) path. That path applies PII redaction before
-            // writing, which is critical for CREATE SECRET statements that carry
-            // bearer tokens in their SQL text. Migrating those kinds is a
-            // separate task once caller-side redaction for log_event is in place.
+            // Secret-bearing kinds (CREATE/DROP/SHOW SECRET, ATTACH, DETACH)
+            // stay on the legacy log(&AuditEntry) path: it applies PII redaction
+            // before writing, which is critical for statements that carry bearer
+            // tokens or credentials in their SQL text. All other DDL/DML/admin
+            // kinds emit canonical AuditEvents via log_event (the worker thread
+            // redacts query text there too); DML maps to Query, the rest to
+            // AdminDdl.
             if matches!(&kind, StatementKind::Query(_)) {
                 let ps = policy_summary.unwrap_or_default();
 
@@ -1586,7 +1589,7 @@ impl QueryHandler {
                         statement_type: kind_name,
                     }),
                     session_id: Some(session.id.clone()),
-                    client_ip: None,
+                    client_ip: client_ip.clone(),
                     integrity: sqe_metrics::audit::Integrity::default(),
                 };
                 audit.log_event(event);
@@ -1652,13 +1655,23 @@ impl QueryHandler {
                         statement_type: kind_name,
                     }),
                     session_id: Some(session.id.clone()),
-                    client_ip: None,
+                    client_ip: client_ip.clone(),
                     integrity: sqe_metrics::audit::Integrity::default(),
                 };
                 audit.log_event(grant_event);
-            } else {
-                // Legacy path for DDL, DML, admin statements.
-                // PII redaction runs inside log() before the entry is queued.
+            } else if matches!(
+                &kind,
+                StatementKind::CreateSecret(_)
+                    | StatementKind::DropSecret(_)
+                    | StatementKind::ShowSecrets
+                    | StatementKind::Attach(_)
+                    | StatementKind::Detach(_)
+            ) {
+                // Secret-bearing statements stay on the redacted legacy path.
+                // PII redaction runs inside log() before the entry is written.
+                // Never route these through log_event: the legacy path is the
+                // established redaction contract for bearer tokens and catalog
+                // credentials embedded in SQL text.
                 let ps = policy_summary.unwrap_or_default();
                 audit.log(&sqe_metrics::audit::AuditEntry {
                     timestamp: chrono::Utc::now().to_rfc3339(),
@@ -1677,6 +1690,65 @@ impl QueryHandler {
                     columns_restricted: ps.columns_restricted,
                     policy_denied: ps.denied,
                 });
+            } else {
+                // Canonical path for DDL, DML, and admin statements.
+                // Non-secret SQL travels through log_event; the worker thread
+                // applies redact_pii before chain-stamping and writing.
+                let audit_kind = if matches!(
+                    &kind,
+                    StatementKind::Insert(_)
+                        | StatementKind::Ctas(_)
+                        | StatementKind::Merge(_)
+                        | StatementKind::Delete(_)
+                        | StatementKind::Update(_)
+                        | StatementKind::Truncate(_)
+                ) {
+                    sqe_metrics::audit::AuditKind::Query
+                } else {
+                    sqe_metrics::audit::AuditKind::AdminDdl
+                };
+
+                let ddl_outcome = match &result {
+                    Ok(_) => sqe_metrics::audit::Outcome::Success,
+                    Err(e) => sqe_metrics::audit::Outcome::Failure {
+                        error_type: Some(e.error_code().trino_error_type().to_string()),
+                        error_code: Some(e.error_code().name().to_string()),
+                        message: Some(e.client_message()),
+                    },
+                };
+
+                let ddl_actor = sqe_metrics::audit::Actor::from_parts(
+                    session.user.username.clone(),
+                    session.user.subject.clone(),
+                    session.user.email.clone(),
+                    session.user.roles.clone(),
+                    session.user.groups.clone(),
+                );
+
+                let ddl_event = sqe_metrics::audit::AuditEvent {
+                    time: chrono::Utc::now(),
+                    kind: audit_kind,
+                    actor: ddl_actor,
+                    outcome: ddl_outcome,
+                    resources: audit_resources,
+                    policy: None,
+                    timing: Some(sqe_metrics::audit::Timing {
+                        duration_ms: duration.as_millis() as u64,
+                        queued_ms: 0,
+                        planning_ms: 0,
+                        execution_ms: 0,
+                    }),
+                    stats: None,
+                    query: Some(sqe_metrics::audit::QueryInfo {
+                        text: Some(sql.to_string()),
+                        query_hash: sqe_metrics::audit::query_hash(sql),
+                        statement_type: kind_name,
+                    }),
+                    session_id: Some(session.id.clone()),
+                    client_ip: client_ip.clone(),
+                    integrity: sqe_metrics::audit::Integrity::default(),
+                };
+                audit.log_event(ddl_event);
             }
         }
 
@@ -1731,6 +1803,7 @@ impl QueryHandler {
         &self,
         session: &Session,
         sql: &str,
+        client_ip: Option<String>,
     ) -> sqe_core::Result<(SchemaRef, SendableRecordBatchStream)> {
         // --- Admission control -------------------------------------------------
         let pressure = crate::memory::check_pressure(&self.runtime.memory_pool);
@@ -1860,12 +1933,19 @@ impl QueryHandler {
             session.source.as_deref(),
             sql,
             &session.id,
-            None,
+            client_ip.as_deref(),
             session.user.roles.clone(),
         );
 
         match self.open_stream(session, sql, &query_id, start).await {
-            Ok((schema, inner_stream, final_plan, tt_cleanup, tables_touched, policy_summary)) => {
+            Ok((schema, inner_stream, final_plan, tt_cleanup, tables_touched, policy_summary, audit_resources)) => {
+                let actor = sqe_metrics::audit::Actor::from_parts(
+                    session.user.username.clone(),
+                    session.user.subject.clone(),
+                    session.user.email.clone(),
+                    session.user.roles.clone(),
+                    session.user.groups.clone(),
+                );
                 let finalizer = crate::streaming::StreamFinalizer {
                     tracker: Arc::clone(&self.query_tracker),
                     metrics: self.metrics.clone(),
@@ -1883,6 +1963,9 @@ impl QueryHandler {
                     tables_touched,
                     policy_summary,
                     profile_mode: self.profile_mode,
+                    actor,
+                    resources: audit_resources,
+                    client_ip: client_ip.clone(),
                 };
 
                 let tracked = crate::streaming::TrackedRecordBatchStream::with_permits_reservation_and_cancel_token(
@@ -1939,6 +2022,7 @@ impl QueryHandler {
         TimeTravelCleanup,
         Vec<String>,
         sqe_policy::PolicySummary,
+        Vec<sqe_metrics::audit::Resource>,
     )> {
         let (ctx, session_catalog) = self.create_session_context(session).await?;
 
@@ -1966,6 +2050,21 @@ impl QueryHandler {
         let (enforced_plan, policy_summary) =
             self.policy_enforcer.evaluate(&session.user, plan).await?;
         debug!("Policy-enforced plan (streaming): {:?}", enforced_plan);
+        // Compute the structured resource list from the logical plan now,
+        // before it is consumed by `execute_logical_plan`. The streaming
+        // finalizer needs these to emit a canonical `AuditEvent`; there is
+        // no opportunity to recover the logical plan later in the pipeline.
+        let effective_catalog_buf: Option<String> = if session.default_catalog.is_none() {
+            Some(self.config.resolve_default_catalog())
+        } else {
+            None
+        };
+        let default_catalog_str: Option<&str> = session
+            .default_catalog
+            .as_deref()
+            .or(effective_catalog_buf.as_deref());
+        let audit_resources =
+            crate::audit_resources::resources_from_plan(&enforced_plan, default_catalog_str);
         let tables_touched = sqe_lineage::extract::extract_table_names(&enforced_plan);
 
         let enforced_df = ctx
@@ -2022,7 +2121,7 @@ impl QueryHandler {
         let stream = execute_stream(Arc::clone(&final_plan), ctx.task_ctx())
             .map_err(|e| SqeError::Execution(format!("Query execution failed: {e}")))?;
 
-        Ok((schema, stream, final_plan, tt_cleanup, tables_touched, policy_summary))
+        Ok((schema, stream, final_plan, tt_cleanup, tables_touched, policy_summary, audit_resources))
     }
 
     /// Return the schema for a SQL statement without executing it.

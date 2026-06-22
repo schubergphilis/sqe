@@ -40,8 +40,7 @@ async fn live_data_file_count(
     let batches = handler
         .execute(
             session,
-            &format!("SELECT COUNT(*) FROM table_files('{namespace}', '{table_name}')"),
-        )
+            &format!("SELECT COUNT(*) FROM table_files('{namespace}', '{table_name}')"), None)
         .await
         .expect("files metadata scan");
     let col = batches[0].column(0);
@@ -60,11 +59,11 @@ async fn rewrite_merges_small_files_preserves_rows() {
     let table_name = "rewrite_real_test";
     let table = format!("{namespace}.{table_name}");
     let _ = handler
-        .execute(&session, &format!("DROP TABLE IF EXISTS {table}"))
+        .execute(&session, &format!("DROP TABLE IF EXISTS {table}"), None)
         .await;
 
     handler
-        .execute(&session, &format!("CREATE TABLE {table} (id BIGINT)"))
+        .execute(&session, &format!("CREATE TABLE {table} (id BIGINT)"), None)
         .await
         .expect("CREATE");
 
@@ -72,7 +71,7 @@ async fn rewrite_merges_small_files_preserves_rows() {
     // each commit under the default write mode.
     for i in 0..50i64 {
         handler
-            .execute(&session, &format!("INSERT INTO {table} VALUES ({i})"))
+            .execute(&session, &format!("INSERT INTO {table} VALUES ({i})"), None)
             .await
             .expect("INSERT");
     }
@@ -84,7 +83,7 @@ async fn rewrite_merges_small_files_preserves_rows() {
     );
 
     let before_rows_batches = handler
-        .execute(&session, &format!("SELECT COUNT(*) FROM {table}"))
+        .execute(&session, &format!("SELECT COUNT(*) FROM {table}"), None)
         .await
         .expect("SELECT COUNT before");
     let before_rows = before_rows_batches[0]
@@ -99,8 +98,7 @@ async fn rewrite_merges_small_files_preserves_rows() {
     let summary = handler
         .execute(
             &session,
-            &format!("CALL system.rewrite_data_files(table => '{table}')"),
-        )
+            &format!("CALL system.rewrite_data_files(table => '{table}')"), None)
         .await
         .expect("rewrite_data_files");
     assert!(!summary.is_empty(), "summary row expected");
@@ -120,7 +118,7 @@ async fn rewrite_merges_small_files_preserves_rows() {
 
     // Row count invariant.
     let after_rows_batches = handler
-        .execute(&session, &format!("SELECT COUNT(*) FROM {table}"))
+        .execute(&session, &format!("SELECT COUNT(*) FROM {table}"), None)
         .await
         .expect("SELECT COUNT after");
     let after_rows = after_rows_batches[0]
@@ -133,7 +131,7 @@ async fn rewrite_merges_small_files_preserves_rows() {
 
     // Value invariant: SELECT * must return the same set of ids.
     let rows_batches = handler
-        .execute(&session, &format!("SELECT id FROM {table} ORDER BY id"))
+        .execute(&session, &format!("SELECT id FROM {table} ORDER BY id"), None)
         .await
         .expect("SELECT id");
     let mut observed: Vec<i64> = Vec::new();
@@ -151,7 +149,7 @@ async fn rewrite_merges_small_files_preserves_rows() {
     assert_eq!(observed, expected, "rewrite must preserve the row set");
 
     let _ = handler
-        .execute(&session, &format!("DROP TABLE IF EXISTS {table}"))
+        .execute(&session, &format!("DROP TABLE IF EXISTS {table}"), None)
         .await;
 }
 
@@ -164,18 +162,18 @@ async fn rewrite_skips_below_min_input_files() {
     let table_name = "rewrite_real_min_skip";
     let table = format!("{namespace}.{table_name}");
     let _ = handler
-        .execute(&session, &format!("DROP TABLE IF EXISTS {table}"))
+        .execute(&session, &format!("DROP TABLE IF EXISTS {table}"), None)
         .await;
 
     handler
-        .execute(&session, &format!("CREATE TABLE {table} (id BIGINT)"))
+        .execute(&session, &format!("CREATE TABLE {table} (id BIGINT)"), None)
         .await
         .expect("CREATE");
 
     // Fewer than the default min_input_files=5: rewrite must no-op.
     for i in 0..3i64 {
         handler
-            .execute(&session, &format!("INSERT INTO {table} VALUES ({i})"))
+            .execute(&session, &format!("INSERT INTO {table} VALUES ({i})"), None)
             .await
             .expect("INSERT");
     }
@@ -186,8 +184,7 @@ async fn rewrite_skips_below_min_input_files() {
     let summary = handler
         .execute(
             &session,
-            &format!("CALL system.rewrite_data_files(table => '{table}')"),
-        )
+            &format!("CALL system.rewrite_data_files(table => '{table}')"), None)
         .await
         .expect("rewrite_data_files");
 
@@ -212,6 +209,6 @@ async fn rewrite_skips_below_min_input_files() {
     );
 
     let _ = handler
-        .execute(&session, &format!("DROP TABLE IF EXISTS {table}"))
+        .execute(&session, &format!("DROP TABLE IF EXISTS {table}"), None)
         .await;
 }

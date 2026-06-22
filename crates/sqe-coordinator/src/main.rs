@@ -83,7 +83,7 @@ impl TrinoQueryExecutor for QueryHandlerAdapter {
         self.rate_limiter
             .check(&session.user.username)
             .map_err(|e| sqe_core::SqeError::Execution(format!("rate limit: {e}")))?;
-        self.handler.execute(session, sql).await
+        self.handler.execute(session, sql, None).await
     }
 }
 
@@ -271,7 +271,98 @@ async fn async_main() -> anyhow::Result<()> {
     } else {
         audit_logger
     };
+
+    // Attach the OCSF export spool when audit export is enabled.
+    // `with_export_spool` opens the spool file in append mode and registers it
+    // as a secondary OCSF-JSONL sink on the logger. Must happen before Arc::new.
+    let (audit_logger, shipper_spool_path) =
+        if config.metrics.audit_export.enabled && config.metrics.audit_export.target == "otlp" {
+            let spool = sqe_coordinator::derive_spool_path(
+                &config.metrics.audit_export.spool_path,
+                &config.metrics.audit_log_path,
+            );
+            let logger = audit_logger
+                .with_export_spool(&spool)
+                .map_err(|e| anyhow::anyhow!("audit export: failed to open spool file: {e}"))?;
+            (logger, Some(spool))
+        } else {
+            (audit_logger, None)
+        };
+
     let audit = Arc::new(audit_logger);
+
+    // Spawn the OTLP audit shipper when export is enabled. The watch channel is
+    // created here and the `true` signal is sent after `serve_with_shutdown`
+    // returns so the shipper loop exits cleanly instead of busy-spinning.
+    let shipper_shutdown_tx = if let Some(ref spool_path) = shipper_spool_path {
+        let ae = &config.metrics.audit_export;
+
+        // Resolve the OTLP endpoint: use the export-specific one first, then fall
+        // back to the general metrics endpoint. Warn and skip when both are empty.
+        let endpoint = if !ae.otlp_endpoint.is_empty() {
+            ae.otlp_endpoint.clone()
+        } else if !config.metrics.otlp_endpoint.is_empty() {
+            config.metrics.otlp_endpoint.clone()
+        } else {
+            tracing::warn!(
+                "audit export: no OTLP endpoint configured \
+                 (audit_export.otlp_endpoint and metrics.otlp_endpoint are both empty); \
+                 shipper will not start"
+            );
+            String::new()
+        };
+
+        if endpoint.is_empty() {
+            None
+        } else {
+            match sqe_metrics::audit::export::OtlpExporter::new(&endpoint) {
+                Err(e) => {
+                    tracing::warn!(error = %e, "audit export: failed to build OtlpExporter; shipper will not start");
+                    None
+                }
+                Ok(exporter) => {
+                    let cursor_path = format!("{spool_path}.cursor");
+                    let shipper_metrics = sqe_metrics::audit::export::ShipperMetrics {
+                        records_total: Some(metrics.audit_export_records_total.clone()),
+                        batch_failures_total: Some(metrics.audit_export_batch_failures_total.clone()),
+                        spool_lag_bytes: Some(metrics.audit_export_spool_lag_bytes.clone()),
+                        cursor_seq: Some(metrics.audit_export_cursor_seq.clone()),
+                        last_success_timestamp: Some(metrics.audit_export_last_success_timestamp.clone()),
+                    };
+                    let shipper = sqe_metrics::audit::export::OtlpLogShipper::new(
+                        std::path::PathBuf::from(spool_path),
+                        std::path::PathBuf::from(&cursor_path),
+                        std::sync::Arc::new(exporter),
+                        ae.batch_max,
+                        ae.max_spool_bytes,
+                        sqe_coordinator::parse_start_at(&ae.start_at),
+                        ae.flush_interval_ms,
+                    )
+                    .with_metrics(shipper_metrics);
+
+                    let (tx, rx) = tokio::sync::watch::channel(false);
+                    tokio::spawn(shipper.run(rx));
+                    tracing::info!(
+                        spool = %spool_path,
+                        endpoint = %endpoint,
+                        "Started audit OTLP shipper"
+                    );
+                    Some(tx)
+                }
+            }
+        }
+    } else {
+        // Export disabled or unknown target: no shipper.
+        if config.metrics.audit_export.enabled
+            && config.metrics.audit_export.target != "otlp"
+        {
+            tracing::warn!(
+                target = %config.metrics.audit_export.target,
+                "audit export: unknown target; only \"otlp\" is supported; shipper will not start"
+            );
+        }
+        None
+    };
 
     // Guard + self-audit the superdebug_log_results escape hatch.
     // No-op when the flag is false (the default).
@@ -427,13 +518,19 @@ async fn async_main() -> anyhow::Result<()> {
         tracing::info!("SQE coordinator listening on {} (plaintext)", addr);
     }
 
-    server_builder
+    let serve_result = server_builder
         .add_service(arrow_flight::flight_service_server::FlightServiceServer::new(
             flight_service,
         ))
         .serve_with_shutdown(addr, shutdown_signal())
-        .await?;
+        .await;
 
+    // Signal the audit shipper to stop now that the server has exited.
+    if let Some(tx) = shipper_shutdown_tx {
+        let _ = tx.send(true);
+    }
+
+    serve_result?;
     tracing::info!("SQE coordinator shut down");
     Ok(())
 }
