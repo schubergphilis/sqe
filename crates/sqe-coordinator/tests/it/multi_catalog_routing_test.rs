@@ -105,8 +105,7 @@ async fn unknown_catalog_qualifier_errors_clearly() {
     let err = h
         .execute(
             &session,
-            "SELECT * FROM tf_main_warehouse.tf_demo_namespace.demo_t",
-        )
+            "SELECT * FROM tf_main_warehouse.tf_demo_namespace.demo_t", None)
         .await
         .expect_err("3-part name with unknown catalog must error");
 
@@ -149,8 +148,7 @@ async fn known_catalog_qualifier_passes_pre_flight() {
     let err = h
         .execute(
             &session,
-            "SELECT * FROM tf_main_warehouse.tf_demo_namespace.demo_t",
-        )
+            "SELECT * FROM tf_main_warehouse.tf_demo_namespace.demo_t", None)
         .await
         .expect_err("placeholder Polaris URL must fail somewhere");
 
@@ -171,7 +169,7 @@ async fn unqualified_name_skips_pre_flight() {
     let h = handler(config);
     let session = fake_session();
 
-    let result = h.execute(&session, "SELECT * FROM foo").await;
+    let result = h.execute(&session, "SELECT * FROM foo", None).await;
     if let Err(err) = result {
         let msg = err.to_string();
         assert!(
@@ -194,7 +192,7 @@ async fn system_catalog_qualifier_passes() {
     let session = fake_session();
 
     let result = h
-        .execute(&session, "SELECT * FROM system.runtime.queries")
+        .execute(&session, "SELECT * FROM system.runtime.queries", None)
         .await;
     if let Err(err) = result {
         let msg = err.to_string();

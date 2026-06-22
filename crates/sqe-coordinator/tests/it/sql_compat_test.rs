@@ -157,7 +157,7 @@ async fn run_sql_file(filename: &str) {
     let mut failed = 0usize;
 
     for block in &blocks {
-        let result = handler.execute(&session, &block.sql).await;
+        let result = handler.execute(&session, &block.sql, None).await;
 
         match result {
             Err(e) => {

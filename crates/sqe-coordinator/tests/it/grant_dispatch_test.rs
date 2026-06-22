@@ -134,7 +134,7 @@ async fn grant_rejected_without_admin_role_and_backend_not_called() {
     let session = session_with_roles(vec!["analyst"]);
 
     let err = handler
-        .execute(&session, "GRANT SELECT ON sales.orders TO ROLE analyst")
+        .execute(&session, "GRANT SELECT ON sales.orders TO ROLE analyst", None)
         .await
         .expect_err("non-admin must not be able to GRANT");
 
@@ -157,7 +157,7 @@ async fn revoke_rejected_without_admin_role_and_backend_not_called() {
     let session = session_with_roles(vec![]);
 
     let err = handler
-        .execute(&session, "REVOKE SELECT ON sales.orders FROM ROLE analyst")
+        .execute(&session, "REVOKE SELECT ON sales.orders FROM ROLE analyst", None)
         .await
         .expect_err("non-admin must not be able to REVOKE");
 
@@ -176,7 +176,7 @@ async fn grant_allowed_for_admin_reaches_backend() {
     let session = session_with_roles(vec!["service_admin"]);
 
     handler
-        .execute(&session, "GRANT SELECT ON sales.orders TO ROLE analyst")
+        .execute(&session, "GRANT SELECT ON sales.orders TO ROLE analyst", None)
         .await
         .expect("admin GRANT should succeed");
 
@@ -193,7 +193,7 @@ async fn revoke_allowed_for_admin_reaches_backend() {
     let session = session_with_roles(vec!["catalog_admin"]);
 
     handler
-        .execute(&session, "REVOKE SELECT ON sales.orders FROM ROLE analyst")
+        .execute(&session, "REVOKE SELECT ON sales.orders FROM ROLE analyst", None)
         .await
         .expect("admin REVOKE should succeed");
 
