@@ -442,7 +442,7 @@ async function renderQueries(){
     const rows = await getJSON("/api/v1/queries?limit=200"); clearErr();
     if(current!==null) return; // detail open
     $("#queries").innerHTML =
-      "<table><thead><tr><th>id</th><th>state</th><th>user</th><th>sql (redacted)</th>"+
+      "<table><thead><tr><th>id</th><th>state</th><th>user</th><th>sql (redacted)</th><th>sql hash</th>"+
       "<th class=num>elapsed</th><th class=num>rows</th><th class=num>scanned</th></tr></thead><tbody>"+
       rows.map(q=>{
         const el = (q.executionMs||0)+(q.planningMs||0)+(q.queuedMs||0);
@@ -450,6 +450,7 @@ async function renderQueries(){
           `<td class="${stClass(q.state)}">${esc(q.state)}</td>`+
           `<td>${esc(q.username||"")}</td>`+
           `<td title="${esc(q.sql||"")}">${esc(String(q.sql||"").slice(0,60))}</td>`+
+          `<td title="${esc(q.sqlHash||"")}">${esc(String(q.sqlHash||"").slice(0,12))}</td>`+
           `<td class=num>${ms(el)}</td><td class=num>${q.outputRows|0}</td>`+
           `<td class=num>${fmtBytes(q.bytesScanned)}</td></tr>`;
       }).join("")+"</tbody></table>";
