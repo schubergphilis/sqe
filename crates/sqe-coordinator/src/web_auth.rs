@@ -15,10 +15,11 @@
 //! `/healthz`, `/readyz`, and `/api/v1/status` are NOT gated: they are
 //! attached to the router before the `route_layer` is applied.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::{
-    extract::{Request, State},
+    extract::{ConnectInfo, Request, State},
     http::StatusCode,
     middleware::Next,
     response::{IntoResponse, Response},
@@ -100,6 +101,20 @@ pub trait BearerAdminState: Send + Sync + 'static {
     ///
     /// The default implementation is a no-op; `HealthState` overrides it.
     fn note_dashboard_success(&self) {}
+    /// Resolve the client IP from the TCP peer address and optional
+    /// `X-Forwarded-For` header, applying the same precedence as the Flight
+    /// SQL path: honour XFF only when the peer is a trusted proxy, otherwise
+    /// return the raw peer address.
+    ///
+    /// The default implementation ignores XFF (peer-wins, no proxy trust).
+    /// `HealthState` overrides this to delegate to
+    /// `SecurityConfig::resolve_client_ip`, which applies the configured
+    /// `trusted_proxies` list.
+    fn resolve_client_ip(&self, peer: Option<&str>, xff: Option<&str>) -> Option<String> {
+        // Default: no XFF honoring. Use peer directly.
+        let _ = xff;
+        peer.map(|p| p.to_string())
+    }
 }
 
 /// Build an `AuditEvent` for a dashboard access attempt by an identified
@@ -110,8 +125,10 @@ pub trait BearerAdminState: Send + Sync + 'static {
 /// The bearer token is NEVER included: only the resolved identity fields
 /// (on success or Forbidden) are recorded.
 ///
-/// `client_ip` is `None` for now because the health router is served
-/// without `into_make_service_with_connect_info`; wired in Phase C2.
+/// `client_ip` is `Some` when the health router is served with
+/// `into_make_service_with_connect_info` and a `ConnectInfo<SocketAddr>`
+/// extension is present on the request. It is `None` for test callers that
+/// do not supply `ConnectInfo` (graceful degradation).
 pub fn dashboard_audit_event(
     result: &Result<Identity, (GuardReject, Option<Identity>)>,
     client_ip: Option<String>,
@@ -208,6 +225,30 @@ where
             return (StatusCode::UNAUTHORIZED, "auth not configured").into_response();
         }
     };
+
+    // Extract the TCP peer address from the ConnectInfo extension. This is
+    // present only when the server was started with
+    // `into_make_service_with_connect_info::<SocketAddr>()`. Callers (tests,
+    // worker path) that do not supply ConnectInfo get None here; the IP
+    // resolution degrades gracefully to None in that case.
+    let peer: Option<String> = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ci| ci.0.to_string());
+
+    // Extract the X-Forwarded-For header, if present.
+    let xff: Option<String> = request
+        .headers()
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+
+    // Resolve the client IP using the state's configured proxy trust list.
+    // `resolve_client_ip` on the trait defaults to peer-wins (no XFF);
+    // HealthState overrides this to call SecurityConfig::resolve_client_ip.
+    let client_ip: Option<String> =
+        state.resolve_client_ip(peer.as_deref(), xff.as_deref());
+
     let header = request
         .headers()
         .get(axum::http::header::AUTHORIZATION)
@@ -224,14 +265,17 @@ where
     // For Forbidden: always emit the audit line (unchanged; low volume, security signal).
     match &result {
         Err((GuardReject::Unauthorized, _)) => {
-            tracing::debug!("dashboard: anonymous denial (no bearer token or invalid scheme)");
+            tracing::debug!(
+                client_ip = client_ip.as_deref().unwrap_or("unknown"),
+                "dashboard: anonymous denial (no bearer token or invalid scheme)"
+            );
             state.on_anonymous_denial();
         }
         Ok(identity) => {
             state.note_dashboard_success();
             if state.should_emit_success_audit(&identity.user_id) {
                 if let Some(audit) = state.audit() {
-                    if let Some(event) = dashboard_audit_event(&result, None) {
+                    if let Some(event) = dashboard_audit_event(&result, client_ip.clone()) {
                         audit.log_event(event);
                     }
                 }
@@ -239,7 +283,7 @@ where
         }
         Err((GuardReject::Forbidden, _)) => {
             if let Some(audit) = state.audit() {
-                if let Some(event) = dashboard_audit_event(&result, None) {
+                if let Some(event) = dashboard_audit_event(&result, client_ip.clone()) {
                     audit.log_event(event);
                 }
             }
@@ -695,5 +739,204 @@ mod tests {
         );
         // Success counter unchanged (Forbidden is not a success).
         assert_eq!(state.success_count.load(AOrdering::Relaxed), 0);
+    }
+
+    // ── TDD: client_ip carried in dashboard-access audit events ───────────
+
+    /// Success audit event carries client_ip when provided.
+    #[test]
+    fn audit_success_carries_client_ip() {
+        let result: Result<sqe_auth::Identity, (GuardReject, Option<sqe_auth::Identity>)> =
+            Ok(admin_identity());
+        let event = dashboard_audit_event(&result, Some("203.0.113.42".into()))
+            .expect("success must produce an event");
+        assert_eq!(
+            event.client_ip.as_deref(),
+            Some("203.0.113.42"),
+            "client_ip must be threaded into the audit event"
+        );
+        // Verify it serialises correctly.
+        let s = serde_json::to_string(&event).unwrap();
+        assert!(
+            s.contains("203.0.113.42"),
+            "client_ip must appear in serialised event: {s}"
+        );
+    }
+
+    /// Forbidden audit event carries client_ip when provided.
+    #[test]
+    fn audit_forbidden_carries_client_ip() {
+        let result: Result<sqe_auth::Identity, (GuardReject, Option<sqe_auth::Identity>)> =
+            Err((GuardReject::Forbidden, Some(non_admin_identity())));
+        let event = dashboard_audit_event(&result, Some("10.0.0.99".into()))
+            .expect("Forbidden must produce an event");
+        assert_eq!(
+            event.client_ip.as_deref(),
+            Some("10.0.0.99"),
+            "client_ip must be threaded into the Forbidden audit event"
+        );
+    }
+
+    /// Success audit event with None client_ip still writes an event (graceful-None).
+    #[test]
+    fn audit_success_graceful_none_client_ip() {
+        let result: Result<sqe_auth::Identity, (GuardReject, Option<sqe_auth::Identity>)> =
+            Ok(admin_identity());
+        let event = dashboard_audit_event(&result, None)
+            .expect("success must produce an event even with no client_ip");
+        assert!(
+            event.client_ip.is_none(),
+            "client_ip must be None when not provided"
+        );
+    }
+
+    /// `require_admin_bearer` emits an audit event with client_ip when ConnectInfo
+    /// is present in the request extensions (router oneshot with ConnectInfo set).
+    #[tokio::test]
+    async fn require_admin_bearer_emits_client_ip_on_success() {
+        use axum::{Router, routing::get};
+        use tower::ServiceExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("ci_audit.jsonl");
+        let logger = Arc::new(
+            sqe_metrics::audit::AuditLogger::new(path.to_str().unwrap()).expect("audit logger"),
+        );
+
+        let provider: Arc<dyn sqe_auth::AuthProvider> =
+            Arc::new(StubProvider { roles: vec!["admin".into()], ok: true });
+
+        struct CiState {
+            provider: Arc<dyn sqe_auth::AuthProvider>,
+            auth_cfg: sqe_core::config::AuthConfig,
+            audit: Arc<sqe_metrics::audit::AuditLogger>,
+        }
+
+        impl BearerAdminState for CiState {
+            fn bearer_provider(&self) -> Option<&Arc<dyn sqe_auth::AuthProvider>> {
+                Some(&self.provider)
+            }
+            fn auth_config(&self) -> Option<&sqe_core::config::AuthConfig> {
+                Some(&self.auth_cfg)
+            }
+            fn audit(&self) -> Option<&Arc<sqe_metrics::audit::AuditLogger>> {
+                Some(&self.audit)
+            }
+        }
+
+        let state = Arc::new(CiState {
+            provider,
+            auth_cfg: auth_cfg(&["admin"]),
+            audit: Arc::clone(&logger),
+        });
+
+        let app = Router::new()
+            .route("/guarded", get(|| async { "ok" }))
+            .route_layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                require_admin_bearer::<CiState>,
+            ))
+            .with_state(state);
+
+        // Build a request with ConnectInfo set in extensions.
+        let peer: std::net::SocketAddr = "203.0.113.7:54321".parse().unwrap();
+        let mut req = axum::http::Request::builder()
+            .uri("/guarded")
+            .header("Authorization", "Bearer tok")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(peer));
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+
+        logger.flush();
+        let content = std::fs::read_to_string(&path).unwrap_or_default();
+        assert!(
+            !content.trim().is_empty(),
+            "audit logger must have written a line"
+        );
+        let v: serde_json::Value = serde_json::from_str(content.lines().next().unwrap())
+            .expect("valid JSON");
+        assert_eq!(
+            v["client_ip"].as_str(),
+            Some("203.0.113.7:54321"),
+            "audit event must carry the ConnectInfo peer IP; got: {v}"
+        );
+    }
+
+    /// `require_admin_bearer` emits an audit event with client_ip when ConnectInfo
+    /// is present and the outcome is Forbidden.
+    #[tokio::test]
+    async fn require_admin_bearer_emits_client_ip_on_forbidden() {
+        use axum::{Router, routing::get};
+        use tower::ServiceExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("ci_forbidden_audit.jsonl");
+        let logger = Arc::new(
+            sqe_metrics::audit::AuditLogger::new(path.to_str().unwrap()).expect("audit logger"),
+        );
+
+        // Provider returns a non-admin identity.
+        let provider: Arc<dyn sqe_auth::AuthProvider> =
+            Arc::new(StubProvider { roles: vec!["analyst".into()], ok: true });
+
+        struct CiForbiddenState {
+            provider: Arc<dyn sqe_auth::AuthProvider>,
+            auth_cfg: sqe_core::config::AuthConfig,
+            audit: Arc<sqe_metrics::audit::AuditLogger>,
+        }
+
+        impl BearerAdminState for CiForbiddenState {
+            fn bearer_provider(&self) -> Option<&Arc<dyn sqe_auth::AuthProvider>> {
+                Some(&self.provider)
+            }
+            fn auth_config(&self) -> Option<&sqe_core::config::AuthConfig> {
+                Some(&self.auth_cfg)
+            }
+            fn audit(&self) -> Option<&Arc<sqe_metrics::audit::AuditLogger>> {
+                Some(&self.audit)
+            }
+        }
+
+        let state = Arc::new(CiForbiddenState {
+            provider,
+            auth_cfg: auth_cfg(&["admin"]),
+            audit: Arc::clone(&logger),
+        });
+
+        let app = Router::new()
+            .route("/guarded", get(|| async { "ok" }))
+            .route_layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                require_admin_bearer::<CiForbiddenState>,
+            ))
+            .with_state(state);
+
+        let peer: std::net::SocketAddr = "192.0.2.55:44444".parse().unwrap();
+        let mut req = axum::http::Request::builder()
+            .uri("/guarded")
+            .header("Authorization", "Bearer tok")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(peer));
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::FORBIDDEN);
+
+        logger.flush();
+        let content = std::fs::read_to_string(&path).unwrap_or_default();
+        assert!(
+            !content.trim().is_empty(),
+            "Forbidden must write an audit line"
+        );
+        let v: serde_json::Value = serde_json::from_str(content.lines().next().unwrap())
+            .expect("valid JSON");
+        assert_eq!(
+            v["client_ip"].as_str(),
+            Some("192.0.2.55:44444"),
+            "Forbidden audit event must carry the ConnectInfo peer IP; got: {v}"
+        );
     }
 }
