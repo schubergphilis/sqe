@@ -467,6 +467,20 @@ where
     Err(last_err.expect("retry loop must have captured an error"))
 }
 
+/// Backoff (exponential + jitter, capped ~1s) for retrying a CoW UPDATE/DELETE
+/// after an optimistic-concurrency conflict. Mirrors `commit_with_retry`'s
+/// schedule. CoW cannot use `commit_with_retry` directly because the rewritten
+/// data files are snapshot-specific: on conflict the whole rewrite must re-run
+/// against the reloaded snapshot, not just re-commit stale files.
+fn cow_conflict_backoff_ms(attempt: u32) -> u64 {
+    let base = 50_u64.saturating_mul(1_u64 << attempt.saturating_sub(1));
+    let jitter = (Uuid::new_v4().as_u128() as u64) % 50;
+    base.saturating_add(jitter).min(1000)
+}
+
+/// Max attempts for a CoW UPDATE/DELETE that loses an optimistic-concurrency race.
+const COW_MAX_ATTEMPTS: u32 = 4;
+
 fn is_conflict_message(msg: &str) -> bool {
     let lower = msg.to_lowercase();
     lower.contains("commitconflict")
@@ -1633,17 +1647,12 @@ impl WriteHandler {
             ))),
         };
 
-        let table = catalog.load_table(&table_ident).await?;
-
-        // Get all data files from current snapshot via manifest entries
-        let old_data_files = self.collect_data_files(&table).await?;
-
-        if old_data_files.is_empty() {
-            info!(table = %table_ident, "DELETE: table has no data files, nothing to delete");
-            return Ok(vec![]);
-        }
+        let mut table = catalog.load_table(&table_ident).await?;
 
         let where_clause = &delete.selection;
+        // Snapshot-independent setup (schema + policy predicates) runs once;
+        // the data-file changes are retried against a reloaded snapshot on an
+        // optimistic-concurrency conflict.
         let target_schema = build_arrow_schema_for_table(&table)?;
         let predicates = self
             .compute_write_predicates(session, &table_ident, target_schema)
@@ -1652,129 +1661,167 @@ impl WriteHandler {
         // No WHERE = truncate. With no policy row filter we keep the fast
         // path: drop every file. With a row filter we must preserve rows
         // outside the user's view, so the truncate degrades into a CoW
-        // rewrite under the row filter.
+        // rewrite under the row filter (handled by the main path below).
         if where_clause.is_none() && predicates.row_filter_sql.is_none() {
-            info!(table = %table_ident, file_count = old_data_files.len(), "DELETE: truncating table (no WHERE clause)");
-            let tx = Transaction::new(&table);
-            let action = tx.rewrite_files().delete_files(old_data_files);
-            let tx = action.apply(tx).map_err(|e| {
-                SqeError::Execution(format!("Failed to apply truncate transaction: {e}"))
-            })?;
-            tx.commit(catalog.as_catalog().as_ref())
-                .await
-                .map_err(|e| SqeError::Execution(format!("Failed to commit truncate: {e}")))?;
-            info!(table = %table_ident, "DELETE: table truncated successfully");
-            return Ok(vec![]);
+            let mut attempt = 1u32;
+            loop {
+                let old_data_files = self.collect_data_files(&table).await?;
+                if old_data_files.is_empty() {
+                    info!(table = %table_ident, "DELETE: table has no data files, nothing to delete");
+                    return Ok(vec![]);
+                }
+                info!(table = %table_ident, file_count = old_data_files.len(), attempt, "DELETE: truncating table (no WHERE clause)");
+                let tx = Transaction::new(&table);
+                let action = tx.rewrite_files().delete_files(old_data_files);
+                let commit_result = match action.apply(tx) {
+                    Ok(tx) => tx.commit(catalog.as_catalog().as_ref()).await,
+                    Err(e) => Err(e),
+                };
+                match commit_result {
+                    Ok(_) => {
+                        info!(table = %table_ident, "DELETE: table truncated successfully");
+                        return Ok(vec![]);
+                    }
+                    Err(e)
+                        if (e.retryable() || is_conflict_message(&e.to_string()))
+                            && attempt < COW_MAX_ATTEMPTS =>
+                    {
+                        let sleep_ms = cow_conflict_backoff_ms(attempt);
+                        warn!(table = %table_ident, op = "truncate", attempt, backoff_ms = sleep_ms, error = %e, "commit conflict; reloading table and retrying");
+                        tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
+                        table = catalog.load_table(&table_ident).await?;
+                        attempt += 1;
+                    }
+                    Err(e) => {
+                        return Err(SqeError::Execution(format!("Failed to commit truncate: {e}")));
+                    }
+                }
+            }
         }
 
-        // Partition-pruned CoW: rewrite only data files whose partition could
-        // match the WHERE clause; the rest stay untouched in the new snapshot.
-        // Unpartitioned tables / unprunable WHEREs rewrite every file as before.
-        // See issue #263.
-        let (old_data_files, pruned_files) =
-            partition_prune_cow_files(old_data_files, &table, where_clause.as_ref());
-        if old_data_files.is_empty() {
-            info!(table = %table_ident, "DELETE: no partitions match the WHERE clause; nothing to rewrite");
-            return Ok(affected_rows_batch(0));
-        }
-        if pruned_files > 0 {
-            info!(
-                table = %table_ident,
-                pruned_files,
-                rewrite_files = old_data_files.len(),
-                "DELETE: partition-pruned CoW rewrite"
-            );
-        }
-
+        // Lift any `IN (subquery)` expressions out of the WHERE into materialised
+        // scratch MemTables joined via LEFT JOIN. The guard must outlive every
+        // rewrite below; its Drop deregisters the scratch tables.
         let raw_where = where_clause
             .as_ref()
             .map(|w| format!("{w}"))
             .unwrap_or_else(|| "TRUE".to_string());
-        // Lift any `IN (subquery)` expressions out of the WHERE into materialised
-        // scratch MemTables joined via LEFT JOIN. The cleanup guard must outlive
-        // every per-batch evaluator call below; `_in_subq_guard`'s Drop runs at
-        // the end of this handler and deregisters the scratch tables.
         let (where_sql, joins_sql, _in_subq_guard) =
             self.lift_in_subqueries(&raw_where, ctx).await?;
-        info!(
-            table = %table_ident,
-            file_count = old_data_files.len(),
-            where_clause = %where_sql,
-            policy_row_filter = predicates.row_filter_sql.is_some(),
-            policy_masks = predicates.column_mask_sqls.len(),
-            "DELETE: CoW rewrite"
-        );
 
-        let mut new_data_files = Vec::new();
-        let mut total_deleted = 0usize;
-        let tracker = new_upload_tracker();
-        let cleanup_guard =
-            WriteCleanupGuard::new(table.file_io().clone(), tracker.clone(), "delete-cow")
-                .with_metrics(self.metrics.clone());
-
-        for data_file in &old_data_files {
-            let file_path = data_file.file_path();
-            let batches = self.read_parquet_via_table(&table, file_path).await?;
-
-            if batches.is_empty() {
-                continue;
+        // Partition-pruned CoW under optimistic-concurrency retry: each attempt
+        // re-reads the snapshot, rewrites only data files whose partition could
+        // match the WHERE (rest untouched, #263), and commits. A commit conflict
+        // re-runs the whole rewrite against the reloaded snapshot (#47).
+        let mut attempt = 1u32;
+        let total_deleted = loop {
+            let old_data_files = self.collect_data_files(&table).await?;
+            if old_data_files.is_empty() {
+                info!(table = %table_ident, "DELETE: table has no data files, nothing to delete");
+                return Ok(vec![]);
             }
+            let (to_rewrite, pruned_files) =
+                partition_prune_cow_files(old_data_files, &table, where_clause.as_ref());
+            if to_rewrite.is_empty() {
+                info!(table = %table_ident, "DELETE: no partitions match the WHERE clause; nothing to rewrite");
+                return Ok(affected_rows_batch(0));
+            }
+            if pruned_files > 0 {
+                info!(table = %table_ident, pruned_files, rewrite_files = to_rewrite.len(), "DELETE: partition-pruned CoW rewrite");
+            }
+            info!(
+                table = %table_ident,
+                file_count = to_rewrite.len(),
+                where_clause = %where_sql,
+                policy_row_filter = predicates.row_filter_sql.is_some(),
+                policy_masks = predicates.column_mask_sqls.len(),
+                attempt,
+                "DELETE: CoW rewrite"
+            );
 
-            // Evaluate WHERE predicate against each batch, keep rows that do NOT match
-            let mut surviving_batches = Vec::new();
-            for batch in &batches {
-                let filtered = self
-                    .filter_batch_negate(
-                        ctx,
-                        batch,
-                        &where_sql,
-                        &joins_sql,
-                        &table_ident,
-                        &predicates,
+            let mut new_data_files = Vec::new();
+            let mut deleted_this_attempt = 0usize;
+            let tracker = new_upload_tracker();
+            let cleanup_guard =
+                WriteCleanupGuard::new(table.file_io().clone(), tracker.clone(), "delete-cow")
+                    .with_metrics(self.metrics.clone());
+
+            for data_file in &to_rewrite {
+                let file_path = data_file.file_path();
+                let batches = self.read_parquet_via_table(&table, file_path).await?;
+                if batches.is_empty() {
+                    continue;
+                }
+                let mut surviving_batches = Vec::new();
+                for batch in &batches {
+                    let filtered = self
+                        .filter_batch_negate(ctx, batch, &where_sql, &joins_sql, &table_ident, &predicates)
+                        .await?;
+                    deleted_this_attempt += batch.num_rows() - filtered.num_rows();
+                    if filtered.num_rows() > 0 {
+                        surviving_batches.push(filtered);
+                    }
+                }
+                if !surviving_batches.is_empty() {
+                    let new_files = write_data_files_with_metrics(
+                        &table,
+                        surviving_batches,
+                        "delete",
+                        self.metrics.as_ref(),
+                        self.compression(),
+                        tracker.clone(),
                     )
                     .await?;
-                total_deleted += batch.num_rows() - filtered.num_rows();
-                if filtered.num_rows() > 0 {
-                    surviving_batches.push(filtered);
+                    new_data_files.extend(new_files);
                 }
             }
 
-            // Write surviving rows as new data files (skip if all rows deleted)
-            if !surviving_batches.is_empty() {
-                let new_files = write_data_files_with_metrics(
-                    &table,
-                    surviving_batches,
-                    "delete",
-                    self.metrics.as_ref(),
-                    self.compression(),
-                    tracker.clone(),
-                )
-                .await?;
-                new_data_files.extend(new_files);
+            info!(
+                table = %table_ident,
+                deleted_rows = deleted_this_attempt,
+                rewrite_files = to_rewrite.len(),
+                new_files = new_data_files.len(),
+                "DELETE: committing CoW rewrite"
+            );
+
+            let tx = Transaction::new(&table);
+            let action = tx
+                .rewrite_files()
+                .add_data_files(new_data_files)
+                .delete_files(to_rewrite);
+            let commit_result = match action.apply(tx) {
+                Ok(tx) => tx.commit(catalog.as_catalog().as_ref()).await,
+                Err(e) => Err(e),
+            };
+            match commit_result {
+                Ok(_) => {
+                    cleanup_guard.mark_committed();
+                    break deleted_this_attempt;
+                }
+                Err(e)
+                    if (e.retryable() || is_conflict_message(&e.to_string()))
+                        && attempt < COW_MAX_ATTEMPTS =>
+                {
+                    drop(cleanup_guard);
+                    let sleep_ms = cow_conflict_backoff_ms(attempt);
+                    warn!(
+                        table = %table_ident,
+                        op = "delete-cow",
+                        attempt,
+                        backoff_ms = sleep_ms,
+                        error = %e,
+                        "commit conflict; reloading table and retrying"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
+                    table = catalog.load_table(&table_ident).await?;
+                    attempt += 1;
+                    continue;
+                }
+                Err(e) => {
+                    return Err(SqeError::Execution(format!("Failed to commit DELETE: {e}")));
+                }
             }
-        }
-
-        info!(
-            table = %table_ident,
-            deleted_rows = total_deleted,
-            old_files = old_data_files.len(),
-            new_files = new_data_files.len(),
-            "DELETE: committing CoW rewrite"
-        );
-
-        // Atomic commit: remove old files, add new files
-        let tx = Transaction::new(&table);
-        let action = tx
-            .rewrite_files()
-            .add_data_files(new_data_files)
-            .delete_files(old_data_files);
-        let tx = action
-            .apply(tx)
-            .map_err(|e| SqeError::Execution(format!("Failed to apply DELETE rewrite: {e}")))?;
-        tx.commit(catalog.as_catalog().as_ref())
-            .await
-            .map_err(|e| SqeError::Execution(format!("Failed to commit DELETE: {e}")))?;
-        cleanup_guard.mark_committed();
+        };
 
         info!(table = %table_ident, deleted_rows = total_deleted, "DELETE committed successfully");
         Ok(affected_rows_batch(total_deleted))
@@ -2214,145 +2261,146 @@ impl WriteHandler {
             ))),
         };
 
-        let table = catalog.load_table(&table_ident).await?;
+        let mut table = catalog.load_table(&table_ident).await?;
 
-        // Get all data files
-        let old_data_files = self.collect_data_files(&table).await?;
-
-        if old_data_files.is_empty() {
-            info!(table = %table_ident, "UPDATE: table has no data files");
-            return Ok(vec![]);
-        }
-
-        // Partition-pruned CoW: rewrite only the data files whose partition
-        // could match the WHERE clause; leave the rest untouched in the new
-        // snapshot. On an unpartitioned table (or an unprunable WHERE) this is
-        // every file, i.e. the original full-rewrite behaviour. See issue #263.
-        let (old_data_files, pruned_files) =
-            partition_prune_cow_files(old_data_files, &table, selection.as_ref());
-        if old_data_files.is_empty() {
-            info!(table = %table_ident, "UPDATE: no partitions match the WHERE clause; nothing to rewrite");
-            return Ok(affected_rows_batch(0));
-        }
-        if pruned_files > 0 {
-            info!(
-                table = %table_ident,
-                pruned_files,
-                rewrite_files = old_data_files.len(),
-                "UPDATE: partition-pruned CoW rewrite"
-            );
-        }
-
+        // Snapshot-independent setup runs once. Schema, policy predicates, and
+        // lifted IN-subqueries do not depend on the data snapshot, so they are
+        // computed before the retry loop. Subquery values are evaluated against
+        // the initial snapshot, consistent with UPDATE's snapshot isolation.
         let target_schema = build_arrow_schema_for_table(&table)?;
         let predicates = self
             .compute_write_predicates(session, &table_ident, target_schema)
             .await?;
-
-        // Build the SET clause as SQL CASE expressions for a SELECT rewrite
-        // UPDATE t SET col1 = expr1, col2 = expr2 WHERE cond
-        // becomes:
-        // SELECT CASE WHEN cond THEN expr1 ELSE col1 END AS col1,
-        //        CASE WHEN cond THEN expr2 ELSE col2 END AS col2,
-        //        col3, col4, ...  (unchanged columns)
-        // FROM t
+        // Build the SET clause as SQL CASE expressions for a SELECT rewrite:
+        // UPDATE t SET c1=e1 WHERE cond  ->  SELECT CASE WHEN cond THEN e1 ELSE c1 END, ...
         let raw_where = selection
             .as_ref()
             .map(|w| format!("{w}"))
             .unwrap_or_else(|| "TRUE".to_string());
         // Lift any `IN (subquery)` expressions; see `handle_delete` for details.
-        // The guard must outlive the per-batch loop below.
+        // The guard must outlive every rewrite below.
         let (where_sql, joins_sql, _in_subq_guard) =
             self.lift_in_subqueries(&raw_where, ctx).await?;
 
-        info!(
-            table = %table_ident,
-            file_count = old_data_files.len(),
-            assignments = assignments.len(),
-            where_clause = %where_sql,
-            policy_row_filter = predicates.row_filter_sql.is_some(),
-            policy_masks = predicates.column_mask_sqls.len(),
-            "UPDATE: CoW rewrite"
-        );
+        // Partition-pruned CoW under optimistic-concurrency retry. Each attempt
+        // re-reads the current snapshot, rewrites only the data files whose
+        // partition could match the WHERE (the rest stay untouched, #263), and
+        // commits. On a commit conflict the whole rewrite re-runs against the
+        // reloaded snapshot -- re-committing snapshot-specific rewritten files
+        // would drop a concurrent writer's changes (#47, write-path race).
+        let mut attempt = 1u32;
+        let total_updated = loop {
+            let old_data_files = self.collect_data_files(&table).await?;
+            if old_data_files.is_empty() {
+                info!(table = %table_ident, "UPDATE: table has no data files");
+                return Ok(vec![]);
+            }
+            let (to_rewrite, pruned_files) =
+                partition_prune_cow_files(old_data_files, &table, selection.as_ref());
+            if to_rewrite.is_empty() {
+                info!(table = %table_ident, "UPDATE: no partitions match the WHERE clause; nothing to rewrite");
+                return Ok(affected_rows_batch(0));
+            }
+            if pruned_files > 0 {
+                info!(table = %table_ident, pruned_files, rewrite_files = to_rewrite.len(), "UPDATE: partition-pruned CoW rewrite");
+            }
+            info!(
+                table = %table_ident,
+                file_count = to_rewrite.len(),
+                assignments = assignments.len(),
+                where_clause = %where_sql,
+                policy_row_filter = predicates.row_filter_sql.is_some(),
+                policy_masks = predicates.column_mask_sqls.len(),
+                attempt,
+                "UPDATE: CoW rewrite"
+            );
 
-        let mut new_data_files = Vec::new();
-        let mut total_updated = 0usize;
-        let tracker = new_upload_tracker();
-        let cleanup_guard =
-            WriteCleanupGuard::new(table.file_io().clone(), tracker.clone(), "update-cow")
-                .with_metrics(self.metrics.clone());
+            let mut new_data_files = Vec::new();
+            let mut updated_this_attempt = 0usize;
+            let tracker = new_upload_tracker();
+            let cleanup_guard =
+                WriteCleanupGuard::new(table.file_io().clone(), tracker.clone(), "update-cow")
+                    .with_metrics(self.metrics.clone());
 
-        for data_file in &old_data_files {
-            let file_path = data_file.file_path();
-            let batches = self.read_parquet_via_table(&table, file_path).await?;
-
-            if batches.is_empty() {
-                continue;
+            for data_file in &to_rewrite {
+                let file_path = data_file.file_path();
+                let batches = self.read_parquet_via_table(&table, file_path).await?;
+                if batches.is_empty() {
+                    continue;
+                }
+                let mut rewritten_batches = Vec::new();
+                for batch in &batches {
+                    let rewritten = self
+                        .apply_update(ctx, batch, assignments, &where_sql, &joins_sql, &table_ident, &predicates)
+                        .await?;
+                    rewritten_batches.push(rewritten);
+                }
+                for batch in &batches {
+                    let count = self
+                        .count_matching_rows(ctx, batch, &where_sql, &joins_sql, &table_ident, &predicates)
+                        .await?;
+                    updated_this_attempt += count;
+                }
+                let new_files = write_data_files_with_metrics(
+                    &table,
+                    rewritten_batches,
+                    "update",
+                    self.metrics.as_ref(),
+                    self.compression(),
+                    tracker.clone(),
+                )
+                .await?;
+                new_data_files.extend(new_files);
             }
 
-            let mut rewritten_batches = Vec::new();
+            info!(
+                table = %table_ident,
+                updated_rows = updated_this_attempt,
+                rewrite_files = to_rewrite.len(),
+                new_files = new_data_files.len(),
+                "UPDATE: committing CoW rewrite"
+            );
 
-            for batch in &batches {
-                let rewritten = self
-                    .apply_update(
-                        ctx,
-                        batch,
-                        assignments,
-                        &where_sql,
-                        &joins_sql,
-                        &table_ident,
-                        &predicates,
-                    )
-                    .await?;
-                rewritten_batches.push(rewritten);
+            let tx = Transaction::new(&table);
+            let action = tx
+                .rewrite_files()
+                .add_data_files(new_data_files)
+                .delete_files(to_rewrite);
+            let commit_result = match action.apply(tx) {
+                Ok(tx) => tx.commit(catalog.as_catalog().as_ref()).await,
+                Err(e) => Err(e),
+            };
+            match commit_result {
+                Ok(_) => {
+                    cleanup_guard.mark_committed();
+                    break updated_this_attempt;
+                }
+                Err(e)
+                    if (e.retryable() || is_conflict_message(&e.to_string()))
+                        && attempt < COW_MAX_ATTEMPTS =>
+                {
+                    // Drop the guard so this attempt's orphan parquet files are
+                    // deleted before we reload and rewrite again.
+                    drop(cleanup_guard);
+                    let sleep_ms = cow_conflict_backoff_ms(attempt);
+                    warn!(
+                        table = %table_ident,
+                        op = "update-cow",
+                        attempt,
+                        backoff_ms = sleep_ms,
+                        error = %e,
+                        "commit conflict; reloading table and retrying"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
+                    table = catalog.load_table(&table_ident).await?;
+                    attempt += 1;
+                    continue;
+                }
+                Err(e) => {
+                    return Err(SqeError::Execution(format!("Failed to commit UPDATE: {e}")));
+                }
             }
-
-            // Count updated rows by comparing before/after
-            for batch in &batches {
-                let count = self
-                    .count_matching_rows(
-                        ctx,
-                        batch,
-                        &where_sql,
-                        &joins_sql,
-                        &table_ident,
-                        &predicates,
-                    )
-                    .await?;
-                total_updated += count;
-            }
-
-            let new_files = write_data_files_with_metrics(
-                &table,
-                rewritten_batches,
-                "update",
-                self.metrics.as_ref(),
-                self.compression(),
-                tracker.clone(),
-            )
-            .await?;
-            new_data_files.extend(new_files);
-        }
-
-        info!(
-            table = %table_ident,
-            updated_rows = total_updated,
-            old_files = old_data_files.len(),
-            new_files = new_data_files.len(),
-            "UPDATE: committing CoW rewrite"
-        );
-
-        let tx = Transaction::new(&table);
-        let action = tx
-            .rewrite_files()
-            .add_data_files(new_data_files)
-            .delete_files(old_data_files);
-        let tx = action
-            .apply(tx)
-            .map_err(|e| SqeError::Execution(format!("Failed to apply UPDATE rewrite: {e}")))?;
-        tx.commit(catalog.as_catalog().as_ref())
-            .await
-            .map_err(|e| SqeError::Execution(format!("Failed to commit UPDATE: {e}")))?;
-        cleanup_guard.mark_committed();
+        };
 
         info!(table = %table_ident, updated_rows = total_updated, "UPDATE committed successfully");
         Ok(affected_rows_batch(total_updated))
