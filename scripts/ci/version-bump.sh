@@ -20,8 +20,18 @@
 set -euo pipefail
 
 SEED_VERSION="0.36.0"
+
+# The automated release/* flow is opt-in: it only works once RELEASE_TOKEN is
+# configured (a project access token with api + write_repository, allowed to
+# push to main). Until then this job is a deliberate no-op so it stays green on
+# every main push. Releases can still be cut manually via scripts/release.sh.
+if [[ -z "${RELEASE_TOKEN:-}" ]]; then
+  echo "RELEASE_TOKEN not configured; automated release/* flow disabled. Skipping."
+  exit 0
+fi
+
 API="${CI_API_V4_URL}/projects/${CI_PROJECT_ID}"
-AUTH=(--header "PRIVATE-TOKEN: ${RELEASE_TOKEN:?RELEASE_TOKEN must be set}")
+AUTH=(--header "PRIVATE-TOKEN: ${RELEASE_TOKEN}")
 
 echo "==> Looking up the merged MR for ${CI_COMMIT_SHA}"
 # This job runs on every main push, so a transient API hiccup on the lookup
