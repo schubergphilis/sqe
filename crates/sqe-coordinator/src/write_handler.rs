@@ -1667,6 +1667,25 @@ impl WriteHandler {
             return Ok(vec![]);
         }
 
+        // Partition-pruned CoW: rewrite only data files whose partition could
+        // match the WHERE clause; the rest stay untouched in the new snapshot.
+        // Unpartitioned tables / unprunable WHEREs rewrite every file as before.
+        // See issue #263.
+        let (old_data_files, pruned_files) =
+            partition_prune_cow_files(old_data_files, &table, where_clause.as_ref());
+        if old_data_files.is_empty() {
+            info!(table = %table_ident, "DELETE: no partitions match the WHERE clause; nothing to rewrite");
+            return Ok(affected_rows_batch(0));
+        }
+        if pruned_files > 0 {
+            info!(
+                table = %table_ident,
+                pruned_files,
+                rewrite_files = old_data_files.len(),
+                "DELETE: partition-pruned CoW rewrite"
+            );
+        }
+
         let raw_where = where_clause
             .as_ref()
             .map(|w| format!("{w}"))
@@ -2203,6 +2222,25 @@ impl WriteHandler {
         if old_data_files.is_empty() {
             info!(table = %table_ident, "UPDATE: table has no data files");
             return Ok(vec![]);
+        }
+
+        // Partition-pruned CoW: rewrite only the data files whose partition
+        // could match the WHERE clause; leave the rest untouched in the new
+        // snapshot. On an unpartitioned table (or an unprunable WHERE) this is
+        // every file, i.e. the original full-rewrite behaviour. See issue #263.
+        let (old_data_files, pruned_files) =
+            partition_prune_cow_files(old_data_files, &table, selection.as_ref());
+        if old_data_files.is_empty() {
+            info!(table = %table_ident, "UPDATE: no partitions match the WHERE clause; nothing to rewrite");
+            return Ok(affected_rows_batch(0));
+        }
+        if pruned_files > 0 {
+            info!(
+                table = %table_ident,
+                pruned_files,
+                rewrite_files = old_data_files.len(),
+                "UPDATE: partition-pruned CoW rewrite"
+            );
         }
 
         let target_schema = build_arrow_schema_for_table(&table)?;
@@ -5083,6 +5121,150 @@ pub(crate) fn sql_type_to_arrow(
     }
 }
 
+/// A literal an identity-partition column is constrained to equal, lifted from
+/// a WHERE clause. Used to skip data files whose partition provably cannot hold
+/// a matching row, so Copy-on-Write UPDATE/DELETE rewrite only affected
+/// partitions instead of the whole table. See issue #263.
+#[derive(Debug, Clone, PartialEq)]
+enum PartitionConstraintValue {
+    Int(i64),
+    Str(String),
+    Bool(bool),
+}
+
+/// Lift top-level `col = <literal>` equality conjuncts from a WHERE clause.
+/// Only AND-connected equalities qualify; anything under OR/NOT is ignored so
+/// pruning stays conservative (we must never skip a file that could match).
+/// Column names are lowercased for case-insensitive matching.
+fn extract_partition_eq_constraints(
+    where_expr: &sqlparser::ast::Expr,
+) -> std::collections::HashMap<String, PartitionConstraintValue> {
+    use sqlparser::ast::{BinaryOperator, Expr};
+    let mut out = std::collections::HashMap::new();
+    fn lit(e: &Expr) -> Option<PartitionConstraintValue> {
+        use sqlparser::ast::Value;
+        match e {
+            Expr::Value(v) => match &v.value {
+                Value::Number(n, _) => n.parse::<i64>().ok().map(PartitionConstraintValue::Int),
+                Value::SingleQuotedString(s) | Value::DoubleQuotedString(s) => {
+                    Some(PartitionConstraintValue::Str(s.clone()))
+                }
+                Value::Boolean(b) => Some(PartitionConstraintValue::Bool(*b)),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+    fn walk(e: &Expr, out: &mut std::collections::HashMap<String, PartitionConstraintValue>) {
+        match e {
+            Expr::BinaryOp { left, op: BinaryOperator::And, right } => {
+                walk(left, out);
+                walk(right, out);
+            }
+            Expr::Nested(inner) => walk(inner, out),
+            Expr::BinaryOp { left, op: BinaryOperator::Eq, right } => {
+                let pair = match (left.as_ref(), right.as_ref()) {
+                    (Expr::Identifier(id), v) => Some((id, v)),
+                    (v, Expr::Identifier(id)) => Some((id, v)),
+                    _ => None,
+                };
+                if let Some((id, v)) = pair {
+                    if let Some(cv) = lit(v) {
+                        out.insert(id.value.to_ascii_lowercase(), cv);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    walk(where_expr, &mut out);
+    out
+}
+
+/// True when an iceberg partition literal is provably different from the
+/// constrained value. Returns false for any pair we cannot compare exactly, so
+/// uncertainty never prunes a file.
+fn partition_literal_definitely_ne(
+    lit: &iceberg::spec::Literal,
+    want: &PartitionConstraintValue,
+) -> bool {
+    use iceberg::spec::{Literal, PrimitiveLiteral};
+    match (lit, want) {
+        (Literal::Primitive(PrimitiveLiteral::Int(v)), PartitionConstraintValue::Int(w)) => {
+            (*v as i64) != *w
+        }
+        (Literal::Primitive(PrimitiveLiteral::Long(v)), PartitionConstraintValue::Int(w)) => v != w,
+        (Literal::Primitive(PrimitiveLiteral::String(v)), PartitionConstraintValue::Str(w)) => v != w,
+        (Literal::Primitive(PrimitiveLiteral::Boolean(v)), PartitionConstraintValue::Bool(w)) => v != w,
+        _ => false,
+    }
+}
+
+/// Decide whether a data file's partition could contain a row matching the
+/// constraints. Returns `false` only when an identity-partition column is
+/// constrained to a value the file's partition provably differs from; any
+/// uncertainty (non-identity transform, null partition value, type mismatch,
+/// unconstrained column) keeps the file (`true`). Conservative by design:
+/// false negatives would silently lose data.
+fn partition_could_match(
+    partition: &iceberg::spec::Struct,
+    spec: &iceberg::spec::PartitionSpec,
+    schema: &IcebergSchema,
+    constraints: &std::collections::HashMap<String, PartitionConstraintValue>,
+) -> bool {
+    if constraints.is_empty() {
+        return true;
+    }
+    for (idx, pf) in spec.fields().iter().enumerate() {
+        if !matches!(pf.transform, iceberg::spec::Transform::Identity) {
+            continue;
+        }
+        let Some(src) = schema.field_by_id(pf.source_id) else {
+            continue;
+        };
+        let Some(want) = constraints.get(&src.name.to_ascii_lowercase()) else {
+            continue;
+        };
+        if let Some(Some(lit)) = partition.fields().get(idx) {
+            if partition_literal_definitely_ne(lit, want) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Partition-prune the data files a CoW UPDATE/DELETE must rewrite. Returns the
+/// subset of `files` whose partition could match `where_expr` (these get
+/// rewritten); the rest are left untouched in the new snapshot. Falls back to
+/// all files when the table is unpartitioned, the WHERE is absent, or no
+/// identity-partition equality can be lifted. Returns `(to_rewrite, pruned_count)`.
+fn partition_prune_cow_files(
+    files: Vec<DataFile>,
+    table: &IcebergTable,
+    where_expr: Option<&sqlparser::ast::Expr>,
+) -> (Vec<DataFile>, usize) {
+    let Some(where_expr) = where_expr else {
+        return (files, 0);
+    };
+    let constraints = extract_partition_eq_constraints(where_expr);
+    if constraints.is_empty() {
+        return (files, 0);
+    }
+    let spec = table.metadata().default_partition_spec();
+    if spec.fields().is_empty() {
+        return (files, 0);
+    }
+    let schema = table.metadata().current_schema();
+    let total = files.len();
+    let to_rewrite: Vec<DataFile> = files
+        .into_iter()
+        .filter(|df| partition_could_match(df.partition(), spec.as_ref(), schema.as_ref(), &constraints))
+        .collect();
+    let pruned = total - to_rewrite.len();
+    (to_rewrite, pruned)
+}
+
 fn arrow_schema_to_iceberg(arrow_schema: &ArrowSchema) -> sqe_core::Result<IcebergSchema> {
     let mut fields = Vec::with_capacity(arrow_schema.fields().len());
 
@@ -6273,6 +6455,75 @@ mod tests {
             sqlparser::ast::Statement::CreateTable(ct) => ct,
             other => panic!("expected CreateTable, got {other:?}"),
         }
+    }
+
+    fn parse_where(cond: &str) -> sqlparser::ast::Expr {
+        use sqlparser::ast::{SetExpr, Statement};
+        use sqlparser::dialect::GenericDialect;
+        use sqlparser::parser::Parser;
+        let sql = format!("SELECT 1 FROM t WHERE {cond}");
+        let stmt = Parser::parse_sql(&GenericDialect {}, &sql)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        match stmt {
+            Statement::Query(q) => match *q.body {
+                SetExpr::Select(s) => s.selection.expect("has WHERE"),
+                _ => panic!("not a select"),
+            },
+            other => panic!("not a query: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_extract_partition_eq_constraints_and_conjuncts() {
+        let c = extract_partition_eq_constraints(&parse_where(
+            "ol_w_id = 1 AND ol_d_id = 2 AND ol_delivery_d IS NULL",
+        ));
+        assert_eq!(c.get("ol_w_id"), Some(&PartitionConstraintValue::Int(1)));
+        assert_eq!(c.get("ol_d_id"), Some(&PartitionConstraintValue::Int(2)));
+        assert!(!c.contains_key("ol_delivery_d")); // IS NULL is not an equality
+    }
+
+    #[test]
+    fn test_extract_partition_eq_constraints_literal_on_left_and_string() {
+        let c = extract_partition_eq_constraints(&parse_where("1 = w_id AND name = 'BAR'"));
+        assert_eq!(c.get("w_id"), Some(&PartitionConstraintValue::Int(1)));
+        assert_eq!(
+            c.get("name"),
+            Some(&PartitionConstraintValue::Str("BAR".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_extract_partition_eq_constraints_ignores_or() {
+        // OR at the top level is not safe to prune on.
+        assert!(extract_partition_eq_constraints(&parse_where("w_id = 1 OR d_id = 2")).is_empty());
+        // An OR nested under AND: only the AND-level equality is lifted.
+        let c = extract_partition_eq_constraints(&parse_where("w_id = 1 AND (a = 2 OR b = 3)"));
+        assert_eq!(c.get("w_id"), Some(&PartitionConstraintValue::Int(1)));
+        assert!(!c.contains_key("a") && !c.contains_key("b"));
+    }
+
+    #[test]
+    fn test_partition_literal_definitely_ne() {
+        use iceberg::spec::{Literal, PrimitiveLiteral};
+        let int1 = Literal::Primitive(PrimitiveLiteral::Int(1));
+        let int2 = Literal::Primitive(PrimitiveLiteral::Int(2));
+        let long1 = Literal::Primitive(PrimitiveLiteral::Long(1));
+        let bar = Literal::Primitive(PrimitiveLiteral::String("BAR".into()));
+        // provably different -> prunable
+        assert!(partition_literal_definitely_ne(&int2, &PartitionConstraintValue::Int(1)));
+        // equal -> not prunable
+        assert!(!partition_literal_definitely_ne(&int1, &PartitionConstraintValue::Int(1)));
+        assert!(!partition_literal_definitely_ne(&long1, &PartitionConstraintValue::Int(1)));
+        assert!(partition_literal_definitely_ne(
+            &bar,
+            &PartitionConstraintValue::Str("FOO".into())
+        ));
+        // type mismatch -> conservatively NOT provably different (keep the file)
+        assert!(!partition_literal_definitely_ne(&int1, &PartitionConstraintValue::Str("1".into())));
     }
 
     #[test]
