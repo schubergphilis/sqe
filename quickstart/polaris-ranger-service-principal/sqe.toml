@@ -28,10 +28,25 @@ spill_dir = "/tmp/sqe-spill"
 [auth]
 ssl_verification = false
 
+# (a) Service principal presents client_id/client_secret -> SQE runs the grant.
 [[auth.providers]]
 type = "client_credentials_passthrough"
 token_url = "http://keycloak:8080/realms/iceberg-ranger/protocol/openid-connect/token"
 roles_claim = "realm_access.roles"
+
+# (b) Client fetched its OWN token (ran client_credentials against Keycloak
+# itself) and presents it as a Bearer. SQE validates it via JWKS and forwards it.
+# This consumes the bearer_token credential, so it does not conflict with the
+# username/password provider above -- both serve the same listener. Works over
+# Flight SQL AND the Trino-compat HTTP path (both route through this chain).
+[[auth.providers]]
+type = "bearer_token"
+jwks_url = "http://keycloak:8080/realms/iceberg-ranger/protocol/openid-connect/certs"
+issuer = "http://keycloak:8080/realms/iceberg-ranger"
+audience = "account"
+user_claim = "preferred_username"
+roles_claim = "realm_access.roles"
+allow_insecure_jwks = true   # dev only: Keycloak JWKS over plain HTTP
 
 # ── Catalogs ────────────────────────────────────────────────────────────────
 [catalogs.sales_wh]
