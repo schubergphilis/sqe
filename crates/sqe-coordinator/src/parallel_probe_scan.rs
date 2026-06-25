@@ -14,8 +14,10 @@
 //! build is collected into one partition, but the right probe may have N
 //! partitions (shared build hash table, N probe threads). Star-schema fact
 //! tables (SSB `lineorder`, TPC-H `lineitem`) are always the probe side. So the
-//! safe, regression-free win is: parallelize ONLY scans on the probe (right)
-//! side of `CollectLeft` joins, never a build-side scan.
+//! safe, regression-free win is: parallelize any scan that is NOT on the build
+//! (left) side of a `CollectLeft` join -- the probe side of such joins, and
+//! join-free scans (which have no build side to coalesce). Build-side scans are
+//! never touched.
 //!
 //! The load-bearing invariant -- "never parallelize a build-side scan" -- is the
 //! q72 regression guard, and it is unit-tested directly via
@@ -270,6 +272,17 @@ mod tests {
 
         assert_eq!(leaves.len(), 1, "only the fact probe should be collected");
         assert!(Arc::ptr_eq(&leaves[0], &fact), "must be the fact table");
+    }
+
+    #[test]
+    fn join_free_scan_is_parallelizable() {
+        // A bare scan with no join above it has no build side to coalesce, so
+        // it is safe (and beneficial) to parallelize. Documented as intentional:
+        // the rule's guard excludes BUILD-side scans, not join-free ones.
+        let scan = leaf();
+        let leaves = collect_probe_side_leaves(&scan);
+        assert_eq!(leaves.len(), 1);
+        assert!(Arc::ptr_eq(&leaves[0], &scan));
     }
 
     #[test]
