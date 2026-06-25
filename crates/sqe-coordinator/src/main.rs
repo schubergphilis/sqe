@@ -13,9 +13,15 @@ use sqe_policy::grants::{polaris::PolarisGrantBackend, ranger::RangerGrantBacken
 // Trino adapter types
 use sqe_trino_compat::server::{NodeContext, TrinoAuthenticator, TrinoQueryExecutor};
 
+use sqe_coordinator::auth_session::identity_to_session;
+
 struct AuthenticatorAdapter {
-    authenticator: Arc<sqe_auth::Authenticator>,
-    bearer_provider: Option<Arc<dyn sqe_auth::AuthProvider>>,
+    /// The full auth provider chain built from `[[auth.providers]]` (falls back
+    /// to a single-provider wrapper around the legacy `Authenticator` when no
+    /// providers are configured). Both Basic auth and bearer tokens dispatch
+    /// through it, so the Trino-compat path sees exactly the same providers as
+    /// the Flight SQL handshake (including `client_credentials_passthrough`).
+    auth_chain: Arc<dyn sqe_auth::AuthProvider>,
 }
 
 #[async_trait::async_trait]
@@ -25,46 +31,44 @@ impl TrinoAuthenticator for AuthenticatorAdapter {
         username: &str,
         password: &str,
     ) -> Result<sqe_core::Session, sqe_core::SqeError> {
-        self.authenticator
-            .authenticate(username, password)
+        // Route Basic auth through the same chain as the Flight SQL handshake,
+        // so a service principal's client_id/client_secret reaches
+        // `client_credentials_passthrough` over Trino just as it does over
+        // Flight SQL. With no `[[auth.providers]]` configured the chain wraps
+        // the legacy `Authenticator`, so behaviour is unchanged for legacy setups.
+        let credentials = sqe_auth::FlightCredentials {
+            username: Some(username.to_string()),
+            password: Some(sqe_core::SecretString::new(password.to_string())),
+            ..Default::default()
+        };
+        let identity = self
+            .auth_chain
+            .authenticate(&credentials)
             .await
-            .map_err(|e| sqe_core::SqeError::Auth(e.to_string()))
+            .map_err(|e| sqe_core::SqeError::Auth(e.to_string()))?;
+        Ok(identity_to_session(identity, None))
     }
 
     async fn authenticate_bearer(
         &self,
         token: &str,
     ) -> Result<sqe_core::Session, sqe_core::SqeError> {
-        let provider = self.bearer_provider.as_ref().ok_or_else(|| {
-            sqe_core::SqeError::Auth(
-                "Bearer token authentication is not configured".to_string(),
-            )
-        })?;
-
         let credentials = sqe_auth::FlightCredentials {
             bearer_token: Some(sqe_core::SecretString::new(token.to_string())),
             ..Default::default()
         };
 
-        let identity = provider
+        let identity = self
+            .auth_chain
             .authenticate(&credentials)
             .await
             .map_err(|e| {
                 sqe_core::SqeError::Auth(format!("Bearer token validation failed: {e}"))
             })?;
 
-        // Convert Identity to Session: use the JWT itself as the catalog token
-        // (passthrough to Polaris), and the identity fields for user/roles.
-        let token_expiry = chrono::Utc::now() + chrono::Duration::hours(1);
-        Ok(sqe_core::Session::new(
-            identity.user_id,
-            identity
-                .catalog_token
-                .unwrap_or_else(|| sqe_core::SecretString::new(token.to_string())),
-            None,
-            token_expiry,
-            identity.roles,
-        ))
+        // Fall back to the raw JWT as the catalog token when the provider did
+        // not supply one (passthrough to Polaris).
+        Ok(identity_to_session(identity, Some(token)))
     }
 }
 
@@ -417,13 +421,6 @@ async fn async_main() -> anyhow::Result<()> {
         metrics.clone(),
     );
 
-    // Bearer auth chain for the Trino-compat HTTP path. Reuses the same
-    // chain instance the Flight SQL path uses (built above via
-    // `build_auth_chain` and stored in `auth_chain`) so both endpoints
-    // see identical provider behaviour.
-    let bearer_provider: Option<Arc<dyn sqe_auth::AuthProvider>> =
-        Some(Arc::clone(&auth_chain));
-
     // Construct OAuth2 external auth state from [auth.external] config (if present).
     let oauth2_state: Option<Arc<sqe_trino_compat::oauth2::OAuth2State>> =
         if let Some(ref ext) = config.auth.external {
@@ -461,8 +458,7 @@ async fn async_main() -> anyhow::Result<()> {
     // Start Trino-compat HTTP server
     if config.coordinator.trino_http_port > 0 {
         let auth_adapter = Arc::new(AuthenticatorAdapter {
-            authenticator: authenticator.clone(),
-            bearer_provider: bearer_provider.clone(),
+            auth_chain: Arc::clone(&auth_chain),
         });
         let handler_adapter = Arc::new(QueryHandlerAdapter {
             handler: query_handler.clone(),

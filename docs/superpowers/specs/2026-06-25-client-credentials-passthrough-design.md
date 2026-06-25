@@ -244,6 +244,29 @@ Per the project's after-completing-work checklist: README roadmap, nextsteps.md,
 and a short quickstart README/OVERVIEW explaining the SP flow and the
 single-protocol / SP-only-listener caveats.
 
+## Follow-on (2026-06-25b): service principals over Trino + dbt
+
+Extends the provider to the other two transports.
+
+- Trino-compat HTTP Basic auth previously called the legacy `Authenticator`
+  directly, bypassing `[[auth.providers]]`. Now both coordinator binaries route
+  Basic auth through the auth chain. CRITICAL: the deployed binary is
+  `sqe-server` (`src/bin/sqe_server.rs`, the Dockerfile ENTRYPOINT), not
+  `sqe-coordinator` (`src/main.rs`) -- both have their own `AuthenticatorAdapter`
+  and both were updated. A shared `identity_to_session` helper lives in
+  `crates/sqe-coordinator/src/auth_session.rs`. Backward compatible (empty
+  providers -> chain wraps the legacy Authenticator).
+- The quickstart `sqe.toml` adds a `bearer_token` provider next to the
+  passthrough provider (different credential fields, so they coexist on one
+  listener). `test.sh` proves allow/deny over Trino HTTP Basic auth and a
+  client-fetched bearer token. 10/10 on a live stack.
+- dbt-sqe (`adapters/dbt-sqe`) gains `method`/`client_id`/`client_secret`/`token`
+  profile fields. OAuth creds travel as Flight Basic auth (server runs the
+  grant); `token` sets the ADBC bearer header. Mapping isolated in a dbt-free
+  `auth.py` with 7 unit tests.
+- Not done (already exists, not demoed): the interactive Trino OAuth2 external
+  browser flow (`oauth2.rs`, `[auth.external]`).
+
 ## Shipped (2026-06-25) and where it deviates from the plan
 
 Both parts are implemented and validated end to end (test.sh 7/7 against a live
