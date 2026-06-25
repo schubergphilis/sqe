@@ -1252,7 +1252,34 @@ impl ExecutionPlan for IcebergScanExec {
                 }
             }
             let scan = sb.build().map_err(|e| DataFusionError::External(Box::new(e)))?;
-            let scan_result = scan.to_arrow_with_metrics().await.map_err(|e| DataFusionError::External(Box::new(e)))?;
+            // With >1 output partition, each partition must read ONLY its
+            // assigned files. `scan.to_arrow_with_metrics()` plans the WHOLE
+            // table, so calling it per partition would re-read every file in
+            // each partition and duplicate rows (issue #235). Plan once here and
+            // filter the task stream to this partition's `file_entries` (the
+            // round-robin slice above); intra-file split subtasks share the data
+            // file path, so a path filter keeps all row groups of an assigned
+            // file. At 1 partition the slice is the whole table, so the plain
+            // path stays unchanged.
+            let scan_result = if total_partitions > 1 {
+                let allowed: std::collections::HashSet<String> =
+                    file_entries.iter().map(|(p, _)| p.clone()).collect();
+                let tasks = scan
+                    .plan_files()
+                    .await
+                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                let filtered: iceberg::scan::FileScanTaskStream = Box::pin(
+                    tasks.try_filter(move |t| {
+                        futures::future::ready(allowed.contains(t.data_file_path()))
+                    }),
+                );
+                scan.read_tasks_to_arrow_with_metrics(filtered)
+                    .map_err(|e| DataFusionError::External(Box::new(e)))?
+            } else {
+                scan.to_arrow_with_metrics()
+                    .await
+                    .map_err(|e| DataFusionError::External(Box::new(e)))?
+            };
             let scan_metrics = scan_result.metrics().clone();
             let rows_decoded_inspect = rows_decoded.clone();
             let arrow_stream = scan_result
