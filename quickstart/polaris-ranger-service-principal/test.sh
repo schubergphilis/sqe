@@ -22,9 +22,53 @@ SP_ADMIN_SECRET="${SP_ADMIN_SECRET:-sp-admin-secret}"
 SP_READER_SECRET="${SP_READER_SECRET:-sp-reader-secret}"
 SP_DENIED_SECRET="${SP_DENIED_SECRET:-sp-denied-secret}"
 
+TRINO="http://localhost:${SQE_TRINO_PORT:-28080}"
+
 PASS=0; FAIL=0
 green() { printf '\033[32m%s\033[0m\n' "$*"; }
 red()   { printf '\033[31m%s\033[0m\n' "$*"; }
+
+b64() { printf '%s' "$1" | base64 | tr -d '\n'; }
+
+# Run a query over the Trino-compat HTTP path. $1 = full Authorization header
+# value (e.g. "Basic ..." or "Bearer ..."), $2 = X-Trino-User, $3 = SQL.
+# Prints DONE on success, or QUERYERROR/HTTPERROR/TIMEOUT with detail.
+trino_run() { # auth_header user sql
+  python3 - "$TRINO" "$1" "$2" "$3" <<'PY'
+import sys, json, time, urllib.request, urllib.error
+base, auth, user, sql = sys.argv[1:5]
+def get(url, data=None, method="GET"):
+    req = urllib.request.Request(url, data=(data.encode() if data else None), method=method,
+        headers={"Authorization": auth, "X-Trino-User": user, "Content-Type": "text/plain"})
+    return json.load(urllib.request.urlopen(req, timeout=15))
+try:
+    j = get(base + "/v1/statement", data=sql, method="POST")
+    for _ in range(80):
+        if j.get("error"):
+            print("QUERYERROR", json.dumps(j["error"])[:300]); sys.exit(0)
+        nu = j.get("nextUri")
+        if not nu:
+            print("DONE"); sys.exit(0)
+        time.sleep(0.25)
+        j = get(nu)
+    print("TIMEOUT")
+except urllib.error.HTTPError as e:
+    print("HTTPERROR", e.code, e.read()[:200].decode(errors="replace"))
+except Exception as e:
+    print("HTTPERROR 0", str(e)[:200])
+PY
+}
+
+assert_trino_allow() { # desc client_id secret sql
+  local out; out="$(trino_run "Basic $(b64 "$2:$3")" "$2" "$4")"
+  if echo "$out" | grep -q '^DONE'; then green "PASS  $1"; PASS=$((PASS+1));
+  else red "FAIL  $1"; echo "      $(echo "$out" | tr '\n' ' ' | cut -c1-200)"; FAIL=$((FAIL+1)); fi
+}
+assert_trino_deny() { # desc client_id secret sql
+  local out; out="$(trino_run "Basic $(b64 "$2:$3")" "$2" "$4")"
+  if echo "$out" | grep -qE 'QUERYERROR|HTTPERROR'; then green "PASS  $1 (denied)"; PASS=$((PASS+1));
+  else red "FAIL  $1 (expected denial)"; echo "      $(echo "$out" | tr '\n' ' ' | cut -c1-200)"; FAIL=$((FAIL+1)); fi
+}
 
 # Run SQL as a service principal: username = client_id, password = client_secret.
 # sqe-cli prints "Error: ..." on failure and still exits 0, so classify by text.
@@ -119,6 +163,26 @@ assert_deny "sp-reader INSERT orders (no write grant)" sp-reader "$SP_READER_SEC
 echo
 echo "== 5. A wrong client_secret is rejected at auth =="
 assert_rejected "sp-reader with WRONG secret" sp-reader "totally-wrong-secret" "SELECT 1"
+
+echo
+echo "== 6. Same service principal over the Trino HTTP path (Basic auth) =="
+# Proves Trino HTTP Basic auth now routes through the auth chain and reaches
+# client_credentials_passthrough, exactly like Flight SQL.
+assert_trino_allow "sp-reader SELECT orders over Trino HTTP"  sp-reader "$SP_READER_SECRET" "SELECT region FROM sales_wh.sales.orders LIMIT 1"
+assert_trino_deny  "sp-denied SELECT orders over Trino HTTP"  sp-denied "$SP_DENIED_SECRET" "SELECT region FROM sales_wh.sales.orders LIMIT 1"
+
+echo
+echo "== 7. Client-fetched bearer token over Trino HTTP =="
+# The client runs client_credentials against Keycloak itself, then presents the
+# JWT as a Bearer. SQE validates it via JWKS (bearer_token provider) and forwards.
+SP_READER_JWT="$(curl -s -X POST "$KC" -d grant_type=client_credentials -d client_id=sp-reader -d "client_secret=$SP_READER_SECRET" | python3 -c 'import sys,json;print(json.load(sys.stdin).get("access_token",""))' 2>/dev/null)"
+if [ -z "$SP_READER_JWT" ]; then
+  red "FAIL  could not mint sp-reader bearer token"; FAIL=$((FAIL+1))
+else
+  out="$(trino_run "Bearer $SP_READER_JWT" sp-reader "SELECT region FROM sales_wh.sales.orders LIMIT 1")"
+  if echo "$out" | grep -q '^DONE'; then green "PASS  sp-reader SELECT orders via Bearer (Trino HTTP)"; PASS=$((PASS+1));
+  else red "FAIL  sp-reader Bearer over Trino"; echo "      $(echo "$out" | tr '\n' ' ' | cut -c1-200)"; FAIL=$((FAIL+1)); fi
+fi
 
 echo
 echo "================ RESULT: ${PASS} passed, ${FAIL} failed ================"
