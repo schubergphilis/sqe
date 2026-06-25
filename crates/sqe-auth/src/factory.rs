@@ -16,6 +16,7 @@ use crate::aws_iam::{AwsIamProvider, AwsIamProviderConfig};
 use crate::bearer_token::{BearerTokenProvider, BearerTokenProviderConfig};
 use crate::chain::AuthChain;
 use crate::mtls::{MtlsProvider, MtlsProviderConfig};
+use crate::oidc_client_credentials::{OidcClientCredentialsConfig, OidcClientCredentialsProvider};
 use crate::oidc_provider::{OidcPasswordProvider, OidcPasswordProviderConfig};
 use crate::token_exchange::{TokenExchangeProvider, TokenExchangeConfig};
 use crate::provider::AuthProvider;
@@ -248,6 +249,31 @@ pub async fn build_auth_chain(config: &AuthConfig) -> sqe_core::Result<AuthChain
                             roles: roles.clone(),
                         },
                     ))
+                }
+                AuthProviderConfig::ClientCredentialsPassthrough {
+                    token_url,
+                    roles_claim,
+                    subject_claim,
+                    scope,
+                } => {
+                    info!(
+                        index = i,
+                        token_url = %token_url,
+                        "Adding OidcClientCredentialsProvider (per-connection passthrough) to chain"
+                    );
+                    let cc_config = OidcClientCredentialsConfig {
+                        token_url: token_url.clone(),
+                        roles_claim: roles_claim.clone(),
+                        subject_claim: subject_claim.clone(),
+                        scope: scope.clone(),
+                        accept_invalid_certs: config.should_skip_tls_verify(),
+                    };
+                    let provider = OidcClientCredentialsProvider::new(cc_config).map_err(|e| {
+                        sqe_core::SqeError::Config(format!(
+                            "Failed to create OidcClientCredentialsProvider: {e}"
+                        ))
+                    })?;
+                    Arc::new(provider)
                 }
             };
             providers.push(provider);
