@@ -92,7 +92,11 @@ pub const DEFAULT_SCAN_SPLIT_TARGET_SIZE: u64 = 32 * 1024 * 1024;
 /// been updated.
 pub const DEFAULT_TARGET_PARTITIONS: usize = 1;
 
-#[derive(Debug)]
+// Clone is derived so physical optimizer rules (e.g. the probe-side scan
+// parallelization rule, issue #235) can rebuild a scan node with a different
+// `target_partitions` from a shared reference; `with_target_partitions`
+// consumes `self`. All fields are cheap-to-clone (Arc / Copy / metadata).
+#[derive(Debug, Clone)]
 pub struct IcebergScanExec {
     table: Table,
     projected_schema: SchemaRef,
