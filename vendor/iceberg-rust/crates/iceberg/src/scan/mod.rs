@@ -534,6 +534,24 @@ impl TableScan {
     /// engine UI (e.g. DataFusion Comet's `bytes_scanned` ->
     /// Spark's `TaskMetrics.inputMetrics.setBytesRead()`).
     pub async fn to_arrow_with_metrics(&self) -> Result<crate::arrow::ScanResult> {
+        self.read_tasks_to_arrow_with_metrics(self.plan_files().await?)
+    }
+
+    /// Like [`to_arrow_with_metrics`] but reads a caller-supplied
+    /// [`FileScanTaskStream`] instead of planning all files itself.
+    ///
+    /// Engines that assign a DISJOINT subset of data files to each output
+    /// partition (SQE issue #235: parallel probe-side scan) plan once, slice
+    /// the tasks per partition, and call this so each partition reads only its
+    /// files. Reusing the scan's configured reader (concurrency, row-group /
+    /// row-selection filtering, split target size, dynamic predicate) keeps
+    /// per-file decode behavior identical to `to_arrow_with_metrics`; the
+    /// builder fields are private, which is why this lives here rather than in
+    /// the calling engine.
+    pub fn read_tasks_to_arrow_with_metrics(
+        &self,
+        tasks: FileScanTaskStream,
+    ) -> Result<crate::arrow::ScanResult> {
         let mut arrow_reader_builder = ArrowReaderBuilder::new(self.file_io.clone())
             .with_data_file_concurrency_limit(self.concurrency_limit_data_files)
             .with_row_group_filtering_enabled(self.row_group_filtering_enabled)
@@ -549,7 +567,7 @@ impl TableScan {
                 arrow_reader_builder.with_dynamic_predicate(dynamic_predicate);
         }
 
-        arrow_reader_builder.build().read(self.plan_files().await?)
+        arrow_reader_builder.build().read(tasks)
     }
 
     /// Returns a reference to the column names of the table scan.
