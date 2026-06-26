@@ -286,6 +286,10 @@ Full archive in [`docs/site/blog/`](docs/site/blog/).
 | `sqe-metrics` | Prometheus, OpenTelemetry, audit logger |
 | `sqe-lineage` | OpenLineage 2-0-2 emitter; column-level lineage |
 | `sqe-trino-compat` | Trino wire protocol |
+| `sqe-trino-functions` | Trino-compatible scalar UDFs for DataFusion |
+| `sqe-quack-wire` | Pure-Rust port of DuckDB's BinarySerializer (Quack RPC) |
+| `sqe-quack-server` | Quack RPC server; accepts DuckDB clients over HTTP |
+| `sqe-quack-client` | Client side of the DuckDB Quack RPC |
 | `sqe-bench` | Benchmark suite (7 suites, 222 queries) |
 
 ## Tech stack
