@@ -6643,6 +6643,7 @@ dependencies = [
  "sqe-core",
  "tokio",
  "tracing",
+ "url",
  "uuid",
 ]
 
