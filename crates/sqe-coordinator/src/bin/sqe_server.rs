@@ -513,6 +513,12 @@ async fn flip_ready_and_drain(ready: &AtomicBool, drain_secs: u64) {
 // ── Trino adapters ─────────────────────────────────────────────
 struct AuthenticatorAdapter {
     authenticator: Arc<sqe_auth::Authenticator>,
+    /// The full auth provider chain (built from `[[auth.providers]]`). When set
+    /// (always, in production) BOTH Basic auth and bearer tokens dispatch
+    /// through it, so the Trino-compat path sees the same providers as the
+    /// Flight SQL handshake, including `client_credentials_passthrough`. When
+    /// `None` (some unit-test fixtures), Basic auth falls back to the legacy
+    /// `Authenticator`.
     bearer_provider: Option<Arc<dyn sqe_auth::AuthProvider>>,
 }
 
@@ -523,6 +529,22 @@ impl TrinoAuthenticator for AuthenticatorAdapter {
         username: &str,
         password: &str,
     ) -> Result<sqe_core::Session, sqe_core::SqeError> {
+        // Route Basic auth through the chain so a service principal's
+        // client_id/client_secret reaches `client_credentials_passthrough` over
+        // Trino just as it does over Flight SQL. Fall back to the legacy
+        // authenticator only when no chain is wired (test fixtures).
+        if let Some(provider) = self.bearer_provider.as_ref() {
+            let credentials = sqe_auth::FlightCredentials {
+                username: Some(username.to_string()),
+                password: Some(sqe_core::SecretString::new(password.to_string())),
+                ..Default::default()
+            };
+            let identity = provider
+                .authenticate(&credentials)
+                .await
+                .map_err(|e| sqe_core::SqeError::Auth(e.to_string()))?;
+            return Ok(sqe_coordinator::auth_session::identity_to_session(identity, None));
+        }
         self.authenticator
             .authenticate(username, password)
             .await
@@ -547,18 +569,9 @@ impl TrinoAuthenticator for AuthenticatorAdapter {
             .await
             .map_err(|e| sqe_core::SqeError::Auth(format!("Bearer token validation failed: {e}")))?;
 
-        // Convert Identity to Session: use the JWT itself as the catalog token
-        // (passthrough to Polaris), and the identity fields for user/roles.
-        let token_expiry = chrono::Utc::now() + chrono::Duration::hours(1);
-        Ok(sqe_core::Session::new(
-            identity.user_id,
-            identity
-                .catalog_token
-                .unwrap_or_else(|| sqe_core::SecretString::new(token.to_string())),
-            None,
-            token_expiry,
-            identity.roles,
-        ))
+        // Fall back to the raw JWT as the catalog token when the provider did
+        // not supply one (passthrough to Polaris).
+        Ok(sqe_coordinator::auth_session::identity_to_session(identity, Some(token)))
     }
 }
 
