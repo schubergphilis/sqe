@@ -836,6 +836,23 @@ impl QueryHandler {
                         // dbt and most BI clients use this query for schema
                         // inspection and only need the first two columns.
                         self.handle_show_columns(session, show_options).await
+                    } else if let sqlparser::ast::Statement::ExplainTable {
+                        describe_alias,
+                        table_name,
+                        ..
+                    } = stmt.as_ref()
+                    {
+                        // DESCRIBE / DESC <table> -> same column metadata as
+                        // SHOW COLUMNS. EXPLAIN TABLE (a different alias) is not
+                        // a column-listing request, so it is not redirected.
+                        use sqlparser::ast::DescribeAlias;
+                        if matches!(describe_alias, DescribeAlias::Describe | DescribeAlias::Desc) {
+                            self.columns_for_table(session, &table_name.to_string()).await
+                        } else {
+                            Err(SqeError::NotImplemented(format!(
+                                "Utility statement not supported: {stmt}"
+                            )))
+                        }
                     } else {
                         Err(SqeError::NotImplemented(format!(
                             "Utility statement not supported: {stmt}"
@@ -3047,7 +3064,19 @@ impl QueryHandler {
 
         // Use only the bare table name for the WHERE filter; information_schema
         // queries collapse to the leaf table name.
-        let bare_name = table_name.split('.').next_back().unwrap_or(&table_name);
+        self.columns_for_table(session, &table_name).await
+    }
+
+    /// Column metadata for a table via `information_schema.columns`, shared by
+    /// `SHOW COLUMNS` and `DESCRIBE <table>`.
+    async fn columns_for_table(
+        &self,
+        session: &Session,
+        table_name: &str,
+    ) -> sqe_core::Result<Vec<RecordBatch>> {
+        // Use only the bare table name for the WHERE filter; information_schema
+        // queries collapse to the leaf table name.
+        let bare_name = table_name.split('.').next_back().unwrap_or(table_name);
         let col_sql = format!(
             "SELECT column_name, data_type, is_nullable \
              FROM information_schema.columns \
@@ -3058,12 +3087,12 @@ impl QueryHandler {
         let (ctx, _) = self.create_session_context(session).await?;
         let df = ctx.sql(&col_sql).await.map_err(|e| {
             SqeError::Execution(format!(
-                "SHOW COLUMNS failed to query information_schema: {e}"
+                "failed to query information_schema.columns: {e}"
             ))
         })?;
         df.collect().await.map_err(|e| {
             SqeError::Execution(format!(
-                "SHOW COLUMNS failed to collect column metadata: {e}"
+                "failed to collect column metadata: {e}"
             ))
         })
     }
