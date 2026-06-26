@@ -47,6 +47,11 @@ pub fn qualify_information_schema(sql: &str, session_catalog: &str) -> String {
     if session_catalog.is_empty() {
         return sql.to_string();
     }
+    // SECURITY: the session catalog is attacker-controllable (the
+    // X-Trino-Catalog header). Escape it as a SQL quoted identifier by doubling
+    // any embedded double-quote, so a value like `x"; DROP ...` cannot break out
+    // of the `"..."` and inject SQL into the rewritten statement.
+    let escaped_catalog = session_catalog.replace('"', "\"\"");
     const NEEDLE: &str = "information_schema";
     let lower = sql.to_ascii_lowercase();
     let mut out = String::with_capacity(sql.len() + session_catalog.len() + 4);
@@ -63,7 +68,7 @@ pub fn qualify_information_schema(sql: &str, session_catalog: &str) -> String {
             let followed_by_dot = next == Some('.');
             if !already_qualified && !part_of_ident && followed_by_dot {
                 out.push('"');
-                out.push_str(session_catalog);
+                out.push_str(&escaped_catalog);
                 out.push_str("\".");
                 out.push_str(&sql[i..after]); // preserve original case
                 i = after;
@@ -380,6 +385,23 @@ mod tests {
     fn case_insensitive_preserves_original_case() {
         let out = qualify_information_schema("FROM INFORMATION_SCHEMA.TABLES", "ws");
         assert_eq!(out, "FROM \"ws\".INFORMATION_SCHEMA.TABLES");
+    }
+
+    #[test]
+    fn malicious_session_catalog_cannot_break_out_of_quoted_identifier() {
+        // The X-Trino-Catalog header is attacker-controlled. A double-quote in
+        // the value must be doubled so it cannot close the quoted identifier
+        // and inject SQL into the rewritten statement.
+        let out = qualify_information_schema(
+            "SELECT 1 FROM information_schema.tables",
+            "evil\".oops--",
+        );
+        assert_eq!(
+            out,
+            "SELECT 1 FROM \"evil\"\".oops--\".information_schema.tables"
+        );
+        // The raw (un-doubled) breakout sequence must not appear.
+        assert!(!out.contains("evil\".oops"), "breakout present: {out}");
     }
 
     #[test]
