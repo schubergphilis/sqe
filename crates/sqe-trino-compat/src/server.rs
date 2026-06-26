@@ -783,6 +783,15 @@ async fn submit_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
             return (StatusCode::OK, Json(response)).into_response();
         }
     };
+    // #2: qualify an unqualified `information_schema` reference with the session
+    // catalog so it resolves to (and, under polaris-auto, discovers) that
+    // catalog instead of the engine default. Only metadata queries are touched.
+    let effective_sql = match session.default_catalog.as_deref() {
+        Some(cat) if info_schema_compat::is_metadata_query(&effective_sql) => {
+            info_schema_compat::qualify_information_schema(&effective_sql, cat)
+        }
+        _ => effective_sql,
+    };
     let exec_sql = effective_sql.as_str();
 
     match state.query_handler.execute(&session, exec_sql).await {
