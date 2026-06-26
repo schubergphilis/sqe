@@ -135,3 +135,40 @@ async fn information_schema_reveals_provider_and_catalog() {
         .execute(&session, &format!("DROP TABLE IF EXISTS {fq}"), None)
         .await;
 }
+
+// #4: DESCRIBE <table> must be supported (aliased to SHOW COLUMNS) instead of
+// failing with "Statement type not supported". Returns the same projection.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn describe_table_aliases_to_show_columns() {
+    let (session, handler) = crate::common::setup_handler().await;
+    let ns = "default";
+    let name = "describe_probe";
+    let fq = format!("{ns}.{name}");
+
+    let _ = handler.execute(&session, &format!("DROP TABLE IF EXISTS {fq}"), None).await;
+    handler
+        .execute(&session, &format!("CREATE TABLE {fq} (a INT, b VARCHAR)"), None)
+        .await
+        .expect("create table");
+
+    let rows = handler
+        .execute(&session, &format!("DESCRIBE {fq}"), None)
+        .await
+        .expect("DESCRIBE must be supported (aliased to SHOW COLUMNS)");
+
+    assert!(!rows.is_empty());
+    let schema = rows[0].schema();
+    assert_eq!(schema.field(0).name(), "column_name");
+    assert_eq!(schema.field(1).name(), "data_type");
+
+    let col = rows[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("column_name is Utf8");
+    let names: Vec<&str> = (0..col.len()).map(|i| col.value(i)).collect();
+    assert!(names.contains(&"a") && names.contains(&"b"), "got columns: {names:?}");
+
+    let _ = handler.execute(&session, &format!("DROP TABLE IF EXISTS {fq}"), None).await;
+}

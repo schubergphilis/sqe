@@ -40,20 +40,39 @@ This collides with the "keep it standard with DataFusion" steer: the standard bu
 exactly what produces Arrow names + global merge + inert policy. The PR-A direction is now a
 maintainer decision (see fork below).
 
-### PR-A design fork (maintainer decision)
+### PR-A decision: compat layer on top of DataFusion (chosen)
 
-- **Choice X -- un-shadow (revive the custom provider).** Disable the built-in for
-  Iceberg catalogs (or otherwise let `SqeCatalogProvider`'s `information_schema` win), so
-  #99's SQL type mapping AND the policy filtering come alive, and the model becomes
-  per-catalog (Trino-correct). Fixes #2 + #3 properly and closes the security gap. Cost:
-  not "DataFusion-standard"; the custom provider must cover every info_schema table BI tools
-  query and every consumer (dbt reflection, `audit_e2e_test`, Flight SQL GetTables/GetColumns,
-  system catalog visibility). Larger, higher blast radius -- inventory consumers first.
-- **Choice Y -- keep the built-in (standard), translate at the Trino boundary.** Map Arrow
-  type strings to Trino names only where SQE controls the path (SHOW COLUMNS / DESCRIBE
-  rewrites). Cost: cannot satisfy a stock `SELECT ... FROM information_schema.columns` from a
-  BI tool (those still return Arrow names unless every result set is post-processed --
-  fragile), does not fix #2's catalog merge, leaves policy filtering inert. Partial fix.
+Keep DataFusion's built-in `information_schema` (standard; survives without live Iceberg
+connectivity) and add a Trino-compatibility layer that normalizes metadata results on the
+**Trino HTTP boundary only**. Implemented in `sqe-trino-compat::info_schema_compat`:
+
+- **Type names (#3)**: `arrow_display_to_trino_type` maps the built-in's Arrow display
+  strings (ground-truthed from the live stack: `Int64`, `Utf8`, `Decimal128(10, 2)`,
+  `Date32`, `Time64(µs)`, `Timestamp(µs)`, `Timestamp(µs, "+00:00")`, `LargeBinary`, ...)
+  to Trino names. The `data_type` column of metadata results is rewritten.
+- **Catalog scoping (#2)**: scope the listing to the session catalog (`X-Trino-Catalog`)
+  when set; otherwise drop the engine-internal `system`/`datafusion` catalogs so BI tools
+  don't see them.
+- **Gating**: applied only when `is_metadata_query(sql)` (references `information_schema`,
+  or is `SHOW COLUMNS` / `DESCRIBE`), at the `batches_to_trino` call site in `submit_query`.
+- **DESCRIBE (#4)**: classified as Utility and aliased to the shared `columns_for_table`
+  (same as SHOW COLUMNS) in the coordinator, so it flows through the same path and inherits
+  the type translation.
+
+**Known limitations (documented, accepted for this pass):**
+- Covers the **Trino HTTP path only**. Flight SQL `DoGet` metadata queries (e.g. dbt-sqe's
+  reflection over ADBC) still return Arrow names. Fixing those would require reviving the
+  custom provider (the rejected "un-shadow" option) -- tracked separately.
+- Type translation matches DataFusion's Arrow display strings, so a DataFusion upgrade that
+  changes that rendering needs the mapper updated. The live discriminator test guards this.
+- Detection is by SQL shape + a `data_type` / `table_catalog` column; a metadata query that
+  aliases `data_type` to another name is not translated. BI tools use the standard shapes.
+- Catalog scoping filters by exact session-catalog match; an explicitly cross-catalog
+  qualified `other_cat.information_schema...` while a different session catalog is set would
+  be over-filtered. BI reflection does not do this.
+
+The deeper finding -- that the custom provider's #99 type mapping and `information_schema`
+policy filtering are inert behind the built-in -- remains open as a security follow-up.
 
 ## Decomposition: two themed PRs
 
