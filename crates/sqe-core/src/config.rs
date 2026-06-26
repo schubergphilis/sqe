@@ -840,6 +840,29 @@ pub enum AuthProviderConfig {
         /// OAuth2 client_secret.
         client_secret: String,
     },
+    /// Per-connection OAuth2 `client_credentials` passthrough. The end-user
+    /// client presents its OWN `client_id`/`client_secret` on the connection
+    /// (Basic auth: username = client_id, password = client_secret); SQE runs
+    /// the grant per connection and forwards the resulting token to the catalog.
+    /// No credentials live in config: that is the difference from
+    /// `ClientCredentials`. Because it consumes username/password it cannot
+    /// share a listener with `OidcPassword`; deploy it as the sole
+    /// username/password provider (service-principal-only access).
+    ClientCredentialsPassthrough {
+        /// Full OAuth2 token endpoint URL.
+        token_url: String,
+        /// Dot-separated JSON path to the roles array in the JWT payload.
+        /// Default: `"realm_access.roles"`.
+        #[serde(default = "default_roles_claim")]
+        roles_claim: String,
+        /// JWT claim for the subject identifier (`sub`). Default: `"sub"`.
+        #[serde(default = "default_user_claim")]
+        subject_claim: String,
+        /// Optional OAuth `scope`, sent only when set. No Polaris-specific
+        /// default.
+        #[serde(default)]
+        scope: Option<String>,
+    },
     /// OAuth2 Token Exchange (RFC 8693) — exchanges an incoming credential for a
     /// user-scoped JWT via an OIDC token endpoint. Catch-all; place last in chain.
     TokenExchange {
@@ -1004,6 +1027,9 @@ impl std::fmt::Debug for AuthProviderConfig {
                     AuthProviderConfig::ApiKey { .. } => "ApiKey",
                     AuthProviderConfig::Mtls { .. } => "Mtls",
                     AuthProviderConfig::Anonymous { .. } => "Anonymous",
+                    AuthProviderConfig::ClientCredentialsPassthrough { .. } => {
+                        "ClientCredentialsPassthrough"
+                    }
                     AuthProviderConfig::BearerPassthrough { .. } => "BearerPassthrough",
                     // The three secret-bearing variants are handled above.
                     _ => "AuthProviderConfig",
@@ -3317,6 +3343,7 @@ impl SqeConfig {
                 | AuthProviderConfig::ApiKey { .. }
                 | AuthProviderConfig::Mtls { .. }
                 | AuthProviderConfig::Anonymous { .. }
+                | AuthProviderConfig::ClientCredentialsPassthrough { .. }
                 | AuthProviderConfig::BearerPassthrough { .. } => {}
             }
         }
@@ -4805,6 +4832,78 @@ type = "aws"
             }
             other => panic!("Expected ClientCredentials, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_parse_client_credentials_passthrough_provider_defaults() {
+        // Only token_url is required; the rest default. Crucially, no
+        // client_id / client_secret fields exist (they arrive per connection).
+        let toml_str = r#"
+            type = "client_credentials_passthrough"
+            token_url = "http://keycloak:8080/realms/iceberg-sp/protocol/openid-connect/token"
+        "#;
+
+        let config: AuthProviderConfig = toml::from_str(toml_str).unwrap();
+        match config {
+            AuthProviderConfig::ClientCredentialsPassthrough {
+                token_url,
+                roles_claim,
+                subject_claim,
+                scope,
+            } => {
+                assert_eq!(
+                    token_url,
+                    "http://keycloak:8080/realms/iceberg-sp/protocol/openid-connect/token"
+                );
+                assert_eq!(roles_claim, "realm_access.roles");
+                assert_eq!(subject_claim, "sub");
+                assert!(scope.is_none());
+            }
+            other => panic!("Expected ClientCredentialsPassthrough, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_client_credentials_passthrough_provider_explicit() {
+        let toml_str = r#"
+            type = "client_credentials_passthrough"
+            token_url = "http://idp/token"
+            roles_claim = "groups"
+            subject_claim = "client_id"
+            scope = "catalog"
+        "#;
+
+        let config: AuthProviderConfig = toml::from_str(toml_str).unwrap();
+        match config {
+            AuthProviderConfig::ClientCredentialsPassthrough {
+                roles_claim,
+                subject_claim,
+                scope,
+                ..
+            } => {
+                assert_eq!(roles_claim, "groups");
+                assert_eq!(subject_claim, "client_id");
+                assert_eq!(scope.as_deref(), Some("catalog"));
+            }
+            other => panic!("Expected ClientCredentialsPassthrough, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn client_credentials_passthrough_debug_names_variant() {
+        // The variant holds no secret, so it falls through to the name-only
+        // summary. Assert the name is correct (not the generic fallback).
+        let cfg = AuthProviderConfig::ClientCredentialsPassthrough {
+            token_url: "http://idp/token".to_string(),
+            roles_claim: "realm_access.roles".to_string(),
+            subject_claim: "sub".to_string(),
+            scope: None,
+        };
+        let dbg = format!("{cfg:?}");
+        assert!(
+            dbg.contains("ClientCredentialsPassthrough"),
+            "debug should name the variant: {dbg}"
+        );
     }
 
     #[test]
