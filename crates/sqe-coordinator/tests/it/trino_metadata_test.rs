@@ -172,3 +172,20 @@ async fn describe_table_aliases_to_show_columns() {
 
     let _ = handler.execute(&session, &format!("DROP TABLE IF EXISTS {fq}"), None).await;
 }
+
+// Security guard: a table name containing a single quote must be escaped into
+// the information_schema query (SHOW COLUMNS / DESCRIBE), not break it. Without
+// escaping, `WHERE table_name = 'weird'name'` is a SQL error (or injection);
+// with escaping it is a valid query that simply matches no table.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn describe_with_quote_in_name_is_escaped_not_injected() {
+    let (session, handler) = crate::common::setup_handler().await;
+    let r = handler
+        .execute(&session, "DESCRIBE \"weird'name\"", None)
+        .await;
+    assert!(
+        r.is_ok(),
+        "escaped name must produce valid SQL (no injection/parse error), got: {r:?}"
+    );
+}

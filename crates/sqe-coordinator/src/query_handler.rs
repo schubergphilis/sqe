@@ -3075,8 +3075,11 @@ impl QueryHandler {
         table_name: &str,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         // Use only the bare table name for the WHERE filter; information_schema
-        // queries collapse to the leaf table name.
+        // queries collapse to the leaf table name. The name is client-supplied
+        // (SHOW COLUMNS / DESCRIBE), so escape it as a SQL string literal
+        // (double single-quotes) to prevent injection into this query.
         let bare_name = table_name.split('.').next_back().unwrap_or(table_name);
+        let bare_name = bare_name.replace('\'', "''");
         let col_sql = format!(
             "SELECT column_name, data_type, is_nullable \
              FROM information_schema.columns \
