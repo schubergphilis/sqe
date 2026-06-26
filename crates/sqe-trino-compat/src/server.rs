@@ -16,6 +16,7 @@ use uuid::Uuid;
 use sqe_core::Session;
 use sqe_core::config::SecurityConfig;
 
+use crate::info_schema_compat;
 use crate::prepared;
 use crate::protocol::{
     self, NodeVersion, ServerInfo, TrinoColumn, TrinoError, TrinoResponse, TrinoStats,
@@ -772,6 +773,18 @@ async fn submit_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
             } else {
                 None
             };
+            // Trino-normalize information_schema / SHOW COLUMNS / DESCRIBE
+            // results: translate Arrow type names to Trino names and scope the
+            // catalog listing to the session catalog. Other queries pass
+            // through untouched.
+            let batches = if info_schema_compat::is_metadata_query(exec_sql) {
+                info_schema_compat::apply_info_schema_compat(
+                    batches,
+                    session.default_catalog.as_deref(),
+                )
+            } else {
+                batches
+            };
             let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
             let (columns, data) = protocol::batches_to_trino(&batches);
             let pages = paginate_rows(data, state.page_size);
@@ -1226,6 +1239,81 @@ mod tests {
         let seen = seen.lock().unwrap();
         assert_eq!(seen.len(), 1, "executor should run exactly once");
         assert_eq!(seen[0], "SELECT * FROM t WHERE a = 5");
+    }
+
+    #[tokio::test]
+    async fn submit_metadata_query_translates_types_and_scopes_catalog() {
+        // Executor returns an information_schema.columns-shaped batch with Arrow
+        // type names and a foreign (system) catalog row -- exactly what the
+        // built-in information_schema produces.
+        struct InfoSchemaQuery;
+        #[async_trait::async_trait]
+        impl TrinoQueryExecutor for InfoSchemaQuery {
+            async fn execute(
+                &self,
+                _: &Session,
+                _: &str,
+            ) -> Result<Vec<arrow_array::RecordBatch>, sqe_core::SqeError> {
+                use arrow_array::StringArray;
+                use arrow_schema::{DataType, Field, Schema};
+                let schema = Arc::new(Schema::new(vec![
+                    Field::new("table_catalog", DataType::Utf8, false),
+                    Field::new("column_name", DataType::Utf8, false),
+                    Field::new("data_type", DataType::Utf8, false),
+                ]));
+                let batch = arrow_array::RecordBatch::try_new(
+                    schema,
+                    vec![
+                        Arc::new(StringArray::from(vec!["iceberg", "system"])),
+                        Arc::new(StringArray::from(vec!["a", "b"])),
+                        Arc::new(StringArray::from(vec!["Int64", "Utf8"])),
+                    ],
+                )
+                .unwrap();
+                Ok(vec![batch])
+            }
+        }
+
+        let state = Arc::new(TrinoState::<MockAuthOk, InfoSchemaQuery> {
+            authenticator: Arc::new(MockAuthOk),
+            query_handler: Arc::new(InfoSchemaQuery),
+            results: build_result_cache(),
+            node: NodeContext {
+                version: "0.1.0".to_string(),
+                ready: Arc::new(AtomicBool::new(true)),
+                started_at: Instant::now(),
+            },
+            page_size: DEFAULT_PAGE_SIZE,
+            port: 8080,
+            oauth2: None,
+            security: SecurityConfig::default(),
+            auth_rate_limiter: None,
+            expose_version: true,
+        });
+
+        let mut headers = basic_auth_header("alice", "pw");
+        headers.insert("x-trino-catalog", "iceberg".parse().unwrap());
+
+        let resp = submit_query::<MockAuthOk, InfoSchemaQuery>(
+            State(state),
+            test_peer(),
+            headers,
+            "SELECT table_catalog, column_name, data_type FROM information_schema.columns"
+                .to_string(),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let tr: TrinoResponse = serde_json::from_slice(&body).unwrap();
+        let data = tr.data.expect("data rows");
+
+        // The `system` row is scoped out (session catalog = iceberg), and the
+        // Arrow `Int64` is translated to Trino `bigint`.
+        assert_eq!(data.len(), 1, "only the iceberg-catalog row should remain");
+        assert_eq!(data[0][0], serde_json::json!("iceberg"));
+        assert_eq!(data[0][2], serde_json::json!("bigint"));
     }
 
     #[tokio::test]
