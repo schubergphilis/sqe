@@ -85,6 +85,20 @@ pub enum SqeError {
     #[error("S3 throttled: {0}")]
     S3Throttled(String),
 
+    /// An error that preserves its underlying cause (source chain) while
+    /// keeping a structured [`SqeErrorCode`] and a user-facing message. Build
+    /// it via the `*_src` constructors at I/O boundaries (catalog/S3/auth/HTTP/
+    /// parse) so debugging keeps the original error instead of flattening it
+    /// into a string. The legacy `String` variants stay for un-migrated call
+    /// sites. (#268)
+    #[error("{message}")]
+    Sourced {
+        code: SqeErrorCode,
+        message: String,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync + 'static>,
+    },
+
     #[error(transparent)]
     Internal(#[from] anyhow::Error),
 }
@@ -98,6 +112,68 @@ fn body_for_display(body: &str) -> String {
 }
 
 impl SqeError {
+    /// Build a source-preserving error with an explicit [`SqeErrorCode`]. The
+    /// underlying cause is kept reachable via [`std::error::Error::source`].
+    pub fn sourced(
+        code: SqeErrorCode,
+        message: impl Into<String>,
+        source: impl Into<Box<dyn std::error::Error + Send + Sync + 'static>>,
+    ) -> Self {
+        SqeError::Sourced {
+            code,
+            message: message.into(),
+            source: source.into(),
+        }
+    }
+
+    /// Catalog boundary error that keeps its cause. The code is classified from
+    /// the message exactly like [`SqeError::Catalog`], so this is a drop-in
+    /// upgrade that additionally preserves the source chain. (#268)
+    pub fn catalog_src(
+        message: impl Into<String>,
+        source: impl std::error::Error + Send + Sync + 'static,
+    ) -> Self {
+        let message = message.into();
+        let code = classify_catalog_error(&message);
+        SqeError::Sourced { code, message, source: Box::new(source) }
+    }
+
+    /// Execution boundary error that keeps its cause; classified like
+    /// [`SqeError::Execution`]. (#268)
+    pub fn execution_src(
+        message: impl Into<String>,
+        source: impl std::error::Error + Send + Sync + 'static,
+    ) -> Self {
+        let message = message.into();
+        let code = classify_execution_error(&message);
+        SqeError::Sourced { code, message, source: Box::new(source) }
+    }
+
+    /// Auth boundary error that keeps its cause (`AuthenticationFailed`). (#268)
+    pub fn auth_src(
+        message: impl Into<String>,
+        source: impl std::error::Error + Send + Sync + 'static,
+    ) -> Self {
+        SqeError::Sourced {
+            code: SqeErrorCode::AuthenticationFailed,
+            message: message.into(),
+            source: Box::new(source),
+        }
+    }
+
+    /// Config boundary error that keeps its cause (`InternalError`; detail is
+    /// hidden from clients like [`SqeError::Config`]). (#268)
+    pub fn config_src(
+        message: impl Into<String>,
+        source: impl std::error::Error + Send + Sync + 'static,
+    ) -> Self {
+        SqeError::Sourced {
+            code: SqeErrorCode::InternalError,
+            message: message.into(),
+            source: Box::new(source),
+        }
+    }
+
     /// Return a sanitised message safe for sending to clients.
     ///
     /// Routing by the error *variant*, not the error-code classification:
@@ -138,6 +214,15 @@ impl SqeError {
             SqeError::Config(_) | SqeError::Internal(_) => {
                 self.error_code().generic_message().to_string()
             }
+            // Boundary errors carry useful catalog/exec/auth detail; only the
+            // InternalError code (e.g. config_src) hides its message.
+            SqeError::Sourced { code, message, .. } => {
+                if *code == SqeErrorCode::InternalError {
+                    code.generic_message().to_string()
+                } else {
+                    clean_error_message(message)
+                }
+            }
         }
     }
 
@@ -147,6 +232,10 @@ impl SqeError {
         match self {
             SqeError::Catalog(msg) => msg.contains("HTTP 404"),
             SqeError::CatalogHttp { status, .. } => *status == 404,
+            SqeError::Sourced { code, .. } => matches!(
+                code,
+                SqeErrorCode::TableNotFound | SqeErrorCode::ViewNotFound
+            ),
             _ => false,
         }
     }
@@ -188,6 +277,7 @@ impl SqeError {
             SqeError::S3Throttled(_) => SqeErrorCode::ResourceExhausted,
             SqeError::Catalog(msg) => classify_catalog_error(msg),
             SqeError::Execution(msg) => classify_execution_error(msg),
+            SqeError::Sourced { code, .. } => *code,
         }
     }
 }
@@ -611,6 +701,70 @@ fn regex_strip_type_sig(msg: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---------------------------------------------------------------------------
+    // #268: source-preserving errors (Sourced variant + *_src constructors)
+    // ---------------------------------------------------------------------------
+
+    #[derive(Debug)]
+    struct DummyCause(&'static str);
+    impl std::fmt::Display for DummyCause {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "dummy cause: {}", self.0)
+        }
+    }
+    impl std::error::Error for DummyCause {}
+
+    #[test]
+    fn sourced_preserves_source_chain() {
+        use std::error::Error as _;
+        let err = SqeError::sourced(
+            SqeErrorCode::StorageError,
+            "write failed",
+            DummyCause("disk full"),
+        );
+        let src = err.source().expect("source must be set");
+        assert!(src.to_string().contains("disk full"));
+        assert_eq!(err.error_code(), SqeErrorCode::StorageError);
+        assert_eq!(err.to_string(), "write failed");
+    }
+
+    #[test]
+    fn catalog_src_classifies_code_like_catalog_variant() {
+        use std::error::Error as _;
+        // Drop-in upgrade: same code classification as Catalog(String).
+        let msg = "load table failed: HTTP 404 Not Found";
+        let legacy = SqeError::Catalog(msg.to_string());
+        let sourced = SqeError::catalog_src(msg, DummyCause("rest 404"));
+        assert_eq!(sourced.error_code(), legacy.error_code());
+        assert!(sourced.source().is_some());
+    }
+
+    #[test]
+    fn execution_src_classifies_code_like_execution_variant() {
+        let msg = "scan failed: connection reset";
+        let legacy = SqeError::Execution(msg.to_string());
+        let sourced = SqeError::execution_src(msg, DummyCause("io"));
+        assert_eq!(sourced.error_code(), legacy.error_code());
+    }
+
+    #[test]
+    fn auth_src_is_authentication_failed() {
+        let err = SqeError::auth_src("token rejected", DummyCause("401"));
+        assert_eq!(err.error_code(), SqeErrorCode::AuthenticationFailed);
+    }
+
+    #[test]
+    fn sourced_client_message_shows_user_detail_hides_internal() {
+        let user = SqeError::sourced(
+            SqeErrorCode::TableNotFound,
+            "no such table: t",
+            DummyCause("x"),
+        );
+        assert!(user.client_message().contains("no such table"));
+        let internal = SqeError::config_src("secret path /etc/x failed", DummyCause("y"));
+        assert!(!internal.client_message().contains("/etc/x"));
+    }
 
     // ---------------------------------------------------------------------------
     // Existing tests (updated where client_message behaviour changed)
