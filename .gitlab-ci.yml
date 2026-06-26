@@ -13,10 +13,18 @@ stages:
   - discover
   - trigger
   - build
+  - release
 
 variables:
   BUILD_ENGINE: "kaniko"
   SECRET_DETECTION_ENABLED: 'true'
+  # Publish images to the Harbor registry via the shared `robot$vpf-ci-pusher`
+  # credentials, inherited from the `vpf-data-ai` group CI/CD variables
+  # (REGISTRY_USERNAME / REGISTRY_PASSWORD). The .kaniko-build template prefers
+  # these over the GitLab project registry whenever REGISTRY_URL is set, and
+  # builds `${REGISTRY_URL}/${REGISTRY_PROJECT}/${IMAGE_NAME}`.
+  REGISTRY_URL: "repo.sovereign-data.org"
+  REGISTRY_PROJECT: "chameleon"
 
 secret_detection:
   stage: secret-detection
@@ -402,7 +410,9 @@ build-sqe:
   variables:
     DOCKERFILE_PATH: 'Dockerfile'
     BUILD_CONTEXT: '.'
-    IMAGE_NAME: 'sqe'
+    # repo.sovereign-data.org/chameleon/sqlengine/sqe (REGISTRY_URL +
+    # REGISTRY_PROJECT are set at the top of this file).
+    IMAGE_NAME: 'sqlengine/sqe'
     BUILD_ARGS: >-
       VERSION=${CI_COMMIT_TAG:-${CI_COMMIT_SHORT_SHA}}
       BUILD_DATE=${CI_PIPELINE_CREATED_AT}
@@ -412,6 +422,11 @@ build-sqe:
   # kaniko image on each MR is expensive and redundant. A Dockerfile or crate
   # change still rebuilds the image here on the merge-to-main push.
   rules:
+    # The release bot's version-bump commit only changes Cargo.toml/Cargo.lock
+    # version strings. Skip the redundant rebuild here; the tag pipeline's
+    # release-sqe job publishes the real release image.
+    - if: '$CI_COMMIT_TITLE =~ /^chore\(release\)/'
+      when: never
     - if: '$CI_COMMIT_BRANCH == "main" && $CI_PIPELINE_SOURCE == "push"'
       changes:
         - crates/**/*
@@ -443,9 +458,10 @@ build-sqe:
     DOCKER_DRIVER: overlay2
     # Pin the syft release used to generate the SBOM. Bump deliberately.
     SYFT_VERSION: "1.18.1"
-    # Image reference to scan. build-sqe pushes IMAGE_NAME 'sqe' to the
-    # project registry; tag is the git tag on a release, else the short SHA.
-    SBOM_IMAGE: "${CI_REGISTRY_IMAGE}/sqe:${CI_COMMIT_TAG}"
+    # Image reference to scan, on the Harbor registry build-sqe / release-sqe
+    # push to: repo.sovereign-data.org/chameleon/sqlengine/sqe. The overriding
+    # job sets the tag (short SHA for main builds, git tag for releases).
+    SBOM_IMAGE: "${REGISTRY_URL}/${REGISTRY_PROJECT}/sqlengine/sqe:${CI_COMMIT_TAG}"
   before_script:
     - apk add --no-cache bash curl docker-cli
     # Install the pinned syft. Fail loudly if the install does not yield a
@@ -454,8 +470,9 @@ build-sqe:
     - 'command -v syft >/dev/null || { echo "ERROR: syft not installed; supply-chain gate cannot run"; exit 1; }'
     - syft version
   script:
-    - echo "Logging in to ${CI_REGISTRY} and pulling ${SBOM_IMAGE}"
-    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+    # Authenticate to Harbor with the shared robot creds (inherited group vars).
+    - echo "Logging in to ${REGISTRY_URL} and pulling ${SBOM_IMAGE}"
+    - echo "$REGISTRY_PASSWORD" | docker login -u "$REGISTRY_USERNAME" --password-stdin "$REGISTRY_URL"
     - docker pull "$SBOM_IMAGE"
     # Generate a CycloneDX JSON SBOM for the container image.
     - syft "docker:${SBOM_IMAGE}" -o cyclonedx-json=sbom-sqe.cdx.json
@@ -498,11 +515,17 @@ sbom-sign:
     - job: build-sqe
       artifacts: false
   variables:
-    SBOM_IMAGE: "${CI_REGISTRY_IMAGE}/sqe:${CI_COMMIT_SHORT_SHA}"
+    SBOM_IMAGE: "${REGISTRY_URL}/${REGISTRY_PROJECT}/sqlengine/sqe:${CI_COMMIT_SHORT_SHA}"
   # A missing/failed supply-chain gate must not turn the merge-to-main image
   # build red. The job fails loudly on its own row; it does not block.
   allow_failure: true
   rules:
+    # Skip on the release bot's version-bump commit. It shares build-sqe's
+    # changes: filter (Cargo.toml/Cargo.lock) and has a non-optional
+    # needs: build-sqe; suppressing build-sqe without suppressing this job
+    # would leave an unsatisfiable need / a pull of an image never built.
+    - if: '$CI_COMMIT_TITLE =~ /^chore\(release\)/'
+      when: never
     - if: '$CI_COMMIT_BRANCH == "main" && $CI_PIPELINE_SOURCE == "push"'
       changes:
         - crates/**/*
@@ -510,14 +533,70 @@ sbom-sign:
         - Cargo.lock
         - Dockerfile
 
+# ── Release flow (opt-in via a release/* MR) ──────────────────
+# See release.md and
+# docs/superpowers/specs/2026-06-24-harbor-push-and-semver-releases-design.md
+#
+# version-bump (main-push only) reads the just-merged MR via the GitLab API; if
+# its source branch is release/*, it bumps the workspace version, commits it to
+# main, and creates the vX.Y.Z tag. The tag pipeline then runs release-sqe,
+# which passes DOCKER_TAGS to the kaniko template to publish :<version> +
+# :stable. version-bump is gated to main-push so it never re-runs in the tag
+# pipeline (no loop); the bump commit it creates has no release/* MR, so even
+# its own main pipeline exits step-2 early.
+version-bump:
+  stage: release
+  image: rust:bookworm
+  # Run after the image build on main, but never block the release on it.
+  needs:
+    - job: build-sqe
+      optional: true
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq jq git curl > /dev/null
+  script:
+    - bash scripts/ci/version-bump.sh
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main" && $CI_PIPELINE_SOURCE == "push"'
+
+# Build + push the release image on the version tag. DOCKER_TAGS is set
+# explicitly because the .kaniko-build template self-skips on a tag pipeline
+# unless told which tags to publish. No lint/test needs: the tagged commit is
+# the already-green merged tree plus a mechanical version-string bump.
+release-sqe:
+  extends: .kaniko-build
+  stage: build
+  variables:
+    DOCKERFILE_PATH: 'Dockerfile'
+    BUILD_CONTEXT: '.'
+    IMAGE_NAME: 'sqlengine/sqe'
+    DOCKER_TAGS: "$CI_COMMIT_TAG stable"
+    BUILD_ARGS: >-
+      VERSION=${CI_COMMIT_TAG}
+      BUILD_DATE=${CI_PIPELINE_CREATED_AT}
+      GIT_REVISION=${CI_COMMIT_SHA}
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/'
+
 # ── Release pipeline (triggered on tag push: v*) ──────────────
 
 # Release-time SBOM + checksums for the tagged image, attached to the release.
+# Runs in the `release` stage (after build) with an explicit needs on
+# release-sqe so it scans the image that was just published, rather than racing
+# ahead of the build as it did when it sat in the `test` stage.
 sbom-sign-release:
   extends: .sbom-sign-base
-  stage: test
+  stage: release
+  needs:
+    # Optional: release-sqe is excluded on pre-release tags (its rule is the
+    # strict /^v\d+\.\d+\.\d+$/), while this job's loose /^v[0-9]+/ rule still
+    # matches them. A non-optional need on a rules-excluded job would fail
+    # pipeline creation for pre-releases; optional keeps the release shipping
+    # (no image, SBOM soft-fails via allow_failure).
+    - job: release-sqe
+      optional: true
+      artifacts: false
   variables:
-    SBOM_IMAGE: "${CI_REGISTRY_IMAGE}/sqe:${CI_COMMIT_TAG}"
+    SBOM_IMAGE: "${REGISTRY_URL}/${REGISTRY_PROJECT}/sqlengine/sqe:${CI_COMMIT_TAG}"
   # Best-effort: a syft download hiccup or wrong image ref must never block
   # the tag release (which previously always produced a release). The release
   # job needs this one as `optional` so a failure here still ships the release
@@ -553,7 +632,7 @@ changelog:
     - if: '$CI_COMMIT_TAG =~ /^v[0-9]+/'
 
 release:
-  stage: build
+  stage: release
   image: registry.gitlab.com/gitlab-org/release-cli:latest
   needs:
     - job: changelog

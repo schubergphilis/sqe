@@ -241,6 +241,21 @@ fn concurrent_writer_produces_retryable_commit_conflict() {
     // "Conflict detection on concurrent commits".
 }
 
+/// #263 / #47: a partition-pruned Copy-on-Write UPDATE/DELETE that loses an
+/// optimistic-concurrency race must reload the snapshot, re-prune partitions,
+/// re-run the rewrite, and re-commit (NOT re-commit the stale rewritten files,
+/// which would drop the concurrent writer's changes). With two writers hitting
+/// disjoint partitions, both commits succeed without conflict; with two writers
+/// on the same partition, the loser retries and converges. Correctness is
+/// guarded by iceberg-rust's `validate_data_file_changes` at commit, so a
+/// conflict fails cleanly rather than corrupting data.
+#[test]
+#[ignore = "needs two concurrent sessions against live Polaris"]
+fn cow_update_delete_retries_on_concurrency_conflict() {
+    // Implementation tracked alongside the spec scenario
+    // "Partition-aware CoW writes retry on commit conflict".
+}
+
 /// Task 6.3 acceptance (live-stack variant).
 ///
 /// DELETE on a MoR table with a declared primary key writes one equality

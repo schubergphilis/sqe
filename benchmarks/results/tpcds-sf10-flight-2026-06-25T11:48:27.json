@@ -1,0 +1,611 @@
+{
+  "benchmark": "tpcds",
+  "scale_factor": 10.0,
+  "protocol": "flight",
+  "timestamp": "2026-06-25T11:48:27",
+  "summary": {
+    "total": 99,
+    "pass": 99,
+    "fail": 0,
+    "diff": 0,
+    "skip": 0,
+    "error": 0,
+    "total_duration_ms": 146086
+  },
+  "queries": [
+    {
+      "id": "q01",
+      "status": "pass",
+      "duration_ms": 666,
+      "rows": 1008
+    },
+    {
+      "id": "q02",
+      "status": "pass",
+      "duration_ms": 1737,
+      "rows": 2513
+    },
+    {
+      "id": "q03",
+      "status": "pass",
+      "duration_ms": 661,
+      "rows": 1025
+    },
+    {
+      "id": "q04",
+      "status": "pass",
+      "duration_ms": 2168,
+      "rows": 100
+    },
+    {
+      "id": "q05",
+      "status": "pass",
+      "duration_ms": 972,
+      "rows": 1060
+    },
+    {
+      "id": "q06",
+      "status": "pass",
+      "duration_ms": 341,
+      "rows": 50
+    },
+    {
+      "id": "q07",
+      "status": "pass",
+      "duration_ms": 920,
+      "rows": 980
+    },
+    {
+      "id": "q08",
+      "status": "pass",
+      "duration_ms": 714,
+      "rows": 120
+    },
+    {
+      "id": "q09",
+      "status": "pass",
+      "duration_ms": 10805,
+      "rows": 1
+    },
+    {
+      "id": "q10",
+      "status": "pass",
+      "duration_ms": 816,
+      "rows": 465
+    },
+    {
+      "id": "q11",
+      "status": "pass",
+      "duration_ms": 2012,
+      "rows": 100
+    },
+    {
+      "id": "q12",
+      "status": "pass",
+      "duration_ms": 207,
+      "rows": 700
+    },
+    {
+      "id": "q13",
+      "status": "pass",
+      "duration_ms": 873,
+      "rows": 1
+    },
+    {
+      "id": "q14",
+      "status": "pass",
+      "duration_ms": 4601,
+      "rows": 1066
+    },
+    {
+      "id": "q15",
+      "status": "pass",
+      "duration_ms": 395,
+      "rows": 408
+    },
+    {
+      "id": "q16",
+      "status": "pass",
+      "duration_ms": 22,
+      "rows": 1
+    },
+    {
+      "id": "q17",
+      "status": "pass",
+      "duration_ms": 1341,
+      "rows": 0
+    },
+    {
+      "id": "q18",
+      "status": "pass",
+      "duration_ms": 729,
+      "rows": 1066
+    },
+    {
+      "id": "q19",
+      "status": "pass",
+      "duration_ms": 325,
+      "rows": 1031
+    },
+    {
+      "id": "q20",
+      "status": "pass",
+      "duration_ms": 274,
+      "rows": 300
+    },
+    {
+      "id": "q21",
+      "status": "pass",
+      "duration_ms": 1801,
+      "rows": 1023
+    },
+    {
+      "id": "q22",
+      "status": "pass",
+      "duration_ms": 15357,
+      "rows": 1085
+    },
+    {
+      "id": "q23",
+      "status": "pass",
+      "duration_ms": 2739,
+      "rows": 1
+    },
+    {
+      "id": "q24",
+      "status": "pass",
+      "duration_ms": 4080,
+      "rows": 4
+    },
+    {
+      "id": "q25",
+      "status": "pass",
+      "duration_ms": 1351,
+      "rows": 0
+    },
+    {
+      "id": "q26",
+      "status": "pass",
+      "duration_ms": 435,
+      "rows": 1007
+    },
+    {
+      "id": "q27",
+      "status": "pass",
+      "duration_ms": 602,
+      "rows": 1016
+    },
+    {
+      "id": "q28",
+      "status": "pass",
+      "duration_ms": 2696,
+      "rows": 1
+    },
+    {
+      "id": "q29",
+      "status": "pass",
+      "duration_ms": 1176,
+      "rows": 0
+    },
+    {
+      "id": "q30",
+      "status": "pass",
+      "duration_ms": 714,
+      "rows": 586
+    },
+    {
+      "id": "q31",
+      "status": "pass",
+      "duration_ms": 1261,
+      "rows": 14
+    },
+    {
+      "id": "q32",
+      "status": "pass",
+      "duration_ms": 309,
+      "rows": 1
+    },
+    {
+      "id": "q33",
+      "status": "pass",
+      "duration_ms": 546,
+      "rows": 930
+    },
+    {
+      "id": "q34",
+      "status": "pass",
+      "duration_ms": 653,
+      "rows": 100
+    },
+    {
+      "id": "q35",
+      "status": "pass",
+      "duration_ms": 510,
+      "rows": 985
+    },
+    {
+      "id": "q36",
+      "status": "pass",
+      "duration_ms": 1081,
+      "rows": 111
+    },
+    {
+      "id": "q37",
+      "status": "pass",
+      "duration_ms": 1689,
+      "rows": 19
+    },
+    {
+      "id": "q38",
+      "status": "pass",
+      "duration_ms": 853,
+      "rows": 1
+    },
+    {
+      "id": "q39",
+      "status": "pass",
+      "duration_ms": 4415,
+      "rows": 3864
+    },
+    {
+      "id": "q40",
+      "status": "pass",
+      "duration_ms": 300,
+      "rows": 100
+    },
+    {
+      "id": "q41",
+      "status": "pass",
+      "duration_ms": 195,
+      "rows": 300
+    },
+    {
+      "id": "q42",
+      "status": "pass",
+      "duration_ms": 194,
+      "rows": 10
+    },
+    {
+      "id": "q43",
+      "status": "pass",
+      "duration_ms": 373,
+      "rows": 30
+    },
+    {
+      "id": "q44",
+      "status": "pass",
+      "duration_ms": 4098,
+      "rows": 10
+    },
+    {
+      "id": "q45",
+      "status": "pass",
+      "duration_ms": 385,
+      "rows": 383
+    },
+    {
+      "id": "q46",
+      "status": "pass",
+      "duration_ms": 712,
+      "rows": 1026
+    },
+    {
+      "id": "q47",
+      "status": "pass",
+      "duration_ms": 4325,
+      "rows": 1093
+    },
+    {
+      "id": "q48",
+      "status": "pass",
+      "duration_ms": 621,
+      "rows": 1
+    },
+    {
+      "id": "q49",
+      "status": "pass",
+      "duration_ms": 549,
+      "rows": 942
+    },
+    {
+      "id": "q50",
+      "status": "pass",
+      "duration_ms": 1774,
+      "rows": 100
+    },
+    {
+      "id": "q51",
+      "status": "pass",
+      "duration_ms": 954,
+      "rows": 1100
+    },
+    {
+      "id": "q52",
+      "status": "pass",
+      "duration_ms": 177,
+      "rows": 1032
+    },
+    {
+      "id": "q53",
+      "status": "pass",
+      "duration_ms": 371,
+      "rows": 212
+    },
+    {
+      "id": "q54",
+      "status": "pass",
+      "duration_ms": 579,
+      "rows": 0
+    },
+    {
+      "id": "q55",
+      "status": "pass",
+      "duration_ms": 193,
+      "rows": 1032
+    },
+    {
+      "id": "q56",
+      "status": "pass",
+      "duration_ms": 497,
+      "rows": 1029
+    },
+    {
+      "id": "q57",
+      "status": "pass",
+      "duration_ms": 2113,
+      "rows": 1068
+    },
+    {
+      "id": "q58",
+      "status": "pass",
+      "duration_ms": 694,
+      "rows": 11
+    },
+    {
+      "id": "q59",
+      "status": "pass",
+      "duration_ms": 1496,
+      "rows": 100
+    },
+    {
+      "id": "q60",
+      "status": "pass",
+      "duration_ms": 524,
+      "rows": 984
+    },
+    {
+      "id": "q61",
+      "status": "pass",
+      "duration_ms": 584,
+      "rows": 1
+    },
+    {
+      "id": "q62",
+      "status": "pass",
+      "duration_ms": 455,
+      "rows": 1100
+    },
+    {
+      "id": "q63",
+      "status": "pass",
+      "duration_ms": 411,
+      "rows": 702
+    },
+    {
+      "id": "q64",
+      "status": "pass",
+      "duration_ms": 4105,
+      "rows": 6
+    },
+    {
+      "id": "q65",
+      "status": "pass",
+      "duration_ms": 626,
+      "rows": 1091
+    },
+    {
+      "id": "q66",
+      "status": "pass",
+      "duration_ms": 357,
+      "rows": 50
+    },
+    {
+      "id": "q67",
+      "status": "pass",
+      "duration_ms": 5477,
+      "rows": 300
+    },
+    {
+      "id": "q68",
+      "status": "pass",
+      "duration_ms": 692,
+      "rows": 1015
+    },
+    {
+      "id": "q69",
+      "status": "pass",
+      "duration_ms": 779,
+      "rows": 1067
+    },
+    {
+      "id": "q70",
+      "status": "pass",
+      "duration_ms": 971,
+      "rows": 3
+    },
+    {
+      "id": "q71",
+      "status": "pass",
+      "duration_ms": 387,
+      "rows": 1094
+    },
+    {
+      "id": "q72",
+      "status": "pass",
+      "duration_ms": 19778,
+      "rows": 100
+    },
+    {
+      "id": "q73",
+      "status": "pass",
+      "duration_ms": 533,
+      "rows": 1000
+    },
+    {
+      "id": "q74",
+      "status": "pass",
+      "duration_ms": 1493,
+      "rows": 100
+    },
+    {
+      "id": "q75",
+      "status": "pass",
+      "duration_ms": 2288,
+      "rows": 100
+    },
+    {
+      "id": "q76",
+      "status": "pass",
+      "duration_ms": 2337,
+      "rows": 720
+    },
+    {
+      "id": "q77",
+      "status": "pass",
+      "duration_ms": 356,
+      "rows": 773
+    },
+    {
+      "id": "q78",
+      "status": "pass",
+      "duration_ms": 702,
+      "rows": 96
+    },
+    {
+      "id": "q79",
+      "status": "pass",
+      "duration_ms": 648,
+      "rows": 1027
+    },
+    {
+      "id": "q80",
+      "status": "pass",
+      "duration_ms": 661,
+      "rows": 1044
+    },
+    {
+      "id": "q81",
+      "status": "pass",
+      "duration_ms": 487,
+      "rows": 588
+    },
+    {
+      "id": "q82",
+      "status": "pass",
+      "duration_ms": 1732,
+      "rows": 19
+    },
+    {
+      "id": "q83",
+      "status": "pass",
+      "duration_ms": 399,
+      "rows": 16
+    },
+    {
+      "id": "q84",
+      "status": "pass",
+      "duration_ms": 499,
+      "rows": 100
+    },
+    {
+      "id": "q85",
+      "status": "pass",
+      "duration_ms": 576,
+      "rows": 2
+    },
+    {
+      "id": "q86",
+      "status": "pass",
+      "duration_ms": 239,
+      "rows": 111
+    },
+    {
+      "id": "q87",
+      "status": "pass",
+      "duration_ms": 812,
+      "rows": 1
+    },
+    {
+      "id": "q88",
+      "status": "pass",
+      "duration_ms": 44,
+      "rows": 1
+    },
+    {
+      "id": "q89",
+      "status": "pass",
+      "duration_ms": 305,
+      "rows": 1006
+    },
+    {
+      "id": "q90",
+      "status": "pass",
+      "duration_ms": 11,
+      "rows": 1
+    },
+    {
+      "id": "q91",
+      "status": "pass",
+      "duration_ms": 383,
+      "rows": 3
+    },
+    {
+      "id": "q92",
+      "status": "pass",
+      "duration_ms": 154,
+      "rows": 1
+    },
+    {
+      "id": "q93",
+      "status": "pass",
+      "duration_ms": 1382,
+      "rows": 100
+    },
+    {
+      "id": "q94",
+      "status": "pass",
+      "duration_ms": 8,
+      "rows": 1
+    },
+    {
+      "id": "q95",
+      "status": "pass",
+      "duration_ms": 7,
+      "rows": 1
+    },
+    {
+      "id": "q96",
+      "status": "pass",
+      "duration_ms": 8,
+      "rows": 1
+    },
+    {
+      "id": "q97",
+      "status": "pass",
+      "duration_ms": 510,
+      "rows": 1
+    },
+    {
+      "id": "q98",
+      "status": "pass",
+      "duration_ms": 309,
+      "rows": 300
+    },
+    {
+      "id": "q99",
+      "status": "pass",
+      "duration_ms": 610,
+      "rows": 962
+    }
+  ]
+}

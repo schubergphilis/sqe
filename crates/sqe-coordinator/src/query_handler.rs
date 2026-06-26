@@ -2095,6 +2095,26 @@ impl QueryHandler {
             physical_plan
         };
 
+        // Probe-side scan parallelization (issue #235). Opt-in: bumps the
+        // probe-side Iceberg scan of CollectLeft joins to N output partitions
+        // so the fact-table decode runs across cores; build-side scans are
+        // never touched (the q72 regression guard). Default off until validated
+        // on a clean (non-swapping) benchmark rig. Uses the real session config
+        // so EnforceDistribution sees the configured target_partitions.
+        let physical_plan = if self.config.query.parallel_probe_scan {
+            let state = ctx.state();
+            let rule = crate::parallel_probe_scan::ParallelProbeScanRule::new();
+            match rule.optimize(physical_plan.clone(), state.config_options()) {
+                Ok(optimized) => optimized,
+                Err(e) => {
+                    debug!(error = %e, "Probe-side scan parallelization failed, using original plan");
+                    physical_plan
+                }
+            }
+        } else {
+            physical_plan
+        };
+
         // Adaptive sort stripping
         let sort_mode = SortMode::parse(&self.config.query.sort_mode);
         let pressure = crate::memory::check_pressure(&self.runtime.memory_pool);
