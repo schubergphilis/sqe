@@ -22,11 +22,16 @@ pub struct SystemCatalogProvider {
 }
 
 impl SystemCatalogProvider {
-    pub fn new(session_catalog: Arc<SessionCatalog>, warehouse: String) -> Self {
+    pub fn new(
+        session_catalog: Arc<SessionCatalog>,
+        warehouse: String,
+        catalogs: Vec<String>,
+    ) -> Self {
         Self {
             jdbc_schema: Arc::new(JdbcSchemaProvider::new(
                 session_catalog.clone(),
                 warehouse.clone(),
+                catalogs,
             )),
             metadata_schema: Arc::new(MetadataSchemaProvider::new(session_catalog, warehouse)),
             runtime_schema: None,

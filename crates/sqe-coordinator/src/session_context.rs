@@ -457,9 +457,14 @@ pub async fn create_session_context(
                 coordinator_uri,
                 config.coordinator.worker_urls.clone(),
             ));
+            // All configured catalog names so `system.jdbc.catalogs` enumerates
+            // every catalog the session can see, not just the default (#5).
+            let jdbc_catalog_names: Vec<String> =
+                flattened.iter().map(|(name, _)| name.clone()).collect();
             let system_catalog = sqe_catalog::SystemCatalogProvider::new(
                 session_catalog_for_system,
                 config.catalog.warehouse.clone(),
+                jdbc_catalog_names,
             )
             .with_runtime(runtime_schema);
             ctx.register_catalog("system", Arc::new(system_catalog));

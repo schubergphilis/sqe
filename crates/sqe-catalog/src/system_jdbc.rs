@@ -32,15 +32,38 @@ struct JdbcTypeRow {
 pub struct JdbcSchemaProvider {
     session_catalog: Arc<SessionCatalog>,
     warehouse: String,
+    /// Every catalog the session can see (default warehouse first, then the
+    /// other configured catalogs, deduplicated). `system.jdbc.catalogs`
+    /// enumerates this list so JDBC catalog discovery sees all catalogs, not
+    /// just the default. (handoff #5)
+    catalogs: Vec<String>,
 }
 
 impl JdbcSchemaProvider {
-    pub fn new(session_catalog: Arc<SessionCatalog>, warehouse: String) -> Self {
+    pub fn new(
+        session_catalog: Arc<SessionCatalog>,
+        warehouse: String,
+        configured_catalogs: Vec<String>,
+    ) -> Self {
+        let catalogs = build_catalog_list(&warehouse, configured_catalogs);
         Self {
             session_catalog,
             warehouse,
+            catalogs,
         }
     }
+}
+
+/// Catalog enumeration for `system.jdbc.catalogs`: the default warehouse first,
+/// then the other configured catalogs, deduplicated with order preserved.
+fn build_catalog_list(warehouse: &str, configured: Vec<String>) -> Vec<String> {
+    let mut catalogs = vec![warehouse.to_string()];
+    for c in configured {
+        if !catalogs.contains(&c) {
+            catalogs.push(c);
+        }
+    }
+    catalogs
 }
 
 impl std::fmt::Debug for JdbcSchemaProvider {
@@ -71,7 +94,7 @@ impl SchemaProvider for JdbcSchemaProvider {
     async fn table(&self, name: &str) -> DFResult<Option<Arc<dyn TableProvider>>> {
         match name {
             "types" => Ok(Some(build_types_table()?)),
-            "catalogs" => Ok(Some(build_catalogs_table(&self.warehouse)?)),
+            "catalogs" => Ok(Some(build_catalogs_table(&self.catalogs)?)),
             "schemas" => Ok(Some(self.build_schemas_table().await?)),
             "tables" => Ok(Some(self.build_tables_table().await?)),
             "columns" => Ok(Some(self.build_columns_table().await?)),
@@ -457,8 +480,9 @@ fn build_types_table() -> DFResult<Arc<dyn TableProvider>> {
     Ok(Arc::new(MemTable::try_new(schema, vec![vec![batch]])?))
 }
 
-/// Build the `system.jdbc.catalogs` table with a single row for the warehouse.
-fn build_catalogs_table(warehouse: &str) -> DFResult<Arc<dyn TableProvider>> {
+/// Build the `system.jdbc.catalogs` table, one row per catalog the session
+/// can see (JDBC `getCatalogs()` shape: a single `table_cat` column).
+fn build_catalogs_table(catalogs: &[String]) -> DFResult<Arc<dyn TableProvider>> {
     let schema = Arc::new(Schema::new(vec![Field::new(
         "table_cat",
         DataType::Utf8,
@@ -466,7 +490,9 @@ fn build_catalogs_table(warehouse: &str) -> DFResult<Arc<dyn TableProvider>> {
     )]));
 
     let mut cat_b = StringBuilder::new();
-    cat_b.append_value(warehouse);
+    for c in catalogs {
+        cat_b.append_value(c);
+    }
 
     let batch = RecordBatch::try_new(
         schema.clone(),
@@ -517,9 +543,38 @@ mod tests {
 
     #[test]
     fn test_catalogs_table() {
-        let table = build_catalogs_table("my_warehouse").unwrap();
+        let table =
+            build_catalogs_table(&["my_warehouse".to_string()]).unwrap();
         let schema = table.schema();
         assert_eq!(schema.field(0).name(), "table_cat");
+    }
+
+    #[test]
+    fn catalog_list_enumerates_all_warehouse_first() {
+        let list = build_catalog_list(
+            "main_warehouse",
+            vec!["sales_wh".to_string(), "ops_wh".to_string()],
+        );
+        assert_eq!(
+            list.iter().map(String::as_str).collect::<Vec<_>>(),
+            vec!["main_warehouse", "sales_wh", "ops_wh"]
+        );
+    }
+
+    #[test]
+    fn catalog_list_dedups_and_preserves_order() {
+        let list = build_catalog_list(
+            "main_warehouse",
+            vec![
+                "main_warehouse".to_string(), // duplicate of default
+                "ws_energy_co".to_string(),
+                "ws_energy_co".to_string(), // duplicate
+            ],
+        );
+        assert_eq!(
+            list.iter().map(String::as_str).collect::<Vec<_>>(),
+            vec!["main_warehouse", "ws_energy_co"]
+        );
     }
 
     #[test]
@@ -622,7 +677,7 @@ mod tests {
     /// `build_catalogs_table` schema must have exactly 1 column named `table_cat`.
     #[test]
     fn test_catalogs_table_schema_column_count() {
-        let table = build_catalogs_table("my_warehouse").unwrap();
+        let table = build_catalogs_table(&["my_warehouse".to_string()]).unwrap();
         assert_eq!(
             table.schema().fields().len(),
             1,
@@ -635,7 +690,7 @@ mod tests {
     #[test]
     fn test_catalogs_table_builds_for_any_warehouse_name() {
         for name in &["warehouse1", "my-wh", "", "üñîcödé-wh"] {
-            let result = build_catalogs_table(name);
+            let result = build_catalogs_table(&[name.to_string()]);
             assert!(
                 result.is_ok(),
                 "build_catalogs_table should succeed for warehouse name '{name}'"
