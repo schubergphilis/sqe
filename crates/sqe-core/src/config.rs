@@ -3348,6 +3348,27 @@ impl SqeConfig {
             }
         }
 
+        // [auth].client_secret -> oidc_password provider inheritance. The
+        // shared `[auth]` client_id/client_secret is SQE's own OIDC client, the
+        // same one the `oidc_password` (ROPC) provider uses. A provider with an
+        // empty client_secret inherits `[auth].client_secret` (which
+        // `SQE_AUTH__CLIENT_SECRET` fills), so the common "one shared secret via
+        // env" setup keeps working after migrating to `[[auth.providers]]`.
+        // Only empty fields are filled, so an explicit per-provider secret
+        // (TOML or `SQE_AUTH__PROVIDERS__<N>__CLIENT_SECRET`) still wins. Scoped
+        // to `oidc_password` on purpose: `client_credentials` / `token_exchange`
+        // are distinct external clients with their own secrets.
+        let shared_secret = self.auth.client_secret.expose().to_string();
+        if !shared_secret.is_empty() {
+            for provider in self.auth.providers.iter_mut() {
+                if let AuthProviderConfig::OidcPassword { client_secret, .. } = provider {
+                    if client_secret.is_empty() {
+                        *client_secret = shared_secret.clone();
+                    }
+                }
+            }
+        }
+
         // Catalog
         // SQE_CATALOG__CATALOG_URL is the canonical env var; the legacy
         // SQE_CATALOG__POLARIS_URL is honoured first for backwards-compat
@@ -5320,6 +5341,64 @@ otlp_endpoint = ""
 
         std::env::remove_var("SQE_AUTH__PROVIDERS__0__CLIENT_SECRET");
         std::env::remove_var("SQE_AUTH__PROVIDERS__1__CLIENT_SECRET");
+    }
+
+    #[test]
+    fn oidc_password_inherits_auth_client_secret_when_empty() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::remove_var("SQE_AUTH__CLIENT_SECRET");
+        std::env::remove_var("SQE_AUTH__PROVIDERS__0__CLIENT_SECRET");
+
+        // The common deployment: shared secret on [auth] (often via
+        // SQE_AUTH__CLIENT_SECRET), oidc_password provider left empty.
+        let mut cfg = valid_config();
+        cfg.auth.client_secret = SecretString::new("shared-from-auth".to_string());
+        cfg.auth.providers = vec![AuthProviderConfig::OidcPassword {
+            token_url: "http://idp.example.com/token".to_string(),
+            client_id: "sqe".to_string(),
+            client_secret: String::new(),
+            roles_claim: "realm_access.roles".to_string(),
+            subject_claim: "sub".to_string(),
+            email_claim: String::new(),
+            groups_claim: String::new(),
+        }];
+
+        cfg.apply_env_overrides();
+
+        match &cfg.auth.providers[0] {
+            AuthProviderConfig::OidcPassword { client_secret, .. } => {
+                assert_eq!(client_secret, "shared-from-auth");
+            }
+            other => panic!("expected OidcPassword, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn explicit_oidc_password_secret_beats_auth_inheritance() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::remove_var("SQE_AUTH__CLIENT_SECRET");
+        std::env::remove_var("SQE_AUTH__PROVIDERS__0__CLIENT_SECRET");
+
+        let mut cfg = valid_config();
+        cfg.auth.client_secret = SecretString::new("shared-from-auth".to_string());
+        cfg.auth.providers = vec![AuthProviderConfig::OidcPassword {
+            token_url: "http://idp.example.com/token".to_string(),
+            client_id: "sqe".to_string(),
+            client_secret: "explicit-provider-secret".to_string(),
+            roles_claim: "realm_access.roles".to_string(),
+            subject_claim: "sub".to_string(),
+            email_claim: String::new(),
+            groups_claim: String::new(),
+        }];
+
+        cfg.apply_env_overrides();
+
+        match &cfg.auth.providers[0] {
+            AuthProviderConfig::OidcPassword { client_secret, .. } => {
+                assert_eq!(client_secret, "explicit-provider-secret");
+            }
+            other => panic!("expected OidcPassword, got {other:?}"),
+        }
     }
 
     #[test]
