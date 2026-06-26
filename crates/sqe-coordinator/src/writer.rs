@@ -552,7 +552,11 @@ pub async fn write_data_files_streaming(
         }
 
         if total_rows == 0 {
-            let _ = writer.close().await;
+            // Propagate close errors even on the empty-write path: a failed
+            // close can signal a file build/flush problem we must not mask.
+            writer.close().await.map_err(|e| {
+                SqeError::Execution(format!("Close writer error (empty write): {e}"))
+            })?;
             return Ok((vec![], 0));
         }
 
@@ -599,7 +603,13 @@ pub async fn write_data_files_streaming(
         }
 
         if total_rows == 0 {
-            let _ = writer.close().await;
+            // Propagate close errors even on the empty-write path: a failed
+            // close can signal a file build/flush problem we must not mask.
+            writer.close().await.map_err(|e| {
+                SqeError::Execution(format!(
+                    "Close partitioned writer error (empty write): {e}"
+                ))
+            })?;
             return Ok((vec![], 0));
         }
 
