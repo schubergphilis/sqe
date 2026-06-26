@@ -52,6 +52,12 @@ pub struct OidcClientCredentialsConfig {
     pub scope: Option<String>,
     /// Skip TLS certificate verification (dev/test only).
     pub accept_invalid_certs: bool,
+    /// When `true`, a token-endpoint rejection returns `NotMyCredentials`
+    /// (defer to the next provider) instead of `AuthFailed`, so this provider
+    /// can share a Basic-auth listener with `OidcPasswordProvider`. Infra
+    /// errors (connection refused, timeouts) still surface as `Internal` and
+    /// stop the chain. (#276)
+    pub fallthrough_on_reject: bool,
 }
 
 impl Default for OidcClientCredentialsConfig {
@@ -62,6 +68,7 @@ impl Default for OidcClientCredentialsConfig {
             subject_claim: "sub".to_string(),
             scope: None,
             accept_invalid_certs: false,
+            fallthrough_on_reject: false,
         }
     }
 }
@@ -246,7 +253,16 @@ impl AuthProvider for OidcClientCredentialsProvider {
             return Err(AuthError::NotMyCredentials);
         }
 
-        let token = self.fetch_token(&client_id, &client_secret).await?;
+        let token = match self.fetch_token(&client_id, &client_secret).await {
+            Ok(t) => t,
+            // On a clean grant rejection, defer to the next provider when
+            // configured for a mixed Basic-auth listener (#276). Infra errors
+            // (Internal) still propagate and stop the chain.
+            Err(AuthError::AuthFailed(_)) if self.config.fallthrough_on_reject => {
+                return Err(AuthError::NotMyCredentials);
+            }
+            Err(e) => return Err(e),
+        };
 
         // Cache the (validated) secret so refresh can re-run the grant.
         self.secrets
@@ -461,5 +477,85 @@ mod tests {
             expires_at: None,
         };
         assert!(p.refresh_catalog_token(&id).await.unwrap().is_none());
+    }
+
+    // --- #276: fallthrough_on_reject (mixed Basic-auth listener) ---
+
+    /// Mock token endpoint that rejects every grant with HTTP 401.
+    async fn start_rejecting_token_server() -> (tokio::task::JoinHandle<()>, String) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let url = format!("http://127.0.0.1:{port}/token");
+        let handle = tokio::spawn(async move {
+            for _ in 0..10 {
+                let (mut stream, _) = match listener.accept().await {
+                    Ok(s) => s,
+                    Err(_) => break,
+                };
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = vec![0u8; 4096];
+                let _ = stream.read(&mut buf).await;
+                let body = "{\"error\":\"invalid_client\"}";
+                let resp = format!(
+                    "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes()).await;
+                let _ = stream.flush().await;
+            }
+        });
+        (handle, url)
+    }
+
+    fn provider_fallthrough(token_url: &str, fallthrough: bool) -> OidcClientCredentialsProvider {
+        OidcClientCredentialsProvider::new(OidcClientCredentialsConfig {
+            token_url: token_url.to_string(),
+            fallthrough_on_reject: fallthrough,
+            ..Default::default()
+        })
+        .unwrap()
+    }
+
+    fn basic(user: &str, pass: &str) -> FlightCredentials {
+        FlightCredentials {
+            username: Some(user.to_string()),
+            password: Some(SecretString::new(pass.to_string())),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn reject_defers_when_fallthrough_enabled() {
+        // A human ROPC credential hitting this SP provider: the grant is
+        // rejected, and with fallthrough it defers so the chain can try ROPC.
+        let (_h, url) = start_rejecting_token_server().await;
+        let p = provider_fallthrough(&url, true);
+        assert!(matches!(
+            p.authenticate(&basic("alice", "human-password")).await,
+            Err(AuthError::NotMyCredentials)
+        ));
+    }
+
+    #[tokio::test]
+    async fn reject_fails_hard_when_fallthrough_disabled() {
+        // Default behavior is unchanged: a rejection is a hard AuthFailed.
+        let (_h, url) = start_rejecting_token_server().await;
+        let p = provider_fallthrough(&url, false);
+        assert!(matches!(
+            p.authenticate(&basic("sp", "wrong-secret")).await,
+            Err(AuthError::AuthFailed(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn infra_error_still_stops_even_with_fallthrough() {
+        // Connection refused -> Internal, never NotMyCredentials, so an IdP
+        // outage stops the chain instead of silently falling through.
+        let p = provider_fallthrough("http://127.0.0.1:1/token", true);
+        assert!(matches!(
+            p.authenticate(&basic("sp", "secret")).await,
+            Err(AuthError::Internal(_))
+        ));
     }
 }
