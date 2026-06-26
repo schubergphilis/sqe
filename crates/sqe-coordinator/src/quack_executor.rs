@@ -67,6 +67,17 @@ pub fn sqe_error_to_query_error(err: SqeError) -> QueryError {
         // Anything that bubbled out as anyhow::Error is by definition
         // unexpected; same treatment as Config.
         SqeError::Internal(_) => QueryError::Internal(msg),
+
+        // Source-preserving boundary errors: route by code. InternalError
+        // (e.g. config_src) is an operator problem -> Internal; everything else
+        // (catalog/exec/auth/storage boundaries) surfaces as Execution.
+        SqeError::Sourced { ref code, .. } => {
+            if *code == sqe_core::SqeErrorCode::InternalError {
+                QueryError::Internal(msg)
+            } else {
+                QueryError::Execution(msg)
+            }
+        }
     }
 }
 
