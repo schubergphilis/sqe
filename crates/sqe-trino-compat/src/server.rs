@@ -16,6 +16,7 @@ use uuid::Uuid;
 use sqe_core::Session;
 use sqe_core::config::SecurityConfig;
 
+use crate::prepared;
 use crate::protocol::{
     self, NodeVersion, ServerInfo, TrinoColumn, TrinoError, TrinoResponse, TrinoStats,
 };
@@ -492,10 +493,13 @@ fn apply_session_headers(
         append(headers, HeaderName::from_static("x-trino-clear-session"), name);
     }
     for (name, sql) in &update.added_prepare {
+        // The SQL value must be URL-encoded: it contains spaces, commas, and
+        // `=` that would otherwise corrupt the header. The Trino client replays
+        // this verbatim in X-Trino-Prepared-Statement, where we URL-decode it.
         append(
             headers,
             HeaderName::from_static("x-trino-added-prepare"),
-            &format!("{name}={sql}"),
+            &format!("{name}={}", prepared::form_urlencode(sql)),
         );
     }
     for name in &update.deallocated_prepare {
@@ -733,9 +737,36 @@ async fn submit_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
 
     let session_update = protocol::parse_session_statement(sql);
 
-    match state.query_handler.execute(&session, sql).await {
+    // Trino prepared statements are stateless: the client carries the prepared
+    // SQL in X-Trino-Prepared-Statement headers and submits `EXECUTE <name>
+    // USING ...`. Resolve such a body into concrete SQL before execution.
+    let prepared = {
+        let values: Vec<String> = headers
+            .get_all("x-trino-prepared-statement")
+            .iter()
+            .filter_map(|v| v.to_str().ok().map(str::to_string))
+            .collect();
+        prepared::parse_prepared_statements(&values)
+    };
+    let effective_sql = match prepared::rewrite_execute(sql, &prepared) {
+        Ok(Some(rewritten)) => rewritten,
+        Ok(None) => sql.to_string(),
+        Err(msg) => {
+            let response = TrinoResponse {
+                id: query_id.clone(),
+                info_uri: Some(info_uri(&base_url, &query_id)),
+                stats: TrinoStats::failed(),
+                error: Some(TrinoError::user_error(msg, Some(&query_id))),
+                ..Default::default()
+            };
+            return (StatusCode::OK, Json(response)).into_response();
+        }
+    };
+    let exec_sql = effective_sql.as_str();
+
+    match state.query_handler.execute(&session, exec_sql).await {
         Ok(batches) => {
-            let update_type = classify_update_type(sql).map(str::to_string);
+            let update_type = classify_update_type(exec_sql).map(str::to_string);
             let update_count = if update_type.is_some() {
                 extract_update_count(&batches).or(Some(0))
             } else {
@@ -1129,6 +1160,95 @@ mod tests {
         ) -> Result<Vec<arrow_array::RecordBatch>, sqe_core::SqeError> {
             Err(sqe_core::SqeError::Execution("mock".to_string()))
         }
+    }
+
+    /// Captures the SQL strings the executor is asked to run, so a test can
+    /// assert what the prepared-statement rewrite produced.
+    struct RecordingQuery {
+        seen: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+    #[async_trait::async_trait]
+    impl TrinoQueryExecutor for RecordingQuery {
+        async fn execute(
+            &self,
+            _: &Session,
+            sql: &str,
+        ) -> Result<Vec<arrow_array::RecordBatch>, sqe_core::SqeError> {
+            self.seen.lock().unwrap().push(sql.to_string());
+            Ok(vec![])
+        }
+    }
+
+    fn recording_state(
+        seen: Arc<std::sync::Mutex<Vec<String>>>,
+    ) -> Arc<TrinoState<MockAuthOk, RecordingQuery>> {
+        Arc::new(TrinoState::<MockAuthOk, RecordingQuery> {
+            authenticator: Arc::new(MockAuthOk),
+            query_handler: Arc::new(RecordingQuery { seen }),
+            results: build_result_cache(),
+            node: NodeContext {
+                version: "0.1.0".to_string(),
+                ready: Arc::new(AtomicBool::new(true)),
+                started_at: Instant::now(),
+            },
+            page_size: DEFAULT_PAGE_SIZE,
+            port: 8080,
+            oauth2: None,
+            security: SecurityConfig::default(),
+            auth_rate_limiter: None,
+            expose_version: true,
+        })
+    }
+
+    #[tokio::test]
+    async fn submit_resolves_prepared_statement_from_header() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let state = recording_state(seen.clone());
+
+        let mut headers = basic_auth_header("alice", "pw");
+        // q1 = "SELECT * FROM t WHERE a = ?" url-encoded, as a real Trino
+        // client carries it back from x-trino-added-prepare.
+        headers.insert(
+            "x-trino-prepared-statement",
+            "q1=SELECT+%2A+FROM+t+WHERE+a+%3D+%3F".parse().unwrap(),
+        );
+
+        let resp = submit_query::<MockAuthOk, RecordingQuery>(
+            State(state),
+            test_peer(),
+            headers,
+            "EXECUTE q1 USING 5".to_string(),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "executor should run exactly once");
+        assert_eq!(seen[0], "SELECT * FROM t WHERE a = 5");
+    }
+
+    #[tokio::test]
+    async fn submit_unresolved_execute_never_reaches_executor() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let state = recording_state(seen.clone());
+
+        // EXECUTE naming a statement the client never sent: must error out
+        // before execution, so the executor is never called.
+        let resp = submit_query::<MockAuthOk, RecordingQuery>(
+            State(state),
+            test_peer(),
+            basic_auth_header("alice", "pw"),
+            "EXECUTE missing USING 1".to_string(),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "unresolved EXECUTE must not reach the executor"
+        );
     }
 
     #[test]

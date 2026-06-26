@@ -1585,7 +1585,7 @@ impl FlightSqlService for SqeFlightSqlService {
         let sql = match self.prepared_params.get(&key).await {
             Some(params) => {
                 self.prepared_params.invalidate(&key).await;
-                substitute_placeholders(&fetch.handle, &params)
+                sqe_core::substitute_placeholders(&fetch.handle, &params)
                     .map_err(Status::invalid_argument)?
             }
             None => fetch.handle.clone(),
@@ -2331,48 +2331,8 @@ fn sql_quote_string(s: &str) -> String {
     format!("'{escaped}'")
 }
 
-/// Replace `?` placeholders in the SQL string with the bound literals,
-/// in order. Returns an error if the placeholder count differs from the
-/// number of bound values, mirroring the JDBC behaviour of a
-/// `SQLException` rather than executing with a partial bind.
-fn substitute_placeholders(sql: &str, params: &[String]) -> Result<String, String> {
-    let mut out = String::with_capacity(sql.len() + params.iter().map(|s| s.len()).sum::<usize>());
-    let mut next: usize = 0;
-    let mut in_single = false;
-    let mut in_double = false;
-    let bytes = sql.as_bytes();
-    let mut i: usize = 0;
-    while i < bytes.len() {
-        let c = bytes[i] as char;
-        if !in_single && !in_double && c == '?' {
-            if next >= params.len() {
-                return Err(format!(
-                    "prepared statement expected {} parameters but bind supplied {}",
-                    next + 1,
-                    params.len()
-                ));
-            }
-            out.push_str(&params[next]);
-            next += 1;
-            i += 1;
-            continue;
-        }
-        if !in_double && c == '\'' {
-            in_single = !in_single;
-        } else if !in_single && c == '"' {
-            in_double = !in_double;
-        }
-        out.push(c);
-        i += 1;
-    }
-    if next != params.len() {
-        return Err(format!(
-            "prepared statement consumed {next} parameters but bind supplied {}",
-            params.len()
-        ));
-    }
-    Ok(out)
-}
+// `?` placeholder substitution lives in `sqe_core::substitute_placeholders`,
+// shared with the Trino HTTP `EXECUTE ... USING` path.
 
 // Unit tests
 // ---------------------------------------------------------------------------
@@ -2480,27 +2440,6 @@ mod tests {
         assert!(super::like_match("a_c", "abc"));
         assert!(!super::like_match("a_c", "abbc"));
         assert!(!super::like_match("a_c", "ac"));
-    }
-
-    #[test]
-    fn substitute_placeholders_basic() {
-        let sql = "SELECT * FROM t WHERE a = ? AND b = ?";
-        let out = super::substitute_placeholders(sql, &["1".into(), "'foo'".into()]).unwrap();
-        assert_eq!(out, "SELECT * FROM t WHERE a = 1 AND b = 'foo'");
-    }
-
-    #[test]
-    fn substitute_placeholders_skips_inside_quotes() {
-        // The `?` inside a string literal must be preserved as-is.
-        let sql = "SELECT '? not bound' FROM t WHERE a = ?";
-        let out = super::substitute_placeholders(sql, &["42".into()]).unwrap();
-        assert_eq!(out, "SELECT '? not bound' FROM t WHERE a = 42");
-    }
-
-    #[test]
-    fn substitute_placeholders_mismatch_errors() {
-        assert!(super::substitute_placeholders("?", &[]).is_err());
-        assert!(super::substitute_placeholders("?", &["a".into(), "b".into()]).is_err());
     }
 
     #[test]

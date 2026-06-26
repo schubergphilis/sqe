@@ -184,6 +184,28 @@ impl TrinoError {
             error_location: None,
         }
     }
+
+    /// Build a Trino USER_ERROR for a malformed request (e.g. an `EXECUTE`
+    /// naming a prepared statement the client never sent). USER_ERROR is
+    /// returned as HTTP 200 with an error body, per the Trino protocol.
+    pub fn user_error(message: impl Into<String>, query_id: Option<&str>) -> Self {
+        let message = message.into();
+        Self {
+            message: message.clone(),
+            error_code: 1,
+            error_name: "SYNTAX_ERROR".to_string(),
+            error_type: "USER_ERROR".to_string(),
+            query_id: query_id.map(|s| s.to_string()),
+            failure_info: Some(TrinoFailureInfo {
+                r#type: "io.trino.spi.TrinoException".to_string(),
+                message,
+                suppressed: Vec::new(),
+                cause: None,
+                stack: Vec::new(),
+            }),
+            error_location: None,
+        }
+    }
 }
 
 /// Build a `TrinoTypeSignature` from a Trino type string.
