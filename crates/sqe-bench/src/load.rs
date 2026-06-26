@@ -54,6 +54,20 @@ fn partition_spec(benchmark: &str, table: &str) -> Option<&'static str> {
     match (benchmark, table) {
         ("tpch", "lineitem") => Some("month(l_shipdate)"),
         ("tpch", "orders") => Some("month(o_orderdate)"),
+        // TPC-C: partition by the warehouse[/district] key that the OLTP-style
+        // UPDATE/DELETE statements filter on (`w_id`, `d_id`). With partition-
+        // aware Copy-on-Write (issue #263), a `WHERE w_id=1 AND d_id=1` write
+        // rewrites only that one partition instead of the whole table -- correct
+        // and bounded, without Merge-on-Read. `item` is warehouse-independent
+        // (global) so it stays unpartitioned.
+        ("tpcc", "warehouse") => Some("w_id"),
+        ("tpcc", "stock") => Some("s_w_id"),
+        ("tpcc", "district") => Some("d_w_id, d_id"),
+        ("tpcc", "customer") => Some("c_w_id, c_d_id"),
+        ("tpcc", "orders") => Some("o_w_id, o_d_id"),
+        ("tpcc", "new_order") => Some("no_w_id, no_d_id"),
+        ("tpcc", "order_line") => Some("ol_w_id, ol_d_id"),
+        ("tpcc", "hist") => Some("h_w_id, h_d_id"),
         _ => None,
     }
 }

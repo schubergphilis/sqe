@@ -238,6 +238,16 @@ pub struct QueryConfig {
     /// Default: 10 (fact table must be at least 10x larger than the smallest dimension).
     #[serde(default = "default_star_schema_min_ratio")]
     pub star_schema_min_ratio: usize,
+    /// Parallelize the probe-side Iceberg scan of `CollectLeft` (broadcast)
+    /// hash joins so the fact-table decode runs across cores while the build
+    /// side stays single-partition (issue #235, follow-up to #131). Build-side
+    /// scans are never touched, so the q72 regression cannot recur.
+    ///
+    /// Default: false. This is a single-node scan-parallelism optimization with
+    /// a documented regression history; it stays opt-in until validated on a
+    /// clean (non-swapping) benchmark rig.
+    #[serde(default)]
+    pub parallel_probe_scan: bool,
     /// Idle-timeout (seconds) for an active result stream. When the gRPC
     /// client has not pulled a batch within this window the coordinator
     /// aborts the stream and releases its concurrency permit. Bounds the
@@ -298,6 +308,7 @@ impl Default for QueryConfig {
             late_materialization_min_projection_cols: default_late_mat_min_projection_cols(),
             star_schema_reorder: default_true(),
             star_schema_min_ratio: default_star_schema_min_ratio(),
+            parallel_probe_scan: false,
             stream_idle_timeout_secs: default_stream_idle_timeout(),
             distributed_scan_pushdown: default_true(),
             runtime_filter_inlist_max_values: default_runtime_filter_inlist_max_values(),
