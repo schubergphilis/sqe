@@ -17,7 +17,14 @@ from dbt_common.exceptions import DbtDatabaseError, DbtRuntimeError
 
 @dataclass
 class SQECredentials(Credentials):
-    """Connection credentials for SQE."""
+    """Connection credentials for SQE.
+
+    Three auth styles are supported (see ``auth.flight_db_kwargs``):
+    - Basic: ``user`` + ``password`` (human user).
+    - OAuth client_credentials (service principal): ``method: oauth`` with
+      ``client_id`` + ``client_secret``. SQE runs the grant and forwards the token.
+    - Pre-obtained bearer: ``token`` (the client fetched its own OAuth token).
+    """
 
     host: str = "localhost"
     port: int = 50051
@@ -25,6 +32,11 @@ class SQECredentials(Credentials):
     password: Optional[str] = None
     database: str = "warehouse"
     schema: str = "default"
+    # OAuth / service-principal auth.
+    method: Optional[str] = None
+    client_id: Optional[str] = None
+    client_secret: Optional[str] = None
+    token: Optional[str] = None
 
     _ALIASES = {"catalog": "database"}
 
@@ -37,7 +49,8 @@ class SQECredentials(Credentials):
         return self.host
 
     def _connection_keys(self) -> Tuple[str, ...]:
-        return ("host", "port", "database", "schema", "user")
+        # Never expose password / client_secret / token in dbt debug output.
+        return ("host", "port", "database", "schema", "user", "method", "client_id")
 
 
 class SQEConnectionManager(SQLConnectionManager):
@@ -52,17 +65,23 @@ class SQEConnectionManager(SQLConnectionManager):
 
         credentials = connection.credentials
 
+        uri = f"grpc://{credentials.host}:{credentials.port}"
         try:
             from adbc_driver_flightsql.dbapi import connect
 
-            uri = f"grpc://{credentials.host}:{credentials.port}"
+            from dbt.adapters.sqe.auth import flight_db_kwargs
 
-            kwargs = {"uri": uri}
-            if credentials.user:
-                kwargs["db_kwargs"] = {
-                    "username": credentials.user,
-                    "password": credentials.password or "",
-                }
+            db_kwargs = flight_db_kwargs(
+                user=credentials.user,
+                password=credentials.password,
+                method=credentials.method,
+                client_id=credentials.client_id,
+                client_secret=credentials.client_secret,
+                token=credentials.token,
+            )
+            kwargs: dict = {"uri": uri}
+            if db_kwargs:
+                kwargs["db_kwargs"] = db_kwargs
 
             handle = connect(**kwargs)
             connection.handle = handle
