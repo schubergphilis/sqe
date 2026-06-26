@@ -950,7 +950,7 @@ impl SessionCatalog {
             .map_err(sqe_core::SqeError::Catalog)?;
         let started = Instant::now();
         let result = dispatch_catalog!(self.inner, list_namespaces(None))
-            .map_err(|e| sqe_core::SqeError::Catalog(format!("Failed to list namespaces: {e}")));
+            .map_err(|e| sqe_core::SqeError::catalog_src(format!("Failed to list namespaces: {e}"), e));
         match &result {
             Ok(_) => self.circuit_breaker.record_success(),
             Err(_) => self.circuit_breaker.record_failure(),
@@ -1030,7 +1030,7 @@ impl SessionCatalog {
             .map_err(sqe_core::SqeError::Catalog)?;
         let started = Instant::now();
         let result = dispatch_catalog!(self.inner, list_tables(namespace))
-            .map_err(|e| sqe_core::SqeError::Catalog(format!("Failed to list tables: {e}")));
+            .map_err(|e| sqe_core::SqeError::catalog_src(format!("Failed to list tables: {e}"), e));
         match &result {
             Ok(_) => self.circuit_breaker.record_success(),
             Err(_) => self.circuit_breaker.record_failure(),
@@ -1181,7 +1181,7 @@ impl SessionCatalog {
             .map_err(sqe_core::SqeError::Catalog)?;
         let started = Instant::now();
         let result = dispatch_catalog!(self.inner, load_table(table_ident))
-            .map_err(|e| sqe_core::SqeError::Catalog(format!("Failed to load table: {e}")));
+            .map_err(|e| sqe_core::SqeError::catalog_src(format!("Failed to load table: {e}"), e));
         match &result {
             Ok(table) => {
                 self.circuit_breaker.record_success();
@@ -1649,7 +1649,7 @@ impl SessionCatalog {
         let resp = req
             .send()
             .await
-            .map_err(|e| SqeError::Catalog(format!("Failed to commit schema update: {e}")))?;
+            .map_err(|e| SqeError::catalog_src(format!("Failed to commit schema update: {e}"), e))?;
 
         let status = resp.status();
         if !status.is_success() {
