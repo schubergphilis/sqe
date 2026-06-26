@@ -36,6 +36,12 @@ pub struct OidcPasswordProviderConfig {
     pub groups_claim: String,
     /// Whether to skip TLS certificate verification (dev/test only).
     pub accept_invalid_certs: bool,
+    /// When `true`, a token-endpoint rejection of the ROPC grant returns
+    /// `NotMyCredentials` (defer to the next provider) instead of `AuthFailed`,
+    /// so this provider can share a Basic-auth listener with a following
+    /// `client_credentials_passthrough` provider. Infra errors still surface as
+    /// `Internal` and stop the chain. (#276)
+    pub fallthrough_on_reject: bool,
 }
 
 impl Default for OidcPasswordProviderConfig {
@@ -49,6 +55,7 @@ impl Default for OidcPasswordProviderConfig {
             email_claim: String::new(),
             groups_claim: String::new(),
             accept_invalid_certs: false,
+            fallthrough_on_reject: false,
         }
     }
 }
@@ -284,7 +291,16 @@ impl AuthProvider for OidcPasswordProvider {
             return Err(AuthError::NotMyCredentials);
         }
 
-        let token_response = self.exchange_credentials(username, password).await?;
+        let token_response = match self.exchange_credentials(username, password).await {
+            Ok(t) => t,
+            // On a clean grant rejection, defer to the next provider when
+            // configured for a mixed Basic-auth listener (#276). Infra errors
+            // (Internal) still propagate and stop the chain.
+            Err(AuthError::AuthFailed(_)) if self.config.fallthrough_on_reject => {
+                return Err(AuthError::NotMyCredentials);
+            }
+            Err(e) => return Err(e),
+        };
 
         let user_id = Self::extract_sub(&token_response.access_token)
             .unwrap_or_else(|| username.clone());
@@ -506,6 +522,7 @@ mod tests {
             email_claim: String::new(),
             groups_claim: String::new(),
             accept_invalid_certs: false,
+            fallthrough_on_reject: false,
         };
         assert!(OidcPasswordProvider::new(config).is_ok());
     }

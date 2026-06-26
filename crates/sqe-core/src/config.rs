@@ -830,6 +830,14 @@ pub enum AuthProviderConfig {
         /// Empty string disables extraction. Separate from `roles_claim`.
         #[serde(default)]
         groups_claim: String,
+        /// When `true`, a token-endpoint *rejection* of the ROPC grant returns
+        /// `NotMyCredentials` (defer to the next provider) instead of
+        /// `AuthFailed` (stop the chain). Set this on a mixed Basic-auth
+        /// listener so a `client_id`/`client_secret` that is not a valid user
+        /// falls through to `client_credentials_passthrough`. Default `false`
+        /// preserves single-provider behavior. (#276)
+        #[serde(default)]
+        fallthrough_on_reject: bool,
     },
     /// Generic OAuth2 client_credentials grant (e.g. Polaris service token).
     ClientCredentials {
@@ -845,9 +853,11 @@ pub enum AuthProviderConfig {
     /// (Basic auth: username = client_id, password = client_secret); SQE runs
     /// the grant per connection and forwards the resulting token to the catalog.
     /// No credentials live in config: that is the difference from
-    /// `ClientCredentials`. Because it consumes username/password it cannot
-    /// share a listener with `OidcPassword`; deploy it as the sole
-    /// username/password provider (service-principal-only access).
+    /// `ClientCredentials`. It consumes username/password, so to share a
+    /// listener with `OidcPassword` (mixed human + service-principal Basic
+    /// auth) set `fallthrough_on_reject = true` on the `OidcPassword` provider
+    /// that precedes it; otherwise deploy it as the sole username/password
+    /// provider (service-principal-only access). (#276)
     ClientCredentialsPassthrough {
         /// Full OAuth2 token endpoint URL.
         token_url: String,
@@ -862,6 +872,12 @@ pub enum AuthProviderConfig {
         /// default.
         #[serde(default)]
         scope: Option<String>,
+        /// When `true`, a token-endpoint *rejection* of the client_credentials
+        /// grant returns `NotMyCredentials` instead of `AuthFailed`, so a
+        /// human ROPC credential that is not a valid client falls through to a
+        /// following `oidc_password` provider. Default `false`. (#276)
+        #[serde(default)]
+        fallthrough_on_reject: bool,
     },
     /// OAuth2 Token Exchange (RFC 8693) — exchanges an incoming credential for a
     /// user-scoped JWT via an OIDC token endpoint. Catch-all; place last in chain.
@@ -3800,6 +3816,7 @@ mod tests {
             subject_claim: "sub".to_string(),
             email_claim: String::new(),
             groups_claim: String::new(),
+            fallthrough_on_reject: false,
         };
         let dbg = format!("{cfg:?}");
         assert!(!dbg.contains("super-secret-value"), "leaked secret: {dbg}");
@@ -4850,6 +4867,7 @@ type = "aws"
                 roles_claim,
                 subject_claim,
                 scope,
+                fallthrough_on_reject: _,
             } => {
                 assert_eq!(
                     token_url,
@@ -4898,6 +4916,7 @@ type = "aws"
             roles_claim: "realm_access.roles".to_string(),
             subject_claim: "sub".to_string(),
             scope: None,
+            fallthrough_on_reject: false,
         };
         let dbg = format!("{cfg:?}");
         assert!(
@@ -5286,6 +5305,7 @@ otlp_endpoint = ""
                 subject_claim: "sub".to_string(),
                 email_claim: String::new(),
                 groups_claim: String::new(),
+                fallthrough_on_reject: false,
             },
             AuthProviderConfig::ClientCredentials {
                 token_endpoint: "http://polaris:8181/oauth/tokens".to_string(),
