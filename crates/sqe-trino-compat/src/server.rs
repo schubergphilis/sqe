@@ -738,6 +738,26 @@ async fn submit_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
 
     let session_update = protocol::parse_session_statement(sql);
 
+    // PREPARE / DEALLOCATE PREPARE are session-control statements with no
+    // result set: they register (or forget) the prepared SQL purely via the
+    // x-trino-added-prepare / x-trino-deallocated-prepare response headers, and
+    // must NOT be sent to the executor (the SQL parser rejects Trino's
+    // `PREPARE <name> FROM <sql>` form). This is the Metabase/JDBC connect gate:
+    // the driver issues PREPARE before any query. (#1)
+    if let Some(ref update) = session_update {
+        if !update.added_prepare.is_empty() || !update.deallocated_prepare.is_empty() {
+            let response = TrinoResponse {
+                id: query_id.clone(),
+                info_uri: Some(info_uri(&base_url, &query_id)),
+                stats: TrinoStats::finished(),
+                ..Default::default()
+            };
+            let mut resp = (StatusCode::OK, Json(response)).into_response();
+            apply_session_headers(resp.headers_mut(), update);
+            return resp;
+        }
+    }
+
     // Trino prepared statements are stateless: the client carries the prepared
     // SQL in X-Trino-Prepared-Statement headers and submits `EXECUTE <name>
     // USING ...`. Resolve such a body into concrete SQL before execution.
@@ -1239,6 +1259,39 @@ mod tests {
         let seen = seen.lock().unwrap();
         assert_eq!(seen.len(), 1, "executor should run exactly once");
         assert_eq!(seen[0], "SELECT * FROM t WHERE a = 5");
+    }
+
+    #[tokio::test]
+    async fn submit_prepare_registers_via_header_without_executing() {
+        // PREPARE is the JDBC/Metabase connect gate. It must NOT reach the
+        // executor (the SQL parser rejects `PREPARE <name> FROM <sql>`); it
+        // returns 200 + an x-trino-added-prepare header the client replays.
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let state = recording_state(seen.clone());
+
+        let resp = submit_query::<MockAuthOk, RecordingQuery>(
+            State(state),
+            test_peer(),
+            basic_auth_header("alice", "pw"),
+            "PREPARE ps FROM SELECT 1".to_string(),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "PREPARE must not be sent to the executor"
+        );
+        let hdr = resp
+            .headers()
+            .get("x-trino-added-prepare")
+            .expect("x-trino-added-prepare header")
+            .to_str()
+            .unwrap();
+        assert!(hdr.starts_with("ps="), "header was: {hdr}");
+        // SQL is URL-encoded (space -> '+'), so the client can replay it.
+        assert!(hdr.contains("SELECT"), "header was: {hdr}");
     }
 
     #[tokio::test]
