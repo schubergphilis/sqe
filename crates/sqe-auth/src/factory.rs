@@ -48,6 +48,7 @@ pub async fn build_auth_chain(config: &AuthConfig) -> sqe_core::Result<AuthChain
                     subject_claim,
                     email_claim,
                     groups_claim,
+                    fallthrough_on_reject,
                 } => {
                     info!(
                         index = i,
@@ -63,6 +64,7 @@ pub async fn build_auth_chain(config: &AuthConfig) -> sqe_core::Result<AuthChain
                         email_claim: email_claim.clone(),
                         groups_claim: groups_claim.clone(),
                         accept_invalid_certs: config.should_skip_tls_verify(),
+                        fallthrough_on_reject: *fallthrough_on_reject,
                     };
                     let provider = OidcPasswordProvider::new(oidc_config).map_err(|e| {
                         sqe_core::SqeError::Config(format!(
@@ -255,6 +257,7 @@ pub async fn build_auth_chain(config: &AuthConfig) -> sqe_core::Result<AuthChain
                     roles_claim,
                     subject_claim,
                     scope,
+                    fallthrough_on_reject,
                 } => {
                     info!(
                         index = i,
@@ -267,6 +270,7 @@ pub async fn build_auth_chain(config: &AuthConfig) -> sqe_core::Result<AuthChain
                         subject_claim: subject_claim.clone(),
                         scope: scope.clone(),
                         accept_invalid_certs: config.should_skip_tls_verify(),
+                        fallthrough_on_reject: *fallthrough_on_reject,
                     };
                     let provider = OidcClientCredentialsProvider::new(cc_config).map_err(|e| {
                         sqe_core::SqeError::Config(format!(
@@ -353,6 +357,7 @@ mod tests {
                 subject_claim: "sub".to_string(),
                 email_claim: String::new(),
                 groups_claim: String::new(),
+                fallthrough_on_reject: false,
             }],
             role_mappings: HashMap::new(),
             external: None,
@@ -388,6 +393,7 @@ mod tests {
                     subject_claim: "sub".to_string(),
                     email_claim: String::new(),
                     groups_claim: String::new(),
+                    fallthrough_on_reject: false,
                 },
                 AuthProviderConfig::Anonymous {
                     user: "fallback".to_string(),
@@ -436,5 +442,119 @@ mod tests {
         let chain = build_auth_chain(&config).await.expect("should build chain");
         assert_eq!(chain.len(), 1);
         assert!(!chain.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // #276: ROPC + client_credentials_passthrough coexist on one Basic-auth
+    // listener via fallthrough_on_reject. Exercises the oidc_password
+    // fallthrough path end-to-end (the chain defers to passthrough).
+    // -----------------------------------------------------------------------
+
+    /// Mock token endpoint: 200 + a (fake, unsigned) JWT for a
+    /// `grant_type=client_credentials` request, 401 for anything else
+    /// (i.e. the ROPC `grant_type=password` attempt is rejected).
+    async fn start_grant_aware_server() -> (tokio::task::JoinHandle<()>, String) {
+        use base64::Engine as _;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let url = format!("http://127.0.0.1:{port}/token");
+        // Fake JWT with the claims the passthrough provider reads.
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+            br#"{"preferred_username":"svc-reader","sub":"svc-reader","realm_access":{"roles":["reader"]}}"#,
+        );
+        let jwt = format!("eyJhbGciOiJSUzI1NiJ9.{payload}.sig");
+        let handle = tokio::spawn(async move {
+            for _ in 0..10 {
+                let (mut stream, _) = match listener.accept().await {
+                    Ok(s) => s,
+                    Err(_) => break,
+                };
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = vec![0u8; 8192];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let resp = if req.contains("grant_type=client_credentials") {
+                    let body = format!(
+                        r#"{{"access_token":"{jwt}","expires_in":3600,"token_type":"Bearer"}}"#
+                    );
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                } else {
+                    let body = r#"{"error":"unauthorized_client"}"#;
+                    format!(
+                        "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                };
+                let _ = stream.write_all(resp.as_bytes()).await;
+                let _ = stream.flush().await;
+            }
+        });
+        (handle, url)
+    }
+
+    #[tokio::test]
+    async fn ropc_and_passthrough_coexist_on_one_listener() {
+        let (_h, url) = start_grant_aware_server().await;
+        let config = AuthConfig {
+            keycloak_url: String::new(),
+            realm: String::new(),
+            client_id: String::new(),
+            client_secret: sqe_core::SecretString::default(),
+            token_endpoint: String::new(),
+            token_refresh_buffer_secs: 60,
+            ssl_verification: true,
+            tls_skip_verify: false,
+            roles_claim: "realm_access.roles".to_string(),
+            providers: vec![
+                // ROPC first, with fallthrough so a non-user credential defers.
+                AuthProviderConfig::OidcPassword {
+                    token_url: url.clone(),
+                    client_id: "sqe".to_string(),
+                    client_secret: String::new(),
+                    roles_claim: "realm_access.roles".to_string(),
+                    subject_claim: "sub".to_string(),
+                    email_claim: String::new(),
+                    groups_claim: String::new(),
+                    fallthrough_on_reject: true,
+                },
+                // Service-principal client_id/secret handled here on fallthrough.
+                AuthProviderConfig::ClientCredentialsPassthrough {
+                    token_url: url.clone(),
+                    roles_claim: "realm_access.roles".to_string(),
+                    subject_claim: "sub".to_string(),
+                    scope: None,
+                    fallthrough_on_reject: false,
+                },
+            ],
+            role_mappings: HashMap::new(),
+            external: None,
+            admin_roles: Vec::new(),
+        };
+
+        let chain = build_auth_chain(&config).await.expect("should build chain");
+
+        // A client_id:client_secret Basic credential: ROPC password-grant is
+        // rejected (401) -> oidc_password defers -> passthrough runs the
+        // client_credentials grant (200) and authenticates.
+        let creds = FlightCredentials {
+            username: Some("svc-reader".to_string()),
+            password: Some(sqe_core::SecretString::new("svc-secret".to_string())),
+            ..Default::default()
+        };
+        let identity = chain
+            .authenticate(&creds)
+            .await
+            .expect("service principal must authenticate via passthrough fallthrough");
+        assert_eq!(identity.user_id, "svc-reader");
+        assert!(
+            identity.roles.contains(&"reader".to_string()),
+            "roles came from the client_credentials JWT, proving the passthrough path ran: {:?}",
+            identity.roles
+        );
     }
 }
