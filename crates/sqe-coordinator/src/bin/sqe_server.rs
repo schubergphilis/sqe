@@ -592,6 +592,15 @@ impl TrinoQueryExecutor for QueryHandlerAdapter {
             .map_err(|e| sqe_core::SqeError::Execution(format!("rate limit: {e}")))?;
         self.handler.execute(session, sql, None).await
     }
+
+    async fn describe_prepared(
+        &self,
+        session: &sqe_core::Session,
+        prepared_sql: &str,
+        kind: sqe_trino_compat::protocol::DescribeKind,
+    ) -> Result<Vec<arrow_array::RecordBatch>, sqe_core::SqeError> {
+        self.handler.describe_prepared(session, prepared_sql, kind).await
+    }
 }
 
 // ── Main ───────────────────────────────────────────────────────

@@ -36,6 +36,7 @@ mod partition_evolution_e2e;
 mod quack_e2e;
 mod rewrite_data_files_real;
 mod sql_compat_test;
+mod trino_describe_test;
 mod trino_metadata_test;
 mod trino_session_catalog_test;
 mod v3_e2e;
