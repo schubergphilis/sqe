@@ -2866,15 +2866,12 @@ impl QueryHandler {
             }
         };
 
-        // Query information_schema.columns for the table's column definitions.
-        // Use only the last part of a qualified name for the WHERE filter.
-        let bare_name = table_name.split('.').next_back().unwrap_or(&table_name);
-        let col_sql = format!(
-            "SELECT column_name, data_type, is_nullable \
-             FROM information_schema.columns \
-             WHERE table_name = '{bare_name}' \
-             ORDER BY ordinal_position"
-        );
+        // Query information_schema.columns for the table's column definitions,
+        // qualified by the table's catalog and schema so the lookup hits the
+        // right catalog (a 3-part name, or a 2-part name under the session
+        // catalog) instead of only the default. Without this the body came
+        // back empty for tables outside the default catalog. (#2)
+        let col_sql = info_schema_columns_query(&table_name);
 
         let df = ctx.sql(&col_sql).await.map_err(|e| {
             SqeError::Execution(format!("Failed to query column metadata: {e}"))
@@ -3108,18 +3105,7 @@ impl QueryHandler {
         session: &Session,
         table_name: &str,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
-        // Use only the bare table name for the WHERE filter; information_schema
-        // queries collapse to the leaf table name. The name is client-supplied
-        // (SHOW COLUMNS / DESCRIBE), so escape it as a SQL string literal
-        // (double single-quotes) to prevent injection into this query.
-        let bare_name = table_name.split('.').next_back().unwrap_or(table_name);
-        let bare_name = bare_name.replace('\'', "''");
-        let col_sql = format!(
-            "SELECT column_name, data_type, is_nullable \
-             FROM information_schema.columns \
-             WHERE table_name = '{bare_name}' \
-             ORDER BY ordinal_position"
-        );
+        let col_sql = info_schema_columns_query(table_name);
 
         let (ctx, _) = self.create_session_context(session).await?;
         let df = ctx.sql(&col_sql).await.map_err(|e| {
@@ -5216,6 +5202,43 @@ fn extract_otel_table_info(kind: &StatementKind) -> Option<(Option<String>, Opti
     }
 }
 
+/// Build an `information_schema.columns` query for a (possibly qualified)
+/// table name, qualifying by the table's catalog and schema when present.
+///
+/// A bare name queries the default catalog's information_schema (with the
+/// session catalog as default, that is the caller's catalog). A 2-part
+/// `schema.table` adds a `table_schema` filter; a 3-part
+/// `catalog.schema.table` additionally qualifies the information_schema
+/// reference with that catalog, so SHOW CREATE TABLE / SHOW COLUMNS resolve a
+/// table outside the default catalog instead of returning an empty result.
+///
+/// All interpolated values are escaped (string literals double single-quotes;
+/// the catalog identifier doubles double-quotes) to prevent injection. (#2)
+fn info_schema_columns_query(table_name: &str) -> String {
+    let parts: Vec<&str> = table_name.split('.').collect();
+    let (catalog, schema, bare) = match parts.as_slice() {
+        [t] => (None, None, *t),
+        [s, t] => (None, Some(*s), *t),
+        [c, s, t] => (Some(*c), Some(*s), *t),
+        // More than 3 parts: take the last three as catalog.schema.table.
+        [.., c, s, t] => (Some(*c), Some(*s), *t),
+        [] => (None, None, table_name),
+    };
+    let esc_lit = |s: &str| s.replace('\'', "''");
+    let from = match catalog {
+        Some(c) => format!("\"{}\".information_schema.columns", c.replace('"', "\"\"")),
+        None => "information_schema.columns".to_string(),
+    };
+    let mut where_clause = format!("table_name = '{}'", esc_lit(bare));
+    if let Some(s) = schema {
+        where_clause.push_str(&format!(" AND table_schema = '{}'", esc_lit(s)));
+    }
+    format!(
+        "SELECT column_name, data_type, is_nullable \
+         FROM {from} WHERE {where_clause} ORDER BY ordinal_position"
+    )
+}
+
 /// Decide whether a statement should produce OpenLineage events.
 ///
 /// - SELECT (`Query`): opt-in via `cfg.emit_selects` -- read-only queries
@@ -5339,6 +5362,38 @@ mod tests {
     use super::*;
     use sqe_core::config::QueryConfig;
     use sqe_core::session::Session;
+
+    #[test]
+    fn info_schema_columns_query_qualifies_by_catalog_and_schema() {
+        // Bare name: default catalog's information_schema, no schema filter.
+        let bare = info_schema_columns_query("fct_revenue_monthly");
+        assert!(bare.contains("FROM information_schema.columns"));
+        assert!(bare.contains("table_name = 'fct_revenue_monthly'"));
+        assert!(!bare.contains("table_schema ="));
+
+        // 2-part: adds a schema filter, default catalog.
+        let two = info_schema_columns_query("gold.fct_revenue_monthly");
+        assert!(two.contains("FROM information_schema.columns"));
+        assert!(two.contains("table_name = 'fct_revenue_monthly'"));
+        assert!(two.contains("table_schema = 'gold'"));
+
+        // 3-part: qualifies the information_schema reference with the catalog.
+        let three = info_schema_columns_query("ws_energy_co.gold.fct_revenue_monthly");
+        assert!(three.contains("\"ws_energy_co\".information_schema.columns"));
+        assert!(three.contains("table_schema = 'gold'"));
+        assert!(three.contains("table_name = 'fct_revenue_monthly'"));
+    }
+
+    #[test]
+    fn info_schema_columns_query_escapes_injection() {
+        // Single quotes in the (client-supplied) name are escaped as SQL
+        // string literals; double quotes in the catalog ident are doubled.
+        let q = info_schema_columns_query("ev'il.sch'ema.ta'ble");
+        assert!(q.contains("table_name = 'ta''ble'"));
+        assert!(q.contains("table_schema = 'sch''ema'"));
+        let q2 = info_schema_columns_query(r#"ca"t.s.t"#);
+        assert!(q2.contains("\"ca\"\"t\".information_schema.columns"));
+    }
 
     /// Build a minimal session for timeout tests.
     fn test_session(roles: Vec<&str>) -> Session {
