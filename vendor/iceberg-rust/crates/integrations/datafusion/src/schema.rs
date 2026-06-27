@@ -33,6 +33,39 @@ use iceberg::{Catalog, Error, ErrorKind, NamespaceIdent, Result, TableCreation, 
 use crate::table::IcebergTableProvider;
 use crate::to_datafusion_error;
 
+/// Drive `fut` to completion from a synchronous `SchemaProvider` method,
+/// safely on both multi-thread and current-thread tokio runtimes.
+///
+/// The previous `spawn_blocking(|| Handle::current().block_on(..))` wrapped in
+/// `futures::executor::block_on(join)` deadlocks on a current-thread runtime
+/// (SQE #195): the calling thread parks in `futures::executor::block_on`,
+/// leaving tokio's single-threaded driver un-pumped, so the `Handle::block_on`
+/// inside the spawn_blocking closure can never make progress -> the runtime
+/// wedges. Pick the strategy by runtime flavor instead:
+///
+/// - `MultiThread`: `block_in_place` + `Handle::block_on` (the worker leaves the
+///   scheduler for the await; other workers keep running).
+/// - `CurrentThread`: drive the future on a dedicated OS thread pinned to the
+///   same `Handle`, then join. Never re-enters the single-threaded driver.
+fn block_on_runtime_compat<F>(fut: F) -> F::Output
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    let handle = tokio::runtime::Handle::current();
+    match handle.runtime_flavor() {
+        tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(|| handle.block_on(fut))
+        }
+        _ => std::thread::scope(|scope| {
+            scope
+                .spawn(|| handle.block_on(fut))
+                .join()
+                .expect("iceberg block-on thread panicked")
+        }),
+    }
+}
+
 /// Represents a [`SchemaProvider`] for the Iceberg [`Catalog`], managing
 /// access to table providers within a specific namespace.
 #[derive(Debug)]
@@ -170,42 +203,32 @@ impl SchemaProvider for IcebergSchemaProvider {
         let tables = self.tables.clone();
         let name_clone = name.clone();
 
-        // Use tokio's spawn_blocking to handle the async work on a blocking thread pool
-        let result = tokio::task::spawn_blocking(move || {
-            // Create a new runtime handle to execute the async work
-            let rt = tokio::runtime::Handle::current();
-            rt.block_on(async move {
-                // Verify the input table is empty - CREATE TABLE only accepts schema definition
-                ensure_table_is_empty(&table)
-                    .await
-                    .map_err(to_datafusion_error)?;
-
-                catalog
-                    .create_table(&namespace, table_creation)
-                    .await
-                    .map_err(to_datafusion_error)?;
-
-                // Create a new table provider using the catalog reference
-                let table_provider = IcebergTableProvider::try_new(
-                    catalog.clone(),
-                    namespace.clone(),
-                    name_clone.clone(),
-                )
+        // Bridge this synchronous trait method into the async catalog API with a
+        // runtime-flavor-aware helper (SQE #195). The earlier
+        // `futures::executor::block_on(spawn_blocking(|| Handle::block_on(..)))`
+        // pattern deadlocked the embedded CLI's current-thread runtime.
+        block_on_runtime_compat(async move {
+            // Verify the input table is empty - CREATE TABLE only accepts schema definition
+            ensure_table_is_empty(&table)
                 .await
                 .map_err(to_datafusion_error)?;
 
-                // Store the new table provider
-                tables.insert(name_clone, Arc::new(table_provider));
+            catalog
+                .create_table(&namespace, table_creation)
+                .await
+                .map_err(to_datafusion_error)?;
 
-                Ok(None)
-            })
-        });
+            // Create a new table provider using the catalog reference
+            let table_provider =
+                IcebergTableProvider::try_new(catalog.clone(), namespace.clone(), name_clone.clone())
+                    .await
+                    .map_err(to_datafusion_error)?;
 
-        // Block on the spawned task to get the result
-        // This is safe because spawn_blocking moves the blocking to a dedicated thread pool
-        futures::executor::block_on(result).map_err(|e| {
-            DataFusionError::Execution(format!("Failed to create Iceberg table: {e}"))
-        })?
+            // Store the new table provider
+            tables.insert(name_clone, Arc::new(table_provider));
+
+            Ok(None)
+        })
     }
 
     fn deregister_table(&self, name: &str) -> DFResult<Option<Arc<dyn TableProvider>>> {
@@ -219,29 +242,23 @@ impl SchemaProvider for IcebergSchemaProvider {
         let tables = self.tables.clone();
         let table_name = name.to_string();
 
-        // Use tokio's spawn_blocking to handle the async work on a blocking thread pool
-        let result = tokio::task::spawn_blocking(move || {
-            let rt = tokio::runtime::Handle::current();
-            rt.block_on(async move {
-                let table_ident = TableIdent::new(namespace, table_name.clone());
+        // Runtime-flavor-aware bridge; see register_table / SQE #195.
+        block_on_runtime_compat(async move {
+            let table_ident = TableIdent::new(namespace, table_name.clone());
 
-                // Drop the table from the Iceberg catalog
-                catalog
-                    .drop_table(&table_ident)
-                    .await
-                    .map_err(to_datafusion_error)?;
+            // Drop the table from the Iceberg catalog
+            catalog
+                .drop_table(&table_ident)
+                .await
+                .map_err(to_datafusion_error)?;
 
-                // Remove from local cache and return the removed provider
-                let removed = tables
-                    .remove(&table_name)
-                    .map(|(_, table)| table as Arc<dyn TableProvider>);
+            // Remove from local cache and return the removed provider
+            let removed = tables
+                .remove(&table_name)
+                .map(|(_, table)| table as Arc<dyn TableProvider>);
 
-                Ok(removed)
-            })
-        });
-
-        futures::executor::block_on(result)
-            .map_err(|e| DataFusionError::Execution(format!("Failed to drop Iceberg table: {e}")))?
+            Ok(removed)
+        })
     }
 }
 
