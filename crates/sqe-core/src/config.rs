@@ -3254,6 +3254,32 @@ impl SqeConfig {
         if !self.auth.keycloak_url.is_empty() {
             tracing::warn!("config key 'auth.keycloak_url' is deprecated — the OIDC password grant provider works with any OIDC-compliant endpoint, not just Keycloak. This key will continue to work but may be renamed in a future release.");
         }
+        if let Some(w) = self.legacy_auth_ignored_warning() {
+            tracing::warn!("{w}");
+        }
+    }
+
+    /// #276: when both the legacy flat endpoint config (`auth.keycloak_url` /
+    /// `auth.token_endpoint`) and `[[auth.providers]]` are set, the provider
+    /// chain takes precedence and the legacy endpoint fields are ignored. This
+    /// used to be silent; surface it as a warning so operators notice the dead
+    /// config. Returns `None` when there is no ambiguity. The shared
+    /// `auth.client_id`/`client_secret` are intentionally NOT flagged — the
+    /// `oidc_password` provider may inherit `client_secret` from `[auth]`.
+    pub(crate) fn legacy_auth_ignored_warning(&self) -> Option<String> {
+        let has_providers = !self.auth.providers.is_empty();
+        let has_legacy_endpoint = !self.auth.keycloak_url.trim().is_empty()
+            || !self.auth.token_endpoint.trim().is_empty();
+        if has_providers && has_legacy_endpoint {
+            Some(
+                "auth.keycloak_url / auth.token_endpoint (legacy) are set alongside \
+                 [[auth.providers]]; the provider chain takes precedence and the legacy \
+                 endpoint fields are IGNORED. Remove them to avoid confusion."
+                    .to_string(),
+            )
+        } else {
+            None
+        }
     }
 
     /// Apply environment variable overrides. Convention: `SQE_<SECTION>__<FIELD>`.
@@ -4028,6 +4054,62 @@ mod tests {
         config.auth.keycloak_url = String::new();
         config.auth.token_endpoint = "https://token.example.com/token".to_string();
         assert!(config.validate().is_ok());
+    }
+
+    // #276: legacy flat endpoint config + [[auth.providers]] is ambiguous.
+    fn oidc_provider_for_validate() -> AuthProviderConfig {
+        AuthProviderConfig::OidcPassword {
+            token_url: "https://idp.example.com/token".to_string(),
+            client_id: "sqe".to_string(),
+            client_secret: String::new(),
+            roles_claim: "realm_access.roles".to_string(),
+            subject_claim: "sub".to_string(),
+            email_claim: String::new(),
+            groups_claim: String::new(),
+            fallthrough_on_reject: false,
+        }
+    }
+
+    #[test]
+    fn warns_when_legacy_keycloak_url_set_with_providers() {
+        let mut config = valid_config(); // valid_config sets keycloak_url
+        config.auth.providers = vec![oidc_provider_for_validate()];
+        // Non-fatal (3 quickstarts intentionally set both), but warned.
+        assert!(config.validate().is_ok());
+        let w = config.legacy_auth_ignored_warning().expect("warning");
+        assert!(w.contains("IGNORED"), "got: {w}");
+    }
+
+    #[test]
+    fn warns_when_legacy_token_endpoint_set_with_providers() {
+        let mut config = valid_config();
+        config.auth.keycloak_url = String::new();
+        config.auth.token_endpoint = "https://token.example.com/token".to_string();
+        config.auth.providers = vec![oidc_provider_for_validate()];
+        assert!(config.legacy_auth_ignored_warning().is_some());
+    }
+
+    #[test]
+    fn no_warning_for_providers_without_legacy_endpoints() {
+        let mut config = valid_config();
+        config.auth.keycloak_url = String::new();
+        config.auth.token_endpoint = String::new();
+        config.auth.providers = vec![oidc_provider_for_validate()];
+        assert!(config.validate().is_ok(), "{:?}", config.validate());
+        assert!(config.legacy_auth_ignored_warning().is_none());
+    }
+
+    #[test]
+    fn no_warning_for_shared_client_secret_with_providers() {
+        // The shared [auth].client_secret is fine alongside providers (the
+        // oidc_password provider may inherit it); only legacy ENDPOINT fields
+        // trigger the precedence warning.
+        let mut config = valid_config();
+        config.auth.keycloak_url = String::new();
+        config.auth.token_endpoint = String::new();
+        config.auth.client_secret = SecretString::new("shared".to_string());
+        config.auth.providers = vec![oidc_provider_for_validate()];
+        assert!(config.legacy_auth_ignored_warning().is_none());
     }
 
     #[test]
@@ -5381,6 +5463,7 @@ otlp_endpoint = ""
             subject_claim: "sub".to_string(),
             email_claim: String::new(),
             groups_claim: String::new(),
+            fallthrough_on_reject: false,
         }];
 
         cfg.apply_env_overrides();
@@ -5409,6 +5492,7 @@ otlp_endpoint = ""
             subject_claim: "sub".to_string(),
             email_claim: String::new(),
             groups_claim: String::new(),
+            fallthrough_on_reject: false,
         }];
 
         cfg.apply_env_overrides();
