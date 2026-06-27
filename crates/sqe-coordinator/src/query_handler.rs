@@ -2227,6 +2227,63 @@ impl QueryHandler {
         }
     }
 
+    /// Describe a prepared statement: its output columns (`DESCRIBE OUTPUT`) or
+    /// its bind parameters (`DESCRIBE INPUT`). Returns a synthetic result set
+    /// matching Trino's column layout. `prepared_sql` is the statement template
+    /// with `?` placeholders; they are numbered to `$1..$N` so DataFusion can
+    /// plan it (inferring the output schema and placeholder types) without
+    /// bound values. (#3)
+    pub async fn describe_prepared(
+        &self,
+        session: &Session,
+        prepared_sql: &str,
+        kind: sqe_trino_compat::protocol::DescribeKind,
+    ) -> sqe_core::Result<Vec<RecordBatch>> {
+        use sqe_trino_compat::protocol::DescribeKind;
+        let (numbered_sql, param_count) = sqe_core::number_placeholders(prepared_sql);
+        match kind {
+            DescribeKind::Output => {
+                let schema = self.get_schema(session, &numbered_sql).await?;
+                build_describe_output(&schema)
+            }
+            DescribeKind::Input => {
+                let param_types = self
+                    .prepared_parameter_types(session, &numbered_sql, param_count)
+                    .await?;
+                build_describe_input(&param_types)
+            }
+        }
+    }
+
+    /// Plan a (placeholder-numbered) statement and return the inferred type of
+    /// each bind parameter in positional order. `None` for a parameter whose
+    /// type DataFusion could not infer.
+    async fn prepared_parameter_types(
+        &self,
+        session: &Session,
+        numbered_sql: &str,
+        param_count: usize,
+    ) -> sqe_core::Result<Vec<Option<DataType>>> {
+        let kind = sqe_sql::parse_and_classify_typed(
+            &sqe_sql::pre_parse_pipeline(&sqe_sql::UserSql::from(numbered_sql))?,
+        )?;
+        if let Some(stmt) = kind.statement() {
+            self.preflight_resolve_catalogs(stmt, session).await?;
+        }
+        let (ctx, _session_catalog) = self.create_session_context(session).await?;
+        let df = ctx
+            .sql(numbered_sql)
+            .await
+            .map_err(|e| SqeError::Execution(format!("SQL planning failed: {e}")))?;
+        let types_map = df
+            .logical_plan()
+            .get_parameter_types()
+            .map_err(|e| SqeError::Execution(format!("parameter type inference failed: {e}")))?;
+        Ok((1..=param_count)
+            .map(|i| types_map.get(&format!("${i}")).cloned().flatten())
+            .collect())
+    }
+
     /// Execute a SELECT query through DataFusion with the user's catalog.
     ///
     /// After policy enforcement and physical planning, this method attempts to
@@ -5237,6 +5294,86 @@ fn info_schema_columns_query(table_name: &str) -> String {
         "SELECT column_name, data_type, is_nullable \
          FROM {from} WHERE {where_clause} ORDER BY ordinal_position"
     )
+}
+
+/// Build the `DESCRIBE OUTPUT` result set for a prepared statement's output
+/// schema: one row per column, matching Trino's column layout
+/// (Column Name, Catalog, Schema, Table, Type, Type Size, Aliased). Catalog /
+/// Schema / Table are null (SQE does not track per-column source bindings);
+/// Type is the Trino type name; Type Size is the fixed byte width where known.
+fn build_describe_output(schema: &SchemaRef) -> sqe_core::Result<Vec<RecordBatch>> {
+    use arrow_array::builder::{BooleanBuilder, Int64Builder};
+    let out_schema = Arc::new(Schema::new(vec![
+        Field::new("Column Name", DataType::Utf8, false),
+        Field::new("Catalog", DataType::Utf8, true),
+        Field::new("Schema", DataType::Utf8, true),
+        Field::new("Table", DataType::Utf8, true),
+        Field::new("Type", DataType::Utf8, false),
+        Field::new("Type Size", DataType::Int64, true),
+        Field::new("Aliased", DataType::Boolean, false),
+    ]));
+    let mut name_b = StringBuilder::new();
+    let mut cat_b = StringBuilder::new();
+    let mut sch_b = StringBuilder::new();
+    let mut tbl_b = StringBuilder::new();
+    let mut type_b = StringBuilder::new();
+    let mut size_b = Int64Builder::new();
+    let mut aliased_b = BooleanBuilder::new();
+    for field in schema.fields() {
+        name_b.append_value(field.name());
+        cat_b.append_null();
+        sch_b.append_null();
+        tbl_b.append_null();
+        type_b.append_value(sqe_trino_compat::types::arrow_to_trino_type(field.data_type()));
+        match field.data_type().primitive_width() {
+            Some(w) => size_b.append_value(w as i64),
+            None => size_b.append_null(),
+        }
+        aliased_b.append_value(false);
+    }
+    let batch = RecordBatch::try_new(
+        out_schema.clone(),
+        vec![
+            Arc::new(name_b.finish()) as ArrayRef,
+            Arc::new(cat_b.finish()) as ArrayRef,
+            Arc::new(sch_b.finish()) as ArrayRef,
+            Arc::new(tbl_b.finish()) as ArrayRef,
+            Arc::new(type_b.finish()) as ArrayRef,
+            Arc::new(size_b.finish()) as ArrayRef,
+            Arc::new(aliased_b.finish()) as ArrayRef,
+        ],
+    )
+    .map_err(|e| SqeError::Execution(format!("Failed to build DESCRIBE OUTPUT batch: {e}")))?;
+    Ok(vec![batch])
+}
+
+/// Build the `DESCRIBE INPUT` result set: one row per bind parameter
+/// (Position, Type), matching Trino's layout. Position is 0-based; Type is the
+/// inferred Trino type name, or `unknown` when DataFusion could not infer it.
+fn build_describe_input(param_types: &[Option<DataType>]) -> sqe_core::Result<Vec<RecordBatch>> {
+    use arrow_array::builder::Int64Builder;
+    let out_schema = Arc::new(Schema::new(vec![
+        Field::new("Position", DataType::Int64, false),
+        Field::new("Type", DataType::Utf8, false),
+    ]));
+    let mut pos_b = Int64Builder::new();
+    let mut type_b = StringBuilder::new();
+    for (i, dt) in param_types.iter().enumerate() {
+        pos_b.append_value(i as i64);
+        match dt {
+            Some(dt) => type_b.append_value(sqe_trino_compat::types::arrow_to_trino_type(dt)),
+            None => type_b.append_value("unknown"),
+        }
+    }
+    let batch = RecordBatch::try_new(
+        out_schema.clone(),
+        vec![
+            Arc::new(pos_b.finish()) as ArrayRef,
+            Arc::new(type_b.finish()) as ArrayRef,
+        ],
+    )
+    .map_err(|e| SqeError::Execution(format!("Failed to build DESCRIBE INPUT batch: {e}")))?;
+    Ok(vec![batch])
 }
 
 /// Decide whether a statement should produce OpenLineage events.
