@@ -234,7 +234,10 @@ impl SqeError {
             SqeError::CatalogHttp { status, .. } => *status == 404,
             SqeError::Sourced { code, .. } => matches!(
                 code,
-                SqeErrorCode::TableNotFound | SqeErrorCode::ViewNotFound
+                SqeErrorCode::TableNotFound
+                    | SqeErrorCode::ViewNotFound
+                    | SqeErrorCode::SchemaNotFound
+                    | SqeErrorCode::CatalogNotFound
             ),
             _ => false,
         }
@@ -863,6 +866,27 @@ mod tests {
         let err =
             SqeError::Catalog("Failed to drop view (HTTP 500 Internal Server Error)".into());
         assert!(!err.is_not_found());
+    }
+
+    #[test]
+    fn is_not_found_true_for_sourced_not_found_codes() {
+        // A migrated catalog boundary (Sourced) must report is_not_found()
+        // for every not-found code, not just Table/View. Namespace ops
+        // (list_namespaces, get_namespace) classify a 404 as SchemaNotFound /
+        // CatalogNotFound; without these arms a `catalog_src` migration would
+        // silently flip is_not_found() from true to false. (#268)
+        for code in [
+            SqeErrorCode::TableNotFound,
+            SqeErrorCode::ViewNotFound,
+            SqeErrorCode::SchemaNotFound,
+            SqeErrorCode::CatalogNotFound,
+        ] {
+            let err = SqeError::sourced(code, "not found", DummyCause("404"));
+            assert!(err.is_not_found(), "{code} should be is_not_found");
+        }
+        // A non-not-found code stays false.
+        let other = SqeError::sourced(SqeErrorCode::CatalogError, "boom", DummyCause("500"));
+        assert!(!other.is_not_found());
     }
 
     #[test]
