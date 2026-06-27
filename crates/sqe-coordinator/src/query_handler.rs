@@ -322,6 +322,15 @@ impl QueryHandler {
         session: &Session,
         catalog: Option<&str>,
     ) -> sqe_core::Result<Arc<SessionCatalog>> {
+        // An explicit catalog in the SHOW statement wins; otherwise fall back to
+        // the session catalog (the connection's X-Trino-Catalog / Flight
+        // catalog). Without this, `SHOW TABLES` / `SHOW TABLES FROM <schema>`
+        // and `SHOW SCHEMAS` (no catalog qualifier) resolved against the default
+        // warehouse and ignored the session catalog, so a BI client syncing
+        // against a polaris-auto-discovered catalog saw 0 tables -- while the
+        // SELECT path worked because its explicit 3-part name triggered
+        // discovery. This aligns the SHOW path with the SELECT path. (#6/#2)
+        let catalog = catalog.or(session.default_catalog.as_deref());
         if let Some(cat) = catalog {
             if cat != self.config.catalog.warehouse
                 && self.config.query.catalog_discovery
