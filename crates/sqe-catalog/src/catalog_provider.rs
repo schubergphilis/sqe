@@ -148,7 +148,22 @@ impl SqeCatalogProvider {
         session_user: Option<SessionUser>,
         namespace_visibility_filter: bool,
     ) -> sqe_core::Result<Self> {
-        let mut namespaces = session_catalog.list_namespaces().await?;
+        // A principal not authorized to list this catalog's namespaces gets an
+        // empty list, not a hard error: the catalog still registers (so it
+        // appears in SHOW CATALOGS / system.jdbc.catalogs) but exposes no
+        // namespaces to this caller, instead of aborting the whole session
+        // context build. Per-operation checks still protect the data. (#5)
+        let mut namespaces = match session_catalog.list_namespaces().await {
+            Ok(ns) => ns,
+            Err(e) if e.error_code() == sqe_core::SqeErrorCode::AccessDenied => {
+                debug!(
+                    warehouse = %warehouse,
+                    "principal not authorized to list namespaces; registering catalog with none visible"
+                );
+                Vec::new()
+            }
+            Err(e) => return Err(e),
+        };
 
         if namespace_visibility_filter && session_catalog.is_rest_backend() {
             let listed = namespaces.len();

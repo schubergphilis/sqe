@@ -160,11 +160,21 @@ pub async fn create_session_context(
     table_cache: Option<&TableMetadataCache>,
     runtime_catalogs: &RuntimeCatalogRegistry,
 ) -> sqe_core::Result<(SessionContext, Arc<SessionCatalog>)> {
-    // --- Cache key: username + token fingerprint ---
+    // --- Cache key: username + token fingerprint + session catalog/schema ---
     // Different tokens from the same user must not share a stale SessionCatalog.
     // We key by username + first 16 hex chars of the SHA-256 of the access token.
+    // The session catalog/schema (X-Trino-Catalog / X-Trino-Schema) are part of
+    // the key: the same user+token opening two connections against different
+    // catalogs/schemas builds distinct DataFusion default-catalog contexts and
+    // must not collide in the cache.
     let token_hash = format!("{:x}", Sha256::digest(session.access_token().expose_bytes()));
-    let cache_key = format!("{}:{}", session.user.username, &token_hash[..16]);
+    let cache_key = format!(
+        "{}:{}:{}:{}",
+        session.user.username,
+        &token_hash[..16],
+        session.default_catalog.as_deref().unwrap_or(""),
+        session.default_schema.as_deref().unwrap_or(""),
+    );
 
     // --- Atomic cache lookup / build via try_get_with ---
     // Eliminates the TOCTOU race where two concurrent requests for the same key
@@ -195,9 +205,63 @@ pub async fn create_session_context(
                 .collect();
             let catalog_name = config.resolve_default_catalog();
 
+            // --- Session catalog/schema resolution (Trino X-Trino-Catalog /
+            //     X-Trino-Schema) ---
+            // Honor the session catalog and schema for ALL table resolution,
+            // not just 3-part identifiers: an unqualified `t` resolves to
+            // `<session-catalog>.<session-schema>.t` and a 2-part `s.t` to
+            // `<session-catalog>.s.t`. The session catalog may be a Polaris
+            // warehouse that is not in static config (the same path 3-part
+            // names trigger), so discover and register it here so DataFusion
+            // can resolve unqualified/2-part names against it. Falls back to
+            // the config default catalog when the session names none, or names
+            // one that does not resolve for this principal -- so unqualified
+            // queries never break with "unknown catalog".
+            let config_catalog_names: std::collections::HashSet<&str> =
+                flattened.iter().map(|(n, _)| n.as_str()).collect();
+            let session_schema = session
+                .default_schema
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .unwrap_or("default")
+                .to_string();
+            let mut discovered_session_catalog: Option<(
+                String,
+                SqeCatalogProvider,
+                Arc<SessionCatalog>,
+            )> = None;
+            let default_catalog = match session
+                .default_catalog
+                .as_deref()
+                .filter(|c| !c.is_empty())
+            {
+                // Already a static-config catalog: the loop below registers it;
+                // just point DataFusion's default at it.
+                Some(c) if config_catalog_names.contains(c) => c.to_string(),
+                // Non-config catalog: try Polaris discovery with the caller's
+                // bearer. Register it only if Polaris resolves it for this
+                // principal; otherwise keep the config default.
+                Some(c) => {
+                    match discover_catalog_provider(
+                        c, config, session, table_cache, policy_store, prom_metrics,
+                    )
+                    .await
+                    {
+                        Some((provider, session_catalog)) => {
+                            discovered_session_catalog =
+                                Some((c.to_string(), provider, session_catalog));
+                            c.to_string()
+                        }
+                        None => catalog_name.clone(),
+                    }
+                }
+                None => catalog_name.clone(),
+            };
+            drop(config_catalog_names);
+
             let session_config = SessionConfig::new()
                 .with_information_schema(true)
-                .with_default_catalog_and_schema(&catalog_name, "default")
+                .with_default_catalog_and_schema(&default_catalog, &session_schema)
                 // Parse numeric literals like 0.06 as DECIMAL instead of DOUBLE.
                 // Matches Trino/SQL standard behavior: 0.06 - 0.01 = 0.05 (exact),
                 // not 0.049999999999999996 (floating-point). Critical for correct
@@ -356,6 +420,11 @@ pub async fn create_session_context(
             // pick the primary by name via `query.default_catalog`.
             let global_storage = config.storage.clone();
             let mut primary_session_catalog: Option<Arc<SessionCatalog>> = None;
+            // Every reachable catalog paired with its SessionCatalog, so the
+            // system.jdbc.* / system.metadata.* providers enumerate all of them
+            // (config catalogs + the session's own discovered catalog), not just
+            // the default. (#5)
+            let mut system_catalog_entries: Vec<sqe_catalog::SystemCatalogEntry> = Vec::new();
 
             for (cat_name, cat_cfg) in &flattened {
                 let (catalog_provider, session_catalog) = build_catalog_provider(
@@ -369,10 +438,29 @@ pub async fn create_session_context(
                 )
                 .await?;
                 ctx.register_catalog(cat_name, Arc::new(catalog_provider));
+                system_catalog_entries.push(sqe_catalog::SystemCatalogEntry {
+                    name: cat_name.clone(),
+                    catalog: session_catalog.clone(),
+                });
 
                 if primary_session_catalog.is_none() {
                     primary_session_catalog = Some(session_catalog);
                 }
+            }
+
+            // Register the session's discovered Polaris catalog (from
+            // X-Trino-Catalog) when it is not a static-config catalog, so
+            // 2-part and bare table names resolve against it -- and add it to the
+            // system metadata enumeration so JDBC clients see it. Skipped when
+            // the session names no catalog, names a config catalog (already
+            // registered above), or Polaris did not resolve it (default fell
+            // back to the config catalog).
+            if let Some((cat_name, provider, session_catalog)) = discovered_session_catalog {
+                ctx.register_catalog(cat_name.clone(), Arc::new(provider));
+                system_catalog_entries.push(sqe_catalog::SystemCatalogEntry {
+                    name: cat_name,
+                    catalog: session_catalog,
+                });
             }
 
             // Hold onto the primary for downstream consumers that
@@ -387,7 +475,6 @@ pub async fn create_session_context(
                 ))
             })?;
             let session_catalog_for_return = session_catalog.clone();
-            let session_catalog_for_system = session_catalog.clone();
 
             // Register the system catalog for Trino JDBC metadata browsing
             // (system.jdbc.types, system.jdbc.catalogs, system.jdbc.schemas, etc.)
@@ -457,16 +544,12 @@ pub async fn create_session_context(
                 coordinator_uri,
                 config.coordinator.worker_urls.clone(),
             ));
-            // All configured catalog names so `system.jdbc.catalogs` enumerates
-            // every catalog the session can see, not just the default (#5).
-            let jdbc_catalog_names: Vec<String> =
-                flattened.iter().map(|(name, _)| name.clone()).collect();
-            let system_catalog = sqe_catalog::SystemCatalogProvider::new(
-                session_catalog_for_system,
-                config.catalog.warehouse.clone(),
-                jdbc_catalog_names,
-            )
-            .with_runtime(runtime_schema);
+            // Enumerate every reachable catalog (config catalogs + the session's
+            // own discovered catalog) so `system.jdbc.*` / `system.metadata.*`
+            // see all of them, not just the default. (#5)
+            let system_catalog =
+                sqe_catalog::SystemCatalogProvider::new(system_catalog_entries)
+                    .with_runtime(runtime_schema);
             ctx.register_catalog("system", Arc::new(system_catalog));
 
             // Register any catalogs attached at runtime via ATTACH.
@@ -499,11 +582,15 @@ pub async fn create_session_context(
             //
             // database: wired to config.catalog.warehouse (the Polaris warehouse name).
             // schema: None -- no per-session default namespace is set at this point (MVP).
+            // current_catalog() / current_database() return the session's
+            // effective catalog (X-Trino-Catalog, else the config default) and
+            // current_schema() returns the session schema (X-Trino-Schema, else
+            // "default"), so Trino clients see the catalog/schema they set. (#1)
             let session_identity = std::sync::Arc::new(sqe_policy::session_udf::SessionIdentity {
                 username: session.user.username.clone(),
                 roles: session.user.roles.clone(),
-                database: Some(config.catalog.warehouse.clone()),
-                schema: None,
+                database: Some(default_catalog.clone()),
+                schema: Some(session_schema.clone()),
             });
             for udf in sqe_policy::session_udf::session_udfs(session_identity) {
                 ctx.register_udf(udf);
@@ -671,7 +758,7 @@ pub(crate) async fn discover_catalog_provider(
     table_cache: Option<&TableMetadataCache>,
     policy_store: Option<&Arc<dyn PolicyStore>>,
     prom_metrics: Option<&Arc<sqe_metrics::MetricsRegistry>>,
-) -> Option<SqeCatalogProvider> {
+) -> Option<(SqeCatalogProvider, Arc<SessionCatalog>)> {
     if config.query.catalog_discovery != sqe_core::config::CatalogDiscovery::PolarisAuto {
         return None;
     }
@@ -689,7 +776,7 @@ pub(crate) async fn discover_catalog_provider(
     )
     .await
     {
-        Ok((provider, _)) => Some(provider),
+        Ok((provider, session_catalog)) => Some((provider, session_catalog)),
         Err(e) => {
             tracing::info!(
                 warehouse,

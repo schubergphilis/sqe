@@ -277,6 +277,50 @@ impl ScalarUDFImpl for CurrentDatabaseFunc {
 }
 
 // ---------------------------------------------------------------------------
+// current_catalog() -- Trino/SQL-standard alias for the session catalog.
+// Trino clients call `current_catalog`; it returns the same value as
+// `current_database` (the session's catalog / Polaris warehouse).
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct CurrentCatalogFunc {
+    identity: Arc<SessionIdentity>,
+    signature: Signature,
+}
+
+impl CurrentCatalogFunc {
+    fn new(identity: Arc<SessionIdentity>) -> Self {
+        Self {
+            identity,
+            signature: Signature::exact(vec![], Volatility::Immutable),
+        }
+    }
+}
+
+impl ScalarUDFImpl for CurrentCatalogFunc {
+    fn name(&self) -> &str {
+        "current_catalog"
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, _arg_types: &[DataType]) -> datafusion::error::Result<DataType> {
+        Ok(DataType::Utf8)
+    }
+
+    fn invoke_with_args(
+        &self,
+        _args: ScalarFunctionArgs,
+    ) -> datafusion::error::Result<ColumnarValue> {
+        Ok(ColumnarValue::Scalar(ScalarValue::Utf8(
+            self.identity.database.clone(),
+        )))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // current_schema()
 // ---------------------------------------------------------------------------
 
@@ -331,6 +375,7 @@ pub fn session_udfs(identity: Arc<SessionIdentity>) -> Vec<ScalarUDF> {
         ScalarUDF::from(IsRoleInSessionFunc::new(Arc::clone(&identity))),
         ScalarUDF::from(CurrentAvailableRolesFunc::new(Arc::clone(&identity))),
         ScalarUDF::from(CurrentDatabaseFunc::new(Arc::clone(&identity))),
+        ScalarUDF::from(CurrentCatalogFunc::new(Arc::clone(&identity))),
         ScalarUDF::from(CurrentSchemaFunc::new(Arc::clone(&identity))),
     ]
 }
@@ -667,9 +712,9 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_session_udfs_returns_five() {
+    fn test_session_udfs_returns_six() {
         let udfs = session_udfs(alice_identity());
-        assert_eq!(udfs.len(), 5);
+        assert_eq!(udfs.len(), 6);
     }
 
     #[test]
@@ -680,6 +725,7 @@ mod tests {
         assert!(names.contains(&"is_role_in_session"));
         assert!(names.contains(&"current_available_roles"));
         assert!(names.contains(&"current_database"));
+        assert!(names.contains(&"current_catalog"));
         assert!(names.contains(&"current_schema"));
     }
 

@@ -942,6 +942,26 @@ impl SessionCatalog {
         &self.warehouse
     }
 
+    /// Record a catalog-call outcome on the circuit breaker, treating a 401/403
+    /// as a non-fault. An auth failure is a per-principal authorization
+    /// decision, not a transient catalog fault: counting it would open the
+    /// breaker and turn later authorized calls into CircuitBreakerOpen errors.
+    /// During metadata enumeration that would let a forbidden namespace/table
+    /// poison the rest of the catalog. Only real faults (5xx, network, timeout)
+    /// trip the breaker. (#5)
+    fn record_breaker_outcome<T>(&self, result: &sqe_core::Result<T>) {
+        match result {
+            Ok(_) => self.circuit_breaker.record_success(),
+            Err(e)
+                if matches!(
+                    e.error_code(),
+                    sqe_core::SqeErrorCode::AccessDenied
+                        | sqe_core::SqeErrorCode::AuthenticationFailed
+                ) => {}
+            Err(_) => self.circuit_breaker.record_failure(),
+        }
+    }
+
     /// List all namespaces in the catalog.
     #[instrument(skip(self), fields(warehouse = %self.warehouse))]
     pub async fn list_namespaces(&self) -> sqe_core::Result<Vec<NamespaceIdent>> {
@@ -952,10 +972,7 @@ impl SessionCatalog {
         let started = Instant::now();
         let result = dispatch_catalog!(self.inner, list_namespaces(None))
             .map_err(|e| sqe_core::SqeError::catalog_src(format!("Failed to list namespaces: {e}"), e));
-        match &result {
-            Ok(_) => self.circuit_breaker.record_success(),
-            Err(_) => self.circuit_breaker.record_failure(),
-        }
+        self.record_breaker_outcome(&result);
         self.record_catalog_call("list_namespaces", started, result.is_ok());
         result
     }
@@ -1032,10 +1049,7 @@ impl SessionCatalog {
         let started = Instant::now();
         let result = dispatch_catalog!(self.inner, list_tables(namespace))
             .map_err(|e| sqe_core::SqeError::catalog_src(format!("Failed to list tables: {e}"), e));
-        match &result {
-            Ok(_) => self.circuit_breaker.record_success(),
-            Err(_) => self.circuit_breaker.record_failure(),
-        }
+        self.record_breaker_outcome(&result);
         self.record_catalog_call("list_tables", started, result.is_ok());
         result
     }
@@ -1218,6 +1232,14 @@ impl SessionCatalog {
                     });
                 }
             }
+            // Auth failures (401/403) are per-principal decisions, not faults:
+            // do not let them open the breaker (#5). Other errors do.
+            Err(e)
+                if matches!(
+                    e.error_code(),
+                    sqe_core::SqeErrorCode::AccessDenied
+                        | sqe_core::SqeErrorCode::AuthenticationFailed
+                ) => {}
             Err(_) => self.circuit_breaker.record_failure(),
         }
         self.record_catalog_call("load_table", started, result.is_ok());
