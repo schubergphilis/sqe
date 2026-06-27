@@ -322,6 +322,15 @@ impl QueryHandler {
         session: &Session,
         catalog: Option<&str>,
     ) -> sqe_core::Result<Arc<SessionCatalog>> {
+        // An explicit catalog in the SHOW statement wins; otherwise fall back to
+        // the session catalog (the connection's X-Trino-Catalog / Flight
+        // catalog). Without this, `SHOW TABLES` / `SHOW TABLES FROM <schema>`
+        // and `SHOW SCHEMAS` (no catalog qualifier) resolved against the default
+        // warehouse and ignored the session catalog, so a BI client syncing
+        // against a polaris-auto-discovered catalog saw 0 tables -- while the
+        // SELECT path worked because its explicit 3-part name triggered
+        // discovery. This aligns the SHOW path with the SELECT path. (#6/#2)
+        let catalog = catalog.or(session.default_catalog.as_deref());
         if let Some(cat) = catalog {
             if cat != self.config.catalog.warehouse
                 && self.config.query.catalog_discovery
@@ -3117,8 +3126,12 @@ impl QueryHandler {
         let catalog = show_tables_catalog(filter);
         let session_catalog = self.show_catalog(session, catalog.as_deref()).await?;
 
-        // If a filter is provided, use it as the namespace; otherwise list all namespaces
-        let ns_name = parse_show_tables_namespace(filter);
+        // Explicit `FROM <schema>` wins; otherwise fall back to the session
+        // schema (X-Trino-Schema) so bare `SHOW TABLES` lists that schema's
+        // tables (Trino behavior). Only when neither is set list all
+        // namespaces. (#7)
+        let ns_name =
+            parse_show_tables_namespace(filter).or_else(|| session.default_schema.clone());
         let namespaces = match ns_name {
             None => session_catalog.list_namespaces().await?,
             Some(name) => vec![iceberg::NamespaceIdent::new(name)],
