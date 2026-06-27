@@ -526,15 +526,16 @@ impl QueryHandler {
             if known.contains(q) {
                 continue;
             }
-            if let Some(provider) = crate::session_context::discover_catalog_provider(
-                q,
-                &self.config,
-                session,
-                self.table_cache.as_ref(),
-                self.policy_store.as_ref(),
-                self.metrics.as_ref(),
-            )
-            .await
+            if let Some((provider, _session_catalog)) =
+                crate::session_context::discover_catalog_provider(
+                    q,
+                    &self.config,
+                    session,
+                    self.table_cache.as_ref(),
+                    self.policy_store.as_ref(),
+                    self.metrics.as_ref(),
+                )
+                .await
             {
                 ctx.register_catalog(q.clone(), std::sync::Arc::new(provider));
                 known.insert(q.clone());
@@ -2980,16 +2981,31 @@ impl QueryHandler {
         Ok(vec![result])
     }
 
-    /// Handle SHOW CATALOGS by returning the configured warehouse name.
+    /// Handle SHOW CATALOGS by listing every catalog the session can reach:
+    /// the configured catalogs plus the session's own (X-Trino-Catalog) Polaris
+    /// warehouse, deduplicated. JDBC schema sync (DatabaseMetaData.getCatalogs)
+    /// then sees workspace catalogs, not just the default warehouse. (#5)
     async fn handle_show_catalogs(
         &self,
-        _session: &Session,
+        session: &Session,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
-        let catalog_name = if self.config.catalog.warehouse.is_empty() {
-            "default"
-        } else {
-            &self.config.catalog.warehouse
-        };
+        // Configured catalogs first (default warehouse leads), then the session
+        // catalog if it is not already in the list.
+        let mut candidates: Vec<String> =
+            self.config.flattened_catalogs().into_iter().map(|(n, _)| n).collect();
+        if let Some(session_catalog) = session.default_catalog.as_deref() {
+            candidates.push(session_catalog.to_string());
+        }
+        if candidates.is_empty() {
+            candidates.push(self.config.catalog.warehouse.clone());
+        }
+        let mut catalog_names: Vec<String> = Vec::new();
+        for name in candidates {
+            let name = if name.is_empty() { "default".to_string() } else { name };
+            if !catalog_names.contains(&name) {
+                catalog_names.push(name);
+            }
+        }
 
         let schema = Arc::new(Schema::new(vec![Field::new(
             "catalog_name",
@@ -2998,7 +3014,9 @@ impl QueryHandler {
         )]));
 
         let mut builder = StringBuilder::new();
-        builder.append_value(catalog_name);
+        for name in &catalog_names {
+            builder.append_value(name);
+        }
         let array: ArrayRef = Arc::new(builder.finish());
 
         let batch = RecordBatch::try_new(schema, vec![array])
@@ -3022,7 +3040,14 @@ impl QueryHandler {
         let catalog = show_schemas_catalog(filter);
         let session_catalog = self.show_catalog(session, catalog.as_deref()).await?;
 
-        let namespaces = session_catalog.list_namespaces().await?;
+        // A principal that is not authorized to list this catalog's namespaces
+        // gets an empty result, not a hard error -- so JDBC schema sync and
+        // SHOW SCHEMAS skip catalogs the user can't see instead of aborting. (#5)
+        let namespaces = match session_catalog.list_namespaces().await {
+            Ok(ns) => ns,
+            Err(e) if e.error_code() == sqe_core::SqeErrorCode::AccessDenied => Vec::new(),
+            Err(e) => return Err(e),
+        };
 
         let schema = Arc::new(Schema::new(vec![Field::new(
             "schema_name",

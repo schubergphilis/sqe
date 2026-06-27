@@ -49,6 +49,42 @@ async fn mount_empty_polaris() -> MockServer {
     server
 }
 
+/// Polaris mock that serves one namespace (`gold`) with one table, so
+/// `system.jdbc.tables` enumeration produces rows. Path matchers ignore the
+/// `?warehouse=` query, so every warehouse (config + discovered) sees the same
+/// content.
+async fn mount_polaris_with_table() -> MockServer {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/config"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(r#"{"overrides":{},"defaults":{}}"#),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1/namespaces"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"namespaces":[["gold"]]}"#))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1/namespaces/gold"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(r#"{"namespace":["gold"],"properties":{}}"#),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1/namespaces/gold/tables"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"{"identifiers":[{"namespace":["gold"],"name":"fct_revenue_monthly"}]}"#,
+        ))
+        .mount(&server)
+        .await;
+    server
+}
+
 fn session(token: &str, catalog: Option<&str>, schema: Option<&str>) -> Session {
     Session::new(
         format!("user_{token}"),
@@ -87,6 +123,74 @@ async fn build_ctx(config: &SqeConfig, session: &Session) -> (String, String, bo
         .map(|c| ctx.catalog(c).is_some())
         .unwrap_or(false);
     (default_catalog, default_schema, session_catalog_registered)
+}
+
+/// BLOCKER 2: `system.jdbc.tables` / `system.jdbc.catalogs` must enumerate the
+/// session's own (discovered) catalog, not just the default warehouse, so JDBC
+/// schema sync (Metabase/DBeaver) sees workspace tables.
+#[tokio::test]
+async fn system_jdbc_enumerates_session_catalog_tables() {
+    let server = mount_polaris_with_table().await;
+    let toml = format!(
+        "[coordinator]\n\n[auth]\n\n[query]\ncatalog_discovery = \"polaris-auto\"\n\n\
+         [catalog]\ncatalog_url = \"{}\"\nwarehouse = \"main_warehouse\"\n",
+        server.uri()
+    );
+    let config: SqeConfig = toml::from_str(&toml).expect("config parses");
+    let session = session("tok_enum", Some("ws_energy_co"), Some("gold"));
+
+    let tracker = Arc::new(QueryTracker::new(&config.query_history));
+    let registry = RuntimeCatalogRegistry::default();
+    let (ctx, _catalog) = create_session_context(
+        &config, &session, None, &tracker, None, None, None, &registry,
+    )
+    .await
+    .expect("session context builds");
+
+    // system.jdbc.catalogs must list the session catalog.
+    let cats = ctx
+        .sql("SELECT table_cat FROM system.jdbc.catalogs ORDER BY table_cat")
+        .await
+        .expect("query catalogs")
+        .collect()
+        .await
+        .expect("collect catalogs");
+    let cat_csv = batches_to_string(&cats);
+    assert!(
+        cat_csv.contains("ws_energy_co"),
+        "system.jdbc.catalogs must include the session catalog: {cat_csv}"
+    );
+
+    // system.jdbc.tables filtered to the session catalog must return its table.
+    let tables = ctx
+        .sql(
+            "SELECT table_cat, table_schem, table_name FROM system.jdbc.tables \
+             WHERE table_cat = 'ws_energy_co' AND table_schem = 'gold'",
+        )
+        .await
+        .expect("query tables")
+        .collect()
+        .await
+        .expect("collect tables");
+    let tbl_csv = batches_to_string(&tables);
+    assert!(
+        tbl_csv.contains("fct_revenue_monthly"),
+        "system.jdbc.tables WHERE table_cat='ws_energy_co' must return the gold mart: {tbl_csv}"
+    );
+}
+
+/// Render record batches to a flat string for substring assertions.
+fn batches_to_string(batches: &[arrow_array::RecordBatch]) -> String {
+    let mut out = String::new();
+    for b in batches {
+        for col in b.columns() {
+            for row in 0..b.num_rows() {
+                out.push_str(&arrow::util::display::array_value_to_string(col, row).unwrap_or_default());
+                out.push(' ');
+            }
+        }
+    }
+    out
 }
 
 /// The real bug: a session catalog that is NOT in static config is discovered

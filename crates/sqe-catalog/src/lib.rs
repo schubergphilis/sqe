@@ -62,4 +62,4 @@ pub use mount::build_catalog;
 pub use rest_catalog::{invalidate_rest_catalog_cache_all, SessionCatalog, TableMetadataCache};
 pub use iceberg_scan::coalesce_file_entries;
 #[cfg(feature = "rest")]
-pub use system_catalog::SystemCatalogProvider;
+pub use system_catalog::{SystemCatalogEntry, SystemCatalogProvider};
