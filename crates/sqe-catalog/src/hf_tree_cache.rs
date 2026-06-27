@@ -162,7 +162,7 @@ impl HfHttpClient for ReqwestClient {
         let resp = req
             .send()
             .await
-            .map_err(|e| SqeError::Catalog(format!("HF API GET {url} failed: {e}")))?;
+            .map_err(|e| SqeError::catalog_src(format!("HF API GET {url} failed: {e}"), e))?;
         let status = resp.status();
         if !status.is_success() {
             return Err(SqeError::Catalog(format!(
@@ -173,7 +173,7 @@ impl HfHttpClient for ReqwestClient {
         let body = resp
             .bytes()
             .await
-            .map_err(|e| SqeError::Catalog(format!("HF API read body failed: {e}")))?;
+            .map_err(|e| SqeError::catalog_src(format!("HF API read body failed: {e}"), e))?;
         Ok((body, headers))
     }
 }
@@ -265,9 +265,10 @@ impl HfTreeCache {
         loop {
             let (body, headers) = self.http.fetch(&url).await?;
             let entries: Vec<TreeEntry> = serde_json::from_slice(&body).map_err(|e| {
-                SqeError::Catalog(format!(
-                    "HF tree response parse failed for {url}: {e}"
-                ))
+                SqeError::catalog_src(
+                    format!("HF tree response parse failed for {url}: {e}"),
+                    e,
+                )
             })?;
             all.extend(entries);
             page += 1;

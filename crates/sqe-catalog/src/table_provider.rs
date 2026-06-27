@@ -63,9 +63,10 @@ impl SqeTableProvider {
         debug!(table = %table_name, "Creating SqeTableProvider");
 
         let schema = schema_to_arrow_schema(table.metadata().current_schema()).map_err(|e| {
-            sqe_core::SqeError::Catalog(format!(
-                "Failed to convert Iceberg schema to Arrow for {table_name}: {e}"
-            ))
+            sqe_core::SqeError::catalog_src(
+                format!("Failed to convert Iceberg schema to Arrow for {table_name}: {e}"),
+                e,
+            )
         })?;
 
         Ok(Self {
