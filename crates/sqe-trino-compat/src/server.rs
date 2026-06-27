@@ -180,6 +180,24 @@ pub trait TrinoQueryExecutor: Send + Sync + 'static {
         session: &Session,
         sql: &str,
     ) -> Result<Vec<arrow_array::RecordBatch>, sqe_core::SqeError>;
+
+    /// Describe a prepared statement's output columns (`DESCRIBE OUTPUT`) or
+    /// bind parameters (`DESCRIBE INPUT`), returning a synthetic result set.
+    ///
+    /// `prepared_sql` is the resolved statement template (with `?`
+    /// placeholders) looked up from the session's prepared statements. The
+    /// default returns `NotImplemented` so executors that do not support
+    /// prepared-statement introspection (test mocks) are unaffected.
+    async fn describe_prepared(
+        &self,
+        _session: &Session,
+        _prepared_sql: &str,
+        _kind: crate::protocol::DescribeKind,
+    ) -> Result<Vec<arrow_array::RecordBatch>, sqe_core::SqeError> {
+        Err(sqe_core::SqeError::NotImplemented(
+            "DESCRIBE OUTPUT / DESCRIBE INPUT is not supported by this executor".into(),
+        ))
+    }
 }
 
 #[derive(Default)]
@@ -812,7 +830,31 @@ async fn submit_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
     };
     let exec_sql = effective_sql.as_str();
 
-    match state.query_handler.execute(&session, exec_sql).await {
+    // DESCRIBE OUTPUT <name> / DESCRIBE INPUT <name>: describe a prepared
+    // statement (JDBC PreparedStatement.getMetaData / getParameterMetaData).
+    // sqlparser does not model these, so intercept here while the prepared
+    // statement map is still in scope, resolve the template by name, and ask
+    // the executor to plan it for the output schema / parameter types. The
+    // resulting batches flow through the same response path as a normal query
+    // (DESCRIBE is not an update type and not a metadata query, so the
+    // update-count / info_schema-compat steps below are no-ops for it).
+    let exec_result = if let Some((kind, name)) = protocol::parse_describe_prepared(exec_sql) {
+        match prepared.get(&name) {
+            Some(prepared_sql) => {
+                state
+                    .query_handler
+                    .describe_prepared(&session, prepared_sql, kind)
+                    .await
+            }
+            None => Err(sqe_core::SqeError::Execution(format!(
+                "Prepared statement not found: {name}"
+            ))),
+        }
+    } else {
+        state.query_handler.execute(&session, exec_sql).await
+    };
+
+    match exec_result {
         Ok(batches) => {
             let update_type = classify_update_type(exec_sql).map(str::to_string);
             let update_count = if update_type.is_some() {

@@ -338,6 +338,42 @@ impl UpdatedSessionState {
 /// only when this returns `Some`. The Trino client REST API spec defines
 /// the supported verbs as USE, SET SESSION/CATALOG, RESET SESSION,
 /// PREPARE, DEALLOCATE PREPARE.
+///
+/// Which prepared-statement metadata a `DESCRIBE` requests. Trino JDBC issues
+/// `DESCRIBE OUTPUT <name>` for `PreparedStatement.getMetaData()` and
+/// `DESCRIBE INPUT <name>` for `getParameterMetaData()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DescribeKind {
+    Output,
+    Input,
+}
+
+/// Detect `DESCRIBE OUTPUT <name>` / `DESCRIBE INPUT <name>` (and the `DESC`
+/// abbreviation) and return the kind plus the prepared-statement name.
+///
+/// Returns `None` for anything else, including a plain `DESCRIBE <table>`
+/// (which sqlparser models as `ExplainTable` and the coordinator already
+/// handles). sqlparser does not model the OUTPUT/INPUT forms, so they are
+/// detected by prefix here before the SQL reaches the planner.
+pub fn parse_describe_prepared(sql: &str) -> Option<(DescribeKind, String)> {
+    let trimmed = sql.trim().trim_end_matches(';').trim();
+    let upper = trimmed.to_uppercase();
+    for (prefix, kind) in [
+        ("DESCRIBE OUTPUT ", DescribeKind::Output),
+        ("DESCRIBE INPUT ", DescribeKind::Input),
+        ("DESC OUTPUT ", DescribeKind::Output),
+        ("DESC INPUT ", DescribeKind::Input),
+    ] {
+        if upper.starts_with(prefix) {
+            let name = unquote_identifier(trimmed[prefix.len()..].trim());
+            if !name.is_empty() {
+                return Some((kind, name));
+            }
+        }
+    }
+    None
+}
+
 pub fn parse_session_statement(sql: &str) -> Option<UpdatedSessionState> {
     let trimmed = sql.trim().trim_end_matches(';').trim();
     let upper = trimmed.to_uppercase();
@@ -697,6 +733,27 @@ mod tests {
 
         let s = parse_session_statement("DEALLOCATE PREPARE p1").unwrap();
         assert_eq!(s.deallocated_prepare, vec!["p1".to_string()]);
+    }
+
+    #[test]
+    fn test_parse_describe_prepared() {
+        assert_eq!(
+            parse_describe_prepared("DESCRIBE OUTPUT my_stmt"),
+            Some((DescribeKind::Output, "my_stmt".to_string()))
+        );
+        assert_eq!(
+            parse_describe_prepared("describe input \"My Stmt\";"),
+            Some((DescribeKind::Input, "My Stmt".to_string()))
+        );
+        assert_eq!(
+            parse_describe_prepared("DESC OUTPUT p1"),
+            Some((DescribeKind::Output, "p1".to_string()))
+        );
+        // Plain DESCRIBE <table> is NOT a prepared-statement describe.
+        assert_eq!(parse_describe_prepared("DESCRIBE my_table"), None);
+        assert_eq!(parse_describe_prepared("SELECT 1"), None);
+        // Missing name.
+        assert_eq!(parse_describe_prepared("DESCRIBE OUTPUT"), None);
     }
 
     #[test]
