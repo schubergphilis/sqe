@@ -8,9 +8,10 @@ use datafusion::catalog::SchemaProvider;
 use datafusion::datasource::{MemTable, TableProvider};
 use datafusion::error::Result as DFResult;
 use iceberg::NamespaceIdent;
-use tracing::{error, warn};
+use tracing::warn;
 
 use crate::rest_catalog::SessionCatalog;
+use crate::system_catalog::SystemCatalogEntry;
 
 /// DataFusion `SchemaProvider` for the virtual `system.metadata` schema.
 ///
@@ -18,24 +19,28 @@ use crate::rest_catalog::SessionCatalog;
 /// `table_comments`) that provide introspection into catalog and table-level
 /// properties stored in Polaris / Iceberg.
 pub struct MetadataSchemaProvider {
-    session_catalog: Arc<SessionCatalog>,
-    warehouse: String,
+    /// Every catalog the session can reach (primary first, deduplicated by
+    /// name). The metadata tables iterate these so `system.metadata.catalogs`
+    /// and the per-table/-schema property tables cover all reachable catalogs,
+    /// not just the default. (#5)
+    catalogs: Vec<SystemCatalogEntry>,
 }
 
 impl MetadataSchemaProvider {
-    pub fn new(session_catalog: Arc<SessionCatalog>, warehouse: String) -> Self {
-        Self {
-            session_catalog,
-            warehouse,
-        }
+    pub fn new(entries: Vec<SystemCatalogEntry>) -> Self {
+        let mut seen = std::collections::HashSet::new();
+        let catalogs = entries
+            .into_iter()
+            .filter(|e| seen.insert(e.name.clone()))
+            .collect();
+        Self { catalogs }
     }
 }
 
 impl std::fmt::Debug for MetadataSchemaProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("MetadataSchemaProvider")
-            .field("warehouse", &self.warehouse)
-            .finish()
+        let names: Vec<&str> = self.catalogs.iter().map(|e| e.name.as_str()).collect();
+        f.debug_struct("MetadataSchemaProvider").field("catalogs", &names).finish()
     }
 }
 
@@ -60,7 +65,10 @@ impl SchemaProvider for MetadataSchemaProvider {
 
     async fn table(&self, name: &str) -> DFResult<Option<Arc<dyn TableProvider>>> {
         match name {
-            "catalogs" => Ok(Some(build_catalogs_table(&self.warehouse)?)),
+            "catalogs" => {
+                let names: Vec<String> = self.catalogs.iter().map(|e| e.name.clone()).collect();
+                Ok(Some(build_catalogs_table(&names)?))
+            }
             "table_properties" => Ok(Some(self.build_table_properties_table().await?)),
             "schema_properties" => Ok(Some(self.build_schema_properties_table().await?)),
             "table_comments" => Ok(Some(self.build_table_comments_table().await?)),
@@ -70,12 +78,14 @@ impl SchemaProvider for MetadataSchemaProvider {
 }
 
 impl MetadataSchemaProvider {
-    /// List namespaces, returning an empty vec on error (with a log message).
-    async fn list_namespaces_safe(&self) -> Vec<NamespaceIdent> {
-        match self.session_catalog.list_namespaces().await {
+    /// List a single catalog's namespaces, returning an empty vec on error
+    /// (with a log message) so enumeration skips an unauthorized / unreachable
+    /// catalog instead of aborting the whole metadata listing.
+    async fn list_namespaces_safe(catalog: &SessionCatalog) -> Vec<NamespaceIdent> {
+        match catalog.list_namespaces().await {
             Ok(namespaces) => namespaces,
             Err(e) => {
-                error!(error = %e, "Failed to list namespaces for system.metadata");
+                warn!(error = %e, "system.metadata: skipping catalog whose namespaces could not be listed");
                 Vec::new()
             }
         }
@@ -100,42 +110,42 @@ impl MetadataSchemaProvider {
             Field::new("property_value", DataType::Utf8, true),
         ]));
 
-        let namespaces = self.list_namespaces_safe().await;
-
         let mut catalog_b = StringBuilder::new();
         let mut schema_b = StringBuilder::new();
         let mut table_b = StringBuilder::new();
         let mut prop_name_b = StringBuilder::new();
         let mut prop_value_b = StringBuilder::new();
 
-        for ns in &namespaces {
-            let ns_str = Self::namespace_to_string(ns);
-            let tables = match self.session_catalog.list_tables(ns).await {
-                Ok(t) => t,
-                Err(e) => {
-                    warn!(namespace = %ns_str, error = %e, "Failed to list tables for system.metadata.table_properties");
-                    continue;
-                }
-            };
-
-            for table_ident in &tables {
-                let full_ident =
-                    iceberg::TableIdent::new(ns.clone(), table_ident.name().to_string());
-                let table = match self.session_catalog.load_table(&full_ident).await {
+        for entry in &self.catalogs {
+            for ns in &Self::list_namespaces_safe(&entry.catalog).await {
+                let ns_str = Self::namespace_to_string(ns);
+                let tables = match entry.catalog.list_tables(ns).await {
                     Ok(t) => t,
                     Err(e) => {
-                        warn!(table = %table_ident.name(), error = %e, "Failed to load table for system.metadata.table_properties");
+                        warn!(catalog = %entry.name, namespace = %ns_str, error = %e, "Failed to list tables for system.metadata.table_properties");
                         continue;
                     }
                 };
 
-                let properties = table.metadata().properties();
-                for (key, value) in properties {
-                    catalog_b.append_value(&self.warehouse);
-                    schema_b.append_value(&ns_str);
-                    table_b.append_value(table_ident.name());
-                    prop_name_b.append_value(key);
-                    prop_value_b.append_value(value);
+                for table_ident in &tables {
+                    let full_ident =
+                        iceberg::TableIdent::new(ns.clone(), table_ident.name().to_string());
+                    let table = match entry.catalog.load_table(&full_ident).await {
+                        Ok(t) => t,
+                        Err(e) => {
+                            warn!(catalog = %entry.name, table = %table_ident.name(), error = %e, "Failed to load table for system.metadata.table_properties");
+                            continue;
+                        }
+                    };
+
+                    let properties = table.metadata().properties();
+                    for (key, value) in properties {
+                        catalog_b.append_value(&entry.name);
+                        schema_b.append_value(&ns_str);
+                        table_b.append_value(table_ident.name());
+                        prop_name_b.append_value(key);
+                        prop_value_b.append_value(value);
+                    }
                 }
             }
         }
@@ -165,27 +175,27 @@ impl MetadataSchemaProvider {
             Field::new("property_value", DataType::Utf8, true),
         ]));
 
-        let namespaces = self.list_namespaces_safe().await;
-
         let mut catalog_b = StringBuilder::new();
         let mut schema_b = StringBuilder::new();
         let mut prop_name_b = StringBuilder::new();
         let mut prop_value_b = StringBuilder::new();
 
-        for ns in &namespaces {
-            let ns_str = Self::namespace_to_string(ns);
-            match self.session_catalog.get_namespace(ns).await {
-                Ok(namespace) => {
-                    let properties = namespace.properties();
-                    for (key, value) in properties {
-                        catalog_b.append_value(&self.warehouse);
-                        schema_b.append_value(&ns_str);
-                        prop_name_b.append_value(key);
-                        prop_value_b.append_value(value);
+        for entry in &self.catalogs {
+            for ns in &Self::list_namespaces_safe(&entry.catalog).await {
+                let ns_str = Self::namespace_to_string(ns);
+                match entry.catalog.get_namespace(ns).await {
+                    Ok(namespace) => {
+                        let properties = namespace.properties();
+                        for (key, value) in properties {
+                            catalog_b.append_value(&entry.name);
+                            schema_b.append_value(&ns_str);
+                            prop_name_b.append_value(key);
+                            prop_value_b.append_value(value);
+                        }
                     }
-                }
-                Err(e) => {
-                    warn!(namespace = %ns_str, error = %e, "Failed to get namespace for system.metadata.schema_properties");
+                    Err(e) => {
+                        warn!(catalog = %entry.name, namespace = %ns_str, error = %e, "Failed to get namespace for system.metadata.schema_properties");
+                    }
                 }
             }
         }
@@ -215,41 +225,41 @@ impl MetadataSchemaProvider {
             Field::new("comment", DataType::Utf8, true),
         ]));
 
-        let namespaces = self.list_namespaces_safe().await;
-
         let mut catalog_b = StringBuilder::new();
         let mut schema_b = StringBuilder::new();
         let mut table_b = StringBuilder::new();
         let mut comment_b = StringBuilder::new();
 
-        for ns in &namespaces {
-            let ns_str = Self::namespace_to_string(ns);
-            let tables = match self.session_catalog.list_tables(ns).await {
-                Ok(t) => t,
-                Err(e) => {
-                    warn!(namespace = %ns_str, error = %e, "Failed to list tables for system.metadata.table_comments");
-                    continue;
-                }
-            };
-
-            for table_ident in &tables {
-                let full_ident =
-                    iceberg::TableIdent::new(ns.clone(), table_ident.name().to_string());
-                let table = match self.session_catalog.load_table(&full_ident).await {
+        for entry in &self.catalogs {
+            for ns in &Self::list_namespaces_safe(&entry.catalog).await {
+                let ns_str = Self::namespace_to_string(ns);
+                let tables = match entry.catalog.list_tables(ns).await {
                     Ok(t) => t,
                     Err(e) => {
-                        warn!(table = %table_ident.name(), error = %e, "Failed to load table for system.metadata.table_comments");
+                        warn!(catalog = %entry.name, namespace = %ns_str, error = %e, "Failed to list tables for system.metadata.table_comments");
                         continue;
                     }
                 };
 
-                catalog_b.append_value(&self.warehouse);
-                schema_b.append_value(&ns_str);
-                table_b.append_value(table_ident.name());
+                for table_ident in &tables {
+                    let full_ident =
+                        iceberg::TableIdent::new(ns.clone(), table_ident.name().to_string());
+                    let table = match entry.catalog.load_table(&full_ident).await {
+                        Ok(t) => t,
+                        Err(e) => {
+                            warn!(catalog = %entry.name, table = %table_ident.name(), error = %e, "Failed to load table for system.metadata.table_comments");
+                            continue;
+                        }
+                    };
 
-                match table.metadata().properties().get("comment") {
-                    Some(comment) => comment_b.append_value(comment),
-                    None => comment_b.append_null(),
+                    catalog_b.append_value(&entry.name);
+                    schema_b.append_value(&ns_str);
+                    table_b.append_value(table_ident.name());
+
+                    match table.metadata().properties().get("comment") {
+                        Some(comment) => comment_b.append_value(comment),
+                        None => comment_b.append_null(),
+                    }
                 }
             }
         }
@@ -268,10 +278,9 @@ impl MetadataSchemaProvider {
     }
 }
 
-/// Build the static `system.metadata.catalogs` table with a single row.
-///
-/// Contains the warehouse name and connector type ("iceberg").
-pub fn build_catalogs_table(warehouse: &str) -> DFResult<Arc<dyn TableProvider>> {
+/// Build the `system.metadata.catalogs` table: one row per reachable catalog,
+/// each with connector type "iceberg".
+pub fn build_catalogs_table(catalogs: &[String]) -> DFResult<Arc<dyn TableProvider>> {
     let schema = Arc::new(Schema::new(vec![
         Field::new("catalog_name", DataType::Utf8, false),
         Field::new("connector_id", DataType::Utf8, false),
@@ -280,8 +289,10 @@ pub fn build_catalogs_table(warehouse: &str) -> DFResult<Arc<dyn TableProvider>>
     let mut catalog_b = StringBuilder::new();
     let mut connector_b = StringBuilder::new();
 
-    catalog_b.append_value(warehouse);
-    connector_b.append_value("iceberg");
+    for catalog in catalogs {
+        catalog_b.append_value(catalog);
+        connector_b.append_value("iceberg");
+    }
 
     let batch = RecordBatch::try_new(
         schema.clone(),
@@ -300,7 +311,7 @@ mod tests {
 
     #[test]
     fn test_catalogs_table_schema() {
-        let table = build_catalogs_table("my_warehouse").unwrap();
+        let table = build_catalogs_table(&["my_warehouse".to_string()]).unwrap();
         let schema = table.schema();
         assert_eq!(schema.fields().len(), 2);
         assert_eq!(schema.field(0).name(), "catalog_name");
@@ -310,7 +321,7 @@ mod tests {
     #[test]
     fn test_catalogs_table_builds_for_any_warehouse_name() {
         for name in &["warehouse1", "my-wh", "", "test-warehouse"] {
-            let result = build_catalogs_table(name);
+            let result = build_catalogs_table(&[name.to_string()]);
             assert!(
                 result.is_ok(),
                 "build_catalogs_table should succeed for warehouse name '{name}'"
@@ -319,8 +330,19 @@ mod tests {
     }
 
     #[test]
+    fn test_catalogs_table_lists_every_reachable_catalog() {
+        // One row per reachable catalog, not just the default. (#5)
+        let table = build_catalogs_table(&[
+            "main_warehouse".to_string(),
+            "ws_energy_co".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(table.schema().fields().len(), 2);
+    }
+
+    #[test]
     fn test_catalogs_table_column_types() {
-        let table = build_catalogs_table("test").unwrap();
+        let table = build_catalogs_table(&["test".to_string()]).unwrap();
         let schema = table.schema();
         assert_eq!(*schema.field(0).data_type(), DataType::Utf8);
         assert_eq!(*schema.field(1).data_type(), DataType::Utf8);

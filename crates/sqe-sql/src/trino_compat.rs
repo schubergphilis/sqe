@@ -146,7 +146,12 @@ pub fn rewrite_trino_compat(sql: &str) -> String {
     let has_grouping_set = lower.contains("rollup")
         || lower.contains("cube")
         || lower.contains("grouping sets");
-    if !has_json_cast && !has_dollar && !has_grouping_set {
+    // `current_schema` (bare keyword) -> rewrite_bare_current_schema. sqlparser
+    // parses bare `current_schema` as a column identifier (unlike
+    // `current_catalog`, which it treats as a reserved no-arg function), so we
+    // rewrite it to the `current_schema()` call form the session UDF answers.
+    let has_current_schema = lower.contains("current_schema");
+    if !has_json_cast && !has_dollar && !has_grouping_set && !has_current_schema {
         return sql.to_string();
     }
 
@@ -205,6 +210,9 @@ impl VisitorMut for TrinoCompatVisitor {
 
     fn post_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<Self::Break> {
         if rewrite_cast_as_json(expr) {
+            self.rewrites += 1;
+        }
+        if rewrite_bare_current_schema(expr) {
             self.rewrites += 1;
         }
         ControlFlow::Continue(())
@@ -284,6 +292,37 @@ fn rewrite_cast_as_json(expr: &mut Expr) -> bool {
         args: FunctionArguments::List(FunctionArgumentList {
             duplicate_treatment: None,
             args: vec![FunctionArg::Unnamed(FunctionArgExpr::Expr(inner_expr))],
+            clauses: vec![],
+        }),
+        filter: None,
+        null_treatment: None,
+        over: None,
+        within_group: vec![],
+    });
+    true
+}
+
+/// Rewrite a bare `current_schema` identifier into the `current_schema()`
+/// call form. sqlparser parses bare `current_schema` as a column identifier
+/// (so it reaches the planner as "No field named current_schema"), unlike
+/// `current_catalog`, which it treats as a reserved no-arg function. Trino
+/// clients send the bare keyword; the call form resolves to the session UDF.
+/// Only unquoted identifiers are rewritten, so a quoted `"current_schema"`
+/// column reference is left untouched. Returns true if the rewrite fired.
+fn rewrite_bare_current_schema(expr: &mut Expr) -> bool {
+    let Expr::Identifier(ident) = expr else {
+        return false;
+    };
+    if ident.quote_style.is_some() || !ident.value.eq_ignore_ascii_case("current_schema") {
+        return false;
+    }
+    *expr = Expr::Function(Function {
+        name: ObjectName::from(vec![Ident::new("current_schema")]),
+        uses_odbc_syntax: false,
+        parameters: FunctionArguments::None,
+        args: FunctionArguments::List(FunctionArgumentList {
+            duplicate_treatment: None,
+            args: vec![],
             clauses: vec![],
         }),
         filter: None,
@@ -945,6 +984,27 @@ mod tests {
         assert_eq!(
             count_once, count_twice,
             "idempotency violated:\n  once:  {once}\n  twice: {twice}"
+        );
+    }
+
+    #[test]
+    fn rewrites_bare_current_schema_to_call_form() {
+        // sqlparser parses bare `current_schema` as a column identifier, so it
+        // must be rewritten to `current_schema()` for the session UDF. (#1)
+        let out = rewrite_trino_compat("SELECT current_schema");
+        assert!(
+            out.to_lowercase().contains("current_schema()"),
+            "bare current_schema must become a call: {out}"
+        );
+    }
+
+    #[test]
+    fn quoted_current_schema_column_is_left_untouched() {
+        // A quoted identifier is a real column reference, not the keyword.
+        let out = rewrite_trino_compat(r#"SELECT "current_schema" FROM t"#);
+        assert!(
+            !out.contains("current_schema()"),
+            "quoted column must not be rewritten: {out}"
         );
     }
 }
