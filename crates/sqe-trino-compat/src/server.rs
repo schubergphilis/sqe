@@ -750,6 +750,17 @@ async fn submit_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
                 id: query_id.clone(),
                 info_uri: Some(info_uri(&base_url, &query_id)),
                 stats: TrinoStats::finished(),
+                // Trino marks these non-query statements with an updateType so
+                // JDBC clients treat the response as a completed update rather
+                // than waiting for a result set.
+                update_type: Some(
+                    if !update.added_prepare.is_empty() {
+                        "PREPARE"
+                    } else {
+                        "DEALLOCATE"
+                    }
+                    .to_string(),
+                ),
                 ..Default::default()
             };
             let mut resp = (StatusCode::OK, Json(response)).into_response();
@@ -1297,10 +1308,39 @@ mod tests {
             .get("x-trino-added-prepare")
             .expect("x-trino-added-prepare header")
             .to_str()
-            .unwrap();
+            .unwrap()
+            .to_string();
         assert!(hdr.starts_with("ps="), "header was: {hdr}");
         // SQL is URL-encoded (space -> '+'), so the client can replay it.
         assert!(hdr.contains("SELECT"), "header was: {hdr}");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let tr: TrinoResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(tr.update_type.as_deref(), Some("PREPARE"));
+    }
+
+    #[tokio::test]
+    async fn submit_deallocate_returns_update_type_without_executing() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let state = recording_state(seen.clone());
+
+        let resp = submit_query::<MockAuthOk, RecordingQuery>(
+            State(state),
+            test_peer(),
+            basic_auth_header("alice", "pw"),
+            "DEALLOCATE PREPARE ps".to_string(),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "DEALLOCATE must not be sent to the executor"
+        );
+        assert!(resp.headers().get("x-trino-deallocated-prepare").is_some());
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let tr: TrinoResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(tr.update_type.as_deref(), Some("DEALLOCATE"));
     }
 
     #[tokio::test]
