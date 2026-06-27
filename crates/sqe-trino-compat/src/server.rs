@@ -750,6 +750,13 @@ async fn submit_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
                 id: query_id.clone(),
                 info_uri: Some(info_uri(&base_url, &query_id)),
                 stats: TrinoStats::finished(),
+                // Non-null (empty) columns: the field is skip_serializing_if
+                // None, so omitting it makes the JDBC driver see `columns: null`
+                // and getColumns() throws. Real Trino returns [] for PREPARE, so
+                // the driver builds a 0-column ResultSet and (with updateType
+                // set) treats it as a non-query — letting prepareStatement and
+                // the connection test succeed.
+                columns: Some(vec![]),
                 // Trino marks these non-query statements with an updateType so
                 // JDBC clients treat the response as a completed update rather
                 // than waiting for a result set.
@@ -1316,6 +1323,8 @@ mod tests {
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let tr: TrinoResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(tr.update_type.as_deref(), Some("PREPARE"));
+        // Non-null empty columns (omitting it -> JSON null -> driver throws).
+        assert_eq!(tr.columns.map(|c| c.len()), Some(0));
     }
 
     #[tokio::test]
@@ -1341,6 +1350,7 @@ mod tests {
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let tr: TrinoResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(tr.update_type.as_deref(), Some("DEALLOCATE"));
+        assert_eq!(tr.columns.map(|c| c.len()), Some(0));
     }
 
     #[tokio::test]
