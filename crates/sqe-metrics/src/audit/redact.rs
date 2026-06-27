@@ -1,3 +1,6 @@
+//! PII redaction for audit payloads: SQL literal scrubbing and GDPR identifier
+//! handling ([`GdprIdentifierMode`]).
+
 /// Redact common PII patterns and secret literals from SQL text for audit
 /// log safety.
 ///

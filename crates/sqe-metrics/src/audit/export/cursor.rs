@@ -1,3 +1,6 @@
+//! Durable [`SeqCursor`] persisting the last-shipped sequence so audit export
+//! resumes after a restart without gaps or duplicates.
+
 use std::path::PathBuf;
 
 /// Persists "the highest audit `integrity.seq` already shipped" to a small file.

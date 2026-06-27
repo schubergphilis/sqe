@@ -1,3 +1,6 @@
+//! OpenTelemetry initialization: tracing subscriber + OTLP span export, and
+//! the [`OtelGuard`] that flushes on shutdown.
+
 use opentelemetry::trace::TracerProvider;
 use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
 use opentelemetry_otlp::{LogExporter, MetricExporter, SpanExporter, WithExportConfig};

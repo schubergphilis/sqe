@@ -1,3 +1,7 @@
+//! OCSF-aligned audit logging: a structured event model, tamper-evident hash
+//! chaining, PII/GDPR redaction, pluggable sinks, and async export to
+//! OTLP/SIEM backends.
+
 pub mod export;
 mod chain;
 mod event;

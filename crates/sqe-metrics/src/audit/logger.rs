@@ -1,3 +1,6 @@
+//! Builds [`AuditEntry`] records from engine activity, including the
+//! `query_hash` helper used to reference a statement without storing its text.
+
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;

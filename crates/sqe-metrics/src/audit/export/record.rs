@@ -1,3 +1,6 @@
+//! Wire types for the audit export path: [`Severity`] and the [`ShipRecord`]
+//! payload sent to downstream sinks.
+
 use serde_json::Value;
 
 /// Severity tier for a shipped log record. Derived from OCSF `status_id`.
