@@ -8,17 +8,23 @@ pub fn arrow_to_trino_type(dt: &DataType) -> String {
         DataType::Int8 | DataType::UInt8 => "tinyint".to_string(),
         DataType::Int16 | DataType::UInt16 => "smallint".to_string(),
         DataType::Int32 => "integer".to_string(),
-        DataType::UInt32 | DataType::Int64 => "bigint".to_string(),
-        // u64 exceeds i64::MAX; decimal(20,0) covers the full unsigned range.
-        DataType::UInt64 => "decimal(20,0)".to_string(),
+        // u64 nominally exceeds i64::MAX, but the only u64 columns SQE produces
+        // are computed aggregates -- count(*), approx_distinct(), row_number()
+        // OVER(...) -- whose values fit i64 in practice, and Trino itself types
+        // those as bigint. Mapping to bigint (not decimal(20,0)) matches Trino
+        // so BI clients see integer columns, not decimals. (#4)
+        DataType::UInt32 | DataType::Int64 | DataType::UInt64 => "bigint".to_string(),
         DataType::Float16 | DataType::Float32 => "real".to_string(),
         DataType::Float64 => "double".to_string(),
         DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => "varchar".to_string(),
         DataType::Binary | DataType::LargeBinary | DataType::BinaryView | DataType::FixedSizeBinary(_) => "varbinary".to_string(),
         DataType::Date32 | DataType::Date64 => "date".to_string(),
         DataType::Time32(_) | DataType::Time64(_) => "time".to_string(),
-        DataType::Timestamp(_, None) => "timestamp".to_string(),
-        DataType::Timestamp(_, Some(_)) => "timestamp with time zone".to_string(),
+        // Report an explicit precision. SQE timestamps are microsecond-backed
+        // and rendered to 6 fractional digits, so timestamp(6) / timestamp(6)
+        // with time zone is the consistent, Trino-accurate type. (#5)
+        DataType::Timestamp(_, None) => "timestamp(6)".to_string(),
+        DataType::Timestamp(_, Some(_)) => "timestamp(6) with time zone".to_string(),
         DataType::Duration(_) => "interval day to second".to_string(),
         DataType::Interval(arrow_schema::IntervalUnit::YearMonth) => "interval year to month".to_string(),
         DataType::Interval(_) => "interval day to second".to_string(),
@@ -45,6 +51,35 @@ pub fn arrow_to_trino_type(dt: &DataType) -> String {
         }
         other => format!("{other:?}"),
     }
+}
+
+/// Normalize a rendered timestamp string to exactly 6 fractional-second digits
+/// (truncating extra precision, padding shorter), preserving any trailing
+/// timezone offset (`+00:00`, `Z`). Trino reports these columns as
+/// `timestamp(6)`, so a nanosecond-backed value rendered with 9 digits (e.g.
+/// from `date_trunc`) and a microsecond CAST rendered with 6 must agree.
+fn normalize_timestamp_fraction(s: &str) -> String {
+    // Find where any timezone suffix begins: the first '+', '-', or 'Z' after
+    // the date (skip the first 11 chars: "YYYY-MM-DD " ) so the date's '-'
+    // separators are not mistaken for an offset.
+    let tz_start = s
+        .char_indices()
+        .skip(11)
+        .find(|(_, c)| *c == '+' || *c == '-' || *c == 'Z')
+        .map(|(i, _)| i)
+        .unwrap_or(s.len());
+    let (body, suffix) = s.split_at(tz_start);
+
+    let normalized_body = if let Some(dot) = body.find('.') {
+        let mut frac: String = body[dot + 1..].chars().take(6).collect();
+        while frac.len() < 6 {
+            frac.push('0');
+        }
+        format!("{}.{}", &body[..dot], frac)
+    } else {
+        format!("{}.000000", body.trim_end())
+    };
+    format!("{normalized_body}{suffix}")
 }
 
 pub fn arrow_value_to_json(
@@ -91,9 +126,9 @@ pub fn arrow_value_to_json(
             serde_json::json!(arr.value(row))
         }
         DataType::UInt64 => {
-            // Mapped to decimal(20,0); Trino renders decimals as JSON strings.
+            // Mapped to bigint; render as a JSON number, not a decimal string. (#4)
             let arr = array.as_any().downcast_ref::<UInt64Array>().unwrap();
-            serde_json::Value::String(arr.value(row).to_string())
+            serde_json::json!(arr.value(row))
         }
         DataType::Float32 => {
             let arr = array.as_any().downcast_ref::<Float32Array>().unwrap();
@@ -131,13 +166,12 @@ pub fn arrow_value_to_json(
         }
         // Timestamps must use Trino format: "2024-03-20 08:00:00.000" (space separator, millis)
         // The JDBC driver rejects ISO 8601 "T" separator.
-        DataType::Timestamp(unit, tz) => {
+        DataType::Timestamp(_, tz) => {
             let s = arrow::util::display::array_value_to_string(array, row).unwrap_or_default();
-            // Replace 'T' with space and ensure fractional seconds
+            // Replace 'T' with space (the JDBC driver rejects ISO 8601 'T').
             let s = s.replace('T', " ");
-            // Strip timezone suffix if present (Trino handles tz separately)
+            // Strip timezone suffix for naive timestamps (Trino handles tz separately).
             let s = if tz.is_none() {
-                // Remove any trailing Z or +00:00 for naive timestamps
                 s.trim_end_matches('Z')
                     .trim_end_matches("+00:00")
                     .trim_end_matches("+00")
@@ -145,23 +179,11 @@ pub fn arrow_value_to_json(
             } else {
                 s
             };
-            // Ensure fractional seconds exist (Trino expects at least .000)
-            let s = if !s.contains('.') {
-                let precision = match unit {
-                    arrow_schema::TimeUnit::Second => 0,
-                    arrow_schema::TimeUnit::Millisecond => 3,
-                    arrow_schema::TimeUnit::Microsecond => 6,
-                    arrow_schema::TimeUnit::Nanosecond => 9,
-                };
-                if precision > 0 {
-                    format!("{s}.{:0>width$}", 0, width = precision)
-                } else {
-                    format!("{s}.000")
-                }
-            } else {
-                s
-            };
-            serde_json::Value::String(s)
+            // Normalize to exactly 6 fractional digits so timestamp(6) renders
+            // consistently regardless of the backing unit -- date_trunc emits 9
+            // (nanosecond) while CAST emits 6, and the JDBC type is timestamp(6).
+            // (#5)
+            serde_json::Value::String(normalize_timestamp_fraction(&s))
         }
         DataType::Date32 | DataType::Date64 => {
             serde_json::Value::String(
@@ -231,7 +253,38 @@ mod tests {
     fn test_arrow_to_trino_type_timestamp() {
         assert_eq!(
             arrow_to_trino_type(&DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None)),
-            "timestamp"
+            "timestamp(6)"
+        );
+        assert_eq!(
+            arrow_to_trino_type(&DataType::Timestamp(
+                arrow_schema::TimeUnit::Microsecond,
+                Some("UTC".into())
+            )),
+            "timestamp(6) with time zone"
+        );
+    }
+
+    #[test]
+    fn test_normalize_timestamp_fraction() {
+        // Truncate 9 (nanosecond) -> 6.
+        assert_eq!(
+            normalize_timestamp_fraction("2024-03-20 08:00:00.123456789"),
+            "2024-03-20 08:00:00.123456"
+        );
+        // Pad missing fractional -> .000000.
+        assert_eq!(
+            normalize_timestamp_fraction("2024-03-20 08:00:00"),
+            "2024-03-20 08:00:00.000000"
+        );
+        // Already 6 -> unchanged.
+        assert_eq!(
+            normalize_timestamp_fraction("2024-03-20 08:00:00.500000"),
+            "2024-03-20 08:00:00.500000"
+        );
+        // Preserve a timezone offset suffix while normalizing the fraction.
+        assert_eq!(
+            normalize_timestamp_fraction("2024-03-20 08:00:00.123456789+00:00"),
+            "2024-03-20 08:00:00.123456+00:00"
         );
     }
 
@@ -290,15 +343,17 @@ mod tests {
     }
 
     #[test]
-    fn test_uint64_maps_to_decimal_20_0() {
-        assert_eq!(arrow_to_trino_type(&DataType::UInt64), "decimal(20,0)");
+    fn test_uint64_maps_to_bigint() {
+        // count(*) / row_number() produce UInt64; Trino types those as bigint. (#4)
+        assert_eq!(arrow_to_trino_type(&DataType::UInt64), "bigint");
     }
 
     #[test]
-    fn test_uint64_value_rendered_as_decimal_string() {
-        let arr = arrow_array::UInt64Array::from(vec![u64::MAX]);
+    fn test_uint64_value_rendered_as_number() {
+        let arr = arrow_array::UInt64Array::from(vec![42u64]);
         let val = arrow_value_to_json(&arr, 0);
-        assert_eq!(val, serde_json::Value::String(u64::MAX.to_string()));
+        assert_eq!(val, serde_json::json!(42u64));
+        assert!(val.is_number(), "u64 must render as a JSON number, not a string");
     }
 
     #[test]
