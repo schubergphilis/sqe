@@ -1,3 +1,8 @@
+//! SQE metrics, OpenTelemetry, and the OCSF audit-logging subsystem.
+//!
+//! Exposes the Prometheus registry + `/metrics` server ([`server`]), OTel
+//! init ([`otel`]), and the structured audit pipeline ([`audit`]).
+
 pub mod server;
 pub mod audit;
 pub mod otel;

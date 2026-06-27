@@ -1,3 +1,5 @@
+//! Prometheus metrics HTTP server exposing the `/metrics` scrape endpoint.
+
 use std::sync::Arc;
 
 use axum::{Router, routing::get, extract::State, response::IntoResponse};
