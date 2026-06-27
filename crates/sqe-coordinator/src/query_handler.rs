@@ -3126,8 +3126,12 @@ impl QueryHandler {
         let catalog = show_tables_catalog(filter);
         let session_catalog = self.show_catalog(session, catalog.as_deref()).await?;
 
-        // If a filter is provided, use it as the namespace; otherwise list all namespaces
-        let ns_name = parse_show_tables_namespace(filter);
+        // Explicit `FROM <schema>` wins; otherwise fall back to the session
+        // schema (X-Trino-Schema) so bare `SHOW TABLES` lists that schema's
+        // tables (Trino behavior). Only when neither is set list all
+        // namespaces. (#7)
+        let ns_name =
+            parse_show_tables_namespace(filter).or_else(|| session.default_schema.clone());
         let namespaces = match ns_name {
             None => session_catalog.list_namespaces().await?,
             Some(name) => vec![iceberg::NamespaceIdent::new(name)],
