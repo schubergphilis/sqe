@@ -1,3 +1,6 @@
+//! Render an `AuditEvent` as an OCSF (Open Cybersecurity Schema Framework)
+//! JSON object via [`to_ocsf`].
+
 use serde_json::{json, Value};
 use super::event::{AuditEvent, AuditKind, ObjectType, Outcome};
 

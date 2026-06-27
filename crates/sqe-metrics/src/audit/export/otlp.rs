@@ -1,3 +1,5 @@
+//! [`OtlpExporter`] that ships audit records to an OpenTelemetry collector.
+
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use opentelemetry::logs::{Logger as _, LogRecord as _, LoggerProvider as _};

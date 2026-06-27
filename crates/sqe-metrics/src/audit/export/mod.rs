@@ -1,3 +1,6 @@
+//! Audit export pipeline: a durable [`cursor`] for resumable shipping, wire
+//! [`record`] shaping, an [`otlp`] exporter, and the background [`shipper`].
+
 mod cursor;
 mod otlp;
 mod record;

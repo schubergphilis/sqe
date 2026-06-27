@@ -1,3 +1,6 @@
+//! Background shipper that batches and delivers audit records, with
+//! [`ShipperMetrics`] and configurable [`StartAt`] position.
+
 use std::io::{BufRead, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::sync::Arc;
