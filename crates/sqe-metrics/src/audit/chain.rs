@@ -1,3 +1,6 @@
+//! Tamper-evident [`HashChain`] linking consecutive audit records so gaps or
+//! edits are detectable.
+
 use sha2::{Digest, Sha256};
 use super::event::AuditEvent;
 

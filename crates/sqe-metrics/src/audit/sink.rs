@@ -1,3 +1,6 @@
+//! [`AuditSink`] trait and output [`AuditFormat`]s — the pluggable destination
+//! audit events are written to.
+
 use std::io::Write;
 
 use serde::{Deserialize, Serialize};

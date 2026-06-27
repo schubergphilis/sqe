@@ -1,3 +1,6 @@
+//! [`TagLookup`] trait for resolving column tags referenced in audit context,
+//! with a [`NoopTagLookup`] default.
+
 /// Mirror of `sqe_policy::tag_source::TagSource`, reproduced here so
 /// `sqe-metrics` does not gain a dependency on `sqe-policy`.
 ///

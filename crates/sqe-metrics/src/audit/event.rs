@@ -1,3 +1,6 @@
+//! Audit event model: [`AuditKind`], [`Actor`], outcome, and the structured
+//! `AuditEvent` that every audited operation produces.
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
