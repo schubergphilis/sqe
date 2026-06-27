@@ -341,7 +341,7 @@ pub async fn plan_incremental(
         let (mut added_data, mut added_deletes) =
             collect_added_files_for_snapshot(table, &snap)
                 .await
-                .map_err(|e| SqeError::Catalog(format!("Failed to read manifests for snapshot {sid}: {e}")))?;
+                .map_err(|e| SqeError::catalog_src(format!("Failed to read manifests for snapshot {sid}: {e}"), e))?;
 
         // Replace the per-snapshot-local ordinal with a global-per-snapshot
         // ordinal so the meta column is stable regardless of file layout.

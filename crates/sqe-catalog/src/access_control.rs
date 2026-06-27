@@ -89,7 +89,7 @@ impl AccessControlClient {
         let client = Client::builder()
             .timeout(std::time::Duration::from_secs(30))
             .build()
-            .map_err(|e| SqeError::Config(format!("Failed to build HTTP client: {e}")))?;
+            .map_err(|e| SqeError::config_src(format!("Failed to build HTTP client: {e}"), e))?;
 
         // Strip trailing slash for consistent URL construction.
         let base_url = base_url.trim_end_matches('/').to_string();
@@ -110,7 +110,7 @@ impl AccessControlClient {
             .json(req)
             .send()
             .await
-            .map_err(|e| SqeError::Execution(format!("Access control API request failed: {e}")))?;
+            .map_err(|e| SqeError::execution_src(format!("Access control API request failed: {e}"), e))?;
 
         let status = resp.status();
         if !status.is_success() {
@@ -136,7 +136,7 @@ impl AccessControlClient {
             .json(req)
             .send()
             .await
-            .map_err(|e| SqeError::Execution(format!("Access control API request failed: {e}")))?;
+            .map_err(|e| SqeError::execution_src(format!("Access control API request failed: {e}"), e))?;
 
         let status = resp.status();
         if !status.is_success() {
@@ -166,7 +166,7 @@ impl AccessControlClient {
             .query(params)
             .send()
             .await
-            .map_err(|e| SqeError::Execution(format!("Access control API request failed: {e}")))?;
+            .map_err(|e| SqeError::execution_src(format!("Access control API request failed: {e}"), e))?;
 
         let status = resp.status();
         if !status.is_success() {
@@ -179,7 +179,7 @@ impl AccessControlClient {
         let entries: Vec<GrantEntry> = resp
             .json()
             .await
-            .map_err(|e| SqeError::Execution(format!("Failed to parse grants response: {e}")))?;
+            .map_err(|e| SqeError::execution_src(format!("Failed to parse grants response: {e}"), e))?;
 
         Ok(entries)
     }
@@ -201,7 +201,7 @@ impl AccessControlClient {
             .query(&[("user", user)])
             .send()
             .await
-            .map_err(|e| SqeError::Execution(format!("Access control API request failed: {e}")))?;
+            .map_err(|e| SqeError::execution_src(format!("Access control API request failed: {e}"), e))?;
 
         let status = resp.status();
         if !status.is_success() {
@@ -215,7 +215,7 @@ impl AccessControlClient {
             .json()
             .await
             .map_err(|e| {
-                SqeError::Execution(format!("Failed to parse effective grants response: {e}"))
+                SqeError::execution_src(format!("Failed to parse effective grants response: {e}"), e)
             })?;
 
         Ok(entries)
@@ -238,7 +238,7 @@ impl AccessControlClient {
             .json(req)
             .send()
             .await
-            .map_err(|e| SqeError::Execution(format!("Access control API request failed: {e}")))?;
+            .map_err(|e| SqeError::execution_src(format!("Access control API request failed: {e}"), e))?;
 
         let status = resp.status();
         if !status.is_success() {
@@ -252,7 +252,7 @@ impl AccessControlClient {
             .json()
             .await
             .map_err(|e| {
-                SqeError::Execution(format!("Failed to parse check access response: {e}"))
+                SqeError::execution_src(format!("Failed to parse check access response: {e}"), e)
             })?;
 
         Ok(response)

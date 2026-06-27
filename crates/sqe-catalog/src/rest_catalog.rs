@@ -768,14 +768,15 @@ impl SessionCatalog {
         {
             iceberg_catalog_loader::load(catalog_type)
                 .map_err(|e| {
-                    SqeError::Catalog(format!(
-                        "Catalog loader rejected type `{catalog_type}`: {e}"
-                    ))
+                    SqeError::catalog_src(
+                        format!("Catalog loader rejected type `{catalog_type}`: {e}"),
+                        e,
+                    )
                 })?
                 .load(name.to_string(), props)
                 .await
                 .map_err(|e| {
-                    SqeError::Catalog(format!("Catalog `{catalog_type}` build failed: {e}"))
+                    SqeError::catalog_src(format!("Catalog `{catalog_type}` build failed: {e}"), e)
                 })
         }
     }
@@ -894,7 +895,7 @@ impl SessionCatalog {
                     props,
                 )
                 .await
-                .map_err(|e| SqeError::Catalog(format!("Failed to create REST catalog: {e}")))?;
+                .map_err(|e| SqeError::catalog_src(format!("Failed to create REST catalog: {e}"), e))?;
             let arc_catalog = Arc::new(catalog);
             REST_CATALOG_CACHE.insert(catalog_key, arc_catalog.clone()).await;
             arc_catalog
@@ -972,7 +973,7 @@ impl SessionCatalog {
             "Getting namespace"
         );
         dispatch_catalog!(self.inner, get_namespace(namespace))
-            .map_err(|e| sqe_core::SqeError::Catalog(format!("Failed to get namespace: {e}")))
+            .map_err(|e| sqe_core::SqeError::catalog_src(format!("Failed to get namespace: {e}"), e))
     }
 
     /// True when the backend is the REST/Polaris variant — the only backend
@@ -1301,7 +1302,7 @@ impl SessionCatalog {
     /// Check if a table exists.
     pub async fn table_exists(&self, table_ident: &TableIdent) -> sqe_core::Result<bool> {
         dispatch_catalog!(self.inner, table_exists(table_ident)).map_err(|e| {
-            sqe_core::SqeError::Catalog(format!("Failed to check table existence: {e}"))
+            sqe_core::SqeError::catalog_src(format!("Failed to check table existence: {e}"), e)
         })
     }
 
@@ -1391,7 +1392,7 @@ impl SessionCatalog {
         let resp = req
             .send()
             .await
-            .map_err(|e| SqeError::Catalog(format!("Failed to create view: {e}")))?;
+            .map_err(|e| SqeError::catalog_src(format!("Failed to create view: {e}"), e))?;
 
         let status = resp.status();
         if !status.is_success() {
@@ -1437,7 +1438,7 @@ impl SessionCatalog {
         let resp = req
             .send()
             .await
-            .map_err(|e| SqeError::Catalog(format!("Failed to list views: {e}")))?;
+            .map_err(|e| SqeError::catalog_src(format!("Failed to list views: {e}"), e))?;
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -1456,7 +1457,7 @@ impl SessionCatalog {
         let body: serde_json::Value = resp
             .json()
             .await
-            .map_err(|e| SqeError::Catalog(format!("Failed to parse views list: {e}")))?;
+            .map_err(|e| SqeError::catalog_src(format!("Failed to parse views list: {e}"), e))?;
 
         let names = body["identifiers"]
             .as_array()
@@ -1499,7 +1500,7 @@ impl SessionCatalog {
         let resp = req
             .send()
             .await
-            .map_err(|e| SqeError::Catalog(format!("Failed to load view: {e}")))?;
+            .map_err(|e| SqeError::catalog_src(format!("Failed to load view: {e}"), e))?;
 
         if resp.status().as_u16() == 404 {
             return Ok(None);
@@ -1521,7 +1522,7 @@ impl SessionCatalog {
         let body: serde_json::Value = resp
             .json()
             .await
-            .map_err(|e| SqeError::Catalog(format!("Failed to parse view response: {e}")))?;
+            .map_err(|e| SqeError::catalog_src(format!("Failed to parse view response: {e}"), e))?;
 
         // Iceberg REST view response: metadata.versions[last].representations[type=sql].sql
         let sql = body["metadata"]["versions"]
@@ -1571,7 +1572,7 @@ impl SessionCatalog {
         let resp = req
             .send()
             .await
-            .map_err(|e| SqeError::Catalog(format!("Failed to drop view: {e}")))?;
+            .map_err(|e| SqeError::catalog_src(format!("Failed to drop view: {e}"), e))?;
 
         let status = resp.status();
         if !status.is_success() {
@@ -1630,9 +1631,9 @@ impl SessionCatalog {
                 "name": table_ident.name(),
             },
             "requirements": serde_json::to_value(&requirements)
-                .map_err(|e| SqeError::Execution(format!("Failed to serialize requirements: {e}")))?,
+                .map_err(|e| SqeError::execution_src(format!("Failed to serialize requirements: {e}"), e))?,
             "updates": serde_json::to_value(&updates)
-                .map_err(|e| SqeError::Execution(format!("Failed to serialize updates: {e}")))?,
+                .map_err(|e| SqeError::execution_src(format!("Failed to serialize updates: {e}"), e))?,
         });
 
         debug!(url = %url, table = %table_ident, "Committing schema update via Polaris REST");
