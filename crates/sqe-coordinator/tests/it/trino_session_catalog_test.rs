@@ -179,6 +179,53 @@ async fn system_jdbc_enumerates_session_catalog_tables() {
     );
 }
 
+/// Gap #1: current_catalog / current_schema return the session's values.
+/// Tests both the bare-keyword form Trino clients send and the function-call
+/// form.
+#[tokio::test]
+async fn current_catalog_and_schema_return_session_values() {
+    let server = mount_empty_polaris().await;
+    let toml = format!(
+        "[coordinator]\n\n[auth]\n\n[query]\ncatalog_discovery = \"polaris-auto\"\n\n\
+         [catalog]\ncatalog_url = \"{}\"\nwarehouse = \"main_warehouse\"\n",
+        server.uri()
+    );
+    let config: SqeConfig = toml::from_str(&toml).expect("config parses");
+    let session = session("tok_curcat", Some("ws_energy_co"), Some("gold"));
+
+    let tracker = Arc::new(QueryTracker::new(&config.query_history));
+    let registry = RuntimeCatalogRegistry::default();
+    let (ctx, _catalog) = create_session_context(
+        &config, &session, None, &tracker, None, None, None, &registry,
+    )
+    .await
+    .expect("session context builds");
+
+    // This path is ctx.sql() directly, which does NOT apply the Trino-compat
+    // SQL rewrite. So use the forms that parse here: bare `current_catalog`
+    // (sqlparser reserved no-arg function) and the `current_schema()` call form.
+    // The bare `current_schema` -> `current_schema()` rewrite is covered by a
+    // unit test in sqe-sql (rewrite_trino_compat), and the full handler path
+    // applies that rewrite before planning.
+    for (sql, expected) in [
+        ("SELECT current_catalog", "ws_energy_co"),
+        ("SELECT current_schema()", "gold"),
+    ] {
+        let batches = ctx
+            .sql(sql)
+            .await
+            .unwrap_or_else(|e| panic!("`{sql}` must plan: {e}"))
+            .collect()
+            .await
+            .unwrap_or_else(|e| panic!("`{sql}` must execute: {e}"));
+        let out = batches_to_string(&batches);
+        assert!(
+            out.contains(expected),
+            "`{sql}` must return {expected}, got: {out}"
+        );
+    }
+}
+
 /// Render record batches to a flat string for substring assertions.
 fn batches_to_string(batches: &[arrow_array::RecordBatch]) -> String {
     let mut out = String::new();

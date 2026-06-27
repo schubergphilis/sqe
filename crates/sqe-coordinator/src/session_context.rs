@@ -582,11 +582,15 @@ pub async fn create_session_context(
             //
             // database: wired to config.catalog.warehouse (the Polaris warehouse name).
             // schema: None -- no per-session default namespace is set at this point (MVP).
+            // current_catalog() / current_database() return the session's
+            // effective catalog (X-Trino-Catalog, else the config default) and
+            // current_schema() returns the session schema (X-Trino-Schema, else
+            // "default"), so Trino clients see the catalog/schema they set. (#1)
             let session_identity = std::sync::Arc::new(sqe_policy::session_udf::SessionIdentity {
                 username: session.user.username.clone(),
                 roles: session.user.roles.clone(),
-                database: Some(config.catalog.warehouse.clone()),
-                schema: None,
+                database: Some(default_catalog.clone()),
+                schema: Some(session_schema.clone()),
             });
             for udf in sqe_policy::session_udf::session_udfs(session_identity) {
                 ctx.register_udf(udf);
