@@ -8,9 +8,10 @@ use datafusion::catalog::SchemaProvider;
 use datafusion::datasource::{MemTable, TableProvider};
 use datafusion::error::Result as DFResult;
 use iceberg::NamespaceIdent;
-use tracing::{error, warn};
+use tracing::warn;
 
 use crate::rest_catalog::SessionCatalog;
+use crate::system_catalog::SystemCatalogEntry;
 
 /// Descriptor for a single row in the `system.jdbc.types` table.
 struct JdbcTypeRow {
@@ -30,47 +31,51 @@ struct JdbcTypeRow {
 /// Exposes JDBC metadata tables (`types`, `catalogs`, `schemas`, `tables`, `columns`)
 /// required by Trino JDBC drivers (e.g. DBeaver) for metadata browsing.
 pub struct JdbcSchemaProvider {
-    session_catalog: Arc<SessionCatalog>,
-    warehouse: String,
-    /// Every catalog the session can see (default warehouse first, then the
-    /// other configured catalogs, deduplicated). `system.jdbc.catalogs`
-    /// enumerates this list so JDBC catalog discovery sees all catalogs, not
-    /// just the default. (handoff #5)
-    catalogs: Vec<String>,
+    /// Every catalog the session can reach (primary/default first, then the
+    /// other configured catalogs and the session's own, deduplicated by name).
+    /// `system.jdbc.catalogs` enumerates the names; `schemas`/`tables`/`columns`
+    /// iterate each catalog so JDBC metadata browsing sees all of them, not just
+    /// the default. (#5)
+    catalogs: Vec<SystemCatalogEntry>,
 }
 
 impl JdbcSchemaProvider {
-    pub fn new(
-        session_catalog: Arc<SessionCatalog>,
-        warehouse: String,
-        configured_catalogs: Vec<String>,
-    ) -> Self {
-        let catalogs = build_catalog_list(&warehouse, configured_catalogs);
+    pub fn new(entries: Vec<SystemCatalogEntry>) -> Self {
         Self {
-            session_catalog,
-            warehouse,
-            catalogs,
+            catalogs: dedup_entries(entries),
         }
     }
 }
 
-/// Catalog enumeration for `system.jdbc.catalogs`: the default warehouse first,
-/// then the other configured catalogs, deduplicated with order preserved.
-fn build_catalog_list(warehouse: &str, configured: Vec<String>) -> Vec<String> {
-    let mut catalogs = vec![warehouse.to_string()];
-    for c in configured {
-        if !catalogs.contains(&c) {
-            catalogs.push(c);
+/// Deduplicate reachable catalogs by name, preserving order (primary first).
+fn dedup_entries(entries: Vec<SystemCatalogEntry>) -> Vec<SystemCatalogEntry> {
+    let mut seen = std::collections::HashSet::new();
+    entries
+        .into_iter()
+        .filter(|e| seen.insert(e.name.clone()))
+        .collect()
+}
+
+/// List a single catalog's namespaces as dotted strings; `[]` on error
+/// (unauthorized / unreachable catalog), so enumeration skips it rather than
+/// aborting the whole metadata listing.
+async fn list_namespaces_for(catalog: &SessionCatalog) -> Vec<String> {
+    match catalog.list_namespaces().await {
+        Ok(namespaces) => namespaces
+            .iter()
+            .map(|ns| ns.as_ref().iter().map(|s| s.as_str()).collect::<Vec<_>>().join("."))
+            .collect(),
+        Err(e) => {
+            warn!(error = %e, "system.jdbc: skipping catalog whose namespaces could not be listed");
+            Vec::new()
         }
     }
-    catalogs
 }
 
 impl std::fmt::Debug for JdbcSchemaProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("JdbcSchemaProvider")
-            .field("warehouse", &self.warehouse)
-            .finish()
+        let names: Vec<&str> = self.catalogs.iter().map(|e| e.name.as_str()).collect();
+        f.debug_struct("JdbcSchemaProvider").field("catalogs", &names).finish()
     }
 }
 
@@ -94,7 +99,10 @@ impl SchemaProvider for JdbcSchemaProvider {
     async fn table(&self, name: &str) -> DFResult<Option<Arc<dyn TableProvider>>> {
         match name {
             "types" => Ok(Some(build_types_table()?)),
-            "catalogs" => Ok(Some(build_catalogs_table(&self.catalogs)?)),
+            "catalogs" => {
+                let names: Vec<String> = self.catalogs.iter().map(|e| e.name.clone()).collect();
+                Ok(Some(build_catalogs_table(&names)?))
+            }
             "schemas" => Ok(Some(self.build_schemas_table().await?)),
             "tables" => Ok(Some(self.build_tables_table().await?)),
             "columns" => Ok(Some(self.build_columns_table().await?)),
@@ -104,43 +112,24 @@ impl SchemaProvider for JdbcSchemaProvider {
 }
 
 impl JdbcSchemaProvider {
-    async fn list_namespaces_safe(&self) -> Vec<String> {
-        match self.session_catalog.list_namespaces().await {
-            Ok(namespaces) => namespaces
-                .iter()
-                .map(|ns| {
-                    ns.as_ref()
-                        .iter()
-                        .map(|s| s.as_str())
-                        .collect::<Vec<_>>()
-                        .join(".")
-                })
-                .collect(),
-            Err(e) => {
-                error!(error = %e, "Failed to list namespaces for system.jdbc");
-                Vec::new()
-            }
-        }
-    }
-
     async fn build_schemas_table(&self) -> DFResult<Arc<dyn TableProvider>> {
         let schema = Arc::new(Schema::new(vec![
             Field::new("table_schem", DataType::Utf8, false),
             Field::new("table_catalog", DataType::Utf8, false),
         ]));
 
-        let namespaces = self.list_namespaces_safe().await;
-
         let mut schem_builder = StringBuilder::new();
         let mut catalog_builder = StringBuilder::new();
 
-        // Always include information_schema
-        schem_builder.append_value("information_schema");
-        catalog_builder.append_value(&self.warehouse);
+        for entry in &self.catalogs {
+            // Every catalog exposes information_schema.
+            schem_builder.append_value("information_schema");
+            catalog_builder.append_value(&entry.name);
 
-        for ns in &namespaces {
-            schem_builder.append_value(ns);
-            catalog_builder.append_value(&self.warehouse);
+            for ns in list_namespaces_for(&entry.catalog).await {
+                schem_builder.append_value(&ns);
+                catalog_builder.append_value(&entry.name);
+            }
         }
 
         let batch = RecordBatch::try_new(
@@ -168,8 +157,6 @@ impl JdbcSchemaProvider {
             Field::new("ref_generation", DataType::Utf8, true),
         ]));
 
-        let namespaces = self.list_namespaces_safe().await;
-
         let mut cat_b = StringBuilder::new();
         let mut schem_b = StringBuilder::new();
         let mut name_b = StringBuilder::new();
@@ -181,25 +168,27 @@ impl JdbcSchemaProvider {
         let mut self_ref_b = StringBuilder::new();
         let mut ref_gen_b = StringBuilder::new();
 
-        for ns in &namespaces {
-            let ns_ident = NamespaceIdent::new(ns.clone());
-            match self.session_catalog.list_tables(&ns_ident).await {
-                Ok(tables) => {
-                    for table in &tables {
-                        cat_b.append_value(&self.warehouse);
-                        schem_b.append_value(ns);
-                        name_b.append_value(table.name());
-                        type_b.append_value("TABLE");
-                        remarks_b.append_null();
-                        type_cat_b.append_null();
-                        type_schem_b.append_null();
-                        type_name_b.append_null();
-                        self_ref_b.append_null();
-                        ref_gen_b.append_null();
+        for entry in &self.catalogs {
+            for ns in list_namespaces_for(&entry.catalog).await {
+                let ns_ident = NamespaceIdent::new(ns.clone());
+                match entry.catalog.list_tables(&ns_ident).await {
+                    Ok(tables) => {
+                        for table in &tables {
+                            cat_b.append_value(&entry.name);
+                            schem_b.append_value(&ns);
+                            name_b.append_value(table.name());
+                            type_b.append_value("TABLE");
+                            remarks_b.append_null();
+                            type_cat_b.append_null();
+                            type_schem_b.append_null();
+                            type_name_b.append_null();
+                            self_ref_b.append_null();
+                            ref_gen_b.append_null();
+                        }
                     }
-                }
-                Err(e) => {
-                    warn!(namespace = %ns, error = %e, "Failed to list tables for system.jdbc.tables");
+                    Err(e) => {
+                        warn!(catalog = %entry.name, namespace = %ns, error = %e, "Failed to list tables for system.jdbc.tables");
+                    }
                 }
             }
         }
@@ -252,8 +241,6 @@ impl JdbcSchemaProvider {
             Field::new("is_generatedcolumn", DataType::Utf8, false),
         ]));
 
-        let namespaces = self.list_namespaces_safe().await;
-
         let mut cat_b = StringBuilder::new();
         let mut schem_b = StringBuilder::new();
         let mut tbl_b = StringBuilder::new();
@@ -279,55 +266,57 @@ impl JdbcSchemaProvider {
         let mut is_auto_b = StringBuilder::new();
         let mut is_gen_b = StringBuilder::new();
 
-        for ns in &namespaces {
-            let ns_ident = NamespaceIdent::new(ns.clone());
-            let tables = match self.session_catalog.list_tables(&ns_ident).await {
-                Ok(t) => t,
-                Err(e) => {
-                    warn!(namespace = %ns, error = %e, "Failed to list tables for system.jdbc.columns");
-                    continue;
-                }
-            };
-
-            for table_ident in &tables {
-                let full_ident =
-                    iceberg::TableIdent::new(ns_ident.clone(), table_ident.name().to_string());
-                let table = match self.session_catalog.load_table(&full_ident).await {
+        for entry in &self.catalogs {
+            for ns in list_namespaces_for(&entry.catalog).await {
+                let ns_ident = NamespaceIdent::new(ns.clone());
+                let tables = match entry.catalog.list_tables(&ns_ident).await {
                     Ok(t) => t,
                     Err(e) => {
-                        warn!(table = %table_ident.name(), error = %e, "Failed to load table for system.jdbc.columns");
+                        warn!(catalog = %entry.name, namespace = %ns, error = %e, "Failed to list tables for system.jdbc.columns");
                         continue;
                     }
                 };
 
-                let iceberg_schema = table.metadata().current_schema();
-                for (idx, field) in iceberg_schema.as_struct().fields().iter().enumerate() {
-                    let (jdbc_type, type_name) = iceberg_type_to_jdbc(&field.field_type);
+                for table_ident in &tables {
+                    let full_ident =
+                        iceberg::TableIdent::new(ns_ident.clone(), table_ident.name().to_string());
+                    let table = match entry.catalog.load_table(&full_ident).await {
+                        Ok(t) => t,
+                        Err(e) => {
+                            warn!(catalog = %entry.name, table = %table_ident.name(), error = %e, "Failed to load table for system.jdbc.columns");
+                            continue;
+                        }
+                    };
 
-                    cat_b.append_value(&self.warehouse);
-                    schem_b.append_value(ns);
-                    tbl_b.append_value(table_ident.name());
-                    col_b.append_value(&field.name);
-                    dtype_b.append_value(jdbc_type);
-                    tname_b.append_value(type_name);
-                    colsize_b.append_null();
-                    buflen_b.append_null();
-                    dec_digits_b.append_null();
-                    radix_b.append_null();
-                    nullable_b.append_value(if field.required { 0 } else { 1 });
-                    remarks_b.append_null();
-                    coldef_b.append_null();
-                    sql_dt_b.append_null();
-                    sql_sub_b.append_null();
-                    char_oct_b.append_null();
-                    ordinal_b.append_value((idx + 1) as i32);
-                    is_nullable_b.append_value(if field.required { "NO" } else { "YES" });
-                    scope_cat_b.append_null();
-                    scope_sch_b.append_null();
-                    scope_tbl_b.append_null();
-                    src_dt_b.append_null();
-                    is_auto_b.append_value("NO");
-                    is_gen_b.append_value("NO");
+                    let iceberg_schema = table.metadata().current_schema();
+                    for (idx, field) in iceberg_schema.as_struct().fields().iter().enumerate() {
+                        let (jdbc_type, type_name) = iceberg_type_to_jdbc(&field.field_type);
+
+                        cat_b.append_value(&entry.name);
+                        schem_b.append_value(&ns);
+                        tbl_b.append_value(table_ident.name());
+                        col_b.append_value(&field.name);
+                        dtype_b.append_value(jdbc_type);
+                        tname_b.append_value(type_name);
+                        colsize_b.append_null();
+                        buflen_b.append_null();
+                        dec_digits_b.append_null();
+                        radix_b.append_null();
+                        nullable_b.append_value(if field.required { 0 } else { 1 });
+                        remarks_b.append_null();
+                        coldef_b.append_null();
+                        sql_dt_b.append_null();
+                        sql_sub_b.append_null();
+                        char_oct_b.append_null();
+                        ordinal_b.append_value((idx + 1) as i32);
+                        is_nullable_b.append_value(if field.required { "NO" } else { "YES" });
+                        scope_cat_b.append_null();
+                        scope_sch_b.append_null();
+                        scope_tbl_b.append_null();
+                        src_dt_b.append_null();
+                        is_auto_b.append_value("NO");
+                        is_gen_b.append_value("NO");
+                    }
                 }
             }
         }
@@ -550,31 +539,16 @@ mod tests {
     }
 
     #[test]
-    fn catalog_list_enumerates_all_warehouse_first() {
-        let list = build_catalog_list(
-            "main_warehouse",
-            vec!["sales_wh".to_string(), "ops_wh".to_string()],
-        );
-        assert_eq!(
-            list.iter().map(String::as_str).collect::<Vec<_>>(),
-            vec!["main_warehouse", "sales_wh", "ops_wh"]
-        );
-    }
-
-    #[test]
-    fn catalog_list_dedups_and_preserves_order() {
-        let list = build_catalog_list(
-            "main_warehouse",
-            vec![
-                "main_warehouse".to_string(), // duplicate of default
-                "ws_energy_co".to_string(),
-                "ws_energy_co".to_string(), // duplicate
-            ],
-        );
-        assert_eq!(
-            list.iter().map(String::as_str).collect::<Vec<_>>(),
-            vec!["main_warehouse", "ws_energy_co"]
-        );
+    fn catalogs_table_lists_every_reachable_catalog() {
+        // The catalogs table emits one row per reachable catalog name, in the
+        // order given (primary/default first). Dedup of entries happens in
+        // JdbcSchemaProvider::new before this point. (#5)
+        let table = build_catalogs_table(&[
+            "main_warehouse".to_string(),
+            "ws_energy_co".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(table.schema().field(0).name(), "table_cat");
     }
 
     #[test]

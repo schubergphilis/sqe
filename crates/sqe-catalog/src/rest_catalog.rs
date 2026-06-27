@@ -953,6 +953,18 @@ impl SessionCatalog {
             .map_err(|e| sqe_core::SqeError::catalog_src(format!("Failed to list namespaces: {e}"), e));
         match &result {
             Ok(_) => self.circuit_breaker.record_success(),
+            // A 401/403 is a per-principal authorization decision, not a
+            // transient catalog fault. Counting it as a failure would open the
+            // breaker and turn later authorized calls into CircuitBreakerOpen
+            // errors -- and during metadata enumeration a 403 on one namespace
+            // listing would poison the whole catalog. Only real faults (5xx,
+            // network, timeout) should trip the breaker. (#5)
+            Err(e)
+                if matches!(
+                    e.error_code(),
+                    sqe_core::SqeErrorCode::AccessDenied
+                        | sqe_core::SqeErrorCode::AuthenticationFailed
+                ) => {}
             Err(_) => self.circuit_breaker.record_failure(),
         }
         self.record_catalog_call("list_namespaces", started, result.is_ok());

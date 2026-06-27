@@ -7,6 +7,23 @@ use crate::system_jdbc::JdbcSchemaProvider;
 use crate::system_metadata::MetadataSchemaProvider;
 use crate::system_runtime::RuntimeSchemaProvider;
 
+/// One catalog the session can reach, paired with the `SessionCatalog` used to
+/// enumerate it. `system.jdbc.*` and `system.metadata.*` iterate these so JDBC
+/// metadata browsing (`getCatalogs`/`getTables`/`getColumns`) sees every
+/// reachable catalog -- the configured ones plus the session's own
+/// (X-Trino-Catalog) Polaris warehouse -- not just the default. (#5)
+#[derive(Clone)]
+pub struct SystemCatalogEntry {
+    pub name: String,
+    pub catalog: Arc<SessionCatalog>,
+}
+
+impl std::fmt::Debug for SystemCatalogEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SystemCatalogEntry").field("name", &self.name).finish()
+    }
+}
+
 /// DataFusion `CatalogProvider` for the virtual `system` catalog.
 ///
 /// Provides the following schemas:
@@ -22,18 +39,14 @@ pub struct SystemCatalogProvider {
 }
 
 impl SystemCatalogProvider {
-    pub fn new(
-        session_catalog: Arc<SessionCatalog>,
-        warehouse: String,
-        catalogs: Vec<String>,
-    ) -> Self {
+    /// Build the `system` catalog over every reachable catalog. `entries[0]`
+    /// is the primary/default warehouse (first in JDBC catalog listings);
+    /// `entries` also include the session's own catalog so a JDBC client that
+    /// connected with `X-Trino-Catalog=<ws>` enumerates `<ws>`.
+    pub fn new(entries: Vec<SystemCatalogEntry>) -> Self {
         Self {
-            jdbc_schema: Arc::new(JdbcSchemaProvider::new(
-                session_catalog.clone(),
-                warehouse.clone(),
-                catalogs,
-            )),
-            metadata_schema: Arc::new(MetadataSchemaProvider::new(session_catalog, warehouse)),
+            jdbc_schema: Arc::new(JdbcSchemaProvider::new(entries.clone())),
+            metadata_schema: Arc::new(MetadataSchemaProvider::new(entries)),
             runtime_schema: None,
         }
     }
