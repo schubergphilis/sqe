@@ -151,7 +151,17 @@ pub fn rewrite_trino_compat(sql: &str) -> String {
     // `current_catalog`, which it treats as a reserved no-arg function), so we
     // rewrite it to the `current_schema()` call form the session UDF answers.
     let has_current_schema = lower.contains("current_schema");
-    if !has_json_cast && !has_dollar && !has_grouping_set && !has_current_schema {
+    // `as uuid` / `as ipaddress` -> rewrite_cast_custom_to_varchar. Trino's
+    // UUID and IPADDRESS types have no DataFusion equivalent (CAST -> a
+    // NOT_SUPPORTED error); both are string-representable, so on the read path
+    // we rewrite the cast to VARCHAR.
+    let has_custom_cast = lower.contains("as uuid") || lower.contains("as ipaddress");
+    if !has_json_cast
+        && !has_dollar
+        && !has_grouping_set
+        && !has_current_schema
+        && !has_custom_cast
+    {
         return sql.to_string();
     }
 
@@ -209,6 +219,9 @@ impl VisitorMut for TrinoCompatVisitor {
     type Break = ();
 
     fn post_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<Self::Break> {
+        if rewrite_cast_custom_to_varchar(expr) {
+            self.rewrites += 1;
+        }
         if rewrite_cast_as_json(expr) {
             self.rewrites += 1;
         }
@@ -263,6 +276,40 @@ fn has_wrap_cte(query: &Query) -> bool {
     with.cte_tables
         .iter()
         .any(|cte| cte.alias.name.value == ROLLUP_WRAP_CTE)
+}
+
+/// Rewrite `CAST(x AS UUID)` / `CAST(x AS IPADDRESS)` to `CAST(x AS VARCHAR)`.
+///
+/// Trino's UUID and IPADDRESS types have no DataFusion equivalent, so the cast
+/// would surface as a NOT_SUPPORTED error. Both are string-representable, so on
+/// the read path (BI clients over generic datasets) we map them to VARCHAR.
+/// This is a display-level compatibility shim: it does not validate the UUID /
+/// IP-address format the way Trino's native cast would. `ROW(...)` casts are
+/// deliberately not handled here (named-field struct casts are out of scope).
+/// Returns true if the rewrite fired.
+fn rewrite_cast_custom_to_varchar(expr: &mut Expr) -> bool {
+    let Expr::Cast { data_type, .. } = expr else {
+        return false;
+    };
+    // sqlparser models UUID as a dedicated variant; IPADDRESS is unknown to it
+    // and lands as a single-part Custom type.
+    let is_target = match &*data_type {
+        SqlDataType::Uuid => true,
+        SqlDataType::Custom(name, _modifiers) => {
+            name.0.len() == 1
+                && name.0[0]
+                    .as_ident()
+                    .map(|i| i.value.eq_ignore_ascii_case("ipaddress"))
+                    .unwrap_or(false)
+        }
+        _ => false,
+    };
+    if is_target {
+        *data_type = SqlDataType::Varchar(None);
+        true
+    } else {
+        false
+    }
 }
 
 /// Rewrite `Expr::Cast { data_type: JSON, expr }` to `to_json(expr)`.
@@ -1006,5 +1053,26 @@ mod tests {
             !out.contains("current_schema()"),
             "quoted column must not be rewritten: {out}"
         );
+    }
+
+    #[test]
+    fn rewrites_cast_uuid_and_ipaddress_to_varchar() {
+        // Trino UUID / IPADDRESS casts have no DataFusion equivalent; map to
+        // VARCHAR so the read path succeeds. (#6)
+        let out = rewrite_trino_compat("SELECT CAST(id AS UUID) FROM t").to_uppercase();
+        assert!(out.contains("CAST(ID AS VARCHAR)"), "got: {out}");
+        assert!(!out.contains("AS UUID"), "got: {out}");
+
+        let out = rewrite_trino_compat("SELECT CAST(addr AS ipaddress) FROM t").to_uppercase();
+        assert!(out.contains("CAST(ADDR AS VARCHAR)"), "got: {out}");
+        assert!(!out.contains("IPADDRESS"), "got: {out}");
+    }
+
+    #[test]
+    fn leaves_other_custom_casts_untouched() {
+        // A non-UUID/ipaddress custom type (e.g. a v3 TIMESTAMP_NS) must not be
+        // rewritten to VARCHAR.
+        let out = rewrite_trino_compat("SELECT CAST(x AS BIGINT) FROM t");
+        assert!(!out.to_uppercase().contains("VARCHAR"), "got: {out}");
     }
 }
