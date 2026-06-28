@@ -165,6 +165,54 @@ pub fn apply_info_schema_compat(
         .collect()
 }
 
+/// True when `sql` is a `SHOW COLUMNS` or a `DESCRIBE <table>` / `DESC <table>`
+/// (not `DESCRIBE OUTPUT/INPUT`, which are intercepted earlier). Used to gate
+/// the Trino column-shape reshape so plain `information_schema.columns` selects
+/// keep their native column names.
+pub fn is_describe_or_show_columns(sql: &str) -> bool {
+    let s = sql.trim_start().to_ascii_lowercase();
+    s.starts_with("show columns")
+        || ((s.starts_with("describe ") || s.starts_with("desc "))
+            && !s.starts_with("describe output")
+            && !s.starts_with("describe input"))
+}
+
+/// Reshape a SHOW COLUMNS / DESCRIBE result from SQE's
+/// `[column_name, data_type, is_nullable]` to Trino's
+/// `[Column, Type, Extra, Comment]`. The `data_type` values must already be
+/// Trino type names (run [`apply_info_schema_compat`] first). Batches whose
+/// shape doesn't match are returned unchanged.
+pub fn reshape_describe_to_trino(batches: Vec<RecordBatch>) -> Vec<RecordBatch> {
+    batches.into_iter().map(reshape_describe_batch).collect()
+}
+
+fn reshape_describe_batch(batch: RecordBatch) -> RecordBatch {
+    let schema = batch.schema();
+    let (Ok(name_idx), Ok(type_idx)) =
+        (schema.index_of("column_name"), schema.index_of("data_type"))
+    else {
+        return batch;
+    };
+    let n = batch.num_rows();
+    let empty: arrow_array::ArrayRef = Arc::new(StringArray::from(vec![""; n]));
+    let out_schema = Arc::new(arrow_schema::Schema::new(vec![
+        arrow_schema::Field::new("Column", arrow_schema::DataType::Utf8, false),
+        arrow_schema::Field::new("Type", arrow_schema::DataType::Utf8, false),
+        arrow_schema::Field::new("Extra", arrow_schema::DataType::Utf8, true),
+        arrow_schema::Field::new("Comment", arrow_schema::DataType::Utf8, true),
+    ]));
+    RecordBatch::try_new(
+        out_schema,
+        vec![
+            batch.column(name_idx).clone(),
+            batch.column(type_idx).clone(),
+            empty.clone(),
+            empty,
+        ],
+    )
+    .unwrap_or(batch)
+}
+
 /// Replace the Arrow display strings in a `data_type` column with Trino names.
 fn translate_data_type(batch: RecordBatch) -> RecordBatch {
     let schema = batch.schema();
@@ -223,6 +271,38 @@ mod tests {
     use super::*;
     use arrow_array::RecordBatch;
     use arrow_schema::{DataType, Field, Schema};
+
+    #[test]
+    fn describe_reshape_to_trino_columns() {
+        assert!(is_describe_or_show_columns("SHOW COLUMNS FROM t"));
+        assert!(is_describe_or_show_columns("describe gold.t"));
+        assert!(is_describe_or_show_columns("DESC t"));
+        assert!(!is_describe_or_show_columns("DESCRIBE OUTPUT p"));
+        assert!(!is_describe_or_show_columns("SELECT * FROM information_schema.columns"));
+
+        // [column_name, data_type, is_nullable] -> [Column, Type, Extra, Comment]
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("column_name", DataType::Utf8, false),
+            Field::new("data_type", DataType::Utf8, false),
+            Field::new("is_nullable", DataType::Utf8, false),
+        ]));
+        let b = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["id", "name"])),
+                Arc::new(StringArray::from(vec!["bigint", "varchar"])),
+                Arc::new(StringArray::from(vec!["NO", "YES"])),
+            ],
+        )
+        .unwrap();
+        let out = reshape_describe_to_trino(vec![b]);
+        let s = out[0].schema();
+        assert_eq!(
+            s.fields().iter().map(|f| f.name().as_str()).collect::<Vec<_>>(),
+            vec!["Column", "Type", "Extra", "Comment"]
+        );
+        assert_eq!(out[0].num_rows(), 2);
+    }
 
     // ── type mapping (ground truth from the live stack discriminator) ──────
     #[test]

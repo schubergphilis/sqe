@@ -867,10 +867,19 @@ async fn submit_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
             // catalog listing to the session catalog. Other queries pass
             // through untouched.
             let batches = if info_schema_compat::is_metadata_query(exec_sql) {
-                info_schema_compat::apply_info_schema_compat(
+                let batches = info_schema_compat::apply_info_schema_compat(
                     batches,
                     session.default_catalog.as_deref(),
-                )
+                );
+                // SHOW COLUMNS / DESCRIBE <table>: reshape SQE's
+                // [column_name, data_type, is_nullable] to Trino's
+                // [Column, Type, Extra, Comment] (type values already
+                // translated above). information_schema selects are left as-is.
+                if info_schema_compat::is_describe_or_show_columns(exec_sql) {
+                    info_schema_compat::reshape_describe_to_trino(batches)
+                } else {
+                    batches
+                }
             } else {
                 batches
             };
