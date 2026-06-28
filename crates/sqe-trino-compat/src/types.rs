@@ -82,6 +82,32 @@ fn normalize_timestamp_fraction(s: &str) -> String {
     format!("{normalized_body}{suffix}")
 }
 
+/// Format an interval as Trino's day-to-second literal `D HH:MM:SS.mmm`
+/// (e.g. one day -> `1 00:00:00.000`), from a day count and a nanosecond
+/// remainder. Negative intervals carry a leading `-`.
+fn format_day_time_interval(days: i64, nanos: i64) -> String {
+    let total_nanos = days.saturating_mul(86_400_000_000_000).saturating_add(nanos);
+    let neg = total_nanos < 0;
+    let n = total_nanos.unsigned_abs();
+    let millis_total = n / 1_000_000;
+    let secs_total = millis_total / 1000;
+    let millis = millis_total % 1000;
+    let d = secs_total / 86_400;
+    let rem = secs_total % 86_400;
+    let (h, m, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+    let sign = if neg { "-" } else { "" };
+    format!("{sign}{d} {h:02}:{m:02}:{s:02}.{millis:03}")
+}
+
+/// Format a year-month interval as Trino's `Y-M` literal (e.g. 14 months ->
+/// `1-2`). Negative intervals carry a leading `-`.
+fn format_year_month_interval(months: i32) -> String {
+    let neg = months < 0;
+    let m = months.unsigned_abs();
+    let sign = if neg { "-" } else { "" };
+    format!("{sign}{}-{}", m / 12, m % 12)
+}
+
 pub fn arrow_value_to_json(
     array: &dyn arrow_array::Array,
     row: usize,
@@ -228,6 +254,51 @@ pub fn arrow_value_to_json(
                 base64::engine::general_purpose::STANDARD.encode(arr.value(row)),
             )
         }
+        // Intervals: Trino renders day-to-second as `D HH:MM:SS.mmm` and
+        // year-to-month as `Y-M`; Arrow's display ("1 days") is not Trino-valid.
+        DataType::Interval(arrow_schema::IntervalUnit::YearMonth) => {
+            let arr = array.as_any().downcast_ref::<IntervalYearMonthArray>().unwrap();
+            serde_json::Value::String(format_year_month_interval(arr.value(row)))
+        }
+        DataType::Interval(arrow_schema::IntervalUnit::DayTime) => {
+            let arr = array.as_any().downcast_ref::<IntervalDayTimeArray>().unwrap();
+            let v = arr.value(row);
+            serde_json::Value::String(format_day_time_interval(
+                v.days as i64,
+                (v.milliseconds as i64) * 1_000_000,
+            ))
+        }
+        DataType::Interval(arrow_schema::IntervalUnit::MonthDayNano) => {
+            let arr = array.as_any().downcast_ref::<IntervalMonthDayNanoArray>().unwrap();
+            let v = arr.value(row);
+            // A pure month interval renders year-to-month; anything with a day
+            // or sub-day component renders day-to-second.
+            if v.days == 0 && v.nanoseconds == 0 {
+                serde_json::Value::String(format_year_month_interval(v.months))
+            } else {
+                serde_json::Value::String(format_day_time_interval(v.days as i64, v.nanoseconds))
+            }
+        }
+        DataType::Duration(unit) => {
+            let nanos: i64 = match unit {
+                arrow_schema::TimeUnit::Second => {
+                    array.as_any().downcast_ref::<DurationSecondArray>().unwrap().value(row)
+                        .saturating_mul(1_000_000_000)
+                }
+                arrow_schema::TimeUnit::Millisecond => {
+                    array.as_any().downcast_ref::<DurationMillisecondArray>().unwrap().value(row)
+                        .saturating_mul(1_000_000)
+                }
+                arrow_schema::TimeUnit::Microsecond => {
+                    array.as_any().downcast_ref::<DurationMicrosecondArray>().unwrap().value(row)
+                        .saturating_mul(1_000)
+                }
+                arrow_schema::TimeUnit::Nanosecond => {
+                    array.as_any().downcast_ref::<DurationNanosecondArray>().unwrap().value(row)
+                }
+            };
+            serde_json::Value::String(format_day_time_interval(0, nanos))
+        }
         _ => {
             serde_json::Value::String(
                 arrow::util::display::array_value_to_string(array, row).unwrap_or_default(),
@@ -285,6 +356,31 @@ mod tests {
         assert_eq!(
             normalize_timestamp_fraction("2024-03-20 08:00:00.123456789+00:00"),
             "2024-03-20 08:00:00.123456+00:00"
+        );
+    }
+
+    #[test]
+    fn test_trino_interval_formatting() {
+        // day-to-second `D HH:MM:SS.mmm`
+        assert_eq!(format_day_time_interval(1, 0), "1 00:00:00.000");
+        assert_eq!(format_day_time_interval(0, 90 * 60 * 1_000_000_000), "0 01:30:00.000");
+        assert_eq!(format_day_time_interval(0, 1_500_000_000), "0 00:00:01.500");
+        assert_eq!(format_day_time_interval(-1, 0), "-1 00:00:00.000");
+        // year-to-month `Y-M`
+        assert_eq!(format_year_month_interval(14), "1-2");
+        assert_eq!(format_year_month_interval(3), "0-3");
+        assert_eq!(format_year_month_interval(-5), "-0-5");
+    }
+
+    #[test]
+    fn test_interval_value_renders_trino() {
+        use arrow::datatypes::IntervalMonthDayNano;
+        use arrow_array::IntervalMonthDayNanoArray;
+        // one day -> "1 00:00:00.000"
+        let arr = IntervalMonthDayNanoArray::from(vec![IntervalMonthDayNano::new(0, 1, 0)]);
+        assert_eq!(
+            arrow_value_to_json(&arr, 0),
+            serde_json::Value::String("1 00:00:00.000".to_string())
         );
     }
 
