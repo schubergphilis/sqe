@@ -3061,8 +3061,9 @@ impl QueryHandler {
             }
         }
 
+        // Trino's `SHOW CATALOGS` column is named `Catalog`.
         let schema = Arc::new(Schema::new(vec![Field::new(
-            "catalog_name",
+            "Catalog",
             DataType::Utf8,
             false,
         )]));
@@ -3103,8 +3104,9 @@ impl QueryHandler {
             Err(e) => return Err(e),
         };
 
+        // Trino's `SHOW SCHEMAS` column is named `Schema`.
         let schema = Arc::new(Schema::new(vec![Field::new(
-            "schema_name",
+            "Schema",
             DataType::Utf8,
             false,
         )]));
@@ -3205,23 +3207,25 @@ impl QueryHandler {
             Some(name) => vec![iceberg::NamespaceIdent::new(name)],
         };
 
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("namespace", DataType::Utf8, false),
-            Field::new("table_name", DataType::Utf8, false),
-        ]));
+        // Trino's `SHOW TABLES` returns a SINGLE column named `Table` holding
+        // bare table names (the schema is the FROM / session-schema context).
+        // SQE previously returned two columns [namespace, table_name]; the
+        // Trino / Starburst JDBC driver reads column 0 as the table name, so
+        // the leading namespace column made every row collapse to the namespace
+        // (e.g. Metabase schema sync saw one malformed `gold.` entry instead of
+        // the real tables). Match Trino exactly: one `Table` column.
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "Table",
+            DataType::Utf8,
+            false,
+        )]));
 
-        let mut ns_builder = StringBuilder::new();
-        let mut table_builder = StringBuilder::new();
-
+        let mut names: Vec<String> = Vec::new();
         for ns in &namespaces {
             match session_catalog.list_tables(ns).await {
                 Ok(tables) => {
-                    let ns_name: Vec<&str> =
-                        ns.as_ref().iter().map(|s| s.as_str()).collect();
-                    let ns_str = ns_name.join(".");
                     for table in &tables {
-                        ns_builder.append_value(&ns_str);
-                        table_builder.append_value(table.name());
+                        names.push(table.name().to_string());
                     }
                 }
                 Err(e) => {
@@ -3233,11 +3237,16 @@ impl QueryHandler {
                 }
             }
         }
+        // Trino lists table names sorted.
+        names.sort();
 
-        let ns_array: ArrayRef = Arc::new(ns_builder.finish());
+        let mut table_builder = StringBuilder::new();
+        for name in &names {
+            table_builder.append_value(name);
+        }
         let table_array: ArrayRef = Arc::new(table_builder.finish());
 
-        let batch = RecordBatch::try_new(schema, vec![ns_array, table_array])
+        let batch = RecordBatch::try_new(schema, vec![table_array])
             .map_err(|e| SqeError::Execution(format!("Failed to create result batch: {e}")))?;
 
         Ok(vec![batch])
