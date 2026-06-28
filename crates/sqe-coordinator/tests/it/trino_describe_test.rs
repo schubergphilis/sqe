@@ -76,6 +76,26 @@ fn cell(batch: &arrow_array::RecordBatch, col: usize, row: usize) -> String {
     arrow::util::display::array_value_to_string(batch.column(col), row).unwrap_or_default()
 }
 
+/// SHOW TABLES / SHOW SCHEMAS / SHOW CATALOGS use Trino's single-column,
+/// Trino-named result shape (#1 P0, #2). The Trino/Starburst JDBC driver reads
+/// column 0 of SHOW TABLES as the table name; SQE's old [namespace, table_name]
+/// shape made it read the namespace and collapse every row.
+#[tokio::test]
+async fn show_results_use_trino_column_shape() {
+    let server = mount_empty_polaris().await;
+    let h = handler(&server.uri());
+
+    let tables = h.execute(&session(), "SHOW TABLES FROM gold", None).await.expect("show tables");
+    assert_eq!(tables[0].schema().fields().len(), 1, "SHOW TABLES is single-column");
+    assert_eq!(tables[0].schema().field(0).name(), "Table");
+
+    let schemas = h.execute(&session(), "SHOW SCHEMAS", None).await.expect("show schemas");
+    assert_eq!(schemas[0].schema().field(0).name(), "Schema");
+
+    let catalogs = h.execute(&session(), "SHOW CATALOGS", None).await.expect("show catalogs");
+    assert_eq!(catalogs[0].schema().field(0).name(), "Catalog");
+}
+
 /// DESCRIBE OUTPUT: one row per output column with the Trino type name.
 #[tokio::test]
 async fn describe_output_lists_columns_and_types() {
