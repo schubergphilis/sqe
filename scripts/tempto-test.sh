@@ -19,10 +19,14 @@ COMPOSE=(docker compose -f docker-compose.test.yml -f docker-compose.compare.yml
 CONFIG="/work/tempto-configuration.yaml"
 TARGET="SQE (via TLS proxy)"
 SVCS=(sqe tls-proxy)
+READY_NAME="SQE"
+READY_URL="http://localhost:28080/v1/info"
 BUILD_FLAG="--build"
 for arg in "$@"; do
   case "$arg" in
-    --baseline) CONFIG="/work/tempto-configuration-baseline.yaml"; TARGET="real Trino (baseline)"; SVCS=(trino) ;;
+    --baseline)
+      CONFIG="/work/tempto-configuration-baseline.yaml"; TARGET="real Trino (baseline)"
+      SVCS=(trino); READY_NAME="Trino"; READY_URL="http://localhost:38080/v1/info" ;;
     --no-build) BUILD_FLAG="" ;;
     *) echo "unknown arg: $arg" >&2; exit 2 ;;
   esac
@@ -35,9 +39,9 @@ echo "=== Tempto Iceberg compatibility run -- target: $TARGET ==="
 echo "Bootstrapping test stack (idempotent)..."
 "$SCRIPT_DIR/bootstrap-test.sh"
 
-echo "Waiting for SQE compat endpoint..."
-timeout 60 bash -c 'until curl -sf http://localhost:28080/v1/info >/dev/null; do sleep 1; done' \
-  || { echo "ERROR: SQE not reachable on 28080"; exit 1; }
+echo "Waiting for $READY_NAME endpoint..."
+timeout 90 bash -c "until curl -sf $READY_URL >/dev/null; do sleep 1; done" \
+  || { echo "ERROR: $READY_NAME not reachable at $READY_URL"; exit 1; }
 
 TESTS=$(grep -vE '^\s*#|^\s*$' testing/tempto/allowlist.txt | paste -sd, -)
 echo "Running tempto allow-list: $TESTS"
