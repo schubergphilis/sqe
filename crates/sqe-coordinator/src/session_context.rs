@@ -476,6 +476,21 @@ pub async fn create_session_context(
             })?;
             let session_catalog_for_return = session_catalog.clone();
 
+            // The SessionCatalog bound to the session's *effective* default
+            // catalog (the one a normal `SELECT ns.t` resolves against -- a
+            // discovered Polaris warehouse from X-Trino-Catalog, or a named
+            // config catalog). The iceberg metadata TVFs (table_snapshots,
+            // $history, $partitions, ...) use this so `"ns.t$snapshots"` loads
+            // the table from the caller's catalog instead of the primary/config
+            // catalog (which failed with "table_snapshots: failed to load" when
+            // the session catalog differed). Falls back to the primary when the
+            // name isn't among the built catalogs. (#4)
+            let effective_session_catalog = system_catalog_entries
+                .iter()
+                .find(|e| e.name == default_catalog)
+                .map(|e| Arc::clone(&e.catalog))
+                .unwrap_or_else(|| session_catalog_for_return.clone());
+
             // Register the system catalog for Trino JDBC metadata browsing
             // (system.jdbc.types, system.jdbc.catalogs, system.jdbc.schemas, etc.)
             // and the system.runtime.* virtual tables for query/node/task info.
@@ -663,37 +678,37 @@ pub async fn create_session_context(
             ctx.register_udtf(
                 "table_snapshots",
                 Arc::new(sqe_catalog::iceberg_metadata_tvf::TableSnapshotsFunction::new(
-                    Arc::clone(&session_catalog_for_return),
+                    Arc::clone(&effective_session_catalog),
                 )),
             );
             ctx.register_udtf(
                 "table_manifests",
                 Arc::new(sqe_catalog::iceberg_metadata_tvf::TableManifestsFunction::new(
-                    Arc::clone(&session_catalog_for_return),
+                    Arc::clone(&effective_session_catalog),
                 )),
             );
             ctx.register_udtf(
                 "table_history",
                 Arc::new(sqe_catalog::iceberg_metadata_tvf::TableHistoryFunction::new(
-                    Arc::clone(&session_catalog_for_return),
+                    Arc::clone(&effective_session_catalog),
                 )),
             );
             ctx.register_udtf(
                 "table_files",
                 Arc::new(sqe_catalog::iceberg_metadata_tvf::TableFilesFunction::new(
-                    Arc::clone(&session_catalog_for_return),
+                    Arc::clone(&effective_session_catalog),
                 )),
             );
             ctx.register_udtf(
                 "table_partitions",
                 Arc::new(sqe_catalog::iceberg_metadata_tvf::TablePartitionsFunction::new(
-                    Arc::clone(&session_catalog_for_return),
+                    Arc::clone(&effective_session_catalog),
                 )),
             );
             ctx.register_udtf(
                 "table_refs",
                 Arc::new(sqe_catalog::iceberg_metadata_tvf::TableRefsFunction::new(
-                    Arc::clone(&session_catalog_for_return),
+                    Arc::clone(&effective_session_catalog),
                 )),
             );
 
