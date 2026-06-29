@@ -8,9 +8,9 @@ use datafusion::catalog::SchemaProvider;
 use datafusion::datasource::{MemTable, TableProvider};
 use datafusion::error::Result as DFResult;
 use iceberg::NamespaceIdent;
-use tracing::warn;
+use tracing::{debug, warn};
 
-use crate::rest_catalog::SessionCatalog;
+use crate::rest_catalog::{listing_error_is_forbidden, SessionCatalog};
 use crate::system_catalog::SystemCatalogEntry;
 
 /// Descriptor for a single row in the `system.jdbc.types` table.
@@ -66,7 +66,13 @@ async fn list_namespaces_for(catalog: &SessionCatalog) -> Vec<String> {
             .map(|ns| ns.as_ref().iter().map(|s| s.as_str()).collect::<Vec<_>>().join("."))
             .collect(),
         Err(e) => {
-            warn!(error = %e, "system.jdbc: skipping catalog whose namespaces could not be listed");
+            // A principal that cannot LIST a catalog's namespaces just doesn't
+            // see it: skip quietly (#318). Any other failure is logged.
+            if listing_error_is_forbidden(&e) {
+                debug!(error = %e, "system.jdbc: skipping catalog the principal is not authorized to list");
+            } else {
+                warn!(error = %e, "system.jdbc: skipping catalog whose namespaces could not be listed");
+            }
             Vec::new()
         }
     }
@@ -186,6 +192,9 @@ impl JdbcSchemaProvider {
                             ref_gen_b.append_null();
                         }
                     }
+                    Err(e) if listing_error_is_forbidden(&e) => {
+                        debug!(catalog = %entry.name, namespace = %ns, "system.jdbc.tables: skipping namespace the principal is not authorized to list");
+                    }
                     Err(e) => {
                         warn!(catalog = %entry.name, namespace = %ns, error = %e, "Failed to list tables for system.jdbc.tables");
                     }
@@ -271,6 +280,10 @@ impl JdbcSchemaProvider {
                 let ns_ident = NamespaceIdent::new(ns.clone());
                 let tables = match entry.catalog.list_tables(&ns_ident).await {
                     Ok(t) => t,
+                    Err(e) if listing_error_is_forbidden(&e) => {
+                        debug!(catalog = %entry.name, namespace = %ns, "system.jdbc.columns: skipping namespace the principal is not authorized to list");
+                        continue;
+                    }
                     Err(e) => {
                         warn!(catalog = %entry.name, namespace = %ns, error = %e, "Failed to list tables for system.jdbc.columns");
                         continue;
