@@ -35,3 +35,9 @@ docs/neuw84-submission/
 
 # Subagent-driven-development scratch (ledger, briefs, reports)
 .superpowers/
+
+# tempto run artifacts
+testing/tempto/reports/
+testing/tempto/.gradle/
+testing/tempto/build/
+testing/tempto/*.hprof
