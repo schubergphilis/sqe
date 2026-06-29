@@ -20,11 +20,22 @@ allow-list tests surfaced the next layer of gaps (parser/semantic, not wire):
 1. `INSERT INTO t VALUES 1` (bare single value, no parentheses) -> SQE parser
    `Expected: (, found: 1`. Trino accepts row values without parens; SQE
    (sqlparser-rs) requires `VALUES (1)`. Blocks the insert setup in all three.
+   **FIXED (issue #315):** the Trino HTTP pre-parse chain now wraps bare
+   `VALUES` rows (parse-gated tokenizer rewrite) so `VALUES 1` -> `VALUES (1)`.
 2. `CALL system.rollback_to_snapshot(NULL, 'customer_orders', <id>)` ->
    `CALL system.* requires named arguments like table => 'ns.t'`. Trino allows
    positional procedure arguments; SQE requires named.
+   **FIXED (issue #316):** SQE now accepts positional CALL args, mapping
+   `rollback_to_snapshot('schema', 'table', <id>)` by Trino's verified
+   parameter order and rejecting NULLs with Trino's `<field> cannot be null`
+   phrasing.
 
-These are the next compatibility findings, candidates for their own issues.
+Both blockers above are fixed in code (unit + wire-serialization verified).
+End-to-end re-run (these 3 tests green against SQE) is pending a live stack; the
+test bodies also exercise `FETCH FIRST 1 ROW WITH TIES` (parses in sqlparser
+0.62; DataFusion planner support unverified) and a `$snapshots` metadata read
+(already handled), either of which could surface as the next layer once the
+wire/parser blockers are cleared.
 
 Verified both directions on 2026-06-29 with the curated allow-list (3 tests:
 `testIcebergConcurrentInsert`, `testRollbackToSnapshot`,
