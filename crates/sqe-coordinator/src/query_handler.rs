@@ -3459,6 +3459,31 @@ impl QueryHandler {
                     }
                 }
             }
+            VersionRef::Timestamp(raw) => {
+                // `FOR TIMESTAMP AS OF` / `FOR SYSTEM_TIME AS OF`: parse the
+                // captured argument (a `TIMESTAMP '...'` literal, a quoted
+                // string, or epoch millis) with the same resolver the AST path
+                // uses, then pick the latest snapshot at or before that time.
+                use sqlparser::dialect::GenericDialect;
+                use sqlparser::parser::Parser;
+                let expr = Parser::new(&GenericDialect {})
+                    .try_with_sql(raw)
+                    .and_then(|mut p| p.parse_expr())
+                    .map_err(|e| {
+                        SqeError::Execution(format!(
+                            "FOR TIMESTAMP AS OF: cannot parse timestamp '{raw}': {e}"
+                        ))
+                    })?;
+                let target_ms = resolve_timestamp_expr(&expr)?;
+                let snapshot_id = find_snapshot_at_timestamp(metadata, target_ms)?;
+                tracing::info!(
+                    table = %spec.table,
+                    target_ms,
+                    snapshot_id,
+                    "Time travel (FOR TIMESTAMP AS OF): pinned snapshot"
+                );
+                snapshot_id
+            }
         };
 
         tracing::info!(
