@@ -61,13 +61,17 @@ both expose catalog `iceberg`, which the upstream tests hardcode.
 
 ## Current status
 
-The harness works end to end. As of 2026-06-29 every upstream Iceberg test is
-blocked against SQE by a response-shape bug (SQE emits `data: []` for
-column-less DDL/update statements; the Trino 465 JDBC client rejects it). See
-`testing/tempto/exclusions.md` "Headline finding" for the root cause, a
-no-tempto reproduction, and the suggested SQE-side fix. Run
-`scripts/tempto-test.sh --baseline` against the real Trino to confirm the
-harness itself is sound.
+The harness is verified end to end. On 2026-06-29 the 3-test curated allow-list
+ran **3 SUCCEEDED / 0 FAILED against the real Trino baseline** (Trino 481) and
+**0 / 3 against SQE**, every SQE failure the same response-shape bug: SQE emits
+`data: []` for column-less DDL/update statements, which the Trino 465 JDBC
+client rejects. The harness produces real passes; SQE fails solely on that bug.
+See `testing/tempto/exclusions.md` "Headline finding" for the root cause, a
+no-tempto reproduction, and the suggested SQE-side fix.
+
+Note: the baseline used the locally-available `trinodb/trino:481` image via a
+one-off image override; `docker-compose.compare.yml` pins `465`, which
+`scripts/tempto-test.sh --baseline` will pull on first use.
 
 ## Adding a test to the allow-list
 

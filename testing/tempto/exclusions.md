@@ -6,9 +6,17 @@ allow-list is excluded for one of the reasons below.
 
 ## Headline finding (2026-06-29): SQE rejects all DDL/update over the Trino 465 JDBC client
 
-The harness works end to end (TLS, Basic auth, catalog `iceberg`, tempto suite
-init, queries reaching SQE), but every statement a Trino 465 JDBC client sends
-fails with:
+Verified both directions on 2026-06-29 with the curated allow-list (3 tests:
+`testIcebergConcurrentInsert`, `testRollbackToSnapshot`,
+`testRollbackToSnapshotWithNullArgument`):
+
+- Against the real Trino baseline (`--baseline`, Trino 481): **3 SUCCEEDED / 0
+  FAILED** -- the harness runs full test bodies to green (concurrent insert ran
+  28.6s, rollback_to_snapshot 5.4s).
+- Against SQE: **0 SUCCEEDED / 3 FAILED**, every failure the same error below.
+
+So the harness is sound; SQE fails solely on this bug. Every statement a Trino
+465 JDBC client sends fails with:
 
 ```
 java.sql.SQLException: Error executing query: Columns must be set when decoding data
@@ -61,12 +69,20 @@ sound: `scripts/tempto-test.sh --baseline`.
   existence under the warehouse directory; needs `databases.hive.*` + an HDFS
   client, which this REST/S3 stack does not provide.
 
-## Allow-list caveats (still attempted; see allowlist.txt)
-- `TestIcebergPartitionEvolution.testDroppedPartitionField` -- one onSpark()
-  setup call; will need triage once the DDL blocker is fixed.
-- `TestIcebergInsert.testIcebergConcurrentInsert` -- tagged `hms_only`; may be
-  excluded after the blocker is fixed if it depends on HMS semantics.
+## Excluded: fails against real Trino too (needs Hive migrate setup)
+- `TestIcebergProcedureCalls.testMigrateUnsupportedTransactionalTable` -- failed
+  on the Trino 481 baseline (no Hive table to migrate in this stack), so it is
+  not a clean SQE signal. The other `testMigrate*` methods use onSpark()/onHive().
+
+## Allow-list (verified green on the real Trino baseline; see allowlist.txt)
+- `TestIcebergInsert.testIcebergConcurrentInsert` -- pure onTrino despite the
+  `hms_only` group label; CREATE TABLE + concurrent INSERT + SELECT.
+- `TestIcebergProcedureCalls.testRollbackToSnapshot` -- exercises the
+  `rollback_to_snapshot` procedure (SQE must support it for this to pass once
+  the DDL blocker is fixed).
+- `TestIcebergProcedureCalls.testRollbackToSnapshotWithNullArgument`.
 
 ## Partially included (future)
-- `TestIcebergProcedureCalls` -- only procedures SQE supports; rest excluded.
+- `TestIcebergPartitionEvolution.testDroppedPartitionField` -- one onSpark()
+  setup call; would need a `spark` tempto database to run.
 - `TestIcebergOptimize` -- include only if SQE supports `ALTER TABLE ... EXECUTE optimize`.
