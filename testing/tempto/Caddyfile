@@ -1,0 +1,9 @@
+{
+    auto_https disable_redirects
+    local_certs
+}
+
+https://tls-proxy:8443 {
+    tls internal
+    reverse_proxy http://sqe:8080
+}
