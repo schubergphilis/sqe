@@ -1,27 +1,38 @@
-//! Pre-parser for `FOR VERSION AS OF` and `FOR INCREMENTAL BETWEEN` clauses.
+//! Pre-parser for the Trino/Iceberg time-travel and CDC clauses:
+//! `FOR VERSION AS OF`, `FOR TIMESTAMP AS OF`, `FOR SYSTEM_TIME AS OF`, and
+//! `FOR INCREMENTAL BETWEEN SNAPSHOT <x> AND SNAPSHOT <y>`.
 //!
-//! sqlparser-rs 0.53 only models `FOR SYSTEM_TIME AS OF <expr>`. Trino/Iceberg
-//! also accept `FOR VERSION AS OF <snapshot_id_or_ref>` and the Iceberg CDC
-//! extension `FOR INCREMENTAL BETWEEN SNAPSHOT <x> AND SNAPSHOT <y>`.
+//! sqlparser-rs does not parse ANY of these `FOR <kind> AS OF` table-version
+//! clauses in the dialect SQE uses -- it expects `FOR UPDATE` / `FOR SHARE` and
+//! errors with "Expected: one of UPDATE or SHARE". (The classifier parses
+//! before the coordinator's AST-level handling runs, so even
+//! `FOR SYSTEM_TIME AS OF` -- which sqlparser nominally models -- never reaches
+//! that path.) So we pre-scan the SQL text, extract the table name and clause
+//! argument, and strip the clause so sqlparser can parse the remaining query.
+//! The coordinator resolves the argument against table metadata:
 //!
-//! We pre-scan the SQL text, extract table name and clause arguments, then
-//! strip the clause so sqlparser can parse the query. The coordinator
-//! resolves snapshot ids against table metadata:
-//!
-//! 1. If the value is an integer literal, treat it as a snapshot id.
-//! 2. If the value is a string literal, look it up in the table's named refs.
-//! 3. If both a branch and tag exist with the same name, prefer the tag
-//!    (it's immutable) and log a warning.
+//! 1. `FOR VERSION AS OF <int>`        -> snapshot id directly.
+//! 2. `FOR VERSION AS OF '<name>'`     -> a branch/tag name (tag wins on clash).
+//! 3. `FOR TIMESTAMP AS OF <expr>` /
+//!    `FOR SYSTEM_TIME AS OF <expr>`   -> a timestamp; the coordinator picks the
+//!    latest snapshot at or before it.
 
 use sqe_core::{Result, SqeError};
 
-/// A version reference extracted from `FOR VERSION AS OF <x>`.
+/// A version reference extracted from a `FOR {VERSION|TIMESTAMP|SYSTEM_TIME}
+/// AS OF <x>` clause.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VersionRef {
     /// Numeric snapshot id, e.g. `FOR VERSION AS OF 12345`.
     SnapshotId(i64),
     /// String ref name, e.g. `FOR VERSION AS OF 'feature_x'`.
     Named(String),
+    /// A timestamp argument, e.g. `FOR TIMESTAMP AS OF TIMESTAMP '2026-01-01
+    /// 00:00:00'` or `FOR SYSTEM_TIME AS OF 1700000000000`. The raw argument
+    /// text (the `TIMESTAMP '...'` literal, a quoted string, or an epoch-millis
+    /// integer) is carried verbatim; the coordinator parses it to epoch millis
+    /// and selects the latest snapshot at or before that time.
+    Timestamp(String),
 }
 
 /// The parsed time-travel specification for one table reference.
@@ -51,60 +62,79 @@ pub struct IncrementalSpec {
     pub end: i64,
 }
 
-/// Extract all `FOR VERSION AS OF` clauses from the SQL text.
+/// Time-travel clause headers, each tagged with whether its argument is a
+/// timestamp (`true`) or a version ref (`false`). Surrounded by spaces so they
+/// only match between tokens. `FOR SYSTEM_TIME` is listed before
+/// `FOR TIMESTAMP` only for readability; matching picks the earliest position,
+/// not list order.
+const TIME_TRAVEL_NEEDLES: &[(&str, bool)] = &[
+    (" FOR VERSION AS OF ", false),
+    (" FOR TIMESTAMP AS OF ", true),
+    (" FOR SYSTEM_TIME AS OF ", true),
+];
+
+/// Extract all `FOR {VERSION|TIMESTAMP|SYSTEM_TIME} AS OF` clauses from the SQL
+/// text.
 ///
 /// Returns the rewritten SQL with those clauses removed, plus a list of
-/// `(table, version)` pairs the caller must resolve against table metadata.
-///
-/// `FOR SYSTEM_TIME AS OF` clauses are left alone; the existing DataFusion
-/// path handles them.
+/// `(table, version)` pairs the caller resolves against table metadata. All
+/// three forms are stripped here because sqlparser rejects every `FOR ... AS
+/// OF` table-version spelling in SQE's dialect (it expects `FOR UPDATE` /
+/// `FOR SHARE`), so the clause must be gone before the query is parsed.
 pub fn extract_time_travel_spec(sql: &str) -> Result<(String, Vec<TimeTravelSpec>)> {
     let upper = sql.to_uppercase();
-    let needle = " FOR VERSION AS OF ";
-    if !upper.contains(needle.trim()) {
+    let upper_bytes = upper.as_bytes();
+
+    // Fast path: no time-travel clause present.
+    if !TIME_TRAVEL_NEEDLES
+        .iter()
+        .any(|(n, _)| find_needle(upper_bytes, n.as_bytes()).is_some())
+    {
         return Ok((sql.to_string(), vec![]));
     }
 
     let mut out = String::with_capacity(sql.len());
     let mut specs = Vec::new();
-    let bytes = sql.as_bytes();
-    let upper_bytes = upper.as_bytes();
     let mut cursor = 0;
 
-    while cursor < bytes.len() {
-        // Find next occurrence of " FOR VERSION AS OF " (case-insensitive).
+    while cursor < sql.len() {
         let window_start = cursor;
         let remaining = &upper_bytes[cursor..];
-        let needle_upper = needle.as_bytes();
-        let hit = find_needle(remaining, needle_upper);
-        match hit {
+        // Find the EARLIEST occurrence of any needle (not list order), so
+        // mixed clauses across joined tables are handled left to right.
+        let mut best: Option<(usize, &'static str, bool)> = None;
+        for (needle, is_ts) in TIME_TRAVEL_NEEDLES {
+            if let Some(off) = find_needle(remaining, needle.as_bytes()) {
+                if best.is_none_or(|(b, _, _)| off < b) {
+                    best = Some((off, needle, *is_ts));
+                }
+            }
+        }
+        match best {
             None => {
                 // No more time-travel clauses; copy the tail.
                 out.push_str(&sql[window_start..]);
                 break;
             }
-            Some(offset) => {
+            Some((offset, needle, is_timestamp)) => {
                 let clause_start = cursor + offset;
-                // We need to find the start of the preceding table token.
-                // Walk backward over whitespace and one identifier (possibly dotted
-                // and/or quoted).
+                // Walk backward over whitespace and one (possibly dotted /
+                // quoted) identifier to find the preceding table token.
                 let table_end = sql[..clause_start].trim_end().len();
                 let table_start = find_table_start(&sql[..table_end]);
                 let table = sql[table_start..table_end].trim().to_string();
 
-                // Copy everything from window_start up to the table start and
-                // from table_start..clause_start (the table name itself).
                 out.push_str(&sql[window_start..clause_start]);
 
-                // Move cursor past the clause header.
                 let after_kw = clause_start + needle.len();
-                let (version, consumed) = parse_version_token(&sql[after_kw..])?;
+                let (version, consumed) = if is_timestamp {
+                    parse_timestamp_token(&sql[after_kw..])?
+                } else {
+                    parse_version_token(&sql[after_kw..])?
+                };
                 cursor = after_kw + consumed;
 
-                specs.push(TimeTravelSpec {
-                    table,
-                    version,
-                });
+                specs.push(TimeTravelSpec { table, version });
             }
         }
     }
@@ -206,6 +236,75 @@ fn parse_version_token(input: &str) -> Result<(VersionRef, usize)> {
             "FOR VERSION AS OF: expected integer or quoted ref name, got '{}'",
             trimmed.split_whitespace().next().unwrap_or("")
         )))
+    }
+}
+
+/// Parse the timestamp argument after `FOR TIMESTAMP AS OF ` /
+/// `FOR SYSTEM_TIME AS OF `. Accepts:
+/// - A `TIMESTAMP '<text>'` typed literal.
+/// - A bare single/double-quoted string: `'2026-01-01 00:00:00'`.
+/// - An unquoted integer (epoch milliseconds): `1700000000000`.
+///
+/// Returns [`VersionRef::Timestamp`] carrying the raw argument text (including
+/// any `TIMESTAMP` keyword) and the number of bytes consumed from `input`. The
+/// coordinator parses the raw text to epoch millis, so this stays purely
+/// lexical.
+fn parse_timestamp_token(input: &str) -> Result<(VersionRef, usize)> {
+    let trimmed = input.trim_start();
+    let leading_ws = input.len() - trimmed.len();
+
+    if trimmed.is_empty() {
+        return Err(SqeError::Execution(
+            "FOR TIMESTAMP AS OF requires a timestamp literal or epoch milliseconds".to_string(),
+        ));
+    }
+
+    // Optional `TIMESTAMP` keyword prefix (Trino: `TIMESTAMP '...'`).
+    let upper = trimmed.to_uppercase();
+    let body_off = if upper.starts_with("TIMESTAMP")
+        && trimmed[9..].starts_with([' ', '\''])
+    {
+        let mut k = 9;
+        while trimmed[k..].starts_with(' ') {
+            k += 1;
+        }
+        k
+    } else {
+        0
+    };
+    let body = &trimmed[body_off..];
+    let first = body.as_bytes().first().copied();
+
+    match first {
+        Some(b'\'') | Some(b'"') => {
+            let quote = first.unwrap();
+            let bytes = body.as_bytes();
+            let mut end = 1;
+            while end < bytes.len() && bytes[end] != quote {
+                end += 1;
+            }
+            if end >= bytes.len() {
+                return Err(SqeError::Execution(
+                    "FOR TIMESTAMP AS OF: unterminated timestamp string literal".to_string(),
+                ));
+            }
+            let lit_end = body_off + end + 1; // include closing quote
+            let raw = trimmed[..lit_end].trim().to_string();
+            Ok((VersionRef::Timestamp(raw), leading_ws + lit_end))
+        }
+        // Bare epoch-millis integer (no `TIMESTAMP` keyword).
+        Some(c) if body_off == 0 && (c.is_ascii_digit() || c == b'-') => {
+            let end = body
+                .find(|ch: char| !ch.is_ascii_digit() && ch != '-')
+                .unwrap_or(body.len());
+            let raw = trimmed[..end].to_string();
+            Ok((VersionRef::Timestamp(raw), leading_ws + end))
+        }
+        _ => Err(SqeError::Execution(format!(
+            "FOR TIMESTAMP AS OF: expected a TIMESTAMP literal, quoted string, \
+             or epoch-millis integer, got '{}'",
+            trimmed.split_whitespace().next().unwrap_or("")
+        ))),
     }
 }
 
@@ -467,5 +566,71 @@ mod tests {
         let (_sql, specs) = extract_incremental_spec(input).unwrap();
         assert_eq!(specs[0].start, 5);
         assert_eq!(specs[0].end, 5);
+    }
+
+    // --- FOR TIMESTAMP / SYSTEM_TIME AS OF (#5) ---
+
+    #[test]
+    fn extracts_for_timestamp_as_of_typed_literal() {
+        let (sql, specs) = extract_time_travel_spec(
+            "SELECT * FROM ns.t FOR TIMESTAMP AS OF TIMESTAMP '2026-01-01 00:00:00'",
+        )
+        .unwrap();
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].table, "ns.t");
+        assert_eq!(
+            specs[0].version,
+            VersionRef::Timestamp("TIMESTAMP '2026-01-01 00:00:00'".to_string())
+        );
+        // Clause stripped so sqlparser can parse the remainder.
+        assert_eq!(sql, "SELECT * FROM ns.t");
+    }
+
+    #[test]
+    fn extracts_for_system_time_as_of_quoted_string() {
+        let (sql, specs) = extract_time_travel_spec(
+            "SELECT a FROM t FOR SYSTEM_TIME AS OF '2026-01-01' WHERE a > 1",
+        )
+        .unwrap();
+        assert_eq!(specs[0].table, "t");
+        assert_eq!(specs[0].version, VersionRef::Timestamp("'2026-01-01'".to_string()));
+        assert_eq!(sql, "SELECT a FROM t WHERE a > 1");
+    }
+
+    #[test]
+    fn extracts_for_timestamp_as_of_epoch_millis() {
+        let (_sql, specs) =
+            extract_time_travel_spec("SELECT * FROM t FOR TIMESTAMP AS OF 1700000000000").unwrap();
+        assert_eq!(specs[0].version, VersionRef::Timestamp("1700000000000".to_string()));
+    }
+
+    #[test]
+    fn for_version_as_of_still_extracts_snapshot_id() {
+        // Regression: the version path is unchanged.
+        let (sql, specs) =
+            extract_time_travel_spec("SELECT * FROM t FOR VERSION AS OF 12345").unwrap();
+        assert_eq!(specs[0].version, VersionRef::SnapshotId(12345));
+        assert_eq!(sql, "SELECT * FROM t");
+    }
+
+    #[test]
+    fn for_timestamp_as_of_query_classifies_after_strip() {
+        // The whole point of #5: the Trino spelling no longer trips the
+        // classifier (which rejects every `FOR ... AS OF` form), because the
+        // clause is stripped before sqlparser sees it.
+        let sql = crate::UserSql::from(
+            "SELECT * FROM t FOR TIMESTAMP AS OF TIMESTAMP '2026-01-01 00:00:00'",
+        );
+        let classifiable = crate::pre_parse_pipeline(&sql).expect("pre-parse ok");
+        assert!(
+            crate::parse_and_classify_typed(&classifiable).is_ok(),
+            "FOR TIMESTAMP AS OF should classify after the strip"
+        );
+    }
+
+    #[test]
+    fn timestamp_token_rejects_garbage() {
+        let err = extract_time_travel_spec("SELECT * FROM t FOR TIMESTAMP AS OF xyz").unwrap_err();
+        assert!(err.to_string().contains("FOR TIMESTAMP AS OF"));
     }
 }
