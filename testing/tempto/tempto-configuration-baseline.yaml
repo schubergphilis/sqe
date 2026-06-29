@@ -1,0 +1,14 @@
+databases:
+  trino:
+    host: trino
+    port: 8080
+    server_address: http://trino:8080
+    jdbc_driver_class: io.trino.jdbc.TrinoDriver
+    jdbc_url: jdbc:trino://trino:8080/iceberg/default
+    jdbc_user: admin
+    jdbc_password: ""
+    jdbc_pooling: false
+
+tests:
+  assert:
+    float_tolerance: 0.000001
