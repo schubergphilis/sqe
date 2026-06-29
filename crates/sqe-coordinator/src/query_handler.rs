@@ -3459,6 +3459,31 @@ impl QueryHandler {
                     }
                 }
             }
+            VersionRef::Timestamp(raw) => {
+                // `FOR TIMESTAMP AS OF` / `FOR SYSTEM_TIME AS OF`: parse the
+                // captured argument (a `TIMESTAMP '...'` literal, a quoted
+                // string, or epoch millis) with the same resolver the AST path
+                // uses, then pick the latest snapshot at or before that time.
+                use sqlparser::dialect::GenericDialect;
+                use sqlparser::parser::Parser;
+                let expr = Parser::new(&GenericDialect {})
+                    .try_with_sql(raw)
+                    .and_then(|mut p| p.parse_expr())
+                    .map_err(|e| {
+                        SqeError::Execution(format!(
+                            "FOR TIMESTAMP AS OF: cannot parse timestamp '{raw}': {e}"
+                        ))
+                    })?;
+                let target_ms = resolve_timestamp_expr(&expr)?;
+                let snapshot_id = find_snapshot_at_timestamp(metadata, target_ms)?;
+                tracing::info!(
+                    table = %spec.table,
+                    target_ms,
+                    snapshot_id,
+                    "Time travel (FOR TIMESTAMP AS OF): pinned snapshot"
+                );
+                snapshot_id
+            }
         };
 
         tracing::info!(
@@ -5576,6 +5601,32 @@ mod tests {
         let rc = b.column(4).as_any().downcast_ref::<arrow_array::Float64Array>().unwrap();
         assert!(rc.is_null(0) && rc.is_null(1), "per-column row_count is NULL");
         assert_eq!(rc.value(2), 42.0, "summary row carries row_count");
+    }
+
+    #[test]
+    fn for_timestamp_raw_resolves_to_millis() {
+        // Exercises the exact glue apply_version_spec's VersionRef::Timestamp
+        // arm runs: parse the raw text captured by parse_timestamp_token into
+        // an Expr, then resolve to epoch millis. The raw forms here match what
+        // sqe_sql::parse_timestamp_token emits (verified in its own tests). (#5)
+        use sqlparser::dialect::GenericDialect;
+        use sqlparser::parser::Parser;
+        let resolve = |raw: &str| -> i64 {
+            let expr = Parser::new(&GenericDialect {})
+                .try_with_sql(raw)
+                .and_then(|mut p| p.parse_expr())
+                .unwrap_or_else(|e| panic!("parse_expr('{raw}') failed: {e}"));
+            resolve_timestamp_expr(&expr)
+                .unwrap_or_else(|e| panic!("resolve('{raw}') failed: {e}"))
+        };
+        // `TIMESTAMP '...'` literal and a bare quoted date both resolve to
+        // 2026-01-01 midnight UTC; they must agree.
+        let ts_literal = resolve("TIMESTAMP '2026-01-01 00:00:00'");
+        let bare_date = resolve("'2026-01-01'");
+        assert_eq!(ts_literal, bare_date, "TIMESTAMP literal == bare date midnight");
+        assert!(ts_literal > 0);
+        // Epoch millis pass through unchanged.
+        assert_eq!(resolve("1700000000000"), 1_700_000_000_000);
     }
 
     #[test]
