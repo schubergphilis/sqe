@@ -9,6 +9,7 @@ repository.workspace = true
 [dependencies]
 sqe-core = { path = "../sqe-core" }
 sqe-auth = { path = "../sqe-auth" }
+sqe-sql = { path = "../sqe-sql" }
 hex = { workspace = true }
 sha2 = { workspace = true }
 arrow = { workspace = true }
