@@ -6,6 +6,12 @@ allow-list is excluded for one of the reasons below.
 
 ## Headline finding (2026-06-29): SQE rejects all DDL/update over the Trino 465 JDBC client
 
+**FIXED (issue #314):** `build_page_response` now emits `data: None` when the
+result has no columns (`paginated.columns.is_empty()`), so column-less DDL/update
+responses omit `data` the way real Trino does. The Trino 465 client's
+`data == null -> NULL_ROWS` early return is now hit and the `!columns.isEmpty()`
+assertion is never reached. The original finding is kept below for the record.
+
 Verified both directions on 2026-06-29 with the curated allow-list (3 tests:
 `testIcebergConcurrentInsert`, `testRollbackToSnapshot`,
 `testRollbackToSnapshotWithNullArgument`):
