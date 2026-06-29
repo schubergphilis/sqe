@@ -833,6 +833,11 @@ async fn submit_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
             return (StatusCode::OK, Json(response)).into_response();
         }
     };
+    // #9: wrap parenthesis-less `VALUES` rows (`INSERT INTO t VALUES 1`,
+    // `VALUES 1, 2`) that Trino accepts but sqlparser rejects. Runs before
+    // classification and planning so both see the normalized form; a no-op for
+    // SQL that already parses (including a column named `values`). See #315.
+    let effective_sql = sqe_sql::rewrite_paren_less_values(&effective_sql);
     // #2: qualify an unqualified `information_schema` reference with the session
     // catalog so it resolves to (and, under polaris-auto, discovers) that
     // catalog instead of the engine default. Only metadata queries are touched.
