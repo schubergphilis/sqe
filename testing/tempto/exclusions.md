@@ -12,6 +12,20 @@ responses omit `data` the way real Trino does. The Trino 465 client's
 `data == null -> NULL_ROWS` early return is now hit and the `!columns.isEmpty()`
 assertion is never reached. The original finding is kept below for the record.
 
+**Re-run after the fix (SQE rebuilt from main + MR !463, 2026-06-29):** the
+`Columns must be set when decoding data` error is GONE (0 occurrences) -- DDL /
+`USE` / `CREATE` now decode. With the wire protocol unblocked, the same three
+allow-list tests surfaced the next layer of gaps (parser/semantic, not wire):
+
+1. `INSERT INTO t VALUES 1` (bare single value, no parentheses) -> SQE parser
+   `Expected: (, found: 1`. Trino accepts row values without parens; SQE
+   (sqlparser-rs) requires `VALUES (1)`. Blocks the insert setup in all three.
+2. `CALL system.rollback_to_snapshot(NULL, 'customer_orders', <id>)` ->
+   `CALL system.* requires named arguments like table => 'ns.t'`. Trino allows
+   positional procedure arguments; SQE requires named.
+
+These are the next compatibility findings, candidates for their own issues.
+
 Verified both directions on 2026-06-29 with the curated allow-list (3 tests:
 `testIcebergConcurrentInsert`, `testRollbackToSnapshot`,
 `testRollbackToSnapshotWithNullArgument`):
