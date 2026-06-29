@@ -8,9 +8,9 @@ use datafusion::catalog::SchemaProvider;
 use datafusion::datasource::{MemTable, TableProvider};
 use datafusion::error::Result as DFResult;
 use iceberg::NamespaceIdent;
-use tracing::warn;
+use tracing::{debug, warn};
 
-use crate::rest_catalog::SessionCatalog;
+use crate::rest_catalog::{listing_error_is_forbidden, SessionCatalog};
 use crate::system_catalog::SystemCatalogEntry;
 
 /// DataFusion `SchemaProvider` for the virtual `system.metadata` schema.
@@ -84,6 +84,10 @@ impl MetadataSchemaProvider {
     async fn list_namespaces_safe(catalog: &SessionCatalog) -> Vec<NamespaceIdent> {
         match catalog.list_namespaces().await {
             Ok(namespaces) => namespaces,
+            Err(e) if listing_error_is_forbidden(&e) => {
+                debug!(error = %e, "system.metadata: skipping catalog the principal is not authorized to list");
+                Vec::new()
+            }
             Err(e) => {
                 warn!(error = %e, "system.metadata: skipping catalog whose namespaces could not be listed");
                 Vec::new()
@@ -121,6 +125,10 @@ impl MetadataSchemaProvider {
                 let ns_str = Self::namespace_to_string(ns);
                 let tables = match entry.catalog.list_tables(ns).await {
                     Ok(t) => t,
+                    Err(e) if listing_error_is_forbidden(&e) => {
+                        debug!(catalog = %entry.name, namespace = %ns_str, "system.metadata.table_properties: skipping namespace the principal is not authorized to list");
+                        continue;
+                    }
                     Err(e) => {
                         warn!(catalog = %entry.name, namespace = %ns_str, error = %e, "Failed to list tables for system.metadata.table_properties");
                         continue;
@@ -193,6 +201,9 @@ impl MetadataSchemaProvider {
                             prop_value_b.append_value(value);
                         }
                     }
+                    Err(e) if listing_error_is_forbidden(&e) => {
+                        debug!(catalog = %entry.name, namespace = %ns_str, "system.metadata.schema_properties: skipping namespace the principal is not authorized to access");
+                    }
                     Err(e) => {
                         warn!(catalog = %entry.name, namespace = %ns_str, error = %e, "Failed to get namespace for system.metadata.schema_properties");
                     }
@@ -235,6 +246,10 @@ impl MetadataSchemaProvider {
                 let ns_str = Self::namespace_to_string(ns);
                 let tables = match entry.catalog.list_tables(ns).await {
                     Ok(t) => t,
+                    Err(e) if listing_error_is_forbidden(&e) => {
+                        debug!(catalog = %entry.name, namespace = %ns_str, "system.metadata.table_comments: skipping namespace the principal is not authorized to list");
+                        continue;
+                    }
                     Err(e) => {
                         warn!(catalog = %entry.name, namespace = %ns_str, error = %e, "Failed to list tables for system.metadata.table_comments");
                         continue;

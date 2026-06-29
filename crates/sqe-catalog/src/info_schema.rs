@@ -9,12 +9,12 @@ use datafusion::catalog::SchemaProvider;
 use datafusion::datasource::{MemTable, TableProvider};
 use datafusion::error::Result as DFResult;
 use iceberg::NamespaceIdent;
-use tracing::{error, warn};
+use tracing::{debug, error, warn};
 
 use sqe_core::SessionUser;
 use sqe_policy::PolicyStore;
 
-use crate::rest_catalog::SessionCatalog;
+use crate::rest_catalog::{listing_error_is_forbidden, SessionCatalog};
 
 /// DataFusion `SchemaProvider` for the virtual `information_schema`.
 ///
@@ -122,6 +122,9 @@ impl InformationSchemaProvider {
                         type_builder.append_value("BASE TABLE");
                     }
                 }
+                Err(e) if listing_error_is_forbidden(&e) => {
+                    debug!(namespace = %ns, "information_schema.tables: skipping namespace the principal is not authorized to list");
+                }
                 Err(e) => {
                     warn!(namespace = %ns, error = %e, "Failed to list tables for information_schema");
                 }
@@ -178,6 +181,10 @@ impl InformationSchemaProvider {
             let ns_ident = NamespaceIdent::new(ns.clone());
             let tables = match self.session_catalog.list_tables(&ns_ident).await {
                 Ok(t) => t,
+                Err(e) if listing_error_is_forbidden(&e) => {
+                    debug!(namespace = ?ns, "information_schema.columns: skipping namespace the principal is not authorized to list");
+                    continue;
+                }
                 Err(e) => {
                     warn!(namespace = ?ns, error = %e, "Failed to list tables for columns");
                     continue;
@@ -318,6 +325,10 @@ impl InformationSchemaProvider {
                 .iter()
                 .map(|ns| ns.as_ref().iter().map(|s| s.as_str()).collect::<Vec<_>>().join("."))
                 .collect(),
+            Err(e) if listing_error_is_forbidden(&e) => {
+                debug!(error = %e, "information_schema: skipping catalog the principal is not authorized to list");
+                Vec::new()
+            }
             Err(e) => {
                 error!(error = %e, "Failed to list namespaces for information_schema");
                 Vec::new()
