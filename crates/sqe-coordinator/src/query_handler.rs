@@ -2,7 +2,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use arrow_array::RecordBatch;
-use arrow_array::{ArrayRef, BooleanArray, Int64Array, builder::StringBuilder};
+use arrow_array::{ArrayRef, BooleanArray, builder::StringBuilder};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::execution::SendableRecordBatchStream;
@@ -1173,10 +1173,9 @@ impl QueryHandler {
                     self.handle_comment_on(session, stmt, &session_catalog).await
                 }
 
-                // SHOW STATS FOR table — return snapshot summary stats
+                // SHOW STATS FOR table — Trino per-column stats result set
                 StatementKind::ShowStats(ref table_name) => {
-                    let (_, session_catalog) = self.create_session_context(session).await?;
-                    self.handle_show_stats(session, table_name, &session_catalog).await
+                    self.handle_show_stats(session, table_name).await
                 }
 
                 StatementKind::Merge(stmt) => {
@@ -4402,72 +4401,47 @@ impl QueryHandler {
         &self,
         session: &Session,
         table_name: &str,
-        session_catalog: &Arc<SessionCatalog>,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         use iceberg::{NamespaceIdent, TableIdent};
 
-        // Parse "schema.table" or "table"
+        // Parse "table" / "schema.table" / "catalog.schema.table". Resolve the
+        // catalog via show_catalog (explicit qualifier wins, else the session
+        // catalog, with polaris-auto discovery) so SHOW STATS finds tables in
+        // the caller's catalog instead of failing against the default
+        // warehouse ("Failed to load table ... does not exist"). (#6)
         let parts: Vec<&str> = table_name.splitn(3, '.').collect();
-        let (namespace, bare_table) = match parts.len() {
-            1 => ("default", parts[0]),
-            2 => (parts[0], parts[1]),
-            _ => (parts[1], parts[2]), // catalog.schema.table
+        let (catalog, namespace, bare_table) = match parts.len() {
+            1 => (None, "default", parts[0]),
+            2 => (None, parts[0], parts[1]),
+            _ => (Some(parts[0]), parts[1], parts[2]),
         };
+        let session_catalog = self.show_catalog(session, catalog).await?;
 
         let ns_ident = NamespaceIdent::new(namespace.to_string());
         let table_ident = TableIdent::new(ns_ident, bare_table.to_string());
-
         let table = session_catalog.load_table(&table_ident).await?;
         let metadata = table.metadata();
 
-        // Extract stats from the current snapshot summary (empty table has no snapshot)
-        let (row_count, file_count, total_size) = if let Some(snapshot) = metadata.current_snapshot() {
-            let summary = snapshot.summary();
-            let props = &summary.additional_properties;
-            let rows = props
+        // Table-level row count from the current snapshot summary (None when the
+        // table has never been written). Per-column stats (size, distinct, null
+        // fraction, min/max) are not cheaply available from iceberg metadata, so
+        // they are reported NULL -- the result SHAPE matches Trino so clients
+        // and the CBO do not error.
+        let row_count: Option<f64> = metadata.current_snapshot().and_then(|s| {
+            s.summary()
+                .additional_properties
                 .get("total-records")
-                .and_then(|v| v.parse::<i64>().ok())
-                .unwrap_or(0);
-            let files = props
-                .get("total-data-files")
-                .and_then(|v| v.parse::<i64>().ok())
-                .unwrap_or(0);
-            let size = props
-                .get("total-files-size")
-                .and_then(|v| v.parse::<i64>().ok())
-                .unwrap_or(0);
-            (rows, files, size)
-        } else {
-            (0_i64, 0_i64, 0_i64)
-        };
+                .and_then(|v| v.parse::<f64>().ok())
+        });
 
-        tracing::info!(
-            username = %session.user.username,
-            table = %table_ident,
-            row_count,
-            file_count,
-            total_size,
-            "SHOW STATS FOR — returning snapshot summary"
-        );
-
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("column_name", DataType::Utf8, false),
-            Field::new("row_count", DataType::Int64, true),
-            Field::new("data_file_count", DataType::Int64, true),
-            Field::new("total_size", DataType::Int64, true),
-        ]));
-
-        let mut name_builder = StringBuilder::new();
-        name_builder.append_value("<all columns>");
-        let name_array: ArrayRef = Arc::new(name_builder.finish());
-        let row_array: ArrayRef = Arc::new(Int64Array::from(vec![row_count]));
-        let file_array: ArrayRef = Arc::new(Int64Array::from(vec![file_count]));
-        let size_array: ArrayRef = Arc::new(Int64Array::from(vec![total_size]));
-
-        let batch = RecordBatch::try_new(schema, vec![name_array, row_array, file_array, size_array])
-            .map_err(|e| SqeError::Execution(format!("Failed to build SHOW STATS result: {e}")))?;
-
-        Ok(vec![batch])
+        let column_names: Vec<String> = metadata
+            .current_schema()
+            .as_struct()
+            .fields()
+            .iter()
+            .map(|f| f.name.clone())
+            .collect();
+        build_show_stats_batch(&column_names, row_count)
     }
 
     // -----------------------------------------------------------------------
@@ -5305,6 +5279,71 @@ fn info_schema_columns_query(table_name: &str) -> String {
     )
 }
 
+/// Build Trino's `SHOW STATS FOR <table>` result set: one row per column
+/// (name set, per-column stats NULL -- iceberg does not cheaply expose
+/// data_size/distinct/null-fraction/min/max), plus a final summary row
+/// (column_name NULL, row_count from the snapshot, or NULL when never
+/// written). Columns: column_name, data_size, distinct_values_count,
+/// nulls_fraction, row_count, low_value, high_value. (#6)
+fn build_show_stats_batch(
+    column_names: &[String],
+    row_count: Option<f64>,
+) -> sqe_core::Result<Vec<RecordBatch>> {
+    use arrow_array::builder::Float64Builder;
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("column_name", DataType::Utf8, true),
+        Field::new("data_size", DataType::Float64, true),
+        Field::new("distinct_values_count", DataType::Float64, true),
+        Field::new("nulls_fraction", DataType::Float64, true),
+        Field::new("row_count", DataType::Float64, true),
+        Field::new("low_value", DataType::Utf8, true),
+        Field::new("high_value", DataType::Utf8, true),
+    ]));
+    let mut name_b = StringBuilder::new();
+    let mut data_size_b = Float64Builder::new();
+    let mut distinct_b = Float64Builder::new();
+    let mut nulls_b = Float64Builder::new();
+    let mut row_count_b = Float64Builder::new();
+    let mut low_b = StringBuilder::new();
+    let mut high_b = StringBuilder::new();
+
+    for name in column_names {
+        name_b.append_value(name);
+        data_size_b.append_null();
+        distinct_b.append_null();
+        nulls_b.append_null();
+        row_count_b.append_null();
+        low_b.append_null();
+        high_b.append_null();
+    }
+    // Summary row.
+    name_b.append_null();
+    data_size_b.append_null();
+    distinct_b.append_null();
+    nulls_b.append_null();
+    match row_count {
+        Some(rc) => row_count_b.append_value(rc),
+        None => row_count_b.append_null(),
+    }
+    low_b.append_null();
+    high_b.append_null();
+
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(name_b.finish()) as ArrayRef,
+            Arc::new(data_size_b.finish()) as ArrayRef,
+            Arc::new(distinct_b.finish()) as ArrayRef,
+            Arc::new(nulls_b.finish()) as ArrayRef,
+            Arc::new(row_count_b.finish()) as ArrayRef,
+            Arc::new(low_b.finish()) as ArrayRef,
+            Arc::new(high_b.finish()) as ArrayRef,
+        ],
+    )
+    .map_err(|e| SqeError::Execution(format!("Failed to build SHOW STATS result: {e}")))?;
+    Ok(vec![batch])
+}
+
 /// Build the `DESCRIBE OUTPUT` result set for a prepared statement's output
 /// schema: one row per column, matching Trino's column layout
 /// (Column Name, Catalog, Schema, Table, Type, Type Size, Aliased). Catalog /
@@ -5508,6 +5547,36 @@ mod tests {
     use super::*;
     use sqe_core::config::QueryConfig;
     use sqe_core::session::Session;
+
+    #[test]
+    fn show_stats_batch_has_trino_shape() {
+        use arrow_array::Array;
+        let cols = vec!["id".to_string(), "name".to_string()];
+        let batches = build_show_stats_batch(&cols, Some(42.0)).unwrap();
+        let b = &batches[0];
+        // Trino's 7-column layout.
+        assert_eq!(
+            b.schema().fields().iter().map(|f| f.name().as_str()).collect::<Vec<_>>(),
+            vec![
+                "column_name",
+                "data_size",
+                "distinct_values_count",
+                "nulls_fraction",
+                "row_count",
+                "low_value",
+                "high_value"
+            ]
+        );
+        // One row per column + a summary row.
+        assert_eq!(b.num_rows(), 3);
+        let names = b.column(0).as_any().downcast_ref::<arrow_array::StringArray>().unwrap();
+        assert_eq!(names.value(0), "id");
+        assert_eq!(names.value(1), "name");
+        assert!(names.is_null(2), "summary row has NULL column_name");
+        let rc = b.column(4).as_any().downcast_ref::<arrow_array::Float64Array>().unwrap();
+        assert!(rc.is_null(0) && rc.is_null(1), "per-column row_count is NULL");
+        assert_eq!(rc.value(2), 42.0, "summary row carries row_count");
+    }
 
     #[test]
     fn info_schema_columns_query_qualifies_by_catalog_and_schema() {
