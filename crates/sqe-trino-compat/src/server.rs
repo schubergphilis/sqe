@@ -16,6 +16,7 @@ use uuid::Uuid;
 use sqe_core::Session;
 use sqe_core::config::SecurityConfig;
 
+use crate::explain_compat;
 use crate::info_schema_compat;
 use crate::prepared;
 use crate::protocol::{
@@ -888,6 +889,16 @@ async fn submit_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
                 } else {
                     batches
                 }
+            } else {
+                batches
+            };
+            // #9: EXPLAIN is not a metadata query, so it needs its own branch.
+            // Collapse SQE's structured EXPLAIN / EXPLAIN ANALYZE / EXPLAIN FULL
+            // output into Trino's single `Query Plan` varchar column, which BI
+            // and JDBC tools string-match. Trino-path-scoped: native Flight SQL
+            // clients keep the rich structured table.
+            let batches = if explain_compat::is_explain(exec_sql) {
+                explain_compat::reshape_explain_to_trino(batches)
             } else {
                 batches
             };
