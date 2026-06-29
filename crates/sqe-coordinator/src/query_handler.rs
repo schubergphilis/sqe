@@ -5604,6 +5604,32 @@ mod tests {
     }
 
     #[test]
+    fn for_timestamp_raw_resolves_to_millis() {
+        // Exercises the exact glue apply_version_spec's VersionRef::Timestamp
+        // arm runs: parse the raw text captured by parse_timestamp_token into
+        // an Expr, then resolve to epoch millis. The raw forms here match what
+        // sqe_sql::parse_timestamp_token emits (verified in its own tests). (#5)
+        use sqlparser::dialect::GenericDialect;
+        use sqlparser::parser::Parser;
+        let resolve = |raw: &str| -> i64 {
+            let expr = Parser::new(&GenericDialect {})
+                .try_with_sql(raw)
+                .and_then(|mut p| p.parse_expr())
+                .unwrap_or_else(|e| panic!("parse_expr('{raw}') failed: {e}"));
+            resolve_timestamp_expr(&expr)
+                .unwrap_or_else(|e| panic!("resolve('{raw}') failed: {e}"))
+        };
+        // `TIMESTAMP '...'` literal and a bare quoted date both resolve to
+        // 2026-01-01 midnight UTC; they must agree.
+        let ts_literal = resolve("TIMESTAMP '2026-01-01 00:00:00'");
+        let bare_date = resolve("'2026-01-01'");
+        assert_eq!(ts_literal, bare_date, "TIMESTAMP literal == bare date midnight");
+        assert!(ts_literal > 0);
+        // Epoch millis pass through unchanged.
+        assert_eq!(resolve("1700000000000"), 1_700_000_000_000);
+    }
+
+    #[test]
     fn info_schema_columns_query_qualifies_by_catalog_and_schema() {
         // Bare name: default catalog's information_schema, no schema filter.
         let bare = info_schema_columns_query("fct_revenue_monthly");
