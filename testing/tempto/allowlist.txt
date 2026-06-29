@@ -1,0 +1,7 @@
+# Curated upstream Iceberg product-tests that run against SQE alone (no Spark/Hive).
+# Format: one tempto test matcher per line; '#' comments and blank lines ignored.
+# Matchers are substring-matched against test names by the tempto runner.
+# Verified pure-onTrino at trino tag 465. Expand as SQE gains features.
+io.trino.tests.product.iceberg.TestIcebergInsert
+io.trino.tests.product.iceberg.TestIcebergPartitionEvolution
+io.trino.tests.product.iceberg.TestCreateDropSchema

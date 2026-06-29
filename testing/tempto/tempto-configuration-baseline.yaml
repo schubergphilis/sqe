@@ -12,3 +12,11 @@ databases:
 tests:
   assert:
     float_tolerance: 0.000001
+
+# Unused, but the product-tests jar registers an LDAP SuiteModuleProvider
+# unconditionally; these keys must exist for the Guice injector to build.
+ldap:
+  admin:
+    dn: cn=admin,dc=trino,dc=testldap,dc=com
+    password: admin
+  url: ldap://ldapserver
