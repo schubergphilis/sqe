@@ -160,12 +160,19 @@ pub fn rewrite_trino_compat(sql: &str) -> String {
     // literal, which DataFusion rejects; rewritten to a plain string (SQE
     // stores JSON as Utf8).
     let has_json_literal = lower.contains("json '");
+    // `row(` -> the Trino ROW(...) constructor and the `CAST(ROW(...) AS
+    // ROW(...))` named-row cast. The bare constructor becomes `struct(...)`;
+    // the constructor-then-cast idiom becomes `named_struct(...)`. A false
+    // positive (e.g. a column literally named `arrow`) is harmless: it only
+    // forces the AST walk, which rewrites nothing it should not.
+    let has_row = lower.contains("row(");
     if !has_json_cast
         && !has_dollar
         && !has_grouping_set
         && !has_current_schema
         && !has_custom_cast
         && !has_json_literal
+        && !has_row
     {
         return sql.to_string();
     }
@@ -234,6 +241,17 @@ impl VisitorMut for TrinoCompatVisitor {
             self.rewrites += 1;
         }
         if rewrite_json_typed_string(expr) {
+            self.rewrites += 1;
+        }
+        // ROW constructor rewrite runs before the cast rewrite at this node,
+        // but post-order traversal means any *inner* ROW(...) has already
+        // become struct(...) by the time we reach an enclosing Cast. The cast
+        // rewrite accepts either name, so the order within this method does
+        // not matter.
+        if rewrite_row_constructor(expr) {
+            self.rewrites += 1;
+        }
+        if rewrite_cast_as_row(expr) {
             self.rewrites += 1;
         }
         ControlFlow::Continue(())
@@ -334,6 +352,129 @@ fn rewrite_json_typed_string(expr: &mut Expr) -> bool {
         }
     }
     false
+}
+
+/// Rewrite the Trino `ROW(...)` row constructor to DataFusion's `struct(...)`.
+///
+/// Trino spells an anonymous row value `ROW(1, 'a', true)`; DataFusion's
+/// equivalent built-in is `struct(...)`, which produces a struct with
+/// positional field names `c0`, `c1`, .... sqlparser parses `ROW(...)` as a
+/// plain function call named `ROW`, so the rewrite is a single rename. Only
+/// the single-part, unquoted, case-insensitive `ROW` name is matched, so a
+/// quoted `"row"` column-returning function is left untouched. Returns true if
+/// the rewrite fired.
+fn rewrite_row_constructor(expr: &mut Expr) -> bool {
+    let Expr::Function(func) = expr else {
+        return false;
+    };
+    if !function_name_is(func, "row") {
+        return false;
+    }
+    func.name = ObjectName::from(vec![Ident::new("struct")]);
+    true
+}
+
+/// Rewrite `CAST(ROW(v1, v2, ...) AS ROW(n1 t1, n2 t2, ...))` to
+/// `named_struct('n1', CAST(v1 AS t1), 'n2', CAST(v2 AS t2), ...)`.
+///
+/// This is Trino's exact named-row semantics: the cast labels each positional
+/// field and coerces its value. sqlparser parses the target `ROW(...)` type as
+/// a `Custom` type whose modifier list is the flattened `[name, type, name,
+/// type, ...]` sequence (parameterized field types like `decimal(10,2)` do not
+/// parse at all, so only single-token field types reach this rewrite).
+///
+/// Only the constructor-then-cast idiom is handled: the inner expression must
+/// itself be a `ROW(...)` / `struct(...)` constructor with one argument per
+/// declared field. `CAST(<struct column> AS ROW(...))` is intentionally left
+/// alone -- reconstructing it would require positional `get_field('c0')`
+/// access that breaks on a real column whose fields carry real names, so the
+/// fragile case is surfaced as a normal DataFusion error rather than a wrong
+/// answer. Returns true if the rewrite fired.
+fn rewrite_cast_as_row(expr: &mut Expr) -> bool {
+    let Expr::Cast {
+        expr: inner,
+        data_type,
+        ..
+    } = expr
+    else {
+        return false;
+    };
+
+    // Target type must be a single-part `ROW` custom type with a non-empty,
+    // even modifier list (name/type pairs).
+    let SqlDataType::Custom(type_name, modifiers) = data_type else {
+        return false;
+    };
+    let is_row_type = type_name.0.len() == 1
+        && type_name.0[0]
+            .as_ident()
+            .map(|i| i.value.eq_ignore_ascii_case("row"))
+            .unwrap_or(false);
+    if !is_row_type || modifiers.is_empty() || modifiers.len() % 2 != 0 {
+        return false;
+    }
+    let field_count = modifiers.len() / 2;
+
+    // Inner expression must be a ROW/struct constructor with one arg per field.
+    let Expr::Function(func) = inner.as_ref() else {
+        return false;
+    };
+    if !function_name_is(func, "row") && !function_name_is(func, "struct") {
+        return false;
+    }
+    let FunctionArguments::List(arg_list) = &func.args else {
+        return false;
+    };
+    if arg_list.args.len() != field_count {
+        return false;
+    }
+
+    // Pair each constructor argument with its declared field name and type,
+    // then build `named_struct('name', CAST(arg AS type), ...)` by templating
+    // and re-parsing. Hand-constructing the named_struct call would mean
+    // parsing each type token into a `SqlDataType` ourselves; round-tripping
+    // through the parser is shorter and reuses sqlparser's type grammar.
+    let mut parts: Vec<String> = Vec::with_capacity(field_count);
+    for (i, arg) in arg_list.args.iter().enumerate() {
+        let FunctionArg::Unnamed(FunctionArgExpr::Expr(arg_expr)) = arg else {
+            return false;
+        };
+        let field_name = modifiers[i * 2].replace('\'', "''");
+        let field_type = &modifiers[i * 2 + 1];
+        parts.push(format!("'{field_name}', CAST({arg_expr} AS {field_type})"));
+    }
+    let new_sql = format!("SELECT named_struct({})", parts.join(", "));
+
+    let Ok(mut stmts) = Parser::parse_sql(&GenericDialect {}, &new_sql) else {
+        return false;
+    };
+    let Some(Statement::Query(q)) = stmts.drain(..).next() else {
+        return false;
+    };
+    let SetExpr::Select(select) = *q.body else {
+        return false;
+    };
+    let mut projection = select.projection;
+    let Some(item) = projection.drain(..).next() else {
+        return false;
+    };
+    let new_expr = match item {
+        sqlparser::ast::SelectItem::UnnamedExpr(e) => e,
+        _ => return false,
+    };
+    *expr = new_expr;
+    true
+}
+
+/// True if `func` is a single-part, unquoted function name matching `want`
+/// case-insensitively (e.g. distinguishes the `ROW` keyword-constructor from a
+/// quoted `"row"` user function).
+fn function_name_is(func: &Function, want: &str) -> bool {
+    func.name.0.len() == 1
+        && func.name.0[0]
+            .as_ident()
+            .map(|i| i.quote_style.is_none() && i.value.eq_ignore_ascii_case(want))
+            .unwrap_or(false)
 }
 
 fn rewrite_cast_as_json(expr: &mut Expr) -> bool {
@@ -1097,6 +1238,71 @@ mod tests {
         let out = rewrite_trino_compat(r#"SELECT JSON '{"a": 1}' AS j"#);
         assert!(!out.to_uppercase().contains("JSON '"), "JSON literal kept: {out}");
         assert!(out.contains(r#"'{"a": 1}'"#), "string value lost: {out}");
+    }
+
+    #[test]
+    fn row_constructor_rewritten_to_struct() {
+        // Trino ROW(...) anonymous constructor -> DataFusion struct(...). (#7)
+        let out = rewrite_trino_compat("SELECT ROW(1, 'a', true)");
+        let lower = out.to_ascii_lowercase();
+        assert!(lower.contains("struct("), "ROW must become struct(): {out}");
+        assert!(!lower.contains("row("), "ROW( should be gone: {out}");
+        assert!(out.contains('1') && out.contains("'a'"), "args must survive: {out}");
+    }
+
+    #[test]
+    fn quoted_row_function_left_untouched() {
+        // A quoted "row" identifier is a user function, not the keyword.
+        let out = rewrite_trino_compat(r#"SELECT "row"(1, 2)"#);
+        assert!(
+            !out.to_ascii_lowercase().contains("struct("),
+            "quoted row function must not be rewritten: {out}"
+        );
+    }
+
+    #[test]
+    fn cast_row_to_named_row_uses_named_struct() {
+        // CAST(ROW(...) AS ROW(name type, ...)) -> named_struct with per-field
+        // CAST. Trino's named-row semantics. (#7)
+        let out = rewrite_trino_compat(
+            "SELECT CAST(ROW(1, 'a') AS ROW(x int, y varchar))",
+        );
+        let lower = out.to_ascii_lowercase();
+        assert!(lower.contains("named_struct("), "expected named_struct: {out}");
+        assert!(lower.contains("'x'") && lower.contains("'y'"), "field names: {out}");
+        assert!(
+            lower.contains("cast(1 as int)"),
+            "first field cast missing: {out}"
+        );
+        assert!(
+            lower.contains("cast('a' as varchar)"),
+            "second field cast missing: {out}"
+        );
+        // The outer ROW custom type must be gone (DataFusion rejects it).
+        assert!(!lower.contains("as row("), "ROW cast type should be gone: {out}");
+    }
+
+    #[test]
+    fn cast_struct_column_to_row_is_left_alone() {
+        // CAST(<column> AS ROW(...)) is the fragile case we deliberately do
+        // not reconstruct: the inner expr is not a ROW/struct constructor, so
+        // named_struct must not fire.
+        let out = rewrite_trino_compat("SELECT CAST(c AS ROW(x int, y varchar)) FROM t");
+        assert!(
+            !out.to_ascii_lowercase().contains("named_struct("),
+            "column cast must not become named_struct: {out}"
+        );
+    }
+
+    #[test]
+    fn cast_row_arg_count_mismatch_left_alone() {
+        // Field count != constructor arg count: do not produce a half-built
+        // named_struct. The inner ROW still becomes struct() (harmless).
+        let out = rewrite_trino_compat("SELECT CAST(ROW(1) AS ROW(x int, y varchar))");
+        assert!(
+            !out.to_ascii_lowercase().contains("named_struct("),
+            "arg/field mismatch must not build named_struct: {out}"
+        );
     }
 
     #[test]
