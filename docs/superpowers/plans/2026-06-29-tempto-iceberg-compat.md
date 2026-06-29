@@ -4,7 +4,7 @@
 
 **Goal:** Run the official upstream `trino-product-tests` Iceberg suite (via the `trinodb/tempto` framework) against SQE's Trino HTTP endpoint and report compatibility as pass / fail / documented-exclusion.
 
-**Architecture:** A fully Docker-based harness. The published `io.trino:trino-product-tests:465` jar (no Trino source build) is run by a small Gradle project inside a container; it speaks the Trino JDBC protocol to a Caddy TLS terminator that forwards to SQE's plain-HTTP compat endpoint. SQE runs against Polaris + RustFS with its single catalog named `iceberg` (the name the upstream tests hardcode). A curated allow-list selects the pure-Trino runnable tests; everything Spark/Hive/HDFS-coupled is excluded and documented.
+**Architecture:** A fully Docker-based harness layered on the EXISTING parity stack (`docker-compose.test.yml + docker-compose.compare.yml`), which already runs Polaris + RustFS + SQE (`:28080`) + real Trino 465 (`:38080`), bootstrapped by `scripts/bootstrap-test.sh`. Both engines already expose catalog `iceberg` (SQE via `Config::LEGACY_CATALOG_NAME = "iceberg"` for the single `[catalog]` block; Trino via `iceberg.properties`), which is the name the upstream tests hardcode. The published `io.trino:trino-product-tests:465` jar (no Trino source build) is run by a small Gradle project in a container; it speaks the Trino JDBC protocol to a Caddy TLS terminator that forwards to SQE's plain-HTTP compat endpoint. The same suite can be aimed at the real Trino (plain HTTP, user-only auth) as a baseline to prove the harness itself is sound. A curated allow-list selects the pure-Trino runnable tests; everything Spark/Hive/HDFS-coupled is excluded and documented.
 
 **Tech Stack:** Docker Compose, Caddy (TLS), Gradle + JDK 23 (container), `io.trino:trino-product-tests:465`, `io.trino.tempto:tempto-core` (transitive), Trino JDBC driver, Apache Polaris 1.5.0, RustFS, SQE (`sqe-trino-compat`).
 
@@ -13,8 +13,7 @@
 - **Host requires only Docker** (Docker 29 + Compose v5 present). Gradle/Caddy/JDK run in containers. Do not add host-level JVM/Gradle deps.
 - **Pinned versions:** Trino product-tests + JDBC = **465** (matches `docker-compose.compare.yml` `trinodb/trino:465`). Polaris **1.5.0**. RustFS `latest` (matches test stack).
 - **Auth:** HTTP **Basic** `root` / `s3cr3t` over TLS. The Trino JDBC driver refuses password/token over plain HTTP, so TLS is mandatory. Do NOT use Bearer (SQE test `[auth]` only exchanges Basic creds with Polaris; it does not validate inbound JWTs).
-- **Catalog name MUST be `iceberg`** — upstream tests hardcode `USE iceberg.default`, `iceberg.default.<table>`, and assert `CREATE TABLE iceberg.default...`. SQE presents `[catalog] warehouse` as its SQL catalog name, so the tempto SQE config sets `warehouse = "iceberg"`.
-- **Polaris location non-overlap:** each catalog needs a distinct `allowedLocations`. The `iceberg` catalog uses bucket `s3://warehouse-iceberg/` (the existing stack already uses `s3://warehouse/` and `s3://warehouse-discovery/`).
+- **Catalog name is already `iceberg`** — upstream tests hardcode `USE iceberg.default`, `iceberg.default.<table>`, and assert `CREATE TABLE iceberg.default...`. No config change needed: SQE registers the single `[catalog]` block under `Config::LEGACY_CATALOG_NAME = "iceberg"` (`crates/sqe-core/src/config.rs:2941`) regardless of the Polaris `warehouse` value, and the compare-stack Trino catalog is named `iceberg`. Reuse the existing `test_warehouse` Polaris warehouse and `scripts/bootstrap-test.sh`; do NOT create a new warehouse or bucket.
 - **Git:** work on branch `test/tempto-iceberg-compat`. Commit per task. Never push to main.
 - **No emdash/endash/Unicode arrows** in any committed docs (repo voice rule); use `->` in code, plain hyphens in prose.
 - **Reuse, do not duplicate:** layer on top of `docker-compose.test.yml`; mirror `scripts/bootstrap-test.sh` rather than reinventing Polaris bootstrap.
@@ -25,14 +24,14 @@
 
 - `testing/tempto/build.gradle.kts` — Gradle project; pulls `trino-product-tests:465`, `application` plugin, mainClass = `io.trino.tests.product.TemptoProductTestRunner`.
 - `testing/tempto/settings.gradle.kts` — root project name.
-- `testing/tempto/tempto-configuration.yaml` — single `trino` database pointing at the TLS proxy with Basic creds.
+- `testing/tempto/tempto-configuration.yaml` — single `trino` database pointing at the TLS proxy with Basic creds (SQE under test).
+- `testing/tempto/tempto-configuration-baseline.yaml` — `trino` database pointing at the real Trino (`trino:8080`, user-only, no TLS) for harness sanity.
 - `testing/tempto/allowlist.txt` — curated FQ test class/method list (one per line, `#` comments).
 - `testing/tempto/exclusions.md` — every excluded class/method + reason.
 - `testing/tempto/Caddyfile` — TLS terminator config (`:8443` -> `sqe:8080`).
-- `tests/tempto/coordinator-tempto.toml` — SQE coordinator config, `warehouse = "iceberg"`, single-node (no workers).
-- `docker-compose.tempto.yml` — overlay adding `tls-proxy` and `tempto-runner` services and the tempto SQE config mount.
-- `scripts/tempto/bootstrap-iceberg-catalog.sh` — create `warehouse-iceberg` bucket + `iceberg` Polaris catalog + namespace (mirror of `bootstrap-test.sh`, parameterized).
-- `scripts/tempto-test.sh` — top-level orchestrator: up stack, bootstrap, wait, run runner, summarize.
+- `tests/tempto/coordinator-tempto.toml` — single-node SQE coordinator config (no workers), `warehouse = "test_warehouse"` (SQL catalog name resolves to `iceberg`). Overrides the distributed config the compare stack mounts, so SQE serves tempto without workers.
+- `docker-compose.tempto.yml` — overlay on top of `docker-compose.test.yml + docker-compose.compare.yml`; adds `tls-proxy` and `tempto-runner` services and remounts the single-node config onto the existing `sqe` service. Does NOT redefine Polaris/RustFS/Trino.
+- `scripts/tempto-test.sh` — top-level orchestrator: up stack, reuse `bootstrap-test.sh`, wait, run runner (SQE, or `--baseline` against real Trino), summarize.
 - `docs/internal/process/tempto-iceberg-compat.md` — usage + coverage + how to add/exclude a test.
 
 ---
@@ -153,23 +152,25 @@ git commit -m "test(tempto): caddy TLS terminator for SQE compat endpoint"
 
 ---
 
-## Task 3: SQE tempto stack config + iceberg-catalog bootstrap
+## Task 3: Single-node SQE config for the tempto stack
 
-Stands up SQE with catalog `iceberg` on Polaris + RustFS.
+The compare stack mounts the distributed `coordinator.toml` (worker URLs, no workers in that overlay). Tempto runs DDL/DML and small queries against one node, so we remount a single-node config. No new Polaris warehouse or bucket: the legacy `[catalog]` block already surfaces as SQL catalog `iceberg`, and `scripts/bootstrap-test.sh` already creates `test_warehouse` + the `default` namespace.
 
 **Files:**
 - Create: `tests/tempto/coordinator-tempto.toml`
-- Create: `scripts/tempto/bootstrap-iceberg-catalog.sh`
 
 **Interfaces:**
-- Consumes: existing `docker-compose.test.yml` services (`polaris`, `rustfs`).
-- Produces: a Polaris catalog named `iceberg` backed by `s3://warehouse-iceberg/` with namespace `default`; a SQE coordinator config exposing SQL catalog `iceberg`.
+- Consumes: existing `docker-compose.test.yml` services (`polaris`, `rustfs`) and `scripts/bootstrap-test.sh`.
+- Produces: a single-node SQE coordinator config exposing SQL catalog `iceberg` over Polaris `test_warehouse`.
 
-- [ ] **Step 1: Write `tests/tempto/coordinator-tempto.toml`** (single-node; copy of the distributed coordinator with no workers and warehouse renamed)
+- [ ] **Step 1: Write `tests/tempto/coordinator-tempto.toml`** (single-node; same warehouse as the test stack so it reuses the existing bootstrap)
 
 ```toml
 # SQE coordinator config for the tempto compatibility stack.
-# Single-node (no workers); catalog presented to SQL as "iceberg".
+# Single-node (no workers). The single [catalog] block surfaces to SQL as
+# catalog "iceberg" (Config::LEGACY_CATALOG_NAME), which is what the upstream
+# Iceberg product-tests hardcode. Warehouse stays test_warehouse so the
+# existing scripts/bootstrap-test.sh applies unchanged.
 [coordinator]
 flight_sql_port = 50051
 trino_http_port = 8080
@@ -186,7 +187,7 @@ client_secret = "s3cr3t"
 
 [catalog]
 catalog_url = "http://polaris:8181/api/catalog"
-warehouse = "iceberg"
+warehouse = "test_warehouse"
 
 [storage]
 s3_endpoint = "http://rustfs:9000"
@@ -206,124 +207,51 @@ max_entries = 10000
 ttl_secs = 1800
 ```
 
-- [ ] **Step 2: Write `scripts/tempto/bootstrap-iceberg-catalog.sh`** (mirror of `bootstrap-test.sh`, dedicated to the `iceberg` catalog + its own bucket)
-
-```bash
-#!/usr/bin/env bash
-set -euo pipefail
-# Create the 'iceberg' Polaris catalog + 'warehouse-iceberg' bucket + 'default'
-# namespace for the tempto compatibility stack. Idempotent.
-
-POLARIS_URL="${POLARIS_URL:-http://localhost:18181}"
-S3_URL="${S3_URL:-http://localhost:19000}"
-S3_ACCESS_KEY="${S3_ACCESS_KEY:-s3admin}"
-S3_SECRET_KEY="${S3_SECRET_KEY:-s3admin}"
-CLIENT_ID="${CLIENT_ID:-root}"
-CLIENT_SECRET="${CLIENT_SECRET:-s3cr3t}"
-WAREHOUSE="iceberg"
-BUCKET="warehouse-iceberg"
-NAMESPACE="default"
-
-echo "=== Tempto iceberg-catalog bootstrap ==="
-
-echo -n "Waiting for Polaris..."
-for i in $(seq 1 60); do
-  HTTP=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$POLARIS_URL/api/catalog/v1/oauth/tokens" \
-    -d "grant_type=client_credentials&client_id=$CLIENT_ID&client_secret=$CLIENT_SECRET&scope=PRINCIPAL_ROLE:ALL" 2>/dev/null || echo "000")
-  [ "$HTTP" = "200" ] && { echo " ready"; break; }
-  [ "$i" -eq 60 ] && { echo " TIMEOUT (HTTP=$HTTP)"; exit 1; }
-  echo -n "."; sleep 1
-done
-
-echo -n "Creating bucket '$BUCKET'... "
-CODE=$(curl -s -o /dev/null -w "%{http_code}" -X PUT "$S3_URL/$BUCKET" \
-  -u "${S3_ACCESS_KEY}:${S3_SECRET_KEY}" 2>/dev/null || echo "000")
-case "$CODE" in 200|204) echo "created" ;; 409) echo "exists" ;; *) echo "FAILED ($CODE)"; exit 1 ;; esac
-
-echo -n "Getting Polaris token... "
-TOKEN=$(curl -sf -X POST "$POLARIS_URL/api/catalog/v1/oauth/tokens" \
-  -d "grant_type=client_credentials&client_id=$CLIENT_ID&client_secret=$CLIENT_SECRET&scope=PRINCIPAL_ROLE:ALL" \
-  | python3 -c "import sys,json; print(json.load(sys.stdin)['access_token'])")
-[ -z "$TOKEN" ] && { echo "FAILED"; exit 1; }
-echo "done"
-
-echo -n "Creating catalog '$WAREHOUSE'... "
-CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$POLARIS_URL/api/management/v1/catalogs" \
-  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-  -d "{\"catalog\":{\"name\":\"$WAREHOUSE\",\"type\":\"INTERNAL\",\"storageConfigInfo\":{\"storageType\":\"S3\",\"allowedLocations\":[\"s3://$BUCKET/\"],\"endpoint\":\"$S3_URL\",\"endpointInternal\":\"http://rustfs:9000\",\"pathStyleAccess\":true},\"properties\":{\"default-base-location\":\"s3://$BUCKET/\",\"polaris.config.drop-with-purge.enabled\":\"true\"}}}" 2>/dev/null)
-case "$CODE" in 200|201) echo "done" ;; 409) echo "exists" ;; *) echo "FAILED ($CODE)"; exit 1 ;; esac
-
-echo -n "Granting catalog admin... "
-curl -s -o /dev/null -X POST "$POLARIS_URL/api/management/v1/catalogs/$WAREHOUSE/catalog-roles" \
-  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-  -d '{"catalogRole":{"name":"catalog_admin"}}' 2>/dev/null || true
-curl -s -o /dev/null -X PUT "$POLARIS_URL/api/management/v1/catalogs/$WAREHOUSE/catalog-roles/catalog_admin/grants" \
-  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-  -d '{"grant":{"type":"catalog","privilege":"CATALOG_MANAGE_CONTENT"}}' 2>/dev/null || true
-curl -s -o /dev/null -X PUT "$POLARIS_URL/api/management/v1/principal-roles/service_admin/catalog-roles/$WAREHOUSE" \
-  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-  -d "{\"catalogRole\":{\"name\":\"catalog_admin\"}}" 2>/dev/null || true
-echo "done"
-
-echo -n "Creating namespace '$NAMESPACE'... "
-CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
-  "$POLARIS_URL/api/catalog/v1/$WAREHOUSE/namespaces" \
-  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-  -d "{\"namespace\":[\"$NAMESPACE\"]}" 2>/dev/null)
-case "$CODE" in 200|201) echo "done" ;; 409) echo "exists" ;; *) echo "WARN ($CODE)" ;; esac
-echo "Bootstrap complete."
-```
-
-- [ ] **Step 3: Make the script executable + verify shell syntax**
+- [ ] **Step 2: Validate the TOML parses**
 
 Run:
 ```bash
-chmod +x scripts/tempto/bootstrap-iceberg-catalog.sh
-bash -n scripts/tempto/bootstrap-iceberg-catalog.sh && echo "syntax OK"
+python3 -c "import tomllib,sys; tomllib.load(open('tests/tempto/coordinator-tempto.toml','rb')); print('toml OK')"
 ```
-Expected: `syntax OK`.
+Expected: `toml OK`.
 
-- [ ] **Step 4: Commit**
+- [ ] **Step 3: Commit**
 
 ```bash
-git add tests/tempto/coordinator-tempto.toml scripts/tempto/bootstrap-iceberg-catalog.sh
-git commit -m "test(tempto): SQE iceberg-catalog config + Polaris bootstrap"
+git add tests/tempto/coordinator-tempto.toml
+git commit -m "test(tempto): single-node SQE config for the tempto stack"
 ```
 
 ---
 
 ## Task 4: Compose overlay + live connectivity check
 
-Wires SQE + TLS proxy + runner into one stack and proves Basic-over-TLS reaches SQE end to end.
+Layers the TLS proxy + runner onto the EXISTING parity stack and proves Basic-over-TLS reaches SQE end to end. Reuses the compare stack's `sqe` and `trino` services and `scripts/bootstrap-test.sh`.
 
 **Files:**
 - Create: `docker-compose.tempto.yml`
 - Create: `testing/tempto/tempto-configuration.yaml`
+- Create: `testing/tempto/tempto-configuration-baseline.yaml`
 
 **Interfaces:**
-- Consumes: `docker-compose.test.yml` (polaris, rustfs), Task 1 Gradle project, Task 2 Caddyfile, Task 3 SQE config.
-- Produces: services `sqe` (compat HTTP 8080, host 28080), `tls-proxy` (8443, host 28443), `tempto-runner` (manual `run` profile); a tempto `trino` database definition.
+- Consumes: `docker-compose.test.yml + docker-compose.compare.yml` (polaris, rustfs, `sqe`, `trino`), Task 1 Gradle project, Task 2 Caddyfile, Task 3 SQE config.
+- Produces: overlay services `tls-proxy` (8443, host 28443) and `tempto-runner` (`run` profile); a remount of the single-node config onto the existing `sqe`; tempto `trino` database definitions for SQE and for the baseline.
 
-- [ ] **Step 1: Write `docker-compose.tempto.yml`**
+- [ ] **Step 1: Write `docker-compose.tempto.yml`** (third overlay; does NOT redefine polaris/rustfs/trino)
 
 ```yaml
 # docker-compose.tempto.yml
-# Tempto Iceberg-compatibility overlay. Compose with the test stack:
-#   docker compose -f docker-compose.test.yml -f docker-compose.tempto.yml up -d sqe tls-proxy
+# Tempto Iceberg-compatibility overlay on top of the existing parity stack.
+# Always compose all three files, in this order:
+#   docker compose -f docker-compose.test.yml -f docker-compose.compare.yml \
+#     -f docker-compose.tempto.yml up -d sqe trino tls-proxy
 # Then bootstrap + run via scripts/tempto-test.sh.
 services:
+  # Remount a single-node config onto the compare-stack SQE (which otherwise
+  # mounts the distributed coordinator.toml that expects worker-1/worker-2).
   sqe:
-    build:
-      context: .
-    ports:
-      - "28080:8080"   # Trino HTTP compat (host debugging)
-    environment:
-      SQE_CONFIG: /etc/sqe/config.toml
     volumes:
       - ./tests/tempto/coordinator-tempto.toml:/etc/sqe/config.toml:ro
-    depends_on:
-      polaris:
-        condition: service_healthy
 
   tls-proxy:
     image: caddy:2
@@ -340,7 +268,6 @@ services:
     volumes:
       - ./testing/tempto:/work
       - sqe-tempto-gradle:/home/gradle/.gradle
-    # Driven explicitly by scripts/tempto-test.sh; no default command.
     entrypoint: ["gradle", "--no-daemon"]
     command: ["help"]
     depends_on:
@@ -351,7 +278,7 @@ volumes:
   sqe-tempto-gradle:
 ```
 
-- [ ] **Step 2: Write `testing/tempto/tempto-configuration.yaml`** (only the `trino` database `onTrino()` needs; in-network hostnames)
+- [ ] **Step 2: Write `testing/tempto/tempto-configuration.yaml`** (SQE under test, via the TLS proxy; in-network hostnames)
 
 ```yaml
 databases:
@@ -370,47 +297,58 @@ tests:
     float_tolerance: 0.000001
 ```
 
-- [ ] **Step 3: Validate the merged compose**
+- [ ] **Step 3: Write `testing/tempto/tempto-configuration-baseline.yaml`** (real Trino, plain HTTP, user-only auth; proves the harness)
+
+```yaml
+databases:
+  trino:
+    host: trino
+    port: 8080
+    server_address: http://trino:8080
+    jdbc_driver_class: io.trino.jdbc.TrinoDriver
+    jdbc_url: jdbc:trino://trino:8080/iceberg/default
+    jdbc_user: admin
+    jdbc_password: ""
+    jdbc_pooling: false
+
+tests:
+  assert:
+    float_tolerance: 0.000001
+```
+
+- [ ] **Step 4: Validate the merged compose**
 
 Run:
 ```bash
-docker compose -f docker-compose.test.yml -f docker-compose.tempto.yml config >/dev/null && echo "compose OK"
+docker compose -f docker-compose.test.yml -f docker-compose.compare.yml -f docker-compose.tempto.yml config >/dev/null && echo "compose OK"
 ```
-Expected: `compose OK` (no merge/key errors).
+Expected: `compose OK` (no merge/key errors); the `sqe` service shows the tempto config mount.
 
-- [ ] **Step 4: Bring up the stack and bootstrap**
+- [ ] **Step 5: Bring up the stack and bootstrap**
 
 Run:
 ```bash
-docker compose -f docker-compose.test.yml -f docker-compose.tempto.yml up -d --build sqe tls-proxy
-POLARIS_URL=http://localhost:18181 S3_URL=http://localhost:19000 \
-  scripts/tempto/bootstrap-iceberg-catalog.sh
+docker compose -f docker-compose.test.yml -f docker-compose.compare.yml -f docker-compose.tempto.yml \
+  up -d --build sqe trino tls-proxy
+scripts/bootstrap-test.sh
 ```
-Expected: stack starts; bootstrap prints `Bootstrap complete.`
+Expected: stack starts; bootstrap prints its warehouse/namespace lines and completes (idempotent if already bootstrapped).
 
-- [ ] **Step 5: Prove Basic-over-TLS reaches SQE and catalog is `iceberg`**
+- [ ] **Step 6: Prove Basic-over-TLS reaches SQE and catalog is `iceberg`**
 
-Run (trino-cli is on the host; talk to the host-published HTTPS proxy port):
-```bash
-trino --server https://localhost:28443 --insecure \
-  --user root --password <<< "" 2>/dev/null; \
-TRINO_PASSWORD=s3cr3t trino --server https://localhost:28443 --insecure \
-  --user root --password --catalog iceberg --schema default \
-  --execute "SHOW CATALOGS"
-```
-Expected: output includes `iceberg`. If trino-cli password prompting is awkward in non-interactive mode, substitute the proven curl path against the proxy:
+Run the proven curl path against the host-published HTTPS proxy port (`-k` accepts Caddy's self-signed cert):
 ```bash
 curl -sk -u root:s3cr3t -H "X-Trino-User: root" -H "X-Trino-Catalog: iceberg" \
   -H "Content-Type: text/plain" --data "SHOW CATALOGS" \
   https://localhost:28443/v1/statement | python3 -c "import sys,json;d=json.load(sys.stdin);print(d.get('stats',{}).get('state'),d.get('nextUri'))"
 ```
-Expected: state `QUEUED`/`RUNNING`/`FINISHED` (not an auth error). Follow `nextUri` if needed to confirm `iceberg` appears.
+Expected: state `QUEUED`/`RUNNING`/`FINISHED` (not an auth error). Follow `nextUri` until the result includes `iceberg`. This confirms TLS termination, Basic auth, and the catalog name in one shot.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
-git add docker-compose.tempto.yml testing/tempto/tempto-configuration.yaml
-git commit -m "test(tempto): compose overlay + tempto trino connection config"
+git add docker-compose.tempto.yml testing/tempto/tempto-configuration.yaml testing/tempto/tempto-configuration-baseline.yaml
+git commit -m "test(tempto): compose overlay + tempto trino connection configs"
 ```
 
 ---
@@ -516,22 +454,29 @@ git commit -m "docs(tempto): document Iceberg test exclusions and reasons"
 ```bash
 #!/usr/bin/env bash
 set -euo pipefail
-# Run the upstream Trino Iceberg product-tests against SQE via tempto.
-# Usage: scripts/tempto-test.sh [--no-build]
+# Run the upstream Trino Iceberg product-tests via tempto, against SQE (default)
+# or the real Trino baseline. Layers on the existing parity stack.
+# Usage: scripts/tempto-test.sh [--baseline] [--no-build]
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$ROOT_DIR"
 
-COMPOSE=(docker compose -f docker-compose.test.yml -f docker-compose.tempto.yml)
+COMPOSE=(docker compose -f docker-compose.test.yml -f docker-compose.compare.yml -f docker-compose.tempto.yml)
+CONFIG="/work/tempto-configuration.yaml"
+TARGET="SQE (via TLS proxy)"
 BUILD_FLAG="--build"
-[ "${1:-}" = "--no-build" ] && BUILD_FLAG=""
+for arg in "$@"; do
+  case "$arg" in
+    --baseline) CONFIG="/work/tempto-configuration-baseline.yaml"; TARGET="real Trino (baseline)" ;;
+    --no-build) BUILD_FLAG="" ;;
+  esac
+done
 
-echo "=== Tempto Iceberg compatibility run ==="
-"${COMPOSE[@]}" up -d $BUILD_FLAG sqe tls-proxy
+echo "=== Tempto Iceberg compatibility run -- target: $TARGET ==="
+"${COMPOSE[@]}" up -d $BUILD_FLAG sqe trino tls-proxy
 
-echo "Bootstrapping iceberg catalog..."
-POLARIS_URL=http://localhost:18181 S3_URL=http://localhost:19000 \
-  "$SCRIPT_DIR/tempto/bootstrap-iceberg-catalog.sh"
+echo "Bootstrapping test stack (idempotent)..."
+"$SCRIPT_DIR/bootstrap-test.sh"
 
 echo "Waiting for SQE compat endpoint..."
 timeout 60 bash -c 'until curl -sf http://localhost:28080/v1/info >/dev/null; do sleep 1; done' \
@@ -541,15 +486,15 @@ TESTS=$(grep -vE '^\s*#|^\s*$' testing/tempto/allowlist.txt | paste -sd, -)
 echo "Running tempto allow-list: $TESTS"
 set +e
 "${COMPOSE[@]}" run --rm tempto-runner -q run \
-  --args="--config /work/tempto-configuration.yaml --report-dir /work/reports --tests $TESTS"
+  --args="--config $CONFIG --report-dir /work/reports --tests $TESTS"
 RC=$?
 set -e
 
 echo ""
 if [ $RC -eq 0 ]; then
-  echo "RESULT: PASS (allow-list green)"
+  echo "RESULT: PASS (allow-list green) against $TARGET"
 else
-  echo "RESULT: FAIL (rc=$RC) -- see testing/tempto/reports/ for the tempto report"
+  echo "RESULT: FAIL (rc=$RC) against $TARGET -- see testing/tempto/reports/ for the tempto report"
 fi
 exit $RC
 ```
