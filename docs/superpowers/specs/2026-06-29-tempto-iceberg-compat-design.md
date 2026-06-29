@@ -59,6 +59,24 @@ and the runnable parts of optimize/procedures. It grows as SQE gains features. T
 why the "curated allow-list + exclusions" model fits: it makes the runnable surface and
 the gaps both explicit.
 
+## Update (reuse pivot, 2026-06-29)
+
+Two findings simplified the build and are now load-bearing:
+
+1. **Catalog is already `iceberg`.** The upstream tests hardcode catalog `iceberg`.
+   SQE registers the single `[catalog]` block under
+   `Config::LEGACY_CATALOG_NAME = "iceberg"` (`crates/sqe-core/src/config.rs:2941`)
+   regardless of the Polaris `warehouse` value, and the compare-stack Trino catalog
+   is named `iceberg`. So the existing compare stack already serves catalog `iceberg`
+   on both engines. No new Polaris warehouse, bucket, or bootstrap is needed; reuse
+   `test_warehouse` and `scripts/bootstrap-test.sh`.
+2. **Layer on the existing parity stack.** Compose
+   `docker-compose.test.yml + docker-compose.compare.yml + docker-compose.tempto.yml`.
+   The overlay adds only `tls-proxy` (caddy) and `tempto-runner`, and remounts a
+   single-node SQE config (the compare stack mounts the distributed `coordinator.toml`
+   that expects workers). Pointing tempto at the compare stack's real Trino gives a
+   harness-sanity baseline for free (`--baseline`).
+
 ## Architecture
 
 ```
