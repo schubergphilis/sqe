@@ -828,6 +828,14 @@ async fn submit_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
         }
         _ => effective_sql,
     };
+    // #8: name unaliased expression columns _col0, _col1, ... the way Trino
+    // does, instead of DataFusion's expression-text column names (e.g.
+    // `Int64(1) + Int64(1)`), which JDBC/BI clients display verbatim. Scoped
+    // to the Trino wire path: native Flight SQL clients keep DataFusion names.
+    // A no-op for non-SELECT statements (DESCRIBE, SHOW, DDL) and for
+    // projections containing a wildcard, so it is safe to run unconditionally
+    // here, before the DESCRIBE-prepared interception below.
+    let effective_sql = sqe_sql::alias_anonymous_select_columns(&effective_sql);
     let exec_sql = effective_sql.as_str();
 
     // DESCRIBE OUTPUT <name> / DESCRIBE INPUT <name>: describe a prepared

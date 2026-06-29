@@ -6641,6 +6641,7 @@ dependencies = [
  "sha2 0.10.9",
  "sqe-auth",
  "sqe-core",
+ "sqe-sql",
  "tokio",
  "tracing",
  "url",

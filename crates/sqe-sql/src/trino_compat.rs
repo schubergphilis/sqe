@@ -38,7 +38,7 @@ use std::ops::ControlFlow;
 use sqlparser::ast::{
     DataType as SqlDataType, Expr, Function, FunctionArg, FunctionArgExpr,
     FunctionArgumentList, FunctionArguments, GroupByExpr, GroupByWithModifier, Ident,
-    LimitClause, ObjectName, Query, Select, SetExpr, Statement, TableFactor,
+    LimitClause, ObjectName, Query, Select, SelectItem, SetExpr, Statement, TableFactor,
     TableFunctionArgs, Value, Visit, VisitMut, Visitor, VisitorMut,
 };
 use sqlparser::dialect::GenericDialect;
@@ -211,6 +211,110 @@ pub fn rewrite_trino_compat(sql: &str) -> String {
         .map(Statement::to_string)
         .collect::<Vec<_>>()
         .join("; ")
+}
+
+/// Give each unaliased expression column in the top-level projection Trino's
+/// positional `_colN` name (N = 0-based position in the SELECT list).
+///
+/// Trino names an anonymous output column `_col0`, `_col1`, ... by its absolute
+/// position in the select list (so `SELECT a, count(*)` yields `a`, `_col1`).
+/// DataFusion instead names such a column after its expression text (e.g.
+/// `Int64(1) + Int64(1)`), which BI clients display verbatim. This rewrite adds
+/// the explicit alias so DataFusion emits the Trino-style name.
+///
+/// Scope and limits, all deliberate:
+/// - Only the outermost query's output projection is rewritten. Anonymous
+///   columns inside subqueries / CTEs never surface as output names, so they
+///   keep DataFusion's naming. For a set operation (`UNION`, etc.) the output
+///   names come from the leftmost SELECT, which is the one rewritten.
+/// - Plain column references (`c`, `t.c`) and already-aliased items keep their
+///   natural name; only genuine expressions are renamed.
+/// - If the projection contains a `*` / `t.*` wildcard the rewrite is skipped
+///   entirely: a wildcard's column count is unknown before planning, so the
+///   absolute positions of any following expressions cannot be computed at the
+///   AST level. A wrong `_colN` is worse than DataFusion's fallback name.
+///
+/// This is applied on the Trino wire path only (the HTTP server's pre-parse
+/// chain), so native Flight SQL clients keep DataFusion's column names. Returns
+/// the rewritten SQL, or the input unchanged when nothing was renamed or the
+/// input does not parse.
+pub fn alias_anonymous_select_columns(sql: &str) -> String {
+    let dialect = GenericDialect {};
+    let mut statements = match Parser::parse_sql(&dialect, sql) {
+        Ok(s) => s,
+        Err(_) => return sql.to_string(),
+    };
+
+    let mut changed = false;
+    for stmt in &mut statements {
+        if let Statement::Query(query) = stmt {
+            if let Some(select) = leftmost_select_mut(query.body.as_mut()) {
+                if alias_select_projection(select) {
+                    changed = true;
+                }
+            }
+        }
+    }
+
+    if !changed {
+        // Preserve the user's exact text when no rename fired; the Display
+        // round-trip does not reproduce every input verbatim.
+        return sql.to_string();
+    }
+
+    statements
+        .iter()
+        .map(Statement::to_string)
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// Follow a set-expression tree to the leftmost `Select`, whose projection
+/// determines the output column names (Trino, like SQL, takes set-operation
+/// result names from the first branch). Returns `None` for bodies that have no
+/// SELECT projection (`VALUES`, `INSERT`, ...).
+fn leftmost_select_mut(body: &mut SetExpr) -> Option<&mut Select> {
+    match body {
+        SetExpr::Select(s) => Some(s.as_mut()),
+        SetExpr::SetOperation { left, .. } => leftmost_select_mut(left.as_mut()),
+        SetExpr::Query(q) => leftmost_select_mut(q.body.as_mut()),
+        _ => None,
+    }
+}
+
+/// Rewrite `select`'s projection in place, aliasing each unaliased expression
+/// column to `_col<position>`. Returns true if any item was renamed. Skips the
+/// whole projection when it contains a wildcard (see
+/// [`alias_anonymous_select_columns`]).
+fn alias_select_projection(select: &mut Select) -> bool {
+    let has_wildcard = select.projection.iter().any(|item| {
+        matches!(
+            item,
+            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _)
+        )
+    });
+    if has_wildcard {
+        return false;
+    }
+
+    let mut changed = false;
+    for (i, item) in select.projection.iter_mut().enumerate() {
+        let SelectItem::UnnamedExpr(expr) = item else {
+            // ExprWithAlias(es) already carry a name; wildcards are excluded above.
+            continue;
+        };
+        // A bare column reference already has a usable name in both engines.
+        if matches!(expr, Expr::Identifier(_) | Expr::CompoundIdentifier(_)) {
+            continue;
+        }
+        let taken = std::mem::replace(expr, Expr::Identifier(Ident::new("__sqe_colN_tmp")));
+        *item = SelectItem::ExprWithAlias {
+            expr: taken,
+            alias: Ident::new(format!("_col{i}")),
+        };
+        changed = true;
+    }
+    changed
 }
 
 /// Combined visitor that runs every Trino-compat rewriter. One walk over
@@ -1229,6 +1333,70 @@ mod tests {
         let out = rewrite_trino_compat("SELECT CAST(addr AS ipaddress) FROM t").to_uppercase();
         assert!(out.contains("CAST(ADDR AS VARCHAR)"), "got: {out}");
         assert!(!out.contains("IPADDRESS"), "got: {out}");
+    }
+
+    // ── _colN aliasing of unaliased expression columns (#8) ────────────
+
+    #[test]
+    fn anonymous_expression_gets_col0() {
+        let out = alias_anonymous_select_columns("SELECT 1 + 1");
+        assert!(out.contains("AS _col0"), "expected _col0 alias: {out}");
+    }
+
+    #[test]
+    fn col_index_is_absolute_select_position() {
+        // Trino numbers by absolute position: plain `a` keeps its name, the
+        // expression at position 1 becomes _col1, the literal at 2 becomes
+        // _col2.
+        let out = alias_anonymous_select_columns("SELECT a, 2 + 2, 'h' FROM t");
+        let lower = out.to_ascii_lowercase();
+        assert!(lower.contains("2 + 2 as _col1"), "expr should be _col1: {out}");
+        assert!(out.contains("'h' AS _col2"), "literal should be _col2: {out}");
+        // The plain column `a` is not aliased.
+        assert!(!out.contains("a AS _col0"), "plain column must keep its name: {out}");
+    }
+
+    #[test]
+    fn aggregate_after_plain_column_is_col1() {
+        // The canonical Trino case: SELECT a, count(*) -> a, _col1.
+        let out = alias_anonymous_select_columns("SELECT a, count(*) FROM t GROUP BY a");
+        let lower = out.to_ascii_lowercase();
+        assert!(lower.contains("count(*) as _col1"), "count(*) should be _col1: {out}");
+    }
+
+    #[test]
+    fn explicit_alias_is_preserved() {
+        let out = alias_anonymous_select_columns("SELECT 1 + 1 AS total, 2 * 2");
+        assert!(out.contains("AS total"), "explicit alias must survive: {out}");
+        assert!(out.contains("AS _col1"), "second expr should be _col1: {out}");
+        assert!(!out.to_ascii_lowercase().contains("as _col0"), "aliased item keeps name: {out}");
+    }
+
+    #[test]
+    fn qualified_column_reference_is_not_aliased() {
+        let out = alias_anonymous_select_columns("SELECT t.a, t.b FROM t");
+        assert!(
+            !out.to_ascii_lowercase().contains("_col"),
+            "plain qualified columns must not be aliased: {out}"
+        );
+        // No rename fired -> input returned verbatim.
+        assert_eq!(out, "SELECT t.a, t.b FROM t");
+    }
+
+    #[test]
+    fn projection_with_wildcard_is_skipped() {
+        // A wildcard makes following positions uncomputable, so the whole
+        // projection is left alone.
+        let sql = "SELECT *, 1 + 1 FROM t";
+        let out = alias_anonymous_select_columns(sql);
+        assert_eq!(out, sql, "wildcard projection must be left untouched: {out}");
+    }
+
+    #[test]
+    fn union_aliases_leftmost_select() {
+        // Output column names come from the first branch of a UNION.
+        let out = alias_anonymous_select_columns("SELECT 1 + 1 UNION SELECT 2 + 2");
+        assert!(out.contains("AS _col0"), "leftmost select should be aliased: {out}");
     }
 
     #[test]
