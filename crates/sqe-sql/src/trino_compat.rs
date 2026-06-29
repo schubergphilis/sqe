@@ -156,11 +156,16 @@ pub fn rewrite_trino_compat(sql: &str) -> String {
     // NOT_SUPPORTED error); both are string-representable, so on the read path
     // we rewrite the cast to VARCHAR.
     let has_custom_cast = lower.contains("as uuid") || lower.contains("as ipaddress");
+    // `json '...'` -> rewrite_json_typed_string: a Trino JSON typed-string
+    // literal, which DataFusion rejects; rewritten to a plain string (SQE
+    // stores JSON as Utf8).
+    let has_json_literal = lower.contains("json '");
     if !has_json_cast
         && !has_dollar
         && !has_grouping_set
         && !has_current_schema
         && !has_custom_cast
+        && !has_json_literal
     {
         return sql.to_string();
     }
@@ -226,6 +231,9 @@ impl VisitorMut for TrinoCompatVisitor {
             self.rewrites += 1;
         }
         if rewrite_bare_current_schema(expr) {
+            self.rewrites += 1;
+        }
+        if rewrite_json_typed_string(expr) {
             self.rewrites += 1;
         }
         ControlFlow::Continue(())
@@ -314,6 +322,20 @@ fn rewrite_cast_custom_to_varchar(expr: &mut Expr) -> bool {
 
 /// Rewrite `Expr::Cast { data_type: JSON, expr }` to `to_json(expr)`.
 /// Returns true if the rewrite fired.
+/// Rewrite a Trino `JSON '<text>'` typed-string literal to a plain string
+/// literal. DataFusion's planner rejects the JSON typed string
+/// ("Unsupported ... JSON"); SQE represents JSON columns as Utf8, and the
+/// string value carries the same content. Returns true if the rewrite fired.
+fn rewrite_json_typed_string(expr: &mut Expr) -> bool {
+    if let Expr::TypedString(ts) = expr {
+        if matches!(ts.data_type, SqlDataType::JSON) {
+            *expr = Expr::Value(ts.value.clone());
+            return true;
+        }
+    }
+    false
+}
+
 fn rewrite_cast_as_json(expr: &mut Expr) -> bool {
     let Expr::Cast {
         kind: _,
@@ -1066,6 +1088,15 @@ mod tests {
         let out = rewrite_trino_compat("SELECT CAST(addr AS ipaddress) FROM t").to_uppercase();
         assert!(out.contains("CAST(ADDR AS VARCHAR)"), "got: {out}");
         assert!(!out.contains("IPADDRESS"), "got: {out}");
+    }
+
+    #[test]
+    fn rewrites_json_literal_to_string() {
+        // Trino `JSON '<text>'` -> a plain string literal (SQE stores JSON as
+        // Utf8); DataFusion rejects the JSON typed string. (#7)
+        let out = rewrite_trino_compat(r#"SELECT JSON '{"a": 1}' AS j"#);
+        assert!(!out.to_uppercase().contains("JSON '"), "JSON literal kept: {out}");
+        assert!(out.contains(r#"'{"a": 1}'"#), "string value lost: {out}");
     }
 
     #[test]
