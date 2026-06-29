@@ -614,6 +614,19 @@ fn build_page_response(
         .unwrap_or_default();
     let is_last = page_token + 1 >= paginated.total_pages;
 
+    // DDL/update statements produce no columns. The Trino 465 JDBC client's
+    // ResultRowsDecoder early-returns on `data == null` but otherwise asserts
+    // `columns` is non-empty, so a non-null `data` with empty `columns` is
+    // rejected ("Columns must be set when decoding data"). Real Trino omits
+    // `data` entirely for updates; match that by emitting None when there are
+    // no columns. A SELECT returning zero rows still has columns, so its
+    // (empty) data stays present. See issue #314.
+    let data = if paginated.columns.is_empty() {
+        None
+    } else {
+        Some(page_data)
+    };
+
     let metrics = protocol::ExecutionMetrics {
         elapsed_millis: paginated.created_at.elapsed().as_millis() as u64,
         processed_rows: paginated.total_rows as u64,
@@ -629,7 +642,7 @@ fn build_page_response(
         info_uri: Some(info_uri(base_url, query_id)),
         next_uri: next_uri(base_url, query_id, page_token, paginated.total_pages),
         columns: Some(paginated.columns.clone()),
-        data: Some(page_data),
+        data,
         stats,
         update_type: paginated.update_type.clone(),
         update_count: paginated.update_count,
@@ -1709,6 +1722,74 @@ mod tests {
         assert!(resp.next_uri.is_none());
         assert_eq!(resp.data.as_ref().unwrap().len(), 1);
         assert_eq!(resp.stats.state, "FINISHED");
+    }
+
+    #[test]
+    fn test_build_page_response_omits_data_for_columnless_update() {
+        // Trino 465 JDBC client rejects a non-null `data` with empty `columns`
+        // ("Columns must be set when decoding data"). Real Trino omits `data`
+        // entirely for DDL/update statements. SQE must match: column-less result
+        // -> data: None. See issue #314.
+        let paginated = PaginatedResult {
+            columns: vec![],
+            pages: vec![vec![]],
+            total_pages: 1,
+            created_at: Instant::now(),
+            owner_username: "test".to_string(),
+            total_rows: 0,
+            update_type: Some("CREATE TABLE".to_string()),
+            update_count: None,
+            estimated_bytes: 0,
+        };
+
+        let resp = build_page_response("http://localhost:8080", "q-ddl", &paginated, 0);
+        assert!(
+            resp.data.is_none(),
+            "column-less update must omit data (got {:?})",
+            resp.data
+        );
+        assert_eq!(resp.update_type, Some("CREATE TABLE".to_string()));
+        assert_eq!(resp.stats.state, "FINISHED");
+
+        // Wire-level check: `data` is skip_serializing_if = Option::is_none, so
+        // a None value drops the field entirely. This is exactly what the Trino
+        // 465 client's `data == null -> NULL_ROWS` early return needs to see.
+        let json: serde_json::Value = serde_json::to_value(&resp).unwrap();
+        let obj = json.as_object().unwrap();
+        assert!(
+            !obj.contains_key("data"),
+            "serialized response must omit the data field for a column-less update, got {json}"
+        );
+        assert_eq!(obj.get("updateType").and_then(|v| v.as_str()), Some("CREATE TABLE"));
+    }
+
+    #[test]
+    fn test_build_page_response_keeps_data_for_empty_select() {
+        // A SELECT that legitimately returns zero rows still has columns, so
+        // `data` must remain present (Some) and non-null. Gating is on empty
+        // columns, not empty data.
+        let paginated = PaginatedResult {
+            columns: vec![TrinoColumn {
+                name: "id".to_string(),
+                r#type: "bigint".to_string(),
+                type_signature: crate::protocol::type_signature_for("bigint"),
+            }],
+            pages: vec![vec![]],
+            total_pages: 1,
+            created_at: Instant::now(),
+            owner_username: "test".to_string(),
+            total_rows: 0,
+            update_type: None,
+            update_count: None,
+            estimated_bytes: 0,
+        };
+
+        let resp = build_page_response("http://localhost:8080", "q-empty", &paginated, 0);
+        assert!(
+            resp.data.is_some(),
+            "SELECT with columns must keep data present even when empty"
+        );
+        assert!(resp.data.as_ref().unwrap().is_empty());
     }
 
     #[test]
