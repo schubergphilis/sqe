@@ -702,30 +702,39 @@ fn rewrite_metadata_dollar_table(factor: &mut TableFactor) -> bool {
         return false;
     };
 
-    // Extract namespace and table name. Two cases:
-    //   1) Single-ident form: `"ns.tbl$snapshots"` -> last_str contains
-    //      a `.` before the `$`. Split on the last `.`.
-    //   2) Multi-ident form: `"ns"."tbl$snapshots"` -> parts.len() >= 2,
-    //      take parts[0..len-1].join(".") as the namespace.
-    let (namespace, table_name): (String, String) = if parts.len() >= 2 {
-        let ns = parts[..parts.len() - 1]
+    // Flatten the reference into bare name segments, handling both the
+    // multi-ident form (`"ns"."tbl$snapshots"`) and the single dotted ident
+    // (`"ns.tbl$snapshots"`). The suffix has already been stripped from the
+    // last segment.
+    let segments: Vec<String> = if parts.len() >= 2 {
+        let mut segs: Vec<String> = parts[..parts.len() - 1]
             .iter()
             .filter_map(|p| p.as_ident())
             .map(|i| i.value.clone())
-            .collect::<Vec<_>>()
-            .join(".");
-        (ns, bare_table_in_last.to_string())
-    } else if let Some(dot_in_last) = bare_table_in_last.rfind('.') {
-        let ns = &bare_table_in_last[..dot_in_last];
-        let tbl = &bare_table_in_last[dot_in_last + 1..];
-        (ns.to_string(), tbl.to_string())
+            .collect();
+        segs.push(bare_table_in_last.to_string());
+        segs
     } else {
-        // Single-segment `"tbl$snapshots"` with no namespace. The TVFs
-        // require both args, so we cannot rewrite without inventing a
-        // namespace. Leave the FROM clause alone; DataFusion will produce
-        // a "table not found" error which is the correct behaviour.
-        return false;
+        bare_table_in_last.split('.').map(str::to_string).collect()
     };
+
+    // The metadata TVFs take (namespace, table). SQE models a single-level
+    // namespace plus an optional catalog prefix that handlers resolve against
+    // the session's bound catalog regardless (the metadata TVFs use the
+    // session's effective catalog). So the namespace is the segment
+    // immediately before the table; any catalog (or higher) prefix is dropped.
+    // Passing the catalog-qualified `catalog.schema` as the namespace made
+    // Polaris fail to load the table (#317).
+    let n = segments.len();
+    if n < 2 {
+        // Single-segment `"tbl$snapshots"` with no namespace. The TVFs require
+        // both args, so we cannot rewrite without inventing a namespace. Leave
+        // the FROM clause alone; DataFusion produces a "table not found" error,
+        // which is the correct behaviour.
+        return false;
+    }
+    let namespace = segments[n - 2].clone();
+    let table_name = segments[n - 1].clone();
 
     // Build the TableFunctionArgs (two string-literal args).
     let args_vec = vec![
@@ -1157,15 +1166,30 @@ mod tests {
 
     #[test]
     fn dollar_table_three_segment_namespace() {
-        // catalog.schema.table format: three quoted parts.
+        // catalog.schema.table format: three quoted parts. The catalog prefix
+        // is dropped -- the metadata TVF resolves against the session's bound
+        // catalog (like every other table op in SQE), and Iceberg/Polaris wants
+        // the bare schema as the namespace, not `catalog.schema`. Passing the
+        // catalog-qualified namespace made Polaris fail with "table does not
+        // exist" (#317).
         let out = rewrite_trino_compat(
             r#"SELECT * FROM "cat"."schema"."t$snapshots""#,
         );
         let lower = out.to_ascii_lowercase();
-        // Namespace becomes "cat.schema"; the TVF takes the joined ns + bare table.
         assert!(
-            lower.contains("table_snapshots('cat.schema', 't')"),
-            "three-segment ns should join, got: {out}"
+            lower.contains("table_snapshots('schema', 't')"),
+            "catalog should be dropped, leaving the bare schema, got: {out}"
+        );
+    }
+
+    #[test]
+    fn dollar_table_three_segment_single_ident() {
+        // The single-identifier dotted form must drop the catalog the same way.
+        let out = rewrite_trino_compat(r#"SELECT * FROM "cat.schema.t$snapshots""#);
+        let lower = out.to_ascii_lowercase();
+        assert!(
+            lower.contains("table_snapshots('schema', 't')"),
+            "catalog should be dropped from the single-ident form, got: {out}"
         );
     }
 
