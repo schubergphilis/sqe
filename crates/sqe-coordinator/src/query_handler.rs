@@ -1191,6 +1191,14 @@ impl QueryHandler {
                     self.handle_show_stats(session, table_name).await
                 }
 
+                // ANALYZE table — Trino table-statistics command. SQE accepts
+                // it so tooling that runs ANALYZE after a load does not error;
+                // stats collection is currently a no-op (#329). A missing table
+                // still errors, like a SELECT would.
+                StatementKind::Analyze(ref table_name) => {
+                    self.handle_analyze(session, table_name).await
+                }
+
                 StatementKind::Merge(stmt) => {
                     // Extract source SQL from the MERGE statement and execute it
                     // to get the source batches, then pass them to the write handler.
@@ -4529,6 +4537,44 @@ impl QueryHandler {
             .map(|f| f.name.clone())
             .collect();
         build_show_stats_batch(&column_names, row_count)
+    }
+
+    /// ANALYZE [catalog.][schema.]table [WITH (...)] — Trino's table-statistics
+    /// command. SQE resolves and loads the table (so a missing table errors the
+    /// same way a SELECT would) and returns a successful empty result. Computing
+    /// or persisting Iceberg statistics is not yet implemented; the statement
+    /// succeeds as a no-op so tooling that issues ANALYZE after a load (and the
+    /// cost-based optimizer's stats refresh) does not fail (#329).
+    async fn handle_analyze(
+        &self,
+        session: &Session,
+        table_name: &str,
+    ) -> sqe_core::Result<Vec<RecordBatch>> {
+        use iceberg::{NamespaceIdent, TableIdent};
+
+        // Resolve the same way SHOW STATS does: explicit catalog qualifier wins,
+        // else the session catalog (with polaris-auto discovery). load_table
+        // returns an error for a missing table, so ANALYZE on a non-existent
+        // table fails instead of silently succeeding.
+        let parts: Vec<&str> = table_name.splitn(3, '.').collect();
+        let (catalog, namespace, bare_table) = match parts.len() {
+            1 => (None, "default", parts[0]),
+            2 => (None, parts[0], parts[1]),
+            _ => (Some(parts[0]), parts[1], parts[2]),
+        };
+        let session_catalog = self.show_catalog(session, catalog).await?;
+        let ns_ident = NamespaceIdent::new(namespace.to_string());
+        let table_ident = TableIdent::new(ns_ident, bare_table.to_string());
+        let _table = session_catalog.load_table(&table_ident).await?;
+
+        // TODO(#329): compute and persist Iceberg table statistics (NDV/min/max
+        // via Puffin sketches) so the cost-based optimizer benefits. For now the
+        // statement is a no-op once the table is confirmed to exist.
+        debug!(
+            table = %table_name,
+            "ANALYZE: table statistics collection is a no-op; statement accepted"
+        );
+        Ok(vec![])
     }
 
     // -----------------------------------------------------------------------
