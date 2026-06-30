@@ -10,7 +10,7 @@
 //! a type DataFusion cannot coerce) fails here rather than in production.
 
 use datafusion::execution::context::SessionContext;
-use sqe_sql::rewrite_trino_compat;
+use sqe_sql::{rewrite_ctas_compat, rewrite_trino_compat};
 
 /// Rewrite `input` the way the coordinator's pre-parse stage does, then plan +
 /// execute it against a default SessionContext and return the single scalar
@@ -95,6 +95,84 @@ async fn fetch_first_only_executes_as_limit() {
     )
     .await;
     assert_eq!(got.len(), 2, "ONLY -> LIMIT 2 returns exactly two rows: {got:?}");
+}
+
+/// Run a CTAS through `rewrite_ctas_compat` against a fresh SessionContext,
+/// then query `SELECT <select> FROM <table>` and return the column-0 i64 values
+/// (sorted). Proves the rewritten DDL plans, executes, and produces the
+/// expected schema/rows on DataFusion (which shares sqlparser 0.62 with SQE).
+async fn run_ctas_then_query(ctas: &str, table: &str, select: &str) -> Vec<i64> {
+    use datafusion::arrow::array::Int64Array;
+
+    let ctx = SessionContext::new();
+    let rewritten = rewrite_ctas_compat(ctas);
+    ctx.sql(&rewritten)
+        .await
+        .unwrap_or_else(|e| panic!("planning failed for `{rewritten}` (from `{ctas}`): {e}"))
+        .collect()
+        .await
+        .unwrap_or_else(|e| panic!("CTAS execution failed for `{rewritten}`: {e}"));
+
+    let q = format!("SELECT {select} FROM {table}");
+    let batches = ctx
+        .sql(&q)
+        .await
+        .unwrap_or_else(|e| panic!("query planning failed for `{q}`: {e}"))
+        .collect()
+        .await
+        .unwrap_or_else(|e| panic!("query execution failed for `{q}`: {e}"));
+    let mut out = Vec::new();
+    for b in &batches {
+        let col = b
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("int64 column 0");
+        for i in 0..col.len() {
+            out.push(col.value(i));
+        }
+    }
+    out.sort_unstable();
+    out
+}
+
+#[tokio::test]
+async fn ctas_column_alias_list_renames_output_columns() {
+    // #328: `(x, y)` is a name-only alias list, not a typed coldef list. The
+    // rewrite must rename the VALUES output columns positionally so the new
+    // names resolve. Selecting by alias proves the rename took effect.
+    let got = run_ctas_then_query(
+        "CREATE TABLE aliased (x, y) AS VALUES (10, 20), (30, 40)",
+        "aliased",
+        "x",
+    )
+    .await;
+    assert_eq!(got, vec![10, 30], "alias `x` must resolve to VALUES column 0");
+}
+
+#[tokio::test]
+async fn ctas_with_no_data_creates_empty_table() {
+    // #322: WITH NO DATA creates the table structure with zero rows. The
+    // column must still exist (schema preserved) but no rows materialize.
+    let got = run_ctas_then_query(
+        "CREATE TABLE empties AS SELECT 7 AS a WITH NO DATA",
+        "empties",
+        "a",
+    )
+    .await;
+    assert!(got.is_empty(), "WITH NO DATA must yield zero rows, got {got:?}");
+}
+
+#[tokio::test]
+async fn ctas_with_data_materializes_rows() {
+    // #322: WITH DATA is the default -- rows are materialized.
+    let got = run_ctas_then_query(
+        "CREATE TABLE filled AS SELECT 5 AS a WITH DATA",
+        "filled",
+        "a",
+    )
+    .await;
+    assert_eq!(got, vec![5], "WITH DATA must materialize the row");
 }
 
 #[tokio::test]
