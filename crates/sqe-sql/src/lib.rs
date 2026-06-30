@@ -1,3 +1,4 @@
+pub mod alter_execute;
 pub mod attach;
 pub mod catalog_qualifiers;
 pub mod classifier;
@@ -23,6 +24,7 @@ pub use classifier::{
     parse_and_classify, parse_and_classify_typed, CheckAccessParams, ShowEffectivePolicyParams,
     ShowGrantsTarget, StatementKind,
 };
+pub use alter_execute::rewrite_alter_execute;
 pub use ctas_compat::rewrite_ctas_compat;
 pub use ddl::{try_parse_ref_ddl, BranchRetention, RefDdl};
 pub use paren_less_values::rewrite_paren_less_values;
