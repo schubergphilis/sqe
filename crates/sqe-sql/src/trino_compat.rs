@@ -38,7 +38,7 @@ use std::ops::ControlFlow;
 use sqlparser::ast::{
     DataType as SqlDataType, Expr, Function, FunctionArg, FunctionArgExpr,
     FunctionArgumentList, FunctionArguments, GroupByExpr, GroupByWithModifier, Ident,
-    LimitClause, ObjectName, Query, Select, SelectItem, SetExpr, Statement, TableFactor,
+    LimitClause, ObjectName, OrderByKind, Query, Select, SelectItem, SetExpr, Statement, TableFactor,
     TableFunctionArgs, Value, Visit, VisitMut, Visitor, VisitorMut,
 };
 use sqlparser::dialect::GenericDialect;
@@ -166,6 +166,10 @@ pub fn rewrite_trino_compat(sql: &str) -> String {
     // positive (e.g. a column literally named `arrow`) is harmless: it only
     // forces the AST walk, which rewrites nothing it should not.
     let has_row = lower.contains("row(");
+    // `fetch` -> rewrite_fetch_clause: `FETCH FIRST n ROW[S] ONLY` becomes
+    // `LIMIT n`, and `... WITH TIES` becomes a `RANK() <= n` subquery, because
+    // DataFusion rejects any `query.fetch` (it plans only LIMIT). See #319.
+    let has_fetch = lower.contains("fetch");
     if !has_json_cast
         && !has_dollar
         && !has_grouping_set
@@ -173,6 +177,7 @@ pub fn rewrite_trino_compat(sql: &str) -> String {
         && !has_custom_cast
         && !has_json_literal
         && !has_row
+        && !has_fetch
     {
         return sql.to_string();
     }
@@ -390,6 +395,12 @@ impl VisitorMut for TrinoCompatVisitor {
         if (self.wrap_cte_depth == 0 || was_wrap_owner)
             && wrap_rollup_for_empty_input(query)
         {
+            self.rewrites += 1;
+        }
+        // Translate a FETCH clause DataFusion can't plan. Runs after the ROLLUP
+        // wrap so it sees the final outer query (the wrap moves `fetch` onto the
+        // wrapper). See #319.
+        if rewrite_fetch_clause(query) {
             self.rewrites += 1;
         }
         // Leave: pair the increment in pre_visit_query.
@@ -926,6 +937,167 @@ fn restore_query_fields(
     query.fetch = fetch;
 }
 
+/// Translate a `FETCH FIRST n ROW[S] {ONLY|WITH TIES}` clause that DataFusion
+/// rejects (it plans only `LIMIT`, returning `not_impl_err!("FETCH clause is
+/// not supported yet")` for any `query.fetch`). Returns true when the query was
+/// rewritten. See #319.
+///
+/// - `ONLY` (and the count-less `FETCH FIRST ROW`) maps to `LIMIT n`, always.
+/// - `WITH TIES` maps to a `RANK() OVER (ORDER BY ...) <= n` subquery, which
+///   reproduces standard top-N-with-ties. It fires only on a tractable shape
+///   (plain `SELECT`, an explicit projection whose items are all nameable,
+///   `ORDER BY` present, no `LIMIT`/`OFFSET`); on any other shape it leaves
+///   `query.fetch` untouched so DataFusion emits its own error rather than
+///   risk a silently-wrong rewrite.
+/// - `PERCENT` is left untouched (unsupported).
+fn rewrite_fetch_clause(query: &mut Query) -> bool {
+    let Some(fetch) = query.fetch.as_ref() else {
+        return false;
+    };
+    if fetch.percent {
+        return false;
+    }
+    let with_ties = fetch.with_ties;
+    let quantity = fetch.quantity.clone();
+
+    if with_ties {
+        rewrite_fetch_with_ties(query, quantity)
+    } else {
+        rewrite_fetch_only(query, quantity)
+    }
+}
+
+/// `FETCH FIRST n ROWS ONLY` -> `LIMIT n`, preserving any existing `OFFSET`.
+fn rewrite_fetch_only(query: &mut Query, quantity: Option<Expr>) -> bool {
+    // A query carrying the MySQL `LIMIT o, l` form alongside FETCH is too
+    // unusual to reason about; leave it for DataFusion.
+    if matches!(query.limit_clause, Some(LimitClause::OffsetCommaLimit { .. })) {
+        return false;
+    }
+    // `FETCH FIRST ROW ONLY` with no count means one row.
+    let limit = quantity.unwrap_or_else(|| int_literal_expr(1));
+    let (offset, limit_by) = match query.limit_clause.take() {
+        Some(LimitClause::LimitOffset { offset, limit_by, .. }) => (offset, limit_by),
+        _ => (None, Vec::new()),
+    };
+    query.limit_clause = Some(LimitClause::LimitOffset {
+        limit: Some(limit),
+        offset,
+        limit_by,
+    });
+    query.fetch = None;
+    true
+}
+
+/// `... ORDER BY k FETCH FIRST n ROWS WITH TIES` ->
+/// `SELECT <cols> FROM (SELECT <cols>, RANK() OVER (ORDER BY k) AS r FROM ...)
+///  WHERE r <= n ORDER BY k`, the standard top-N-with-ties translation. Gated
+/// to a shape we can rewrite faithfully; returns false (leaving FETCH alone)
+/// otherwise.
+fn rewrite_fetch_with_ties(query: &mut Query, quantity: Option<Expr>) -> bool {
+    // WITH TIES needs an explicit count and no competing LIMIT/OFFSET.
+    let Some(quantity) = quantity else {
+        return false;
+    };
+    if query.limit_clause.is_some() {
+        return false;
+    }
+    // ORDER BY is required for WITH TIES (Trino rejects it without one).
+    let Some(order_by) = query.order_by.as_ref() else {
+        return false;
+    };
+    let OrderByKind::Expressions(order_exprs) = &order_by.kind else {
+        return false;
+    };
+    if order_exprs.is_empty() {
+        return false;
+    }
+    // Plain SELECT body only.
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return false;
+    };
+    // Every projection item must be nameable so the outer query can re-select
+    // exactly the original columns (excluding the synthetic rank). Wildcards
+    // and unaliased compound/computed expressions are declined.
+    let mut out_names: Vec<String> = Vec::with_capacity(select.projection.len());
+    for item in &select.projection {
+        match item {
+            SelectItem::UnnamedExpr(Expr::Identifier(id)) => out_names.push(id.value.clone()),
+            SelectItem::ExprWithAlias { alias, .. } => out_names.push(alias.value.clone()),
+            _ => return false,
+        }
+    }
+    if out_names.is_empty() {
+        return false;
+    }
+
+    let order_str = order_exprs
+        .iter()
+        .map(|e| e.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    // Build the `RANK() OVER (ORDER BY ...) AS __sqe_ties_rank` projection item
+    // via the parser rather than hand-assembling the Function AST.
+    let rank_probe = format!("SELECT RANK() OVER (ORDER BY {order_str}) AS __sqe_ties_rank");
+    let Ok(mut rank_stmts) = Parser::parse_sql(&GenericDialect {}, &rank_probe) else {
+        return false;
+    };
+    let rank_item = match rank_stmts.pop() {
+        Some(Statement::Query(q)) => match *q.body {
+            SetExpr::Select(s) if s.projection.len() == 1 => s.projection.into_iter().next(),
+            _ => None,
+        },
+        _ => None,
+    };
+    let Some(rank_item) = rank_item else {
+        return false;
+    };
+
+    // Inner query: the original SELECT with the rank column appended, carrying
+    // forward any WITH; the ORDER BY / FETCH live on the outer query.
+    let mut inner_select = select.clone();
+    inner_select.projection.push(rank_item);
+    let inner_query = Query {
+        with: query.with.clone(),
+        body: Box::new(SetExpr::Select(inner_select)),
+        order_by: None,
+        limit_clause: None,
+        fetch: None,
+        locks: vec![],
+        for_clause: None,
+        settings: None,
+        format_clause: None,
+        pipe_operators: vec![],
+    };
+
+    let names_str = out_names.join(", ");
+    let wrap_sql = format!(
+        "SELECT {names} FROM ({inner}) AS __sqe_ties \
+         WHERE __sqe_ties_rank <= {n} ORDER BY {order}",
+        names = names_str,
+        inner = inner_query,
+        n = quantity,
+        order = order_str,
+    );
+    let Ok(mut stmts) = Parser::parse_sql(&GenericDialect {}, &wrap_sql) else {
+        return false;
+    };
+    if stmts.is_empty() {
+        return false;
+    }
+    let Statement::Query(wrap_query) = stmts.remove(0) else {
+        return false;
+    };
+    *query = *wrap_query;
+    true
+}
+
+/// A bare unsigned integer literal expression.
+fn int_literal_expr(n: u64) -> Expr {
+    Expr::Value(Value::Number(n.to_string(), false).into())
+}
+
 /// Return true if `select.group_by` contains any grouping-set construct
 /// (`ROLLUP(...)`, `CUBE(...)`, `GROUPING SETS (...)`, or the MySQL
 /// `... WITH ROLLUP` / `... WITH CUBE` modifier).
@@ -1129,6 +1301,77 @@ mod tests {
         assert!(
             !out.to_ascii_lowercase().contains("table_snapshots("),
             "single-segment $-table should not be rewritten: {out}"
+        );
+    }
+
+    #[test]
+    fn fetch_first_only_becomes_limit() {
+        let out = rewrite_trino_compat("SELECT x FROM t FETCH FIRST 5 ROWS ONLY");
+        let lower = out.to_ascii_lowercase();
+        assert!(lower.contains("limit 5"), "ONLY should map to LIMIT: {out}");
+        assert!(!lower.contains("fetch"), "FETCH should be gone: {out}");
+    }
+
+    #[test]
+    fn fetch_first_only_no_count_is_limit_one() {
+        let out = rewrite_trino_compat("SELECT x FROM t FETCH FIRST ROW ONLY");
+        let lower = out.to_ascii_lowercase();
+        assert!(lower.contains("limit 1"), "count-less ONLY is LIMIT 1: {out}");
+    }
+
+    #[test]
+    fn fetch_only_preserves_offset() {
+        let out = rewrite_trino_compat("SELECT x FROM t OFFSET 5 ROWS FETCH FIRST 2 ROWS ONLY");
+        let lower = out.to_ascii_lowercase();
+        assert!(lower.contains("limit 2"), "ONLY -> LIMIT: {out}");
+        assert!(lower.contains("offset 5"), "OFFSET must survive: {out}");
+        assert!(!lower.contains("fetch"), "FETCH gone: {out}");
+    }
+
+    #[test]
+    fn fetch_with_ties_becomes_rank_subquery() {
+        let out = rewrite_trino_compat(
+            "SELECT snapshot_id FROM t WHERE p IS NOT NULL ORDER BY committed_at FETCH FIRST 1 ROW WITH TIES",
+        );
+        let lower = out.to_ascii_lowercase();
+        assert!(lower.contains("rank() over"), "WITH TIES needs RANK: {out}");
+        assert!(lower.contains("__sqe_ties_rank <= 1"), "rank filter: {out}");
+        assert!(!lower.contains("fetch"), "FETCH gone: {out}");
+        // The original predicate and projection survive.
+        assert!(lower.contains("snapshot_id"), "projection kept: {out}");
+        assert!(lower.contains("p is not null"), "WHERE kept: {out}");
+    }
+
+    #[test]
+    fn fetch_with_ties_without_order_by_left_alone() {
+        // WITH TIES has no meaning without ORDER BY; leave it for the planner.
+        let sql = "SELECT x FROM t FETCH FIRST 1 ROW WITH TIES";
+        let out = rewrite_trino_compat(sql);
+        assert!(
+            out.to_ascii_lowercase().contains("fetch"),
+            "no ORDER BY -> not rewritten: {out}"
+        );
+    }
+
+    #[test]
+    fn fetch_with_ties_wildcard_left_alone() {
+        // `SELECT *` cannot be re-projected in the outer query without leaking
+        // the synthetic rank column, so the rewrite declines.
+        let sql = "SELECT * FROM t ORDER BY x FETCH FIRST 1 ROW WITH TIES";
+        let out = rewrite_trino_compat(sql);
+        assert!(
+            out.to_ascii_lowercase().contains("fetch"),
+            "wildcard projection -> not rewritten: {out}"
+        );
+    }
+
+    #[test]
+    fn fetch_percent_left_alone() {
+        let sql = "SELECT x FROM t ORDER BY x FETCH FIRST 10 PERCENT ROWS ONLY";
+        let out = rewrite_trino_compat(sql);
+        assert!(
+            out.to_ascii_lowercase().contains("fetch"),
+            "PERCENT is unsupported -> not rewritten: {out}"
         );
     }
 
