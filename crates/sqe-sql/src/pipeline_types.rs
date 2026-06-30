@@ -77,5 +77,8 @@ pub fn pre_parse_pipeline(sql: &UserSql) -> sqe_core::Result<ClassifiableSql> {
     // and the identifier-only column-alias list (#328). Parse-gated, so a no-op
     // for SQL that already parses.
     let normalized = crate::ctas_compat::rewrite_ctas_compat(&normalized);
+    // Trino `ALTER TABLE ... EXECUTE optimize` -> `CALL system.rewrite_data_files`.
+    // Parse-gated; a no-op for SQL that already parses. (#331)
+    let normalized = crate::alter_execute::rewrite_alter_execute(&normalized);
     Ok(ClassifiableSql::from_normalized(normalized))
 }

@@ -87,6 +87,55 @@ async fn fetch_first_with_ties_includes_tied_rows() {
 }
 
 #[tokio::test]
+async fn fetch_with_ties_order_column_absent_from_select() {
+    // #319 regression: the ORDER BY column is NOT in the SELECT list -- the
+    // exact shape of testRollbackToSnapshot (`SELECT snapshot_id ... ORDER BY
+    // committed_at FETCH FIRST 1 ROW WITH TIES`). The inner subquery projects
+    // only the selected column + the synthetic rank, so the outer query must
+    // order by the rank, not the (now-absent) order key. Before the fix this
+    // failed to plan ("No field named ord"); now it must plan and execute.
+    use datafusion::arrow::array::Int64Array;
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::arrow::record_batch::RecordBatch;
+    use std::sync::Arc;
+
+    let ctx = SessionContext::new();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("sel", DataType::Int64, false),
+        Field::new("ord", DataType::Int64, false),
+    ]));
+    // (sel, ord): ranks by ord are 1,2,2,4 -> rank<=2 keeps sel {100,200,300}.
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(vec![100, 200, 300, 400])),
+            Arc::new(Int64Array::from(vec![10, 20, 20, 30])),
+        ],
+    )
+    .unwrap();
+    ctx.register_batch("t2", batch).unwrap();
+
+    let input = "SELECT sel FROM t2 ORDER BY ord FETCH FIRST 2 ROWS WITH TIES";
+    let rewritten = rewrite_trino_compat(input);
+    let batches = ctx
+        .sql(&rewritten)
+        .await
+        .unwrap_or_else(|e| panic!("planning failed for `{rewritten}` (from `{input}`): {e}"))
+        .collect()
+        .await
+        .unwrap_or_else(|e| panic!("execution failed for `{rewritten}`: {e}"));
+    let mut got = Vec::new();
+    for b in &batches {
+        let col = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        for i in 0..col.len() {
+            got.push(col.value(i));
+        }
+    }
+    got.sort_unstable();
+    assert_eq!(got, vec![100, 200, 300], "WITH TIES keeps the tied row by rank");
+}
+
+#[tokio::test]
 async fn fetch_first_only_executes_as_limit() {
     // FETCH FIRST 2 ROWS ONLY -> LIMIT 2: exactly two rows, ties irrelevant.
     let got = run_int_query(
@@ -95,6 +144,54 @@ async fn fetch_first_only_executes_as_limit() {
     )
     .await;
     assert_eq!(got.len(), 2, "ONLY -> LIMIT 2 returns exactly two rows: {got:?}");
+}
+
+#[tokio::test]
+async fn ctas_as_table_qualified_source_copies_rows() {
+    // #330: `CREATE TABLE dst AS TABLE <qualified.name>` -> `AS SELECT * FROM
+    // <qualified.name>`. A dotted source is what sqlparser rejects, so use a
+    // 3-part name DataFusion resolves (`datafusion.public.<table>`) to prove the
+    // rewrite both parses and executes a real copy.
+    use datafusion::arrow::array::Int64Array;
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::arrow::record_batch::RecordBatch;
+    use std::sync::Arc;
+
+    let ctx = SessionContext::new();
+    let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)]));
+    let batch =
+        RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1, 2, 3]))]).unwrap();
+    ctx.register_batch("src", batch).unwrap();
+
+    let ctas = "CREATE TABLE dst AS TABLE datafusion.public.src";
+    let rewritten = rewrite_ctas_compat(ctas);
+    assert!(
+        rewritten.contains("AS SELECT * FROM datafusion.public.src"),
+        "AS TABLE expanded: {rewritten}"
+    );
+    ctx.sql(&rewritten)
+        .await
+        .unwrap_or_else(|e| panic!("planning failed for `{rewritten}`: {e}"))
+        .collect()
+        .await
+        .unwrap_or_else(|e| panic!("CTAS execution failed for `{rewritten}`: {e}"));
+
+    let batches = ctx
+        .sql("SELECT n FROM dst")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let mut got = Vec::new();
+    for b in &batches {
+        let col = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        for i in 0..col.len() {
+            got.push(col.value(i));
+        }
+    }
+    got.sort_unstable();
+    assert_eq!(got, vec![1, 2, 3], "AS TABLE copied all source rows");
 }
 
 /// Run a CTAS through `rewrite_ctas_compat` against a fresh SessionContext,
