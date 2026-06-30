@@ -1017,4 +1017,63 @@ mod tests {
     // `sqe_catalog::parquet_writer_config`. The coordinator writer is a
     // thin wrapper; end-to-end coverage runs in
     // `tests/bloom_distributed_write.rs`.
+
+    use super::*;
+    use std::sync::Arc;
+
+    use arrow_array::{Int32Array, StringArray};
+    use arrow_schema::{DataType, Field};
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use parquet::arrow::ArrowWriter;
+
+    /// `parse_parquet_compression` maps "lz4" to the modern `LZ4_RAW` frame,
+    /// not the deprecated Hadoop-framed `Compression::LZ4`. The distinction
+    /// matters: `LZ4_RAW` is the only LZ4 variant readers reliably interop on.
+    #[test]
+    fn lz4_string_maps_to_lz4_raw() {
+        assert_eq!(parse_parquet_compression("lz4"), Compression::LZ4_RAW);
+        assert_eq!(parse_parquet_compression("LZ4"), Compression::LZ4_RAW);
+    }
+
+    /// Empirical proof that an `LZ4_RAW`-compressed Parquet file written with
+    /// the same `WriterProperties` SQE feeds iceberg-rust round-trips in this
+    /// build (the `lz4` parquet feature is compiled). This is the ground-truth
+    /// check behind #332: LZ4 is supported for Parquet data files. If the
+    /// feature ever gets dropped from the build, this test fails at write.
+    #[test]
+    fn lz4_raw_parquet_roundtrips() {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(StringArray::from(vec!["a", "b", "c"])),
+            ],
+        )
+        .unwrap();
+
+        // Same property shape the write path uses: set_compression(LZ4_RAW).
+        let props = writer_props(Compression::LZ4_RAW);
+
+        let mut buf = Vec::new();
+        {
+            let mut w = ArrowWriter::try_new(&mut buf, schema.clone(), Some(props)).unwrap();
+            w.write(&batch).unwrap();
+            w.close().unwrap();
+        }
+        assert!(!buf.is_empty(), "LZ4_RAW write produced no bytes");
+
+        let reader = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(buf))
+            .unwrap()
+            .build()
+            .unwrap();
+        let mut rows = 0;
+        for rb in reader {
+            rows += rb.unwrap().num_rows();
+        }
+        assert_eq!(rows, 3, "LZ4_RAW read-back lost rows");
+    }
 }
