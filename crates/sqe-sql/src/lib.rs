@@ -1,6 +1,7 @@
 pub mod attach;
 pub mod catalog_qualifiers;
 pub mod classifier;
+pub mod ctas_compat;
 pub mod ddl;
 pub mod paren_less_values;
 pub mod partition;
@@ -22,6 +23,7 @@ pub use classifier::{
     parse_and_classify, parse_and_classify_typed, CheckAccessParams, ShowEffectivePolicyParams,
     ShowGrantsTarget, StatementKind,
 };
+pub use ctas_compat::rewrite_ctas_compat;
 pub use ddl::{try_parse_ref_ddl, BranchRetention, RefDdl};
 pub use paren_less_values::rewrite_paren_less_values;
 pub use partition::normalize_partitioned_by;
