@@ -496,7 +496,10 @@ async fn polaris_auto_mutations_on_discovered_catalog() {
         .await
         .expect("DELETE on a discovered-catalog table must succeed (#334)");
 
-    // Net effect: row 3 deleted (2 rows remain).
+    // Net effect: row 3 deleted (2 rows remain) AND row 1's amt bumped to 11.
+    // Asserting the value (not just the row count) proves the UPDATE actually
+    // committed against the discovered catalog -- a silent no-op UPDATE (no
+    // error, no write) would still leave 2 rows and pass a count-only check.
     let batches = handler
         .execute(
             &session,
@@ -505,6 +508,35 @@ async fn polaris_auto_mutations_on_discovered_catalog() {
         .expect("read back after mutations");
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(rows, 2, "DELETE should have removed exactly one row");
+
+    // Collect (id, amt) across all batches and check both mutations landed.
+    let mut pairs: Vec<(i64, i64)> = Vec::new();
+    for b in &batches {
+        let id = b
+            .column_by_name("id")
+            .expect("'id' column")
+            .as_any()
+            .downcast_ref::<arrow_array::Int64Array>()
+            .expect("'id' is Int64");
+        let amt = b
+            .column_by_name("amt")
+            .expect("'amt' column")
+            .as_any()
+            .downcast_ref::<arrow_array::Int64Array>()
+            .expect("'amt' is Int64");
+        for i in 0..b.num_rows() {
+            pairs.push((id.value(i), amt.value(i)));
+        }
+    }
+    assert!(
+        !pairs.iter().any(|(id, _)| *id == 3),
+        "DELETE should have removed id=3: {pairs:?}"
+    );
+    assert_eq!(
+        pairs.iter().find(|(id, _)| *id == 1).map(|(_, amt)| *amt),
+        Some(11),
+        "UPDATE should have committed amt=11 for id=1 (10 + 1): {pairs:?}"
+    );
 
     let _ = handler
         .execute(
