@@ -169,6 +169,15 @@ fn register_trino_aggregate_aliases(ctx: &datafusion::prelude::SessionContext) {
     let every = (*bool_and_udaf()).clone().with_aliases(["every"]);
     ctx.register_udaf(every);
 
+    // variance(x) → var_samp(x). Trino's `variance` is a synonym for the
+    // sample variance (mirroring `stddev` = `stddev_samp`). DataFusion's
+    // sample-variance UDAF is named `var` with aliases `var_sample` / `var_samp`
+    // but not `variance`, so SELECT variance(...) hit FUNCTION_NOT_FOUND. Adding
+    // the alias resolves it to the same accumulator. (#333)
+    use datafusion::functions_aggregate::variance::var_samp_udaf;
+    let variance = (*var_samp_udaf()).clone().with_aliases(["variance"]);
+    ctx.register_udaf(variance);
+
     // max_by(x, y) / min_by(x, y) — real UDAFs that pick x at the row
     // where y is max/min. arg_max / arg_min are registered as aliases
     // (DuckDB and ClickHouse spelling). Replaces the previous scalar

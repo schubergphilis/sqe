@@ -308,7 +308,7 @@ Each section lists Trino functions with their SQE status:
 | `approx_percentile(x, p)` | `approx_percentile(x, p)` | ✅ | DataFusion's `approx_percentile_cont` UDAF re-registered with `approx_percentile` alias |
 | `stddev(x)` / `stddev_samp(x)` | Same | ✅ | |
 | `stddev_pop(x)` | Same | ✅ | |
-| `variance(x)` / `var_samp(x)` | Same | ✅ | |
+| `variance(x)` / `var_samp(x)` | Same | ✅ | DataFusion's sample-variance UDAF (`var`) re-registered with `variance` alias |
 | `var_pop(x)` | Same | ✅ | |
 | `covar_samp(y, x)` | `covar_samp(y, x)` | ✅ | |
 | `covar_pop(y, x)` | `covar_pop(y, x)` | ✅ | |
