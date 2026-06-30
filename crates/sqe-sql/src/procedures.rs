@@ -274,9 +274,10 @@ pub fn try_parse_call(stmt: &Statement) -> sqe_core::Result<Option<ProcedureCall
         return Ok(None);
     }
 
-    let args = extract_args(&func.args)?;
+    let proc_lower = proc.to_ascii_lowercase();
+    let args = extract_args(&proc_lower, &func.args)?;
 
-    match proc.to_ascii_lowercase().as_str() {
+    match proc_lower.as_str() {
         "rewrite_data_files" => parse_rewrite_data_files(args).map(Some),
         "expire_snapshots" => parse_expire_snapshots(args).map(Some),
         "remove_orphan_files" => parse_remove_orphan_files(args).map(Some),
@@ -430,10 +431,18 @@ fn split_system_name(name: &ObjectName) -> Option<(String, String)> {
     }
 }
 
-/// Extract `name => value` pairs from a `Function::args` field. Unnamed
-/// positional arguments are rejected because the Iceberg contract expects
-/// named args and silent positional acceptance is a foot-gun.
-fn extract_args(args: &FunctionArguments) -> sqe_core::Result<Vec<(String, Expr)>> {
+/// Resolve a `CALL system.<proc>(...)` argument list into the `name => value`
+/// pairs the per-procedure parsers consume.
+///
+/// Trino accepts both named (`table => 'ns.t'`) and positional
+/// (`'ns', 't', <id>`) procedure arguments, but a single CALL must be one or
+/// the other: Trino rejects any mix with "Named and positional arguments
+/// cannot be mixed", and we match that. Named args pass through. Positional
+/// args are mapped to names via `positional_spec` for the procedures whose
+/// Trino signature we have verified; folding Trino's leading `(schema, table)`
+/// pair into SQE's single `table => 'schema.table'` ref. Procedures without a
+/// verified positional signature stay named-only.
+fn extract_args(proc: &str, args: &FunctionArguments) -> sqe_core::Result<Vec<(String, Expr)>> {
     let list = match args {
         FunctionArguments::List(list) => list,
         FunctionArguments::None => return Ok(Vec::new()),
@@ -444,24 +453,21 @@ fn extract_args(args: &FunctionArguments) -> sqe_core::Result<Vec<(String, Expr)
         }
     };
 
-    let mut out = Vec::with_capacity(list.args.len());
+    let mut named = Vec::with_capacity(list.args.len());
+    let mut positional = Vec::with_capacity(list.args.len());
     for arg in &list.args {
         match arg {
             FunctionArg::Named {
                 name,
                 arg: FunctionArgExpr::Expr(expr),
                 ..
-            } => out.push((name.value.clone(), expr.clone())),
+            } => named.push((name.value.clone(), expr.clone())),
             FunctionArg::ExprNamed {
                 name: Expr::Identifier(ident),
                 arg: FunctionArgExpr::Expr(expr),
                 ..
-            } => out.push((ident.value.clone(), expr.clone())),
-            FunctionArg::Unnamed(_) => {
-                return Err(SqeError::Execution(
-                    "CALL system.* requires named arguments like `table => 'ns.t'`".to_string(),
-                ));
-            }
+            } => named.push((ident.value.clone(), expr.clone())),
+            FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => positional.push(expr.clone()),
             _ => {
                 return Err(SqeError::Execution(format!(
                     "Unsupported argument shape for CALL system.*: {arg}"
@@ -469,7 +475,113 @@ fn extract_args(args: &FunctionArguments) -> sqe_core::Result<Vec<(String, Expr)
             }
         }
     }
+
+    if !named.is_empty() && !positional.is_empty() {
+        return Err(SqeError::Execution(
+            "Named and positional arguments cannot be mixed".to_string(),
+        ));
+    }
+
+    if positional.is_empty() {
+        return Ok(named);
+    }
+    positional_to_named(proc, positional)
+}
+
+/// One positional parameter slot in a procedure's Trino signature, expressed in
+/// terms of how SQE consumes it.
+enum PosSlot {
+    /// Trino's leading `(schema_name, table_name)` pair, folded into SQE's
+    /// single `table => 'schema.table'` reference.
+    SchemaThenTable,
+    /// A single positional argument bound to the named key SQE expects.
+    Named(&'static str),
+}
+
+/// Trino positional signatures for the procedures we have verified against the
+/// Trino 465 connector source. Procedures absent here stay named-only: shipping
+/// an unverified positional order would silently bind arguments to the wrong
+/// parameter, which is worse than requiring named args.
+fn positional_spec(proc: &str) -> Option<&'static [PosSlot]> {
+    match proc {
+        // io.trino.plugin.iceberg.procedure.RollbackToSnapshotProcedure:
+        // (SCHEMA, TABLE, SNAPSHOT_ID).
+        "rollback_to_snapshot" => Some(&[PosSlot::SchemaThenTable, PosSlot::Named("snapshot_id")]),
+        _ => None,
+    }
+}
+
+/// Map positional arguments onto their procedure's named parameters.
+fn positional_to_named(
+    proc: &str,
+    exprs: Vec<Expr>,
+) -> sqe_core::Result<Vec<(String, Expr)>> {
+    let spec = positional_spec(proc).ok_or_else(|| {
+        SqeError::Execution(format!(
+            "CALL system.{proc} does not support positional arguments; use named arguments like `table => 'ns.t'`"
+        ))
+    })?;
+
+    let mut it = exprs.into_iter();
+    let mut out = Vec::new();
+    for slot in spec {
+        match slot {
+            PosSlot::SchemaThenTable => {
+                let schema = next_positional(&mut it, proc)?;
+                let table = next_positional(&mut it, proc)?;
+                let schema = expect_non_null_string(&schema, "schema")?;
+                let table = expect_non_null_string(&table, "table")?;
+                out.push(("table".to_string(), string_expr(format!("{schema}.{table}"))));
+            }
+            PosSlot::Named(key) => {
+                let expr = next_positional(&mut it, proc)?;
+                reject_null(&expr, key)?;
+                out.push(((*key).to_string(), expr));
+            }
+        }
+    }
+    if it.next().is_some() {
+        return Err(SqeError::Execution(format!(
+            "Too many positional arguments for CALL system.{proc}"
+        )));
+    }
     Ok(out)
+}
+
+fn next_positional(it: &mut std::vec::IntoIter<Expr>, proc: &str) -> sqe_core::Result<Expr> {
+    it.next().ok_or_else(|| {
+        SqeError::Execution(format!(
+            "Too few positional arguments for CALL system.{proc}"
+        ))
+    })
+}
+
+fn is_null(expr: &Expr) -> bool {
+    matches!(
+        expr,
+        Expr::Value(ValueWithSpan {
+            value: Value::Null,
+            ..
+        })
+    )
+}
+
+/// Reject a NULL positional argument with Trino's `<field> cannot be null`
+/// phrasing (asserted by testRollbackToSnapshotWithNullArgument).
+fn reject_null(expr: &Expr, field: &str) -> sqe_core::Result<()> {
+    if is_null(expr) {
+        return Err(SqeError::Execution(format!("{field} cannot be null")));
+    }
+    Ok(())
+}
+
+fn expect_non_null_string(expr: &Expr, field: &str) -> sqe_core::Result<String> {
+    reject_null(expr, field)?;
+    expect_string(expr, field)
+}
+
+fn string_expr(s: String) -> Expr {
+    Expr::Value(Value::SingleQuotedString(s).with_empty_span())
 }
 
 fn take_table(args: &mut Vec<(String, Expr)>) -> sqe_core::Result<TableRef> {
@@ -1021,6 +1133,81 @@ mod tests {
         let call = try_parse_call(&stmt).unwrap().expect("match");
         match call {
             ProcedureCall::SetCurrentSnapshot { snapshot_id, .. } => assert_eq!(snapshot_id, -42),
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    fn call_err(sql: &str) -> String {
+        let stmt = parse_first(sql);
+        try_parse_call(&stmt)
+            .err()
+            .unwrap_or_else(|| panic!("expected error for {sql}"))
+            .to_string()
+    }
+
+    #[test]
+    fn positional_rollback_to_snapshot() {
+        // Trino sends positional args (schema, table, snapshot_id). SQE folds
+        // schema+table into its single `table` ref. See issue #316.
+        let stmt = parse_first(
+            "CALL system.rollback_to_snapshot('default', 'orders', 9876543210)",
+        );
+        let call = try_parse_call(&stmt).unwrap().expect("match");
+        match call {
+            ProcedureCall::RollbackToSnapshot { table, snapshot_id } => {
+                assert_eq!(table.as_string(), "default.orders");
+                assert_eq!(snapshot_id, 9_876_543_210);
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn positional_rollback_null_args_match_trino_messages() {
+        // testRollbackToSnapshotWithNullArgument asserts these exact phrases.
+        assert!(
+            call_err("CALL system.rollback_to_snapshot(NULL, 'customer_orders', 8954597067493422955)")
+                .contains("schema cannot be null")
+        );
+        assert!(
+            call_err("CALL system.rollback_to_snapshot('testdb', NULL, 8954597067493422955)")
+                .contains("table cannot be null")
+        );
+        assert!(
+            call_err("CALL system.rollback_to_snapshot('testdb', 'customer_orders', NULL)")
+                .contains("snapshot_id cannot be null")
+        );
+    }
+
+    #[test]
+    fn mixed_named_and_positional_rejected() {
+        let err = call_err("CALL system.rollback_to_snapshot('default', table => 'orders', 1)");
+        assert!(
+            err.contains("Named and positional arguments cannot be mixed"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn positional_unsupported_procedure_errors_clearly() {
+        // A procedure without a verified Trino positional signature stays
+        // named-only; the error must name the procedure and point at named args.
+        let err = call_err("CALL system.drop_table('ns', 'orders')");
+        assert!(err.contains("drop_table"), "got: {err}");
+        assert!(err.contains("named arguments"), "got: {err}");
+    }
+
+    #[test]
+    fn named_rollback_to_snapshot_still_works() {
+        // Regression: the named form must keep working unchanged.
+        let stmt =
+            parse_first("CALL system.rollback_to_snapshot(table => 'ns.t', snapshot_id => 7)");
+        let call = try_parse_call(&stmt).unwrap().expect("match");
+        match call {
+            ProcedureCall::RollbackToSnapshot { table, snapshot_id } => {
+                assert_eq!(table.as_string(), "ns.t");
+                assert_eq!(snapshot_id, 7);
+            }
             other => panic!("unexpected variant: {other:?}"),
         }
     }
