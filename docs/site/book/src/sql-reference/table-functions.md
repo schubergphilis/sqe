@@ -52,7 +52,7 @@ Six TVFs that expose Iceberg internal state without leaving SQL. Useful for obse
 
 | TVF | Origin | Returns | Trino | Snowflake | Spark SQL |
 |---|---|---|---|---|---|
-| `table_snapshots(ns, table)` | `sqe-catalog` | One row per snapshot. Columns: `snapshot_id`, `parent_snapshot_id`, `timestamp_ms`, `operation`, `summary`. `iceberg_metadata_tvf.rs:93` | `t$snapshots` | - | `t.snapshots` |
+| `table_snapshots(ns, table)` | `sqe-catalog` | One row per snapshot, in Trino's `$snapshots` column shape. Columns: `committed_at`, `snapshot_id`, `parent_id`, `operation`, `manifest_list`, `summary`. `iceberg_metadata_tvf.rs:93` | `t$snapshots` | - | `t.snapshots` |
 | `table_history(ns, table)` | `sqe-catalog` | Linear snapshot history. Columns: `made_current_at`, `snapshot_id`, `parent_id`, `is_current_ancestor`. `iceberg_metadata_tvf.rs:356` | `t$history` | - | `t.history` |
 | `table_files(ns, table)` | `sqe-catalog` | One row per data file in the current snapshot. Columns: `content`, `file_path`, `partition`, `record_count`, `file_size_in_bytes`. `iceberg_metadata_tvf.rs:469` | `t$files` | - | `t.files` |
 | `table_manifests(ns, table)` | `sqe-catalog` | One row per manifest in the current snapshot. `iceberg_metadata_tvf.rs:217` | `t$manifests` | - | `t.manifests` |
@@ -94,7 +94,7 @@ SELECT
     summary['added-files-size'] AS added_bytes,
     summary['total-files-size'] AS total_bytes
 FROM table_snapshots('analytics', 'events')
-ORDER BY timestamp_ms DESC
+ORDER BY committed_at DESC
 LIMIT 10;
 ```
 
