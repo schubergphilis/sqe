@@ -104,6 +104,7 @@ Connection conn = DriverManager.getConnection(url, props);
 - Prepared statements are not supported via the Trino protocol.
 - Transaction control (`START TRANSACTION`, `COMMIT`) is not supported. Queries execute in auto-commit mode.
 - Type mapping covers common types; complex nested types may differ from native Trino behavior.
+- Materialized views are not supported. `CREATE MATERIALIZED VIEW` returns a clear "not supported" error rather than creating a plain view. `DROP MATERIALIZED VIEW IF EXISTS` is treated as a no-op so client tooling that issues it on teardown can proceed.
 
 ## Flight SQL vs Trino HTTP
 
