@@ -2,6 +2,7 @@ pub mod attach;
 pub mod catalog_qualifiers;
 pub mod classifier;
 pub mod ddl;
+pub mod paren_less_values;
 pub mod partition;
 pub mod partition_evolution;
 pub mod pipeline_types;
@@ -22,6 +23,7 @@ pub use classifier::{
     ShowGrantsTarget, StatementKind,
 };
 pub use ddl::{try_parse_ref_ddl, BranchRetention, RefDdl};
+pub use paren_less_values::rewrite_paren_less_values;
 pub use partition::normalize_partitioned_by;
 pub use pipeline_types::{pre_parse_pipeline, ClassifiableSql, UserSql};
 pub use partition_evolution::{try_parse_partition_evolution, PartitionEvolution};

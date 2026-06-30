@@ -520,6 +520,28 @@ pub(crate) fn iceberg_error_is_forbidden(e: &iceberg::Error) -> bool {
     rendered.contains("403") || rendered.contains("forbidden")
 }
 
+/// Wrap a catalog list/get failure, classifying a Forbidden (403) answer as
+/// [`sqe_core::SqeErrorCode::AccessDenied`] even when the status surfaces only
+/// in the error's Debug rendering (the Display string the message-based
+/// classifier sees can omit it, e.g. Polaris' `not authorized for op
+/// 'LIST_TABLES'`). This lets the metadata-sweep enumerators reliably skip
+/// namespaces the principal cannot list rather than log-spamming WARN (#318).
+fn classify_listing_error(context: &str, e: iceberg::Error) -> SqeError {
+    let message = format!("{context}: {e}");
+    if iceberg_error_is_forbidden(&e) {
+        SqeError::sourced(sqe_core::SqeErrorCode::AccessDenied, message, e)
+    } else {
+        SqeError::catalog_src(message, e)
+    }
+}
+
+/// True when a catalog listing error means the principal is not authorized to
+/// see that catalog/namespace (a 403). Enumerators skip such namespaces
+/// quietly; any other error is still surfaced/logged.
+pub(crate) fn listing_error_is_forbidden(e: &SqeError) -> bool {
+    e.error_code() == sqe_core::SqeErrorCode::AccessDenied
+}
+
 impl SessionCatalog {
     /// Create a new per-session catalog configured with the user's bearer token.
     ///
@@ -971,7 +993,7 @@ impl SessionCatalog {
             .map_err(sqe_core::SqeError::Catalog)?;
         let started = Instant::now();
         let result = dispatch_catalog!(self.inner, list_namespaces(None))
-            .map_err(|e| sqe_core::SqeError::catalog_src(format!("Failed to list namespaces: {e}"), e));
+            .map_err(|e| classify_listing_error("Failed to list namespaces", e));
         self.record_breaker_outcome(&result);
         self.record_catalog_call("list_namespaces", started, result.is_ok());
         result
@@ -990,7 +1012,7 @@ impl SessionCatalog {
             "Getting namespace"
         );
         dispatch_catalog!(self.inner, get_namespace(namespace))
-            .map_err(|e| sqe_core::SqeError::catalog_src(format!("Failed to get namespace: {e}"), e))
+            .map_err(|e| classify_listing_error("Failed to get namespace", e))
     }
 
     /// True when the backend is the REST/Polaris variant — the only backend
@@ -1048,7 +1070,7 @@ impl SessionCatalog {
             .map_err(sqe_core::SqeError::Catalog)?;
         let started = Instant::now();
         let result = dispatch_catalog!(self.inner, list_tables(namespace))
-            .map_err(|e| sqe_core::SqeError::catalog_src(format!("Failed to list tables: {e}"), e));
+            .map_err(|e| classify_listing_error("Failed to list tables", e));
         self.record_breaker_outcome(&result);
         self.record_catalog_call("list_tables", started, result.is_ok());
         result
@@ -1937,5 +1959,47 @@ mod cache_capacity_tests {
         )
         .with_context("status", "401 Unauthorized");
         assert!(!iceberg_error_is_forbidden(&unauthorized));
+    }
+
+    /// A 403 whose status shows only in the Debug rendering (not the Display
+    /// string the message-based classifier sees) must still be classified
+    /// AccessDenied, so metadata-sweep enumerators skip it quietly (#318).
+    #[test]
+    fn classify_listing_error_marks_forbidden_as_access_denied() {
+        let e = iceberg::Error::new(
+            iceberg::ErrorKind::Unexpected,
+            "Received response with unexpected status code",
+        )
+        .with_context("status", "403 Forbidden");
+        let wrapped = super::classify_listing_error("Failed to list tables", e);
+        assert_eq!(wrapped.error_code(), sqe_core::SqeErrorCode::AccessDenied);
+        assert!(super::listing_error_is_forbidden(&wrapped));
+    }
+
+    /// Polaris' typed `not authorized for op 'LIST_TABLES'` answer carries the
+    /// 403 in a context entry; it must classify as AccessDenied too.
+    #[test]
+    fn classify_listing_error_handles_polaris_not_authorized_shape() {
+        let e = iceberg::Error::new(
+            iceberg::ErrorKind::DataInvalid,
+            "Principal 'energyco-viewer' is not authorized for op 'LIST_TABLES' on namespace ontology",
+        )
+        .with_context("type", "NotAuthorizedException")
+        .with_context("code", "403");
+        let wrapped = super::classify_listing_error("Failed to list tables", e);
+        assert!(super::listing_error_is_forbidden(&wrapped));
+    }
+
+    /// A genuine failure (5xx / timeout) is NOT forbidden: enumerators still
+    /// surface it (WARN), they do not silently drop the namespace.
+    #[test]
+    fn classify_listing_error_keeps_server_errors_non_forbidden() {
+        let e = iceberg::Error::new(
+            iceberg::ErrorKind::Unexpected,
+            "Received response with unexpected status code",
+        )
+        .with_context("status", "500 Internal Server Error");
+        let wrapped = super::classify_listing_error("Failed to list tables", e);
+        assert!(!super::listing_error_is_forbidden(&wrapped));
     }
 }
