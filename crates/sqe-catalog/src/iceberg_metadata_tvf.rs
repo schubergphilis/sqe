@@ -39,9 +39,9 @@
 
 use std::sync::Arc;
 
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use arrow_array::builder::{Int64Builder, StringBuilder};
-use arrow_array::{ArrayRef, RecordBatch};
+use arrow_array::{ArrayRef, RecordBatch, TimestampMillisecondArray};
 use async_trait::async_trait;
 use datafusion::catalog::{Session, TableFunctionImpl, TableProvider};
 use datafusion::common::{plan_err, ScalarValue};
@@ -171,16 +171,27 @@ fn parse_two_string_args(fn_name: &str, exprs: &[Expr]) -> DFResult<(String, Str
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Schema for `table_snapshots()` output.
+///
+/// Matches Trino's `$snapshots` metadata table: column names, order, and the
+/// `committed_at` timestamp type, so Trino/Iceberg clients that reference
+/// `committed_at` / `parent_id` resolve them (#320). The previous schema
+/// exposed iceberg-rust's raw field names (`parent_snapshot_id`,
+/// `timestamp_ms`) plus engine-internal extras (`sequence_number`,
+/// `is_current_snapshot`) that no Trino client expects. Trino types `summary`
+/// as `map(varchar, varchar)`; SQE emits a compact JSON string, the one
+/// remaining shape difference.
 fn snapshots_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
+        Field::new(
+            "committed_at",
+            DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())),
+            false,
+        ),
         Field::new("snapshot_id", DataType::Int64, false),
-        Field::new("parent_snapshot_id", DataType::Int64, true),
-        Field::new("sequence_number", DataType::Int64, false),
-        Field::new("timestamp_ms", DataType::Int64, false),
+        Field::new("parent_id", DataType::Int64, true),
         Field::new("operation", DataType::Utf8, false),
         Field::new("manifest_list", DataType::Utf8, false),
         Field::new("summary", DataType::Utf8, false),
-        Field::new("is_current_snapshot", DataType::Boolean, false),
     ]))
 }
 
@@ -212,28 +223,25 @@ impl TableFunctionImpl for TableSnapshotsFunction {
 
 fn build_snapshots_batch(table: &Table, schema: &SchemaRef) -> DFResult<RecordBatch> {
     let metadata = table.metadata();
-    let current_snapshot_id = metadata.current_snapshot_id();
 
+    // committed_at is built as a Vec of epoch-millis and finished into a
+    // timezone-stamped TimestampMillisecondArray to match the schema's UTC tz.
+    let mut committed_at_ms: Vec<i64> = Vec::new();
     let mut snapshot_id_b = Int64Builder::new();
     let mut parent_id_b = Int64Builder::new();
-    let mut sequence_b = Int64Builder::new();
-    let mut timestamp_ms_b = Int64Builder::new();
     let mut operation_b = StringBuilder::new();
     let mut manifest_list_b = StringBuilder::new();
     let mut summary_b = StringBuilder::new();
-    let mut is_current_b = arrow_array::builder::BooleanBuilder::new();
 
     for snap in metadata.snapshots() {
-        let sid = snap.snapshot_id();
-        snapshot_id_b.append_value(sid);
+        committed_at_ms.push(snap.timestamp_ms());
+        snapshot_id_b.append_value(snap.snapshot_id());
 
         match snap.parent_snapshot_id() {
             Some(pid) => parent_id_b.append_value(pid),
             None => parent_id_b.append_null(),
         }
 
-        sequence_b.append_value(snap.sequence_number());
-        timestamp_ms_b.append_value(snap.timestamp_ms());
         operation_b.append_value(snap.summary().operation.as_str());
         manifest_list_b.append_value(snap.manifest_list());
 
@@ -250,21 +258,19 @@ fn build_snapshots_batch(table: &Table, schema: &SchemaRef) -> DFResult<RecordBa
                 .collect();
             summary_b.append_value(format!("{{{}}}", pairs.join(",")));
         }
-
-        is_current_b.append_value(current_snapshot_id == Some(sid));
     }
+
+    let committed_at = TimestampMillisecondArray::from(committed_at_ms).with_timezone("UTC");
 
     let batch = RecordBatch::try_new(
         schema.clone(),
         vec![
+            Arc::new(committed_at) as ArrayRef,
             Arc::new(snapshot_id_b.finish()) as ArrayRef,
             Arc::new(parent_id_b.finish()) as ArrayRef,
-            Arc::new(sequence_b.finish()) as ArrayRef,
-            Arc::new(timestamp_ms_b.finish()) as ArrayRef,
             Arc::new(operation_b.finish()) as ArrayRef,
             Arc::new(manifest_list_b.finish()) as ArrayRef,
             Arc::new(summary_b.finish()) as ArrayRef,
-            Arc::new(is_current_b.finish()) as ArrayRef,
         ],
     )?;
 
@@ -922,36 +928,40 @@ mod tests {
     #[test]
     fn test_snapshots_schema_column_count() {
         let schema = snapshots_schema();
-        assert_eq!(schema.fields().len(), 8);
+        assert_eq!(schema.fields().len(), 6);
     }
 
     #[test]
-    fn test_snapshots_schema_column_names() {
+    fn test_snapshots_schema_matches_trino_columns() {
+        // Trino's $snapshots column names and order (#320).
         let schema = snapshots_schema();
         let expected = [
+            "committed_at",
             "snapshot_id",
-            "parent_snapshot_id",
-            "sequence_number",
-            "timestamp_ms",
+            "parent_id",
             "operation",
             "manifest_list",
             "summary",
-            "is_current_snapshot",
         ];
         for (i, name) in expected.iter().enumerate() {
             assert_eq!(schema.field(i).name(), *name, "snapshots column {i}");
         }
+        // committed_at is a UTC-stamped millisecond timestamp, matching Trino's
+        // timestamp(3) with time zone (not raw epoch millis).
+        assert_eq!(
+            schema.field(0).data_type(),
+            &DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())),
+        );
     }
 
     #[test]
     fn test_snapshots_schema_nullability() {
         let schema = snapshots_schema();
-        // snapshot_id must be non-null
-        assert!(!schema.field(0).is_nullable(), "snapshot_id must be non-null");
-        // parent_snapshot_id must be nullable (root snapshots have no parent)
-        assert!(schema.field(1).is_nullable(), "parent_snapshot_id must be nullable");
-        // is_current_snapshot must be non-null
-        assert!(!schema.field(7).is_nullable(), "is_current_snapshot must be non-null");
+        // committed_at and snapshot_id must be non-null.
+        assert!(!schema.field(0).is_nullable(), "committed_at must be non-null");
+        assert!(!schema.field(1).is_nullable(), "snapshot_id must be non-null");
+        // parent_id must be nullable (root snapshots have no parent).
+        assert!(schema.field(2).is_nullable(), "parent_id must be nullable");
     }
 
     // ── manifests_schema ─────────────────────────────────────────────────────

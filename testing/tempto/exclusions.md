@@ -4,6 +4,27 @@ Upstream group: `io.trino.tests.product.iceberg` at trino tag 465.
 Run model: curated allow-list (`allowlist.txt`). Everything not on the
 allow-list is excluded for one of the reasons below.
 
+## Full-package sweep (2026-06-30)
+
+Ran the entire `io.trino.tests.product.iceberg` package against SQE (389 tests,
+4 passed) and harvested the distinct SQE-reported errors. Most failures are
+harness-side (tests need a `hive`/`tpch` catalog or Spark/Hive setup this stack
+does not provide -- e.g. `unknown catalog 'hive'`). The genuine SQE Trino-compat
+gaps below were each re-confirmed with a direct curl against the `iceberg`
+catalog. Filed as their own issues:
+
+| Gap | Repro (iceberg catalog) | SQE error |
+|---|---|---|
+| ROW / struct types | `CREATE TABLE t(c ROW(a integer, b varchar))` ; `CAST(row('x') AS row(field real))` | `SQL type not supported for CREATE TABLE: ROW(...)` / parser `Expected: <, found: (` |
+| CTAS `WITH [NO] DATA` | `CREATE TABLE t AS SELECT 1 a WITH DATA` | `Parse error: Expected: end of statement, found: WITH` |
+| Session properties | `SET SESSION iceberg.compression_codec = 'ZSTD'` ; `SHOW SESSION LIKE '...'` | `Utility statement not supported: SET SESSION ...` / `SHOW LIKE` |
+| Materialized views | `DROP MATERIALIZED VIEW IF EXISTS t` | `Utility statement not supported: DROP MATERIALIZED VIEW` |
+| Iceberg hidden columns | `SELECT "$path" FROM t` | `Schema error: No field named "$path"` |
+| UUID literal / write | `SELECT UUID '...'` ; CTAS of a uuid value | `Unsupported SQL type UUID` (note: a `uuid` column type and `CAST(... AS uuid)` in a bare SELECT parse OK) |
+
+The `$snapshots` metadata-table column-shape gap (issue #320) was found the same
+way (Trino `committed_at`/`parent_id` vs SQE `timestamp_ms`/`parent_snapshot_id`).
+
 ## Headline finding (2026-06-29): SQE rejects all DDL/update over the Trino 465 JDBC client
 
 **FIXED (issue #314):** `build_page_response` now emits `data: None` when the
@@ -42,6 +63,11 @@ from main, 2026-06-30): 2 SUCCEEDED / 1 FAILED against SQE.**
   implement `FETCH FIRST ... WITH TIES` (Trino supports it). The `$snapshots`
   read and positional `rollback_to_snapshot` CALL both work now. This is the
   next compatibility finding (candidate for its own issue).
+
+**After #319 (FETCH ... WITH TIES) merged (2026-06-30):** the FETCH error is gone;
+`testRollbackToSnapshot` then failed one layer deeper on the `$snapshots`
+metadata-table column shape (filed as #320). Allow-list stays 2/3 on SQE. The
+full-package sweep above was run from this state.
 
 Verified both directions on 2026-06-29 with the curated allow-list (3 tests:
 `testIcebergConcurrentInsert`, `testRollbackToSnapshot`,

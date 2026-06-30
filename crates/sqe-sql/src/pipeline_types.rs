@@ -73,5 +73,9 @@ pub fn pre_parse_pipeline(sql: &UserSql) -> sqe_core::Result<ClassifiableSql> {
     let (stripped, _incremental) = crate::time_travel::extract_incremental_spec(sql.as_str())?;
     let (stripped, _version) = crate::time_travel::extract_time_travel_spec(&stripped)?;
     let normalized = crate::partition::normalize_partitioned_by(&stripped);
+    // Trino CTAS modifiers sqlparser rejects: `WITH [NO] DATA` suffix (#322)
+    // and the identifier-only column-alias list (#328). Parse-gated, so a no-op
+    // for SQL that already parses.
+    let normalized = crate::ctas_compat::rewrite_ctas_compat(&normalized);
     Ok(ClassifiableSql::from_normalized(normalized))
 }
