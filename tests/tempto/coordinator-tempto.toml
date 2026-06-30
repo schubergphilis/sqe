@@ -1,0 +1,39 @@
+# SQE coordinator config for the tempto compatibility stack.
+# Single-node (no workers). The single [catalog] block surfaces to SQL as
+# catalog "iceberg" (Config::LEGACY_CATALOG_NAME), which is what the upstream
+# Iceberg product-tests hardcode. Warehouse stays test_warehouse so the
+# existing scripts/bootstrap-test.sh applies unchanged.
+[coordinator]
+flight_sql_port = 50051
+trino_http_port = 8080
+worker_urls = []
+allow_unauthenticated_workers = true
+
+[metrics]
+prometheus_port = 9090
+
+[auth]
+token_endpoint = "http://polaris:8181/api/catalog/v1/oauth/tokens"
+client_id = "root"
+client_secret = "s3cr3t"
+
+[catalog]
+catalog_url = "http://polaris:8181/api/catalog"
+warehouse = "test_warehouse"
+
+[storage]
+s3_endpoint = "http://rustfs:9000"
+s3_access_key = "s3admin"
+s3_secret_key = "s3admin"
+s3_region = "us-east-1"
+s3_path_style = true
+
+[query_cache]
+enabled = true
+max_memory_mb = 128
+max_entry_mb = 5
+ttl_secs = 300
+
+[query_history]
+max_entries = 10000
+ttl_secs = 1800
