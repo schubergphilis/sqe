@@ -552,6 +552,101 @@ fn extract_header(headers: &HeaderMap, name: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// Parse the catalog session properties the client carries in `X-Trino-Session`
+/// (the values it replays after a `SET SESSION`). The header is a
+/// comma-separated list of `name=value` pairs, possibly split across multiple
+/// header lines. Used to answer `SHOW SESSION`. (#323)
+fn incoming_session_properties(headers: &HeaderMap) -> Vec<(String, String)> {
+    let mut props = Vec::new();
+    for value in headers.get_all("x-trino-session") {
+        let Ok(raw) = value.to_str() else { continue };
+        for pair in raw.split(',') {
+            let pair = pair.trim();
+            if pair.is_empty() {
+                continue;
+            }
+            if let Some((name, val)) = pair.split_once('=') {
+                props.push((name.trim().to_string(), val.trim().to_string()));
+            }
+        }
+    }
+    props
+}
+
+/// Match a value against a Trino `LIKE` pattern (`%` = any sequence, `_` = any
+/// single char). Used to filter `SHOW SESSION LIKE '...'`. Case-sensitive,
+/// matching Trino's session-property names.
+fn like_match(value: &str, pattern: &str) -> bool {
+    // Anchored glob match via classic dynamic programming over chars.
+    let v: Vec<char> = value.chars().collect();
+    let p: Vec<char> = pattern.chars().collect();
+    let (n, m) = (v.len(), p.len());
+    let mut dp = vec![vec![false; m + 1]; n + 1];
+    dp[0][0] = true;
+    for j in 1..=m {
+        if p[j - 1] == '%' {
+            dp[0][j] = dp[0][j - 1];
+        }
+    }
+    for i in 1..=n {
+        for j in 1..=m {
+            dp[i][j] = match p[j - 1] {
+                '%' => dp[i - 1][j] || dp[i][j - 1],
+                '_' => dp[i - 1][j - 1],
+                c => dp[i - 1][j - 1] && v[i - 1] == c,
+            };
+        }
+    }
+    dp[n][m]
+}
+
+/// Build the `SHOW SESSION` result set in Trino's column shape
+/// (`Name, Value, Default, Type, Description`), one row per current session
+/// property, filtered by an optional `LIKE` pattern on the name. (#323)
+fn build_show_session_batches(
+    props: &[(String, String)],
+    like: Option<&str>,
+) -> Vec<arrow_array::RecordBatch> {
+    use arrow_array::StringArray;
+    use arrow_schema::{DataType, Field, Schema};
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("Name", DataType::Utf8, false),
+        Field::new("Value", DataType::Utf8, true),
+        Field::new("Default", DataType::Utf8, true),
+        Field::new("Type", DataType::Utf8, true),
+        Field::new("Description", DataType::Utf8, true),
+    ]));
+
+    let (mut names, mut values) = (Vec::new(), Vec::new());
+    for (name, value) in props {
+        if let Some(pat) = like {
+            if !like_match(name, pat) {
+                continue;
+            }
+        }
+        names.push(name.clone());
+        values.push(value.clone());
+    }
+    let row_count = names.len();
+    let empty: Vec<Option<String>> = vec![None; row_count];
+
+    let batch = arrow_array::RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(names)),
+            Arc::new(StringArray::from(values)),
+            Arc::new(StringArray::from(empty.clone())),
+            Arc::new(StringArray::from(empty.clone())),
+            Arc::new(StringArray::from(empty)),
+        ],
+    );
+    match batch {
+        Ok(b) => vec![b],
+        Err(_) => vec![],
+    }
+}
+
 /// Apply extracted Trino headers to a session (catalog, schema, source).
 fn apply_trino_headers(session: Session, trino_headers: &TrinoClientHeaders) -> Session {
     session
@@ -770,36 +865,46 @@ async fn submit_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
 
     let session_update = protocol::parse_session_statement(sql);
 
-    // PREPARE / DEALLOCATE PREPARE are session-control statements with no
-    // result set: they register (or forget) the prepared SQL purely via the
-    // x-trino-added-prepare / x-trino-deallocated-prepare response headers, and
-    // must NOT be sent to the executor (the SQL parser rejects Trino's
-    // `PREPARE <name> FROM <sql>` form). This is the Metabase/JDBC connect gate:
-    // the driver issues PREPARE before any query. (#1)
+    // Session-control statements with no result set are driven purely by
+    // response headers and must NOT be sent to the executor (the SQL parser
+    // rejects them):
+    //   - PREPARE / DEALLOCATE PREPARE register/forget prepared SQL via
+    //     x-trino-added-prepare / x-trino-deallocated-prepare. This is the
+    //     Metabase/JDBC connect gate: the driver issues PREPARE before any
+    //     query. (#1)
+    //   - SET SESSION / RESET SESSION set/clear catalog session properties via
+    //     x-trino-set-session / x-trino-clear-session. SQE has no tunable
+    //     session-property registry, so these are accept-and-echo: the client's
+    //     value round-trips in X-Trino-Session and surfaces in SHOW SESSION,
+    //     and the executor (which would reject "SET SESSION ...") is bypassed.
+    //     (#323)
+    // USE / SET CATALOG (set_catalog / set_schema only) are left to fall
+    // through: the executor handles them and the headers are applied after.
     if let Some(ref update) = session_update {
-        if !update.added_prepare.is_empty() || !update.deallocated_prepare.is_empty() {
+        let update_type = if !update.added_prepare.is_empty() {
+            Some("PREPARE")
+        } else if !update.deallocated_prepare.is_empty() {
+            Some("DEALLOCATE")
+        } else if !update.set_session.is_empty() {
+            Some("SET SESSION")
+        } else if !update.clear_session.is_empty() {
+            Some("RESET SESSION")
+        } else {
+            None
+        };
+        if let Some(update_type) = update_type {
             let response = TrinoResponse {
                 id: query_id.clone(),
                 info_uri: Some(info_uri(&base_url, &query_id)),
                 stats: TrinoStats::finished(),
                 // Non-null (empty) columns: the field is skip_serializing_if
                 // None, so omitting it makes the JDBC driver see `columns: null`
-                // and getColumns() throws. Real Trino returns [] for PREPARE, so
-                // the driver builds a 0-column ResultSet and (with updateType
-                // set) treats it as a non-query — letting prepareStatement and
-                // the connection test succeed.
+                // and getColumns() throws. Real Trino returns [] for these
+                // non-query statements, so the driver builds a 0-column
+                // ResultSet and (with updateType set) treats it as a completed
+                // update rather than waiting for a result set.
                 columns: Some(vec![]),
-                // Trino marks these non-query statements with an updateType so
-                // JDBC clients treat the response as a completed update rather
-                // than waiting for a result set.
-                update_type: Some(
-                    if !update.added_prepare.is_empty() {
-                        "PREPARE"
-                    } else {
-                        "DEALLOCATE"
-                    }
-                    .to_string(),
-                ),
+                update_type: Some(update_type.to_string()),
                 ..Default::default()
             };
             let mut resp = (StatusCode::OK, Json(response)).into_response();
@@ -877,6 +982,13 @@ async fn submit_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
                 "Prepared statement not found: {name}"
             ))),
         }
+    } else if let Some(like) = protocol::parse_show_session(exec_sql) {
+        // SHOW SESSION [LIKE ...]: surface the session properties the client
+        // currently carries (replayed in X-Trino-Session), filtered by LIKE,
+        // in Trino's column shape. SQE has no tunable-property registry, so
+        // Default/Type/Description are reported empty. (#323)
+        let props = incoming_session_properties(&headers);
+        Ok(build_show_session_batches(&props, like.as_deref()))
     } else {
         state.query_handler.execute(&session, exec_sql).await
     };
@@ -1346,6 +1458,114 @@ mod tests {
             auth_rate_limiter: None,
             expose_version: true,
         })
+    }
+
+    #[test]
+    fn like_match_handles_wildcards() {
+        assert!(like_match("iceberg.compression_codec", "iceberg.compression_codec"));
+        assert!(like_match("iceberg.compression_codec", "iceberg.%"));
+        assert!(like_match("iceberg.compression_codec", "%codec"));
+        assert!(like_match("abc", "a_c"));
+        assert!(!like_match("iceberg.x", "hive.%"));
+        assert!(!like_match("abc", "a_"));
+        assert!(like_match("", "%"));
+    }
+
+    #[test]
+    fn incoming_session_properties_parses_comma_list() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-trino-session",
+            "iceberg.compression_codec=ZSTD, query_max_run_time=1h".parse().unwrap(),
+        );
+        let props = incoming_session_properties(&headers);
+        assert_eq!(
+            props,
+            vec![
+                ("iceberg.compression_codec".to_string(), "ZSTD".to_string()),
+                ("query_max_run_time".to_string(), "1h".to_string()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn submit_set_session_echoes_via_header_without_executing() {
+        // SET SESSION must NOT reach the executor (which rejects "SET SESSION
+        // ..." as an unsupported utility statement). It returns 200 +
+        // x-trino-set-session header the client replays, with updateType set.
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let state = recording_state(seen.clone());
+
+        let resp = submit_query::<MockAuthOk, RecordingQuery>(
+            State(state),
+            test_peer(),
+            basic_auth_header("alice", "pw"),
+            "SET SESSION iceberg.compression_codec = 'ZSTD'".to_string(),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "SET SESSION must not be sent to the executor"
+        );
+        let hdr = resp
+            .headers()
+            .get("x-trino-set-session")
+            .expect("x-trino-set-session header")
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(hdr, "iceberg.compression_codec='ZSTD'");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let tr: TrinoResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(tr.update_type.as_deref(), Some("SET SESSION"));
+        assert_eq!(tr.columns.map(|c| c.len()), Some(0));
+    }
+
+    #[tokio::test]
+    async fn submit_show_session_returns_current_properties() {
+        // SHOW SESSION surfaces the properties the client carries in
+        // X-Trino-Session, filtered by LIKE, without hitting the executor.
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let state = recording_state(seen.clone());
+
+        let mut headers = basic_auth_header("alice", "pw");
+        headers.insert(
+            "x-trino-session",
+            "iceberg.compression_codec=ZSTD, query_max_run_time=1h".parse().unwrap(),
+        );
+
+        let resp = submit_query::<MockAuthOk, RecordingQuery>(
+            State(state),
+            test_peer(),
+            headers,
+            "SHOW SESSION LIKE 'iceberg.compression_codec'".to_string(),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "SHOW SESSION must not be sent to the executor"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let tr: TrinoResponse = serde_json::from_slice(&body).unwrap();
+        // Trino's 5-column shape.
+        let cols: Vec<String> = tr
+            .columns
+            .expect("columns")
+            .into_iter()
+            .map(|c| c.name)
+            .collect();
+        assert_eq!(cols, vec!["Name", "Value", "Default", "Type", "Description"]);
+        // Exactly the LIKE-matched property, with its value.
+        let data = tr.data.expect("data");
+        assert_eq!(data.len(), 1, "LIKE filter keeps one property: {data:?}");
+        assert_eq!(data[0][0], serde_json::json!("iceberg.compression_codec"));
+        assert_eq!(data[0][1], serde_json::json!("ZSTD"));
     }
 
     #[tokio::test]
