@@ -1074,13 +1074,20 @@ fn rewrite_fetch_with_ties(query: &mut Query, quantity: Option<Expr>) -> bool {
     };
 
     let names_str = out_names.join(", ");
+    // Order the outer query by the synthetic rank, not the original order key:
+    // the inner subquery projects only `out_names + __sqe_ties_rank`, so the
+    // order column (e.g. `committed_at` in `SELECT snapshot_id ... ORDER BY
+    // committed_at`) is not exposed and `ORDER BY committed_at` here would fail
+    // resolution. `RANK()` is monotonic with the order key (it carries the
+    // ASC/DESC/NULLS direction from `order_str` into its OVER clause), so
+    // ordering by the rank reproduces the user's ordering; within-tie order is
+    // unspecified under WITH TIES regardless. See #319.
     let wrap_sql = format!(
         "SELECT {names} FROM ({inner}) AS __sqe_ties \
-         WHERE __sqe_ties_rank <= {n} ORDER BY {order}",
+         WHERE __sqe_ties_rank <= {n} ORDER BY __sqe_ties_rank",
         names = names_str,
         inner = inner_query,
         n = quantity,
-        order = order_str,
     );
     let Ok(mut stmts) = Parser::parse_sql(&GenericDialect {}, &wrap_sql) else {
         return false;
@@ -1332,6 +1339,11 @@ mod tests {
 
     #[test]
     fn fetch_with_ties_becomes_rank_subquery() {
+        // This is the exact failing shape from #319: the ORDER BY column
+        // (`committed_at`) is NOT in the SELECT list (`snapshot_id`). The inner
+        // subquery only projects `snapshot_id` + the rank, so the outer ORDER BY
+        // must reference the rank, not `committed_at` (which would fail to
+        // resolve against the subquery and re-break testRollbackToSnapshot).
         let out = rewrite_trino_compat(
             "SELECT snapshot_id FROM t WHERE p IS NOT NULL ORDER BY committed_at FETCH FIRST 1 ROW WITH TIES",
         );
@@ -1342,6 +1354,19 @@ mod tests {
         // The original predicate and projection survive.
         assert!(lower.contains("snapshot_id"), "projection kept: {out}");
         assert!(lower.contains("p is not null"), "WHERE kept: {out}");
+        // Regression guard (#319): the outer ORDER BY rides on the synthetic
+        // rank column, which the subquery exposes; it must not order by the
+        // dropped order key. `committed_at` still appears once inside RANK's
+        // OVER clause, so assert the outer ordering specifically.
+        assert!(
+            lower.contains("order by __sqe_ties_rank"),
+            "outer ORDER BY uses the rank, not the dropped order column: {out}"
+        );
+        assert_eq!(
+            lower.matches("committed_at").count(),
+            1,
+            "committed_at appears only inside RANK's OVER, not the outer ORDER BY: {out}"
+        );
     }
 
     #[test]
