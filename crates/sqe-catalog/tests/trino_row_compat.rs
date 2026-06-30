@@ -98,6 +98,50 @@ async fn fetch_first_only_executes_as_limit() {
 }
 
 #[tokio::test]
+async fn uuid_literal_executes_as_string() {
+    // #326: `UUID '...'` is rejected by DataFusion ("Unsupported SQL type
+    // UUID"). The compat rewrite turns it into a plain string literal (SQE
+    // stores UUID as Utf8), so it plans and executes as a string column.
+    let dt = rewrite_and_run("SELECT UUID 'bdeb4567-89ab-cdef-0123-456789abcdef'").await;
+    assert!(dt.starts_with("Utf8"), "UUID literal should yield a Utf8 column, got: {dt}");
+}
+
+#[tokio::test]
+async fn cast_as_uuid_executes_as_string() {
+    // #326: CAST(.. AS uuid) is likewise rejected by DataFusion; the compat
+    // rewrite maps it to VARCHAR. Locks in that the read path works.
+    let dt = rewrite_and_run("SELECT CAST('bdeb4567-89ab-cdef-0123-456789abcdef' AS uuid)").await;
+    assert!(dt.starts_with("Utf8"), "CAST AS uuid should yield a Utf8 column, got: {dt}");
+}
+
+#[tokio::test]
+async fn ctas_with_uuid_value_materializes() {
+    // #326: the issue's CTAS repro -- materialize a uuid value via CTAS. The
+    // CAST(.. AS uuid) rewrite makes it a Utf8 column, which the (in-memory)
+    // CTAS path writes without hitting "Unsupported SQL type UUID".
+    use datafusion::arrow::array::StringViewArray;
+    let ctx = SessionContext::new();
+    let ctas = rewrite_trino_compat(
+        "CREATE TABLE u AS SELECT CAST('bdeb4567-89ab-cdef-0123-456789abcdef' AS uuid) c",
+    );
+    ctx.sql(&ctas)
+        .await
+        .unwrap_or_else(|e| panic!("planning failed for `{ctas}`: {e}"))
+        .collect()
+        .await
+        .unwrap_or_else(|e| panic!("CTAS execution failed for `{ctas}`: {e}"));
+    let batches = ctx.sql("SELECT c FROM u").await.unwrap().collect().await.unwrap();
+    // CAST(.. AS varchar) yields a Utf8View column; the uuid is stored as its
+    // string representation.
+    let col = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringViewArray>()
+        .expect("uuid stored as a string-view column");
+    assert_eq!(col.value(0), "bdeb4567-89ab-cdef-0123-456789abcdef");
+}
+
+#[tokio::test]
 async fn row_constructor_executes_as_struct() {
     // SELECT ROW(1, 'a', true) -> struct(1, 'a', true): a struct column.
     let dt = rewrite_and_run("SELECT ROW(1, 'a', true)").await;
