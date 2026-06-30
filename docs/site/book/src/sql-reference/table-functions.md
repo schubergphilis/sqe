@@ -94,7 +94,7 @@ SELECT
     summary['added-files-size'] AS added_bytes,
     summary['total-files-size'] AS total_bytes
 FROM table_snapshots('analytics', 'events')
-ORDER BY timestamp_ms DESC
+ORDER BY committed_at DESC
 LIMIT 10;
 ```
 
