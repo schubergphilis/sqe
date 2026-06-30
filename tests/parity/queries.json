@@ -1,0 +1,16 @@
+{
+  "count_lineitem": "SELECT count(*) FROM lineitem",
+  "count_orders": "SELECT count(*) FROM orders",
+  "sum_revenue": "SELECT round(sum(extendedprice*(1-discount)),2) FROM lineitem",
+  "distinct_count": "SELECT count(DISTINCT orderkey) FROM lineitem",
+  "q1_pricing_summary": "SELECT returnflag,linestatus,sum(quantity) sq,sum(extendedprice) sp,count(*) c FROM lineitem WHERE shipdate<=DATE '1998-09-02' GROUP BY returnflag,linestatus ORDER BY returnflag,linestatus",
+  "q6_revenue": "SELECT round(sum(extendedprice*discount),2) rev FROM lineitem WHERE shipdate>=DATE '1994-01-01' AND shipdate<DATE '1995-01-01' AND discount BETWEEN 0.05 AND 0.07 AND quantity<24",
+  "join_cust_orders": "SELECT c.mktsegment,count(*) FROM customer c JOIN orders o ON c.custkey=o.custkey GROUP BY c.mktsegment ORDER BY 1",
+  "q3_shipping": "SELECT o.orderkey,round(sum(l.extendedprice*(1-l.discount)),2) rev,o.orderdate FROM customer c JOIN orders o ON c.custkey=o.custkey JOIN lineitem l ON l.orderkey=o.orderkey WHERE c.mktsegment='BUILDING' AND o.orderdate<DATE '1995-03-15' AND l.shipdate>DATE '1995-03-15' GROUP BY o.orderkey,o.orderdate ORDER BY rev DESC,o.orderdate LIMIT 10",
+  "q5_nation_revenue": "SELECT n.name,round(sum(l.extendedprice*(1-l.discount)),2) rev FROM customer c JOIN orders o ON c.custkey=o.custkey JOIN lineitem l ON l.orderkey=o.orderkey JOIN supplier s ON l.suppkey=s.suppkey AND c.nationkey=s.nationkey JOIN nation n ON s.nationkey=n.nationkey JOIN region r ON n.regionkey=r.regionkey WHERE r.name='ASIA' AND o.orderdate>=DATE '1994-01-01' AND o.orderdate<DATE '1995-01-01' GROUP BY n.name ORDER BY rev DESC",
+  "q10_returns": "SELECT c.name,round(sum(l.extendedprice*(1-l.discount)),2) rev,n.name FROM customer c JOIN orders o ON c.custkey=o.custkey JOIN lineitem l ON l.orderkey=o.orderkey JOIN nation n ON c.nationkey=n.nationkey WHERE o.orderdate>=DATE '1993-10-01' AND o.orderdate<DATE '1994-01-01' AND l.returnflag='R' GROUP BY c.name,n.name ORDER BY rev DESC LIMIT 20",
+  "having_filter": "SELECT orderkey,count(*) c FROM lineitem GROUP BY orderkey HAVING count(*)>=5 ORDER BY orderkey LIMIT 15",
+  "window_rank": "SELECT orderkey,totalprice,rank() OVER (ORDER BY totalprice DESC) rk FROM orders ORDER BY rk LIMIT 10",
+  "subquery_in": "SELECT count(*) FROM orders WHERE custkey IN (SELECT custkey FROM customer WHERE mktsegment='AUTOMOBILE')",
+  "case_agg": "SELECT returnflag,sum(CASE WHEN discount>0.05 THEN 1 ELSE 0 END) hi FROM lineitem GROUP BY returnflag ORDER BY 1"
+}
