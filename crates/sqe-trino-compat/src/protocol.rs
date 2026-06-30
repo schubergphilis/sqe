@@ -439,6 +439,46 @@ pub fn parse_session_statement(sql: &str) -> Option<UpdatedSessionState> {
     None
 }
 
+/// Detect `SHOW SESSION` / `SHOW SESSION LIKE '<pattern>'` and return the
+/// LIKE pattern (unquoted) if present. Returns `None` for anything that is not
+/// a `SHOW SESSION` statement.
+///
+/// sqlparser does not model `SHOW SESSION` (it collapses to a `SHOW LIKE`
+/// utility the executor rejects), so the Trino server intercepts it here and
+/// builds the result directly, the same way it does for `DESCRIBE OUTPUT`.
+pub fn parse_show_session(sql: &str) -> Option<Option<String>> {
+    let trimmed = sql.trim().trim_end_matches(';').trim();
+    let upper = trimmed.to_uppercase();
+    let rest = if upper == "SHOW SESSION" {
+        ""
+    } else if let Some(r) = upper
+        .strip_prefix("SHOW SESSION ")
+        .map(|_| trimmed["SHOW SESSION ".len()..].trim())
+    {
+        r
+    } else {
+        return None;
+    };
+    if rest.is_empty() {
+        return Some(None);
+    }
+    // Optional `LIKE '<pattern>'`.
+    let rest_upper = rest.to_uppercase();
+    if let Some(after) = rest_upper.strip_prefix("LIKE ") {
+        let pat = rest[rest.len() - after.len()..].trim();
+        // Strip the surrounding single quotes of the SQL string literal.
+        let pat = pat
+            .strip_prefix('\'')
+            .and_then(|v| v.strip_suffix('\''))
+            .map(|v| v.replace("''", "'"))
+            .unwrap_or_else(|| pat.to_string());
+        return Some(Some(pat));
+    }
+    // `SHOW SESSION <something-else>` is not a form we model; ignore the tail
+    // and return all properties rather than failing the client.
+    Some(None)
+}
+
 fn unquote_identifier(s: &str) -> String {
     let s = s.trim();
     if let Some(stripped) = s.strip_prefix('"').and_then(|v| v.strip_suffix('"')) {
@@ -722,6 +762,26 @@ mod tests {
     fn test_parse_session_reset_session() {
         let s = parse_session_statement("RESET SESSION foo").unwrap();
         assert_eq!(s.clear_session, vec!["foo".to_string()]);
+    }
+
+    #[test]
+    fn test_parse_show_session() {
+        // Bare SHOW SESSION: all properties, no filter.
+        assert_eq!(parse_show_session("SHOW SESSION"), Some(None));
+        assert_eq!(parse_show_session("  show session ;"), Some(None));
+        // LIKE filter, quotes stripped.
+        assert_eq!(
+            parse_show_session("SHOW SESSION LIKE 'iceberg.compression_codec'"),
+            Some(Some("iceberg.compression_codec".to_string()))
+        );
+        assert_eq!(
+            parse_show_session("show session like 'iceberg.%'"),
+            Some(Some("iceberg.%".to_string()))
+        );
+        // Not a SHOW SESSION statement.
+        assert_eq!(parse_show_session("SHOW TABLES"), None);
+        assert_eq!(parse_show_session("SELECT 1"), None);
+        assert_eq!(parse_show_session("SHOW SESSIONS"), None);
     }
 
     #[test]
