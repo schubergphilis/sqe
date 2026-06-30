@@ -5163,10 +5163,79 @@ pub(crate) fn sql_type_to_arrow(
             }
             Ok(DataType::Time64(arrow_schema::TimeUnit::Microsecond))
         }
+        // STRUCT<a INT, b VARCHAR> -> Arrow Struct (#321). sqlparser parses the
+        // native `STRUCT<...>` form into structured fields, so each field type
+        // (including nested structs and parameterized types) recurses cleanly.
+        // Fields are nullable, matching how CTAS-derived struct schemas land.
+        SqlType::Struct(fields, _) => {
+            let arrow_fields = fields
+                .iter()
+                .enumerate()
+                .map(|(i, sf)| {
+                    let name = sf
+                        .field_name
+                        .as_ref()
+                        .map(|id| id.value.clone())
+                        .unwrap_or_else(|| format!("col{i}"));
+                    Ok(arrow_schema::Field::new(name, sql_type_to_arrow(&sf.field_type)?, true))
+                })
+                .collect::<sqe_core::Result<Vec<_>>>()?;
+            Ok(DataType::Struct(arrow_fields.into()))
+        }
+        // Trino's `ROW(a INT, b VARCHAR)` (#321). sqlparser does not parse this
+        // into `Struct`; it lands as a `Custom("ROW", [a, INT, b, VARCHAR])`
+        // type with a flattened name/type modifier list. Rebuild the equivalent
+        // `STRUCT<...>` text and reparse so field types go through sqlparser's
+        // grammar, then map via the Struct arm above. Parameterized field types
+        // (e.g. `decimal(10,2)`) do not survive sqlparser's modifier flattening
+        // -- the same limitation as the `CAST(.. AS ROW(..))` rewrite -- so a
+        // ROW field that needs parameters should use `STRUCT<...>` directly.
+        SqlType::Custom(name, modifiers)
+            if name.0.len() == 1
+                && name.0[0]
+                    .as_ident()
+                    .map(|i| i.value.eq_ignore_ascii_case("row"))
+                    .unwrap_or(false)
+                && !modifiers.is_empty()
+                && modifiers.len() % 2 == 0 =>
+        {
+            let fields_str = modifiers
+                .chunks(2)
+                .map(|pair| format!("{} {}", pair[0], pair[1]))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let struct_type = parse_struct_type(&fields_str).ok_or_else(|| {
+                SqeError::NotImplemented(format!(
+                    "ROW type not supported for CREATE TABLE: ROW({fields_str}). \
+                     Use STRUCT<...> for parameterized field types."
+                ))
+            })?;
+            sql_type_to_arrow(&struct_type)
+        }
         other => Err(SqeError::NotImplemented(format!(
             "SQL type not supported for CREATE TABLE: {other}"
         ))),
     }
+}
+
+/// Parse a `STRUCT<...>` field list (e.g. `a INT, b VARCHAR`) into the
+/// sqlparser `Struct` data type by reconstructing a one-column `CREATE TABLE`
+/// and pulling the column's type. Returns `None` if the reconstructed text does
+/// not parse (e.g. a field type sqlparser cannot recover from a `ROW` modifier
+/// list). Used to bridge Trino's `ROW(...)` syntax to the native struct mapping.
+fn parse_struct_type(fields_str: &str) -> Option<sqlparser::ast::DataType> {
+    use sqlparser::ast::{ColumnDef, Statement};
+    use sqlparser::dialect::GenericDialect;
+    use sqlparser::parser::Parser;
+
+    let sql = format!("CREATE TABLE __sqe_row (__c STRUCT<{fields_str}>)");
+    let stmts = Parser::parse_sql(&GenericDialect {}, &sql).ok()?;
+    let cols = match stmts.into_iter().next()? {
+        Statement::CreateTable(ct) => ct.columns,
+        _ => return None,
+    };
+    let ColumnDef { data_type, .. } = cols.into_iter().next()?;
+    matches!(data_type, sqlparser::ast::DataType::Struct(..)).then_some(data_type)
 }
 
 /// A literal an identity-partition column is constrained to equal, lifted from
@@ -6287,6 +6356,66 @@ mod tests {
             DataType::Int64
         );
         assert_eq!(sql_type_to_arrow(&SqlType::Int64).unwrap(), DataType::Int64);
+    }
+
+    /// Parse `CREATE TABLE x (c <type_decl>)` and return the column's SQL type,
+    /// so struct/row type tests exercise the same AST shape production hits.
+    fn col_sql_type(type_decl: &str) -> SqlType {
+        use sqlparser::dialect::GenericDialect;
+        use sqlparser::parser::Parser;
+        let sql = format!("CREATE TABLE x (c {type_decl})");
+        let stmts = Parser::parse_sql(&GenericDialect {}, &sql).unwrap();
+        match stmts.into_iter().next().unwrap() {
+            sqlparser::ast::Statement::CreateTable(ct) => {
+                ct.columns.into_iter().next().unwrap().data_type
+            }
+            _ => panic!("not a CREATE TABLE"),
+        }
+    }
+
+    #[test]
+    fn test_sql_type_to_arrow_struct_native() {
+        // STRUCT<a INT, b VARCHAR> -> Arrow Struct with mapped, named fields.
+        let dt = sql_type_to_arrow(&col_sql_type("STRUCT<a INT, b VARCHAR>")).unwrap();
+        let DataType::Struct(fields) = dt else {
+            panic!("expected Struct, got {dt:?}");
+        };
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[0].name(), "a");
+        assert_eq!(fields[0].data_type(), &DataType::Int32);
+        assert_eq!(fields[1].name(), "b");
+        assert_eq!(fields[1].data_type(), &DataType::Utf8);
+    }
+
+    #[test]
+    fn test_sql_type_to_arrow_row_maps_to_struct() {
+        // #321: Trino ROW(a integer, b varchar) lands as Custom and must map to
+        // the same Arrow Struct as the STRUCT<...> spelling.
+        let dt = sql_type_to_arrow(&col_sql_type("ROW(a integer, b varchar)")).unwrap();
+        let DataType::Struct(fields) = dt else {
+            panic!("expected Struct, got {dt:?}");
+        };
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[0].name(), "a");
+        assert_eq!(fields[0].data_type(), &DataType::Int32);
+        assert_eq!(fields[1].name(), "b");
+        assert_eq!(fields[1].data_type(), &DataType::Utf8);
+    }
+
+    #[test]
+    fn test_sql_type_to_arrow_nested_struct() {
+        // Nested struct recurses through the field-type mapping.
+        let dt = sql_type_to_arrow(&col_sql_type("STRUCT<inner STRUCT<x BIGINT>>")).unwrap();
+        let DataType::Struct(fields) = dt else {
+            panic!("expected Struct, got {dt:?}");
+        };
+        assert_eq!(fields[0].name(), "inner");
+        assert!(
+            matches!(fields[0].data_type(), DataType::Struct(inner) if inner[0].name() == "x"
+                && inner[0].data_type() == &DataType::Int64),
+            "nested struct field not mapped: {:?}",
+            fields[0].data_type()
+        );
     }
 
     #[test]
