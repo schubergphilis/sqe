@@ -29,6 +29,9 @@ services:
       - "38080:8080"
     volumes:
       - ./tests/trino/catalog/iceberg.properties:/etc/trino/catalog/iceberg.properties:ro
+      # Built-in tpch connector: generates TPC-H demo data on demand. The parity
+      # harness CTASes from tpch.tiny into the shared iceberg (Polaris) catalog.
+      - ./tests/trino/catalog/tpch.properties:/etc/trino/catalog/tpch.properties:ro
       - ./tests/trino/config.properties:/etc/trino/config.properties:ro
     depends_on:
       polaris:
