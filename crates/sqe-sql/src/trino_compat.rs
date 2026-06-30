@@ -156,10 +156,10 @@ pub fn rewrite_trino_compat(sql: &str) -> String {
     // NOT_SUPPORTED error); both are string-representable, so on the read path
     // we rewrite the cast to VARCHAR.
     let has_custom_cast = lower.contains("as uuid") || lower.contains("as ipaddress");
-    // `json '...'` -> rewrite_json_typed_string: a Trino JSON typed-string
-    // literal, which DataFusion rejects; rewritten to a plain string (SQE
-    // stores JSON as Utf8).
-    let has_json_literal = lower.contains("json '");
+    // `json '...'` / `uuid '...'` -> rewrite_utf8_typed_string: Trino typed-string
+    // literals DataFusion rejects; rewritten to a plain string (SQE stores both
+    // JSON and UUID as Utf8). See #326 for UUID.
+    let has_utf8_literal = lower.contains("json '") || lower.contains("uuid '");
     // `row(` -> the Trino ROW(...) constructor and the `CAST(ROW(...) AS
     // ROW(...))` named-row cast. The bare constructor becomes `struct(...)`;
     // the constructor-then-cast idiom becomes `named_struct(...)`. A false
@@ -175,7 +175,7 @@ pub fn rewrite_trino_compat(sql: &str) -> String {
         && !has_grouping_set
         && !has_current_schema
         && !has_custom_cast
-        && !has_json_literal
+        && !has_utf8_literal
         && !has_row
         && !has_fetch
     {
@@ -349,7 +349,7 @@ impl VisitorMut for TrinoCompatVisitor {
         if rewrite_bare_current_schema(expr) {
             self.rewrites += 1;
         }
-        if rewrite_json_typed_string(expr) {
+        if rewrite_utf8_typed_string(expr) {
             self.rewrites += 1;
         }
         // ROW constructor rewrite runs before the cast rewrite at this node,
@@ -453,15 +453,17 @@ fn rewrite_cast_custom_to_varchar(expr: &mut Expr) -> bool {
     }
 }
 
-/// Rewrite `Expr::Cast { data_type: JSON, expr }` to `to_json(expr)`.
-/// Returns true if the rewrite fired.
-/// Rewrite a Trino `JSON '<text>'` typed-string literal to a plain string
-/// literal. DataFusion's planner rejects the JSON typed string
-/// ("Unsupported ... JSON"); SQE represents JSON columns as Utf8, and the
-/// string value carries the same content. Returns true if the rewrite fired.
-fn rewrite_json_typed_string(expr: &mut Expr) -> bool {
+/// Rewrite a Trino typed-string literal whose type SQE represents as Utf8 to a
+/// plain string literal: `JSON '<text>'` (#7) and `UUID '<text>'` (#326).
+/// DataFusion's planner rejects both typed strings ("Unsupported SQL type
+/// JSON" / "Unsupported SQL type UUID"); SQE stores JSON and UUID columns as
+/// Utf8 (see `sql_type_to_arrow`), and the string value carries the same
+/// content. This is the literal counterpart to `rewrite_cast_custom_to_varchar`,
+/// which already maps `CAST(.. AS UUID)` to VARCHAR. Returns true if the
+/// rewrite fired.
+fn rewrite_utf8_typed_string(expr: &mut Expr) -> bool {
     if let Expr::TypedString(ts) = expr {
-        if matches!(ts.data_type, SqlDataType::JSON) {
+        if matches!(ts.data_type, SqlDataType::JSON | SqlDataType::Uuid) {
             *expr = Expr::Value(ts.value.clone());
             return true;
         }
@@ -1673,6 +1675,18 @@ mod tests {
         let out = rewrite_trino_compat(r#"SELECT JSON '{"a": 1}' AS j"#);
         assert!(!out.to_uppercase().contains("JSON '"), "JSON literal kept: {out}");
         assert!(out.contains(r#"'{"a": 1}'"#), "string value lost: {out}");
+    }
+
+    #[test]
+    fn rewrites_uuid_literal_to_string() {
+        // Trino `UUID '<text>'` -> a plain string literal (SQE stores UUID as
+        // Utf8); DataFusion rejects the UUID typed string. (#326)
+        let out = rewrite_trino_compat("SELECT UUID 'bdeb4567-89ab-cdef-0123-456789abcdef' AS u");
+        assert!(!out.to_uppercase().contains("UUID '"), "UUID literal kept: {out}");
+        assert!(
+            out.contains("'bdeb4567-89ab-cdef-0123-456789abcdef'"),
+            "string value lost: {out}"
+        );
     }
 
     #[test]
