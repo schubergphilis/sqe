@@ -5333,8 +5333,42 @@ fn extract_otel_table_info(kind: &StatementKind) -> Option<(Option<String>, Opti
 ///
 /// All interpolated values are escaped (string literals double single-quotes;
 /// the catalog identifier doubles double-quotes) to prevent injection. (#2)
+/// Split a (possibly double-quoted) dotted SQL identifier into its unquoted
+/// parts, the way the SELECT planner does. `.` separates qualifiers only
+/// outside quotes, a `""` inside quotes is a literal `"`, and surrounding
+/// quotes are stripped. So `"cat"."sch"."tbl"` -> [cat, sch, tbl] and
+/// `"a.b"."c"` -> [a.b, c]. Without this, `ObjectName::to_string()` leaves
+/// the quote characters in, they leak into the WHERE filter, and
+/// DESCRIBE/SHOW COLUMNS match nothing (#327).
+fn split_qualified_identifier(name: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut cur = String::new();
+    let mut in_quote = false;
+    let mut chars = name.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' if in_quote => {
+                if chars.peek() == Some(&'"') {
+                    cur.push('"');
+                    chars.next();
+                } else {
+                    in_quote = false;
+                }
+            }
+            '"' => in_quote = true,
+            '.' if !in_quote => {
+                parts.push(std::mem::take(&mut cur));
+            }
+            _ => cur.push(c),
+        }
+    }
+    parts.push(cur);
+    parts
+}
+
 fn info_schema_columns_query(table_name: &str) -> String {
-    let parts: Vec<&str> = table_name.split('.').collect();
+    let parts = split_qualified_identifier(table_name);
+    let parts: Vec<&str> = parts.iter().map(String::as_str).collect();
     let (catalog, schema, bare) = match parts.as_slice() {
         [t] => (None, None, *t),
         [s, t] => (None, Some(*s), *t),
@@ -5716,13 +5750,44 @@ mod tests {
     }
 
     #[test]
+    fn info_schema_columns_query_unquotes_double_quoted_identifiers() {
+        // #327: the Starburst/Trino JDBC driver emits
+        // `DESCRIBE "cat"."schema"."table"` for field discovery. The quoted
+        // form must resolve identically to the unquoted form -- otherwise the
+        // quote characters leak into the WHERE filter, nothing matches, and
+        // DESCRIBE/SHOW COLUMNS silently return 0 rows (Metabase syncs 0
+        // fields). Each part is unquoted the same way the SELECT planner does.
+        let unquoted = info_schema_columns_query("ws_energy_co.gold.fct_revenue_monthly");
+        let quoted =
+            info_schema_columns_query(r#""ws_energy_co"."gold"."fct_revenue_monthly""#);
+        assert_eq!(quoted, unquoted, "quoted 3-part name must resolve like the unquoted form");
+
+        // A single quoted part is enough to break the naive split; cover it.
+        let partial = info_schema_columns_query(r#"ws_energy_co.gold."fct_revenue_monthly""#);
+        assert_eq!(partial, unquoted, "one quoted part must still resolve");
+
+        // Quoted single identifier (no qualifier).
+        let bare = info_schema_columns_query(r#""fct_revenue_monthly""#);
+        assert!(bare.contains("table_name = 'fct_revenue_monthly'"));
+        assert!(!bare.contains('"'), "no quote chars should leak: {bare}");
+
+        // An embedded dot inside a quoted part is one identifier, not a
+        // qualifier boundary; an embedded `""` is a literal quote.
+        let dotted = info_schema_columns_query(r#""we.ird"."col""umn""#);
+        assert!(dotted.contains("table_schema = 'we.ird'"), "dot stays in part: {dotted}");
+        assert!(dotted.contains(r#"table_name = 'col"umn'"#), "doubled quote collapses: {dotted}");
+    }
+
+    #[test]
     fn info_schema_columns_query_escapes_injection() {
         // Single quotes in the (client-supplied) name are escaped as SQL
         // string literals; double quotes in the catalog ident are doubled.
         let q = info_schema_columns_query("ev'il.sch'ema.ta'ble");
         assert!(q.contains("table_name = 'ta''ble'"));
         assert!(q.contains("table_schema = 'sch''ema'"));
-        let q2 = info_schema_columns_query(r#"ca"t.s.t"#);
+        // A well-formed quoted catalog whose value embeds a `"` (written `""`):
+        // the value is `ca"t`, re-doubled when injected into the quoted FROM.
+        let q2 = info_schema_columns_query(r#""ca""t".s.t"#);
         assert!(q2.contains("\"ca\"\"t\".information_schema.columns"));
     }
 
