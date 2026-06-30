@@ -104,6 +104,7 @@ Connection conn = DriverManager.getConnection(url, props);
 - Prepared statements are not supported via the Trino protocol.
 - Transaction control (`START TRANSACTION`, `COMMIT`) is not supported. Queries execute in auto-commit mode.
 - Type mapping covers common types; complex nested types may differ from native Trino behavior.
+- Iceberg hidden columns (`$path`, `$file_modified_time`, `$partition`) are not exposed on table scans. They need a per-row, per-source-file column that is resolvable by name but excluded from `SELECT *`. DataFusion has no such metadata-column mechanism yet (tracked upstream at apache/datafusion#20135, not in any release), and adding the column to the scan schema would make every `SELECT *` return it. For file-level introspection use the `table_files('ns', 't')` table function, which lists `file_path`, `record_count`, and `file_size_in_bytes` per data file.
 - Materialized views are not supported. `CREATE MATERIALIZED VIEW` returns a clear "not supported" error rather than creating a plain view. `DROP MATERIALIZED VIEW IF EXISTS` is treated as a no-op so client tooling that issues it on teardown can proceed.
 
 ## Flight SQL vs Trino HTTP
