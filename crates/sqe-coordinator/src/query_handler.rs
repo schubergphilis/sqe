@@ -2054,7 +2054,7 @@ impl QueryHandler {
 
         let sql = self.handle_incremental(sql, &ctx, &session_catalog).await?;
         let (sql, tt_cleanup) =
-            self.handle_time_travel(&sql, &ctx, &session_catalog).await?;
+            self.handle_time_travel(&sql, &ctx, session, &session_catalog).await?;
         // Apply Trino-compat AST rewrites before planning, matching the
         // execute() path. Today this matters for the empty-input ROLLUP /
         // CUBE / GROUPING SETS wrap that works around apache/datafusion#21570;
@@ -2209,7 +2209,7 @@ impl QueryHandler {
                 .handle_incremental(sql, &ctx, &session_catalog)
                 .await?;
             let (sql_for_plan, _tt_cleanup) = self
-                .handle_time_travel(&sql_for_plan, &ctx, &session_catalog)
+                .handle_time_travel(&sql_for_plan, &ctx, session, &session_catalog)
                 .await?;
             let df = ctx
                 .sql(&sql_for_plan)
@@ -2319,7 +2319,7 @@ impl QueryHandler {
         // providers when this function returns, so the bare table name
         // resolves to HEAD on the next query in the same session (#44).
         let (sql, _tt_cleanup) = self
-            .handle_time_travel(&sql, &ctx, &session_catalog)
+            .handle_time_travel(&sql, &ctx, session, &session_catalog)
             .await?;
         // Pre-process Trino-compat AST patterns DataFusion does not natively
         // recognize. Today this only rewrites `CAST(v AS JSON)` to
@@ -3293,10 +3293,32 @@ impl QueryHandler {
     ///
     /// When no time travel is found the original SQL is returned unchanged
     /// and the guard is empty.
+    /// Resolve which catalog a (possibly catalog-qualified) time-travel table
+    /// reference loads against, mirroring the SELECT/SHOW resolution (#2/#6):
+    /// an explicit `catalog.schema.table` uses that catalog; otherwise the
+    /// session's bound default catalog (discovered under polaris-auto). The
+    /// time-travel path previously loaded against the primary/config catalog,
+    /// so a polaris-auto session querying a discovered catalog failed with
+    /// "table does not exist" (#317). Falls back to `fallback` only when the
+    /// reference names no catalog and the session has no default.
+    async fn resolve_reference_catalog(
+        &self,
+        session: &Session,
+        table: &str,
+        fallback: &Arc<SessionCatalog>,
+    ) -> sqe_core::Result<Arc<SessionCatalog>> {
+        let explicit = explicit_catalog_component(table);
+        if explicit.is_none() && session.default_catalog.is_none() {
+            return Ok(Arc::clone(fallback));
+        }
+        self.show_catalog(session, explicit).await
+    }
+
     async fn handle_time_travel(
         &self,
         sql: &str,
         ctx: &SessionContext,
+        session: &Session,
         session_catalog: &Arc<SessionCatalog>,
     ) -> sqe_core::Result<(String, TimeTravelCleanup)> {
         use sqlparser::ast::SetExpr;
@@ -3317,8 +3339,17 @@ impl QueryHandler {
         let mut version_resolved = !version_specs.is_empty();
         if version_resolved {
             for spec in &version_specs {
+                // Resolve the catalog the table lives in, like the SELECT/SHOW
+                // paths do (#2/#6). A time-travel reference loads against the
+                // session's bound catalog -- or, for a catalog-qualified name,
+                // that catalog -- not the primary/config catalog. Using the
+                // primary made polaris-auto sessions fail with "table does not
+                // exist" (#317).
+                let resolved_catalog = self
+                    .resolve_reference_catalog(session, &spec.table, session_catalog)
+                    .await?;
                 let alias =
-                    Self::apply_version_spec(spec, ctx, session_catalog, prefetch_concurrency)
+                    Self::apply_version_spec(spec, ctx, &resolved_catalog, prefetch_concurrency)
                         .await?;
                 cleanup_aliases.push(alias.clone());
                 rewritten_for_version =
@@ -3346,9 +3377,10 @@ impl QueryHandler {
         if let sqlparser::ast::Statement::Query(ref mut query) = stmt {
             if let SetExpr::Select(ref mut select) = *query.body {
                 for twj in &mut select.from {
-                    if Self::process_time_travel_table_factor(
+                    if self.process_time_travel_table_factor(
                         &mut twj.relation,
                         ctx,
+                        session,
                         session_catalog,
                         cleanup,
                         prefetch_concurrency,
@@ -3356,9 +3388,10 @@ impl QueryHandler {
                         found_time_travel = true;
                     }
                     for join in &mut twj.joins {
-                        if Self::process_time_travel_table_factor(
+                        if self.process_time_travel_table_factor(
                             &mut join.relation,
                             ctx,
+                            session,
                             session_catalog,
                             cleanup,
                             prefetch_concurrency,
@@ -3530,8 +3563,10 @@ impl QueryHandler {
     /// The alias is pushed into `cleanup` so the caller can deregister it
     /// once query execution completes.
     async fn process_time_travel_table_factor(
+        &self,
         relation: &mut TableFactor,
         ctx: &SessionContext,
+        session: &Session,
         session_catalog: &Arc<SessionCatalog>,
         cleanup: &mut Vec<String>,
         prefetch_concurrency: usize,
@@ -3542,6 +3577,13 @@ impl QueryHandler {
             if let Some(TableVersion::ForSystemTimeAsOf(ref expr)) = version {
                 let table_name = name.to_string();
                 let timestamp_ms = resolve_timestamp_expr(expr)?;
+
+                // Resolve the catalog the same way the SELECT/SHOW paths do, so
+                // a polaris-auto session loads from its bound catalog rather
+                // than the primary/config one (#317).
+                let session_catalog = &self
+                    .resolve_reference_catalog(session, &table_name, session_catalog)
+                    .await?;
 
                 // Extract namespace and table from the (possibly qualified) name
                 let parts: Vec<&str> = table_name.split('.').collect();
@@ -4627,6 +4669,18 @@ impl Drop for TimeTravelCleanup {
 /// Used to rewrite a table reference like `ns.t` to `datafusion.public.alias` after the incremental pre-parser has run.
 ///
 /// The match is strict: `needle` must be preceded and followed by a character that cannot appear in a SQL identifier (whitespace, punctuation, or start / end of string). This prevents spurious matches when `needle` appears as a substring of a longer identifier.
+/// The explicit catalog component of a dotted table reference, if present.
+/// SQE models references as `[catalog.]schema.table` (single-level namespace),
+/// so only a three-part name carries an explicit catalog; one- and two-part
+/// names do not. Used to route time-travel reads to the right catalog (#317).
+fn explicit_catalog_component(table: &str) -> Option<&str> {
+    let parts: Vec<&str> = table.split('.').collect();
+    match parts.as_slice() {
+        [catalog, _schema, _table] => Some(catalog),
+        _ => None,
+    }
+}
+
 fn replace_table_reference(sql: &str, needle: &str, replacement: &str) -> String {
     if needle.is_empty() {
         return sql.to_string();
@@ -5572,6 +5626,17 @@ mod tests {
     use super::*;
     use sqe_core::config::QueryConfig;
     use sqe_core::session::Session;
+
+    #[test]
+    fn explicit_catalog_component_only_for_three_part() {
+        // Three-part name carries an explicit catalog; one/two-part do not.
+        assert_eq!(
+            explicit_catalog_component("ws_energy_co.gold.fct_revenue_monthly"),
+            Some("ws_energy_co")
+        );
+        assert_eq!(explicit_catalog_component("gold.fct_revenue_monthly"), None);
+        assert_eq!(explicit_catalog_component("fct_revenue_monthly"), None);
+    }
 
     #[test]
     fn show_stats_batch_has_trino_shape() {
