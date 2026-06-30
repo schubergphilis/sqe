@@ -149,3 +149,36 @@ sound: `scripts/tempto-test.sh --baseline`.
 - `TestIcebergPartitionEvolution.testDroppedPartitionField` -- one onSpark()
   setup call; would need a `spark` tempto database to run.
 - `TestIcebergOptimize` -- include only if SQE supports `ALTER TABLE ... EXECUTE optimize`.
+
+## Full-package sweep batch (2026-06-30): issues #320-#328
+
+A full-package tempto sweep surfaced nine more Trino-compat gaps. Status and
+verification level (be precise: not all are stack-validated the way #314-#319
+were):
+
+| # | Gap | Status | Verified |
+|---|---|---|---|
+| #327 | DESCRIBE/SHOW COLUMNS ignore double-quoted identifiers (0 rows) | FIXED | Unit (quote-aware identifier split) |
+| #322 | CTAS `WITH [NO] DATA` suffix parse-fails | FIXED | Unit + DataFusion execute |
+| #328 | CTAS column-alias list `(a,b) AS ...` parse-fails | FIXED | Unit + DataFusion execute |
+| #323 | `SET/RESET/SHOW SESSION` unsupported | FIXED | Unit + server integration |
+| #324 | materialized views: DROP hard-errors / CREATE silently makes a view | FIXED | Unit (no-op DROP IF EXISTS, reject CREATE) + documented |
+| #320 | `$snapshots` columns differ from Trino (`parent_id`, `committed_at`) | FIXED | Schema unit-verified; **live `$snapshots` query stack-pending** |
+| #326 | `UUID '...'` literal rejected | FIXED | Unit + DataFusion execute (literal, CAST, CTAS) |
+| #321 | ROW/STRUCT types in CREATE TABLE | FIXED (type mapping) | Type mapping unit-verified; **Iceberg struct write/read stack-pending** |
+| #325 | Iceberg hidden columns (`$path`, ...) not exposed | **BLOCKED (upstream)** | n/a |
+
+Notes:
+- **#320, #321** ship the verifiable layer (schema/type mapping, with
+  DataFusion execute tests where applicable) but their end-to-end Iceberg
+  read/write is **not** validated against a live Polaris+S3 stack on this
+  branch. Re-run the harness against a real stack to confirm before treating
+  them as stack-validated.
+- **#325 is blocked on DataFusion.** Trino's `$path` is a per-row, per-file
+  column that resolves by name yet is excluded from `SELECT *`. DataFusion 54
+  has no metadata/system-column mechanism (confirmed: a field marked
+  `datafusion.system_column` is still returned by `SELECT *`). It is an open
+  upstream proposal (apache/datafusion#20135), not in any release. Adding the
+  column to the scan schema would break `SELECT *` parity, so it is documented
+  as unsupported with `table_files('ns','t')` as the file-introspection
+  workaround, rather than shipped as a veneer.
