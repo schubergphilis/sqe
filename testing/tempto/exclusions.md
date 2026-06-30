@@ -30,12 +30,18 @@ allow-list tests surfaced the next layer of gaps (parser/semantic, not wire):
    parameter order and rejecting NULLs with Trino's `<field> cannot be null`
    phrasing.
 
-Both blockers above are fixed in code (unit + wire-serialization verified).
-End-to-end re-run (these 3 tests green against SQE) is pending a live stack; the
-test bodies also exercise `FETCH FIRST 1 ROW WITH TIES` (parses in sqlparser
-0.62; DataFusion planner support unverified) and a `$snapshots` metadata read
-(already handled), either of which could surface as the next layer once the
-wire/parser blockers are cleared.
+**End-to-end re-run with all fixes merged (#314/#315/#316/#317/#318, SQE rebuilt
+from main, 2026-06-30): 2 SUCCEEDED / 1 FAILED against SQE.**
+- `TestIcebergInsert.testIcebergConcurrentInsert` -> SUCCESS (11.3s; real
+  concurrent CREATE/INSERT/SELECT workload now passes on SQE).
+- `TestIcebergProcedureCalls.testRollbackToSnapshotWithNullArgument` -> SUCCESS.
+- `TestIcebergProcedureCalls.testRollbackToSnapshot` -> FAILURE, new gap:
+  `This feature is not implemented: FETCH clause is not supported yet` on
+  `SELECT snapshot_id FROM ...\"...$snapshots\" WHERE parent_id IS NOT NULL
+  ORDER BY committed_at FETCH FIRST 1 ROW WITH TIES`. SQE/DataFusion does not
+  implement `FETCH FIRST ... WITH TIES` (Trino supports it). The `$snapshots`
+  read and positional `rollback_to_snapshot` CALL both work now. This is the
+  next compatibility finding (candidate for its own issue).
 
 Verified both directions on 2026-06-29 with the curated allow-list (3 tests:
 `testIcebergConcurrentInsert`, `testRollbackToSnapshot`,
