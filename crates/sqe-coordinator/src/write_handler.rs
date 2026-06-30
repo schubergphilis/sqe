@@ -9,7 +9,7 @@ use datafusion::datasource::{provider_as_source, MemTable};
 use datafusion::logical_expr::{dml::InsertOp, LogicalPlan, LogicalPlanBuilder};
 use datafusion::prelude::SessionContext as DFSessionContext;
 use futures::{StreamExt, TryStreamExt};
-use iceberg::arrow::arrow_type_to_type;
+use iceberg::arrow::arrow_schema_to_schema_auto_assign_ids;
 use iceberg::spec::{
     DataContentType, DataFile, FormatVersion, ManifestStatus, NestedField, Schema as IcebergSchema,
 };
@@ -5049,13 +5049,6 @@ fn compound_ident_parts(expr: &sqlparser::ast::Expr) -> Option<(String, String)>
     }
 }
 
-/// Convert an Arrow schema to an Iceberg schema.
-///
-/// Arrow schemas from DataFusion queries do not carry Parquet field-id metadata,
-/// so we cannot use `iceberg::arrow::arrow_schema_to_schema` directly (it
-/// requires the `PARQUET_FIELD_ID` key). Instead, we convert each Arrow field
-/// individually using `arrow_type_to_type` and assign sequential field IDs
-/// starting from 1.
 /// Convert a sqlparser SQL data type to an Arrow DataType.
 pub(crate) fn sql_type_to_arrow(
     sql_type: &sqlparser::ast::DataType,
@@ -5382,31 +5375,17 @@ fn partition_prune_cow_files(
     (to_rewrite, pruned)
 }
 
+/// Convert an Arrow schema to an Iceberg schema, assigning field IDs.
+///
+/// Arrow schemas from DataFusion queries carry no Parquet field-id metadata, so
+/// `iceberg::arrow::arrow_schema_to_schema` (which requires `PARQUET_FIELD_ID`)
+/// cannot be used. `arrow_schema_to_schema_auto_assign_ids` walks the schema and
+/// assigns fresh Iceberg field IDs recursively, including nested struct, list,
+/// and map fields. A manual top-level-only loop (the previous implementation)
+/// could not: nested struct fields then hit iceberg-rust's "Field id not found
+/// in metadata", which is the ROW/struct write failure in #321.
 fn arrow_schema_to_iceberg(arrow_schema: &ArrowSchema) -> sqe_core::Result<IcebergSchema> {
-    let mut fields = Vec::with_capacity(arrow_schema.fields().len());
-
-    for (idx, arrow_field) in arrow_schema.fields().iter().enumerate() {
-        let field_id = (idx + 1) as i32;
-        let iceberg_type = arrow_type_to_type(arrow_field.data_type()).map_err(|e| {
-            SqeError::Execution(format!(
-                "Cannot convert Arrow type {:?} for field '{}' to Iceberg type: {e}",
-                arrow_field.data_type(),
-                arrow_field.name()
-            ))
-        })?;
-
-        let field = if arrow_field.is_nullable() {
-            NestedField::optional(field_id, arrow_field.name(), iceberg_type)
-        } else {
-            NestedField::required(field_id, arrow_field.name(), iceberg_type)
-        };
-
-        fields.push(Arc::new(field));
-    }
-
-    IcebergSchema::builder()
-        .with_fields(fields)
-        .build()
+    arrow_schema_to_schema_auto_assign_ids(arrow_schema)
         .map_err(|e| SqeError::Execution(format!("Failed to build Iceberg schema: {e}")))
 }
 
@@ -5430,28 +5409,19 @@ pub(crate) fn arrow_schema_to_iceberg_with_defaults(
         )));
     }
 
-    let mut fields = Vec::with_capacity(arrow_schema.fields().len());
+    // Assign field IDs recursively first (handles nested struct/list/map, which
+    // a top-level-only loop cannot -- see arrow_schema_to_iceberg / #321), then
+    // attach column DEFAULTs to the top-level fields. DEFAULTs apply only to
+    // top-level columns, so the nested IDs from the auto-assignment are
+    // preserved unchanged.
+    let base = arrow_schema_to_schema_auto_assign_ids(arrow_schema)
+        .map_err(|e| SqeError::Execution(format!("Failed to build Iceberg schema: {e}")))?;
 
-    for (idx, (arrow_field, col_def)) in arrow_schema
-        .fields()
-        .iter()
-        .zip(column_defs.iter())
-        .enumerate()
-    {
-        let field_id = (idx + 1) as i32;
-        let iceberg_type = arrow_type_to_type(arrow_field.data_type()).map_err(|e| {
-            SqeError::Execution(format!(
-                "Cannot convert Arrow type {:?} for field '{}' to Iceberg type: {e}",
-                arrow_field.data_type(),
-                arrow_field.name()
-            ))
-        })?;
+    let mut fields = Vec::with_capacity(column_defs.len());
 
-        let mut field = if arrow_field.is_nullable() {
-            NestedField::optional(field_id, arrow_field.name(), iceberg_type.clone())
-        } else {
-            NestedField::required(field_id, arrow_field.name(), iceberg_type.clone())
-        };
+    for (base_field, col_def) in base.as_struct().fields().iter().zip(column_defs.iter()) {
+        let mut field: NestedField = (**base_field).clone();
+        let iceberg_type = field.field_type.as_ref().clone();
 
         // Pull the DEFAULT from the column def (if any) and lift it into
         // an iceberg Literal compatible with the target type.
@@ -6416,6 +6386,47 @@ mod tests {
             "nested struct field not mapped: {:?}",
             fields[0].data_type()
         );
+    }
+
+    #[test]
+    fn test_arrow_schema_to_iceberg_assigns_nested_struct_field_ids() {
+        // #321 regression: a struct column must convert to an Iceberg schema
+        // with field IDs assigned recursively. The old top-level-only loop hit
+        // iceberg-rust's "Field id not found in metadata" on the nested fields
+        // (DataFusion Arrow schemas carry no PARQUET_FIELD_ID), which is what
+        // blocked ROW/struct writes.
+        use arrow_schema::{DataType, Field, Fields, Schema as ArrowSchema};
+
+        let struct_fields = Fields::from(vec![
+            Field::new("a", DataType::Int32, true),
+            Field::new("b", DataType::Utf8, true),
+        ]);
+        let arrow = ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("payload", DataType::Struct(struct_fields), true),
+        ]);
+
+        let iceberg = arrow_schema_to_iceberg(&arrow)
+            .expect("nested struct schema must convert without a field-id error");
+
+        let top = iceberg.as_struct().fields();
+        assert_eq!(top.len(), 2, "two top-level fields");
+
+        // The struct column's nested fields are present and carry their own IDs.
+        let iceberg::spec::Type::Struct(nested) = top[1].field_type.as_ref() else {
+            panic!("payload should map to a struct type, got {:?}", top[1].field_type);
+        };
+        assert_eq!(nested.fields().len(), 2, "nested struct fields preserved");
+
+        // Every field ID across the whole schema must be unique and non-zero --
+        // duplicate or zero nested IDs are exactly what breaks the writer.
+        let mut ids = vec![top[0].id, top[1].id];
+        ids.extend(nested.fields().iter().map(|f| f.id));
+        assert!(ids.iter().all(|&id| id > 0), "all field ids assigned: {ids:?}");
+        let mut sorted = ids.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), ids.len(), "field ids unique across nesting: {ids:?}");
     }
 
     #[test]

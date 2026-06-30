@@ -182,3 +182,28 @@ Notes:
   column to the scan schema would break `SELECT *` parity, so it is documented
   as unsupported with `table_files('ns','t')` as the file-introspection
   workaround, rather than shipped as a veneer.
+
+## Live-stack re-run batch (2026-06-30): reopened partials + new findings
+
+The harness was run against a real Trino-481 baseline + live stack, which
+re-opened three partial fixes and surfaced three new gaps.
+
+| Issue | Status | Verification |
+|---|---|---|
+| #319 | FETCH WITH TIES dropped the ORDER BY column when absent from SELECT | FIXED | Unit + DataFusion execute (order col not in SELECT) |
+| #330 | `CREATE TABLE ... AS TABLE <qualified.name>` parse-fails | FIXED | Unit + DataFusion execute (3-part source copy) |
+| #331 | `ALTER TABLE ... EXECUTE optimize` parse-fails | FIXED (optimize) | Rewrite -> `CALL system.rewrite_data_files`; classifies as the existing maintenance procedure (unit + e2e classify). `file_size_threshold` dropped (no faithful map); destructive procs left unhandled |
+| #321 | ROW/struct write: `Field id not found` on nested fields | FIXED (write path) | `arrow_schema_to_iceberg` now uses iceberg-rust `arrow_schema_to_schema_auto_assign_ids` to assign nested IDs recursively; unit-verified. **e2e struct write/read still stack-pending** |
+| #326 | uuid Iceberg write "unsupported" | round-trip done; fidelity blocked upstream | Literal/CAST/CTAS already round-trip as string (Utf8) at HEAD. Genuine Iceberg `uuid` logical type needs Arrow `FixedSizeBinary(16)`, which DataFusion cannot produce from a string (no uuid type) -- same upstream class as #325 |
+| #332 | LZ4 codec "not supported for Parquet/Avro" | **needs live repro** | Hypothesis disproven: parquet `lz4` feature is already enabled (via `default`), and iceberg-rust honors the passed `WriterProperties` compression as-is. The exact error string is in neither SQE nor vendored iceberg-rust. Separately, `SET SESSION iceberg.compression_codec` is echoed to the client but never reaches the writer (it reads static `config.catalog.parquet_compression`) -- a distinct gap |
+
+Notes:
+- **#319/#330/#331** are fully verified at the rewrite + DataFusion execute /
+  classification layer (no live stack needed) and are closed.
+- **#321** ships the real write-path fix (recursive nested field-id assignment)
+  but the end-to-end struct write/read is still stack-pending; do not close on
+  the unit test alone.
+- **#326, #332** carry no code change this round: #326's round-trip already
+  works at HEAD (genuine uuid fidelity is upstream-blocked); #332's simple
+  hypotheses are disproven and it needs a live reproduction to capture the real
+  error origin.
