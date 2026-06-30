@@ -863,6 +863,19 @@ impl QueryHandler {
                                 "Utility statement not supported: {stmt}"
                             )))
                         }
+                    } else if let Some(mv) = classify_materialized_view(stmt.as_ref()) {
+                        // SQE does not support materialized views (#324).
+                        // DROP MATERIALIZED VIEW IF EXISTS is a client-compat
+                        // no-op; anything else is a clear unsupported error.
+                        match mv {
+                            MaterializedViewStmt::DropIfExistsNoop => {
+                                debug!("DROP MATERIALIZED VIEW IF EXISTS: materialized views unsupported, treating as no-op");
+                                Ok(Vec::new())
+                            }
+                            MaterializedViewStmt::Unsupported => Err(SqeError::NotImplemented(
+                                "materialized views are not supported".to_string(),
+                            )),
+                        }
                     } else {
                         Err(SqeError::NotImplemented(format!(
                             "Utility statement not supported: {stmt}"
@@ -3258,6 +3271,13 @@ impl QueryHandler {
         session: &Session,
         stmt: &Statement,
     ) -> sqe_core::Result<()> {
+        // CREATE MATERIALIZED VIEW is unsupported (#324); reject it rather than
+        // silently creating a plain view that would never refresh.
+        if classify_materialized_view(stmt) == Some(MaterializedViewStmt::Unsupported) {
+            return Err(SqeError::NotImplemented(
+                "materialized views are not supported".to_string(),
+            ));
+        }
         let query = match stmt {
             Statement::CreateView(cv) => &cv.query,
             other => {
@@ -4681,6 +4701,37 @@ fn explicit_catalog_component(table: &str) -> Option<&str> {
     }
 }
 
+/// How a materialized-view statement should be handled. SQE does not support
+/// materialized views (#324). `DROP MATERIALIZED VIEW IF EXISTS` is a
+/// client-compat no-op; every other MV statement is a clear "unsupported"
+/// error, so CREATE MATERIALIZED VIEW is rejected rather than silently
+/// creating a plain view, and a generic "utility not supported" is avoided.
+#[derive(Debug, PartialEq, Eq)]
+enum MaterializedViewStmt {
+    /// `DROP MATERIALIZED VIEW IF EXISTS <name>` -> safe no-op.
+    DropIfExistsNoop,
+    /// CREATE MATERIALIZED VIEW, or DROP without IF EXISTS -> unsupported.
+    Unsupported,
+}
+
+/// Classify a materialized-view statement, or `None` if `stmt` is not one.
+fn classify_materialized_view(stmt: &Statement) -> Option<MaterializedViewStmt> {
+    use sqlparser::ast::ObjectType;
+    match stmt {
+        Statement::Drop {
+            object_type: ObjectType::MaterializedView,
+            if_exists,
+            ..
+        } => Some(if *if_exists {
+            MaterializedViewStmt::DropIfExistsNoop
+        } else {
+            MaterializedViewStmt::Unsupported
+        }),
+        Statement::CreateView(cv) if cv.materialized => Some(MaterializedViewStmt::Unsupported),
+        _ => None,
+    }
+}
+
 fn replace_table_reference(sql: &str, needle: &str, replacement: &str) -> String {
     if needle.is_empty() {
         return sql.to_string();
@@ -5626,6 +5677,52 @@ mod tests {
     use super::*;
     use sqe_core::config::QueryConfig;
     use sqe_core::session::Session;
+
+    fn parse_one(sql: &str) -> Statement {
+        use sqlparser::dialect::GenericDialect;
+        use sqlparser::parser::Parser;
+        Parser::parse_sql(&GenericDialect {}, sql)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap()
+    }
+
+    #[test]
+    fn classify_materialized_view_distinguishes_noop_from_unsupported() {
+        // DROP MATERIALIZED VIEW IF EXISTS -> safe no-op for client compat.
+        assert_eq!(
+            classify_materialized_view(&parse_one(
+                "DROP MATERIALIZED VIEW IF EXISTS iceberg.default.mv"
+            )),
+            Some(MaterializedViewStmt::DropIfExistsNoop)
+        );
+        // DROP without IF EXISTS -> unsupported (would error in Trino anyway).
+        assert_eq!(
+            classify_materialized_view(&parse_one("DROP MATERIALIZED VIEW iceberg.default.mv")),
+            Some(MaterializedViewStmt::Unsupported)
+        );
+        // CREATE MATERIALIZED VIEW -> unsupported, not silently a plain view.
+        assert_eq!(
+            classify_materialized_view(&parse_one(
+                "CREATE MATERIALIZED VIEW mv AS SELECT 1 a"
+            )),
+            Some(MaterializedViewStmt::Unsupported)
+        );
+        // Plain views and table drops are not MV statements.
+        assert_eq!(
+            classify_materialized_view(&parse_one("CREATE VIEW v AS SELECT 1 a")),
+            None
+        );
+        assert_eq!(
+            classify_materialized_view(&parse_one("DROP VIEW IF EXISTS v")),
+            None
+        );
+        assert_eq!(
+            classify_materialized_view(&parse_one("DROP TABLE IF EXISTS t")),
+            None
+        );
+    }
 
     #[test]
     fn explicit_catalog_component_only_for_three_part() {
