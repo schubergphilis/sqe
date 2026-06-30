@@ -102,6 +102,11 @@ pub enum StatementKind {
     ShowCreateTable(Box<Statement>),
     /// TRUNCATE TABLE name — routes to DELETE FROM without WHERE
     Truncate(String),
+    /// ANALYZE [catalog.][schema.]table [WITH (...)] — Trino table-statistics
+    /// command. Carries the raw (possibly dotted/quoted) table reference; the
+    /// handler resolves it against the catalog (so a missing table errors) and
+    /// treats stats collection as a no-op (#329).
+    Analyze(String),
     /// CALL procedure — not supported, returns informative error
     Call(Box<Statement>),
     /// CALL system.<maintenance procedure>(...) matched against the
@@ -179,6 +184,7 @@ impl StatementKind {
             StatementKind::Use(_) => "use",
             StatementKind::ShowCreateTable(_) => "showcreatetable",
             StatementKind::Truncate(_) => "truncate",
+            StatementKind::Analyze(_) => "analyze",
             StatementKind::Call(_) => "call",
             StatementKind::Procedure(_) => "procedure",
             StatementKind::AlterTableProps(_) => "altertableprops",
@@ -285,6 +291,16 @@ pub fn parse_and_classify(sql: &str) -> sqe_core::Result<StatementKind> {
     if let Some(rest) = strip_prefix_ci(trimmed, "SHOW STATS FOR ") {
         let table = rest.trim().trim_end_matches(';').to_string();
         return Ok(StatementKind::ShowStats(table));
+    }
+
+    // Pre-scan for ANALYZE [TABLE] <table> [WITH (...)]. sqlparser's
+    // `parse_analyze` stops at the `WITH` keyword, so Trino's
+    // `ANALYZE t WITH (...)` form leaves trailing tokens and fails to parse.
+    // Intercept the whole statement here, extract the table reference, and
+    // drop any WITH/PARTITION/FOR-COLUMNS clause: SQE treats ANALYZE as a
+    // stats no-op (#329), so the analyze properties do not affect behaviour.
+    if let Some(rest) = strip_prefix_ci(trimmed, "ANALYZE ") {
+        return parse_analyze(rest);
     }
 
     // Pre-scan for SHOW EFFECTIVE GRANTS FOR USER "name"
@@ -648,6 +664,30 @@ fn classify(stmt: Statement) -> sqe_core::Result<StatementKind> {
             "Statement type not supported: {stmt}"
         ))),
     }
+}
+
+/// Parse the remainder of an `ANALYZE ...` statement (everything after the
+/// `ANALYZE ` prefix) into [`StatementKind::Analyze`] carrying the table
+/// reference. Accepts the optional `TABLE` keyword and ignores any trailing
+/// `WITH (...)`, `PARTITION (...)`, or `FOR COLUMNS ...` clause: the table
+/// name ends at the first whitespace or `(`. The reference is kept raw
+/// (possibly dotted) and resolved by the coordinator handler.
+fn parse_analyze(rest: &str) -> sqe_core::Result<StatementKind> {
+    let rest = rest.trim().trim_end_matches(';').trim();
+    // Optional `TABLE` keyword (Hive-style `ANALYZE TABLE t`).
+    let rest = strip_prefix_ci(rest, "TABLE ").map(str::trim).unwrap_or(rest);
+    let table = rest
+        .split(|c: char| c.is_whitespace() || c == '(')
+        .next()
+        .unwrap_or("")
+        .trim();
+    if table.is_empty() {
+        return Err(sqe_core::SqeError::Execution(
+            "ANALYZE requires a table name: ANALYZE [catalog.][schema.]table [WITH (...)]"
+                .to_string(),
+        ));
+    }
+    Ok(StatementKind::Analyze(table.to_string()))
 }
 
 /// Parse a dotted resource reference like `catalog.namespace.table` into
@@ -1444,6 +1484,51 @@ mod tests {
             .remove(0);
         let kind = StatementKind::ShowCreateTable(Box::new(stmt));
         assert_eq!(kind.name(), "showcreatetable");
+    }
+
+    #[test]
+    fn test_analyze_bare_table() {
+        let result = parse_and_classify("ANALYZE t").unwrap();
+        match result {
+            StatementKind::Analyze(table) => assert_eq!(table, "t"),
+            other => panic!("Expected Analyze, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_analyze_schema_qualified() {
+        let result = parse_and_classify("ANALYZE myschema.orders").unwrap();
+        match result {
+            StatementKind::Analyze(table) => assert_eq!(table, "myschema.orders"),
+            other => panic!("Expected Analyze, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_analyze_catalog_qualified_with_properties() {
+        // sqlparser cannot parse the trailing WITH (...); the pre-scan must.
+        let result =
+            parse_and_classify("ANALYZE iceberg.default.t WITH (partitioning = ARRAY['x'])")
+                .unwrap();
+        match result {
+            StatementKind::Analyze(table) => assert_eq!(table, "iceberg.default.t"),
+            other => panic!("Expected Analyze, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_analyze_table_keyword_stripped() {
+        let result = parse_and_classify("ANALYZE TABLE cat.sch.tbl").unwrap();
+        match result {
+            StatementKind::Analyze(table) => assert_eq!(table, "cat.sch.tbl"),
+            other => panic!("Expected Analyze, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_analyze_name_label() {
+        let kind = StatementKind::Analyze("t".to_string());
+        assert_eq!(kind.name(), "analyze");
     }
 
     #[test]
