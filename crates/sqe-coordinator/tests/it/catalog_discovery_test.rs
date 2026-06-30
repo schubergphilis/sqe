@@ -439,6 +439,80 @@ async fn polaris_auto_lazy_hit() {
     assert_eq!(label_arr.value(0), "discovered");
 }
 
+/// #334: row-level mutations against a DISCOVERED (non-default) catalog must
+/// load and commit against the discovered warehouse, not the session-default
+/// one. Before the fix the UPDATE/DELETE/MERGE handlers used the passed
+/// `session_catalog` (the configured default `test_warehouse`) instead of
+/// resolving the target catalog from the 3-part name the way INSERT does, so
+/// loading the target failed with "table does not exist" even though
+/// INSERT/SELECT/CTAS resolved the same table.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
+async fn polaris_auto_mutations_on_discovered_catalog() {
+    let _live = LIVE_STACK_LOCK.lock().await;
+    crate::common::init_tracing();
+
+    // Seed a mutable table in `discovery_test_wh` via a handler whose default
+    // catalog IS the discovery warehouse, so the rows land there.
+    {
+        let seed_handler = make_handler(seed_config());
+        let session = live_session().await;
+        let _ = seed_handler
+            .execute(&session, "DROP TABLE IF EXISTS disc_ns.mut_t", None)
+            .await;
+        seed_handler
+            .execute(
+                &session,
+                "CREATE TABLE disc_ns.mut_t (id BIGINT, amt BIGINT)", None)
+            .await
+            .expect("create disc_ns.mut_t in discovery_test_wh");
+        seed_handler
+            .execute(
+                &session,
+                "INSERT INTO disc_ns.mut_t VALUES (1, 10), (2, 20), (3, 30)", None)
+            .await
+            .expect("insert into disc_ns.mut_t");
+    }
+    // Flush caches so the polaris-auto handler builds a fresh context whose
+    // default catalog is `test_warehouse`, not the seed handler's discovery wh.
+    sqe_coordinator::session_context::invalidate_all_session_caches().await;
+
+    // Operate through a polaris-auto handler whose DEFAULT catalog is
+    // `test_warehouse`, addressing the table by its 3-part discovered name.
+    let handler = make_handler(polaris_auto_config());
+    let session = live_session().await;
+
+    handler
+        .execute(
+            &session,
+            "UPDATE discovery_test_wh.disc_ns.mut_t SET amt = amt + 1 WHERE id = 1", None)
+        .await
+        .expect("UPDATE on a discovered-catalog table must succeed (#334)");
+
+    handler
+        .execute(
+            &session,
+            "DELETE FROM discovery_test_wh.disc_ns.mut_t WHERE id = 3", None)
+        .await
+        .expect("DELETE on a discovered-catalog table must succeed (#334)");
+
+    // Net effect: row 3 deleted (2 rows remain).
+    let batches = handler
+        .execute(
+            &session,
+            "SELECT id, amt FROM discovery_test_wh.disc_ns.mut_t ORDER BY id", None)
+        .await
+        .expect("read back after mutations");
+    let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(rows, 2, "DELETE should have removed exactly one row");
+
+    let _ = handler
+        .execute(
+            &session,
+            "DROP TABLE IF EXISTS discovery_test_wh.disc_ns.mut_t", None)
+        .await;
+}
+
 /// Flight `get_flight_info` regression (the actual reported bug): `get_schema`
 /// on a discovered warehouse must return the table's schema, not "table not
 /// found". This is the schema-planning twin of `polaris_auto_lazy_hit` and the

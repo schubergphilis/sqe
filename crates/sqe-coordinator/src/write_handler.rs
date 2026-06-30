@@ -2188,6 +2188,19 @@ impl WriteHandler {
         ctx: &DFSessionContext,
         plan_out: &mut Option<sqe_lineage::PlanOrHint>,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
+        // Resolve the target catalog from the table reference, mirroring INSERT,
+        // so a DELETE against a discovered/non-default catalog loads and commits
+        // against the right warehouse instead of the session-default one (#334).
+        // On name-extraction failure keep the passed catalog; the slow path
+        // surfaces the original error in context.
+        let catalog = match delete_target_object_name(stmt) {
+            Ok(name) => {
+                let target = resolve_target_catalog(catalog_qualifier(name), session);
+                self.resolve_session_catalog(session, target.as_deref()).await?
+            }
+            Err(_) => catalog,
+        };
+
         // Peek at the target table to read its properties. Any parse or
         // load error falls through to the default CoW path, which surfaces
         // the error at that point.
@@ -2422,6 +2435,17 @@ impl WriteHandler {
         ctx: &DFSessionContext,
         plan_out: &mut Option<sqe_lineage::PlanOrHint>,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
+        // Resolve the target catalog from the table reference, mirroring INSERT,
+        // so an UPDATE against a discovered/non-default catalog loads and commits
+        // against the right warehouse instead of the session-default one (#334).
+        let catalog = match update_target_object_name(stmt) {
+            Ok(name) => {
+                let target = resolve_target_catalog(catalog_qualifier(name), session);
+                self.resolve_session_catalog(session, target.as_deref()).await?
+            }
+            Err(_) => catalog,
+        };
+
         // Peek at the target table to read its properties.
         let Ok(table_factor_name) = update_target_object_name(stmt) else {
             return self.handle_update(session, stmt, catalog, ctx).await;
@@ -3108,6 +3132,20 @@ impl WriteHandler {
         source_plan: Option<LogicalPlan>,
         plan_out: &mut Option<sqe_lineage::PlanOrHint>,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
+        // Resolve the target catalog from the table reference, mirroring INSERT,
+        // so a MERGE against a discovered/non-default catalog loads and commits
+        // against the right warehouse instead of the session-default one (#334).
+        let catalog = match stmt {
+            Statement::Merge(merge) => match &merge.table {
+                sqlparser::ast::TableFactor::Table { name, .. } => {
+                    let target = resolve_target_catalog(catalog_qualifier(name), session);
+                    self.resolve_session_catalog(session, target.as_deref()).await?
+                }
+                _ => catalog,
+            },
+            _ => catalog,
+        };
+
         // Peek at the target table to read its properties.
         let merge_table = match stmt {
             Statement::Merge(merge) => &merge.table,
@@ -4513,11 +4551,21 @@ impl WriteHandler {
     /// instead of the configured default warehouse. Symmetric with the read
     /// path: an explicit catalog Polaris cannot resolve is an "unknown catalog"
     /// error, not a silent fall-through to the default warehouse.
-    async fn create_catalog_bridge(
+    /// Resolve the typed [`SessionCatalog`] for a write target.
+    ///
+    /// `target_warehouse` is the catalog qualifier resolved from the table
+    /// reference via [`resolve_target_catalog`]: `Some(w)` selects a
+    /// discovered/non-default catalog; `None` (or the configured default)
+    /// uses the session's default warehouse. Returns the concrete
+    /// `Arc<SessionCatalog>` so the UPDATE/DELETE/MERGE handlers (which thread
+    /// `Arc<SessionCatalog>`, not `dyn Catalog`) can load and commit against
+    /// the right warehouse; [`Self::create_catalog_bridge`] wraps the same
+    /// value as `dyn Catalog` for the INSERT/CTAS paths.
+    async fn resolve_session_catalog(
         &self,
         session: &Session,
         target_warehouse: Option<&str>,
-    ) -> sqe_core::Result<Arc<dyn Catalog>> {
+    ) -> sqe_core::Result<Arc<SessionCatalog>> {
         let session_catalog = match target_warehouse {
             Some(warehouse)
                 if warehouse != self.config.catalog.warehouse
@@ -4553,7 +4601,18 @@ impl WriteHandler {
         // session state before load_table works correctly.
         let _ = session_catalog.list_namespaces().await;
 
-        Ok(session_catalog.as_catalog())
+        Ok(session_catalog)
+    }
+
+    async fn create_catalog_bridge(
+        &self,
+        session: &Session,
+        target_warehouse: Option<&str>,
+    ) -> sqe_core::Result<Arc<dyn Catalog>> {
+        Ok(self
+            .resolve_session_catalog(session, target_warehouse)
+            .await?
+            .as_catalog())
     }
 }
 
