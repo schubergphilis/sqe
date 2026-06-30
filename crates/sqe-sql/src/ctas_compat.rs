@@ -167,6 +167,14 @@ fn rewrite_ctas(sql: &str) -> Option<String> {
     }
     let as_idx = meaningful[p];
 
+    // Detect the Trino `AS TABLE <source>` shorthand, which is sugar for
+    // `AS SELECT * FROM <source>`. sqlparser accepts a single-identifier source
+    // but fails on a qualified `catalog.schema.table` (the dot), so this rewrite
+    // supplies the expansion. The source token after `TABLE` is captured below.
+    // #330.
+    let as_table = p + 1 < meaningful.len() && is_word(&tokens[meaningful[p + 1]], Keyword::TABLE);
+    let as_table_source_tok = if as_table { meaningful[p + 1] + 1 } else { 0 };
+
     // Detect a trailing `WITH DATA` / `WITH NO DATA` (depth 0, statement tail,
     // before an optional `;`).
     let mut last = meaningful.len() - 1;
@@ -196,7 +204,7 @@ fn rewrite_ctas(sql: &str) -> Option<String> {
     }
 
     let has_alias = alias_open_mi.is_some();
-    if !has_alias && !with_data && !with_no_data {
+    if !has_alias && !with_data && !with_no_data && !as_table {
         return None; // nothing this rewrite handles
     }
 
@@ -228,14 +236,28 @@ fn rewrite_ctas(sql: &str) -> Option<String> {
     let header = render(&tokens[0..header_end_tok]);
     let header = header.trim_end();
 
+    // The select body. For `AS TABLE <source>` the source is everything after
+    // the `TABLE` keyword, expanded to `SELECT * FROM <source>`; otherwise the
+    // body is the query verbatim.
+    let select_body = if as_table {
+        let source = render(&tokens[as_table_source_tok..query_end_tok]);
+        let source = source.trim();
+        if source.is_empty() {
+            return None;
+        }
+        format!("SELECT * FROM {source}")
+    } else {
+        query_str.to_string()
+    };
+
     // Build the body, applying column aliases and/or emptiness.
     let mut body = if has_alias {
         format!(
-            "SELECT * FROM ({query_str}) AS {CTA_ALIAS}({})",
+            "SELECT * FROM ({select_body}) AS {CTA_ALIAS}({})",
             aliases.join(", ")
         )
     } else {
-        query_str.to_string()
+        select_body
     };
     if with_no_data {
         body = format!("SELECT * FROM ({body}) AS {NO_DATA_ALIAS} LIMIT 0");
@@ -343,6 +365,42 @@ mod tests {
         assert!(parses(&out), "rewrite must parse: {out}");
         assert!(out.contains(&format!("{CTA_ALIAS}(a, b)")), "aliases applied: {out}");
         assert!(out.to_ascii_uppercase().contains("LIMIT 0"), "empties result: {out}");
+    }
+
+    #[test]
+    fn as_table_qualified_source_becomes_select_star() {
+        // #330: `AS TABLE cat.schema.tbl` is Trino sugar for `AS SELECT * FROM
+        // cat.schema.tbl`. The dotted source is what sqlparser chokes on.
+        let out = rewrite_ctas_compat(
+            "CREATE TABLE iceberg.default.t WITH (format='PARQUET') AS TABLE tpch.tiny.nation",
+        );
+        assert!(parses(&out), "rewrite must parse: {out}");
+        assert!(
+            out.contains("AS SELECT * FROM tpch.tiny.nation"),
+            "AS TABLE expanded to SELECT *: {out}"
+        );
+        // The WITH (format=...) table option is preserved on the header.
+        assert!(out.contains("WITH (format='PARQUET')"), "table options kept: {out}");
+        assert!(!out.to_ascii_uppercase().contains("AS TABLE"), "AS TABLE form gone: {out}");
+    }
+
+    #[test]
+    fn as_table_with_no_data_combines() {
+        // `AS TABLE <src> WITH NO DATA` -> empty copy of the source schema.
+        let out = rewrite_ctas_compat("CREATE TABLE t AS TABLE tpch.tiny.nation WITH NO DATA");
+        assert!(parses(&out), "rewrite must parse: {out}");
+        assert!(out.contains("SELECT * FROM tpch.tiny.nation"), "source expanded: {out}");
+        assert!(out.to_ascii_uppercase().contains("LIMIT 0"), "empties result: {out}");
+    }
+
+    #[test]
+    fn as_table_quoted_source_preserved() {
+        let out = rewrite_ctas_compat(r#"CREATE TABLE t AS TABLE iceberg."my schema".events"#);
+        assert!(parses(&out), "rewrite must parse: {out}");
+        assert!(
+            out.contains(r#"SELECT * FROM iceberg."my schema".events"#),
+            "quoted identifier preserved: {out}"
+        );
     }
 
     #[test]
