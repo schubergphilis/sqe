@@ -207,3 +207,40 @@ Notes:
   works at HEAD (genuine uuid fidelity is upstream-blocked); #332's simple
   hypotheses are disproven and it needs a live reproduction to capture the real
   error origin.
+
+## Full-package sweep + SQL-surface probe (2026-06-30): issues #335-#344
+
+SQE image rebuilt from main with #329/#321/#334 merged. Full
+`io.trino.tests.product.iceberg` sweep: **349 tests, 2 passed, 347 failed**
+(~70 failures are harness-side `unknown catalog 'hive'/'tpch'` -- need
+Spark/Hive/extra catalogs this stack lacks). Merged fixes confirmed *absent*
+from the entire error harvest: #314 wire error, FETCH WITH TIES, AS TABLE,
+ALTER EXECUTE, bare VALUES, positional CALL, `$snapshots` shape, ANALYZE.
+`rollback_to_snapshot` execution stub remains the 1 allow-list FAIL (tracked).
+
+After the sweep, a direct curl probe battery over the broader Trino SQL surface
+(functions, window fns, set ops, types, DDL, joins, subqueries, DML/MERGE,
+struct access) ran against the `iceberg` catalog. Most of it passes (lambdas,
+json/map/array fns, date/time, window frames, UNION/INTERSECT/EXCEPT,
+approx_*, MERGE/UPDATE/DELETE, COMMENT ON, ADD/RENAME COLUMN, partitioned
+CREATE, CTAS WITH/NO DATA, info_schema, struct field read). Genuine gaps filed:
+
+| Issue | Gap | Repro | SQE error |
+|---|---|---|---|
+| #335 | ROW as CAST/expression type (nested + parameterized field types); blocks struct INSERT | `CAST(row(1,row(10)) AS row(a int,b row(x int)))`; `INSERT ... CAST(ROW(...) AS ROW(...))` | `Expected: type modifiers, found: (` / `Unsupported SQL type row(...)` |
+| #336 | `ALTER TABLE DROP COLUMN nested.subfield` | `ALTER TABLE t DROP COLUMN _struct._field` | `Expected: end of statement, found: .` |
+| #337 | unquoted ident vs case-preserved column (DESIGN DECISION) | col `"testInteger"`, `SELECT testInteger` | `No field named testinteger` |
+| #338 | `ALTER TABLE SET PROPERTIES` | `ALTER TABLE t SET PROPERTIES format_version = 2` | `Expected: (, found: PROPERTIES` |
+| #339 | `CAST AS VARBINARY` / varbinary type | `SELECT CAST('abc' AS varbinary)` | `Unsupported SQL type VARBINARY` |
+| #340 | `listagg(...) WITHIN GROUP` | `listagg(x,',') WITHIN GROUP (ORDER BY x)` | `WITHIN GROUP is only supported for ordered-set aggregate functions` |
+| #341 | `UNNEST ... WITH ORDINALITY` | `UNNEST(ARRAY[1,2]) WITH ORDINALITY` | `UNNEST with ordinality is not supported yet` |
+| #342 | correlated scalar subquery & LATERAL not physically planned | `SELECT (SELECT a.x) FROM (VALUES 1) a(x)`; `LATERAL (SELECT a.x+1)` | `Physical plan does not support logical expression ScalarSubquery/OuterReferenceColumn` |
+| #343 | `CREATE TABLE ... LIKE` | `CREATE TABLE c (LIKE src)` | `SQL type not supported for CREATE TABLE: src` |
+| #344 | `SHOW FUNCTIONS` | `SHOW FUNCTIONS` | `Utility statement not supported: SHOW FUNCTIONS` |
+
+False positives ruled out this round: `COMMENT ON TABLE` (test-ordering, table
+absent at call time -> works once created); `PREPARE`/`DESCRIBE OUTPUT`
+(prepared statements live in the Trino session via `X-Trino-Added-Prepare`
+response headers that separate curl calls don't carry -- not a SQE gap). Struct
+field *read* (`info.name`, `info['name']`) works; only struct *construction*
+(ROW value) is blocked, by #335.
