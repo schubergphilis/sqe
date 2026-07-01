@@ -256,6 +256,15 @@ pub fn parse_parquet_compression(s: &str) -> Compression {
     }
 }
 
+/// Resolve the effective Parquet write compression.
+///
+/// A per-session codec (`session_codec`, from the Trino `iceberg.compression_codec`
+/// session property, #353) wins over the static `config_codec` default. Both go
+/// through [`parse_parquet_compression`], so an unknown value falls back to ZSTD.
+pub fn resolve_write_compression(session_codec: Option<&str>, config_codec: &str) -> Compression {
+    parse_parquet_compression(session_codec.unwrap_or(config_codec))
+}
+
 /// Build `WriterProperties` with the given compression codec.
 ///
 /// Used by the position-delete writer and other paths that do not carry an
@@ -1033,6 +1042,25 @@ mod tests {
     fn lz4_string_maps_to_lz4_raw() {
         assert_eq!(parse_parquet_compression("lz4"), Compression::LZ4_RAW);
         assert_eq!(parse_parquet_compression("LZ4"), Compression::LZ4_RAW);
+    }
+
+    #[test]
+    fn resolve_write_compression_session_wins_over_config() {
+        // Session override takes precedence.
+        assert_eq!(
+            resolve_write_compression(Some("snappy"), "zstd"),
+            Compression::SNAPPY
+        );
+        // No session override -> config default.
+        assert_eq!(
+            resolve_write_compression(None, "snappy"),
+            Compression::SNAPPY
+        );
+        // Unknown session codec -> ZSTD fallback (no panic), matching config leniency.
+        assert_eq!(
+            resolve_write_compression(Some("garbage"), "snappy"),
+            Compression::ZSTD(ZstdLevel::try_new(3).unwrap())
+        );
     }
 
     /// Empirical proof that an `LZ4_RAW`-compressed Parquet file written with

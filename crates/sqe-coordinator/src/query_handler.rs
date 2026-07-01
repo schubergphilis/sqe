@@ -867,6 +867,12 @@ impl QueryHandler {
                         // SHOW FUNCTIONS -> list the registered functions with
                         // Trino's column shape (#344).
                         self.handle_show_functions(session).await
+                    } else if is_show_roles(stmt.as_ref()) {
+                        // SHOW ROLES / SHOW CURRENT ROLES / SHOW ROLE GRANTS ->
+                        // the caller's roles from the OIDC token. SQE has no
+                        // global role registry, so "available roles" is the
+                        // caller's own set (#350).
+                        self.handle_show_roles(session)
                     } else if let Some(mv) = classify_materialized_view(stmt.as_ref()) {
                         // SQE does not support materialized views (#324).
                         // DROP MATERIALIZED VIEW IF EXISTS is a client-compat
@@ -4727,6 +4733,23 @@ impl QueryHandler {
         Ok(vec![batch])
     }
 
+    /// SHOW ROLES / SHOW CURRENT ROLES / SHOW ROLE GRANTS -> the caller's roles.
+    ///
+    /// SQE derives roles from the OIDC token, not a global role catalog, so all
+    /// three return the caller's own roles under a single `Role` column (Trino's
+    /// column name). This lets JDBC clients that probe roles on connect proceed
+    /// (#350).
+    fn handle_show_roles(&self, session: &Session) -> sqe_core::Result<Vec<RecordBatch>> {
+        let schema = Arc::new(Schema::new(vec![Field::new("Role", DataType::Utf8, false)]));
+        let mut role_b = StringBuilder::new();
+        for role in &session.user.roles {
+            role_b.append_value(role);
+        }
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(role_b.finish()) as ArrayRef])
+            .map_err(|e| SqeError::Execution(format!("Failed to build SHOW ROLES result: {e}")))?;
+        Ok(vec![batch])
+    }
+
     /// Drop a table if it exists — used for CREATE OR REPLACE TABLE.
     async fn drop_table_if_exists(
         &self,
@@ -4851,6 +4874,22 @@ fn classify_materialized_view(stmt: &Statement) -> Option<MaterializedViewStmt> 
         Statement::CreateView(cv) if cv.materialized => Some(MaterializedViewStmt::Unsupported),
         _ => None,
     }
+}
+
+/// True for Trino role-introspection statements: `SHOW ROLES`,
+/// `SHOW CURRENT ROLES`, `SHOW ROLE GRANTS`. sqlparser 0.62 has no dedicated
+/// AST node for these, so they land in the generic `ShowVariable` catch-all
+/// (`SHOW <idents>`); match the exact identifier sequences (#350).
+fn is_show_roles(stmt: &Statement) -> bool {
+    let Statement::ShowVariable { variable } = stmt else {
+        return false;
+    };
+    let idents: Vec<String> = variable.iter().map(|i| i.value.to_ascii_uppercase()).collect();
+    let parts: Vec<&str> = idents.iter().map(String::as_str).collect();
+    matches!(
+        parts.as_slice(),
+        ["ROLES"] | ["CURRENT", "ROLES"] | ["ROLE", "GRANTS"]
+    )
 }
 
 fn replace_table_reference(sql: &str, needle: &str, replacement: &str) -> String {
@@ -5841,6 +5880,16 @@ mod tests {
             .into_iter()
             .next()
             .unwrap()
+    }
+
+    #[test]
+    fn is_show_roles_matches_the_three_role_statements() {
+        assert!(is_show_roles(&parse_one("SHOW ROLES")));
+        assert!(is_show_roles(&parse_one("SHOW CURRENT ROLES")));
+        assert!(is_show_roles(&parse_one("SHOW ROLE GRANTS")));
+        // Other SHOW <x> statements must fall through, not be swallowed.
+        assert!(!is_show_roles(&parse_one("SHOW TIMEZONE")));
+        assert!(!is_show_roles(&parse_one("SHOW roles_extra")));
     }
 
     #[test]
