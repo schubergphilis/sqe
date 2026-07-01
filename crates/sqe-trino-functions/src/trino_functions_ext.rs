@@ -1187,8 +1187,17 @@ impl ScalarUDFImpl for ParseDatetime {
                 ColumnarValue::Scalar(ScalarValue::Utf8(Some(joda_fmt))),
             ) => {
                 let chrono_fmt = joda_to_chrono(joda_fmt);
+                // Try full datetime first; fall back to a date-only pattern.
+                // chrono's NaiveDateTime parse requires a time component, but
+                // Trino's parse_datetime accepts date-only patterns and returns
+                // midnight (e.g. parse_datetime('2020-01-02','yyyy-MM-dd')).
                 let ts = NaiveDateTime::parse_from_str(s, &chrono_fmt)
                     .ok()
+                    .or_else(|| {
+                        NaiveDate::parse_from_str(s, &chrono_fmt)
+                            .ok()
+                            .and_then(|d| d.and_hms_opt(0, 0, 0))
+                    })
                     .map(|dt| dt.and_utc().timestamp_micros());
                 Ok(ColumnarValue::Scalar(ScalarValue::TimestampMicrosecond(
                     ts, None,
@@ -1202,30 +1211,50 @@ impl ScalarUDFImpl for ParseDatetime {
 }
 
 /// Translate Joda datetime format patterns to chrono format patterns.
-/// Covers the most common patterns used in Trino queries.
+///
+/// Single pass over the input, greedily matching the longest token at each
+/// position. A chained `str::replace` (the previous approach) re-scanned its
+/// own output: after `"dd" -> "%d"`, a later `"d" -> "%d"` re-hit the `d` inside
+/// the just-emitted `%d` and corrupted it to `%%d` (a literal `%d`), so almost
+/// every date format failed to parse. Emitting tokens in one pass avoids that.
 fn joda_to_chrono(joda: &str) -> String {
-    // Order matters — longer patterns must be replaced before shorter ones
-    joda.replace("yyyy", "%Y")
-        .replace("yy", "%y")
-        .replace("MMMM", "%B")  // full month name
-        .replace("MMM", "%b")   // abbreviated month
-        .replace("MM", "%m")    // zero-padded month
-        .replace("M", "%m")
-        .replace("dd", "%d")    // zero-padded day
-        .replace("d", "%d")
-        .replace("HH", "%H")    // 24-hour
-        .replace("hh", "%I")    // 12-hour
-        .replace("H", "%H")
-        .replace("h", "%I")
-        .replace("mm", "%M")    // minute
-        .replace("ss", "%S")    // second
-        .replace("SSS", "%.3f") // milliseconds
-        .replace("SS", "%.2f")
-        .replace("EEEE", "%A")  // full day name (must be before EEE)
-        .replace("EEE", "%a")   // abbreviated day name
-        .replace("ZZ", "%:z")   // timezone offset with colon
-        .replace("Z", "%z")     // timezone offset
-        .replace("a", "%p")     // AM/PM
+    // Longest variant of each letter group first so the greedy match is correct.
+    const TOKENS: &[(&str, &str)] = &[
+        ("yyyy", "%Y"),
+        ("yy", "%y"),
+        ("MMMM", "%B"), // full month name
+        ("MMM", "%b"),  // abbreviated month
+        ("MM", "%m"),   // zero-padded month
+        ("M", "%m"),
+        ("dd", "%d"), // zero-padded day
+        ("d", "%d"),
+        ("HH", "%H"), // 24-hour
+        ("H", "%H"),
+        ("hh", "%I"), // 12-hour
+        ("h", "%I"),
+        ("mm", "%M"),   // minute
+        ("ss", "%S"),   // second
+        ("SSS", "%.3f"), // milliseconds
+        ("SS", "%.2f"),
+        ("EEEE", "%A"), // full day name (before EEE)
+        ("EEE", "%a"),  // abbreviated day name
+        ("ZZ", "%:z"),  // timezone offset with colon
+        ("Z", "%z"),    // timezone offset
+        ("a", "%p"),    // AM/PM
+    ];
+    let mut out = String::with_capacity(joda.len() * 2);
+    let mut rest = joda;
+    while !rest.is_empty() {
+        if let Some((pat, rep)) = TOKENS.iter().find(|(p, _)| rest.starts_with(p)) {
+            out.push_str(rep);
+            rest = &rest[pat.len()..];
+        } else {
+            let ch = rest.chars().next().unwrap();
+            out.push(ch);
+            rest = &rest[ch.len_utf8()..];
+        }
+    }
+    out
 }
 
 /// word_stem(s) or word_stem(s, lang) → stemmed word in the specified language.
@@ -1858,5 +1887,61 @@ fn scalar_to_json_string(v: &ScalarValue) -> String {
         ScalarValue::Boolean(Some(b)) => b.to_string(),
         ScalarValue::Null => "null".to_string(),
         other => format!("\"{other}\""),
+    }
+}
+
+#[cfg(test)]
+mod parse_datetime_tests {
+    use super::*;
+    use arrow::array::{Array, TimestampMicrosecondArray};
+    use datafusion::prelude::SessionContext;
+
+    #[test]
+    fn joda_to_chrono_does_not_corrupt_repeated_letters() {
+        // Regression for the chained-replace bug that produced `%%d` / `%%H`.
+        assert_eq!(joda_to_chrono("yyyy-MM-dd HH:mm:ss"), "%Y-%m-%d %H:%M:%S");
+        assert_eq!(joda_to_chrono("yyyy-MM-dd"), "%Y-%m-%d");
+        assert_eq!(joda_to_chrono("HH:mm"), "%H:%M");
+        assert_eq!(joda_to_chrono("yy/M/d"), "%y/%m/%d");
+    }
+
+    async fn parse_dt(s: &str, fmt: &str) -> Option<i64> {
+        let ctx = SessionContext::new();
+        register_extended_trino_functions(&ctx);
+        let sql = format!("SELECT parse_datetime('{s}', '{fmt}')");
+        let b = ctx.sql(&sql).await.unwrap().collect().await.unwrap();
+        let a = b[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        if a.is_null(0) {
+            None
+        } else {
+            Some(a.value(0))
+        }
+    }
+
+    #[tokio::test]
+    async fn parse_datetime_handles_date_only_and_datetime() {
+        // Date-only pattern -> midnight (matches Trino), previously returned NULL.
+        let midnight = NaiveDate::from_ymd_opt(2020, 1, 2)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc()
+            .timestamp_micros();
+        assert_eq!(parse_dt("2020-01-02", "yyyy-MM-dd").await, Some(midnight));
+        // Full datetime pattern (previously corrupted to %%d/%%H -> NULL).
+        let dt = NaiveDate::from_ymd_opt(2020, 1, 2)
+            .unwrap()
+            .and_hms_opt(3, 4, 5)
+            .unwrap()
+            .and_utc()
+            .timestamp_micros();
+        assert_eq!(
+            parse_dt("2020-01-02 03:04:05", "yyyy-MM-dd HH:mm:ss").await,
+            Some(dt)
+        );
     }
 }
