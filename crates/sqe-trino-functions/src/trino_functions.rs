@@ -116,6 +116,9 @@ pub fn register_trino_functions(ctx: &datafusion::prelude::SessionContext) {
         .clone()
         .with_aliases(["split"]);
     ctx.register_udf(split);
+
+    // count_if, element_at (array/map), contains (array) (#356).
+    crate::coverage_fns::register_coverage_fns(ctx);
 }
 
 /// Register Trino-spelled aliases for existing DataFusion aggregate UDAFs.

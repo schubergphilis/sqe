@@ -295,6 +295,7 @@ Each section lists Trino functions with their SQE status:
 |---|---|---|---|
 | `count(*)` / `count(x)` | Same | ✅ | |
 | `count(DISTINCT x)` | Same | ✅ | |
+| `count_if(pred)` | `count_if(pred)` | ✅ | Trino compat UDAF; counts TRUE rows, ignores false and NULL |
 | `sum(x)` | Same | ✅ | |
 | `avg(x)` | Same | ✅ | |
 | `min(x)` / `max(x)` | Same | ✅ | |
