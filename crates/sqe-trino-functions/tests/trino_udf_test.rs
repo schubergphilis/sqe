@@ -949,6 +949,34 @@ async fn test_every_alias_resolves_to_bool_and() {
 }
 
 #[tokio::test]
+async fn test_variance_alias_resolves_to_var_samp() {
+    // variance(x) is the Trino spelling for the sample variance var_samp(x).
+    // var_samp of [1,2,3,4,5] = 2.5. (#333)
+    let ctx = ctx().await;
+    let df = ctx
+        .sql(
+            "SELECT variance(v), var_samp(v) \
+             FROM (VALUES (1.0), (2.0), (3.0), (4.0), (5.0)) t(v)",
+        )
+        .await
+        .expect("variance parse");
+    let batches = df.collect().await.expect("variance execute");
+    let variance: f64 = array_value_to_string(batches[0].column(0), 0)
+        .unwrap()
+        .parse()
+        .expect("variance result must parse as f64");
+    let var_samp: f64 = array_value_to_string(batches[0].column(1), 0)
+        .unwrap()
+        .parse()
+        .expect("var_samp result must parse as f64");
+    assert!((variance - 2.5).abs() < 1e-9, "variance([1..5]) should be 2.5, got {variance}");
+    assert!(
+        (variance - var_samp).abs() < 1e-9,
+        "variance must equal var_samp ({variance} vs {var_samp})"
+    );
+}
+
+#[tokio::test]
 async fn test_approx_percentile_alias() {
     let ctx = ctx().await;
     // approx_percentile(x, p) shares the impl with approx_percentile_cont.
