@@ -100,6 +100,12 @@ pub enum StatementKind {
     Use(String),
     /// SHOW CREATE TABLE name — reconstruct DDL from metadata
     ShowCreateTable(Box<Statement>),
+    /// SHOW CREATE SCHEMA name — reconstruct namespace DDL from metadata.
+    /// sqlparser 0.62 rejects the SCHEMA form outright (it only models
+    /// SHOW CREATE TABLE/VIEW/...), so this is detected by prefix before the
+    /// parser runs. Carries the raw (possibly dotted/quoted) schema reference.
+    /// (#351a)
+    ShowCreateSchema(String),
     /// TRUNCATE TABLE name — routes to DELETE FROM without WHERE
     Truncate(String),
     /// ANALYZE [catalog.][schema.]table [WITH (...)] — Trino table-statistics
@@ -183,6 +189,7 @@ impl StatementKind {
             StatementKind::Rollback => "rollback",
             StatementKind::Use(_) => "use",
             StatementKind::ShowCreateTable(_) => "showcreatetable",
+            StatementKind::ShowCreateSchema(_) => "showcreateschema",
             StatementKind::Truncate(_) => "truncate",
             StatementKind::Analyze(_) => "analyze",
             StatementKind::Call(_) => "call",
@@ -269,6 +276,37 @@ fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
     }
 }
 
+/// Detect the Trino/SQL `ALTER TABLE ... DROP COLUMN [IF EXISTS] <a.b...>`
+/// dotted-path form (a nested struct-subfield drop) and return the dotted path.
+/// Returns `None` for a plain (non-dotted) `DROP COLUMN`, which sqlparser
+/// parses natively. Matching is tolerant of case and whitespace; the path is
+/// the token sequence after `DROP COLUMN [IF EXISTS]` up to the next clause
+/// separator (comma, whitespace-then-clause, or end). Only fires when a `.`
+/// appears inside that path. (#336)
+fn detect_nested_drop_column(trimmed: &str) -> Option<String> {
+    let upper = trimmed.to_uppercase();
+    // Find the `DROP COLUMN` keyword pair (byte offset in the uppercased copy,
+    // which lines up with the original since the prefix is ASCII).
+    let idx = upper.find("DROP COLUMN")?;
+    let after = &trimmed[idx + "DROP COLUMN".len()..];
+    let after = after.trim_start();
+    // Skip an optional `IF EXISTS`.
+    let after = strip_prefix_ci(after, "IF EXISTS")
+        .map(|r| r.trim_start())
+        .unwrap_or(after);
+    // The column reference runs until a delimiter that ends it: whitespace,
+    // comma, or the statement terminator. A dotted path uses `.` internally.
+    let end = after
+        .find(|c: char| c.is_whitespace() || c == ',' || c == ';')
+        .unwrap_or(after.len());
+    let path = after[..end].trim();
+    if path.contains('.') && !path.is_empty() {
+        Some(path.to_string())
+    } else {
+        None
+    }
+}
+
 /// Parse a SQL string and classify the first statement.
 pub fn parse_and_classify(sql: &str) -> sqe_core::Result<StatementKind> {
     // Before parsing with sqlparser, check for SHOW CATALOGS which sqlparser
@@ -278,6 +316,21 @@ pub fn parse_and_classify(sql: &str) -> sqe_core::Result<StatementKind> {
 
     if upper == "SHOW CATALOGS" || upper.starts_with("SHOW CATALOGS ") {
         return Ok(StatementKind::ShowCatalogs);
+    }
+
+    // Pre-scan for SHOW CREATE SCHEMA <name>. sqlparser 0.62 only models
+    // SHOW CREATE for TABLE/VIEW/... and rejects the SCHEMA form at parse time,
+    // so it never reaches the AST match below. Intercept it here and carry the
+    // raw schema reference for the handler to resolve. (#351a). SHOW CREATE
+    // TABLE / VIEW still parse normally and flow through the AST match.
+    if let Some(rest) = strip_prefix_ci(trimmed, "SHOW CREATE SCHEMA ") {
+        let schema = rest.trim().trim_end_matches(';').trim().to_string();
+        if schema.is_empty() {
+            return Err(sqe_core::SqeError::Execution(
+                "SHOW CREATE SCHEMA requires a schema name".into(),
+            ));
+        }
+        return Ok(StatementKind::ShowCreateSchema(schema));
     }
 
     // Pre-scan for EXPLAIN FULL — not standard SQL, sqlparser won't parse it.
@@ -408,6 +461,20 @@ pub fn parse_and_classify(sql: &str) -> sqe_core::Result<StatementKind> {
         // Column-tag authoring; distinct from Iceberg snapshot CREATE/DROP TAG above.
         if let Some(set_tags) = try_parse_set_tags(trimmed)? {
             return Ok(StatementKind::SetTags(Box::new(set_tags)));
+        }
+        // ALTER TABLE t DROP COLUMN a.b — a dotted path drops a nested struct
+        // subfield. sqlparser 0.62 rejects the `.` with a baffling
+        // `Expected: end of statement, found: .`. Intercept the dotted form and
+        // surface a clear NotImplemented rather than the parser noise, so a
+        // client sees an actionable message. Nested Iceberg schema surgery
+        // (removing a subfield from a struct) is not yet implemented. A
+        // non-dotted DROP COLUMN still flows to sqlparser and the normal
+        // AlterSchema handler. (#336)
+        if let Some(path) = detect_nested_drop_column(trimmed) {
+            return Err(sqe_core::SqeError::NotImplemented(format!(
+                "dropping a nested column ('{path}') is not yet supported; \
+                 only top-level columns can be dropped"
+            )));
         }
     }
 
@@ -1615,6 +1682,43 @@ mod tests {
     }
 
     #[test]
+    fn test_show_create_schema_bare() {
+        // sqlparser rejects SHOW CREATE SCHEMA at parse time, so the prefix
+        // detection must intercept it and carry the raw schema name. (#351a)
+        let result = parse_and_classify("SHOW CREATE SCHEMA my_schema").unwrap();
+        match result {
+            StatementKind::ShowCreateSchema(name) => assert_eq!(name, "my_schema"),
+            other => panic!("Expected ShowCreateSchema, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_show_create_schema_qualified_and_trailing_semicolon() {
+        let result = parse_and_classify("show create schema iceberg.tpch_demo;").unwrap();
+        match result {
+            StatementKind::ShowCreateSchema(name) => assert_eq!(name, "iceberg.tpch_demo"),
+            other => panic!("Expected ShowCreateSchema, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_show_create_schema_missing_name_errors() {
+        assert!(parse_and_classify("SHOW CREATE SCHEMA").is_err());
+        assert!(parse_and_classify("SHOW CREATE SCHEMA   ").is_err());
+    }
+
+    #[test]
+    fn test_show_create_table_still_parses_after_schema_prefix_added() {
+        // Ensure the new SHOW CREATE SCHEMA prefix does not swallow the TABLE
+        // form, which still flows through the sqlparser AST path.
+        let result = parse_and_classify("SHOW CREATE TABLE my_schema.t");
+        assert!(
+            matches!(result, Ok(StatementKind::ShowCreateTable(_))),
+            "Expected ShowCreateTable, got: {result:?}"
+        );
+    }
+
+    #[test]
     fn test_analyze_bare_table() {
         let result = parse_and_classify("ANALYZE t").unwrap();
         match result {
@@ -2008,9 +2112,76 @@ mod tests {
     }
 
     #[test]
+    fn test_drop_nested_column_returns_clear_not_implemented() {
+        // #336: a dotted DROP COLUMN path must surface a clear NotImplemented
+        // instead of sqlparser's `Expected: end of statement, found: .`.
+        let err = parse_and_classify("ALTER TABLE t DROP COLUMN nested.subfield")
+            .expect_err("dotted DROP COLUMN should error");
+        assert!(matches!(err, sqe_core::SqeError::NotImplemented(_)), "got: {err:?}");
+        let msg = err.to_string();
+        assert!(msg.contains("nested.subfield"), "message should name the path: {msg}");
+    }
+
+    #[test]
+    fn test_drop_nested_column_if_exists() {
+        let err = parse_and_classify("ALTER TABLE t DROP COLUMN IF EXISTS a.b.c")
+            .expect_err("dotted DROP COLUMN IF EXISTS should error");
+        assert!(matches!(err, sqe_core::SqeError::NotImplemented(_)));
+        assert!(err.to_string().contains("a.b.c"));
+    }
+
+    #[test]
+    fn test_drop_top_level_column_still_alter_schema() {
+        // Regression: the nested-drop pre-scan must not steal a plain
+        // (non-dotted) DROP COLUMN, which sqlparser parses natively.
+        let kind = parse_and_classify("ALTER TABLE t DROP COLUMN x").unwrap();
+        assert!(matches!(kind, StatementKind::AlterSchema(_)), "got: {kind:?}");
+    }
+
+    #[test]
+    fn detect_nested_drop_column_unit() {
+        assert_eq!(
+            detect_nested_drop_column("ALTER TABLE t DROP COLUMN a.b"),
+            Some("a.b".to_string())
+        );
+        assert_eq!(
+            detect_nested_drop_column("alter table t drop column IF EXISTS a.b.c"),
+            Some("a.b.c".to_string())
+        );
+        assert_eq!(detect_nested_drop_column("ALTER TABLE t DROP COLUMN x"), None);
+        assert_eq!(detect_nested_drop_column("ALTER TABLE t ADD COLUMN x INT"), None);
+    }
+
+    #[test]
     fn test_ref_ddl_name() {
         let kind = parse_and_classify("ALTER TABLE t CREATE BRANCH b").unwrap();
         assert_eq!(kind.name(), "refddl");
+    }
+
+    #[test]
+    fn test_set_time_zone_classifies_as_utility_settimezone() {
+        // Precondition for the coordinator's SET TIME ZONE no-op handling
+        // (#351b): the statement must classify as Utility carrying a
+        // Statement::Set(Set::SetTimeZone { .. }) so the handler can match it
+        // narrowly and accept it. `SET WRITE_BRANCH` must still not be caught
+        // here (it has its own dedicated kind).
+        let kind = parse_and_classify("SET TIME ZONE 'UTC'").unwrap();
+        match kind {
+            StatementKind::Utility(stmt) => assert!(
+                matches!(
+                    stmt.as_ref(),
+                    sqlparser::ast::Statement::Set(sqlparser::ast::Set::SetTimeZone { .. })
+                ),
+                "expected Set(SetTimeZone), got: {stmt:?}"
+            ),
+            other => panic!("expected Utility(SetTimeZone), got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_set_time_zone_local_classifies_as_utility_settimezone() {
+        let kind = parse_and_classify("SET TIME ZONE LOCAL").unwrap();
+        assert!(matches!(kind, StatementKind::Utility(_)));
     }
 
     // ── SET WRITE_BRANCH tests ────────────────────────────────────────────
