@@ -1,9 +1,11 @@
 pub mod alter_execute;
 pub mod attach;
+pub mod bare_table;
 pub mod catalog_qualifiers;
 pub mod classifier;
 pub mod ctas_compat;
 pub mod ddl;
+pub mod nested_row_cast;
 pub mod paren_less_values;
 pub mod partition;
 pub mod partition_evolution;
@@ -27,6 +29,8 @@ pub use classifier::{
 pub use alter_execute::rewrite_alter_execute;
 pub use ctas_compat::rewrite_ctas_compat;
 pub use ddl::{try_parse_ref_ddl, BranchRetention, RefDdl};
+pub use bare_table::rewrite_bare_table;
+pub use nested_row_cast::rewrite_nested_row_cast;
 pub use paren_less_values::rewrite_paren_less_values;
 pub use partition::normalize_partitioned_by;
 pub use pipeline_types::{pre_parse_pipeline, ClassifiableSql, UserSql};
