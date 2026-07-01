@@ -977,6 +977,38 @@ async fn test_variance_alias_resolves_to_var_samp() {
 }
 
 #[tokio::test]
+async fn test_skewness_and_kurtosis_over_sql() {
+    // Trino higher-moment aggregates over integer input (exercises the
+    // Float64 coercion layer + registration). Values [1,2,3,4,10]:
+    // skewness = 36/sqrt(1000) = 1.1384199..., kurtosis = 3.152. (#333)
+    let ctx = ctx().await;
+    let df = ctx
+        .sql(
+            "SELECT skewness(v), kurtosis(v) \
+             FROM (VALUES (1), (2), (3), (4), (10)) t(v)",
+        )
+        .await
+        .expect("skewness/kurtosis parse");
+    let batches = df.collect().await.expect("skewness/kurtosis execute");
+    let skewness: f64 = array_value_to_string(batches[0].column(0), 0)
+        .unwrap()
+        .parse()
+        .expect("skewness result must parse as f64");
+    let kurtosis: f64 = array_value_to_string(batches[0].column(1), 0)
+        .unwrap()
+        .parse()
+        .expect("kurtosis result must parse as f64");
+    assert!(
+        (skewness - 1.138_419_957_660_617).abs() < 1e-9,
+        "skewness([1,2,3,4,10]) should be ~1.13842, got {skewness}"
+    );
+    assert!(
+        (kurtosis - 3.152).abs() < 1e-9,
+        "kurtosis([1,2,3,4,10]) should be 3.152, got {kurtosis}"
+    );
+}
+
+#[tokio::test]
 async fn test_approx_percentile_alias() {
     let ctx = ctx().await;
     // approx_percentile(x, p) shares the impl with approx_percentile_cont.
