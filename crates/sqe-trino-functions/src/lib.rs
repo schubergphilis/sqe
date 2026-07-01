@@ -18,6 +18,7 @@
 
 pub mod aggregates;
 pub mod central_moments;
+pub mod coverage_fns;
 pub(crate) mod helpers;
 pub mod histogram;
 pub mod map_aggregates;

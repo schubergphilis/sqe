@@ -184,6 +184,8 @@ Each section lists Trino functions with their SQE status:
 |---|---|---|---|
 | `sequence(start, stop)` / `sequence(start, stop, step)` | `sequence(...)` | ✅ | Trino spelling of DataFusion's inclusive `generate_series`; integer and date/timestamp + `INTERVAL` forms. The one gap is 2-arg descending (`sequence(5, 1)`), which needs an explicit negative step |
 | `slice(array, start, length)` | `slice(array, start, length)` | ✅ | Trino compat UDF; 1-based, negative `start` counts from the end, `length` clamps to the array end |
+| `element_at(array, n)` | `element_at(array, n)` | ✅ | Trino compat UDF; 1-based, negative from the end, out-of-bounds returns NULL. Also handles `element_at(map, key)` returning the scalar value |
+| `contains(array, x)` | `contains(array, x)` | ✅ | Trino compat UDF; three-valued (NULL when `x` is absent but the array holds a NULL). The string `contains(haystack, needle)` form is preserved |
 
 ## Scalar Functions: Date/Time
 
@@ -305,6 +307,7 @@ Each section lists Trino functions with their SQE status:
 |---|---|---|---|
 | `count(*)` / `count(x)` | Same | ✅ | |
 | `count(DISTINCT x)` | Same | ✅ | |
+| `count_if(pred)` | `count_if(pred)` | ✅ | Trino compat UDAF; counts TRUE rows, ignores false and NULL |
 | `sum(x)` | Same | ✅ | |
 | `avg(x)` | Same | ✅ | |
 | `min(x)` / `max(x)` | Same | ✅ | |
