@@ -67,6 +67,16 @@ them quickly.
    can cross await points. Files:
    `crates/catalog/loader/Cargo.toml`,
    `crates/catalog/loader/src/lib.rs`.
+6. **Current-schema projection for non-time-travel scans (issue #358)**:
+   `TableScanBuilder::build` resolves the scan projection schema from the
+   table's current schema when no `snapshot_id` is requested, instead of the
+   schema tagged on the latest snapshot. ALTER TABLE ADD COLUMN is
+   metadata-only (no new snapshot), so the latest snapshot keeps the pre-ADD
+   schema; reading against it dropped added columns and failed with "Column
+   <c> not found in table". Explicit snapshot scans still use the snapshot
+   schema (time-travel semantics preserved). Files:
+   `crates/iceberg/src/scan/mod.rs` (build + two regression tests). Not filed
+   upstream yet.
 
 ## Cherry-picks from apache/iceberg-rust main
 
