@@ -32,7 +32,7 @@ use tracing::instrument;
 
 use crate::catalog_ops::{catalog_qualifier, parse_table_ref};
 use crate::writer::{
-    new_upload_tracker, parse_parquet_compression, write_data_files_streaming_with_metrics,
+    new_upload_tracker, resolve_write_compression, write_data_files_streaming_with_metrics,
     write_data_files_with_metrics, write_equality_delete_files, write_position_delete_files,
     WriteCleanupGuard,
 };
@@ -639,9 +639,17 @@ impl WriteHandler {
         .await
     }
 
-    /// Return the Parquet compression codec from config.
-    fn compression(&self) -> parquet::basic::Compression {
-        parse_parquet_compression(&self.config.catalog.parquet_compression)
+    /// Return the Parquet compression codec for this write.
+    ///
+    /// A per-session `iceberg.compression_codec` (Trino session property, #353)
+    /// takes precedence; otherwise the static `catalog.parquet_compression`
+    /// config default is used. Unknown values fall back to ZSTD (with a warning)
+    /// via `parse_parquet_compression`, matching the config path's leniency.
+    fn compression(&self, session: &Session) -> parquet::basic::Compression {
+        resolve_write_compression(
+            session.compression_codec.as_deref(),
+            &self.config.catalog.parquet_compression,
+        )
     }
 
     /// Best-effort capture of a self-referential write plan (DELETE / UPDATE
@@ -904,7 +912,7 @@ impl WriteHandler {
                     batches,
                     "ctas",
                     self.metrics.as_ref(),
-                    self.compression(),
+                    self.compression(session),
                     tracker,
                 )
                 .await?;
@@ -1104,7 +1112,7 @@ impl WriteHandler {
                 stream,
                 "ctas",
                 self.metrics.as_ref(),
-                self.compression(),
+                self.compression(session),
                 tracker,
             )
             .await?;
@@ -1258,7 +1266,7 @@ impl WriteHandler {
             stream,
             "insert",
             self.metrics.as_ref(),
-            self.compression(),
+            self.compression(session),
             tracker,
         )
         .await?;
@@ -1606,7 +1614,7 @@ impl WriteHandler {
             batches,
             "insert",
             self.metrics.as_ref(),
-            self.compression(),
+            self.compression(session),
             tracker,
         )
         .await?;
@@ -1703,7 +1711,7 @@ impl WriteHandler {
             batches,
             "ingest",
             self.metrics.as_ref(),
-            self.compression(),
+            self.compression(session),
             tracker,
         )
         .await?;
@@ -1886,7 +1894,7 @@ impl WriteHandler {
                         surviving_batches,
                         "delete",
                         self.metrics.as_ref(),
-                        self.compression(),
+                        self.compression(session),
                         tracker.clone(),
                     )
                     .await?;
@@ -2077,7 +2085,7 @@ impl WriteHandler {
 
         // Write position delete files (sorted by (file_path, pos) inside the helper).
         let delete_files =
-            write_position_delete_files(&table, position_deletes, self.compression()).await?;
+            write_position_delete_files(&table, position_deletes, self.compression(session)).await?;
 
         // Commit: append position delete files. FastAppendAction auto-routes DataFiles
         // with content_type=PositionDeletes into the delete manifest entry.
@@ -2242,7 +2250,7 @@ impl WriteHandler {
             &table,
             key_batches,
             identifier_field_ids,
-            self.compression(),
+            self.compression(session),
         )
         .await?;
 
@@ -2477,7 +2485,7 @@ impl WriteHandler {
                     rewritten_batches,
                     "update",
                     self.metrics.as_ref(),
-                    self.compression(),
+                    self.compression(session),
                     tracker.clone(),
                 )
                 .await?;
@@ -2773,7 +2781,7 @@ impl WriteHandler {
             new_row_batches,
             "update-mor",
             self.metrics.as_ref(),
-            self.compression(),
+            self.compression(session),
             tracker,
         )
         .await?;
@@ -2782,7 +2790,7 @@ impl WriteHandler {
             &table,
             key_batches,
             identifier_field_ids,
-            self.compression(),
+            self.compression(session),
         )
         .await?;
 
@@ -3188,7 +3196,7 @@ impl WriteHandler {
                 result_batches,
                 "merge",
                 self.metrics.as_ref(),
-                self.compression(),
+                self.compression(session),
                 tracker,
             )
             .await?
@@ -3684,7 +3692,7 @@ impl WriteHandler {
                 new_data_batches,
                 "merge-mor",
                 self.metrics.as_ref(),
-                self.compression(),
+                self.compression(session),
                 tracker,
             )
             .await?
@@ -3697,7 +3705,7 @@ impl WriteHandler {
                 &table,
                 equality_delete_batches,
                 identifier_field_ids,
-                self.compression(),
+                self.compression(session),
             )
             .await?
         } else {
