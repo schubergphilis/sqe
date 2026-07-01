@@ -291,7 +291,27 @@ impl<'a> TableScanBuilder<'a> {
                 current_snapshot_id.clone()
             }
         };
-        let schema = snapshot.schema(self.table.metadata())?;
+        // Schema resolution for the scan projection.
+        //
+        // For an explicit snapshot scan (time travel), read against the schema
+        // that snapshot was written with, matching Iceberg's as-of semantics.
+        //
+        // For a plain "current" scan (no snapshot_id requested), read against
+        // the table's CURRENT schema, not the schema tagged on the latest
+        // snapshot. ALTER TABLE ADD COLUMN is a metadata-only change: it bumps
+        // current-schema-id but creates no new snapshot, so the latest
+        // snapshot still references the pre-ADD schema. Using the snapshot
+        // schema here would drop columns added after the last write and fail
+        // projection with "Column <c> not found in table" (issue #358). The
+        // per-file ArrowReader + RecordBatchTransformer already backfill NULL
+        // (or the field's initial-default) for fields absent from older data
+        // files via field-id-based projection, so reading against the current
+        // schema yields correct NULL-for-old-rows semantics.
+        let schema = if self.snapshot_id.is_some() {
+            snapshot.schema(self.table.metadata())?
+        } else {
+            self.table.metadata().current_schema().clone()
+        };
 
         // Check that all column names exist in the schema (skip reserved columns).
         if let Some(column_names) = self.column_names.as_ref() {
@@ -1334,6 +1354,92 @@ pub mod tests {
 
         let table_scan = table.scan().select(["x", "y", "z", "a", "b"]).build();
         assert!(table_scan.is_err());
+    }
+
+    /// Regression test for issue #358.
+    ///
+    /// ALTER TABLE ADD COLUMN bumps current-schema-id but writes no snapshot,
+    /// so the latest snapshot still references the pre-ADD schema. A plain
+    /// (non-time-travel) scan must project against the table's CURRENT schema
+    /// so columns added after the last write are readable (NULL-backfilled for
+    /// old data files), not against the snapshot's older schema. Before the
+    /// fix, selecting a post-ADD column failed with
+    /// "Column <c> not found in table".
+    fn table_with_current_schema_ahead_of_snapshot() -> Table {
+        // TableMetadataV2Valid: current-schema-id=1 (fields x,y,z), current
+        // snapshot 3055729675574597004 tagged schema-id=1. Force that snapshot
+        // back to schema-id=0 (only field x) to model "ALTER ADD COLUMN y,z
+        // after the last append": current schema has y,z, latest snapshot does
+        // not.
+        let json = fs::read_to_string(format!(
+            "{}/testdata/table_metadata/TableMetadataV2Valid.json",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap();
+        let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        for snap in value["snapshots"].as_array_mut().unwrap() {
+            if snap["snapshot-id"].as_i64() == Some(3055729675574597004) {
+                snap["schema-id"] = serde_json::json!(0);
+            }
+        }
+        let table_metadata: TableMetadata = serde_json::from_value(value).unwrap();
+        // Sanity: current schema (1) has y,z; the current snapshot's schema (0)
+        // does not. This is the exact #358 shape.
+        assert!(table_metadata.current_schema().field_by_name("z").is_some());
+        assert_eq!(
+            table_metadata
+                .current_snapshot()
+                .unwrap()
+                .schema(&table_metadata)
+                .unwrap()
+                .field_by_name("z"),
+            None
+        );
+
+        Table::builder()
+            .metadata(table_metadata)
+            .identifier(TableIdent::from_strs(["db", "t358"]).unwrap())
+            .file_io(FileIO::from_path("fs:///tmp").unwrap().build().unwrap())
+            .metadata_location("fs:///tmp/t358/metadata/v1.json")
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn test_scan_added_column_uses_current_schema_issue_358() {
+        let table = table_with_current_schema_ahead_of_snapshot();
+
+        // Selecting a column added after the last snapshot must succeed: the
+        // scan projects against the current schema, and the reader NULL-fills
+        // it for old data files. Pre-fix this returned
+        // "Column z not found in table".
+        let scan = table
+            .scan()
+            .select(["x", "y", "z"])
+            .build()
+            .expect("scan against current schema should resolve added columns");
+        assert_eq!(
+            Some(vec!["x".to_string(), "y".to_string(), "z".to_string()]),
+            scan.column_names
+        );
+    }
+
+    #[test]
+    fn test_scan_time_travel_keeps_snapshot_schema_issue_358() {
+        // An explicit snapshot scan must still project against that snapshot's
+        // schema (schema-0, only x), so selecting a column that did not exist
+        // at that snapshot correctly errors.
+        let table = table_with_current_schema_ahead_of_snapshot();
+
+        let err = table
+            .scan()
+            .snapshot_id(3055729675574597004)
+            .select(["x", "z"])
+            .build();
+        assert!(
+            err.is_err(),
+            "time-travel scan must not expose columns added after the snapshot"
+        );
     }
 
     #[test]
