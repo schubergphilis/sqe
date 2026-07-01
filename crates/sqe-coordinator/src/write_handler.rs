@@ -30,7 +30,7 @@ use sqe_core::table_properties::{
 use sqe_core::{Session, SqeConfig, SqeError};
 use tracing::instrument;
 
-use crate::catalog_ops::{catalog_qualifier, parse_table_ref};
+use crate::catalog_ops::{catalog_qualifier, fold_unquoted_ident, parse_table_ref};
 use crate::writer::{
     new_upload_tracker, resolve_write_compression, write_data_files_streaming_with_metrics,
     write_data_files_with_metrics, write_equality_delete_files, write_position_delete_files,
@@ -1351,25 +1351,8 @@ impl WriteHandler {
             ));
         }
 
-        // Convert SQL column definitions to Arrow schema.
-        let arrow_fields: Vec<arrow_schema::Field> = ct
-            .columns
-            .iter()
-            .map(|col| {
-                let arrow_type = sql_type_to_arrow(&col.data_type)?;
-                let nullable = !col
-                    .options
-                    .iter()
-                    .any(|opt| matches!(opt.option, sqlparser::ast::ColumnOption::NotNull));
-                Ok(arrow_schema::Field::new(
-                    col.name.value.clone(),
-                    arrow_type,
-                    nullable,
-                ))
-            })
-            .collect::<sqe_core::Result<Vec<_>>>()?;
-
-        let arrow_schema = ArrowSchema::new(arrow_fields);
+        // Convert SQL column definitions to Arrow schema (folds unquoted names, #337).
+        let arrow_schema = ArrowSchema::new(create_table_arrow_fields(&ct.columns)?);
         let iceberg_schema = arrow_schema_to_iceberg_with_defaults(&arrow_schema, &ct.columns)?;
 
         // Decide the format version. V3 features auto-upgrade the table;
@@ -5580,6 +5563,29 @@ fn arrow_schema_to_iceberg(arrow_schema: &ArrowSchema) -> sqe_core::Result<Icebe
 /// sets both `initial_default` and `write_default` on the `NestedField`.
 /// `initial_default` fills existing rows in case of retroactive `ADD COLUMN`;
 /// `write_default` applies to new rows when no value is provided.
+/// Build the Arrow fields for a `CREATE TABLE (cols)` statement, folding
+/// unquoted column names to lowercase (quoted names preserved) so stored names
+/// match Trino / DataFusion query-side identifier normalization (#337).
+pub(crate) fn create_table_arrow_fields(
+    column_defs: &[sqlparser::ast::ColumnDef],
+) -> sqe_core::Result<Vec<arrow_schema::Field>> {
+    column_defs
+        .iter()
+        .map(|col| {
+            let arrow_type = sql_type_to_arrow(&col.data_type)?;
+            let nullable = !col
+                .options
+                .iter()
+                .any(|opt| matches!(opt.option, sqlparser::ast::ColumnOption::NotNull));
+            Ok(arrow_schema::Field::new(
+                fold_unquoted_ident(&col.name),
+                arrow_type,
+                nullable,
+            ))
+        })
+        .collect()
+}
+
 pub(crate) fn arrow_schema_to_iceberg_with_defaults(
     arrow_schema: &ArrowSchema,
     column_defs: &[sqlparser::ast::ColumnDef],
@@ -6046,10 +6052,12 @@ fn parse_partition_transform(
             // Helper closures.
             let column_name = |arg: &Expr| -> sqe_core::Result<String> {
                 match arg {
-                    Expr::Identifier(id) => Ok(id.value.clone()),
+                    // Fold the partition-by column ref so it matches the folded
+                    // stored column name (#337).
+                    Expr::Identifier(id) => Ok(fold_unquoted_ident(id)),
                     Expr::CompoundIdentifier(parts) => parts
                         .last()
-                        .map(|p| p.value.clone())
+                        .map(fold_unquoted_ident)
                         .ok_or_else(|| {
                             SqeError::Execution(format!(
                                 "PARTITIONED BY {fn_name}(): empty compound identifier"
@@ -6174,6 +6182,22 @@ mod tests {
     // -------------------------------------------------------------------------
     // target-catalog resolution: explicit qualifier -> session catalog -> default
     // -------------------------------------------------------------------------
+
+    #[test]
+    fn create_table_arrow_fields_folds_unquoted_names() {
+        // #337: unquoted column names fold to lowercase in the stored schema;
+        // double-quoted names keep their case.
+        use sqlparser::parser::Parser;
+        let sql = r#"CREATE TABLE t (testInteger int, "KeepMe" int)"#;
+        let stmts = Parser::parse_sql(&sqlparser::dialect::GenericDialect {}, sql).unwrap();
+        let cols = match &stmts[0] {
+            Statement::CreateTable(ct) => &ct.columns,
+            other => panic!("expected CreateTable, got {other:?}"),
+        };
+        let fields = create_table_arrow_fields(cols).unwrap();
+        let names: Vec<&str> = fields.iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(names, vec!["testinteger", "KeepMe"]);
+    }
 
     #[test]
     fn resolve_target_catalog_prefers_explicit_then_session() {
