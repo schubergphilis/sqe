@@ -547,16 +547,19 @@ impl CatalogOps {
                         )))?;
 
                     max_field_id += 1;
+                    // Fold the new column name (unquoted -> lowercase) so it is
+                    // consistent with CREATE TABLE and query-side folding (#337).
+                    let col_name = fold_unquoted_ident(&column_def.name);
                     let mut new_field = if not_null {
                         NestedField::required(
                             max_field_id,
-                            &column_def.name.value,
+                            &col_name,
                             iceberg_type.clone(),
                         )
                     } else {
                         NestedField::optional(
                             max_field_id,
-                            &column_def.name.value,
+                            &col_name,
                             iceberg_type.clone(),
                         )
                     };
@@ -600,7 +603,8 @@ impl CatalogOps {
                     // single `column_name` field). Drop each in turn, keeping
                     // the same not-found / IF EXISTS semantics per column.
                     for column_name in column_names {
-                        let col = column_name.value.as_str();
+                        let col_folded = fold_unquoted_ident(column_name);
+                        let col = col_folded.as_str();
                         let pos = fields.iter().position(|f| f.name == col);
                         match pos {
                             Some(idx) => { fields.remove(idx); }
@@ -615,7 +619,9 @@ impl CatalogOps {
                 }
 
                 AlterTableOperation::RenameColumn { old_column_name, new_column_name } => {
-                    let old_name = old_column_name.value.as_str();
+                    // Fold both: the source lookup and the destination name (#337).
+                    let old_name_folded = fold_unquoted_ident(old_column_name);
+                    let old_name = old_name_folded.as_str();
                     let pos = fields.iter().position(|f| f.name == old_name).ok_or_else(|| {
                         SqeError::Execution(format!(
                             "Column '{old_name}' not found in table '{table_ident}'"
@@ -624,7 +630,7 @@ impl CatalogOps {
                     let old_field = &fields[pos];
                     let renamed = NestedField::new(
                         old_field.id,
-                        new_column_name.value.clone(),
+                        fold_unquoted_ident(new_column_name),
                         *old_field.field_type.clone(),
                         old_field.required,
                     );
@@ -632,7 +638,8 @@ impl CatalogOps {
                 }
 
                 AlterTableOperation::AlterColumn { column_name, op } => {
-                    let col = column_name.value.as_str();
+                    let col_folded = fold_unquoted_ident(column_name);
+                    let col = col_folded.as_str();
                     let pos = fields.iter().position(|f| f.name == col).ok_or_else(|| {
                         SqeError::Execution(format!(
                             "Column '{col}' not found in table '{table_ident}'"
@@ -1280,6 +1287,19 @@ fn sql_expr_to_string(expr: &Expr) -> String {
     }
 }
 
+/// Fold a column identifier the way Trino does: unquoted names fold to
+/// lowercase, double-quoted names are preserved. This matches DataFusion's
+/// query-side identifier normalization (`to_lowercase`), so a column stored
+/// from unquoted DDL resolves against an unquoted (folded) query, and a
+/// double-quoted column keeps its case and must be quoted to reference (#337).
+pub(crate) fn fold_unquoted_ident(ident: &sqlparser::ast::Ident) -> String {
+    if ident.quote_style.is_some() {
+        ident.value.clone()
+    } else {
+        ident.value.to_lowercase()
+    }
+}
+
 /// Parse a sqlparser `ObjectName` into an iceberg `TableIdent`.
 ///
 /// Returning a `TableIdent` end-to-end removes the chance of an
@@ -1522,6 +1542,23 @@ mod tests {
 
     fn empty_locks() -> TableLockMap {
         StdArc::new(std::sync::Mutex::new(HashMap::new()))
+    }
+
+    #[test]
+    fn fold_unquoted_ident_folds_unquoted_preserves_quoted() {
+        // Unquoted -> lowercase (matches Trino + DataFusion query-side folding).
+        assert_eq!(
+            fold_unquoted_ident(&Ident::new("testInteger")),
+            "testinteger"
+        );
+        assert_eq!(fold_unquoted_ident(&Ident::new("ALREADYUP")), "alreadyup");
+        // Already lowercase is unchanged.
+        assert_eq!(fold_unquoted_ident(&Ident::new("plain")), "plain");
+        // Double-quoted -> case preserved.
+        assert_eq!(
+            fold_unquoted_ident(&Ident::with_quote('"', "KeepMe")),
+            "KeepMe"
+        );
     }
 
     #[test]

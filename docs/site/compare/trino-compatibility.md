@@ -401,6 +401,8 @@ Each section lists Trino functions with their SQE status:
 | `CALL procedure(...)` | Same (system.* only) | ✅ | Iceberg maintenance procedures are wired: `CALL system.expire_snapshots(...)`, `CALL system.remove_orphan_files(...)`, `CALL system.rewrite_data_files(...)`, `CALL system.rewrite_manifests(...)`. User-defined stored procedures return an informative `NotImplemented` ("SQE does not have stored procedures") rather than a parse error |
 | `GRANT` / `REVOKE` | Planned (Plan C) | 🔧 | SQE-specific grant system |
 
+**Identifier case.** Unquoted identifiers fold to lowercase, matching Trino: `CREATE TABLE t (testInteger int)` stores the column as `testinteger`, and `SELECT testInteger` resolves it. Double-quoted identifiers preserve case (`"testInteger"` stays `testInteger` and must be quoted to reference). This applies to CREATE TABLE columns, ALTER TABLE ADD/DROP/RENAME/ALTER COLUMN, and PARTITIONED BY refs. Caveat: a pre-existing mixed-case column (e.g. a table created by another engine) must be referenced with quotes, exactly as in Trino.
+
 ## Type System
 
 | Trino Type | SQE/Arrow Type | Status | Notes |
