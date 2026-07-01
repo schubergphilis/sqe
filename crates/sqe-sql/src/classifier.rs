@@ -386,6 +386,15 @@ pub fn parse_and_classify(sql: &str) -> sqe_core::Result<StatementKind> {
     // standard SQL and sqlparser-rs will either reject them or classify them as
     // generic AlterTable statements, losing the branch/tag semantics.
     if upper.starts_with("ALTER TABLE ") {
+        // Trino spells Iceberg table-property updates
+        // `ALTER TABLE t SET PROPERTIES k = v [, ...]` (no parentheses, no
+        // TBLPROPERTIES keyword). sqlparser only accepts the parenthesized
+        // `SET TBLPROPERTIES (k = v, ...)` form, so rewrite the Trino form and
+        // re-classify; the existing AlterTableProps handler then commits them
+        // as Iceberg SetProperties (#338).
+        if let Some(rewritten) = rewrite_set_properties(trimmed) {
+            return parse_and_classify(&rewritten);
+        }
         if let Some(ref_ddl) = try_parse_ref_ddl(trimmed)? {
             return Ok(StatementKind::RefDdl(Box::new(ref_ddl)));
         }
@@ -455,6 +464,16 @@ pub fn parse_and_classify(sql: &str) -> sqe_core::Result<StatementKind> {
             .trim_end_matches('"')
             .to_string();
         return Ok(StatementKind::SetWriteBranch(Some(name)));
+    }
+
+    // Trino's `CREATE TABLE new (LIKE src)` copies a table's schema. sqlparser's
+    // GenericDialect does not support the parenthesized LIKE form (it parses the
+    // body as a column named `LIKE` of type `src`), so rewrite the pure form to
+    // the plain `CREATE TABLE new LIKE src`, which sqlparser records in
+    // `CreateTable.like`. The coordinator's create handler copies the source
+    // schema (#343).
+    if let Some(rewritten) = rewrite_create_table_like(trimmed) {
+        return parse_and_classify(&rewritten);
     }
 
     let dialect = GenericDialect {};
@@ -664,6 +683,115 @@ fn classify(stmt: Statement) -> sqe_core::Result<StatementKind> {
             "Statement type not supported: {stmt}"
         ))),
     }
+}
+
+/// Rewrite Trino's `ALTER TABLE t SET PROPERTIES k = v [, ...]` (no
+/// parentheses, no `TBLPROPERTIES` keyword) into the parenthesized
+/// `ALTER TABLE t SET TBLPROPERTIES (k = v, ...)` form that sqlparser parses
+/// into `AlterTableOperation::SetTblProperties`. Returns `None` when the
+/// statement is not a bare `SET PROPERTIES` (so `SET TBLPROPERTIES (...)` and
+/// every other ALTER TABLE flavour fall through untouched). See #338.
+fn rewrite_set_properties(trimmed: &str) -> Option<String> {
+    // Match ` SET PROPERTIES ` case-insensitively on the byte-equal uppercased
+    // copy (the statement is ASCII up to this keyword). The leading space plus
+    // the literal `PROPERTIES` (not `TBLPROPERTIES`) means the already-valid
+    // `SET TBLPROPERTIES` form never matches here, so re-classification of the
+    // rewritten string does not loop.
+    const NEEDLE: &str = " SET PROPERTIES ";
+    let idx = trimmed.to_ascii_uppercase().find(NEEDLE)?;
+    let head = &trimmed[..idx];
+    let body = trimmed[idx + NEEDLE.len()..]
+        .trim()
+        .trim_end_matches(';')
+        .trim();
+    if body.is_empty() {
+        return None;
+    }
+    // Split into `key = value` pairs on top-level commas and double-quote each
+    // key. Iceberg property names are dotted/hyphenated (e.g.
+    // `commit.retry.num-retries`) and do not parse as bare identifiers; quoting
+    // them as delimited identifiers makes sqlparser accept the list. Values are
+    // kept verbatim (they may themselves contain commas inside `ARRAY[...]`,
+    // which the top-level split preserves).
+    let mut pairs: Vec<String> = Vec::new();
+    for segment in split_top_level(body, ',') {
+        let seg = segment.trim();
+        if seg.is_empty() {
+            return None;
+        }
+        let eq_parts = split_top_level(seg, '=');
+        if eq_parts.len() < 2 {
+            return None;
+        }
+        let key = eq_parts[0].trim().trim_matches('"').trim_matches('\'');
+        let value = eq_parts[1..].join("=");
+        let value = value.trim();
+        if key.is_empty() || value.is_empty() {
+            return None;
+        }
+        let key_esc = key.replace('"', "\"\"");
+        pairs.push(format!("\"{key_esc}\" = {value}"));
+    }
+    if pairs.is_empty() {
+        return None;
+    }
+    Some(format!("{head} SET TBLPROPERTIES ({})", pairs.join(", ")))
+}
+
+/// Split `s` on top-level occurrences of `delim` -- occurrences at bracket
+/// depth zero and outside single/double quotes. Used to break a
+/// `key = value, key = value` property list without tripping on commas or `=`
+/// nested inside `ARRAY[...]`, `(...)`, or quoted string values.
+fn split_top_level(s: &str, delim: char) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut start = 0usize;
+    for (i, c) in s.char_indices() {
+        match c {
+            '\'' if !in_double => in_single = !in_single,
+            '"' if !in_single => in_double = !in_double,
+            '(' | '[' if !in_single && !in_double => depth += 1,
+            ')' | ']' if !in_single && !in_double => depth -= 1,
+            _ if c == delim && depth == 0 && !in_single && !in_double => {
+                out.push(s[start..i].to_string());
+                start = i + c.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    out.push(s[start..].to_string());
+    out
+}
+
+/// Rewrite Trino's parenthesized `CREATE TABLE new (LIKE src)` into the plain
+/// `CREATE TABLE new LIKE src` form that sqlparser's GenericDialect records in
+/// `CreateTable.like`. Only the pure LIKE-only body is rewritten: a mixed
+/// `(LIKE src, extra_col ...)` list would silently drop the extra columns, so
+/// it is declined (returns `None`) and surfaces as a normal error. Any
+/// `INCLUDING`/`EXCLUDING PROPERTIES` suffix is dropped (SQE copies the schema
+/// only). See #343.
+fn rewrite_create_table_like(trimmed: &str) -> Option<String> {
+    if !trimmed.to_ascii_uppercase().starts_with("CREATE TABLE ") {
+        return None;
+    }
+    // The parenthesized body begins at the first `(`.
+    let lparen = trimmed.find('(')?;
+    let inner = trimmed[lparen + 1..].trim_start();
+    let after_like = strip_prefix_ci(inner, "LIKE ")?;
+    // Reject a mixed column list: only the pure `(LIKE src ...)` form is safe.
+    let close = after_like.find(')')?;
+    let clause = &after_like[..close];
+    if clause.contains(',') {
+        return None;
+    }
+    let src = clause.split_whitespace().next()?;
+    if src.is_empty() {
+        return None;
+    }
+    let head = trimmed[..lparen].trim_end();
+    Some(format!("{head} LIKE {src}"))
 }
 
 /// Parse the remainder of an `ANALYZE ...` statement (everything after the
@@ -1493,6 +1621,95 @@ mod tests {
             StatementKind::Analyze(table) => assert_eq!(table, "t"),
             other => panic!("Expected Analyze, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_set_properties_classifies_as_alter_table_props() {
+        // Trino's bare `SET PROPERTIES k = v` must be rewritten to
+        // `SET TBLPROPERTIES (k = v)` and classified as AlterTableProps (#338).
+        let result =
+            parse_and_classify("ALTER TABLE nation SET PROPERTIES format_version = 2").unwrap();
+        assert!(
+            matches!(result, StatementKind::AlterTableProps(_)),
+            "Expected AlterTableProps, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_set_properties_multiple_pairs() {
+        let result = parse_and_classify(
+            "ALTER TABLE ns.t SET PROPERTIES format_version = 2, commit.retry.num-retries = 4",
+        )
+        .unwrap();
+        assert!(
+            matches!(result, StatementKind::AlterTableProps(_)),
+            "Expected AlterTableProps, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_set_tblproperties_still_classifies() {
+        // The already-valid parenthesized form must keep working and must not
+        // be mangled by the SET PROPERTIES rewrite.
+        let result =
+            parse_and_classify("ALTER TABLE nation SET TBLPROPERTIES ('format_version' = '2')")
+                .unwrap();
+        assert!(
+            matches!(result, StatementKind::AlterTableProps(_)),
+            "Expected AlterTableProps, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_create_table_like_parenthesized_rewritten() {
+        // Trino's `(LIKE src)` must be rewritten so sqlparser records it in
+        // CreateTable.like rather than mis-parsing it as a column (#343).
+        let result = parse_and_classify("CREATE TABLE nation_copy (LIKE nation)").unwrap();
+        match result {
+            StatementKind::CreateTable(stmt) => {
+                let Statement::CreateTable(ct) = *stmt else {
+                    panic!("expected inner CreateTable");
+                };
+                assert!(
+                    ct.like.is_some(),
+                    "expected like clause populated, columns={:?}",
+                    ct.columns
+                );
+            }
+            other => panic!("Expected CreateTable, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_plain_create_table_not_treated_as_like() {
+        // A normal column-def CREATE TABLE opens with `(` but does not start
+        // with LIKE, so the rewrite must decline and leave it a CreateTable
+        // with real columns (like clause absent).
+        let result = parse_and_classify("CREATE TABLE t (a INT, b VARCHAR)").unwrap();
+        match result {
+            StatementKind::CreateTable(stmt) => {
+                let Statement::CreateTable(ct) = *stmt else {
+                    panic!("expected inner CreateTable");
+                };
+                assert!(ct.like.is_none(), "plain create must not gain a LIKE clause");
+                assert_eq!(ct.columns.len(), 2, "columns should be preserved");
+            }
+            other => panic!("Expected CreateTable, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_set_properties_dotted_hyphenated_key() {
+        // Dotted + hyphenated Iceberg property names must be quoted so they
+        // parse; the whole statement classifies as AlterTableProps (#338).
+        let result = parse_and_classify(
+            "ALTER TABLE t SET PROPERTIES \"write.format.default\" = 'PARQUET'",
+        )
+        .unwrap();
+        assert!(
+            matches!(result, StatementKind::AlterTableProps(_)),
+            "Expected AlterTableProps, got: {result:?}"
+        );
     }
 
     #[test]
