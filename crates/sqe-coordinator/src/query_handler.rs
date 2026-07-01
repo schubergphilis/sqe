@@ -4528,7 +4528,7 @@ impl QueryHandler {
         session_catalog: &Arc<SessionCatalog>,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         use sqlparser::ast::CommentObject;
-        use crate::catalog_ops::parse_table_ref;
+        use crate::catalog_ops::resolve_table_ident;
 
         let (object_type, object_name, comment_text) = match stmt {
             Statement::Comment {
@@ -4575,7 +4575,7 @@ impl QueryHandler {
             }
         };
 
-        let table_ident = parse_table_ref(&table_ref_parts)?;
+        let table_ident = resolve_table_ident(&table_ref_parts, session)?;
 
         let comment_value = comment_text.clone().unwrap_or_default();
 
@@ -4858,10 +4858,10 @@ impl QueryHandler {
         session: &Session,
         table_name: &sqlparser::ast::ObjectName,
     ) -> sqe_core::Result<()> {
-        use crate::catalog_ops::parse_table_ref;
+        use crate::catalog_ops::resolve_table_ident;
         use iceberg::Catalog;
 
-        let table_ident = parse_table_ref(table_name)?;
+        let table_ident = resolve_table_ident(table_name, session)?;
 
         let session_catalog = Arc::new(
             SessionCatalog::for_session(

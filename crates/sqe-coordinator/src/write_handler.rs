@@ -214,17 +214,20 @@ fn delete_target_object_name(stmt: &Statement) -> sqe_core::Result<&ObjectName> 
 /// Resolve the target `TableIdent` for a `Statement::Delete`. Combines the
 /// `ObjectName` extraction with `parse_table_ref`; five DELETE handlers used
 /// to inline this prologue.
-fn resolve_delete_target_ident(stmt: &Statement) -> sqe_core::Result<TableIdent> {
-    parse_table_ref(delete_target_object_name(stmt)?)
+fn resolve_delete_target_ident(
+    stmt: &Statement,
+    session: &Session,
+) -> sqe_core::Result<TableIdent> {
+    resolve_table_ident(delete_target_object_name(stmt)?, session)
 }
 
 /// Best-effort variant for the dispatcher: returns `None` instead of an error
 /// so the dispatcher can fall through to a slower path that surfaces the same
 /// error in context.
-fn try_resolve_delete_target_ident(stmt: &Statement) -> Option<TableIdent> {
+fn try_resolve_delete_target_ident(stmt: &Statement, session: &Session) -> Option<TableIdent> {
     delete_target_object_name(stmt)
         .ok()
-        .and_then(|name| parse_table_ref(name).ok())
+        .and_then(|name| resolve_table_ident(name, session).ok())
 }
 
 /// Extract the target table `ObjectName` from a `Statement::Update`.
@@ -247,15 +250,18 @@ fn update_target_object_name(stmt: &Statement) -> sqe_core::Result<&ObjectName> 
 
 /// Resolve the target `TableIdent` for a `Statement::Update`. Mirrors
 /// `resolve_delete_target_ident` so callers stay symmetric.
-fn resolve_update_target_ident(stmt: &Statement) -> sqe_core::Result<TableIdent> {
-    parse_table_ref(update_target_object_name(stmt)?)
+fn resolve_update_target_ident(
+    stmt: &Statement,
+    session: &Session,
+) -> sqe_core::Result<TableIdent> {
+    resolve_table_ident(update_target_object_name(stmt)?, session)
 }
 
 /// Best-effort variant for the dispatcher.
-fn try_resolve_update_target_ident(stmt: &Statement) -> Option<TableIdent> {
+fn try_resolve_update_target_ident(stmt: &Statement, session: &Session) -> Option<TableIdent> {
     update_target_object_name(stmt)
         .ok()
-        .and_then(|name| parse_table_ref(name).ok())
+        .and_then(|name| resolve_table_ident(name, session).ok())
 }
 
 /// Resolve the (catalog, namespace, table) tuple used to label a write target
@@ -840,7 +846,7 @@ impl WriteHandler {
             }
         };
 
-        let table_ident = parse_table_ref(table_name)?;
+        let table_ident = resolve_table_ident(table_name, session)?;
         let namespace = table_ident.namespace().clone();
         let name = table_ident.name().to_string();
 
@@ -1014,7 +1020,7 @@ impl WriteHandler {
             }
         };
 
-        let table_ident = parse_table_ref(table_name)?;
+        let table_ident = resolve_table_ident(table_name, session)?;
         let namespace = table_ident.namespace().clone();
         let name = table_ident.name().to_string();
 
@@ -1198,7 +1204,7 @@ impl WriteHandler {
             }
         };
 
-        let table_ident = parse_table_ref(table_name)?;
+        let table_ident = resolve_table_ident(table_name, session)?;
 
         info!(
             username = %session.user.username,
@@ -1341,7 +1347,7 @@ impl WriteHandler {
             return self.handle_create_table_like(session, ct, like_kind).await;
         }
 
-        let table_ident = parse_table_ref(&ct.name)?;
+        let table_ident = resolve_table_ident(&ct.name, session)?;
         let namespace = table_ident.namespace().clone();
         let name = table_ident.name().to_string();
 
@@ -1555,7 +1561,7 @@ impl WriteHandler {
             }
         };
 
-        let table_ident = parse_table_ref(table_name)?;
+        let table_ident = resolve_table_ident(table_name, session)?;
 
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
 
@@ -1747,7 +1753,7 @@ impl WriteHandler {
         catalog: Arc<SessionCatalog>,
         ctx: &DFSessionContext,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
-        let table_ident = resolve_delete_target_ident(stmt)?;
+        let table_ident = resolve_delete_target_ident(stmt, session)?;
         let delete = match stmt {
             Statement::Delete(d) => d,
             // unreachable: resolve_delete_target_ident above already filtered.
@@ -1957,7 +1963,7 @@ impl WriteHandler {
         catalog: Arc<SessionCatalog>,
         ctx: &DFSessionContext,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
-        let table_ident = resolve_delete_target_ident(stmt)?;
+        let table_ident = resolve_delete_target_ident(stmt, session)?;
         let delete = match stmt {
             Statement::Delete(d) => d,
             other => return Err(SqeError::Execution(format!(
@@ -2120,7 +2126,7 @@ impl WriteHandler {
         catalog: Arc<SessionCatalog>,
         ctx: &DFSessionContext,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
-        let table_ident = resolve_delete_target_ident(stmt)?;
+        let table_ident = resolve_delete_target_ident(stmt, session)?;
         let delete = match stmt {
             Statement::Delete(d) => d,
             other => return Err(SqeError::Execution(format!(
@@ -2316,7 +2322,7 @@ impl WriteHandler {
         let Ok(table_factor_name) = delete_target_object_name(stmt) else {
             return self.handle_delete(session, stmt, catalog, ctx).await;
         };
-        let Some(table_ident) = try_resolve_delete_target_ident(stmt) else {
+        let Some(table_ident) = try_resolve_delete_target_ident(stmt, session) else {
             return self.handle_delete(session, stmt, catalog, ctx).await;
         };
         let Ok(table) = catalog.load_table(&table_ident).await else {
@@ -2375,7 +2381,7 @@ impl WriteHandler {
         catalog: Arc<SessionCatalog>,
         ctx: &DFSessionContext,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
-        let table_ident = resolve_update_target_ident(stmt)?;
+        let table_ident = resolve_update_target_ident(stmt, session)?;
         let (assignments, selection) = match stmt {
             Statement::Update(update) => (&update.assignments, &update.selection),
             other => return Err(SqeError::Execution(format!(
@@ -2559,7 +2565,7 @@ impl WriteHandler {
         let Ok(table_factor_name) = update_target_object_name(stmt) else {
             return self.handle_update(session, stmt, catalog, ctx).await;
         };
-        let Some(table_ident) = try_resolve_update_target_ident(stmt) else {
+        let Some(table_ident) = try_resolve_update_target_ident(stmt, session) else {
             return self.handle_update(session, stmt, catalog, ctx).await;
         };
         let Ok(table) = catalog.load_table(&table_ident).await else {
@@ -2624,7 +2630,7 @@ impl WriteHandler {
         catalog: Arc<SessionCatalog>,
         ctx: &DFSessionContext,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
-        let table_ident = resolve_update_target_ident(stmt)?;
+        let table_ident = resolve_update_target_ident(stmt, session)?;
         let (assignments, selection) = match stmt {
             Statement::Update(update) => (&update.assignments, &update.selection),
             other => return Err(SqeError::Execution(format!(
@@ -2873,7 +2879,7 @@ impl WriteHandler {
             }
         };
 
-        let table_ident = parse_table_ref(target_table_name)?;
+        let table_ident = resolve_table_ident(target_table_name, session)?;
 
         // Extract source alias (needed for column references in the JOIN)
         let source_alias = match source_factor {
@@ -3272,7 +3278,7 @@ impl WriteHandler {
                     .await;
             }
         };
-        let Ok(table_ident) = parse_table_ref(target_name) else {
+        let Ok(table_ident) = resolve_table_ident(target_name, session) else {
             return self
                 .handle_merge(session, stmt, source_batches, catalog, ctx)
                 .await;
@@ -3392,7 +3398,7 @@ impl WriteHandler {
                 )));
             }
         };
-        let table_ident = parse_table_ref(target_table_name)?;
+        let table_ident = resolve_table_ident(target_table_name, session)?;
 
         let source_alias = match source_factor {
             TableFactor::Table { alias, .. } => alias.as_ref().map(|a| a.name.value.clone()),
@@ -6224,6 +6230,68 @@ mod tests {
             resolve_target_catalog(Some("other_wh".to_string()), &session),
             Some("other_wh".to_string())
         );
+    }
+
+    fn test_session(default_schema: Option<&str>) -> sqe_core::Session {
+        let mut session = sqe_core::Session::new(
+            "u".to_string(),
+            sqe_core::SecretString::new("t".to_string()),
+            None,
+            chrono::Utc::now(),
+            vec![],
+        );
+        session.default_schema = default_schema.map(|s| s.to_string());
+        session
+    }
+
+    #[test]
+    fn resolve_table_ident_unqualified_uses_session_schema() {
+        // #357: an unqualified write target resolves against the session's
+        // X-Trino-Schema, matching the read path, not the hard-coded `default`.
+        use sqlparser::ast::Ident;
+        let session = test_session(Some("sesstest"));
+        let name = ObjectName::from(vec![Ident::new("s357")]);
+        let ident = resolve_table_ident(&name, &session).unwrap();
+        assert_eq!(
+            ident.namespace(),
+            &NamespaceIdent::new("sesstest".to_string())
+        );
+        assert_eq!(ident.name(), "s357");
+    }
+
+    #[test]
+    fn resolve_table_ident_unqualified_falls_back_to_default() {
+        // No session schema set (and empty-string treated as unset) -> `default`.
+        use sqlparser::ast::Ident;
+        let name = ObjectName::from(vec![Ident::new("s357")]);
+
+        let unset = resolve_table_ident(&name, &test_session(None)).unwrap();
+        assert_eq!(unset.namespace(), &NamespaceIdent::new("default".to_string()));
+
+        let empty = resolve_table_ident(&name, &test_session(Some(""))).unwrap();
+        assert_eq!(empty.namespace(), &NamespaceIdent::new("default".to_string()));
+    }
+
+    #[test]
+    fn resolve_table_ident_qualified_names_unchanged() {
+        // A 2- or 3-part name already names its namespace; the session schema
+        // must not override it.
+        use sqlparser::ast::Ident;
+        let session = test_session(Some("sesstest"));
+
+        let two = ObjectName::from(vec![Ident::new("otherns"), Ident::new("t")]);
+        let ident = resolve_table_ident(&two, &session).unwrap();
+        assert_eq!(ident.namespace(), &NamespaceIdent::new("otherns".to_string()));
+        assert_eq!(ident.name(), "t");
+
+        let three = ObjectName::from(vec![
+            Ident::new("cat"),
+            Ident::new("otherns"),
+            Ident::new("t"),
+        ]);
+        let ident = resolve_table_ident(&three, &session).unwrap();
+        assert_eq!(ident.namespace(), &NamespaceIdent::new("otherns".to_string()));
+        assert_eq!(ident.name(), "t");
     }
 
     // -------------------------------------------------------------------------

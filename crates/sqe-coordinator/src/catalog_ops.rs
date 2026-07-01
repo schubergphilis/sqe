@@ -106,7 +106,7 @@ impl CatalogOps {
             SqeError::Execution("DROP TABLE requires at least one table name".to_string())
         })?;
 
-        let table_ident = parse_table_ref(table_name)?;
+        let table_ident = resolve_table_ident(table_name, session)?;
 
         info!(
             username = %session.user.username,
@@ -312,7 +312,7 @@ impl CatalogOps {
                 )
             })?;
 
-        let src_ident = parse_table_ref(source_name)?;
+        let src_ident = resolve_table_ident(source_name, session)?;
 
         // For the destination, if only a bare name is given (1 part), inherit
         // the source namespace so that a simple `RENAME TO new_name` stays in
@@ -386,7 +386,7 @@ impl CatalogOps {
             }
         };
 
-        let view_ident = parse_table_ref(view_name)?;
+        let view_ident = resolve_table_ident(view_name, session)?;
         let namespace = view_ident.namespace();
         let name = view_ident.name();
         let select_sql = format!("{query}");
@@ -450,7 +450,7 @@ impl CatalogOps {
             SqeError::Execution("DROP VIEW requires at least one view name".to_string())
         })?;
 
-        let view_ident = parse_table_ref(view_name)?;
+        let view_ident = resolve_table_ident(view_name, session)?;
         let namespace = view_ident.namespace();
         let name = view_ident.name();
 
@@ -499,7 +499,7 @@ impl CatalogOps {
             }
         };
 
-        let table_ident = parse_table_ref(table_name)?;
+        let table_ident = resolve_table_ident(table_name, session)?;
 
         info!(
             username = %session.user.username,
@@ -745,7 +745,7 @@ impl CatalogOps {
         use iceberg::spec::{NestedField, Type};
 
         let table_name = parse_object_name(table)?;
-        let table_ident = parse_table_ref(&table_name)?;
+        let table_ident = resolve_table_ident(&table_name, session)?;
 
         let session_catalog = self
             .session_catalog_for(session, catalog_qualifier(&table_name).as_deref())
@@ -842,7 +842,7 @@ impl CatalogOps {
             }
         };
 
-        let table_ident = parse_table_ref(table_name)?;
+        let table_ident = resolve_table_ident(table_name, session)?;
 
         // Extract SET TBLPROPERTIES key-value pairs
         let mut updates: HashMap<String, String> = HashMap::new();
@@ -932,7 +932,7 @@ impl CatalogOps {
         }
 
         let object_name = parse_object_name(table_ref)?;
-        let table_ident = parse_table_ref(&object_name)?;
+        let table_ident = resolve_table_ident(&object_name, session)?;
 
         let session_catalog = self
             .session_catalog_for(session, catalog_qualifier(&object_name).as_deref())
@@ -1048,7 +1048,7 @@ impl CatalogOps {
         stmt: &sqe_sql::tags::SetTagsStatement,
     ) -> sqe_core::Result<()> {
         let object_name = parse_object_name(&stmt.table)?;
-        let table_ident = parse_table_ref(&object_name)?;
+        let table_ident = resolve_table_ident(&object_name, session)?;
 
         let session_catalog = self
             .session_catalog_for(session, catalog_qualifier(&object_name).as_deref())
@@ -1115,7 +1115,7 @@ impl CatalogOps {
         table: &str,
     ) -> sqe_core::Result<(TableIdent, HashMap<String, Vec<String>>)> {
         let object_name = parse_object_name(table)?;
-        let table_ident = parse_table_ref(&object_name)?;
+        let table_ident = resolve_table_ident(&object_name, session)?;
 
         let session_catalog = self
             .session_catalog_for(session, catalog_qualifier(&object_name).as_deref())
@@ -1153,7 +1153,7 @@ impl CatalogOps {
         };
 
         let object_name = parse_object_name(table_ref)?;
-        let table_ident = parse_table_ref(&object_name)?;
+        let table_ident = resolve_table_ident(&object_name, session)?;
 
         let session_catalog = self
             .session_catalog_for(session, catalog_qualifier(&object_name).as_deref())
@@ -1484,6 +1484,32 @@ pub(crate) fn parse_table_ref(name: &ObjectName) -> sqe_core::Result<TableIdent>
             "Invalid table reference with {n} parts: {name}"
         ))),
     }
+}
+
+/// Resolve a table reference to a `TableIdent`, honoring the session schema
+/// (`X-Trino-Schema`) for an unqualified 1-part name.
+///
+/// `parse_table_ref` defaults an unqualified name to the `default` namespace,
+/// but the read path (and Trino) resolve `t` against the session's default
+/// schema. The write/DDL handlers must match that so a client on
+/// `X-Trino-Schema: tpch_demo` targets `tpch_demo.t`, not `default.t` (#357).
+/// A 2- or 3-part name already names its namespace and is returned unchanged;
+/// when the session schema is unset or empty we fall back to `default`.
+pub(crate) fn resolve_table_ident(
+    name: &ObjectName,
+    session: &Session,
+) -> sqe_core::Result<TableIdent> {
+    let ident = parse_table_ref(name)?;
+    let is_unqualified = name.0.iter().filter_map(|p| p.as_ident()).count() == 1;
+    if is_unqualified {
+        if let Some(schema) = session.default_schema.as_deref().filter(|s| !s.is_empty()) {
+            return Ok(TableIdent::new(
+                NamespaceIdent::new(schema.to_string()),
+                ident.name().to_string(),
+            ));
+        }
+    }
+    Ok(ident)
 }
 
 /// Return the per-key async lock, creating it on first use.
