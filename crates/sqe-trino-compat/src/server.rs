@@ -953,6 +953,20 @@ async fn submit_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
     // classification and planning so both see the normalized form; a no-op for
     // SQL that already parses (including a column named `values`). See #315.
     let effective_sql = sqe_sql::rewrite_paren_less_values(&effective_sql);
+    // #351c: expand a leading bare `TABLE <name>` into `SELECT * FROM <name>`
+    // (Trino/SQL-standard shorthand) that sqlparser rejects. Runs before
+    // classification and planning so both see the normalized form; a no-op for
+    // SQL that already parses (CREATE/DROP/SHOW CREATE TABLE, a column named
+    // `table`). See #351c.
+    let effective_sql = sqe_sql::rewrite_bare_table(&effective_sql);
+    // #335: expand a nested / parameterized ROW-typed CAST target
+    // (`CAST(row(1, row(10)) AS row(a int, b row(x int)))`) into nested
+    // `named_struct(...)`. sqlparser rejects the nested ROW type outright, so
+    // the AST-level rewriter never sees it; this source-level rewrite runs
+    // first and yields parseable SQL. A no-op for the single-level ROW cast
+    // (which parses and is handled by the AST rewriter) and for any SQL that
+    // already parses. See #335.
+    let effective_sql = sqe_sql::rewrite_nested_row_cast(&effective_sql);
     // #2: qualify an unqualified `information_schema` reference with the session
     // catalog so it resolves to (and, under polaris-auto, discovers) that
     // catalog instead of the engine default. Only metadata queries are touched.
