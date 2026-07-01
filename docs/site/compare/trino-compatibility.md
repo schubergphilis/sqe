@@ -74,7 +74,7 @@ noting semantic differences and gaps.
 | Scalar: Regex | 6 | 6 | 0 | 0 | 100% |
 | Scalar: Conditional | 8 | 7 | 1 | 0 | 100% |
 | Scalar: Conversion | 10 | 9 | 0 | 1 | 90% |
-| Aggregate | 33 | 31 | 0 | 2 | 93.9% |
+| Aggregate | 35 | 33 | 0 | 2 | 94.3% |
 | Window | 14 | 13 | 0 | 1 | 92.9% |
 | DDL/DML | 31 + 1🔧 | 26 | 2 | 3 | 90.3% |
 | Type System | 27 | 22 | 0 | 5 | 81.5% |
@@ -310,6 +310,8 @@ Each section lists Trino functions with their SQE status:
 | `stddev_pop(x)` | Same | ✅ | |
 | `variance(x)` / `var_samp(x)` | Same | ✅ | DataFusion's sample-variance UDAF (`var`) re-registered with `variance` alias |
 | `var_pop(x)` | Same | ✅ | |
+| `skewness(x)` | `skewness(x)` | ✅ | Real `AggregateUDFImpl` in `crates/sqe-trino-functions/src/central_moments.rs::CentralMoment`. Online central moments; population skewness `sqrt(n)*m3/m2^1.5` matching Trino (NULL for n<3) |
+| `kurtosis(x)` | `kurtosis(x)` | ✅ | Same accumulator as `skewness`. Sample excess kurtosis matching Trino's formula (NULL for n<4) |
 | `covar_samp(y, x)` | `covar_samp(y, x)` | ✅ | |
 | `covar_pop(y, x)` | `covar_pop(y, x)` | ✅ | |
 | `corr(y, x)` | `corr(y, x)` | ✅ | |
