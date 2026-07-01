@@ -116,6 +116,9 @@ pub fn register_trino_functions(ctx: &datafusion::prelude::SessionContext) {
         .clone()
         .with_aliases(["split"]);
     ctx.register_udf(split);
+
+    // Bitwise scalar functions, `sequence`, and `slice` (#346, #349).
+    crate::scalar_fns::register_scalar_fns(ctx);
 }
 
 /// Register Trino-spelled aliases for existing DataFusion aggregate UDAFs.
