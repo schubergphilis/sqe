@@ -286,6 +286,29 @@ fn build_arrow_schema_for_table(table: &IcebergTable) -> sqe_core::Result<Arc<Ar
     Ok(Arc::new(arrow_schema))
 }
 
+/// Resolve a table reference to a `TableIdent`, honoring the session schema
+/// (X-Trino-Schema) for an unqualified 1-part name.
+///
+/// `parse_table_ref` defaults an unqualified name to the `default` namespace.
+/// The read path and Trino instead resolve `t` against the session's default
+/// schema, so a `CREATE TABLE new (LIKE nation)` issued with
+/// `X-Trino-Schema: tpch_demo` must look for `tpch_demo.nation`, not
+/// `default.nation`. A 2- or 3-part name already names its namespace and is
+/// returned unchanged.
+fn resolve_table_ident(name: &ObjectName, session: &Session) -> sqe_core::Result<TableIdent> {
+    let ident = parse_table_ref(name)?;
+    let is_unqualified = name.0.iter().filter_map(|p| p.as_ident()).count() == 1;
+    if is_unqualified {
+        if let Some(schema) = session.default_schema.as_deref().filter(|s| !s.is_empty()) {
+            return Ok(TableIdent::new(
+                NamespaceIdent::new(schema.to_string()),
+                ident.name().to_string(),
+            ));
+        }
+    }
+    Ok(ident)
+}
+
 /// Alias used inside the policy subquery to expose the unmasked value of a
 /// masked column. UPDATE's CASE-ELSE branch must reference this so unchanged
 /// rows persist their pre-mask values instead of writing the masked value
@@ -1302,6 +1325,14 @@ impl WriteHandler {
             }
         };
 
+        // Trino's `CREATE TABLE new (LIKE src)` copies the source table's
+        // schema. The classifier rewrites the parenthesized form to the plain
+        // `LIKE src` sqlparser records in `CreateTable.like`; copy the source
+        // schema here (#343).
+        if let Some(like_kind) = &ct.like {
+            return self.handle_create_table_like(session, ct, like_kind).await;
+        }
+
         let table_ident = parse_table_ref(&ct.name)?;
         let namespace = table_ident.namespace().clone();
         let name = table_ident.name().to_string();
@@ -1412,6 +1443,93 @@ impl WriteHandler {
             "Table created successfully"
         );
 
+        Ok(vec![])
+    }
+
+    /// Handle `CREATE TABLE new (LIKE src)` by copying the source table's
+    /// current schema (#343).
+    ///
+    /// The new table is created empty (no data), with a freshly assigned set of
+    /// Iceberg field IDs derived from the source's Arrow schema. Table
+    /// properties, partitioning, and sort order are NOT copied: Trino gates
+    /// those behind explicit `INCLUDING PROPERTIES` clauses that SQE does not
+    /// yet parse, so the safe default is a plain schema copy. The source is
+    /// resolved against its own catalog qualifier, so `CREATE TABLE a.b.new
+    /// (LIKE c.d.src)` copies across catalogs.
+    async fn handle_create_table_like(
+        &self,
+        session: &Session,
+        ct: &sqlparser::ast::CreateTable,
+        like_kind: &sqlparser::ast::CreateTableLikeKind,
+    ) -> sqe_core::Result<Vec<RecordBatch>> {
+        use sqlparser::ast::CreateTableLikeKind;
+
+        let src_name = match like_kind {
+            CreateTableLikeKind::Plain(l) | CreateTableLikeKind::Parenthesized(l) => &l.name,
+        };
+        // Resolve unqualified names against the session schema (X-Trino-Schema),
+        // matching Trino and the read path. `parse_table_ref` alone defaults a
+        // 1-part name to the `default` namespace, which would miss a source
+        // table that lives in the session schema.
+        let src_ident = resolve_table_ident(src_name, session)?;
+        let table_ident = resolve_table_ident(&ct.name, session)?;
+        let namespace = table_ident.namespace().clone();
+        let name = table_ident.name().to_string();
+
+        // Load the source table's current schema (resolved against the source's
+        // own catalog qualifier) and re-derive a clean Iceberg schema from it.
+        let src_catalog = self
+            .create_catalog_bridge(session, catalog_qualifier(src_name).as_deref())
+            .await?;
+        let src_table = src_catalog.load_table(&src_ident).await.map_err(|e| {
+            SqeError::Catalog(format!(
+                "CREATE TABLE LIKE: source table '{src_ident}' not found: {e}"
+            ))
+        })?;
+        let src_arrow = iceberg::arrow::schema_to_arrow_schema(src_table.metadata().current_schema())
+            .map_err(|e| {
+                SqeError::Execution(format!("CREATE TABLE LIKE: source schema conversion: {e}"))
+            })?;
+        let iceberg_schema = arrow_schema_to_iceberg(&src_arrow)?;
+
+        info!(
+            username = %session.user.username,
+            namespace = %namespace,
+            table = %name,
+            source = %src_ident,
+            columns = src_arrow.fields().len(),
+            "Creating table from LIKE source"
+        );
+
+        let target_catalog = resolve_target_catalog(catalog_qualifier(&ct.name), session);
+        let catalog = self
+            .create_catalog_bridge(session, target_catalog.as_deref())
+            .await?;
+
+        ensure_namespace(catalog.as_ref(), &namespace).await?;
+
+        if ct.if_not_exists && catalog.load_table(&table_ident).await.is_ok() {
+            info!(table = %table_ident, "Table already exists, skipping (IF NOT EXISTS)");
+            return Ok(vec![]);
+        }
+
+        let format_version = self.format_version();
+        let props = self.format_version_props(format_version);
+        let location = unique_table_location(catalog.as_ref(), &namespace, &name).await;
+        let table_creation = TableCreation::builder()
+            .name(name.clone())
+            .schema(iceberg_schema)
+            .location_opt(location)
+            .format_version(format_version)
+            .properties(props)
+            .build();
+
+        catalog
+            .create_table(&namespace, table_creation)
+            .await
+            .map_err(|e| SqeError::Catalog(format!("Failed to create table: {e}")))?;
+
+        info!(namespace = %namespace, table = %name, "Table created successfully (LIKE)");
         Ok(vec![])
     }
 

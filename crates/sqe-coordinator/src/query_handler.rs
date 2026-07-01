@@ -863,6 +863,10 @@ impl QueryHandler {
                                 "Utility statement not supported: {stmt}"
                             )))
                         }
+                    } else if matches!(stmt.as_ref(), sqlparser::ast::Statement::ShowFunctions { .. }) {
+                        // SHOW FUNCTIONS -> list the registered functions with
+                        // Trino's column shape (#344).
+                        self.handle_show_functions(session).await
                     } else if let Some(mv) = classify_materialized_view(stmt.as_ref()) {
                         // SQE does not support materialized views (#324).
                         // DROP MATERIALIZED VIEW IF EXISTS is a client-compat
@@ -4648,6 +4652,77 @@ impl QueryHandler {
             vec![Arc::new(name_b.finish()) as ArrayRef, Arc::new(type_b.finish()) as ArrayRef],
         )
         .map_err(|e| SqeError::Execution(format!("Failed to build SHOW SECRETS result: {e}")))?;
+
+        Ok(vec![batch])
+    }
+
+    /// Handle `SHOW FUNCTIONS` by listing the registered scalar, aggregate, and
+    /// window functions (#344).
+    ///
+    /// Trino's `SHOW FUNCTIONS` returns six columns (Function Name, Return Type,
+    /// Argument Types, Function Type, Deterministic, Description). SQE emits the
+    /// same column shape so BI tools that introspect the function catalog get a
+    /// well-formed result. The row *content* is engine-specific and never
+    /// matches Trino: DataFusion's UDFs carry variadic/overloaded signatures
+    /// that don't decompose into Trino's one-row-per-signature type strings, so
+    /// the type columns are left empty and every function is reported
+    /// deterministic. Function Type is `scalar` / `aggregate` / `window`.
+    async fn handle_show_functions(
+        &self,
+        session: &Session,
+    ) -> sqe_core::Result<Vec<RecordBatch>> {
+        let (ctx, _) = self.create_session_context(session).await?;
+        let state = ctx.state();
+
+        // Collect (name, kind) across the three registries, then sort so the
+        // output is stable regardless of HashMap iteration order.
+        let mut rows: Vec<(String, &'static str)> = Vec::new();
+        for name in state.scalar_functions().keys() {
+            rows.push((name.clone(), "scalar"));
+        }
+        for name in state.aggregate_functions().keys() {
+            rows.push((name.clone(), "aggregate"));
+        }
+        for name in state.window_functions().keys() {
+            rows.push((name.clone(), "window"));
+        }
+        rows.sort();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("Function Name", DataType::Utf8, false),
+            Field::new("Return Type", DataType::Utf8, false),
+            Field::new("Argument Types", DataType::Utf8, false),
+            Field::new("Function Type", DataType::Utf8, false),
+            Field::new("Deterministic", DataType::Boolean, false),
+            Field::new("Description", DataType::Utf8, false),
+        ]));
+
+        let mut name_b = StringBuilder::new();
+        let mut ret_b = StringBuilder::new();
+        let mut arg_b = StringBuilder::new();
+        let mut type_b = StringBuilder::new();
+        let mut desc_b = StringBuilder::new();
+        for (name, kind) in &rows {
+            name_b.append_value(name);
+            ret_b.append_value("");
+            arg_b.append_value("");
+            type_b.append_value(kind);
+            desc_b.append_value("");
+        }
+        let det = BooleanArray::from(vec![true; rows.len()]);
+
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(name_b.finish()) as ArrayRef,
+                Arc::new(ret_b.finish()) as ArrayRef,
+                Arc::new(arg_b.finish()) as ArrayRef,
+                Arc::new(type_b.finish()) as ArrayRef,
+                Arc::new(det) as ArrayRef,
+                Arc::new(desc_b.finish()) as ArrayRef,
+            ],
+        )
+        .map_err(|e| SqeError::Execution(format!("Failed to build SHOW FUNCTIONS result: {e}")))?;
 
         Ok(vec![batch])
     }

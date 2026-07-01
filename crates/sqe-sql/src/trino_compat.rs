@@ -37,9 +37,9 @@ use std::ops::ControlFlow;
 
 use sqlparser::ast::{
     DataType as SqlDataType, Expr, Function, FunctionArg, FunctionArgExpr,
-    FunctionArgumentList, FunctionArguments, GroupByExpr, GroupByWithModifier, Ident,
-    LimitClause, ObjectName, OrderByKind, Query, Select, SelectItem, SetExpr, Statement, TableFactor,
-    TableFunctionArgs, Value, Visit, VisitMut, Visitor, VisitorMut,
+    FunctionArgumentClause, FunctionArgumentList, FunctionArguments, GroupByExpr,
+    GroupByWithModifier, Ident, LimitClause, ObjectName, OrderByKind, Query, Select, SelectItem,
+    SetExpr, Statement, TableFactor, TableFunctionArgs, Value, Visit, VisitMut, Visitor, VisitorMut,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -170,6 +170,19 @@ pub fn rewrite_trino_compat(sql: &str) -> String {
     // `LIMIT n`, and `... WITH TIES` becomes a `RANK() <= n` subquery, because
     // DataFusion rejects any `query.fetch` (it plans only LIMIT). See #319.
     let has_fetch = lower.contains("fetch");
+    // `as varbinary` / `as binary` -> rewrite_cast_binary_to_bytea: Trino's
+    // VARBINARY has no DataFusion CAST target (the planner errors "Unsupported
+    // SQL type VARBINARY"). DataFusion accepts BYTEA, which lowers to Arrow
+    // Binary and serializes over the Trino wire as a base64 `varbinary` value,
+    // byte-identical to Trino. See #339.
+    let has_binary_cast = lower.contains("as varbinary") || lower.contains("as binary");
+    // `within group` -> rewrite_listagg_within_group: Trino's
+    // `listagg(x, sep) WITHIN GROUP (ORDER BY ...)` reaches DataFusion, which
+    // rejects WITHIN GROUP for string aggregates. Rewritten to
+    // `string_agg(x, sep ORDER BY ...)`, which produces identical output. Only
+    // `listagg` is touched; percentile_cont/percentile_disc keep WITHIN GROUP.
+    // See #340.
+    let has_within_group = lower.contains("within group");
     if !has_json_cast
         && !has_dollar
         && !has_grouping_set
@@ -178,6 +191,8 @@ pub fn rewrite_trino_compat(sql: &str) -> String {
         && !has_utf8_literal
         && !has_row
         && !has_fetch
+        && !has_binary_cast
+        && !has_within_group
     {
         return sql.to_string();
     }
@@ -363,6 +378,12 @@ impl VisitorMut for TrinoCompatVisitor {
         if rewrite_cast_as_row(expr) {
             self.rewrites += 1;
         }
+        if rewrite_cast_binary_to_bytea(expr) {
+            self.rewrites += 1;
+        }
+        if rewrite_listagg_within_group(expr) {
+            self.rewrites += 1;
+        }
         ControlFlow::Continue(())
     }
 
@@ -451,6 +472,55 @@ fn rewrite_cast_custom_to_varchar(expr: &mut Expr) -> bool {
     } else {
         false
     }
+}
+
+/// Rewrite `CAST(x AS VARBINARY)` / `CAST(x AS BINARY)` to `CAST(x AS BYTEA)`.
+///
+/// Trino's `VARBINARY` has no DataFusion CAST target: the planner rejects both
+/// `VARBINARY` and `BINARY` with "Unsupported SQL type". DataFusion accepts
+/// PostgreSQL's `BYTEA`, which lowers to Arrow `Binary`. SQE already serializes
+/// an Arrow `Binary` column over the Trino wire as the `varbinary` type with a
+/// base64-encoded value, byte-identical to Trino's own `VARBINARY` output.
+/// Returns true if the rewrite fired. See #339.
+fn rewrite_cast_binary_to_bytea(expr: &mut Expr) -> bool {
+    let Expr::Cast { data_type, .. } = expr else {
+        return false;
+    };
+    if matches!(&*data_type, SqlDataType::Varbinary(_) | SqlDataType::Binary(_)) {
+        *data_type = SqlDataType::Bytea;
+        true
+    } else {
+        false
+    }
+}
+
+/// Rewrite `listagg(x, sep) WITHIN GROUP (ORDER BY ...)` to
+/// `string_agg(x, sep ORDER BY ...)`.
+///
+/// Trino spells the ordered string aggregate `listagg(...) WITHIN GROUP (...)`.
+/// DataFusion has no `listagg`; SQE aliases it to `string_agg`, but `string_agg`
+/// takes its ordering as an inline `ORDER BY` inside the argument list, not as a
+/// trailing `WITHIN GROUP` clause (which DataFusion rejects for string
+/// aggregates). This moves the WITHIN GROUP ordering into the argument list and
+/// renames the call. Only `listagg` is matched, so genuine ordered-set
+/// aggregates (`percentile_cont` / `percentile_disc`) keep their native WITHIN
+/// GROUP handling. Returns true if the rewrite fired. See #340.
+fn rewrite_listagg_within_group(expr: &mut Expr) -> bool {
+    let Expr::Function(func) = expr else {
+        return false;
+    };
+    if !function_name_is(func, "listagg") || func.within_group.is_empty() {
+        return false;
+    }
+    let FunctionArguments::List(arg_list) = &mut func.args else {
+        return false;
+    };
+    // Move the WITHIN GROUP ordering into the argument list as an inline
+    // ORDER BY, the form string_agg expects, then rename the call.
+    let order_by = std::mem::take(&mut func.within_group);
+    arg_list.clauses.push(FunctionArgumentClause::OrderBy(order_by));
+    func.name = ObjectName::from(vec![Ident::new("string_agg")]);
+    true
 }
 
 /// Rewrite a Trino typed-string literal whose type SQE represents as Utf8 to a
@@ -1218,6 +1288,63 @@ mod tests {
             out.to_ascii_lowercase().contains("to_json"),
             "WHERE-clause CAST should be rewritten: {out}"
         );
+    }
+
+    // ─── CAST AS VARBINARY -> BYTEA (#339) ─────────────────────────────────
+
+    #[test]
+    fn cast_as_varbinary_rewritten_to_bytea() {
+        let out = rewrite_trino_compat("SELECT CAST('abc' AS VARBINARY)");
+        let lower = out.to_ascii_lowercase();
+        assert!(lower.contains("bytea"), "expected BYTEA target: {out}");
+        assert!(!lower.contains("varbinary"), "VARBINARY should be gone: {out}");
+    }
+
+    #[test]
+    fn cast_as_binary_rewritten_to_bytea() {
+        let out = rewrite_trino_compat("SELECT CAST(x AS BINARY) FROM t");
+        let lower = out.to_ascii_lowercase();
+        assert!(lower.contains("bytea"), "expected BYTEA target: {out}");
+    }
+
+    #[test]
+    fn cast_as_varbinary_preserves_inner_expr() {
+        let out = rewrite_trino_compat("SELECT CAST(from_hex(h) AS VARBINARY) FROM t");
+        assert!(out.contains("from_hex(h)"), "inner expr should survive: {out}");
+        assert!(out.to_ascii_lowercase().contains("bytea"));
+    }
+
+    // ─── listagg WITHIN GROUP -> string_agg (#340) ─────────────────────────
+
+    #[test]
+    fn listagg_within_group_rewritten_to_string_agg() {
+        let out = rewrite_trino_compat(
+            "SELECT listagg(name, ',') WITHIN GROUP (ORDER BY name) FROM nation",
+        );
+        let lower = out.to_ascii_lowercase();
+        assert!(lower.contains("string_agg"), "expected string_agg: {out}");
+        assert!(!lower.contains("within group"), "WITHIN GROUP should be gone: {out}");
+        assert!(lower.contains("order by name"), "ordering should move inline: {out}");
+    }
+
+    #[test]
+    fn listagg_without_within_group_untouched_by_this_rewrite() {
+        // No WITHIN GROUP -> this rewrite must not fire (listagg is a UDF alias
+        // that already works). The text should be unchanged.
+        let sql = "SELECT listagg(name, ',') FROM nation";
+        let out = rewrite_trino_compat(sql);
+        assert_eq!(out, sql, "bare listagg should be left alone: {out}");
+    }
+
+    #[test]
+    fn percentile_cont_within_group_not_rewritten() {
+        // Genuine ordered-set aggregates keep their WITHIN GROUP clause.
+        let out = rewrite_trino_compat(
+            "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY x) FROM t",
+        );
+        let lower = out.to_ascii_lowercase();
+        assert!(lower.contains("within group"), "WITHIN GROUP must survive: {out}");
+        assert!(!lower.contains("string_agg"), "must not become string_agg: {out}");
     }
 
     // ─── Metadata $-syntax rewriter ────────────────────────────────────────
