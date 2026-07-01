@@ -178,6 +178,13 @@ fn register_trino_aggregate_aliases(ctx: &datafusion::prelude::SessionContext) {
     let variance = (*var_samp_udaf()).clone().with_aliases(["variance"]);
     ctx.register_udaf(variance);
 
+    // skewness(x) / kurtosis(x) — Trino higher-moment aggregates. Not
+    // DataFusion built-ins; real UDAFs over shared online central moments
+    // (count, m1, m2, m3, m4) in crate::central_moments, matching Trino's
+    // exact update / merge / output arithmetic. (#333)
+    ctx.register_udaf(crate::central_moments::CentralMoment::skewness_udaf());
+    ctx.register_udaf(crate::central_moments::CentralMoment::kurtosis_udaf());
+
     // max_by(x, y) / min_by(x, y) — real UDAFs that pick x at the row
     // where y is max/min. arg_max / arg_min are registered as aliases
     // (DuckDB and ClickHouse spelling). Replaces the previous scalar
