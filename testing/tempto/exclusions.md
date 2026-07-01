@@ -244,3 +244,40 @@ absent at call time -> works once created); `PREPARE`/`DESCRIBE OUTPUT`
 response headers that separate curl calls don't carry -- not a SQE gap). Struct
 field *read* (`info.name`, `info['name']`) works; only struct *construction*
 (ROW value) is blocked, by #335.
+
+## #335-#344 outcomes (2026-07-01): 5 fixed, 5 deferred
+
+Of the ten gaps above, five were fixed (merged in MR !492) and five deferred
+with concrete blockers. Fixes verified against the shared-catalog rig (SQE
+:28080 vs real Trino-465 :38080, same Polaris catalog, `tpch_demo`).
+
+### Fixed
+
+| Issue | Fix | Verification |
+|---|---|---|
+| #339 | `CAST(x AS VARBINARY)` / `CAST(x AS BINARY)` rewritten to `CAST(x AS BYTEA)` in the Trino read-path rewriter. SQE already serializes Arrow `Binary` over the wire as base64 `varbinary`. | Live content parity: `CAST('abc' AS varbinary)` -> `YWJj` on both; `x'deadbeef'` -> `3q2+7w==` on both. |
+| #340 | `listagg(x, sep) WITHIN GROUP (ORDER BY ...)` rewritten to `string_agg(x, sep ORDER BY ...)`. Only `listagg` is touched; `percentile_cont`/`percentile_disc` keep native WITHIN GROUP. | Live content parity: byte-identical concatenation vs Trino on `nation`. |
+| #338 | Bare `ALTER TABLE t SET PROPERTIES k = v` rewritten (classifier pre-scan) to `SET TBLPROPERTIES ("k" = v, ...)`; dotted/hyphenated keys are quoted. Existing AlterTableProps handler commits Iceberg SetProperties. | Live effect: property persisted, visible in `SHOW CREATE TABLE`. |
+| #343 | Parenthesized `CREATE TABLE new (LIKE src)` rewritten to the plain LIKE form (GenericDialect lacks the parenthesized variant); `handle_create_table_like` copies the source schema. Unqualified names resolve against the session schema (X-Trino-Schema), matching Trino and the read path. | Unit + compile verified; the first live retest surfaced the `default`-vs-session-schema namespace bug, fixed by `resolve_table_ident`. |
+| #344 | `SHOW FUNCTIONS` handler lists scalar/aggregate/window functions with Trino's six-column shape. | Live shape parity: 6 columns (`Function Name`, `Return Type`, `Argument Types`, `Function Type`, `Deterministic`, `Description`), non-empty. Row *content* differs from Trino by design (different function sets). |
+
+### Deferred (concrete blockers, not silently skipped)
+
+- **#335 ROW as CAST/expression type** -- two blockers. (1) Nested/parameterized
+  `CAST(row(...) AS row(a int, b row(x int)))` does not parse
+  (`Expected: type modifiers, found: (`); needs a pre-parse string rewrite.
+  (2) Even parsed, SQE serializes a struct result over the Trino wire as a
+  stringified `'{a: 1, b: {x: 10}}'` while Trino emits a nested array
+  `[1, [10]]`, so full parity also needs struct-value wire serialization.
+  Isolated as its own effort.
+- **#336 ALTER TABLE DROP COLUMN nested.subfield** -- sqlparser rejects the
+  dotted path (`Expected: end of statement, found: .`) AND dropping a leaf
+  requires recursive Iceberg nested-schema surgery. Niche; deferred.
+- **#337 unquoted identifier vs case-preserved column** -- design decision.
+  Trino folds unquoted identifiers to lowercase; SQE preserves case. Aligning
+  needs a catalog-aware identifier-resolution pass. Documented divergence.
+- **#341 UNNEST ... WITH ORDINALITY** -- DataFusion has no WITH ORDINALITY;
+  needs table-factor AST surgery to synthesize the ordinal column.
+- **#342 correlated scalar subquery & LATERAL** -- DataFusion does not
+  physically plan correlated ScalarSubquery/OuterReferenceColumn here, nor
+  LATERAL joins; needs decorrelation passes (only the UPDATE SET path has one).
