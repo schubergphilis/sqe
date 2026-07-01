@@ -174,6 +174,18 @@ Each section lists Trino functions with their SQE status:
 | `to_base(n, radix)` | `to_base(n, radix)` | ✅ | Trino compat UDF |
 | `truncate(x[, n])` | `truncate(x[, n])` | ✅ | Trino compat UDF; truncates toward zero with optional decimal-precision argument |
 | `width_bucket(x, bound1, bound2, n)` | Same | ✅ | Native DataFusion (built-in in DF 52) |
+| `bitwise_and(x, y)` / `bitwise_or(x, y)` / `bitwise_xor(x, y)` | Same | ✅ | Trino compat UDF; widens integer args to `bigint` like Trino |
+| `bitwise_not(x)` | `bitwise_not(x)` | ✅ | Trino compat UDF |
+| `bitwise_left_shift(v, s)` / `bitwise_right_shift(v, s)` | Same | ✅ | Trino compat UDF; logical (zero-fill) shift on 64 bits. Trino's narrower `integer`-width shift is not reachable because DataFusion types integer literals as `bigint` |
+
+## Scalar Functions: Array
+
+| Trino Function | SQE Equivalent | Status | Notes |
+|---|---|---|---|
+| `sequence(start, stop)` / `sequence(start, stop, step)` | `sequence(...)` | ✅ | Trino spelling of DataFusion's inclusive `generate_series`; integer and date/timestamp + `INTERVAL` forms. The one gap is 2-arg descending (`sequence(5, 1)`), which needs an explicit negative step |
+| `slice(array, start, length)` | `slice(array, start, length)` | ✅ | Trino compat UDF; 1-based, negative `start` counts from the end, `length` clamps to the array end |
+| `element_at(array, n)` | `element_at(array, n)` | ✅ | Trino compat UDF; 1-based, negative from the end, out-of-bounds returns NULL. Also handles `element_at(map, key)` returning the scalar value |
+| `contains(array, x)` | `contains(array, x)` | ✅ | Trino compat UDF; three-valued (NULL when `x` is absent but the array holds a NULL). The string `contains(haystack, needle)` form is preserved |
 
 ## Scalar Functions: Date/Time
 

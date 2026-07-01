@@ -117,6 +117,9 @@ pub fn register_trino_functions(ctx: &datafusion::prelude::SessionContext) {
         .with_aliases(["split"]);
     ctx.register_udf(split);
 
+    // Bitwise scalar functions, `sequence`, and `slice` (#346, #349).
+    crate::scalar_fns::register_scalar_fns(ctx);
+
     // count_if, element_at (array/map), contains (array) (#356).
     crate::coverage_fns::register_coverage_fns(ctx);
 }
