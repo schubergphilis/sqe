@@ -149,6 +149,8 @@ pub struct TrinoClientHeaders {
     pub schema: Option<String>,
     pub user: Option<String>,
     pub source: Option<String>,
+    /// `iceberg.compression_codec` from the `X-Trino-Session` property list, if set.
+    pub compression_codec: Option<String>,
 }
 
 #[async_trait::async_trait]
@@ -535,11 +537,18 @@ fn apply_session_headers(
 
 /// Extract Trino client headers from the HTTP request.
 fn extract_trino_headers(headers: &HeaderMap) -> TrinoClientHeaders {
+    // The client replays `SET SESSION` values in `X-Trino-Session`; pick out
+    // `iceberg.compression_codec` so writes in this request honour it (#353).
+    let compression_codec = incoming_session_properties(headers)
+        .into_iter()
+        .find(|(k, _)| k == "iceberg.compression_codec")
+        .map(|(_, v)| v);
     TrinoClientHeaders {
         catalog: extract_header(headers, "x-trino-catalog"),
         schema: extract_header(headers, "x-trino-schema"),
         user: extract_header(headers, "x-trino-user"),
         source: extract_header(headers, "x-trino-source"),
+        compression_codec,
     }
 }
 
@@ -653,6 +662,7 @@ fn apply_trino_headers(session: Session, trino_headers: &TrinoClientHeaders) -> 
         .with_catalog(trino_headers.catalog.clone())
         .with_schema(trino_headers.schema.clone())
         .with_source(trino_headers.source.clone())
+        .with_compression_codec(trino_headers.compression_codec.clone())
 }
 
 // ── Pagination helpers ────────────────────────────────────────
@@ -1488,6 +1498,43 @@ mod tests {
         );
     }
 
+    #[test]
+    fn extract_trino_headers_picks_up_compression_codec() {
+        // #353: the codec set via SET SESSION is replayed in X-Trino-Session and
+        // must land on the parsed headers so it can reach the write path.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-trino-session",
+            "iceberg.compression_codec=ZSTD, query_max_run_time=1h".parse().unwrap(),
+        );
+        let parsed = extract_trino_headers(&headers);
+        assert_eq!(parsed.compression_codec.as_deref(), Some("ZSTD"));
+
+        // Absent -> None (writer falls back to config default).
+        let empty = extract_trino_headers(&HeaderMap::new());
+        assert_eq!(empty.compression_codec, None);
+    }
+
+    #[test]
+    fn apply_trino_headers_propagates_compression_codec_to_session() {
+        let session = Session::new(
+            "u".to_string(),
+            sqe_core::SecretString::new("token".to_string()),
+            None,
+            chrono::Utc::now() + chrono::Duration::hours(1),
+            vec![],
+        );
+        let trino_headers = TrinoClientHeaders {
+            catalog: None,
+            schema: None,
+            user: None,
+            source: None,
+            compression_codec: Some("SNAPPY".to_string()),
+        };
+        let session = apply_trino_headers(session, &trino_headers);
+        assert_eq!(session.compression_codec.as_deref(), Some("SNAPPY"));
+    }
+
     #[tokio::test]
     async fn submit_set_session_echoes_via_header_without_executing() {
         // SET SESSION must NOT reach the executor (which rejects "SET SESSION
@@ -2101,6 +2148,7 @@ mod tests {
             schema: Some("analytics".to_string()),
             user: Some("testuser".to_string()),
             source: Some("trino-jdbc".to_string()),
+            compression_codec: None,
         };
 
         let session = apply_trino_headers(session, &trino_headers);

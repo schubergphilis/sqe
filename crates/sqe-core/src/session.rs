@@ -56,6 +56,10 @@ pub struct Session {
     /// `SET WRITE_BRANCH = '<name>'`, INSERT/UPDATE/DELETE/MERGE statements
     /// route their snapshot ref updates to this branch instead of `main`.
     pub write_branch: Option<String>,
+    /// Per-session Parquet compression codec, carried by the client in the
+    /// `iceberg.compression_codec` Trino session property (`X-Trino-Session`).
+    /// When set, write paths use it instead of `config.catalog.parquet_compression`.
+    pub compression_codec: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -93,6 +97,7 @@ impl Session {
             default_schema: None,
             source: None,
             write_branch: None,
+            compression_codec: None,
         }
     }
 
@@ -147,6 +152,14 @@ impl Session {
     #[must_use = "with_source consumes self; bind the returned Session"]
     pub fn with_source(mut self, source: Option<String>) -> Self {
         self.source = source;
+        self
+    }
+
+    /// Returns a new session with the given per-session Parquet compression
+    /// codec (from the `iceberg.compression_codec` Trino session property).
+    #[must_use = "with_compression_codec consumes self; bind the returned Session"]
+    pub fn with_compression_codec(mut self, codec: Option<String>) -> Self {
+        self.compression_codec = codec;
         self
     }
 

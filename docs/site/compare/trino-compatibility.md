@@ -392,6 +392,8 @@ Each section lists Trino functions with their SQE status:
 | `SHOW COLUMNS FROM` | `SHOW COLUMNS FROM` | ✅ | New `handle_show_columns` handler translates Trino's `SHOW COLUMNS FROM ns.t` into a query against `information_schema.columns`. Returns `(column_name, data_type, is_nullable)`, the subset dbt and BI clients use for schema inspection |
 | `SHOW CREATE TABLE` | Same | ✅ | Reconstructs DDL from information_schema |
 | `SHOW STATS FOR` | Same | ✅ | Returns row_count, data_file_count, total_size from snapshot summary |
+| `SHOW ROLES` / `SHOW CURRENT ROLES` / `SHOW ROLE GRANTS` | Returns the caller's roles | ✅ | SQE derives roles from the OIDC token (no global role registry), so all three return the caller's own roles under a `Role` column. Lets JDBC clients that probe roles on connect proceed |
+| `SET SESSION iceberg.compression_codec` | Applied to writes | ✅ | The per-session codec now reaches the Parquet writer (session value wins over `catalog.parquet_compression`); previously echoed to the client but ignored |
 | `EXPLAIN` | Same | ✅ | DataFusion explain |
 | `EXPLAIN ANALYZE` | `EXPLAIN ANALYZE` | ✅ | Routed through `parse_and_classify` -> `Statement::Explain { analyze: true }` -> `explain_handler.analyze()` since Phase 2; the previous "different keyword" caveat was a stale doc claim. `EXPLAIN FULL` is an SQE-specific extension on top |
 | `USE catalog.schema` | Same | ✅ | Parsed and accepted (session-level, sets default catalog/schema) |
