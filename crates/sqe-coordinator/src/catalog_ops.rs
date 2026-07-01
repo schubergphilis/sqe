@@ -728,6 +728,101 @@ impl CatalogOps {
         Ok(())
     }
 
+    /// Drop a nested struct subfield: `ALTER TABLE t DROP COLUMN a.b[.c]` (#336).
+    ///
+    /// `path[0]` is the top-level column; `path[1..]` walks into nested structs.
+    /// The struct field is rebuilt without the leaf subfield, preserving every
+    /// other field's Iceberg id (so the commit is a pure delete). A missing leaf
+    /// errors unless `if_exists` is set, in which case it is a no-op.
+    #[instrument(skip(self, session, path), fields(username = %session.user.username))]
+    pub async fn drop_nested_column(
+        &self,
+        session: &Session,
+        table: &str,
+        path: &[String],
+        if_exists: bool,
+    ) -> sqe_core::Result<()> {
+        use iceberg::spec::{NestedField, Type};
+
+        let table_name = parse_object_name(table)?;
+        let table_ident = parse_table_ref(&table_name)?;
+
+        let session_catalog = self
+            .session_catalog_for(session, catalog_qualifier(&table_name).as_deref())
+            .await?;
+        let catalog = session_catalog.as_catalog();
+        let iceberg_table = catalog
+            .load_table(&table_ident)
+            .await
+            .map_err(|e| SqeError::Catalog(format!("Failed to load table '{table_ident}': {e}")))?;
+
+        let metadata = iceberg_table.metadata();
+        let current_schema = metadata.current_schema();
+        let last_assigned_field_id = metadata.last_column_id();
+        let current_schema_id = current_schema.schema_id();
+        let mut fields: Vec<StdArc<NestedField>> = current_schema.as_struct().fields().to_vec();
+
+        let dotted = path.join(".");
+        let (top, rest) = path.split_first().expect("nested drop path has >= 2 parts");
+        let Some(idx) = fields.iter().position(|f| &f.name == top) else {
+            if if_exists {
+                return Ok(());
+            }
+            return Err(SqeError::Execution(format!(
+                "Column '{top}' not found in table '{table_ident}'"
+            )));
+        };
+
+        let field = &fields[idx];
+        let Type::Struct(inner) = &*field.field_type else {
+            return Err(SqeError::Execution(format!(
+                "Cannot drop '{dotted}': column '{top}' is not a struct"
+            )));
+        };
+        match remove_struct_subfield(inner, rest, if_exists)? {
+            // Subfield removed: rebuild the struct column, keeping id/required.
+            Some(new_inner) => {
+                let f = &fields[idx];
+                fields[idx] = StdArc::new(NestedField::new(
+                    f.id,
+                    f.name.clone(),
+                    Type::Struct(new_inner),
+                    f.required,
+                ));
+            }
+            // Leaf absent + IF EXISTS: nothing to commit.
+            None => return Ok(()),
+        }
+
+        let new_schema_id = metadata
+            .schemas_iter()
+            .map(|s| s.schema_id())
+            .max()
+            .unwrap_or(0)
+            + 1;
+        let new_schema = IcebergSchema::builder()
+            .with_schema_id(new_schema_id)
+            .with_fields(fields)
+            .with_identifier_field_ids(current_schema.identifier_field_ids())
+            .build()
+            .map_err(|e| SqeError::Execution(format!("Failed to build new schema: {e}")))?;
+
+        let updates = vec![
+            TableUpdate::AddSchema { schema: new_schema },
+            TableUpdate::SetCurrentSchema { schema_id: -1 },
+        ];
+        let requirements = vec![
+            TableRequirement::LastAssignedFieldIdMatch { last_assigned_field_id },
+            TableRequirement::CurrentSchemaIdMatch { current_schema_id },
+        ];
+        session_catalog
+            .commit_schema_update(&table_ident, updates, requirements)
+            .await?;
+
+        info!(table = %table_ident, column = %dotted, "Nested column dropped");
+        Ok(())
+    }
+
     /// Set table properties via the Iceberg REST catalog.
     ///
     /// Handles `ALTER TABLE ... SET TBLPROPERTIES (...)` by extracting the
@@ -1300,6 +1395,62 @@ pub(crate) fn fold_unquoted_ident(ident: &sqlparser::ast::Ident) -> String {
     }
 }
 
+/// Rebuild `struct_type` with the subfield at `path` removed, preserving the
+/// Iceberg id/type/required of every retained (and every ancestor) field so the
+/// schema change is a pure delete. `path[0]` is a direct field of this struct;
+/// deeper paths recurse. Returns `Ok(None)` when the leaf is absent and
+/// `if_exists` is set (a no-op the caller skips), otherwise errors on a missing
+/// field or a non-struct ancestor. (#336)
+fn remove_struct_subfield(
+    struct_type: &iceberg::spec::StructType,
+    path: &[String],
+    if_exists: bool,
+) -> sqe_core::Result<Option<iceberg::spec::StructType>> {
+    use iceberg::spec::{NestedField, StructType, Type};
+
+    let (head, rest) = path.split_first().expect("path must be non-empty");
+    let mut new_fields: Vec<StdArc<NestedField>> = Vec::with_capacity(struct_type.fields().len());
+    let mut found = false;
+
+    for f in struct_type.fields() {
+        if &f.name != head {
+            new_fields.push(f.clone());
+            continue;
+        }
+        found = true;
+        if rest.is_empty() {
+            // Leaf: drop it by not pushing it.
+            continue;
+        }
+        // Recurse into the nested struct.
+        let Type::Struct(inner) = &*f.field_type else {
+            return Err(SqeError::Execution(format!(
+                "Cannot drop nested column: '{head}' is not a struct"
+            )));
+        };
+        match remove_struct_subfield(inner, rest, if_exists)? {
+            Some(new_inner) => new_fields.push(StdArc::new(NestedField::new(
+                f.id,
+                f.name.clone(),
+                Type::Struct(new_inner),
+                f.required,
+            ))),
+            // Deeper leaf absent + IF EXISTS: whole op is a no-op.
+            None => return Ok(None),
+        }
+    }
+
+    if !found {
+        if if_exists {
+            return Ok(None);
+        }
+        return Err(SqeError::Execution(format!(
+            "Nested field '{head}' not found"
+        )));
+    }
+    Ok(Some(StructType::new(new_fields)))
+}
+
 /// Parse a sqlparser `ObjectName` into an iceberg `TableIdent`.
 ///
 /// Returning a `TableIdent` end-to-end removes the chance of an
@@ -1559,6 +1710,52 @@ mod tests {
             fold_unquoted_ident(&Ident::with_quote('"', "KeepMe")),
             "KeepMe"
         );
+    }
+
+    #[test]
+    fn remove_struct_subfield_drops_leaf_and_recurses() {
+        use iceberg::spec::{NestedField, PrimitiveType, StructType, Type};
+        let int_ty = || Type::Primitive(PrimitiveType::Int);
+        // struct { a (id 2), b (id 3) }
+        let st = StructType::new(vec![
+            StdArc::new(NestedField::required(2, "a", int_ty())),
+            StdArc::new(NestedField::required(3, "b", int_ty())),
+        ]);
+        let out = remove_struct_subfield(&st, &["b".to_string()], false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            out.fields().iter().map(|f| f.name.as_str()).collect::<Vec<_>>(),
+            vec!["a"]
+        );
+        assert_eq!(out.fields()[0].id, 2, "retained field keeps its id");
+
+        // Missing leaf: errors without IF EXISTS, no-op (None) with it.
+        assert!(remove_struct_subfield(&st, &["z".to_string()], false).is_err());
+        assert!(remove_struct_subfield(&st, &["z".to_string()], true)
+            .unwrap()
+            .is_none());
+
+        // Nested: struct { s: struct { x (6), y (7) } } drop s.y
+        let nested = StructType::new(vec![StdArc::new(NestedField::required(
+            5,
+            "s",
+            Type::Struct(StructType::new(vec![
+                StdArc::new(NestedField::required(6, "x", int_ty())),
+                StdArc::new(NestedField::required(7, "y", int_ty())),
+            ])),
+        ))]);
+        let out2 = remove_struct_subfield(&nested, &["s".to_string(), "y".to_string()], false)
+            .unwrap()
+            .unwrap();
+        let Type::Struct(inner) = &*out2.fields()[0].field_type else {
+            panic!("s should still be a struct");
+        };
+        assert_eq!(
+            inner.fields().iter().map(|f| f.name.as_str()).collect::<Vec<_>>(),
+            vec!["x"]
+        );
+        assert_eq!(inner.fields()[0].id, 6, "nested retained field keeps its id");
     }
 
     #[test]
