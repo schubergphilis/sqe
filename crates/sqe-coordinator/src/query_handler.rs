@@ -863,6 +863,31 @@ impl QueryHandler {
                                 "Utility statement not supported: {stmt}"
                             )))
                         }
+                    } else if matches!(
+                        stmt.as_ref(),
+                        sqlparser::ast::Statement::Set(sqlparser::ast::Set::SetTimeZone { .. })
+                    ) {
+                        // Trino/JDBC clients emit `SET TIME ZONE '<tz>'` on
+                        // connect (e.g. DBeaver, dbt). SQE has no per-session
+                        // time-zone state, so the zone is accepted and recorded
+                        // in the log but not applied: query timestamps are
+                        // evaluated in the engine default zone regardless. This
+                        // matches Trino's "statement succeeds" contract (it
+                        // returns FINISHED with no rows) so the client's
+                        // connection setup does not fail. Accepting only the
+                        // SetTimeZone variant keeps every other unsupported SET
+                        // shape surfacing its clear error below. (#351b)
+                        if let sqlparser::ast::Statement::Set(
+                            sqlparser::ast::Set::SetTimeZone { value, .. },
+                        ) = stmt.as_ref()
+                        {
+                            tracing::info!(
+                                requested_time_zone = %value,
+                                "SET TIME ZONE accepted as a no-op (SQE has no per-session zone; \
+                                 timestamps use the engine default zone)"
+                            );
+                        }
+                        Ok(Vec::new())
                     } else if matches!(stmt.as_ref(), sqlparser::ast::Statement::ShowFunctions { .. }) {
                         // SHOW FUNCTIONS -> list the registered functions with
                         // Trino's column shape (#344).
@@ -1118,6 +1143,12 @@ impl QueryHandler {
                 StatementKind::ShowCreateTable(ref stmt) => {
                     let (ctx, session_catalog) = self.create_session_context(session).await?;
                     self.handle_show_create_table(session, stmt, &ctx, &session_catalog)
+                        .await
+                }
+
+                StatementKind::ShowCreateSchema(ref schema_ref) => {
+                    let (_ctx, session_catalog) = self.create_session_context(session).await?;
+                    self.handle_show_create_schema(schema_ref, &session_catalog)
                         .await
                 }
 
@@ -3053,6 +3084,70 @@ impl QueryHandler {
 
         let schema = Arc::new(Schema::new(vec![Field::new(
             "Create Table",
+            DataType::Utf8,
+            false,
+        )]));
+        let result = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(ArrowStringArray::from(vec![ddl.as_str()])) as ArrayRef],
+        )
+        .map_err(|e| SqeError::Execution(format!("Failed to build result batch: {e}")))?;
+
+        Ok(vec![result])
+    }
+
+    /// Handle SHOW CREATE SCHEMA <name> by reconstructing the namespace DDL
+    /// from catalog metadata, mirroring `handle_show_create_table`'s output
+    /// shape. Trino emits a single-column result named `Create Schema`; the
+    /// value is a `CREATE SCHEMA <name>` string with an optional
+    /// `WITH ( location = '...' )` clause for any namespace `location`
+    /// property. sqlparser cannot parse the SHOW CREATE SCHEMA form, so this
+    /// is reached via the `ShowCreateSchema(String)` classification rather than
+    /// an AST match. (#351a)
+    async fn handle_show_create_schema(
+        &self,
+        schema_ref: &str,
+        session_catalog: &Arc<SessionCatalog>,
+    ) -> sqe_core::Result<Vec<RecordBatch>> {
+        use arrow_array::StringArray as ArrowStringArray;
+
+        // The reference may be catalog-qualified (`iceberg.tpch_demo`) or a
+        // bare schema (`tpch_demo`). The namespace ident is the last part; a
+        // catalog prefix is only used for the displayed DDL name. Quoting is
+        // stripped so the lookup uses the raw namespace name.
+        let cleaned = schema_ref.trim().trim_end_matches(';').trim();
+        let parts: Vec<String> = cleaned
+            .split('.')
+            .map(|p| p.trim().trim_matches('"').trim_matches('\'').to_string())
+            .collect();
+        let ns_name = parts
+            .last()
+            .filter(|p| !p.is_empty())
+            .ok_or_else(|| SqeError::Execution("SHOW CREATE SCHEMA requires a schema name".into()))?
+            .clone();
+
+        let ns_ident = iceberg::NamespaceIdent::new(ns_name.clone());
+        // Resolve the namespace so a missing schema errors like Trino, and so
+        // any `location` property can be surfaced in the DDL. A schema that
+        // does not exist (or a backend that rejects the lookup) surfaces a
+        // clear error rather than fabricating DDL for a non-existent schema.
+        let location = match session_catalog.get_namespace(&ns_ident).await {
+            Ok(ns) => ns.properties().get("location").cloned(),
+            Err(e) => {
+                return Err(SqeError::Execution(format!(
+                    "Failed to describe schema {ns_name}: {e}"
+                )))
+            }
+        };
+
+        let mut ddl = format!("CREATE SCHEMA {cleaned}");
+        if let Some(loc) = location.filter(|l| !l.is_empty()) {
+            let loc_escaped = loc.replace('\'', "''");
+            ddl.push_str(&format!("\nWITH (\n   location = '{loc_escaped}'\n)"));
+        }
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "Create Schema",
             DataType::Utf8,
             false,
         )]));
