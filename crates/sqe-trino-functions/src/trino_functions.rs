@@ -412,9 +412,12 @@ trino_extract_fn!(ExtractSecond, "second",
     |us: i64| time_us_to_naive(us).map(|t| t.second() as f64)
 );
 trino_extract_fn!(DayOfWeek, "day_of_week",
-    |d: NaiveDate| d.weekday().num_days_from_sunday() as f64,
-    |us| us_to_naive(us).weekday().num_days_from_sunday() as f64,
-    |ns| ns_to_naive(ns).weekday().num_days_from_sunday() as f64,
+    // Trino uses ISO day-of-week: Monday=1 .. Sunday=7. chrono's
+    // `number_from_monday()` matches; `num_days_from_sunday()` (Sunday=0) is
+    // the Postgres/DataFusion `dow` convention and returned wrong values (#361).
+    |d: NaiveDate| d.weekday().number_from_monday() as f64,
+    |us| us_to_naive(us).weekday().number_from_monday() as f64,
+    |ns| ns_to_naive(ns).weekday().number_from_monday() as f64,
     |_us: i64| None
 );
 trino_extract_fn!(DayOfYear, "day_of_year",
@@ -2371,9 +2374,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn day_of_week_monday() {
-        // 2026-03-30 is Monday. Trino: Monday=1
+    async fn day_of_week_iso() {
+        // Trino uses ISO day-of-week: Monday=1 .. Sunday=7 (#361).
+        // 2026-03-30 is a Monday.
         assert_eq!(run_query("SELECT day_of_week(DATE '2026-03-30')").await, 1);
+        // 2026-04-01 is a Wednesday.
+        assert_eq!(run_query("SELECT day_of_week(DATE '2026-04-01')").await, 3);
+        // 2024-01-07 is a Sunday. The Postgres `dow` convention returns 0 here;
+        // Trino/ISO returns 7. This case is the regression guard for #361.
+        assert_eq!(run_query("SELECT day_of_week(DATE '2024-01-07')").await, 7);
     }
 
     #[tokio::test]
