@@ -242,6 +242,17 @@ pub fn type_signature_for(trino_type: &str) -> TrinoTypeSignature {
         value: serde_json::json!(v),
     };
 
+    // Handle parameterized temporal types: `timestamp(p)`, `timestamp(p) with
+    // time zone`, `time(p)`, `time(p) with time zone`. `arrow_to_trino_type`
+    // emits the precision baked into the type string (e.g. "timestamp(6)"),
+    // but the Trino JDBC driver's ClientTypeSignature parser rejects a
+    // parameterized base in `rawType` and throws on the whole response. The
+    // precision must live in `arguments` with `rawType` holding only the base
+    // name -- the same shape `decimal` already uses. (#345)
+    if let Some(sig) = parameterized_temporal_signature(trino_type, &long_arg) {
+        return sig;
+    }
+
     match trino_type {
         // varchar/varbinary: driver reads arguments[0] for display size
         "varchar" => TrinoTypeSignature {
@@ -252,8 +263,9 @@ pub fn type_signature_for(trino_type: &str) -> TrinoTypeSignature {
             raw_type: "varbinary".to_string(),
             arguments: vec![long_arg(2147483647)],
         },
-        // timestamp types: driver reads arguments[0] for precision (default 3 if missing,
-        // but we provide 6 for microsecond precision to match Iceberg)
+        // Bare (non-parameterized) temporal types: driver reads arguments[0]
+        // for precision; default to 6 (microsecond) to match Iceberg. The
+        // parameterized forms are handled above.
         "timestamp" => TrinoTypeSignature {
             raw_type: "timestamp".to_string(),
             arguments: vec![long_arg(6)],
@@ -267,6 +279,36 @@ pub fn type_signature_for(trino_type: &str) -> TrinoTypeSignature {
             arguments: vec![],
         },
     }
+}
+
+/// Build a type signature for a parameterized temporal type, extracting the
+/// precision into `arguments` with the base name in `rawType`.
+///
+/// Recognizes `timestamp(p)`, `timestamp(p) with time zone`, `time(p)`, and
+/// `time(p) with time zone`. Returns `None` for any other (or non-parameterized)
+/// input, so bare `timestamp` / `time` fall through to the exact-match arms.
+fn parameterized_temporal_signature(
+    trino_type: &str,
+    long_arg: &impl Fn(i64) -> TrinoTypeArgument,
+) -> Option<TrinoTypeSignature> {
+    // Split off a trailing " with time zone" so the precision parse sees the
+    // bare `base(p)` form.
+    let (base, tz_suffix) = match trino_type.strip_suffix(" with time zone") {
+        Some(prefix) => (prefix, " with time zone"),
+        None => (trino_type, ""),
+    };
+
+    let open = base.find('(')?;
+    let name = &base[..open];
+    if name != "timestamp" && name != "time" {
+        return None;
+    }
+    let precision: i64 = base[open + 1..].strip_suffix(')')?.trim().parse().ok()?;
+
+    Some(TrinoTypeSignature {
+        raw_type: format!("{name}{tz_suffix}"),
+        arguments: vec![long_arg(precision)],
+    })
 }
 
 pub fn batches_to_trino(
@@ -707,6 +749,82 @@ mod tests {
         assert!(json.contains("\"warnings\":[]"), "warnings array must always be present");
         assert!(json.contains("\"cpuTimeMillis\""), "stats must include cpuTimeMillis");
         assert!(json.contains("\"processedRows\""), "stats must include processedRows");
+    }
+
+    #[test]
+    fn test_type_signature_timestamp_precision_in_arguments() {
+        // #345: timestamp(p) must serialize rawType "timestamp" + precision in
+        // arguments, not rawType "timestamp(6)". The Trino JDBC driver's
+        // ClientTypeSignature parser rejects a parameterized base in rawType.
+        let sig = type_signature_for("timestamp(6)");
+        let json = serde_json::to_value(&sig).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "rawType": "timestamp",
+                "arguments": [{ "kind": "LONG", "value": 6 }]
+            }),
+            "timestamp(6) signature, got: {json}"
+        );
+    }
+
+    #[test]
+    fn test_type_signature_timestamp_with_tz_precision_in_arguments() {
+        let sig = type_signature_for("timestamp(6) with time zone");
+        let json = serde_json::to_value(&sig).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "rawType": "timestamp with time zone",
+                "arguments": [{ "kind": "LONG", "value": 6 }]
+            }),
+            "timestamp(6) with time zone signature, got: {json}"
+        );
+    }
+
+    #[test]
+    fn test_type_signature_time_precision_in_arguments() {
+        // The helper also covers time(p), even though arrow_to_trino_type
+        // currently emits a bare "time".
+        let sig = type_signature_for("time(3)");
+        let json = serde_json::to_value(&sig).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "rawType": "time",
+                "arguments": [{ "kind": "LONG", "value": 3 }]
+            }),
+            "time(3) signature, got: {json}"
+        );
+    }
+
+    #[test]
+    fn test_type_signature_bare_temporal_fall_through() {
+        // Non-parameterized forms still hit the exact-match arms with a
+        // default precision of 6.
+        assert_eq!(type_signature_for("timestamp").raw_type, "timestamp");
+        assert_eq!(type_signature_for("timestamp").arguments.len(), 1);
+        assert_eq!(
+            type_signature_for("timestamp with time zone").raw_type,
+            "timestamp with time zone"
+        );
+    }
+
+    #[test]
+    fn test_type_signature_decimal_unchanged() {
+        // Guard the pre-existing decimal shape the parameterized-temporal
+        // handler must not disturb.
+        let json = serde_json::to_value(type_signature_for("decimal(10,2)")).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "rawType": "decimal",
+                "arguments": [
+                    { "kind": "LONG", "value": 10 },
+                    { "kind": "LONG", "value": 2 }
+                ]
+            })
+        );
     }
 
     #[test]
