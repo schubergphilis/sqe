@@ -48,6 +48,42 @@ python3 tests/parity/parity_compare.py \
   --schema tpch_demo
 ```
 
+## Iceberg SQL parity (DDL/DML/metadata/interop)
+
+`parity_compare.py` is read-only. `iceberg_parity.py` covers the Iceberg-specific
+surface by running a *sequence* of DDL/DML on both engines and diffing a verify
+query. Two scenario kinds (see `iceberg_scenarios.json`):
+
+- **parity** — SQE and Trino each run the identical setup on their OWN table
+  (`{t}_sqe` / `{t}_trino`), then a verify SELECT is diffed. Proves the write
+  path produces the same logical result.
+- **interop** — one engine writes a SHARED table; both engines read it and the
+  reads are diffed. Proves SQE-written Iceberg (including merge-on-read
+  position-delete files) is Trino-readable and vice versa.
+
+```bash
+python3 tests/parity/iceberg_parity.py tests/parity/iceberg_scenarios.json
+```
+
+Table names are fully qualified (`tpch_demo.<t>`) on purpose: SQE's write path
+resolves an UNqualified name to the `default` namespace while reads use the
+session schema, so qualifying isolates these tests to the Iceberg operations.
+That namespace split is a known gap (see below), not exercised here.
+
+### Known gaps this surfaced (excluded from the green set)
+
+- **Unqualified-write namespace**: `CREATE/INSERT` land in `default`, reads use
+  the session schema, so `CREATE TABLE t; INSERT; SELECT * FROM t` fails
+  "table not found" under a non-`default` session schema. (Same root as #343.)
+- **Schema-evolution read**: `SELECT <col>` where `<col>` was added by
+  `ALTER TABLE ADD COLUMN` returns a broken response for rows written before the
+  add (should NULL-backfill).
+- **ALTER RENAME COLUMN**: accepted but not persisted.
+- **MERGE with inline `(VALUES ...) AS src(cols)` source**: source-column
+  resolution fails; table/subquery sources work.
+- **Snapshot/history count**: SQE does not record the CREATE as a snapshot/
+  history entry (off-by-one vs Trino).
+
 ## Notes
 
 - Polaris persistence is in-memory; the demo schema is lost if the `polaris`

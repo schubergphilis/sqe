@@ -1,0 +1,111 @@
+[
+  {"name": "create_insert", "kind": "parity",
+   "setup": ["CREATE TABLE {t} (id int, grp varchar, amt double)",
+             "INSERT INTO {t} VALUES (1,'a',10.0),(2,'a',20.5),(3,'b',30.0)"],
+   "verify": "SELECT id, grp, amt FROM {t} ORDER BY id"},
+
+  {"name": "ctas", "kind": "parity",
+   "setup": ["CREATE TABLE {t} AS SELECT nationkey, name, regionkey FROM nation"],
+   "verify": "SELECT regionkey, count(*) c FROM {t} GROUP BY regionkey ORDER BY regionkey"},
+
+  {"name": "insert_from_select", "kind": "parity",
+   "setup": ["CREATE TABLE {t} (rk int, rn varchar)",
+             "INSERT INTO {t} SELECT regionkey, name FROM region"],
+   "verify": "SELECT rk, rn FROM {t} ORDER BY rk"},
+
+  {"name": "insert_multi_batch", "kind": "parity",
+   "setup": ["CREATE TABLE {t} (id int)",
+             "INSERT INTO {t} VALUES (1),(2)",
+             "INSERT INTO {t} VALUES (3)",
+             "INSERT INTO {t} VALUES (4),(5)"],
+   "verify": "SELECT count(*), sum(id) FROM {t}"},
+
+  {"name": "update_rows", "kind": "parity",
+   "setup": ["CREATE TABLE {t} (id int, grp varchar, amt double)",
+             "INSERT INTO {t} VALUES (1,'a',10.0),(2,'a',20.0),(3,'b',30.0)",
+             "UPDATE {t} SET amt = amt + 100 WHERE grp='a'"],
+   "verify": "SELECT id, amt FROM {t} ORDER BY id"},
+
+  {"name": "delete_rows", "kind": "parity",
+   "setup": ["CREATE TABLE {t} (id int, grp varchar)",
+             "INSERT INTO {t} VALUES (1,'a'),(2,'a'),(3,'b'),(4,'b')",
+             "DELETE FROM {t} WHERE grp='b'"],
+   "verify": "SELECT id FROM {t} ORDER BY id"},
+
+  {"name": "merge_table_source", "kind": "parity",
+   "setup": ["CREATE TABLE {t} (id int, val varchar)",
+             "INSERT INTO {t} VALUES (1,'x'),(2,'y'),(3,'z')",
+             "MERGE INTO {t} tgt USING (SELECT nationkey AS id, name AS val FROM nation WHERE nationkey IN (2,9)) src ON tgt.id=src.id WHEN MATCHED THEN UPDATE SET val=src.val WHEN NOT MATCHED THEN INSERT (id,val) VALUES (src.id, src.val)"],
+   "verify": "SELECT id, val FROM {t} ORDER BY id"},
+
+  {"name": "create_like_insert", "kind": "parity",
+   "setup": ["CREATE TABLE {t} (LIKE nation)",
+             "INSERT INTO {t} SELECT * FROM nation WHERE regionkey=1"],
+   "verify": "SELECT nationkey, name FROM {t} ORDER BY nationkey"},
+
+  {"name": "partitioned_write", "kind": "parity",
+   "setup": ["CREATE TABLE {t} (id int, grp varchar, amt double) WITH (partitioning = ARRAY['grp'])",
+             "INSERT INTO {t} VALUES (1,'a',10.0),(2,'b',20.0),(3,'a',30.0),(4,'c',40.0)"],
+   "verify": "SELECT grp, count(*), round(sum(amt),2) FROM {t} GROUP BY grp ORDER BY grp"},
+
+  {"name": "alter_drop_column", "kind": "parity",
+   "setup": ["CREATE TABLE {t} (id int, a varchar, b int)",
+             "INSERT INTO {t} VALUES (1,'x',7),(2,'y',8)",
+             "ALTER TABLE {t} DROP COLUMN b"],
+   "verify": "SELECT id, a FROM {t} ORDER BY id"},
+
+  {"name": "alter_set_properties", "kind": "parity",
+   "setup": ["CREATE TABLE {t} (id int)",
+             "INSERT INTO {t} VALUES (1),(2),(3)",
+             "ALTER TABLE {t} SET PROPERTIES format_version = 2"],
+   "verify": "SELECT count(*) FROM {t}"},
+
+  {"name": "meta_snapshots_readable", "kind": "parity",
+   "setup": ["CREATE TABLE {t} (id int)",
+             "INSERT INTO {t} VALUES (1)",
+             "INSERT INTO {t} VALUES (2)"],
+   "verify": "SELECT count(*) > 0 FROM {snaptbl}"},
+
+  {"name": "meta_history_readable", "kind": "parity",
+   "setup": ["CREATE TABLE {t} (id int)",
+             "INSERT INTO {t} VALUES (1)",
+             "INSERT INTO {t} VALUES (2)"],
+   "verify": "SELECT count(*) > 0 FROM {histtbl}"},
+
+  {"name": "io_sqe_write_read", "kind": "interop", "writer": "SQE",
+   "setup": ["CREATE TABLE {t} (id int, grp varchar, amt double)",
+             "INSERT INTO {t} VALUES (1,'a',10.0),(2,'b',20.0),(3,'a',30.5)"],
+   "verify": "SELECT id, grp, amt FROM {t} ORDER BY id"},
+
+  {"name": "io_trino_write_read", "kind": "interop", "writer": "Trino",
+   "setup": ["CREATE TABLE {t} (id int, grp varchar, amt double)",
+             "INSERT INTO {t} VALUES (1,'a',10.0),(2,'b',20.0),(3,'a',30.5)"],
+   "verify": "SELECT id, grp, amt FROM {t} ORDER BY id"},
+
+  {"name": "io_sqe_ctas", "kind": "interop", "writer": "SQE",
+   "setup": ["CREATE TABLE {t} AS SELECT custkey, name, acctbal FROM customer WHERE nationkey=1"],
+   "verify": "SELECT count(*), round(sum(acctbal),2) FROM {t}"},
+
+  {"name": "io_trino_partitioned", "kind": "interop", "writer": "Trino",
+   "setup": ["CREATE TABLE {t} (id int, grp varchar) WITH (partitioning = ARRAY['grp'])",
+             "INSERT INTO {t} VALUES (1,'a'),(2,'b'),(3,'a')"],
+   "verify": "SELECT grp, count(*) FROM {t} GROUP BY grp ORDER BY grp"},
+
+  {"name": "io_sqe_update_read", "kind": "interop", "writer": "SQE",
+   "setup": ["CREATE TABLE {t} (id int, amt double)",
+             "INSERT INTO {t} VALUES (1,10.0),(2,20.0),(3,30.0)",
+             "UPDATE {t} SET amt = amt * 2 WHERE id <= 2"],
+   "verify": "SELECT id, amt FROM {t} ORDER BY id"},
+
+  {"name": "io_trino_delete_read", "kind": "interop", "writer": "Trino",
+   "setup": ["CREATE TABLE {t} (id int, grp varchar)",
+             "INSERT INTO {t} VALUES (1,'a'),(2,'b'),(3,'a'),(4,'b')",
+             "DELETE FROM {t} WHERE grp='b'"],
+   "verify": "SELECT id FROM {t} ORDER BY id"},
+
+  {"name": "io_sqe_merge_read", "kind": "interop", "writer": "SQE",
+   "setup": ["CREATE TABLE {t} (id int, val varchar)",
+             "INSERT INTO {t} VALUES (1,'x'),(2,'y'),(3,'z')",
+             "MERGE INTO {t} tgt USING (SELECT regionkey AS id, name AS val FROM region WHERE regionkey IN (2,5)) src ON tgt.id=src.id WHEN MATCHED THEN UPDATE SET val=src.val WHEN NOT MATCHED THEN INSERT (id,val) VALUES (src.id, src.val)"],
+   "verify": "SELECT id, val FROM {t} ORDER BY id"}
+]
