@@ -954,6 +954,13 @@ impl QueryHandler {
                     crate::session_context::invalidate_session_cache(&session.user.username).await;
                     Ok(vec![])
                 }
+                StatementKind::DropNestedColumn { table, path, if_exists } => {
+                    self.catalog_ops
+                        .drop_nested_column(session, table, path, *if_exists)
+                        .await?;
+                    crate::session_context::invalidate_session_cache(&session.user.username).await;
+                    Ok(vec![])
+                }
                 StatementKind::AlterTableProps(stmt) => {
                     self.catalog_ops.set_table_properties(session, stmt).await?;
                     crate::session_context::invalidate_session_cache(&session.user.username).await;

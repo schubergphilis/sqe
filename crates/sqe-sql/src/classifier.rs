@@ -106,6 +106,16 @@ pub enum StatementKind {
     /// parser runs. Carries the raw (possibly dotted/quoted) schema reference.
     /// (#351a)
     ShowCreateSchema(String),
+    /// ALTER TABLE t DROP COLUMN a.b — drop a nested struct subfield. The
+    /// dotted path is rejected by sqlparser 0.62 (`Expected: end of statement,
+    /// found: .`), so it is detected by prefix before the parser runs. Carries
+    /// the raw table reference and the dotted field path split into components
+    /// (e.g. `["info", "age"]`). (#336)
+    DropNestedColumn {
+        table: String,
+        path: Vec<String>,
+        if_exists: bool,
+    },
     /// TRUNCATE TABLE name — routes to DELETE FROM without WHERE
     Truncate(String),
     /// ANALYZE [catalog.][schema.]table [WITH (...)] — Trino table-statistics
@@ -190,6 +200,7 @@ impl StatementKind {
             StatementKind::Use(_) => "use",
             StatementKind::ShowCreateTable(_) => "showcreatetable",
             StatementKind::ShowCreateSchema(_) => "showcreateschema",
+            StatementKind::DropNestedColumn { .. } => "dropnestedcolumn",
             StatementKind::Truncate(_) => "truncate",
             StatementKind::Analyze(_) => "analyze",
             StatementKind::Call(_) => "call",
@@ -283,28 +294,47 @@ fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
 /// the token sequence after `DROP COLUMN [IF EXISTS]` up to the next clause
 /// separator (comma, whitespace-then-clause, or end). Only fires when a `.`
 /// appears inside that path. (#336)
-fn detect_nested_drop_column(trimmed: &str) -> Option<String> {
+/// Detect `ALTER TABLE <table> DROP COLUMN [IF EXISTS] <a.b[.c]>` (a dotted
+/// nested-field drop). Returns `(table_ref, path_components, if_exists)` where
+/// `table_ref` is the raw (possibly qualified/quoted) table reference and
+/// `path_components` are the dot-split, unquoted field names. Returns `None`
+/// for a non-dotted DROP COLUMN (which sqlparser handles normally). (#336)
+fn detect_nested_drop_column(trimmed: &str) -> Option<(String, Vec<String>, bool)> {
     let upper = trimmed.to_uppercase();
-    // Find the `DROP COLUMN` keyword pair (byte offset in the uppercased copy,
-    // which lines up with the original since the prefix is ASCII).
     let idx = upper.find("DROP COLUMN")?;
-    let after = &trimmed[idx + "DROP COLUMN".len()..];
-    let after = after.trim_start();
-    // Skip an optional `IF EXISTS`.
-    let after = strip_prefix_ci(after, "IF EXISTS")
-        .map(|r| r.trim_start())
-        .unwrap_or(after);
-    // The column reference runs until a delimiter that ends it: whitespace,
-    // comma, or the statement terminator. A dotted path uses `.` internally.
+    // The table reference sits between `ALTER TABLE [IF EXISTS]` and `DROP COLUMN`.
+    let prefix = trimmed[..idx].trim_end();
+    let prefix_rest = strip_prefix_ci(prefix.trim_start(), "ALTER TABLE")?;
+    let table_ref = strip_prefix_ci(prefix_rest.trim_start(), "IF EXISTS")
+        .map(|r| r.trim())
+        .unwrap_or_else(|| prefix_rest.trim());
+    if table_ref.is_empty() {
+        return None;
+    }
+
+    let after = trimmed[idx + "DROP COLUMN".len()..].trim_start();
+    // Optional `IF EXISTS` on the column itself.
+    let (if_exists, after) = match strip_prefix_ci(after, "IF EXISTS") {
+        Some(r) => (true, r.trim_start()),
+        None => (false, after),
+    };
+    // The column reference runs until a delimiter: whitespace, comma, terminator.
     let end = after
         .find(|c: char| c.is_whitespace() || c == ',' || c == ';')
         .unwrap_or(after.len());
-    let path = after[..end].trim();
-    if path.contains('.') && !path.is_empty() {
-        Some(path.to_string())
-    } else {
-        None
+    let path_str = after[..end].trim();
+    if !path_str.contains('.') || path_str.is_empty() {
+        return None;
     }
+    let path: Vec<String> = path_str
+        .split('.')
+        .map(|s| s.trim().trim_matches('"').to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if path.len() < 2 {
+        return None;
+    }
+    Some((table_ref.to_string(), path, if_exists))
 }
 
 /// Parse a SQL string and classify the first statement.
@@ -464,17 +494,16 @@ pub fn parse_and_classify(sql: &str) -> sqe_core::Result<StatementKind> {
         }
         // ALTER TABLE t DROP COLUMN a.b — a dotted path drops a nested struct
         // subfield. sqlparser 0.62 rejects the `.` with a baffling
-        // `Expected: end of statement, found: .`. Intercept the dotted form and
-        // surface a clear NotImplemented rather than the parser noise, so a
-        // client sees an actionable message. Nested Iceberg schema surgery
-        // (removing a subfield from a struct) is not yet implemented. A
-        // non-dotted DROP COLUMN still flows to sqlparser and the normal
-        // AlterSchema handler. (#336)
-        if let Some(path) = detect_nested_drop_column(trimmed) {
-            return Err(sqe_core::SqeError::NotImplemented(format!(
-                "dropping a nested column ('{path}') is not yet supported; \
-                 only top-level columns can be dropped"
-            )));
+        // `Expected: end of statement, found: .`, so intercept the dotted form
+        // and route it to the nested-drop handler, which rewrites the struct
+        // field without the subfield. A non-dotted DROP COLUMN still flows to
+        // sqlparser and the normal AlterSchema handler. (#336)
+        if let Some((table, path, if_exists)) = detect_nested_drop_column(trimmed) {
+            return Ok(StatementKind::DropNestedColumn {
+                table,
+                path,
+                if_exists,
+            });
         }
     }
 
@@ -2112,22 +2141,31 @@ mod tests {
     }
 
     #[test]
-    fn test_drop_nested_column_returns_clear_not_implemented() {
-        // #336: a dotted DROP COLUMN path must surface a clear NotImplemented
+    fn test_drop_nested_column_classifies_to_dropnestedcolumn() {
+        // #336: a dotted DROP COLUMN path routes to the nested-drop handler
         // instead of sqlparser's `Expected: end of statement, found: .`.
-        let err = parse_and_classify("ALTER TABLE t DROP COLUMN nested.subfield")
-            .expect_err("dotted DROP COLUMN should error");
-        assert!(matches!(err, sqe_core::SqeError::NotImplemented(_)), "got: {err:?}");
-        let msg = err.to_string();
-        assert!(msg.contains("nested.subfield"), "message should name the path: {msg}");
+        let kind = parse_and_classify("ALTER TABLE t DROP COLUMN nested.subfield").unwrap();
+        match kind {
+            StatementKind::DropNestedColumn { table, path, if_exists } => {
+                assert_eq!(table, "t");
+                assert_eq!(path, vec!["nested".to_string(), "subfield".to_string()]);
+                assert!(!if_exists);
+            }
+            other => panic!("expected DropNestedColumn, got: {other:?}"),
+        }
     }
 
     #[test]
     fn test_drop_nested_column_if_exists() {
-        let err = parse_and_classify("ALTER TABLE t DROP COLUMN IF EXISTS a.b.c")
-            .expect_err("dotted DROP COLUMN IF EXISTS should error");
-        assert!(matches!(err, sqe_core::SqeError::NotImplemented(_)));
-        assert!(err.to_string().contains("a.b.c"));
+        let kind = parse_and_classify("ALTER TABLE t DROP COLUMN IF EXISTS a.b.c").unwrap();
+        match kind {
+            StatementKind::DropNestedColumn { table, path, if_exists } => {
+                assert_eq!(table, "t");
+                assert_eq!(path, vec!["a".to_string(), "b".to_string(), "c".to_string()]);
+                assert!(if_exists);
+            }
+            other => panic!("expected DropNestedColumn, got: {other:?}"),
+        }
     }
 
     #[test]
@@ -2142,11 +2180,15 @@ mod tests {
     fn detect_nested_drop_column_unit() {
         assert_eq!(
             detect_nested_drop_column("ALTER TABLE t DROP COLUMN a.b"),
-            Some("a.b".to_string())
+            Some(("t".to_string(), vec!["a".to_string(), "b".to_string()], false))
         );
         assert_eq!(
-            detect_nested_drop_column("alter table t drop column IF EXISTS a.b.c"),
-            Some("a.b.c".to_string())
+            detect_nested_drop_column("alter table ns.t drop column IF EXISTS a.b.c"),
+            Some((
+                "ns.t".to_string(),
+                vec!["a".to_string(), "b".to_string(), "c".to_string()],
+                true
+            ))
         );
         assert_eq!(detect_nested_drop_column("ALTER TABLE t DROP COLUMN x"), None);
         assert_eq!(detect_nested_drop_column("ALTER TABLE t ADD COLUMN x INT"), None);
