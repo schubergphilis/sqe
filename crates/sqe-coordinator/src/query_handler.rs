@@ -1244,19 +1244,7 @@ impl QueryHandler {
                     // Extract source SQL from the MERGE statement and execute it
                     // to get the source batches, then pass them to the write handler.
                     let source_sql = if let Statement::Merge(merge) = stmt.as_ref() {
-                        match &merge.source {
-                            sqlparser::ast::TableFactor::Table { name, .. } => {
-                                format!("SELECT * FROM {name}")
-                            }
-                            sqlparser::ast::TableFactor::Derived { subquery, .. } => {
-                                format!("{subquery}")
-                            }
-                            other => {
-                                return Err(SqeError::Execution(format!(
-                                    "Unsupported MERGE source: {other}"
-                                )));
-                            }
-                        }
+                        merge_source_sql(&merge.source)?
                     } else {
                         return Err(SqeError::Execution(
                             "Expected MERGE statement".into(),
@@ -5961,6 +5949,44 @@ fn parse_show_tables_namespace(filter: &str) -> Option<String> {
     }
 }
 
+/// Build the SELECT SQL that materialises a MERGE source relation.
+///
+/// The MERGE source is executed as a standalone query so the resulting
+/// batches can be registered as a scratch MemTable and joined against the
+/// target. The tricky case is a derived table (`USING (...) AS s(c1, c2)`):
+/// the source alias's *column list* renames the projected columns, and that
+/// rename must survive into the executed SQL. Otherwise a `VALUES` source
+/// keeps its synthetic `column1`/`column2` names and later references to
+/// `s.c1` fail to resolve (issue #360).
+///
+/// A subquery source that names its own columns (`SELECT a AS c1 ...`) works
+/// even without the alias list, which is why the table/subquery MERGE paths
+/// were already green. Wrapping the subquery in
+/// `SELECT * FROM (<subquery>) AS s(c1, c2)` applies the alias column list
+/// uniformly, fixing both `VALUES` sources and column-list subquery sources.
+/// When the derived source has no alias column list, the SQL is emitted
+/// byte-for-byte as before so the existing passing paths cannot regress.
+fn merge_source_sql(source: &TableFactor) -> Result<String, SqeError> {
+    match source {
+        TableFactor::Table { name, .. } => Ok(format!("SELECT * FROM {name}")),
+        TableFactor::Derived {
+            subquery, alias, ..
+        } => match alias {
+            // Derived source carries an explicit column-alias list, e.g.
+            // `AS s(id, v)`. Re-apply it by wrapping the subquery: the alias's
+            // Display renders `AS s (id, v)` with correct quoting/case.
+            Some(a) if !a.columns.is_empty() => {
+                Ok(format!("SELECT * FROM ({subquery}) {a}"))
+            }
+            // No column-alias list: preserve the original behaviour exactly.
+            _ => Ok(format!("{subquery}")),
+        },
+        other => Err(SqeError::Execution(format!(
+            "Unsupported MERGE source: {other}"
+        ))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5975,6 +6001,65 @@ mod tests {
             .into_iter()
             .next()
             .unwrap()
+    }
+
+    fn merge_source_of(sql: &str) -> TableFactor {
+        match parse_one(sql) {
+            Statement::Merge(m) => m.source,
+            other => panic!("expected MERGE, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn merge_source_sql_table_form_selects_star() {
+        let src = merge_source_of(
+            "MERGE INTO t tgt USING src ON tgt.id = src.id \
+             WHEN MATCHED THEN UPDATE SET v = src.v",
+        );
+        assert_eq!(merge_source_sql(&src).unwrap(), "SELECT * FROM src");
+    }
+
+    #[test]
+    fn merge_source_sql_subquery_without_column_list_is_unchanged() {
+        // The historical (green) subquery path: names its own columns via AS,
+        // so no wrapping is needed and the SQL stays byte-identical.
+        let src = merge_source_of(
+            "MERGE INTO t tgt USING (SELECT nk AS id, name AS v FROM nation) src \
+             ON tgt.id = src.id WHEN MATCHED THEN UPDATE SET v = src.v",
+        );
+        assert_eq!(
+            merge_source_sql(&src).unwrap(),
+            "SELECT nk AS id, name AS v FROM nation"
+        );
+    }
+
+    #[test]
+    fn merge_source_sql_values_with_alias_columns_is_wrapped() {
+        // Issue #360: an inline VALUES source with an alias column list must
+        // have the alias re-applied, otherwise the columns stay column1/column2
+        // and `s.v` / `s.id` fail to resolve.
+        let src = merge_source_of(
+            "MERGE INTO m360 t USING (VALUES (1, 99)) AS s(id, v) ON t.id = s.id \
+             WHEN MATCHED THEN UPDATE SET v = s.v",
+        );
+        assert_eq!(
+            merge_source_sql(&src).unwrap(),
+            "SELECT * FROM (VALUES (1, 99)) AS s (id, v)"
+        );
+    }
+
+    #[test]
+    fn merge_source_sql_subquery_with_alias_columns_is_wrapped() {
+        // A subquery source that relies on the alias column list (rather than
+        // inline AS) is the same bug class and is fixed the same way.
+        let src = merge_source_of(
+            "MERGE INTO t tgt USING (SELECT nk, name FROM nation) AS s(id, v) \
+             ON tgt.id = s.id WHEN MATCHED THEN UPDATE SET v = s.v",
+        );
+        assert_eq!(
+            merge_source_sql(&src).unwrap(),
+            "SELECT * FROM (SELECT nk, name FROM nation) AS s (id, v)"
+        );
     }
 
     #[test]
