@@ -7,6 +7,7 @@ use arrow_schema::Schema as ArrowSchema;
 use datafusion::common::TableReference;
 use datafusion::datasource::{provider_as_source, MemTable};
 use datafusion::logical_expr::{dml::InsertOp, LogicalPlan, LogicalPlanBuilder};
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::prelude::SessionContext as DFSessionContext;
 use futures::{StreamExt, TryStreamExt};
 use iceberg::arrow::arrow_schema_to_schema_auto_assign_ids;
@@ -31,6 +32,7 @@ use sqe_core::{Session, SqeConfig, SqeError};
 use tracing::instrument;
 
 use crate::catalog_ops::{catalog_qualifier, fold_unquoted_ident, parse_table_ref};
+use crate::write_memory::{TrackedBatchBuffer, WriteReservation};
 use crate::writer::{
     new_upload_tracker, resolve_write_compression, write_data_files_streaming_with_metrics,
     write_data_files_with_metrics, write_equality_delete_files, write_position_delete_files,
@@ -1737,6 +1739,124 @@ impl WriteHandler {
         Ok(total_rows)
     }
 
+    /// Streaming variant of [`handle_ingest`] for the Flight `DoPut` path.
+    ///
+    /// The batched [`handle_ingest`] `try_collect`s the entire uploaded Arrow
+    /// stream into a `Vec<RecordBatch>` on the coordinator before writing it.
+    /// That buffer is unbounded and invisible to the memory pool: a client can
+    /// upload an arbitrarily large stream and balloon the coordinator past its
+    /// cgroup limit. This variant feeds each decoded batch straight into
+    /// `write_data_files_streaming`, the same O(batch_size) sink CTAS and INSERT
+    /// already use, so resident memory stays at one batch plus one row group.
+    ///
+    /// The target schema comes from table metadata, so the stream is never
+    /// peeked. Per-batch field-id stamping and type casts are applied by the
+    /// streaming sink exactly as they are for INSERT (see `apply_stamped_schema`).
+    ///
+    /// `handle_ingest` (the batched signature) is retained for internal callers
+    /// and the name-parsing tests.
+    pub async fn handle_ingest_streaming<S, E>(
+        &self,
+        session: &Session,
+        table_name: &str,
+        batch_stream: S,
+    ) -> sqe_core::Result<usize>
+    where
+        S: futures::Stream<Item = std::result::Result<RecordBatch, E>> + Send + 'static,
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        // Parse "catalog.schema.table" or "schema.table" (mirrors handle_ingest).
+        let parts: Vec<&str> = table_name.split('.').collect();
+        let (target_catalog, namespace_str, name) = match parts.as_slice() {
+            [ns, tbl] => (None, *ns, (*tbl).to_string()),
+            [cat, ns, tbl] => (Some(*cat), *ns, (*tbl).to_string()),
+            _ => {
+                return Err(SqeError::Execution(format!(
+                    "Invalid table name for ingest: {table_name}"
+                )));
+            }
+        };
+
+        let namespace = iceberg::NamespaceIdent::new(namespace_str.to_string());
+        let table_ident = TableIdent::new(namespace, name);
+
+        info!(
+            username = %session.user.username,
+            table = %table_ident,
+            "Executing streaming DoPut ingest"
+        );
+
+        let catalog = self.create_catalog_bridge(session, target_catalog).await?;
+
+        let table = catalog
+            .load_table(&table_ident)
+            .await
+            .map_err(|e| SqeError::Catalog(format!("Failed to load table: {e}")))?;
+
+        // The streaming sink re-stamps every batch onto the table schema, so the
+        // adapter's declared schema is only the stream contract, not the write
+        // schema. Derive it from the table's current Iceberg schema.
+        let arrow_schema = Arc::new(
+            iceberg::arrow::schema_to_arrow_schema(table.metadata().current_schema()).map_err(
+                |e| SqeError::Execution(format!("Failed to derive ingest Arrow schema: {e}")),
+            )?,
+        );
+
+        let mapped = batch_stream
+            .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)));
+        let stream: datafusion::execution::SendableRecordBatchStream =
+            Box::pin(RecordBatchStreamAdapter::new(arrow_schema, Box::pin(mapped)));
+
+        let tracker = new_upload_tracker();
+        let cleanup_guard =
+            WriteCleanupGuard::new(table.file_io().clone(), tracker.clone(), "ingest")
+                .with_metrics(self.metrics.clone());
+        let (data_files, total_rows) = write_data_files_streaming_with_metrics(
+            &table,
+            stream,
+            "ingest",
+            self.metrics.as_ref(),
+            self.compression(session),
+            tracker,
+        )
+        .await?;
+
+        if !data_files.is_empty() {
+            let files_for_retry = data_files.clone();
+            let catalog_for_commit = catalog.clone();
+            commit_with_retry(
+                catalog.as_ref(),
+                &table_ident,
+                "ingest",
+                move |fresh_table| {
+                    let files = files_for_retry.clone();
+                    let cat = catalog_for_commit.clone();
+                    async move {
+                        let tx = Transaction::new(&fresh_table);
+                        let action = tx.fast_append().add_data_files(files);
+                        let tx = action.apply(tx)?;
+                        tx.commit(cat.as_ref()).await
+                    }
+                },
+            )
+            .await
+            .map_err(|e| {
+                SqeError::Execution(format!("Failed to commit ingest transaction: {e}"))
+            })?;
+            cleanup_guard.mark_committed();
+
+            info!(
+                table = %table_ident,
+                total_rows,
+                "Streaming DoPut ingest committed successfully"
+            );
+        } else {
+            cleanup_guard.mark_committed();
+        }
+
+        Ok(total_rows)
+    }
+
     /// Handle DELETE FROM ns.table [WHERE ...]
     ///
     /// Uses Copy-on-Write: reads all data files, filters out rows matching
@@ -1863,7 +1983,7 @@ impl WriteHandler {
 
             for data_file in &to_rewrite {
                 let file_path = data_file.file_path();
-                let batches = self.read_parquet_via_table(&table, file_path).await?;
+                let batches = self.read_parquet_via_table(&table, file_path, ctx, true).await?;
                 if batches.is_empty() {
                     continue;
                 }
@@ -2031,7 +2151,7 @@ impl WriteHandler {
 
         for data_file in &old_data_files {
             let file_path = data_file.file_path().to_string();
-            let batches = self.read_parquet_via_table(&table, &file_path).await?;
+            let batches = self.read_parquet_via_table(&table, &file_path, ctx, true).await?;
 
             if batches.is_empty() {
                 continue;
@@ -2204,7 +2324,7 @@ impl WriteHandler {
 
         for data_file in &old_data_files {
             let file_path = data_file.file_path().to_string();
-            let batches = self.read_parquet_via_table(&table, &file_path).await?;
+            let batches = self.read_parquet_via_table(&table, &file_path, ctx, true).await?;
             if batches.is_empty() {
                 continue;
             }
@@ -2452,7 +2572,7 @@ impl WriteHandler {
 
             for data_file in &to_rewrite {
                 let file_path = data_file.file_path();
-                let batches = self.read_parquet_via_table(&table, file_path).await?;
+                let batches = self.read_parquet_via_table(&table, file_path, ctx, true).await?;
                 if batches.is_empty() {
                     continue;
                 }
@@ -2697,7 +2817,7 @@ impl WriteHandler {
 
         for data_file in &old_data_files {
             let file_path = data_file.file_path().to_string();
-            let batches = self.read_parquet_via_table(&table, &file_path).await?;
+            let batches = self.read_parquet_via_table(&table, &file_path, ctx, true).await?;
             if batches.is_empty() {
                 continue;
             }
@@ -2903,16 +3023,33 @@ impl WriteHandler {
 
         let old_data_files = self.collect_data_files(&table).await?;
 
-        // Read all target batches into memory
-        let mut target_batches: Vec<RecordBatch> = Vec::new();
+        // Read all target batches into memory, tracked against the shared
+        // memory pool. A copy-on-write MERGE materializes the whole target
+        // table; without tracking, a target larger than the pool OOM-kills the
+        // coordinator. Pushing each batch through the reservation makes the
+        // read fail as one query part-way through the loop instead. See
+        // docs/internal/specs/2026-07-02-write-path-memory-safety-design.md.
+        let pool = ctx.runtime_env().memory_pool.clone();
+        let mut target_buf = TrackedBatchBuffer::gated(
+            &pool,
+            "merge-target-buffer",
+            self.config.query.write_buffer_tracking,
+        );
         for data_file in &old_data_files {
             let file_path = data_file.file_path();
-            let batches = self.read_parquet_via_table(&table, file_path).await?;
-            target_batches.extend(batches);
+            // track = false: the returned batches are re-registered into
+            // `merge-target-buffer` just below, so tracking the decode here too
+            // would double-count the same bytes.
+            let batches = self
+                .read_parquet_via_table(&table, file_path, ctx, false)
+                .await?;
+            for batch in batches {
+                target_buf.push(batch)?;
+            }
         }
 
         // Get the target schema from existing data (or table metadata if empty)
-        let target_schema = if let Some(first) = target_batches.first() {
+        let target_schema = if let Some(first) = target_buf.as_slice().first() {
             first.schema()
         } else {
             // Empty table — get the schema from the Iceberg table metadata
@@ -2948,10 +3085,17 @@ impl WriteHandler {
 
         // Register target data as a MemTable in the full session context
         // (which has all catalog tables registered for cross-table subqueries)
-        let target_mem = if target_batches.is_empty() {
+        let target_mem = if target_buf.is_empty() {
             datafusion::datasource::MemTable::try_new(target_schema.clone(), vec![])
         } else {
-            datafusion::datasource::MemTable::try_new(target_schema.clone(), vec![target_batches])
+            // The scratch MemTable holds Arc-backed clones of the tracked
+            // batches; `target_buf` keeps the single reservation and lives to
+            // the end of the merge, so tracking covers the whole operation
+            // without double-counting the shared array data.
+            datafusion::datasource::MemTable::try_new(
+                target_schema.clone(),
+                vec![target_buf.as_slice().to_vec()],
+            )
         }
         .map_err(|e| SqeError::Execution(format!("Failed to create target MemTable: {e}")))?;
         ctx.register_table(&qualified_target_ref, Arc::new(target_mem))
@@ -3134,64 +3278,45 @@ impl WriteHandler {
             .sql(&select_sql)
             .await
             .map_err(|e| SqeError::Execution(format!("Failed to plan MERGE query: {e}")))?;
-        let mut result_batches: Vec<RecordBatch> = df
-            .collect()
-            .await
-            .map_err(|e| SqeError::Execution(format!("Failed to execute MERGE query: {e}")))?;
 
-        // Deregistration of the scratch MemTables is handled by the
-        // `MergeScratchCleanup` drop guard declared above. Keeping the
-        // guard alive for the rest of the function lets early-returns
-        // and `?` short-circuits still clean up.
+        // Layer B (output side): stream the merged output straight into the
+        // streaming sink instead of `df.collect()`-ing the whole merged result
+        // into a Vec and buffering it through `write_data_files_with_metrics`.
+        // The merged output is at least as large as the target table, so this
+        // removes the single biggest MERGE buffer. The join/CASE state stays
+        // inside DataFusion operators, which are pool-tracked (and spillable
+        // under subsystem A) rather than an invisible Vec.
+        //
+        // The stream must be fully consumed by the awaited write below before
+        // the `target_buf` reservation and the `MergeScratchCleanup` guard
+        // (both declared above) drop: the MemTableExec feeding the join holds
+        // Arc refs into the tracked target batches for the duration of the read.
+        let stream = df.execute_stream().await.map_err(|e| {
+            SqeError::Execution(format!("Failed to execute MERGE query: {e}"))
+        })?;
 
-        // For WHEN MATCHED THEN DELETE: filter out the rows where all columns are NULL
-        // (these are the matched rows we set to NULL above)
-        if matched_delete {
-            let mut filtered_batches = Vec::new();
-            for batch in &result_batches {
-                if batch.num_rows() == 0 {
-                    continue;
-                }
-                // A row is a "deleted matched" row if all columns are NULL
-                // (we set them to NULL for matched rows in the CASE expression).
-                // Filter: keep rows where at least one column is NOT NULL.
-                let mut keep = vec![true; batch.num_rows()];
-                for (row, flag) in keep.iter_mut().enumerate() {
-                    // Check if ALL columns are null (this is a deleted matched row)
-                    let all_null = (0..batch.num_columns()).all(|c| batch.column(c).is_null(row));
-                    if all_null {
-                        *flag = false;
-                    }
-                }
-                let keep_arr = arrow::array::BooleanArray::from(keep);
-                let filtered = filter_record_batch(batch, &keep_arr).map_err(|e| {
-                    SqeError::Execution(format!("Failed to filter MERGE DELETE results: {e}"))
-                })?;
-                if filtered.num_rows() > 0 {
-                    filtered_batches.push(filtered);
-                }
-            }
-            result_batches = filtered_batches;
-        }
+        // For WHEN MATCHED THEN DELETE the merge SELECT emits all-NULL rows for
+        // the deleted matches; drop them per batch in-stream so the streamed
+        // row count matches the buffered baseline.
+        let stream = if matched_delete {
+            filter_merge_delete_rows(stream)
+        } else {
+            stream
+        };
 
-        // Write new data files from the merged results
-        let total_rows: usize = result_batches.iter().map(|b| b.num_rows()).sum();
+        // Write new data files from the merged results (streaming).
         let tracker = new_upload_tracker();
         let cleanup_guard =
             WriteCleanupGuard::new(table.file_io().clone(), tracker.clone(), "merge-cow");
-        let new_data_files = if total_rows > 0 {
-            write_data_files_with_metrics(
-                &table,
-                result_batches,
-                "merge",
-                self.metrics.as_ref(),
-                self.compression(session),
-                tracker,
-            )
-            .await?
-        } else {
-            vec![]
-        };
+        let (new_data_files, total_rows) = write_data_files_streaming_with_metrics(
+            &table,
+            stream,
+            "merge",
+            self.metrics.as_ref(),
+            self.compression(session),
+            tracker,
+        )
+        .await?;
 
         info!(
             table = %table_ident,
@@ -3422,15 +3547,27 @@ impl WriteHandler {
         // Collect target batches for the JOIN. Unlike CoW we do not need
         // to rewrite them; the RowDelta only touches matched rows.
         let old_data_files = self.collect_data_files(&table).await?;
-        let mut target_batches: Vec<RecordBatch> = Vec::new();
+        // Pool-track the accumulated target read (Layer A), mirroring the CoW
+        // MERGE path. track = false on the per-file read so the decode is not
+        // double-counted against this buffer.
+        let pool = ctx.runtime_env().memory_pool.clone();
+        let mut target_buf = TrackedBatchBuffer::gated(
+            &pool,
+            "merge-eq-target-buffer",
+            self.config.query.write_buffer_tracking,
+        );
         for data_file in &old_data_files {
             let file_path = data_file.file_path();
-            let batches = self.read_parquet_via_table(&table, file_path).await?;
-            target_batches.extend(batches);
+            let batches = self
+                .read_parquet_via_table(&table, file_path, ctx, false)
+                .await?;
+            for batch in batches {
+                target_buf.push(batch)?;
+            }
         }
 
         // Resolve schema from the existing data or the Iceberg metadata.
-        let target_schema = if let Some(first) = target_batches.first() {
+        let target_schema = if let Some(first) = target_buf.as_slice().first() {
             first.schema()
         } else {
             let iceberg_schema = table.metadata().current_schema();
@@ -3456,12 +3593,12 @@ impl WriteHandler {
         let _merge_scratch_guard =
             MergeScratchCleanup::new(ctx, vec![q_target.clone(), q_source.clone()]);
 
-        let target_mem = if target_batches.is_empty() {
+        let target_mem = if target_buf.is_empty() {
             datafusion::datasource::MemTable::try_new(target_schema.clone(), vec![])
         } else {
             datafusion::datasource::MemTable::try_new(
                 target_schema.clone(),
-                vec![target_batches.clone()],
+                vec![target_buf.as_slice().to_vec()],
             )
         }
         .map_err(|e| SqeError::Execution(format!("Failed to create target MemTable: {e}")))?;
@@ -3939,11 +4076,33 @@ impl WriteHandler {
     ///
     /// Uses iceberg-rust's scan infrastructure to read a single file via the
     /// table's already-configured FileIO (which handles S3 credentials, region, etc.).
+    /// Read one Iceberg data file into memory as `RecordBatch`es.
+    ///
+    /// When `track` is true the copy-on-write decode is registered against the
+    /// query memory pool (Layer A, write-path memory safety): the compressed
+    /// file bytes and the decoded Arrow batches are both reserved, so a wide
+    /// file decompressing to several GB of Arrow fails this one query with a
+    /// typed `ResourceExhausted` instead of OOM-killing the coordinator. The
+    /// peak residency is here, during decode, where both reservations are live;
+    /// they release when this function returns. Callers that then accumulate
+    /// the returned batches keep their own tracked buffer alive for that.
+    ///
+    /// `handle_merge` passes `track = false` because it pushes every returned
+    /// batch into its own `merge-target-buffer`, and double-registering the
+    /// same bytes would overstate the reservation.
     async fn read_parquet_via_table(
         &self,
         table: &IcebergTable,
         file_path: &str,
+        ctx: &DFSessionContext,
+        track: bool,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
+        let pool = if track && self.config.query.write_buffer_tracking {
+            Some(ctx.runtime_env().memory_pool.clone())
+        } else {
+            None
+        };
+
         let file_io = table.file_io();
         let input = file_io
             .new_input(file_path)
@@ -3953,6 +4112,16 @@ impl WriteHandler {
             .read()
             .await
             .map_err(|e| SqeError::Execution(format!("Failed to read file '{file_path}': {e}")))?;
+
+        // Reserve the compressed bytes for the lifetime of the decode below.
+        // Dropped when this function returns (on success or via `?`).
+        let _file_bytes_res = if let Some(p) = pool.as_ref() {
+            let mut r = WriteReservation::new(p, "cow-file-bytes");
+            r.try_grow(input_file.len())?;
+            Some(r)
+        } else {
+            None
+        };
 
         let reader = parquet::arrow::arrow_reader::ArrowReaderBuilder::try_new(input_file)
             .map_err(|e| {
@@ -3967,13 +4136,25 @@ impl WriteHandler {
             ))
         })?;
 
-        let batches: Vec<RecordBatch> =
+        let batches: Vec<RecordBatch> = if let Some(p) = pool.as_ref() {
+            // Reserve each decoded batch as it is produced so an oversized file
+            // is denied mid-decode rather than fully materialised first.
+            let mut buf = TrackedBatchBuffer::new(p, "cow-decode-buffer");
+            for item in reader {
+                let batch = item.map_err(|e| {
+                    SqeError::Execution(format!("Failed to read Parquet file '{file_path}': {e}"))
+                })?;
+                buf.push(batch)?;
+            }
+            buf.into_inner()
+        } else {
             reader
                 .into_iter()
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| {
                     SqeError::Execution(format!("Failed to read Parquet file '{file_path}': {e}"))
-                })?;
+                })?
+        };
 
         Ok(batches)
     }
@@ -4788,6 +4969,37 @@ impl Drop for InSubqueryCleanup {
             }
         }
     }
+}
+
+/// Filter all-NULL rows out of a MERGE copy-on-write output stream.
+///
+/// The `WHEN MATCHED THEN DELETE` clause is compiled into a CASE that emits an
+/// all-NULL row for every deleted match. The buffered path dropped those rows
+/// after `collect()`; the streaming path drops them per batch here so the
+/// streamed output (and its row count) matches the buffered baseline exactly.
+/// The declared schema is preserved so the downstream sink stamps identically.
+fn filter_merge_delete_rows(
+    stream: datafusion::execution::SendableRecordBatchStream,
+) -> datafusion::execution::SendableRecordBatchStream {
+    let schema = stream.schema();
+    let filtered = stream.map(|batch_result| {
+        let batch = batch_result?;
+        if batch.num_rows() == 0 {
+            return Ok(batch);
+        }
+        let mut keep = vec![true; batch.num_rows()];
+        for (row, flag) in keep.iter_mut().enumerate() {
+            // A row is a deleted match when every column is NULL.
+            let all_null = (0..batch.num_columns()).all(|c| batch.column(c).is_null(row));
+            if all_null {
+                *flag = false;
+            }
+        }
+        let keep_arr = arrow::array::BooleanArray::from(keep);
+        filter_record_batch(&batch, &keep_arr)
+            .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))
+    });
+    Box::pin(RecordBatchStreamAdapter::new(schema, filtered))
 }
 
 /// RAII guard that deregisters MERGE scratch MemTables on drop.

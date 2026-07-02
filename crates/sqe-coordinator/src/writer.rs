@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -27,6 +28,8 @@ use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::WriterProperties;
 use sqe_catalog::parquet_writer_config::{self, writer_props_for_table as shared_writer_props_for_table};
 use sqe_core::SqeError;
+
+use crate::write_memory::WriteReservation;
 use tracing::{error, info, instrument, warn};
 use uuid::Uuid;
 
@@ -1020,6 +1023,214 @@ fn apply_stamped_schema(
         .map_err(|e| SqeError::Execution(format!("Failed to apply stamped schema: {e}")))
 }
 
+/// A memory-bounded partitioned writer (write-path memory safety, Layer B).
+///
+/// Like the vendored [`FanoutWriter`](iceberg::writer::partitioning::fanout_writer)
+/// it keeps one open rolling writer per distinct partition value, but with two
+/// limits:
+///
+/// - `max_open`: cap on concurrently open partition writers.
+/// - `byte_budget`: total estimated buffered bytes across open writers.
+///
+/// When either limit would be exceeded, the least-recently-written open writer
+/// is closed and flushed first ("cutover"), its `DataFile`s collected. A
+/// partition that receives more rows after its writer was cut simply gets a
+/// fresh writer and another file. Passing `0` for a limit disables it.
+///
+/// Cutover is correct by construction: Iceberg permits any number of data files
+/// per partition. It trades bounded memory for small-file debt, repaired by the
+/// existing `system.rewrite_data_files` procedure. The response to a
+/// cutover-heavy write is a counter (`cutovers()`), not a failure.
+///
+/// The byte estimate accumulates [`RecordBatch::get_array_memory_size`] per
+/// partition since that partition's writer was (re)opened. Arrow size exceeds
+/// encoded parquet size, so it overstates, which is the safe direction for a
+/// budget. When a `fanout-buffer` [`WriteReservation`] is supplied the estimate
+/// is mirrored onto the shared pool (best-effort) so the governor sees the
+/// fanout memory; the hard bound remains `byte_budget`.
+///
+/// NOTE: not yet wired into the live write path. The two partitioned write
+/// sites still use the vendored unbounded `TaskWriter`. Swapping them behind
+/// the `fanout_max_open_writers` / `fanout_buffer_budget` config knobs is the
+/// stack-validation step (an Iceberg commit of cutover output needs Polaris).
+/// The file-level behaviour below (splitting, cutover, `DataFile` completeness)
+/// is covered by the local `fs_io` tests in this module.
+pub struct BoundedFanoutWriter<B: IcebergWriterBuilder> {
+    inner_builder: B,
+    splitter: iceberg::arrow::RecordBatchPartitionSplitter,
+    open: HashMap<Struct, B::R>,
+    est_bytes: HashMap<Struct, usize>,
+    /// Monotonic "last written" tick per open partition, for LRW eviction.
+    last_written: HashMap<Struct, u64>,
+    tick: u64,
+    output: Vec<DataFile>,
+    max_open: usize,
+    byte_budget: usize,
+    total_bytes: usize,
+    cutovers: u64,
+    reservation: Option<WriteReservation>,
+}
+
+impl<B: IcebergWriterBuilder> BoundedFanoutWriter<B> {
+    /// Create a bounded fanout writer. `max_open` / `byte_budget` of `0`
+    /// disable the respective limit. `reservation`, when supplied, is resized
+    /// to the running byte estimate for pool visibility (best-effort).
+    pub fn new(
+        inner_builder: B,
+        splitter: iceberg::arrow::RecordBatchPartitionSplitter,
+        max_open: usize,
+        byte_budget: usize,
+        reservation: Option<WriteReservation>,
+    ) -> Self {
+        Self {
+            inner_builder,
+            splitter,
+            open: HashMap::new(),
+            est_bytes: HashMap::new(),
+            last_written: HashMap::new(),
+            tick: 0,
+            output: Vec::new(),
+            max_open,
+            byte_budget,
+            total_bytes: 0,
+            cutovers: 0,
+            reservation,
+        }
+    }
+
+    /// Number of cutovers performed (extra files beyond one-per-partition).
+    pub fn cutovers(&self) -> u64 {
+        self.cutovers
+    }
+
+    /// Split `batch` per partition and route each sub-batch to its partition
+    /// writer, cutting over least-recently-written writers as needed to honour
+    /// `max_open` and `byte_budget`.
+    pub async fn write(&mut self, batch: RecordBatch) -> sqe_core::Result<()> {
+        if batch.num_rows() == 0 {
+            return Ok(());
+        }
+        let partitioned = self
+            .splitter
+            .split(&batch)
+            .map_err(|e| SqeError::Execution(format!("Partition split error: {e}")))?;
+
+        for (partition_key, part_batch, _row_ids) in partitioned {
+            if part_batch.num_rows() == 0 {
+                continue;
+            }
+            let key = partition_key.data().clone();
+            let bytes = part_batch.get_array_memory_size();
+
+            // Cap: opening a new partition when the map is full evicts the
+            // least-recently-written writer(s) first.
+            if self.max_open > 0 && !self.open.contains_key(&key) {
+                while self.open.len() >= self.max_open {
+                    if !self.cut_over_lrw(Some(&key)).await? {
+                        break;
+                    }
+                }
+            }
+
+            // Budget: evict other partitions until this write fits. Never evict
+            // the partition being written (it would only reopen). If it is the
+            // sole open partition, accept the overflow: one writer at full
+            // row-group size must always fit.
+            if self.byte_budget > 0 {
+                while self.total_bytes + bytes > self.byte_budget {
+                    if !self.cut_over_lrw(Some(&key)).await? {
+                        break;
+                    }
+                }
+            }
+
+            self.get_or_open(&partition_key)
+                .await?
+                .write(part_batch)
+                .await
+                .map_err(|e| SqeError::Execution(format!("Partitioned write error: {e}")))?;
+
+            self.total_bytes += bytes;
+            *self.est_bytes.entry(key.clone()).or_insert(0) += bytes;
+            self.tick += 1;
+            self.last_written.insert(key, self.tick);
+
+            // Pool visibility (best-effort): the hard bound is `byte_budget`.
+            if let Some(res) = self.reservation.as_mut() {
+                let _ = res.try_resize(self.total_bytes);
+            }
+        }
+        Ok(())
+    }
+
+    /// Close every open writer and return all `DataFile`s (from cutovers and
+    /// the final flush).
+    pub async fn close(mut self) -> sqe_core::Result<Vec<DataFile>> {
+        let keys: Vec<Struct> = self.open.keys().cloned().collect();
+        for key in keys {
+            if let Some(mut writer) = self.open.remove(&key) {
+                let files = writer.close().await.map_err(|e| {
+                    SqeError::Execution(format!("Close partition writer error: {e}"))
+                })?;
+                self.output.extend(files);
+            }
+        }
+        Ok(self.output)
+    }
+
+    /// Get the open writer for `partition_key`, building a fresh one if this
+    /// partition has no open writer (first write, or after a cutover).
+    async fn get_or_open(
+        &mut self,
+        partition_key: &PartitionKey,
+    ) -> sqe_core::Result<&mut B::R> {
+        let key = partition_key.data().clone();
+        if !self.open.contains_key(&key) {
+            let writer = self
+                .inner_builder
+                .build(Some(partition_key.clone()))
+                .await
+                .map_err(|e| {
+                    SqeError::Execution(format!("Failed to build partition writer: {e}"))
+                })?;
+            self.open.insert(key.clone(), writer);
+        }
+        self.open
+            .get_mut(&key)
+            .ok_or_else(|| SqeError::Execution("partition writer missing after build".into()))
+    }
+
+    /// Close and flush the least-recently-written open writer (never `protect`),
+    /// collecting its `DataFile`s. Returns `false` when there is nothing left to
+    /// evict (empty, or only `protect` remains).
+    async fn cut_over_lrw(&mut self, protect: Option<&Struct>) -> sqe_core::Result<bool> {
+        let victim = self
+            .open
+            .keys()
+            .filter(|k| protect != Some(*k))
+            .min_by_key(|k| self.last_written.get(*k).copied().unwrap_or(0))
+            .cloned();
+        let Some(key) = victim else {
+            return Ok(false);
+        };
+        if let Some(mut writer) = self.open.remove(&key) {
+            let files = writer
+                .close()
+                .await
+                .map_err(|e| SqeError::Execution(format!("Cutover close error: {e}")))?;
+            self.output.extend(files);
+        }
+        let freed = self.est_bytes.remove(&key).unwrap_or(0);
+        self.total_bytes = self.total_bytes.saturating_sub(freed);
+        self.last_written.remove(&key);
+        self.cutovers += 1;
+        if let Some(res) = self.reservation.as_mut() {
+            let _ = res.try_resize(self.total_bytes);
+        }
+        Ok(true)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     // Bloom filter unit tests live next to their implementation in
@@ -1103,5 +1314,202 @@ mod tests {
             rows += rb.unwrap().num_rows();
         }
         assert_eq!(rows, 3, "LZ4_RAW read-back lost rows");
+    }
+
+    // ---- BoundedFanoutWriter -------------------------------------------
+    //
+    // These exercise the file-level behaviour (splitting, cutover order, cap,
+    // budget, DataFile completeness) against a local fs FileIO + TempDir, the
+    // same rig the vendored fanout tests use. They validate everything short of
+    // the Iceberg commit, which needs a live catalog.
+
+    use iceberg::spec::{
+        Literal, NestedField, PartitionSpec, PrimitiveType, Schema as IceSchema, Transform,
+        Type as IceType,
+    };
+    use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+    use tempfile::TempDir;
+
+    fn fanout_schema() -> Arc<IceSchema> {
+        Arc::new(
+            IceSchema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "id", IceType::Primitive(PrimitiveType::Int)).into(),
+                    NestedField::required(2, "region", IceType::Primitive(PrimitiveType::String))
+                        .into(),
+                ])
+                .build()
+                .unwrap(),
+        )
+    }
+
+    fn fanout_splitter(
+        schema: &Arc<IceSchema>,
+    ) -> iceberg::arrow::RecordBatchPartitionSplitter {
+        let spec = Arc::new(
+            PartitionSpec::builder(schema.clone())
+                .with_spec_id(0)
+                .add_partition_field("region", "region", Transform::Identity)
+                .unwrap()
+                .build()
+                .unwrap(),
+        );
+        iceberg::arrow::RecordBatchPartitionSplitter::try_new_with_computed_values(
+            schema.clone(),
+            spec,
+        )
+        .unwrap()
+    }
+
+    fn fanout_builder(dir: &TempDir, schema: Arc<IceSchema>) -> impl IcebergWriterBuilder {
+        let file_io = iceberg::io::FileIOBuilder::new_fs_io().build().unwrap();
+        let loc = DefaultLocationGenerator::with_data_location(
+            dir.path().to_str().unwrap().to_string(),
+        );
+        let name = DefaultFileNameGenerator::new(
+            "test".to_string(),
+            None,
+            iceberg::spec::DataFileFormat::Parquet,
+        );
+        let pqb = ParquetWriterBuilder::new(WriterProperties::builder().build(), schema);
+        let rwb =
+            RollingFileWriterBuilder::new_with_default_file_size(pqb, file_io, loc, name);
+        DataFileWriterBuilder::new(rwb)
+    }
+
+    fn region_batch(ids: &[i32], regions: &[&str]) -> RecordBatch {
+        let id_field = arrow_schema::Field::new("id", DataType::Int32, false).with_metadata(
+            HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), "1".to_string())]),
+        );
+        let region_field = arrow_schema::Field::new("region", DataType::Utf8, false)
+            .with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "2".to_string(),
+            )]));
+        let schema = Arc::new(arrow_schema::Schema::new(vec![id_field, region_field]));
+        RecordBatch::try_new(schema, vec![
+            Arc::new(Int32Array::from(ids.to_vec())),
+            Arc::new(StringArray::from(regions.to_vec())),
+        ])
+        .unwrap()
+    }
+
+    fn region_struct(region: &str) -> Struct {
+        Struct::from_iter([Some(Literal::string(region))])
+    }
+
+    /// Group the returned data files into (file_count, total_rows) per partition.
+    fn by_partition(files: &[DataFile]) -> HashMap<Struct, (usize, u64)> {
+        let mut m: HashMap<Struct, (usize, u64)> = HashMap::new();
+        for f in files {
+            let e = m.entry(f.partition().clone()).or_insert((0, 0));
+            e.0 += 1;
+            e.1 += f.record_count();
+        }
+        m
+    }
+
+    #[tokio::test]
+    async fn bounded_fanout_unbounded_writes_one_file_per_partition() {
+        let dir = TempDir::new().unwrap();
+        let schema = fanout_schema();
+        let mut w = BoundedFanoutWriter::new(
+            fanout_builder(&dir, schema.clone()),
+            fanout_splitter(&schema),
+            0, // no cap
+            0, // no byte budget
+            None,
+        );
+        w.write(region_batch(&[1, 2, 3, 4], &["US", "US", "EU", "ASIA"]))
+            .await
+            .unwrap();
+        assert_eq!(w.cutovers(), 0, "no limits => no cutover");
+        let files = w.close().await.unwrap();
+        let per = by_partition(&files);
+        assert_eq!(per.len(), 3, "one entry per distinct partition");
+        assert_eq!(per[&region_struct("US")], (1, 2));
+        assert_eq!(per[&region_struct("EU")], (1, 1));
+        assert_eq!(per[&region_struct("ASIA")], (1, 1));
+    }
+
+    #[tokio::test]
+    async fn bounded_fanout_cap_one_reopens_partition_and_preserves_rows() {
+        let dir = TempDir::new().unwrap();
+        let schema = fanout_schema();
+        let mut w = BoundedFanoutWriter::new(
+            fanout_builder(&dir, schema.clone()),
+            fanout_splitter(&schema),
+            1, // only one open writer at a time
+            0,
+            None,
+        );
+        // Separate writes so the sequence is deterministic: US, EU, US.
+        w.write(region_batch(&[1], &["US"])).await.unwrap();
+        w.write(region_batch(&[2], &["EU"])).await.unwrap(); // evicts US
+        w.write(region_batch(&[3], &["US"])).await.unwrap(); // evicts EU, reopens US
+        assert_eq!(w.cutovers(), 2, "each new partition evicts the open one");
+        let files = w.close().await.unwrap();
+        let per = by_partition(&files);
+        assert_eq!(per[&region_struct("US")], (2, 2), "US reopened => 2 files");
+        assert_eq!(per[&region_struct("EU")], (1, 1));
+        let total: u64 = files.iter().map(|f| f.record_count()).sum();
+        assert_eq!(total, 3, "cutover preserves every row");
+    }
+
+    #[tokio::test]
+    async fn bounded_fanout_byte_budget_forces_cutover() {
+        let dir = TempDir::new().unwrap();
+        let schema = fanout_schema();
+        let mut w = BoundedFanoutWriter::new(
+            fanout_builder(&dir, schema.clone()),
+            fanout_splitter(&schema),
+            0,
+            1, // 1-byte budget: any second open partition trips it
+            None,
+        );
+        w.write(region_batch(&[1, 2, 3], &["US", "EU", "ASIA"]))
+            .await
+            .unwrap();
+        assert!(w.cutovers() >= 1, "tiny budget must cut over");
+        let files = w.close().await.unwrap();
+        let total: u64 = files.iter().map(|f| f.record_count()).sum();
+        assert_eq!(total, 3, "budget cutover preserves every row");
+        let per = by_partition(&files);
+        assert!(per.contains_key(&region_struct("US")));
+        assert!(per.contains_key(&region_struct("EU")));
+        assert!(per.contains_key(&region_struct("ASIA")));
+    }
+
+    #[tokio::test]
+    async fn bounded_fanout_evicts_least_recently_written_first() {
+        let dir = TempDir::new().unwrap();
+        let schema = fanout_schema();
+        let mut w = BoundedFanoutWriter::new(
+            fanout_builder(&dir, schema.clone()),
+            fanout_splitter(&schema),
+            2, // two open writers
+            0,
+            None,
+        );
+        // Sequence: US, EU, US, ASIA, EU.
+        //  - after US,EU: open {US,EU}
+        //  - US touched => EU is now least-recently-written
+        //  - ASIA (cap full) evicts EU (LRW), not US
+        //  - EU (cap full: US,ASIA) evicts US (now LRW)
+        // So EU is written to two files, US and ASIA to one each.
+        w.write(region_batch(&[1], &["US"])).await.unwrap();
+        w.write(region_batch(&[2], &["EU"])).await.unwrap();
+        w.write(region_batch(&[3], &["US"])).await.unwrap();
+        w.write(region_batch(&[4], &["ASIA"])).await.unwrap();
+        w.write(region_batch(&[5], &["EU"])).await.unwrap();
+        assert_eq!(w.cutovers(), 2);
+        let files = w.close().await.unwrap();
+        let per = by_partition(&files);
+        assert_eq!(per[&region_struct("US")], (1, 2), "US never evicted mid-run => 1 file, 2 rows");
+        assert_eq!(per[&region_struct("EU")], (2, 2), "EU evicted then reopened => 2 files");
+        assert_eq!(per[&region_struct("ASIA")], (1, 1));
+        let total: u64 = files.iter().map(|f| f.record_count()).sum();
+        assert_eq!(total, 5);
     }
 }
