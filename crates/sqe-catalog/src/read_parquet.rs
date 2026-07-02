@@ -625,4 +625,173 @@ mod tests {
         let result = build_s3_store(&args, &storage);
         assert!(result.is_ok(), "build_s3_store fallback failed: {:?}", result.err());
     }
+
+    // ── #363: stale listing-cache regression ─────────────────────────────────
+
+    /// Write a Parquet file at `path` with `num_rows` single-column rows. The
+    /// row count controls the file size, so a larger `num_rows` produces a
+    /// strictly larger file at the same location.
+    fn write_parquet_file(path: &std::path::Path, num_rows: usize) {
+        use arrow_array::{Int64Array, RecordBatch};
+        use arrow_schema::{DataType, Field, Schema};
+        use parquet::arrow::ArrowWriter;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        let values: Int64Array = (0..num_rows as i64).collect::<Vec<_>>().into();
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(values)]).unwrap();
+        let file = std::fs::File::create(path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+    }
+
+    async fn count_dir(ctx: &SessionContext, dir_url: &str, table: &str) -> DFResult<i64> {
+        let url = ListingTableUrl::parse(dir_url).unwrap();
+        let options = ListingOptions::new(Arc::new(ParquetFormat::default()))
+            .with_file_extension(".parquet");
+        let state = ctx.state();
+        let schema = options.infer_schema(&state, &url).await?;
+        let provider = ListingTable::try_new(
+            ListingTableConfig::new(url)
+                .with_listing_options(options)
+                .with_schema(schema),
+        )?;
+        // Re-register the table on every call so each read re-lists through the
+        // session's `list_files_cache` (the cache under test), mirroring how a
+        // fresh `read_parquet(...)` TVF call resolves the directory each query.
+        let _ = ctx.deregister_table(table);
+        ctx.register_table(table, Arc::new(provider)).unwrap();
+        let batches = ctx
+            .sql(&format!("SELECT count(*) AS n FROM {table}"))
+            .await?
+            .collect()
+            .await?;
+        use datafusion::arrow::array::AsArray;
+        use datafusion::arrow::datatypes::Int64Type;
+        Ok(batches[0]
+            .column(0)
+            .as_primitive::<Int64Type>()
+            .value(0))
+    }
+
+    /// #363: reading a directory, then reading it again after a file at the
+    /// same path grows, must reflect the new file — not a stale cached listing.
+    ///
+    /// DataFusion 54 enables `list_files_cache` (infinite TTL) and
+    /// `file_statistics_cache` by default. When an external writer (dbt loading
+    /// into the raw bucket) replaces `dir/part-0.parquet` with a larger file
+    /// after SQE has listed the directory once, the cached `ObjectMeta.size`
+    /// goes stale. The next directory read computes the Parquet footer offset
+    /// from the stale (smaller) size and fails with "Corrupt footer" — while a
+    /// single-file read of the same object, which does not use the listing
+    /// cache, succeeds. This test reproduces that divergence.
+    #[tokio::test]
+    async fn directory_read_reflects_grown_file_not_stale_listing() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("customer");
+        std::fs::create_dir_all(&sub).unwrap();
+        let file = sub.join("part-0.parquet");
+
+        // Small file first, then a much larger file at the same path.
+        write_parquet_file(&file, 4);
+        let dir_url = format!("file://{}/", sub.display());
+
+        // Build the session with the same cache config SQE's coordinator and
+        // embedded runtimes use (#363): the on-by-default, infinite-TTL
+        // list_files_cache is disabled so a directory relists per read.
+        use datafusion::execution::runtime_env::RuntimeEnvBuilder;
+        let runtime = RuntimeEnvBuilder::new()
+            .with_cache_manager(crate::lazy_object_store::external_store_cache_config())
+            .build_arc()
+            .unwrap();
+        let ctx = SessionContext::new_with_config_rt(Default::default(), runtime);
+        let first = count_dir(&ctx, &dir_url, "t").await.unwrap();
+        assert_eq!(first, 4, "baseline directory read");
+
+        // External writer replaces the file with a strictly larger one.
+        write_parquet_file(&file, 50_000);
+
+        let second = count_dir(&ctx, &dir_url, "t").await.unwrap();
+        assert_eq!(
+            second, 50_000,
+            "directory read after the file grew must see the new file, \
+             not a stale cached listing/footer size"
+        );
+    }
+
+    /// #363: the crash branch. Demonstrates that with DataFusion 54's default
+    /// caches, a directory read after the file grows fails with the exact
+    /// "Corrupt footer" error the issue reports.
+    ///
+    /// Same root cause as the test above (a stale `list_files_cache` entry),
+    /// but a different downstream symptom depending on metadata-cache state:
+    ///   * If the footer-metadata cache still holds a valid entry for the old
+    ///     (small) `ObjectMeta`, `count(*)` is answered from cached statistics
+    ///     and silently returns the STALE COUNT (the test above).
+    ///   * If it does not (metadata cache empty/limited — the demo case), the
+    ///     reader calls `fetch_metadata` with the stale, smaller size and reads
+    ///     the "footer" from the middle of the now-larger file, producing
+    ///     "Invalid Parquet file. Corrupt footer".
+    /// Both branches vanish once `list_files_cache` is disabled, so the fix
+    /// covers both; this test pins the crash symptom so a future "add a TTL
+    /// instead of disabling" change cannot silently reintroduce it.
+    #[tokio::test]
+    async fn stale_listing_causes_corrupt_footer_with_default_caches() {
+        use datafusion::execution::cache::cache_manager::CacheManagerConfig;
+        use datafusion::execution::runtime_env::RuntimeEnvBuilder;
+
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("customer");
+        std::fs::create_dir_all(&sub).unwrap();
+        let file = sub.join("part-0.parquet");
+        write_parquet_file(&file, 4);
+        let dir_url = format!("file://{}/", sub.display());
+
+        // DataFusion 54 defaults: list_files_cache ON (infinite TTL). Disable
+        // only the per-file metadata/statistics caches so `count(*)` must fetch
+        // the footer (rather than answer from cached stats), driving the read
+        // through the stale cached size — exactly the demo's code path.
+        let runtime = RuntimeEnvBuilder::new()
+            .with_cache_manager(
+                CacheManagerConfig::default()
+                    .with_metadata_cache_limit(0)
+                    .with_file_statistics_cache_limit(0),
+            )
+            .build_arc()
+            .unwrap();
+        let ctx = SessionContext::new_with_config_rt(Default::default(), runtime);
+
+        assert_eq!(count_dir(&ctx, &dir_url, "t").await.unwrap(), 4);
+        write_parquet_file(&file, 50_000);
+        let err = count_dir(&ctx, &dir_url, "t")
+            .await
+            .expect_err("stale list_files_cache size must corrupt the footer read");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Corrupt footer") || msg.to_lowercase().contains("footer"),
+            "expected a corrupt-footer error, got: {msg}"
+        );
+
+        // Same sequence with list_files_cache disabled (the #363 fix) succeeds.
+        // Reset the file to the small size first — the crash branch above grew
+        // it to 50k, and this section must start from the small file again.
+        write_parquet_file(&file, 4);
+        let fixed_runtime = RuntimeEnvBuilder::new()
+            .with_cache_manager(
+                crate::lazy_object_store::external_store_cache_config()
+                    .with_metadata_cache_limit(0)
+                    .with_file_statistics_cache_limit(0),
+            )
+            .build_arc()
+            .unwrap();
+        let fixed_ctx = SessionContext::new_with_config_rt(Default::default(), fixed_runtime);
+        assert_eq!(count_dir(&fixed_ctx, &dir_url, "t").await.unwrap(), 4);
+        write_parquet_file(&file, 50_000);
+        assert_eq!(
+            count_dir(&fixed_ctx, &dir_url, "t").await.unwrap(),
+            50_000,
+            "with list_files_cache disabled the grown file reads cleanly"
+        );
+    }
 }

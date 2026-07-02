@@ -33,11 +33,36 @@
 use std::sync::Arc;
 
 use datafusion::error::{DataFusionError, Result as DFResult};
+use datafusion::execution::cache::cache_manager::CacheManagerConfig;
 use datafusion::execution::object_store::ObjectStoreRegistry;
 use object_store::http::HttpBuilder;
 use object_store::ObjectStore;
 use sqe_core::config::{StorageConfig, TvfPolicy};
 use url::Url;
+
+/// DataFusion cache-manager config safe for reading **external, mutable**
+/// object stores.
+///
+/// The file-reader TVFs (`read_parquet` / `read_csv`) read raw buckets that
+/// external writers (a dbt run landing files, another engine) mutate while
+/// SQE is live. DataFusion 54 enables `list_files_cache` by default with an
+/// **infinite TTL** (`CacheManagerConfig::default`), so a directory listed
+/// once is frozen for the life of the process: a file that grows after that
+/// first LIST keeps its stale `ObjectMeta.size`, and the next directory read
+/// computes the Parquet footer offset from the smaller cached size and fails
+/// with `"Invalid Parquet file. Corrupt footer"` — while a single-file read
+/// of the same object, which never consults the listing cache, succeeds
+/// (issue #363).
+///
+/// Disabling only the listing cache forces a fresh LIST per scan. The
+/// per-file statistics and footer-metadata caches are kept: both validate a
+/// cached entry against the current `ObjectMeta` (size + last_modified), so a
+/// fresh LIST cascades into re-reading any file that actually changed, while
+/// Iceberg scans (which resolve files from immutable manifest snapshots, not
+/// directory listings) keep their footer-parse savings unchanged.
+pub fn external_store_cache_config() -> CacheManagerConfig {
+    CacheManagerConfig::default().with_list_files_cache_limit(0)
+}
 
 /// Wrap any inner [`ObjectStoreRegistry`] (typically
 /// [`DefaultObjectStoreRegistry`]) so that HTTP / HTTPS URLs without a
