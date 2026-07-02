@@ -3269,64 +3269,45 @@ impl WriteHandler {
             .sql(&select_sql)
             .await
             .map_err(|e| SqeError::Execution(format!("Failed to plan MERGE query: {e}")))?;
-        let mut result_batches: Vec<RecordBatch> = df
-            .collect()
-            .await
-            .map_err(|e| SqeError::Execution(format!("Failed to execute MERGE query: {e}")))?;
 
-        // Deregistration of the scratch MemTables is handled by the
-        // `MergeScratchCleanup` drop guard declared above. Keeping the
-        // guard alive for the rest of the function lets early-returns
-        // and `?` short-circuits still clean up.
+        // Layer B (output side): stream the merged output straight into the
+        // streaming sink instead of `df.collect()`-ing the whole merged result
+        // into a Vec and buffering it through `write_data_files_with_metrics`.
+        // The merged output is at least as large as the target table, so this
+        // removes the single biggest MERGE buffer. The join/CASE state stays
+        // inside DataFusion operators, which are pool-tracked (and spillable
+        // under subsystem A) rather than an invisible Vec.
+        //
+        // The stream must be fully consumed by the awaited write below before
+        // the `target_buf` reservation and the `MergeScratchCleanup` guard
+        // (both declared above) drop: the MemTableExec feeding the join holds
+        // Arc refs into the tracked target batches for the duration of the read.
+        let stream = df.execute_stream().await.map_err(|e| {
+            SqeError::Execution(format!("Failed to execute MERGE query: {e}"))
+        })?;
 
-        // For WHEN MATCHED THEN DELETE: filter out the rows where all columns are NULL
-        // (these are the matched rows we set to NULL above)
-        if matched_delete {
-            let mut filtered_batches = Vec::new();
-            for batch in &result_batches {
-                if batch.num_rows() == 0 {
-                    continue;
-                }
-                // A row is a "deleted matched" row if all columns are NULL
-                // (we set them to NULL for matched rows in the CASE expression).
-                // Filter: keep rows where at least one column is NOT NULL.
-                let mut keep = vec![true; batch.num_rows()];
-                for (row, flag) in keep.iter_mut().enumerate() {
-                    // Check if ALL columns are null (this is a deleted matched row)
-                    let all_null = (0..batch.num_columns()).all(|c| batch.column(c).is_null(row));
-                    if all_null {
-                        *flag = false;
-                    }
-                }
-                let keep_arr = arrow::array::BooleanArray::from(keep);
-                let filtered = filter_record_batch(batch, &keep_arr).map_err(|e| {
-                    SqeError::Execution(format!("Failed to filter MERGE DELETE results: {e}"))
-                })?;
-                if filtered.num_rows() > 0 {
-                    filtered_batches.push(filtered);
-                }
-            }
-            result_batches = filtered_batches;
-        }
+        // For WHEN MATCHED THEN DELETE the merge SELECT emits all-NULL rows for
+        // the deleted matches; drop them per batch in-stream so the streamed
+        // row count matches the buffered baseline.
+        let stream = if matched_delete {
+            filter_merge_delete_rows(stream)
+        } else {
+            stream
+        };
 
-        // Write new data files from the merged results
-        let total_rows: usize = result_batches.iter().map(|b| b.num_rows()).sum();
+        // Write new data files from the merged results (streaming).
         let tracker = new_upload_tracker();
         let cleanup_guard =
             WriteCleanupGuard::new(table.file_io().clone(), tracker.clone(), "merge-cow");
-        let new_data_files = if total_rows > 0 {
-            write_data_files_with_metrics(
-                &table,
-                result_batches,
-                "merge",
-                self.metrics.as_ref(),
-                self.compression(session),
-                tracker,
-            )
-            .await?
-        } else {
-            vec![]
-        };
+        let (new_data_files, total_rows) = write_data_files_streaming_with_metrics(
+            &table,
+            stream,
+            "merge",
+            self.metrics.as_ref(),
+            self.compression(session),
+            tracker,
+        )
+        .await?;
 
         info!(
             table = %table_ident,
@@ -4923,6 +4904,37 @@ impl Drop for InSubqueryCleanup {
             }
         }
     }
+}
+
+/// Filter all-NULL rows out of a MERGE copy-on-write output stream.
+///
+/// The `WHEN MATCHED THEN DELETE` clause is compiled into a CASE that emits an
+/// all-NULL row for every deleted match. The buffered path dropped those rows
+/// after `collect()`; the streaming path drops them per batch here so the
+/// streamed output (and its row count) matches the buffered baseline exactly.
+/// The declared schema is preserved so the downstream sink stamps identically.
+fn filter_merge_delete_rows(
+    stream: datafusion::execution::SendableRecordBatchStream,
+) -> datafusion::execution::SendableRecordBatchStream {
+    let schema = stream.schema();
+    let filtered = stream.map(|batch_result| {
+        let batch = batch_result?;
+        if batch.num_rows() == 0 {
+            return Ok(batch);
+        }
+        let mut keep = vec![true; batch.num_rows()];
+        for (row, flag) in keep.iter_mut().enumerate() {
+            // A row is a deleted match when every column is NULL.
+            let all_null = (0..batch.num_columns()).all(|c| batch.column(c).is_null(row));
+            if all_null {
+                *flag = false;
+            }
+        }
+        let keep_arr = arrow::array::BooleanArray::from(keep);
+        filter_record_batch(&batch, &keep_arr)
+            .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))
+    });
+    Box::pin(RecordBatchStreamAdapter::new(schema, filtered))
 }
 
 /// RAII guard that deregisters MERGE scratch MemTables on drop.
