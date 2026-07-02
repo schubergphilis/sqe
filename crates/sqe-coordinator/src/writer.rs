@@ -499,6 +499,7 @@ pub async fn write_data_files_streaming(
     file_prefix: &str,
     compression: Compression,
     tracker: UploadedPaths,
+    fanout: FanoutLimits,
 ) -> sqe_core::Result<(Vec<DataFile>, usize)> {
     let inner_loc = DefaultLocationGenerator::new(table.metadata().clone())
         .map_err(|e| SqeError::Execution(format!("Location generator error: {e}")))?;
@@ -577,11 +578,9 @@ pub async fn write_data_files_streaming(
             .await
             .map_err(|e| SqeError::Execution(format!("Close writer error: {e}")))?
     } else {
-        // Partitioned streaming: TaskWriter routes per-row to the right
-        // partition writer; the splitter computes partition values from
+        // Partitioned streaming. The splitter computes partition values from
         // source columns at runtime so the input stream does not need a
-        // pre-stamped `_partition` column. Fanout enabled so unsorted
-        // streams work.
+        // pre-stamped `_partition` column.
         use iceberg::arrow::RecordBatchPartitionSplitter;
         use iceberg::writer::task_writer::TaskWriter;
         let splitter = RecordBatchPartitionSplitter::try_new_with_computed_values(
@@ -593,44 +592,83 @@ pub async fn write_data_files_streaming(
                 "Failed to build partition splitter: {e}"
             ))
         })?;
-        let mut writer = TaskWriter::new_with_partition_splitter(
-            data_file_writer_builder,
-            true,
-            iceberg_schema.clone(),
-            partition_spec,
-            Some(splitter),
-        );
 
-        while let Some(batch_result) = stream.next().await {
-            let batch = batch_result
-                .map_err(|e| SqeError::Execution(format!("Stream error: {e}")))?;
-            if batch.num_rows() == 0 {
-                continue;
+        if fanout.is_bounded() {
+            // Memory-bounded path: SQE's BoundedFanoutWriter caps open writers
+            // and buffered bytes, cutting over least-recently-written writers.
+            // Only reached when an operator sets `fanout_max_open_writers` or
+            // `fanout_buffer_budget`; the default leaves both 0 and takes the
+            // unbounded TaskWriter path below (byte-for-byte unchanged).
+            let mut writer = BoundedFanoutWriter::new(
+                data_file_writer_builder,
+                splitter,
+                fanout.max_open,
+                fanout.byte_budget,
+                None,
+            );
+            while let Some(batch_result) = stream.next().await {
+                let batch = batch_result
+                    .map_err(|e| SqeError::Execution(format!("Stream error: {e}")))?;
+                if batch.num_rows() == 0 {
+                    continue;
+                }
+                let stamped = apply_stamped_schema(batch, &stamped_schema)?;
+                total_rows += stamped.num_rows();
+                writer.write(stamped).await?;
             }
-            let stamped = apply_stamped_schema(batch, &stamped_schema)?;
-            total_rows += stamped.num_rows();
-            writer.write(stamped).await.map_err(|e| {
-                SqeError::Execution(format!("Partitioned write error: {e}"))
-            })?;
-        }
+            let cutovers = writer.cutovers();
+            let data_files = writer.close().await?;
+            if cutovers > 0 {
+                info!(
+                    cutovers,
+                    file_count = data_files.len(),
+                    "Bounded fanout cut over open writers (small-file debt; \
+                     repair with system.rewrite_data_files)"
+                );
+            }
+            data_files
+        } else {
+            // Default unbounded path: TaskWriter with fanout enabled so
+            // unsorted streams work, one open writer per partition value.
+            let mut writer = TaskWriter::new_with_partition_splitter(
+                data_file_writer_builder,
+                true,
+                iceberg_schema.clone(),
+                partition_spec,
+                Some(splitter),
+            );
 
-        if total_rows == 0 {
-            // Propagate close errors even on the empty-write path: a failed
-            // close can signal a file build/flush problem we must not mask.
-            writer.close().await.map_err(|e| {
-                SqeError::Execution(format!(
-                    "Close partitioned writer error (empty write): {e}"
-                ))
-            })?;
-            return Ok((vec![], 0));
-        }
+            while let Some(batch_result) = stream.next().await {
+                let batch = batch_result
+                    .map_err(|e| SqeError::Execution(format!("Stream error: {e}")))?;
+                if batch.num_rows() == 0 {
+                    continue;
+                }
+                let stamped = apply_stamped_schema(batch, &stamped_schema)?;
+                total_rows += stamped.num_rows();
+                writer.write(stamped).await.map_err(|e| {
+                    SqeError::Execution(format!("Partitioned write error: {e}"))
+                })?;
+            }
 
-        writer
-            .close()
-            .await
-            .map_err(|e| SqeError::Execution(format!(
-                "Close partitioned writer error: {e}"
-            )))?
+            if total_rows == 0 {
+                // Propagate close errors even on the empty-write path: a failed
+                // close can signal a file build/flush problem we must not mask.
+                writer.close().await.map_err(|e| {
+                    SqeError::Execution(format!(
+                        "Close partitioned writer error (empty write): {e}"
+                    ))
+                })?;
+                return Ok((vec![], 0));
+            }
+
+            writer
+                .close()
+                .await
+                .map_err(|e| SqeError::Execution(format!(
+                    "Close partitioned writer error: {e}"
+                )))?
+        }
     };
 
     info!(
@@ -658,9 +696,11 @@ pub async fn write_data_files_streaming_with_metrics(
     metrics: Option<&Arc<sqe_metrics::MetricsRegistry>>,
     compression: Compression,
     tracker: UploadedPaths,
+    fanout: FanoutLimits,
 ) -> sqe_core::Result<(Vec<DataFile>, usize)> {
     let (data_files, total_rows) =
-        write_data_files_streaming(table, stream, file_prefix, compression, tracker).await?;
+        write_data_files_streaming(table, stream, file_prefix, compression, tracker, fanout)
+            .await?;
 
     if let Some(m) = metrics {
         let total_bytes: u64 = data_files.iter().map(|df| df.file_size_in_bytes()).sum();
@@ -1023,6 +1063,35 @@ fn apply_stamped_schema(
         .map_err(|e| SqeError::Execution(format!("Failed to apply stamped schema: {e}")))
 }
 
+/// Resolved fanout limits for a partitioned streaming write. Both `0` means
+/// unbounded (the default): the write takes the vendored `TaskWriter` path,
+/// byte-for-byte unchanged. A non-zero value in either field switches the write
+/// to [`BoundedFanoutWriter`]. A `0` in one field while the other is set means
+/// that particular limit is disabled (e.g. cap the open-writer count but impose
+/// no byte budget).
+#[derive(Debug, Clone, Copy)]
+pub struct FanoutLimits {
+    /// Max concurrently open partition writers (`0` = no cap).
+    pub max_open: usize,
+    /// Total buffered-byte budget across open writers (`0` = no budget).
+    pub byte_budget: usize,
+}
+
+impl FanoutLimits {
+    /// The default: no limits, unbounded `TaskWriter` path.
+    pub const fn unbounded() -> Self {
+        Self {
+            max_open: 0,
+            byte_budget: 0,
+        }
+    }
+
+    /// True when at least one limit is active (selects [`BoundedFanoutWriter`]).
+    pub fn is_bounded(&self) -> bool {
+        self.max_open > 0 || self.byte_budget > 0
+    }
+}
+
 /// A memory-bounded partitioned writer (write-path memory safety, Layer B).
 ///
 /// Like the vendored [`FanoutWriter`](iceberg::writer::partitioning::fanout_writer)
@@ -1049,12 +1118,13 @@ fn apply_stamped_schema(
 /// is mirrored onto the shared pool (best-effort) so the governor sees the
 /// fanout memory; the hard bound remains `byte_budget`.
 ///
-/// NOTE: not yet wired into the live write path. The two partitioned write
-/// sites still use the vendored unbounded `TaskWriter`. Swapping them behind
-/// the `fanout_max_open_writers` / `fanout_buffer_budget` config knobs is the
-/// stack-validation step (an Iceberg commit of cutover output needs Polaris).
-/// The file-level behaviour below (splitting, cutover, `DataFile` completeness)
-/// is covered by the local `fs_io` tests in this module.
+/// Wired into the streaming write path ([`write_data_files_streaming`]) behind
+/// the [`FanoutLimits`] gate: reached only when an operator sets
+/// `fanout_max_open_writers` or `fanout_buffer_budget` (the default leaves both
+/// 0 and takes the unbounded `TaskWriter` path unchanged). The file-level
+/// behaviour (splitting, cutover, `DataFile` completeness) is covered by the
+/// local `fs_io` tests in this module; the end-to-end Iceberg commit of cutover
+/// output still needs a live catalog to validate.
 pub struct BoundedFanoutWriter<B: IcebergWriterBuilder> {
     inner_builder: B,
     splitter: iceberg::arrow::RecordBatchPartitionSplitter,
@@ -1408,6 +1478,18 @@ mod tests {
             e.1 += f.record_count();
         }
         m
+    }
+
+    #[test]
+    fn fanout_limits_gating() {
+        assert!(!FanoutLimits::unbounded().is_bounded(), "default is unbounded");
+        assert!(!FanoutLimits { max_open: 0, byte_budget: 0 }.is_bounded());
+        assert!(FanoutLimits { max_open: 8, byte_budget: 0 }.is_bounded(), "cap only");
+        assert!(
+            FanoutLimits { max_open: 0, byte_budget: 1 << 20 }.is_bounded(),
+            "budget only"
+        );
+        assert!(FanoutLimits { max_open: 8, byte_budget: 1 << 20 }.is_bounded());
     }
 
     #[tokio::test]
