@@ -36,6 +36,7 @@ pub mod web_auth;
 pub mod web_ui;
 pub mod worker_registry;
 pub mod write_handler;
+pub mod write_memory;
 pub mod writer;
 
 pub use mode::Mode;
