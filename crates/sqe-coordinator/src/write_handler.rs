@@ -36,7 +36,7 @@ use crate::write_memory::{TrackedBatchBuffer, WriteReservation};
 use crate::writer::{
     new_upload_tracker, resolve_write_compression, write_data_files_streaming_with_metrics,
     write_data_files_with_metrics, write_equality_delete_files, write_position_delete_files,
-    WriteCleanupGuard,
+    FanoutLimits, WriteCleanupGuard,
 };
 
 /// Rewrap the source SELECT of an `INSERT INTO t (c1, c2, ...) SELECT ...` so
@@ -660,6 +660,33 @@ impl WriteHandler {
         )
     }
 
+    /// Resolve fanout limits for a partitioned streaming write from config.
+    ///
+    /// Both knobs default to 0 → [`FanoutLimits::unbounded`], the vendored
+    /// `TaskWriter` path (byte-for-byte unchanged). Setting
+    /// `fanout_max_open_writers` or `fanout_buffer_budget` opts into the bounded
+    /// writer. A malformed `fanout_buffer_budget` string logs a warning and
+    /// disables just the byte budget rather than failing the write.
+    fn fanout_limits(&self) -> FanoutLimits {
+        let max_open = self.config.query.fanout_max_open_writers;
+        let byte_budget =
+            match sqe_core::config::parse_memory_limit(&self.config.query.fanout_buffer_budget) {
+                Ok(b) => b,
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        value = %self.config.query.fanout_buffer_budget,
+                        "invalid fanout_buffer_budget; disabling fanout byte budget"
+                    );
+                    0
+                }
+            };
+        FanoutLimits {
+            max_open,
+            byte_budget,
+        }
+    }
+
     /// Best-effort capture of a self-referential write plan (DELETE / UPDATE
     /// against a single target). Plans `SELECT * FROM <target>`, wraps it in a
     /// synthetic INSERT to the same target, and stores the wrapper in
@@ -1122,6 +1149,7 @@ impl WriteHandler {
                 self.metrics.as_ref(),
                 self.compression(session),
                 tracker,
+                self.fanout_limits(),
             )
             .await?;
 
@@ -1276,6 +1304,7 @@ impl WriteHandler {
             self.metrics.as_ref(),
             self.compression(session),
             tracker,
+            self.fanout_limits(),
         )
         .await?;
 
@@ -1818,6 +1847,7 @@ impl WriteHandler {
             self.metrics.as_ref(),
             self.compression(session),
             tracker,
+            self.fanout_limits(),
         )
         .await?;
 
@@ -1980,6 +2010,7 @@ impl WriteHandler {
             let cleanup_guard =
                 WriteCleanupGuard::new(table.file_io().clone(), tracker.clone(), "delete-cow")
                     .with_metrics(self.metrics.clone());
+            let pool = ctx.runtime_env().memory_pool.clone();
 
             for data_file in &to_rewrite {
                 let file_path = data_file.file_path();
@@ -1987,20 +2018,28 @@ impl WriteHandler {
                 if batches.is_empty() {
                     continue;
                 }
-                let mut surviving_batches = Vec::new();
+                // Pool-track the surviving-rows accumulation (Layer A,
+                // cow-keep-buffer). Per-file and a subset of the file, but the
+                // decode reservation has already released by now, so this is
+                // its own tracked buffer, not a double-count.
+                let mut surviving = TrackedBatchBuffer::gated(
+                    &pool,
+                    "cow-keep-buffer",
+                    self.config.query.write_buffer_tracking,
+                );
                 for batch in &batches {
                     let filtered = self
                         .filter_batch_negate(ctx, batch, &where_sql, &joins_sql, &table_ident, &predicates)
                         .await?;
                     deleted_this_attempt += batch.num_rows() - filtered.num_rows();
                     if filtered.num_rows() > 0 {
-                        surviving_batches.push(filtered);
+                        surviving.push(filtered)?;
                     }
                 }
-                if !surviving_batches.is_empty() {
+                if !surviving.is_empty() {
                     let new_files = write_data_files_with_metrics(
                         &table,
-                        surviving_batches,
+                        surviving.into_inner(),
                         "delete",
                         self.metrics.as_ref(),
                         self.compression(session),
@@ -2569,6 +2608,7 @@ impl WriteHandler {
             let cleanup_guard =
                 WriteCleanupGuard::new(table.file_io().clone(), tracker.clone(), "update-cow")
                     .with_metrics(self.metrics.clone());
+            let pool = ctx.runtime_env().memory_pool.clone();
 
             for data_file in &to_rewrite {
                 let file_path = data_file.file_path();
@@ -2576,12 +2616,19 @@ impl WriteHandler {
                 if batches.is_empty() {
                     continue;
                 }
-                let mut rewritten_batches = Vec::new();
+                // Pool-track the per-file rewritten accumulation (Layer A,
+                // cow-keep-buffer). The decode reservation has released by now,
+                // so this is its own tracked buffer.
+                let mut rewritten = TrackedBatchBuffer::gated(
+                    &pool,
+                    "cow-keep-buffer",
+                    self.config.query.write_buffer_tracking,
+                );
                 for batch in &batches {
-                    let rewritten = self
+                    let out = self
                         .apply_update(ctx, batch, assignments, &where_sql, &joins_sql, &table_ident, &predicates)
                         .await?;
-                    rewritten_batches.push(rewritten);
+                    rewritten.push(out)?;
                 }
                 for batch in &batches {
                     let count = self
@@ -2591,7 +2638,7 @@ impl WriteHandler {
                 }
                 let new_files = write_data_files_with_metrics(
                     &table,
-                    rewritten_batches,
+                    rewritten.into_inner(),
                     "update",
                     self.metrics.as_ref(),
                     self.compression(session),
@@ -3315,6 +3362,7 @@ impl WriteHandler {
             self.metrics.as_ref(),
             self.compression(session),
             tracker,
+            self.fanout_limits(),
         )
         .await?;
 
