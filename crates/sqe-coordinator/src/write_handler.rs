@@ -32,7 +32,7 @@ use sqe_core::{Session, SqeConfig, SqeError};
 use tracing::instrument;
 
 use crate::catalog_ops::{catalog_qualifier, fold_unquoted_ident, parse_table_ref};
-use crate::write_memory::TrackedBatchBuffer;
+use crate::write_memory::{TrackedBatchBuffer, WriteReservation};
 use crate::writer::{
     new_upload_tracker, resolve_write_compression, write_data_files_streaming_with_metrics,
     write_data_files_with_metrics, write_equality_delete_files, write_position_delete_files,
@@ -1983,7 +1983,7 @@ impl WriteHandler {
 
             for data_file in &to_rewrite {
                 let file_path = data_file.file_path();
-                let batches = self.read_parquet_via_table(&table, file_path).await?;
+                let batches = self.read_parquet_via_table(&table, file_path, ctx, true).await?;
                 if batches.is_empty() {
                     continue;
                 }
@@ -2151,7 +2151,7 @@ impl WriteHandler {
 
         for data_file in &old_data_files {
             let file_path = data_file.file_path().to_string();
-            let batches = self.read_parquet_via_table(&table, &file_path).await?;
+            let batches = self.read_parquet_via_table(&table, &file_path, ctx, true).await?;
 
             if batches.is_empty() {
                 continue;
@@ -2324,7 +2324,7 @@ impl WriteHandler {
 
         for data_file in &old_data_files {
             let file_path = data_file.file_path().to_string();
-            let batches = self.read_parquet_via_table(&table, &file_path).await?;
+            let batches = self.read_parquet_via_table(&table, &file_path, ctx, true).await?;
             if batches.is_empty() {
                 continue;
             }
@@ -2572,7 +2572,7 @@ impl WriteHandler {
 
             for data_file in &to_rewrite {
                 let file_path = data_file.file_path();
-                let batches = self.read_parquet_via_table(&table, file_path).await?;
+                let batches = self.read_parquet_via_table(&table, file_path, ctx, true).await?;
                 if batches.is_empty() {
                     continue;
                 }
@@ -2817,7 +2817,7 @@ impl WriteHandler {
 
         for data_file in &old_data_files {
             let file_path = data_file.file_path().to_string();
-            let batches = self.read_parquet_via_table(&table, &file_path).await?;
+            let batches = self.read_parquet_via_table(&table, &file_path, ctx, true).await?;
             if batches.is_empty() {
                 continue;
             }
@@ -3033,7 +3033,12 @@ impl WriteHandler {
         let mut target_buf = TrackedBatchBuffer::new(&pool, "merge-target-buffer");
         for data_file in &old_data_files {
             let file_path = data_file.file_path();
-            let batches = self.read_parquet_via_table(&table, file_path).await?;
+            // track = false: the returned batches are re-registered into
+            // `merge-target-buffer` just below, so tracking the decode here too
+            // would double-count the same bytes.
+            let batches = self
+                .read_parquet_via_table(&table, file_path, ctx, false)
+                .await?;
             for batch in batches {
                 target_buf.push(batch)?;
             }
@@ -3538,15 +3543,23 @@ impl WriteHandler {
         // Collect target batches for the JOIN. Unlike CoW we do not need
         // to rewrite them; the RowDelta only touches matched rows.
         let old_data_files = self.collect_data_files(&table).await?;
-        let mut target_batches: Vec<RecordBatch> = Vec::new();
+        // Pool-track the accumulated target read (Layer A), mirroring the CoW
+        // MERGE path. track = false on the per-file read so the decode is not
+        // double-counted against this buffer.
+        let pool = ctx.runtime_env().memory_pool.clone();
+        let mut target_buf = TrackedBatchBuffer::new(&pool, "merge-eq-target-buffer");
         for data_file in &old_data_files {
             let file_path = data_file.file_path();
-            let batches = self.read_parquet_via_table(&table, file_path).await?;
-            target_batches.extend(batches);
+            let batches = self
+                .read_parquet_via_table(&table, file_path, ctx, false)
+                .await?;
+            for batch in batches {
+                target_buf.push(batch)?;
+            }
         }
 
         // Resolve schema from the existing data or the Iceberg metadata.
-        let target_schema = if let Some(first) = target_batches.first() {
+        let target_schema = if let Some(first) = target_buf.as_slice().first() {
             first.schema()
         } else {
             let iceberg_schema = table.metadata().current_schema();
@@ -3572,12 +3585,12 @@ impl WriteHandler {
         let _merge_scratch_guard =
             MergeScratchCleanup::new(ctx, vec![q_target.clone(), q_source.clone()]);
 
-        let target_mem = if target_batches.is_empty() {
+        let target_mem = if target_buf.is_empty() {
             datafusion::datasource::MemTable::try_new(target_schema.clone(), vec![])
         } else {
             datafusion::datasource::MemTable::try_new(
                 target_schema.clone(),
-                vec![target_batches.clone()],
+                vec![target_buf.as_slice().to_vec()],
             )
         }
         .map_err(|e| SqeError::Execution(format!("Failed to create target MemTable: {e}")))?;
@@ -4055,11 +4068,33 @@ impl WriteHandler {
     ///
     /// Uses iceberg-rust's scan infrastructure to read a single file via the
     /// table's already-configured FileIO (which handles S3 credentials, region, etc.).
+    /// Read one Iceberg data file into memory as `RecordBatch`es.
+    ///
+    /// When `track` is true the copy-on-write decode is registered against the
+    /// query memory pool (Layer A, write-path memory safety): the compressed
+    /// file bytes and the decoded Arrow batches are both reserved, so a wide
+    /// file decompressing to several GB of Arrow fails this one query with a
+    /// typed `ResourceExhausted` instead of OOM-killing the coordinator. The
+    /// peak residency is here, during decode, where both reservations are live;
+    /// they release when this function returns. Callers that then accumulate
+    /// the returned batches keep their own tracked buffer alive for that.
+    ///
+    /// `handle_merge` passes `track = false` because it pushes every returned
+    /// batch into its own `merge-target-buffer`, and double-registering the
+    /// same bytes would overstate the reservation.
     async fn read_parquet_via_table(
         &self,
         table: &IcebergTable,
         file_path: &str,
+        ctx: &DFSessionContext,
+        track: bool,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
+        let pool = if track {
+            Some(ctx.runtime_env().memory_pool.clone())
+        } else {
+            None
+        };
+
         let file_io = table.file_io();
         let input = file_io
             .new_input(file_path)
@@ -4069,6 +4104,16 @@ impl WriteHandler {
             .read()
             .await
             .map_err(|e| SqeError::Execution(format!("Failed to read file '{file_path}': {e}")))?;
+
+        // Reserve the compressed bytes for the lifetime of the decode below.
+        // Dropped when this function returns (on success or via `?`).
+        let _file_bytes_res = if let Some(p) = pool.as_ref() {
+            let mut r = WriteReservation::new(p, "cow-file-bytes");
+            r.try_grow(input_file.len())?;
+            Some(r)
+        } else {
+            None
+        };
 
         let reader = parquet::arrow::arrow_reader::ArrowReaderBuilder::try_new(input_file)
             .map_err(|e| {
@@ -4083,13 +4128,25 @@ impl WriteHandler {
             ))
         })?;
 
-        let batches: Vec<RecordBatch> =
+        let batches: Vec<RecordBatch> = if let Some(p) = pool.as_ref() {
+            // Reserve each decoded batch as it is produced so an oversized file
+            // is denied mid-decode rather than fully materialised first.
+            let mut buf = TrackedBatchBuffer::new(p, "cow-decode-buffer");
+            for item in reader {
+                let batch = item.map_err(|e| {
+                    SqeError::Execution(format!("Failed to read Parquet file '{file_path}': {e}"))
+                })?;
+                buf.push(batch)?;
+            }
+            buf.into_inner()
+        } else {
             reader
                 .into_iter()
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| {
                     SqeError::Execution(format!("Failed to read Parquet file '{file_path}': {e}"))
-                })?;
+                })?
+        };
 
         Ok(batches)
     }
