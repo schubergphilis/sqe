@@ -7,6 +7,7 @@ use arrow_schema::Schema as ArrowSchema;
 use datafusion::common::TableReference;
 use datafusion::datasource::{provider_as_source, MemTable};
 use datafusion::logical_expr::{dml::InsertOp, LogicalPlan, LogicalPlanBuilder};
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::prelude::SessionContext as DFSessionContext;
 use futures::{StreamExt, TryStreamExt};
 use iceberg::arrow::arrow_schema_to_schema_auto_assign_ids;
@@ -1731,6 +1732,124 @@ impl WriteHandler {
             cleanup_guard.mark_committed();
 
             info!(table = %table_ident, total_rows, "DoPut ingest committed successfully");
+        } else {
+            cleanup_guard.mark_committed();
+        }
+
+        Ok(total_rows)
+    }
+
+    /// Streaming variant of [`handle_ingest`] for the Flight `DoPut` path.
+    ///
+    /// The batched [`handle_ingest`] `try_collect`s the entire uploaded Arrow
+    /// stream into a `Vec<RecordBatch>` on the coordinator before writing it.
+    /// That buffer is unbounded and invisible to the memory pool: a client can
+    /// upload an arbitrarily large stream and balloon the coordinator past its
+    /// cgroup limit. This variant feeds each decoded batch straight into
+    /// `write_data_files_streaming`, the same O(batch_size) sink CTAS and INSERT
+    /// already use, so resident memory stays at one batch plus one row group.
+    ///
+    /// The target schema comes from table metadata, so the stream is never
+    /// peeked. Per-batch field-id stamping and type casts are applied by the
+    /// streaming sink exactly as they are for INSERT (see `apply_stamped_schema`).
+    ///
+    /// `handle_ingest` (the batched signature) is retained for internal callers
+    /// and the name-parsing tests.
+    pub async fn handle_ingest_streaming<S, E>(
+        &self,
+        session: &Session,
+        table_name: &str,
+        batch_stream: S,
+    ) -> sqe_core::Result<usize>
+    where
+        S: futures::Stream<Item = std::result::Result<RecordBatch, E>> + Send + 'static,
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        // Parse "catalog.schema.table" or "schema.table" (mirrors handle_ingest).
+        let parts: Vec<&str> = table_name.split('.').collect();
+        let (target_catalog, namespace_str, name) = match parts.as_slice() {
+            [ns, tbl] => (None, *ns, (*tbl).to_string()),
+            [cat, ns, tbl] => (Some(*cat), *ns, (*tbl).to_string()),
+            _ => {
+                return Err(SqeError::Execution(format!(
+                    "Invalid table name for ingest: {table_name}"
+                )));
+            }
+        };
+
+        let namespace = iceberg::NamespaceIdent::new(namespace_str.to_string());
+        let table_ident = TableIdent::new(namespace, name);
+
+        info!(
+            username = %session.user.username,
+            table = %table_ident,
+            "Executing streaming DoPut ingest"
+        );
+
+        let catalog = self.create_catalog_bridge(session, target_catalog).await?;
+
+        let table = catalog
+            .load_table(&table_ident)
+            .await
+            .map_err(|e| SqeError::Catalog(format!("Failed to load table: {e}")))?;
+
+        // The streaming sink re-stamps every batch onto the table schema, so the
+        // adapter's declared schema is only the stream contract, not the write
+        // schema. Derive it from the table's current Iceberg schema.
+        let arrow_schema = Arc::new(
+            iceberg::arrow::schema_to_arrow_schema(table.metadata().current_schema()).map_err(
+                |e| SqeError::Execution(format!("Failed to derive ingest Arrow schema: {e}")),
+            )?,
+        );
+
+        let mapped = batch_stream
+            .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)));
+        let stream: datafusion::execution::SendableRecordBatchStream =
+            Box::pin(RecordBatchStreamAdapter::new(arrow_schema, Box::pin(mapped)));
+
+        let tracker = new_upload_tracker();
+        let cleanup_guard =
+            WriteCleanupGuard::new(table.file_io().clone(), tracker.clone(), "ingest")
+                .with_metrics(self.metrics.clone());
+        let (data_files, total_rows) = write_data_files_streaming_with_metrics(
+            &table,
+            stream,
+            "ingest",
+            self.metrics.as_ref(),
+            self.compression(session),
+            tracker,
+        )
+        .await?;
+
+        if !data_files.is_empty() {
+            let files_for_retry = data_files.clone();
+            let catalog_for_commit = catalog.clone();
+            commit_with_retry(
+                catalog.as_ref(),
+                &table_ident,
+                "ingest",
+                move |fresh_table| {
+                    let files = files_for_retry.clone();
+                    let cat = catalog_for_commit.clone();
+                    async move {
+                        let tx = Transaction::new(&fresh_table);
+                        let action = tx.fast_append().add_data_files(files);
+                        let tx = action.apply(tx)?;
+                        tx.commit(cat.as_ref()).await
+                    }
+                },
+            )
+            .await
+            .map_err(|e| {
+                SqeError::Execution(format!("Failed to commit ingest transaction: {e}"))
+            })?;
+            cleanup_guard.mark_committed();
+
+            info!(
+                table = %table_ident,
+                total_rows,
+                "Streaming DoPut ingest committed successfully"
+            );
         } else {
             cleanup_guard.mark_committed();
         }

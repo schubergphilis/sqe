@@ -1887,21 +1887,19 @@ impl FlightSqlService for SqeFlightSqlService {
             "DoPut statement ingest"
         );
 
-        // Decode the Arrow stream into RecordBatches
+        // Decode the Arrow stream into RecordBatches. Feed the decoded stream
+        // straight into the streaming write sink instead of `try_collect`-ing
+        // the whole upload into a Vec: an arbitrarily large client upload no
+        // longer buffers unbounded on the coordinator (write-path memory safety).
         let stream = request.into_inner();
         let flight_stream = arrow_flight::decode::FlightRecordBatchStream::new_from_flight_data(
             stream.map_err(|e| arrow_flight::error::FlightError::Tonic(Box::new(e))),
         );
 
-        let batches: Vec<RecordBatch> = flight_stream
-            .try_collect()
-            .await
-            .map_err(|e| Status::internal(format!("Failed to decode Arrow stream: {e}")))?;
-
         let rows = self
             .query_handler
             .write_handler()
-            .handle_ingest(&session, &qualified, batches)
+            .handle_ingest_streaming(&session, &qualified, Box::pin(flight_stream))
             .await
             .map_err(|e| sqe_error_to_status(&e, None))?;
 
