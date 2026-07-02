@@ -600,6 +600,13 @@ fn classify_execution_error(msg: &str) -> SqeErrorCode {
         || lower.contains("add explicit type casts")
         || lower.contains("invalid comparison operation")
         || lower.contains("invalid argument error")
+        // iceberg-rust rejects a literal whose type does not match the column
+        // it is compared against (e.g. `WHERE varchar_col = 1`) with
+        // `DataInvalid => Can't convert datum from <a> type to <b> type`. That
+        // is a user predicate type error, not an engine failure, so it must be
+        // a TypeMismatch (USER_ERROR) rather than ExecutionFailed
+        // (INTERNAL_ERROR), which would tell a BI client SQE is broken.
+        || lower.contains("convert datum")
     {
         SqeErrorCode::TypeMismatch
     } else if lower.contains("table") && lower.contains("not found") {
@@ -652,6 +659,8 @@ fn clean_error_message(msg: &str) -> String {
         "External error: ",
         "Arrow error: ",
         "Invalid argument error: ",
+        // iceberg-rust error kind wrapper: "DataInvalid => <cause>".
+        "DataInvalid => ",
     ];
     let mut cleaned = msg;
     for prefix in &prefixes {
@@ -993,6 +1002,34 @@ mod tests {
                 .into(),
         );
         assert_eq!(err.error_code(), SqeErrorCode::TypeMismatch);
+    }
+
+    #[test]
+    fn error_code_iceberg_datum_conversion_is_type_mismatch() {
+        // iceberg-rust rejects a literal whose type does not match the column
+        // it is compared against (e.g. `WHERE varchar_col = 1`) with a
+        // `DataInvalid => Can't convert datum ...` error, surfaced through the
+        // scan/predicate path as `SqeError::Execution`. That is a user type
+        // error, not an engine failure: it must classify as TypeMismatch (a
+        // USER_ERROR over Trino), not fall through to ExecutionFailed
+        // (INTERNAL_ERROR), which mislabels a bad predicate as a server bug.
+        let err = SqeError::Execution(
+            "DataInvalid => Can't convert datum from long type to string type.".into(),
+        );
+        assert_eq!(err.error_code(), SqeErrorCode::TypeMismatch);
+        assert!(err.error_code().is_user_error());
+    }
+
+    #[test]
+    fn client_message_strips_iceberg_datainvalid_prefix() {
+        // The raw iceberg `DataInvalid => ` wrapper should not leak to clients;
+        // the readable cause survives.
+        let err = SqeError::Execution(
+            "DataInvalid => Can't convert datum from long type to string type.".into(),
+        );
+        let msg = err.client_message();
+        assert!(!msg.contains("DataInvalid =>"), "prefix leaked: {msg}");
+        assert!(msg.starts_with("Can't convert datum"), "unexpected: {msg}");
     }
 
     #[test]
