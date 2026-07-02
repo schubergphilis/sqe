@@ -20,9 +20,11 @@ Flow:
 1. Parse SQL, extract target table name and SELECT query
 2. Execute SELECT to get Arrow RecordBatches
 3. Convert Arrow schema to Iceberg schema
-4. Create table in Polaris catalog
-5. Write RecordBatches as Parquet files to S3
+4. Create table in the Iceberg catalog
+5. Stream RecordBatches to Parquet files at constant memory
 6. Commit data files to Iceberg via AppendAction
+
+Add `PARTITIONED BY (year(ts), bucket(16, id), ...)` to partition on write. The standard Iceberg transforms (`year`, `month`, `day`, `hour`, `bucket`, `truncate`, `identity`) are parsed and applied. Partitioned writes route through a bounded fanout writer that caps open per-partition writers and flushes the least-recently-written one when limits are hit.
 
 ### CREATE OR REPLACE TABLE
 
@@ -49,7 +51,7 @@ GROUP BY 1, 2;
 Flow:
 1. Parse SQL, extract target table and SELECT query
 2. Execute SELECT to get Arrow RecordBatches
-3. Write RecordBatches as Parquet files to S3
+3. Stream RecordBatches to Parquet files at constant memory
 4. Commit data files to Iceberg via AppendAction (new snapshot)
 
 ## Write Architecture
@@ -77,9 +79,11 @@ sequenceDiagram
     WH-->>QH: Success
 ```
 
-## Row-Level Operations (Copy-on-Write)
+## Row-Level Operations
 
-Row-level write operations are implemented via Copy-on-Write using the RisingWave iceberg-rust fork's `rewrite_files()` transaction API. Affected data files are read, filtered/transformed, and rewritten as new files in a single atomic Iceberg commit.
+DELETE, UPDATE, and MERGE each choose Copy-on-Write or Merge-on-Read per operation, read from a table property: `write.delete.mode`, `write.update.mode`, and `write.merge.mode`. Each defaults to copy-on-write.
+
+Copy-on-Write reads the affected data files, filters or transforms the rows, and rewrites them as new files in a single atomic commit through `RewriteFilesAction`. Merge-on-Read leaves the data files in place and writes delete files instead: position deletes for DELETE, equality deletes for UPDATE (when the table declares an identifier-field-id), and a `RowDeltaAction` for MERGE. Copy-on-Write keeps reads fast; Merge-on-Read keeps writes cheap.
 
 ### DELETE FROM
 
@@ -99,7 +103,9 @@ Flow:
 2. Read each affected file, apply the WHERE filter
 3. If all rows match: mark file for removal
 4. If partial match: rewrite file without matching rows
-5. Commit via `rewrite_files()` (remove old files, add rewritten files)
+5. Commit via `RewriteFilesAction` (remove old files, add rewritten files)
+
+Under `write.delete.mode=merge-on-read`, DELETE instead writes position-delete files and commits a `RowDeltaAction`, leaving the data files untouched.
 
 ### UPDATE
 
@@ -118,7 +124,9 @@ Flow:
 2. Read each affected file, apply the WHERE filter
 3. For matching rows: apply SET expressions
 4. Rewrite file with modified rows
-5. Commit via `rewrite_files()`
+5. Commit via `RewriteFilesAction`
+
+Under `write.update.mode=merge-on-read`, UPDATE writes a new data file plus an equality-delete file in one `RowDeltaAction`, provided the table declares an identifier-field-id.
 
 ### MERGE INTO
 
@@ -133,11 +141,17 @@ Flow:
 2. Classify each result row: matched (UPDATE/DELETE) or not matched (INSERT)
 3. Rewrite affected target data files with modifications applied
 4. Add new data files for INSERT rows
-5. Commit via `rewrite_files()` (remove old files, add new + rewritten files)
+5. Commit via `RewriteFilesAction` (remove old files, add new + rewritten files)
+
+Under `write.merge.mode=merge-on-read`, MERGE routes matched and unmatched rows through a `RowDeltaAction` (position/equality deletes plus new data files) instead of rewriting the target files.
 
 ### Iceberg Dependency
 
-Row-level writes depend on the [risingwavelabs/iceberg-rust](https://github.com/risingwavelabs/iceberg-rust) fork (branch `dev_rebase_main_20260303` at commit `c034b19105fa`, vendored at `vendor/iceberg-rust/`) which provides the `rewrite_files()` transaction support not yet available in upstream iceberg-rust. When upstream ships `OverwriteAction`, the dependency can be migrated back to the official crate.
+Row-level writes depend on the SQE-rebased fork of [risingwavelabs/iceberg-rust](https://github.com/risingwavelabs/iceberg-rust), vendored at `vendor/iceberg-rust/`. It provides `RewriteFilesAction` / `OverwriteFilesAction` for Copy-on-Write, `PositionDeleteFileWriter` and `EqualityDeleteFileWriter` with `RowDeltaAction` for Merge-on-Read, and `DeletionVectorWriter` for Iceberg V3, none of which are available upstream yet. SQE also carries its own vendor patches (feature-gated catalog backends, `Send + Sync` catalog builders, ADD COLUMN scan projection) and owns write-path components outside the vendor tree, such as the bounded fanout writer. See `vendor/iceberg-rust/README.md` for the patch inventory.
+
+## Maintenance
+
+Table maintenance runs through `CALL system.*` procedures: `rewrite_data_files` (bin-packs small files), `expire_snapshots`, `remove_orphan_files`, `rewrite_manifests`, plus `register_table` and `drop_table`. See [Iceberg Integration](iceberg.md#maintenance-procedures) for the full surface.
 
 ## dbt Compatibility
 
@@ -147,6 +161,6 @@ The write path is designed to support [dbt Core](https://www.getdbt.com/) via a 
 |---|---|---|
 | `table` | `CREATE OR REPLACE TABLE AS SELECT` | Supported |
 | `incremental` (append) | `INSERT INTO SELECT` | Supported |
-| `incremental` (merge) | `MERGE INTO` | Supported (CoW) |
+| `incremental` (merge) | `MERGE INTO` | Supported (CoW or MoR) |
 | `view` | `CREATE VIEW AS SELECT` | Supported |
 | `seed` | `INSERT INTO` (from CSV) | Supported |

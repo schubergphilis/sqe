@@ -16,7 +16,7 @@ How DuckDB, Arrow/DataFusion, SQE's `LogicalTypeId`, and Iceberg primitive types
 | `FLOAT` | `Float32` | `Float` | `float` | ✅ | |
 | `DOUBLE` | `Float64` | `Double` | `double` | ✅ | |
 | `DECIMAL(p, s)` | `Decimal128` | `Decimal` + `ExtraTypeInfo::Decimal { precision, scale }` | `decimal(p, s)` | ✅ | physical width tier-narrowed to i16/i32/i64/i128 per DuckDB; `Decimal256` not supported; negative scale rejected |
-| `VARCHAR` | `Utf8` / `LargeUtf8` / `Utf8View` | `Varchar` | `string` | ✅ | DataFusion 53 emits `Utf8View` by default |
+| `VARCHAR` | `Utf8` / `LargeUtf8` / `Utf8View` | `Varchar` | `string` | ✅ | DataFusion 54 emits `Utf8View` by default |
 | `BLOB` | `Binary` / `LargeBinary` / `BinaryView` | `Blob` | `binary` | ✅ | nulls round-trip |
 | `DATE` | `Date32` | `Date` | `date` | ✅ | both sides use days-since-1970-01-01 |
 | `DATE` from `Date64` | `Date64` | `Date` | `date` | ✅ | narrowed to `i32` days |

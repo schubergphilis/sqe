@@ -18,6 +18,7 @@ trino_http_port = 8080    # 0 to disable
 | `/v1/info` | GET | Node info (version, uptime, coordinator status) |
 | `/v1/info/state` | GET | Plain text: `ACTIVE` or `STARTING` |
 | `/v1/statement` | POST | Submit a SQL query |
+| `/v1/statement/queued/{id}/{token}` | GET | Poll a queued/running query until results are ready |
 | `/v1/statement/{id}/{token}` | GET | Fetch paginated results |
 | `/v1/statement/{id}` | DELETE | Cancel a running query |
 
@@ -72,6 +73,20 @@ Query results are paginated. The initial response includes a `nextUri` field. Fo
 ```
 
 When `nextUri` is absent, all results have been consumed.
+
+## Async Submission
+
+Submission is async, matching Trino's own protocol. `POST /v1/statement` spawns the query on a background task with a bounded initial wait. If the query does not finish in that window, the first response carries `state: QUEUED`, no `data`, and a `nextUri` pointing at `/v1/statement/queued/{id}/{token}`:
+
+```json
+{
+  "id": "query-uuid",
+  "stats": { "state": "QUEUED" },
+  "nextUri": "http://localhost:8080/v1/statement/queued/query-uuid/0"
+}
+```
+
+The client follows the queued links (state stays `QUEUED` or `RUNNING`) until the query finishes, at which point `nextUri` redirects to the results route at token 0 and the response starts carrying `columns` and `data`. Clients that only ever poll `nextUri` need no special handling: the queued and results routes chain transparently.
 
 ## Using with the CLI
 

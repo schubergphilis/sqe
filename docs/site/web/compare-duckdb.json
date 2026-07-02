@@ -87,11 +87,11 @@
     },
     {
       "title": "File-format table functions",
-      "body": "<code>read_parquet</code>, <code>read_csv</code> (full DuckDB-parity options), <code>read_json</code> / <code>read_json_auto</code>, <code>read_avro</code>, and <code>read_delta</code> with Delta Lake time-travel."
+      "body": "<code>read_parquet</code>, <code>read_csv</code> (full DuckDB-parity options), and <code>read_json</code> / <code>read_json_auto</code>."
     },
     {
       "title": "Query a file directly",
-      "body": "<code>SELECT * FROM 'file.parquet'</code> auto-detects parquet, csv, json, and avro on local, S3, HTTPS, and hf:// paths."
+      "body": "<code>SELECT * FROM 'file.parquet'</code> auto-detects parquet, csv, and json on local, S3, HTTPS, and hf:// paths."
     },
     {
       "title": "COPY … TO",
@@ -129,10 +129,6 @@
     },
     {
       "feature": "<code>PIVOT</code> / <code>UNPIVOT</code>",
-      "reason": "DataFusion parser does not support it"
-    },
-    {
-      "feature": "<code>QUALIFY</code>",
       "reason": "DataFusion parser does not support it"
     },
     {

@@ -5,7 +5,7 @@ SQE is built on the [iceberg-rust](https://github.com/apache/iceberg-rust) libra
 ## Iceberg version
 
 - **iceberg-rust**: SQE-rebased fork of [risingwavelabs/iceberg-rust](https://github.com/risingwavelabs/iceberg-rust) `dev_rebase_main_20260303` at commit `c034b19105fa`, vendored at `vendor/iceberg-rust/`. Provides `RewriteFilesAction` / `OverwriteFilesAction` (Copy-on-Write DELETE/UPDATE), `PositionDeleteFileWriter` (Merge-on-Read position deletes), and `DeletionVectorWriter` (Iceberg V3) on top of upstream v0.9.0.
-- **DataFusion**: 53.0
+- **DataFusion**: 54.0
 - **Arrow**: 58
 - **Parquet**: 58
 - **Iceberg table format**: V2 and V3. V3 features verified end-to-end (TIMESTAMP_NS, column defaults, equality-delete UPDATE on identifier-fields, partition evolution).
@@ -116,7 +116,7 @@ Read-side optimizations:
 - **Partition pruning**: Iceberg manifest stats skip whole partitions that cannot match the query predicate.
 - **Column projection**: only requested columns leave Parquet.
 - **Predicate pushdown**: filters land at the row group level, the page-index level, and the Parquet `RowFilter`.
-- **Runtime filter pushdown**: Phase P shipped a `DynamicPredicate` API that absorbs DataFusion 53 hash-join build-side runtime filters into the same pruning surface. SF10 TPC-H lineitem-heavy queries saw `q06 -51%`, `q07 -31%`, `q14 -33%`. Engineering log at [Runtime filter pushdown](../design-notes/runtime-filter-pushdown.md).
+- **Runtime filter pushdown**: Phase P shipped a `DynamicPredicate` API that absorbs DataFusion 54 hash-join build-side runtime filters into the same pruning surface. SF10 TPC-H lineitem-heavy queries saw `q06 -51%`, `q07 -31%`, `q14 -33%`. Engineering log at [Runtime filter pushdown](../design-notes/runtime-filter-pushdown.md).
 - **Bloom filter consultation**: `write.parquet.bloom-filter-columns` lands bloom offsets in the file footer; DataFusion consults them automatically for literal equality predicates at scan time.
 - **5-layer caching**: REST catalog cache, table metadata cache, manifest cache, SessionContext cache, OAuth token cache. Warm queries hit sub-millisecond planning.
 
@@ -136,10 +136,24 @@ Supported DML, both V2 and V3 verified:
 - **INSERT INTO**: streaming, with proper schema validation against the catalog.
 - **DELETE FROM**: Copy-on-Write via `RewriteFilesAction`, or Merge-on-Read via `PositionDeleteFileWriter` when `write.delete.mode=merge-on-read`.
 - **UPDATE**: CoW or MoR (equality deletes when the table declares an identifier-field-id).
-- **MERGE INTO**: full WHEN MATCHED / WHEN NOT MATCHED semantics, dispatching to CoW or MoR based on the table's `write.update.mode`.
+- **MERGE INTO**: full WHEN MATCHED / WHEN NOT MATCHED semantics, dispatching to CoW or MoR based on the table's `write.merge.mode` (default copy-on-write).
 - **ALTER TABLE**: `ADD/DROP/RENAME COLUMN`, `SET/DROP NOT NULL`, type promotion, `ADD/DROP/REPLACE PARTITION FIELD` (partition evolution), `CREATE/DROP BRANCH/TAG`, `SET WRITE BRANCH`.
 
+DELETE reads `write.delete.mode`, UPDATE reads `write.update.mode`, and MERGE reads `write.merge.mode`. Each defaults to copy-on-write. CTAS and INSERT stream RecordBatches straight to Parquet at constant memory. Partitioned writes route rows through a bounded fanout writer that caps the number of open per-partition writers and flushes the least-recently-written one when the cap or byte budget is hit.
+
 The writer respects `write.parquet.bloom-filter-columns` and `write.parquet.bloom-filter-fpp` for any column the schema knows about. The footer-inspection test in `crates/sqe-catalog/src/parquet_writer_config.rs` proves bloom offsets land in the resulting Parquet file.
+
+## Maintenance procedures
+
+SQE runs table maintenance through `CALL system.*` procedures, each committing through the vendored iceberg-rust transaction actions:
+
+- **`rewrite_data_files`**: bin-packs small files into larger ones, with `target_file_size_bytes`, `min_input_files`, and `max_concurrent_file_group_rewrites` options.
+- **`expire_snapshots`**: drops snapshots older than a cutoff, honouring `older_than` and `retain_last`.
+- **`remove_orphan_files`**: deletes data files no snapshot references.
+- **`rewrite_manifests`**: compacts manifest files.
+- **`register_table`** and **`drop_table`** (without purge): catalog-pointer operations for migration, disaster recovery, and the golden-dataset workflow.
+
+Snapshot-pointer procedures (`set_current_snapshot`, `rollback_to_snapshot`) and `drop_table(purge => true)` are not yet implemented and return an explicit error.
 
 ## V3 features verified
 
