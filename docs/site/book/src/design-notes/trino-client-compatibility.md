@@ -63,7 +63,7 @@ Drove the Trino client protocol (what the JDBC driver and the SQLAlchemy dialect
 | Typed timestamp | `date_trunc('month', CAST(now() AS timestamp))` | `timestamp(6)` with `rawType: "timestamp"` and precision in `arguments`; value normalized to 6 fractional digits |
 | Computed aggregate | `count(*)` | type `bigint`, value rendered as a JSON number |
 | Time-series chart | `date_trunc('quarter', ...) GROUP BY 1` | `timestamp(6)` + `bigint`, correct rows |
-| Pagination | `SELECT * ... LIMIT 2500` then follow `nextUri` | `nextUri` chain followed to `FINISHED` (demo table fit one page, so multi-page was not stressed) |
+| Pagination | 83,521-row result, follow `nextUri` | 84 pages of 1000 rows (521 on the last), exact row count, `RUNNING` -> `FINISHED`; the `max_result_rows` guard rejects oversized results cleanly |
 
 A type-mismatched predicate (for example `WHERE varchar_col = 1`) used to return `errorName: EXECUTION_FAILED`, `errorType: INTERNAL_ERROR`, and the raw `DataInvalid => Can't convert datum ...` string, which told a BI client the engine was broken rather than the query. That now classifies as `TYPE_MISMATCH` (`USER_ERROR`) with the `DataInvalid => ` wrapper stripped. Genuinely bad SQL already surfaced well (`Invalid function 'frobnicate'. Did you mean 'truncate'?`). The remaining error-detail work is the generic-message cases noted below.
 
