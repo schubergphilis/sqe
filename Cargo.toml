@@ -178,9 +178,9 @@ datasketches = "0.2"
 [profile.dev]
 # Line-tables only — enough for backtraces/panics, much less to generate.
 debug = 1
-# On macOS: skip dsymutil post-link step (no .dSYM bundle, separate dwarf files
-# instead). Saves ~20-30% of link time on every rebuild.
-split-debuginfo = "unpacked"
+# Avoid one loose .o file per codegen unit. `unpacked` accumulated ~385k
+# objects under target/debug/deps and made Defender-scanned builds degrade.
+split-debuginfo = "off"
 
 # Third-party dependencies (the `*` glob matches every non-workspace crate)
 # carry no debuginfo. We almost never step into the ~760 upstream crates with a
@@ -189,6 +189,16 @@ split-debuginfo = "unpacked"
 # so panics and backtraces in our own code stay fully attributed. Behaviour is
 # unchanged; only debug symbols inside dependency frames are dropped.
 [profile.dev.package."*"]
+debug = false
+
+# Cargo's test profile does not inherit the dev profile customizations. Keep
+# first-party line tables for useful failure backtraces, but avoid full DWARF
+# and loose split-debug objects for every test harness and dependency.
+[profile.test]
+debug = 1
+split-debuginfo = "off"
+
+[profile.test.package."*"]
 debug = false
 
 # ── Release profile: fast builds with good runtime performance ─

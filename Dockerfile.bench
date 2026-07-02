@@ -53,7 +53,7 @@ COPY vendor/ vendor/
 RUN --mount=type=cache,id=sqe-cargo-registry-${TARGETARCH},target=/usr/local/cargo/registry \
     --mount=type=cache,id=sqe-cargo-git-${TARGETARCH},target=/usr/local/cargo/git \
     --mount=type=cache,id=sqe-sccache-${TARGETARCH},target=/sccache \
-    cargo chef cook --release --recipe-path recipe.json && \
+    cargo chef cook --release --recipe-path recipe.json --package sqe-bench && \
     sccache --show-stats
 
 # ── Stage 4: Build sqe-bench only ────────────────────────────
@@ -66,7 +66,10 @@ COPY xtask/ xtask/
 RUN --mount=type=cache,id=sqe-cargo-registry-${TARGETARCH},target=/usr/local/cargo/registry \
     --mount=type=cache,id=sqe-cargo-git-${TARGETARCH},target=/usr/local/cargo/git \
     --mount=type=cache,id=sqe-sccache-${TARGETARCH},target=/sccache \
+    --mount=type=cache,id=sqe-target-release-bench-${TARGETARCH},target=/build/target,sharing=locked,from=deps,source=/build/target \
     cargo build --release --bin sqe-bench && \
+    mkdir -p /build/out && \
+    cp target/release/sqe-bench /build/out/ && \
     sccache --show-stats
 
 # ── Stage 5: Minimal runtime ─────────────────────────────────
@@ -80,7 +83,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     rm -rf /var/lib/apt/lists/* && \
     groupadd -r sqe && useradd -r -g sqe -u 1000 sqe
 
-COPY --from=builder /build/target/release/sqe-bench /usr/local/bin/
+COPY --from=builder /build/out/sqe-bench /usr/local/bin/
 
 USER sqe
 

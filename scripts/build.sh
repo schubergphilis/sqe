@@ -11,12 +11,12 @@ PROFILE="${1:-release}"
 case "$PROFILE" in
     release)
         echo "Building release binaries..."
-        cargo build --release --bin sqe-server --bin sqe-cli
+        cargo build --release --no-default-features --bin sqe-server --bin sqe-cli
         BIN_DIR="target/release"
         ;;
     debug)
         echo "Building debug binaries..."
-        cargo build --bin sqe-server --bin sqe-cli
+        cargo build --no-default-features --bin sqe-server --bin sqe-cli
         BIN_DIR="target/debug"
         ;;
     *)

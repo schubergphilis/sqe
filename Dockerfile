@@ -53,7 +53,9 @@ COPY vendor/ vendor/
 RUN --mount=type=cache,id=sqe-cargo-registry-${TARGETARCH},target=/usr/local/cargo/registry \
     --mount=type=cache,id=sqe-cargo-git-${TARGETARCH},target=/usr/local/cargo/git \
     --mount=type=cache,id=sqe-sccache-${TARGETARCH},target=/sccache \
-    cargo chef cook --release --recipe-path recipe.json && \
+    cargo chef cook --release --recipe-path recipe.json \
+      --no-default-features \
+      --package sqe-coordinator --package sqe-worker --package sqe-cli && \
     sccache --show-stats
 
 # ── Stage 4: Build application (only workspace crates recompile) ─
@@ -68,7 +70,11 @@ COPY xtask/ xtask/
 RUN --mount=type=cache,id=sqe-cargo-registry-${TARGETARCH},target=/usr/local/cargo/registry \
     --mount=type=cache,id=sqe-cargo-git-${TARGETARCH},target=/usr/local/cargo/git \
     --mount=type=cache,id=sqe-sccache-${TARGETARCH},target=/sccache \
-    cargo build --release --bin sqe-server --bin sqe-worker --bin sqe-cli && \
+    --mount=type=cache,id=sqe-target-release-${TARGETARCH},target=/build/target,sharing=locked,from=deps,source=/build/target \
+    cargo build --release --no-default-features \
+      --bin sqe-server --bin sqe-worker --bin sqe-cli && \
+    mkdir -p /build/out && \
+    cp target/release/sqe-server target/release/sqe-worker target/release/sqe-cli /build/out/ && \
     sccache --show-stats
 
 # ── Stage 5: Runtime image ────────────────────────────────────
@@ -90,9 +96,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     rm -rf /var/lib/apt/lists/* && \
     groupadd -r sqe && useradd -r -g sqe -u 1000 sqe
 
-COPY --from=builder /build/target/release/sqe-server /usr/local/bin/
-COPY --from=builder /build/target/release/sqe-worker /usr/local/bin/
-COPY --from=builder /build/target/release/sqe-cli /usr/local/bin/
+COPY --from=builder /build/out/ /usr/local/bin/
 
 USER sqe
 EXPOSE 50051 50052 8080 9090 9091

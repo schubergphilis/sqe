@@ -341,13 +341,32 @@ pub async fn create_session_context(
                     let rt = datafusion::execution::runtime_env::RuntimeEnvBuilder::new()
                         .with_memory_pool(pool)
                         .with_object_store_registry(registry)
+                        // #363: mirror the shared runtime — no infinite-TTL
+                        // list_files_cache, so directory reads of mutable
+                        // external buckets list fresh.
+                        .with_cache_manager(
+                            sqe_catalog::lazy_object_store::external_store_cache_config(),
+                        )
                         .build_arc()
                         .map_err(|e| {
                             Arc::new(SqeError::Config(format!("Failed to create runtime env: {e}")))
                         })?;
                     SessionContext::new_with_config_rt(session_config, rt)
                 } else {
-                    SessionContext::new_with_config(session_config)
+                    // Unlimited-memory fallback (max_query_memory = 0; test /
+                    // one-shot only). Build an explicit runtime so this path
+                    // also gets the #363 cache config — a bare
+                    // `new_with_config` would use DataFusion's default runtime
+                    // with the infinite-TTL list_files_cache re-enabled.
+                    let rt = datafusion::execution::runtime_env::RuntimeEnvBuilder::new()
+                        .with_cache_manager(
+                            sqe_catalog::lazy_object_store::external_store_cache_config(),
+                        )
+                        .build_arc()
+                        .map_err(|e| {
+                            Arc::new(SqeError::Config(format!("Failed to create runtime env: {e}")))
+                        })?;
+                    SessionContext::new_with_config_rt(session_config, rt)
                 }
             };
 
