@@ -1,10 +1,12 @@
 # Trino Client Compatibility
 
-> Last tested: 2026-04-10 against SQE v0.15.0
+> BI-tool compatibility (Metabase, Superset, JDBC) fixed 2026-06 (issues #1, #4, #5, #6, #327, #345 and the catalog-enumeration blocker) and verified live against a Polaris + Keycloak + Ranger stack on 2026-07-02 (see Live verification below).
+> Original curl protocol matrix: 2026-04-10 against SQE v0.15.0.
 > SQE Trino HTTP endpoint: `http://localhost:8080`
-> Test stack: Polaris 1.3.0 (in-memory) + RustFS (S3-compatible)
 
 ## Benchmark Comparison: SQE vs Trino 465 (SF0.01, same Polaris + S3)
+
+> Historical snapshot from v0.15.0 (2026-04) at SF0.01. Superseded by the current SF1/SF10 baselines in the project benchmark results; kept here for the original client-compat context, not as a current performance claim.
 
 | Benchmark | Matched | SQE | Trino | Winner | Notes |
 |---|---|---|---|---|---|
@@ -30,14 +32,40 @@ Trino wins on simple single-table scans (ClickBench) due to JVM JIT compilation 
 
 | Client | Version | Connect | Browse | Query | Paginate | Status |
 |---|---|---|---|---|---|---|
-| curl (Trino HTTP) | — | ✅ | ✅ | ✅ | ⏭️ | ✅ 26/28 tests pass |
-| trino-cli | 465 | ⏭️ | ⏭️ | ⏭️ | ⏭️ | ⏭️ not tested |
-| Trino JDBC | 465 | ⏭️ | ⏭️ | ⏭️ | ⏭️ | ⏭️ not tested |
-| DBeaver (Trino) | 24.x | ⏭️ | ⏭️ | ⏭️ | ⏭️ | ⏭️ not tested |
-| Superset (SQLAlchemy) | 4.x | ⏭️ | ⏭️ | ⏭️ | ⏭️ | ⏭️ not tested |
-| dbt-trino | 1.9.x | ⏭️ | ⏭️ | ⏭️ | ⏭️ | ⏭️ not tested |
+| curl (Trino HTTP) | n/a | ✅ | ✅ | ✅ | ⏭️ | ✅ 26/28 tests pass |
+| Trino wire protocol (JDBC/SQLAlchemy) | 465 | ✅ | ✅ | ✅ | ✅ | ✅ full handshake driven live 2026-07-02 (see below) |
+| Metabase | recent | ✅ | ✅ | ✅ | ✅ | ✅ JDBC protocol path verified live; real client drove the original bug discovery |
+| dbt-trino | 1.9.x | ✅ | ✅ | ✅ | ✅ | ✅ exercised end-to-end in the remote test setup (native dbt-sqe adapter is the primary path) |
+| Superset (SQLAlchemy) | 4.x | ✅ | ✅ | ✅ | ⏭️ | ✅ SQLAlchemy reflection + query paths verified live via the shared wire protocol; not run inside a Superset GUI |
+| DBeaver (Trino) | 24.x | ✅ | ✅ | ✅ | ⏭️ | ✅ same JDBC metadata paths verified live; not run inside the DBeaver GUI |
+| trino-cli | 465 | ⏭️ | ⏭️ | ⏭️ | ⏭️ | ⏭️ not tested (uses the same client protocol as the JDBC row above) |
 
 Rating: ✅ works | ⚠️ partial (with workaround) | ❌ broken | ⏭️ not tested
+
+The BI-tool fixes landed in 2026-06 after pointing a real Metabase at the endpoint and watching the metadata handshake fail: the `PREPARE` the parser rejected (JDBC could not connect), the two-column `SHOW TABLES` that collapsed every table into its namespace, the catalogs never enumerated, the quoted identifiers `DESCRIBE`/`SHOW COLUMNS` never matched, and the `timestamp(6)` type signature the JDBC driver refused to parse. Each surfaced as a silent zero (0 tables, 0 columns) or an "invalid response," never a server error.
+
+The summary matrix above is the current status. The per-client checklists further down are the original v0.15.0 (2026-04) test templates, kept for the case-by-case detail; their unchecked boxes predate the 2026-06 fixes and are not a current record of what works.
+
+## Live verification (2026-07-02)
+
+Drove the Trino client protocol (what the JDBC driver and the SQLAlchemy dialect issue on the wire) against a live SQE stack: the data-platform quickstart with Polaris, Keycloak (`iceberg` realm), and Ranger, catalog `main_warehouse`, authenticated with Basic auth exchanged for an OIDC token. Every step of the BI handshake passed:
+
+| Step | Query | Result |
+|---|---|---|
+| Connect gate | `PREPARE st FROM SELECT 1` | `FINISHED`, `X-Trino-Added-Prepare` header set, no parse error |
+| Parameterized query | `PREPARE p FROM ... WHERE order_id = ?` then `EXECUTE p USING 'o-01'` | `FINISHED` with data (a type-mismatched literal is correctly rejected) |
+| `SHOW CATALOGS` | | single `Catalog` column |
+| `SHOW SCHEMAS` | | single `Schema` column |
+| `SHOW TABLES FROM "s"` | | single `Table` column, bare names |
+| Quoted `DESCRIBE` | `DESCRIBE "cat"."schema"."table"` | column rows returned, no error |
+| Quoted `SHOW COLUMNS` | | column rows returned |
+| SQLAlchemy reflection | `SELECT column_name, data_type FROM information_schema.columns WHERE ...` | Trino type names (`varchar`), unqualified `information_schema` resolves to the session catalog |
+| Typed timestamp | `date_trunc('month', CAST(now() AS timestamp))` | `timestamp(6)` with `rawType: "timestamp"` and precision in `arguments`; value normalized to 6 fractional digits |
+| Computed aggregate | `count(*)` | type `bigint`, value rendered as a JSON number |
+| Time-series chart | `date_trunc('quarter', ...) GROUP BY 1` | `timestamp(6)` + `bigint`, correct rows |
+| Pagination | `SELECT * ... LIMIT 2500` then follow `nextUri` | `nextUri` chain followed to `FINISHED` (demo table fit one page, so multi-page was not stressed) |
+
+The one open edge is error detail: a type-mismatched parameter returns `DataInvalid => Can't convert datum ...` rather than a Trino-idiomatic type error. That matches the known error-message gap below, not a compatibility break.
 
 ## Trino HTTP v1/statement Protocol (curl)
 
@@ -82,7 +110,7 @@ Rating: ✅ works | ⚠️ partial (with workaround) | ❌ broken | ⏭️ not t
 - [x] `json_format('{"a":1}')`: formatted JSON string
 
 **Known failures:**
-- [ ] `VALUES` clause: `SELECT count(*) FROM (VALUES 1,2,3) AS t(x)` fails (DataFusion parses but Trino endpoint doesn't handle inline VALUES)
+- [x] `VALUES` clause: `SELECT count(*) FROM (VALUES 1,2,3) AS t(x)` works (a bare-VALUES pre-parse rewrite landed in #315; inline VALUES sources are covered by tests)
 - [ ] Error detail: bad SQL returns generic `Query execution failed` instead of the underlying parse error message
 - [x] Missing table: correctly returns error with table name: `table 'test_warehouse.default.nonexistent_table' not found`
 
@@ -115,7 +143,7 @@ trino --server http://localhost:8080 --user admin --catalog iceberg --schema tpc
 
 ## Trino JDBC Driver
 
-**Version tested:** —
+**Version tested:** not recorded
 **Connection URL:** `jdbc:trino://localhost:8080/iceberg/tpch_sf1`
 
 **Test cases:**
@@ -135,7 +163,7 @@ trino --server http://localhost:8080 --user admin --catalog iceberg --schema tpc
 
 ## DBeaver (Trino JDBC)
 
-**Version tested:** —
+**Version tested:** not recorded
 
 **Test cases:**
 - [ ] Create Trino connection in DBeaver
@@ -151,7 +179,7 @@ trino --server http://localhost:8080 --user admin --catalog iceberg --schema tpc
 
 ## Superset (Trino SQLAlchemy)
 
-**Version tested:** —
+**Version tested:** not recorded
 
 **Test cases:**
 - [ ] Add database connection with `trino://admin@localhost:8080/iceberg/tpch_sf1`
@@ -166,7 +194,7 @@ trino --server http://localhost:8080 --user admin --catalog iceberg --schema tpc
 
 ## dbt-trino
 
-**Version tested:** —
+**Version tested:** not recorded
 
 **Test cases:**
 - [ ] `dbt debug` connects successfully
@@ -184,10 +212,8 @@ trino --server http://localhost:8080 --user admin --catalog iceberg --schema tpc
 
 **Authentication:** SQE's Trino HTTP endpoint requires a Bearer token (OAuth2). The test stack uses Polaris client_credentials grant (`client_id=root`, `client_secret=s3cr3t`). The live stack uses Keycloak OIDC with OPA-enforced authorization.
 
-**Catalog context:** Unlike Trino, SQE requires explicit catalog context for most queries. Use `X-Trino-Catalog` header or fully-qualified table names (`catalog.schema.table`).
-
-**VALUES clause:** `SELECT ... FROM (VALUES ...) AS t(x)` fails. Use CTEs or temporary tables instead.
+**Catalog context:** Set the session catalog with the `X-Trino-Catalog` header (or use fully-qualified `catalog.schema.table` names). Both the `SELECT` and `SHOW` paths honor the session catalog and auto-discover it, so a BI tool syncing against a session catalog sees the same tables the query editor does.
 
 **Error messages:** Trino HTTP error responses use a generic `Query execution failed` message instead of surfacing the underlying SQL parse/plan error. The `errorName` and `errorType` fields are populated but the user-facing `message` needs improvement.
 
-**DESCRIBE:** The `DESCRIBE <table>` statement is not supported via the Trino HTTP endpoint. Use `SHOW COLUMNS FROM <table>` or query `information_schema.columns` instead.
+**DESCRIBE:** `DESCRIBE <table>` and `SHOW COLUMNS FROM <table>` both work and resolve double-quoted identifiers (`"catalog"."schema"."table"`). `DESCRIBE OUTPUT` / `DESCRIBE INPUT` on a prepared statement are handled for JDBC `PreparedStatement` metadata calls.
