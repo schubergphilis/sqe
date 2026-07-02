@@ -102,5 +102,5 @@ above are the regression guard.
 - Authentication needs Basic auth (`-u user:password`) to populate the session,
   not just the `X-Trino-User` header. For the local root client the password is
   empty (`-u root:`).
-- The Trino layer is optional; enable it with `[trino_compat] enabled = true`.
-  Flight SQL is the recommended protocol for SQE-native clients.
+- The Trino HTTP endpoint is enabled by default on `[coordinator] trino_http_port = 8080`;
+  set the port to `0` to disable it. Flight SQL is the recommended protocol for SQE-native clients.

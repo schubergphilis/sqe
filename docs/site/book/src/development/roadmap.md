@@ -56,6 +56,7 @@ SQL write operations and catalog DDL.
 - `CREATE SCHEMA` / `DROP SCHEMA`
 - `DROP TABLE` / `DROP TABLE IF EXISTS`
 - Parquet writer (to S3 via Iceberg)
+- Write-path memory safety: pool-tracked write buffers (oversized writes fail with a typed `ResourceExhausted` instead of OOM), streaming ingest/CTAS/INSERT, and an opt-in bounded fanout writer (see [Write Path, Memory Safety](../features/write-path.md#memory-safety))
 - Audit logging (JSONL, OCSF): canonical `AuditEvent`, OCSF class mapping, tamper-evident hash chain, GDPR-tag masking, identity enrichment
 - OpenTelemetry export (OTLP/gRPC)
 - Trino-compatible HTTP endpoint
@@ -341,9 +342,9 @@ graph LR
 
 ## Phase 8 - Trino Decommission (Future)
 
-Complete migration from Trino DCAF fork.
+Complete migration from Trino DCAF fork. The BI-tool slice has largely landed: Metabase and the Trino JDBC driver connect, sync schemas, and run typed queries against the Trino HTTP endpoint, and Superset rides the same path (see [Trino Compatibility](../features/trino-compatibility.md)). What remains is the wind-down of the fork itself.
 
-- Full Trino wire protocol compatibility for remaining tools
+- Full Trino wire protocol compatibility for remaining tools (BI tools done; DBeaver/dbt-trino exercised)
 - Dashboard migration playbook (Superset, Grafana, etc.)
 - JDBC driver migration guide (Trino JDBC to Flight SQL JDBC)
 - Performance parity validation (benchmark comparison)
