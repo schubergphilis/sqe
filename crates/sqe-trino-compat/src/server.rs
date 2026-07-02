@@ -173,7 +173,8 @@ pub enum QueryStatus {
     /// under the same `query_id`.
     Finished,
     /// Execution failed; carries the mapped Trino error to replay on poll.
-    Failed(protocol::TrinoError),
+    /// Boxed to keep the enum small (the error struct is ~200 bytes).
+    Failed(Box<protocol::TrinoError>),
     /// Cancelled via DELETE or evicted while still running.
     Cancelled,
 }
@@ -1290,10 +1291,10 @@ async fn submit_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
             fn drop(&mut self) {
                 let mut s = self.0.status.lock().unwrap();
                 if !s.is_terminal() {
-                    *s = QueryStatus::Failed(protocol::TrinoError::user_error(
+                    *s = QueryStatus::Failed(Box::new(protocol::TrinoError::user_error(
                         "query task terminated unexpectedly",
                         None,
-                    ));
+                    )));
                     self.0.notify.notify_waiters();
                 }
             }
@@ -1331,7 +1332,7 @@ async fn submit_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
                 );
                 let trino_error =
                     protocol::TrinoError::from_sqe_error(&sqe_err, Some(&task_query_id));
-                *task_handle.status.lock().unwrap() = QueryStatus::Failed(trino_error);
+                *task_handle.status.lock().unwrap() = QueryStatus::Failed(Box::new(trino_error));
             }
         }
         task_handle.notify.notify_waiters();
@@ -1366,7 +1367,7 @@ async fn submit_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
                 id: query_id.clone(),
                 info_uri: Some(info_uri(&base_url, &query_id)),
                 stats: TrinoStats::failed(),
-                error: Some(trino_error.clone()),
+                error: Some(trino_error.as_ref().clone()),
                 ..Default::default()
             };
             let mut resp = (StatusCode::OK, Json(response)).into_response();
@@ -1555,18 +1556,28 @@ async fn get_queued_results<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
 
     let status = handle.status.lock().unwrap();
     match &*status {
-        QueryStatus::Finished => (
-            StatusCode::OK,
-            Json(build_finished_redirect_response(&base_url, &id)),
-        )
-            .into_response(),
+        QueryStatus::Finished => {
+            let mut resp = (
+                StatusCode::OK,
+                Json(build_finished_redirect_response(&base_url, &id)),
+            )
+                .into_response();
+            // Echo any session-state mutation (USE / SET CATALOG) on the
+            // redirect hop. Normally applied inline on the POST because such
+            // statements finish in <1s; this covers the rare case where the
+            // task finishes only after the POST's bounded wait elapsed.
+            if let Some(ref update) = handle.session_update {
+                apply_session_headers(resp.headers_mut(), update);
+            }
+            resp
+        }
         QueryStatus::Failed(trino_error) => {
             let is_rate_limited = trino_error.error_name == "RESOURCE_EXHAUSTED";
             let response = TrinoResponse {
                 id: id.clone(),
                 info_uri: Some(info_uri(&base_url, &id)),
                 stats: TrinoStats::failed(),
-                error: Some(trino_error.clone()),
+                error: Some(trino_error.as_ref().clone()),
                 ..Default::default()
             };
             let mut resp = (StatusCode::OK, Json(response)).into_response();
@@ -2080,7 +2091,10 @@ mod tests {
         let err = protocol::TrinoError::user_error("boom", Some("q1"));
         state
             .queries
-            .insert("q1".to_string(), handle_with(QueryStatus::Failed(err), "alice"));
+            .insert(
+                "q1".to_string(),
+                handle_with(QueryStatus::Failed(Box::new(err)), "alice"),
+            );
         let resp = get_queued_results(
             State(state),
             test_peer(),
