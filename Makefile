@@ -77,7 +77,7 @@ SQE_BUILD_ARGS := \
 	--build-arg GIT_REVISION=$(GIT_REVISION) \
 	--build-arg VERSION=$(IMAGE_TAG)
 
-.PHONY: help all dev release rustbook ebook ebook-pdf ebook-epub ebook-html \
+.PHONY: help all check dev release rustbook ebook ebook-pdf ebook-epub ebook-html \
         benchmark-charts test clippy fmt fmt-check clean clean-rust clean-rustbook \
         clean-ebook clean-benchmark-charts clean-images check-tools maintain \
         build build-sqe sbom sbom-sqe sqe-config images \
@@ -88,6 +88,7 @@ help:
 	@echo "SQE build targets:"
 	@echo ""
 	@echo "  Code:"
+	@echo "    make check        Type-check all targets without linking (fastest feedback)"
 	@echo "    make dev          Debug build of sqe-cli + sqe-server (fast compile)"
 	@echo "    make release      Release build of sqe-cli + sqe-server (LTO, optimised)"
 	@echo "    make test         cargo test --workspace"
@@ -130,23 +131,28 @@ help:
 all: dev rustbook ebook build sbom
 
 # ── Code: cargo builds ────────────────────────────────────────────────────
+check:
+	$(CARGO) check --workspace --all-targets --exclude sqe-cli
+	$(CARGO) check --package sqe-cli --all-targets --no-default-features
+
 dev:
 	@echo "==> Building debug binaries ($(BIN_CLI), $(BIN_SERVER))"
-	$(CARGO) build --bin $(BIN_CLI) --bin $(BIN_SERVER)
+	$(CARGO) build --no-default-features --bin $(BIN_CLI) --bin $(BIN_SERVER)
 	@echo ""
 	@echo "Binaries:"
 	@ls -lh $(DEBUG_BIN)/$(BIN_CLI) $(DEBUG_BIN)/$(BIN_SERVER)
 
 release:
 	@echo "==> Building release binaries ($(BIN_CLI), $(BIN_SERVER))"
-	$(CARGO) build --release --bin $(BIN_CLI) --bin $(BIN_SERVER)
+	$(CARGO) build --release --no-default-features --bin $(BIN_CLI) --bin $(BIN_SERVER)
 	@echo ""
 	@echo "Binaries:"
 	@ls -lh $(RELEASE_BIN)/$(BIN_CLI) $(RELEASE_BIN)/$(BIN_SERVER)
 
 test:
 	@echo "==> Running unit tests"
-	$(CARGO) test --workspace
+	$(CARGO) test --workspace --exclude sqe-cli
+	$(CARGO) test --package sqe-cli --no-default-features
 
 clippy:
 	@echo "==> Running clippy"
