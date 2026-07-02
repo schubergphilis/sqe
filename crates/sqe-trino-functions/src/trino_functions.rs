@@ -496,12 +496,16 @@ fn date_add_date(d: NaiveDate, unit: TimeUnit, amount: i64) -> DFResult<NaiveDat
     result.ok_or_else(|| DataFusionError::Internal("date_add overflow".to_string()))
 }
 
-/// Add `amount` of `unit` to a microsecond timestamp, returning updated micros.
-fn ts_add_us(us: i64, unit: TimeUnit, amount: i64) -> DFResult<i64> {
-    let dt = chrono::DateTime::from_timestamp_micros(us)
-        .unwrap_or_default()
-        .naive_utc();
-    let result = match unit {
+/// Add `amount` of `unit` to a naive datetime. Calendar units (year, month)
+/// preserve the time-of-day; wall-clock units use signed durations. Shared by
+/// the microsecond and nanosecond timestamp paths so both resolutions apply
+/// identical semantics.
+fn add_units_to_naive(
+    dt: chrono::NaiveDateTime,
+    unit: TimeUnit,
+    amount: i64,
+) -> Option<chrono::NaiveDateTime> {
+    match unit {
         TimeUnit::Year => {
             let months = amount * 12;
             let date = if months >= 0 {
@@ -523,12 +527,29 @@ fn ts_add_us(us: i64, unit: TimeUnit, amount: i64) -> DFResult<i64> {
         TimeUnit::Hour => dt.checked_add_signed(Duration::hours(amount)),
         TimeUnit::Minute => dt.checked_add_signed(Duration::minutes(amount)),
         TimeUnit::Second => dt.checked_add_signed(Duration::seconds(amount)),
-    };
-    let new_dt = result.ok_or_else(|| DataFusionError::Internal("date_add overflow".to_string()))?;
+    }
+}
+
+/// Add `amount` of `unit` to a microsecond timestamp, returning updated micros.
+fn ts_add_us(us: i64, unit: TimeUnit, amount: i64) -> DFResult<i64> {
+    let dt = chrono::DateTime::from_timestamp_micros(us)
+        .unwrap_or_default()
+        .naive_utc();
+    let new_dt = add_units_to_naive(dt, unit, amount)
+        .ok_or_else(|| DataFusionError::Internal("date_add overflow".to_string()))?;
+    Ok(new_dt.and_utc().timestamp_micros())
+}
+
+/// Add `amount` of `unit` to a nanosecond timestamp, returning updated nanos.
+/// DataFusion's default timestamp resolution (what `now()` and
+/// `CAST(... AS timestamp)` produce) is nanosecond, so this is the common path.
+fn ts_add_ns(ns: i64, unit: TimeUnit, amount: i64) -> DFResult<i64> {
+    let dt = chrono::DateTime::from_timestamp_nanos(ns).naive_utc();
+    let new_dt = add_units_to_naive(dt, unit, amount)
+        .ok_or_else(|| DataFusionError::Internal("date_add overflow".to_string()))?;
     new_dt
         .and_utc()
-        .timestamp_micros()
-        .checked_mul(1) // identity — just to keep the type
+        .timestamp_nanos_opt()
         .ok_or_else(|| DataFusionError::Internal("ts overflow".to_string()))
 }
 
@@ -627,6 +648,23 @@ impl ScalarUDFImpl for DateAdd {
                     }
                     let result: TimestampMicrosecondArray = out.into_iter().collect();
                     Ok(ColumnarValue::Array(Arc::new(result) as ArrayRef))
+                } else if let Some(ts_arr) =
+                    array.as_any().downcast_ref::<TimestampNanosecondArray>()
+                {
+                    let tz = match ts_arr.data_type() {
+                        DataType::Timestamp(_, tz) => tz.clone(),
+                        _ => None,
+                    };
+                    let mut out: Vec<Option<i64>> = Vec::with_capacity(ts_arr.len());
+                    for opt in ts_arr.iter() {
+                        match opt {
+                            None => out.push(None),
+                            Some(ns) => out.push(Some(ts_add_ns(ns, unit_str, amount)?)),
+                        }
+                    }
+                    let result: TimestampNanosecondArray =
+                        out.into_iter().collect::<TimestampNanosecondArray>().with_timezone_opt(tz);
+                    Ok(ColumnarValue::Array(Arc::new(result) as ArrayRef))
                 } else {
                     Err(DataFusionError::Internal(format!(
                         "date_add: unsupported array type {:?}",
@@ -657,6 +695,19 @@ impl ScalarUDFImpl for DateAdd {
                 }
                 ScalarValue::TimestampMicrosecond(None, tz) => {
                     Ok(ColumnarValue::Scalar(ScalarValue::TimestampMicrosecond(
+                        None,
+                        tz.clone(),
+                    )))
+                }
+                ScalarValue::TimestampNanosecond(Some(ns), tz) => {
+                    let new_ns = ts_add_ns(*ns, unit_str, amount)?;
+                    Ok(ColumnarValue::Scalar(ScalarValue::TimestampNanosecond(
+                        Some(new_ns),
+                        tz.clone(),
+                    )))
+                }
+                ScalarValue::TimestampNanosecond(None, tz) => {
+                    Ok(ColumnarValue::Scalar(ScalarValue::TimestampNanosecond(
                         None,
                         tz.clone(),
                     )))
@@ -715,6 +766,10 @@ impl ScalarUDFImpl for DateDiff {
                     Ok(Some(us_to_naive(*us).date()))
                 }
                 ScalarValue::TimestampMicrosecond(None, _) => Ok(None),
+                ScalarValue::TimestampNanosecond(Some(ns), _) => {
+                    Ok(Some(ns_to_naive(*ns).date()))
+                }
+                ScalarValue::TimestampNanosecond(None, _) => Ok(None),
                 other => Err(DataFusionError::Internal(format!(
                     "date_diff: unsupported scalar type {other:?}"
                 ))),
@@ -764,6 +819,11 @@ impl ScalarUDFImpl for DateDiff {
                             arr.as_any()
                                 .downcast_ref::<TimestampMicrosecondArray>()
                                 .map(|a| us_to_naive(a.value(i)).date())
+                        })
+                        .or_else(|| {
+                            arr.as_any()
+                                .downcast_ref::<TimestampNanosecondArray>()
+                                .map(|a| ns_to_naive(a.value(i)).date())
                         })
                 };
                 let len = arr1.len();
@@ -2486,7 +2546,45 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn date_add_on_nanosecond_timestamp() {
+        // `CAST(... AS timestamp)` and `now()` produce Timestamp(Nanosecond),
+        // DataFusion's default. date_add previously only handled
+        // TimestampMicrosecond and fell through to an INTERNAL_ERROR
+        // ("unsupported scalar type TimestampNanosecond") -- which reads to a
+        // BI client as an engine bug on one of the most common dashboard
+        // functions. day(date_add('day', 1, 2026-01-15 12:00:00)) == 16.
+        assert_eq!(
+            run_query("SELECT day(date_add('day', 1, CAST('2026-01-15 12:00:00' AS timestamp)))")
+                .await,
+            16,
+        );
+    }
+
+    #[tokio::test]
+    async fn date_add_hour_on_nanosecond_timestamp() {
+        // Sub-day units must work on nanosecond timestamps too.
+        assert_eq!(
+            run_query("SELECT hour(date_add('hour', 3, CAST('2026-01-15 12:00:00' AS timestamp)))")
+                .await,
+            15,
+        );
+    }
+
     // ── date_diff tests ───────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn date_diff_on_nanosecond_timestamp() {
+        // Same nanosecond-timestamp gap as date_add. date_diff('day', ...)
+        // over two CAST-as-timestamp values must return the day delta, not
+        // an INTERNAL_ERROR.
+        let v = run_query_i64(
+            "SELECT date_diff('day', CAST('2026-01-01 00:00:00' AS timestamp), \
+             CAST('2026-01-06 00:00:00' AS timestamp))",
+        )
+        .await;
+        assert_eq!(v, 5);
+    }
 
     #[tokio::test]
     async fn date_diff_days() {
