@@ -102,6 +102,7 @@
 - [Quack: the DuckDB wire protocol](./quickstart/quack.md)
   - [Quack protocol reference](./quickstart/quack-protocol.md)
   - [Quack data-type matrix](./quickstart/quack-datatype-matrix.md)
+- [Connect BI tools (Metabase, Superset, DBeaver)](./quickstart/bi-tools.md)
 - [Observability: metrics + Grafana](./quickstart/observability.md)
 - [Benchmarks: TPC-H / TPC-DS / SSB](./quickstart/benchmark.md)
 
