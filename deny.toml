@@ -34,4 +34,14 @@ ignore = [
     # run with `default-features = false`, so the legacy stack (rustls 0.21,
     # webpki 0.101.7, hyper 0.14) is gone from the tree. Ignores removed so the
     # gate catches any regression.
+    # quick-xml (0.37.5/0.38.4/0.39.4): high-severity XML-parsing DoS advisories
+    # fixed in >=0.41.0. Transitive only -- object_store 0.13.2 pins
+    # `quick-xml ^0.39.0` (S3/GCS list + multipart XML) and the AWS SDK pulls the
+    # older lines. The fix is unreachable (object_store 0.13.2 rejects 0.41; no
+    # newer object_store in the escrow registry). SQE parses XML only from its
+    # configured object store / catalog (trusted infra), never attacker input, so
+    # the DoS needs a malicious storage backend. Drop when object_store bumps
+    # quick-xml past 0.41. Matched by cargo-deny too (version-range match).
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
 ]
