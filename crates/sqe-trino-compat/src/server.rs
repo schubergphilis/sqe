@@ -35,6 +35,23 @@ const RESULT_TTL_SECS: u64 = 300;
 /// gigabytes outside DataFusion's memory pool.
 const RESULT_CACHE_MAX_BYTES: u64 = 512 * 1024 * 1024;
 
+/// A query-registry entry idle (un-polled) for this long is evicted. This is
+/// `time_to_idle`, NOT `time_to_live`: every poll's `queries.get(&id)` counts
+/// as an access and resets the timer, so a query that runs longer than this
+/// but is actively polled is never reaped. Only a genuinely abandoned client
+/// (no poll for this long) triggers eviction, whose listener aborts the
+/// still-running background task. Using `time_to_live` here would abort any
+/// query still executing at the 300s mark mid-flight — the opposite of the
+/// feature's purpose.
+const QUERY_REGISTRY_IDLE_SECS: u64 = 300;
+
+/// Default bounded wait applied to the POST and to a poll with no explicit
+/// `maxWait`: no single HTTP call blocks longer than this on query progress.
+const DEFAULT_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Hard upper bound a client-supplied `maxWait` is clamped to.
+const MAX_WAIT_CAP: std::time::Duration = std::time::Duration::from_secs(10);
+
 fn build_result_cache() -> MokaCache<String, Arc<PaginatedResult>> {
     MokaCache::builder()
         .max_capacity(RESULT_CACHE_MAX_BYTES)
@@ -56,6 +73,9 @@ pub struct TrinoState<A, Q> {
     pub authenticator: Arc<A>,
     pub query_handler: Arc<Q>,
     pub results: MokaCache<String, Arc<PaginatedResult>>,
+    /// In-flight / recently-finished query lifecycle handles, keyed by
+    /// `query_id`. Distinct from `results`, which holds finished page data.
+    pub queries: MokaCache<String, Arc<QueryHandle>>,
     pub node: NodeContext,
     /// Number of rows per page. Configurable for testing; defaults to [`DEFAULT_PAGE_SIZE`].
     pub page_size: usize,
@@ -140,6 +160,69 @@ fn estimate_json_bytes(value: &serde_json::Value) -> usize {
                 + 16
         }
     }
+}
+
+/// Lifecycle state of a submitted statement executing on a background task.
+#[derive(Debug)]
+pub enum QueryStatus {
+    /// Registered, background task not yet observed to start.
+    Queued,
+    /// Background task is running `Q::execute`.
+    Running,
+    /// Finished successfully; the `PaginatedResult` is in the result cache
+    /// under the same `query_id`.
+    Finished,
+    /// Execution failed; carries the mapped Trino error to replay on poll.
+    Failed(protocol::TrinoError),
+    /// Cancelled via DELETE or evicted while still running.
+    Cancelled,
+}
+
+impl QueryStatus {
+    /// True once the query will never transition again.
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            QueryStatus::Finished | QueryStatus::Failed(_) | QueryStatus::Cancelled
+        )
+    }
+}
+
+/// Shared handle for a statement executing in the background. Stored in the
+/// query registry under `query_id`; the background task and every poll share
+/// the same `Arc<QueryHandle>`.
+#[derive(Debug)]
+pub struct QueryHandle {
+    /// Current lifecycle state; mutated by the background task and by cancel.
+    pub status: std::sync::Mutex<QueryStatus>,
+    /// Woken on every status transition so waiting polls re-check promptly.
+    pub notify: tokio::sync::Notify,
+    /// Abort handle for the background task; set just after spawn.
+    pub abort: std::sync::Mutex<Option<tokio::task::AbortHandle>>,
+    /// Username that submitted the query; used for poll/cancel authorization.
+    pub owner_username: String,
+    /// Session-state mutation (USE / SET CATALOG) to echo as response headers
+    /// when the query finishes. `None` for ordinary statements.
+    pub session_update: Option<protocol::UpdatedSessionState>,
+    /// Registration time; used for diagnostics.
+    pub created_at: std::time::Instant,
+}
+
+/// Build the query-state registry. Idle-evicts abandoned entries and, on
+/// eviction of a still-running query, aborts its background task.
+fn build_query_registry() -> MokaCache<String, Arc<QueryHandle>> {
+    MokaCache::builder()
+        .time_to_idle(std::time::Duration::from_secs(QUERY_REGISTRY_IDLE_SECS))
+        .eviction_listener(|_key, handle: Arc<QueryHandle>, _cause| {
+            let mut status = handle.status.lock().unwrap();
+            if !status.is_terminal() {
+                if let Some(abort) = handle.abort.lock().unwrap().as_ref() {
+                    abort.abort();
+                }
+                *status = QueryStatus::Cancelled;
+            }
+        })
+        .build()
 }
 
 /// Trino client headers extracted from the request.
@@ -249,6 +332,7 @@ where
         authenticator,
         query_handler,
         results: build_result_cache(),
+        queries: build_query_registry(),
         node,
         page_size: DEFAULT_PAGE_SIZE,
         port,
@@ -1293,6 +1377,7 @@ mod tests {
             authenticator: Arc::new(MockAuth),
             query_handler: Arc::new(MockQuery),
             results: build_result_cache(),
+            queries: build_query_registry(),
             node: NodeContext {
                 version: "0.1.0".to_string(),
                 ready: ready.clone(),
@@ -1322,6 +1407,7 @@ mod tests {
             authenticator: Arc::new(MockAuth),
             query_handler: Arc::new(MockQuery),
             results: build_result_cache(),
+            queries: build_query_registry(),
             node: NodeContext {
                 version: "0.1.0".to_string(),
                 ready,
@@ -1346,6 +1432,7 @@ mod tests {
             authenticator: Arc::new(MockAuth),
             query_handler: Arc::new(MockQuery),
             results: build_result_cache(),
+            queries: build_query_registry(),
             node: NodeContext {
                 version: "0.1.0".to_string(),
                 ready,
@@ -1370,6 +1457,7 @@ mod tests {
             authenticator: Arc::new(MockAuth),
             query_handler: Arc::new(MockQuery),
             results: build_result_cache(),
+            queries: build_query_registry(),
             node: NodeContext {
                 version: "0.1.0".to_string(),
                 ready,
@@ -1470,6 +1558,7 @@ mod tests {
             authenticator: Arc::new(MockAuthOk),
             query_handler: Arc::new(RecordingQuery { seen }),
             results: build_result_cache(),
+            queries: build_query_registry(),
             node: NodeContext {
                 version: "0.1.0".to_string(),
                 ready: Arc::new(AtomicBool::new(true)),
@@ -1759,6 +1848,7 @@ mod tests {
             authenticator: Arc::new(MockAuthOk),
             query_handler: Arc::new(InfoSchemaQuery),
             results: build_result_cache(),
+            queries: build_query_registry(),
             node: NodeContext {
                 version: "0.1.0".to_string(),
                 ready: Arc::new(AtomicBool::new(true)),
@@ -2192,6 +2282,26 @@ mod tests {
     // ── Integration-style tests for pagination flow ───────────
 
     #[test]
+    fn query_registry_stores_and_reports_terminal_status() {
+        let registry = build_query_registry();
+        let handle = Arc::new(QueryHandle {
+            status: std::sync::Mutex::new(QueryStatus::Running),
+            notify: tokio::sync::Notify::new(),
+            abort: std::sync::Mutex::new(None),
+            owner_username: "alice".to_string(),
+            session_update: None,
+            created_at: std::time::Instant::now(),
+        });
+        registry.insert("q1".to_string(), handle.clone());
+
+        let got = registry.get("q1").expect("handle present");
+        assert!(!got.status.lock().unwrap().is_terminal());
+
+        *got.status.lock().unwrap() = QueryStatus::Finished;
+        assert!(got.status.lock().unwrap().is_terminal());
+    }
+
+    #[test]
     fn test_paginated_result_cleanup_after_last_page() {
         let results: MokaCache<String, Arc<PaginatedResult>> = build_result_cache();
         results.insert(
@@ -2221,6 +2331,7 @@ mod tests {
             authenticator: Arc::new(MockAuthOk),
             query_handler: Arc::new(MockQuery),
             results: build_result_cache(),
+            queries: build_query_registry(),
             node: NodeContext {
                 version: "0.1.0".to_string(),
                 ready: Arc::new(AtomicBool::new(true)),
@@ -2252,6 +2363,7 @@ mod tests {
             authenticator: Arc::new(MockAuth),
             query_handler: Arc::new(MockQuery),
             results: build_result_cache(),
+            queries: build_query_registry(),
             node: NodeContext {
                 version: "0.1.0".to_string(),
                 ready: Arc::new(AtomicBool::new(true)),
@@ -2299,6 +2411,7 @@ mod tests {
             authenticator: Arc::new(MockAuthOk),
             query_handler: Arc::new(MockQuery),
             results: build_result_cache(),
+            queries: build_query_registry(),
             node: NodeContext {
                 version: "0.1.0".to_string(),
                 ready: Arc::new(AtomicBool::new(true)),
@@ -2371,6 +2484,7 @@ mod tests {
             authenticator: Arc::new(MockAuthOk),
             query_handler: Arc::new(MockQuery),
             results: build_result_cache(),
+            queries: build_query_registry(),
             node: NodeContext {
                 version: "0.1.0".to_string(),
                 ready: Arc::new(AtomicBool::new(true)),
@@ -2423,6 +2537,7 @@ mod tests {
             authenticator: Arc::new(MockAuthOk),
             query_handler: Arc::new(MockQuery),
             results: build_result_cache(),
+            queries: build_query_registry(),
             node: NodeContext {
                 version: "0.1.0".to_string(),
                 ready: Arc::new(AtomicBool::new(true)),
@@ -2465,6 +2580,7 @@ mod tests {
             authenticator: Arc::new(MockAuth),
             query_handler: Arc::new(MockQuery),
             results: build_result_cache(),
+            queries: build_query_registry(),
             node: NodeContext {
                 version: "0.1.0".to_string(),
                 ready: Arc::new(AtomicBool::new(true)),
@@ -2547,6 +2663,7 @@ mod tests {
             authenticator: Arc::new(MockAuth),
             query_handler: Arc::new(MockQuery),
             results: build_result_cache(),
+            queries: build_query_registry(),
             node: NodeContext {
                 version: "0.1.0".to_string(),
                 ready: Arc::new(AtomicBool::new(true)),
@@ -2593,6 +2710,7 @@ mod tests {
             authenticator: Arc::new(MockAuth),
             query_handler: Arc::new(MockQuery),
             results: build_result_cache(),
+            queries: build_query_registry(),
             node: NodeContext {
                 version: "0.1.0".to_string(),
                 ready: Arc::new(AtomicBool::new(true)),
@@ -2637,6 +2755,7 @@ mod tests {
             authenticator: Arc::new(MockAuth),
             query_handler: Arc::new(MockQuery),
             results: build_result_cache(),
+            queries: build_query_registry(),
             node: NodeContext {
                 version: "1.2.3-4567".to_string(),
                 ready: Arc::new(AtomicBool::new(true)),
@@ -2668,6 +2787,7 @@ mod tests {
             authenticator: Arc::new(MockAuth),
             query_handler: Arc::new(MockQuery),
             results: build_result_cache(),
+            queries: build_query_registry(),
             node: NodeContext {
                 version: "0.1.0".to_string(),
                 ready: Arc::new(AtomicBool::new(true)),
