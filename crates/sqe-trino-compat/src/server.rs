@@ -295,6 +295,25 @@ pub struct TrinoServerOptions {
     pub expose_version: bool,
 }
 
+/// Assemble the statement/info routes with state. Extracted so a unit test can
+/// build the router and fail fast if a route pattern conflicts (matchit panics
+/// at insert time).
+fn build_statement_router<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
+    state: Arc<TrinoState<A, Q>>,
+) -> Router {
+    Router::new()
+        .route("/v1/info", get(server_info::<A, Q>))
+        .route("/v1/info/state", get(server_state::<A, Q>))
+        .route("/v1/statement", post(submit_query::<A, Q>))
+        .route("/v1/statement/{id}/{token}", get(get_results::<A, Q>))
+        .route(
+            "/v1/statement/queued/{id}/{token}",
+            get(get_queued_results::<A, Q>),
+        )
+        .route("/v1/statement/{id}", delete(cancel_query::<A, Q>))
+        .with_state(state)
+}
+
 pub fn start_trino_server<A, Q>(
     authenticator: Arc<A>,
     query_handler: Arc<Q>,
@@ -361,14 +380,7 @@ where
             next.run(req).await
         });
 
-        let mut app = Router::new()
-            .route("/v1/info", get(server_info::<A, Q>))
-            .route("/v1/info/state", get(server_state::<A, Q>))
-            .route("/v1/statement", post(submit_query::<A, Q>))
-            .route("/v1/statement/{id}/{token}", get(get_results::<A, Q>))
-            .route("/v1/statement/{id}", delete(cancel_query::<A, Q>))
-            .layer(cors_layer)
-            .with_state(state);
+        let mut app = build_statement_router(state).layer(cors_layer);
 
         if let Some(oauth2_state) = oauth2 {
             let oauth2_routes = Router::new()
@@ -1474,6 +1486,116 @@ async fn get_results<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
     }
 }
 
+#[tracing::instrument(skip_all, name = "trino.get_queued_results")]
+async fn get_queued_results<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
+    State(state): State<Arc<TrinoState<A, Q>>>,
+    ConnectInfo(_peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path((id, token)): Path<(String, String)>,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
+) -> Response {
+    let session = if let Some(bearer) = extract_bearer_token(&headers) {
+        match state.authenticator.authenticate_bearer(&bearer).await {
+            Ok(s) => s,
+            Err(_) => return StatusCode::UNAUTHORIZED.into_response(),
+        }
+    } else if let Some((user, pass)) = extract_basic_auth(&headers) {
+        match state.authenticator.authenticate(&user, &pass).await {
+            Ok(s) => s,
+            Err(_) => return StatusCode::UNAUTHORIZED.into_response(),
+        }
+    } else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+
+    let base_url = extract_base_url(&headers, state.port);
+    let next_token: usize = token.parse().unwrap_or(1usize).saturating_add(1);
+
+    let handle = match state.queries.get(&id) {
+        Some(h) => h,
+        None => {
+            // Unknown/evicted id -> Trino "query not found" (same shape as
+            // get_results' None arm).
+            let response = TrinoResponse {
+                id: id.clone(),
+                info_uri: Some(info_uri(&base_url, &id)),
+                stats: TrinoStats::failed(),
+                error: Some(TrinoError {
+                    message: "Query not found".to_string(),
+                    error_code: 1,
+                    error_name: "USER_ERROR".to_string(),
+                    error_type: "USER_ERROR".to_string(),
+                    query_id: None,
+                    failure_info: None,
+                    error_location: None,
+                }),
+                ..Default::default()
+            };
+            return (StatusCode::NOT_FOUND, Json(response)).into_response();
+        }
+    };
+
+    if handle.owner_username != session.user.username {
+        warn!(
+            query_id = %id,
+            caller = %session.user.username,
+            owner = %handle.owner_username,
+            "get_queued_results denied: caller does not own query"
+        );
+        return StatusCode::FORBIDDEN.into_response();
+    }
+
+    // Extract maxWait from the raw query string ("maxWait=1s").
+    let max_wait_raw = raw_query
+        .as_deref()
+        .and_then(|q| q.split('&').find_map(|kv| kv.strip_prefix("maxWait=")));
+    let max_wait = clamp_max_wait(max_wait_raw);
+
+    await_terminal_or_timeout(&handle, max_wait).await;
+
+    let status = handle.status.lock().unwrap();
+    match &*status {
+        QueryStatus::Finished => (
+            StatusCode::OK,
+            Json(build_finished_redirect_response(&base_url, &id)),
+        )
+            .into_response(),
+        QueryStatus::Failed(trino_error) => {
+            let is_rate_limited = trino_error.error_name == "RESOURCE_EXHAUSTED";
+            let response = TrinoResponse {
+                id: id.clone(),
+                info_uri: Some(info_uri(&base_url, &id)),
+                stats: TrinoStats::failed(),
+                error: Some(trino_error.clone()),
+                ..Default::default()
+            };
+            let mut resp = (StatusCode::OK, Json(response)).into_response();
+            if is_rate_limited {
+                resp.headers_mut().insert(
+                    axum::http::header::RETRY_AFTER,
+                    axum::http::HeaderValue::from_static("1"),
+                );
+            }
+            resp
+        }
+        QueryStatus::Cancelled => {
+            let response = TrinoResponse {
+                id: id.clone(),
+                info_uri: Some(info_uri(&base_url, &id)),
+                stats: TrinoStats::failed(),
+                error: Some(TrinoError::user_error("Query was canceled", Some(&id))),
+                ..Default::default()
+            };
+            (StatusCode::OK, Json(response)).into_response()
+        }
+        QueryStatus::Queued | QueryStatus::Running => (
+            StatusCode::OK,
+            Json(build_running_response(&base_url, &id, next_token)),
+        )
+            .into_response(),
+    }
+}
+
 async fn cancel_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
     State(state): State<Arc<TrinoState<A, Q>>>,
     ConnectInfo(_peer): ConnectInfo<SocketAddr>,
@@ -1852,6 +1974,142 @@ mod tests {
         // A columnless empty result reports FINISHED with no further nextUri.
         assert_eq!(json.stats.state, "FINISHED");
         assert!(json.next_uri.is_none());
+    }
+
+    #[tokio::test]
+    async fn statement_router_builds_without_route_conflict() {
+        let open = Arc::new(AtomicBool::new(false));
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let state = gated_state(open, gate);
+        // Panics here if the queued route conflicts with the results route.
+        let _router = build_statement_router(state);
+    }
+
+    fn handle_with(status: QueryStatus, owner: &str) -> Arc<QueryHandle> {
+        Arc::new(QueryHandle {
+            status: std::sync::Mutex::new(status),
+            notify: tokio::sync::Notify::new(),
+            abort: std::sync::Mutex::new(None),
+            owner_username: owner.to_string(),
+            session_update: None,
+            created_at: std::time::Instant::now(),
+        })
+    }
+
+    #[tokio::test]
+    async fn queued_poll_running_returns_running_with_incremented_token() {
+        let open = Arc::new(AtomicBool::new(false));
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let state = gated_state(open, gate);
+        state
+            .queries
+            .insert("q1".to_string(), handle_with(QueryStatus::Running, "alice"));
+        let resp = get_queued_results(
+            State(state),
+            test_peer(),
+            basic_auth_header("alice", "pw"),
+            Path(("q1".to_string(), "3".to_string())),
+            axum::extract::RawQuery(Some("maxWait=50ms".to_string())),
+        )
+        .await;
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: protocol::TrinoResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json.stats.state, "RUNNING");
+        assert_eq!(
+            json.next_uri.as_deref(),
+            Some("http://localhost:8080/v1/statement/queued/q1/4")
+        );
+        assert!(json.data.is_none());
+    }
+
+    #[tokio::test]
+    async fn queued_poll_finished_redirects_to_results_route() {
+        let open = Arc::new(AtomicBool::new(false));
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let state = gated_state(open, gate);
+        state
+            .queries
+            .insert("q1".to_string(), handle_with(QueryStatus::Finished, "alice"));
+        let resp = get_queued_results(
+            State(state),
+            test_peer(),
+            basic_auth_header("alice", "pw"),
+            Path(("q1".to_string(), "1".to_string())),
+            axum::extract::RawQuery(None),
+        )
+        .await;
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: protocol::TrinoResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json.next_uri.as_deref(),
+            Some("http://localhost:8080/v1/statement/q1/0")
+        );
+        assert!(json.data.is_none());
+    }
+
+    #[tokio::test]
+    async fn queued_poll_failed_returns_error_json() {
+        let open = Arc::new(AtomicBool::new(false));
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let state = gated_state(open, gate);
+        let err = protocol::TrinoError::user_error("boom", Some("q1"));
+        state
+            .queries
+            .insert("q1".to_string(), handle_with(QueryStatus::Failed(err), "alice"));
+        let resp = get_queued_results(
+            State(state),
+            test_peer(),
+            basic_auth_header("alice", "pw"),
+            Path(("q1".to_string(), "1".to_string())),
+            axum::extract::RawQuery(None),
+        )
+        .await;
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: protocol::TrinoResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json.stats.state, "FAILED");
+        assert!(json.error.is_some());
+        assert!(json.next_uri.is_none());
+    }
+
+    #[tokio::test]
+    async fn queued_poll_unknown_id_returns_not_found() {
+        let open = Arc::new(AtomicBool::new(false));
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let state = gated_state(open, gate);
+        let resp = get_queued_results(
+            State(state),
+            test_peer(),
+            basic_auth_header("alice", "pw"),
+            Path(("missing".to_string(), "1".to_string())),
+            axum::extract::RawQuery(None),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn queued_poll_rejects_non_owner() {
+        let open = Arc::new(AtomicBool::new(false));
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let state = gated_state(open, gate);
+        state
+            .queries
+            .insert("q1".to_string(), handle_with(QueryStatus::Running, "bob"));
+        let resp = get_queued_results(
+            State(state),
+            test_peer(),
+            basic_auth_header("alice", "pw"), // MockAuthOk authenticates as "alice"
+            Path(("q1".to_string(), "1".to_string())),
+            axum::extract::RawQuery(Some("maxWait=10ms".to_string())),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
 
     #[test]
