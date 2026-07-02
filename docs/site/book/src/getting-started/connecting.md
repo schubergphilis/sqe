@@ -64,7 +64,7 @@ Set `useEncryption=true` when the coordinator runs with TLS. JDBC tools (DBeaver
 
 ## Trino HTTP
 
-When the Trino compat layer is enabled (`[trino_compat] enabled = true`), Trino clients, the Trino JDBC driver, and Trino-compatible BI tools point at the HTTP endpoint unchanged. Basic auth carries the user; the password is the OIDC secret (empty for a local root client).
+The Trino HTTP endpoint is on by default (`[coordinator] trino_http_port = 8080`, set to `0` to disable). Trino clients, the Trino JDBC driver, and Trino-compatible BI tools (Metabase, Superset) point at it unchanged. Basic auth carries the user; the password is the OIDC secret (empty for a local root client).
 
 ```bash
 curl -s -u jacob:your-password \
