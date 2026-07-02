@@ -586,6 +586,30 @@ impl TrinoStats {
         }
     }
 
+    /// Stats for a query that has been accepted but not yet started/finished.
+    pub fn queued() -> Self {
+        Self {
+            state: "QUEUED".to_string(),
+            queued: true,
+            scheduled: false,
+            nodes: 0,
+            total_splits: 0,
+            queued_splits: 0,
+            running_splits: 0,
+            completed_splits: 0,
+            cpu_time_millis: 0,
+            wall_time_millis: 0,
+            queued_time_millis: 0,
+            elapsed_time_millis: 0,
+            processed_rows: 0,
+            processed_bytes: 0,
+            physical_input_bytes: 0,
+            peak_memory_bytes: 0,
+            spilled_bytes: 0,
+            root_stage: None,
+        }
+    }
+
     pub fn failed() -> Self {
         Self {
             state: "FAILED".to_string(),
@@ -648,6 +672,14 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use arrow_schema::{DataType, Field, Schema};
+
+    #[test]
+    fn trino_stats_queued_state() {
+        let s = TrinoStats::queued();
+        assert_eq!(s.state, "QUEUED");
+        assert!(s.queued);
+        assert!(!s.scheduled);
+    }
 
     #[test]
     fn test_batches_to_trino_empty() {
