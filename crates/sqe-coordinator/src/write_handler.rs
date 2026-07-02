@@ -3030,7 +3030,11 @@ impl WriteHandler {
         // read fail as one query part-way through the loop instead. See
         // docs/internal/specs/2026-07-02-write-path-memory-safety-design.md.
         let pool = ctx.runtime_env().memory_pool.clone();
-        let mut target_buf = TrackedBatchBuffer::new(&pool, "merge-target-buffer");
+        let mut target_buf = TrackedBatchBuffer::gated(
+            &pool,
+            "merge-target-buffer",
+            self.config.query.write_buffer_tracking,
+        );
         for data_file in &old_data_files {
             let file_path = data_file.file_path();
             // track = false: the returned batches are re-registered into
@@ -3547,7 +3551,11 @@ impl WriteHandler {
         // MERGE path. track = false on the per-file read so the decode is not
         // double-counted against this buffer.
         let pool = ctx.runtime_env().memory_pool.clone();
-        let mut target_buf = TrackedBatchBuffer::new(&pool, "merge-eq-target-buffer");
+        let mut target_buf = TrackedBatchBuffer::gated(
+            &pool,
+            "merge-eq-target-buffer",
+            self.config.query.write_buffer_tracking,
+        );
         for data_file in &old_data_files {
             let file_path = data_file.file_path();
             let batches = self
@@ -4089,7 +4097,7 @@ impl WriteHandler {
         ctx: &DFSessionContext,
         track: bool,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
-        let pool = if track {
+        let pool = if track && self.config.query.write_buffer_tracking {
             Some(ctx.runtime_env().memory_pool.clone())
         } else {
             None

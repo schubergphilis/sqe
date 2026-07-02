@@ -285,6 +285,30 @@ pub struct QueryConfig {
     /// type fit. Default: "4MB". Set to "0" to keep DataFusion's default.
     #[serde(default = "default_runtime_filter_inlist_max_size")]
     pub runtime_filter_inlist_max_size: String,
+    /// Cap on concurrently open partition writers per partitioned write (the
+    /// bounded fanout writer). When a batch arrives for a new partition and
+    /// the map is full, the least-recently-written writer is closed and
+    /// flushed first, then the new one opens. Default 0 = auto (derived from
+    /// the pool size, floored at 8 and capped at 64). Small deployments with
+    /// few partitions never reach it. Cutover trades bounded memory for
+    /// small-file debt, repaired by `system.rewrite_data_files`.
+    #[serde(default)]
+    pub fanout_max_open_writers: usize,
+    /// Byte budget for total buffered fanout memory across open partition
+    /// writers, same string format as `max_query_memory` ("512MB"). When the
+    /// tracked estimate exceeds the budget, writers flush in
+    /// least-recently-written order until under budget. Default "0" = auto
+    /// (a fraction of the node pool, bounded below so one writer at full
+    /// row-group size always fits).
+    #[serde(default = "default_fanout_buffer_budget")]
+    pub fanout_buffer_budget: String,
+    /// Whether Layer A write-buffer pool reservations are active. Default
+    /// true. Escape hatch: set false to disable the write-side memory
+    /// accounting (never the streaming paths) if a deployment hits an
+    /// accounting false positive. Documented as a diagnostic, not a tuning
+    /// knob.
+    #[serde(default = "default_true")]
+    pub write_buffer_tracking: bool,
 }
 
 impl Default for QueryConfig {
@@ -313,6 +337,9 @@ impl Default for QueryConfig {
             distributed_scan_pushdown: default_true(),
             runtime_filter_inlist_max_values: default_runtime_filter_inlist_max_values(),
             runtime_filter_inlist_max_size: default_runtime_filter_inlist_max_size(),
+            fanout_max_open_writers: 0,
+            fanout_buffer_budget: default_fanout_buffer_budget(),
+            write_buffer_tracking: default_true(),
         }
     }
 }
@@ -2897,6 +2924,7 @@ fn default_max_query_memory() -> String { "256MB".to_string() }
 fn default_distribution_threshold() -> String { "128MB".to_string() }
 fn default_distribution_file_threshold() -> usize { 4 }
 fn default_target_task_size() -> String { "256MB".to_string() }
+fn default_fanout_buffer_budget() -> String { "0".to_string() }
 fn default_sort_mode() -> String { "adaptive".to_string() }
 fn default_late_mat_min_projection_cols() -> usize { 1 }
 fn default_star_schema_min_ratio() -> usize { 10 }
@@ -6209,5 +6237,37 @@ mod ranger_config_tests {
         assert_eq!(c.flush_interval_ms, 2000);
         assert_eq!(c.start_at, "now");
         assert_eq!(c.max_spool_bytes, 1_073_741_824);
+    }
+
+    #[test]
+    fn write_memory_safety_defaults() {
+        let c = QueryConfig::default();
+        assert_eq!(c.fanout_max_open_writers, 0, "0 = auto");
+        assert_eq!(c.fanout_buffer_budget, "0", "\"0\" = auto");
+        assert!(c.write_buffer_tracking, "tracking on by default");
+    }
+
+    /// A config file predating the write-memory-safety knobs still parses, and
+    /// the new fields fall back to their defaults (`#[serde(default)]`).
+    #[test]
+    fn write_memory_safety_knobs_are_back_compatible() {
+        let toml = r#"
+timeout_secs = 120
+max_query_memory = "512MB"
+"#;
+        let c: QueryConfig = toml::from_str(toml).expect("old config still parses");
+        assert_eq!(c.fanout_max_open_writers, 0);
+        assert_eq!(c.fanout_buffer_budget, "0");
+        assert!(c.write_buffer_tracking);
+        // Explicit overrides round-trip.
+        let toml = r#"
+fanout_max_open_writers = 32
+fanout_buffer_budget = "256MB"
+write_buffer_tracking = false
+"#;
+        let c: QueryConfig = toml::from_str(toml).expect("overrides parse");
+        assert_eq!(c.fanout_max_open_writers, 32);
+        assert_eq!(c.fanout_buffer_budget, "256MB");
+        assert!(!c.write_buffer_tracking);
     }
 }

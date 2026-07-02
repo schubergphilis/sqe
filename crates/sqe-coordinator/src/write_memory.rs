@@ -49,7 +49,9 @@ fn exhausted(
 pub struct TrackedBatchBuffer {
     label: String,
     batches: Vec<RecordBatch>,
-    reservation: MemoryReservation,
+    /// `None` when write-buffer tracking is disabled (the `write-buffer-tracking`
+    /// escape hatch): pushes append without reserving and never deny.
+    reservation: Option<MemoryReservation>,
 }
 
 impl TrackedBatchBuffer {
@@ -61,18 +63,43 @@ impl TrackedBatchBuffer {
         Self {
             label,
             batches: Vec::new(),
-            reservation,
+            reservation: Some(reservation),
+        }
+    }
+
+    /// Build an untracked buffer that behaves like a plain `Vec<RecordBatch>`:
+    /// `push` never reserves and never denies. Used when the
+    /// `write-buffer-tracking` escape hatch is off so call sites keep one code
+    /// path regardless of the flag.
+    pub fn untracked(label: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            batches: Vec::new(),
+            reservation: None,
+        }
+    }
+
+    /// Convenience: [`new`](Self::new) when `enabled`, else
+    /// [`untracked`](Self::untracked). Honours the `write-buffer-tracking` flag
+    /// at the call site with one line.
+    pub fn gated(pool: &Arc<dyn MemoryPool>, label: impl Into<String>, enabled: bool) -> Self {
+        if enabled {
+            Self::new(pool, label)
+        } else {
+            Self::untracked(label)
         }
     }
 
     /// Reserve room for `batch` and append it. On denial the batch is dropped
     /// and a typed resource-exhausted error is returned; the buffer is
-    /// unchanged.
+    /// unchanged. An untracked buffer always appends.
     pub fn push(&mut self, batch: RecordBatch) -> Result<(), SqeError> {
-        let requested = batch.get_array_memory_size();
-        self.reservation
-            .try_grow(requested)
-            .map_err(|e| exhausted(&self.label, requested, e))?;
+        if let Some(reservation) = self.reservation.as_mut() {
+            let requested = batch.get_array_memory_size();
+            reservation
+                .try_grow(requested)
+                .map_err(|e| exhausted(&self.label, requested, e))?;
+        }
         self.batches.push(batch);
         Ok(())
     }
@@ -93,9 +120,9 @@ impl TrackedBatchBuffer {
         self.batches.is_empty()
     }
 
-    /// Bytes currently reserved against the pool.
+    /// Bytes currently reserved against the pool (0 when untracked).
     pub fn reserved_bytes(&self) -> usize {
-        self.reservation.size()
+        self.reservation.as_ref().map_or(0, |r| r.size())
     }
 
     /// The buffer's label.
@@ -215,6 +242,34 @@ mod tests {
             assert!(pool.reserved() > 0);
         }
         assert_eq!(pool.reserved(), 0, "reservation released on drop");
+    }
+
+    #[test]
+    fn untracked_buffer_never_reserves_or_denies() {
+        // A tiny pool that would deny any real reservation.
+        let pool = pool(64);
+        let mut buf = TrackedBatchBuffer::untracked("cow-decode-buffer");
+        // Push a batch far larger than the pool: untracked must still append.
+        buf.push(batch(1000)).expect("untracked never denies");
+        assert_eq!(buf.len(), 1);
+        assert_eq!(buf.reserved_bytes(), 0, "untracked reserves nothing");
+        assert_eq!(pool.reserved(), 0, "pool untouched when untracked");
+    }
+
+    #[test]
+    fn gated_buffer_tracks_only_when_enabled() {
+        let pool = pool(1 << 20);
+        let tracked = TrackedBatchBuffer::gated(&pool, "g", true);
+        let untracked = TrackedBatchBuffer::gated(&pool, "g", false);
+        // Both start empty; the distinction shows once bytes are pushed.
+        assert_eq!(tracked.reserved_bytes(), 0);
+        assert_eq!(untracked.reserved_bytes(), 0);
+        let mut tracked = tracked;
+        let mut untracked = untracked;
+        tracked.push(batch(100)).expect("admit");
+        untracked.push(batch(100)).expect("admit");
+        assert!(tracked.reserved_bytes() > 0, "enabled reserves");
+        assert_eq!(untracked.reserved_bytes(), 0, "disabled reserves nothing");
     }
 
     #[test]
