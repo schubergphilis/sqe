@@ -147,6 +147,12 @@ distribution_file_threshold = 4 # Min file count to distribute
 target_task_size = "256MB"      # Target scan task size for bin-packing
 sort_mode = "adaptive"          # "adaptive", "partition_only", or "strict"
 
+# Write-path memory safety (see Features -> Write Path)
+write_buffer_tracking = true    # Pool-track write buffers; big writes fail with ResourceExhausted, not OOM
+fanout_max_open_writers = 0     # Cap on open per-partition writers (0 = auto: pool-derived, 8..64); opt-in bounded fanout
+fanout_buffer_budget = "0"      # Byte budget for buffered fanout memory, "512MB" style (0 = auto); opt-in bounded fanout
+merge_target_streaming = false  # Stream CoW MERGE target from files instead of buffering (opt-in, needs write_buffer_tracking)
+
 [query.role_overrides]          # Per-role timeout overrides (seconds)
 # admin = 3600                  # Admins get 1 hour
 # analyst = 600                 # Analysts get 10 minutes
