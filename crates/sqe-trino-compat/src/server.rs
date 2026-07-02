@@ -1630,7 +1630,28 @@ async fn cancel_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
         }
     }
 
+    // Abort the background task if the query is still in flight. Results are
+    // not inserted until the task finishes, so an in-flight query has no
+    // `results` entry and its ownership is enforced here against the registry.
+    if let Some(handle) = state.queries.get(&id) {
+        if handle.owner_username != session.user.username {
+            warn!(
+                query_id = %id,
+                caller = %session.user.username,
+                owner = %handle.owner_username,
+                "Cancel denied: caller does not own query"
+            );
+            return StatusCode::FORBIDDEN.into_response();
+        }
+        if let Some(abort) = handle.abort.lock().unwrap().as_ref() {
+            abort.abort();
+        }
+        *handle.status.lock().unwrap() = QueryStatus::Cancelled;
+        handle.notify.notify_waiters();
+    }
+
     state.results.invalidate(&id);
+    state.queries.invalidate(&id);
     StatusCode::NO_CONTENT.into_response()
 }
 
@@ -2110,6 +2131,36 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn cancel_aborts_running_query_and_marks_cancelled() {
+        let open = Arc::new(AtomicBool::new(false));
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let state = gated_state(open, gate.clone());
+        let handle = handle_with(QueryStatus::Running, "alice");
+        let gate2 = gate.clone();
+        let task = tokio::spawn(async move {
+            gate2.notified().await; // never released in this test
+        });
+        *handle.abort.lock().unwrap() = Some(task.abort_handle());
+        state.queries.insert("q1".to_string(), handle.clone());
+
+        let resp = cancel_query(
+            State(state.clone()),
+            test_peer(),
+            basic_auth_header("alice", "pw"),
+            Path("q1".to_string()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert!(matches!(
+            *handle.status.lock().unwrap(),
+            QueryStatus::Cancelled
+        ));
+        // Give the runtime a tick to process the abort.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(task.is_finished());
     }
 
     #[test]
