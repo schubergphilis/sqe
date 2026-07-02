@@ -820,6 +820,63 @@ fn build_finished_redirect_response(base_url: &str, query_id: &str) -> TrinoResp
     }
 }
 
+/// Wait until `handle.status` is terminal or `max_wait` elapses. A missed
+/// `notify_waiters` (tokio `Notify` does not store permits) only defers to the
+/// next client poll — correctness holds, at most one extra round-trip.
+async fn await_terminal_or_timeout(handle: &QueryHandle, max_wait: std::time::Duration) {
+    let deadline = tokio::time::Instant::now() + max_wait;
+    loop {
+        {
+            if handle.status.lock().unwrap().is_terminal() {
+                return;
+            }
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return;
+        }
+        // Ignore the timeout result: on either arm we loop and re-check status,
+        // and the deadline check above terminates the loop when time is up.
+        let _ = tokio::time::timeout(remaining, handle.notify.notified()).await;
+    }
+}
+
+/// Parse Trino's `maxWait` duration string and clamp to `[0, MAX_WAIT_CAP]`.
+/// Absent or unparseable input falls back to `DEFAULT_MAX_WAIT`.
+fn clamp_max_wait(raw: Option<&str>) -> std::time::Duration {
+    match raw.and_then(parse_trino_duration) {
+        Some(d) => d.min(MAX_WAIT_CAP),
+        None => DEFAULT_MAX_WAIT,
+    }
+}
+
+/// Parse a Trino duration literal: an integer followed by `ms`, `s`, or `m`.
+fn parse_trino_duration(s: &str) -> Option<std::time::Duration> {
+    let s = s.trim();
+    if let Some(num) = s.strip_suffix("ms") {
+        return num
+            .trim()
+            .parse::<u64>()
+            .ok()
+            .map(std::time::Duration::from_millis);
+    }
+    if let Some(num) = s.strip_suffix('s') {
+        return num
+            .trim()
+            .parse::<u64>()
+            .ok()
+            .map(std::time::Duration::from_secs);
+    }
+    if let Some(num) = s.strip_suffix('m') {
+        return num
+            .trim()
+            .parse::<u64>()
+            .ok()
+            .map(|m| std::time::Duration::from_secs(m * 60));
+    }
+    None
+}
+
 /// Derive the base URL from the `Host` header, falling back to `localhost:<port>`.
 fn extract_base_url(headers: &HeaderMap, bound_port: u16) -> String {
     let scheme = extract_header(headers, "x-forwarded-proto")
@@ -2085,6 +2142,55 @@ mod tests {
     fn test_next_uri_single_page() {
         let uri = next_uri("http://localhost:8080", "q-123", 0, 1);
         assert!(uri.is_none());
+    }
+
+    #[test]
+    fn clamp_max_wait_parses_and_clamps() {
+        use std::time::Duration;
+        assert_eq!(clamp_max_wait(Some("500ms")), Duration::from_millis(500));
+        assert_eq!(clamp_max_wait(Some("2s")), Duration::from_secs(2));
+        assert_eq!(clamp_max_wait(Some("1m")), MAX_WAIT_CAP); // 60s clamped to cap
+        assert_eq!(clamp_max_wait(Some("garbage")), DEFAULT_MAX_WAIT);
+        assert_eq!(clamp_max_wait(None), DEFAULT_MAX_WAIT);
+    }
+
+    #[tokio::test]
+    async fn await_terminal_returns_when_finished() {
+        let handle = Arc::new(QueryHandle {
+            status: std::sync::Mutex::new(QueryStatus::Running),
+            notify: tokio::sync::Notify::new(),
+            abort: std::sync::Mutex::new(None),
+            owner_username: "u".to_string(),
+            session_update: None,
+            created_at: std::time::Instant::now(),
+        });
+        let h2 = handle.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            *h2.status.lock().unwrap() = QueryStatus::Finished;
+            h2.notify.notify_waiters();
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            await_terminal_or_timeout(&handle, std::time::Duration::from_secs(5)),
+        )
+        .await
+        .expect("returned before outer timeout");
+        assert!(handle.status.lock().unwrap().is_terminal());
+    }
+
+    #[tokio::test]
+    async fn await_terminal_returns_on_timeout_when_still_running() {
+        let handle = Arc::new(QueryHandle {
+            status: std::sync::Mutex::new(QueryStatus::Running),
+            notify: tokio::sync::Notify::new(),
+            abort: std::sync::Mutex::new(None),
+            owner_username: "u".to_string(),
+            session_update: None,
+            created_at: std::time::Instant::now(),
+        });
+        await_terminal_or_timeout(&handle, std::time::Duration::from_millis(30)).await;
+        assert!(!handle.status.lock().unwrap().is_terminal());
     }
 
     #[test]
