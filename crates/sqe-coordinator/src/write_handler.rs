@@ -3093,42 +3093,89 @@ impl WriteHandler {
 
         let old_data_files = self.collect_data_files(&table).await?;
 
-        // Read all target batches into memory, tracked against the shared
-        // memory pool. A copy-on-write MERGE materializes the whole target
-        // table; without tracking, a target larger than the pool OOM-kills the
-        // coordinator. Pushing each batch through the reservation makes the
-        // read fail as one query part-way through the loop instead. See
-        // docs/internal/specs/2026-07-02-write-path-memory-safety-design.md.
-        let pool = ctx.runtime_env().memory_pool.clone();
-        let mut target_buf = TrackedBatchBuffer::gated(
-            &pool,
-            "merge-target-buffer",
-            self.config.query.write_buffer_tracking,
-        );
-        for data_file in &old_data_files {
-            let file_path = data_file.file_path();
-            // track = false: the returned batches are re-registered into
-            // `merge-target-buffer` just below, so tracking the decode here too
-            // would double-count the same bytes.
-            let batches = self
-                .read_parquet_via_table(&table, file_path, ctx, false)
-                .await?;
-            for batch in batches {
-                target_buf.push(batch)?;
-            }
-        }
+        // Build the target relation for the merge SELECT. Two paths:
+        //  - Buffered (default): read the whole target into a pool-tracked Vec
+        //    (Layer A `merge-target-buffer`) and register it as a MemTable.
+        //  - Streaming (B2, opt-in via `merge_target_streaming`): scan the
+        //    pinned `old_data_files` lazily so the target flows through the
+        //    merge join as governed operator memory instead of a MemTable Vec.
+        // See docs/internal/specs/2026-07-02-write-path-memory-safety-design.md.
+        let stream_target =
+            self.config.query.merge_target_streaming && self.config.query.write_buffer_tracking;
 
-        // Get the target schema from existing data (or table metadata if empty)
-        let target_schema = if let Some(first) = target_buf.as_slice().first() {
-            first.schema()
+        // Holds the Layer A target reservation alive to the end of the merge in
+        // the buffered path (the MemTable clones its Arc-backed batches). None
+        // in the streaming path.
+        let mut _target_buf_hold: Option<TrackedBatchBuffer> = None;
+
+        let (target_schema, target_provider): (
+            arrow_schema::SchemaRef,
+            Arc<dyn datafusion::datasource::TableProvider>,
+        ) = if stream_target {
+            let schema = Arc::new(
+                iceberg::arrow::schema_to_arrow_schema(table.metadata().current_schema())
+                    .map_err(|e| {
+                        SqeError::Execution(format!(
+                            "Failed to convert Iceberg schema to Arrow: {e}"
+                        ))
+                    })?,
+            );
+            let provider = crate::merge_target_provider::merge_target_table(
+                &table,
+                &old_data_files,
+                schema.clone(),
+            )?;
+            info!(
+                table = %table_ident,
+                files = old_data_files.len(),
+                "MERGE: streaming target from pinned data files (B2)"
+            );
+            (schema, Arc::new(provider))
         } else {
-            // Empty table — get the schema from the Iceberg table metadata
-            let iceberg_schema = table.metadata().current_schema();
-            let arrow_schema =
-                iceberg::arrow::schema_to_arrow_schema(iceberg_schema).map_err(|e| {
-                    SqeError::Execution(format!("Failed to convert Iceberg schema to Arrow: {e}"))
-                })?;
-            Arc::new(arrow_schema)
+            let pool = ctx.runtime_env().memory_pool.clone();
+            let mut target_buf = TrackedBatchBuffer::gated(
+                &pool,
+                "merge-target-buffer",
+                self.config.query.write_buffer_tracking,
+            );
+            for data_file in &old_data_files {
+                let file_path = data_file.file_path();
+                // track = false: the returned batches are re-registered into
+                // `merge-target-buffer` just below, so tracking the decode here
+                // too would double-count the same bytes.
+                let batches = self
+                    .read_parquet_via_table(&table, file_path, ctx, false)
+                    .await?;
+                for batch in batches {
+                    target_buf.push(batch)?;
+                }
+            }
+
+            // Target schema from existing data (or table metadata if empty).
+            let target_schema = if let Some(first) = target_buf.as_slice().first() {
+                first.schema()
+            } else {
+                let iceberg_schema = table.metadata().current_schema();
+                Arc::new(
+                    iceberg::arrow::schema_to_arrow_schema(iceberg_schema).map_err(|e| {
+                        SqeError::Execution(format!(
+                            "Failed to convert Iceberg schema to Arrow: {e}"
+                        ))
+                    })?,
+                )
+            };
+
+            let target_mem = if target_buf.is_empty() {
+                datafusion::datasource::MemTable::try_new(target_schema.clone(), vec![])
+            } else {
+                datafusion::datasource::MemTable::try_new(
+                    target_schema.clone(),
+                    vec![target_buf.as_slice().to_vec()],
+                )
+            }
+            .map_err(|e| SqeError::Execution(format!("Failed to create target MemTable: {e}")))?;
+            _target_buf_hold = Some(target_buf);
+            (target_schema, Arc::new(target_mem))
         };
 
         let target_columns: Vec<String> = target_schema
@@ -3137,10 +3184,10 @@ impl WriteHandler {
             .map(|f| f.name().clone())
             .collect();
 
-        // Use the target alias (or a default) for the merge MemTable names.
+        // Use the target alias (or a default) for the merge scratch table names.
         // The scratch table names embed a per-invocation uuid so concurrent
         // MERGEs running in the same session do not clobber each other's
-        // MemTable registrations.
+        // registrations.
         let t_alias = target_alias.clone().unwrap_or_else(|| "t".to_string());
         let s_alias = source_alias.clone().unwrap_or_else(|| "s".to_string());
         let merge_id = Uuid::now_v7().simple().to_string();
@@ -3153,23 +3200,10 @@ impl WriteHandler {
             vec![qualified_target_ref.clone(), qualified_source_ref.clone()],
         );
 
-        // Register target data as a MemTable in the full session context
-        // (which has all catalog tables registered for cross-table subqueries)
-        let target_mem = if target_buf.is_empty() {
-            datafusion::datasource::MemTable::try_new(target_schema.clone(), vec![])
-        } else {
-            // The scratch MemTable holds Arc-backed clones of the tracked
-            // batches; `target_buf` keeps the single reservation and lives to
-            // the end of the merge, so tracking covers the whole operation
-            // without double-counting the shared array data.
-            datafusion::datasource::MemTable::try_new(
-                target_schema.clone(),
-                vec![target_buf.as_slice().to_vec()],
-            )
-        }
-        .map_err(|e| SqeError::Execution(format!("Failed to create target MemTable: {e}")))?;
-        ctx.register_table(&qualified_target_ref, Arc::new(target_mem))
-            .map_err(|e| SqeError::Execution(format!("Failed to register target MemTable: {e}")))?;
+        // Register the target relation in the full session context (which has
+        // all catalog tables registered for cross-table subqueries).
+        ctx.register_table(&qualified_target_ref, target_provider)
+            .map_err(|e| SqeError::Execution(format!("Failed to register target provider: {e}")))?;
 
         // Use the pre-executed source batches (caller handles source query execution)
         if source_batches.is_empty() {
