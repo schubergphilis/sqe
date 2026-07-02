@@ -309,6 +309,15 @@ pub struct QueryConfig {
     /// knob.
     #[serde(default = "default_true")]
     pub write_buffer_tracking: bool,
+    /// Whether a copy-on-write MERGE streams its target from the pinned data
+    /// files instead of materialising the whole target into a MemTable
+    /// (write-path memory safety, Layer B phase B2). Default false: the
+    /// buffered path (bounded by the Layer A `merge-target-buffer`) is used.
+    /// When true, the target flows through the merge join as governed operator
+    /// memory. Opt-in until validated against a live catalog. Requires
+    /// `write_buffer_tracking` (ignored when tracking is off).
+    #[serde(default)]
+    pub merge_target_streaming: bool,
 }
 
 impl Default for QueryConfig {
@@ -340,6 +349,7 @@ impl Default for QueryConfig {
             fanout_max_open_writers: 0,
             fanout_buffer_budget: default_fanout_buffer_budget(),
             write_buffer_tracking: default_true(),
+            merge_target_streaming: false,
         }
     }
 }
@@ -6245,6 +6255,7 @@ mod ranger_config_tests {
         assert_eq!(c.fanout_max_open_writers, 0, "0 = auto");
         assert_eq!(c.fanout_buffer_budget, "0", "\"0\" = auto");
         assert!(c.write_buffer_tracking, "tracking on by default");
+        assert!(!c.merge_target_streaming, "B2 off by default");
     }
 
     /// A config file predating the write-memory-safety knobs still parses, and
