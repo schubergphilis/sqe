@@ -70,11 +70,15 @@ Expected: FAIL to compile — `QueryHandle`, `QueryStatus`, `build_query_registr
 Add near the other `const` declarations (after line 36):
 
 ```rust
-/// Query-state registry entries older than this are evicted (mirrors the
-/// result cache TTL). On eviction of a still-running query the eviction
-/// listener aborts its background task so an abandoned client cannot leak a
-/// running query forever.
-const QUERY_REGISTRY_TTL_SECS: u64 = 300;
+/// A query-registry entry idle (un-polled) for this long is evicted. This is
+/// `time_to_idle`, NOT `time_to_live`: every poll's `queries.get(&id)` counts
+/// as an access and resets the timer, so a query that runs longer than this
+/// but is actively polled is never reaped. Only a genuinely abandoned client
+/// (no poll for this long) triggers eviction, whose listener aborts the
+/// still-running background task. Using `time_to_live` here would abort any
+/// query still executing at the 300s mark mid-flight — the opposite of the
+/// feature's purpose.
+const QUERY_REGISTRY_IDLE_SECS: u64 = 300;
 
 /// Default bounded wait applied to the POST and to a poll with no explicit
 /// `maxWait`: no single HTTP call blocks longer than this on query progress.
@@ -133,11 +137,11 @@ pub struct QueryHandle {
     pub created_at: std::time::Instant,
 }
 
-/// Build the query-state registry. TTL-evicts abandoned entries and, on
+/// Build the query-state registry. Idle-evicts abandoned entries and, on
 /// eviction of a still-running query, aborts its background task.
 fn build_query_registry() -> MokaCache<String, Arc<QueryHandle>> {
     MokaCache::builder()
-        .time_to_live(std::time::Duration::from_secs(QUERY_REGISTRY_TTL_SECS))
+        .time_to_idle(std::time::Duration::from_secs(QUERY_REGISTRY_IDLE_SECS))
         .eviction_listener(|_key, handle: Arc<QueryHandle>, _cause| {
             let mut status = handle.status.lock().unwrap();
             if !status.is_terminal() {
@@ -810,6 +814,27 @@ Replace the Task 3 synchronous block (the `run_statement(...).await` + `match ex
     let owner = session.user.username.clone();
 
     let task = tokio::spawn(async move {
+        // Drop guard: if `run_statement` panics (or the task is otherwise torn
+        // down) without a terminal status set, force `Failed` on unwind so the
+        // next poll returns an error instead of the client polling a
+        // never-terminal `Running` entry forever (idle eviction would never
+        // fire because each poll resets the idle timer). Normal completion sets
+        // a terminal status first, so this no-ops.
+        struct TerminalGuard(Arc<QueryHandle>);
+        impl Drop for TerminalGuard {
+            fn drop(&mut self) {
+                let mut s = self.0.status.lock().unwrap();
+                if !s.is_terminal() {
+                    *s = QueryStatus::Failed(protocol::TrinoError::user_error(
+                        "query task terminated unexpectedly",
+                        None,
+                    ));
+                    self.0.notify.notify_waiters();
+                }
+            }
+        }
+        let _guard = TerminalGuard(task_handle.clone());
+
         *task_handle.status.lock().unwrap() = QueryStatus::Running;
         task_handle.notify.notify_waiters();
         let result = run_statement(
@@ -864,8 +889,11 @@ Replace the Task 3 synchronous block (the `run_statement(...).await` + `match ex
         }
     }
     // Failed within the wait: replay the mapped Trino error immediately so fast
-    // failures still surface on the POST rather than forcing a poll.
+    // failures still surface on the POST rather than forcing a poll. Preserve
+    // the `Retry-After` header the old synchronous error arm added for
+    // ResourceExhausted (rate-limit/OOM), detected via the stable error name.
     if let QueryStatus::Failed(ref trino_error) = *handle.status.lock().unwrap() {
+        let is_rate_limited = trino_error.error_name == "RESOURCE_EXHAUSTED";
         let response = TrinoResponse {
             id: query_id.clone(),
             info_uri: Some(info_uri(&base_url, &query_id)),
@@ -873,7 +901,14 @@ Replace the Task 3 synchronous block (the `run_statement(...).await` + `match ex
             error: Some(trino_error.clone()),
             ..Default::default()
         };
-        return (StatusCode::OK, Json(response)).into_response();
+        let mut resp = (StatusCode::OK, Json(response)).into_response();
+        if is_rate_limited {
+            resp.headers_mut().insert(
+                axum::http::header::RETRY_AFTER,
+                axum::http::HeaderValue::from_static("1"),
+            );
+        }
+        return resp;
     }
 
     build_started_response(&base_url, &query_id)
@@ -926,7 +961,7 @@ Add the poll endpoint and register it. Handles running/finished/failed/cancelled
         params: axum::extract::RawQuery,
     ) -> Response
     ```
-  - Route: `.route("/v1/statement/queued/{id}/{token}", get(get_queued_results::<A, Q>))`.
+  - Route: `.route("/v1/statement/queued/{id}/{token}", get(get_queued_results::<A, Q>))`, registered inside a new extracted `fn build_statement_router<A, Q>(state: Arc<TrinoState<A, Q>>) -> Router`.
 - Consumes: `QueryHandle`/`QueryStatus` (Task 1), `await_terminal_or_timeout`/`clamp_max_wait` (Task 4), `build_running_response`/`build_finished_redirect_response` (Task 2).
 
 - [ ] **Step 1: Write the failing tests**
@@ -1149,6 +1184,7 @@ async fn get_queued_results<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
                 .into_response()
         }
         QueryStatus::Failed(trino_error) => {
+            let is_rate_limited = trino_error.error_name == "RESOURCE_EXHAUSTED";
             let response = TrinoResponse {
                 id: id.clone(),
                 info_uri: Some(info_uri(&base_url, &id)),
@@ -1156,7 +1192,14 @@ async fn get_queued_results<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
                 error: Some(trino_error.clone()),
                 ..Default::default()
             };
-            (StatusCode::OK, Json(response)).into_response()
+            let mut resp = (StatusCode::OK, Json(response)).into_response();
+            if is_rate_limited {
+                resp.headers_mut().insert(
+                    axum::http::header::RETRY_AFTER,
+                    axum::http::HeaderValue::from_static("1"),
+                );
+            }
+            resp
         }
         QueryStatus::Cancelled => {
             let response = TrinoResponse {
@@ -1176,25 +1219,61 @@ async fn get_queued_results<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
 }
 ```
 
-- [ ] **Step 4: Register the route**
+- [ ] **Step 4: Extract `build_statement_router` and register the route through it**
 
-In `start_trino_server_with_options` add after line 284 (`.route("/v1/statement/{id}/{token}", get(get_results::<A, Q>))`):
+axum 0.8 uses `matchit`, which panics at `.route()` insert time if two patterns conflict at a segment. Asserting the 5-segment queued path "cannot collide" with the 4-segment results path is not enough — a bad registration panics at server startup, caught by nothing until deploy. Extract the router assembly into a function so a unit test can build it and catch a conflict panic at test time.
+
+Add near `start_trino_server_with_options` (e.g. just before it):
 
 ```rust
-            .route(
-                "/v1/statement/queued/{id}/{token}",
-                get(get_queued_results::<A, Q>),
-            )
+/// Assemble the statement/info routes with state. Extracted so a unit test can
+/// build the router and fail fast if a route pattern conflicts (matchit panics
+/// at insert time).
+fn build_statement_router<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
+    state: Arc<TrinoState<A, Q>>,
+) -> Router {
+    Router::new()
+        .route("/v1/info", get(server_info::<A, Q>))
+        .route("/v1/info/state", get(server_state::<A, Q>))
+        .route("/v1/statement", post(submit_query::<A, Q>))
+        .route("/v1/statement/{id}/{token}", get(get_results::<A, Q>))
+        .route(
+            "/v1/statement/queued/{id}/{token}",
+            get(get_queued_results::<A, Q>),
+        )
+        .route("/v1/statement/{id}", delete(cancel_query::<A, Q>))
+        .with_state(state)
+}
 ```
 
-(The 5-segment queued path cannot collide with the 4-segment results path.)
+Then in `start_trino_server_with_options`, replace the inline `let mut app = Router::new().route(...)....with_state(state);` block (lines ~280-287) with:
 
-- [ ] **Step 5: Run tests to verify they pass**
+```rust
+        let mut app = build_statement_router(state).layer(cors_layer);
+```
 
-Run: `cargo test -p sqe-trino-compat queued_poll`
-Expected: PASS (all five).
+(The `cors_layer` and the subsequent `oauth2` merge stay as they are; `.layer` and `.merge` apply to the `Router<()>` returned after `with_state`.)
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 5: Add the router-build test**
+
+In `#[cfg(test)]`:
+
+```rust
+#[tokio::test]
+async fn statement_router_builds_without_route_conflict() {
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let state = gated_state(gate);
+    // Panics here if the queued route conflicts with the results route.
+    let _router = build_statement_router(state);
+}
+```
+
+- [ ] **Step 6: Run tests to verify they pass**
+
+Run: `cargo test -p sqe-trino-compat queued_poll statement_router_builds`
+Expected: PASS (all six).
+
+- [ ] **Step 7: Commit**
 
 ```bash
 git add crates/sqe-trino-compat/src/server.rs
@@ -1356,8 +1435,9 @@ Not a code task; run once the branch is deployed to the demo stack. Reuses the #
 - `get_queued_results` route + running/finished/failed/cancelled/not-found (spec §3) -> Task 6. Finished = status-only redirect to the results route (spec §3.3).
 - `get_results` unchanged (spec §4) -> untouched; the redirect targets it at token 0.
 - `cancel_query` aborts + marks cancelled (spec §5) -> Task 7.
-- Error handling: `Q::execute` error -> `Failed(TrinoError::from_sqe_error)` (spec) -> Task 5 task body + Task 6 replay. Unknown id -> not found -> Task 6. Task panic -> tokio `JoinError`; the task sets status before returning, and a panic leaves the handle non-terminal until TTL eviction aborts/cancels it (spec "task panic treated as Failed" is approximated by the eviction-cancel path; acceptable — a panic in `Q::execute` is not expected and still yields a poll that eventually reports Cancelled rather than hanging a client forever).
-- Lifecycle/cleanup: registry TTL + eviction-abort (spec) -> Task 1 `build_query_registry`. Result TTL unchanged. `maxWait` clamp (spec) -> Task 4.
+- Error handling: `Q::execute` error -> `Failed(TrinoError::from_sqe_error)` (spec) -> Task 5 task body + Task 6 replay. Unknown id -> not found -> Task 6. Task panic -> the `TerminalGuard` Drop guard in the spawned task (Task 5) forces `Failed` on unwind, so the next poll returns an error rather than the client polling a never-terminal `Running` entry forever. Rate-limited (`RESOURCE_EXHAUSTED`) failures carry `Retry-After` on both the inline POST replay (Task 5) and the poll (Task 6), matching the old synchronous arm.
+- Lifecycle/cleanup: registry `time_to_idle` (NOT `time_to_live`) + eviction-abort (Task 1 `build_query_registry`) — a polled query never gets reaped mid-flight; only an abandoned one (no poll for 300s) is evicted and its task aborted. Result TTL unchanged. `maxWait` clamp (spec) -> Task 4.
+- Route safety: `build_statement_router` extraction + `statement_router_builds_without_route_conflict` test (Task 6) fail fast at test time if the queued route pattern conflicts with the results route (matchit panics at insert).
 - Testing (spec): blocking mock (`GatedQuery`) -> Task 5; running/finished/failed/cancelled polls -> Task 6/7; started response carries `nextUri` and no `data` -> Task 5.
 - Acceptance (spec): fast inline preserved (Task 5), started+poll+results handoff (Tasks 5/6), demo medallion (Task 9).
 - Out of scope (streaming, concurrency queueing) -> not implemented, as specified.
