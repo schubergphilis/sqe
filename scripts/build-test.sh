@@ -10,11 +10,12 @@ ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$ROOT_DIR"
 
 echo "=== Step 1: Build ==="
-cargo build --release --bin sqe-server --bin sqe-cli
+cargo build --release --no-default-features --bin sqe-server --bin sqe-cli
 echo ""
 
 echo "=== Step 2: Unit tests ==="
-cargo test --workspace
+cargo test --workspace --exclude sqe-cli
+cargo test --package sqe-cli --no-default-features
 echo ""
 
 echo "=== Step 3: Integration tests ==="

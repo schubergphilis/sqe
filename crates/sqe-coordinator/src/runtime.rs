@@ -101,7 +101,12 @@ pub fn build_coordinator_runtime(
         ));
     let mut builder = RuntimeEnvBuilder::new()
         .with_memory_pool(memory_pool)
-        .with_object_store_registry(registry);
+        .with_object_store_registry(registry)
+        // #363: disable DataFusion 54's on-by-default, infinite-TTL
+        // `list_files_cache` so directory reads of external mutable buckets
+        // (read_parquet / read_csv over raw S3 that dbt writes into) always
+        // list fresh instead of computing footer offsets from a stale size.
+        .with_cache_manager(sqe_catalog::lazy_object_store::external_store_cache_config());
 
     if config.spill_to_disk {
         // Create spill directory if it doesn't exist
