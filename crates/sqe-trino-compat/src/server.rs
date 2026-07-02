@@ -883,6 +883,80 @@ fn build_page_response(
 
 // ── Handlers ──────────────────────────────────────────────────
 
+/// Dispatch a resolved statement to the right executor path: DESCRIBE
+/// prepared, SHOW SESSION, or a normal `execute`. Mirrors the interception
+/// order in `submit_query` so async execution behaves identically.
+async fn run_statement<Q: TrinoQueryExecutor>(
+    handler: &Q,
+    session: &Session,
+    exec_sql: &str,
+    prepared: &std::collections::HashMap<String, String>,
+    show_session_props: &[(String, String)],
+) -> Result<Vec<arrow_array::RecordBatch>, sqe_core::SqeError> {
+    if let Some((kind, name)) = protocol::parse_describe_prepared(exec_sql) {
+        match prepared.get(&name) {
+            Some(prepared_sql) => handler.describe_prepared(session, prepared_sql, kind).await,
+            None => Err(sqe_core::SqeError::Execution(format!(
+                "Prepared statement not found: {name}"
+            ))),
+        }
+    } else if let Some(like) = protocol::parse_show_session(exec_sql) {
+        Ok(build_show_session_batches(show_session_props, like.as_deref()))
+    } else {
+        handler.execute(session, exec_sql).await
+    }
+}
+
+/// Turn a successful statement's record batches into a `PaginatedResult`:
+/// apply info-schema/EXPLAIN Trino-compat reshaping, classify the update
+/// type/count, and paginate. Pure post-processing shared by the sync and
+/// async paths.
+fn build_paginated_result(
+    batches: Vec<arrow_array::RecordBatch>,
+    exec_sql: &str,
+    session_catalog: Option<&str>,
+    page_size: usize,
+    owner_username: String,
+) -> PaginatedResult {
+    let update_type = classify_update_type(exec_sql).map(str::to_string);
+    let update_count = if update_type.is_some() {
+        extract_update_count(&batches).or(Some(0))
+    } else {
+        None
+    };
+    let batches = if info_schema_compat::is_metadata_query(exec_sql) {
+        let batches = info_schema_compat::apply_info_schema_compat(batches, session_catalog);
+        if info_schema_compat::is_describe_or_show_columns(exec_sql) {
+            info_schema_compat::reshape_describe_to_trino(batches)
+        } else {
+            batches
+        }
+    } else {
+        batches
+    };
+    let batches = if explain_compat::is_explain(exec_sql) {
+        explain_compat::reshape_explain_to_trino(batches)
+    } else {
+        batches
+    };
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    let (columns, data) = protocol::batches_to_trino(&batches);
+    let pages = paginate_rows(data, page_size);
+    let total_pages = pages.len();
+    let estimated_bytes = estimate_paginated_bytes(&pages, &columns);
+    PaginatedResult {
+        columns,
+        pages,
+        total_pages,
+        total_rows,
+        created_at: std::time::Instant::now(),
+        owner_username,
+        update_type,
+        update_count,
+        estimated_bytes,
+    }
+}
+
 #[tracing::instrument(
     skip_all,
     fields(
@@ -1112,98 +1186,31 @@ async fn submit_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
     let effective_sql = sqe_sql::alias_anonymous_select_columns(&effective_sql);
     let exec_sql = effective_sql.as_str();
 
-    // DESCRIBE OUTPUT <name> / DESCRIBE INPUT <name>: describe a prepared
-    // statement (JDBC PreparedStatement.getMetaData / getParameterMetaData).
-    // sqlparser does not model these, so intercept here while the prepared
-    // statement map is still in scope, resolve the template by name, and ask
-    // the executor to plan it for the output schema / parameter types. The
-    // resulting batches flow through the same response path as a normal query
-    // (DESCRIBE is not an update type and not a metadata query, so the
-    // update-count / info_schema-compat steps below are no-ops for it).
-    let exec_result = if let Some((kind, name)) = protocol::parse_describe_prepared(exec_sql) {
-        match prepared.get(&name) {
-            Some(prepared_sql) => {
-                state
-                    .query_handler
-                    .describe_prepared(&session, prepared_sql, kind)
-                    .await
-            }
-            None => Err(sqe_core::SqeError::Execution(format!(
-                "Prepared statement not found: {name}"
-            ))),
-        }
-    } else if let Some(like) = protocol::parse_show_session(exec_sql) {
-        // SHOW SESSION [LIKE ...]: surface the session properties the client
-        // currently carries (replayed in X-Trino-Session), filtered by LIKE,
-        // in Trino's column shape. SQE has no tunable-property registry, so
-        // Default/Type/Description are reported empty. (#323)
-        let props = incoming_session_properties(&headers);
-        Ok(build_show_session_batches(&props, like.as_deref()))
-    } else {
-        state.query_handler.execute(&session, exec_sql).await
-    };
+    // Dispatch DESCRIBE prepared / SHOW SESSION / normal execute, then turn a
+    // successful result into a `PaginatedResult`. Both steps live in
+    // `run_statement` / `build_paginated_result` so the async spawn path can
+    // reuse them verbatim.
+    let show_session_props = incoming_session_properties(&headers);
+    let exec_result = run_statement(
+        state.query_handler.as_ref(),
+        &session,
+        exec_sql,
+        &prepared,
+        &show_session_props,
+    )
+    .await;
 
     match exec_result {
         Ok(batches) => {
-            let update_type = classify_update_type(exec_sql).map(str::to_string);
-            let update_count = if update_type.is_some() {
-                extract_update_count(&batches).or(Some(0))
-            } else {
-                None
-            };
-            // Trino-normalize information_schema / SHOW COLUMNS / DESCRIBE
-            // results: translate Arrow type names to Trino names and scope the
-            // catalog listing to the session catalog. Other queries pass
-            // through untouched.
-            let batches = if info_schema_compat::is_metadata_query(exec_sql) {
-                let batches = info_schema_compat::apply_info_schema_compat(
-                    batches,
-                    session.default_catalog.as_deref(),
-                );
-                // SHOW COLUMNS / DESCRIBE <table>: reshape SQE's
-                // [column_name, data_type, is_nullable] to Trino's
-                // [Column, Type, Extra, Comment] (type values already
-                // translated above). information_schema selects are left as-is.
-                if info_schema_compat::is_describe_or_show_columns(exec_sql) {
-                    info_schema_compat::reshape_describe_to_trino(batches)
-                } else {
-                    batches
-                }
-            } else {
-                batches
-            };
-            // #9: EXPLAIN is not a metadata query, so it needs its own branch.
-            // Collapse SQE's structured EXPLAIN / EXPLAIN ANALYZE / EXPLAIN FULL
-            // output into Trino's single `Query Plan` varchar column, which BI
-            // and JDBC tools string-match. Trino-path-scoped: native Flight SQL
-            // clients keep the rich structured table.
-            let batches = if explain_compat::is_explain(exec_sql) {
-                explain_compat::reshape_explain_to_trino(batches)
-            } else {
-                batches
-            };
-            let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-            let (columns, data) = protocol::batches_to_trino(&batches);
-            let pages = paginate_rows(data, state.page_size);
-            let total_pages = pages.len();
-            let estimated_bytes = estimate_paginated_bytes(&pages, &columns);
-
-            let paginated = PaginatedResult {
-                columns,
-                pages,
-                total_pages,
-                total_rows,
-                created_at: std::time::Instant::now(),
-                owner_username: session.user.username.clone(),
-                update_type,
-                update_count,
-                estimated_bytes,
-            };
-
+            let paginated = build_paginated_result(
+                batches,
+                exec_sql,
+                session.default_catalog.as_deref(),
+                state.page_size,
+                session.user.username.clone(),
+            );
             let response = build_page_response(&base_url, &query_id, &paginated, 0);
-
             state.results.insert(query_id, Arc::new(paginated));
-
             let mut resp = (StatusCode::OK, Json(response)).into_response();
             if let Some(ref update) = session_update {
                 apply_session_headers(resp.headers_mut(), update);
