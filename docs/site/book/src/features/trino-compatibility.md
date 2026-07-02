@@ -1,6 +1,6 @@
 # Trino Compatibility
 
-SQE includes a Trino-compatible HTTP endpoint that allows existing Trino clients (JDBC drivers, DBeaver, CLI tools) to connect without modification.
+SQE includes a Trino-compatible HTTP endpoint that allows existing Trino clients (JDBC drivers, CLI tools, DBeaver) and Trino-speaking BI tools (Metabase, Superset) to connect without modification.
 
 ## Enabling
 
@@ -113,10 +113,19 @@ props.setProperty("password", "secret");
 Connection conn = DriverManager.getConnection(url, props);
 ```
 
+### Metabase and Superset
+
+BI tools that speak Trino connect through the same endpoint. Metabase uses the Trino JDBC driver, Superset uses the Trino SQLAlchemy dialect (`trino://user@host:8080/catalog`). Both drive a metadata handshake on connect (prepare a statement, enumerate catalogs and schemas, list tables, describe columns) before running a chart, and SQE now matches Trino's exact response shape at each step:
+
+- `PREPARE` and `DEALLOCATE PREPARE` are handled as session-control via the `X-Trino-Added-Prepare` / `X-Trino-Deallocated-Prepare` headers, so the JDBC connection test succeeds.
+- `SHOW TABLES` returns a single `Table` column, `SHOW SCHEMAS` a `Schema` column, and `SHOW CATALOGS` a `Catalog` column, so schema sync reads the right values.
+- `SHOW CATALOGS` and the `system.jdbc.*` / `system.metadata.*` tables enumerate every reachable catalog and skip the ones the caller is not authorized to list, and `SHOW TABLES` / `SHOW SCHEMAS` honor the session catalog (`X-Trino-Catalog`).
+- `DESCRIBE` and `SHOW COLUMNS` resolve double-quoted identifiers (`"catalog"."schema"."table"`), so field discovery works.
+- Types map to their Trino equivalents: `timestamp(6)` carries its precision in the type signature (so date bucketing over JDBC works), and computed unsigned-64 aggregates like `count(*)` map to `bigint` rather than `decimal`.
+
 ## Limitations
 
 - The Trino endpoint returns results as JSON (Trino wire format), not Arrow. For maximum performance, use Flight SQL.
-- Prepared statements are not supported via the Trino protocol.
 - Transaction control (`START TRANSACTION`, `COMMIT`) is not supported. Queries execute in auto-commit mode.
 - Type mapping covers common types; complex nested types may differ from native Trino behavior.
 - Iceberg hidden columns (`$path`, `$file_modified_time`, `$partition`) are not exposed on table scans. They need a per-row, per-source-file column that is resolvable by name but excluded from `SELECT *`. DataFusion has no such metadata-column mechanism yet (tracked upstream at apache/datafusion#20135, not in any release), and adding the column to the scan schema would make every `SELECT *` return it. For file-level introspection use the `table_files('ns', 't')` table function, which lists `file_path`, `record_count`, and `file_size_in_bytes` per data file.
@@ -129,7 +138,7 @@ Connection conn = DriverManager.getConnection(url, props);
 | Port | 50051 | 8080 |
 | Wire format | Arrow IPC (binary, columnar) | JSON |
 | Performance | High (zero-copy) | Lower (serialization overhead) |
-| Client support | ADBC, JDBC (Flight SQL), dbt | Trino JDBC, DBeaver, Tableau |
+| Client support | ADBC, JDBC (Flight SQL), dbt | Trino JDBC, DBeaver, Metabase, Superset |
 | Pagination | Arrow Flight streaming | nextUri polling |
 
 Use Flight SQL for performance-sensitive workloads. Use Trino HTTP for compatibility with existing tools.
