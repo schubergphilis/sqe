@@ -149,6 +149,10 @@ pub fn build_embedded_context(memory_limit_bytes: usize) -> anyhow::Result<Sessi
     let runtime = RuntimeEnvBuilder::new()
         .with_memory_pool(pool)
         .with_object_store_registry(registry)
+        // #363: disable DataFusion 54's infinite-TTL list_files_cache so
+        // directory reads of mutable external buckets always list fresh
+        // (stale cached ObjectMeta.size -> "Corrupt footer" on grown files).
+        .with_cache_manager(sqe_catalog::lazy_object_store::external_store_cache_config())
         .build_arc()
         .map_err(|e| anyhow::anyhow!("failed to build runtime env: {e}"))?;
 
