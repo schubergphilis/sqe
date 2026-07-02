@@ -778,6 +778,48 @@ fn info_uri(base_url: &str, query_id: &str) -> String {
     format!("{base_url}/v1/query/{query_id}")
 }
 
+/// Build a `queued`-route URI (the status/poll namespace).
+fn queued_uri(base_url: &str, query_id: &str, token: usize) -> String {
+    format!("{base_url}/v1/statement/queued/{query_id}/{token}")
+}
+
+/// Response for a POST whose query did not finish within the bounded wait:
+/// no data, `state=QUEUED`, `nextUri` -> the queued poll route (token 1).
+fn build_started_response(base_url: &str, query_id: &str) -> TrinoResponse {
+    TrinoResponse {
+        id: query_id.to_string(),
+        info_uri: Some(info_uri(base_url, query_id)),
+        next_uri: Some(queued_uri(base_url, query_id, 1)),
+        stats: TrinoStats::queued(),
+        ..Default::default()
+    }
+}
+
+/// Response for a poll on a query still running: no data, `state=RUNNING`,
+/// `nextUri` -> the next queued poll token.
+fn build_running_response(base_url: &str, query_id: &str, next_token: usize) -> TrinoResponse {
+    TrinoResponse {
+        id: query_id.to_string(),
+        info_uri: Some(info_uri(base_url, query_id)),
+        next_uri: Some(queued_uri(base_url, query_id, next_token)),
+        stats: TrinoStats::running(0, 1),
+        ..Default::default()
+    }
+}
+
+/// Response for a poll on a query that just finished: no data, `state=RUNNING`,
+/// `nextUri` -> the results-paging route at token 0. The queued route stays a
+/// status/redirect endpoint; the results route stays pure data paging.
+fn build_finished_redirect_response(base_url: &str, query_id: &str) -> TrinoResponse {
+    TrinoResponse {
+        id: query_id.to_string(),
+        info_uri: Some(info_uri(base_url, query_id)),
+        next_uri: Some(format!("{base_url}/v1/statement/{query_id}/0")),
+        stats: TrinoStats::running(0, 1),
+        ..Default::default()
+    }
+}
+
 /// Derive the base URL from the `Host` header, falling back to `localhost:<port>`.
 fn extract_base_url(headers: &HeaderMap, bound_port: u16) -> String {
     let scheme = extract_header(headers, "x-forwarded-proto")
@@ -2036,6 +2078,40 @@ mod tests {
     fn test_next_uri_single_page() {
         let uri = next_uri("http://localhost:8080", "q-123", 0, 1);
         assert!(uri.is_none());
+    }
+
+    #[test]
+    fn started_response_points_at_queued_route_without_data() {
+        let resp = build_started_response("http://h:8080", "q1");
+        assert_eq!(resp.stats.state, "QUEUED");
+        assert_eq!(
+            resp.next_uri.as_deref(),
+            Some("http://h:8080/v1/statement/queued/q1/1")
+        );
+        assert!(resp.data.is_none());
+        assert!(resp.columns.is_none());
+    }
+
+    #[test]
+    fn running_response_increments_queued_token() {
+        let resp = build_running_response("http://h:8080", "q1", 4);
+        assert_eq!(resp.stats.state, "RUNNING");
+        assert_eq!(
+            resp.next_uri.as_deref(),
+            Some("http://h:8080/v1/statement/queued/q1/4")
+        );
+        assert!(resp.data.is_none());
+    }
+
+    #[test]
+    fn finished_redirect_response_points_at_results_route() {
+        let resp = build_finished_redirect_response("http://h:8080", "q1");
+        assert_eq!(resp.stats.state, "RUNNING");
+        assert_eq!(
+            resp.next_uri.as_deref(),
+            Some("http://h:8080/v1/statement/q1/0")
+        );
+        assert!(resp.data.is_none());
     }
 
     #[test]
