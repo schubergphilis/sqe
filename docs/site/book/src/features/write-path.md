@@ -149,6 +149,18 @@ Under `write.merge.mode=merge-on-read`, MERGE routes matched and unmatched rows 
 
 Row-level writes depend on the SQE-rebased fork of [risingwavelabs/iceberg-rust](https://github.com/risingwavelabs/iceberg-rust), vendored at `vendor/iceberg-rust/`. It provides `RewriteFilesAction` / `OverwriteFilesAction` for Copy-on-Write, `PositionDeleteFileWriter` and `EqualityDeleteFileWriter` with `RowDeltaAction` for Merge-on-Read, and `DeletionVectorWriter` for Iceberg V3, none of which are available upstream yet. SQE also carries its own vendor patches (feature-gated catalog backends, `Send + Sync` catalog builders, ADD COLUMN scan projection) and owns write-path components outside the vendor tree, such as the bounded fanout writer. See `vendor/iceberg-rust/README.md` for the patch inventory.
 
+## Memory Safety
+
+Large writes used to be a way to run the coordinator out of memory. The write path now bounds its own memory in three ways.
+
+The straight-line paths stream at constant memory. CTAS and INSERT write Parquet in a streaming loop rather than collecting the full result set first. Flight `DoPut` ingest streams the upload instead of buffering it. Row group by row group, the peak stays flat regardless of how many rows the SELECT produces.
+
+Some row-level paths still have to buffer. Copy-on-Write MERGE reads the target rows, and UPDATE, DELETE, and Merge-on-Read decode each affected file before rewriting it. Those buffers register against the DataFusion memory pool (Layer A). When a buffer would exceed the pool, the write fails with a typed `ResourceExhausted` error instead of OOM-killing the process. The query dies, the coordinator lives, and the caller gets a clear reason.
+
+Partitioned writes can open one Parquet writer per partition, and a high-cardinality partition key multiplies that into memory pressure. The bounded fanout writer caps the number of concurrently open per-partition writers. When a batch arrives for a new partition and the map is full, the least-recently-written writer closes and flushes first, then the new one opens. Cutover trades bounded memory for small-file debt, which `CALL system.rewrite_data_files` repairs. The bounded writer is opt-in: set `fanout_max_open_writers` or `fanout_buffer_budget` (see [Configuration](../deployment/configuration.md)) to turn it on. Left unset, partitioned writes use the unbounded writer.
+
+Two knobs stay off by default until validated against a live catalog. `merge_target_streaming` streams a Copy-on-Write MERGE target from the pinned data files through the merge join as governed operator memory, instead of buffering the whole target. `write_buffer_tracking` is a diagnostic escape hatch: it defaults on, and setting it false disables the Layer A reservations (never the streaming paths) if a deployment ever hits an accounting false positive.
+
 ## Maintenance
 
 Table maintenance runs through `CALL system.*` procedures: `rewrite_data_files` (bin-packs small files), `expire_snapshots`, `remove_orphan_files`, `rewrite_manifests`, plus `register_table` and `drop_table`. See [Iceberg Integration](iceberg.md#maintenance-procedures) for the full surface.

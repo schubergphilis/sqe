@@ -10,6 +10,7 @@ A query's memory cost is dominated by the operators that hold state, not by the 
 - **Sorts.** `ORDER BY` over a large input needs the input in memory or spilled. SQE's external merge sort spills sorted runs to disk and merges them with constant overhead.
 - **Aggregations.** A high-cardinality `GROUP BY` holds one entry per group. This is the documented hard edge: hash-aggregate spill is limited by upstream DataFusion, so a single node can OOM on a query like TPC-H q18 that produces millions of groups. Distribution is the fix.
 - **Result buffering.** Large result sets held before streaming to the client.
+- **Write buffers.** Copy-on-Write MERGE and per-file rewrites for UPDATE, DELETE, and Merge-on-Read buffer rows before committing. These register against the pool, so an oversized write now fails with `ResourceExhausted` instead of OOM-killing the coordinator. See [Write Path, Memory Safety](../features/write-path.md#memory-safety).
 
 Scan volume drives I/O and parallelism, not steady-state memory. The scan optimizations (file and page pruning, late materialization, the S3 I/O pipeline) reduce bytes read; they do not change the fact that the join, sort, and aggregate operators are where memory goes. See [Streaming Execution](../architecture/streaming-execution.md) for the full operator-by-operator behaviour.
 
