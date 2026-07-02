@@ -31,6 +31,7 @@ use sqe_core::{Session, SqeConfig, SqeError};
 use tracing::instrument;
 
 use crate::catalog_ops::{catalog_qualifier, fold_unquoted_ident, parse_table_ref};
+use crate::write_memory::TrackedBatchBuffer;
 use crate::writer::{
     new_upload_tracker, resolve_write_compression, write_data_files_streaming_with_metrics,
     write_data_files_with_metrics, write_equality_delete_files, write_position_delete_files,
@@ -2903,16 +2904,24 @@ impl WriteHandler {
 
         let old_data_files = self.collect_data_files(&table).await?;
 
-        // Read all target batches into memory
-        let mut target_batches: Vec<RecordBatch> = Vec::new();
+        // Read all target batches into memory, tracked against the shared
+        // memory pool. A copy-on-write MERGE materializes the whole target
+        // table; without tracking, a target larger than the pool OOM-kills the
+        // coordinator. Pushing each batch through the reservation makes the
+        // read fail as one query part-way through the loop instead. See
+        // docs/internal/specs/2026-07-02-write-path-memory-safety-design.md.
+        let pool = ctx.runtime_env().memory_pool.clone();
+        let mut target_buf = TrackedBatchBuffer::new(&pool, "merge-target-buffer");
         for data_file in &old_data_files {
             let file_path = data_file.file_path();
             let batches = self.read_parquet_via_table(&table, file_path).await?;
-            target_batches.extend(batches);
+            for batch in batches {
+                target_buf.push(batch)?;
+            }
         }
 
         // Get the target schema from existing data (or table metadata if empty)
-        let target_schema = if let Some(first) = target_batches.first() {
+        let target_schema = if let Some(first) = target_buf.as_slice().first() {
             first.schema()
         } else {
             // Empty table — get the schema from the Iceberg table metadata
@@ -2948,10 +2957,17 @@ impl WriteHandler {
 
         // Register target data as a MemTable in the full session context
         // (which has all catalog tables registered for cross-table subqueries)
-        let target_mem = if target_batches.is_empty() {
+        let target_mem = if target_buf.is_empty() {
             datafusion::datasource::MemTable::try_new(target_schema.clone(), vec![])
         } else {
-            datafusion::datasource::MemTable::try_new(target_schema.clone(), vec![target_batches])
+            // The scratch MemTable holds Arc-backed clones of the tracked
+            // batches; `target_buf` keeps the single reservation and lives to
+            // the end of the merge, so tracking covers the whole operation
+            // without double-counting the shared array data.
+            datafusion::datasource::MemTable::try_new(
+                target_schema.clone(),
+                vec![target_buf.as_slice().to_vec()],
+            )
         }
         .map_err(|e| SqeError::Execution(format!("Failed to create target MemTable: {e}")))?;
         ctx.register_table(&qualified_target_ref, Arc::new(target_mem))
