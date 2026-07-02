@@ -1241,54 +1241,120 @@ async fn submit_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
     // projections containing a wildcard, so it is safe to run unconditionally
     // here, before the DESCRIBE-prepared interception below.
     let effective_sql = sqe_sql::alias_anonymous_select_columns(&effective_sql);
-    let exec_sql = effective_sql.as_str();
+    // Register the query handle before spawning so a fast poll always finds it.
+    let handle = Arc::new(QueryHandle {
+        status: std::sync::Mutex::new(QueryStatus::Queued),
+        notify: tokio::sync::Notify::new(),
+        abort: std::sync::Mutex::new(None),
+        owner_username: session.user.username.clone(),
+        session_update: session_update.clone(),
+        created_at: std::time::Instant::now(),
+    });
+    state.queries.insert(query_id.clone(), handle.clone());
 
-    // Dispatch DESCRIBE prepared / SHOW SESSION / normal execute, then turn a
-    // successful result into a `PaginatedResult`. Both steps live in
-    // `run_statement` / `build_paginated_result` so the async spawn path can
-    // reuse them verbatim.
+    // Move owned state into the background task.
     let show_session_props = incoming_session_properties(&headers);
-    let exec_result = run_statement(
-        state.query_handler.as_ref(),
-        &session,
-        exec_sql,
-        &prepared,
-        &show_session_props,
-    )
-    .await;
+    let task_handler = state.query_handler.clone();
+    let task_results = state.results.clone();
+    let task_handle = handle.clone();
+    let task_query_id = query_id.clone();
+    let task_session = session.clone();
+    let task_sql = effective_sql.clone();
+    let task_prepared = prepared.clone();
+    let task_props = show_session_props;
+    let task_catalog = session.default_catalog.clone();
+    let page_size = state.page_size;
+    let owner = session.user.username.clone();
 
-    match exec_result {
-        Ok(batches) => {
-            let paginated = build_paginated_result(
-                batches,
-                exec_sql,
-                session.default_catalog.as_deref(),
-                state.page_size,
-                session.user.username.clone(),
-            );
-            let response = build_page_response(&base_url, &query_id, &paginated, 0);
-            state.results.insert(query_id, Arc::new(paginated));
+    let task = tokio::spawn(async move {
+        // Drop guard: if `run_statement` panics (or the task is otherwise torn
+        // down) without a terminal status set, force `Failed` on unwind so the
+        // next poll returns an error instead of the client polling a
+        // never-terminal `Running` entry forever (idle eviction would never
+        // fire because each poll resets the idle timer). Normal completion sets
+        // a terminal status first, so this no-ops.
+        struct TerminalGuard(Arc<QueryHandle>);
+        impl Drop for TerminalGuard {
+            fn drop(&mut self) {
+                let mut s = self.0.status.lock().unwrap();
+                if !s.is_terminal() {
+                    *s = QueryStatus::Failed(protocol::TrinoError::user_error(
+                        "query task terminated unexpectedly",
+                        None,
+                    ));
+                    self.0.notify.notify_waiters();
+                }
+            }
+        }
+        let _guard = TerminalGuard(task_handle.clone());
+
+        *task_handle.status.lock().unwrap() = QueryStatus::Running;
+        task_handle.notify.notify_waiters();
+        let result = run_statement(
+            task_handler.as_ref(),
+            &task_session,
+            &task_sql,
+            &task_prepared,
+            &task_props,
+        )
+        .await;
+        match result {
+            Ok(batches) => {
+                let paginated = build_paginated_result(
+                    batches,
+                    &task_sql,
+                    task_catalog.as_deref(),
+                    page_size,
+                    owner,
+                );
+                task_results.insert(task_query_id, Arc::new(paginated));
+                *task_handle.status.lock().unwrap() = QueryStatus::Finished;
+            }
+            Err(sqe_err) => {
+                tracing::warn!(
+                    error_code = %sqe_err.error_code(),
+                    query_id = %task_query_id,
+                    error = %sqe_err,
+                    "Trino query execution failed"
+                );
+                let trino_error =
+                    protocol::TrinoError::from_sqe_error(&sqe_err, Some(&task_query_id));
+                *task_handle.status.lock().unwrap() = QueryStatus::Failed(trino_error);
+            }
+        }
+        task_handle.notify.notify_waiters();
+    });
+    *handle.abort.lock().unwrap() = Some(task.abort_handle());
+
+    // Bounded wait: return the first page inline if the query finished, else a
+    // started response the client polls.
+    await_terminal_or_timeout(&handle, DEFAULT_MAX_WAIT).await;
+
+    let status_is_finished = matches!(*handle.status.lock().unwrap(), QueryStatus::Finished);
+    if status_is_finished {
+        if let Some(paginated) = state.results.get(&query_id) {
+            let response = build_page_response(&base_url, &query_id, paginated.as_ref(), 0);
             let mut resp = (StatusCode::OK, Json(response)).into_response();
             if let Some(ref update) = session_update {
                 apply_session_headers(resp.headers_mut(), update);
             }
-            resp
+            return resp;
         }
-        Err(sqe_err) => {
-            tracing::warn!(
-                error_code = %sqe_err.error_code(),
-                query_id = %query_id,
-                error = %sqe_err,
-                "Trino query execution failed"
-            );
-            let is_rate_limited =
-                sqe_err.error_code() == sqe_core::SqeErrorCode::ResourceExhausted;
-            let trino_error = TrinoError::from_sqe_error(&sqe_err, Some(&query_id));
+    }
+
+    // Failed within the wait: replay the mapped Trino error immediately so fast
+    // failures still surface on the POST rather than forcing a poll. Preserve
+    // the `Retry-After` header the old synchronous arm added for
+    // ResourceExhausted (rate-limit/OOM), detected via the stable error name.
+    {
+        let status = handle.status.lock().unwrap();
+        if let QueryStatus::Failed(ref trino_error) = *status {
+            let is_rate_limited = trino_error.error_name == "RESOURCE_EXHAUSTED";
             let response = TrinoResponse {
                 id: query_id.clone(),
                 info_uri: Some(info_uri(&base_url, &query_id)),
                 stats: TrinoStats::failed(),
-                error: Some(trino_error),
+                error: Some(trino_error.clone()),
                 ..Default::default()
             };
             let mut resp = (StatusCode::OK, Json(response)).into_response();
@@ -1298,9 +1364,20 @@ async fn submit_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
                     axum::http::HeaderValue::from_static("1"),
                 );
             }
-            resp
+            return resp;
         }
     }
+
+    // Still running: hand the client to the queued poll route.
+    let mut resp = (
+        StatusCode::OK,
+        Json(build_started_response(&base_url, &query_id)),
+    )
+        .into_response();
+    if let Some(ref update) = session_update {
+        apply_session_headers(resp.headers_mut(), update);
+    }
+    resp
 }
 
 #[tracing::instrument(skip_all, name = "trino.get_results")]
@@ -1677,6 +1754,104 @@ mod tests {
             auth_rate_limiter: None,
             expose_version: true,
         })
+    }
+
+    /// Executor whose `execute` blocks until `gate` is fired, unless `open` is
+    /// already set (fast-path returning immediately). Lets a test force either
+    /// the "did not finish in the bounded wait" path or the inline-finish path
+    /// deterministically. Returns an empty result set.
+    struct GatedQuery {
+        open: Arc<AtomicBool>,
+        gate: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl TrinoQueryExecutor for GatedQuery {
+        async fn execute(
+            &self,
+            _session: &Session,
+            _sql: &str,
+        ) -> Result<Vec<arrow_array::RecordBatch>, sqe_core::SqeError> {
+            if !self.open.load(Ordering::SeqCst) {
+                self.gate.notified().await;
+            }
+            Ok(vec![])
+        }
+    }
+
+    fn gated_state(
+        open: Arc<AtomicBool>,
+        gate: Arc<tokio::sync::Notify>,
+    ) -> Arc<TrinoState<MockAuthOk, GatedQuery>> {
+        Arc::new(TrinoState::<MockAuthOk, GatedQuery> {
+            authenticator: Arc::new(MockAuthOk),
+            query_handler: Arc::new(GatedQuery { open, gate }),
+            results: build_result_cache(),
+            queries: build_query_registry(),
+            node: NodeContext {
+                version: "test".to_string(),
+                ready: Arc::new(AtomicBool::new(true)),
+                started_at: Instant::now(),
+            },
+            page_size: DEFAULT_PAGE_SIZE,
+            port: 8080,
+            oauth2: None,
+            security: SecurityConfig::default(),
+            auth_rate_limiter: None,
+            expose_version: false,
+        })
+    }
+
+    #[tokio::test]
+    async fn submit_slow_query_returns_started_response_with_next_uri() {
+        let open = Arc::new(AtomicBool::new(false));
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let state = gated_state(open, gate.clone());
+        let resp = submit_query(
+            State(state.clone()),
+            test_peer(),
+            basic_auth_header("alice", "pw"),
+            "SELECT 1".to_string(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: protocol::TrinoResponse = serde_json::from_slice(&body).unwrap();
+        // Did not finish in the bounded wait: a nextUri to the queued route, no data.
+        assert!(json
+            .next_uri
+            .as_deref()
+            .unwrap()
+            .contains("/v1/statement/queued/"));
+        assert!(json.data.is_none());
+        assert_ne!(json.stats.state, "FINISHED");
+        // Release so the background task does not leak.
+        gate.notify_waiters();
+    }
+
+    #[tokio::test]
+    async fn submit_fast_query_returns_inline_finished() {
+        // open=true: execute returns immediately, so the query finishes within
+        // the bounded wait and the POST returns its (empty) result inline.
+        let open = Arc::new(AtomicBool::new(true));
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let state = gated_state(open, gate);
+        let resp = submit_query(
+            State(state.clone()),
+            test_peer(),
+            basic_auth_header("alice", "pw"),
+            "SELECT 1".to_string(),
+        )
+        .await;
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: protocol::TrinoResponse = serde_json::from_slice(&body).unwrap();
+        // A columnless empty result reports FINISHED with no further nextUri.
+        assert_eq!(json.stats.state, "FINISHED");
+        assert!(json.next_uri.is_none());
     }
 
     #[test]
