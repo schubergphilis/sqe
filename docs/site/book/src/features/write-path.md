@@ -24,7 +24,7 @@ Flow:
 5. Stream RecordBatches to Parquet files at constant memory
 6. Commit data files to Iceberg via AppendAction
 
-Add `PARTITIONED BY (year(ts), bucket(16, id), ...)` to partition on write. The standard Iceberg transforms (`year`, `month`, `day`, `hour`, `bucket`, `truncate`, `identity`) are parsed and applied. Partitioned writes route through a bounded fanout writer that caps open per-partition writers and flushes the least-recently-written one when limits are hit.
+Add `PARTITIONED BY (year(ts), bucket(16, id), ...)` to partition on write. The standard Iceberg transforms (`year`, `month`, `day`, `hour`, `bucket`, `truncate`, `identity`) are parsed and applied. Partitioned writes use an unbounded writer by default; set `fanout_max_open_writers` or `fanout_buffer_budget` to opt into a bounded fanout writer that caps open per-partition writers and flushes the least-recently-written one when a limit is hit.
 
 ### CREATE OR REPLACE TABLE
 
