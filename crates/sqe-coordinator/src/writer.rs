@@ -1092,6 +1092,24 @@ impl FanoutLimits {
     }
 }
 
+/// Rough per-open-writer resident estimate: one parquet row group buffered
+/// before it flushes to the multipart upload. Used only to auto-derive the
+/// fanout caps from the pool size. Provisional (spec open decision #4, pending
+/// measurement of real row-group residency).
+const FANOUT_PER_WRITER_EST_BYTES: usize = 128 * 1024 * 1024;
+
+/// Auto-derive `(max_open, byte_budget)` from the node memory pool size, used
+/// to fill whichever fanout knob an operator left at 0 once bounded mode is
+/// active. Generous by design: `max_open` sits above any realistic partition
+/// count (floor 8, cap 64) and the budget is a pool fraction floored at one
+/// writer, so a normally-clustered write never cuts over. See spec open
+/// decision #4.
+pub fn auto_fanout_caps(pool_bytes: usize) -> (usize, usize) {
+    let max_open = (pool_bytes / FANOUT_PER_WRITER_EST_BYTES).clamp(8, 64);
+    let byte_budget = (pool_bytes / 8).max(FANOUT_PER_WRITER_EST_BYTES);
+    (max_open, byte_budget)
+}
+
 /// A memory-bounded partitioned writer (write-path memory safety, Layer B).
 ///
 /// Like the vendored [`FanoutWriter`](iceberg::writer::partitioning::fanout_writer)
@@ -1478,6 +1496,24 @@ mod tests {
             e.1 += f.record_count();
         }
         m
+    }
+
+    #[test]
+    fn auto_fanout_caps_are_generous_and_clamped() {
+        let mb = 1024 * 1024;
+        let gb = 1024 * mb;
+        // 8GB pool: cap hits the 64 ceiling, budget = pool/8 = 1GB.
+        let (max_open, budget) = auto_fanout_caps(8 * gb);
+        assert_eq!(max_open, 64, "large pool clamps to 64");
+        assert_eq!(budget, gb);
+        // Tiny 256MB pool: cap floors at 8, budget floors at one row-group est.
+        let (max_open, budget) = auto_fanout_caps(256 * mb);
+        assert_eq!(max_open, 8, "tiny pool floors at 8");
+        assert_eq!(budget, FANOUT_PER_WRITER_EST_BYTES, "budget floors at one writer");
+        // Mid 4GB pool: 4GB/128MB = 32 open, 512MB budget.
+        let (max_open, budget) = auto_fanout_caps(4 * gb);
+        assert_eq!(max_open, 32);
+        assert_eq!(budget, 512 * mb);
     }
 
     #[test]

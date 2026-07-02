@@ -665,11 +665,22 @@ impl WriteHandler {
     /// Both knobs default to 0 → [`FanoutLimits::unbounded`], the vendored
     /// `TaskWriter` path (byte-for-byte unchanged). Setting
     /// `fanout_max_open_writers` or `fanout_buffer_budget` opts into the bounded
-    /// writer. A malformed `fanout_buffer_budget` string logs a warning and
-    /// disables just the byte budget rather than failing the write.
+    /// writer; once bounded mode is active, a knob left at 0 is auto-derived
+    /// from the coordinator memory pool ([`auto_fanout_caps`]) so the operator
+    /// need only set one. `write_buffer_tracking = false` forces unbounded. A
+    /// malformed `fanout_buffer_budget` string warns and disables just the
+    /// byte budget rather than failing the write.
+    ///
+    /// Note: both-0 stays unbounded on purpose. Making auto-derivation apply
+    /// with no knob set (spec open decision #4 "both-0 = bounded") would route
+    /// every partitioned write through the bounded writer; that default flip is
+    /// held for a stack-validated follow-up.
     fn fanout_limits(&self) -> FanoutLimits {
-        let max_open = self.config.query.fanout_max_open_writers;
-        let byte_budget =
+        if !self.config.query.write_buffer_tracking {
+            return FanoutLimits::unbounded();
+        }
+        let cfg_max = self.config.query.fanout_max_open_writers;
+        let cfg_budget =
             match sqe_core::config::parse_memory_limit(&self.config.query.fanout_buffer_budget) {
                 Ok(b) => b,
                 Err(e) => {
@@ -681,9 +692,21 @@ impl WriteHandler {
                     0
                 }
             };
+
+        // Both unset → unbounded, unchanged default path.
+        if cfg_max == 0 && cfg_budget == 0 {
+            return FanoutLimits::unbounded();
+        }
+
+        // Bounded mode is active; auto-derive whichever knob is still 0 from the
+        // coordinator pool size so the operator only has to set one.
+        let pool_bytes =
+            sqe_core::config::parse_memory_limit(&self.config.coordinator.memory_limit)
+                .unwrap_or(8 * 1024 * 1024 * 1024);
+        let (auto_max, auto_budget) = crate::writer::auto_fanout_caps(pool_bytes);
         FanoutLimits {
-            max_open,
-            byte_budget,
+            max_open: if cfg_max > 0 { cfg_max } else { auto_max },
+            byte_budget: if cfg_budget > 0 { cfg_budget } else { auto_budget },
         }
     }
 
