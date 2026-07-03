@@ -46,6 +46,8 @@ Implementations:
 - **OPA Enforcer**: queries Open Policy Agent for policies (experimental, not yet wired)
 - **Cedar Enforcer**: evaluates AWS Cedar policies locally (experimental, not yet wired)
 
+The Ranger enforcer reads the same `hive` service-def that Apache Spark reads through its Kyuubi authorization plugin, so one policy written once in Ranger enforces byte-identically in SQE and in Spark. See [Fine-grained access control](../features/fine-grained-access-control.md) for the how-to and [Spark / Ranger Parity](../design-notes/sqe-spark-ranger-parity.md) for the validated result.
+
 ## SQL Extensions
 
 ```sql
