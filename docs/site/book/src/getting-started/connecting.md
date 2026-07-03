@@ -75,7 +75,7 @@ curl -s -u jacob:your-password \
 
 The first response carries a `nextUri`; a client follows it until results are exhausted. A Trino JDBC client connects against `http://localhost:8080`. Basic auth is required to populate the session, not just the `X-Trino-User` header.
 
-DBeaver, JDBC, and BI-tool specifics for the Trino path are covered in [Trino HTTP connectivity](../features/trino-http.md). Flight SQL is the recommended protocol for SQE-native clients; reach for Trino HTTP when a tool only speaks Trino.
+The Trino JDBC driver and the Trino CLI refuse to send a username and password over plain HTTP. The endpoint serves plain HTTP, so for password auth put a TLS-terminating reverse proxy in front and connect over `https://`. Bearer-token auth works over plain HTTP if you cannot terminate TLS. See [Connect BI tools](../quickstart/bi-tools.md) for Metabase, Superset, DBeaver, and CLI recipes, and [Trino HTTP connectivity](../features/trino-http.md) for the endpoint reference. Flight SQL is the recommended protocol for SQE-native clients; reach for Trino HTTP when a tool only speaks Trino.
 
 ## Which protocol
 
