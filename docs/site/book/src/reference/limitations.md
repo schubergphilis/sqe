@@ -26,9 +26,9 @@ See [S3 Credential Vending](../design-notes/s3vending.md) for the full design an
 
 ### Fine-grained policy enforcement is off by default
 
-SQE parses the security SQL surface: `GRANT ... MASKED WITH`, `GRANT ... ROWS WHERE`, `SHOW EFFECTIVE GRANTS`, `CHECK ACCESS`. The plan-rewriting enforcement that would apply those row filters and column masks is not the default. The active enforcer is `passthrough`, which returns plans unmodified. The config exposes `[policy] engine = "passthrough"` as the only option today. OPA and Cedar enforcers are planned, not yet wired.
+SQE parses the security SQL surface: `GRANT ... MASKED WITH`, `GRANT ... ROWS WHERE`, `SHOW EFFECTIVE GRANTS`, `CHECK ACCESS`. Plan-rewriting enforcement of row filters and column masks is shipped but off by default: the default `[policy] engine = "passthrough"` returns plans unmodified. Set `engine = "ranger"` (Apache Ranger fine-grained policies, row-filter + data-mask, shared with Spark/Kyuubi) or `engine = "in-memory"` (dev and tests) to turn enforcement on. The `opa` and `cedar` engines are defined in config but not yet wired (selecting them errors today).
 
-Treat the access-control SQL as a documented surface, not a live control you can rely on out of the box. See [Security & Policy](../architecture/security.md), [GRANT and REVOKE](../sql-reference/grant-revoke.md), and the [Roadmap](../development/roadmap.md) (Phase 6, Security Policies, Planned).
+The gap to know about is the default, not the capability: enforcement does nothing until you select an engine. See [Fine-grained access control](../features/fine-grained-access-control.md), [GRANT and REVOKE](../sql-reference/grant-revoke.md), and [Spark / Ranger Parity](../design-notes/sqe-spark-ranger-parity.md).
 
 ### Grant model gaps
 

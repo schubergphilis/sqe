@@ -26,7 +26,7 @@ The consequence to hold in mind: a user who passes the catalog's permission chec
 
 SQE parses a fine-grained access-control SQL surface: column masks (`GRANT ... MASKED WITH`), row filters (`GRANT ... ROWS WHERE`), `SHOW EFFECTIVE GRANTS`, and `CHECK ACCESS`. The enforcement model is plan rewriting: filters and masks are injected into the logical plan before DataFusion's optimizer runs, so the optimizer cannot push a user predicate through a mask to probe raw values. The design follows the PostgreSQL row-level-security model, with no information leakage.
 
-The enforcement is not on by default. The active enforcer is `PassthroughEnforcer`, which returns plans unmodified. The config exposes `[policy] engine = "passthrough"` as the only option today; OPA and Cedar enforcers are planned, not yet wired. Treat the masks and filters as a documented surface, not a live control you can lean on out of the box. See [Security & Policy](security.md), [GRANT and REVOKE](../sql-reference/grant-revoke.md), and [Limitations](../reference/limitations.md#fine-grained-policy-enforcement-is-off-by-default).
+The enforcement is off by default: the default `[policy] engine = "passthrough"` returns plans unmodified. Two enforcers are shipped and wired, and you turn enforcement on by selecting one. `ranger` reads row-filter and column-mask policies from an Apache Ranger `hive` service and feeds the plan rewriter; `in-memory` keeps grants in a hash map for dev and tests. The `opa` and `cedar` engines are defined in config but not yet wired (selecting them errors today). Because the Ranger backend reads the same `hive` service-def that Apache Spark reads through its Kyuubi authorization plugin, one policy enforces byte-identically in SQE and in Spark. See [Fine-grained access control](../features/fine-grained-access-control.md) for the how-to, [Spark / Ranger Parity](../design-notes/sqe-spark-ranger-parity.md) for the cross-engine result, and [GRANT and REVOKE](../sql-reference/grant-revoke.md) for the engine config.
 
 ## The TVF object-store boundary
 
@@ -53,6 +53,6 @@ Flight SQL connections can run with TLS, and optional mTLS adds client-certifica
 | Catalog metadata (list, load, commit) | Yes | User bearer token to the catalog |
 | Write data path (INSERT / MERGE / DELETE) | Yes | Per-table vended credentials |
 | Read data path | No | Static `[storage]` key; per-user vending not yet built |
-| Row filters / column masks | No (off by default) | SQL surface parses; enforcer is passthrough |
+| Row filters / column masks | Off by default; available | Ranger + in-memory enforcers shipped; enable with `[policy] engine`. Ranger shares the policy with Spark/Kyuubi |
 | TVF file access | Engine identity, not user | Scope storage creds and filesystem access minimally |
 | Worker reach | Limited by pushed creds | Today bounded by the static read key |
