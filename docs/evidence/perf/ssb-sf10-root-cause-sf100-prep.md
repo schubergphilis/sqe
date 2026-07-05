@@ -214,6 +214,16 @@ Three verdicts fall out:
   went 727ms at SF1 to 10,261ms at SF10 for q4.1, roughly 14x for 10x rows on a
   memory-tight box.
 
+The full 13-query timed set seals the null end to end: default cap total 84.3s,
+raised cap total 84.4s (per-query deltas all sub-second noise; q1.1/q3.4 sanity
+checks show no regression from the raise either). Result JSONs:
+`benchmarks/results/ssb-sf10-flight-2026-07-05T14:30:24.json` (default) and
+`...T14:32:14.json` (raised cap). The ~84s total vs the clean rig's 31.8s reflects
+the 8GB memory cap plus swap pressure on this box, which is also why the Trino
+compare was deliberately not run here: a Trino JVM grabs its heap eagerly at
+startup on a box with ~120MB truly free, and any ratio against a memory-capped SQE
+would be non-comparable anyway. The fresh SF10 compare belongs on the clean rig.
+
 ## 7. Fix plan, ranked (amended)
 
 1. **Profile the single-stream funnel at SF10 before building anything.** The
