@@ -207,9 +207,17 @@ Three verdicts fall out:
   so its key set never becomes a scan filter. The decode fraction equals
   custkey (0.199) x suppkey (0.204) = 0.041 exactly, at SF1 and SF10 alike, with
   partkey contributing nothing even when its build (32K keys at SF1) was far under
-  the old cap. Why the optimizer picks that side, and which lever flips it (join
-  reordering, statistics, or sideways information passing), is under code
-  investigation.
+  the old cap. The code trace pins the mechanism: DF54 dynamic filters flow
+  build to probe only (no probe-side filter exists), and the build/probe swap
+  decides on degraded statistics. `estimate_join_statistics` returns
+  `total_byte_size: Absent` for every join output (DF54
+  `joins/utils.rs:459`, unconditional), so above the first join the swap falls
+  back to row counts, and the final position of part comes from the logical join
+  order. The effect is positional, which the asymmetry itself proves: three dim
+  filters push, one does not. q4.3 places part as a build (its p_category filter
+  reaches the scan, fraction 0.003 includes it); q4.1/q4.2's ordering does not.
+  The one-read discriminator for which join level mispositions part: the per-join
+  `Statistics` num_rows precision and child order in the q4.1 vs q4.3 EXPLAINs.
 - The throughput funnel scales as predicted: `fetch_time` above the lineorder scan
   went 727ms at SF1 to 10,261ms at SF10 for q4.1, roughly 14x for 10x rows on a
   memory-tight box.
@@ -234,12 +242,23 @@ would be non-comparable anyway. The fresh SF10 compare belongs on the clean rig.
    re-evaluation) and why #235 failed to move it. `fetch_time` per partition is the
    metric. Only then re-attempt source-parallel output partitioning (the Phase 2
    broadcast-parallel-probe design in `sf10-bucket-a-scan-parallelism-design.md`).
-2. **Make the partkey semijoin pushable in q4.1/q4.2.** Part must become a build
-   side whose key set feeds the fact scan, via join reordering, better statistics
-   for the side picker, or sideways information passing (the currently dead
-   `predicate_transfer` building blocks in sqe-planner). Worth a further ~2.5x cut
-   of q4.1's survivors (0.041 to ~0.016). The code investigation into why the
-   optimizer picks part as probe decides which lever is cheapest.
+2. **Make the partkey semijoin pushable in q4.1/q4.2.** Worth a further ~2.5x cut
+   of q4.1's survivors (0.041 to ~0.016). Three levers, effort-ranked by the code
+   trace:
+   - Fastest: a targeted SQE `PhysicalOptimizerRule` that forces part onto the
+     build side of the outermost fact join, modeled on the existing
+     `ParallelProbeScanRule` (`crates/sqe-coordinator/src/parallel_probe_scan.rs`).
+     Narrow but needs no stats and no new machinery.
+   - Medium, uncertain: NDV statistics (sketch at write time, attached via
+     `cached_statistics`) to sharpen the logical reorder. Two upstream gaps cap
+     the payoff: DF54 reports join-output byte size as Absent unconditionally,
+     and Iceberg carries no NDV today.
+   - Largest and most general: wire the dead `predicate_transfer` module
+     (`crates/sqe-planner/src/predicate_transfer.rs`, 553 lines, zero callers).
+     Sideways information passing is direction-independent, so it sidesteps the
+     build/probe problem entirely and is the flagship roadmap lever. Caveat: its
+     `MAX_PREDICATE_TRANSFER_VALUES=10_000` cap excludes the 320K-key part build
+     as sized; it needs a raise or a bloom/hash variant for this case.
 3. **Distributed SSB stays gated on shipping membership sets to workers.** The
    serialized range predicate cannot carry hash-set selectivity, which is why
    distributed-2w (53.6s) is slower than single-node (42.0s) on the level rig. The
