@@ -1,7 +1,10 @@
 # SSB SF10 root cause and SF100 preparation
 
-Date: 2026-07-05. Status: root cause pinned to three layers; SF100 blocker list
-verified in code. Supersedes the "cause pinned to engine maturity" wording of
+Date: 2026-07-05, amended same day after an SF10 instrumented run on the freed dev
+box (section 6). Status: root cause pinned to three layers; the InList-cap fix
+candidate from the first version is REFUTED by a null A/B and replaced by a
+join-structure finding. SF100 blocker list verified in code. Supersedes the "cause
+pinned to engine maturity" wording of
 `docs/superpowers/specs/2026-06-25-ssb-sf10-gap-investigation-findings.md` with a
 measured mechanism. Companion evidence: `sf10-slow-queries.md`,
 `sf10-loser-aggregation.md`, `sf10-bucket-a-scan-parallelism-design.md`,
@@ -16,12 +19,17 @@ decomposes into three layers:
 
 1. **q1.x and q3.4 are healthy.** Direct fact predicates prune row groups; SQE wins
    or ties these at SF10.
-2. **q4.1 and q4.2 lose their part filter at SF10.** Their build side
-   (`p_mfgr = 'MFGR#1' OR 'MFGR#2'`) is 320,000 distinct partkeys, which crosses
-   DataFusion's InList pushdown cap (`hash_join_inlist_pushdown_max_distinct_values`,
-   SQE default 65,536). Above the cap the join emits an opaque hash-map probe; only
-   useless min/max bounds survive translation to the scan. One config raise recovers
-   this layer.
+2. **q4.1 and q4.2 never get a partkey filter on the fact scan, at any scale.**
+   The first version of this doc blamed DataFusion's InList pushdown cap
+   (`hash_join_inlist_pushdown_max_distinct_values`, SQE default 65,536), which
+   their 320K-key part build crosses at SF10. The SF10 A/B refuted that: raising
+   the cap to 1,048,576 changed `rows_decoded` by zero. The real cause is join
+   structure. In the physical plan, part sits on the PROBE side of the outermost
+   join with the lineorder stream as the build, so the partkey key set is never a
+   scan-pushable filter regardless of cap. Selectivity arithmetic confirms it at
+   both scales: the observed decode fraction is exactly custkey x suppkey with
+   partkey contributing nothing (SF1 0.039, SF10 0.041). The lever is join order
+   or sideways information passing, not a config raise.
 3. **Everything else is single-output-partition scan throughput.** The dynamic
    filters arm correctly and cut decode proportionally at every practical key count.
    What they cannot cut is I/O (uniformly scattered FKs put matches in every row
@@ -72,12 +80,13 @@ Single cold run per query; the SF1 noise floor is 5 to 12 percent.
 - **Seal-race timing.** The dim hash builds seal in under 1ms; `filter_wait_time`
   on the fact scan measured 0.18ms; raising `runtime_filters.wait_ms` from 100 to
   1000 changed nothing (identical `rows_decoded`). Refuted.
-- **Filter shape degradation as the suite-wide cause.** A controlled key-count sweep
-  (section 4) shows the hash-set RowFilter cutting decode proportionally at every
-  step up to 64,051 build-side keys. q3.1/q3.2/q3.3 join no part table, cross no
-  threshold, and still lose in the same band. q4.3 has every filter armed at SF10
-  (largest build 32,000 keys) and loses hardest. Refuted as primary driver;
-  confirmed as a real secondary effect for q4.1/q4.2 only (section 5).
+- **Filter shape degradation, both as suite-wide cause and as the q4.1/q4.2
+  cause.** A controlled key-count sweep (section 4) shows the hash-set RowFilter
+  cutting decode proportionally at every step up to 64,051 build-side keys.
+  q3.1/q3.2/q3.3 join no part table, cross no threshold, and still lose in the same
+  band. q4.3 has every filter armed at SF10 (largest build 32,000 keys) and loses
+  hardest. The SF10 cap A/B (section 6) then refuted the cap even for q4.1/q4.2:
+  their missing partkey filter is join structure, not shape.
 - **Raw decode throughput.** ClickBench, which is decode-heavy with no joins, wins
   2.06x. Refuted.
 - **Scan task parallelism inside the file.** The #131 intra-file split is live on
@@ -129,7 +138,7 @@ semijoin. Both costs scale linearly with fact size while the output stays one
 partition. That is the SF1-to-SF10 crossover: the same fraction survives, but 10x
 rows pay key decode and 10x survivors cross the single-stream funnel.
 
-## 5. The threshold that is real but narrow
+## 5. The threshold that is real but, it turns out, not binding
 
 The shape decision lives in DataFusion 54's hash join build
 (`datafusion-physical-plan/src/joins/hash_join/exec.rs:2036-2060`): the dynamic
@@ -156,21 +165,58 @@ part 80K x SF, date 2,557 fixed):
 
 Only q4.1 and q4.2 cross, and only on the partkey filter (their custkey and suppkey
 filters still arm). The Int32 byte cost of 320K keys is 1.28MB, under the 4MB byte
-cap, so the value cap is the binding one. There is no second cap downstream: the
-vendored `MembershipSet` builds an uncapped hash set, and `IN_PREDICATE_LIMIT=200`
-in iceberg-rust gates only min/max pruning, not the RowFilter. Caveat: SF10 arming
-for the "under" rows is inferred from key counts, not yet measured; the clean-rig
-discriminator in section 7 converts it to fact.
+cap, so the value cap would be the binding one. There is no second cap downstream:
+the vendored `MembershipSet` builds an uncapped hash set, and `IN_PREDICATE_LIMIT=200`
+in iceberg-rust gates only min/max pruning, not the RowFilter.
 
-## 6. Fix plan, ranked
+The cap analysis above is correct about the code and wrong about the bottleneck.
+The SF10 measurement (next section) shows the partkey filter is absent from the
+fact scan for a structural reason that no cap value changes: the plan never makes
+part a build side that feeds the scan.
 
-1. **Raise `runtime_filter_inlist_max_values` past 320K and A/B q4.1/q4.2 at SF10.**
-   Cheapest lever, targets the two queries that carry ~32 percent of the gap. Watch
-   two costs: seal-time construction of a 320K-literal InList, and TPC-H/TPC-DS
-   regression (the cap exists for a reason upstream). If seal cost bites, the
-   alternative is teaching the pushdown to hand over the build's key set as a
-   hash-set predicate directly instead of an InListExpr.
-2. **Profile the single-stream funnel at SF10 before building anything.** The
+## 6. Measured at SF10: prediction 1 confirmed, cap fix refuted
+
+Instrumented run on ssb_sf10 on the freed dev box (2026-07-05): 60,000,000
+lineorder rows landed as 4 unsorted data files (~1.74GB; sort-on-write OOMed and
+the loader took its documented unsorted failover). Coordinator capped at 8GB with
+spill, so wall times are not comparable to the 31GB clean rig; counters are
+cap-independent and are the signal.
+
+| query | rows_decoded / 60M | fraction | bytes_scanned | pushed_filters | fetch_time above scan |
+|---|---:|---:|---:|---:|---:|
+| q1.1 | 1,122,558 | 0.019 | 454MB | 1 | 3,801ms |
+| q2.1 | 488,179 | 0.008 | 783MB | 3 | 5,936ms |
+| q3.1 | 2,024,270 | 0.034 | 761MB | 3 | 7,099ms |
+| q4.1 | 2,433,461 | 0.041 | 1,178MB | 3 | 10,261ms |
+| q4.2 | 693,974 | 0.012 | 1,178MB | 3 | 14,579ms |
+| q4.3 | 150,659 | 0.003 | 1,178MB | 3 | 16,068ms |
+
+Three verdicts fall out:
+
+- **Prediction 1 confirmed.** q2.1/q3.1/q4.3 arm their filters at SF10 and decode
+  0.3 to 3.4 percent of the fact table. The suite-wide loss happens WITH working
+  filters, which pins it on throughput, not filtering.
+- **The cap fix is a null.** Raising `runtime_filter_inlist_max_values` from
+  65,536 to 1,048,576 (verified live in `information_schema.df_settings`, byte cap
+  raised alongside) left `rows_decoded` identical to the row: q4.1
+  2,433,461 before and after, q4.2 693,974 before and after, `pushed_filters`
+  still 3.
+- **The partkey filter is missing structurally.** q4.1 joins four dims but only
+  three filters (orderdate, custkey, suppkey) reach the scan. Part is the probe
+  side of the outermost join, with the accumulated lineorder stream as the build,
+  so its key set never becomes a scan filter. The decode fraction equals
+  custkey (0.199) x suppkey (0.204) = 0.041 exactly, at SF1 and SF10 alike, with
+  partkey contributing nothing even when its build (32K keys at SF1) was far under
+  the old cap. Why the optimizer picks that side, and which lever flips it (join
+  reordering, statistics, or sideways information passing), is under code
+  investigation.
+- The throughput funnel scales as predicted: `fetch_time` above the lineorder scan
+  went 727ms at SF1 to 10,261ms at SF10 for q4.1, roughly 14x for 10x rows on a
+  memory-tight box.
+
+## 7. Fix plan, ranked (amended)
+
+1. **Profile the single-stream funnel at SF10 before building anything.** The
    evidence says output-partitioning is the suite-wide wall, but the opt-in
    ParallelProbeScanRule (#235) measured perf-neutral (34.1s on, 31.7s off), so a
    naive multi-output scan is not the fix. Instrument where the merged stream
@@ -178,16 +224,23 @@ discriminator in section 7 converts it to fact.
    re-evaluation) and why #235 failed to move it. `fetch_time` per partition is the
    metric. Only then re-attempt source-parallel output partitioning (the Phase 2
    broadcast-parallel-probe design in `sf10-bucket-a-scan-parallelism-design.md`).
+2. **Make the partkey semijoin pushable in q4.1/q4.2.** Part must become a build
+   side whose key set feeds the fact scan, via join reordering, better statistics
+   for the side picker, or sideways information passing (the currently dead
+   `predicate_transfer` building blocks in sqe-planner). Worth a further ~2.5x cut
+   of q4.1's survivors (0.041 to ~0.016). The code investigation into why the
+   optimizer picks part as probe decides which lever is cheapest.
 3. **Distributed SSB stays gated on shipping membership sets to workers.** The
    serialized range predicate cannot carry hash-set selectivity, which is why
    distributed-2w (53.6s) is slower than single-node (42.0s) on the level rig. The
    DF54 `DynamicFilter` protobuf spike from `roadmap-tracker.md` is the entry point.
-4. **Do not spend on: longer `wait_ms`, `clustering_skip` as an SSB fix (11 percent,
+4. **Do not spend on: raising `runtime_filter_inlist_max_values` (measured null at
+   SF10, section 6), longer `wait_ms`, `clustering_skip` as an SSB fix (11 percent,
    real but small), bloom filters for I/O on scattered keys (every page has matches;
    the sweep's constant `bytes_scanned` shows page skipping cannot win), or more
    filter wiring (the filters already arm and cut decode).**
 
-## 7. SF100 readiness
+## 8. SF100 readiness
 
 Blockers in dependency order, states verified in code this session:
 
@@ -204,7 +257,7 @@ Blockers in dependency order, states verified in code this session:
 2. **Sort-on-write must degrade, not die.** The lo_orderdate clustering sort OOMs
    at scale (`ExternalSorterMerge` reports `can_spill=false`) and the loader falls
    back to an unsorted write, silently giving up q1.x pruning at exactly the scale
-   where it matters most.
+   where it matters most. Observed live during the SF10 load this session.
 3. **Shuffle has no spill.** The in-memory bounded-channel shuffle bounds every
    distributed SF100 run (`sf100-scaling-risks.md` risks 2 and 5).
 4. **Worker scan backpressure.** Decode outruns Flight shipment and exhausts the
@@ -216,14 +269,14 @@ Blockers in dependency order, states verified in code this session:
    prerequisites for loading the dataset at all; measurement before they land is
    not possible on any box.
 
-The immediate SF10 confirmation run for section 6 needs only the clean rig and the
-one-line instrumentation: dump named Count/Time metrics in
-`crates/sqe-coordinator/src/explain.rs` `walk_analyze`, run with
-`RUST_LOG='sqe_coordinator=info,sqe_catalog=debug,warn'`, and read `rows_decoded`
-for q2.1/q3.1/q4.3 (expected well under 60M if the arming inference holds) and
-q4.1/q4.2 (expected near 60M on the partkey path until fix 1 lands).
+The SF10 counter run originally planned for the clean rig happened on the freed dev
+box instead (section 6). What still needs the clean rig: comparable wall-clock
+ratios vs Trino on the current build, the funnel profiling of fix 1, and any
+regression check for whatever lever fix 2 turns out to be. The instrumentation
+recipe: dump named Count/Time metrics in `crates/sqe-coordinator/src/explain.rs`
+`walk_analyze`, run with `RUST_LOG='sqe_coordinator=info,sqe_catalog=debug,warn'`.
 
-## 8. Side findings
+## 9. Side findings
 
 - **SSB has no value-level oracle.** `benchmarks/expected/canonical_rows_duckdb.json`
   has no `ssb` key, so compare runs check row counts only, and SSB money columns are
