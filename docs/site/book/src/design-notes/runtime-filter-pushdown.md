@@ -5,6 +5,14 @@
 > Pairs with upstream issue
 > [apache/iceberg-rust#2376](https://github.com/apache/iceberg-rust/issues/2376).
 
+> **Update 2026-07-05.** Parts of this log are historical. The resolution below
+> says `with_dynamic_predicate` stays intentionally absent from SQE's
+> `IcebergScanExec`; since MR #220 the current code registers it by default,
+> with a seal-wait (`runtime_filters.wait_ms`) and the #132 clustering-skip
+> gate. Measurements on the current code, plus the SSB root-cause verdict this
+> log fed into, live in `docs/evidence/perf/ssb-sf10-root-cause-sf100-prep.md`.
+> Treat the code as authoritative where the two disagree.
+
 ## Problem
 
 DataFusion 53 has a runtime / dynamic filter pushdown path: a `HashJoinExec`
