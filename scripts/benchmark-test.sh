@@ -20,16 +20,18 @@ set -euo pipefail
 #
 # External data source (skip the generate step, load pre-published parquet
 # straight from an S3 bucket — see benchmark-publish-data.sh):
-#   BENCH_DATA_SOURCE=s3://sqe-testlake \
+#   BENCH_DATA_SOURCE=s3://sqe-benchmark \
 #   BENCH_S3_ENDPOINT=https://s3.example.com \
 #   BENCH_S3_PROFILE=storagegrid \
 #   BENCH_SCALE=0.1 ./scripts/benchmark-test.sh tpch
 #
 # External warehouse (Iceberg tables on an external S3 endpoint instead of
-# RustFS; with --compare-trino both engines then read the same endpoint):
+# RustFS; with --compare-trino both engines then read the same endpoint).
+# Convention: sqe-benchmark holds the generated source data, sqe-testlake
+# is the Polaris-connected warehouse:
 #   BENCH_WAREHOUSE=external \
-#   BENCH_WAREHOUSE_LOCATION=s3://sqe-testlake/warehouse \
-#   BENCH_DATA_SOURCE=s3://sqe-testlake \
+#   BENCH_WAREHOUSE_LOCATION=s3://sqe-testlake \
+#   BENCH_DATA_SOURCE=s3://sqe-benchmark \
 #   BENCH_S3_ENDPOINT=https://s3.example.com \
 #   BENCH_S3_PROFILE=storagegrid \
 #   BENCH_SCALE=1 ./scripts/benchmark-test.sh --compare-trino tpch ssb
@@ -50,6 +52,11 @@ BENCH_PORT_TRINO="18080"
 COMPARE_TRINO="${COMPARE_TRINO:-}"
 TRINO_PORT="38080"
 TRINO_IMAGE="${TRINO_IMAGE:-trinodb/trino:481}"
+# Optional container memory cap (e.g. TRINO_MEMORY=12g). The image sizes
+# the JVM heap at 80% of container memory; without a cap that is 80% of
+# the HOST's RAM — on a shared box that starves the coordinator and the
+# comparison. Leave empty for the previous unbounded behavior.
+TRINO_MEMORY="${TRINO_MEMORY:-}"
 
 # S3 credentials (match test stack)
 S3_ACCESS_KEY="${S3_ACCESS_KEY:-s3admin}"
@@ -394,9 +401,14 @@ TRINOEOF
     docker stop trino-bench 2>/dev/null || true
     sleep 1
 
+    TRINO_MEMORY_ARGS=()
+    if [ -n "$TRINO_MEMORY" ]; then
+        TRINO_MEMORY_ARGS=(--memory "$TRINO_MEMORY")
+    fi
     TRINO_CONTAINER=$(docker run -d --rm \
         --name trino-bench \
         -p "${TRINO_PORT}:8080" \
+        ${TRINO_MEMORY_ARGS[@]+"${TRINO_MEMORY_ARGS[@]}"} \
         -v /tmp/trino-bench/catalog/iceberg.properties:/etc/trino/catalog/iceberg.properties:ro \
         -v /tmp/trino-bench/config.properties:/etc/trino/config.properties:ro \
         "$TRINO_IMAGE")

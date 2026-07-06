@@ -16,14 +16,14 @@ set -euo pipefail
 # regenerates or re-uploads existing ones. Use BENCH_FORCE=1 to overwrite.
 #
 # Usage:
-#   BENCH_DATA_BUCKET=s3://sqe-testlake \
+#   BENCH_DATA_BUCKET=s3://sqe-benchmark \
 #   BENCH_S3_PROFILE=storagegrid \
 #   BENCH_S3_ENDPOINT=https://s3.example.com \
 #   BENCH_SCALE=0.1 ./scripts/benchmark-publish-data.sh            # all benchmarks
 #   BENCH_SCALE=1   ./scripts/benchmark-publish-data.sh tpch ssb   # only these
 #
 # Environment:
-#   BENCH_DATA_BUCKET   target bucket URL, e.g. s3://sqe-testlake (required)
+#   BENCH_DATA_BUCKET   target bucket URL, e.g. s3://sqe-benchmark (required)
 #   BENCH_S3_ENDPOINT   S3 endpoint URL (required)
 #   BENCH_S3_PROFILE    aws CLI profile holding the credentials (default: default)
 #   BENCH_SCALE         scale factor (default: 0.1)
@@ -44,7 +44,7 @@ BENCH_FORCE="${BENCH_FORCE:-0}"
 
 if [ -z "$BENCH_DATA_BUCKET" ] || [ -z "$BENCH_S3_ENDPOINT" ]; then
     echo "ERROR: BENCH_DATA_BUCKET and BENCH_S3_ENDPOINT must be set." >&2
-    echo "  e.g. BENCH_DATA_BUCKET=s3://sqe-testlake BENCH_S3_ENDPOINT=https://s3.example.com" >&2
+    echo "  e.g. BENCH_DATA_BUCKET=s3://sqe-benchmark BENCH_S3_ENDPOINT=https://s3.example.com" >&2
     exit 1
 fi
 if ! command -v aws >/dev/null 2>&1; then
