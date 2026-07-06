@@ -248,6 +248,15 @@ pub struct QueryConfig {
     /// clean (non-swapping) benchmark rig.
     #[serde(default)]
     pub parallel_probe_scan: bool,
+    /// Swap the dimension scan onto the build side of star-tail CollectLeft
+    /// joins when the join-output side has no byte statistics but the dim
+    /// scan has a known size under the broadcast threshold. Fixes the
+    /// SSB q4.x class where cascaded cardinality underestimates keep the
+    /// fact stream as the build and the dim's semijoin filter never reaches
+    /// the fact scan. Default true; bounded downside by construction (a
+    /// wrong swap collects at most broadcast-threshold bytes).
+    #[serde(default = "default_true")]
+    pub dim_build_swap: bool,
     /// Idle-timeout (seconds) for an active result stream. When the gRPC
     /// client has not pulled a batch within this window the coordinator
     /// aborts the stream and releases its concurrency permit. Bounds the
@@ -342,6 +351,7 @@ impl Default for QueryConfig {
             star_schema_reorder: default_true(),
             star_schema_min_ratio: default_star_schema_min_ratio(),
             parallel_probe_scan: false,
+            dim_build_swap: true,
             stream_idle_timeout_secs: default_stream_idle_timeout(),
             distributed_scan_pushdown: default_true(),
             runtime_filter_inlist_max_values: default_runtime_filter_inlist_max_values(),

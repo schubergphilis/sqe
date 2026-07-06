@@ -17,11 +17,51 @@ use sqe_policy::PolicyEnforcer;
 
 pub struct ExplainHandler {
     pub policy_enforcer: Arc<dyn PolicyEnforcer>,
+    /// Plan-shape settings mirrored from `QueryConfig` so EXPLAIN output and
+    /// EXPLAIN ANALYZE execution match what `query_handler` actually runs.
+    star_schema_reorder: bool,
+    star_schema_min_ratio: usize,
+    dim_build_swap: bool,
 }
 
 impl ExplainHandler {
-    pub fn new(policy_enforcer: Arc<dyn PolicyEnforcer>) -> Self {
-        Self { policy_enforcer }
+    pub fn new(
+        policy_enforcer: Arc<dyn PolicyEnforcer>,
+        query_config: &sqe_core::config::QueryConfig,
+    ) -> Self {
+        Self {
+            policy_enforcer,
+            star_schema_reorder: query_config.star_schema_reorder,
+            star_schema_min_ratio: query_config.star_schema_min_ratio,
+            dim_build_swap: query_config.dim_build_swap,
+        }
+    }
+
+    /// Apply the same post-planning plan-shape rules `query_handler` applies,
+    /// so EXPLAIN shows (and EXPLAIN ANALYZE measures) the executed plan
+    /// rather than the raw planner output.
+    fn apply_plan_shape_rules(
+        &self,
+        ctx: &SessionContext,
+        mut plan: Arc<dyn ExecutionPlan>,
+    ) -> Arc<dyn ExecutionPlan> {
+        use datafusion::physical_optimizer::PhysicalOptimizerRule;
+        if self.star_schema_reorder {
+            let rule = sqe_planner::StarSchemaReorderRule::new(self.star_schema_min_ratio);
+            match rule.optimize(plan.clone(), &datafusion::config::ConfigOptions::new()) {
+                Ok(optimized) => plan = optimized,
+                Err(e) => tracing::debug!(error = %e, "EXPLAIN: star-schema reorder failed"),
+            }
+        }
+        if self.dim_build_swap {
+            let state = ctx.state();
+            let rule = crate::dim_build_swap::DimBuildSwapRule::new();
+            match rule.optimize(plan.clone(), state.config_options()) {
+                Ok(optimized) => plan = optimized,
+                Err(e) => tracing::debug!(error = %e, "EXPLAIN: dim-build swap failed"),
+            }
+        }
+        plan
     }
 
     /// EXPLAIN <query> — returns logical and physical plan as text, no execution.
@@ -49,6 +89,7 @@ impl ExplainHandler {
             .create_physical_plan(&enforced)
             .await
             .map_err(|e| SqeError::Execution(format!("Physical planning failed: {e}")))?;
+        let physical = self.apply_plan_shape_rules(ctx, physical);
 
         let physical_str = format!("{}", displayable(physical.as_ref()).indent(true));
 
@@ -107,6 +148,7 @@ impl ExplainHandler {
             .create_physical_plan(&enforced)
             .await
             .map_err(|e| SqeError::Execution(format!("Physical planning failed: {e}")))?;
+        let physical = self.apply_plan_shape_rules(ctx, physical);
         let physical_plan_ms = physical_plan_start.elapsed().as_secs_f64() * 1000.0;
 
         // Execute — populates metrics on each node in-place
@@ -239,6 +281,7 @@ impl ExplainHandler {
             .create_physical_plan(&enforced)
             .await
             .map_err(|e| SqeError::Execution(format!("Physical planning failed: {e}")))?;
+        let physical = self.apply_plan_shape_rules(ctx, physical);
         let physical_plan_ms = physical_plan_start.elapsed().as_secs_f64() * 1000.0;
 
         // Execute — populates per-node metrics in-place
