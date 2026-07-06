@@ -24,6 +24,15 @@ set -euo pipefail
 #   BENCH_S3_ENDPOINT=https://s3.example.com \
 #   BENCH_S3_PROFILE=storagegrid \
 #   BENCH_SCALE=0.1 ./scripts/benchmark-test.sh tpch
+#
+# External warehouse (Iceberg tables on an external S3 endpoint instead of
+# RustFS; with --compare-trino both engines then read the same endpoint):
+#   BENCH_WAREHOUSE=external \
+#   BENCH_WAREHOUSE_LOCATION=s3://sqe-testlake/warehouse \
+#   BENCH_DATA_SOURCE=s3://sqe-testlake \
+#   BENCH_S3_ENDPOINT=https://s3.example.com \
+#   BENCH_S3_PROFILE=storagegrid \
+#   BENCH_SCALE=1 ./scripts/benchmark-test.sh --compare-trino tpch ssb
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -95,6 +104,41 @@ else
     DATA_S3_REGION="$S3_REGION"
 fi
 
+# ── External warehouse (optional) ────────────────────────────
+# BENCH_WAREHOUSE=external puts the Iceberg WAREHOUSE (where the loaded
+# tables live) on an external S3 endpoint instead of RustFS: Polaris is
+# recreated with matching credentials, the catalog's storage config
+# points at the endpoint, SQE's [storage] block is rewritten in the temp
+# config, and the Trino comparison container reads the same endpoint —
+# both engines then fetch over the identical network path.
+#   BENCH_WAREHOUSE=external \
+#   BENCH_WAREHOUSE_LOCATION=s3://sqe-testlake/warehouse \
+#   BENCH_S3_ENDPOINT=https://s3.example.com BENCH_S3_PROFILE=... \
+#   ./scripts/benchmark-test.sh --compare-trino tpch
+BENCH_WAREHOUSE="${BENCH_WAREHOUSE:-local}"
+BENCH_WAREHOUSE_LOCATION="${BENCH_WAREHOUSE_LOCATION:-}"
+
+case "$BENCH_WAREHOUSE" in
+    local|external) ;;
+    *)
+        echo "ERROR: BENCH_WAREHOUSE must be 'local' or 'external', got: '$BENCH_WAREHOUSE'" >&2
+        exit 1
+        ;;
+esac
+
+if [ "$BENCH_WAREHOUSE" = "external" ]; then
+    if [ -z "$BENCH_S3_ENDPOINT" ] || [ -z "$BENCH_WAREHOUSE_LOCATION" ]; then
+        echo "ERROR: BENCH_WAREHOUSE=external requires BENCH_S3_ENDPOINT and BENCH_WAREHOUSE_LOCATION" >&2
+        exit 1
+    fi
+    WH_S3_ACCESS_KEY="${WH_S3_ACCESS_KEY:-$(aws configure get aws_access_key_id --profile "$BENCH_S3_PROFILE")}"
+    WH_S3_SECRET_KEY="${WH_S3_SECRET_KEY:-$(aws configure get aws_secret_access_key --profile "$BENCH_S3_PROFILE")}"
+    if [ -z "$WH_S3_ACCESS_KEY" ] || [ -z "$WH_S3_SECRET_KEY" ]; then
+        echo "ERROR: could not resolve S3 credentials from profile '$BENCH_S3_PROFILE'" >&2
+        exit 1
+    fi
+fi
+
 # Build profile: `release` (default) uses `cargo build --release` and
 # runs binaries out of `target/release/`. `debug` skips `--release` for
 # faster incremental rebuilds and runs out of `target/debug/`. The debug
@@ -156,10 +200,31 @@ echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo "  Starting test stack..."
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+if [ "$BENCH_WAREHOUSE" = "external" ]; then
+    # Polaris performs the warehouse's S3 operations itself (metadata
+    # writes, drop-with-purge), so it must carry the external endpoint
+    # and credentials. Recreate so the env change applies; Polaris here
+    # is in-memory, the bootstrap below repopulates it.
+    export POLARIS_S3_ENDPOINT="$BENCH_S3_ENDPOINT"
+    export POLARIS_S3_ACCESS_KEY="$WH_S3_ACCESS_KEY"
+    export POLARIS_S3_SECRET_KEY="$WH_S3_SECRET_KEY"
+    export POLARIS_S3_REGION="$BENCH_S3_REGION"
+    # No STS on S3-compatible endpoints like StorageGRID: skip Polaris'
+    # credential subscoping or CREATE TABLE fails with STS 405.
+    export POLARIS_SKIP_SUBSCOPING=true
+    docker compose -f "$COMPOSE_FILE" up -d --force-recreate polaris
+fi
 docker compose -f "$COMPOSE_FILE" up -d
 
 # Bootstrap (creates bucket, warehouse, grants)
-"$SCRIPT_DIR/bootstrap-test.sh"
+if [ "$BENCH_WAREHOUSE" = "external" ]; then
+    WAREHOUSE_MODE=external \
+    EXT_S3_ENDPOINT="$BENCH_S3_ENDPOINT" \
+    WAREHOUSE_LOCATION="$BENCH_WAREHOUSE_LOCATION" \
+        "$SCRIPT_DIR/bootstrap-test.sh"
+else
+    "$SCRIPT_DIR/bootstrap-test.sh"
+fi
 echo ""
 
 # ── Start SQE coordinator in background ───────────────────────
@@ -169,18 +234,29 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 SQE_LOG_FILE="/tmp/sqe-bench-coord-$$.log"
 SQE_CONFIG="$ROOT_DIR/tests/sqe-test.toml"
 
-# With an external data source, read_parquet() carries an inline
-# `endpoint =>` override, and the coordinator's SSRF gate (issue #46)
-# rejects endpoint hosts that are not in `[storage.tvf] allowed_http_hosts`.
-# Generate a temp config that allowlists exactly the data endpoint's host.
-if [ -n "$EXTERNAL_DATA" ]; then
+# Generate a temp coordinator config when anything is external:
+# - External data source: read_parquet() carries an inline `endpoint =>`
+#   override, and the coordinator's SSRF gate (issue #46) rejects endpoint
+#   hosts that are not in `[storage.tvf] allowed_http_hosts`.
+# - External warehouse: SQE reads/writes the Iceberg tables with its
+#   [storage] credentials, so that block must point at the external
+#   endpoint instead of RustFS.
+if [ -n "$EXTERNAL_DATA" ] || [ "$BENCH_WAREHOUSE" = "external" ]; then
     ENDPOINT_HOST=$(python3 -c "from urllib.parse import urlparse; import sys; print(urlparse(sys.argv[1]).hostname or '')" "$BENCH_S3_ENDPOINT")
     if [ -z "$ENDPOINT_HOST" ]; then
         echo "ERROR: could not parse host from BENCH_S3_ENDPOINT=$BENCH_S3_ENDPOINT" >&2
         exit 1
     fi
     SQE_CONFIG_EXT="/tmp/sqe-bench-config-$$.toml"
+    touch "$SQE_CONFIG_EXT" && chmod 600 "$SQE_CONFIG_EXT"
+    WH_MODE="$BENCH_WAREHOUSE" \
+    WH_ENDPOINT="$BENCH_S3_ENDPOINT" \
+    WH_ACCESS_KEY="${WH_S3_ACCESS_KEY:-}" \
+    WH_SECRET_KEY="${WH_S3_SECRET_KEY:-}" \
+    WH_REGION="$BENCH_S3_REGION" \
     python3 - "$ROOT_DIR/tests/sqe-test.toml" "$SQE_CONFIG_EXT" "$ENDPOINT_HOST" <<'PYEOF'
+import os
+import re
 import sys
 src, dst, host = sys.argv[1:4]
 text = open(src).read()
@@ -189,10 +265,26 @@ assert anchor in text, "tests/sqe-test.toml is missing the [storage.tvf] section
 # Include the loopback hosts so local-endpoint TVF calls keep working:
 # an explicit allowed_http_hosts REPLACES the (empty) default entirely.
 text = text.replace(anchor, anchor + f'allowed_http_hosts = ["{host}", "localhost", "127.0.0.1"]\n', 1)
+if os.environ.get("WH_MODE") == "external":
+    subs = {
+        "s3_endpoint": os.environ["WH_ENDPOINT"],
+        "s3_access_key": os.environ["WH_ACCESS_KEY"],
+        "s3_secret_key": os.environ["WH_SECRET_KEY"],
+        "s3_region": os.environ["WH_REGION"],
+    }
+    for key, value in subs.items():
+        pattern = re.compile(rf'^{key} = ".*"$', re.MULTILINE)
+        assert pattern.search(text), f"tests/sqe-test.toml is missing '{key}' under [storage]"
+        text = pattern.sub(f'{key} = "{value}"', text)
 open(dst, "w").write(text)
 PYEOF
     SQE_CONFIG="$SQE_CONFIG_EXT"
-    echo "External data source: $BENCH_DATA_SOURCE (endpoint host '$ENDPOINT_HOST' allowlisted)"
+    if [ -n "$EXTERNAL_DATA" ]; then
+        echo "External data source: $BENCH_DATA_SOURCE (endpoint host '$ENDPOINT_HOST' allowlisted)"
+    fi
+    if [ "$BENCH_WAREHOUSE" = "external" ]; then
+        echo "External warehouse: $BENCH_WAREHOUSE_LOCATION via $BENCH_S3_ENDPOINT"
+    fi
 fi
 
 # Fail fast if any coordinator port is already bound. A stale coordinator
@@ -248,12 +340,29 @@ if [ -n "$COMPARE_TRINO" ]; then
         -d "grant_type=client_credentials&client_id=root&client_secret=s3cr3t&scope=PRINCIPAL_ROLE:ALL" \
         | python3 -c "import sys,json; print(json.load(sys.stdin)['access_token'])")
 
-    # Get Polaris and RustFS container IPs on the test stack network
+    # Get the Polaris container IP on the test stack network
     POLARIS_IP=$(docker inspect sqlengine-polaris-1 --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}')
-    RUSTFS_IP=$(docker inspect sqlengine-rustfs-1 --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}')
 
-    # Create Trino catalog config
+    # Trino's S3 target follows the warehouse: RustFS (via container IP)
+    # in local mode, the external endpoint otherwise — then SQE and Trino
+    # fetch table data over the identical network path.
+    if [ "$BENCH_WAREHOUSE" = "external" ]; then
+        TRINO_S3_ENDPOINT="$BENCH_S3_ENDPOINT"
+        TRINO_S3_ACCESS_KEY="$WH_S3_ACCESS_KEY"
+        TRINO_S3_SECRET_KEY="$WH_S3_SECRET_KEY"
+        TRINO_S3_REGION="$BENCH_S3_REGION"
+    else
+        RUSTFS_IP=$(docker inspect sqlengine-rustfs-1 --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}')
+        TRINO_S3_ENDPOINT="http://${RUSTFS_IP}:9000"
+        TRINO_S3_ACCESS_KEY="$S3_ACCESS_KEY"
+        TRINO_S3_SECRET_KEY="$S3_SECRET_KEY"
+        TRINO_S3_REGION="$S3_REGION"
+    fi
+
+    # Create Trino catalog config (may carry external credentials)
     mkdir -p /tmp/trino-bench/catalog
+    touch /tmp/trino-bench/catalog/iceberg.properties
+    chmod 600 /tmp/trino-bench/catalog/iceberg.properties
     cat > /tmp/trino-bench/catalog/iceberg.properties << TRINOEOF
 connector.name=iceberg
 iceberg.catalog.type=rest
@@ -262,11 +371,11 @@ iceberg.rest-catalog.warehouse=test_warehouse
 iceberg.rest-catalog.security=OAUTH2
 iceberg.rest-catalog.oauth2.token=${POLARIS_TOKEN}
 fs.native-s3.enabled=true
-s3.endpoint=http://${RUSTFS_IP}:9000
-s3.region=${S3_REGION}
+s3.endpoint=${TRINO_S3_ENDPOINT}
+s3.region=${TRINO_S3_REGION}
 s3.path-style-access=true
-s3.aws-access-key=${S3_ACCESS_KEY}
-s3.aws-secret-key=${S3_SECRET_KEY}
+s3.aws-access-key=${TRINO_S3_ACCESS_KEY}
+s3.aws-secret-key=${TRINO_S3_SECRET_KEY}
 TRINOEOF
 
     cat > /tmp/trino-bench/config.properties << 'TRINOEOF'
