@@ -149,10 +149,22 @@ pub async fn load_benchmark(
         if let Some(spec) = partition_spec(benchmark, &table_def.name) {
             base_sql.push_str(&format!(" PARTITIONED BY ({spec})"));
         }
-        base_sql.push_str(&format!(
-            " AS SELECT * FROM read_parquet('{}/*.parquet'",
-            table_path
-        ));
+        // Object-store paths use the directory form: DataFusion's
+        // `ListingTableUrl` only expands `*` globs on local filesystem
+        // paths — on `s3://` the star is treated as a literal key and the
+        // listing comes back empty. The directory form lists the prefix
+        // and the reader's `.parquet` extension filter selects the files.
+        if table_path.contains("://") {
+            base_sql.push_str(&format!(
+                " AS SELECT * FROM read_parquet('{}/'",
+                table_path
+            ));
+        } else {
+            base_sql.push_str(&format!(
+                " AS SELECT * FROM read_parquet('{}/*.parquet'",
+                table_path
+            ));
+        }
 
         // Append S3 credentials if provided
         if let Some(ref key) = s3_args.access_key {

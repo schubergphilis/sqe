@@ -36,6 +36,46 @@ S3_REGION="${S3_REGION:-us-east-1}"
 SQE_USERNAME="${SQE_USERNAME:-root}"
 SQE_PASSWORD="${SQE_PASSWORD:-}"
 
+# ── External data source (optional) ──────────────────────────
+# BENCH_DATA_SOURCE=s3://<bucket> reads pre-published parquet from an S3
+# bucket instead of generating locally (see benchmark-publish-data.sh).
+BENCH_DATA_SOURCE="${BENCH_DATA_SOURCE:-generate}"
+BENCH_S3_PROFILE="${BENCH_S3_PROFILE:-default}"
+BENCH_S3_ENDPOINT="${BENCH_S3_ENDPOINT:-}"
+BENCH_S3_REGION="${BENCH_S3_REGION:-us-east-1}"
+
+EXTERNAL_DATA=""
+case "$BENCH_DATA_SOURCE" in
+    s3://*) EXTERNAL_DATA=1 ;;
+    generate) ;;
+    *)
+        echo "ERROR: BENCH_DATA_SOURCE must be 'generate' or an s3:// URL, got: '$BENCH_DATA_SOURCE'" >&2
+        exit 1
+        ;;
+esac
+
+if [ -n "$EXTERNAL_DATA" ]; then
+    if [ -z "$BENCH_S3_ENDPOINT" ]; then
+        echo "ERROR: BENCH_S3_ENDPOINT is required with BENCH_DATA_SOURCE=$BENCH_DATA_SOURCE" >&2
+        exit 1
+    fi
+    DATA_PATH="$BENCH_DATA_SOURCE"
+    DATA_S3_ACCESS_KEY="${DATA_S3_ACCESS_KEY:-$(aws configure get aws_access_key_id --profile "$BENCH_S3_PROFILE")}"
+    DATA_S3_SECRET_KEY="${DATA_S3_SECRET_KEY:-$(aws configure get aws_secret_access_key --profile "$BENCH_S3_PROFILE")}"
+    DATA_S3_ENDPOINT="$BENCH_S3_ENDPOINT"
+    DATA_S3_REGION="$BENCH_S3_REGION"
+    if [ -z "$DATA_S3_ACCESS_KEY" ] || [ -z "$DATA_S3_SECRET_KEY" ]; then
+        echo "ERROR: could not resolve S3 credentials from profile '$BENCH_S3_PROFILE'" >&2
+        exit 1
+    fi
+else
+    DATA_PATH="$BENCH_DATA_DIR"
+    DATA_S3_ACCESS_KEY="$S3_ACCESS_KEY"
+    DATA_S3_SECRET_KEY="$S3_SECRET_KEY"
+    DATA_S3_ENDPOINT="$S3_ENDPOINT"
+    DATA_S3_REGION="$S3_REGION"
+fi
+
 ALL_BENCHMARKS=(tpch ssb tpcds tpcc tpce tpcbb clickbench)
 if [ $# -gt 0 ]; then
     BENCHMARKS=("$@")
@@ -76,6 +116,32 @@ echo "  Starting SQE coordinator..."
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 SQE_LOG_FILE="/tmp/sqe-bench-coord-$$.log"
 SQE_CONFIG="$ROOT_DIR/tests/sqe-test.toml"
+
+# With an external data source, read_parquet() carries an inline
+# `endpoint =>` override, and the coordinator's SSRF gate (issue #46)
+# rejects endpoint hosts that are not in `[storage.tvf] allowed_http_hosts`.
+# Generate a temp config that allowlists exactly the data endpoint's host.
+if [ -n "$EXTERNAL_DATA" ]; then
+    ENDPOINT_HOST=$(python3 -c "from urllib.parse import urlparse; import sys; print(urlparse(sys.argv[1]).hostname or '')" "$BENCH_S3_ENDPOINT")
+    if [ -z "$ENDPOINT_HOST" ]; then
+        echo "ERROR: could not parse host from BENCH_S3_ENDPOINT=$BENCH_S3_ENDPOINT" >&2
+        exit 1
+    fi
+    SQE_CONFIG_EXT="/tmp/sqe-bench-config-$$.toml"
+    python3 - "$ROOT_DIR/tests/sqe-test.toml" "$SQE_CONFIG_EXT" "$ENDPOINT_HOST" <<'PYEOF'
+import sys
+src, dst, host = sys.argv[1:4]
+text = open(src).read()
+anchor = "[storage.tvf]\n"
+assert anchor in text, "tests/sqe-test.toml is missing the [storage.tvf] section"
+# Include the loopback hosts so local-endpoint TVF calls keep working:
+# an explicit allowed_http_hosts REPLACES the (empty) default entirely.
+text = text.replace(anchor, anchor + f'allowed_http_hosts = ["{host}", "localhost", "127.0.0.1"]\n', 1)
+open(dst, "w").write(text)
+PYEOF
+    SQE_CONFIG="$SQE_CONFIG_EXT"
+    echo "External data source: $BENCH_DATA_SOURCE (endpoint host '$ENDPOINT_HOST' allowlisted)"
+fi
 
 RUST_LOG="${RUST_LOG:-sqe=info,warn}" \
     "$SQE_BIN" "$SQE_CONFIG" \
@@ -123,7 +189,7 @@ cleanup() {
         echo "Stopping SQE coordinator..."
         kill "$SQE_PID" 2>/dev/null || true
         wait "$SQE_PID" 2>/dev/null || true
-        rm -f "$SQE_LOG_FILE"
+        rm -f "$SQE_LOG_FILE" "${SQE_CONFIG_EXT:-}"
     fi
 }
 trap cleanup EXIT
@@ -142,17 +208,21 @@ for BENCH in "${BENCHMARKS[@]}"; do
 
     # ── Generate ──────────────────────────────────────────────
     echo ""
-    echo "  [1/2] Generating data..."
-    GEN_START=$(date +%s)
-    if ! "$BENCH_BIN" generate "$BENCH" \
-        --scale "$BENCH_SCALE" \
-        --output "$BENCH_DATA_DIR" 2>&1; then
-        echo "  ✗ Generate FAILED"
-        FAIL=$((FAIL + 1))
-        continue
+    if [ -n "$EXTERNAL_DATA" ]; then
+        echo "  [1/2] Using pre-published data: $DATA_PATH/$BENCH/sf$BENCH_SCALE"
+    else
+        echo "  [1/2] Generating data..."
+        GEN_START=$(date +%s)
+        if ! "$BENCH_BIN" generate "$BENCH" \
+            --scale "$BENCH_SCALE" \
+            --output "$BENCH_DATA_DIR" 2>&1; then
+            echo "  ✗ Generate FAILED"
+            FAIL=$((FAIL + 1))
+            continue
+        fi
+        GEN_END=$(date +%s)
+        echo "  ✓ Generated in $((GEN_END - GEN_START))s"
     fi
-    GEN_END=$(date +%s)
-    echo "  ✓ Generated in $((GEN_END - GEN_START))s"
 
     # ── Load ──────────────────────────────────────────────────
     echo ""
@@ -160,16 +230,16 @@ for BENCH in "${BENCHMARKS[@]}"; do
     LOAD_START=$(date +%s)
     if ! "$BENCH_BIN" load "$BENCH" \
         --scale "$BENCH_SCALE" \
-        --data "$BENCH_DATA_DIR" \
+        --data "$DATA_PATH" \
         --protocol "$BENCH_PROTOCOL" \
         --host "$BENCH_HOST" \
         --port "$BENCH_PORT" \
         --username "$SQE_USERNAME" \
         --password "$SQE_PASSWORD" \
-        --s3-access-key "$S3_ACCESS_KEY" \
-        --s3-secret-key "$S3_SECRET_KEY" \
-        --s3-endpoint "$S3_ENDPOINT" \
-        --s3-region "$S3_REGION" \
+        --s3-access-key "$DATA_S3_ACCESS_KEY" \
+        --s3-secret-key "$DATA_S3_SECRET_KEY" \
+        --s3-endpoint "$DATA_S3_ENDPOINT" \
+        --s3-region "$DATA_S3_REGION" \
         --clean 2>&1; then
         echo "  ✗ Load FAILED"
         FAIL=$((FAIL + 1))
@@ -180,7 +250,9 @@ for BENCH in "${BENCHMARKS[@]}"; do
     PASS=$((PASS + 1))
 
     # Clean generated files (data is now in Iceberg/S3)
-    rm -rf "${BENCH_DATA_DIR:?}/$BENCH"
+    if [ -z "$EXTERNAL_DATA" ]; then
+        rm -rf "${BENCH_DATA_DIR:?}/$BENCH"
+    fi
 done
 
 # ── Summary ───────────────────────────────────────────────────
