@@ -32,11 +32,14 @@ decomposes into three layers:
    or sideways information passing, not a config raise.
 3. **Everything else is single-output-partition scan throughput.** The dynamic
    filters arm correctly and cut decode proportionally at every practical key count.
-   What they cannot cut is I/O (uniformly scattered FKs put matches in every row
-   group) or the key-column decode of the full fact table, and all of it funnels
-   through one output stream. At 10x the rows, the funnel loses to Trino's
-   split-parallel pipelines. The one prior attempt at output parallelism (#235) was
-   perf-neutral, so this layer needs profiling before more construction.
+   What they cannot cut is bytes read (uniformly scattered FKs put matches in every
+   row group) or the key-column decode of the full fact table, and all of it
+   funnels through one output stream. Measured directly: q4.1's coordinator
+   CPU-seconds equal its wall time at ~1 core average, so the wall is serialized
+   CPU, not storage wait; the same work across the box's cores is ~1.5s. At 10x
+   the rows, the funnel loses to Trino's split-parallel pipelines. The one prior
+   attempt at output parallelism (#235) was perf-neutral, so this layer needs
+   profiling before more construction.
 
 ## 1. Where the gap lives
 
@@ -222,6 +225,20 @@ Three verdicts fall out:
   went 727ms at SF1 to 10,261ms at SF10 for q4.1, roughly 14x for 10x rows on a
   memory-tight box.
 
+A CPU-vs-I/O discrimination probe settles the "is this just heavy storage I/O"
+question. On ssb_sf10 (11-core box), q4.1's coordinator CPU-seconds equal its wall
+time (10.5-11.4 CPU-s vs 10.8-11.9s wall, 95-97 percent) at an average of 0.96
+cores, peak 1.8. The coordinator is fully CPU-busy on one core for the whole query:
+not idle-waiting on storage (CPU would sit far below wall) and not multi-core
+saturated (cores would sit far above 1). A warm rerun of a one-column full scan was
+no faster than cold (2.9s then 3.2s), and the local S3 server peaked at 1-4 cores
+without ever stalling the coordinator, so storage overlaps off the critical path.
+Notable: even with 4 files and the intra-file split, average cores stay below 1,
+meaning the decode subtasks are effectively serialized by backpressure from the
+single output consumer rather than running concurrently. The ~11 CPU-seconds of
+decode, filter evaluation, and join work would be ~1.5s spread across the 11 cores.
+Serialization is the wall; faster storage would move nothing.
+
 The full 13-query timed set seals the null end to end: default cap total 84.3s,
 raised cap total 84.4s (per-query deltas all sub-second noise; q1.1/q3.4 sanity
 checks show no regression from the raise either). Result JSONs:
@@ -319,5 +336,10 @@ recipe: dump named Count/Time metrics in `crates/sqe-coordinator/src/explain.rs`
   states `with_dynamic_predicate` is intentionally absent from `IcebergScanExec`.
   The current code registers it by default (MR #220 plus the seal-wait). A pointer
   note has been added there.
+- **`SELECT COUNT(*)` is not served from Iceberg metadata.** A bare
+  `COUNT(*) FROM lineorder` at SF10 takes ~15-17s and burns ~13 coordinator
+  CPU-seconds even warm, so it does per-row work instead of reading the snapshot
+  row count. A metadata fast-path would make it near-instant. Unrelated to the SSB
+  gap; file it.
 - SF1 evidence run: `benchmarks/results/ssb-sf1-flight-2026-07-05T13:24:57.json`
   (contended dev box, structure-only signal).
