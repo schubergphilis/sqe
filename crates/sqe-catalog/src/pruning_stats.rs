@@ -136,10 +136,18 @@ pub fn aggregate_column_statistics(
 /// counts aggregated across all files. The `arrow_schema` should match the
 /// projection the scan node will return — typically `IcebergScanExec`'s
 /// `projected_schema`.
+///
+/// `row_count_exact` may only be true when the snapshot holds NO live delete
+/// files (position or equality): manifest `record_count` sums overcount rows
+/// that Merge-on-Read deletes remove at read time. With `Precision::Exact`
+/// row counts, DataFusion's `AggregateStatistics` rule answers unfiltered
+/// `COUNT(*)` from metadata without scanning, so exactness here is a
+/// correctness contract, not a hint.
 pub fn aggregate_table_statistics(
     data_files: &[DataFile],
     arrow_schema: &Schema,
     iceberg_schema: &iceberg::spec::Schema,
+    row_count_exact: bool,
 ) -> Statistics {
     let num_rows: usize = data_files
         .iter()
@@ -151,7 +159,11 @@ pub fn aggregate_table_statistics(
         .sum();
     let column_statistics = aggregate_column_statistics(data_files, arrow_schema, iceberg_schema);
     Statistics {
-        num_rows: Precision::Inexact(num_rows),
+        num_rows: if row_count_exact {
+            Precision::Exact(num_rows)
+        } else {
+            Precision::Inexact(num_rows)
+        },
         total_byte_size: Precision::Inexact(total_byte_size),
         column_statistics,
     }
@@ -641,8 +653,20 @@ mod tests {
             &[make(1_000, 50), make(2_000, 75), make(500, 25)],
             &arrow_schema,
             &iceberg_schema,
+            false,
         );
         assert_eq!(stats.num_rows, Precision::Inexact(150));
         assert_eq!(stats.total_byte_size, Precision::Inexact(3_500));
+
+        // With no live delete files the row count is a correctness-grade
+        // exact value; byte size stays inexact either way.
+        let exact = aggregate_table_statistics(
+            &[make(1_000, 50), make(2_000, 75), make(500, 25)],
+            &arrow_schema,
+            &iceberg_schema,
+            true,
+        );
+        assert_eq!(exact.num_rows, Precision::Exact(150));
+        assert_eq!(exact.total_byte_size, Precision::Inexact(3_500));
     }
 }

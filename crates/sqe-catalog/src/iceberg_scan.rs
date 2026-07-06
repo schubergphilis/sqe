@@ -623,7 +623,13 @@ impl ExecutionPlan for IcebergScanExec {
         use datafusion::common::{stats::Precision, ColumnStatistics, Statistics};
 
         if let Some(cached) = &self.cached_statistics {
-            return Ok(Arc::new(cached.clone()));
+            let scan_reduces_rows = self.predicates.is_some()
+                || !self.df_filters.is_empty()
+                || !self.pushed_down_filters.is_empty();
+            return Ok(Arc::new(degrade_row_count_for_filtered_scan(
+                cached.clone(),
+                scan_reduces_rows,
+            )));
         }
 
         let metadata = self.table.metadata();
@@ -1658,6 +1664,25 @@ async fn collect_data_files_for_pruning(
 /// the `column_statistics` array indexes line up with what DataFusion sees.
 /// Returns row count, byte size, and per-column min/max/null counts; distinct
 /// counts and sums stay `Absent` (Iceberg manifests don't carry them).
+/// Degrade an `Exact` table-wide row count to `Inexact` when the scan carries
+/// any row-reducing predicate (static Iceberg predicate, DataFusion filter, or
+/// pushed-down dynamic filter).
+///
+/// The cached statistics describe the whole snapshot; a filtered scan emits
+/// fewer rows. Left `Exact`, DataFusion's `AggregateStatistics` rule would
+/// answer `COUNT(*)` with the unfiltered total — including for policy row
+/// filters that must never be bypassed. Column statistics and byte size stay
+/// untouched; only the row count carries the exactness contract.
+fn degrade_row_count_for_filtered_scan(
+    mut stats: datafusion::common::Statistics,
+    scan_reduces_rows: bool,
+) -> datafusion::common::Statistics {
+    if scan_reduces_rows {
+        stats.num_rows = stats.num_rows.to_inexact();
+    }
+    stats
+}
+
 pub async fn compute_table_statistics(
     table: &Table,
     snapshot_id: Option<i64>,
@@ -1700,6 +1725,11 @@ pub async fn compute_table_statistics(
     .await
     .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
+    // Track live delete files (position or equality) alongside collecting data
+    // files. Merge-on-Read deletes remove rows at read time that the manifest
+    // record counts still include, so the aggregated row count is exact only
+    // when the snapshot carries no live delete entries.
+    let mut has_live_delete_files = false;
     let data_files: Vec<DataFile> = manifests
         .into_iter()
         .flat_map(|manifest| {
@@ -1707,8 +1737,12 @@ pub async fn compute_table_statistics(
                 .entries()
                 .iter()
                 .filter(|entry| {
-                    entry.status() != ManifestStatus::Deleted
-                        && entry.data_file().content_type() == DataContentType::Data
+                    let live = entry.status() != ManifestStatus::Deleted;
+                    let is_data = entry.data_file().content_type() == DataContentType::Data;
+                    if live && !is_data {
+                        has_live_delete_files = true;
+                    }
+                    live && is_data
                 })
                 .map(|entry| entry.data_file().clone())
                 .collect::<Vec<_>>()
@@ -1720,6 +1754,7 @@ pub async fn compute_table_statistics(
         &data_files,
         arrow_schema,
         iceberg_schema,
+        !has_live_delete_files,
     ))
 }
 
@@ -2000,6 +2035,36 @@ mod tests {
             vec![Arc::new(Int32Array::from(values.to_vec()))],
         )
         .unwrap()
+    }
+
+    /// An Exact table-wide row count must survive an unfiltered scan (that is
+    /// what lets DataFusion answer COUNT(*) from metadata) and must degrade to
+    /// Inexact the moment the scan carries any row-reducing filter — policy
+    /// row filters included. Both directions are correctness contracts.
+    #[test]
+    fn exact_row_count_degrades_under_filters() {
+        use datafusion::common::stats::Precision;
+        use datafusion::common::Statistics;
+
+        let schema = Schema::new(vec![Field::new("a", DataType::Int32, false)]);
+        let exact = Statistics {
+            num_rows: Precision::Exact(150),
+            ..Statistics::new_unknown(&schema)
+        };
+
+        let untouched = degrade_row_count_for_filtered_scan(exact.clone(), false);
+        assert_eq!(untouched.num_rows, Precision::Exact(150));
+
+        let degraded = degrade_row_count_for_filtered_scan(exact, true);
+        assert_eq!(degraded.num_rows, Precision::Inexact(150));
+
+        // Inexact input stays inexact either way.
+        let inexact = Statistics {
+            num_rows: Precision::Inexact(150),
+            ..Statistics::new_unknown(&schema)
+        };
+        let still_inexact = degrade_row_count_for_filtered_scan(inexact, true);
+        assert_eq!(still_inexact.num_rows, Precision::Inexact(150));
     }
 
     /// No dynamic filters (or already-sealed ones) must not wait at all;
