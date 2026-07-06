@@ -16,10 +16,46 @@ CLIENT_SECRET="${CLIENT_SECRET:-s3cr3t}"
 WAREHOUSE="${WAREHOUSE:-test_warehouse}"
 NAMESPACE="${NAMESPACE:-default}"
 
+# Warehouse storage mode. `local` (default) targets the RustFS container
+# and creates the buckets itself. `external` targets an existing bucket
+# on an external S3 endpoint (the endpoint must be reachable from inside
+# the Polaris container too — Polaris performs the metadata writes):
+#   WAREHOUSE_MODE=external \
+#   EXT_S3_ENDPOINT=https://s3.example.com \
+#   WAREHOUSE_LOCATION=s3://my-bucket/warehouse ./scripts/bootstrap-test.sh
+# Polaris must have been started with matching POLARIS_S3_* env
+# (see docker-compose.test.yml).
+WAREHOUSE_MODE="${WAREHOUSE_MODE:-local}"
+EXT_S3_ENDPOINT="${EXT_S3_ENDPOINT:-}"
+WAREHOUSE_LOCATION="${WAREHOUSE_LOCATION:-}"
+
+if [ "$WAREHOUSE_MODE" = "external" ]; then
+    if [ -z "$EXT_S3_ENDPOINT" ] || [ -z "$WAREHOUSE_LOCATION" ]; then
+        echo "ERROR: WAREHOUSE_MODE=external requires EXT_S3_ENDPOINT and WAREHOUSE_LOCATION" >&2
+        exit 1
+    fi
+    WAREHOUSE_BASE="${WAREHOUSE_LOCATION%/}/"
+    STORAGE_ENDPOINT="$EXT_S3_ENDPOINT"
+    STORAGE_ENDPOINT_INTERNAL="$EXT_S3_ENDPOINT"
+    # With credential subscoping skipped (no STS on the endpoint), Polaris
+    # builds its metadata-write S3 client without the storage config's
+    # endpoint and falls through to real AWS. The Iceberg FileIO catalog
+    # properties pin it to the external endpoint.
+    EXTRA_CATALOG_PROPS=",
+                \"s3.endpoint\": \"$EXT_S3_ENDPOINT\",
+                \"s3.path-style-access\": \"true\""
+else
+    WAREHOUSE_BASE="s3://warehouse/"
+    STORAGE_ENDPOINT="$S3_URL"
+    STORAGE_ENDPOINT_INTERNAL="http://rustfs:9000"
+    EXTRA_CATALOG_PROPS=""
+fi
+
 echo "=== SQE Test Stack Bootstrap ==="
 echo "Polaris:   $POLARIS_URL"
-echo "S3:        $S3_URL"
-echo "Warehouse: $WAREHOUSE"
+echo "Mode:      $WAREHOUSE_MODE"
+echo "S3:        $STORAGE_ENDPOINT"
+echo "Warehouse: $WAREHOUSE ($WAREHOUSE_BASE)"
 echo ""
 
 # ── Wait for Polaris ───────────────────────────────────────────
@@ -36,7 +72,8 @@ for i in $(seq 1 60); do
     sleep 1
 done
 
-# ── Wait for RustFS ────────────────────────────────────────────
+# ── Wait for RustFS (local mode only) ──────────────────────────
+if [ "$WAREHOUSE_MODE" = "local" ]; then
 echo -n "Waiting for RustFS..."
 for i in $(seq 1 15); do
     if curl -so /dev/null "$S3_URL/" 2>/dev/null; then
@@ -93,6 +130,7 @@ else
     esac
 fi
 done
+fi # WAREHOUSE_MODE=local
 
 # ── 2. Get Polaris OAuth2 token ────────────────────────────────
 echo -n "Getting Polaris token... "
@@ -119,14 +157,14 @@ HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
             \"type\": \"INTERNAL\",
             \"storageConfigInfo\": {
                 \"storageType\": \"S3\",
-                \"allowedLocations\": [\"s3://warehouse/\"],
-                \"endpoint\": \"$S3_URL\",
-                \"endpointInternal\": \"http://rustfs:9000\",
+                \"allowedLocations\": [\"$WAREHOUSE_BASE\"],
+                \"endpoint\": \"$STORAGE_ENDPOINT\",
+                \"endpointInternal\": \"$STORAGE_ENDPOINT_INTERNAL\",
                 \"pathStyleAccess\": true
             },
             \"properties\": {
-                \"default-base-location\": \"s3://warehouse/\",
-                \"polaris.config.drop-with-purge.enabled\": \"true\"
+                \"default-base-location\": \"$WAREHOUSE_BASE\",
+                \"polaris.config.drop-with-purge.enabled\": \"true\"$EXTRA_CATALOG_PROPS
             }
         }
     }" 2>/dev/null)
@@ -188,6 +226,13 @@ esac
 # warehouse that is NOT in [catalogs.*] of the test config. Polaris in
 # this stack is in-memory, so it must be re-created on every fresh
 # stack or those tests fail with "Unable to find warehouse".
+# External mode is benchmark-only: the discovery warehouse stays on
+# RustFS and is skipped.
+if [ "$WAREHOUSE_MODE" = "external" ]; then
+    echo ""
+    echo "=== Bootstrap complete (external warehouse) ==="
+    exit 0
+fi
 echo -n "Creating warehouse 'discovery_test_wh'... "
 HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
     "$POLARIS_URL/api/management/v1/catalogs" \
