@@ -48,7 +48,7 @@ sqe> SELECT snapshot_id, committed_at FROM s3tables.sales."orders$snapshots";
 | **Distributed mode** (coordinator + workers) | yes | yes | no |
 | **Iceberg V2 + V3 read + write** | native | V2 + partial V3 | extension, read-only |
 | **Per-query OIDC bearer passthrough** | yes | service account only | n/a (single-tenant) |
-| **Ranger row filters + column masks at LogicalPlan** | yes (Phase 1 + Phase 2A) | no | no |
+| **Ranger row filters + column masks at LogicalPlan** | yes (incl. tag-based) | no | no |
 | **OPA / Cedar policy at LogicalPlan** | roadmap | no | no |
 | **GRANT/REVOKE to Polaris or Apache Ranger** | yes | no | no |
 | **Multi-catalog in one engine** | 7 backends | one at a time | per-extension |
