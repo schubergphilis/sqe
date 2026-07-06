@@ -177,7 +177,7 @@ impl QueryHandler {
             });
             maintenance_handler = maintenance_handler.with_query_history(f);
         }
-        let explain_handler = crate::explain::ExplainHandler::new(Arc::clone(&policy_enforcer));
+        let explain_handler = crate::explain::ExplainHandler::new(Arc::clone(&policy_enforcer), &config.query);
         let query_semaphore = if config.query.max_concurrent_queries > 0 {
             Some(Arc::new(tokio::sync::Semaphore::new(config.query.max_concurrent_queries)))
         } else {
@@ -2178,6 +2178,25 @@ impl QueryHandler {
             physical_plan
         };
 
+        // Dim-build swap: put the dimension scan on the build side of
+        // star-tail CollectLeft joins when cascaded estimates left the fact
+        // stream there (SSB q4.x partkey class). Runs before the parallel
+        // probe rule so build/probe roles are final, and re-wires dynamic
+        // filters itself for the new orientation.
+        let physical_plan = if self.config.query.dim_build_swap {
+            let state = ctx.state();
+            let rule = crate::dim_build_swap::DimBuildSwapRule::new();
+            match rule.optimize(physical_plan.clone(), state.config_options()) {
+                Ok(optimized) => optimized,
+                Err(e) => {
+                    debug!(error = %e, "Dim-build swap failed, using original plan");
+                    physical_plan
+                }
+            }
+        } else {
+            physical_plan
+        };
+
         // Probe-side scan parallelization (issue #235). Opt-in: bumps the
         // probe-side Iceberg scan of CollectLeft joins to N output partitions
         // so the fact-table decode runs across cores; build-side scans are
@@ -2440,6 +2459,21 @@ impl QueryHandler {
                         error = %e,
                         "Star-schema join reorder failed, using original plan"
                     );
+                    physical_plan
+                }
+            }
+        } else {
+            physical_plan
+        };
+
+        // Dim-build swap (see the streaming path for rationale).
+        let physical_plan = if self.config.query.dim_build_swap {
+            let state = ctx.state();
+            let rule = crate::dim_build_swap::DimBuildSwapRule::new();
+            match rule.optimize(physical_plan.clone(), state.config_options()) {
+                Ok(optimized) => optimized,
+                Err(e) => {
+                    debug!(error = %e, "Dim-build swap failed, using original plan");
                     physical_plan
                 }
             }

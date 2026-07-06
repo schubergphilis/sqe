@@ -366,6 +366,18 @@ impl IcebergScanExec {
     pub fn projection(&self) -> Option<&[String]> { self.projection.as_deref() }
     pub fn pushed_down_filters(&self) -> &[Arc<dyn PhysicalExpr>] { &self.pushed_down_filters }
 
+    /// Clone this scan with `pushed_down_filters` emptied.
+    ///
+    /// For physical rules that restructure joins after the dynamic-filter
+    /// pushdown pass has already run (e.g. the dim-build-swap rule): the
+    /// stored filters were wired for the old join orientation, so the rule
+    /// strips every scan and re-runs the post-optimization `FilterPushdown`
+    /// to rewire. `handle_child_pushdown_result` APPENDS to the stored set,
+    /// so re-running without stripping would double-evaluate every filter.
+    pub fn clone_without_pushed_filters(&self) -> Self {
+        self.clone_with_pushed_filters(Vec::new())
+    }
+
     /// Create a copy of this scan with additional dynamic filters pushed down
     /// from parent operators (e.g., `HashJoinExec` build-side bounds).
     ///
