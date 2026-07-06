@@ -63,6 +63,9 @@ pub struct ReadJsonFunction {
     /// Authenticated caller identity for the object-store prefix gate.
     /// `TvfCaller::default()` (anonymous, untrusted) fails closed.
     caller: TvfCaller,
+    /// The executing session's runtime environment; see
+    /// [`crate::read_parquet::ReadParquetFunction::with_runtime_env`].
+    runtime_env: Option<Arc<datafusion::execution::runtime_env::RuntimeEnv>>,
 }
 
 impl ReadJsonFunction {
@@ -70,12 +73,27 @@ impl ReadJsonFunction {
         Self {
             storage,
             caller: TvfCaller::default(),
+            runtime_env: None,
         }
     }
 
     /// Create a new `ReadJsonFunction` bound to an authenticated caller.
     pub fn with_caller(storage: StorageConfig, caller: TvfCaller) -> Self {
-        Self { storage, caller }
+        Self {
+            storage,
+            caller,
+            runtime_env: None,
+        }
+    }
+
+    /// Bind the executing session's runtime environment so inline-credential
+    /// object stores are visible to the scan, not just to schema inference.
+    pub fn with_runtime_env(
+        mut self,
+        env: Arc<datafusion::execution::runtime_env::RuntimeEnv>,
+    ) -> Self {
+        self.runtime_env = Some(env);
+        self
     }
 }
 
@@ -110,8 +128,9 @@ impl TableFunctionImpl for ReadJsonFunction {
         )?;
 
         let storage = self.storage.clone();
+        let runtime_env = self.runtime_env.clone();
         crate::runtime_bridge::block_on_compat(async move {
-            build_json_listing_table(&args, &json_opts, &storage).await
+            build_json_listing_table(&args, &json_opts, &storage, runtime_env.as_deref()).await
         })
         .ok_or_else(|| {
             DataFusionError::Plan(format!("{FN_NAME}: no tokio runtime available"))
@@ -123,6 +142,7 @@ async fn build_json_listing_table(
     args: &FileTvfArgs,
     json_opts: &JsonOpts,
     storage: &StorageConfig,
+    runtime_env: Option<&datafusion::execution::runtime_env::RuntimeEnv>,
 ) -> DFResult<Arc<dyn TableProvider>> {
     let mut args = args.clone();
     rewrite_hf_path_in_place(FN_NAME, &mut args)?;
@@ -130,7 +150,7 @@ async fn build_json_listing_table(
     let listing_url = ListingTableUrl::parse(&args.path)?;
 
     let tmp_ctx = SessionContext::new();
-    register_s3_store_if_needed(FN_NAME, &tmp_ctx, &args, storage)?;
+    register_s3_store_if_needed(FN_NAME, &tmp_ctx, &args, storage, runtime_env)?;
     register_azure_store_if_needed(FN_NAME, &tmp_ctx, &args, storage)?;
     register_gcs_store_if_needed(FN_NAME, &tmp_ctx, &args, storage)?;
     register_http_store_if_needed(FN_NAME, &tmp_ctx, &args.path)?;
