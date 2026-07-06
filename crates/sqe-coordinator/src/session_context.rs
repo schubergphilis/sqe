@@ -660,10 +660,13 @@ pub async fn create_session_context(
             );
             ctx.register_udtf(
                 "read_parquet",
-                Arc::new(sqe_catalog::read_parquet::ReadParquetFunction::with_caller(
-                    config.storage.clone(),
-                    tvf_caller.clone(),
-                )),
+                Arc::new(
+                    sqe_catalog::read_parquet::ReadParquetFunction::with_caller(
+                        config.storage.clone(),
+                        tvf_caller.clone(),
+                    )
+                    .with_runtime_env(ctx.runtime_env()),
+                ),
             );
 
             // V8: read_csv() and read_json() TVFs alongside read_parquet().
@@ -674,17 +677,23 @@ pub async fn create_session_context(
             // overrides flow through the shared file_tvf_common helpers.
             ctx.register_udtf(
                 "read_csv",
-                Arc::new(sqe_catalog::read_csv::ReadCsvFunction::with_caller(
-                    config.storage.clone(),
-                    tvf_caller.clone(),
-                )),
+                Arc::new(
+                    sqe_catalog::read_csv::ReadCsvFunction::with_caller(
+                        config.storage.clone(),
+                        tvf_caller.clone(),
+                    )
+                    .with_runtime_env(ctx.runtime_env()),
+                ),
             );
             ctx.register_udtf(
                 "read_json",
-                Arc::new(sqe_catalog::read_json::ReadJsonFunction::with_caller(
-                    config.storage.clone(),
-                    tvf_caller,
-                )),
+                Arc::new(
+                    sqe_catalog::read_json::ReadJsonFunction::with_caller(
+                        config.storage.clone(),
+                        tvf_caller,
+                    )
+                    .with_runtime_env(ctx.runtime_env()),
+                ),
             );
 
             // Register Iceberg metadata TVFs:
