@@ -128,6 +128,13 @@ pub struct ReadParquetFunction {
     /// Authenticated caller identity for the object-store prefix gate.
     /// `TvfCaller::default()` (anonymous, untrusted) fails closed.
     caller: TvfCaller,
+    /// The executing session's runtime environment. Inline-credential S3
+    /// stores must be registered here as well as on the inference context,
+    /// because the scan resolves object stores through the session registry
+    /// at execution time. `None` (tests, standalone use) skips that
+    /// registration and execution falls back to the engine's `[storage]`
+    /// config — correct only when the inline endpoint matches it.
+    runtime_env: Option<Arc<datafusion::execution::runtime_env::RuntimeEnv>>,
 }
 
 impl ReadParquetFunction {
@@ -138,12 +145,27 @@ impl ReadParquetFunction {
         Self {
             storage,
             caller: TvfCaller::default(),
+            runtime_env: None,
         }
     }
 
     /// Create a new `ReadParquetFunction` bound to an authenticated caller.
     pub fn with_caller(storage: StorageConfig, caller: TvfCaller) -> Self {
-        Self { storage, caller }
+        Self {
+            storage,
+            caller,
+            runtime_env: None,
+        }
+    }
+
+    /// Bind the executing session's runtime environment so inline-credential
+    /// object stores are visible to the scan, not just to schema inference.
+    pub fn with_runtime_env(
+        mut self,
+        env: Arc<datafusion::execution::runtime_env::RuntimeEnv>,
+    ) -> Self {
+        self.runtime_env = Some(env);
+        self
     }
 }
 
@@ -164,12 +186,13 @@ impl TableFunctionImpl for ReadParquetFunction {
             &self.caller,
         )?;
         let storage = self.storage.clone();
+        let runtime_env = self.runtime_env.clone();
 
         // `TableFunctionImpl::call` is sync; schema inference is async.
         // block_on_compat drives the future on multi-thread (block_in_place)
         // or current-thread (off-thread) runtimes (issue #83).
         crate::runtime_bridge::block_on_compat(async move {
-            build_listing_table(&args, &storage).await
+            build_listing_table(&args, &storage, runtime_env.as_deref()).await
         })
         .ok_or_else(|| {
             datafusion::error::DataFusionError::Plan(
@@ -187,6 +210,7 @@ impl TableFunctionImpl for ReadParquetFunction {
 async fn build_listing_table(
     args: &ReadParquetArgs,
     storage: &StorageConfig,
+    runtime_env: Option<&datafusion::execution::runtime_env::RuntimeEnv>,
 ) -> DFResult<Arc<dyn TableProvider>> {
     // V10: resolve hf:// to its HTTPS form before URL parsing so HF
     // dataset / model paths flow through the same httpfs path as raw
@@ -227,7 +251,16 @@ async fn build_listing_table(
             .map_err(|e| datafusion::error::DataFusionError::Plan(format!(
                 "read_parquet: failed to build object-store URL: {e}"
             )))?;
-        tmp_ctx.register_object_store(&store_url, Arc::new(s3));
+        // Register on the inference context AND the executing session's
+        // runtime env: the temp context never runs the scan, and without
+        // the session registration execution falls through to the lazy
+        // fallback store built from `[storage]` — the wrong endpoint and
+        // credentials whenever the inline `endpoint =>` differs from it.
+        let store: Arc<dyn object_store::ObjectStore> = Arc::new(s3);
+        tmp_ctx.register_object_store(&store_url, Arc::clone(&store));
+        if let Some(env) = runtime_env {
+            env.register_object_store(&store_url, store);
+        }
         debug!(path = %args.path, "Registered S3 object store for read_parquet");
     } else if crate::file_tvf_common::is_azure_path(&args.path) {
         let common_args = args.as_file_tvf_args();
