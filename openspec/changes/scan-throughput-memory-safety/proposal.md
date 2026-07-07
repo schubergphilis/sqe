@@ -1,5 +1,37 @@
 # Scan Throughput + Memory Safety (SF10 pipeline efficiency)
 
+> Status update 2026-07-07, after the instrumented attribution runs on the
+> rig and the DuckDB memory research
+> (`docs/internal/research/duckdb-memory-architecture.md`):
+>
+> - Phase 0 IMPLEMENTED (branch `feat/tracked-write-sink`): per-query
+>   pool-residue + RSS observer, top-consumer report, RSS gauge.
+> - Phase B was ALREADY COMPLETE IN MAIN (ingest/CTAS streaming, CoW and
+>   MERGE tracking, bounded fanout; `write_buffer_tracking` default on) and
+>   is now validated: the attribution run measured ~99% pool coverage of RSS
+>   during an SF10 load. Tasks 2.1-2.5 are moot; the 2.6 gate PASSES with a
+>   real cap.
+> - The OOM taxonomy collapsed to one root cause: SQE_MEMORY_LIMIT was
+>   documented but never implemented, so "capped" runs used the config
+>   file's 64GB limit on a 31GB box. Fix on branch
+>   `feat/memory-limit-env-override`. With a real 12GB cap, the full 7-suite
+>   SF10 sweep runs in ONE coordinator with zero kernel kills (gate 4 of the
+>   success criteria, passed 2026-07-07; TPC-DS suite+compare peak RSS
+>   3.3GB).
+> - Phase C re-scoped from a leak hunt to four DuckDB-informed items:
+>   (C1) the env override [done, branch above]; (C2) RAM-fraction default
+>   for memory_limit (~70% of physical RAM when unset); (C3) allocator:
+>   tuned jemalloc with background purge threads + decay, fixing the
+>   measured 22.4GB glibc RSS-parking after large sorts; (C4) caches
+>   (footer, metadata, moka policy) registered as MemoryPool consumers.
+>   Sort-merge spill and hash-join spill are upstream DataFusion work:
+>   track, do not build (issue list in the research doc).
+> - Phase A is implemented on branch `feat/parallel-scan-output`
+>   (ParallelScanRule: taint-walk q72 guard over required_input_distribution,
+>   RoundRobinBatch advertisement, EnforceDistribution re-run); rig gates
+>   pending. The sibling `parallel_probe_scan` (#235) opt-in is A/B'd in the
+>   same rig session.
+
 ## Why
 
 The first fair SQE-vs-Trino sweep (2026-07-06, rig idp-gpu-01, 8 cores / 31GB,
