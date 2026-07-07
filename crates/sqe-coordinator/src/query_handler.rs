@@ -1494,6 +1494,11 @@ impl QueryHandler {
             }
         }
 
+        // Phase 0 (scan-throughput-memory-safety): pool residue + RSS at
+        // query completion. Streamed queries log via the StreamFinalizer;
+        // this covers the batch path's success and error outcomes.
+        crate::memory::observe_query_end(&self.runtime.memory_pool, &query_id);
+
         // Resolve resources from the plan using structured TableReferences so
         // audit entries carry fully-qualified `catalog.ns.table` names.
         // `session.default_catalog` fills missing catalog components for Bare
