@@ -293,8 +293,14 @@ pub async fn run_benchmark_test(
 /// "q01" → "1", "1" → "1", "q1" → "1"
 fn normalize_query_id(id: &str) -> String {
     let trimmed = id.trim_start_matches('q');
-    let n: u64 = trimmed.parse().unwrap_or(0);
-    n.to_string()
+    // Integer ids normalize numerically ("q01" == "1"). Dotted ids (SSB's
+    // "q3.1") fail the parse and previously all collapsed to "0", which
+    // made every filter match every query — `--query q3.1` silently ran
+    // the whole suite. Compare those as plain strings instead.
+    match trimmed.parse::<u64>() {
+        Ok(n) => n.to_string(),
+        Err(_) => trimmed.to_string(),
+    }
 }
 
 /// Strip SQL line comments (`-- ...` to end-of-line, preserving the newline).
