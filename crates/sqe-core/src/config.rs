@@ -3370,6 +3370,16 @@ impl SqeConfig {
             "SQE_COORDINATOR__CREDENTIAL_PUSH_REQUEST_TIMEOUT_SECS",
             &mut self.coordinator.credential_push_request_timeout_secs,
         );
+        // Coordinator memory knobs use short, un-namespaced env names because
+        // operators reach for them under OOM pressure and a mistyped
+        // `SQE_COORDINATOR__MEMORY_LIMIT` silently keeps the file value (the bug
+        // this fixes: an 8GB intent ran with a 64GB file limit and OOM-killed a
+        // 31GB box). Applied overrides log at INFO with the value; neither is a
+        // secret.
+        // `SQE_MEMORY_LIMIT` overrides `coordinator.memory_limit` ("8GB", "512MB").
+        env_override_str_logged("SQE_MEMORY_LIMIT", &mut self.coordinator.memory_limit);
+        // `SQE_MEMORY_POOL` overrides `coordinator.memory_pool` ("greedy" | "fair").
+        env_override_str_logged("SQE_MEMORY_POOL", &mut self.coordinator.memory_pool);
 
         // Worker
         env_override_str("SQE_WORKER__COORDINATOR_URL", &mut self.worker.coordinator_url);
@@ -3728,6 +3738,17 @@ fn validate_urls(config: &SqeConfig, errors: &mut Vec<String>) {
 
 fn env_override_str(key: &str, target: &mut String) {
     if let Ok(val) = std::env::var(key) {
+        *target = val;
+    }
+}
+
+/// Like [`env_override_str`], but logs at INFO when the override fires. The
+/// value is included: these knobs (coordinator memory limit / pool) are not
+/// secrets, and an operator diagnosing an OOM needs to see the effective value
+/// rather than guess whether the env var took effect.
+fn env_override_str_logged(key: &str, target: &mut String) {
+    if let Ok(val) = std::env::var(key) {
+        tracing::info!(env = key, value = %val, "config override applied from environment");
         *target = val;
     }
 }
@@ -5375,6 +5396,29 @@ otlp_endpoint = ""
         std::env::remove_var("SQE_METRICS__OPENLINEAGE__ENABLED");
         std::env::remove_var("SQE_METRICS__OPENLINEAGE__SPOOL_MAX_BYTES");
         std::env::remove_var("SQE_METRICS__OPENLINEAGE__CHANNEL_CAPACITY");
+    }
+
+    #[test]
+    fn env_overrides_apply_to_coordinator_memory() {
+        // std::env::set_var is process-wide; serialise against every other
+        // env-touching test in this module (see ENV_LOCK docs below).
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+
+        std::env::set_var("SQE_MEMORY_LIMIT", "12GB");
+        std::env::set_var("SQE_MEMORY_POOL", "fair");
+
+        let mut cfg = valid_config();
+        // Precondition: the short env names must actually change the value, i.e.
+        // start from something other than what we set (guards the regression
+        // where nothing read SQE_MEMORY_LIMIT and the file value silently won).
+        assert_ne!(cfg.coordinator.memory_limit, "12GB");
+        cfg.apply_env_overrides();
+
+        assert_eq!(cfg.coordinator.memory_limit, "12GB");
+        assert_eq!(cfg.coordinator.memory_pool, "fair");
+
+        std::env::remove_var("SQE_MEMORY_LIMIT");
+        std::env::remove_var("SQE_MEMORY_POOL");
     }
 
     #[test]
