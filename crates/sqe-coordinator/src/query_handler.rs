@@ -2217,6 +2217,32 @@ impl QueryHandler {
             physical_plan
         };
 
+        // Single-node parallel scan (issue #131 follow-up). Opt-in: gives each
+        // qualifying Iceberg scan N output partitions, choosing partitioning the
+        // parent can consume so EnforceDistribution inserts no redundant gather.
+        // Build-side and single-partition-ordered scans stay serial (the q72
+        // guard falls out of `required_input_distribution`). Runs after the
+        // probe rule so join distribution is final; distinct from it (that keeps
+        // CollectLeft and parallelizes only the probe). Default off until the
+        // q72 benchmark gate passes.
+        let physical_plan = if self.config.query.parallel_scan {
+            let byte_threshold = sqe_core::parse_memory_limit(
+                &self.config.query.distribution_threshold,
+            )
+            .unwrap_or(0);
+            let state = ctx.state();
+            let rule = crate::parallel_scan::ParallelScanRule::new(byte_threshold);
+            match rule.optimize(physical_plan.clone(), state.config_options()) {
+                Ok(optimized) => optimized,
+                Err(e) => {
+                    debug!(error = %e, "Parallel scan pass failed, using original plan");
+                    physical_plan
+                }
+            }
+        } else {
+            physical_plan
+        };
+
         // Adaptive sort stripping
         let sort_mode = SortMode::parse(&self.config.query.sort_mode);
         let pressure = crate::memory::check_pressure(&self.runtime.memory_pool);
