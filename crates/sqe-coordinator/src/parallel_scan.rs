@@ -1,104 +1,63 @@
-//! Physical optimizer rule: parallelize a single-node Iceberg scan by giving
-//! it N output partitions, choosing partitioning the consuming operator can use
-//! so `EnforceDistribution` never inserts a redundant gather.
+//! Physical optimizer rule: parallelize single-node Iceberg scans by giving
+//! each qualifying scan N output partitions, then letting `EnforceDistribution`
+//! place the exchanges the new partition counts require.
 //!
 //! ## Why (issue #131 follow-up)
 //!
 //! `IcebergScanExec` defaults to one output partition. Auto-wiring
 //! `target_partitions` at the table-provider level made the scan advertise
-//! `Partitioning::UnknownPartitioning(N)`, which `EnforceDistribution` cannot
-//! use to satisfy a downstream `HashJoinExec`: it falls back to `CollectLeft`
-//! and inserts a `CoalescePartitionsExec` immediately above the scan, gathering
-//! the N streams back into one. tpcds q72 regressed 5-6x. See
-//! `table_provider.rs` and issue #131.
+//! `Partitioning::UnknownPartitioning(N)`, which `EnforceDistribution` could not
+//! use to satisfy a downstream `HashJoinExec`: it fell back to `CollectLeft` and
+//! inserted a `CoalescePartitionsExec` immediately above the scan, gathering the
+//! N streams back into one and fragmenting the hash build. tpcds q72 regressed
+//! 5-6x. See `table_provider.rs` and issue #131.
 //!
-//! The lesson is not "do not parallelize" but "do not announce parallelism the
-//! optimizer cannot use, and do not parallelize a scan whose consumer requires
-//! a single partition". This rule runs AFTER `create_physical_plan` (so after
-//! DataFusion's own `EnforceDistribution`) and decides per scan using the one
-//! signal DataFusion itself uses: the parent's
-//! [`ExecutionPlan::required_input_distribution`].
+//! ## Approach
 //!
-//! ## What it does
+//! This rule runs AFTER `create_physical_plan` (so after DataFusion's own
+//! `EnforceDistribution`). Because an `IcebergScanExec` is always a single
+//! partition when `EnforceDistribution` first runs, a `Partitioned` hash join
+//! ends up directly over its scan inputs with no repartition between them (an
+//! empirical fact, verified in the tests). So placing a `RepartitionExec(Hash)`
+//! per scan by hand cannot keep both join inputs at the same partition count:
+//! bump only the fact side and the join sees N vs 1, which is invalid.
 //!
-//! For each single-partition [`IcebergScanExec`] whose cached manifest byte
-//! size reaches the threshold, it looks at how the parent consumes that input:
+//! Instead the rule bumps every qualifying scan to `RoundRobinBatch(N)` and
+//! re-runs `EnforceDistribution` once. Given a `Partitioned` join with one input
+//! now at N and the other at 1, `EnforceDistribution` inserts
+//! `RepartitionExec(Hash(key), N)` above BOTH inputs, so partition counts match,
+//! the join stays `Partitioned` (re-running distribution does not re-pick join
+//! modes, that is `JoinSelection`), and no `CoalescePartitionsExec` lands above
+//! a scan. Aggregates get their `Hash` / coalesce before the final merge, and a
+//! multi-partition root is coalesced by `execute_stream`. This is the mechanism
+//! the sibling `ParallelProbeScanRule` (#235) already ships and that q72 was
+//! validated against.
 //!
-//! - Parent is an absorbing exchange (`RepartitionExec` / `CoalescePartitionsExec`):
-//!   bump the scan to `RoundRobinBatch(N)`. The exchange already re-partitions
-//!   or gathers, so nothing else changes. This is the production win: a
-//!   `Partitioned` hash join's inputs already carry a `RepartitionExec(Hash)`
-//!   inserted by `EnforceDistribution`, and bumping the scan below it only
-//!   changes that exchange's input partition count. The join stays
-//!   `Partitioned`; no `CoalescePartitionsExec` lands above the scan.
-//! - Parent requires `HashPartitioned(keys)` on the scan directly (a
-//!   `Partitioned` join with the scan as a direct child, no intervening
-//!   exchange): bump the scan to `RoundRobinBatch(N)` and insert an explicit
-//!   `RepartitionExec(Hash(keys), N)` between scan and parent. The keys come
-//!   straight from the parent's distribution requirement, so no key recovery
-//!   guesswork.
-//! - Parent requires `SinglePartition` (the build side of a `CollectLeft`
-//!   join, a global sort, a global limit, a final/single aggregate) or requires
-//!   an input ordering: leave the scan serial. The `CollectLeft` build-side
-//!   case is the q72 regression guard, and here it is the same generic signal
-//!   the optimizer uses, not a special case.
-//! - Parent requires `UnspecifiedDistribution` (filter, projection): bump to
-//!   `RoundRobinBatch(N)` with no inserted exchange, but only when the
-//!   parallelism will be absorbed above (see `Ctx` below). No absorbing
-//!   boundary means the extra partitions would reach the single-partition
-//!   output boundary unmerged, so the scan is left serial.
+//! ## The one load-bearing guard
 //!
-//! ## Ctx: does the parallelism get absorbed?
-//!
-//! Bumping a scan raises its parent's output partition count, which propagates
-//! up until an operator merges or re-partitions it. `Ctx::Free` means some
-//! ancestor already absorbs multiple partitions (an exchange was crossed, or
-//! the plan root, which `execute_stream` wraps in a `CoalescePartitionsExec`);
-//! `Ctx::Blocked` means a `SinglePartition` / ordering requirement lies above
-//! with no absorbing exchange between, so raising the count would violate it.
-//! A pipeline (`UnspecifiedDistribution`) scan is bumped only under `Ctx::Free`.
-//!
-//! ## Not handled (deferred)
-//!
-//! A scan directly under a partial aggregate, or a scan-bound query whose only
-//! consumer is a single-partition output with no exchange (a bare
-//! `SELECT count(*) ... WHERE`), is left serial: bumping it would need an
-//! absorbing boundary this pass does not insert. Those speedups belong to the
-//! benchmark-gate phase.
+//! A scan on the build (left) side of a `CollectLeft` join is NEVER bumped.
+//! `EnforceDistribution` requires that side to be a single partition, so bumping
+//! it re-creates the exact `CoalescePartitionsExec`-above-scan shape that q72
+//! regressed on. The guard is expressed generically through
+//! [`ExecutionPlan::required_input_distribution`]: a child reached via a
+//! `SinglePartition` requirement (a `CollectLeft` build side, a global sort, a
+//! global limit, a final aggregate over a collapsed single-partition input) or a
+//! required input ordering is tainted and left serial. `Partitioned`-join sides
+//! are deliberately NOT tainted: those are the scans this rule exists to cover
+//! (this is where it goes beyond #235, which only parallelizes `CollectLeft`
+//! probes).
 
 use std::sync::Arc;
 
+use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::config::ConfigOptions;
 use datafusion::error::Result;
-use datafusion::physical_expr::{Distribution, PhysicalExpr};
+use datafusion::physical_expr::Distribution;
+use datafusion::physical_optimizer::enforce_distribution::EnforceDistribution;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
-use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
-use datafusion::physical_plan::repartition::RepartitionExec;
-use datafusion::physical_plan::{ExecutionPlan, Partitioning};
+use datafusion::physical_plan::ExecutionPlan;
 use sqe_catalog::iceberg_scan::IcebergScanExec;
 use tracing::debug;
-
-/// Whether the parallelism produced below `node` is absorbed before the
-/// single-partition output boundary. See the module docs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Ctx {
-    /// An exchange (or the plan root) will merge / re-partition extra partitions.
-    Free,
-    /// A `SinglePartition` or ordering requirement lies above with no absorbing
-    /// exchange between; extra partitions here would violate it.
-    Blocked,
-}
-
-/// What to do with a single-partition scan given how its parent consumes it.
-#[derive(Debug, Clone)]
-enum LeafAction {
-    /// Leave the scan at one partition.
-    Serial,
-    /// Bump the scan to `RoundRobinBatch(N)` with no inserted exchange.
-    BumpRoundRobin,
-    /// Bump the scan and wrap it in `RepartitionExec(Hash(keys), N)`.
-    BumpHash(Vec<Arc<dyn PhysicalExpr>>),
-}
 
 /// Physical optimizer rule that parallelizes single-node Iceberg scans. Gated
 /// by `query.parallel_scan`; `byte_threshold` reuses `distribution_threshold`.
@@ -123,18 +82,27 @@ impl PhysicalOptimizerRule for ParallelScanRule {
         if n <= 1 {
             return Ok(plan);
         }
-
-        // A bare scan as the whole plan: `execute_stream` coalesces a
-        // multi-partition root, so parallelism is absorbed (Ctx::Free).
-        if plan.children().is_empty() {
-            if let Some(bumped) = self.bump_if_qualifying(&plan, n) {
-                debug!(target_partitions = n, "ParallelScanRule parallelized a root scan");
-                return Ok(bumped);
-            }
+        // Single source of truth for the q72 guard: the unit-tested taint walk
+        // decides which leaves may be bumped (build-side scans never appear).
+        let leaves = collect_non_build_leaves(&plan);
+        let bumpable: Vec<Arc<dyn ExecutionPlan>> = leaves
+            .into_iter()
+            .filter(|leaf| self.is_bumpable_scan(leaf))
+            .collect();
+        if bumpable.is_empty() {
             return Ok(plan);
         }
-
-        self.rewrite(&plan, Ctx::Free, n)
+        let rewritten = bump_scans(&plan, &bumpable, n)?;
+        debug!(
+            target_partitions = n,
+            count = bumpable.len(),
+            "ParallelScanRule bumped scan(s); re-running EnforceDistribution"
+        );
+        // Re-run EnforceDistribution so the bumped partition counts get the
+        // exchanges they need (Hash repartition on both sides of a Partitioned
+        // join, coalesce before a final aggregate). Only non-build scans changed,
+        // so no CollectLeft build side is coalesced: no q72-class regression.
+        EnforceDistribution::new().optimize(rewritten, config)
     }
 
     fn name(&self) -> &str {
@@ -147,95 +115,17 @@ impl PhysicalOptimizerRule for ParallelScanRule {
 }
 
 impl ParallelScanRule {
-    /// Rebuild `node`, parallelizing any qualifying leaf scan among its direct
-    /// children according to how `node` consumes that child, and recursing into
-    /// non-leaf children with the propagated [`Ctx`].
-    fn rewrite(
-        &self,
-        node: &Arc<dyn ExecutionPlan>,
-        ctx: Ctx,
-        n: usize,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        let children = node.children();
-        if children.is_empty() {
-            return Ok(Arc::clone(node));
+    /// A leaf is bumpable when it is a single-partition `IcebergScanExec` whose
+    /// cached manifest byte size reaches the threshold. Unknown size counts as
+    /// below threshold (conservative): the pass never parallelizes a scan it
+    /// cannot size. A zero threshold disables the size gate.
+    fn is_bumpable_scan(&self, leaf: &Arc<dyn ExecutionPlan>) -> bool {
+        let Some(scan) = leaf.downcast_ref::<IcebergScanExec>() else {
+            return false;
+        };
+        if scan.properties().output_partitioning().partition_count() != 1 {
+            return false;
         }
-        let mut new_children: Vec<Arc<dyn ExecutionPlan>> = Vec::with_capacity(children.len());
-        let mut changed = false;
-        for (idx, child) in children.iter().enumerate() {
-            if child.children().is_empty() {
-                match self.rewrite_leaf(node, idx, ctx, child, n) {
-                    Some(replacement) => {
-                        new_children.push(replacement);
-                        changed = true;
-                    }
-                    None => new_children.push(Arc::clone(child)),
-                }
-            } else {
-                let child_ctx = child_ctx(node, idx, ctx);
-                let rewritten = self.rewrite(child, child_ctx, n)?;
-                if !Arc::ptr_eq(&rewritten, child) {
-                    changed = true;
-                }
-                new_children.push(rewritten);
-            }
-        }
-        if changed {
-            Arc::clone(node).with_new_children(new_children)
-        } else {
-            Ok(Arc::clone(node))
-        }
-    }
-
-    /// Decide and apply the action for a leaf `child` of `parent` at `idx`.
-    /// Returns the replacement node, or `None` to leave the child unchanged.
-    fn rewrite_leaf(
-        &self,
-        parent: &Arc<dyn ExecutionPlan>,
-        idx: usize,
-        parent_ctx: Ctx,
-        child: &Arc<dyn ExecutionPlan>,
-        n: usize,
-    ) -> Option<Arc<dyn ExecutionPlan>> {
-        let scan = child.downcast_ref::<IcebergScanExec>()?;
-        if scan.properties().output_partitioning().partition_count() != 1 || !self.qualifies(scan) {
-            return None;
-        }
-        match classify_child(parent, idx, parent_ctx) {
-            LeafAction::Serial => None,
-            LeafAction::BumpRoundRobin => {
-                Some(Arc::new(scan.clone().with_target_partitions(n)))
-            }
-            LeafAction::BumpHash(exprs) => {
-                let bumped: Arc<dyn ExecutionPlan> =
-                    Arc::new(scan.clone().with_target_partitions(n));
-                let repart =
-                    RepartitionExec::try_new(bumped, Partitioning::Hash(exprs, n)).ok()?;
-                Some(Arc::new(repart))
-            }
-        }
-    }
-
-    /// Bump a root-level scan when it qualifies. Root parallelism is absorbed by
-    /// the `CoalescePartitionsExec` `execute_stream` adds over a multi-partition
-    /// plan, so a bare scan root is always safe to parallelize.
-    fn bump_if_qualifying(
-        &self,
-        plan: &Arc<dyn ExecutionPlan>,
-        n: usize,
-    ) -> Option<Arc<dyn ExecutionPlan>> {
-        let scan = plan.downcast_ref::<IcebergScanExec>()?;
-        if scan.properties().output_partitioning().partition_count() != 1 || !self.qualifies(scan) {
-            return None;
-        }
-        Some(Arc::new(scan.clone().with_target_partitions(n)))
-    }
-
-    /// A scan qualifies when its cached manifest byte size reaches the
-    /// threshold. Unknown size is treated as below threshold (conservative):
-    /// the pass never parallelizes a scan it cannot size. A zero threshold
-    /// disables the gate.
-    fn qualifies(&self, scan: &IcebergScanExec) -> bool {
         if self.byte_threshold == 0 {
             return true;
         }
@@ -249,60 +139,62 @@ impl ParallelScanRule {
     }
 }
 
-/// True if `node` merges or re-partitions its input, absorbing whatever
-/// partition count arrives from below.
-fn is_absorbing_exchange(node: &Arc<dyn ExecutionPlan>) -> bool {
-    node.downcast_ref::<RepartitionExec>().is_some()
-        || node.downcast_ref::<CoalescePartitionsExec>().is_some()
+/// Rebuild the plan, replacing each scan in `targets` (matched by pointer
+/// identity) with a copy bumped to `n` output partitions. `targets` come from
+/// [`collect_non_build_leaves`] filtered to single-partition `IcebergScanExec`,
+/// so a build-side scan can never be a target.
+fn bump_scans(
+    plan: &Arc<dyn ExecutionPlan>,
+    targets: &[Arc<dyn ExecutionPlan>],
+    n: usize,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    let transformed = Arc::clone(plan).transform_up(|node| {
+        if targets.iter().any(|t| Arc::ptr_eq(t, &node)) {
+            let scan = node
+                .downcast_ref::<IcebergScanExec>()
+                .expect("target is an IcebergScanExec");
+            let bumped: Arc<dyn ExecutionPlan> =
+                Arc::new(scan.clone().with_target_partitions(n));
+            Ok(Transformed::yes(bumped))
+        } else {
+            Ok(Transformed::no(node))
+        }
+    })?;
+    Ok(transformed.data)
 }
 
-/// The [`Ctx`] to propagate into child `idx` of `parent`.
-fn child_ctx(parent: &Arc<dyn ExecutionPlan>, idx: usize, parent_ctx: Ctx) -> Ctx {
-    if is_absorbing_exchange(parent) {
-        return Ctx::Free;
-    }
-    if requires_ordering(parent, idx) {
-        return Ctx::Blocked;
-    }
-    match parent.required_input_distribution().into_iter().nth(idx) {
-        Some(Distribution::SinglePartition) => Ctx::Blocked,
-        // A Hash requirement is satisfied by an exchange within the child
-        // subtree (`EnforceDistribution` placed one) or, for a direct leaf, by
-        // the explicit repartition this pass inserts; either way parallelism
-        // below is absorbed.
-        Some(Distribution::HashPartitioned(_)) => Ctx::Free,
-        // Unspecified (or missing): the parent passes its input partition count
-        // straight up, so the child inherits the parent's absorption state.
-        _ => parent_ctx,
-    }
+/// Collect the leaf plans that are safe to parallelize: a leaf is included
+/// unless, on its path from the root, it is reached through an operator that
+/// requires that child to be a single partition or to arrive in a specific
+/// order. Build sides of `CollectLeft` joins, global sorts, global limits, and
+/// final aggregates over collapsed single-partition inputs all taint their
+/// subtree; `Partitioned`-join and pipeline (filter/projection) branches do not.
+///
+/// This is the q72 regression guard as a pure function over the plan tree, so it
+/// is unit-tested directly with stand-in leaves (the sibling `parallel_probe_scan`
+/// rule tests its guard the same way).
+pub(crate) fn collect_non_build_leaves(
+    plan: &Arc<dyn ExecutionPlan>,
+) -> Vec<Arc<dyn ExecutionPlan>> {
+    let mut out = Vec::new();
+    walk(plan, false, &mut out);
+    out
 }
 
-/// Decide the action for a leaf child `idx` of `parent`, given the parent's
-/// absorption state. Pure over the plan tree (no `IcebergScanExec` dependency)
-/// so the q72-guard decisions are unit-tested directly.
-fn classify_child(parent: &Arc<dyn ExecutionPlan>, idx: usize, parent_ctx: Ctx) -> LeafAction {
-    if is_absorbing_exchange(parent) {
-        return LeafAction::BumpRoundRobin;
-    }
-    if requires_ordering(parent, idx) {
-        return LeafAction::Serial;
-    }
-    match parent.required_input_distribution().into_iter().nth(idx) {
-        Some(Distribution::SinglePartition) => LeafAction::Serial,
-        Some(Distribution::HashPartitioned(exprs)) => {
-            if parent_ctx == Ctx::Free {
-                LeafAction::BumpHash(exprs)
-            } else {
-                LeafAction::Serial
-            }
+fn walk(node: &Arc<dyn ExecutionPlan>, tainted: bool, out: &mut Vec<Arc<dyn ExecutionPlan>>) {
+    let children = node.children();
+    if children.is_empty() {
+        if !tainted {
+            out.push(Arc::clone(node));
         }
-        _ => {
-            if parent_ctx == Ctx::Free {
-                LeafAction::BumpRoundRobin
-            } else {
-                LeafAction::Serial
-            }
-        }
+        return;
+    }
+    let reqs = node.required_input_distribution();
+    for (idx, child) in children.iter().enumerate() {
+        let child_tainted = tainted
+            || matches!(reqs.get(idx), Some(Distribution::SinglePartition))
+            || requires_ordering(node, idx);
+        walk(child, child_tainted, out);
     }
 }
 
@@ -325,11 +217,12 @@ mod tests {
     use datafusion::common::NullEquality;
     use datafusion::logical_expr::JoinType;
     use datafusion::physical_expr::expressions::col;
+    use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
     use datafusion::physical_plan::filter::FilterExec;
     use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
     use datafusion::physical_plan::memory::LazyMemoryExec;
+    use datafusion::physical_plan::sorts::sort::SortExec;
     use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
-    use datafusion::physical_expr::{expressions::Column, LexOrdering, PhysicalSortExpr};
 
     fn schema() -> Arc<Schema> {
         Arc::new(Schema::new(vec![
@@ -338,10 +231,11 @@ mod tests {
         ]))
     }
 
-    // A childless stand-in for a scan leaf. The classification functions are
-    // pure over the plan tree, so a `LazyMemoryExec` exercises the q72-guard
-    // decisions without needing a live Iceberg `Table` (mirrors the sibling
-    // `parallel_probe_scan` tests).
+    // A childless stand-in for a scan leaf. The taint walk is pure over the plan
+    // tree, so a `LazyMemoryExec` exercises the q72 guard without a live Iceberg
+    // `Table` (mirrors the sibling `parallel_probe_scan` tests). The rule's
+    // `is_bumpable_scan` filter (IcebergScanExec + byte threshold) is applied
+    // separately in `optimize`.
     fn leaf() -> Arc<dyn ExecutionPlan> {
         Arc::new(LazyMemoryExec::try_new(schema(), vec![]).unwrap())
     }
@@ -371,114 +265,158 @@ mod tests {
     }
 
     fn filter(child: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
-        // val IS NOT NULL: any always-typed boolean predicate works; we only
-        // inspect the plan shape, never execute.
         let predicate = datafusion::physical_plan::expressions::IsNotNullExpr::new(
             col("val", &child.schema()).unwrap(),
         );
         Arc::new(FilterExec::try_new(Arc::new(predicate), child).unwrap())
     }
 
-    // Task 3.2 (and 3.1): the probe input of a `Partitioned` hash join is
-    // classified `BumpHash` on the join key. `BumpHash` inserts a
-    // `RepartitionExec(Hash)` between scan and join and never rebuilds the join,
-    // so no `CoalescePartitionsExec` appears above the scan (3.1) and the join
-    // stays `Partitioned`, not `CollectLeft` (3.2).
-    #[test]
-    fn partitioned_join_probe_is_bump_hash_on_the_join_key() {
-        let j = join(leaf(), leaf(), PartitionMode::Partitioned);
-        match classify_child(&j, 1, Ctx::Free) {
-            LeafAction::BumpHash(exprs) => {
-                assert_eq!(exprs.len(), 1, "one join key");
-                let c = exprs[0].downcast_ref::<Column>().expect("column key");
-                assert_eq!(c.name(), "id", "hash repartition must use the join key");
-            }
-            other => panic!("expected BumpHash, got {other:?}"),
-        }
-        // The build (left) side of the same join is also hash-partitioned.
-        assert!(matches!(
-            classify_child(&j, 0, Ctx::Free),
-            LeafAction::BumpHash(_)
-        ));
+    fn ptr_in(leaves: &[Arc<dyn ExecutionPlan>], target: &Arc<dyn ExecutionPlan>) -> bool {
+        leaves.iter().any(|l| Arc::ptr_eq(l, target))
     }
 
-    // Task 3.3: a filter-only parent parallelizes with round-robin and inserts
-    // no exchange.
+    // Tasks 3.1 / 3.2: both inputs of a `Partitioned` join are collected, so the
+    // fact scan is bumped. Re-running `EnforceDistribution` then repartitions
+    // both sides to `Hash(N)` (see `enforce_distribution_reconciles_partitioned_join`),
+    // which keeps the join `Partitioned` and inserts no `CoalescePartitionsExec`
+    // above the scan.
     #[test]
-    fn filter_parent_is_bump_round_robin_no_exchange() {
-        let f = filter(leaf());
-        assert!(matches!(
-            classify_child(&f, 0, Ctx::Free),
-            LeafAction::BumpRoundRobin
-        ));
+    fn partitioned_join_both_sides_collected() {
+        let l = leaf();
+        let r = leaf();
+        let j = join(Arc::clone(&l), Arc::clone(&r), PartitionMode::Partitioned);
+        let leaves = collect_non_build_leaves(&j);
+        assert!(ptr_in(&leaves, &l), "left Partitioned-join input is bumpable");
+        assert!(ptr_in(&leaves, &r), "right Partitioned-join input is bumpable");
     }
 
-    // Task 3.4 / q72 guard: the build side of a `CollectLeft` join requires a
-    // single partition, so it is left serial and can never be parallelized.
+    // Task 3.4 / q72 guard: the build (left) side of a `CollectLeft` join is
+    // excluded; the probe (right) side is included.
     #[test]
-    fn collect_left_build_side_is_serial() {
-        let j = join(leaf(), leaf(), PartitionMode::CollectLeft);
-        assert!(matches!(
-            classify_child(&j, 0, Ctx::Free),
-            LeafAction::Serial
-        ));
+    fn collect_left_excludes_build_includes_probe() {
+        let build = leaf();
+        let probe = leaf();
+        let j = join(Arc::clone(&build), Arc::clone(&probe), PartitionMode::CollectLeft);
+        let leaves = collect_non_build_leaves(&j);
+        assert!(!ptr_in(&leaves, &build), "CollectLeft build side must never be bumped");
+        assert!(ptr_in(&leaves, &probe), "CollectLeft probe side is bumpable");
     }
 
-    // The probe side of a `CollectLeft` join has no distribution requirement, so
-    // it is parallelizable when the parallelism is absorbed above (Ctx::Free)
-    // and left serial when it is not (Ctx::Blocked).
+    // Nested SSB shape: dimA join (dimB join fact), all CollectLeft. Only the
+    // fact probe is collectable; every dimension build side is excluded.
     #[test]
-    fn collect_left_probe_side_depends_on_absorption() {
-        let j = join(leaf(), leaf(), PartitionMode::CollectLeft);
-        assert!(matches!(
-            classify_child(&j, 1, Ctx::Free),
-            LeafAction::BumpRoundRobin
-        ));
-        assert!(matches!(
-            classify_child(&j, 1, Ctx::Blocked),
-            LeafAction::Serial
-        ));
+    fn nested_collect_left_collects_only_the_fact_probe() {
+        let dim_a = leaf();
+        let dim_b = leaf();
+        let fact = leaf();
+        let inner = join(Arc::clone(&dim_b), Arc::clone(&fact), PartitionMode::CollectLeft);
+        let outer = join(Arc::clone(&dim_a), inner, PartitionMode::CollectLeft);
+        let leaves = collect_non_build_leaves(&outer);
+        assert!(ptr_in(&leaves, &fact), "the fact probe is collected");
+        assert!(!ptr_in(&leaves, &dim_a), "dimA build excluded");
+        assert!(!ptr_in(&leaves, &dim_b), "dimB build excluded");
     }
 
-    // A pipeline scan whose extra partitions would reach a single-partition
-    // boundary unmerged (Ctx::Blocked) is left serial.
+    // Task 3.3: a filter passes its scan through as bumpable (no distribution
+    // requirement).
     #[test]
-    fn unspecified_parent_serial_when_blocked() {
-        let f = filter(leaf());
-        assert!(matches!(
-            classify_child(&f, 0, Ctx::Blocked),
-            LeafAction::Serial
-        ));
+    fn filter_passes_scan_through() {
+        let l = leaf();
+        let f = filter(Arc::clone(&l));
+        assert!(ptr_in(&collect_non_build_leaves(&f), &l));
     }
 
-    // An operator that requires an input ordering (e.g. SortPreservingMerge)
-    // leaves its child serial: bumping the scan would scramble the assumed
-    // per-partition order.
+    // Task 2.4: a global sort requires a single partition, so its scan is left
+    // serial (excluded).
     #[test]
-    fn ordering_requiring_parent_is_serial() {
-        let child = leaf();
-        let sort_expr = PhysicalSortExpr::new_default(col("id", &child.schema()).unwrap());
+    fn global_sort_excludes_scan() {
+        let l = leaf();
+        let sort_expr = PhysicalSortExpr::new_default(col("id", &l.schema()).unwrap());
         let ordering = LexOrdering::new(vec![sort_expr]).unwrap();
-        let spm = Arc::new(SortPreservingMergeExec::new(ordering, child));
-        let spm: Arc<dyn ExecutionPlan> = spm;
-        assert!(matches!(
-            classify_child(&spm, 0, Ctx::Free),
-            LeafAction::Serial
-        ));
+        // preserve_partitioning defaults to false: a global sort.
+        let sort: Arc<dyn ExecutionPlan> = Arc::new(SortExec::new(ordering, Arc::clone(&l)));
+        assert!(!ptr_in(&collect_non_build_leaves(&sort), &l));
     }
 
-    // An absorbing exchange parent bumps its child to round-robin regardless of
-    // the incoming ctx: the exchange re-partitions or gathers below it.
+    // An operator that requires an input ordering (SortPreservingMerge) excludes
+    // its scan: bumping would scramble the assumed per-partition order.
     #[test]
-    fn exchange_parent_bumps_round_robin() {
-        let child = leaf();
-        let repart = Arc::new(
-            RepartitionExec::try_new(child, Partitioning::RoundRobinBatch(4)).unwrap(),
+    fn ordering_requiring_parent_excludes_scan() {
+        let l = leaf();
+        let sort_expr = PhysicalSortExpr::new_default(col("id", &l.schema()).unwrap());
+        let ordering = LexOrdering::new(vec![sort_expr]).unwrap();
+        let spm: Arc<dyn ExecutionPlan> =
+            Arc::new(SortPreservingMergeExec::new(ordering, Arc::clone(&l)));
+        assert!(!ptr_in(&collect_non_build_leaves(&spm), &l));
+    }
+
+    // The load-bearing DataFusion behaviour the rule relies on: bump one input of
+    // a Partitioned join (fact at 4 partitions) and leave the other at 1, then
+    // let EnforceDistribution (inside `create_physical_plan`) reconcile. It must
+    // insert `RepartitionExec(Hash)` above BOTH inputs, keep the join
+    // `Partitioned`, and add no `CoalescePartitionsExec` above the 1-partition
+    // side. This is what makes bump + re-run safe for the fact-dim case (tasks
+    // 3.1 / 3.2).
+    #[tokio::test]
+    async fn enforce_distribution_reconciles_partitioned_join() {
+        use datafusion::arrow::array::Int64Array;
+        use datafusion::arrow::record_batch::RecordBatch;
+        use datafusion::datasource::MemTable;
+        use datafusion::physical_plan::displayable;
+        use datafusion::prelude::{SessionConfig, SessionContext};
+
+        let cfg = SessionConfig::new()
+            .with_target_partitions(4)
+            // Force Partitioned (not CollectLeft) so we exercise the fact-dim
+            // hash-partitioned shape.
+            .set_usize("datafusion.optimizer.hash_join_single_partition_threshold", 0);
+        let ctx = SessionContext::new_with_config(cfg);
+        let s = schema();
+        let b = RecordBatch::try_new(
+            s.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3])),
+                Arc::new(Int64Array::from(vec![10, 20, 30])),
+            ],
+        )
+        .unwrap();
+        // fact: 4 partitions (a bumped scan); dim: 1 partition (unbumped).
+        ctx.register_table(
+            "fact",
+            Arc::new(
+                MemTable::try_new(
+                    s.clone(),
+                    vec![vec![b.clone()], vec![b.clone()], vec![b.clone()], vec![b.clone()]],
+                )
+                .unwrap(),
+            ),
+        )
+        .unwrap();
+        ctx.register_table("dim", Arc::new(MemTable::try_new(s.clone(), vec![vec![b]]).unwrap()))
+            .unwrap();
+
+        let plan = ctx
+            .sql("SELECT fact.val FROM fact JOIN dim ON fact.id = dim.id")
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+        let rendered = format!("{}", displayable(plan.as_ref()).indent(true));
+
+        assert!(
+            rendered.contains("mode=Partitioned"),
+            "join must stay Partitioned, not fall back to CollectLeft:\n{rendered}"
         );
-        let repart: Arc<dyn ExecutionPlan> = repart;
-        assert!(matches!(
-            classify_child(&repart, 0, Ctx::Blocked),
-            LeafAction::BumpRoundRobin
-        ));
+        assert!(
+            !rendered.contains("CoalescePartitionsExec"),
+            "no CoalescePartitionsExec may be inserted above a scan:\n{rendered}"
+        );
+        assert_eq!(
+            rendered.matches("RepartitionExec: partitioning=Hash").count(),
+            2,
+            "EnforceDistribution must hash-repartition BOTH join inputs to match \
+             partition counts:\n{rendered}"
+        );
     }
 }

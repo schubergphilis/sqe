@@ -351,12 +351,14 @@ impl IcebergScanExec {
     /// `UnknownPartitioning(n)`. Both satisfy `Distribution::UnspecifiedDistribution`
     /// (filters, projections, the probe side of a `CollectLeft` join), so a
     /// pipeline consumer sees the parallelism with no added exchange. Neither
-    /// satisfies `HashPartitioning`, so a `Partitioned` hash join still needs an
-    /// explicit `RepartitionExec(Hash(key), n)` above the scan -- the
-    /// partitioning-aware planner pass places it deliberately instead of letting
-    /// `EnforceDistribution` guess from `UnknownPartitioning` and insert a
-    /// `CoalescePartitionsExec` (the #131 regression). `RoundRobinBatch` names
-    /// the file-round-robin fan-out honestly for a source node.
+    /// satisfies `HashPartitioning`, so a `Partitioned` hash join still needs a
+    /// `RepartitionExec(Hash(key), n)` above the scan; the parallel-scan pass
+    /// re-runs `EnforceDistribution` after bumping, which inserts that
+    /// repartition on both join sides. `RoundRobinBatch` names the
+    /// file-round-robin fan-out honestly for a source node, and unlike
+    /// `UnknownPartitioning` it does not provoke `EnforceDistribution` into a
+    /// `CoalescePartitionsExec` above the scan when the consumer only needs an
+    /// unspecified distribution (the #131 regression shape).
     #[must_use = "with_target_partitions consumes self; bind the returned scan"]
     pub fn with_target_partitions(mut self, target_partitions: usize) -> Self {
         let n = target_partitions.max(1);
