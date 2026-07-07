@@ -4,9 +4,11 @@
 //! classifies it into pressure levels. When memory pressure reaches `Red`
 //! (>95% utilization), new queries are rejected to prevent OOM.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
-use datafusion::execution::memory_pool::{MemoryLimit, MemoryPool};
+use datafusion::execution::memory_pool::{
+    GreedyMemoryPool, MemoryLimit, MemoryPool, TrackConsumersPool,
+};
 use datafusion::execution::runtime_env::RuntimeEnv;
 
 /// Memory pressure classification based on pool utilization.
@@ -94,6 +96,72 @@ pub fn limit_bytes(pool: &Arc<dyn MemoryPool>) -> usize {
     match pool.memory_limit() {
         MemoryLimit::Finite(n) => n,
         _ => 0,
+    }
+}
+
+// ── Per-query memory observation ─────────────────────────────────────────
+//
+// Phase 0 of `openspec/changes/scan-throughput-memory-safety`: make memory
+// growth attributable instead of guessed at. One INFO line per completed
+// query carries the pool residue and process RSS; residue above a threshold
+// additionally logs the pool's top consumers by name. Two kernel OOM kills at
+// SF10 (2026-07-06) happened below the configured pool cap, so RSS-vs-pool
+// divergence across a query sweep is the primary retention signal.
+
+/// The coordinator's concrete tracked pool, kept alongside the `dyn` handle in
+/// the runtime so [`tracked_pool_report`] can name consumers. One coordinator
+/// runtime per process; set once at startup, `None` under `memory_pool =
+/// "fair"` (FairSpillPool has no consumer tracking).
+static TRACKED_POOL: OnceLock<Arc<TrackConsumersPool<GreedyMemoryPool>>> = OnceLock::new();
+
+/// Record the concrete tracked pool for consumer reporting. Later calls are
+/// ignored (tests build multiple runtimes in one process; the first wins).
+pub fn set_tracked_pool(pool: Arc<TrackConsumersPool<GreedyMemoryPool>>) {
+    let _ = TRACKED_POOL.set(pool);
+}
+
+/// The top `n` pool consumers by reserved bytes, or `None` when the runtime
+/// was built without consumer tracking.
+pub fn tracked_pool_report(n: usize) -> Option<String> {
+    TRACKED_POOL.get().map(|p| p.report_top(n))
+}
+
+/// Current process resident set size in bytes, from `/proc/self/status`
+/// (`VmRSS`). Returns `None` where procfs is unavailable (macOS dev boxes);
+/// the retention gates run on Linux.
+pub fn process_rss_bytes() -> Option<usize> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let line = status.lines().find(|l| l.starts_with("VmRSS:"))?;
+    let kb: usize = line.split_whitespace().nth(1)?.parse().ok()?;
+    Some(kb * 1024)
+}
+
+/// Pool residue above this after a query completes triggers a consumer-report
+/// WARN. Concurrent queries legitimately hold reservations, so the report is
+/// a sequential-sweep diagnostic, not an alert; the threshold keeps it quiet
+/// during normal concurrent operation.
+const RESIDUE_REPORT_BYTES: usize = 64 * 1024 * 1024;
+
+/// Log pool residue and process RSS at query completion. Call exactly once
+/// per query, after the tracker records the terminal state (the
+/// `StreamFinalizer` for streamed queries, the batch path otherwise).
+pub fn observe_query_end(pool: &Arc<dyn MemoryPool>, query_id: &dyn std::fmt::Display) {
+    let pool_residue = pool.reserved();
+    let rss = process_rss_bytes();
+    tracing::info!(
+        query_id = %query_id,
+        pool_residue_bytes = pool_residue,
+        process_rss_bytes = rss.unwrap_or(0),
+        "query memory at completion"
+    );
+    if pool_residue > RESIDUE_REPORT_BYTES {
+        if let Some(report) = tracked_pool_report(5) {
+            tracing::warn!(
+                query_id = %query_id,
+                pool_residue_bytes = pool_residue,
+                "pool residue after query completion; top consumers: {report}"
+            );
+        }
     }
 }
 
@@ -191,6 +259,9 @@ pub fn spawn_metrics_reporter(
             metrics.coordinator_memory_used_bytes.set(used as f64);
             metrics.coordinator_memory_limit_bytes.set(limit as f64);
             metrics.coordinator_memory_pressure.set(pressure.as_gauge());
+            if let Some(rss) = process_rss_bytes() {
+                metrics.coordinator_rss_bytes.set(rss as f64);
+            }
         }
     })
 }
@@ -354,6 +425,28 @@ mod tests {
         assert!(b.is_some(), "bob's budget is independent from alice");
         assert_eq!(reg.used_bytes("alice"), 400);
         assert_eq!(reg.used_bytes("bob"), 400);
+    }
+
+    #[test]
+    fn process_rss_reads_on_linux_and_degrades_elsewhere() {
+        let rss = process_rss_bytes();
+        if cfg!(target_os = "linux") {
+            assert!(rss.expect("procfs available") > 0);
+        }
+        // Non-Linux: None is the contract; nothing further to assert.
+    }
+
+    #[test]
+    fn observe_query_end_handles_residue_and_empty_pools() {
+        use datafusion::execution::memory_pool::{MemoryConsumer, GreedyMemoryPool};
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1 << 30));
+        // Empty pool: must not panic.
+        observe_query_end(&pool, &"q-empty");
+        // Live reservation above the report threshold: must not panic even
+        // when the global tracked pool belongs to another runtime (or none).
+        let mut r = MemoryConsumer::new("residue-test").register(&pool);
+        r.try_grow(RESIDUE_REPORT_BYTES + 1).expect("grow");
+        observe_query_end(&pool, &"q-residue");
     }
 
     #[test]
