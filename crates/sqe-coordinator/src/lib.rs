@@ -2,6 +2,7 @@ pub mod adaptive_sort;
 pub mod auth_session;
 pub mod dim_build_swap;
 pub mod parallel_probe_scan;
+pub mod parallel_scan;
 pub mod audit_resources;
 pub mod audit_tag_adapter;
 pub mod metrics_history;
