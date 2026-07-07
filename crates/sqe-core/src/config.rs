@@ -248,6 +248,23 @@ pub struct QueryConfig {
     /// clean (non-swapping) benchmark rig.
     #[serde(default)]
     pub parallel_probe_scan: bool,
+    /// Parallelize single-node Iceberg scans across cores by giving each scan
+    /// N output partitions, where the operator above the scan can consume the
+    /// parallelism without a redundant gather (issue #131 follow-up). The scan
+    /// advertises `RoundRobinBatch(N)`; where it feeds a `Partitioned` hash
+    /// join the pass inserts an explicit `RepartitionExec(Hash(key), N)` so the
+    /// join stays `Partitioned` instead of falling back to `CollectLeft` +
+    /// `CoalescePartitionsExec` (the q72 regression shape). Scans on a
+    /// `CollectLeft` build side, under a global sort, or under an unrecognized
+    /// parent are left serial. N comes from
+    /// `datafusion.execution.target_partitions`; only scans whose cached
+    /// manifest byte size reaches `distribution_threshold` are parallelized.
+    ///
+    /// Default: false. Distinct from `parallel_probe_scan`, which keeps the
+    /// `CollectLeft` shape and parallelizes only the probe side; enable one at
+    /// a time. Stays opt-in until the q72 benchmark gate passes.
+    #[serde(default)]
+    pub parallel_scan: bool,
     /// Swap the dimension scan onto the build side of star-tail CollectLeft
     /// joins when the join-output side has no byte statistics but the dim
     /// scan has a known size under the broadcast threshold. Fixes the
@@ -351,6 +368,7 @@ impl Default for QueryConfig {
             star_schema_reorder: default_true(),
             star_schema_min_ratio: default_star_schema_min_ratio(),
             parallel_probe_scan: false,
+            parallel_scan: false,
             dim_build_swap: true,
             stream_idle_timeout_secs: default_stream_idle_timeout(),
             distributed_scan_pushdown: default_true(),

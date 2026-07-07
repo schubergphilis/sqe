@@ -346,6 +346,17 @@ impl IcebergScanExec {
     /// emits an independent `SendableRecordBatchStream`. The DataFusion planner
     /// typically passes `execution.target_partitions` here so the scan fan-out
     /// matches the configured CPU parallelism.
+    ///
+    /// The scan advertises `Partitioning::RoundRobinBatch(n)` rather than
+    /// `UnknownPartitioning(n)`. Both satisfy `Distribution::UnspecifiedDistribution`
+    /// (filters, projections, the probe side of a `CollectLeft` join), so a
+    /// pipeline consumer sees the parallelism with no added exchange. Neither
+    /// satisfies `HashPartitioning`, so a `Partitioned` hash join still needs an
+    /// explicit `RepartitionExec(Hash(key), n)` above the scan -- the
+    /// partitioning-aware planner pass places it deliberately instead of letting
+    /// `EnforceDistribution` guess from `UnknownPartitioning` and insert a
+    /// `CoalescePartitionsExec` (the #131 regression). `RoundRobinBatch` names
+    /// the file-round-robin fan-out honestly for a source node.
     #[must_use = "with_target_partitions consumes self; bind the returned scan"]
     pub fn with_target_partitions(mut self, target_partitions: usize) -> Self {
         let n = target_partitions.max(1);
@@ -353,7 +364,7 @@ impl IcebergScanExec {
         let eq = self.properties.eq_properties.clone();
         self.properties = Arc::new(PlanProperties::new(
             eq,
-            Partitioning::UnknownPartitioning(n),
+            Partitioning::RoundRobinBatch(n),
             self.properties.emission_type,
             self.properties.boundedness,
         ));
