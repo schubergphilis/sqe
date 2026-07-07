@@ -1,3 +1,5 @@
+> Status 2026-07-07: adopted as phase A of `openspec/changes/scan-throughput-memory-safety/` (adds a memory clamp on the partition count and pool-registered decode buffers on top of this design). Execute via that change's tasks; this folder is retired when it lands.
+
 ## Why
 
 A single-node Iceberg scan runs on one core. `IcebergScanExec` defaults to `DEFAULT_TARGET_PARTITIONS = 1` (`crates/sqe-catalog/src/iceberg_scan.rs:75`) and `target_partitions` is deliberately not auto-wired (`crates/sqe-catalog/src/table_provider.rs:229-246`). On a multi-core coordinator a scan-bound query leaves most cores idle.
