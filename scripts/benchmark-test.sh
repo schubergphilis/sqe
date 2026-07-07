@@ -17,6 +17,24 @@ set -euo pipefail
 #                                                  # for faster incremental rebuilds)
 #   ./scripts/benchmark-test.sh --compare-trino tpch  # compare SQE vs Trino output
 #   ./scripts/benchmark-test.sh --compare-trino       # compare all benchmarks
+#
+# External data source (skip the generate step, load pre-published parquet
+# straight from an S3 bucket — see benchmark-publish-data.sh):
+#   BENCH_DATA_SOURCE=s3://sqe-benchmark \
+#   BENCH_S3_ENDPOINT=https://s3.example.com \
+#   BENCH_S3_PROFILE=storagegrid \
+#   BENCH_SCALE=0.1 ./scripts/benchmark-test.sh tpch
+#
+# External warehouse (Iceberg tables on an external S3 endpoint instead of
+# RustFS; with --compare-trino both engines then read the same endpoint).
+# Convention: sqe-benchmark holds the generated source data, sqe-testlake
+# is the Polaris-connected warehouse:
+#   BENCH_WAREHOUSE=external \
+#   BENCH_WAREHOUSE_LOCATION=s3://sqe-testlake \
+#   BENCH_DATA_SOURCE=s3://sqe-benchmark \
+#   BENCH_S3_ENDPOINT=https://s3.example.com \
+#   BENCH_S3_PROFILE=storagegrid \
+#   BENCH_SCALE=1 ./scripts/benchmark-test.sh --compare-trino tpch ssb
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -34,6 +52,11 @@ BENCH_PORT_TRINO="18080"
 COMPARE_TRINO="${COMPARE_TRINO:-}"
 TRINO_PORT="38080"
 TRINO_IMAGE="${TRINO_IMAGE:-trinodb/trino:481}"
+# Optional container memory cap (e.g. TRINO_MEMORY=12g). The image sizes
+# the JVM heap at 80% of container memory; without a cap that is 80% of
+# the HOST's RAM — on a shared box that starves the coordinator and the
+# comparison. Leave empty for the previous unbounded behavior.
+TRINO_MEMORY="${TRINO_MEMORY:-}"
 
 # S3 credentials (match test stack)
 S3_ACCESS_KEY="${S3_ACCESS_KEY:-s3admin}"
@@ -44,6 +67,84 @@ S3_REGION="${S3_REGION:-us-east-1}"
 # Auth credentials (match test stack)
 SQE_USERNAME="${SQE_USERNAME:-root}"
 SQE_PASSWORD="${SQE_PASSWORD:-}"
+
+# ── External data source (optional) ──────────────────────────
+# BENCH_DATA_SOURCE=s3://<bucket> reads pre-published parquet from an S3
+# bucket instead of generating locally (see benchmark-publish-data.sh).
+# The generate step is skipped and the load's read_parquet() call gets the
+# bucket's credentials inline. The warehouse (where the Iceberg tables are
+# written) is unaffected — it stays on the test stack's RustFS.
+BENCH_DATA_SOURCE="${BENCH_DATA_SOURCE:-generate}"
+BENCH_S3_PROFILE="${BENCH_S3_PROFILE:-default}"
+BENCH_S3_ENDPOINT="${BENCH_S3_ENDPOINT:-}"
+BENCH_S3_REGION="${BENCH_S3_REGION:-us-east-1}"
+
+EXTERNAL_DATA=""
+case "$BENCH_DATA_SOURCE" in
+    s3://*) EXTERNAL_DATA=1 ;;
+    generate) ;;
+    *)
+        echo "ERROR: BENCH_DATA_SOURCE must be 'generate' or an s3:// URL, got: '$BENCH_DATA_SOURCE'" >&2
+        exit 1
+        ;;
+esac
+
+if [ -n "$EXTERNAL_DATA" ]; then
+    if [ -z "$BENCH_S3_ENDPOINT" ]; then
+        echo "ERROR: BENCH_S3_ENDPOINT is required with BENCH_DATA_SOURCE=$BENCH_DATA_SOURCE" >&2
+        exit 1
+    fi
+    DATA_PATH="$BENCH_DATA_SOURCE"
+    DATA_S3_ACCESS_KEY="${DATA_S3_ACCESS_KEY:-$(aws configure get aws_access_key_id --profile "$BENCH_S3_PROFILE")}"
+    DATA_S3_SECRET_KEY="${DATA_S3_SECRET_KEY:-$(aws configure get aws_secret_access_key --profile "$BENCH_S3_PROFILE")}"
+    DATA_S3_ENDPOINT="$BENCH_S3_ENDPOINT"
+    DATA_S3_REGION="$BENCH_S3_REGION"
+    if [ -z "$DATA_S3_ACCESS_KEY" ] || [ -z "$DATA_S3_SECRET_KEY" ]; then
+        echo "ERROR: could not resolve S3 credentials from profile '$BENCH_S3_PROFILE'" >&2
+        exit 1
+    fi
+else
+    DATA_PATH="$BENCH_DATA_DIR"
+    DATA_S3_ACCESS_KEY="$S3_ACCESS_KEY"
+    DATA_S3_SECRET_KEY="$S3_SECRET_KEY"
+    DATA_S3_ENDPOINT="$S3_ENDPOINT"
+    DATA_S3_REGION="$S3_REGION"
+fi
+
+# ── External warehouse (optional) ────────────────────────────
+# BENCH_WAREHOUSE=external puts the Iceberg WAREHOUSE (where the loaded
+# tables live) on an external S3 endpoint instead of RustFS: Polaris is
+# recreated with matching credentials, the catalog's storage config
+# points at the endpoint, SQE's [storage] block is rewritten in the temp
+# config, and the Trino comparison container reads the same endpoint —
+# both engines then fetch over the identical network path.
+#   BENCH_WAREHOUSE=external \
+#   BENCH_WAREHOUSE_LOCATION=s3://sqe-testlake/warehouse \
+#   BENCH_S3_ENDPOINT=https://s3.example.com BENCH_S3_PROFILE=... \
+#   ./scripts/benchmark-test.sh --compare-trino tpch
+BENCH_WAREHOUSE="${BENCH_WAREHOUSE:-local}"
+BENCH_WAREHOUSE_LOCATION="${BENCH_WAREHOUSE_LOCATION:-}"
+
+case "$BENCH_WAREHOUSE" in
+    local|external) ;;
+    *)
+        echo "ERROR: BENCH_WAREHOUSE must be 'local' or 'external', got: '$BENCH_WAREHOUSE'" >&2
+        exit 1
+        ;;
+esac
+
+if [ "$BENCH_WAREHOUSE" = "external" ]; then
+    if [ -z "$BENCH_S3_ENDPOINT" ] || [ -z "$BENCH_WAREHOUSE_LOCATION" ]; then
+        echo "ERROR: BENCH_WAREHOUSE=external requires BENCH_S3_ENDPOINT and BENCH_WAREHOUSE_LOCATION" >&2
+        exit 1
+    fi
+    WH_S3_ACCESS_KEY="${WH_S3_ACCESS_KEY:-$(aws configure get aws_access_key_id --profile "$BENCH_S3_PROFILE")}"
+    WH_S3_SECRET_KEY="${WH_S3_SECRET_KEY:-$(aws configure get aws_secret_access_key --profile "$BENCH_S3_PROFILE")}"
+    if [ -z "$WH_S3_ACCESS_KEY" ] || [ -z "$WH_S3_SECRET_KEY" ]; then
+        echo "ERROR: could not resolve S3 credentials from profile '$BENCH_S3_PROFILE'" >&2
+        exit 1
+    fi
+fi
 
 # Build profile: `release` (default) uses `cargo build --release` and
 # runs binaries out of `target/release/`. `debug` skips `--release` for
@@ -106,10 +207,31 @@ echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo "  Starting test stack..."
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+if [ "$BENCH_WAREHOUSE" = "external" ]; then
+    # Polaris performs the warehouse's S3 operations itself (metadata
+    # writes, drop-with-purge), so it must carry the external endpoint
+    # and credentials. Recreate so the env change applies; Polaris here
+    # is in-memory, the bootstrap below repopulates it.
+    export POLARIS_S3_ENDPOINT="$BENCH_S3_ENDPOINT"
+    export POLARIS_S3_ACCESS_KEY="$WH_S3_ACCESS_KEY"
+    export POLARIS_S3_SECRET_KEY="$WH_S3_SECRET_KEY"
+    export POLARIS_S3_REGION="$BENCH_S3_REGION"
+    # No STS on S3-compatible endpoints like StorageGRID: skip Polaris'
+    # credential subscoping or CREATE TABLE fails with STS 405.
+    export POLARIS_SKIP_SUBSCOPING=true
+    docker compose -f "$COMPOSE_FILE" up -d --force-recreate polaris
+fi
 docker compose -f "$COMPOSE_FILE" up -d
 
 # Bootstrap (creates bucket, warehouse, grants)
-"$SCRIPT_DIR/bootstrap-test.sh"
+if [ "$BENCH_WAREHOUSE" = "external" ]; then
+    WAREHOUSE_MODE=external \
+    EXT_S3_ENDPOINT="$BENCH_S3_ENDPOINT" \
+    WAREHOUSE_LOCATION="$BENCH_WAREHOUSE_LOCATION" \
+        "$SCRIPT_DIR/bootstrap-test.sh"
+else
+    "$SCRIPT_DIR/bootstrap-test.sh"
+fi
 echo ""
 
 # ── Start SQE coordinator in background ───────────────────────
@@ -118,6 +240,59 @@ echo "  Starting SQE coordinator..."
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 SQE_LOG_FILE="/tmp/sqe-bench-coord-$$.log"
 SQE_CONFIG="$ROOT_DIR/tests/sqe-test.toml"
+
+# Generate a temp coordinator config when anything is external:
+# - External data source: read_parquet() carries an inline `endpoint =>`
+#   override, and the coordinator's SSRF gate (issue #46) rejects endpoint
+#   hosts that are not in `[storage.tvf] allowed_http_hosts`.
+# - External warehouse: SQE reads/writes the Iceberg tables with its
+#   [storage] credentials, so that block must point at the external
+#   endpoint instead of RustFS.
+if [ -n "$EXTERNAL_DATA" ] || [ "$BENCH_WAREHOUSE" = "external" ]; then
+    ENDPOINT_HOST=$(python3 -c "from urllib.parse import urlparse; import sys; print(urlparse(sys.argv[1]).hostname or '')" "$BENCH_S3_ENDPOINT")
+    if [ -z "$ENDPOINT_HOST" ]; then
+        echo "ERROR: could not parse host from BENCH_S3_ENDPOINT=$BENCH_S3_ENDPOINT" >&2
+        exit 1
+    fi
+    SQE_CONFIG_EXT="/tmp/sqe-bench-config-$$.toml"
+    touch "$SQE_CONFIG_EXT" && chmod 600 "$SQE_CONFIG_EXT"
+    WH_MODE="$BENCH_WAREHOUSE" \
+    WH_ENDPOINT="$BENCH_S3_ENDPOINT" \
+    WH_ACCESS_KEY="${WH_S3_ACCESS_KEY:-}" \
+    WH_SECRET_KEY="${WH_S3_SECRET_KEY:-}" \
+    WH_REGION="$BENCH_S3_REGION" \
+    python3 - "$ROOT_DIR/tests/sqe-test.toml" "$SQE_CONFIG_EXT" "$ENDPOINT_HOST" <<'PYEOF'
+import os
+import re
+import sys
+src, dst, host = sys.argv[1:4]
+text = open(src).read()
+anchor = "[storage.tvf]\n"
+assert anchor in text, "tests/sqe-test.toml is missing the [storage.tvf] section"
+# Include the loopback hosts so local-endpoint TVF calls keep working:
+# an explicit allowed_http_hosts REPLACES the (empty) default entirely.
+text = text.replace(anchor, anchor + f'allowed_http_hosts = ["{host}", "localhost", "127.0.0.1"]\n', 1)
+if os.environ.get("WH_MODE") == "external":
+    subs = {
+        "s3_endpoint": os.environ["WH_ENDPOINT"],
+        "s3_access_key": os.environ["WH_ACCESS_KEY"],
+        "s3_secret_key": os.environ["WH_SECRET_KEY"],
+        "s3_region": os.environ["WH_REGION"],
+    }
+    for key, value in subs.items():
+        pattern = re.compile(rf'^{key} = ".*"$', re.MULTILINE)
+        assert pattern.search(text), f"tests/sqe-test.toml is missing '{key}' under [storage]"
+        text = pattern.sub(f'{key} = "{value}"', text)
+open(dst, "w").write(text)
+PYEOF
+    SQE_CONFIG="$SQE_CONFIG_EXT"
+    if [ -n "$EXTERNAL_DATA" ]; then
+        echo "External data source: $BENCH_DATA_SOURCE (endpoint host '$ENDPOINT_HOST' allowlisted)"
+    fi
+    if [ "$BENCH_WAREHOUSE" = "external" ]; then
+        echo "External warehouse: $BENCH_WAREHOUSE_LOCATION via $BENCH_S3_ENDPOINT"
+    fi
+fi
 
 # Fail fast if any coordinator port is already bound. A stale coordinator
 # from a previous run silently steals the health probe below and the bench
@@ -172,12 +347,29 @@ if [ -n "$COMPARE_TRINO" ]; then
         -d "grant_type=client_credentials&client_id=root&client_secret=s3cr3t&scope=PRINCIPAL_ROLE:ALL" \
         | python3 -c "import sys,json; print(json.load(sys.stdin)['access_token'])")
 
-    # Get Polaris and RustFS container IPs on the test stack network
+    # Get the Polaris container IP on the test stack network
     POLARIS_IP=$(docker inspect sqlengine-polaris-1 --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}')
-    RUSTFS_IP=$(docker inspect sqlengine-rustfs-1 --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}')
 
-    # Create Trino catalog config
+    # Trino's S3 target follows the warehouse: RustFS (via container IP)
+    # in local mode, the external endpoint otherwise — then SQE and Trino
+    # fetch table data over the identical network path.
+    if [ "$BENCH_WAREHOUSE" = "external" ]; then
+        TRINO_S3_ENDPOINT="$BENCH_S3_ENDPOINT"
+        TRINO_S3_ACCESS_KEY="$WH_S3_ACCESS_KEY"
+        TRINO_S3_SECRET_KEY="$WH_S3_SECRET_KEY"
+        TRINO_S3_REGION="$BENCH_S3_REGION"
+    else
+        RUSTFS_IP=$(docker inspect sqlengine-rustfs-1 --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}')
+        TRINO_S3_ENDPOINT="http://${RUSTFS_IP}:9000"
+        TRINO_S3_ACCESS_KEY="$S3_ACCESS_KEY"
+        TRINO_S3_SECRET_KEY="$S3_SECRET_KEY"
+        TRINO_S3_REGION="$S3_REGION"
+    fi
+
+    # Create Trino catalog config (may carry external credentials)
     mkdir -p /tmp/trino-bench/catalog
+    touch /tmp/trino-bench/catalog/iceberg.properties
+    chmod 600 /tmp/trino-bench/catalog/iceberg.properties
     cat > /tmp/trino-bench/catalog/iceberg.properties << TRINOEOF
 connector.name=iceberg
 iceberg.catalog.type=rest
@@ -186,11 +378,11 @@ iceberg.rest-catalog.warehouse=test_warehouse
 iceberg.rest-catalog.security=OAUTH2
 iceberg.rest-catalog.oauth2.token=${POLARIS_TOKEN}
 fs.native-s3.enabled=true
-s3.endpoint=http://${RUSTFS_IP}:9000
-s3.region=${S3_REGION}
+s3.endpoint=${TRINO_S3_ENDPOINT}
+s3.region=${TRINO_S3_REGION}
 s3.path-style-access=true
-s3.aws-access-key=${S3_ACCESS_KEY}
-s3.aws-secret-key=${S3_SECRET_KEY}
+s3.aws-access-key=${TRINO_S3_ACCESS_KEY}
+s3.aws-secret-key=${TRINO_S3_SECRET_KEY}
 TRINOEOF
 
     cat > /tmp/trino-bench/config.properties << 'TRINOEOF'
@@ -209,9 +401,14 @@ TRINOEOF
     docker stop trino-bench 2>/dev/null || true
     sleep 1
 
+    TRINO_MEMORY_ARGS=()
+    if [ -n "$TRINO_MEMORY" ]; then
+        TRINO_MEMORY_ARGS=(--memory "$TRINO_MEMORY")
+    fi
     TRINO_CONTAINER=$(docker run -d --rm \
         --name trino-bench \
         -p "${TRINO_PORT}:8080" \
+        ${TRINO_MEMORY_ARGS[@]+"${TRINO_MEMORY_ARGS[@]}"} \
         -v /tmp/trino-bench/catalog/iceberg.properties:/etc/trino/catalog/iceberg.properties:ro \
         -v /tmp/trino-bench/config.properties:/etc/trino/config.properties:ro \
         "$TRINO_IMAGE")
@@ -251,6 +448,7 @@ cleanup() {
     if [ -n "$TRINO_CONTAINER" ]; then
         docker stop trino-bench 2>/dev/null || true
     fi
+    rm -f "${SQE_CONFIG_EXT:-}"
     # Don't tear down docker -- leave it for subsequent runs
     echo "Done."
 }
@@ -279,21 +477,23 @@ for BENCH in "${BENCHMARKS[@]}"; do
     if [ "$BENCH" = "tpcbb" ] && [ -z "$TPCDS_LOADED" ]; then
         echo ""
         echo "  [pre] TPC-BB requires TPC-DS tables — generating and loading..."
-        "$BENCH_BIN" generate tpcds \
-            --scale "$BENCH_SCALE" \
-            --output "$BENCH_DATA_DIR" 2>&1 || true
+        if [ -z "$EXTERNAL_DATA" ]; then
+            "$BENCH_BIN" generate tpcds \
+                --scale "$BENCH_SCALE" \
+                --output "$BENCH_DATA_DIR" 2>&1 || true
+        fi
         "$BENCH_BIN" load tpcds \
             --scale "$BENCH_SCALE" \
-            --data "$BENCH_DATA_DIR" \
+            --data "$DATA_PATH" \
             --protocol "$BENCH_PROTOCOL" \
             --host "$BENCH_HOST" \
             --port "$BENCH_PORT" \
             --username "$SQE_USERNAME" \
             --password "$SQE_PASSWORD" \
-            --s3-access-key "$S3_ACCESS_KEY" \
-            --s3-secret-key "$S3_SECRET_KEY" \
-            --s3-endpoint "$S3_ENDPOINT" \
-            --s3-region "$S3_REGION" \
+            --s3-access-key "$DATA_S3_ACCESS_KEY" \
+            --s3-secret-key "$DATA_S3_SECRET_KEY" \
+            --s3-endpoint "$DATA_S3_ENDPOINT" \
+            --s3-region "$DATA_S3_REGION" \
             --clean 2>&1 || {
             echo "  ✗ Failed to load TPC-DS prerequisite tables for TPC-BB"
             RESULTS+=("$BENCH: PREREQ_FAILED")
@@ -306,18 +506,22 @@ for BENCH in "${BENCHMARKS[@]}"; do
 
     # ── Step 1: Generate ──────────────────────────────────────
     echo ""
-    echo "  [1/3] Generating data..."
-    GEN_START=$(date +%s)
-    if ! "$BENCH_BIN" generate "$BENCH" \
-        --scale "$BENCH_SCALE" \
-        --output "$BENCH_DATA_DIR" 2>&1; then
-        echo "  ✗ Generation FAILED for $BENCH"
-        RESULTS+=("$BENCH: GENERATE_FAILED")
-        TOTAL_ERROR=$((TOTAL_ERROR + 1))
-        continue
+    if [ -n "$EXTERNAL_DATA" ]; then
+        echo "  [1/3] Using pre-published data: $DATA_PATH/$BENCH/sf$BENCH_SCALE"
+    else
+        echo "  [1/3] Generating data..."
+        GEN_START=$(date +%s)
+        if ! "$BENCH_BIN" generate "$BENCH" \
+            --scale "$BENCH_SCALE" \
+            --output "$BENCH_DATA_DIR" 2>&1; then
+            echo "  ✗ Generation FAILED for $BENCH"
+            RESULTS+=("$BENCH: GENERATE_FAILED")
+            TOTAL_ERROR=$((TOTAL_ERROR + 1))
+            continue
+        fi
+        GEN_END=$(date +%s)
+        echo "  ✓ Generated in $((GEN_END - GEN_START))s"
     fi
-    GEN_END=$(date +%s)
-    echo "  ✓ Generated in $((GEN_END - GEN_START))s"
 
     # ── Step 2: Load ──────────────────────────────────────────
     #
@@ -335,16 +539,16 @@ for BENCH in "${BENCHMARKS[@]}"; do
     for attempt in $(seq 1 "$LOAD_ATTEMPTS"); do
         if "$BENCH_BIN" load "$BENCH" \
             --scale "$BENCH_SCALE" \
-            --data "$BENCH_DATA_DIR" \
+            --data "$DATA_PATH" \
             --protocol "$BENCH_PROTOCOL" \
             --host "$BENCH_HOST" \
             --port "$BENCH_PORT" \
             --username "$SQE_USERNAME" \
             --password "$SQE_PASSWORD" \
-            --s3-access-key "$S3_ACCESS_KEY" \
-            --s3-secret-key "$S3_SECRET_KEY" \
-            --s3-endpoint "$S3_ENDPOINT" \
-            --s3-region "$S3_REGION" \
+            --s3-access-key "$DATA_S3_ACCESS_KEY" \
+            --s3-secret-key "$DATA_S3_SECRET_KEY" \
+            --s3-endpoint "$DATA_S3_ENDPOINT" \
+            --s3-region "$DATA_S3_REGION" \
             --clean 2>&1; then
             LOAD_OK=1
             break
@@ -416,7 +620,9 @@ for BENCH in "${BENCHMARKS[@]}"; do
 
     # ── Clean up generated data for this benchmark ────────────
     # Keep tpcds data if tpcbb still needs it (tpcbb loads into tpcds namespace)
-    if [ "$BENCH" = "tpcds" ] && [[ " ${BENCHMARKS[*]} " =~ " tpcbb " ]]; then
+    if [ -n "$EXTERNAL_DATA" ]; then
+        : # nothing staged locally
+    elif [ "$BENCH" = "tpcds" ] && [[ " ${BENCHMARKS[*]} " =~ " tpcbb " ]]; then
         echo "  (keeping tpcds data — needed by tpcbb)"
     else
         rm -rf "${BENCH_DATA_DIR:?}/$BENCH"

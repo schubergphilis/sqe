@@ -669,11 +669,23 @@ pub fn build_s3_store_for_bucket(
 /// If `args.path` is an S3 URL, register an [`AmazonS3`] object store on the
 /// supplied [`SessionContext`] under the bucket-scoped URL so subsequent
 /// listing / read operations resolve it. No-op for local paths.
+///
+/// `runtime_env` is the EXECUTING session's runtime environment. The
+/// `ctx` registration only covers schema inference inside the TVF (the
+/// temp context never executes the scan); at execution time DataFusion
+/// resolves the bucket through the session's object-store registry, and
+/// without this registration the lazy fallback builds a store from the
+/// engine's `[storage]` config — the wrong endpoint and credentials
+/// whenever the call's inline `endpoint =>` differs from the engine's.
+/// The registration is session-scoped and bucket-scoped: later queries in
+/// the same session reusing this bucket resolve to the caller's inline
+/// credentials, never a shared/global registry.
 pub fn register_s3_store_if_needed(
     fn_name: &str,
     ctx: &SessionContext,
     args: &FileTvfArgs,
     storage: &StorageConfig,
+    runtime_env: Option<&datafusion::execution::runtime_env::RuntimeEnv>,
 ) -> DFResult<()> {
     if !is_s3_path(&args.path) {
         return Ok(());
@@ -695,7 +707,11 @@ pub fn register_s3_store_if_needed(
             "{fn_name}: failed to build object-store URL: {e}"
         ))
     })?;
-    ctx.register_object_store(&store_url, Arc::new(s3));
+    let store: Arc<dyn object_store::ObjectStore> = Arc::new(s3);
+    ctx.register_object_store(&store_url, Arc::clone(&store));
+    if let Some(env) = runtime_env {
+        env.register_object_store(&store_url, store);
+    }
     Ok(())
 }
 
