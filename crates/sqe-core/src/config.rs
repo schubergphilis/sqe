@@ -253,21 +253,26 @@ pub struct QueryConfig {
     #[serde(default = "default_true")]
     pub parallel_probe_scan: bool,
     /// Parallelize single-node Iceberg scans across cores by giving each scan
-    /// N output partitions, where the operator above the scan can consume the
-    /// parallelism without a redundant gather (issue #131 follow-up). The scan
-    /// advertises `RoundRobinBatch(N)`; where it feeds a `Partitioned` hash
-    /// join the pass inserts an explicit `RepartitionExec(Hash(key), N)` so the
-    /// join stays `Partitioned` instead of falling back to `CollectLeft` +
-    /// `CoalescePartitionsExec` (the q72 regression shape). Scans on a
-    /// `CollectLeft` build side, under a global sort, or under an unrecognized
-    /// parent are left serial. N comes from
-    /// `datafusion.execution.target_partitions`; only scans whose cached
-    /// manifest byte size reaches `distribution_threshold` are parallelized.
+    /// N output partitions, then re-running `EnforceDistribution` and
+    /// `EnforceSorting` so the plan re-erects the exchanges and orderings it
+    /// needs (issue #131 follow-up). Only join build sides taint: a
+    /// `CollectLeft` build stays serial (the q72 dimension guard), and the
+    /// probe/`Partitioned`-join fact scans this exists for get parallel decode.
+    /// N comes from `datafusion.execution.target_partitions`; only scans whose
+    /// cached manifest byte size reaches `distribution_threshold` are
+    /// parallelized, so small dimension scans stay serial.
     ///
-    /// Default: false. Distinct from `parallel_probe_scan`, which keeps the
-    /// `CollectLeft` shape and parallelizes only the probe side; enable one at
-    /// a time. Stays opt-in until the q72 benchmark gate passes.
-    #[serde(default)]
+    /// Default: true (since 2026-07-08). Validated on the clean SF10 rig
+    /// together with `parallel_probe_scan`: the Partitioned-join fact scans it
+    /// unlocks take tpcds q72 52s -> 41s, tpch q18 12.4s -> 7.1s and
+    /// q21 12.3s -> 9.0s; suite totals vs Trino improve to tpch 63.0s vs
+    /// 109.3s and tpcds 212.5s vs 313.7s with SSB at parity, 22/22 + 13/13 +
+    /// 99/99 rows matched. The only measured cost is ~1.5s on tpcds q39
+    /// (still ahead of Trino). Complements `parallel_probe_scan` (CollectLeft
+    /// probes); this rule covers scans under `Partitioned`-mode joins and
+    /// join-free plans above the size gate. Set to false to restore serial
+    /// scans outside CollectLeft probes.
+    #[serde(default = "default_true")]
     pub parallel_scan: bool,
     /// Swap the dimension scan onto the build side of star-tail CollectLeft
     /// joins when the join-output side has no byte statistics but the dim
@@ -372,7 +377,7 @@ impl Default for QueryConfig {
             star_schema_reorder: default_true(),
             star_schema_min_ratio: default_star_schema_min_ratio(),
             parallel_probe_scan: true,
-            parallel_scan: false,
+            parallel_scan: true,
             dim_build_swap: true,
             stream_idle_timeout_secs: default_stream_idle_timeout(),
             distributed_scan_pushdown: default_true(),
