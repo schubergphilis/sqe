@@ -444,7 +444,7 @@ mod tests {
         observe_query_end(&pool, &"q-empty");
         // Live reservation above the report threshold: must not panic even
         // when the global tracked pool belongs to another runtime (or none).
-        let mut r = MemoryConsumer::new("residue-test").register(&pool);
+        let r = MemoryConsumer::new("residue-test").register(&pool);
         r.try_grow(RESIDUE_REPORT_BYTES + 1).expect("grow");
         observe_query_end(&pool, &"q-residue");
     }
