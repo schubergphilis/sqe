@@ -16,7 +16,7 @@ FROM
     transaction
 WHERE
     t_day = DATE '2026-06-10'
-    AND t_a_id BETWEEN 1000000 AND 1000100
+    AND t_a_id BETWEEN 1000 AND 1100
 ORDER BY
     t_a_id, t_ts
 LIMIT 1000
