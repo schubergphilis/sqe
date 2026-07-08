@@ -84,6 +84,13 @@ cargo-check:
 cargo-test:
   stage: test
   image: rust:bookworm
+  variables:
+    # Debug-build async state machines in the scan path are large (no move
+    # elision, fat frames); the default 2MB test-thread stack overflowed once
+    # already (audit_e2e it-test, MR 537). The root cause is fixed by boxing
+    # the scan stream future, but keep 8MB of headroom so a future local
+    # regression fails a test with a clean message instead of SIGABRT.
+    RUST_MIN_STACK: "8388608"
   before_script:
     # `clang` + `mold` are required because .cargo/config.toml pins them as
     # the linker for x86_64-unknown-linux-gnu builds (faster link than GNU
