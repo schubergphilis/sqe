@@ -146,6 +146,11 @@ pub enum Command {
         /// interrupted run (iceberg sink)
         #[arg(long, default_value_t = false)]
         resume: bool,
+
+        /// Drop and recreate the bank tables before loading, making the
+        /// run idempotent (iceberg sink)
+        #[arg(long, default_value_t = false, conflicts_with = "resume")]
+        clean: bool,
     },
 
     /// Load generated data into SQE via Iceberg REST catalog
