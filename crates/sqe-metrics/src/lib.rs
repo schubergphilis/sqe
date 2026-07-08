@@ -49,6 +49,10 @@ pub struct MetricsRegistry {
     pub coordinator_memory_used_bytes: Gauge,
     pub coordinator_memory_limit_bytes: Gauge,
     pub coordinator_memory_pressure: Gauge,
+    /// Process resident set size. Divergence between this and the pool
+    /// gauge across a query sweep is the untracked-memory/retention signal
+    /// (phase 0 of scan-throughput-memory-safety).
+    pub coordinator_rss_bytes: Gauge,
 
     // Spill metrics
     pub sort_spill_count: Counter,
@@ -242,6 +246,13 @@ impl MetricsRegistry {
         )
         .unwrap();
         registry.register(Box::new(coordinator_memory_limit_bytes.clone())).unwrap();
+
+        let coordinator_rss_bytes = Gauge::new(
+            "sqe_coordinator_rss_bytes",
+            "Coordinator process resident set size in bytes",
+        )
+        .unwrap();
+        registry.register(Box::new(coordinator_rss_bytes.clone())).unwrap();
 
         let coordinator_memory_pressure = Gauge::new(
             "sqe_coordinator_memory_pressure",
@@ -615,6 +626,7 @@ impl MetricsRegistry {
             coordinator_memory_used_bytes,
             coordinator_memory_limit_bytes,
             coordinator_memory_pressure,
+            coordinator_rss_bytes,
             sort_spill_count,
             sort_spill_bytes,
             join_spill_count,
