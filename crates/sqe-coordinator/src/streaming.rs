@@ -219,6 +219,7 @@ impl StreamFinalizer {
             pm.spill_bytes,
             pm.peak_memory_bytes,
         );
+        crate::memory::observe_query_end(&self.runtime.memory_pool, &self.query_id);
 
         if let Some(ref metrics) = self.metrics {
             metrics
@@ -296,6 +297,7 @@ impl StreamFinalizer {
     fn on_error(self, rows: usize, err: &sqe_core::SqeError) {
         let duration = self.start.elapsed();
         self.tracker.failed(&self.query_id, err);
+        crate::memory::observe_query_end(&self.runtime.memory_pool, &self.query_id);
 
         if let Some(ref metrics) = self.metrics {
             metrics
@@ -352,6 +354,7 @@ impl StreamFinalizer {
     fn on_cancel(self, rows: usize) {
         let duration = self.start.elapsed();
         self.tracker.canceled(&self.query_id);
+        crate::memory::observe_query_end(&self.runtime.memory_pool, &self.query_id);
 
         if let Some(ref metrics) = self.metrics {
             metrics

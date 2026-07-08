@@ -45,21 +45,25 @@ use sqe_core::parse_memory_limit;
 /// key. Unknown values warn and fall back to greedy.
 fn build_memory_pool(kind: &str, memory_bytes: usize) -> Arc<dyn MemoryPool> {
     const TOP_CONSUMERS_IN_ERROR: usize = 5;
-    match kind.trim().to_ascii_lowercase().as_str() {
-        "fair" => Arc::new(FairSpillPool::new(memory_bytes)),
-        "greedy" => Arc::new(TrackConsumersPool::new(
+    let tracked_greedy = || {
+        let pool = Arc::new(TrackConsumersPool::new(
             GreedyMemoryPool::new(memory_bytes),
             std::num::NonZeroUsize::new(TOP_CONSUMERS_IN_ERROR).expect("non-zero const"),
-        )),
+        ));
+        // Keep the concrete handle for per-query consumer reporting
+        // (crate::memory::tracked_pool_report).
+        crate::memory::set_tracked_pool(Arc::clone(&pool));
+        pool as Arc<dyn MemoryPool>
+    };
+    match kind.trim().to_ascii_lowercase().as_str() {
+        "fair" => Arc::new(FairSpillPool::new(memory_bytes)),
+        "greedy" => tracked_greedy(),
         other => {
             tracing::warn!(
                 memory_pool = other,
                 "Unknown coordinator.memory_pool, defaulting to greedy"
             );
-            Arc::new(TrackConsumersPool::new(
-                GreedyMemoryPool::new(memory_bytes),
-                std::num::NonZeroUsize::new(TOP_CONSUMERS_IN_ERROR).expect("non-zero const"),
-            ))
+            tracked_greedy()
         }
     }
 }
