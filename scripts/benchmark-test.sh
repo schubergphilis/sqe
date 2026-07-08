@@ -355,7 +355,13 @@ if [ -n "$COMPARE_TRINO" ]; then
         | python3 -c "import sys,json; print(json.load(sys.stdin)['access_token'])")
 
     # Get the Polaris container IP on the test stack network
-    POLARIS_IP=$(docker inspect sqlengine-polaris-1 --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}')
+    # Resolve containers through compose, not by hardcoded name: the
+    # compose project is named after the checkout directory, so a name
+    # like "sqlengine-polaris-1" only exists when the repo lives in a
+    # directory called "sqlengine" (a worktree checkout silently gets a
+    # dead or missing container, Trino's catalog URI becomes garbage, and
+    # Trino exits right after "ready").
+    POLARIS_IP=$(docker inspect "$(docker compose -f "$COMPOSE_FILE" ps -q polaris)" --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}')
 
     # Trino's S3 target follows the warehouse: RustFS (via container IP)
     # in local mode, the external endpoint otherwise — then SQE and Trino
@@ -366,7 +372,7 @@ if [ -n "$COMPARE_TRINO" ]; then
         TRINO_S3_SECRET_KEY="$WH_S3_SECRET_KEY"
         TRINO_S3_REGION="$BENCH_S3_REGION"
     else
-        RUSTFS_IP=$(docker inspect sqlengine-rustfs-1 --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}')
+        RUSTFS_IP=$(docker inspect "$(docker compose -f "$COMPOSE_FILE" ps -q rustfs)" --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}')
         TRINO_S3_ENDPOINT="http://${RUSTFS_IP}:9000"
         TRINO_S3_ACCESS_KEY="$S3_ACCESS_KEY"
         TRINO_S3_SECRET_KEY="$S3_SECRET_KEY"
@@ -392,7 +398,23 @@ s3.aws-access-key=${TRINO_S3_ACCESS_KEY}
 s3.aws-secret-key=${TRINO_S3_SECRET_KEY}
 TRINOEOF
 
-    cat > /tmp/trino-bench/config.properties << 'TRINOEOF'
+    # Query memory must fit inside the JVM heap (80% of container memory).
+    # Uncapped, the 8GB default matches the historical behavior. With a
+    # TRINO_MEMORY cap, a fixed 8GB can exceed the heap and Trino exits at
+    # startup with "Configuration is invalid" — the wait loop then times
+    # out and the comparison is silently skipped. Derive ~30% of the cap
+    # instead (floored at 1GB), mirroring Trino's own default ratio.
+    TRINO_QUERY_MEM="8GB"
+    if [ -n "$TRINO_MEMORY" ]; then
+        TRINO_QUERY_MEM=$(python3 -c "
+import re
+m = re.fullmatch(r'(\d+(?:\.\d+)?)([kmgt]?)b?', '$TRINO_MEMORY'.lower())
+n, u = float(m.group(1)), m.group(2)
+gb = n * {'k': 1/2**20, 'm': 1/2**10, 'g': 1, 't': 2**10, '': 1/2**30}[u]
+print(f'{max(1, int(gb * 0.3))}GB')")
+    fi
+
+    cat > /tmp/trino-bench/config.properties << TRINOEOF
 coordinator=true
 node-scheduler.include-coordinator=true
 http-server.http.port=8080
@@ -400,8 +422,8 @@ discovery.uri=http://localhost:8080
 # The image sizes the JVM heap at 80% of container memory (~13GB on a
 # 16GB Docker VM), but query memory defaults to 30% of heap (~4GB).
 # Raise it so SF10 hash joins are not unfairly memory-starved vs SQE.
-query.max-memory=8GB
-query.max-memory-per-node=8GB
+query.max-memory=${TRINO_QUERY_MEM}
+query.max-memory-per-node=${TRINO_QUERY_MEM}
 TRINOEOF
 
     # Stop any existing Trino container
