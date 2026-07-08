@@ -29,7 +29,8 @@ use datafusion::physical_plan::{
 use datafusion_expr::ColumnarValue;
 use futures::{Stream, StreamExt, TryStreamExt};
 use iceberg::expr::Predicate;
-use iceberg::spec::{DataContentType, DataFile, ManifestContentType, ManifestStatus};
+use iceberg::scan::{FileScanTask, FileScanTaskStream};
+use iceberg::spec::{DataContentType, DataFile, DataFileFormat, ManifestContentType, ManifestStatus};
 use iceberg::table::Table;
 use parquet::arrow::arrow_reader::{
     ArrowPredicate, ArrowReaderOptions, ParquetRecordBatchReaderBuilder, RowFilter,
@@ -865,7 +866,13 @@ impl ExecutionPlan for IcebergScanExec {
         // `schema` is also needed after the stream is created (for IcebergRecordBatchStream),
         // so clone it before moving it into the async block.
         let schema_for_stream = schema.clone();
-        let stream = futures::stream::once(async move {
+        // The async block below is a ~600-line state machine holding every
+        // local across every await of both reader paths. Box it BEFORE handing
+        // it to `stream::once`: composed inline, debug builds (no move elision)
+        // materialize the whole machine on the caller's stack once per wrapper
+        // layer, which overflows the 2MB default test-thread stack in CI.
+        // Boxed first, the frame holds one copy and the wrappers copy a pointer.
+        let stream = futures::stream::once(Box::pin(async move {
             let schema = schema_for_stream;
             // ── Collect data file list via iceberg-rust's scan planner ────────
             //
@@ -906,31 +913,69 @@ impl ExecutionPlan for IcebergScanExec {
                 "IcebergScanExec: file entries collected and sorted by size descending"
             );
 
-            // Round-robin assignment after the size-descending sort spreads the
-            // largest files across partitions instead of clustering them at the
-            // top of partition 0. With one partition this is a no-op slice.
-            if total_partitions > 1 {
-                let before = file_entries.len();
-                file_entries = file_entries
-                    .into_iter()
-                    .enumerate()
-                    .filter(|(idx, _)| idx % total_partitions == partition)
-                    .map(|(_, entry)| entry)
-                    .collect();
+            // Deletes and direct-read eligibility are decided from the
+            // TABLE-WIDE file list, before choosing how to distribute work.
+            // Split-level assignment (below) breaks the whole table into
+            // byte-range splits, so the file-level round-robin slice must not
+            // run first on that path.
+            //
+            // The direct fast path opens parquet directly via FileIO and cannot
+            // apply Iceberg position or equality deletes. Any snapshot
+            // referencing delete manifests must fall back to iceberg-rust's
+            // reader pipeline (`scan.to_arrow`) which routes through
+            // CachingDeleteFileLoader. Without this gate, every MoR table whose
+            // data files are all under the threshold returns previously-deleted
+            // rows.
+            let has_deletes = snapshot_has_delete_files(&table, snapshot_id).await?;
+            if has_deletes {
                 debug!(
-                    partition = partition,
-                    total_partitions = total_partitions,
-                    before = before,
-                    after = file_entries.len(),
-                    "IcebergScanExec: round-robin partition slice"
+                    "IcebergScanExec: snapshot has delete manifests, skipping direct-read fast path"
                 );
             }
+            let use_direct = !has_deletes
+                && small_file_threshold > 0
+                && file_entries.iter().all(|(_, size)| *size <= small_file_threshold);
 
-            // Counted after the partition slice so the per-partition values
-            // sum to the table-wide totals, and before dynamic file pruning so
-            // `files_matched - files_pruned_dynamic` is the files actually read.
-            files_matched.add(file_entries.len());
-            bytes_planned.add(file_entries.iter().map(|(_, sz)| *sz as usize).sum());
+            // Split-level output partitioning (issue #131 follow-up): a
+            // delete-free scan over large files distributes BYTE-RANGE splits
+            // across the output partitions instead of whole files. A 1-4 file
+            // sorted-on-write fact table otherwise pins every row to the one
+            // partition its file round-robins to, leaving the other partitions
+            // empty and collapsing the exchange above the scan; splitting fans
+            // the row groups across all partitions. The direct fast path (all
+            // small files) and the delete fallback keep whole-file round-robin.
+            let use_split_assignment = total_partitions > 1 && !use_direct && !has_deletes;
+
+            if !use_split_assignment {
+                // Round-robin assignment after the size-descending sort spreads
+                // the largest files across partitions instead of clustering them
+                // at the top of partition 0. With one partition this is a no-op
+                // slice.
+                if total_partitions > 1 {
+                    let before = file_entries.len();
+                    file_entries = file_entries
+                        .into_iter()
+                        .enumerate()
+                        .filter(|(idx, _)| idx % total_partitions == partition)
+                        .map(|(_, entry)| entry)
+                        .collect();
+                    debug!(
+                        partition = partition,
+                        total_partitions = total_partitions,
+                        before = before,
+                        after = file_entries.len(),
+                        "IcebergScanExec: round-robin partition slice"
+                    );
+                }
+
+                // Counted after the partition slice so the per-partition values
+                // sum to the table-wide totals, and before dynamic file pruning
+                // so `files_matched - files_pruned_dynamic` is the files actually
+                // read. On the split path these are counted from the assigned
+                // splits instead (see below).
+                files_matched.add(file_entries.len());
+                bytes_planned.add(file_entries.iter().map(|(_, sz)| *sz as usize).sum());
+            }
 
             // Waited AFTER manifest planning so that I/O overlaps the join
             // build sides, and BEFORE either reader path samples the dynamic
@@ -949,23 +994,6 @@ impl ExecutionPlan for IcebergScanExec {
             // each file entirely in one S3 GET and parse Parquet from memory. This
             // eliminates the extra HEAD, footer, and manifest-re-read requests that
             // iceberg-rust's `scan.to_arrow()` pipeline issues per file.
-            //
-            // The fast path opens parquet directly via FileIO and cannot apply
-            // Iceberg position or equality deletes. Any snapshot referencing
-            // delete manifests must fall back to iceberg-rust's reader pipeline
-            // (`scan.to_arrow`) which routes through CachingDeleteFileLoader.
-            // Without this gate, every MoR table whose data files are all under
-            // the threshold returns previously-deleted rows.
-            let has_deletes = snapshot_has_delete_files(&table, snapshot_id).await?;
-            if has_deletes {
-                debug!(
-                    "IcebergScanExec: snapshot has delete manifests, skipping direct-read fast path"
-                );
-            }
-            let use_direct = !has_deletes
-                && small_file_threshold > 0
-                && file_entries.iter().all(|(_, size)| *size <= small_file_threshold);
-
             if use_direct {
                 debug!(
                     file_count = file_entries.len(),
@@ -1288,22 +1316,69 @@ impl ExecutionPlan for IcebergScanExec {
             }
             let scan = sb.build().map_err(|e| DataFusionError::External(Box::new(e)))?;
             // With >1 output partition, each partition must read ONLY its
-            // assigned files. `scan.to_arrow_with_metrics()` plans the WHOLE
-            // table, so calling it per partition would re-read every file in
-            // each partition and duplicate rows (issue #235). Plan once here and
-            // filter the task stream to this partition's `file_entries` (the
-            // round-robin slice above); intra-file split subtasks share the data
-            // file path, so a path filter keeps all row groups of an assigned
-            // file. At 1 partition the slice is the whole table, so the plain
-            // path stays unchanged.
-            let scan_result = if total_partitions > 1 {
+            // assigned work. `scan.to_arrow_with_metrics()` plans the WHOLE
+            // table, so calling it per partition would re-read everything and
+            // duplicate rows (issue #235). Plan once and hand this partition its
+            // slice.
+            let scan_result = if use_split_assignment {
+                // Split-level assignment: break the table's large files into
+                // byte-range splits and round-robin the splits across
+                // partitions, so a 1-4 file fact table fans out across all
+                // partitions instead of pinning its rows to one. `plan_files()`
+                // yields whole-file tasks; `assign_split_tasks` produces this
+                // partition's disjoint (file, byte-range) subtasks. The reader
+                // reads each sub-range exactly as the #131 intra-file subtasks
+                // do and will not re-split an already-ranged task.
+                let all_tasks: Vec<FileScanTask> = scan
+                    .plan_files()
+                    .await
+                    .map_err(|e| DataFusionError::External(Box::new(e)))?
+                    .try_collect()
+                    .await
+                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                let my_tasks = assign_split_tasks(
+                    all_tasks,
+                    DEFAULT_SCAN_SPLIT_TARGET_SIZE,
+                    total_partitions,
+                    partition,
+                );
+                // `files_matched` counts assigned SPLITS on this path (not whole
+                // files), so its cross-partition sum is the total split count;
+                // `bytes_planned` still sums to the table's total bytes. A whole
+                // task carries `length == file_size`; `plan_files` never emits
+                // `length == 0`, but fall back to the file size if it ever did.
+                files_matched.add(my_tasks.len());
+                bytes_planned.add(
+                    my_tasks
+                        .iter()
+                        .map(|t| {
+                            (if t.length == 0 { t.file_size_in_bytes } else { t.length }) as usize
+                        })
+                        .sum::<usize>(),
+                );
+                debug!(
+                    partition = partition,
+                    total_partitions = total_partitions,
+                    assigned_splits = my_tasks.len(),
+                    "IcebergScanExec: split-level partition assignment"
+                );
+                let stream: FileScanTaskStream =
+                    Box::pin(futures::stream::iter(my_tasks.into_iter().map(Ok)));
+                scan.read_tasks_to_arrow_with_metrics(stream)
+                    .map_err(|e| DataFusionError::External(Box::new(e)))?
+            } else if total_partitions > 1 {
+                // Whole-file assignment (delete fallback): filter the planned
+                // task stream to this partition's `file_entries` (the
+                // round-robin slice above); intra-file split subtasks share the
+                // data file path, so a path filter keeps all row groups of an
+                // assigned file.
                 let allowed: std::collections::HashSet<String> =
                     file_entries.iter().map(|(p, _)| p.clone()).collect();
                 let tasks = scan
                     .plan_files()
                     .await
                     .map_err(|e| DataFusionError::External(Box::new(e)))?;
-                let filtered: iceberg::scan::FileScanTaskStream = Box::pin(
+                let filtered: FileScanTaskStream = Box::pin(
                     tasks.try_filter(move |t| {
                         futures::future::ready(allowed.contains(t.data_file_path()))
                     }),
@@ -1465,7 +1540,7 @@ impl ExecutionPlan for IcebergScanExec {
                 }))
                 .boxed();
             Ok::<BatchStream, DataFusionError>(s)
-        }).try_flatten();
+        })).try_flatten();
         Ok(Box::pin(IcebergRecordBatchStream { schema, inner: Box::pin(stream), baseline }))
     }
 }
@@ -1836,6 +1911,115 @@ pub fn coalesce_file_entries(
         groups.push(current_group);
     }
     groups
+}
+
+/// Byte-range splits for one data file of `size` bytes at `target`.
+///
+/// Mirrors the vendored `split_file_scan_task`
+/// (`vendor/iceberg-rust/crates/iceberg/src/arrow/reader.rs`): keep the two in
+/// sync on rebase. A file smaller than twice the target (or `target == 0`,
+/// splitting disabled) stays whole and returns a single `(0, size)` range;
+/// otherwise it splits into `ceil(size / target)` near-equal ranges. The
+/// ranges tile `[0, size)` with no gap or overlap, which is the correctness
+/// invariant the reader relies on: `filter_row_groups_by_byte_range` assigns
+/// each row group to the range holding its midpoint, so a contiguous cover
+/// selects every row group exactly once. Every split range has
+/// `length < size`, so the reader's `whole_file` check stays false and it does
+/// not re-split them.
+fn file_byte_splits(size: u64, target: u64) -> Vec<(u64, u64)> {
+    if target == 0 || size < target.saturating_mul(2) {
+        return vec![(0, size)];
+    }
+    let chunks = size.div_ceil(target);
+    let chunk_len = size.div_ceil(chunks);
+    (0..chunks)
+        .map(|i| {
+            let start = i * chunk_len;
+            (start, chunk_len.min(size - start))
+        })
+        .collect()
+}
+
+/// Deterministic global order of byte-range splits for a set of files, as
+/// `(file_index, start, length)`.
+///
+/// Each file is `(size, splittable)`: a splittable file large enough is broken
+/// into byte ranges via [`file_byte_splits`], a non-splittable file (e.g.
+/// non-Parquet, which the row-group reader cannot range-read) stays whole. The
+/// list is ordered length-descending with a stable tiebreak on
+/// `(file_index, start)`, so the modulo slice in [`assign_split_tasks`] hands
+/// each partition a disjoint share that, unioned, covers every split exactly
+/// once. Callers must pass files in a canonical (path-sorted) order so
+/// `file_index` is stable across partitions.
+fn ordered_split_ranges(files: &[(u64, bool)], target: u64) -> Vec<(usize, u64, u64)> {
+    let mut ranges: Vec<(usize, u64, u64)> = files
+        .iter()
+        .enumerate()
+        .flat_map(|(idx, &(size, splittable))| {
+            let file_target = if splittable { target } else { 0 };
+            file_byte_splits(size, file_target)
+                .into_iter()
+                .map(move |(start, length)| (idx, start, length))
+        })
+        .collect();
+    ranges.sort_by(|a, b| b.2.cmp(&a.2).then(a.0.cmp(&b.0)).then(a.1.cmp(&b.1)));
+    ranges
+}
+
+/// Build this partition's byte-range scan tasks by splitting large files and
+/// round-robining the splits across `total_partitions`.
+///
+/// Each input task is a whole-file task from `plan_files`. Files large enough
+/// to split become several byte-range subtasks (same math as the vendored
+/// `split_file_scan_task`); smaller and non-Parquet files stay whole. Tasks are
+/// first ordered by path so the derived split order is identical in every
+/// partition, then the ordered split list is sliced by
+/// `index % total_partitions == partition`. The result is the disjoint set of
+/// `(file, byte-range)` tasks this partition reads; their lengths sum with the
+/// other partitions' to the table's total bytes. A partition with no assigned
+/// splits returns an empty vector.
+fn assign_split_tasks(
+    mut tasks: Vec<FileScanTask>,
+    split_target_size: u64,
+    total_partitions: usize,
+    partition: usize,
+) -> Vec<FileScanTask> {
+    // Canonical order so `file_index` is stable across partitions regardless of
+    // the (unordered) `plan_files` stream order each partition plans from.
+    tasks.sort_by(|a, b| a.data_file_path.cmp(&b.data_file_path));
+    // Byte-range subtasks only make sense for the Parquet row-group reader; any
+    // other format stays whole.
+    let files: Vec<(u64, bool)> = tasks
+        .iter()
+        .map(|t| {
+            (
+                t.file_size_in_bytes,
+                t.data_file_format == DataFileFormat::Parquet,
+            )
+        })
+        .collect();
+    ordered_split_ranges(&files, split_target_size)
+        .into_iter()
+        .enumerate()
+        .filter(|(i, _)| i % total_partitions == partition)
+        .map(|(_, (idx, start, length))| {
+            let base = &tasks[idx];
+            if start == 0 && length == base.file_size_in_bytes {
+                // Whole file (below the split threshold or non-Parquet): the
+                // original task unchanged keeps its `record_count` and lets the
+                // reader treat it as a whole-file read.
+                base.clone()
+            } else {
+                FileScanTask {
+                    start,
+                    length,
+                    // Per the field contract, only valid for whole-file reads.
+                    record_count: None,
+                    ..base.clone()
+                }
+            }
+        })
+        .collect()
 }
 
 /// Wraps a DataFusion `PhysicalExpr` as a Parquet `ArrowPredicate` for row-level
@@ -2268,5 +2452,114 @@ mod tests {
 
         let second = flat.next().await.unwrap();
         assert!(second.is_err(), "the failing file surfaces as a mid-stream Err");
+    }
+
+    /// Assert a file's byte-range splits tile `[0, size)` with no gap or
+    /// overlap: the correctness invariant `filter_row_groups_by_byte_range`
+    /// relies on to select each row group exactly once.
+    fn assert_contiguous_cover(splits: &[(u64, u64)], size: u64) {
+        assert_eq!(splits.first().map(|(s, _)| *s), Some(0), "first start is 0");
+        let mut expected_start = 0u64;
+        for (start, length) in splits {
+            assert_eq!(*start, expected_start, "ranges are contiguous");
+            expected_start += *length;
+        }
+        assert_eq!(expected_start, size, "ranges cover the whole file");
+    }
+
+    /// `file_byte_splits` must produce a contiguous cover of `[0, size)` at
+    /// every boundary, must leave a file below twice the target whole, and must
+    /// never emit a split whose length equals the file size (which the reader
+    /// would re-split).
+    #[test]
+    fn file_byte_splits_covers_and_respects_boundaries() {
+        let target = 32 * 1024 * 1024u64;
+
+        // Below 2x target: stays whole.
+        let whole = file_byte_splits(2 * target - 1, target);
+        assert_eq!(whole, vec![(0, 2 * target - 1)], "stays whole under 2x target");
+
+        // Exactly 2x target: first size that splits.
+        let at = file_byte_splits(2 * target, target);
+        assert_eq!(at.len(), 2, "2x target splits into two");
+        assert_contiguous_cover(&at, 2 * target);
+
+        // Target disabled: always whole.
+        assert_eq!(file_byte_splits(10 * target, 0), vec![(0, 10 * target)]);
+
+        for &size in &[100u64, 3 * target + 7, 1_717_986_918] {
+            let splits = file_byte_splits(size, target);
+            assert_contiguous_cover(&splits, size);
+            if splits.len() > 1 {
+                for (_, length) in &splits {
+                    assert!(*length < size, "a split length never equals the file size");
+                }
+            }
+        }
+    }
+
+    /// A single 1.6 GiB file split at 32 MiB and round-robined across 8
+    /// partitions must reach every partition with per-partition byte totals
+    /// within 2x of each other, and the splits must still cover the file
+    /// exactly.
+    #[test]
+    fn split_assignment_balances_single_large_file() {
+        let target = 32 * 1024 * 1024u64;
+        let size = 1_717_986_918u64; // ~1.6 GiB
+        let order = ordered_split_ranges(&[(size, true)], target);
+        assert!(order.len() >= 48, "~50 splits expected, got {}", order.len());
+
+        let n = 8usize;
+        let mut per_partition = vec![0u64; n];
+        for (i, (_, _, length)) in order.iter().enumerate() {
+            per_partition[i % n] += *length;
+        }
+        assert!(per_partition.iter().all(|&b| b > 0), "every partition gets data");
+        let max = *per_partition.iter().max().unwrap();
+        let min = *per_partition.iter().min().unwrap();
+        assert!(max <= 2 * min, "byte totals within 2x: min={min} max={max}");
+        assert_eq!(
+            per_partition.iter().sum::<u64>(),
+            size,
+            "splits cover the file exactly"
+        );
+    }
+
+    /// Small files and non-Parquet files (whatever their size) stay whole: one
+    /// range each, starting at 0 and spanning the full file.
+    #[test]
+    fn small_and_non_parquet_files_stay_whole() {
+        let target = 32 * 1024 * 1024u64;
+        // small parquet, tiny parquet, large NON-parquet (would split if parquet).
+        let files = vec![(1_000_000u64, true), (2_000_000, true), (500_000_000, false)];
+        let order = ordered_split_ranges(&files, target);
+        assert_eq!(order.len(), 3, "no file is both large and splittable");
+        for (idx, start, length) in &order {
+            assert_eq!(*start, 0, "whole file starts at 0");
+            assert_eq!(*length, files[*idx].0, "whole file spans the full size");
+        }
+    }
+
+    /// With one output partition the modulo slice keeps every split, so the
+    /// assignment is a no-op that still covers the whole file.
+    #[test]
+    fn split_assignment_n1_is_noop() {
+        let target = 32 * 1024 * 1024u64;
+        let size = 500_000_000u64;
+        let n = 1usize;
+        let partition = 0usize;
+        let order = ordered_split_ranges(&[(size, true)], target);
+        let kept: Vec<_> = order
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| i % n == partition)
+            .map(|(_, r)| *r)
+            .collect();
+        assert_eq!(kept.len(), order.len(), "N=1 keeps every split");
+        assert_eq!(
+            kept.iter().map(|(_, _, l)| *l).sum::<u64>(),
+            size,
+            "covers the whole file"
+        );
     }
 }
