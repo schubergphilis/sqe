@@ -1,3 +1,4 @@
+pub mod bank;
 pub mod clickbench;
 pub mod config;
 pub mod parquet_writer;
@@ -166,6 +167,7 @@ where
 
 pub fn get_generator(name: &str) -> anyhow::Result<Box<dyn BenchmarkGenerator>> {
     match name {
+        "bank" => Ok(Box::new(bank::BankGenerator)),
         "tpch" => Ok(Box::new(tpch::TpchGenerator)),
         "ssb" => Ok(Box::new(ssb::SsbGenerator)),
         "tpcc" => Ok(Box::new(tpcc::TpccGenerator)),
@@ -174,7 +176,7 @@ pub fn get_generator(name: &str) -> anyhow::Result<Box<dyn BenchmarkGenerator>> 
         "clickbench" => Ok(Box::new(clickbench::ClickBenchGenerator)),
         "tpcds" => Ok(Box::new(tpcds::TpcdsGenerator)),
         _ => anyhow::bail!(
-            "Unknown benchmark: {name}. Supported: tpch, ssb, tpcc, tpce, tpcbb, clickbench, tpcds"
+            "Unknown benchmark: {name}. Supported: tpch, ssb, tpcc, tpce, tpcbb, clickbench, tpcds, bank"
         ),
     }
 }
@@ -193,7 +195,7 @@ mod sweep_tests {
         let dir = std::env::temp_dir().join(format!("sqe-bench-sweep-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let config = GenerateConfig { threads: 1, ..Default::default() };
-        for bench in ["tpch", "ssb", "tpcds", "tpcc", "tpce", "tpcbb", "clickbench"] {
+        for bench in ["tpch", "ssb", "tpcds", "tpcc", "tpce", "tpcbb", "clickbench", "bank"] {
             let g = get_generator(bench).unwrap();
             for t in g.tables() {
                 g.generate_table(&t.name, 0.001, dir.to_str().unwrap(), &config)
