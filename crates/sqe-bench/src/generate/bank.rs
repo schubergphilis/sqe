@@ -264,6 +264,15 @@ const DESC_MERCHANTS: &[&str] = &[
 // Dimension generators
 // ---------------------------------------------------------------------------
 
+/// A high-entropy uppercase-alphanumeric reference of length `N`, like the
+/// EndToEndId on a real payment.
+fn rand_ref<const N: usize>(rng: &mut StdRng) -> String {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    (0..N)
+        .map(|_| ALPHABET[rng.gen_range(0..ALPHABET.len())] as char)
+        .collect()
+}
+
 /// Currency of account `a_id`, consistent across every table that mentions
 /// the account without any lookup table.
 fn account_currency(a_id: i64) -> &'static str {
@@ -510,11 +519,16 @@ pub fn transaction_day_shard(
             // 97% settled, 2% pending, 1% rejected.
             let s = rng.gen_range(0..100u32);
             t_status.push(if s < 97 { "settled" } else { TXN_STATUSES_100[(s - 97) as usize] });
+            // The end-to-end reference mirrors SEPA EndToEndId: unique
+            // high-entropy identifiers that give the row a realistic
+            // compressed footprint (all other columns dictionary-compress
+            // to near nothing, which would make a "4 TB day" mean an
+            // implausible number of rows).
             t_description.push(format!(
-                "{} {} ref {:010}",
+                "{} {} e2e {}",
                 DESC_MERCHANTS[rng.gen_range(0..DESC_MERCHANTS.len())],
                 DESC_VERBS[rng.gen_range(0..DESC_VERBS.len())],
-                rng.gen_range(0..9_999_999_999u64)
+                rand_ref::<24>(&mut rng)
             ));
             t_balance_after.push(rng.gen_range(-10_000_000..1_000_000_000i64));
             t_country.push(COUNTRIES[rng.gen_range(0..COUNTRIES.len())]);

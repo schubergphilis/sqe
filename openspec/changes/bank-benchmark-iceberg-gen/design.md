@@ -41,7 +41,7 @@ Facts, one Iceberg partition per calendar day (identity transform on the `date` 
 | `transaction` | derived from `--bytes-per-day` | t_id (long), t_day (date, partition), t_ts (timestamp), t_a_id (long), t_counterparty_iban (string), t_counterparty_bic (string), t_amount (decimal(15,2)), t_currency (string), t_direction (debit/credit), t_channel (sepa/swift/card/internal/instant), t_category (string, MCC-like), t_status (settled/pending/rejected), t_description (string, 30-80 chars), t_balance_after (decimal(15,2)), t_country (string) |
 | `account_balance` | 1 per account | b_day (date, partition), b_a_id (long), b_balance (decimal(15,2)), b_currency (string), b_txn_count (int) |
 
-`transaction` carries the volume. The two free-text-ish columns (`t_description`, `t_counterparty_iban`) keep compressed bytes/row realistic (target ~150-250 B) so 4 TB/day means a plausible row count, not a degenerate one.
+`transaction` carries the volume. The description embeds a SEPA-style high-entropy end-to-end reference so rows do not dictionary-compress to nothing. Measured: ~51 compressed B/row at zstd3, so 4 TB/day is ~86B rows/day (card-processor scale). Raise `--customers` (default 10M) to keep per-account activity plausible at that volume.
 
 Iceberg schemas are built with explicit field IDs; the Arrow schemas used by the generator match them via `PARQUET_FIELD_ID_META_KEY` metadata so written Parquet carries the field IDs Iceberg requires.
 

@@ -62,6 +62,90 @@ pub enum Command {
         /// Default is the parquet writer's default.
         #[arg(long)]
         row_group_size: Option<usize>,
+
+        /// Output sink: `parquet` writes staging files to --output (the
+        /// default; load them later with `sqe-bench load`); `iceberg`
+        /// writes straight into Iceberg tables through the catalog REST
+        /// API. Currently only the `bank` benchmark supports `iceberg`.
+        #[arg(long, default_value = "parquet")]
+        sink: Sink,
+
+        /// Trading days to generate (iceberg sink)
+        #[arg(long, default_value_t = 12u32)]
+        days: u32,
+
+        /// First trading day, YYYY-MM-DD (iceberg sink)
+        #[arg(long)]
+        start_date: Option<String>,
+
+        /// Compressed bytes to land per trading day, e.g. `4t` or `500g`.
+        /// Rows per day are derived from a pilot calibration. Mutually
+        /// exclusive with --rows-per-day (iceberg sink)
+        #[arg(long, conflicts_with = "rows_per_day")]
+        bytes_per_day: Option<String>,
+
+        /// Explicit transaction rows per trading day (iceberg sink)
+        #[arg(long)]
+        rows_per_day: Option<u64>,
+
+        /// Number of customers; accounts are 2.5x this (iceberg sink)
+        #[arg(long, default_value_t = 10_000_000u64)]
+        customers: u64,
+
+        /// Iceberg REST catalog URI, e.g. http://localhost:8181/api/catalog
+        /// (iceberg sink)
+        #[arg(long, env = "ICEBERG_CATALOG_URI")]
+        catalog_uri: Option<String>,
+
+        /// Warehouse name in the catalog (iceberg sink)
+        #[arg(long, env = "ICEBERG_WAREHOUSE")]
+        warehouse: Option<String>,
+
+        /// Namespace for the tables (iceberg sink)
+        #[arg(long, env = "SQE_NAMESPACE", default_value = "bank")]
+        namespace: String,
+
+        /// OAuth2 client id for the catalog's client-credentials grant
+        /// (iceberg sink)
+        #[arg(long, env = "SQE_CLIENT_ID")]
+        client_id: Option<String>,
+
+        /// OAuth2 client secret (iceberg sink)
+        #[arg(long, env = "SQE_CLIENT_SECRET")]
+        client_secret: Option<String>,
+
+        /// OAuth2 token endpoint; defaults to the catalog's own
+        /// /v1/oauth/tokens (iceberg sink)
+        #[arg(long, env = "SQE_TOKEN_ENDPOINT")]
+        oauth2_server_uri: Option<String>,
+
+        /// OAuth2 scope (iceberg sink)
+        #[arg(long)]
+        scope: Option<String>,
+
+        /// Pre-acquired bearer token, alternative to client credentials
+        /// (iceberg sink)
+        #[arg(long, env = "ICEBERG_BEARER_TOKEN")]
+        bearer_token: Option<String>,
+
+        /// Use path-style S3 addressing (MinIO/RustFS style endpoints)
+        /// (iceberg sink)
+        #[arg(long, default_value_t = false)]
+        s3_path_style: bool,
+
+        /// Data file rollover size, e.g. `512m` (iceberg sink)
+        #[arg(long, default_value = "512m")]
+        target_file_size: String,
+
+        /// Print the sized plan (calibration included) and exit without
+        /// writing any table data (iceberg sink)
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+
+        /// Skip days that already have a committed snapshot; use after an
+        /// interrupted run (iceberg sink)
+        #[arg(long, default_value_t = false)]
+        resume: bool,
     },
 
     /// Load generated data into SQE via Iceberg REST catalog
@@ -261,6 +345,14 @@ pub enum Command {
         #[arg(long, default_value = "benchmarks/results")]
         output: String,
     },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum Sink {
+    /// Local (or staged) Parquet files for a later `sqe-bench load`
+    Parquet,
+    /// Direct write + commit into Iceberg tables via the REST catalog
+    Iceberg,
 }
 
 #[derive(Clone, ValueEnum)]
