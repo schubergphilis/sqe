@@ -33,6 +33,8 @@ use datafusion::physical_optimizer::enforce_sorting::EnforceSorting;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
+use datafusion::physical_plan::limit::GlobalLimitExec;
+use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 use sqe_catalog::iceberg_scan::IcebergScanExec;
@@ -50,7 +52,10 @@ use tracing::debug;
 /// `EnforceSorting` removes it. Finally, if the resulting root is still
 /// multi-partition (e.g. a partitioned window function ending in a per-partition
 /// TopK), the root is coalesced back to a single partition so result collection
-/// does not concatenate N partitions and over-return `N * limit` rows.
+/// does not concatenate N partitions and over-return `N * limit` rows. Last, a
+/// global `LIMIT` that `LimitPushdown` stranded as a per-partition `fetch` below
+/// the (single-partition) root is re-applied at the root; see
+/// [`restore_stranded_global_fetch`].
 #[derive(Debug, Default)]
 pub struct ParallelProbeScanRule;
 
@@ -98,7 +103,8 @@ impl PhysicalOptimizerRule for ParallelProbeScanRule {
         // (its ordering is destroyed by the exchange and re-established above it)
         // -- the redundant wide-row sort that OOMs on rollup inputs.
         let resorted = EnforceSorting::new().optimize(redistributed, config)?;
-        Ok(restore_single_partition_root(resorted))
+        let single = restore_single_partition_root(resorted);
+        Ok(restore_stranded_global_fetch(single))
     }
 
     fn name(&self) -> &str {
@@ -158,6 +164,96 @@ pub(crate) fn restore_single_partition_root(
         Some(ordering) => Arc::new(SortPreservingMergeExec::new(ordering, plan).with_fetch(fetch)),
         None => Arc::new(CoalescePartitionsExec::new(plan).with_fetch(fetch)),
     }
+}
+
+/// Restore a global `LIMIT` that DataFusion's `LimitPushdown` stranded as a
+/// per-partition cap during the re-optimization this rule performs.
+///
+/// `LimitPushdown` runs on the ORIGINAL single-partition plan and pushes a
+/// global `ORDER BY ... LIMIT n` into a `fetch` on a mid-plan operator (a
+/// `SortExec`, a `LocalLimitExec`, or a `FilterExec`). After the scans are
+/// bumped and `EnforceDistribution` + `EnforceSorting` re-run, that operator's
+/// output becomes multi-partition, so its `fetch` now caps EACH of `N`
+/// partitions at `n` rows (`N * n` total), and the `SortPreservingMergeExec`
+/// that `EnforceSorting` inserts above it carries NO fetch.
+/// [`restore_single_partition_root`] does not catch this: the root is already a
+/// single partition (the fetchless merge), so it is returned untouched.
+///
+/// Walk down from the root through single-child operators that preserve row
+/// COUNT and either preserve row ORDER (`ProjectionExec`, fetchless
+/// `SortPreservingMergeExec`) or emit an unordered stream (fetchless
+/// `CoalescePartitionsExec`), stopping at the first node that carries a `fetch`.
+/// If that node's output is multi-partition and the root itself has no fetch,
+/// re-apply the cap at the root. Re-capping is safe precisely because no
+/// intervening operator drops rows: for an ordered root the stream reaching the
+/// root is in final output order and every global-top-`n` row survived its
+/// partition's own top-`n` cap, so truncating the merged stream at `n`
+/// reconstructs exactly the rows the original `ORDER BY ... LIMIT` selected; for
+/// an unordered root (a `CoalescePartitionsExec`, reached only for a bare
+/// `LIMIT`) any `n` rows satisfy the limit. The invariant breaks the moment a
+/// `FilterExec`, sort, aggregate, or join sits between the root and the fetch
+/// node, which is why the walk stops at any other operator.
+///
+/// Shared with [`crate::parallel_scan::ParallelScanRule`], which re-optimizes
+/// the same way and inherits the same stranding.
+pub(crate) fn restore_stranded_global_fetch(
+    plan: Arc<dyn ExecutionPlan>,
+) -> Arc<dyn ExecutionPlan> {
+    // The root already carries the global cap: nothing was stranded.
+    if plan.fetch().is_some() {
+        return plan;
+    }
+    let Some(fetch) = find_stranded_fetch(&plan) else {
+        return plan;
+    };
+    // Re-apply the global cap in final output order. A fetchless merge root
+    // folds the fetch in directly (both merge nodes return `Some` from
+    // `with_fetch`); any other root (a bare `LIMIT` with no `ORDER BY`, whose
+    // root is unordered) is wrapped in a `GlobalLimitExec`.
+    let is_mergeish = plan.downcast_ref::<SortPreservingMergeExec>().is_some()
+        || plan.downcast_ref::<CoalescePartitionsExec>().is_some();
+    if is_mergeish {
+        if let Some(capped) = plan.with_fetch(Some(fetch)) {
+            return capped;
+        }
+    }
+    Arc::new(GlobalLimitExec::new(plan, 0, Some(fetch)))
+}
+
+/// Walk down from `root` through single-child, row-order- and row-count-
+/// preserving operators, returning the `fetch` of the first fetch-bearing node
+/// IF that node's output is multi-partition (a stranded per-partition cap). The
+/// walk descends only through `ProjectionExec` and fetchless
+/// `SortPreservingMergeExec` / `CoalescePartitionsExec`; any other operator
+/// (including a fetchless `FilterExec`) ends the walk with no result.
+fn find_stranded_fetch(root: &Arc<dyn ExecutionPlan>) -> Option<usize> {
+    let mut node = Arc::clone(root);
+    loop {
+        if let Some(fetch) = node.fetch() {
+            // A single-partition cap is already a global cap: not stranded.
+            return (node.output_partitioning().partition_count() > 1).then_some(fetch);
+        }
+        if !is_row_preserving_passthrough(&node) {
+            return None;
+        }
+        let children = node.children();
+        let [child] = children.as_slice() else {
+            return None;
+        };
+        node = Arc::clone(child);
+    }
+}
+
+/// Whether `node` passes its input through without dropping rows, so a global
+/// cap above it is equivalent to the same cap below it. `ProjectionExec` and
+/// `SortPreservingMergeExec` also preserve order; `CoalescePartitionsExec` does
+/// not, but it is only walked past when fetchless (its `fetch` would stop the
+/// walk first) and an unordered root only ever carries a bare `LIMIT`. Only
+/// these node types are safe to walk past when hunting a stranded fetch.
+fn is_row_preserving_passthrough(node: &Arc<dyn ExecutionPlan>) -> bool {
+    node.downcast_ref::<ProjectionExec>().is_some()
+        || node.downcast_ref::<SortPreservingMergeExec>().is_some()
+        || node.downcast_ref::<CoalescePartitionsExec>().is_some()
 }
 
 /// Collect the leaf execution plans (no children) that sit on a pure PROBE
@@ -402,6 +498,141 @@ mod tests {
         assert!(
             collect_probe_side_leaves(&join).is_empty(),
             "Partitioned-mode joins must yield no parallelizable leaves"
+        );
+    }
+
+    // ---- restore_stranded_global_fetch (q10/q14/q51 wrong-results fix) ----
+
+    /// An 8-partition round-robin input, standing in for a bumped probe scan.
+    fn repartitioned8() -> Arc<dyn ExecutionPlan> {
+        repartitioned(8)
+    }
+
+    /// A `FilterExec` over `input`, optionally carrying a per-partition fetch.
+    /// The predicate (`id IS NOT NULL`) is irrelevant; the fetch and the
+    /// partition count are what the walk inspects.
+    fn filter(input: Arc<dyn ExecutionPlan>, fetch: Option<usize>) -> Arc<dyn ExecutionPlan> {
+        use datafusion::physical_expr::expressions::col;
+        use datafusion::physical_plan::expressions::IsNotNullExpr;
+        use datafusion::physical_plan::filter::FilterExec;
+        let predicate = Arc::new(IsNotNullExpr::new(col("id", &input.schema()).unwrap()));
+        let base: Arc<dyn ExecutionPlan> = Arc::new(FilterExec::try_new(predicate, input).unwrap());
+        // FilterExec exposes fetch only through the trait `with_fetch` (the
+        // inherent builder-style one lives on FilterExecBuilder); it always
+        // returns Some.
+        base.with_fetch(fetch).unwrap()
+    }
+
+    /// An identity `ProjectionExec` (fetchless, order- and count-preserving).
+    fn identity_projection(input: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
+        use datafusion::physical_expr::expressions::col;
+        let s = input.schema();
+        let exprs = vec![
+            (col("id", &s).unwrap(), "id".to_string()),
+            (col("val", &s).unwrap(), "val".to_string()),
+        ];
+        Arc::new(ProjectionExec::try_new(exprs, input).unwrap())
+    }
+
+    /// A `SortPreservingMergeExec` on `id`, optionally carrying a fetch. Its
+    /// output is always a single partition.
+    fn spm(input: Arc<dyn ExecutionPlan>, fetch: Option<usize>) -> Arc<dyn ExecutionPlan> {
+        use datafusion::physical_expr::expressions::col;
+        use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
+        let ordering =
+            LexOrdering::new(vec![PhysicalSortExpr::new_default(col("id", &input.schema()).unwrap())])
+                .unwrap();
+        Arc::new(SortPreservingMergeExec::new(ordering, input).with_fetch(fetch))
+    }
+
+    /// A per-partition `SortExec` (preserve_partitioning) carrying a fetch, over
+    /// an 8-partition input. Stands in for a stranded fetch on a `SortExec`.
+    fn per_partition_sort_with_fetch(fetch: usize) -> Arc<dyn ExecutionPlan> {
+        use datafusion::physical_expr::expressions::col;
+        use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
+        use datafusion::physical_plan::sorts::sort::SortExec;
+        let input = repartitioned8();
+        let ordering =
+            LexOrdering::new(vec![PhysicalSortExpr::new_default(col("id", &input.schema()).unwrap())])
+                .unwrap();
+        Arc::new(
+            SortExec::new(ordering, input)
+                .with_preserve_partitioning(true)
+                .with_fetch(Some(fetch)),
+        )
+    }
+
+    #[test]
+    fn stranded_per_partition_fetch_below_spm_projection_is_restored_at_root() {
+        // The q51 spine, verbatim from the executed plan:
+        //   SortPreservingMergeExec [ordering]      (no fetch, 1 partition)
+        //     ProjectionExec                        (8 partitions)
+        //       FilterExec: ..., fetch=100          (8 x 100 = 800 rows escape)
+        // LimitPushdown pushed the global `ORDER BY ... LIMIT 100` onto the
+        // filter while the plan was single-partition; after the scans were bumped
+        // the filter caps each of 8 partitions, and the merge above it carries no
+        // fetch. The pass must re-apply the cap at the root.
+        let spine = spm(identity_projection(filter(repartitioned8(), Some(100))), None);
+        assert_eq!(spine.output_partitioning().partition_count(), 1);
+        assert_eq!(spine.fetch(), None, "the fetchless merge root is the bug");
+
+        let restored = restore_stranded_global_fetch(spine);
+
+        assert_eq!(restored.output_partitioning().partition_count(), 1);
+        assert_eq!(
+            restored.fetch(),
+            Some(100),
+            "the stranded per-partition LIMIT must be re-applied globally at the root"
+        );
+    }
+
+    #[test]
+    fn stranded_fetch_on_a_sort_exec_is_also_restored() {
+        // The bug note lists SortExec as another operator LimitPushdown can strand
+        // the fetch on. SortExec surfaces its cap through the trait `fetch()`, so
+        // the generic walk catches it too (covers the q10/q14 sort-strand shape).
+        let spine = spm(identity_projection(per_partition_sort_with_fetch(100)), None);
+        assert_eq!(spine.fetch(), None);
+
+        let restored = restore_stranded_global_fetch(spine);
+
+        assert_eq!(restored.fetch(), Some(100));
+    }
+
+    #[test]
+    fn fetchless_spine_with_no_fetch_below_is_unchanged() {
+        // SPM -> Projection -> Repartition, no fetch anywhere: nothing stranded.
+        let root = spm(identity_projection(repartitioned8()), None);
+        let restored = restore_stranded_global_fetch(Arc::clone(&root));
+        assert!(
+            Arc::ptr_eq(&root, &restored),
+            "with no fetch below, the plan must be returned untouched"
+        );
+    }
+
+    #[test]
+    fn fetch_already_on_root_is_unchanged() {
+        // The root already carries the global cap (single-partition merge with
+        // fetch): the LIMIT is intact, so the pass is a no-op.
+        let root = spm(repartitioned8(), Some(100));
+        assert_eq!(root.fetch(), Some(100));
+        let restored = restore_stranded_global_fetch(Arc::clone(&root));
+        assert!(
+            Arc::ptr_eq(&root, &restored),
+            "a root that already caps globally must be returned untouched"
+        );
+    }
+
+    #[test]
+    fn fetch_below_a_fetchless_filter_is_not_hoisted() {
+        // SPM -> FilterExec(no fetch) -> SortExec(fetch=100). The filter changes
+        // row count, so the walk stops at it and the deeper fetch is NOT hoisted
+        // (hoisting a limit above a filter would be wrong).
+        let root = spm(filter(per_partition_sort_with_fetch(100), None), None);
+        let restored = restore_stranded_global_fetch(Arc::clone(&root));
+        assert!(
+            Arc::ptr_eq(&root, &restored),
+            "the walk must stop at a fetchless FilterExec and hoist nothing"
         );
     }
 }

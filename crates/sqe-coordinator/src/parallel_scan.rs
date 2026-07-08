@@ -66,7 +66,7 @@ use datafusion::physical_plan::ExecutionPlan;
 use sqe_catalog::iceberg_scan::IcebergScanExec;
 use tracing::debug;
 
-use crate::parallel_probe_scan::restore_single_partition_root;
+use crate::parallel_probe_scan::{restore_single_partition_root, restore_stranded_global_fetch};
 
 /// Physical optimizer rule that parallelizes single-node Iceberg scans. Gated
 /// by `query.parallel_scan`; `byte_threshold` reuses `distribution_threshold`.
@@ -120,7 +120,8 @@ impl PhysicalOptimizerRule for ParallelScanRule {
         // per-partition TopK) would otherwise over-return `N * limit` rows,
         // because SQE's result collection concatenates root partitions.
         let resorted = EnforceSorting::new().optimize(redistributed, config)?;
-        Ok(restore_single_partition_root(resorted))
+        let single = restore_single_partition_root(resorted);
+        Ok(restore_stranded_global_fetch(single))
     }
 
     fn name(&self) -> &str {
