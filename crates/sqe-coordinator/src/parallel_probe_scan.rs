@@ -29,8 +29,11 @@ use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::Result;
 use datafusion::config::ConfigOptions;
 use datafusion::physical_optimizer::enforce_distribution::EnforceDistribution;
+use datafusion::physical_optimizer::enforce_sorting::EnforceSorting;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
+use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
+use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 use sqe_catalog::iceberg_scan::IcebergScanExec;
 use tracing::debug;
@@ -40,9 +43,14 @@ use tracing::debug;
 ///
 /// Runs AFTER `StarSchemaReorderRule` and DataFusion's own `EnforceDistribution`
 /// (single-node path in `query_handler`). After bumping probe scans to N output
-/// partitions it re-runs `EnforceDistribution` so the upward operator chain
-/// (e.g. the final aggregate) gets the exchanges it needs and results stay
-/// correct.
+/// partitions it re-runs `EnforceDistribution` THEN `EnforceSorting` (the same
+/// order DataFusion's stock pipeline runs them). Re-running only
+/// `EnforceDistribution` would leave a stale pre-bump sort below a newly
+/// inserted repartition, which re-sorts wide rows for nothing and can OOM;
+/// `EnforceSorting` removes it. Finally, if the resulting root is still
+/// multi-partition (e.g. a partitioned window function ending in a per-partition
+/// TopK), the root is coalesced back to a single partition so result collection
+/// does not concatenate N partitions and over-return `N * limit` rows.
 #[derive(Debug, Default)]
 pub struct ParallelProbeScanRule;
 
@@ -84,7 +92,13 @@ impl PhysicalOptimizerRule for ParallelProbeScanRule {
         // with correct exchanges (the final aggregate must still see a coalesced
         // / hash-partitioned input). Only probe-side scans changed, so a
         // CollectLeft build is never coalesced -> no q72-class regression.
-        EnforceDistribution::new().optimize(rewritten, config)
+        let redistributed = EnforceDistribution::new().optimize(rewritten, config)?;
+        // Then EnforceSorting, matching DataFusion's stock pipeline order. This
+        // drops any sort that EnforceDistribution stranded below a repartition
+        // (its ordering is destroyed by the exchange and re-established above it)
+        // -- the redundant wide-row sort that OOMs on rollup inputs.
+        let resorted = EnforceSorting::new().optimize(redistributed, config)?;
+        Ok(restore_single_partition_root(resorted))
     }
 
     fn name(&self) -> &str {
@@ -119,6 +133,26 @@ fn bump_scans(
         }
     })?;
     Ok(transformed.data)
+}
+
+/// Restore a single-partition root so the rest of SQE (result collection
+/// concatenates root partitions) does not over-return rows. If the root already
+/// has a single output partition it is returned untouched. A root that keeps an
+/// output ordering (the common case: a `preserve_partitioning` TopK sort) is
+/// merged with `SortPreservingMergeExec`, carrying the root's fetch so a global
+/// `ORDER BY ... LIMIT` still caps at `limit` rows; an unordered root is merged
+/// with `CoalescePartitionsExec`, also carrying any fetch so a bare `LIMIT`
+/// cannot over-return `N * limit` rows.
+fn restore_single_partition_root(plan: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
+    if plan.output_partitioning().partition_count() <= 1 {
+        return plan;
+    }
+    let ordering = plan.output_ordering().cloned();
+    let fetch = plan.fetch();
+    match ordering {
+        Some(ordering) => Arc::new(SortPreservingMergeExec::new(ordering, plan).with_fetch(fetch)),
+        None => Arc::new(CoalescePartitionsExec::new(plan).with_fetch(fetch)),
+    }
 }
 
 /// Collect the leaf execution plans (no children) that sit on a pure PROBE
@@ -283,6 +317,73 @@ mod tests {
         let leaves = collect_probe_side_leaves(&scan);
         assert_eq!(leaves.len(), 1);
         assert!(Arc::ptr_eq(&leaves[0], &scan));
+    }
+
+    fn repartitioned(n: usize) -> Arc<dyn ExecutionPlan> {
+        use datafusion::physical_plan::repartition::RepartitionExec;
+        use datafusion::physical_plan::Partitioning;
+        Arc::new(RepartitionExec::try_new(leaf(), Partitioning::RoundRobinBatch(n)).unwrap())
+    }
+
+    #[test]
+    fn ordered_multi_partition_root_becomes_sort_preserving_merge_with_fetch() {
+        // q67 shape: a preserve_partitioning TopK sort left as the multi-partition
+        // root. restore_single_partition_root must merge it back to one partition
+        // via SortPreservingMergeExec while carrying the global LIMIT (fetch).
+        use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
+        use datafusion::physical_plan::sorts::sort::SortExec;
+
+        let ordering = LexOrdering::new(vec![PhysicalSortExpr::new_default(
+            datafusion::physical_expr::expressions::col("id", &schema()).unwrap(),
+        )])
+        .unwrap();
+        let root: Arc<dyn ExecutionPlan> = Arc::new(
+            SortExec::new(ordering, repartitioned(8))
+                .with_preserve_partitioning(true)
+                .with_fetch(Some(100)),
+        );
+        assert!(root.output_partitioning().partition_count() > 1);
+
+        let restored = restore_single_partition_root(root);
+
+        assert_eq!(restored.output_partitioning().partition_count(), 1);
+        assert!(
+            restored.downcast_ref::<SortPreservingMergeExec>().is_some(),
+            "ordered multi-partition root must be merged with SortPreservingMergeExec"
+        );
+        assert_eq!(
+            restored.fetch(),
+            Some(100),
+            "the global ORDER BY ... LIMIT fetch must be carried onto the merge"
+        );
+    }
+
+    #[test]
+    fn unordered_multi_partition_root_becomes_coalesce_partitions() {
+        let root = repartitioned(8);
+        assert!(root.output_partitioning().partition_count() > 1);
+        assert!(root.output_ordering().is_none());
+
+        let restored = restore_single_partition_root(root);
+
+        assert_eq!(restored.output_partitioning().partition_count(), 1);
+        assert!(
+            restored.downcast_ref::<CoalescePartitionsExec>().is_some(),
+            "unordered multi-partition root must be coalesced"
+        );
+    }
+
+    #[test]
+    fn single_partition_root_is_not_rewrapped() {
+        let root: Arc<dyn ExecutionPlan> = Arc::new(CoalescePartitionsExec::new(repartitioned(8)));
+        assert_eq!(root.output_partitioning().partition_count(), 1);
+
+        let restored = restore_single_partition_root(Arc::clone(&root));
+
+        assert!(
+            Arc::ptr_eq(&root, &restored),
+            "an already single-partition root must be returned unchanged (no double-wrap)"
+        );
     }
 
     #[test]
