@@ -243,10 +243,14 @@ pub struct QueryConfig {
     /// side stays single-partition (issue #235, follow-up to #131). Build-side
     /// scans are never touched, so the q72 regression cannot recur.
     ///
-    /// Default: false. This is a single-node scan-parallelism optimization with
-    /// a documented regression history; it stays opt-in until validated on a
-    /// clean (non-swapping) benchmark rig.
-    #[serde(default)]
+    /// Default: true (since 2026-07-08). Validated on the clean SF10 rig with
+    /// split-level scan partitioning in place: SSB 20.0s vs Trino 21.4s, TPC-H
+    /// neutral, TPC-DS 99/99 correct at +6% total (the residual is the real
+    /// cost of parallel window/rollup plans on q67/q47/q57, not skew). The
+    /// 2026-06 "perf-neutral" verdict predated the dynamic-filter and
+    /// dim-build-swap fixes and was measured on a contended box. Set to false
+    /// to restore fully serial CollectLeft probes.
+    #[serde(default = "default_true")]
     pub parallel_probe_scan: bool,
     /// Parallelize single-node Iceberg scans across cores by giving each scan
     /// N output partitions, where the operator above the scan can consume the
@@ -367,7 +371,7 @@ impl Default for QueryConfig {
             late_materialization_min_projection_cols: default_late_mat_min_projection_cols(),
             star_schema_reorder: default_true(),
             star_schema_min_ratio: default_star_schema_min_ratio(),
-            parallel_probe_scan: false,
+            parallel_probe_scan: true,
             parallel_scan: false,
             dim_build_swap: true,
             stream_idle_timeout_secs: default_stream_idle_timeout(),
