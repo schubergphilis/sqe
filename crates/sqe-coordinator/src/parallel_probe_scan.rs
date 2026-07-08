@@ -35,6 +35,7 @@ use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
 use datafusion::physical_plan::limit::GlobalLimitExec;
 use datafusion::physical_plan::projection::ProjectionExec;
+use datafusion::physical_plan::scalar_subquery::ScalarSubqueryExec;
 use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 use sqe_catalog::iceberg_scan::IcebergScanExec;
@@ -237,10 +238,17 @@ fn find_stranded_fetch(root: &Arc<dyn ExecutionPlan>) -> Option<usize> {
             return None;
         }
         let children = node.children();
-        let [child] = children.as_slice() else {
-            return None;
+        let next = match children.as_slice() {
+            [child] => Arc::clone(child),
+            // ScalarSubqueryExec lists its subquery plans as extra children;
+            // the pass-through main input is always child 0 and is the only
+            // stream that reaches the root.
+            [input, ..] if node.downcast_ref::<ScalarSubqueryExec>().is_some() => {
+                Arc::clone(input)
+            }
+            _ => return None,
         };
-        node = Arc::clone(child);
+        node = next;
     }
 }
 
@@ -248,12 +256,18 @@ fn find_stranded_fetch(root: &Arc<dyn ExecutionPlan>) -> Option<usize> {
 /// cap above it is equivalent to the same cap below it. `ProjectionExec` and
 /// `SortPreservingMergeExec` also preserve order; `CoalescePartitionsExec` does
 /// not, but it is only walked past when fetchless (its `fetch` would stop the
-/// walk first) and an unordered root only ever carries a bare `LIMIT`. Only
-/// these node types are safe to walk past when hunting a stranded fetch.
+/// walk first) and an unordered root only ever carries a bare `LIMIT`.
+/// `ScalarSubqueryExec` resolves its uncorrelated subqueries once and then
+/// streams its main input through 1:1 in order (`CardinalityEffect::Equal`);
+/// tpcds q14 strands its TopK fetch below one. Only these node types are safe
+/// to walk past when hunting a stranded fetch — notably NOT window operators,
+/// which preserve row count but compute values over whatever row set reaches
+/// them, so a cap below one is not equivalent to a cap above it.
 fn is_row_preserving_passthrough(node: &Arc<dyn ExecutionPlan>) -> bool {
     node.downcast_ref::<ProjectionExec>().is_some()
         || node.downcast_ref::<SortPreservingMergeExec>().is_some()
         || node.downcast_ref::<CoalescePartitionsExec>().is_some()
+        || node.downcast_ref::<ScalarSubqueryExec>().is_some()
 }
 
 /// Collect the leaf execution plans (no children) that sit on a pure PROBE
@@ -597,6 +611,40 @@ mod tests {
         let restored = restore_stranded_global_fetch(spine);
 
         assert_eq!(restored.fetch(), Some(100));
+    }
+
+    #[test]
+    fn stranded_fetch_below_scalar_subquery_exec_is_restored() {
+        // The q14 spine, verbatim from the executed plan:
+        //   SortPreservingMergeExec [ordering]      (no fetch, 1 partition)
+        //     ScalarSubqueryExec: subqueries=1      (main input streamed 1:1)
+        //       SortExec: TopK(fetch=100), preserve_partitioning (8 partitions)
+        // ScalarSubqueryExec resolves its subqueries once and passes the main
+        // input through unchanged, but it lists the subquery plans as extra
+        // children — the walk must descend into child 0, not stop at the
+        // multi-child node (q14 returned 749 rows on the rig before this).
+        use datafusion::logical_expr::execution_props::ScalarSubqueryResults;
+        let scalar_wrap: Arc<dyn ExecutionPlan> = Arc::new(ScalarSubqueryExec::new(
+            per_partition_sort_with_fetch(100),
+            vec![],
+            ScalarSubqueryResults::new(0),
+        ));
+        let ordering = scalar_wrap
+            .output_ordering()
+            .expect("preserve_partitioning sort propagates its ordering")
+            .clone();
+        let spine: Arc<dyn ExecutionPlan> =
+            Arc::new(SortPreservingMergeExec::new(ordering, scalar_wrap));
+        assert_eq!(spine.output_partitioning().partition_count(), 1);
+        assert_eq!(spine.fetch(), None, "the fetchless merge root is the bug");
+
+        let restored = restore_stranded_global_fetch(spine);
+
+        assert_eq!(
+            restored.fetch(),
+            Some(100),
+            "the fetch stranded below ScalarSubqueryExec must be re-applied at the root"
+        );
     }
 
     #[test]
