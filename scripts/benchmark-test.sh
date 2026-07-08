@@ -6,6 +6,13 @@ set -euo pipefail
 # For each benchmark: generate SF1 data → load into SQE → run queries.
 # Uses the same Polaris + RustFS stack as integration-test.sh.
 #
+# The `bank` benchmark loads differently: no staging parquet and no CTAS
+# through the engine — sqe-bench writes partition-aligned parquet straight
+# to the warehouse and commits one snapshot per trading day via the
+# Iceberg REST API (`--sink iceberg`; openspec bank-benchmark-iceberg-gen).
+# BENCH_DATA_SOURCE does not apply to it. Scale maps to 12 trading days of
+# 2M rows/day at SF1.
+#
 # Usage:
 #   ./scripts/benchmark-test.sh                    # run all benchmarks
 #   ./scripts/benchmark-test.sh tpch               # run only TPC-H
@@ -162,7 +169,7 @@ case "$PROFILE" in
 esac
 
 # Parse options
-ALL_BENCHMARKS=(tpch ssb tpcds tpcc tpce tpcbb clickbench)
+ALL_BENCHMARKS=(tpch ssb tpcds tpcc tpce tpcbb clickbench bank)
 BENCHMARKS=()
 for arg in "$@"; do
     case "$arg" in
@@ -504,6 +511,69 @@ for BENCH in "${BENCHMARKS[@]}"; do
         echo "  ✓ TPC-DS tables loaded for TPC-BB"
     fi
 
+    if [ "$BENCH" = "bank" ]; then
+        # ── Steps 1+2 (bank): generate straight into Iceberg ──
+        # No staging parquet, no CTAS through the engine: sqe-bench writes
+        # partition-aligned parquet to the warehouse and commits one
+        # snapshot per trading day via the Iceberg REST API. `--clean`
+        # drops + recreates the tables, so a retry is idempotent.
+        SCALE_FMT=$(python3 -c "s='$BENCH_SCALE'; print((s.rstrip('0').rstrip('.') if '.' in s else s).replace('.','_'))")
+        BANK_ROWS_PER_DAY=$(python3 -c "print(max(1, int(2_000_000 * float('$BENCH_SCALE'))))")
+        BANK_CUSTOMERS=$(python3 -c "print(max(100, int(100_000 * float('$BENCH_SCALE'))))")
+        # The load writes to the WAREHOUSE endpoint (where the Iceberg
+        # tables live), not the staging-data endpoint.
+        if [ "$BENCH_WAREHOUSE" = "external" ]; then
+            BANK_S3_ENDPOINT="$BENCH_S3_ENDPOINT"
+            BANK_S3_ACCESS_KEY="$WH_S3_ACCESS_KEY"
+            BANK_S3_SECRET_KEY="$WH_S3_SECRET_KEY"
+            BANK_S3_REGION="$BENCH_S3_REGION"
+        else
+            BANK_S3_ENDPOINT="$S3_ENDPOINT"
+            BANK_S3_ACCESS_KEY="$S3_ACCESS_KEY"
+            BANK_S3_SECRET_KEY="$S3_SECRET_KEY"
+            BANK_S3_REGION="$S3_REGION"
+        fi
+        echo ""
+        echo "  [1-2/3] Generating straight into Iceberg (12 days x ${BANK_ROWS_PER_DAY} rows/day)..."
+        LOAD_START=$(date +%s)
+        LOAD_ATTEMPTS=2
+        LOAD_OK=0
+        for attempt in $(seq 1 "$LOAD_ATTEMPTS"); do
+            if "$BENCH_BIN" generate bank \
+                --sink iceberg \
+                --days 12 \
+                --rows-per-day "$BANK_ROWS_PER_DAY" \
+                --customers "$BANK_CUSTOMERS" \
+                --namespace "bank_sf${SCALE_FMT}" \
+                --catalog-uri "http://localhost:18181/api/catalog" \
+                --warehouse test_warehouse \
+                --client-id root \
+                --client-secret s3cr3t \
+                --scope 'PRINCIPAL_ROLE:ALL' \
+                --s3-endpoint "$BANK_S3_ENDPOINT" \
+                --s3-access-key "$BANK_S3_ACCESS_KEY" \
+                --s3-secret-key "$BANK_S3_SECRET_KEY" \
+                --s3-region "$BANK_S3_REGION" \
+                --s3-path-style \
+                --clean 2>&1; then
+                LOAD_OK=1
+                break
+            fi
+            if [ "$attempt" -lt "$LOAD_ATTEMPTS" ]; then
+                echo "  ⚠ Load attempt $attempt failed, retrying after 3s..."
+                sleep 3
+            fi
+        done
+        if [ "$LOAD_OK" -ne 1 ]; then
+            echo "  ✗ Load FAILED for $BENCH after $LOAD_ATTEMPTS attempts"
+            RESULTS+=("$BENCH: LOAD_FAILED")
+            TOTAL_ERROR=$((TOTAL_ERROR + 1))
+            continue
+        fi
+        LOAD_END=$(date +%s)
+        echo "  ✓ Loaded in $((LOAD_END - LOAD_START))s"
+    else
+
     # ── Step 1: Generate ──────────────────────────────────────
     echo ""
     if [ -n "$EXTERNAL_DATA" ]; then
@@ -567,6 +637,8 @@ for BENCH in "${BENCHMARKS[@]}"; do
     LOAD_END=$(date +%s)
     echo "  ✓ Loaded in $((LOAD_END - LOAD_START))s"
     if [ "$BENCH" = "tpcds" ]; then TPCDS_LOADED=1; fi
+
+    fi # end bank / staged-load branch
 
     # ── Step 3: Test ──────────────────────────────────────────
     echo ""
