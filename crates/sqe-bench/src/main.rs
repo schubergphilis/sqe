@@ -4,6 +4,7 @@ mod compare;
 mod comparison;
 mod generate;
 mod load;
+mod sink;
 
 /// Format a scale factor as an identifier-safe string (no dots).
 /// 0.01 → "0_01", 1.0 → "1", 10.0 → "10"
