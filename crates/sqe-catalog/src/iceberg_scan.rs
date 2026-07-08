@@ -866,7 +866,13 @@ impl ExecutionPlan for IcebergScanExec {
         // `schema` is also needed after the stream is created (for IcebergRecordBatchStream),
         // so clone it before moving it into the async block.
         let schema_for_stream = schema.clone();
-        let stream = futures::stream::once(async move {
+        // The async block below is a ~600-line state machine holding every
+        // local across every await of both reader paths. Box it BEFORE handing
+        // it to `stream::once`: composed inline, debug builds (no move elision)
+        // materialize the whole machine on the caller's stack once per wrapper
+        // layer, which overflows the 2MB default test-thread stack in CI.
+        // Boxed first, the frame holds one copy and the wrappers copy a pointer.
+        let stream = futures::stream::once(Box::pin(async move {
             let schema = schema_for_stream;
             // ── Collect data file list via iceberg-rust's scan planner ────────
             //
@@ -1534,7 +1540,7 @@ impl ExecutionPlan for IcebergScanExec {
                 }))
                 .boxed();
             Ok::<BatchStream, DataFusionError>(s)
-        }).try_flatten();
+        })).try_flatten();
         Ok(Box::pin(IcebergRecordBatchStream { schema, inner: Box::pin(stream), baseline }))
     }
 }
