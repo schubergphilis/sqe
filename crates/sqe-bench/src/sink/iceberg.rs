@@ -41,6 +41,12 @@ use crate::generate::GenerateConfig;
 /// Snapshot summary key marking a committed trading day.
 pub const SNAPSHOT_DAY_PROP: &str = "sqe-bench.day";
 
+/// Table property prefix marking a committed trading day. The property
+/// (`sqe-bench.day.YYYY-MM-DD = done`) is the durable resume record: some
+/// catalogs (Nessie) serve metadata with a trimmed snapshot history, so
+/// snapshot summary markers alone are not reliable across catalogs.
+pub const DAY_PROP_PREFIX: &str = "sqe-bench.day.";
+
 /// Target rows per generation shard for the small fixed-width tables
 /// (dimensions and balance snapshots). Fact shard counts come from the
 /// caller, which sizes them against the byte target.
@@ -319,12 +325,14 @@ async fn ensure_tables(
     Ok(tables)
 }
 
-/// Days already committed for `table`, read from snapshot summaries.
+/// Days already committed for `table`, read from the day-marker table
+/// properties.
 fn committed_days(table: &Table) -> HashSet<i32> {
     table
         .metadata()
-        .snapshots()
-        .filter_map(|s| s.summary().additional_properties.get(SNAPSHOT_DAY_PROP))
+        .properties()
+        .keys()
+        .filter_map(|k| k.strip_prefix(DAY_PROP_PREFIX))
         .filter_map(|d| parse_day(d).ok())
         .collect()
 }
@@ -406,7 +414,15 @@ async fn commit_files(
             format_day(day),
         )]));
     }
-    let tx = append.apply(tx).context("applying append")?;
+    let mut tx = append.apply(tx).context("applying append")?;
+    if let Some(day) = day {
+        // Durable resume marker; committed atomically with the append.
+        tx = tx
+            .update_table_properties()
+            .set(format!("{DAY_PROP_PREFIX}{}", format_day(day)), "done".to_string())
+            .apply(tx)
+            .context("applying day property")?;
+    }
     tx.commit(ctx.catalog.as_ref())
         .await
         .context("committing append")?;
