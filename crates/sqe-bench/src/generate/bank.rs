@@ -516,7 +516,7 @@ pub fn transaction_day_shard(
                 DESC_VERBS[rng.gen_range(0..DESC_VERBS.len())],
                 rng.gen_range(0..9_999_999_999u64)
             ));
-            t_balance_after.push(rng.gen_range(-100_000_00..10_000_000_00i64));
+            t_balance_after.push(rng.gen_range(-10_000_000..1_000_000_000i64));
             t_country.push(COUNTRIES[rng.gen_range(0..COUNTRIES.len())]);
         }
 
@@ -577,7 +577,7 @@ pub fn account_balance_day_shard(
             let a_id = (next + i as u64) as i64;
             b_day.push(day);
             b_a_id.push(a_id);
-            b_balance.push(rng.gen_range(-500_000_00..50_000_000_00i64));
+            b_balance.push(rng.gen_range(-50_000_000..5_000_000_000i64));
             b_currency.push(account_currency(a_id));
             b_txn_count.push(rng.gen_range(0..200i32));
         }
@@ -659,7 +659,7 @@ impl BenchmarkGenerator for BankGenerator {
                 unit_seed("customer", 0, 0),
                 output_dir,
                 config,
-                |range, seed| customer_range(range, seed),
+                customer_range,
             ),
             "account" => parallel_generate_table(
                 table,
@@ -677,7 +677,7 @@ impl BenchmarkGenerator for BankGenerator {
                 unit_seed("kyc_profile", 0, 0),
                 output_dir,
                 config,
-                |range, seed| kyc_profile_range(range, seed),
+                kyc_profile_range,
             ),
             // Facts run through the same day/shard units as the Iceberg
             // sink: the global row range maps onto per-day slices so scale
