@@ -21,6 +21,8 @@ arrow = { workspace = true }
 arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
 arrow-flight = { workspace = true }
+iceberg = { workspace = true }
+iceberg-catalog-rest = { workspace = true }
 parquet = { workspace = true }
 object_store = { workspace = true }
 tokio = { workspace = true }

@@ -6,3 +6,4 @@
 //! the user-facing binary.
 
 pub mod generate;
+pub mod sink;
