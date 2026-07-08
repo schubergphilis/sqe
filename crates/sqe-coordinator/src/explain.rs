@@ -23,6 +23,8 @@ pub struct ExplainHandler {
     star_schema_min_ratio: usize,
     dim_build_swap: bool,
     parallel_probe_scan: bool,
+    parallel_scan: bool,
+    distribution_threshold: String,
 }
 
 impl ExplainHandler {
@@ -36,6 +38,8 @@ impl ExplainHandler {
             star_schema_min_ratio: query_config.star_schema_min_ratio,
             dim_build_swap: query_config.dim_build_swap,
             parallel_probe_scan: query_config.parallel_probe_scan,
+            parallel_scan: query_config.parallel_scan,
+            distribution_threshold: query_config.distribution_threshold.clone(),
         }
     }
 
@@ -69,6 +73,16 @@ impl ExplainHandler {
             match rule.optimize(plan.clone(), state.config_options()) {
                 Ok(optimized) => plan = optimized,
                 Err(e) => tracing::debug!(error = %e, "EXPLAIN: probe-side scan parallelization failed"),
+            }
+        }
+        if self.parallel_scan {
+            let byte_threshold =
+                sqe_core::parse_memory_limit(&self.distribution_threshold).unwrap_or(0);
+            let state = ctx.state();
+            let rule = crate::parallel_scan::ParallelScanRule::new(byte_threshold);
+            match rule.optimize(plan.clone(), state.config_options()) {
+                Ok(optimized) => plan = optimized,
+                Err(e) => tracing::debug!(error = %e, "EXPLAIN: parallel scan pass failed"),
             }
         }
         plan
