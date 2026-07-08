@@ -133,6 +133,8 @@ pub struct BankRunSpec {
     pub target_file_size: usize,
     /// Skip days that already have a committed snapshot.
     pub resume: bool,
+    /// Drop existing bank tables first (idempotent reload).
+    pub clean: bool,
 }
 
 /// One generation unit: a disjoint slice of one table, optionally bound to
@@ -264,9 +266,11 @@ fn bank_arrow_schema(table: &str) -> arrow_schema::SchemaRef {
 }
 
 /// Create the namespace and any missing bank tables; return handles.
+/// With `clean`, existing bank tables are dropped and recreated first.
 async fn ensure_tables(
     catalog: &dyn Catalog,
     namespace: &str,
+    clean: bool,
 ) -> anyhow::Result<HashMap<&'static str, TableCtx>> {
     let ns = NamespaceIdent::new(namespace.to_string());
     if !catalog
@@ -284,6 +288,13 @@ async fn ensure_tables(
     let mut tables = HashMap::new();
     for name in BANK_TABLES {
         let ident = TableIdent::new(ns.clone(), name.to_string());
+        if clean && catalog.table_exists(&ident).await? {
+            catalog
+                .drop_table(&ident)
+                .await
+                .with_context(|| format!("dropping table {name}"))?;
+            println!("Dropped table {namespace}.{name}");
+        }
         let table = if catalog.table_exists(&ident).await? {
             catalog.load_table(&ident).await?
         } else {
@@ -497,7 +508,7 @@ pub async fn run_bank(
         .context("connecting to catalog")?;
     let catalog: Box<dyn Catalog> = Box::new(catalog);
 
-    let tables = ensure_tables(catalog.as_ref(), &target.namespace).await?;
+    let tables = ensure_tables(catalog.as_ref(), &target.namespace, spec.clean).await?;
 
     // Refuse to double-load: unless resuming, every table must be empty.
     let mut done_txn: HashSet<i32> = HashSet::new();

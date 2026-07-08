@@ -59,6 +59,7 @@ async fn main() -> anyhow::Result<()> {
             target_file_size,
             dry_run,
             resume,
+            clean,
             ..
         } => {
             let config = generate::GenerateConfig::resolve(
@@ -90,7 +91,7 @@ async fn main() -> anyhow::Result<()> {
 
                 println!("Calibrating transaction bytes/row (pilot shard)...");
                 let calibration = sink::plan::calibrate(&config, plan.accounts())?;
-                let run_plan = match bytes_per_day.as_deref() {
+                let mut run_plan = match bytes_per_day.as_deref() {
                     Some(b) => sink::plan::RunPlan::from_bytes_per_day(
                         sink::plan::parse_size(b)?,
                         plan,
@@ -108,6 +109,7 @@ async fn main() -> anyhow::Result<()> {
                         )
                     }
                 };
+                run_plan.spec.clean = clean;
                 run_plan.print(config.threads);
                 if dry_run {
                     println!("--dry-run: nothing written.");

@@ -76,7 +76,7 @@ else
     DATA_S3_REGION="$S3_REGION"
 fi
 
-ALL_BENCHMARKS=(tpch ssb tpcds tpcc tpce tpcbb clickbench)
+ALL_BENCHMARKS=(tpch ssb tpcds tpcc tpce tpcbb clickbench bank)
 if [ $# -gt 0 ]; then
     BENCHMARKS=("$@")
 else
@@ -205,6 +205,43 @@ for BENCH in "${BENCHMARKS[@]}"; do
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo "  $(echo "$BENCH" | tr '[:lower:]' '[:upper:]') (SF${BENCH_SCALE})"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+    # ── bank: direct-to-Iceberg (no staging, no CTAS) ─────────
+    # sqe-bench writes partition-aligned parquet straight to the warehouse
+    # and commits one snapshot per trading day via the Iceberg REST API.
+    if [ "$BENCH" = "bank" ]; then
+        SCALE_FMT=$(python3 -c "s='$BENCH_SCALE'; print((s.rstrip('0').rstrip('.') if '.' in s else s).replace('.','_'))")
+        BANK_ROWS_PER_DAY=$(python3 -c "print(max(1, int(2_000_000 * float('$BENCH_SCALE'))))")
+        BANK_CUSTOMERS=$(python3 -c "print(max(100, int(100_000 * float('$BENCH_SCALE'))))")
+        echo ""
+        echo "  [1-2/2] Generating straight into Iceberg (12 days x ${BANK_ROWS_PER_DAY} rows/day)..."
+        LOAD_START=$(date +%s)
+        if ! "$BENCH_BIN" generate bank \
+            --sink iceberg \
+            --days 12 \
+            --rows-per-day "$BANK_ROWS_PER_DAY" \
+            --customers "$BANK_CUSTOMERS" \
+            --namespace "bank_sf${SCALE_FMT}" \
+            --catalog-uri "http://localhost:18181/api/catalog" \
+            --warehouse test_warehouse \
+            --client-id root \
+            --client-secret s3cr3t \
+            --scope 'PRINCIPAL_ROLE:ALL' \
+            --s3-endpoint "$S3_ENDPOINT" \
+            --s3-access-key "$S3_ACCESS_KEY" \
+            --s3-secret-key "$S3_SECRET_KEY" \
+            --s3-region "$S3_REGION" \
+            --s3-path-style \
+            --clean 2>&1; then
+            echo "  ✗ Load FAILED"
+            FAIL=$((FAIL + 1))
+            continue
+        fi
+        LOAD_END=$(date +%s)
+        echo "  ✓ Loaded in $((LOAD_END - LOAD_START))s"
+        PASS=$((PASS + 1))
+        continue
+    fi
 
     # ── Generate ──────────────────────────────────────────────
     echo ""
