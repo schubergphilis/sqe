@@ -23,15 +23,21 @@
 //! bump only the fact side and the join sees N vs 1, which is invalid.
 //!
 //! Instead the rule bumps every qualifying scan to `RoundRobinBatch(N)` and
-//! re-runs `EnforceDistribution` once. Given a `Partitioned` join with one input
-//! now at N and the other at 1, `EnforceDistribution` inserts
+//! re-runs `EnforceDistribution` then `EnforceSorting` (the same order
+//! DataFusion's stock pipeline runs them). Given a `Partitioned` join with one
+//! input now at N and the other at 1, `EnforceDistribution` inserts
 //! `RepartitionExec(Hash(key), N)` above BOTH inputs, so partition counts match,
 //! the join stays `Partitioned` (re-running distribution does not re-pick join
 //! modes, that is `JoinSelection`), and no `CoalescePartitionsExec` lands above
-//! a scan. Aggregates get their `Hash` / coalesce before the final merge, and a
-//! multi-partition root is coalesced by `execute_stream`. This is the mechanism
-//! the sibling `ParallelProbeScanRule` (#235) already ships and that q72 was
-//! validated against.
+//! a scan. `EnforceSorting` then removes any sort stranded below a newly
+//! inserted repartition (its ordering is destroyed by the exchange and redone
+//! above it) so wide rows are not re-sorted for nothing. Aggregates get their
+//! `Hash` / coalesce before the final merge; a root that legitimately stays
+//! multi-partition is coalesced back to a single partition by
+//! [`restore_single_partition_root`], since SQE's result collection concatenates
+//! root partitions rather than merging them. This is the mechanism the sibling
+//! `ParallelProbeScanRule` (#235) already ships and that q72 was validated
+//! against.
 //!
 //! ## The one load-bearing guard
 //!
@@ -54,10 +60,13 @@ use datafusion::config::ConfigOptions;
 use datafusion::error::Result;
 use datafusion::physical_expr::Distribution;
 use datafusion::physical_optimizer::enforce_distribution::EnforceDistribution;
+use datafusion::physical_optimizer::enforce_sorting::EnforceSorting;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::ExecutionPlan;
 use sqe_catalog::iceberg_scan::IcebergScanExec;
 use tracing::debug;
+
+use crate::parallel_probe_scan::restore_single_partition_root;
 
 /// Physical optimizer rule that parallelizes single-node Iceberg scans. Gated
 /// by `query.parallel_scan`; `byte_threshold` reuses `distribution_threshold`.
@@ -102,7 +111,16 @@ impl PhysicalOptimizerRule for ParallelScanRule {
         // exchanges they need (Hash repartition on both sides of a Partitioned
         // join, coalesce before a final aggregate). Only non-build scans changed,
         // so no CollectLeft build side is coalesced: no q72-class regression.
-        EnforceDistribution::new().optimize(rewritten, config)
+        let redistributed = EnforceDistribution::new().optimize(rewritten, config)?;
+        // Then EnforceSorting, matching DataFusion's stock pipeline order, so a
+        // sort stranded below a newly inserted repartition (its ordering redone
+        // above the exchange) is removed instead of re-sorting wide rows and
+        // risking OOM. Finally restore a single-partition root: a plan that stays
+        // multi-partition to the top (e.g. a partitioned window ending in a
+        // per-partition TopK) would otherwise over-return `N * limit` rows,
+        // because SQE's result collection concatenates root partitions.
+        let resorted = EnforceSorting::new().optimize(redistributed, config)?;
+        Ok(restore_single_partition_root(resorted))
     }
 
     fn name(&self) -> &str {
@@ -348,6 +366,46 @@ mod tests {
         let spm: Arc<dyn ExecutionPlan> =
             Arc::new(SortPreservingMergeExec::new(ordering, Arc::clone(&l)));
         assert!(!ptr_in(&collect_non_build_leaves(&spm), &l));
+    }
+
+    // The rule now shares `parallel_probe_scan`'s single-partition-root restore.
+    // An ordered multi-partition root (a `preserve_partitioning` TopK, e.g. a
+    // partitioned window ending in a per-partition `SortExec`) is merged back to
+    // one partition via `SortPreservingMergeExec` carrying its fetch, so the
+    // rewritten plan cannot over-return `N * limit` rows through SQE's
+    // partition-concatenating result collection. The rule's own `optimize` tail
+    // needs a live `IcebergScanExec` to trigger a bump, so this shared behaviour
+    // is exercised here (and in the `parallel_probe_scan` tests) rather than
+    // through `optimize` with stand-in leaves.
+    #[test]
+    fn shared_root_restore_merges_ordered_multi_partition_root_with_fetch() {
+        use datafusion::physical_plan::repartition::RepartitionExec;
+        use datafusion::physical_plan::{ExecutionPlanProperties, Partitioning};
+
+        let repartitioned: Arc<dyn ExecutionPlan> =
+            Arc::new(RepartitionExec::try_new(leaf(), Partitioning::RoundRobinBatch(8)).unwrap());
+        let ordering =
+            LexOrdering::new(vec![PhysicalSortExpr::new_default(col("id", &schema()).unwrap())])
+                .unwrap();
+        let root: Arc<dyn ExecutionPlan> = Arc::new(
+            SortExec::new(ordering, repartitioned)
+                .with_preserve_partitioning(true)
+                .with_fetch(Some(100)),
+        );
+        assert!(root.output_partitioning().partition_count() > 1);
+
+        let restored = restore_single_partition_root(root);
+
+        assert_eq!(restored.output_partitioning().partition_count(), 1);
+        assert!(
+            restored.downcast_ref::<SortPreservingMergeExec>().is_some(),
+            "ordered multi-partition root must be merged with SortPreservingMergeExec"
+        );
+        assert_eq!(
+            restored.fetch(),
+            Some(100),
+            "the global ORDER BY ... LIMIT fetch must be carried onto the merge"
+        );
     }
 
     // The load-bearing DataFusion behaviour the rule relies on: bump one input of

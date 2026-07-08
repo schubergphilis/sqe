@@ -143,7 +143,12 @@ fn bump_scans(
 /// `ORDER BY ... LIMIT` still caps at `limit` rows; an unordered root is merged
 /// with `CoalescePartitionsExec`, also carrying any fetch so a bare `LIMIT`
 /// cannot over-return `N * limit` rows.
-fn restore_single_partition_root(plan: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
+///
+/// Shared with [`crate::parallel_scan::ParallelScanRule`], which has the same
+/// post-bump obligation to hand the rest of SQE a single-partition root.
+pub(crate) fn restore_single_partition_root(
+    plan: Arc<dyn ExecutionPlan>,
+) -> Arc<dyn ExecutionPlan> {
     if plan.output_partitioning().partition_count() <= 1 {
         return plan;
     }
