@@ -6282,6 +6282,8 @@ dependencies = [
  "clap",
  "csv",
  "futures",
+ "iceberg",
+ "iceberg-catalog-rest",
  "object_store",
  "parquet",
  "rand 0.8.6",

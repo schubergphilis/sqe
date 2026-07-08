@@ -8,3 +8,4 @@
 //! catalog owns table metadata from the moment of creation.
 
 pub mod iceberg;
+pub mod plan;

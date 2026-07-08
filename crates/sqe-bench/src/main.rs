@@ -37,6 +37,28 @@ async fn main() -> anyhow::Result<()> {
             threads,
             compression,
             row_group_size,
+            sink,
+            days,
+            start_date,
+            bytes_per_day,
+            rows_per_day,
+            customers,
+            catalog_uri,
+            warehouse,
+            namespace,
+            client_id,
+            client_secret,
+            oauth2_server_uri,
+            scope,
+            bearer_token,
+            s3_endpoint,
+            s3_access_key,
+            s3_secret_key,
+            s3_region,
+            s3_path_style,
+            target_file_size,
+            dry_run,
+            resume,
             ..
         } => {
             let config = generate::GenerateConfig::resolve(
@@ -44,6 +66,78 @@ async fn main() -> anyhow::Result<()> {
                 compression.as_deref(),
                 row_group_size,
             )?;
+
+            if let cli::Sink::Iceberg = sink {
+                anyhow::ensure!(
+                    benchmark == "bank",
+                    "--sink iceberg currently supports only the bank benchmark"
+                );
+                anyhow::ensure!(
+                    bytes_per_day.is_some() || rows_per_day.is_some(),
+                    "--sink iceberg needs --bytes-per-day (e.g. 4t) or --rows-per-day"
+                );
+                let start_day = match start_date.as_deref() {
+                    Some(s) => sink::iceberg::parse_day(s)?,
+                    None => generate::bank::DEFAULT_START_DAY,
+                };
+                let mut plan = generate::bank::BankPlan {
+                    customers,
+                    start_day,
+                    days,
+                    txn_rows_per_day: rows_per_day.unwrap_or(0),
+                };
+                let target_file_size = sink::plan::parse_size(&target_file_size)? as usize;
+
+                println!("Calibrating transaction bytes/row (pilot shard)...");
+                let calibration = sink::plan::calibrate(&config, plan.accounts())?;
+                let run_plan = match bytes_per_day.as_deref() {
+                    Some(b) => sink::plan::RunPlan::from_bytes_per_day(
+                        sink::plan::parse_size(b)?,
+                        plan,
+                        calibration,
+                        target_file_size,
+                        resume,
+                    ),
+                    None => {
+                        plan.txn_rows_per_day = rows_per_day.unwrap_or(1).max(1);
+                        sink::plan::RunPlan::from_rows_per_day(
+                            plan,
+                            calibration,
+                            target_file_size,
+                            resume,
+                        )
+                    }
+                };
+                run_plan.print(config.threads);
+                if dry_run {
+                    println!("--dry-run: nothing written.");
+                    return Ok(());
+                }
+                let catalog_uri = catalog_uri
+                    .ok_or_else(|| anyhow::anyhow!("--sink iceberg needs --catalog-uri"))?;
+                let warehouse = warehouse
+                    .ok_or_else(|| anyhow::anyhow!("--sink iceberg needs --warehouse"))?;
+
+                let target = sink::iceberg::IcebergTarget {
+                    catalog_uri,
+                    warehouse,
+                    namespace,
+                    credential: match (client_id, client_secret) {
+                        (Some(id), Some(secret)) => Some(format!("{id}:{secret}")),
+                        _ => None,
+                    },
+                    oauth2_server_uri,
+                    scope,
+                    bearer_token,
+                    s3_endpoint,
+                    s3_access_key,
+                    s3_secret_key,
+                    s3_region: Some(s3_region),
+                    s3_path_style,
+                };
+                return sink::iceberg::run_bank(&target, &run_plan.spec, &config).await;
+            }
+
             let gen = generate::get_generator(&benchmark)?;
             println!(
                 "Generating {benchmark} (threads={}, compression={:?}, row_group_size={:?})",
