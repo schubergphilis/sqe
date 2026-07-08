@@ -22,6 +22,7 @@ pub struct ExplainHandler {
     star_schema_reorder: bool,
     star_schema_min_ratio: usize,
     dim_build_swap: bool,
+    parallel_probe_scan: bool,
 }
 
 impl ExplainHandler {
@@ -34,6 +35,7 @@ impl ExplainHandler {
             star_schema_reorder: query_config.star_schema_reorder,
             star_schema_min_ratio: query_config.star_schema_min_ratio,
             dim_build_swap: query_config.dim_build_swap,
+            parallel_probe_scan: query_config.parallel_probe_scan,
         }
     }
 
@@ -59,6 +61,14 @@ impl ExplainHandler {
             match rule.optimize(plan.clone(), state.config_options()) {
                 Ok(optimized) => plan = optimized,
                 Err(e) => tracing::debug!(error = %e, "EXPLAIN: dim-build swap failed"),
+            }
+        }
+        if self.parallel_probe_scan {
+            let state = ctx.state();
+            let rule = crate::parallel_probe_scan::ParallelProbeScanRule::new();
+            match rule.optimize(plan.clone(), state.config_options()) {
+                Ok(optimized) => plan = optimized,
+                Err(e) => tracing::debug!(error = %e, "EXPLAIN: probe-side scan parallelization failed"),
             }
         }
         plan
