@@ -41,27 +41,53 @@
 //!
 //! ## The one load-bearing guard
 //!
-//! A scan on the build (left) side of a `CollectLeft` join is NEVER bumped.
+//! A scan on the build (left) side of a `CollectLeft` hash join is NEVER bumped.
 //! `EnforceDistribution` requires that side to be a single partition, so bumping
 //! it re-creates the exact `CoalescePartitionsExec`-above-scan shape that q72
-//! regressed on. The guard is expressed generically through
-//! [`ExecutionPlan::required_input_distribution`]: a child reached via a
-//! `SinglePartition` requirement (a `CollectLeft` build side, a global sort, a
-//! global limit, a final aggregate over a collapsed single-partition input) or a
-//! required input ordering is tainted and left serial. `Partitioned`-join sides
-//! are deliberately NOT tainted: those are the scans this rule exists to cover
-//! (this is where it goes beyond #235, which only parallelizes `CollectLeft`
-//! probes).
+//! regressed on. This is the ONLY single-partition requirement the rule cannot
+//! repair by re-running the stock pipeline: join-mode selection (`JoinSelection`)
+//! is not re-run here, so a `CollectLeft` join stays `CollectLeft` and keeps
+//! demanding a one-partition build.
+//!
+//! Everything else the re-run repairs. `EnforceDistribution` then
+//! `EnforceSorting` re-place every exchange and re-erect every ordering the new
+//! partition counts require, so a scan under a global sort, a
+//! `SortPreservingMergeExec`, a window, or a final aggregate is safe to bump: the
+//! merge / sort / coalesce is simply rebuilt ABOVE the inserted exchange. The
+//! taint walk therefore keys ONLY on joins, not on
+//! [`ExecutionPlan::required_input_distribution`] /
+//! [`ExecutionPlan::required_input_ordering`]. Keying on those (as an earlier
+//! version did) tainted the child of nearly every plan's root
+//! `SortPreservingMergeExec` / global `SortExec` and left `bumpable` empty on
+//! every real benchmark query, so the rule never fired. The walk's rules:
+//!
+//! - `CollectLeft` hash join: taint the build (left) side; inherit on the probe.
+//! - `Partitioned` hash join: inherit taint on BOTH sides. These are the scans
+//!   this rule exists to unlock (tpcds q72 `inventory`, tpch q9 `lineitem`);
+//!   `EnforceDistribution` hash-repartitions both inputs to N and the join stays
+//!   `Partitioned`. This is where it goes beyond #235, which only parallelizes
+//!   `CollectLeft` probes.
+//! - `Auto` hash join: taint BOTH sides. `Auto` advertises
+//!   `UnknownPartitioning(N)` (the #131 shape), so a bumped child scan is exactly
+//!   what `EnforceDistribution` coalesces above; treat it as unsafe.
+//! - Any other join (sort-merge, nested-loop, cross, symmetric-hash,
+//!   piecewise-merge): taint both sides (conservative; their build sides carry
+//!   single-partition or strict-order requirements this walk does not model).
+//! - `UnionExec` and pipeline operators (filter, projection, aggregate, sort,
+//!   limit, merge, coalesce): inherit the incoming taint unchanged.
 
 use std::sync::Arc;
 
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::config::ConfigOptions;
 use datafusion::error::Result;
-use datafusion::physical_expr::Distribution;
 use datafusion::physical_optimizer::enforce_distribution::EnforceDistribution;
 use datafusion::physical_optimizer::enforce_sorting::EnforceSorting;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
+use datafusion::physical_plan::joins::{
+    CrossJoinExec, HashJoinExec, NestedLoopJoinExec, PartitionMode, PiecewiseMergeJoinExec,
+    SortMergeJoinExec, SymmetricHashJoinExec,
+};
 use datafusion::physical_plan::ExecutionPlan;
 use sqe_catalog::iceberg_scan::IcebergScanExec;
 use tracing::debug;
@@ -183,15 +209,17 @@ fn bump_scans(
 }
 
 /// Collect the leaf plans that are safe to parallelize: a leaf is included
-/// unless, on its path from the root, it is reached through an operator that
-/// requires that child to be a single partition or to arrive in a specific
-/// order. Build sides of `CollectLeft` joins, global sorts, global limits, and
-/// final aggregates over collapsed single-partition inputs all taint their
-/// subtree; `Partitioned`-join and pipeline (filter/projection) branches do not.
+/// unless, on its path from the root, it is reached by descending into the build
+/// (left) side of a `CollectLeft` hash join, into either side of an `Auto` hash
+/// join, or into either side of any non-hash join. Hash-`Partitioned` join sides,
+/// `UnionExec` branches, and pipeline operators (filter, projection, aggregate,
+/// sort, limit, merge) pass taint through unchanged, so their scans stay
+/// bumpable.
 ///
 /// This is the q72 regression guard as a pure function over the plan tree, so it
 /// is unit-tested directly with stand-in leaves (the sibling `parallel_probe_scan`
-/// rule tests its guard the same way).
+/// rule tests its guard the same way — but note the two walks treat a
+/// `Partitioned` join oppositely, so they are deliberately NOT shared).
 pub(crate) fn collect_non_build_leaves(
     plan: &Arc<dyn ExecutionPlan>,
 ) -> Vec<Arc<dyn ExecutionPlan>> {
@@ -208,25 +236,58 @@ fn walk(node: &Arc<dyn ExecutionPlan>, tainted: bool, out: &mut Vec<Arc<dyn Exec
         }
         return;
     }
-    let reqs = node.required_input_distribution();
-    for (idx, child) in children.iter().enumerate() {
-        let child_tainted = tainted
-            || matches!(reqs.get(idx), Some(Distribution::SinglePartition))
-            || requires_ordering(node, idx);
-        walk(child, child_tainted, out);
+
+    if let Some(hj) = node.downcast_ref::<HashJoinExec>() {
+        match hj.partition_mode() {
+            // Build (left) side is collected to one partition by
+            // EnforceDistribution; bumping it re-creates the q72 regression.
+            // Probe (right) side inherits the incoming taint.
+            PartitionMode::CollectLeft => {
+                walk(hj.left(), true, out);
+                walk(hj.right(), tainted, out);
+            }
+            // Both sides are hash-repartitioned to N and the join stays
+            // Partitioned: exactly the scans this rule unlocks.
+            PartitionMode::Partitioned => {
+                walk(hj.left(), tainted, out);
+                walk(hj.right(), tainted, out);
+            }
+            // Auto advertises UnknownPartitioning(N) (the #131 shape); a bumped
+            // child is what EnforceDistribution coalesces above. Taint both.
+            PartitionMode::Auto => {
+                walk(hj.left(), true, out);
+                walk(hj.right(), true, out);
+            }
+        }
+        return;
+    }
+
+    // Any non-hash join has a single-partition build side (or a strict-order
+    // requirement) this walk does not model: taint both inputs conservatively.
+    if is_non_hash_join(node) {
+        for child in &children {
+            walk(child, true, out);
+        }
+        return;
+    }
+
+    // Pipeline operators and UnionExec: row plumbing that EnforceDistribution +
+    // EnforceSorting re-establish above the inserted exchange. Inherit taint.
+    for child in &children {
+        walk(child, tainted, out);
     }
 }
 
-/// Whether `parent` requires its child `idx` to arrive in a specific order.
-/// Bumping a scan under such an operator (e.g. `SortPreservingMergeExec`) would
-/// scramble the per-partition ordering it assumes, so those scans stay serial.
-fn requires_ordering(parent: &Arc<dyn ExecutionPlan>, idx: usize) -> bool {
-    parent
-        .required_input_ordering()
-        .into_iter()
-        .nth(idx)
-        .flatten()
-        .is_some()
+/// Whether `node` is a join other than `HashJoinExec` (handled by the caller).
+/// Enumerates the join operators DataFusion 54 exports; a scan under any of them
+/// is left serial because their build sides carry single-partition or
+/// strict-order requirements the taint walk does not model.
+fn is_non_hash_join(node: &Arc<dyn ExecutionPlan>) -> bool {
+    node.downcast_ref::<CrossJoinExec>().is_some()
+        || node.downcast_ref::<NestedLoopJoinExec>().is_some()
+        || node.downcast_ref::<PiecewiseMergeJoinExec>().is_some()
+        || node.downcast_ref::<SortMergeJoinExec>().is_some()
+        || node.downcast_ref::<SymmetricHashJoinExec>().is_some()
 }
 
 #[cfg(test)]
@@ -345,28 +406,88 @@ mod tests {
         assert!(ptr_in(&collect_non_build_leaves(&f), &l));
     }
 
-    // Task 2.4: a global sort requires a single partition, so its scan is left
-    // serial (excluded).
+    // A global (preserve_partitioning=false) SortExec no longer excludes its
+    // scan: EnforceSorting rebuilds the sort above the inserted exchange after
+    // the bump, so the scan is safe to parallelize. (Inverted from the old
+    // ordering-taint behaviour, which kept the rule from ever firing.)
     #[test]
-    fn global_sort_excludes_scan() {
+    fn global_sort_no_longer_excludes_scan() {
         let l = leaf();
         let sort_expr = PhysicalSortExpr::new_default(col("id", &l.schema()).unwrap());
         let ordering = LexOrdering::new(vec![sort_expr]).unwrap();
         // preserve_partitioning defaults to false: a global sort.
         let sort: Arc<dyn ExecutionPlan> = Arc::new(SortExec::new(ordering, Arc::clone(&l)));
-        assert!(!ptr_in(&collect_non_build_leaves(&sort), &l));
+        assert!(
+            ptr_in(&collect_non_build_leaves(&sort), &l),
+            "a scan under a global sort is now bumpable (ordering re-erected above the exchange)"
+        );
     }
 
-    // An operator that requires an input ordering (SortPreservingMerge) excludes
-    // its scan: bumping would scramble the assumed per-partition order.
+    // Test (3): a `SortPreservingMergeExec` root no longer excludes its scan.
+    // Nearly every real query roots in an SPM; the old ordering taint made this
+    // subtree serial and left `bumpable` empty on every benchmark query.
     #[test]
-    fn ordering_requiring_parent_excludes_scan() {
+    fn spm_root_no_longer_excludes_scan() {
         let l = leaf();
         let sort_expr = PhysicalSortExpr::new_default(col("id", &l.schema()).unwrap());
         let ordering = LexOrdering::new(vec![sort_expr]).unwrap();
         let spm: Arc<dyn ExecutionPlan> =
             Arc::new(SortPreservingMergeExec::new(ordering, Arc::clone(&l)));
-        assert!(!ptr_in(&collect_non_build_leaves(&spm), &l));
+        assert!(
+            ptr_in(&collect_non_build_leaves(&spm), &l),
+            "a scan under an SPM root is now bumpable (this is what unlocks the rule)"
+        );
+    }
+
+    // Test (2), the actual unlock: SPM -> global SortExec -> Partitioned hash
+    // join -> two leaves. BOTH leaves must be collected. Before the rewrite the
+    // SPM/sort ordering taint propagated all the way down and returned neither
+    // (the tpcds q72 `inventory` / `catalog_sales` shape).
+    #[test]
+    fn spm_over_sort_over_partitioned_join_collects_both_leaves() {
+        let l = leaf();
+        let r = leaf();
+        let j = join(Arc::clone(&l), Arc::clone(&r), PartitionMode::Partitioned);
+        let sort_expr = PhysicalSortExpr::new_default(col("id", &j.schema()).unwrap());
+        let ordering = LexOrdering::new(vec![sort_expr]).unwrap();
+        let sort: Arc<dyn ExecutionPlan> =
+            Arc::new(SortExec::new(ordering.clone(), j)); // global sort (preserve=false)
+        let spm: Arc<dyn ExecutionPlan> = Arc::new(SortPreservingMergeExec::new(ordering, sort));
+
+        let leaves = collect_non_build_leaves(&spm);
+        assert!(
+            ptr_in(&leaves, &l) && ptr_in(&leaves, &r),
+            "both Partitioned-join inputs must be bumpable through an SPM+sort cap"
+        );
+    }
+
+    // Test (4): a non-hash join (CrossJoinExec here) taints both sides, so
+    // neither leaf is collected. Same for SortMergeJoin / NestedLoop / etc.
+    #[test]
+    fn non_hash_join_taints_both_sides() {
+        let l = leaf();
+        let r = leaf();
+        let cj: Arc<dyn ExecutionPlan> = Arc::new(CrossJoinExec::new(Arc::clone(&l), Arc::clone(&r)));
+        let leaves = collect_non_build_leaves(&cj);
+        assert!(
+            !ptr_in(&leaves, &l) && !ptr_in(&leaves, &r),
+            "a non-hash join must leave both its scans serial"
+        );
+    }
+
+    // Test (5): UnionExec is multi-child but NOT a join; it inherits taint, so an
+    // untainted union collects both branches.
+    #[test]
+    fn union_inherits_taint_and_collects_both_branches() {
+        use datafusion::physical_plan::union::UnionExec;
+        let a = leaf();
+        let b = leaf();
+        let u = UnionExec::try_new(vec![Arc::clone(&a), Arc::clone(&b)]).unwrap();
+        let leaves = collect_non_build_leaves(&u);
+        assert!(
+            ptr_in(&leaves, &a) && ptr_in(&leaves, &b),
+            "UnionExec must inherit taint (untainted -> both branches bumpable)"
+        );
     }
 
     // The rule now shares `parallel_probe_scan`'s single-partition-root restore.
