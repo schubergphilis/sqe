@@ -411,16 +411,20 @@ TRINOEOF
     # Uncapped, the 8GB default matches the historical behavior. With a
     # TRINO_MEMORY cap, a fixed 8GB can exceed the heap and Trino exits at
     # startup with "Configuration is invalid" — the wait loop then times
-    # out and the comparison is silently skipped. Derive ~30% of the cap
-    # instead (floored at 1GB), mirroring Trino's own default ratio.
-    TRINO_QUERY_MEM="8GB"
-    if [ -n "$TRINO_MEMORY" ]; then
+    # out and the comparison is silently skipped. Derive 50% of the cap
+    # instead (floored at 1GB): that is ~62% of the heap, which the rig
+    # configs have run safely, while the earlier 30% (12g -> 3GB) made
+    # Trino fail SF10 q18/q21 hash joins that fit fine in half the
+    # container — an unfair handicap in the comparison. TRINO_QUERY_MEMORY
+    # overrides the derivation explicitly.
+    TRINO_QUERY_MEM="${TRINO_QUERY_MEMORY:-8GB}"
+    if [ -n "$TRINO_MEMORY" ] && [ -z "${TRINO_QUERY_MEMORY:-}" ]; then
         TRINO_QUERY_MEM=$(python3 -c "
 import re
 m = re.fullmatch(r'(\d+(?:\.\d+)?)([kmgt]?)b?', '$TRINO_MEMORY'.lower())
 n, u = float(m.group(1)), m.group(2)
 gb = n * {'k': 1/2**20, 'm': 1/2**10, 'g': 1, 't': 2**10, '': 1/2**30}[u]
-print(f'{max(1, int(gb * 0.3))}GB')")
+print(f'{max(1, int(gb * 0.5))}GB')")
     fi
 
     cat > /tmp/trino-bench/config.properties << TRINOEOF
