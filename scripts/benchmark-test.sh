@@ -363,6 +363,15 @@ if [ -n "$COMPARE_TRINO" ]; then
     # Trino exits right after "ready").
     POLARIS_IP=$(docker inspect "$(docker compose -f "$COMPOSE_FILE" ps -q polaris)" --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}')
 
+    # Trino must join the test stack's compose network. The catalog URI
+    # below points at Polaris' compose-network IP, and on a Linux host
+    # user-defined bridge networks are isolated from the default bridge,
+    # so a Trino container left on the default bridge fails every catalog
+    # call with ICEBERG_CATALOG_ERROR after a ~4.5min connect timeout
+    # (macOS masks this). Published ports (-p) still work on a
+    # user-defined network, so localhost:${TRINO_PORT} is unaffected.
+    STACK_NETWORK=$(docker inspect "$(docker compose -f "$COMPOSE_FILE" ps -q polaris)" --format '{{range $k, $v := .NetworkSettings.Networks}}{{$k}}{{end}}')
+
     # Trino's S3 target follows the warehouse: RustFS (via container IP)
     # in local mode, the external endpoint otherwise — then SQE and Trino
     # fetch table data over the identical network path.
@@ -434,9 +443,14 @@ TRINOEOF
     if [ -n "$TRINO_MEMORY" ]; then
         TRINO_MEMORY_ARGS=(--memory "$TRINO_MEMORY")
     fi
+    TRINO_NETWORK_ARGS=()
+    if [ -n "$STACK_NETWORK" ]; then
+        TRINO_NETWORK_ARGS=(--network "$STACK_NETWORK")
+    fi
     TRINO_CONTAINER=$(docker run -d --rm \
         --name trino-bench \
         -p "${TRINO_PORT}:8080" \
+        ${TRINO_NETWORK_ARGS[@]+"${TRINO_NETWORK_ARGS[@]}"} \
         ${TRINO_MEMORY_ARGS[@]+"${TRINO_MEMORY_ARGS[@]}"} \
         -v /tmp/trino-bench/catalog/iceberg.properties:/etc/trino/catalog/iceberg.properties:ro \
         -v /tmp/trino-bench/config.properties:/etc/trino/config.properties:ro \
