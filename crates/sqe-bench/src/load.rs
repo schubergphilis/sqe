@@ -16,6 +16,11 @@ pub struct LoadArgs<'a> {
     pub clean: bool,
     pub catalog: Option<&'a str>,
     pub namespace_override: Option<&'a str>,
+    /// Emit Parquet bloom filters on join-key columns of the loaded tables
+    /// (via the `write.parquet.bloom-filter-columns` table property on the
+    /// CTAS). Off by default so baselines stay comparable; see
+    /// [`bloom_columns`].
+    pub bloom_filter: bool,
 }
 
 /// Sort-on-write clustering key for a fact table.
@@ -69,6 +74,41 @@ fn partition_spec(benchmark: &str, table: &str) -> Option<&'static str> {
         ("tpcc", "order_line") => Some("ol_w_id, ol_d_id"),
         ("tpcc", "hist") => Some("h_w_id, h_d_id"),
         _ => None,
+    }
+}
+
+/// Join-key columns to bloom-filter for a benchmark table, or `&[]` for none.
+///
+/// Set only when the caller passes `--bloom-filter`. The names become the
+/// Iceberg table property `write.parquet.bloom-filter-columns` on the load
+/// CTAS, so SQE's Iceberg writer emits per-row-group bloom footers on the
+/// *queried* data files (not the staging Parquet, which the CTAS reads whole
+/// and discards). DataFusion's `parquet.bloom_filter_on_read` (default true)
+/// then consults those footers to skip row groups on literal-equality probes.
+///
+/// TPC-H/SSB join keys use the `_key` suffix, which the engine's default
+/// `write.parquet.bloom-filter-auto` (it targets `_sk` surrogate keys) does
+/// not catch, so without this list those suites get no blooms. TPC-DS `_sk`
+/// keys already auto-bloom and are intentionally omitted here. Keyed by
+/// `(benchmark, table)` because table names collide across suites
+/// (`orders`/`customer` exist in both TPC-H and TPC-C with different keys).
+fn bloom_columns(benchmark: &str, table: &str) -> &'static [&'static str] {
+    match (benchmark, table) {
+        // TPC-H
+        ("tpch", "lineitem") => &["l_orderkey", "l_partkey", "l_suppkey"],
+        ("tpch", "orders") => &["o_orderkey", "o_custkey"],
+        ("tpch", "customer") => &["c_custkey", "c_nationkey"],
+        ("tpch", "supplier") => &["s_suppkey", "s_nationkey"],
+        ("tpch", "part") => &["p_partkey"],
+        ("tpch", "partsupp") => &["ps_partkey", "ps_suppkey"],
+        ("tpch", "nation") => &["n_nationkey", "n_regionkey"],
+        ("tpch", "region") => &["r_regionkey"],
+        // SSB
+        ("ssb", "lineorder") => &["lo_custkey", "lo_partkey", "lo_suppkey", "lo_orderdate"],
+        ("ssb", "ddate") => &["d_datekey"],
+        // Other suites: no explicit list. TPC-DS `_sk` keys auto-bloom via
+        // the engine default; other suites are out of scope for now.
+        _ => &[],
     }
 }
 
@@ -148,6 +188,20 @@ pub async fn load_benchmark(
         let mut base_sql = format!("CREATE TABLE {qualified_ns}.{}", table_def.name);
         if let Some(spec) = partition_spec(benchmark, &table_def.name) {
             base_sql.push_str(&format!(" PARTITIONED BY ({spec})"));
+        }
+        // Bloom filters on join-key columns, when requested. The property
+        // must be set at table-creation time (it drives the CTAS data
+        // write), so it goes in TBLPROPERTIES on this CREATE, after any
+        // PARTITIONED BY and before AS SELECT -- the only clause order
+        // sqlparser 0.62 accepts for CTAS.
+        if args.bloom_filter {
+            let cols = bloom_columns(benchmark, &table_def.name);
+            if !cols.is_empty() {
+                base_sql.push_str(&format!(
+                    " TBLPROPERTIES ('write.parquet.bloom-filter-columns' = '{}')",
+                    cols.join(",")
+                ));
+            }
         }
         // Object-store paths use the directory form: DataFusion's
         // `ListingTableUrl` only expands `*` globs on local filesystem
@@ -230,4 +284,40 @@ pub async fn load_benchmark(
 
     println!("Done. All tables loaded into {qualified_ns}.");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bloom_columns_cover_tpch_and_ssb_join_keys() {
+        assert_eq!(
+            bloom_columns("tpch", "lineitem"),
+            &["l_orderkey", "l_partkey", "l_suppkey"]
+        );
+        assert_eq!(
+            bloom_columns("ssb", "lineorder"),
+            &["lo_custkey", "lo_partkey", "lo_suppkey", "lo_orderdate"]
+        );
+        assert_eq!(bloom_columns("tpch", "region"), &["r_regionkey"]);
+    }
+
+    #[test]
+    fn bloom_columns_are_suite_scoped_not_table_name_scoped() {
+        // `orders` and `customer` exist in both TPC-H and TPC-C with
+        // different key columns. A table-name-only lookup would wrongly
+        // bloom tpcc.orders with TPC-H's o_orderkey/o_custkey.
+        assert_eq!(bloom_columns("tpch", "orders"), &["o_orderkey", "o_custkey"]);
+        assert!(bloom_columns("tpcc", "orders").is_empty());
+        assert!(bloom_columns("tpcc", "customer").is_empty());
+    }
+
+    #[test]
+    fn bloom_columns_empty_for_auto_bloomed_and_unknown_suites() {
+        // TPC-DS `_sk` keys auto-bloom via the engine default, so no
+        // explicit list here; unknown suites get nothing.
+        assert!(bloom_columns("tpcds", "store_sales").is_empty());
+        assert!(bloom_columns("clickbench", "hits").is_empty());
+    }
 }

@@ -25,6 +25,9 @@ BENCH_KEEP_RUNNING="${BENCH_KEEP_RUNNING:-0}"
 BENCH_HOST="localhost"
 BENCH_PORT_FLIGHT="60051"
 BENCH_PORT_TRINO="18080"
+# Bloom-filter A/B lever: any truthy value passes `--bloom-filter` to the
+# load, writing Parquet blooms on TPC-H/SSB join-key columns. Off by default.
+BENCH_BLOOM_FILTER="${BENCH_BLOOM_FILTER:-}"
 
 # Credentials (match test stack — same as integration-test.sh)
 S3_ACCESS_KEY="${S3_ACCESS_KEY:-s3admin}"
@@ -264,6 +267,13 @@ for BENCH in "${BENCHMARKS[@]}"; do
     # ── Load ──────────────────────────────────────────────────
     echo ""
     echo "  [2/2] Loading into SQE..."
+    # Translate the BENCH_BLOOM_FILTER env toggle into the load flag.
+    # Lowercase via tr for bash 3.2 (macOS).
+    BLOOM_ARGS=()
+    case "$(printf '%s' "$BENCH_BLOOM_FILTER" | tr '[:upper:]' '[:lower:]')" in
+        ""|0|false|no|off) ;;
+        *) BLOOM_ARGS=(--bloom-filter); echo "  (bloom filters ON for join-key columns)" ;;
+    esac
     LOAD_START=$(date +%s)
     if ! "$BENCH_BIN" load "$BENCH" \
         --scale "$BENCH_SCALE" \
@@ -277,6 +287,7 @@ for BENCH in "${BENCHMARKS[@]}"; do
         --s3-secret-key "$DATA_S3_SECRET_KEY" \
         --s3-endpoint "$DATA_S3_ENDPOINT" \
         --s3-region "$DATA_S3_REGION" \
+        ${BLOOM_ARGS[@]+"${BLOOM_ARGS[@]}"} \
         --clean 2>&1; then
         echo "  ✗ Load FAILED"
         FAIL=$((FAIL + 1))
