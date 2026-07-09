@@ -29,7 +29,7 @@ plus three one-shot setup jobs and the engine):
 | `keycloak-config` | `adorsys/keycloak-config-cli` | One-shot: imports the `iceberg` realm (one confidential client, three users), then exits. |
 | `rustfs` | `rustfs/rustfs` | S3-compatible object store. The Iceberg warehouse lives here. No MinIO. |
 | `bucket-init` | `amazon/aws-cli` | One-shot: creates the `warehouse` bucket (RustFS does not auto-create), then exits. |
-| `polaris` | `apache/polaris:1.5.0` | Iceberg REST catalog, federated to Keycloak (validates the tokens SQE forwards). |
+| `polaris` | `apache/polaris:1.6.0` | Iceberg REST catalog, federated to Keycloak (validates the tokens SQE forwards). |
 | `polaris-setup` | `curlimages/curl` | One-shot: creates the catalog, the RBAC chain, the OIDC principals, and the `demo` namespace, then exits. |
 | `sqe` | built from this repo | The query engine. Flight SQL on 50051, Trino-compat HTTP on 8080. |
 

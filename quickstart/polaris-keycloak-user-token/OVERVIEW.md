@@ -16,7 +16,7 @@ This quickstart runs the **same Docker stack** as `polaris-keycloak-client-id`. 
 | `keycloak-config` | `adorsys/keycloak-config-cli` | One-shot: imports the `iceberg` realm (one confidential client + one public client, three users), then exits. |
 | `rustfs` | `rustfs/rustfs` | S3-compatible object store. The Iceberg warehouse lives here. |
 | `bucket-init` | `amazon/aws-cli` | One-shot: creates the `warehouse` bucket, then exits. |
-| `polaris` | `apache/polaris:1.5.0` | Iceberg REST catalog, federated to Keycloak. Validates the tokens SQE forwards. |
+| `polaris` | `apache/polaris:1.6.0` | Iceberg REST catalog, federated to Keycloak. Validates the tokens SQE forwards. |
 | `polaris-setup` | `curlimages/curl` | One-shot: creates the catalog, RBAC roles, OIDC principals, and the `demo` namespace, then exits. |
 | `sqe` | built from this repo | The query engine. Flight SQL on 50051, Trino-compat HTTP on 8080. |
 

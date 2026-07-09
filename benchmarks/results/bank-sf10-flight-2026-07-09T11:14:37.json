@@ -1,0 +1,71 @@
+{
+  "benchmark": "bank",
+  "scale_factor": 10.0,
+  "protocol": "flight",
+  "timestamp": "2026-07-09T11:14:37",
+  "summary": {
+    "total": 8,
+    "pass": 2,
+    "fail": 0,
+    "diff": 0,
+    "skip": 0,
+    "error": 6,
+    "total_duration_ms": 46353
+  },
+  "queries": [
+    {
+      "id": "q01",
+      "status": "pass",
+      "duration_ms": 7285,
+      "rows": 28
+    },
+    {
+      "id": "q02",
+      "status": "pass",
+      "duration_ms": 3290,
+      "rows": 35
+    },
+    {
+      "id": "q03",
+      "status": "error",
+      "duration_ms": 35776,
+      "rows": 0,
+      "message": "Failed to collect record batches: Tonic error: code: 'Unknown error', message: \"h2 protocol error: error reading a body from connection\", source: hyper::Error(Body, Error { kind: Io(Kind(ConnectionReset)) })"
+    },
+    {
+      "id": "q04",
+      "status": "error",
+      "duration_ms": 2,
+      "rows": 0,
+      "message": "Failed to connect to 'http://localhost:60051': transport error"
+    },
+    {
+      "id": "q05",
+      "status": "error",
+      "duration_ms": 0,
+      "rows": 0,
+      "message": "Failed to connect to 'http://localhost:60051': transport error"
+    },
+    {
+      "id": "q06",
+      "status": "error",
+      "duration_ms": 0,
+      "rows": 0,
+      "message": "Failed to connect to 'http://localhost:60051': transport error"
+    },
+    {
+      "id": "q07",
+      "status": "error",
+      "duration_ms": 0,
+      "rows": 0,
+      "message": "Failed to connect to 'http://localhost:60051': transport error"
+    },
+    {
+      "id": "q08",
+      "status": "error",
+      "duration_ms": 0,
+      "rows": 0,
+      "message": "Failed to connect to 'http://localhost:60051': transport error"
+    }
+  ]
+}
