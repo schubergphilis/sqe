@@ -24,6 +24,7 @@ set -euo pipefail
 #                                                  # for faster incremental rebuilds)
 #   ./scripts/benchmark-test.sh --compare-trino tpch  # compare SQE vs Trino output
 #   ./scripts/benchmark-test.sh --compare-trino       # compare all benchmarks
+#   BENCH_BLOOM_FILTER=1 ./scripts/benchmark-test.sh --compare-trino tpch  # bloom A/B
 #
 # External data source (skip the generate step, load pre-published parquet
 # straight from an S3 bucket — see benchmark-publish-data.sh):
@@ -54,6 +55,16 @@ BENCH_DATA_DIR="${BENCH_DATA_DIR:-/tmp/sqe-bench-data}"
 BENCH_HOST="localhost"
 BENCH_PORT_FLIGHT="60051"
 BENCH_PORT_TRINO="18080"
+
+# Bloom-filter A/B lever. When set to a truthy value, the load step passes
+# `--bloom-filter`, which writes Parquet bloom filters on TPC-H/SSB join-key
+# columns (via the `write.parquet.bloom-filter-columns` table property) into
+# the actual queried Iceberg data files. Off by default so baselines stay
+# comparable. Generate once, then load twice (off vs on) for a clean A/B on
+# identical data. Note: DataFusion consults bloom footers only for literal
+# equality predicates; TPC-H/SSB join keys are hash-join runtime filters, so
+# a null/negative delta at SF1 is an expected finding, not a failure.
+BENCH_BLOOM_FILTER="${BENCH_BLOOM_FILTER:-}"
 
 # Trino comparison mode: start a Trino container and validate results against it
 COMPARE_TRINO="${COMPARE_TRINO:-}"
@@ -677,6 +688,14 @@ for BENCH in "${BENCHMARKS[@]}"; do
     # transient blip. Tracked at ~3% rate in the May-2026 SF1 sweeps.
     echo ""
     echo "  [2/3] Loading into SQE..."
+    # Translate the BENCH_BLOOM_FILTER env toggle into the load flag. Any
+    # non-empty, non-"0"/"false" value turns it on. Lowercase via tr for
+    # bash 3.2 (macOS) which lacks the ${var,,} expansion.
+    BLOOM_ARGS=()
+    case "$(printf '%s' "$BENCH_BLOOM_FILTER" | tr '[:upper:]' '[:lower:]')" in
+        ""|0|false|no|off) ;;
+        *) BLOOM_ARGS=(--bloom-filter); echo "  (bloom filters ON for join-key columns)" ;;
+    esac
     LOAD_START=$(date +%s)
     LOAD_ATTEMPTS=2
     LOAD_OK=0
@@ -693,6 +712,7 @@ for BENCH in "${BENCHMARKS[@]}"; do
             --s3-secret-key "$DATA_S3_SECRET_KEY" \
             --s3-endpoint "$DATA_S3_ENDPOINT" \
             --s3-region "$DATA_S3_REGION" \
+            ${BLOOM_ARGS[@]+"${BLOOM_ARGS[@]}"} \
             --clean 2>&1; then
             LOAD_OK=1
             break
