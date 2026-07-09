@@ -363,6 +363,14 @@ if [ -n "$COMPARE_TRINO" ]; then
     # Trino exits right after "ready").
     POLARIS_IP=$(docker inspect "$(docker compose -f "$COMPOSE_FILE" ps -q polaris)" --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}')
 
+    # Trino must join the SAME docker network as the stack: on Linux,
+    # bridge networks are isolated by iptables, so a default-bridge Trino
+    # times out connecting to the Polaris IP (each query then burns a
+    # ~4.5min catalog connect-timeout and fails with
+    # ICEBERG_CATALOG_ERROR). Docker Desktop on macOS happens to tolerate
+    # the cross-network traffic, which masked this.
+    STACK_NETWORK=$(docker inspect "$(docker compose -f "$COMPOSE_FILE" ps -q polaris)" --format '{{range $k, $v := .NetworkSettings.Networks}}{{$k}}{{end}}')
+
     # Trino's S3 target follows the warehouse: RustFS (via container IP)
     # in local mode, the external endpoint otherwise — then SQE and Trino
     # fetch table data over the identical network path.
@@ -430,12 +438,18 @@ TRINOEOF
     docker stop trino-bench 2>/dev/null || true
     sleep 1
 
+    # Pull ahead of `docker run` so image download time does not eat the
+    # readiness wait below (a first-time pull once silently disabled the
+    # whole comparison).
+    docker pull "$TRINO_IMAGE" 2>&1 | tail -1
+
     TRINO_MEMORY_ARGS=()
     if [ -n "$TRINO_MEMORY" ]; then
         TRINO_MEMORY_ARGS=(--memory "$TRINO_MEMORY")
     fi
     TRINO_CONTAINER=$(docker run -d --rm \
         --name trino-bench \
+        --network "$STACK_NETWORK" \
         -p "${TRINO_PORT}:8080" \
         ${TRINO_MEMORY_ARGS[@]+"${TRINO_MEMORY_ARGS[@]}"} \
         -v /tmp/trino-bench/catalog/iceberg.properties:/etc/trino/catalog/iceberg.properties:ro \
@@ -443,12 +457,16 @@ TRINOEOF
         "$TRINO_IMAGE")
 
     echo -n "Waiting for Trino..."
-    for i in $(seq 1 60); do
+    for i in $(seq 1 180); do
         if curl -sf "http://localhost:${TRINO_PORT}/v1/info" >/dev/null 2>&1; then
             echo " ready"
             break
         fi
-        if [ "$i" -eq 60 ]; then echo " TIMEOUT"; COMPARE_TRINO=""; fi
+        if [ "$i" -eq 180 ]; then
+            echo " TIMEOUT"
+            echo "  WARNING: TRINO DID NOT COME UP — the Trino comparison is DISABLED for this run"
+            COMPARE_TRINO=""
+        fi
         echo -n "."
         sleep 2
     done
