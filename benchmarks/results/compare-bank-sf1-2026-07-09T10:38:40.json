@@ -1,0 +1,25 @@
+{
+  "benchmark": "bank",
+  "scale": 1.0,
+  "timestamp": "2026-07-09T10:38:40+00:00",
+  "sqe_endpoint": "http://localhost:60051",
+  "trino_endpoint": "http://localhost:38080",
+  "reconstructed": "summary-only: per-query table lost when the campaign log was truncated by a relaunch; totals recorded live during the run",
+  "summary": {
+    "total": 8,
+    "matched": 8,
+    "vacuous": 0,
+    "expected_empty": 0,
+    "vacuous_bug": 0,
+    "dialect_diff": 0,
+    "row_diff": 0,
+    "sqe_failed": 0,
+    "trino_failed": 0,
+    "both_failed": 0,
+    "sqe_total_ms": 10507,
+    "trino_total_ms": 19793,
+    "avg_speedup": 3.8,
+    "median_speedup": null
+  },
+  "queries": []
+}
