@@ -61,7 +61,8 @@ The embedded engine can attach a Glue or S3 Tables catalog directly, with no
 coordinator. Pass `--catalog-backend` plus the cloud warehouse; credentials come
 from the standard AWS provider chain (`AWS_PROFILE`, instance profile, SSO).
 These catalogs attach read-only (query, not write); use the server for writes.
-Requires the `aws` cargo feature (default-on).
+Requires the `aws` cargo feature, which is off by default to keep the AWS SDK
+out of standard builds: `cargo install --path crates/sqe-cli --features aws`.
 
 ```bash
 # AWS Glue Data Catalog (warehouse is an s3:// prefix)
