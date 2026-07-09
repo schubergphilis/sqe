@@ -320,7 +320,7 @@ The test stack is two containers: Polaris in in-memory mode and RustFS (a lightw
 # docker-compose.test.yml
 services:
   polaris:
-    image: apache/polaris:1.5.0
+    image: apache/polaris:1.6.0
     environment:
       POLARIS_PERSISTENCE_TYPE: in-memory
       POLARIS_BOOTSTRAP_CREDENTIALS: "POLARIS,root,s3cr3t"

@@ -1,0 +1,121 @@
+{
+  "benchmark": "bank",
+  "scale": 1.0,
+  "timestamp": "2026-07-09T10:06:49.890736627+00:00",
+  "sqe_endpoint": "http://localhost:60051",
+  "trino_endpoint": "http://localhost:38080",
+  "queries": [
+    {
+      "query_name": "q01",
+      "sqe_time_ms": 1,
+      "trino_time_ms": 579,
+      "speedup": 579.0,
+      "sqe_rows": 0,
+      "trino_rows": 28,
+      "rows_match": false,
+      "sqe_error": "Query failed: Tonic error: code: 'Some requested entity was not found', message: \"table 'iceberg.bank_sf1.transaction' not found\"",
+      "trino_error": null,
+      "status": "SqeFailed"
+    },
+    {
+      "query_name": "q02",
+      "sqe_time_ms": 1,
+      "trino_time_ms": 545,
+      "speedup": 545.0,
+      "sqe_rows": 0,
+      "trino_rows": 35,
+      "rows_match": false,
+      "sqe_error": "Query failed: Tonic error: code: 'Some requested entity was not found', message: \"table 'iceberg.bank_sf1.transaction' not found\"",
+      "trino_error": null,
+      "status": "SqeFailed"
+    },
+    {
+      "query_name": "q03",
+      "sqe_time_ms": 2,
+      "trino_time_ms": 2114,
+      "speedup": 1057.0,
+      "sqe_rows": 0,
+      "trino_rows": 10,
+      "rows_match": false,
+      "sqe_error": "Query failed: Tonic error: code: 'Some requested entity was not found', message: \"table 'iceberg.bank_sf1.transaction' not found\"",
+      "trino_error": null,
+      "status": "SqeFailed"
+    },
+    {
+      "query_name": "q04",
+      "sqe_time_ms": 2,
+      "trino_time_ms": 1230,
+      "speedup": 615.0,
+      "sqe_rows": 0,
+      "trino_rows": 500,
+      "rows_match": false,
+      "sqe_error": "Query failed: Tonic error: code: 'Some requested entity was not found', message: \"table 'iceberg.bank_sf1.transaction' not found\"",
+      "trino_error": null,
+      "status": "SqeFailed"
+    },
+    {
+      "query_name": "q05",
+      "sqe_time_ms": 1,
+      "trino_time_ms": 641,
+      "speedup": 641.0,
+      "sqe_rows": 0,
+      "trino_rows": 815,
+      "rows_match": false,
+      "sqe_error": "Query failed: Tonic error: code: 'Some requested entity was not found', message: \"table 'iceberg.bank_sf1.transaction' not found\"",
+      "trino_error": null,
+      "status": "SqeFailed"
+    },
+    {
+      "query_name": "q06",
+      "sqe_time_ms": 2,
+      "trino_time_ms": 2968,
+      "speedup": 1484.0,
+      "sqe_rows": 0,
+      "trino_rows": 90,
+      "rows_match": false,
+      "sqe_error": "Query failed: Tonic error: code: 'Some requested entity was not found', message: \"table 'iceberg.bank_sf1.transaction' not found\"",
+      "trino_error": null,
+      "status": "SqeFailed"
+    },
+    {
+      "query_name": "q07",
+      "sqe_time_ms": 2,
+      "trino_time_ms": 1467,
+      "speedup": 733.5,
+      "sqe_rows": 0,
+      "trino_rows": 84,
+      "rows_match": false,
+      "sqe_error": "Query failed: Tonic error: code: 'Some requested entity was not found', message: \"table 'iceberg.bank_sf1.account_balance' not found\"",
+      "trino_error": null,
+      "status": "SqeFailed"
+    },
+    {
+      "query_name": "q08",
+      "sqe_time_ms": 1,
+      "trino_time_ms": 195,
+      "speedup": 195.0,
+      "sqe_rows": 0,
+      "trino_rows": 150,
+      "rows_match": false,
+      "sqe_error": "Query failed: Tonic error: code: 'Some requested entity was not found', message: \"table 'iceberg.bank_sf1.transaction' not found\"",
+      "trino_error": null,
+      "status": "SqeFailed"
+    }
+  ],
+  "summary": {
+    "total": 8,
+    "matched": 0,
+    "vacuous": 0,
+    "expected_empty": 0,
+    "vacuous_bug": 0,
+    "dialect_diff": 0,
+    "row_diff": 0,
+    "sqe_failed": 8,
+    "trino_failed": 0,
+    "both_failed": 0,
+    "avg_speedup": 0.0,
+    "median_speedup": 0.0,
+    "sqe_total_ms": 12,
+    "trino_total_ms": 9739
+  }
+}
