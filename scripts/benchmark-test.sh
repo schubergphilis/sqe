@@ -458,7 +458,6 @@ TRINOEOF
     fi
     TRINO_CONTAINER=$(docker run -d --rm \
         --name trino-bench \
-        --network "$STACK_NETWORK" \
         -p "${TRINO_PORT}:8080" \
         ${TRINO_NETWORK_ARGS[@]+"${TRINO_NETWORK_ARGS[@]}"} \
         ${TRINO_MEMORY_ARGS[@]+"${TRINO_MEMORY_ARGS[@]}"} \
