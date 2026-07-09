@@ -363,12 +363,13 @@ if [ -n "$COMPARE_TRINO" ]; then
     # Trino exits right after "ready").
     POLARIS_IP=$(docker inspect "$(docker compose -f "$COMPOSE_FILE" ps -q polaris)" --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}')
 
-    # Trino must join the SAME docker network as the stack: on Linux,
-    # bridge networks are isolated by iptables, so a default-bridge Trino
-    # times out connecting to the Polaris IP (each query then burns a
-    # ~4.5min catalog connect-timeout and fails with
-    # ICEBERG_CATALOG_ERROR). Docker Desktop on macOS happens to tolerate
-    # the cross-network traffic, which masked this.
+    # Trino must join the test stack's compose network. The catalog URI
+    # below points at Polaris' compose-network IP, and on a Linux host
+    # user-defined bridge networks are isolated from the default bridge,
+    # so a Trino container left on the default bridge fails every catalog
+    # call with ICEBERG_CATALOG_ERROR after a ~4.5min connect timeout
+    # (macOS masks this). Published ports (-p) still work on a
+    # user-defined network, so localhost:${TRINO_PORT} is unaffected.
     STACK_NETWORK=$(docker inspect "$(docker compose -f "$COMPOSE_FILE" ps -q polaris)" --format '{{range $k, $v := .NetworkSettings.Networks}}{{$k}}{{end}}')
 
     # Trino's S3 target follows the warehouse: RustFS (via container IP)
@@ -410,16 +411,20 @@ TRINOEOF
     # Uncapped, the 8GB default matches the historical behavior. With a
     # TRINO_MEMORY cap, a fixed 8GB can exceed the heap and Trino exits at
     # startup with "Configuration is invalid" — the wait loop then times
-    # out and the comparison is silently skipped. Derive ~30% of the cap
-    # instead (floored at 1GB), mirroring Trino's own default ratio.
-    TRINO_QUERY_MEM="8GB"
-    if [ -n "$TRINO_MEMORY" ]; then
+    # out and the comparison is silently skipped. Derive 50% of the cap
+    # instead (floored at 1GB): that is ~62% of the heap, which the rig
+    # configs have run safely, while the earlier 30% (12g -> 3GB) made
+    # Trino fail SF10 q18/q21 hash joins that fit fine in half the
+    # container — an unfair handicap in the comparison. TRINO_QUERY_MEMORY
+    # overrides the derivation explicitly.
+    TRINO_QUERY_MEM="${TRINO_QUERY_MEMORY:-8GB}"
+    if [ -n "$TRINO_MEMORY" ] && [ -z "${TRINO_QUERY_MEMORY:-}" ]; then
         TRINO_QUERY_MEM=$(python3 -c "
 import re
 m = re.fullmatch(r'(\d+(?:\.\d+)?)([kmgt]?)b?', '$TRINO_MEMORY'.lower())
 n, u = float(m.group(1)), m.group(2)
 gb = n * {'k': 1/2**20, 'm': 1/2**10, 'g': 1, 't': 2**10, '': 1/2**30}[u]
-print(f'{max(1, int(gb * 0.3))}GB')")
+print(f'{max(1, int(gb * 0.5))}GB')")
     fi
 
     cat > /tmp/trino-bench/config.properties << TRINOEOF
@@ -447,10 +452,15 @@ TRINOEOF
     if [ -n "$TRINO_MEMORY" ]; then
         TRINO_MEMORY_ARGS=(--memory "$TRINO_MEMORY")
     fi
+    TRINO_NETWORK_ARGS=()
+    if [ -n "$STACK_NETWORK" ]; then
+        TRINO_NETWORK_ARGS=(--network "$STACK_NETWORK")
+    fi
     TRINO_CONTAINER=$(docker run -d --rm \
         --name trino-bench \
         --network "$STACK_NETWORK" \
         -p "${TRINO_PORT}:8080" \
+        ${TRINO_NETWORK_ARGS[@]+"${TRINO_NETWORK_ARGS[@]}"} \
         ${TRINO_MEMORY_ARGS[@]+"${TRINO_MEMORY_ARGS[@]}"} \
         -v /tmp/trino-bench/catalog/iceberg.properties:/etc/trino/catalog/iceberg.properties:ro \
         -v /tmp/trino-bench/config.properties:/etc/trino/config.properties:ro \
@@ -612,6 +622,30 @@ for BENCH in "${BENCHMARKS[@]}"; do
         fi
         LOAD_END=$(date +%s)
         echo "  ✓ Loaded in $((LOAD_END - LOAD_START))s"
+
+        # The bank load is the only one that bypasses the engine (direct
+        # Iceberg REST commits), and the coordinator's catalog caches the
+        # namespace listing: tables committed behind its back come back
+        # "table not found" until a restart. Bounce the coordinator so
+        # the test step sees the freshly committed namespace.
+        echo "  Restarting coordinator to pick up externally committed tables..."
+        kill "$SQE_PID" 2>/dev/null || true
+        wait "$SQE_PID" 2>/dev/null || true
+        RUST_LOG="${RUST_LOG:-sqe=info,warn}" \
+            "$SQE_BIN" "$SQE_CONFIG" \
+            >> "$SQE_LOG_FILE" 2>&1 &
+        SQE_PID=$!
+        for i in $(seq 1 60); do
+            if curl -so /dev/null "http://localhost:18080/v1/info" 2>/dev/null; then
+                echo "  ✓ Coordinator restarted (PID $SQE_PID)"
+                break
+            fi
+            if ! kill -0 "$SQE_PID" 2>/dev/null; then
+                echo "  ✗ Coordinator failed to restart"
+                break
+            fi
+            sleep 1
+        done
     else
 
     # ── Step 1: Generate ──────────────────────────────────────
