@@ -1,0 +1,119 @@
+{
+  "benchmark": "tpcc",
+  "scale_factor": 1.0,
+  "protocol": "flight",
+  "timestamp": "2026-07-06T19:02:46",
+  "summary": {
+    "total": 17,
+    "pass": 17,
+    "fail": 0,
+    "diff": 0,
+    "skip": 0,
+    "error": 0,
+    "total_duration_ms": 19683
+  },
+  "queries": [
+    {
+      "id": "customer_balance",
+      "status": "pass",
+      "duration_ms": 247,
+      "rows": 100
+    },
+    {
+      "id": "delivery",
+      "status": "pass",
+      "duration_ms": 1698,
+      "rows": 10
+    },
+    {
+      "id": "delivery_delete",
+      "status": "pass",
+      "duration_ms": 467,
+      "rows": 1
+    },
+    {
+      "id": "delivery_update_customer",
+      "status": "pass",
+      "duration_ms": 1165,
+      "rows": 1
+    },
+    {
+      "id": "delivery_update_orderline",
+      "status": "pass",
+      "duration_ms": 7231,
+      "rows": 1
+    },
+    {
+      "id": "delivery_update_orders",
+      "status": "pass",
+      "duration_ms": 966,
+      "rows": 1
+    },
+    {
+      "id": "district_orders",
+      "status": "pass",
+      "duration_ms": 1070,
+      "rows": 10
+    },
+    {
+      "id": "new_order",
+      "status": "pass",
+      "duration_ms": 1036,
+      "rows": 100
+    },
+    {
+      "id": "new_order_update_district",
+      "status": "pass",
+      "duration_ms": 216,
+      "rows": 1
+    },
+    {
+      "id": "new_order_update_stock",
+      "status": "pass",
+      "duration_ms": 1981,
+      "rows": 1
+    },
+    {
+      "id": "order_status",
+      "status": "pass",
+      "duration_ms": 1155,
+      "rows": 20
+    },
+    {
+      "id": "payment",
+      "status": "pass",
+      "duration_ms": 187,
+      "rows": 50
+    },
+    {
+      "id": "payment_update_customer",
+      "status": "pass",
+      "duration_ms": 318,
+      "rows": 1
+    },
+    {
+      "id": "payment_update_district",
+      "status": "pass",
+      "duration_ms": 290,
+      "rows": 1
+    },
+    {
+      "id": "payment_update_warehouse",
+      "status": "pass",
+      "duration_ms": 278,
+      "rows": 1
+    },
+    {
+      "id": "stock_level",
+      "status": "pass",
+      "duration_ms": 126,
+      "rows": 1
+    },
+    {
+      "id": "warehouse_summary",
+      "status": "pass",
+      "duration_ms": 1252,
+      "rows": 1
+    }
+  ]
+}

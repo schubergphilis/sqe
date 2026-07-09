@@ -443,6 +443,11 @@ TRINOEOF
     docker stop trino-bench 2>/dev/null || true
     sleep 1
 
+    # Pull ahead of `docker run` so image download time does not eat the
+    # readiness wait below (a first-time pull once silently disabled the
+    # whole comparison).
+    docker pull "$TRINO_IMAGE" 2>&1 | tail -1
+
     TRINO_MEMORY_ARGS=()
     if [ -n "$TRINO_MEMORY" ]; then
         TRINO_MEMORY_ARGS=(--memory "$TRINO_MEMORY")
@@ -453,6 +458,7 @@ TRINOEOF
     fi
     TRINO_CONTAINER=$(docker run -d --rm \
         --name trino-bench \
+        --network "$STACK_NETWORK" \
         -p "${TRINO_PORT}:8080" \
         ${TRINO_NETWORK_ARGS[@]+"${TRINO_NETWORK_ARGS[@]}"} \
         ${TRINO_MEMORY_ARGS[@]+"${TRINO_MEMORY_ARGS[@]}"} \
@@ -461,12 +467,16 @@ TRINOEOF
         "$TRINO_IMAGE")
 
     echo -n "Waiting for Trino..."
-    for i in $(seq 1 60); do
+    for i in $(seq 1 180); do
         if curl -sf "http://localhost:${TRINO_PORT}/v1/info" >/dev/null 2>&1; then
             echo " ready"
             break
         fi
-        if [ "$i" -eq 60 ]; then echo " TIMEOUT"; COMPARE_TRINO=""; fi
+        if [ "$i" -eq 180 ]; then
+            echo " TIMEOUT"
+            echo "  WARNING: TRINO DID NOT COME UP — the Trino comparison is DISABLED for this run"
+            COMPARE_TRINO=""
+        fi
         echo -n "."
         sleep 2
     done
