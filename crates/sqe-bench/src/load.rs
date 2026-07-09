@@ -181,19 +181,21 @@ pub async fn load_benchmark(
                 .await;
         }
 
-        // Build the base CTAS: CREATE TABLE [PARTITIONED BY (...)] AS SELECT
-        // * FROM read_parquet(...). Partitioning (coarse, manifest-level file
-        // pruning) is part of the table definition; clustering (ORDER BY, the
-        // sort-on-write hint below) is appended per the failover path.
+        // Build the base CTAS: CREATE TABLE [TBLPROPERTIES (...)]
+        // [PARTITIONED BY (...)] AS SELECT * FROM read_parquet(...).
+        // Partitioning (coarse, manifest-level file pruning) is part of the
+        // table definition; clustering (ORDER BY, the sort-on-write hint
+        // below) is appended per the failover path.
+        //
+        // Clause order matters: the engine normalizes `PARTITIONED BY` to
+        // sqlparser's `PARTITION BY`, and sqlparser only accepts table
+        // options (TBLPROPERTIES / WITH) *before* PARTITION BY on a CTAS.
+        // TBLPROPERTIES after PARTITIONED BY fails to parse (verified against
+        // the engine parse path, not raw GenericDialect).
         let mut base_sql = format!("CREATE TABLE {qualified_ns}.{}", table_def.name);
-        if let Some(spec) = partition_spec(benchmark, &table_def.name) {
-            base_sql.push_str(&format!(" PARTITIONED BY ({spec})"));
-        }
         // Bloom filters on join-key columns, when requested. The property
-        // must be set at table-creation time (it drives the CTAS data
-        // write), so it goes in TBLPROPERTIES on this CREATE, after any
-        // PARTITIONED BY and before AS SELECT -- the only clause order
-        // sqlparser 0.62 accepts for CTAS.
+        // must be set at table-creation time -- it drives the CTAS data
+        // write through SQE's Iceberg writer.
         if args.bloom_filter {
             let cols = bloom_columns(benchmark, &table_def.name);
             if !cols.is_empty() {
@@ -202,6 +204,9 @@ pub async fn load_benchmark(
                     cols.join(",")
                 ));
             }
+        }
+        if let Some(spec) = partition_spec(benchmark, &table_def.name) {
+            base_sql.push_str(&format!(" PARTITIONED BY ({spec})"));
         }
         // Object-store paths use the directory form: DataFusion's
         // `ListingTableUrl` only expands `*` globs on local filesystem
