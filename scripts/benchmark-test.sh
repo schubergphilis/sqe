@@ -608,6 +608,30 @@ for BENCH in "${BENCHMARKS[@]}"; do
         fi
         LOAD_END=$(date +%s)
         echo "  ✓ Loaded in $((LOAD_END - LOAD_START))s"
+
+        # The bank load is the only one that bypasses the engine (direct
+        # Iceberg REST commits), and the coordinator's catalog caches the
+        # namespace listing: tables committed behind its back come back
+        # "table not found" until a restart. Bounce the coordinator so
+        # the test step sees the freshly committed namespace.
+        echo "  Restarting coordinator to pick up externally committed tables..."
+        kill "$SQE_PID" 2>/dev/null || true
+        wait "$SQE_PID" 2>/dev/null || true
+        RUST_LOG="${RUST_LOG:-sqe=info,warn}" \
+            "$SQE_BIN" "$SQE_CONFIG" \
+            >> "$SQE_LOG_FILE" 2>&1 &
+        SQE_PID=$!
+        for i in $(seq 1 60); do
+            if curl -so /dev/null "http://localhost:18080/v1/info" 2>/dev/null; then
+                echo "  ✓ Coordinator restarted (PID $SQE_PID)"
+                break
+            fi
+            if ! kill -0 "$SQE_PID" 2>/dev/null; then
+                echo "  ✗ Coordinator failed to restart"
+                break
+            fi
+            sleep 1
+        done
     else
 
     # ── Step 1: Generate ──────────────────────────────────────
