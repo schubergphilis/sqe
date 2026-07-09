@@ -8,6 +8,8 @@ tests/.test-env
 .worktrees/
 .claude/worktrees/
 .claude/scheduled_tasks.lock
+# Pre-compact conversation backups written by a Claude Code hook.
+.claude/backups/
 
 # Vendored iceberg-rust has its own resolver; its Cargo.lock is not checked in.
 vendor/iceberg-rust/Cargo.lock
