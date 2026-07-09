@@ -178,6 +178,7 @@ async fn main() -> anyhow::Result<()> {
             client_secret,
             catalog,
             namespace,
+            bloom_filter,
             ..
         } => {
             let protocol_str = match protocol {
@@ -216,6 +217,7 @@ async fn main() -> anyhow::Result<()> {
                     clean,
                     catalog: catalog.as_deref(),
                     namespace_override: namespace.as_deref(),
+                    bloom_filter,
                 },
             )
             .await
