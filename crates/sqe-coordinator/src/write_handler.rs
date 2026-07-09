@@ -871,7 +871,7 @@ impl WriteHandler {
         stmt: &Statement,
         batches: Vec<RecordBatch>,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
-        let (table_name, _or_replace, arrow_schema, partition_by) = match stmt {
+        let (table_name, _or_replace, arrow_schema, partition_by, user_options) = match stmt {
             Statement::CreateTable(ct) => {
                 if ct.query.is_none() {
                     return Err(SqeError::Execution(
@@ -889,7 +889,13 @@ impl WriteHandler {
                     ));
                 };
 
-                (&ct.name, ct.or_replace, schema, ct.partition_by.as_deref())
+                (
+                    &ct.name,
+                    ct.or_replace,
+                    schema,
+                    ct.partition_by.as_deref(),
+                    create_table_options_as_slice(&ct.table_options),
+                )
             }
             other => {
                 return Err(SqeError::Execution(format!(
@@ -925,13 +931,20 @@ impl WriteHandler {
         let partition_spec = build_partition_spec(partition_by, &iceberg_schema)?;
         let create_format_version = self.format_version();
         let location = unique_table_location(catalog.as_ref(), &namespace, &name).await;
+        // Merge user-specified TBLPROPERTIES / WITH options so a CTAS keeps
+        // the properties the user typed (e.g. write.parquet.bloom-filter-*,
+        // write.*.mode). Without this a CTAS silently drops every property,
+        // unlike the plain CREATE TABLE path. The properties must be set at
+        // creation time because they drive the data write that follows.
+        let mut props = self.format_version_props(create_format_version);
+        merge_user_table_properties(&mut props, user_options);
         let table_creation = TableCreation::builder()
             .name(name.clone())
             .schema(iceberg_schema)
             .location_opt(location)
             .format_version(create_format_version)
             .partition_spec_opt(partition_spec)
-            .properties(self.format_version_props(create_format_version))
+            .properties(props)
             .build();
 
         let _created_table = catalog
@@ -1056,14 +1069,19 @@ impl WriteHandler {
         select_sql: &str,
         plan_out: &mut Option<sqe_lineage::PlanOrHint>,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
-        let (table_name, _or_replace, partition_by) = match stmt {
+        let (table_name, _or_replace, partition_by, user_options) = match stmt {
             Statement::CreateTable(ct) => {
                 if ct.query.is_none() {
                     return Err(SqeError::Execution(
                         "CTAS statement has no SELECT query".into(),
                     ));
                 }
-                (&ct.name, ct.or_replace, ct.partition_by.as_deref())
+                (
+                    &ct.name,
+                    ct.or_replace,
+                    ct.partition_by.as_deref(),
+                    create_table_options_as_slice(&ct.table_options),
+                )
             }
             other => {
                 return Err(SqeError::Execution(format!(
@@ -1119,13 +1137,18 @@ impl WriteHandler {
 
         let create_format_version = self.format_version();
         let location = unique_table_location(catalog.as_ref(), &namespace, &name).await;
+        // Merge user TBLPROPERTIES / WITH options (see handle_ctas for why):
+        // a CTAS must keep properties like write.parquet.bloom-filter-* that
+        // drive the data write, matching the plain CREATE TABLE path.
+        let mut props = self.format_version_props(create_format_version);
+        merge_user_table_properties(&mut props, user_options);
         let table_creation = TableCreation::builder()
             .name(name.clone())
             .schema(iceberg_schema)
             .location_opt(location)
             .format_version(create_format_version)
             .partition_spec_opt(partition_spec)
-            .properties(self.format_version_props(create_format_version))
+            .properties(props)
             .build();
 
         let _created_table = catalog
