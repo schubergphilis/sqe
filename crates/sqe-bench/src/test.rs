@@ -540,6 +540,13 @@ mod tests {
     }
 
     #[test]
+    fn normalize_query_id_keeps_dotted_ids_distinct() {
+        assert_eq!(normalize_query_id("q3.1"), "3.1");
+        assert_eq!(normalize_query_id("3.1"), "3.1");
+        assert_ne!(normalize_query_id("q3.1"), normalize_query_id("q4.2"));
+    }
+
+    #[test]
     fn prefix_tables_qualifies_tpch_tables() {
         let sql = "SELECT * FROM lineitem WHERE l_shipdate > DATE '1998-01-01'";
         let result = prefix_tables(sql, "tpch_sf1", "tpch");
