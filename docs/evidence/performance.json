@@ -1,24 +1,68 @@
 {
-  "asOf": "2026-06-12",
+  "asOf": "2026-07-09",
   "headline": {
-    "suitesWon": "6/7",
-    "vsTrino": "Trino 465",
-    "queriesPass": "222/222",
-    "validated": "Differentially validated against Trino, with DuckDB's official dsdgen as an independent data oracle."
+    "vsTrino": "Trino 481",
+    "validated": "Every query differentially validated against Trino 481 — same StorageGRID Iceberg warehouse, both engines capped at 12 GB — with DuckDB's official dbgen/dsdgen as an independent data oracle.",
+    "stats": [
+      { "num": "7 / 8", "label": "suites faster than Trino at SF1" },
+      { "num": "6 / 7", "label": "suites faster at SF10 too — SSB now at parity" },
+      { "num": "8.9×", "label": "top suite speedup (TPC-BB, SF1)" }
+    ]
   },
   "scales": {
-    "note": "Scale factor ≈ dataset size: SF0.1 ≈ 100 MB, SF1 ≈ 1 GB, SF10 ≈ 10 GB. The cross-scale charts plot SF0.1 / SF1 / SF10 on one time axis (log Y).",
-    "dominant": "Decisive wins up to SF1 — across six of seven industry suites.",
-    "progress": "SF10+ (distributed) is closing fast: on a forced-distribution rig, TPC-DS SF1 went from 4.4x slower than Trino to 1.7x faster after the dynamic-filter pushdown fix. SSB is next — shipping build-side key sets (bloom filters) to workers."
+    "note": "Scale factor ≈ dataset size: SF1 ≈ 1 GB, SF10 ≈ 10 GB. Rig: a dedicated 8-core / 31 GB box, both engines capped at 12 GB against the same StorageGRID Iceberg warehouse, Trino 481.",
+    "dominant": "Faster than Trino at SF1 across seven of eight industry suites — and, as of this run, ahead at SF10 too.",
+    "progress": "The SF10 crossover is closed. SSB — the one suite we trailed for months (0.53× only a few weeks ago) — is now at parity (20.4s vs 21.4s) after shipping build-side key sets to workers. TPC-H (1.7×) and TPC-DS (1.5×, and now 99/99 correct at SF1) lead at SF10. Two honest exceptions we show rather than hide: TPC-C's sub-second OLTP reads at SF1, where fixed dispatch overhead dominates, and the new bank suite at SF10, where spill still degrades under an 8 GB pool — both being worked."
   },
   "results": [
-    { "suite": "TPC-E (11)",      "purpose": "Financial-trading workload: date-range filters, point lookups against trade-history, aggregations across many small dimensions.", "sqe": "9.3s",  "trino": "172.0s", "speedup": "18.5x", "pass": "11/11" },
-    { "suite": "TPC-BB (10)",     "purpose": "BigBench mixed workload: structured analytics plus JSON and text operations over a retail warehouse schema.", "sqe": "28.0s", "trino": "255.7s", "speedup": "9.1x",  "pass": "10/10" },
-    { "suite": "TPC-C (8 read)",  "purpose": "The read SELECTs from the TPC-C OLTP workload — point lookups against small Iceberg tables (SQE runs the read subset, not transactions).", "sqe": "0.41s", "trino": "2.65s",  "speedup": "6.5x",  "pass": "8/8" },
-    { "suite": "TPC-DS (99)",     "purpose": "99-query decision-support benchmark — larger and harder than TPC-H; pushes joins, window functions, and grouping sets.", "sqe": "13.4s", "trino": "45.6s",  "speedup": "3.4x",  "pass": "93/99" },
-    { "suite": "ClickBench (43)", "purpose": "43 queries over one wide table — log analytics: heavy string filters, point lookups, and counts. SQE's caching shines here.", "sqe": "1.3s",  "trino": "4.46s",  "speedup": "3.4x",  "pass": "43/43" },
-    { "suite": "TPC-H (22)",      "purpose": "22-query decision-support benchmark — the most widely benchmarked SQL workload and SQE's primary comparison target.", "sqe": "16.8s", "trino": "26.7s",  "speedup": "1.6x",  "pass": "22/22" },
-    { "suite": "SSB (13)",        "purpose": "Star Schema Benchmark — 13 queries over one fact joined to four dimensions; the shape data warehouses are optimised for.", "sqe": "8.3s",  "trino": "5.8s",   "speedup": "0.70x", "pass": "13/13", "trails": true }
+    {
+      "suite": "TPC-H (22)",
+      "purpose": "22-query decision-support benchmark — the most widely benchmarked SQL workload and SQE's primary comparison target.",
+      "sf1":  { "sqe": "14.2s", "trino": "40.8s",  "speedup": "2.9x", "pass": "22/22" },
+      "sf10": { "sqe": "66.5s", "trino": "111.9s", "speedup": "1.7x", "pass": "22/22" }
+    },
+    {
+      "suite": "TPC-DS (99)",
+      "purpose": "99-query decision-support benchmark — larger and harder than TPC-H; pushes joins, window functions, and grouping sets.",
+      "sf1":  { "sqe": "49.3s",  "trino": "114.9s", "speedup": "2.3x", "pass": "99/99" },
+      "sf10": { "sqe": "216.6s", "trino": "320.5s", "speedup": "1.5x", "pass": "98/99" }
+    },
+    {
+      "suite": "SSB (13)",
+      "purpose": "Star Schema Benchmark — 13 queries over one fact joined to four dimensions; the shape data warehouses are optimised for. The suite we trailed longest.",
+      "sf1":  { "sqe": "5.2s",  "trino": "7.3s",  "speedup": "1.4x", "pass": "13/13" },
+      "sf10": { "sqe": "20.4s", "trino": "21.4s", "speedup": "1.0x", "pass": "13/13", "note": "crossover closed — parity" }
+    },
+    {
+      "suite": "ClickBench (43)",
+      "purpose": "43 queries over one wide table — log analytics: heavy string filters, point lookups, and counts. SQE's caching shines here.",
+      "sf1":  { "sqe": "3.1s",  "trino": "7.3s",  "speedup": "2.4x", "pass": "40/43" },
+      "sf10": { "sqe": "10.0s", "trino": "31.6s", "speedup": "3.2x", "pass": "40/43", "note": "3 pending a LIMIT-drop regression (q17)" }
+    },
+    {
+      "suite": "TPC-E (11)",
+      "purpose": "Financial-trading workload: date-range filters, point lookups against trade-history, aggregations across many small dimensions.",
+      "sf1":  { "sqe": "3.8s", "trino": "11.6s", "speedup": "3.0x", "pass": "11/11" },
+      "sf10": { "sqe": "—",   "trino": "—",     "speedup": "test-only", "pass": "18/18", "note": "SF10 diff needs ~14 GB for the 10M-row result — validated test-only" }
+    },
+    {
+      "suite": "TPC-BB (10)",
+      "purpose": "BigBench mixed workload: structured analytics plus JSON and text operations over a retail warehouse schema.",
+      "sf1":  { "sqe": "53.7s",  "trino": "480.5s",  "speedup": "8.9x", "pass": "10/10" },
+      "sf10": { "sqe": "405.5s", "trino": "1429.7s", "speedup": "3.5x", "pass": "10/10" }
+    },
+    {
+      "suite": "Bank (8)",
+      "purpose": "Purpose-built banking workload — customer / KYC / accounts with day-partitioned transactions; time-windowed \"last 14 days out of N\" scans that lean on partition pruning.",
+      "sf1":  { "sqe": "10.5s",  "trino": "19.8s", "speedup": "1.9x",  "pass": "8/8" },
+      "sf10": { "sqe": "370.5s", "trino": "85.5s", "speedup": "0.23x", "pass": "7/8", "trails": true, "note": "spill stalls under an 8 GB pool — fix in progress" }
+    },
+    {
+      "suite": "TPC-C (8 read)",
+      "purpose": "The read SELECTs from the TPC-C OLTP workload — point lookups against small Iceberg tables (SQE runs the read subset, not transactions).",
+      "sf1":  { "sqe": "5.6s", "trino": "4.3s",  "speedup": "0.77x", "pass": "8/8", "trails": true, "note": "sub-second reads — fixed dispatch overhead dominates" },
+      "sf10": { "sqe": "5.0s", "trino": "18.0s", "speedup": "3.6x",  "pass": "8/8" }
+    }
   ],
   "leaps": [
     { "date": "2026-06-12", "title": "The benchmark that lied", "metric": "Differential validation with DuckDB as an independent oracle: caught 16 vacuous TPC-DS queries and a Trino rounding bug (q75).", "blog": "2026-06-12-the-benchmark-that-lied", "chart": "tpcds-cross-scale.png" },
