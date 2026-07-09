@@ -231,6 +231,15 @@ pub enum Command {
         /// OAuth2 client secret
         #[arg(long, env = "SQE_CLIENT_SECRET")]
         client_secret: Option<String>,
+
+        /// Emit Parquet bloom filters on join-key columns of the loaded
+        /// tables (TPC-H/SSB) via the `write.parquet.bloom-filter-columns`
+        /// table property. Off by default so baselines stay comparable.
+        /// A/B lever: generate once, load twice (off vs on) for a clean
+        /// comparison on identical data. (The benchmark scripts translate
+        /// `BENCH_BLOOM_FILTER=1` into this flag.)
+        #[arg(long, default_value_t = false)]
+        bloom_filter: bool,
     },
 
     /// Run benchmark queries and report timing
