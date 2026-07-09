@@ -159,6 +159,15 @@ fn generate_web_clickstreams(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     let mut batches = Vec::new();
     let mut offset = 0usize;
 
+    // q07 (product affinity) pairs items co-viewed in one (user, date)
+    // session. Drawing user and date independently per row makes every
+    // (user, date) unique, so no pair ever recurs and the HAVING is empty.
+    // Group consecutive rows into sessions that share one (user, date);
+    // items stay per-row so a session is a basket of co-viewed items.
+    let mut session_remaining = 0u32;
+    let mut session_user: Option<i32> = None;
+    let mut session_date: i32 = 1;
+
     while offset < total {
         let n = BATCH_SIZE.min(total - offset);
 
@@ -172,12 +181,24 @@ fn generate_web_clickstreams(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
         let mut wcs_search_keywords: Vec<Option<String>> = Vec::with_capacity(n);
 
         for _ in 0..n {
+            if session_remaining == 0 {
+                // A session is 2..=6 clicks under one (user, date). The user
+                // is null at the same ~30% rate as before (logged-out clicks).
+                session_remaining = rng.gen_range(2..=6);
+                session_user = if rng.gen_bool(0.70) {
+                    Some(rng.gen_range(1..=num_users))
+                } else {
+                    None
+                };
+                session_date = rng.gen_range(1..=num_date_sks);
+            }
+            session_remaining -= 1;
+
             // ~5% of clicks have nulls in optional FK columns (abandoned sessions)
             let is_sale = rng.gen_bool(0.60);
-            let is_logged_in = rng.gen_bool(0.70);
             let has_keyword = rng.gen_bool(0.30);
 
-            wcs_click_date_sk.push(Some(rng.gen_range(1..=num_date_sks)));
+            wcs_click_date_sk.push(Some(session_date));
             wcs_click_time_sk.push(Some(rng.gen_range(0..num_time_sks)));
             wcs_sales_sk.push(if is_sale {
                 Some(rng.gen_range(1..=num_sales))
@@ -186,11 +207,7 @@ fn generate_web_clickstreams(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
             });
             wcs_item_sk.push(Some(rng.gen_range(1..=num_items)));
             wcs_web_page_sk.push(Some(rng.gen_range(1..=num_web_pages)));
-            wcs_user_sk.push(if is_logged_in {
-                Some(rng.gen_range(1..=num_users))
-            } else {
-                None
-            });
+            wcs_user_sk.push(session_user);
             wcs_referrer_url.push(Some(
                 REFERRER_DOMAINS[rng.gen_range(0..REFERRER_DOMAINS.len())].to_string(),
             ));
@@ -439,6 +456,35 @@ mod tests {
         let first_batch = &batches[0];
         let sales_col = first_batch.column(2);
         assert!(sales_col.null_count() > 0, "expected some null sales_sk values");
+    }
+
+    #[test]
+    fn test_web_clickstreams_is_sessionized() {
+        // q07 needs (user, date) sessions to repeat items, so distinct
+        // (user, date) combos must sit well below the non-null-user row
+        // count rather than tracking it one-to-one.
+        use arrow_array::Array;
+        use std::collections::HashSet;
+        let (_schema, batches) = generate_web_clickstreams(0.01);
+        let mut combos: HashSet<(i32, i32)> = HashSet::new();
+        let mut non_null_rows = 0usize;
+        for b in &batches {
+            let dates = b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+            let users = b.column(5).as_any().downcast_ref::<Int32Array>().unwrap();
+            for i in 0..b.num_rows() {
+                if users.is_valid(i) {
+                    non_null_rows += 1;
+                    combos.insert((users.value(i), dates.value(i)));
+                }
+            }
+        }
+        assert!(non_null_rows > 0, "expected some logged-in rows");
+        assert!(
+            (combos.len() as f64) < 0.6 * non_null_rows as f64,
+            "distinct (user, date) combos {} not below 0.6x non-null rows {}",
+            combos.len(),
+            non_null_rows
+        );
     }
 
     #[test]

@@ -51,6 +51,24 @@ pub const DEFAULT_START_DAY: i32 = 20_605;
 /// (local Parquet) path. The Iceberg sink passes an explicit day count.
 const SCALE_MODE_DAYS: u32 = 3;
 
+/// Fraud ring for bank q03 (high-velocity account screen). Uniform account
+/// draws give every account only a few dozen debits in a 3-day window, so
+/// `HAVING COUNT(*) > 100` never fires. These fixed low-id accounts absorb
+/// a global stride of debits on the first three trading days so the screen
+/// has accounts above the absolute threshold at benchmark scales.
+const FRAUD_RING_START: i64 = 1;
+/// Number of accounts in the ring; q03 returns one row per ring account.
+const FRAUD_RING_COUNT: i64 = 10;
+/// Every `FRAUD_RING_STRIDE`-th transaction id on a ring day is redirected
+/// (as a debit) to a ring account. Keyed on the global `t_id` so the redirect
+/// is shard-independent and total row counts stay unchanged; sized so the
+/// per-account debit count lands in the hundreds at sf0.1 and grows with
+/// scale, always clearing the 100-row threshold.
+const FRAUD_RING_STRIDE: i64 = 200;
+/// Trading days the ring is active on: the first three days from the start,
+/// matching the q03 window `DATE '2026-06-01' AND DATE '2026-06-03'`.
+const FRAUD_RING_DAYS: std::ops::Range<i32> = DEFAULT_START_DAY..DEFAULT_START_DAY + 3;
+
 // ---------------------------------------------------------------------------
 // Plan: the sizing knobs shared by every generation unit
 // ---------------------------------------------------------------------------
@@ -492,13 +510,23 @@ pub fn transaction_day_shard(
 
         for i in 0..n {
             let row = offset + i as u64;
-            t_id.push(t_id_start + row as i64);
+            let id = t_id_start + row as i64;
+            t_id.push(id);
             t_day.push(day);
             // Ascending across the unit: each row advances by the day span
             // divided by the unit's row count. Files cut from this stream
             // cover contiguous time windows, so ts min/max stats are tight.
             t_ts.push(day_start_micros + (row as i128 * DAY_MICROS as i128 / rows.max(1) as i128) as i64);
-            let a_id = rng.gen_range(accounts.start..accounts.end.max(accounts.start + 1)) as i64;
+            // Draw unconditionally so the rng sequence (and every non-ring
+            // row) is identical whether or not this row joins the ring.
+            let drawn_a_id =
+                rng.gen_range(accounts.start..accounts.end.max(accounts.start + 1)) as i64;
+            let ring_account =
+                FRAUD_RING_START + (id / FRAUD_RING_STRIDE).rem_euclid(FRAUD_RING_COUNT);
+            let use_ring = FRAUD_RING_DAYS.contains(&day)
+                && id % FRAUD_RING_STRIDE == 0
+                && accounts.contains(&(ring_account as u64));
+            let a_id = if use_ring { ring_account } else { drawn_a_id };
             t_a_id.push(a_id);
             t_cp_iban.push(format!(
                 "{}{:02}BANK{:010}",
@@ -513,7 +541,10 @@ pub fn transaction_day_shard(
             let base = 10i64.pow(mag + 2);
             t_amount.push(rng.gen_range(base / 2..base * 5));
             t_currency.push(account_currency(a_id));
-            t_direction.push(if rng.gen_range(0..2) == 0 { "debit" } else { "credit" });
+            // Draw unconditionally to keep the rng aligned; ring rows are
+            // forced to debit so they land in q03's outgoing-transaction filter.
+            let debit = rng.gen_range(0..2) == 0 || use_ring;
+            t_direction.push(if debit { "debit" } else { "credit" });
             t_channel.push(CHANNELS[rng.gen_range(0..CHANNELS.len())]);
             t_category.push(CATEGORIES[rng.gen_range(0..CATEGORIES.len())]);
             // 97% settled, 2% pending, 1% rejected.
@@ -822,6 +853,44 @@ mod tests {
             rows += b.num_rows() as u64;
         }
         assert_eq!(rows, 200_000);
+    }
+
+    #[test]
+    fn fraud_ring_crosses_q03_threshold_at_sf01() {
+        // q03's high-velocity screen (HAVING COUNT(*) > 100 debits in the
+        // 3-day window) must fire for ring accounts and stay silent for
+        // ordinary accounts, which uniform draws keep near a dozen debits.
+        use std::collections::HashMap;
+        let plan = BankPlan::from_scale(0.1);
+        let per_day = plan.txn_rows_per_day;
+        let mut debits: HashMap<i64, u64> = HashMap::new();
+        for day_idx in 0..plan.days {
+            let day = plan.start_day + day_idx as i32;
+            let t_id_start = day_idx as i64 * per_day as i64;
+            let seed = crate::generate::config::seed_for_table_partition(
+                unit_seed("transaction", 0, 0),
+                day_idx as usize,
+            );
+            for batch in
+                transaction_day_shard(day, per_day, t_id_start, 0..plan.accounts(), seed)
+            {
+                let a_ids = batch.column(3).as_any().downcast_ref::<Int64Array>().unwrap();
+                let dirs = batch.column(8).as_any().downcast_ref::<StringArray>().unwrap();
+                for i in 0..batch.num_rows() {
+                    if dirs.value(i) == "debit" {
+                        *debits.entry(a_ids.value(i)).or_default() += 1;
+                    }
+                }
+            }
+        }
+        for acct in FRAUD_RING_START..FRAUD_RING_START + FRAUD_RING_COUNT {
+            let c = debits.get(&acct).copied().unwrap_or(0);
+            assert!(c > 100, "ring account {acct} has {c} debits, expected > 100");
+        }
+        for acct in [500i64, 5_000, 20_000] {
+            let c = debits.get(&acct).copied().unwrap_or(0);
+            assert!(c <= 100, "non-ring account {acct} has {c} debits, expected <= 100");
+        }
     }
 
     #[test]

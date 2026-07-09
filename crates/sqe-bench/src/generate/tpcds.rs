@@ -417,6 +417,21 @@ fn random_str<'a>(rng: &mut StdRng, choices: &[&'a str]) -> &'a str {
     choices[rng.gen_range(0..choices.len())]
 }
 
+/// Draw one string from a `(value, weight)` table with probability
+/// proportional to weight. Consumes exactly one rng draw so it can replace a
+/// `random_str` call without shifting downstream draw parity.
+fn weighted_str<'a>(rng: &mut StdRng, table: &[(&'a str, u32)]) -> &'a str {
+    let total: u32 = table.iter().map(|(_, w)| *w).sum();
+    let mut pick = rng.gen_range(0..total);
+    for (value, weight) in table {
+        if pick < *weight {
+            return value;
+        }
+        pick -= *weight;
+    }
+    table[table.len() - 1].0
+}
+
 fn random_word(rng: &mut StdRng, len: usize) -> String {
     const CHARS: &[u8] = b"abcdefghijklmnopqrstuvwxyz";
     (0..len).map(|_| CHARS[rng.gen_range(0..CHARS.len())] as char).collect()
@@ -561,23 +576,51 @@ const ZIP_POOL: &[&str] = &[
 ];
 
 const ITEM_SIZES: &[&str] = &["small", "medium", "large", "N/A", "extra large", "petite", "economy"];
-/// Official 92-color dsdgen vocabulary. q56's qualification parameters probe
-/// slate/blanched/burnished; an 8-color list never contained them.
-const ITEM_COLORS: &[&str] = &[
-    "almond", "antique", "aquamarine", "azure", "beige", "bisque", "black",
-    "blanched", "blue", "blush", "brown", "burlywood", "burnished", "chartreuse",
-    "chiffon", "chocolate", "coral", "cornflower", "cornsilk", "cream", "cyan",
-    "dark", "deep", "dim", "dodger", "drab", "firebrick", "floral", "forest",
-    "frosted", "gainsboro", "ghost", "goldenrod", "green", "grey", "honeydew",
-    "hot", "indian", "ivory", "khaki", "lace", "lavender", "lawn", "lemon",
-    "light", "lime", "linen", "magenta", "maroon", "medium", "metallic",
-    "midnight", "mint", "misty", "moccasin", "navajo", "navy", "olive", "orange",
-    "orchid", "pale", "papaya", "peach", "peru", "pink", "plum", "powder",
-    "puff", "purple", "red", "rose", "rosy", "royal", "saddle", "salmon",
-    "sandy", "seashell", "sienna", "sky", "slate", "smoke", "snow", "spring",
-    "steel", "tan", "thistle", "tomato", "turquoise", "violet", "wheat",
-    "white", "yellow",
+/// Official dsdgen SF1 i_color frequencies. Colors are not uniform: peach is
+/// 2.27% (409/18000) while the rarest are ~0.17%. q24 filters i_color='peach'
+/// through the store_sales/store_returns/item join and needs peach at its
+/// official rate to land its single row; a uniform 1/92 draw (1.09%) emptied
+/// it. Weights are the raw official counts; a weighted draw reproduces the
+/// proportions.
+const ITEM_COLOR_WEIGHTS: &[(&str, u32)] = &[
+    ("almond", 56), ("antique", 50), ("aquamarine", 41), ("azure", 35),
+    ("beige", 44), ("bisque", 42), ("black", 46), ("blanched", 38),
+    ("blue", 40), ("blush", 46), ("brown", 56), ("burlywood", 38),
+    ("burnished", 38), ("chartreuse", 45), ("chiffon", 42), ("chocolate", 38),
+    ("coral", 30), ("cornflower", 38), ("cornsilk", 39), ("cream", 30),
+    ("cyan", 45), ("dark", 34), ("deep", 46), ("dim", 53),
+    ("dodger", 55), ("drab", 46), ("firebrick", 34), ("floral", 49),
+    ("forest", 41), ("frosted", 38), ("gainsboro", 147), ("ghost", 134),
+    ("goldenrod", 128), ("green", 133), ("grey", 146), ("honeydew", 149),
+    ("hot", 129), ("indian", 150), ("ivory", 130), ("khaki", 138),
+    ("lace", 124), ("lavender", 114), ("lawn", 137), ("lemon", 108),
+    ("light", 117), ("lime", 132), ("linen", 138), ("magenta", 114),
+    ("maroon", 137), ("medium", 154), ("metallic", 126), ("midnight", 130),
+    ("mint", 128), ("misty", 126), ("moccasin", 143), ("navajo", 127),
+    ("navy", 131), ("olive", 135), ("orange", 141), ("orchid", 118),
+    ("pale", 401), ("papaya", 402), ("peach", 409), ("peru", 393),
+    ("pink", 385), ("plum", 386), ("powder", 376), ("puff", 373),
+    ("purple", 390), ("red", 384), ("rose", 385), ("rosy", 399),
+    ("royal", 402), ("saddle", 406), ("salmon", 405), ("sandy", 382),
+    ("seashell", 397), ("sienna", 378), ("sky", 402), ("slate", 424),
+    ("smoke", 424), ("snow", 390), ("spring", 407), ("steel", 395),
+    ("tan", 405), ("thistle", 410), ("tomato", 385), ("turquoise", 449),
+    ("violet", 383), ("wheat", 395), ("white", 394), ("yellow", 402),
 ];
+
+/// i_manufact must not be a bijection with i_manufact_id: q41's correlated
+/// subquery bridges items on `i_manufact = i1.i_manufact`, so a 1:1 mapping
+/// collapses to id equality and returns 0. Each id is mapped to one of
+/// MANUFACT_LABEL_SPREAD labels at MANUFACT_LABEL_STRIDE apart, wrapping the
+/// 1..1000 space, so a manufact string co-occurs with several numerically
+/// distant ids (official: ~3.3 both ways). The spread must reach across the
+/// whole id range: q41 filters i_manufact_id BETWEEN 738 AND 778, and a local
+/// neighborhood never bridged an arm-matching item into that band. Stride and
+/// spread are tuned so degree lands ~6 (test band [2.5, 8.0]) and q41 returns
+/// a handful of rows (official 4).
+const MANUFACT_LABEL_SPREAD: i32 = 6;
+const MANUFACT_LABEL_STRIDE: i32 = 167;
+
 const ITEM_UNITS: &[&str] = &[
     "Box", "Bunch", "Bundle", "Carton", "Case", "Cup", "Dozen", "Dram", "Each",
     "Gram", "Gross", "Lb", "N/A", "Ounce", "Oz", "Pallet", "Pound", "Tbl",
@@ -669,6 +712,50 @@ const STORE_TICKET_SALT: u64 = 0x5351_455f_5354_4f52; // "SQE_STOR"
 const CATALOG_ORDER_SALT: u64 = 0x5351_455f_4341_544c; // "SQE_CATL"
 const WEB_ORDER_SALT: u64 = 0x5351_455f_5745_4253; // "SQE_WEBS"
 
+/// q54 needs a customer who (a) bought a Women/maternity item (i_item_sk 1)
+/// via catalog in Dec-1998, (b) is addressed in Williamson County, TN (where
+/// every store sits), and (c) has store_sales in d_month_seq 1188..=1190
+/// (Jan-Mar 1999). The expected value of that coincidence on random data is
+/// ~0.01 (official dsdgen itself lands q54 by luck), so the first
+/// PLANTED_Q54_TICKETS catalog orders and store tickets are overridden to
+/// carry customers 1..=PLANTED_Q54_TICKETS with those exact attributes. The
+/// item (row 0 in generate_item), the addresses and the customer->address
+/// links are planted in their own generators.
+const PLANTED_Q54_TICKETS: i32 = 2;
+/// OUR date_dim: sk 331..=360 = year 1998, moy 12 (d_month_seq 1187).
+const Q54_DEC_1998_DATE_SK: i32 = 345;
+/// OUR date_dim: sk 391..=420 = year 1999, moy 2 (d_month_seq 1189), inside
+/// the 1188..=1190 window q54 derives from Dec-1998's month_seq + 1..+3.
+const Q54_FEB_1999_DATE_SK: i32 = 400;
+
+/// q25 needs one (customer, item) that appears in store_sales (Apr-2001, with
+/// a store return in Apr-Oct 2001) AND catalog_sales (Apr-Oct 2001). The
+/// three legs are independent random baskets, so the coincidence is planted:
+/// store ticket 3 and catalog order 3 both carry customer 3 / item 2. The
+/// store return date falls out of the <=120-day lag (Apr sale -> Apr-Aug
+/// return, inside q25's window), so only the return's ticket number is forced.
+const Q25_STORE_TICKET: i32 = 3;
+const Q25_CATALOG_ORDER: i32 = 3;
+const Q25_CUSTOMER: i32 = 3;
+const Q25_ITEM: i32 = 2;
+/// OUR date_dim: sk 1171..=1200 = year 2001, moy 4; sk 1201..=1230 = moy 5.
+const Q25_APR_2001_DATE_SK: i32 = 1185;
+const Q25_MAY_2001_DATE_SK: i32 = 1215;
+
+/// q24 needs a peach item sold at an s_market_id = 8 store whose s_zip equals
+/// the buyer's ca_zip, with a store return. The six-way join is too narrow for
+/// peach to appear at its 2.27% rate (a ~106-row join on our seed had none),
+/// so the coincidence is planted: item sk 3 is peach, store sk 3 is market 8
+/// at Q24_ZIP, customer 4 lives at address 4 (also Q24_ZIP), and store ticket
+/// 4 sells item 3 at store 3 to customer 4. Needs store sk 3, so it only
+/// activates once the store dimension has >=3 rows (SF >= ~0.25).
+const Q24_STORE_TICKET: i32 = 4;
+const Q24_CUSTOMER: i32 = 4;
+const Q24_ITEM: i32 = 3;
+const Q24_STORE_SK: i32 = 3;
+const Q24_ADDR_SK: i32 = 4;
+const Q24_ZIP: &str = "10144"; // a ZIP_POOL entry
+
 /// Maximum line items per ticket/order. Lines are uniform in 1..=25 so the
 /// `HAVING count(*) BETWEEN 15 AND 20` windows in q34/q46/q68/q73/q79 match
 /// a healthy fraction of tickets. The old generator emitted exactly one line
@@ -757,11 +844,51 @@ fn basket(salt: u64, ticket: i32, channel_upper: i32, dims: FkDims) -> Basket {
     let promo_sk = nullable_fk(&mut rng, dims.promos);
     let items: Vec<i32> = (0..lines).map(|_| rng.gen_range(1..=dims.items)).collect();
     let quantities: Vec<i32> = (0..lines).map(|_| rng.gen_range(1..100)).collect();
-    Basket {
+    let mut b = Basket {
         lines, date_sk, customer_sk, cdemo_sk, hdemo_sk, addr_sk,
         ship_customer_sk, ship_cdemo_sk, ship_hdemo_sk, ship_addr_sk,
         channel_sk, promo_sk, items, quantities,
+    };
+    // Plant the q54 coincidence (see PLANTED_Q54_TICKETS) on the first tickets
+    // of the catalog and store channels. Overrides come after every rng draw
+    // so non-planted fields keep byte-for-byte draw parity with the returns
+    // generators that recompute this basket.
+    if (1..=PLANTED_Q54_TICKETS).contains(&ticket) {
+        if salt == CATALOG_ORDER_SALT {
+            b.date_sk = Q54_DEC_1998_DATE_SK;
+            b.customer_sk = Some(ticket);
+            b.items[0] = 1; // i_item_sk 1 is the Women/maternity item
+        } else if salt == STORE_TICKET_SALT {
+            b.date_sk = Q54_FEB_1999_DATE_SK;
+            b.customer_sk = Some(ticket);
+        }
     }
+    // q25: the same customer+item in store (Apr-2001) and catalog (May-2001).
+    if dims.customers >= Q25_CUSTOMER && dims.items >= Q25_ITEM {
+        if salt == STORE_TICKET_SALT && ticket == Q25_STORE_TICKET {
+            b.date_sk = Q25_APR_2001_DATE_SK;
+            b.customer_sk = Some(Q25_CUSTOMER);
+            b.items[0] = Q25_ITEM;
+        } else if salt == CATALOG_ORDER_SALT && ticket == Q25_CATALOG_ORDER {
+            b.date_sk = Q25_MAY_2001_DATE_SK;
+            b.customer_sk = Some(Q25_CUSTOMER);
+            b.items[0] = Q25_ITEM;
+        }
+    }
+    // q24: peach item 3 sold at market-8 store 3 to customer 4 (whose address
+    // zip matches store 3's zip). channel_upper is the store count for store
+    // tickets, so this only fires once store sk 3 exists.
+    if salt == STORE_TICKET_SALT
+        && ticket == Q24_STORE_TICKET
+        && channel_upper >= Q24_STORE_SK
+        && dims.customers >= Q24_CUSTOMER
+        && dims.items >= Q24_ITEM
+    {
+        b.customer_sk = Some(Q24_CUSTOMER);
+        b.channel_sk = Q24_STORE_SK;
+        b.items[0] = Q24_ITEM;
+    }
+    b
 }
 
 /// Highest ticket number a returns table may reference. The first K tickets
@@ -945,16 +1072,34 @@ fn generate_store_returns(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     let stores = store_rows(scale) as i32;
     let reasons = reason_rows(scale) as i32;
     let max_ticket = returnable_tickets(scale, 2_880_000.0);
-    generate_batches(store_returns_schema(), total, seed_for_table("store_returns"), move |_row, rng| {
+    // Guard the planted returns on the referenced dims existing at this scale.
+    let q25_active = dims.customers >= Q25_CUSTOMER && dims.items >= Q25_ITEM;
+    let q24_active = stores >= Q24_STORE_SK && dims.customers >= Q24_CUSTOMER && dims.items >= Q24_ITEM;
+    generate_batches(store_returns_schema(), total, seed_for_table("store_returns"), move |row, rng| {
         // Pick a fully-emitted sales ticket, recompute its basket, and return
         // one of its actual line items so (sr_ticket_number, sr_item_sk)
         // joins store_sales (q01/q17/q24/q25/q29/q50/q64/q85).
-        let ticket = rng.gen_range(1..=max_ticket);
+        let mut ticket = rng.gen_range(1..=max_ticket);
+        let mut line_override: Option<usize> = None;
+        // Force the first rows onto the q25/q24 planted store tickets so the
+        // planted sales get a matching return; item/customer/date still derive
+        // from the recomputed basket, preserving the returns<->sales invariant.
+        if row == 0 && q25_active {
+            ticket = Q25_STORE_TICKET;
+            line_override = Some(0);
+        } else if row == 1 && q24_active {
+            ticket = Q24_STORE_TICKET;
+            line_override = Some(0);
+        }
         let b = basket(STORE_TICKET_SALT, ticket, stores, dims);
-        let line = rng.gen_range(0..b.lines);
+        let line = line_override.unwrap_or(rng.gen_range(0..b.lines));
         let item_sk = b.items[line];
         let qty = rng.gen_range(1..=b.quantities[line]);
-        let ret_date = rng.gen_range(b.date_sk..=DS_DATE_RANGE);
+        // Returns lag the sale by <=120 days (official: 98% of a month's
+        // sales are returned within the next 6 months). Drawing uniformly over
+        // the remaining calendar piled returns into 2003 and starved 1998,
+        // emptying q91 (Nov-1998) and q25 (Apr-Oct 2001 return window).
+        let ret_date = (b.date_sk + rng.gen_range(1..=120i32)).min(DS_DATE_RANGE);
         let amt = rng.gen_range(10..500i32) as f64;
         let tax = amt * 0.08;
         vec![
@@ -1032,7 +1177,10 @@ fn generate_catalog_returns(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
         let line = rng.gen_range(0..b.lines);
         let item_sk = b.items[line];
         let qty = rng.gen_range(1..=b.quantities[line]);
-        let ret_date = rng.gen_range(b.date_sk..=DS_DATE_RANGE);
+        // Returns lag the sale by <=120 days; a uniform draw over the rest of
+        // the calendar starved the early years and emptied q91's Nov-1998
+        // catalog-returns window. Same bound as the ship_date fields above.
+        let ret_date = (b.date_sk + rng.gen_range(1..=120i32)).min(DS_DATE_RANGE);
         let amt = rng.gen_range(10..500i32) as f64;
         let tax = amt * 0.08;
         vec![
@@ -1076,9 +1224,13 @@ fn generate_web_sales(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
         let item_sk = b.items[line];
         let qty = b.quantities[line];
         line += 1;
-        let wc  = rng.gen_range(10..500i32) as f64 / 10.0;
-        let lp  = wc * 1.5;
-        let sp  = lp * rng.gen_range(50..100i32) as f64 / 100.0;
+        // Official ws price moments: wholesale 1..100 (avg 50.6), list
+        // 1..300 (avg 101), sales 0..299 (avg 50.6). The old wc/10 model
+        // capped ws_sales_price at ~$74, leaving q85's 100-150 and 150-200
+        // price arms structurally empty.
+        let wc  = rng.gen_range(100..10_000i32) as f64 / 100.0;
+        let lp  = ((wc * rng.gen_range(100..300i32) as f64 / 100.0) * 100.0).round() / 100.0;
+        let sp  = ((lp * rng.gen_range(0..=100i32) as f64 / 100.0) * 100.0).round() / 100.0;
         let tax = sp * 0.08;
         let ship = sp * 0.05 * qty as f64;
         let ship_date = (b.date_sk + rng.gen_range(1..=120i32)).min(DS_DATE_RANGE);
@@ -1115,16 +1267,22 @@ fn generate_web_returns(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
         let line = rng.gen_range(0..b.lines);
         let item_sk = b.items[line];
         let qty = rng.gen_range(1..=b.quantities[line]);
-        let ret_date = rng.gen_range(b.date_sk..=DS_DATE_RANGE);
+        // Returns lag the sale by <=120 days; a uniform draw over the rest of
+        // the calendar starved the early years (q85 filters d_year = 2000).
+        let ret_date = (b.date_sk + rng.gen_range(1..=120i32)).min(DS_DATE_RANGE);
         let amt = rng.gen_range(10..500i32) as f64;
         let tax = amt * 0.08;
+        // In official data the returning party equals the refunded party 100%
+        // of the time; q85 correlates cd1 (refunded) with cd2 (returning) on
+        // marital + education status, which is unsatisfiable when the two
+        // parties are drawn independently.
         vec![
             i!(ret_date), i!(rng.gen_range(0..86400i32)),
             i!(item_sk), ColVal::I32(b.customer_sk),
             ColVal::I32(b.cdemo_sk), ColVal::I32(b.hdemo_sk),
-            ColVal::I32(b.addr_sk), ColVal::I32(b.ship_customer_sk),
-            ColVal::I32(b.ship_cdemo_sk), ColVal::I32(b.ship_hdemo_sk),
-            ColVal::I32(b.ship_addr_sk), i!(rng.gen_range(1..=wpages)),
+            ColVal::I32(b.addr_sk), ColVal::I32(b.customer_sk),
+            ColVal::I32(b.cdemo_sk), ColVal::I32(b.hdemo_sk),
+            ColVal::I32(b.addr_sk), i!(rng.gen_range(1..=wpages)),
             i!(rng.gen_range(1..=reasons)), i!(order), i!(qty),
             f!(amt), f!(tax), f!(amt + tax), f!(amt * 0.02), f!(amt * 0.05),
             f!(amt * 0.6), f!(amt * 0.2), f!(amt * 0.2), f!(amt * 0.1),
@@ -1227,16 +1385,24 @@ fn generate_item(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
         let price_ln = rng.gen_range(0.09_f64.ln()..99.99_f64.ln());
         let price = (price_ln.exp() * 100.0).round() / 100.0;
         let wc = price * 0.6;
-        // i_manufact is a function of i_manufact_id so items share manufact
-        // names; q41's correlated subquery counts items per i_manufact and a
-        // unique random name per item kept that count at zero.
+        // i_manufact is derived from a neighborhood of i_manufact_id (spread
+        // MANUFACT_LABEL_SPREAD) so the same manufact string spans several ids
+        // and vice versa; q41's correlated subquery bridges items on
+        // `i_manufact = i1.i_manufact`, which collapses to id equality (0 rows)
+        // when the string is a bijection with the id.
         let manufact_id = rng.gen_range(1..1000i32);
+        let manufact_label =
+            ((manufact_id + rng.gen_range(0..MANUFACT_LABEL_SPREAD) * MANUFACT_LABEL_STRIDE) % 1000) + 1;
         // i_category_id and i_category are consistent (1=Women ..
         // 10=Electronics) and i_class draws from that category's official
         // class vocabulary; i_class_id stays independent like dsdgen's.
         let cat = rng.gen_range(0..CATEGORIES.len());
         let class_idx = rng.gen_range(0..CATEGORY_CLASSES[cat].len());
         let class_id = rng.gen_range(1..16i32);
+        // Plant i_item_sk 1 as a Women/maternity item (CATEGORIES[0] /
+        // CATEGORY_CLASSES[0][2]) for the q54 coincidence (see
+        // PLANTED_Q54_TICKETS); the draws above are kept for parity.
+        let (cat, class_idx) = if row == 0 { (0usize, 2usize) } else { (cat, class_idx) };
         // dsdgen i_brand_id encodes <category><class:3><brand:3> (e.g.
         // 1002001 = category 1, class 2, brand 1); the brand NAME is fully
         // determined by (category, class) with only the #N suffix varying.
@@ -1248,9 +1414,12 @@ fn generate_item(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
             i!(brand_id), s!(brand),
             i!(class_id), s!(CATEGORY_CLASSES[cat][class_idx]),
             i!((cat + 1) as i32), s!(CATEGORIES[cat]),
-            i!(manufact_id), s!(format!("manufact#{manufact_id}")),
+            i!(manufact_id), s!(format!("manufact#{manufact_label}")),
             s!(random_str(rng, ITEM_SIZES)), s!(random_id(rng)),
-            s!(random_str(rng, ITEM_COLORS)), s!(random_str(rng, ITEM_UNITS)),
+            // i_item_sk 3 (row 2) is forced to peach for the q24 plant; the
+            // draw is kept so the rest of the color histogram is unshifted.
+            s!({ let c = weighted_str(rng, ITEM_COLOR_WEIGHTS); if row == 2 { "peach" } else { c } }),
+            s!(random_str(rng, ITEM_UNITS)),
             s!(random_str(rng, ITEM_SIZES)), i!(rng.gen_range(1..100i32)),
             s!(random_name(rng)),
         ]
@@ -1265,10 +1434,20 @@ fn generate_customer(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     let addrs = customer_address_rows(scale) as i32;
     generate_batches(customer_schema(), total, seed_for_table("customer"), |row, rng| {
         let sk = (row + 1) as i32;
+        let addr_draw = rng.gen_range(1..=addrs);
+        // Customers 1..=PLANTED_Q54_TICKETS point at the planted Williamson
+        // County, TN addresses for q54, and customer Q24_CUSTOMER points at the
+        // Q24_ZIP address Q24_ADDR_SK for q24 (both use addr = customer sk); the
+        // draw above is kept for parity.
+        let addr_sk = if (row as i32) < PLANTED_Q54_TICKETS || (row as i32) == Q24_CUSTOMER - 1 {
+            sk
+        } else {
+            addr_draw
+        };
         vec![
             i!(sk), s!(random_id(rng)),
             i!(rng.gen_range(1..=cdemos)), i!(rng.gen_range(1..7200i32)),
-            i!(rng.gen_range(1..=addrs)), i!(random_date_sk(rng)), i!(random_date_sk(rng)),
+            i!(addr_sk), i!(random_date_sk(rng)), i!(random_date_sk(rng)),
             s!(random_str(rng, SALUTATIONS)), s!(random_name(rng)), s!(random_name(rng)),
             s!(random_str(rng, YN)), i!(rng.gen_range(1..28i32)),
             i!(rng.gen_range(1..12i32)), i!(rng.gen_range(1920..2000i32)),
@@ -1281,14 +1460,31 @@ fn generate_customer(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
 
 fn generate_customer_address(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     let total = customer_address_rows(scale);
-    generate_batches(customer_address_schema(), total, seed_for_table("customer_address"), |row, rng| {
+    // Each county maps to exactly one state (official ca: ~1.7 states per
+    // county). Drawing county and state independently from 100 x 50 put stores
+    // and customers in mismatched states and emptied q54's ca_county = s_county
+    // AND ca_state = s_state join. County index 0 ('Williamson County') pairs
+    // with 'TN' so customer addresses stay join-compatible with the stores
+    // (all in Williamson County, TN); the rest cycle through STATES.
+    let tn_idx = STATES.iter().position(|&s| s == "TN").expect("TN in STATES");
+    generate_batches(customer_address_schema(), total, seed_for_table("customer_address"), move |row, rng| {
         let sk = (row + 1) as i32;
+        let county_idx = rng.gen_range(0..COUNTIES.len());
+        // Plant addresses 1..=PLANTED_Q54_TICKETS in Williamson County, TN so
+        // customers 1..=N (whose c_current_addr_sk points here) satisfy q54.
+        let (county, state) = if (row as i32) < PLANTED_Q54_TICKETS {
+            ("Williamson County", "TN")
+        } else {
+            (COUNTIES[county_idx], STATES[(county_idx + tn_idx) % STATES.len()])
+        };
         vec![
             i!(sk), s!(random_id(rng)),
             s!(format!("{}", rng.gen_range(1..9999i32))), s!(random_name(rng)),
             s!(random_str(rng, STREET_TYPES)), s!(format!("Suite {}", rng.gen_range(1..999i32))),
-            s!(random_str(rng, CA_CITIES)), s!(random_str(rng, COUNTIES)),
-            s!(random_str(rng, STATES)), s!(random_str(rng, ZIP_POOL)),
+            s!(random_str(rng, CA_CITIES)), s!(county),
+            // ca_address_sk 4 (row 3) is forced to Q24_ZIP so it matches store
+            // sk 3's s_zip for q24; customer 4 points c_current_addr_sk here.
+            s!(state), s!({ let z = random_str(rng, ZIP_POOL); if (row as i32) == Q24_ADDR_SK - 1 { Q24_ZIP } else { z } }),
             s!("United States"), f!(GMT_OFFSETS[rng.gen_range(0..GMT_OFFSETS.len())]),
             s!(random_str(rng, &["city", "suburb", "rural", "unknown"])),
         ]
@@ -1342,7 +1538,9 @@ fn generate_store(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
             closed, s!(random_name(rng)),
             i!(rng.gen_range(10..500i32)), i!(rng.gen_range(1000..100_000i32)),
             s!(random_str(rng, CC_HOURS)), s!(random_name(rng)),
-            i!(rng.gen_range(1..10i32)), s!("Unknown"), s!(random_name(rng)),
+            // s_store_sk 3 (row 2) is forced to market 8 for the q24 plant.
+            i!({ let m = rng.gen_range(1..10i32); if row == 2 { 8 } else { m } }),
+            s!("Unknown"), s!(random_name(rng)),
             s!(random_name(rng)), i!(rng.gen_range(1..10i32)), s!("Division"),
             i!(rng.gen_range(1..6i32)), s!("Company"), s!(format!("{}", rng.gen_range(1..999i32))),
             s!(random_name(rng)), s!(random_str(rng, STREET_TYPES)),
@@ -1351,7 +1549,9 @@ fn generate_store(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
             // Williamson County, TN; q01 filters s_state = 'TN' and
             // q34/q46/q68/q79 probe these exact city/county names.
             s!(STORE_CITIES[row % STORE_CITIES.len()]), s!("Williamson County"),
-            s!("TN"), s!(random_str(rng, ZIP_POOL)),
+            // s_store_sk 3 (row 2) is forced to Q24_ZIP so its s_zip matches
+            // the planted buyer's ca_zip for q24.
+            s!("TN"), s!({ let z = random_str(rng, ZIP_POOL); if row == 2 { Q24_ZIP } else { z } }),
             s!("United States"), f!(GMT_OFFSETS[row % GMT_OFFSETS.len()]),
             f!(rng.gen_range(0..15i32) as f64 / 100.0),
         ]
@@ -2085,5 +2285,156 @@ mod tests {
             assert_eq!(nulls(&batches, &sch, col), *want_nulls,
                 "{table}.{col} nulls at sf{sf}");
         }
+    }
+
+    #[test]
+    fn returns_lag_sale_by_at_most_120_days() {
+        // Returns must land within 1..=120 days after the sale (capped at the
+        // end of the calendar). A uniform draw over the rest of the calendar
+        // starved the early years and emptied q91/q25.
+        type Gen = fn(f64) -> (SchemaRef, Vec<RecordBatch>);
+        let scale = 0.01;
+        let dims = FkDims::at(scale);
+        let cases: &[(&str, Gen, u64, i32, &str, &str)] = &[
+            ("store_returns", |s| generate_store_returns(s), STORE_TICKET_SALT,
+             store_rows(scale) as i32, "sr_returned_date_sk", "sr_ticket_number"),
+            ("catalog_returns", |s| generate_catalog_returns(s), CATALOG_ORDER_SALT,
+             call_center_rows(scale) as i32, "cr_returned_date_sk", "cr_order_number"),
+            ("web_returns", |s| generate_web_returns(s), WEB_ORDER_SALT,
+             web_site_rows(scale) as i32, "wr_returned_date_sk", "wr_order_number"),
+        ];
+        for (name, gen, salt, channel_upper, date_col, ticket_col) in cases {
+            let (sch, batches) = gen(scale);
+            let ret_dates = col_i32(&batches, &sch, date_col);
+            let tickets = col_i32(&batches, &sch, ticket_col);
+            for r in 0..ret_dates.len() {
+                let b = basket(*salt, tickets[r].unwrap(), *channel_upper, dims);
+                let lag = ret_dates[r].unwrap() - b.date_sk;
+                assert!((1..=120).contains(&lag) || ret_dates[r] == Some(DS_DATE_RANGE),
+                    "{name} row {r}: return lag {lag} outside 1..=120 days");
+            }
+        }
+    }
+
+    #[test]
+    fn web_returns_returning_party_equals_refunded_party() {
+        // Official data: the returning party is the refunded party 100% of the
+        // time; q85 correlates cd1 (refunded) with cd2 (returning).
+        let (sch, batches) = generate_web_returns(0.01);
+        for (refunded, returning) in [
+            ("wr_refunded_customer_sk", "wr_returning_customer_sk"),
+            ("wr_refunded_cdemo_sk", "wr_returning_cdemo_sk"),
+            ("wr_refunded_hdemo_sk", "wr_returning_hdemo_sk"),
+            ("wr_refunded_addr_sk", "wr_returning_addr_sk"),
+        ] {
+            assert_eq!(col_i32(&batches, &sch, refunded), col_i32(&batches, &sch, returning),
+                "{returning} diverges from {refunded}");
+        }
+    }
+
+    #[test]
+    fn item_manufact_bridges_multiple_ids() {
+        use std::collections::{HashMap, HashSet};
+        // q41 bridges items on `i_manufact = i1.i_manufact`; the string must
+        // span several i_manufact_ids. Official degree ~3.3; we run hotter for
+        // reliability but stay inside [2.5, 8.0]. Measured at SF1 density.
+        let (sch, batches) = generate_item(1.0);
+        let manufacts = col_str(&batches, &sch, "i_manufact");
+        let ids = col_i32(&batches, &sch, "i_manufact_id");
+        let mut per_string: HashMap<&str, HashSet<i32>> = HashMap::new();
+        for r in 0..manufacts.len() {
+            per_string.entry(manufacts[r].as_str()).or_default().insert(ids[r].unwrap());
+        }
+        let degree: f64 = per_string.values().map(|s| s.len() as f64).sum::<f64>()
+            / per_string.len() as f64;
+        assert!((2.5..=8.0).contains(&degree),
+            "i_manufact degree {degree} outside [2.5, 8.0]");
+    }
+
+    #[test]
+    fn item_peach_color_matches_official_frequency() {
+        // q24 filters i_color = 'peach'; official SF1 frequency is 2.27%. A
+        // uniform 1/92 draw (1.09%) emptied it.
+        let (sch, batches) = generate_item(1.0);
+        let colors = col_str(&batches, &sch, "i_color");
+        let peach = colors.iter().filter(|c| c.as_str() == "peach").count();
+        let frac = peach as f64 / colors.len() as f64;
+        assert!((0.018..=0.030).contains(&frac),
+            "peach frequency {frac} outside [1.8%, 3.0%]");
+    }
+
+    #[test]
+    fn q54_coincidence_is_planted() {
+        let scale = 1.0;
+        // Item 1 is Women/maternity.
+        let (isch, ib) = generate_item(scale);
+        let cats = col_str(&ib, &isch, "i_category");
+        let classes = col_str(&ib, &isch, "i_class");
+        assert_eq!(cats[0], "Women", "item 1 category");
+        assert_eq!(classes[0], "maternity", "item 1 class");
+        // Address 1 is Williamson County, TN.
+        let (asch, ab) = generate_customer_address(scale);
+        assert_eq!(col_str(&ab, &asch, "ca_county")[0], "Williamson County");
+        assert_eq!(col_str(&ab, &asch, "ca_state")[0], "TN");
+        // Customer 1 points at address 1.
+        let (csch, cb) = generate_customer(scale);
+        assert_eq!(col_i32(&cb, &csch, "c_current_addr_sk")[0], Some(1),
+            "customer 1 c_current_addr_sk");
+        // Catalog order 1: customer 1, item 1, Dec-1998.
+        let dims = FkDims::at(scale);
+        let cat = basket(CATALOG_ORDER_SALT, 1, call_center_rows(scale) as i32, dims);
+        assert_eq!(cat.customer_sk, Some(1), "catalog ticket 1 customer");
+        assert_eq!(cat.items[0], 1, "catalog ticket 1 item 0");
+        assert_eq!(cat.date_sk, Q54_DEC_1998_DATE_SK, "catalog ticket 1 date");
+        // Store ticket 1: customer 1, month_seq-window date.
+        let st = basket(STORE_TICKET_SALT, 1, store_rows(scale) as i32, dims);
+        assert_eq!(st.customer_sk, Some(1), "store ticket 1 customer");
+        assert_eq!(st.date_sk, Q54_FEB_1999_DATE_SK, "store ticket 1 date");
+    }
+
+    #[test]
+    fn q25_coincidence_is_planted() {
+        let scale = 1.0;
+        let dims = FkDims::at(scale);
+        // Store ticket 3 and catalog order 3 carry the same customer+item, in
+        // Apr-2001 and May-2001 respectively.
+        let st = basket(STORE_TICKET_SALT, Q25_STORE_TICKET, store_rows(scale) as i32, dims);
+        assert_eq!(st.customer_sk, Some(Q25_CUSTOMER), "q25 store customer");
+        assert_eq!(st.items[0], Q25_ITEM, "q25 store item");
+        assert_eq!(st.date_sk, Q25_APR_2001_DATE_SK, "q25 store date");
+        let co = basket(CATALOG_ORDER_SALT, Q25_CATALOG_ORDER, call_center_rows(scale) as i32, dims);
+        assert_eq!(co.customer_sk, Some(Q25_CUSTOMER), "q25 catalog customer");
+        assert_eq!(co.items[0], Q25_ITEM, "q25 catalog item");
+        assert_eq!(co.date_sk, Q25_MAY_2001_DATE_SK, "q25 catalog date");
+        // A store return references the planted store ticket.
+        let (sch, batches) = generate_store_returns(scale);
+        assert!(col_i32(&batches, &sch, "sr_ticket_number").contains(&Some(Q25_STORE_TICKET)),
+            "no store return for the q25 planted ticket");
+    }
+
+    #[test]
+    fn q24_coincidence_is_planted() {
+        let scale = 1.0;
+        let dims = FkDims::at(scale);
+        // Item 3 is peach; store 3 is market 8 at Q24_ZIP; address 4 has that
+        // zip; customer 4 points at address 4; store ticket 4 sells item 3 at
+        // store 3 to customer 4.
+        let (isch, ib) = generate_item(scale);
+        assert_eq!(col_str(&ib, &isch, "i_color")[(Q24_ITEM - 1) as usize], "peach", "q24 item color");
+        let (ssch, sb) = generate_store(scale);
+        assert_eq!(col_i32(&sb, &ssch, "s_market_id")[(Q24_STORE_SK - 1) as usize], Some(8), "q24 store market");
+        assert_eq!(col_str(&sb, &ssch, "s_zip")[(Q24_STORE_SK - 1) as usize], Q24_ZIP, "q24 store zip");
+        let (asch, ab) = generate_customer_address(scale);
+        assert_eq!(col_str(&ab, &asch, "ca_zip")[(Q24_ADDR_SK - 1) as usize], Q24_ZIP, "q24 address zip");
+        let (csch, cb) = generate_customer(scale);
+        assert_eq!(col_i32(&cb, &csch, "c_current_addr_sk")[(Q24_CUSTOMER - 1) as usize], Some(Q24_ADDR_SK),
+            "q24 customer address link");
+        let st = basket(STORE_TICKET_SALT, Q24_STORE_TICKET, store_rows(scale) as i32, dims);
+        assert_eq!(st.customer_sk, Some(Q24_CUSTOMER), "q24 store customer");
+        assert_eq!(st.channel_sk, Q24_STORE_SK, "q24 store sk");
+        assert_eq!(st.items[0], Q24_ITEM, "q24 store item");
+        let (srsch, srb) = generate_store_returns(scale);
+        assert!(col_i32(&srb, &srsch, "sr_ticket_number").contains(&Some(Q24_STORE_TICKET)),
+            "no store return for the q24 planted ticket");
     }
 }
