@@ -79,15 +79,66 @@ impl ClassifiedMerge<'_> {
 /// rendering to the scratch table names, matching how the ON condition is
 /// rewritten in the handler.
 fn rewrite_aliases(expr_sql: String, names: &MergeNames<'_>) -> String {
-    expr_sql
-        .replace(
-            &format!("{}.", names.t_alias),
-            &format!("{}.", names.target_ref),
-        )
-        .replace(
-            &format!("{}.", names.s_alias),
-            &format!("{}.", names.source_ref),
-        )
+    let out = replace_alias_qualifier(&expr_sql, names.t_alias, names.target_ref);
+    replace_alias_qualifier(&out, names.s_alias, names.source_ref)
+}
+
+/// Replace `alias.` qualifier occurrences in an expression's SQL rendering
+/// with `replacement.`, respecting identifier boundaries and quoting:
+///
+/// - an occurrence only fires when the preceding character cannot extend an
+///   identifier or dotted path (so alias `s` does not fire inside
+///   `users.name` or `a.s.x`),
+/// - single-quoted string literals and double-quoted identifiers are copied
+///   verbatim (with doubled-quote escapes), so `'s.'` in a literal survives.
+fn replace_alias_qualifier(sql: &str, alias: &str, replacement: &str) -> String {
+    let needle = format!("{alias}.");
+    let mut out = String::with_capacity(sql.len());
+    let mut i = 0;
+    // True when the previous character could extend an identifier or dotted
+    // path, which disqualifies a match starting here.
+    let mut guarded = false;
+    while i < sql.len() {
+        let c = sql[i..].chars().next().expect("index is a char boundary");
+        if c == '\'' || c == '"' {
+            // Copy the whole quoted region verbatim; a doubled quote escapes.
+            let mut j = i + c.len_utf8();
+            loop {
+                match sql[j..].find(c) {
+                    Some(k) => {
+                        j += k + c.len_utf8();
+                        if sql[j..].starts_with(c) {
+                            j += c.len_utf8();
+                        } else {
+                            break;
+                        }
+                    }
+                    None => {
+                        j = sql.len();
+                        break;
+                    }
+                }
+            }
+            out.push_str(&sql[i..j]);
+            i = j;
+            // A closing identifier quote can be followed by a member access
+            // (`"s".x`); a string literal cannot start an alias either way.
+            guarded = true;
+            continue;
+        }
+        if !guarded && sql[i..].starts_with(&needle) {
+            out.push_str(replacement);
+            out.push('.');
+            i += needle.len();
+            // The replacement ends in `.`; what follows is a member access.
+            guarded = true;
+            continue;
+        }
+        out.push(c);
+        guarded = c.is_ascii_alphanumeric() || matches!(c, '_' | '$' | '.');
+        i += c.len_utf8();
+    }
+    out
 }
 
 /// Classify the statement's clauses by row class, preserving statement order
@@ -349,9 +400,8 @@ pub(crate) fn resolve_update_expr(
         if col_name == col {
             let expr_sql = format!("{}", a.value);
             // Rewrite alias references to MemTable names
-            return expr_sql
-                .replace(&format!("{t_alias}."), &format!("{target_table_ref}."))
-                .replace(&format!("{s_alias}."), &format!("{source_table_ref}."));
+            let out = replace_alias_qualifier(&expr_sql, t_alias, target_table_ref);
+            return replace_alias_qualifier(&out, s_alias, source_table_ref);
         }
     }
     // Column not in SET assignments — pass through from target
@@ -376,8 +426,8 @@ pub(crate) fn resolve_insert_expr(
     target_table_ref: &str,
 ) -> String {
     let rewrite = |expr: String| -> String {
-        expr.replace(&format!("{s_alias}."), &format!("{source_table_ref}."))
-            .replace(&format!("{t_alias}."), &format!("{target_table_ref}."))
+        let out = replace_alias_qualifier(&expr, s_alias, source_table_ref);
+        replace_alias_qualifier(&out, t_alias, target_table_ref)
     };
 
     match insert_kind {
@@ -543,9 +593,7 @@ mod tests {
     }
 
     #[test]
-    fn classify_rejects_invalid_combination() {
-        // NOT MATCHED + DELETE parses under some dialect paths only; build the
-        // clause by hand to hit the validation arm.
+    fn classify_accepts_plain_matched_update() {
         let clauses = merge_clauses(
             "MERGE INTO tgt AS t USING src AS s ON t.id = s.id \
              WHEN MATCHED THEN UPDATE SET v = s.v",
@@ -554,6 +602,60 @@ mod tests {
         let sc = cols(&["id", "v"]);
         let n = names(&tc, &sc);
         assert!(classify_merge_clauses(&clauses, &n).is_ok());
+    }
+
+    #[test]
+    fn classify_rejects_invalid_clause_action_combination() {
+        // Every invalid combination is rejected by sqlparser at parse time,
+        // so mutate a parsed clause to reach classify's validation arm:
+        // NOT MATCHED + DELETE is not a legal pairing.
+        let mut clauses = merge_clauses(
+            "MERGE INTO tgt AS t USING src AS s ON t.id = s.id \
+             WHEN MATCHED THEN DELETE",
+        );
+        clauses[0].clause_kind = MergeClauseKind::NotMatched;
+        let tc = cols(&["id"]);
+        let sc = cols(&["id"]);
+        let n = names(&tc, &sc);
+        let Err(err) = classify_merge_clauses(&clauses, &n) else {
+            panic!("NOT MATCHED + DELETE must be rejected");
+        };
+        assert!(
+            err.to_string().contains("Unsupported MERGE clause combination"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn alias_rewrite_is_identifier_aware() {
+        // Alias `s` must not fire inside `users.name` (substring), inside a
+        // dotted path `a.s.x` (member access), or inside a string literal.
+        let sql = "MERGE INTO tgt AS t USING src AS s ON t.id = s.id \
+                   WHEN MATCHED AND users.name = s.name AND a.s.x = 's.literal' \
+                     THEN UPDATE SET v = s.v";
+        let out = build(sql, &["id", "v"], &["id", "v", "name"]);
+        assert!(out.contains("users.name"), "substring alias misfired: {out}");
+        assert!(out.contains("a.s.x"), "dotted-path alias misfired: {out}");
+        assert!(out.contains("'s.literal'"), "literal rewritten: {out}");
+        assert!(
+            out.contains("__merge_source_x.name"),
+            "genuine alias not rewritten: {out}"
+        );
+    }
+
+    #[test]
+    fn replace_alias_qualifier_boundaries() {
+        assert_eq!(
+            replace_alias_qualifier("s.x + users.x + a.s.x + 's.x'", "s", "R"),
+            "R.x + users.x + a.s.x + 's.x'"
+        );
+        assert_eq!(replace_alias_qualifier("(s.x)", "s", "R"), "(R.x)");
+        assert_eq!(replace_alias_qualifier("_s.x", "s", "R"), "_s.x");
+        assert_eq!(replace_alias_qualifier("\"s\".x", "s", "R"), "\"s\".x");
+        assert_eq!(
+            replace_alias_qualifier("'it''s.x' = s.y", "s", "R"),
+            "'it''s.x' = R.y"
+        );
     }
 
     #[test]
