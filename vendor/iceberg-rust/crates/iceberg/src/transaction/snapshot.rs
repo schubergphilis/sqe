@@ -22,6 +22,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
+use futures::StreamExt;
 use uuid::Uuid;
 
 use crate::error::Result;
@@ -658,9 +659,11 @@ partition_struct: {:?}, partition_type: {:?}",
             );
         }
 
-        // RowDelta/MoR: position and equality delete files must be counted in
-        // the snapshot summary so downstream tooling (Spark, matrix checks,
-        // dbt) can see added-delete-files, total-position-deletes, etc.
+        // Also account for added delete files (position / equality deletes),
+        // so the `added-*` / `total-*` delete counters in the snapshot summary
+        // stay consistent with the delete manifests written below. The
+        // collector branches on `data_file.content` to update the matching
+        // counters.
         for delete_file in &self.added_delete_files {
             summary_collector.add_file(
                 delete_file,
@@ -947,21 +950,29 @@ partition_struct: {:?}, partition_type: {:?}",
 
         let mut duplicate_files = Vec::new();
 
-        // Load all manifests concurrently, then scan entries
+        // Scan the current snapshot's manifests to detect duplicate adds and
+        // validate deletes.
         if let Some(current_snapshot) = branch_snapshot_ref {
             let manifest_list = current_snapshot
                 .load_manifest_list(table.file_io(), table.metadata_ref().as_ref())
                 .await?;
 
             let manifest_files: Vec<_> = manifest_list.entries().to_vec();
-            let loaded_manifests = load_manifests(
-                table.file_io(),
-                manifest_files,
-                crate::util::DEFAULT_LOAD_CONCURRENCY_LIMIT,
-            )
-            .await?;
+            // Stream the current snapshot's manifests instead of loading them all
+            // up front: each manifest is dropped immediately after it is scanned,
+            // and the early-exit below stops pulling further manifests once both
+            // validation checks are satisfied. This bounds peak memory and avoids
+            // loading the whole manifest set for large snapshots.
+            let file_io = table.file_io().clone();
+            let mut manifest_stream = futures::stream::iter(manifest_files)
+                .map(|manifest_file| {
+                    let file_io = file_io.clone();
+                    async move { manifest_file.load_manifest(&file_io).await }
+                })
+                .buffer_unordered(crate::util::DEFAULT_LOAD_CONCURRENCY_LIMIT);
 
-            'outer: for (_, manifest) in &loaded_manifests {
+            'outer: while let Some(manifest) = manifest_stream.next().await {
+                let manifest = manifest?;
                 for entry in manifest.entries() {
                     if !entry.is_alive() {
                         continue;
@@ -1374,6 +1385,156 @@ mod tests {
         assert_eq!(
             total_data_files, PARENT_TOTAL_DATA_FILES,
             "total-data-files must stay at {PARENT_TOTAL_DATA_FILES} (added=1 − removed=1)",
+        );
+    }
+
+    /// Regression test: delete files added by a commit must be reflected in
+    /// the snapshot summary. `summary()` previously only fed
+    /// `added_data_files` into the collector, so `added-delete-files` /
+    /// `added-position-deletes` / `added-equality-deletes` were never emitted
+    /// and the `total-*` delete counters rolled forward as zero on every
+    /// commit, no matter how many delete files the manifests carried.
+    #[tokio::test]
+    async fn test_summary_accounts_for_added_delete_files() {
+        const PARENT_SNAPSHOT_ID: i64 = 42;
+        const PARENT_TOTAL_DELETE_FILES: u64 = 2;
+        const PARENT_TOTAL_POSITION_DELETES: u64 = 7;
+        const PARENT_TOTAL_EQUALITY_DELETES: u64 = 3;
+        const POS_DELETE_RECORDS: u64 = 4;
+        const EQ_DELETE_RECORDS: u64 = 2;
+
+        // Parent snapshot on `main` that already reports cumulative delete
+        // totals, so the test also covers the roll-forward arithmetic.
+        let base = make_v2_minimal_table();
+        let parent_summary = Summary {
+            operation: Operation::Append,
+            additional_properties: HashMap::from([
+                (
+                    "total-delete-files".to_string(),
+                    PARENT_TOTAL_DELETE_FILES.to_string(),
+                ),
+                (
+                    "total-position-deletes".to_string(),
+                    PARENT_TOTAL_POSITION_DELETES.to_string(),
+                ),
+                (
+                    "total-equality-deletes".to_string(),
+                    PARENT_TOTAL_EQUALITY_DELETES.to_string(),
+                ),
+            ]),
+        };
+        let parent_snapshot = Snapshot::builder()
+            .with_snapshot_id(PARENT_SNAPSHOT_ID)
+            .with_timestamp_ms(base.metadata().last_updated_ms() + 1)
+            .with_sequence_number(1)
+            .with_schema_id(0)
+            .with_manifest_list("memory:///unused-by-summary.avro")
+            .with_summary(parent_summary)
+            .build();
+
+        let metadata_with_parent = base
+            .metadata()
+            .clone()
+            .into_builder(Some("s3://bucket/test/location/metadata/v1.json".into()))
+            .add_snapshot(parent_snapshot)
+            .unwrap()
+            .set_ref(MAIN_BRANCH, SnapshotReference {
+                snapshot_id: PARENT_SNAPSHOT_ID,
+                retention: SnapshotRetention::Branch {
+                    min_snapshots_to_keep: None,
+                    max_snapshot_age_ms: None,
+                    max_ref_age_ms: None,
+                },
+            })
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+        let table = base.with_metadata(Arc::new(metadata_with_parent));
+
+        let make_file = |path: &str, content: DataContentType, records: u64| {
+            DataFileBuilder::default()
+                .partition_spec_id(table.metadata().default_partition_spec_id())
+                .content(content)
+                .file_path(path.to_string())
+                .file_format(DataFileFormat::Parquet)
+                .file_size_in_bytes(100)
+                .record_count(records)
+                .partition(Struct::from_iter([Some(Literal::long(300))]))
+                .build()
+                .unwrap()
+        };
+        let added_data = make_file("test/data.parquet", DataContentType::Data, 10);
+        let added_pos_delete = make_file(
+            "test/pos-del.parquet",
+            DataContentType::PositionDeletes,
+            POS_DELETE_RECORDS,
+        );
+        let added_eq_delete = make_file(
+            "test/eq-del.parquet",
+            DataContentType::EqualityDeletes,
+            EQ_DELETE_RECORDS,
+        );
+
+        let producer = SnapshotProducer::new(
+            &table,
+            Uuid::now_v7(),
+            None,
+            None,
+            HashMap::new(),
+            vec![added_data],
+            vec![added_pos_delete, added_eq_delete],
+            vec![],
+            vec![],
+        );
+
+        let summary = producer.summary(&RewriteFilesOperation).unwrap();
+        let props = &summary.additional_properties;
+
+        // Added delete-file accounting — absent before the fix.
+        assert_eq!(
+            props.get("added-delete-files").map(String::as_str),
+            Some("2"),
+            "added-delete-files must count both delete files",
+        );
+        assert_eq!(
+            props.get("added-position-delete-files").map(String::as_str),
+            Some("1"),
+        );
+        assert_eq!(
+            props.get("added-equality-delete-files").map(String::as_str),
+            Some("1"),
+        );
+        assert_eq!(
+            props.get("added-position-deletes").map(String::as_str),
+            Some(POS_DELETE_RECORDS.to_string().as_str()),
+        );
+        assert_eq!(
+            props.get("added-equality-deletes").map(String::as_str),
+            Some(EQ_DELETE_RECORDS.to_string().as_str()),
+        );
+
+        // Totals roll forward from the parent instead of staying at zero.
+        assert_eq!(
+            props.get("total-delete-files").map(String::as_str),
+            Some((PARENT_TOTAL_DELETE_FILES + 2).to_string().as_str()),
+            "total-delete-files must roll forward from the parent",
+        );
+        assert_eq!(
+            props.get("total-position-deletes").map(String::as_str),
+            Some(
+                (PARENT_TOTAL_POSITION_DELETES + POS_DELETE_RECORDS)
+                    .to_string()
+                    .as_str()
+            ),
+        );
+        assert_eq!(
+            props.get("total-equality-deletes").map(String::as_str),
+            Some(
+                (PARENT_TOTAL_EQUALITY_DELETES + EQ_DELETE_RECORDS)
+                    .to_string()
+                    .as_str()
+            ),
         );
     }
 
