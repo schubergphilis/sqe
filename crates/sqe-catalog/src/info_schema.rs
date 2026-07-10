@@ -498,6 +498,14 @@ fn iceberg_to_sql_type_info(t: &iceberg::spec::Type) -> SqlTypeInfo {
             numeric_scale: None,
             datetime_precision: None,
         },
+        Type::Variant(_) => SqlTypeInfo {
+            data_type: "variant".to_string(),
+            udt_name: "variant".to_string(),
+            character_maximum_length: None,
+            numeric_precision: None,
+            numeric_scale: None,
+            datetime_precision: None,
+        },
     }
 }
 

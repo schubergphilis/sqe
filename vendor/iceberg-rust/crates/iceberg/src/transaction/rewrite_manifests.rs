@@ -27,8 +27,10 @@ use crate::spec::{
     ManifestWriter, Operation,
 };
 use crate::table::Table;
-use crate::transaction::{ActionCommit, TransactionAction};
-use crate::util::{DEFAULT_LOAD_CONCURRENCY_LIMIT, load_manifests};
+use crate::transaction::{
+    ActionCommit, MANIFEST_TARGET_SIZE_BYTES, MANIFEST_TARGET_SIZE_BYTES_DEFAULT, TransactionAction,
+};
+use crate::util::{DEFAULT_LOAD_CONCURRENCY_LIMIT, try_for_each_manifest};
 use crate::{Error, ErrorKind};
 
 const KEPT_MANIFESTS_COUNT: &str = "manifests-kept";
@@ -381,9 +383,40 @@ impl TransactionAction for RewriteManifestsAction {
         let mut entry_count: usize = 0;
 
         if let Some(cluster_func) = &self.cluster_by_func {
-            // Writers keyed by (cluster_key, partition_spec_id).
-            // BTreeMap ensures deterministic manifest ordering across runs.
+            // Target size for a single output manifest. Once an in-progress
+            // writer reaches this, it is sealed and a fresh writer is started
+            // for the same cluster key. Mirrors Spark/Iceberg
+            // `commit.manifest.target-size-bytes` (default 8 MiB) so a hot
+            // partition no longer produces one unbounded manifest.
+            //
+            // Resolution order: the per-commit snapshot property set on this
+            // action via `set_snapshot_properties` wins, so a caller can size
+            // the manifests for a single rewrite without persisting a table
+            // property (the snapshot property is also recorded in the snapshot
+            // summary); otherwise fall back to the table property, then the
+            // Iceberg default.
+            let target_manifest_size_bytes: u64 = self
+                .snapshot_properties
+                .get(MANIFEST_TARGET_SIZE_BYTES)
+                .or_else(|| {
+                    table
+                        .metadata()
+                        .properties()
+                        .get(MANIFEST_TARGET_SIZE_BYTES)
+                })
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(MANIFEST_TARGET_SIZE_BYTES_DEFAULT as u64);
+
+            // Currently-open writer per (cluster_key, partition_spec_id).
+            // BTreeMap gives deterministic ordering for the writers that are
+            // still open when streaming finishes.
             let mut writers: BTreeMap<(String, i32), ManifestWriter> = BTreeMap::new();
+            // Writers that reached the target size mid-stream and were sealed.
+            // They are finalized after the streaming loop because
+            // `write_manifest_file` is async and the routing closure is sync.
+            // Their (unbounded) count is what makes a hot partition span
+            // multiple manifests instead of one.
+            let mut full_writers: Vec<ManifestWriter> = Vec::new();
 
             // Filter out deleted manifests, then process remaining
             let remaining_manifests: Vec<ManifestFile> = current_manifests
@@ -409,39 +442,61 @@ impl TransactionAction for RewriteManifestsAction {
                 manifests_to_rewrite.push(manifest_file);
             }
 
-            // Load all manifests to rewrite concurrently.
-            let loaded_manifests = load_manifests(
+            // Stream the manifests to rewrite, routing their entries into the
+            // writers and dropping each loaded manifest immediately instead of
+            // holding all of them in memory at once (a large rewrite batch would
+            // otherwise retain every loaded manifest for the whole loop).
+            // Writers are stateful, so the closure runs sequentially.
+            try_for_each_manifest(
                 table.file_io(),
                 manifests_to_rewrite,
                 DEFAULT_LOAD_CONCURRENCY_LIMIT,
+                |manifest_file, manifest| {
+                    let spec_id = manifest_file.partition_spec_id;
+                    for entry in manifest.entries() {
+                        if !entry.is_alive() {
+                            continue;
+                        }
+
+                        let key = cluster_func(entry.data_file());
+                        let writer_key = (key, spec_id);
+
+                        if !writers.contains_key(&writer_key) {
+                            let w = snapshot_producer
+                                .new_manifest_writer(ManifestContentType::Data, spec_id)?;
+                            writers.insert(writer_key.clone(), w);
+                        }
+                        let writer = writers
+                            .get_mut(&writer_key)
+                            .expect("writer was just inserted for this key");
+                        writer.add_existing_entry(entry.as_ref().clone())?;
+                        entry_count += 1;
+
+                        // Roll over once this manifest reaches the target size:
+                        // seal it now (deferred finalize) and let the next entry
+                        // for this key open a fresh writer.
+                        if writer.estimated_manifest_size() >= target_manifest_size_bytes {
+                            let sealed = writers
+                                .remove(&writer_key)
+                                .expect("writer present for this key");
+                            full_writers.push(sealed);
+                        }
+                    }
+                    Ok(())
+                },
             )
             .await?;
 
-            // Route entries to writers (sequential — writers are stateful).
-            for (manifest_file, manifest) in &loaded_manifests {
-                let spec_id = &manifest_file.partition_spec_id;
-                for entry in manifest.entries() {
-                    if !entry.is_alive() {
-                        continue;
-                    }
-
-                    let key = cluster_func(entry.data_file());
-                    let writer_key = (key, *spec_id);
-
-                    let writer = match writers.entry(writer_key) {
-                        std::collections::btree_map::Entry::Occupied(e) => e.into_mut(),
-                        std::collections::btree_map::Entry::Vacant(e) => {
-                            let w = snapshot_producer
-                                .new_manifest_writer(ManifestContentType::Data, *spec_id)?;
-                            e.insert(w)
-                        }
-                    };
-                    writer.add_existing_entry(entry.as_ref().clone())?;
-                    entry_count += 1;
-                }
+            // Finalize sealed writers first, then the writers still open at the
+            // end. Manifest ordering is not required for correctness (existing
+            // entries keep their sequence numbers, and kept manifests are placed
+            // before new ones below for first_row_id assignment). Sealed-writer
+            // order follows stream completion (`buffer_unordered`); remaining
+            // writers follow BTreeMap key order.
+            for writer in full_writers {
+                let manifest_file = writer.write_manifest_file().await?;
+                new_manifests.push(manifest_file);
             }
-
-            // Close all writers and collect new manifests (deterministic order)
             for (_key, writer) in writers {
                 let manifest_file = writer.write_manifest_file().await?;
                 new_manifests.push(manifest_file);
