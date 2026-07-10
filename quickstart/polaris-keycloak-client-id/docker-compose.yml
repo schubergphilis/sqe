@@ -87,7 +87,7 @@ services:
   # quickstart dependency-free; principals are recreated by polaris-setup on
   # each fresh start.
   polaris:
-    image: apache/polaris:1.5.0
+    image: apache/polaris:1.6.0
     environment:
       POLARIS_PERSISTENCE_TYPE: in-memory
       POLARIS_BOOTSTRAP_CREDENTIALS: iceberg,root,${POLARIS_BOOTSTRAP_SECRET:-polaris-root-secret}
