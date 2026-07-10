@@ -28,6 +28,7 @@ use datafusion::physical_plan::{
 };
 use datafusion_expr::ColumnarValue;
 use futures::{Stream, StreamExt, TryStreamExt};
+use iceberg::arrow::DecodeGate;
 use iceberg::expr::Predicate;
 use iceberg::scan::{FileScanTask, FileScanTaskStream};
 use iceberg::spec::{DataContentType, DataFile, DataFileFormat, ManifestContentType, ManifestStatus};
@@ -176,6 +177,13 @@ pub struct IcebergScanExec {
     /// to seal before scan-time pruning samples them. Sourced from
     /// `[catalog.runtime_filters] wait_ms`. 0 disables. Default 100.
     runtime_filter_wait_ms: u64,
+    /// Decode-concurrency permits shared by every partition (and every
+    /// optimizer-rule clone) of this scan node, sized `num_cpus`. Without
+    /// it each partition's reader brings its own `num_cpus`-wide semaphore,
+    /// multiplying in-flight row-group decompressions to
+    /// `target_partitions x num_cpus` (issue #367). Deliberately per scan
+    /// node, not process-global: see `scan_memory` module docs.
+    decode_permits: Arc<tokio::sync::Semaphore>,
 }
 
 impl IcebergScanExec {
@@ -246,7 +254,10 @@ impl IcebergScanExec {
             }
         };
         let properties = Arc::new(PlanProperties::new(eq_props, Partitioning::UnknownPartitioning(DEFAULT_TARGET_PARTITIONS), EmissionType::Incremental, Boundedness::Bounded));
-        Self { table, projected_schema, projection, predicates, df_filters, properties, metrics: ExecutionPlanMetricsSet::new(), snapshot_id: None, trust_sort_order: false, small_file_threshold_bytes: DEFAULT_SMALL_FILE_THRESHOLD_BYTES, pushed_down_filters: vec![], manifest_concurrency: DEFAULT_MANIFEST_CONCURRENCY, direct_read_concurrency: DEFAULT_DIRECT_READ_CONCURRENCY, target_partitions: DEFAULT_TARGET_PARTITIONS, cached_statistics: None, runtime_filter_clustering_skip: false, runtime_filter_uniform_threshold: 0.8, runtime_filter_wait_ms: DEFAULT_RUNTIME_FILTER_WAIT_MS }
+        let decode_permits = Arc::new(tokio::sync::Semaphore::new(
+            std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8),
+        ));
+        Self { table, projected_schema, projection, predicates, df_filters, properties, metrics: ExecutionPlanMetricsSet::new(), snapshot_id: None, trust_sort_order: false, small_file_threshold_bytes: DEFAULT_SMALL_FILE_THRESHOLD_BYTES, pushed_down_filters: vec![], manifest_concurrency: DEFAULT_MANIFEST_CONCURRENCY, direct_read_concurrency: DEFAULT_DIRECT_READ_CONCURRENCY, target_partitions: DEFAULT_TARGET_PARTITIONS, cached_statistics: None, runtime_filter_clustering_skip: false, runtime_filter_uniform_threshold: 0.8, runtime_filter_wait_ms: DEFAULT_RUNTIME_FILTER_WAIT_MS, decode_permits }
     }
 
     /// Attach pre-computed statistics aggregated from Iceberg manifests.
@@ -417,6 +428,9 @@ impl IcebergScanExec {
             runtime_filter_clustering_skip: self.runtime_filter_clustering_skip,
             runtime_filter_uniform_threshold: self.runtime_filter_uniform_threshold,
             runtime_filter_wait_ms: self.runtime_filter_wait_ms,
+            // Shared, not fresh: the rebuilt scan reads the same table in the
+            // same query, so it stays under the same decode budget.
+            decode_permits: self.decode_permits.clone(),
         }
     }
 
@@ -800,7 +814,7 @@ impl ExecutionPlan for IcebergScanExec {
         )
     }
 
-    fn execute(&self, partition: usize, _context: Arc<TaskContext>) -> DFResult<SendableRecordBatchStream> {
+    fn execute(&self, partition: usize, context: Arc<TaskContext>) -> DFResult<SendableRecordBatchStream> {
         let span = info_span!("iceberg_scan", table=%self.table.identifier(), partition=partition, predicates=?self.predicates);
         let _guard = span.enter();
         if partition >= self.target_partitions {
@@ -822,6 +836,16 @@ impl ExecutionPlan for IcebergScanExec {
         let runtime_filter_clustering_skip = self.runtime_filter_clustering_skip;
         let runtime_filter_uniform_threshold = self.runtime_filter_uniform_threshold;
         let runtime_filter_wait_ms = self.runtime_filter_wait_ms;
+        // Decode admission (issue #367): every partition shares this scan
+        // node's permits, and each admitted decode reserves its estimated
+        // working set against the query's memory pool so pressure fails
+        // typed instead of OOM-killing the host.
+        let decode_gate = crate::scan_memory::ScanDecodeGate::new(
+            self.decode_permits.clone(),
+            context.runtime_env().memory_pool.clone(),
+            format!("iceberg-scan-decode:{}", self.table.identifier()),
+            crate::scan_memory::decode_tracking_enabled(),
+        );
         let baseline = BaselineMetrics::new(&self.metrics, partition);
         let _files_pruned_minmax = MetricBuilder::new(&self.metrics).counter("files_pruned_minmax", partition);
         let files_pruned_dynamic = MetricBuilder::new(&self.metrics).counter("files_pruned_dynamic", partition);
@@ -1100,6 +1124,7 @@ impl ExecutionPlan for IcebergScanExec {
                 let bytes_scanned = bytes_scanned.clone();
                 let rows_prefilter = rows_prefilter.clone();
                 let rows_decoded = rows_decoded.clone();
+                let direct_decode_gate = Arc::clone(&decode_gate);
                 let per_file_stream = futures::stream::iter(
                     file_entries.into_iter().map(move |(path, size)| {
                         let file_io = file_io.clone();
@@ -1109,8 +1134,15 @@ impl ExecutionPlan for IcebergScanExec {
                         let bytes_scanned = bytes_scanned.clone();
                         let rows_prefilter = rows_prefilter.clone();
                         let rows_decoded = rows_decoded.clone();
+                        let decode_gate = Arc::clone(&direct_decode_gate);
                         async move {
                             debug!(path = %path, size = size, "Direct-read: reading file");
+
+                            // Decode admission (issue #367): bounds in-flight
+                            // direct reads across every partition of this scan
+                            // and reserves the estimated working set (the
+                            // whole file is read into memory, then decoded).
+                            let mut admission = decode_gate.admit(size).await?;
 
                             let input = file_io
                                 .new_input(&path)
@@ -1214,7 +1246,18 @@ impl ExecutionPlan for IcebergScanExec {
                                     batches.push(batch);
                                 }
                             }
-                            Ok::<Vec<RecordBatch>, DataFusionError>(batches)
+                            // The compressed bytes are gone once the reader is
+                            // drained; what this task still holds is the decoded
+                            // batches. Correct the compressed-size estimate to
+                            // that actual footprint; the admission travels with
+                            // the batches and releases once they are yielded
+                            // downstream (see flatten_per_file_batches).
+                            let held: usize =
+                                batches.iter().map(|b| b.get_array_memory_size()).sum();
+                            admission.try_resize(held)?;
+                            Ok::<(Vec<RecordBatch>, crate::scan_memory::DecodeAdmission), DataFusionError>(
+                                (batches, admission),
+                            )
                         }
                     }),
                 )
@@ -1256,6 +1299,11 @@ impl ExecutionPlan for IcebergScanExec {
             // output partition; this is purely intra-scan decode fan-out, so the
             // plan shape (and join distribution) is unchanged.
             sb = sb.with_task_split_target_size(Some(DEFAULT_SCAN_SPLIT_TARGET_SIZE));
+            // Decode admission (issue #367): the vendored reader consults the
+            // gate before every file scan (sub)task, so this partition's
+            // decodes share the scan-wide permit budget and reserve their
+            // estimated working set against the query pool.
+            sb = sb.with_decode_gate(Arc::clone(&decode_gate) as Arc<dyn DecodeGate>);
             // Two-tier dynamic-filter pushdown.
             //
             // Tier 1 (scan-time): the DynamicPredicate is sampled once
@@ -1567,6 +1615,11 @@ impl ExecutionPlan for IcebergScanExec {
 /// `IcebergRecordBatchStream`, both of which carry `DFResult` per item, so the
 /// error still terminates the scan.
 ///
+/// Each file's [`DecodeAdmission`](crate::scan_memory::DecodeAdmission) rides
+/// behind its batches and drops once they have all been yielded (or the
+/// stream is dropped), releasing that file's pool reservation exactly when
+/// the scan stops holding its memory.
+///
 /// Note: streaming is at file granularity, not row granularity. Each file is
 /// still read fully into memory by `input.read().await` before decode; the
 /// per-file size cap is the small-file threshold gate, not this function.
@@ -1574,11 +1627,17 @@ fn flatten_per_file_batches<S>(
     per_file_stream: S,
 ) -> futures::stream::BoxStream<'static, DFResult<RecordBatch>>
 where
-    S: Stream<Item = DFResult<Vec<RecordBatch>>> + Send + 'static,
+    S: Stream<Item = DFResult<(Vec<RecordBatch>, crate::scan_memory::DecodeAdmission)>>
+        + Send
+        + 'static,
 {
     per_file_stream
-        .map_ok(|batches| {
+        .map_ok(|(batches, admission)| {
             futures::stream::iter(batches.into_iter().map(Ok::<RecordBatch, DataFusionError>))
+                .chain(futures::stream::poll_fn(move |_| {
+                    let _hold_until_yielded = &admission;
+                    Poll::Ready(None)
+                }))
         })
         .try_flatten()
         .boxed()
@@ -2360,6 +2419,29 @@ mod tests {
         assert_eq!(counter.value(), 5, "two counted batches: 3 + 2 rows");
     }
 
+    /// Mint a [`DecodeAdmission`](crate::scan_memory::DecodeAdmission) against
+    /// the given pool for the flatten tests, mirroring what the direct-read
+    /// path attaches to each per-file batch vector.
+    async fn admission_on(
+        pool: &Arc<dyn datafusion::execution::memory_pool::MemoryPool>,
+    ) -> crate::scan_memory::DecodeAdmission {
+        crate::scan_memory::ScanDecodeGate::new(
+            Arc::new(tokio::sync::Semaphore::new(8)),
+            Arc::clone(pool),
+            "iceberg-scan-decode:test".into(),
+            true,
+        )
+        .admit(16)
+        .await
+        .expect("test pool admits")
+    }
+
+    fn test_pool() -> Arc<dyn datafusion::execution::memory_pool::MemoryPool> {
+        Arc::new(datafusion::execution::memory_pool::GreedyMemoryPool::new(
+            1 << 20,
+        ))
+    }
+
     /// Each per-file `Vec<RecordBatch>` is spliced into one flat stream in file
     /// order, with every batch and every row preserved. This is the correctness
     /// guarantee the streaming rewrite must keep relative to the old
@@ -2370,10 +2452,15 @@ mod tests {
             Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
 
         // Two files: the first yields two batches, the second yields one.
-        let per_file: Vec<DFResult<Vec<RecordBatch>>> = vec![
-            Ok(vec![batch(&schema, &[1, 2]), batch(&schema, &[3])]),
-            Ok(vec![batch(&schema, &[4, 5, 6])]),
+        let pool = test_pool();
+        let per_file: Vec<DFResult<(Vec<RecordBatch>, crate::scan_memory::DecodeAdmission)>> = vec![
+            Ok((
+                vec![batch(&schema, &[1, 2]), batch(&schema, &[3])],
+                admission_on(&pool).await,
+            )),
+            Ok((vec![batch(&schema, &[4, 5, 6])], admission_on(&pool).await)),
         ];
+        assert!(pool.reserved() > 0, "admissions hold reservations");
 
         let flat = flatten_per_file_batches(futures::stream::iter(per_file));
         let out: Vec<RecordBatch> = flat.try_collect().await.unwrap();
@@ -2392,6 +2479,11 @@ mod tests {
 
         assert_eq!(out.len(), 3, "all three batches survive the flatten");
         assert_eq!(rows, vec![1, 2, 3, 4, 5, 6], "rows preserved in file order");
+        assert_eq!(
+            pool.reserved(),
+            0,
+            "every file's reservation released once its batches were yielded"
+        );
     }
 
     /// The stream must be lazy: polling for the first batch must NOT have driven
@@ -2407,10 +2499,11 @@ mod tests {
         let produced_in = Arc::clone(&produced);
 
         // Three files; `inspect` fires as each is pulled by the downstream.
+        let pool = test_pool();
         let upstream = futures::stream::iter(vec![
-            Ok::<Vec<RecordBatch>, DataFusionError>(vec![batch(&schema, &[1])]),
-            Ok(vec![batch(&schema, &[2])]),
-            Ok(vec![batch(&schema, &[3])]),
+            Ok::<_, DataFusionError>((vec![batch(&schema, &[1])], admission_on(&pool).await)),
+            Ok((vec![batch(&schema, &[2])], admission_on(&pool).await)),
+            Ok((vec![batch(&schema, &[3])], admission_on(&pool).await)),
         ])
         .inspect(move |_| {
             produced_in.fetch_add(1, Ordering::SeqCst);
@@ -2439,10 +2532,11 @@ mod tests {
         let schema: SchemaRef =
             Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
 
-        let per_file: Vec<DFResult<Vec<RecordBatch>>> = vec![
-            Ok(vec![batch(&schema, &[1])]),
+        let pool = test_pool();
+        let per_file: Vec<DFResult<(Vec<RecordBatch>, crate::scan_memory::DecodeAdmission)>> = vec![
+            Ok((vec![batch(&schema, &[1])], admission_on(&pool).await)),
             Err(DataFusionError::Internal("file read failed".into())),
-            Ok(vec![batch(&schema, &[2])]),
+            Ok((vec![batch(&schema, &[2])], admission_on(&pool).await)),
         ];
 
         let mut flat = flatten_per_file_batches(futures::stream::iter(per_file));
