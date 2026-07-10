@@ -1,0 +1,72 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "sqe.fullname" . }}-config
+  labels:
+    {{- include "sqe.labels" . | nindent 4 }}
+data:
+  sqe.toml: |
+    [coordinator]
+    flight_sql_port = {{ .Values.config.coordinator.flight_sql_port }}
+    trino_http_port = {{ .Values.config.coordinator.trino_http_port }}
+    mode = {{ .Values.config.coordinator.mode | quote }}
+    # DEP-02: the engine's tracked memory_limit defaults to 8GB in code, but
+    # the coordinator pod is capped at 2Gi by default -- DataFusion would
+    # allocate toward 8GB and the kernel OOMKills the pod long before spill
+    # fires. Render a coordinator memory_limit sized below the pod limit
+    # (~70-75%) so spill triggers before the cgroup OOM. DEP-01 gives /tmp the
+    # writable volume the spill needs.
+    memory_limit = {{ .Values.config.coordinator.memory_limit | quote }}
+    spill_to_disk = {{ .Values.config.coordinator.spill_to_disk }}
+    spill_dir = {{ .Values.config.coordinator.spill_dir | quote }}
+    {{- if .Values.worker.enabled }}
+    worker_urls = [{{ range $i, $e := until (int .Values.worker.replicas) }}{{ if $i }}, {{ end }}"http://{{ include "sqe.fullname" $ }}-worker-{{ $e }}.{{ include "sqe.fullname" $ }}-worker-headless:50052"{{ end }}]
+    {{- end }}
+
+    [worker]
+    {{- if .Values.worker.enabled }}
+    # ISSUE-218: only render coordinator_url in distributed mode. The engine's
+    # config validation rejects a non-empty coordinator_url with an empty
+    # worker_secret, so emitting this in single-node mode would crash a plain
+    # `helm install` that never set a secret. In distributed mode the secret
+    # arrives as the SQE_WORKER__WORKER_SECRET env override.
+    coordinator_url = "http://{{ include "sqe.fullname" . }}-coordinator:50051"
+    {{- end }}
+    heartbeat_interval_secs = {{ .Values.config.worker.heartbeat_interval_secs }}
+    # DEP-02: worker engine memory_limit must sit below the worker pod limit
+    # (~75%) to leave headroom for Arrow buffers outside DataFusion's accounted
+    # pool; an 8GB engine limit in an 8Gi pod leaves zero headroom and OOMKills.
+    memory_limit = {{ .Values.config.worker.memory_limit | quote }}
+    spill_dir = {{ .Values.config.worker.spill_dir | quote }}
+
+    [auth]
+    keycloak_url = {{ .Values.config.auth.keycloak_url | quote }}
+    realm = {{ .Values.config.auth.realm | quote }}
+    client_id = {{ .Values.config.auth.client_id | quote }}
+    token_refresh_buffer_secs = {{ .Values.config.auth.token_refresh_buffer_secs }}
+    ssl_verification = {{ .Values.config.auth.ssl_verification }}
+
+    [catalog]
+    catalog_url = {{ .Values.config.catalog.catalog_url | quote }}
+    warehouse = {{ .Values.config.catalog.warehouse | quote }}
+    metadata_cache_ttl_secs = {{ .Values.config.catalog.metadata_cache_ttl_secs }}
+
+    [storage]
+    s3_endpoint = {{ .Values.config.storage.s3_endpoint | quote }}
+    s3_region = {{ .Values.config.storage.s3_region | quote }}
+    s3_path_style = {{ .Values.config.storage.s3_path_style }}
+
+    [policy]
+    engine = {{ .Values.config.policy.engine | quote }}
+
+    [metrics]
+    prometheus_port = {{ .Values.config.metrics.prometheus_port }}
+    otlp_endpoint = {{ .Values.config.metrics.otlp_endpoint | quote }}
+    # ISSUE-248: derive audit_log_path from the audit.* block so the toml and
+    # the mounted volume agree by construction. Empty when audit.enabled=false
+    # (the logger becomes a no-op); otherwise a file under the mounted audit dir.
+    {{- if .Values.audit.enabled }}
+    audit_log_path = {{ printf "%s/%s" (trimSuffix "/" .Values.audit.path) .Values.audit.fileName | quote }}
+    {{- else }}
+    audit_log_path = ""
+    {{- end }}

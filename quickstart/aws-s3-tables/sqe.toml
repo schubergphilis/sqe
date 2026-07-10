@@ -1,0 +1,61 @@
+# SQE config for the AWS S3 Tables quickstart (reference template).
+# run.sh copies this to sqe.toml.local and fills in __TABLE_BUCKET_ARN__ /
+# __REGION__ from the CDK stack outputs. By hand: `cp sqe.toml sqe.toml.local`,
+# replace the placeholders, then `docker compose up -d`.
+#
+# AWS credentials come from the AWS SDK provider chain via the container env
+# (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_REGION), which run.sh
+# resolves from your AWS_PROFILE.
+
+[coordinator]
+flight_sql_port = 50051
+trino_http_port = 8080
+mode = "hybrid"
+flight_compression = "none"
+
+[worker]
+memory_limit = "4GB"
+spill_dir = "/tmp/sqe-spill"
+
+# ── Authentication ────────────────────────────────────────────────────────
+# S3 Tables authenticates via AWS IAM (the SDK chain), not a user token, so
+# there is no IdP. Anonymous dev-mode auth (SQE logs a security warning). For
+# real multi-user auth put SQE behind Keycloak; the catalog still uses IAM.
+[auth]
+keycloak_url = ""
+realm = ""
+client_id = ""
+client_secret = ""
+ssl_verification = false
+
+[[auth.providers]]
+type = "anonymous"
+user = "anonymous"
+roles = ["admin"]
+
+# ── Catalog: AWS S3 Tables (managed Iceberg) over the AWS SDK ──────────────
+# table_bucket_arn is arn:aws:s3tables:REGION:ACCOUNT:bucket/NAME (the CDK
+# stack creates the bucket). The s3tables backend registers under the legacy
+# SQL catalog name `iceberg`, so tables are iceberg.<namespace>.<table>.
+[catalog.backend]
+type = "s3tables"
+table_bucket_arn = "__TABLE_BUCKET_ARN__"
+
+# Legacy single-catalog block (required by the deserialiser).
+[catalog]
+polaris_url = "https://placeholder.invalid"   # unused by the s3tables backend
+warehouse = "s3tables"
+
+# ── Storage: S3 Tables manages its own storage; only the region is needed ──
+[storage]
+s3_region = "__REGION__"
+s3_path_style = false
+
+[policy]
+engine = "passthrough"
+
+[session]
+idle_timeout_secs = 900
+
+[metrics]
+prometheus_port = 9090

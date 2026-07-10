@@ -1,0 +1,121 @@
+{
+  "benchmark": "bank",
+  "scale": 0.1,
+  "timestamp": "2026-07-08T16:33:57.240698+00:00",
+  "sqe_endpoint": "http://localhost:60051",
+  "trino_endpoint": "http://localhost:38080",
+  "queries": [
+    {
+      "query_name": "q01",
+      "sqe_time_ms": 75,
+      "trino_time_ms": 1786,
+      "speedup": 23.813333333333333,
+      "sqe_rows": 28,
+      "trino_rows": 28,
+      "rows_match": true,
+      "sqe_error": null,
+      "trino_error": null,
+      "status": "Match"
+    },
+    {
+      "query_name": "q02",
+      "sqe_time_ms": 63,
+      "trino_time_ms": 306,
+      "speedup": 4.857142857142857,
+      "sqe_rows": 35,
+      "trino_rows": 35,
+      "rows_match": true,
+      "sqe_error": null,
+      "trino_error": null,
+      "status": "Match"
+    },
+    {
+      "query_name": "q03",
+      "sqe_time_ms": 177,
+      "trino_time_ms": 947,
+      "speedup": 5.350282485875706,
+      "sqe_rows": 0,
+      "trino_rows": 0,
+      "rows_match": true,
+      "sqe_error": null,
+      "trino_error": null,
+      "status": "Vacuous"
+    },
+    {
+      "query_name": "q04",
+      "sqe_time_ms": 86,
+      "trino_time_ms": 964,
+      "speedup": 11.209302325581396,
+      "sqe_rows": 500,
+      "trino_rows": 500,
+      "rows_match": true,
+      "sqe_error": null,
+      "trino_error": null,
+      "status": "Match"
+    },
+    {
+      "query_name": "q05",
+      "sqe_time_ms": 209,
+      "trino_time_ms": 253,
+      "speedup": 1.2105263157894737,
+      "sqe_rows": 795,
+      "trino_rows": 795,
+      "rows_match": true,
+      "sqe_error": null,
+      "trino_error": null,
+      "status": "Match"
+    },
+    {
+      "query_name": "q06",
+      "sqe_time_ms": 202,
+      "trino_time_ms": 987,
+      "speedup": 4.8861386138613865,
+      "sqe_rows": 90,
+      "trino_rows": 90,
+      "rows_match": true,
+      "sqe_error": null,
+      "trino_error": null,
+      "status": "Match"
+    },
+    {
+      "query_name": "q07",
+      "sqe_time_ms": 79,
+      "trino_time_ms": 559,
+      "speedup": 7.075949367088608,
+      "sqe_rows": 84,
+      "trino_rows": 84,
+      "rows_match": true,
+      "sqe_error": null,
+      "trino_error": null,
+      "status": "Match"
+    },
+    {
+      "query_name": "q08",
+      "sqe_time_ms": 96,
+      "trino_time_ms": 242,
+      "speedup": 2.5208333333333335,
+      "sqe_rows": 150,
+      "trino_rows": 150,
+      "rows_match": true,
+      "sqe_error": null,
+      "trino_error": null,
+      "status": "Match"
+    }
+  ],
+  "summary": {
+    "total": 8,
+    "matched": 7,
+    "vacuous": 1,
+    "expected_empty": 0,
+    "vacuous_bug": 0,
+    "dialect_diff": 0,
+    "row_diff": 0,
+    "sqe_failed": 0,
+    "trino_failed": 0,
+    "both_failed": 0,
+    "avg_speedup": 7.615438579000762,
+    "median_speedup": 5.350282485875706,
+    "sqe_total_ms": 987,
+    "trino_total_ms": 6044
+  }
+}

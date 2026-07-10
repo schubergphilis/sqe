@@ -1,0 +1,109 @@
+# SQE config for the Polaris + Ranger + Keycloak quickstart.
+#
+# SQE authenticates users against Keycloak (ROPC password grant), passes the
+# bearer token through to Polaris, and translates GRANT/REVOKE into Apache
+# Ranger Admin REST calls via the `ranger` access-control backend. Polaris
+# enforces those Ranger policies through its embedded Ranger authorizer.
+
+[coordinator]
+flight_sql_port = 50051
+trino_http_port = 8080
+mode = "hybrid"
+flight_compression = "none"
+
+[worker]
+memory_limit = "4GB"
+spill_dir = "/tmp/sqe-spill"
+
+# ── Authentication ──────────────────────────────────────────────────────────
+[auth]
+keycloak_url = "http://keycloak:8080"
+realm = "iceberg-ranger"
+client_id = "sqe-client"
+client_secret = "sqe-secret-change-me"
+ssl_verification = false
+# carol holds sqe_admin; GRANT/REVOKE are gated behind this allowlist.
+admin_roles = ["sqe_admin"]
+
+# ROPC: SQE exchanges username+password for a Keycloak token, then passes it to
+# Polaris. realm_access.roles carries analyst/engineer/sqe_admin.
+[[auth.providers]]
+type = "oidc_password"
+token_url = "http://keycloak:8080/realms/iceberg-ranger/protocol/openid-connect/token"
+client_id = "sqe-client"
+client_secret = "sqe-secret-change-me"
+roles_claim = "realm_access.roles"
+accept_invalid_certs = true
+
+# ── Catalogs ────────────────────────────────────────────────────────────────
+[catalogs.sales_wh]
+polaris_url = "http://polaris:8181/api/catalog"
+warehouse = "sales_wh"
+metadata_cache_ttl_secs = 30
+default_table_format_version = 2
+
+[catalogs.ops_wh]
+polaris_url = "http://polaris:8181/api/catalog"
+warehouse = "ops_wh"
+metadata_cache_ttl_secs = 30
+default_table_format_version = 2
+
+[catalog]
+polaris_url = "http://polaris:8181/api/catalog"
+warehouse = "sales_wh"
+
+# polaris-auto lets the write path route DML (CREATE/INSERT) into a non-default
+# catalog named in a 3-part identifier (e.g. ops_wh.ops.x), discovering it from
+# Polaris. Without this, writes fall back to the default catalog.
+[query]
+catalog_discovery = "polaris-auto"
+
+# ── Storage ─────────────────────────────────────────────────────────────────
+[storage]
+s3_endpoint = "http://rustfs:9000"
+s3_region = "us-east-1"
+s3_access_key = "s3admin"
+s3_secret_key = "s3adminpw"
+s3_path_style = true
+s3_allow_http = true
+
+# Fine-grained ENFORCEMENT (row filters + column masks) read by SQE directly
+# from a `hive`-type Ranger service. This is separate from the coarse
+# [access_control] path below (GRANT/REVOKE -> polaris service -> Polaris
+# enforces). The hive service is the one Apache Spark / Kyuubi would also read,
+# so the same policy set is shared. admin-password also via
+# SQE_POLICY__RANGER__ADMIN_PASSWORD.
+[policy]
+engine = "ranger"
+
+[policy.ranger]
+url = "http://ranger-admin:6080"
+service-name = "hive"
+admin-user = "admin"
+admin-password = "rangerR0cks!"
+
+# ── Access control: Apache Ranger ────────────────────────────────────────────
+# SQE writes GRANT/REVOKE to Ranger Admin; Polaris enforces. service-name must
+# match the Polaris `polaris.authorization.ranger.service-name`. `realm` is the
+# `root` resource value: left empty first; set it if enforcement does not match
+# SQE-written policies (see OVERVIEW.md). admin-password can also be supplied via
+# SQE_ACCESS_CONTROL__RANGER__ADMIN_PASSWORD.
+[access_control]
+backend = "ranger"
+url = "http://ranger-admin:6080"
+
+[access_control.ranger]
+service-name = "polaris"
+admin-user = "admin"
+admin-password = "rangerR0cks!"
+# Polaris includes the `root` resource in every authorization request, so every
+# Ranger policy SQE writes must carry a matching `root` value. "*" matches the
+# realm Polaris sends (verified against this stack). Without it, GRANTs succeed
+# but enforcement silently never matches.
+realm = "*"
+
+[session]
+idle_timeout_secs = 900
+
+[metrics]
+prometheus_port = 9090
