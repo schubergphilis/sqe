@@ -109,6 +109,31 @@ fn collect_unpushed_scans(
     }
 }
 
+/// Sum of the progress-indicating metric values across every operator in
+/// the plan tree: elapsed compute, output rows, and spill activity. Two
+/// equal fingerprints sampled at different times mean no operator did
+/// measurable work in between. Used by the idle-timeout guard to tell a
+/// blocking-but-working operator (e.g. a spilling final aggregate that
+/// emits nothing until its merge completes) from a wedged pipeline or an
+/// abandoned client, which advance nothing. Issue #365.
+fn plan_progress_fingerprint(plan: &Arc<dyn ExecutionPlan>) -> u64 {
+    let mut fp: u64 = 0;
+    let mut stack: Vec<Arc<dyn ExecutionPlan>> = vec![Arc::clone(plan)];
+    while let Some(node) = stack.pop() {
+        if let Some(metrics) = node.metrics() {
+            fp = fp
+                .wrapping_add(metrics.elapsed_compute().unwrap_or(0) as u64)
+                .wrapping_add(metrics.output_rows().unwrap_or(0) as u64)
+                .wrapping_add(metrics.spill_count().unwrap_or(0) as u64)
+                .wrapping_add(metrics.spilled_bytes().unwrap_or(0) as u64);
+        }
+        for child in node.children() {
+            stack.push(Arc::clone(child));
+        }
+    }
+    fp
+}
+
 /// State captured at query start that [`TrackedRecordBatchStream`] uses
 /// to finalize tracker / metrics / audit exactly once when the stream
 /// terminates (clean EOF, error, or client drop).
@@ -447,6 +472,20 @@ pub struct TrackedRecordBatchStream {
     idle_timeout: Option<Duration>,
     /// Pending idle deadline. Pinned so it can be polled in place each call.
     idle_sleep: Option<Pin<Box<Sleep>>>,
+    /// Operator-metrics fingerprint at the last idle-deadline check. When
+    /// the idle timer fires but the fingerprint has advanced, the pipeline
+    /// is working (e.g. a spilling aggregate that emits nothing until its
+    /// merge completes) and the deadline is extended instead of aborting.
+    /// Issue #365.
+    idle_progress: Option<u64>,
+    /// Hard ceiling on progress-based idle extensions, mirroring
+    /// `query.timeout_secs` for the streaming path (which has no outer
+    /// `tokio::time::timeout` wrapping consumption). Past this instant an
+    /// idle stream aborts even when operators still advance. None leaves
+    /// extensions unbounded.
+    query_deadline: Option<tokio::time::Instant>,
+    /// The duration behind `query_deadline`, kept for the abort message.
+    query_timeout: Option<Duration>,
 }
 
 impl TrackedRecordBatchStream {
@@ -470,6 +509,9 @@ impl TrackedRecordBatchStream {
             cancelled: false,
             idle_timeout: None,
             idle_sleep: None,
+            idle_progress: None,
+            query_deadline: None,
+            query_timeout: None,
         }
     }
 
@@ -495,6 +537,9 @@ impl TrackedRecordBatchStream {
             cancelled: false,
             idle_timeout: None,
             idle_sleep: None,
+            idle_progress: None,
+            query_deadline: None,
+            query_timeout: None,
         }
     }
 
@@ -519,6 +564,9 @@ impl TrackedRecordBatchStream {
             cancelled: false,
             idle_timeout: None,
             idle_sleep: None,
+            idle_progress: None,
+            query_deadline: None,
+            query_timeout: None,
         }
     }
 
@@ -545,6 +593,9 @@ impl TrackedRecordBatchStream {
             cancelled: false,
             idle_timeout: None,
             idle_sleep: None,
+            idle_progress: None,
+            query_deadline: None,
+            query_timeout: None,
         }
     }
 
@@ -558,12 +609,35 @@ impl TrackedRecordBatchStream {
     }
 
     /// Enable the idle-timeout guard. The stream aborts (releasing its
-    /// concurrency permit) when no batch is produced for `timeout`. Skips
+    /// concurrency permit) when no batch is produced for `timeout` AND the
+    /// plan's operator metrics stopped advancing (issue #365). Skips
     /// installation when `timeout` is zero. Issue #75.
     pub fn with_idle_timeout(mut self, timeout: Duration) -> Self {
         if !timeout.is_zero() {
             self.idle_timeout = Some(timeout);
             self.idle_sleep = Some(Box::pin(tokio::time::sleep(timeout)));
+            // Baseline for the first progress check: whatever the operators
+            // already accumulated by install time. A pipeline that is wedged
+            // from the start never moves off this value and aborts at the
+            // first deadline, exactly as before.
+            self.idle_progress = self
+                .finalizer
+                .as_ref()
+                .map(|f| plan_progress_fingerprint(&f.plan));
+        }
+        self
+    }
+
+    /// Bound progress-based idle extensions to `total` from now. Without
+    /// this, a stream that keeps accruing operator work while never
+    /// emitting a batch could extend its idle deadline forever; with it,
+    /// `query.timeout_secs` bounds the streaming path the same way the
+    /// buffered path's `tokio::time::timeout` does. Skips installation
+    /// when `total` is zero. Issue #365.
+    pub fn with_query_deadline(mut self, total: Duration) -> Self {
+        if !total.is_zero() {
+            self.query_deadline = Some(tokio::time::Instant::now() + total);
+            self.query_timeout = Some(total);
         }
         self
     }
@@ -626,28 +700,66 @@ impl Stream for TrackedRecordBatchStream {
                 // and the diff harness scored it as a row-count mismatch
                 // instead of a failure (Trino reports the equivalent as
                 // EXCEEDED_TIME_LIMIT).
-                if let Some(ref mut sleep) = self.idle_sleep {
-                    if sleep.as_mut().poll(cx).is_ready() {
-                        warn!(
-                            rows_so_far = self.rows_so_far,
-                            "Stream idle-timeout reached, aborting query and releasing permits"
-                        );
-                        self.cancelled = true;
-                        let timeout = self.idle_timeout.unwrap_or_default();
-                        let msg = format!(
+                let idle_fired = match self.idle_sleep {
+                    Some(ref mut sleep) => sleep.as_mut().poll(cx).is_ready(),
+                    None => false,
+                };
+                if idle_fired {
+                    // A blocking operator (spilling final aggregate, large
+                    // sort merge) can legitimately run past the idle window
+                    // without yielding a batch. Advancing operator metrics
+                    // mean the pipeline is working, not wedged, so extend
+                    // the deadline instead of aborting. A stalled pipeline
+                    // or an abandoned client advances nothing (operators
+                    // blocked on backpressure accrue no compute), so the
+                    // abort still fires for the cases the guard exists for
+                    // (issue #75). Issue #365.
+                    let sampled = self
+                        .finalizer
+                        .as_ref()
+                        .map(|f| plan_progress_fingerprint(&f.plan));
+                    let progressed = sampled.is_some() && sampled != self.idle_progress;
+                    let within_deadline = self
+                        .query_deadline
+                        .is_none_or(|d| tokio::time::Instant::now() < d);
+                    if progressed && within_deadline {
+                        self.idle_progress = sampled;
+                        self.reset_idle_timer();
+                        // Poll the reset timer so its waker is registered;
+                        // reset() alone does not schedule a wake-up.
+                        if let Some(ref mut sleep) = self.idle_sleep {
+                            let _ = sleep.as_mut().poll(cx);
+                        }
+                        return Poll::Pending;
+                    }
+                    warn!(
+                        rows_so_far = self.rows_so_far,
+                        operators_active = progressed,
+                        "Stream idle-timeout reached, aborting query and releasing permits"
+                    );
+                    self.cancelled = true;
+                    let msg = if progressed {
+                        format!(
+                            "Query timed out after {}s: operators were still \
+                             executing but no results were produced within the \
+                             total query timeout.",
+                            self.query_timeout.unwrap_or_default().as_secs()
+                        )
+                    } else {
+                        format!(
                             "Query aborted: produced no results for {}s (idle timeout). \
                              The execution pipeline stalled or the client stopped \
                              consuming the result stream.",
-                            timeout.as_secs()
+                            self.idle_timeout.unwrap_or_default().as_secs()
+                        )
+                    };
+                    if let Some(f) = self.finalizer.take() {
+                        f.on_error(
+                            self.rows_so_far,
+                            &sqe_core::SqeError::Execution(msg.clone()),
                         );
-                        if let Some(f) = self.finalizer.take() {
-                            f.on_error(
-                                self.rows_so_far,
-                                &sqe_core::SqeError::Execution(msg.clone()),
-                            );
-                        }
-                        return Poll::Ready(Some(Err(DataFusionError::Execution(msg))));
                     }
+                    return Poll::Ready(Some(Err(DataFusionError::Execution(msg))));
                 }
                 Poll::Pending
             }
@@ -1166,6 +1278,176 @@ mod tests {
         assert!(stream.next().await.is_none());
 
         // And the tracker records a failure, not a cancel or success.
+        let record = find_record(&tracker, qid);
+        assert_eq!(record.state, QueryState::Failed);
+    }
+
+    use std::fmt;
+
+    use datafusion::common::Result as DFResult;
+    use datafusion::execution::TaskContext;
+    use datafusion::physical_expr::EquivalenceProperties;
+    use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+    use datafusion::physical_plan::metrics::{
+        Count, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet,
+    };
+    use datafusion::physical_plan::{DisplayAs, DisplayFormatType, Partitioning, PlanProperties};
+
+    /// ExecutionPlan stub whose metrics the test advances from outside.
+    /// `execute` is never called: it exists purely so the idle-timeout
+    /// guard has an operator tree to fingerprint.
+    #[derive(Debug)]
+    struct MetricsStubExec {
+        props: Arc<PlanProperties>,
+        metrics: ExecutionPlanMetricsSet,
+    }
+
+    impl MetricsStubExec {
+        fn create() -> (Arc<dyn ExecutionPlan>, Count) {
+            let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));
+            let metrics = ExecutionPlanMetricsSet::new();
+            let rows = MetricBuilder::new(&metrics).output_rows(0);
+            let props = Arc::new(PlanProperties::new(
+                EquivalenceProperties::new(schema),
+                Partitioning::UnknownPartitioning(1),
+                EmissionType::Incremental,
+                Boundedness::Bounded,
+            ));
+            (Arc::new(Self { props, metrics }), rows)
+        }
+    }
+
+    impl DisplayAs for MetricsStubExec {
+        fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "MetricsStubExec")
+        }
+    }
+
+    impl ExecutionPlan for MetricsStubExec {
+        fn name(&self) -> &str {
+            "MetricsStubExec"
+        }
+
+        fn properties(&self) -> &Arc<PlanProperties> {
+            &self.props
+        }
+
+        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+            vec![]
+        }
+
+        fn with_new_children(
+            self: Arc<Self>,
+            _children: Vec<Arc<dyn ExecutionPlan>>,
+        ) -> DFResult<Arc<dyn ExecutionPlan>> {
+            Ok(self)
+        }
+
+        fn execute(
+            &self,
+            _partition: usize,
+            _context: Arc<TaskContext>,
+        ) -> DFResult<SendableRecordBatchStream> {
+            Err(DataFusionError::Internal(
+                "MetricsStubExec is not executable".to_string(),
+            ))
+        }
+
+        fn metrics(&self) -> Option<MetricsSet> {
+            Some(self.metrics.clone_inner())
+        }
+    }
+
+    /// Build a tracked stream over a never-yielding inner stream whose plan
+    /// is a [`MetricsStubExec`], returning the stream, the metric handle to
+    /// advance, the tracker, and the query id.
+    async fn idle_test_stream(
+        idle: Duration,
+    ) -> (TrackedRecordBatchStream, Count, Arc<QueryTracker>, uuid::Uuid) {
+        let (plan, rows) = MetricsStubExec::create();
+        let schema = plan.schema();
+        let runtime = SessionContext::new().runtime_env();
+        let tracker = test_tracker();
+        let finalizer = test_finalizer(Arc::clone(&tracker), plan, runtime);
+        let qid = finalizer.query_id;
+        tracker.start(qid, "test-user", None, "SELECT 1", "test-session", None, vec![]);
+
+        let pending = futures::stream::pending::<Result<RecordBatch, DataFusionError>>();
+        let inner: SendableRecordBatchStream =
+            Box::pin(RecordBatchStreamAdapter::new(schema, pending));
+        let stream = TrackedRecordBatchStream::new(inner, finalizer, None)
+            .with_idle_timeout(idle);
+        (stream, rows, tracker, qid)
+    }
+
+    /// Issue #365: a stream that emits no batch but whose operator metrics
+    /// keep advancing (a spilling final aggregate mid-merge) must NOT be
+    /// aborted at the idle deadline — the guard extends instead.
+    #[tokio::test]
+    async fn idle_timeout_extends_while_operator_metrics_advance() {
+        let (mut stream, rows, _tracker, _qid) =
+            idle_test_stream(Duration::from_millis(50)).await;
+
+        let ticker = tokio::spawn(async move {
+            loop {
+                rows.add(1);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
+
+        // Six idle windows: without progress-aware extension the stream
+        // aborts at ~50ms; with it, it must still be pending at 300ms.
+        let polled = tokio::time::timeout(Duration::from_millis(300), stream.next()).await;
+        ticker.abort();
+        assert!(
+            polled.is_err(),
+            "stream must still be pending while operators advance, got: {polled:?}"
+        );
+    }
+
+    /// The wedged / abandoned-client case (issue #75) is unchanged: metrics
+    /// that never move past their install-time baseline abort at the first
+    /// idle deadline.
+    #[tokio::test]
+    async fn idle_timeout_aborts_when_metrics_do_not_advance() {
+        let (mut stream, _rows, tracker, qid) =
+            idle_test_stream(Duration::from_millis(50)).await;
+
+        let item = tokio::time::timeout(Duration::from_millis(300), stream.next())
+            .await
+            .expect("stream must abort at the first idle deadline");
+        let err = item
+            .expect("stream must yield an item")
+            .expect_err("idle timeout must surface as an error");
+        assert!(err.to_string().contains("idle timeout"), "unexpected error: {err}");
+
+        let record = find_record(&tracker, qid);
+        assert_eq!(record.state, QueryState::Failed);
+    }
+
+    /// Progress-based extensions must not be unbounded: past the query
+    /// deadline the stream aborts even though operators still advance.
+    #[tokio::test]
+    async fn query_deadline_bounds_idle_extensions() {
+        let (stream, rows, tracker, qid) = idle_test_stream(Duration::from_millis(50)).await;
+        let mut stream = stream.with_query_deadline(Duration::from_millis(150));
+
+        let ticker = tokio::spawn(async move {
+            loop {
+                rows.add(1);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
+
+        let item = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .expect("stream must abort once the query deadline passes");
+        ticker.abort();
+        let err = item
+            .expect("stream must yield an item")
+            .expect_err("deadline expiry must surface as an error");
+        assert!(err.to_string().contains("timed out"), "unexpected error: {err}");
+
         let record = find_record(&tracker, qid);
         assert_eq!(record.state, QueryState::Failed);
     }
