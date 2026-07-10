@@ -1,0 +1,56 @@
+[package]
+name = "sqe-worker"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "sqe_worker"
+path = "src/lib.rs"
+
+[[bin]]
+name = "sqe-worker"
+path = "src/main.rs"
+
+[dependencies]
+sqe-core = { path = "../sqe-core" }
+sqe-catalog = { path = "../sqe-catalog" }
+sqe-planner = { path = "../sqe-planner" }
+sqe-metrics = { path = "../sqe-metrics" }
+datafusion = { workspace = true }
+datafusion-proto = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
+arrow = { workspace = true }
+arrow-flight = { workspace = true }
+arrow-ipc = { workspace = true }
+arrow-schema = { workspace = true }
+arrow-array = { workspace = true }
+parquet = { workspace = true }
+object_store = { workspace = true }
+tonic = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = "0.1"
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+futures = { workspace = true }
+bytes = { workspace = true }
+anyhow = { workspace = true }
+url = { workspace = true }
+chrono = { workspace = true }
+opentelemetry = { workspace = true }
+tracing-opentelemetry = { workspace = true }
+subtle = { workspace = true }
+prometheus = { workspace = true }
+# Local network interface enumeration for advertise-URL derivation (issue #220).
+# Used only at worker startup to pick the first non-loopback, non-link-local
+# address when POD_IP / HOSTNAME are not set. Cross-platform (posix + windows).
+if-addrs = "0.15"
+
+[dev-dependencies]
+tokio = { workspace = true }
+async-trait = { workspace = true }

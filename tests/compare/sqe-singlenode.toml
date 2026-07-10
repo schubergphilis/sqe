@@ -1,0 +1,56 @@
+# Single-node embedded SQE coordinator for the in-network parity compare.
+#
+# Runs inside the docker test stack network (mount as /etc/sqe/config.toml on
+# the compare `sqe` service) so SQE reads rustfs container-to-container, the
+# same storage path Trino gets. A host coordinator reads through the Docker
+# port-forward, which caps at ~160 MB/s aggregate vs ~320 MB/s in-VM and
+# understates SQE on every scan-bound query.
+#
+# Memory is deliberately bounded to mirror the Trino container in the same
+# stack (tests/trino/jvm.config: heap capped at 50% of the 16 GB VM, query
+# memory 5 GB) so both engines run in the same envelope: 8 VM CPUs, ~8 GB
+# ceiling, 5 GB per query, same network distance to storage.
+
+[coordinator]
+flight_sql_port = 50051
+trino_http_port = 8080
+memory_limit = "8GB"
+spill_to_disk = true
+spill_dir = "/tmp/sqe-spill"
+spill_compression = "lz4"
+
+[metrics]
+prometheus_port = 9090
+
+[auth]
+token_endpoint = "http://polaris:8181/api/catalog/v1/oauth/tokens"
+client_id = "root"
+client_secret = "s3cr3t"
+
+[query]
+# Per-operator profiles for every query; this rig exists for perf analysis.
+query_profile = "all"
+max_result_rows = 10_000_000
+max_query_memory = "5GB"
+per_user_memory_budget = "0"
+timeout_secs = 1800
+
+[catalog]
+polaris_url = "http://polaris:8181/api/catalog"
+warehouse = "test_warehouse"
+
+[storage]
+s3_endpoint = "http://rustfs:9000"
+s3_access_key = "s3admin"
+s3_secret_key = "s3admin"
+s3_region = "us-east-1"
+s3_path_style = true
+
+[query_cache]
+enabled = false
+
+# The sqe-bench loader streams generated parquet via read_parquet() on
+# local paths; mount the host's /tmp/sqe-bench-data into the container
+# at the same path when loading through this coordinator.
+[storage.tvf]
+allow_local_paths = true

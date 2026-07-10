@@ -1,0 +1,181 @@
+Jun 16, 2026 11:38:36 AM org.jline.utils.Log logr
+WARNING: Unable to create a system terminal, creating a dumb terminal (enable debug logging for more information)
+"Trino version: 465
+Queued: 213.69us, Analysis: 43.61ms, Planning: 82.80ms, Execution: 7.89s
+Fragment 1 [SINGLE]
+    CPU: 2.34ms, Scheduled: 3.14ms, Blocked 2.18m (Input: 1.03m, Output: 0.00ns), Input: 8 rows (104B); per task: avg.: 8.00 std.dev.: 0.00, Output: 1 row (17B)
+    Peak Memory: 960B, Tasks count: 1; per task: max: 960B
+    Output layout: [expr_20]
+    Output partitioning: SINGLE []
+    Project[]
+    │   Layout: [expr_20:decimal(38,2)]
+    │   Estimates: {rows: 1 (17B), cpu: 17, memory: 0B, network: 0B}
+    │   CPU: 0.00ns (0.00%), Scheduled: 1.00ms (0.00%), Blocked: 0.00ns (0.00%), Output: 1 row (17B)
+    │   Input avg.: 0.13 rows, Input std.dev.: 264.58%
+    │   expr_20 := $operator$divide(sum, decimal(2,1) '7.0')
+    └─ LocalExchange[partitioning = ROUND_ROBIN]
+       │   Layout: [sum:decimal(38,2)]
+       │   Estimates: {rows: 1 (17B), cpu: 17, memory: 0B, network: 0B}
+       │   CPU: 0.00ns (0.00%), Scheduled: 0.00ns (0.00%), Blocked: 1.03m (20.33%), Output: 1 row (17B)
+       │   Input avg.: 1.00 rows, Input std.dev.: 0.00%
+       └─ Aggregate[type = FINAL]
+          │   Layout: [sum:decimal(38,2)]
+          │   Estimates: {rows: 1 (17B), cpu: ?, memory: 17B, network: 0B}
+          │   CPU: 0.00ns (0.00%), Scheduled: 0.00ns (0.00%), Blocked: 0.00ns (0.00%), Output: 1 row (17B)
+          │   Input avg.: 8.00 rows, Input std.dev.: 0.00%
+          │   sum := sum(sum_24)
+          └─ LocalExchange[partitioning = SINGLE]
+             │   Layout: [sum_24:varbinary]
+             │   Estimates: {rows: ? (?), cpu: 0, memory: 0B, network: 0B}
+             │   CPU: 0.00ns (0.00%), Scheduled: 0.00ns (0.00%), Blocked: 7.77s (2.56%), Output: 8 rows (104B)
+             │   Input avg.: 1.00 rows, Input std.dev.: 70.71%
+             └─ RemoteSource[sourceFragmentIds = [2]]
+                    Layout: [sum_24:varbinary]
+                    CPU: 0.00ns (0.00%), Scheduled: 0.00ns (0.00%), Blocked: 1.03m (20.33%), Output: 8 rows (104B)
+                    Input avg.: 1.00 rows, Input std.dev.: 70.71%
+
+Fragment 2 [HASH]
+    CPU: 21.49s, Scheduled: 44.94s, Blocked 1.94m (Input: 50.08s, Output: 0.00ns), Input: 59351603 rows (1.01GB); per task: avg.: 59351603.00 std.dev.: 0.00, Output: 8 rows (104B)
+    Peak Memory: 105.10MB, Tasks count: 1; per task: max: 111.87MB
+    Output layout: [sum_24]
+    Output partitioning: SINGLE []
+    Aggregate[type = PARTIAL]
+    │   Layout: [sum_24:varbinary]
+    │   CPU: 2.00ms (0.01%), Scheduled: 2.00ms (0.00%), Blocked: 0.00ns (0.00%), Output: 8 rows (104B)
+    │   Input avg.: 890.38 rows, Input std.dev.: 25.10%
+    │   sum_24 := sum(l_extendedprice)
+    └─ FilterProject[filterPredicate = (CAST(l_quantity AS decimal(16,3)) < $operator$multiply(COALESCE(avg, avg_23), decimal(1,1) '0.2'))]
+       │   Layout: [l_extendedprice:decimal(15,2)]
+       │   Estimates: {rows: ? (?), cpu: ?, memory: 0B, network: 0B}/{rows: ? (?), cpu: ?, memory: 0B, network: 0B}
+       │   CPU: 4.00ms (0.01%), Scheduled: 6.00ms (0.01%), Blocked: 0.00ns (0.00%), Output: 7123 rows (62.60kB)
+       │   Input avg.: 9948.50 rows, Input std.dev.: 24.94%
+       └─ CrossJoin[]
+          │   Layout: [l_quantity:decimal(15,2), l_extendedprice:decimal(15,2), avg:decimal(15,2), avg_23:decimal(15,2)]
+          │   Estimates: {rows: ? (?), cpu: ?, memory: 9B, network: 0B}
+          │   CPU: 1.00ms (0.00%), Scheduled: 1.00ms (0.00%), Blocked: 9.96s (3.28%), Output: 79588 rows (2.05MB)
+          │   Distribution: REPLICATED
+          ├─ LeftJoin[criteria = (l_partkey = l_partkey_3), distribution = PARTITIONED]
+          │  │   Layout: [l_quantity:decimal(15,2), l_extendedprice:decimal(15,2), avg:decimal(15,2)]
+          │  │   Estimates: {rows: ? (?), cpu: ?, memory: ?, network: 0B}
+          │  │   CPU: 136.00ms (0.37%), Scheduled: 168.00ms (0.19%), Blocked: 48.76s (16.04%), Output: 79588 rows (2.05MB)
+          │  │   Left (probe) Input avg.: 9948.50 rows, Input std.dev.: 24.94%
+          │  │   Right (build) Input avg.: 250000.00 rows, Input std.dev.: 0.14%
+          │  │   Distribution: PARTITIONED
+          │  ├─ RemoteSource[sourceFragmentIds = [3]]
+          │  │      Layout: [l_partkey:integer, l_quantity:decimal(15,2), l_extendedprice:decimal(15,2)]
+          │  │      CPU: 1.00ms (0.00%), Scheduled: 8.00ms (0.01%), Blocked: 14.32s (4.71%), Output: 79588 rows (1.75MB)
+          │  │      Input avg.: 9948.50 rows, Input std.dev.: 24.94%
+          │  └─ Aggregate[type = FINAL, keys = [l_partkey_3]]
+          │     │   Layout: [l_partkey_3:integer, avg:decimal(15,2)]
+          │     │   Estimates: {rows: ? (?), cpu: 3.35G, memory: ?, network: 0B}
+          │     │   CPU: 17.32s (47.49%), Scheduled: 34.98s (38.64%), Blocked: 0.00ns (0.00%), Output: 2000000 rows (26.70MB)
+          │     │   Input avg.: 7409001.75 rows, Input std.dev.: 0.14%
+          │     │   avg := avg(avg_25)
+          │     └─ LocalExchange[partitioning = HASH, arguments = [l_partkey_3::integer]]
+          │        │   Layout: [l_partkey_3:integer, avg_25:varbinary]
+          │        │   Estimates: {rows: 60000000 (3.35GB), cpu: 3.35G, memory: 0B, network: 0B}
+          │        │   CPU: 3.60s (9.86%), Scheduled: 8.68s (9.59%), Blocked: 12.48s (4.10%), Output: 59272014 rows (1.00GB)
+          │        │   Input avg.: 7409001.75 rows, Input std.dev.: 25.73%
+          │        └─ RemoteSource[sourceFragmentIds = [5]]
+          │               Layout: [l_partkey_3:integer, avg_25:varbinary]
+          │               CPU: 412.00ms (1.13%), Scheduled: 1.07s (1.18%), Blocked: 33.05s (10.87%), Output: 59272014 rows (1.00GB)
+          │               Input avg.: 7409001.75 rows, Input std.dev.: 25.73%
+          └─ LocalExchange[partitioning = SINGLE]
+             │   Layout: [avg_23:decimal(15,2)]
+             │   Estimates: {rows: 1 (9B), cpu: 0, memory: 0B, network: 0B}
+             │   CPU: 0.00ns (0.00%), Scheduled: 0.00ns (0.00%), Blocked: 540.00ms (0.18%), Output: 1 row (9B)
+             │   Input avg.: 0.13 rows, Input std.dev.: 264.58%
+             └─ RemoteSource[sourceFragmentIds = [6]]
+                    Layout: [avg_23:decimal(15,2)]
+                    CPU: 0.00ns (0.00%), Scheduled: 0.00ns (0.00%), Blocked: 2.72s (0.89%), Output: 1 row (9B)
+                    Input avg.: 0.13 rows, Input std.dev.: 264.58%
+
+Fragment 3 [SOURCE]
+    CPU: 4.11s, Scheduled: 14.25s, Blocked 18.99s (Input: 1.99s, Output: 0.00ns), Input: 60002665 rows (1.28GB); per task: avg.: 60002665.00 std.dev.: 0.00, Output: 79588 rows (1.75MB)
+    Peak Memory: 1.01MB, Tasks count: 1; per task: max: 97.20MB
+    Output layout: [l_partkey, l_quantity, l_extendedprice]
+    Output partitioning: HASH [l_partkey]
+    InnerJoin[criteria = (l_partkey = p_partkey), distribution = REPLICATED]
+    │   Layout: [l_partkey:integer, l_quantity:decimal(15,2), l_extendedprice:decimal(15,2)]
+    │   Estimates: {rows: ? (?), cpu: ?, memory: 2.84MB, network: 0B}
+    │   CPU: 828.00ms (2.27%), Scheduled: 2.47s (2.73%), Blocked: 4.73s (1.56%), Output: 79588 rows (1.75MB)
+    │   Left (probe) Input avg.: 133613.67 rows, Input std.dev.: 209.14%
+    │   Right (build) Input avg.: 333.13 rows, Input std.dev.: 5.60%
+    │   Distribution: REPLICATED
+    │   dynamicFilterAssignments = {p_partkey -> #df_1159}
+    ├─ ScanFilter[table = iceberg:tpch_sf10.lineitem$data@2337369359903125659, dynamicFilters = {l_partkey = #df_1159}]
+    │      Layout: [l_partkey:integer, l_quantity:decimal(15,2), l_extendedprice:decimal(15,2)]
+    │      Estimates: {rows: 60000000 (1.29GB), cpu: 1.29G, memory: 0B, network: 0B}/{rows: 60000000 (1.29GB), cpu: 1.29G, memory: 0B, network: 0B}
+    │      CPU: 3.28s (9.00%), Scheduled: 11.77s (13.00%), Blocked: 0.00ns (0.00%), Output: 11223548 rows (246.18MB)
+    │      Input avg.: 714285.71 rows, Input std.dev.: 18.14%
+    │      l_quantity := 5:l_quantity:decimal(15,2)
+    │      l_extendedprice := 6:l_extendedprice:decimal(15,2)
+    │      l_partkey := 2:l_partkey:integer
+    │      Input: 60000000 rows (1.28GB), Filtered: 81.29%, Physical input: 492.16MB, Physical input time: 4.54s
+    │      Dynamic filters: 
+    │          - df_1159, [ SortedRangeSet[type=integer, ranges=2665, {[147], ..., [1999507]}] ], collection time=565.49ms
+    └─ LocalExchange[partitioning = HASH, arguments = [p_partkey::integer]]
+       │   Layout: [p_partkey:integer]
+       │   Estimates: {rows: 594604 (2.84MB), cpu: 2.84M, memory: 0B, network: 0B}
+       │   CPU: 0.00ns (0.00%), Scheduled: 0.00ns (0.00%), Blocked: 2.23s (0.73%), Output: 2665 rows (13.01kB)
+       │   Input avg.: 333.13 rows, Input std.dev.: 173.80%
+       └─ RemoteSource[sourceFragmentIds = [4]]
+              Layout: [p_partkey:integer]
+              CPU: 0.00ns (0.00%), Scheduled: 0.00ns (0.00%), Blocked: 1.99s (0.65%), Output: 2665 rows (13.01kB)
+              Input avg.: 333.13 rows, Input std.dev.: 173.80%
+
+Fragment 4 [SOURCE]
+    CPU: 51.08ms, Scheduled: 349.38ms, Blocked 0.00ns (Input: 0.00ns, Output: 0.00ns), Input: 2000000 rows (24.95MB); per task: avg.: 2000000.00 std.dev.: 0.00, Output: 2665 rows (13.01kB)
+    Peak Memory: 8.43kB, Tasks count: 1; per task: max: 8.43kB
+    Output layout: [p_partkey]
+    Output partitioning: BROADCAST []
+    ScanFilterProject[table = iceberg:tpch_sf10.part$data@4378245844543384673, filterPredicate = ((p_brand = varchar 'Brand#23') AND (p_container = varchar 'MED BOX'))]
+        Layout: [p_partkey:integer]
+        Estimates: {rows: 2000000 (9.54MB), cpu: 35.09M, memory: 0B, network: 0B}/{rows: 594604 (2.84MB), cpu: 35.09M, memory: 0B, network: 0B}/{rows: 594604 (2.84MB), cpu: 2.84M, memory: 0B, network: 0B}
+        CPU: 51.00ms (0.14%), Scheduled: 349.00ms (0.39%), Blocked: 0.00ns (0.00%), Output: 2665 rows (13.01kB)
+        Input avg.: 1000000.00 rows, Input std.dev.: 4.86%
+        p_partkey := 1:p_partkey:integer
+        p_brand := 4:p_brand:varchar
+        p_container := 7:p_container:varchar
+        Input: 2000000 rows (24.95MB), Filtered: 99.87%, Physical input: 8.77MB, Physical input time: 243.74ms
+
+Fragment 5 [SOURCE]
+    CPU: 10.86s, Scheduled: 31.09s, Blocked 41.89s (Input: 0.00ns, Output: 41.90s), Input: 60000000 rows (801.09MB); per task: avg.: 60000000.00 std.dev.: 0.00, Output: 59272014 rows (1.00GB)
+    Peak Memory: 152.58MB, Tasks count: 1; per task: max: 326.33MB
+    Output layout: [l_partkey_3, avg_25]
+    Output partitioning: HASH [l_partkey_3]
+    Aggregate[type = PARTIAL, keys = [l_partkey_3]]
+    │   Layout: [l_partkey_3:integer, avg_25:varbinary]
+    │   Estimates: {rows: 60000000 (3.35GB), cpu: ?, memory: ?, network: ?}
+    │   CPU: 9.27s (25.43%), Scheduled: 24.54s (27.10%), Blocked: 41.90s (13.78%), Output: 59272014 rows (1.00GB)
+    │   Input avg.: 714285.71 rows, Input std.dev.: 18.14%
+    │   avg_25 := avg(l_quantity_6) (mask = non_null)
+    └─ ScanProject[table = iceberg:tpch_sf10.lineitem$data@2337369359903125659]
+           Layout: [l_quantity_6:decimal(15,2), l_partkey_3:integer, non_null:boolean]
+           Estimates: {rows: 60000000 (915.53MB), cpu: 801.09M, memory: 0B, network: 0B}/{rows: 60000000 (915.53MB), cpu: 915.53M, memory: 0B, network: 0B}
+           CPU: 1.56s (4.28%), Scheduled: 6.49s (7.17%), Blocked: 0.00ns (0.00%), Output: 60000000 rows (801.14MB)
+           Input avg.: 714285.71 rows, Input std.dev.: 18.14%
+           non_null := boolean 'true'
+           l_partkey_3 := 2:l_partkey:integer
+           l_quantity_6 := 5:l_quantity:decimal(15,2)
+           Input: 60000000 rows (801.09MB), Filtered: 0.00%, Physical input: 277.10MB, Physical input time: 3.37s
+
+Fragment 6 [SINGLE]
+    CPU: 226.70us, Scheduled: 261.50us, Blocked 0.00ns (Input: 0.00ns, Output: 0.00ns), Input: 1 row (11B); per task: avg.: 1.00 std.dev.: 0.00, Output: 1 row (9B)
+    Peak Memory: 104B, Tasks count: 1; per task: max: 104B
+    Output layout: [avg_23]
+    Output partitioning: BROADCAST []
+    Aggregate[]
+    │   Layout: [avg_23:decimal(15,2)]
+    │   Estimates: {rows: 1 (9B), cpu: 2, memory: 9B, network: 0B}
+    │   CPU: 0.00ns (0.00%), Scheduled: 0.00ns (0.00%), Blocked: 0.00ns (0.00%), Output: 1 row (9B)
+    │   Input avg.: 1.00 rows, Input std.dev.: 0.00%
+    │   avg_23 := avg(null) (mask = null_22)
+    └─ Values[]
+           Layout: [null:decimal(15,2), null_22:boolean]
+           Estimates: {rows: 1 (2B), cpu: 0, memory: 0B, network: 0B}
+           CPU: 0.00ns (0.00%), Scheduled: 0.00ns (0.00%), Blocked: 0.00ns (0.00%), Output: 1 row (11B)
+           Input avg.: 1.00 rows, Input std.dev.: 0.00%
+           (null::decimal(15,2), null::boolean)
+
+"

@@ -1,0 +1,22 @@
+%%{init: {'theme': 'dark', 'themeVariables': {'fontSize': '14px'}}}%%
+flowchart TD
+    SQL["SQL String"]
+    Parse["1. Parse — sqlparser-rs"]
+    LP["2. Logical Plan — relational algebra"]
+    Policy["3. Policy Rewrite — row filters, column masks"]
+    Opt["4. Optimize — pushdown, pruning, folding"]
+    PP["5. Physical Plan — ExecutionPlan nodes"]
+    Dist{"Distribute?"}
+    Exec["Execute locally — vectorised pull"]
+    Split["Split into scan fragments"]
+    Workers["Dispatch to workers via Flight"]
+    Collect["Collect and merge results"]
+    Arrow["Arrow RecordBatches"]
+
+    SQL --> Parse --> LP --> Policy --> Opt --> PP --> Dist
+    Dist -->|"single-node"| Exec --> Arrow
+    Dist -->|"distributed"| Split --> Workers --> Collect --> Arrow
+
+    style Policy fill:#c62828,color:#fff
+    style Dist fill:#1565c0,color:#fff
+    style Arrow fill:#2e7d32,color:#fff

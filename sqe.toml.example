@@ -1,0 +1,233 @@
+[coordinator]
+flight_sql_port = 50051
+trino_http_port = 8080
+mode = "hybrid"   # "local", "distributed", or "hybrid"
+# debug = false   # Set true for verbose error messages (dev only)
+
+# Memory limit for coordinator query processing (sorts, joins, aggregates).
+# Supports: B, KB, MB, GB, TB (e.g. "8GB", "4096MB").
+memory_limit = "8GB"
+# Spill to disk when memory limit is reached. Recommended: true for production.
+spill_to_disk = true
+# Directory for spill files. Use fast local SSD. Will be created if it doesn't exist.
+spill_dir = "/tmp/sqe-coordinator-spill"
+# Compression for spill files: "none", "lz4" (fast, recommended), "zstd" (smaller)
+spill_compression = "lz4"
+
+# Optional TLS for Flight SQL listener.
+# When cert_file + key_file are set, the server runs with TLS.
+# When omitted, the server runs in plaintext.
+# [coordinator.tls]
+# cert_file = "/etc/sqe/server.crt"
+# key_file  = "/etc/sqe/server.key"
+# ca_file   = ""  # Optional: PEM CA for mTLS client cert verification
+
+[worker]
+coordinator_url = "http://coordinator:50052"
+heartbeat_interval_secs = 5
+memory_limit = "8GB"
+spill_dir = "/tmp/sqe-spill"
+# URL the coordinator uses to reach this worker's Flight service, sent in every
+# heartbeat. Leave empty to auto-derive a routable address at startup:
+#   1. POD_IP env var (Kubernetes downward API)
+#   2. HOSTNAME env var, only when it is an IP literal
+#   3. first non-loopback, non-link-local local interface address (IPv4 preferred)
+# Set explicitly when auto-derivation is wrong (NAT, multi-homed, overlay nets).
+# NEVER advertise 0.0.0.0: the coordinator rejects it (every worker would
+# collide on one bogus loopback registry entry). Scheme follows TLS:
+# https when [coordinator.tls] is set, otherwise http.
+# advertise_url = "http://worker-1.svc.cluster.local:50052"
+#
+# Shared secret authenticating worker <-> coordinator traffic. REQUIRED when
+# coordinator_url is set: the worker refuses to boot with an empty secret
+# (set worker.allow_unauthenticated = true to waive, dev only). Must match
+# coordinator.worker_secret.
+worker_secret = "change-me-shared-worker-secret"
+
+[auth]
+keycloak_url = "https://auth.local"
+realm = "iceberg"
+client_id = "sqe-client"
+client_secret = ""
+token_refresh_buffer_secs = 60
+# ssl_verification = false  # ⚠ Only set to false for local dev with self-signed certs
+
+# ── Auth providers (explicit chain, overrides legacy keycloak_url/client_id) ──
+# When configured, the auth chain uses these providers in order.
+# First provider to accept the credentials wins.
+
+# OIDC password grant — for Trino JDBC / HTTP basic auth logins
+[[auth.providers]]
+type = "oidc_password"
+token_url = "https://auth.local/realms/iceberg/protocol/openid-connect/token"
+client_id = "sqe-client"
+client_secret = ""
+roles_claim = "realm_access.roles"
+
+# Bearer token (JWT) — for pre-authenticated clients (data platform, CI/CD, Airflow)
+# IMPORTANT: issuer must match KC_HOSTNAME exactly. If KC_HOSTNAME includes a scheme
+# (e.g. "http://auth.local"), the issuer here must use the same scheme.
+[[auth.providers]]
+type = "bearer_token"
+jwks_url = "https://auth.local/realms/iceberg/protocol/openid-connect/certs"
+issuer = "https://auth.local/realms/iceberg"
+# audience = "sqe"  # ⚠ Recommended: restrict accepted tokens to this audience claim.
+                     # Without this, tokens issued for ANY service by this IdP are accepted.
+user_claim = "preferred_username"
+roles_claim = "realm_access.roles"
+
+# ── Interactive OIDC flows (Trino SSO + CLI device code) ────────
+# Uncomment to enable browser-based SSO for Trino JDBC and device code for CLI.
+#
+# The Authorization Code + PKCE flow is used for Trino external authentication:
+#   1. Trino JDBC sends query without credentials
+#   2. SQE returns 401 with WWW-Authenticate: Bearer x_redirect_server="...", x_token_server="..."
+#   3. JDBC driver opens browser for IdP login
+#   4. User authenticates, SQE receives callback, JDBC polls for token
+#
+# The Device Code flow (RFC 8628) is used for CLI / headless environments:
+#   user runs `sqe auth login`, gets a URL + code, authenticates in browser.
+#
+# [auth.external]
+# issuer = "https://idp.example.com/realms/sqe"
+# client_id = "sqe"
+# client_secret = "your-client-secret"           # Optional: omit for public clients
+# redirect_uri = "https://sqe.example.com/oauth2/callback"
+# scopes = ["openid", "profile"]
+# challenge_timeout_secs = 900                    # How long auth sessions live (default: 900s)
+# accept_invalid_certs = false                    # Set true for dev with self-signed certs
+#
+# # Optional: override OIDC discovery endpoints (auto-discovered from issuer by default)
+# # authorization_endpoint = "https://idp.example.com/realms/sqe/protocol/openid-connect/auth"
+# # token_endpoint = "https://idp.example.com/realms/sqe/protocol/openid-connect/token"
+# # device_authorization_endpoint = "https://idp.example.com/realms/sqe/protocol/openid-connect/auth/device"
+#
+# # Device code flow — separate client_id allows different scopes (e.g. offline_access)
+# [auth.external.device]
+# client_id = "sqe-cli"
+# scopes = ["openid", "profile", "offline_access"]
+
+[catalog]
+polaris_url = "http://polaris:8181/api/catalog"
+warehouse = "iceberg"
+metadata_cache_ttl_secs = 30
+default_table_format_version = 2  # 2 (default) or 3 for Iceberg v3 tables
+# trust_sort_order = false  # default: only partition columns declared as pre-sorted (safe)
+# trust_sort_order = true   # trust ALL Iceberg sort order columns (faster but risky for mixed-writer tables)
+# Hide namespace NAMES the caller has no grants in from SHOW SCHEMAS,
+# information_schema.schemata, and Flight SQL GetDbSchemas. REST/Polaris
+# backend only; probes each listed namespace once per session with the
+# caller's bearer (LOAD_NAMESPACE_METADATA) and drops names on 403.
+# Fails open on any other probe error. Set false to restore unfiltered
+# listings.
+# namespace_visibility_filter = true
+
+[storage]
+s3_endpoint = "http://s3:9000"
+s3_region = "us-east-1"
+s3_access_key = "<your-s3-access-key>"
+s3_secret_key = "<your-s3-secret-key>"
+s3_path_style = true
+
+# ── File-TVF security (read_parquet / read_csv / read_json / read_delta) ──
+# All defaults fail closed.
+#
+# [storage.tvf]
+# Local filesystem paths in TVF calls (read_csv('/etc/passwd')). Default
+# false; leave false on any shared deployment.
+# allow_local_paths = false
+#
+# Arbitrary http(s):// fetches from TVF calls. Default false (IMDS lives at
+# http://169.254.169.254). When false, only allowed_http_hosts are reachable.
+# allow_http = false
+# allowed_http_hosts = ["huggingface.co"]
+#
+# Object-store URL prefixes (s3:// s3a:// abfss:// abfs:// azure:// az://
+# gs:// gcs://) that TVFs may read using the ENGINE's storage credentials
+# above. Default EMPTY = all such reads are DENIED: without this gate any
+# authenticated user could read_csv('s3://<any-bucket>/<any-key>') with the
+# engine's static S3 key, bypassing catalog authorization entirely. Prefixes
+# match on path-segment boundaries; the literal `{user}` expands to the
+# authenticated username. TVF calls that carry complete inline credentials
+# (access_key + secret_key, an Azure key / SAS token, or an inline GCS
+# service-account key) bypass this list — the engine's key is not used.
+# allowed_object_store_prefixes = [
+#   "s3://data-platform-staging/_table-load-staging/",
+#   "s3://notebook-scratch/{user}/",
+# ]
+#
+# JWT roles (case-insensitive) allowed to read ANY object-store path with
+# the engine's credentials. Default empty = no override.
+# object_store_admin_roles = ["sqe-storage-admin"]
+
+# ── Wire-protocol security ────────────────────────────────────
+[security]
+# trusted_proxies = ["10.0.0.1"]  # IPs allowed to set x-forwarded-for for audit IPs
+#
+# allow_insecure_transport: opt out of the TLS-on-the-wire requirement.
+# When distributed mode targets a NON-loopback peer (coordinator.worker_urls
+# or worker.coordinator_url pointing off-box) and [coordinator.tls] is not
+# configured, the engine refuses to start. User bearer tokens, the worker
+# secret, and vended S3 credentials would otherwise travel in cleartext.
+# Loopback-only setups (127.0.0.1 / ::1 / localhost) stay usable without TLS.
+#
+# This example talks to a non-loopback "coordinator" host over plaintext http,
+# so the opt-in is enabled here for dev. Remove it and configure
+# [coordinator.tls] before exposing the engine on an untrusted network.
+allow_insecure_transport = true  # dev only -- enable TLS for production
+
+[policy]
+engine = "passthrough"
+
+[session]
+idle_timeout_secs = 900       # 15 minutes — sessions idle longer than this are expired
+absolute_timeout_secs = 28800  # 8 hours — sessions older than this are expired regardless of activity
+
+[metrics]
+prometheus_port = 9090
+# OTLP gRPC endpoint for traces, metrics, and logs (e.g. "http://otel-collector:4317")
+# Leave empty to disable OpenTelemetry export (structured JSON logs only)
+otlp_endpoint = ""
+# Security audit log (one JSONL entry per statement: who ran what, when, against
+# which tables). Empty disables it (the logger is a no-op). The default is empty
+# here because an unwritable path is fatal at startup, and a single example file
+# cannot know your durable location; leaving it off keeps a plain `cargo run`
+# and the quickstarts working.
+#
+# DURABILITY: the path MUST live on storage that survives process/host restart.
+# Records appended to an ephemeral location (a container emptyDir, a tmpfs, /tmp)
+# vanish on restart and the audit trail is lost. For a sovereign, fine-grained
+# security engine that is a compliance gap, so point this at a persistent mount,
+# e.g. a dedicated volume:
+#   audit_log_path = "/var/log/sqe/audit/audit.jsonl"
+# Under Helm this is wired automatically: set audit.enabled=true (default) plus
+# audit.persistence.enabled=true to back it with a PVC. See ISSUE-248.
+audit_log_path = ""
+
+# ── Query execution ───────────────────────────────────────────
+[query]
+# Maximum estimated build-side size for hash join before falling back to
+# SortMergeJoin. SortMergeJoin spills to disk via external sort, preventing
+# OOM on large joins. Default: "2GB". Set to "0" to always use hash join.
+# Supports: B, KB, MB, GB, TB.
+hash_join_memory_threshold = "2GB"
+
+# ── Query result cache ────────────────────────────────────────
+[query_cache]
+# Enable/disable the query result cache.
+enabled = true
+# Maximum total cache memory in MB.
+max_memory_mb = 256
+# Maximum size of a single cached result in MB. Results larger than this
+# are not cached.
+max_entry_mb = 5
+# Time-to-live in seconds. Cached results expire after this duration.
+ttl_secs = 300
+
+# ── Query history ─────────────────────────────────────────────
+[query_history]
+# Maximum number of query records kept in memory (viewable via
+# SELECT * FROM system.runtime.queries).
+max_entries = 10000
+# Time-to-live in seconds for query history records.
+ttl_secs = 1800

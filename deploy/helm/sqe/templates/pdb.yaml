@@ -1,0 +1,36 @@
+{{- if .Values.podDisruptionBudget.enabled }}
+# ISSUE-249 / ISSUE-221: keep a node drain or rolling upgrade from evicting the
+# coordinator and all workers at once. The coordinator is single-replica today
+# (process-local session and query state, no shared store), so minAvailable: 1
+# forces a conscious downtime decision rather than HA. The worker PDB lets a
+# drain roll through one node at a time.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "sqe.fullname" . }}-coordinator
+  labels:
+    {{- include "sqe.labels" . | nindent 4 }}
+    app.kubernetes.io/component: coordinator
+spec:
+  minAvailable: {{ .Values.podDisruptionBudget.coordinator.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "sqe.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: coordinator
+{{- if .Values.worker.enabled }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "sqe.fullname" . }}-worker
+  labels:
+    {{- include "sqe.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker
+spec:
+  maxUnavailable: {{ .Values.podDisruptionBudget.worker.maxUnavailable }}
+  selector:
+    matchLabels:
+      {{- include "sqe.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: worker
+{{- end }}
+{{- end }}

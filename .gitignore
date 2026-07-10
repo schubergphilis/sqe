@@ -1,0 +1,45 @@
+/target
+# Staged deployment configs from `make sqe-config` / `make build`.
+/dist
+*.swp
+*.swo
+.DS_Store
+tests/.test-env
+.worktrees/
+.claude/worktrees/
+.claude/scheduled_tasks.lock
+# Pre-compact conversation backups written by a Claude Code hook.
+.claude/backups/
+
+# Vendored iceberg-rust has its own resolver; its Cargo.lock is not checked in.
+vendor/iceberg-rust/Cargo.lock
+
+# Secrets & certs
+.env
+.env.*
+# Allowlist the documented template so `cp .env.example .env` works.
+!.env.example
+*.pem
+*.key
+*.crt
+*.p12
+
+# Logs
+*.log
+*.jsonl
+log*.txt
+
+# External submission scratch dirs (e.g. icebergmatrix.org submission JSON)
+docs/neuw84-submission/
+
+# Generated mdBook output (build-dir resolves here; docs.getsqe.com builds from the docs-website repo)
+/docs/target/
+
+# Subagent-driven-development scratch (ledger, briefs, reports)
+.superpowers/
+
+# tempto run artifacts
+testing/tempto/reports/
+testing/tempto/.gradle/
+testing/tempto/build/
+testing/tempto/*.hprof

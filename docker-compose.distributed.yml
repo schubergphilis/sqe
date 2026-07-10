@@ -1,0 +1,56 @@
+# docker-compose.distributed.yml — Distributed SQE stack
+#
+# Extends docker-compose.test.yml with coordinator + 2 workers.
+# Uses the same Polaris + RustFS as the integration test stack.
+#
+# Usage (the quickstart/distributed scenario wraps all three steps):
+#   docker compose -f docker-compose.test.yml -f docker-compose.distributed.yml up --build -d
+#   ./scripts/bootstrap-distributed.sh
+#   scripts/test.sh scenario distributed   # or: quickstart/distributed/run.sh --check
+
+services:
+  # ── SQE Coordinator ────────────────────────────────────────
+  coordinator:
+    build: .
+    entrypoint: ["sqe-server", "--config", "/config/coordinator.toml"]
+    volumes:
+      - ./tests/distributed/coordinator.toml:/config/coordinator.toml:ro
+    ports:
+      - "60051:50051"   # Flight SQL
+      - "28080:8080"    # Trino HTTP
+      - "29090:9090"    # Prometheus metrics
+    environment:
+      RUST_LOG: sqe=info,warn
+    depends_on:
+      polaris:
+        condition: service_healthy
+      rustfs:
+        condition: service_started
+
+  # ── SQE Worker 1 ───────────────────────────────────────────
+  worker-1:
+    build: .
+    entrypoint: ["sqe-worker", "/config/worker.toml"]
+    volumes:
+      - ./tests/distributed/worker.toml:/config/worker.toml:ro
+    ports:
+      - "60061:50052"
+      - "29091:9091"
+    environment:
+      RUST_LOG: sqe=info,warn
+    depends_on:
+      - coordinator
+
+  # ── SQE Worker 2 ───────────────────────────────────────────
+  worker-2:
+    build: .
+    entrypoint: ["sqe-worker", "/config/worker.toml"]
+    volumes:
+      - ./tests/distributed/worker.toml:/config/worker.toml:ro
+    ports:
+      - "60062:50052"
+      - "29092:9091"
+    environment:
+      RUST_LOG: sqe=info,warn
+    depends_on:
+      - coordinator
