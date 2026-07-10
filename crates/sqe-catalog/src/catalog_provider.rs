@@ -1,4 +1,5 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
+use std::time::{Duration, Instant};
 
 use datafusion::catalog::{CatalogProvider, SchemaProvider};
 use futures::StreamExt;
@@ -16,6 +17,64 @@ use crate::schema_provider::SqeSchemaProvider;
 /// 30-namespace catalog costs ~4 round-trip waves, paid once per session
 /// catalog construction, never per query.
 const NAMESPACE_PROBE_CONCURRENCY: usize = 8;
+
+/// Minimum interval between miss-triggered live namespace re-lists (#368).
+/// A query probing a genuinely nonexistent schema must not turn into a
+/// Polaris list-namespaces storm; one probe per window per provider is
+/// enough to pick up externally committed namespaces.
+const NAMESPACE_RELIST_COOLDOWN: Duration = Duration::from_secs(5);
+
+/// Answer "is `name` in the namespace snapshot?", re-listing live on a miss.
+///
+/// A miss is exactly the moment the snapshot is provably stale (#368:
+/// namespaces committed through the REST API by external writers never
+/// fire our local DDL invalidation hooks), so the extra catalog round
+/// trip sits on the failure path only; hits never call `relist`. The
+/// cooldown gate absorbs miss-storms, and a failed or unavailable
+/// re-list keeps the previous snapshot untouched.
+pub(crate) fn contains_or_refresh<F>(
+    names: &RwLock<Vec<String>>,
+    last_relist: &Mutex<Option<Instant>>,
+    cooldown: Duration,
+    name: &str,
+    relist: F,
+) -> bool
+where
+    F: FnOnce() -> Option<sqe_core::Result<Vec<String>>>,
+{
+    if names
+        .read()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .any(|n| n == name)
+    {
+        return true;
+    }
+
+    {
+        let mut last = last_relist.lock().unwrap_or_else(PoisonError::into_inner);
+        if last.is_some_and(|at| at.elapsed() < cooldown) {
+            return false;
+        }
+        *last = Some(Instant::now());
+    }
+
+    match relist() {
+        Some(Ok(fresh)) => {
+            let found = fresh.iter().any(|n| n == name);
+            *names.write().unwrap_or_else(PoisonError::into_inner) = fresh;
+            found
+        }
+        Some(Err(e)) => {
+            debug!(schema = name, error = %e, "live namespace re-list failed; keeping cached snapshot");
+            false
+        }
+        None => {
+            debug!(schema = name, "live namespace re-list skipped: no tokio runtime");
+            false
+        }
+    }
+}
 
 /// Probe-filter a namespace list with bounded concurrency, preserving the
 /// input order. `probe` answers "may this caller see the namespace?"; the
@@ -55,7 +114,15 @@ pub struct SqeCatalogProvider {
     warehouse: String,
     /// Cached namespace names, populated at construction time.
     /// This avoids async calls in the synchronous `schema_names()` method.
-    cached_namespaces: Vec<String>,
+    /// A `schema()` miss refreshes the snapshot live (#368), so namespaces
+    /// committed by external REST writers become visible without a restart.
+    cached_namespaces: RwLock<Vec<String>>,
+    /// Whether miss-triggered re-lists apply the same per-namespace
+    /// visibility probes as construction. Must match, or a stale-miss
+    /// refresh would resurface names the caller is not granted.
+    namespace_visibility_filter: bool,
+    /// Instant of the last miss-triggered re-list; gates the cooldown.
+    namespace_relist_at: Mutex<Option<Instant>>,
     /// Optional policy store for filtering restricted columns in information_schema.
     policy_store: Option<Arc<dyn PolicyStore>>,
     /// Session user identity for policy resolution.
@@ -83,7 +150,7 @@ impl std::fmt::Debug for SqeCatalogProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SqeCatalogProvider")
             .field("warehouse", &self.warehouse)
-            .field("cached_namespaces", &self.cached_namespaces)
+            .field("cached_namespaces", &self.cached_namespace_names())
             .field("has_policy_store", &self.policy_store.is_some())
             .field("session_user", &self.session_user)
             .finish()
@@ -153,8 +220,13 @@ impl SqeCatalogProvider {
         // appears in SHOW CATALOGS / system.jdbc.catalogs) but exposes no
         // namespaces to this caller, instead of aborting the whole session
         // context build. Per-operation checks still protect the data. (#5)
-        let mut namespaces = match session_catalog.list_namespaces().await {
-            Ok(ns) => ns,
+        let cached_namespaces = match Self::list_visible_namespace_names(
+            Arc::clone(&session_catalog),
+            namespace_visibility_filter,
+        )
+        .await
+        {
+            Ok(names) => names,
             Err(e) if e.error_code() == sqe_core::SqeErrorCode::AccessDenied => {
                 debug!(
                     warehouse = %warehouse,
@@ -165,29 +237,6 @@ impl SqeCatalogProvider {
             Err(e) => return Err(e),
         };
 
-        if namespace_visibility_filter && session_catalog.is_rest_backend() {
-            let listed = namespaces.len();
-            let catalog = &session_catalog;
-            namespaces = filter_visible_namespaces(
-                namespaces,
-                NAMESPACE_PROBE_CONCURRENCY,
-                |ns| async move { catalog.namespace_visible(&ns).await },
-            )
-            .await;
-            if namespaces.len() < listed {
-                debug!(
-                    listed,
-                    visible = namespaces.len(),
-                    "Namespace visibility filter hid ungranted namespace names"
-                );
-            }
-        }
-
-        let cached_namespaces: Vec<String> = namespaces
-            .iter()
-            .map(|ns| ns.as_ref().iter().map(|s| s.as_str()).collect::<Vec<_>>().join("."))
-            .collect();
-
         debug!(
             namespace_count = cached_namespaces.len(),
             "Initialized SqeCatalogProvider"
@@ -197,7 +246,9 @@ impl SqeCatalogProvider {
             session_catalog,
             storage_config,
             warehouse,
-            cached_namespaces,
+            cached_namespaces: RwLock::new(cached_namespaces),
+            namespace_visibility_filter,
+            namespace_relist_at: Mutex::new(None),
             policy_store,
             session_user,
             prom_metrics: None,
@@ -270,7 +321,9 @@ impl SqeCatalogProvider {
             session_catalog,
             storage_config,
             warehouse,
-            cached_namespaces: namespaces,
+            cached_namespaces: RwLock::new(namespaces),
+            namespace_visibility_filter: true,
+            namespace_relist_at: Mutex::new(None),
             policy_store: None,
             session_user: None,
             prom_metrics: None,
@@ -282,12 +335,54 @@ impl SqeCatalogProvider {
             runtime_filter_wait_ms: crate::iceberg_scan::DEFAULT_RUNTIME_FILTER_WAIT_MS,
         }
     }
+
+    /// List namespace names visible to this session, applying the same
+    /// per-namespace probes as construction when `visibility_filter` is on.
+    /// Shared by the constructor snapshot and the miss-triggered re-list so
+    /// the two can never disagree on what the caller may see.
+    async fn list_visible_namespace_names(
+        session_catalog: Arc<SessionCatalog>,
+        visibility_filter: bool,
+    ) -> sqe_core::Result<Vec<String>> {
+        let mut namespaces = session_catalog.list_namespaces().await?;
+
+        if visibility_filter && session_catalog.is_rest_backend() {
+            let listed = namespaces.len();
+            let catalog = &session_catalog;
+            namespaces = filter_visible_namespaces(
+                namespaces,
+                NAMESPACE_PROBE_CONCURRENCY,
+                |ns| async move { catalog.namespace_visible(&ns).await },
+            )
+            .await;
+            if namespaces.len() < listed {
+                debug!(
+                    listed,
+                    visible = namespaces.len(),
+                    "Namespace visibility filter hid ungranted namespace names"
+                );
+            }
+        }
+
+        Ok(namespaces
+            .iter()
+            .map(|ns| ns.as_ref().iter().map(|s| s.as_str()).collect::<Vec<_>>().join("."))
+            .collect())
+    }
+
+    /// Snapshot of the cached namespace names.
+    fn cached_namespace_names(&self) -> Vec<String> {
+        self.cached_namespaces
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
 }
 
 impl CatalogProvider for SqeCatalogProvider {
 
     fn schema_names(&self) -> Vec<String> {
-        let mut names = self.cached_namespaces.clone();
+        let mut names = self.cached_namespace_names();
         names.push("information_schema".to_string());
         names
     }
@@ -304,11 +399,29 @@ impl CatalogProvider for SqeCatalogProvider {
                 // schemata/tables/columns must derive from the same
                 // (visibility-filtered) list SHOW SCHEMAS serves, not a
                 // second unfiltered listNamespaces.
-                .with_cached_namespaces(self.cached_namespaces.clone()),
+                .with_cached_namespaces(self.cached_namespace_names()),
             ));
         }
 
-        if !self.cached_namespaces.contains(&name.to_string()) {
+        // On a miss, re-list live before answering None (#368): external
+        // REST commits never fire the local invalidation hooks, so the
+        // frozen construction-time snapshot is the only thing standing
+        // between an externally created namespace and this session. Same
+        // sync-async bridge the schema provider uses for table_names().
+        let relist = || {
+            let catalog = Arc::clone(&self.session_catalog);
+            let visibility_filter = self.namespace_visibility_filter;
+            crate::runtime_bridge::block_on_compat(async move {
+                Self::list_visible_namespace_names(catalog, visibility_filter).await
+            })
+        };
+        if !contains_or_refresh(
+            &self.cached_namespaces,
+            &self.namespace_relist_at,
+            NAMESPACE_RELIST_COOLDOWN,
+            name,
+            relist,
+        ) {
             debug!(schema = name, "Schema not found in cached namespaces");
             return None;
         }
@@ -383,5 +496,95 @@ mod tests {
         .await;
         assert_eq!(out.len(), 20);
         assert_eq!(probes.load(Ordering::SeqCst), 20);
+    }
+
+    fn snapshot(names: &[&str]) -> RwLock<Vec<String>> {
+        RwLock::new(names.iter().map(|s| s.to_string()).collect())
+    }
+
+    /// #368 regression shape: a namespace committed after construction is
+    /// invisible in the snapshot; the miss re-lists live, finds it, and the
+    /// snapshot is updated for subsequent callers. Under the pre-fix frozen
+    /// snapshot this lookup answered false until process restart.
+    #[test]
+    fn miss_relists_and_finds_externally_added_namespace() {
+        let names = snapshot(&["public"]);
+        let last = Mutex::new(None);
+        let found = contains_or_refresh(&names, &last, Duration::from_secs(5), "bank", || {
+            Some(Ok(vec!["public".to_string(), "bank".to_string()]))
+        });
+        assert!(found);
+        assert_eq!(*names.read().unwrap(), vec!["public", "bank"]);
+    }
+
+    /// Repeated misses inside the cooldown window run exactly one re-list;
+    /// a nonexistent-schema probe loop cannot hammer the catalog.
+    #[test]
+    fn cooldown_suppresses_repeated_relists() {
+        let names = snapshot(&["public"]);
+        let last = Mutex::new(None);
+        let relists = AtomicUsize::new(0);
+        for _ in 0..5 {
+            let found =
+                contains_or_refresh(&names, &last, Duration::from_secs(60), "nope", || {
+                    relists.fetch_add(1, Ordering::SeqCst);
+                    Some(Ok(vec!["public".to_string()]))
+                });
+            assert!(!found);
+        }
+        assert_eq!(relists.load(Ordering::SeqCst), 1);
+    }
+
+    /// A cooldown of zero re-arms immediately: the gate is a rate limit,
+    /// not a one-shot.
+    #[test]
+    fn zero_cooldown_rearms() {
+        let names = snapshot(&[]);
+        let last = Mutex::new(None);
+        let relists = AtomicUsize::new(0);
+        for _ in 0..3 {
+            contains_or_refresh(&names, &last, Duration::ZERO, "nope", || {
+                relists.fetch_add(1, Ordering::SeqCst);
+                Some(Ok(Vec::new()))
+            });
+        }
+        assert_eq!(relists.load(Ordering::SeqCst), 3);
+    }
+
+    /// The steady-state hit path never re-lists: cached names answer
+    /// directly and the closure must not run.
+    #[test]
+    fn hit_does_not_relist() {
+        let names = snapshot(&["public"]);
+        let last = Mutex::new(None);
+        let found = contains_or_refresh(&names, &last, Duration::from_secs(5), "public", || {
+            panic!("hit path must not re-list")
+        });
+        assert!(found);
+    }
+
+    /// A failed re-list keeps the previous snapshot instead of wiping it:
+    /// a transient catalog error must not blank out a working session.
+    #[test]
+    fn failed_relist_keeps_previous_snapshot() {
+        let names = snapshot(&["public"]);
+        let last = Mutex::new(None);
+        let found = contains_or_refresh(&names, &last, Duration::from_secs(5), "bank", || {
+            Some(Err(sqe_core::SqeError::Catalog("polaris down".to_string())))
+        });
+        assert!(!found);
+        assert_eq!(*names.read().unwrap(), vec!["public"]);
+    }
+
+    /// `None` from the bridge (no tokio runtime) degrades to the frozen
+    /// answer, snapshot untouched.
+    #[test]
+    fn no_runtime_keeps_previous_snapshot() {
+        let names = snapshot(&["public"]);
+        let last = Mutex::new(None);
+        let found =
+            contains_or_refresh(&names, &last, Duration::from_secs(5), "bank", || None);
+        assert!(!found);
+        assert_eq!(*names.read().unwrap(), vec!["public"]);
     }
 }
