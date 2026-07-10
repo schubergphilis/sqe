@@ -77,6 +77,27 @@ const MAX_BYTE_RANGE_CONCURRENCY: usize = 16;
 /// their row groups decode in parallel across runtime worker threads.
 pub const DEFAULT_TASK_SPLIT_TARGET_SIZE: u64 = 128 * 1024 * 1024;
 
+/// SQE PATCH (sqe#367): admission control for file scan task decode work.
+///
+/// The reader calls [`DecodeGate::admit`] before dispatching each file scan
+/// (sub)task on the parallel decode path and holds the returned guard until
+/// that subtask's batches have all been forwarded. Engines implement this to
+/// bound decode concurrency across the scan's partitions (each `read()` call
+/// otherwise gets its own `concurrency_limit_data_files`-wide semaphore) and
+/// to reserve the estimated decode memory against an operator memory pool,
+/// so memory pressure surfaces as a typed scan error instead of a host OOM
+/// kill.
+pub trait DecodeGate: Send + Sync + std::fmt::Debug {
+    /// Admit a decode whose compressed input is approximately
+    /// `estimated_bytes`. Resolves once capacity is available; the returned
+    /// guard releases the admission on drop. An error denies the decode and
+    /// fails the scan stream.
+    fn admit(
+        &self,
+        estimated_bytes: u64,
+    ) -> BoxFuture<'_, Result<Box<dyn std::any::Any + Send>>>;
+}
+
 /// Builder to create ArrowReader
 pub struct ArrowReaderBuilder {
     batch_size: Option<usize>,
@@ -87,6 +108,7 @@ pub struct ArrowReaderBuilder {
     metadata_size_hint: Option<usize>,
     dynamic_predicate: Option<Arc<dyn DynamicPredicate>>,
     task_split_target_size: Option<u64>,
+    decode_gate: Option<Arc<dyn DecodeGate>>,
 }
 
 impl ArrowReaderBuilder {
@@ -103,7 +125,15 @@ impl ArrowReaderBuilder {
             metadata_size_hint: None,
             dynamic_predicate: None,
             task_split_target_size: Some(DEFAULT_TASK_SPLIT_TARGET_SIZE),
+            decode_gate: None,
         }
+    }
+
+    /// SQE PATCH (sqe#367): attach a [`DecodeGate`] consulted before each
+    /// file scan (sub)task decode. See the trait docs.
+    pub fn with_decode_gate(mut self, gate: Arc<dyn DecodeGate>) -> Self {
+        self.decode_gate = Some(gate);
+        self
     }
 
     /// Sets the byte-range split target for large Parquet file scan tasks,
@@ -177,6 +207,7 @@ impl ArrowReaderBuilder {
             metadata_size_hint: self.metadata_size_hint,
             dynamic_predicate: self.dynamic_predicate,
             task_split_target_size: self.task_split_target_size,
+            decode_gate: self.decode_gate,
         }
     }
 }
@@ -201,6 +232,9 @@ pub struct ArrowReader {
     /// disables splitting. See
     /// [`ArrowReaderBuilder::with_task_split_target_size`].
     task_split_target_size: Option<u64>,
+    /// SQE PATCH (sqe#367): optional decode admission gate. See
+    /// [`ArrowReaderBuilder::with_decode_gate`].
+    decode_gate: Option<Arc<dyn DecodeGate>>,
 }
 
 impl ArrowReader {
@@ -219,6 +253,7 @@ impl ArrowReader {
         let metadata_size_hint = self.metadata_size_hint;
         let dynamic_predicate = self.dynamic_predicate.clone();
         let task_split_target_size = self.task_split_target_size;
+        let decode_gate = self.decode_gate.clone();
 
         // Per-scan I/O metrics.  Cloned into both the data-file path
         // (`process_file_scan_task`) and the delete-file loader so the
@@ -230,8 +265,12 @@ impl ArrowReader {
             .with_scan_metrics(scan_metrics.clone());
         let bytes_read = scan_metrics.bytes_read_counter().clone();
 
-        // Fast-path for single concurrency to avoid overhead of try_flatten_unordered
-        let stream: ArrowRecordBatchStream = if concurrency_limit_data_files == 1 {
+        // Fast-path for single concurrency to avoid overhead of try_flatten_unordered.
+        // SQE PATCH (sqe#367): a decode gate forces the general path (with an
+        // internal semaphore of 1) so admission still applies at concurrency 1.
+        let stream: ArrowRecordBatchStream = if concurrency_limit_data_files == 1
+            && decode_gate.is_none()
+        {
             Box::pin(
                 tasks
                     .and_then(move |task| {
@@ -296,6 +335,30 @@ impl ArrowReader {
                             // The semaphore is never closed; bail defensively.
                             Err(_) => break 'outer,
                         };
+                        // SQE PATCH (sqe#367): gate admission AFTER the
+                        // per-read permit so the wait order is always
+                        // per-read -> gate; both release together when the
+                        // subtask's worker finishes. A denial (typically a
+                        // memory-pool reservation failure) fails the scan
+                        // with the gate's typed error instead of decoding
+                        // into an unaccounted allocation.
+                        let admission = match &decode_gate {
+                            Some(gate) => {
+                                let estimate = if subtask.length > 0 {
+                                    subtask.length
+                                } else {
+                                    subtask.file_size_in_bytes
+                                };
+                                match gate.admit(estimate).await {
+                                    Ok(guard) => Some(guard),
+                                    Err(err) => {
+                                        let _ = tx.send(Err(err)).await;
+                                        break 'outer;
+                                    }
+                                }
+                            }
+                            None => None,
+                        };
                         let tx = tx.clone();
                         let file_io = file_io.clone();
                         let delete_file_loader = delete_file_loader.clone();
@@ -303,6 +366,10 @@ impl ArrowReader {
                         let bytes_read = bytes_read.clone();
                         crate::runtime::spawn(async move {
                             let _permit = permit;
+                            // SQE PATCH (sqe#367): held until every batch of
+                            // this subtask has been sent, so the gate's
+                            // reservation covers the decode working set.
+                            let _admission = admission;
                             let stream = Self::process_file_scan_task(
                                 subtask,
                                 batch_size,
