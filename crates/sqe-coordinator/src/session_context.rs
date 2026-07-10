@@ -393,6 +393,16 @@ pub async fn create_session_context(
             // `enable_url_table()` (single-tenant, `allow_local_paths = true`).
             let mut ctx = ctx;
 
+            // #366: two-phase rewrite for COUNT(DISTINCT x) with count()
+            // companions. DataFusion's built-in single-distinct rule rejects
+            // the shape when COUNT(*) / COUNT(col) rides along, dropping the
+            // whole aggregation onto per-group HashSet distinct state (8-12GB
+            // and a degenerate spill for bank q03 at SF10). The rule is
+            // complementary: it only fires on plans the built-in rule skips.
+            ctx.add_optimizer_rule(Arc::new(
+                sqe_planner::SingleDistinctCountCompanionRule::new(),
+            ));
+
             // Register DataFusion's built-in in-memory catalog so DML helpers can register
             // temporary MemTables under `datafusion.public.<name>` without hitting the
             // Iceberg catalog which does not support dynamic table registration.
