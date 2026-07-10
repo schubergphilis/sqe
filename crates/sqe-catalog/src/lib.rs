@@ -38,6 +38,7 @@ pub mod read_csv;
 // pub mod read_delta;
 pub mod read_json;
 pub mod read_parquet;
+pub mod scan_memory;
 pub mod sort_order;
 #[cfg(feature = "rest")]
 pub mod system_catalog;

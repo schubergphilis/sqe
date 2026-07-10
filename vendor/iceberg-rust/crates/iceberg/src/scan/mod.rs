@@ -31,7 +31,7 @@ use futures::channel::mpsc::{Sender, channel};
 use futures::stream::BoxStream;
 use futures::{SinkExt, StreamExt, TryStreamExt};
 
-use crate::arrow::{ArrowReaderBuilder, DEFAULT_TASK_SPLIT_TARGET_SIZE};
+use crate::arrow::{ArrowReaderBuilder, DEFAULT_TASK_SPLIT_TARGET_SIZE, DecodeGate};
 use crate::delete_file_index::DeleteFileIndex;
 use crate::expr::visitors::inclusive_metrics_evaluator::InclusiveMetricsEvaluator;
 use crate::expr::{Bind, BoundPredicate, DynamicPredicate, Predicate};
@@ -71,6 +71,9 @@ pub struct TableScanBuilder<'a> {
     row_group_filtering_enabled: bool,
     row_selection_enabled: bool,
     task_split_target_size: Option<u64>,
+    /// SQE PATCH (sqe#367): optional decode admission gate, forwarded to
+    /// the arrow reader. See [`crate::arrow::DecodeGate`].
+    decode_gate: Option<Arc<dyn DecodeGate>>,
 }
 
 impl<'a> TableScanBuilder<'a> {
@@ -93,7 +96,15 @@ impl<'a> TableScanBuilder<'a> {
             row_group_filtering_enabled: true,
             row_selection_enabled: false,
             task_split_target_size: Some(DEFAULT_TASK_SPLIT_TARGET_SIZE),
+            decode_gate: None,
         }
+    }
+
+    /// SQE PATCH (sqe#367): attach a [`DecodeGate`] consulted before each
+    /// file scan (sub)task decode. See [`crate::arrow::DecodeGate`].
+    pub fn with_decode_gate(mut self, gate: Arc<dyn DecodeGate>) -> Self {
+        self.decode_gate = Some(gate);
+        self
     }
 
     /// Target byte size for splitting a single large data file into
@@ -286,6 +297,7 @@ impl<'a> TableScanBuilder<'a> {
                         row_selection_enabled: self.row_selection_enabled,
                         task_split_target_size: self.task_split_target_size,
                         dynamic_predicate: self.dynamic_predicate.clone(),
+                        decode_gate: self.decode_gate.clone(),
                     });
                 };
                 current_snapshot_id.clone()
@@ -402,6 +414,7 @@ impl<'a> TableScanBuilder<'a> {
             row_selection_enabled: self.row_selection_enabled,
             task_split_target_size: self.task_split_target_size,
             dynamic_predicate: self.dynamic_predicate,
+            decode_gate: self.decode_gate,
         })
     }
 }
@@ -440,6 +453,10 @@ pub struct TableScan {
     /// [`TableScanBuilder::with_dynamic_predicate`]). Sampled by the
     /// reader once per file scan task and ANDed into the static filter.
     dynamic_predicate: Option<Arc<dyn DynamicPredicate>>,
+
+    /// SQE PATCH (sqe#367): optional decode admission gate (see
+    /// [`TableScanBuilder::with_decode_gate`]). Forwarded to the reader.
+    decode_gate: Option<Arc<dyn DecodeGate>>,
 }
 
 impl TableScan {
@@ -585,6 +602,10 @@ impl TableScan {
         if let Some(dynamic_predicate) = self.dynamic_predicate.clone() {
             arrow_reader_builder =
                 arrow_reader_builder.with_dynamic_predicate(dynamic_predicate);
+        }
+
+        if let Some(decode_gate) = self.decode_gate.clone() {
+            arrow_reader_builder = arrow_reader_builder.with_decode_gate(decode_gate);
         }
 
         arrow_reader_builder.build().read(tasks)

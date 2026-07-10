@@ -632,7 +632,14 @@ fn classify_execution_error(msg: &str) -> SqeErrorCode {
         SqeErrorCode::QueryCancelled
     } else if lower.contains("already referenced") || lower.contains("commit conflict") {
         SqeErrorCode::CommitConflict
-    } else if lower.contains("rate limit") {
+    } else if lower.contains("rate limit")
+        // DataFusion memory-pool denials: `DataFusionError::ResourcesExhausted`
+        // renders as "Resources exhausted: Failed to allocate additional N
+        // bytes for <consumer> ...". Emitted by operator spill pressure and by
+        // the pool-tracked scan/write buffers (issue #367).
+        || lower.contains("resources exhausted")
+        || lower.contains("failed to allocate")
+    {
         SqeErrorCode::ResourceExhausted
     } else {
         SqeErrorCode::ExecutionFailed
@@ -933,6 +940,20 @@ mod tests {
         let code = err.error_code();
         assert_eq!(code, SqeErrorCode::TableNotFound);
         assert!(code.is_user_error());
+    }
+
+    #[test]
+    fn classify_execution_pool_denial_as_resource_exhausted() {
+        // DataFusion memory-pool denials (operator spill pressure, the
+        // pool-tracked scan decode path from issue #367) must surface as
+        // RESOURCE_EXHAUSTED, not a generic execution failure.
+        let err = SqeError::Execution(
+            "Resources exhausted: Failed to allocate additional 134217728 bytes for \
+             iceberg-scan-decode:iceberg.tpch.lineitem with 0 bytes already allocated \
+             for this reservation - 1048576 bytes remain available for the total pool"
+                .into(),
+        );
+        assert_eq!(err.error_code(), SqeErrorCode::ResourceExhausted);
     }
 
     #[test]
