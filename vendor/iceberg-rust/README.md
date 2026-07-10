@@ -44,7 +44,7 @@ The RisingWave fork provides all of these.
 
 ## SQE-only patches in this vendor copy
 
-Five patch families ride on top of the upstream snapshot. Each is
+These patch families ride on top of the upstream snapshot. Each is
 documented inline at the touch site so a future rebase can re-apply
 them quickly.
 
@@ -77,6 +77,17 @@ them quickly.
    schema (time-travel semantics preserved). Files:
    `crates/iceberg/src/scan/mod.rs` (build + two regression tests). Not filed
    upstream yet.
+7. **`DecodeGate` decode admission hook (SQE issue #367)**: optional
+   `Arc<dyn DecodeGate>` on `ArrowReaderBuilder` / `TableScanBuilder`,
+   consulted before each file scan (sub)task decode on the parallel path
+   and held until the subtask's batches are forwarded. SQE implements it
+   (`sqe-catalog::scan_memory::ScanDecodeGate`) to bound decode
+   concurrency per scan node and reserve the estimated decode memory
+   against the DataFusion pool, so pressure fails typed instead of
+   OOM-killing the host. All sites marked `SQE PATCH (sqe#367)`. Files:
+   `crates/iceberg/src/arrow/reader.rs`, `crates/iceberg/src/scan/mod.rs`.
+   Must be re-applied on the next vendor refresh (SQE issue #370). Not
+   filed upstream yet.
 
 ## Cherry-picks from apache/iceberg-rust main
 
