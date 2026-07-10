@@ -12,10 +12,13 @@ path = "src/main.rs"
 
 [features]
 # `aws` turns on the Glue + S3 Tables catalog backends for the embedded
-# engine (`--catalog-backend glue|s3tables`). Default-on so a normal
-# `cargo install` gets it; drop it (`--no-default-features`) for a slim
-# build with no AWS SDK weight.
-default = ["aws"]
+# engine (`--catalog-backend glue|s3tables`). Default-OFF: as a workspace
+# member, a default-on `aws` unifies aws-sdk-glue + aws-sdk-s3tables into
+# the single shared sqe-catalog build of every `cargo build` /
+# `cargo test` at the repo root, even though coordinator and worker
+# never ask for them. Opt in with `cargo install sqe-cli --features aws`
+# or `cargo build -p sqe-cli --features aws`.
+default = []
 aws = ["sqe-catalog/glue", "sqe-catalog/s3tables"]
 # DEP-07: the `delta` feature (read_delta() TVF) is REMOVED for the DataFusion 54
 # bump. deltalake-core has no DF 54 release yet. Restore this line and the

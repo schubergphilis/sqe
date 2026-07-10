@@ -42,8 +42,8 @@ BENCH_SKIP_TEST="${BENCH_SKIP_TEST:-}"
 
 PROFILE="${PROFILE:-release}"
 case "$PROFILE" in
-    release|debug) ;;
-    *) echo "ERROR: PROFILE must be 'release' or 'debug', got: '$PROFILE'" >&2; exit 1 ;;
+    release|debug|dev-release) ;;
+    *) echo "ERROR: PROFILE must be 'release', 'dev-release' or 'debug', got: '$PROFILE'" >&2; exit 1 ;;
 esac
 BENCH_BIN="$ROOT_DIR/target/$PROFILE/sqe-bench"
 SQE_BIN="$ROOT_DIR/target/$PROFILE/sqe-coordinator"
@@ -89,9 +89,11 @@ echo ""
 if [ ! -x "$BENCH_BIN" ] || [ ! -x "$SQE_BIN" ]; then
     echo "Building sqe-bench + sqe-coordinator (profile: $PROFILE)..."
     if [ "$PROFILE" = "release" ]; then
-        cargo build -p sqe-bench -p sqe-coordinator --release
+        cargo build -p sqe-bench -p sqe-coordinator --bin sqe-bench --bin sqe-coordinator --release
+    elif [ "$PROFILE" = "dev-release" ]; then
+        cargo build -p sqe-bench -p sqe-coordinator --bin sqe-bench --bin sqe-coordinator --profile dev-release
     else
-        cargo build -p sqe-bench -p sqe-coordinator
+        cargo build -p sqe-bench -p sqe-coordinator --bin sqe-bench --bin sqe-coordinator
     fi
 fi
 

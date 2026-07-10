@@ -58,7 +58,12 @@ object_store = { version = "0.13", features = ["aws", "http", "azure", "gcp"] }
 # Five apache main fixes cherry-picked on top: #2118, #2348, #2307, #2351, #2360.
 # Vendored in vendor/iceberg-rust/ — see vendor/iceberg-rust/README.md
 iceberg = { path = "vendor/iceberg-rust/crates/iceberg" }
-iceberg-catalog-rest = { path = "vendor/iceberg-rust/crates/catalog/rest", features = ["aws-sigv4"] }
+# No default `aws-sigv4` here: the feature drags aws-config plus the
+# aws-sdk-sso/ssooidc/sts credential chain into every build, including the
+# pure-Polaris default. Builds that talk to SigV4-signed REST endpoints
+# (Glue REST, S3 Tables REST) opt in via sqe-catalog's `rest-sigv4`
+# feature, which glue / s3tables / full-backends enable.
+iceberg-catalog-rest = { path = "vendor/iceberg-rust/crates/catalog/rest" }
 iceberg-datafusion = { path = "vendor/iceberg-rust/crates/integrations/datafusion" }
 # Optional catalog backends, vendored from upstream apache/iceberg-rust
 # v0.9.0 alongside the RisingWave fork. Gated by cargo features in

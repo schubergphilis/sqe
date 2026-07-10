@@ -19,9 +19,11 @@ set -euo pipefail
 #   ./scripts/benchmark-test.sh tpch ssb           # run TPC-H and SSB
 #   BENCH_SCALE=0.01 ./scripts/benchmark-test.sh   # use SF0.01 (faster)
 #   BENCH_PROTOCOL=trino ./scripts/benchmark-test.sh  # use Trino HTTP
-#   PROFILE=debug ./scripts/benchmark-test.sh      # debug build + target/debug/ binaries
-#                                                  # (default: release; skips --release
-#                                                  # for faster incremental rebuilds)
+#   PROFILE=dev-release ./scripts/benchmark-test.sh  # release opt-level without LTO,
+#                                                  # incremental — fast rebuilds while
+#                                                  # iterating, representative query perf
+#   PROFILE=debug ./scripts/benchmark-test.sh      # unoptimized build + target/debug/
+#                                                  # binaries (default: release)
 #   ./scripts/benchmark-test.sh --compare-trino tpch  # compare SQE vs Trino output
 #   ./scripts/benchmark-test.sh --compare-trino       # compare all benchmarks
 #   BENCH_BLOOM_FILTER=1 ./scripts/benchmark-test.sh --compare-trino tpch  # bloom A/B
@@ -165,16 +167,18 @@ if [ "$BENCH_WAREHOUSE" = "external" ]; then
 fi
 
 # Build profile: `release` (default) uses `cargo build --release` and
-# runs binaries out of `target/release/`. `debug` skips `--release` for
-# faster incremental rebuilds and runs out of `target/debug/`. The debug
-# profile is slower at query time but dramatically faster to compile, so
-# it is the right default when iterating on the coordinator between
-# benchmark runs. Scale factors beyond SF1 should still use release.
+# runs binaries out of `target/release/`. `dev-release` keeps the same
+# opt-level but drops thin-LTO, cranks codegen-units, and compiles
+# incrementally — query perf stays representative while rebuilds after a
+# small code change are minutes faster; use it when iterating on the
+# coordinator between benchmark runs. `debug` skips optimization
+# entirely: fastest compile, slowest queries, fine for smoke tests.
+# Committed baseline numbers should still come from `release`.
 PROFILE="${PROFILE:-release}"
 case "$PROFILE" in
-    release|debug) ;;
+    release|debug|dev-release) ;;
     *)
-        echo "ERROR: PROFILE must be 'release' or 'debug', got: '$PROFILE'" >&2
+        echo "ERROR: PROFILE must be 'release', 'dev-release' or 'debug', got: '$PROFILE'" >&2
         exit 1
         ;;
 esac
@@ -206,9 +210,11 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 echo "  Building sqe-bench (profile: $PROFILE)..."
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 if [ "$PROFILE" = "release" ]; then
-    cargo build -p sqe-bench -p sqe-coordinator --release 2>&1
+    cargo build -p sqe-bench -p sqe-coordinator --bin sqe-bench --bin sqe-coordinator --release 2>&1
+elif [ "$PROFILE" = "dev-release" ]; then
+    cargo build -p sqe-bench -p sqe-coordinator --bin sqe-bench --bin sqe-coordinator --profile dev-release 2>&1
 else
-    cargo build -p sqe-bench -p sqe-coordinator 2>&1
+    cargo build -p sqe-bench -p sqe-coordinator --bin sqe-bench --bin sqe-coordinator 2>&1
 fi
 BENCH_BIN="$ROOT_DIR/target/$PROFILE/sqe-bench"
 SQE_BIN="$ROOT_DIR/target/$PROFILE/sqe-coordinator"

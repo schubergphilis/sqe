@@ -200,7 +200,7 @@ fi
 
 echo ""
 echo "Building sqe-bench + sqe-coordinator (release)..."
-cargo build --release -p sqe-bench -p sqe-coordinator 2>&1 | tail -3
+cargo build --release -p sqe-bench -p sqe-coordinator --bin sqe-bench --bin sqe-coordinator 2>&1 | tail -3
 BENCH_BIN="$ROOT_DIR/target/release/sqe-bench"
 COORD_BIN="$ROOT_DIR/target/release/sqe-coordinator"
 echo ""
