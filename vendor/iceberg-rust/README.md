@@ -1,10 +1,9 @@
 # iceberg-rust (SQE vendored fork)
 
 This is a vendored copy of the [RisingWave Labs iceberg-rust fork](https://github.com/risingwavelabs/iceberg-rust),
-branch `dev_rebase_main_20260303` at commit `c034b19105fa`. The branch carries
+branch `dev_rebase_main_20260303` at commit `813e54419b43`. The branch carries
 DataFusion 53.0 / Arrow 58 / Parquet 58 (RW PR #148, 2026-04-15) plus writer
-and transaction fixes on top. (The branch tip `9491dcab` is a CODEOWNERS-only
-change and is not vendored.)
+and transaction fixes on top.
 
 ## Vendored crates
 
@@ -38,7 +37,7 @@ The RisingWave fork provides all of these.
 
 ## Upstream tracking
 
-- RisingWave fork: `dev_rebase_main_20260303` @ `c034b19105fa`
+- RisingWave fork: `dev_rebase_main_20260303` @ `813e54419b43`
 - Apache upstream: tracking PRs #2185 (OverwriteAction) and #2203 (RowDeltaAction)
 - When upstream merges these, SQE will migrate to official apache/iceberg-rust
 
@@ -86,8 +85,9 @@ them quickly.
    against the DataFusion pool, so pressure fails typed instead of
    OOM-killing the host. All sites marked `SQE PATCH (sqe#367)`. Files:
    `crates/iceberg/src/arrow/reader.rs`, `crates/iceberg/src/scan/mod.rs`.
-   Must be re-applied on the next vendor refresh (SQE issue #370). Not
-   filed upstream yet.
+   Survived the `813e544` refresh (issue #370) via auto-merge; verify the
+   `SQE PATCH (sqe#367)` markers on the next refresh too. Not filed
+   upstream yet.
 
 ## Cherry-picks from apache/iceberg-rust main
 
@@ -185,6 +185,47 @@ reverted). SQE excludes this vendor copy from its workspace and never
 compiles the vendor test target, so the breakage is invisible in practice.
 Validate iceberg changes through the SQE workspace path-dep
 (`cargo test --workspace --lib`), not the vendor's own test suite.
+
+## Bumped `c034b19105fa` -> `813e54419b43` (2026-07-10, issue #370)
+
+Twelve commits from `dev_rebase_main_20260303`, merged with a 3-way
+merge (vendor state committed onto `c034b19`, `git merge 813e544`,
+resolve, copy back):
+
+- **#166** account for added delete files in snapshot summary
+- **#167** sort position-delete entries globally by `(file_path, pos)`
+- **#169** auto-set `referenced_data_file` on `PositionDeleteFileWriter`
+- **#170 / #171 / #172** stream manifest lists and manifest loading to
+  bound memory (snapshot expiration, rewrite-manifests, append/overwrite
+  validation)
+- **#174 / #175** rewrite_manifests target size, honored from snapshot
+  properties
+- **#145** Variant support (Iceberg V3); SQE maps `Type::Variant` to
+  `variant` in information_schema
+- **#179** fix rewrite/overwrite transactions mishandling DELETE
+  manifests (CoW DELETE/UPDATE path)
+- **#164 / #176** CODEOWNERS-only, pruned
+
+Merge notes for the next rebaser:
+
+- The vendor tree had already split `utils.rs` into `util/mod.rs` +
+  `util/snapshot.rs` and backported early versions of the manifest
+  loaders. Upstream's streaming rewrites (#170-#172) superseded those
+  backports; conflicts in `transaction/{remove_snapshots,
+  rewrite_manifests,snapshot}.rs` were resolved to upstream semantics
+  with `crate::util` paths. Upstream still uses a flat `utils.rs`, so
+  every refresh will re-hit this rename; git's rename detection folds
+  upstream's `utils.rs` edits into `util/mod.rs` automatically.
+- SQE patch families 1 (DynamicPredicate) and 7 (DecodeGate) both touch
+  `arrow/reader.rs`, which upstream's Variant support also modified;
+  all three auto-merged in disjoint regions.
+- The five apache cherry-picks (#2118, #2348, #2307, #2351, #2360) are
+  still absent upstream and remain applied; verified present post-merge.
+- Validation: full workspace `cargo build --all`, 16/16 lib test targets
+  green (374 sqe-catalog, 604 sqe-coordinator among them), clippy
+  `--all-targets --all-features -D warnings` clean. The #179 CoW
+  round-trip and write-mode checks need the quickstart stack (SQE issue
+  #371 tracks that verification).
 
 ## Catalog config: URL and bucket conventions
 

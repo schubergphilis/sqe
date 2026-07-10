@@ -51,7 +51,7 @@ parquet = { version = "58", features = ["async", "object_store"] }
 object_store = { version = "0.13", features = ["aws", "http", "azure", "gcp"] }
 
 # Iceberg — RisingWave fork for rewrite_files() / overwrite_files() transaction support.
-# Pinned to risingwavelabs/iceberg-rust dev_rebase_main_20260303 @ c034b19105fa.
+# Pinned to risingwavelabs/iceberg-rust dev_rebase_main_20260303 @ 813e54419b43.
 # DF 53 / Arrow 58 / Parquet 58 land via RW PR #148. Retains RW fork features:
 # RewriteFilesAction, OverwriteFilesAction, PositionDeleteFileWriter,
 # DeletionVectorWriter, MergeAppend, parallel manifest loading.
