@@ -36,8 +36,8 @@
 use std::ops::ControlFlow;
 
 use sqlparser::ast::{
-    DataType as SqlDataType, Expr, Function, FunctionArg, FunctionArgExpr,
-    FunctionArgumentClause, FunctionArgumentList, FunctionArguments, GroupByExpr,
+    BinaryOperator, CastKind, DataType as SqlDataType, Expr, Function, FunctionArg,
+    FunctionArgExpr, FunctionArgumentClause, FunctionArgumentList, FunctionArguments, GroupByExpr,
     GroupByWithModifier, Ident, LimitClause, ObjectName, OrderByKind, Query, Select, SelectItem,
     SetExpr, Statement, TableFactor, TableFunctionArgs, Value, Visit, VisitMut, Visitor, VisitorMut,
 };
@@ -183,6 +183,19 @@ pub fn rewrite_trino_compat(sql: &str) -> String {
     // `listagg` is touched; percentile_cont/percentile_disc keep WITHIN GROUP.
     // See #340.
     let has_within_group = lower.contains("within group");
+    // `try(` -> rewrite_try_function: Trino's error-suppression wrapper is
+    // lowered to TRY_CAST / NULLIF-guarded division. `try_cast(` does not
+    // contain `try(`, so the control that already works skips the walk. See
+    // #347.
+    let has_try = lower.contains("try(") || lower.contains("try (");
+    // `recursive` -> apply_recursive_cte_column_aliases: name the anchor
+    // projection after the declared CTE column list so the recursive term
+    // resolves it. See #348.
+    let has_recursive = lower.contains("recursive");
+    // `ordinality` -> rewrite_unnest_with_ordinality: the uncorrelated
+    // `UNNEST(..) WITH ORDINALITY AS t(x, n)` becomes a row_number() derived
+    // table. See #341.
+    let has_ordinality = lower.contains("ordinality");
     if !has_json_cast
         && !has_dollar
         && !has_grouping_set
@@ -193,6 +206,9 @@ pub fn rewrite_trino_compat(sql: &str) -> String {
         && !has_fetch
         && !has_binary_cast
         && !has_within_group
+        && !has_try
+        && !has_recursive
+        && !has_ordinality
     {
         return sql.to_string();
     }
@@ -384,6 +400,9 @@ impl VisitorMut for TrinoCompatVisitor {
         if rewrite_listagg_within_group(expr) {
             self.rewrites += 1;
         }
+        if rewrite_try_function(expr) {
+            self.rewrites += 1;
+        }
         ControlFlow::Continue(())
     }
 
@@ -392,6 +411,9 @@ impl VisitorMut for TrinoCompatVisitor {
         factor: &mut TableFactor,
     ) -> ControlFlow<Self::Break> {
         if rewrite_metadata_dollar_table(factor) {
+            self.rewrites += 1;
+        }
+        if rewrite_unnest_with_ordinality(factor) {
             self.rewrites += 1;
         }
         ControlFlow::Continue(())
@@ -403,6 +425,9 @@ impl VisitorMut for TrinoCompatVisitor {
         // re-wrap-suppression purposes.
         if has_wrap_cte(query) {
             self.wrap_cte_depth += 1;
+        }
+        if apply_recursive_cte_column_aliases(query) {
+            self.rewrites += 1;
         }
         ControlFlow::Continue(())
     }
@@ -497,6 +522,234 @@ fn rewrite_cast_binary_to_bytea(expr: &mut Expr) -> bool {
 /// Rewrite `listagg(x, sep) WITHIN GROUP (ORDER BY ...)` to
 /// `string_agg(x, sep ORDER BY ...)`.
 ///
+/// Rewrite the uncorrelated `UNNEST(...) WITH ORDINALITY AS t(x, .., n)`
+/// table factor DataFusion rejects with NotImplemented. See #341.
+///
+/// The ordinality column is Trino's 1-based element position, which for a
+/// single-partition unnest equals `row_number() OVER ()` in emission order,
+/// so the factor becomes a derived table:
+///
+/// `(SELECT x, .., row_number() OVER () AS n FROM UNNEST(...) AS __sqe_unnest(x, ..)) AS t`
+///
+/// Scope, all deliberate:
+/// - Only fires when the array expressions contain NO column references. A
+///   correlated `FROM tbl, UNNEST(tbl.arr) WITH ORDINALITY` would need a
+///   LATERAL derived table (which DataFusion cannot plan either) and a
+///   per-row ordinal, so it keeps DataFusion's NotImplemented error rather
+///   than silently computing a global row number.
+/// - Requires an explicit alias column list naming every unnested column
+///   plus the ordinality column (Trino's common spelling); without it the
+///   generated projection cannot name its columns.
+fn rewrite_unnest_with_ordinality(factor: &mut TableFactor) -> bool {
+    let TableFactor::UNNEST {
+        alias: Some(alias),
+        array_exprs,
+        with_offset: false,
+        with_offset_alias: None,
+        with_ordinality: true,
+    } = factor
+    else {
+        return false;
+    };
+    if array_exprs.is_empty() || alias.columns.len() != array_exprs.len() + 1 {
+        return false;
+    }
+    // Bail on any column reference inside the array expressions: the factor
+    // would be correlated and the global row number would be wrong.
+    struct HasColumnRef(bool);
+    impl Visitor for HasColumnRef {
+        type Break = ();
+        fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<Self::Break> {
+            if matches!(expr, Expr::Identifier(_) | Expr::CompoundIdentifier(_)) {
+                self.0 = true;
+                return ControlFlow::Break(());
+            }
+            ControlFlow::Continue(())
+        }
+    }
+    let mut has_ref = HasColumnRef(false);
+    for e in array_exprs.iter() {
+        let _ = e.visit(&mut has_ref);
+        if has_ref.0 {
+            return false;
+        }
+    }
+
+    let value_cols: Vec<String> = alias.columns[..array_exprs.len()]
+        .iter()
+        .map(|c| c.name.to_string())
+        .collect();
+    let ord_col = alias.columns[array_exprs.len()].name.to_string();
+    let arrays = array_exprs
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let derived = format!(
+        "(SELECT {vals}, row_number() OVER () AS {ord_col} FROM UNNEST({arrays}) \
+         AS __sqe_unnest({vals})) AS {name}",
+        vals = value_cols.join(", "),
+        name = alias.name,
+    );
+    // Round-trip through the parser to build the derived table factor; the
+    // input is generated from already-parsed AST pieces, so a parse failure
+    // only means we leave the factor (and DataFusion's error) untouched.
+    let Ok(stmts) = Parser::parse_sql(&GenericDialect {}, &format!("SELECT * FROM {derived}"))
+    else {
+        return false;
+    };
+    let Some(Statement::Query(query)) = stmts.into_iter().next() else {
+        return false;
+    };
+    let SetExpr::Select(select) = *query.body else {
+        return false;
+    };
+    let Some(table_with_joins) = select.from.into_iter().next() else {
+        return false;
+    };
+    *factor = table_with_joins.relation;
+    true
+}
+
+/// Rewrite Trino's `try(expr)` error-suppression wrapper. See #347.
+///
+/// DataFusion has no mechanism to catch runtime evaluation errors of an
+/// arbitrary expression, so `try` is lowered statically: the wrapper is
+/// removed and the error sources named by Trino's contract that have a
+/// NULL-safe spelling are rewritten inside the argument:
+///
+/// - every `CAST` becomes `TRY_CAST` (invalid cast yields NULL)
+/// - every `/` and `%` divisor is wrapped in `NULLIF(d, 0)`
+///   (divide-by-zero yields NULL, since `x / NULL` is NULL)
+///
+/// A runtime error with no static NULL-safe form (e.g. numeric overflow)
+/// still surfaces as an error; `try` of an error-free expression passes
+/// through unchanged, matching Trino. Returns true if the rewrite fired.
+fn rewrite_try_function(expr: &mut Expr) -> bool {
+    let Expr::Function(func) = expr else {
+        return false;
+    };
+    if !function_name_is(func, "try") {
+        return false;
+    }
+    let FunctionArguments::List(arg_list) = &mut func.args else {
+        return false;
+    };
+    if arg_list.args.len() != 1 || !arg_list.clauses.is_empty() {
+        return false;
+    }
+    let FunctionArg::Unnamed(FunctionArgExpr::Expr(inner)) = &mut arg_list.args[0] else {
+        return false;
+    };
+    let mut inner = std::mem::replace(inner, Expr::Identifier(Ident::new("__sqe_try_tmp")));
+    let _ = VisitMut::visit(&mut inner, &mut TryNullSafeVisitor);
+    *expr = inner;
+    true
+}
+
+/// Makes the argument of `try(...)` NULL-safe for the error classes that
+/// can be expressed statically; see [`rewrite_try_function`].
+struct TryNullSafeVisitor;
+
+impl VisitorMut for TryNullSafeVisitor {
+    type Break = ();
+
+    fn post_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<Self::Break> {
+        match expr {
+            Expr::Cast { kind, .. } if matches!(kind, CastKind::Cast) => {
+                *kind = CastKind::TryCast;
+            }
+            Expr::BinaryOp {
+                op: BinaryOperator::Divide | BinaryOperator::Modulo,
+                right,
+                ..
+            } => {
+                let divisor = std::mem::replace(
+                    right.as_mut(),
+                    Expr::Identifier(Ident::new("__sqe_try_tmp")),
+                );
+                *right.as_mut() = Expr::Function(Function {
+                    name: ObjectName::from(vec![Ident::new("nullif")]),
+                    uses_odbc_syntax: false,
+                    parameters: FunctionArguments::None,
+                    args: FunctionArguments::List(FunctionArgumentList {
+                        duplicate_treatment: None,
+                        args: vec![
+                            FunctionArg::Unnamed(FunctionArgExpr::Expr(divisor)),
+                            FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::value(
+                                Value::Number("0".to_string(), false),
+                            ))),
+                        ],
+                        clauses: vec![],
+                    }),
+                    filter: None,
+                    null_treatment: None,
+                    over: None,
+                    within_group: vec![],
+                });
+            }
+            _ => {}
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+/// Apply a recursive CTE's declared column-alias list to its anchor term.
+/// See #348.
+///
+/// DataFusion names a recursive CTE's working table from the anchor
+/// projection and ignores the `WITH RECURSIVE t(n) AS (...)` alias list, so
+/// `WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM t ...)` fails
+/// with "No field named n" (the working column is named `Int64(1)`).
+/// Aliasing the anchor's projection items with the declared names makes the
+/// working table expose them to the recursive term; the alias list itself is
+/// left in place for the outer query. Wildcard projection items cannot be
+/// position-aligned at the AST level and are skipped. Returns true if any
+/// anchor item was renamed.
+fn apply_recursive_cte_column_aliases(query: &mut Query) -> bool {
+    let Some(with) = &mut query.with else {
+        return false;
+    };
+    if !with.recursive {
+        return false;
+    }
+    let mut changed = false;
+    for cte in &mut with.cte_tables {
+        if cte.alias.columns.is_empty() {
+            continue;
+        }
+        // The anchor is the leftmost SELECT under the CTE's set operations.
+        let mut body = &mut *cte.query.body;
+        while let SetExpr::SetOperation { left, .. } = body {
+            body = &mut **left;
+        }
+        let SetExpr::Select(anchor) = body else {
+            continue;
+        };
+        for (item, col) in anchor.projection.iter_mut().zip(cte.alias.columns.iter()) {
+            match item {
+                SelectItem::UnnamedExpr(e) => {
+                    let taken =
+                        std::mem::replace(e, Expr::Identifier(Ident::new("__sqe_cte_tmp")));
+                    *item = SelectItem::ExprWithAlias {
+                        expr: taken,
+                        alias: col.name.clone(),
+                    };
+                    changed = true;
+                }
+                SelectItem::ExprWithAlias { alias, .. } => {
+                    if alias.value != col.name.value {
+                        *alias = col.name.clone();
+                        changed = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    changed
+}
+
 /// Trino spells the ordered string aggregate `listagg(...) WITHIN GROUP (...)`.
 /// DataFusion has no `listagg`; SQE aliases it to `string_agg`, but `string_agg`
 /// takes its ordering as an inline `ORDER BY` inside the argument list, not as a
@@ -1325,6 +1578,120 @@ mod tests {
         assert!(lower.contains("string_agg"), "expected string_agg: {out}");
         assert!(!lower.contains("within group"), "WITHIN GROUP should be gone: {out}");
         assert!(lower.contains("order by name"), "ordering should move inline: {out}");
+    }
+
+    #[test]
+    fn try_division_guards_divisor_with_nullif() {
+        let out = rewrite_trino_compat("SELECT try(1/0)");
+        let lower = out.to_ascii_lowercase();
+        assert!(!lower.contains("try("), "try wrapper should be gone: {out}");
+        assert!(lower.contains("nullif(0, 0)"), "divisor guard missing: {out}");
+    }
+
+    #[test]
+    fn try_cast_becomes_try_cast() {
+        let out = rewrite_trino_compat("SELECT try(CAST('x' AS integer))");
+        let lower = out.to_ascii_lowercase();
+        assert!(!lower.contains("try("), "try wrapper should be gone: {out}");
+        assert!(lower.contains("try_cast('x' as int"), "cast not made safe: {out}");
+    }
+
+    #[test]
+    fn try_of_safe_expression_unwraps() {
+        let out = rewrite_trino_compat("SELECT try(1+1)");
+        assert!(!out.to_ascii_lowercase().contains("try"), "{out}");
+        assert!(out.contains("1 + 1"), "{out}");
+    }
+
+    #[test]
+    fn try_nested_operations_all_guarded() {
+        let out =
+            rewrite_trino_compat("SELECT try(CAST(a AS bigint) / b % c) FROM t");
+        let lower = out.to_ascii_lowercase();
+        assert!(lower.contains("try_cast(a as bigint"), "{out}");
+        assert!(lower.contains("nullif(b, 0)"), "{out}");
+        assert!(lower.contains("nullif(c, 0)"), "{out}");
+    }
+
+    #[test]
+    fn try_cast_function_untouched() {
+        // `try_cast(...)` already works; the rewriter must not touch it.
+        let sql = "SELECT try_cast('x' AS integer)";
+        assert_eq!(rewrite_trino_compat(sql), sql);
+    }
+
+    #[test]
+    fn quoted_try_column_function_untouched() {
+        // A quoted "try" is a genuine user function/column, not the wrapper.
+        let sql = "SELECT \"try\"(x) FROM t";
+        assert_eq!(rewrite_trino_compat(sql), sql);
+    }
+
+    #[test]
+    fn recursive_cte_alias_applied_to_anchor() {
+        let out = rewrite_trino_compat(
+            "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM t WHERE n < 5) \
+             SELECT count(*) FROM t",
+        );
+        let lower = out.to_ascii_lowercase();
+        assert!(lower.contains("select 1 as n union all"), "anchor not aliased: {out}");
+    }
+
+    #[test]
+    fn recursive_cte_multi_column_aliases_applied() {
+        let out = rewrite_trino_compat(
+            "WITH RECURSIVE r(a, b) AS (SELECT 1, 10 UNION ALL SELECT a+1, b+10 FROM r WHERE a < 3) \
+             SELECT * FROM r",
+        );
+        let lower = out.to_ascii_lowercase();
+        assert!(lower.contains("select 1 as a, 10 as b union all"), "{out}");
+    }
+
+    #[test]
+    fn non_recursive_cte_alias_untouched() {
+        // Plain WITH already works; the rewrite is recursive-only.
+        let sql = "WITH t(n) AS (SELECT 1) SELECT n FROM t";
+        assert_eq!(rewrite_trino_compat(sql), sql);
+    }
+
+    #[test]
+    fn recursive_cte_existing_anchor_alias_renamed() {
+        let out = rewrite_trino_compat(
+            "WITH RECURSIVE t(n) AS (SELECT 1 AS x UNION ALL SELECT n+1 FROM t WHERE n < 2) \
+             SELECT n FROM t",
+        );
+        assert!(out.to_ascii_lowercase().contains("select 1 as n union all"), "{out}");
+    }
+
+    #[test]
+    fn unnest_with_ordinality_becomes_row_number_derived_table() {
+        let out =
+            rewrite_trino_compat("SELECT * FROM UNNEST(ARRAY[1,2]) WITH ORDINALITY AS t(x, n)");
+        let lower = out.to_ascii_lowercase();
+        assert!(!lower.contains("ordinality"), "{out}");
+        assert!(lower.contains("row_number() over () as n"), "{out}");
+        assert!(lower.contains("unnest(array[1, 2]) as __sqe_unnest (x)"), "{out}");
+        assert!(lower.contains(") as t"), "{out}");
+    }
+
+    #[test]
+    fn unnest_ordinality_correlated_left_alone() {
+        // A column reference in the array expr means the factor is
+        // correlated; a global row number would be wrong, so no rewrite.
+        let sql = "SELECT * FROM tbl, UNNEST(tbl.arr) WITH ORDINALITY AS t(x, n)";
+        assert_eq!(rewrite_trino_compat(sql), sql);
+    }
+
+    #[test]
+    fn unnest_ordinality_without_alias_columns_left_alone() {
+        let sql = "SELECT * FROM UNNEST(ARRAY[1,2]) WITH ORDINALITY AS t";
+        assert_eq!(rewrite_trino_compat(sql), sql);
+    }
+
+    #[test]
+    fn unnest_without_ordinality_untouched() {
+        let sql = "SELECT * FROM UNNEST(ARRAY[1,2]) AS t(x)";
+        assert_eq!(rewrite_trino_compat(sql), sql);
     }
 
     #[test]
