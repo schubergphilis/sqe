@@ -1,5 +1,0 @@
-{"id":1,"kind":"click","amount":1.50}
-{"id":2,"kind":"purchase","amount":42.00}
-{"id":3,"kind":"click","amount":0.75}
-{"id":4,"kind":"purchase","amount":13.25}
-{"id":5,"kind":"refund","amount":-5.00}

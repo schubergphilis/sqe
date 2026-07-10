@@ -1,6 +1,0 @@
-.env
-sqe.toml.local
-cdk-outputs.json
-cdk/node_modules/
-cdk/cdk.out/
-cdk/package-lock.json
