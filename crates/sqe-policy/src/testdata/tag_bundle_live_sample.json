@@ -1,0 +1,9 @@
+{
+  "__placeholder__": "Replace this file with a REAL bundle captured from a live Ranger during the Ranger-backend validation run: GET /service/plugins/policies/download/<service>. The capture MUST contain at least one tag-linked datamask policy and one tag-linked rowfilter policy under the top-level `tagPolicies` block. Once dropped in, remove the #[ignore] on resolve_tag_policies_against_live_sample in ranger_store.rs and adjust the asserted user/roles/tags constants to match the capture. The empty bundle below keeps the placeholder valid JSON (the #[ignore]-d test stays inert until replaced).",
+  "policyVersion": 0,
+  "policies": [],
+  "tagPolicies": {
+    "serviceName": "tag",
+    "policies": []
+  }
+}

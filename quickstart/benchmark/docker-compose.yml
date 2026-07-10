@@ -1,0 +1,131 @@
+# SQE quickstart: benchmarks (TPC-H / TPC-DS / SSB).
+#
+# Generates a benchmark dataset, loads it into SQE as Iceberg tables, and runs
+# the suite's queries, reporting per-query timings. The catalog here is Project
+# Nessie (auth-less) over RustFS, so the focus stays on the engine, not on auth.
+#
+# Two SQE images are involved:
+#   - sqe        : the coordinator (Dockerfile)        -> serves Flight SQL on 50051
+#   - sqe-bench  : the bench data tool (Dockerfile.bench) -> generate / load / test
+#
+# sqe-bench `generate` writes Parquet to a volume the coordinator also mounts;
+# `load` then issues CTAS-over-read_parquet, so the coordinator reads those files
+# directly. That is why both share the `bench-data` volume at the same path.
+#
+#   cp .env.example .env
+#   ./run.sh                       # tpch SF0.01 by default
+#   BENCH=ssb SCALE=0.1 ./run.sh   # pick suite + scale
+
+services:
+  # ── RustFS — S3-compatible object store (the warehouse) ───────────────
+  rustfs:
+    image: rustfs/rustfs:1.0.0-alpha.89
+    environment:
+      RUSTFS_ACCESS_KEY: ${S3_ACCESS_KEY:-s3admin}
+      RUSTFS_SECRET_KEY: ${S3_SECRET_KEY:-s3adminpw}
+    volumes:
+      - rustfs-data:/data
+    ports:
+      - "${RUSTFS_PORT:-19000}:9000"
+      - "${RUSTFS_CONSOLE_PORT:-19001}:9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9001/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+
+  # ── bucket-init — create the warehouse bucket (RustFS needs real S3) ──
+  bucket-init:
+    image: amazon/aws-cli:2.31.15
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        aws s3api head-bucket --bucket warehouse --endpoint-url http://rustfs:9000 2>/dev/null \
+          || aws s3 mb s3://warehouse --endpoint-url http://rustfs:9000
+        echo "bucket ready"
+    environment:
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: ${S3_ACCESS_KEY:-s3admin}
+      AWS_SECRET_ACCESS_KEY: ${S3_SECRET_KEY:-s3adminpw}
+    restart: "no"
+    depends_on:
+      rustfs:
+        condition: service_healthy
+
+  # ── Nessie — the Iceberg REST catalog ─────────────────────────────────
+  nessie:
+    image: ghcr.io/projectnessie/nessie:0.107.5
+    environment:
+      NESSIE_VERSION_STORE_TYPE: IN_MEMORY
+      QUARKUS_HTTP_PORT: "19120"
+      NESSIE_CATALOG_DEFAULT_WAREHOUSE: warehouse
+      NESSIE_CATALOG_WAREHOUSES_WAREHOUSE_LOCATION: s3://warehouse/
+      NESSIE_CATALOG_SERVICE_S3_DEFAULT_OPTIONS_ENDPOINT: http://rustfs:9000
+      NESSIE_CATALOG_SERVICE_S3_DEFAULT_OPTIONS_PATH_STYLE_ACCESS: "true"
+      NESSIE_CATALOG_SERVICE_S3_DEFAULT_OPTIONS_REGION: us-east-1
+      NESSIE_CATALOG_SERVICE_S3_DEFAULT_OPTIONS_ACCESS_KEY: urn:nessie-secret:quarkus:nessie.catalog.secrets.s3
+      NESSIE_CATALOG_SECRETS_S3_NAME: ${S3_ACCESS_KEY:-s3admin}
+      NESSIE_CATALOG_SECRETS_S3_SECRET: ${S3_SECRET_KEY:-s3adminpw}
+    ports:
+      - "${NESSIE_PORT:-19120}:19120"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:19120/api/v2/config || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 20s
+    depends_on:
+      bucket-init:
+        condition: service_completed_successfully
+
+  # ── SQE — the query engine (coordinator) ──────────────────────────────
+  # Mounts the shared bench-data volume read-only: `load` tells the coordinator
+  # to read_parquet() the generated files straight off this path.
+  sqe:
+    image: ${SQE_IMAGE:-sqe-quickstart:latest}
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    command: ["--config", "/etc/sqe/sqe.toml"]
+    environment:
+      RUST_LOG: "info"
+    volumes:
+      - ./sqe.toml:/etc/sqe/sqe.toml:ro
+      - bench-data:/bench-data:ro
+    ports:
+      - "${SQE_FLIGHT_PORT:-60051}:50051"
+      - "${SQE_TRINO_PORT:-18080}:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9091/healthz || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    depends_on:
+      nessie:
+        condition: service_healthy
+
+  # ── sqe-bench — generate / load / test (one-shot, run via `docker compose run`) ──
+  # Runs as root so it can populate the fresh (root-owned) named volume; the
+  # Parquet it writes is world-readable, so the coordinator (uid 1000) reads it.
+  # Behind the `bench` profile so it does not start on a plain `up`.
+  sqe-bench:
+    image: sqe-bench:latest
+    build:
+      context: ../..
+      dockerfile: Dockerfile.bench
+    user: "0:0"
+    profiles: ["bench"]
+    volumes:
+      - bench-data:/bench-data
+      # `sqe-bench test` reads the suite's query files from ./benchmarks/queries
+      # relative to its working dir (/). Mount the repo's query sets read-only.
+      - ../../benchmarks/queries:/benchmarks/queries:ro
+    depends_on:
+      sqe:
+        condition: service_healthy
+
+volumes:
+  rustfs-data:
+  bench-data:

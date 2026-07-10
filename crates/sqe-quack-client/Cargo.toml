@@ -1,0 +1,20 @@
+[package]
+name = "sqe-quack-client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+sqe-quack-wire = { path = "../sqe-quack-wire" }
+arrow = { workspace = true }
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+async-trait = { workspace = true }
+datafusion = { workspace = true }
+datafusion-expr = { workspace = true }
+reqwest = { workspace = true, features = ["blocking"] }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["rt"] }
+url = { workspace = true }

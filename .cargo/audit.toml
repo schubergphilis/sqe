@@ -1,0 +1,49 @@
+# cargo-audit configuration for SQE.
+#
+# The CI `check` stage runs bare `cargo audit`, which (unlike `cargo deny`)
+# does NOT read deny.toml, so advisory ignores are configured here separately.
+#
+# NOTE: cargo-audit and cargo-deny do NOT raise the same set of advisories, so
+# this list is intentionally NOT identical to deny.toml `[advisories] ignore`:
+#
+# - RUSTSEC-2023-0071 (rsa Marvin attack): cargo-audit raises this as a hard
+#   vulnerability against rsa 0.9.10 (transitive via sqlx-mysql), so it MUST be
+#   ignored here or the gate fails. cargo-deny does not match it, so it is NOT
+#   in deny.toml. No fixed rsa upgrade exists upstream; SQE performs no RSA
+#   private-key decryption on attacker-controlled timing (transitive signing
+#   path only). Re-evaluate when `rsa` ships a fix.
+# - RUSTSEC-2024-0436 (paste v1.0.15): unmaintained proc macro, transitive from
+#   arrow-flight/datafusion/parquet/tonic. No known vulnerability.
+# - RUSTSEC-2026-0176/0177 (pyo3 0.28.3): pyo3 sits in Cargo.lock only as the
+#   never-enabled optional `python` feature of jiter (via
+#   datafusion-functions-json); no SQE crate or feature activates it, so pyo3
+#   is never compiled into any SQE binary (`cargo tree -i pyo3` finds no
+#   dependents). The fix (pyo3 >=0.29) is unreachable anyway: jiter 0.13 pins
+#   ^0.28 and 0.29 is not in the escrow registry. Drop both ignores when
+#   datafusion-functions-json bumps jiter past pyo3 0.28.
+#
+# RUSTSEC-2026-0098/0099/0104 (rustls-webpki 0.101.7) were removed in #133:
+# the AWS Glue/S3Tables catalogs now use an explicit rustls-0.23 HttpClient, so
+# the legacy connector (rustls 0.21 / webpki 0.101.7 / hyper 0.14) is gone from
+# the tree and the advisories no longer apply.
+# - RUSTSEC-2026-0194 (quick-xml quadratic duplicate-attribute check) and
+#   RUSTSEC-2026-0195 (quick-xml unbounded namespace-declaration allocation),
+#   both high-severity XML-parsing DoS fixed in quick-xml >=0.41.0. quick-xml
+#   is transitive only: object_store 0.13.2 pins `quick-xml ^0.39.0` (parsing
+#   S3/GCS list-objects + multipart XML) and the AWS SDK pulls 0.37.5/0.38.4.
+#   The fix is unreachable today -- object_store 0.13.2 rejects 0.41, and a
+#   semver bump of object_store is not in the escrow registry (`cargo update
+#   -p quick-xml --precise 0.41.0` fails to select). Exposure is narrow: SQE
+#   parses XML only from its configured object store and catalog endpoints
+#   (trusted infrastructure), never attacker-supplied documents, so triggering
+#   the DoS requires a malicious/compromised storage backend. Drop both when
+#   object_store bumps quick-xml past 0.41.
+[advisories]
+ignore = [
+    "RUSTSEC-2023-0071",
+    "RUSTSEC-2024-0436",
+    "RUSTSEC-2026-0176",
+    "RUSTSEC-2026-0177",
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
+]

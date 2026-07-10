@@ -1,0 +1,411 @@
+use clap::{Parser, Subcommand, ValueEnum};
+
+#[derive(Parser)]
+#[command(
+    name = "sqe-bench",
+    version,
+    about = "SQE benchmark data generator, loader, and query tester"
+)]
+pub struct Cli {
+    #[command(subcommand)]
+    pub command: Command,
+}
+
+#[derive(Subcommand)]
+pub enum Command {
+    /// Generate Parquet data files for a benchmark suite
+    Generate {
+        /// Benchmark suite to generate (tpch, ssb, tpcds, tpcc, tpce, tpcbb, clickbench)
+        #[arg(value_name = "BENCHMARK")]
+        benchmark: String,
+
+        /// Scale factor (e.g. 1 = 1 GB for TPC-H, 10 = 10x)
+        #[arg(long, default_value_t = 1.0)]
+        scale: f64,
+
+        /// Output directory for Parquet files
+        #[arg(long, default_value = "data")]
+        output: String,
+
+        /// S3 endpoint URL (if writing directly to object storage)
+        #[arg(long, env = "AWS_ENDPOINT_URL")]
+        s3_endpoint: Option<String>,
+
+        /// S3 access key ID
+        #[arg(long, env = "AWS_ACCESS_KEY_ID")]
+        s3_access_key: Option<String>,
+
+        /// S3 secret access key
+        #[arg(long, env = "AWS_SECRET_ACCESS_KEY")]
+        s3_secret_key: Option<String>,
+
+        /// S3 bucket name (required when writing to S3)
+        #[arg(long, env = "BENCH_S3_BUCKET")]
+        s3_bucket: Option<String>,
+
+        /// S3 region
+        #[arg(long, env = "AWS_DEFAULT_REGION", default_value = "us-east-1")]
+        s3_region: String,
+
+        /// Worker threads for parallel per-partition generation. Default
+        /// is `std::thread::available_parallelism()`, clamped to [1, 256].
+        /// Overrides the `BENCH_GEN_THREADS` env var when set.
+        #[arg(long)]
+        threads: Option<usize>,
+
+        /// Parquet compression codec: `zstd1`, `zstd3` (default), `zstd9`,
+        /// `snappy`, or `none`. Overrides `BENCH_GEN_COMPRESSION`.
+        #[arg(long)]
+        compression: Option<String>,
+
+        /// Max rows per parquet row group. Overrides `BENCH_GEN_ROW_GROUP_SIZE`.
+        /// Default is the parquet writer's default.
+        #[arg(long)]
+        row_group_size: Option<usize>,
+
+        /// Output sink: `parquet` writes staging files to --output (the
+        /// default; load them later with `sqe-bench load`); `iceberg`
+        /// writes straight into Iceberg tables through the catalog REST
+        /// API. Currently only the `bank` benchmark supports `iceberg`.
+        #[arg(long, default_value = "parquet")]
+        sink: Sink,
+
+        /// Trading days to generate (iceberg sink)
+        #[arg(long, default_value_t = 12u32)]
+        days: u32,
+
+        /// First trading day, YYYY-MM-DD (iceberg sink)
+        #[arg(long)]
+        start_date: Option<String>,
+
+        /// Compressed bytes to land per trading day, e.g. `4t` or `500g`.
+        /// Rows per day are derived from a pilot calibration. Mutually
+        /// exclusive with --rows-per-day (iceberg sink)
+        #[arg(long, conflicts_with = "rows_per_day")]
+        bytes_per_day: Option<String>,
+
+        /// Explicit transaction rows per trading day (iceberg sink)
+        #[arg(long)]
+        rows_per_day: Option<u64>,
+
+        /// Number of customers; accounts are 2.5x this (iceberg sink)
+        #[arg(long, default_value_t = 10_000_000u64)]
+        customers: u64,
+
+        /// Iceberg REST catalog URI, e.g. http://localhost:8181/api/catalog
+        /// (iceberg sink)
+        #[arg(long, env = "ICEBERG_CATALOG_URI")]
+        catalog_uri: Option<String>,
+
+        /// Warehouse name in the catalog (iceberg sink)
+        #[arg(long, env = "ICEBERG_WAREHOUSE")]
+        warehouse: Option<String>,
+
+        /// Namespace for the tables (iceberg sink)
+        #[arg(long, env = "SQE_NAMESPACE", default_value = "bank")]
+        namespace: String,
+
+        /// OAuth2 client id for the catalog's client-credentials grant
+        /// (iceberg sink)
+        #[arg(long, env = "SQE_CLIENT_ID")]
+        client_id: Option<String>,
+
+        /// OAuth2 client secret (iceberg sink)
+        #[arg(long, env = "SQE_CLIENT_SECRET")]
+        client_secret: Option<String>,
+
+        /// OAuth2 token endpoint; defaults to the catalog's own
+        /// /v1/oauth/tokens (iceberg sink)
+        #[arg(long, env = "SQE_TOKEN_ENDPOINT")]
+        oauth2_server_uri: Option<String>,
+
+        /// OAuth2 scope (iceberg sink)
+        #[arg(long)]
+        scope: Option<String>,
+
+        /// Pre-acquired bearer token, alternative to client credentials
+        /// (iceberg sink)
+        #[arg(long, env = "ICEBERG_BEARER_TOKEN")]
+        bearer_token: Option<String>,
+
+        /// Use path-style S3 addressing (MinIO/RustFS style endpoints)
+        /// (iceberg sink)
+        #[arg(long, default_value_t = false)]
+        s3_path_style: bool,
+
+        /// Data file rollover size, e.g. `512m` (iceberg sink)
+        #[arg(long, default_value = "512m")]
+        target_file_size: String,
+
+        /// Print the sized plan (calibration included) and exit without
+        /// writing any table data (iceberg sink)
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+
+        /// Skip days that already have a committed snapshot; use after an
+        /// interrupted run (iceberg sink)
+        #[arg(long, default_value_t = false)]
+        resume: bool,
+
+        /// Drop and recreate the bank tables before loading, making the
+        /// run idempotent (iceberg sink)
+        #[arg(long, default_value_t = false, conflicts_with = "resume")]
+        clean: bool,
+    },
+
+    /// Load generated data into SQE via Iceberg REST catalog
+    Load {
+        /// Benchmark suite to load (tpch, ssb, tpcds, tpcc, tpce, tpcbb, clickbench)
+        #[arg(value_name = "BENCHMARK")]
+        benchmark: String,
+
+        /// Scale factor used when generating the data
+        #[arg(long, default_value_t = 1.0)]
+        scale: f64,
+
+        /// Directory containing generated Parquet files
+        #[arg(long, default_value = "data")]
+        data: String,
+
+        /// Wire protocol to use for loading
+        #[arg(long, default_value = "flight")]
+        protocol: Protocol,
+
+        /// Coordinator host
+        #[arg(long, default_value = "localhost")]
+        host: String,
+
+        /// Coordinator port
+        #[arg(long, default_value_t = 50051u16)]
+        port: u16,
+
+        /// Catalog name (e.g. main_warehouse). If set, tables are created as
+        /// <catalog>.<namespace>.<table> instead of <namespace>.<table>.
+        #[arg(long, env = "SQE_CATALOG")]
+        catalog: Option<String>,
+
+        /// Override the auto-generated namespace (default: <benchmark>_sf<scale>)
+        #[arg(long, env = "SQE_NAMESPACE")]
+        namespace: Option<String>,
+
+        /// Drop and recreate tables before loading
+        #[arg(long, default_value_t = false)]
+        clean: bool,
+
+        /// S3 endpoint URL
+        #[arg(long, env = "AWS_ENDPOINT_URL")]
+        s3_endpoint: Option<String>,
+
+        /// S3 access key ID
+        #[arg(long, env = "AWS_ACCESS_KEY_ID")]
+        s3_access_key: Option<String>,
+
+        /// S3 secret access key
+        #[arg(long, env = "AWS_SECRET_ACCESS_KEY")]
+        s3_secret_key: Option<String>,
+
+        /// S3 bucket name
+        #[arg(long, env = "BENCH_S3_BUCKET")]
+        s3_bucket: Option<String>,
+
+        /// S3 region
+        #[arg(long, env = "AWS_DEFAULT_REGION", default_value = "us-east-1")]
+        s3_region: String,
+
+        /// Username for authentication (OIDC password grant)
+        #[arg(long, env = "SQE_USER")]
+        username: Option<String>,
+
+        /// Password for authentication (OIDC password grant)
+        #[arg(long, env = "SQE_PASSWORD")]
+        password: Option<String>,
+
+        /// OAuth2 token endpoint for client_credentials auth
+        #[arg(long, env = "SQE_TOKEN_ENDPOINT")]
+        token_endpoint: Option<String>,
+
+        /// OAuth2 client ID
+        #[arg(long, env = "SQE_CLIENT_ID")]
+        client_id: Option<String>,
+
+        /// OAuth2 client secret
+        #[arg(long, env = "SQE_CLIENT_SECRET")]
+        client_secret: Option<String>,
+
+        /// Emit Parquet bloom filters on join-key columns of the loaded
+        /// tables (TPC-H/SSB) via the `write.parquet.bloom-filter-columns`
+        /// table property. Off by default so baselines stay comparable.
+        /// A/B lever: generate once, load twice (off vs on) for a clean
+        /// comparison on identical data. (The benchmark scripts translate
+        /// `BENCH_BLOOM_FILTER=1` into this flag.)
+        #[arg(long, default_value_t = false)]
+        bloom_filter: bool,
+    },
+
+    /// Run benchmark queries and report timing
+    Test {
+        /// Benchmark suite to test (tpch, ssb, tpcds, tpcc, tpce, tpcbb, clickbench)
+        #[arg(value_name = "BENCHMARK")]
+        benchmark: String,
+
+        /// Scale factor (informational, used in result metadata)
+        #[arg(long, default_value_t = 1.0)]
+        scale: f64,
+
+        /// Wire protocol to use for queries
+        #[arg(long, default_value = "flight")]
+        protocol: Protocol,
+
+        /// Coordinator host
+        #[arg(long, default_value = "localhost")]
+        host: String,
+
+        /// Coordinator port
+        #[arg(long, default_value_t = 50051u16)]
+        port: u16,
+
+        /// Run only the specified query (e.g. "q1" or "1"); runs all if omitted
+        #[arg(long)]
+        query: Option<String>,
+
+        /// Catalog name (must match the value used during load)
+        #[arg(long, env = "SQE_CATALOG")]
+        catalog: Option<String>,
+
+        /// Override namespace (must match the value used during load)
+        #[arg(long, env = "SQE_NAMESPACE")]
+        namespace: Option<String>,
+
+        /// Username for authentication (OIDC password grant)
+        #[arg(long, env = "SQE_USER")]
+        username: Option<String>,
+
+        /// Password for authentication (OIDC password grant)
+        #[arg(long, env = "SQE_PASSWORD")]
+        password: Option<String>,
+
+        /// OAuth2 token endpoint for client_credentials auth
+        #[arg(long, env = "SQE_TOKEN_ENDPOINT")]
+        token_endpoint: Option<String>,
+
+        /// OAuth2 client ID
+        #[arg(long, env = "SQE_CLIENT_ID")]
+        client_id: Option<String>,
+
+        /// OAuth2 client secret
+        #[arg(long, env = "SQE_CLIENT_SECRET")]
+        client_secret: Option<String>,
+    },
+
+    /// Compare SQE vs Trino: run identical benchmark queries against both and diff results
+    Compare {
+        /// Benchmark suite (tpch, tpcds, ssb)
+        #[arg(value_name = "BENCHMARK")]
+        benchmark: String,
+
+        /// Scale factor
+        #[arg(long, default_value_t = 1.0)]
+        scale: f64,
+
+        /// SQE Flight SQL host
+        #[arg(long, default_value = "localhost")]
+        sqe_host: String,
+
+        /// SQE Flight SQL port
+        #[arg(long, default_value_t = 50051u16)]
+        sqe_port: u16,
+
+        /// SQE auth username
+        #[arg(long, env = "SQE_USER")]
+        sqe_username: Option<String>,
+
+        /// SQE auth password
+        #[arg(long, env = "SQE_PASSWORD")]
+        sqe_password: Option<String>,
+
+        /// OAuth2 token endpoint for client_credentials auth
+        #[arg(long, env = "SQE_TOKEN_ENDPOINT")]
+        token_endpoint: Option<String>,
+
+        /// OAuth2 client ID
+        #[arg(long, env = "SQE_CLIENT_ID")]
+        client_id: Option<String>,
+
+        /// OAuth2 client secret
+        #[arg(long, env = "SQE_CLIENT_SECRET")]
+        client_secret: Option<String>,
+
+        /// Trino HTTP URL (e.g., http://localhost:8080)
+        #[arg(long)]
+        trino_url: String,
+
+        /// Trino user
+        #[arg(long, default_value = "admin")]
+        trino_user: String,
+
+        /// Trino catalog (default: same as benchmark namespace)
+        #[arg(long)]
+        trino_catalog: Option<String>,
+
+        /// Trino schema (default: same as benchmark namespace)
+        #[arg(long)]
+        trino_schema: Option<String>,
+
+        /// Single query to compare (e.g., "q1" or "1")
+        #[arg(long)]
+        query: Option<String>,
+
+        /// Output directory for comparison report
+        #[arg(long, default_value = "benchmarks/results")]
+        output: String,
+    },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum Sink {
+    /// Local (or staged) Parquet files for a later `sqe-bench load`
+    Parquet,
+    /// Direct write + commit into Iceberg tables via the REST catalog
+    Iceberg,
+}
+
+#[derive(Clone, ValueEnum)]
+pub enum Protocol {
+    /// Arrow Flight SQL (gRPC/HTTP2)
+    Flight,
+    /// Trino-compat HTTP REST
+    Http,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_compare_subcommand_parses() {
+        let args = Cli::parse_from([
+            "sqe-bench", "compare", "tpch",
+            "--scale", "1",
+            "--sqe-host", "localhost",
+            "--sqe-port", "50051",
+            "--trino-url", "http://localhost:8080",
+        ]);
+        match args.command {
+            Command::Compare {
+                benchmark,
+                scale,
+                sqe_host,
+                sqe_port,
+                trino_url,
+                ..
+            } => {
+                assert_eq!(benchmark, "tpch");
+                assert_eq!(scale, 1.0);
+                assert_eq!(sqe_host, "localhost");
+                assert_eq!(sqe_port, 50051);
+                assert_eq!(trino_url, "http://localhost:8080");
+            }
+            _ => panic!("expected Compare command"),
+        }
+    }
+}

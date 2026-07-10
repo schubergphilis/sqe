@@ -1,0 +1,17 @@
+# Curated upstream Iceberg product-tests to run against SQE (no Spark/Hive/HDFS).
+# Format: one tempto test matcher per line; '#' comments and blank lines ignored.
+# Matchers are substring-matched against test names by the tempto runner.
+#
+# These three are EMPIRICALLY VERIFIED to pass against the real Trino baseline
+# (`scripts/tempto-test.sh --baseline`): pure-onTrino, self-contained, exercising
+# Iceberg CREATE/INSERT/SELECT and the rollback_to_snapshot procedure. They are
+# the proof the harness runs full test bodies to green.
+#
+# STATUS (2026-06-29): all three currently FAIL against SQE on the first DDL
+# statement -- SQE emits `data: []` for column-less DDL/update, which the Trino
+# 465 JDBC client rejects ("Columns must be set when decoding data"). See
+# testing/tempto/exclusions.md "Headline finding". They go green once that is
+# fixed (rollback_to_snapshot also requires SQE to support that procedure).
+io.trino.tests.product.iceberg.TestIcebergInsert.testIcebergConcurrentInsert
+io.trino.tests.product.iceberg.TestIcebergProcedureCalls.testRollbackToSnapshot
+io.trino.tests.product.iceberg.TestIcebergProcedureCalls.testRollbackToSnapshotWithNullArgument

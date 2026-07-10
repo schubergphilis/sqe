@@ -1,0 +1,34 @@
+SQE has been deployed!
+
+Coordinator: {{ include "sqe.fullname" . }}-coordinator
+{{- if .Values.worker.enabled }}
+Workers:     {{ .Values.worker.replicas }} replicas
+{{- if not (include "sqe.workerSecretConfigured" .) }}
+
+WARNING (ISSUE-218): distributed mode is enabled (worker.enabled=true) but no
+worker secret is set. The coordinator and workers will FAIL startup validation
+and crashloop. Set one of:
+
+  --set workerSecret.existingSecret=<secret-name> --set workerSecret.key=<key>
+  --set workerSecret.value=<shared-secret>     # dev/test only
+
+The same value is injected into the coordinator and every worker; they must match.
+{{- end }}
+{{- else }}
+Workers:     disabled (single-node mode)
+{{- end }}
+
+Coordinator HA: the coordinator runs as a single replica. Session, registry,
+and query state are process-local, so a restart drops in-flight queries and
+invalidates client sessions. Running more than one coordinator replica is NOT
+yet safe (state is not shared). HA is tracked in ISSUE-221.
+
+Connect via Flight SQL:
+  kubectl port-forward svc/{{ include "sqe.fullname" . }}-coordinator {{ .Values.service.flightSqlPort }}:{{ .Values.service.flightSqlPort }}
+  sqe-cli --host localhost --port {{ .Values.service.flightSqlPort }}
+
+Connect via Trino HTTP:
+  kubectl port-forward svc/{{ include "sqe.fullname" . }}-coordinator {{ .Values.service.trinoHttpPort }}:{{ .Values.service.trinoHttpPort }}
+
+Interactive SQL in the cluster:
+  kubectl exec -it deploy/{{ include "sqe.fullname" . }}-coordinator -- sqe-cli

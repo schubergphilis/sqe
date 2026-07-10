@@ -1,0 +1,153 @@
+{
+  "benchmark": "tpce",
+  "scale": 1.0,
+  "timestamp": "2026-04-30T16:30:53.710173+00:00",
+  "sqe_endpoint": "http://localhost:60051",
+  "trino_endpoint": "http://localhost:38080",
+  "queries": [
+    {
+      "query_name": "broker_volume",
+      "sqe_time_ms": 22,
+      "trino_time_ms": 239,
+      "speedup": 10.863636363636363,
+      "sqe_rows": 25,
+      "trino_rows": 25,
+      "rows_match": true,
+      "sqe_error": null,
+      "trino_error": null,
+      "status": "Match"
+    },
+    {
+      "query_name": "customer_position",
+      "sqe_time_ms": 135,
+      "trino_time_ms": 1857,
+      "speedup": 13.755555555555556,
+      "sqe_rows": 857125,
+      "trino_rows": 857125,
+      "rows_match": true,
+      "sqe_error": null,
+      "trino_error": null,
+      "status": "Match"
+    },
+    {
+      "query_name": "data_maintenance",
+      "sqe_time_ms": 69,
+      "trino_time_ms": 120,
+      "speedup": 1.7391304347826086,
+      "sqe_rows": 2,
+      "trino_rows": 2,
+      "rows_match": true,
+      "sqe_error": null,
+      "trino_error": null,
+      "status": "Match"
+    },
+    {
+      "query_name": "market_feed",
+      "sqe_time_ms": 17,
+      "trino_time_ms": 107,
+      "speedup": 6.294117647058823,
+      "sqe_rows": 100,
+      "trino_rows": 100,
+      "rows_match": true,
+      "sqe_error": null,
+      "trino_error": null,
+      "status": "Match"
+    },
+    {
+      "query_name": "market_watch",
+      "sqe_time_ms": 41,
+      "trino_time_ms": 324,
+      "speedup": 7.902439024390244,
+      "sqe_rows": 50000,
+      "trino_rows": 50000,
+      "rows_match": true,
+      "sqe_error": null,
+      "trino_error": null,
+      "status": "Match"
+    },
+    {
+      "query_name": "security_detail",
+      "sqe_time_ms": 24,
+      "trino_time_ms": 125,
+      "speedup": 5.208333333333333,
+      "sqe_rows": 104,
+      "trino_rows": 104,
+      "rows_match": true,
+      "sqe_error": null,
+      "trino_error": null,
+      "status": "Match"
+    },
+    {
+      "query_name": "trade_lookup",
+      "sqe_time_ms": 55,
+      "trino_time_ms": 177,
+      "speedup": 3.2181818181818183,
+      "sqe_rows": 4361,
+      "trino_rows": 4361,
+      "rows_match": true,
+      "sqe_error": null,
+      "trino_error": null,
+      "status": "Match"
+    },
+    {
+      "query_name": "trade_order",
+      "sqe_time_ms": 29,
+      "trino_time_ms": 256,
+      "speedup": 8.827586206896552,
+      "sqe_rows": 300,
+      "trino_rows": 300,
+      "rows_match": true,
+      "sqe_error": null,
+      "trino_error": null,
+      "status": "Match"
+    },
+    {
+      "query_name": "trade_result",
+      "sqe_time_ms": 7794,
+      "trino_time_ms": 14161,
+      "speedup": 1.8169104439312291,
+      "sqe_rows": 21343862,
+      "trino_rows": 0,
+      "rows_match": false,
+      "sqe_error": null,
+      "trino_error": "Failed to poll Trino: error sending request for url (http://localhost:38080/v1/statement/executing/20260430_163039_00150_h65ss/yb14ae8beadbadcabab17da5e37536488401c2523/35)",
+      "status": "TrinoFailed"
+    },
+    {
+      "query_name": "trade_status",
+      "sqe_time_ms": 303,
+      "trino_time_ms": 0,
+      "speedup": 0.0,
+      "sqe_rows": 31479,
+      "trino_rows": 0,
+      "rows_match": false,
+      "sqe_error": null,
+      "trino_error": "Failed to submit query: error sending request for url (http://localhost:38080/v1/statement)",
+      "status": "TrinoFailed"
+    },
+    {
+      "query_name": "trade_update",
+      "sqe_time_ms": 95,
+      "trino_time_ms": 0,
+      "speedup": 0.0,
+      "sqe_rows": 4361,
+      "trino_rows": 0,
+      "rows_match": false,
+      "sqe_error": null,
+      "trino_error": "Failed to submit query: error sending request for url (http://localhost:38080/v1/statement)",
+      "status": "TrinoFailed"
+    }
+  ],
+  "summary": {
+    "total": 11,
+    "matched": 8,
+    "row_diff": 0,
+    "sqe_failed": 0,
+    "trino_failed": 3,
+    "both_failed": 0,
+    "avg_speedup": 7.226122547979413,
+    "median_speedup": 7.902439024390244,
+    "sqe_total_ms": 8584,
+    "trino_total_ms": 17366
+  }
+}

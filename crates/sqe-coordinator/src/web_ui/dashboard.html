@@ -1,0 +1,529 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>SQE</title>
+<style>
+  /* Visual language adapted from the Schuberg Philis design system
+     (colours + layout: SBP Blue, Soft Blue panels, Space Gray header, the
+     marker bar, signal colours, no shadows/borders). Self-contained: system
+     fonts (no brand webfonts), no logos. */
+  :root {
+    --sbp-blue:#1E80ED; --soft-blue:#E8F2FD; --turquoise:#1EE8ED;
+    --midnight:#020C17; --space-gray:#082646; --white:#fff;
+    --yellow:#FFDB4E; --pale-blue:#F3F6FB;
+    --gray-medium:#5A6782; --gray-light:#AACBEF;
+    --green:#0E9F6E; --red:#D6336C;          /* readable-on-light state colours */
+    --mut:var(--gray-medium);                 /* secondary text (used by page JS) */
+    --font:system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    --mono:ui-monospace,"SF Mono",Monaco,Consolas,"Liberation Mono",monospace;
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--pale-blue); color:var(--midnight);
+         font:14px/1.5 var(--font); -webkit-font-smoothing:antialiased; }
+
+  /* dark header (SBP Space Gray), brand wordmark + eyebrow + marker bar */
+  header { background:var(--space-gray); color:var(--white);
+           display:flex; align-items:center; gap:1.5rem; padding:.7rem 1.5rem; }
+  .brand { display:flex; flex-direction:column; gap:.2rem; }
+  .brand .eyebrow { font-family:var(--mono); font-size:11px; font-weight:700;
+                    letter-spacing:.04em; color:var(--turquoise); }
+  .brand .wordmark { font-size:20px; font-weight:900; letter-spacing:.01em; line-height:1; }
+  .brand .marker { width:56px; height:4px; background:var(--yellow); margin-top:.3rem; }
+  nav { display:flex; gap:.2rem; margin-left:1rem; }
+  nav button { background:none; border:none; color:var(--gray-light); cursor:pointer;
+               padding:.5rem .75rem; font:600 14px var(--font);
+               border-bottom:3px solid transparent; }
+  nav button:hover { color:var(--white); }
+  nav button.active { color:var(--white); border-bottom-color:var(--sbp-blue); }
+  #meta { margin-left:auto; font-family:var(--mono); font-size:12px; color:var(--gray-light); }
+
+  #err { color:var(--red); background:#ffe1ea; padding:.5rem 1.5rem;
+         display:none; font-weight:600; }
+
+  /* content */
+  #overview, #queries, #cluster, #detail { padding:1.5rem; }
+  h2 { margin:.25rem 0 1rem; font-size:20px; font-weight:900; color:var(--midnight); }
+  h3 { margin:1.4rem 0 .6rem; font-size:13px; font-weight:700; color:var(--sbp-blue);
+       display:flex; align-items:center; gap:.5rem; letter-spacing:.01em; }
+  h3::before { content:""; width:28px; height:3px; background:var(--sbp-blue); }
+  h4 { margin:1.2rem 0 .5rem; font-size:13px; font-weight:700; color:var(--midnight); }
+
+  /* pale-panel cards: Soft Blue fill, rounded, no border/shadow */
+  .kv { display:grid; grid-template-columns:max-content 1fr; gap:.4rem 1.5rem;
+        background:var(--soft-blue); border-radius:8px; padding:1rem 1.25rem;
+        margin-bottom:1rem; max-width:780px; font-variant-numeric:tabular-nums; }
+  .kv div:nth-child(odd) { color:var(--gray-medium); }
+
+  /* tables: Soft Blue header, white rows, fill-only separation, no shadow */
+  table { width:100%; border-collapse:collapse; background:var(--white);
+          border-radius:8px; overflow:hidden; }
+  thead th { background:var(--soft-blue); color:var(--gray-medium); font-weight:700;
+             text-align:left; padding:.55rem .75rem; font-size:12.5px; }
+  tbody td { padding:.5rem .75rem; border-bottom:1px solid var(--soft-blue);
+             white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:46ch; }
+  tbody tr:last-child td { border-bottom:none; }
+  tr.q { cursor:pointer; } tr.q:hover { background:var(--pale-blue); }
+  .num { text-align:right; font-variant-numeric:tabular-nums; font-family:var(--mono); }
+  th.num { font-family:var(--mono); }
+
+  /* state signal colours */
+  .s-RUNNING { color:var(--sbp-blue); font-weight:700; }
+  .s-FINISHED { color:var(--green); font-weight:700; }
+  .s-FAILED, .s-CANCELED { color:var(--red); font-weight:700; }
+
+  a.back { color:var(--sbp-blue); cursor:pointer; font-weight:600;
+           display:inline-block; margin-bottom:.6rem; }
+  #detail.hidden { display:none; }
+  #detail pre { background:var(--soft-blue); border-radius:8px; padding:1rem;
+                font-family:var(--mono); font-size:12.5px; overflow:auto; max-width:920px; }
+
+  /* ── Dashboard stat cards ── */
+  .stat-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr));
+               gap:.75rem; margin-bottom:1.25rem; }
+  .stat-card { background:var(--white); border-radius:8px; padding:1rem 1.25rem;
+               display:flex; flex-direction:column; gap:.25rem; }
+  .stat-num  { font-size:40px; font-weight:900; color:var(--sbp-blue);
+               font-variant-numeric:tabular-nums; line-height:1; }
+  .stat-num.fail { color:var(--red); }
+  .stat-label{ font-size:12px; color:var(--gray-medium); font-weight:600;
+               letter-spacing:.01em; }
+  .stat-spark { width:100%; height:36px; overflow:visible; display:block; }
+
+  /* ── Histogram ── */
+  .hist-wrap { background:var(--white); border-radius:8px; padding:1rem 1.25rem;
+               margin-bottom:1.25rem; }
+  .hist-muted { font-size:12px; color:var(--gray-medium); font-style:italic; }
+  /* Histogram legend */
+  .hist-legend { display:flex; align-items:center; gap:1rem; margin-top:.5rem;
+                 font-size:12px; color:var(--gray-medium); }
+  .hist-legend-swatch { display:inline-block; width:12px; height:10px;
+                        border-radius:2px; flex-shrink:0; }
+  .hist-caption { margin-left:auto; font-style:italic; }
+
+  /* ── Gauge cards ── */
+  .gauge-row  { display:grid; grid-template-columns:1fr 1fr; gap:.75rem;
+                margin-bottom:1.25rem; }
+  .gauge-card { background:var(--white); border-radius:8px; padding:1rem 1.25rem;
+                display:flex; flex-direction:column; gap:.5rem; }
+  .gauge-title{ font-size:12px; font-weight:700; color:var(--gray-medium);
+                letter-spacing:.01em; text-transform:uppercase; }
+  .gauge-pct  { font-size:36px; font-weight:900; color:var(--sbp-blue);
+                font-variant-numeric:tabular-nums; line-height:1; }
+  .bar-track  { background:var(--soft-blue); border-radius:4px; height:8px;
+                overflow:hidden; }
+  .bar-fill   { height:100%; border-radius:4px; background:var(--sbp-blue);
+                transition:width .4s; }
+  .spark-wrap { height:40px; }
+  svg.spark   { width:100%; height:40px; overflow:visible; }
+
+  /* ── Tooltip ── */
+  #tip { position:fixed; pointer-events:none; display:none; z-index:9999;
+         background:#1a2535; color:#fff; font:600 12px var(--mono);
+         padding:.3rem .55rem; border-radius:5px; white-space:nowrap; }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">
+    <div class="eyebrow">Sovereign query engine</div>
+    <div class="wordmark">SQE</div>
+    <div class="marker"></div>
+  </div>
+  <nav>
+    <button data-tab="overview" class="active">Overview</button>
+    <button data-tab="queries">Queries</button>
+    <button data-tab="cluster">Cluster</button>
+  </nav>
+  <span id="meta"></span>
+</header>
+<div id="err"></div>
+<div id="overview"></div>
+<div id="queries" style="display:none"></div>
+<div id="cluster" style="display:none"></div>
+<div id="detail" class="hidden"></div>
+
+<!-- Shared tooltip: lives outside #overview so it survives innerHTML rewrites -->
+<div id="tip"></div>
+
+<script>
+const $ = s => document.querySelector(s);
+let tab = "overview", current = null;
+
+// HTML-escape every value that comes from the engine (usernames, SQL, error
+// messages, worker URLs are user- or config-controlled). Without this, a query
+// whose SQL contains "<script>" would execute in an operator's browser
+// (stored XSS). No DOMPurify dep: this page has no build step.
+function esc(s){ return String(s==null?"":s).replace(/[&<>"']/g, c=>(
+  {"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c])); }
+// State strings come from our own enum; strip to A-Z before using as a CSS class.
+function stClass(s){ return "s-"+String(s).replace(/[^A-Z]/g,""); }
+function fmtBytes(n){ if(!n) return "0"; const u=["B","KB","MB","GB","TB"];
+  let i=0,v=n; while(v>=1024&&i<u.length-1){v/=1024;i++;} return v.toFixed(1)+u[i]; }
+function ms(n){ return (n|0)>=1000 ? ((n|0)/1000).toFixed(2)+"s" : (n|0)+"ms"; }
+function dash(v){ return (v==null||v===0||v==="")?"--":esc(v); }
+// Format a Unix-epoch-ms timestamp as local HH:MM for chart tooltips.
+function hhmm(unixMs){ return new Date(unixMs).toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"}); }
+
+async function getJSON(u){ const r=await fetch(u); if(!r.ok) throw new Error(u+" "+r.status);
+  return r.json(); }
+
+function showErr(e){ const el=$("#err"); el.textContent="lost connection: "+e.message;
+  el.style.display="block"; }
+function clearErr(){ $("#err").style.display="none"; }
+
+// ── Shared tooltip (event-delegated) ──────────────────────────────────────────
+// The #tip div is static in <body> and never overwritten. Listeners are
+// attached once to document, reading the data-tip attribute of hovered SVG
+// elements. Using pageX/pageY keeps positioning correct regardless of any
+// positioned ancestors.
+const tip = $("#tip");
+
+document.addEventListener("mouseover", e => {
+  const t = e.target.closest("[data-tip]");
+  if (!t) return;
+  tip.textContent = t.getAttribute("data-tip");
+  tip.style.display = "block";
+});
+
+document.addEventListener("mousemove", e => {
+  if (!e.target.closest("[data-tip]")) return;
+  tip.style.left = (e.pageX + 14) + "px";
+  tip.style.top  = (e.pageY - 28) + "px";
+});
+
+document.addEventListener("mouseout", e => {
+  if (!e.target.closest("[data-tip]")) return;
+  tip.style.display = "none";
+});
+
+document.addEventListener("touchstart", e => {
+  const t = e.target.closest("[data-tip]");
+  if (!t) { tip.style.display = "none"; return; }
+  const touch = e.touches[0];
+  tip.textContent = t.getAttribute("data-tip");
+  tip.style.left  = (touch.pageX + 14) + "px";
+  tip.style.top   = (touch.pageY - 28) + "px";
+  tip.style.display = "block";
+}, { passive: true });
+
+// ── SVG histogram ──────────────────────────────────────────────────────────
+// Builds a stacked-bar histogram from bucket data.
+// "Completed" bars = b.finished (successfully finished, not double-counting failed).
+// "Failed" bars    = b.failed   (failed, stacked on top).
+// Each bar gets a transparent hit-target rect carrying the data-tip label.
+function buildHistSvg(buckets, W, H) {
+  if (!buckets || buckets.length === 0) return "";
+  const maxVal = Math.max(...buckets.map(b => (b.finished||0)+(b.failed||0)), 1);
+  const n = buckets.length;
+  const gap = 2;
+  const barW = Math.max(1, Math.floor((W - gap * (n - 1)) / n));
+  let bars = "";
+  for (let i = 0; i < n; i++) {
+    const x = i * (barW + gap);
+    const finished  = b => (b.finished||0);
+    const failed    = b => (b.failed||0);
+    const fin  = finished(buckets[i]);
+    const fail = failed(buckets[i]);
+    const totalQ = fin + fail;
+    const totalH = Math.round((totalQ / maxVal) * H);
+    const failH  = Math.round((fail / maxVal) * H);
+    if (fin > 0) {
+      bars += `<rect x="${x}" y="${H - totalH + failH}" width="${barW}" height="${totalH - failH}" fill="var(--sbp-blue)" />`;
+    }
+    if (fail > 0) {
+      bars += `<rect x="${x}" y="${H - failH}" width="${barW}" height="${failH}" fill="var(--red)" />`;
+    }
+    if (totalQ === 0) {
+      bars += `<rect x="${x}" y="${H - 2}" width="${barW}" height="2" fill="var(--soft-blue)" />`;
+    }
+    // Transparent hit-target covering the full bar height for tooltip
+    const label = `${hhmm(buckets[i].tUnixMs)} · ${fin} completed, ${fail} failed`;
+    bars += `<rect x="${x}" y="0" width="${barW}" height="${H}" fill="transparent" data-tip="${esc(label)}" style="cursor:crosshair" />`;
+  }
+  return `<svg viewBox="0 0 ${W} ${H}" width="100%" height="${H}" preserveAspectRatio="none">${bars}</svg>`;
+}
+
+// ── SVG sparkline (polyline + per-point hover rects) ─────────────────────────
+// Returns inline SVG for a small sparkline. The `series` array is
+// [{val, label}] objects; `color` is a CSS color string.
+function sparklineSvg(series, color, W, H, cssClass) {
+  if (!series || series.length < 2) return `<svg class="${cssClass||"stat-spark"}" viewBox="0 0 ${W} ${H}"></svg>`;
+  const vals = series.map(p => p.val);
+  const maxV = Math.max(...vals, 0.001);
+  const pts = vals.map((v, i) => {
+    const x = (i / (vals.length - 1)) * W;
+    const y = H - (v / maxV) * (H - 4) - 2;
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  }).join(" ");
+
+  // Faint area fill under the line
+  const firstX = 0, lastX = W;
+  const firstY = H - (vals[0] / maxV) * (H - 4) - 2;
+  const areaPath = `M${firstX},${firstY} ` + pts.split(" ").slice(1).map(p => `L${p}`).join(" ") + ` L${lastX},${H} L${firstX},${H} Z`;
+
+  // Per-point transparent hit-target columns
+  const colW = W / vals.length;
+  let targets = "";
+  for (let i = 0; i < series.length; i++) {
+    const x = i * colW;
+    const label = series[i].label;
+    targets += `<rect x="${x.toFixed(1)}" y="0" width="${colW.toFixed(1)}" height="${H}" fill="transparent" data-tip="${esc(label)}" style="cursor:crosshair" />`;
+  }
+
+  return `<svg class="${cssClass||"stat-spark"}" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">` +
+    `<path d="${areaPath}" fill="${color}" opacity="0.10" />` +
+    `<polyline points="${pts}" fill="none" stroke="${color}" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round" />` +
+    targets +
+    `</svg>`;
+}
+
+// Build a sparkline series array from buckets given a value extractor and label template.
+function bucketSeries(buckets, valFn, labelFn) {
+  return buckets.map(b => ({ val: valFn(b), label: labelFn(b) }));
+}
+
+// ── SVG sparkline (gauge variant, polyline) ────────────────────────────────
+// Used for the two gauge-card sparklines (same shape, different CSS class).
+function buildSparkSvg(series, W, H) {
+  return sparklineSvg(series, "var(--sbp-blue)", W, H, "spark");
+}
+
+async function renderOverview(){
+  try {
+    const [o, hist] = await Promise.all([
+      getJSON("/api/v1/overview"),
+      getJSON("/api/v1/metrics/history").catch(() => ({ buckets: [] }))
+    ]);
+    clearErr();
+    $("#meta").textContent = `${esc(o.node.role)} v${esc(o.node.version)} · up ${o.node.uptimeSeconds|0}s`;
+    const cap = o.capabilities||{}, res = o.resources||{}, met = o.metrics||{};
+    const buckets = (hist && hist.buckets) ? hist.buckets : [];
+
+    // ── Stat cards with per-metric sparklines ───────────────────────────────
+    const W = 200, H = 36;
+    const statDefs = [
+      {
+        label:"Total queries",
+        num: met.totalQueries|0,
+        cls:"",
+        series: bucketSeries(buckets, b=>b.total||0,    b=>`${hhmm(b.tUnixMs)} · ${b.total||0} total`),
+        color:"var(--sbp-blue)"
+      },
+      {
+        label:"Finished",
+        num: met.finished|0,
+        cls:"",
+        series: bucketSeries(buckets, b=>b.finished||0, b=>`${hhmm(b.tUnixMs)} · ${b.finished||0} finished`),
+        color:"var(--sbp-blue)"
+      },
+      {
+        label:"Failed",
+        num: met.failed|0,
+        cls:"fail",
+        series: bucketSeries(buckets, b=>b.failed||0,   b=>`${hhmm(b.tUnixMs)} · ${b.failed||0} failed`),
+        color:"var(--red)"
+      },
+      {
+        label:"Running",
+        num: met.running|0,
+        cls:"",
+        series: bucketSeries(buckets, b=>b.avgActive||0, b=>`${hhmm(b.tUnixMs)} · ${(b.avgActive||0).toFixed(1)} avg active`),
+        color:"var(--sbp-blue)"
+      },
+      {
+        label:"Avg latency",
+        num: ms(met.avgExecutionMs),
+        cls:"",
+        raw:true,
+        series: bucketSeries(buckets, b=>b.avgLatencyMs||0, b=>`${hhmm(b.tUnixMs)} · ${ms(b.avgLatencyMs||0)} avg latency`),
+        color:"var(--sbp-blue)"
+      },
+      {
+        label:"Rows out",
+        num: met.totalOutputRows|0,
+        cls:"",
+        series: bucketSeries(buckets, b=>b.rowsOut||0,  b=>`${hhmm(b.tUnixMs)} · ${(b.rowsOut||0).toLocaleString()} rows`),
+        color:"var(--sbp-blue)"
+      },
+    ];
+    const statCards = statDefs.map(s => {
+      const spark = s.series.length >= 2
+        ? sparklineSvg(s.series, s.color, W, H, "stat-spark")
+        : `<svg class="stat-spark" viewBox="0 0 ${W} ${H}"></svg>`;
+      return `<div class="stat-card">` +
+        `<div class="stat-num ${s.cls}">${s.raw ? esc(s.num) : (s.num|0)}</div>` +
+        `<div class="stat-label">${esc(s.label)}</div>` +
+        spark +
+        `</div>`;
+    }).join("");
+
+    // ── Memory gauge ────────────────────────────────────────────────────────
+    // Use latest maxMemPct from history; fall back to 0 when no history yet.
+    const lastBucket = buckets.length > 0 ? buckets[buckets.length - 1] : null;
+    const memPct = lastBucket ? (lastBucket.maxMemPct||0) : 0;
+    const memPctDisp = memPct.toFixed(1);
+    const memFill = memPct > 80 ? "#FF7000" : "var(--sbp-blue)";
+    const memSparkSeries = bucketSeries(buckets, b=>b.avgMemPct||0, b=>`${hhmm(b.tUnixMs)} · ${(b.avgMemPct||0).toFixed(1)}% mem`);
+    const memSpark = buildSparkSvg(memSparkSeries, 200, 40);
+
+    // ── Concurrency gauge ───────────────────────────────────────────────────
+    const maxConc = cap.maxConcurrentQueries || 0;
+    const activeQ = res.activeQueries || 0;
+    const concPct = maxConc > 0 ? Math.min((activeQ / maxConc) * 100, 100) : 0;
+    const concPctDisp = concPct.toFixed(1);
+    const concSparkSeries = bucketSeries(buckets, b=>b.avgActive||0, b=>`${hhmm(b.tUnixMs)} · ${(b.avgActive||0).toFixed(1)} avg active`);
+    const concSpark = buildSparkSvg(concSparkSeries, 200, 40);
+
+    // ── Histogram ───────────────────────────────────────────────────────────
+    const histSvg = buckets.length > 0
+      ? buildHistSvg(buckets, 900, 100)
+      : `<p class="hist-muted">collecting&hellip;</p>`;
+
+    // Histogram legend (only shown when there is data)
+    const histLegend = buckets.length > 0
+      ? `<div class="hist-legend">` +
+        `<span class="hist-legend-swatch" style="background:var(--sbp-blue)"></span> Completed` +
+        `<span class="hist-legend-swatch" style="background:var(--red)"></span> Failed` +
+        `<span class="hist-caption">1-min buckets &middot; last 1h</span>` +
+        `</div>`
+      : "";
+
+    $("#overview").innerHTML =
+      `<h2>${esc(o.node.name)} <span style="color:var(--mut)">v${esc(o.node.version)}</span>`+
+      ` &mdash; <span class="s-FINISHED">${esc(o.node.role)}</span>`+
+      ` &mdash; DataFusion ${esc(o.node.datafusionVersion)}</h2>`+
+
+      // a. Stat cards
+      `<h3>Activity</h3>`+
+      `<div class="stat-grid">${statCards}</div>`+
+
+      // b. Histogram
+      `<h3>Query activity (last 1h)</h3>`+
+      `<div class="hist-wrap">${histSvg}${histLegend}</div>`+
+
+      // c. Resource gauges
+      `<h3>Resource usage</h3>`+
+      `<div class="gauge-row">`+
+        `<div class="gauge-card">`+
+          `<div class="gauge-title">Memory</div>`+
+          `<div class="gauge-pct">${memPctDisp}%</div>`+
+          `<div class="bar-track"><div class="bar-fill" style="width:${Math.min(memPct,100).toFixed(1)}%;background:${memFill}"></div></div>`+
+          `<div class="spark-wrap">${memSpark}</div>`+
+        `</div>`+
+        `<div class="gauge-card">`+
+          `<div class="gauge-title">Concurrency ${activeQ|0} / ${maxConc|0}</div>`+
+          `<div class="gauge-pct">${concPctDisp}%</div>`+
+          `<div class="bar-track"><div class="bar-fill" style="width:${Math.min(concPct,100).toFixed(1)}%"></div></div>`+
+          `<div class="spark-wrap">${concSpark}</div>`+
+        `</div>`+
+      `</div>`+
+
+      // d. Capabilities (config reference)
+      `<h3>Requirements</h3>`+
+      `<div class=kv>`+
+      `<div>Flight SQL port</div><div>${dash(cap.flightSqlPort)}</div>`+
+      `<div>Trino HTTP port</div><div>${dash(cap.trinoHttpPort)}</div>`+
+      `<div>Quack port</div><div>${dash(cap.quackPort)}</div>`+
+      `<div>Catalog backend</div><div>${dash(cap.catalogBackend)}</div>`+
+      `<div>Catalog URL</div><div>${dash(cap.catalogUrl)}</div>`+
+      `<div>Storage</div><div>${dash(cap.storage)}</div>`+
+      `<div>Max query memory</div><div>${dash(cap.memoryLimit)}</div>`+
+      `<div>Max concurrent queries</div><div>${dash(cap.maxConcurrentQueries)}</div>`+
+      `<div>CPU cores</div><div>${res.cpuCores|0}</div>`+
+      `<div>Memory limit</div><div>${fmtBytes(res.memoryLimitBytes)}</div>`+
+      `</div>`;
+  } catch(e){ showErr(e); }
+}
+
+async function renderQueries(){
+  try {
+    const rows = await getJSON("/api/v1/queries?limit=200"); clearErr();
+    if(current!==null) return; // detail open
+    $("#queries").innerHTML =
+      "<table><thead><tr><th>id</th><th>state</th><th>user</th><th>sql (redacted)</th><th>sql hash</th>"+
+      "<th class=num>elapsed</th><th class=num>rows</th><th class=num>scanned</th></tr></thead><tbody>"+
+      rows.map(q=>{
+        const el = (q.executionMs||0)+(q.planningMs||0)+(q.queuedMs||0);
+        return `<tr class=q data-id="${esc(q.queryId)}"><td>${esc(String(q.queryId).slice(0,8))}</td>`+
+          `<td class="${stClass(q.state)}">${esc(q.state)}</td>`+
+          `<td>${esc(q.username||"")}</td>`+
+          `<td title="${esc(q.sql||"")}">${esc(String(q.sql||"").slice(0,60))}</td>`+
+          `<td title="${esc(q.sqlHash||"")}">${esc(String(q.sqlHash||"").slice(0,12))}</td>`+
+          `<td class=num>${ms(el)}</td><td class=num>${q.outputRows|0}</td>`+
+          `<td class=num>${fmtBytes(q.bytesScanned)}</td></tr>`;
+      }).join("")+"</tbody></table>";
+    document.querySelectorAll("tr.q").forEach(tr=>
+      tr.onclick=()=>openDetail(tr.dataset.id));
+  } catch(e){ showErr(e); }
+}
+
+async function openDetail(id){
+  current = id;
+  try {
+    const d = await getJSON("/api/v1/queries/"+encodeURIComponent(id)); clearErr();
+    $("#queries").style.display="none"; $("#cluster").style.display="none"; $("#overview").style.display="none";
+    const det = $("#detail"); det.classList.remove("hidden");
+    const fr = (d.fragments||[]).map(f=>
+      `<tr><td>${esc(f.taskId)}</td><td>${esc(f.workerUrl)}</td>`+
+      `<td class="${stClass(f.state)}">${esc(f.state)}</td>`+
+      `<td class=num>${ms(f.elapsedMs)}</td><td class=num>${f.outputRows|0}</td></tr>`).join("");
+    det.innerHTML = `<a class=back onclick="closeDetail()">&larr; back</a>`+
+      `<h3>${esc(d.queryId)}</h3>`+
+      `<div class=kv>`+
+      `<div>state</div><div class="${stClass(d.state)}">${esc(d.state)}</div>`+
+      `<div>user</div><div>${esc(d.username||"")}</div>`+
+      `<div>roles</div><div>${esc((d.roles||[]).join(", "))}</div>`+
+      (d.clientIp?`<div>client ip</div><div>${esc(d.clientIp)}</div>`:"")+
+      `<div>queued</div><div>${ms(d.queuedMs)}</div>`+
+      `<div>planning</div><div>${ms(d.planningMs)}</div>`+
+      `<div>execution</div><div>${ms(d.executionMs)}</div>`+
+      `<div>rows out</div><div>${d.outputRows|0}</div>`+
+      `<div>bytes scanned</div><div>${fmtBytes(d.bytesScanned)}</div>`+
+      `<div>spill</div><div>${fmtBytes(d.spillBytes)}</div>`+
+      `<div>peak mem</div><div>${fmtBytes(d.peakMemoryBytes)}</div>`+
+      (d.errorMessage?`<div>error</div><div class=s-FAILED>${esc(d.errorMessage)}</div>`:"")+
+      `</div>`+
+      `<pre style="white-space:pre-wrap;color:var(--mut)">sql (redacted): ${esc(d.sql||"")}\n\nsql hash: ${esc(d.sqlHash)}</pre>`+
+      (fr?`<h4>fragments</h4><table><thead><tr><th>task</th><th>worker</th><th>state</th>`+
+        `<th class=num>elapsed</th><th class=num>rows</th></tr></thead><tbody>${fr}</tbody></table>`:"");
+  } catch(e){ showErr(e); }
+}
+function closeDetail(){ current=null; $("#detail").classList.add("hidden");
+  $("#queries").style.display=""; switchTab(tab); }
+
+async function renderCluster(){
+  try {
+    const [w,st] = await Promise.all([getJSON("/api/v1/workers"), getJSON("/api/v1/status")]);
+    clearErr();
+    $("#meta").textContent = `${st.node.role} v${st.node.version} · up ${st.node.uptimeSeconds}s`;
+    $("#cluster").innerHTML =
+      `<div class=kv><div>workers</div><div>${w.healthyCount|0}/${w.total|0} healthy</div>`+
+      `<div>active queries</div><div>${w.activeQueries|0}</div></div>`+
+      "<table><thead><tr><th>worker</th><th>healthy</th><th class=num>in-flight</th></tr></thead><tbody>"+
+      (w.workers||[]).map(x=>`<tr><td>${esc(x.url)}</td><td>${x.healthy?"yes":"no"}</td>`+
+        `<td class=num>${x.inFlight|0}</td></tr>`).join("")+"</tbody></table>";
+  } catch(e){ showErr(e); }
+}
+
+function switchTab(t){
+  tab=t; current=null; $("#detail").classList.add("hidden");
+  document.querySelectorAll("nav button").forEach(b=>
+    b.classList.toggle("active", b.dataset.tab===t));
+  $("#overview").style.display = t==="overview" ? "" : "none";
+  $("#queries").style.display  = t==="queries"  ? "" : "none";
+  $("#cluster").style.display  = t==="cluster"  ? "" : "none";
+  tick();
+}
+document.querySelectorAll("nav button").forEach(b=>
+  b.onclick=()=>switchTab(b.dataset.tab));
+
+function tick(){ if(current!==null) return;
+  if(tab==="overview") renderOverview();
+  else if(tab==="queries") renderQueries();
+  else renderCluster(); }
+tick(); setInterval(tick, 2000);
+</script>
+</body>
+</html>

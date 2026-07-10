@@ -1,0 +1,88 @@
+{
+  "benchmark": "tpce",
+  "scale_factor": 1.0,
+  "protocol": "flight",
+  "timestamp": "2026-03-25T08:53:06",
+  "summary": {
+    "total": 11,
+    "pass": 6,
+    "fail": 0,
+    "diff": 0,
+    "skip": 5,
+    "error": 0,
+    "total_duration_ms": 3826
+  },
+  "queries": [
+    {
+      "id": "broker_volume",
+      "status": "pass",
+      "duration_ms": 643,
+      "rows": 15
+    },
+    {
+      "id": "customer_position",
+      "status": "pass",
+      "duration_ms": 910,
+      "rows": 1397074
+    },
+    {
+      "id": "data_maintenance",
+      "status": "skip",
+      "duration_ms": 0,
+      "rows": 0,
+      "message": "requires: update, delete"
+    },
+    {
+      "id": "market_feed",
+      "status": "skip",
+      "duration_ms": 0,
+      "rows": 0,
+      "message": "requires: update"
+    },
+    {
+      "id": "market_watch",
+      "status": "pass",
+      "duration_ms": 560,
+      "rows": 50000
+    },
+    {
+      "id": "security_detail",
+      "status": "pass",
+      "duration_ms": 572,
+      "rows": 125
+    },
+    {
+      "id": "trade_lookup",
+      "status": "pass",
+      "duration_ms": 581,
+      "rows": 4299
+    },
+    {
+      "id": "trade_order",
+      "status": "skip",
+      "duration_ms": 0,
+      "rows": 0,
+      "message": "requires: insert"
+    },
+    {
+      "id": "trade_result",
+      "status": "skip",
+      "duration_ms": 0,
+      "rows": 0,
+      "message": "requires: update, insert"
+    },
+    {
+      "id": "trade_status",
+      "status": "pass",
+      "duration_ms": 560,
+      "rows": 31155
+    },
+    {
+      "id": "trade_update",
+      "status": "skip",
+      "duration_ms": 0,
+      "rows": 0,
+      "message": "requires: update"
+    }
+  ]
+}

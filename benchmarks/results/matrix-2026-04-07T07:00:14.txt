@@ -1,0 +1,32 @@
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Benchmark Matrix Results — Tue Apr  7 09:00:14 CEST 2026
+  Scale factor: SF1
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+── Config: single-512mb ──────────────────────────────────────
+  Memory: 512MB, PID: 73327
+  tpch SF1: 21/22 pass, 1 error, 35.1s
+    sqe_cache_misses_total 22
+
+── Config: single-8gb ──────────────────────────────────────
+  Memory: 8GB, PID: 74449
+  tpch SF1: 22/22 pass, 0 error, 32.8s
+    sqe_cache_misses_total 22
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Matrix complete. Results in benchmarks/results/
+  Metrics deltas in benchmarks/metrics/
+  Summary:  /Users/jjverhoeks/git/schuberg/vpf-data-ai/chameleon/Applications/sqlengine/benchmarks/results/matrix-2026-04-07T07:00:14.txt
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Total time per config:
+  single-512mb         [########################################]   35.2s  (21/22 pass)
+  single-8gb           [#####################################...]   32.9s  (22/22 pass)
+
+Per-suite timing comparison:
+  tpch:
+    single-512mb         ##############################   35.2s
+    single-8gb           ############################     32.9s
+
+
