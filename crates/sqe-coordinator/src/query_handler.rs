@@ -2066,6 +2066,12 @@ impl QueryHandler {
                 .with_teardown(tt_cleanup)
                 .with_idle_timeout(std::time::Duration::from_secs(
                     self.config.query.stream_idle_timeout_secs,
+                ))
+                // Bounds progress-based idle extensions (issue #365): the
+                // streaming path has no outer tokio timeout, so this is
+                // where `query.timeout_secs` gets enforced for streams.
+                .with_query_deadline(std::time::Duration::from_secs(
+                    timeout_for_session(&self.config.query, session),
                 ));
                 let boxed: SendableRecordBatchStream = Box::pin(tracked);
                 Ok((schema, boxed))
