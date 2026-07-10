@@ -130,6 +130,11 @@ Benchmark JSON results in `benchmarks/results/` are **committed to the repo** fo
 # Quick smoke test: TPC-H SF1 single-node
 BENCH_SCALE=1 ./scripts/benchmark-test.sh tpch
 
+# Iterating on engine code between runs: dev-release profile (release
+# opt-level, no LTO, incremental) rebuilds in a fraction of release time.
+# Committed baseline numbers must still come from PROFILE=release.
+PROFILE=dev-release BENCH_SCALE=1 ./scripts/benchmark-test.sh tpch
+
 # Distributed test: coordinator + 2 workers (heavy; brings up its own stack)
 scripts/test.sh scenario distributed
 ```

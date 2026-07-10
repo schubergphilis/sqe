@@ -23,7 +23,7 @@ default = ["rest"]
 # Use when packaging an image that needs to dispatch to Polaris, Glue,
 # S3 Tables, Hive Metastore, Hadoop warehouses, and Postgres-backed SQL
 # catalogs.
-full-backends = ["rest", "sql-postgres", "hms", "glue", "hadoop", "s3tables"]
+full-backends = ["rest", "rest-sigv4", "sql-postgres", "hms", "glue", "hadoop", "s3tables"]
 # REST catalog (the protocol Polaris and Nessie both speak). Activating
 # the feature pulls in `iceberg-catalog-rest`, compiles the
 # `rest_catalog` module, and registers the loader's REST builder.
@@ -35,6 +35,15 @@ rest = [
     "dep:iceberg-catalog-rest",
     "iceberg-catalog-loader/rest",
 ]
+# SigV4 request signing for REST catalogs behind AWS-signed endpoints
+# (Glue Iceberg REST, S3 Tables REST; engaged at runtime via
+# `rest.sigv4-enabled=true` or auto-detected AWS endpoints). Kept out of
+# the plain `rest` feature because it pulls aws-config plus the
+# aws-sdk-sso / ssooidc / sts credential-chain crates into an otherwise
+# AWS-free Polaris/Nessie build. `glue`, `s3tables`, and `full-backends`
+# enable it; without the feature the sigv4 catalog properties are
+# ignored by the vendored REST client.
+rest-sigv4 = ["rest", "iceberg-catalog-rest/aws-sigv4"]
 # JDBC-style SQL catalog. SQLite via rusqlite (existing helper) plus the
 # upstream iceberg-catalog-sql crate which uses sqlx::any for runtime
 # dispatch to SQLite/PostgreSQL/MySQL.
@@ -66,6 +75,7 @@ glue = [
     "iceberg-catalog-loader/glue",
     "dep:aws-config",
     "dep:aws-credential-types",
+    "rest-sigv4",
 ]
 # AWS S3 Tables (managed Iceberg). Pulls in aws-sdk-s3tables. Shares
 # the aws-config + aws-sdk runtime already pulled by `glue`, so the
@@ -76,6 +86,7 @@ s3tables = [
     "iceberg-catalog-loader/s3tables",
     "dep:aws-config",
     "dep:aws-credential-types",
+    "rest-sigv4",
 ]
 # Delta Lake read support (delta-rs) is REMOVED for the DataFusion 54 bump.
 # deltalake-core 0.32.1 targets DataFusion 53.1, so its `DeltaTableProvider`

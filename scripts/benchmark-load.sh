@@ -95,12 +95,25 @@ fi
 cd "$ROOT_DIR"
 
 # ── Build ─────────────────────────────────────────────────────
+# PROFILE=release (default) | dev-release (same opt-level, no LTO,
+# incremental — much faster rebuilds when iterating) | debug.
+PROFILE="${PROFILE:-release}"
+case "$PROFILE" in
+    release|debug|dev-release) ;;
+    *) echo "ERROR: PROFILE must be 'release', 'dev-release' or 'debug', got: '$PROFILE'" >&2; exit 1 ;;
+esac
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "  Building sqe-bench + sqe-coordinator..."
+echo "  Building sqe-bench + sqe-coordinator (profile: $PROFILE)..."
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-cargo build -p sqe-bench -p sqe-coordinator --release 2>&1
-BENCH_BIN="$ROOT_DIR/target/release/sqe-bench"
-SQE_BIN="$ROOT_DIR/target/release/sqe-coordinator"
+if [ "$PROFILE" = "release" ]; then
+    cargo build -p sqe-bench -p sqe-coordinator --bin sqe-bench --bin sqe-coordinator --release 2>&1
+elif [ "$PROFILE" = "dev-release" ]; then
+    cargo build -p sqe-bench -p sqe-coordinator --bin sqe-bench --bin sqe-coordinator --profile dev-release 2>&1
+else
+    cargo build -p sqe-bench -p sqe-coordinator --bin sqe-bench --bin sqe-coordinator 2>&1
+fi
+BENCH_BIN="$ROOT_DIR/target/$PROFILE/sqe-bench"
+SQE_BIN="$ROOT_DIR/target/$PROFILE/sqe-coordinator"
 echo ""
 
 # ── Start test stack ──────────────────────────────────────────
