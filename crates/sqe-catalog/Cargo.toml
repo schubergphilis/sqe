@@ -14,11 +14,12 @@ repository.workspace = true
 # deployment. Operators who need additional backends opt in by feature or
 # by the `full-backends` umbrella.
 #
-# Approximate binary cost on top of `rest`-only: hadoop adds ~0 (no new
-# deps); sql-postgres ~5-10 MB; hms ~10-15 MB; glue ~50-80 MB
-# (aws-sdk-glue is the heavyweight); s3tables adds ~5-10 MB on top of
-# glue's AWS SDK runtime.
-default = ["rest"]
+# Approximate binary cost on top of `rest`-only: rest-sigv4 adds aws-config
+# plus the SigV4 credential chain (~10-15 MB compile weight, no Glue/S3
+# Tables SDK); hadoop adds ~0 (no new deps); sql-postgres ~5-10 MB; hms
+# ~10-15 MB; glue ~50-80 MB (aws-sdk-glue is the heavyweight); s3tables
+# adds ~5-10 MB on top of glue's AWS SDK runtime.
+default = ["rest", "rest-sigv4"]
 # Umbrella for the legacy default: every supported backend compiled in.
 # Use when packaging an image that needs to dispatch to Polaris, Glue,
 # S3 Tables, Hive Metastore, Hadoop warehouses, and Postgres-backed SQL
@@ -37,12 +38,13 @@ rest = [
 ]
 # SigV4 request signing for REST catalogs behind AWS-signed endpoints
 # (Glue Iceberg REST, S3 Tables REST; engaged at runtime via
-# `rest.sigv4-enabled=true` or auto-detected AWS endpoints). Kept out of
-# the plain `rest` feature because it pulls aws-config plus the
-# aws-sdk-sso / ssooidc / sts credential-chain crates into an otherwise
-# AWS-free Polaris/Nessie build. `glue`, `s3tables`, and `full-backends`
-# enable it; without the feature the sigv4 catalog properties are
-# ignored by the vendored REST client.
+# `rest.sigv4-enabled=true` or auto-detected AWS endpoints). Default-on
+# so coordinator/worker builds can talk to AWS Iceberg REST without
+# pulling in the full Glue/S3 Tables SDK backends. Slim builds that want
+# zero AWS crates (Polaris/Nessie only) can use `--no-default-features
+# --features rest`. `glue`, `s3tables`, and `full-backends` also enable
+# it; without the feature the sigv4 catalog properties are ignored by
+# the vendored REST client.
 rest-sigv4 = ["rest", "iceberg-catalog-rest/aws-sigv4"]
 # JDBC-style SQL catalog. SQLite via rusqlite (existing helper) plus the
 # upstream iceberg-catalog-sql crate which uses sqlx::any for runtime
