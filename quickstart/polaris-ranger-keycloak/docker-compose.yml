@@ -159,7 +159,7 @@ services:
 
   # ── Polaris — Iceberg REST catalog, Ranger authorizer + Keycloak OIDC ─
   polaris:
-    image: apache/polaris:1.5.0
+    image: apache/polaris:1.6.0
     environment:
       POLARIS_PERSISTENCE_TYPE: in-memory
       POLARIS_BOOTSTRAP_CREDENTIALS: iceberg-ranger,root,${POLARIS_BOOTSTRAP_SECRET:-polaris-root-secret}

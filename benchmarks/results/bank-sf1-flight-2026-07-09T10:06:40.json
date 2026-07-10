@@ -1,0 +1,73 @@
+{
+  "benchmark": "bank",
+  "scale_factor": 1.0,
+  "protocol": "flight",
+  "timestamp": "2026-07-09T10:06:40",
+  "summary": {
+    "total": 8,
+    "pass": 0,
+    "fail": 0,
+    "diff": 0,
+    "skip": 0,
+    "error": 8,
+    "total_duration_ms": 8
+  },
+  "queries": [
+    {
+      "id": "q01",
+      "status": "error",
+      "duration_ms": 1,
+      "rows": 0,
+      "message": "Query failed: Tonic error: code: 'Some requested entity was not found', message: \"table 'iceberg.bank_sf1.transaction' not found\""
+    },
+    {
+      "id": "q02",
+      "status": "error",
+      "duration_ms": 1,
+      "rows": 0,
+      "message": "Query failed: Tonic error: code: 'Some requested entity was not found', message: \"table 'iceberg.bank_sf1.transaction' not found\""
+    },
+    {
+      "id": "q03",
+      "status": "error",
+      "duration_ms": 1,
+      "rows": 0,
+      "message": "Query failed: Tonic error: code: 'Some requested entity was not found', message: \"table 'iceberg.bank_sf1.transaction' not found\""
+    },
+    {
+      "id": "q04",
+      "status": "error",
+      "duration_ms": 1,
+      "rows": 0,
+      "message": "Query failed: Tonic error: code: 'Some requested entity was not found', message: \"table 'iceberg.bank_sf1.transaction' not found\""
+    },
+    {
+      "id": "q05",
+      "status": "error",
+      "duration_ms": 1,
+      "rows": 0,
+      "message": "Query failed: Tonic error: code: 'Some requested entity was not found', message: \"table 'iceberg.bank_sf1.transaction' not found\""
+    },
+    {
+      "id": "q06",
+      "status": "error",
+      "duration_ms": 1,
+      "rows": 0,
+      "message": "Query failed: Tonic error: code: 'Some requested entity was not found', message: \"table 'iceberg.bank_sf1.transaction' not found\""
+    },
+    {
+      "id": "q07",
+      "status": "error",
+      "duration_ms": 1,
+      "rows": 0,
+      "message": "Query failed: Tonic error: code: 'Some requested entity was not found', message: \"table 'iceberg.bank_sf1.account_balance' not found\""
+    },
+    {
+      "id": "q08",
+      "status": "error",
+      "duration_ms": 1,
+      "rows": 0,
+      "message": "Query failed: Tonic error: code: 'Some requested entity was not found', message: \"table 'iceberg.bank_sf1.transaction' not found\""
+    }
+  ]
+}
