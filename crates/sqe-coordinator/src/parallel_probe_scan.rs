@@ -56,7 +56,9 @@ use tracing::debug;
 /// does not concatenate N partitions and over-return `N * limit` rows. Last, a
 /// global `LIMIT` that `LimitPushdown` stranded as a per-partition `fetch` below
 /// the (single-partition) root is re-applied at the root; see
-/// [`restore_stranded_global_fetch`].
+/// [`restore_stranded_global_fetch`]. A fetch the re-run ERASED from the tree
+/// entirely (sortless `GROUP BY ... LIMIT`, issue #364) is re-applied from the
+/// pre-bump plan; see [`reapply_erased_root_fetch`].
 #[derive(Debug, Default)]
 pub struct ParallelProbeScanRule;
 
@@ -89,6 +91,10 @@ impl PhysicalOptimizerRule for ParallelProbeScanRule {
         if bumpable.is_empty() {
             return Ok(plan);
         }
+        // The pre-bump plan is correct by construction: remember its global row
+        // cap so a fetch the re-optimization ERASES (not merely strands) can be
+        // re-applied at the root; see [`reapply_erased_root_fetch`].
+        let pre_fetch = effective_root_fetch(&plan);
         let rewritten = bump_scans(&plan, &bumpable, n)?;
         debug!(
             target_partitions = n,
@@ -105,7 +111,8 @@ impl PhysicalOptimizerRule for ParallelProbeScanRule {
         // -- the redundant wide-row sort that OOMs on rollup inputs.
         let resorted = EnforceSorting::new().optimize(redistributed, config)?;
         let single = restore_single_partition_root(resorted);
-        Ok(restore_stranded_global_fetch(single))
+        let restored = restore_stranded_global_fetch(single);
+        Ok(reapply_erased_root_fetch(restored, pre_fetch))
     }
 
     fn name(&self) -> &str {
@@ -207,10 +214,58 @@ pub(crate) fn restore_stranded_global_fetch(
     let Some(fetch) = find_stranded_fetch(&plan) else {
         return plan;
     };
-    // Re-apply the global cap in final output order. A fetchless merge root
-    // folds the fetch in directly (both merge nodes return `Some` from
-    // `with_fetch`); any other root (a bare `LIMIT` with no `ORDER BY`, whose
-    // root is unordered) is wrapped in a `GlobalLimitExec`.
+    apply_fetch_at_root(plan, fetch)
+}
+
+/// Re-apply a global `LIMIT` that the re-optimization ERASED from the tree
+/// entirely, so [`restore_stranded_global_fetch`] has nothing to find.
+///
+/// For `GROUP BY ... LIMIT` with no `ORDER BY`, `LimitPushdown` (on the
+/// original single-partition plan) deletes the `GlobalLimitExec` and parks the
+/// fetch on the root `CoalescePartitionsExec` (an `AggregateExec` has no
+/// `fetch()` to push into). When the rules re-run `EnforceDistribution`, its
+/// `remove_dist_changing_operators` strips that coalesce -- discarding the
+/// fetch -- and `add_merge_on_top` re-inserts a fetchless one. The cap is gone
+/// from the tree, and the plan over-returns every group (clickbench q17
+/// returned ~1M rows for `LIMIT 10`; issue #364).
+///
+/// `pre_fetch` is the pre-bump plan's global cap, captured with
+/// [`effective_root_fetch`] BEFORE re-optimizing (the pre-bump plan is correct
+/// by construction). If the re-optimized plan's root spine carries any fetch --
+/// the cap survived, or a stranded one was already restored -- nothing is done.
+/// Otherwise the cap is re-applied at the root: safe for an ordered root (the
+/// merged stream is in final output order and no per-partition cap dropped rows
+/// below, so truncating at `n` reproduces the original selection) and for an
+/// unordered root (a bare `LIMIT`, where any `n` rows satisfy the query).
+///
+/// Shared with [`crate::parallel_scan::ParallelScanRule`].
+pub(crate) fn reapply_erased_root_fetch(
+    plan: Arc<dyn ExecutionPlan>,
+    pre_fetch: Option<usize>,
+) -> Arc<dyn ExecutionPlan> {
+    let Some(fetch) = pre_fetch else {
+        return plan;
+    };
+    if root_spine_fetch(&plan).is_some() {
+        return plan;
+    }
+    apply_fetch_at_root(plan, fetch)
+}
+
+/// The global row cap of a plan whose root spine is trusted (the pre-bump
+/// plan): the first fetch on the root spine, provided it caps a
+/// single-partition stream (a multi-partition fetch is a per-partition cap,
+/// not a global one).
+pub(crate) fn effective_root_fetch(root: &Arc<dyn ExecutionPlan>) -> Option<usize> {
+    root_spine_fetch(root)
+        .and_then(|(fetch, partitions)| (partitions <= 1).then_some(fetch))
+}
+
+/// Cap `plan` at `fetch` rows in final output order. A merge root folds the
+/// fetch in directly (both merge nodes return `Some` from `with_fetch`); any
+/// other root (a bare `LIMIT` with no `ORDER BY`, whose root is unordered) is
+/// wrapped in a `GlobalLimitExec`.
+fn apply_fetch_at_root(plan: Arc<dyn ExecutionPlan>, fetch: usize) -> Arc<dyn ExecutionPlan> {
     let is_mergeish = plan.downcast_ref::<SortPreservingMergeExec>().is_some()
         || plan.downcast_ref::<CoalescePartitionsExec>().is_some();
     if is_mergeish {
@@ -228,11 +283,19 @@ pub(crate) fn restore_stranded_global_fetch(
 /// `SortPreservingMergeExec` / `CoalescePartitionsExec`; any other operator
 /// (including a fetchless `FilterExec`) ends the walk with no result.
 fn find_stranded_fetch(root: &Arc<dyn ExecutionPlan>) -> Option<usize> {
+    root_spine_fetch(root)
+        .and_then(|(fetch, partitions)| (partitions > 1).then_some(fetch))
+}
+
+/// Walk down from `root` through single-child, row-count-preserving operators
+/// (see [`is_row_preserving_passthrough`]), returning the first fetch-bearing
+/// node's `fetch` together with its output partition count. Any other operator
+/// (including a fetchless `FilterExec`) ends the walk with no result.
+fn root_spine_fetch(root: &Arc<dyn ExecutionPlan>) -> Option<(usize, usize)> {
     let mut node = Arc::clone(root);
     loop {
         if let Some(fetch) = node.fetch() {
-            // A single-partition cap is already a global cap: not stranded.
-            return (node.output_partitioning().partition_count() > 1).then_some(fetch);
+            return Some((fetch, node.output_partitioning().partition_count()));
         }
         if !is_row_preserving_passthrough(&node) {
             return None;
@@ -681,6 +744,100 @@ mod tests {
         assert!(
             Arc::ptr_eq(&root, &restored),
             "the walk must stop at a fetchless FilterExec and hoist nothing"
+        );
+    }
+
+    // ---- reapply_erased_root_fetch (#364: sortless GROUP BY ... LIMIT) ----
+
+    /// A GROUP-BY-only `AggregateExec` (no aggregate expressions) over `input`.
+    /// Stands in for the final aggregate of `GROUP BY ... LIMIT` with no ORDER
+    /// BY; it has no `fetch()` and is not a row-preserving pass-through, so the
+    /// stranded-fetch walk stops at it.
+    fn group_by_agg(input: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
+        use datafusion::physical_expr::expressions::col;
+        use datafusion::physical_plan::aggregates::{
+            AggregateExec, AggregateMode, PhysicalGroupBy,
+        };
+        let s = input.schema();
+        let group_by =
+            PhysicalGroupBy::new_single(vec![(col("id", &s).unwrap(), "id".to_string())]);
+        Arc::new(
+            AggregateExec::try_new(AggregateMode::Single, group_by, vec![], vec![], input, s)
+                .unwrap(),
+        )
+    }
+
+    /// A fetchless `CoalescePartitionsExec` root, as `add_merge_on_top`
+    /// re-inserts it after `remove_dist_changing_operators` discarded the
+    /// fetch-bearing one.
+    fn coalesce(input: Arc<dyn ExecutionPlan>, fetch: Option<usize>) -> Arc<dyn ExecutionPlan> {
+        Arc::new(CoalescePartitionsExec::new(input).with_fetch(fetch))
+    }
+
+    #[test]
+    fn effective_root_fetch_reads_the_pre_bump_coalesce_cap() {
+        // The pre-bump clickbench q17 spine: CoalescePartitionsExec(fetch=10)
+        // over the final aggregate. LimitPushdown deleted the GlobalLimitExec
+        // and parked the global cap here; the capture must read it.
+        let pre = coalesce(group_by_agg(leaf()), Some(10));
+        assert_eq!(effective_root_fetch(&pre), Some(10));
+    }
+
+    #[test]
+    fn effective_root_fetch_ignores_a_per_partition_cap() {
+        // A multi-partition fetch caps each partition, not the query: it must
+        // NOT be captured as a global cap (re-applying it at the root of a
+        // different plan could truncate a result that was never globally capped).
+        let per_partition = per_partition_sort_with_fetch(100);
+        assert!(per_partition.output_partitioning().partition_count() > 1);
+        assert_eq!(effective_root_fetch(&per_partition), None);
+    }
+
+    #[test]
+    fn erased_group_by_limit_fetch_is_reapplied_from_the_pre_bump_plan() {
+        // The #364 shape after the re-run: a FETCHLESS coalesce root (rebuilt by
+        // add_merge_on_top) over the multi-partition final aggregate. The fetch
+        // exists NOWHERE in the tree, so restore_stranded_global_fetch finds
+        // nothing (its walk also stops at AggregateExec) -- the pre-bump cap
+        // must be re-applied at the root.
+        let post = coalesce(group_by_agg(repartitioned8()), None);
+        assert_eq!(post.output_partitioning().partition_count(), 1);
+
+        let after_stranded = restore_stranded_global_fetch(Arc::clone(&post));
+        assert!(
+            Arc::ptr_eq(&post, &after_stranded),
+            "precondition: the stranded-fetch pass alone cannot see an erased fetch"
+        );
+
+        let restored = reapply_erased_root_fetch(after_stranded, Some(10));
+        assert_eq!(
+            restored.fetch(),
+            Some(10),
+            "the erased GROUP BY ... LIMIT cap must be re-applied at the root"
+        );
+        assert_eq!(restored.output_partitioning().partition_count(), 1);
+    }
+
+    #[test]
+    fn surviving_root_fetch_is_not_double_applied() {
+        // The cap survived the re-run (or restore_stranded_global_fetch already
+        // re-applied one): the pass must leave the plan untouched, even when the
+        // pre-bump fetch differs (the re-optimized tree is the source of truth).
+        let root = coalesce(group_by_agg(repartitioned8()), Some(10));
+        let restored = reapply_erased_root_fetch(Arc::clone(&root), Some(7));
+        assert!(
+            Arc::ptr_eq(&root, &restored),
+            "a root spine that already carries a fetch must be returned untouched"
+        );
+    }
+
+    #[test]
+    fn no_pre_bump_fetch_means_no_reapply() {
+        let root = coalesce(group_by_agg(repartitioned8()), None);
+        let restored = reapply_erased_root_fetch(Arc::clone(&root), None);
+        assert!(
+            Arc::ptr_eq(&root, &restored),
+            "with no pre-bump cap there is nothing to re-apply"
         );
     }
 }

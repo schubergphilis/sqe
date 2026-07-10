@@ -92,7 +92,10 @@ use datafusion::physical_plan::ExecutionPlan;
 use sqe_catalog::iceberg_scan::IcebergScanExec;
 use tracing::debug;
 
-use crate::parallel_probe_scan::{restore_single_partition_root, restore_stranded_global_fetch};
+use crate::parallel_probe_scan::{
+    effective_root_fetch, reapply_erased_root_fetch, restore_single_partition_root,
+    restore_stranded_global_fetch,
+};
 
 /// Physical optimizer rule that parallelizes single-node Iceberg scans. Gated
 /// by `query.parallel_scan`; `byte_threshold` reuses `distribution_threshold`.
@@ -127,6 +130,10 @@ impl PhysicalOptimizerRule for ParallelScanRule {
         if bumpable.is_empty() {
             return Ok(plan);
         }
+        // The pre-bump plan is correct by construction: remember its global row
+        // cap so a fetch the re-optimization ERASES (not merely strands) can be
+        // re-applied at the root; see `reapply_erased_root_fetch`.
+        let pre_fetch = effective_root_fetch(&plan);
         let rewritten = bump_scans(&plan, &bumpable, n)?;
         debug!(
             target_partitions = n,
@@ -147,7 +154,8 @@ impl PhysicalOptimizerRule for ParallelScanRule {
         // because SQE's result collection concatenates root partitions.
         let resorted = EnforceSorting::new().optimize(redistributed, config)?;
         let single = restore_single_partition_root(resorted);
-        Ok(restore_stranded_global_fetch(single))
+        let restored = restore_stranded_global_fetch(single);
+        Ok(reapply_erased_root_fetch(restored, pre_fetch))
     }
 
     fn name(&self) -> &str {
