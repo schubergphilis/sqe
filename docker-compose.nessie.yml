@@ -1,0 +1,50 @@
+# docker-compose.nessie.yml — Project Nessie REST catalog stack.
+#
+# Nessie speaks the Iceberg REST protocol (the same surface Polaris
+# exposes), so it slots into our existing REST catalog code path
+# without a new cargo feature. The matrix-cell test below (in
+# `crates/sqe-catalog/tests/backends_integration.rs::nessie::`) goes
+# through the same `iceberg-catalog-rest` client SQE uses against
+# Polaris in production.
+#
+# Layered on top of docker-compose.test.yml so the rustfs S3 from the
+# rest of the test infra is reused. Nessie itself uses an in-memory
+# version store for the catalog metadata (no external DB needed for a
+# CI smoke test).
+#
+# Usage:
+#   docker compose -f docker-compose.test.yml \
+#                  -f docker-compose.nessie.yml up -d
+#   cargo test -p sqe-catalog backends_integration -- \
+#       --ignored nessie::
+
+services:
+  nessie:
+    image: ghcr.io/projectnessie/nessie:0.107.5
+    environment:
+      # In-memory version store keeps the test stack self-contained;
+      # nothing persists across `docker compose down`.
+      NESSIE_VERSION_STORE_TYPE: IN_MEMORY
+      QUARKUS_HTTP_PORT: 19120
+      # Iceberg REST surface lives under /iceberg/v1; Nessie's regular
+      # API stays on /api. Both are mounted on the same port.
+      NESSIE_CATALOG_DEFAULT_WAREHOUSE: warehouse
+      NESSIE_CATALOG_WAREHOUSES_WAREHOUSE_LOCATION: s3://warehouse/
+      NESSIE_CATALOG_SERVICE_S3_DEFAULT_OPTIONS_ENDPOINT: http://rustfs:9000
+      NESSIE_CATALOG_SERVICE_S3_DEFAULT_OPTIONS_PATH_STYLE_ACCESS: "true"
+      NESSIE_CATALOG_SERVICE_S3_DEFAULT_OPTIONS_REGION: us-east-1
+      NESSIE_CATALOG_SERVICE_S3_DEFAULT_OPTIONS_ACCESS_KEY: urn:nessie-secret:quarkus:nessie.catalog.secrets.s3
+      NESSIE_CATALOG_SECRETS_S3_NAME: s3admin
+      NESSIE_CATALOG_SECRETS_S3_SECRET: s3admin
+    ports:
+      # Offset from the production default (19120) so dev boxes can
+      # run a local Nessie alongside the test stack without colliding.
+      - "19121:19120"
+    healthcheck:
+      # Quarkus `/q/health` is not exposed in the 0.107.x server image;
+      # `/api/v2/config` is a cheap GET that's always on.
+      test: ["CMD-SHELL", "curl -fsS http://localhost:19120/api/v2/config || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 30s

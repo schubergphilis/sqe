@@ -1,0 +1,346 @@
+# SQE quickstart: Polaris 1.5 + Apache Ranger 2.8 + Keycloak.
+#
+# A second access-control option for Polaris. SQE translates GRANT/REVOKE into
+# Apache Ranger Admin REST calls (the new `ranger` access-control backend);
+# Polaris 1.5's embedded Ranger authorizer ENFORCES those policies when SQE
+# (carrying each user's Keycloak token) asks Polaris for table access.
+#
+# Identity flow: SQE authenticates the user against Keycloak (ROPC), passes the
+# bearer token to Polaris. Polaris maps preferred_username -> principal name and
+# realm_access.roles -> principal-roles, then sends those to Ranger. So Ranger
+# policies are keyed on the Keycloak username (USER grants) and realm role
+# (ROLE grants). Groups are NOT delivered (no usersync here).
+#
+#   cp .env.example .env
+#   docker compose up -d --build --wait
+#   ./test.sh            # SQE GRANT/REVOKE + fine-grained mask enforcement
+#   ./parity-test.sh     # SQE <-> Spark (Kyuubi Authz) Ranger mask cross-compare
+#
+# This stack also runs Apache Spark 3.5 + the Kyuubi Spark AuthZ (Ranger) plugin
+# so the SAME Ranger `hive` ssn mask can be cross-checked against SQE. See the
+# `spark` service below and parity-test.sh. Spark 4.0 is NOT usable
+# (kyuubi-spark-authz_2.13 is not on Maven Central); see spark/Dockerfile.
+#
+# Host ports are offset (38080 / 28181 / 26080 / 29000 / 60061) so this stack
+# runs next to the other quickstarts. Ranger Admin first-boot takes 2-4 min.
+
+services:
+  # ── Keycloak — identity provider ──────────────────────────────────────
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.5.4
+    command: start-dev
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-admin}
+      KC_HOSTNAME: http://keycloak:8080
+      KC_HOSTNAME_STRICT: "false"
+      KC_HTTP_ENABLED: "true"
+      KC_HTTP_PORT: "8080"
+      KC_HEALTH_ENABLED: "true"
+      KC_LOG_LEVEL: INFO
+    ports:
+      - "${KEYCLOAK_PORT:-38080}:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/localhost/9000"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+
+  keycloak-config:
+    image: adorsys/keycloak-config-cli:6.4.1-26
+    environment:
+      KEYCLOAK_URL: http://keycloak:8080
+      KEYCLOAK_USER: admin
+      KEYCLOAK_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-admin}
+      KEYCLOAK_AVAILABILITYCHECK_ENABLED: "true"
+      KEYCLOAK_AVAILABILITYCHECK_TIMEOUT: 120s
+      IMPORT_FILES_LOCATIONS: /config/*
+      IMPORT_VARSUBSTITUTION_ENABLED: "true"
+      SQE_CLIENT_SECRET: ${SQE_CLIENT_SECRET:-sqe-secret-change-me}
+    volumes:
+      - ./keycloak/realm-ranger.json:/config/realm-ranger.json:ro
+    restart: "no"
+    depends_on:
+      keycloak:
+        condition: service_healthy
+
+  # ── RustFS — S3-compatible object store ───────────────────────────────
+  rustfs:
+    image: rustfs/rustfs:1.0.0-alpha.89
+    environment:
+      RUSTFS_ACCESS_KEY: ${S3_ACCESS_KEY:-s3admin}
+      RUSTFS_SECRET_KEY: ${S3_SECRET_KEY:-s3adminpw}
+    volumes:
+      - rustfs-data:/data
+    ports:
+      - "${RUSTFS_PORT:-29000}:9000"
+      - "${RUSTFS_CONSOLE_PORT:-29001}:9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9001/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+
+  bucket-init:
+    image: amazon/aws-cli:2.31.15
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        aws s3api head-bucket --bucket warehouse --endpoint-url http://rustfs:9000 2>/dev/null \
+          || aws s3 mb s3://warehouse --endpoint-url http://rustfs:9000
+        echo "bucket ready"
+    environment:
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: ${S3_ACCESS_KEY:-s3admin}
+      AWS_SECRET_ACCESS_KEY: ${S3_SECRET_KEY:-s3adminpw}
+    restart: "no"
+    depends_on:
+      rustfs:
+        condition: service_healthy
+
+  # ── Ranger Admin database ─────────────────────────────────────────────
+  ranger-db:
+    image: postgres:13.16
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-rangerR0cks!}
+    volumes:
+      - ranger-db-data:/var/lib/postgresql/data
+      - ./ranger/init_postgres.sh:/docker-entrypoint-initdb.d/init_postgres.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+  # ── Ranger Admin — the policy store SQE writes to ─────────────────────
+  # Official apache/ranger image (postgres build). install.properties is mounted
+  # because the image deletes the bundled one. Solr audit is disabled. First boot
+  # runs schema DDL and can take 2-4 minutes; the port-open healthcheck just
+  # gates dependents, and ranger-setup does the real REST-readiness wait.
+  ranger-admin:
+    image: apache/ranger:2.8.0
+    environment:
+      RANGER_VERSION: 2.8.0
+      RANGER_DB_TYPE: postgres
+      KERBEROS_ENABLED: "false"
+      DEBUG_ADMIN: "false"
+    volumes:
+      - ./ranger/install.properties:/opt/ranger/admin/install.properties:ro
+    ports:
+      - "${RANGER_PORT:-26080}:6080"
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/6080'"]
+      interval: 10s
+      timeout: 5s
+      retries: 60
+      start_period: 90s
+    depends_on:
+      ranger-db:
+        condition: service_healthy
+
+  # ── ranger-setup — register service-def + service, seed admin grant ───
+  ranger-setup:
+    image: curlimages/curl:8.14.1
+    entrypoint: ["sh", "/bootstrap-ranger.sh"]
+    environment:
+      RANGER_URL: http://ranger-admin:6080
+      RANGER_USER: admin
+      RANGER_PASS: ${RANGER_ADMIN_PASSWORD:-rangerR0cks!}
+      SERVICE_NAME: polaris
+    volumes:
+      - ./ranger/bootstrap-ranger.sh:/bootstrap-ranger.sh:ro
+      - ./ranger/servicedef-polaris.json:/servicedef-polaris.json:ro
+    restart: "no"
+    depends_on:
+      ranger-admin:
+        condition: service_healthy
+
+  # ── Polaris — Iceberg REST catalog, Ranger authorizer + Keycloak OIDC ─
+  polaris:
+    image: apache/polaris:1.5.0
+    environment:
+      POLARIS_PERSISTENCE_TYPE: in-memory
+      POLARIS_BOOTSTRAP_CREDENTIALS: iceberg-ranger,root,${POLARIS_BOOTSTRAP_SECRET:-polaris-root-secret}
+      POLARIS_PRODUCTION_READINESS_CHECKS_ENABLED: "false"
+      QUARKUS_HTTP_PORT: "8181"
+      QUARKUS_MANAGEMENT_PORT: "8182"
+      QUARKUS_LOG_LEVEL: INFO
+      QUARKUS_LOG_CATEGORY__ORG_APACHE_POLARIS__LEVEL: INFO
+      # Realm
+      polaris.realm-context.realms: iceberg-ranger
+      polaris.realm-context.default-realm: iceberg-ranger
+      polaris.realm-context.require-header: "false"
+      # OIDC federation to Keycloak: name from preferred_username, principal-roles
+      # from realm_access.roles (so Ranger receives analyst/engineer/sqe_admin).
+      polaris.authentication.type: mixed
+      quarkus.oidc.tenant-enabled: "true"
+      quarkus.oidc.auth-server-url: http://keycloak:8080/realms/iceberg-ranger
+      quarkus.oidc.token.issuer: http://keycloak:8080/realms/iceberg-ranger
+      quarkus.oidc.client-id: polaris-frontend-client
+      quarkus.oidc.token.audience: account
+      quarkus.oidc.roles.role-claim-path: "realm_access/roles"
+      quarkus.oidc.tls.verification: none
+      polaris.oidc.principal-mapper.name-claim-path: preferred_username
+      polaris.oidc.principal-roles-mapper.filter: ".*"
+      polaris.oidc.principal-roles-mapper.mappings[0].regex: (.+)
+      polaris.oidc.principal-roles-mapper.mappings[0].replacement: $1
+      # Apache Ranger authorizer (Beta, Polaris 1.5)
+      polaris.authorization.type: ranger
+      polaris.authorization.ranger.service-name: polaris
+      polaris.authorization.ranger.authz.default.policy.source.impl: org.apache.ranger.admin.client.RangerAdminRESTClient
+      polaris.authorization.ranger.authz.default.policy.rest.url: http://ranger-admin:6080
+      polaris.authorization.ranger.authz.default.policy.rest.client.username: admin
+      polaris.authorization.ranger.authz.default.policy.rest.client.password: ${RANGER_ADMIN_PASSWORD:-rangerR0cks!}
+      polaris.authorization.ranger.authz.default.policy.pollIntervalMs: "5000"
+      polaris.features."SUPPORTED_CATALOG_STORAGE_TYPES": "[\"S3\"]"
+      polaris.features."SKIP_CREDENTIAL_SUBSCOPING_INDIRECTION": "false"
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: ${S3_ACCESS_KEY:-s3admin}
+      AWS_SECRET_ACCESS_KEY: ${S3_SECRET_KEY:-s3adminpw}
+      QUARKUS_S3_ENDPOINT_OVERRIDE: http://rustfs:9000
+      QUARKUS_S3_PATH_STYLE_ACCESS: "true"
+      QUARKUS_S3_AWS_REGION: us-east-1
+      QUARKUS_S3_AWS_CREDENTIALS_TYPE: static
+      QUARKUS_S3_AWS_CREDENTIALS_STATIC_PROVIDER_ACCESS_KEY_ID: ${S3_ACCESS_KEY:-s3admin}
+      QUARKUS_S3_AWS_CREDENTIALS_STATIC_PROVIDER_SECRET_ACCESS_KEY: ${S3_SECRET_KEY:-s3adminpw}
+    ports:
+      - "${POLARIS_PORT:-28181}:8181"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8182/q/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+    depends_on:
+      keycloak-config:
+        condition: service_completed_successfully
+      rustfs:
+        condition: service_healthy
+      ranger-setup:
+        condition: service_completed_successfully
+
+  # ── polaris-setup — catalogs, namespaces, principals, principal-roles ─
+  polaris-setup:
+    image: curlimages/curl:8.14.1
+    entrypoint: ["sh", "/bootstrap-data.sh"]
+    environment:
+      POLARIS_URL: http://polaris:8181
+      POLARIS_REALM: iceberg-ranger
+      S3_ENDPOINT: http://rustfs:9000
+      S3_BUCKET: warehouse
+      BOOTSTRAP_CLIENT_ID: root
+      BOOTSTRAP_CLIENT_SECRET: ${POLARIS_BOOTSTRAP_SECRET:-polaris-root-secret}
+    volumes:
+      - ./polaris/bootstrap-data.sh:/bootstrap-data.sh:ro
+    restart: "no"
+    depends_on:
+      polaris:
+        condition: service_healthy
+      bucket-init:
+        condition: service_completed_successfully
+
+  # ── SQE — the query engine ────────────────────────────────────────────
+  sqe:
+    image: ${SQE_IMAGE:-sqe-quickstart:latest}
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    command: ["--config", "/etc/sqe/sqe.toml"]
+    environment:
+      RUST_LOG: "info,sqe_auth=debug,sqe_policy=debug,sqe_coordinator::session_manager=debug"
+      SQE_POLICY__RANGER__ADMIN_PASSWORD: ${RANGER_ADMIN_PASSWORD:-rangerR0cks!}
+    volumes:
+      - ./sqe.toml:/etc/sqe/sqe.toml:ro
+    ports:
+      - "${SQE_FLIGHT_PORT:-60061}:50051"
+      - "${SQE_TRINO_PORT:-28080}:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9091/healthz || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    depends_on:
+      polaris-setup:
+        condition: service_completed_successfully
+
+  # ── data-seed — write sales.orders via SQE (carol as sqe_admin) ───────
+  # Creates + populates the table that both SQE and Spark query in
+  # parity-test.sh (the SQE<->Spark Ranger-mask cross-compare). Runs after SQE
+  # is healthy. carol (sqe_admin) has full catalog access. test.sh does its own
+  # seeding too (idempotent CREATE TABLE IF NOT EXISTS), so running either first
+  # is safe.
+  data-seed:
+    image: ${SQE_IMAGE:-sqe-quickstart:latest}
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        echo "waiting for SQE Flight port ..."
+        until sqe-cli --host sqe --port 50051 --user carol -e "SELECT 1" 2>/dev/null | grep -q '1'; do sleep 3; done
+        echo "SQE ready, seeding data ..."
+        sqe-cli --host sqe --port 50051 --user carol -e "CREATE TABLE IF NOT EXISTS sales_wh.sales.orders (id BIGINT, region VARCHAR, amount DOUBLE, ssn VARCHAR)"
+        sqe-cli --host sqe --port 50051 --user carol -e "INSERT INTO sales_wh.sales.orders VALUES (1,'EU',10.0,'111-11-1111'),(2,'US',20.0,'222-22-2222')"
+        # Grant engineer SELECT on orders so bob can LOAD the table through the
+        # Polaris Ranger authorizer (the coarse gate). Without this, bob has only
+        # the baseline traverse grant and the table is hidden as "not found".
+        # SQE translates this into a Ranger `polaris`-service policy. (Spark's
+        # access goes through the separate `hive`-service access policy seeded by
+        # bootstrap-ranger.sh -- the two engines authorize via two services.)
+        sqe-cli --host sqe --port 50051 --user carol -e "GRANT SELECT ON sales_wh.sales.orders TO ROLE \"engineer\""
+        echo "data seed complete"
+    environment:
+      SQE_HOST: sqe
+      SQE_PASSWORD: carol123
+    restart: "no"
+    depends_on:
+      sqe:
+        condition: service_healthy
+
+  # ── Spark 3.5 + Kyuubi Authz + Iceberg — SQE<->Spark mask cross-compare ─
+  # Spark connects to the SAME Polaris catalog (as the `root` service account via
+  # client_credentials) and reads the SAME Ranger `hive` service that SQE reads.
+  # parity-test.sh runs `SELECT id, ssn FROM sales_wh.sales.orders` as bob in
+  # both engines and asserts byte-identical masked ssn (xxx-xx-1111 / xxx-xx-2222).
+  #
+  # HADOOP_USER_NAME=bob: Kyuubi Authz resolves Ranger roles for bob (member of
+  # 'engineer' -> ssn MASK_SHOW_LAST_4 applies). Polaris's Ranger authorizer gates
+  # catalog access for the `root` service account (which has full ADMIN_ACCESS in
+  # the `polaris` Ranger service from bootstrap-ranger.sh); fine-grained masking is
+  # Kyuubi's job, keyed on bob, NOT on the Polaris service account.
+  #
+  # The Dockerfile downloads iceberg-spark-runtime + the shaded kyuubi-spark-authz
+  # jar (ranger deps bundled) at build time into $SPARK_HOME/jars/.
+  # No host port is exposed: parity-test.sh runs via `docker compose exec`.
+  spark:
+    build:
+      context: ./spark
+      dockerfile: Dockerfile
+    # Keep the container alive so parity-test.sh can exec into it via
+    # `docker compose exec spark spark-sql ...`.
+    command: ["sleep", "infinity"]
+    environment:
+      HADOOP_USER_NAME: bob
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: ${S3_ACCESS_KEY:-s3admin}
+      AWS_SECRET_ACCESS_KEY: ${S3_SECRET_KEY:-s3adminpw}
+    volumes:
+      - ./spark/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
+      - ./spark/ranger-spark-security.xml:/opt/spark/conf/ranger-spark-security.xml:ro
+      - ./spark/ranger-spark-audit.xml:/opt/spark/conf/ranger-spark-audit.xml:ro
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /opt/spark/conf/spark-defaults.conf"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    depends_on:
+      data-seed:
+        condition: service_completed_successfully
+
+volumes:
+  rustfs-data:
+  ranger-db-data:

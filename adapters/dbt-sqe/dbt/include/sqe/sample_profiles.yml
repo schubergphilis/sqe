@@ -1,0 +1,39 @@
+my_project:
+  target: dev
+  outputs:
+    # Basic auth: a human user (username + password).
+    dev:
+      type: sqe
+      host: localhost
+      port: 50051
+      user: admin
+      password: "{{ env_var('SQE_PASSWORD') }}"
+      catalog: warehouse
+      schema: analytics
+      threads: 4
+
+    # OAuth service principal: SQE runs the client_credentials grant per
+    # connection (server-side client_credentials_passthrough provider) and
+    # forwards the token to the catalog. No browser, no token fetch in dbt.
+    service_principal:
+      type: sqe
+      host: localhost
+      port: 50051
+      method: oauth
+      client_id: "{{ env_var('SQE_CLIENT_ID') }}"
+      client_secret: "{{ env_var('SQE_CLIENT_SECRET') }}"
+      catalog: warehouse
+      schema: analytics
+      threads: 4
+
+    # Pre-obtained bearer token: the client/CI fetched its own OAuth token
+    # (e.g. ran client_credentials against the IdP) and passes it through. SQE
+    # validates it (bearer_token provider) and forwards it.
+    bearer:
+      type: sqe
+      host: localhost
+      port: 50051
+      token: "{{ env_var('SQE_TOKEN') }}"
+      catalog: warehouse
+      schema: analytics
+      threads: 4

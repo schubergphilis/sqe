@@ -1,0 +1,35 @@
+# SQE quickstart: AWS S3 Tables (managed Iceberg).
+#
+# Just the SQE coordinator: S3 Tables is metadata + storage in one AWS product,
+# so there is no Polaris/Keycloak/RustFS. SQE talks to S3 Tables over the AWS
+# SDK using the credentials passed in via the environment (resolved from your
+# AWS_PROFILE by run.sh). The table bucket is created by the CDK stack in ./cdk.
+#
+#   ./run.sh            # cdk deploy -> up -> queries -> down -> cdk destroy
+#   docker compose up   # by hand, after: cp sqe.toml sqe.toml.local + fill in
+
+services:
+  sqe:
+    image: ${SQE_IMAGE:-sqe-quickstart:latest}
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    command: ["--config", "/etc/sqe/sqe.toml"]
+    environment:
+      RUST_LOG: "info,sqe_catalog=debug,sqe_coordinator::write_handler=debug"
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:?run.sh exports this from your AWS profile}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:?run.sh exports this from your AWS profile}
+      AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-}
+      AWS_REGION: ${AWS_REGION:-eu-example-1}
+    volumes:
+      - ./sqe.toml.local:/etc/sqe/sqe.toml:ro
+      - ./queries.sql:/queries.sql:ro
+    ports:
+      - "${SQE_FLIGHT_PORT:-60051}:50051"
+      - "${SQE_TRINO_PORT:-18080}:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9091/healthz || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s

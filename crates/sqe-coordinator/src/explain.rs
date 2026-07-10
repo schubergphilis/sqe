@@ -1,0 +1,581 @@
+//! Handlers for EXPLAIN, EXPLAIN ANALYZE, and EXPLAIN FULL.
+//!
+//! All three apply policy enforcement before producing output — the plan
+//! shown is the plan that actually executes.
+
+use std::sync::Arc;
+
+use arrow_array::{ArrayRef, Int32Array, RecordBatch, StringArray};
+use arrow_schema::{DataType, Field, Schema};
+use datafusion::physical_plan::metrics::MetricValue;
+use datafusion::physical_plan::{collect, displayable, ExecutionPlan};
+use datafusion::prelude::SessionContext;
+
+use sqe_catalog::IcebergScanExec;
+use sqe_core::{Session, SqeError};
+use sqe_policy::PolicyEnforcer;
+
+pub struct ExplainHandler {
+    pub policy_enforcer: Arc<dyn PolicyEnforcer>,
+    /// Plan-shape settings mirrored from `QueryConfig` so EXPLAIN output and
+    /// EXPLAIN ANALYZE execution match what `query_handler` actually runs.
+    star_schema_reorder: bool,
+    star_schema_min_ratio: usize,
+    dim_build_swap: bool,
+    parallel_probe_scan: bool,
+    parallel_scan: bool,
+    distribution_threshold: String,
+}
+
+impl ExplainHandler {
+    pub fn new(
+        policy_enforcer: Arc<dyn PolicyEnforcer>,
+        query_config: &sqe_core::config::QueryConfig,
+    ) -> Self {
+        Self {
+            policy_enforcer,
+            star_schema_reorder: query_config.star_schema_reorder,
+            star_schema_min_ratio: query_config.star_schema_min_ratio,
+            dim_build_swap: query_config.dim_build_swap,
+            parallel_probe_scan: query_config.parallel_probe_scan,
+            parallel_scan: query_config.parallel_scan,
+            distribution_threshold: query_config.distribution_threshold.clone(),
+        }
+    }
+
+    /// Apply the same post-planning plan-shape rules `query_handler` applies,
+    /// so EXPLAIN shows (and EXPLAIN ANALYZE measures) the executed plan
+    /// rather than the raw planner output.
+    fn apply_plan_shape_rules(
+        &self,
+        ctx: &SessionContext,
+        mut plan: Arc<dyn ExecutionPlan>,
+    ) -> Arc<dyn ExecutionPlan> {
+        use datafusion::physical_optimizer::PhysicalOptimizerRule;
+        if self.star_schema_reorder {
+            let rule = sqe_planner::StarSchemaReorderRule::new(self.star_schema_min_ratio);
+            match rule.optimize(plan.clone(), &datafusion::config::ConfigOptions::new()) {
+                Ok(optimized) => plan = optimized,
+                Err(e) => tracing::debug!(error = %e, "EXPLAIN: star-schema reorder failed"),
+            }
+        }
+        if self.dim_build_swap {
+            let state = ctx.state();
+            let rule = crate::dim_build_swap::DimBuildSwapRule::new();
+            match rule.optimize(plan.clone(), state.config_options()) {
+                Ok(optimized) => plan = optimized,
+                Err(e) => tracing::debug!(error = %e, "EXPLAIN: dim-build swap failed"),
+            }
+        }
+        if self.parallel_probe_scan {
+            let state = ctx.state();
+            let rule = crate::parallel_probe_scan::ParallelProbeScanRule::new();
+            match rule.optimize(plan.clone(), state.config_options()) {
+                Ok(optimized) => plan = optimized,
+                Err(e) => tracing::debug!(error = %e, "EXPLAIN: probe-side scan parallelization failed"),
+            }
+        }
+        if self.parallel_scan {
+            let byte_threshold =
+                sqe_core::parse_memory_limit(&self.distribution_threshold).unwrap_or(0);
+            let state = ctx.state();
+            let rule = crate::parallel_scan::ParallelScanRule::new(byte_threshold);
+            match rule.optimize(plan.clone(), state.config_options()) {
+                Ok(optimized) => plan = optimized,
+                Err(e) => tracing::debug!(error = %e, "EXPLAIN: parallel scan pass failed"),
+            }
+        }
+        plan
+    }
+
+    /// EXPLAIN <query> — returns logical and physical plan as text, no execution.
+    pub async fn plan(
+        &self,
+        session: &Session,
+        inner_sql: &str,
+        ctx: &SessionContext,
+    ) -> sqe_core::Result<Vec<RecordBatch>> {
+        let df = ctx
+            .sql(inner_sql)
+            .await
+            .map_err(|e| SqeError::Execution(format!("EXPLAIN planning failed: {e}")))?;
+
+        let logical = df.logical_plan().clone();
+        let (enforced, _policy_summary) = self
+            .policy_enforcer
+            .evaluate(&session.user, logical)
+            .await?;
+
+        let logical_str = format!("{}", enforced.display_indent());
+
+        let physical = ctx
+            .state()
+            .create_physical_plan(&enforced)
+            .await
+            .map_err(|e| SqeError::Execution(format!("Physical planning failed: {e}")))?;
+        let physical = self.apply_plan_shape_rules(ctx, physical);
+
+        let physical_str = format!("{}", displayable(physical.as_ref()).indent(true));
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("plan_type", DataType::Utf8, false),
+            Field::new("plan", DataType::Utf8, false),
+        ]));
+        let types: ArrayRef = Arc::new(StringArray::from(vec!["logical_plan", "physical_plan"]));
+        let plans: ArrayRef = Arc::new(StringArray::from(vec![
+            logical_str.as_str(),
+            physical_str.as_str(),
+        ]));
+        let batch = RecordBatch::try_new(schema, vec![types, plans])
+            .map_err(|e| SqeError::Execution(format!("Failed to build explain batch: {e}")))?;
+
+        Ok(vec![batch])
+    }
+
+    /// EXPLAIN ANALYZE <query> — executes the query and returns per-operator
+    /// metrics, prefixed with phase-level timings (parse + logical plan,
+    /// policy evaluation, physical plan, execution, total).
+    ///
+    /// Output schema: (step INT32, operation TEXT, output_rows INT64, elapsed_ms FLOAT64,
+    ///                 output_bytes INT64, output_batches INT64,
+    ///                 spill_count INT64, spilled_bytes INT64, spilled_rows INT64)
+    ///
+    /// Phase rows have negative `step` values so they sort before the
+    /// physical-plan operator rows (which start at step 0). Operation
+    /// names are prefixed with `[phase] ` to make them easy to filter.
+    pub async fn analyze(
+        &self,
+        session: &Session,
+        inner_sql: &str,
+        ctx: &SessionContext,
+    ) -> sqe_core::Result<Vec<RecordBatch>> {
+        let total_start = std::time::Instant::now();
+
+        let parse_start = std::time::Instant::now();
+        let df = ctx
+            .sql(inner_sql)
+            .await
+            .map_err(|e| SqeError::Execution(format!("EXPLAIN ANALYZE planning failed: {e}")))?;
+        let logical = df.logical_plan().clone();
+        let parse_ms = parse_start.elapsed().as_secs_f64() * 1000.0;
+
+        let policy_start = std::time::Instant::now();
+        let (enforced, _policy_summary) = self
+            .policy_enforcer
+            .evaluate(&session.user, logical)
+            .await?;
+        let policy_ms = policy_start.elapsed().as_secs_f64() * 1000.0;
+
+        let physical_plan_start = std::time::Instant::now();
+        let physical = ctx
+            .state()
+            .create_physical_plan(&enforced)
+            .await
+            .map_err(|e| SqeError::Execution(format!("Physical planning failed: {e}")))?;
+        let physical = self.apply_plan_shape_rules(ctx, physical);
+        let physical_plan_ms = physical_plan_start.elapsed().as_secs_f64() * 1000.0;
+
+        // Execute — populates metrics on each node in-place
+        let execute_start = std::time::Instant::now();
+        collect(physical.clone(), ctx.task_ctx())
+            .await
+            .map_err(|e| SqeError::Execution(format!("EXPLAIN ANALYZE execution failed: {e}")))?;
+        let execute_ms = execute_start.elapsed().as_secs_f64() * 1000.0;
+
+        let total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
+        // The "framework" overhead is everything outside per-operator
+        // execution: parse + logical plan + policy + physical plan +
+        // result materialization. This is the value that dominates SSB
+        // SF1 timings where each query has tiny actual work but a fixed
+        // setup cost.
+        let framework_ms = total_ms - execute_ms;
+
+        // Phase rows go first in the output. Negative step keeps them
+        // visually distinct from the per-operator step numbers (0..N).
+        let mut rows: Vec<AnalyzeRow> = vec![
+            phase_row(-5, "[phase] parse + logical plan", parse_ms),
+            phase_row(-4, "[phase] policy evaluate", policy_ms),
+            phase_row(-3, "[phase] physical plan", physical_plan_ms),
+            phase_row(-2, "[phase] execute (per-op detail below)", execute_ms),
+            phase_row(-1, "[phase] framework overhead (parse + plan + policy + result)", framework_ms),
+        ];
+        walk_analyze(&physical, &mut rows);
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("step", DataType::Int32, false),
+            Field::new("operation", DataType::Utf8, false),
+            Field::new("output_rows", DataType::Int64, true),
+            Field::new("elapsed_ms", DataType::Float64, true),
+            Field::new("output_bytes", DataType::Int64, true),
+            Field::new("output_batches", DataType::Int64, true),
+            Field::new("spill_count", DataType::Int64, true),
+            Field::new("spilled_bytes", DataType::Int64, true),
+            Field::new("spilled_rows", DataType::Int64, true),
+        ]));
+
+        let steps: ArrayRef = Arc::new(Int32Array::from(
+            rows.iter().map(|r| r.step).collect::<Vec<_>>(),
+        ));
+        let ops: ArrayRef = Arc::new(StringArray::from(
+            rows.iter().map(|r| r.operation.as_str()).collect::<Vec<_>>(),
+        ));
+
+        macro_rules! nullable_i64 {
+            ($rows:expr, $field:ident) => {{
+                let mut b = arrow_array::builder::Int64Builder::new();
+                for r in $rows {
+                    match r.$field {
+                        Some(v) => b.append_value(v),
+                        None => b.append_null(),
+                    }
+                }
+                Arc::new(b.finish()) as ArrayRef
+            }};
+        }
+
+        let output_rows_arr = nullable_i64!(&rows, output_rows);
+
+        let mut elapsed_b = arrow_array::builder::Float64Builder::new();
+        for r in &rows {
+            match r.elapsed_ms {
+                Some(v) => elapsed_b.append_value(v),
+                None => elapsed_b.append_null(),
+            }
+        }
+        let elapsed_arr: ArrayRef = Arc::new(elapsed_b.finish());
+
+        let output_bytes_arr = nullable_i64!(&rows, output_bytes);
+        let output_batches_arr = nullable_i64!(&rows, output_batches);
+        let spill_count_arr = nullable_i64!(&rows, spill_count);
+        let spilled_bytes_arr = nullable_i64!(&rows, spilled_bytes);
+        let spilled_rows_arr = nullable_i64!(&rows, spilled_rows);
+
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                steps,
+                ops,
+                output_rows_arr,
+                elapsed_arr,
+                output_bytes_arr,
+                output_batches_arr,
+                spill_count_arr,
+                spilled_bytes_arr,
+                spilled_rows_arr,
+            ],
+        )
+        .map_err(|e| SqeError::Execution(format!("Failed to build analyze batch: {e}")))?;
+
+        Ok(vec![batch])
+    }
+
+    /// EXPLAIN FULL <query> — executes the query and returns Iceberg statistics
+    /// combined with actual per-operator metrics.
+    /// Output schema: (step INT32, operation TEXT, estimated_rows INT64,
+    ///                 estimated_bytes INT64, files_scanned INT32, files_total INT32,
+    ///                 output_rows INT64, elapsed_ms FLOAT64, output_bytes INT64,
+    ///                 output_batches INT64, spill_count INT64, spilled_bytes INT64,
+    ///                 spilled_rows INT64)
+    pub async fn full(
+        &self,
+        session: &Session,
+        inner_sql: &str,
+        ctx: &SessionContext,
+    ) -> sqe_core::Result<Vec<RecordBatch>> {
+        let total_start = std::time::Instant::now();
+
+        let parse_start = std::time::Instant::now();
+        let df = ctx
+            .sql(inner_sql)
+            .await
+            .map_err(|e| SqeError::Execution(format!("EXPLAIN FULL planning failed: {e}")))?;
+        let logical = df.logical_plan().clone();
+        let parse_ms = parse_start.elapsed().as_secs_f64() * 1000.0;
+
+        let policy_start = std::time::Instant::now();
+        let (enforced, _policy_summary) = self
+            .policy_enforcer
+            .evaluate(&session.user, logical)
+            .await?;
+        let policy_ms = policy_start.elapsed().as_secs_f64() * 1000.0;
+
+        let physical_plan_start = std::time::Instant::now();
+        let physical = ctx
+            .state()
+            .create_physical_plan(&enforced)
+            .await
+            .map_err(|e| SqeError::Execution(format!("Physical planning failed: {e}")))?;
+        let physical = self.apply_plan_shape_rules(ctx, physical);
+        let physical_plan_ms = physical_plan_start.elapsed().as_secs_f64() * 1000.0;
+
+        // Execute — populates per-node metrics in-place
+        let execute_start = std::time::Instant::now();
+        collect(physical.clone(), ctx.task_ctx())
+            .await
+            .map_err(|e| SqeError::Execution(format!("EXPLAIN FULL execution failed: {e}")))?;
+        let execute_ms = execute_start.elapsed().as_secs_f64() * 1000.0;
+
+        let total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
+        let framework_ms = total_ms - execute_ms;
+
+        let mut rows: Vec<FullRow> = vec![
+            full_phase_row(-5, "[phase] parse + logical plan", parse_ms),
+            full_phase_row(-4, "[phase] policy evaluate", policy_ms),
+            full_phase_row(-3, "[phase] physical plan", physical_plan_ms),
+            full_phase_row(-2, "[phase] execute (per-op detail below)", execute_ms),
+            full_phase_row(-1, "[phase] framework overhead (parse + plan + policy + result)", framework_ms),
+        ];
+        walk_full(&physical, &mut rows);
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("step", DataType::Int32, false),
+            Field::new("operation", DataType::Utf8, false),
+            Field::new("estimated_rows", DataType::Int64, true),
+            Field::new("estimated_bytes", DataType::Int64, true),
+            Field::new("files_scanned", DataType::Int32, true),
+            Field::new("files_total", DataType::Int32, true),
+            Field::new("output_rows", DataType::Int64, true),
+            Field::new("elapsed_ms", DataType::Float64, true),
+            Field::new("output_bytes", DataType::Int64, true),
+            Field::new("output_batches", DataType::Int64, true),
+            Field::new("spill_count", DataType::Int64, true),
+            Field::new("spilled_bytes", DataType::Int64, true),
+            Field::new("spilled_rows", DataType::Int64, true),
+        ]));
+
+        let steps: ArrayRef = Arc::new(Int32Array::from(
+            rows.iter().map(|r| r.step).collect::<Vec<_>>(),
+        ));
+        let ops: ArrayRef = Arc::new(StringArray::from(
+            rows.iter().map(|r| r.operation.as_str()).collect::<Vec<_>>(),
+        ));
+
+        macro_rules! nullable_array {
+            ($builder:ty, $rows:expr, $field:ident) => {{
+                let mut b = <$builder>::new();
+                for r in $rows {
+                    match r.$field {
+                        Some(v) => b.append_value(v),
+                        None => b.append_null(),
+                    }
+                }
+                Arc::new(b.finish()) as ArrayRef
+            }};
+        }
+
+        let est_rows = nullable_array!(arrow_array::builder::Int64Builder, &rows, estimated_rows);
+        let est_bytes = nullable_array!(arrow_array::builder::Int64Builder, &rows, estimated_bytes);
+        let f_scanned = nullable_array!(arrow_array::builder::Int32Builder, &rows, files_scanned);
+        let f_total = nullable_array!(arrow_array::builder::Int32Builder, &rows, files_total);
+        let out_rows = nullable_array!(arrow_array::builder::Int64Builder, &rows, output_rows);
+        let elapsed = nullable_array!(arrow_array::builder::Float64Builder, &rows, elapsed_ms);
+        let out_bytes = nullable_array!(arrow_array::builder::Int64Builder, &rows, output_bytes);
+        let out_batches = nullable_array!(arrow_array::builder::Int64Builder, &rows, output_batches);
+        let spill_cnt = nullable_array!(arrow_array::builder::Int64Builder, &rows, spill_count);
+        let spill_bytes = nullable_array!(arrow_array::builder::Int64Builder, &rows, spilled_bytes);
+        let spill_rows = nullable_array!(arrow_array::builder::Int64Builder, &rows, spilled_rows);
+
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                steps, ops, est_rows, est_bytes, f_scanned, f_total, out_rows, elapsed,
+                out_bytes, out_batches, spill_cnt, spill_bytes, spill_rows,
+            ],
+        )
+        .map_err(|e| SqeError::Execution(format!("Failed to build full explain batch: {e}")))?;
+
+        Ok(vec![batch])
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Private row types and free-function tree walkers
+// ---------------------------------------------------------------------------
+
+/// Build an `AnalyzeRow` for a phase-level timing entry. Phase rows
+/// only carry `elapsed_ms`; the other metric columns are `None` so
+/// downstream filtering can ignore them or render them as blanks.
+fn phase_row(step: i32, operation: &str, elapsed_ms: f64) -> AnalyzeRow {
+    AnalyzeRow {
+        step,
+        operation: operation.to_string(),
+        output_rows: None,
+        elapsed_ms: Some(elapsed_ms),
+        output_bytes: None,
+        output_batches: None,
+        spill_count: None,
+        spilled_bytes: None,
+        spilled_rows: None,
+    }
+}
+
+struct AnalyzeRow {
+    step: i32,
+    operation: String,
+    output_rows: Option<i64>,
+    elapsed_ms: Option<f64>,
+    output_bytes: Option<i64>,
+    output_batches: Option<i64>,
+    spill_count: Option<i64>,
+    spilled_bytes: Option<i64>,
+    spilled_rows: Option<i64>,
+}
+
+fn full_phase_row(step: i32, operation: &str, elapsed_ms: f64) -> FullRow {
+    FullRow {
+        step,
+        operation: operation.to_string(),
+        estimated_rows: None,
+        estimated_bytes: None,
+        files_scanned: None,
+        files_total: None,
+        output_rows: None,
+        elapsed_ms: Some(elapsed_ms),
+        output_bytes: None,
+        output_batches: None,
+        spill_count: None,
+        spilled_bytes: None,
+        spilled_rows: None,
+    }
+}
+
+struct FullRow {
+    step: i32,
+    operation: String,
+    estimated_rows: Option<i64>,
+    estimated_bytes: Option<i64>,
+    files_scanned: Option<i32>,
+    files_total: Option<i32>,
+    output_rows: Option<i64>,
+    elapsed_ms: Option<f64>,
+    output_bytes: Option<i64>,
+    output_batches: Option<i64>,
+    spill_count: Option<i64>,
+    spilled_bytes: Option<i64>,
+    spilled_rows: Option<i64>,
+}
+
+fn walk_analyze(node: &Arc<dyn ExecutionPlan>, rows: &mut Vec<AnalyzeRow>) {
+    for child in node.children() {
+        walk_analyze(child, rows);
+    }
+    let step = rows.len() as i32;
+    let operation = node.name().to_string();
+    let metrics = node.metrics();
+    let output_rows = metrics
+        .as_ref()
+        .and_then(|m| m.output_rows())
+        .map(|r| r as i64);
+    let elapsed_ms = metrics
+        .as_ref()
+        .and_then(|m| m.elapsed_compute())
+        .map(|ns| ns as f64 / 1_000_000.0);
+    let output_bytes = metrics
+        .as_ref()
+        .and_then(|m| m.sum(|metric| matches!(metric.value(), MetricValue::OutputBytes(_))))
+        .map(|v| v.as_usize() as i64);
+    let output_batches = metrics
+        .as_ref()
+        .and_then(|m| m.sum(|metric| matches!(metric.value(), MetricValue::OutputBatches(_))))
+        .map(|v| v.as_usize() as i64);
+    let spill_count = metrics
+        .as_ref()
+        .and_then(|m| m.spill_count())
+        .map(|v| v as i64);
+    let spilled_bytes = metrics
+        .as_ref()
+        .and_then(|m| m.spilled_bytes())
+        .map(|v| v as i64);
+    let spilled_rows = metrics
+        .as_ref()
+        .and_then(|m| m.spilled_rows())
+        .map(|v| v as i64);
+    rows.push(AnalyzeRow {
+        step,
+        operation,
+        output_rows,
+        elapsed_ms,
+        output_bytes,
+        output_batches,
+        spill_count,
+        spilled_bytes,
+        spilled_rows,
+    });
+}
+
+fn walk_full(node: &Arc<dyn ExecutionPlan>, rows: &mut Vec<FullRow>) {
+    for child in node.children() {
+        walk_full(child, rows);
+    }
+    let step = rows.len() as i32;
+    let operation = node.name().to_string();
+
+    // Actual execution metrics (populated after collect())
+    let metrics = node.metrics();
+    let output_rows = metrics.as_ref().and_then(|m| m.output_rows()).map(|r| r as i64);
+    let elapsed_ms = metrics.as_ref().and_then(|m| m.elapsed_compute()).map(|ns| ns as f64 / 1_000_000.0);
+    let output_bytes = metrics
+        .as_ref()
+        .and_then(|m| m.sum(|metric| matches!(metric.value(), MetricValue::OutputBytes(_))))
+        .map(|v| v.as_usize() as i64);
+    let output_batches = metrics
+        .as_ref()
+        .and_then(|m| m.sum(|metric| matches!(metric.value(), MetricValue::OutputBatches(_))))
+        .map(|v| v.as_usize() as i64);
+    let spill_count = metrics
+        .as_ref()
+        .and_then(|m| m.spill_count())
+        .map(|v| v as i64);
+    let spilled_bytes = metrics
+        .as_ref()
+        .and_then(|m| m.spilled_bytes())
+        .map(|v| v as i64);
+    let spilled_rows = metrics
+        .as_ref()
+        .and_then(|m| m.spilled_rows())
+        .map(|v| v as i64);
+
+    if let Some(scan) = node.downcast_ref::<IcebergScanExec>() {
+        let table = scan.table();
+        let snap = table.metadata().current_snapshot();
+        let props = snap.map(|s| s.summary().additional_properties.clone());
+
+        let parse_i64 = |key: &str| -> Option<i64> {
+            props.as_ref()?.get(key)?.parse::<i64>()
+                .map_err(|e| { tracing::warn!(key, "Failed to parse Iceberg snapshot stat: {e}"); e })
+                .ok()
+        };
+        let parse_i32 = |key: &str| -> Option<i32> {
+            props.as_ref()?.get(key)?.parse::<i32>()
+                .map_err(|e| { tracing::warn!(key, "Failed to parse Iceberg snapshot stat: {e}"); e })
+                .ok()
+        };
+
+        let estimated_rows = parse_i64("total-records");
+        let estimated_bytes = parse_i64("total-files-size");
+        let files_total = parse_i32("total-data-files");
+        let files_scanned = files_total;
+
+        rows.push(FullRow {
+            step, operation, estimated_rows, estimated_bytes, files_scanned, files_total,
+            output_rows, elapsed_ms, output_bytes, output_batches,
+            spill_count, spilled_bytes, spilled_rows,
+        });
+    } else {
+        use datafusion::common::stats::Precision;
+        let estimated_rows = node
+            .partition_statistics(None)
+            .ok()
+            .and_then(|s| match s.num_rows {
+                Precision::Exact(v) | Precision::Inexact(v) => Some(v as i64),
+                Precision::Absent => None,
+            });
+
+        rows.push(FullRow {
+            step, operation, estimated_rows, estimated_bytes: None,
+            files_scanned: None, files_total: None,
+            output_rows, elapsed_ms, output_bytes, output_batches,
+            spill_count, spilled_bytes, spilled_rows,
+        });
+    }
+}

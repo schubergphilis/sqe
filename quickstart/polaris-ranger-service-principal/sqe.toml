@@ -1,0 +1,97 @@
+# SQE config for the Polaris + Ranger + Keycloak quickstart.
+#
+# SQE authenticates users against Keycloak (ROPC password grant), passes the
+# bearer token through to Polaris, and translates GRANT/REVOKE into Apache
+# Ranger Admin REST calls via the `ranger` access-control backend. Polaris
+# enforces those Ranger policies through its embedded Ranger authorizer.
+
+[coordinator]
+flight_sql_port = 50051
+trino_http_port = 8080
+mode = "hybrid"
+flight_compression = "none"
+
+[worker]
+memory_limit = "4GB"
+spill_dir = "/tmp/sqe-spill"
+
+# ── Authentication: per-connection client_credentials passthrough ────────────
+# The connecting client presents its OWN client_id/client_secret as Flight Basic
+# auth (username = client_id, password = client_secret). SQE runs the
+# client_credentials grant per connection and forwards the token to Polaris. No
+# service-principal credentials live here: each client IS its own service
+# principal. ssl_verification=false makes the factory accept Keycloak's dev TLS.
+#
+# This provider consumes username/password, so it CANNOT share a listener with
+# oidc_password -- a human username would be tried as a client_id and rejected.
+# This is a service-principal-only deployment.
+[auth]
+ssl_verification = false
+
+# (a) Service principal presents client_id/client_secret -> SQE runs the grant.
+[[auth.providers]]
+type = "client_credentials_passthrough"
+token_url = "http://keycloak:8080/realms/iceberg-ranger/protocol/openid-connect/token"
+roles_claim = "realm_access.roles"
+
+# (b) Client fetched its OWN token (ran client_credentials against Keycloak
+# itself) and presents it as a Bearer. SQE validates it via JWKS and forwards it.
+# This consumes the bearer_token credential, so it does not conflict with the
+# username/password provider above -- both serve the same listener. Works over
+# Flight SQL AND the Trino-compat HTTP path (both route through this chain).
+[[auth.providers]]
+type = "bearer_token"
+jwks_url = "http://keycloak:8080/realms/iceberg-ranger/protocol/openid-connect/certs"
+issuer = "http://keycloak:8080/realms/iceberg-ranger"
+audience = "account"
+user_claim = "preferred_username"
+roles_claim = "realm_access.roles"
+allow_insecure_jwks = true   # dev only: Keycloak JWKS over plain HTTP
+
+# ── Catalogs ────────────────────────────────────────────────────────────────
+[catalogs.sales_wh]
+polaris_url = "http://polaris:8181/api/catalog"
+warehouse = "sales_wh"
+metadata_cache_ttl_secs = 30
+default_table_format_version = 2
+
+[catalogs.ops_wh]
+polaris_url = "http://polaris:8181/api/catalog"
+warehouse = "ops_wh"
+metadata_cache_ttl_secs = 30
+default_table_format_version = 2
+
+[catalog]
+polaris_url = "http://polaris:8181/api/catalog"
+warehouse = "sales_wh"
+
+# polaris-auto lets the write path route DML (CREATE/INSERT) into a non-default
+# catalog named in a 3-part identifier (e.g. ops_wh.ops.x), discovering it from
+# Polaris. Without this, writes fall back to the default catalog.
+[query]
+catalog_discovery = "polaris-auto"
+
+# ── Storage ─────────────────────────────────────────────────────────────────
+[storage]
+s3_endpoint = "http://rustfs:9000"
+s3_region = "us-east-1"
+s3_access_key = "s3admin"
+s3_secret_key = "s3adminpw"
+s3_path_style = true
+s3_allow_http = true
+
+# Authorization is enforced entirely at the Polaris + Ranger boundary on the
+# forwarded SP token. SQE-side policy is off: a client_credentials SP carries no
+# per-user role for SQE to key masks on, and the demo's point is the coarse
+# per-connection allow/deny gate. (SQE-side masking would need the SP's role to
+# flow into the policy engine -- a separate enhancement.) No [access_control]
+# block either: SQE runs as one SP and cannot issue per-user GRANT/REVOKE; the
+# Ranger grants are pre-seeded by ranger/bootstrap-ranger.sh.
+[policy]
+engine = "passthrough"
+
+[session]
+idle_timeout_secs = 900
+
+[metrics]
+prometheus_port = 9090

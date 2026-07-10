@@ -1,0 +1,86 @@
+Jun 16, 2026 11:39:52 AM org.jline.utils.Log logr
+WARNING: Unable to create a system terminal, creating a dumb terminal (enable debug logging for more information)
+"Trino version: 465
+Queued: 803.16us, Analysis: 32.03ms, Planning: 73.18ms, Execution: 416.77ms
+Fragment 1 [SINGLE]
+    CPU: 3.76ms, Scheduled: 6.65ms, Blocked 1.94s (Input: 1.70s, Output: 0.00ns), Input: 58 rows (522B); per task: avg.: 58.00 std.dev.: 0.00, Output: 1 row (9B)
+    Peak Memory: 512B, Tasks count: 1; per task: max: 536B
+    Output layout: [sum]
+    Output partitioning: SINGLE []
+    Aggregate[type = FINAL]
+    │   Layout: [sum:double]
+    │   Estimates: {rows: 1 (9B), cpu: ?, memory: 9B, network: 0B}
+    │   CPU: 0.00ns (0.00%), Scheduled: 0.00ns (0.00%), Blocked: 0.00ns (0.00%), Output: 1 row (9B)
+    │   Input avg.: 58.00 rows, Input std.dev.: 0.00%
+    │   sum := sum(sum_2)
+    └─ LocalExchange[partitioning = SINGLE]
+       │   Layout: [sum_2:double]
+       │   Estimates: {rows: ? (?), cpu: 0, memory: 0B, network: 0B}
+       │   CPU: 0.00ns (0.00%), Scheduled: 1.00ms (0.06%), Blocked: 219.00ms (9.04%), Output: 58 rows (522B)
+       │   Input avg.: 7.25 rows, Input std.dev.: 75.47%
+       └─ RemoteSource[sourceFragmentIds = [2]]
+              Layout: [sum_2:double]
+              CPU: 1.00ms (0.16%), Scheduled: 1.00ms (0.06%), Blocked: 1.70s (70.16%), Output: 58 rows (522B)
+              Input avg.: 7.25 rows, Input std.dev.: 75.47%
+
+Fragment 2 [SOURCE]
+    CPU: 609.94ms, Scheduled: 1.63s, Blocked 504.40ms (Input: 184.40ms, Output: 0.00ns), Input: 9249133 rows (211.69MB); per task: avg.: 9249133.00 std.dev.: 0.00, Output: 58 rows (522B)
+    Peak Memory: 129kB, Tasks count: 1; per task: max: 129kB
+    Output layout: [sum_2]
+    Output partitioning: SINGLE []
+    Aggregate[type = PARTIAL]
+    │   Layout: [sum_2:double]
+    │   CPU: 14.00ms (2.30%), Scheduled: 15.00ms (0.92%), Blocked: 0.00ns (0.00%), Output: 58 rows (522B)
+    │   Input avg.: 19354.45 rows, Input std.dev.: 240.20%
+    │   sum_2 := sum(expr)
+    └─ Project[]
+       │   Layout: [expr:double]
+       │   Estimates: {rows: ? (?), cpu: ?, memory: 0B, network: 0B}
+       │   CPU: 23.00ms (3.77%), Scheduled: 26.00ms (1.59%), Blocked: 0.00ns (0.00%), Output: 1122558 rows (9.63MB)
+       │   Input avg.: 19354.45 rows, Input std.dev.: 240.20%
+       │   expr := $operator$multiply(lo_extendedprice, CAST(lo_discount AS double))
+       └─ InnerJoin[criteria = (lo_orderdate = d_datekey), distribution = REPLICATED]
+          │   Layout: [lo_extendedprice:double, lo_discount:integer]
+          │   Estimates: {rows: ? (?), cpu: ?, memory: ?, network: 0B}
+          │   CPU: 117.00ms (19.18%), Scheduled: 147.00ms (8.97%), Blocked: 295.00ms (12.17%), Output: 1122558 rows (14.99MB)
+          │   Left (probe) Input avg.: 20909.95 rows, Input std.dev.: 233.78%
+          │   Right (build) Input avg.: 365.00 rows, Input std.dev.: 0.00%
+          │   Distribution: REPLICATED
+          │   dynamicFilterAssignments = {d_datekey -> #df_600}
+          ├─ ScanFilterProject[table = iceberg:ssb_sf10.lineorder$data@3570725759546406660, filterPredicate = ((lo_discount BETWEEN integer '1' AND integer '3') AND (lo_quantity < integer '25')), dynamicFilters = {lo_orderdate = #df_600}]
+          │      Layout: [lo_orderdate:integer, lo_extendedprice:double, lo_discount:integer]
+          │      Estimates: {rows: 60000000 (1.06GB), cpu: 1.34G, memory: 0B, network: 0B}/{rows: 7025749 (127.31MB), cpu: 1.34G, memory: 0B, network: 0B}/{rows: 7025749 (127.31MB), cpu: 127.31M, memory: 0B, network: 0B}
+          │      CPU: 453.00ms (74.26%), Scheduled: 1.44s (87.86%), Blocked: 0.00ns (0.00%), Output: 1212777 rows (21.98MB)
+          │      Input avg.: 159461.52 rows, Input std.dev.: 233.79%
+          │      lo_extendedprice := 10:lo_extendedprice:double
+          │      lo_quantity := 9:lo_quantity:integer
+          │      lo_discount := 12:lo_discount:integer
+          │      lo_orderdate := 6:lo_orderdate:integer
+          │      Input: 9248768 rows (211.69MB), Filtered: 86.89%, Physical input: 55.16MB, Physical input time: 832.58ms
+          │      Dynamic filters: 
+          │          - df_600, [ SortedRangeSet[type=integer, ranges=365, {[19930101], ..., [19931231]}] ], collection time=38.48ms
+          └─ LocalExchange[partitioning = SINGLE]
+             │   Layout: [d_datekey:integer]
+             │   Estimates: {rows: ? (?), cpu: 0, memory: 0B, network: 0B}
+             │   CPU: 0.00ns (0.00%), Scheduled: 0.00ns (0.00%), Blocked: 25.00ms (1.03%), Output: 365 rows (1.78kB)
+             │   Input avg.: 45.63 rows, Input std.dev.: 264.58%
+             └─ RemoteSource[sourceFragmentIds = [3]]
+                    Layout: [d_datekey:integer]
+                    CPU: 0.00ns (0.00%), Scheduled: 0.00ns (0.00%), Blocked: 184.00ms (7.59%), Output: 365 rows (1.78kB)
+                    Input avg.: 45.63 rows, Input std.dev.: 264.58%
+
+Fragment 3 [SOURCE]
+    CPU: 2.16ms, Scheduled: 8.99ms, Blocked 0.00ns (Input: 0.00ns, Output: 0.00ns), Input: 2557 rows (16.24kB); per task: avg.: 2557.00 std.dev.: 0.00, Output: 365 rows (1.78kB)
+    Peak Memory: 2.21kB, Tasks count: 1; per task: max: 2.21kB
+    Output layout: [d_datekey]
+    Output partitioning: BROADCAST []
+    ScanFilterProject[table = iceberg:ssb_sf10.dim_date$data@2122930608055716551, filterPredicate = (d_year = integer '1993')]
+        Layout: [d_datekey:integer]
+        Estimates: {rows: 2557 (12.49kB), cpu: 24.97k, memory: 0B, network: 0B}/{rows: ? (?), cpu: 24.97k, memory: 0B, network: 0B}/{rows: ? (?), cpu: ?, memory: 0B, network: 0B}
+        CPU: 2.00ms (0.33%), Scheduled: 9.00ms (0.55%), Blocked: 0.00ns (0.00%), Output: 365 rows (1.78kB)
+        Input avg.: 2557.00 rows, Input std.dev.: 0.00%
+        d_datekey := 1:d_datekey:integer
+        d_year := 5:d_year:integer
+        Input: 2557 rows (16.24kB), Filtered: 85.73%, Physical input: 28.89kB, Physical input time: 20.69us
+
+"

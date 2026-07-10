@@ -1,0 +1,191 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "title": "Memory Usage vs Limit",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "targets": [
+        { "expr": "sqe_coordinator_memory_used_bytes", "legendFormat": "Used (bytes)" },
+        { "expr": "sqe_coordinator_memory_limit_bytes", "legendFormat": "Limit (bytes)" }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "bytes", "custom": { "fillOpacity": 10 } }
+      }
+    },
+    {
+      "title": "Memory Pressure",
+      "type": "gauge",
+      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 0 },
+      "targets": [
+        { "expr": "sqe_coordinator_memory_pressure", "legendFormat": "Pressure" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "min": 0, "max": 3,
+          "thresholds": {
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 1 },
+              { "color": "orange", "value": 2 },
+              { "color": "red", "value": 3 }
+            ]
+          },
+          "mappings": [
+            { "type": "value", "options": { "0": { "text": "Green" }, "1": { "text": "Yellow" }, "2": { "text": "Orange" }, "3": { "text": "Red" } } }
+          ]
+        }
+      }
+    },
+    {
+      "title": "Active Sessions / Workers",
+      "type": "stat",
+      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 0 },
+      "targets": [
+        { "expr": "sqe_active_sessions", "legendFormat": "Sessions" },
+        { "expr": "sqe_healthy_workers", "legendFormat": "Workers" }
+      ]
+    },
+    {
+      "title": "Query Rate",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "targets": [
+        { "expr": "rate(sqe_query_count_total[30s])", "legendFormat": "{{status}} {{statement_type}}" }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "ops", "custom": { "fillOpacity": 20 } }
+      }
+    },
+    {
+      "title": "Query Duration (p50, p95, p99)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "targets": [
+        { "expr": "histogram_quantile(0.50, rate(sqe_query_duration_seconds_bucket[1m]))", "legendFormat": "p50" },
+        { "expr": "histogram_quantile(0.95, rate(sqe_query_duration_seconds_bucket[1m]))", "legendFormat": "p95" },
+        { "expr": "histogram_quantile(0.99, rate(sqe_query_duration_seconds_bucket[1m]))", "legendFormat": "p99" }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "s" }
+      }
+    },
+    {
+      "title": "Spill Events",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 16 },
+      "targets": [
+        { "expr": "rate(sqe_sort_spill_count_total[30s])", "legendFormat": "Sort spills/s" },
+        { "expr": "rate(sqe_join_spill_count_total[30s])", "legendFormat": "Join spills/s" }
+      ]
+    },
+    {
+      "title": "Spill Bytes",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 16 },
+      "targets": [
+        { "expr": "rate(sqe_sort_spill_bytes_total[30s])", "legendFormat": "Sort spill B/s" },
+        { "expr": "rate(sqe_join_spill_bytes_total[30s])", "legendFormat": "Join spill B/s" }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "Bps" }
+      }
+    },
+    {
+      "title": "Time to First Row",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 16 },
+      "targets": [
+        { "expr": "histogram_quantile(0.50, rate(sqe_time_to_first_row_seconds_bucket[1m]))", "legendFormat": "p50" },
+        { "expr": "histogram_quantile(0.95, rate(sqe_time_to_first_row_seconds_bucket[1m]))", "legendFormat": "p95" }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "s" }
+      }
+    },
+    {
+      "title": "Late Materialization Effectiveness",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 24 },
+      "targets": [
+        { "expr": "rate(sqe_late_mat_bytes_predicate_total[30s])", "legendFormat": "Predicate bytes/s" },
+        { "expr": "rate(sqe_late_mat_bytes_projection_total[30s])", "legendFormat": "Projection bytes/s" }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "Bps" }
+      }
+    },
+    {
+      "title": "File Pruning",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 24 },
+      "targets": [
+        { "expr": "rate(sqe_files_pruned_minmax_total[30s])", "legendFormat": "Min/max pruned/s" },
+        { "expr": "rate(sqe_files_pruned_bloom_total[30s])", "legendFormat": "Bloom pruned/s" },
+        { "expr": "rate(sqe_pages_pruned_index_total[30s])", "legendFormat": "Pages pruned/s" }
+      ]
+    },
+    {
+      "title": "Cache Hit Rate",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 32 },
+      "targets": [
+        { "expr": "rate(sqe_cache_hits_total[1m]) / (rate(sqe_cache_hits_total[1m]) + rate(sqe_cache_misses_total[1m]))", "legendFormat": "Query cache hit rate" },
+        { "expr": "rate(sqe_footer_cache_hits[1m]) / (rate(sqe_footer_cache_hits[1m]) + rate(sqe_footer_cache_misses[1m]))", "legendFormat": "Footer cache hit rate" }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "percentunit", "min": 0, "max": 1 }
+      }
+    },
+    {
+      "title": "Worker Activity",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 32 },
+      "targets": [
+        { "expr": "rate(sqe_worker_fragments_executed_total[30s])", "legendFormat": "Fragments/s {{instance}}" },
+        { "expr": "rate(sqe_worker_bytes_read_total[30s])", "legendFormat": "Bytes read/s {{instance}}" }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "Bps" }
+      }
+    },
+    {
+      "title": "Shuffle Traffic",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 40 },
+      "targets": [
+        { "expr": "rate(sqe_shuffle_bytes_sent_total[30s])", "legendFormat": "Sent B/s" },
+        { "expr": "rate(sqe_shuffle_bytes_received_total[30s])", "legendFormat": "Received B/s" }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "Bps" }
+      }
+    },
+    {
+      "title": "Rows Returned",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 40 },
+      "targets": [
+        { "expr": "rate(sqe_rows_returned_total[30s])", "legendFormat": "Rows/s" }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "rows/s" }
+      }
+    }
+  ],
+  "refresh": "5s",
+  "schemaVersion": 39,
+  "tags": ["sqe", "benchmark"],
+  "templating": { "list": [] },
+  "time": { "from": "now-15m", "to": "now" },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "SQE Benchmark",
+  "uid": "sqe-benchmark",
+  "version": 1
+}

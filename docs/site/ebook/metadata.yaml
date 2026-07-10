@@ -1,0 +1,91 @@
+---
+title: "Sovereign by Design"
+subtitle: "Building a Production Query Engine on DataFusion"
+author: Jacob Verhoeks
+date: 2026
+lang: en-GB
+description: |
+  The complete journey of replacing Trino with a purpose-built Rust query engine.
+  From first DataFusion query to distributed execution over Apache Iceberg,
+  with OIDC auth passthrough, policy-as-plan-rewriting, and zero service accounts.
+  A practitioner's guide to building data infrastructure you actually own.
+
+rights: "Copyright 2026 Jacob Verhoeks. All rights reserved."
+
+publisher: Self-published
+cover-image: diagrams/cover.png
+
+# ── PDF settings (A4, print-optimised) ──────────────────────────────
+documentclass: book
+classoption:
+  - openright          # chapters always start on a right-hand (odd) page
+papersize: a4
+fontsize: 10pt         # 10pt on A4 gives ~70 chars/line — ideal for readability
+mainfont: "Georgia"
+sansfont: "Helvetica Neue"
+monofont: "Menlo"
+monofontoptions:
+  - Scale=0.85         # monospace slightly smaller so code blocks fit
+geometry:
+  - top=30mm
+  - bottom=30mm
+  - left=30mm
+  - right=25mm
+  - marginparwidth=0mm
+linestretch: 1.3       # slightly more line spacing for A4 readability
+toc: true
+toc-depth: 0           # chapters only in TOC
+number-sections: true
+
+header-includes:
+  - \setcounter{tocdepth}{0}
+  # Scale oversized images/floats to fit within text width
+  - \usepackage[export]{adjustbox}
+  - \let\oldincludegraphics\includegraphics
+  - \renewcommand{\includegraphics}[2][]{\oldincludegraphics[max width=\linewidth,max height=0.85\textheight,keepaspectratio,#1]{#2}}
+  - \usepackage{graphicx}
+  - \usepackage{xcolor}
+  - \usepackage{tikz}
+  # Reduce code block font size so wide listings fit within A4 margins
+  - \usepackage{fancyvrb}
+  - \DefineVerbatimEnvironment{Highlighting}{Verbatim}{fontsize=\small,commandchars=\\\{\}}
+  # Every chapter starts on a new page (openright in book class does this,
+  # but we also add \clearpage before chapter headings for safety)
+  - |
+    \let\originalchapter\chapter
+    \renewcommand{\chapter}{\clearpage\originalchapter}
+  # Full-bleed cover page
+  - |
+    \renewcommand{\maketitle}{%
+      \thispagestyle{empty}%
+      \newgeometry{margin=0pt}%
+      \begin{tikzpicture}[remember picture,overlay]
+        \node[anchor=center] at (current page.center) {%
+          \includegraphics[width=\paperwidth,height=\paperheight]{diagrams/cover.png}%
+        };
+        \fill[black,opacity=0.5] ([yshift=25mm]current page.west) rectangle ([yshift=-30mm]current page.east);
+        \node[anchor=center,text width=0.80\paperwidth,align=center] at ([yshift=3mm]current page.center) {%
+          {\fontsize{36}{42}\selectfont\bfseries\color{white}\textsf{Sovereign by Design}\par}%
+          \vspace{6pt}%
+          {\fontsize{13}{17}\selectfont\color{white!85}\textsf{Building a Production Query Engine on DataFusion}\par}%
+          \vspace{10pt}%
+          {\fontsize{14}{18}\selectfont\color{white}\textsf{Jacob Verhoeks}\par}%
+        };
+      \end{tikzpicture}%
+      \restoregeometry%
+      \clearpage%
+    }
+
+colorlinks: true
+linkcolor: NavyBlue
+urlcolor: NavyBlue
+highlight-style: tango
+
+# ── EPUB settings ───────────────────────────────────────────────────
+# These are picked up only for EPUB output; PDF ignores them.
+epub-metadata: |
+  <dc:language>en-GB</dc:language>
+  <dc:rights>Copyright 2026 Jacob Verhoeks. All rights reserved.</dc:rights>
+css:
+  - epub.css
+---

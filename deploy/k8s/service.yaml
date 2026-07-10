@@ -1,0 +1,22 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: sqe-coordinator
+  labels:
+    app: sqe
+    component: coordinator
+spec:
+  type: ClusterIP
+  selector:
+    app: sqe
+    component: coordinator
+  ports:
+    - name: flight-sql
+      port: 50051
+      targetPort: flight-sql
+    - name: trino-http
+      port: 8080
+      targetPort: trino-http
+    - name: metrics
+      port: 9090
+      targetPort: metrics

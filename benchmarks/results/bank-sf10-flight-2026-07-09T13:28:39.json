@@ -1,0 +1,65 @@
+{
+  "benchmark": "bank",
+  "scale_factor": 10.0,
+  "protocol": "flight",
+  "timestamp": "2026-07-09T13:28:39",
+  "summary": {
+    "total": 8,
+    "pass": 8,
+    "fail": 0,
+    "diff": 0,
+    "skip": 0,
+    "error": 0,
+    "total_duration_ms": 130717
+  },
+  "queries": [
+    {
+      "id": "q01",
+      "status": "pass",
+      "duration_ms": 6786,
+      "rows": 28
+    },
+    {
+      "id": "q02",
+      "status": "pass",
+      "duration_ms": 3430,
+      "rows": 35
+    },
+    {
+      "id": "q03",
+      "status": "pass",
+      "duration_ms": 97682,
+      "rows": 10
+    },
+    {
+      "id": "q04",
+      "status": "pass",
+      "duration_ms": 6780,
+      "rows": 500
+    },
+    {
+      "id": "q05",
+      "status": "pass",
+      "duration_ms": 1471,
+      "rows": 857
+    },
+    {
+      "id": "q06",
+      "status": "pass",
+      "duration_ms": 10735,
+      "rows": 90
+    },
+    {
+      "id": "q07",
+      "status": "pass",
+      "duration_ms": 1514,
+      "rows": 84
+    },
+    {
+      "id": "q08",
+      "status": "pass",
+      "duration_ms": 2319,
+      "rows": 150
+    }
+  ]
+}

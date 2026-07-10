@@ -1,0 +1,221 @@
+# SQE quickstart: Polaris + Keycloak (user token / bring-your-own-token).
+#
+# Same stack as polaris-keycloak-client-id, but SQE does NOT mint tokens. An
+# upstream app (here: a curl call to Keycloak's public client) mints the user's
+# bearer token, the client passes it with `--token`, and SQE validates it against
+# the realm JWKS and passes it through to Polaris. The only difference from the
+# client-id quickstart is sqe.toml (a bearer_token provider instead of oidc_password).
+#
+# Everything runs on one Docker network. Services address each other by name
+# (keycloak:8080, polaris:8181, rustfs:9000), so the Keycloak token issuer is
+# a single consistent hostname and no /etc/hosts editing or reverse proxy is
+# needed. Host ports are offset (28080, 18181, 19000, 60051, 18080) so this
+# stack can run next to other local stacks without clashing.
+#
+#   cp .env.example .env       # the defaults already work; edit to change secrets/ports
+#   docker compose up -d --wait
+#   ./run.sh                   # bootstrap + queries + capture (or just run queries yourself)
+
+services:
+  # ── Keycloak — the identity provider ──────────────────────────────────
+  # start-dev uses an in-memory H2 DB: zero external dependencies, realm is
+  # re-imported on every fresh start. KC_HOSTNAME is fixed to the in-network
+  # name so every token's issuer claim is http://keycloak:8080/realms/iceberg,
+  # which is exactly what Polaris validates against.
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.5.4
+    command: start-dev
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-admin}
+      KC_HOSTNAME: http://keycloak:8080
+      KC_HOSTNAME_STRICT: "false"
+      KC_HTTP_ENABLED: "true"
+      KC_HTTP_PORT: "8080"
+      KC_HEALTH_ENABLED: "true"
+      KC_LOG_LEVEL: INFO
+    ports:
+      - "${KEYCLOAK_PORT:-28080}:8080"
+    healthcheck:
+      # The KC image ships no curl/wget. The management port (9000) is the last
+      # socket to open during startup, so "port 9000 accepts a connection" is a
+      # reliable readiness signal. keycloak-config does its own API-level wait.
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/localhost/9000"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+
+  # ── keycloak-config — imports the realm, then exits ───────────────────
+  # adorsys/keycloak-config-cli applies _shared/keycloak/realm-iceberg.json
+  # and substitutes $(env:NAME) placeholders (client secret, root password).
+  keycloak-config:
+    image: adorsys/keycloak-config-cli:6.4.1-26
+    environment:
+      KEYCLOAK_URL: http://keycloak:8080
+      KEYCLOAK_USER: admin
+      KEYCLOAK_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-admin}
+      KEYCLOAK_AVAILABILITYCHECK_ENABLED: "true"
+      KEYCLOAK_AVAILABILITYCHECK_TIMEOUT: 120s
+      IMPORT_FILES_LOCATIONS: /config/*
+      IMPORT_VARSUBSTITUTION_ENABLED: "true"
+      SQE_CLIENT_SECRET: ${SQE_CLIENT_SECRET:-sqe-secret-change-me}
+      ROOT_PASSWORD: ${ROOT_PASSWORD:-root123}
+    volumes:
+      - ../_shared/keycloak/realm-iceberg.json:/config/realm-iceberg.json:ro
+    restart: "no"
+    depends_on:
+      keycloak:
+        condition: service_healthy
+
+  # ── RustFS — S3-compatible object store (the warehouse) ───────────────
+  rustfs:
+    image: rustfs/rustfs:1.0.0-alpha.89
+    environment:
+      RUSTFS_ACCESS_KEY: ${S3_ACCESS_KEY:-s3admin}
+      RUSTFS_SECRET_KEY: ${S3_SECRET_KEY:-s3adminpw}
+    volumes:
+      - rustfs-data:/data
+    ports:
+      - "${RUSTFS_PORT:-19000}:9000"
+      - "${RUSTFS_CONSOLE_PORT:-19001}:9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9001/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+
+  # ── Polaris — the Iceberg REST catalog, federated to Keycloak ─────────
+  # authentication.type=mixed: accepts BOTH Polaris-internal tokens (used by
+  # bootstrap.sh via client_credentials) AND external Keycloak OIDC tokens
+  # (used by SQE on behalf of end users). In-memory persistence keeps the
+  # quickstart dependency-free; principals are recreated by polaris-setup on
+  # each fresh start.
+  polaris:
+    image: apache/polaris:1.5.0
+    environment:
+      POLARIS_PERSISTENCE_TYPE: in-memory
+      POLARIS_BOOTSTRAP_CREDENTIALS: iceberg,root,${POLARIS_BOOTSTRAP_SECRET:-polaris-root-secret}
+      POLARIS_PRODUCTION_READINESS_CHECKS_ENABLED: "false"
+      QUARKUS_HTTP_PORT: "8181"
+      QUARKUS_MANAGEMENT_PORT: "8182"
+      QUARKUS_LOG_LEVEL: INFO
+      QUARKUS_LOG_CATEGORY__ORG_APACHE_POLARIS__LEVEL: INFO
+      # Realm
+      polaris.realm-context.realms: iceberg
+      polaris.realm-context.default-realm: iceberg
+      polaris.realm-context.require-header: "false"
+      # OIDC federation to Keycloak
+      polaris.authentication.type: mixed
+      quarkus.oidc.tenant-enabled: "true"
+      quarkus.oidc.auth-server-url: http://keycloak:8080/realms/iceberg
+      quarkus.oidc.token.issuer: http://keycloak:8080/realms/iceberg
+      quarkus.oidc.client-id: polaris-frontend-client
+      quarkus.oidc.token.audience: account
+      quarkus.oidc.roles.role-claim-path: groups
+      quarkus.oidc.tls.verification: none
+      polaris.oidc.principal-mapper.name-claim-path: preferred_username
+      polaris.oidc.principal-roles-mapper.filter: ".*"
+      polaris.oidc.principal-roles-mapper.mappings[0].regex: (.+)
+      polaris.oidc.principal-roles-mapper.mappings[0].replacement: $1
+      polaris.features."SUPPORTED_CATALOG_STORAGE_TYPES": "[\"S3\"]"
+      # Keep false so Polaris injects s3.endpoint + path-style into the Iceberg
+      # FileIO (works with the custom RustFS endpoint + per-catalog stsUnavailable).
+      polaris.features."SKIP_CREDENTIAL_SUBSCOPING_INDIRECTION": "false"
+      # S3 access for Polaris's own server-side metadata writes
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: ${S3_ACCESS_KEY:-s3admin}
+      AWS_SECRET_ACCESS_KEY: ${S3_SECRET_KEY:-s3adminpw}
+      QUARKUS_S3_ENDPOINT_OVERRIDE: http://rustfs:9000
+      QUARKUS_S3_PATH_STYLE_ACCESS: "true"
+      QUARKUS_S3_AWS_REGION: us-east-1
+      QUARKUS_S3_AWS_CREDENTIALS_TYPE: static
+      QUARKUS_S3_AWS_CREDENTIALS_STATIC_PROVIDER_ACCESS_KEY_ID: ${S3_ACCESS_KEY:-s3admin}
+      QUARKUS_S3_AWS_CREDENTIALS_STATIC_PROVIDER_SECRET_ACCESS_KEY: ${S3_SECRET_KEY:-s3adminpw}
+    ports:
+      - "${POLARIS_PORT:-18181}:8181"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8182/q/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+    depends_on:
+      keycloak-config:
+        condition: service_completed_successfully
+      rustfs:
+        condition: service_healthy
+
+  # ── bucket-init — create the warehouse bucket (RustFS needs real S3) ──
+  bucket-init:
+    image: amazon/aws-cli:2.31.15
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        aws s3api head-bucket --bucket warehouse --endpoint-url http://rustfs:9000 2>/dev/null \
+          || aws s3 mb s3://warehouse --endpoint-url http://rustfs:9000
+        echo "bucket ready"
+    environment:
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: ${S3_ACCESS_KEY:-s3admin}
+      AWS_SECRET_ACCESS_KEY: ${S3_SECRET_KEY:-s3adminpw}
+    restart: "no"
+    depends_on:
+      rustfs:
+        condition: service_healthy
+
+  # ── polaris-setup — one-shot RBAC + catalog + namespace bootstrap ─────
+  polaris-setup:
+    image: curlimages/curl:8.14.1
+    entrypoint: ["sh", "/bootstrap.sh"]
+    environment:
+      POLARIS_URL: http://polaris:8181
+      POLARIS_REALM: iceberg
+      S3_ENDPOINT: http://rustfs:9000
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY:-s3admin}
+      S3_SECRET_KEY: ${S3_SECRET_KEY:-s3adminpw}
+      S3_BUCKET: warehouse
+      BOOTSTRAP_CLIENT_ID: root
+      BOOTSTRAP_CLIENT_SECRET: ${POLARIS_BOOTSTRAP_SECRET:-polaris-root-secret}
+      WAREHOUSE: quickstart
+      NAMESPACE: demo
+    volumes:
+      - ../_shared/polaris/bootstrap.sh:/bootstrap.sh:ro
+    restart: "no"
+    depends_on:
+      polaris:
+        condition: service_healthy
+      bucket-init:
+        condition: service_completed_successfully
+
+  # ── SQE — the query engine (Flight SQL + Trino-compat HTTP) ───────────
+  # Built from this repo. SQE authenticates end users against Keycloak via the
+  # ROPC grant (sqe-client + secret), then passes each user's token through to
+  # Polaris. Config in sqe.toml.
+  sqe:
+    image: ${SQE_IMAGE:-sqe-quickstart:latest}
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    command: ["--config", "/etc/sqe/sqe.toml"]
+    environment:
+      RUST_LOG: "info,sqe_auth=debug,sqe_coordinator::session_manager=debug"
+    volumes:
+      - ./sqe.toml:/etc/sqe/sqe.toml:ro
+      - ./queries.sql:/queries.sql:ro
+    ports:
+      - "${SQE_FLIGHT_PORT:-60051}:50051"
+      - "${SQE_TRINO_PORT:-18080}:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9091/healthz || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    depends_on:
+      polaris-setup:
+        condition: service_completed_successfully
+
+volumes:
+  rustfs-data:
