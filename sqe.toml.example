@@ -204,6 +204,43 @@ otlp_endpoint = ""
 # audit.persistence.enabled=true to back it with a PVC. See ISSUE-248.
 audit_log_path = ""
 
+# OpenTelemetry trace sampling (0.0–1.0). Default when omitted: 0.01 (1% of queries).
+# Set to 1.0 to trace every query (expensive at high QPS). Set to 0.0 to disable tracing.
+# trace_sample_rate = 0.01
+
+# OTLP audit export: tails the OCSF spool and ships records to a SIEM collector.
+# Off by default. Requires audit_log_path (or metrics.audit format = "ocsf"/"both").
+# Production tuning and phase-by-phase guidance: docs/production.md
+[metrics.audit_export]
+enabled = false
+target = "otlp"               # only "otlp" is supported today; "kafka" is reserved
+otlp_endpoint = ""            # empty falls back to metrics.otlp_endpoint above
+spool_path = ""               # empty -> <audit_log_path>.ocsf.spool.jsonl
+batch_max = 512               # max OCSF records per OTLP export batch
+flush_interval_ms = 2000      # shipper poll interval in milliseconds
+max_spool_bytes = 1073741824  # 1 GiB; WARN when spool exceeds this (queries never block)
+start_at = "now"              # "now" (skip backlog on first run) | "beginning" (replay all)
+
+# OpenLineage 2-0-2 lineage events for DML/DDL. Off by default; zero hot-path cost when
+# disabled. When enabled, at least one sink (file_path or http_endpoint) is required.
+# Full reference: docs/site/book/src/operations/openlineage.md
+# Production tuning: docs/production.md
+[metrics.openlineage]
+enabled = false
+job_namespace = "sqe"         # per-environment namespace in lineage UI
+# producer = ""               # optional producer URI override (default: sqe binary version)
+emit_selects = false          # set true only when read lineage is required
+file_path = ""                # append-only JSONL sink (e.g. "/var/log/sqe/lineage.jsonl")
+http_endpoint = ""            # OL collector URL (e.g. "https://marquez.example.com/api/v1/lineage")
+auth_mode = "none"            # "none" | "bearer" | "user_token"
+api_key = ""                  # required when auth_mode = "bearer"
+http_timeout_ms = 5000
+http_retry_attempts = 1
+spool_path = ""               # disk spool for HTTP collector outages (recommended with http_endpoint)
+spool_max_bytes = 104857600   # 100 MiB default
+replay_interval_secs = 30
+channel_capacity = 10000
+
 # ── Query execution ───────────────────────────────────────────
 [query]
 # Maximum estimated build-side size for hash join before falling back to
