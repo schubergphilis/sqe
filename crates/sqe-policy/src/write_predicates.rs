@@ -66,7 +66,7 @@ pub async fn extract_write_predicates(
     namespace_key: &str,
     table_name: &str,
     schema: Arc<ArrowSchema>,
-) -> sqe_core::Result<WritePolicyPredicates> {
+) -> sqe_core::Result<(WritePolicyPredicates, crate::PolicySummary)> {
     let table_ref = TableReference::partial(
         namespace_key.to_string(),
         table_name.to_string(),
@@ -81,8 +81,8 @@ pub async fn extract_write_predicates(
         .and_then(|b| b.build())
         .map_err(|e| SqeError::Execution(format!("policy probe scan: {e}")))?;
 
-    let (rewritten, _summary) = enforcer.evaluate(user, plan).await?;
-    Ok(unparse_predicates(&rewritten))
+    let (rewritten, summary) = enforcer.evaluate(user, plan).await?;
+    Ok((unparse_predicates(&rewritten), summary))
 }
 
 /// Walk a rewritten plan and pull row filters + masks out as SQL fragments.
@@ -166,7 +166,7 @@ mod tests {
     async fn empty_policy_yields_no_predicates() {
         let store = Arc::new(InMemoryPolicyStore::new());
         let enf = PolicyPlanRewriter::new(store);
-        let out = extract_write_predicates(
+        let (out, _summary) = extract_write_predicates(
             &enf,
             &user("alice"),
             "default",
@@ -186,7 +186,7 @@ mod tests {
         store.add_table_policy("default", "employees", pol).await;
         let enf = PolicyPlanRewriter::new(Arc::new(store));
 
-        let out = extract_write_predicates(
+        let (out, summary) = extract_write_predicates(
             &enf,
             &user("alice"),
             "default",
@@ -196,6 +196,7 @@ mod tests {
         .await
         .unwrap();
 
+        assert_eq!(summary.row_filters_applied, 1);
         let s = out.row_filter_sql.expect("row filter present");
         assert!(s.contains("region"), "row filter sql: {s}");
         assert!(s.contains("EU"), "row filter sql: {s}");
@@ -210,7 +211,7 @@ mod tests {
         store.add_table_policy("default", "employees", pol).await;
         let enf = PolicyPlanRewriter::new(Arc::new(store));
 
-        let out = extract_write_predicates(
+        let (out, summary) = extract_write_predicates(
             &enf,
             &user("alice"),
             "default",
@@ -220,6 +221,7 @@ mod tests {
         .await
         .unwrap();
 
+        assert_eq!(summary.columns_masked, vec!["ssn".to_string()]);
         let mask = out
             .column_mask_sqls
             .get("ssn")
@@ -241,7 +243,7 @@ mod tests {
         store.add_table_policy("default", "employees", pol).await;
         let enf = PolicyPlanRewriter::new(Arc::new(store));
 
-        let out = extract_write_predicates(
+        let (out, summary) = extract_write_predicates(
             &enf,
             &user("alice"),
             "default",
@@ -251,6 +253,7 @@ mod tests {
         .await
         .unwrap();
 
+        assert_eq!(summary.columns_masked, vec!["id".to_string()]);
         let mask = out
             .column_mask_sqls
             .get("id")
@@ -270,7 +273,7 @@ mod tests {
         store.add_table_policy("default", "employees", pol).await;
         let enf = PolicyPlanRewriter::new(Arc::new(store));
 
-        let out = extract_write_predicates(
+        let (out, summary) = extract_write_predicates(
             &enf,
             &user("alice"),
             "default",
@@ -280,6 +283,8 @@ mod tests {
         .await
         .unwrap();
 
+        assert_eq!(summary.row_filters_applied, 1);
+        assert_eq!(summary.columns_masked, vec!["ssn".to_string()]);
         assert!(out.row_filter_sql.is_some());
         assert!(out.column_mask_sqls.contains_key("ssn"));
     }
