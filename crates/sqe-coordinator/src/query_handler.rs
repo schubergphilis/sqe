@@ -2308,6 +2308,8 @@ impl QueryHandler {
         // Distribute scan across workers if possible.
         let final_plan = self.try_distribute(physical_plan, session, query_id).await;
 
+        let _execute_span = tracing::info_span!("sqe.execute", query_id = %query_id);
+
         // Planning complete — promote tracker to Running
         self.query_tracker
             .running(query_id, start.elapsed().as_millis() as u64);
@@ -2571,6 +2573,8 @@ impl QueryHandler {
 
         // Try to distribute scan work across workers
         let final_plan = self.try_distribute(physical_plan, session, query_id).await;
+
+        let _execute_span = tracing::info_span!("sqe.execute", query_id = %query_id);
 
         // Execute the (possibly distributed) plan.
         //

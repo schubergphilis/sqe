@@ -475,9 +475,9 @@ P0 advanced in this pass:
 
 P1 advanced:
 - O4: `trace_id` + `query_id` on `AuditEvent` + helper + wiring across paths (!626).
-- O3: `sqe.query` root spans + `sqe.policy_rewrite` child spans added (!628).
+- O3: `sqe.query` root spans + `sqe.policy_rewrite` + `sqe.execute` + `sqe.write_commit` child spans (expanded on this branch).
 - O5: Maintenance procedures now emit OpenLineage (flipped should_emit + existing paths; !627).
-- O6: still open.
+- O6: Trino/Quack traceparent propagation wired (!630).
 - Structural items (god-crate, full CI) remain.
 
 See the appended 2026-07-11 sections lower in this file for details per MR.
