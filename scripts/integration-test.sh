@@ -27,6 +27,11 @@ SQE_LOG_FILE="$(mktemp /tmp/sqe-test-XXXXXX.log)"
 
 echo ""
 echo "Running integration tests..."
+# Q-04: Write-path CI validation (Polaris + RustFS).
+# The write tests (test_ctas_roundtrip, test_insert_into, and related DELETE/MERGE)
+# exercise the full write path against the test stack. They are included via --ignored.
+# Use explicit filter e.g. ./scripts/integration-test.sh test_ctas_roundtrip to focus.
+# For stronger validation a dedicated job or WRITE=1 mode can be added later.
 # Runs all test binaries in sqe-coordinator (integration_test + sql_compat_test).
 # Capture SQE coordinator tracing output (requires RUST_LOG to be set for structured logs).
 # RUST_MIN_STACK=8 MiB matches the production coordinator runtime (see
