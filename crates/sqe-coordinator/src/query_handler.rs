@@ -1626,20 +1626,15 @@ impl QueryHandler {
                     },
                 };
 
-                let policy = if ps.row_filters_applied > 0
-                    || !ps.columns_masked.is_empty()
-                    || !ps.columns_restricted.is_empty()
-                    || ps.denied
-                {
-                    Some(sqe_metrics::audit::PolicyAudit {
-                        row_filters_applied: ps.row_filters_applied,
-                        columns_masked: ps.columns_masked,
-                        columns_restricted: ps.columns_restricted,
-                        denied: ps.denied,
-                    })
-                } else {
-                    None
-                };
+                // Always emit PolicyAudit for SELECTs (even when all fields zero).
+                // This records the policy decision explicitly for SIEM/audit completeness
+                // (P0 from full audit: DML + read path policy decisions must be visible).
+                let policy = Some(sqe_metrics::audit::PolicyAudit {
+                    row_filters_applied: ps.row_filters_applied,
+                    columns_masked: ps.columns_masked,
+                    columns_restricted: ps.columns_restricted,
+                    denied: ps.denied,
+                });
 
                 let actor = sqe_metrics::audit::Actor::from_parts(
                     session.user.username.clone(),
@@ -1830,21 +1825,19 @@ impl QueryHandler {
                         | StatementKind::Truncate(_)
                 );
                 let ps = policy_summary.unwrap_or_default();
-                let policy = if is_dml
-                    && (ps.row_filters_applied > 0
-                        || !ps.columns_masked.is_empty()
-                        || !ps.columns_restricted.is_empty()
-                        || ps.denied)
-                {
-                    Some(sqe_metrics::audit::PolicyAudit {
-                        row_filters_applied: ps.row_filters_applied,
-                        columns_masked: ps.columns_masked,
-                        columns_restricted: ps.columns_restricted,
-                        denied: ps.denied,
-                    })
-                } else {
-                    None
-                };
+                // Always emit PolicyAudit for DML (INSERT/CTAS/MERGE/DELETE/UPDATE/...).
+                // Previously conditional on "had effect"; now unconditional so every
+                // write carries the source policy decision (row filters, masks, denies)
+                // even when zero-effect (policy engine admitted the source raw).
+                // Addresses full-audit P0 "DML policy audit on write path" and O2.
+                // Write handler already calls enforce_source_plan / compute_write_predicates
+                // and threads the summary out for all DML dispatch paths.
+                let policy = Some(sqe_metrics::audit::PolicyAudit {
+                    row_filters_applied: ps.row_filters_applied,
+                    columns_masked: ps.columns_masked,
+                    columns_restricted: ps.columns_restricted,
+                    denied: ps.denied,
+                });
                 let stats = if is_dml {
                     Some(sqe_metrics::audit::QueryStats {
                         rows_returned: rows,
