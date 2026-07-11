@@ -2199,8 +2199,7 @@ impl QueryHandler {
             let _policy_span = tracing::info_span!(
                 "sqe.policy_rewrite",
                 user = %session.user.username
-            )
-            .entered();
+            );
             self.policy_enforcer.evaluate(&session.user, plan).await?
         };
         debug!("Policy-enforced plan (streaming): {:?}", enforced_plan);
@@ -2517,8 +2516,7 @@ impl QueryHandler {
             let _policy_span = tracing::info_span!(
                 "sqe.policy_rewrite",
                 user = %session.user.username
-            )
-            .entered();
+            );
             self.policy_enforcer
                 .evaluate(&session.user, plan)
                 .await?
