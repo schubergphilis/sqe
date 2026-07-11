@@ -1387,7 +1387,9 @@ impl QueryHandler {
         let execution_ms = duration.as_millis() as u64;
         let tt_for_complete: Vec<String> = match captured_plan.as_ref() {
             Some(sqe_lineage::PlanOrHint::Plan(p)) => {
-                sqe_lineage::extract::extract_table_names(p.as_ref())
+                let mut tt = sqe_lineage::extract::extract_table_names(p.as_ref());
+                append_metadata_tvf_targets(p.as_ref(), &mut tt);
+                tt
             }
             _ => Vec::new(),
         };
@@ -2159,7 +2161,8 @@ impl QueryHandler {
             .or(effective_catalog_buf.as_deref());
         let audit_resources =
             crate::audit_resources::resources_from_plan(&enforced_plan, default_catalog_str);
-        let tables_touched = sqe_lineage::extract::extract_table_names(&enforced_plan);
+        let mut tables_touched = sqe_lineage::extract::extract_table_names(&enforced_plan);
+        append_metadata_tvf_targets(&enforced_plan, &mut tables_touched);
 
         let enforced_df = ctx
             .execute_logical_plan(enforced_plan)
@@ -4998,6 +5001,33 @@ impl Drop for TimeTravelCleanup {
 /// SQE models references as `[catalog.]schema.table` (single-level namespace),
 /// so only a three-part name carries an explicit catalog; one- and two-part
 /// names do not. Used to route time-travel reads to the right catalog (#317).
+/// Append the underlying Iceberg tables of any metadata TVF scans
+/// (`table_files('ns','t')`, `table_snapshots(...)`, ...) to `tables`.
+///
+/// `extract_table_names` sees only the TVF function name on those scans, so
+/// cached TVF results were never invalidated by DML writes to the target
+/// table and served stale file/snapshot listings (#371).
+fn append_metadata_tvf_targets(
+    plan: &datafusion::logical_expr::LogicalPlan,
+    tables: &mut Vec<String>,
+) {
+    use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+    let _ = plan.apply(|node| {
+        if let datafusion::logical_expr::LogicalPlan::TableScan(scan) = node {
+            if let Ok(provider) = datafusion::datasource::source_as_provider(&scan.source) {
+                if let Some(target) =
+                    sqe_catalog::iceberg_metadata_tvf::metadata_tvf_target_table(provider.as_ref())
+                {
+                    if !tables.contains(&target) {
+                        tables.push(target);
+                    }
+                }
+            }
+        }
+        Ok(TreeNodeRecursion::Continue)
+    });
+}
+
 fn explicit_catalog_component(table: &str) -> Option<&str> {
     let parts: Vec<&str> = table.split('.').collect();
     match parts.as_slice() {
