@@ -51,6 +51,11 @@ pub struct SqeTableProvider {
     /// Bounded wait (ms) at scan open for pending dynamic filters, from
     /// `[catalog.runtime_filters] wait_ms`.
     runtime_filter_wait_ms: u64,
+    /// Issue #369: bloom-filter row-group probing of sealed runtime
+    /// filters, from `[catalog.runtime_filters] bloom_probe` /
+    /// `bloom_max_values`.
+    runtime_filter_bloom_probe: bool,
+    runtime_filter_bloom_max_values: usize,
 }
 
 impl SqeTableProvider {
@@ -81,6 +86,8 @@ impl SqeTableProvider {
             runtime_filter_clustering_skip: false,
             runtime_filter_uniform_threshold: 0.8,
             runtime_filter_wait_ms: crate::iceberg_scan::DEFAULT_RUNTIME_FILTER_WAIT_MS,
+            runtime_filter_bloom_probe: true,
+            runtime_filter_bloom_max_values: 65536,
         })
     }
 
@@ -131,6 +138,16 @@ impl SqeTableProvider {
     #[must_use = "with_runtime_filter_wait_ms consumes self; bind the returned provider"]
     pub fn with_runtime_filter_wait_ms(mut self, wait_ms: u64) -> Self {
         self.runtime_filter_wait_ms = wait_ms;
+        self
+    }
+
+    /// Bloom-filter (SBBF) row-group probing of sealed runtime filters
+    /// (issue #369), from `[catalog.runtime_filters]`. Threads through to
+    /// `IcebergScanExec`.
+    #[must_use = "with_runtime_filter_bloom consumes self; bind the returned provider"]
+    pub fn with_runtime_filter_bloom(mut self, enabled: bool, max_values: usize) -> Self {
+        self.runtime_filter_bloom_probe = enabled;
+        self.runtime_filter_bloom_max_values = max_values;
         self
     }
 
@@ -261,7 +278,11 @@ impl TableProvider for SqeTableProvider {
                 self.runtime_filter_clustering_skip,
                 self.runtime_filter_uniform_threshold,
             )
-            .with_runtime_filter_wait_ms(self.runtime_filter_wait_ms);
+            .with_runtime_filter_wait_ms(self.runtime_filter_wait_ms)
+            .with_runtime_filter_bloom(
+                self.runtime_filter_bloom_probe,
+                self.runtime_filter_bloom_max_values,
+            );
 
         // Pre-compute per-column min/max/null_count from manifest entries so
         // DataFusion's join-order optimizer sees real selectivity and picks

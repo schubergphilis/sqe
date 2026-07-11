@@ -1534,6 +1534,25 @@ pub struct RuntimeFiltersConfig {
     /// Default: 100.
     #[serde(default = "default_runtime_filter_wait_ms")]
     pub wait_ms: u64,
+    /// Probe parquet bloom filters (SBBF) with sealed runtime-filter key
+    /// sets during row-group pruning (issue #369). Stats-based pruning
+    /// gives up on IN sets above 200 literals, so join key sets get no
+    /// row-group pruning without this. Only fires on columns that carry
+    /// bloom filters (`write.parquet.bloom-filter-columns`); a row group
+    /// is pruned only when every key tests bloom-negative.
+    ///
+    /// Default: true. Disable for A/B runs without reloading data.
+    #[serde(default = "default_runtime_filter_bloom_probe")]
+    pub bloom_probe: bool,
+    /// Cap on the number of keys a membership conjunct may carry and
+    /// still be bloom-probed. Probe cost is O(keys) per row group in the
+    /// all-negative (prune) case. Matches the runtime-filter InList
+    /// emission cap so every sealed filter that reaches the reader is
+    /// probeable by default.
+    ///
+    /// Default: 65536.
+    #[serde(default = "default_runtime_filter_bloom_max_values")]
+    pub bloom_max_values: usize,
 }
 
 impl Default for RuntimeFiltersConfig {
@@ -1542,8 +1561,18 @@ impl Default for RuntimeFiltersConfig {
             clustering_skip_enabled: false,
             uniform_threshold: default_runtime_filter_uniform_threshold(),
             wait_ms: default_runtime_filter_wait_ms(),
+            bloom_probe: default_runtime_filter_bloom_probe(),
+            bloom_max_values: default_runtime_filter_bloom_max_values(),
         }
     }
+}
+
+fn default_runtime_filter_bloom_probe() -> bool {
+    true
+}
+
+fn default_runtime_filter_bloom_max_values() -> usize {
+    65536
 }
 
 fn default_runtime_filter_uniform_threshold() -> f64 {

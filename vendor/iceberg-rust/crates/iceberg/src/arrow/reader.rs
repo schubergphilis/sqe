@@ -46,7 +46,8 @@ use parquet::file::metadata::{
 };
 use parquet::schema::types::{SchemaDescriptor, Type as ParquetType};
 
-use std::sync::atomic::AtomicU64;
+// SQE PATCH (sqe#369): `Ordering` for the bloom-pruned counter.
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::arrow::caching_delete_file_loader::CachingDeleteFileLoader;
 use crate::arrow::int96::coerce_int96_timestamps;
@@ -58,6 +59,8 @@ use crate::error::Result;
 use crate::expr::visitors::bound_predicate_visitor::{BoundPredicateVisitor, visit};
 use crate::expr::visitors::page_index_evaluator::PageIndexEvaluator;
 use crate::expr::visitors::row_group_metrics_evaluator::RowGroupMetricsEvaluator;
+// SQE PATCH (sqe#369): bloom-filter row-group probing.
+use crate::expr::visitors::sbbf_row_group_evaluator::SbbfRowGroupEvaluator;
 use crate::expr::{Bind, BoundPredicate, BoundReference, DynamicPredicate};
 use crate::io::{FileIO, FileMetadata, FileRead};
 use crate::metadata_columns::{RESERVED_FIELD_ID_FILE, is_metadata_field};
@@ -107,6 +110,9 @@ pub struct ArrowReaderBuilder {
     dynamic_predicate: Option<Arc<dyn DynamicPredicate>>,
     task_split_target_size: Option<u64>,
     decode_gate: Option<Arc<dyn DecodeGate>>,
+    // SQE PATCH (sqe#369): parquet bloom-filter (SBBF) row-group probing.
+    bloom_filter_probing_enabled: bool,
+    bloom_probe_max_values: usize,
 }
 
 impl ArrowReaderBuilder {
@@ -124,7 +130,27 @@ impl ArrowReaderBuilder {
             dynamic_predicate: None,
             task_split_target_size: Some(DEFAULT_TASK_SPLIT_TARGET_SIZE),
             decode_gate: None,
+            bloom_filter_probing_enabled: true,
+            bloom_probe_max_values:
+                crate::expr::sbbf_row_group_evaluator::DEFAULT_BLOOM_PROBE_MAX_VALUES,
         }
+    }
+
+    /// SQE PATCH (sqe#369): enable or disable parquet bloom-filter
+    /// (SBBF) row-group probing for positive membership conjuncts
+    /// (`IN` sets / equality literals, including sealed hash-join
+    /// runtime filters). Requires row group filtering to be enabled
+    /// and blooms present in the file; both are checked per row group.
+    pub fn with_bloom_filter_probing_enabled(mut self, enabled: bool) -> Self {
+        self.bloom_filter_probing_enabled = enabled;
+        self
+    }
+
+    /// SQE PATCH (sqe#369): cap on the number of literals a membership
+    /// conjunct may carry and still be bloom-probed.
+    pub fn with_bloom_probe_max_values(mut self, max_values: usize) -> Self {
+        self.bloom_probe_max_values = max_values;
+        self
     }
 
     /// SQE PATCH (sqe#367): attach a [`DecodeGate`] consulted before each
@@ -206,6 +232,8 @@ impl ArrowReaderBuilder {
             dynamic_predicate: self.dynamic_predicate,
             task_split_target_size: self.task_split_target_size,
             decode_gate: self.decode_gate,
+            bloom_filter_probing_enabled: self.bloom_filter_probing_enabled,
+            bloom_probe_max_values: self.bloom_probe_max_values,
         }
     }
 }
@@ -233,6 +261,12 @@ pub struct ArrowReader {
     /// SQE PATCH (sqe#367): optional decode admission gate. See
     /// [`ArrowReaderBuilder::with_decode_gate`].
     decode_gate: Option<Arc<dyn DecodeGate>>,
+    /// SQE PATCH (sqe#369): parquet bloom-filter (SBBF) row-group
+    /// probing. See [`ArrowReaderBuilder::with_bloom_filter_probing_enabled`].
+    bloom_filter_probing_enabled: bool,
+    /// SQE PATCH (sqe#369): see
+    /// [`ArrowReaderBuilder::with_bloom_probe_max_values`].
+    bloom_probe_max_values: usize,
 }
 
 impl ArrowReader {
@@ -252,6 +286,9 @@ impl ArrowReader {
         let dynamic_predicate = self.dynamic_predicate.clone();
         let task_split_target_size = self.task_split_target_size;
         let decode_gate = self.decode_gate.clone();
+        // SQE PATCH (sqe#369)
+        let bloom_filter_probing_enabled = self.bloom_filter_probing_enabled;
+        let bloom_probe_max_values = self.bloom_probe_max_values;
 
         // Per-scan I/O metrics.  Cloned into both the data-file path
         // (`process_file_scan_task`) and the delete-file loader so the
@@ -262,6 +299,8 @@ impl ArrowReader {
             .clone()
             .with_scan_metrics(scan_metrics.clone());
         let bytes_read = scan_metrics.bytes_read_counter().clone();
+        // SQE PATCH (sqe#369)
+        let row_groups_pruned_bloom = scan_metrics.row_groups_pruned_bloom_counter().clone();
 
         // Fast-path for single concurrency to avoid overhead of try_flatten_unordered.
         // SQE PATCH (sqe#367): a decode gate forces the general path (with an
@@ -275,6 +314,8 @@ impl ArrowReader {
                         let file_io = file_io.clone();
                         let dynamic_predicate = dynamic_predicate.clone();
                         let bytes_read = bytes_read.clone();
+                        // SQE PATCH (sqe#369)
+                        let row_groups_pruned_bloom = row_groups_pruned_bloom.clone();
 
                         Self::process_file_scan_task(
                             task,
@@ -286,6 +327,9 @@ impl ArrowReader {
                             metadata_size_hint,
                             dynamic_predicate,
                             bytes_read,
+                            bloom_filter_probing_enabled,
+                            bloom_probe_max_values,
+                            row_groups_pruned_bloom,
                         )
                     })
                     .map_err(|err| {
@@ -362,6 +406,8 @@ impl ArrowReader {
                         let delete_file_loader = delete_file_loader.clone();
                         let dynamic_predicate = dynamic_predicate.clone();
                         let bytes_read = bytes_read.clone();
+                        // SQE PATCH (sqe#369)
+                        let row_groups_pruned_bloom = row_groups_pruned_bloom.clone();
                         crate::runtime::spawn(async move {
                             let _permit = permit;
                             // SQE PATCH (sqe#367): held until every batch of
@@ -378,6 +424,9 @@ impl ArrowReader {
                                 metadata_size_hint,
                                 dynamic_predicate,
                                 bytes_read,
+                                bloom_filter_probing_enabled,
+                                bloom_probe_max_values,
+                                row_groups_pruned_bloom,
                             )
                             .await;
                             match stream {
@@ -415,6 +464,11 @@ impl ArrowReader {
         metadata_size_hint: Option<usize>,
         dynamic_predicate: Option<Arc<dyn DynamicPredicate>>,
         bytes_read: Arc<AtomicU64>,
+        // SQE PATCH (sqe#369): bloom-filter row-group probing controls
+        // and the pruned-row-group counter reported via `ScanMetrics`.
+        bloom_filter_probing_enabled: bool,
+        bloom_probe_max_values: usize,
+        row_groups_pruned_bloom: Arc<AtomicU64>,
     ) -> Result<ArrowRecordBatchStream> {
         let should_load_page_index =
             (row_selection_enabled && task.predicate.is_some()) || !task.deletes.is_empty();
@@ -668,6 +722,73 @@ impl ArrowReader {
                     }
                     None => Some(predicate_filtered_row_groups),
                 };
+            }
+
+            // SQE PATCH (sqe#369): parquet bloom-filter (SBBF) row-group
+            // pruning for positive membership conjuncts, AFTER the stats
+            // path. The stats evaluator gives up on IN sets above 200
+            // literals, so a sealed hash-join runtime filter (up to
+            // 65536 keys) gets no row-group pruning from min/max alone.
+            // For each surviving row group and each membership conjunct
+            // whose column carries a bloom filter, prune the row group
+            // only when EVERY key tests bloom-negative; a single
+            // bloom-positive hit short-circuits to keep it. Bloom
+            // filters are loaded lazily (one ranged read per probed
+            // (row group, column) with an offset present); missing
+            // blooms and read errors keep the row group.
+            if bloom_filter_probing_enabled && row_group_filtering_enabled {
+                let conjuncts = SbbfRowGroupEvaluator::collect(
+                    &predicate,
+                    &field_id_map,
+                    bloom_probe_max_values,
+                );
+                if !conjuncts.is_empty() {
+                    let candidates: Vec<usize> = match &selected_row_group_indices {
+                        Some(selected) => selected.clone(),
+                        None => {
+                            (0..record_batch_stream_builder.metadata().num_row_groups())
+                                .collect()
+                        }
+                    };
+                    let mut kept = Vec::with_capacity(candidates.len());
+                    for rg_idx in candidates {
+                        let mut prune = false;
+                        for conjunct in &conjuncts {
+                            let has_bloom = record_batch_stream_builder
+                                .metadata()
+                                .row_group(rg_idx)
+                                .column(conjunct.parquet_column_index)
+                                .bloom_filter_offset()
+                                .is_some();
+                            if !has_bloom {
+                                continue;
+                            }
+                            let sbbf = match record_batch_stream_builder
+                                .get_row_group_column_bloom_filter(
+                                    rg_idx,
+                                    conjunct.parquet_column_index,
+                                )
+                                .await
+                            {
+                                Ok(Some(sbbf)) => sbbf,
+                                // No bloom or a read failure: pruning is
+                                // an optimization, never a correctness
+                                // requirement, so keep the row group.
+                                Ok(None) | Err(_) => continue,
+                            };
+                            if conjunct.all_absent(&sbbf) {
+                                prune = true;
+                                break;
+                            }
+                        }
+                        if prune {
+                            row_groups_pruned_bloom.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            kept.push(rg_idx);
+                        }
+                    }
+                    selected_row_group_indices = Some(kept);
+                }
             }
 
             if row_selection_enabled {

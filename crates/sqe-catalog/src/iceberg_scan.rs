@@ -177,6 +177,13 @@ pub struct IcebergScanExec {
     /// to seal before scan-time pruning samples them. Sourced from
     /// `[catalog.runtime_filters] wait_ms`. 0 disables. Default 100.
     runtime_filter_wait_ms: u64,
+    /// Issue #369: probe parquet bloom filters (SBBF) with sealed
+    /// runtime-filter key sets during row-group pruning. Sourced from
+    /// `[catalog.runtime_filters] bloom_probe`. Default true.
+    runtime_filter_bloom_probe: bool,
+    /// Issue #369: cap on keys per membership conjunct for bloom probing.
+    /// Sourced from `[catalog.runtime_filters] bloom_max_values`. Default 65536.
+    runtime_filter_bloom_max_values: usize,
     /// Decode-concurrency permits shared by every partition (and every
     /// optimizer-rule clone) of this scan node, sized `num_cpus`. Without
     /// it each partition's reader brings its own `num_cpus`-wide semaphore,
@@ -257,7 +264,7 @@ impl IcebergScanExec {
         let decode_permits = Arc::new(tokio::sync::Semaphore::new(
             std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8),
         ));
-        Self { table, projected_schema, projection, predicates, df_filters, properties, metrics: ExecutionPlanMetricsSet::new(), snapshot_id: None, trust_sort_order: false, small_file_threshold_bytes: DEFAULT_SMALL_FILE_THRESHOLD_BYTES, pushed_down_filters: vec![], manifest_concurrency: DEFAULT_MANIFEST_CONCURRENCY, direct_read_concurrency: DEFAULT_DIRECT_READ_CONCURRENCY, target_partitions: DEFAULT_TARGET_PARTITIONS, cached_statistics: None, runtime_filter_clustering_skip: false, runtime_filter_uniform_threshold: 0.8, runtime_filter_wait_ms: DEFAULT_RUNTIME_FILTER_WAIT_MS, decode_permits }
+        Self { table, projected_schema, projection, predicates, df_filters, properties, metrics: ExecutionPlanMetricsSet::new(), snapshot_id: None, trust_sort_order: false, small_file_threshold_bytes: DEFAULT_SMALL_FILE_THRESHOLD_BYTES, pushed_down_filters: vec![], manifest_concurrency: DEFAULT_MANIFEST_CONCURRENCY, direct_read_concurrency: DEFAULT_DIRECT_READ_CONCURRENCY, target_partitions: DEFAULT_TARGET_PARTITIONS, cached_statistics: None, runtime_filter_clustering_skip: false, runtime_filter_uniform_threshold: 0.8, runtime_filter_wait_ms: DEFAULT_RUNTIME_FILTER_WAIT_MS, runtime_filter_bloom_probe: true, runtime_filter_bloom_max_values: 65536, decode_permits }
     }
 
     /// Attach pre-computed statistics aggregated from Iceberg manifests.
@@ -326,6 +333,16 @@ impl IcebergScanExec {
     pub fn with_runtime_filter_clustering(mut self, skip: bool, uniform_threshold: f64) -> Self {
         self.runtime_filter_clustering_skip = skip;
         self.runtime_filter_uniform_threshold = uniform_threshold;
+        self
+    }
+
+    /// Issue #369: bloom-filter (SBBF) row-group probing of sealed
+    /// runtime-filter key sets. `enabled` toggles the probe (A/B without
+    /// reloading data); `max_values` caps the keys per conjunct.
+    #[must_use = "with_runtime_filter_bloom consumes self; bind the returned scan"]
+    pub fn with_runtime_filter_bloom(mut self, enabled: bool, max_values: usize) -> Self {
+        self.runtime_filter_bloom_probe = enabled;
+        self.runtime_filter_bloom_max_values = max_values;
         self
     }
 
@@ -428,6 +445,8 @@ impl IcebergScanExec {
             runtime_filter_clustering_skip: self.runtime_filter_clustering_skip,
             runtime_filter_uniform_threshold: self.runtime_filter_uniform_threshold,
             runtime_filter_wait_ms: self.runtime_filter_wait_ms,
+            runtime_filter_bloom_probe: self.runtime_filter_bloom_probe,
+            runtime_filter_bloom_max_values: self.runtime_filter_bloom_max_values,
             // Shared, not fresh: the rebuilt scan reads the same table in the
             // same query, so it stays under the same decode budget.
             decode_permits: self.decode_permits.clone(),
@@ -836,6 +855,8 @@ impl ExecutionPlan for IcebergScanExec {
         let runtime_filter_clustering_skip = self.runtime_filter_clustering_skip;
         let runtime_filter_uniform_threshold = self.runtime_filter_uniform_threshold;
         let runtime_filter_wait_ms = self.runtime_filter_wait_ms;
+        let runtime_filter_bloom_probe = self.runtime_filter_bloom_probe;
+        let runtime_filter_bloom_max_values = self.runtime_filter_bloom_max_values;
         // Decode admission (issue #367): every partition shares this scan
         // node's permits, and each admitted decode reserves its estimated
         // working set against the query's memory pool so pressure fails
@@ -866,6 +887,7 @@ impl ExecutionPlan for IcebergScanExec {
         let rows_passed_filter_pending = MetricBuilder::new(&self.metrics).counter("rows_passed_filter_pending", partition);
         let dynamic_filters_resolved = MetricBuilder::new(&self.metrics).counter("dynamic_filters_resolved", partition);
         let dynamic_filters_pending = MetricBuilder::new(&self.metrics).counter("dynamic_filters_pending", partition);
+        let row_groups_pruned_bloom = MetricBuilder::new(&self.metrics).counter("row_groups_pruned_bloom", partition);
         let filter_wait_time = MetricBuilder::new(&self.metrics).subset_time("filter_wait_time", partition);
         debug!(table=%table.identifier(), predicates=?predicates, snapshot_id=?snapshot_id, pushed_filters=pushed_down_filters.len(), "Executing IcebergScanExec");
 
@@ -1304,6 +1326,12 @@ impl ExecutionPlan for IcebergScanExec {
             // decodes share the scan-wide permit budget and reserve their
             // estimated working set against the query pool.
             sb = sb.with_decode_gate(Arc::clone(&decode_gate) as Arc<dyn DecodeGate>);
+            // Bloom-filter row-group probing (issue #369): the vendored
+            // reader tests sealed runtime-filter key sets against parquet
+            // SBBFs and prunes row groups where every key is bloom-negative.
+            sb = sb
+                .with_bloom_filter_probing_enabled(runtime_filter_bloom_probe)
+                .with_bloom_probe_max_values(runtime_filter_bloom_max_values);
             // Two-tier dynamic-filter pushdown.
             //
             // Tier 1 (scan-time): the DynamicPredicate is sampled once
@@ -1580,7 +1608,7 @@ impl ExecutionPlan for IcebergScanExec {
             // Flush the vendored reader's storage byte counter into the
             // DataFusion metric when the stream completes or is dropped, so
             // early-terminated scans (LIMIT, join short-circuit) still report.
-            let flush = BytesScannedFlush { scan_metrics, counter: bytes_scanned.clone() };
+            let flush = BytesScannedFlush { scan_metrics, counter: bytes_scanned.clone(), bloom_pruned_counter: row_groups_pruned_bloom.clone() };
             let s: BatchStream = s
                 .chain(futures::stream::poll_fn(move |_| {
                     let _keep_alive = &flush;
@@ -2143,6 +2171,9 @@ fn is_trivial_true(expr: &Arc<dyn PhysicalExpr>) -> bool {
 struct BytesScannedFlush {
     scan_metrics: iceberg::arrow::ScanMetrics,
     counter: datafusion::physical_plan::metrics::Count,
+    /// Issue #369: row groups pruned by bloom-filter probing, flushed
+    /// alongside the byte counter so EXPLAIN ANALYZE reports it.
+    bloom_pruned_counter: datafusion::physical_plan::metrics::Count,
 }
 
 impl Drop for BytesScannedFlush {
@@ -2150,6 +2181,10 @@ impl Drop for BytesScannedFlush {
         let bytes = self.scan_metrics.bytes_read();
         if bytes > 0 {
             self.counter.add(bytes as usize);
+        }
+        let pruned = self.scan_metrics.row_groups_pruned_bloom();
+        if pruned > 0 {
+            self.bloom_pruned_counter.add(pruned as usize);
         }
     }
 }
