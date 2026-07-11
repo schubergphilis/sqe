@@ -196,6 +196,8 @@ pub fn dashboard_audit_event(
         }),
         session_id: None,
         client_ip,
+        trace_id: None,
+        query_id: None,
         integrity: Integrity::default(),
     })
 }

@@ -137,6 +137,8 @@ pub fn maybe_warn_superdebug(audit: &sqe_metrics::audit::AuditLogger, config: &s
         }),
         session_id: None,
         client_ip: None,
+        trace_id: None,
+        query_id: None,
         integrity: sqe_metrics::audit::Integrity::default(),
     };
     audit.log_event(event);

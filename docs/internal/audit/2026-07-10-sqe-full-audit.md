@@ -495,3 +495,14 @@ See Prioritized Action Plan above and nextsteps.md for current NEXT pointers. Th
 
 See plan.md for details. Previous MRs: !625 (DML PolicyAudit), !626 (trace/query_id on AuditEvent).
 
+## 2026-07-11 Session Progress (otel/trace wiring)
+- Added `sqe_metrics::propagation::current_trace_id()` helper.
+- Extended `AuditEvent` with `trace_id` + `query_id` (with serde skip, test updates).
+- Wired capture + population in query_handler (buffered + streaming paths), StreamFinalizer, maintenance, web_auth, lib small emit, and OCSF tests.
+- All AuditEvent literals updated; legacy path uses None.
+- This advances O4 (trace_id on audit events). Root spans (O3) follow-up on same branch or next (info_span skeleton + instrument on execute_query / policy paths).
+- MR will be created for this change set.
+- Also see companion MR !625 for unconditional DML PolicyAudit (P0/O2).
+
+Next per plan: root spans, maintenance OL, Trino trace headers.
+
