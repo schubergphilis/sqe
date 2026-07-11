@@ -3346,10 +3346,15 @@ impl WriteHandler {
         ctx.register_table(&qualified_source_ref, Arc::new(source_mem))
             .map_err(|e| SqeError::Execution(format!("Failed to register source MemTable: {e}")))?;
 
-        // Rewrite the ON condition to use our MemTable names instead of aliases
-        let on_rewritten = on_sql
-            .replace(&format!("{t_alias}."), &format!("{target_table_ref}."))
-            .replace(&format!("{s_alias}."), &format!("{source_table_ref}."));
+        // Rewrite the ON condition to use our MemTable names instead of
+        // aliases, using the same identifier-aware rewriter as the clause
+        // predicates so an alias cannot fire inside a substring, dotted path,
+        // or string literal.
+        let on_rewritten = crate::merge_sql::replace_alias_qualifier(
+            &crate::merge_sql::replace_alias_qualifier(&on_sql, &t_alias, &target_table_ref),
+            &s_alias,
+            &source_table_ref,
+        );
 
         let source_columns: Vec<String> = source_schema
             .fields()
@@ -3764,9 +3769,12 @@ impl WriteHandler {
             .map(|f| f.name().clone())
             .collect();
 
-        let on_rewritten = on_sql
-            .replace(&format!("{t_alias}."), &format!("{target_ref}."))
-            .replace(&format!("{s_alias}."), &format!("{source_ref}."));
+        // Identifier-aware ON rewrite (see the CoW path for rationale).
+        let on_rewritten = crate::merge_sql::replace_alias_qualifier(
+            &crate::merge_sql::replace_alias_qualifier(&on_sql, &t_alias, &target_ref),
+            &s_alias,
+            &source_ref,
+        );
 
         // Classify MERGE clauses.
         let mut matched_update: Option<&[sqlparser::ast::Assignment]> = None;
