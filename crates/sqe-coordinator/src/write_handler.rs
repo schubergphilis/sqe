@@ -554,6 +554,26 @@ async fn unique_table_location(
 /// Write handlers receive already-executed RecordBatches from the query pipeline
 /// and persist them as Iceberg data files via Parquet, then commit the changes
 /// through the Iceberg REST catalog.
+/// Snapshot-pinned scan plan for delete-aware DML rewrite reads (#371).
+/// Built by [`WriteHandler::plan_delete_aware_read`]; consumed per file by
+/// [`WriteHandler::read_data_file_applying_deletes`].
+struct DeleteAwareReadPlan {
+    scan: iceberg::scan::TableScan,
+    tasks_by_path: std::collections::HashMap<String, Vec<iceberg::scan::FileScanTask>>,
+}
+
+impl DeleteAwareReadPlan {
+    /// True when any planned data file carries delete files. The streaming
+    /// MERGE target path reads raw parquet and must downgrade to the
+    /// buffered (delete-applying) path when deletes exist.
+    fn has_deletes(&self) -> bool {
+        self.tasks_by_path
+            .values()
+            .flatten()
+            .any(|t| !t.deletes.is_empty())
+    }
+}
+
 pub struct WriteHandler {
     config: SqeConfig,
     metrics: Option<Arc<sqe_metrics::MetricsRegistry>>,
@@ -2057,10 +2077,13 @@ impl WriteHandler {
                 WriteCleanupGuard::new(table.file_io().clone(), tracker.clone(), "delete-cow")
                     .with_metrics(self.metrics.clone());
             let pool = ctx.runtime_env().memory_pool.clone();
+            let read_plan = self.plan_delete_aware_read(&table).await?;
 
             for data_file in &to_rewrite {
                 let file_path = data_file.file_path();
-                let batches = self.read_parquet_via_table(&table, file_path, ctx, true).await?;
+                let batches = self
+                    .read_data_file_applying_deletes(&read_plan, &table, file_path, ctx, true)
+                    .await?;
                 if batches.is_empty() {
                     continue;
                 }
@@ -2232,6 +2255,12 @@ impl WriteHandler {
         );
 
         // Scan each data file and collect (file_path, row_position) pairs for matching rows.
+        //
+        // This read is deliberately RAW (`read_parquet_via_table`, no delete
+        // application): position deletes address physical row offsets in the
+        // file, so applying existing delete files here would shift positions
+        // and delete the wrong rows. Re-marking an already-deleted position
+        // is harmless.
         let mut position_deletes: Vec<(String, i64)> = Vec::new();
 
         for data_file in &old_data_files {
@@ -2403,13 +2432,18 @@ impl WriteHandler {
 
         // Scan every data file and collect rows where WHERE matches. Equality
         // deletes need only the identifier columns, so we keep the full batch
-        // for now and let the writer project downstream.
+        // for now and let the writer project downstream. Deletes are applied
+        // during the read (#371) so already-deleted rows neither inflate the
+        // affected-row count nor emit redundant delete keys.
         let mut key_batches: Vec<RecordBatch> = Vec::new();
         let mut total_matched: usize = 0;
+        let read_plan = self.plan_delete_aware_read(&table).await?;
 
         for data_file in &old_data_files {
             let file_path = data_file.file_path().to_string();
-            let batches = self.read_parquet_via_table(&table, &file_path, ctx, true).await?;
+            let batches = self
+                .read_data_file_applying_deletes(&read_plan, &table, &file_path, ctx, true)
+                .await?;
             if batches.is_empty() {
                 continue;
             }
@@ -2655,10 +2689,13 @@ impl WriteHandler {
                 WriteCleanupGuard::new(table.file_io().clone(), tracker.clone(), "update-cow")
                     .with_metrics(self.metrics.clone());
             let pool = ctx.runtime_env().memory_pool.clone();
+            let read_plan = self.plan_delete_aware_read(&table).await?;
 
             for data_file in &to_rewrite {
                 let file_path = data_file.file_path();
-                let batches = self.read_parquet_via_table(&table, file_path, ctx, true).await?;
+                let batches = self
+                    .read_data_file_applying_deletes(&read_plan, &table, file_path, ctx, true)
+                    .await?;
                 if batches.is_empty() {
                     continue;
                 }
@@ -2907,10 +2944,15 @@ impl WriteHandler {
         let mut new_row_batches: Vec<RecordBatch> = Vec::new();
         let mut key_batches: Vec<RecordBatch> = Vec::new();
         let mut total_updated: usize = 0;
+        // Deletes applied during the read (#371): a row already removed by a
+        // delete file must not be matched and re-emitted as an updated row.
+        let read_plan = self.plan_delete_aware_read(&table).await?;
 
         for data_file in &old_data_files {
             let file_path = data_file.file_path().to_string();
-            let batches = self.read_parquet_via_table(&table, &file_path, ctx, true).await?;
+            let batches = self
+                .read_data_file_applying_deletes(&read_plan, &table, &file_path, ctx, true)
+                .await?;
             if batches.is_empty() {
                 continue;
             }
@@ -3115,6 +3157,7 @@ impl WriteHandler {
         let table = catalog.load_table(&table_ident).await?;
 
         let old_data_files = self.collect_data_files(&table).await?;
+        let read_plan = self.plan_delete_aware_read(&table).await?;
 
         // Build the target relation for the merge SELECT. Two paths:
         //  - Buffered (default): read the whole target into a pool-tracked Vec
@@ -3123,8 +3166,24 @@ impl WriteHandler {
         //    pinned `old_data_files` lazily so the target flows through the
         //    merge join as governed operator memory instead of a MemTable Vec.
         // See docs/internal/specs/2026-07-02-write-path-memory-safety-design.md.
-        let stream_target =
-            self.config.query.merge_target_streaming && self.config.query.write_buffer_tracking;
+        //
+        // The streaming provider decodes raw parquet, so it must stand down
+        // when the snapshot carries delete files (#371): rewriting a target
+        // read without its position/equality deletes applied resurrects
+        // MoR-deleted rows. The buffered path below applies them.
+        let stream_target = self.config.query.merge_target_streaming
+            && self.config.query.write_buffer_tracking
+            && !read_plan.has_deletes();
+        if self.config.query.merge_target_streaming
+            && self.config.query.write_buffer_tracking
+            && read_plan.has_deletes()
+        {
+            info!(
+                table = %table_ident,
+                "MERGE: target carries delete files; using the buffered \
+                 (delete-applying) path instead of the streaming provider"
+            );
+        }
 
         // Holds the Layer A target reservation alive to the end of the merge in
         // the buffered path (the MemTable clones its Arc-backed batches). None
@@ -3167,7 +3226,7 @@ impl WriteHandler {
                 // `merge-target-buffer` just below, so tracking the decode here
                 // too would double-count the same bytes.
                 let batches = self
-                    .read_parquet_via_table(&table, file_path, ctx, false)
+                    .read_data_file_applying_deletes(&read_plan, &table, file_path, ctx, false)
                     .await?;
                 for batch in batches {
                     target_buf.push(batch)?;
@@ -3684,10 +3743,13 @@ impl WriteHandler {
             "merge-eq-target-buffer",
             self.config.query.write_buffer_tracking,
         );
+        // Deletes applied during the read (#371): an already-deleted target
+        // row must not join as MATCHED and be re-emitted by the RowDelta.
+        let read_plan = self.plan_delete_aware_read(&table).await?;
         for data_file in &old_data_files {
             let file_path = data_file.file_path();
             let batches = self
-                .read_parquet_via_table(&table, file_path, ctx, false)
+                .read_data_file_applying_deletes(&read_plan, &table, file_path, ctx, false)
                 .await?;
             for batch in batches {
                 target_buf.push(batch)?;
@@ -4285,6 +4347,102 @@ impl WriteHandler {
         };
 
         Ok(batches)
+    }
+
+    /// Plan a snapshot-pinned, delete-aware read for a DML rewrite (#371).
+    ///
+    /// `read_parquet_via_table` decodes a data file's raw bytes, which
+    /// silently resurrects rows already removed by position/equality delete
+    /// files: a MoR DELETE followed by a CoW UPDATE/DELETE/MERGE rewrote the
+    /// deleted rows back into the table. This plan routes per-file rewrite
+    /// reads through the Iceberg scan machinery instead, so every file's
+    /// applicable delete files are applied during the read.
+    ///
+    /// Plan once per commit attempt, right after each `collect_data_files`
+    /// on the same loaded table, so the task set matches the snapshot whose
+    /// files the rewrite deletes.
+    async fn plan_delete_aware_read(
+        &self,
+        table: &IcebergTable,
+    ) -> sqe_core::Result<DeleteAwareReadPlan> {
+        let scan = table.scan().select_all().build().map_err(|e| {
+            SqeError::Execution(format!("Failed to build rewrite read scan: {e}"))
+        })?;
+        let tasks: Vec<iceberg::scan::FileScanTask> = scan
+            .plan_files()
+            .await
+            .map_err(|e| SqeError::Execution(format!("Failed to plan rewrite read: {e}")))?
+            .try_collect()
+            .await
+            .map_err(|e| SqeError::Execution(format!("Failed to plan rewrite read: {e}")))?;
+        let mut tasks_by_path: std::collections::HashMap<String, Vec<iceberg::scan::FileScanTask>> =
+            std::collections::HashMap::new();
+        for task in tasks {
+            tasks_by_path
+                .entry(task.data_file_path.clone())
+                .or_default()
+                .push(task);
+        }
+        Ok(DeleteAwareReadPlan { scan, tasks_by_path })
+    }
+
+    /// Read one data file with its delete files applied, for CoW/MoR
+    /// rewrites. Memory-tracking contract matches `read_parquet_via_table`:
+    /// with `track` the decoded batches are reserved against the query pool
+    /// while buffered here; callers that re-accumulate pass `track = false`.
+    async fn read_data_file_applying_deletes(
+        &self,
+        plan: &DeleteAwareReadPlan,
+        table: &IcebergTable,
+        file_path: &str,
+        ctx: &DFSessionContext,
+        track: bool,
+    ) -> sqe_core::Result<Vec<RecordBatch>> {
+        let Some(tasks) = plan.tasks_by_path.get(file_path) else {
+            // Not in the planned snapshot. Unreachable when planned against
+            // the same table load as `collect_data_files`; raw read keeps
+            // the pre-#371 behaviour rather than failing the DML.
+            warn!(
+                file_path,
+                "delete-aware read: file missing from scan plan; falling back to raw read"
+            );
+            return self.read_parquet_via_table(table, file_path, ctx, track).await;
+        };
+        let stream: iceberg::scan::FileScanTaskStream =
+            Box::pin(futures::stream::iter(tasks.clone().into_iter().map(Ok)));
+        let result = plan
+            .scan
+            .read_tasks_to_arrow_with_metrics(stream)
+            .map_err(|e| {
+                SqeError::Execution(format!("Failed to read data file '{file_path}': {e}"))
+            })?;
+        let mut batch_stream = result.stream();
+
+        let pool = if track && self.config.query.write_buffer_tracking {
+            Some(ctx.runtime_env().memory_pool.clone())
+        } else {
+            None
+        };
+        let mut batches: Vec<RecordBatch> = Vec::new();
+        let mut buf = pool
+            .as_ref()
+            .map(|p| TrackedBatchBuffer::new(p, "cow-decode-buffer"));
+        while let Some(item) = batch_stream.next().await {
+            let batch = item.map_err(|e| {
+                SqeError::Execution(format!("Failed to read data file '{file_path}': {e}"))
+            })?;
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            match buf.as_mut() {
+                Some(b) => b.push(batch)?,
+                None => batches.push(batch),
+            }
+        }
+        Ok(match buf {
+            Some(b) => b.into_inner(),
+            None => batches,
+        })
     }
 
     /// Evaluate a WHERE clause against a RecordBatch and return rows that do NOT match.
