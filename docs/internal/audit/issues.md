@@ -209,11 +209,15 @@ let cache_key = format!("{}:{}", session.user.username, &fingerprint[..16]);
 ### R3 — HIGH: `.expect()` in S3 Range Coalescing
 
 **Severity:** High
-**File:** `crates/sqe-catalog/src/s3_io.rs:191`
+**Status:** Addressed by refactor (no such expect remains in current code).
 
-**What's wrong:** `.expect("every original range must be covered by a coalesced range")`. Reachable with corrupt or overlapping Parquet column chunk metadata.
+**Original:** File `crates/sqe-catalog/src/s3_io.rs:191` (file has been refactored/removed; logic consolidated).
 
-**How to fix:** Replace with `.ok_or_else(...)` returning a proper `object_store::Error`.
+**What's wrong (historical):** `.expect("every original range must be covered by a coalesced range")`. Reachable with corrupt or overlapping Parquet column chunk metadata.
+
+**Current state:** Byte-range splitting and file coalescing now live in `iceberg_scan.rs` (`file_byte_splits`, `coalesce_file_entries`, `ordered_split_ranges`). The tiling invariant ("ranges tile [0, size) with no gap or overlap") is enforced by construction in the math (div_ceil + collect); no panicking expect on "coverage by coalesced".
+
+**Remediation:** Audit item satisfied by the structural change. Added this note for traceability. If future byte-range coalescing for multi-chunk GETs is added, use `Result` + `object_store::Error` (or SqeError) instead of expect.
 
 ---
 
