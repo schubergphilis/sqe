@@ -2141,7 +2141,7 @@ impl WriteHandler {
             for data_file in &to_rewrite {
                 let file_path = data_file.file_path();
                 let batches = self
-                    .read_data_file_applying_deletes(&read_plan, &table, file_path, ctx, true)
+                    .read_data_file_applying_deletes(&read_plan,file_path, ctx, true)
                     .await?;
                 if batches.is_empty() {
                     continue;
@@ -2503,7 +2503,7 @@ impl WriteHandler {
         for data_file in &old_data_files {
             let file_path = data_file.file_path().to_string();
             let batches = self
-                .read_data_file_applying_deletes(&read_plan, &table, &file_path, ctx, true)
+                .read_data_file_applying_deletes(&read_plan,&file_path, ctx, true)
                 .await?;
             if batches.is_empty() {
                 continue;
@@ -2766,7 +2766,7 @@ impl WriteHandler {
             for data_file in &to_rewrite {
                 let file_path = data_file.file_path();
                 let batches = self
-                    .read_data_file_applying_deletes(&read_plan, &table, file_path, ctx, true)
+                    .read_data_file_applying_deletes(&read_plan,file_path, ctx, true)
                     .await?;
                 if batches.is_empty() {
                     continue;
@@ -3034,7 +3034,7 @@ impl WriteHandler {
         for data_file in &old_data_files {
             let file_path = data_file.file_path().to_string();
             let batches = self
-                .read_data_file_applying_deletes(&read_plan, &table, &file_path, ctx, true)
+                .read_data_file_applying_deletes(&read_plan,&file_path, ctx, true)
                 .await?;
             if batches.is_empty() {
                 continue;
@@ -3309,7 +3309,7 @@ impl WriteHandler {
                 // `merge-target-buffer` just below, so tracking the decode here
                 // too would double-count the same bytes.
                 let batches = self
-                    .read_data_file_applying_deletes(&read_plan, &table, file_path, ctx, false)
+                    .read_data_file_applying_deletes(&read_plan,file_path, ctx, false)
                     .await?;
                 for batch in batches {
                     target_buf.push(batch)?;
@@ -3765,7 +3765,7 @@ impl WriteHandler {
         for data_file in &old_data_files {
             let file_path = data_file.file_path();
             let batches = self
-                .read_data_file_applying_deletes(&read_plan, &table, file_path, ctx, false)
+                .read_data_file_applying_deletes(&read_plan,file_path, ctx, false)
                 .await?;
             for batch in batches {
                 target_buf.push(batch)?;
@@ -4294,20 +4294,24 @@ impl WriteHandler {
     async fn read_data_file_applying_deletes(
         &self,
         plan: &DeleteAwareReadPlan,
-        table: &IcebergTable,
         file_path: &str,
         ctx: &DFSessionContext,
         track: bool,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         let Some(tasks) = plan.tasks_by_path.get(file_path) else {
-            // Not in the planned snapshot. Unreachable when planned against
-            // the same table load as `collect_data_files`; raw read keeps
-            // the pre-#371 behaviour rather than failing the DML.
-            warn!(
-                file_path,
-                "delete-aware read: file missing from scan plan; falling back to raw read"
-            );
-            return self.read_parquet_via_table(table, file_path, ctx, track).await;
+            // The file came from `collect_data_files` but is absent from the
+            // scan plan's `tasks_by_path`. That should be unreachable when both
+            // are derived from the same table load, but if a storage backend
+            // normalises `data_file_path` differently between the manifest
+            // entry and the scan task, silently raw-reading here would drop the
+            // file's delete files and resurrect deleted rows. Fail loud instead
+            // (see !576 review): a wrong DML result is worse than an error.
+            return Err(SqeError::Execution(format!(
+                "delete-aware read: data file '{file_path}' is missing from the \
+                 scan plan; refusing to read it without its delete files (this \
+                 indicates a data-file path mismatch between the manifest and \
+                 the scan planner)"
+            )));
         };
         let stream: iceberg::scan::FileScanTaskStream =
             Box::pin(futures::stream::iter(tasks.clone().into_iter().map(Ok)));
