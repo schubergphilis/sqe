@@ -725,6 +725,7 @@ impl QueryHandler {
             &session.id,
             client_ip.as_deref(),
             session.user.roles.clone(),
+            trace_id.clone(),
         );
 
         // OpenLineage: emit START event. The observer is sync and best-effort;
@@ -2052,6 +2053,7 @@ impl QueryHandler {
             sql_length = sql.len(),
             "Starting streaming query"
         );
+        let trace_id = sqe_metrics::propagation::current_trace_id();
         let cancel_token = self.query_tracker.start(
             query_id,
             &session.user.username,
@@ -2060,6 +2062,7 @@ impl QueryHandler {
             &session.id,
             client_ip.as_deref(),
             session.user.roles.clone(),
+            trace_id.clone(),
         );
 
         match self.open_stream(session, sql, &query_id, start).await {
@@ -2485,6 +2488,7 @@ impl QueryHandler {
         let sql = sql.as_str();
 
         // Plan the query via DataFusion's SQL planner
+        let _plan_span = tracing::info_span!("sqe.plan", query_id = %query_id);
         let df = ctx
             .sql(sql)
             .await
