@@ -88,6 +88,35 @@ them quickly.
    Survived the `813e544` refresh (issue #370) via auto-merge; verify the
    `SQE PATCH (sqe#367)` markers on the next refresh too. Not filed
    upstream yet.
+8. **Bloom-filter (SBBF) row-group probing (SQE issue #369)**: after
+   stats-based row-group pruning, the reader tests positive membership
+   conjuncts (`IN` sets / equality literals, including sealed hash-join
+   runtime filters routed through the `DynamicPredicate` of family 1)
+   against each surviving row group's parquet bloom filter and prunes
+   the row group when EVERY key tests bloom-negative. The stats path
+   gives up on `IN` above 200 literals, so large runtime-filter key
+   sets get no row-group pruning without this. Conjuncts are collected
+   from positive `AND` positions only (`OR`/`NOT` subtrees ignored) so
+   negated equality-delete predicates can never cause unsound pruning.
+   Blooms load lazily via parquet's async
+   `get_row_group_column_bloom_filter`; missing blooms and read errors
+   keep the row group. Toggle and cap ride on
+   `ArrowReaderBuilder::with_bloom_filter_probing_enabled` /
+   `with_bloom_probe_max_values` (and the `TableScanBuilder`
+   equivalents); pruned row groups are reported via
+   `ScanMetrics::row_groups_pruned_bloom`. All sites marked
+   `SQE PATCH (sqe#369)`. Files:
+   `crates/iceberg/src/expr/visitors/sbbf_row_group_evaluator.rs` (new),
+   `crates/iceberg/src/expr/visitors/mod.rs`,
+   `crates/iceberg/src/expr/mod.rs`,
+   `crates/iceberg/src/arrow/reader.rs`,
+   `crates/iceberg/src/arrow/scan_metrics.rs`,
+   `crates/iceberg/src/scan/mod.rs`, plus the CASE-of-InLists union in
+   `crates/integrations/datafusion/src/physical_plan/physical_to_predicate.rs`
+   that lets a PARTITIONED hash join's sealed dynamic filter reach the
+   pruning paths as a single `Predicate::Set` per column. Behavioral
+   tests live in SQE at `crates/sqe-catalog/tests/bloom_probe_369.rs`.
+   Not filed upstream yet.
 
 ## Cherry-picks from apache/iceberg-rust main
 
