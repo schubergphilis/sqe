@@ -369,6 +369,8 @@ impl MaintenanceHandler {
                 }),
                 session_id: Some(session.id.clone()),
                 client_ip: None,
+                trace_id: None,
+                query_id: None,
                 integrity: sqe_metrics::audit::Integrity::default(),
             });
         }
