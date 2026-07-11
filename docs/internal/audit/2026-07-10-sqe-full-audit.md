@@ -474,8 +474,8 @@ P0 advanced in this pass:
 - Helm values now document production_mode, rate_limit, TLS/auth checklist items (!632).
 
 P1 advanced:
-- O4: `trace_id` + `query_id` on `AuditEvent` + helper + wiring across paths (!626).
-- O3: `sqe.query` root spans + `sqe.policy_rewrite` + `sqe.execute` + `sqe.write_commit` child spans (expanded on this branch).
+- O4: `trace_id` + `query_id` on `AuditEvent` + helper + wiring across paths (!626); also added to QueryRecord / system.runtime.queries (!634).
+- O3: `sqe.query` root spans + `sqe.policy_rewrite` + `sqe.execute` + `sqe.write_commit` + `sqe.plan` child spans (expanded on this branch). Spill and catalog REST tracing still open.
 - O5: Maintenance procedures now emit OpenLineage (flipped should_emit + existing paths; !627).
 - O6: Trino/Quack traceparent propagation wired (!630).
 - Structural items (god-crate, full CI) remain.
