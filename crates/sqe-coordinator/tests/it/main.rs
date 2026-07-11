@@ -23,6 +23,7 @@ mod attach_dispatch_test;
 mod attach_rest_test;
 mod audit_e2e_test;
 mod catalog_discovery_test;
+mod ctas_write_modes_e2e;
 mod equality_delete_integration;
 mod grant_dispatch_test;
 mod grant_introspection_gate_test;
