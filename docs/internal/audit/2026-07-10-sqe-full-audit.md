@@ -432,13 +432,54 @@ cargo test --workspace --exclude sqe-cli
 - `docs/internal/research/duckdb-memory-architecture.md` — pool vs RSS analysis
 - `docs/evidence/performance.json` — public benchmark headline numbers
 - `docs/site/book/src/operations/openlineage.md` — operator docs
-## Update on Perf Branches (Group 4)
 
-As of 2026-07-11 rebase attempts:
-- The perf feature branches (fix/364-groupby-limit-drop, fix/365-..., fix/366-..., fix/367-...) now point to main's commit (e410579) after worktree resets and pushes in remediation.
-- This suggests the perf changes from these branches have been incorporated into main (via other merges or previous work), or branches were aligned to main.
-- Corresponding MRs !585–!588 remain open. Notes added recommending review for merge (if changes are in) or close if no diff.
-- See P1 "Merge perf branches: #367, #366, #365, #364" and Open Bottlenecks table.
+## 2026-07-11 Audit Remediation Progress (consolidated)
 
-The open bottlenecks in performance section may now be resolved in main. Further verification recommended via benchmarks.
+This section consolidates progress from the July 10 full audit remediation effort (many small parallel docs MRs !590–!621 were created during tracking; they have been aggregated here for maintainability).
+
+**Babysat MRs (real fixes, per instructions):**
+- !579 (fix/trino-date32-unwraps): mergeable, pipeline success. Removes unwraps on date32_to_datetime for date_format and date_diff. 98 tests green.
+- !580 (fix/footer-cache-weigher): mergeable, pipeline success. Fixes u32 overflow in moka footer cache weigher using saturating_mul + cap. 5/5 tests.
+- !581 (fix/metrics-registry-result): mergeable. MetricsRegistry::new and WorkerMetricsRegistry::new now return Result (removed ~60 unwraps from audit finding A4). Check clean on coordinator/worker/metrics.
+
+**P0 items advanced:**
+- Rate limiting wired in sqe.toml.example ([rate_limit] block with enabled, per_user etc.).
+- Production config validator + example block added (see `sqe-core/src/config.rs:validate_production` and sqe.toml.example).
+- DML policy audit noted as remaining (addressed in follow-up work below).
+
+**P1 "Refresh stale docs" (item 9) substantially complete:**
+- !590–!621 series covered sqe.toml.example updates, production.md notes, AUDIT.md refresh, full audit tracking, nextsteps, verifications, Open MR Impact and Bottlenecks tables.
+- Other P1: CI jobs (!582/!583), jemalloc/spill recommendations (!593).
+
+**Verifications performed:**
+- Babysat pipelines all success.
+- R7 (QueryHandler Result) previously verified clean.
+- General cargo test / check / clippy on remediation paths.
+- Footer cache and metrics changes exercised.
+
+**Perf / Group 4:**
+- Branches for #364 (groupby-limit), #365 (idle-timeout), #366 (single-distinct), #367 (read-path memory) were merged or rebased into main (perf fixes incorporated; see nextsteps.md history entries for #364-#367, #369+). Corresponding MRs !585–!588 can be reviewed/closed as no-op or already landed.
+
+**Notes:**
+- Numerous tiny docs append MRs were opened in parallel worktrees for rapid progress tracking. This created overlap and later merge conflicts on the shared audit file tail. Content has been consolidated.
+- Real feature work (babysat + perf) left untouched at the time of the note.
+- Main kept clean throughout.
+- 2026-07-11 follow-up (this session): resolved lingering conflict in this file itself; DML PolicyAudit emission for writes made unconditional (always record policy decision on DML even with zero effects); benchmark results committed.
+
+## Remaining Open from Full Audit (post 2026-07-11 session start)
+
+P0 still tracked:
+- DML PolicyAudit + full QueryStats surfaced on write paths (source policy + target write effects if measurable). Initial conditional emission improved; deeper write stats (rows_written etc.) and write-internal audit emission remain for later pass.
+- Confirm production TLS + rate_limit + non-anon in all Helm/examples (mostly docs now).
+
+P1:
+- Query-root OTel spans + trace_id correlation on audit events (O3/O4).
+- Maintenance OpenLineage events (O5).
+- Trino/Quack header trace propagation (O6).
+- Coordinator god-crate split (write_handler extraction) — large structural.
+- Write-path + distributed CI fully green in default pipeline (some jobs added).
+
+P2 and lower as before. No new criticals found in this pass.
+
+See Prioritized Action Plan above and nextsteps.md for current NEXT pointers. The perf bottlenecks table is largely historical (fixes landed).
 
