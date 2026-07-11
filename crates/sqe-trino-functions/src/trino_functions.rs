@@ -756,11 +756,11 @@ impl ScalarUDFImpl for DateDiff {
 
         fn scalar_to_naive_date(sv: &ScalarValue) -> DFResult<Option<NaiveDate>> {
             match sv {
-                ScalarValue::Date32(Some(days)) => Ok(Some(
-                    temporal_conversions::date32_to_datetime(*days)
-                        .unwrap()
-                        .date(),
-                )),
+                ScalarValue::Date32(Some(days)) => {
+                    // None for out-of-range Date32; yield a NULL result
+                    // instead of unwrapping into a panic.
+                    Ok(temporal_conversions::date32_to_datetime(*days).map(|dt| dt.date()))
+                }
                 ScalarValue::Date32(None) => Ok(None),
                 ScalarValue::TimestampMicrosecond(Some(us), _) => {
                     Ok(Some(us_to_naive(*us).date()))
@@ -1284,11 +1284,13 @@ impl ScalarUDFImpl for DateFormat {
                     date_arr
                         .iter()
                         .map(|opt| {
-                            opt.map(|days| {
-                                let d = temporal_conversions::date32_to_datetime(days)
-                                    .unwrap()
-                                    .date();
-                                format_naive(d.and_hms_opt(0, 0, 0).unwrap(), &pattern)
+                            opt.and_then(|days| {
+                                // date32_to_datetime returns None for Date32 values
+                                // whose day count overflows NaiveDateTime. Emit a
+                                // NULL row instead of unwrapping into a panic.
+                                temporal_conversions::date32_to_datetime(days).map(|dt| {
+                                    format_naive(dt.date().and_hms_opt(0, 0, 0).unwrap(), &pattern)
+                                })
                             })
                         })
                         .collect()
@@ -1313,10 +1315,10 @@ fn scalar_to_naive_dt(
         ScalarValue::TimestampMicrosecond(Some(us), _) => Ok(Some(us_to_naive(*us))),
         ScalarValue::TimestampNanosecond(Some(ns), _) => Ok(Some(ns_to_naive(*ns))),
         ScalarValue::Date32(Some(days)) => {
-            let d = temporal_conversions::date32_to_datetime(*days)
-                .unwrap()
-                .date();
-            Ok(Some(d.and_hms_opt(0, 0, 0).unwrap()))
+            // None for out-of-range Date32; yield a NULL result
+            // instead of unwrapping into a panic.
+            Ok(temporal_conversions::date32_to_datetime(*days)
+                .and_then(|dt| dt.date().and_hms_opt(0, 0, 0)))
         }
         ScalarValue::TimestampMicrosecond(None, _)
         | ScalarValue::TimestampNanosecond(None, _)
