@@ -242,14 +242,24 @@ fn case_arm(class_cond: &str, predicate: Option<&str>, value: &str) -> String {
     }
 }
 
+/// Name of the synthetic per-side presence-flag column used to detect a row's
+/// match class. Each side of the FULL OUTER JOIN is wrapped in a derived table
+/// that adds `TRUE AS <flag>`; the flag is NULL exactly when that side is
+/// absent for the joined row. Derived from the unique per-invocation scratch
+/// ref so it cannot collide with a user column.
+fn present_flag(scratch_ref: &str) -> String {
+    format!("__sqe_present_{scratch_ref}")
+}
+
 /// Build the merge SELECT: an inner FULL OUTER JOIN projection with one CASE
 /// per target column plus the keep column, wrapped in an outer projection
 /// that filters on the keep column and drops it.
 ///
-/// Match classes are detected through NULL sentinels on the first column of
-/// each side, matching the pre-existing behaviour (a genuinely NULL first
-/// column on a present row would misclassify; ON keys are non-NULL in
-/// practice and always so for dbt's `dbt_scd_id`).
+/// Match classes are detected through synthetic presence-flag columns
+/// ([`present_flag`]) injected on each side, not through any user column. A
+/// row present on a side has a non-NULL flag; an absent side (the NULL half of
+/// the outer join) has a NULL flag. So a genuinely NULL data column can no
+/// longer misclassify a present row.
 pub(crate) fn build_merge_select(
     classified: &ClassifiedMerge<'_>,
     names: &MergeNames<'_>,
@@ -257,8 +267,10 @@ pub(crate) fn build_merge_select(
     qualified_source_ref: &str,
     on_rewritten: &str,
 ) -> String {
-    let target_sentinel = format!("{}.\"{}\"", names.target_ref, names.target_columns[0]);
-    let source_sentinel = format!("{}.\"{}\"", names.source_ref, names.source_columns[0]);
+    let t_flag = present_flag(names.target_ref);
+    let s_flag = present_flag(names.source_ref);
+    let target_sentinel = format!("{}.\"{t_flag}\"", names.target_ref);
+    let source_sentinel = format!("{}.\"{s_flag}\"", names.source_ref);
     let matched_cond = format!("{target_sentinel} IS NOT NULL AND {source_sentinel} IS NOT NULL");
     let source_only_cond = format!("{target_sentinel} IS NULL");
     let target_only_cond = format!("{source_sentinel} IS NULL");
@@ -375,9 +387,17 @@ pub(crate) fn build_merge_select(
         .collect::<Vec<_>>()
         .join(", ");
 
+    // Wrap each side in a derived table that adds the presence flag, so match
+    // class depends on the flag rather than a nullable user column. The derived
+    // tables keep the scratch-ref aliases, so the ON condition, passthrough,
+    // and assignment references (`{ref}."col"`) all still resolve; the flag
+    // columns stay inside the join scope and never reach the outer projection.
     format!(
-        "SELECT {outer_projection} FROM (SELECT {} FROM {qualified_target_ref} AS {} \
-         FULL OUTER JOIN {qualified_source_ref} AS {} ON {on_rewritten}) \
+        "SELECT {outer_projection} FROM (SELECT {} FROM \
+         (SELECT *, TRUE AS \"{t_flag}\" FROM {qualified_target_ref}) AS {} \
+         FULL OUTER JOIN \
+         (SELECT *, TRUE AS \"{s_flag}\" FROM {qualified_source_ref}) AS {} \
+         ON {on_rewritten}) \
          WHERE {MERGE_KEEP_COLUMN}",
         inner_cols.join(", "),
         names.target_ref,
@@ -568,9 +588,52 @@ mod tests {
         // Deleted/unclaimed rows are dropped by the keep filter.
         assert!(out.ends_with(&format!("WHERE {MERGE_KEEP_COLUMN}")), "{out}");
         // Source-only rows failing the insert predicate are not inserted.
+        // Source-only is now detected via the target presence flag, not the
+        // first data column.
+        let t_flag = present_flag("__merge_target_x");
         assert!(
-            out.contains("WHEN __merge_target_x.\"dbt_scd_id\" IS NULL THEN FALSE"),
+            out.contains(&format!(
+                "WHEN __merge_target_x.\"{t_flag}\" IS NULL THEN FALSE"
+            )),
             "source-only default drop arm missing: {out}"
+        );
+    }
+
+    #[test]
+    fn row_class_detection_uses_presence_flags_not_data_columns() {
+        // #374: match class must not depend on any user column value. The
+        // generated SQL wraps each side with a presence flag and gates the
+        // classes on that flag, so a nullable first column can't misclassify.
+        let sql = "MERGE INTO tgt AS t USING src AS s ON t.id = s.id \
+                   WHEN MATCHED THEN UPDATE SET v = s.v \
+                   WHEN NOT MATCHED THEN INSERT (id, v) VALUES (s.id, s.v) \
+                   WHEN NOT MATCHED BY SOURCE THEN DELETE";
+        let out = build(sql, &["id", "v"], &["id", "v"]);
+        let t_flag = present_flag("__merge_target_x");
+        let s_flag = present_flag("__merge_source_x");
+        // Both sides are wrapped in a derived table adding the flag.
+        assert!(
+            out.contains(&format!(
+                "(SELECT *, TRUE AS \"{t_flag}\" FROM datafusion.public.__merge_target_x) AS __merge_target_x"
+            )),
+            "target presence-flag wrapping missing: {out}"
+        );
+        assert!(
+            out.contains(&format!(
+                "(SELECT *, TRUE AS \"{s_flag}\" FROM datafusion.public.__merge_source_x) AS __merge_source_x"
+            )),
+            "source presence-flag wrapping missing: {out}"
+        );
+        // Class conditions reference the flags, never the id/v data columns.
+        assert!(
+            out.contains(&format!("__merge_target_x.\"{t_flag}\" IS NOT NULL")),
+            "matched cond not flag-based: {out}"
+        );
+        // The flag column is not projected out of the inner select or the outer
+        // projection (outer selects only the target columns).
+        assert!(
+            out.starts_with("SELECT \"id\", \"v\" FROM"),
+            "flag leaked into outer projection: {out}"
         );
     }
 
@@ -595,8 +658,11 @@ mod tests {
                    WHEN MATCHED THEN UPDATE SET v = s.v \
                    WHEN NOT MATCHED BY SOURCE THEN DELETE";
         let out = build(sql, &["id", "v"], &["id", "v"]);
+        let s_flag = present_flag("__merge_source_x");
         assert!(
-            out.contains("WHEN __merge_source_x.\"id\" IS NULL THEN FALSE"),
+            out.contains(&format!(
+                "WHEN __merge_source_x.\"{s_flag}\" IS NULL THEN FALSE"
+            )),
             "by-source delete keep arm missing: {out}"
         );
     }
@@ -606,10 +672,11 @@ mod tests {
         let sql = "MERGE INTO tgt AS t USING src AS s ON t.id = s.id \
                    WHEN NOT MATCHED BY SOURCE AND t.active THEN UPDATE SET active = false";
         let out = build(sql, &["id", "active"], &["id"]);
+        let s_flag = present_flag("__merge_source_x");
         assert!(
-            out.contains(
-                "WHEN __merge_source_x.\"id\" IS NULL AND (__merge_target_x.active) THEN false"
-            ),
+            out.contains(&format!(
+                "WHEN __merge_source_x.\"{s_flag}\" IS NULL AND (__merge_target_x.active) THEN false"
+            )),
             "by-source update arm missing: {out}"
         );
         // Rows failing the predicate pass through unchanged (ELSE TRUE keep).
