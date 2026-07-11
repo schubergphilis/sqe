@@ -68,7 +68,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_metrics_handler_returns_text() {
-        let metrics = Arc::new(MetricsRegistry::new());
+        let metrics = Arc::new(MetricsRegistry::new().unwrap());
         metrics.query_count.with_label_values(&["success", "query", ""]).inc();
         // Observe a duration sample so the histogram family appears in gather()
         metrics.query_duration.with_label_values(&["query"]).observe(0.1);
@@ -87,7 +87,7 @@ mod tests {
     async fn test_worker_metrics_handler_returns_text() {
         use crate::WorkerMetricsRegistry;
 
-        let metrics = Arc::new(WorkerMetricsRegistry::new());
+        let metrics = Arc::new(WorkerMetricsRegistry::new().unwrap());
         metrics.fragments_executed.inc();
         metrics.rows_scanned.inc_by(42.0);
         metrics.bytes_read.inc_by(1024.0);
