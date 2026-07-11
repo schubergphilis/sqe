@@ -91,7 +91,7 @@ fn rewrite_aliases(expr_sql: String, names: &MergeNames<'_>) -> String {
 ///   `users.name` or `a.s.x`),
 /// - single-quoted string literals and double-quoted identifiers are copied
 ///   verbatim (with doubled-quote escapes), so `'s.'` in a literal survives.
-fn replace_alias_qualifier(sql: &str, alias: &str, replacement: &str) -> String {
+pub(crate) fn replace_alias_qualifier(sql: &str, alias: &str, replacement: &str) -> String {
     let needle = format!("{alias}.");
     let mut out = String::with_capacity(sql.len());
     let mut i = 0;
@@ -153,6 +153,30 @@ pub(crate) fn classify_merge_clauses<'a>(
         by_source: Vec::new(),
     };
     for clause in clauses {
+        // Oracle-style per-action sub-predicates (`UPDATE SET ... WHERE`,
+        // `... DELETE WHERE`, `INSERT ... VALUES (...) WHERE`) are parsed by
+        // sqlparser but not implemented here. Reject them rather than silently
+        // dropping the condition, which would apply the action unconditionally.
+        match &clause.action {
+            MergeAction::Update(u)
+                if u.update_predicate.is_some() || u.delete_predicate.is_some() =>
+            {
+                return Err(SqeError::NotImplemented(
+                    "Oracle-style sub-predicates in a MERGE UPDATE clause \
+                     (UPDATE ... WHERE / DELETE WHERE) are not supported; \
+                     use WHEN MATCHED AND <cond> instead"
+                        .to_string(),
+                ));
+            }
+            MergeAction::Insert(i) if i.insert_predicate.is_some() => {
+                return Err(SqeError::NotImplemented(
+                    "Oracle-style INSERT ... WHERE in a MERGE clause is not \
+                     supported; use WHEN NOT MATCHED AND <cond> instead"
+                        .to_string(),
+                ));
+            }
+            _ => {}
+        }
         let predicate = clause
             .predicate
             .as_ref()
@@ -624,6 +648,51 @@ mod tests {
             err.to_string().contains("Unsupported MERGE clause combination"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn classify_rejects_oracle_update_where_subpredicate() {
+        let clauses = merge_clauses(
+            "MERGE INTO tgt AS t USING src AS s ON t.id = s.id \
+             WHEN MATCHED THEN UPDATE SET v = s.v WHERE t.x > 0",
+        );
+        let tc = cols(&["id", "v"]);
+        let sc = cols(&["id", "v", "x"]);
+        let n = names(&tc, &sc);
+        let Err(err) = classify_merge_clauses(&clauses, &n) else {
+            panic!("Oracle UPDATE ... WHERE must be rejected");
+        };
+        assert!(err.to_string().contains("Oracle-style sub-predicates"), "{err}");
+    }
+
+    #[test]
+    fn classify_rejects_oracle_update_delete_where_subpredicate() {
+        let clauses = merge_clauses(
+            "MERGE INTO tgt AS t USING src AS s ON t.id = s.id \
+             WHEN MATCHED THEN UPDATE SET v = s.v DELETE WHERE t.y < 0",
+        );
+        let tc = cols(&["id", "v"]);
+        let sc = cols(&["id", "v", "y"]);
+        let n = names(&tc, &sc);
+        assert!(
+            classify_merge_clauses(&clauses, &n).is_err(),
+            "Oracle DELETE WHERE must be rejected"
+        );
+    }
+
+    #[test]
+    fn classify_rejects_oracle_insert_where_subpredicate() {
+        let clauses = merge_clauses(
+            "MERGE INTO tgt AS t USING src AS s ON t.id = s.id \
+             WHEN NOT MATCHED THEN INSERT (id, v) VALUES (s.id, s.v) WHERE s.z = 1",
+        );
+        let tc = cols(&["id", "v"]);
+        let sc = cols(&["id", "v", "z"]);
+        let n = names(&tc, &sc);
+        let Err(err) = classify_merge_clauses(&clauses, &n) else {
+            panic!("Oracle INSERT ... WHERE must be rejected");
+        };
+        assert!(err.to_string().contains("INSERT ... WHERE"), "{err}");
     }
 
     #[test]
