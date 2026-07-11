@@ -483,7 +483,7 @@ mod tests {
         let schema = test_schema();
         let input = make_memory_plan(schema);
         let plan = make_sort_plan(input, &["name"], None);
-        let metrics = Arc::new(sqe_metrics::MetricsRegistry::new());
+        let metrics = Arc::new(sqe_metrics::MetricsRegistry::new().unwrap());
 
         let (_result, decisions) = apply_adaptive_sort(
             plan,

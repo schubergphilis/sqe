@@ -668,7 +668,7 @@ mod tests {
     use tonic::Request;
 
     fn make_service(secret: &str) -> WorkerFlightService {
-        let metrics = Arc::new(WorkerMetricsRegistry::new());
+        let metrics = Arc::new(WorkerMetricsRegistry::new().unwrap());
         WorkerFlightService::new(metrics, SessionContext::new())
             .with_worker_secret(secret.to_string())
     }
