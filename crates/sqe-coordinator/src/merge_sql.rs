@@ -91,7 +91,7 @@ fn rewrite_aliases(expr_sql: String, names: &MergeNames<'_>) -> String {
 ///   `users.name` or `a.s.x`),
 /// - single-quoted string literals and double-quoted identifiers are copied
 ///   verbatim (with doubled-quote escapes), so `'s.'` in a literal survives.
-fn replace_alias_qualifier(sql: &str, alias: &str, replacement: &str) -> String {
+pub(crate) fn replace_alias_qualifier(sql: &str, alias: &str, replacement: &str) -> String {
     let needle = format!("{alias}.");
     let mut out = String::with_capacity(sql.len());
     let mut i = 0;
@@ -153,6 +153,30 @@ pub(crate) fn classify_merge_clauses<'a>(
         by_source: Vec::new(),
     };
     for clause in clauses {
+        // Oracle-style per-action sub-predicates (`UPDATE SET ... WHERE`,
+        // `... DELETE WHERE`, `INSERT ... VALUES (...) WHERE`) are parsed by
+        // sqlparser but not implemented here. Reject them rather than silently
+        // dropping the condition, which would apply the action unconditionally.
+        match &clause.action {
+            MergeAction::Update(u)
+                if u.update_predicate.is_some() || u.delete_predicate.is_some() =>
+            {
+                return Err(SqeError::NotImplemented(
+                    "Oracle-style sub-predicates in a MERGE UPDATE clause \
+                     (UPDATE ... WHERE / DELETE WHERE) are not supported; \
+                     use WHEN MATCHED AND <cond> instead"
+                        .to_string(),
+                ));
+            }
+            MergeAction::Insert(i) if i.insert_predicate.is_some() => {
+                return Err(SqeError::NotImplemented(
+                    "Oracle-style INSERT ... WHERE in a MERGE clause is not \
+                     supported; use WHEN NOT MATCHED AND <cond> instead"
+                        .to_string(),
+                ));
+            }
+            _ => {}
+        }
         let predicate = clause
             .predicate
             .as_ref()
@@ -191,26 +215,6 @@ pub(crate) fn classify_merge_clauses<'a>(
     Ok(out)
 }
 
-/// True when the statement uses clause shapes the merge-on-read equality
-/// path cannot express: clause predicates, `NOT MATCHED BY SOURCE`, or more
-/// than one clause per row class (which needs first-match-wins ordering).
-/// The dispatcher falls back to copy-on-write for these.
-pub(crate) fn merge_needs_cow(clauses: &[MergeClause]) -> bool {
-    let mut matched = 0usize;
-    let mut not_matched = 0usize;
-    for clause in clauses {
-        if clause.predicate.is_some() {
-            return true;
-        }
-        match clause.clause_kind {
-            MergeClauseKind::NotMatchedBySource => return true,
-            MergeClauseKind::Matched => matched += 1,
-            MergeClauseKind::NotMatched | MergeClauseKind::NotMatchedByTarget => not_matched += 1,
-        }
-    }
-    matched > 1 || not_matched > 1
-}
-
 fn case_arm(class_cond: &str, predicate: Option<&str>, value: &str) -> String {
     match predicate {
         Some(p) => format!("WHEN {class_cond} AND ({p}) THEN {value}"),
@@ -218,14 +222,24 @@ fn case_arm(class_cond: &str, predicate: Option<&str>, value: &str) -> String {
     }
 }
 
+/// Name of the synthetic per-side presence-flag column used to detect a row's
+/// match class. Each side of the FULL OUTER JOIN is wrapped in a derived table
+/// that adds `TRUE AS <flag>`; the flag is NULL exactly when that side is
+/// absent for the joined row. Derived from the unique per-invocation scratch
+/// ref so it cannot collide with a user column.
+fn present_flag(scratch_ref: &str) -> String {
+    format!("__sqe_present_{scratch_ref}")
+}
+
 /// Build the merge SELECT: an inner FULL OUTER JOIN projection with one CASE
 /// per target column plus the keep column, wrapped in an outer projection
 /// that filters on the keep column and drops it.
 ///
-/// Match classes are detected through NULL sentinels on the first column of
-/// each side, matching the pre-existing behaviour (a genuinely NULL first
-/// column on a present row would misclassify; ON keys are non-NULL in
-/// practice and always so for dbt's `dbt_scd_id`).
+/// Match classes are detected through synthetic presence-flag columns
+/// ([`present_flag`]) injected on each side, not through any user column. A
+/// row present on a side has a non-NULL flag; an absent side (the NULL half of
+/// the outer join) has a NULL flag. So a genuinely NULL data column can no
+/// longer misclassify a present row.
 pub(crate) fn build_merge_select(
     classified: &ClassifiedMerge<'_>,
     names: &MergeNames<'_>,
@@ -233,8 +247,10 @@ pub(crate) fn build_merge_select(
     qualified_source_ref: &str,
     on_rewritten: &str,
 ) -> String {
-    let target_sentinel = format!("{}.\"{}\"", names.target_ref, names.target_columns[0]);
-    let source_sentinel = format!("{}.\"{}\"", names.source_ref, names.source_columns[0]);
+    let t_flag = present_flag(names.target_ref);
+    let s_flag = present_flag(names.source_ref);
+    let target_sentinel = format!("{}.\"{t_flag}\"", names.target_ref);
+    let source_sentinel = format!("{}.\"{s_flag}\"", names.source_ref);
     let matched_cond = format!("{target_sentinel} IS NOT NULL AND {source_sentinel} IS NOT NULL");
     let source_only_cond = format!("{target_sentinel} IS NULL");
     let target_only_cond = format!("{source_sentinel} IS NULL");
@@ -351,14 +367,85 @@ pub(crate) fn build_merge_select(
         .collect::<Vec<_>>()
         .join(", ");
 
+    // Wrap each side in a derived table that adds the presence flag, so match
+    // class depends on the flag rather than a nullable user column. The derived
+    // tables keep the scratch-ref aliases, so the ON condition, passthrough,
+    // and assignment references (`{ref}."col"`) all still resolve; the flag
+    // columns stay inside the join scope and never reach the outer projection.
     format!(
-        "SELECT {outer_projection} FROM (SELECT {} FROM {qualified_target_ref} AS {} \
-         FULL OUTER JOIN {qualified_source_ref} AS {} ON {on_rewritten}) \
+        "SELECT {outer_projection} FROM (SELECT {} FROM \
+         (SELECT *, TRUE AS \"{t_flag}\" FROM {qualified_target_ref}) AS {} \
+         FULL OUTER JOIN \
+         (SELECT *, TRUE AS \"{s_flag}\" FROM {qualified_source_ref}) AS {} \
+         ON {on_rewritten}) \
          WHERE {MERGE_KEEP_COLUMN}",
         inner_cols.join(", "),
         names.target_ref,
         names.source_ref,
     )
+}
+
+/// Build the two COUNT queries used to detect a MERGE cardinality violation
+/// (a target row matched by more than one source row). Returns
+/// `(pair_count_sql, matched_count_sql)`:
+///
+/// - `pair_count` counts join output rows (one per matching target/source
+///   pair),
+/// - `matched_count` counts distinct target rows that have at least one match.
+///
+/// `pair_count > matched_count` iff some target row matched multiple source
+/// rows. Using two counts avoids materialising a synthetic row id, so the
+/// check stays a cheap streaming aggregate. Only meaningful when the statement
+/// has at least one matched clause.
+pub(crate) fn build_cardinality_check_sql(
+    names: &MergeNames<'_>,
+    qualified_target_ref: &str,
+    qualified_source_ref: &str,
+    on_rewritten: &str,
+) -> (String, String) {
+    let t = names.target_ref;
+    let s = names.source_ref;
+    let pair_count = format!(
+        "SELECT COUNT(*) FROM {qualified_target_ref} AS {t} \
+         JOIN {qualified_source_ref} AS {s} ON {on_rewritten}"
+    );
+    let matched_count = format!(
+        "SELECT COUNT(*) FROM {qualified_target_ref} AS {t} \
+         WHERE EXISTS (SELECT 1 FROM {qualified_source_ref} AS {s} WHERE {on_rewritten})"
+    );
+    (pair_count, matched_count)
+}
+
+/// First-match-wins guard for the clause at `idx` within one row class
+/// (matched / not-matched / by-source), for the merge-on-read path which runs
+/// one guarded query per clause instead of a single CASE. The clause fires
+/// only when its own predicate holds and no earlier clause in the class
+/// already claimed the row:
+///
+/// `COALESCE((own), FALSE) AND NOT COALESCE((prior_0), FALSE) AND ...`
+///
+/// NULL predicates count as false (SQL CASE semantics). An unconditional
+/// clause (no predicate) contributes no own-term (it matches every row in the
+/// class); once an unconditional clause appears, every later clause in the
+/// class is unreachable and its guard collapses to `FALSE`, mirroring the CoW
+/// CASE where a later arm after an unconditional one never runs.
+pub(crate) fn first_match_guard(class: &[ClassifiedClause<'_>], idx: usize) -> String {
+    let mut terms: Vec<String> = Vec::new();
+    if let Some(p) = &class[idx].predicate {
+        terms.push(format!("COALESCE(({p}), FALSE)"));
+    }
+    for prior in &class[..idx] {
+        match &prior.predicate {
+            Some(p) => terms.push(format!("NOT COALESCE(({p}), FALSE)")),
+            // A prior unconditional clause already claimed the row.
+            None => terms.push("FALSE".to_string()),
+        }
+    }
+    if terms.is_empty() {
+        "TRUE".to_string()
+    } else {
+        terms.join(" AND ")
+    }
 }
 
 /// Resolve the UPDATE expression for one target column from the SET
@@ -544,9 +631,52 @@ mod tests {
         // Deleted/unclaimed rows are dropped by the keep filter.
         assert!(out.ends_with(&format!("WHERE {MERGE_KEEP_COLUMN}")), "{out}");
         // Source-only rows failing the insert predicate are not inserted.
+        // Source-only is now detected via the target presence flag, not the
+        // first data column.
+        let t_flag = present_flag("__merge_target_x");
         assert!(
-            out.contains("WHEN __merge_target_x.\"dbt_scd_id\" IS NULL THEN FALSE"),
+            out.contains(&format!(
+                "WHEN __merge_target_x.\"{t_flag}\" IS NULL THEN FALSE"
+            )),
             "source-only default drop arm missing: {out}"
+        );
+    }
+
+    #[test]
+    fn row_class_detection_uses_presence_flags_not_data_columns() {
+        // #374: match class must not depend on any user column value. The
+        // generated SQL wraps each side with a presence flag and gates the
+        // classes on that flag, so a nullable first column can't misclassify.
+        let sql = "MERGE INTO tgt AS t USING src AS s ON t.id = s.id \
+                   WHEN MATCHED THEN UPDATE SET v = s.v \
+                   WHEN NOT MATCHED THEN INSERT (id, v) VALUES (s.id, s.v) \
+                   WHEN NOT MATCHED BY SOURCE THEN DELETE";
+        let out = build(sql, &["id", "v"], &["id", "v"]);
+        let t_flag = present_flag("__merge_target_x");
+        let s_flag = present_flag("__merge_source_x");
+        // Both sides are wrapped in a derived table adding the flag.
+        assert!(
+            out.contains(&format!(
+                "(SELECT *, TRUE AS \"{t_flag}\" FROM datafusion.public.__merge_target_x) AS __merge_target_x"
+            )),
+            "target presence-flag wrapping missing: {out}"
+        );
+        assert!(
+            out.contains(&format!(
+                "(SELECT *, TRUE AS \"{s_flag}\" FROM datafusion.public.__merge_source_x) AS __merge_source_x"
+            )),
+            "source presence-flag wrapping missing: {out}"
+        );
+        // Class conditions reference the flags, never the id/v data columns.
+        assert!(
+            out.contains(&format!("__merge_target_x.\"{t_flag}\" IS NOT NULL")),
+            "matched cond not flag-based: {out}"
+        );
+        // The flag column is not projected out of the inner select or the outer
+        // projection (outer selects only the target columns).
+        assert!(
+            out.starts_with("SELECT \"id\", \"v\" FROM"),
+            "flag leaked into outer projection: {out}"
         );
     }
 
@@ -571,8 +701,11 @@ mod tests {
                    WHEN MATCHED THEN UPDATE SET v = s.v \
                    WHEN NOT MATCHED BY SOURCE THEN DELETE";
         let out = build(sql, &["id", "v"], &["id", "v"]);
+        let s_flag = present_flag("__merge_source_x");
         assert!(
-            out.contains("WHEN __merge_source_x.\"id\" IS NULL THEN FALSE"),
+            out.contains(&format!(
+                "WHEN __merge_source_x.\"{s_flag}\" IS NULL THEN FALSE"
+            )),
             "by-source delete keep arm missing: {out}"
         );
     }
@@ -582,10 +715,11 @@ mod tests {
         let sql = "MERGE INTO tgt AS t USING src AS s ON t.id = s.id \
                    WHEN NOT MATCHED BY SOURCE AND t.active THEN UPDATE SET active = false";
         let out = build(sql, &["id", "active"], &["id"]);
+        let s_flag = present_flag("__merge_source_x");
         assert!(
-            out.contains(
-                "WHEN __merge_source_x.\"id\" IS NULL AND (__merge_target_x.active) THEN false"
-            ),
+            out.contains(&format!(
+                "WHEN __merge_source_x.\"{s_flag}\" IS NULL AND (__merge_target_x.active) THEN false"
+            )),
             "by-source update arm missing: {out}"
         );
         // Rows failing the predicate pass through unchanged (ELSE TRUE keep).
@@ -627,6 +761,51 @@ mod tests {
     }
 
     #[test]
+    fn classify_rejects_oracle_update_where_subpredicate() {
+        let clauses = merge_clauses(
+            "MERGE INTO tgt AS t USING src AS s ON t.id = s.id \
+             WHEN MATCHED THEN UPDATE SET v = s.v WHERE t.x > 0",
+        );
+        let tc = cols(&["id", "v"]);
+        let sc = cols(&["id", "v", "x"]);
+        let n = names(&tc, &sc);
+        let Err(err) = classify_merge_clauses(&clauses, &n) else {
+            panic!("Oracle UPDATE ... WHERE must be rejected");
+        };
+        assert!(err.to_string().contains("Oracle-style sub-predicates"), "{err}");
+    }
+
+    #[test]
+    fn classify_rejects_oracle_update_delete_where_subpredicate() {
+        let clauses = merge_clauses(
+            "MERGE INTO tgt AS t USING src AS s ON t.id = s.id \
+             WHEN MATCHED THEN UPDATE SET v = s.v DELETE WHERE t.y < 0",
+        );
+        let tc = cols(&["id", "v"]);
+        let sc = cols(&["id", "v", "y"]);
+        let n = names(&tc, &sc);
+        assert!(
+            classify_merge_clauses(&clauses, &n).is_err(),
+            "Oracle DELETE WHERE must be rejected"
+        );
+    }
+
+    #[test]
+    fn classify_rejects_oracle_insert_where_subpredicate() {
+        let clauses = merge_clauses(
+            "MERGE INTO tgt AS t USING src AS s ON t.id = s.id \
+             WHEN NOT MATCHED THEN INSERT (id, v) VALUES (s.id, s.v) WHERE s.z = 1",
+        );
+        let tc = cols(&["id", "v"]);
+        let sc = cols(&["id", "v", "z"]);
+        let n = names(&tc, &sc);
+        let Err(err) = classify_merge_clauses(&clauses, &n) else {
+            panic!("Oracle INSERT ... WHERE must be rejected");
+        };
+        assert!(err.to_string().contains("INSERT ... WHERE"), "{err}");
+    }
+
+    #[test]
     fn alias_rewrite_is_identifier_aware() {
         // Alias `s` must not fire inside `users.name` (substring), inside a
         // dotted path `a.s.x` (member access), or inside a string literal.
@@ -659,32 +838,53 @@ mod tests {
     }
 
     #[test]
-    fn merge_needs_cow_matrix() {
-        let plain = merge_clauses(
+    fn first_match_guard_orders_predicates() {
+        let clauses = merge_clauses(
             "MERGE INTO tgt AS t USING src AS s ON t.id = s.id \
-             WHEN MATCHED THEN UPDATE SET v = s.v \
-             WHEN NOT MATCHED THEN INSERT (id, v) VALUES (s.id, s.v)",
-        );
-        assert!(!merge_needs_cow(&plain), "plain upsert stays MoR-eligible");
-
-        let predicated = merge_clauses(
-            "MERGE INTO tgt AS t USING src AS s ON t.id = s.id \
-             WHEN MATCHED AND s.op = 'u' THEN UPDATE SET v = s.v",
-        );
-        assert!(merge_needs_cow(&predicated), "predicate forces CoW");
-
-        let by_source = merge_clauses(
-            "MERGE INTO tgt AS t USING src AS s ON t.id = s.id \
-             WHEN NOT MATCHED BY SOURCE THEN DELETE",
-        );
-        assert!(merge_needs_cow(&by_source), "BY SOURCE forces CoW");
-
-        let multi = merge_clauses(
-            "MERGE INTO tgt AS t USING src AS s ON t.id = s.id \
-             WHEN MATCHED THEN DELETE \
+             WHEN MATCHED AND s.op = 'del' THEN DELETE \
+             WHEN MATCHED AND s.op = 'upd' THEN UPDATE SET v = s.v \
              WHEN MATCHED THEN UPDATE SET v = s.v",
         );
-        assert!(merge_needs_cow(&multi), "multiple matched clauses force CoW");
+        let tc = cols(&["id", "v"]);
+        let sc = cols(&["id", "v", "op"]);
+        let n = names(&tc, &sc);
+        let c = classify_merge_clauses(&clauses, &n).unwrap();
+        assert_eq!(c.matched.len(), 3);
+        assert_eq!(
+            first_match_guard(&c.matched, 0),
+            "COALESCE((__merge_source_x.op = 'del'), FALSE)"
+        );
+        assert_eq!(
+            first_match_guard(&c.matched, 1),
+            "COALESCE((__merge_source_x.op = 'upd'), FALSE) AND \
+             NOT COALESCE((__merge_source_x.op = 'del'), FALSE)"
+        );
+        // Trailing unconditional clause: no own term, just NOT of both priors.
+        assert_eq!(
+            first_match_guard(&c.matched, 2),
+            "NOT COALESCE((__merge_source_x.op = 'del'), FALSE) AND \
+             NOT COALESCE((__merge_source_x.op = 'upd'), FALSE)"
+        );
+    }
+
+    #[test]
+    fn first_match_guard_after_unconditional_collapses_to_false() {
+        let clauses = merge_clauses(
+            "MERGE INTO tgt AS t USING src AS s ON t.id = s.id \
+             WHEN MATCHED THEN UPDATE SET v = s.v \
+             WHEN MATCHED AND s.op = 'x' THEN DELETE",
+        );
+        let tc = cols(&["id", "v"]);
+        let sc = cols(&["id", "v", "op"]);
+        let n = names(&tc, &sc);
+        let c = classify_merge_clauses(&clauses, &n).unwrap();
+        assert_eq!(first_match_guard(&c.matched, 0), "TRUE");
+        // The clause after an unconditional one is unreachable.
+        assert!(
+            first_match_guard(&c.matched, 1).contains("FALSE"),
+            "{}",
+            first_match_guard(&c.matched, 1)
+        );
     }
 
     #[test]
@@ -698,4 +898,190 @@ mod tests {
         // deleted: the only FALSE arms are the source-only default.
         assert_eq!(out.matches("THEN FALSE").count(), 1, "{out}");
     }
+
+    #[test]
+    fn cardinality_check_sql_shape() {
+        let tc = cols(&["id", "v"]);
+        let sc = cols(&["id", "v"]);
+        let n = names(&tc, &sc);
+        let (pair, matched) = build_cardinality_check_sql(
+            &n,
+            "datafusion.public.__merge_target_x",
+            "datafusion.public.__merge_source_x",
+            "__merge_target_x.id = __merge_source_x.id",
+        );
+        assert!(
+            pair.contains("JOIN datafusion.public.__merge_source_x AS __merge_source_x ON"),
+            "pair count is a plain join: {pair}"
+        );
+        assert!(
+            matched.contains("WHERE EXISTS (SELECT 1 FROM datafusion.public.__merge_source_x"),
+            "matched count is an EXISTS semi-join: {matched}"
+        );
+    }
+
+    // ---- In-process DataFusion execution tests ---------------------------
+    // These actually run the generated SQL against MemTables, so they verify
+    // row-level behaviour (not just SQL shape) without a live catalog.
+
+    use arrow_array::{Array, Int32Array, RecordBatch, StringArray};
+    use arrow_schema::{DataType, Field, Schema};
+    use datafusion::prelude::SessionContext;
+    use std::sync::Arc;
+
+    fn id_v_batch(ids: Vec<Option<i32>>, vs: Vec<Option<&str>>) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, true),
+            Field::new("v", DataType::Utf8, true),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(ids)),
+                Arc::new(StringArray::from(vs)),
+            ],
+        )
+        .unwrap()
+    }
+
+    async fn run_sql(ctx: &SessionContext, sql: &str) -> Vec<RecordBatch> {
+        ctx.sql(sql).await.expect("plan").collect().await.expect("collect")
+    }
+
+    /// Collect (id, v) rows from result batches, sorted by id for a stable
+    /// assertion.
+    fn id_v_rows(batches: &[RecordBatch]) -> Vec<(Option<i32>, Option<String>)> {
+        let mut rows = Vec::new();
+        for b in batches {
+            let ids = b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+            let vs = b.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+            for i in 0..b.num_rows() {
+                let id = if ids.is_null(i) { None } else { Some(ids.value(i)) };
+                let v = if vs.is_null(i) {
+                    None
+                } else {
+                    Some(vs.value(i).to_string())
+                };
+                rows.push((id, v));
+            }
+        }
+        rows.sort();
+        rows
+    }
+
+    #[tokio::test]
+    async fn execute_first_match_wins_delete_before_update_and_insert() {
+        // matched+DELETE (predicated) precedes matched+UPDATE; source-only
+        // inserts; target-only passes through unchanged.
+        let ctx = SessionContext::new();
+        ctx.register_batch(
+            "__merge_target_x",
+            id_v_batch(vec![Some(1), Some(2), Some(3)], vec![Some("a"), Some("b"), Some("c")]),
+        )
+        .unwrap();
+        ctx.register_batch(
+            "__merge_source_x",
+            id_v_batch(vec![Some(2), Some(3), Some(4)], vec![Some("del"), Some("B"), Some("D")]),
+        )
+        .unwrap();
+
+        let sql = "MERGE INTO tgt AS t USING src AS s ON t.id = s.id \
+                   WHEN MATCHED AND s.v = 'del' THEN DELETE \
+                   WHEN MATCHED THEN UPDATE SET v = s.v \
+                   WHEN NOT MATCHED THEN INSERT (id, v) VALUES (s.id, s.v)";
+        let out = build(sql, &["id", "v"], &["id", "v"]);
+        let rows = id_v_rows(&run_sql(&ctx, &out).await);
+        // id=1 passthrough, id=2 deleted, id=3 updated to 'B', id=4 inserted.
+        assert_eq!(
+            rows,
+            vec![
+                (Some(1), Some("a".into())),
+                (Some(3), Some("B".into())),
+                (Some(4), Some("D".into())),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_null_first_column_still_classifies_as_matched() {
+        // #374: a present target row whose FIRST column is NULL must still be
+        // classified matched (via the presence flag), not misread as absent.
+        // Column order puts the nullable non-key column first; join is on id.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("v", DataType::Utf8, true),
+            Field::new("id", DataType::Int32, true),
+        ]));
+        let tgt = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec![None::<&str>])),
+                Arc::new(Int32Array::from(vec![Some(2)])),
+            ],
+        )
+        .unwrap();
+        let src = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec![Some("new")])),
+                Arc::new(Int32Array::from(vec![Some(2)])),
+            ],
+        )
+        .unwrap();
+        let ctx = SessionContext::new();
+        ctx.register_batch("__merge_target_x", tgt).unwrap();
+        ctx.register_batch("__merge_source_x", src).unwrap();
+
+        let sql = "MERGE INTO tgt AS t USING src AS s ON t.id = s.id \
+                   WHEN MATCHED THEN UPDATE SET v = s.v";
+        let out = build(sql, &["v", "id"], &["v", "id"]);
+        let batches = run_sql(&ctx, &out).await;
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 1, "matched row must survive as one updated row");
+        let vs = batches[0].column(0).as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(vs.value(0), "new", "matched row must be updated, not dropped/inserted");
+    }
+
+    #[tokio::test]
+    async fn execute_cardinality_check_detects_and_passes() {
+        let tc = cols(&["id", "v"]);
+        let sc = cols(&["id", "v"]);
+        let n = names(&tc, &sc);
+        let (pair_sql, matched_sql) = build_cardinality_check_sql(
+            &n,
+            "datafusion.public.__merge_target_x",
+            "datafusion.public.__merge_source_x",
+            "__merge_target_x.id = __merge_source_x.id",
+        );
+        let count = |batches: Vec<RecordBatch>| -> i64 {
+            batches[0].column(0).as_any().downcast_ref::<Int64Array>().unwrap().value(0)
+        };
+
+        // Duplicate source key 1 -> target row 1 matches twice -> violation.
+        let ctx = SessionContext::new();
+        ctx.register_batch("__merge_target_x", id_v_batch(vec![Some(1)], vec![Some("a")]))
+            .unwrap();
+        ctx.register_batch(
+            "__merge_source_x",
+            id_v_batch(vec![Some(1), Some(1)], vec![Some("x"), Some("y")]),
+        )
+        .unwrap();
+        let pair = count(run_sql(&ctx, &pair_sql).await);
+        let matched = count(run_sql(&ctx, &matched_sql).await);
+        assert!(pair > matched, "duplicate source key must violate: {pair} vs {matched}");
+
+        // Unique source keys -> no violation.
+        let ctx2 = SessionContext::new();
+        ctx2.register_batch("__merge_target_x", id_v_batch(vec![Some(1)], vec![Some("a")]))
+            .unwrap();
+        ctx2.register_batch(
+            "__merge_source_x",
+            id_v_batch(vec![Some(1), Some(2)], vec![Some("x"), Some("y")]),
+        )
+        .unwrap();
+        let pair2 = count(run_sql(&ctx2, &pair_sql).await);
+        let matched2 = count(run_sql(&ctx2, &matched_sql).await);
+        assert!(pair2 <= matched2, "unique keys must not violate: {pair2} vs {matched2}");
+    }
+
+    use arrow_array::Int64Array;
 }
