@@ -601,18 +601,16 @@ impl WriteHandler {
     }
 
     /// Run the source plan through the configured policy enforcer, if any.
-    /// Used by INSERT / CTAS / DELETE / UPDATE source SELECTs so row filters,
-    /// column masks, and column restrictions apply on writes too.
+    /// Used by INSERT / CTAS source SELECTs so row filters, column masks,
+    /// and column restrictions apply on writes too.
     async fn enforce_source_plan(
         &self,
         session: &Session,
         plan: LogicalPlan,
-    ) -> sqe_core::Result<LogicalPlan> {
+    ) -> sqe_core::Result<(LogicalPlan, sqe_policy::PolicySummary)> {
         match &self.policy_enforcer {
-            // The write path does not yet surface a policy summary to the audit
-            // log (deferred — see review note); discard it here.
-            Some(enf) => enf.evaluate(&session.user, plan).await.map(|(p, _summary)| p),
-            None => Ok(plan),
+            Some(enf) => enf.evaluate(&session.user, plan).await,
+            None => Ok((plan, sqe_policy::PolicySummary::default())),
         }
     }
 
@@ -625,6 +623,7 @@ impl WriteHandler {
         session: &Session,
         table_ident: &TableIdent,
         schema: Arc<ArrowSchema>,
+        policy_summary_out: &mut Option<sqe_policy::PolicySummary>,
     ) -> sqe_core::Result<sqe_policy::write_predicates::WritePolicyPredicates> {
         let Some(enf) = &self.policy_enforcer else {
             return Ok(sqe_policy::write_predicates::WritePolicyPredicates::default());
@@ -637,14 +636,16 @@ impl WriteHandler {
             .last()
             .cloned()
             .unwrap_or_else(|| "default".to_string());
-        sqe_policy::write_predicates::extract_write_predicates(
+        let (predicates, summary) = sqe_policy::write_predicates::extract_write_predicates(
             enf.as_ref(),
             &session.user,
             &namespace_key,
             table_ident.name(),
             schema,
         )
-        .await
+        .await?;
+        *policy_summary_out = Some(summary);
+        Ok(predicates)
     }
 
     /// Return the Parquet compression codec for this write.
@@ -1068,6 +1069,7 @@ impl WriteHandler {
         ctx: &DFSessionContext,
         select_sql: &str,
         plan_out: &mut Option<sqe_lineage::PlanOrHint>,
+        policy_summary_out: &mut Option<sqe_policy::PolicySummary>,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         let (table_name, _or_replace, partition_by, user_options) = match stmt {
             Statement::CreateTable(ct) => {
@@ -1103,9 +1105,10 @@ impl WriteHandler {
         // Enforce policy on the source SELECT so masks and restrictions
         // shape the target table. Without this, CTAS over a masked table
         // creates a sink with plaintext columns.
-        let enforced_source = self
+        let (enforced_source, policy_summary) = self
             .enforce_source_plan(session, df.logical_plan().clone())
             .await?;
+        *policy_summary_out = Some(policy_summary);
         let df = ctx
             .execute_logical_plan(enforced_source)
             .await
@@ -1263,6 +1266,7 @@ impl WriteHandler {
         ctx: &DFSessionContext,
         select_sql: &str,
         plan_out: &mut Option<sqe_lineage::PlanOrHint>,
+        policy_summary_out: &mut Option<sqe_policy::PolicySummary>,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         let (table_name, explicit_columns) = match stmt {
             Statement::Insert(ins) => match &ins.table {
@@ -1316,7 +1320,9 @@ impl WriteHandler {
         // source SELECT. Without this, INSERT INTO sink SELECT FROM masked
         // would copy plaintext into sink, bypassing every policy.
         let source_plan = df.logical_plan().clone();
-        let enforced_plan = self.enforce_source_plan(session, source_plan).await?;
+        let (enforced_plan, policy_summary) =
+            self.enforce_source_plan(session, source_plan).await?;
+        *policy_summary_out = Some(policy_summary);
 
         let (lin_catalog, lin_namespace, lin_table) =
             lineage_target_parts(&self.config, &table_ident);
@@ -1941,13 +1947,14 @@ impl WriteHandler {
     ///
     /// Without a WHERE clause, this is a truncate: commits a rewrite that
     /// removes all data files.
-    #[instrument(skip(self, session, stmt, catalog, ctx), fields(username = %session.user.username))]
+    #[instrument(skip(self, session, stmt, catalog, ctx, policy_summary_out), fields(username = %session.user.username))]
     pub async fn handle_delete(
         &self,
         session: &Session,
         stmt: &Statement,
         catalog: Arc<SessionCatalog>,
         ctx: &DFSessionContext,
+        policy_summary_out: &mut Option<sqe_policy::PolicySummary>,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         let table_ident = resolve_delete_target_ident(stmt, session)?;
         let delete = match stmt {
@@ -1966,7 +1973,7 @@ impl WriteHandler {
         // optimistic-concurrency conflict.
         let target_schema = build_arrow_schema_for_table(&table)?;
         let predicates = self
-            .compute_write_predicates(session, &table_ident, target_schema)
+            .compute_write_predicates(session, &table_ident, target_schema, policy_summary_out)
             .await?;
 
         // No WHERE = truncate. With no policy row filter we keep the fast
@@ -2160,13 +2167,14 @@ impl WriteHandler {
     /// Without a WHERE clause this falls back to the CoW truncate path (same as
     /// `handle_delete`), since there is no efficiency benefit to writing delete files
     /// for every row.
-    #[instrument(skip(self, session, stmt, catalog, ctx), fields(username = %session.user.username))]
+    #[instrument(skip(self, session, stmt, catalog, ctx, policy_summary_out), fields(username = %session.user.username))]
     pub async fn handle_delete_mor(
         &self,
         session: &Session,
         stmt: &Statement,
         catalog: Arc<SessionCatalog>,
         ctx: &DFSessionContext,
+        policy_summary_out: &mut Option<sqe_policy::PolicySummary>,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         let table_ident = resolve_delete_target_ident(stmt, session)?;
         let delete = match stmt {
@@ -2188,7 +2196,7 @@ impl WriteHandler {
         let where_clause = &delete.selection;
         let target_schema = build_arrow_schema_for_table(&table)?;
         let predicates = self
-            .compute_write_predicates(session, &table_ident, target_schema)
+            .compute_write_predicates(session, &table_ident, target_schema, policy_summary_out)
             .await?;
 
         // No WHERE clause and no policy row filter: keep the fast truncate
@@ -2323,13 +2331,14 @@ impl WriteHandler {
     /// The file is committed via `RowDeltaAction` so the operation classifies
     /// as `Overwrite` with `added-delete-files=1` in the snapshot summary,
     /// matching Java Iceberg and Spark semantics.
-    #[instrument(skip(self, session, stmt, catalog, ctx), fields(username = %session.user.username))]
+    #[instrument(skip(self, session, stmt, catalog, ctx, policy_summary_out), fields(username = %session.user.username))]
     pub async fn handle_delete_equality(
         &self,
         session: &Session,
         stmt: &Statement,
         catalog: Arc<SessionCatalog>,
         ctx: &DFSessionContext,
+        policy_summary_out: &mut Option<sqe_policy::PolicySummary>,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         let table_ident = resolve_delete_target_ident(stmt, session)?;
         let delete = match stmt {
@@ -2361,7 +2370,7 @@ impl WriteHandler {
         let where_clause = &delete.selection;
         let target_schema = build_arrow_schema_for_table(&table)?;
         let predicates = self
-            .compute_write_predicates(session, &table_ident, target_schema)
+            .compute_write_predicates(session, &table_ident, target_schema, policy_summary_out)
             .await?;
 
         // DELETE without WHERE and without a policy row filter: fall back
@@ -2507,6 +2516,7 @@ impl WriteHandler {
         catalog: Arc<SessionCatalog>,
         ctx: &DFSessionContext,
         plan_out: &mut Option<sqe_lineage::PlanOrHint>,
+        policy_summary_out: &mut Option<sqe_policy::PolicySummary>,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         // Resolve the target catalog from the table reference, mirroring INSERT,
         // so a DELETE against a discovered/non-default catalog loads and commits
@@ -2525,13 +2535,19 @@ impl WriteHandler {
         // load error falls through to the default CoW path, which surfaces
         // the error at that point.
         let Ok(table_factor_name) = delete_target_object_name(stmt) else {
-            return self.handle_delete(session, stmt, catalog, ctx).await;
+            return self
+                .handle_delete(session, stmt, catalog, ctx, policy_summary_out)
+                .await;
         };
         let Some(table_ident) = try_resolve_delete_target_ident(stmt, session) else {
-            return self.handle_delete(session, stmt, catalog, ctx).await;
+            return self
+                .handle_delete(session, stmt, catalog, ctx, policy_summary_out)
+                .await;
         };
         let Ok(table) = catalog.load_table(&table_ident).await else {
-            return self.handle_delete(session, stmt, catalog, ctx).await;
+            return self
+                .handle_delete(session, stmt, catalog, ctx, policy_summary_out)
+                .await;
         };
 
         // Capture lineage: a DELETE rewrites the target in place, so the
@@ -2558,18 +2574,21 @@ impl WriteHandler {
                         table = %table_ident,
                         "DELETE dispatch: MoR + equality deletes"
                     );
-                    self.handle_delete_equality(session, stmt, catalog, ctx).await
+                    self.handle_delete_equality(session, stmt, catalog, ctx, policy_summary_out)
+                        .await
                 } else {
                     info!(
                         table = %table_ident,
                         "DELETE dispatch: MoR + position deletes (no PK declared)"
                     );
-                    self.handle_delete_mor(session, stmt, catalog, ctx).await
+                    self.handle_delete_mor(session, stmt, catalog, ctx, policy_summary_out)
+                        .await
                 }
             }
             WriteMode::CopyOnWrite => {
                 info!(table = %table_ident, "DELETE dispatch: CoW");
-                self.handle_delete(session, stmt, catalog, ctx).await
+                self.handle_delete(session, stmt, catalog, ctx, policy_summary_out)
+                    .await
             }
         }
     }
@@ -2578,13 +2597,14 @@ impl WriteHandler {
     ///
     /// Uses Copy-on-Write: reads all data files, applies SET assignments to
     /// rows matching WHERE, writes new files, atomically swaps.
-    #[instrument(skip(self, session, stmt, catalog, ctx), fields(username = %session.user.username))]
+    #[instrument(skip(self, session, stmt, catalog, ctx, policy_summary_out), fields(username = %session.user.username))]
     pub async fn handle_update(
         &self,
         session: &Session,
         stmt: &Statement,
         catalog: Arc<SessionCatalog>,
         ctx: &DFSessionContext,
+        policy_summary_out: &mut Option<sqe_policy::PolicySummary>,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         let table_ident = resolve_update_target_ident(stmt, session)?;
         let (assignments, selection) = match stmt {
@@ -2602,7 +2622,7 @@ impl WriteHandler {
         // the initial snapshot, consistent with UPDATE's snapshot isolation.
         let target_schema = build_arrow_schema_for_table(&table)?;
         let predicates = self
-            .compute_write_predicates(session, &table_ident, target_schema)
+            .compute_write_predicates(session, &table_ident, target_schema, policy_summary_out)
             .await?;
         // Build the SET clause as SQL CASE expressions for a SELECT rewrite:
         // UPDATE t SET c1=e1 WHERE cond  ->  SELECT CASE WHEN cond THEN e1 ELSE c1 END, ...
@@ -2762,6 +2782,7 @@ impl WriteHandler {
         catalog: Arc<SessionCatalog>,
         ctx: &DFSessionContext,
         plan_out: &mut Option<sqe_lineage::PlanOrHint>,
+        policy_summary_out: &mut Option<sqe_policy::PolicySummary>,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         // Resolve the target catalog from the table reference, mirroring INSERT,
         // so an UPDATE against a discovered/non-default catalog loads and commits
@@ -2776,13 +2797,19 @@ impl WriteHandler {
 
         // Peek at the target table to read its properties.
         let Ok(table_factor_name) = update_target_object_name(stmt) else {
-            return self.handle_update(session, stmt, catalog, ctx).await;
+            return self
+                .handle_update(session, stmt, catalog, ctx, policy_summary_out)
+                .await;
         };
         let Some(table_ident) = try_resolve_update_target_ident(stmt, session) else {
-            return self.handle_update(session, stmt, catalog, ctx).await;
+            return self
+                .handle_update(session, stmt, catalog, ctx, policy_summary_out)
+                .await;
         };
         let Ok(table) = catalog.load_table(&table_ident).await else {
-            return self.handle_update(session, stmt, catalog, ctx).await;
+            return self
+                .handle_update(session, stmt, catalog, ctx, policy_summary_out)
+                .await;
         };
 
         // Capture lineage: UPDATE rewrites target rows in place. v1 emits
@@ -2806,18 +2833,21 @@ impl WriteHandler {
                         table = %table_ident,
                         "UPDATE dispatch: MoR + equality deletes"
                     );
-                    self.handle_update_equality(session, stmt, catalog, ctx).await
+                    self.handle_update_equality(session, stmt, catalog, ctx, policy_summary_out)
+                        .await
                 } else {
                     info!(
                         table = %table_ident,
                         "UPDATE dispatch: MoR requested but no PK; falling back to CoW"
                     );
-                    self.handle_update(session, stmt, catalog, ctx).await
+                    self.handle_update(session, stmt, catalog, ctx, policy_summary_out)
+                        .await
                 }
             }
             WriteMode::CopyOnWrite => {
                 info!(table = %table_ident, "UPDATE dispatch: CoW");
-                self.handle_update(session, stmt, catalog, ctx).await
+                self.handle_update(session, stmt, catalog, ctx, policy_summary_out)
+                    .await
             }
         }
     }
@@ -2835,13 +2865,14 @@ impl WriteHandler {
     /// `trade_result_update_holding` pattern benefits here because the
     /// working set is the small set of matched rows, not every file in
     /// the partition.
-    #[instrument(skip(self, session, stmt, catalog, ctx), fields(username = %session.user.username))]
+    #[instrument(skip(self, session, stmt, catalog, ctx, policy_summary_out), fields(username = %session.user.username))]
     pub async fn handle_update_equality(
         &self,
         session: &Session,
         stmt: &Statement,
         catalog: Arc<SessionCatalog>,
         ctx: &DFSessionContext,
+        policy_summary_out: &mut Option<sqe_policy::PolicySummary>,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         let table_ident = resolve_update_target_ident(stmt, session)?;
         let (assignments, selection) = match stmt {
@@ -2875,7 +2906,7 @@ impl WriteHandler {
 
         let target_schema = build_arrow_schema_for_table(&table)?;
         let predicates = self
-            .compute_write_predicates(session, &table_ident, target_schema)
+            .compute_write_predicates(session, &table_ident, target_schema, policy_summary_out)
             .await?;
 
         let raw_where = selection
@@ -7604,8 +7635,9 @@ s3_path_style = true
             vec![],
         );
         let before = format!("{plan:?}");
-        let after = handler.enforce_source_plan(&session, plan).await.unwrap();
+        let (after, summary) = handler.enforce_source_plan(&session, plan).await.unwrap();
         assert_eq!(before, format!("{after:?}"));
+        assert_eq!(summary, sqe_policy::PolicySummary::default());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -7649,12 +7681,13 @@ s3_path_style = true
             chrono::Utc::now(),
             vec![],
         );
-        let rewritten = handler.enforce_source_plan(&session, plan).await.unwrap();
+        let (rewritten, summary) = handler.enforce_source_plan(&session, plan).await.unwrap();
         let s = format!("{}", rewritten.display_indent());
         assert!(
             s.contains("Projection:") && s.contains("\"***\""),
             "expected redacted projection, got: {s}"
         );
+        assert_eq!(summary.columns_masked, vec!["ssn".to_string()]);
 
         // Also verify the rewriter trait method can be called via the field
         // (the `_` import keeps the trait in scope even if a future code
@@ -7740,8 +7773,9 @@ s3_path_style = true
             Field::new("ssn", DataType::Utf8, true),
             Field::new("region", DataType::Utf8, true),
         ]));
+        let mut policy_summary = None;
         handler
-            .compute_write_predicates(session, table_ident, schema)
+            .compute_write_predicates(session, table_ident, schema, &mut policy_summary)
             .await
             .unwrap()
     }

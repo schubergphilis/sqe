@@ -1059,6 +1059,7 @@ impl QueryHandler {
                                     &ctx,
                                     &select_sql,
                                     &mut captured_plan,
+                                    &mut policy_summary,
                                 )
                                 .await;
                             crate::session_context::invalidate_session_cache(&session.user.username).await;
@@ -1088,6 +1089,7 @@ impl QueryHandler {
                                 &ctx,
                                 &select_sql,
                                 &mut captured_plan,
+                                &mut policy_summary,
                             )
                             .await
                     } else {
@@ -1112,6 +1114,7 @@ impl QueryHandler {
                             session_catalog,
                             &ctx,
                             &mut captured_plan,
+                            &mut policy_summary,
                         )
                         .await
                 }
@@ -1128,6 +1131,7 @@ impl QueryHandler {
                             session_catalog,
                             &ctx,
                             &mut captured_plan,
+                            &mut policy_summary,
                         )
                         .await
                 }
@@ -1175,6 +1179,7 @@ impl QueryHandler {
                                 session_catalog,
                                 &ctx,
                                 &mut captured_plan,
+                                &mut policy_summary,
                             )
                             .await
                     } else {
@@ -1813,20 +1818,57 @@ impl QueryHandler {
                     session.user.groups.clone(),
                 );
 
+                let is_dml = matches!(
+                    &kind,
+                    StatementKind::Insert(_)
+                        | StatementKind::Ctas(_)
+                        | StatementKind::Merge(_)
+                        | StatementKind::Delete(_)
+                        | StatementKind::Update(_)
+                        | StatementKind::Truncate(_)
+                );
+                let ps = policy_summary.unwrap_or_default();
+                let policy = if is_dml
+                    && (ps.row_filters_applied > 0
+                        || !ps.columns_masked.is_empty()
+                        || !ps.columns_restricted.is_empty()
+                        || ps.denied)
+                {
+                    Some(sqe_metrics::audit::PolicyAudit {
+                        row_filters_applied: ps.row_filters_applied,
+                        columns_masked: ps.columns_masked,
+                        columns_restricted: ps.columns_restricted,
+                        denied: ps.denied,
+                    })
+                } else {
+                    None
+                };
+                let stats = if is_dml {
+                    Some(sqe_metrics::audit::QueryStats {
+                        rows_returned: rows,
+                        bytes_scanned: pm.bytes_scanned,
+                        rows_scanned: pm.rows_scanned,
+                        spill_bytes: pm.spill_bytes,
+                        peak_memory_bytes: pm.peak_memory_bytes,
+                    })
+                } else {
+                    None
+                };
+
                 let ddl_event = sqe_metrics::audit::AuditEvent {
                     time: chrono::Utc::now(),
                     kind: audit_kind,
                     actor: ddl_actor,
                     outcome: ddl_outcome,
                     resources: audit_resources,
-                    policy: None,
+                    policy,
                     timing: Some(sqe_metrics::audit::Timing {
                         duration_ms: duration.as_millis() as u64,
                         queued_ms: 0,
                         planning_ms: 0,
-                        execution_ms: 0,
+                        execution_ms: if is_dml { execution_ms } else { 0 },
                     }),
-                    stats: None,
+                    stats,
                     query: Some(sqe_metrics::audit::QueryInfo {
                         text: Some(sql.to_string()),
                         query_hash: sqe_metrics::audit::query_hash(sql),
