@@ -880,7 +880,10 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
     let sampler_tracker = query_tracker.clone();
 
     // Metrics & audit
-    let metrics = Arc::new(sqe_metrics::MetricsRegistry::new());
+    let metrics = Arc::new(
+        sqe_metrics::MetricsRegistry::new()
+            .map_err(|e| anyhow::anyhow!("failed to initialize metrics registry: {e}"))?,
+    );
 
     sqe_metrics::server::start_metrics_server(metrics.clone(), config.metrics.prometheus_port);
     tracing::info!("Prometheus metrics on port {}", config.metrics.prometheus_port);
@@ -1474,7 +1477,10 @@ async fn run_worker(config: SqeConfig) -> anyhow::Result<()> {
     let port = config.worker.flight_port;
     let addr = format!("0.0.0.0:{port}").parse()?;
 
-    let worker_metrics = Arc::new(sqe_metrics::WorkerMetricsRegistry::new());
+    let worker_metrics = Arc::new(
+        sqe_metrics::WorkerMetricsRegistry::new()
+            .map_err(|e| anyhow::anyhow!("failed to initialize worker metrics registry: {e}"))?,
+    );
     sqe_metrics::server::start_metrics_server(
         worker_metrics.clone(),
         config.metrics.prometheus_port,

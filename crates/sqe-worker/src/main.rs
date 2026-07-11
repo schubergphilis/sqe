@@ -18,7 +18,10 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // Worker-specific Prometheus metrics
-    let worker_metrics = Arc::new(WorkerMetricsRegistry::new());
+    let worker_metrics = Arc::new(
+        WorkerMetricsRegistry::new()
+            .map_err(|e| anyhow::anyhow!("failed to initialize worker metrics registry: {e}"))?,
+    );
     sqe_metrics::server::start_metrics_server(
         worker_metrics.clone(),
         config.metrics.prometheus_port,

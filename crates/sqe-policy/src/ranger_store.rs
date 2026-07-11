@@ -834,7 +834,7 @@ mod tests {
             breaker_failure_threshold: 1,
             ..RangerPolicyConfig::default()
         };
-        let metrics = Arc::new(MetricsRegistry::new());
+        let metrics = Arc::new(MetricsRegistry::new().unwrap());
         let store = RangerStore::from_config(&cfg).unwrap().with_metrics(metrics.clone());
 
         // First fetch fails (transport error) -> record_failure opens the
@@ -864,7 +864,7 @@ mod tests {
     /// call (the miss path would hit `cached_bundle`/`fetch_bundle`).
     #[tokio::test]
     async fn cache_hit_counter_increments_on_ranger() {
-        let metrics = Arc::new(MetricsRegistry::new());
+        let metrics = Arc::new(MetricsRegistry::new().unwrap());
         let store = RangerStore::from_config(&RangerPolicyConfig::default())
             .unwrap()
             .with_metrics(metrics.clone());
