@@ -5,6 +5,7 @@
 //! boundaries via tonic [`MetadataMap`].
 
 use opentelemetry::propagation::{Extractor, Injector};
+use opentelemetry::trace::TraceContextExt;
 use tonic::metadata::{MetadataKey, MetadataMap, MetadataValue};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
@@ -120,6 +121,23 @@ pub fn trace_context_http_headers() -> Vec<(String, String)> {
         propagator.inject_context(&cx, &mut VecInjector(&mut headers));
     });
     headers
+}
+
+/// Return the current active trace ID (32-char lowercase hex) if a valid
+/// OpenTelemetry span context is present on the current tracing span.
+/// Returns None when OTel is not initialized or no sampled span is active.
+///
+/// Used to stamp `trace_id` onto `AuditEvent` and query records for
+/// correlation (full-audit O4).
+pub fn current_trace_id() -> Option<String> {
+    let cx = tracing::Span::current().context();
+    let span_ref = cx.span();
+    let sc = span_ref.span_context();
+    if sc.is_valid() {
+        Some(format!("{:032x}", sc.trace_id()))
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
