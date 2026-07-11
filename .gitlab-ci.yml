@@ -208,6 +208,37 @@ integration-test:
       allow_failure: true
   timeout: 1h
 
+# ── Distributed smoke (Q-05) ───────────────────────────────────
+# Runs the distributed dispatch test (test_distributed_select) against
+# the coordinator + 2 workers stack. Uses the same dind + Alpine setup
+# as integration-test but overlays docker-compose.distributed.yml and
+# sets DISTRIBUTED=1 so the integration script brings up workers and
+# does not skip the distributed test. This ensures worker dispatch and
+# system.runtime.tasks visibility do not regress.
+distributed-smoke:
+  stage: test
+  image: docker:24
+  services:
+    - name: docker:24-dind
+      alias: docker
+      command: ["--tls=false", "--host=tcp://0.0.0.0:2375"]
+  variables:
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_TLS_CERTDIR: ""
+    DOCKER_DRIVER: overlay2
+    DISTRIBUTED: "1"
+  before_script:
+    - apk add --no-cache bash curl docker-compose rust cargo cmake protobuf-dev openssl-dev pkgconfig clang mold
+  script:
+    - ./scripts/integration-test.sh test_distributed_select
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+    - if: '$CI_COMMIT_BRANCH == "main" && $CI_PIPELINE_SOURCE == "push"'
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: manual
+      allow_failure: true
+  timeout: 1h
+
 # ── Quickstart scenario tests (Tier 2) ─────────────────────────
 # Tier 2 of scripts/test.sh: runs every SELF_CONTAINED quickstart through its
 # run.sh --check. Each scenario brings up its own docker-compose stack (Polaris,
