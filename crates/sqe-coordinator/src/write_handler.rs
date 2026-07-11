@@ -3537,6 +3537,24 @@ impl WriteHandler {
         Ok(affected_rows_batch(total_rows))
     }
 
+    /// Plan + collect one MoR MERGE sub-query, mapping errors to a labelled
+    /// `SqeError::Execution`. Shared by the matched / not-matched / by-source
+    /// clause loops.
+    async fn run_merge_subquery(
+        &self,
+        ctx: &DFSessionContext,
+        sql: &str,
+        label: &str,
+    ) -> sqe_core::Result<Vec<RecordBatch>> {
+        let df = ctx
+            .sql(sql)
+            .await
+            .map_err(|e| SqeError::Execution(format!("MoR MERGE {label} plan failed: {e}")))?;
+        df.collect()
+            .await
+            .map_err(|e| SqeError::Execution(format!("MoR MERGE {label} execution failed: {e}")))
+    }
+
     /// Dispatch MERGE to CoW or MoR based on `write.merge.mode`
     /// (Phase H, task 9.7).
     ///
@@ -3629,25 +3647,11 @@ impl WriteHandler {
         let mode = resolve_merge_mode(table.metadata().properties())?;
         match mode {
             WriteMode::MergeOnRead => {
-                // The equality path expresses exactly one unpredicated clause
-                // per row class; predicated / multi-clause / BY SOURCE merges
-                // (the dbt SCD2 snapshot shape) run copy-on-write instead.
-                let needs_cow = match stmt {
-                    Statement::Merge(merge) => {
-                        crate::merge_sql::merge_needs_cow(&merge.clauses)
-                    }
-                    _ => false,
-                };
-                if needs_cow {
-                    info!(
-                        table = %table_ident,
-                        "MERGE dispatch: clause shape needs CoW (predicates, \
-                         multiple clauses, or NOT MATCHED BY SOURCE)"
-                    );
-                    return self
-                        .handle_merge(session, stmt, source_batches, catalog, ctx)
-                        .await;
-                }
+                // The equality path now expresses the full clause surface
+                // (predicates, multiple clauses per class, and NOT MATCHED BY
+                // SOURCE) via first-match-wins guards, so every shape stays on
+                // MoR as long as the table declares a primary key. Without a PK
+                // there are no equality-delete keys, so fall back to CoW.
                 let has_ids = table
                     .metadata()
                     .current_schema()
@@ -3680,16 +3684,24 @@ impl WriteHandler {
 
     /// Handle MERGE INTO in Merge-on-Read mode.
     ///
-    /// The three MERGE clause branches map onto RowDelta inputs:
+    /// Supports the full clause surface via first-match-wins guards (one
+    /// guarded query per clause), so each MERGE clause maps onto RowDelta
+    /// inputs:
     ///
-    /// - `WHEN MATCHED THEN UPDATE`: emit a data file row with the new
-    ///   values and an equality-delete row with the matched target's PK.
+    /// - `WHEN MATCHED THEN UPDATE`: emit a data file row with the new values
+    ///   and an equality-delete row with the matched target's PK.
     /// - `WHEN MATCHED THEN DELETE`: emit an equality-delete row only.
     /// - `WHEN NOT MATCHED THEN INSERT`: emit a data file row only.
+    /// - `WHEN NOT MATCHED BY SOURCE THEN DELETE / UPDATE`: act on target-only
+    ///   rows (no source match) via an anti-join; DELETE emits an
+    ///   equality-delete, UPDATE emits the old PK as a delete plus the
+    ///   reassigned row as new data.
     ///
-    /// All outputs commit in one `RowDeltaAction`. Target rows that have
-    /// no matching source row pass through untouched: no rewrite, no
-    /// delete.
+    /// Multiple clauses per class are honored in statement order: a target row
+    /// belongs to the first clause in its class whose predicate passes, so the
+    /// per-clause guards are mutually exclusive and no row is emitted twice.
+    /// All outputs commit in one `RowDeltaAction`. Target rows claimed by no
+    /// clause pass through untouched: no rewrite, no delete.
     #[instrument(
         skip(self, session, stmt, source_batches, catalog, ctx),
         fields(username = %session.user.username)
@@ -3702,7 +3714,7 @@ impl WriteHandler {
         catalog: Arc<SessionCatalog>,
         ctx: &DFSessionContext,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
-        use sqlparser::ast::{MergeAction, MergeClauseKind, MergeInsertKind, TableFactor};
+        use sqlparser::ast::TableFactor;
 
         let (table_factor, source_factor, on_expr, clauses) = match stmt {
             Statement::Merge(merge) => {
@@ -3837,46 +3849,39 @@ impl WriteHandler {
             &source_ref,
         );
 
-        // Classify MERGE clauses.
-        let mut matched_update: Option<&[sqlparser::ast::Assignment]> = None;
-        let mut matched_delete = false;
-        let mut not_matched_insert: Option<(&[sqlparser::ast::ObjectName], &MergeInsertKind)> = None;
-        for clause in clauses {
-            match (&clause.clause_kind, &clause.action) {
-                // sqlparser 0.62: Update is a tuple variant (MergeUpdateExpr),
-                // Delete is a struct variant carrying a token.
-                (MergeClauseKind::Matched, MergeAction::Update(update_expr)) => {
-                    matched_update = Some(&update_expr.assignments);
-                }
-                (MergeClauseKind::Matched, MergeAction::Delete { .. }) => {
-                    matched_delete = true;
-                }
-                (
-                    MergeClauseKind::NotMatched | MergeClauseKind::NotMatchedByTarget,
-                    MergeAction::Insert(insert_expr),
-                ) => {
-                    not_matched_insert = Some((&insert_expr.columns, &insert_expr.kind));
-                }
-                (MergeClauseKind::NotMatchedBySource, MergeAction::Delete { .. }) => {
-                    return Err(SqeError::NotImplemented(
-                        "WHEN NOT MATCHED BY SOURCE THEN DELETE is not yet supported".to_string(),
-                    ));
-                }
-                _ => {
-                    return Err(SqeError::NotImplemented(format!(
-                        "Unsupported MERGE clause combination: {:?} / {:?}",
-                        clause.clause_kind, clause.action
-                    )));
-                }
-            }
+        // Classify clauses with the same classifier the CoW path uses: ordered
+        // per row class, predicates rewritten to scratch refs, Oracle
+        // sub-predicates rejected, NOT MATCHED BY SOURCE supported.
+        let merge_names = crate::merge_sql::MergeNames {
+            target_ref: &target_ref,
+            source_ref: &source_ref,
+            t_alias: &t_alias,
+            s_alias: &s_alias,
+            target_columns: &target_columns,
+            source_columns: &source_columns,
+        };
+        let classified = crate::merge_sql::classify_merge_clauses(clauses, &merge_names)?;
+        let (matched_count, not_matched_count, by_source_count) = classified.counts();
+
+        // Cardinality check (shared with CoW): a matched target row hit by more
+        // than one source row would be emitted multiple times. Only matched
+        // clauses can trigger it.
+        if self.config.query.merge_cardinality_check && matched_count > 0 {
+            let (pair_sql, matched_sql) = crate::merge_sql::build_cardinality_check_sql(
+                &merge_names,
+                &q_target,
+                &q_source,
+                &on_rewritten,
+            );
+            check_merge_cardinality(ctx, &pair_sql, &matched_sql).await?;
         }
 
         info!(
             table = %table_ident,
             on_condition = %on_sql,
-            matched_update = matched_update.is_some(),
-            matched_delete,
-            not_matched_insert = not_matched_insert.is_some(),
+            matched_count,
+            not_matched_count,
+            by_source_count,
             "MoR MERGE: planning row delta"
         );
 
@@ -3886,125 +3891,185 @@ impl WriteHandler {
         let mut deleted_rows: usize = 0;
         let mut inserted_rows: usize = 0;
 
-        // MATCHED UPDATE: INNER JOIN of target + source, emit new row per
-        // match plus an equality-delete row for the old target PK.
-        if let Some(assignments) = matched_update {
-            let update_cols: Vec<String> = target_columns
-                .iter()
-                .map(|col| {
-                    let expr = crate::merge_sql::resolve_update_expr(
-                        col,
-                        assignments,
-                        &target_ref,
-                        &source_ref,
-                        &t_alias,
-                        &s_alias,
-                    );
-                    format!("{expr} AS \"{col}\"")
-                })
-                .collect();
-            let new_sql = format!(
-                "SELECT {} FROM {q_target} INNER JOIN {q_source} ON {on_rewritten}",
-                update_cols.join(", ")
-            );
-            let df = ctx
-                .sql(&new_sql)
-                .await
-                .map_err(|e| SqeError::Execution(format!("MoR MERGE UPDATE plan failed: {e}")))?;
-            let batches = df.collect().await.map_err(|e| {
-                SqeError::Execution(format!("MoR MERGE UPDATE execution failed: {e}"))
-            })?;
-            for batch in batches {
-                updated_rows += batch.num_rows();
-                if batch.num_rows() > 0 {
-                    new_data_batches.push(batch);
-                }
-            }
-
-            // Old target rows for the equality delete. The writer projects
-            // identifier columns, so we select all target columns for the
-            // matched rows.
-            let old_cols: Vec<String> = target_columns
+        // Old-key projection for an equality delete: the writer projects the
+        // identifier fields, so selecting all target columns is sufficient.
+        let old_key_cols = || -> String {
+            target_columns
                 .iter()
                 .map(|col| format!("{target_ref}.\"{col}\" AS \"{col}\""))
-                .collect();
-            let old_sql = format!(
-                "SELECT {} FROM {q_target} INNER JOIN {q_source} ON {on_rewritten}",
-                old_cols.join(", ")
-            );
-            let df = ctx.sql(&old_sql).await.map_err(|e| {
-                SqeError::Execution(format!("MoR MERGE old-key plan failed: {e}"))
-            })?;
-            let batches = df.collect().await.map_err(|e| {
-                SqeError::Execution(format!("MoR MERGE old-key execution failed: {e}"))
-            })?;
-            for batch in batches {
-                if batch.num_rows() > 0 {
-                    equality_delete_batches.push(batch);
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+
+        // MATCHED clauses (INNER JOIN target+source). First-match-wins guards
+        // make each matched target row belong to at most one clause, so no row
+        // is emitted twice across clauses.
+        for (i, clause) in classified.matched.iter().enumerate() {
+            let guard = crate::merge_sql::first_match_guard(&classified.matched, i);
+            match &clause.op {
+                crate::merge_sql::MergeOp::Update(assignments) => {
+                    let update_cols: Vec<String> = target_columns
+                        .iter()
+                        .map(|col| {
+                            let expr = crate::merge_sql::resolve_update_expr(
+                                col,
+                                assignments,
+                                &target_ref,
+                                &source_ref,
+                                &t_alias,
+                                &s_alias,
+                            );
+                            format!("{expr} AS \"{col}\"")
+                        })
+                        .collect();
+                    let new_sql = format!(
+                        "SELECT {} FROM {q_target} INNER JOIN {q_source} ON {on_rewritten} WHERE {guard}",
+                        update_cols.join(", ")
+                    );
+                    for batch in self
+                        .run_merge_subquery(ctx, &new_sql, "MATCHED UPDATE new-row")
+                        .await?
+                    {
+                        updated_rows += batch.num_rows();
+                        if batch.num_rows() > 0 {
+                            new_data_batches.push(batch);
+                        }
+                    }
+                    let old_sql = format!(
+                        "SELECT {} FROM {q_target} INNER JOIN {q_source} ON {on_rewritten} WHERE {guard}",
+                        old_key_cols()
+                    );
+                    for batch in self
+                        .run_merge_subquery(ctx, &old_sql, "MATCHED UPDATE old-key")
+                        .await?
+                    {
+                        if batch.num_rows() > 0 {
+                            equality_delete_batches.push(batch);
+                        }
+                    }
+                }
+                crate::merge_sql::MergeOp::Delete => {
+                    let del_sql = format!(
+                        "SELECT {} FROM {q_target} INNER JOIN {q_source} ON {on_rewritten} WHERE {guard}",
+                        old_key_cols()
+                    );
+                    for batch in self
+                        .run_merge_subquery(ctx, &del_sql, "MATCHED DELETE")
+                        .await?
+                    {
+                        deleted_rows += batch.num_rows();
+                        if batch.num_rows() > 0 {
+                            equality_delete_batches.push(batch);
+                        }
+                    }
+                }
+                crate::merge_sql::MergeOp::Insert(..) => {
+                    return Err(SqeError::Execution(
+                        "internal error: INSERT classified as a matched MERGE clause".to_string(),
+                    ));
                 }
             }
         }
 
-        // MATCHED DELETE: emit equality-delete rows only, no new data file.
-        if matched_delete {
-            let old_cols: Vec<String> = target_columns
-                .iter()
-                .map(|col| format!("{target_ref}.\"{col}\" AS \"{col}\""))
-                .collect();
-            let del_sql = format!(
-                "SELECT {} FROM {q_target} INNER JOIN {q_source} ON {on_rewritten}",
-                old_cols.join(", ")
-            );
-            let df = ctx.sql(&del_sql).await.map_err(|e| {
-                SqeError::Execution(format!("MoR MERGE DELETE plan failed: {e}"))
-            })?;
-            let batches = df.collect().await.map_err(|e| {
-                SqeError::Execution(format!("MoR MERGE DELETE execution failed: {e}"))
-            })?;
-            for batch in batches {
-                deleted_rows += batch.num_rows();
-                if batch.num_rows() > 0 {
-                    equality_delete_batches.push(batch);
+        // NOT MATCHED (source-only): INSERT via anti-join from source to target.
+        for (i, clause) in classified.not_matched.iter().enumerate() {
+            let guard = crate::merge_sql::first_match_guard(&classified.not_matched, i);
+            if let crate::merge_sql::MergeOp::Insert(insert_cols, insert_kind) = &clause.op {
+                let insert_exprs: Vec<String> = target_columns
+                    .iter()
+                    .map(|col| {
+                        let expr = crate::merge_sql::resolve_insert_expr(
+                            col,
+                            insert_cols,
+                            insert_kind,
+                            &source_ref,
+                            &source_columns,
+                            &s_alias,
+                            &t_alias,
+                            &target_ref,
+                        );
+                        format!("{expr} AS \"{col}\"")
+                    })
+                    .collect();
+                let insert_sql = format!(
+                    "SELECT {} FROM {q_source} WHERE NOT EXISTS \
+                     (SELECT 1 FROM {q_target} WHERE {on_rewritten}) AND ({guard})",
+                    insert_exprs.join(", ")
+                );
+                for batch in self
+                    .run_merge_subquery(ctx, &insert_sql, "NOT MATCHED INSERT")
+                    .await?
+                {
+                    inserted_rows += batch.num_rows();
+                    if batch.num_rows() > 0 {
+                        new_data_batches.push(batch);
+                    }
                 }
             }
         }
 
-        // NOT MATCHED INSERT: LEFT ANTI JOIN from source to target.
-        if let Some((insert_cols, insert_kind)) = not_matched_insert {
-            let insert_exprs: Vec<String> = target_columns
-                .iter()
-                .map(|col| {
-                    let expr = crate::merge_sql::resolve_insert_expr(
-                        col,
-                        insert_cols,
-                        insert_kind,
-                        &source_ref,
-                        &source_columns,
-                        &s_alias,
-                        &t_alias,
-                        &target_ref,
-                    );
-                    format!("{expr} AS \"{col}\"")
-                })
-                .collect();
-            // A source row is "not matched" when the JOIN on the ON
-            // condition does not find a target row. LEFT ANTI JOIN gives
-            // that directly.
-            let insert_sql = format!(
-                "SELECT {} FROM {q_source} WHERE NOT EXISTS \
-                 (SELECT 1 FROM {q_target} WHERE {on_rewritten})",
-                insert_exprs.join(", ")
+        // NOT MATCHED BY SOURCE (target-only): UPDATE / DELETE target rows with
+        // no source match. Source columns are absent for this class, so a BY
+        // SOURCE clause references target columns only (SQL standard); a source
+        // reference would fail to plan here.
+        for (i, clause) in classified.by_source.iter().enumerate() {
+            let guard = crate::merge_sql::first_match_guard(&classified.by_source, i);
+            let anti = format!(
+                "FROM {q_target} WHERE NOT EXISTS \
+                 (SELECT 1 FROM {q_source} WHERE {on_rewritten}) AND ({guard})"
             );
-            let df = ctx.sql(&insert_sql).await.map_err(|e| {
-                SqeError::Execution(format!("MoR MERGE INSERT plan failed: {e}"))
-            })?;
-            let batches = df.collect().await.map_err(|e| {
-                SqeError::Execution(format!("MoR MERGE INSERT execution failed: {e}"))
-            })?;
-            for batch in batches {
-                inserted_rows += batch.num_rows();
-                if batch.num_rows() > 0 {
-                    new_data_batches.push(batch);
+            match &clause.op {
+                crate::merge_sql::MergeOp::Delete => {
+                    let del_sql = format!("SELECT {} {anti}", old_key_cols());
+                    for batch in self
+                        .run_merge_subquery(ctx, &del_sql, "BY SOURCE DELETE")
+                        .await?
+                    {
+                        deleted_rows += batch.num_rows();
+                        if batch.num_rows() > 0 {
+                            equality_delete_batches.push(batch);
+                        }
+                    }
+                }
+                crate::merge_sql::MergeOp::Update(assignments) => {
+                    let new_cols: Vec<String> = target_columns
+                        .iter()
+                        .map(|col| {
+                            let expr = crate::merge_sql::resolve_update_expr(
+                                col,
+                                assignments,
+                                &target_ref,
+                                &source_ref,
+                                &t_alias,
+                                &s_alias,
+                            );
+                            format!("{expr} AS \"{col}\"")
+                        })
+                        .collect();
+                    let new_sql = format!("SELECT {} {anti}", new_cols.join(", "));
+                    for batch in self
+                        .run_merge_subquery(ctx, &new_sql, "BY SOURCE UPDATE new-row")
+                        .await?
+                    {
+                        updated_rows += batch.num_rows();
+                        if batch.num_rows() > 0 {
+                            new_data_batches.push(batch);
+                        }
+                    }
+                    let old_sql = format!("SELECT {} {anti}", old_key_cols());
+                    for batch in self
+                        .run_merge_subquery(ctx, &old_sql, "BY SOURCE UPDATE old-key")
+                        .await?
+                    {
+                        if batch.num_rows() > 0 {
+                            equality_delete_batches.push(batch);
+                        }
+                    }
+                }
+                crate::merge_sql::MergeOp::Insert(..) => {
+                    return Err(SqeError::Execution(
+                        "internal error: INSERT classified as a BY SOURCE MERGE clause".to_string(),
+                    ));
                 }
             }
         }
