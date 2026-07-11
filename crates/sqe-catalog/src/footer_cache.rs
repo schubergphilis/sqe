@@ -16,6 +16,18 @@ use parquet::file::metadata::ParquetMetaData;
 use prometheus::Counter;
 use tracing::debug;
 
+/// Estimate the memory weight of a cached footer entry in bytes.
+///
+/// Uses `num_row_groups * num_columns * 500` (minimum 1024), saturating at
+/// `u32::MAX` to avoid truncation when casting to the weigher's `u32` type.
+fn footer_entry_weight(num_row_groups: u64, num_columns: u64) -> u32 {
+    num_row_groups
+        .saturating_mul(num_columns)
+        .saturating_mul(500)
+        .max(1024)
+        .min(u32::MAX as u64) as u32
+}
+
 /// Async LRU cache for parsed Parquet file footers, keyed by S3 URI.
 #[derive(Clone)]
 pub struct FooterCache {
@@ -35,17 +47,17 @@ impl FooterCache {
         let cache = Cache::builder()
             .max_capacity(max_size_bytes)
             .weigher(|_key: &String, value: &Arc<ParquetMetaData>| {
-                let num_row_groups = value.num_row_groups() as u32;
-                let num_columns = if num_row_groups > 0 {
-                    value.row_group(0).num_columns() as u32
+                let num_row_groups = value.num_row_groups() as u64;
+                let num_columns = if value.num_row_groups() > 0 {
+                    value.row_group(0).num_columns() as u64
                 } else {
                     // Fallback: use schema descriptor.
                     value
                         .file_metadata()
                         .schema_descr()
-                        .num_columns() as u32
+                        .num_columns() as u64
                 };
-                (num_row_groups * num_columns * 500).max(1024)
+                footer_entry_weight(num_row_groups, num_columns)
             })
             .build();
 
@@ -151,6 +163,19 @@ mod tests {
         let hits = Counter::new("test_hits", "test").unwrap();
         let misses = Counter::new("test_misses", "test").unwrap();
         (hits, misses)
+    }
+
+    #[test]
+    fn test_footer_entry_weight_does_not_overflow() {
+        // Would wrap to 0 in u32: 10_000 * 100_000 * 500 = 500_000_000_000
+        let weight = footer_entry_weight(10_000, 100_000);
+        assert_eq!(weight, u32::MAX);
+        assert_ne!(weight, 0);
+
+        // Extreme values saturate rather than underflow.
+        let weight = footer_entry_weight(u64::MAX, u64::MAX);
+        assert_eq!(weight, u32::MAX);
+        assert!(weight >= 1024);
     }
 
     #[tokio::test]
