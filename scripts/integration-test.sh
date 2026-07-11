@@ -9,16 +9,24 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-COMPOSE_FILE="$ROOT_DIR/docker-compose.test.yml"
+
+# Support distributed smoke via DISTRIBUTED=1 (wires Q-05 / audit distributed CI)
+DISTRIBUTED="${DISTRIBUTED:-0}"
+COMPOSE_ARGS=( -f "$ROOT_DIR/docker-compose.test.yml" )
+BOOTSTRAP_SCRIPT="$SCRIPT_DIR/bootstrap-test.sh"
+if [ "$DISTRIBUTED" = "1" ]; then
+    COMPOSE_ARGS+=( -f "$ROOT_DIR/docker-compose.distributed.yml" )
+    BOOTSTRAP_SCRIPT="$SCRIPT_DIR/bootstrap-distributed.sh"
+fi
 
 cd "$ROOT_DIR"
 
 # ── Start test stack ──────────────────────────────────────────
-echo "Starting test stack..."
-docker compose -f "$COMPOSE_FILE" up -d
+echo "Starting test stack (DISTRIBUTED=$DISTRIBUTED)..."
+docker compose "${COMPOSE_ARGS[@]}" up -d
 
 # ── Bootstrap (idempotent) ────────────────────────────────────
-"$SCRIPT_DIR/bootstrap-test.sh"
+"$BOOTSTRAP_SCRIPT"
 
 # ── Run integration tests ─────────────────────────────────────
 # Clean up any stale log files from aborted previous runs
@@ -35,13 +43,13 @@ echo "Running integration tests..."
 # path that integration_test.rs::test_aggregation_basic + similar exercise.
 # test_distributed_select intentionally fails when no worker is listening on
 # :50052 (issue #122 — local-fallback masking distributed dispatch bugs).
-# This script targets docker-compose.test.yml, which doesn't include a worker;
-# distributed coverage is exercised by the quickstart/distributed scenario
-# (scripts/test.sh scenario distributed) on docker-compose.distributed.yml.
+# Default (DISTRIBUTED=0): this script targets docker-compose.test.yml (no worker);
+# distributed coverage is exercised via DISTRIBUTED=1 or scripts/test.sh scenario distributed.
+# When DISTRIBUTED=1 the distributed compose overlay is used and the skip is omitted.
 # Skip the test here unless the caller passes
 # their own filter args ($# > 0 implies an explicit test name was selected).
 SKIP_ARGS=()
-if [ "$#" -eq 0 ]; then
+if [ "$#" -eq 0 ] && [ "$DISTRIBUTED" != "1" ]; then
     SKIP_ARGS=(--skip test_distributed_select)
     # The deep-OR stack-overflow guards (in_subquery_or_stack_overflow.rs
     # prod_stack_4k..32k) are release-only via #[cfg_attr(debug_assertions,
