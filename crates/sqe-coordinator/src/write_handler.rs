@@ -495,7 +495,12 @@ where
             }
         }
     }
-    Err(last_err.expect("retry loop must have captured an error"))
+    Err(last_err.unwrap_or_else(|| {
+        iceberg::Error::new(
+            iceberg::ErrorKind::Unexpected,
+            "commit_with_retry exhausted attempts without capturing an error",
+        )
+    }))
 }
 
 /// Backoff (exponential + jitter, capped ~1s) for retrying a CoW UPDATE/DELETE
@@ -3297,6 +3302,12 @@ impl WriteHandler {
             .map(|f| f.name().clone())
             .collect();
 
+        if target_columns.is_empty() {
+            return Err(SqeError::Execution(format!(
+                "MERGE target table {table_ident} has no columns for match detection"
+            )));
+        }
+
         // Use the target alias (or a default) for the merge scratch table names.
         // The scratch table names embed a per-invocation uuid so concurrent
         // MERGEs running in the same session do not clobber each other's
@@ -3345,6 +3356,12 @@ impl WriteHandler {
             .iter()
             .map(|f| f.name().clone())
             .collect();
+
+        if source_columns.is_empty() {
+            return Err(SqeError::Execution(
+                "MERGE source has no columns for match detection".to_string(),
+            ));
+        }
 
         // Classify the clauses (honoring statement order and per-clause
         // predicates) and compile them into one SELECT over a FULL OUTER
