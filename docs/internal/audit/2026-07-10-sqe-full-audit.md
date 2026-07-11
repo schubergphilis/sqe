@@ -442,3 +442,11 @@ As of 2026-07-11 rebase attempts:
 
 The open bottlenecks in performance section may now be resolved in main. Further verification recommended via benchmarks.
 
+## Additional 2026-07-11 Progress (maintenance lineage O5 start)
+- Branch fix/audit-maintenance-lineage created.
+- Audit doc updated.
+- (Follow-up) Hook ready in query_handler Procedure arm to call lineage.on_query_complete with maintenance ctx (reusing QueryCompleteCtx + LineageObserver already passed to maintenance paths). Full emit (with target as output facet) is the remaining piece for O5.
+- MR will track it.
+
+See plan.md in session for full remaining list + verification. MRs created: !625 (DML policy), !626 (trace ids on audit).
+
