@@ -483,3 +483,9 @@ P2 and lower as before. No new criticals found in this pass.
 
 See Prioritized Action Plan above and nextsteps.md for current NEXT pointers. The perf bottlenecks table is largely historical (fixes landed).
 
+## 2026-07-11 O3 Progress (root spans)
+- `sqe.query` root span at execute entry points (query_id + user).
+- `sqe.policy_rewrite` child span around policy enforcement.
+- Works with the trace_id on AuditEvent (O4) for correlation.
+- More phase spans (execute, spill, write_commit) can be added iteratively.
+
