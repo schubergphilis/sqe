@@ -5985,15 +5985,15 @@ fn build_describe_input(param_types: &[Option<DataType>]) -> sqe_core::Result<Ve
 ///
 /// - SELECT (`Query`): opt-in via `cfg.emit_selects` -- read-only queries
 ///   are noisy and lineage tools rarely need them.
-/// - Maintenance procedures (`Procedure`): never emit. CALL system.optimize,
-///   expire_snapshots, etc. mutate snapshot history but produce no
-///   user-visible inputs/outputs that matter to lineage.
+/// - Maintenance procedures (`Procedure`): emit (full audit O5). CALL system.*
+///   (rewrite_data_files, expire_snapshots, etc.) mutate the table and should
+///   appear in the lineage graph as operations on the target table.
 /// - Everything else (DML writes, DDL, SHOW commands, transactions, USE,
 ///   GRANT/REVOKE): always emit. Sinks decide what to do with metadata events.
 fn should_emit(kind: &StatementKind, cfg: &sqe_core::config::OpenLineageConfig) -> bool {
     match kind {
         StatementKind::Query(_) => cfg.emit_selects,
-        StatementKind::Procedure(_) => false,
+        StatementKind::Procedure(_) => true,
         _ => true,
     }
 }
@@ -6971,15 +6971,14 @@ mod tests {
     }
 
     #[test]
-    fn should_emit_maintenance_procedure_never_emits() {
-        // CALL system.rewrite_data_files is classified as Procedure, the
-        // maintenance variant. Lineage events for snapshot rewrites add
-        // noise without a meaningful input/output set.
+    fn should_emit_maintenance_procedure_emits() {
+        // Per full audit O5: maintenance procedures should emit lineage events
+        // so that snapshot rewrites / expires appear in the graph.
         let kind = sqe_sql::parse_and_classify("CALL system.rewrite_data_files(table => 'ns.t')")
             .expect("parse CALL");
         assert!(matches!(kind, StatementKind::Procedure(_)));
-        assert!(!should_emit(&kind, &ol_cfg(false)));
-        assert!(!should_emit(&kind, &ol_cfg(true)));
+        assert!(should_emit(&kind, &ol_cfg(false)));
+        assert!(should_emit(&kind, &ol_cfg(true)));
     }
 
     #[test]
