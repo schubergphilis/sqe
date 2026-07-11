@@ -466,20 +466,23 @@ This section consolidates progress from the July 10 full audit remediation effor
 - Main kept clean throughout.
 - 2026-07-11 follow-up (this session): resolved lingering conflict in this file itself; DML PolicyAudit emission for writes made unconditional (always record policy decision on DML even with zero effects); benchmark results committed.
 
-## Remaining Open from Full Audit (post 2026-07-11 session start)
+## Remaining Open from Full Audit (post 2026-07-11 session)
 
-P0 still tracked:
-- DML PolicyAudit + full QueryStats surfaced on write paths (source policy + target write effects if measurable). Initial conditional emission improved; deeper write stats (rows_written etc.) and write-internal audit emission remain for later pass.
-- Confirm production TLS + rate_limit + non-anon in all Helm/examples (mostly docs now).
+P0 advanced in this pass:
+- DML PolicyAudit now unconditional for writes + SELECTs (!625). Deeper write stats (rows_written) still open.
+- Production validator already present.
+- Helm values now document production_mode, rate_limit, TLS/auth checklist items (!632).
 
-P1:
-- Query-root OTel spans + trace_id correlation on audit events (O3/O4).
-- Maintenance OpenLineage events (O5).
-- Trino/Quack header trace propagation (O6).
-- Coordinator god-crate split (write_handler extraction) — large structural.
-- Write-path + distributed CI fully green in default pipeline (some jobs added).
+P1 advanced:
+- O4: `trace_id` + `query_id` on `AuditEvent` + helper + wiring across paths (!626).
+- O3: `sqe.query` root spans + `sqe.policy_rewrite` child spans added (!628).
+- O5: Maintenance procedures now emit OpenLineage (flipped should_emit + existing paths; !627).
+- O6: still open.
+- Structural items (god-crate, full CI) remain.
 
-P2 and lower as before. No new criticals found in this pass.
+See the appended 2026-07-11 sections lower in this file for details per MR.
+
+P2 and lower as before. No new criticals.
 
 See Prioritized Action Plan above and nextsteps.md for current NEXT pointers. The perf bottlenecks table is largely historical (fixes landed).
 
@@ -493,4 +496,13 @@ See Prioritized Action Plan above and nextsteps.md for current NEXT pointers. Th
 - Added `attach_trace_context_from_headers` + HeaderMapExtractor in sqe-metrics/propagation.
 - Wired early in Trino submit_query and Quack handle_quack using the new helper.
 - Incoming traceparent now flows into SQE query spans and audit trace_id capture.
+
+## Additional 2026-07-11 Progress (maintenance lineage O5)
+- `should_emit` now returns `true` for `StatementKind::Procedure` (was hard false).
+- Updated comment + renamed/fixed the unit test.
+- Because the early `ol_emit` + start and the post-execution complete/fail paths already key off `should_emit`, maintenance CALLs will now produce OpenLineage events (start + complete with the SQL and run_id).
+- This closes the explicit gap "1. Maintenance procedures ... no OL events" from the audit.
+- Branch: fix/audit-maintenance-lineage ; MR to be created/updated.
+
+See plan.md for details. Previous MRs: !625 (DML PolicyAudit), !626 (trace/query_id on AuditEvent).
 

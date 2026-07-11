@@ -28,6 +28,17 @@ coordinator:
   nodeSelector: {}
   tolerations: []
   affinity: {}
+
+  # Production checklist (see full-audit 2026-07-10 P0):
+  # - Set coordinator.production_mode = true (via config or SQE_PRODUCTION_MODE)
+  #   to enforce no anonymous/bearer_passthrough, rate_limit.enabled=true,
+  #   allow_insecure_transport=false, non-empty worker_secret, etc.
+  # - Configure TLS (coordinator.tls section or ingress) and set
+  #   security.allow_insecure_transport = false.
+  # - Enable rate limiting (see [rate_limit] below or configmap).
+  # - Use proper OIDC (no anonymous, client_credentials only for SPs).
+  # - Provide non-default worker_secret when using workers.
+  production_mode: false
   podAnnotations: {}
 
 # ── Workers ─────────────────────────────────────────────────
@@ -133,6 +144,12 @@ config:
     # lockstep (audit.path + audit.fileName). Setting it here would let the
     # config drift from the mount and write audit records to a path that has no
     # durable volume behind it.
+
+  # Rate limiting (P0 for production; enable when production_mode or explicitly).
+  # rate_limit:
+  #   enabled: true
+  #   per_user_queries_per_minute: 120
+  #   global_queries_per_minute: 5000
 
 # -- Audit log (ISSUE-248) ----------------------------------------------------
 # The coordinator writes security-relevant audit records (one JSONL entry per
