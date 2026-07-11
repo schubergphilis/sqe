@@ -570,6 +570,12 @@ pub struct CoordinatorConfig {
     /// exits cleanly before SIGKILL. Default: 25 s. Issue #250.
     #[serde(default = "default_shutdown_drain_secs")]
     pub shutdown_drain_secs: u64,
+    /// When `true`, refuse to start if dev-only auth providers, disabled rate
+    /// limiting, cleartext transport waivers, or unauthenticated workers are
+    /// configured. Default: `false` (warnings only). Set via TOML or env
+    /// `SQE_PRODUCTION_MODE` / `SQE_COORDINATOR__PRODUCTION_MODE`.
+    #[serde(default)]
+    pub production_mode: bool,
 }
 
 /// HTTP/2 + TCP knobs applied to every tonic Server / Client this
@@ -674,6 +680,7 @@ impl std::fmt::Debug for CoordinatorConfig {
                 &self.credential_push_request_timeout_secs,
             )
             .field("shutdown_drain_secs", &self.shutdown_drain_secs)
+            .field("production_mode", &self.production_mode)
             .finish()
     }
 }
@@ -3305,12 +3312,79 @@ impl SqeConfig {
         validate_byte_sizes(self, &mut errors);
         validate_memory_budget_invariants(self, &mut errors);
 
+        if self.coordinator.production_mode {
+            match self.validate_production() {
+                Ok(()) => {}
+                Err(crate::error::SqeError::Config(msg)) => errors.push(msg),
+                Err(e) => return Err(e),
+            }
+        }
+
         if errors.is_empty() {
             Ok(())
         } else {
             Err(crate::error::SqeError::Config(
                 format!("config error: {}", errors.join("; ")),
             ))
+        }
+    }
+
+    /// Fail-closed production guard. Only enforced when
+    /// `coordinator.production_mode` is `true` (via [`SqeConfig::validate`]).
+    pub fn validate_production(&self) -> crate::error::Result<()> {
+        let mut errors = Vec::new();
+
+        if self
+            .auth
+            .providers
+            .iter()
+            .any(|p| matches!(
+                p,
+                AuthProviderConfig::Anonymous { .. }
+                    | AuthProviderConfig::BearerPassthrough { .. }
+            ))
+        {
+            errors.push(
+                "production_mode: auth.providers must not include anonymous or \
+                 bearer_passthrough providers (dev-only; accept any connection \
+                 or skip local JWT validation)"
+                    .to_string(),
+            );
+        }
+
+        if !self.rate_limit.enabled {
+            errors.push(
+                "production_mode: rate_limit.enabled must be true (disabled rate \
+                 limiting allows query and auth flooding)"
+                    .to_string(),
+            );
+        }
+
+        if self.security.allow_insecure_transport {
+            errors.push(
+                "production_mode: security.allow_insecure_transport must be false \
+                 (cleartext distributed hops expose bearer tokens, worker secrets, \
+                 and vended S3 credentials)"
+                    .to_string(),
+            );
+        }
+
+        if !self.coordinator.worker_urls.is_empty()
+            && self.coordinator.worker_secret.is_empty()
+            && self.coordinator.allow_unauthenticated_workers
+        {
+            errors.push(
+                "production_mode: coordinator.worker_urls is set with an empty \
+                 coordinator.worker_secret and coordinator.allow_unauthenticated_workers \
+                 = true (any TCP-reachable client may register as a worker)"
+                    .to_string(),
+            );
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(crate::error::SqeError::Config(errors.join("; ")))
         }
     }
 
@@ -3365,6 +3439,12 @@ impl SqeConfig {
         env_override_u16("SQE_COORDINATOR__TRINO_HTTP_PORT", &mut self.coordinator.trino_http_port);
         env_override_str("SQE_COORDINATOR__MODE", &mut self.coordinator.mode);
         env_override_bool("SQE_COORDINATOR__DEBUG", &mut self.coordinator.debug);
+        // Short `SQE_PRODUCTION_MODE` for operators; namespaced form wins when both set.
+        env_override_bool("SQE_PRODUCTION_MODE", &mut self.coordinator.production_mode);
+        env_override_bool(
+            "SQE_COORDINATOR__PRODUCTION_MODE",
+            &mut self.coordinator.production_mode,
+        );
         env_override_secret("SQE_COORDINATOR__WORKER_SECRET", &mut self.coordinator.worker_secret);
         env_override_bool(
             "SQE_COORDINATOR__ALLOW_UNAUTHENTICATED_WORKERS",
@@ -4058,6 +4138,7 @@ mod tests {
                 credential_push_connect_timeout_secs: default_credential_push_connect_timeout_secs(),
                 credential_push_request_timeout_secs: default_credential_push_request_timeout_secs(),
                 shutdown_drain_secs: default_shutdown_drain_secs(),
+                production_mode: false,
             },
             worker: WorkerConfig::default(),
             auth: AuthConfig {
@@ -4443,6 +4524,120 @@ mod tests {
         config.coordinator.worker_urls.clear();
         config.coordinator.worker_secret = SecretString::default();
         assert!(config.validate().is_ok());
+    }
+
+    fn valid_production_config() -> SqeConfig {
+        let mut config = valid_config();
+        config.coordinator.production_mode = true;
+        config.rate_limit.enabled = true;
+        config.security.allow_insecure_transport = false;
+        config.auth.providers = vec![oidc_provider_for_validate()];
+        config
+    }
+
+    #[test]
+    fn validate_production_skipped_when_production_mode_false() {
+        let mut config = valid_config();
+        config.coordinator.production_mode = false;
+        config.rate_limit.enabled = false;
+        config.auth.providers = vec![AuthProviderConfig::Anonymous {
+            user: "anonymous".to_string(),
+            roles: vec![],
+        }];
+        assert!(config.validate_production().is_err());
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_production_accepts_hardened_config() {
+        let config = valid_production_config();
+        assert!(config.validate_production().is_ok());
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_production_rejects_anonymous_provider() {
+        let mut config = valid_production_config();
+        config.auth.providers = vec![AuthProviderConfig::Anonymous {
+            user: "anonymous".to_string(),
+            roles: vec![],
+        }];
+        let err = config.validate_production().unwrap_err().to_string();
+        assert!(
+            err.contains("anonymous") && err.contains("bearer_passthrough"),
+            "got: {err}"
+        );
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("anonymous"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_production_rejects_bearer_passthrough_provider() {
+        let mut config = valid_production_config();
+        config.auth.providers = vec![AuthProviderConfig::BearerPassthrough {
+            user: "bearer-passthrough".to_string(),
+            roles: vec![],
+        }];
+        let err = config.validate_production().unwrap_err().to_string();
+        assert!(err.contains("bearer_passthrough"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_production_rejects_disabled_rate_limit() {
+        let mut config = valid_production_config();
+        config.rate_limit.enabled = false;
+        let err = config.validate_production().unwrap_err().to_string();
+        assert!(err.contains("rate_limit.enabled"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_production_rejects_allow_insecure_transport() {
+        let mut config = valid_production_config();
+        config.security.allow_insecure_transport = true;
+        let err = config.validate_production().unwrap_err().to_string();
+        assert!(
+            err.contains("security.allow_insecure_transport"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_production_rejects_unauthenticated_workers_with_empty_secret() {
+        let mut config = valid_production_config();
+        config.coordinator.worker_urls = vec!["http://worker-1:50051".to_string()];
+        config.coordinator.worker_secret = SecretString::default();
+        config.coordinator.allow_unauthenticated_workers = true;
+        let err = config.validate_production().unwrap_err().to_string();
+        assert!(
+            err.contains("allow_unauthenticated_workers") && err.contains("worker_secret"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_production_accepts_distributed_with_worker_secret() {
+        let mut config = valid_production_config();
+        config.coordinator.worker_urls = vec!["http://worker-1:50051".to_string()];
+        config.coordinator.worker_secret = SecretString::new("shared-secret-value".to_string());
+        assert!(config.validate_production().is_ok());
+    }
+
+    #[test]
+    fn env_overrides_apply_to_production_mode() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+
+        std::env::set_var("SQE_PRODUCTION_MODE", "true");
+        let mut cfg = valid_config();
+        assert!(!cfg.coordinator.production_mode);
+        cfg.apply_env_overrides();
+        assert!(cfg.coordinator.production_mode);
+
+        std::env::set_var("SQE_COORDINATOR__PRODUCTION_MODE", "false");
+        cfg.apply_env_overrides();
+        assert!(!cfg.coordinator.production_mode);
+
+        std::env::remove_var("SQE_PRODUCTION_MODE");
+        std::env::remove_var("SQE_COORDINATOR__PRODUCTION_MODE");
     }
 
     /// Regression for issues #22 + #35: a worker that registers with a

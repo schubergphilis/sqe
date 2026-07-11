@@ -11,6 +11,7 @@ pub mod tag_source_impl;
 pub mod catalog_ops;
 pub mod channel_pool;
 pub mod maintenance;
+pub mod merge_sql;
 pub mod merge_target_provider;
 pub mod tls;
 pub mod transport;
