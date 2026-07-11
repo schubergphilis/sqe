@@ -86,6 +86,7 @@ pub struct QueryRecord {
     /// requires one (mode "all", or "slow"/failure). Capped at 64 KiB by
     /// the renderer.
     pub profile: Option<String>,
+    pub trace_id: Option<String>,
     pub fragments: Arc<Mutex<Vec<FragmentInfo>>>,
 }
 
@@ -133,6 +134,7 @@ impl QueryTracker {
         session_id: &str,
         client_ip: Option<&str>,
         roles: Vec<String>,
+        trace_id: Option<String>,
     ) -> CancellationToken {
         let token = CancellationToken::new();
         let record = QueryRecord {
@@ -160,6 +162,7 @@ impl QueryTracker {
             spill_bytes: 0,
             peak_memory_bytes: 0,
             profile: None,
+            trace_id,
             fragments: Arc::new(Mutex::new(Vec::new())),
         };
         self.history.insert(query_id, Arc::new(record));
@@ -336,7 +339,7 @@ mod tests {
     async fn start_creates_queued_record() {
         let tracker = QueryTracker::new(&test_config());
         let id = Uuid::now_v7();
-        let _token = tracker.start(id, "alice", Some("cli"), "SELECT 1", "s1", None, vec![]);
+        let _token = tracker.start(id, "alice", Some("cli"), "SELECT 1", "s1", None, vec![], None);
         let records = tracker.records();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].state, QueryState::Queued);
@@ -348,7 +351,7 @@ mod tests {
     async fn full_lifecycle_queued_running_finished() {
         let tracker = QueryTracker::new(&test_config());
         let id = Uuid::now_v7();
-        tracker.start(id, "bob", None, "SELECT *", "s2", None, vec![]);
+        tracker.start(id, "bob", None, "SELECT *", "s2", None, vec![], None);
         tracker.running(&id, 10);
         tracker.complete(&id, 42, 150, vec!["ns.table1".to_string()], 0, 0, 0, 0);
         let rec = tracker.history.get(&id).unwrap();
