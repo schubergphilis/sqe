@@ -27,7 +27,7 @@ aws = ["sqe-catalog/glue", "sqe-catalog/s3tables"]
 
 [dependencies]
 sqe-core = { path = "../sqe-core" }
-sqe-catalog = { path = "../sqe-catalog", default-features = false, features = ["rest", "sql-sqlite", "hadoop"] }
+sqe-catalog = { path = "../sqe-catalog", default-features = false, features = ["rest", "rest-sigv4", "sql-sqlite", "hadoop"] }
 sqe-sql = { path = "../sqe-sql" }
 sqe-trino-functions = { path = "../sqe-trino-functions" }
 sqe-trino-compat = { path = "../sqe-trino-compat" }

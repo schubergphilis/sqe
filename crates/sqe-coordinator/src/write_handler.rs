@@ -495,7 +495,12 @@ where
             }
         }
     }
-    Err(last_err.expect("retry loop must have captured an error"))
+    Err(last_err.unwrap_or_else(|| {
+        iceberg::Error::new(
+            iceberg::ErrorKind::Unexpected,
+            "commit_with_retry exhausted attempts without capturing an error",
+        )
+    }))
 }
 
 /// Backoff (exponential + jitter, capped ~1s) for retrying a CoW UPDATE/DELETE
@@ -554,6 +559,26 @@ async fn unique_table_location(
 /// Write handlers receive already-executed RecordBatches from the query pipeline
 /// and persist them as Iceberg data files via Parquet, then commit the changes
 /// through the Iceberg REST catalog.
+/// Snapshot-pinned scan plan for delete-aware DML rewrite reads (#371).
+/// Built by [`WriteHandler::plan_delete_aware_read`]; consumed per file by
+/// [`WriteHandler::read_data_file_applying_deletes`].
+struct DeleteAwareReadPlan {
+    scan: iceberg::scan::TableScan,
+    tasks_by_path: std::collections::HashMap<String, Vec<iceberg::scan::FileScanTask>>,
+}
+
+impl DeleteAwareReadPlan {
+    /// True when any planned data file carries delete files. The streaming
+    /// MERGE target path reads raw parquet and must downgrade to the
+    /// buffered (delete-applying) path when deletes exist.
+    fn has_deletes(&self) -> bool {
+        self.tasks_by_path
+            .values()
+            .flatten()
+            .any(|t| !t.deletes.is_empty())
+    }
+}
+
 pub struct WriteHandler {
     config: SqeConfig,
     metrics: Option<Arc<sqe_metrics::MetricsRegistry>>,
@@ -601,18 +626,16 @@ impl WriteHandler {
     }
 
     /// Run the source plan through the configured policy enforcer, if any.
-    /// Used by INSERT / CTAS / DELETE / UPDATE source SELECTs so row filters,
-    /// column masks, and column restrictions apply on writes too.
+    /// Used by INSERT / CTAS source SELECTs so row filters, column masks,
+    /// and column restrictions apply on writes too.
     async fn enforce_source_plan(
         &self,
         session: &Session,
         plan: LogicalPlan,
-    ) -> sqe_core::Result<LogicalPlan> {
+    ) -> sqe_core::Result<(LogicalPlan, sqe_policy::PolicySummary)> {
         match &self.policy_enforcer {
-            // The write path does not yet surface a policy summary to the audit
-            // log (deferred — see review note); discard it here.
-            Some(enf) => enf.evaluate(&session.user, plan).await.map(|(p, _summary)| p),
-            None => Ok(plan),
+            Some(enf) => enf.evaluate(&session.user, plan).await,
+            None => Ok((plan, sqe_policy::PolicySummary::default())),
         }
     }
 
@@ -625,6 +648,7 @@ impl WriteHandler {
         session: &Session,
         table_ident: &TableIdent,
         schema: Arc<ArrowSchema>,
+        policy_summary_out: &mut Option<sqe_policy::PolicySummary>,
     ) -> sqe_core::Result<sqe_policy::write_predicates::WritePolicyPredicates> {
         let Some(enf) = &self.policy_enforcer else {
             return Ok(sqe_policy::write_predicates::WritePolicyPredicates::default());
@@ -637,14 +661,16 @@ impl WriteHandler {
             .last()
             .cloned()
             .unwrap_or_else(|| "default".to_string());
-        sqe_policy::write_predicates::extract_write_predicates(
+        let (predicates, summary) = sqe_policy::write_predicates::extract_write_predicates(
             enf.as_ref(),
             &session.user,
             &namespace_key,
             table_ident.name(),
             schema,
         )
-        .await
+        .await?;
+        *policy_summary_out = Some(summary);
+        Ok(predicates)
     }
 
     /// Return the Parquet compression codec for this write.
@@ -1068,6 +1094,7 @@ impl WriteHandler {
         ctx: &DFSessionContext,
         select_sql: &str,
         plan_out: &mut Option<sqe_lineage::PlanOrHint>,
+        policy_summary_out: &mut Option<sqe_policy::PolicySummary>,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         let (table_name, _or_replace, partition_by, user_options) = match stmt {
             Statement::CreateTable(ct) => {
@@ -1103,9 +1130,10 @@ impl WriteHandler {
         // Enforce policy on the source SELECT so masks and restrictions
         // shape the target table. Without this, CTAS over a masked table
         // creates a sink with plaintext columns.
-        let enforced_source = self
+        let (enforced_source, policy_summary) = self
             .enforce_source_plan(session, df.logical_plan().clone())
             .await?;
+        *policy_summary_out = Some(policy_summary);
         let df = ctx
             .execute_logical_plan(enforced_source)
             .await
@@ -1263,6 +1291,7 @@ impl WriteHandler {
         ctx: &DFSessionContext,
         select_sql: &str,
         plan_out: &mut Option<sqe_lineage::PlanOrHint>,
+        policy_summary_out: &mut Option<sqe_policy::PolicySummary>,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         let (table_name, explicit_columns) = match stmt {
             Statement::Insert(ins) => match &ins.table {
@@ -1316,7 +1345,9 @@ impl WriteHandler {
         // source SELECT. Without this, INSERT INTO sink SELECT FROM masked
         // would copy plaintext into sink, bypassing every policy.
         let source_plan = df.logical_plan().clone();
-        let enforced_plan = self.enforce_source_plan(session, source_plan).await?;
+        let (enforced_plan, policy_summary) =
+            self.enforce_source_plan(session, source_plan).await?;
+        *policy_summary_out = Some(policy_summary);
 
         let (lin_catalog, lin_namespace, lin_table) =
             lineage_target_parts(&self.config, &table_ident);
@@ -1941,13 +1972,14 @@ impl WriteHandler {
     ///
     /// Without a WHERE clause, this is a truncate: commits a rewrite that
     /// removes all data files.
-    #[instrument(skip(self, session, stmt, catalog, ctx), fields(username = %session.user.username))]
+    #[instrument(skip(self, session, stmt, catalog, ctx, policy_summary_out), fields(username = %session.user.username))]
     pub async fn handle_delete(
         &self,
         session: &Session,
         stmt: &Statement,
         catalog: Arc<SessionCatalog>,
         ctx: &DFSessionContext,
+        policy_summary_out: &mut Option<sqe_policy::PolicySummary>,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         let table_ident = resolve_delete_target_ident(stmt, session)?;
         let delete = match stmt {
@@ -1966,7 +1998,7 @@ impl WriteHandler {
         // optimistic-concurrency conflict.
         let target_schema = build_arrow_schema_for_table(&table)?;
         let predicates = self
-            .compute_write_predicates(session, &table_ident, target_schema)
+            .compute_write_predicates(session, &table_ident, target_schema, policy_summary_out)
             .await?;
 
         // No WHERE = truncate. With no policy row filter we keep the fast
@@ -2057,10 +2089,13 @@ impl WriteHandler {
                 WriteCleanupGuard::new(table.file_io().clone(), tracker.clone(), "delete-cow")
                     .with_metrics(self.metrics.clone());
             let pool = ctx.runtime_env().memory_pool.clone();
+            let read_plan = self.plan_delete_aware_read(&table).await?;
 
             for data_file in &to_rewrite {
                 let file_path = data_file.file_path();
-                let batches = self.read_parquet_via_table(&table, file_path, ctx, true).await?;
+                let batches = self
+                    .read_data_file_applying_deletes(&read_plan, &table, file_path, ctx, true)
+                    .await?;
                 if batches.is_empty() {
                     continue;
                 }
@@ -2160,13 +2195,14 @@ impl WriteHandler {
     /// Without a WHERE clause this falls back to the CoW truncate path (same as
     /// `handle_delete`), since there is no efficiency benefit to writing delete files
     /// for every row.
-    #[instrument(skip(self, session, stmt, catalog, ctx), fields(username = %session.user.username))]
+    #[instrument(skip(self, session, stmt, catalog, ctx, policy_summary_out), fields(username = %session.user.username))]
     pub async fn handle_delete_mor(
         &self,
         session: &Session,
         stmt: &Statement,
         catalog: Arc<SessionCatalog>,
         ctx: &DFSessionContext,
+        policy_summary_out: &mut Option<sqe_policy::PolicySummary>,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         let table_ident = resolve_delete_target_ident(stmt, session)?;
         let delete = match stmt {
@@ -2188,7 +2224,7 @@ impl WriteHandler {
         let where_clause = &delete.selection;
         let target_schema = build_arrow_schema_for_table(&table)?;
         let predicates = self
-            .compute_write_predicates(session, &table_ident, target_schema)
+            .compute_write_predicates(session, &table_ident, target_schema, policy_summary_out)
             .await?;
 
         // No WHERE clause and no policy row filter: keep the fast truncate
@@ -2232,6 +2268,12 @@ impl WriteHandler {
         );
 
         // Scan each data file and collect (file_path, row_position) pairs for matching rows.
+        //
+        // This read is deliberately RAW (`read_parquet_via_table`, no delete
+        // application): position deletes address physical row offsets in the
+        // file, so applying existing delete files here would shift positions
+        // and delete the wrong rows. Re-marking an already-deleted position
+        // is harmless.
         let mut position_deletes: Vec<(String, i64)> = Vec::new();
 
         for data_file in &old_data_files {
@@ -2323,13 +2365,14 @@ impl WriteHandler {
     /// The file is committed via `RowDeltaAction` so the operation classifies
     /// as `Overwrite` with `added-delete-files=1` in the snapshot summary,
     /// matching Java Iceberg and Spark semantics.
-    #[instrument(skip(self, session, stmt, catalog, ctx), fields(username = %session.user.username))]
+    #[instrument(skip(self, session, stmt, catalog, ctx, policy_summary_out), fields(username = %session.user.username))]
     pub async fn handle_delete_equality(
         &self,
         session: &Session,
         stmt: &Statement,
         catalog: Arc<SessionCatalog>,
         ctx: &DFSessionContext,
+        policy_summary_out: &mut Option<sqe_policy::PolicySummary>,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         let table_ident = resolve_delete_target_ident(stmt, session)?;
         let delete = match stmt {
@@ -2361,7 +2404,7 @@ impl WriteHandler {
         let where_clause = &delete.selection;
         let target_schema = build_arrow_schema_for_table(&table)?;
         let predicates = self
-            .compute_write_predicates(session, &table_ident, target_schema)
+            .compute_write_predicates(session, &table_ident, target_schema, policy_summary_out)
             .await?;
 
         // DELETE without WHERE and without a policy row filter: fall back
@@ -2403,13 +2446,18 @@ impl WriteHandler {
 
         // Scan every data file and collect rows where WHERE matches. Equality
         // deletes need only the identifier columns, so we keep the full batch
-        // for now and let the writer project downstream.
+        // for now and let the writer project downstream. Deletes are applied
+        // during the read (#371) so already-deleted rows neither inflate the
+        // affected-row count nor emit redundant delete keys.
         let mut key_batches: Vec<RecordBatch> = Vec::new();
         let mut total_matched: usize = 0;
+        let read_plan = self.plan_delete_aware_read(&table).await?;
 
         for data_file in &old_data_files {
             let file_path = data_file.file_path().to_string();
-            let batches = self.read_parquet_via_table(&table, &file_path, ctx, true).await?;
+            let batches = self
+                .read_data_file_applying_deletes(&read_plan, &table, &file_path, ctx, true)
+                .await?;
             if batches.is_empty() {
                 continue;
             }
@@ -2507,6 +2555,7 @@ impl WriteHandler {
         catalog: Arc<SessionCatalog>,
         ctx: &DFSessionContext,
         plan_out: &mut Option<sqe_lineage::PlanOrHint>,
+        policy_summary_out: &mut Option<sqe_policy::PolicySummary>,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         // Resolve the target catalog from the table reference, mirroring INSERT,
         // so a DELETE against a discovered/non-default catalog loads and commits
@@ -2525,13 +2574,19 @@ impl WriteHandler {
         // load error falls through to the default CoW path, which surfaces
         // the error at that point.
         let Ok(table_factor_name) = delete_target_object_name(stmt) else {
-            return self.handle_delete(session, stmt, catalog, ctx).await;
+            return self
+                .handle_delete(session, stmt, catalog, ctx, policy_summary_out)
+                .await;
         };
         let Some(table_ident) = try_resolve_delete_target_ident(stmt, session) else {
-            return self.handle_delete(session, stmt, catalog, ctx).await;
+            return self
+                .handle_delete(session, stmt, catalog, ctx, policy_summary_out)
+                .await;
         };
         let Ok(table) = catalog.load_table(&table_ident).await else {
-            return self.handle_delete(session, stmt, catalog, ctx).await;
+            return self
+                .handle_delete(session, stmt, catalog, ctx, policy_summary_out)
+                .await;
         };
 
         // Capture lineage: a DELETE rewrites the target in place, so the
@@ -2558,18 +2613,21 @@ impl WriteHandler {
                         table = %table_ident,
                         "DELETE dispatch: MoR + equality deletes"
                     );
-                    self.handle_delete_equality(session, stmt, catalog, ctx).await
+                    self.handle_delete_equality(session, stmt, catalog, ctx, policy_summary_out)
+                        .await
                 } else {
                     info!(
                         table = %table_ident,
                         "DELETE dispatch: MoR + position deletes (no PK declared)"
                     );
-                    self.handle_delete_mor(session, stmt, catalog, ctx).await
+                    self.handle_delete_mor(session, stmt, catalog, ctx, policy_summary_out)
+                        .await
                 }
             }
             WriteMode::CopyOnWrite => {
                 info!(table = %table_ident, "DELETE dispatch: CoW");
-                self.handle_delete(session, stmt, catalog, ctx).await
+                self.handle_delete(session, stmt, catalog, ctx, policy_summary_out)
+                    .await
             }
         }
     }
@@ -2578,13 +2636,14 @@ impl WriteHandler {
     ///
     /// Uses Copy-on-Write: reads all data files, applies SET assignments to
     /// rows matching WHERE, writes new files, atomically swaps.
-    #[instrument(skip(self, session, stmt, catalog, ctx), fields(username = %session.user.username))]
+    #[instrument(skip(self, session, stmt, catalog, ctx, policy_summary_out), fields(username = %session.user.username))]
     pub async fn handle_update(
         &self,
         session: &Session,
         stmt: &Statement,
         catalog: Arc<SessionCatalog>,
         ctx: &DFSessionContext,
+        policy_summary_out: &mut Option<sqe_policy::PolicySummary>,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         let table_ident = resolve_update_target_ident(stmt, session)?;
         let (assignments, selection) = match stmt {
@@ -2602,7 +2661,7 @@ impl WriteHandler {
         // the initial snapshot, consistent with UPDATE's snapshot isolation.
         let target_schema = build_arrow_schema_for_table(&table)?;
         let predicates = self
-            .compute_write_predicates(session, &table_ident, target_schema)
+            .compute_write_predicates(session, &table_ident, target_schema, policy_summary_out)
             .await?;
         // Build the SET clause as SQL CASE expressions for a SELECT rewrite:
         // UPDATE t SET c1=e1 WHERE cond  ->  SELECT CASE WHEN cond THEN e1 ELSE c1 END, ...
@@ -2655,10 +2714,13 @@ impl WriteHandler {
                 WriteCleanupGuard::new(table.file_io().clone(), tracker.clone(), "update-cow")
                     .with_metrics(self.metrics.clone());
             let pool = ctx.runtime_env().memory_pool.clone();
+            let read_plan = self.plan_delete_aware_read(&table).await?;
 
             for data_file in &to_rewrite {
                 let file_path = data_file.file_path();
-                let batches = self.read_parquet_via_table(&table, file_path, ctx, true).await?;
+                let batches = self
+                    .read_data_file_applying_deletes(&read_plan, &table, file_path, ctx, true)
+                    .await?;
                 if batches.is_empty() {
                     continue;
                 }
@@ -2762,6 +2824,7 @@ impl WriteHandler {
         catalog: Arc<SessionCatalog>,
         ctx: &DFSessionContext,
         plan_out: &mut Option<sqe_lineage::PlanOrHint>,
+        policy_summary_out: &mut Option<sqe_policy::PolicySummary>,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         // Resolve the target catalog from the table reference, mirroring INSERT,
         // so an UPDATE against a discovered/non-default catalog loads and commits
@@ -2776,13 +2839,19 @@ impl WriteHandler {
 
         // Peek at the target table to read its properties.
         let Ok(table_factor_name) = update_target_object_name(stmt) else {
-            return self.handle_update(session, stmt, catalog, ctx).await;
+            return self
+                .handle_update(session, stmt, catalog, ctx, policy_summary_out)
+                .await;
         };
         let Some(table_ident) = try_resolve_update_target_ident(stmt, session) else {
-            return self.handle_update(session, stmt, catalog, ctx).await;
+            return self
+                .handle_update(session, stmt, catalog, ctx, policy_summary_out)
+                .await;
         };
         let Ok(table) = catalog.load_table(&table_ident).await else {
-            return self.handle_update(session, stmt, catalog, ctx).await;
+            return self
+                .handle_update(session, stmt, catalog, ctx, policy_summary_out)
+                .await;
         };
 
         // Capture lineage: UPDATE rewrites target rows in place. v1 emits
@@ -2806,18 +2875,21 @@ impl WriteHandler {
                         table = %table_ident,
                         "UPDATE dispatch: MoR + equality deletes"
                     );
-                    self.handle_update_equality(session, stmt, catalog, ctx).await
+                    self.handle_update_equality(session, stmt, catalog, ctx, policy_summary_out)
+                        .await
                 } else {
                     info!(
                         table = %table_ident,
                         "UPDATE dispatch: MoR requested but no PK; falling back to CoW"
                     );
-                    self.handle_update(session, stmt, catalog, ctx).await
+                    self.handle_update(session, stmt, catalog, ctx, policy_summary_out)
+                        .await
                 }
             }
             WriteMode::CopyOnWrite => {
                 info!(table = %table_ident, "UPDATE dispatch: CoW");
-                self.handle_update(session, stmt, catalog, ctx).await
+                self.handle_update(session, stmt, catalog, ctx, policy_summary_out)
+                    .await
             }
         }
     }
@@ -2835,13 +2907,14 @@ impl WriteHandler {
     /// `trade_result_update_holding` pattern benefits here because the
     /// working set is the small set of matched rows, not every file in
     /// the partition.
-    #[instrument(skip(self, session, stmt, catalog, ctx), fields(username = %session.user.username))]
+    #[instrument(skip(self, session, stmt, catalog, ctx, policy_summary_out), fields(username = %session.user.username))]
     pub async fn handle_update_equality(
         &self,
         session: &Session,
         stmt: &Statement,
         catalog: Arc<SessionCatalog>,
         ctx: &DFSessionContext,
+        policy_summary_out: &mut Option<sqe_policy::PolicySummary>,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         let table_ident = resolve_update_target_ident(stmt, session)?;
         let (assignments, selection) = match stmt {
@@ -2875,7 +2948,7 @@ impl WriteHandler {
 
         let target_schema = build_arrow_schema_for_table(&table)?;
         let predicates = self
-            .compute_write_predicates(session, &table_ident, target_schema)
+            .compute_write_predicates(session, &table_ident, target_schema, policy_summary_out)
             .await?;
 
         let raw_where = selection
@@ -2907,10 +2980,15 @@ impl WriteHandler {
         let mut new_row_batches: Vec<RecordBatch> = Vec::new();
         let mut key_batches: Vec<RecordBatch> = Vec::new();
         let mut total_updated: usize = 0;
+        // Deletes applied during the read (#371): a row already removed by a
+        // delete file must not be matched and re-emitted as an updated row.
+        let read_plan = self.plan_delete_aware_read(&table).await?;
 
         for data_file in &old_data_files {
             let file_path = data_file.file_path().to_string();
-            let batches = self.read_parquet_via_table(&table, &file_path, ctx, true).await?;
+            let batches = self
+                .read_data_file_applying_deletes(&read_plan, &table, &file_path, ctx, true)
+                .await?;
             if batches.is_empty() {
                 continue;
             }
@@ -3066,7 +3144,7 @@ impl WriteHandler {
         catalog: Arc<SessionCatalog>,
         ctx: &DFSessionContext,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
-        use sqlparser::ast::{MergeAction, MergeClauseKind, MergeInsertKind, TableFactor};
+        use sqlparser::ast::TableFactor;
 
         let (table_factor, source_factor, on_expr, clauses) = match stmt {
             Statement::Merge(merge) => {
@@ -3115,6 +3193,7 @@ impl WriteHandler {
         let table = catalog.load_table(&table_ident).await?;
 
         let old_data_files = self.collect_data_files(&table).await?;
+        let read_plan = self.plan_delete_aware_read(&table).await?;
 
         // Build the target relation for the merge SELECT. Two paths:
         //  - Buffered (default): read the whole target into a pool-tracked Vec
@@ -3123,8 +3202,24 @@ impl WriteHandler {
         //    pinned `old_data_files` lazily so the target flows through the
         //    merge join as governed operator memory instead of a MemTable Vec.
         // See docs/internal/specs/2026-07-02-write-path-memory-safety-design.md.
-        let stream_target =
-            self.config.query.merge_target_streaming && self.config.query.write_buffer_tracking;
+        //
+        // The streaming provider decodes raw parquet, so it must stand down
+        // when the snapshot carries delete files (#371): rewriting a target
+        // read without its position/equality deletes applied resurrects
+        // MoR-deleted rows. The buffered path below applies them.
+        let stream_target = self.config.query.merge_target_streaming
+            && self.config.query.write_buffer_tracking
+            && !read_plan.has_deletes();
+        if self.config.query.merge_target_streaming
+            && self.config.query.write_buffer_tracking
+            && read_plan.has_deletes()
+        {
+            info!(
+                table = %table_ident,
+                "MERGE: target carries delete files; using the buffered \
+                 (delete-applying) path instead of the streaming provider"
+            );
+        }
 
         // Holds the Layer A target reservation alive to the end of the merge in
         // the buffered path (the MemTable clones its Arc-backed batches). None
@@ -3167,7 +3262,7 @@ impl WriteHandler {
                 // `merge-target-buffer` just below, so tracking the decode here
                 // too would double-count the same bytes.
                 let batches = self
-                    .read_parquet_via_table(&table, file_path, ctx, false)
+                    .read_data_file_applying_deletes(&read_plan, &table, file_path, ctx, false)
                     .await?;
                 for batch in batches {
                     target_buf.push(batch)?;
@@ -3206,6 +3301,12 @@ impl WriteHandler {
             .iter()
             .map(|f| f.name().clone())
             .collect();
+
+        if target_columns.is_empty() {
+            return Err(SqeError::Execution(format!(
+                "MERGE target table {table_ident} has no columns for match detection"
+            )));
+        }
 
         // Use the target alias (or a default) for the merge scratch table names.
         // The scratch table names embed a per-invocation uuid so concurrent
@@ -3250,154 +3351,49 @@ impl WriteHandler {
             .replace(&format!("{t_alias}."), &format!("{target_table_ref}."))
             .replace(&format!("{s_alias}."), &format!("{source_table_ref}."));
 
-        // Build a key column from the ON condition for matched/unmatched detection.
-        // We need a column from the target side that we can check IS NULL / IS NOT NULL
-        // to determine match status. Use the first target column as a sentinel.
-        let target_sentinel = format!("{target_table_ref}.\"{}\"", target_columns[0]);
-
-        // Also get a source sentinel for detecting not-matched rows
         let source_columns: Vec<String> = source_schema
             .fields()
             .iter()
             .map(|f| f.name().clone())
             .collect();
-        let source_sentinel = format!("{source_table_ref}.\"{}\"", source_columns[0]);
 
-        // Classify clauses
-        let mut matched_update: Option<&[sqlparser::ast::Assignment]> = None;
-        let mut matched_delete = false;
-        let mut not_matched_insert: Option<(&[sqlparser::ast::ObjectName], &MergeInsertKind)> = None;
-
-        for clause in clauses {
-            match (&clause.clause_kind, &clause.action) {
-                // sqlparser 0.62: MergeAction::Update is a tuple variant holding
-                // MergeUpdateExpr; Delete is a struct variant carrying a token.
-                (MergeClauseKind::Matched, MergeAction::Update(update_expr)) => {
-                    matched_update = Some(&update_expr.assignments);
-                }
-                (MergeClauseKind::Matched, MergeAction::Delete { .. }) => {
-                    matched_delete = true;
-                }
-                (
-                    MergeClauseKind::NotMatched | MergeClauseKind::NotMatchedByTarget,
-                    MergeAction::Insert(insert_expr),
-                ) => {
-                    not_matched_insert = Some((&insert_expr.columns, &insert_expr.kind));
-                }
-                (MergeClauseKind::NotMatchedBySource, MergeAction::Delete { .. }) => {
-                    // Not-matched-by-source DELETE means remove target-only rows
-                    // This is handled below by omitting target-only rows from the output
-                    // For now, we don't support this clause
-                    return Err(SqeError::NotImplemented(
-                        "WHEN NOT MATCHED BY SOURCE THEN DELETE is not yet supported".to_string(),
-                    ));
-                }
-                _ => {
-                    return Err(SqeError::NotImplemented(format!(
-                        "Unsupported MERGE clause combination: {:?} / {:?}",
-                        clause.clause_kind, clause.action
-                    )));
-                }
-            }
+        if source_columns.is_empty() {
+            return Err(SqeError::Execution(
+                "MERGE source has no columns for match detection".to_string(),
+            ));
         }
 
-        // Build the SELECT query that implements the MERGE logic
-        // Uses FULL OUTER JOIN to classify rows into:
-        //   - matched (both target and source present): apply UPDATE or DELETE
-        //   - not-matched (source only): apply INSERT
-        //   - target-only (target only, no source match): pass through
-
-        let column_exprs: Vec<String> = if matched_delete {
-            // WHEN MATCHED THEN DELETE:
-            // - Matched rows are excluded (filtered out via WHERE)
-            // - Not-matched rows are inserted (if clause present)
-            // - Target-only rows pass through
-            //
-            // We use a WHERE clause to exclude matched rows instead of CASE
-            target_columns
-                .iter()
-                .map(|col| {
-                    if let Some((insert_cols, insert_kind)) = &not_matched_insert {
-                        let insert_expr = self.resolve_insert_expr(
-                            col,
-                            insert_cols,
-                            insert_kind,
-                            &source_table_ref,
-                            &source_columns,
-                            &s_alias,
-                            &t_alias,
-                            &target_table_ref,
-                        );
-                        format!(
-                            "CASE \
-                               WHEN {source_sentinel} IS NOT NULL AND {target_sentinel} IS NOT NULL THEN NULL \
-                               WHEN {target_sentinel} IS NULL THEN {insert_expr} \
-                               ELSE {target_table_ref}.\"{col}\" \
-                             END AS \"{col}\""
-                        )
-                    } else {
-                        format!(
-                            "CASE \
-                               WHEN {source_sentinel} IS NOT NULL AND {target_sentinel} IS NOT NULL THEN NULL \
-                               ELSE {target_table_ref}.\"{col}\" \
-                             END AS \"{col}\""
-                        )
-                    }
-                })
-                .collect()
-        } else {
-            // WHEN MATCHED THEN UPDATE (and optionally WHEN NOT MATCHED THEN INSERT):
-            target_columns
-                .iter()
-                .map(|col| {
-                    let update_expr = if let Some(assignments) = &matched_update {
-                        self.resolve_update_expr(
-                            col,
-                            assignments,
-                            &target_table_ref,
-                            &source_table_ref,
-                            &t_alias,
-                            &s_alias,
-                        )
-                    } else {
-                        format!("{target_table_ref}.\"{col}\"")
-                    };
-
-                    let insert_expr = if let Some((insert_cols, insert_kind)) = &not_matched_insert
-                    {
-                        self.resolve_insert_expr(
-                            col,
-                            insert_cols,
-                            insert_kind,
-                            &source_table_ref,
-                            &source_columns,
-                            &s_alias,
-                            &t_alias,
-                            &target_table_ref,
-                        )
-                    } else {
-                        "NULL".to_string()
-                    };
-
-                    format!(
-                        "CASE \
-                           WHEN {target_sentinel} IS NOT NULL AND {source_sentinel} IS NOT NULL THEN {update_expr} \
-                           WHEN {target_sentinel} IS NULL THEN {insert_expr} \
-                           ELSE {target_table_ref}.\"{col}\" \
-                         END AS \"{col}\""
-                    )
-                })
-                .collect()
+        // Classify the clauses (honoring statement order and per-clause
+        // predicates) and compile them into one SELECT over a FULL OUTER
+        // JOIN. Row classes are detected through NULL sentinels on the
+        // first column of each side; rows a DELETE clause claims (or
+        // source-only rows no INSERT clause claims) are dropped by the
+        // keep-column WHERE inside the generated SQL.
+        let merge_names = crate::merge_sql::MergeNames {
+            target_ref: &target_table_ref,
+            source_ref: &source_table_ref,
+            t_alias: &t_alias,
+            s_alias: &s_alias,
+            target_columns: &target_columns,
+            source_columns: &source_columns,
         };
+        let classified = crate::merge_sql::classify_merge_clauses(clauses, &merge_names)?;
+        let (matched_clauses, not_matched_clauses, by_source_clauses) = classified.counts();
 
-        let select_sql = format!(
-            "SELECT {} FROM {qualified_target_ref} AS {target_table_ref} FULL OUTER JOIN {qualified_source_ref} AS {source_table_ref} ON {on_rewritten}",
-            column_exprs.join(", ")
+        let select_sql = crate::merge_sql::build_merge_select(
+            &classified,
+            &merge_names,
+            &qualified_target_ref,
+            &qualified_source_ref,
+            &on_rewritten,
         );
 
         info!(
             table = %table_ident,
             merge_sql = %select_sql,
+            matched_clauses,
+            not_matched_clauses,
+            by_source_clauses,
             "MERGE: executing merge query"
         );
 
@@ -3418,18 +3414,12 @@ impl WriteHandler {
         // the `target_buf` reservation and the `MergeScratchCleanup` guard
         // (both declared above) drop: the MemTableExec feeding the join holds
         // Arc refs into the tracked target batches for the duration of the read.
+        // Rows removed by the MERGE (DELETE clauses, unclaimed source-only
+        // rows) are filtered by the keep-column WHERE inside `select_sql`, so
+        // the stream carries exactly the surviving rows.
         let stream = df.execute_stream().await.map_err(|e| {
             SqeError::Execution(format!("Failed to execute MERGE query: {e}"))
         })?;
-
-        // For WHEN MATCHED THEN DELETE the merge SELECT emits all-NULL rows for
-        // the deleted matches; drop them per batch in-stream so the streamed
-        // row count matches the buffered baseline.
-        let stream = if matched_delete {
-            filter_merge_delete_rows(stream)
-        } else {
-            stream
-        };
 
         // Write new data files from the merged results (streaming).
         let tracker = new_upload_tracker();
@@ -3573,6 +3563,25 @@ impl WriteHandler {
         let mode = resolve_merge_mode(table.metadata().properties())?;
         match mode {
             WriteMode::MergeOnRead => {
+                // The equality path expresses exactly one unpredicated clause
+                // per row class; predicated / multi-clause / BY SOURCE merges
+                // (the dbt SCD2 snapshot shape) run copy-on-write instead.
+                let needs_cow = match stmt {
+                    Statement::Merge(merge) => {
+                        crate::merge_sql::merge_needs_cow(&merge.clauses)
+                    }
+                    _ => false,
+                };
+                if needs_cow {
+                    info!(
+                        table = %table_ident,
+                        "MERGE dispatch: clause shape needs CoW (predicates, \
+                         multiple clauses, or NOT MATCHED BY SOURCE)"
+                    );
+                    return self
+                        .handle_merge(session, stmt, source_batches, catalog, ctx)
+                        .await;
+                }
                 let has_ids = table
                     .metadata()
                     .current_schema()
@@ -3684,10 +3693,13 @@ impl WriteHandler {
             "merge-eq-target-buffer",
             self.config.query.write_buffer_tracking,
         );
+        // Deletes applied during the read (#371): an already-deleted target
+        // row must not join as MATCHED and be re-emitted by the RowDelta.
+        let read_plan = self.plan_delete_aware_read(&table).await?;
         for data_file in &old_data_files {
             let file_path = data_file.file_path();
             let batches = self
-                .read_parquet_via_table(&table, file_path, ctx, false)
+                .read_data_file_applying_deletes(&read_plan, &table, file_path, ctx, false)
                 .await?;
             for batch in batches {
                 target_buf.push(batch)?;
@@ -3811,7 +3823,7 @@ impl WriteHandler {
             let update_cols: Vec<String> = target_columns
                 .iter()
                 .map(|col| {
-                    let expr = self.resolve_update_expr(
+                    let expr = crate::merge_sql::resolve_update_expr(
                         col,
                         assignments,
                         &target_ref,
@@ -3893,7 +3905,7 @@ impl WriteHandler {
             let insert_exprs: Vec<String> = target_columns
                 .iter()
                 .map(|col| {
-                    let expr = self.resolve_insert_expr(
+                    let expr = crate::merge_sql::resolve_insert_expr(
                         col,
                         insert_cols,
                         insert_kind,
@@ -4024,124 +4036,6 @@ impl WriteHandler {
             "MoR MERGE committed successfully"
         );
         Ok(affected_rows_batch(total_touched))
-    }
-
-    /// Resolve an UPDATE SET expression for a single column in the MERGE context.
-    ///
-    /// Rewrites alias references (e.g., `t.col` or `s.col`) to point to the
-    /// MemTable names used in the FULL OUTER JOIN.
-    fn resolve_update_expr(
-        &self,
-        col: &str,
-        assignments: &[sqlparser::ast::Assignment],
-        target_table_ref: &str,
-        source_table_ref: &str,
-        t_alias: &str,
-        s_alias: &str,
-    ) -> String {
-        for a in assignments {
-            let col_name = match &a.target {
-                sqlparser::ast::AssignmentTarget::ColumnName(name) => {
-                    // Could be "t.col" or just "col"
-                    let parts: Vec<String> = name
-                        .0
-                        .iter()
-                        .filter_map(|p| p.as_ident())
-                        .map(|i| i.value.clone())
-                        .collect();
-                    parts.last().cloned().unwrap_or_default()
-                }
-                sqlparser::ast::AssignmentTarget::Tuple(names) => names
-                    .first()
-                    .map(|n| {
-                        let parts: Vec<String> = n
-                            .0
-                            .iter()
-                            .filter_map(|p| p.as_ident())
-                            .map(|i| i.value.clone())
-                            .collect();
-                        parts.last().cloned().unwrap_or_default()
-                    })
-                    .unwrap_or_default(),
-            };
-            if col_name == col {
-                let expr_sql = format!("{}", a.value);
-                // Rewrite alias references to MemTable names
-                return expr_sql
-                    .replace(&format!("{t_alias}."), &format!("{target_table_ref}."))
-                    .replace(&format!("{s_alias}."), &format!("{source_table_ref}."));
-            }
-        }
-        // Column not in SET assignments — pass through from target
-        format!("{target_table_ref}.\"{col}\"")
-    }
-
-    /// Resolve an INSERT expression for a single column in the MERGE context.
-    ///
-    /// Maps the INSERT column list + VALUES to find the expression for the
-    /// given target column. Rewrites alias references (e.g., `s.col`) to
-    /// use the MemTable name.
-    #[allow(clippy::too_many_arguments)]
-    fn resolve_insert_expr(
-        &self,
-        col: &str,
-        // sqlparser 0.62: MERGE INSERT column list is Vec<ObjectName> (was Vec<Ident>).
-        insert_columns: &[sqlparser::ast::ObjectName],
-        insert_kind: &sqlparser::ast::MergeInsertKind,
-        source_table_ref: &str,
-        source_columns: &[String],
-        s_alias: &str,
-        t_alias: &str,
-        target_table_ref: &str,
-    ) -> String {
-        use sqlparser::ast::MergeInsertKind;
-
-        let rewrite_aliases = |expr: String| -> String {
-            expr.replace(&format!("{s_alias}."), &format!("{source_table_ref}."))
-                .replace(&format!("{t_alias}."), &format!("{target_table_ref}."))
-        };
-
-        match insert_kind {
-            MergeInsertKind::Values(values) => {
-                if insert_columns.is_empty() {
-                    // No explicit column list — positional mapping by source column name.
-                    if let Some(row) = values.rows.first() {
-                        if let Some(idx) = source_columns.iter().position(|sc| sc == col) {
-                            if idx < row.len() {
-                                return rewrite_aliases(format!("{}", row[idx]));
-                            }
-                        }
-                        return "NULL".to_string();
-                    }
-                    "NULL".to_string()
-                } else {
-                    // Explicit column list — find the column position. A MERGE
-                    // insert column is a bare name; compare against its last
-                    // identifier part (ObjectName in 0.62).
-                    if let Some(pos) = insert_columns.iter().position(|c| {
-                        c.0.last()
-                            .and_then(|p| p.as_ident())
-                            .map(|id| id.value == col)
-                            .unwrap_or(false)
-                    }) {
-                        if let Some(row) = values.rows.first() {
-                            if pos < row.len() {
-                                return rewrite_aliases(format!("{}", row[pos]));
-                            }
-                        }
-                    }
-                    "NULL".to_string()
-                }
-            }
-            MergeInsertKind::Row => {
-                // INSERT ROW: use the source column with the same name
-                if source_columns.contains(&col.to_string()) {
-                    format!("{source_table_ref}.\"{col}\"")
-                } else {
-                    "NULL".to_string()
-                }
-            }
-        }
     }
 
     // -------------------------------------------------------------------------
@@ -4285,6 +4179,102 @@ impl WriteHandler {
         };
 
         Ok(batches)
+    }
+
+    /// Plan a snapshot-pinned, delete-aware read for a DML rewrite (#371).
+    ///
+    /// `read_parquet_via_table` decodes a data file's raw bytes, which
+    /// silently resurrects rows already removed by position/equality delete
+    /// files: a MoR DELETE followed by a CoW UPDATE/DELETE/MERGE rewrote the
+    /// deleted rows back into the table. This plan routes per-file rewrite
+    /// reads through the Iceberg scan machinery instead, so every file's
+    /// applicable delete files are applied during the read.
+    ///
+    /// Plan once per commit attempt, right after each `collect_data_files`
+    /// on the same loaded table, so the task set matches the snapshot whose
+    /// files the rewrite deletes.
+    async fn plan_delete_aware_read(
+        &self,
+        table: &IcebergTable,
+    ) -> sqe_core::Result<DeleteAwareReadPlan> {
+        let scan = table.scan().select_all().build().map_err(|e| {
+            SqeError::Execution(format!("Failed to build rewrite read scan: {e}"))
+        })?;
+        let tasks: Vec<iceberg::scan::FileScanTask> = scan
+            .plan_files()
+            .await
+            .map_err(|e| SqeError::Execution(format!("Failed to plan rewrite read: {e}")))?
+            .try_collect()
+            .await
+            .map_err(|e| SqeError::Execution(format!("Failed to plan rewrite read: {e}")))?;
+        let mut tasks_by_path: std::collections::HashMap<String, Vec<iceberg::scan::FileScanTask>> =
+            std::collections::HashMap::new();
+        for task in tasks {
+            tasks_by_path
+                .entry(task.data_file_path.clone())
+                .or_default()
+                .push(task);
+        }
+        Ok(DeleteAwareReadPlan { scan, tasks_by_path })
+    }
+
+    /// Read one data file with its delete files applied, for CoW/MoR
+    /// rewrites. Memory-tracking contract matches `read_parquet_via_table`:
+    /// with `track` the decoded batches are reserved against the query pool
+    /// while buffered here; callers that re-accumulate pass `track = false`.
+    async fn read_data_file_applying_deletes(
+        &self,
+        plan: &DeleteAwareReadPlan,
+        table: &IcebergTable,
+        file_path: &str,
+        ctx: &DFSessionContext,
+        track: bool,
+    ) -> sqe_core::Result<Vec<RecordBatch>> {
+        let Some(tasks) = plan.tasks_by_path.get(file_path) else {
+            // Not in the planned snapshot. Unreachable when planned against
+            // the same table load as `collect_data_files`; raw read keeps
+            // the pre-#371 behaviour rather than failing the DML.
+            warn!(
+                file_path,
+                "delete-aware read: file missing from scan plan; falling back to raw read"
+            );
+            return self.read_parquet_via_table(table, file_path, ctx, track).await;
+        };
+        let stream: iceberg::scan::FileScanTaskStream =
+            Box::pin(futures::stream::iter(tasks.clone().into_iter().map(Ok)));
+        let result = plan
+            .scan
+            .read_tasks_to_arrow_with_metrics(stream)
+            .map_err(|e| {
+                SqeError::Execution(format!("Failed to read data file '{file_path}': {e}"))
+            })?;
+        let mut batch_stream = result.stream();
+
+        let pool = if track && self.config.query.write_buffer_tracking {
+            Some(ctx.runtime_env().memory_pool.clone())
+        } else {
+            None
+        };
+        let mut batches: Vec<RecordBatch> = Vec::new();
+        let mut buf = pool
+            .as_ref()
+            .map(|p| TrackedBatchBuffer::new(p, "cow-decode-buffer"));
+        while let Some(item) = batch_stream.next().await {
+            let batch = item.map_err(|e| {
+                SqeError::Execution(format!("Failed to read data file '{file_path}': {e}"))
+            })?;
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            match buf.as_mut() {
+                Some(b) => b.push(batch)?,
+                None => batches.push(batch),
+            }
+        }
+        Ok(match buf {
+            Some(b) => b.into_inner(),
+            None => batches,
+        })
     }
 
     /// Evaluate a WHERE clause against a RecordBatch and return rows that do NOT match.
@@ -5097,37 +5087,6 @@ impl Drop for InSubqueryCleanup {
             }
         }
     }
-}
-
-/// Filter all-NULL rows out of a MERGE copy-on-write output stream.
-///
-/// The `WHEN MATCHED THEN DELETE` clause is compiled into a CASE that emits an
-/// all-NULL row for every deleted match. The buffered path dropped those rows
-/// after `collect()`; the streaming path drops them per batch here so the
-/// streamed output (and its row count) matches the buffered baseline exactly.
-/// The declared schema is preserved so the downstream sink stamps identically.
-fn filter_merge_delete_rows(
-    stream: datafusion::execution::SendableRecordBatchStream,
-) -> datafusion::execution::SendableRecordBatchStream {
-    let schema = stream.schema();
-    let filtered = stream.map(|batch_result| {
-        let batch = batch_result?;
-        if batch.num_rows() == 0 {
-            return Ok(batch);
-        }
-        let mut keep = vec![true; batch.num_rows()];
-        for (row, flag) in keep.iter_mut().enumerate() {
-            // A row is a deleted match when every column is NULL.
-            let all_null = (0..batch.num_columns()).all(|c| batch.column(c).is_null(row));
-            if all_null {
-                *flag = false;
-            }
-        }
-        let keep_arr = arrow::array::BooleanArray::from(keep);
-        filter_record_batch(&batch, &keep_arr)
-            .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))
-    });
-    Box::pin(RecordBatchStreamAdapter::new(schema, filtered))
 }
 
 /// RAII guard that deregisters MERGE scratch MemTables on drop.
@@ -7851,8 +7810,9 @@ s3_path_style = true
             vec![],
         );
         let before = format!("{plan:?}");
-        let after = handler.enforce_source_plan(&session, plan).await.unwrap();
+        let (after, summary) = handler.enforce_source_plan(&session, plan).await.unwrap();
         assert_eq!(before, format!("{after:?}"));
+        assert_eq!(summary, sqe_policy::PolicySummary::default());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -7896,12 +7856,13 @@ s3_path_style = true
             chrono::Utc::now(),
             vec![],
         );
-        let rewritten = handler.enforce_source_plan(&session, plan).await.unwrap();
+        let (rewritten, summary) = handler.enforce_source_plan(&session, plan).await.unwrap();
         let s = format!("{}", rewritten.display_indent());
         assert!(
             s.contains("Projection:") && s.contains("\"***\""),
             "expected redacted projection, got: {s}"
         );
+        assert_eq!(summary.columns_masked, vec!["ssn".to_string()]);
 
         // Also verify the rewriter trait method can be called via the field
         // (the `_` import keeps the trait in scope even if a future code
@@ -7987,8 +7948,9 @@ s3_path_style = true
             Field::new("ssn", DataType::Utf8, true),
             Field::new("region", DataType::Utf8, true),
         ]));
+        let mut policy_summary = None;
         handler
-            .compute_write_predicates(session, table_ident, schema)
+            .compute_write_predicates(session, table_ident, schema, &mut policy_summary)
             .await
             .unwrap()
     }
