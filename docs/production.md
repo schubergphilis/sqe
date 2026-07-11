@@ -293,3 +293,14 @@ Route audit logs and traces through an OpenTelemetry Collector when possible. Au
 - [Full audit (2026-07-10)](internal/audit/2026-07-10-sqe-full-audit.md)
 - [Example config](../sqe.toml.example)
 - [QUICKSTART](../QUICKSTART.md) for local validation before production cutover
+## Recent Audit Remediation Notes (2026-07-11)
+
+- `[rate_limit]` section and full production examples now documented in `sqe.toml.example` (see MRs !590, !591).
+- Stale `AUDIT.md` and the full `2026-07-10-sqe-full-audit.md` refreshed with progress (MRs !592, !594).
+- Jemalloc and memory recommendations added to example (MR !593).
+- Babysat fixes for several R items verified and pushed (!579–!581).
+- Perf Group 4 branches currently at main; MRs !585–!588 have notes.
+- Production config validator, DML audit, observability wiring, and CI for write/distributed have seen substantial progress via prior and current MRs.
+
+Refer to the full audit for the prioritized plan. Keep `sqe.toml.example` and this guide in sync as more items land.
+
