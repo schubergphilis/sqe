@@ -471,6 +471,7 @@ This section consolidates progress from the July 10 full audit remediation effor
 P0 advanced in this pass:
 - DML PolicyAudit now unconditional for writes + SELECTs (!625). Deeper write stats (rows_written) still open.
 - Production validator already present.
+- Helm values now document production_mode, rate_limit, TLS/auth checklist items (!632).
 
 P1 advanced:
 - O4: `trace_id` + `query_id` on `AuditEvent` + helper + wiring across paths (!626).
