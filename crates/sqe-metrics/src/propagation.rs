@@ -122,6 +122,39 @@ pub fn trace_context_http_headers() -> Vec<(String, String)> {
     headers
 }
 
+/// Adapter that implements [`Extractor`] for `axum::http::HeaderMap`.
+struct HeaderMapExtractor<'a>(&'a axum::http::HeaderMap);
+
+impl Extractor for HeaderMapExtractor<'_> {
+    fn get(&self, key: &str) -> Option<&str> {
+        self.0.get(key).and_then(|v| v.to_str().ok())
+    }
+
+    fn keys(&self) -> Vec<&str> {
+        self.0.keys().map(|k| k.as_str()).collect()
+    }
+}
+
+/// Extract W3C TraceContext (`traceparent`/`tracestate`) from incoming HTTP headers.
+///
+/// Intended for Trino-compat and Quack HTTP surfaces (O6).
+pub fn extract_trace_context_from_headers(headers: &axum::http::HeaderMap) -> opentelemetry::Context {
+    opentelemetry::global::get_text_map_propagator(|propagator| {
+        propagator.extract(&HeaderMapExtractor(headers))
+    })
+}
+
+/// Extract trace context from HTTP headers and attach it to the current tracing span.
+///
+/// This makes `current_trace_id()` and any child `sqe.query` / policy spans
+/// part of the caller's trace (for OTel + audit correlation).
+///
+/// Call early in Trino/Quack request handlers.
+pub fn attach_trace_context_from_headers(headers: &axum::http::HeaderMap) {
+    let cx = extract_trace_context_from_headers(headers);
+    let _ = tracing::Span::current().set_parent(cx);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
