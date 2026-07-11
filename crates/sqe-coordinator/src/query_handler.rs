@@ -708,6 +708,7 @@ impl QueryHandler {
 
         // Generate a query ID for lifecycle tracking
         let query_id = uuid::Uuid::now_v7();
+        let trace_id = sqe_metrics::propagation::current_trace_id();
         // Wall-clock start timestamp for OpenLineage. The Instant `start`
         // already captured monotonic time but OL events need RFC3339 timestamps.
         let ol_started_at = chrono::Utc::now();
@@ -1685,6 +1686,8 @@ impl QueryHandler {
                     }),
                     session_id: Some(session.id.clone()),
                     client_ip: client_ip.clone(),
+                    trace_id,
+                    query_id: Some(query_id.to_string()),
                     integrity: sqe_metrics::audit::Integrity::default(),
                 };
                 audit.log_event(event);
@@ -1751,6 +1754,8 @@ impl QueryHandler {
                     }),
                     session_id: Some(session.id.clone()),
                     client_ip: client_ip.clone(),
+                    trace_id: trace_id.clone(),
+                    query_id: Some(query_id.to_string()),
                     integrity: sqe_metrics::audit::Integrity::default(),
                 };
                 audit.log_event(grant_event);
@@ -1878,6 +1883,8 @@ impl QueryHandler {
                     }),
                     session_id: Some(session.id.clone()),
                     client_ip: client_ip.clone(),
+                    trace_id,
+                    query_id: Some(query_id.to_string()),
                     integrity: sqe_metrics::audit::Integrity::default(),
                 };
                 audit.log_event(ddl_event);
@@ -2053,8 +2060,10 @@ impl QueryHandler {
         // --- Start tracker ----------------------------------------------------
         let start = std::time::Instant::now();
         let query_id = uuid::Uuid::now_v7();
+        let trace_id = sqe_metrics::propagation::current_trace_id();
         info!(
             query_id = %query_id,
+            trace_id = ?trace_id,
             username = %session.user.username,
             sql_length = sql.len(),
             "Starting streaming query"
@@ -2098,6 +2107,7 @@ impl QueryHandler {
                     actor,
                     resources: audit_resources,
                     client_ip: client_ip.clone(),
+                    trace_id: sqe_metrics::propagation::current_trace_id(),
                 };
 
                 let tracked = crate::streaming::TrackedRecordBatchStream::with_permits_reservation_and_cancel_token(
