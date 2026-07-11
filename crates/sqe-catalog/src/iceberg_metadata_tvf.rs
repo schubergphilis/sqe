@@ -136,6 +136,30 @@ impl TableProvider for IcebergMetadataProvider {
     }
 }
 
+/// If `provider` is one of the Iceberg metadata TVF providers
+/// (`table_files`, `table_snapshots`, `table_manifests`, ...), return the
+/// underlying Iceberg table as `namespace.table`.
+///
+/// The query result cache indexes cached results by the table names in the
+/// plan's `TableScan` nodes, but a metadata TVF scan carries the function
+/// name, not the target table -- so DML writes never invalidated cached TVF
+/// results and `table_files()` counts went stale after DELETE/UPDATE/MERGE
+/// (#371). The coordinator calls this to index those entries under the real
+/// table.
+pub fn metadata_tvf_target_table(
+    provider: &dyn TableProvider,
+) -> Option<String> {
+    (provider as &dyn std::any::Any)
+        .downcast_ref::<IcebergMetadataProvider>()
+        .map(|p| {
+            format!(
+                "{}.{}",
+                p.ident.namespace().as_ref().join("."),
+                p.ident.name()
+            )
+        })
+}
+
 fn ident_for(namespace: &str, table_name: &str) -> TableIdent {
     TableIdent::new(
         NamespaceIdent::new(namespace.to_string()),
