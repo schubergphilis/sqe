@@ -1059,6 +1059,7 @@ impl QueryHandler {
                                     &ctx,
                                     &select_sql,
                                     &mut captured_plan,
+                                    &mut policy_summary,
                                 )
                                 .await;
                             crate::session_context::invalidate_session_cache(&session.user.username).await;
@@ -1088,6 +1089,7 @@ impl QueryHandler {
                                 &ctx,
                                 &select_sql,
                                 &mut captured_plan,
+                                &mut policy_summary,
                             )
                             .await
                     } else {
@@ -1112,6 +1114,7 @@ impl QueryHandler {
                             session_catalog,
                             &ctx,
                             &mut captured_plan,
+                            &mut policy_summary,
                         )
                         .await
                 }
@@ -1128,6 +1131,7 @@ impl QueryHandler {
                             session_catalog,
                             &ctx,
                             &mut captured_plan,
+                            &mut policy_summary,
                         )
                         .await
                 }
@@ -1175,6 +1179,7 @@ impl QueryHandler {
                                 session_catalog,
                                 &ctx,
                                 &mut captured_plan,
+                                &mut policy_summary,
                             )
                             .await
                     } else {
@@ -1387,7 +1392,9 @@ impl QueryHandler {
         let execution_ms = duration.as_millis() as u64;
         let tt_for_complete: Vec<String> = match captured_plan.as_ref() {
             Some(sqe_lineage::PlanOrHint::Plan(p)) => {
-                sqe_lineage::extract::extract_table_names(p.as_ref())
+                let mut tt = sqe_lineage::extract::extract_table_names(p.as_ref());
+                append_metadata_tvf_targets(p.as_ref(), &mut tt);
+                tt
             }
             _ => Vec::new(),
         };
@@ -1813,20 +1820,57 @@ impl QueryHandler {
                     session.user.groups.clone(),
                 );
 
+                let is_dml = matches!(
+                    &kind,
+                    StatementKind::Insert(_)
+                        | StatementKind::Ctas(_)
+                        | StatementKind::Merge(_)
+                        | StatementKind::Delete(_)
+                        | StatementKind::Update(_)
+                        | StatementKind::Truncate(_)
+                );
+                let ps = policy_summary.unwrap_or_default();
+                let policy = if is_dml
+                    && (ps.row_filters_applied > 0
+                        || !ps.columns_masked.is_empty()
+                        || !ps.columns_restricted.is_empty()
+                        || ps.denied)
+                {
+                    Some(sqe_metrics::audit::PolicyAudit {
+                        row_filters_applied: ps.row_filters_applied,
+                        columns_masked: ps.columns_masked,
+                        columns_restricted: ps.columns_restricted,
+                        denied: ps.denied,
+                    })
+                } else {
+                    None
+                };
+                let stats = if is_dml {
+                    Some(sqe_metrics::audit::QueryStats {
+                        rows_returned: rows,
+                        bytes_scanned: pm.bytes_scanned,
+                        rows_scanned: pm.rows_scanned,
+                        spill_bytes: pm.spill_bytes,
+                        peak_memory_bytes: pm.peak_memory_bytes,
+                    })
+                } else {
+                    None
+                };
+
                 let ddl_event = sqe_metrics::audit::AuditEvent {
                     time: chrono::Utc::now(),
                     kind: audit_kind,
                     actor: ddl_actor,
                     outcome: ddl_outcome,
                     resources: audit_resources,
-                    policy: None,
+                    policy,
                     timing: Some(sqe_metrics::audit::Timing {
                         duration_ms: duration.as_millis() as u64,
                         queued_ms: 0,
                         planning_ms: 0,
-                        execution_ms: 0,
+                        execution_ms: if is_dml { execution_ms } else { 0 },
                     }),
-                    stats: None,
+                    stats,
                     query: Some(sqe_metrics::audit::QueryInfo {
                         text: Some(sql.to_string()),
                         query_hash: sqe_metrics::audit::query_hash(sql),
@@ -2159,7 +2203,8 @@ impl QueryHandler {
             .or(effective_catalog_buf.as_deref());
         let audit_resources =
             crate::audit_resources::resources_from_plan(&enforced_plan, default_catalog_str);
-        let tables_touched = sqe_lineage::extract::extract_table_names(&enforced_plan);
+        let mut tables_touched = sqe_lineage::extract::extract_table_names(&enforced_plan);
+        append_metadata_tvf_targets(&enforced_plan, &mut tables_touched);
 
         let enforced_df = ctx
             .execute_logical_plan(enforced_plan)
@@ -4998,6 +5043,33 @@ impl Drop for TimeTravelCleanup {
 /// SQE models references as `[catalog.]schema.table` (single-level namespace),
 /// so only a three-part name carries an explicit catalog; one- and two-part
 /// names do not. Used to route time-travel reads to the right catalog (#317).
+/// Append the underlying Iceberg tables of any metadata TVF scans
+/// (`table_files('ns','t')`, `table_snapshots(...)`, ...) to `tables`.
+///
+/// `extract_table_names` sees only the TVF function name on those scans, so
+/// cached TVF results were never invalidated by DML writes to the target
+/// table and served stale file/snapshot listings (#371).
+fn append_metadata_tvf_targets(
+    plan: &datafusion::logical_expr::LogicalPlan,
+    tables: &mut Vec<String>,
+) {
+    use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+    let _ = plan.apply(|node| {
+        if let datafusion::logical_expr::LogicalPlan::TableScan(scan) = node {
+            if let Ok(provider) = datafusion::datasource::source_as_provider(&scan.source) {
+                if let Some(target) =
+                    sqe_catalog::iceberg_metadata_tvf::metadata_tvf_target_table(provider.as_ref())
+                {
+                    if !tables.contains(&target) {
+                        tables.push(target);
+                    }
+                }
+            }
+        }
+        Ok(TreeNodeRecursion::Continue)
+    });
+}
+
 fn explicit_catalog_component(table: &str) -> Option<&str> {
     let parts: Vec<&str> = table.split('.').collect();
     match parts.as_slice() {
