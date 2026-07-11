@@ -24,5 +24,10 @@ pub(crate) mod page_index_evaluator;
 pub(crate) mod predicate_visitor;
 pub(crate) mod rewrite_not;
 pub(crate) mod row_group_metrics_evaluator;
+// SQE PATCH (sqe#369): public so SQE can unit-test the membership
+// conjunct collection and bloom probing from its own workspace (the
+// vendored crate's standalone test target does not compile; see the
+// vendor README).
+pub mod sbbf_row_group_evaluator;
 pub(crate) mod strict_metrics_evaluator;
 pub(crate) mod strict_projection;

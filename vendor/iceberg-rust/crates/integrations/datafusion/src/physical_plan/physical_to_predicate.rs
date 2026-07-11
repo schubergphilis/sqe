@@ -39,7 +39,7 @@ use std::sync::Arc;
 
 use datafusion::arrow::datatypes::DataType;
 use datafusion::physical_expr::expressions::{
-    BinaryExpr, Column, DynamicFilterPhysicalExpr, InListExpr, Literal,
+    BinaryExpr, CaseExpr, Column, DynamicFilterPhysicalExpr, InListExpr, Literal,
 };
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::scalar::ScalarValue;
@@ -122,7 +122,160 @@ fn convert_physical(expr: &Arc<dyn PhysicalExpr>) -> Option<Predicate> {
         return convert_in_list(in_list);
     }
 
+    // 4. CaseExpr: the sealed shape of a PARTITIONED hash join's
+    //    dynamic filter (DataFusion `shared_bounds.rs`):
+    //    `CASE hash(col) % n WHEN p THEN col IN (...) [AND bounds] ...
+    //     ELSE false END`. Converted by unioning the per-arm membership
+    //    sets into one `Predicate::Set` per column (sqe#369).
+    if let Some(case) = any.downcast_ref::<CaseExpr>() {
+        return convert_case(case);
+    }
+
     None
+}
+
+/// Convert the sealed CASE-of-InLists shape a partitioned `HashJoinExec`
+/// dynamic filter takes into a conjunction of per-column membership
+/// sets, by unioning every arm's `IN` set (sqe#369).
+///
+/// Soundness: a row accepted by the CASE satisfies exactly one arm, and
+/// each arm's acceptance region is contained in that arm's membership
+/// set for every column the arm constrains. For any column constrained
+/// by EVERY arm, an accepted row's value therefore lies in the union of
+/// the arms' sets for that column, so `col IN (union)` is a strict
+/// over-approximation of the CASE: safe for pruning, never for exact
+/// evaluation (the reader always re-applies the real filter).
+///
+/// Bail-outs (return `None`, reader falls back to the static
+/// predicate):
+/// - `ELSE` is anything but a literal `false` (e.g. the
+///   canceled-unknown seal uses `ELSE true`, admitting arbitrary rows);
+/// - any arm's THEN admits rows we cannot bound by a membership set
+///   (`lit(true)` fallback arms, map-lookup pushdown for large build
+///   sides, struct-keyed multi-column joins);
+/// - no single column is constrained by every arm (mixed-column arms).
+fn convert_case(case: &CaseExpr) -> Option<Predicate> {
+    if let Some(else_expr) = case.else_expr() {
+        if !is_literal_false(else_expr) {
+            return None;
+        }
+    }
+
+    // Membership sets per arm: column name -> literal datums.
+    let mut arms: Vec<std::collections::HashMap<String, Vec<Datum>>> = Vec::new();
+    for (_when, then) in case.when_then_expr() {
+        if is_literal_false(then) {
+            // Arm admits no rows (e.g. an empty build partition):
+            // contributes nothing to any union.
+            continue;
+        }
+        let mut sets = std::collections::HashMap::new();
+        collect_membership_sets(then, &mut sets);
+        if sets.is_empty() {
+            // Arm admits rows unconstrained by any membership set.
+            return None;
+        }
+        arms.push(sets);
+    }
+
+    if arms.is_empty() {
+        // Every arm was `false`: the CASE is provably false.
+        return Some(Predicate::AlwaysFalse);
+    }
+
+    // Columns constrained by EVERY arm; only those yield a sound union.
+    let mut common: Vec<&String> = arms[0]
+        .keys()
+        .filter(|col| arms.iter().all(|arm| arm.contains_key(*col)))
+        .collect();
+    if common.is_empty() {
+        return None;
+    }
+    // Deterministic conjunct order for stable plans/tests.
+    common.sort();
+
+    let mut result: Option<Predicate> = None;
+    for col in common {
+        let mut union: Vec<Datum> = Vec::new();
+        for arm in &arms {
+            union.extend(arm[col].iter().cloned());
+        }
+        let membership = if union.is_empty() {
+            // Every arm carried an empty IN-list for this column:
+            // provably false.
+            Predicate::AlwaysFalse
+        } else {
+            Reference::new(col.clone()).is_in(union)
+        };
+        result = Some(match result {
+            Some(acc) => acc.and(membership),
+            None => membership,
+        });
+    }
+    result
+}
+
+/// Collect the membership sets of the positive conjuncts of `expr` into
+/// `out` (column name -> literals). Recurses into `AND`; every other
+/// node contributes nothing. Ignoring a conjunct only widens the
+/// over-approximation, so this never loses soundness; the caller treats
+/// an arm with NO collected sets as unbounded and bails.
+fn collect_membership_sets(
+    expr: &Arc<dyn PhysicalExpr>,
+    out: &mut std::collections::HashMap<String, Vec<Datum>>,
+) {
+    use datafusion::logical_expr::Operator;
+
+    let any = expr.as_ref();
+    if let Some(binary) = any.downcast_ref::<BinaryExpr>() {
+        if *binary.op() == Operator::And {
+            collect_membership_sets(binary.left(), out);
+            collect_membership_sets(binary.right(), out);
+        } else if *binary.op() == Operator::Eq {
+            // col = literal (either side).
+            let col_lit = match (
+                extract_column(binary.left()),
+                extract_literal(binary.right()),
+            ) {
+                (Some(col), Some(lit)) => Some((col, lit)),
+                _ => match (
+                    extract_column(binary.right()),
+                    extract_literal(binary.left()),
+                ) {
+                    (Some(col), Some(lit)) => Some((col, lit)),
+                    _ => None,
+                },
+            };
+            if let Some((col, lit)) = col_lit
+                && let Some(datum) = scalar_to_datum(&lit)
+            {
+                out.entry(col).or_default().push(datum);
+            }
+        }
+        return;
+    }
+    if let Some(in_list) = any.downcast_ref::<InListExpr>() {
+        if in_list.negated() {
+            return;
+        }
+        let Some(col) = extract_column(in_list.expr()) else {
+            return;
+        };
+        let mut datums = Vec::with_capacity(in_list.list().len());
+        for item in in_list.list() {
+            let Some(lit) = extract_literal(item) else {
+                return;
+            };
+            let Some(datum) = scalar_to_datum(&lit) else {
+                return;
+            };
+            datums.push(datum);
+        }
+        // An empty IN-list constrains the column to the empty set (the
+        // arm admits no rows); record it so the caller does not treat
+        // the arm as unbounded.
+        out.entry(col).or_default().extend(datums);
+    }
 }
 
 fn convert_binary(binary: &BinaryExpr) -> Option<Predicate> {
@@ -246,6 +399,15 @@ fn is_literal_true(expr: &Arc<dyn PhysicalExpr>) -> bool {
     matches!(
         extract_literal(expr),
         Some(ScalarValue::Boolean(Some(true)))
+    )
+}
+
+/// `lit(false)`: the shape DataFusion uses both for empty-partition CASE
+/// arms and for the `ELSE` of a sealed partitioned-join filter (sqe#369).
+fn is_literal_false(expr: &Arc<dyn PhysicalExpr>) -> bool {
+    matches!(
+        extract_literal(expr),
+        Some(ScalarValue::Boolean(Some(false)))
     )
 }
 

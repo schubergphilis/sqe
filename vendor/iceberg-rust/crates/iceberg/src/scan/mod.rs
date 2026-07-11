@@ -74,6 +74,11 @@ pub struct TableScanBuilder<'a> {
     /// SQE PATCH (sqe#367): optional decode admission gate, forwarded to
     /// the arrow reader. See [`crate::arrow::DecodeGate`].
     decode_gate: Option<Arc<dyn DecodeGate>>,
+    /// SQE PATCH (sqe#369): parquet bloom-filter (SBBF) row-group
+    /// probing, forwarded to the arrow reader.
+    bloom_filter_probing_enabled: bool,
+    /// SQE PATCH (sqe#369): probe-cost cap, forwarded to the arrow reader.
+    bloom_probe_max_values: usize,
 }
 
 impl<'a> TableScanBuilder<'a> {
@@ -97,6 +102,9 @@ impl<'a> TableScanBuilder<'a> {
             row_selection_enabled: false,
             task_split_target_size: Some(DEFAULT_TASK_SPLIT_TARGET_SIZE),
             decode_gate: None,
+            bloom_filter_probing_enabled: true,
+            bloom_probe_max_values:
+                crate::expr::sbbf_row_group_evaluator::DEFAULT_BLOOM_PROBE_MAX_VALUES,
         }
     }
 
@@ -104,6 +112,23 @@ impl<'a> TableScanBuilder<'a> {
     /// file scan (sub)task decode. See [`crate::arrow::DecodeGate`].
     pub fn with_decode_gate(mut self, gate: Arc<dyn DecodeGate>) -> Self {
         self.decode_gate = Some(gate);
+        self
+    }
+
+    /// SQE PATCH (sqe#369): enable or disable parquet bloom-filter
+    /// (SBBF) row-group probing for positive membership conjuncts
+    /// (`IN` sets / equality literals, including sealed hash-join
+    /// runtime filters). Default on; per row group it only fires when
+    /// the column chunk carries a bloom filter.
+    pub fn with_bloom_filter_probing_enabled(mut self, enabled: bool) -> Self {
+        self.bloom_filter_probing_enabled = enabled;
+        self
+    }
+
+    /// SQE PATCH (sqe#369): cap on the number of literals a membership
+    /// conjunct may carry and still be bloom-probed.
+    pub fn with_bloom_probe_max_values(mut self, max_values: usize) -> Self {
+        self.bloom_probe_max_values = max_values;
         self
     }
 
@@ -298,6 +323,8 @@ impl<'a> TableScanBuilder<'a> {
                         task_split_target_size: self.task_split_target_size,
                         dynamic_predicate: self.dynamic_predicate.clone(),
                         decode_gate: self.decode_gate.clone(),
+                        bloom_filter_probing_enabled: self.bloom_filter_probing_enabled,
+                        bloom_probe_max_values: self.bloom_probe_max_values,
                     });
                 };
                 current_snapshot_id.clone()
@@ -415,6 +442,8 @@ impl<'a> TableScanBuilder<'a> {
             task_split_target_size: self.task_split_target_size,
             dynamic_predicate: self.dynamic_predicate,
             decode_gate: self.decode_gate,
+            bloom_filter_probing_enabled: self.bloom_filter_probing_enabled,
+            bloom_probe_max_values: self.bloom_probe_max_values,
         })
     }
 }
@@ -457,6 +486,14 @@ pub struct TableScan {
     /// SQE PATCH (sqe#367): optional decode admission gate (see
     /// [`TableScanBuilder::with_decode_gate`]). Forwarded to the reader.
     decode_gate: Option<Arc<dyn DecodeGate>>,
+
+    /// SQE PATCH (sqe#369): parquet bloom-filter (SBBF) row-group
+    /// probing (see [`TableScanBuilder::with_bloom_filter_probing_enabled`]).
+    /// Forwarded to the reader.
+    bloom_filter_probing_enabled: bool,
+    /// SQE PATCH (sqe#369): probe-cost cap (see
+    /// [`TableScanBuilder::with_bloom_probe_max_values`]).
+    bloom_probe_max_values: usize,
 }
 
 impl TableScan {
@@ -593,7 +630,10 @@ impl TableScan {
             .with_data_file_concurrency_limit(self.concurrency_limit_data_files)
             .with_row_group_filtering_enabled(self.row_group_filtering_enabled)
             .with_row_selection_enabled(self.row_selection_enabled)
-            .with_task_split_target_size(self.task_split_target_size);
+            .with_task_split_target_size(self.task_split_target_size)
+            // SQE PATCH (sqe#369)
+            .with_bloom_filter_probing_enabled(self.bloom_filter_probing_enabled)
+            .with_bloom_probe_max_values(self.bloom_probe_max_values);
 
         if let Some(batch_size) = self.batch_size {
             arrow_reader_builder = arrow_reader_builder.with_batch_size(batch_size);

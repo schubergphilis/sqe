@@ -57,6 +57,10 @@ pub struct SqeSchemaProvider {
     /// Bounded wait (ms) at scan open for pending dynamic filters,
     /// propagated to each `SqeTableProvider`.
     runtime_filter_wait_ms: u64,
+    /// Issue #369: bloom-filter row-group probing of sealed runtime
+    /// filters, propagated to each `SqeTableProvider`.
+    runtime_filter_bloom_probe: bool,
+    runtime_filter_bloom_max_values: usize,
     /// Short-TTL cache of table_names() results so repeated planning
     /// lookups during a single dbt run do not pay two REST round trips
     /// per call.
@@ -87,6 +91,8 @@ impl SqeSchemaProvider {
             runtime_filter_clustering_skip: false,
             runtime_filter_uniform_threshold: 0.8,
             runtime_filter_wait_ms: crate::iceberg_scan::DEFAULT_RUNTIME_FILTER_WAIT_MS,
+            runtime_filter_bloom_probe: true,
+            runtime_filter_bloom_max_values: 65536,
             table_names_cache,
         }
     }
@@ -134,6 +140,15 @@ impl SqeSchemaProvider {
     #[must_use = "with_runtime_filter_wait_ms consumes self; bind the returned provider"]
     pub fn with_runtime_filter_wait_ms(mut self, wait_ms: u64) -> Self {
         self.runtime_filter_wait_ms = wait_ms;
+        self
+    }
+
+    /// Bloom-filter (SBBF) row-group probing of sealed runtime filters
+    /// (issue #369), propagated to every table provider.
+    #[must_use = "with_runtime_filter_bloom consumes self; bind the returned provider"]
+    pub fn with_runtime_filter_bloom(mut self, enabled: bool, max_values: usize) -> Self {
+        self.runtime_filter_bloom_probe = enabled;
+        self.runtime_filter_bloom_max_values = max_values;
         self
     }
 
@@ -251,7 +266,11 @@ impl SchemaProvider for SqeSchemaProvider {
                                 self.runtime_filter_clustering_skip,
                                 self.runtime_filter_uniform_threshold,
                             )
-                            .with_runtime_filter_wait_ms(self.runtime_filter_wait_ms);
+                            .with_runtime_filter_wait_ms(self.runtime_filter_wait_ms)
+                            .with_runtime_filter_bloom(
+                                self.runtime_filter_bloom_probe,
+                                self.runtime_filter_bloom_max_values,
+                            );
                         return Ok(Some(Arc::new(provider)));
                     }
                     Err(e) => {
