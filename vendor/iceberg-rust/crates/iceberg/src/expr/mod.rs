@@ -28,6 +28,9 @@ use std::fmt::{Display, Formatter};
 
 pub use dynamic::DynamicPredicate;
 pub use predicate::*;
+// SQE PATCH (sqe#369): re-export the bloom probe evaluator for SQE
+// unit tests.
+pub use visitors::sbbf_row_group_evaluator;
 
 use crate::spec::SchemaRef;
 

@@ -53,12 +53,16 @@ impl<F: FileRead> FileRead for CountingFileRead<F> {
 #[derive(Clone, Debug)]
 pub struct ScanMetrics {
     bytes_read: Arc<AtomicU64>,
+    /// SQE PATCH (sqe#369): row groups pruned by parquet bloom-filter
+    /// (SBBF) membership probing.
+    row_groups_pruned_bloom: Arc<AtomicU64>,
 }
 
 impl ScanMetrics {
     pub(crate) fn new() -> Self {
         Self {
             bytes_read: Arc::new(AtomicU64::new(0)),
+            row_groups_pruned_bloom: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -69,6 +73,18 @@ impl ScanMetrics {
     /// Total bytes read from storage for data files during this scan.
     pub fn bytes_read(&self) -> u64 {
         self.bytes_read.load(Ordering::Relaxed)
+    }
+
+    /// SQE PATCH (sqe#369): counter handle threaded into the per-task
+    /// reader so bloom pruning can report.
+    pub(crate) fn row_groups_pruned_bloom_counter(&self) -> &Arc<AtomicU64> {
+        &self.row_groups_pruned_bloom
+    }
+
+    /// SQE PATCH (sqe#369): total row groups pruned during this scan by
+    /// bloom-filter membership probing of sealed runtime-filter key sets.
+    pub fn row_groups_pruned_bloom(&self) -> u64 {
+        self.row_groups_pruned_bloom.load(Ordering::Relaxed)
     }
 }
 

@@ -144,6 +144,10 @@ pub struct SqeCatalogProvider {
     /// Bounded wait (ms) at scan open for pending dynamic filters,
     /// propagated downstream.
     runtime_filter_wait_ms: u64,
+    /// Issue #369: bloom-filter row-group probing of sealed runtime
+    /// filters, propagated downstream.
+    runtime_filter_bloom_probe: bool,
+    runtime_filter_bloom_max_values: usize,
 }
 
 impl std::fmt::Debug for SqeCatalogProvider {
@@ -258,6 +262,8 @@ impl SqeCatalogProvider {
             runtime_filter_clustering_skip: false,
             runtime_filter_uniform_threshold: 0.8,
             runtime_filter_wait_ms: crate::iceberg_scan::DEFAULT_RUNTIME_FILTER_WAIT_MS,
+            runtime_filter_bloom_probe: true,
+            runtime_filter_bloom_max_values: 65536,
         })
     }
 
@@ -309,6 +315,15 @@ impl SqeCatalogProvider {
         self
     }
 
+    /// Bloom-filter (SBBF) row-group probing of sealed runtime filters
+    /// (issue #369). Propagated to schema and table providers.
+    #[must_use = "with_runtime_filter_bloom consumes self; bind the returned provider"]
+    pub fn with_runtime_filter_bloom(mut self, enabled: bool, max_values: usize) -> Self {
+        self.runtime_filter_bloom_probe = enabled;
+        self.runtime_filter_bloom_max_values = max_values;
+        self
+    }
+
     /// Create a catalog provider with pre-populated namespace names.
     /// Useful when the namespace list is already known.
     pub fn with_namespaces(
@@ -333,6 +348,8 @@ impl SqeCatalogProvider {
             runtime_filter_clustering_skip: false,
             runtime_filter_uniform_threshold: 0.8,
             runtime_filter_wait_ms: crate::iceberg_scan::DEFAULT_RUNTIME_FILTER_WAIT_MS,
+            runtime_filter_bloom_probe: true,
+            runtime_filter_bloom_max_values: 65536,
         }
     }
 
@@ -443,6 +460,10 @@ impl CatalogProvider for SqeCatalogProvider {
             self.runtime_filter_uniform_threshold,
         );
         provider = provider.with_runtime_filter_wait_ms(self.runtime_filter_wait_ms);
+        provider = provider.with_runtime_filter_bloom(
+            self.runtime_filter_bloom_probe,
+            self.runtime_filter_bloom_max_values,
+        );
 
         Some(Arc::new(provider))
 

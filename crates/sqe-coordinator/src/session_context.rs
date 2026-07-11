@@ -91,6 +91,11 @@ pub(crate) async fn build_catalog_provider(
     );
     catalog_provider = catalog_provider
         .with_runtime_filter_wait_ms(cat_cfg.runtime_filters.wait_ms);
+    // Issue #369: bloom-filter row-group probing of sealed runtime filters.
+    catalog_provider = catalog_provider.with_runtime_filter_bloom(
+        cat_cfg.runtime_filters.bloom_probe,
+        cat_cfg.runtime_filters.bloom_max_values,
+    );
 
     Ok((catalog_provider, session_catalog))
 }
