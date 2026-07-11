@@ -411,6 +411,9 @@ async fn test_local_fallback_select() {
 // fall through to local execution and still pass. We now fail loudly
 // when the worker is unreachable and check system.runtime.tasks to
 // confirm at least one task ran on a worker node.
+//
+// Wired into CI via scripts/integration-test.sh (DISTRIBUTED=1) +
+// dedicated distributed-smoke job in .gitlab-ci.yml (Q-05).
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs docker-compose.distributed.yml + a worker on :50052"]
 async fn test_distributed_select() {
