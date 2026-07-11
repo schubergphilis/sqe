@@ -510,7 +510,7 @@ async fn test_distributed_select() {
 // Test: MetricsRegistry can be created and incremented
 #[test]
 fn test_metrics_registry() {
-    let metrics = sqe_metrics::MetricsRegistry::new();
+    let metrics = sqe_metrics::MetricsRegistry::new().unwrap();
     metrics
         .query_count
         .with_label_values(&["success", "query", ""])

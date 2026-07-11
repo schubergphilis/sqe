@@ -13,6 +13,94 @@ use prometheus::{
     IntCounterVec, IntGauge, Opts, Registry,
 };
 
+fn register_counter(
+    registry: &Registry,
+    name: &str,
+    help: &str,
+) -> Result<Counter, prometheus::Error> {
+    let m = Counter::new(name, help)?;
+    registry.register(Box::new(m.clone()))?;
+    Ok(m)
+}
+
+fn register_counter_vec(
+    registry: &Registry,
+    name: &str,
+    help: &str,
+    labels: &[&str],
+) -> Result<CounterVec, prometheus::Error> {
+    let m = CounterVec::new(Opts::new(name, help), labels)?;
+    registry.register(Box::new(m.clone()))?;
+    Ok(m)
+}
+
+fn register_gauge(registry: &Registry, name: &str, help: &str) -> Result<Gauge, prometheus::Error> {
+    let m = Gauge::new(name, help)?;
+    registry.register(Box::new(m.clone()))?;
+    Ok(m)
+}
+
+fn register_gauge_vec(
+    registry: &Registry,
+    name: &str,
+    help: &str,
+    labels: &[&str],
+) -> Result<GaugeVec, prometheus::Error> {
+    let m = GaugeVec::new(Opts::new(name, help), labels)?;
+    registry.register(Box::new(m.clone()))?;
+    Ok(m)
+}
+
+fn register_histogram(
+    registry: &Registry,
+    opts: HistogramOpts,
+) -> Result<Histogram, prometheus::Error> {
+    let m = Histogram::with_opts(opts)?;
+    registry.register(Box::new(m.clone()))?;
+    Ok(m)
+}
+
+fn register_histogram_vec(
+    registry: &Registry,
+    opts: HistogramOpts,
+    labels: &[&str],
+) -> Result<HistogramVec, prometheus::Error> {
+    let m = HistogramVec::new(opts, labels)?;
+    registry.register(Box::new(m.clone()))?;
+    Ok(m)
+}
+
+fn register_int_counter(
+    registry: &Registry,
+    name: &str,
+    help: &str,
+) -> Result<IntCounter, prometheus::Error> {
+    let m = IntCounter::new(name, help)?;
+    registry.register(Box::new(m.clone()))?;
+    Ok(m)
+}
+
+fn register_int_counter_vec(
+    registry: &Registry,
+    name: &str,
+    help: &str,
+    labels: &[&str],
+) -> Result<IntCounterVec, prometheus::Error> {
+    let m = IntCounterVec::new(Opts::new(name, help), labels)?;
+    registry.register(Box::new(m.clone()))?;
+    Ok(m)
+}
+
+fn register_int_gauge(
+    registry: &Registry,
+    name: &str,
+    help: &str,
+) -> Result<IntGauge, prometheus::Error> {
+    let m = IntGauge::new(name, help)?;
+    registry.register(Box::new(m.clone()))?;
+    Ok(m)
+}
+
 /// Trait for types that expose a Prometheus [`Registry`] for metrics serving.
 pub trait HasRegistry: Send + Sync + 'static {
     fn prometheus_registry(&self) -> &Registry;
@@ -127,324 +215,282 @@ pub struct MetricsRegistry {
 }
 
 impl MetricsRegistry {
-    pub fn new() -> Self {
+    pub fn new() -> Result<Self, prometheus::Error> {
         let registry = Registry::new();
 
-        let query_count = CounterVec::new(
-            Opts::new("sqe_query_count_total", "Total queries executed"),
+        let query_count = register_counter_vec(
+            &registry,
+            "sqe_query_count_total",
+            "Total queries executed",
             &["status", "statement_type", "error_code"],
-        )
-        .unwrap();
-        registry.register(Box::new(query_count.clone())).unwrap();
+        )?;
 
-        let query_duration = HistogramVec::new(
+        let query_duration = register_histogram_vec(
+            &registry,
             HistogramOpts::new("sqe_query_duration_seconds", "Query execution duration")
                 .buckets(vec![0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0]),
             &["statement_type"],
-        )
-        .unwrap();
-        registry.register(Box::new(query_duration.clone())).unwrap();
+        )?;
 
-        let rows_returned = Counter::new(
+        let rows_returned = register_counter(
+            &registry,
             "sqe_rows_returned_total",
             "Total rows returned across all queries",
-        )
-        .unwrap();
-        registry.register(Box::new(rows_returned.clone())).unwrap();
+        )?;
 
-        let active_sessions = IntGauge::new(
-            "sqe_active_sessions",
-            "Number of active sessions",
-        )
-        .unwrap();
-        registry.register(Box::new(active_sessions.clone())).unwrap();
+        let active_sessions =
+            register_int_gauge(&registry, "sqe_active_sessions", "Number of active sessions")?;
 
-        let healthy_workers = IntGauge::new(
+        let healthy_workers = register_int_gauge(
+            &registry,
             "sqe_healthy_workers",
             "Number of healthy workers",
-        )
-        .unwrap();
-        registry.register(Box::new(healthy_workers.clone())).unwrap();
+        )?;
 
-        let cache_hits = Counter::new("sqe_cache_hits_total", "Total cache hits").unwrap();
-        let cache_misses = Counter::new("sqe_cache_misses_total", "Total cache misses").unwrap();
-        let cache_invalidations = Counter::new("sqe_cache_invalidations_total", "Total cache invalidations").unwrap();
-        let cache_size_bytes = Gauge::new("sqe_cache_size_bytes", "Current cache memory usage in bytes").unwrap();
-        let cache_entries = Gauge::new("sqe_cache_entries", "Current number of cached entries").unwrap();
+        let cache_hits = register_counter(&registry, "sqe_cache_hits_total", "Total cache hits")?;
+        let cache_misses =
+            register_counter(&registry, "sqe_cache_misses_total", "Total cache misses")?;
+        let cache_invalidations = register_counter(
+            &registry,
+            "sqe_cache_invalidations_total",
+            "Total cache invalidations",
+        )?;
+        let cache_size_bytes = register_gauge(
+            &registry,
+            "sqe_cache_size_bytes",
+            "Current cache memory usage in bytes",
+        )?;
+        let cache_entries = register_gauge(
+            &registry,
+            "sqe_cache_entries",
+            "Current number of cached entries",
+        )?;
 
-        registry.register(Box::new(cache_hits.clone())).unwrap();
-        registry.register(Box::new(cache_misses.clone())).unwrap();
-        registry.register(Box::new(cache_invalidations.clone())).unwrap();
-        registry.register(Box::new(cache_size_bytes.clone())).unwrap();
-        registry.register(Box::new(cache_entries.clone())).unwrap();
-
-        let scheduler_decisions = IntCounterVec::new(
-            Opts::new("sqe_scheduler_decisions_total", "Scheduling decisions by type"),
+        let scheduler_decisions = register_int_counter_vec(
+            &registry,
+            "sqe_scheduler_decisions_total",
+            "Scheduling decisions by type",
             &["decision"],
-        )
-        .unwrap();
-        registry.register(Box::new(scheduler_decisions.clone())).unwrap();
+        )?;
 
-        let scheduler_task_count = Histogram::with_opts(
+        let scheduler_task_count = register_histogram(
+            &registry,
             HistogramOpts::new(
                 "sqe_scheduler_task_count",
                 "Number of tasks per distributed query",
             )
             .buckets(vec![1.0, 2.0, 3.0, 5.0, 10.0, 20.0, 50.0, 100.0]),
-        )
-        .unwrap();
-        registry.register(Box::new(scheduler_task_count.clone())).unwrap();
+        )?;
 
-        let scheduler_task_size_mb = Histogram::with_opts(
+        let scheduler_task_size_mb = register_histogram(
+            &registry,
             HistogramOpts::new(
                 "sqe_scheduler_task_size_mb",
                 "Size of individual scan tasks in MB",
             )
             .buckets(vec![1.0, 10.0, 50.0, 100.0, 256.0, 512.0, 1024.0, 5120.0]),
-        )
-        .unwrap();
-        registry.register(Box::new(scheduler_task_size_mb.clone())).unwrap();
+        )?;
 
-        let scheduler_stragglers = IntCounter::new(
+        let scheduler_stragglers = register_int_counter(
+            &registry,
             "sqe_scheduler_stragglers_total",
             "Number of straggler fragments detected",
-        )
-        .unwrap();
-        registry.register(Box::new(scheduler_stragglers.clone())).unwrap();
+        )?;
 
-        let footer_cache_hits = Counter::new(
+        let footer_cache_hits = register_counter(
+            &registry,
             "sqe_footer_cache_hits_total",
             "Total Parquet footer cache hits",
-        )
-        .unwrap();
-        registry.register(Box::new(footer_cache_hits.clone())).unwrap();
+        )?;
 
-        let footer_cache_misses = Counter::new(
+        let footer_cache_misses = register_counter(
+            &registry,
             "sqe_footer_cache_misses_total",
             "Total Parquet footer cache misses",
-        )
-        .unwrap();
-        registry.register(Box::new(footer_cache_misses.clone())).unwrap();
+        )?;
 
-        let footer_cache_size_bytes = Gauge::new(
+        let footer_cache_size_bytes = register_gauge(
+            &registry,
             "sqe_footer_cache_size_bytes",
             "Current estimated size of Parquet footer cache in bytes",
-        )
-        .unwrap();
-        registry.register(Box::new(footer_cache_size_bytes.clone())).unwrap();
+        )?;
 
-        let coordinator_memory_used_bytes = Gauge::new(
+        let coordinator_memory_used_bytes = register_gauge(
+            &registry,
             "sqe_coordinator_memory_used_bytes",
             "Current coordinator DataFusion memory pool usage in bytes",
-        )
-        .unwrap();
-        registry.register(Box::new(coordinator_memory_used_bytes.clone())).unwrap();
+        )?;
 
-        let coordinator_memory_limit_bytes = Gauge::new(
+        let coordinator_memory_limit_bytes = register_gauge(
+            &registry,
             "sqe_coordinator_memory_limit_bytes",
             "Coordinator DataFusion memory pool limit in bytes",
-        )
-        .unwrap();
-        registry.register(Box::new(coordinator_memory_limit_bytes.clone())).unwrap();
+        )?;
 
-        let coordinator_rss_bytes = Gauge::new(
+        let coordinator_rss_bytes = register_gauge(
+            &registry,
             "sqe_coordinator_rss_bytes",
             "Coordinator process resident set size in bytes",
-        )
-        .unwrap();
-        registry.register(Box::new(coordinator_rss_bytes.clone())).unwrap();
+        )?;
 
-        let coordinator_memory_pressure = Gauge::new(
+        let coordinator_memory_pressure = register_gauge(
+            &registry,
             "sqe_coordinator_memory_pressure",
             "Coordinator memory pressure level (0=green, 1=yellow, 2=orange, 3=red)",
-        )
-        .unwrap();
-        registry.register(Box::new(coordinator_memory_pressure.clone())).unwrap();
+        )?;
 
         // Spill metrics
-        let sort_spill_count = Counter::new(
+        let sort_spill_count = register_counter(
+            &registry,
             "sqe_sort_spill_count_total",
             "Number of sort spill events",
-        )
-        .unwrap();
-        registry.register(Box::new(sort_spill_count.clone())).unwrap();
+        )?;
 
-        let sort_spill_bytes = Counter::new(
-            "sqe_sort_spill_bytes_total",
-            "Bytes spilled for sorts",
-        )
-        .unwrap();
-        registry.register(Box::new(sort_spill_bytes.clone())).unwrap();
+        let sort_spill_bytes =
+            register_counter(&registry, "sqe_sort_spill_bytes_total", "Bytes spilled for sorts")?;
 
-        let join_spill_count = Counter::new(
+        let join_spill_count = register_counter(
+            &registry,
             "sqe_join_spill_count_total",
             "Join spill events (SortMergeJoin)",
-        )
-        .unwrap();
-        registry.register(Box::new(join_spill_count.clone())).unwrap();
+        )?;
 
-        let join_spill_bytes = Counter::new(
-            "sqe_join_spill_bytes_total",
-            "Bytes spilled for joins",
-        )
-        .unwrap();
-        registry.register(Box::new(join_spill_bytes.clone())).unwrap();
+        let join_spill_bytes =
+            register_counter(&registry, "sqe_join_spill_bytes_total", "Bytes spilled for joins")?;
 
         // Shuffle metrics (Phase B — registered now, incremented when shuffle lands)
-        let shuffle_bytes_sent = Counter::new(
+        let shuffle_bytes_sent = register_counter(
+            &registry,
             "sqe_shuffle_bytes_sent_total",
             "Bytes sent via DoExchange",
-        )
-        .unwrap();
-        registry.register(Box::new(shuffle_bytes_sent.clone())).unwrap();
+        )?;
 
-        let shuffle_bytes_received = Counter::new(
+        let shuffle_bytes_received = register_counter(
+            &registry,
             "sqe_shuffle_bytes_received_total",
             "Bytes received via DoExchange",
-        )
-        .unwrap();
-        registry.register(Box::new(shuffle_bytes_received.clone())).unwrap();
+        )?;
 
-        let shuffle_partitions = Counter::new(
+        let shuffle_partitions = register_counter(
+            &registry,
             "sqe_shuffle_partitions_total",
             "Shuffle partitions created",
-        )
-        .unwrap();
-        registry.register(Box::new(shuffle_partitions.clone())).unwrap();
+        )?;
 
         // Late materialization metrics
-        let late_mat_bytes_predicate = Counter::new(
+        let late_mat_bytes_predicate = register_counter(
+            &registry,
             "sqe_late_mat_bytes_predicate_total",
             "Bytes read for predicate evaluation",
-        )
-        .unwrap();
-        registry.register(Box::new(late_mat_bytes_predicate.clone())).unwrap();
+        )?;
 
-        let late_mat_bytes_projection = Counter::new(
+        let late_mat_bytes_projection = register_counter(
+            &registry,
             "sqe_late_mat_bytes_projection_total",
             "Bytes read for projection",
-        )
-        .unwrap();
-        registry.register(Box::new(late_mat_bytes_projection.clone())).unwrap();
+        )?;
 
-        let late_mat_selectivity = Histogram::with_opts(
+        let late_mat_selectivity = register_histogram(
+            &registry,
             HistogramOpts::new(
                 "sqe_late_mat_selectivity",
                 "Late materialization selectivity (rows surviving / total rows)",
             )
             .buckets(vec![0.01, 0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99, 1.0]),
-        )
-        .unwrap();
-        registry.register(Box::new(late_mat_selectivity.clone())).unwrap();
+        )?;
 
         // Pruning metrics
-        let files_pruned_minmax = Counter::new(
+        let files_pruned_minmax = register_counter(
+            &registry,
             "sqe_files_pruned_minmax_total",
             "Files skipped by min/max pruning",
-        )
-        .unwrap();
-        registry.register(Box::new(files_pruned_minmax.clone())).unwrap();
+        )?;
 
-        let files_pruned_bloom = Counter::new(
+        let files_pruned_bloom = register_counter(
+            &registry,
             "sqe_files_pruned_bloom_total",
             "Files skipped by bloom filter",
-        )
-        .unwrap();
-        registry.register(Box::new(files_pruned_bloom.clone())).unwrap();
+        )?;
 
-        let pages_pruned_index = Counter::new(
+        let pages_pruned_index = register_counter(
+            &registry,
             "sqe_pages_pruned_index_total",
             "Pages skipped by page index",
-        )
-        .unwrap();
-        registry.register(Box::new(pages_pruned_index.clone())).unwrap();
+        )?;
 
         // Latency
-        let time_to_first_row = Histogram::with_opts(
+        let time_to_first_row = register_histogram(
+            &registry,
             HistogramOpts::new(
                 "sqe_time_to_first_row_seconds",
                 "Time from query submit to first result row",
             )
             .buckets(vec![0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0]),
-        )
-        .unwrap();
-        registry.register(Box::new(time_to_first_row.clone())).unwrap();
+        )?;
 
         // S3 I/O metrics
-        let s3_requests_total = IntCounterVec::new(
-            Opts::new("sqe_s3_requests_total", "Total S3 requests by operation and status"),
+        let s3_requests_total = register_int_counter_vec(
+            &registry,
+            "sqe_s3_requests_total",
+            "Total S3 requests by operation and status",
             &["operation", "status"],
-        )
-        .unwrap();
-        registry.register(Box::new(s3_requests_total.clone())).unwrap();
+        )?;
 
-        let s3_bytes_read_total = IntCounter::new(
+        let s3_bytes_read_total = register_int_counter(
+            &registry,
             "sqe_s3_bytes_read_total",
             "Total bytes fetched from S3",
-        )
-        .unwrap();
-        registry.register(Box::new(s3_bytes_read_total.clone())).unwrap();
+        )?;
 
-        let s3_bytes_written_total = IntCounter::new(
+        let s3_bytes_written_total = register_int_counter(
+            &registry,
             "sqe_s3_bytes_written_total",
             "Total bytes written to S3",
-        )
-        .unwrap();
-        registry.register(Box::new(s3_bytes_written_total.clone())).unwrap();
+        )?;
 
-        let s3_request_duration_seconds = Histogram::with_opts(
+        let s3_request_duration_seconds = register_histogram(
+            &registry,
             HistogramOpts::new(
                 "sqe_s3_request_duration_seconds",
                 "S3 request latency in seconds",
             )
             .buckets(vec![0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]),
-        )
-        .unwrap();
-        registry.register(Box::new(s3_request_duration_seconds.clone())).unwrap();
+        )?;
 
         // Auth metrics
-        let auth_attempts_total = IntCounterVec::new(
-            Opts::new(
-                "sqe_auth_attempts_total",
-                "Total authentication attempts by provider and status",
-            ),
+        let auth_attempts_total = register_int_counter_vec(
+            &registry,
+            "sqe_auth_attempts_total",
+            "Total authentication attempts by provider and status",
             &["provider", "status"],
-        )
-        .unwrap();
-        registry.register(Box::new(auth_attempts_total.clone())).unwrap();
+        )?;
 
-        let auth_duration_seconds = Histogram::with_opts(
+        let auth_duration_seconds = register_histogram(
+            &registry,
             HistogramOpts::new(
                 "sqe_auth_duration_seconds",
                 "Authentication handshake latency in seconds",
             )
             .buckets(vec![0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0]),
-        )
-        .unwrap();
-        registry.register(Box::new(auth_duration_seconds.clone())).unwrap();
+        )?;
 
-        let token_refresh_total = IntCounterVec::new(
-            Opts::new(
-                "sqe_token_refresh_total",
-                "Total token refresh attempts by status",
-            ),
+        let token_refresh_total = register_int_counter_vec(
+            &registry,
+            "sqe_token_refresh_total",
+            "Total token refresh attempts by status",
             &["status"],
-        )
-        .unwrap();
-        registry.register(Box::new(token_refresh_total.clone())).unwrap();
+        )?;
 
         // Adaptive sort stripping metric
-        let sorts_stripped_total = IntCounterVec::new(
-            Opts::new(
-                "sqe_sorts_stripped_total",
-                "Total sort operations stripped by adaptive sort rule",
-            ),
+        let sorts_stripped_total = register_int_counter_vec(
+            &registry,
+            "sqe_sorts_stripped_total",
+            "Total sort operations stripped by adaptive sort rule",
             &["mode", "reason"],
-        )
-        .unwrap();
-        registry.register(Box::new(sorts_stripped_total.clone())).unwrap();
+        )?;
 
-        let catalog_request_duration_seconds = HistogramVec::new(
+        let catalog_request_duration_seconds = register_histogram_vec(
+            &registry,
             HistogramOpts::new(
                 "sqe_catalog_request_duration_seconds",
                 "Catalog (Polaris REST) roundtrip latency in seconds",
@@ -453,25 +499,17 @@ impl MetricsRegistry {
                 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
             ]),
             &["op", "status"],
-        )
-        .unwrap();
-        registry
-            .register(Box::new(catalog_request_duration_seconds.clone()))
-            .unwrap();
+        )?;
 
-        let catalog_circuit_breaker_state = GaugeVec::new(
-            Opts::new(
-                "sqe_catalog_circuit_breaker_state",
-                "Catalog circuit breaker state (0=closed, 1=half_open, 2=open)",
-            ),
+        let catalog_circuit_breaker_state = register_gauge_vec(
+            &registry,
+            "sqe_catalog_circuit_breaker_state",
+            "Catalog circuit breaker state (0=closed, 1=half_open, 2=open)",
             &["circuit"],
-        )
-        .unwrap();
-        registry
-            .register(Box::new(catalog_circuit_breaker_state.clone()))
-            .unwrap();
+        )?;
 
-        let policy_resolve_duration_seconds = HistogramVec::new(
+        let policy_resolve_duration_seconds = register_histogram_vec(
+            &registry,
             HistogramOpts::new(
                 "sqe_policy_resolve_duration_seconds",
                 "Policy backend (OPA / Cedar) resolve latency in seconds",
@@ -480,131 +518,84 @@ impl MetricsRegistry {
                 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0,
             ]),
             &["backend", "status"],
-        )
-        .unwrap();
-        registry
-            .register(Box::new(policy_resolve_duration_seconds.clone()))
-            .unwrap();
+        )?;
 
-        let policy_cache_hits_total = IntCounterVec::new(
-            Opts::new(
-                "sqe_policy_cache_hits_total",
-                "Policy backend cache hits by backend",
-            ),
+        let policy_cache_hits_total = register_int_counter_vec(
+            &registry,
+            "sqe_policy_cache_hits_total",
+            "Policy backend cache hits by backend",
             &["backend"],
-        )
-        .unwrap();
-        registry
-            .register(Box::new(policy_cache_hits_total.clone()))
-            .unwrap();
+        )?;
 
-        let policy_cache_misses_total = IntCounterVec::new(
-            Opts::new(
-                "sqe_policy_cache_misses_total",
-                "Policy backend cache misses by backend",
-            ),
+        let policy_cache_misses_total = register_int_counter_vec(
+            &registry,
+            "sqe_policy_cache_misses_total",
+            "Policy backend cache misses by backend",
             &["backend"],
-        )
-        .unwrap();
-        registry
-            .register(Box::new(policy_cache_misses_total.clone()))
-            .unwrap();
+        )?;
 
-        let policy_circuit_breaker_state = GaugeVec::new(
-            Opts::new(
-                "sqe_policy_circuit_breaker_state",
-                "Policy backend circuit breaker state (0=closed, 1=half_open, 2=open)",
-            ),
+        let policy_circuit_breaker_state = register_gauge_vec(
+            &registry,
+            "sqe_policy_circuit_breaker_state",
+            "Policy backend circuit breaker state (0=closed, 1=half_open, 2=open)",
             &["backend"],
-        )
-        .unwrap();
-        registry
-            .register(Box::new(policy_circuit_breaker_state.clone()))
-            .unwrap();
+        )?;
 
-        let write_orphan_files_total = IntCounterVec::new(
-            Opts::new(
-                "sqe_write_orphan_files_total",
-                "Orphan parquet files from cancelled/failed writes, by op and cleanup outcome",
-            ),
+        let write_orphan_files_total = register_int_counter_vec(
+            &registry,
+            "sqe_write_orphan_files_total",
+            "Orphan parquet files from cancelled/failed writes, by op and cleanup outcome",
             &["op", "outcome"],
-        )
-        .unwrap();
-        registry
-            .register(Box::new(write_orphan_files_total.clone()))
-            .unwrap();
+        )?;
 
         // Audit export (OTLP shipper) metrics
-        let audit_export_records_total = IntCounterVec::new(
-            Opts::new(
-                "sqe_audit_export_records_total",
-                "Total audit records shipped by status (success or failure)",
-            ),
+        let audit_export_records_total = register_int_counter_vec(
+            &registry,
+            "sqe_audit_export_records_total",
+            "Total audit records shipped by status (success or failure)",
             &["status"],
-        )
-        .unwrap();
-        registry
-            .register(Box::new(audit_export_records_total.clone()))
-            .unwrap();
+        )?;
 
-        let audit_export_batch_failures_total = IntCounter::new(
+        let audit_export_batch_failures_total = register_int_counter(
+            &registry,
             "sqe_audit_export_batch_failures_total",
             "Total failed audit export batch attempts",
-        )
-        .unwrap();
-        registry
-            .register(Box::new(audit_export_batch_failures_total.clone()))
-            .unwrap();
+        )?;
 
-        let audit_export_spool_lag_bytes = Gauge::new(
+        let audit_export_spool_lag_bytes = register_gauge(
+            &registry,
             "sqe_audit_export_spool_lag_bytes",
             "Bytes in the audit spool not yet shipped (file size minus committed offset)",
-        )
-        .unwrap();
-        registry
-            .register(Box::new(audit_export_spool_lag_bytes.clone()))
-            .unwrap();
+        )?;
 
-        let audit_export_cursor_seq = Gauge::new(
+        let audit_export_cursor_seq = register_gauge(
+            &registry,
             "sqe_audit_export_cursor_seq",
             "Sequence number of the last successfully acked audit export record",
-        )
-        .unwrap();
-        registry
-            .register(Box::new(audit_export_cursor_seq.clone()))
-            .unwrap();
+        )?;
 
-        let audit_export_last_success_timestamp = Gauge::new(
+        let audit_export_last_success_timestamp = register_gauge(
+            &registry,
             "sqe_audit_export_last_success_timestamp",
             "Unix timestamp (seconds) of the last successful audit export batch",
-        )
-        .unwrap();
-        registry
-            .register(Box::new(audit_export_last_success_timestamp.clone()))
-            .unwrap();
+        )?;
 
-        let dashboard_auth_anonymous_denied_total = IntCounter::new(
+        let dashboard_auth_anonymous_denied_total = register_int_counter(
+            &registry,
             "sqe_dashboard_auth_anonymous_denied_total",
             "Anonymous dashboard access denials (no bearer token / invalid scheme). \
              These are NOT written to the audit spool.",
-        )
-        .unwrap();
-        registry
-            .register(Box::new(dashboard_auth_anonymous_denied_total.clone()))
-            .unwrap();
+        )?;
 
-        let dashboard_auth_success_total = IntCounter::new(
+        let dashboard_auth_success_total = register_int_counter(
+            &registry,
             "sqe_dashboard_auth_success_total",
             "Successful admin bearer authentications for dashboard requests. \
              Incremented on every success, including within-window deduplicated \
              requests that do not write an audit line.",
-        )
-        .unwrap();
-        registry
-            .register(Box::new(dashboard_auth_success_total.clone()))
-            .unwrap();
+        )?;
 
-        Self {
+        Ok(Self {
             registry,
             query_count,
             query_duration,
@@ -663,13 +654,13 @@ impl MetricsRegistry {
             audit_export_last_success_timestamp,
             dashboard_auth_anonymous_denied_total,
             dashboard_auth_success_total,
-        }
+        })
     }
 }
 
 impl Default for MetricsRegistry {
     fn default() -> Self {
-        Self::new()
+        Self::new().expect("metrics registry must initialize at startup")
     }
 }
 
@@ -707,37 +698,29 @@ pub struct WorkerMetricsRegistry {
 }
 
 impl WorkerMetricsRegistry {
-    pub fn new() -> Self {
+    pub fn new() -> Result<Self, prometheus::Error> {
         let registry = Registry::new();
 
-        let fragments_executed = Counter::new(
+        let fragments_executed = register_counter(
+            &registry,
             "sqe_worker_fragments_executed_total",
             "Total number of scan fragments executed",
-        )
-        .unwrap();
-        registry
-            .register(Box::new(fragments_executed.clone()))
-            .unwrap();
+        )?;
 
-        let rows_scanned = Counter::new(
+        let rows_scanned = register_counter(
+            &registry,
             "sqe_worker_rows_scanned_total",
             "Total rows scanned across all fragments",
-        )
-        .unwrap();
-        registry
-            .register(Box::new(rows_scanned.clone()))
-            .unwrap();
+        )?;
 
-        let bytes_read = Counter::new(
+        let bytes_read = register_counter(
+            &registry,
             "sqe_worker_bytes_read_total",
             "Total bytes read from storage",
-        )
-        .unwrap();
-        registry
-            .register(Box::new(bytes_read.clone()))
-            .unwrap();
+        )?;
 
-        let fragment_duration = Histogram::with_opts(
+        let fragment_duration = register_histogram(
+            &registry,
             HistogramOpts::new(
                 "sqe_worker_fragment_duration_seconds",
                 "Per-fragment execution time",
@@ -745,25 +728,21 @@ impl WorkerMetricsRegistry {
             .buckets(vec![
                 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0,
             ]),
-        )
-        .unwrap();
-        registry
-            .register(Box::new(fragment_duration.clone()))
-            .unwrap();
+        )?;
 
-        Self {
+        Ok(Self {
             registry,
             fragments_executed,
             rows_scanned,
             bytes_read,
             fragment_duration,
-        }
+        })
     }
 }
 
 impl Default for WorkerMetricsRegistry {
     fn default() -> Self {
-        Self::new()
+        Self::new().expect("worker metrics registry must initialize at startup")
     }
 }
 
@@ -781,7 +760,7 @@ mod tests {
 
     #[test]
     fn test_metrics_registry_creation() {
-        let metrics = MetricsRegistry::new();
+        let metrics = MetricsRegistry::new().unwrap();
         // Touch each metric so Prometheus includes it in gather()
         metrics.query_count.with_label_values(&["success", "query", ""]).inc_by(0.0);
         metrics.query_duration.with_label_values(&["query"]).observe(0.0);
@@ -835,7 +814,7 @@ mod tests {
 
     #[test]
     fn test_write_orphan_files_total() {
-        let metrics = MetricsRegistry::new();
+        let metrics = MetricsRegistry::new().unwrap();
         metrics.write_orphan_files_total.with_label_values(&["insert", "leaked"]).inc_by(3);
         metrics.write_orphan_files_total.with_label_values(&["insert", "deleted"]).inc_by(5);
         assert_eq!(
@@ -850,7 +829,7 @@ mod tests {
 
     #[test]
     fn test_query_count_increment() {
-        let metrics = MetricsRegistry::new();
+        let metrics = MetricsRegistry::new().unwrap();
         metrics.query_count.with_label_values(&["success", "query", ""]).inc();
         let count = metrics.query_count.with_label_values(&["success", "query", ""]).get();
         assert_eq!(count, 1.0);
@@ -858,7 +837,7 @@ mod tests {
 
     #[test]
     fn test_query_duration_observe() {
-        let metrics = MetricsRegistry::new();
+        let metrics = MetricsRegistry::new().unwrap();
         metrics.query_duration.with_label_values(&["query"]).observe(0.5);
         let count = metrics.query_duration.with_label_values(&["query"]).get_sample_count();
         assert_eq!(count, 1);
@@ -866,7 +845,7 @@ mod tests {
 
     #[test]
     fn test_active_sessions_gauge() {
-        let metrics = MetricsRegistry::new();
+        let metrics = MetricsRegistry::new().unwrap();
         metrics.active_sessions.inc();
         metrics.active_sessions.inc();
         assert_eq!(metrics.active_sessions.get(), 2);
@@ -876,7 +855,7 @@ mod tests {
 
     #[test]
     fn test_spill_metrics() {
-        let metrics = MetricsRegistry::new();
+        let metrics = MetricsRegistry::new().unwrap();
         metrics.sort_spill_count.inc_by(5.0);
         metrics.sort_spill_bytes.inc_by(1024.0);
         metrics.join_spill_count.inc_by(3.0);
@@ -889,7 +868,7 @@ mod tests {
 
     #[test]
     fn test_shuffle_metrics() {
-        let metrics = MetricsRegistry::new();
+        let metrics = MetricsRegistry::new().unwrap();
         metrics.shuffle_bytes_sent.inc_by(4096.0);
         metrics.shuffle_bytes_received.inc_by(8192.0);
         metrics.shuffle_partitions.inc_by(10.0);
@@ -900,7 +879,7 @@ mod tests {
 
     #[test]
     fn test_late_materialization_metrics() {
-        let metrics = MetricsRegistry::new();
+        let metrics = MetricsRegistry::new().unwrap();
         metrics.late_mat_bytes_predicate.inc_by(500.0);
         metrics.late_mat_bytes_projection.inc_by(1500.0);
         assert_eq!(metrics.late_mat_bytes_predicate.get(), 500.0);
@@ -913,7 +892,7 @@ mod tests {
 
     #[test]
     fn test_pruning_metrics() {
-        let metrics = MetricsRegistry::new();
+        let metrics = MetricsRegistry::new().unwrap();
         metrics.files_pruned_minmax.inc_by(10.0);
         metrics.files_pruned_bloom.inc_by(5.0);
         metrics.pages_pruned_index.inc_by(20.0);
@@ -924,7 +903,7 @@ mod tests {
 
     #[test]
     fn test_time_to_first_row_histogram() {
-        let metrics = MetricsRegistry::new();
+        let metrics = MetricsRegistry::new().unwrap();
         metrics.time_to_first_row.observe(0.05);
         metrics.time_to_first_row.observe(0.5);
         metrics.time_to_first_row.observe(5.0);
@@ -935,7 +914,7 @@ mod tests {
 
     #[test]
     fn test_s3_metrics() {
-        let metrics = MetricsRegistry::new();
+        let metrics = MetricsRegistry::new().unwrap();
         metrics.s3_requests_total.with_label_values(&["get", "success"]).inc();
         metrics.s3_requests_total.with_label_values(&["get", "success"]).inc();
         metrics.s3_requests_total.with_label_values(&["put", "success"]).inc();
@@ -965,7 +944,7 @@ mod tests {
 
     #[test]
     fn test_auth_metrics() {
-        let metrics = MetricsRegistry::new();
+        let metrics = MetricsRegistry::new().unwrap();
         metrics.auth_attempts_total.with_label_values(&["oidc", "success"]).inc();
         metrics.auth_attempts_total.with_label_values(&["oidc", "failed"]).inc();
         metrics.auth_attempts_total.with_label_values(&["bearer", "success"]).inc();
@@ -994,7 +973,7 @@ mod tests {
 
     #[test]
     fn test_sorts_stripped_metric() {
-        let metrics = MetricsRegistry::new();
+        let metrics = MetricsRegistry::new().unwrap();
         metrics.sorts_stripped_total.with_label_values(&["adaptive", "memory_pressure"]).inc();
         metrics.sorts_stripped_total.with_label_values(&["partition_only", "partition_only"]).inc();
         metrics.sorts_stripped_total.with_label_values(&["adaptive", "memory_pressure"]).inc();
@@ -1012,7 +991,7 @@ mod tests {
 
     #[test]
     fn test_worker_metrics_registry_creation() {
-        let m = WorkerMetricsRegistry::new();
+        let m = WorkerMetricsRegistry::new().unwrap();
         // Touch each metric so Prometheus includes it in gather()
         m.fragments_executed.inc_by(0.0);
         m.rows_scanned.inc_by(0.0);
@@ -1023,7 +1002,7 @@ mod tests {
 
     #[test]
     fn test_worker_fragments_executed_counter() {
-        let m = WorkerMetricsRegistry::new();
+        let m = WorkerMetricsRegistry::new().unwrap();
         m.fragments_executed.inc();
         m.fragments_executed.inc();
         assert_eq!(m.fragments_executed.get(), 2.0);
@@ -1031,7 +1010,7 @@ mod tests {
 
     #[test]
     fn test_worker_rows_scanned_counter() {
-        let m = WorkerMetricsRegistry::new();
+        let m = WorkerMetricsRegistry::new().unwrap();
         m.rows_scanned.inc_by(500.0);
         m.rows_scanned.inc_by(300.0);
         assert_eq!(m.rows_scanned.get(), 800.0);
@@ -1039,7 +1018,7 @@ mod tests {
 
     #[test]
     fn test_worker_bytes_read_counter() {
-        let m = WorkerMetricsRegistry::new();
+        let m = WorkerMetricsRegistry::new().unwrap();
         m.bytes_read.inc_by(1024.0);
         m.bytes_read.inc_by(2048.0);
         assert_eq!(m.bytes_read.get(), 3072.0);
@@ -1047,7 +1026,7 @@ mod tests {
 
     #[test]
     fn test_worker_fragment_duration_histogram() {
-        let m = WorkerMetricsRegistry::new();
+        let m = WorkerMetricsRegistry::new().unwrap();
         m.fragment_duration.observe(0.1);
         m.fragment_duration.observe(0.5);
         m.fragment_duration.observe(2.0);

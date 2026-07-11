@@ -161,7 +161,7 @@ mod tests {
             ..Default::default()
         };
         config.ranger.url = "http://ranger.example:6080".to_string();
-        let metrics = std::sync::Arc::new(sqe_metrics::MetricsRegistry::new());
+        let metrics = std::sync::Arc::new(sqe_metrics::MetricsRegistry::new().unwrap());
         let (_enforcer, store) =
             build_policy_enforcer(&config, None, Some(metrics)).unwrap();
         assert!(store.is_some());

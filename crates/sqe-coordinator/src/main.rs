@@ -221,7 +221,10 @@ async fn async_main() -> anyhow::Result<()> {
     }
 
     // Initialize metrics
-    let metrics = Arc::new(sqe_metrics::MetricsRegistry::new());
+    let metrics = Arc::new(
+        sqe_metrics::MetricsRegistry::new()
+            .map_err(|e| anyhow::anyhow!("failed to initialize metrics registry: {e}"))?,
+    );
 
     // Start metrics server
     sqe_metrics::server::start_metrics_server(metrics.clone(), config.metrics.prometheus_port);
