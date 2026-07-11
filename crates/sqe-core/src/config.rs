@@ -353,6 +353,13 @@ pub struct QueryConfig {
     /// `write_buffer_tracking` (ignored when tracking is off).
     #[serde(default)]
     pub merge_target_streaming: bool,
+    /// Whether a MERGE aborts when a single target row is matched by more than
+    /// one source row (a cardinality violation). Default true, matching
+    /// Spark / Trino / Athena, which error rather than silently duplicating
+    /// the target row. Set false only to opt out of the extra count pass over
+    /// the join when the source join key is known unique.
+    #[serde(default = "default_true")]
+    pub merge_cardinality_check: bool,
 }
 
 impl Default for QueryConfig {
@@ -387,6 +394,7 @@ impl Default for QueryConfig {
             fanout_buffer_budget: default_fanout_buffer_budget(),
             write_buffer_tracking: default_true(),
             merge_target_streaming: false,
+            merge_cardinality_check: default_true(),
         }
     }
 }
@@ -6561,6 +6569,7 @@ mod ranger_config_tests {
         assert_eq!(c.fanout_buffer_budget, "0", "\"0\" = auto");
         assert!(c.write_buffer_tracking, "tracking on by default");
         assert!(!c.merge_target_streaming, "B2 off by default");
+        assert!(c.merge_cardinality_check, "cardinality check on by default");
     }
 
     /// A config file predating the write-memory-safety knobs still parses, and

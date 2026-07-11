@@ -405,6 +405,37 @@ pub(crate) fn build_merge_select(
     )
 }
 
+/// Build the two COUNT queries used to detect a MERGE cardinality violation
+/// (a target row matched by more than one source row). Returns
+/// `(pair_count_sql, matched_count_sql)`:
+///
+/// - `pair_count` counts join output rows (one per matching target/source
+///   pair),
+/// - `matched_count` counts distinct target rows that have at least one match.
+///
+/// `pair_count > matched_count` iff some target row matched multiple source
+/// rows. Using two counts avoids materialising a synthetic row id, so the
+/// check stays a cheap streaming aggregate. Only meaningful when the statement
+/// has at least one matched clause.
+pub(crate) fn build_cardinality_check_sql(
+    names: &MergeNames<'_>,
+    qualified_target_ref: &str,
+    qualified_source_ref: &str,
+    on_rewritten: &str,
+) -> (String, String) {
+    let t = names.target_ref;
+    let s = names.source_ref;
+    let pair_count = format!(
+        "SELECT COUNT(*) FROM {qualified_target_ref} AS {t} \
+         JOIN {qualified_source_ref} AS {s} ON {on_rewritten}"
+    );
+    let matched_count = format!(
+        "SELECT COUNT(*) FROM {qualified_target_ref} AS {t} \
+         WHERE EXISTS (SELECT 1 FROM {qualified_source_ref} AS {s} WHERE {on_rewritten})"
+    );
+    (pair_count, matched_count)
+}
+
 /// Resolve the UPDATE expression for one target column from the SET
 /// assignments, rewriting alias references to the scratch table names. A
 /// column without an assignment passes through from the target.
@@ -834,4 +865,190 @@ mod tests {
         // deleted: the only FALSE arms are the source-only default.
         assert_eq!(out.matches("THEN FALSE").count(), 1, "{out}");
     }
+
+    #[test]
+    fn cardinality_check_sql_shape() {
+        let tc = cols(&["id", "v"]);
+        let sc = cols(&["id", "v"]);
+        let n = names(&tc, &sc);
+        let (pair, matched) = build_cardinality_check_sql(
+            &n,
+            "datafusion.public.__merge_target_x",
+            "datafusion.public.__merge_source_x",
+            "__merge_target_x.id = __merge_source_x.id",
+        );
+        assert!(
+            pair.contains("JOIN datafusion.public.__merge_source_x AS __merge_source_x ON"),
+            "pair count is a plain join: {pair}"
+        );
+        assert!(
+            matched.contains("WHERE EXISTS (SELECT 1 FROM datafusion.public.__merge_source_x"),
+            "matched count is an EXISTS semi-join: {matched}"
+        );
+    }
+
+    // ---- In-process DataFusion execution tests ---------------------------
+    // These actually run the generated SQL against MemTables, so they verify
+    // row-level behaviour (not just SQL shape) without a live catalog.
+
+    use arrow_array::{Array, Int32Array, RecordBatch, StringArray};
+    use arrow_schema::{DataType, Field, Schema};
+    use datafusion::prelude::SessionContext;
+    use std::sync::Arc;
+
+    fn id_v_batch(ids: Vec<Option<i32>>, vs: Vec<Option<&str>>) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, true),
+            Field::new("v", DataType::Utf8, true),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(ids)),
+                Arc::new(StringArray::from(vs)),
+            ],
+        )
+        .unwrap()
+    }
+
+    async fn run_sql(ctx: &SessionContext, sql: &str) -> Vec<RecordBatch> {
+        ctx.sql(sql).await.expect("plan").collect().await.expect("collect")
+    }
+
+    /// Collect (id, v) rows from result batches, sorted by id for a stable
+    /// assertion.
+    fn id_v_rows(batches: &[RecordBatch]) -> Vec<(Option<i32>, Option<String>)> {
+        let mut rows = Vec::new();
+        for b in batches {
+            let ids = b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+            let vs = b.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+            for i in 0..b.num_rows() {
+                let id = if ids.is_null(i) { None } else { Some(ids.value(i)) };
+                let v = if vs.is_null(i) {
+                    None
+                } else {
+                    Some(vs.value(i).to_string())
+                };
+                rows.push((id, v));
+            }
+        }
+        rows.sort();
+        rows
+    }
+
+    #[tokio::test]
+    async fn execute_first_match_wins_delete_before_update_and_insert() {
+        // matched+DELETE (predicated) precedes matched+UPDATE; source-only
+        // inserts; target-only passes through unchanged.
+        let ctx = SessionContext::new();
+        ctx.register_batch(
+            "__merge_target_x",
+            id_v_batch(vec![Some(1), Some(2), Some(3)], vec![Some("a"), Some("b"), Some("c")]),
+        )
+        .unwrap();
+        ctx.register_batch(
+            "__merge_source_x",
+            id_v_batch(vec![Some(2), Some(3), Some(4)], vec![Some("del"), Some("B"), Some("D")]),
+        )
+        .unwrap();
+
+        let sql = "MERGE INTO tgt AS t USING src AS s ON t.id = s.id \
+                   WHEN MATCHED AND s.v = 'del' THEN DELETE \
+                   WHEN MATCHED THEN UPDATE SET v = s.v \
+                   WHEN NOT MATCHED THEN INSERT (id, v) VALUES (s.id, s.v)";
+        let out = build(sql, &["id", "v"], &["id", "v"]);
+        let rows = id_v_rows(&run_sql(&ctx, &out).await);
+        // id=1 passthrough, id=2 deleted, id=3 updated to 'B', id=4 inserted.
+        assert_eq!(
+            rows,
+            vec![
+                (Some(1), Some("a".into())),
+                (Some(3), Some("B".into())),
+                (Some(4), Some("D".into())),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_null_first_column_still_classifies_as_matched() {
+        // #374: a present target row whose FIRST column is NULL must still be
+        // classified matched (via the presence flag), not misread as absent.
+        // Column order puts the nullable non-key column first; join is on id.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("v", DataType::Utf8, true),
+            Field::new("id", DataType::Int32, true),
+        ]));
+        let tgt = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec![None::<&str>])),
+                Arc::new(Int32Array::from(vec![Some(2)])),
+            ],
+        )
+        .unwrap();
+        let src = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec![Some("new")])),
+                Arc::new(Int32Array::from(vec![Some(2)])),
+            ],
+        )
+        .unwrap();
+        let ctx = SessionContext::new();
+        ctx.register_batch("__merge_target_x", tgt).unwrap();
+        ctx.register_batch("__merge_source_x", src).unwrap();
+
+        let sql = "MERGE INTO tgt AS t USING src AS s ON t.id = s.id \
+                   WHEN MATCHED THEN UPDATE SET v = s.v";
+        let out = build(sql, &["v", "id"], &["v", "id"]);
+        let batches = run_sql(&ctx, &out).await;
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 1, "matched row must survive as one updated row");
+        let vs = batches[0].column(0).as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(vs.value(0), "new", "matched row must be updated, not dropped/inserted");
+    }
+
+    #[tokio::test]
+    async fn execute_cardinality_check_detects_and_passes() {
+        let tc = cols(&["id", "v"]);
+        let sc = cols(&["id", "v"]);
+        let n = names(&tc, &sc);
+        let (pair_sql, matched_sql) = build_cardinality_check_sql(
+            &n,
+            "datafusion.public.__merge_target_x",
+            "datafusion.public.__merge_source_x",
+            "__merge_target_x.id = __merge_source_x.id",
+        );
+        let count = |batches: Vec<RecordBatch>| -> i64 {
+            batches[0].column(0).as_any().downcast_ref::<Int64Array>().unwrap().value(0)
+        };
+
+        // Duplicate source key 1 -> target row 1 matches twice -> violation.
+        let ctx = SessionContext::new();
+        ctx.register_batch("__merge_target_x", id_v_batch(vec![Some(1)], vec![Some("a")]))
+            .unwrap();
+        ctx.register_batch(
+            "__merge_source_x",
+            id_v_batch(vec![Some(1), Some(1)], vec![Some("x"), Some("y")]),
+        )
+        .unwrap();
+        let pair = count(run_sql(&ctx, &pair_sql).await);
+        let matched = count(run_sql(&ctx, &matched_sql).await);
+        assert!(pair > matched, "duplicate source key must violate: {pair} vs {matched}");
+
+        // Unique source keys -> no violation.
+        let ctx2 = SessionContext::new();
+        ctx2.register_batch("__merge_target_x", id_v_batch(vec![Some(1)], vec![Some("a")]))
+            .unwrap();
+        ctx2.register_batch(
+            "__merge_source_x",
+            id_v_batch(vec![Some(1), Some(2)], vec![Some("x"), Some("y")]),
+        )
+        .unwrap();
+        let pair2 = count(run_sql(&ctx2, &pair_sql).await);
+        let matched2 = count(run_sql(&ctx2, &matched_sql).await);
+        assert!(pair2 <= matched2, "unique keys must not violate: {pair2} vs {matched2}");
+    }
+
+    use arrow_array::Int64Array;
 }

@@ -144,6 +144,53 @@ fn affected_rows_batch(count: usize) -> Vec<RecordBatch> {
     }
 }
 
+/// Run the MERGE cardinality check against the registered target/source
+/// scratch tables. Errors when a single target row is matched by more than one
+/// source row (Spark / Trino / Athena all reject this rather than silently
+/// duplicating the target row). Shared by the copy-on-write and merge-on-read
+/// merge paths; the caller gates on `merge_cardinality_check` and on the
+/// statement actually having a matched clause (source-only / by-source rows
+/// cannot violate cardinality).
+async fn check_merge_cardinality(
+    ctx: &DFSessionContext,
+    pair_count_sql: &str,
+    matched_count_sql: &str,
+) -> sqe_core::Result<()> {
+    async fn scalar_count(ctx: &DFSessionContext, sql: &str) -> sqe_core::Result<i64> {
+        let batches = ctx
+            .sql(sql)
+            .await
+            .map_err(|e| {
+                SqeError::Execution(format!("MERGE cardinality check failed to plan: {e}"))
+            })?
+            .collect()
+            .await
+            .map_err(|e| SqeError::Execution(format!("MERGE cardinality check failed: {e}")))?;
+        Ok(batches
+            .first()
+            .and_then(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<arrow_array::Int64Array>()
+            })
+            .map(|a| a.value(0))
+            .unwrap_or(0))
+    }
+
+    let pair_count = scalar_count(ctx, pair_count_sql).await?;
+    let matched_count = scalar_count(ctx, matched_count_sql).await?;
+    if pair_count > matched_count {
+        return Err(SqeError::Execution(
+            "One MERGE target table row matched more than one source row \
+             (cardinality violation). Deduplicate the source rows or narrow the \
+             ON condition; set query.merge_cardinality_check = false to disable \
+             this check."
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// Wrap a source SELECT `LogicalPlan` in a synthetic `LogicalPlan::Dml::Insert`
 /// targeting the given (catalog, namespace, table) tuple, so the OpenLineage
 /// extractor can produce both inputs (via the source's TableScans) and outputs
@@ -3384,6 +3431,20 @@ impl WriteHandler {
         };
         let classified = crate::merge_sql::classify_merge_clauses(clauses, &merge_names)?;
         let (matched_clauses, not_matched_clauses, by_source_clauses) = classified.counts();
+
+        // Cardinality check: a target row matched by >1 source row would be
+        // silently duplicated by the FULL OUTER JOIN. Only matched clauses can
+        // trigger it, so skip the extra count pass for insert-only / by-source
+        // merges.
+        if self.config.query.merge_cardinality_check && matched_clauses > 0 {
+            let (pair_sql, matched_sql) = crate::merge_sql::build_cardinality_check_sql(
+                &merge_names,
+                &qualified_target_ref,
+                &qualified_source_ref,
+                &on_rewritten,
+            );
+            check_merge_cardinality(ctx, &pair_sql, &matched_sql).await?;
+        }
 
         let select_sql = crate::merge_sql::build_merge_select(
             &classified,
