@@ -485,3 +485,12 @@ P2 and lower as before. No new criticals.
 
 See Prioritized Action Plan above and nextsteps.md for current NEXT pointers. The perf bottlenecks table is largely historical (fixes landed).
 
+## Additional 2026-07-11 Progress (maintenance lineage O5)
+- `should_emit` now returns `true` for `StatementKind::Procedure` (was hard false).
+- Updated comment + renamed/fixed the unit test.
+- Because the early `ol_emit` + start and the post-execution complete/fail paths already key off `should_emit`, maintenance CALLs will now produce OpenLineage events (start + complete with the SQL and run_id).
+- This closes the explicit gap "1. Maintenance procedures ... no OL events" from the audit.
+- Branch: fix/audit-maintenance-lineage ; MR to be created/updated.
+
+See plan.md for details. Previous MRs: !625 (DML PolicyAudit), !626 (trace/query_id on AuditEvent).
+
