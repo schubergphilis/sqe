@@ -8,6 +8,16 @@ mode = "hybrid"   # "local", "distributed", or "hybrid"
 # security.allow_insecure_transport, unauthenticated workers). Env:
 # SQE_PRODUCTION_MODE or SQE_COORDINATOR__PRODUCTION_MODE.
 
+# Rate limiting (P0 for production). Disabled by default for dev ergonomics.
+# Set enabled = true (or SQE_RATE_LIMIT__ENABLED=true) in prod; the
+# production_mode validator will refuse startup if disabled.
+[rate_limit]
+enabled = false
+per_user_queries_per_minute = 60
+global_queries_per_minute = 1000
+auth_attempts_per_minute = 10
+metadata_per_user_per_minute = 120
+
 # Memory limit for coordinator query processing (sorts, joins, aggregates).
 # Supports: B, KB, MB, GB, TB (e.g. "8GB", "4096MB").
 memory_limit = "8GB"
