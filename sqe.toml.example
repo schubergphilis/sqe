@@ -318,3 +318,8 @@ ttl_secs = 1800
 # [metrics.openlineage]
 # enabled = true
 # http_endpoint = "https://marquez/api/v1/lineage"
+# Memory / spill / jemalloc notes (from full audit P1/M section)
+# Use honest memory_limit (e.g. 50-70% RAM). spill_to_disk=true + fast NVMe.
+# For jemalloc (M6): consider in Docker/Helm for background purge to reduce
+# RSS parking post-query. Test via benchmark rig.
+# See audit for full M1-M8 matrix and decision.
