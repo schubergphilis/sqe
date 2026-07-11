@@ -215,26 +215,6 @@ pub(crate) fn classify_merge_clauses<'a>(
     Ok(out)
 }
 
-/// True when the statement uses clause shapes the merge-on-read equality
-/// path cannot express: clause predicates, `NOT MATCHED BY SOURCE`, or more
-/// than one clause per row class (which needs first-match-wins ordering).
-/// The dispatcher falls back to copy-on-write for these.
-pub(crate) fn merge_needs_cow(clauses: &[MergeClause]) -> bool {
-    let mut matched = 0usize;
-    let mut not_matched = 0usize;
-    for clause in clauses {
-        if clause.predicate.is_some() {
-            return true;
-        }
-        match clause.clause_kind {
-            MergeClauseKind::NotMatchedBySource => return true,
-            MergeClauseKind::Matched => matched += 1,
-            MergeClauseKind::NotMatched | MergeClauseKind::NotMatchedByTarget => not_matched += 1,
-        }
-    }
-    matched > 1 || not_matched > 1
-}
-
 fn case_arm(class_cond: &str, predicate: Option<&str>, value: &str) -> String {
     match predicate {
         Some(p) => format!("WHEN {class_cond} AND ({p}) THEN {value}"),
@@ -434,6 +414,38 @@ pub(crate) fn build_cardinality_check_sql(
          WHERE EXISTS (SELECT 1 FROM {qualified_source_ref} AS {s} WHERE {on_rewritten})"
     );
     (pair_count, matched_count)
+}
+
+/// First-match-wins guard for the clause at `idx` within one row class
+/// (matched / not-matched / by-source), for the merge-on-read path which runs
+/// one guarded query per clause instead of a single CASE. The clause fires
+/// only when its own predicate holds and no earlier clause in the class
+/// already claimed the row:
+///
+/// `COALESCE((own), FALSE) AND NOT COALESCE((prior_0), FALSE) AND ...`
+///
+/// NULL predicates count as false (SQL CASE semantics). An unconditional
+/// clause (no predicate) contributes no own-term (it matches every row in the
+/// class); once an unconditional clause appears, every later clause in the
+/// class is unreachable and its guard collapses to `FALSE`, mirroring the CoW
+/// CASE where a later arm after an unconditional one never runs.
+pub(crate) fn first_match_guard(class: &[ClassifiedClause<'_>], idx: usize) -> String {
+    let mut terms: Vec<String> = Vec::new();
+    if let Some(p) = &class[idx].predicate {
+        terms.push(format!("COALESCE(({p}), FALSE)"));
+    }
+    for prior in &class[..idx] {
+        match &prior.predicate {
+            Some(p) => terms.push(format!("NOT COALESCE(({p}), FALSE)")),
+            // A prior unconditional clause already claimed the row.
+            None => terms.push("FALSE".to_string()),
+        }
+    }
+    if terms.is_empty() {
+        "TRUE".to_string()
+    } else {
+        terms.join(" AND ")
+    }
 }
 
 /// Resolve the UPDATE expression for one target column from the SET
@@ -826,32 +838,53 @@ mod tests {
     }
 
     #[test]
-    fn merge_needs_cow_matrix() {
-        let plain = merge_clauses(
+    fn first_match_guard_orders_predicates() {
+        let clauses = merge_clauses(
             "MERGE INTO tgt AS t USING src AS s ON t.id = s.id \
-             WHEN MATCHED THEN UPDATE SET v = s.v \
-             WHEN NOT MATCHED THEN INSERT (id, v) VALUES (s.id, s.v)",
-        );
-        assert!(!merge_needs_cow(&plain), "plain upsert stays MoR-eligible");
-
-        let predicated = merge_clauses(
-            "MERGE INTO tgt AS t USING src AS s ON t.id = s.id \
-             WHEN MATCHED AND s.op = 'u' THEN UPDATE SET v = s.v",
-        );
-        assert!(merge_needs_cow(&predicated), "predicate forces CoW");
-
-        let by_source = merge_clauses(
-            "MERGE INTO tgt AS t USING src AS s ON t.id = s.id \
-             WHEN NOT MATCHED BY SOURCE THEN DELETE",
-        );
-        assert!(merge_needs_cow(&by_source), "BY SOURCE forces CoW");
-
-        let multi = merge_clauses(
-            "MERGE INTO tgt AS t USING src AS s ON t.id = s.id \
-             WHEN MATCHED THEN DELETE \
+             WHEN MATCHED AND s.op = 'del' THEN DELETE \
+             WHEN MATCHED AND s.op = 'upd' THEN UPDATE SET v = s.v \
              WHEN MATCHED THEN UPDATE SET v = s.v",
         );
-        assert!(merge_needs_cow(&multi), "multiple matched clauses force CoW");
+        let tc = cols(&["id", "v"]);
+        let sc = cols(&["id", "v", "op"]);
+        let n = names(&tc, &sc);
+        let c = classify_merge_clauses(&clauses, &n).unwrap();
+        assert_eq!(c.matched.len(), 3);
+        assert_eq!(
+            first_match_guard(&c.matched, 0),
+            "COALESCE((__merge_source_x.op = 'del'), FALSE)"
+        );
+        assert_eq!(
+            first_match_guard(&c.matched, 1),
+            "COALESCE((__merge_source_x.op = 'upd'), FALSE) AND \
+             NOT COALESCE((__merge_source_x.op = 'del'), FALSE)"
+        );
+        // Trailing unconditional clause: no own term, just NOT of both priors.
+        assert_eq!(
+            first_match_guard(&c.matched, 2),
+            "NOT COALESCE((__merge_source_x.op = 'del'), FALSE) AND \
+             NOT COALESCE((__merge_source_x.op = 'upd'), FALSE)"
+        );
+    }
+
+    #[test]
+    fn first_match_guard_after_unconditional_collapses_to_false() {
+        let clauses = merge_clauses(
+            "MERGE INTO tgt AS t USING src AS s ON t.id = s.id \
+             WHEN MATCHED THEN UPDATE SET v = s.v \
+             WHEN MATCHED AND s.op = 'x' THEN DELETE",
+        );
+        let tc = cols(&["id", "v"]);
+        let sc = cols(&["id", "v", "op"]);
+        let n = names(&tc, &sc);
+        let c = classify_merge_clauses(&clauses, &n).unwrap();
+        assert_eq!(first_match_guard(&c.matched, 0), "TRUE");
+        // The clause after an unconditional one is unreachable.
+        assert!(
+            first_match_guard(&c.matched, 1).contains("FALSE"),
+            "{}",
+            first_match_guard(&c.matched, 1)
+        );
     }
 
     #[test]
