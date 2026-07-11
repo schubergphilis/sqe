@@ -272,3 +272,39 @@ ttl_secs = 300
 max_entries = 10000
 # Time-to-live in seconds for query history records.
 ttl_secs = 1800
+
+# ── Production example (copy/adapt for real deploys) ─────────────────
+# Uncomment/adjust for production. Combine with production_mode = true
+# and the P0 checklist in docs/internal/audit/2026-07-10-sqe-full-audit.md.
+#
+# [coordinator]
+# production_mode = true
+# memory_limit = "64GB"   # honest fraction of host RAM
+# spill_to_disk = true
+# spill_dir = "/fast/ssd/sqe-spill"
+#
+# [rate_limit]
+# enabled = true
+# per_user_queries_per_minute = 120
+# global_queries_per_minute = 5000
+#
+# [coordinator.tls]
+# cert_file = "/etc/sqe/tls.crt"
+# key_file  = "/etc/sqe/tls.key"
+#
+# [worker]
+# worker_secret = "long-random-secret-here"
+# advertise_url = "https://worker-1:50052"
+#
+# [metrics]
+# otlp_endpoint = "http://otel:4317"
+# trace_sample_rate = 0.05
+# audit_log_path = "/var/log/sqe/audit/audit.jsonl"
+#
+# [metrics.audit_export]
+# enabled = true
+# spool_path = "/var/log/sqe/audit/audit.ocsf.spool.jsonl"
+#
+# [metrics.openlineage]
+# enabled = true
+# http_endpoint = "https://marquez/api/v1/lineage"
