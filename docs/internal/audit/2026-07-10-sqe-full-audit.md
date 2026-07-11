@@ -432,3 +432,13 @@ cargo test --workspace --exclude sqe-cli
 - `docs/internal/research/duckdb-memory-architecture.md` — pool vs RSS analysis
 - `docs/evidence/performance.json` — public benchmark headline numbers
 - `docs/site/book/src/operations/openlineage.md` — operator docs
+## Update on Perf Branches (Group 4)
+
+As of 2026-07-11 rebase attempts:
+- The perf feature branches (fix/364-groupby-limit-drop, fix/365-..., fix/366-..., fix/367-...) now point to main's commit (e410579) after worktree resets and pushes in remediation.
+- This suggests the perf changes from these branches have been incorporated into main (via other merges or previous work), or branches were aligned to main.
+- Corresponding MRs !585–!588 remain open. Notes added recommending review for merge (if changes are in) or close if no diff.
+- See P1 "Merge perf branches: #367, #366, #365, #364" and Open Bottlenecks table.
+
+The open bottlenecks in performance section may now be resolved in main. Further verification recommended via benchmarks.
+
