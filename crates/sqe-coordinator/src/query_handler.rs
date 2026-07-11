@@ -725,8 +725,7 @@ impl QueryHandler {
             "sqe.query",
             query_id = %query_id,
             user = %session.user.username,
-        )
-        .entered();
+        );
 
         let cancel_token = self.query_tracker.start(
             query_id,
@@ -2068,8 +2067,7 @@ impl QueryHandler {
             "sqe.query",
             query_id = %query_id,
             user = %session.user.username,
-        )
-        .entered();
+        );
 
         let cancel_token = self.query_tracker.start(
             query_id,
