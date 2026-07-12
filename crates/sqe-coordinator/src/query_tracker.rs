@@ -367,7 +367,7 @@ mod tests {
     async fn failed_records_error() {
         let tracker = QueryTracker::new(&test_config());
         let id = Uuid::now_v7();
-        tracker.start(id, "carol", None, "BAD SQL", "s3", None, vec![]);
+        tracker.start(id, "carol", None, "BAD SQL", "s3", None, vec![], None);
         tracker.running(&id, 0);
         let err = sqe_core::SqeError::Execution("syntax error near BAD".to_string());
         tracker.failed(&id, &err);
@@ -383,7 +383,7 @@ mod tests {
     async fn cancel_fires_token_and_records() {
         let tracker = QueryTracker::new(&test_config());
         let id = Uuid::now_v7();
-        let token = tracker.start(id, "dave", None, "SELECT 1", "s4", None, vec![]);
+        let token = tracker.start(id, "dave", None, "SELECT 1", "s4", None, vec![], None);
         assert!(!token.is_cancelled());
         let cancelled = tracker.cancel(&id);
         assert!(cancelled);
@@ -396,7 +396,7 @@ mod tests {
     async fn set_profile_attaches_to_terminal_record() {
         let tracker = QueryTracker::new(&test_config());
         let id = Uuid::now_v7();
-        tracker.start(id, "alice", None, "SELECT 1", "s1", None, vec![]);
+        tracker.start(id, "alice", None, "SELECT 1", "s1", None, vec![], None);
         tracker.running(&id, 1);
         tracker.complete(&id, 5, 10, vec![], 0, 0, 0, 0);
         tracker.set_profile(&id, "elapsed_ms=10\nProjectionExec".to_string());
@@ -419,7 +419,7 @@ mod tests {
         let tracker = QueryTracker::new(&test_config());
         for i in 0..5 {
             let id = Uuid::now_v7();
-            tracker.start(id, &format!("user{i}"), None, "SELECT 1", "s", None, vec![]);
+            tracker.start(id, &format!("user{i}"), None, "SELECT 1", "s", None, vec![], None);
         }
         assert_eq!(tracker.records().len(), 5);
     }
@@ -437,7 +437,7 @@ mod tests {
                 let id = Uuid::now_v7();
                 let user = format!("user{i}");
                 let sql = format!("SELECT {i}");
-                tracker.start(id, &user, None, &sql, "session", None, vec![]);
+                tracker.start(id, &user, None, &sql, "session", None, vec![], None);
                 tracker.running(&id, (i * 5) as u64);
                 // Simulate some work
                 tokio::task::yield_now().await;
@@ -480,7 +480,7 @@ mod tests {
             let tracker = tracker.clone();
             handles.spawn(async move {
                 let id = Uuid::now_v7();
-                tracker.start(id, "user", None, "SELECT 1", "s", None, vec![]);
+                tracker.start(id, "user", None, "SELECT 1", "s", None, vec![], None);
                 tracker.running(&id, 5);
                 tokio::task::yield_now().await;
 
@@ -517,7 +517,7 @@ mod tests {
     async fn set_and_update_fragments() {
         let tracker = QueryTracker::new(&test_config());
         let id = Uuid::now_v7();
-        tracker.start(id, "alice", None, "SELECT *", "s1", None, vec![]);
+        tracker.start(id, "alice", None, "SELECT *", "s1", None, vec![], None);
 
         let frags = vec![
             FragmentInfo {
@@ -554,7 +554,7 @@ mod tests {
     async fn update_fragment_unknown_is_noop() {
         let tracker = QueryTracker::new(&test_config());
         let id = Uuid::now_v7();
-        tracker.start(id, "bob", None, "SELECT 1", "s2", None, vec![]);
+        tracker.start(id, "bob", None, "SELECT 1", "s2", None, vec![], None);
         tracker.update_fragment(&id, "nonexistent", FragmentState::Failed, 0, 0);
         // Should not panic
     }
@@ -563,7 +563,7 @@ mod tests {
     async fn all_fragments_done_returns_none_while_running() {
         let tracker = QueryTracker::new(&test_config());
         let id = Uuid::now_v7();
-        tracker.start(id, "alice", None, "SELECT *", "s1", None, vec![]);
+        tracker.start(id, "alice", None, "SELECT *", "s1", None, vec![], None);
 
         let frags = vec![
             FragmentInfo {
@@ -612,7 +612,7 @@ mod tests {
     async fn all_fragments_done_returns_none_for_empty_fragments() {
         let tracker = QueryTracker::new(&test_config());
         let id = Uuid::now_v7();
-        tracker.start(id, "alice", None, "SELECT 1", "s1", None, vec![]);
+        tracker.start(id, "alice", None, "SELECT 1", "s1", None, vec![], None);
         // No fragments set — treated as "not a distributed query"
         assert!(tracker.all_fragments_done(&id).is_none());
     }
@@ -621,7 +621,7 @@ mod tests {
     async fn all_fragments_done_works_with_failed_fragments() {
         let tracker = QueryTracker::new(&test_config());
         let id = Uuid::now_v7();
-        tracker.start(id, "alice", None, "SELECT *", "s1", None, vec![]);
+        tracker.start(id, "alice", None, "SELECT *", "s1", None, vec![], None);
 
         let frags = vec![
             FragmentInfo {
@@ -661,7 +661,7 @@ mod tests {
         let mut ids = Vec::new();
         for i in 0..10 {
             let id = Uuid::now_v7();
-            tracker.start(id, &format!("user{i}"), None, "SELECT 1", "s", None, vec![]);
+            tracker.start(id, &format!("user{i}"), None, "SELECT 1", "s", None, vec![], None);
             tracker.complete(&id, 0, 0, vec![], 0, 0, 0, 0);
             ids.push(id);
         }

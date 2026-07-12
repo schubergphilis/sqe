@@ -123,15 +123,21 @@ pub fn trace_context_http_headers() -> Vec<(String, String)> {
     headers
 }
 
-/// Return the active OpenTelemetry trace ID when the current tracing span has
-/// a valid span context.
+/// Return the current active trace ID (32-char lowercase hex) if a valid
+/// OpenTelemetry span context is present on the current tracing span.
+/// Returns None when OTel is not initialized or no sampled span is active.
+///
+/// Used to stamp `trace_id` onto `AuditEvent` and query records for
+/// correlation (full-audit O4).
 pub fn current_trace_id() -> Option<String> {
     let cx = tracing::Span::current().context();
-    let span = cx.span();
-    let span_context = span.span_context();
-    span_context
-        .is_valid()
-        .then(|| format!("{:032x}", span_context.trace_id()))
+    let span_ref = cx.span();
+    let sc = span_ref.span_context();
+    if sc.is_valid() {
+        Some(format!("{:032x}", sc.trace_id()))
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]

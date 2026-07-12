@@ -148,6 +148,12 @@ pub struct AuditEvent {
     pub session_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_ip: Option<String>,
+    /// W3C trace ID (32 hex chars) for correlation with OTel traces (O4).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trace_id: Option<String>,
+    /// SQE internal query ID (uuid v7 string) for joining audit + history + spans.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub query_id: Option<String>,
     #[serde(default)]
     pub integrity: Integrity,
 }
@@ -205,6 +211,8 @@ pub(crate) fn sample_query_event() -> AuditEvent {
         }),
         session_id: Some("sess-1".into()),
         client_ip: Some("10.0.0.1".into()),
+        trace_id: Some("0af7651916cd43dd8448eb211c80319c".into()),
+        query_id: Some("019f510a-a20f-74f1-81cd-d1d22ae2e18b".into()),
         integrity: Integrity::default(),
     }
 }
@@ -242,6 +250,8 @@ mod tests {
             }),
             session_id: Some("sess-1".into()),
             client_ip: Some("10.0.0.1".into()),
+            trace_id: None,
+            query_id: None,
             integrity: Integrity::default(),
         }
     }
