@@ -5,6 +5,7 @@
 //! boundaries via tonic [`MetadataMap`].
 
 use opentelemetry::propagation::{Extractor, Injector};
+use opentelemetry::trace::TraceContextExt;
 use tonic::metadata::{MetadataKey, MetadataMap, MetadataValue};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
@@ -120,6 +121,17 @@ pub fn trace_context_http_headers() -> Vec<(String, String)> {
         propagator.inject_context(&cx, &mut VecInjector(&mut headers));
     });
     headers
+}
+
+/// Return the active OpenTelemetry trace ID when the current tracing span has
+/// a valid span context.
+pub fn current_trace_id() -> Option<String> {
+    let cx = tracing::Span::current().context();
+    let span = cx.span();
+    let span_context = span.span_context();
+    span_context
+        .is_valid()
+        .then(|| format!("{:032x}", span_context.trace_id()))
 }
 
 #[cfg(test)]

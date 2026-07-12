@@ -717,6 +717,7 @@ impl QueryHandler {
             sql_length = sql.len(),
             "Executing query"
         );
+        let trace_id = sqe_metrics::propagation::current_trace_id();
         let cancel_token = self.query_tracker.start(
             query_id,
             &session.user.username,
@@ -725,6 +726,7 @@ impl QueryHandler {
             &session.id,
             client_ip.as_deref(),
             session.user.roles.clone(),
+            trace_id,
         );
 
         // OpenLineage: emit START event. The observer is sync and best-effort;
@@ -2052,6 +2054,7 @@ impl QueryHandler {
             sql_length = sql.len(),
             "Starting streaming query"
         );
+        let trace_id = sqe_metrics::propagation::current_trace_id();
         let cancel_token = self.query_tracker.start(
             query_id,
             &session.user.username,
@@ -2060,6 +2063,7 @@ impl QueryHandler {
             &session.id,
             client_ip.as_deref(),
             session.user.roles.clone(),
+            trace_id,
         );
 
         match self.open_stream(session, sql, &query_id, start).await {
