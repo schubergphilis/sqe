@@ -172,6 +172,7 @@ async fn identify() -> impl IntoResponse {
     )
 }
 
+#[tracing::instrument(skip_all, name = "quack.handle")]
 async fn handle_quack(
     State(state): State<Arc<QuackServerState>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -179,6 +180,9 @@ async fn handle_quack(
     // `Bytes` consumes the request body, so it must be the last extractor.
     body: Bytes,
 ) -> impl IntoResponse {
+    // O6: Trace propagation for Quack.
+    sqe_metrics::propagation::attach_trace_context_from_headers(&headers);
+
     // Decode only the header first and reject server-only / response message
     // types up front. This avoids running the full body decoder (including the
     // DataChunk-carrying response paths) for messages a client must never send.

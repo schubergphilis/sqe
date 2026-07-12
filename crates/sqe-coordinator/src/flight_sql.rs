@@ -499,6 +499,8 @@ impl SqeFlightSqlService {
                 query: None,
                 session_id,
                 client_ip,
+                trace_id: sqe_metrics::propagation::current_trace_id(),
+                query_id: None,
                 integrity: sqe_metrics::audit::Integrity::default(),
             };
             audit.log_event(event);
@@ -537,6 +539,8 @@ impl SqeFlightSqlService {
                 query: None,
                 session_id,
                 client_ip,
+                trace_id: sqe_metrics::propagation::current_trace_id(),
+                query_id: None,
                 integrity: sqe_metrics::audit::Integrity::default(),
             };
             audit.log_event(event);
