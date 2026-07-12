@@ -71,16 +71,15 @@ impl BasicDeleteFileLoader {
            Essentially a super-cut-down ArrowReader. We can't use ArrowReader directly
            as that introduces a circular dependency.
         */
-        let (parquet_file_reader, arrow_metadata) =
-            ArrowReader::open_parquet_and_load_metadata(
-                data_file_path,
-                self.file_io.clone(),
-                false,
-                None,
-                file_size_in_bytes,
-                bytes_read_counter,
-            )
-            .await?;
+        let (parquet_file_reader, arrow_metadata) = ArrowReader::open_parquet_and_load_metadata(
+            data_file_path,
+            self.file_io.clone(),
+            false,
+            None,
+            file_size_in_bytes,
+            bytes_read_counter,
+        )
+        .await?;
         let record_batch_stream =
             ParquetRecordBatchStreamBuilder::new_with_metadata(parquet_file_reader, arrow_metadata)
                 .build()?

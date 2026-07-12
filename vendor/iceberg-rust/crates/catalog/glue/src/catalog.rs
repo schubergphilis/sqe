@@ -208,9 +208,7 @@ impl GlueCatalog {
         // argument is accepted for API compatibility but unused on the
         // fork because it routes through the inlined OpenDalStorage layer.
         let _ = storage_factory;
-        let file_io = FileIOBuilder::new("s3")
-            .with_props(file_io_props)
-            .build()?;
+        let file_io = FileIOBuilder::new("s3").with_props(file_io_props).build()?;
 
         Ok(GlueCatalog {
             config,

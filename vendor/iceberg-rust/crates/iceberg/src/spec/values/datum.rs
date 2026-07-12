@@ -106,7 +106,9 @@ impl<'de> Deserialize<'de> for Datum {
             }
 
             fn visit_seq<A>(self, mut seq: A) -> std::result::Result<Self::Value, A::Error>
-            where A: serde::de::SeqAccess<'de> {
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
                 let r#type = seq
                     .next_element::<PrimitiveType>()?
                     .ok_or_else(|| serde::de::Error::invalid_length(0, &self))?;
@@ -125,7 +127,9 @@ impl<'de> Deserialize<'de> for Datum {
             }
 
             fn visit_map<V>(self, mut map: V) -> std::result::Result<Datum, V::Error>
-            where V: MapAccess<'de> {
+            where
+                V: MapAccess<'de>,
+            {
                 let mut raw_primitive: Option<RawLiteral> = None;
                 let mut r#type: Option<PrimitiveType> = None;
                 while let Some(key) = map.next_key()? {

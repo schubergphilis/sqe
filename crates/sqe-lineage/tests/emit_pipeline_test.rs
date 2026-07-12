@@ -276,7 +276,10 @@ async fn events_in_same_session_share_parent_run_id() {
     let parent_b = &b["run"]["facets"]["parent"]["run"]["runId"];
     assert!(parent_a.is_string(), "parent.run.runId present on START");
     assert!(parent_b.is_string(), "parent.run.runId present on COMPLETE");
-    assert_eq!(parent_a, parent_b, "same session_id produces same parent runId");
+    assert_eq!(
+        parent_a, parent_b,
+        "same session_id produces same parent runId"
+    );
 
     // Sanity: the parent runId equals the session UUID itself.
     assert_eq!(parent_a.as_str().unwrap(), session_uuid);

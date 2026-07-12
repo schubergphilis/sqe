@@ -153,14 +153,10 @@ fn collect_equality_cols_in_expr(expr: &Expr, counts: &mut HashMap<String, usize
         Expr::InList { expr, list, .. } if !list.is_empty() => {
             // `col IN (lit, lit, ...)` is equivalent to equality probes.
             if let Expr::Identifier(ident) = expr.as_ref() {
-                *counts
-                    .entry(ident.value.to_lowercase())
-                    .or_insert(0) += 1;
+                *counts.entry(ident.value.to_lowercase()).or_insert(0) += 1;
             } else if let Expr::CompoundIdentifier(parts) = expr.as_ref() {
                 if let Some(last) = parts.last() {
-                    *counts
-                        .entry(last.value.to_lowercase())
-                        .or_insert(0) += 1;
+                    *counts.entry(last.value.to_lowercase()).or_insert(0) += 1;
                 }
             }
         }
@@ -236,8 +232,8 @@ fn build_result_batch(
 
 #[cfg(test)]
 mod tests {
-    use arrow_array::Array;
     use super::*;
+    use arrow_array::Array;
 
     fn tref(ns: &str, name: &str) -> TableRef {
         TableRef {
@@ -289,11 +285,7 @@ mod tests {
         let batches = suggest_bloom_filter_columns(&t, &q, None).unwrap();
         let b = &batches[0];
         let cols = b.column(0).as_any().downcast_ref::<StringArray>().unwrap();
-        let rec = b
-            .column(2)
-            .as_any()
-            .downcast_ref::<BooleanArray>()
-            .unwrap();
+        let rec = b.column(2).as_any().downcast_ref::<BooleanArray>().unwrap();
         assert_eq!(cols.value(0), "customer_id");
         assert!(rec.value(0), "customer_id should be recommended");
         assert_eq!(cols.value(1), "product_id");
@@ -313,11 +305,7 @@ mod tests {
         }
         let batches = suggest_bloom_filter_columns(&t, &q, None).unwrap();
         let b = &batches[0];
-        let rec = b
-            .column(2)
-            .as_any()
-            .downcast_ref::<BooleanArray>()
-            .unwrap();
+        let rec = b.column(2).as_any().downcast_ref::<BooleanArray>().unwrap();
         assert!(!rec.value(0), "5% should not be recommended");
     }
 
@@ -375,9 +363,7 @@ mod tests {
         let mut q: Vec<String> = Vec::new();
         for col_idx in 0..10 {
             for _ in 0..(10 - col_idx) {
-                q.push(format!(
-                    "SELECT * FROM ns.t WHERE c{col_idx} = 1"
-                ));
+                q.push(format!("SELECT * FROM ns.t WHERE c{col_idx} = 1"));
             }
         }
         let batches = suggest_bloom_filter_columns(&t, &q, None).unwrap();

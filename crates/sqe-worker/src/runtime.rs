@@ -46,8 +46,7 @@ pub fn build_session_context(config: &WorkerConfig) -> anyhow::Result<SessionCon
         builder = builder.with_temp_file_path(&config.spill_dir);
     } else {
         // Disable disk manager — any attempt to spill will return an error.
-        let disk_builder =
-            DiskManagerBuilder::default().with_mode(DiskManagerMode::Disabled);
+        let disk_builder = DiskManagerBuilder::default().with_mode(DiskManagerMode::Disabled);
         builder = builder.with_disk_manager_builder(disk_builder);
     }
 

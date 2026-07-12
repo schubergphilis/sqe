@@ -63,8 +63,7 @@ pub fn qualify_information_schema(sql: &str, session_catalog: &str) -> String {
             let next = sql[after..].chars().next();
             // Standalone `information_schema.` not already catalog-qualified.
             let already_qualified = prev == Some('.');
-            let part_of_ident =
-                matches!(prev, Some(c) if c.is_alphanumeric() || c == '_');
+            let part_of_ident = matches!(prev, Some(c) if c.is_alphanumeric() || c == '_');
             let followed_by_dot = next == Some('.');
             if !already_qualified && !part_of_ident && followed_by_dot {
                 out.push('"');
@@ -278,7 +277,9 @@ mod tests {
         assert!(is_describe_or_show_columns("describe gold.t"));
         assert!(is_describe_or_show_columns("DESC t"));
         assert!(!is_describe_or_show_columns("DESCRIBE OUTPUT p"));
-        assert!(!is_describe_or_show_columns("SELECT * FROM information_schema.columns"));
+        assert!(!is_describe_or_show_columns(
+            "SELECT * FROM information_schema.columns"
+        ));
 
         // [column_name, data_type, is_nullable] -> [Column, Type, Extra, Comment]
         let schema = Arc::new(Schema::new(vec![
@@ -298,7 +299,10 @@ mod tests {
         let out = reshape_describe_to_trino(vec![b]);
         let s = out[0].schema();
         assert_eq!(
-            s.fields().iter().map(|f| f.name().as_str()).collect::<Vec<_>>(),
+            s.fields()
+                .iter()
+                .map(|f| f.name().as_str())
+                .collect::<Vec<_>>(),
             vec!["Column", "Type", "Extra", "Comment"]
         );
         assert_eq!(out[0].num_rows(), 2);
@@ -331,7 +335,10 @@ mod tests {
 
     #[test]
     fn unknown_type_passes_through() {
-        assert_eq!(arrow_display_to_trino_type("SomeFutureType"), "SomeFutureType");
+        assert_eq!(
+            arrow_display_to_trino_type("SomeFutureType"),
+            "SomeFutureType"
+        );
     }
 
     #[test]
@@ -359,7 +366,11 @@ mod tests {
 
     fn data_type_values(b: &RecordBatch) -> Vec<String> {
         let idx = b.schema().index_of("data_type").unwrap();
-        let col = b.column(idx).as_any().downcast_ref::<StringArray>().unwrap();
+        let col = b
+            .column(idx)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
         (0..col.len()).map(|i| col.value(i).to_string()).collect()
     }
 
@@ -387,7 +398,11 @@ mod tests {
 
     fn catalog_values(b: &RecordBatch) -> Vec<String> {
         let idx = b.schema().index_of("table_catalog").unwrap();
-        let col = b.column(idx).as_any().downcast_ref::<StringArray>().unwrap();
+        let col = b
+            .column(idx)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
         (0..col.len()).map(|i| col.value(i).to_string()).collect()
     }
 
@@ -472,10 +487,8 @@ mod tests {
         // The X-Trino-Catalog header is attacker-controlled. A double-quote in
         // the value must be doubled so it cannot close the quoted identifier
         // and inject SQL into the rewritten statement.
-        let out = qualify_information_schema(
-            "SELECT 1 FROM information_schema.tables",
-            "evil\".oops--",
-        );
+        let out =
+            qualify_information_schema("SELECT 1 FROM information_schema.tables", "evil\".oops--");
         assert_eq!(
             out,
             "SELECT 1 FROM \"evil\"\".oops--\".information_schema.tables"

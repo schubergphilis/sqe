@@ -17,13 +17,12 @@
 //! The non-ignored tests stay on the static shape of the rewrite + provider
 //! construction so every PR exercises them without Docker.
 
-
 use std::sync::Arc;
 
 #[allow(unused_imports)]
 use arrow_array::Array;
 use sqe_catalog::incremental_scan::{
-    ChangeKind, IncrementalFile, IncrementalPlan, augment_schema_with_meta,
+    augment_schema_with_meta, ChangeKind, IncrementalFile, IncrementalPlan,
 };
 
 // ---------------------------------------------------------------------------
@@ -35,8 +34,7 @@ use sqe_catalog::incremental_scan::{
 /// DataFusion can plan, plus the specs for every matching table.
 #[test]
 fn parser_strips_incremental_clause() {
-    let input =
-        "SELECT count(*) FROM ns.t FOR INCREMENTAL BETWEEN SNAPSHOT 100 AND SNAPSHOT 105";
+    let input = "SELECT count(*) FROM ns.t FOR INCREMENTAL BETWEEN SNAPSHOT 100 AND SNAPSHOT 105";
     let (rewritten, specs) = sqe_sql::extract_incremental_spec(input).unwrap();
     assert_eq!(specs.len(), 1);
     assert_eq!(specs[0].table, "ns.t");
@@ -62,8 +60,11 @@ fn provider_exposes_meta_columns_in_schema() {
         Field::new("val", DataType::Utf8, true),
     ]));
     let augmented = augment_schema_with_meta(&base);
-    let names: Vec<&str> =
-        augmented.fields().iter().map(|f| f.name().as_str()).collect();
+    let names: Vec<&str> = augmented
+        .fields()
+        .iter()
+        .map(|f| f.name().as_str())
+        .collect();
     assert_eq!(
         names,
         vec![
@@ -96,8 +97,7 @@ fn attach_meta_columns_fills_every_row() {
         ordinal: 3,
     };
 
-    let out =
-        sqe_catalog::incremental_scan::attach_meta_columns(batch, &file).unwrap();
+    let out = sqe_catalog::incremental_scan::attach_meta_columns(batch, &file).unwrap();
     assert_eq!(out.num_rows(), 3);
     assert_eq!(out.num_columns(), 4);
 
@@ -109,18 +109,10 @@ fn attach_meta_columns_fills_every_row() {
     assert_eq!(kind.value(0), "insert");
     assert_eq!(kind.value(2), "insert");
 
-    let ord = out
-        .column(2)
-        .as_any()
-        .downcast_ref::<Int64Array>()
-        .unwrap();
+    let ord = out.column(2).as_any().downcast_ref::<Int64Array>().unwrap();
     assert_eq!(ord.value(0), 3);
 
-    let snap = out
-        .column(3)
-        .as_any()
-        .downcast_ref::<Int64Array>()
-        .unwrap();
+    let snap = out.column(3).as_any().downcast_ref::<Int64Array>().unwrap();
     assert_eq!(snap.value(1), 42);
 }
 
@@ -132,11 +124,7 @@ fn incremental_provider_builds_with_empty_plan() {
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion::datasource::TableProvider;
 
-    let base = Arc::new(Schema::new(vec![Field::new(
-        "id",
-        DataType::Int64,
-        false,
-    )]));
+    let base = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
     let plan = IncrementalPlan::default();
 
     // The provider is constructed with the base Arrow schema plus the plan.
@@ -185,7 +173,9 @@ async fn incremental_scan_three_snapshots_returns_45_rows() {
     handler
         .execute(
             &session,
-            &format!("CREATE TABLE {table} (id BIGINT, val VARCHAR)"), None)
+            &format!("CREATE TABLE {table} (id BIGINT, val VARCHAR)"),
+            None,
+        )
         .await
         .expect("create table");
 
@@ -203,7 +193,9 @@ async fn incremental_scan_three_snapshots_returns_45_rows() {
                     .map(|i| format!("({i}, 'a')"))
                     .collect::<Vec<_>>()
                     .join(", ")
-            ), None)
+            ),
+            None,
+        )
         .await
         .expect("insert 10");
 
@@ -217,7 +209,9 @@ async fn incremental_scan_three_snapshots_returns_45_rows() {
                     .map(|i| format!("({i}, 'b')"))
                     .collect::<Vec<_>>()
                     .join(", ")
-            ), None)
+            ),
+            None,
+        )
         .await
         .expect("insert 15");
 
@@ -231,7 +225,9 @@ async fn incremental_scan_three_snapshots_returns_45_rows() {
                     .map(|i| format!("({i}, 'c')"))
                     .collect::<Vec<_>>()
                     .join(", ")
-            ), None)
+            ),
+            None,
+        )
         .await
         .expect("insert 20");
 
@@ -242,7 +238,9 @@ async fn incremental_scan_three_snapshots_returns_45_rows() {
             &session,
             &format!(
                 "SELECT snapshot_id FROM table_snapshots('{ns}', 'orders') ORDER BY timestamp_ms"
-            ), None)
+            ),
+            None,
+        )
         .await
         .expect("query snapshots");
     let mut ids: Vec<i64> = Vec::new();
@@ -293,14 +291,16 @@ async fn incremental_scan_meta_columns_are_populated() {
         .await
         .expect("create schema");
     handler
-        .execute(
-            &session,
-            &format!("CREATE TABLE {table} (id BIGINT)"), None)
+        .execute(&session, &format!("CREATE TABLE {table} (id BIGINT)"), None)
         .await
         .expect("create table");
 
     handler
-        .execute(&session, &format!("INSERT INTO {table} VALUES (1), (2), (3)"), None)
+        .execute(
+            &session,
+            &format!("INSERT INTO {table} VALUES (1), (2), (3)"),
+            None,
+        )
         .await
         .expect("insert 3");
 
@@ -309,7 +309,9 @@ async fn incremental_scan_meta_columns_are_populated() {
             &session,
             &format!(
                 "SELECT snapshot_id FROM table_snapshots('{ns}', 'events') ORDER BY timestamp_ms"
-            ), None)
+            ),
+            None,
+        )
         .await
         .expect("query snapshots");
     let s3 = batches[0]

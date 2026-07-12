@@ -209,9 +209,7 @@ async fn handle_quack(
             // ConnectionRequest specifically, since that is the IdP-amplifying
             // path. The header is read here (not in the dispatcher) so the
             // other message types pay no resolution cost.
-            let forwarded_for = headers
-                .get("x-forwarded-for")
-                .and_then(|v| v.to_str().ok());
+            let forwarded_for = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok());
             let client_ip = client_key(peer, forwarded_for, &state.security);
             handle_connection_request(&state, &request_header, &client_ip, req).await
         }
@@ -577,14 +575,20 @@ mod tests {
 
         // Untrusted by default: key is the proxy's own IP, header ignored.
         let untrusted = SecurityConfig::default();
-        assert_eq!(client_key(proxy, Some("203.0.113.5"), &untrusted), "10.0.0.1");
+        assert_eq!(
+            client_key(proxy, Some("203.0.113.5"), &untrusted),
+            "10.0.0.1"
+        );
 
         // Trusted proxy: key follows the forwarded client.
         let trusted = SecurityConfig {
             trusted_proxies: vec!["10.0.0.1".to_string()],
             ..SecurityConfig::default()
         };
-        assert_eq!(client_key(proxy, Some("203.0.113.5"), &trusted), "203.0.113.5");
+        assert_eq!(
+            client_key(proxy, Some("203.0.113.5"), &trusted),
+            "203.0.113.5"
+        );
         assert_ne!(
             client_key(proxy, Some("203.0.113.5"), &trusted),
             client_key(proxy, Some("198.51.100.9"), &trusted),

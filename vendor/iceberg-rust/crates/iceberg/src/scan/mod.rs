@@ -173,10 +173,7 @@ impl<'a> TableScanBuilder<'a> {
     /// that open before the dynamic source becomes useful (e.g. before
     /// a hash join build side completes) simply see `None` and fall
     /// back to the static predicate.
-    pub fn with_dynamic_predicate(
-        mut self,
-        dynamic_predicate: Arc<dyn DynamicPredicate>,
-    ) -> Self {
+    pub fn with_dynamic_predicate(mut self, dynamic_predicate: Arc<dyn DynamicPredicate>) -> Self {
         self.dynamic_predicate = Some(dynamic_predicate);
         self
     }
@@ -640,8 +637,7 @@ impl TableScan {
         }
 
         if let Some(dynamic_predicate) = self.dynamic_predicate.clone() {
-            arrow_reader_builder =
-                arrow_reader_builder.with_dynamic_predicate(dynamic_predicate);
+            arrow_reader_builder = arrow_reader_builder.with_dynamic_predicate(dynamic_predicate);
         }
 
         if let Some(decode_gate) = self.decode_gate.clone() {
@@ -838,12 +834,15 @@ pub mod tests {
                     env!("CARGO_MANIFEST_DIR")
                 ))
                 .unwrap();
-                let metadata_json = render_template(&template_json_str, context! {
-                    table_location => &table_location,
-                    manifest_list_1_location => &manifest_list1_location,
-                    manifest_list_2_location => &manifest_list2_location,
-                    table_metadata_1_location => &table_metadata1_location,
-                });
+                let metadata_json = render_template(
+                    &template_json_str,
+                    context! {
+                        table_location => &table_location,
+                        manifest_list_1_location => &manifest_list1_location,
+                        manifest_list_2_location => &manifest_list2_location,
+                        table_metadata_1_location => &table_metadata1_location,
+                    },
+                );
                 serde_json::from_str::<TableMetadata>(&metadata_json).unwrap()
             };
 
@@ -878,10 +877,13 @@ pub mod tests {
                     env!("CARGO_MANIFEST_DIR")
                 ))
                 .unwrap();
-                let metadata_json = render_template(&template_json_str, context! {
-                    table_location => &table_location,
-                    table_metadata_1_location => &table_metadata1_location,
-                });
+                let metadata_json = render_template(
+                    &template_json_str,
+                    context! {
+                        table_location => &table_location,
+                        table_metadata_1_location => &table_metadata1_location,
+                    },
+                );
                 serde_json::from_str::<TableMetadata>(&metadata_json).unwrap()
             };
 
@@ -917,12 +919,15 @@ pub mod tests {
                     env!("CARGO_MANIFEST_DIR")
                 ))
                 .unwrap();
-                let metadata_json = render_template(&template_json_str, context! {
-                    table_location => &table_location,
-                    manifest_list_1_location => &manifest_list1_location,
-                    manifest_list_2_location => &manifest_list2_location,
-                    table_metadata_1_location => &table_metadata1_location,
-                });
+                let metadata_json = render_template(
+                    &template_json_str,
+                    context! {
+                        table_location => &table_location,
+                        manifest_list_1_location => &manifest_list1_location,
+                        manifest_list_2_location => &manifest_list2_location,
+                        table_metadata_1_location => &table_metadata1_location,
+                    },
+                );
                 serde_json::from_str::<TableMetadata>(&metadata_json).unwrap()
             };
 
@@ -1155,9 +1160,10 @@ pub mod tests {
             let values: BooleanArray = values.into();
             let col8 = Arc::new(values) as ArrayRef;
 
-            let to_write = RecordBatch::try_new(schema.clone(), vec![
-                col1, col2, col3, col4, col5, col6, col7, col8,
-            ])
+            let to_write = RecordBatch::try_new(
+                schema.clone(),
+                vec![col1, col2, col3, col4, col5, col6, col7, col8],
+            )
             .unwrap();
 
             // Write the Parquet files

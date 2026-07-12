@@ -20,8 +20,10 @@ use super::{parquet_writer, BenchmarkGenerator, GenerateStats, TableDef};
 /// representation arrow-rs uses internally.
 fn decimal_array(values: Vec<f64>, precision: u8, scale: i8) -> Decimal128Array {
     let factor = 10_f64.powi(scale as i32);
-    let scaled: Vec<i128> =
-        values.into_iter().map(|v| (v * factor).round() as i128).collect();
+    let scaled: Vec<i128> = values
+        .into_iter()
+        .map(|v| (v * factor).round() as i128)
+        .collect();
     Decimal128Array::from_iter_values(scaled)
         .with_precision_and_scale(precision, scale)
         .expect("valid TPC-C precision/scale")
@@ -455,7 +457,11 @@ fn generate_customer(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
             let wid = ((idx / 30_000) as i32 + 1).min(num_warehouses);
 
             // 10% bad credit
-            let credit = if rng.gen_range(0..10) == 0 { "BC" } else { "GC" };
+            let credit = if rng.gen_range(0..10) == 0 {
+                "BC"
+            } else {
+                "GC"
+            };
             // last name for first 1000 customers is deterministic (TPC-C spec)
             let last = if cid <= 1000 {
                 make_last_name((cid - 1) as usize)
@@ -832,7 +838,11 @@ fn generate_item() -> (SchemaRef, Vec<RecordBatch>) {
             let data = if rng.gen_range(0..10) == 0 {
                 let pos = rng.gen_range(0..=14usize);
                 let base = random_data(&mut rng);
-                format!("{}ORIGINAL{}", &base[..pos.min(base.len())], &base[pos.min(base.len())..])
+                format!(
+                    "{}ORIGINAL{}",
+                    &base[..pos.min(base.len())],
+                    &base[pos.min(base.len())..]
+                )
             } else {
                 random_data(&mut rng)
             };
@@ -921,7 +931,11 @@ fn generate_stock(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
             let data = if rng.gen_range(0..10) == 0 {
                 let pos = rng.gen_range(0..=14usize);
                 let base = random_data(&mut rng);
-                format!("{}ORIGINAL{}", &base[..pos.min(base.len())], &base[pos.min(base.len())..])
+                format!(
+                    "{}ORIGINAL{}",
+                    &base[..pos.min(base.len())],
+                    &base[pos.min(base.len())..]
+                )
             } else {
                 random_data(&mut rng)
             };

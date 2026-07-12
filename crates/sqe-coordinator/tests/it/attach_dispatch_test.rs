@@ -77,11 +77,18 @@ async fn create_bearer_secret_succeeds() {
     let session = dummy_session();
 
     let result = handler
-        .execute(&session, "CREATE SECRET my_tok (TYPE bearer, TOKEN 'abc123')", None)
+        .execute(
+            &session,
+            "CREATE SECRET my_tok (TYPE bearer, TOKEN 'abc123')",
+            None,
+        )
         .await;
 
     assert!(result.is_ok(), "unexpected error: {:?}", result);
-    assert_eq!(result.unwrap().iter().map(|b| b.num_rows()).sum::<usize>(), 0);
+    assert_eq!(
+        result.unwrap().iter().map(|b| b.num_rows()).sum::<usize>(),
+        0
+    );
 }
 
 #[tokio::test]
@@ -115,18 +122,29 @@ async fn create_duplicate_secret_errors() {
     let session = dummy_session();
 
     handler
-        .execute(&session, "CREATE SECRET dup (TYPE bearer, TOKEN 'tok1')", None)
+        .execute(
+            &session,
+            "CREATE SECRET dup (TYPE bearer, TOKEN 'tok1')",
+            None,
+        )
         .await
         .expect("first create");
 
     let err = handler
-        .execute(&session, "CREATE SECRET dup (TYPE bearer, TOKEN 'tok2')", None)
+        .execute(
+            &session,
+            "CREATE SECRET dup (TYPE bearer, TOKEN 'tok2')",
+            None,
+        )
         .await
         .expect_err("second create should fail");
 
     let msg = err.to_string();
     assert!(msg.contains("dup"), "error should name the secret: {msg}");
-    assert!(msg.contains("already exists"), "error should say 'already exists': {msg}");
+    assert!(
+        msg.contains("already exists"),
+        "error should say 'already exists': {msg}"
+    );
 }
 
 #[tokio::test]
@@ -152,7 +170,10 @@ async fn show_secrets_empty_returns_zero_rows() {
     let handler = make_handler(SecretStore::new(), RuntimeCatalogRegistry::new());
     let session = dummy_session();
 
-    let batches = handler.execute(&session, "SHOW SECRETS", None).await.unwrap();
+    let batches = handler
+        .execute(&session, "SHOW SECRETS", None)
+        .await
+        .unwrap();
     let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(total_rows, 0);
 }
@@ -161,7 +182,12 @@ async fn show_secrets_empty_returns_zero_rows() {
 async fn show_secrets_lists_name_and_type_not_value() {
     let secrets = SecretStore::new();
     secrets
-        .create("alpha", sqe_core::Secret::Bearer { token: "supersecret".to_string() })
+        .create(
+            "alpha",
+            sqe_core::Secret::Bearer {
+                token: "supersecret".to_string(),
+            },
+        )
         .unwrap();
     secrets
         .create(
@@ -178,7 +204,10 @@ async fn show_secrets_lists_name_and_type_not_value() {
 
     let handler = make_handler(secrets, RuntimeCatalogRegistry::new());
     let session = dummy_session();
-    let batches = handler.execute(&session, "SHOW SECRETS", None).await.unwrap();
+    let batches = handler
+        .execute(&session, "SHOW SECRETS", None)
+        .await
+        .unwrap();
 
     let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(total_rows, 2, "expected 2 secrets listed");
@@ -216,7 +245,11 @@ async fn drop_secret_removes_from_store() {
     let session = dummy_session();
 
     handler
-        .execute(&session, "CREATE SECRET ephemeral (TYPE bearer, TOKEN 'tok')", None)
+        .execute(
+            &session,
+            "CREATE SECRET ephemeral (TYPE bearer, TOKEN 'tok')",
+            None,
+        )
         .await
         .unwrap();
 
@@ -226,7 +259,10 @@ async fn drop_secret_removes_from_store() {
         .expect("drop should succeed");
 
     // After drop, SHOW SECRETS should be empty again.
-    let batches = handler.execute(&session, "SHOW SECRETS", None).await.unwrap();
+    let batches = handler
+        .execute(&session, "SHOW SECRETS", None)
+        .await
+        .unwrap();
     let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(total_rows, 0);
 }
@@ -242,8 +278,14 @@ async fn drop_missing_secret_errors() {
         .expect_err("drop of unknown secret should fail");
 
     let msg = err.to_string();
-    assert!(msg.contains("nonexistent"), "error should name the secret: {msg}");
-    assert!(msg.contains("not found"), "error should say 'not found': {msg}");
+    assert!(
+        msg.contains("nonexistent"),
+        "error should name the secret: {msg}"
+    );
+    assert!(
+        msg.contains("not found"),
+        "error should say 'not found': {msg}"
+    );
 }
 
 #[tokio::test]
@@ -251,7 +293,12 @@ async fn drop_secret_in_use_by_attached_catalog_errors() {
     let secrets = SecretStore::new();
     let catalogs = RuntimeCatalogRegistry::new();
     secrets
-        .create("mytoken", sqe_core::Secret::Bearer { token: "tok".to_string() })
+        .create(
+            "mytoken",
+            sqe_core::Secret::Bearer {
+                token: "tok".to_string(),
+            },
+        )
         .unwrap();
 
     // Simulate a catalog referencing the secret by building an AttachedCatalog entry
@@ -261,7 +308,10 @@ async fn drop_secret_in_use_by_attached_catalog_errors() {
     use tempfile::tempdir;
     let dir = tempdir().unwrap();
     let mut opts = BTreeMap::new();
-    opts.insert("SECRET".to_string(), OptionValue::SecretRef("mytoken".to_string()));
+    opts.insert(
+        "SECRET".to_string(),
+        OptionValue::SecretRef("mytoken".to_string()),
+    );
     let stmt = AttachStatement {
         name: "blocked".to_string(),
         location: dir.path().to_str().unwrap().to_string(),
@@ -282,8 +332,14 @@ async fn drop_secret_in_use_by_attached_catalog_errors() {
         .expect_err("drop of in-use secret should fail");
 
     let msg = err.to_string();
-    assert!(msg.contains("mytoken"), "error should name the secret: {msg}");
-    assert!(msg.contains("blocked"), "error should name the catalog: {msg}");
+    assert!(
+        msg.contains("mytoken"),
+        "error should name the secret: {msg}"
+    );
+    assert!(
+        msg.contains("blocked"),
+        "error should name the catalog: {msg}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -296,7 +352,11 @@ async fn create_secret_rejected_without_admin_role() {
     let session = session_with_roles(vec!["analyst".to_string()]);
 
     let err = handler
-        .execute(&session, "CREATE SECRET denied_tok (TYPE bearer, TOKEN 'tok')", None)
+        .execute(
+            &session,
+            "CREATE SECRET denied_tok (TYPE bearer, TOKEN 'tok')",
+            None,
+        )
         .await
         .expect_err("non-admin must not create secrets");
 
@@ -310,7 +370,11 @@ async fn drop_secret_rejected_without_admin_role() {
     let handler = make_handler(SecretStore::new(), RuntimeCatalogRegistry::new());
     let admin = dummy_session();
     handler
-        .execute(&admin, "CREATE SECRET to_drop (TYPE bearer, TOKEN 'tok')", None)
+        .execute(
+            &admin,
+            "CREATE SECRET to_drop (TYPE bearer, TOKEN 'tok')",
+            None,
+        )
         .await
         .expect("admin creates secret");
 

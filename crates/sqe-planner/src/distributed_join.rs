@@ -136,9 +136,7 @@ impl PhysicalOptimizerRule for BroadcastJoinRule {
                     match BroadcastJoinPlan::from_hash_join(hash_join, side) {
                         Ok(broadcast_plan) => {
                             let broadcast_plan = Arc::new(broadcast_plan);
-                            return Ok(Transformed::yes(
-                                broadcast_plan as Arc<dyn ExecutionPlan>,
-                            ));
+                            return Ok(Transformed::yes(broadcast_plan as Arc<dyn ExecutionPlan>));
                         }
                         Err(e) => {
                             debug!(
@@ -216,10 +214,7 @@ impl BroadcastJoinPlan {
     /// gracefully (the caller falls back to the original plan) rather than
     /// panicking inside a `PhysicalOptimizerRule` and crashing the planning
     /// thread for the query.
-    pub fn from_hash_join(
-        hash_join: &HashJoinExec,
-        broadcast_side: BroadcastSide,
-    ) -> Result<Self> {
+    pub fn from_hash_join(hash_join: &HashJoinExec, broadcast_side: BroadcastSide) -> Result<Self> {
         let broadcast_size = match broadcast_side {
             BroadcastSide::Left => estimate_side_size(hash_join.left()),
             BroadcastSide::Right => estimate_side_size(hash_join.right()),
@@ -300,8 +295,7 @@ impl ExecutionPlan for BroadcastJoinPlan {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         if children.len() != 1 {
             return Err(datafusion::error::DataFusionError::Internal(
-                "BroadcastJoinPlan expects exactly one child (the inner HashJoinExec)"
-                    .to_string(),
+                "BroadcastJoinPlan expects exactly one child (the inner HashJoinExec)".to_string(),
             ));
         }
         // The child must be a HashJoinExec
@@ -628,20 +622,14 @@ impl PhysicalOptimizerRule for PreSortedJoinRule {
                 let left_sort_exprs: Vec<PhysicalSortExpr> = on
                     .iter()
                     .map(|(left_col, _)| {
-                        PhysicalSortExpr::new(
-                            Arc::clone(left_col),
-                            SortOptions::default(),
-                        )
+                        PhysicalSortExpr::new(Arc::clone(left_col), SortOptions::default())
                     })
                     .collect();
 
                 let right_sort_exprs: Vec<PhysicalSortExpr> = on
                     .iter()
                     .map(|(_, right_col)| {
-                        PhysicalSortExpr::new(
-                            Arc::clone(right_col),
-                            SortOptions::default(),
-                        )
+                        PhysicalSortExpr::new(Arc::clone(right_col), SortOptions::default())
                     })
                     .collect();
 
@@ -675,9 +663,7 @@ impl PhysicalOptimizerRule for PreSortedJoinRule {
                         hash_join.null_equality(),
                     ) {
                         Ok(smj) => {
-                            return Ok(Transformed::yes(
-                                Arc::new(smj) as Arc<dyn ExecutionPlan>
-                            ));
+                            return Ok(Transformed::yes(Arc::new(smj) as Arc<dyn ExecutionPlan>));
                         }
                         Err(e) => {
                             debug!(
@@ -749,10 +735,7 @@ fn is_sorted_on(plan: &Arc<dyn ExecutionPlan>, required: &[PhysicalSortExpr]) ->
 ///
 /// Returns the strategy that should be used based on the estimated sizes
 /// of both join sides and the broadcast threshold.
-pub fn select_join_strategy(
-    hash_join: &HashJoinExec,
-    broadcast_threshold: usize,
-) -> JoinStrategy {
+pub fn select_join_strategy(hash_join: &HashJoinExec, broadcast_threshold: usize) -> JoinStrategy {
     let left_size = estimate_side_size(hash_join.left());
     let right_size = estimate_side_size(hash_join.right());
 
@@ -1161,8 +1144,10 @@ mod tests {
         );
         let ordering = LexOrdering::new(vec![sort_expr]).unwrap();
 
-        let sorted_left: Arc<dyn ExecutionPlan> =
-            Arc::new(SortExec::new(ordering.clone(), make_memory_plan(schema.clone())));
+        let sorted_left: Arc<dyn ExecutionPlan> = Arc::new(SortExec::new(
+            ordering.clone(),
+            make_memory_plan(schema.clone()),
+        ));
         let sorted_right: Arc<dyn ExecutionPlan> =
             Arc::new(SortExec::new(ordering, make_memory_plan(schema.clone())));
 
@@ -1170,9 +1155,7 @@ mod tests {
 
         let result = rule.optimize(plan, &config).unwrap();
         assert!(
-            result
-                .downcast_ref::<SortMergeJoinExec>()
-                .is_some(),
+            result.downcast_ref::<SortMergeJoinExec>().is_some(),
             "Expected SortMergeJoinExec when both inputs are sorted on join keys"
         );
     }
@@ -1216,8 +1199,10 @@ mod tests {
         );
         let ordering = LexOrdering::new(vec![sort_expr]).unwrap();
 
-        let sorted_left: Arc<dyn ExecutionPlan> =
-            Arc::new(SortExec::new(ordering.clone(), make_memory_plan(schema.clone())));
+        let sorted_left: Arc<dyn ExecutionPlan> = Arc::new(SortExec::new(
+            ordering.clone(),
+            make_memory_plan(schema.clone()),
+        ));
         let sorted_right: Arc<dyn ExecutionPlan> =
             Arc::new(SortExec::new(ordering, make_memory_plan(schema.clone())));
 
@@ -1250,10 +1235,7 @@ mod tests {
             format!("{}", JoinStrategy::Broadcast(BroadcastSide::Left)),
             "Broadcast (Left)"
         );
-        assert_eq!(
-            format!("{}", JoinStrategy::ShuffleHash),
-            "ShuffleHash"
-        );
+        assert_eq!(format!("{}", JoinStrategy::ShuffleHash), "ShuffleHash");
     }
 
     // ─── Helper function tests ───

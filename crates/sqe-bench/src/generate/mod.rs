@@ -3,11 +3,11 @@ pub mod clickbench;
 pub mod config;
 pub mod parquet_writer;
 pub mod ssb;
+pub mod tpcbb;
 pub mod tpcc;
+pub mod tpcds;
 pub mod tpce;
 pub mod tpch;
-pub mod tpcbb;
-pub mod tpcds;
 
 use arrow_schema::SchemaRef;
 use std::time::Duration;
@@ -94,12 +94,7 @@ where
     if threads == 1 {
         let batches = gen_range(0..total_rows, base_seed);
         let (files, bytes) = parquet_writer::write_parquet_stream(
-            batches,
-            schema,
-            output_dir,
-            table_name,
-            "",
-            config,
+            batches, schema, output_dir, table_name, "", config,
         )?;
         return Ok(GenerateStats {
             table: table_name.to_string(),
@@ -181,7 +176,6 @@ pub fn get_generator(name: &str) -> anyhow::Result<Box<dyn BenchmarkGenerator>> 
     }
 }
 
-
 #[cfg(test)]
 mod sweep_tests {
     use super::*;
@@ -194,8 +188,20 @@ mod sweep_tests {
     fn every_generator_table_builds_clean_batches() {
         let dir = std::env::temp_dir().join(format!("sqe-bench-sweep-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let config = GenerateConfig { threads: 1, ..Default::default() };
-        for bench in ["tpch", "ssb", "tpcds", "tpcc", "tpce", "tpcbb", "clickbench", "bank"] {
+        let config = GenerateConfig {
+            threads: 1,
+            ..Default::default()
+        };
+        for bench in [
+            "tpch",
+            "ssb",
+            "tpcds",
+            "tpcc",
+            "tpce",
+            "tpcbb",
+            "clickbench",
+            "bank",
+        ] {
             let g = get_generator(bench).unwrap();
             for t in g.tables() {
                 g.generate_table(&t.name, 0.001, dir.to_str().unwrap(), &config)

@@ -4,7 +4,9 @@ use std::sync::Arc;
 
 use arrow_array::{Array, RecordBatch};
 use arrow_flight::encode::FlightDataEncoderBuilder;
+use arrow_flight::error::FlightError;
 use arrow_flight::flight_service_server::FlightService;
+use arrow_flight::sql::metadata::{SqlInfoDataBuilder, XdbcTypeInfo, XdbcTypeInfoDataBuilder};
 use arrow_flight::sql::server::FlightSqlService;
 use arrow_flight::sql::server::PeekableFlightDataStream;
 use arrow_flight::sql::{
@@ -20,12 +22,10 @@ use arrow_flight::sql::{
     CommandStatementUpdate, DoPutPreparedStatementResult, Nullable, ProstMessageExt, Searchable,
     SqlInfo, TicketStatementQuery, XdbcDataType,
 };
-use arrow_flight::sql::metadata::{SqlInfoDataBuilder, XdbcTypeInfo, XdbcTypeInfoDataBuilder};
 use arrow_flight::{
-    Action, FlightDescriptor, FlightEndpoint, FlightInfo, HandshakeRequest,
-    HandshakeResponse, Ticket,
+    Action, FlightDescriptor, FlightEndpoint, FlightInfo, HandshakeRequest, HandshakeResponse,
+    Ticket,
 };
-use arrow_flight::error::FlightError;
 use arrow_ipc::writer::IpcWriteOptions;
 use base64::Engine;
 
@@ -40,14 +40,14 @@ const BASIC_AUTH_B64: base64::engine::GeneralPurpose = base64::engine::GeneralPu
     base64::engine::GeneralPurposeConfig::new()
         .with_decode_padding_mode(base64::engine::DecodePaddingMode::Indifferent),
 );
-use futures::{Stream, StreamExt, TryStreamExt, stream};
+use futures::{stream, Stream, StreamExt, TryStreamExt};
 use prost::Message;
 use tonic::metadata::MetadataValue;
 use tonic::{Request, Response, Status, Streaming};
 use tracing::{debug, info, warn};
 
 use sqe_core::SqeConfig;
-use sqe_sql::{StatementKind, parse_and_classify_typed, pre_parse_pipeline, UserSql};
+use sqe_sql::{parse_and_classify_typed, pre_parse_pipeline, StatementKind, UserSql};
 
 use crate::query_handler::QueryHandler;
 use crate::query_tracker::QueryTracker;
@@ -57,7 +57,7 @@ use crate::worker_registry::WorkerRegistry;
 // Re-export helpers so callers that imported directly from this module
 // keep working without changes.
 pub use crate::flight_sql_helpers::FetchResults;
-use crate::flight_sql_helpers::{FlightStream, sqe_error_to_status};
+use crate::flight_sql_helpers::{sqe_error_to_status, FlightStream};
 
 /// Populate the full Flight SQL `SqlInfo` table.
 ///
@@ -175,26 +175,62 @@ pub fn build_sql_info_data() -> Result<arrow_flight::sql::metadata::SqlInfoData,
     b.append(
         I::SqlKeywords,
         vec![
-            "ALTER".into(), "AND".into(), "AS".into(), "ASC".into(),
-            "BETWEEN".into(), "BIGINT".into(), "BY".into(),
-            "CASE".into(), "CAST".into(), "COLUMN".into(), "CREATE".into(),
-            "DELETE".into(), "DESC".into(), "DISTINCT".into(), "DROP".into(),
-            "ELSE".into(), "END".into(), "EXISTS".into(),
-            "FALSE".into(), "FOR".into(), "FROM".into(), "FULL".into(),
-            "GROUP".into(), "HAVING".into(),
-            "IN".into(), "INNER".into(), "INSERT".into(), "INTO".into(), "IS".into(),
+            "ALTER".into(),
+            "AND".into(),
+            "AS".into(),
+            "ASC".into(),
+            "BETWEEN".into(),
+            "BIGINT".into(),
+            "BY".into(),
+            "CASE".into(),
+            "CAST".into(),
+            "COLUMN".into(),
+            "CREATE".into(),
+            "DELETE".into(),
+            "DESC".into(),
+            "DISTINCT".into(),
+            "DROP".into(),
+            "ELSE".into(),
+            "END".into(),
+            "EXISTS".into(),
+            "FALSE".into(),
+            "FOR".into(),
+            "FROM".into(),
+            "FULL".into(),
+            "GROUP".into(),
+            "HAVING".into(),
+            "IN".into(),
+            "INNER".into(),
+            "INSERT".into(),
+            "INTO".into(),
+            "IS".into(),
             "JOIN".into(),
-            "LEFT".into(), "LIKE".into(), "LIMIT".into(),
+            "LEFT".into(),
+            "LIKE".into(),
+            "LIMIT".into(),
             "MERGE".into(),
-            "NOT".into(), "NULL".into(),
-            "ON".into(), "OR".into(), "ORDER".into(), "OUTER".into(),
-            "PARTITION".into(), "PREPARE".into(),
+            "NOT".into(),
+            "NULL".into(),
+            "ON".into(),
+            "OR".into(),
+            "ORDER".into(),
+            "OUTER".into(),
+            "PARTITION".into(),
+            "PREPARE".into(),
             "RIGHT".into(),
-            "SELECT".into(), "SET".into(),
-            "TABLE".into(), "THEN".into(), "TRUE".into(),
-            "UNION".into(), "UPDATE".into(), "USING".into(),
-            "VALUES".into(), "VIEW".into(),
-            "WHEN".into(), "WHERE".into(), "WITH".into(),
+            "SELECT".into(),
+            "SET".into(),
+            "TABLE".into(),
+            "THEN".into(),
+            "TRUE".into(),
+            "UNION".into(),
+            "UPDATE".into(),
+            "USING".into(),
+            "VALUES".into(),
+            "VIEW".into(),
+            "WHEN".into(),
+            "WHERE".into(),
+            "WITH".into(),
         ],
     );
     b.append(I::SqlSearchStringEscape, "\\");
@@ -332,7 +368,6 @@ pub fn encode_batches_to_stream(
     Ok(Response::new(Box::pin(flight_stream)))
 }
 
-
 /// Strip the `:port` suffix from a peer-address string so the auth
 /// rate-limit key is stable across the ephemeral source ports a single
 /// IP cycles through.
@@ -450,7 +485,10 @@ impl SqeFlightSqlService {
     }
 
     #[must_use = "with_rate_limiter consumes self; bind the returned service"]
-    pub fn with_rate_limiter(mut self, limiter: Arc<crate::rate_limiter::QueryRateLimiter>) -> Self {
+    pub fn with_rate_limiter(
+        mut self,
+        limiter: Arc<crate::rate_limiter::QueryRateLimiter>,
+    ) -> Self {
         self.rate_limiter = Some(limiter);
         self
     }
@@ -586,7 +624,11 @@ impl SqeFlightSqlService {
                         message: Some("No authorization header".to_string()),
                     },
                     sqe_metrics::audit::Actor::from_parts(
-                        "unknown".to_string(), None, None, vec![], vec![],
+                        "unknown".to_string(),
+                        None,
+                        None,
+                        vec![],
+                        vec![],
                     ),
                     Some(client_ip.clone()),
                     None,
@@ -675,7 +717,11 @@ impl SqeFlightSqlService {
                             message: Some("Invalid or expired bearer token".to_string()),
                         },
                         sqe_metrics::audit::Actor::from_parts(
-                            "unknown".to_string(), None, None, vec![], vec![],
+                            "unknown".to_string(),
+                            None,
+                            None,
+                            vec![],
+                            vec![],
                         ),
                         Some(client_ip),
                         None,
@@ -693,7 +739,11 @@ impl SqeFlightSqlService {
                 message: Some("Invalid or expired session token".to_string()),
             },
             sqe_metrics::audit::Actor::from_parts(
-                "unknown".to_string(), None, None, vec![], vec![],
+                "unknown".to_string(),
+                None,
+                None,
+                vec![],
+                vec![],
             ),
             Some(client_ip),
             None,
@@ -703,8 +753,9 @@ impl SqeFlightSqlService {
 
     /// Parse the `[coordinator] flight_compression` config into IPC write options.
     fn flight_ipc_options(&self) -> Result<IpcWriteOptions, Status> {
-        let compression = sqe_core::FlightCompression::from_config(&self.config.coordinator.flight_compression)
-            .map_err(|e| Status::internal(format!("Invalid flight_compression config: {e}")))?;
+        let compression =
+            sqe_core::FlightCompression::from_config(&self.config.coordinator.flight_compression)
+                .map_err(|e| Status::internal(format!("Invalid flight_compression config: {e}")))?;
         ipc_options_for(compression)
     }
 
@@ -757,9 +808,8 @@ impl SqeFlightSqlService {
                 .map_err(|e| sqe_error_to_status(&e, None))?;
 
             let options = self.flight_ipc_options()?;
-            let batch_stream = stream.map(|res| {
-                res.map_err(|e| FlightError::ExternalError(Box::new(e)))
-            });
+            let batch_stream =
+                stream.map(|res| res.map_err(|e| FlightError::ExternalError(Box::new(e))));
             let flight_stream = FlightDataEncoderBuilder::new()
                 .with_schema(schema)
                 .with_options(options)
@@ -956,19 +1006,27 @@ impl FlightSqlService for SqeFlightSqlService {
 
         // Record auth duration regardless of outcome
         if let Some(ref metrics) = self.metrics {
-            metrics.auth_duration_seconds.observe(auth_elapsed.as_secs_f64());
+            metrics
+                .auth_duration_seconds
+                .observe(auth_elapsed.as_secs_f64());
         }
 
         let session = match auth_result {
             Ok(Ok(session)) => {
                 if let Some(ref metrics) = self.metrics {
-                    metrics.auth_attempts_total.with_label_values(&["oidc", "success"]).inc();
+                    metrics
+                        .auth_attempts_total
+                        .with_label_values(&["oidc", "success"])
+                        .inc();
                 }
                 session
             }
             Ok(Err(e)) => {
                 if let Some(ref metrics) = self.metrics {
-                    metrics.auth_attempts_total.with_label_values(&["oidc", "failed"]).inc();
+                    metrics
+                        .auth_attempts_total
+                        .with_label_values(&["oidc", "failed"])
+                        .inc();
                 }
                 // Server-side detail stays in the warn log. The
                 // unauthenticated peer receives an opaque message so
@@ -983,7 +1041,11 @@ impl FlightSqlService for SqeFlightSqlService {
                         message: Some("Authentication failed".to_string()),
                     },
                     sqe_metrics::audit::Actor::from_parts(
-                        username.to_string(), None, None, vec![], vec![],
+                        username.to_string(),
+                        None,
+                        None,
+                        vec![],
+                        vec![],
                     ),
                     Some(client_ip.clone()),
                     None,
@@ -992,7 +1054,10 @@ impl FlightSqlService for SqeFlightSqlService {
             }
             Err(_) => {
                 if let Some(ref metrics) = self.metrics {
-                    metrics.auth_attempts_total.with_label_values(&["oidc", "failed"]).inc();
+                    metrics
+                        .auth_attempts_total
+                        .with_label_values(&["oidc", "failed"])
+                        .inc();
                 }
                 warn!(username = username, "Handshake timed out after 30s");
                 self.emit_auth_event(
@@ -1002,7 +1067,11 @@ impl FlightSqlService for SqeFlightSqlService {
                         message: Some("Authentication timed out".to_string()),
                     },
                     sqe_metrics::audit::Actor::from_parts(
-                        username.to_string(), None, None, vec![], vec![],
+                        username.to_string(),
+                        None,
+                        None,
+                        vec![],
+                        vec![],
                     ),
                     Some(client_ip.clone()),
                     None,
@@ -1029,11 +1098,7 @@ impl FlightSqlService for SqeFlightSqlService {
             Some(client_ip.clone()),
             Some(session.id.clone()),
         );
-        self.emit_session_event(
-            handshake_actor,
-            Some(client_ip),
-            Some(session.id.clone()),
-        );
+        self.emit_session_event(handshake_actor, Some(client_ip), Some(session.id.clone()));
 
         let result = HandshakeResponse {
             protocol_version: 0,
@@ -1130,7 +1195,8 @@ impl FlightSqlService for SqeFlightSqlService {
             .map_err(|e| Status::internal(format!("Invalid statement handle: {e}")))?;
 
         let client_ip = Some(self.extract_client_ip(&request));
-        self.run_sql_into_flight_response(&session, sql_str, client_ip).await
+        self.run_sql_into_flight_response(&session, sql_str, client_ip)
+            .await
     }
 
     /// Handle fallback do_get for tickets that don't match known Flight SQL types.
@@ -1152,7 +1218,9 @@ impl FlightSqlService for SqeFlightSqlService {
             );
 
             let client_ip = Some(self.extract_client_ip(&request));
-            return self.run_sql_into_flight_response(&session, &fetch.handle, client_ip).await;
+            return self
+                .run_sql_into_flight_response(&session, &fetch.handle, client_ip)
+                .await;
         }
 
         Err(Status::unimplemented(format!(
@@ -1204,7 +1272,9 @@ impl FlightSqlService for SqeFlightSqlService {
 
         let mut builder = query.into_builder();
         builder.append(&catalog_name);
-        let batch = builder.build().map_err(|e| Status::internal(format!("Failed to build batch: {e}")))?;
+        let batch = builder
+            .build()
+            .map_err(|e| Status::internal(format!("Failed to build batch: {e}")))?;
         self.batches_to_stream(vec![batch])
     }
 
@@ -1269,7 +1339,9 @@ impl FlightSqlService for SqeFlightSqlService {
         }
 
         let _schema = builder.schema();
-        let batch = builder.build().map_err(|e| Status::internal(format!("Failed to build batch: {e}")))?;
+        let batch = builder
+            .build()
+            .map_err(|e| Status::internal(format!("Failed to build batch: {e}")))?;
         self.batches_to_stream(vec![batch])
     }
 
@@ -1390,7 +1462,9 @@ impl FlightSqlService for SqeFlightSqlService {
                     Ok(schema) => {
                         builder
                             .append(&catalog_name, ns, table_name, "TABLE", &schema)
-                            .map_err(|e| Status::internal(format!("Failed to append table: {e}")))?;
+                            .map_err(|e| {
+                                Status::internal(format!("Failed to append table: {e}"))
+                            })?;
                         continue;
                     }
                     Err(_) => {
@@ -1431,8 +1505,9 @@ impl FlightSqlService for SqeFlightSqlService {
 
         // Decode the SQL from the prepared statement handle
         let fetch: FetchResults =
-            Message::decode(&*cmd.prepared_statement_handle)
-                .map_err(|e| Status::internal(format!("Failed to decode prepared statement handle: {e}")))?;
+            Message::decode(&*cmd.prepared_statement_handle).map_err(|e| {
+                Status::internal(format!("Failed to decode prepared statement handle: {e}"))
+            })?;
 
         let schema = self
             .query_handler
@@ -1500,7 +1575,9 @@ impl FlightSqlService for SqeFlightSqlService {
         request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
         let flight_descriptor = request.into_inner();
-        let ticket = Ticket { ticket: query.as_any().encode_to_vec().into() };
+        let ticket = Ticket {
+            ticket: query.as_any().encode_to_vec().into(),
+        };
         let endpoint = FlightEndpoint::new().with_ticket(ticket);
         let info = FlightInfo::new()
             .with_endpoint(endpoint)
@@ -1514,7 +1591,9 @@ impl FlightSqlService for SqeFlightSqlService {
         request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
         let flight_descriptor = request.into_inner();
-        let ticket = Ticket { ticket: query.as_any().encode_to_vec().into() };
+        let ticket = Ticket {
+            ticket: query.as_any().encode_to_vec().into(),
+        };
         let endpoint = FlightEndpoint::new().with_ticket(ticket);
         let info = FlightInfo::new()
             .with_endpoint(endpoint)
@@ -1528,7 +1607,9 @@ impl FlightSqlService for SqeFlightSqlService {
         request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
         let flight_descriptor = request.into_inner();
-        let ticket = Ticket { ticket: query.as_any().encode_to_vec().into() };
+        let ticket = Ticket {
+            ticket: query.as_any().encode_to_vec().into(),
+        };
         let endpoint = FlightEndpoint::new().with_ticket(ticket);
         let info = FlightInfo::new()
             .with_endpoint(endpoint)
@@ -1542,7 +1623,9 @@ impl FlightSqlService for SqeFlightSqlService {
         request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
         let flight_descriptor = request.into_inner();
-        let ticket = Ticket { ticket: query.as_any().encode_to_vec().into() };
+        let ticket = Ticket {
+            ticket: query.as_any().encode_to_vec().into(),
+        };
         let endpoint = FlightEndpoint::new().with_ticket(ticket);
         let info = FlightInfo::new()
             .with_endpoint(endpoint)
@@ -1573,8 +1656,9 @@ impl FlightSqlService for SqeFlightSqlService {
 
         // Decode the SQL from the prepared statement handle
         let fetch: FetchResults =
-            Message::decode(&*query.prepared_statement_handle)
-                .map_err(|e| Status::internal(format!("Failed to decode prepared statement handle: {e}")))?;
+            Message::decode(&*query.prepared_statement_handle).map_err(|e| {
+                Status::internal(format!("Failed to decode prepared statement handle: {e}"))
+            })?;
 
         // Substitute any bound parameters before execution. Without this
         // the SQL still contains `?` placeholders and DataFusion rejects
@@ -1598,7 +1682,8 @@ impl FlightSqlService for SqeFlightSqlService {
         );
 
         let client_ip = Some(self.extract_client_ip(&request));
-        self.run_sql_into_flight_response(&session, &sql, client_ip).await
+        self.run_sql_into_flight_response(&session, &sql, client_ip)
+            .await
     }
 
     async fn do_get_table_types(
@@ -1615,9 +1700,11 @@ impl FlightSqlService for SqeFlightSqlService {
         let mut builder = arrow_array::builder::StringBuilder::new();
         builder.append_value("TABLE");
         let arr = builder.finish();
-        let schema = Arc::new(arrow_schema::Schema::new(vec![
-            arrow_schema::Field::new("table_type", arrow_schema::DataType::Utf8, false),
-        ]));
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "table_type",
+            arrow_schema::DataType::Utf8,
+            false,
+        )]));
         let batch = RecordBatch::try_new(schema, vec![Arc::new(arr)])
             .map_err(|e| Status::internal(format!("Failed to build table types: {e}")))?;
         self.batches_to_stream(vec![batch])
@@ -1704,10 +1791,10 @@ impl FlightSqlService for SqeFlightSqlService {
         });
 
         for (name, dt, size, radix) in [
-            ("tinyint",  XdbcDataType::XdbcTinyint,  3,  10),
-            ("smallint", XdbcDataType::XdbcSmallint, 5,  10),
-            ("integer",  XdbcDataType::XdbcInteger,  10, 10),
-            ("bigint",   XdbcDataType::XdbcBigint,   19, 10),
+            ("tinyint", XdbcDataType::XdbcTinyint, 3, 10),
+            ("smallint", XdbcDataType::XdbcSmallint, 5, 10),
+            ("integer", XdbcDataType::XdbcInteger, 10, 10),
+            ("bigint", XdbcDataType::XdbcBigint, 19, 10),
         ] {
             builder.append(XdbcTypeInfo {
                 type_name: name.into(),
@@ -1726,7 +1813,7 @@ impl FlightSqlService for SqeFlightSqlService {
         }
 
         for (name, dt, size) in [
-            ("real",   XdbcDataType::XdbcReal,   7),
+            ("real", XdbcDataType::XdbcReal, 7),
             ("double", XdbcDataType::XdbcDouble, 15),
         ] {
             builder.append(XdbcTypeInfo {
@@ -1834,13 +1921,13 @@ impl FlightSqlService for SqeFlightSqlService {
             ..Default::default()
         });
 
-        let xdbc_data = builder.build().map_err(|e| {
-            Status::internal(format!("Failed to build XDBC type info: {e}"))
-        })?;
+        let xdbc_data = builder
+            .build()
+            .map_err(|e| Status::internal(format!("Failed to build XDBC type info: {e}")))?;
 
-        let batch = xdbc_data.record_batch(query.data_type).map_err(|e| {
-            Status::internal(format!("Failed to filter XDBC type info: {e}"))
-        })?;
+        let batch = xdbc_data
+            .record_batch(query.data_type)
+            .map_err(|e| Status::internal(format!("Failed to filter XDBC type info: {e}")))?;
 
         self.batches_to_stream(vec![batch])
     }
@@ -1962,8 +2049,9 @@ impl FlightSqlService for SqeFlightSqlService {
 
         // Decode the SQL from the prepared statement handle
         let fetch: FetchResults =
-            Message::decode(&*query.prepared_statement_handle)
-                .map_err(|e| Status::internal(format!("Failed to decode prepared statement handle: {e}")))?;
+            Message::decode(&*query.prepared_statement_handle).map_err(|e| {
+                Status::internal(format!("Failed to decode prepared statement handle: {e}"))
+            })?;
 
         let batches = self
             .query_handler
@@ -2079,12 +2167,9 @@ impl FlightSqlService for SqeFlightSqlService {
         // ActionCancelQueryRequest.info contains the serialized FlightInfo
         // from get_flight_info_statement. Decode it to extract the query
         // handle from the first endpoint ticket.
-        let flight_info: arrow_flight::FlightInfo =
-            Message::decode(&*query.info).map_err(|e| {
-                Status::invalid_argument(format!(
-                    "CancelQuery: failed to decode FlightInfo: {e}"
-                ))
-            })?;
+        let flight_info: arrow_flight::FlightInfo = Message::decode(&*query.info).map_err(|e| {
+            Status::invalid_argument(format!("CancelQuery: failed to decode FlightInfo: {e}"))
+        })?;
 
         let query_id = flight_info
             .endpoint
@@ -2222,10 +2307,8 @@ impl FlightSqlService for SqeFlightSqlService {
                 let result = arrow_flight::Result {
                     body: bytes::Bytes::from_static(b"ok"),
                 };
-                Ok(Response::new(
-                    Box::pin(stream::once(async { Ok(result) }))
-                        as <Self as FlightService>::DoActionStream,
-                ))
+                Ok(Response::new(Box::pin(stream::once(async { Ok(result) }))
+                    as <Self as FlightService>::DoActionStream))
             }
             other => Err(Status::invalid_argument(format!(
                 "Unknown action type: {other}"
@@ -2287,16 +2370,66 @@ fn arrow_value_to_sql_literal(array: &dyn arrow_array::Array, row: usize) -> Str
             let a = array.as_any().downcast_ref::<BooleanArray>().unwrap();
             if a.value(row) { "TRUE" } else { "FALSE" }.to_string()
         }
-        DataType::Int8 => array.as_any().downcast_ref::<Int8Array>().unwrap().value(row).to_string(),
-        DataType::Int16 => array.as_any().downcast_ref::<Int16Array>().unwrap().value(row).to_string(),
-        DataType::Int32 => array.as_any().downcast_ref::<Int32Array>().unwrap().value(row).to_string(),
-        DataType::Int64 => array.as_any().downcast_ref::<Int64Array>().unwrap().value(row).to_string(),
-        DataType::UInt8 => array.as_any().downcast_ref::<UInt8Array>().unwrap().value(row).to_string(),
-        DataType::UInt16 => array.as_any().downcast_ref::<UInt16Array>().unwrap().value(row).to_string(),
-        DataType::UInt32 => array.as_any().downcast_ref::<UInt32Array>().unwrap().value(row).to_string(),
-        DataType::UInt64 => array.as_any().downcast_ref::<UInt64Array>().unwrap().value(row).to_string(),
-        DataType::Float32 => array.as_any().downcast_ref::<Float32Array>().unwrap().value(row).to_string(),
-        DataType::Float64 => array.as_any().downcast_ref::<Float64Array>().unwrap().value(row).to_string(),
+        DataType::Int8 => array
+            .as_any()
+            .downcast_ref::<Int8Array>()
+            .unwrap()
+            .value(row)
+            .to_string(),
+        DataType::Int16 => array
+            .as_any()
+            .downcast_ref::<Int16Array>()
+            .unwrap()
+            .value(row)
+            .to_string(),
+        DataType::Int32 => array
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .value(row)
+            .to_string(),
+        DataType::Int64 => array
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(row)
+            .to_string(),
+        DataType::UInt8 => array
+            .as_any()
+            .downcast_ref::<UInt8Array>()
+            .unwrap()
+            .value(row)
+            .to_string(),
+        DataType::UInt16 => array
+            .as_any()
+            .downcast_ref::<UInt16Array>()
+            .unwrap()
+            .value(row)
+            .to_string(),
+        DataType::UInt32 => array
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .unwrap()
+            .value(row)
+            .to_string(),
+        DataType::UInt64 => array
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap()
+            .value(row)
+            .to_string(),
+        DataType::Float32 => array
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap()
+            .value(row)
+            .to_string(),
+        DataType::Float64 => array
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap()
+            .value(row)
+            .to_string(),
         DataType::Utf8 => {
             let a = array.as_any().downcast_ref::<StringArray>().unwrap();
             sql_quote_string(a.value(row))
@@ -2409,8 +2542,8 @@ mod tests {
             DataType::Utf8,
             false,
         )]));
-        let batch =
-            RecordBatch::try_new(schema.clone(), vec![Arc::new(arr)]).expect("batch should be valid");
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(arr)])
+            .expect("batch should be valid");
 
         let batch_schema = batch.schema();
         let field = batch_schema.field(0);
@@ -2682,7 +2815,9 @@ mod tests {
         use arrow_flight::sql::CommandGetSqlInfo;
         let query = CommandGetSqlInfo { info: vec![] };
         let info_builder = query.into_builder(&sql_info_data);
-        let batch = info_builder.build().expect("info_builder.build() should succeed");
+        let batch = info_builder
+            .build()
+            .expect("info_builder.build() should succeed");
 
         // We appended 3 entries; the batch must contain at least those rows.
         assert!(
@@ -2739,25 +2874,15 @@ mod tests {
     fn build_flight_info_distributed_with_multiple_workers() {
         let schema = test_schema();
         let endpoints = vec![
-            (
-                "grpc://worker-1:50051".to_string(),
-                test_ticket("part-0"),
-            ),
-            (
-                "grpc://worker-2:50051".to_string(),
-                test_ticket("part-1"),
-            ),
-            (
-                "grpc://worker-3:50051".to_string(),
-                test_ticket("part-2"),
-            ),
+            ("grpc://worker-1:50051".to_string(), test_ticket("part-0")),
+            ("grpc://worker-2:50051".to_string(), test_ticket("part-1")),
+            ("grpc://worker-3:50051".to_string(), test_ticket("part-2")),
         ];
         let fallback = test_ticket("fallback");
 
-        let info = SqeFlightSqlService::build_flight_info_distributed(
-            &schema, &endpoints, fallback,
-        )
-        .expect("build_flight_info_distributed should succeed");
+        let info =
+            SqeFlightSqlService::build_flight_info_distributed(&schema, &endpoints, fallback)
+                .expect("build_flight_info_distributed should succeed");
 
         assert_eq!(
             info.endpoint.len(),
@@ -2793,12 +2918,9 @@ mod tests {
         let empty: Vec<(String, Ticket)> = vec![];
         let fallback = test_ticket("SELECT 1");
 
-        let info = SqeFlightSqlService::build_flight_info_distributed(
-            &schema,
-            &empty,
-            fallback.clone(),
-        )
-        .expect("empty executor list should fall back to single endpoint");
+        let info =
+            SqeFlightSqlService::build_flight_info_distributed(&schema, &empty, fallback.clone())
+                .expect("empty executor list should fall back to single endpoint");
 
         assert_eq!(
             info.endpoint.len(),
@@ -2820,42 +2942,28 @@ mod tests {
     #[test]
     fn build_flight_info_distributed_single_worker() {
         let schema = test_schema();
-        let endpoints = vec![(
-            "grpc://worker-1:50051".to_string(),
-            test_ticket("part-0"),
-        )];
+        let endpoints = vec![("grpc://worker-1:50051".to_string(), test_ticket("part-0"))];
         let fallback = test_ticket("fallback");
 
-        let info = SqeFlightSqlService::build_flight_info_distributed(
-            &schema, &endpoints, fallback,
-        )
-        .expect("single-worker distributed should succeed");
+        let info =
+            SqeFlightSqlService::build_flight_info_distributed(&schema, &endpoints, fallback)
+                .expect("single-worker distributed should succeed");
 
         assert_eq!(info.endpoint.len(), 1);
         let ep = &info.endpoint[0];
-        assert_eq!(
-            ep.location[0].uri,
-            "grpc://worker-1:50051"
-        );
-        assert_eq!(
-            ep.ticket.as_ref().unwrap().ticket.as_ref(),
-            b"part-0"
-        );
+        assert_eq!(ep.location[0].uri, "grpc://worker-1:50051");
+        assert_eq!(ep.ticket.as_ref().unwrap().ticket.as_ref(), b"part-0");
     }
 
     #[test]
     fn build_flight_info_distributed_carries_schema_bytes() {
         let schema = test_schema();
-        let endpoints = vec![(
-            "grpc://worker-1:50051".to_string(),
-            test_ticket("part-0"),
-        )];
+        let endpoints = vec![("grpc://worker-1:50051".to_string(), test_ticket("part-0"))];
         let fallback = test_ticket("fallback");
 
-        let info = SqeFlightSqlService::build_flight_info_distributed(
-            &schema, &endpoints, fallback,
-        )
-        .expect("should succeed");
+        let info =
+            SqeFlightSqlService::build_flight_info_distributed(&schema, &endpoints, fallback)
+                .expect("should succeed");
 
         // The FlightInfo must carry encoded schema bytes so the client can
         // decode the result schema before opening DoGet streams.
@@ -2911,7 +3019,9 @@ mod tests {
             "padded base64 (Rust clients) must decode"
         );
         assert_eq!(
-            BASIC_AUTH_B64.decode(unpadded).expect("unpadded must decode"),
+            BASIC_AUTH_B64
+                .decode(unpadded)
+                .expect("unpadded must decode"),
             creds,
             "unpadded base64 (ADBC/Go clients) must decode -- the bug"
         );

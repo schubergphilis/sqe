@@ -184,10 +184,13 @@ mod tests {
     }
 
     fn batch(ids: &[i32], regions: &[&str]) -> RecordBatch {
-        RecordBatch::try_new(schema(), vec![
-            Arc::new(Int32Array::from(ids.to_vec())),
-            Arc::new(StringArray::from(regions.to_vec())),
-        ])
+        RecordBatch::try_new(
+            schema(),
+            vec![
+                Arc::new(Int32Array::from(ids.to_vec())),
+                Arc::new(StringArray::from(regions.to_vec())),
+            ],
+        )
         .unwrap()
     }
 
@@ -250,11 +253,7 @@ mod tests {
             // Every yielded batch carries the declared schema.
             assert_eq!(b.schema().fields().len(), 2);
             rows += b.num_rows();
-            let col = b
-                .column(0)
-                .as_any()
-                .downcast_ref::<Int32Array>()
-                .unwrap();
+            let col = b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
             for i in 0..col.len() {
                 ids.push(col.value(i));
             }

@@ -226,9 +226,7 @@ impl AuthProvider for ApiKeyProvider {
             });
         }
 
-        Err(AuthError::AuthFailed(
-            "invalid API key".to_string(),
-        ))
+        Err(AuthError::AuthFailed("invalid API key".to_string()))
     }
 
     // refresh_catalog_token: returns Ok(None) — API keys have no catalog token.
@@ -255,9 +253,7 @@ async fn load_keys_from_file_async(path: &Path) -> Result<Vec<ApiKeyEntry>, anyh
 
 /// Get file modification time as an opaque comparable value.
 fn file_mtime(path: &Path) -> Option<std::time::SystemTime> {
-    std::fs::metadata(path)
-        .ok()
-        .and_then(|m| m.modified().ok())
+    std::fs::metadata(path).ok().and_then(|m| m.modified().ok())
 }
 
 fn sha256_digest(bytes: &[u8]) -> [u8; 32] {
@@ -272,10 +268,7 @@ mod tests {
 
     fn test_config() -> ApiKeyProviderConfig {
         let mut role_mappings = HashMap::new();
-        role_mappings.insert(
-            "readers".to_string(),
-            vec!["read-only".to_string()],
-        );
+        role_mappings.insert("readers".to_string(), vec!["read-only".to_string()]);
         role_mappings.insert(
             "admins".to_string(),
             vec!["admin".to_string(), "read-only".to_string()],
@@ -385,7 +378,9 @@ mod tests {
     async fn jwt_password_returns_not_my_credentials() {
         let provider = ApiKeyProvider::with_keys(test_config(), test_keys());
         let creds = FlightCredentials {
-            password: Some(sqe_core::SecretString::new("eyJhbGciOiJSUzI1NiJ9.payload.sig".to_string())),
+            password: Some(sqe_core::SecretString::new(
+                "eyJhbGciOiJSUzI1NiJ9.payload.sig".to_string(),
+            )),
             ..Default::default()
         };
 
@@ -454,7 +449,11 @@ mod tests {
             expires_at: None,
         };
 
-        assert!(provider.refresh_catalog_token(&identity).await.unwrap().is_none());
+        assert!(provider
+            .refresh_catalog_token(&identity)
+            .await
+            .unwrap()
+            .is_none());
     }
 
     // -----------------------------------------------------------------------
@@ -568,7 +567,9 @@ user = "new-user"
         let provider = ApiKeyProvider::with_keys(test_config(), keys);
 
         let creds = FlightCredentials {
-            password: Some(sqe_core::SecretString::new("sqe_short_but_longer".to_string())),
+            password: Some(sqe_core::SecretString::new(
+                "sqe_short_but_longer".to_string(),
+            )),
             ..Default::default()
         };
         match provider.authenticate(&creds).await {

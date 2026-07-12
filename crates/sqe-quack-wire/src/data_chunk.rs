@@ -202,7 +202,9 @@ pub enum ExtraTypeInfo {
     /// (see [`enum_physical_width`]). DuckDB writes this as a hand-rolled
     /// `EnumTypeInfo` rather than via the auto-generated serializer:
     /// field 200 (values_count, u64) + field 201 (list of strings).
-    Enum { values: Vec<String> },
+    Enum {
+        values: Vec<String>,
+    },
 }
 
 impl ExtraTypeInfo {
@@ -346,8 +348,16 @@ impl ExtraTypeInfo {
         }
         match kind {
             ExtraTypeInfoType::Decimal => {
-                let precision = if d.read_optional(200)? { d.read_u8()? } else { 0 };
-                let scale = if d.read_optional(201)? { d.read_u8()? } else { 0 };
+                let precision = if d.read_optional(200)? {
+                    d.read_u8()?
+                } else {
+                    0
+                };
+                let scale = if d.read_optional(201)? {
+                    d.read_u8()?
+                } else {
+                    0
+                };
                 Ok(ExtraTypeInfo::Decimal { precision, scale })
             }
             ExtraTypeInfoType::List => {
@@ -383,7 +393,11 @@ impl ExtraTypeInfo {
                 d.expect_field(200)?;
                 let child = LogicalType::decode_with_depth(d, child_depth)?;
                 d.expect_object_end()?;
-                let size = if d.read_optional(201)? { d.read_u32()? } else { 0 };
+                let size = if d.read_optional(201)? {
+                    d.read_u32()?
+                } else {
+                    0
+                };
                 Ok(ExtraTypeInfo::Array {
                     child: Box::new(child),
                     size,
@@ -559,10 +573,7 @@ pub enum VectorData {
     /// ARRAY<T, N>. Fixed-size flattened child vector — child row count is
     /// `array_size * parent_row_count`. Distinct from `List` because the
     /// wire layout omits per-row entries (sizes are constant).
-    Array {
-        array_size: u64,
-        child: Box<Vector>,
-    },
+    Array { array_size: u64, child: Box<Vector> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -779,9 +790,7 @@ impl Vector {
                 d.expect_field(106)?;
                 let child_logical = match &logical_type.extra {
                     Some(ExtraTypeInfo::List { child }) => (**child).clone(),
-                    _ => {
-                        return Err(crate::WireError::UnsupportedLogicalType(logical_type.id))
-                    }
+                    _ => return Err(crate::WireError::UnsupportedLogicalType(logical_type.id)),
                 };
                 let child_vec =
                     Vector::decode_with_depth(child_logical, child_count as usize, d, child_depth)?;
@@ -859,12 +868,13 @@ impl Vector {
                 let width = logical_type
                     .physical_width()
                     .expect("physical_width is Some on this match arm");
-                let needed = count.checked_mul(width).ok_or(
-                    crate::WireError::CountExceedsRemaining {
-                        count: count as u64,
-                        remaining: bytes.len() as u64,
-                    },
-                )?;
+                let needed =
+                    count
+                        .checked_mul(width)
+                        .ok_or(crate::WireError::CountExceedsRemaining {
+                            count: count as u64,
+                            remaining: bytes.len() as u64,
+                        })?;
                 if bytes.len() < needed {
                     return Err(crate::WireError::CountExceedsRemaining {
                         count: needed as u64,
@@ -1122,8 +1132,7 @@ mod tests {
             // field 101 (validity mask) — 8 bytes, bit 0 = 0 (invalid)
             0x65, 0x00, 0x08, 0xfe, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
             // field 102 (data list) — count=1, then a single 1-byte "string" = 0x80
-            0x66, 0x00, 0x01, 0x01, 0x80,
-            // object terminator
+            0x66, 0x00, 0x01, 0x01, 0x80, // object terminator
             0xff, 0xff,
         ]
         .to_vec();
@@ -1398,7 +1407,10 @@ mod tests {
                 ExtraTypeInfo::Struct {
                     fields: vec![
                         ("name".to_string(), LogicalType::new(LogicalTypeId::Varchar)),
-                        ("score".to_string(), LogicalType::new(LogicalTypeId::Integer)),
+                        (
+                            "score".to_string(),
+                            LogicalType::new(LogicalTypeId::Integer),
+                        ),
                     ],
                 },
             )),
@@ -1455,7 +1467,8 @@ mod tests {
         // STRUCT(id INTEGER, name VARCHAR), 2 rows.
         let int_bytes: Vec<u8> = [1i32, 2].iter().flat_map(|v| v.to_le_bytes()).collect();
         let id_col = Vector::new_fixed(LogicalTypeId::Integer, int_bytes);
-        let name_col = Vector::new_strings(vec![Some("alice".to_string()), Some("bob".to_string())]);
+        let name_col =
+            Vector::new_strings(vec![Some("alice".to_string()), Some("bob".to_string())]);
         let v = Vector {
             logical_type: LogicalType::with_extra(
                 LogicalTypeId::Struct,
@@ -1555,7 +1568,10 @@ mod tests {
         // indicate field 201 was emitted; absence is the easier check.
         // We look for the pattern 0xC9, 0x00 (field 201 LE).
         let leaked_field_201 = bytes.windows(2).any(|w| w == [0xC9, 0x00]);
-        assert!(!leaked_field_201, "field 201 must not be emitted when size=0");
+        assert!(
+            !leaked_field_201,
+            "field 201 must not be emitted when size=0"
+        );
     }
 
     #[test]
@@ -1690,7 +1706,10 @@ mod tests {
         // 3 rows: row 0 picks member "a" (tag=0), row 1 picks "b" (tag=1),
         // row 2 picks "a" (tag=0).
         let tag_col = Vector::new_fixed(LogicalTypeId::UTinyInt, vec![0u8, 1, 0]);
-        let a_bytes: Vec<u8> = [10i32, 0, 30].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let a_bytes: Vec<u8> = [10i32, 0, 30]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
         let a_col = Vector {
             logical_type: LogicalType::new(LogicalTypeId::Integer),
             validity: Some(vec![true, false, true]),
@@ -1741,7 +1760,10 @@ mod tests {
             ExtraTypeInfo::Struct {
                 fields: vec![
                     ("key".to_string(), LogicalType::new(LogicalTypeId::Varchar)),
-                    ("value".to_string(), LogicalType::new(LogicalTypeId::Integer)),
+                    (
+                        "value".to_string(),
+                        LogicalType::new(LogicalTypeId::Integer),
+                    ),
                 ],
             },
         );
@@ -1791,9 +1813,7 @@ mod tests {
         for _ in 0..depth {
             t = LogicalType::with_extra(
                 LogicalTypeId::List,
-                ExtraTypeInfo::List {
-                    child: Box::new(t),
-                },
+                ExtraTypeInfo::List { child: Box::new(t) },
             );
         }
         t
@@ -1812,7 +1832,10 @@ mod tests {
 
         let mut d = BinaryDeserializer::new(&bytes);
         let err = LogicalType::decode(&mut d).unwrap_err();
-        assert!(matches!(err, crate::WireError::RecursionLimitExceeded { .. }));
+        assert!(matches!(
+            err,
+            crate::WireError::RecursionLimitExceeded { .. }
+        ));
     }
 
     #[test]
@@ -1841,7 +1864,7 @@ mod tests {
         crate::varint::encode_unsigned(0, &mut bytes); // row_count = 0
         bytes.extend_from_slice(&101u16.to_le_bytes()); // field 101 (types list)
         crate::varint::encode_unsigned(1_000_000_000, &mut bytes); // bogus count
-        // no payload follows.
+                                                                   // no payload follows.
 
         let mut d = BinaryDeserializer::new(&bytes);
         let err = DataChunk::decode(&mut d).unwrap_err();
@@ -1886,8 +1909,7 @@ mod tests {
         bytes.extend_from_slice(&raw);
 
         let mut d = BinaryDeserializer::new(&bytes);
-        let decoded =
-            Vector::decode(LogicalType::new(LogicalTypeId::Integer), 3, &mut d).unwrap();
+        let decoded = Vector::decode(LogicalType::new(LogicalTypeId::Integer), 3, &mut d).unwrap();
         assert_eq!(decoded.data, VectorData::Fixed(raw));
     }
 
@@ -1902,7 +1924,7 @@ mod tests {
         crate::varint::encode_unsigned(5_000_000_000, &mut bytes); // huge count
         bytes.extend_from_slice(&201u16.to_le_bytes()); // field 201 values list
         crate::varint::encode_unsigned(5_000_000_000, &mut bytes); // listed count
-        // no string payload follows.
+                                                                   // no string payload follows.
 
         let mut d = BinaryDeserializer::new(&bytes);
         let err = ExtraTypeInfo::decode_inner(&mut d).unwrap_err();

@@ -234,9 +234,7 @@ fn parse_branch_retention(input: &str) -> Result<BranchRetention> {
             }
             "max_ref_age_ms" => {
                 out.max_ref_age_ms = Some(v.parse().map_err(|_| {
-                    SqeError::Execution(format!(
-                        "max_ref_age_ms requires an integer, got '{v}'"
-                    ))
+                    SqeError::Execution(format!("max_ref_age_ms requires an integer, got '{v}'"))
                 })?);
             }
             other => {
@@ -256,9 +254,7 @@ fn parse_tag_retention(input: &str) -> Result<Option<i64>> {
         match k.to_lowercase().as_str() {
             "max_ref_age_ms" => {
                 out = Some(v.parse().map_err(|_| {
-                    SqeError::Execution(format!(
-                        "max_ref_age_ms requires an integer, got '{v}'"
-                    ))
+                    SqeError::Execution(format!("max_ref_age_ms requires an integer, got '{v}'"))
                 })?);
             }
             other => {
@@ -301,7 +297,11 @@ fn parse_retention_args(input: &str) -> Result<Vec<(String, String)>> {
             .to_string();
         let v = it
             .next()
-            .ok_or_else(|| SqeError::Execution(format!("retention option '{k}' missing value (use 'k => v')")))?
+            .ok_or_else(|| {
+                SqeError::Execution(format!(
+                    "retention option '{k}' missing value (use 'k => v')"
+                ))
+            })?
             .trim()
             .trim_matches('\'')
             .trim_matches('"')
@@ -322,9 +322,7 @@ fn parse_retention_args(input: &str) -> Result<Vec<(String, String)>> {
 fn split_identifier(input: &str) -> Result<(String, &str)> {
     let trimmed = input.trim_start();
     if trimmed.is_empty() {
-        return Err(SqeError::Execution(
-            "expected an identifier".to_string(),
-        ));
+        return Err(SqeError::Execution("expected an identifier".to_string()));
     }
     let bytes = trimmed.as_bytes();
     if bytes[0] == b'"' {
@@ -414,7 +412,9 @@ mod tests {
 
     #[test]
     fn create_tag_simple() {
-        let ddl = try_parse_ref_ddl("ALTER TABLE t CREATE TAG v1").unwrap().unwrap();
+        let ddl = try_parse_ref_ddl("ALTER TABLE t CREATE TAG v1")
+            .unwrap()
+            .unwrap();
         assert_eq!(
             ddl,
             RefDdl::CreateTag {
@@ -476,7 +476,9 @@ mod tests {
             .unwrap()
             .unwrap();
         match ddl {
-            RefDdl::DropBranch { name, if_exists, .. } => {
+            RefDdl::DropBranch {
+                name, if_exists, ..
+            } => {
                 assert_eq!(name, "stale");
                 assert!(if_exists);
             }
@@ -501,7 +503,9 @@ mod tests {
             .unwrap()
             .unwrap();
         match ddl {
-            RefDdl::DropTag { name, if_exists, .. } => {
+            RefDdl::DropTag {
+                name, if_exists, ..
+            } => {
                 assert_eq!(name, "v1");
                 assert!(if_exists);
             }

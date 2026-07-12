@@ -85,11 +85,7 @@ fn random_name(rng: &mut StdRng) -> String {
 
 fn random_email(rng: &mut StdRng, id: i64) -> String {
     let domain = ["example.com", "mail.net", "broker.org", "finance.io"];
-    format!(
-        "user{}@{}",
-        id,
-        domain[rng.gen_range(0..domain.len())]
-    )
+    format!("user{}@{}", id, domain[rng.gen_range(0..domain.len())])
 }
 
 fn random_phone(rng: &mut StdRng) -> String {
@@ -499,10 +495,38 @@ const TRADE_TYPES: &[(&str, &str, i32, i32)] = &[
 ];
 
 const EXCHANGES: &[(&str, &str, i32, i32, i32, &str)] = &[
-    ("NYSE", "New York Stock Exchange", 1366, 930, 1600, "Primary US equity market"),
-    ("NASDAQ", "NASDAQ Stock Market", 3286, 930, 1600, "Electronic equity market"),
-    ("AMEX", "American Stock Exchange", 712, 930, 1600, "Equities and ETFs"),
-    ("NYSE_MKT", "NYSE MKT LLC", 480, 930, 1600, "Small and mid cap equities"),
+    (
+        "NYSE",
+        "New York Stock Exchange",
+        1366,
+        930,
+        1600,
+        "Primary US equity market",
+    ),
+    (
+        "NASDAQ",
+        "NASDAQ Stock Market",
+        3286,
+        930,
+        1600,
+        "Electronic equity market",
+    ),
+    (
+        "AMEX",
+        "American Stock Exchange",
+        712,
+        930,
+        1600,
+        "Equities and ETFs",
+    ),
+    (
+        "NYSE_MKT",
+        "NYSE MKT LLC",
+        480,
+        930,
+        1600,
+        "Small and mid cap equities",
+    ),
 ];
 
 const SECTORS: &[(&str, &str)] = &[
@@ -520,7 +544,9 @@ const SECTORS: &[(&str, &str)] = &[
     ("SC0012", "Transportation"),
 ];
 
-const SP_RATES: &[&str] = &["AAA", "AA+", "AA", "AA-", "A+", "A", "A-", "BBB+", "BBB", "BB"];
+const SP_RATES: &[&str] = &[
+    "AAA", "AA+", "AA", "AA-", "A+", "A", "A-", "BBB+", "BBB", "BB",
+];
 
 const CASH_TYPES: &[&str] = &["Cash", "Margin"];
 
@@ -528,7 +554,9 @@ const GENDERS: &[&str] = &["M", "F", "U"];
 
 const COUNTRIES: &[&str] = &["US", "CA", "GB", "DE", "FR", "JP", "AU", "CH", "NL", "SE"];
 
-const AREA_CODES: &[&str] = &["212", "415", "312", "713", "617", "305", "404", "206", "303", "702"];
+const AREA_CODES: &[&str] = &[
+    "212", "415", "312", "713", "617", "305", "404", "206", "303", "702",
+];
 
 // Generate a stock symbol from an index
 fn symb_for_idx(idx: usize) -> String {
@@ -828,7 +856,11 @@ fn generate_address(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
         for i in 0..n {
             let id = (offset + i + 1) as i64;
             ad_id.push(id);
-            ad_line1.push(format!("{} {}", rng.gen_range(1..9999u32), random_name(&mut rng)));
+            ad_line1.push(format!(
+                "{} {}",
+                rng.gen_range(1..9999u32),
+                random_name(&mut rng)
+            ));
             ad_line2.push(format!("Apt {}", rng.gen_range(1..500u32)));
             ad_zc_code.push(format!("{:05}", rng.gen_range(0..14741u32)));
             ad_ctry.push(COUNTRIES[rng.gen_range(0..COUNTRIES.len())].to_string());
@@ -891,7 +923,11 @@ fn generate_customer(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
             let id = (offset + i + 1) as i64;
             c_id.push(id);
             c_tax_id.push(tax_id_for(id));
-            c_st_id.push(STATUS_TYPES[rng.gen_range(0..STATUS_TYPES.len())].0.to_string());
+            c_st_id.push(
+                STATUS_TYPES[rng.gen_range(0..STATUS_TYPES.len())]
+                    .0
+                    .to_string(),
+            );
             c_l_name.push(random_name(&mut rng));
             c_f_name.push(random_name(&mut rng));
             c_m_name.push(random_word(&mut rng, 1).to_uppercase());
@@ -1111,8 +1147,16 @@ fn generate_broker(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
         for i in 0..n {
             let id = (offset + i + 1) as i64;
             b_id.push(id);
-            b_st_id.push(STATUS_TYPES[rng.gen_range(0..STATUS_TYPES.len())].0.to_string());
-            b_name.push(format!("Broker {} {}", random_name(&mut rng), random_name(&mut rng)));
+            b_st_id.push(
+                STATUS_TYPES[rng.gen_range(0..STATUS_TYPES.len())]
+                    .0
+                    .to_string(),
+            );
+            b_name.push(format!(
+                "Broker {} {}",
+                random_name(&mut rng),
+                random_name(&mut rng)
+            ));
             b_num_trades.push(rng.gen_range(0..100_000i32));
             b_comm_total.push((rng.gen_range(0..10_000_000_i64) as f64) / 100.0);
         }
@@ -1163,7 +1207,11 @@ fn generate_company(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
         for i in 0..n {
             let id = (offset + i + 1) as i64;
             co_id.push(id);
-            co_st_id.push(STATUS_TYPES[rng.gen_range(0..STATUS_TYPES.len())].0.to_string());
+            co_st_id.push(
+                STATUS_TYPES[rng.gen_range(0..STATUS_TYPES.len())]
+                    .0
+                    .to_string(),
+            );
             co_name.push(format!(
                 "{} {} Corp",
                 random_name(&mut rng),
@@ -1171,7 +1219,11 @@ fn generate_company(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
             ));
             co_in_id.push(format!("IN{:04}", rng.gen_range(0..102u32)));
             co_sp_rate.push(SP_RATES[rng.gen_range(0..SP_RATES.len())].to_string());
-            co_ceo.push(format!("{} {}", random_name(&mut rng), random_name(&mut rng)));
+            co_ceo.push(format!(
+                "{} {}",
+                random_name(&mut rng),
+                random_name(&mut rng)
+            ));
             co_ad_id.push(rng.gen_range(1..=num_addr));
             co_desc.push(random_text(&mut rng, 5, 15));
             co_open_date.push(random_date(&mut rng));
@@ -1279,11 +1331,23 @@ fn generate_security(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
         for i in 0..n {
             let idx = offset + i;
             let symb = symb_for_idx(idx);
-            let high = (rng.gen_range(50..500u32) as f64) + (rng.gen_range(0..100u32) as f64) / 100.0;
+            let high =
+                (rng.gen_range(50..500u32) as f64) + (rng.gen_range(0..100u32) as f64) / 100.0;
             let low = high * (0.5 + rng.gen_range(0..50u32) as f64 / 100.0);
             s_symb.push(symb);
-            s_issue.push(if rng.gen_bool(0.8) { "COMMON" } else { "PREFERRED" }.to_string());
-            s_st_id.push(STATUS_TYPES[rng.gen_range(0..STATUS_TYPES.len())].0.to_string());
+            s_issue.push(
+                if rng.gen_bool(0.8) {
+                    "COMMON"
+                } else {
+                    "PREFERRED"
+                }
+                .to_string(),
+            );
+            s_st_id.push(
+                STATUS_TYPES[rng.gen_range(0..STATUS_TYPES.len())]
+                    .0
+                    .to_string(),
+            );
             s_name.push(format!("{} Inc", random_name(&mut rng)));
             s_ex_id.push(EXCHANGES[rng.gen_range(0..EXCHANGES.len())].0.to_string());
             s_co_id.push(rng.gen_range(1..=num_co));
@@ -1355,7 +1419,8 @@ fn generate_daily_market(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
         let mut dm_vol = Vec::with_capacity(n);
 
         for _ in 0..n {
-            let close = (rng.gen_range(10..500u32) as f64) + (rng.gen_range(0..100u32) as f64) / 100.0;
+            let close =
+                (rng.gen_range(10..500u32) as f64) + (rng.gen_range(0..100u32) as f64) / 100.0;
             let high = close * (1.0 + rng.gen_range(0..10u32) as f64 / 100.0);
             let low = close * (1.0 - rng.gen_range(0..10u32) as f64 / 100.0);
             dm_date.push(random_date(&mut rng));
@@ -1481,7 +1546,8 @@ fn generate_last_trade(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
 
         for i in 0..n {
             let idx = offset + i;
-            let price = (rng.gen_range(10..500u32) as f64) + (rng.gen_range(0..100u32) as f64) / 100.0;
+            let price =
+                (rng.gen_range(10..500u32) as f64) + (rng.gen_range(0..100u32) as f64) / 100.0;
             lt_s_symb.push(symb_for_idx(idx));
             lt_dts.push(random_date(&mut rng));
             lt_price.push(price);
@@ -1537,7 +1603,11 @@ fn generate_news_item(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
             ni_item.push(random_text(&mut rng, 50, 100));
             ni_dts.push(random_date(&mut rng));
             ni_source.push(format!("Source{}", rng.gen_range(1..=20u32)));
-            ni_author.push(format!("{} {}", random_name(&mut rng), random_name(&mut rng)));
+            ni_author.push(format!(
+                "{} {}",
+                random_name(&mut rng),
+                random_name(&mut rng)
+            ));
         }
 
         let hl_refs: Vec<&str> = ni_headline.iter().map(|s| s.as_str()).collect();
@@ -1639,14 +1709,22 @@ fn generate_trade(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
             let price = (rng.gen_range(100..50000u32) as f64) / 100.0;
             t_id.push(id);
             t_dts.push(random_date(&mut rng));
-            t_st_id.push(STATUS_TYPES[rng.gen_range(0..STATUS_TYPES.len())].0.to_string());
+            t_st_id.push(
+                STATUS_TYPES[rng.gen_range(0..STATUS_TYPES.len())]
+                    .0
+                    .to_string(),
+            );
             t_tt_id.push(TRADE_TYPES[tt_idx].0.to_string());
             t_is_cash.push(rng.gen_range(0..=1i32));
             t_s_symb.push(symb_for_idx(rng.gen_range(0..num_symb)));
             t_qty.push(rng.gen_range(1..10000i32));
             t_bid_price.push(price);
             t_ca_id.push(rng.gen_range(1..=num_accounts));
-            t_exec_name.push(format!("{} {}", random_name(&mut rng), random_name(&mut rng)));
+            t_exec_name.push(format!(
+                "{} {}",
+                random_name(&mut rng),
+                random_name(&mut rng)
+            ));
             t_trade_price.push(price * (0.99 + rng.gen_range(0..3u32) as f64 / 100.0));
             t_chrg.push((rng.gen_range(0..2000u32) as f64) / 100.0);
             t_comm.push((rng.gen_range(0..1000u32) as f64) / 100.0);
@@ -1707,7 +1785,11 @@ fn generate_trade_history(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
         for _ in 0..n {
             th_t_id.push(rng.gen_range(1..=num_trades));
             th_dts.push(random_date(&mut rng));
-            th_st_id.push(STATUS_TYPES[rng.gen_range(0..STATUS_TYPES.len())].0.to_string());
+            th_st_id.push(
+                STATUS_TYPES[rng.gen_range(0..STATUS_TYPES.len())]
+                    .0
+                    .to_string(),
+            );
         }
 
         let st_refs: Vec<&str> = th_st_id.iter().map(|s| s.as_str()).collect();
@@ -1752,7 +1834,11 @@ fn generate_trade_request(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
 
         for _ in 0..n {
             tr_t_id.push(rng.gen_range(1..=num_trades));
-            tr_tt_id.push(TRADE_TYPES[rng.gen_range(0..TRADE_TYPES.len())].0.to_string());
+            tr_tt_id.push(
+                TRADE_TYPES[rng.gen_range(0..TRADE_TYPES.len())]
+                    .0
+                    .to_string(),
+            );
             tr_s_symb.push(symb_for_idx(rng.gen_range(0..num_symb)));
             tr_qty.push(rng.gen_range(1..10000i32));
             tr_bid_price.push((rng.gen_range(100..50000u32) as f64) / 100.0);
@@ -2508,7 +2594,10 @@ mod tests {
         for i in [0, 1, 25, 26, 100, 1000, 456975] {
             let s = symb_for_idx(i);
             assert_eq!(s.len(), 4, "symbol {s} for idx {i} is not 4 chars");
-            assert!(s.chars().all(|c| c.is_ascii_uppercase()), "non-uppercase: {s}");
+            assert!(
+                s.chars().all(|c| c.is_ascii_uppercase()),
+                "non-uppercase: {s}"
+            );
         }
     }
 

@@ -66,13 +66,15 @@ impl SortMode {
             "partition_only" | "partition-only" => Self::PartitionOnly,
             "adaptive" => Self::Adaptive,
             _ => {
-                tracing::warn!(sort_mode = s, "Unknown sort_mode, defaulting to partition_only");
+                tracing::warn!(
+                    sort_mode = s,
+                    "Unknown sort_mode, defaulting to partition_only"
+                );
                 Self::PartitionOnly
             }
         }
     }
 }
-
 
 /// Controls passive per-query profiling: after a streaming query finishes
 /// (or fails), the coordinator renders the executed physical plan with the
@@ -98,7 +100,10 @@ impl ProfileMode {
             "slow" => Self::Slow,
             "all" => Self::All,
             _ => {
-                tracing::warn!(query_profile = s, "Unknown query_profile, defaulting to off");
+                tracing::warn!(
+                    query_profile = s,
+                    "Unknown query_profile, defaulting to off"
+                );
                 Self::Off
             }
         }
@@ -422,10 +427,18 @@ impl Default for QueryCacheConfig {
     }
 }
 
-fn default_cache_enabled() -> bool { true }
-fn default_cache_max_memory_mb() -> u64 { 256 }
-fn default_cache_max_entry_mb() -> u64 { 5 }
-fn default_cache_ttl_secs() -> u64 { 300 }
+fn default_cache_enabled() -> bool {
+    true
+}
+fn default_cache_max_memory_mb() -> u64 {
+    256
+}
+fn default_cache_max_entry_mb() -> u64 {
+    5
+}
+fn default_cache_ttl_secs() -> u64 {
+    300
+}
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct QueryHistoryConfig {
@@ -444,8 +457,12 @@ impl Default for QueryHistoryConfig {
     }
 }
 
-fn default_history_max_entries() -> u64 { 10000 }
-fn default_history_ttl_secs() -> u64 { 1800 }
+fn default_history_max_entries() -> u64 {
+    10000
+}
+fn default_history_ttl_secs() -> u64 {
+    1800
+}
 
 #[derive(Deserialize, Clone)]
 pub struct CoordinatorConfig {
@@ -670,10 +687,19 @@ impl std::fmt::Debug for CoordinatorConfig {
             .field("shuffle_compression", &self.shuffle_compression)
             .field("max_workers", &self.max_workers)
             .field("transport", &self.transport)
-            .field("worker_connect_timeout_secs", &self.worker_connect_timeout_secs)
+            .field(
+                "worker_connect_timeout_secs",
+                &self.worker_connect_timeout_secs,
+            )
             .field("worker_rpc_timeout_secs", &self.worker_rpc_timeout_secs)
-            .field("auth_handshake_timeout_secs", &self.auth_handshake_timeout_secs)
-            .field("health_check_interval_secs", &self.health_check_interval_secs)
+            .field(
+                "auth_handshake_timeout_secs",
+                &self.auth_handshake_timeout_secs,
+            )
+            .field(
+                "health_check_interval_secs",
+                &self.health_check_interval_secs,
+            )
             .field("health_check_max_failures", &self.health_check_max_failures)
             .field(
                 "credential_refresh_interval_secs",
@@ -1259,9 +1285,21 @@ impl std::fmt::Debug for AuthConfig {
             .field("token_endpoint", &self.token_endpoint)
             .field("token_refresh_buffer_secs", &self.token_refresh_buffer_secs)
             .field("ssl_verification", &self.ssl_verification)
-            .field("providers", &format!("[{} provider(s)]", self.providers.len()))
-            .field("role_mappings", &format!("[{} mapping(s)]", self.role_mappings.len()))
-            .field("external", &self.external.as_ref().map(|e| format!("issuer={}", e.issuer)))
+            .field(
+                "providers",
+                &format!("[{} provider(s)]", self.providers.len()),
+            )
+            .field(
+                "role_mappings",
+                &format!("[{} mapping(s)]", self.role_mappings.len()),
+            )
+            .field(
+                "external",
+                &self
+                    .external
+                    .as_ref()
+                    .map(|e| format!("issuer={}", e.issuer)),
+            )
             .finish()
     }
 }
@@ -1409,7 +1447,6 @@ pub enum CatalogAuthConfig {
     /// SQE level; the AWS SDK handles credentials.
     Aws,
 }
-
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct CatalogConfig {
@@ -1902,20 +1939,11 @@ impl TvfPolicy {
             }
             // Parse out the host (lowercased) and check the allowlist.
             // Keeping this local + total avoids panicking on malformed input.
-            let after_scheme = lower
-                .split_once("://")
-                .map(|x| x.1)
-                .unwrap_or("");
+            let after_scheme = lower.split_once("://").map(|x| x.1).unwrap_or("");
             let host_with_port = after_scheme.split('/').next().unwrap_or("");
-            let host = host_with_port
-                .split(':')
-                .next()
-                .unwrap_or("")
-                .trim();
+            let host = host_with_port.split(':').next().unwrap_or("").trim();
             if host.is_empty() {
-                return Err(format!(
-                    "TVF: malformed URL '{path}' (missing host)"
-                ));
+                return Err(format!("TVF: malformed URL '{path}' (missing host)"));
             }
             if self
                 .allowed_http_hosts
@@ -2034,16 +2062,9 @@ impl TvfPolicy {
         if self.allow_http {
             return Ok(());
         }
-        let after_scheme = lower
-            .split_once("://")
-            .map(|x| x.1)
-            .unwrap_or("");
+        let after_scheme = lower.split_once("://").map(|x| x.1).unwrap_or("");
         let host_with_port = after_scheme.split('/').next().unwrap_or("");
-        let host = host_with_port
-            .split(':')
-            .next()
-            .unwrap_or("")
-            .trim();
+        let host = host_with_port.split(':').next().unwrap_or("").trim();
         if host.is_empty() {
             return Err(format!(
                 "TVF: malformed endpoint '{endpoint}' (missing host)"
@@ -2091,12 +2112,24 @@ impl Default for StorageConfig {
     }
 }
 
-fn default_coalesce_threshold() -> String { "1MB".to_string() }
-fn default_footer_cache_size() -> String { "256MB".to_string() }
-fn default_concurrent_requests_per_file() -> usize { 4 }
-fn default_max_concurrent_files() -> usize { 8 }
-fn default_prefetch_buffer() -> String { "32MB".to_string() }
-fn default_prefetch_concurrency() -> usize { 4 }
+fn default_coalesce_threshold() -> String {
+    "1MB".to_string()
+}
+fn default_footer_cache_size() -> String {
+    "256MB".to_string()
+}
+fn default_concurrent_requests_per_file() -> usize {
+    4
+}
+fn default_max_concurrent_files() -> usize {
+    8
+}
+fn default_prefetch_buffer() -> String {
+    "32MB".to_string()
+}
+fn default_prefetch_concurrency() -> usize {
+    4
+}
 
 impl std::fmt::Debug for StorageConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -2109,7 +2142,10 @@ impl std::fmt::Debug for StorageConfig {
             .field("s3_allow_http", &self.s3_allow_http)
             .field("coalesce_threshold", &self.coalesce_threshold)
             .field("footer_cache_size", &self.footer_cache_size)
-            .field("concurrent_requests_per_file", &self.concurrent_requests_per_file)
+            .field(
+                "concurrent_requests_per_file",
+                &self.concurrent_requests_per_file,
+            )
             .field("max_concurrent_files", &self.max_concurrent_files)
             .field("prefetch_buffer", &self.prefetch_buffer)
             .field("prefetch_concurrency", &self.prefetch_concurrency)
@@ -2210,7 +2246,9 @@ impl Default for AccessControlConfig {
     }
 }
 
-fn default_access_control_timeout() -> u64 { 30 }
+fn default_access_control_timeout() -> u64 {
+    30
+}
 
 /// Apache Ranger backend configuration (Polaris 1.5 embedded authorizer).
 ///
@@ -2561,11 +2599,21 @@ pub struct AuditExportConfig {
     pub start_at: String,
 }
 
-fn default_export_target() -> String { "otlp".into() }
-fn default_export_batch_max() -> usize { 512 }
-fn default_export_flush_ms() -> u64 { 2000 }
-fn default_export_max_spool() -> u64 { 1_073_741_824 }
-fn default_export_start_at() -> String { "now".into() }
+fn default_export_target() -> String {
+    "otlp".into()
+}
+fn default_export_batch_max() -> usize {
+    512
+}
+fn default_export_flush_ms() -> u64 {
+    2000
+}
+fn default_export_max_spool() -> u64 {
+    1_073_741_824
+}
+fn default_export_start_at() -> String {
+    "now".into()
+}
 
 impl Default for AuditExportConfig {
     fn default() -> Self {
@@ -2735,14 +2783,10 @@ impl OpenLineageConfig {
             );
         }
         if self.auth_mode == "bearer" && self.api_key.is_empty() {
-            return Err(
-                "openlineage.auth_mode = \"bearer\" requires api_key to be set".into(),
-            );
+            return Err("openlineage.auth_mode = \"bearer\" requires api_key to be set".into());
         }
         if !self.spool_path.is_empty() && self.http_endpoint.is_empty() {
-            return Err(
-                "openlineage.spool_path requires http_endpoint to be set".into(),
-            );
+            return Err("openlineage.spool_path requires http_endpoint to be set".into());
         }
         if self.enabled && self.spool_max_bytes < 1024 * 1024 {
             return Err("openlineage.spool_max_bytes must be at least 1 MiB".into());
@@ -2844,11 +2888,7 @@ impl SecurityConfig {
     /// and skips IPs that are themselves in the trusted_proxies list,
     /// stopping at the first untrusted address. This survives chains of
     /// known proxies that prepend to one another.
-    pub fn resolve_client_ip(
-        &self,
-        peer: Option<&str>,
-        forwarded_for: Option<&str>,
-    ) -> String {
+    pub fn resolve_client_ip(&self, peer: Option<&str>, forwarded_for: Option<&str>) -> String {
         let peer = peer.unwrap_or("unknown");
         let peer_host = strip_port(peer);
         let trusted = !self.trusted_proxies.is_empty()
@@ -2919,7 +2959,10 @@ fn host_is_loopback(host: &str) -> bool {
         return true;
     }
     // Strip IPv6 brackets if present (e.g. "[::1]").
-    let bare = host.strip_prefix('[').and_then(|r| r.strip_suffix(']')).unwrap_or(host);
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|r| r.strip_suffix(']'))
+        .unwrap_or(host);
     matches!(bare.parse::<std::net::IpAddr>(), Ok(ip) if ip.is_loopback())
 }
 
@@ -2988,68 +3031,188 @@ impl Default for SessionConfig {
     }
 }
 
-fn default_idle_timeout() -> u64 { 900 }       // 15 minutes
-fn default_absolute_timeout() -> u64 { 28800 }  // 8 hours
-fn default_session_persistence() -> String { "memory".to_string() }
-fn default_session_persistence_path() -> String { "/tmp/sqe-sessions.json".to_string() }
-fn default_session_snapshot_interval() -> u64 { 60 }
-fn default_session_expiry_sweep_interval() -> u64 { 60 }
-fn default_auth_handshake_timeout_secs() -> u64 { 30 }
-fn default_health_check_interval_secs() -> u64 { 5 }
-fn default_health_check_max_failures() -> u32 { 3 }
-fn default_credential_refresh_interval_secs() -> u64 { 60 }
-fn default_credential_push_connect_timeout_secs() -> u64 { 5 }
-fn default_credential_push_request_timeout_secs() -> u64 { 10 }
-fn default_shutdown_drain_secs() -> u64 { 25 }  // < helm terminationGracePeriodSeconds
-fn default_query_timeout() -> u64 { 300 }       // 5 minutes
-fn default_max_result_rows() -> usize { 1_000_000 }
-fn default_max_concurrent_queries() -> usize { 100 }
-fn default_max_concurrent_per_user() -> usize { 20 }
-fn default_per_user_memory_budget() -> String { "1GB".to_string() }
-fn default_slow_query_threshold() -> u64 { 30 }
-fn default_query_profile() -> String { "off".to_string() }
-fn default_runtime_filter_inlist_max_values() -> usize { 65536 }
-fn default_runtime_filter_inlist_max_size() -> String { "4MB".to_string() }
-fn default_stream_idle_timeout() -> u64 { 300 }
-fn default_max_query_memory() -> String { "256MB".to_string() }
-fn default_distribution_threshold() -> String { "128MB".to_string() }
-fn default_distribution_file_threshold() -> usize { 4 }
-fn default_target_task_size() -> String { "256MB".to_string() }
-fn default_fanout_buffer_budget() -> String { "0".to_string() }
-fn default_sort_mode() -> String { "adaptive".to_string() }
-fn default_late_mat_min_projection_cols() -> usize { 1 }
-fn default_star_schema_min_ratio() -> usize { 10 }
+fn default_idle_timeout() -> u64 {
+    900
+} // 15 minutes
+fn default_absolute_timeout() -> u64 {
+    28800
+} // 8 hours
+fn default_session_persistence() -> String {
+    "memory".to_string()
+}
+fn default_session_persistence_path() -> String {
+    "/tmp/sqe-sessions.json".to_string()
+}
+fn default_session_snapshot_interval() -> u64 {
+    60
+}
+fn default_session_expiry_sweep_interval() -> u64 {
+    60
+}
+fn default_auth_handshake_timeout_secs() -> u64 {
+    30
+}
+fn default_health_check_interval_secs() -> u64 {
+    5
+}
+fn default_health_check_max_failures() -> u32 {
+    3
+}
+fn default_credential_refresh_interval_secs() -> u64 {
+    60
+}
+fn default_credential_push_connect_timeout_secs() -> u64 {
+    5
+}
+fn default_credential_push_request_timeout_secs() -> u64 {
+    10
+}
+fn default_shutdown_drain_secs() -> u64 {
+    25
+} // < helm terminationGracePeriodSeconds
+fn default_query_timeout() -> u64 {
+    300
+} // 5 minutes
+fn default_max_result_rows() -> usize {
+    1_000_000
+}
+fn default_max_concurrent_queries() -> usize {
+    100
+}
+fn default_max_concurrent_per_user() -> usize {
+    20
+}
+fn default_per_user_memory_budget() -> String {
+    "1GB".to_string()
+}
+fn default_slow_query_threshold() -> u64 {
+    30
+}
+fn default_query_profile() -> String {
+    "off".to_string()
+}
+fn default_runtime_filter_inlist_max_values() -> usize {
+    65536
+}
+fn default_runtime_filter_inlist_max_size() -> String {
+    "4MB".to_string()
+}
+fn default_stream_idle_timeout() -> u64 {
+    300
+}
+fn default_max_query_memory() -> String {
+    "256MB".to_string()
+}
+fn default_distribution_threshold() -> String {
+    "128MB".to_string()
+}
+fn default_distribution_file_threshold() -> usize {
+    4
+}
+fn default_target_task_size() -> String {
+    "256MB".to_string()
+}
+fn default_fanout_buffer_budget() -> String {
+    "0".to_string()
+}
+fn default_sort_mode() -> String {
+    "adaptive".to_string()
+}
+fn default_late_mat_min_projection_cols() -> usize {
+    1
+}
+fn default_star_schema_min_ratio() -> usize {
+    10
+}
 
-fn default_coordinator_memory() -> String { "8GB".to_string() }
-fn default_memory_pool() -> String { "greedy".to_string() }
-fn default_coordinator_spill_dir() -> String { "/tmp/sqe-coordinator-spill".to_string() }
-fn default_spill_compression() -> String { "lz4".to_string() }
-fn default_flight_compression() -> String { "lz4".to_string() }
-fn default_shuffle_compression() -> String { "zstd".to_string() }
-fn default_max_workers() -> usize { 1024 }
-fn default_worker_connect_timeout() -> u64 { 5 }
-fn default_worker_rpc_timeout() -> u64 { 630 }
+fn default_coordinator_memory() -> String {
+    "8GB".to_string()
+}
+fn default_memory_pool() -> String {
+    "greedy".to_string()
+}
+fn default_coordinator_spill_dir() -> String {
+    "/tmp/sqe-coordinator-spill".to_string()
+}
+fn default_spill_compression() -> String {
+    "lz4".to_string()
+}
+fn default_flight_compression() -> String {
+    "lz4".to_string()
+}
+fn default_shuffle_compression() -> String {
+    "zstd".to_string()
+}
+fn default_max_workers() -> usize {
+    1024
+}
+fn default_worker_connect_timeout() -> u64 {
+    5
+}
+fn default_worker_rpc_timeout() -> u64 {
+    630
+}
 
-fn default_flight_port() -> u16 { 50051 }
-fn default_trino_port() -> u16 { 8080 }
-fn default_mode() -> String { "hybrid".to_string() }
-fn default_worker_flight_port() -> u16 { 50052 }
-fn default_heartbeat() -> u64 { 5 }
-fn default_memory() -> String { "8GB".to_string() }
-fn default_spill_dir() -> String { "/tmp/sqe-spill".to_string() }
-fn default_scan_timeout() -> u64 { 600 }         // 10 minutes
-fn default_refresh_buffer() -> u64 { 60 }
-fn default_true() -> bool { true }
-fn default_cache_ttl() -> u64 { 30 }
-fn default_table_format_version() -> u8 { 2 }
-fn default_small_file_threshold_mb() -> u64 { 3 }
-fn default_parquet_compression() -> String { "zstd".to_string() }
-fn default_manifest_concurrency() -> usize { 64 }
-fn default_prometheus_port() -> u16 { 9090 }
-fn default_per_user_rpm() -> u32 { 60 }
-fn default_global_rpm() -> u32 { 1000 }
-fn default_auth_rpm() -> u32 { 10 }
-fn default_metadata_rpm() -> u32 { 120 }
+fn default_flight_port() -> u16 {
+    50051
+}
+fn default_trino_port() -> u16 {
+    8080
+}
+fn default_mode() -> String {
+    "hybrid".to_string()
+}
+fn default_worker_flight_port() -> u16 {
+    50052
+}
+fn default_heartbeat() -> u64 {
+    5
+}
+fn default_memory() -> String {
+    "8GB".to_string()
+}
+fn default_spill_dir() -> String {
+    "/tmp/sqe-spill".to_string()
+}
+fn default_scan_timeout() -> u64 {
+    600
+} // 10 minutes
+fn default_refresh_buffer() -> u64 {
+    60
+}
+fn default_true() -> bool {
+    true
+}
+fn default_cache_ttl() -> u64 {
+    30
+}
+fn default_table_format_version() -> u8 {
+    2
+}
+fn default_small_file_threshold_mb() -> u64 {
+    3
+}
+fn default_parquet_compression() -> String {
+    "zstd".to_string()
+}
+fn default_manifest_concurrency() -> usize {
+    64
+}
+fn default_prometheus_port() -> u16 {
+    9090
+}
+fn default_per_user_rpm() -> u32 {
+    60
+}
+fn default_global_rpm() -> u32 {
+    1000
+}
+fn default_auth_rpm() -> u32 {
+    10
+}
+fn default_metadata_rpm() -> u32 {
+    120
+}
 
 impl SqeConfig {
     /// Default name for the legacy `[catalog]` block when the new
@@ -3085,11 +3248,8 @@ impl SqeConfig {
         if self.catalogs.is_empty() {
             return vec![(Self::LEGACY_CATALOG_NAME.to_string(), &self.catalog)];
         }
-        let mut out: Vec<(String, &CatalogConfig)> = self
-            .catalogs
-            .iter()
-            .map(|(k, v)| (k.clone(), v))
-            .collect();
+        let mut out: Vec<(String, &CatalogConfig)> =
+            self.catalogs.iter().map(|(k, v)| (k.clone(), v)).collect();
         // Stable order so DataFusion catalog registration produces a
         // deterministic information_schema ordering and the welcome
         // banner is reproducible.
@@ -3360,9 +3520,10 @@ impl SqeConfig {
         if errors.is_empty() {
             Ok(())
         } else {
-            Err(crate::error::SqeError::Config(
-                format!("config error: {}", errors.join("; ")),
-            ))
+            Err(crate::error::SqeError::Config(format!(
+                "config error: {}",
+                errors.join("; ")
+            )))
         }
     }
 
@@ -3371,16 +3532,12 @@ impl SqeConfig {
     pub fn validate_production(&self) -> crate::error::Result<()> {
         let mut errors = Vec::new();
 
-        if self
-            .auth
-            .providers
-            .iter()
-            .any(|p| matches!(
+        if self.auth.providers.iter().any(|p| {
+            matches!(
                 p,
-                AuthProviderConfig::Anonymous { .. }
-                    | AuthProviderConfig::BearerPassthrough { .. }
-            ))
-        {
+                AuthProviderConfig::Anonymous { .. } | AuthProviderConfig::BearerPassthrough { .. }
+            )
+        }) {
             errors.push(
                 "production_mode: auth.providers must not include anonymous or \
                  bearer_passthrough providers (dev-only; accept any connection \
@@ -3472,8 +3629,14 @@ impl SqeConfig {
     /// E.g. `SQE_AUTH__KEYCLOAK_URL=https://...` overrides `auth.keycloak_url`.
     fn apply_env_overrides(&mut self) {
         // Coordinator
-        env_override_u16("SQE_COORDINATOR__FLIGHT_SQL_PORT", &mut self.coordinator.flight_sql_port);
-        env_override_u16("SQE_COORDINATOR__TRINO_HTTP_PORT", &mut self.coordinator.trino_http_port);
+        env_override_u16(
+            "SQE_COORDINATOR__FLIGHT_SQL_PORT",
+            &mut self.coordinator.flight_sql_port,
+        );
+        env_override_u16(
+            "SQE_COORDINATOR__TRINO_HTTP_PORT",
+            &mut self.coordinator.trino_http_port,
+        );
         env_override_str("SQE_COORDINATOR__MODE", &mut self.coordinator.mode);
         env_override_bool("SQE_COORDINATOR__DEBUG", &mut self.coordinator.debug);
         // Short `SQE_PRODUCTION_MODE` for operators; namespaced form wins when both set.
@@ -3482,7 +3645,10 @@ impl SqeConfig {
             "SQE_COORDINATOR__PRODUCTION_MODE",
             &mut self.coordinator.production_mode,
         );
-        env_override_secret("SQE_COORDINATOR__WORKER_SECRET", &mut self.coordinator.worker_secret);
+        env_override_secret(
+            "SQE_COORDINATOR__WORKER_SECRET",
+            &mut self.coordinator.worker_secret,
+        );
         env_override_bool(
             "SQE_COORDINATOR__ALLOW_UNAUTHENTICATED_WORKERS",
             &mut self.coordinator.allow_unauthenticated_workers,
@@ -3526,14 +3692,23 @@ impl SqeConfig {
         env_override_str_logged("SQE_MEMORY_POOL", &mut self.coordinator.memory_pool);
 
         // Worker
-        env_override_str("SQE_WORKER__COORDINATOR_URL", &mut self.worker.coordinator_url);
+        env_override_str(
+            "SQE_WORKER__COORDINATOR_URL",
+            &mut self.worker.coordinator_url,
+        );
         env_override_u16("SQE_WORKER__FLIGHT_PORT", &mut self.worker.flight_port);
         env_override_str("SQE_WORKER__ADVERTISE_URL", &mut self.worker.advertise_url);
-        env_override_u64("SQE_WORKER__HEARTBEAT_INTERVAL_SECS", &mut self.worker.heartbeat_interval_secs);
+        env_override_u64(
+            "SQE_WORKER__HEARTBEAT_INTERVAL_SECS",
+            &mut self.worker.heartbeat_interval_secs,
+        );
         env_override_str("SQE_WORKER__MEMORY_LIMIT", &mut self.worker.memory_limit);
         env_override_bool("SQE_WORKER__SPILL_TO_DISK", &mut self.worker.spill_to_disk);
         env_override_str("SQE_WORKER__SPILL_DIR", &mut self.worker.spill_dir);
-        env_override_u64("SQE_WORKER__SCAN_TIMEOUT_SECS", &mut self.worker.scan_timeout_secs);
+        env_override_u64(
+            "SQE_WORKER__SCAN_TIMEOUT_SECS",
+            &mut self.worker.scan_timeout_secs,
+        );
         env_override_str("SQE_WORKER__WORKER_SECRET", &mut self.worker.worker_secret);
         env_override_bool(
             "SQE_WORKER__ALLOW_UNAUTHENTICATED",
@@ -3552,8 +3727,14 @@ impl SqeConfig {
         env_override_str("SQE_AUTH__CLIENT_ID", &mut self.auth.client_id);
         env_override_secret("SQE_AUTH__CLIENT_SECRET", &mut self.auth.client_secret);
         env_override_str("SQE_AUTH__TOKEN_ENDPOINT", &mut self.auth.token_endpoint);
-        env_override_u64("SQE_AUTH__TOKEN_REFRESH_BUFFER_SECS", &mut self.auth.token_refresh_buffer_secs);
-        env_override_bool("SQE_AUTH__SSL_VERIFICATION", &mut self.auth.ssl_verification);
+        env_override_u64(
+            "SQE_AUTH__TOKEN_REFRESH_BUFFER_SECS",
+            &mut self.auth.token_refresh_buffer_secs,
+        );
+        env_override_bool(
+            "SQE_AUTH__SSL_VERIFICATION",
+            &mut self.auth.ssl_verification,
+        );
         env_override_str("SQE_AUTH__ROLES_CLAIM", &mut self.auth.roles_claim);
 
         // Auth providers: secrets must be injectable via env so Kubernetes
@@ -3620,24 +3801,66 @@ impl SqeConfig {
         env_override_str("SQE_CATALOG__POLARIS_URL", &mut self.catalog.catalog_url);
         env_override_str("SQE_CATALOG__CATALOG_URL", &mut self.catalog.catalog_url);
         env_override_str("SQE_CATALOG__WAREHOUSE", &mut self.catalog.warehouse);
-        env_override_u64("SQE_CATALOG__METADATA_CACHE_TTL_SECS", &mut self.catalog.metadata_cache_ttl_secs);
-        env_override_u8("SQE_CATALOG__DEFAULT_TABLE_FORMAT_VERSION", &mut self.catalog.default_table_format_version);
-        env_override_usize("SQE_CATALOG__MANIFEST_CONCURRENCY", &mut self.catalog.manifest_concurrency);
+        env_override_u64(
+            "SQE_CATALOG__METADATA_CACHE_TTL_SECS",
+            &mut self.catalog.metadata_cache_ttl_secs,
+        );
+        env_override_u8(
+            "SQE_CATALOG__DEFAULT_TABLE_FORMAT_VERSION",
+            &mut self.catalog.default_table_format_version,
+        );
+        env_override_usize(
+            "SQE_CATALOG__MANIFEST_CONCURRENCY",
+            &mut self.catalog.manifest_concurrency,
+        );
 
         // Storage
         env_override_str("SQE_STORAGE__S3_ENDPOINT", &mut self.storage.s3_endpoint);
         env_override_str("SQE_STORAGE__S3_REGION", &mut self.storage.s3_region);
-        env_override_str("SQE_STORAGE__S3_ACCESS_KEY", &mut self.storage.s3_access_key);
-        env_override_secret("SQE_STORAGE__S3_SECRET_KEY", &mut self.storage.s3_secret_key);
-        env_override_bool("SQE_STORAGE__S3_PATH_STYLE", &mut self.storage.s3_path_style);
-        env_override_bool("SQE_STORAGE__S3_ALLOW_HTTP", &mut self.storage.s3_allow_http);
-        env_override_usize("SQE_STORAGE__PREFETCH_CONCURRENCY", &mut self.storage.prefetch_concurrency);
-        env_override_str("SQE_STORAGE__AZURE_ACCOUNT", &mut self.storage.azure_account);
-        env_override_str("SQE_STORAGE__AZURE_ACCESS_KEY", &mut self.storage.azure_access_key);
-        env_override_str("SQE_STORAGE__AZURE_SAS_TOKEN", &mut self.storage.azure_sas_token);
-        env_override_bool("SQE_STORAGE__AZURE_USE_EMULATOR", &mut self.storage.azure_use_emulator);
-        env_override_str("SQE_STORAGE__GCS_SERVICE_ACCOUNT_PATH", &mut self.storage.gcs_service_account_path);
-        env_override_str("SQE_STORAGE__GCS_SERVICE_ACCOUNT_KEY", &mut self.storage.gcs_service_account_key);
+        env_override_str(
+            "SQE_STORAGE__S3_ACCESS_KEY",
+            &mut self.storage.s3_access_key,
+        );
+        env_override_secret(
+            "SQE_STORAGE__S3_SECRET_KEY",
+            &mut self.storage.s3_secret_key,
+        );
+        env_override_bool(
+            "SQE_STORAGE__S3_PATH_STYLE",
+            &mut self.storage.s3_path_style,
+        );
+        env_override_bool(
+            "SQE_STORAGE__S3_ALLOW_HTTP",
+            &mut self.storage.s3_allow_http,
+        );
+        env_override_usize(
+            "SQE_STORAGE__PREFETCH_CONCURRENCY",
+            &mut self.storage.prefetch_concurrency,
+        );
+        env_override_str(
+            "SQE_STORAGE__AZURE_ACCOUNT",
+            &mut self.storage.azure_account,
+        );
+        env_override_str(
+            "SQE_STORAGE__AZURE_ACCESS_KEY",
+            &mut self.storage.azure_access_key,
+        );
+        env_override_str(
+            "SQE_STORAGE__AZURE_SAS_TOKEN",
+            &mut self.storage.azure_sas_token,
+        );
+        env_override_bool(
+            "SQE_STORAGE__AZURE_USE_EMULATOR",
+            &mut self.storage.azure_use_emulator,
+        );
+        env_override_str(
+            "SQE_STORAGE__GCS_SERVICE_ACCOUNT_PATH",
+            &mut self.storage.gcs_service_account_path,
+        );
+        env_override_str(
+            "SQE_STORAGE__GCS_SERVICE_ACCOUNT_KEY",
+            &mut self.storage.gcs_service_account_key,
+        );
 
         // Policy
         env_override_parse("SQE_POLICY__ENGINE", &mut self.policy.engine);
@@ -3648,7 +3871,10 @@ impl SqeConfig {
         );
 
         // Access control
-        env_override_parse("SQE_ACCESS_CONTROL__BACKEND", &mut self.access_control.backend);
+        env_override_parse(
+            "SQE_ACCESS_CONTROL__BACKEND",
+            &mut self.access_control.backend,
+        );
         env_override_str("SQE_ACCESS_CONTROL__URL", &mut self.access_control.url);
         env_override_secret(
             "SQE_ACCESS_CONTROL__RANGER__ADMIN_PASSWORD",
@@ -3656,9 +3882,18 @@ impl SqeConfig {
         );
 
         // Metrics
-        env_override_u16("SQE_METRICS__PROMETHEUS_PORT", &mut self.metrics.prometheus_port);
-        env_override_str("SQE_METRICS__OTLP_ENDPOINT", &mut self.metrics.otlp_endpoint);
-        env_override_str("SQE_METRICS__AUDIT_LOG_PATH", &mut self.metrics.audit_log_path);
+        env_override_u16(
+            "SQE_METRICS__PROMETHEUS_PORT",
+            &mut self.metrics.prometheus_port,
+        );
+        env_override_str(
+            "SQE_METRICS__OTLP_ENDPOINT",
+            &mut self.metrics.otlp_endpoint,
+        );
+        env_override_str(
+            "SQE_METRICS__AUDIT_LOG_PATH",
+            &mut self.metrics.audit_log_path,
+        );
         env_override_str("SQE_METRICS__AUDIT__FORMAT", &mut self.metrics.audit.format);
         env_override_bool(
             "SQE_METRICS__AUDIT__SUPERDEBUG_LOG_RESULTS",
@@ -3743,12 +3978,24 @@ impl SqeConfig {
 
         // Rate limit
         env_override_bool("SQE_RATE_LIMIT__ENABLED", &mut self.rate_limit.enabled);
-        env_override_u32("SQE_RATE_LIMIT__PER_USER_QUERIES_PER_MINUTE", &mut self.rate_limit.per_user_queries_per_minute);
-        env_override_u32("SQE_RATE_LIMIT__GLOBAL_QUERIES_PER_MINUTE", &mut self.rate_limit.global_queries_per_minute);
+        env_override_u32(
+            "SQE_RATE_LIMIT__PER_USER_QUERIES_PER_MINUTE",
+            &mut self.rate_limit.per_user_queries_per_minute,
+        );
+        env_override_u32(
+            "SQE_RATE_LIMIT__GLOBAL_QUERIES_PER_MINUTE",
+            &mut self.rate_limit.global_queries_per_minute,
+        );
 
         // Session
-        env_override_u64("SQE_SESSION__IDLE_TIMEOUT_SECS", &mut self.session.idle_timeout_secs);
-        env_override_u64("SQE_SESSION__ABSOLUTE_TIMEOUT_SECS", &mut self.session.absolute_timeout_secs);
+        env_override_u64(
+            "SQE_SESSION__IDLE_TIMEOUT_SECS",
+            &mut self.session.idle_timeout_secs,
+        );
+        env_override_u64(
+            "SQE_SESSION__ABSOLUTE_TIMEOUT_SECS",
+            &mut self.session.absolute_timeout_secs,
+        );
         env_override_u64(
             "SQE_SESSION__EXPIRY_SWEEP_INTERVAL_SECS",
             &mut self.session.expiry_sweep_interval_secs,
@@ -3824,8 +4071,14 @@ fn validate_byte_sizes(config: &SqeConfig, errors: &mut Vec<String>) {
 
     check("coordinator.memory_limit", &config.coordinator.memory_limit);
     check("worker.memory_limit", &config.worker.memory_limit);
-    check("storage.coalesce_threshold", &config.storage.coalesce_threshold);
-    check("storage.footer_cache_size", &config.storage.footer_cache_size);
+    check(
+        "storage.coalesce_threshold",
+        &config.storage.coalesce_threshold,
+    );
+    check(
+        "storage.footer_cache_size",
+        &config.storage.footer_cache_size,
+    );
     check("storage.prefetch_buffer", &config.storage.prefetch_buffer);
 }
 
@@ -3858,7 +4111,10 @@ fn validate_urls(config: &SqeConfig, errors: &mut Vec<String>) {
 
     check("storage.s3_endpoint", &config.storage.s3_endpoint);
     check("metrics.otlp_endpoint", &config.metrics.otlp_endpoint);
-    check("metrics.openlineage.http_endpoint", &config.metrics.openlineage.http_endpoint);
+    check(
+        "metrics.openlineage.http_endpoint",
+        &config.metrics.openlineage.http_endpoint,
+    );
 
     check("auth.keycloak_url", &config.auth.keycloak_url);
     check("auth.token_endpoint", &config.auth.token_endpoint);
@@ -3989,10 +4245,19 @@ mod tests {
 
     #[test]
     fn catalog_discovery_parses_and_defaults() {
-        assert_eq!(CatalogDiscovery::parse("polaris-auto"), CatalogDiscovery::PolarisAuto);
+        assert_eq!(
+            CatalogDiscovery::parse("polaris-auto"),
+            CatalogDiscovery::PolarisAuto
+        );
         assert_eq!(CatalogDiscovery::parse("static"), CatalogDiscovery::Static);
-        assert_eq!(CatalogDiscovery::parse("PoLaRiS-AuTo"), CatalogDiscovery::PolarisAuto);
-        assert_eq!(CatalogDiscovery::parse("nonsense"), CatalogDiscovery::Static);
+        assert_eq!(
+            CatalogDiscovery::parse("PoLaRiS-AuTo"),
+            CatalogDiscovery::PolarisAuto
+        );
+        assert_eq!(
+            CatalogDiscovery::parse("nonsense"),
+            CatalogDiscovery::Static
+        );
         assert_eq!(CatalogDiscovery::default(), CatalogDiscovery::Static);
     }
 
@@ -4080,7 +4345,10 @@ mod tests {
         };
         let dbg = format!("{cfg:?}");
         assert!(!dbg.contains("super-secret-value"), "leaked secret: {dbg}");
-        assert!(dbg.contains("[REDACTED]"), "expected redaction marker: {dbg}");
+        assert!(
+            dbg.contains("[REDACTED]"),
+            "expected redaction marker: {dbg}"
+        );
 
         let cc = AuthProviderConfig::ClientCredentials {
             token_endpoint: "https://idp/token".to_string(),
@@ -4108,7 +4376,10 @@ mod tests {
         };
         let dbg = format!("{cfg:?}");
         assert!(!dbg.contains("worker-secret-12345"), "leaked secret: {dbg}");
-        assert!(dbg.contains("[REDACTED]"), "expected redaction marker: {dbg}");
+        assert!(
+            dbg.contains("[REDACTED]"),
+            "expected redaction marker: {dbg}"
+        );
     }
 
     #[test]
@@ -4172,8 +4443,10 @@ mod tests {
                 health_check_interval_secs: default_health_check_interval_secs(),
                 health_check_max_failures: default_health_check_max_failures(),
                 credential_refresh_interval_secs: default_credential_refresh_interval_secs(),
-                credential_push_connect_timeout_secs: default_credential_push_connect_timeout_secs(),
-                credential_push_request_timeout_secs: default_credential_push_request_timeout_secs(),
+                credential_push_connect_timeout_secs: default_credential_push_connect_timeout_secs(
+                ),
+                credential_push_request_timeout_secs: default_credential_push_request_timeout_secs(
+                ),
                 shutdown_drain_secs: default_shutdown_drain_secs(),
                 production_mode: false,
             },
@@ -4351,7 +4624,8 @@ mod tests {
     #[test]
     fn test_validate_rejects_malformed_worker_url() {
         let mut config = valid_config();
-        config.coordinator.worker_urls = vec!["http://good.example".to_string(), "://broken".to_string()];
+        config.coordinator.worker_urls =
+            vec!["http://good.example".to_string(), "://broken".to_string()];
         config.coordinator.worker_secret = SecretString::new("s".to_string());
         let err = config.validate().unwrap_err().to_string();
         assert!(
@@ -4367,7 +4641,8 @@ mod tests {
         // Coordinator side: a non-loopback worker URL with no TLS and no
         // opt-in must be rejected.
         let mut config = valid_config();
-        config.coordinator.worker_urls = vec!["http://worker-1.svc.cluster.local:50052".to_string()];
+        config.coordinator.worker_urls =
+            vec!["http://worker-1.svc.cluster.local:50052".to_string()];
         config.coordinator.worker_secret = SecretString::new("shared".to_string());
         let err = config.validate().unwrap_err().to_string();
         assert!(
@@ -4393,7 +4668,8 @@ mod tests {
     #[test]
     fn test_validate_allows_distributed_non_loopback_with_opt_in() {
         let mut config = valid_config();
-        config.coordinator.worker_urls = vec!["http://worker-1.svc.cluster.local:50052".to_string()];
+        config.coordinator.worker_urls =
+            vec!["http://worker-1.svc.cluster.local:50052".to_string()];
         config.coordinator.worker_secret = SecretString::new("shared".to_string());
         config.security.allow_insecure_transport = true;
         assert!(
@@ -4406,13 +4682,18 @@ mod tests {
     #[test]
     fn test_validate_allows_distributed_non_loopback_with_tls() {
         let mut config = valid_config();
-        config.coordinator.worker_urls = vec!["http://worker-1.svc.cluster.local:50052".to_string()];
+        config.coordinator.worker_urls =
+            vec!["http://worker-1.svc.cluster.local:50052".to_string()];
         config.coordinator.worker_secret = SecretString::new("shared".to_string());
         // is_enabled() only checks the strings are non-empty; the paths are
         // validated elsewhere and the existing valid_config skips that check.
         config.coordinator.tls.cert_file = "/etc/sqe/tls.crt".to_string();
         config.coordinator.tls.key_file = "/etc/sqe/tls.key".to_string();
-        let err = config.validate().err().map(|e| e.to_string()).unwrap_or_default();
+        let err = config
+            .validate()
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
         assert!(
             !err.contains("non-loopback peer"),
             "TLS-enabled distributed should not raise the transport error, got: {err}"
@@ -4733,8 +5014,7 @@ mod tests {
     #[test]
     fn legacy_polaris_url_alias_deserializes() {
         let new_toml = "[catalog]\ncatalog_url = \"http://new.example.com\"\nwarehouse = \"wh\"\n";
-        let old_toml =
-            "[catalog]\npolaris_url = \"http://old.example.com\"\nwarehouse = \"wh\"\n";
+        let old_toml = "[catalog]\npolaris_url = \"http://old.example.com\"\nwarehouse = \"wh\"\n";
 
         #[derive(serde::Deserialize)]
         struct Wrap {
@@ -4810,7 +5090,7 @@ mod tests {
                     metadata_cache_ttl_secs: 30,
                     default_table_format_version: 2,
                     trust_sort_order: false,
-                namespace_visibility_filter: true,
+                    namespace_visibility_filter: true,
                     small_file_threshold_mb: 3,
                     parquet_compression: "zstd".to_string(),
                     manifest_concurrency: 64,
@@ -5034,7 +5314,10 @@ type = "aws"
             .storage
             .as_ref()
             .expect("partner has storage override");
-        assert_eq!(partner_storage.s3_endpoint, "https://partner-s3.example.com");
+        assert_eq!(
+            partner_storage.s3_endpoint,
+            "https://partner-s3.example.com"
+        );
         assert_eq!(partner_storage.s3_region, "us-east-1");
         assert_eq!(partner_storage.s3_access_key, "partner-key");
 
@@ -5104,7 +5387,10 @@ type = "aws"
     #[test]
     fn test_storage_config_s3_allow_http_defaults_false() {
         let config = StorageConfig::default();
-        assert!(!config.s3_allow_http, "s3_allow_http should default to false (secure by default)");
+        assert!(
+            !config.s3_allow_http,
+            "s3_allow_http should default to false (secure by default)"
+        );
     }
 
     #[test]
@@ -5201,7 +5487,10 @@ type = "aws"
             } => {
                 assert_eq!(email_claim, "email", "email_claim should be 'email'");
                 assert_eq!(groups_claim, "groups", "groups_claim should be 'groups'");
-                assert_eq!(subject_claim, "sub", "subject_claim should default to 'sub'");
+                assert_eq!(
+                    subject_claim, "sub",
+                    "subject_claim should default to 'sub'"
+                );
             }
             other => panic!("Expected OidcPassword, got: {other:?}"),
         }
@@ -5222,7 +5511,10 @@ type = "aws"
             } => {
                 assert_eq!(email_claim, "", "email_claim should default to empty");
                 assert_eq!(groups_claim, "", "groups_claim should default to empty");
-                assert_eq!(subject_claim, "sub", "subject_claim should default to 'sub'");
+                assert_eq!(
+                    subject_claim, "sub",
+                    "subject_claim should default to 'sub'"
+                );
             }
             other => panic!("Expected OidcPassword, got: {other:?}"),
         }
@@ -5407,8 +5699,14 @@ type = "aws"
 
         let config: AuthConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.providers.len(), 2);
-        assert!(matches!(config.providers[0], AuthProviderConfig::OidcPassword { .. }));
-        assert!(matches!(config.providers[1], AuthProviderConfig::Anonymous { .. }));
+        assert!(matches!(
+            config.providers[0],
+            AuthProviderConfig::OidcPassword { .. }
+        ));
+        assert!(matches!(
+            config.providers[1],
+            AuthProviderConfig::Anonymous { .. }
+        ));
     }
 
     #[test]
@@ -5768,14 +6066,8 @@ otlp_endpoint = ""
             },
         ];
 
-        std::env::set_var(
-            "SQE_AUTH__PROVIDERS__0__CLIENT_SECRET",
-            "from-env-oidc",
-        );
-        std::env::set_var(
-            "SQE_AUTH__PROVIDERS__1__CLIENT_SECRET",
-            "from-env-ccg",
-        );
+        std::env::set_var("SQE_AUTH__PROVIDERS__0__CLIENT_SECRET", "from-env-oidc");
+        std::env::set_var("SQE_AUTH__PROVIDERS__1__CLIENT_SECRET", "from-env-ccg");
 
         cfg.apply_env_overrides();
 
@@ -5870,10 +6162,7 @@ otlp_endpoint = ""
             roles_claim: "realm_access.roles".to_string(),
         }];
 
-        std::env::set_var(
-            "SQE_AUTH__PROVIDERS__0__CLIENT_SECRET",
-            "exchange-secret",
-        );
+        std::env::set_var("SQE_AUTH__PROVIDERS__0__CLIENT_SECRET", "exchange-secret");
 
         cfg.apply_env_overrides();
 
@@ -5957,7 +6246,7 @@ otlp_endpoint = ""
     fn tvf_object_store_prefix_allows_exact_subtree() {
         let policy = TvfPolicy {
             allowed_object_store_prefixes: vec![
-                "s3://data-platform-staging/_table-load-staging/".to_string(),
+                "s3://data-platform-staging/_table-load-staging/".to_string()
             ],
             ..Default::default()
         };
@@ -6008,23 +6297,22 @@ otlp_endpoint = ""
         let err = check_remote(&policy, "s3://staging/uploads/../../etc/x.csv").unwrap_err();
         assert!(err.contains("dot path segment"), "got: {err}");
         // Percent-encoded variants too.
-        let err =
-            check_remote(&policy, "s3://staging/uploads/%2e%2e/secret.csv").unwrap_err();
+        let err = check_remote(&policy, "s3://staging/uploads/%2e%2e/secret.csv").unwrap_err();
         assert!(err.contains("dot path segment"), "got: {err}");
-        let err =
-            check_remote(&policy, "s3://staging/uploads/.%2E/secret.csv").unwrap_err();
+        let err = check_remote(&policy, "s3://staging/uploads/.%2E/secret.csv").unwrap_err();
         assert!(err.contains("dot path segment"), "got: {err}");
         // Percent-encoded slash could smuggle a hidden segment boundary.
-        let err =
-            check_remote(&policy, "s3://staging/uploads%2f..%2fsecret.csv").unwrap_err();
+        let err = check_remote(&policy, "s3://staging/uploads%2f..%2fsecret.csv").unwrap_err();
         assert!(
             err.contains("percent-encoded slash") || err.contains("dot path segment"),
             "got: {err}"
         );
         // Double-encoding (`%252e` -> `%2e` -> `.`).
-        let err =
-            check_remote(&policy, "s3://staging/uploads/%252e%252e/secret.csv").unwrap_err();
-        assert!(err.contains("double-encoding") || err.contains("dot path segment"), "got: {err}");
+        let err = check_remote(&policy, "s3://staging/uploads/%252e%252e/secret.csv").unwrap_err();
+        assert!(
+            err.contains("double-encoding") || err.contains("dot path segment"),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -6062,7 +6350,10 @@ otlp_endpoint = ""
         };
         let admin = TvfCaller::for_user(
             "root".to_string(),
-            vec!["uma_authorization".to_string(), "SQE-Storage-Admin".to_string()],
+            vec![
+                "uma_authorization".to_string(),
+                "SQE-Storage-Admin".to_string(),
+            ],
         );
         assert!(policy
             .check_path("s3://any-bucket/any.parquet", &admin, false)
@@ -6121,10 +6412,7 @@ otlp_endpoint = ""
     #[test]
     fn tvf_allowed_http_host_is_accepted_exact_match() {
         let policy = TvfPolicy {
-            allowed_http_hosts: vec![
-                "data.example.com".to_string(),
-                "huggingface.co".to_string(),
-            ],
+            allowed_http_hosts: vec!["data.example.com".to_string(), "huggingface.co".to_string()],
             ..Default::default()
         };
         assert!(check_remote(&policy, "https://data.example.com/file.parquet").is_ok());
@@ -6223,8 +6511,7 @@ otlp_endpoint = ""
     #[test]
     fn security_default_ignores_x_forwarded_for() {
         let security = SecurityConfig::default();
-        let resolved = security
-            .resolve_client_ip(Some("10.0.0.1:55555"), Some("1.2.3.4"));
+        let resolved = security.resolve_client_ip(Some("10.0.0.1:55555"), Some("1.2.3.4"));
         assert_eq!(resolved, "10.0.0.1:55555");
     }
 
@@ -6234,24 +6521,18 @@ otlp_endpoint = ""
             trusted_proxies: vec!["10.0.0.1".to_string()],
             ..Default::default()
         };
-        let resolved = security
-            .resolve_client_ip(Some("10.0.0.1:33333"), Some("203.0.113.7"));
+        let resolved = security.resolve_client_ip(Some("10.0.0.1:33333"), Some("203.0.113.7"));
         assert_eq!(resolved, "203.0.113.7");
     }
 
     #[test]
     fn security_chain_walks_right_to_left_skipping_trusted() {
         let security = SecurityConfig {
-            trusted_proxies: vec![
-                "10.0.0.1".to_string(),
-                "10.0.0.2".to_string(),
-            ],
+            trusted_proxies: vec!["10.0.0.1".to_string(), "10.0.0.2".to_string()],
             ..Default::default()
         };
-        let resolved = security.resolve_client_ip(
-            Some("10.0.0.1"),
-            Some("203.0.113.7, 10.0.0.2, 10.0.0.1"),
-        );
+        let resolved =
+            security.resolve_client_ip(Some("10.0.0.1"), Some("203.0.113.7, 10.0.0.2, 10.0.0.1"));
         assert_eq!(resolved, "203.0.113.7");
     }
 
@@ -6261,8 +6542,7 @@ otlp_endpoint = ""
             trusted_proxies: vec!["10.0.0.99".to_string()],
             ..Default::default()
         };
-        let resolved = security
-            .resolve_client_ip(Some("198.51.100.5"), Some("1.2.3.4"));
+        let resolved = security.resolve_client_ip(Some("198.51.100.5"), Some("1.2.3.4"));
         assert_eq!(resolved, "198.51.100.5");
     }
 
@@ -6341,7 +6621,10 @@ otlp_endpoint = ""
             "worker_secret leaked to Debug output: {dbg}"
         );
         assert!(dbg.contains("<set>"), "presence sentinel missing: {dbg}");
-        assert!(dbg.contains("CoordinatorConfig"), "struct tag missing: {dbg}");
+        assert!(
+            dbg.contains("CoordinatorConfig"),
+            "struct tag missing: {dbg}"
+        );
     }
 
     #[test]

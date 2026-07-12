@@ -20,7 +20,9 @@ pub struct SystemCatalogEntry {
 
 impl std::fmt::Debug for SystemCatalogEntry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SystemCatalogEntry").field("name", &self.name).finish()
+        f.debug_struct("SystemCatalogEntry")
+            .field("name", &self.name)
+            .finish()
     }
 }
 
@@ -60,7 +62,6 @@ impl SystemCatalogProvider {
 }
 
 impl CatalogProvider for SystemCatalogProvider {
-
     fn schema_names(&self) -> Vec<String> {
         let mut names = vec!["jdbc".to_string(), "metadata".to_string()];
         if self.runtime_schema.is_some() {
@@ -73,7 +74,10 @@ impl CatalogProvider for SystemCatalogProvider {
         match name {
             "jdbc" => Some(self.jdbc_schema.clone()),
             "metadata" => Some(self.metadata_schema.clone()),
-            "runtime" => self.runtime_schema.as_ref().map(|s| s.clone() as Arc<dyn SchemaProvider>),
+            "runtime" => self
+                .runtime_schema
+                .as_ref()
+                .map(|s| s.clone() as Arc<dyn SchemaProvider>),
             _ => None,
         }
     }

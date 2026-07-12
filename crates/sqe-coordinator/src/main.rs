@@ -96,7 +96,9 @@ impl TrinoQueryExecutor for QueryHandlerAdapter {
         prepared_sql: &str,
         kind: sqe_trino_compat::protocol::DescribeKind,
     ) -> Result<Vec<arrow_array::RecordBatch>, sqe_core::SqeError> {
-        self.handler.describe_prepared(session, prepared_sql, kind).await
+        self.handler
+            .describe_prepared(session, prepared_sql, kind)
+            .await
     }
 }
 
@@ -211,9 +213,8 @@ async fn async_main() -> anyhow::Result<()> {
     // Start background health checks (every 5 seconds). Keep the TaskGuard
     // for the lifetime of the binary so cancellation fires at shutdown.
     if !config.coordinator.worker_urls.is_empty() {
-        _task_guards.push(
-            worker_registry.start_health_check_task(std::time::Duration::from_secs(5)),
-        );
+        _task_guards
+            .push(worker_registry.start_health_check_task(std::time::Duration::from_secs(5)));
         tracing::info!(
             workers = ?config.coordinator.worker_urls,
             "Started worker health check task"
@@ -234,11 +235,14 @@ async fn async_main() -> anyhow::Result<()> {
     );
 
     // Initialize query tracker and result cache
-    let query_tracker = Arc::new(
-        sqe_coordinator::query_tracker::QueryTracker::new(&config.query_history),
-    );
+    let query_tracker = Arc::new(sqe_coordinator::query_tracker::QueryTracker::new(
+        &config.query_history,
+    ));
     let query_cache = if config.query_cache.enabled {
-        Some(Arc::new(sqe_coordinator::query_cache::ResultCache::new(&config.query_cache, Some(metrics.clone()))))
+        Some(Arc::new(sqe_coordinator::query_cache::ResultCache::new(
+            &config.query_cache,
+            Some(metrics.clone()),
+        )))
     } else {
         None
     };
@@ -340,10 +344,14 @@ async fn async_main() -> anyhow::Result<()> {
                     let cursor_path = format!("{spool_path}.cursor");
                     let shipper_metrics = sqe_metrics::audit::export::ShipperMetrics {
                         records_total: Some(metrics.audit_export_records_total.clone()),
-                        batch_failures_total: Some(metrics.audit_export_batch_failures_total.clone()),
+                        batch_failures_total: Some(
+                            metrics.audit_export_batch_failures_total.clone(),
+                        ),
                         spool_lag_bytes: Some(metrics.audit_export_spool_lag_bytes.clone()),
                         cursor_seq: Some(metrics.audit_export_cursor_seq.clone()),
-                        last_success_timestamp: Some(metrics.audit_export_last_success_timestamp.clone()),
+                        last_success_timestamp: Some(
+                            metrics.audit_export_last_success_timestamp.clone(),
+                        ),
                     };
                     let shipper = sqe_metrics::audit::export::OtlpLogShipper::new(
                         std::path::PathBuf::from(spool_path),
@@ -369,9 +377,7 @@ async fn async_main() -> anyhow::Result<()> {
         }
     } else {
         // Export disabled or unknown target: no shipper.
-        if config.metrics.audit_export.enabled
-            && config.metrics.audit_export.target != "otlp"
-        {
+        if config.metrics.audit_export.enabled && config.metrics.audit_export.target != "otlp" {
             tracing::warn!(
                 target = %config.metrics.audit_export.target,
                 "audit export: unknown target; only \"otlp\" is supported; shipper will not start"
@@ -527,9 +533,7 @@ async fn async_main() -> anyhow::Result<()> {
     }
 
     let serve_result = server_builder
-        .add_service(arrow_flight::flight_service_server::FlightServiceServer::new(
-            flight_service,
-        ))
+        .add_service(arrow_flight::flight_service_server::FlightServiceServer::new(flight_service))
         .serve_with_shutdown(addr, shutdown_signal())
         .await;
 
@@ -628,9 +632,7 @@ fn build_oauth2_state(
     })
 }
 
-fn build_grant_backend(
-    config: &SqeConfig,
-) -> anyhow::Result<Option<Arc<dyn GrantBackend>>> {
+fn build_grant_backend(config: &SqeConfig) -> anyhow::Result<Option<Arc<dyn GrantBackend>>> {
     use sqe_core::config::AccessControlBackend;
     match config.access_control.backend {
         AccessControlBackend::Chameleon if !config.access_control.url.is_empty() => {

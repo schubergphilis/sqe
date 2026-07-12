@@ -7,9 +7,9 @@ pub mod scan_task;
 pub mod shuffle_exec;
 pub mod single_distinct_count;
 pub mod splitter;
-pub mod stats;
 pub mod stage_planner;
 pub mod star_schema_reorder;
+pub mod stats;
 
 pub use distributed_aggregate::{
     AggregateStrategy, DistributedAggregateRule, FinalAggregateExec, PartialAggregateExec,
@@ -25,7 +25,6 @@ pub use distributed_sort::{
     DistributedSortRule, DEFAULT_DISTRIBUTED_SORT_THRESHOLD, MIN_EXECUTORS_FOR_DISTRIBUTED_SORT,
 };
 pub use join_strategy::JoinStrategyRule;
-pub use star_schema_reorder::{StarSchemaReorderRule, DEFAULT_MIN_RATIO};
 pub use predicate_transfer::{
     build_predicate_transfer, extract_distinct_from_batches, extract_distinct_values,
     PredicateTransfer, MAX_PREDICATE_TRANSFER_VALUES,
@@ -36,3 +35,4 @@ pub use single_distinct_count::SingleDistinctCountCompanionRule;
 pub use splitter::bin_pack_files;
 pub use splitter::split_files;
 pub use stage_planner::{compute_waves, decompose_plan, QueryStage, ShuffleType};
+pub use star_schema_reorder::{StarSchemaReorderRule, DEFAULT_MIN_RATIO};

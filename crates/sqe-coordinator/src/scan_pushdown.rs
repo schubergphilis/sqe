@@ -28,17 +28,17 @@
 use std::sync::Arc;
 
 use datafusion::common::ScalarValue;
-use datafusion::logical_expr::{Expr, expr::InList};
-use datafusion::physical_expr::PhysicalExpr;
+use datafusion::logical_expr::{expr::InList, Expr};
 use datafusion::physical_expr::expressions::{
     BinaryExpr as PhysBinaryExpr, Column as PhysColumn, InListExpr, IsNotNullExpr, IsNullExpr,
     Literal as PhysLiteral, NotExpr,
 };
-use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::limit::{GlobalLimitExec, LocalLimitExec};
 use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::repartition::RepartitionExec;
+use datafusion::physical_plan::ExecutionPlan;
 use datafusion_proto::bytes::Serializeable;
 
 /// Serialize the scan's filter predicate to proto bytes for transport in a
@@ -48,9 +48,7 @@ use datafusion_proto::bytes::Serializeable;
 /// reconstructs a single predicate. Serialization failures are non-fatal: the
 /// caller treats `None` as "ship every projected row" and relies on the
 /// coordinator's `FilterExec`.
-pub fn serialize_scan_predicate(
-    df_filters: &[datafusion::logical_expr::Expr],
-) -> Option<Vec<u8>> {
+pub fn serialize_scan_predicate(df_filters: &[datafusion::logical_expr::Expr]) -> Option<Vec<u8>> {
     if df_filters.is_empty() {
         return None;
     }
@@ -117,7 +115,9 @@ pub fn physical_filter_to_logical_lenient(expr: &Arc<dyn PhysicalExpr>) -> Optio
 pub fn physical_filter_to_logical(expr: &Arc<dyn PhysicalExpr>) -> Option<Expr> {
     let any: &dyn PhysicalExpr = expr.as_ref();
     if let Some(c) = any.downcast_ref::<PhysColumn>() {
-        return Some(Expr::Column(datafusion::common::Column::from_name(c.name())));
+        return Some(Expr::Column(datafusion::common::Column::from_name(
+            c.name(),
+        )));
     }
     if let Some(l) = any.downcast_ref::<PhysLiteral>() {
         return Some(Expr::Literal(l.value().clone(), None));
@@ -144,7 +144,9 @@ pub fn physical_filter_to_logical(expr: &Arc<dyn PhysicalExpr>) -> Option<Expr> 
         return Some(Expr::IsNull(Box::new(physical_filter_to_logical(n.arg())?)));
     }
     if let Some(n) = any.downcast_ref::<IsNotNullExpr>() {
-        return Some(Expr::IsNotNull(Box::new(physical_filter_to_logical(n.arg())?)));
+        return Some(Expr::IsNotNull(Box::new(physical_filter_to_logical(
+            n.arg(),
+        )?)));
     }
     if let Some(n) = any.downcast_ref::<NotExpr>() {
         return Some(Expr::Not(Box::new(physical_filter_to_logical(n.arg())?)));
@@ -243,16 +245,16 @@ pub fn extract_pushable_limit(
 mod tests {
     use super::*;
     use arrow_schema::{DataType, Field, Schema};
+    use datafusion::logical_expr::Operator;
     use datafusion::logical_expr::{col, lit};
     use datafusion::physical_expr::expressions::{col as pcol, lit as plit};
+    use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
     use datafusion::physical_plan::empty::EmptyExec;
-    use datafusion::physical_plan::sorts::sort::SortExec;
     use datafusion::physical_plan::expressions::BinaryExpr;
-    use datafusion::logical_expr::Operator;
     use datafusion::physical_plan::filter::FilterExec;
     use datafusion::physical_plan::projection::ProjectionExec;
+    use datafusion::physical_plan::sorts::sort::SortExec;
     use datafusion::physical_plan::PhysicalExpr;
-    use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
 
     fn schema() -> Arc<Schema> {
         Arc::new(Schema::new(vec![
@@ -283,8 +285,7 @@ mod tests {
         // Two filters fold into one AND expr that decodes back identically.
         let filters = vec![col("a").gt(lit(5i64)), col("b").lt(lit(10i64))];
         let bytes = serialize_scan_predicate(&filters).unwrap();
-        let decoded =
-            datafusion::logical_expr::Expr::from_bytes(&bytes).expect("decode");
+        let decoded = datafusion::logical_expr::Expr::from_bytes(&bytes).expect("decode");
         let expected = col("a").gt(lit(5i64)).and(col("b").lt(lit(10i64)));
         assert_eq!(decoded, expected);
     }
@@ -308,8 +309,7 @@ mod tests {
             vec![(pcol("a", &schema()).unwrap(), "a".to_string())];
         let projection: Arc<dyn ExecutionPlan> =
             Arc::new(ProjectionExec::try_new(proj_expr, scan.clone()).unwrap());
-        let limit: Arc<dyn ExecutionPlan> =
-            Arc::new(GlobalLimitExec::new(projection, 0, Some(10)));
+        let limit: Arc<dyn ExecutionPlan> = Arc::new(GlobalLimitExec::new(projection, 0, Some(10)));
         assert_eq!(extract_pushable_limit(&limit, &scan), Some(10));
     }
 
@@ -327,8 +327,7 @@ mod tests {
         ));
         let filter: Arc<dyn ExecutionPlan> =
             Arc::new(FilterExec::try_new(predicate, scan.clone()).unwrap());
-        let limit: Arc<dyn ExecutionPlan> =
-            Arc::new(GlobalLimitExec::new(filter, 3, Some(10)));
+        let limit: Arc<dyn ExecutionPlan> = Arc::new(GlobalLimitExec::new(filter, 3, Some(10)));
         assert_eq!(extract_pushable_limit(&limit, &scan), None);
     }
 
@@ -341,8 +340,7 @@ mod tests {
             LexOrdering::new(vec![sort_expr]).unwrap(),
             scan.clone(),
         ));
-        let limit: Arc<dyn ExecutionPlan> =
-            Arc::new(GlobalLimitExec::new(sort, 0, Some(10)));
+        let limit: Arc<dyn ExecutionPlan> = Arc::new(GlobalLimitExec::new(sort, 0, Some(10)));
         assert_eq!(extract_pushable_limit(&limit, &scan), None);
     }
 
@@ -355,8 +353,7 @@ mod tests {
     #[test]
     fn offset_only_global_limit_yields_none() {
         let scan = leaf();
-        let limit: Arc<dyn ExecutionPlan> =
-            Arc::new(GlobalLimitExec::new(scan.clone(), 5, None));
+        let limit: Arc<dyn ExecutionPlan> = Arc::new(GlobalLimitExec::new(scan.clone(), 5, None));
         assert_eq!(extract_pushable_limit(&limit, &scan), None);
     }
 
@@ -377,8 +374,7 @@ mod tests {
             Operator::LtEq,
             plit(17i64),
         ));
-        let both: Arc<dyn PhysicalExpr> =
-            Arc::new(BinaryExpr::new(ge, Operator::And, le));
+        let both: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(ge, Operator::And, le));
         let logical = physical_filter_to_logical(&both).expect("convertible");
         assert_eq!(
             logical,
@@ -406,8 +402,7 @@ mod tests {
     fn unconvertible_physical_filter_yields_none() {
         use datafusion::physical_expr::expressions::CaseExpr;
         let case: Arc<dyn PhysicalExpr> = Arc::new(
-            CaseExpr::try_new(None, vec![(plit(true), plit(1i64))], Some(plit(0i64)))
-                .unwrap(),
+            CaseExpr::try_new(None, vec![(plit(true), plit(1i64))], Some(plit(0i64))).unwrap(),
         );
         assert!(physical_filter_to_logical(&case).is_none());
     }
@@ -425,11 +420,9 @@ mod tests {
         ));
         // stand-in for the unconvertible hash_lookup term
         let opaque: Arc<dyn PhysicalExpr> = Arc::new(
-            CaseExpr::try_new(None, vec![(plit(true), plit(true))], Some(plit(false)))
-                .unwrap(),
+            CaseExpr::try_new(None, vec![(plit(true), plit(true))], Some(plit(false))).unwrap(),
         );
-        let both: Arc<dyn PhysicalExpr> =
-            Arc::new(BinaryExpr::new(ge, Operator::And, opaque));
+        let both: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(ge, Operator::And, opaque));
         let logical = physical_filter_to_logical_lenient(&both).expect("partial conversion");
         assert_eq!(logical, col("a").gt_eq(lit(3i64)));
         // strict conversion still refuses the same expr

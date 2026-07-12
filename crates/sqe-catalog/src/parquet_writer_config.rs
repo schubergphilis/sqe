@@ -91,10 +91,7 @@ pub const DEFAULT_BLOOM_FILTER_AUTO: bool = true;
 /// When `bloom-filter-columns` is unset and `bloom-filter-auto` is true
 /// (default), auto-detects FK-shaped integer columns; see
 /// [`auto_detect_fk_columns`].
-pub fn writer_props_for_table(
-    table: &Table,
-    compression: Compression,
-) -> WriterProperties {
+pub fn writer_props_for_table(table: &Table, compression: Compression) -> WriterProperties {
     build_writer_props(
         table.metadata().properties(),
         table.metadata().current_schema(),
@@ -258,28 +255,17 @@ mod tests {
     fn schema_fact_table() -> IcebergSchema {
         IcebergSchema::builder()
             .with_fields(vec![
-                NestedField::required(1, "ss_item_sk", Type::Primitive(PrimitiveType::Long))
-                    .into(),
-                NestedField::required(2, "ss_store_sk", Type::Primitive(PrimitiveType::Int))
-                    .into(),
+                NestedField::required(1, "ss_item_sk", Type::Primitive(PrimitiveType::Long)).into(),
+                NestedField::required(2, "ss_store_sk", Type::Primitive(PrimitiveType::Int)).into(),
                 NestedField::optional(3, "ss_promo_sk", Type::Primitive(PrimitiveType::Long))
                     .into(),
                 NestedField::required(4, "i_item_id", Type::Primitive(PrimitiveType::String))
                     .into(),
-                NestedField::optional(
-                    5,
-                    "transaction_id",
-                    Type::Primitive(PrimitiveType::Long),
-                )
-                .into(),
-                NestedField::optional(6, "ss_quantity", Type::Primitive(PrimitiveType::Int))
+                NestedField::optional(5, "transaction_id", Type::Primitive(PrimitiveType::Long))
                     .into(),
-                NestedField::optional(
-                    7,
-                    "ss_sales_price",
-                    Type::Primitive(PrimitiveType::Double),
-                )
-                .into(),
+                NestedField::optional(6, "ss_quantity", Type::Primitive(PrimitiveType::Int)).into(),
+                NestedField::optional(7, "ss_sales_price", Type::Primitive(PrimitiveType::Double))
+                    .into(),
             ])
             .build()
             .expect("schema")
@@ -385,10 +371,9 @@ mod tests {
         let schema = schema_fact_table();
         let w = build_writer_props(&props, &schema, Compression::UNCOMPRESSED);
 
-        assert!(
-            w.bloom_filter_properties(&ColumnPath::new(vec!["ss_promo_sk".to_string()]))
-                .is_some()
-        );
+        assert!(w
+            .bloom_filter_properties(&ColumnPath::new(vec!["ss_promo_sk".to_string()]))
+            .is_some());
         for col in ["ss_item_sk", "ss_store_sk"] {
             assert!(
                 w.bloom_filter_properties(&ColumnPath::new(vec![col.to_string()]))
@@ -481,14 +466,12 @@ mod tests {
         );
         let schema = schema_id_name();
         let w = build_writer_props(&props, &schema, Compression::UNCOMPRESSED);
-        assert!(
-            w.bloom_filter_properties(&ColumnPath::new(vec!["id".to_string()]))
-                .is_some()
-        );
-        assert!(
-            w.bloom_filter_properties(&ColumnPath::new(vec!["does_not_exist".to_string()]))
-                .is_none()
-        );
+        assert!(w
+            .bloom_filter_properties(&ColumnPath::new(vec!["id".to_string()]))
+            .is_some());
+        assert!(w
+            .bloom_filter_properties(&ColumnPath::new(vec!["does_not_exist".to_string()]))
+            .is_none());
     }
 
     #[test]

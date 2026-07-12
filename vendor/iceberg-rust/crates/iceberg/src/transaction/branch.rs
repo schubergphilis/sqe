@@ -30,8 +30,8 @@ use async_trait::async_trait;
 
 use crate::spec::{MAIN_BRANCH, SnapshotReference, SnapshotRetention};
 use crate::table::Table;
-use crate::transaction::action::{ActionCommit, TransactionAction};
 use crate::transaction::Transaction;
+use crate::transaction::action::{ActionCommit, TransactionAction};
 use crate::{Error, ErrorKind, Result, TableUpdate};
 
 /// A transactional action that creates or updates a named branch.
@@ -90,12 +90,7 @@ impl TransactionAction for CreateBranchAction {
             ));
         }
 
-        if self.if_not_exists
-            && table
-                .metadata()
-                .snapshot_for_ref(&self.name)
-                .is_some()
-        {
+        if self.if_not_exists && table.metadata().snapshot_for_ref(&self.name).is_some() {
             return Ok(ActionCommit::new(vec![], vec![]));
         }
 
@@ -112,15 +107,12 @@ impl TransactionAction for CreateBranchAction {
                 }
                 id
             }
-            None => table
-                .metadata()
-                .current_snapshot_id()
-                .ok_or_else(|| {
-                    Error::new(
-                        ErrorKind::PreconditionFailed,
-                        "CREATE BRANCH requires an existing snapshot; table has none",
-                    )
-                })?,
+            None => table.metadata().current_snapshot_id().ok_or_else(|| {
+                Error::new(
+                    ErrorKind::PreconditionFailed,
+                    "CREATE BRANCH requires an existing snapshot; table has none",
+                )
+            })?,
         };
 
         let retention = self.retention.clone().unwrap_or(SnapshotRetention::Branch {
@@ -209,15 +201,12 @@ impl TransactionAction for CreateTagAction {
                 }
                 id
             }
-            None => table
-                .metadata()
-                .current_snapshot_id()
-                .ok_or_else(|| {
-                    Error::new(
-                        ErrorKind::PreconditionFailed,
-                        "CREATE TAG requires an existing snapshot; table has none",
-                    )
-                })?,
+            None => table.metadata().current_snapshot_id().ok_or_else(|| {
+                Error::new(
+                    ErrorKind::PreconditionFailed,
+                    "CREATE TAG requires an existing snapshot; table has none",
+                )
+            })?,
         };
 
         let retention = SnapshotRetention::Tag {

@@ -125,12 +125,7 @@ impl PredicateTransfer {
             return None;
         }
 
-        let list: Vec<Expr> = self
-            .key_values
-            .iter()
-            .cloned()
-            .map(lit)
-            .collect();
+        let list: Vec<Expr> = self.key_values.iter().cloned().map(lit).collect();
 
         debug!(
             num_values = list.len(),
@@ -220,11 +215,8 @@ pub fn build_predicate_transfer(
     build_column: &str,
     probe_column: &str,
 ) -> Option<PredicateTransfer> {
-    let values = extract_distinct_from_batches(
-        batches,
-        build_column,
-        MAX_PREDICATE_TRANSFER_VALUES,
-    )?;
+    let values =
+        extract_distinct_from_batches(batches, build_column, MAX_PREDICATE_TRANSFER_VALUES)?;
 
     let transfer = PredicateTransfer::new(values, probe_column);
 
@@ -246,9 +238,9 @@ pub fn build_predicate_transfer(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
     use arrow_array::{Int64Array, StringArray};
     use arrow_schema::{DataType, Field, Schema};
+    use std::sync::Arc;
 
     fn make_int_batch(values: Vec<Option<i64>>) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
@@ -262,11 +254,7 @@ mod tests {
                 .map(|v| v.map(|n| format!("name_{n}")))
                 .collect::<Vec<_>>(),
         );
-        RecordBatch::try_new(
-            schema,
-            vec![Arc::new(id_array), Arc::new(name_array)],
-        )
-        .unwrap()
+        RecordBatch::try_new(schema, vec![Arc::new(id_array), Arc::new(name_array)]).unwrap()
     }
 
     // ─── PredicateTransfer tests ───
@@ -289,9 +277,7 @@ mod tests {
 
     #[test]
     fn test_predicate_transfer_should_apply_normal() {
-        let values: HashSet<ScalarValue> = (1..=100)
-            .map(|i| ScalarValue::Int64(Some(i)))
-            .collect();
+        let values: HashSet<ScalarValue> = (1..=100).map(|i| ScalarValue::Int64(Some(i))).collect();
 
         let transfer = PredicateTransfer::new(values, "id");
         assert!(transfer.should_apply());
@@ -451,8 +437,7 @@ mod tests {
 
     #[test]
     fn test_extract_distinct_from_batches_empty() {
-        let values =
-            extract_distinct_from_batches(&[], "id", MAX_PREDICATE_TRANSFER_VALUES);
+        let values = extract_distinct_from_batches(&[], "id", MAX_PREDICATE_TRANSFER_VALUES);
         assert!(values.is_none());
     }
 
@@ -495,9 +480,7 @@ mod tests {
 
     #[test]
     fn test_predicate_transfer_clone() {
-        let values: HashSet<ScalarValue> = vec![ScalarValue::Int64(Some(1))]
-            .into_iter()
-            .collect();
+        let values: HashSet<ScalarValue> = vec![ScalarValue::Int64(Some(1))].into_iter().collect();
         let transfer = PredicateTransfer::new(values, "id");
         let cloned = transfer.clone();
         assert_eq!(cloned.num_values(), transfer.num_values());
@@ -506,9 +489,7 @@ mod tests {
 
     #[test]
     fn test_predicate_transfer_debug() {
-        let values: HashSet<ScalarValue> = vec![ScalarValue::Int64(Some(42))]
-            .into_iter()
-            .collect();
+        let values: HashSet<ScalarValue> = vec![ScalarValue::Int64(Some(42))].into_iter().collect();
         let transfer = PredicateTransfer::new(values, "id");
         let debug_str = format!("{transfer:?}");
         assert!(debug_str.contains("PredicateTransfer"));
@@ -524,17 +505,11 @@ mod tests {
         // Probe side: large fact table with customer_id column
         // Predicate transfer pushes: WHERE customer_id IN (100, 200, 300)
 
-        let build_batches = vec![
-            make_int_batch(vec![Some(100), Some(200), Some(300)]),
-        ];
+        let build_batches = vec![make_int_batch(vec![Some(100), Some(200), Some(300)])];
 
         // Step 1: Build the transfer from build-side batches
-        let transfer = build_predicate_transfer(
-            &build_batches,
-            "id",
-            "customer_id",
-        )
-        .expect("Should create predicate transfer");
+        let transfer = build_predicate_transfer(&build_batches, "id", "customer_id")
+            .expect("Should create predicate transfer");
 
         assert_eq!(transfer.num_values(), 3);
         assert_eq!(transfer.probe_column(), "customer_id");

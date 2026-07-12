@@ -287,7 +287,9 @@ mod tests {
         let table = make_v2_minimal_table();
         let tx = Transaction::new(&table);
 
-        let action = tx.row_delta().add_data_files(vec![data_file("test/1.parquet")]);
+        let action = tx
+            .row_delta()
+            .add_data_files(vec![data_file("test/1.parquet")]);
         let mut action_commit = Arc::new(action).commit(&table).await.unwrap();
         let updates = action_commit.take_updates();
 

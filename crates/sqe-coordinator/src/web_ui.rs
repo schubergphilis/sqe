@@ -100,7 +100,12 @@ pub struct OverviewDto {
 /// is computed by the caller from `Instant::elapsed`. `cpu_cores` is
 /// `std::thread::available_parallelism()` (fallback 1), resolved by the caller.
 /// The tracker provides all runtime counters.
-pub fn overview(node: &NodeInfo, uptime_seconds: u64, cpu_cores: usize, tracker: &QueryTracker) -> OverviewDto {
+pub fn overview(
+    node: &NodeInfo,
+    uptime_seconds: u64,
+    cpu_cores: usize,
+    tracker: &QueryTracker,
+) -> OverviewDto {
     let records = tracker.records();
 
     let mut running = 0usize;
@@ -131,7 +136,11 @@ pub fn overview(node: &NodeInfo, uptime_seconds: u64, cpu_cores: usize, tracker:
         total_spill_bytes += rec.spill_bytes;
     }
 
-    let avg_execution_ms = if finished > 0 { finished_execution_ms_sum / finished as u64 } else { 0 };
+    let avg_execution_ms = if finished > 0 {
+        finished_execution_ms_sum / finished as u64
+    } else {
+        0
+    };
     let total_queries = records.len();
 
     let memory_limit_bytes = node
@@ -415,16 +424,28 @@ mod tests {
     use sqe_core::QueryHistoryConfig;
 
     fn tracker() -> QueryTracker {
-        QueryTracker::new(&QueryHistoryConfig { max_entries: 100, ttl_secs: 60 })
+        QueryTracker::new(&QueryHistoryConfig {
+            max_entries: 100,
+            ttl_secs: 60,
+        })
     }
 
     #[tokio::test]
     async fn query_list_returns_started_records_recent_first() {
         let t = tracker();
         let id1 = Uuid::now_v7();
-        t.start(id1, "alice", Some("cli"), "SELECT 1", "s1", None, vec![]);
+        t.start(id1, "alice", Some("cli"), "SELECT 1", "s1", None, vec![], None);
         let id2 = Uuid::now_v7();
-        t.start(id2, "bob", Some("flight_sql"), "SELECT 2", "s2", None, vec![]);
+        t.start(
+            id2,
+            "bob",
+            Some("flight_sql"),
+            "SELECT 2",
+            "s2",
+            None,
+            vec![],
+            None,
+        );
 
         let list = query_list(&t, None, 100);
         assert_eq!(list.len(), 2);
@@ -441,14 +462,17 @@ mod tests {
         let t = tracker();
         let id = Uuid::now_v7();
         let sql = "SELECT secret FROM t WHERE email = 'jane@x.com'";
-        t.start(id, "alice", None, sql, "s1", None, vec![]);
+        t.start(id, "alice", None, sql, "s1", None, vec![], None);
         t.running(&id, 5);
 
         let running = query_list(&t, Some("running"), 100);
         assert_eq!(running.len(), 1);
         // Raw SQL must not appear in the DTO; redact_pii replaces PII patterns.
         let json = serde_json::to_string(&running[0]).unwrap();
-        assert!(!json.contains("jane@x.com"), "raw email must not appear in serialized DTO: {json}");
+        assert!(
+            !json.contains("jane@x.com"),
+            "raw email must not appear in serialized DTO: {json}"
+        );
         assert_eq!(running[0].sql_hash, sql_digest(sql));
 
         let finished = query_list(&t, Some("finished"), 100);
@@ -462,7 +486,16 @@ mod tests {
     async fn query_list_respects_limit() {
         let t = tracker();
         for i in 0..10 {
-            t.start(Uuid::now_v7(), &format!("u{i}"), None, "SELECT 1", "s", None, vec![]);
+            t.start(
+                Uuid::now_v7(),
+                &format!("u{i}"),
+                None,
+                "SELECT 1",
+                "s",
+                None,
+                vec![],
+                None,
+            );
         }
         assert_eq!(query_list(&t, None, 3).len(), 3);
     }
@@ -474,7 +507,7 @@ mod tests {
         // Multibyte SQL must hash cleanly (the old byte-slice truncation could
         // split a char; hashing operates on bytes and never panics).
         let sql = "λ".repeat(600);
-        t.start(id, "alice", None, &sql, "s1", None, vec![]);
+        t.start(id, "alice", None, &sql, "s1", None, vec![], None);
         let list = query_list(&t, None, 100);
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].sql_hash, sql_digest(&sql));
@@ -485,15 +518,27 @@ mod tests {
         use crate::query_tracker::{FragmentInfo, FragmentState};
         let t = tracker();
         let id = Uuid::now_v7();
-        t.start(id, "alice", None, "SELECT *", "s1", None, vec!["analyst".to_string()]);
-        t.set_fragments(&id, vec![FragmentInfo {
-            task_id: "frag-0".into(),
-            worker_url: "http://w1:50052".into(),
-            state: FragmentState::Running,
-            elapsed_ms: 12,
-            input_rows: 5,
-            output_rows: 3,
-        }]);
+        t.start(
+            id,
+            "alice",
+            None,
+            "SELECT *",
+            "s1",
+            None,
+            vec!["analyst".to_string()],
+            None,
+        );
+        t.set_fragments(
+            &id,
+            vec![FragmentInfo {
+                task_id: "frag-0".into(),
+                worker_url: "http://w1:50052".into(),
+                state: FragmentState::Running,
+                elapsed_ms: 12,
+                input_rows: 5,
+                output_rows: 3,
+            }],
+        );
 
         let detail = query_detail(&t, &id).expect("detail present");
         assert_eq!(detail.summary.query_id, id.to_string());
@@ -516,16 +561,37 @@ mod tests {
         use crate::query_tracker::{FragmentInfo, FragmentState};
         let t = tracker();
         let id = Uuid::now_v7();
-        t.start(id, "alice", None, "SELECT *", "s1", None, vec![]);
+        t.start(id, "alice", None, "SELECT *", "s1", None, vec![], None);
         t.running(&id, 1);
-        t.set_fragments(&id, vec![
-            FragmentInfo { task_id: "f0".into(), worker_url: "http://w1:50052".into(),
-                state: FragmentState::Running, elapsed_ms: 0, input_rows: 0, output_rows: 0 },
-            FragmentInfo { task_id: "f1".into(), worker_url: "http://w1:50052".into(),
-                state: FragmentState::Running, elapsed_ms: 0, input_rows: 0, output_rows: 0 },
-            FragmentInfo { task_id: "f2".into(), worker_url: "http://w2:50052".into(),
-                state: FragmentState::Finished, elapsed_ms: 9, input_rows: 0, output_rows: 0 },
-        ]);
+        t.set_fragments(
+            &id,
+            vec![
+                FragmentInfo {
+                    task_id: "f0".into(),
+                    worker_url: "http://w1:50052".into(),
+                    state: FragmentState::Running,
+                    elapsed_ms: 0,
+                    input_rows: 0,
+                    output_rows: 0,
+                },
+                FragmentInfo {
+                    task_id: "f1".into(),
+                    worker_url: "http://w1:50052".into(),
+                    state: FragmentState::Running,
+                    elapsed_ms: 0,
+                    input_rows: 0,
+                    output_rows: 0,
+                },
+                FragmentInfo {
+                    task_id: "f2".into(),
+                    worker_url: "http://w2:50052".into(),
+                    state: FragmentState::Finished,
+                    elapsed_ms: 9,
+                    input_rows: 0,
+                    output_rows: 0,
+                },
+            ],
+        );
 
         let view = workers_view(
             2,
@@ -536,9 +602,17 @@ mod tests {
         assert_eq!(view.total, 2);
         assert_eq!(view.healthy_count, 2);
         assert_eq!(view.active_queries, 1);
-        let w1 = view.workers.iter().find(|w| w.url == "http://w1:50052").unwrap();
+        let w1 = view
+            .workers
+            .iter()
+            .find(|w| w.url == "http://w1:50052")
+            .unwrap();
         assert_eq!(w1.in_flight, 2);
-        let w2 = view.workers.iter().find(|w| w.url == "http://w2:50052").unwrap();
+        let w2 = view
+            .workers
+            .iter()
+            .find(|w| w.url == "http://w2:50052")
+            .unwrap();
         assert_eq!(w2.in_flight, 0); // its only fragment is Finished
     }
 
@@ -600,20 +674,32 @@ mod tests {
 
         // Two finished queries with different execution times.
         let id1 = Uuid::now_v7();
-        t.start(id1, "alice", None, "SELECT 1", "s1", None, vec![]);
+        t.start(id1, "alice", None, "SELECT 1", "s1", None, vec![], None);
         t.running(&id1, 5);
-        t.complete(&id1, 100, 200, vec!["t1".to_string()], 1024, 100, 0, 512 * 1024 * 1024);
+        t.complete(
+            &id1,
+            100,
+            200,
+            vec!["t1".to_string()],
+            1024,
+            100,
+            0,
+            512 * 1024 * 1024,
+        );
 
         let id2 = Uuid::now_v7();
-        t.start(id2, "bob", None, "SELECT 2", "s2", None, vec![]);
+        t.start(id2, "bob", None, "SELECT 2", "s2", None, vec![], None);
         t.running(&id2, 3);
         t.complete(&id2, 50, 400, vec![], 2048, 50, 64, 256 * 1024 * 1024);
 
         // One failed query.
         let id3 = Uuid::now_v7();
-        t.start(id3, "carol", None, "BAD SQL", "s3", None, vec![]);
+        t.start(id3, "carol", None, "BAD SQL", "s3", None, vec![], None);
         t.running(&id3, 1);
-        t.failed(&id3, &sqe_core::SqeError::Execution("syntax error".to_string()));
+        t.failed(
+            &id3,
+            &sqe_core::SqeError::Execution("syntax error".to_string()),
+        );
 
         let node = default_node_info();
         let dto = overview(&node, 0, 2, &t);
@@ -627,7 +713,7 @@ mod tests {
         assert_eq!(dto.metrics.avg_execution_ms, 300);
         assert_eq!(dto.metrics.total_output_rows, 150); // 100 + 50
         assert_eq!(dto.metrics.total_bytes_scanned, 3072); // 1024 + 2048
-        // peak memory = max(512MB, 256MB) = 512MB
+                                                           // peak memory = max(512MB, 256MB) = 512MB
         assert_eq!(dto.resources.peak_query_memory_bytes, 512 * 1024 * 1024);
         assert_eq!(dto.resources.total_spill_bytes, 64);
     }
@@ -658,7 +744,16 @@ mod tests {
         let t = tracker();
         let id = Uuid::now_v7();
         let sql = "SELECT * FROM users WHERE email = 'a@b.com'";
-        t.start(id, "alice", None, sql, "s1", Some("10.0.0.7"), vec!["admin".to_string()]);
+        t.start(
+            id,
+            "alice",
+            None,
+            sql,
+            "s1",
+            Some("10.0.0.7"),
+            vec!["admin".to_string()],
+            None,
+        );
 
         let list = query_list(&t, None, 100);
         assert_eq!(list.len(), 1);
@@ -668,8 +763,16 @@ mod tests {
         assert_eq!(item.roles, vec!["admin".to_string()]);
         assert_eq!(item.client_ip, Some("10.0.0.7".to_string()));
         // sql must be redact_pii output: email replaced, raw literal absent.
-        assert!(item.sql.contains("[EMAIL]"), "expected [EMAIL] in sql, got: {}", item.sql);
-        assert!(!item.sql.contains("a@b.com"), "raw email must not appear in sql, got: {}", item.sql);
+        assert!(
+            item.sql.contains("[EMAIL]"),
+            "expected [EMAIL] in sql, got: {}",
+            item.sql
+        );
+        assert!(
+            !item.sql.contains("a@b.com"),
+            "raw email must not appear in sql, got: {}",
+            item.sql
+        );
     }
 
     /// error_message is passed through redact_pii so PII in engine error
@@ -678,11 +781,10 @@ mod tests {
     async fn error_message_is_redacted_in_dto() {
         let t = tracker();
         let id = Uuid::now_v7();
-        t.start(id, "bob", None, "SELECT 1", "s1", None, vec![]);
+        t.start(id, "bob", None, "SELECT 1", "s1", None, vec![], None);
         // Simulate a failed query whose error message contains an email address.
-        let err = sqe_core::SqeError::Execution(
-            "constraint violation for user 'a@b.com'".to_string(),
-        );
+        let err =
+            sqe_core::SqeError::Execution("constraint violation for user 'a@b.com'".to_string());
         t.failed(&id, &err);
 
         let list = query_list(&t, None, 100);
@@ -690,7 +792,10 @@ mod tests {
         let item = &list[0];
 
         // The DTO must contain the redacted placeholder, not the raw address.
-        let msg = item.error_message.as_deref().expect("error_message present");
+        let msg = item
+            .error_message
+            .as_deref()
+            .expect("error_message present");
         assert!(
             msg.contains("[EMAIL]"),
             "expected [EMAIL] in error_message, got: {msg}"

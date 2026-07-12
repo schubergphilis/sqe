@@ -159,15 +159,13 @@ impl AwsIamProvider {
             signed_headers = "content-type;host;x-amz-date;x-amz-security-token".to_string();
         }
 
-        let canonical_request = format!(
-            "POST\n/\n\n{canonical_headers}\n{signed_headers}\n{payload_hash}"
-        );
+        let canonical_request =
+            format!("POST\n/\n\n{canonical_headers}\n{signed_headers}\n{payload_hash}");
 
         // Step 2: String to sign
         let canonical_request_hash = hex_sha256(canonical_request.as_bytes());
-        let string_to_sign = format!(
-            "AWS4-HMAC-SHA256\n{amz_date}\n{credential_scope}\n{canonical_request_hash}"
-        );
+        let string_to_sign =
+            format!("AWS4-HMAC-SHA256\n{amz_date}\n{credential_scope}\n{canonical_request_hash}");
 
         // Step 3: Signing key
         let signing_key = derive_signing_key(secret_access_key, &date_stamp, region, service);
@@ -200,10 +198,9 @@ impl AwsIamProvider {
             .map_err(|e| AuthError::Internal(anyhow::anyhow!("STS request failed: {e}")))?;
 
         let status = response.status();
-        let response_body = response
-            .text()
-            .await
-            .map_err(|e| AuthError::Internal(anyhow::anyhow!("failed to read STS response: {e}")))?;
+        let response_body = response.text().await.map_err(|e| {
+            AuthError::Internal(anyhow::anyhow!("failed to read STS response: {e}"))
+        })?;
 
         if !status.is_success() {
             debug!(status = %status, body = %response_body, "STS GetCallerIdentity rejected");
@@ -221,24 +218,15 @@ impl AwsIamProvider {
         //     <Account>123456789012</Account>
         //   </GetCallerIdentityResult>
         // </GetCallerIdentityResponse>
-        let arn = extract_xml_element(&response_body, "Arn")
-            .ok_or_else(|| {
-                AuthError::Internal(anyhow::anyhow!(
-                    "STS response missing <Arn> element"
-                ))
-            })?;
-        let user_id = extract_xml_element(&response_body, "UserId")
-            .ok_or_else(|| {
-                AuthError::Internal(anyhow::anyhow!(
-                    "STS response missing <UserId> element"
-                ))
-            })?;
-        let account = extract_xml_element(&response_body, "Account")
-            .ok_or_else(|| {
-                AuthError::Internal(anyhow::anyhow!(
-                    "STS response missing <Account> element"
-                ))
-            })?;
+        let arn = extract_xml_element(&response_body, "Arn").ok_or_else(|| {
+            AuthError::Internal(anyhow::anyhow!("STS response missing <Arn> element"))
+        })?;
+        let user_id = extract_xml_element(&response_body, "UserId").ok_or_else(|| {
+            AuthError::Internal(anyhow::anyhow!("STS response missing <UserId> element"))
+        })?;
+        let account = extract_xml_element(&response_body, "Account").ok_or_else(|| {
+            AuthError::Internal(anyhow::anyhow!("STS response missing <Account> element"))
+        })?;
 
         Ok(StsIdentity {
             arn,
@@ -443,8 +431,7 @@ fn hex_sha256(data: &[u8]) -> String {
 
 /// Compute HMAC-SHA256.
 fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
-    let mut mac =
-        HmacSha256::new_from_slice(key).expect("HMAC can take key of any size");
+    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC can take key of any size");
     mac.update(data);
     mac.finalize().into_bytes().to_vec()
 }
@@ -458,10 +445,7 @@ fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
 /// kSigning = HMAC(kService, "aws4_request")
 /// ```
 fn derive_signing_key(secret: &str, date_stamp: &str, region: &str, service: &str) -> Vec<u8> {
-    let k_date = hmac_sha256(
-        format!("AWS4{secret}").as_bytes(),
-        date_stamp.as_bytes(),
-    );
+    let k_date = hmac_sha256(format!("AWS4{secret}").as_bytes(), date_stamp.as_bytes());
     let k_region = hmac_sha256(&k_date, region.as_bytes());
     let k_service = hmac_sha256(&k_region, service.as_bytes());
     hmac_sha256(&k_service, b"aws4_request")
@@ -602,7 +586,9 @@ mod tests {
 
         let creds = FlightCredentials {
             username: Some("AKIAIOSFODNN7EXAMPLE".to_string()),
-            password: Some(sqe_core::SecretString::new("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string())),
+            password: Some(sqe_core::SecretString::new(
+                "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string(),
+            )),
             ..Default::default()
         };
 
@@ -799,15 +785,13 @@ mod tests {
 
     #[test]
     fn extract_xml_element_basic() {
-        let xml = "<Response><Arn>arn:aws:iam::123:user/Alice</Arn><Account>123</Account></Response>";
+        let xml =
+            "<Response><Arn>arn:aws:iam::123:user/Alice</Arn><Account>123</Account></Response>";
         assert_eq!(
             extract_xml_element(xml, "Arn"),
             Some("arn:aws:iam::123:user/Alice".to_string())
         );
-        assert_eq!(
-            extract_xml_element(xml, "Account"),
-            Some("123".to_string())
-        );
+        assert_eq!(extract_xml_element(xml, "Account"), Some("123".to_string()));
     }
 
     #[test]

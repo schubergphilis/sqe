@@ -437,11 +437,8 @@ impl PhysicalOptimizerRule for DistributedAggregateRule {
                 if input_size > threshold {
                     // Estimate group cardinality for strategy selection
                     let estimated_groups = estimate_group_cardinality(agg_exec);
-                    let strategy = select_aggregate_strategy(
-                        estimated_groups,
-                        num_executors,
-                        hc_threshold,
-                    );
+                    let strategy =
+                        select_aggregate_strategy(estimated_groups, num_executors, hc_threshold);
 
                     debug!(
                         input_bytes = input_size,
@@ -467,9 +464,10 @@ impl PhysicalOptimizerRule for DistributedAggregateRule {
                         }
                     };
 
-                    let partial_node: Arc<dyn ExecutionPlan> = Arc::new(
-                        PartialAggregateExec::new(Arc::new(partial_agg), strategy.clone()),
-                    );
+                    let partial_node: Arc<dyn ExecutionPlan> = Arc::new(PartialAggregateExec::new(
+                        Arc::new(partial_agg),
+                        strategy.clone(),
+                    ));
 
                     // Create final aggregate consuming partial results
                     let final_agg = match AggregateExec::try_new(
@@ -487,9 +485,8 @@ impl PhysicalOptimizerRule for DistributedAggregateRule {
                         }
                     };
 
-                    let final_node: Arc<dyn ExecutionPlan> = Arc::new(
-                        FinalAggregateExec::new(Arc::new(final_agg), strategy),
-                    );
+                    let final_node: Arc<dyn ExecutionPlan> =
+                        Arc::new(FinalAggregateExec::new(Arc::new(final_agg), strategy));
 
                     return Ok(Transformed::yes(final_node));
                 }
@@ -537,8 +534,7 @@ fn estimate_group_cardinality(agg: &AggregateExec) -> Option<usize> {
 
     // Only plain column references map to an input column index; anything else
     // (expressions, function calls) has no single backing column statistic.
-    let column = first_expr
-        .downcast_ref::<datafusion::physical_expr::expressions::Column>()?;
+    let column = first_expr.downcast_ref::<datafusion::physical_expr::expressions::Column>()?;
     let col_index = column.index();
 
     let input = &agg.children()[0];
@@ -564,12 +560,7 @@ mod tests {
             "CoordinatorMerge"
         );
         assert_eq!(
-            format!(
-                "{}",
-                AggregateStrategy::ShuffleMerge {
-                    num_partitions: 4
-                }
-            ),
+            format!("{}", AggregateStrategy::ShuffleMerge { num_partitions: 4 }),
             "ShuffleMerge(partitions=4)"
         );
     }
@@ -586,9 +577,7 @@ mod tests {
             select_aggregate_strategy(Some(200_000), 4, DEFAULT_HIGH_CARDINALITY_THRESHOLD);
         assert_eq!(
             strategy,
-            AggregateStrategy::ShuffleMerge {
-                num_partitions: 4
-            }
+            AggregateStrategy::ShuffleMerge { num_partitions: 4 }
         );
     }
 
@@ -620,9 +609,7 @@ mod tests {
         let strategy = select_aggregate_strategy(Some(threshold + 1), 4, threshold);
         assert_eq!(
             strategy,
-            AggregateStrategy::ShuffleMerge {
-                num_partitions: 4
-            }
+            AggregateStrategy::ShuffleMerge { num_partitions: 4 }
         );
     }
 
@@ -661,9 +648,8 @@ mod tests {
         );
         let config = ConfigOptions::new();
 
-        let schema: SchemaRef = Arc::new(Schema::new(vec![
-            Field::new("key", DataType::Int64, false),
-        ]));
+        let schema: SchemaRef =
+            Arc::new(Schema::new(vec![Field::new("key", DataType::Int64, false)]));
         let input: Arc<dyn ExecutionPlan> =
             Arc::new(LazyMemoryExec::try_new(schema, vec![]).unwrap());
 
@@ -701,25 +687,15 @@ mod tests {
         );
         assert_ne!(
             AggregateStrategy::CoordinatorMerge,
-            AggregateStrategy::ShuffleMerge {
-                num_partitions: 4
-            }
+            AggregateStrategy::ShuffleMerge { num_partitions: 4 }
         );
         assert_eq!(
-            AggregateStrategy::ShuffleMerge {
-                num_partitions: 4
-            },
-            AggregateStrategy::ShuffleMerge {
-                num_partitions: 4
-            }
+            AggregateStrategy::ShuffleMerge { num_partitions: 4 },
+            AggregateStrategy::ShuffleMerge { num_partitions: 4 }
         );
         assert_ne!(
-            AggregateStrategy::ShuffleMerge {
-                num_partitions: 4
-            },
-            AggregateStrategy::ShuffleMerge {
-                num_partitions: 8
-            }
+            AggregateStrategy::ShuffleMerge { num_partitions: 4 },
+            AggregateStrategy::ShuffleMerge { num_partitions: 8 }
         );
     }
 
@@ -730,9 +706,11 @@ mod tests {
         use arrow_schema::{DataType, Field, Schema, SchemaRef};
         use datafusion::physical_plan::memory::LazyMemoryExec;
 
-        let schema: SchemaRef = Arc::new(Schema::new(vec![
-            Field::new("val", DataType::Float64, true),
-        ]));
+        let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+            "val",
+            DataType::Float64,
+            true,
+        )]));
         let input: Arc<dyn ExecutionPlan> =
             Arc::new(LazyMemoryExec::try_new(schema.clone(), vec![]).unwrap());
 

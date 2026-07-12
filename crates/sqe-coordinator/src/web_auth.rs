@@ -26,7 +26,9 @@ use axum::{
 };
 use sqe_auth::{AuthProvider, FlightCredentials, Identity};
 use sqe_core::SecretString;
-use sqe_metrics::audit::{Actor, AuditEvent, AuditKind, AuditLogger, Integrity, Outcome, QueryInfo};
+use sqe_metrics::audit::{
+    Actor, AuditEvent, AuditKind, AuditLogger, Integrity, Outcome, QueryInfo,
+};
 
 /// Reason a bearer-admin guard check failed.
 #[derive(Debug, PartialEq, Eq)]
@@ -164,13 +166,7 @@ pub fn dashboard_audit_event(
         }
         // Forbidden with no identity (should not occur; handled defensively).
         Err((GuardReject::Forbidden, None)) => {
-            let actor = Actor::from_parts(
-                "unknown".into(),
-                None,
-                None,
-                vec![],
-                vec![],
-            );
+            let actor = Actor::from_parts("unknown".into(), None, None, vec![], vec![]);
             let outcome = Outcome::Failure {
                 error_type: Some("DashboardAccessDenied".into()),
                 error_code: None,
@@ -246,8 +242,7 @@ where
     // Resolve the client IP using the state's configured proxy trust list.
     // `resolve_client_ip` on the trait defaults to peer-wins (no XFF);
     // HealthState overrides this to call SecurityConfig::resolve_client_ip.
-    let client_ip: Option<String> =
-        state.resolve_client_ip(peer.as_deref(), xff.as_deref());
+    let client_ip: Option<String> = state.resolve_client_ip(peer.as_deref(), xff.as_deref());
 
     let header = request
         .headers()
@@ -352,32 +347,40 @@ mod tests {
 
     #[tokio::test]
     async fn missing_header_is_unauthorized() {
-        let p: Arc<dyn sqe_auth::AuthProvider> =
-            Arc::new(StubProvider { roles: vec![], ok: true });
+        let p: Arc<dyn sqe_auth::AuthProvider> = Arc::new(StubProvider {
+            roles: vec![],
+            ok: true,
+        });
         let r = bearer_admin_identity(&p, &auth_cfg(&["admin"]), None).await;
         assert!(matches!(r, Err((GuardReject::Unauthorized, None))));
     }
 
     #[tokio::test]
     async fn non_bearer_scheme_is_unauthorized() {
-        let p: Arc<dyn sqe_auth::AuthProvider> =
-            Arc::new(StubProvider { roles: vec![], ok: true });
+        let p: Arc<dyn sqe_auth::AuthProvider> = Arc::new(StubProvider {
+            roles: vec![],
+            ok: true,
+        });
         let r = bearer_admin_identity(&p, &auth_cfg(&["admin"]), Some("Basic abc")).await;
         assert!(matches!(r, Err((GuardReject::Unauthorized, None))));
     }
 
     #[tokio::test]
     async fn valid_bearer_non_admin_is_forbidden() {
-        let p: Arc<dyn sqe_auth::AuthProvider> =
-            Arc::new(StubProvider { roles: vec!["analyst".into()], ok: true });
+        let p: Arc<dyn sqe_auth::AuthProvider> = Arc::new(StubProvider {
+            roles: vec!["analyst".into()],
+            ok: true,
+        });
         let r = bearer_admin_identity(&p, &auth_cfg(&["admin"]), Some("Bearer tok")).await;
         assert!(matches!(r, Err((GuardReject::Forbidden, Some(_)))));
     }
 
     #[tokio::test]
     async fn valid_bearer_admin_is_ok() {
-        let p: Arc<dyn sqe_auth::AuthProvider> =
-            Arc::new(StubProvider { roles: vec!["admin".into()], ok: true });
+        let p: Arc<dyn sqe_auth::AuthProvider> = Arc::new(StubProvider {
+            roles: vec!["admin".into()],
+            ok: true,
+        });
         let id = bearer_admin_identity(&p, &auth_cfg(&["admin"]), Some("Bearer tok"))
             .await
             .unwrap();
@@ -388,7 +391,11 @@ mod tests {
     // Returns (logger, path, tempdir) -- the caller keeps tempdir alive.
     fn write_and_read_opt(
         result: Result<sqe_auth::Identity, (GuardReject, Option<sqe_auth::Identity>)>,
-    ) -> (sqe_metrics::audit::AuditLogger, std::path::PathBuf, tempfile::TempDir) {
+    ) -> (
+        sqe_metrics::audit::AuditLogger,
+        std::path::PathBuf,
+        tempfile::TempDir,
+    ) {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("audit.jsonl");
         let logger =
@@ -435,9 +442,12 @@ mod tests {
         let (_logger, path, _dir) = write_and_read_opt(result);
         let content = std::fs::read_to_string(&path).unwrap();
         let lines: Vec<&str> = content.lines().collect();
-        assert_eq!(lines.len(), 1, "expected exactly one audit line; got: {content}");
-        let v: serde_json::Value =
-            serde_json::from_str(lines[0]).expect("line must be valid JSON");
+        assert_eq!(
+            lines.len(),
+            1,
+            "expected exactly one audit line; got: {content}"
+        );
+        let v: serde_json::Value = serde_json::from_str(lines[0]).expect("line must be valid JSON");
         // kind must be "auth" (OCSF Authentication)
         assert_eq!(
             v["kind"].as_str(),
@@ -493,11 +503,22 @@ mod tests {
         let (_logger, path, _dir) = write_and_read_opt(result);
         let content = std::fs::read_to_string(&path).unwrap();
         let lines: Vec<&str> = content.lines().collect();
-        assert_eq!(lines.len(), 1, "expected exactly one audit line; got: {content}");
-        let v: serde_json::Value =
-            serde_json::from_str(lines[0]).expect("line must be valid JSON");
-        assert_eq!(v["kind"].as_str(), Some("auth"), "kind must be 'auth'; got: {v}");
-        assert_eq!(v["status"].as_str(), Some("failure"), "status must be 'failure'; got: {v}");
+        assert_eq!(
+            lines.len(),
+            1,
+            "expected exactly one audit line; got: {content}"
+        );
+        let v: serde_json::Value = serde_json::from_str(lines[0]).expect("line must be valid JSON");
+        assert_eq!(
+            v["kind"].as_str(),
+            Some("auth"),
+            "kind must be 'auth'; got: {v}"
+        );
+        assert_eq!(
+            v["status"].as_str(),
+            Some("failure"),
+            "status must be 'failure'; got: {v}"
+        );
         let msg = v["message"].as_str().unwrap_or("");
         assert!(
             msg.contains("admin"),
@@ -794,7 +815,7 @@ mod tests {
     /// is present in the request extensions (router oneshot with ConnectInfo set).
     #[tokio::test]
     async fn require_admin_bearer_emits_client_ip_on_success() {
-        use axum::{Router, routing::get};
+        use axum::{routing::get, Router};
         use tower::ServiceExt;
 
         let dir = tempfile::tempdir().expect("tempdir");
@@ -803,8 +824,10 @@ mod tests {
             sqe_metrics::audit::AuditLogger::new(path.to_str().unwrap()).expect("audit logger"),
         );
 
-        let provider: Arc<dyn sqe_auth::AuthProvider> =
-            Arc::new(StubProvider { roles: vec!["admin".into()], ok: true });
+        let provider: Arc<dyn sqe_auth::AuthProvider> = Arc::new(StubProvider {
+            roles: vec!["admin".into()],
+            ok: true,
+        });
 
         struct CiState {
             provider: Arc<dyn sqe_auth::AuthProvider>,
@@ -856,8 +879,8 @@ mod tests {
             !content.trim().is_empty(),
             "audit logger must have written a line"
         );
-        let v: serde_json::Value = serde_json::from_str(content.lines().next().unwrap())
-            .expect("valid JSON");
+        let v: serde_json::Value =
+            serde_json::from_str(content.lines().next().unwrap()).expect("valid JSON");
         assert_eq!(
             v["client_ip"].as_str(),
             Some("203.0.113.7:54321"),
@@ -869,7 +892,7 @@ mod tests {
     /// is present and the outcome is Forbidden.
     #[tokio::test]
     async fn require_admin_bearer_emits_client_ip_on_forbidden() {
-        use axum::{Router, routing::get};
+        use axum::{routing::get, Router};
         use tower::ServiceExt;
 
         let dir = tempfile::tempdir().expect("tempdir");
@@ -879,8 +902,10 @@ mod tests {
         );
 
         // Provider returns a non-admin identity.
-        let provider: Arc<dyn sqe_auth::AuthProvider> =
-            Arc::new(StubProvider { roles: vec!["analyst".into()], ok: true });
+        let provider: Arc<dyn sqe_auth::AuthProvider> = Arc::new(StubProvider {
+            roles: vec!["analyst".into()],
+            ok: true,
+        });
 
         struct CiForbiddenState {
             provider: Arc<dyn sqe_auth::AuthProvider>,
@@ -931,8 +956,8 @@ mod tests {
             !content.trim().is_empty(),
             "Forbidden must write an audit line"
         );
-        let v: serde_json::Value = serde_json::from_str(content.lines().next().unwrap())
-            .expect("valid JSON");
+        let v: serde_json::Value =
+            serde_json::from_str(content.lines().next().unwrap()).expect("valid JSON");
         assert_eq!(
             v["client_ip"].as_str(),
             Some("192.0.2.55:44444"),

@@ -35,9 +35,7 @@ pub fn rewrite_bare_table(sql: &str) -> String {
         return sql.to_string();
     }
     match rewrite_leading_table(sql) {
-        Some(candidate)
-            if candidate != sql && Parser::parse_sql(&dialect, &candidate).is_ok() =>
-        {
+        Some(candidate) if candidate != sql && Parser::parse_sql(&dialect, &candidate).is_ok() => {
             candidate
         }
         _ => sql.to_string(),

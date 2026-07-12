@@ -10,14 +10,14 @@ use datafusion::physical_expr::create_physical_expr;
 use datafusion::physical_plan::PhysicalExpr;
 use datafusion::prelude::SessionContext;
 use datafusion_proto::bytes::Serializeable;
+use futures::{Stream, StreamExt, TryStreamExt};
 use object_store::aws::AmazonS3Builder;
-use object_store::{ObjectStore, ObjectStoreExt};
 use object_store::path::Path as ObjectPath;
+use object_store::{ObjectStore, ObjectStoreExt};
 use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
 use parquet::arrow::async_reader::ParquetObjectReader;
 use parquet::arrow::ParquetRecordBatchStreamBuilder;
 use parquet::file::metadata::ParquetMetaData;
-use futures::{Stream, StreamExt, TryStreamExt};
 use sqe_catalog::late_materialize;
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, info, warn};
@@ -42,7 +42,6 @@ type OpenedParquet = anyhow::Result<(ParquetBatchStream, SchemaRef, u64)>;
 
 /// A boxed, in-flight open of one Parquet file (#234 depth-1 prefetch).
 type PendingOpen = Pin<Box<dyn std::future::Future<Output = OpenedParquet> + Send>>;
-
 
 /// Decode the coordinator's pushed-down predicate (#233) from its serialized
 /// `Expr` bytes. Returns `None` when no predicate was pushed or when decoding
@@ -173,8 +172,7 @@ pub async fn execute_scan_streaming(
     )
     .await?;
 
-    let (tx, rx) =
-        mpsc::channel::<anyhow::Result<RecordBatch>>(16);
+    let (tx, rx) = mpsc::channel::<anyhow::Result<RecordBatch>>(16);
 
     // Share the task and the per-file open inputs by Arc so each prefetch
     // future (below) can own its inputs without borrowing producer locals.
@@ -370,8 +368,7 @@ pub async fn execute_scan_streaming(
         }
     });
 
-    let out_stream: ScanBatchStream =
-        Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx));
+    let out_stream: ScanBatchStream = Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx));
     Ok((first_schema, out_stream))
 }
 
@@ -425,8 +422,7 @@ async fn open_parquet_stream(
                 let p = path_for_fetch;
                 async move {
                     let fetch_reader = ParquetObjectReader::new(s, p).with_file_size(fetch_size);
-                    let tmp_builder =
-                        ParquetRecordBatchStreamBuilder::new(fetch_reader).await?;
+                    let tmp_builder = ParquetRecordBatchStreamBuilder::new(fetch_reader).await?;
                     Ok::<ParquetMetaData, parquet::errors::ParquetError>(
                         tmp_builder.metadata().as_ref().clone(),
                     )
@@ -616,57 +612,58 @@ pub async fn execute_scan(
         let meta = store.head(&path).await?;
         // Record S3 HEAD request
         if let Some(cm) = coordinator_metrics {
-            cm.s3_requests_total.with_label_values(&["head", "success"]).inc();
+            cm.s3_requests_total
+                .with_label_values(&["head", "success"])
+                .inc();
         }
         total_bytes += meta.size as u64;
-        let reader = ParquetObjectReader::new(store.clone(), meta.location)
-            .with_file_size(meta.size);
+        let reader =
+            ParquetObjectReader::new(store.clone(), meta.location).with_file_size(meta.size);
 
         // Use the footer cache if available: get_or_fetch returns cached
         // metadata or fetches it via a temporary reader and caches the result.
-        let mut builder: ParquetRecordBatchStreamBuilder<ParquetObjectReader> =
-            if let Some(cache) = footer_cache {
-                let cache_key = file_path.clone();
-                let store_for_fetch = store.clone();
-                let path_for_fetch = path.clone();
-                let file_size = meta.size;
+        let mut builder: ParquetRecordBatchStreamBuilder<ParquetObjectReader> = if let Some(cache) =
+            footer_cache
+        {
+            let cache_key = file_path.clone();
+            let store_for_fetch = store.clone();
+            let path_for_fetch = path.clone();
+            let file_size = meta.size;
 
-                let cached_meta = cache
-                    .get_or_fetch(&cache_key, || {
-                        let s = store_for_fetch;
-                        let p = path_for_fetch;
-                        async move {
-                            let fetch_reader = ParquetObjectReader::new(s, p)
-                                .with_file_size(file_size);
-                            let tmp_builder =
-                                ParquetRecordBatchStreamBuilder::new(fetch_reader).await?;
-                            Ok::<ParquetMetaData, parquet::errors::ParquetError>(
-                                tmp_builder.metadata().as_ref().clone(),
-                            )
-                        }
-                    })
-                    .await
-                    .map_err(|e| anyhow::anyhow!("Footer cache error: {e}"))?;
+            let cached_meta = cache
+                .get_or_fetch(&cache_key, || {
+                    let s = store_for_fetch;
+                    let p = path_for_fetch;
+                    async move {
+                        let fetch_reader = ParquetObjectReader::new(s, p).with_file_size(file_size);
+                        let tmp_builder =
+                            ParquetRecordBatchStreamBuilder::new(fetch_reader).await?;
+                        Ok::<ParquetMetaData, parquet::errors::ParquetError>(
+                            tmp_builder.metadata().as_ref().clone(),
+                        )
+                    }
+                })
+                .await
+                .map_err(|e| anyhow::anyhow!("Footer cache error: {e}"))?;
 
-                // Enable page-level min/max pruning via PageIndex.
-                // This lets the Parquet reader skip individual data pages
-                // within row groups whose min/max don't satisfy the predicate.
-                //
-                // NOTE: sqe_pages_pruned_index_total remains at 0 because arrow-rs
-                // does not expose a page-skip counter from its internal PageIndex
-                // pruning. Instrumenting this requires upstream changes in arrow-rs
-                // or a custom ParquetExec wrapper. Tracked for future work.
-                let reader_opts = ArrowReaderOptions::new().with_page_index_policy(parquet::file::metadata::PageIndexPolicy::Required);
-                let arrow_meta = ArrowReaderMetadata::try_new(
-                    cached_meta,
-                    reader_opts,
-                )?;
-                ParquetRecordBatchStreamBuilder::new_with_metadata(reader, arrow_meta)
-            } else {
-                // Enable page-level min/max pruning for direct reads too
-                let reader_opts = ArrowReaderOptions::new().with_page_index_policy(parquet::file::metadata::PageIndexPolicy::Required);
-                ParquetRecordBatchStreamBuilder::new_with_options(reader, reader_opts).await?
-            };
+            // Enable page-level min/max pruning via PageIndex.
+            // This lets the Parquet reader skip individual data pages
+            // within row groups whose min/max don't satisfy the predicate.
+            //
+            // NOTE: sqe_pages_pruned_index_total remains at 0 because arrow-rs
+            // does not expose a page-skip counter from its internal PageIndex
+            // pruning. Instrumenting this requires upstream changes in arrow-rs
+            // or a custom ParquetExec wrapper. Tracked for future work.
+            let reader_opts = ArrowReaderOptions::new()
+                .with_page_index_policy(parquet::file::metadata::PageIndexPolicy::Required);
+            let arrow_meta = ArrowReaderMetadata::try_new(cached_meta, reader_opts)?;
+            ParquetRecordBatchStreamBuilder::new_with_metadata(reader, arrow_meta)
+        } else {
+            // Enable page-level min/max pruning for direct reads too
+            let reader_opts = ArrowReaderOptions::new()
+                .with_page_index_policy(parquet::file::metadata::PageIndexPolicy::Required);
+            ParquetRecordBatchStreamBuilder::new_with_options(reader, reader_opts).await?
+        };
 
         // Apply column projection. Prefer field-ID-based projection (#43): the
         // coordinator sends `projected_field_ids` parallel to `projected_columns`,
@@ -678,10 +675,7 @@ pub async fn execute_scan(
         // (Hive-written files predating Iceberg's metadata stamp).
         if !task.projected_columns.is_empty() {
             let parquet_schema = builder.schema().clone();
-            let projected_by_id = project_by_field_id(
-                &parquet_schema,
-                &task.projected_field_ids,
-            );
+            let projected_by_id = project_by_field_id(&parquet_schema, &task.projected_field_ids);
             let indices: Vec<usize> = match projected_by_id {
                 Some(ids) => ids,
                 None => task
@@ -697,10 +691,7 @@ pub async fn execute_scan(
             };
 
             if !indices.is_empty() {
-                let mask = parquet::arrow::ProjectionMask::roots(
-                    builder.parquet_schema(),
-                    indices,
-                );
+                let mask = parquet::arrow::ProjectionMask::roots(builder.parquet_schema(), indices);
                 builder = builder.with_projection(mask);
             }
         }
@@ -756,9 +747,12 @@ pub async fn execute_scan(
         // Record S3 GET metrics for this file read
         if let Some(cm) = coordinator_metrics {
             let s3_elapsed = s3_start.elapsed();
-            cm.s3_requests_total.with_label_values(&["get", "success"]).inc();
+            cm.s3_requests_total
+                .with_label_values(&["get", "success"])
+                .inc();
             cm.s3_bytes_read_total.inc_by(meta.size as u64);
-            cm.s3_request_duration_seconds.observe(s3_elapsed.as_secs_f64());
+            cm.s3_request_duration_seconds
+                .observe(s3_elapsed.as_secs_f64());
 
             // Late materialization metrics: track bytes and selectivity when
             // a RowFilter was applied. Approximate predicate bytes as the file
@@ -786,10 +780,7 @@ pub async fn execute_scan(
         // Account for the in-memory size of the Arrow batches against the
         // memory pool.  `try_grow` will return an error if the limit is
         // exceeded, propagating back-pressure to the caller.
-        let batch_mem: usize = batches
-            .iter()
-            .map(|b| b.get_array_memory_size())
-            .sum();
+        let batch_mem: usize = batches.iter().map(|b| b.get_array_memory_size()).sum();
         reservation.try_grow(batch_mem)?;
 
         debug!(
@@ -981,8 +972,8 @@ mod tests {
     // Field-ID projection (#43) — covers the RENAME / ADD COLUMN survival paths.
     // -------------------------------------------------------------------------
 
-    use std::collections::HashMap;
     use arrow_schema::{DataType, Field, Schema};
+    use std::collections::HashMap;
 
     fn stamped(name: &str, id: i32) -> Field {
         let mut md = HashMap::new();
@@ -996,10 +987,7 @@ mod tests {
         // catalog has since renamed it to "c". The worker is asked to project
         // [field_id = 2] and must resolve to parquet position 1 even though
         // the file's column name is "b".
-        let schema = Schema::new(vec![
-            stamped("id", 1),
-            stamped("b", 2),
-        ]);
+        let schema = Schema::new(vec![stamped("id", 1), stamped("b", 2)]);
         let indices = project_by_field_id(&schema, &[1, 2]).unwrap();
         assert_eq!(indices, vec![0, 1]);
     }
@@ -1104,9 +1092,8 @@ mod tests {
         // A column absent from the file schema cannot bind; build returns None
         // (non-fatal: scan proceeds unfiltered, coordinator still filters).
         let expr = col("does_not_exist").gt(lit(5i64));
-        let file_schema: SchemaRef = Arc::new(Schema::new(vec![
-            Field::new("a", DataType::Int64, false),
-        ]));
+        let file_schema: SchemaRef =
+            Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
         assert!(build_physical_predicate(&expr, &file_schema, "frag-test").is_none());
     }
 
@@ -1116,14 +1103,14 @@ mod tests {
     // when the size is unknown.
     // -------------------------------------------------------------------------
 
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use object_store::memory::InMemory;
-    use object_store::{
-        GetOptions, GetResult, ListResult, ObjectMeta, PutMultipartOptions, PutOptions,
-        PutPayload, PutResult, CopyOptions,
-    };
-    use object_store::path::Path as OsPath;
     use futures::stream::BoxStream;
+    use object_store::memory::InMemory;
+    use object_store::path::Path as OsPath;
+    use object_store::{
+        CopyOptions, GetOptions, GetResult, ListResult, ObjectMeta, PutMultipartOptions,
+        PutOptions, PutPayload, PutResult,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// ObjectStore wrapper that counts HEAD-style metadata fetches, delegating
     /// everything else to an inner store. In object_store 0.13 `head()` is an
@@ -1306,8 +1293,8 @@ mod tests {
     #[tokio::test]
     async fn open_parquet_stream_predicate_reduces_rows() {
         use arrow_array::Int64Array;
-        use parquet::arrow::ArrowWriter;
         use datafusion::logical_expr::{col, lit};
+        use parquet::arrow::ArrowWriter;
 
         // Two columns: a (predicate column) and b (projection-only). a = 1..=10.
         let schema: SchemaRef = Arc::new(Schema::new(vec![
@@ -1318,10 +1305,7 @@ mod tests {
         let b: Vec<i64> = a.iter().map(|v| v * 100).collect();
         let batch = RecordBatch::try_new(
             schema.clone(),
-            vec![
-                Arc::new(Int64Array::from(a)),
-                Arc::new(Int64Array::from(b)),
-            ],
+            vec![Arc::new(Int64Array::from(a)), Arc::new(Int64Array::from(b))],
         )
         .unwrap();
         let mut buf = Vec::new();
@@ -1447,6 +1431,10 @@ mod tests {
             .iter()
             .map(|f| f.name().as_str())
             .collect();
-        assert_eq!(names, vec!["a", "c"], "projected columns come back in file order");
+        assert_eq!(
+            names,
+            vec!["a", "c"],
+            "projected columns come back in file order"
+        );
     }
 }

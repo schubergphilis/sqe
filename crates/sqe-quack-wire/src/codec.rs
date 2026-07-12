@@ -351,10 +351,7 @@ impl<'a> BinaryDeserializer<'a> {
         let count = self.read_u64()?;
         let remaining = self.remaining().len() as u64;
         if count > remaining {
-            return Err(crate::WireError::CountExceedsRemaining {
-                count,
-                remaining,
-            });
+            return Err(crate::WireError::CountExceedsRemaining { count, remaining });
         }
         Ok(count as usize)
     }

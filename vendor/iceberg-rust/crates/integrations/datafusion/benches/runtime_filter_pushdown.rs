@@ -40,8 +40,8 @@ use criterion::{
     BatchSize, BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main,
 };
 use datafusion::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
-use datafusion::physical_expr::expressions::{in_list, lit, BinaryExpr, Column};
 use datafusion::physical_expr::PhysicalExpr;
+use datafusion::physical_expr::expressions::{BinaryExpr, Column, in_list, lit};
 use datafusion::scalar::ScalarValue;
 use iceberg::expr::Bind;
 use iceberg::spec::{NestedField, PrimitiveType, Schema as IcebergSchema, Type};
@@ -94,12 +94,9 @@ fn make_bounds_and_membership(n: usize) -> Arc<dyn PhysicalExpr> {
     let lo: Arc<dyn PhysicalExpr> = lit(ScalarValue::Int64(Some(0)));
     let hi: Arc<dyn PhysicalExpr> = lit(ScalarValue::Int64(Some((n.max(1) - 1) as i64)));
 
-    let ge: Arc<dyn PhysicalExpr> =
-        Arc::new(BinaryExpr::new(col.clone(), Operator::GtEq, lo));
-    let le: Arc<dyn PhysicalExpr> =
-        Arc::new(BinaryExpr::new(col.clone(), Operator::LtEq, hi));
-    let bounds: Arc<dyn PhysicalExpr> =
-        Arc::new(BinaryExpr::new(ge, Operator::And, le));
+    let ge: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(col.clone(), Operator::GtEq, lo));
+    let le: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(col.clone(), Operator::LtEq, hi));
+    let bounds: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(ge, Operator::And, le));
 
     let membership = make_in_list(n);
 
@@ -143,8 +140,8 @@ fn bench_bind_predicate(c: &mut Criterion) {
     let schema = Arc::new(iceberg_schema());
     for &n in IN_LIST_SIZES {
         let filters = vec![make_in_list(n)];
-        let predicate = convert_physical_filters_to_predicate(&filters)
-            .expect("convertible synthetic filter");
+        let predicate =
+            convert_physical_filters_to_predicate(&filters).expect("convertible synthetic filter");
         group.throughput(Throughput::Elements(n as u64));
         group.bench_with_input(BenchmarkId::from_parameter(n), &predicate, |b, p| {
             b.iter_batched(

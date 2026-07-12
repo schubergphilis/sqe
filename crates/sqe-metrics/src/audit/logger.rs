@@ -290,9 +290,8 @@ impl AuditLogger {
         // `native_events` controls whether canonical events are also written to
         // native_sink (true for Native/Both; false for Ocsf where path is legacy-only).
         let native_file = open_sink_file(native_path)?;
-        let native_sink = NativeJsonlSink::from_writer(Box::new(
-            std::io::BufWriter::new(native_file),
-        ));
+        let native_sink =
+            NativeJsonlSink::from_writer(Box::new(std::io::BufWriter::new(native_file)));
 
         let (ocsf_sink, native_events): (Option<OcsfJsonlSink>, bool) = match format {
             AuditFormat::Native => (None, true),
@@ -329,7 +328,12 @@ impl AuditLogger {
                     let gdpr_snap: Option<GdprSnap> = {
                         if let Ok(guard) = gdpr_worker.lock() {
                             guard.as_ref().map(|c| {
-                                (c.tags.clone(), c.mode, c.salt.clone(), Arc::clone(&c.lookup))
+                                (
+                                    c.tags.clone(),
+                                    c.mode,
+                                    c.salt.clone(),
+                                    Arc::clone(&c.lookup),
+                                )
                             })
                         } else {
                             None
@@ -352,7 +356,12 @@ impl AuditLogger {
                                             &path_owned,
                                         );
                                         batch.clear();
-                                        Self::flush_sinks(&mut native_sink, &mut ocsf_sink, &mut spool_sink_worker.lock().unwrap(), &path_owned);
+                                        Self::flush_sinks(
+                                            &mut native_sink,
+                                            &mut ocsf_sink,
+                                            &mut spool_sink_worker.lock().unwrap(),
+                                            &path_owned,
+                                        );
                                         // Now stamp and write the canonical event.
                                         Self::write_event(
                                             &mut native_sink,
@@ -364,7 +373,12 @@ impl AuditLogger {
                                             gdpr_snap.as_ref(),
                                             &path_owned,
                                         );
-                                        Self::flush_sinks(&mut native_sink, &mut ocsf_sink, &mut spool_sink_worker.lock().unwrap(), &path_owned);
+                                        Self::flush_sinks(
+                                            &mut native_sink,
+                                            &mut ocsf_sink,
+                                            &mut spool_sink_worker.lock().unwrap(),
+                                            &path_owned,
+                                        );
                                     }
                                     AuditMsg::Flush(ack) => {
                                         Self::write_legacy_batch(
@@ -374,7 +388,12 @@ impl AuditLogger {
                                             &path_owned,
                                         );
                                         batch.clear();
-                                        Self::flush_sinks(&mut native_sink, &mut ocsf_sink, &mut spool_sink_worker.lock().unwrap(), &path_owned);
+                                        Self::flush_sinks(
+                                            &mut native_sink,
+                                            &mut ocsf_sink,
+                                            &mut spool_sink_worker.lock().unwrap(),
+                                            &path_owned,
+                                        );
                                         let _ = ack.send(());
                                     }
                                 }
@@ -386,7 +405,12 @@ impl AuditLogger {
                                     &batch,
                                     &path_owned,
                                 );
-                                Self::flush_sinks(&mut native_sink, &mut ocsf_sink, &mut spool_sink_worker.lock().unwrap(), &path_owned);
+                                Self::flush_sinks(
+                                    &mut native_sink,
+                                    &mut ocsf_sink,
+                                    &mut spool_sink_worker.lock().unwrap(),
+                                    &path_owned,
+                                );
                             }
                         }
                         AuditMsg::Event(event) => {
@@ -406,7 +430,12 @@ impl AuditLogger {
                                             &path_owned,
                                         );
                                         batch.clear();
-                                        Self::flush_sinks(&mut native_sink, &mut ocsf_sink, &mut spool_sink_worker.lock().unwrap(), &path_owned);
+                                        Self::flush_sinks(
+                                            &mut native_sink,
+                                            &mut ocsf_sink,
+                                            &mut spool_sink_worker.lock().unwrap(),
+                                            &path_owned,
+                                        );
                                         // Process this legacy entry immediately.
                                         Self::write_legacy_batch(
                                             &mut native_sink,
@@ -414,7 +443,12 @@ impl AuditLogger {
                                             &[*e],
                                             &path_owned,
                                         );
-                                        Self::flush_sinks(&mut native_sink, &mut ocsf_sink, &mut spool_sink_worker.lock().unwrap(), &path_owned);
+                                        Self::flush_sinks(
+                                            &mut native_sink,
+                                            &mut ocsf_sink,
+                                            &mut spool_sink_worker.lock().unwrap(),
+                                            &path_owned,
+                                        );
                                     }
                                     AuditMsg::Flush(ack) => {
                                         Self::write_events(
@@ -428,7 +462,12 @@ impl AuditLogger {
                                             &path_owned,
                                         );
                                         batch.clear();
-                                        Self::flush_sinks(&mut native_sink, &mut ocsf_sink, &mut spool_sink_worker.lock().unwrap(), &path_owned);
+                                        Self::flush_sinks(
+                                            &mut native_sink,
+                                            &mut ocsf_sink,
+                                            &mut spool_sink_worker.lock().unwrap(),
+                                            &path_owned,
+                                        );
                                         let _ = ack.send(());
                                     }
                                 }
@@ -444,16 +483,31 @@ impl AuditLogger {
                                     gdpr_snap.as_ref(),
                                     &path_owned,
                                 );
-                                Self::flush_sinks(&mut native_sink, &mut ocsf_sink, &mut spool_sink_worker.lock().unwrap(), &path_owned);
+                                Self::flush_sinks(
+                                    &mut native_sink,
+                                    &mut ocsf_sink,
+                                    &mut spool_sink_worker.lock().unwrap(),
+                                    &path_owned,
+                                );
                             }
                         }
                         AuditMsg::Flush(ack) => {
-                            Self::flush_sinks(&mut native_sink, &mut ocsf_sink, &mut spool_sink_worker.lock().unwrap(), &path_owned);
+                            Self::flush_sinks(
+                                &mut native_sink,
+                                &mut ocsf_sink,
+                                &mut spool_sink_worker.lock().unwrap(),
+                                &path_owned,
+                            );
                             let _ = ack.send(());
                         }
                     }
                 }
-                Self::flush_sinks(&mut native_sink, &mut ocsf_sink, &mut spool_sink_worker.lock().unwrap(), &path_owned);
+                Self::flush_sinks(
+                    &mut native_sink,
+                    &mut ocsf_sink,
+                    &mut spool_sink_worker.lock().unwrap(),
+                    &path_owned,
+                );
             })
             .map_err(|e| format!("Failed to start audit writer thread: {e}"))?;
 
@@ -490,7 +544,11 @@ impl AuditLogger {
             let prev = chain.current_prev_hash().to_string();
             let hash = chain_hash_raw(&prev, body_json.as_bytes());
             chain.advance(hash.clone());
-            let integrity = Integrity { seq, prev_hash: prev, hash };
+            let integrity = Integrity {
+                seq,
+                prev_hash: prev,
+                hash,
+            };
             let line = inject_integrity(&body_json, &integrity);
             if let Err(e) = native_sink.write_raw_line(&line) {
                 tracing::error!("AUDIT: write failed for '{path}': {e}");
@@ -526,10 +584,16 @@ impl AuditLogger {
         let mut fallback = false;
 
         for resource in &event.resources {
-            match lookup.column_tags(resource.catalog.as_deref(), &resource.namespace, &resource.name) {
+            match lookup.column_tags(
+                resource.catalog.as_deref(),
+                &resource.namespace,
+                &resource.name,
+            ) {
                 Some(col_map) => {
                     for (col, col_tags) in &col_map {
-                        if col_tags.iter().any(|t| tags.iter().any(|g| g.eq_ignore_ascii_case(t)))
+                        if col_tags
+                            .iter()
+                            .any(|t| tags.iter().any(|g| g.eq_ignore_ascii_case(t)))
                             && !masked_cols.contains(col)
                         {
                             masked_cols.push(col.clone());
@@ -707,7 +771,12 @@ impl AuditLogger {
     ) -> Self {
         if !tags.is_empty() {
             if let Ok(mut guard) = self.gdpr.lock() {
-                *guard = Some(GdprConfig { tags, mode, salt, lookup });
+                *guard = Some(GdprConfig {
+                    tags,
+                    mode,
+                    salt,
+                    lookup,
+                });
             }
         }
         self
@@ -992,9 +1061,8 @@ mod tests {
         let logger = AuditLogger::new(path_str).unwrap();
         let mut entry = test_entry();
         entry.statement_type = "create_secret".to_string();
-        entry.query_text = Some(
-            "CREATE SECRET prod_token (TYPE bearer, TOKEN 'eyJSECRETJWTPAYLOAD')".to_string(),
-        );
+        entry.query_text =
+            Some("CREATE SECRET prod_token (TYPE bearer, TOKEN 'eyJSECRETJWTPAYLOAD')".to_string());
         logger.log(&entry);
         logger.flush();
 
@@ -1019,9 +1087,8 @@ mod tests {
 
         let logger = AuditLogger::new(path_str).unwrap();
         let mut entry = test_entry();
-        entry.query_text = Some(
-            "SELECT * FROM users WHERE email = 'carol@example.com'".to_string(),
-        );
+        entry.query_text =
+            Some("SELECT * FROM users WHERE email = 'carol@example.com'".to_string());
         logger.log(&entry);
         logger.flush();
 
@@ -1032,7 +1099,10 @@ mod tests {
             1,
             "exactly one entry must exist so the negative assertion below is meaningful, got: {content}"
         );
-        assert!(!content.contains("carol@example.com"), "PII must not appear in audit log");
+        assert!(
+            !content.contains("carol@example.com"),
+            "PII must not appear in audit log"
+        );
         assert!(content.contains("[EMAIL]"));
     }
 
@@ -1068,7 +1138,10 @@ mod tests {
         // Defect 2: every line must be valid JSON (no torn lines).
         let parsed: Vec<serde_json::Value> = lines
             .iter()
-            .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("line {l:?} is not valid JSON: {e}")))
+            .map(|l| {
+                serde_json::from_str(l)
+                    .unwrap_or_else(|e| panic!("line {l:?} is not valid JSON: {e}"))
+            })
             .collect();
 
         // Extract seq from each line's integrity block.
@@ -1084,7 +1157,11 @@ mod tests {
 
         // Defect 1: seqs must be strictly increasing 0,1,2,3 in file order
         // (the event must not be stamped before the legacy entries that preceded it).
-        assert_eq!(seqs, vec![0, 1, 2, 3], "seq must be 0,1,2,3 in file order; got {seqs:?}");
+        assert_eq!(
+            seqs,
+            vec![0, 1, 2, 3],
+            "seq must be 0,1,2,3 in file order; got {seqs:?}"
+        );
 
         // Position check: line[2] is the canonical event (has "kind":"query"),
         // lines 0,1,3 are legacy flat entries (have "username" but no top-level "kind").
@@ -1111,11 +1188,9 @@ mod tests {
     fn both_format_writes_native_and_ocsf_files() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("audit.jsonl");
-        let logger = AuditLogger::with_config(
-            path.to_str().unwrap(),
-            crate::audit::AuditFormat::Both,
-        )
-        .unwrap();
+        let logger =
+            AuditLogger::with_config(path.to_str().unwrap(), crate::audit::AuditFormat::Both)
+                .unwrap();
         logger.log_event(crate::audit::sample_query_event());
         logger.flush();
         let native = std::fs::read_to_string(&path).unwrap();
@@ -1131,7 +1206,12 @@ mod tests {
         use std::collections::HashMap;
         struct Stub;
         impl crate::audit::TagLookup for Stub {
-            fn column_tags(&self, _c: Option<&str>, _n: &[String], _t: &str) -> Option<HashMap<String, Vec<String>>> {
+            fn column_tags(
+                &self,
+                _c: Option<&str>,
+                _n: &[String],
+                _t: &str,
+            ) -> Option<HashMap<String, Vec<String>>> {
                 let mut m = HashMap::new();
                 m.insert("email".to_string(), vec!["gdpr".to_string()]);
                 Some(m)
@@ -1139,12 +1219,27 @@ mod tests {
         }
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("audit.jsonl");
-        let logger = AuditLogger::with_config(path.to_str().unwrap(), crate::audit::AuditFormat::Native)
-            .unwrap()
-            .with_gdpr(vec!["gdpr".into()], crate::audit::GdprIdentifierMode::Tokenize, "salt".into(), std::sync::Arc::new(Stub));
+        let logger =
+            AuditLogger::with_config(path.to_str().unwrap(), crate::audit::AuditFormat::Native)
+                .unwrap()
+                .with_gdpr(
+                    vec!["gdpr".into()],
+                    crate::audit::GdprIdentifierMode::Tokenize,
+                    "salt".into(),
+                    std::sync::Arc::new(Stub),
+                );
         let mut ev = crate::audit::sample_query_event();
-        ev.resources = vec![crate::audit::Resource { catalog: Some("polaris".into()), namespace: vec!["hr".into()], name: "users".into(), object_type: crate::audit::ObjectType::Table }];
-        ev.query = Some(crate::audit::QueryInfo { text: Some("SELECT id FROM users WHERE email = 'alice@x.io'".into()), query_hash: "h".into(), statement_type: "query".into() });
+        ev.resources = vec![crate::audit::Resource {
+            catalog: Some("polaris".into()),
+            namespace: vec!["hr".into()],
+            name: "users".into(),
+            object_type: crate::audit::ObjectType::Table,
+        }];
+        ev.query = Some(crate::audit::QueryInfo {
+            text: Some("SELECT id FROM users WHERE email = 'alice@x.io'".into()),
+            query_hash: "h".into(),
+            statement_type: "query".into(),
+        });
         logger.log_event(ev);
         logger.flush();
         let content = std::fs::read_to_string(&path).unwrap();
@@ -1218,20 +1313,45 @@ mod tests {
         use std::collections::HashMap;
         struct Unknown;
         impl crate::audit::TagLookup for Unknown {
-            fn column_tags(&self, _c: Option<&str>, _n: &[String], _t: &str) -> Option<HashMap<String, Vec<String>>> { None }
+            fn column_tags(
+                &self,
+                _c: Option<&str>,
+                _n: &[String],
+                _t: &str,
+            ) -> Option<HashMap<String, Vec<String>>> {
+                None
+            }
         }
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("audit.jsonl");
-        let logger = AuditLogger::with_config(path.to_str().unwrap(), crate::audit::AuditFormat::Native)
-            .unwrap()
-            .with_gdpr(vec!["gdpr".into()], crate::audit::GdprIdentifierMode::Tokenize, "salt".into(), std::sync::Arc::new(Unknown));
+        let logger =
+            AuditLogger::with_config(path.to_str().unwrap(), crate::audit::AuditFormat::Native)
+                .unwrap()
+                .with_gdpr(
+                    vec!["gdpr".into()],
+                    crate::audit::GdprIdentifierMode::Tokenize,
+                    "salt".into(),
+                    std::sync::Arc::new(Unknown),
+                );
         let mut ev = crate::audit::sample_query_event();
-        ev.resources = vec![crate::audit::Resource { catalog: None, namespace: vec![], name: "users".into(), object_type: crate::audit::ObjectType::Table }];
-        ev.query = Some(crate::audit::QueryInfo { text: Some("SELECT id FROM users WHERE ssn = '123-45-6789'".into()), query_hash: "h".into(), statement_type: "query".into() });
+        ev.resources = vec![crate::audit::Resource {
+            catalog: None,
+            namespace: vec![],
+            name: "users".into(),
+            object_type: crate::audit::ObjectType::Table,
+        }];
+        ev.query = Some(crate::audit::QueryInfo {
+            text: Some("SELECT id FROM users WHERE ssn = '123-45-6789'".into()),
+            query_hash: "h".into(),
+            statement_type: "query".into(),
+        });
         logger.log_event(ev);
         logger.flush();
         let content = std::fs::read_to_string(&path).unwrap();
-        assert!(!content.contains("123-45-6789"), "literal survived unknown-tag fallback: {content}");
+        assert!(
+            !content.contains("123-45-6789"),
+            "literal survived unknown-tag fallback: {content}"
+        );
     }
 
     /// Regression test for the fail-open GDPR masking bug (MUST-FIX 1).
@@ -1252,7 +1372,12 @@ mod tests {
         use std::collections::HashMap;
         struct MixedStub;
         impl crate::audit::TagLookup for MixedStub {
-            fn column_tags(&self, _c: Option<&str>, _n: &[String], table: &str) -> Option<HashMap<String, Vec<String>>> {
+            fn column_tags(
+                &self,
+                _c: Option<&str>,
+                _n: &[String],
+                table: &str,
+            ) -> Option<HashMap<String, Vec<String>>> {
                 if table == "a" {
                     let mut m = HashMap::new();
                     m.insert("email".to_string(), vec!["gdpr".to_string()]);
@@ -1265,14 +1390,15 @@ mod tests {
         }
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("audit.jsonl");
-        let logger = AuditLogger::with_config(path.to_str().unwrap(), crate::audit::AuditFormat::Native)
-            .unwrap()
-            .with_gdpr(
-                vec!["gdpr".into()],
-                crate::audit::GdprIdentifierMode::Tokenize,
-                "salt".into(),
-                std::sync::Arc::new(MixedStub),
-            );
+        let logger =
+            AuditLogger::with_config(path.to_str().unwrap(), crate::audit::AuditFormat::Native)
+                .unwrap()
+                .with_gdpr(
+                    vec!["gdpr".into()],
+                    crate::audit::GdprIdentifierMode::Tokenize,
+                    "salt".into(),
+                    std::sync::Arc::new(MixedStub),
+                );
         let mut ev = crate::audit::sample_query_event();
         ev.resources = vec![
             crate::audit::Resource {
@@ -1357,7 +1483,10 @@ mod tests {
             !spool.is_empty(),
             "spool must be non-empty after flush() while logger is alive (flush_sinks must flush the spool BufWriter)"
         );
-        let spool_line = spool.lines().next().expect("spool must have at least one line");
+        let spool_line = spool
+            .lines()
+            .next()
+            .expect("spool must have at least one line");
         let v: serde_json::Value = serde_json::from_str(spool_line)
             .unwrap_or_else(|e| panic!("spool line is not valid JSON: {e}\n{spool_line}"));
 
@@ -1366,9 +1495,7 @@ mod tests {
             Some(6005),
             "spool must contain OCSF class_uid 6005 (datastore_activity); got: {v}"
         );
-        let seq = v
-            .pointer("/metadata/sequence")
-            .and_then(|s| s.as_u64());
+        let seq = v.pointer("/metadata/sequence").and_then(|s| s.as_u64());
         assert!(
             seq.is_some(),
             "spool line must contain metadata.sequence (written after chain.stamp); got: {v}"

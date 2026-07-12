@@ -208,11 +208,10 @@ mod reader_e2e {
     /// filter can prove them absent -- exactly the sealed runtime
     /// filter case this feature targets.
     fn write_test_file(dir: &std::path::Path, with_blooms: bool) -> String {
-        let arrow_field = arrow_schema::Field::new("id", arrow_schema::DataType::Int64, false)
-            .with_metadata(HashMap::from([(
-                PARQUET_FIELD_ID_META_KEY.to_string(),
-                "1".to_string(),
-            )]));
+        let arrow_field =
+            arrow_schema::Field::new("id", arrow_schema::DataType::Int64, false).with_metadata(
+                HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), "1".to_string())]),
+            );
         let arrow_schema = Arc::new(arrow_schema::Schema::new(vec![arrow_field]));
 
         let mut props = WriterProperties::builder().set_max_row_group_row_count(Some(100));
@@ -299,7 +298,8 @@ mod reader_e2e {
         // but both keys are odd and therefore bloom-negative.
         let pred = Reference::new("id").is_in([Datum::long(5), Datum::long(2001)]);
 
-        let (rows, pruned) = run_scan(reader_builder(), scan_task(&path, file_schema(), pred)).await;
+        let (rows, pruned) =
+            run_scan(reader_builder(), scan_task(&path, file_schema(), pred)).await;
         assert_eq!(rows, 0);
         assert_eq!(pruned, 2, "both row groups bloom-negative for both keys");
     }
@@ -313,7 +313,8 @@ mod reader_e2e {
         // bloom-negative for row group 1, so it gets pruned.
         let pred = Reference::new("id").is_in([Datum::long(4), Datum::long(2001)]);
 
-        let (rows, pruned) = run_scan(reader_builder(), scan_task(&path, file_schema(), pred)).await;
+        let (rows, pruned) =
+            run_scan(reader_builder(), scan_task(&path, file_schema(), pred)).await;
         assert_eq!(rows, 1, "the matching row comes back");
         assert_eq!(pruned, 1, "only the keyless row group is pruned");
     }
@@ -324,7 +325,8 @@ mod reader_e2e {
         let path = write_test_file(dir.path(), false);
         let pred = Reference::new("id").is_in([Datum::long(5), Datum::long(2001)]);
 
-        let (rows, pruned) = run_scan(reader_builder(), scan_task(&path, file_schema(), pred)).await;
+        let (rows, pruned) =
+            run_scan(reader_builder(), scan_task(&path, file_schema(), pred)).await;
         assert_eq!(rows, 0, "row filter still removes non-matching rows");
         assert_eq!(pruned, 0, "no blooms -> nothing pruned by the probe");
     }
@@ -364,7 +366,8 @@ mod reader_e2e {
             .is_in([Datum::long(5), Datum::long(2001)])
             .or(Reference::new("id").greater_than_or_equal_to(Datum::long(0)));
 
-        let (rows, pruned) = run_scan(reader_builder(), scan_task(&path, file_schema(), pred)).await;
+        let (rows, pruned) =
+            run_scan(reader_builder(), scan_task(&path, file_schema(), pred)).await;
         assert_eq!(rows, 200, "OR branch admits every row");
         assert_eq!(pruned, 0, "membership under OR is never probed");
     }
@@ -476,10 +479,7 @@ mod case_union {
         // Arm 1 constrains `id`, arm 2 constrains `other`: no column is
         // constrained by every arm, so no sound union exists.
         let case = case_expr(
-            vec![
-                in_list_expr("id", 0, &[1]),
-                in_list_expr("other", 1, &[2]),
-            ],
+            vec![in_list_expr("id", 0, &[1]), in_list_expr("other", 1, &[2])],
             lit(ScalarValue::Boolean(Some(false))),
         );
         assert_eq!(convert(case), None);
@@ -531,11 +531,7 @@ mod case_union {
         );
         // The eq-style bounds comparisons on `id` may not add keys, but
         // the IN sets union across arms.
-        let expected = Reference::new("id").is_in([
-            Datum::long(1),
-            Datum::long(2),
-            Datum::long(9),
-        ]);
+        let expected = Reference::new("id").is_in([Datum::long(1), Datum::long(2), Datum::long(9)]);
         assert_eq!(convert(case), Some(expected));
     }
 

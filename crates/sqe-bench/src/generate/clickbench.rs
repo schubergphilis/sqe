@@ -176,18 +176,22 @@ const BROWSER_LANGUAGES: &[&str] = &[
     "ru", "en-US", "en-GB", "de", "fr", "es", "it", "zh-CN", "ja", "pt-BR",
 ];
 
-const BROWSER_COUNTRIES: &[&str] =
-    &["RU", "US", "DE", "FR", "GB", "CN", "BR", "IN", "UA", "BY"];
+const BROWSER_COUNTRIES: &[&str] = &["RU", "US", "DE", "FR", "GB", "CN", "BR", "IN", "UA", "BY"];
 
-const SOCIAL_NETWORKS: &[&str] =
-    &["", "vk.com", "facebook.com", "twitter.com", "instagram.com", "odnoklassniki.ru"];
+const SOCIAL_NETWORKS: &[&str] = &[
+    "",
+    "vk.com",
+    "facebook.com",
+    "twitter.com",
+    "instagram.com",
+    "odnoklassniki.ru",
+];
 
 const SOCIAL_ACTIONS: &[&str] = &["", "like", "share", "comment", "follow", "repost"];
 
 const HIT_COLORS: &[&str] = &["W", "G", "Y", "R", "B", "O"];
 
-const PAGE_CHARSETS: &[&str] =
-    &["UTF-8", "windows-1251", "ISO-8859-1", "UTF-16", "KOI8-R"];
+const PAGE_CHARSETS: &[&str] = &["UTF-8", "windows-1251", "ISO-8859-1", "UTF-16", "KOI8-R"];
 
 const URL_PREFIXES: &[&str] = &[
     "http://example.com/page",
@@ -475,7 +479,11 @@ fn generate_hits(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
             cookie_enable.push(rng.gen_range(0..2));
             javascript_enable.push(rng.gen_range(0..2));
             is_mobile.push(is_mob);
-            mobile_phone.push(if is_mob == 1 { rng.gen_range(1..200) } else { 0 });
+            mobile_phone.push(if is_mob == 1 {
+                rng.gen_range(1..200)
+            } else {
+                0
+            });
             mobile_phone_model.push(mob_model);
             params.push(String::new());
             ip_network_id.push(rng.gen_range(0..1000));
@@ -568,8 +576,7 @@ fn generate_hits(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
         let hit_color_refs: Vec<&str> = hit_color.iter().map(|s| s.as_str()).collect();
         let browser_language_refs: Vec<&str> =
             browser_language.iter().map(|s| s.as_str()).collect();
-        let browser_country_refs: Vec<&str> =
-            browser_country.iter().map(|s| s.as_str()).collect();
+        let browser_country_refs: Vec<&str> = browser_country.iter().map(|s| s.as_str()).collect();
         let social_network_refs: Vec<&str> = social_network.iter().map(|s| s.as_str()).collect();
         let social_action_refs: Vec<&str> = social_action.iter().map(|s| s.as_str()).collect();
         let social_source_page_refs: Vec<&str> =
@@ -830,13 +837,41 @@ mod tests {
         let mut hot_counter_users: HashSet<i64> = HashSet::new();
 
         for b in &batches {
-            let uids = b.column(uid_idx).as_any().downcast_ref::<Int64Array>().unwrap();
-            let titles = b.column(title_idx).as_any().downcast_ref::<StringArray>().unwrap();
-            let urls = b.column(url_idx).as_any().downcast_ref::<StringArray>().unwrap();
-            let referers = b.column(referer_idx).as_any().downcast_ref::<StringArray>().unwrap();
-            let phrases = b.column(phrase_idx).as_any().downcast_ref::<StringArray>().unwrap();
-            let counters = b.column(counter_idx).as_any().downcast_ref::<Int32Array>().unwrap();
-            let utms = b.column(utm_idx).as_any().downcast_ref::<StringArray>().unwrap();
+            let uids = b
+                .column(uid_idx)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            let titles = b
+                .column(title_idx)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let urls = b
+                .column(url_idx)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let referers = b
+                .column(referer_idx)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let phrases = b
+                .column(phrase_idx)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let counters = b
+                .column(counter_idx)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            let utms = b
+                .column(utm_idx)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
             let interests = b
                 .column(interests_idx)
                 .as_any()
@@ -899,7 +934,10 @@ mod tests {
             ("hot Referer", hot_referer_rows),
             ("UTMSource", utm_rows),
         ] {
-            assert!(count < total / 50, "{name} seeded into {count} rows, expected < 2%");
+            assert!(
+                count < total / 50,
+                "{name} seeded into {count} rows, expected < 2%"
+            );
         }
     }
 

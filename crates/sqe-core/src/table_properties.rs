@@ -89,12 +89,18 @@ mod tests {
 
     #[test]
     fn parse_accepts_copy_on_write() {
-        assert_eq!(WriteMode::parse("copy-on-write").unwrap(), WriteMode::CopyOnWrite);
+        assert_eq!(
+            WriteMode::parse("copy-on-write").unwrap(),
+            WriteMode::CopyOnWrite
+        );
     }
 
     #[test]
     fn parse_accepts_merge_on_read() {
-        assert_eq!(WriteMode::parse("merge-on-read").unwrap(), WriteMode::MergeOnRead);
+        assert_eq!(
+            WriteMode::parse("merge-on-read").unwrap(),
+            WriteMode::MergeOnRead
+        );
     }
 
     #[test]
@@ -133,7 +139,10 @@ mod tests {
         props.insert(WRITE_MERGE_MODE.to_string(), "MoR".to_string());
         let err = resolve_merge_mode(&props).unwrap_err();
         let msg = format!("{err}");
-        assert!(msg.contains("MoR"), "error should mention the bad value: {msg}");
+        assert!(
+            msg.contains("MoR"),
+            "error should mention the bad value: {msg}"
+        );
     }
 
     #[test]

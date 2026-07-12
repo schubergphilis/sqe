@@ -61,11 +61,9 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn block_on_compat_works_on_multi_thread() {
-        let result = tokio::task::spawn_blocking(|| {
-            block_on_compat(async { 42i32 })
-        })
-        .await
-        .unwrap();
+        let result = tokio::task::spawn_blocking(|| block_on_compat(async { 42i32 }))
+            .await
+            .unwrap();
         assert_eq!(result, Some(42));
     }
 

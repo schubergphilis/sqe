@@ -44,7 +44,6 @@ pub struct IcebergMetadataTableProvider {
 
 #[async_trait]
 impl TableProvider for IcebergMetadataTableProvider {
-
     fn schema(&self) -> ArrowSchemaRef {
         let metadata_table = self.table.inspect();
         let schema = match self.r#type {

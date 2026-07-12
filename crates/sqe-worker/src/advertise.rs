@@ -239,13 +239,8 @@ mod tests {
 
     #[test]
     fn rejects_unspecified_candidate() {
-        let err = build_advertise_url(
-            "",
-            Some(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
-            50052,
-            false,
-        )
-        .unwrap_err();
+        let err = build_advertise_url("", Some(IpAddr::V4(Ipv4Addr::UNSPECIFIED)), 50052, false)
+            .unwrap_err();
         assert!(err.contains("not routable"), "got: {err}");
     }
 

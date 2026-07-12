@@ -1,41 +1,41 @@
 pub mod adaptive_sort;
-pub mod auth_session;
-pub mod dim_build_swap;
-pub mod parallel_probe_scan;
-pub mod parallel_scan;
 pub mod audit_resources;
 pub mod audit_tag_adapter;
-pub mod metrics_history;
-pub mod policy_wiring;
-pub mod tag_source_impl;
+pub mod auth_session;
 pub mod catalog_ops;
 pub mod channel_pool;
-pub mod maintenance;
-pub mod merge_sql;
-pub mod merge_target_provider;
-pub mod tls;
-pub mod transport;
 pub mod codec;
 pub mod credential_refresh;
+pub mod dim_build_swap;
 pub mod distributed_scan;
 pub mod explain;
 pub mod flight_sql;
 pub mod flight_sql_helpers;
+pub mod maintenance;
 pub mod memory;
+pub mod merge_sql;
+pub mod merge_target_provider;
+pub mod metrics_history;
 pub mod mode;
+pub mod parallel_probe_scan;
+pub mod parallel_scan;
+pub mod policy_wiring;
 pub mod quack_executor;
-pub mod query_handler;
-pub mod runtime;
-pub mod runtime_catalog;
-pub mod session_context;
 pub mod query_cache;
+pub mod query_handler;
 pub mod query_tracker;
 pub mod rate_limiter;
+pub mod runtime;
+pub mod runtime_catalog;
 pub mod scan_pushdown;
 pub mod scheduler;
+pub mod session_context;
+pub mod session_manager;
 pub mod streaming;
 pub mod suggest_bloom;
-pub mod session_manager;
+pub mod tag_source_impl;
+pub mod tls;
+pub mod transport;
 pub mod web_auth;
 pub mod web_ui;
 pub mod worker_registry;
@@ -101,7 +101,10 @@ pub fn parse_audit_format(s: &str) -> sqe_metrics::audit::AuditFormat {
 ///
 /// The self-audit event is a best-effort record. When `audit_log_path` is empty
 /// the logger is a no-op, so the event drops silently while the `warn!` still fires.
-pub fn maybe_warn_superdebug(audit: &sqe_metrics::audit::AuditLogger, config: &sqe_core::SqeConfig) {
+pub fn maybe_warn_superdebug(
+    audit: &sqe_metrics::audit::AuditLogger,
+    config: &sqe_core::SqeConfig,
+) {
     if !config.metrics.audit.superdebug_log_results {
         return;
     }
@@ -116,13 +119,7 @@ pub fn maybe_warn_superdebug(audit: &sqe_metrics::audit::AuditLogger, config: &s
     let event = sqe_metrics::audit::AuditEvent {
         time: chrono::Utc::now(),
         kind: sqe_metrics::audit::AuditKind::AdminDdl,
-        actor: sqe_metrics::audit::Actor::from_parts(
-            "system".into(),
-            None,
-            None,
-            vec![],
-            vec![],
-        ),
+        actor: sqe_metrics::audit::Actor::from_parts("system".into(), None, None, vec![], vec![]),
         outcome: sqe_metrics::audit::Outcome::Success,
         resources: vec![],
         policy: None,
@@ -130,7 +127,8 @@ pub fn maybe_warn_superdebug(audit: &sqe_metrics::audit::AuditLogger, config: &s
         stats: None,
         query: Some(sqe_metrics::audit::QueryInfo {
             text: Some(
-                "superdebug_log_results enabled via metrics.audit.superdebug_log_results = true".into(),
+                "superdebug_log_results enabled via metrics.audit.superdebug_log_results = true"
+                    .into(),
             ),
             query_hash: sqe_metrics::audit::query_hash("superdebug_log_results_enabled"),
             statement_type: "superdebug_log_results_enabled".into(),
@@ -246,7 +244,10 @@ pub mod __test_support {
     /// Report whether a `CREATE TABLE` would require Iceberg format-version 3.
     pub fn needs_v3(ct: &sqlparser::ast::CreateTable) -> Result<bool> {
         let schema = build_iceberg_schema_with_defaults(ct)?;
-        Ok(crate::write_handler::requires_v3_features(&ct.columns, &schema))
+        Ok(crate::write_handler::requires_v3_features(
+            &ct.columns,
+            &schema,
+        ))
     }
 }
 

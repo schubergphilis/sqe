@@ -90,7 +90,12 @@ fn parallel_and_serial_produce_same_row_counts_for_every_tpch_table() {
 
     for table_def in gen.tables() {
         let serial_stats = gen
-            .generate_table(&table_def.name, TEST_SCALE, serial_dir.to_str().unwrap(), &serial_cfg)
+            .generate_table(
+                &table_def.name,
+                TEST_SCALE,
+                serial_dir.to_str().unwrap(),
+                &serial_cfg,
+            )
             .unwrap_or_else(|e| panic!("serial generate failed for {}: {e}", table_def.name));
         let parallel_stats = gen
             .generate_table(

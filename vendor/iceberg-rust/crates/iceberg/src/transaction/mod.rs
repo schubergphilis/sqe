@@ -420,14 +420,17 @@ mod tests {
             .into_builder(Some("s3://bucket/test/location/metadata/v1.json".into()))
             .add_snapshot(parent_snapshot)
             .unwrap()
-            .set_ref(MAIN_BRANCH, SnapshotReference {
-                snapshot_id: PARENT_SNAPSHOT_ID,
-                retention: SnapshotRetention::Branch {
-                    min_snapshots_to_keep: None,
-                    max_snapshot_age_ms: None,
-                    max_ref_age_ms: None,
+            .set_ref(
+                MAIN_BRANCH,
+                SnapshotReference {
+                    snapshot_id: PARENT_SNAPSHOT_ID,
+                    retention: SnapshotRetention::Branch {
+                        min_snapshots_to_keep: None,
+                        max_snapshot_age_ms: None,
+                        max_ref_age_ms: None,
+                    },
                 },
-            })
+            )
             .unwrap()
             .build()
             .unwrap()

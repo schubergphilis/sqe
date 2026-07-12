@@ -45,9 +45,7 @@ use datafusion::execution::memory_pool::FairSpillPool;
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use iceberg::CatalogBuilder;
-use iceberg_catalog_sql::{
-    SQL_CATALOG_PROP_URI, SQL_CATALOG_PROP_WAREHOUSE, SqlCatalogBuilder,
-};
+use iceberg_catalog_sql::{SqlCatalogBuilder, SQL_CATALOG_PROP_URI, SQL_CATALOG_PROP_WAREHOUSE};
 use sqe_core::config::StorageConfig;
 
 use crate::writable_iceberg_catalog::WritableIcebergCatalog;
@@ -143,9 +141,11 @@ pub fn build_embedded_context(memory_limit_bytes: usize) -> anyhow::Result<Sessi
     // `read_csv('https://...')`, `read_parquet('https://...')`, etc. lazily
     // build an HttpStore for the URL's scheme://host on first request. Keeps
     // s3 / file behaviour unchanged; only http/https get the lazy build.
-    let registry = Arc::new(sqe_catalog::lazy_object_store::LazyHttpObjectStoreRegistry::new(
-        datafusion::execution::object_store::DefaultObjectStoreRegistry::new(),
-    ));
+    let registry = Arc::new(
+        sqe_catalog::lazy_object_store::LazyHttpObjectStoreRegistry::new(
+            datafusion::execution::object_store::DefaultObjectStoreRegistry::new(),
+        ),
+    );
     let runtime = RuntimeEnvBuilder::new()
         .with_memory_pool(pool)
         .with_object_store_registry(registry)
@@ -318,15 +318,17 @@ async fn attach_sqlite_catalog(
     std::fs::create_dir_all(path)
         .map_err(|e| anyhow::anyhow!("failed to create warehouse dir {}: {e}", path.display()))?;
     let data_root = path.join("iceberg");
-    std::fs::create_dir_all(&data_root).map_err(|e| {
-        anyhow::anyhow!("failed to create data dir {}: {e}", data_root.display())
-    })?;
+    std::fs::create_dir_all(&data_root)
+        .map_err(|e| anyhow::anyhow!("failed to create data dir {}: {e}", data_root.display()))?;
 
     // SQLite URI is `sqlite://<absolute path>` per sqlx's parsing.
     // We canonicalise so relative paths in `--warehouse` work even
     // after later `cd` calls.
     let abs = path.canonicalize().map_err(|e| {
-        anyhow::anyhow!("failed to canonicalise warehouse path {}: {e}", path.display())
+        anyhow::anyhow!(
+            "failed to canonicalise warehouse path {}: {e}",
+            path.display()
+        )
     })?;
     let db_path = abs.join("sqe.db");
     // `mode=rwc` tells SQLite to create the file if missing; without it
@@ -534,18 +536,25 @@ impl EmbeddedClient {
         .await
         .map_err(|e| format!("ATTACH failed: {e}"))?;
 
-        let provider = sqe_catalog::writable_iceberg_catalog::WritableIcebergCatalog::try_new(
-            catalog.clone(),
-        )
-        .await
-        .map_err(|e| format!("ATTACH: failed to wrap catalog '{}': {e}", stmt.name))?;
+        let provider =
+            sqe_catalog::writable_iceberg_catalog::WritableIcebergCatalog::try_new(catalog.clone())
+                .await
+                .map_err(|e| format!("ATTACH: failed to wrap catalog '{}': {e}", stmt.name))?;
 
-        self.ctx.register_catalog(stmt.name.clone(), Arc::new(provider));
+        self.ctx
+            .register_catalog(stmt.name.clone(), Arc::new(provider));
 
-        let secret_ref = stmt.options.get("SECRET").and_then(|v| v.as_secret_ref()).map(|s| s.to_string());
+        let secret_ref = stmt
+            .options
+            .get("SECRET")
+            .and_then(|v| v.as_secret_ref())
+            .map(|s| s.to_string());
         self.attached_catalogs.insert(stmt.name.clone(), secret_ref);
 
-        Ok(QueryResult { columns: vec![], rows: vec![] })
+        Ok(QueryResult {
+            columns: vec![],
+            rows: vec![],
+        })
     }
 
     fn embedded_handle_detach(
@@ -562,7 +571,10 @@ impl EmbeddedClient {
         // but our tracking no longer considers it attached — queries that
         // try to resolve it will fail at plan time once the provider is
         // removed from our accounting.
-        Ok(QueryResult { columns: vec![], rows: vec![] })
+        Ok(QueryResult {
+            columns: vec![],
+            rows: vec![],
+        })
     }
 
     fn embedded_handle_create_secret(
@@ -578,7 +590,10 @@ impl EmbeddedClient {
         self.secrets
             .create(&stmt.name, secret)
             .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
-        Ok(QueryResult { columns: vec![], rows: vec![] })
+        Ok(QueryResult {
+            columns: vec![],
+            rows: vec![],
+        })
     }
 
     fn embedded_handle_drop_secret(
@@ -595,7 +610,10 @@ impl EmbeddedClient {
         self.secrets
             .drop_secret(&stmt.name, &in_use)
             .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
-        Ok(QueryResult { columns: vec![], rows: vec![] })
+        Ok(QueryResult {
+            columns: vec![],
+            rows: vec![],
+        })
     }
 
     fn embedded_handle_show_secrets(&self) -> Result<QueryResult, Box<dyn std::error::Error>> {
@@ -627,11 +645,16 @@ fn record_batches_to_query_result(
         let formatters: Vec<_> = batch
             .columns()
             .iter()
-            .map(|col| arrow::util::display::ArrayFormatter::try_new(col.as_ref(), &Default::default()))
+            .map(|col| {
+                arrow::util::display::ArrayFormatter::try_new(col.as_ref(), &Default::default())
+            })
             .collect::<Result<_, _>>()
             .unwrap_or_default();
         for row_idx in 0..batch.num_rows() {
-            let row: Vec<String> = formatters.iter().map(|f| f.value(row_idx).to_string()).collect();
+            let row: Vec<String> = formatters
+                .iter()
+                .map(|f| f.value(row_idx).to_string())
+                .collect();
             rows.push(row);
         }
     }
@@ -664,10 +687,7 @@ mod tests {
     #[tokio::test]
     async fn embedded_client_returns_zero_rows_for_empty_select() {
         let mut client = EmbeddedClient::new(64 * 1024 * 1024).expect("build client");
-        let result = client
-            .execute("SELECT 1 WHERE FALSE")
-            .await
-            .expect("query");
+        let result = client.execute("SELECT 1 WHERE FALSE").await.expect("query");
         assert_eq!(result.columns, vec!["Int64(1)".to_string()]);
         assert!(result.rows.is_empty());
     }
@@ -796,9 +816,7 @@ mod tests {
             ],
         };
         let result = EmbeddedClient::with_warehouse(64 * 1024 * 1024, &mode).await;
-        let err = result
-            .map(|_| ())
-            .expect_err("duplicate names must error");
+        let err = result.map(|_| ()).expect_err("duplicate names must error");
         let msg = format!("{err}");
         assert!(
             msg.contains("repeated"),
@@ -812,8 +830,8 @@ mod tests {
     /// matches what the user passed on `--catalog NAME=PATH`.
     #[tokio::test]
     async fn two_catalogs_both_visible() {
-        use iceberg::{Catalog, NamespaceIdent, TableCreation};
         use iceberg::spec::{NestedField, PrimitiveType, Schema as IcebergSchema, Type};
+        use iceberg::{Catalog, NamespaceIdent, TableCreation};
 
         let tmp_a = tempfile::tempdir().expect("tempdir a");
         let tmp_b = tempfile::tempdir().expect("tempdir b");
@@ -959,13 +977,20 @@ mod tests {
 
         // Phase 1: create namespace + table via SQL.
         {
-            let mut c =
-                bounded("phase1_open", 90, EmbeddedClient::with_warehouse(64 * 1024 * 1024, &mode))
-                    .await
-                    .expect("first client");
-            bounded("create_schema", 90, c.execute("CREATE SCHEMA iceberg.test_ns"))
-                .await
-                .expect("CREATE SCHEMA");
+            let mut c = bounded(
+                "phase1_open",
+                90,
+                EmbeddedClient::with_warehouse(64 * 1024 * 1024, &mode),
+            )
+            .await
+            .expect("first client");
+            bounded(
+                "create_schema",
+                90,
+                c.execute("CREATE SCHEMA iceberg.test_ns"),
+            )
+            .await
+            .expect("CREATE SCHEMA");
             bounded(
                 "create_table",
                 90,
@@ -978,10 +1003,13 @@ mod tests {
         // Phase 2: build the embedded client, confirm the iceberg
         // catalog is registered and the namespace + table are visible
         // via DataFusion's information_schema.
-        let mut c =
-            bounded("phase2_open", 90, EmbeddedClient::with_warehouse(64 * 1024 * 1024, &mode))
-                .await
-                .expect("client builds against existing warehouse");
+        let mut c = bounded(
+            "phase2_open",
+            90,
+            EmbeddedClient::with_warehouse(64 * 1024 * 1024, &mode),
+        )
+        .await
+        .expect("client builds against existing warehouse");
         let r = bounded(
             "phase2_query",
             90,
@@ -994,7 +1022,10 @@ mod tests {
         )
         .await
         .expect("information_schema.tables");
-        assert_eq!(r.columns, vec!["table_schema".to_string(), "table_name".to_string()]);
+        assert_eq!(
+            r.columns,
+            vec!["table_schema".to_string(), "table_name".to_string()]
+        );
         // The iceberg-datafusion bridge exposes the user table plus
         // metadata pseudo-tables ($snapshots, $manifests). We only
         // require the main table is visible — the pseudo-tables are
@@ -1039,10 +1070,7 @@ mod tests {
         drop(f);
 
         let mut client = EmbeddedClient::new(64 * 1024 * 1024).expect("build client");
-        let sql = format!(
-            "SELECT count(*) AS n FROM read_csv('{}')",
-            path.display()
-        );
+        let sql = format!("SELECT count(*) AS n FROM read_csv('{}')", path.display());
         let result = client.execute(&sql).await.expect("query");
         assert_eq!(result.columns, vec!["n".to_string()]);
         assert_eq!(result.rows, vec![vec!["2".to_string()]]);
@@ -1061,10 +1089,7 @@ mod tests {
         drop(f);
 
         let mut client = EmbeddedClient::new(64 * 1024 * 1024).expect("build client");
-        let sql = format!(
-            "SELECT count(*) AS n FROM read_json('{}')",
-            path.display()
-        );
+        let sql = format!("SELECT count(*) AS n FROM read_json('{}')", path.display());
         let result = client.execute(&sql).await.expect("query");
         assert_eq!(result.rows, vec![vec!["2".to_string()]]);
     }
@@ -1127,10 +1152,7 @@ mod tests {
         );
         client.execute(&copy_sql).await.expect("copy");
 
-        let count_sql = format!(
-            "SELECT count(*) AS n FROM read_csv('{}')",
-            path.display()
-        );
+        let count_sql = format!("SELECT count(*) AS n FROM read_csv('{}')", path.display());
         let result = client.execute(&count_sql).await.expect("read");
         assert_eq!(result.rows, vec![vec!["2".to_string()]]);
     }
@@ -1147,7 +1169,10 @@ mod tests {
         // itself fails. The rewrite must have happened first; otherwise
         // we'd see "table not found" with the literal hf:// URL.
         let sql = "SELECT * FROM 'hf://datasets/sqe-tests-not-real/v12-rewrite/data.csv'";
-        let err = client.execute(sql).await.expect_err("hf:// URL must rewrite");
+        let err = client
+            .execute(sql)
+            .await
+            .expect_err("hf:// URL must rewrite");
         let msg = format!("{err}");
         assert!(
             !msg.contains("'hf://"),
@@ -1162,7 +1187,10 @@ mod tests {
     async fn select_from_malformed_hf_url_errors_with_diagnostic() {
         let mut client = EmbeddedClient::new(64 * 1024 * 1024).expect("build client");
         let sql = "SELECT * FROM 'hf://malformed'";
-        let err = client.execute(sql).await.expect_err("malformed hf:// must error");
+        let err = client
+            .execute(sql)
+            .await
+            .expect_err("malformed hf:// must error");
         let msg = format!("{err}");
         assert!(
             msg.contains("malformed HuggingFace URL"),
@@ -1209,7 +1237,10 @@ mod tests {
         assert_eq!(r.rows.len(), 1);
         assert_eq!(r.rows[0][0], "tok1");
         assert_eq!(r.rows[0][1], "bearer");
-        assert!(!r.rows[0].iter().any(|v| v.contains("abc")), "token must not appear in output");
+        assert!(
+            !r.rows[0].iter().any(|v| v.contains("abc")),
+            "token must not appear in output"
+        );
     }
 
     #[tokio::test]
@@ -1226,7 +1257,10 @@ mod tests {
     #[tokio::test]
     async fn create_duplicate_secret_errors() {
         let mut client = EmbeddedClient::new(64 * 1024 * 1024).expect("build");
-        client.execute("CREATE SECRET dup (TYPE bearer, TOKEN 't')").await.expect("first");
+        client
+            .execute("CREATE SECRET dup (TYPE bearer, TOKEN 't')")
+            .await
+            .expect("first");
         let err = client
             .execute("CREATE SECRET dup (TYPE bearer, TOKEN 't2')")
             .await
@@ -1247,7 +1281,10 @@ mod tests {
     #[tokio::test]
     async fn drop_secret_removes_it() {
         let mut client = EmbeddedClient::new(64 * 1024 * 1024).expect("build");
-        client.execute("CREATE SECRET eph (TYPE bearer, TOKEN 't')").await.expect("create");
+        client
+            .execute("CREATE SECRET eph (TYPE bearer, TOKEN 't')")
+            .await
+            .expect("create");
         client.execute("DROP SECRET eph").await.expect("drop");
         let r = client.execute("SHOW SECRETS").await.expect("show");
         assert_eq!(r.rows.len(), 0);
@@ -1256,7 +1293,10 @@ mod tests {
     #[tokio::test]
     async fn drop_missing_secret_errors() {
         let mut client = EmbeddedClient::new(64 * 1024 * 1024).expect("build");
-        let err = client.execute("DROP SECRET nope").await.expect_err("should fail");
+        let err = client
+            .execute("DROP SECRET nope")
+            .await
+            .expect_err("should fail");
         assert!(err.to_string().contains("not found"));
     }
 
@@ -1296,7 +1336,8 @@ mod tests {
             .expect("information_schema query");
         assert!(
             r.rows.iter().any(|row| row[0] == "myns"),
-            "namespace 'myns' must appear in information_schema; got {:?}", r.rows
+            "namespace 'myns' must appear in information_schema; got {:?}",
+            r.rows
         );
     }
 
@@ -1308,7 +1349,10 @@ mod tests {
 
         let sql = format!("ATTACH '{path}' AS dupcat (TYPE sqlite)");
         client.execute(&sql).await.expect("first attach");
-        let err = client.execute(&sql).await.expect_err("duplicate attach should fail");
+        let err = client
+            .execute(&sql)
+            .await
+            .expect_err("duplicate attach should fail");
         assert!(err.to_string().contains("already attached"));
     }
 
@@ -1318,17 +1362,26 @@ mod tests {
         let path = tmp.path().to_str().unwrap();
         let mut client = EmbeddedClient::new(64 * 1024 * 1024).expect("build");
 
-        client.execute(&format!("ATTACH '{path}' AS detachme (TYPE sqlite)")).await.expect("attach");
+        client
+            .execute(&format!("ATTACH '{path}' AS detachme (TYPE sqlite)"))
+            .await
+            .expect("attach");
         client.execute("DETACH detachme").await.expect("detach");
 
         // After detach, attaching with the same name must succeed (tracking cleared)
-        client.execute(&format!("ATTACH '{path}' AS detachme (TYPE sqlite)")).await.expect("re-attach after detach");
+        client
+            .execute(&format!("ATTACH '{path}' AS detachme (TYPE sqlite)"))
+            .await
+            .expect("re-attach after detach");
     }
 
     #[tokio::test]
     async fn detach_unknown_catalog_errors() {
         let mut client = EmbeddedClient::new(64 * 1024 * 1024).expect("build");
-        let err = client.execute("DETACH nope").await.expect_err("should fail");
+        let err = client
+            .execute("DETACH nope")
+            .await
+            .expect_err("should fail");
         assert!(err.to_string().contains("not attached"));
     }
 
@@ -1338,17 +1391,28 @@ mod tests {
         let path = tmp.path().to_str().unwrap();
         let mut client = EmbeddedClient::new(64 * 1024 * 1024).expect("build");
 
-        client.execute("CREATE SECRET tok (TYPE bearer, TOKEN 'xyz')").await.expect("create");
+        client
+            .execute("CREATE SECRET tok (TYPE bearer, TOKEN 'xyz')")
+            .await
+            .expect("create");
         // ATTACH with SECRET ref. SQLite doesn't use the bearer token for
         // auth but the parser still records the secret_ref in options.
         client
-            .execute(&format!("ATTACH '{path}' AS guarded (TYPE sqlite, SECRET tok)"))
+            .execute(&format!(
+                "ATTACH '{path}' AS guarded (TYPE sqlite, SECRET tok)"
+            ))
             .await
             .expect("attach with secret ref");
 
-        let err = client.execute("DROP SECRET tok").await.expect_err("in-use drop should fail");
+        let err = client
+            .execute("DROP SECRET tok")
+            .await
+            .expect_err("in-use drop should fail");
         let msg = err.to_string();
         assert!(msg.contains("tok"), "error should name the secret: {msg}");
-        assert!(msg.contains("guarded"), "error should name the catalog: {msg}");
+        assert!(
+            msg.contains("guarded"),
+            "error should name the catalog: {msg}"
+        );
     }
 }

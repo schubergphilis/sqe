@@ -527,9 +527,10 @@ pub(crate) mod tests {
         let namespace_ident = NamespaceIdent::new("abc".into());
         create_namespace(&catalog, &namespace_ident).await;
 
-        assert_eq!(catalog.list_namespaces(None).await.unwrap(), vec![
-            namespace_ident
-        ]);
+        assert_eq!(
+            catalog.list_namespaces(None).await.unwrap(),
+            vec![namespace_ident]
+        );
     }
 
     #[tokio::test]
@@ -551,11 +552,10 @@ pub(crate) mod tests {
         let namespace_ident_1 = NamespaceIdent::new("a".into());
         let namespace_ident_2 = NamespaceIdent::from_strs(vec!["a", "b"]).unwrap();
         let namespace_ident_3 = NamespaceIdent::new("b".into());
-        create_namespaces(&catalog, &vec![
-            &namespace_ident_1,
-            &namespace_ident_2,
-            &namespace_ident_3,
-        ])
+        create_namespaces(
+            &catalog,
+            &vec![&namespace_ident_1, &namespace_ident_2, &namespace_ident_3],
+        )
         .await;
 
         assert_eq!(
@@ -586,11 +586,10 @@ pub(crate) mod tests {
         let namespace_ident_1 = NamespaceIdent::new("a".into());
         let namespace_ident_2 = NamespaceIdent::from_strs(vec!["a", "b"]).unwrap();
         let namespace_ident_3 = NamespaceIdent::new("c".into());
-        create_namespaces(&catalog, &vec![
-            &namespace_ident_1,
-            &namespace_ident_2,
-            &namespace_ident_3,
-        ])
+        create_namespaces(
+            &catalog,
+            &vec![&namespace_ident_1, &namespace_ident_2, &namespace_ident_3],
+        )
         .await;
 
         assert_eq!(
@@ -615,13 +614,16 @@ pub(crate) mod tests {
         let namespace_ident_3 = NamespaceIdent::from_strs(vec!["a", "b"]).unwrap();
         let namespace_ident_4 = NamespaceIdent::from_strs(vec!["a", "c"]).unwrap();
         let namespace_ident_5 = NamespaceIdent::new("b".into());
-        create_namespaces(&catalog, &vec![
-            &namespace_ident_1,
-            &namespace_ident_2,
-            &namespace_ident_3,
-            &namespace_ident_4,
-            &namespace_ident_5,
-        ])
+        create_namespaces(
+            &catalog,
+            &vec![
+                &namespace_ident_1,
+                &namespace_ident_2,
+                &namespace_ident_3,
+                &namespace_ident_4,
+                &namespace_ident_5,
+            ],
+        )
         .await;
 
         assert_eq!(
@@ -815,9 +817,10 @@ pub(crate) mod tests {
             )
         );
 
-        assert_eq!(catalog.list_namespaces(None).await.unwrap(), vec![
-            namespace_ident_a.clone()
-        ]);
+        assert_eq!(
+            catalog.list_namespaces(None).await.unwrap(),
+            vec![namespace_ident_a.clone()]
+        );
 
         assert_eq!(
             catalog
@@ -865,11 +868,14 @@ pub(crate) mod tests {
         let namespace_ident_a = NamespaceIdent::new("a".into());
         let namespace_ident_a_b = NamespaceIdent::from_strs(vec!["a", "b"]).unwrap();
         let namespace_ident_a_b_c = NamespaceIdent::from_strs(vec!["a", "b", "c"]).unwrap();
-        create_namespaces(&catalog, &vec![
-            &namespace_ident_a,
-            &namespace_ident_a_b,
-            &namespace_ident_a_b_c,
-        ])
+        create_namespaces(
+            &catalog,
+            &vec![
+                &namespace_ident_a,
+                &namespace_ident_a_b,
+                &namespace_ident_a_b_c,
+            ],
+        )
         .await;
 
         assert_eq!(
@@ -941,11 +947,14 @@ pub(crate) mod tests {
         let namespace_ident_a = NamespaceIdent::new("a".into());
         let namespace_ident_a_b = NamespaceIdent::from_strs(vec!["a", "b"]).unwrap();
         let namespace_ident_a_b_c = NamespaceIdent::from_strs(vec!["a", "b", "c"]).unwrap();
-        create_namespaces(&catalog, &vec![
-            &namespace_ident_a,
-            &namespace_ident_a_b,
-            &namespace_ident_a_b_c,
-        ])
+        create_namespaces(
+            &catalog,
+            &vec![
+                &namespace_ident_a,
+                &namespace_ident_a_b,
+                &namespace_ident_a_b_c,
+            ],
+        )
         .await;
 
         let mut new_properties = HashMap::new();
@@ -1014,11 +1023,14 @@ pub(crate) mod tests {
         let namespace_ident_a = NamespaceIdent::new("a".into());
         let namespace_ident_a_b = NamespaceIdent::from_strs(vec!["a", "b"]).unwrap();
         let namespace_ident_a_b_c = NamespaceIdent::from_strs(vec!["a", "b", "c"]).unwrap();
-        create_namespaces(&catalog, &vec![
-            &namespace_ident_a,
-            &namespace_ident_a_b,
-            &namespace_ident_a_b_c,
-        ])
+        create_namespaces(
+            &catalog,
+            &vec![
+                &namespace_ident_a,
+                &namespace_ident_a_b,
+                &namespace_ident_a_b_c,
+            ],
+        )
         .await;
 
         catalog
@@ -1406,9 +1418,10 @@ pub(crate) mod tests {
         let table_ident = TableIdent::new(namespace_ident.clone(), "tbl1".into());
         create_table(&catalog, &table_ident).await;
 
-        assert_eq!(catalog.list_tables(&namespace_ident).await.unwrap(), vec![
-            table_ident
-        ]);
+        assert_eq!(
+            catalog.list_tables(&namespace_ident).await.unwrap(),
+            vec![table_ident]
+        );
     }
 
     #[tokio::test]
@@ -1437,11 +1450,10 @@ pub(crate) mod tests {
         let table_ident_1 = TableIdent::new(namespace_ident_1.clone(), "tbl1".into());
         let table_ident_2 = TableIdent::new(namespace_ident_1.clone(), "tbl2".into());
         let table_ident_3 = TableIdent::new(namespace_ident_2.clone(), "tbl1".into());
-        let _ = create_tables(&catalog, vec![
-            &table_ident_1,
-            &table_ident_2,
-            &table_ident_3,
-        ])
+        let _ = create_tables(
+            &catalog,
+            vec![&table_ident_1, &table_ident_2, &table_ident_3],
+        )
         .await;
 
         assert_eq!(
@@ -1631,9 +1643,10 @@ pub(crate) mod tests {
             .await
             .unwrap();
 
-        assert_eq!(catalog.list_tables(&namespace_ident).await.unwrap(), vec![
-            dst_table_ident
-        ],);
+        assert_eq!(
+            catalog.list_tables(&namespace_ident).await.unwrap(),
+            vec![dst_table_ident],
+        );
     }
 
     #[tokio::test]
@@ -1675,9 +1688,10 @@ pub(crate) mod tests {
             .await
             .unwrap();
 
-        assert_eq!(catalog.list_tables(&namespace_ident).await.unwrap(), vec![
-            table_ident
-        ],);
+        assert_eq!(
+            catalog.list_tables(&namespace_ident).await.unwrap(),
+            vec![table_ident],
+        );
     }
 
     #[tokio::test]
@@ -1686,11 +1700,14 @@ pub(crate) mod tests {
         let namespace_ident_a = NamespaceIdent::new("a".into());
         let namespace_ident_a_b = NamespaceIdent::from_strs(vec!["a", "b"]).unwrap();
         let namespace_ident_a_b_c = NamespaceIdent::from_strs(vec!["a", "b", "c"]).unwrap();
-        create_namespaces(&catalog, &vec![
-            &namespace_ident_a,
-            &namespace_ident_a_b,
-            &namespace_ident_a_b_c,
-        ])
+        create_namespaces(
+            &catalog,
+            &vec![
+                &namespace_ident_a,
+                &namespace_ident_a_b,
+                &namespace_ident_a_b_c,
+            ],
+        )
         .await;
 
         let src_table_ident = TableIdent::new(namespace_ident_a_b_c.clone(), "tbl1".into());

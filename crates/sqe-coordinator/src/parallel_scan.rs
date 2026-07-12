@@ -206,8 +206,7 @@ fn bump_scans(
             let scan = node
                 .downcast_ref::<IcebergScanExec>()
                 .expect("target is an IcebergScanExec");
-            let bumped: Arc<dyn ExecutionPlan> =
-                Arc::new(scan.clone().with_target_partitions(n));
+            let bumped: Arc<dyn ExecutionPlan> = Arc::new(scan.clone().with_target_partitions(n));
             Ok(Transformed::yes(bumped))
         } else {
             Ok(Transformed::no(node))
@@ -374,8 +373,14 @@ mod tests {
         let r = leaf();
         let j = join(Arc::clone(&l), Arc::clone(&r), PartitionMode::Partitioned);
         let leaves = collect_non_build_leaves(&j);
-        assert!(ptr_in(&leaves, &l), "left Partitioned-join input is bumpable");
-        assert!(ptr_in(&leaves, &r), "right Partitioned-join input is bumpable");
+        assert!(
+            ptr_in(&leaves, &l),
+            "left Partitioned-join input is bumpable"
+        );
+        assert!(
+            ptr_in(&leaves, &r),
+            "right Partitioned-join input is bumpable"
+        );
     }
 
     // Task 3.4 / q72 guard: the build (left) side of a `CollectLeft` join is
@@ -384,10 +389,20 @@ mod tests {
     fn collect_left_excludes_build_includes_probe() {
         let build = leaf();
         let probe = leaf();
-        let j = join(Arc::clone(&build), Arc::clone(&probe), PartitionMode::CollectLeft);
+        let j = join(
+            Arc::clone(&build),
+            Arc::clone(&probe),
+            PartitionMode::CollectLeft,
+        );
         let leaves = collect_non_build_leaves(&j);
-        assert!(!ptr_in(&leaves, &build), "CollectLeft build side must never be bumped");
-        assert!(ptr_in(&leaves, &probe), "CollectLeft probe side is bumpable");
+        assert!(
+            !ptr_in(&leaves, &build),
+            "CollectLeft build side must never be bumped"
+        );
+        assert!(
+            ptr_in(&leaves, &probe),
+            "CollectLeft probe side is bumpable"
+        );
     }
 
     // Nested SSB shape: dimA join (dimB join fact), all CollectLeft. Only the
@@ -397,7 +412,11 @@ mod tests {
         let dim_a = leaf();
         let dim_b = leaf();
         let fact = leaf();
-        let inner = join(Arc::clone(&dim_b), Arc::clone(&fact), PartitionMode::CollectLeft);
+        let inner = join(
+            Arc::clone(&dim_b),
+            Arc::clone(&fact),
+            PartitionMode::CollectLeft,
+        );
         let outer = join(Arc::clone(&dim_a), inner, PartitionMode::CollectLeft);
         let leaves = collect_non_build_leaves(&outer);
         assert!(ptr_in(&leaves, &fact), "the fact probe is collected");
@@ -458,8 +477,7 @@ mod tests {
         let j = join(Arc::clone(&l), Arc::clone(&r), PartitionMode::Partitioned);
         let sort_expr = PhysicalSortExpr::new_default(col("id", &j.schema()).unwrap());
         let ordering = LexOrdering::new(vec![sort_expr]).unwrap();
-        let sort: Arc<dyn ExecutionPlan> =
-            Arc::new(SortExec::new(ordering.clone(), j)); // global sort (preserve=false)
+        let sort: Arc<dyn ExecutionPlan> = Arc::new(SortExec::new(ordering.clone(), j)); // global sort (preserve=false)
         let spm: Arc<dyn ExecutionPlan> = Arc::new(SortPreservingMergeExec::new(ordering, sort));
 
         let leaves = collect_non_build_leaves(&spm);
@@ -475,7 +493,8 @@ mod tests {
     fn non_hash_join_taints_both_sides() {
         let l = leaf();
         let r = leaf();
-        let cj: Arc<dyn ExecutionPlan> = Arc::new(CrossJoinExec::new(Arc::clone(&l), Arc::clone(&r)));
+        let cj: Arc<dyn ExecutionPlan> =
+            Arc::new(CrossJoinExec::new(Arc::clone(&l), Arc::clone(&r)));
         let leaves = collect_non_build_leaves(&cj);
         assert!(
             !ptr_in(&leaves, &l) && !ptr_in(&leaves, &r),
@@ -514,9 +533,10 @@ mod tests {
 
         let repartitioned: Arc<dyn ExecutionPlan> =
             Arc::new(RepartitionExec::try_new(leaf(), Partitioning::RoundRobinBatch(8)).unwrap());
-        let ordering =
-            LexOrdering::new(vec![PhysicalSortExpr::new_default(col("id", &schema()).unwrap())])
-                .unwrap();
+        let ordering = LexOrdering::new(vec![PhysicalSortExpr::new_default(
+            col("id", &schema()).unwrap(),
+        )])
+        .unwrap();
         let root: Arc<dyn ExecutionPlan> = Arc::new(
             SortExec::new(ordering, repartitioned)
                 .with_preserve_partitioning(true)
@@ -557,7 +577,10 @@ mod tests {
             .with_target_partitions(4)
             // Force Partitioned (not CollectLeft) so we exercise the fact-dim
             // hash-partitioned shape.
-            .set_usize("datafusion.optimizer.hash_join_single_partition_threshold", 0);
+            .set_usize(
+                "datafusion.optimizer.hash_join_single_partition_threshold",
+                0,
+            );
         let ctx = SessionContext::new_with_config(cfg);
         let s = schema();
         let b = RecordBatch::try_new(
@@ -574,14 +597,22 @@ mod tests {
             Arc::new(
                 MemTable::try_new(
                     s.clone(),
-                    vec![vec![b.clone()], vec![b.clone()], vec![b.clone()], vec![b.clone()]],
+                    vec![
+                        vec![b.clone()],
+                        vec![b.clone()],
+                        vec![b.clone()],
+                        vec![b.clone()],
+                    ],
                 )
                 .unwrap(),
             ),
         )
         .unwrap();
-        ctx.register_table("dim", Arc::new(MemTable::try_new(s.clone(), vec![vec![b]]).unwrap()))
-            .unwrap();
+        ctx.register_table(
+            "dim",
+            Arc::new(MemTable::try_new(s.clone(), vec![vec![b]]).unwrap()),
+        )
+        .unwrap();
 
         let plan = ctx
             .sql("SELECT fact.val FROM fact JOIN dim ON fact.id = dim.id")
@@ -601,7 +632,9 @@ mod tests {
             "no CoalescePartitionsExec may be inserted above a scan:\n{rendered}"
         );
         assert_eq!(
-            rendered.matches("RepartitionExec: partitioning=Hash").count(),
+            rendered
+                .matches("RepartitionExec: partitioning=Hash")
+                .count(),
             2,
             "EnforceDistribution must hash-repartition BOTH join inputs to match \
              partition counts:\n{rendered}"

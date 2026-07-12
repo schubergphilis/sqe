@@ -76,9 +76,7 @@ pub fn print_summary(benchmark: &str, scale: f64, protocol: &str, results: &[Que
     );
 
     // Machine-readable summary line for shell script parsing
-    println!(
-        "BENCH_SUMMARY:{benchmark}:{pass}:{fail}:{diff}:{skip}:{error}:{total}:{total_ms}"
-    );
+    println!("BENCH_SUMMARY:{benchmark}:{pass}:{fail}:{diff}:{skip}:{error}:{total}:{total_ms}");
 }
 
 // ---------------------------------------------------------------------------
@@ -133,9 +131,7 @@ pub fn write_json_report(
         queries,
     };
 
-    let path = format!(
-        "benchmarks/results/{benchmark}-sf{scale}-{protocol}-{timestamp}.json"
-    );
+    let path = format!("benchmarks/results/{benchmark}-sf{scale}-{protocol}-{timestamp}.json");
     std::fs::create_dir_all("benchmarks/results/")?;
     std::fs::write(&path, serde_json::to_string_pretty(&report)?)?;
     Ok(path)

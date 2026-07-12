@@ -70,8 +70,7 @@ async fn mount_polaris_with_table() -> MockServer {
     Mock::given(method("GET"))
         .and(path("/v1/namespaces/gold"))
         .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_string(r#"{"namespace":["gold"],"properties":{}}"#),
+            ResponseTemplate::new(200).set_body_string(r#"{"namespace":["gold"],"properties":{}}"#),
         )
         .mount(&server)
         .await;
@@ -100,18 +99,10 @@ fn session(token: &str, catalog: Option<&str>, schema: Option<&str>) -> Session 
 async fn build_ctx(config: &SqeConfig, session: &Session) -> (String, String, bool) {
     let tracker = Arc::new(QueryTracker::new(&config.query_history));
     let registry = RuntimeCatalogRegistry::default();
-    let (ctx, _catalog) = create_session_context(
-        config,
-        session,
-        None,
-        &tracker,
-        None,
-        None,
-        None,
-        &registry,
-    )
-    .await
-    .expect("create_session_context succeeds against mock Polaris");
+    let (ctx, _catalog) =
+        create_session_context(config, session, None, &tracker, None, None, None, &registry)
+            .await
+            .expect("create_session_context succeeds against mock Polaris");
 
     let cfg = ctx.copied_config();
     let opts = cfg.options();
@@ -232,7 +223,9 @@ fn batches_to_string(batches: &[arrow_array::RecordBatch]) -> String {
     for b in batches {
         for col in b.columns() {
             for row in 0..b.num_rows() {
-                out.push_str(&arrow::util::display::array_value_to_string(col, row).unwrap_or_default());
+                out.push_str(
+                    &arrow::util::display::array_value_to_string(col, row).unwrap_or_default(),
+                );
                 out.push(' ');
             }
         }

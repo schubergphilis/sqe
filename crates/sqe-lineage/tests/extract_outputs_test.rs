@@ -28,19 +28,15 @@ fn build_insert_plan(
     ));
     let source_mem = MemTable::try_new(arrow_schema.clone(), vec![vec![]]).unwrap();
     let source_provider: Arc<dyn datafusion::catalog::TableProvider> = Arc::new(source_mem);
-    let source_scan = LogicalPlanBuilder::scan(
-        source_ref,
-        provider_as_source(source_provider),
-        None,
-    )
-    .unwrap()
-    .build()
-    .unwrap();
+    let source_scan =
+        LogicalPlanBuilder::scan(source_ref, provider_as_source(source_provider), None)
+            .unwrap()
+            .build()
+            .unwrap();
 
     let target_mem = MemTable::try_new(arrow_schema, vec![vec![]]).unwrap();
     let target_provider: Arc<dyn datafusion::catalog::TableProvider> = Arc::new(target_mem);
-    let target_ref =
-        TableReference::full(target_catalog, target_schema, target_table);
+    let target_ref = TableReference::full(target_catalog, target_schema, target_table);
 
     LogicalPlanBuilder::insert_into(
         source_scan,
@@ -69,11 +65,7 @@ fn insert_plan_yields_one_output_dataset() {
     let output = &outputs[0];
     assert_eq!(output.namespace, "https://polaris.example/api/catalog");
     assert_eq!(output.name, "sales.archive");
-    let ds = output
-        .facets
-        .dataSource
-        .as_ref()
-        .expect("dataSource facet");
+    let ds = output.facets.dataSource.as_ref().expect("dataSource facet");
     assert_eq!(ds.name, "polaris");
     assert_eq!(ds.uri, "https://polaris.example/api/catalog");
     // Schema facet is filled in E14, not E2.

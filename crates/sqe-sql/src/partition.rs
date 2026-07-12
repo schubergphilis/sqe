@@ -64,7 +64,8 @@ pub fn normalize_partitioned_by(sql: &str) -> String {
         // sides so we do not corrupt identifiers like `MY_PARTITIONED_TABLE`.
         if (c == b'P' || c == b'p') && i + 14 <= bytes.len() {
             let before_ok = i == 0 || !is_ident_byte(bytes[i - 1]);
-            if before_ok && case_insensitive_eq(&bytes[i..i + 13], b"PARTITIONED B")
+            if before_ok
+                && case_insensitive_eq(&bytes[i..i + 13], b"PARTITIONED B")
                 && bytes[i + 13].eq_ignore_ascii_case(&b'Y')
                 && (i + 14 == bytes.len() || !is_ident_byte(bytes[i + 14]))
             {

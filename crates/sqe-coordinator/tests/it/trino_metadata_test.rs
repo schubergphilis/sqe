@@ -31,7 +31,13 @@ fn print_str_cols(label: &str, batches: &[arrow_array::RecordBatch]) {
                     let col = b.column(c);
                     col.as_any()
                         .downcast_ref::<StringArray>()
-                        .map(|s| if s.is_null(row) { "NULL".into() } else { s.value(row).to_string() })
+                        .map(|s| {
+                            if s.is_null(row) {
+                                "NULL".into()
+                            } else {
+                                s.value(row).to_string()
+                            }
+                        })
                         .unwrap_or_else(|| format!("<{}>", col.data_type()))
                 })
                 .collect();
@@ -88,7 +94,8 @@ async fn information_schema_reveals_provider_and_catalog() {
             "SELECT table_catalog, table_schema, count(*) AS n \
              FROM information_schema.tables GROUP BY table_catalog, table_schema \
              ORDER BY table_catalog, table_schema",
-        None)
+            None,
+        )
         .await;
     match tbls {
         Ok(b) => {
@@ -100,8 +107,18 @@ async fn information_schema_reveals_provider_and_catalog() {
                     schema.fields().iter().map(|f| f.name()).collect::<Vec<_>>()
                 );
                 for row in 0..batch.num_rows() {
-                    let cat = batch.column(0).as_any().downcast_ref::<StringArray>().map(|s| s.value(row).to_string()).unwrap_or_default();
-                    let sch = batch.column(1).as_any().downcast_ref::<StringArray>().map(|s| s.value(row).to_string()).unwrap_or_default();
+                    let cat = batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .map(|s| s.value(row).to_string())
+                        .unwrap_or_default();
+                    let sch = batch
+                        .column(1)
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .map(|s| s.value(row).to_string())
+                        .unwrap_or_default();
                     eprintln!("    catalog={cat} schema={sch}");
                 }
             }
@@ -110,7 +127,10 @@ async fn information_schema_reveals_provider_and_catalog() {
     }
 
     // (C) SHOW COLUMNS path (rewrites to information_schema.columns).
-    match handler.execute(&session, &format!("SHOW COLUMNS FROM {fq}"), None).await {
+    match handler
+        .execute(&session, &format!("SHOW COLUMNS FROM {fq}"), None)
+        .await
+    {
         Ok(b) => print_str_cols("(C) SHOW COLUMNS", &b),
         Err(e) => eprintln!("---- (C) SHOW COLUMNS ERROR: {e}"),
     }
@@ -146,9 +166,15 @@ async fn describe_table_aliases_to_show_columns() {
     let name = "describe_probe";
     let fq = format!("{ns}.{name}");
 
-    let _ = handler.execute(&session, &format!("DROP TABLE IF EXISTS {fq}"), None).await;
+    let _ = handler
+        .execute(&session, &format!("DROP TABLE IF EXISTS {fq}"), None)
+        .await;
     handler
-        .execute(&session, &format!("CREATE TABLE {fq} (a INT, b VARCHAR)"), None)
+        .execute(
+            &session,
+            &format!("CREATE TABLE {fq} (a INT, b VARCHAR)"),
+            None,
+        )
         .await
         .expect("create table");
 
@@ -168,9 +194,14 @@ async fn describe_table_aliases_to_show_columns() {
         .downcast_ref::<StringArray>()
         .expect("column_name is Utf8");
     let names: Vec<&str> = (0..col.len()).map(|i| col.value(i)).collect();
-    assert!(names.contains(&"a") && names.contains(&"b"), "got columns: {names:?}");
+    assert!(
+        names.contains(&"a") && names.contains(&"b"),
+        "got columns: {names:?}"
+    );
 
-    let _ = handler.execute(&session, &format!("DROP TABLE IF EXISTS {fq}"), None).await;
+    let _ = handler
+        .execute(&session, &format!("DROP TABLE IF EXISTS {fq}"), None)
+        .await;
 }
 
 // Security guard: a table name containing a single quote must be escaped into

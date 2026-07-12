@@ -255,8 +255,7 @@ impl DistributedSortExec {
         // (boundaries.len() + 1), but from the coordinator's perspective
         // it is a single globally-sorted stream.
         // Build equivalence properties with output ordering matching the sort exprs.
-        let ordering_vec: Vec<PhysicalSortExpr> =
-            sort_exprs.iter().cloned().collect();
+        let ordering_vec: Vec<PhysicalSortExpr> = sort_exprs.iter().cloned().collect();
         let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new_with_orderings(schema, vec![ordering_vec]),
             Partitioning::UnknownPartitioning(1),
@@ -368,8 +367,8 @@ impl ExecutionPlan for DistributedSortExec {
         // 3. We just do a local sort on the received partition
         //
         // For now, fall back to a local SortExec on the input.
-        let local_sort = SortExec::new(self.sort_exprs.clone(), Arc::clone(&self.input))
-            .with_fetch(self.fetch);
+        let local_sort =
+            SortExec::new(self.sort_exprs.clone(), Arc::clone(&self.input)).with_fetch(self.fetch);
         local_sort.execute(partition, context)
     }
 }
@@ -520,9 +519,11 @@ mod tests {
 
     #[test]
     fn test_boundaries_single_partition() {
-        let stats = vec![
-            ("f1".to_string(), ScalarValue::Int64(Some(1)), ScalarValue::Int64(Some(100))),
-        ];
+        let stats = vec![(
+            "f1".to_string(),
+            ScalarValue::Int64(Some(1)),
+            ScalarValue::Int64(Some(100)),
+        )];
         let result = compute_range_boundaries(&stats, 1).unwrap();
         assert!(result.is_empty(), "Single partition needs no boundaries");
     }
@@ -530,14 +531,25 @@ mod tests {
     #[test]
     fn test_boundaries_two_partitions() {
         let stats = vec![
-            ("f1".to_string(), ScalarValue::Int64(Some(1)), ScalarValue::Int64(Some(50))),
-            ("f2".to_string(), ScalarValue::Int64(Some(51)), ScalarValue::Int64(Some(100))),
+            (
+                "f1".to_string(),
+                ScalarValue::Int64(Some(1)),
+                ScalarValue::Int64(Some(50)),
+            ),
+            (
+                "f2".to_string(),
+                ScalarValue::Int64(Some(51)),
+                ScalarValue::Int64(Some(100)),
+            ),
         ];
         let result = compute_range_boundaries(&stats, 2).unwrap();
         assert_eq!(result.len(), 1, "Two partitions need 1 boundary");
         // The boundary should be somewhere in the middle
         if let ScalarValue::Int64(Some(v)) = &result[0] {
-            assert!(*v > 1 && *v <= 100, "Boundary {v} should be between 1 and 100");
+            assert!(
+                *v > 1 && *v <= 100,
+                "Boundary {v} should be between 1 and 100"
+            );
         } else {
             panic!("Expected Int64 boundary, got {:?}", result[0]);
         }
@@ -546,10 +558,26 @@ mod tests {
     #[test]
     fn test_boundaries_four_partitions() {
         let stats = vec![
-            ("f1".to_string(), ScalarValue::Int64(Some(0)), ScalarValue::Int64(Some(25))),
-            ("f2".to_string(), ScalarValue::Int64(Some(26)), ScalarValue::Int64(Some(50))),
-            ("f3".to_string(), ScalarValue::Int64(Some(51)), ScalarValue::Int64(Some(75))),
-            ("f4".to_string(), ScalarValue::Int64(Some(76)), ScalarValue::Int64(Some(100))),
+            (
+                "f1".to_string(),
+                ScalarValue::Int64(Some(0)),
+                ScalarValue::Int64(Some(25)),
+            ),
+            (
+                "f2".to_string(),
+                ScalarValue::Int64(Some(26)),
+                ScalarValue::Int64(Some(50)),
+            ),
+            (
+                "f3".to_string(),
+                ScalarValue::Int64(Some(51)),
+                ScalarValue::Int64(Some(75)),
+            ),
+            (
+                "f4".to_string(),
+                ScalarValue::Int64(Some(76)),
+                ScalarValue::Int64(Some(100)),
+            ),
         ];
         let result = compute_range_boundaries(&stats, 4).unwrap();
         assert_eq!(result.len(), 3, "Four partitions need 3 boundaries");
@@ -567,8 +595,16 @@ mod tests {
     #[test]
     fn test_boundaries_with_null_values() {
         let stats = vec![
-            ("f1".to_string(), ScalarValue::Int64(None), ScalarValue::Int64(Some(50))),
-            ("f2".to_string(), ScalarValue::Int64(Some(51)), ScalarValue::Int64(None)),
+            (
+                "f1".to_string(),
+                ScalarValue::Int64(None),
+                ScalarValue::Int64(Some(50)),
+            ),
+            (
+                "f2".to_string(),
+                ScalarValue::Int64(Some(51)),
+                ScalarValue::Int64(None),
+            ),
         ];
         let result = compute_range_boundaries(&stats, 2).unwrap();
         // Should still produce boundaries from non-null values
@@ -577,11 +613,16 @@ mod tests {
 
     #[test]
     fn test_boundaries_all_null() {
-        let stats = vec![
-            ("f1".to_string(), ScalarValue::Int64(None), ScalarValue::Int64(None)),
-        ];
+        let stats = vec![(
+            "f1".to_string(),
+            ScalarValue::Int64(None),
+            ScalarValue::Int64(None),
+        )];
         let result = compute_range_boundaries(&stats, 4).unwrap();
-        assert!(result.is_empty(), "All-null stats should produce no boundaries");
+        assert!(
+            result.is_empty(),
+            "All-null stats should produce no boundaries"
+        );
     }
 
     // ── sample_based_boundaries tests ───────────────────────────────
@@ -594,9 +635,7 @@ mod tests {
 
     #[test]
     fn test_sample_boundaries_basic() {
-        let samples: Vec<ScalarValue> = (0..100)
-            .map(|i| ScalarValue::Int64(Some(i)))
-            .collect();
+        let samples: Vec<ScalarValue> = (0..100).map(|i| ScalarValue::Int64(Some(i))).collect();
         let result = sample_based_boundaries(&samples, 4).unwrap();
         assert_eq!(result.len(), 3, "4 partitions need 3 boundaries");
 
@@ -623,10 +662,26 @@ mod tests {
     #[test]
     fn test_needs_sampling_sufficient() {
         let stats = vec![
-            ("f1".to_string(), ScalarValue::Int64(Some(0)), ScalarValue::Int64(Some(25))),
-            ("f2".to_string(), ScalarValue::Int64(Some(26)), ScalarValue::Int64(Some(50))),
-            ("f3".to_string(), ScalarValue::Int64(Some(51)), ScalarValue::Int64(Some(75))),
-            ("f4".to_string(), ScalarValue::Int64(Some(76)), ScalarValue::Int64(Some(100))),
+            (
+                "f1".to_string(),
+                ScalarValue::Int64(Some(0)),
+                ScalarValue::Int64(Some(25)),
+            ),
+            (
+                "f2".to_string(),
+                ScalarValue::Int64(Some(26)),
+                ScalarValue::Int64(Some(50)),
+            ),
+            (
+                "f3".to_string(),
+                ScalarValue::Int64(Some(51)),
+                ScalarValue::Int64(Some(75)),
+            ),
+            (
+                "f4".to_string(),
+                ScalarValue::Int64(Some(76)),
+                ScalarValue::Int64(Some(100)),
+            ),
         ];
         // 8 distinct candidates (4 min + 4 max) >= 4 partitions
         assert!(!needs_sampling(&stats, 4));
@@ -634,9 +689,11 @@ mod tests {
 
     #[test]
     fn test_needs_sampling_insufficient() {
-        let stats = vec![
-            ("f1".to_string(), ScalarValue::Int64(Some(0)), ScalarValue::Int64(Some(100))),
-        ];
+        let stats = vec![(
+            "f1".to_string(),
+            ScalarValue::Int64(Some(0)),
+            ScalarValue::Int64(Some(100)),
+        )];
         // Only 2 distinct candidates but need 8 partitions
         assert!(needs_sampling(&stats, 8));
     }
@@ -751,7 +808,11 @@ mod tests {
             input,
             ordering,
             vec![ScalarValue::Int64(Some(50)), ScalarValue::Int64(Some(100))],
-            vec!["grpc://h1:50051".to_string(), "grpc://h2:50051".to_string(), "grpc://h3:50051".to_string()],
+            vec![
+                "grpc://h1:50051".to_string(),
+                "grpc://h2:50051".to_string(),
+                "grpc://h3:50051".to_string(),
+            ],
             Some(1000),
         );
 
@@ -815,7 +876,7 @@ mod tests {
     #[test]
     fn test_rule_single_executor_keeps_sort() {
         let rule = DistributedSortRule::new(
-            0, // threshold of 0 means "always distribute"
+            0,                                   // threshold of 0 means "always distribute"
             vec!["grpc://h1:50051".to_string()], // Only 1 executor
             vec![],
         );

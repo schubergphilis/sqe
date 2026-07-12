@@ -90,8 +90,7 @@ async fn latest_snapshot(
         .expect("summary column")
         .value(0)
         .to_string();
-    let summary: HashMap<String, String> =
-        serde_json::from_str(&summary_json).unwrap_or_default();
+    let summary: HashMap<String, String> = serde_json::from_str(&summary_json).unwrap_or_default();
     (op, summary)
 }
 
@@ -147,8 +146,18 @@ async fn seed_three_files(
         &format!("CREATE TABLE {fq}{props} AS SELECT 1 AS id, 10 AS v"),
     )
     .await;
-    exec(handler, session, &format!("INSERT INTO {fq} VALUES (2, 20)")).await;
-    exec(handler, session, &format!("INSERT INTO {fq} VALUES (3, 30)")).await;
+    exec(
+        handler,
+        session,
+        &format!("INSERT INTO {fq} VALUES (2, 20)"),
+    )
+    .await;
+    exec(
+        handler,
+        session,
+        &format!("INSERT INTO {fq} VALUES (3, 30)"),
+    )
+    .await;
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -162,10 +171,21 @@ async fn ctas_delete_mode_mor_writes_position_deletes() {
     let name = "ctas_del_mor_371";
     let fq = format!("{ns}.{name}");
 
-    seed_three_files(&handler, &session, &fq, "'write.delete.mode' = 'merge-on-read'").await;
+    seed_three_files(
+        &handler,
+        &session,
+        &fq,
+        "'write.delete.mode' = 'merge-on-read'",
+    )
+    .await;
     assert_eq!(live_data_file_count(&handler, &session, ns, name).await, 3);
 
-    exec(&handler, &session, &format!("DELETE FROM {fq} WHERE id = 1")).await;
+    exec(
+        &handler,
+        &session,
+        &format!("DELETE FROM {fq} WHERE id = 1"),
+    )
+    .await;
 
     // MoR must not rewrite data files: all three stay live, the delete
     // lands as a delete file in the delete manifest.
@@ -209,7 +229,12 @@ async fn ctas_delete_mode_default_is_cow() {
     seed_three_files(&handler, &session, &fq, "").await;
     assert_eq!(live_data_file_count(&handler, &session, ns, name).await, 3);
 
-    exec(&handler, &session, &format!("DELETE FROM {fq} WHERE id = 1")).await;
+    exec(
+        &handler,
+        &session,
+        &format!("DELETE FROM {fq} WHERE id = 1"),
+    )
+    .await;
 
     // CoW rewrites: the single-row file holding id=1 disappears and no
     // replacement is written (nothing survives the predicate in it).
@@ -247,12 +272,28 @@ async fn ctas_update_mode_mor_without_pk_falls_back_to_cow() {
     let name = "ctas_upd_mor_371";
     let fq = format!("{ns}.{name}");
 
-    seed_three_files(&handler, &session, &fq, "'write.update.mode' = 'merge-on-read'").await;
+    seed_three_files(
+        &handler,
+        &session,
+        &fq,
+        "'write.update.mode' = 'merge-on-read'",
+    )
+    .await;
 
-    exec(&handler, &session, &format!("UPDATE {fq} SET v = 99 WHERE id = 2")).await;
+    exec(
+        &handler,
+        &session,
+        &format!("UPDATE {fq} SET v = 99 WHERE id = 2"),
+    )
+    .await;
 
     assert_eq!(
-        scalar_i64(&handler, &session, &format!("SELECT v FROM {fq} WHERE id = 2")).await,
+        scalar_i64(
+            &handler,
+            &session,
+            &format!("SELECT v FROM {fq} WHERE id = 2")
+        )
+        .await,
         99,
         "UPDATE result must be visible regardless of mode"
     );
@@ -285,7 +326,13 @@ async fn ctas_merge_mode_mor_without_pk_falls_back_to_cow() {
     let name = "ctas_merge_mor_371";
     let fq = format!("{ns}.{name}");
 
-    seed_three_files(&handler, &session, &fq, "'write.merge.mode' = 'merge-on-read'").await;
+    seed_three_files(
+        &handler,
+        &session,
+        &fq,
+        "'write.merge.mode' = 'merge-on-read'",
+    )
+    .await;
 
     exec(
         &handler,
@@ -301,12 +348,22 @@ async fn ctas_merge_mode_mor_without_pk_falls_back_to_cow() {
     .await;
 
     assert_eq!(
-        scalar_i64(&handler, &session, &format!("SELECT v FROM {fq} WHERE id = 2")).await,
+        scalar_i64(
+            &handler,
+            &session,
+            &format!("SELECT v FROM {fq} WHERE id = 2")
+        )
+        .await,
         200,
         "MATCHED UPDATE branch must surface the new value"
     );
     assert_eq!(
-        scalar_i64(&handler, &session, &format!("SELECT v FROM {fq} WHERE id = 4")).await,
+        scalar_i64(
+            &handler,
+            &session,
+            &format!("SELECT v FROM {fq} WHERE id = 4")
+        )
+        .await,
         40,
         "NOT MATCHED INSERT branch must surface the new row"
     );
@@ -354,8 +411,14 @@ async fn ctas_write_mode_properties_survive_to_metadata() {
     let ddl = batches
         .iter()
         .flat_map(|b| {
-            let col = b.column(0).as_any().downcast_ref::<StringArray>().expect("ddl");
-            (0..col.len()).map(|i| col.value(i).to_string()).collect::<Vec<_>>()
+            let col = b
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("ddl");
+            (0..col.len())
+                .map(|i| col.value(i).to_string())
+                .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>()
         .join("\n");
@@ -383,14 +446,30 @@ async fn mor_delete_then_cow_update_round_trip() {
     let fq = format!("{ns}.{name}");
 
     // delete.mode=MoR only; UPDATE stays on the default CoW path.
-    seed_three_files(&handler, &session, &fq, "'write.delete.mode' = 'merge-on-read'").await;
+    seed_three_files(
+        &handler,
+        &session,
+        &fq,
+        "'write.delete.mode' = 'merge-on-read'",
+    )
+    .await;
 
     // 1. MoR DELETE id=1 -> delete manifest, 3 live data files.
-    exec(&handler, &session, &format!("DELETE FROM {fq} WHERE id = 1")).await;
+    exec(
+        &handler,
+        &session,
+        &format!("DELETE FROM {fq} WHERE id = 1"),
+    )
+    .await;
     assert_eq!(live_data_file_count(&handler, &session, ns, name).await, 3);
 
     // 2. CoW UPDATE id=2 -> rewrite while a delete manifest is live.
-    exec(&handler, &session, &format!("UPDATE {fq} SET v = 222 WHERE id = 2")).await;
+    exec(
+        &handler,
+        &session,
+        &format!("UPDATE {fq} SET v = 222 WHERE id = 2"),
+    )
+    .await;
 
     // 3. Full read-back: id=1 stays deleted, id=2 updated, id=3 intact.
     assert_eq!(
@@ -399,22 +478,42 @@ async fn mor_delete_then_cow_update_round_trip() {
         "CoW rewrite over a live delete manifest must not resurrect the deleted row"
     );
     assert_eq!(
-        scalar_i64(&handler, &session, &format!("SELECT v FROM {fq} WHERE id = 2")).await,
+        scalar_i64(
+            &handler,
+            &session,
+            &format!("SELECT v FROM {fq} WHERE id = 2")
+        )
+        .await,
         222
     );
     assert_eq!(
-        scalar_i64(&handler, &session, &format!("SELECT v FROM {fq} WHERE id = 3")).await,
+        scalar_i64(
+            &handler,
+            &session,
+            &format!("SELECT v FROM {fq} WHERE id = 3")
+        )
+        .await,
         30
     );
 
     // 4. Second MoR DELETE keeps composing.
-    exec(&handler, &session, &format!("DELETE FROM {fq} WHERE id = 3")).await;
+    exec(
+        &handler,
+        &session,
+        &format!("DELETE FROM {fq} WHERE id = 3"),
+    )
+    .await;
     assert_eq!(
         scalar_i64(&handler, &session, &format!("SELECT COUNT(*) FROM {fq}")).await,
         1
     );
     assert_eq!(
-        scalar_i64(&handler, &session, &format!("SELECT v FROM {fq} WHERE id = 2")).await,
+        scalar_i64(
+            &handler,
+            &session,
+            &format!("SELECT v FROM {fq} WHERE id = 2")
+        )
+        .await,
         222
     );
 

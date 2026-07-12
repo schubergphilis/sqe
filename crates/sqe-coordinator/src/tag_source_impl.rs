@@ -118,9 +118,7 @@ impl TagSource for CacheTagSource {
 ///
 /// Returns an empty map on any failure (absent key, malformed JSON, wrong
 /// JSON shape) — fail-safe: no tags means no extra masking.
-pub(crate) fn parse_column_tags(
-    props: &HashMap<String, String>,
-) -> HashMap<String, Vec<String>> {
+pub(crate) fn parse_column_tags(props: &HashMap<String, String>) -> HashMap<String, Vec<String>> {
     let raw = match props.get(PROP_KEY) {
         Some(v) => v,
         None => return HashMap::new(),
@@ -182,7 +180,10 @@ mod tests {
     use sqe_sql::tags::{ColumnTagOp, TagAction};
 
     fn props(pairs: &[(&str, &str)]) -> HashMap<String, String> {
-        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
     }
 
     fn map(pairs: &[(&str, &[&str])]) -> std::collections::HashMap<String, Vec<String>> {
@@ -201,7 +202,10 @@ mod tests {
             action: TagAction::Set,
         }];
         let got = apply_tag_ops(&cur, &ops);
-        assert_eq!(got.get("email").unwrap(), &vec!["PII".to_string(), "GDPR".to_string()]);
+        assert_eq!(
+            got.get("email").unwrap(),
+            &vec!["PII".to_string(), "GDPR".to_string()]
+        );
     }
 
     #[test]
@@ -261,10 +265,7 @@ mod tests {
         )]);
         let got = parse_column_tags(&p);
         assert_eq!(got.get("email").unwrap(), &vec!["PII", "GDPR"]);
-        assert_eq!(
-            got.get("salary").unwrap(),
-            &vec!["PII", "CONFIDENTIAL"]
-        );
+        assert_eq!(got.get("salary").unwrap(), &vec!["PII", "CONFIDENTIAL"]);
         assert_eq!(got.len(), 2);
     }
 
@@ -343,7 +344,10 @@ mod tests {
 
         // Serialize under PROP_KEY (what set_column_tags commits) and read back.
         let written = serialize_to_props(&merged);
-        assert!(written.contains_key(PROP_KEY), "property must be written under PROP_KEY");
+        assert!(
+            written.contains_key(PROP_KEY),
+            "property must be written under PROP_KEY"
+        );
         let read_back = parse_column_tags(&written);
         assert_eq!(
             read_back.get("email").unwrap(),

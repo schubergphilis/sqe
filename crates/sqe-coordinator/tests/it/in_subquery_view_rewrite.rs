@@ -140,10 +140,9 @@ async fn single_column_in_small_keyset() {
         &["x", "x", "x", "x", "x"],
     );
 
-    let (where_sql, joins_sql, _guard) =
-        lift_in_subqueries("c1 IN (SELECT k FROM keyset)", &ctx)
-            .await
-            .expect("lift");
+    let (where_sql, joins_sql, _guard) = lift_in_subqueries("c1 IN (SELECT k FROM keyset)", &ctx)
+        .await
+        .expect("lift");
 
     assert!(
         where_sql.contains("__matched"),
@@ -174,19 +173,12 @@ async fn multi_column_tuple_in_small_keyset() {
     );
     // Keyset matches (2,'b'), (5,'e'), (10,'j'); tuples that don't match any
     // outer row are included to confirm the semi-join drops them.
-    register_two_col(
-        &ctx,
-        "keyset",
-        &[2, 5, 10, 99],
-        &["b", "e", "j", "nope"],
-    );
+    register_two_col(&ctx, "keyset", &[2, 5, 10, 99], &["b", "e", "j", "nope"]);
 
-    let (where_sql, joins_sql, _guard) = lift_in_subqueries(
-        "(c1, c2) IN (SELECT k, label FROM keyset)",
-        &ctx,
-    )
-    .await
-    .expect("lift");
+    let (where_sql, joins_sql, _guard) =
+        lift_in_subqueries("(c1, c2) IN (SELECT k, label FROM keyset)", &ctx)
+            .await
+            .expect("lift");
 
     let rows = select_c1_where(&ctx, "t", &joins_sql, &where_sql).await;
     assert_eq!(rows, vec![2, 5, 10]);
@@ -214,12 +206,10 @@ async fn delete_shape_multi_column_not_predicate() {
     );
     register_two_col(&ctx, "keyset", &[2, 5, 10], &["b", "e", "j"]);
 
-    let (where_sql, joins_sql, _guard) = lift_in_subqueries(
-        "(c1, c2) IN (SELECT k, label FROM keyset)",
-        &ctx,
-    )
-    .await
-    .expect("lift");
+    let (where_sql, joins_sql, _guard) =
+        lift_in_subqueries("(c1, c2) IN (SELECT k, label FROM keyset)", &ctx)
+            .await
+            .expect("lift");
 
     // Wrap in NOT to match what `filter_batch_negate` splices into its SELECT.
     let negated = format!("NOT ({where_sql})");
@@ -248,10 +238,9 @@ async fn mor_delete_shape_single_column() {
     );
     register_two_col(&ctx, "keyset", &[3, 6, 9], &["_", "_", "_"]);
 
-    let (where_sql, joins_sql, _guard) =
-        lift_in_subqueries("c1 IN (SELECT k FROM keyset)", &ctx)
-            .await
-            .expect("lift");
+    let (where_sql, joins_sql, _guard) = lift_in_subqueries("c1 IN (SELECT k FROM keyset)", &ctx)
+        .await
+        .expect("lift");
 
     let rows = select_c1_where(&ctx, "t", &joins_sql, &where_sql).await;
     assert_eq!(rows, vec![3, 6, 9]);
@@ -291,34 +280,24 @@ async fn not_in_single_column() {
 #[tokio::test(flavor = "multi_thread")]
 async fn in_empty_subquery_matches_nothing() {
     let ctx = SessionContext::new();
-    register_three_col(
-        &ctx,
-        "t",
-        &[1, 2, 3],
-        &["a", "b", "c"],
-        &[10, 20, 30],
-    );
+    register_three_col(&ctx, "t", &[1, 2, 3], &["a", "b", "c"], &[10, 20, 30]);
     register_two_col(&ctx, "keyset", &[], &[]);
 
-    let (where_sql, joins_sql, _guard) =
-        lift_in_subqueries("c1 IN (SELECT k FROM keyset)", &ctx)
-            .await
-            .expect("lift");
+    let (where_sql, joins_sql, _guard) = lift_in_subqueries("c1 IN (SELECT k FROM keyset)", &ctx)
+        .await
+        .expect("lift");
 
     let rows = select_c1_where(&ctx, "t", &joins_sql, &where_sql).await;
-    assert!(rows.is_empty(), "IN (empty) must match nothing, got {rows:?}");
+    assert!(
+        rows.is_empty(),
+        "IN (empty) must match nothing, got {rows:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn not_in_empty_subquery_matches_everything() {
     let ctx = SessionContext::new();
-    register_three_col(
-        &ctx,
-        "t",
-        &[1, 2, 3],
-        &["a", "b", "c"],
-        &[10, 20, 30],
-    );
+    register_three_col(&ctx, "t", &[1, 2, 3], &["a", "b", "c"], &[10, 20, 30]);
     register_two_col(&ctx, "keyset", &[], &[]);
 
     let (where_sql, joins_sql, _guard) =
@@ -352,10 +331,9 @@ async fn null_rows_in_subquery_are_dropped_from_keyset() {
     );
     register_single_col(&ctx, "keyset", vec![Some(2), None, Some(4), None]);
 
-    let (where_sql, joins_sql, _guard) =
-        lift_in_subqueries("c1 IN (SELECT k FROM keyset)", &ctx)
-            .await
-            .expect("lift");
+    let (where_sql, joins_sql, _guard) = lift_in_subqueries("c1 IN (SELECT k FROM keyset)", &ctx)
+        .await
+        .expect("lift");
 
     let rows = select_c1_where(&ctx, "t", &joins_sql, &where_sql).await;
     assert_eq!(rows, vec![2, 4]);
@@ -428,7 +406,8 @@ async fn stress_one_million_row_keyset() {
     )
     .expect("outer batch");
     let t_mem = MemTable::try_new(t_schema, vec![vec![t_batch]]).expect("outer mt");
-    ctx.register_table("t", Arc::new(t_mem)).expect("register t");
+    ctx.register_table("t", Arc::new(t_mem))
+        .expect("register t");
 
     // Keyset: 1M rows. Values 0..N; outer only matches on 0..100.
     let keyset_schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, true)]));
@@ -438,16 +417,14 @@ async fn stress_one_million_row_keyset() {
         vec![Arc::new(Int64Array::from(keyset_vals))],
     )
     .expect("keyset batch");
-    let keyset_mem =
-        MemTable::try_new(keyset_schema, vec![vec![keyset_batch]]).expect("keyset mt");
+    let keyset_mem = MemTable::try_new(keyset_schema, vec![vec![keyset_batch]]).expect("keyset mt");
     ctx.register_table("keyset", Arc::new(keyset_mem))
         .expect("register keyset");
 
     let start = Instant::now();
-    let (where_sql, joins_sql, _guard) =
-        lift_in_subqueries("c1 IN (SELECT k FROM keyset)", &ctx)
-            .await
-            .expect("lift");
+    let (where_sql, joins_sql, _guard) = lift_in_subqueries("c1 IN (SELECT k FROM keyset)", &ctx)
+        .await
+        .expect("lift");
     let sql = format!("SELECT COUNT(*) AS n FROM t{joins_sql} WHERE {where_sql}");
     let df = ctx.sql(&sql).await.expect("plan stress");
     let batches = df.collect().await.expect("collect stress");

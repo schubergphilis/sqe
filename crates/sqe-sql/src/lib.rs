@@ -17,24 +17,24 @@ pub mod trino_compat;
 pub mod tvf_named_args;
 pub mod v3_types;
 
+pub use alter_execute::rewrite_alter_execute;
 pub use attach::{
     build_secret_from_stmt, AttachStatement, CatalogKind, CreateSecretStatement, DetachStatement,
     DropSecretStatement, OptionValue, SecretKind,
 };
+pub use bare_table::rewrite_bare_table;
 pub use catalog_qualifiers::{extract_catalog_qualifiers, extract_catalog_qualifiers_from_sql};
 pub use classifier::{
     parse_and_classify, parse_and_classify_typed, CheckAccessParams, ShowEffectivePolicyParams,
     ShowGrantsTarget, StatementKind,
 };
-pub use alter_execute::rewrite_alter_execute;
 pub use ctas_compat::rewrite_ctas_compat;
 pub use ddl::{try_parse_ref_ddl, BranchRetention, RefDdl};
-pub use bare_table::rewrite_bare_table;
 pub use nested_row_cast::rewrite_nested_row_cast;
 pub use paren_less_values::rewrite_paren_less_values;
 pub use partition::normalize_partitioned_by;
-pub use pipeline_types::{pre_parse_pipeline, ClassifiableSql, UserSql};
 pub use partition_evolution::{try_parse_partition_evolution, PartitionEvolution};
+pub use pipeline_types::{pre_parse_pipeline, ClassifiableSql, UserSql};
 pub use procedures::{try_parse_call, NamespaceRef, ProcedureCall, TableRef};
 pub use time_travel::{
     extract_incremental_spec, extract_time_travel_spec, IncrementalSpec, TimeTravelSpec, VersionRef,
@@ -44,6 +44,6 @@ pub use trino_compat::{
 };
 pub use tvf_named_args::rewrite_named_tvf_args;
 pub use v3_types::{
-    detect_ns_timestamp, extract_default_literal, is_tz_variant, is_v3_only_type,
-    DefaultError, DefaultLiteral, NsTimestamp,
+    detect_ns_timestamp, extract_default_literal, is_tz_variant, is_v3_only_type, DefaultError,
+    DefaultLiteral, NsTimestamp,
 };

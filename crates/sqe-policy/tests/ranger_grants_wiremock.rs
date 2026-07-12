@@ -16,10 +16,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 const SERVICE: &str = "polaris";
 
 fn backend(url: &str) -> RangerGrantBackend {
-    RangerGrantBackend::new(
-        url, SERVICE, "admin", "admin-pw", "POLARIS", 30, false,
-    )
-    .unwrap()
+    RangerGrantBackend::new(url, SERVICE, "admin", "admin-pw", "POLARIS", 30, false).unwrap()
 }
 
 fn grant_stmt() -> GrantStatement {
@@ -99,7 +96,10 @@ async fn show_grants_parses_policies_on_200() {
 
     let backend = backend(&server.uri());
     let entries = backend
-        .show_grants("token", &GrantFilter::ToGrantee(Grantee::Role("analyst".to_string())))
+        .show_grants(
+            "token",
+            &GrantFilter::ToGrantee(Grantee::Role("analyst".to_string())),
+        )
         .await
         .expect("show_grants against a 200 endpoint must succeed");
     assert_eq!(entries.len(), 1, "one matching grant for role analyst");
@@ -121,7 +121,10 @@ async fn show_grants_fails_loudly_on_non_200() {
 
     let backend = backend(&server.uri());
     let err = backend
-        .show_grants("token", &GrantFilter::ToGrantee(Grantee::Role("analyst".to_string())))
+        .show_grants(
+            "token",
+            &GrantFilter::ToGrantee(Grantee::Role("analyst".to_string())),
+        )
         .await
         .expect_err("a 5xx from the policy API must surface as Err");
     assert!(

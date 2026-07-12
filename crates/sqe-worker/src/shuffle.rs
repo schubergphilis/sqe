@@ -53,14 +53,10 @@ impl ExchangeDescriptor {
     pub fn stage_key(&self) -> (String, String) {
         match self {
             ExchangeDescriptor::HashPartition {
-                query_id,
-                stage_id,
-                ..
+                query_id, stage_id, ..
             } => (query_id.clone(), stage_id.clone()),
             ExchangeDescriptor::RangePartition {
-                query_id,
-                stage_id,
-                ..
+                query_id, stage_id, ..
             } => (query_id.clone(), stage_id.clone()),
         }
     }
@@ -159,12 +155,7 @@ impl ShuffleManager {
     }
 
     /// Register a new ShuffleReceiver for a (query_id, stage_id).
-    pub async fn register(
-        &self,
-        query_id: &str,
-        stage_id: &str,
-        receiver: Arc<ShuffleReceiver>,
-    ) {
+    pub async fn register(&self, query_id: &str, stage_id: &str, receiver: Arc<ShuffleReceiver>) {
         let key = (query_id.to_string(), stage_id.to_string());
         debug!(
             query_id = %query_id,
@@ -258,10 +249,8 @@ impl HashPartitioner {
 
         // Assign rows to partitions: hash % num_partitions
         let num_partitions = self.num_partitions as u64;
-        let partition_assignments: Vec<u32> = hashes
-            .iter()
-            .map(|h| (h % num_partitions) as u32)
-            .collect();
+        let partition_assignments: Vec<u32> =
+            hashes.iter().map(|h| (h % num_partitions) as u32).collect();
 
         // Build per-partition row indices
         let mut partition_indices: Vec<Vec<u32>> = vec![Vec::new(); self.num_partitions];
@@ -342,11 +331,9 @@ impl RangePartitioner {
         }
 
         // Extract the key column
-        let key_col = batch
-            .column_by_name(&self.key_column)
-            .ok_or_else(|| {
-                anyhow::anyhow!("Key column '{}' not found in batch", self.key_column)
-            })?;
+        let key_col = batch.column_by_name(&self.key_column).ok_or_else(|| {
+            anyhow::anyhow!("Key column '{}' not found in batch", self.key_column)
+        })?;
 
         // Downcast to Int64Array for binary search against i64 boundaries.
         // For a production system, we'd support more types; for now Int64 covers
@@ -366,9 +353,7 @@ impl RangePartitioner {
         for row_idx in 0..batch.num_rows() {
             let value = key_array.value(row_idx);
             // Binary search: find first boundary > value
-            let partition_id = self
-                .boundaries
-                .partition_point(|b| *b <= value);
+            let partition_id = self.boundaries.partition_point(|b| *b <= value);
             partition_indices[partition_id].push(row_idx as u32);
         }
 
@@ -513,7 +498,12 @@ mod tests {
     fn test_hash_partitioner_4_partitions_distributes() {
         let batch = make_batch(
             (0..100).collect(),
-            (0..100).map(|i| format!("name_{i}")).collect::<Vec<_>>().iter().map(|s| s.as_str()).collect(),
+            (0..100)
+                .map(|i| format!("name_{i}"))
+                .collect::<Vec<_>>()
+                .iter()
+                .map(|s| s.as_str())
+                .collect(),
         );
 
         let partitioner = HashPartitioner::new(vec!["id".to_string()], 4);
@@ -606,10 +596,7 @@ mod tests {
         //   partition 0: key < 10        (strictly less than first boundary)
         //   partition 1: 10 <= key < 20  (between boundaries)
         //   partition 2: key >= 20       (at or above last boundary)
-        let batch = make_range_batch(
-            vec![5, 10, 15, 20, 25],
-            vec!["a", "b", "c", "d", "e"],
-        );
+        let batch = make_range_batch(vec![5, 10, 15, 20, 25], vec!["a", "b", "c", "d", "e"]);
 
         let partitioner = RangePartitioner::new("id".to_string(), vec![10, 20]);
         let result = partitioner.partition(&batch).unwrap();
@@ -617,11 +604,7 @@ mod tests {
         // Verify partitions
         let mut partition_map: HashMap<u32, Vec<i64>> = HashMap::new();
         for (pid, b) in &result {
-            let ids = b
-                .column(0)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .unwrap();
+            let ids = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
             let vals: Vec<i64> = (0..ids.len()).map(|i| ids.value(i)).collect();
             partition_map.insert(*pid, vals);
         }
@@ -727,18 +710,15 @@ mod tests {
     #[test]
     fn test_hash_partitioner_multi_column_key() {
         // Hash on both id and name columns
-        let batch = make_batch(
-            vec![1, 1, 2, 2],
-            vec!["a", "b", "a", "b"],
-        );
-        let partitioner = HashPartitioner::new(
-            vec!["id".to_string(), "name".to_string()],
-            4,
-        );
+        let batch = make_batch(vec![1, 1, 2, 2], vec!["a", "b", "a", "b"]);
+        let partitioner = HashPartitioner::new(vec!["id".to_string(), "name".to_string()], 4);
         let result = partitioner.partition(&batch).unwrap();
 
         let total_rows: usize = result.iter().map(|(_, b)| b.num_rows()).sum();
-        assert_eq!(total_rows, 4, "All rows accounted for with multi-column key");
+        assert_eq!(
+            total_rows, 4,
+            "All rows accounted for with multi-column key"
+        );
 
         // Rows with same (id, name) must land in same partition
         // (1, "a") and (2, "a") have different id, may differ

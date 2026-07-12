@@ -13,8 +13,8 @@ use moka::sync::Cache as MokaCache;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
-use sqe_core::Session;
 use sqe_core::config::SecurityConfig;
+use sqe_core::Session;
 
 use crate::explain_compat;
 use crate::info_schema_compat;
@@ -55,9 +55,7 @@ const MAX_WAIT_CAP: std::time::Duration = std::time::Duration::from_secs(10);
 fn build_result_cache() -> MokaCache<String, Arc<PaginatedResult>> {
     MokaCache::builder()
         .max_capacity(RESULT_CACHE_MAX_BYTES)
-        .weigher(|_key: &String, value: &Arc<PaginatedResult>| {
-            value.estimated_bytes.max(1)
-        })
+        .weigher(|_key: &String, value: &Arc<PaginatedResult>| value.estimated_bytes.max(1))
         .time_to_live(std::time::Duration::from_secs(RESULT_TTL_SECS))
         .build()
 }
@@ -152,7 +150,9 @@ fn estimate_json_bytes(value: &serde_json::Value) -> usize {
         serde_json::Value::Bool(_) => 5,
         serde_json::Value::Number(_) => 16,
         serde_json::Value::String(s) => s.len() + 16,
-        serde_json::Value::Array(items) => items.iter().map(estimate_json_bytes).sum::<usize>() + 16,
+        serde_json::Value::Array(items) => {
+            items.iter().map(estimate_json_bytes).sum::<usize>() + 16
+        }
         serde_json::Value::Object(map) => {
             map.iter()
                 .map(|(k, v)| k.len() + estimate_json_bytes(v) + 8)
@@ -239,7 +239,11 @@ pub struct TrinoClientHeaders {
 
 #[async_trait::async_trait]
 pub trait TrinoAuthenticator: Send + Sync + 'static {
-    async fn authenticate(&self, username: &str, password: &str) -> Result<Session, sqe_core::SqeError>;
+    async fn authenticate(
+        &self,
+        username: &str,
+        password: &str,
+    ) -> Result<Session, sqe_core::SqeError>;
 
     /// Validate a raw bearer token (JWT) and return an authenticated session.
     ///
@@ -366,10 +370,11 @@ where
         // Restrictive CORS: no cross-origin by default. The Trino compat endpoint
         // is designed for JDBC/CLI clients, not browsers. An explicit empty
         // Access-Control-Allow-Origin blocks browser-based cross-origin requests.
-        let cors_layer = axum::middleware::from_fn(|req: axum::extract::Request, next: axum::middleware::Next| async move {
-            if req.method() == axum::http::Method::OPTIONS {
-                // Preflight: respond with 204 and restrictive headers.
-                return axum::response::Response::builder()
+        let cors_layer = axum::middleware::from_fn(
+            |req: axum::extract::Request, next: axum::middleware::Next| async move {
+                if req.method() == axum::http::Method::OPTIONS {
+                    // Preflight: respond with 204 and restrictive headers.
+                    return axum::response::Response::builder()
                     .status(204)
                     .header("Access-Control-Allow-Methods", "GET, POST, DELETE")
                     .header("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Trino-User, X-Trino-Catalog, X-Trino-Schema, X-Trino-Source")
@@ -377,9 +382,10 @@ where
                     .body(axum::body::Body::empty())
                     .unwrap()
                     .into_response();
-            }
-            next.run(req).await
-        });
+                }
+                next.run(req).await
+            },
+        );
 
         let mut app = build_statement_router(state).layer(cors_layer);
 
@@ -431,9 +437,7 @@ fn trino_client_ip<A, Q>(
     headers: &HeaderMap,
     peer: SocketAddr,
 ) -> String {
-    let xff = headers
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok());
+    let xff = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok());
     state
         .security
         .resolve_client_ip(Some(&peer.to_string()), xff)
@@ -596,10 +600,18 @@ fn apply_session_headers(
     }
 
     if let Some(catalog) = &update.set_catalog {
-        insert(headers, HeaderName::from_static("x-trino-set-catalog"), catalog);
+        insert(
+            headers,
+            HeaderName::from_static("x-trino-set-catalog"),
+            catalog,
+        );
     }
     if let Some(schema) = &update.set_schema {
-        insert(headers, HeaderName::from_static("x-trino-set-schema"), schema);
+        insert(
+            headers,
+            HeaderName::from_static("x-trino-set-schema"),
+            schema,
+        );
     }
     for (name, value) in &update.set_session {
         append(
@@ -609,7 +621,11 @@ fn apply_session_headers(
         );
     }
     for name in &update.clear_session {
-        append(headers, HeaderName::from_static("x-trino-clear-session"), name);
+        append(
+            headers,
+            HeaderName::from_static("x-trino-clear-session"),
+            name,
+        );
     }
     for (name, sql) in &update.added_prepare {
         // The SQL value must be URL-encoded: it contains spaces, commas, and
@@ -772,9 +788,7 @@ fn paginate_rows(
     if rows.is_empty() {
         return vec![vec![]];
     }
-    rows.chunks(page_size)
-        .map(|chunk| chunk.to_vec())
-        .collect()
+    rows.chunks(page_size).map(|chunk| chunk.to_vec()).collect()
 }
 
 /// Build a `nextUri` for the given query id and page token, or `None` if this is the last page.
@@ -892,8 +906,7 @@ fn parse_trino_duration(s: &str) -> Option<std::time::Duration> {
 
 /// Derive the base URL from the `Host` header, falling back to `localhost:<port>`.
 fn extract_base_url(headers: &HeaderMap, bound_port: u16) -> String {
-    let scheme = extract_header(headers, "x-forwarded-proto")
-        .unwrap_or_else(|| "http".to_string());
+    let scheme = extract_header(headers, "x-forwarded-proto").unwrap_or_else(|| "http".to_string());
     if let Some(host) = extract_header(headers, "host") {
         format!("{scheme}://{host}")
     } else {
@@ -908,11 +921,7 @@ fn build_page_response(
     paginated: &PaginatedResult,
     page_token: usize,
 ) -> TrinoResponse {
-    let page_data = paginated
-        .pages
-        .get(page_token)
-        .cloned()
-        .unwrap_or_default();
+    let page_data = paginated.pages.get(page_token).cloned().unwrap_or_default();
     let is_last = page_token + 1 >= paginated.total_pages;
 
     // DDL/update statements produce no columns. The Trino 465 JDBC client's
@@ -971,7 +980,10 @@ async fn run_statement<Q: TrinoQueryExecutor>(
             ))),
         }
     } else if let Some(like) = protocol::parse_show_session(exec_sql) {
-        Ok(build_show_session_batches(show_session_props, like.as_deref()))
+        Ok(build_show_session_batches(
+            show_session_props,
+            like.as_deref(),
+        ))
     } else {
         handler.execute(session, exec_sql).await
     }
@@ -1126,7 +1138,11 @@ async fn submit_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
 
     let sql_hash = {
         use sha2::{Digest, Sha256};
-        let normalised: String = sql.split_whitespace().collect::<Vec<_>>().join(" ").to_uppercase();
+        let normalised: String = sql
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_uppercase();
         format!("{:x}", Sha256::digest(normalised.as_bytes()))
     };
     info!(
@@ -1849,13 +1865,9 @@ mod tests {
 
     fn basic_auth_header(user: &str, pass: &str) -> HeaderMap {
         use base64::Engine as _;
-        let encoded = base64::engine::general_purpose::STANDARD
-            .encode(format!("{user}:{pass}"));
+        let encoded = base64::engine::general_purpose::STANDARD.encode(format!("{user}:{pass}"));
         let mut headers = HeaderMap::new();
-        headers.insert(
-            "authorization",
-            format!("Basic {encoded}").parse().unwrap(),
-        );
+        headers.insert("authorization", format!("Basic {encoded}").parse().unwrap());
         headers
     }
 
@@ -2061,9 +2073,10 @@ mod tests {
         let open = Arc::new(AtomicBool::new(false));
         let gate = Arc::new(tokio::sync::Notify::new());
         let state = gated_state(open, gate);
-        state
-            .queries
-            .insert("q1".to_string(), handle_with(QueryStatus::Finished, "alice"));
+        state.queries.insert(
+            "q1".to_string(),
+            handle_with(QueryStatus::Finished, "alice"),
+        );
         let resp = get_queued_results(
             State(state),
             test_peer(),
@@ -2089,12 +2102,10 @@ mod tests {
         let gate = Arc::new(tokio::sync::Notify::new());
         let state = gated_state(open, gate);
         let err = protocol::TrinoError::user_error("boom", Some("q1"));
-        state
-            .queries
-            .insert(
-                "q1".to_string(),
-                handle_with(QueryStatus::Failed(Box::new(err)), "alice"),
-            );
+        state.queries.insert(
+            "q1".to_string(),
+            handle_with(QueryStatus::Failed(Box::new(err)), "alice"),
+        );
         let resp = get_queued_results(
             State(state),
             test_peer(),
@@ -2179,7 +2190,10 @@ mod tests {
 
     #[test]
     fn like_match_handles_wildcards() {
-        assert!(like_match("iceberg.compression_codec", "iceberg.compression_codec"));
+        assert!(like_match(
+            "iceberg.compression_codec",
+            "iceberg.compression_codec"
+        ));
         assert!(like_match("iceberg.compression_codec", "iceberg.%"));
         assert!(like_match("iceberg.compression_codec", "%codec"));
         assert!(like_match("abc", "a_c"));
@@ -2193,7 +2207,9 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(
             "x-trino-session",
-            "iceberg.compression_codec=ZSTD, query_max_run_time=1h".parse().unwrap(),
+            "iceberg.compression_codec=ZSTD, query_max_run_time=1h"
+                .parse()
+                .unwrap(),
         );
         let props = incoming_session_properties(&headers);
         assert_eq!(
@@ -2212,7 +2228,9 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(
             "x-trino-session",
-            "iceberg.compression_codec=ZSTD, query_max_run_time=1h".parse().unwrap(),
+            "iceberg.compression_codec=ZSTD, query_max_run_time=1h"
+                .parse()
+                .unwrap(),
         );
         let parsed = extract_trino_headers(&headers);
         assert_eq!(parsed.compression_codec.as_deref(), Some("ZSTD"));
@@ -2272,7 +2290,9 @@ mod tests {
             .unwrap()
             .to_string();
         assert_eq!(hdr, "iceberg.compression_codec='ZSTD'");
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let tr: TrinoResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(tr.update_type.as_deref(), Some("SET SESSION"));
         assert_eq!(tr.columns.map(|c| c.len()), Some(0));
@@ -2288,7 +2308,9 @@ mod tests {
         let mut headers = basic_auth_header("alice", "pw");
         headers.insert(
             "x-trino-session",
-            "iceberg.compression_codec=ZSTD, query_max_run_time=1h".parse().unwrap(),
+            "iceberg.compression_codec=ZSTD, query_max_run_time=1h"
+                .parse()
+                .unwrap(),
         );
 
         let resp = submit_query::<MockAuthOk, RecordingQuery>(
@@ -2305,7 +2327,9 @@ mod tests {
             seen.lock().unwrap().is_empty(),
             "SHOW SESSION must not be sent to the executor"
         );
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let tr: TrinoResponse = serde_json::from_slice(&body).unwrap();
         // Trino's 5-column shape.
         let cols: Vec<String> = tr
@@ -2314,7 +2338,10 @@ mod tests {
             .into_iter()
             .map(|c| c.name)
             .collect();
-        assert_eq!(cols, vec!["Name", "Value", "Default", "Type", "Description"]);
+        assert_eq!(
+            cols,
+            vec!["Name", "Value", "Default", "Type", "Description"]
+        );
         // Exactly the LIKE-matched property, with its value.
         let data = tr.data.expect("data");
         assert_eq!(data.len(), 1, "LIKE filter keeps one property: {data:?}");
@@ -2382,7 +2409,9 @@ mod tests {
         assert!(hdr.starts_with("ps="), "header was: {hdr}");
         // SQL is URL-encoded (space -> '+'), so the client can replay it.
         assert!(hdr.contains("SELECT"), "header was: {hdr}");
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let tr: TrinoResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(tr.update_type.as_deref(), Some("PREPARE"));
         // Non-null empty columns (omitting it -> JSON null -> driver throws).
@@ -2409,7 +2438,9 @@ mod tests {
             "DEALLOCATE must not be sent to the executor"
         );
         assert!(resp.headers().get("x-trino-deallocated-prepare").is_some());
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let tr: TrinoResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(tr.update_type.as_deref(), Some("DEALLOCATE"));
         assert_eq!(tr.columns.map(|c| c.len()), Some(0));
@@ -2480,7 +2511,9 @@ mod tests {
         .into_response();
 
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let tr: TrinoResponse = serde_json::from_slice(&body).unwrap();
         let data = tr.data.expect("data rows");
 
@@ -2541,28 +2574,18 @@ mod tests {
     #[test]
     fn test_extract_bearer_token_basic_auth_ignored() {
         let mut headers = HeaderMap::new();
-        let encoded = base64::Engine::encode(
-            &base64::engine::general_purpose::STANDARD,
-            b"user:pass",
-        );
-        headers.insert(
-            "authorization",
-            format!("Basic {encoded}").parse().unwrap(),
-        );
+        let encoded =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"user:pass");
+        headers.insert("authorization", format!("Basic {encoded}").parse().unwrap());
         assert!(extract_bearer_token(&headers).is_none());
     }
 
     #[test]
     fn test_extract_basic_auth() {
         let mut headers = HeaderMap::new();
-        let encoded = base64::Engine::encode(
-            &base64::engine::general_purpose::STANDARD,
-            b"root:root123",
-        );
-        headers.insert(
-            "authorization",
-            format!("Basic {encoded}").parse().unwrap(),
-        );
+        let encoded =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"root:root123");
+        headers.insert("authorization", format!("Basic {encoded}").parse().unwrap());
 
         let (user, pass) = extract_basic_auth(&headers).unwrap();
         assert_eq!(user, "root");
@@ -2593,9 +2616,8 @@ mod tests {
 
     #[test]
     fn test_paginate_rows_single_page() {
-        let rows: Vec<Vec<serde_json::Value>> = (0..5)
-            .map(|i| vec![serde_json::json!(i)])
-            .collect();
+        let rows: Vec<Vec<serde_json::Value>> =
+            (0..5).map(|i| vec![serde_json::json!(i)]).collect();
         let pages = paginate_rows(rows, 10);
         assert_eq!(pages.len(), 1);
         assert_eq!(pages[0].len(), 5);
@@ -2603,9 +2625,8 @@ mod tests {
 
     #[test]
     fn test_paginate_rows_multiple_pages() {
-        let rows: Vec<Vec<serde_json::Value>> = (0..25)
-            .map(|i| vec![serde_json::json!(i)])
-            .collect();
+        let rows: Vec<Vec<serde_json::Value>> =
+            (0..25).map(|i| vec![serde_json::json!(i)]).collect();
         let pages = paginate_rows(rows, 10);
         assert_eq!(pages.len(), 3);
         assert_eq!(pages[0].len(), 10);
@@ -2615,9 +2636,8 @@ mod tests {
 
     #[test]
     fn test_paginate_rows_exact_fit() {
-        let rows: Vec<Vec<serde_json::Value>> = (0..20)
-            .map(|i| vec![serde_json::json!(i)])
-            .collect();
+        let rows: Vec<Vec<serde_json::Value>> =
+            (0..20).map(|i| vec![serde_json::json!(i)]).collect();
         let pages = paginate_rows(rows, 10);
         assert_eq!(pages.len(), 2);
         assert_eq!(pages[0].len(), 10);
@@ -2627,7 +2647,10 @@ mod tests {
     #[test]
     fn test_next_uri_has_next() {
         let uri = next_uri("http://localhost:8080", "q-123", 0, 3);
-        assert_eq!(uri, Some("http://localhost:8080/v1/statement/q-123/1".to_string()));
+        assert_eq!(
+            uri,
+            Some("http://localhost:8080/v1/statement/q-123/1".to_string())
+        );
     }
 
     #[test]
@@ -2823,7 +2846,10 @@ mod tests {
             !obj.contains_key("data"),
             "serialized response must omit the data field for a column-less update, got {json}"
         );
-        assert_eq!(obj.get("updateType").and_then(|v| v.as_str()), Some("CREATE TABLE"));
+        assert_eq!(
+            obj.get("updateType").and_then(|v| v.as_str()),
+            Some("CREATE TABLE")
+        );
     }
 
     #[test]
@@ -3153,7 +3179,10 @@ mod tests {
         let trino_resp: TrinoResponse = serde_json::from_slice(&body).unwrap();
 
         assert_eq!(trino_resp.data.as_ref().unwrap().len(), 1);
-        assert_eq!(trino_resp.data.as_ref().unwrap()[0][0], serde_json::json!(20));
+        assert_eq!(
+            trino_resp.data.as_ref().unwrap()[0][0],
+            serde_json::json!(20)
+        );
         assert_eq!(
             trino_resp.next_uri,
             Some("http://localhost:8080/v1/statement/q-paged/2".to_string())
@@ -3413,10 +3442,7 @@ mod tests {
 
         let mut headers = HeaderMap::new();
         // Opaque token (no dots) — not a JWT, no fallback
-        headers.insert(
-            "authorization",
-            "Bearer some-opaque-token".parse().unwrap(),
-        );
+        headers.insert("authorization", "Bearer some-opaque-token".parse().unwrap());
 
         let response = submit_query::<MockAuth, MockQuery>(
             State(state),
@@ -3489,8 +3515,7 @@ mod tests {
         });
         let mut headers = HeaderMap::new();
         headers.insert("x-forwarded-for", "1.2.3.4".parse().unwrap());
-        let resolved =
-            trino_client_ip(&state, &headers, "10.0.0.1:33333".parse().unwrap());
+        let resolved = trino_client_ip(&state, &headers, "10.0.0.1:33333".parse().unwrap());
         assert_eq!(resolved, "10.0.0.1:33333");
     }
 }

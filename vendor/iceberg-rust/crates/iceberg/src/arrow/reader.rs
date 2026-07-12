@@ -35,10 +35,10 @@ use bytes::Bytes;
 use fnv::FnvHashSet;
 use futures::future::BoxFuture;
 use futures::{FutureExt, StreamExt, TryFutureExt, TryStreamExt, stream};
+use parquet::arrow::arrow_reader::ArrowReaderMetadata;
 use parquet::arrow::arrow_reader::{
     ArrowPredicateFn, ArrowReaderOptions, RowFilter, RowSelection, RowSelector,
 };
-use parquet::arrow::arrow_reader::ArrowReaderMetadata;
 use parquet::arrow::async_reader::AsyncFileReader;
 use parquet::arrow::{PARQUET_FIELD_ID_META_KEY, ParquetRecordBatchStreamBuilder, ProjectionMask};
 use parquet::file::metadata::{
@@ -51,8 +51,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::arrow::caching_delete_file_loader::CachingDeleteFileLoader;
 use crate::arrow::int96::coerce_int96_timestamps;
-use crate::arrow::scan_metrics::{CountingFileRead, ScanMetrics, ScanResult};
 use crate::arrow::record_batch_transformer::RecordBatchTransformerBuilder;
+use crate::arrow::scan_metrics::{CountingFileRead, ScanMetrics, ScanResult};
 use crate::arrow::{arrow_schema_to_schema, get_arrow_datum};
 use crate::delete_vector::DeleteVector;
 use crate::error::Result;
@@ -93,10 +93,7 @@ pub trait DecodeGate: Send + Sync + std::fmt::Debug {
     /// `estimated_bytes`. Resolves once capacity is available; the returned
     /// guard releases the admission on drop. An error denies the decode and
     /// fails the scan stream.
-    fn admit(
-        &self,
-        estimated_bytes: u64,
-    ) -> BoxFuture<'_, Result<Box<dyn std::any::Any + Send>>>;
+    fn admit(&self, estimated_bytes: u64) -> BoxFuture<'_, Result<Box<dyn std::any::Any + Send>>>;
 }
 
 /// Builder to create ArrowReader
@@ -174,10 +171,7 @@ impl ArrowReaderBuilder {
     /// Attach a [`DynamicPredicate`] that the reader will sample once
     /// per file scan task and AND into the static predicate. See
     /// [`crate::scan::TableScanBuilder::with_dynamic_predicate`].
-    pub fn with_dynamic_predicate(
-        mut self,
-        dynamic_predicate: Arc<dyn DynamicPredicate>,
-    ) -> Self {
+    pub fn with_dynamic_predicate(mut self, dynamic_predicate: Arc<dyn DynamicPredicate>) -> Self {
         self.dynamic_predicate = Some(dynamic_predicate);
         self
     }
@@ -746,8 +740,7 @@ impl ArrowReader {
                     let candidates: Vec<usize> = match &selected_row_group_indices {
                         Some(selected) => selected.clone(),
                         None => {
-                            (0..record_batch_stream_builder.metadata().num_row_groups())
-                                .collect()
+                            (0..record_batch_stream_builder.metadata().num_row_groups()).collect()
                         }
                     };
                     let mut kept = Vec::with_capacity(candidates.len());
@@ -2523,24 +2516,18 @@ impl MembershipSet {
 
         use arrow_array::{Date32Array, Int32Array, Int64Array, StringArray};
         match column_type {
-            DataType::Int32 => {
-                typed_values(literals, column_type, |a: &Int32Array, i| a.value(i))
-                    .map(MembershipSet::Int32)
-            }
-            DataType::Int64 => {
-                typed_values(literals, column_type, |a: &Int64Array, i| a.value(i))
-                    .map(MembershipSet::Int64)
-            }
+            DataType::Int32 => typed_values(literals, column_type, |a: &Int32Array, i| a.value(i))
+                .map(MembershipSet::Int32),
+            DataType::Int64 => typed_values(literals, column_type, |a: &Int64Array, i| a.value(i))
+                .map(MembershipSet::Int64),
             DataType::Date32 => {
                 typed_values(literals, column_type, |a: &Date32Array, i| a.value(i))
                     .map(MembershipSet::Date32)
             }
-            DataType::Utf8 => {
-                typed_values(literals, column_type, |a: &StringArray, i| {
-                    a.value(i).to_string()
-                })
-                .map(MembershipSet::Utf8)
-            }
+            DataType::Utf8 => typed_values(literals, column_type, |a: &StringArray, i| {
+                a.value(i).to_string()
+            })
+            .map(MembershipSet::Utf8),
             _ => None,
         }
     }
@@ -2650,8 +2637,8 @@ mod tests {
             Arc::new(Scalar::new(Int32Array::from(vec![4]))),
         ];
 
-        let set = MembershipSet::try_build(&DataType::Int32, &literals)
-            .expect("Int32 has a fast path");
+        let set =
+            MembershipSet::try_build(&DataType::Int32, &literals).expect("Int32 has a fast path");
         let column = Int32Array::from(vec![Some(1), Some(2), None, Some(4)]);
         let result = set.eval(&column).unwrap();
 
@@ -3287,27 +3274,30 @@ message schema {
     async fn test_predicate_cast_literal() {
         let predicates = vec![
             // a == 'foo'
-            (Reference::new("a").equal_to(Datum::string("foo")), vec![
-                Some("foo".to_string()),
-            ]),
+            (
+                Reference::new("a").equal_to(Datum::string("foo")),
+                vec![Some("foo".to_string())],
+            ),
             // a != 'foo'
             (
                 Reference::new("a").not_equal_to(Datum::string("foo")),
                 vec![Some("bar".to_string())],
             ),
             // STARTS_WITH(a, 'foo')
-            (Reference::new("a").starts_with(Datum::string("f")), vec![
-                Some("foo".to_string()),
-            ]),
+            (
+                Reference::new("a").starts_with(Datum::string("f")),
+                vec![Some("foo".to_string())],
+            ),
             // NOT STARTS_WITH(a, 'foo')
             (
                 Reference::new("a").not_starts_with(Datum::string("f")),
                 vec![Some("bar".to_string())],
             ),
             // a < 'foo'
-            (Reference::new("a").less_than(Datum::string("foo")), vec![
-                Some("bar".to_string()),
-            ]),
+            (
+                Reference::new("a").less_than(Datum::string("foo")),
+                vec![Some("bar".to_string())],
+            ),
             // a <= 'foo'
             (
                 Reference::new("a").less_than_or_equal_to(Datum::string("foo")),
@@ -3626,17 +3616,20 @@ message schema {
         let file_path = format!("{table_location}/multi_row_group.parquet");
 
         // Force each batch into its own row group for testing byte range filtering.
-        let batch1 = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(Int32Array::from(
-            (0..100).collect::<Vec<i32>>(),
-        ))])
+        let batch1 = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![Arc::new(Int32Array::from((0..100).collect::<Vec<i32>>()))],
+        )
         .unwrap();
-        let batch2 = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(Int32Array::from(
-            (100..200).collect::<Vec<i32>>(),
-        ))])
+        let batch2 = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![Arc::new(Int32Array::from((100..200).collect::<Vec<i32>>()))],
+        )
         .unwrap();
-        let batch3 = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(Int32Array::from(
-            (200..300).collect::<Vec<i32>>(),
-        ))])
+        let batch3 = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![Arc::new(Int32Array::from((200..300).collect::<Vec<i32>>()))],
+        )
         .unwrap();
 
         let props = WriterProperties::builder()
@@ -3955,14 +3948,16 @@ message schema {
         // Row group 1: rows 100-199 (ids 101-200)
         let data_file_path = format!("{table_location}/data.parquet");
 
-        let batch1 = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(
-            Int32Array::from_iter_values(1..=100),
-        )])
+        let batch1 = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(1..=100))],
+        )
         .unwrap();
 
-        let batch2 = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(
-            Int32Array::from_iter_values(101..=200),
-        )])
+        let batch2 = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(101..=200))],
+        )
         .unwrap();
 
         // Force each batch into its own row group
@@ -4001,10 +3996,13 @@ message schema {
         ]));
 
         // Delete row at position 199 (0-indexed, so it's the last row: id=200)
-        let delete_batch = RecordBatch::try_new(delete_schema.clone(), vec![
-            Arc::new(StringArray::from_iter_values(vec![data_file_path.clone()])),
-            Arc::new(Int64Array::from_iter_values(vec![199i64])),
-        ])
+        let delete_batch = RecordBatch::try_new(
+            delete_schema.clone(),
+            vec![
+                Arc::new(StringArray::from_iter_values(vec![data_file_path.clone()])),
+                Arc::new(Int64Array::from_iter_values(vec![199i64])),
+            ],
+        )
         .unwrap();
 
         let delete_props = WriterProperties::builder()
@@ -4171,14 +4169,16 @@ message schema {
         // Row group 1: rows 100-199 (ids 101-200)
         let data_file_path = format!("{table_location}/data.parquet");
 
-        let batch1 = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(
-            Int32Array::from_iter_values(1..=100),
-        )])
+        let batch1 = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(1..=100))],
+        )
         .unwrap();
 
-        let batch2 = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(
-            Int32Array::from_iter_values(101..=200),
-        )])
+        let batch2 = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(101..=200))],
+        )
         .unwrap();
 
         // Force each batch into its own row group
@@ -4217,10 +4217,13 @@ message schema {
         ]));
 
         // Delete row at position 199 (0-indexed, so it's the last row: id=200)
-        let delete_batch = RecordBatch::try_new(delete_schema.clone(), vec![
-            Arc::new(StringArray::from_iter_values(vec![data_file_path.clone()])),
-            Arc::new(Int64Array::from_iter_values(vec![199i64])),
-        ])
+        let delete_batch = RecordBatch::try_new(
+            delete_schema.clone(),
+            vec![
+                Arc::new(StringArray::from_iter_values(vec![data_file_path.clone()])),
+                Arc::new(Int64Array::from_iter_values(vec![199i64])),
+            ],
+        )
         .unwrap();
 
         let delete_props = WriterProperties::builder()
@@ -4415,14 +4418,16 @@ message schema {
         // Row group 1: rows 100-199 (ids 101-200)
         let data_file_path = format!("{table_location}/data.parquet");
 
-        let batch1 = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(
-            Int32Array::from_iter_values(1..=100),
-        )])
+        let batch1 = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(1..=100))],
+        )
         .unwrap();
 
-        let batch2 = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(
-            Int32Array::from_iter_values(101..=200),
-        )])
+        let batch2 = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(101..=200))],
+        )
         .unwrap();
 
         // Force each batch into its own row group
@@ -4461,10 +4466,13 @@ message schema {
         ]));
 
         // Delete row at position 0 (0-indexed, so it's the first row: id=1)
-        let delete_batch = RecordBatch::try_new(delete_schema.clone(), vec![
-            Arc::new(StringArray::from_iter_values(vec![data_file_path.clone()])),
-            Arc::new(Int64Array::from_iter_values(vec![0i64])),
-        ])
+        let delete_batch = RecordBatch::try_new(
+            delete_schema.clone(),
+            vec![
+                Arc::new(StringArray::from_iter_values(vec![data_file_path.clone()])),
+                Arc::new(Int64Array::from_iter_values(vec![0i64])),
+            ],
+        )
         .unwrap();
 
         let delete_props = WriterProperties::builder()
@@ -4712,9 +4720,10 @@ message schema {
         let col3_data = Arc::new(StringArray::from(vec!["c", "d"])) as ArrayRef;
         let col4_data = Arc::new(Int32Array::from(vec![30, 40])) as ArrayRef;
 
-        let to_write = RecordBatch::try_new(arrow_schema.clone(), vec![
-            col1_data, col2_data, col3_data, col4_data,
-        ])
+        let to_write = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![col1_data, col2_data, col3_data, col4_data],
+        )
         .unwrap();
 
         let props = WriterProperties::builder()
@@ -5607,9 +5616,10 @@ message schema {
             .set_compression(Compression::SNAPPY)
             .set_max_row_group_size(10)
             .build();
-        let to_write = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(
-            Int32Array::from_iter_values(0..100),
-        ) as ArrayRef])
+        let to_write = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..100)) as ArrayRef],
+        )
         .unwrap();
         let file = File::create(&path).unwrap();
         let mut writer = ArrowWriter::try_new(file, to_write.schema(), Some(props)).unwrap();
@@ -5634,8 +5644,8 @@ message schema {
         let reader = ArrowReaderBuilder::new(file_io)
             .with_data_file_concurrency_limit(2)
             .build();
-        let tasks = Box::pin(futures::stream::iter(vec![Ok(first), Ok(second)]))
-            as FileScanTaskStream;
+        let tasks =
+            Box::pin(futures::stream::iter(vec![Ok(first), Ok(second)])) as FileScanTaskStream;
         let batches = reader
             .read(tasks)
             .unwrap()
@@ -5690,9 +5700,10 @@ message schema {
             .set_compression(Compression::SNAPPY)
             .set_max_row_group_size(10)
             .build();
-        let to_write = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(
-            Int32Array::from_iter_values(0..100),
-        ) as ArrayRef])
+        let to_write = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..100)) as ArrayRef],
+        )
         .unwrap();
         let file = File::create(&path).unwrap();
         let mut writer = ArrowWriter::try_new(file, to_write.schema(), Some(props)).unwrap();

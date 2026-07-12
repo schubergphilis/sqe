@@ -178,21 +178,17 @@ impl QueryRateLimiter {
 
         // Per-user check
         if let Some(ref limiter) = self.per_user {
-            limiter
-                .check_key(&user_id.to_string())
-                .map_err(|_| {
-                    SqeError::Execution(format!(
-                        "Rate limit exceeded: per-user limit reached for user '{user_id}'"
-                    ))
-                })?;
+            limiter.check_key(&user_id.to_string()).map_err(|_| {
+                SqeError::Execution(format!(
+                    "Rate limit exceeded: per-user limit reached for user '{user_id}'"
+                ))
+            })?;
         }
 
         // Global check
         if let Some(ref limiter) = self.global {
             limiter.check().map_err(|_| {
-                SqeError::Execution(
-                    "Rate limit exceeded: global query limit reached".to_string(),
-                )
+                SqeError::Execution("Rate limit exceeded: global query limit reached".to_string())
             })?;
         }
 

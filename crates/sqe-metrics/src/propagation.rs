@@ -5,6 +5,7 @@
 //! boundaries via tonic [`MetadataMap`].
 
 use opentelemetry::propagation::{Extractor, Injector};
+use opentelemetry::trace::TraceContextExt;
 use tonic::metadata::{MetadataKey, MetadataMap, MetadataValue};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
@@ -122,6 +123,19 @@ pub fn trace_context_http_headers() -> Vec<(String, String)> {
     headers
 }
 
+/// Return the current active trace ID (32 hex chars) if a valid OTel span context
+/// exists on the current tracing span.
+pub fn current_trace_id() -> Option<String> {
+    let cx = tracing::Span::current().context();
+    let span_ref = cx.span();
+    let sc = span_ref.span_context();
+    if sc.is_valid() {
+        Some(format!("{:032x}", sc.trace_id()))
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -145,8 +159,7 @@ mod tests {
             true,
             Default::default(),
         );
-        let cx =
-            opentelemetry::Context::new().with_remote_span_context(span_context.clone());
+        let cx = opentelemetry::Context::new().with_remote_span_context(span_context.clone());
 
         // Inject into metadata
         let mut metadata = MetadataMap::new();
@@ -218,8 +231,14 @@ mod tests {
             injector.set("tracestate", "vendor=value".to_string());
         }
         assert_eq!(headers.len(), 2);
-        assert_eq!(headers[0], ("traceparent".to_string(), "00-abc-def-01".to_string()));
-        assert_eq!(headers[1], ("tracestate".to_string(), "vendor=value".to_string()));
+        assert_eq!(
+            headers[0],
+            ("traceparent".to_string(), "00-abc-def-01".to_string())
+        );
+        assert_eq!(
+            headers[1],
+            ("tracestate".to_string(), "vendor=value".to_string())
+        );
     }
 
     #[test]
@@ -234,8 +253,7 @@ mod tests {
             true,
             Default::default(),
         );
-        let cx =
-            opentelemetry::Context::new().with_remote_span_context(span_context);
+        let cx = opentelemetry::Context::new().with_remote_span_context(span_context);
 
         // Inject into metadata, then extract as HTTP headers via the same context
         let mut metadata = MetadataMap::new();

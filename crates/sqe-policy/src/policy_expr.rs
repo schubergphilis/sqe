@@ -143,9 +143,12 @@ mod tests {
     #[test]
     fn parses_compound_and() {
         // The case the toy parser silently corrupts.
-        let e = parse_sql_predicate("region = 'EU' AND tier < 3", &SessionIdentity::default()).unwrap();
+        let e =
+            parse_sql_predicate("region = 'EU' AND tier < 3", &SessionIdentity::default()).unwrap();
         assert!(matches!(e, Expr::BinaryExpr(_)));
-        let sql = datafusion::sql::unparser::expr_to_sql(&e).unwrap().to_string();
+        let sql = datafusion::sql::unparser::expr_to_sql(&e)
+            .unwrap()
+            .to_string();
         assert!(sql.contains("region"));
         assert!(sql.contains("tier"));
         assert!(sql.to_uppercase().contains("AND"));
@@ -154,7 +157,9 @@ mod tests {
     #[test]
     fn parses_in_list() {
         let e = parse_sql_predicate("dept IN ('hr', 'eng')", &SessionIdentity::default()).unwrap();
-        let sql = datafusion::sql::unparser::expr_to_sql(&e).unwrap().to_string();
+        let sql = datafusion::sql::unparser::expr_to_sql(&e)
+            .unwrap()
+            .to_string();
         assert!(sql.to_uppercase().contains("IN"));
     }
 
@@ -188,21 +193,28 @@ mod tests {
     fn parses_cast_in_filter() {
         // Cast is its own AST variant; the hand-written walker missed it.
         let e = parse_sql_predicate("CAST(tier AS INT) >= 3", &SessionIdentity::default()).unwrap();
-        let sql = datafusion::sql::unparser::expr_to_sql(&e).unwrap().to_string();
+        let sql = datafusion::sql::unparser::expr_to_sql(&e)
+            .unwrap()
+            .to_string();
         assert!(sql.to_lowercase().contains("tier"));
     }
 
     #[test]
     fn parses_substring_mask() {
         let e = parse_sql_predicate("substr(email, 1, 3)", &SessionIdentity::default()).unwrap();
-        let sql = datafusion::sql::unparser::expr_to_sql(&e).unwrap().to_string();
+        let sql = datafusion::sql::unparser::expr_to_sql(&e)
+            .unwrap()
+            .to_string();
         assert!(sql.to_lowercase().contains("email"));
     }
 
     #[test]
     fn parses_or() {
-        let e = parse_sql_predicate("region = 'EU' OR dept = 'eng'", &SessionIdentity::default()).unwrap();
-        let sql = datafusion::sql::unparser::expr_to_sql(&e).unwrap().to_string();
+        let e = parse_sql_predicate("region = 'EU' OR dept = 'eng'", &SessionIdentity::default())
+            .unwrap();
+        let sql = datafusion::sql::unparser::expr_to_sql(&e)
+            .unwrap()
+            .to_string();
         assert!(sql.to_uppercase().contains("OR"));
     }
 
@@ -215,9 +227,16 @@ mod tests {
 
     #[test]
     fn parses_is_role_in_session_in_policy() {
-        let id = SessionIdentity { username: "bob".into(), roles: vec!["admin".into()], ..Default::default() };
+        let id = SessionIdentity {
+            username: "bob".into(),
+            roles: vec!["admin".into()],
+            ..Default::default()
+        };
         let e = parse_sql_predicate("is_role_in_session('admin') OR region = 'EU'", &id).unwrap();
-        let s = datafusion::sql::unparser::expr_to_sql(&e).unwrap().to_string().to_lowercase();
+        let s = datafusion::sql::unparser::expr_to_sql(&e)
+            .unwrap()
+            .to_string()
+            .to_lowercase();
         assert!(s.contains("is_role_in_session"), "got: {s}");
         assert!(s.contains("region"), "got: {s}");
     }
@@ -230,10 +249,17 @@ mod tests {
     // "current_user" is also looked up without parens in practice.
     #[test]
     fn parses_current_user_in_mask_expr() {
-        let id = SessionIdentity { username: "alice".into(), ..Default::default() };
+        let id = SessionIdentity {
+            username: "alice".into(),
+            ..Default::default()
+        };
         // Without parens: sqlparser accepts current_user as a keyword expr.
         let result = parse_sql_predicate("current_user", &id);
-        assert!(result.is_ok(), "expected Ok for bare current_user, got: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "expected Ok for bare current_user, got: {:?}",
+            result.err()
+        );
     }
 
     #[test]

@@ -48,7 +48,10 @@ fn assert_deny_policy(p: &sqe_policy::ResolvedPolicy) {
         Expr::Literal(ScalarValue::Boolean(Some(false)), _) => {}
         other => panic!("expected FALSE literal as the deny filter, got: {other:?}"),
     }
-    assert!(p.column_masks.is_empty(), "deny policy carries no column masks");
+    assert!(
+        p.column_masks.is_empty(),
+        "deny policy carries no column masks"
+    );
     assert!(
         p.restricted_columns.is_empty(),
         "deny policy carries no restricted columns"
@@ -100,7 +103,10 @@ async fn opa_allow_true_yields_populated_policy() {
     let policy = store.resolve(&user(), "employees", "hr").await.unwrap();
     assert_eq!(policy.row_filters.len(), 1);
     assert_eq!(policy.column_masks.len(), 1);
-    assert_eq!(policy.restricted_columns, vec!["internal_notes".to_string()]);
+    assert_eq!(
+        policy.restricted_columns,
+        vec!["internal_notes".to_string()]
+    );
 }
 
 /// `{"result": null}` is OPA's response when the queried policy package is

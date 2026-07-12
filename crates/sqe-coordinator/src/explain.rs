@@ -72,7 +72,9 @@ impl ExplainHandler {
             let rule = crate::parallel_probe_scan::ParallelProbeScanRule::new();
             match rule.optimize(plan.clone(), state.config_options()) {
                 Ok(optimized) => plan = optimized,
-                Err(e) => tracing::debug!(error = %e, "EXPLAIN: probe-side scan parallelization failed"),
+                Err(e) => {
+                    tracing::debug!(error = %e, "EXPLAIN: probe-side scan parallelization failed")
+                }
             }
         }
         if self.parallel_scan {
@@ -197,7 +199,11 @@ impl ExplainHandler {
             phase_row(-4, "[phase] policy evaluate", policy_ms),
             phase_row(-3, "[phase] physical plan", physical_plan_ms),
             phase_row(-2, "[phase] execute (per-op detail below)", execute_ms),
-            phase_row(-1, "[phase] framework overhead (parse + plan + policy + result)", framework_ms),
+            phase_row(
+                -1,
+                "[phase] framework overhead (parse + plan + policy + result)",
+                framework_ms,
+            ),
         ];
         walk_analyze(&physical, &mut rows);
 
@@ -217,7 +223,9 @@ impl ExplainHandler {
             rows.iter().map(|r| r.step).collect::<Vec<_>>(),
         ));
         let ops: ArrayRef = Arc::new(StringArray::from(
-            rows.iter().map(|r| r.operation.as_str()).collect::<Vec<_>>(),
+            rows.iter()
+                .map(|r| r.operation.as_str())
+                .collect::<Vec<_>>(),
         ));
 
         macro_rules! nullable_i64 {
@@ -323,7 +331,11 @@ impl ExplainHandler {
             full_phase_row(-4, "[phase] policy evaluate", policy_ms),
             full_phase_row(-3, "[phase] physical plan", physical_plan_ms),
             full_phase_row(-2, "[phase] execute (per-op detail below)", execute_ms),
-            full_phase_row(-1, "[phase] framework overhead (parse + plan + policy + result)", framework_ms),
+            full_phase_row(
+                -1,
+                "[phase] framework overhead (parse + plan + policy + result)",
+                framework_ms,
+            ),
         ];
         walk_full(&physical, &mut rows);
 
@@ -347,7 +359,9 @@ impl ExplainHandler {
             rows.iter().map(|r| r.step).collect::<Vec<_>>(),
         ));
         let ops: ArrayRef = Arc::new(StringArray::from(
-            rows.iter().map(|r| r.operation.as_str()).collect::<Vec<_>>(),
+            rows.iter()
+                .map(|r| r.operation.as_str())
+                .collect::<Vec<_>>(),
         ));
 
         macro_rules! nullable_array {
@@ -370,7 +384,8 @@ impl ExplainHandler {
         let out_rows = nullable_array!(arrow_array::builder::Int64Builder, &rows, output_rows);
         let elapsed = nullable_array!(arrow_array::builder::Float64Builder, &rows, elapsed_ms);
         let out_bytes = nullable_array!(arrow_array::builder::Int64Builder, &rows, output_bytes);
-        let out_batches = nullable_array!(arrow_array::builder::Int64Builder, &rows, output_batches);
+        let out_batches =
+            nullable_array!(arrow_array::builder::Int64Builder, &rows, output_batches);
         let spill_cnt = nullable_array!(arrow_array::builder::Int64Builder, &rows, spill_count);
         let spill_bytes = nullable_array!(arrow_array::builder::Int64Builder, &rows, spilled_bytes);
         let spill_rows = nullable_array!(arrow_array::builder::Int64Builder, &rows, spilled_rows);
@@ -378,8 +393,19 @@ impl ExplainHandler {
         let batch = RecordBatch::try_new(
             schema,
             vec![
-                steps, ops, est_rows, est_bytes, f_scanned, f_total, out_rows, elapsed,
-                out_bytes, out_batches, spill_cnt, spill_bytes, spill_rows,
+                steps,
+                ops,
+                est_rows,
+                est_bytes,
+                f_scanned,
+                f_total,
+                out_rows,
+                elapsed,
+                out_bytes,
+                out_batches,
+                spill_cnt,
+                spill_bytes,
+                spill_rows,
             ],
         )
         .map_err(|e| SqeError::Execution(format!("Failed to build full explain batch: {e}")))?;
@@ -512,8 +538,14 @@ fn walk_full(node: &Arc<dyn ExecutionPlan>, rows: &mut Vec<FullRow>) {
 
     // Actual execution metrics (populated after collect())
     let metrics = node.metrics();
-    let output_rows = metrics.as_ref().and_then(|m| m.output_rows()).map(|r| r as i64);
-    let elapsed_ms = metrics.as_ref().and_then(|m| m.elapsed_compute()).map(|ns| ns as f64 / 1_000_000.0);
+    let output_rows = metrics
+        .as_ref()
+        .and_then(|m| m.output_rows())
+        .map(|r| r as i64);
+    let elapsed_ms = metrics
+        .as_ref()
+        .and_then(|m| m.elapsed_compute())
+        .map(|ns| ns as f64 / 1_000_000.0);
     let output_bytes = metrics
         .as_ref()
         .and_then(|m| m.sum(|metric| matches!(metric.value(), MetricValue::OutputBytes(_))))
@@ -541,13 +573,25 @@ fn walk_full(node: &Arc<dyn ExecutionPlan>, rows: &mut Vec<FullRow>) {
         let props = snap.map(|s| s.summary().additional_properties.clone());
 
         let parse_i64 = |key: &str| -> Option<i64> {
-            props.as_ref()?.get(key)?.parse::<i64>()
-                .map_err(|e| { tracing::warn!(key, "Failed to parse Iceberg snapshot stat: {e}"); e })
+            props
+                .as_ref()?
+                .get(key)?
+                .parse::<i64>()
+                .map_err(|e| {
+                    tracing::warn!(key, "Failed to parse Iceberg snapshot stat: {e}");
+                    e
+                })
                 .ok()
         };
         let parse_i32 = |key: &str| -> Option<i32> {
-            props.as_ref()?.get(key)?.parse::<i32>()
-                .map_err(|e| { tracing::warn!(key, "Failed to parse Iceberg snapshot stat: {e}"); e })
+            props
+                .as_ref()?
+                .get(key)?
+                .parse::<i32>()
+                .map_err(|e| {
+                    tracing::warn!(key, "Failed to parse Iceberg snapshot stat: {e}");
+                    e
+                })
                 .ok()
         };
 
@@ -557,9 +601,19 @@ fn walk_full(node: &Arc<dyn ExecutionPlan>, rows: &mut Vec<FullRow>) {
         let files_scanned = files_total;
 
         rows.push(FullRow {
-            step, operation, estimated_rows, estimated_bytes, files_scanned, files_total,
-            output_rows, elapsed_ms, output_bytes, output_batches,
-            spill_count, spilled_bytes, spilled_rows,
+            step,
+            operation,
+            estimated_rows,
+            estimated_bytes,
+            files_scanned,
+            files_total,
+            output_rows,
+            elapsed_ms,
+            output_bytes,
+            output_batches,
+            spill_count,
+            spilled_bytes,
+            spilled_rows,
         });
     } else {
         use datafusion::common::stats::Precision;
@@ -572,10 +626,19 @@ fn walk_full(node: &Arc<dyn ExecutionPlan>, rows: &mut Vec<FullRow>) {
             });
 
         rows.push(FullRow {
-            step, operation, estimated_rows, estimated_bytes: None,
-            files_scanned: None, files_total: None,
-            output_rows, elapsed_ms, output_bytes, output_batches,
-            spill_count, spilled_bytes, spilled_rows,
+            step,
+            operation,
+            estimated_rows,
+            estimated_bytes: None,
+            files_scanned: None,
+            files_total: None,
+            output_rows,
+            elapsed_ms,
+            output_bytes,
+            output_batches,
+            spill_count,
+            spilled_bytes,
+            spilled_rows,
         });
     }
 }

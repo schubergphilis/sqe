@@ -133,12 +133,16 @@ impl super::BenchClient for FlightSqlBenchClient {
         let mut client = self.new_client().await?;
 
         let debug = std::env::var("BENCH_DEBUG").is_ok();
-        if debug { eprintln!("[flight] get_flight_info..."); }
+        if debug {
+            eprintln!("[flight] get_flight_info...");
+        }
         let flight_info = client
             .execute(sql.to_string(), None)
             .await
             .map_err(|e| anyhow::anyhow!("Query failed: {e}"))?;
-        if debug { eprintln!("[flight] got {} endpoints", flight_info.endpoint.len()); }
+        if debug {
+            eprintln!("[flight] got {} endpoints", flight_info.endpoint.len());
+        }
 
         let mut batches = Vec::new();
 
@@ -148,13 +152,17 @@ impl super::BenchClient for FlightSqlBenchClient {
                 .clone()
                 .ok_or_else(|| anyhow::anyhow!("Flight endpoint returned no ticket"))?;
 
-            if debug { eprintln!("[flight] do_get endpoint {i}..."); }
+            if debug {
+                eprintln!("[flight] do_get endpoint {i}...");
+            }
             let stream = client
                 .do_get(ticket)
                 .await
                 .map_err(|e| anyhow::anyhow!("do_get failed: {e}"))?;
 
-            if debug { eprintln!("[flight] collecting batches from endpoint {i}..."); }
+            if debug {
+                eprintln!("[flight] collecting batches from endpoint {i}...");
+            }
             let endpoint_batches: Vec<RecordBatch> = stream
                 .try_collect()
                 .await

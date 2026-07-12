@@ -62,8 +62,8 @@ pub(crate) fn sign_ticket(secret: &str, bytes: &[u8]) -> Option<String> {
     if secret.is_empty() {
         return None;
     }
-    let mut mac = <Hmac<Sha256>>::new_from_slice(secret.as_bytes())
-        .expect("HMAC accepts keys of any length");
+    let mut mac =
+        <Hmac<Sha256>>::new_from_slice(secret.as_bytes()).expect("HMAC accepts keys of any length");
     mac.update(bytes);
     let tag = mac.finalize().into_bytes();
     Some(hex_encode(&tag))
@@ -179,11 +179,7 @@ impl DistributedScanExec {
         &self.worker_urls
     }
 
-    pub fn new(
-        scan_tasks: Vec<ScanTask>,
-        worker_urls: Vec<String>,
-        schema: SchemaRef,
-    ) -> Self {
+    pub fn new(scan_tasks: Vec<ScanTask>, worker_urls: Vec<String>, schema: SchemaRef) -> Self {
         assert_eq!(scan_tasks.len(), worker_urls.len());
         let num_partitions = scan_tasks.len();
 
@@ -342,7 +338,6 @@ impl ExecutionPlan for DistributedScanExec {
         "DistributedScanExec"
     }
 
-
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
@@ -443,10 +438,7 @@ impl ExecutionPlan for DistributedScanExec {
         let credential_tracker = self.credential_tracker.clone();
         let max_retries = self.max_retries;
         let worker_registry = self.worker_registry.clone();
-        let channel_pool = self
-            .worker_registry
-            .as_ref()
-            .map(|r| r.channel_pool());
+        let channel_pool = self.worker_registry.as_ref().map(|r| r.channel_pool());
         let local_executor = self.local_executor.clone();
         let fragment_callback = self.fragment_callback.0.clone();
         let worker_secret = self.worker_secret.clone();
@@ -522,9 +514,7 @@ impl ExecutionPlan for DistributedScanExec {
             if !pushed_down_filters.is_empty() {
                 let mut snapshots: Vec<datafusion::logical_expr::Expr> = Vec::new();
                 for f in &pushed_down_filters {
-                    let resolved = match f
-                        .downcast_ref::<DynamicFilterPhysicalExpr>()
-                    {
+                    let resolved = match f.downcast_ref::<DynamicFilterPhysicalExpr>() {
                         Some(dynamic) => match dynamic.current() {
                             Ok(expr) => expr,
                             Err(_) => continue,
@@ -549,8 +539,10 @@ impl ExecutionPlan for DistributedScanExec {
                         .predicate_proto
                         .as_deref()
                         .and_then(|b| datafusion::logical_expr::Expr::from_bytes(b).ok());
-                    if let Some(combined) =
-                        existing.into_iter().chain(snapshots).reduce(|a, b| a.and(b))
+                    if let Some(combined) = existing
+                        .into_iter()
+                        .chain(snapshots)
+                        .reduce(|a, b| a.and(b))
                     {
                         match combined.to_bytes() {
                             Ok(bytes) => {
@@ -631,10 +623,7 @@ impl ExecutionPlan for DistributedScanExec {
                         // error so downstream operators do not see Ok batches
                         // arriving after an Err from this fragment.
                         let terminated: Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>> =
-                            Box::pin(TerminateOnErrorStream::new(
-                                inner,
-                                task.fragment_id.clone(),
-                            ));
+                            Box::pin(TerminateOnErrorStream::new(inner, task.fragment_id.clone()));
                         // Wrap the stream so the callback fires when it
                         // completes and the credential-tracker entry is
                         // released on completion (COORD-02). Wrap whenever
@@ -684,9 +673,8 @@ impl ExecutionPlan for DistributedScanExec {
                         if attempt < max_retries {
                             if let Some(ref registry) = worker_registry {
                                 let healthy = registry.healthy_workers().await;
-                                if let Some(next_worker) = healthy
-                                    .into_iter()
-                                    .find(|w| !failed_workers.contains(w))
+                                if let Some(next_worker) =
+                                    healthy.into_iter().find(|w| !failed_workers.contains(w))
                                 {
                                     current_worker_url = next_worker;
                                     continue;
@@ -730,10 +718,7 @@ impl ExecutionPlan for DistributedScanExec {
                 let inner: Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>> =
                     Box::pin(local_stream);
                 let terminated: Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>> =
-                    Box::pin(TerminateOnErrorStream::new(
-                        inner,
-                        task.fragment_id.clone(),
-                    ));
+                    Box::pin(TerminateOnErrorStream::new(inner, task.fragment_id.clone()));
                 // Wrap the fallback stream so the callback fires on completion
                 // and the credential-tracker entry is released (COORD-02).
                 let wrapped: Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>> =
@@ -810,9 +795,7 @@ async fn dispatch_to_worker(
     let channel = match pool {
         Some(pool) => pool.get(worker_url).await.map_err(|e| {
             pool.invalidate(worker_url);
-            DataFusionError::Execution(format!(
-                "Failed to connect to worker {worker_url}: {e}"
-            ))
+            DataFusionError::Execution(format!("Failed to connect to worker {worker_url}: {e}"))
         })?,
         None => tonic::transport::Endpoint::new(worker_url.to_string())
             .map_err(|e| {
@@ -825,9 +808,7 @@ async fn dispatch_to_worker(
             .connect()
             .await
             .map_err(|e| {
-                DataFusionError::Execution(format!(
-                    "Failed to connect to worker {worker_url}: {e}"
-                ))
+                DataFusionError::Execution(format!("Failed to connect to worker {worker_url}: {e}"))
             })?,
     };
     let mut client = FlightServiceClient::new(channel);
@@ -892,9 +873,7 @@ async fn dispatch_to_worker(
                     pool.invalidate(worker_url);
                 }
             }
-            DataFusionError::Execution(format!(
-                "Worker {worker_url} do_get failed: {e}"
-            ))
+            DataFusionError::Execution(format!("Worker {worker_url} do_get failed: {e}"))
         })?;
 
     let flight_stream = FlightRecordBatchStream::new_from_flight_data(
@@ -1225,8 +1204,11 @@ mod tests {
                 .iter()
                 .map(|n| Field::new(*n, DataType::Int64, false))
                 .collect();
-            let cols: Vec<Arc<dyn arrow_array::Array>> =
-                names.iter().enumerate().map(|(i, _)| col(i as i64)).collect();
+            let cols: Vec<Arc<dyn arrow_array::Array>> = names
+                .iter()
+                .enumerate()
+                .map(|(i, _)| col(i as i64))
+                .collect();
             RecordBatch::try_new(Arc::new(Schema::new(fields)), cols).unwrap()
         }
 
@@ -1270,16 +1252,8 @@ mod tests {
             let out = reassemble_worker_batch(worker, &expected).unwrap();
             assert_eq!(out.schema().field(0).name(), "c");
             assert_eq!(out.schema().field(1).name(), "a");
-            let c = out
-                .column(0)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .unwrap();
-            let a = out
-                .column(1)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .unwrap();
+            let c = out.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+            let a = out.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
             assert_eq!(c.value(0), 1, "column 'c' carries the file's c values");
             assert_eq!(a.value(0), 0, "column 'a' carries the file's a values");
         }
@@ -1417,7 +1391,10 @@ mod tests {
         let result = exec.execute(0, context);
         assert!(result.is_err());
         let err_msg = result.err().unwrap().to_string();
-        assert!(err_msg.contains("out of range"), "unexpected error: {err_msg}");
+        assert!(
+            err_msg.contains("out of range"),
+            "unexpected error: {err_msg}"
+        );
     }
 
     #[test]
@@ -1504,9 +1481,10 @@ mod tests {
             .register(fragment_id.clone(), "http://w1:50052".to_string(), None)
             .await;
 
-        let inner: Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>> = Box::pin(
-            futures::stream::once(async { Err(DataFusionError::Execution("boom".into())) }),
-        );
+        let inner: Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>> =
+            Box::pin(futures::stream::once(async {
+                Err(DataFusionError::Execution("boom".into()))
+            }));
         let mut stream = CallbackStream::new(
             inner,
             fragment_id.clone(),
@@ -1618,7 +1596,10 @@ mod tests {
         let mut buf = String::new();
         use std::fmt::Write;
         write!(buf, "{}", DisplayWrapper(&exec)).unwrap();
-        assert!(buf.contains("max_retries=3"), "display should contain max_retries: {buf}");
+        assert!(
+            buf.contains("max_retries=3"),
+            "display should contain max_retries: {buf}"
+        );
     }
 
     /// Helper to use DisplayAs in tests.
@@ -1631,8 +1612,8 @@ mod tests {
 
     // ---- Retry / fallback integration tests ----
 
-    use std::sync::atomic::{AtomicU32, Ordering};
     use arrow_array::Int64Array;
+    use std::sync::atomic::{AtomicU32, Ordering};
 
     /// A test local executor that returns a single batch with a marker value.
     #[derive(Debug)]
@@ -1691,9 +1672,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_retry_marks_worker_unhealthy() {
-        let registry = Arc::new(WorkerRegistry::new(vec![
-            "http://w1:50052".to_string(),
-        ]));
+        let registry = Arc::new(WorkerRegistry::new(vec!["http://w1:50052".to_string()]));
         registry.mark_healthy("http://w1:50052").await;
         assert_eq!(registry.healthy_workers().await.len(), 1);
 
@@ -1724,9 +1703,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_local_fallback_when_all_workers_fail() {
-        let registry = Arc::new(WorkerRegistry::new(vec![
-            "http://w1:50052".to_string(),
-        ]));
+        let registry = Arc::new(WorkerRegistry::new(vec!["http://w1:50052".to_string()]));
         registry.mark_healthy("http://w1:50052").await;
 
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
@@ -1747,7 +1724,11 @@ mod tests {
         use futures::StreamExt;
         let results: Vec<_> = stream.collect().await;
 
-        assert_eq!(local_exec.calls(), 1, "Local executor should be called once");
+        assert_eq!(
+            local_exec.calls(),
+            1,
+            "Local executor should be called once"
+        );
         assert_eq!(results.len(), 1);
         let batch = results[0].as_ref().unwrap();
         assert_eq!(batch.num_rows(), 1);
@@ -1757,7 +1738,11 @@ mod tests {
             .as_any()
             .downcast_ref::<Int64Array>()
             .unwrap();
-        assert_eq!(col.value(0), 42, "Should get marker value from local executor");
+        assert_eq!(
+            col.value(0),
+            42,
+            "Should get marker value from local executor"
+        );
     }
 
     #[tokio::test]
@@ -1789,7 +1774,9 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert!(results[0].is_ok());
 
-        let metrics = exec.metrics().expect("metrics must be Some after execution");
+        let metrics = exec
+            .metrics()
+            .expect("metrics must be Some after execution");
         assert_eq!(
             metrics.output_rows(),
             Some(1),
@@ -1803,9 +1790,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_no_fallback_returns_error() {
-        let registry = Arc::new(WorkerRegistry::new(vec![
-            "http://w1:50052".to_string(),
-        ]));
+        let registry = Arc::new(WorkerRegistry::new(vec!["http://w1:50052".to_string()]));
         registry.mark_healthy("http://w1:50052").await;
 
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
@@ -1924,10 +1909,7 @@ mod tests {
         let exec = Arc::new(
             DistributedScanExec::new(
                 vec![make_task("f1"), make_task("f2")],
-                vec![
-                    "http://w1:50052".to_string(),
-                    "http://w2:50052".to_string(),
-                ],
+                vec!["http://w1:50052".to_string(), "http://w2:50052".to_string()],
                 schema,
             )
             .with_worker_registry(registry.clone())
@@ -2031,10 +2013,14 @@ mod tests {
         use arrow_array::Int64Array;
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
         let s = schema.clone();
-        let b1 = RecordBatch::try_new(s.clone(), vec![Arc::new(Int64Array::from(vec![1]))]).unwrap();
-        let b2 = RecordBatch::try_new(s.clone(), vec![Arc::new(Int64Array::from(vec![2]))]).unwrap();
-        let b3 = RecordBatch::try_new(s.clone(), vec![Arc::new(Int64Array::from(vec![3]))]).unwrap();
-        let b4 = RecordBatch::try_new(s.clone(), vec![Arc::new(Int64Array::from(vec![4]))]).unwrap();
+        let b1 =
+            RecordBatch::try_new(s.clone(), vec![Arc::new(Int64Array::from(vec![1]))]).unwrap();
+        let b2 =
+            RecordBatch::try_new(s.clone(), vec![Arc::new(Int64Array::from(vec![2]))]).unwrap();
+        let b3 =
+            RecordBatch::try_new(s.clone(), vec![Arc::new(Int64Array::from(vec![3]))]).unwrap();
+        let b4 =
+            RecordBatch::try_new(s.clone(), vec![Arc::new(Int64Array::from(vec![4]))]).unwrap();
         let items: Vec<DFResult<RecordBatch>> = vec![
             Ok(b1),
             Ok(b2),

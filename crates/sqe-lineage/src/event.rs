@@ -5,14 +5,18 @@
 //! See `docs/superpowers/specs/2026-05-08-openlineage-emitter-design.md` §4.1.
 
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 use std::collections::BTreeMap;
+use uuid::Uuid;
 
 pub const SCHEMA_URL: &str = "https://openlineage.io/spec/2-0-2/OpenLineage.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "UPPERCASE")]
-pub enum EventType { Start, Complete, Fail }
+pub enum EventType {
+    Start,
+    Complete,
+    Fail,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunEvent {
@@ -34,7 +38,12 @@ pub struct Run {
 }
 
 impl Run {
-    pub fn new(id: Uuid) -> Self { Self { runId: id, facets: Default::default() } }
+    pub fn new(id: Uuid) -> Self {
+        Self {
+            runId: id,
+            facets: Default::default(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -102,13 +111,40 @@ pub struct OutputDatasetFacets {
 }
 
 // Facet types. Full versions stay here; no partial fills.
-#[derive(Debug, Clone, Serialize, Deserialize)] pub struct NominalTimeFacet { pub nominalStartTime: String }
-#[derive(Debug, Clone, Serialize, Deserialize)] pub struct ParentRunFacet { pub run: Run, pub job: Job }
-#[derive(Debug, Clone, Serialize, Deserialize)] pub struct ErrorMessageFacet { pub message: String, pub programmingLanguage: String }
-#[derive(Debug, Clone, Serialize, Deserialize)] pub struct SqlFacet { pub query: String, pub dialect: String }
-#[derive(Debug, Clone, Serialize, Deserialize)] pub struct SchemaFacet { pub fields: Vec<SchemaField> }
-#[derive(Debug, Clone, Serialize, Deserialize)] pub struct SchemaField { pub name: String, #[serde(rename = "type")] pub field_type: String }
-#[derive(Debug, Clone, Serialize, Deserialize)] pub struct DataSourceFacet { pub name: String, pub uri: String }
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NominalTimeFacet {
+    pub nominalStartTime: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ParentRunFacet {
+    pub run: Run,
+    pub job: Job,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ErrorMessageFacet {
+    pub message: String,
+    pub programmingLanguage: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SqlFacet {
+    pub query: String,
+    pub dialect: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SchemaFacet {
+    pub fields: Vec<SchemaField>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SchemaField {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub field_type: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DataSourceFacet {
+    pub name: String,
+    pub uri: String,
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ColumnLineageFacet {
@@ -128,7 +164,8 @@ pub struct ColumnLineageInput {
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Transformation {
-    #[serde(rename = "type")] pub kind: String,
+    #[serde(rename = "type")]
+    pub kind: String,
     pub subtype: String,
     pub description: String,
     pub masking: bool,

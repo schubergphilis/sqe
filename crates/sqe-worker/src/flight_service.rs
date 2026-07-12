@@ -9,7 +9,7 @@ use arrow_flight::{
     HandshakeRequest, HandshakeResponse, PollInfo, PutResult, SchemaResult, Ticket,
 };
 use arrow_ipc::writer::IpcWriteOptions;
-use futures::{Stream, StreamExt, TryStreamExt, stream};
+use futures::{stream, Stream, StreamExt, TryStreamExt};
 use tonic::{Request, Response, Status, Streaming};
 use tracing::{debug, info, info_span, warn, Instrument};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
@@ -17,8 +17,8 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 use datafusion::prelude::SessionContext;
 use sqe_catalog::FooterCache;
 use sqe_core::FlightCompression;
-use sqe_metrics::WorkerMetricsRegistry;
 use sqe_metrics::propagation::extract_trace_context;
+use sqe_metrics::WorkerMetricsRegistry;
 use sqe_planner::ScanTask;
 
 use crate::credential_channel::{CredentialStore, RefreshableCredentials};
@@ -284,9 +284,8 @@ impl FlightService for WorkerFlightService {
 
         let ticket = request.into_inner();
 
-        let scan_task = ScanTask::from_bytes(&ticket.ticket).map_err(|e| {
-            Status::invalid_argument(format!("Failed to decode ScanTask: {e}"))
-        })?;
+        let scan_task = ScanTask::from_bytes(&ticket.ticket)
+            .map_err(|e| Status::invalid_argument(format!("Failed to decode ScanTask: {e}")))?;
 
         let worker_span = info_span!(
             "worker_execute_scan",
@@ -364,9 +363,9 @@ impl FlightService for WorkerFlightService {
                 .chain(stream::once(async move {
                     drop(cleanup_guard);
                     Err::<arrow_array::RecordBatch, arrow_flight::error::FlightError>(
-                        arrow_flight::error::FlightError::from_external_error(
-                            Box::new(std::io::Error::other("__SQE_CLEANUP_SENTINEL__")),
-                        ),
+                        arrow_flight::error::FlightError::from_external_error(Box::new(
+                            std::io::Error::other("__SQE_CLEANUP_SENTINEL__"),
+                        )),
                     )
                 }))
                 .filter_map(|item| async move {
@@ -385,9 +384,7 @@ impl FlightService for WorkerFlightService {
                 .build(mapped_stream)
                 .map_err(Status::from);
 
-            Ok(Response::new(
-                Box::pin(flight_stream) as Self::DoGetStream
-            ))
+            Ok(Response::new(Box::pin(flight_stream) as Self::DoGetStream))
         }
         .instrument(worker_span)
         .await
@@ -508,21 +505,15 @@ impl FlightService for WorkerFlightService {
             Status::invalid_argument("DoExchange stream ended before descriptor message")
         })??;
 
-        let descriptor = first_msg
-            .flight_descriptor
-            .as_ref()
-            .ok_or_else(|| {
-                Status::invalid_argument(
-                    "First DoExchange message must contain a FlightDescriptor",
-                )
-            })?;
+        let descriptor = first_msg.flight_descriptor.as_ref().ok_or_else(|| {
+            Status::invalid_argument("First DoExchange message must contain a FlightDescriptor")
+        })?;
 
-        let exchange_desc =
-            ExchangeDescriptor::from_bytes(&descriptor.cmd).map_err(|e| {
-                Status::invalid_argument(format!(
-                    "Failed to decode ExchangeDescriptor from descriptor cmd: {e}"
-                ))
-            })?;
+        let exchange_desc = ExchangeDescriptor::from_bytes(&descriptor.cmd).map_err(|e| {
+            Status::invalid_argument(format!(
+                "Failed to decode ExchangeDescriptor from descriptor cmd: {e}"
+            ))
+        })?;
 
         let (query_id, stage_id) = exchange_desc.stage_key();
         let partition_id = exchange_desc.partition_id();
@@ -556,15 +547,12 @@ impl FlightService for WorkerFlightService {
 
         // 3. Decode and buffer incoming RecordBatches.
         //    Chain the first message (which may also contain data) with the rest.
-        let remaining_stream = stream.map_err(|e| {
-            arrow_flight::error::FlightError::Tonic(Box::new(e))
-        });
+        let remaining_stream =
+            stream.map_err(|e| arrow_flight::error::FlightError::Tonic(Box::new(e)));
         let first_stream = futures::stream::once(async move { Ok(first_msg) });
-        let combined =
-            first_stream.chain(remaining_stream);
+        let combined = first_stream.chain(remaining_stream);
 
-        let mut flight_batch_stream =
-            FlightRecordBatchStream::new_from_flight_data(combined);
+        let mut flight_batch_stream = FlightRecordBatchStream::new_from_flight_data(combined);
 
         let schema = shuffle_receiver.schema().clone();
 

@@ -191,7 +191,9 @@ impl FragmentScheduler for WeightedScheduler {
 
         let result: Vec<Assignment> = assignments
             .into_iter()
-            .map(|a| a.expect("BUG: every task must be assigned; healthy worker check passed above"))
+            .map(|a| {
+                a.expect("BUG: every task must be assigned; healthy worker check passed above")
+            })
             .collect();
 
         debug!(
@@ -217,9 +219,7 @@ mod tests {
             data_file_paths: (0..file_count)
                 .map(|i| format!("s3://bucket/file{i}.parquet"))
                 .collect(),
-            file_sizes_bytes: (0..file_count)
-                .map(|_| file_size_mb * MB)
-                .collect(),
+            file_sizes_bytes: (0..file_count).map(|_| file_size_mb * MB).collect(),
             projected_columns: vec![],
             projected_field_ids: vec![],
             s3_endpoint: String::new(),
@@ -549,7 +549,11 @@ mod tests {
             // Verify no overlapping: each task_index appears exactly once
             let mut seen = std::collections::HashSet::new();
             for a in assignments {
-                assert!(seen.insert(a.task_index), "duplicate task_index {}", a.task_index);
+                assert!(
+                    seen.insert(a.task_index),
+                    "duplicate task_index {}",
+                    a.task_index
+                );
             }
         }
     }
@@ -562,12 +566,12 @@ mod tests {
         let scheduler = WeightedScheduler::new();
         // 6 tasks with varying sizes: 1000, 800, 600, 400, 200, 100 MB
         let tasks = vec![
-            make_task_with_sizes("heavy",     &[1000 * MB]),
+            make_task_with_sizes("heavy", &[1000 * MB]),
             make_task_with_sizes("mid_heavy", &[800 * MB]),
-            make_task_with_sizes("mid",       &[600 * MB]),
+            make_task_with_sizes("mid", &[600 * MB]),
             make_task_with_sizes("mid_light", &[400 * MB]),
-            make_task_with_sizes("light",     &[200 * MB]),
-            make_task_with_sizes("tiny",      &[100 * MB]),
+            make_task_with_sizes("light", &[200 * MB]),
+            make_task_with_sizes("tiny", &[100 * MB]),
         ];
         let workers = vec![
             make_worker("http://w1:50052", true, 0),
@@ -579,7 +583,8 @@ mod tests {
         assert_eq!(assignments.len(), 6);
 
         // Compute the total cost assigned to each worker using estimate_cost
-        let mut worker_loads: std::collections::HashMap<&str, u64> = std::collections::HashMap::new();
+        let mut worker_loads: std::collections::HashMap<&str, u64> =
+            std::collections::HashMap::new();
         for a in &assignments {
             let cost = estimate_cost(&tasks[a.task_index]);
             *worker_loads.entry(&a.worker_url).or_insert(0) += cost;

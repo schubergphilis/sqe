@@ -67,10 +67,7 @@ pub async fn extract_write_predicates(
     table_name: &str,
     schema: Arc<ArrowSchema>,
 ) -> sqe_core::Result<(WritePolicyPredicates, crate::PolicySummary)> {
-    let table_ref = TableReference::partial(
-        namespace_key.to_string(),
-        table_name.to_string(),
-    );
+    let table_ref = TableReference::partial(namespace_key.to_string(), table_name.to_string());
 
     let empty_batches: Vec<Vec<arrow_array::RecordBatch>> = vec![vec![]];
     let mem = Arc::new(
@@ -238,8 +235,7 @@ mod tests {
     async fn nullify_on_int_round_trips_to_typed_null() {
         let store = InMemoryPolicyStore::new();
         let mut pol = ResolvedPolicy::default();
-        pol.column_masks
-            .insert("id".to_string(), MaskType::Nullify);
+        pol.column_masks.insert("id".to_string(), MaskType::Nullify);
         store.add_table_policy("default", "employees", pol).await;
         let enf = PolicyPlanRewriter::new(Arc::new(store));
 

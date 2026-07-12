@@ -119,11 +119,7 @@ impl DeviceCodeService {
     ///
     /// `scopes` should include at least `"openid"`.  The values are joined with
     /// a space character before being sent to the IdP.
-    pub fn new(
-        discovery: Arc<OidcDiscovery>,
-        client_id: String,
-        scopes: Vec<String>,
-    ) -> Self {
+    pub fn new(discovery: Arc<OidcDiscovery>, client_id: String, scopes: Vec<String>) -> Self {
         Self {
             discovery,
             client_id,
@@ -145,7 +141,9 @@ impl DeviceCodeService {
             .form(&[("client_id", self.client_id.as_str()), ("scope", &scope)])
             .send()
             .await
-            .map_err(|e| AuthError::Internal(anyhow::anyhow!("device_authorization POST failed: {e}")))?;
+            .map_err(|e| {
+                AuthError::Internal(anyhow::anyhow!("device_authorization POST failed: {e}"))
+            })?;
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -157,7 +155,9 @@ impl DeviceCodeService {
         }
 
         let dar: DeviceAuthResponse = resp.json().await.map_err(|e| {
-            AuthError::Internal(anyhow::anyhow!("device_authorization response parse failed: {e}"))
+            AuthError::Internal(anyhow::anyhow!(
+                "device_authorization response parse failed: {e}"
+            ))
         })?;
 
         info!(
@@ -197,14 +197,19 @@ impl DeviceCodeService {
             ])
             .send()
             .await
-            .map_err(|e| AuthError::Internal(anyhow::anyhow!("device code token POST failed: {e}")))?;
+            .map_err(|e| {
+                AuthError::Internal(anyhow::anyhow!("device code token POST failed: {e}"))
+            })?;
 
         if resp.status().is_success() {
             let tr: TokenResponse = resp.json().await.map_err(|e| {
                 AuthError::Internal(anyhow::anyhow!("token response parse failed: {e}"))
             })?;
 
-            info!(expires_in = tr.expires_in, "Device code flow complete — token issued");
+            info!(
+                expires_in = tr.expires_in,
+                "Device code flow complete — token issued"
+            );
 
             return Ok(DevicePollResult::Complete(TokenSet {
                 access_token: tr.access_token,

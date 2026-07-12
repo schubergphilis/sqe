@@ -97,7 +97,6 @@ struct IcebergMetadataProvider {
 
 #[async_trait]
 impl TableProvider for IcebergMetadataProvider {
-
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
@@ -146,9 +145,7 @@ impl TableProvider for IcebergMetadataProvider {
 /// results and `table_files()` counts went stale after DELETE/UPDATE/MERGE
 /// (#371). The coordinator calls this to index those entries under the real
 /// table.
-pub fn metadata_tvf_target_table(
-    provider: &dyn TableProvider,
-) -> Option<String> {
+pub fn metadata_tvf_target_table(provider: &dyn TableProvider) -> Option<String> {
     (provider as &dyn std::any::Any)
         .downcast_ref::<IcebergMetadataProvider>()
         .map(|p| {
@@ -278,7 +275,13 @@ fn build_snapshots_batch(table: &Table, schema: &SchemaRef) -> DFResult<RecordBa
             // the serde_json crate is already transitively available via iceberg-rust.
             let pairs: Vec<String> = extra
                 .iter()
-                .map(|(k, v)| format!("\"{}\":\"{}\"", k.replace('"', "\\\""), v.replace('"', "\\\"")))
+                .map(|(k, v)| {
+                    format!(
+                        "\"{}\":\"{}\"",
+                        k.replace('"', "\\\""),
+                        v.replace('"', "\\\"")
+                    )
+                })
                 .collect();
             summary_b.append_value(format!("{{{}}}", pairs.join(",")));
         }
@@ -576,7 +579,10 @@ fn int_map_to_json(map: &std::collections::HashMap<i32, u64>) -> String {
     if map.is_empty() {
         return "{}".to_string();
     }
-    let pairs: Vec<String> = map.iter().map(|(k, v)| format!("\"{}\":{}", k, v)).collect();
+    let pairs: Vec<String> = map
+        .iter()
+        .map(|(k, v)| format!("\"{}\":{}", k, v))
+        .collect();
     format!("{{{}}}", pairs.join(","))
 }
 
@@ -611,19 +617,24 @@ async fn build_files_batch(table: &Table, schema: &SchemaRef) -> DFResult<Record
 
                                 file_path_b.append_value(df.file_path());
                                 file_format_b.append_value(format!("{:?}", df.file_format()));
-                                record_count_b.append_value(u64_to_i64_saturating(df.record_count()));
-                                file_size_b.append_value(u64_to_i64_saturating(df.file_size_in_bytes()));
+                                record_count_b
+                                    .append_value(u64_to_i64_saturating(df.record_count()));
+                                file_size_b
+                                    .append_value(u64_to_i64_saturating(df.file_size_in_bytes()));
 
                                 column_sizes_b.append_value(int_map_to_json(df.column_sizes()));
                                 value_counts_b.append_value(int_map_to_json(df.value_counts()));
-                                null_value_counts_b.append_value(int_map_to_json(df.null_value_counts()));
+                                null_value_counts_b
+                                    .append_value(int_map_to_json(df.null_value_counts()));
 
                                 // Represent partition as a simple string of field values
                                 let parts: Vec<String> = df
                                     .partition()
                                     .fields()
                                     .iter()
-                                    .map(|f| f.as_ref().map_or("null".to_string(), |v| format!("{v:?}")))
+                                    .map(|f| {
+                                        f.as_ref().map_or("null".to_string(), |v| format!("{v:?}"))
+                                    })
                                     .collect();
                                 partition_b.append_value(format!("[{}]", parts.join(",")));
                             }
@@ -734,13 +745,14 @@ async fn build_partitions_batch(table: &Table, schema: &SchemaRef) -> DFResult<R
                                     .partition()
                                     .fields()
                                     .iter()
-                                    .map(|f| f.as_ref().map_or("null".to_string(), |v| format!("{v:?}")))
+                                    .map(|f| {
+                                        f.as_ref().map_or("null".to_string(), |v| format!("{v:?}"))
+                                    })
                                     .collect();
                                 let partition_key = format!("[{}]", parts.join(","));
 
-                                let entry_stats = partition_stats
-                                    .entry(partition_key)
-                                    .or_insert((0, 0, 0));
+                                let entry_stats =
+                                    partition_stats.entry(partition_key).or_insert((0, 0, 0));
                                 entry_stats.0 = entry_stats
                                     .0
                                     .saturating_add(u64_to_i64_saturating(df.record_count()));
@@ -915,14 +927,20 @@ mod tests {
         let exprs = vec![str_literal("only_one")];
         let result = parse_two_string_args("test_fn", &exprs);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("exactly 2 arguments"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("exactly 2 arguments"));
     }
 
     #[test]
     fn test_parse_two_args_no_args() {
         let result = parse_two_string_args("test_fn", &[]);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("exactly 2 arguments"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("exactly 2 arguments"));
     }
 
     #[test]
@@ -937,14 +955,13 @@ mod tests {
 
     #[test]
     fn test_parse_two_args_too_many() {
-        let exprs = vec![
-            str_literal("ns"),
-            str_literal("tbl"),
-            str_literal("extra"),
-        ];
+        let exprs = vec![str_literal("ns"), str_literal("tbl"), str_literal("extra")];
         let result = parse_two_string_args("test_fn", &exprs);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("exactly 2 arguments"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("exactly 2 arguments"));
     }
 
     // ── snapshots_schema ─────────────────────────────────────────────────────
@@ -982,8 +999,14 @@ mod tests {
     fn test_snapshots_schema_nullability() {
         let schema = snapshots_schema();
         // committed_at and snapshot_id must be non-null.
-        assert!(!schema.field(0).is_nullable(), "committed_at must be non-null");
-        assert!(!schema.field(1).is_nullable(), "snapshot_id must be non-null");
+        assert!(
+            !schema.field(0).is_nullable(),
+            "committed_at must be non-null"
+        );
+        assert!(
+            !schema.field(1).is_nullable(),
+            "snapshot_id must be non-null"
+        );
         // parent_id must be nullable (root snapshots have no parent).
         assert!(schema.field(2).is_nullable(), "parent_id must be nullable");
     }
@@ -1021,11 +1044,17 @@ mod tests {
         let schema = manifests_schema();
         // manifest_path, manifest_length, partition_spec_id, added_snapshot_id are always present
         for i in 0..4 {
-            assert!(!schema.field(i).is_nullable(), "manifests column {i} must be non-null");
+            assert!(
+                !schema.field(i).is_nullable(),
+                "manifests column {i} must be non-null"
+            );
         }
         // Count columns are nullable (may be absent in older Iceberg formats)
         for i in 4..10 {
-            assert!(schema.field(i).is_nullable(), "manifests column {i} must be nullable");
+            assert!(
+                schema.field(i).is_nullable(),
+                "manifests column {i} must be nullable"
+            );
         }
     }
 
@@ -1039,7 +1068,13 @@ mod tests {
         } else {
             let pairs: Vec<String> = extra
                 .iter()
-                .map(|(k, v)| format!("\"{}\":\"{}\"", k.replace('"', "\\\""), v.replace('"', "\\\"")))
+                .map(|(k, v)| {
+                    format!(
+                        "\"{}\":\"{}\"",
+                        k.replace('"', "\\\""),
+                        v.replace('"', "\\\"")
+                    )
+                })
                 .collect();
             format!("{{{}}}", pairs.join(","))
         };
@@ -1052,10 +1087,19 @@ mod tests {
         extra.insert("ke\"y".to_string(), "va\"lue".to_string());
         let pairs: Vec<String> = extra
             .iter()
-            .map(|(k, v)| format!("\"{}\":\"{}\"", k.replace('"', "\\\""), v.replace('"', "\\\"")))
+            .map(|(k, v)| {
+                format!(
+                    "\"{}\":\"{}\"",
+                    k.replace('"', "\\\""),
+                    v.replace('"', "\\\"")
+                )
+            })
             .collect();
         let result = format!("{{{}}}", pairs.join(","));
         assert!(result.contains("ke\\\"y"), "key should have escaped quotes");
-        assert!(result.contains("va\\\"lue"), "value should have escaped quotes");
+        assert!(
+            result.contains("va\\\"lue"),
+            "value should have escaped quotes"
+        );
     }
 }

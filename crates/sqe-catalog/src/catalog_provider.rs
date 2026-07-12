@@ -70,7 +70,10 @@ where
             false
         }
         None => {
-            debug!(schema = name, "live namespace re-list skipped: no tokio runtime");
+            debug!(
+                schema = name,
+                "live namespace re-list skipped: no tokio runtime"
+            );
             false
         }
     }
@@ -383,7 +386,13 @@ impl SqeCatalogProvider {
 
         Ok(namespaces
             .iter()
-            .map(|ns| ns.as_ref().iter().map(|s| s.as_str()).collect::<Vec<_>>().join("."))
+            .map(|ns| {
+                ns.as_ref()
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join(".")
+            })
             .collect())
     }
 
@@ -397,7 +406,6 @@ impl SqeCatalogProvider {
 }
 
 impl CatalogProvider for SqeCatalogProvider {
-
     fn schema_names(&self) -> Vec<String> {
         let mut names = self.cached_namespace_names();
         names.push("information_schema".to_string());
@@ -466,7 +474,6 @@ impl CatalogProvider for SqeCatalogProvider {
         );
 
         Some(Arc::new(provider))
-
     }
 }
 
@@ -508,8 +515,7 @@ mod tests {
     #[tokio::test]
     async fn filter_probes_each_namespace_once_under_cap() {
         let probes = AtomicUsize::new(0);
-        let input: Vec<NamespaceIdent> =
-            (0..20).map(|i| ns(&format!("ns{i}"))).collect();
+        let input: Vec<NamespaceIdent> = (0..20).map(|i| ns(&format!("ns{i}"))).collect();
         let out = filter_visible_namespaces(input, 0, |_| {
             probes.fetch_add(1, Ordering::SeqCst);
             async move { true }
@@ -546,11 +552,10 @@ mod tests {
         let last = Mutex::new(None);
         let relists = AtomicUsize::new(0);
         for _ in 0..5 {
-            let found =
-                contains_or_refresh(&names, &last, Duration::from_secs(60), "nope", || {
-                    relists.fetch_add(1, Ordering::SeqCst);
-                    Some(Ok(vec!["public".to_string()]))
-                });
+            let found = contains_or_refresh(&names, &last, Duration::from_secs(60), "nope", || {
+                relists.fetch_add(1, Ordering::SeqCst);
+                Some(Ok(vec!["public".to_string()]))
+            });
             assert!(!found);
         }
         assert_eq!(relists.load(Ordering::SeqCst), 1);
@@ -603,8 +608,7 @@ mod tests {
     fn no_runtime_keeps_previous_snapshot() {
         let names = snapshot(&["public"]);
         let last = Mutex::new(None);
-        let found =
-            contains_or_refresh(&names, &last, Duration::from_secs(5), "bank", || None);
+        let found = contains_or_refresh(&names, &last, Duration::from_secs(5), "bank", || None);
         assert!(!found);
         assert_eq!(*names.read().unwrap(), vec!["public"]);
     }

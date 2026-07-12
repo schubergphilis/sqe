@@ -46,7 +46,11 @@ pub fn augment_schema_with_meta(base: &Schema) -> Arc<Schema> {
     let mut fields: Vec<Field> = base.fields().iter().map(|f| f.as_ref().clone()).collect();
     fields.push(Field::new(CHANGE_TYPE_COLUMN, DataType::Utf8, false));
     fields.push(Field::new(CHANGE_ORDINAL_COLUMN, DataType::Int64, false));
-    fields.push(Field::new(COMMIT_SNAPSHOT_ID_COLUMN, DataType::Int64, false));
+    fields.push(Field::new(
+        COMMIT_SNAPSHOT_ID_COLUMN,
+        DataType::Int64,
+        false,
+    ));
     Arc::new(Schema::new_with_metadata(fields, base.metadata().clone()))
 }
 
@@ -81,11 +85,9 @@ pub fn attach_meta_columns(
     let n = batch.num_rows();
     let schema = augment_schema_with_meta(&batch.schema());
 
-    let change_type: ArrayRef =
-        Arc::new(StringArray::from(vec![file.kind.as_str(); n]));
+    let change_type: ArrayRef = Arc::new(StringArray::from(vec![file.kind.as_str(); n]));
     let change_ordinal: ArrayRef = Arc::new(Int64Array::from(vec![file.ordinal; n]));
-    let commit_snapshot: ArrayRef =
-        Arc::new(Int64Array::from(vec![file.snapshot_id; n]));
+    let commit_snapshot: ArrayRef = Arc::new(Int64Array::from(vec![file.snapshot_id; n]));
 
     let mut columns: Vec<ArrayRef> = batch.columns().to_vec();
     columns.push(change_type);
@@ -313,11 +315,7 @@ pub async fn collect_added_files_for_snapshot(
 ///
 /// This is the top-level entry point used by the coordinator after parsing
 /// `FOR INCREMENTAL BETWEEN SNAPSHOT start AND SNAPSHOT end`.
-pub async fn plan_incremental(
-    table: &Table,
-    start: i64,
-    end: i64,
-) -> Result<IncrementalPlan> {
+pub async fn plan_incremental(table: &Table, start: i64, end: i64) -> Result<IncrementalPlan> {
     let metadata = table.metadata();
     let snapshots = resolve_range(metadata, start, end)?;
 
@@ -338,10 +336,14 @@ pub async fn plan_incremental(
             })?
             .clone();
 
-        let (mut added_data, mut added_deletes) =
-            collect_added_files_for_snapshot(table, &snap)
-                .await
-                .map_err(|e| SqeError::catalog_src(format!("Failed to read manifests for snapshot {sid}: {e}"), e))?;
+        let (mut added_data, mut added_deletes) = collect_added_files_for_snapshot(table, &snap)
+            .await
+            .map_err(|e| {
+                SqeError::catalog_src(
+                    format!("Failed to read manifests for snapshot {sid}: {e}"),
+                    e,
+                )
+            })?;
 
         // Replace the per-snapshot-local ordinal with a global-per-snapshot
         // ordinal so the meta column is stable regardless of file layout.
@@ -420,7 +422,11 @@ mod tests {
             Some("old_data.parquet".to_string()),
         );
         let kept = reconcile_in_range_deletes(&data, deletes, &refs);
-        assert_eq!(kept.len(), 0, "delete targeting out-of-range data should drop");
+        assert_eq!(
+            kept.len(),
+            0,
+            "delete targeting out-of-range data should drop"
+        );
     }
 
     #[test]
@@ -522,11 +528,7 @@ mod tests {
     #[test]
     fn resolve_range_excludes_start_snapshot() {
         // start is exclusive.
-        let md = metadata_with_snapshots(&[
-            (100, None),
-            (101, Some(100)),
-            (102, Some(101)),
-        ]);
+        let md = metadata_with_snapshots(&[(100, None), (101, Some(100)), (102, Some(101))]);
         let snaps = resolve_range(&md, 101, 102).unwrap();
         assert_eq!(snaps, vec![102]);
     }
@@ -565,11 +567,7 @@ mod tests {
     #[test]
     fn resolve_range_start_zero_walks_to_root() {
         // Sentinel "from the beginning of history".
-        let md = metadata_with_snapshots(&[
-            (100, None),
-            (101, Some(100)),
-            (102, Some(101)),
-        ]);
+        let md = metadata_with_snapshots(&[(100, None), (101, Some(100)), (102, Some(101))]);
         let snaps = resolve_range(&md, 0, 102).unwrap();
         assert_eq!(snaps, vec![100, 101, 102]);
     }
@@ -593,7 +591,11 @@ mod tests {
         use arrow::datatypes::{DataType, Field, Schema};
         let base = Schema::new(vec![Field::new("id", DataType::Int64, false)]);
         let augmented = augment_schema_with_meta(&base);
-        let names: Vec<&str> = augmented.fields().iter().map(|f| f.name().as_str()).collect();
+        let names: Vec<&str> = augmented
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
         assert_eq!(
             names,
             vec![

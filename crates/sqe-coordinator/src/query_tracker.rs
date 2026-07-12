@@ -1,7 +1,7 @@
-use std::sync::{Arc, Mutex};
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use moka::sync::Cache;
+use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -86,12 +86,16 @@ pub struct QueryRecord {
     /// requires one (mode "all", or "slow"/failure). Capped at 64 KiB by
     /// the renderer.
     pub profile: Option<String>,
+    pub trace_id: Option<String>,
     pub fragments: Arc<Mutex<Vec<FragmentInfo>>>,
 }
 
 impl QueryRecord {
     pub fn fragments_snapshot(&self) -> Vec<FragmentInfo> {
-        self.fragments.lock().expect("fragments mutex poisoned").clone()
+        self.fragments
+            .lock()
+            .expect("fragments mutex poisoned")
+            .clone()
     }
 }
 
@@ -133,6 +137,7 @@ impl QueryTracker {
         session_id: &str,
         client_ip: Option<&str>,
         roles: Vec<String>,
+        trace_id: Option<String>,
     ) -> CancellationToken {
         let token = CancellationToken::new();
         let record = QueryRecord {
@@ -160,6 +165,7 @@ impl QueryTracker {
             spill_bytes: 0,
             peak_memory_bytes: 0,
             profile: None,
+            trace_id,
             fragments: Arc::new(Mutex::new(Vec::new())),
         };
         self.history.insert(query_id, Arc::new(record));
@@ -296,9 +302,9 @@ impl QueryTracker {
         if guard.is_empty() {
             return None;
         }
-        let all_done = guard.iter().all(|f| {
-            matches!(f.state, FragmentState::Finished | FragmentState::Failed)
-        });
+        let all_done = guard
+            .iter()
+            .all(|f| matches!(f.state, FragmentState::Finished | FragmentState::Failed));
         if all_done {
             Some(
                 guard
@@ -329,14 +335,17 @@ mod tests {
     use super::*;
 
     fn test_config() -> QueryHistoryConfig {
-        QueryHistoryConfig { max_entries: 100, ttl_secs: 60 }
+        QueryHistoryConfig {
+            max_entries: 100,
+            ttl_secs: 60,
+        }
     }
 
     #[tokio::test]
     async fn start_creates_queued_record() {
         let tracker = QueryTracker::new(&test_config());
         let id = Uuid::now_v7();
-        let _token = tracker.start(id, "alice", Some("cli"), "SELECT 1", "s1", None, vec![]);
+        let _token = tracker.start(id, "alice", Some("cli"), "SELECT 1", "s1", None, vec![], None);
         let records = tracker.records();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].state, QueryState::Queued);
@@ -348,7 +357,7 @@ mod tests {
     async fn full_lifecycle_queued_running_finished() {
         let tracker = QueryTracker::new(&test_config());
         let id = Uuid::now_v7();
-        tracker.start(id, "bob", None, "SELECT *", "s2", None, vec![]);
+        tracker.start(id, "bob", None, "SELECT *", "s2", None, vec![], None);
         tracker.running(&id, 10);
         tracker.complete(&id, 42, 150, vec!["ns.table1".to_string()], 0, 0, 0, 0);
         let rec = tracker.history.get(&id).unwrap();
@@ -364,7 +373,7 @@ mod tests {
     async fn failed_records_error() {
         let tracker = QueryTracker::new(&test_config());
         let id = Uuid::now_v7();
-        tracker.start(id, "carol", None, "BAD SQL", "s3", None, vec![]);
+        tracker.start(id, "carol", None, "BAD SQL", "s3", None, vec![], None);
         tracker.running(&id, 0);
         let err = sqe_core::SqeError::Execution("syntax error near BAD".to_string());
         tracker.failed(&id, &err);
@@ -380,7 +389,7 @@ mod tests {
     async fn cancel_fires_token_and_records() {
         let tracker = QueryTracker::new(&test_config());
         let id = Uuid::now_v7();
-        let token = tracker.start(id, "dave", None, "SELECT 1", "s4", None, vec![]);
+        let token = tracker.start(id, "dave", None, "SELECT 1", "s4", None, vec![], None);
         assert!(!token.is_cancelled());
         let cancelled = tracker.cancel(&id);
         assert!(cancelled);
@@ -393,7 +402,7 @@ mod tests {
     async fn set_profile_attaches_to_terminal_record() {
         let tracker = QueryTracker::new(&test_config());
         let id = Uuid::now_v7();
-        tracker.start(id, "alice", None, "SELECT 1", "s1", None, vec![]);
+        tracker.start(id, "alice", None, "SELECT 1", "s1", None, vec![], None);
         tracker.running(&id, 1);
         tracker.complete(&id, 5, 10, vec![], 0, 0, 0, 0);
         tracker.set_profile(&id, "elapsed_ms=10\nProjectionExec".to_string());
@@ -416,7 +425,7 @@ mod tests {
         let tracker = QueryTracker::new(&test_config());
         for i in 0..5 {
             let id = Uuid::now_v7();
-            tracker.start(id, &format!("user{i}"), None, "SELECT 1", "s", None, vec![]);
+            tracker.start(id, &format!("user{i}"), None, "SELECT 1", "s", None, vec![], None);
         }
         assert_eq!(tracker.records().len(), 5);
     }
@@ -434,11 +443,20 @@ mod tests {
                 let id = Uuid::now_v7();
                 let user = format!("user{i}");
                 let sql = format!("SELECT {i}");
-                tracker.start(id, &user, None, &sql, "session", None, vec![]);
+                tracker.start(id, &user, None, &sql, "session", None, vec![], None);
                 tracker.running(&id, (i * 5) as u64);
                 // Simulate some work
                 tokio::task::yield_now().await;
-                tracker.complete(&id, i as usize, (i * 10) as u64, vec![format!("table{i}")], 0, 0, 0, 0);
+                tracker.complete(
+                    &id,
+                    i as usize,
+                    (i * 10) as u64,
+                    vec![format!("table{i}")],
+                    0,
+                    0,
+                    0,
+                    0,
+                );
                 id
             });
         }
@@ -477,14 +495,19 @@ mod tests {
             let tracker = tracker.clone();
             handles.spawn(async move {
                 let id = Uuid::now_v7();
-                tracker.start(id, "user", None, "SELECT 1", "s", None, vec![]);
+                tracker.start(id, "user", None, "SELECT 1", "s", None, vec![], None);
                 tracker.running(&id, 5);
                 tokio::task::yield_now().await;
 
                 match i % 3 {
                     0 => tracker.complete(&id, 10, 100, vec![], 0, 0, 0, 0),
-                    1 => tracker.failed(&id, &sqe_core::SqeError::Execution("test error".to_string())),
-                    _ => { tracker.cancel(&id); }
+                    1 => tracker.failed(
+                        &id,
+                        &sqe_core::SqeError::Execution("test error".to_string()),
+                    ),
+                    _ => {
+                        tracker.cancel(&id);
+                    }
                 }
                 (id, i % 3)
             });
@@ -514,7 +537,7 @@ mod tests {
     async fn set_and_update_fragments() {
         let tracker = QueryTracker::new(&test_config());
         let id = Uuid::now_v7();
-        tracker.start(id, "alice", None, "SELECT *", "s1", None, vec![]);
+        tracker.start(id, "alice", None, "SELECT *", "s1", None, vec![], None);
 
         let frags = vec![
             FragmentInfo {
@@ -551,7 +574,7 @@ mod tests {
     async fn update_fragment_unknown_is_noop() {
         let tracker = QueryTracker::new(&test_config());
         let id = Uuid::now_v7();
-        tracker.start(id, "bob", None, "SELECT 1", "s2", None, vec![]);
+        tracker.start(id, "bob", None, "SELECT 1", "s2", None, vec![], None);
         tracker.update_fragment(&id, "nonexistent", FragmentState::Failed, 0, 0);
         // Should not panic
     }
@@ -560,7 +583,7 @@ mod tests {
     async fn all_fragments_done_returns_none_while_running() {
         let tracker = QueryTracker::new(&test_config());
         let id = Uuid::now_v7();
-        tracker.start(id, "alice", None, "SELECT *", "s1", None, vec![]);
+        tracker.start(id, "alice", None, "SELECT *", "s1", None, vec![], None);
 
         let frags = vec![
             FragmentInfo {
@@ -587,7 +610,10 @@ mod tests {
 
         // Finish only frag-0
         tracker.update_fragment(&id, "frag-0", FragmentState::Finished, 100, 50);
-        assert!(tracker.all_fragments_done(&id).is_none(), "frag-1 still running");
+        assert!(
+            tracker.all_fragments_done(&id).is_none(),
+            "frag-1 still running"
+        );
 
         // Finish frag-1 too
         tracker.update_fragment(&id, "frag-1", FragmentState::Finished, 500, 200);
@@ -609,7 +635,7 @@ mod tests {
     async fn all_fragments_done_returns_none_for_empty_fragments() {
         let tracker = QueryTracker::new(&test_config());
         let id = Uuid::now_v7();
-        tracker.start(id, "alice", None, "SELECT 1", "s1", None, vec![]);
+        tracker.start(id, "alice", None, "SELECT 1", "s1", None, vec![], None);
         // No fragments set — treated as "not a distributed query"
         assert!(tracker.all_fragments_done(&id).is_none());
     }
@@ -618,7 +644,7 @@ mod tests {
     async fn all_fragments_done_works_with_failed_fragments() {
         let tracker = QueryTracker::new(&test_config());
         let id = Uuid::now_v7();
-        tracker.start(id, "alice", None, "SELECT *", "s1", None, vec![]);
+        tracker.start(id, "alice", None, "SELECT *", "s1", None, vec![], None);
 
         let frags = vec![
             FragmentInfo {
@@ -658,7 +684,7 @@ mod tests {
         let mut ids = Vec::new();
         for i in 0..10 {
             let id = Uuid::now_v7();
-            tracker.start(id, &format!("user{i}"), None, "SELECT 1", "s", None, vec![]);
+            tracker.start(id, &format!("user{i}"), None, "SELECT 1", "s", None, vec![], None);
             tracker.complete(&id, 0, 0, vec![], 0, 0, 0, 0);
             ids.push(id);
         }

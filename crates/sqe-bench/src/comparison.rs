@@ -1,9 +1,7 @@
 //! Side-by-side benchmark comparison: run identical queries against SQE and Trino.
 
 use crate::client::BenchClient;
-use crate::report::{
-    CompareStatusReport, ComparisonReport, ComparisonSummary, QueryComparison,
-};
+use crate::report::{CompareStatusReport, ComparisonReport, ComparisonSummary, QueryComparison};
 use std::collections::HashMap;
 use std::time::Instant;
 use tracing::{info, warn};
@@ -81,9 +79,7 @@ fn classify_status(
         // declares a canonical count and SQE matches it while Trino does not,
         // Trino is the outlier on a SQL dialect difference (e.g. regexp_replace
         // backreference syntax). SQE is correct -> pass.
-        (None, None)
-            if matches!(canonical, Some(c) if sqe_rows as i64 == c && trino_rows as i64 != c) =>
-        {
+        (None, None) if matches!(canonical, Some(c) if sqe_rows as i64 == c && trino_rows as i64 != c) => {
             CompareStatusReport::DialectDiff
         }
         (None, None) => CompareStatusReport::RowDiff,
@@ -172,7 +168,8 @@ pub async fn run_comparison(
             || sql_upper.starts_with("INSERT ")
             || sql_upper.starts_with("MERGE ");
         // Also check after stripping comments (-- name: ...)
-        let first_stmt = sql.lines()
+        let first_stmt = sql
+            .lines()
             .find(|l| !l.trim().starts_with("--") && !l.trim().is_empty())
             .unwrap_or("")
             .trim()
@@ -208,7 +205,11 @@ pub async fn run_comparison(
             info!(
                 "  {} SQE transport error ({}), retrying once on a fresh connection",
                 query_name,
-                sqe_result.as_ref().err().map(|e| e.to_string()).unwrap_or_default()
+                sqe_result
+                    .as_ref()
+                    .err()
+                    .map(|e| e.to_string())
+                    .unwrap_or_default()
             );
             let retry_start = Instant::now();
             sqe_result = sqe_client.execute(&sql).await;
@@ -235,13 +236,10 @@ pub async fn run_comparison(
         let sqe_time_ms = sqe_elapsed.as_millis() as u64;
         let trino_time_ms = trino_elapsed.as_millis() as u64;
 
-        let rows_match =
-            sqe_error.is_none() && trino_error.is_none() && sqe_rows == trino_rows;
+        let rows_match = sqe_error.is_none() && trino_error.is_none() && sqe_rows == trino_rows;
 
-        let canonical =
-            canonical_rows(expected_rows.as_ref(), benchmark, &query_name, scale);
-        let status =
-            classify_status(&sqe_error, &trino_error, sqe_rows, trino_rows, canonical);
+        let canonical = canonical_rows(expected_rows.as_ref(), benchmark, &query_name, scale);
+        let status = classify_status(&sqe_error, &trino_error, sqe_rows, trino_rows, canonical);
 
         let speedup = if sqe_time_ms > 0 {
             trino_time_ms as f64 / sqe_time_ms as f64

@@ -449,10 +449,9 @@ pub fn parse_session_statement(sql: &str) -> Option<UpdatedSessionState> {
 
     if let Some(rest) = strip_prefix_ci(trimmed, &upper, "SET SESSION ") {
         if let Some((name, value)) = rest.split_once('=') {
-            state.set_session.push((
-                unquote_identifier(name.trim()),
-                value.trim().to_string(),
-            ));
+            state
+                .set_session
+                .push((unquote_identifier(name.trim()), value.trim().to_string()));
             return Some(state);
         }
         return None;
@@ -464,7 +463,9 @@ pub fn parse_session_statement(sql: &str) -> Option<UpdatedSessionState> {
     }
 
     if let Some(rest) = strip_prefix_ci(trimmed, &upper, "DEALLOCATE PREPARE ") {
-        state.deallocated_prepare.push(unquote_identifier(rest.trim()));
+        state
+            .deallocated_prepare
+            .push(unquote_identifier(rest.trim()));
         return Some(state);
     }
 
@@ -670,8 +671,8 @@ impl TrinoStats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
     use arrow_schema::{DataType, Field, Schema};
+    use std::sync::Arc;
 
     #[test]
     fn trino_stats_queued_state() {
@@ -776,11 +777,26 @@ mod tests {
         assert!(json.contains("\"id\":\"q-001\""));
         assert!(json.contains("\"state\":\"FINISHED\""));
         assert!(!json.contains("nextUri")); // Skipped because None
-        assert!(json.contains("\"typeSignature\""), "typeSignature must be present, got: {json}");
-        assert!(json.contains("\"rawType\":\"bigint\""), "rawType must be present, got: {json}");
-        assert!(json.contains("\"warnings\":[]"), "warnings array must always be present");
-        assert!(json.contains("\"cpuTimeMillis\""), "stats must include cpuTimeMillis");
-        assert!(json.contains("\"processedRows\""), "stats must include processedRows");
+        assert!(
+            json.contains("\"typeSignature\""),
+            "typeSignature must be present, got: {json}"
+        );
+        assert!(
+            json.contains("\"rawType\":\"bigint\""),
+            "rawType must be present, got: {json}"
+        );
+        assert!(
+            json.contains("\"warnings\":[]"),
+            "warnings array must always be present"
+        );
+        assert!(
+            json.contains("\"cpuTimeMillis\""),
+            "stats must include cpuTimeMillis"
+        );
+        assert!(
+            json.contains("\"processedRows\""),
+            "stats must include processedRows"
+        );
     }
 
     #[test]
@@ -868,7 +884,10 @@ mod tests {
             ..Default::default()
         };
         let json = serde_json::to_string(&resp).unwrap();
-        assert!(json.contains("\"infoUri\":null"), "infoUri must always be present, got: {json}");
+        assert!(
+            json.contains("\"infoUri\":null"),
+            "infoUri must always be present, got: {json}"
+        );
     }
 
     #[test]

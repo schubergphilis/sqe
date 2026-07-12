@@ -143,9 +143,7 @@ impl ScalarUDFImpl for ElementAt {
             }
             Some(DataType::Map(entries, _)) => match entries.data_type() {
                 // Map's entries is Struct([key, value]); return the value type.
-                DataType::Struct(fields) if fields.len() == 2 => {
-                    Ok(fields[1].data_type().clone())
-                }
+                DataType::Struct(fields) if fields.len() == 2 => Ok(fields[1].data_type().clone()),
                 other => Err(DataFusionError::Plan(format!(
                     "element_at: unexpected map entry type {other:?}"
                 ))),
@@ -163,10 +161,9 @@ impl ScalarUDFImpl for ElementAt {
         if let Some(list) = container.as_any().downcast_ref::<ListArray>() {
             let offsets = list.value_offsets();
             let values = list.values();
-            let idx = keys
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .ok_or_else(|| DataFusionError::Internal("element_at: array index must be bigint".into()))?;
+            let idx = keys.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
+                DataFusionError::Internal("element_at: array index must be bigint".into())
+            })?;
             let mut take_idx: Vec<Option<i64>> = Vec::with_capacity(rows);
             for i in 0..rows {
                 if list.is_null(i) || idx.is_null(i) {
@@ -184,7 +181,11 @@ impl ScalarUDFImpl for ElementAt {
                 } else {
                     -1 // index 0 does not exist -> NULL
                 };
-                take_idx.push(if j >= 0 && j < len { Some(start + j) } else { None });
+                take_idx.push(if j >= 0 && j < len {
+                    Some(start + j)
+                } else {
+                    None
+                });
             }
             let index_array = Int64Array::from(take_idx);
             let result = arrow::compute::take(values.as_ref(), &index_array, None)?;
@@ -277,7 +278,9 @@ impl ScalarUDFImpl for Contains {
                     Some(false)
                 });
             }
-            return Ok(ColumnarValue::Array(Arc::new(BooleanArray::from(out)) as ArrayRef));
+            return Ok(ColumnarValue::Array(
+                Arc::new(BooleanArray::from(out)) as ArrayRef
+            ));
         }
 
         // Preserve DataFusion's string `contains(haystack, needle)`.
@@ -315,7 +318,11 @@ mod tests {
         let ctx = SessionContext::new();
         register_coverage_fns(&ctx);
         let b = ctx.sql(sql).await.unwrap().collect().await.unwrap();
-        let a = b[0].column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        let a = b[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
         if a.is_null(0) {
             None
         } else {
@@ -354,11 +361,23 @@ mod tests {
 
     #[tokio::test]
     async fn element_at_array_matches_trino() {
-        assert_eq!(one_i64("SELECT element_at(make_array(10,20,30), 2)").await, Some(20));
-        assert_eq!(one_i64("SELECT element_at(make_array(10,20,30), -1)").await, Some(30));
+        assert_eq!(
+            one_i64("SELECT element_at(make_array(10,20,30), 2)").await,
+            Some(20)
+        );
+        assert_eq!(
+            one_i64("SELECT element_at(make_array(10,20,30), -1)").await,
+            Some(30)
+        );
         // out of bounds -> NULL
-        assert_eq!(one_i64("SELECT element_at(make_array(10,20,30), 9)").await, None);
-        assert_eq!(one_i64("SELECT element_at(make_array(10,20,30), 0)").await, None);
+        assert_eq!(
+            one_i64("SELECT element_at(make_array(10,20,30), 9)").await,
+            None
+        );
+        assert_eq!(
+            one_i64("SELECT element_at(make_array(10,20,30), 0)").await,
+            None
+        );
     }
 
     #[tokio::test]
@@ -375,8 +394,14 @@ mod tests {
 
     #[tokio::test]
     async fn contains_array_is_three_valued() {
-        assert_eq!(one_bool("SELECT contains(make_array(1,2,3), 2)").await, Some(true));
-        assert_eq!(one_bool("SELECT contains(make_array(1,2,3), 9)").await, Some(false));
+        assert_eq!(
+            one_bool("SELECT contains(make_array(1,2,3), 2)").await,
+            Some(true)
+        );
+        assert_eq!(
+            one_bool("SELECT contains(make_array(1,2,3), 9)").await,
+            Some(false)
+        );
         // absent + a NULL present -> NULL
         assert_eq!(
             one_bool("SELECT contains(make_array(1, CAST(NULL AS int), 3), 2)").await,
@@ -386,7 +411,13 @@ mod tests {
 
     #[tokio::test]
     async fn contains_string_still_works() {
-        assert_eq!(one_bool("SELECT contains('hello world', 'world')").await, Some(true));
-        assert_eq!(one_bool("SELECT contains('hello', 'zzz')").await, Some(false));
+        assert_eq!(
+            one_bool("SELECT contains('hello world', 'world')").await,
+            Some(true)
+        );
+        assert_eq!(
+            one_bool("SELECT contains('hello', 'zzz')").await,
+            Some(false)
+        );
     }
 }

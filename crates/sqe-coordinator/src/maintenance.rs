@@ -18,6 +18,7 @@ use std::sync::Arc;
 
 use arrow_array::{Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
+use futures::TryStreamExt;
 use iceberg::spec::{DataContentType, DataFile, ManifestStatus};
 use iceberg::table::Table as IcebergTable;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
@@ -26,7 +27,6 @@ use sqe_catalog::{SessionCatalog, TableMetadataCache};
 use sqe_core::{Session, SqeConfig, SqeError};
 use sqe_sql::{NamespaceRef, ProcedureCall, TableRef};
 use tracing::{info, warn};
-use futures::TryStreamExt;
 
 use crate::writer::{
     new_upload_tracker, parse_parquet_compression, write_data_files, WriteCleanupGuard,
@@ -118,12 +118,10 @@ impl MaintenanceHandler {
                 self.expire_snapshots(session, table, older_than_ms, *retain_last)
                     .await
             }
-            ProcedureCall::RemoveOrphanFiles {
-                table,
-                older_than,
-            } => {
+            ProcedureCall::RemoveOrphanFiles { table, older_than } => {
                 let older_than_ms = older_than.map(|t| t.timestamp_millis());
-                self.remove_orphan_files(session, table, older_than_ms).await
+                self.remove_orphan_files(session, table, older_than_ms)
+                    .await
             }
             ProcedureCall::RewriteManifests { table } => {
                 self.rewrite_manifests(session, table).await
@@ -132,10 +130,10 @@ impl MaintenanceHandler {
                 table,
                 history_limit,
             } => self.suggest_bloom_filter_columns(table, *history_limit),
-            ProcedureCall::PurgeOrphanLocations {
-                namespace,
-                dry_run,
-            } => self.purge_orphan_locations(session, namespace, *dry_run).await,
+            ProcedureCall::PurgeOrphanLocations { namespace, dry_run } => {
+                self.purge_orphan_locations(session, namespace, *dry_run)
+                    .await
+            }
             ProcedureCall::RegisterTable {
                 table,
                 metadata_location,
@@ -143,14 +141,13 @@ impl MaintenanceHandler {
             ProcedureCall::DropTable { table, purge } => {
                 self.drop_table(session, table, *purge).await
             }
-            ProcedureCall::SetCurrentSnapshot { .. }
-            | ProcedureCall::RollbackToSnapshot { .. } => Err(SqeError::Execution(
-                format!(
+            ProcedureCall::SetCurrentSnapshot { .. } | ProcedureCall::RollbackToSnapshot { .. } => {
+                Err(SqeError::Execution(format!(
                     "CALL system.{}: snapshot pointer operations are not yet implemented; \
                      track via the SQL extensions roadmap",
                     call.name()
-                ),
-            )),
+                )))
+            }
         }
     }
 
@@ -297,11 +294,7 @@ impl MaintenanceHandler {
             Some(f) => f(),
             None => Vec::new(),
         };
-        crate::suggest_bloom::suggest_bloom_filter_columns(
-            table_ref,
-            &queries,
-            history_limit,
-        )
+        crate::suggest_bloom::suggest_bloom_filter_columns(table_ref, &queries, history_limit)
     }
 
     /// Privilege check. Maintenance procedures mutate table state; we insist
@@ -499,8 +492,7 @@ impl MaintenanceHandler {
                     let table_for_group = table_arc.clone();
                     let tracker_for_group = tracker.clone();
                     async move {
-                        rewrite_group(&table_for_group, group, compression, tracker_for_group)
-                            .await
+                        rewrite_group(&table_for_group, group, compression, tracker_for_group).await
                     }
                 })
                 .buffer_unordered(max_concurrent.max(1))
@@ -526,7 +518,10 @@ impl MaintenanceHandler {
         }
 
         let output_count = new_files.len() as i64;
-        let output_bytes: i64 = new_files.iter().map(|f| f.file_size_in_bytes() as i64).sum();
+        let output_bytes: i64 = new_files
+            .iter()
+            .map(|f| f.file_size_in_bytes() as i64)
+            .sum();
 
         info!(
             table = %ident,
@@ -702,15 +697,16 @@ impl MaintenanceHandler {
         let table = load_table(&catalog, &ident).await?;
 
         let threshold_ms = older_than_ms.unwrap_or_else(|| {
-            chrono::Utc::now().timestamp_millis()
-                - DEFAULT_OLDER_THAN_DAYS * 24 * 60 * 60 * 1000
+            chrono::Utc::now().timestamp_millis() - DEFAULT_OLDER_THAN_DAYS * 24 * 60 * 60 * 1000
         });
 
-        let action = iceberg::actions::RemoveOrphanFilesAction::new(table).older_than_ms(threshold_ms);
+        let action =
+            iceberg::actions::RemoveOrphanFilesAction::new(table).older_than_ms(threshold_ms);
 
-        let orphans = action.execute().await.map_err(|e| {
-            SqeError::Execution(format!("remove_orphan_files execute failed: {e}"))
-        })?;
+        let orphans = action
+            .execute()
+            .await
+            .map_err(|e| SqeError::Execution(format!("remove_orphan_files execute failed: {e}")))?;
 
         info!(
             table = %ident,
@@ -881,11 +877,7 @@ impl MaintenanceHandler {
         let listing = file_io
             .list(format!("{ns_base}/"), false)
             .await
-            .map_err(|e| {
-                SqeError::Execution(format!(
-                    "Failed to list prefix '{ns_base}/': {e}"
-                ))
-            })?;
+            .map_err(|e| SqeError::Execution(format!("Failed to list prefix '{ns_base}/': {e}")))?;
         let entries: Vec<_> = listing.try_collect().await.map_err(|e| {
             SqeError::Execution(format!("Failed to collect listing for '{ns_base}/': {e}"))
         })?;
@@ -1038,7 +1030,11 @@ fn canonicalize_uri(s: &str) -> String {
     let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
     let path_collapsed = collapse_slashes(path);
     if path_collapsed.is_empty() {
-        format!("{}://{}", scheme.to_ascii_lowercase(), authority.to_ascii_lowercase())
+        format!(
+            "{}://{}",
+            scheme.to_ascii_lowercase(),
+            authority.to_ascii_lowercase()
+        )
     } else {
         format!(
             "{}://{}/{}",
@@ -1096,7 +1092,10 @@ fn to_table_ident(table_ref: &TableRef) -> TableIdent {
     TableIdent::new(ns, table_ref.name.clone())
 }
 
-async fn load_table(catalog: &Arc<dyn Catalog>, ident: &TableIdent) -> sqe_core::Result<IcebergTable> {
+async fn load_table(
+    catalog: &Arc<dyn Catalog>,
+    ident: &TableIdent,
+) -> sqe_core::Result<IcebergTable> {
     catalog
         .load_table(ident)
         .await
@@ -1250,8 +1249,8 @@ async fn read_parquet_file(
         .await
         .map_err(|e| SqeError::Execution(format!("Failed to read file '{file_path}': {e}")))?;
 
-    let reader = parquet::arrow::arrow_reader::ArrowReaderBuilder::try_new(input_file)
-        .map_err(|e| {
+    let reader =
+        parquet::arrow::arrow_reader::ArrowReaderBuilder::try_new(input_file).map_err(|e| {
             SqeError::Execution(format!(
                 "Failed to create Parquet reader for '{file_path}': {e}"
             ))
@@ -1263,12 +1262,13 @@ async fn read_parquet_file(
         ))
     })?;
 
-    let batches: Vec<RecordBatch> = reader
-        .into_iter()
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| {
-            SqeError::Execution(format!("Failed to read Parquet file '{file_path}': {e}"))
-        })?;
+    let batches: Vec<RecordBatch> =
+        reader
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| {
+                SqeError::Execution(format!("Failed to read Parquet file '{file_path}': {e}"))
+            })?;
 
     Ok(batches)
 }
@@ -1531,10 +1531,7 @@ mod tests {
     #[test]
     fn is_strictly_under_accepts_child() {
         assert!(is_strictly_under("s3://b/wh/ns/t", "s3://b/wh/ns"));
-        assert!(is_strictly_under(
-            "s3://b/wh/ns/t/sub",
-            "s3://b/wh/ns"
-        ));
+        assert!(is_strictly_under("s3://b/wh/ns/t/sub", "s3://b/wh/ns"));
     }
 
     #[test]

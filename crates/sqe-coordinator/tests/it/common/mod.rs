@@ -8,12 +8,11 @@ use std::sync::Arc;
 pub fn init_tracing() {
     static TRACING_INIT: std::sync::Once = std::sync::Once::new();
     TRACING_INIT.call_once(|| {
-        let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| {
-                tracing_subscriber::EnvFilter::new(
-                    "sqe_coordinator=info,sqe_catalog=info,sqe_auth=info,warn",
-                )
-            });
+        let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+            tracing_subscriber::EnvFilter::new(
+                "sqe_coordinator=info,sqe_catalog=info,sqe_auth=info,warn",
+            )
+        });
         tracing_subscriber::fmt()
             .with_env_filter(filter)
             .with_writer(std::io::stderr)
@@ -25,8 +24,7 @@ pub fn init_tracing() {
 /// CARGO_MANIFEST_DIR points to the crate dir (crates/sqe-coordinator),
 /// so we go up two levels to reach the workspace root.
 pub fn test_config_path() -> String {
-    let manifest_dir =
-        std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
     let workspace_root = std::path::Path::new(&manifest_dir)
         .parent() // crates/
         .and_then(|p| p.parent()) // workspace root
@@ -51,21 +49,33 @@ pub async fn setup_handler() -> (sqe_core::Session, sqe_coordinator::QueryHandle
         .await
         .expect("Auth failed for root");
     let policy: Arc<dyn sqe_policy::PolicyEnforcer> = Arc::new(sqe_policy::PassthroughEnforcer);
-    let query_tracker = Arc::new(
-        sqe_coordinator::query_tracker::QueryTracker::new(&config.query_history),
-    );
+    let query_tracker = Arc::new(sqe_coordinator::query_tracker::QueryTracker::new(
+        &config.query_history,
+    ));
     let query_cache = if config.query_cache.enabled {
-        Some(Arc::new(sqe_coordinator::query_cache::ResultCache::new(&config.query_cache, None)))
+        Some(Arc::new(sqe_coordinator::query_cache::ResultCache::new(
+            &config.query_cache,
+            None,
+        )))
     } else {
         None
     };
     let handler = sqe_coordinator::QueryHandler::new(
-        policy, None, config, None, None, None, None, query_tracker, query_cache,
+        policy,
+        None,
+        config,
+        None,
+        None,
+        None,
+        None,
+        query_tracker,
+        query_cache,
         None, // grant_backend
         None, // lineage observer
         sqe_coordinator::RuntimeCatalogRegistry::default(),
         sqe_core::SecretStore::default(),
-    ).expect("Failed to create QueryHandler");
+    )
+    .expect("Failed to create QueryHandler");
     (session, handler)
 }
 
@@ -75,7 +85,12 @@ pub async fn setup_handler() -> (sqe_core::Session, sqe_coordinator::QueryHandle
 pub fn fmt_val(col: &dyn arrow_array::Array, row: usize) -> String {
     #[allow(unused_imports)]
     use arrow_array::Array as _;
-    if col.is_null(row) || col.as_any().downcast_ref::<arrow_array::NullArray>().is_some() {
+    if col.is_null(row)
+        || col
+            .as_any()
+            .downcast_ref::<arrow_array::NullArray>()
+            .is_some()
+    {
         return "NULL".to_string();
     }
     if let Some(a) = col.as_any().downcast_ref::<arrow_array::Int64Array>() {

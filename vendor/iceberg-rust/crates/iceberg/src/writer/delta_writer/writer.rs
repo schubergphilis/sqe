@@ -536,20 +536,26 @@ mod tests {
             )])),
         ]));
 
-        let batch_one = RecordBatch::try_new(arrow_schema.clone(), vec![
-            Arc::new(Int64Array::from(vec![1, 2, 1, 3, 2, 3, 1])),
-            Arc::new(StringArray::from(vec!["a", "b", "c", "d", "e", "f", "g"])),
-            Arc::new(Int32Array::from(vec![INSERT_OP; 7])),
-        ])?;
+        let batch_one = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 1, 3, 2, 3, 1])),
+                Arc::new(StringArray::from(vec!["a", "b", "c", "d", "e", "f", "g"])),
+                Arc::new(Int32Array::from(vec![INSERT_OP; 7])),
+            ],
+        )?;
         delta_writer.write(batch_one).await?;
 
-        let batch_two = RecordBatch::try_new(arrow_schema.clone(), vec![
-            Arc::new(Int64Array::from(vec![1, 2, 3, 4])),
-            Arc::new(StringArray::from(vec!["a", "b", "k", "l"])),
-            Arc::new(Int32Array::from(vec![
-                DELETE_OP, DELETE_OP, DELETE_OP, INSERT_OP,
-            ])),
-        ])?;
+        let batch_two = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3, 4])),
+                Arc::new(StringArray::from(vec!["a", "b", "k", "l"])),
+                Arc::new(Int32Array::from(vec![
+                    DELETE_OP, DELETE_OP, DELETE_OP, INSERT_OP,
+                ])),
+            ],
+        )?;
         delta_writer.write(batch_two).await?;
 
         let data_files = delta_writer.close().await?;
@@ -577,12 +583,15 @@ mod tests {
             .unwrap();
         let batches = reader.map(|batch| batch.unwrap()).collect::<Vec<_>>();
         let res = concat_batches(&data_schema, &batches).unwrap();
-        let expected_batches = RecordBatch::try_new(data_schema.clone(), vec![
-            Arc::new(Int64Array::from(vec![1, 2, 1, 3, 2, 3, 1, 4])),
-            Arc::new(StringArray::from(vec![
-                "a", "b", "c", "d", "e", "f", "g", "l",
-            ])),
-        ])?;
+        let expected_batches = RecordBatch::try_new(
+            data_schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 1, 3, 2, 3, 1, 4])),
+                Arc::new(StringArray::from(vec![
+                    "a", "b", "c", "d", "e", "f", "g", "l",
+                ])),
+            ],
+        )?;
         assert_eq!(expected_batches, res);
 
         let position_delete_file = data_files
@@ -599,13 +608,16 @@ mod tests {
         let batches = reader.map(|batch| batch.unwrap()).collect::<Vec<_>>();
         let position_schema = Arc::new(position_delete_arrow_schema());
         let res = concat_batches(&position_schema, &batches).unwrap();
-        let expected_batches = RecordBatch::try_new(position_schema.clone(), vec![
-            Arc::new(StringArray::from(vec![
-                data_file_path.clone(),
-                data_file_path.clone(),
-            ])),
-            Arc::new(Int64Array::from(vec![0, 1])),
-        ])?;
+        let expected_batches = RecordBatch::try_new(
+            position_schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec![
+                    data_file_path.clone(),
+                    data_file_path.clone(),
+                ])),
+                Arc::new(Int64Array::from(vec![0, 1])),
+            ],
+        )?;
         assert_eq!(expected_batches, res);
 
         let equality_delete_file = data_files
@@ -625,10 +637,13 @@ mod tests {
         )?);
         let equality_arrow_schema = Arc::new(schema_to_arrow_schema(&equality_schema)?);
         let res = concat_batches(&equality_arrow_schema, &batches).unwrap();
-        let expected_batches = RecordBatch::try_new(equality_arrow_schema.clone(), vec![
-            Arc::new(Int64Array::from(vec![3])),
-            Arc::new(StringArray::from(vec!["k"])),
-        ])?;
+        let expected_batches = RecordBatch::try_new(
+            equality_arrow_schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![3])),
+                Arc::new(StringArray::from(vec!["k"])),
+            ],
+        )?;
         assert_eq!(expected_batches, res);
 
         Ok(())
@@ -714,13 +729,16 @@ mod tests {
 
         // INSERT id=1@0, id=2@1, id=2(dup)@2 evicts pos 1 → buf [1]; DELETE id=1 evicts pos 0 → buf [0].
         // close() sorts buffer: [0, 1].
-        let batch = RecordBatch::try_new(arrow_schema.clone(), vec![
-            Arc::new(Int64Array::from(vec![1_i64, 2, 2, 1])),
-            Arc::new(StringArray::from(vec!["a", "b", "c", "d"])),
-            Arc::new(Int32Array::from(vec![
-                INSERT_OP, INSERT_OP, INSERT_OP, DELETE_OP,
-            ])),
-        ])?;
+        let batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1_i64, 2, 2, 1])),
+                Arc::new(StringArray::from(vec!["a", "b", "c", "d"])),
+                Arc::new(Int32Array::from(vec![
+                    INSERT_OP, INSERT_OP, INSERT_OP, DELETE_OP,
+                ])),
+            ],
+        )?;
         delta_writer.write(batch).await?;
 
         let data_files = delta_writer.close().await?;
@@ -839,23 +857,29 @@ mod tests {
         ]));
 
         // write() #1: four fresh inserts, no position-deletes.
-        let write_one = RecordBatch::try_new(arrow_schema.clone(), vec![
-            Arc::new(Int64Array::from(vec![1_i64, 2, 3, 4])),
-            Arc::new(StringArray::from(vec!["a", "b", "c", "d"])),
-            Arc::new(Int32Array::from(vec![INSERT_OP; 4])),
-        ])?;
+        let write_one = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1_i64, 2, 3, 4])),
+                Arc::new(StringArray::from(vec!["a", "b", "c", "d"])),
+                Arc::new(Int32Array::from(vec![INSERT_OP; 4])),
+            ],
+        )?;
         delta_writer.write(write_one).await?;
 
         // write() #2: dup inserts evict positions [1,3]; deletes evict positions [0,2].
         // Buffer accumulates [0,1,2,3]; close() writes them sorted.
-        let write_two = RecordBatch::try_new(arrow_schema.clone(), vec![
-            Arc::new(Int64Array::from(vec![5_i64, 2, 4, 1, 3])),
-            Arc::new(StringArray::from(vec!["e", "B", "D", "a", "c"])),
-            Arc::new(Int32Array::from(vec![
-                INSERT_OP, INSERT_OP, INSERT_OP, // id=5 fresh, id=2 dup, id=4 dup
-                DELETE_OP, DELETE_OP, // id=1, id=3
-            ])),
-        ])?;
+        let write_two = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![5_i64, 2, 4, 1, 3])),
+                Arc::new(StringArray::from(vec!["e", "B", "D", "a", "c"])),
+                Arc::new(Int32Array::from(vec![
+                    INSERT_OP, INSERT_OP, INSERT_OP, // id=5 fresh, id=2 dup, id=4 dup
+                    DELETE_OP, DELETE_OP, // id=1, id=3
+                ])),
+            ],
+        )?;
         delta_writer.write(write_two).await?;
 
         let data_files = delta_writer.close().await?;

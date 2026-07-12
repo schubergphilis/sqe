@@ -113,19 +113,14 @@ impl ScanDecodeGate {
 }
 
 impl DecodeGate for ScanDecodeGate {
-    fn admit(
-        &self,
-        estimated_bytes: u64,
-    ) -> BoxFuture<'_, iceberg::Result<Box<dyn Any + Send>>> {
+    fn admit(&self, estimated_bytes: u64) -> BoxFuture<'_, iceberg::Result<Box<dyn Any + Send>>> {
         Box::pin(async move {
             let admission = ScanDecodeGate::admit(self, estimated_bytes)
                 .await
                 // Carry the DataFusion message verbatim: it contains the
                 // "Resources exhausted"/"Failed to allocate" wording the
                 // coordinator classifies as RESOURCE_EXHAUSTED.
-                .map_err(|e| {
-                    iceberg::Error::new(iceberg::ErrorKind::Unexpected, e.to_string())
-                })?;
+                .map_err(|e| iceberg::Error::new(iceberg::ErrorKind::Unexpected, e.to_string()))?;
             Ok(Box::new(admission) as Box<dyn Any + Send>)
         })
     }
@@ -162,7 +157,11 @@ mod tests {
     use datafusion::execution::memory_pool::GreedyMemoryPool;
     use futures::FutureExt;
 
-    fn gate(pool_bytes: usize, permits: usize, track: bool) -> (Arc<ScanDecodeGate>, Arc<dyn MemoryPool>) {
+    fn gate(
+        pool_bytes: usize,
+        permits: usize,
+        track: bool,
+    ) -> (Arc<ScanDecodeGate>, Arc<dyn MemoryPool>) {
         let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(pool_bytes));
         let gate = ScanDecodeGate::new(
             Arc::new(Semaphore::new(permits)),

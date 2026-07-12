@@ -210,7 +210,9 @@ mod tests {
             restricted_columns: vec!["ssn".to_string(), "dob".to_string()],
             ..Default::default()
         };
-        store.add_table_policy("hr", "employees", table_policy).await;
+        store
+            .add_table_policy("hr", "employees", table_policy)
+            .await;
 
         let user = SessionUser {
             username: "dave".to_string(),

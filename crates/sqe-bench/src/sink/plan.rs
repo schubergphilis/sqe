@@ -146,7 +146,11 @@ impl RunPlan {
         let total_bytes = self.bytes_per_day * p.days as u64;
         let files_per_day = self.bytes_per_day / self.spec.target_file_size.max(1) as u64;
         println!("Run plan");
-        println!("  days:              {} (from {})", p.days, super::iceberg::format_day(p.start_day));
+        println!(
+            "  days:              {} (from {})",
+            p.days,
+            super::iceberg::format_day(p.start_day)
+        );
         println!("  customers:         {}", p.customers);
         println!("  accounts:          {}", p.accounts());
         println!(
@@ -164,7 +168,11 @@ impl RunPlan {
             "  account_balance:   {} rows/day (end-of-day snapshot per account)",
             p.accounts()
         );
-        println!("  total:             ~{} across {} days", human_bytes(total_bytes), p.days);
+        println!(
+            "  total:             ~{} across {} days",
+            human_bytes(total_bytes),
+            p.days
+        );
         let gen_rate = self.calibration.thread_bytes_per_sec * threads as f64;
         println!(
             "  projected:         ~{:.1} h generation at {}/s ({} workers, pilot rate)",
@@ -201,7 +209,10 @@ mod tests {
         assert_eq!(parse_size("128M").unwrap(), 128 << 20);
         assert_eq!(parse_size("64k").unwrap(), 64 << 10);
         assert_eq!(parse_size("12345").unwrap(), 12345);
-        assert_eq!(parse_size("1.5g").unwrap(), (1.5 * (1u64 << 30) as f64) as u64);
+        assert_eq!(
+            parse_size("1.5g").unwrap(),
+            (1.5 * (1u64 << 30) as f64) as u64
+        );
         assert!(parse_size("abc").is_err());
         assert!(parse_size("-4t").is_err());
     }

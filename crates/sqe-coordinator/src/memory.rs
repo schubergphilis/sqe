@@ -277,10 +277,7 @@ mod tests {
 
     #[test]
     fn test_pressure_green_below_70() {
-        assert_eq!(
-            MemoryPressure::from_usage(690, 1000),
-            MemoryPressure::Green
-        );
+        assert_eq!(MemoryPressure::from_usage(690, 1000), MemoryPressure::Green);
     }
 
     #[test]
@@ -317,27 +314,18 @@ mod tests {
 
     #[test]
     fn test_pressure_red_at_95() {
-        assert_eq!(
-            MemoryPressure::from_usage(950, 1000),
-            MemoryPressure::Red
-        );
+        assert_eq!(MemoryPressure::from_usage(950, 1000), MemoryPressure::Red);
     }
 
     #[test]
     fn test_pressure_red_at_100() {
-        assert_eq!(
-            MemoryPressure::from_usage(1000, 1000),
-            MemoryPressure::Red
-        );
+        assert_eq!(MemoryPressure::from_usage(1000, 1000), MemoryPressure::Red);
     }
 
     #[test]
     fn test_pressure_red_over_limit() {
         // Can happen briefly before spill kicks in
-        assert_eq!(
-            MemoryPressure::from_usage(1100, 1000),
-            MemoryPressure::Red
-        );
+        assert_eq!(MemoryPressure::from_usage(1100, 1000), MemoryPressure::Red);
     }
 
     #[test]
@@ -373,7 +361,7 @@ mod tests {
         use datafusion::execution::memory_pool::FairSpillPool;
 
         let pool: Arc<dyn MemoryPool> = Arc::new(FairSpillPool::new(1024 * 1024)); // 1MB
-        // Fresh pool should have zero usage
+                                                                                   // Fresh pool should have zero usage
         let pressure = check_pressure(&pool);
         assert_eq!(pressure, MemoryPressure::Green);
     }
@@ -438,7 +426,7 @@ mod tests {
 
     #[test]
     fn observe_query_end_handles_residue_and_empty_pools() {
-        use datafusion::execution::memory_pool::{MemoryConsumer, GreedyMemoryPool};
+        use datafusion::execution::memory_pool::{GreedyMemoryPool, MemoryConsumer};
         let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1 << 30));
         // Empty pool: must not panic.
         observe_query_end(&pool, &"q-empty");

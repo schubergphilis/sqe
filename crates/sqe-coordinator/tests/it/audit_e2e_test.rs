@@ -25,7 +25,9 @@ use arrow_flight::FlightDescriptor;
 use serde_json::Value;
 use sqe_auth::{AnonymousProvider, AnonymousProviderConfig};
 use sqe_coordinator::flight_sql::SqeFlightSqlService;
-use sqe_coordinator::{query_tracker::QueryTracker, QueryHandler, RuntimeCatalogRegistry, SessionManager};
+use sqe_coordinator::{
+    query_tracker::QueryTracker, QueryHandler, RuntimeCatalogRegistry, SessionManager,
+};
 use sqe_core::{SecretStore, Session, SqeConfig};
 use sqe_metrics::audit::AuditLogger;
 use sqe_policy::PassthroughEnforcer;
@@ -78,9 +80,7 @@ impl AuditFixture {
 fn make_fixture() -> AuditFixture {
     let dir = tempfile::tempdir().expect("tempdir");
     let log_path = dir.path().join("audit.jsonl");
-    let audit = Arc::new(
-        AuditLogger::new(log_path.to_str().unwrap()).expect("audit logger opens"),
-    );
+    let audit = Arc::new(AuditLogger::new(log_path.to_str().unwrap()).expect("audit logger opens"));
     let config = minimal_config();
     let tracker = Arc::new(QueryTracker::new(&config.query_history));
     let handler = QueryHandler::new(
@@ -113,12 +113,8 @@ fn make_fixture() -> AuditFixture {
 fn make_fixture_with_url(catalog_url: &str) -> AuditFixture {
     let dir = tempfile::tempdir().expect("tempdir");
     let log_path = dir.path().join("audit.jsonl");
-    let audit = Arc::new(
-        AuditLogger::new(log_path.to_str().unwrap()).expect("audit logger opens"),
-    );
-    let toml = format!(
-        "[coordinator]\n\n[auth]\n\n[catalog]\ncatalog_url = \"{catalog_url}\"\n"
-    );
+    let audit = Arc::new(AuditLogger::new(log_path.to_str().unwrap()).expect("audit logger opens"));
+    let toml = format!("[coordinator]\n\n[auth]\n\n[catalog]\ncatalog_url = \"{catalog_url}\"\n");
     let config: SqeConfig = toml::from_str(&toml).expect("catalog-url config");
     let tracker = Arc::new(QueryTracker::new(&config.query_history));
     let handler = QueryHandler::new(
@@ -162,7 +158,9 @@ async fn audit_logs_create_secret_with_redacted_token() {
     fx.handler
         .execute(
             &session,
-            "CREATE SECRET my_audit_tok (TYPE bearer, TOKEN 'super_secret_value_xyz')", None)
+            "CREATE SECRET my_audit_tok (TYPE bearer, TOKEN 'super_secret_value_xyz')",
+            None,
+        )
         .await
         .expect("create secret");
 
@@ -178,7 +176,10 @@ async fn audit_logs_create_secret_with_redacted_token() {
         "raw bearer must not appear in audit line: {query_text}"
     );
     assert!(
-        entry["query_hash"].as_str().map(|h| !h.is_empty()).unwrap_or(false),
+        entry["query_hash"]
+            .as_str()
+            .map(|h| !h.is_empty())
+            .unwrap_or(false),
         "query_hash must be present"
     );
 }
@@ -189,7 +190,11 @@ async fn audit_logs_show_and_drop_secret_each_emit_one_line() {
     let session = admin_session();
 
     fx.handler
-        .execute(&session, "CREATE SECRET tmp_tok (TYPE bearer, TOKEN 'x')", None)
+        .execute(
+            &session,
+            "CREATE SECRET tmp_tok (TYPE bearer, TOKEN 'x')",
+            None,
+        )
         .await
         .expect("create");
     fx.handler
@@ -233,7 +238,9 @@ async fn audit_logs_attach_and_detach_against_mock_rest() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/v1/config"))
-        .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"overrides":{},"defaults":{}}"#))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(r#"{"overrides":{},"defaults":{}}"#),
+        )
         .mount(&server)
         .await;
     Mock::given(method("GET"))
@@ -246,10 +253,11 @@ async fn audit_logs_attach_and_detach_against_mock_rest() {
     let session = admin_session();
     let url = server.uri();
 
-    let attach_sql = format!(
-        "ATTACH '{url}' AS audit_cat (TYPE iceberg_rest, WAREHOUSE 'wh')"
-    );
-    fx.handler.execute(&session, &attach_sql, None).await.expect("attach");
+    let attach_sql = format!("ATTACH '{url}' AS audit_cat (TYPE iceberg_rest, WAREHOUSE 'wh')");
+    fx.handler
+        .execute(&session, &attach_sql, None)
+        .await
+        .expect("attach");
     fx.handler
         .execute(&session, "DETACH audit_cat", None)
         .await
@@ -293,17 +301,13 @@ async fn audit_select_query_emits_canonical_event_and_redacts_pii() {
     Mock::given(method("GET"))
         .and(path("/v1/config"))
         .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_string(r#"{"overrides":{},"defaults":{}}"#),
+            ResponseTemplate::new(200).set_body_string(r#"{"overrides":{},"defaults":{}}"#),
         )
         .mount(&server)
         .await;
     Mock::given(method("GET"))
         .and(path("/v1/namespaces"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_string(r#"{"namespaces":[]}"#),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"namespaces":[]}"#))
         .mount(&server)
         .await;
 
@@ -379,7 +383,11 @@ async fn audit_logs_denied_admin_call_as_error() {
 
     let _ = fx
         .handler
-        .execute(&session, "CREATE SECRET nope (TYPE bearer, TOKEN 'x')", None)
+        .execute(
+            &session,
+            "CREATE SECRET nope (TYPE bearer, TOKEN 'x')",
+            None,
+        )
         .await
         .expect_err("non-admin must be denied");
 
@@ -422,11 +430,7 @@ async fn audit_emits_auth_failure_event_for_invalid_session_token() {
     // Construct the service using the fixture's QueryHandler. The handler was
     // built with a tempfile-backed AuditLogger, so `query_handler.audit()`
     // returns Some(...). SqeFlightSqlService::new clones it via audit().
-    let service = SqeFlightSqlService::new(
-        session_manager,
-        Arc::new(fx.handler),
-        minimal_config(),
-    );
+    let service = SqeFlightSqlService::new(session_manager, Arc::new(fx.handler), minimal_config());
 
     // Craft a request with an invalid Bearer token (no dots, so NOT treated
     // as a JWT; not in the session map; triggers the INVALID_SESSION branch).
@@ -522,11 +526,7 @@ async fn audit_jwt_path_emits_auth_not_session() {
     let provider = Arc::new(AnonymousProvider::new(AnonymousProviderConfig::default()));
     let session_manager = Arc::new(SessionManager::with_provider(provider));
 
-    let service = SqeFlightSqlService::new(
-        session_manager,
-        Arc::new(fx.handler),
-        minimal_config(),
-    );
+    let service = SqeFlightSqlService::new(session_manager, Arc::new(fx.handler), minimal_config());
 
     // A dotted token (three segments) is treated as a JWT; AnonymousProvider
     // accepts it and returns an anonymous identity.
@@ -586,8 +586,7 @@ async fn audit_logger_round_trips_session_event() {
     let dir = tempfile::tempdir().expect("tempdir");
     let log_path = dir.path().join("audit.jsonl");
     let audit = Arc::new(
-        sqe_metrics::audit::AuditLogger::new(log_path.to_str().unwrap())
-            .expect("audit logger"),
+        sqe_metrics::audit::AuditLogger::new(log_path.to_str().unwrap()).expect("audit logger"),
     );
 
     // Emit a session event directly using the same actor and session_id
@@ -673,11 +672,7 @@ impl GrantBackend for RecordingGrantBackend {
         Ok(vec![])
     }
 
-    async fn show_effective(
-        &self,
-        _token: &str,
-        _user: &str,
-    ) -> sqe_core::Result<Vec<GrantEntry>> {
+    async fn show_effective(&self, _token: &str, _user: &str) -> sqe_core::Result<Vec<GrantEntry>> {
         Ok(vec![])
     }
 
@@ -686,7 +681,10 @@ impl GrantBackend for RecordingGrantBackend {
         _token: &str,
         _check: &AccessCheck,
     ) -> sqe_core::Result<AccessCheckResult> {
-        Ok(AccessCheckResult { allowed: true, reason: None })
+        Ok(AccessCheckResult {
+            allowed: true,
+            reason: None,
+        })
     }
 
     fn backend_name(&self) -> &str {
@@ -697,9 +695,7 @@ impl GrantBackend for RecordingGrantBackend {
 fn make_fixture_with_grant_backend() -> AuditFixture {
     let dir = tempfile::tempdir().expect("tempdir");
     let log_path = dir.path().join("audit.jsonl");
-    let audit = Arc::new(
-        AuditLogger::new(log_path.to_str().unwrap()).expect("audit logger opens"),
-    );
+    let audit = Arc::new(AuditLogger::new(log_path.to_str().unwrap()).expect("audit logger opens"));
     let config = minimal_config();
     let tracker = Arc::new(QueryTracker::new(&config.query_history));
     let backend = Arc::new(RecordingGrantBackend);
@@ -742,7 +738,11 @@ async fn audit_emits_grant_event_with_resource_and_grantee() {
     let session = admin_session();
 
     fx.handler
-        .execute(&session, "GRANT SELECT ON sales.orders TO ROLE analyst", None)
+        .execute(
+            &session,
+            "GRANT SELECT ON sales.orders TO ROLE analyst",
+            None,
+        )
         .await
         .expect("grant must succeed for admin");
 
@@ -773,8 +773,14 @@ async fn audit_emits_grant_event_with_resource_and_grantee() {
     );
 
     // resources[0].name must be the table name.
-    let resources = entry["resources"].as_array().expect("resources must be array");
-    assert_eq!(resources.len(), 1, "one resource for the granted table; got: {entry}");
+    let resources = entry["resources"]
+        .as_array()
+        .expect("resources must be array");
+    assert_eq!(
+        resources.len(),
+        1,
+        "one resource for the granted table; got: {entry}"
+    );
     assert_eq!(
         resources[0]["name"].as_str(),
         Some("orders"),
@@ -804,7 +810,11 @@ async fn audit_emits_grant_event_for_revoke() {
     let session = admin_session();
 
     fx.handler
-        .execute(&session, "REVOKE SELECT ON sales.orders FROM ROLE analyst", None)
+        .execute(
+            &session,
+            "REVOKE SELECT ON sales.orders FROM ROLE analyst",
+            None,
+        )
         .await
         .expect("revoke must succeed for admin");
 
@@ -846,8 +856,8 @@ async fn streaming_select_emits_canonical_query_event() {
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use datafusion::prelude::SessionContext;
     use futures::StreamExt;
-    use sqe_coordinator::streaming::{StreamFinalizer, TrackedRecordBatchStream};
     use sqe_coordinator::query_tracker::QueryTracker;
+    use sqe_coordinator::streaming::{StreamFinalizer, TrackedRecordBatchStream};
     use sqe_core::QueryHistoryConfig;
     use sqe_metrics::audit::{Actor, AuditLogger, ObjectType, Resource};
     use std::sync::Arc;
@@ -904,15 +914,20 @@ async fn streaming_select_emits_canonical_query_event() {
     };
 
     let qid = fin.query_id;
-    tracker.start(qid, "auditor", None, "SELECT 1 AS x", "sess-streaming-1", None, vec![]);
+    tracker.start(
+        qid,
+        "auditor",
+        None,
+        "SELECT 1 AS x",
+        "sess-streaming-1",
+        None,
+        vec![],
+        None,
+    );
 
     // Drive the success path: create a single-batch stream and drain it.
     let arr = Int64Array::from_iter_values(0..5);
-    let batch = RecordBatch::try_new(
-        Arc::clone(&schema),
-        vec![Arc::new(arr)],
-    )
-    .unwrap();
+    let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(arr)]).unwrap();
     let s = futures::stream::iter(vec![Ok(batch)]);
     let inner: datafusion::physical_plan::SendableRecordBatchStream =
         Box::pin(RecordBatchStreamAdapter::new(Arc::clone(&schema), s));
@@ -924,14 +939,23 @@ async fn streaming_select_emits_canonical_query_event() {
     audit.flush();
 
     let content = std::fs::read_to_string(&path).unwrap();
-    assert!(!content.is_empty(), "audit file must have content after flush");
-    let line = content.lines().next().expect("at least one line in audit file");
+    assert!(
+        !content.is_empty(),
+        "audit file must have content after flush"
+    );
+    let line = content
+        .lines()
+        .next()
+        .expect("at least one line in audit file");
     let v: serde_json::Value = serde_json::from_str(line).unwrap();
 
     // 1. canonical AuditEvent discriminant
     assert_eq!(v["kind"], "query", "expected kind=query, got: {v}");
     // 2. Actor field populated from session
-    assert_eq!(v["actor"]["username"], "auditor", "expected actor.username=auditor, got: {v}");
+    assert_eq!(
+        v["actor"]["username"], "auditor",
+        "expected actor.username=auditor, got: {v}"
+    );
     // 3. non-empty resources array (we set one resource above)
     assert!(
         v["resources"].is_array(),
@@ -1036,7 +1060,9 @@ async fn create_secret_stays_redacted_legacy_after_ddl_migration() {
     fx.handler
         .execute(
             &session,
-            "CREATE SECRET task3_guard (TYPE bearer, TOKEN 'task3_secret_material_xyz')", None)
+            "CREATE SECRET task3_guard (TYPE bearer, TOKEN 'task3_secret_material_xyz')",
+            None,
+        )
         .await
         .expect("create secret must succeed");
 
@@ -1082,17 +1108,13 @@ async fn execute_threads_client_ip_into_query_audit_event() {
     Mock::given(method("GET"))
         .and(path("/v1/config"))
         .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_string(r#"{"overrides":{},"defaults":{}}"#),
+            ResponseTemplate::new(200).set_body_string(r#"{"overrides":{},"defaults":{}}"#),
         )
         .mount(&server)
         .await;
     Mock::given(method("GET"))
         .and(path("/v1/namespaces"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_string(r#"{"namespaces":[]}"#),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"namespaces":[]}"#))
         .mount(&server)
         .await;
 
@@ -1162,8 +1184,12 @@ async fn grant_audit_event_carries_client_ip() {
         .filter(|e| e["kind"].as_str() == Some("grant"))
         .collect();
 
-    assert_eq!(grant_events.len(), 1, "exactly one grant event; got lines:\n{}",
-        serde_json::to_string_pretty(&serde_json::Value::Array(lines.clone())).unwrap_or_default());
+    assert_eq!(
+        grant_events.len(),
+        1,
+        "exactly one grant event; got lines:\n{}",
+        serde_json::to_string_pretty(&serde_json::Value::Array(lines.clone())).unwrap_or_default()
+    );
 
     let entry = grant_events[0];
     assert_eq!(

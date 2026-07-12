@@ -48,9 +48,7 @@ pub fn rewrite_ctas_compat(sql: &str) -> String {
         return sql.to_string();
     }
     match rewrite_ctas(sql) {
-        Some(candidate)
-            if candidate != sql && Parser::parse_sql(&dialect, &candidate).is_ok() =>
-        {
+        Some(candidate) if candidate != sql && Parser::parse_sql(&dialect, &candidate).is_ok() => {
             candidate
         }
         _ => sql.to_string(),
@@ -337,34 +335,59 @@ mod tests {
         let out = rewrite_ctas_compat("CREATE TABLE iceberg.default.t AS SELECT 1 a WITH DATA");
         assert!(parses(&out), "rewrite must parse: {out}");
         assert!(out.contains("SELECT 1 a"), "query preserved: {out}");
-        assert!(!out.to_ascii_uppercase().contains("WITH DATA"), "suffix gone: {out}");
+        assert!(
+            !out.to_ascii_uppercase().contains("WITH DATA"),
+            "suffix gone: {out}"
+        );
     }
 
     #[test]
     fn with_no_data_becomes_empty_via_limit_zero() {
         let out = rewrite_ctas_compat("CREATE TABLE t AS SELECT 1 a WITH NO DATA");
         assert!(parses(&out), "rewrite must parse: {out}");
-        assert!(out.to_ascii_uppercase().contains("LIMIT 0"), "empties result: {out}");
-        assert!(!out.to_ascii_uppercase().contains("NO DATA"), "suffix gone: {out}");
+        assert!(
+            out.to_ascii_uppercase().contains("LIMIT 0"),
+            "empties result: {out}"
+        );
+        assert!(
+            !out.to_ascii_uppercase().contains("NO DATA"),
+            "suffix gone: {out}"
+        );
     }
 
     #[test]
     fn column_alias_list_becomes_derived_table_aliases() {
-        let out =
-            rewrite_ctas_compat("CREATE TABLE iceberg.default.t (id, part_col) AS VALUES (0, 'a'), (1, 'b')");
+        let out = rewrite_ctas_compat(
+            "CREATE TABLE iceberg.default.t (id, part_col) AS VALUES (0, 'a'), (1, 'b')",
+        );
         assert!(parses(&out), "rewrite must parse: {out}");
-        assert!(out.contains(&format!("{CTA_ALIAS}(id, part_col)")), "aliases applied: {out}");
-        assert!(out.contains("VALUES (0, 'a'), (1, 'b')"), "query preserved: {out}");
+        assert!(
+            out.contains(&format!("{CTA_ALIAS}(id, part_col)")),
+            "aliases applied: {out}"
+        );
+        assert!(
+            out.contains("VALUES (0, 'a'), (1, 'b')"),
+            "query preserved: {out}"
+        );
         // The typed-coldef interpretation (which demanded a type) is gone.
-        assert!(!out.contains("(id, part_col) AS"), "alias list moved off the name: {out}");
+        assert!(
+            !out.contains("(id, part_col) AS"),
+            "alias list moved off the name: {out}"
+        );
     }
 
     #[test]
     fn alias_list_and_with_no_data_combine() {
         let out = rewrite_ctas_compat("CREATE TABLE t (a, b) AS VALUES (1, 2) WITH NO DATA");
         assert!(parses(&out), "rewrite must parse: {out}");
-        assert!(out.contains(&format!("{CTA_ALIAS}(a, b)")), "aliases applied: {out}");
-        assert!(out.to_ascii_uppercase().contains("LIMIT 0"), "empties result: {out}");
+        assert!(
+            out.contains(&format!("{CTA_ALIAS}(a, b)")),
+            "aliases applied: {out}"
+        );
+        assert!(
+            out.to_ascii_uppercase().contains("LIMIT 0"),
+            "empties result: {out}"
+        );
     }
 
     #[test]
@@ -380,8 +403,14 @@ mod tests {
             "AS TABLE expanded to SELECT *: {out}"
         );
         // The WITH (format=...) table option is preserved on the header.
-        assert!(out.contains("WITH (format='PARQUET')"), "table options kept: {out}");
-        assert!(!out.to_ascii_uppercase().contains("AS TABLE"), "AS TABLE form gone: {out}");
+        assert!(
+            out.contains("WITH (format='PARQUET')"),
+            "table options kept: {out}"
+        );
+        assert!(
+            !out.to_ascii_uppercase().contains("AS TABLE"),
+            "AS TABLE form gone: {out}"
+        );
     }
 
     #[test]
@@ -389,8 +418,14 @@ mod tests {
         // `AS TABLE <src> WITH NO DATA` -> empty copy of the source schema.
         let out = rewrite_ctas_compat("CREATE TABLE t AS TABLE tpch.tiny.nation WITH NO DATA");
         assert!(parses(&out), "rewrite must parse: {out}");
-        assert!(out.contains("SELECT * FROM tpch.tiny.nation"), "source expanded: {out}");
-        assert!(out.to_ascii_uppercase().contains("LIMIT 0"), "empties result: {out}");
+        assert!(
+            out.contains("SELECT * FROM tpch.tiny.nation"),
+            "source expanded: {out}"
+        );
+        assert!(
+            out.to_ascii_uppercase().contains("LIMIT 0"),
+            "empties result: {out}"
+        );
     }
 
     #[test]
@@ -410,16 +445,28 @@ mod tests {
         let out = rewrite_ctas_compat("CREATE TABLE t (a int) AS SELECT 1 WITH DATA");
         assert!(parses(&out), "rewrite must parse: {out}");
         assert!(out.contains("(a int)"), "typed coldef preserved: {out}");
-        assert!(!out.to_ascii_uppercase().contains("WITH DATA"), "suffix gone: {out}");
-        assert!(!out.contains(CTA_ALIAS), "must not alias-wrap a typed list: {out}");
+        assert!(
+            !out.to_ascii_uppercase().contains("WITH DATA"),
+            "suffix gone: {out}"
+        );
+        assert!(
+            !out.contains(CTA_ALIAS),
+            "must not alias-wrap a typed list: {out}"
+        );
     }
 
     #[test]
     fn quoted_name_with_alias_list() {
         let out = rewrite_ctas_compat(r#"CREATE TABLE "cat"."sch"."t" (x, y) AS SELECT 1, 2"#);
         assert!(parses(&out), "rewrite must parse: {out}");
-        assert!(out.contains(r#""cat"."sch"."t""#), "quoted name preserved: {out}");
-        assert!(out.contains(&format!("{CTA_ALIAS}(x, y)")), "aliases applied: {out}");
+        assert!(
+            out.contains(r#""cat"."sch"."t""#),
+            "quoted name preserved: {out}"
+        );
+        assert!(
+            out.contains(&format!("{CTA_ALIAS}(x, y)")),
+            "aliases applied: {out}"
+        );
     }
 
     #[test]
@@ -449,11 +496,15 @@ mod tests {
 
     #[test]
     fn or_replace_and_if_not_exists_modifiers_preserved() {
-        let out = rewrite_ctas_compat(
-            "CREATE OR REPLACE TABLE t (a, b) AS SELECT 1, 2 WITH DATA",
-        );
+        let out = rewrite_ctas_compat("CREATE OR REPLACE TABLE t (a, b) AS SELECT 1, 2 WITH DATA");
         assert!(parses(&out), "rewrite must parse: {out}");
-        assert!(out.to_ascii_uppercase().contains("OR REPLACE"), "modifier kept: {out}");
-        assert!(out.contains(&format!("{CTA_ALIAS}(a, b)")), "aliases applied: {out}");
+        assert!(
+            out.to_ascii_uppercase().contains("OR REPLACE"),
+            "modifier kept: {out}"
+        );
+        assert!(
+            out.contains(&format!("{CTA_ALIAS}(a, b)")),
+            "aliases applied: {out}"
+        );
     }
 }

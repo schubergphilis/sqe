@@ -2,9 +2,9 @@
 
 use std::sync::Arc;
 
-use axum::{Router, routing::get, extract::State, response::IntoResponse};
+use axum::{extract::State, response::IntoResponse, routing::get, Router};
 use prometheus::Encoder;
-use tracing::{info, error};
+use tracing::{error, info};
 
 use crate::HasRegistry;
 
@@ -39,9 +39,7 @@ pub fn start_metrics_server<R: HasRegistry + Clone>(
     })
 }
 
-async fn metrics_handler<R: HasRegistry>(
-    State(metrics): State<Arc<R>>,
-) -> impl IntoResponse {
+async fn metrics_handler<R: HasRegistry>(State(metrics): State<Arc<R>>) -> impl IntoResponse {
     let encoder = prometheus::TextEncoder::new();
     let metric_families = metrics.prometheus_registry().gather();
     let mut buffer = Vec::new();
@@ -49,14 +47,20 @@ async fn metrics_handler<R: HasRegistry>(
         error!(error = %e, "Failed to encode Prometheus metrics");
         return (
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            [(axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+            [(
+                axum::http::header::CONTENT_TYPE,
+                "text/plain; charset=utf-8",
+            )],
             format!("Failed to encode metrics: {e}").into_bytes(),
         );
     }
 
     (
         axum::http::StatusCode::OK,
-        [(axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; charset=utf-8",
+        )],
         buffer,
     )
 }
@@ -69,9 +73,15 @@ mod tests {
     #[tokio::test]
     async fn test_metrics_handler_returns_text() {
         let metrics = Arc::new(MetricsRegistry::new().unwrap());
-        metrics.query_count.with_label_values(&["success", "query", ""]).inc();
+        metrics
+            .query_count
+            .with_label_values(&["success", "query", ""])
+            .inc();
         // Observe a duration sample so the histogram family appears in gather()
-        metrics.query_duration.with_label_values(&["query"]).observe(0.1);
+        metrics
+            .query_duration
+            .with_label_values(&["query"])
+            .observe(0.1);
 
         let encoder = prometheus::TextEncoder::new();
         let metric_families = metrics.prometheus_registry().gather();

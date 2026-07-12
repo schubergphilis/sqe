@@ -37,9 +37,9 @@ pub fn build_policy_enforcer(
 
     let store: Option<Arc<dyn PolicyStore>> = match config.engine {
         PolicyEngine::Passthrough => None,
-        PolicyEngine::InMemory => {
-            Some(Arc::new(sqe_policy::policy_store::InMemoryPolicyStore::new()))
-        }
+        PolicyEngine::InMemory => Some(Arc::new(
+            sqe_policy::policy_store::InMemoryPolicyStore::new(),
+        )),
         PolicyEngine::Opa => {
             anyhow::bail!(
                 "policy.engine = opa selected but OPA wiring is not part of this change; \
@@ -90,9 +90,8 @@ pub fn build_policy_enforcer(
             // `NoopTagSource` (already the default; this block is explicit for
             // clarity).
             if let Some(cache) = table_cache {
-                let tag_src = Arc::new(crate::tag_source_impl::CacheTagSource::new(
-                    Arc::new(cache),
-                ));
+                let tag_src =
+                    Arc::new(crate::tag_source_impl::CacheTagSource::new(Arc::new(cache)));
                 rewriter = rewriter.with_tag_source(tag_src);
             }
             // else: NoopTagSource stays (set in PolicyPlanRewriter::new).
@@ -162,8 +161,7 @@ mod tests {
         };
         config.ranger.url = "http://ranger.example:6080".to_string();
         let metrics = std::sync::Arc::new(sqe_metrics::MetricsRegistry::new().unwrap());
-        let (_enforcer, store) =
-            build_policy_enforcer(&config, None, Some(metrics)).unwrap();
+        let (_enforcer, store) = build_policy_enforcer(&config, None, Some(metrics)).unwrap();
         assert!(store.is_some());
     }
 }

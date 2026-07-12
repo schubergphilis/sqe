@@ -239,10 +239,13 @@ fn build_position_delete_batch(input: Vec<PositionDeleteInput>) -> Result<Record
         offset_column_builder.append_value(pd_input.pos);
     }
 
-    RecordBatch::try_new(Arc::clone(&POSITION_DELETE_ARROW_SCHEMA), vec![
-        Arc::new(path_column_builder.finish()),
-        Arc::new(offset_column_builder.finish()),
-    ])
+    RecordBatch::try_new(
+        Arc::clone(&POSITION_DELETE_ARROW_SCHEMA),
+        vec![
+            Arc::new(path_column_builder.finish()),
+            Arc::new(offset_column_builder.finish()),
+        ],
+    )
     .map_err(|e| Error::new(ErrorKind::DataInvalid, e.to_string()))
 }
 

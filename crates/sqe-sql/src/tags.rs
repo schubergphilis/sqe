@@ -402,7 +402,10 @@ mod tests {
         let err = try_parse_set_tags("ALTER TABLE t SET TAGS (email = ('PII'")
             .expect_err("unbalanced parens must error");
         let msg = err.to_string();
-        assert!(msg.contains("email"), "error must name the column, got: {msg}");
+        assert!(
+            msg.contains("email"),
+            "error must name the column, got: {msg}"
+        );
     }
 
     #[test]

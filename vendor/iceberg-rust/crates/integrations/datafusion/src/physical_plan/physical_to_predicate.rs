@@ -38,10 +38,10 @@
 use std::sync::Arc;
 
 use datafusion::arrow::datatypes::DataType;
+use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_expr::expressions::{
     BinaryExpr, CaseExpr, Column, DynamicFilterPhysicalExpr, InListExpr, Literal,
 };
-use datafusion::physical_expr::PhysicalExpr;
 use datafusion::scalar::ScalarValue;
 use iceberg::expr::{DynamicPredicate, Predicate, Reference};
 use iceberg::spec::Datum;

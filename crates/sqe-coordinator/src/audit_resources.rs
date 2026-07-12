@@ -40,19 +40,14 @@ use std::collections::BTreeSet;
 /// - `TableScan` whose provider is still a `ViewTable` -> `ObjectType::View`
 ///   (rare after DF54 view inlining; see module doc)
 /// - Everything else -> `ObjectType::Table`
-pub fn resources_from_plan(
-    plan: &LogicalPlan,
-    default_catalog: Option<&str>,
-) -> Vec<Resource> {
+pub fn resources_from_plan(plan: &LogicalPlan, default_catalog: Option<&str>) -> Vec<Resource> {
     let mut seen: BTreeSet<String> = BTreeSet::new();
     let mut resources: Vec<Resource> = Vec::new();
 
     let _ = plan.apply(|node| {
         let maybe = match node {
             LogicalPlan::TableScan(TableScan {
-                table_name,
-                source,
-                ..
+                table_name, source, ..
             }) => {
                 // Check whether this scan's provider is an un-inlined ViewTable.
                 // After DF54 this is rare; governed views are inlined to their

@@ -11,8 +11,8 @@ use datafusion::common::config::ConfigOptions;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::logical_expr::Expr;
-use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_expr::expressions::DynamicFilterPhysicalExpr;
+use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_optimizer::pruning::PruningPredicate;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::filter_pushdown::{
@@ -23,15 +23,16 @@ use datafusion::physical_plan::metrics::{
     BaselineMetrics, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet,
 };
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PhysicalExpr,
-    PlanProperties,
+    DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PhysicalExpr, PlanProperties,
 };
 use datafusion_expr::ColumnarValue;
 use futures::{Stream, StreamExt, TryStreamExt};
 use iceberg::arrow::DecodeGate;
 use iceberg::expr::Predicate;
 use iceberg::scan::{FileScanTask, FileScanTaskStream};
-use iceberg::spec::{DataContentType, DataFile, DataFileFormat, ManifestContentType, ManifestStatus};
+use iceberg::spec::{
+    DataContentType, DataFile, DataFileFormat, ManifestContentType, ManifestStatus,
+};
 use iceberg::table::Table;
 use parquet::arrow::arrow_reader::{
     ArrowPredicate, ArrowReaderOptions, ParquetRecordBatchReaderBuilder, RowFilter,
@@ -194,15 +195,38 @@ pub struct IcebergScanExec {
 }
 
 impl IcebergScanExec {
-    pub fn new(table: Table, projected_schema: SchemaRef, projection: Option<Vec<String>>, predicates: Option<Predicate>) -> Self {
+    pub fn new(
+        table: Table,
+        projected_schema: SchemaRef,
+        projection: Option<Vec<String>>,
+        predicates: Option<Predicate>,
+    ) -> Self {
         Self::new_with_filters(table, projected_schema, projection, predicates, vec![])
     }
 
-    pub fn new_with_filters(table: Table, projected_schema: SchemaRef, projection: Option<Vec<String>>, predicates: Option<Predicate>, df_filters: Vec<Expr>) -> Self {
-        Self::new_with_filters_and_metrics(table, projected_schema, projection, predicates, df_filters)
+    pub fn new_with_filters(
+        table: Table,
+        projected_schema: SchemaRef,
+        projection: Option<Vec<String>>,
+        predicates: Option<Predicate>,
+        df_filters: Vec<Expr>,
+    ) -> Self {
+        Self::new_with_filters_and_metrics(
+            table,
+            projected_schema,
+            projection,
+            predicates,
+            df_filters,
+        )
     }
 
-    pub fn new_with_filters_and_metrics(table: Table, projected_schema: SchemaRef, projection: Option<Vec<String>>, predicates: Option<Predicate>, df_filters: Vec<Expr>) -> Self {
+    pub fn new_with_filters_and_metrics(
+        table: Table,
+        projected_schema: SchemaRef,
+        projection: Option<Vec<String>>,
+        predicates: Option<Predicate>,
+        df_filters: Vec<Expr>,
+    ) -> Self {
         // Sort order from Iceberg metadata.
         //
         // IMPORTANT: Iceberg sort order is a HINT about how files should be
@@ -223,25 +247,36 @@ impl IcebergScanExec {
                 spec.fields()
                     .iter()
                     .filter(|f| f.transform == Transform::Identity)
-                    .filter_map(|f| iceberg_schema.field_by_id(f.source_id).map(|sf| sf.name.clone()))
+                    .filter_map(|f| {
+                        iceberg_schema
+                            .field_by_id(f.source_id)
+                            .map(|sf| sf.name.clone())
+                    })
                     .collect::<std::collections::HashSet<_>>()
             };
 
-            match crate::sort_order::iceberg_sort_to_physical(sort_order, iceberg_schema, &projected_schema) {
+            match crate::sort_order::iceberg_sort_to_physical(
+                sort_order,
+                iceberg_schema,
+                &projected_schema,
+            ) {
                 Some(sort_exprs) => {
                     // Filter sort expressions: only trust partition columns by default.
                     // For TB-scale data, trusting non-partition sort order is dangerous
                     // because writers may not enforce it, causing silent incorrect results.
                     let mut stripped_cols = Vec::new();
-                    let safe_exprs: Vec<_> = sort_exprs.into_iter().filter(|expr| {
-                        let col_name = expr.expr.to_string();
-                        if partition_cols.contains(&col_name) {
-                            true
-                        } else {
-                            stripped_cols.push(col_name);
-                            false
-                        }
-                    }).collect();
+                    let safe_exprs: Vec<_> = sort_exprs
+                        .into_iter()
+                        .filter(|expr| {
+                            let col_name = expr.expr.to_string();
+                            if partition_cols.contains(&col_name) {
+                                true
+                            } else {
+                                stripped_cols.push(col_name);
+                                false
+                            }
+                        })
+                        .collect();
                     if !stripped_cols.is_empty() {
                         debug!(
                             table = %table.identifier(),
@@ -254,17 +289,49 @@ impl IcebergScanExec {
                     if safe_exprs.is_empty() {
                         EquivalenceProperties::new(projected_schema.clone())
                     } else {
-                        crate::sort_order::equivalence_with_sort(projected_schema.clone(), safe_exprs)
+                        crate::sort_order::equivalence_with_sort(
+                            projected_schema.clone(),
+                            safe_exprs,
+                        )
                     }
                 }
                 None => EquivalenceProperties::new(projected_schema.clone()),
             }
         };
-        let properties = Arc::new(PlanProperties::new(eq_props, Partitioning::UnknownPartitioning(DEFAULT_TARGET_PARTITIONS), EmissionType::Incremental, Boundedness::Bounded));
-        let decode_permits = Arc::new(tokio::sync::Semaphore::new(
-            std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8),
+        let properties = Arc::new(PlanProperties::new(
+            eq_props,
+            Partitioning::UnknownPartitioning(DEFAULT_TARGET_PARTITIONS),
+            EmissionType::Incremental,
+            Boundedness::Bounded,
         ));
-        Self { table, projected_schema, projection, predicates, df_filters, properties, metrics: ExecutionPlanMetricsSet::new(), snapshot_id: None, trust_sort_order: false, small_file_threshold_bytes: DEFAULT_SMALL_FILE_THRESHOLD_BYTES, pushed_down_filters: vec![], manifest_concurrency: DEFAULT_MANIFEST_CONCURRENCY, direct_read_concurrency: DEFAULT_DIRECT_READ_CONCURRENCY, target_partitions: DEFAULT_TARGET_PARTITIONS, cached_statistics: None, runtime_filter_clustering_skip: false, runtime_filter_uniform_threshold: 0.8, runtime_filter_wait_ms: DEFAULT_RUNTIME_FILTER_WAIT_MS, runtime_filter_bloom_probe: true, runtime_filter_bloom_max_values: 65536, decode_permits }
+        let decode_permits = Arc::new(tokio::sync::Semaphore::new(
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(8),
+        ));
+        Self {
+            table,
+            projected_schema,
+            projection,
+            predicates,
+            df_filters,
+            properties,
+            metrics: ExecutionPlanMetricsSet::new(),
+            snapshot_id: None,
+            trust_sort_order: false,
+            small_file_threshold_bytes: DEFAULT_SMALL_FILE_THRESHOLD_BYTES,
+            pushed_down_filters: vec![],
+            manifest_concurrency: DEFAULT_MANIFEST_CONCURRENCY,
+            direct_read_concurrency: DEFAULT_DIRECT_READ_CONCURRENCY,
+            target_partitions: DEFAULT_TARGET_PARTITIONS,
+            cached_statistics: None,
+            runtime_filter_clustering_skip: false,
+            runtime_filter_uniform_threshold: 0.8,
+            runtime_filter_wait_ms: DEFAULT_RUNTIME_FILTER_WAIT_MS,
+            runtime_filter_bloom_probe: true,
+            runtime_filter_bloom_max_values: 65536,
+            decode_permits,
+        }
     }
 
     /// Attach pre-computed statistics aggregated from Iceberg manifests.
@@ -356,9 +423,16 @@ impl IcebergScanExec {
             // Rebuild equivalence properties with full sort order
             let sort_order = self.table.metadata().default_sort_order();
             let iceberg_schema = self.table.metadata().current_schema();
-            if let Some(sort_exprs) = crate::sort_order::iceberg_sort_to_physical(sort_order, iceberg_schema, &self.projected_schema) {
+            if let Some(sort_exprs) = crate::sort_order::iceberg_sort_to_physical(
+                sort_order,
+                iceberg_schema,
+                &self.projected_schema,
+            ) {
                 self.properties = Arc::new(PlanProperties::new(
-                    crate::sort_order::equivalence_with_sort(self.projected_schema.clone(), sort_exprs),
+                    crate::sort_order::equivalence_with_sort(
+                        self.projected_schema.clone(),
+                        sort_exprs,
+                    ),
                     Partitioning::UnknownPartitioning(self.target_partitions),
                     EmissionType::Incremental,
                     Boundedness::Bounded,
@@ -402,11 +476,21 @@ impl IcebergScanExec {
         self
     }
 
-    pub fn table(&self) -> &Table { &self.table }
-    pub fn predicates(&self) -> Option<&Predicate> { self.predicates.as_ref() }
-    pub fn df_filters(&self) -> &[Expr] { &self.df_filters }
-    pub fn projection(&self) -> Option<&[String]> { self.projection.as_deref() }
-    pub fn pushed_down_filters(&self) -> &[Arc<dyn PhysicalExpr>] { &self.pushed_down_filters }
+    pub fn table(&self) -> &Table {
+        &self.table
+    }
+    pub fn predicates(&self) -> Option<&Predicate> {
+        self.predicates.as_ref()
+    }
+    pub fn df_filters(&self) -> &[Expr] {
+        &self.df_filters
+    }
+    pub fn projection(&self) -> Option<&[String]> {
+        self.projection.as_deref()
+    }
+    pub fn pushed_down_filters(&self) -> &[Arc<dyn PhysicalExpr>] {
+        &self.pushed_down_filters
+    }
 
     /// Clone this scan with `pushed_down_filters` emptied.
     ///
@@ -465,11 +549,7 @@ impl IcebergScanExec {
         spec.fields()
             .iter()
             .filter(|f| f.transform == Transform::Identity)
-            .filter_map(|f| {
-                schema
-                    .field_by_id(f.source_id)
-                    .map(|sf| sf.name.clone())
-            })
+            .filter_map(|f| schema.field_by_id(f.source_id).map(|sf| sf.name.clone()))
             .collect()
     }
 
@@ -483,26 +563,51 @@ impl IcebergScanExec {
         Ok(result)
     }
 
-    pub async fn data_file_info_with_pruning_stats(&self) -> Result<(Vec<(String, u64)>, usize), iceberg::Error> {
+    pub async fn data_file_info_with_pruning_stats(
+        &self,
+    ) -> Result<(Vec<(String, u64)>, usize), iceberg::Error> {
         let mut sb = self.table.scan();
-        if let Some(sid) = self.snapshot_id { sb = sb.snapshot_id(sid); }
-        if let Some(ref cols) = self.projection { sb = sb.select(cols.iter().map(|s| s.as_str())); }
-        if let Some(ref pred) = self.predicates { sb = sb.with_filter(pred.clone()); }
+        if let Some(sid) = self.snapshot_id {
+            sb = sb.snapshot_id(sid);
+        }
+        if let Some(ref cols) = self.projection {
+            sb = sb.select(cols.iter().map(|s| s.as_str()));
+        }
+        if let Some(ref pred) = self.predicates {
+            sb = sb.with_filter(pred.clone());
+        }
         let scan = sb.build()?;
         let tasks: Vec<_> = scan.plan_files().await?.try_collect().await?;
-        let mut result: Vec<(String, u64)> = tasks.iter().map(|t| (t.data_file_path().to_string(), t.length)).collect();
+        let mut result: Vec<(String, u64)> = tasks
+            .iter()
+            .map(|t| (t.data_file_path().to_string(), t.length))
+            .collect();
         let mut pruned_count = 0usize;
         if !self.df_filters.is_empty() {
             if let Ok(data_files) = self.collect_data_files().await {
-                let planned: std::collections::HashSet<String> = result.iter().map(|(p, _)| p.clone()).collect();
-                let relevant: Vec<DataFile> = data_files.into_iter().filter(|df| planned.contains(df.file_path())).collect();
+                let planned: std::collections::HashSet<String> =
+                    result.iter().map(|(p, _)| p.clone()).collect();
+                let relevant: Vec<DataFile> = data_files
+                    .into_iter()
+                    .filter(|df| planned.contains(df.file_path()))
+                    .collect();
                 if !relevant.is_empty() {
                     let ischema = self.table.metadata().current_schema();
-                    let (kept, pc) = Self::prune_data_files(relevant, &self.df_filters, &self.projected_schema, ischema);
+                    let (kept, pc) = Self::prune_data_files(
+                        relevant,
+                        &self.df_filters,
+                        &self.projected_schema,
+                        ischema,
+                    );
                     pruned_count = pc;
                     if pruned_count > 0 {
-                        debug!(pruned = pruned_count, remaining = kept.len(), "File-level min/max pruning");
-                        let kept_paths: std::collections::HashSet<String> = kept.iter().map(|df| df.file_path().to_string()).collect();
+                        debug!(
+                            pruned = pruned_count,
+                            remaining = kept.len(),
+                            "File-level min/max pruning"
+                        );
+                        let kept_paths: std::collections::HashSet<String> =
+                            kept.iter().map(|df| df.file_path().to_string()).collect();
                         result.retain(|(path, _)| kept_paths.contains(path));
                     }
                 }
@@ -526,26 +631,38 @@ impl IcebergScanExec {
     pub async fn collect_data_files(&self) -> Result<Vec<DataFile>, iceberg::Error> {
         let metadata_ref = self.table.metadata_ref();
         let snapshot = if let Some(sid) = self.snapshot_id {
-            match metadata_ref.snapshot_by_id(sid) { Some(s) => s, None => return Ok(vec![]) }
+            match metadata_ref.snapshot_by_id(sid) {
+                Some(s) => s,
+                None => return Ok(vec![]),
+            }
         } else {
-            match metadata_ref.current_snapshot() { Some(s) => s, None => return Ok(vec![]) }
+            match metadata_ref.current_snapshot() {
+                Some(s) => s,
+                None => return Ok(vec![]),
+            }
         };
         let cache = self.table.object_cache();
         let manifest_list = cache.get_manifest_list(snapshot, &metadata_ref).await?;
         let concurrency = self.manifest_concurrency.max(1);
-        let manifests: Vec<Arc<iceberg::spec::Manifest>> = futures::stream::iter(manifest_list.entries().iter().cloned())
-            .map(|mf| { let cache = cache.clone(); async move { cache.get_manifest(&mf).await } })
-            .buffer_unordered(concurrency)
-            .try_collect()
-            .await?;
+        let manifests: Vec<Arc<iceberg::spec::Manifest>> =
+            futures::stream::iter(manifest_list.entries().iter().cloned())
+                .map(|mf| {
+                    let cache = cache.clone();
+                    async move { cache.get_manifest(&mf).await }
+                })
+                .buffer_unordered(concurrency)
+                .try_collect()
+                .await?;
         let data_files = manifests
             .into_iter()
             .flat_map(|manifest| {
                 manifest
                     .entries()
                     .iter()
-                    .filter(|e| e.status() != ManifestStatus::Deleted
-                        && e.data_file().content_type() == DataContentType::Data)
+                    .filter(|e| {
+                        e.status() != ManifestStatus::Deleted
+                            && e.data_file().content_type() == DataContentType::Data
+                    })
                     .map(|e| e.data_file().clone())
                     .collect::<Vec<_>>()
             })
@@ -553,26 +670,69 @@ impl IcebergScanExec {
         Ok(data_files)
     }
 
-    pub fn prune_data_files(data_files: Vec<DataFile>, df_filters: &[Expr], schema: &SchemaRef, iceberg_schema: &iceberg::spec::Schema) -> (Vec<DataFile>, usize) {
+    pub fn prune_data_files(
+        data_files: Vec<DataFile>,
+        df_filters: &[Expr],
+        schema: &SchemaRef,
+        iceberg_schema: &iceberg::spec::Schema,
+    ) -> (Vec<DataFile>, usize) {
         use datafusion::physical_expr::create_physical_expr;
         use datafusion::prelude::SessionContext;
-        if data_files.is_empty() || df_filters.is_empty() { return (data_files, 0); }
-        let combined = match df_filters.iter().cloned().reduce(|a, b| a.and(b)) { Some(e) => e, None => return (data_files, 0) };
-        let df_schema = match datafusion::common::DFSchema::try_from(schema.as_ref().clone()) { Ok(s) => s, Err(e) => { warn!(error=%e, "DFSchema creation failed"); return (data_files, 0); } };
+        if data_files.is_empty() || df_filters.is_empty() {
+            return (data_files, 0);
+        }
+        let combined = match df_filters.iter().cloned().reduce(|a, b| a.and(b)) {
+            Some(e) => e,
+            None => return (data_files, 0),
+        };
+        let df_schema = match datafusion::common::DFSchema::try_from(schema.as_ref().clone()) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(error=%e, "DFSchema creation failed");
+                return (data_files, 0);
+            }
+        };
         let ctx = SessionContext::new();
         let state = ctx.state();
-        let physical_expr = match create_physical_expr(&combined, &df_schema, state.execution_props()) { Ok(e) => e, Err(e) => { warn!(error=%e, "Physical expr failed"); return (data_files, 0); } };
-        let pruning_pred: PruningPredicate = match PruningPredicate::try_new(physical_expr, schema.clone()) { Ok(p) => p, Err(e) => { warn!(error=%e, "PruningPredicate failed"); return (data_files, 0); } };
-        let stats = IcebergManifestStatistics::new(data_files.clone(), schema.clone(), iceberg_schema);
+        let physical_expr =
+            match create_physical_expr(&combined, &df_schema, state.execution_props()) {
+                Ok(e) => e,
+                Err(e) => {
+                    warn!(error=%e, "Physical expr failed");
+                    return (data_files, 0);
+                }
+            };
+        let pruning_pred: PruningPredicate =
+            match PruningPredicate::try_new(physical_expr, schema.clone()) {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!(error=%e, "PruningPredicate failed");
+                    return (data_files, 0);
+                }
+            };
+        let stats =
+            IcebergManifestStatistics::new(data_files.clone(), schema.clone(), iceberg_schema);
         match pruning_pred.prune(&stats) {
             Ok(flags) => {
                 let total = data_files.len();
-                let kept: Vec<DataFile> = data_files.into_iter().zip(flags).filter_map(|(df, keep)| if keep { Some(df) } else { None }).collect();
+                let kept: Vec<DataFile> = data_files
+                    .into_iter()
+                    .zip(flags)
+                    .filter_map(|(df, keep)| if keep { Some(df) } else { None })
+                    .collect();
                 let pruned = total - kept.len();
-                debug!(total_files = total, kept_files = kept.len(), pruned_files = pruned, "File-level min/max pruning applied");
+                debug!(
+                    total_files = total,
+                    kept_files = kept.len(),
+                    pruned_files = pruned,
+                    "File-level min/max pruning applied"
+                );
                 (kept, pruned)
             }
-            Err(e) => { warn!(error=%e, "PruningPredicate eval failed"); (data_files, 0) }
+            Err(e) => {
+                warn!(error=%e, "PruningPredicate eval failed");
+                (data_files, 0)
+            }
         }
     }
 
@@ -603,13 +763,14 @@ impl IcebergScanExec {
             if current_files.is_empty() {
                 break;
             }
-            let pruning_pred = match PruningPredicate::try_new(Arc::clone(filter_expr), schema.clone()) {
-                Ok(p) => p,
-                Err(e) => {
-                    debug!(error = %e, "PruningPredicate from dynamic filter failed, skipping");
-                    continue;
-                }
-            };
+            let pruning_pred =
+                match PruningPredicate::try_new(Arc::clone(filter_expr), schema.clone()) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        debug!(error = %e, "PruningPredicate from dynamic filter failed, skipping");
+                        continue;
+                    }
+                };
             let stats = IcebergManifestStatistics::new(
                 current_files.clone(),
                 schema.clone(),
@@ -660,12 +821,27 @@ impl DisplayAs for IcebergScanExec {
 }
 
 impl ExecutionPlan for IcebergScanExec {
-    fn name(&self) -> &str { "IcebergScanExec" }
-    fn schema(&self) -> SchemaRef { self.projected_schema.clone() }
-    fn properties(&self) -> &Arc<PlanProperties> { &self.properties }
-    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> { vec![] }
-    fn with_new_children(self: Arc<Self>, _c: Vec<Arc<dyn ExecutionPlan>>) -> DFResult<Arc<dyn ExecutionPlan>> { Ok(self) }
-    fn metrics(&self) -> Option<MetricsSet> { Some(self.metrics.clone_inner()) }
+    fn name(&self) -> &str {
+        "IcebergScanExec"
+    }
+    fn schema(&self) -> SchemaRef {
+        self.projected_schema.clone()
+    }
+    fn properties(&self) -> &Arc<PlanProperties> {
+        &self.properties
+    }
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![]
+    }
+    fn with_new_children(
+        self: Arc<Self>,
+        _c: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        Ok(self)
+    }
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metrics.clone_inner())
+    }
 
     /// Provide table statistics from Iceberg snapshot metadata for cost-based optimization.
     ///
@@ -678,7 +854,10 @@ impl ExecutionPlan for IcebergScanExec {
     /// When `cached_statistics` is populated (via `with_cached_statistics`), the
     /// pre-computed manifest aggregation is returned. Otherwise we fall back to
     /// the snapshot summary's row count and byte size with column stats absent.
-    fn partition_statistics(&self, _partition: Option<usize>) -> DFResult<Arc<datafusion::common::Statistics>> {
+    fn partition_statistics(
+        &self,
+        _partition: Option<usize>,
+    ) -> DFResult<Arc<datafusion::common::Statistics>> {
         use datafusion::common::{stats::Precision, ColumnStatistics, Statistics};
 
         if let Some(cached) = &self.cached_statistics {
@@ -804,7 +983,11 @@ impl ExecutionPlan for IcebergScanExec {
         let mut filter_results: Vec<PushedDown> = Vec::new();
 
         for pf in &child_pushdown_result.parent_filters {
-            if pf.filter.downcast_ref::<DynamicFilterPhysicalExpr>().is_some() {
+            if pf
+                .filter
+                .downcast_ref::<DynamicFilterPhysicalExpr>()
+                .is_some()
+            {
                 // Dynamic filter from hash join — accept it
                 dynamic_filters.push(Arc::clone(&pf.filter));
                 filter_results.push(PushedDown::Yes);
@@ -833,7 +1016,11 @@ impl ExecutionPlan for IcebergScanExec {
         )
     }
 
-    fn execute(&self, partition: usize, context: Arc<TaskContext>) -> DFResult<SendableRecordBatchStream> {
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<TaskContext>,
+    ) -> DFResult<SendableRecordBatchStream> {
         let span = info_span!("iceberg_scan", table=%self.table.identifier(), partition=partition, predicates=?self.predicates);
         let _guard = span.enter();
         if partition >= self.target_partitions {
@@ -868,8 +1055,10 @@ impl ExecutionPlan for IcebergScanExec {
             crate::scan_memory::decode_tracking_enabled(),
         );
         let baseline = BaselineMetrics::new(&self.metrics, partition);
-        let _files_pruned_minmax = MetricBuilder::new(&self.metrics).counter("files_pruned_minmax", partition);
-        let files_pruned_dynamic = MetricBuilder::new(&self.metrics).counter("files_pruned_dynamic", partition);
+        let _files_pruned_minmax =
+            MetricBuilder::new(&self.metrics).counter("files_pruned_minmax", partition);
+        let files_pruned_dynamic =
+            MetricBuilder::new(&self.metrics).counter("files_pruned_dynamic", partition);
         // Scan-level visibility: enough to answer "how much was planned, read,
         // decoded, and dropped by runtime filters" from a profile alone.
         // `rows_decoded` vs `output_rows` gives the post-decode filter kill
@@ -877,18 +1066,25 @@ impl ExecutionPlan for IcebergScanExec {
         // kill rate on the direct path; `rows_passed_filter_pending` counts
         // rows that streamed through while a dynamic filter was still the
         // lit(true) placeholder, i.e. the build side had not sealed yet.
-        let planning_time = MetricBuilder::new(&self.metrics).subset_time("planning_time", partition);
+        let planning_time =
+            MetricBuilder::new(&self.metrics).subset_time("planning_time", partition);
         let files_matched = MetricBuilder::new(&self.metrics).counter("files_matched", partition);
         let bytes_planned = MetricBuilder::new(&self.metrics).counter("bytes_planned", partition);
         let bytes_scanned = MetricBuilder::new(&self.metrics).counter("bytes_scanned", partition);
         let rows_prefilter = MetricBuilder::new(&self.metrics).counter("rows_prefilter", partition);
         let rows_decoded = MetricBuilder::new(&self.metrics).counter("rows_decoded", partition);
-        let rows_filtered_dynamic = MetricBuilder::new(&self.metrics).counter("rows_filtered_dynamic", partition);
-        let rows_passed_filter_pending = MetricBuilder::new(&self.metrics).counter("rows_passed_filter_pending", partition);
-        let dynamic_filters_resolved = MetricBuilder::new(&self.metrics).counter("dynamic_filters_resolved", partition);
-        let dynamic_filters_pending = MetricBuilder::new(&self.metrics).counter("dynamic_filters_pending", partition);
-        let row_groups_pruned_bloom = MetricBuilder::new(&self.metrics).counter("row_groups_pruned_bloom", partition);
-        let filter_wait_time = MetricBuilder::new(&self.metrics).subset_time("filter_wait_time", partition);
+        let rows_filtered_dynamic =
+            MetricBuilder::new(&self.metrics).counter("rows_filtered_dynamic", partition);
+        let rows_passed_filter_pending =
+            MetricBuilder::new(&self.metrics).counter("rows_passed_filter_pending", partition);
+        let dynamic_filters_resolved =
+            MetricBuilder::new(&self.metrics).counter("dynamic_filters_resolved", partition);
+        let dynamic_filters_pending =
+            MetricBuilder::new(&self.metrics).counter("dynamic_filters_pending", partition);
+        let row_groups_pruned_bloom =
+            MetricBuilder::new(&self.metrics).counter("row_groups_pruned_bloom", partition);
+        let filter_wait_time =
+            MetricBuilder::new(&self.metrics).subset_time("filter_wait_time", partition);
         debug!(table=%table.identifier(), predicates=?predicates, snapshot_id=?snapshot_id, pushed_filters=pushed_down_filters.len(), "Executing IcebergScanExec");
 
         // For time-travel: check the specified snapshot exists; for current: check current snapshot.
@@ -899,8 +1095,13 @@ impl ExecutionPlan for IcebergScanExec {
         };
         if !has_snapshot {
             let empty_batch = RecordBatch::new_empty(schema.clone());
-            let stream = futures::stream::once(async move { Ok::<_, DataFusionError>(empty_batch) });
-            return Ok(Box::pin(IcebergRecordBatchStream { schema, inner: Box::pin(stream), baseline }));
+            let stream =
+                futures::stream::once(async move { Ok::<_, DataFusionError>(empty_batch) });
+            return Ok(Box::pin(IcebergRecordBatchStream {
+                schema,
+                inner: Box::pin(stream),
+                baseline,
+            }));
         }
 
         // Type alias to avoid repeating the full BoxStream type in early-returns.
@@ -1617,7 +1818,11 @@ impl ExecutionPlan for IcebergScanExec {
                 .boxed();
             Ok::<BatchStream, DataFusionError>(s)
         })).try_flatten();
-        Ok(Box::pin(IcebergRecordBatchStream { schema, inner: Box::pin(stream), baseline }))
+        Ok(Box::pin(IcebergRecordBatchStream {
+            schema,
+            inner: Box::pin(stream),
+            baseline,
+        }))
     }
 }
 
@@ -1688,10 +1893,7 @@ where
 /// pipeline, so it cannot apply DeleteVectors or equality-delete
 /// predicates. Falling back to `scan.to_arrow()` is the correct choice
 /// any time a delete file exists.
-async fn snapshot_has_delete_files(
-    table: &Table,
-    snapshot_id: Option<i64>,
-) -> DFResult<bool> {
+async fn snapshot_has_delete_files(table: &Table, snapshot_id: Option<i64>) -> DFResult<bool> {
     let metadata_ref = table.metadata_ref();
     let snapshot = match snapshot_id {
         Some(sid) => metadata_ref.snapshot_by_id(sid),
@@ -1763,9 +1965,7 @@ async fn collect_data_files_via_plan(
 /// finds the fact-table columns the runtime filter prunes on.
 fn collect_filter_column_names(filters: &[Arc<dyn PhysicalExpr>]) -> Vec<String> {
     fn walk(expr: &Arc<dyn PhysicalExpr>, out: &mut Vec<String>) {
-        if let Some(col) = expr
-            .downcast_ref::<datafusion::physical_expr::expressions::Column>()
-        {
+        if let Some(col) = expr.downcast_ref::<datafusion::physical_expr::expressions::Column>() {
             let name = col.name().to_string();
             if !out.contains(&name) {
                 out.push(name);
@@ -1808,17 +2008,16 @@ async fn collect_data_files_for_pruning(
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
     let concurrency = concurrency.max(1);
-    let manifests: Vec<Arc<iceberg::spec::Manifest>> = futures::stream::iter(
-        manifest_list.entries().iter().cloned(),
-    )
-    .map(|mf| {
-        let cache = cache.clone();
-        async move { cache.get_manifest(&mf).await }
-    })
-    .buffer_unordered(concurrency)
-    .try_collect()
-    .await
-    .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    let manifests: Vec<Arc<iceberg::spec::Manifest>> =
+        futures::stream::iter(manifest_list.entries().iter().cloned())
+            .map(|mf| {
+                let cache = cache.clone();
+                async move { cache.get_manifest(&mf).await }
+            })
+            .buffer_unordered(concurrency)
+            .try_collect()
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
     let data_files = manifests
         .into_iter()
@@ -1900,17 +2099,16 @@ pub async fn compute_table_statistics(
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
     let concurrency = concurrency.max(1);
-    let manifests: Vec<Arc<iceberg::spec::Manifest>> = futures::stream::iter(
-        manifest_list.entries().iter().cloned(),
-    )
-    .map(|mf| {
-        let cache = cache.clone();
-        async move { cache.get_manifest(&mf).await }
-    })
-    .buffer_unordered(concurrency)
-    .try_collect()
-    .await
-    .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    let manifests: Vec<Arc<iceberg::spec::Manifest>> =
+        futures::stream::iter(manifest_list.entries().iter().cloned())
+            .map(|mf| {
+                let cache = cache.clone();
+                async move { cache.get_manifest(&mf).await }
+            })
+            .buffer_unordered(concurrency)
+            .try_collect()
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
     // Track live delete files (position or equality) alongside collecting data
     // files. Merge-on-Read deletes remove rows at read time that the manifest
@@ -2205,7 +2403,8 @@ impl PhysicalExprPredicate {
         let expr_schema = batch.schema();
         let mut needs_cast = false;
         let mut new_columns: Vec<arrow::array::ArrayRef> = Vec::with_capacity(batch.num_columns());
-        let mut new_fields: Vec<arrow::datatypes::FieldRef> = Vec::with_capacity(batch.num_columns());
+        let mut new_fields: Vec<arrow::datatypes::FieldRef> =
+            Vec::with_capacity(batch.num_columns());
 
         // Widen narrow integer columns to Int64 and narrow string columns to
         // Utf8. Covers the common Iceberg vs DataFusion type gaps (Iceberg
@@ -2288,17 +2487,13 @@ impl ArrowPredicate for PhysicalExprPredicate {
         };
 
         match result {
-            ColumnarValue::Array(array) => {
-                match array.as_any().downcast_ref::<BooleanArray>() {
-                    Some(bool_arr) => Ok(bool_arr.clone()),
-                    None => Ok(BooleanArray::from(vec![true; coerced.num_rows()])),
-                }
-            }
+            ColumnarValue::Array(array) => match array.as_any().downcast_ref::<BooleanArray>() {
+                Some(bool_arr) => Ok(bool_arr.clone()),
+                None => Ok(BooleanArray::from(vec![true; coerced.num_rows()])),
+            },
             ColumnarValue::Scalar(scalar) => {
-                let bool_val = matches!(
-                    scalar,
-                    datafusion::common::ScalarValue::Boolean(Some(true))
-                );
+                let bool_val =
+                    matches!(scalar, datafusion::common::ScalarValue::Boolean(Some(true)));
                 Ok(BooleanArray::from(vec![bool_val; coerced.num_rows()]))
             }
         }
@@ -2315,14 +2510,21 @@ impl Stream for IcebergRecordBatchStream {
     type Item = DFResult<RecordBatch>;
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
-        let poll = { let _timer = this.baseline.elapsed_compute().timer(); this.inner.as_mut().poll_next(cx) };
-        if let Poll::Ready(Some(Ok(ref batch))) = poll { this.baseline.record_output(batch.num_rows()); }
+        let poll = {
+            let _timer = this.baseline.elapsed_compute().timer();
+            this.inner.as_mut().poll_next(cx)
+        };
+        if let Poll::Ready(Some(Ok(ref batch))) = poll {
+            this.baseline.record_output(batch.num_rows());
+        }
         poll
     }
 }
 
 impl datafusion::physical_plan::RecordBatchStream for IcebergRecordBatchStream {
-    fn schema(&self) -> SchemaRef { self.schema.clone() }
+    fn schema(&self) -> SchemaRef {
+        self.schema.clone()
+    }
 }
 
 #[cfg(test)]
@@ -2387,7 +2589,10 @@ mod tests {
             vec![Arc::new(Column::new("a", 0))],
             lit(true),
         ));
-        assert_eq!(wait_for_dynamic_filters(&[Arc::clone(&pending)], 0).await, 0);
+        assert_eq!(
+            wait_for_dynamic_filters(&[Arc::clone(&pending)], 0).await,
+            0
+        );
 
         // A pending placeholder waits out the deadline and returns.
         let waited = wait_for_dynamic_filters(&[Arc::clone(&pending)], 30).await;
@@ -2580,7 +2785,10 @@ mod tests {
         assert!(first.is_ok(), "first file's batch arrives before the error");
 
         let second = flat.next().await.unwrap();
-        assert!(second.is_err(), "the failing file surfaces as a mid-stream Err");
+        assert!(
+            second.is_err(),
+            "the failing file surfaces as a mid-stream Err"
+        );
     }
 
     /// Assert a file's byte-range splits tile `[0, size)` with no gap or
@@ -2606,7 +2814,11 @@ mod tests {
 
         // Below 2x target: stays whole.
         let whole = file_byte_splits(2 * target - 1, target);
-        assert_eq!(whole, vec![(0, 2 * target - 1)], "stays whole under 2x target");
+        assert_eq!(
+            whole,
+            vec![(0, 2 * target - 1)],
+            "stays whole under 2x target"
+        );
 
         // Exactly 2x target: first size that splits.
         let at = file_byte_splits(2 * target, target);
@@ -2636,14 +2848,21 @@ mod tests {
         let target = 32 * 1024 * 1024u64;
         let size = 1_717_986_918u64; // ~1.6 GiB
         let order = ordered_split_ranges(&[(size, true)], target);
-        assert!(order.len() >= 48, "~50 splits expected, got {}", order.len());
+        assert!(
+            order.len() >= 48,
+            "~50 splits expected, got {}",
+            order.len()
+        );
 
         let n = 8usize;
         let mut per_partition = vec![0u64; n];
         for (i, (_, _, length)) in order.iter().enumerate() {
             per_partition[i % n] += *length;
         }
-        assert!(per_partition.iter().all(|&b| b > 0), "every partition gets data");
+        assert!(
+            per_partition.iter().all(|&b| b > 0),
+            "every partition gets data"
+        );
         let max = *per_partition.iter().max().unwrap();
         let min = *per_partition.iter().min().unwrap();
         assert!(max <= 2 * min, "byte totals within 2x: min={min} max={max}");
@@ -2660,7 +2879,11 @@ mod tests {
     fn small_and_non_parquet_files_stay_whole() {
         let target = 32 * 1024 * 1024u64;
         // small parquet, tiny parquet, large NON-parquet (would split if parquet).
-        let files = vec![(1_000_000u64, true), (2_000_000, true), (500_000_000, false)];
+        let files = vec![
+            (1_000_000u64, true),
+            (2_000_000, true),
+            (500_000_000, false),
+        ];
         let order = ordered_split_ranges(&files, target);
         assert_eq!(order.len(), 3, "no file is both large and splittable");
         for (idx, start, length) in &order {

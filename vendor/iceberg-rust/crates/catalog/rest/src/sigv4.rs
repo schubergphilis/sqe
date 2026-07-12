@@ -46,9 +46,7 @@ use std::time::SystemTime;
 
 use aws_credential_types::Credentials;
 use aws_credential_types::provider::ProvideCredentials;
-use aws_sigv4::http_request::{
-    SignableBody, SignableRequest, SigningSettings, sign,
-};
+use aws_sigv4::http_request::{SignableBody, SignableRequest, SigningSettings, sign};
 use aws_sigv4::sign::v4;
 use bytes::Bytes;
 use http::HeaderValue;
@@ -201,14 +199,13 @@ impl SigV4Signer {
             // SAFETY: `name_str` is one of `authorization`,
             // `x-amz-date`, etc., all valid header names by
             // construction.
-            let header_name = http::HeaderName::from_bytes(name_str.as_bytes())
-                .map_err(|e| {
-                    Error::new(
-                        ErrorKind::DataInvalid,
-                        format!("SigV4 produced an invalid header name {name_str}"),
-                    )
-                    .with_source(e)
-                })?;
+            let header_name = http::HeaderName::from_bytes(name_str.as_bytes()).map_err(|e| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    format!("SigV4 produced an invalid header name {name_str}"),
+                )
+                .with_source(e)
+            })?;
             req.headers_mut().insert(header_name, value);
         }
 

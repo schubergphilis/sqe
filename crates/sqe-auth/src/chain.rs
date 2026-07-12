@@ -399,7 +399,6 @@ mod tests {
         }
     }
 
-
     /// The user's reported scenario: Flight SQL hands the chain a JWT in
     /// `bearer_token` only (no username, no password). The chain must skip
     /// the OIDC password provider that sits first and let the bearer
@@ -412,7 +411,9 @@ mod tests {
         ]);
 
         let creds = FlightCredentials {
-            bearer_token: Some(sqe_core::SecretString::new("eyJtest.payload.sig".to_string())),
+            bearer_token: Some(sqe_core::SecretString::new(
+                "eyJtest.payload.sig".to_string(),
+            )),
             ..Default::default()
         };
 
@@ -440,7 +441,9 @@ mod tests {
         ]);
 
         let creds = FlightCredentials {
-            bearer_token: Some(sqe_core::SecretString::new("eyJtest.payload.sig".to_string())),
+            bearer_token: Some(sqe_core::SecretString::new(
+                "eyJtest.payload.sig".to_string(),
+            )),
             ..Default::default()
         };
 

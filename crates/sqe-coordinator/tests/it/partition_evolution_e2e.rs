@@ -16,7 +16,6 @@
 //! `cargo test -p sqe-coordinator --test partition_evolution_e2e -- --ignored
 //! --test-threads=1`.
 
-
 use arrow_array::{Array, Int64Array};
 
 async fn row_count(
@@ -74,14 +73,18 @@ async fn add_identity_partition_field_to_unpartitioned_table() {
     handler
         .execute(
             &session,
-            &format!("ALTER TABLE {fq} ADD PARTITION FIELD region"), None)
+            &format!("ALTER TABLE {fq} ADD PARTITION FIELD region"),
+            None,
+        )
         .await
         .expect("ADD PARTITION FIELD region");
 
     handler
         .execute(
             &session,
-            &format!("INSERT INTO {fq} VALUES (1, 'eu', 10), (2, 'us', 20)"), None)
+            &format!("INSERT INTO {fq} VALUES (1, 'eu', 10), (2, 'us', 20)"),
+            None,
+        )
         .await
         .expect("INSERT after ADD PARTITION FIELD");
 
@@ -116,7 +119,9 @@ async fn add_day_partition_field_with_transform() {
     handler
         .execute(
             &session,
-            &format!("ALTER TABLE {fq} ADD PARTITION FIELD day(ts)"), None)
+            &format!("ALTER TABLE {fq} ADD PARTITION FIELD day(ts)"),
+            None,
+        )
         .await
         .expect("ADD PARTITION FIELD day(ts)");
 
@@ -127,7 +132,9 @@ async fn add_day_partition_field_with_transform() {
                 "INSERT INTO {fq} VALUES \
                  (1, TIMESTAMP '2026-04-26 10:00:00', 10), \
                  (2, TIMESTAMP '2026-04-27 11:00:00', 20)"
-            ), None)
+            ),
+            None,
+        )
         .await
         .expect("INSERT after ADD PARTITION FIELD day(ts)");
 
@@ -163,19 +170,29 @@ async fn drop_partition_field_from_partitioned_table() {
     .await;
 
     handler
-        .execute(&session, &format!("INSERT INTO {fq} VALUES (1, 'eu', 10)"), None)
+        .execute(
+            &session,
+            &format!("INSERT INTO {fq} VALUES (1, 'eu', 10)"),
+            None,
+        )
         .await
         .expect("INSERT pre-DROP");
 
     handler
         .execute(
             &session,
-            &format!("ALTER TABLE {fq} DROP PARTITION FIELD region"), None)
+            &format!("ALTER TABLE {fq} DROP PARTITION FIELD region"),
+            None,
+        )
         .await
         .expect("DROP PARTITION FIELD region");
 
     handler
-        .execute(&session, &format!("INSERT INTO {fq} VALUES (2, 'us', 20)"), None)
+        .execute(
+            &session,
+            &format!("INSERT INTO {fq} VALUES (2, 'us', 20)"),
+            None,
+        )
         .await
         .expect("INSERT after DROP PARTITION FIELD");
 
@@ -214,21 +231,27 @@ async fn replace_partition_field_identity_to_bucket() {
     handler
         .execute(
             &session,
-            &format!("INSERT INTO {fq} VALUES (1, 'eu', 10), (2, 'us', 20)"), None)
+            &format!("INSERT INTO {fq} VALUES (1, 'eu', 10), (2, 'us', 20)"),
+            None,
+        )
         .await
         .expect("INSERT pre-REPLACE");
 
     handler
         .execute(
             &session,
-            &format!(
-                "ALTER TABLE {fq} REPLACE PARTITION FIELD region WITH bucket(8, region)"
-            ), None)
+            &format!("ALTER TABLE {fq} REPLACE PARTITION FIELD region WITH bucket(8, region)"),
+            None,
+        )
         .await
         .expect("REPLACE PARTITION FIELD");
 
     handler
-        .execute(&session, &format!("INSERT INTO {fq} VALUES (3, 'eu', 30)"), None)
+        .execute(
+            &session,
+            &format!("INSERT INTO {fq} VALUES (3, 'eu', 30)"),
+            None,
+        )
         .await
         .expect("INSERT after REPLACE");
 
@@ -255,16 +278,16 @@ async fn add_partition_field_on_v3_table() {
         &handler,
         &session,
         fq,
-        &format!(
-            "CREATE TABLE {fq} (id BIGINT, ts TIMESTAMP_NS(9), value BIGINT)"
-        ),
+        &format!("CREATE TABLE {fq} (id BIGINT, ts TIMESTAMP_NS(9), value BIGINT)"),
     )
     .await;
 
     handler
         .execute(
             &session,
-            &format!("ALTER TABLE {fq} ADD PARTITION FIELD day(ts)"), None)
+            &format!("ALTER TABLE {fq} ADD PARTITION FIELD day(ts)"),
+            None,
+        )
         .await
         .expect("ADD PARTITION FIELD on V3 table");
 
@@ -275,7 +298,9 @@ async fn add_partition_field_on_v3_table() {
                 "INSERT INTO {fq} VALUES \
                  (1, TIMESTAMP '2026-04-26 10:00:00.123456789', 10), \
                  (2, TIMESTAMP '2026-04-27 11:00:00.987654321', 20)"
-            ), None)
+            ),
+            None,
+        )
         .await
         .expect("INSERT after ADD PARTITION FIELD on V3");
 
@@ -307,7 +332,9 @@ async fn drop_unknown_partition_field_returns_error() {
     let err = handler
         .execute(
             &session,
-            &format!("ALTER TABLE {fq} DROP PARTITION FIELD region"), None)
+            &format!("ALTER TABLE {fq} DROP PARTITION FIELD region"),
+            None,
+        )
         .await
         .expect_err("region is not currently a partition field");
 
@@ -342,7 +369,9 @@ async fn add_partition_field_on_unknown_column_returns_error() {
     let err = handler
         .execute(
             &session,
-            &format!("ALTER TABLE {fq} ADD PARTITION FIELD ghost"), None)
+            &format!("ALTER TABLE {fq} ADD PARTITION FIELD ghost"),
+            None,
+        )
         .await
         .expect_err("ghost column is not declared");
 

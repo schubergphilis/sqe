@@ -164,7 +164,13 @@ impl Actor {
         roles: Vec<String>,
         groups: Vec<String>,
     ) -> Self {
-        Self { username, subject, email, roles, groups }
+        Self {
+            username,
+            subject,
+            email,
+            roles,
+            groups,
+        }
     }
 }
 
@@ -190,7 +196,12 @@ pub(crate) fn sample_query_event() -> AuditEvent {
             object_type: ObjectType::Table,
         }],
         policy: None,
-        timing: Some(Timing { duration_ms: 42, queued_ms: 0, planning_ms: 5, execution_ms: 37 }),
+        timing: Some(Timing {
+            duration_ms: 42,
+            queued_ms: 0,
+            planning_ms: 5,
+            execution_ms: 37,
+        }),
         stats: Some(QueryStats {
             rows_returned: 10,
             bytes_scanned: 1024,
@@ -233,8 +244,19 @@ mod tests {
                 object_type: ObjectType::Table,
             }],
             policy: None,
-            timing: Some(Timing { duration_ms: 42, queued_ms: 0, planning_ms: 5, execution_ms: 37 }),
-            stats: Some(QueryStats { rows_returned: 10, bytes_scanned: 1024, rows_scanned: 100, spill_bytes: 0, peak_memory_bytes: 0 }),
+            timing: Some(Timing {
+                duration_ms: 42,
+                queued_ms: 0,
+                planning_ms: 5,
+                execution_ms: 37,
+            }),
+            stats: Some(QueryStats {
+                rows_returned: 10,
+                bytes_scanned: 1024,
+                rows_scanned: 100,
+                spill_bytes: 0,
+                peak_memory_bytes: 0,
+            }),
             query: Some(QueryInfo {
                 text: Some("SELECT 1".into()),
                 query_hash: "abc".into(),

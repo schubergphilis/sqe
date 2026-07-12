@@ -156,7 +156,10 @@ fn advertise_url_is_routable(url: &str) -> bool {
         .next()
         .unwrap_or(after_scheme)
         .rsplit_once('@')
-        .map_or(after_scheme.split('/').next().unwrap_or(after_scheme), |(_, host)| host);
+        .map_or(
+            after_scheme.split('/').next().unwrap_or(after_scheme),
+            |(_, host)| host,
+        );
 
     // Extract host, stripping a trailing :port. Bracketed IPv6 first.
     let host = if let Some(rest) = authority.strip_prefix('[') {
@@ -367,10 +370,7 @@ impl WorkerRegistry {
         }
     }
 
-    pub fn start_health_check_task(
-        self: &Arc<Self>,
-        interval: Duration,
-    ) -> sqe_core::TaskGuard {
+    pub fn start_health_check_task(self: &Arc<Self>, interval: Duration) -> sqe_core::TaskGuard {
         let registry = self.clone();
         sqe_core::spawn_supervised("worker-health-check", move |token| async move {
             let mut ticker = tokio::time::interval(interval);
@@ -592,9 +592,9 @@ mod tests {
     async fn test_concurrent_health_updates() {
         // 10 tokio tasks marking the same worker healthy/unhealthy simultaneously.
         // The final state is non-deterministic, but no panics should occur.
-        let registry = Arc::new(WorkerRegistry::new(vec![
-            "http://worker1:50052".to_string(),
-        ]));
+        let registry = Arc::new(WorkerRegistry::new(
+            vec!["http://worker1:50052".to_string()],
+        ));
         registry.mark_healthy("http://worker1:50052").await;
 
         let mut handles = tokio::task::JoinSet::new();
@@ -654,9 +654,7 @@ mod tests {
     async fn test_many_workers() {
         // Registry with 50 workers; mark a subset healthy and verify
         // healthy_workers() returns exactly that subset.
-        let urls: Vec<String> = (0..50)
-            .map(|i| format!("http://worker{i}:50052"))
-            .collect();
+        let urls: Vec<String> = (0..50).map(|i| format!("http://worker{i}:50052")).collect();
         let registry = WorkerRegistry::new(urls.clone());
 
         assert_eq!(registry.total_workers().await, 50);

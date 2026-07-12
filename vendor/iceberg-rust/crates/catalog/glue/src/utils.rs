@@ -66,8 +66,7 @@ pub(crate) async fn create_sdk_config(
             aws_smithy_http_client::tls::rustls_provider::CryptoMode::Ring,
         ))
         .build_https();
-    let mut config =
-        aws_config::defaults(BehaviorVersion::latest()).http_client(http_client);
+    let mut config = aws_config::defaults(BehaviorVersion::latest()).http_client(http_client);
 
     if let Some(endpoint) = endpoint_uri {
         config = config.endpoint_url(endpoint)

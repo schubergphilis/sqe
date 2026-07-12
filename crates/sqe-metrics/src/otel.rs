@@ -5,14 +5,14 @@ use opentelemetry::trace::TracerProvider;
 use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
 use opentelemetry_otlp::{LogExporter, MetricExporter, SpanExporter, WithExportConfig};
 use opentelemetry_sdk::{
-    logs::SdkLoggerProvider, metrics::SdkMeterProvider,
-    propagation::TraceContextPropagator, trace::SdkTracerProvider, Resource,
+    logs::SdkLoggerProvider, metrics::SdkMeterProvider, propagation::TraceContextPropagator,
+    trace::SdkTracerProvider, Resource,
 };
 use tracing_opentelemetry::OpenTelemetryLayer;
-use tracing_subscriber::Layer;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::Layer;
 
 /// Initialize the full observability stack.
 ///

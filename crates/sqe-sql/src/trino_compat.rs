@@ -39,7 +39,8 @@ use sqlparser::ast::{
     BinaryOperator, CastKind, DataType as SqlDataType, Expr, Function, FunctionArg,
     FunctionArgExpr, FunctionArgumentClause, FunctionArgumentList, FunctionArguments, GroupByExpr,
     GroupByWithModifier, Ident, LimitClause, ObjectName, OrderByKind, Query, Select, SelectItem,
-    SetExpr, Statement, TableFactor, TableFunctionArgs, Value, Visit, VisitMut, Visitor, VisitorMut,
+    SetExpr, Statement, TableFactor, TableFunctionArgs, Value, Visit, VisitMut, Visitor,
+    VisitorMut,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -143,9 +144,8 @@ pub fn rewrite_trino_compat(sql: &str) -> String {
     let lower = sql.to_ascii_lowercase();
     let has_json_cast = lower.contains("as json");
     let has_dollar = lower.contains('$');
-    let has_grouping_set = lower.contains("rollup")
-        || lower.contains("cube")
-        || lower.contains("grouping sets");
+    let has_grouping_set =
+        lower.contains("rollup") || lower.contains("cube") || lower.contains("grouping sets");
     // `current_schema` (bare keyword) -> rewrite_bare_current_schema. sqlparser
     // parses bare `current_schema` as a column identifier (unlike
     // `current_catalog`, which it treats as a reserved no-arg function), so we
@@ -406,10 +406,7 @@ impl VisitorMut for TrinoCompatVisitor {
         ControlFlow::Continue(())
     }
 
-    fn post_visit_table_factor(
-        &mut self,
-        factor: &mut TableFactor,
-    ) -> ControlFlow<Self::Break> {
+    fn post_visit_table_factor(&mut self, factor: &mut TableFactor) -> ControlFlow<Self::Break> {
         if rewrite_metadata_dollar_table(factor) {
             self.rewrites += 1;
         }
@@ -438,9 +435,7 @@ impl VisitorMut for TrinoCompatVisitor {
         // being wrapped a second time when the rewriter runs on SQL that
         // came back through the same path.
         let was_wrap_owner = has_wrap_cte(query);
-        if (self.wrap_cte_depth == 0 || was_wrap_owner)
-            && wrap_rollup_for_empty_input(query)
-        {
+        if (self.wrap_cte_depth == 0 || was_wrap_owner) && wrap_rollup_for_empty_input(query) {
             self.rewrites += 1;
         }
         // Translate a FETCH clause DataFusion can't plan. Runs after the ROLLUP
@@ -459,7 +454,9 @@ impl VisitorMut for TrinoCompatVisitor {
 
 /// True if `query` defines a CTE named `__sqe_rollup_q` (the wrap marker).
 fn has_wrap_cte(query: &Query) -> bool {
-    let Some(with) = &query.with else { return false };
+    let Some(with) = &query.with else {
+        return false;
+    };
     with.cte_tables
         .iter()
         .any(|cte| cte.alias.name.value == ROLLUP_WRAP_CTE)
@@ -511,7 +508,10 @@ fn rewrite_cast_binary_to_bytea(expr: &mut Expr) -> bool {
     let Expr::Cast { data_type, .. } = expr else {
         return false;
     };
-    if matches!(&*data_type, SqlDataType::Varbinary(_) | SqlDataType::Binary(_)) {
+    if matches!(
+        &*data_type,
+        SqlDataType::Varbinary(_) | SqlDataType::Binary(_)
+    ) {
         *data_type = SqlDataType::Bytea;
         true
     } else {
@@ -729,8 +729,7 @@ fn apply_recursive_cte_column_aliases(query: &mut Query) -> bool {
         for (item, col) in anchor.projection.iter_mut().zip(cte.alias.columns.iter()) {
             match item {
                 SelectItem::UnnamedExpr(e) => {
-                    let taken =
-                        std::mem::replace(e, Expr::Identifier(Ident::new("__sqe_cte_tmp")));
+                    let taken = std::mem::replace(e, Expr::Identifier(Ident::new("__sqe_cte_tmp")));
                     *item = SelectItem::ExprWithAlias {
                         expr: taken,
                         alias: col.name.clone(),
@@ -771,7 +770,9 @@ fn rewrite_listagg_within_group(expr: &mut Expr) -> bool {
     // Move the WITHIN GROUP ordering into the argument list as an inline
     // ORDER BY, the form string_agg expects, then rename the call.
     let order_by = std::mem::take(&mut func.within_group);
-    arg_list.clauses.push(FunctionArgumentClause::OrderBy(order_by));
+    arg_list
+        .clauses
+        .push(FunctionArgumentClause::OrderBy(order_by));
     func.name = ObjectName::from(vec![Ident::new("string_agg")]);
     true
 }
@@ -1296,13 +1297,18 @@ fn rewrite_fetch_clause(query: &mut Query) -> bool {
 fn rewrite_fetch_only(query: &mut Query, quantity: Option<Expr>) -> bool {
     // A query carrying the MySQL `LIMIT o, l` form alongside FETCH is too
     // unusual to reason about; leave it for DataFusion.
-    if matches!(query.limit_clause, Some(LimitClause::OffsetCommaLimit { .. })) {
+    if matches!(
+        query.limit_clause,
+        Some(LimitClause::OffsetCommaLimit { .. })
+    ) {
         return false;
     }
     // `FETCH FIRST ROW ONLY` with no count means one row.
     let limit = quantity.unwrap_or_else(|| int_literal_expr(1));
     let (offset, limit_by) = match query.limit_clause.take() {
-        Some(LimitClause::LimitOffset { offset, limit_by, .. }) => (offset, limit_by),
+        Some(LimitClause::LimitOffset {
+            offset, limit_by, ..
+        }) => (offset, limit_by),
         _ => (None, Vec::new()),
     };
     query.limit_clause = Some(LimitClause::LimitOffset {
@@ -1443,12 +1449,9 @@ fn select_uses_grouping_sets(select: &Select) -> bool {
             {
                 return true;
             }
-            exprs.iter().any(|e| {
-                matches!(
-                    e,
-                    Expr::Rollup(_) | Expr::Cube(_) | Expr::GroupingSets(_)
-                )
-            })
+            exprs
+                .iter()
+                .any(|e| matches!(e, Expr::Rollup(_) | Expr::Cube(_) | Expr::GroupingSets(_)))
         }
     }
 }
@@ -1534,9 +1537,7 @@ mod tests {
 
     #[test]
     fn cast_as_json_in_where_clause() {
-        let out = rewrite_trino_compat(
-            "SELECT 1 FROM t WHERE CAST(payload AS JSON) IS NOT NULL",
-        );
+        let out = rewrite_trino_compat("SELECT 1 FROM t WHERE CAST(payload AS JSON) IS NOT NULL");
         assert!(
             out.to_ascii_lowercase().contains("to_json"),
             "WHERE-clause CAST should be rewritten: {out}"
@@ -1550,7 +1551,10 @@ mod tests {
         let out = rewrite_trino_compat("SELECT CAST('abc' AS VARBINARY)");
         let lower = out.to_ascii_lowercase();
         assert!(lower.contains("bytea"), "expected BYTEA target: {out}");
-        assert!(!lower.contains("varbinary"), "VARBINARY should be gone: {out}");
+        assert!(
+            !lower.contains("varbinary"),
+            "VARBINARY should be gone: {out}"
+        );
     }
 
     #[test]
@@ -1563,7 +1567,10 @@ mod tests {
     #[test]
     fn cast_as_varbinary_preserves_inner_expr() {
         let out = rewrite_trino_compat("SELECT CAST(from_hex(h) AS VARBINARY) FROM t");
-        assert!(out.contains("from_hex(h)"), "inner expr should survive: {out}");
+        assert!(
+            out.contains("from_hex(h)"),
+            "inner expr should survive: {out}"
+        );
         assert!(out.to_ascii_lowercase().contains("bytea"));
     }
 
@@ -1576,8 +1583,14 @@ mod tests {
         );
         let lower = out.to_ascii_lowercase();
         assert!(lower.contains("string_agg"), "expected string_agg: {out}");
-        assert!(!lower.contains("within group"), "WITHIN GROUP should be gone: {out}");
-        assert!(lower.contains("order by name"), "ordering should move inline: {out}");
+        assert!(
+            !lower.contains("within group"),
+            "WITHIN GROUP should be gone: {out}"
+        );
+        assert!(
+            lower.contains("order by name"),
+            "ordering should move inline: {out}"
+        );
     }
 
     #[test]
@@ -1585,7 +1598,10 @@ mod tests {
         let out = rewrite_trino_compat("SELECT try(1/0)");
         let lower = out.to_ascii_lowercase();
         assert!(!lower.contains("try("), "try wrapper should be gone: {out}");
-        assert!(lower.contains("nullif(0, 0)"), "divisor guard missing: {out}");
+        assert!(
+            lower.contains("nullif(0, 0)"),
+            "divisor guard missing: {out}"
+        );
     }
 
     #[test]
@@ -1593,7 +1609,10 @@ mod tests {
         let out = rewrite_trino_compat("SELECT try(CAST('x' AS integer))");
         let lower = out.to_ascii_lowercase();
         assert!(!lower.contains("try("), "try wrapper should be gone: {out}");
-        assert!(lower.contains("try_cast('x' as int"), "cast not made safe: {out}");
+        assert!(
+            lower.contains("try_cast('x' as int"),
+            "cast not made safe: {out}"
+        );
     }
 
     #[test]
@@ -1605,8 +1624,7 @@ mod tests {
 
     #[test]
     fn try_nested_operations_all_guarded() {
-        let out =
-            rewrite_trino_compat("SELECT try(CAST(a AS bigint) / b % c) FROM t");
+        let out = rewrite_trino_compat("SELECT try(CAST(a AS bigint) / b % c) FROM t");
         let lower = out.to_ascii_lowercase();
         assert!(lower.contains("try_cast(a as bigint"), "{out}");
         assert!(lower.contains("nullif(b, 0)"), "{out}");
@@ -1634,7 +1652,10 @@ mod tests {
              SELECT count(*) FROM t",
         );
         let lower = out.to_ascii_lowercase();
-        assert!(lower.contains("select 1 as n union all"), "anchor not aliased: {out}");
+        assert!(
+            lower.contains("select 1 as n union all"),
+            "anchor not aliased: {out}"
+        );
     }
 
     #[test]
@@ -1660,7 +1681,10 @@ mod tests {
             "WITH RECURSIVE t(n) AS (SELECT 1 AS x UNION ALL SELECT n+1 FROM t WHERE n < 2) \
              SELECT n FROM t",
         );
-        assert!(out.to_ascii_lowercase().contains("select 1 as n union all"), "{out}");
+        assert!(
+            out.to_ascii_lowercase().contains("select 1 as n union all"),
+            "{out}"
+        );
     }
 
     #[test]
@@ -1670,7 +1694,10 @@ mod tests {
         let lower = out.to_ascii_lowercase();
         assert!(!lower.contains("ordinality"), "{out}");
         assert!(lower.contains("row_number() over () as n"), "{out}");
-        assert!(lower.contains("unnest(array[1, 2]) as __sqe_unnest (x)"), "{out}");
+        assert!(
+            lower.contains("unnest(array[1, 2]) as __sqe_unnest (x)"),
+            "{out}"
+        );
         assert!(lower.contains(") as t"), "{out}");
     }
 
@@ -1706,12 +1733,17 @@ mod tests {
     #[test]
     fn percentile_cont_within_group_not_rewritten() {
         // Genuine ordered-set aggregates keep their WITHIN GROUP clause.
-        let out = rewrite_trino_compat(
-            "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY x) FROM t",
-        );
+        let out =
+            rewrite_trino_compat("SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY x) FROM t");
         let lower = out.to_ascii_lowercase();
-        assert!(lower.contains("within group"), "WITHIN GROUP must survive: {out}");
-        assert!(!lower.contains("string_agg"), "must not become string_agg: {out}");
+        assert!(
+            lower.contains("within group"),
+            "WITHIN GROUP must survive: {out}"
+        );
+        assert!(
+            !lower.contains("string_agg"),
+            "must not become string_agg: {out}"
+        );
     }
 
     // ─── Metadata $-syntax rewriter ────────────────────────────────────────
@@ -1768,7 +1800,8 @@ mod tests {
         // Uppercase suffix should still match.
         let out = rewrite_trino_compat(r#"SELECT * FROM "ns.t$SNAPSHOTS""#);
         assert!(
-            out.to_ascii_lowercase().contains("table_snapshots('ns', 't')"),
+            out.to_ascii_lowercase()
+                .contains("table_snapshots('ns', 't')"),
             "uppercase suffix should match, got: {out}"
         );
     }
@@ -1819,7 +1852,10 @@ mod tests {
     fn fetch_first_only_no_count_is_limit_one() {
         let out = rewrite_trino_compat("SELECT x FROM t FETCH FIRST ROW ONLY");
         let lower = out.to_ascii_lowercase();
-        assert!(lower.contains("limit 1"), "count-less ONLY is LIMIT 1: {out}");
+        assert!(
+            lower.contains("limit 1"),
+            "count-less ONLY is LIMIT 1: {out}"
+        );
     }
 
     #[test]
@@ -1899,9 +1935,7 @@ mod tests {
     #[test]
     fn dollar_table_with_alias() {
         // Aliasing the metadata table should be preserved through rewrite.
-        let out = rewrite_trino_compat(
-            r#"SELECT s.committed_at FROM "ns.t$snapshots" AS s"#,
-        );
+        let out = rewrite_trino_compat(r#"SELECT s.committed_at FROM "ns.t$snapshots" AS s"#);
         let lower = out.to_ascii_lowercase();
         assert!(
             lower.contains("table_snapshots('ns', 't')"),
@@ -1917,9 +1951,7 @@ mod tests {
     #[test]
     fn dollar_table_combined_with_cast_as_json() {
         // Both rewriters should fire in one query.
-        let out = rewrite_trino_compat(
-            r#"SELECT CAST(snapshot_id AS JSON) FROM "ns.t$snapshots""#,
-        );
+        let out = rewrite_trino_compat(r#"SELECT CAST(snapshot_id AS JSON) FROM "ns.t$snapshots""#);
         let lower = out.to_ascii_lowercase();
         assert!(lower.contains("to_json"), "JSON cast missing: {out}");
         assert!(
@@ -1936,9 +1968,7 @@ mod tests {
         // the bare schema as the namespace, not `catalog.schema`. Passing the
         // catalog-qualified namespace made Polaris fail with "table does not
         // exist" (#317).
-        let out = rewrite_trino_compat(
-            r#"SELECT * FROM "cat"."schema"."t$snapshots""#,
-        );
+        let out = rewrite_trino_compat(r#"SELECT * FROM "cat"."schema"."t$snapshots""#);
         let lower = out.to_ascii_lowercase();
         assert!(
             lower.contains("table_snapshots('schema', 't')"),
@@ -1961,14 +1991,10 @@ mod tests {
 
     #[test]
     fn rollup_query_gets_wrapped() {
-        let out = rewrite_trino_compat(
-            "SELECT a, SUM(b) FROM t GROUP BY ROLLUP(a) ORDER BY a LIMIT 10",
-        );
+        let out =
+            rewrite_trino_compat("SELECT a, SUM(b) FROM t GROUP BY ROLLUP(a) ORDER BY a LIMIT 10");
         let lower = out.to_ascii_lowercase();
-        assert!(
-            lower.contains("__sqe_rollup_q"),
-            "wrap CTE missing: {out}"
-        );
+        assert!(lower.contains("__sqe_rollup_q"), "wrap CTE missing: {out}");
         assert!(
             lower.contains("left join __sqe_rollup_q"),
             "LEFT JOIN against wrap CTE missing: {out}"
@@ -1985,9 +2011,7 @@ mod tests {
 
     #[test]
     fn cube_query_gets_wrapped() {
-        let out = rewrite_trino_compat(
-            "SELECT a, b, SUM(c) FROM t GROUP BY CUBE(a, b)",
-        );
+        let out = rewrite_trino_compat("SELECT a, b, SUM(c) FROM t GROUP BY CUBE(a, b)");
         assert!(
             out.to_ascii_lowercase().contains("__sqe_rollup_q"),
             "CUBE should trigger wrap: {out}"
@@ -2041,8 +2065,8 @@ mod tests {
 
     #[test]
     fn shallow_expression_passes_depth_check() {
-        let stmts = Parser::parse_sql(&GenericDialect {}, "SELECT a OR b OR c FROM t")
-            .expect("parse");
+        let stmts =
+            Parser::parse_sql(&GenericDialect {}, "SELECT a OR b OR c FROM t").expect("parse");
         assert!(check_expression_depth(&stmts).is_ok());
     }
 
@@ -2077,9 +2101,7 @@ mod tests {
     fn already_wrapped_is_not_double_wrapped() {
         // First pass wraps.  Second pass on the rewritten SQL must be a
         // no-op (no second nesting of __sqe_rollup_q).
-        let once = rewrite_trino_compat(
-            "SELECT a, SUM(b) FROM t GROUP BY ROLLUP(a)",
-        );
+        let once = rewrite_trino_compat("SELECT a, SUM(b) FROM t GROUP BY ROLLUP(a)");
         let twice = rewrite_trino_compat(&once);
         let count_once = once.matches("__sqe_rollup_q").count();
         let count_twice = twice.matches("__sqe_rollup_q").count();
@@ -2138,10 +2160,19 @@ mod tests {
         // _col2.
         let out = alias_anonymous_select_columns("SELECT a, 2 + 2, 'h' FROM t");
         let lower = out.to_ascii_lowercase();
-        assert!(lower.contains("2 + 2 as _col1"), "expr should be _col1: {out}");
-        assert!(out.contains("'h' AS _col2"), "literal should be _col2: {out}");
+        assert!(
+            lower.contains("2 + 2 as _col1"),
+            "expr should be _col1: {out}"
+        );
+        assert!(
+            out.contains("'h' AS _col2"),
+            "literal should be _col2: {out}"
+        );
         // The plain column `a` is not aliased.
-        assert!(!out.contains("a AS _col0"), "plain column must keep its name: {out}");
+        assert!(
+            !out.contains("a AS _col0"),
+            "plain column must keep its name: {out}"
+        );
     }
 
     #[test]
@@ -2149,15 +2180,27 @@ mod tests {
         // The canonical Trino case: SELECT a, count(*) -> a, _col1.
         let out = alias_anonymous_select_columns("SELECT a, count(*) FROM t GROUP BY a");
         let lower = out.to_ascii_lowercase();
-        assert!(lower.contains("count(*) as _col1"), "count(*) should be _col1: {out}");
+        assert!(
+            lower.contains("count(*) as _col1"),
+            "count(*) should be _col1: {out}"
+        );
     }
 
     #[test]
     fn explicit_alias_is_preserved() {
         let out = alias_anonymous_select_columns("SELECT 1 + 1 AS total, 2 * 2");
-        assert!(out.contains("AS total"), "explicit alias must survive: {out}");
-        assert!(out.contains("AS _col1"), "second expr should be _col1: {out}");
-        assert!(!out.to_ascii_lowercase().contains("as _col0"), "aliased item keeps name: {out}");
+        assert!(
+            out.contains("AS total"),
+            "explicit alias must survive: {out}"
+        );
+        assert!(
+            out.contains("AS _col1"),
+            "second expr should be _col1: {out}"
+        );
+        assert!(
+            !out.to_ascii_lowercase().contains("as _col0"),
+            "aliased item keeps name: {out}"
+        );
     }
 
     #[test]
@@ -2177,14 +2220,20 @@ mod tests {
         // projection is left alone.
         let sql = "SELECT *, 1 + 1 FROM t";
         let out = alias_anonymous_select_columns(sql);
-        assert_eq!(out, sql, "wildcard projection must be left untouched: {out}");
+        assert_eq!(
+            out, sql,
+            "wildcard projection must be left untouched: {out}"
+        );
     }
 
     #[test]
     fn union_aliases_leftmost_select() {
         // Output column names come from the first branch of a UNION.
         let out = alias_anonymous_select_columns("SELECT 1 + 1 UNION SELECT 2 + 2");
-        assert!(out.contains("AS _col0"), "leftmost select should be aliased: {out}");
+        assert!(
+            out.contains("AS _col0"),
+            "leftmost select should be aliased: {out}"
+        );
     }
 
     #[test]
@@ -2192,7 +2241,10 @@ mod tests {
         // Trino `JSON '<text>'` -> a plain string literal (SQE stores JSON as
         // Utf8); DataFusion rejects the JSON typed string. (#7)
         let out = rewrite_trino_compat(r#"SELECT JSON '{"a": 1}' AS j"#);
-        assert!(!out.to_uppercase().contains("JSON '"), "JSON literal kept: {out}");
+        assert!(
+            !out.to_uppercase().contains("JSON '"),
+            "JSON literal kept: {out}"
+        );
         assert!(out.contains(r#"'{"a": 1}'"#), "string value lost: {out}");
     }
 
@@ -2201,7 +2253,10 @@ mod tests {
         // Trino `UUID '<text>'` -> a plain string literal (SQE stores UUID as
         // Utf8); DataFusion rejects the UUID typed string. (#326)
         let out = rewrite_trino_compat("SELECT UUID 'bdeb4567-89ab-cdef-0123-456789abcdef' AS u");
-        assert!(!out.to_uppercase().contains("UUID '"), "UUID literal kept: {out}");
+        assert!(
+            !out.to_uppercase().contains("UUID '"),
+            "UUID literal kept: {out}"
+        );
         assert!(
             out.contains("'bdeb4567-89ab-cdef-0123-456789abcdef'"),
             "string value lost: {out}"
@@ -2215,7 +2270,10 @@ mod tests {
         let lower = out.to_ascii_lowercase();
         assert!(lower.contains("struct("), "ROW must become struct(): {out}");
         assert!(!lower.contains("row("), "ROW( should be gone: {out}");
-        assert!(out.contains('1') && out.contains("'a'"), "args must survive: {out}");
+        assert!(
+            out.contains('1') && out.contains("'a'"),
+            "args must survive: {out}"
+        );
     }
 
     #[test]
@@ -2232,12 +2290,16 @@ mod tests {
     fn cast_row_to_named_row_uses_named_struct() {
         // CAST(ROW(...) AS ROW(name type, ...)) -> named_struct with per-field
         // CAST. Trino's named-row semantics. (#7)
-        let out = rewrite_trino_compat(
-            "SELECT CAST(ROW(1, 'a') AS ROW(x int, y varchar))",
-        );
+        let out = rewrite_trino_compat("SELECT CAST(ROW(1, 'a') AS ROW(x int, y varchar))");
         let lower = out.to_ascii_lowercase();
-        assert!(lower.contains("named_struct("), "expected named_struct: {out}");
-        assert!(lower.contains("'x'") && lower.contains("'y'"), "field names: {out}");
+        assert!(
+            lower.contains("named_struct("),
+            "expected named_struct: {out}"
+        );
+        assert!(
+            lower.contains("'x'") && lower.contains("'y'"),
+            "field names: {out}"
+        );
         assert!(
             lower.contains("cast(1 as int)"),
             "first field cast missing: {out}"
@@ -2247,7 +2309,10 @@ mod tests {
             "second field cast missing: {out}"
         );
         // The outer ROW custom type must be gone (DataFusion rejects it).
-        assert!(!lower.contains("as row("), "ROW cast type should be gone: {out}");
+        assert!(
+            !lower.contains("as row("),
+            "ROW cast type should be gone: {out}"
+        );
     }
 
     #[test]

@@ -9,7 +9,6 @@
 //! `cargo test -p sqe-coordinator --test partition_e2e -- --ignored
 //! --test-threads=1`.
 
-
 use arrow_array::{Array, Int64Array};
 
 async fn row_count(
@@ -73,7 +72,9 @@ async fn create_table_partitioned_by_identity() {
     handler
         .execute(
             &session,
-            &format!("INSERT INTO {fq} VALUES (1, 'eu', 10), (2, 'us', 20)"), None)
+            &format!("INSERT INTO {fq} VALUES (1, 'eu', 10), (2, 'us', 20)"),
+            None,
+        )
         .await
         .expect("INSERT");
 
@@ -123,7 +124,9 @@ async fn create_table_partitioned_by_day_transform() {
                  (1, TIMESTAMP '2026-04-26 10:00:00', 10), \
                  (2, TIMESTAMP '2026-04-27 11:00:00', 20), \
                  (3, TIMESTAMP '2026-04-26 23:30:00', 30)"
-            ), None)
+            ),
+            None,
+        )
         .await
         .expect("INSERT");
 
@@ -160,9 +163,9 @@ async fn create_table_partitioned_by_bucket_transform() {
     handler
         .execute(
             &session,
-            &format!(
-                "INSERT INTO {fq} VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd')"
-            ), None)
+            &format!("INSERT INTO {fq} VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd')"),
+            None,
+        )
         .await
         .expect("INSERT");
 
@@ -202,7 +205,9 @@ async fn create_table_partitioned_by_truncate_transform() {
             &format!(
                 "INSERT INTO {fq} VALUES \
                  ('alpha', 1), ('alphabet', 2), ('beta', 3)"
-            ), None)
+            ),
+            None,
+        )
         .await
         .expect("INSERT");
 
@@ -244,7 +249,9 @@ async fn create_table_partitioned_by_multiple_transforms() {
                  (1, TIMESTAMP '2026-04-26 10:00:00', 'eu'), \
                  (2, TIMESTAMP '2026-04-26 11:00:00', 'us'), \
                  (3, TIMESTAMP '2026-04-27 12:00:00', 'eu')"
-            ), None)
+            ),
+            None,
+        )
         .await
         .expect("INSERT");
 
@@ -285,7 +292,9 @@ async fn create_table_partitioned_by_day_on_v3_table() {
                 "INSERT INTO {fq} VALUES \
                  (1, TIMESTAMP '2026-04-26 10:00:00.123456789', 10), \
                  (2, TIMESTAMP '2026-04-27 11:00:00.987654321', 20)"
-            ), None)
+            ),
+            None,
+        )
         .await
         .expect("INSERT");
 
@@ -319,7 +328,9 @@ async fn unsupported_partition_transform_returns_error() {
             &format!(
                 "CREATE TABLE {fq} (id BIGINT, ts TIMESTAMP) \
                  PARTITIONED BY (random(ts))"
-            ), None)
+            ),
+            None,
+        )
         .await
         .expect_err("random() is not a valid Iceberg transform");
 
@@ -348,9 +359,9 @@ async fn unknown_partition_column_returns_error() {
     let err = handler
         .execute(
             &session,
-            &format!(
-                "CREATE TABLE {fq} (id BIGINT) PARTITIONED BY (region)"
-            ), None)
+            &format!("CREATE TABLE {fq} (id BIGINT) PARTITIONED BY (region)"),
+            None,
+        )
         .await
         .expect_err("region column is not declared in the schema");
 

@@ -84,10 +84,9 @@ impl HttpClient {
         // Track whether the caller intends this client to be
         // authenticated. Used by [`authenticate`] to refuse silent
         // unauthenticated requests if the live token is later lost.
-        let auth_required =
-            token.as_deref().is_some_and(|t| !t.is_empty())
-                || credential.is_some()
-                || gcp_credential.is_some();
+        let auth_required = token.as_deref().is_some_and(|t| !t.is_empty())
+            || credential.is_some()
+            || gcp_credential.is_some();
         Ok(HttpClient {
             client: cfg.client().unwrap_or_default(),
             token: Mutex::new(token),
@@ -130,9 +129,7 @@ impl HttpClient {
         // Surface it here so the failure points at the merge boundary,
         // not the request site, and includes operator-actionable text.
         let saved_user_token = self.token.into_inner();
-        let user_had_token = saved_user_token
-            .as_deref()
-            .is_some_and(|t| !t.is_empty());
+        let user_had_token = saved_user_token.as_deref().is_some_and(|t| !t.is_empty());
         let cfg_token = cfg.token();
         let server_clobbered_with_empty =
             user_had_token && matches!(cfg_token.as_deref(), Some(""));

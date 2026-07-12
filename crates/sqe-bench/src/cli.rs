@@ -384,11 +384,17 @@ mod tests {
     #[test]
     fn test_compare_subcommand_parses() {
         let args = Cli::parse_from([
-            "sqe-bench", "compare", "tpch",
-            "--scale", "1",
-            "--sqe-host", "localhost",
-            "--sqe-port", "50051",
-            "--trino-url", "http://localhost:8080",
+            "sqe-bench",
+            "compare",
+            "tpch",
+            "--scale",
+            "1",
+            "--sqe-host",
+            "localhost",
+            "--sqe-port",
+            "50051",
+            "--trino-url",
+            "http://localhost:8080",
         ]);
         match args.command {
             Command::Compare {

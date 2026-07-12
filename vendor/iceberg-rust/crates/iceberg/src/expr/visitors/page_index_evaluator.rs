@@ -831,10 +831,13 @@ mod tests {
         string_vals.push(Some("BISON".to_string()));
 
         batches.push(
-            RecordBatch::try_new(arrow_schema.clone(), vec![
-                Arc::new(Float32Array::from(float_vals)),
-                Arc::new(StringArray::from(string_vals)),
-            ])
+            RecordBatch::try_new(
+                arrow_schema.clone(),
+                vec![
+                    Arc::new(Float32Array::from(float_vals)),
+                    Arc::new(StringArray::from(string_vals)),
+                ],
+            )
             .unwrap(),
         );
 
@@ -843,10 +846,13 @@ mod tests {
         let string_vals = vec![Some("DEER".to_string()); 1024];
 
         batches.push(
-            RecordBatch::try_new(arrow_schema.clone(), vec![
-                Arc::new(Float32Array::from(float_vals)),
-                Arc::new(StringArray::from(string_vals)),
-            ])
+            RecordBatch::try_new(
+                arrow_schema.clone(),
+                vec![
+                    Arc::new(Float32Array::from(float_vals)),
+                    Arc::new(StringArray::from(string_vals)),
+                ],
+            )
             .unwrap(),
         );
 
@@ -863,10 +869,13 @@ mod tests {
         }
 
         batches.push(
-            RecordBatch::try_new(arrow_schema.clone(), vec![
-                Arc::new(Float32Array::from(float_vals)),
-                Arc::new(StringArray::from(string_vals)),
-            ])
+            RecordBatch::try_new(
+                arrow_schema.clone(),
+                vec![
+                    Arc::new(Float32Array::from(float_vals)),
+                    Arc::new(StringArray::from(string_vals)),
+                ],
+            )
             .unwrap(),
         );
 
@@ -878,10 +887,13 @@ mod tests {
         let string_vals = vec![Some("HIPPO".to_string()); 1024];
 
         batches.push(
-            RecordBatch::try_new(arrow_schema.clone(), vec![
-                Arc::new(Float32Array::from(float_vals)),
-                Arc::new(StringArray::from(string_vals)),
-            ])
+            RecordBatch::try_new(
+                arrow_schema.clone(),
+                vec![
+                    Arc::new(Float32Array::from(float_vals)),
+                    Arc::new(StringArray::from(string_vals)),
+                ],
+            )
             .unwrap(),
         );
 

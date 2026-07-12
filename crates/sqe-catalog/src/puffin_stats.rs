@@ -41,14 +41,14 @@
 
 use std::collections::HashMap;
 
-use arrow_array::{Array, RecordBatch};
 use arrow_array::cast::AsArray;
+use arrow_array::{Array, RecordBatch};
 use arrow_schema::DataType;
 use datasketches::theta::ThetaSketch;
 use iceberg::io::FileIO;
-use iceberg::puffin::{APACHE_DATASKETCHES_THETA_V1, Blob, CompressionCodec, PuffinWriter};
-use iceberg::spec::{Schema as IcebergSchema, StatisticsFile};
+use iceberg::puffin::{Blob, CompressionCodec, PuffinWriter, APACHE_DATASKETCHES_THETA_V1};
 use iceberg::spec::BlobMetadata as SpecBlobMetadata;
+use iceberg::spec::{Schema as IcebergSchema, StatisticsFile};
 use tracing::{debug, warn};
 
 /// Iceberg table property enabling Puffin NDV sidecar emission.
@@ -237,24 +237,27 @@ fn feed_column_into_sketch(sketch: &mut ThetaSketch, column: &dyn Array) {
             // downcast helpers for the microsecond unit since Iceberg stores
             // timestamps at microsecond precision; other units are covered by
             // the generic primitive path below.
-            if let Some(arr) =
-                column.as_any().downcast_ref::<arrow_array::TimestampMicrosecondArray>()
+            if let Some(arr) = column
+                .as_any()
+                .downcast_ref::<arrow_array::TimestampMicrosecondArray>()
             {
                 for i in 0..arr.len() {
                     if arr.is_valid(i) {
                         sketch.update(arr.value(i));
                     }
                 }
-            } else if let Some(arr) =
-                column.as_any().downcast_ref::<arrow_array::TimestampNanosecondArray>()
+            } else if let Some(arr) = column
+                .as_any()
+                .downcast_ref::<arrow_array::TimestampNanosecondArray>()
             {
                 for i in 0..arr.len() {
                     if arr.is_valid(i) {
                         sketch.update(arr.value(i));
                     }
                 }
-            } else if let Some(arr) =
-                column.as_any().downcast_ref::<arrow_array::TimestampMillisecondArray>()
+            } else if let Some(arr) = column
+                .as_any()
+                .downcast_ref::<arrow_array::TimestampMillisecondArray>()
             {
                 for i in 0..arr.len() {
                     if arr.is_valid(i) {
@@ -449,7 +452,11 @@ mod tests {
 
         assert_eq!(stats.snapshot_id, 1);
         assert!(stats.file_size_in_bytes > 0);
-        assert_eq!(stats.blob_metadata.len(), 2, "one blob per primitive column");
+        assert_eq!(
+            stats.blob_metadata.len(),
+            2,
+            "one blob per primitive column"
+        );
 
         let id_meta = stats
             .blob_metadata
@@ -482,11 +489,8 @@ mod tests {
             ArrowDataType::Int64,
             false,
         )]));
-        let batch = RecordBatch::try_new(
-            arrow_schema,
-            vec![Arc::new(Int64Array::from(ids)) as _],
-        )
-        .unwrap();
+        let batch =
+            RecordBatch::try_new(arrow_schema, vec![Arc::new(Int64Array::from(ids)) as _]).unwrap();
 
         let sketches = build_theta_sketches(&schema, &[batch]);
         let (_, _, _, ndv) = sketches[0];

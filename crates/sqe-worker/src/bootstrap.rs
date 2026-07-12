@@ -123,10 +123,7 @@ pub fn build_worker_service(
 
 /// Build the Parquet footer cache and register its hit/miss counters on the
 /// worker metrics registry so the footer hit-rate is scrapeable.
-fn build_footer_cache(
-    config: &SqeConfig,
-    metrics: &WorkerMetricsRegistry,
-) -> Arc<FooterCache> {
+fn build_footer_cache(config: &SqeConfig, metrics: &WorkerMetricsRegistry) -> Arc<FooterCache> {
     let size_bytes = parse_memory_limit(&config.storage.footer_cache_size).unwrap_or_else(|e| {
         tracing::warn!(
             value = %config.storage.footer_cache_size,

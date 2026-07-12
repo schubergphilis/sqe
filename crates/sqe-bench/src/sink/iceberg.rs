@@ -30,7 +30,9 @@ use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
 use iceberg::writer::file_writer::ParquetWriterBuilder;
 use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
 use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation, TableIdent};
-use iceberg_catalog_rest::{RestCatalogBuilder, REST_CATALOG_PROP_URI, REST_CATALOG_PROP_WAREHOUSE};
+use iceberg_catalog_rest::{
+    RestCatalogBuilder, REST_CATALOG_PROP_URI, REST_CATALOG_PROP_WAREHOUSE,
+};
 use parquet::file::properties::WriterProperties;
 use tokio::sync::{Mutex, Semaphore};
 
@@ -179,8 +181,7 @@ impl Unit {
             )),
             ("transaction", Some(d)) => {
                 let day = plan.start_day + d as i32;
-                let t_id_start =
-                    d as i64 * plan.txn_rows_per_day as i64 + self.rows.start as i64;
+                let t_id_start = d as i64 * plan.txn_rows_per_day as i64 + self.rows.start as i64;
                 Box::new(bank::transaction_day_shard(
                     day,
                     self.rows.end - self.rows.start,
@@ -328,10 +329,13 @@ async fn ensure_tables(
             schema_to_arrow_schema(table.metadata().current_schema())
                 .with_context(|| format!("deriving {name} write schema"))?,
         );
-        tables.insert(name, TableCtx {
-            table,
-            write_schema,
-        });
+        tables.insert(
+            name,
+            TableCtx {
+                table,
+                write_schema,
+            },
+        );
     }
     Ok(tables)
 }
@@ -430,7 +434,10 @@ async fn commit_files(
         // Durable resume marker; committed atomically with the append.
         tx = tx
             .update_table_properties()
-            .set(format!("{DAY_PROP_PREFIX}{}", format_day(day)), "done".to_string())
+            .set(
+                format!("{DAY_PROP_PREFIX}{}", format_day(day)),
+                "done".to_string(),
+            )
             .apply(tx)
             .context("applying day property")?;
     }
@@ -537,8 +544,8 @@ pub async fn run_bank(
         );
     }
 
-    let mut props_builder = WriterProperties::builder()
-        .set_compression(config.compression.to_parquet());
+    let mut props_builder =
+        WriterProperties::builder().set_compression(config.compression.to_parquet());
     if let Some(rgs) = config.row_group_size {
         props_builder = props_builder.set_max_row_group_row_count(Some(rgs));
     }
@@ -553,11 +560,7 @@ pub async fn run_bank(
     });
     let sem = Arc::new(Semaphore::new(config.threads.max(1)));
 
-    let mut groups: Vec<(
-        &'static str,
-        Option<i32>,
-        Vec<Unit>,
-    )> = Vec::new();
+    let mut groups: Vec<(&'static str, Option<i32>, Vec<Unit>)> = Vec::new();
 
     if !dims_done {
         for (name, rows) in [

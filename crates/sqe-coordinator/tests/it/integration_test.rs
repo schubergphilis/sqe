@@ -2,15 +2,14 @@
 //! These tests require a running lightweight test stack (Polaris in-memory + RustFS).
 //! Run with: ./scripts/integration-test.sh
 
-
 use std::sync::Arc;
 
 // Test: Authenticate via client_credentials against Polaris built-in OAuth
 #[tokio::test(flavor = "multi_thread")]
 #[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn test_authentication() {
-    let config =
-        sqe_core::SqeConfig::load(&crate::common::test_config_path()).expect("Failed to load test config");
+    let config = sqe_core::SqeConfig::load(&crate::common::test_config_path())
+        .expect("Failed to load test config");
     let authenticator = sqe_auth::Authenticator::new(&config.auth)
         .await
         .expect("Failed to create authenticator");
@@ -30,8 +29,8 @@ async fn test_authentication() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn test_token_fingerprint() {
-    let config =
-        sqe_core::SqeConfig::load(&crate::common::test_config_path()).expect("Failed to load test config");
+    let config = sqe_core::SqeConfig::load(&crate::common::test_config_path())
+        .expect("Failed to load test config");
     let authenticator = sqe_auth::Authenticator::new(&config.auth)
         .await
         .expect("Failed to create authenticator");
@@ -52,8 +51,8 @@ async fn test_token_fingerprint() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn test_simple_select() {
-    let config =
-        sqe_core::SqeConfig::load(&crate::common::test_config_path()).expect("Failed to load test config");
+    let config = sqe_core::SqeConfig::load(&crate::common::test_config_path())
+        .expect("Failed to load test config");
     let authenticator = sqe_auth::Authenticator::new(&config.auth)
         .await
         .expect("Failed to create authenticator");
@@ -64,16 +63,25 @@ async fn test_simple_select() {
 
     // SELECT 1 goes through the full query pipeline including catalog registration
     let policy: Arc<dyn sqe_policy::PolicyEnforcer> = Arc::new(sqe_policy::PassthroughEnforcer);
-    let query_tracker = Arc::new(
-        sqe_coordinator::query_tracker::QueryTracker::new(&config.query_history),
-    );
+    let query_tracker = Arc::new(sqe_coordinator::query_tracker::QueryTracker::new(
+        &config.query_history,
+    ));
     let handler = sqe_coordinator::QueryHandler::new(
-        policy, None, config, None, None, None, None, query_tracker, None,
+        policy,
+        None,
+        config,
+        None,
+        None,
+        None,
+        None,
+        query_tracker,
+        None,
         None, // grant_backend
         None, // lineage observer
         sqe_coordinator::RuntimeCatalogRegistry::default(),
         sqe_core::SecretStore::default(),
-    ).expect("Failed to create QueryHandler");
+    )
+    .expect("Failed to create QueryHandler");
 
     let batches = handler
         .execute(&session, "SELECT 1", None)
@@ -112,7 +120,6 @@ fn test_sql_classification() {
 // Write-path integration tests
 // ---------------------------------------------------------------------------
 
-
 // Test: CTAS roundtrip — create a table, select from it, verify, cleanup
 #[tokio::test(flavor = "multi_thread")]
 #[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
@@ -128,7 +135,9 @@ async fn test_ctas_roundtrip() {
     handler
         .execute(
             &session,
-            "CREATE TABLE test_ns.ctas_test AS SELECT 1 as id, 'hello' as name", None)
+            "CREATE TABLE test_ns.ctas_test AS SELECT 1 as id, 'hello' as name",
+            None,
+        )
         .await
         .expect("CTAS should succeed");
 
@@ -143,9 +152,7 @@ async fn test_ctas_roundtrip() {
 
     // Verify column values
     let batch = &batches[0];
-    let id_col = batch
-        .column_by_name("id")
-        .expect("should have 'id' column");
+    let id_col = batch.column_by_name("id").expect("should have 'id' column");
     let id_arr = id_col
         .as_any()
         .downcast_ref::<arrow_array::Int64Array>()
@@ -183,7 +190,9 @@ async fn test_insert_into() {
     handler
         .execute(
             &session,
-            "CREATE TABLE test_ns.insert_test AS SELECT 1 as id, 'first' as name", None)
+            "CREATE TABLE test_ns.insert_test AS SELECT 1 as id, 'first' as name",
+            None,
+        )
         .await
         .expect("CTAS for insert_test should succeed");
 
@@ -191,7 +200,9 @@ async fn test_insert_into() {
     handler
         .execute(
             &session,
-            "INSERT INTO test_ns.insert_test SELECT 2 as id, 'second' as name", None)
+            "INSERT INTO test_ns.insert_test SELECT 2 as id, 'second' as name",
+            None,
+        )
         .await
         .expect("INSERT INTO should succeed");
 
@@ -226,7 +237,9 @@ async fn test_drop_table() {
     handler
         .execute(
             &session,
-            "CREATE TABLE test_ns.drop_test AS SELECT 1 as id", None)
+            "CREATE TABLE test_ns.drop_test AS SELECT 1 as id",
+            None,
+        )
         .await
         .expect("CTAS for drop_test should succeed");
 
@@ -256,7 +269,9 @@ async fn test_drop_table_if_exists_no_error() {
     let result = handler
         .execute(
             &session,
-            "DROP TABLE IF EXISTS test_ns.nonexistent_table_xyz", None)
+            "DROP TABLE IF EXISTS test_ns.nonexistent_table_xyz",
+            None,
+        )
         .await;
     assert!(
         result.is_ok(),
@@ -284,7 +299,8 @@ fn test_delete_returns_not_implemented() {
     // "overwrite transaction support". Verify that message is present in the
     // error variant so that users get a helpful hint.
     let expected_msg = "overwrite transaction support";
-    let error_msg = "DELETE FROM requires Iceberg overwrite transaction support (planned for Chunk 3)";
+    let error_msg =
+        "DELETE FROM requires Iceberg overwrite transaction support (planned for Chunk 3)";
     assert!(
         error_msg.contains(expected_msg),
         "DELETE error message should mention '{expected_msg}'"
@@ -325,9 +341,7 @@ async fn test_local_fallback_without_workers() {
 fn test_scan_task_roundtrip() {
     let task = sqe_planner::ScanTask {
         fragment_id: "test-001".to_string(),
-        data_file_paths: vec![
-            "s3://bucket/data/file1.parquet".to_string(),
-        ],
+        data_file_paths: vec!["s3://bucket/data/file1.parquet".to_string()],
         file_sizes_bytes: vec![],
         projected_columns: vec!["id".to_string()],
         projected_field_ids: vec![],
@@ -371,24 +385,39 @@ async fn test_local_fallback_select() {
 
     let policy: Arc<dyn sqe_policy::PolicyEnforcer> = Arc::new(sqe_policy::PassthroughEnforcer);
 
-    let query_tracker = Arc::new(
-        sqe_coordinator::query_tracker::QueryTracker::new(&config.query_history),
-    );
+    let query_tracker = Arc::new(sqe_coordinator::query_tracker::QueryTracker::new(
+        &config.query_history,
+    ));
     let handler = sqe_coordinator::QueryHandler::new(
-        policy, None, config, None, None, None, None, query_tracker, None,
+        policy,
+        None,
+        config,
+        None,
+        None,
+        None,
+        None,
+        query_tracker,
+        None,
         None,
         None,
         sqe_coordinator::RuntimeCatalogRegistry::default(),
         sqe_core::SecretStore::default(),
-    ).expect("Failed to create QueryHandler");
+    )
+    .expect("Failed to create QueryHandler");
 
     let _ = handler
-        .execute(&session, "DROP TABLE IF EXISTS test_ns.local_fallback", None)
+        .execute(
+            &session,
+            "DROP TABLE IF EXISTS test_ns.local_fallback",
+            None,
+        )
         .await;
     handler
         .execute(
             &session,
-            "CREATE TABLE test_ns.local_fallback AS SELECT 1 as id, 'local' as name", None)
+            "CREATE TABLE test_ns.local_fallback AS SELECT 1 as id, 'local' as name",
+            None,
+        )
         .await
         .expect("CTAS should succeed");
 
@@ -442,21 +471,30 @@ async fn test_distributed_select() {
          tests/sqe-test.toml) or use --ignored to skip."
     );
 
-    let registry = Arc::new(sqe_coordinator::worker_registry::WorkerRegistry::new(
-        vec![worker_url.to_string()],
-    ));
+    let registry = Arc::new(sqe_coordinator::worker_registry::WorkerRegistry::new(vec![
+        worker_url.to_string(),
+    ]));
     registry.mark_healthy(worker_url).await;
 
-    let query_tracker = Arc::new(
-        sqe_coordinator::query_tracker::QueryTracker::new(&config.query_history),
-    );
+    let query_tracker = Arc::new(sqe_coordinator::query_tracker::QueryTracker::new(
+        &config.query_history,
+    ));
     let handler = sqe_coordinator::QueryHandler::new(
-        policy, None, config, Some(registry), None, None, None, query_tracker, None,
+        policy,
+        None,
+        config,
+        Some(registry),
+        None,
+        None,
+        None,
+        query_tracker,
+        None,
         None,
         None,
         sqe_coordinator::RuntimeCatalogRegistry::default(),
         sqe_core::SecretStore::default(),
-    ).expect("Failed to create QueryHandler");
+    )
+    .expect("Failed to create QueryHandler");
 
     let _ = handler
         .execute(&session, "DROP TABLE IF EXISTS test_ns.dist_test", None)
@@ -464,7 +502,9 @@ async fn test_distributed_select() {
     handler
         .execute(
             &session,
-            "CREATE TABLE test_ns.dist_test AS SELECT 1 as id, 'distributed' as name", None)
+            "CREATE TABLE test_ns.dist_test AS SELECT 1 as id, 'distributed' as name",
+            None,
+        )
         .await
         .expect("CTAS should succeed");
 
@@ -477,7 +517,9 @@ async fn test_distributed_select() {
     let tasks = handler
         .execute(
             &session,
-            "SELECT node_id FROM system.runtime.tasks ORDER BY query_id DESC LIMIT 20", None)
+            "SELECT node_id FROM system.runtime.tasks ORDER BY query_id DESC LIMIT 20",
+            None,
+        )
         .await
         .expect("system.runtime.tasks must be queryable");
     let mut worker_seen = false;
@@ -639,9 +681,8 @@ fn write_test_parquet(dir: &std::path::Path) -> std::path::PathBuf {
     .expect("failed to build test RecordBatch");
 
     let file = std::fs::File::create(&path).expect("failed to create test parquet file");
-    let mut writer =
-        ArrowWriter::try_new(file, Arc::clone(&schema), None)
-            .expect("failed to create ArrowWriter");
+    let mut writer = ArrowWriter::try_new(file, Arc::clone(&schema), None)
+        .expect("failed to create ArrowWriter");
     writer.write(&batch).expect("failed to write batch");
     writer.close().expect("failed to close ArrowWriter");
 
@@ -680,13 +721,18 @@ async fn test_read_parquet_local_file() {
     let batches = handler
         .execute(
             &session,
-            "SELECT * FROM test_ns.from_parquet ORDER BY id", None)
+            "SELECT * FROM test_ns.from_parquet ORDER BY id",
+            None,
+        )
         .await
         .expect("SELECT from from_parquet should succeed");
 
     // 5. Verify row count.
     let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-    assert_eq!(total_rows, 3, "from_parquet table should contain exactly 3 rows");
+    assert_eq!(
+        total_rows, 3,
+        "from_parquet table should contain exactly 3 rows"
+    );
 
     // 6. Verify column values — collect all rows across batches.
     let mut ids: Vec<i64> = Vec::new();
@@ -800,16 +846,19 @@ async fn test_read_csv_local_file() {
         .execute(&session, "DROP TABLE IF EXISTS test_ns.from_csv", None)
         .await;
 
-    let ctas_sql = format!(
-        "CREATE TABLE test_ns.from_csv AS SELECT * FROM read_csv('{csv_path_str}')"
-    );
+    let ctas_sql =
+        format!("CREATE TABLE test_ns.from_csv AS SELECT * FROM read_csv('{csv_path_str}')");
     handler
         .execute(&session, &ctas_sql, None)
         .await
         .expect("CTAS from read_csv should succeed");
 
     let batches = handler
-        .execute(&session, "SELECT id, name FROM test_ns.from_csv ORDER BY id", None)
+        .execute(
+            &session,
+            "SELECT id, name FROM test_ns.from_csv ORDER BY id",
+            None,
+        )
         .await
         .expect("SELECT from from_csv should succeed");
     assert_three_known_rows(&batches);
@@ -834,16 +883,19 @@ async fn test_read_json_local_file() {
         .execute(&session, "DROP TABLE IF EXISTS test_ns.from_json", None)
         .await;
 
-    let ctas_sql = format!(
-        "CREATE TABLE test_ns.from_json AS SELECT * FROM read_json('{json_path_str}')"
-    );
+    let ctas_sql =
+        format!("CREATE TABLE test_ns.from_json AS SELECT * FROM read_json('{json_path_str}')");
     handler
         .execute(&session, &ctas_sql, None)
         .await
         .expect("CTAS from read_json should succeed");
 
     let batches = handler
-        .execute(&session, "SELECT id, name FROM test_ns.from_json ORDER BY id", None)
+        .execute(
+            &session,
+            "SELECT id, name FROM test_ns.from_json ORDER BY id",
+            None,
+        )
         .await
         .expect("SELECT from from_json should succeed");
     assert_three_known_rows(&batches);
@@ -892,31 +944,54 @@ async fn setup_join_fixture() -> (sqe_core::Session, sqe_coordinator::QueryHandl
     let (session, handler) = crate::common::setup_handler().await;
 
     // employees: id BIGINT, name VARCHAR, dept_id BIGINT, salary DOUBLE
-    let _ = handler.execute(&session, "DROP TABLE IF EXISTS test_ns.employees", None).await;
-    handler.execute(&session,
-        "CREATE TABLE test_ns.employees AS \
+    let _ = handler
+        .execute(&session, "DROP TABLE IF EXISTS test_ns.employees", None)
+        .await;
+    handler
+        .execute(
+            &session,
+            "CREATE TABLE test_ns.employees AS \
          SELECT 1 as id, 'Alice'   as name, 10 as dept_id, 90000.0 as salary UNION ALL \
          SELECT 2,        'Bob',            10,             85000.0             UNION ALL \
          SELECT 3,        'Charlie',        20,             70000.0             UNION ALL \
          SELECT 4,        'Dave',           20,             75000.0             UNION ALL \
          SELECT 5,        'Eve',            30,             95000.0             UNION ALL \
-         SELECT 6,        'Frank',          99,             60000.0", None).await.expect("Create employees");
+         SELECT 6,        'Frank',          99,             60000.0",
+            None,
+        )
+        .await
+        .expect("Create employees");
 
     // departments: id BIGINT, dept_name VARCHAR, budget DOUBLE
-    let _ = handler.execute(&session, "DROP TABLE IF EXISTS test_ns.departments", None).await;
-    handler.execute(&session,
-        "CREATE TABLE test_ns.departments AS \
+    let _ = handler
+        .execute(&session, "DROP TABLE IF EXISTS test_ns.departments", None)
+        .await;
+    handler
+        .execute(
+            &session,
+            "CREATE TABLE test_ns.departments AS \
          SELECT 10 as id, 'Engineering' as dept_name, 500000.0 as budget UNION ALL \
          SELECT 20,        'Marketing',               200000.0            UNION ALL \
          SELECT 30,        'Executive',               1000000.0           UNION ALL \
-         SELECT 40,        'HR',                      150000.0", None).await.expect("Create departments");
+         SELECT 40,        'HR',                      150000.0",
+            None,
+        )
+        .await
+        .expect("Create departments");
 
     (session, handler)
 }
 
-async fn teardown_join_fixture(session: &sqe_core::Session, handler: &sqe_coordinator::QueryHandler) {
-    let _ = handler.execute(session, "DROP TABLE IF EXISTS test_ns.employees", None).await;
-    let _ = handler.execute(session, "DROP TABLE IF EXISTS test_ns.departments", None).await;
+async fn teardown_join_fixture(
+    session: &sqe_core::Session,
+    handler: &sqe_coordinator::QueryHandler,
+) {
+    let _ = handler
+        .execute(session, "DROP TABLE IF EXISTS test_ns.employees", None)
+        .await;
+    let _ = handler
+        .execute(session, "DROP TABLE IF EXISTS test_ns.departments", None)
+        .await;
 }
 
 // ---------------------------------------------------------------------------
@@ -929,32 +1004,50 @@ async fn teardown_join_fixture(session: &sqe_core::Session, handler: &sqe_coordi
 async fn test_create_and_drop_view() {
     let (session, handler) = setup_join_fixture().await;
 
-    let _ = handler.execute(&session, "DROP VIEW IF EXISTS test_ns.eng_view", None).await;
+    let _ = handler
+        .execute(&session, "DROP VIEW IF EXISTS test_ns.eng_view", None)
+        .await;
 
     // CREATE VIEW filtering engineering employees
-    handler.execute(&session,
-        "CREATE VIEW test_ns.eng_view AS \
-         SELECT id, name, salary FROM test_ns.employees WHERE dept_id = 10", None).await.expect("CREATE VIEW should succeed");
+    handler
+        .execute(
+            &session,
+            "CREATE VIEW test_ns.eng_view AS \
+         SELECT id, name, salary FROM test_ns.employees WHERE dept_id = 10",
+            None,
+        )
+        .await
+        .expect("CREATE VIEW should succeed");
 
     // SELECT from view
-    let batches = handler.execute(&session, "SELECT * FROM test_ns.eng_view", None)
-        .await.expect("SELECT from view should succeed");
+    let batches = handler
+        .execute(&session, "SELECT * FROM test_ns.eng_view", None)
+        .await
+        .expect("SELECT from view should succeed");
 
-    crate::common::print_results("CREATE VIEW + SELECT", "SELECT * FROM test_ns.eng_view", &batches);
+    crate::common::print_results(
+        "CREATE VIEW + SELECT",
+        "SELECT * FROM test_ns.eng_view",
+        &batches,
+    );
 
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(rows, 2, "Engineering dept has Alice and Bob");
 
     // DROP VIEW
-    handler.execute(&session, "DROP VIEW test_ns.eng_view", None)
-        .await.expect("DROP VIEW should succeed");
+    handler
+        .execute(&session, "DROP VIEW test_ns.eng_view", None)
+        .await
+        .expect("DROP VIEW should succeed");
 
     // View should no longer be queryable. The Polaris in-memory catalog may
     // take a moment to propagate the deletion, so retry with backoff.
     let mut view_gone = false;
     for attempt in 0..10 {
         tokio::time::sleep(std::time::Duration::from_millis(300 * (attempt + 1))).await;
-        let result = handler.execute(&session, "SELECT * FROM test_ns.eng_view", None).await;
+        let result = handler
+            .execute(&session, "SELECT * FROM test_ns.eng_view", None)
+            .await;
         if result.is_err() {
             view_gone = true;
             break;
@@ -974,22 +1067,42 @@ async fn test_create_and_drop_view() {
 #[ignore]
 async fn test_view_with_aggregation() {
     let (session, handler) = setup_join_fixture().await;
-    let _ = handler.execute(&session, "DROP VIEW IF EXISTS test_ns.dept_stats", None).await;
+    let _ = handler
+        .execute(&session, "DROP VIEW IF EXISTS test_ns.dept_stats", None)
+        .await;
 
-    handler.execute(&session,
-        "CREATE VIEW test_ns.dept_stats AS \
+    handler
+        .execute(
+            &session,
+            "CREATE VIEW test_ns.dept_stats AS \
          SELECT dept_id, COUNT(*) as headcount, AVG(salary) as avg_salary \
-         FROM test_ns.employees GROUP BY dept_id", None).await.expect("CREATE VIEW with aggregation");
+         FROM test_ns.employees GROUP BY dept_id",
+            None,
+        )
+        .await
+        .expect("CREATE VIEW with aggregation");
 
-    let batches = handler.execute(&session,
-        "SELECT dept_id, headcount, avg_salary FROM test_ns.dept_stats ORDER BY dept_id", None).await.expect("SELECT from aggregation view");
+    let batches = handler
+        .execute(
+            &session,
+            "SELECT dept_id, headcount, avg_salary FROM test_ns.dept_stats ORDER BY dept_id",
+            None,
+        )
+        .await
+        .expect("SELECT from aggregation view");
 
-    crate::common::print_results("VIEW with GROUP BY", "SELECT * FROM test_ns.dept_stats", &batches);
+    crate::common::print_results(
+        "VIEW with GROUP BY",
+        "SELECT * FROM test_ns.dept_stats",
+        &batches,
+    );
 
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(rows, 4, "Four distinct dept_ids (10, 20, 30, 99)");
 
-    let _ = handler.execute(&session, "DROP VIEW test_ns.dept_stats", None).await;
+    let _ = handler
+        .execute(&session, "DROP VIEW test_ns.dept_stats", None)
+        .await;
     teardown_join_fixture(&session, &handler).await;
 }
 
@@ -1008,8 +1121,10 @@ async fn test_inner_join() {
                INNER JOIN test_ns.departments d ON e.dept_id = d.id \
                ORDER BY e.id";
 
-    let batches = handler.execute(&session, sql, None)
-        .await.expect("INNER JOIN should succeed");
+    let batches = handler
+        .execute(&session, sql, None)
+        .await
+        .expect("INNER JOIN should succeed");
 
     crate::common::print_results("INNER JOIN", sql, &batches);
 
@@ -1019,8 +1134,13 @@ async fn test_inner_join() {
 
     // First row should be Alice in Engineering
     let batch = &batches[0];
-    let name = batch.column_by_name("name").unwrap()
-        .as_any().downcast_ref::<StringArray>().unwrap().value(0);
+    let name = batch
+        .column_by_name("name")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap()
+        .value(0);
     assert_eq!(name, "Alice");
 
     teardown_join_fixture(&session, &handler).await;
@@ -1037,8 +1157,10 @@ async fn test_left_join() {
                LEFT JOIN test_ns.departments d ON e.dept_id = d.id \
                ORDER BY e.id";
 
-    let batches = handler.execute(&session, sql, None)
-        .await.expect("LEFT JOIN should succeed");
+    let batches = handler
+        .execute(&session, sql, None)
+        .await
+        .expect("LEFT JOIN should succeed");
 
     crate::common::print_results("LEFT JOIN", sql, &batches);
 
@@ -1065,8 +1187,10 @@ async fn test_right_join() {
                RIGHT JOIN test_ns.departments d ON e.dept_id = d.id \
                ORDER BY d.id, e.id";
 
-    let batches = handler.execute(&session, sql, None)
-        .await.expect("RIGHT JOIN should succeed");
+    let batches = handler
+        .execute(&session, sql, None)
+        .await
+        .expect("RIGHT JOIN should succeed");
 
     crate::common::print_results("RIGHT JOIN", sql, &batches);
 
@@ -1088,8 +1212,10 @@ async fn test_full_outer_join() {
                FULL OUTER JOIN test_ns.departments d ON e.dept_id = d.id \
                ORDER BY e.id, d.id";
 
-    let batches = handler.execute(&session, sql, None)
-        .await.expect("FULL OUTER JOIN should succeed");
+    let batches = handler
+        .execute(&session, sql, None)
+        .await
+        .expect("FULL OUTER JOIN should succeed");
 
     crate::common::print_results("FULL OUTER JOIN", sql, &batches);
 
@@ -1106,27 +1232,51 @@ async fn test_full_outer_join() {
 async fn test_cross_join() {
     let (session, handler) = crate::common::setup_handler().await;
 
-    let _ = handler.execute(&session, "DROP TABLE IF EXISTS test_ns.colors", None).await;
-    let _ = handler.execute(&session, "DROP TABLE IF EXISTS test_ns.sizes", None).await;
+    let _ = handler
+        .execute(&session, "DROP TABLE IF EXISTS test_ns.colors", None)
+        .await;
+    let _ = handler
+        .execute(&session, "DROP TABLE IF EXISTS test_ns.sizes", None)
+        .await;
 
-    handler.execute(&session,
-        "CREATE TABLE test_ns.colors AS \
-         SELECT 'red' as color UNION ALL SELECT 'blue' UNION ALL SELECT 'green'", None).await.expect("Create colors");
+    handler
+        .execute(
+            &session,
+            "CREATE TABLE test_ns.colors AS \
+         SELECT 'red' as color UNION ALL SELECT 'blue' UNION ALL SELECT 'green'",
+            None,
+        )
+        .await
+        .expect("Create colors");
 
-    handler.execute(&session,
-        "CREATE TABLE test_ns.sizes AS \
-         SELECT 'S' as size UNION ALL SELECT 'M' UNION ALL SELECT 'L'", None).await.expect("Create sizes");
+    handler
+        .execute(
+            &session,
+            "CREATE TABLE test_ns.sizes AS \
+         SELECT 'S' as size UNION ALL SELECT 'M' UNION ALL SELECT 'L'",
+            None,
+        )
+        .await
+        .expect("Create sizes");
 
-    let sql = "SELECT color, size FROM test_ns.colors CROSS JOIN test_ns.sizes ORDER BY color, size";
-    let batches = handler.execute(&session, sql, None).await.expect("CROSS JOIN");
+    let sql =
+        "SELECT color, size FROM test_ns.colors CROSS JOIN test_ns.sizes ORDER BY color, size";
+    let batches = handler
+        .execute(&session, sql, None)
+        .await
+        .expect("CROSS JOIN");
 
     crate::common::print_results("CROSS JOIN (3×3)", sql, &batches);
 
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(rows, 9, "3 colors × 3 sizes = 9 combinations");
 
-    let _ = handler.execute(&session, "DROP TABLE test_ns.colors", None).await;
-    let _ = handler.execute(&session, "DROP TABLE test_ns.sizes", None).await;
+    let _ = handler
+        .execute(&session, "DROP TABLE test_ns.colors", None)
+        .await;
+    let _ = handler
+        .execute(&session, "DROP TABLE test_ns.sizes", None)
+        .await;
 }
 
 // Test: Self-join — manager hierarchy (employee referencing employee)
@@ -1135,21 +1285,32 @@ async fn test_cross_join() {
 async fn test_self_join() {
     let (session, handler) = crate::common::setup_handler().await;
 
-    let _ = handler.execute(&session, "DROP TABLE IF EXISTS test_ns.org", None).await;
-    handler.execute(&session,
-        "CREATE TABLE test_ns.org AS \
+    let _ = handler
+        .execute(&session, "DROP TABLE IF EXISTS test_ns.org", None)
+        .await;
+    handler
+        .execute(
+            &session,
+            "CREATE TABLE test_ns.org AS \
          SELECT 1 as id, 'CEO'      as name, CAST(NULL AS BIGINT) as mgr_id UNION ALL \
          SELECT 2,        'VP Eng',           1                              UNION ALL \
          SELECT 3,        'VP Mkt',           1                              UNION ALL \
          SELECT 4,        'Engineer',         2                              UNION ALL \
-         SELECT 5,        'Marketer',         3", None).await.expect("Create org table");
+         SELECT 5,        'Marketer',         3",
+            None,
+        )
+        .await
+        .expect("Create org table");
 
     let sql = "SELECT e.name as employee, m.name as manager \
                FROM test_ns.org e \
                LEFT JOIN test_ns.org m ON e.mgr_id = m.id \
                ORDER BY e.id";
 
-    let batches = handler.execute(&session, sql, None).await.expect("Self-join");
+    let batches = handler
+        .execute(&session, sql, None)
+        .await
+        .expect("Self-join");
     crate::common::print_results("SELF JOIN (org hierarchy)", sql, &batches);
 
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
@@ -1160,7 +1321,9 @@ async fn test_self_join() {
     let mgr_col = batch.column_by_name("manager").unwrap();
     assert!(mgr_col.is_null(0), "CEO should have NULL manager");
 
-    let _ = handler.execute(&session, "DROP TABLE test_ns.org", None).await;
+    let _ = handler
+        .execute(&session, "DROP TABLE test_ns.org", None)
+        .await;
 }
 
 // ---------------------------------------------------------------------------
@@ -1183,7 +1346,10 @@ async fn test_aggregation_basic() {
                GROUP BY dept_id \
                ORDER BY dept_id";
 
-    let batches = handler.execute(&session, sql, None).await.expect("Aggregation");
+    let batches = handler
+        .execute(&session, sql, None)
+        .await
+        .expect("Aggregation");
     crate::common::print_results("GROUP BY + aggregates", sql, &batches);
 
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
@@ -1191,8 +1357,13 @@ async fn test_aggregation_basic() {
 
     // dept_id=10: Alice(90000) + Bob(85000) → count=2, sum=175000
     let batch = &batches[0];
-    let headcount = batch.column_by_name("headcount").unwrap()
-        .as_any().downcast_ref::<Int64Array>().unwrap().value(0);
+    let headcount = batch
+        .column_by_name("headcount")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0);
     assert_eq!(headcount, 2, "Engineering has 2 employees");
 
     teardown_join_fixture(&session, &handler).await;
@@ -1210,12 +1381,18 @@ async fn test_having_clause() {
                HAVING AVG(salary) > 75000.0 \
                ORDER BY dept_id";
 
-    let batches = handler.execute(&session, sql, None).await.expect("HAVING clause");
+    let batches = handler
+        .execute(&session, sql, None)
+        .await
+        .expect("HAVING clause");
     crate::common::print_results("HAVING AVG(salary) > 75000", sql, &batches);
 
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     // dept 10: avg=87500 ✓, dept 20: avg=72500 ✗, dept 30: avg=95000 ✓, dept 99: avg=60000 ✗
-    assert_eq!(rows, 2, "Only dept 10 (avg=87500) and dept 30 (avg=95000) qualify");
+    assert_eq!(
+        rows, 2,
+        "Only dept 10 (avg=87500) and dept 30 (avg=95000) qualify"
+    );
 
     teardown_join_fixture(&session, &handler).await;
 }
@@ -1232,7 +1409,10 @@ async fn test_join_with_aggregation() {
                GROUP BY d.dept_name \
                ORDER BY headcount DESC, d.dept_name";
 
-    let batches = handler.execute(&session, sql, None).await.expect("JOIN + GROUP BY");
+    let batches = handler
+        .execute(&session, sql, None)
+        .await
+        .expect("JOIN + GROUP BY");
     crate::common::print_results("JOIN + GROUP BY", sql, &batches);
 
     // 4 departments, HR has 0 employees
@@ -1256,7 +1436,10 @@ async fn test_cte_join() {
                INNER JOIN test_ns.departments d ON h.dept_id = d.id \
                ORDER BY h.name";
 
-    let batches = handler.execute(&session, sql, None).await.expect("CTE + JOIN");
+    let batches = handler
+        .execute(&session, sql, None)
+        .await
+        .expect("CTE + JOIN");
     crate::common::print_results("CTE + INNER JOIN", sql, &batches);
 
     // Alice (90000), Bob (85000), Eve (95000) earn > 80000 and have valid depts
@@ -1277,7 +1460,10 @@ async fn test_subquery_where() {
                WHERE salary > (SELECT AVG(salary) FROM test_ns.employees) \
                ORDER BY salary DESC";
 
-    let batches = handler.execute(&session, sql, None).await.expect("Subquery in WHERE");
+    let batches = handler
+        .execute(&session, sql, None)
+        .await
+        .expect("Subquery in WHERE");
     crate::common::print_results("Subquery (salary > AVG)", sql, &batches);
 
     // AVG salary = (90000+85000+70000+75000+95000+60000)/6 = 79166.67
@@ -1287,8 +1473,13 @@ async fn test_subquery_where() {
 
     // Top earner is Eve
     let batch = &batches[0];
-    let name = batch.column_by_name("name").unwrap()
-        .as_any().downcast_ref::<StringArray>().unwrap().value(0);
+    let name = batch
+        .column_by_name("name")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap()
+        .value(0);
     assert_eq!(name, "Eve");
 
     teardown_join_fixture(&session, &handler).await;
@@ -1305,7 +1496,10 @@ async fn test_scalar_subquery_select() {
                FROM test_ns.employees \
                ORDER BY salary_vs_avg DESC";
 
-    let batches = handler.execute(&session, sql, None).await.expect("Scalar subquery in SELECT");
+    let batches = handler
+        .execute(&session, sql, None)
+        .await
+        .expect("Scalar subquery in SELECT");
     crate::common::print_results("Salary vs AVG (scalar subquery)", sql, &batches);
 
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
@@ -1320,32 +1514,55 @@ async fn test_scalar_subquery_select() {
 async fn test_union_all() {
     let (session, handler) = crate::common::setup_handler().await;
 
-    let _ = handler.execute(&session, "DROP TABLE IF EXISTS test_ns.q1_sales", None).await;
-    let _ = handler.execute(&session, "DROP TABLE IF EXISTS test_ns.q2_sales", None).await;
+    let _ = handler
+        .execute(&session, "DROP TABLE IF EXISTS test_ns.q1_sales", None)
+        .await;
+    let _ = handler
+        .execute(&session, "DROP TABLE IF EXISTS test_ns.q2_sales", None)
+        .await;
 
-    handler.execute(&session,
-        "CREATE TABLE test_ns.q1_sales AS \
+    handler
+        .execute(
+            &session,
+            "CREATE TABLE test_ns.q1_sales AS \
          SELECT 'Q1' as quarter, 'Widget' as product, 100 as qty UNION ALL \
-         SELECT 'Q1', 'Gadget', 200", None).await.expect("Create q1_sales");
+         SELECT 'Q1', 'Gadget', 200",
+            None,
+        )
+        .await
+        .expect("Create q1_sales");
 
-    handler.execute(&session,
-        "CREATE TABLE test_ns.q2_sales AS \
+    handler
+        .execute(
+            &session,
+            "CREATE TABLE test_ns.q2_sales AS \
          SELECT 'Q2' as quarter, 'Widget' as product, 150 as qty UNION ALL \
-         SELECT 'Q2', 'Gadget', 250", None).await.expect("Create q2_sales");
+         SELECT 'Q2', 'Gadget', 250",
+            None,
+        )
+        .await
+        .expect("Create q2_sales");
 
     let sql = "SELECT quarter, product, qty FROM test_ns.q1_sales \
                UNION ALL \
                SELECT quarter, product, qty FROM test_ns.q2_sales \
                ORDER BY quarter, product";
 
-    let batches = handler.execute(&session, sql, None).await.expect("UNION ALL across tables");
+    let batches = handler
+        .execute(&session, sql, None)
+        .await
+        .expect("UNION ALL across tables");
     crate::common::print_results("UNION ALL across tables", sql, &batches);
 
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(rows, 4, "2 rows from Q1 + 2 from Q2");
 
-    let _ = handler.execute(&session, "DROP TABLE test_ns.q1_sales", None).await;
-    let _ = handler.execute(&session, "DROP TABLE test_ns.q2_sales", None).await;
+    let _ = handler
+        .execute(&session, "DROP TABLE test_ns.q1_sales", None)
+        .await;
+    let _ = handler
+        .execute(&session, "DROP TABLE test_ns.q2_sales", None)
+        .await;
 }
 
 // Test: ORDER BY, LIMIT, OFFSET
@@ -1355,7 +1572,10 @@ async fn test_order_limit_offset() {
     let (session, handler) = setup_join_fixture().await;
 
     let sql = "SELECT name, salary FROM test_ns.employees ORDER BY salary DESC LIMIT 3 OFFSET 1";
-    let batches = handler.execute(&session, sql, None).await.expect("ORDER BY + LIMIT + OFFSET");
+    let batches = handler
+        .execute(&session, sql, None)
+        .await
+        .expect("ORDER BY + LIMIT + OFFSET");
     crate::common::print_results("ORDER BY DESC LIMIT 3 OFFSET 1", sql, &batches);
 
     // Sorted: Eve(95000), Alice(90000), Bob(85000), Dave(75000), Charlie(70000), Frank(60000)
@@ -1364,8 +1584,13 @@ async fn test_order_limit_offset() {
     assert_eq!(rows, 3, "LIMIT 3 with OFFSET 1");
 
     let batch = &batches[0];
-    let first = batch.column_by_name("name").unwrap()
-        .as_any().downcast_ref::<StringArray>().unwrap().value(0);
+    let first = batch
+        .column_by_name("name")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap()
+        .value(0);
     assert_eq!(first, "Alice", "After offset, first is Alice (2nd highest)");
 
     teardown_join_fixture(&session, &handler).await;
@@ -1382,8 +1607,15 @@ async fn test_where_conditions() {
                WHERE (dept_id = 10 OR dept_id = 20) AND salary >= 75000.0 \
                ORDER BY salary DESC";
 
-    let batches = handler.execute(&session, sql, None).await.expect("Complex WHERE");
-    crate::common::print_results("WHERE (dept=10 OR dept=20) AND salary >= 75000", sql, &batches);
+    let batches = handler
+        .execute(&session, sql, None)
+        .await
+        .expect("Complex WHERE");
+    crate::common::print_results(
+        "WHERE (dept=10 OR dept=20) AND salary >= 75000",
+        sql,
+        &batches,
+    );
 
     // dept 10: Alice(90000)✓ Bob(85000)✓  |  dept 20: Dave(75000)✓ Charlie(70000)✗
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
@@ -1407,7 +1639,10 @@ async fn test_case_expression() {
                FROM test_ns.employees \
                ORDER BY salary DESC";
 
-    let batches = handler.execute(&session, sql, None).await.expect("CASE expression");
+    let batches = handler
+        .execute(&session, sql, None)
+        .await
+        .expect("CASE expression");
     crate::common::print_results("CASE WHEN salary tiers", sql, &batches);
 
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
@@ -1415,8 +1650,12 @@ async fn test_case_expression() {
 
     // Eve and Alice should be Senior
     let batch = &batches[0];
-    let level_col = batch.column_by_name("level").unwrap()
-        .as_any().downcast_ref::<StringArray>().unwrap();
+    let level_col = batch
+        .column_by_name("level")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
     assert_eq!(level_col.value(0), "Senior", "Eve: Senior");
     assert_eq!(level_col.value(1), "Senior", "Alice: Senior");
 
@@ -1438,15 +1677,27 @@ async fn test_string_functions() {
                ORDER BY id \
                LIMIT 3";
 
-    let batches = handler.execute(&session, sql, None).await.expect("String functions");
-    crate::common::print_results("String functions (UPPER, LOWER, LENGTH, CONCAT)", sql, &batches);
+    let batches = handler
+        .execute(&session, sql, None)
+        .await
+        .expect("String functions");
+    crate::common::print_results(
+        "String functions (UPPER, LOWER, LENGTH, CONCAT)",
+        sql,
+        &batches,
+    );
 
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(rows, 3);
 
     let batch = &batches[0];
-    let upper = batch.column_by_name("upper_name").unwrap()
-        .as_any().downcast_ref::<StringArray>().unwrap().value(0);
+    let upper = batch
+        .column_by_name("upper_name")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap()
+        .value(0);
     assert_eq!(upper, "ALICE");
 
     teardown_join_fixture(&session, &handler).await;
@@ -1464,7 +1715,10 @@ async fn test_math_expressions() {
                FROM test_ns.employees \
                ORDER BY id";
 
-    let batches = handler.execute(&session, sql, None).await.expect("Math expressions");
+    let batches = handler
+        .execute(&session, sql, None)
+        .await
+        .expect("Math expressions");
     crate::common::print_results("Math (ROUND, FLOOR, salary expressions)", sql, &batches);
 
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
@@ -1491,8 +1745,15 @@ async fn test_multiple_ctes() {
                INNER JOIN high_depts hd ON e.dept_id = hd.dept_id \
                ORDER BY e.salary DESC";
 
-    let batches = handler.execute(&session, sql, None).await.expect("Multiple CTEs");
-    crate::common::print_results("Multiple CTEs (dept_avg → high_depts → employees)", sql, &batches);
+    let batches = handler
+        .execute(&session, sql, None)
+        .await
+        .expect("Multiple CTEs");
+    crate::common::print_results(
+        "Multiple CTEs (dept_avg → high_depts → employees)",
+        sql,
+        &batches,
+    );
 
     // dept 10: avg=87500 ✓ (Alice+Bob), dept 30: avg=95000 ✓ (Eve), dept 20: avg=72500 ✗
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
@@ -1507,13 +1768,21 @@ async fn test_multiple_ctes() {
 async fn test_three_way_join() {
     let (session, handler) = setup_join_fixture().await;
 
-    let _ = handler.execute(&session, "DROP TABLE IF EXISTS test_ns.projects", None).await;
-    handler.execute(&session,
-        "CREATE TABLE test_ns.projects AS \
+    let _ = handler
+        .execute(&session, "DROP TABLE IF EXISTS test_ns.projects", None)
+        .await;
+    handler
+        .execute(
+            &session,
+            "CREATE TABLE test_ns.projects AS \
          SELECT 101 as project_id, 'Alpha'  as project_name, 10 as owner_dept UNION ALL \
          SELECT 102,               'Beta',                   20               UNION ALL \
          SELECT 103,               'Gamma',                  10               UNION ALL \
-         SELECT 104,               'Delta',                  40", None).await.expect("Create projects");
+         SELECT 104,               'Delta',                  40",
+            None,
+        )
+        .await
+        .expect("Create projects");
 
     let sql = "SELECT e.name, d.dept_name, p.project_name \
                FROM test_ns.employees e \
@@ -1521,8 +1790,15 @@ async fn test_three_way_join() {
                INNER JOIN test_ns.projects p ON e.dept_id = p.owner_dept \
                ORDER BY e.name, p.project_name";
 
-    let batches = handler.execute(&session, sql, None).await.expect("Three-way JOIN");
-    crate::common::print_results("Three-way JOIN (employees × departments × projects)", sql, &batches);
+    let batches = handler
+        .execute(&session, sql, None)
+        .await
+        .expect("Three-way JOIN");
+    crate::common::print_results(
+        "Three-way JOIN (employees × departments × projects)",
+        sql,
+        &batches,
+    );
 
     // eng dept (10): Alice+Bob × Alpha+Gamma = 4 rows
     // mkt dept (20): Charlie+Dave × Beta = 2 rows
@@ -1530,7 +1806,9 @@ async fn test_three_way_join() {
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(rows, 6, "4 eng + 2 mkt = 6 rows");
 
-    let _ = handler.execute(&session, "DROP TABLE test_ns.projects", None).await;
+    let _ = handler
+        .execute(&session, "DROP TABLE test_ns.projects", None)
+        .await;
     teardown_join_fixture(&session, &handler).await;
 }
 
@@ -1545,7 +1823,10 @@ async fn test_in_subquery() {
                WHERE dept_id IN (SELECT id FROM test_ns.departments WHERE dept_name LIKE '%ing%') \
                ORDER BY name";
 
-    let batches = handler.execute(&session, sql, None).await.expect("IN subquery");
+    let batches = handler
+        .execute(&session, sql, None)
+        .await
+        .expect("IN subquery");
     crate::common::print_results("IN (subquery: depts with 'ing' in name)", sql, &batches);
 
     // 'Engineering' and 'Marketing' match — dept ids 10 and 20
@@ -1569,7 +1850,10 @@ async fn test_exists_subquery() {
                ) \
                ORDER BY dept_name";
 
-    let batches = handler.execute(&session, sql, None).await.expect("EXISTS subquery");
+    let batches = handler
+        .execute(&session, sql, None)
+        .await
+        .expect("EXISTS subquery");
     crate::common::print_results("EXISTS (dept has high earner > 85000)", sql, &batches);
 
     // dept 10: Alice(90000) > 85000 ✓ | dept 30: Eve(95000) > 85000 ✓ | others ✗
@@ -1592,7 +1876,10 @@ async fn test_window_functions() {
                WHERE dept_id IN (10, 20) \
                ORDER BY dept_id, salary DESC";
 
-    let batches = handler.execute(&session, sql, None).await.expect("Window functions");
+    let batches = handler
+        .execute(&session, sql, None)
+        .await
+        .expect("Window functions");
     crate::common::print_results("ROW_NUMBER + RANK (partition by dept)", sql, &batches);
 
     // dept 10: Alice row_num=1, Bob row_num=2 | dept 20: Dave row_num=1, Charlie row_num=2
@@ -1613,7 +1900,10 @@ async fn test_window_running_total() {
                FROM test_ns.employees \
                ORDER BY salary";
 
-    let batches = handler.execute(&session, sql, None).await.expect("Running total window");
+    let batches = handler
+        .execute(&session, sql, None)
+        .await
+        .expect("Running total window");
     crate::common::print_results("Running total (SUM OVER ORDER BY salary)", sql, &batches);
 
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
@@ -1640,7 +1930,10 @@ async fn test_explain_plan() {
     crate::common::print_results("EXPLAIN", sql, &batches);
 
     let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-    assert_eq!(total_rows, 2, "EXPLAIN returns exactly 2 rows (logical + physical)");
+    assert_eq!(
+        total_rows, 2,
+        "EXPLAIN returns exactly 2 rows (logical + physical)"
+    );
 
     let batch = &batches[0];
     let plan_type_col = batch.column_by_name("plan_type").expect("plan_type column");
@@ -1657,8 +1950,14 @@ async fn test_explain_plan() {
         .as_any()
         .downcast_ref::<StringArray>()
         .expect("plan is Utf8");
-    assert!(!plans.value(0).is_empty(), "logical plan text must not be empty");
-    assert!(!plans.value(1).is_empty(), "physical plan text must not be empty");
+    assert!(
+        !plans.value(0).is_empty(),
+        "logical plan text must not be empty"
+    );
+    assert!(
+        !plans.value(1).is_empty(),
+        "physical plan text must not be empty"
+    );
     assert!(
         plans.value(0).contains("employees"),
         "logical plan should mention 'employees' table"
@@ -1681,13 +1980,28 @@ async fn test_explain_analyze() {
     crate::common::print_results("EXPLAIN ANALYZE", sql, &batches);
 
     let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-    assert!(total_rows >= 1, "EXPLAIN ANALYZE should return at least one operator row");
+    assert!(
+        total_rows >= 1,
+        "EXPLAIN ANALYZE should return at least one operator row"
+    );
 
     let batch = &batches[0];
-    assert!(batch.column_by_name("step").is_some(), "must have 'step' column");
-    assert!(batch.column_by_name("operation").is_some(), "must have 'operation' column");
-    assert!(batch.column_by_name("output_rows").is_some(), "must have 'output_rows' column");
-    assert!(batch.column_by_name("elapsed_ms").is_some(), "must have 'elapsed_ms' column");
+    assert!(
+        batch.column_by_name("step").is_some(),
+        "must have 'step' column"
+    );
+    assert!(
+        batch.column_by_name("operation").is_some(),
+        "must have 'operation' column"
+    );
+    assert!(
+        batch.column_by_name("output_rows").is_some(),
+        "must have 'output_rows' column"
+    );
+    assert!(
+        batch.column_by_name("elapsed_ms").is_some(),
+        "must have 'elapsed_ms' column"
+    );
 
     teardown_join_fixture(&session, &handler).await;
 }
@@ -1706,7 +2020,10 @@ async fn test_explain_full() {
     crate::common::print_results("EXPLAIN FULL", sql, &batches);
 
     let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-    assert!(total_rows >= 1, "EXPLAIN FULL should return at least one row");
+    assert!(
+        total_rows >= 1,
+        "EXPLAIN FULL should return at least one row"
+    );
 
     let batch = &batches[0];
     assert!(batch.column_by_name("step").is_some());
@@ -1726,8 +2043,7 @@ async fn test_explain_full() {
         .unwrap();
     let files_total_col = batch.column_by_name("files_total").unwrap();
 
-    let scan_row = (0..batch.num_rows())
-        .find(|&i| ops.value(i) == "IcebergScanExec");
+    let scan_row = (0..batch.num_rows()).find(|&i| ops.value(i) == "IcebergScanExec");
 
     assert!(
         scan_row.is_some(),
@@ -1779,13 +2095,14 @@ async fn test_explain_policy_aware() {
 /// Expects SQE_TEST_KEYCLOAK_URL to be set (e.g. "http://localhost:8080").
 fn keycloak_config() -> Option<sqe_core::SqeConfig> {
     let kc_url = std::env::var("SQE_TEST_KEYCLOAK_URL").ok()?;
-    let mut config =
-        sqe_core::SqeConfig::load(&crate::common::test_config_path()).expect("Failed to load test config");
+    let mut config = sqe_core::SqeConfig::load(&crate::common::test_config_path())
+        .expect("Failed to load test config");
     config.auth.keycloak_url = kc_url;
     config.auth.realm = "iceberg".to_string();
     config.auth.client_id = "sqe-client".to_string();
-    config.auth.client_secret =
-        std::env::var("SQE_TEST_CLIENT_SECRET").unwrap_or_else(|_| "sqe-secret-change-me".to_string()).into();
+    config.auth.client_secret = std::env::var("SQE_TEST_CLIENT_SECRET")
+        .unwrap_or_else(|_| "sqe-secret-change-me".to_string())
+        .into();
     config.auth.token_endpoint.clear(); // Force Keycloak ROPC mode
     Some(config)
 }
@@ -1815,7 +2132,10 @@ async fn test_keycloak_auth_with_test_users() {
     assert_eq!(admin_session.user.username, "adminuser");
     assert!(!admin_session.access_token().is_empty());
     assert!(
-        admin_session.user.roles.contains(&"catalog_admin".to_string()),
+        admin_session
+            .user
+            .roles
+            .contains(&"catalog_admin".to_string()),
         "adminuser should have catalog_admin role, got: {:?}",
         admin_session.user.roles
     );
@@ -1827,7 +2147,10 @@ async fn test_keycloak_auth_with_test_users() {
         .expect("testuser auth should succeed");
     assert_eq!(test_session.user.username, "testuser");
     assert!(
-        test_session.user.roles.contains(&"table_reader".to_string()),
+        test_session
+            .user
+            .roles
+            .contains(&"table_reader".to_string()),
         "testuser should have table_reader role"
     );
     assert!(
@@ -1839,7 +2162,9 @@ async fn test_keycloak_auth_with_test_users() {
     );
 
     // Invalid credentials should fail
-    let result = authenticator.authenticate("testuser", "wrong_password").await;
+    let result = authenticator
+        .authenticate("testuser", "wrong_password")
+        .await;
     assert!(result.is_err(), "Wrong password should fail authentication");
 }
 
@@ -1899,19 +2224,24 @@ async fn test_different_user_catalog_visibility() {
         .expect("Failed to create Keycloak authenticator");
 
     let policy: Arc<dyn sqe_policy::PolicyEnforcer> = Arc::new(sqe_policy::PassthroughEnforcer);
-    let handler =
-        sqe_coordinator::QueryHandler::new(
-            policy,
-            None,
-            config.clone(),
-            None, None, None, None,
-            Arc::new(sqe_coordinator::query_tracker::QueryTracker::new(&config.query_history)),
-            None,
-            None, // grant_backend
-            None, // lineage observer
-            sqe_coordinator::RuntimeCatalogRegistry::default(),
-            sqe_core::SecretStore::default(),
-        ).expect("Failed to create QueryHandler");
+    let handler = sqe_coordinator::QueryHandler::new(
+        policy,
+        None,
+        config.clone(),
+        None,
+        None,
+        None,
+        None,
+        Arc::new(sqe_coordinator::query_tracker::QueryTracker::new(
+            &config.query_history,
+        )),
+        None,
+        None, // grant_backend
+        None, // lineage observer
+        sqe_coordinator::RuntimeCatalogRegistry::default(),
+        sqe_core::SecretStore::default(),
+    )
+    .expect("Failed to create QueryHandler");
 
     // adminuser has catalog_admin + table_reader + data_writer roles
     let admin_session = authenticator
@@ -1939,10 +2269,7 @@ async fn test_different_user_catalog_visibility() {
 
     // Both users should be able to list schemas (visibility depends on Polaris ACLs).
     // At minimum, verify both queries succeed without errors.
-    assert!(
-        admin_rows > 0,
-        "adminuser should see at least one schema"
-    );
+    assert!(admin_rows > 0, "adminuser should see at least one schema");
     println!(
         "Catalog visibility: adminuser sees {admin_rows} schemas, testuser sees {test_rows} schemas"
     );
@@ -1991,32 +2318,35 @@ impl sqe_trino_compat::server::TrinoQueryExecutor for TestTrinoQuery {
 async fn test_trino_http_query() {
     crate::common::init_tracing();
 
-    let config =
-        sqe_core::SqeConfig::load(&crate::common::test_config_path()).expect("Failed to load test config");
+    let config = sqe_core::SqeConfig::load(&crate::common::test_config_path())
+        .expect("Failed to load test config");
     let authenticator = Arc::new(
         sqe_auth::Authenticator::new(&config.auth)
             .await
             .expect("Failed to create authenticator"),
     );
     let policy: Arc<dyn sqe_policy::PolicyEnforcer> = Arc::new(sqe_policy::PassthroughEnforcer);
-    let query_tracker = Arc::new(
-        sqe_coordinator::query_tracker::QueryTracker::new(&config.query_history),
+    let query_tracker = Arc::new(sqe_coordinator::query_tracker::QueryTracker::new(
+        &config.query_history,
+    ));
+    let handler = Arc::new(
+        sqe_coordinator::QueryHandler::new(
+            policy,
+            None,
+            config,
+            None,
+            None,
+            None,
+            None,
+            query_tracker,
+            None,
+            None, // grant_backend
+            None, // lineage observer
+            sqe_coordinator::RuntimeCatalogRegistry::default(),
+            sqe_core::SecretStore::default(),
+        )
+        .expect("Failed to create QueryHandler"),
     );
-    let handler = Arc::new(sqe_coordinator::QueryHandler::new(
-        policy,
-        None,
-        config,
-        None,
-        None,
-        None,
-        None,
-        query_tracker,
-        None,
-        None, // grant_backend
-        None, // lineage observer
-        sqe_coordinator::RuntimeCatalogRegistry::default(),
-        sqe_core::SecretStore::default(),
-    ).expect("Failed to create QueryHandler"));
 
     // Bind to port 0 to get an OS-assigned free port
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind to ephemeral port");
@@ -2122,12 +2452,18 @@ async fn test_table_lifecycle_edge_cases() {
         let result = handler.execute(session, sql, None).await;
         let actual_ok = result.is_ok();
         if actual_ok == expect_ok {
-            let rows = result.as_ref().map(|b| b.iter().map(|b| b.num_rows()).sum::<usize>()).unwrap_or(0);
+            let rows = result
+                .as_ref()
+                .map(|b| b.iter().map(|b| b.num_rows()).sum::<usize>())
+                .unwrap_or(0);
             println!("  ✓ {label} (rows={rows})");
             true
         } else {
             let detail = match &result {
-                Ok(batches) => format!("Ok({} rows)", batches.iter().map(|b| b.num_rows()).sum::<usize>()),
+                Ok(batches) => format!(
+                    "Ok({} rows)",
+                    batches.iter().map(|b| b.num_rows()).sum::<usize>()
+                ),
                 Err(e) => format!("Err({e})"),
             };
             println!("  ✗ {label}: expected ok={expect_ok}, got {detail}");
@@ -2139,140 +2475,270 @@ async fn test_table_lifecycle_edge_cases() {
 
     // --- Empty table ---
     println!("\n=== Empty table lifecycle ===");
-    let _ = handler.execute(&session, "DROP TABLE IF EXISTS test_ns.edge_empty", None).await;
+    let _ = handler
+        .execute(&session, "DROP TABLE IF EXISTS test_ns.edge_empty", None)
+        .await;
 
-    if !check(&handler, &session,
+    if !check(
+        &handler,
+        &session,
         "CTAS empty",
         "CREATE TABLE test_ns.edge_empty AS SELECT CAST(1 AS INT) as id, 'x' as name WHERE false",
         true,
-    ).await { failures += 1; }
+    )
+    .await
+    {
+        failures += 1;
+    }
 
-    if !check(&handler, &session,
+    if !check(
+        &handler,
+        &session,
         "SELECT from empty table",
         "SELECT * FROM test_ns.edge_empty",
         true,
-    ).await { failures += 1; }
+    )
+    .await
+    {
+        failures += 1;
+    }
 
-    if !check(&handler, &session,
+    if !check(
+        &handler,
+        &session,
         "COUNT from empty table",
         "SELECT COUNT(*) FROM test_ns.edge_empty",
         true,
-    ).await { failures += 1; }
+    )
+    .await
+    {
+        failures += 1;
+    }
 
-    if !check(&handler, &session,
+    if !check(
+        &handler,
+        &session,
         "DROP empty table",
         "DROP TABLE test_ns.edge_empty",
         true,
-    ).await { failures += 1; }
+    )
+    .await
+    {
+        failures += 1;
+    }
 
     // --- DROP + re-CREATE ---
     println!("\n=== Drop and re-create ===");
-    let _ = handler.execute(&session, "DROP TABLE IF EXISTS test_ns.edge_recreate", None).await;
+    let _ = handler
+        .execute(&session, "DROP TABLE IF EXISTS test_ns.edge_recreate", None)
+        .await;
 
-    if !check(&handler, &session,
+    if !check(
+        &handler,
+        &session,
         "CTAS first version",
         "CREATE TABLE test_ns.edge_recreate AS SELECT 1 as id, 'first' as val",
         true,
-    ).await { failures += 1; }
+    )
+    .await
+    {
+        failures += 1;
+    }
 
-    if !check(&handler, &session,
+    if !check(
+        &handler,
+        &session,
         "SELECT first version",
         "SELECT * FROM test_ns.edge_recreate",
         true,
-    ).await { failures += 1; }
+    )
+    .await
+    {
+        failures += 1;
+    }
 
-    if !check(&handler, &session,
+    if !check(
+        &handler,
+        &session,
         "DROP for re-create",
         "DROP TABLE test_ns.edge_recreate",
         true,
-    ).await { failures += 1; }
+    )
+    .await
+    {
+        failures += 1;
+    }
 
     // Small delay for catalog consistency
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
-    if !check(&handler, &session,
+    if !check(
+        &handler,
+        &session,
         "CTAS re-create same name",
         "CREATE TABLE test_ns.edge_recreate AS SELECT 2 as id, 'second' as val",
         true,
-    ).await { failures += 1; }
+    )
+    .await
+    {
+        failures += 1;
+    }
 
-    if !check(&handler, &session,
+    if !check(
+        &handler,
+        &session,
         "SELECT after re-create",
         "SELECT * FROM test_ns.edge_recreate",
         true,
-    ).await { failures += 1; }
+    )
+    .await
+    {
+        failures += 1;
+    }
 
-    let _ = handler.execute(&session, "DROP TABLE IF EXISTS test_ns.edge_recreate", None).await;
+    let _ = handler
+        .execute(&session, "DROP TABLE IF EXISTS test_ns.edge_recreate", None)
+        .await;
 
     // --- Non-existent table ---
     println!("\n=== Non-existent table ===");
 
-    if !check(&handler, &session,
+    if !check(
+        &handler,
+        &session,
         "DROP IF EXISTS non-existent",
         "DROP TABLE IF EXISTS test_ns.does_not_exist_xyz",
         true,
-    ).await { failures += 1; }
+    )
+    .await
+    {
+        failures += 1;
+    }
 
-    if !check(&handler, &session,
+    if !check(
+        &handler,
+        &session,
         "DROP strict non-existent (should fail)",
         "DROP TABLE test_ns.does_not_exist_xyz",
         false,
-    ).await { failures += 1; }
+    )
+    .await
+    {
+        failures += 1;
+    }
 
-    if !check(&handler, &session,
+    if !check(
+        &handler,
+        &session,
         "SELECT from non-existent (should fail)",
         "SELECT * FROM test_ns.does_not_exist_xyz",
         false,
-    ).await { failures += 1; }
+    )
+    .await
+    {
+        failures += 1;
+    }
 
     // --- Double CREATE ---
     println!("\n=== Double create ===");
-    let _ = handler.execute(&session, "DROP TABLE IF EXISTS test_ns.edge_double", None).await;
+    let _ = handler
+        .execute(&session, "DROP TABLE IF EXISTS test_ns.edge_double", None)
+        .await;
 
-    if !check(&handler, &session,
+    if !check(
+        &handler,
+        &session,
         "CREATE first",
         "CREATE TABLE test_ns.edge_double AS SELECT 1 as x",
         true,
-    ).await { failures += 1; }
+    )
+    .await
+    {
+        failures += 1;
+    }
 
-    if !check(&handler, &session,
+    if !check(
+        &handler,
+        &session,
         "CREATE duplicate (should fail)",
         "CREATE TABLE test_ns.edge_double AS SELECT 2 as x",
         false,
-    ).await { failures += 1; }
+    )
+    .await
+    {
+        failures += 1;
+    }
 
-    let _ = handler.execute(&session, "DROP TABLE IF EXISTS test_ns.edge_double", None).await;
+    let _ = handler
+        .execute(&session, "DROP TABLE IF EXISTS test_ns.edge_double", None)
+        .await;
 
     // --- Multiple INSERTs to same table (file name uniqueness) ---
     println!("\n=== Multiple INSERTs ===");
-    let _ = handler.execute(&session, "DROP TABLE IF EXISTS test_ns.edge_multi_insert", None).await;
+    let _ = handler
+        .execute(
+            &session,
+            "DROP TABLE IF EXISTS test_ns.edge_multi_insert",
+            None,
+        )
+        .await;
 
-    if !check(&handler, &session,
+    if !check(
+        &handler,
+        &session,
         "CTAS base table",
         "CREATE TABLE test_ns.edge_multi_insert AS SELECT 1 as id, 'first' as val",
         true,
-    ).await { failures += 1; }
+    )
+    .await
+    {
+        failures += 1;
+    }
 
-    if !check(&handler, &session,
+    if !check(
+        &handler,
+        &session,
         "INSERT second batch",
         "INSERT INTO test_ns.edge_multi_insert SELECT 2 as id, 'second' as val",
         true,
-    ).await { failures += 1; }
+    )
+    .await
+    {
+        failures += 1;
+    }
 
-    if !check(&handler, &session,
+    if !check(
+        &handler,
+        &session,
         "INSERT third batch",
         "INSERT INTO test_ns.edge_multi_insert SELECT 3 as id, 'third' as val",
         true,
-    ).await { failures += 1; }
+    )
+    .await
+    {
+        failures += 1;
+    }
 
     // Verify all 3 rows are present
-    let batches = handler.execute(&session,
-        "SELECT COUNT(*) as cnt FROM test_ns.edge_multi_insert", None).await.expect("COUNT should succeed");
+    let batches = handler
+        .execute(
+            &session,
+            "SELECT COUNT(*) as cnt FROM test_ns.edge_multi_insert",
+            None,
+        )
+        .await
+        .expect("COUNT should succeed");
     let total: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert!(total > 0, "COUNT query should return at least one row");
     crate::common::print_results("Multi-INSERT count", "SELECT COUNT(*)", &batches);
 
-    let _ = handler.execute(&session, "DROP TABLE IF EXISTS test_ns.edge_multi_insert", None).await;
+    let _ = handler
+        .execute(
+            &session,
+            "DROP TABLE IF EXISTS test_ns.edge_multi_insert",
+            None,
+        )
+        .await;
 
     println!("\n=== Result: {} test(s) failed ===", failures);
     assert_eq!(failures, 0, "{failures} edge case(s) failed");
@@ -2290,20 +2756,36 @@ async fn test_function_compat_and_type_errors() {
         ("lower(int)", "SELECT lower(42)", false),
         ("upper(boolean)", "SELECT upper(false)", false),
         ("abs(varchar)", "SELECT abs('hello')", false),
-
         // Date/time functions — needed for dbt models
         ("year(date)", "SELECT year(DATE '2026-03-30')", true),
         ("month(date)", "SELECT month(DATE '2026-03-30')", true),
-        ("day_of_week(date)", "SELECT extract(DOW FROM DATE '2026-03-30')", true),
-        ("date_part year", "SELECT date_part('year', DATE '2026-03-30')", true),
-        ("date_part month", "SELECT date_part('month', DATE '2026-03-30')", true),
-
+        (
+            "day_of_week(date)",
+            "SELECT extract(DOW FROM DATE '2026-03-30')",
+            true,
+        ),
+        (
+            "date_part year",
+            "SELECT date_part('year', DATE '2026-03-30')",
+            true,
+        ),
+        (
+            "date_part month",
+            "SELECT date_part('month', DATE '2026-03-30')",
+            true,
+        ),
         // Trino-style functions that may not exist in DataFusion
-        ("day_of_week() trino-style", "SELECT day_of_week(DATE '2026-03-30')", true),
-
+        (
+            "day_of_week() trino-style",
+            "SELECT day_of_week(DATE '2026-03-30')",
+            true,
+        ),
         // Decimal arithmetic
-        ("decimal math", "SELECT CAST(5 AS DECIMAL(10,2)) * 19.99 * (1 - 10.0 / 100)", true),
-
+        (
+            "decimal math",
+            "SELECT CAST(5 AS DECIMAL(10,2)) * 19.99 * (1 - 10.0 / 100)",
+            true,
+        ),
         // CAST to date
         ("cast to date", "SELECT CAST('2026-03-30' AS DATE)", true),
     ];
@@ -2338,14 +2820,20 @@ async fn test_large_insert_multi_batch() {
     let (session, handler) = crate::common::setup_handler().await;
 
     let _ = handler
-        .execute(&session, "DROP TABLE IF EXISTS test_ns.large_insert_test", None)
+        .execute(
+            &session,
+            "DROP TABLE IF EXISTS test_ns.large_insert_test",
+            None,
+        )
         .await;
 
     // Create table with CTAS (small seed)
     handler
         .execute(
             &session,
-            "CREATE TABLE test_ns.large_insert_test AS SELECT 0 as id, 'seed' as name", None)
+            "CREATE TABLE test_ns.large_insert_test AS SELECT 0 as id, 'seed' as name",
+            None,
+        )
         .await
         .expect("CTAS seed should succeed");
 
@@ -2382,7 +2870,9 @@ async fn test_large_insert_multi_batch() {
     let batches = handler
         .execute(
             &session,
-            "SELECT COUNT(*) as cnt FROM test_ns.large_insert_test", None)
+            "SELECT COUNT(*) as cnt FROM test_ns.large_insert_test",
+            None,
+        )
         .await
         .expect("COUNT should succeed");
 
@@ -2400,11 +2890,18 @@ async fn test_large_insert_multi_batch() {
         .downcast_ref::<arrow_array::Int64Array>()
         .expect("COUNT should return Int64");
     let total_count = count_col.value(0);
-    assert_eq!(total_count, 2001, "Expected 1 seed + 1000 + 1000 = 2001 rows");
+    assert_eq!(
+        total_count, 2001,
+        "Expected 1 seed + 1000 + 1000 = 2001 rows"
+    );
 
     // Cleanup
     let _ = handler
-        .execute(&session, "DROP TABLE IF EXISTS test_ns.large_insert_test", None)
+        .execute(
+            &session,
+            "DROP TABLE IF EXISTS test_ns.large_insert_test",
+            None,
+        )
         .await;
 }
 
@@ -2459,8 +2956,16 @@ async fn test_error_classification_live() {
     let mut fail = 0;
 
     // Setup for duplicate table test
-    let _ = handler.execute(&session, "DROP TABLE IF EXISTS test_ns.err_dup_test", None).await;
-    let _ = handler.execute(&session, "CREATE TABLE test_ns.err_dup_test AS SELECT 1 as x", None).await;
+    let _ = handler
+        .execute(&session, "DROP TABLE IF EXISTS test_ns.err_dup_test", None)
+        .await;
+    let _ = handler
+        .execute(
+            &session,
+            "CREATE TABLE test_ns.err_dup_test AS SELECT 1 as x",
+            None,
+        )
+        .await;
 
     for (label, sql, expected_code) in &cases {
         // For the duplicate table case, use our pre-created table
@@ -2480,7 +2985,9 @@ async fn test_error_classification_live() {
                     println!("  ✓ {label}: {code_name} — \"{client_msg}\"");
                     pass += 1;
                 } else {
-                    println!("  ✗ {label}: expected {expected_code}, got {code_name} — \"{client_msg}\"");
+                    println!(
+                        "  ✗ {label}: expected {expected_code}, got {code_name} — \"{client_msg}\""
+                    );
                     println!("    full error: {e}");
                     fail += 1;
                 }
@@ -2492,7 +2999,9 @@ async fn test_error_classification_live() {
         }
     }
 
-    let _ = handler.execute(&session, "DROP TABLE IF EXISTS test_ns.err_dup_test", None).await;
+    let _ = handler
+        .execute(&session, "DROP TABLE IF EXISTS test_ns.err_dup_test", None)
+        .await;
 
     println!("\nError classification: {pass} passed, {fail} failed");
     assert_eq!(fail, 0, "{fail} error classification(s) wrong");
@@ -2520,7 +3029,9 @@ async fn test_delete_with_where() {
             "CREATE TABLE test_ns.delete_test AS \
              SELECT 1 as id, 'alice' as val UNION ALL \
              SELECT 2, 'bob' UNION ALL \
-             SELECT 3, 'carol'", None)
+             SELECT 3, 'carol'",
+            None,
+        )
         .await
         .expect("CTAS for delete_test should succeed");
 
@@ -2534,7 +3045,11 @@ async fn test_delete_with_where() {
 
     // Delete the row where id = 2
     handler
-        .execute(&session, "DELETE FROM test_ns.delete_test WHERE id = 2", None)
+        .execute(
+            &session,
+            "DELETE FROM test_ns.delete_test WHERE id = 2",
+            None,
+        )
         .await
         .expect("DELETE WHERE id = 2 should succeed");
 
@@ -2542,7 +3057,9 @@ async fn test_delete_with_where() {
     let batches = handler
         .execute(
             &session,
-            "SELECT id, val FROM test_ns.delete_test ORDER BY id", None)
+            "SELECT id, val FROM test_ns.delete_test ORDER BY id",
+            None,
+        )
         .await
         .expect("SELECT after DELETE should succeed");
 
@@ -2558,9 +3075,7 @@ async fn test_delete_with_where() {
     // Collect remaining ids
     let mut ids: Vec<i64> = Vec::new();
     for batch in &batches {
-        let id_col = batch
-            .column_by_name("id")
-            .expect("should have 'id' column");
+        let id_col = batch.column_by_name("id").expect("should have 'id' column");
         let id_arr = id_col
             .as_any()
             .downcast_ref::<Int64Array>()
@@ -2596,7 +3111,9 @@ async fn test_delete_all() {
             "CREATE TABLE test_ns.trunc_test AS \
              SELECT 1 as id, 'alice' as val UNION ALL \
              SELECT 2, 'bob' UNION ALL \
-             SELECT 3, 'carol'", None)
+             SELECT 3, 'carol'",
+            None,
+        )
         .await
         .expect("CTAS for trunc_test should succeed");
 
@@ -2610,7 +3127,9 @@ async fn test_delete_all() {
     let batches = handler
         .execute(
             &session,
-            "SELECT COUNT(*) as cnt FROM test_ns.trunc_test", None)
+            "SELECT COUNT(*) as cnt FROM test_ns.trunc_test",
+            None,
+        )
         .await
         .expect("SELECT COUNT after DELETE ALL should succeed");
 
@@ -2625,7 +3144,11 @@ async fn test_delete_all() {
         .as_any()
         .downcast_ref::<Int64Array>()
         .expect("COUNT should return Int64");
-    assert_eq!(count_col.value(0), 0, "Table should have 0 rows after DELETE ALL");
+    assert_eq!(
+        count_col.value(0),
+        0,
+        "Table should have 0 rows after DELETE ALL"
+    );
 
     // Cleanup
     handler
@@ -2652,7 +3175,9 @@ async fn test_update_with_where() {
             "CREATE TABLE test_ns.update_test AS \
              SELECT 1 as id, 10 as val UNION ALL \
              SELECT 2, 20 UNION ALL \
-             SELECT 3, 30", None)
+             SELECT 3, 30",
+            None,
+        )
         .await
         .expect("CTAS for update_test should succeed");
 
@@ -2660,7 +3185,9 @@ async fn test_update_with_where() {
     handler
         .execute(
             &session,
-            "UPDATE test_ns.update_test SET val = 99 WHERE id = 2", None)
+            "UPDATE test_ns.update_test SET val = 99 WHERE id = 2",
+            None,
+        )
         .await
         .expect("UPDATE SET val = 99 WHERE id = 2 should succeed");
 
@@ -2668,7 +3195,9 @@ async fn test_update_with_where() {
     let batches = handler
         .execute(
             &session,
-            "SELECT id, val FROM test_ns.update_test ORDER BY id", None)
+            "SELECT id, val FROM test_ns.update_test ORDER BY id",
+            None,
+        )
         .await
         .expect("SELECT after UPDATE should succeed");
 
@@ -2730,7 +3259,9 @@ async fn test_update_all_rows() {
             &session,
             "CREATE TABLE test_ns.update_all AS \
              SELECT 1 as id, 10 as val UNION ALL \
-             SELECT 2, 20", None)
+             SELECT 2, 20",
+            None,
+        )
         .await
         .expect("CTAS for update_all should succeed");
 
@@ -2738,7 +3269,9 @@ async fn test_update_all_rows() {
     handler
         .execute(
             &session,
-            "UPDATE test_ns.update_all SET val = val + 100", None)
+            "UPDATE test_ns.update_all SET val = val + 100",
+            None,
+        )
         .await
         .expect("UPDATE SET val = val + 100 should succeed");
 
@@ -2746,7 +3279,9 @@ async fn test_update_all_rows() {
     let batches = handler
         .execute(
             &session,
-            "SELECT id, val FROM test_ns.update_all ORDER BY id", None)
+            "SELECT id, val FROM test_ns.update_all ORDER BY id",
+            None,
+        )
         .await
         .expect("SELECT after UPDATE ALL should succeed");
 
@@ -2815,7 +3350,9 @@ async fn test_merge_insert_and_update() {
             &session,
             "CREATE TABLE test_ns.merge_target AS \
              SELECT 1 as id, 'a' as val UNION ALL \
-             SELECT 2, 'b'", None)
+             SELECT 2, 'b'",
+            None,
+        )
         .await
         .expect("CTAS for merge_target should succeed");
 
@@ -2825,7 +3362,9 @@ async fn test_merge_insert_and_update() {
             &session,
             "CREATE TABLE test_ns.merge_source AS \
              SELECT 2 as id, 'B' as val UNION ALL \
-             SELECT 3, 'c'", None)
+             SELECT 3, 'c'",
+            None,
+        )
         .await
         .expect("CTAS for merge_source should succeed");
 
@@ -2836,7 +3375,9 @@ async fn test_merge_insert_and_update() {
             "MERGE INTO test_ns.merge_target t \
              USING test_ns.merge_source s ON t.id = s.id \
              WHEN MATCHED THEN UPDATE SET val = s.val \
-             WHEN NOT MATCHED THEN INSERT (id, val) VALUES (s.id, s.val)", None)
+             WHEN NOT MATCHED THEN INSERT (id, val) VALUES (s.id, s.val)",
+            None,
+        )
         .await
         .expect("MERGE should succeed");
 
@@ -2844,7 +3385,9 @@ async fn test_merge_insert_and_update() {
     let batches = handler
         .execute(
             &session,
-            "SELECT id, val FROM test_ns.merge_target ORDER BY id", None)
+            "SELECT id, val FROM test_ns.merge_target ORDER BY id",
+            None,
+        )
         .await
         .expect("SELECT after MERGE should succeed");
 
@@ -2877,7 +3420,11 @@ async fn test_merge_insert_and_update() {
     }
     assert_eq!(
         rows,
-        vec![(1, "a".to_string()), (2, "B".to_string()), (3, "c".to_string())],
+        vec![
+            (1, "a".to_string()),
+            (2, "B".to_string()),
+            (3, "c".to_string())
+        ],
         "Row (2,'b') should be updated to (2,'B'), (3,'c') inserted, (1,'a') unchanged"
     );
 
@@ -2900,10 +3447,18 @@ async fn test_merge_delete_matched() {
 
     // Cleanup leftover
     let _ = handler
-        .execute(&session, "DROP TABLE IF EXISTS test_ns.merge_del_target", None)
+        .execute(
+            &session,
+            "DROP TABLE IF EXISTS test_ns.merge_del_target",
+            None,
+        )
         .await;
     let _ = handler
-        .execute(&session, "DROP TABLE IF EXISTS test_ns.merge_del_source", None)
+        .execute(
+            &session,
+            "DROP TABLE IF EXISTS test_ns.merge_del_source",
+            None,
+        )
         .await;
 
     // Create target table with (1,'a'), (2,'b'), (3,'c')
@@ -2913,7 +3468,9 @@ async fn test_merge_delete_matched() {
             "CREATE TABLE test_ns.merge_del_target AS \
              SELECT 1 as id, 'a' as val UNION ALL \
              SELECT 2, 'b' UNION ALL \
-             SELECT 3, 'c'", None)
+             SELECT 3, 'c'",
+            None,
+        )
         .await
         .expect("CTAS for merge_del_target should succeed");
 
@@ -2922,7 +3479,9 @@ async fn test_merge_delete_matched() {
         .execute(
             &session,
             "CREATE TABLE test_ns.merge_del_source AS \
-             SELECT 2 as id, 'x' as val", None)
+             SELECT 2 as id, 'x' as val",
+            None,
+        )
         .await
         .expect("CTAS for merge_del_source should succeed");
 
@@ -2932,7 +3491,9 @@ async fn test_merge_delete_matched() {
             &session,
             "MERGE INTO test_ns.merge_del_target t \
              USING test_ns.merge_del_source s ON t.id = s.id \
-             WHEN MATCHED THEN DELETE", None)
+             WHEN MATCHED THEN DELETE",
+            None,
+        )
         .await
         .expect("MERGE with DELETE should succeed");
 
@@ -2940,7 +3501,9 @@ async fn test_merge_delete_matched() {
     let batches = handler
         .execute(
             &session,
-            "SELECT id, val FROM test_ns.merge_del_target ORDER BY id", None)
+            "SELECT id, val FROM test_ns.merge_del_target ORDER BY id",
+            None,
+        )
         .await
         .expect("SELECT after MERGE DELETE should succeed");
 
@@ -3010,7 +3573,9 @@ async fn test_delete_larger_dataset() {
                (71),(72),(73),(74),(75),(76),(77),(78),(79),(80),\
                (81),(82),(83),(84),(85),(86),(87),(88),(89),(90),\
                (91),(92),(93),(94),(95),(96),(97),(98),(99),(100)\
-             )", None)
+             )",
+            None,
+        )
         .await
         .expect("CTAS for del_large should succeed");
 
@@ -3019,7 +3584,9 @@ async fn test_delete_larger_dataset() {
     let batches = handler
         .execute(
             &session,
-            "SELECT COUNT(*) as total FROM test_ns.del_large", None)
+            "SELECT COUNT(*) as total FROM test_ns.del_large",
+            None,
+        )
         .await
         .expect("COUNT should succeed");
     let count = batches[0]
@@ -3034,7 +3601,9 @@ async fn test_delete_larger_dataset() {
     handler
         .execute(
             &session,
-            "DELETE FROM test_ns.del_large WHERE id % 3 = 0", None)
+            "DELETE FROM test_ns.del_large WHERE id % 3 = 0",
+            None,
+        )
         .await
         .expect("DELETE WHERE id % 3 = 0 should succeed");
 
@@ -3042,7 +3611,9 @@ async fn test_delete_larger_dataset() {
     let batches = handler
         .execute(
             &session,
-            "SELECT COUNT(*) as cnt FROM test_ns.del_large", None)
+            "SELECT COUNT(*) as cnt FROM test_ns.del_large",
+            None,
+        )
         .await
         .expect("COUNT after DELETE should succeed");
     let remaining = batches[0]
@@ -3051,13 +3622,18 @@ async fn test_delete_larger_dataset() {
         .downcast_ref::<Int64Array>()
         .expect("COUNT should be Int64")
         .value(0);
-    assert_eq!(remaining, 67, "67 rows should remain after deleting 33 (id % 3 = 0)");
+    assert_eq!(
+        remaining, 67,
+        "67 rows should remain after deleting 33 (id % 3 = 0)"
+    );
 
     // Verify no rows with id % 3 = 0 remain
     let batches = handler
         .execute(
             &session,
-            "SELECT COUNT(*) as cnt FROM test_ns.del_large WHERE id % 3 = 0", None)
+            "SELECT COUNT(*) as cnt FROM test_ns.del_large WHERE id % 3 = 0",
+            None,
+        )
         .await
         .expect("COUNT with WHERE should succeed");
     let deleted_remaining = batches[0]
@@ -3066,7 +3642,10 @@ async fn test_delete_larger_dataset() {
         .downcast_ref::<Int64Array>()
         .expect("COUNT should be Int64")
         .value(0);
-    assert_eq!(deleted_remaining, 0, "No rows with id % 3 = 0 should remain");
+    assert_eq!(
+        deleted_remaining, 0,
+        "No rows with id % 3 = 0 should remain"
+    );
 
     // Cleanup
     handler
@@ -3103,7 +3682,9 @@ async fn test_update_larger_dataset() {
                (71),(72),(73),(74),(75),(76),(77),(78),(79),(80),\
                (81),(82),(83),(84),(85),(86),(87),(88),(89),(90),\
                (91),(92),(93),(94),(95),(96),(97),(98),(99),(100)\
-             )", None)
+             )",
+            None,
+        )
         .await
         .expect("CTAS for upd_large should succeed");
 
@@ -3119,7 +3700,9 @@ async fn test_update_larger_dataset() {
     let batches = handler
         .execute(
             &session,
-            "SELECT COUNT(*) as cnt FROM test_ns.upd_large WHERE val LIKE 'updated_%'", None)
+            "SELECT COUNT(*) as cnt FROM test_ns.upd_large WHERE val LIKE 'updated_%'",
+            None,
+        )
         .await
         .expect("COUNT updated rows should succeed");
     let updated_count = batches[0]
@@ -3128,13 +3711,18 @@ async fn test_update_larger_dataset() {
         .downcast_ref::<Int64Array>()
         .expect("COUNT should be Int64")
         .value(0);
-    assert_eq!(updated_count, 21, "21 rows should have been updated (id 10..30)");
+    assert_eq!(
+        updated_count, 21,
+        "21 rows should have been updated (id 10..30)"
+    );
 
     // Verify unchanged rows
     let batches = handler
         .execute(
             &session,
-            "SELECT COUNT(*) as cnt FROM test_ns.upd_large WHERE val LIKE 'val_%'", None)
+            "SELECT COUNT(*) as cnt FROM test_ns.upd_large WHERE val LIKE 'val_%'",
+            None,
+        )
         .await
         .expect("COUNT unchanged rows should succeed");
     let unchanged_count = batches[0]
@@ -3149,7 +3737,9 @@ async fn test_update_larger_dataset() {
     let batches = handler
         .execute(
             &session,
-            "SELECT COUNT(*) as cnt FROM test_ns.upd_large", None)
+            "SELECT COUNT(*) as cnt FROM test_ns.upd_large",
+            None,
+        )
         .await
         .expect("COUNT total rows should succeed");
     let total = batches[0]
@@ -3185,7 +3775,9 @@ async fn test_delete_multiple_data_files() {
             "CREATE TABLE test_ns.del_multi AS \
              SELECT 1 as id, 'a' as val UNION ALL \
              SELECT 2, 'b' UNION ALL \
-             SELECT 3, 'c'", None)
+             SELECT 3, 'c'",
+            None,
+        )
         .await
         .expect("CTAS for del_multi should succeed");
 
@@ -3196,7 +3788,9 @@ async fn test_delete_multiple_data_files() {
             "INSERT INTO test_ns.del_multi \
              SELECT 4 as id, 'd' as val UNION ALL \
              SELECT 5, 'e' UNION ALL \
-             SELECT 6, 'f'", None)
+             SELECT 6, 'f'",
+            None,
+        )
         .await
         .expect("First INSERT INTO del_multi should succeed");
 
@@ -3207,7 +3801,9 @@ async fn test_delete_multiple_data_files() {
             "INSERT INTO test_ns.del_multi \
              SELECT 7 as id, 'g' as val UNION ALL \
              SELECT 8, 'h' UNION ALL \
-             SELECT 9, 'i'", None)
+             SELECT 9, 'i'",
+            None,
+        )
         .await
         .expect("Second INSERT INTO del_multi should succeed");
 
@@ -3215,7 +3811,9 @@ async fn test_delete_multiple_data_files() {
     let batches = handler
         .execute(
             &session,
-            "SELECT COUNT(*) as cnt FROM test_ns.del_multi", None)
+            "SELECT COUNT(*) as cnt FROM test_ns.del_multi",
+            None,
+        )
         .await
         .expect("COUNT should succeed");
     let count = batches[0]
@@ -3230,7 +3828,9 @@ async fn test_delete_multiple_data_files() {
     handler
         .execute(
             &session,
-            "DELETE FROM test_ns.del_multi WHERE id % 2 = 0", None)
+            "DELETE FROM test_ns.del_multi WHERE id % 2 = 0",
+            None,
+        )
         .await
         .expect("DELETE WHERE id % 2 = 0 should succeed");
 
@@ -3238,7 +3838,9 @@ async fn test_delete_multiple_data_files() {
     let batches = handler
         .execute(
             &session,
-            "SELECT id FROM test_ns.del_multi ORDER BY id", None)
+            "SELECT id FROM test_ns.del_multi ORDER BY id",
+            None,
+        )
         .await
         .expect("SELECT after DELETE should succeed");
 
@@ -3291,7 +3893,9 @@ async fn test_update_multiple_data_files() {
             "CREATE TABLE test_ns.upd_multi AS \
              SELECT 1 as id, 10 as val UNION ALL \
              SELECT 2, 20 UNION ALL \
-             SELECT 3, 30", None)
+             SELECT 3, 30",
+            None,
+        )
         .await
         .expect("CTAS for upd_multi should succeed");
 
@@ -3302,7 +3906,9 @@ async fn test_update_multiple_data_files() {
             "INSERT INTO test_ns.upd_multi \
              SELECT 4 as id, 40 as val UNION ALL \
              SELECT 5, 50 UNION ALL \
-             SELECT 6, 60", None)
+             SELECT 6, 60",
+            None,
+        )
         .await
         .expect("INSERT INTO upd_multi should succeed");
 
@@ -3313,7 +3919,9 @@ async fn test_update_multiple_data_files() {
             "INSERT INTO test_ns.upd_multi \
              SELECT 7 as id, 70 as val UNION ALL \
              SELECT 8, 80 UNION ALL \
-             SELECT 9, 90", None)
+             SELECT 9, 90",
+            None,
+        )
         .await
         .expect("Second INSERT INTO upd_multi should succeed");
 
@@ -3321,7 +3929,9 @@ async fn test_update_multiple_data_files() {
     let batches = handler
         .execute(
             &session,
-            "SELECT COUNT(*) as cnt FROM test_ns.upd_multi", None)
+            "SELECT COUNT(*) as cnt FROM test_ns.upd_multi",
+            None,
+        )
         .await
         .expect("COUNT should succeed");
     let count = batches[0]
@@ -3336,7 +3946,9 @@ async fn test_update_multiple_data_files() {
     handler
         .execute(
             &session,
-            "UPDATE test_ns.upd_multi SET val = val + 1000 WHERE id > 5", None)
+            "UPDATE test_ns.upd_multi SET val = val + 1000 WHERE id > 5",
+            None,
+        )
         .await
         .expect("UPDATE WHERE id > 5 should succeed");
 
@@ -3344,7 +3956,9 @@ async fn test_update_multiple_data_files() {
     let batches = handler
         .execute(
             &session,
-            "SELECT id, val FROM test_ns.upd_multi ORDER BY id", None)
+            "SELECT id, val FROM test_ns.upd_multi ORDER BY id",
+            None,
+        )
         .await
         .expect("SELECT after UPDATE should succeed");
 
@@ -3375,8 +3989,15 @@ async fn test_update_multiple_data_files() {
     assert_eq!(
         rows,
         vec![
-            (1, 10), (2, 20), (3, 30), (4, 40), (5, 50),
-            (6, 1060), (7, 1070), (8, 1080), (9, 1090)
+            (1, 10),
+            (2, 20),
+            (3, 30),
+            (4, 40),
+            (5, 50),
+            (6, 1060),
+            (7, 1070),
+            (8, 1080),
+            (9, 1090)
         ],
         "Rows 6-9 should have val increased by 1000, rows 1-5 unchanged"
     );

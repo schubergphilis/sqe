@@ -22,9 +22,7 @@ mod glue {
 
     use iceberg::io::OpenDalStorageFactory;
     use iceberg::{Catalog, CatalogBuilder, NamespaceIdent};
-    use iceberg_catalog_glue::{
-        AWS_REGION_NAME, GLUE_CATALOG_PROP_WAREHOUSE, GlueCatalogBuilder,
-    };
+    use iceberg_catalog_glue::{GlueCatalogBuilder, AWS_REGION_NAME, GLUE_CATALOG_PROP_WAREHOUSE};
 
     /// Live AWS Glue round-trip: create_namespace -> list_namespaces ->
     /// drop_namespace, against the user's account in eu-central-1 (or
@@ -48,12 +46,11 @@ mod glue {
     #[tokio::test]
     #[ignore = "requires AWS credentials + a pre-created S3 bucket; run with --ignored"]
     async fn live_glue_namespace_round_trip() {
-        let warehouse = std::env::var("SQE_TEST_GLUE_WAREHOUSE")
-            .expect(
-                "SQE_TEST_GLUE_WAREHOUSE must be set to a pre-created \
+        let warehouse = std::env::var("SQE_TEST_GLUE_WAREHOUSE").expect(
+            "SQE_TEST_GLUE_WAREHOUSE must be set to a pre-created \
                  s3:// path, e.g. s3://sqe-glue-it-eu-central-1/wh/. \
                  Copy .env.example to .env and source it.",
-            );
+        );
         let region = std::env::var("AWS_REGION").unwrap_or_else(|_| "eu-central-1".into());
 
         // Glue stores warehouse paths but the namespace round-trip
@@ -88,8 +85,7 @@ mod glue {
             .list_namespaces(None)
             .await
             .expect("list_namespaces");
-        let listed_names: Vec<String> =
-            listed.iter().map(|n| n.as_ref().join(".")).collect();
+        let listed_names: Vec<String> = listed.iter().map(|n| n.as_ref().join(".")).collect();
         assert!(
             listed_names.iter().any(|n| n == &ns_name),
             "namespace {ns_name} should appear in list after create. Got first 20: {:?}",
@@ -132,7 +128,7 @@ mod hms {
     use iceberg::io::OpenDalStorageFactory;
     use iceberg::{Catalog, CatalogBuilder, NamespaceIdent};
     use iceberg_catalog_hms::{
-        HMS_CATALOG_PROP_URI, HMS_CATALOG_PROP_WAREHOUSE, HmsCatalogBuilder,
+        HmsCatalogBuilder, HMS_CATALOG_PROP_URI, HMS_CATALOG_PROP_WAREHOUSE,
     };
 
     /// Live HMS round-trip: create_namespace -> namespace_exists -> drop_namespace.
@@ -160,8 +156,7 @@ mod hms {
         // Force IPv4 because Docker port forwarding on macOS doesn't
         // always answer on the IPv6 loopback that `localhost` resolves
         // to first.
-        let uri = std::env::var("SQE_TEST_HMS_URI")
-            .unwrap_or_else(|_| "127.0.0.1:19083".into());
+        let uri = std::env::var("SQE_TEST_HMS_URI").unwrap_or_else(|_| "127.0.0.1:19083".into());
         let warehouse = std::env::var("SQE_TEST_HMS_WAREHOUSE")
             .unwrap_or_else(|_| "s3a://warehouse/hms/".into());
 
@@ -202,10 +197,7 @@ mod hms {
             .list_namespaces(None)
             .await
             .expect("list_namespaces");
-        let listed_names: Vec<String> = listed
-            .iter()
-            .map(|n| n.as_ref().join("."))
-            .collect();
+        let listed_names: Vec<String> = listed.iter().map(|n| n.as_ref().join(".")).collect();
         assert!(
             listed_names.iter().any(|n| n == &ns_name),
             "namespace {ns_name} should appear in list after create. Got: {listed_names:?}"
@@ -236,10 +228,10 @@ mod sql {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use iceberg::CatalogBuilder;
     use iceberg::io::OpenDalStorageFactory;
+    use iceberg::CatalogBuilder;
     use iceberg_catalog_sql::{
-        SQL_CATALOG_PROP_URI, SQL_CATALOG_PROP_WAREHOUSE, SqlCatalogBuilder,
+        SqlCatalogBuilder, SQL_CATALOG_PROP_URI, SQL_CATALOG_PROP_WAREHOUSE,
     };
     use tempfile::tempdir;
 
@@ -301,7 +293,7 @@ mod sql_postgres {
     use iceberg::io::OpenDalStorageFactory;
     use iceberg::{Catalog, CatalogBuilder, NamespaceIdent};
     use iceberg_catalog_sql::{
-        SQL_CATALOG_PROP_URI, SQL_CATALOG_PROP_WAREHOUSE, SqlCatalogBuilder,
+        SqlCatalogBuilder, SQL_CATALOG_PROP_URI, SQL_CATALOG_PROP_WAREHOUSE,
     };
 
     /// Smoke test: connect to a live Postgres instance, build the vendored
@@ -334,10 +326,7 @@ mod sql_postgres {
             .await
             .expect("SqlCatalog should build against live Postgres");
 
-        let ns = NamespaceIdent::new(format!(
-            "sqe_test_ns_{}",
-            uuid::Uuid::new_v4().simple()
-        ));
+        let ns = NamespaceIdent::new(format!("sqe_test_ns_{}", uuid::Uuid::new_v4().simple()));
 
         // Best-effort cleanup of any leftover namespace from a previous run.
         let _ = catalog.drop_namespace(&ns).await;
@@ -430,7 +419,10 @@ warehouse = "{warehouse}"
         // The `catalog.backend = { type = "jdbc", ... }` shape lands
         // as `CatalogBackend::Jdbc` after deserialisation; sanity
         // check before we use it.
-        assert!(matches!(config.catalog.backend, CatalogBackend::Jdbc { .. }));
+        assert!(matches!(
+            config.catalog.backend,
+            CatalogBackend::Jdbc { .. }
+        ));
         // Tighten timeouts to keep the test fast.
         config.catalog.metadata_cache_ttl_secs = 30;
 
@@ -443,10 +435,7 @@ warehouse = "{warehouse}"
         let bridge: Arc<dyn Catalog> = session_catalog.as_catalog();
 
         // Round-trip a unique namespace to prove writes go through.
-        let ns = NamespaceIdent::new(format!(
-            "sqe_engine_jdbc_{}",
-            uuid::Uuid::new_v4().simple()
-        ));
+        let ns = NamespaceIdent::new(format!("sqe_engine_jdbc_{}", uuid::Uuid::new_v4().simple()));
         let _ = bridge.drop_namespace(&ns).await;
         bridge
             .create_namespace(&ns, HashMap::new())
@@ -498,10 +487,10 @@ warehouse = "{warehouse}"
     #[tokio::test]
     #[ignore = "requires live Postgres; run with --ignored against docker-compose postgres"]
     async fn jdbc_postgres_v3_table_format_version_roundtrip() {
-        use iceberg::TableCreation;
         use iceberg::spec::{
             NestedField, PrimitiveType, Schema as IcebergSchema, Type as IcebergType,
         };
+        use iceberg::TableCreation;
 
         let url = std::env::var("SQE_TEST_PG_URL").unwrap_or_else(|_| {
             "postgres://iceberg:iceberg@localhost:15432/iceberg_catalog".to_string()
@@ -521,10 +510,7 @@ warehouse = "{warehouse}"
 
         // Unique namespace per run so retries don't conflict on the
         // shared docker-compose volume.
-        let ns = NamespaceIdent::new(format!(
-            "sqe_v3_jdbc_{}",
-            uuid::Uuid::new_v4().simple()
-        ));
+        let ns = NamespaceIdent::new(format!("sqe_v3_jdbc_{}", uuid::Uuid::new_v4().simple()));
         let _ = catalog.drop_namespace(&ns).await;
         catalog
             .create_namespace(&ns, HashMap::new())
@@ -535,14 +521,12 @@ warehouse = "{warehouse}"
         // type here; the `format-version=3` table property is what
         // iceberg-rust round-trips through the catalog.
         let schema = IcebergSchema::builder()
-            .with_fields(vec![
-                NestedField::required(
-                    1,
-                    "id",
-                    IcebergType::Primitive(PrimitiveType::Long),
-                )
-                .into(),
-            ])
+            .with_fields(vec![NestedField::required(
+                1,
+                "id",
+                IcebergType::Primitive(PrimitiveType::Long),
+            )
+            .into()])
             .build()
             .expect("schema builder");
 
@@ -623,7 +607,11 @@ mod hadoop {
         let tables = backend.list_tables().await.unwrap();
         assert_eq!(tables.len(), 2);
 
-        let orders = backend.find_table("sales", "orders").await.unwrap().unwrap();
+        let orders = backend
+            .find_table("sales", "orders")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(orders.version, 2);
         assert_eq!(orders.namespace, vec!["sales".to_string()]);
     }
@@ -676,8 +664,8 @@ mod nessie {
         // client appends `v1/config?warehouse=...` directly.
         let uri = std::env::var("SQE_TEST_NESSIE_URI")
             .unwrap_or_else(|_| "http://127.0.0.1:19121/iceberg/".into());
-        let warehouse = std::env::var("SQE_TEST_NESSIE_WAREHOUSE")
-            .unwrap_or_else(|_| "warehouse".into());
+        let warehouse =
+            std::env::var("SQE_TEST_NESSIE_WAREHOUSE").unwrap_or_else(|_| "warehouse".into());
 
         let mut props = HashMap::new();
         props.insert("uri".to_string(), uri);
@@ -701,8 +689,7 @@ mod nessie {
             .list_namespaces(None)
             .await
             .expect("list_namespaces");
-        let listed_names: Vec<String> =
-            listed.iter().map(|n| n.as_ref().join(".")).collect();
+        let listed_names: Vec<String> = listed.iter().map(|n| n.as_ref().join(".")).collect();
         assert!(
             listed_names.iter().any(|n| n == &ns_name),
             "namespace {ns_name} should appear in list after create. Got: {listed_names:?}"
@@ -765,14 +752,12 @@ mod s3_tables {
             "SQE_TEST_S3TABLES_WAREHOUSE must be set, e.g. \
              311141556126:s3tablescatalog/iceberg-demo-table-iceberg-data",
         );
-        let region =
-            std::env::var("AWS_REGION").unwrap_or_else(|_| "eu-central-1".into());
+        let region = std::env::var("AWS_REGION").unwrap_or_else(|_| "eu-central-1".into());
         // Default to the federated Glue endpoint; per-bucket
         // `s3tables.<region>.amazonaws.com/iceberg` is also valid but
         // requires `rest.signing-name=s3tables`.
-        let uri = std::env::var("SQE_TEST_S3TABLES_URI").unwrap_or_else(|_| {
-            format!("https://glue.{region}.amazonaws.com/iceberg")
-        });
+        let uri = std::env::var("SQE_TEST_S3TABLES_URI")
+            .unwrap_or_else(|_| format!("https://glue.{region}.amazonaws.com/iceberg"));
         let signing_name =
             std::env::var("SQE_TEST_S3TABLES_SIGNING_NAME").unwrap_or_else(|_| "glue".into());
 
@@ -825,9 +810,7 @@ mod s3_tables {
             .iter()
             .map(|t| format!("{}.{}", t.namespace.as_ref().join("."), t.name))
             .collect();
-        eprintln!(
-            "S3 Tables round-trip ok: namespace={ns_str} tables={table_names:?}"
-        );
+        eprintln!("S3 Tables round-trip ok: namespace={ns_str} tables={table_names:?}");
 
         // Sanity check: at least the namespace listing came back
         // without an Authorization-Bearer 403, which is the failure
@@ -863,8 +846,8 @@ mod unity_catalog {
     async fn unity_catalog_m2m_auth_obtains_token() {
         let endpoint = std::env::var("SQE_TEST_UC_TOKEN_ENDPOINT")
             .expect("SQE_TEST_UC_TOKEN_ENDPOINT must be set");
-        let client_id = std::env::var("SQE_TEST_UC_CLIENT_ID")
-            .expect("SQE_TEST_UC_CLIENT_ID must be set");
+        let client_id =
+            std::env::var("SQE_TEST_UC_CLIENT_ID").expect("SQE_TEST_UC_CLIENT_ID must be set");
         let client_secret = std::env::var("SQE_TEST_UC_CLIENT_SECRET")
             .expect("SQE_TEST_UC_CLIENT_SECRET must be set");
 
@@ -903,9 +886,8 @@ mod unity_catalog {
         // /api/2.1/unity-catalog/iceberg/. The trailing slash is
         // optional; the REST client appends `v1/config?warehouse=...`
         // either way.
-        let uri = std::env::var("SQE_TEST_UNITY_URI").unwrap_or_else(|_| {
-            "http://127.0.0.1:18080/api/2.1/unity-catalog/iceberg".into()
-        });
+        let uri = std::env::var("SQE_TEST_UNITY_URI")
+            .unwrap_or_else(|_| "http://127.0.0.1:18080/api/2.1/unity-catalog/iceberg".into());
         // `warehouse` is the catalog name in Unity's model, not an
         // S3 URI. The seeded image ships with a catalog called
         // `unity` containing a `default` schema.
@@ -926,8 +908,7 @@ mod unity_catalog {
             .list_namespaces(None)
             .await
             .expect("list_namespaces should succeed against Unity OSS");
-        let listed_names: Vec<String> =
-            listed.iter().map(|n| n.as_ref().join(".")).collect();
+        let listed_names: Vec<String> = listed.iter().map(|n| n.as_ref().join(".")).collect();
         assert!(
             listed_names.iter().any(|n| n == "default"),
             "expected `default` namespace in Unity OSS seed; got {listed_names:?}"

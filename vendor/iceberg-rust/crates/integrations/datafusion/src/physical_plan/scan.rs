@@ -22,8 +22,8 @@ use std::vec;
 use datafusion::arrow::array::{BooleanArray, RecordBatch};
 use datafusion::arrow::compute::filter_record_batch;
 use datafusion::arrow::datatypes::SchemaRef as ArrowSchemaRef;
-use datafusion::common::config::ConfigOptions;
 use datafusion::common::DataFusionError;
+use datafusion::common::config::ConfigOptions;
 use datafusion::error::Result as DFResult;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
@@ -246,16 +246,15 @@ impl ExecutionPlan for IcebergTableScan {
         // side is still loading and become selective once it completes,
         // so we evaluate fresh on every batch.
         let runtime_filters = self.runtime_filters.clone();
-        let filtered_stream: Pin<
-            Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>,
-        > = if runtime_filters.is_empty() {
-            Box::pin(stream)
-        } else {
-            Box::pin(stream.map(move |batch_res| match batch_res {
-                Ok(batch) => apply_runtime_filters(batch, &runtime_filters),
-                Err(e) => Err(e),
-            }))
-        };
+        let filtered_stream: Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>> =
+            if runtime_filters.is_empty() {
+                Box::pin(stream)
+            } else {
+                Box::pin(stream.map(move |batch_res| match batch_res {
+                    Ok(batch) => apply_runtime_filters(batch, &runtime_filters),
+                    Err(e) => Err(e),
+                }))
+            };
 
         // Apply limit if specified
         let limited_stream: Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>> =
@@ -346,8 +345,10 @@ impl ExecutionPlan for IcebergTableScan {
         let supported: Vec<PushedDown> =
             vec![PushedDown::Yes; child_pushdown_result.parent_filters.len()];
         let new_node = self.with_runtime_filters(absorbed);
-        Ok(FilterPushdownPropagation::with_parent_pushdown_result(supported)
-            .with_updated_node(Arc::new(new_node) as Arc<dyn ExecutionPlan>))
+        Ok(
+            FilterPushdownPropagation::with_parent_pushdown_result(supported)
+                .with_updated_node(Arc::new(new_node) as Arc<dyn ExecutionPlan>),
+        )
     }
 }
 
@@ -372,19 +373,15 @@ fn apply_runtime_filters(
                 .as_any()
                 .downcast_ref::<BooleanArray>()
                 .ok_or_else(|| {
-                    DataFusionError::Execution(
-                        "runtime filter must produce a BooleanArray".into(),
-                    )
+                    DataFusionError::Execution("runtime filter must produce a BooleanArray".into())
                 })?
                 .clone(),
             ColumnarValue::Scalar(scalar) => {
                 // Scalar true (the initial DynamicFilterPhysicalExpr value)
                 // means "keep all rows". Scalar false / null means "drop
                 // everything in this batch".
-                let keep_all = matches!(
-                    scalar,
-                    datafusion::common::ScalarValue::Boolean(Some(true))
-                );
+                let keep_all =
+                    matches!(scalar, datafusion::common::ScalarValue::Boolean(Some(true)));
                 if keep_all {
                     continue;
                 }

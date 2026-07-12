@@ -129,18 +129,12 @@ fn estimate_build_side_size(hash_join: &HashJoinExec) -> usize {
     };
 
     // Use total_byte_size if it has an exact value.
-    stats
-        .total_byte_size
-        .get_value()
-        .copied()
-        .unwrap_or(0)
+    stats.total_byte_size.get_value().copied().unwrap_or(0)
 }
 
 /// Convert a `HashJoinExec` to a `SortMergeJoinExec`, adding `SortExec` nodes
 /// on both inputs if they are not already sorted on the join keys.
-fn convert_to_sort_merge_join(
-    hash_join: &HashJoinExec,
-) -> Result<Arc<dyn ExecutionPlan>> {
+fn convert_to_sort_merge_join(hash_join: &HashJoinExec) -> Result<Arc<dyn ExecutionPlan>> {
     let join_type = *hash_join.join_type();
     let on = hash_join.on().to_vec();
     let filter = hash_join.filter().cloned();
@@ -152,16 +146,12 @@ fn convert_to_sort_merge_join(
     // Left side uses the left join key columns, right side uses the right.
     let left_sort_exprs: Vec<PhysicalSortExpr> = on
         .iter()
-        .map(|(left_col, _)| {
-            PhysicalSortExpr::new(Arc::clone(left_col), SortOptions::default())
-        })
+        .map(|(left_col, _)| PhysicalSortExpr::new(Arc::clone(left_col), SortOptions::default()))
         .collect();
 
     let right_sort_exprs: Vec<PhysicalSortExpr> = on
         .iter()
-        .map(|(_, right_col)| {
-            PhysicalSortExpr::new(Arc::clone(right_col), SortOptions::default())
-        })
+        .map(|(_, right_col)| PhysicalSortExpr::new(Arc::clone(right_col), SortOptions::default()))
         .collect();
 
     // Wrap inputs in SortExec if not already sorted on the join keys.
@@ -463,8 +453,7 @@ mod tests {
             SortOptions::default(),
         );
         let ordering = LexOrdering::new(vec![sort_expr.clone()]).unwrap();
-        let sorted_input: Arc<dyn ExecutionPlan> =
-            Arc::new(SortExec::new(ordering, input));
+        let sorted_input: Arc<dyn ExecutionPlan> = Arc::new(SortExec::new(ordering, input));
 
         // ensure_sorted should NOT add another SortExec
         let result = ensure_sorted(sorted_input.clone(), &[sort_expr]);

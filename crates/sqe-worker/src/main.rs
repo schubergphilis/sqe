@@ -27,7 +27,6 @@ async fn main() -> anyhow::Result<()> {
         config.metrics.prometheus_port,
     );
 
-
     // Build a configured DataFusion SessionContext with memory limits and spill-to-disk.
     // The context is created early to fail fast on invalid config (e.g. bad memory_limit).
     // It is passed into WorkerFlightService so every scan execution respects the pool.

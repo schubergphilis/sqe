@@ -85,12 +85,14 @@ impl WritableIcebergCatalog {
                 schemas.insert(name, provider);
             }
         }
-        Ok(Self { catalog: client, schemas })
+        Ok(Self {
+            catalog: client,
+            schemas,
+        })
     }
 }
 
 impl CatalogProvider for WritableIcebergCatalog {
-
     fn schema_names(&self) -> Vec<String> {
         self.schemas.iter().map(|e| e.key().clone()).collect()
     }

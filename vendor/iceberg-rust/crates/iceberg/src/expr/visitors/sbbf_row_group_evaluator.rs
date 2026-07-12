@@ -149,9 +149,7 @@ impl SbbfRowGroupEvaluator {
                 if literal_count == 0 || literal_count > max_values {
                     return;
                 }
-                let Some(&parquet_column_index) =
-                    field_id_map.get(&expr.term().field().id)
-                else {
+                let Some(&parquet_column_index) = field_id_map.get(&expr.term().field().id) else {
                     return;
                 };
                 out.push(BloomProbeConjunct {
@@ -160,9 +158,7 @@ impl SbbfRowGroupEvaluator {
                 });
             }
             BoundPredicate::Binary(expr) if expr.op() == PredicateOperator::Eq => {
-                let Some(&parquet_column_index) =
-                    field_id_map.get(&expr.term().field().id)
-                else {
+                let Some(&parquet_column_index) = field_id_map.get(&expr.term().field().id) else {
                     return;
                 };
                 out.push(BloomProbeConjunct {

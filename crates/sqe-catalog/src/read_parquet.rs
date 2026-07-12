@@ -27,7 +27,9 @@ use std::sync::Arc;
 
 use datafusion::catalog::{TableFunctionImpl, TableProvider};
 use datafusion::datasource::file_format::parquet::ParquetFormat;
-use datafusion::datasource::listing::{ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl};
+use datafusion::datasource::listing::{
+    ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
+};
 use datafusion::error::Result as DFResult;
 use datafusion::execution::context::SessionContext;
 use datafusion_expr::Expr;
@@ -246,11 +248,16 @@ async fn build_listing_table(
                 args.path
             ))
         })?;
-        let scheme = if args.path.starts_with("s3a://") { "s3a" } else { "s3" };
-        let store_url = url::Url::parse(&format!("{scheme}://{bucket}"))
-            .map_err(|e| datafusion::error::DataFusionError::Plan(format!(
+        let scheme = if args.path.starts_with("s3a://") {
+            "s3a"
+        } else {
+            "s3"
+        };
+        let store_url = url::Url::parse(&format!("{scheme}://{bucket}")).map_err(|e| {
+            datafusion::error::DataFusionError::Plan(format!(
                 "read_parquet: failed to build object-store URL: {e}"
-            )))?;
+            ))
+        })?;
         // Register on the inference context AND the executing session's
         // runtime env: the temp context never runs the scan, and without
         // the session registration execution falls through to the lazy
@@ -293,8 +300,7 @@ async fn build_listing_table(
     // For local paths DataFusion's default LocalFileSystem is used automatically.
 
     let format = Arc::new(ParquetFormat::default());
-    let listing_options = ListingOptions::new(format)
-        .with_file_extension(".parquet");
+    let listing_options = ListingOptions::new(format).with_file_extension(".parquet");
 
     // Infer schema from the files (async — reads Parquet footers).
     let state = tmp_ctx.state();
@@ -306,9 +312,7 @@ async fn build_listing_table(
         &args.path,
     )
     .await?;
-    let schema = listing_options
-        .infer_schema(&state, &listing_url)
-        .await?;
+    let schema = listing_options.infer_schema(&state, &listing_url).await?;
 
     let config = ListingTableConfig::new(listing_url)
         .with_listing_options(listing_options)
@@ -347,9 +351,10 @@ fn build_s3_store(
     // check but the endpoint flows straight into AmazonS3Builder and
     // pivots the request to IMDS.
     if args.endpoint.as_deref().is_some_and(|s| !s.is_empty()) {
-        storage.tvf.check_endpoint(endpoint).map_err(|e| {
-            datafusion::error::DataFusionError::Plan(format!("read_parquet: {e}"))
-        })?;
+        storage
+            .tvf
+            .check_endpoint(endpoint)
+            .map_err(|e| datafusion::error::DataFusionError::Plan(format!("read_parquet: {e}")))?;
     }
 
     let region = args
@@ -366,8 +371,7 @@ fn build_s3_store(
         ))
     })?;
 
-    let mut builder = AmazonS3Builder::new()
-        .with_bucket_name(bucket);
+    let mut builder = AmazonS3Builder::new().with_bucket_name(bucket);
 
     if !access_key.is_empty() {
         builder = builder.with_access_key_id(access_key);
@@ -399,7 +403,11 @@ fn extract_bucket(path: &str) -> Option<&str> {
         .strip_prefix("s3://")
         .or_else(|| path.strip_prefix("s3a://"))?;
     let bucket = after_scheme.split('/').next()?;
-    if bucket.is_empty() { None } else { Some(bucket) }
+    if bucket.is_empty() {
+        None
+    } else {
+        Some(bucket)
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -457,12 +465,18 @@ mod tests {
 
     #[test]
     fn test_extract_bucket_s3() {
-        assert_eq!(extract_bucket("s3://my-bucket/key/file.parquet"), Some("my-bucket"));
+        assert_eq!(
+            extract_bucket("s3://my-bucket/key/file.parquet"),
+            Some("my-bucket")
+        );
     }
 
     #[test]
     fn test_extract_bucket_s3a() {
-        assert_eq!(extract_bucket("s3a://another-bucket/"), Some("another-bucket"));
+        assert_eq!(
+            extract_bucket("s3a://another-bucket/"),
+            Some("another-bucket")
+        );
     }
 
     #[test]
@@ -482,8 +496,8 @@ mod tests {
     }
 
     fn make_named_arg(key: &str, value: &str) -> Expr {
-        use datafusion_expr::{BinaryExpr, Operator};
         use datafusion::common::Column;
+        use datafusion_expr::{BinaryExpr, Operator};
         Expr::BinaryExpr(BinaryExpr {
             left: Box::new(Expr::Column(Column::new_unqualified(key))),
             op: Operator::Eq,
@@ -523,7 +537,10 @@ mod tests {
     fn test_parse_args_no_args_is_error() {
         let result = parse_args(&[]);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("at least one argument"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("at least one argument"));
     }
 
     #[test]
@@ -534,7 +551,10 @@ mod tests {
         ];
         let result = parse_args(&exprs);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("unknown named argument"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("unknown named argument"));
     }
 
     #[test]
@@ -578,7 +598,10 @@ mod tests {
         assert_eq!(args.azure_account.as_deref(), Some("myaccount"));
         assert_eq!(args.azure_access_key.as_deref(), Some("mykey"));
         assert_eq!(args.azure_sas_token.as_deref(), Some("sv=2021"));
-        assert_eq!(args.gcs_service_account_path.as_deref(), Some("/tmp/sa.json"));
+        assert_eq!(
+            args.gcs_service_account_path.as_deref(),
+            Some("/tmp/sa.json")
+        );
         assert_eq!(
             args.gcs_service_account_key.as_deref(),
             Some("{\"type\":\"service_account\"}")
@@ -593,7 +616,10 @@ mod tests {
         ];
         let result = parse_args(&exprs);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("unknown named argument"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("unknown named argument"));
     }
 
     // ── S3 builder (unit-level, no network) ─────────────────────────────────
@@ -656,7 +682,11 @@ mod tests {
             ..StorageConfig::default()
         };
         let result = build_s3_store(&args, &storage);
-        assert!(result.is_ok(), "build_s3_store fallback failed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "build_s3_store fallback failed: {:?}",
+            result.err()
+        );
     }
 
     // ── #363: stale listing-cache regression ─────────────────────────────────
@@ -671,8 +701,7 @@ mod tests {
 
         let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
         let values: Int64Array = (0..num_rows as i64).collect::<Vec<_>>().into();
-        let batch =
-            RecordBatch::try_new(schema.clone(), vec![Arc::new(values)]).unwrap();
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(values)]).unwrap();
         let file = std::fs::File::create(path).unwrap();
         let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
         writer.write(&batch).unwrap();
@@ -681,8 +710,8 @@ mod tests {
 
     async fn count_dir(ctx: &SessionContext, dir_url: &str, table: &str) -> DFResult<i64> {
         let url = ListingTableUrl::parse(dir_url).unwrap();
-        let options = ListingOptions::new(Arc::new(ParquetFormat::default()))
-            .with_file_extension(".parquet");
+        let options =
+            ListingOptions::new(Arc::new(ParquetFormat::default())).with_file_extension(".parquet");
         let state = ctx.state();
         let schema = options.infer_schema(&state, &url).await?;
         let provider = ListingTable::try_new(
@@ -702,10 +731,7 @@ mod tests {
             .await?;
         use datafusion::arrow::array::AsArray;
         use datafusion::arrow::datatypes::Int64Type;
-        Ok(batches[0]
-            .column(0)
-            .as_primitive::<Int64Type>()
-            .value(0))
+        Ok(batches[0].column(0).as_primitive::<Int64Type>().value(0))
     }
 
     /// #363: reading a directory, then reading it again after a file at the

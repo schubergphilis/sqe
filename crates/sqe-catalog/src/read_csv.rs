@@ -267,9 +267,7 @@ impl TableFunctionImpl for ReadCsvFunction {
         crate::runtime_bridge::block_on_compat(async move {
             build_csv_listing_table(&args, &csv_opts, &storage, runtime_env.as_deref()).await
         })
-        .ok_or_else(|| {
-            DataFusionError::Plan(format!("{FN_NAME}: no tokio runtime available"))
-        })?
+        .ok_or_else(|| DataFusionError::Plan(format!("{FN_NAME}: no tokio runtime available")))?
     }
 }
 
@@ -371,9 +369,7 @@ async fn build_csv_listing_table(
         &args.path,
     )
     .await?;
-    let schema = listing_options
-        .infer_schema(&state, &listing_url)
-        .await?;
+    let schema = listing_options.infer_schema(&state, &listing_url).await?;
 
     let config = ListingTableConfig::new(listing_url)
         .with_listing_options(listing_options)

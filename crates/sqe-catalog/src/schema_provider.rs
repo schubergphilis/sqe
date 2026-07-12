@@ -3,8 +3,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use datafusion::catalog::SchemaProvider;
-use datafusion::datasource::ViewTable;
 use datafusion::datasource::TableProvider;
+use datafusion::datasource::ViewTable;
 use datafusion::error::Result as DFResult;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use iceberg::NamespaceIdent;
@@ -162,7 +162,6 @@ impl SqeSchemaProvider {
 
 #[async_trait]
 impl SchemaProvider for SqeSchemaProvider {
-
     // SAFETY NOTE: DataFusion's SchemaProvider::table_names() is synchronous by design
     // (returns Vec<String>, not a Future). Since our catalog is async (HTTP calls to
     // Polaris), we use `block_in_place` to bridge the sync-async gap. This yields the
@@ -183,9 +182,10 @@ impl SchemaProvider for SqeSchemaProvider {
         let ns_ident = NamespaceIdent::new(ns.clone());
         let ns_ident_views = ns_ident.clone();
 
-        let tables = crate::runtime_bridge::block_on_compat(async move {
-            catalog.list_tables(&ns_ident).await
-        });
+        let tables =
+            crate::runtime_bridge::block_on_compat(
+                async move { catalog.list_tables(&ns_ident).await },
+            );
         let mut names: Vec<String> = match tables {
             Some(Ok(t)) => t.iter().map(|t| t.name().to_string()).collect(),
             Some(Err(e)) => {
@@ -251,33 +251,31 @@ impl SchemaProvider for SqeSchemaProvider {
 
         // First: try loading as a regular Iceberg table
         match self.session_catalog.load_table(&table_ident).await {
-            Ok(table) => {
-                match SqeTableProvider::try_new(table).await {
-                    Ok(provider) => {
-                        let provider = match self.prom_metrics {
-                            Some(ref m) => provider.with_metrics(Arc::clone(m)),
-                            None => provider,
-                        };
-                        let provider = provider
-                            .with_small_file_threshold(self.small_file_threshold_bytes)
-                            .with_manifest_concurrency(self.manifest_concurrency)
-                            .with_prefetch_concurrency(self.prefetch_concurrency)
-                            .with_runtime_filter_clustering(
-                                self.runtime_filter_clustering_skip,
-                                self.runtime_filter_uniform_threshold,
-                            )
-                            .with_runtime_filter_wait_ms(self.runtime_filter_wait_ms)
-                            .with_runtime_filter_bloom(
-                                self.runtime_filter_bloom_probe,
-                                self.runtime_filter_bloom_max_values,
-                            );
-                        return Ok(Some(Arc::new(provider)));
-                    }
-                    Err(e) => {
-                        error!(table = name, error = %e, "Failed to create table provider");
-                    }
+            Ok(table) => match SqeTableProvider::try_new(table).await {
+                Ok(provider) => {
+                    let provider = match self.prom_metrics {
+                        Some(ref m) => provider.with_metrics(Arc::clone(m)),
+                        None => provider,
+                    };
+                    let provider = provider
+                        .with_small_file_threshold(self.small_file_threshold_bytes)
+                        .with_manifest_concurrency(self.manifest_concurrency)
+                        .with_prefetch_concurrency(self.prefetch_concurrency)
+                        .with_runtime_filter_clustering(
+                            self.runtime_filter_clustering_skip,
+                            self.runtime_filter_uniform_threshold,
+                        )
+                        .with_runtime_filter_wait_ms(self.runtime_filter_wait_ms)
+                        .with_runtime_filter_bloom(
+                            self.runtime_filter_bloom_probe,
+                            self.runtime_filter_bloom_max_values,
+                        );
+                    return Ok(Some(Arc::new(provider)));
                 }
-            }
+                Err(e) => {
+                    error!(table = name, error = %e, "Failed to create table provider");
+                }
+            },
             Err(e) => {
                 debug!(table = name, error = %e, "Not found as table, trying view");
             }
@@ -304,11 +302,7 @@ impl SqeSchemaProvider {
     ///
     /// Creates a minimal SessionContext with the same catalog registered so that
     /// the view's SQL can reference tables in the same namespace.
-    async fn plan_view(
-        &self,
-        name: &str,
-        sql: String,
-    ) -> DFResult<Option<Arc<dyn TableProvider>>> {
+    async fn plan_view(&self, name: &str, sql: String) -> DFResult<Option<Arc<dyn TableProvider>>> {
         let catalog_name = &self.warehouse;
 
         let mini_ctx = SessionContext::new_with_config(
@@ -325,9 +319,9 @@ impl SqeSchemaProvider {
         )
         .await
         .map_err(|e| {
-            datafusion::error::DataFusionError::External(format!(
-                "Failed to create catalog for view planning: {e}"
-            ).into())
+            datafusion::error::DataFusionError::External(
+                format!("Failed to create catalog for view planning: {e}").into(),
+            )
         })?;
 
         mini_ctx.register_catalog(catalog_name, Arc::new(catalog_provider));

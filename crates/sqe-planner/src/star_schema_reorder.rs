@@ -432,13 +432,11 @@ fn rebuild_join_chain(
             None => {
                 // Could not find a valid join condition linking these inputs.
                 // This can happen with complex join graphs. Fall back gracefully.
-                return Err(datafusion::error::DataFusionError::Internal(
-                    format!(
-                        "StarSchemaReorderRule: cannot find join condition connecting \
+                return Err(datafusion::error::DataFusionError::Internal(format!(
+                    "StarSchemaReorderRule: cannot find join condition connecting \
                          input {} to the accumulated set {:?}",
-                        new_idx, accumulated_indices,
-                    ),
-                ));
+                    new_idx, accumulated_indices,
+                )));
             }
         }
 
@@ -480,7 +478,12 @@ fn find_condition_for_pair(
                 &new_schema,
             );
             if let Some(on) = on {
-                return Some((on, cond.filter.clone(), cond.null_equality, cond.partition_mode));
+                return Some((
+                    on,
+                    cond.filter.clone(),
+                    cond.null_equality,
+                    cond.partition_mode,
+                ));
             }
         }
     }
@@ -503,7 +506,12 @@ fn find_condition_for_pair(
                 &new_schema,
             );
             if let Some(on) = on {
-                return Some((on, cond.filter.clone(), cond.null_equality, cond.partition_mode));
+                return Some((
+                    on,
+                    cond.filter.clone(),
+                    cond.null_equality,
+                    cond.partition_mode,
+                ));
             }
         }
     }
@@ -520,7 +528,12 @@ fn find_condition_for_pair(
             &new_schema,
         );
         if let Some(on) = on {
-            return Some((on, cond.filter.clone(), cond.null_equality, cond.partition_mode));
+            return Some((
+                on,
+                cond.filter.clone(),
+                cond.null_equality,
+                cond.partition_mode,
+            ));
         }
     }
 
@@ -630,9 +643,7 @@ fn resolve_join_keys_by_name(
 /// Only supports `Column` expressions — returns `None` for complex
 /// expressions (casts, functions, etc.).
 fn extract_column_name(expr: &Arc<dyn datafusion::physical_expr::PhysicalExpr>) -> Option<String> {
-    expr
-        .downcast_ref::<Column>()
-        .map(|c| c.name().to_string())
+    expr.downcast_ref::<Column>().map(|c| c.name().to_string())
 }
 
 /// PLAN-01: resolve a column name to its index ONLY when the name is unique in
@@ -934,7 +945,11 @@ mod tests {
             Some(3),
             "unique name resolves to its index"
         );
-        assert_eq!(index_of_unique(&schema, "absent"), None, "missing name -> None");
+        assert_eq!(
+            index_of_unique(&schema, "absent"),
+            None,
+            "missing name -> None"
+        );
     }
 
     /// `resolve_join_keys` must bail when the accumulated schema has a duplicate
@@ -980,9 +995,9 @@ mod tests {
     ///     changing the string -- so this assertion fails before the fix.
     #[test]
     fn plan01_control_reorders_subject_bails() {
+        use arrow_array::{Int64Array, RecordBatch, StringArray};
         use datafusion::datasource::memory::MemorySourceConfig;
         use datafusion::physical_plan::displayable;
-        use arrow_array::{Int64Array, RecordBatch, StringArray};
 
         // Build an executable, statistics-bearing leaf from real rows.
         fn leaf(
@@ -1002,9 +1017,8 @@ mod tests {
             MemorySourceConfig::try_new_exec(&[vec![batch]], schema, None).unwrap()
         }
 
-        let plan_str = |p: &Arc<dyn ExecutionPlan>| {
-            displayable(p.as_ref()).indent(true).to_string()
-        };
+        let plan_str =
+            |p: &Arc<dyn ExecutionPlan>| displayable(p.as_ref()).indent(true).to_string();
 
         let rule = StarSchemaReorderRule::new(10);
         let config = ConfigOptions::new();

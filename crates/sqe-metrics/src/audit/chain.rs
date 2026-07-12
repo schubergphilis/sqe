@@ -1,8 +1,8 @@
 //! Tamper-evident [`HashChain`] linking consecutive audit records so gaps or
 //! edits are detectable.
 
-use sha2::{Digest, Sha256};
 use super::event::AuditEvent;
+use sha2::{Digest, Sha256};
 
 const GENESIS: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
@@ -13,7 +13,10 @@ pub struct HashChain {
 
 impl HashChain {
     pub fn new() -> Self {
-        Self { next_seq: 0, prev_hash: GENESIS.to_string() }
+        Self {
+            next_seq: 0,
+            prev_hash: GENESIS.to_string(),
+        }
     }
 
     /// Return the sequence number that will be assigned to the next record.
@@ -76,13 +79,20 @@ pub fn verify_chain(events: &[AuditEvent]) -> Result<(), ChainError> {
     for (i, ev) in events.iter().enumerate() {
         let expected_seq = i as u64;
         if ev.integrity.seq != expected_seq {
-            return Err(ChainError::SeqGap { expected: expected_seq, found: ev.integrity.seq });
+            return Err(ChainError::SeqGap {
+                expected: expected_seq,
+                found: ev.integrity.seq,
+            });
         }
         if ev.integrity.prev_hash != prev {
-            return Err(ChainError::BrokenLink { seq: ev.integrity.seq });
+            return Err(ChainError::BrokenLink {
+                seq: ev.integrity.seq,
+            });
         }
         if compute_hash(ev) != ev.integrity.hash {
-            return Err(ChainError::BadHash { seq: ev.integrity.seq });
+            return Err(ChainError::BadHash {
+                seq: ev.integrity.seq,
+            });
         }
         prev = ev.integrity.hash.clone();
     }
@@ -124,7 +134,9 @@ mod tests {
         let mut a = sample_query_event();
         let mut b = sample_query_event();
         let mut c = sample_query_event();
-        chain.stamp(&mut a); chain.stamp(&mut b); chain.stamp(&mut c);
+        chain.stamp(&mut a);
+        chain.stamp(&mut b);
+        chain.stamp(&mut c);
         // Dropping b leaves a seq gap and a broken prev_hash link.
         assert!(verify_chain(&[a, c]).is_err());
     }

@@ -1,8 +1,6 @@
 use std::sync::Arc;
 
-use arrow_array::{
-    Date32Array, Decimal128Array, Int32Array, Int64Array, RecordBatch, StringArray,
-};
+use arrow_array::{Date32Array, Decimal128Array, Int32Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 
 /// Convert an f64 vector to a TPC-H DECIMAL(15, 2) array.
@@ -19,7 +17,10 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 /// scale-2 representation. Range fits comfortably: TPC-H prices stay
 /// well under 1e13, scale-100 → ~1e15, while DECIMAL(15) covers 1e15.
 fn decimal_15_2_array(values: Vec<f64>) -> Decimal128Array {
-    let scaled: Vec<i128> = values.into_iter().map(|v| (v * 100.0).round() as i128).collect();
+    let scaled: Vec<i128> = values
+        .into_iter()
+        .map(|v| (v * 100.0).round() as i128)
+        .collect();
     Decimal128Array::from_iter_values(scaled)
         .with_precision_and_scale(15, 2)
         .expect("Decimal128(15, 2) is valid for TPC-H money/quantity columns")
@@ -159,8 +160,8 @@ const DATE_RANGE: i32 = 2556; // ~7 years in days
 // derived from ship/receipt dates relative to this cutoff, which is what makes
 // (returnflag, linestatus) take exactly four valid combinations rather than six.
 const CURRENT_DATE: i32 = 9298; // days_since_epoch(1995, 6, 17)
-// Order dates are bounded so the derived shipdate (orderdate + up to 121 days)
-// never spills past DATE_START + DATE_RANGE (1998-12-31).
+                                // Order dates are bounded so the derived shipdate (orderdate + up to 121 days)
+                                // never spills past DATE_START + DATE_RANGE (1998-12-31).
 const ORDER_DATE_RANGE: i32 = DATE_RANGE - 121;
 
 /// An order date bounded so the lineitem ship/commit/receipt chain stays in range.
@@ -183,7 +184,9 @@ fn seed_for_table(name: &str) -> u64 {
     // Simple deterministic hash of the table name
     name.bytes()
         .enumerate()
-        .fold(0u64, |acc, (i, b)| acc ^ ((b as u64).wrapping_shl(i as u32 % 64)))
+        .fold(0u64, |acc, (i, b)| {
+            acc ^ ((b as u64).wrapping_shl(i as u32 % 64))
+        })
         .wrapping_add(0xDEAD_BEEF_CAFE_1234)
 }
 
@@ -235,13 +238,7 @@ const MARKET_SEGMENTS: &[&str] = &[
     "HOUSEHOLD",
 ];
 
-const ORDER_PRIORITIES: &[&str] = &[
-    "1-URGENT",
-    "2-HIGH",
-    "3-MEDIUM",
-    "4-NOT SPECIFIED",
-    "5-LOW",
-];
+const ORDER_PRIORITIES: &[&str] = &["1-URGENT", "2-HIGH", "3-MEDIUM", "4-NOT SPECIFIED", "5-LOW"];
 
 const SHIP_MODES: &[&str] = &["REG AIR", "AIR", "RAIL", "SHIP", "TRUCK", "MAIL", "FOB"];
 
@@ -260,26 +257,132 @@ const PART_TYPE_SYL2: &[&str] = &["ANODIZED", "BURNISHED", "PLATED", "POLISHED",
 const PART_TYPE_SYL3: &[&str] = &["TIN", "NICKEL", "BRASS", "STEEL", "COPPER"];
 
 const PART_CONTAINERS: &[&str] = &[
-    "SM CASE", "SM BOX", "SM BAG", "SM JAR", "SM PACK", "SM CAN",
-    "LG CASE", "LG BOX", "LG BAG", "LG JAR", "LG PACK", "LG CAN",
-    "MED CASE", "MED BOX", "MED BAG", "MED JAR", "MED PACK", "MED CAN",
-    "JUMBO CASE", "JUMBO BOX", "JUMBO BAG", "JUMBO JAR", "JUMBO PACK", "JUMBO CAN",
-    "WRAP CASE", "WRAP BOX", "WRAP BAG", "WRAP JAR", "WRAP PACK", "WRAP CAN",
+    "SM CASE",
+    "SM BOX",
+    "SM BAG",
+    "SM JAR",
+    "SM PACK",
+    "SM CAN",
+    "LG CASE",
+    "LG BOX",
+    "LG BAG",
+    "LG JAR",
+    "LG PACK",
+    "LG CAN",
+    "MED CASE",
+    "MED BOX",
+    "MED BAG",
+    "MED JAR",
+    "MED PACK",
+    "MED CAN",
+    "JUMBO CASE",
+    "JUMBO BOX",
+    "JUMBO BAG",
+    "JUMBO JAR",
+    "JUMBO PACK",
+    "JUMBO CAN",
+    "WRAP CASE",
+    "WRAP BOX",
+    "WRAP BAG",
+    "WRAP JAR",
+    "WRAP PACK",
+    "WRAP CAN",
 ];
 
 const PART_COLORS: &[&str] = &[
-    "almond", "antique", "aquamarine", "azure", "beige", "bisque", "black", "blanched",
-    "blue", "blush", "brown", "burlywood", "burnished", "chartreuse", "chiffon", "chocolate",
-    "coral", "cornflower", "cornsilk", "cream", "cyan", "dark", "deep", "dim",
-    "dodger", "drab", "firebrick", "floral", "forest", "frosted", "gainsboro", "ghost",
-    "goldenrod", "green", "grey", "honeydew", "hot", "indian", "ivory", "khaki",
-    "lace", "lavender", "lawn", "lemon", "light", "lime", "linen", "magenta",
-    "maroon", "medium", "metallic", "midnight", "mint", "misty", "moccasin", "navajo",
-    "navy", "olive", "orange", "orchid", "pale", "papaya", "peach", "peru",
-    "pink", "plum", "powder", "puff", "purple", "red", "rose", "rosy",
-    "royal", "saddle", "salmon", "sandy", "sea", "seashell", "sienna", "sky",
-    "slate", "smoke", "snow", "spring", "steel", "tan", "thistle", "tomato",
-    "turquoise", "violet", "wheat", "white", "yellow",
+    "almond",
+    "antique",
+    "aquamarine",
+    "azure",
+    "beige",
+    "bisque",
+    "black",
+    "blanched",
+    "blue",
+    "blush",
+    "brown",
+    "burlywood",
+    "burnished",
+    "chartreuse",
+    "chiffon",
+    "chocolate",
+    "coral",
+    "cornflower",
+    "cornsilk",
+    "cream",
+    "cyan",
+    "dark",
+    "deep",
+    "dim",
+    "dodger",
+    "drab",
+    "firebrick",
+    "floral",
+    "forest",
+    "frosted",
+    "gainsboro",
+    "ghost",
+    "goldenrod",
+    "green",
+    "grey",
+    "honeydew",
+    "hot",
+    "indian",
+    "ivory",
+    "khaki",
+    "lace",
+    "lavender",
+    "lawn",
+    "lemon",
+    "light",
+    "lime",
+    "linen",
+    "magenta",
+    "maroon",
+    "medium",
+    "metallic",
+    "midnight",
+    "mint",
+    "misty",
+    "moccasin",
+    "navajo",
+    "navy",
+    "olive",
+    "orange",
+    "orchid",
+    "pale",
+    "papaya",
+    "peach",
+    "peru",
+    "pink",
+    "plum",
+    "powder",
+    "puff",
+    "purple",
+    "red",
+    "rose",
+    "rosy",
+    "royal",
+    "saddle",
+    "salmon",
+    "sandy",
+    "sea",
+    "seashell",
+    "sienna",
+    "sky",
+    "slate",
+    "smoke",
+    "snow",
+    "spring",
+    "steel",
+    "tan",
+    "thistle",
+    "tomato",
+    "turquoise",
+    "violet",
+    "wheat",
+    "white",
+    "yellow",
 ];
 
 // ---------------------------------------------------------------------------
@@ -288,7 +391,9 @@ const PART_COLORS: &[&str] = &[
 
 fn random_word(rng: &mut StdRng, len: usize) -> String {
     const CHARS: &[u8] = b"abcdefghijklmnopqrstuvwxyz";
-    (0..len).map(|_| CHARS[rng.gen_range(0..CHARS.len())] as char).collect()
+    (0..len)
+        .map(|_| CHARS[rng.gen_range(0..CHARS.len())] as char)
+        .collect()
 }
 
 fn random_address(rng: &mut StdRng) -> String {
@@ -736,7 +841,8 @@ fn generate_orders_range(
             o_orderstatus.push(status.to_string());
             o_totalprice.push((rng.gen_range(10_000..50_000_000_i64) as f64) / 100.0);
             o_orderdate.push(orderdate);
-            o_orderpriority.push(ORDER_PRIORITIES[rng.gen_range(0..ORDER_PRIORITIES.len())].to_string());
+            o_orderpriority
+                .push(ORDER_PRIORITIES[rng.gen_range(0..ORDER_PRIORITIES.len())].to_string());
             o_clerk.push(format!("Clerk#{clerk_num:09}"));
             o_shippriority.push(0i32);
             o_comment.push(random_comment(&mut rng));
@@ -961,9 +1067,8 @@ impl BenchmarkGenerator for TpchGenerator {
             "region" => {
                 let start = std::time::Instant::now();
                 let (schema, batches) = generate_region();
-                let (files, bytes) = parquet_writer::write_parquet_files(
-                    &batches, schema, &full_output, table,
-                )?;
+                let (files, bytes) =
+                    parquet_writer::write_parquet_files(&batches, schema, &full_output, table)?;
                 let rows = batches.iter().map(|b| b.num_rows()).sum();
                 return Ok(GenerateStats {
                     table: table.to_string(),
@@ -976,9 +1081,8 @@ impl BenchmarkGenerator for TpchGenerator {
             "nation" => {
                 let start = std::time::Instant::now();
                 let (schema, batches) = generate_nation();
-                let (files, bytes) = parquet_writer::write_parquet_files(
-                    &batches, schema, &full_output, table,
-                )?;
+                let (files, bytes) =
+                    parquet_writer::write_parquet_files(&batches, schema, &full_output, table)?;
                 let rows = batches.iter().map(|b| b.num_rows()).sum();
                 return Ok(GenerateStats {
                     table: table.to_string(),
@@ -996,50 +1100,35 @@ impl BenchmarkGenerator for TpchGenerator {
         // `parallel_generate_table`, which streams batches into per-worker
         // parquet writers.
         let (total_rows, schema): (usize, SchemaRef) = match table {
-            "supplier" => (
-                super::scaled(scale, 10_000.0).max(1),
-                supplier_schema(),
-            ),
-            "customer" => (
-                super::scaled(scale, 150_000.0).max(1),
-                customer_schema(),
-            ),
+            "supplier" => (super::scaled(scale, 10_000.0).max(1), supplier_schema()),
+            "customer" => (super::scaled(scale, 150_000.0).max(1), customer_schema()),
             "part" => (super::scaled(scale, 200_000.0).max(1), part_schema()),
-            "partsupp" => (
-                super::scaled(scale, 800_000.0).max(1),
-                partsupp_schema(),
-            ),
-            "orders" => (
-                super::scaled(scale, 1_500_000.0).max(1),
-                orders_schema(),
-            ),
-            "lineitem" => (
-                super::scaled(scale, 6_000_000.0).max(1),
-                lineitem_schema(),
-            ),
+            "partsupp" => (super::scaled(scale, 800_000.0).max(1), partsupp_schema()),
+            "orders" => (super::scaled(scale, 1_500_000.0).max(1), orders_schema()),
+            "lineitem" => (super::scaled(scale, 6_000_000.0).max(1), lineitem_schema()),
             _ => anyhow::bail!("Unknown TPC-H table: {table}"),
         };
 
         let base_seed = seed_for_table(table);
         let gen_range: BoxedRangeFn = match table {
-            "supplier" => Box::new(move |range, seed| {
-                Box::new(generate_supplier_range(range, scale, seed))
-            }),
-            "customer" => Box::new(move |range, seed| {
-                Box::new(generate_customer_range(range, scale, seed))
-            }),
-            "part" => Box::new(move |range, seed| {
-                Box::new(generate_part_range(range, scale, seed))
-            }),
-            "partsupp" => Box::new(move |range, seed| {
-                Box::new(generate_partsupp_range(range, scale, seed))
-            }),
-            "orders" => Box::new(move |range, seed| {
-                Box::new(generate_orders_range(range, scale, seed))
-            }),
-            "lineitem" => Box::new(move |range, seed| {
-                Box::new(generate_lineitem_range(range, scale, seed))
-            }),
+            "supplier" => {
+                Box::new(move |range, seed| Box::new(generate_supplier_range(range, scale, seed)))
+            }
+            "customer" => {
+                Box::new(move |range, seed| Box::new(generate_customer_range(range, scale, seed)))
+            }
+            "part" => {
+                Box::new(move |range, seed| Box::new(generate_part_range(range, scale, seed)))
+            }
+            "partsupp" => {
+                Box::new(move |range, seed| Box::new(generate_partsupp_range(range, scale, seed)))
+            }
+            "orders" => {
+                Box::new(move |range, seed| Box::new(generate_orders_range(range, scale, seed)))
+            }
+            "lineitem" => {
+                Box::new(move |range, seed| Box::new(generate_lineitem_range(range, scale, seed)))
+            }
             _ => unreachable!("filtered above"),
         };
 
@@ -1061,9 +1150,8 @@ impl BenchmarkGenerator for TpchGenerator {
 /// type-erase through a `Box<dyn Iterator>` to store a uniform closure
 /// signature in the match below. Factored into a type alias to keep
 /// clippy's `type_complexity` lint happy.
-type BoxedRangeFn = Box<
-    dyn Fn(std::ops::Range<usize>, u64) -> Box<dyn Iterator<Item = RecordBatch> + Send> + Sync,
->;
+type BoxedRangeFn =
+    Box<dyn Fn(std::ops::Range<usize>, u64) -> Box<dyn Iterator<Item = RecordBatch> + Send> + Sync>;
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -1189,10 +1277,30 @@ mod tests {
         let (_schema, batches) = generate_lineitem(0.01);
         let mut combos = std::collections::HashSet::new();
         for b in &batches {
-            let rf = b.column_by_name("l_returnflag").unwrap().as_any().downcast_ref::<StringArray>().unwrap();
-            let ls = b.column_by_name("l_linestatus").unwrap().as_any().downcast_ref::<StringArray>().unwrap();
-            let ship = b.column_by_name("l_shipdate").unwrap().as_any().downcast_ref::<Date32Array>().unwrap();
-            let recv = b.column_by_name("l_receiptdate").unwrap().as_any().downcast_ref::<Date32Array>().unwrap();
+            let rf = b
+                .column_by_name("l_returnflag")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let ls = b
+                .column_by_name("l_linestatus")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let ship = b
+                .column_by_name("l_shipdate")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Date32Array>()
+                .unwrap();
+            let recv = b
+                .column_by_name("l_receiptdate")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Date32Array>()
+                .unwrap();
             for i in 0..b.num_rows() {
                 let (r, l) = (rf.value(i), ls.value(i));
                 combos.insert((r.to_string(), l.to_string()));
@@ -1202,7 +1310,11 @@ mod tests {
                 }
             }
         }
-        assert_eq!(combos.len(), 4, "expected exactly 4 (returnflag,linestatus) combos, got {combos:?}");
+        assert_eq!(
+            combos.len(),
+            4,
+            "expected exactly 4 (returnflag,linestatus) combos, got {combos:?}"
+        );
         assert!(!combos.contains(&("A".to_string(), "O".to_string())));
         assert!(!combos.contains(&("R".to_string(), "O".to_string())));
     }
@@ -1214,10 +1326,18 @@ mod tests {
         assert_eq!(part_retailprice(1), 901.0);
         let (_schema, batches) = generate_part(0.01);
         for b in &batches {
-            let rp = b.column_by_name("p_retailprice").unwrap().as_any().downcast_ref::<Decimal128Array>().unwrap();
+            let rp = b
+                .column_by_name("p_retailprice")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .unwrap();
             for i in 0..b.num_rows() {
                 let dollars = rp.value(i) as f64 / 100.0;
-                assert!((900.0..=2100.0).contains(&dollars), "retail price {dollars} out of spec band");
+                assert!(
+                    (900.0..=2100.0).contains(&dollars),
+                    "retail price {dollars} out of spec band"
+                );
             }
         }
     }
@@ -1229,18 +1349,41 @@ mod tests {
         let (_ps, ps_batches) = generate_partsupp(0.01);
         let mut valid = std::collections::HashSet::new();
         for b in &ps_batches {
-            let pk = b.column_by_name("ps_partkey").unwrap().as_any().downcast_ref::<Int32Array>().unwrap();
-            let sk = b.column_by_name("ps_suppkey").unwrap().as_any().downcast_ref::<Int32Array>().unwrap();
+            let pk = b
+                .column_by_name("ps_partkey")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            let sk = b
+                .column_by_name("ps_suppkey")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
             for i in 0..b.num_rows() {
                 valid.insert((pk.value(i), sk.value(i)));
             }
         }
         let (_li, li_batches) = generate_lineitem(0.01);
         for b in &li_batches {
-            let pk = b.column_by_name("l_partkey").unwrap().as_any().downcast_ref::<Int32Array>().unwrap();
-            let sk = b.column_by_name("l_suppkey").unwrap().as_any().downcast_ref::<Int32Array>().unwrap();
+            let pk = b
+                .column_by_name("l_partkey")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            let sk = b
+                .column_by_name("l_suppkey")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
             for i in 0..b.num_rows() {
-                assert!(valid.contains(&(pk.value(i), sk.value(i))), "lineitem (partkey,suppkey) not in partsupp");
+                assert!(
+                    valid.contains(&(pk.value(i), sk.value(i))),
+                    "lineitem (partkey,suppkey) not in partsupp"
+                );
             }
         }
     }
@@ -1251,14 +1394,20 @@ mod tests {
         // Use a stable path under /tmp; parquet_writer creates subdirs
         let output = "/tmp/sqe-bench-test-tpch-parquet";
 
-        let stats = gen.generate_table("region", 1.0, output, &Default::default()).unwrap();
+        let stats = gen
+            .generate_table("region", 1.0, output, &Default::default())
+            .unwrap();
         assert_eq!(stats.rows, 5);
         assert_eq!(stats.files, 1);
 
-        let stats = gen.generate_table("nation", 1.0, output, &Default::default()).unwrap();
+        let stats = gen
+            .generate_table("nation", 1.0, output, &Default::default())
+            .unwrap();
         assert_eq!(stats.rows, 25);
 
-        let stats = gen.generate_table("supplier", 0.01, output, &Default::default()).unwrap();
+        let stats = gen
+            .generate_table("supplier", 0.01, output, &Default::default())
+            .unwrap();
         assert_eq!(stats.rows, 100);
     }
 
@@ -1278,7 +1427,11 @@ mod tests {
         let idx = sch.index_of("p_type").unwrap();
         let mut seen = std::collections::HashSet::new();
         for b in &batches {
-            let col = b.column(idx).as_any().downcast_ref::<StringArray>().unwrap();
+            let col = b
+                .column(idx)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
             for i in 0..col.len() {
                 seen.insert(col.value(i).to_string());
             }
@@ -1299,7 +1452,11 @@ mod tests {
             for i in 0..col.len() {
                 let ck = col.value(i);
                 assert!(ck >= 1, "custkey must be positive, got {ck}");
-                assert_ne!(ck % 3, 0, "custkey {ck} divisible by 3 should never get orders");
+                assert_ne!(
+                    ck % 3,
+                    0,
+                    "custkey {ck} divisible by 3 should never get orders"
+                );
             }
         }
     }

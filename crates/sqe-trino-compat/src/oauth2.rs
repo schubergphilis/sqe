@@ -30,10 +30,14 @@ pub struct OAuth2State {
 /// the token-poll id, and acts as the anti-CSRF token verified in the callback
 /// (RFC 6749 section 10.12).
 pub async fn generate_challenge(state: &OAuth2State) -> Result<(String, String), StatusCode> {
-    let challenge = state.auth_code_service.start_challenge().await.map_err(|e| {
-        warn!(error = %e, "Failed to start auth code challenge");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    let challenge = state
+        .auth_code_service
+        .start_challenge()
+        .await
+        .map_err(|e| {
+            warn!(error = %e, "Failed to start auth code challenge");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
     let session_key = challenge.state.clone();
     let session_key_hash = hex::encode(Sha256::digest(session_key.as_bytes()));
@@ -42,12 +46,14 @@ pub async fn generate_challenge(state: &OAuth2State) -> Result<(String, String),
         .pending_store
         .insert_pending(&session_key, challenge.code_verifier, challenge.state);
 
-    let initiate_url = format!("{}/oauth2/token/initiate/{}", state.base_url, session_key_hash);
+    let initiate_url = format!(
+        "{}/oauth2/token/initiate/{}",
+        state.base_url, session_key_hash
+    );
     let token_url = format!("{}/oauth2/token/{}", state.base_url, session_key);
 
-    let www_authenticate = format!(
-        "Bearer x_redirect_server=\"{initiate_url}\", x_token_server=\"{token_url}\""
-    );
+    let www_authenticate =
+        format!("Bearer x_redirect_server=\"{initiate_url}\", x_token_server=\"{token_url}\"");
 
     Ok((session_key, www_authenticate))
 }
@@ -96,7 +102,11 @@ fn verify_state_and_take_verifier(
     returned_state: &str,
 ) -> Result<String, &'static str> {
     match store.poll(returned_state) {
-        Some(PendingAuth::AwaitingCallback { code_verifier, state, .. }) => {
+        Some(PendingAuth::AwaitingCallback {
+            code_verifier,
+            state,
+            ..
+        }) => {
             let stored = SecretString::new(state);
             let returned = SecretString::new(returned_state.to_string());
             if stored.ct_eq(&returned) {
@@ -128,7 +138,11 @@ pub async fn callback_handler(
     };
 
     let session_key = &params.state;
-    match state.auth_code_service.exchange_code(&params.code, &code_verifier).await {
+    match state
+        .auth_code_service
+        .exchange_code(&params.code, &code_verifier)
+        .await
+    {
         Ok(tokens) => {
             debug!("Authorization code exchange succeeded");
             state.pending_store.complete(session_key, tokens);
@@ -145,9 +159,16 @@ pub async fn callback_handler(
 #[derive(Debug, Serialize)]
 #[serde(untagged)]
 pub enum TokenPollResponse {
-    Pending { #[serde(rename = "nextUri")] next_uri: String },
-    Complete { token: String },
-    Error { error: String },
+    Pending {
+        #[serde(rename = "nextUri")]
+        next_uri: String,
+    },
+    Complete {
+        token: String,
+    },
+    Error {
+        error: String,
+    },
 }
 
 /// GET /oauth2/token/{auth_id} — polled by the Trino JDBC driver.
@@ -160,9 +181,10 @@ pub async fn poll_token_handler(
             let next_uri = format!("{}/oauth2/token/{}", state.base_url, auth_id);
             Json(TokenPollResponse::Pending { next_uri }).into_response()
         }
-        Some(PendingAuth::Complete(tokens)) => {
-            Json(TokenPollResponse::Complete { token: tokens.access_token }).into_response()
-        }
+        Some(PendingAuth::Complete(tokens)) => Json(TokenPollResponse::Complete {
+            token: tokens.access_token,
+        })
+        .into_response(),
         Some(PendingAuth::Failed(msg)) => {
             Json(TokenPollResponse::Error { error: msg }).into_response()
         }
@@ -210,7 +232,9 @@ mod tests {
 
     #[test]
     fn token_poll_response_complete_serializes() {
-        let resp = TokenPollResponse::Complete { token: "eyJ...".to_string() };
+        let resp = TokenPollResponse::Complete {
+            token: "eyJ...".to_string(),
+        };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("\"token\""));
         assert!(json.contains("eyJ..."));
@@ -218,7 +242,9 @@ mod tests {
 
     #[test]
     fn token_poll_response_error_serializes() {
-        let resp = TokenPollResponse::Error { error: "user denied".to_string() };
+        let resp = TokenPollResponse::Error {
+            error: "user denied".to_string(),
+        };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("\"error\""));
     }
@@ -228,16 +254,25 @@ mod tests {
         let store = PendingAuthStore::new(Duration::from_secs(60));
         store.insert_pending("test-id", "verifier".to_string(), "state".to_string());
 
-        assert!(matches!(store.poll("test-id"), Some(PendingAuth::AwaitingCallback { .. })));
+        assert!(matches!(
+            store.poll("test-id"),
+            Some(PendingAuth::AwaitingCallback { .. })
+        ));
 
-        store.complete("test-id", sqe_auth::pending_auth::TokenSet {
-            access_token: "at".to_string(),
-            id_token: None,
-            refresh_token: None,
-            expires_in: 3600,
-        });
+        store.complete(
+            "test-id",
+            sqe_auth::pending_auth::TokenSet {
+                access_token: "at".to_string(),
+                id_token: None,
+                refresh_token: None,
+                expires_in: 3600,
+            },
+        );
 
-        assert!(matches!(store.poll("test-id"), Some(PendingAuth::Complete(_))));
+        assert!(matches!(
+            store.poll("test-id"),
+            Some(PendingAuth::Complete(_))
+        ));
 
         store.remove("test-id");
         assert!(store.poll("test-id").is_none());
@@ -247,7 +282,11 @@ mod tests {
     fn verify_state_accepts_matching_state() {
         let store = PendingAuthStore::new(Duration::from_secs(60));
         // Keyed by `state`, with the same `state` stored as the CSRF token.
-        store.insert_pending("good-state", "verifier-1".to_string(), "good-state".to_string());
+        store.insert_pending(
+            "good-state",
+            "verifier-1".to_string(),
+            "good-state".to_string(),
+        );
 
         let result = verify_state_and_take_verifier(&store, "good-state");
         assert_eq!(result, Ok("verifier-1".to_string()));
@@ -259,7 +298,11 @@ mod tests {
         // Lookup key and stored CSRF token deliberately diverge to exercise the
         // mismatch branch: the entry is found by key but its stored `state`
         // does not match the value used to look it up.
-        store.insert_pending("lookup-key", "verifier-2".to_string(), "real-state".to_string());
+        store.insert_pending(
+            "lookup-key",
+            "verifier-2".to_string(),
+            "real-state".to_string(),
+        );
 
         let result = verify_state_and_take_verifier(&store, "lookup-key");
         assert!(result.is_err(), "mismatched state must be rejected");
@@ -268,7 +311,11 @@ mod tests {
     #[test]
     fn verify_state_rejects_unknown_state() {
         let store = PendingAuthStore::new(Duration::from_secs(60));
-        store.insert_pending("good-state", "verifier-3".to_string(), "good-state".to_string());
+        store.insert_pending(
+            "good-state",
+            "verifier-3".to_string(),
+            "good-state".to_string(),
+        );
 
         // An attacker-supplied state that was never issued misses the store.
         let result = verify_state_and_take_verifier(&store, "forged-state");

@@ -81,18 +81,14 @@ async fn mount_rest_fixture(server: &MockServer) {
     Mock::given(method("GET"))
         .and(path("/v1/config"))
         .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_string(r#"{"overrides":{},"defaults":{}}"#),
+            ResponseTemplate::new(200).set_body_string(r#"{"overrides":{},"defaults":{}}"#),
         )
         .mount(server)
         .await;
 
     Mock::given(method("GET"))
         .and(path("/v1/namespaces"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_string(r#"{"namespaces":[]}"#),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"namespaces":[]}"#))
         .mount(server)
         .await;
 }
@@ -105,8 +101,7 @@ async fn mount_rest_fixture_requires_auth(server: &MockServer) {
         .and(path("/v1/config"))
         .and(header_exists("Authorization"))
         .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_string(r#"{"overrides":{},"defaults":{}}"#),
+            ResponseTemplate::new(200).set_body_string(r#"{"overrides":{},"defaults":{}}"#),
         )
         .mount(server)
         .await;
@@ -114,17 +109,13 @@ async fn mount_rest_fixture_requires_auth(server: &MockServer) {
     Mock::given(method("GET"))
         .and(path("/v1/namespaces"))
         .and(header_exists("Authorization"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_string(r#"{"namespaces":[]}"#),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"namespaces":[]}"#))
         .mount(server)
         .await;
 
     Mock::given(|req: &Request| !req.headers.contains_key("authorization"))
         .respond_with(
-            ResponseTemplate::new(401)
-                .insert_header("www-authenticate", "Bearer realm=\"test\""),
+            ResponseTemplate::new(401).insert_header("www-authenticate", "Bearer realm=\"test\""),
         )
         .mount(server)
         .await;
@@ -143,12 +134,13 @@ async fn attach_rest_catalog_succeeds() {
     let session = dummy_session();
     let url = server.uri();
 
-    let sql = format!(
-        "ATTACH '{url}' AS remote_cat (TYPE iceberg_rest, WAREHOUSE 'test-wh')"
-    );
+    let sql = format!("ATTACH '{url}' AS remote_cat (TYPE iceberg_rest, WAREHOUSE 'test-wh')");
     let result = handler.execute(&session, &sql, None).await;
     assert!(result.is_ok(), "ATTACH should succeed: {:?}", result.err());
-    assert_eq!(result.unwrap().iter().map(|b| b.num_rows()).sum::<usize>(), 0);
+    assert_eq!(
+        result.unwrap().iter().map(|b| b.num_rows()).sum::<usize>(),
+        0
+    );
 }
 
 #[tokio::test]
@@ -160,10 +152,11 @@ async fn attach_rest_duplicate_name_errors() {
     let session = dummy_session();
     let url = server.uri();
 
-    let sql = format!(
-        "ATTACH '{url}' AS dup_cat (TYPE iceberg_rest, WAREHOUSE 'wh')"
-    );
-    handler.execute(&session, &sql, None).await.expect("first attach");
+    let sql = format!("ATTACH '{url}' AS dup_cat (TYPE iceberg_rest, WAREHOUSE 'wh')");
+    handler
+        .execute(&session, &sql, None)
+        .await
+        .expect("first attach");
 
     let err = handler
         .execute(&session, &sql, None)
@@ -185,14 +178,21 @@ async fn attach_then_detach_then_reattach() {
     let session = dummy_session();
     let url = server.uri();
 
-    let attach_sql = format!(
-        "ATTACH '{url}' AS cycle_cat (TYPE iceberg_rest, WAREHOUSE 'wh')"
-    );
-    handler.execute(&session, &attach_sql, None).await.expect("first attach");
-    handler.execute(&session, "DETACH cycle_cat", None).await.expect("detach");
+    let attach_sql = format!("ATTACH '{url}' AS cycle_cat (TYPE iceberg_rest, WAREHOUSE 'wh')");
+    handler
+        .execute(&session, &attach_sql, None)
+        .await
+        .expect("first attach");
+    handler
+        .execute(&session, "DETACH cycle_cat", None)
+        .await
+        .expect("detach");
 
     // After DETACH the name is free; a second ATTACH must succeed.
-    handler.execute(&session, &attach_sql, None).await.expect("second attach after detach");
+    handler
+        .execute(&session, &attach_sql, None)
+        .await
+        .expect("second attach after detach");
 }
 
 #[tokio::test]
@@ -229,14 +229,21 @@ async fn attach_with_bearer_secret_ref() {
     let url = server.uri();
 
     handler
-        .execute(&session, "CREATE SECRET rest_tok (TYPE bearer, TOKEN 'my_bearer')", None)
+        .execute(
+            &session,
+            "CREATE SECRET rest_tok (TYPE bearer, TOKEN 'my_bearer')",
+            None,
+        )
         .await
         .expect("create secret");
 
     let sql = format!(
         "ATTACH '{url}' AS secret_cat (TYPE iceberg_rest, WAREHOUSE 'wh', SECRET rest_tok)"
     );
-    handler.execute(&session, &sql, None).await.expect("attach with secret ref");
+    handler
+        .execute(&session, &sql, None)
+        .await
+        .expect("attach with secret ref");
 }
 
 #[tokio::test]
@@ -249,14 +256,22 @@ async fn drop_secret_blocked_while_catalog_attached() {
     let url = server.uri();
 
     handler
-        .execute(&session, "CREATE SECRET guard_tok (TYPE bearer, TOKEN 'tok')", None)
+        .execute(
+            &session,
+            "CREATE SECRET guard_tok (TYPE bearer, TOKEN 'tok')",
+            None,
+        )
         .await
         .expect("create secret");
 
     handler
         .execute(
             &session,
-            &format!("ATTACH '{url}' AS guarded (TYPE iceberg_rest, WAREHOUSE 'wh', SECRET guard_tok)"), None)
+            &format!(
+                "ATTACH '{url}' AS guarded (TYPE iceberg_rest, WAREHOUSE 'wh', SECRET guard_tok)"
+            ),
+            None,
+        )
         .await
         .expect("attach");
 
@@ -267,8 +282,14 @@ async fn drop_secret_blocked_while_catalog_attached() {
         .expect_err("drop while in-use should fail");
 
     let msg = err.to_string();
-    assert!(msg.contains("guard_tok"), "error should name the secret: {msg}");
-    assert!(msg.contains("guarded"), "error should name the catalog: {msg}");
+    assert!(
+        msg.contains("guard_tok"),
+        "error should name the secret: {msg}"
+    );
+    assert!(
+        msg.contains("guarded"),
+        "error should name the catalog: {msg}"
+    );
 }
 
 #[tokio::test]
@@ -281,7 +302,11 @@ async fn drop_secret_succeeds_after_detach() {
     let url = server.uri();
 
     handler
-        .execute(&session, "CREATE SECRET free_tok (TYPE bearer, TOKEN 'tok')", None)
+        .execute(
+            &session,
+            "CREATE SECRET free_tok (TYPE bearer, TOKEN 'tok')",
+            None,
+        )
         .await
         .expect("create");
 
@@ -290,11 +315,16 @@ async fn drop_secret_succeeds_after_detach() {
             &session,
             &format!(
                 "ATTACH '{url}' AS free_cat (TYPE iceberg_rest, WAREHOUSE 'wh', SECRET free_tok)"
-            ), None)
+            ),
+            None,
+        )
         .await
         .expect("attach");
 
-    handler.execute(&session, "DETACH free_cat", None).await.expect("detach");
+    handler
+        .execute(&session, "DETACH free_cat", None)
+        .await
+        .expect("detach");
 
     // Secret is no longer in use — DROP must now succeed.
     handler
@@ -303,7 +333,10 @@ async fn drop_secret_succeeds_after_detach() {
         .expect("drop after detach should succeed");
 
     // Confirm it is gone.
-    let batches = handler.execute(&session, "SHOW SECRETS", None).await.unwrap();
+    let batches = handler
+        .execute(&session, "SHOW SECRETS", None)
+        .await
+        .unwrap();
     let total: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(total, 0, "secret store should be empty after drop");
 }
@@ -321,9 +354,7 @@ async fn attach_rejected_without_admin_role() {
     let session = session_with_roles(vec!["analyst".to_string()]);
     let url = server.uri();
 
-    let sql = format!(
-        "ATTACH '{url}' AS forbidden (TYPE iceberg_rest, WAREHOUSE 'wh')"
-    );
+    let sql = format!("ATTACH '{url}' AS forbidden (TYPE iceberg_rest, WAREHOUSE 'wh')");
     let err = handler
         .execute(&session, &sql, None)
         .await
@@ -346,7 +377,9 @@ async fn detach_rejected_without_admin_role() {
     handler
         .execute(
             &admin,
-            &format!("ATTACH '{url}' AS keep_it (TYPE iceberg_rest, WAREHOUSE 'wh')"), None)
+            &format!("ATTACH '{url}' AS keep_it (TYPE iceberg_rest, WAREHOUSE 'wh')"),
+            None,
+        )
         .await
         .expect("admin attaches");
 

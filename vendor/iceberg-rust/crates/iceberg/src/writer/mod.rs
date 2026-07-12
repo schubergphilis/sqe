@@ -402,7 +402,8 @@ type DefaultOutput = Vec<DataFile>;
 /// The builder for iceberg writer.
 #[async_trait::async_trait]
 pub trait IcebergWriterBuilder<I = DefaultInput, O = DefaultOutput>: Send + Sync + 'static
-where I: Send + 'static
+where
+    I: Send + 'static,
 {
     /// The associated writer type.
     type R: IcebergWriter<I, O>;
@@ -413,7 +414,8 @@ where I: Send + 'static
 /// The iceberg writer used to write data to iceberg table.
 #[async_trait::async_trait]
 pub trait IcebergWriter<I = DefaultInput, O = DefaultOutput>: Send + 'static
-where I: Send + 'static
+where
+    I: Send + 'static,
 {
     /// Write data to iceberg table.
     async fn write(&mut self, input: I) -> Result<()>;

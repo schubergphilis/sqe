@@ -38,9 +38,7 @@ pub fn rewrite_paren_less_values(sql: &str) -> String {
         return sql.to_string();
     }
     match wrap_bare_values(sql) {
-        Some(candidate)
-            if candidate != sql && Parser::parse_sql(&dialect, &candidate).is_ok() =>
-        {
+        Some(candidate) if candidate != sql && Parser::parse_sql(&dialect, &candidate).is_ok() => {
             candidate
         }
         _ => sql.to_string(),
@@ -86,8 +84,14 @@ fn wrap_bare_values(sql: &str) -> Option<String> {
             Token::LParen => depth += 1,
             Token::RParen => depth -= 1,
             Token::Word(w) if w.keyword == Keyword::VALUES => {
-                let (next_m, next_depth) =
-                    process_values_list(&tokens, &meaningful, m + 1, depth, &mut prepend, &mut append);
+                let (next_m, next_depth) = process_values_list(
+                    &tokens,
+                    &meaningful,
+                    m + 1,
+                    depth,
+                    &mut prepend,
+                    &mut append,
+                );
                 m = next_m;
                 depth = next_depth;
                 continue;

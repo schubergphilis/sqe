@@ -12,6 +12,12 @@
 
 # ── Configuration ─────────────────────────────────────────────────────────
 CARGO        ?= cargo
+# 8 MiB stack matches the production coordinator runtime (see
+# crates/sqe-coordinator/src/main.rs). Query-driving tests recurse through
+# DataFusion's planner/optimizer visitors deep enough to overflow the 2 MiB
+# default test-thread stack in debug builds. CI (.gitlab-ci.yml) and
+# scripts/integration-test.sh already set this; the `test` target matches them.
+RUST_MIN_STACK ?= 8388608
 MDBOOK       ?= mdbook
 BOOK_DIR     := docs/site/book
 EBOOK_DIR    := docs/site/ebook
@@ -151,8 +157,12 @@ release:
 
 test:
 	@echo "==> Running unit tests"
-	$(CARGO) test --workspace --exclude sqe-cli
-	$(CARGO) test --package sqe-cli --no-default-features
+	# `test-sqlite` pulls sqe-catalog/sql-sqlite so the SQLite-backed catalog
+	# tests (attach_dispatch, runtime_catalog_test) actually run. CI gets this
+	# via feature unification from sqe-cli; `--exclude sqe-cli` here drops that,
+	# so opt in explicitly through the coordinator's purpose-built test feature.
+	RUST_MIN_STACK=$(RUST_MIN_STACK) $(CARGO) test --workspace --exclude sqe-cli --features sqe-coordinator/test-sqlite
+	RUST_MIN_STACK=$(RUST_MIN_STACK) $(CARGO) test --package sqe-cli --no-default-features
 
 clippy:
 	@echo "==> Running clippy"

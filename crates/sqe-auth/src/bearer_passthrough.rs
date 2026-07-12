@@ -123,7 +123,10 @@ mod tests {
             bearer_token: Some(sqe_core::SecretString::new(bearer.to_string())),
             ..Default::default()
         };
-        let identity = provider().authenticate(&creds).await.expect("accept bearer");
+        let identity = provider()
+            .authenticate(&creds)
+            .await
+            .expect("accept bearer");
         assert_eq!(identity.user_id, "alice");
         assert_eq!(identity.roles, vec!["analyst".to_string()]);
         assert_eq!(

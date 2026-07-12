@@ -12,7 +12,6 @@
 //! Non-ignored tests in this file exercise the parser -> classifier path
 //! without requiring any live catalog, so they run on every `cargo test`.
 
-
 use sqe_sql::{parse_and_classify, ProcedureCall, StatementKind};
 
 // ---------------------------------------------------------------------------
@@ -39,10 +38,9 @@ fn rewrite_data_files_classifies_as_procedure() {
 
 #[test]
 fn expire_snapshots_classifies_as_procedure() {
-    let result = parse_and_classify(
-        "CALL system.expire_snapshots(table => 'ns.t', retain_last => 3)",
-    )
-    .expect("parse ok");
+    let result =
+        parse_and_classify("CALL system.expire_snapshots(table => 'ns.t', retain_last => 3)")
+            .expect("parse ok");
     assert!(matches!(result, StatementKind::Procedure(_)));
 }
 
@@ -62,8 +60,8 @@ fn rewrite_manifests_classifies_as_procedure() {
 
 #[test]
 fn unknown_procedure_falls_through_to_call_error() {
-    let result = parse_and_classify("CALL system.not_a_real_procedure(table => 'ns.t')")
-        .expect("parse ok");
+    let result =
+        parse_and_classify("CALL system.not_a_real_procedure(table => 'ns.t')").expect("parse ok");
     assert!(
         matches!(result, StatementKind::Call(_)),
         "unknown system procedures should stay as Call, got {result:?}"
@@ -93,21 +91,32 @@ async fn rewrite_data_files_returns_summary() {
     handler
         .execute(
             &session,
-            &format!("CREATE TABLE {table} (id BIGINT, v VARCHAR)"), None)
+            &format!("CREATE TABLE {table} (id BIGINT, v VARCHAR)"),
+            None,
+        )
         .await
         .expect("CREATE");
     handler
-        .execute(&session, &format!("INSERT INTO {table} VALUES (1, 'a'), (2, 'b')"), None)
+        .execute(
+            &session,
+            &format!("INSERT INTO {table} VALUES (1, 'a'), (2, 'b')"),
+            None,
+        )
         .await
         .expect("INSERT");
 
     let batches = handler
         .execute(
             &session,
-            &format!("CALL system.rewrite_data_files(table => '{table}')"), None)
+            &format!("CALL system.rewrite_data_files(table => '{table}')"),
+            None,
+        )
         .await
         .expect("rewrite_data_files");
-    assert!(!batches.is_empty(), "rewrite_data_files should return a summary batch");
+    assert!(
+        !batches.is_empty(),
+        "rewrite_data_files should return a summary batch"
+    );
 
     let _ = handler
         .execute(&session, &format!("DROP TABLE IF EXISTS {table}"), None)
@@ -149,7 +158,9 @@ async fn rewrite_data_files_actually_compacts_parquet() {
     handler
         .execute(
             &session,
-            &format!("CREATE TABLE {table} (id BIGINT, v VARCHAR)"), None)
+            &format!("CREATE TABLE {table} (id BIGINT, v VARCHAR)"),
+            None,
+        )
         .await
         .expect("CREATE");
 
@@ -162,7 +173,9 @@ async fn rewrite_data_files_actually_compacts_parquet() {
         handler
             .execute(
                 &session,
-                &format!("INSERT INTO {table} VALUES ({i}, '{v}')"), None)
+                &format!("INSERT INTO {table} VALUES ({i}, '{v}')"),
+                None,
+            )
             .await
             .unwrap_or_else(|e| panic!("INSERT #{i} failed: {e}"));
     }
@@ -173,7 +186,9 @@ async fn rewrite_data_files_actually_compacts_parquet() {
     let pre_files = handler
         .execute(
             &session,
-            "SELECT COUNT(*) FROM table_files('default', 'maint_rewrite_compaction_test')", None)
+            "SELECT COUNT(*) FROM table_files('default', 'maint_rewrite_compaction_test')",
+            None,
+        )
         .await
         .expect("table_files pre-rewrite");
     let pre_count = extract_count(&pre_files);
@@ -192,7 +207,9 @@ async fn rewrite_data_files_actually_compacts_parquet() {
                    table => '{table}', \
                    min_input_files => 5, \
                    target_file_size_bytes => 1073741824)"
-            ), None)
+            ),
+            None,
+        )
         .await
         .expect("rewrite_data_files compaction call");
     assert!(!summary.is_empty(), "summary batch must be returned");
@@ -200,9 +217,7 @@ async fn rewrite_data_files_actually_compacts_parquet() {
     // The summary row carries the input/output counts directly. We assert
     // input_count == 10 and output_count strictly less than input_count.
     let s = &summary[0];
-    let input_col = s
-        .column_by_name("input_count")
-        .expect("input_count column");
+    let input_col = s.column_by_name("input_count").expect("input_count column");
     let output_col = s
         .column_by_name("output_count")
         .expect("output_count column");
@@ -240,7 +255,9 @@ async fn rewrite_data_files_actually_compacts_parquet() {
     let post_files = handler
         .execute(
             &session,
-            "SELECT COUNT(*) FROM table_files('default', 'maint_rewrite_compaction_test')", None)
+            "SELECT COUNT(*) FROM table_files('default', 'maint_rewrite_compaction_test')",
+            None,
+        )
         .await
         .expect("table_files post-rewrite");
     let post_files_n = extract_count(&post_files);
@@ -289,10 +306,15 @@ async fn expire_snapshots_retain_last_commits() {
     let batches = handler
         .execute(
             &session,
-            &format!("CALL system.expire_snapshots(table => '{table}', retain_last => 1)"), None)
+            &format!("CALL system.expire_snapshots(table => '{table}', retain_last => 1)"),
+            None,
+        )
         .await
         .expect("expire_snapshots");
-    assert!(!batches.is_empty(), "expire_snapshots should return a summary batch");
+    assert!(
+        !batches.is_empty(),
+        "expire_snapshots should return a summary batch"
+    );
 
     let _ = handler
         .execute(&session, &format!("DROP TABLE IF EXISTS {table}"), None)
@@ -320,7 +342,9 @@ async fn remove_orphan_files_respects_default_threshold() {
     let batches = handler
         .execute(
             &session,
-            &format!("CALL system.remove_orphan_files(table => '{table}')"), None)
+            &format!("CALL system.remove_orphan_files(table => '{table}')"),
+            None,
+        )
         .await
         .expect("remove_orphan_files");
     assert!(!batches.is_empty());
@@ -360,14 +384,20 @@ async fn rewrite_manifests_commits_and_returns_summary() {
         .await
         .expect("CREATE");
     handler
-        .execute(&session, &format!("INSERT INTO {table} VALUES (1), (2), (3)"), None)
+        .execute(
+            &session,
+            &format!("INSERT INTO {table} VALUES (1), (2), (3)"),
+            None,
+        )
         .await
         .expect("INSERT");
 
     let batches = handler
         .execute(
             &session,
-            &format!("CALL system.rewrite_manifests(table => '{table}')"), None)
+            &format!("CALL system.rewrite_manifests(table => '{table}')"),
+            None,
+        )
         .await
         .expect("rewrite_manifests");
     assert!(!batches.is_empty());
@@ -383,7 +413,10 @@ async fn rewrite_manifests_commits_and_returns_summary() {
         .downcast_ref::<arrow_array::Int64Array>()
         .expect("Int64Array count")
         .value(0);
-    assert_eq!(count, 3, "row count must be preserved after rewrite_manifests");
+    assert_eq!(
+        count, 3,
+        "row count must be preserved after rewrite_manifests"
+    );
 
     let _ = handler
         .execute(&session, &format!("DROP TABLE IF EXISTS {table}"), None)
@@ -410,7 +443,9 @@ async fn read_only_user_rejected_with_audit() {
     let err = handler
         .execute(
             &readonly,
-            "CALL system.rewrite_data_files(table => 'default.any_table')", None)
+            "CALL system.rewrite_data_files(table => 'default.any_table')",
+            None,
+        )
         .await
         .expect_err("read-only user should be denied");
     let msg = err.to_string();

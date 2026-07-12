@@ -190,10 +190,7 @@ fn reject(detail: &str) -> DefaultError {
 /// Helpful callers that need to distinguish `TimezoneInfo::Tz`
 /// (TIMESTAMPTZ shorthand) from `TimezoneInfo::None`.
 pub fn is_tz_variant(info: &TimezoneInfo) -> bool {
-    matches!(
-        info,
-        TimezoneInfo::Tz | TimezoneInfo::WithTimeZone
-    )
+    matches!(info, TimezoneInfo::Tz | TimezoneInfo::WithTimeZone)
 }
 
 #[cfg(test)]
@@ -217,7 +214,10 @@ mod tests {
             panic!("expected CreateTable");
         };
         let col = &ct.columns[0];
-        assert_eq!(detect_ns_timestamp(&col.data_type), Some(NsTimestamp::WithoutTz));
+        assert_eq!(
+            detect_ns_timestamp(&col.data_type),
+            Some(NsTimestamp::WithoutTz)
+        );
     }
 
     #[test]
@@ -227,7 +227,10 @@ mod tests {
             panic!("expected CreateTable");
         };
         let col = &ct.columns[0];
-        assert_eq!(detect_ns_timestamp(&col.data_type), Some(NsTimestamp::WithTz));
+        assert_eq!(
+            detect_ns_timestamp(&col.data_type),
+            Some(NsTimestamp::WithTz)
+        );
     }
 
     #[test]
@@ -237,7 +240,10 @@ mod tests {
             panic!("expected CreateTable");
         };
         let col = &ct.columns[0];
-        assert_eq!(detect_ns_timestamp(&col.data_type), Some(NsTimestamp::WithoutTz));
+        assert_eq!(
+            detect_ns_timestamp(&col.data_type),
+            Some(NsTimestamp::WithoutTz)
+        );
     }
 
     #[test]
@@ -295,7 +301,10 @@ mod tests {
                 _ => None,
             })
             .expect("DEFAULT parsed");
-        assert_eq!(extract_default_literal(default).unwrap(), DefaultLiteral::Int(42));
+        assert_eq!(
+            extract_default_literal(default).unwrap(),
+            DefaultLiteral::Int(42)
+        );
     }
 
     #[test]
@@ -313,7 +322,10 @@ mod tests {
                 _ => None,
             })
             .expect("DEFAULT parsed");
-        assert_eq!(extract_default_literal(default).unwrap(), DefaultLiteral::Int(-7));
+        assert_eq!(
+            extract_default_literal(default).unwrap(),
+            DefaultLiteral::Int(-7)
+        );
     }
 
     #[test]
@@ -331,7 +343,10 @@ mod tests {
                 _ => None,
             })
             .expect("DEFAULT parsed");
-        assert_eq!(extract_default_literal(default).unwrap(), DefaultLiteral::Bool(true));
+        assert_eq!(
+            extract_default_literal(default).unwrap(),
+            DefaultLiteral::Bool(true)
+        );
     }
 
     #[test]
@@ -349,13 +364,15 @@ mod tests {
                 _ => None,
             })
             .expect("DEFAULT parsed");
-        assert_eq!(extract_default_literal(default).unwrap(), DefaultLiteral::Int(1));
+        assert_eq!(
+            extract_default_literal(default).unwrap(),
+            DefaultLiteral::Int(1)
+        );
     }
 
     #[test]
     fn rejects_function_default() {
-        let stmt =
-            parse_create("CREATE TABLE t (ts TIMESTAMP DEFAULT current_timestamp())");
+        let stmt = parse_create("CREATE TABLE t (ts TIMESTAMP DEFAULT current_timestamp())");
         let sqlparser::ast::Statement::CreateTable(ct) = stmt else {
             panic!("expected CreateTable");
         };
@@ -396,6 +413,9 @@ mod tests {
                 _ => None,
             })
             .expect("DEFAULT parsed");
-        assert_eq!(extract_default_literal(default).unwrap(), DefaultLiteral::Null);
+        assert_eq!(
+            extract_default_literal(default).unwrap(),
+            DefaultLiteral::Null
+        );
     }
 }

@@ -102,7 +102,10 @@ impl OidcPasswordProvider {
         username: &str,
         password: &str,
     ) -> Result<TokenResponse, AuthError> {
-        debug!(username = username, "Exchanging credentials via OIDC ROPC grant");
+        debug!(
+            username = username,
+            "Exchanging credentials via OIDC ROPC grant"
+        );
 
         let mut params = vec![
             ("grant_type", "password".to_string()),
@@ -121,9 +124,7 @@ impl OidcPasswordProvider {
             .form(&params)
             .send()
             .await
-            .map_err(|e| {
-                AuthError::Internal(anyhow::anyhow!("OIDC token request failed: {e}"))
-            })?;
+            .map_err(|e| AuthError::Internal(anyhow::anyhow!("OIDC token request failed: {e}")))?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -133,17 +134,12 @@ impl OidcPasswordProvider {
                 .unwrap_or_else(|_| "unable to read body".to_string());
             let body = truncate_for_log(&body, 500);
             warn!(status = %status, body = %body, "OIDC provider rejected credentials");
-            return Err(AuthError::AuthFailed(
-                "Authentication failed".to_string(),
-            ));
+            return Err(AuthError::AuthFailed("Authentication failed".to_string()));
         }
 
-        response
-            .json::<TokenResponse>()
-            .await
-            .map_err(|e| {
-                AuthError::Internal(anyhow::anyhow!("Failed to parse OIDC token response: {e}"))
-            })
+        response.json::<TokenResponse>().await.map_err(|e| {
+            AuthError::Internal(anyhow::anyhow!("Failed to parse OIDC token response: {e}"))
+        })
     }
 
     /// Refresh an access token using a refresh_token.
@@ -166,9 +162,7 @@ impl OidcPasswordProvider {
             .form(&params)
             .send()
             .await
-            .map_err(|e| {
-                AuthError::Internal(anyhow::anyhow!("OIDC token refresh failed: {e}"))
-            })?;
+            .map_err(|e| AuthError::Internal(anyhow::anyhow!("OIDC token refresh failed: {e}")))?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -178,17 +172,14 @@ impl OidcPasswordProvider {
                 .unwrap_or_else(|_| "unable to read body".to_string());
             let body = truncate_for_log(&body, 500);
             warn!(status = %status, body = %body, "OIDC provider rejected token refresh");
-            return Err(AuthError::AuthFailed(
-                "Authentication failed".to_string(),
-            ));
+            return Err(AuthError::AuthFailed("Authentication failed".to_string()));
         }
 
-        response
-            .json::<TokenResponse>()
-            .await
-            .map_err(|e| {
-                AuthError::Internal(anyhow::anyhow!("Failed to parse OIDC refresh response: {e}"))
-            })
+        response.json::<TokenResponse>().await.map_err(|e| {
+            AuthError::Internal(anyhow::anyhow!(
+                "Failed to parse OIDC refresh response: {e}"
+            ))
+        })
     }
 
     /// Extract the `sub` claim from a JWT payload (without signature verification).
@@ -302,8 +293,8 @@ impl AuthProvider for OidcPasswordProvider {
             Err(e) => return Err(e),
         };
 
-        let user_id = Self::extract_sub(&token_response.access_token)
-            .unwrap_or_else(|| username.clone());
+        let user_id =
+            Self::extract_sub(&token_response.access_token).unwrap_or_else(|| username.clone());
 
         let roles =
             Self::extract_roles_from_claim(&token_response.access_token, &self.config.roles_claim);
@@ -337,7 +328,9 @@ impl AuthProvider for OidcPasswordProvider {
             email,
             groups,
             catalog_token: Some(sqe_core::SecretString::new(token_response.access_token)),
-            refresh_token: token_response.refresh_token.map(sqe_core::SecretString::new),
+            refresh_token: token_response
+                .refresh_token
+                .map(sqe_core::SecretString::new),
             expires_at,
         })
     }
@@ -352,7 +345,9 @@ impl AuthProvider for OidcPasswordProvider {
         };
 
         let token_response = self.do_refresh_token(refresh_token).await?;
-        Ok(Some(sqe_core::SecretString::new(token_response.access_token)))
+        Ok(Some(sqe_core::SecretString::new(
+            token_response.access_token,
+        )))
     }
 }
 
@@ -366,8 +361,7 @@ mod tests {
             .encode(b"{\"alg\":\"RS256\",\"typ\":\"JWT\"}");
         let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .encode(serde_json::to_vec(claims).unwrap());
-        let signature =
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"fake-sig");
+        let signature = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"fake-sig");
         format!("{header}.{payload}.{signature}")
     }
 
@@ -385,8 +379,7 @@ mod tests {
         });
         let token = fake_jwt(&claims);
 
-        let roles =
-            OidcPasswordProvider::extract_roles_from_claim(&token, "realm_access.roles");
+        let roles = OidcPasswordProvider::extract_roles_from_claim(&token, "realm_access.roles");
         assert_eq!(roles, vec!["admin", "user", "data_engineer"]);
     }
 
@@ -402,8 +395,7 @@ mod tests {
         });
         let token = fake_jwt(&claims);
 
-        let roles =
-            OidcPasswordProvider::extract_roles_from_claim(&token, "custom.nested.roles");
+        let roles = OidcPasswordProvider::extract_roles_from_claim(&token, "custom.nested.roles");
         assert_eq!(roles, vec!["viewer", "editor"]);
     }
 
@@ -426,8 +418,7 @@ mod tests {
         });
         let token = fake_jwt(&claims);
 
-        let roles =
-            OidcPasswordProvider::extract_roles_from_claim(&token, "realm_access.roles");
+        let roles = OidcPasswordProvider::extract_roles_from_claim(&token, "realm_access.roles");
         assert!(roles.is_empty());
     }
 
@@ -439,8 +430,7 @@ mod tests {
         });
         let token = fake_jwt(&claims);
 
-        let roles =
-            OidcPasswordProvider::extract_roles_from_claim(&token, "realm_access.roles");
+        let roles = OidcPasswordProvider::extract_roles_from_claim(&token, "realm_access.roles");
         assert!(roles.is_empty());
     }
 
@@ -580,7 +570,9 @@ mod tests {
 
         let creds = FlightCredentials {
             username: Some("alice".to_string()),
-            password: Some(sqe_core::SecretString::new("eyJhbGciOiJSUzI1NiJ9.payload.sig".to_string())),
+            password: Some(sqe_core::SecretString::new(
+                "eyJhbGciOiJSUzI1NiJ9.payload.sig".to_string(),
+            )),
             ..Default::default()
         };
 

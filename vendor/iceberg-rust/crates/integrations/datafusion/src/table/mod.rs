@@ -109,7 +109,6 @@ impl IcebergTableProvider {
 
 #[async_trait]
 impl TableProvider for IcebergTableProvider {
-
     fn schema(&self) -> ArrowSchemaRef {
         self.schema.clone()
     }
@@ -291,7 +290,6 @@ impl IcebergStaticTableProvider {
 
 #[async_trait]
 impl TableProvider for IcebergStaticTableProvider {
-
     fn schema(&self) -> ArrowSchemaRef {
         self.schema.clone()
     }

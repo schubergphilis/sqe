@@ -1,6 +1,4 @@
-use arrow_array::{
-    cast::AsArray, Array, Float32Array, Float64Array, RecordBatch,
-};
+use arrow_array::{cast::AsArray, Array, Float32Array, Float64Array, RecordBatch};
 use arrow_schema::DataType;
 
 #[derive(Debug)]
@@ -147,11 +145,7 @@ fn parse_csv(csv: &str) -> anyhow::Result<(Vec<String>, Vec<Vec<String>>)> {
         .trim(csv::Trim::All)
         .from_reader(csv.as_bytes());
 
-    let headers: Vec<String> = reader
-        .headers()?
-        .iter()
-        .map(str::to_string)
-        .collect();
+    let headers: Vec<String> = reader.headers()?.iter().map(str::to_string).collect();
 
     let mut rows = Vec::new();
     for record in reader.records() {
@@ -192,23 +186,71 @@ fn cell_to_string(array: &dyn Array, row: usize) -> String {
 
     match array.data_type() {
         DataType::Float32 => {
-            let v = array.as_any().downcast_ref::<Float32Array>().unwrap().value(row);
+            let v = array
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .unwrap()
+                .value(row);
             format!("{v}")
         }
         DataType::Float64 => {
-            let v = array.as_any().downcast_ref::<Float64Array>().unwrap().value(row);
+            let v = array
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap()
+                .value(row);
             format!("{v}")
         }
         DataType::Utf8 => array.as_string::<i32>().value(row).to_string(),
         DataType::LargeUtf8 => array.as_string::<i64>().value(row).to_string(),
-        DataType::Int8 => format!("{}", array.as_primitive::<arrow_array::types::Int8Type>().value(row)),
-        DataType::Int16 => format!("{}", array.as_primitive::<arrow_array::types::Int16Type>().value(row)),
-        DataType::Int32 => format!("{}", array.as_primitive::<arrow_array::types::Int32Type>().value(row)),
-        DataType::Int64 => format!("{}", array.as_primitive::<arrow_array::types::Int64Type>().value(row)),
-        DataType::UInt8 => format!("{}", array.as_primitive::<arrow_array::types::UInt8Type>().value(row)),
-        DataType::UInt16 => format!("{}", array.as_primitive::<arrow_array::types::UInt16Type>().value(row)),
-        DataType::UInt32 => format!("{}", array.as_primitive::<arrow_array::types::UInt32Type>().value(row)),
-        DataType::UInt64 => format!("{}", array.as_primitive::<arrow_array::types::UInt64Type>().value(row)),
+        DataType::Int8 => format!(
+            "{}",
+            array
+                .as_primitive::<arrow_array::types::Int8Type>()
+                .value(row)
+        ),
+        DataType::Int16 => format!(
+            "{}",
+            array
+                .as_primitive::<arrow_array::types::Int16Type>()
+                .value(row)
+        ),
+        DataType::Int32 => format!(
+            "{}",
+            array
+                .as_primitive::<arrow_array::types::Int32Type>()
+                .value(row)
+        ),
+        DataType::Int64 => format!(
+            "{}",
+            array
+                .as_primitive::<arrow_array::types::Int64Type>()
+                .value(row)
+        ),
+        DataType::UInt8 => format!(
+            "{}",
+            array
+                .as_primitive::<arrow_array::types::UInt8Type>()
+                .value(row)
+        ),
+        DataType::UInt16 => format!(
+            "{}",
+            array
+                .as_primitive::<arrow_array::types::UInt16Type>()
+                .value(row)
+        ),
+        DataType::UInt32 => format!(
+            "{}",
+            array
+                .as_primitive::<arrow_array::types::UInt32Type>()
+                .value(row)
+        ),
+        DataType::UInt64 => format!(
+            "{}",
+            array
+                .as_primitive::<arrow_array::types::UInt64Type>()
+                .value(row)
+        ),
         DataType::Boolean => format!("{}", array.as_boolean().value(row)),
         DataType::Date32 | DataType::Date64 => {
             arrow::util::display::array_value_to_string(array, row).unwrap_or_default()
@@ -228,7 +270,10 @@ fn cell_to_string(array: &dyn Array, row: usize) -> String {
             }
         }
         DataType::Utf8View => {
-            let arr = array.as_any().downcast_ref::<arrow_array::StringViewArray>().unwrap();
+            let arr = array
+                .as_any()
+                .downcast_ref::<arrow_array::StringViewArray>()
+                .unwrap();
             arr.value(row).to_string()
         }
         DataType::Timestamp(_, _) | DataType::Time32(_) | DataType::Time64(_) => {
@@ -280,9 +325,7 @@ mod tests {
     use arrow_schema::{Field, Schema};
     use std::sync::Arc;
 
-    fn make_batch(
-        cols: Vec<(&str, Arc<dyn Array>)>,
-    ) -> RecordBatch {
+    fn make_batch(cols: Vec<(&str, Arc<dyn Array>)>) -> RecordBatch {
         let fields: Vec<Field> = cols
             .iter()
             .map(|(name, arr)| Field::new(*name, arr.data_type().clone(), true))
@@ -301,8 +344,7 @@ mod tests {
             ),
             (
                 "name",
-                Arc::new(StringArray::from(vec!["alpha", "beta", "gamma"]))
-                    as Arc<dyn Array>,
+                Arc::new(StringArray::from(vec!["alpha", "beta", "gamma"])) as Arc<dyn Array>,
             ),
         ]);
         let csv = "id,name\n1,alpha\n2,beta\n3,gamma\n";
@@ -405,9 +447,11 @@ mod tests {
     fn test_compare_decimal_trailing_zeros() {
         use std::sync::Arc;
 
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("amount", DataType::Decimal128(10, 4), false),
-        ]));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "amount",
+            DataType::Decimal128(10, 4),
+            false,
+        )]));
         // 1234500 with scale 4 = 123.4500
         let arr = Decimal128Array::from(vec![1_234_500i128])
             .with_precision_and_scale(10, 4)
@@ -416,6 +460,9 @@ mod tests {
 
         let csv = "amount\n123.45\n";
         let result = compare_results(&[batch], csv, 1e-4).unwrap();
-        assert!(matches!(result, CompareStatus::Pass), "trailing zeros should match: {result:?}");
+        assert!(
+            matches!(result, CompareStatus::Pass),
+            "trailing zeros should match: {result:?}"
+        );
     }
 }

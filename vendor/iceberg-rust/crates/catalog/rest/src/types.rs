@@ -326,14 +326,17 @@ mod tests {
         });
         let ns_response: NamespaceResponse =
             serde_json::from_value(json.clone()).expect("Deserialization failed");
-        assert_eq!(ns_response, NamespaceResponse {
-            namespace: NamespaceIdent::from_vec(vec!["nested".to_string(), "ns".to_string()])
-                .unwrap(),
-            properties: HashMap::from([
-                ("key1".to_string(), "value1".to_string()),
-                ("key2".to_string(), "value2".to_string()),
-            ]),
-        });
+        assert_eq!(
+            ns_response,
+            NamespaceResponse {
+                namespace: NamespaceIdent::from_vec(vec!["nested".to_string(), "ns".to_string()])
+                    .unwrap(),
+                properties: HashMap::from([
+                    ("key1".to_string(), "value1".to_string()),
+                    ("key2".to_string(), "value2".to_string()),
+                ]),
+            }
+        );
         assert_eq!(
             serde_json::to_value(&ns_response).expect("Serialization failed"),
             json
@@ -345,11 +348,14 @@ mod tests {
         });
         let ns_response_no_props: NamespaceResponse =
             serde_json::from_value(json_no_props.clone()).expect("Deserialization failed");
-        assert_eq!(ns_response_no_props, NamespaceResponse {
-            namespace: NamespaceIdent::from_vec(vec!["db".to_string(), "schema".to_string()])
-                .unwrap(),
-            properties: HashMap::new(),
-        });
+        assert_eq!(
+            ns_response_no_props,
+            NamespaceResponse {
+                namespace: NamespaceIdent::from_vec(vec!["db".to_string(), "schema".to_string()])
+                    .unwrap(),
+                properties: HashMap::new(),
+            }
+        );
         assert_eq!(
             serde_json::to_value(&ns_response_no_props).expect("Serialization failed"),
             json_no_props

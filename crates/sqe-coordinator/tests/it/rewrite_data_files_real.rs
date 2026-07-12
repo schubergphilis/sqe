@@ -22,7 +22,6 @@
 //! single output. The assertion loosens the upper bound to 10 to leave room
 //! for the writer's rolling cutoff.
 
-
 use arrow_array::{Array, Int64Array};
 
 /// Helper: fetch the live data-file count from a table via the table_files TVF.
@@ -40,7 +39,9 @@ async fn live_data_file_count(
     let batches = handler
         .execute(
             session,
-            &format!("SELECT COUNT(*) FROM table_files('{namespace}', '{table_name}')"), None)
+            &format!("SELECT COUNT(*) FROM table_files('{namespace}', '{table_name}')"),
+            None,
+        )
         .await
         .expect("files metadata scan");
     let col = batches[0].column(0);
@@ -98,7 +99,9 @@ async fn rewrite_merges_small_files_preserves_rows() {
     let summary = handler
         .execute(
             &session,
-            &format!("CALL system.rewrite_data_files(table => '{table}')"), None)
+            &format!("CALL system.rewrite_data_files(table => '{table}')"),
+            None,
+        )
         .await
         .expect("rewrite_data_files");
     assert!(!summary.is_empty(), "summary row expected");
@@ -131,7 +134,11 @@ async fn rewrite_merges_small_files_preserves_rows() {
 
     // Value invariant: SELECT * must return the same set of ids.
     let rows_batches = handler
-        .execute(&session, &format!("SELECT id FROM {table} ORDER BY id"), None)
+        .execute(
+            &session,
+            &format!("SELECT id FROM {table} ORDER BY id"),
+            None,
+        )
         .await
         .expect("SELECT id");
     let mut observed: Vec<i64> = Vec::new();
@@ -184,7 +191,9 @@ async fn rewrite_skips_below_min_input_files() {
     let summary = handler
         .execute(
             &session,
-            &format!("CALL system.rewrite_data_files(table => '{table}')"), None)
+            &format!("CALL system.rewrite_data_files(table => '{table}')"),
+            None,
+        )
         .await
         .expect("rewrite_data_files");
 

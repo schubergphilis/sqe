@@ -1,6 +1,6 @@
-use sqe_lineage::*;
-use sqe_lineage::sinks::file::FileSink;
 use sqe_lineage::event::*;
+use sqe_lineage::sinks::file::FileSink;
+use sqe_lineage::*;
 use tempfile::tempdir;
 
 fn dummy_event() -> RunEvent {
@@ -10,7 +10,11 @@ fn dummy_event() -> RunEvent {
         producer: "test".into(),
         schemaURL: SCHEMA_URL.into(),
         run: Run::new(uuid::Uuid::nil()),
-        job: Job { namespace: "sqe".into(), name: "query:test".into(), facets: Default::default() },
+        job: Job {
+            namespace: "sqe".into(),
+            name: "query:test".into(),
+            facets: Default::default(),
+        },
         inputs: vec![],
         outputs: vec![],
     }

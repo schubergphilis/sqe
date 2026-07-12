@@ -32,8 +32,14 @@ pub async fn create_client(
     match protocol {
         "flight" => {
             let client = flight::FlightSqlBenchClient::connect(
-                host, username, password, token_endpoint, client_id, client_secret,
-            ).await?;
+                host,
+                username,
+                password,
+                token_endpoint,
+                client_id,
+                client_secret,
+            )
+            .await?;
             Ok(Box::new(client))
         }
         "trino" => {

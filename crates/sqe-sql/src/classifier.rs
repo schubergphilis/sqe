@@ -449,7 +449,11 @@ pub fn parse_and_classify(sql: &str) -> sqe_core::Result<StatementKind> {
     // `SHOW TAGS ON` (no table) is also matched so it yields a precise error
     // rather than falling through to sqlparser.
     let show_tags_rest = strip_prefix_ci(trimmed, "SHOW TAGS ON ").or_else(|| {
-        if trimmed.trim_end_matches(';').trim_end().eq_ignore_ascii_case("SHOW TAGS ON") {
+        if trimmed
+            .trim_end_matches(';')
+            .trim_end()
+            .eq_ignore_ascii_case("SHOW TAGS ON")
+        {
             Some("")
         } else {
             None
@@ -637,9 +641,9 @@ fn classify(stmt: Statement) -> sqe_core::Result<StatementKind> {
         // ALTER TABLE — check for RENAME operations
         Statement::AlterTable(ref alter) => {
             let operations = &alter.operations;
-            let is_rename = operations.iter().any(|op| {
-                matches!(op, AlterTableOperation::RenameTable { .. })
-            });
+            let is_rename = operations
+                .iter()
+                .any(|op| matches!(op, AlterTableOperation::RenameTable { .. }));
             let is_schema_change = operations.iter().any(|op| {
                 matches!(
                     op,
@@ -649,9 +653,9 @@ fn classify(stmt: Statement) -> sqe_core::Result<StatementKind> {
                         | AlterTableOperation::AlterColumn { .. }
                 )
             });
-            let is_set_properties = operations.iter().any(|op| {
-                matches!(op, AlterTableOperation::SetTblProperties { .. })
-            });
+            let is_set_properties = operations
+                .iter()
+                .any(|op| matches!(op, AlterTableOperation::SetTblProperties { .. }));
             if is_rename {
                 Ok(StatementKind::Rename(Box::new(stmt)))
             } else if is_schema_change {
@@ -685,7 +689,9 @@ fn classify(stmt: Statement) -> sqe_core::Result<StatementKind> {
         Statement::Set(_) => Ok(StatementKind::Utility(Box::new(stmt))),
 
         // SHOW SCHEMAS — sqlparser has a ShowSchemas variant
-        Statement::ShowSchemas { ref show_options, .. } => {
+        Statement::ShowSchemas {
+            ref show_options, ..
+        } => {
             let filter = show_options
                 .show_in
                 .as_ref()
@@ -695,7 +701,9 @@ fn classify(stmt: Statement) -> sqe_core::Result<StatementKind> {
         }
 
         // SHOW TABLES — sqlparser has a ShowTables variant
-        Statement::ShowTables { ref show_options, .. } => {
+        Statement::ShowTables {
+            ref show_options, ..
+        } => {
             let filter = show_options
                 .show_in
                 .as_ref()
@@ -717,10 +725,18 @@ fn classify(stmt: Statement) -> sqe_core::Result<StatementKind> {
             if var_str == "CATALOGS" {
                 Ok(StatementKind::ShowCatalogs)
             } else if var_str.starts_with("SCHEMAS") {
-                let rest = var_str.strip_prefix("SCHEMAS").unwrap_or("").trim().to_string();
+                let rest = var_str
+                    .strip_prefix("SCHEMAS")
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
                 Ok(StatementKind::ShowSchemas(rest))
             } else if var_str.starts_with("TABLES") {
-                let rest = var_str.strip_prefix("TABLES").unwrap_or("").trim().to_string();
+                let rest = var_str
+                    .strip_prefix("TABLES")
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
                 Ok(StatementKind::ShowTables(rest))
             } else {
                 Ok(StatementKind::Utility(Box::new(stmt)))
@@ -899,7 +915,9 @@ fn rewrite_create_table_like(trimmed: &str) -> Option<String> {
 fn parse_analyze(rest: &str) -> sqe_core::Result<StatementKind> {
     let rest = rest.trim().trim_end_matches(';').trim();
     // Optional `TABLE` keyword (Hive-style `ANALYZE TABLE t`).
-    let rest = strip_prefix_ci(rest, "TABLE ").map(str::trim).unwrap_or(rest);
+    let rest = strip_prefix_ci(rest, "TABLE ")
+        .map(str::trim)
+        .unwrap_or(rest);
     let table = rest
         .split(|c: char| c.is_whitespace() || c == '(')
         .next()
@@ -939,21 +957,23 @@ fn parse_resource_reference(
 fn parse_check_access(rest: &str) -> sqe_core::Result<StatementKind> {
     let upper = rest.to_uppercase();
     // Find " ON " to split privilege from the rest
-    let on_pos = upper
-        .find(" ON ")
-        .ok_or_else(|| sqe_core::SqeError::Execution(
-            "CHECK ACCESS requires: CHECK ACCESS <privilege> ON <resource> FOR USER \"<name>\"".to_string(),
-        ))?;
+    let on_pos = upper.find(" ON ").ok_or_else(|| {
+        sqe_core::SqeError::Execution(
+            "CHECK ACCESS requires: CHECK ACCESS <privilege> ON <resource> FOR USER \"<name>\""
+                .to_string(),
+        )
+    })?;
     let privilege = rest[..on_pos].trim().to_string();
     let after_on = rest[on_pos + 4..].trim();
 
     // Find " FOR USER " to split resource from user
     let after_on_upper = after_on.to_uppercase();
-    let for_user_pos = after_on_upper
-        .find(" FOR USER ")
-        .ok_or_else(|| sqe_core::SqeError::Execution(
-            "CHECK ACCESS requires: CHECK ACCESS <privilege> ON <resource> FOR USER \"<name>\"".to_string(),
-        ))?;
+    let for_user_pos = after_on_upper.find(" FOR USER ").ok_or_else(|| {
+        sqe_core::SqeError::Execution(
+            "CHECK ACCESS requires: CHECK ACCESS <privilege> ON <resource> FOR USER \"<name>\""
+                .to_string(),
+        )
+    })?;
     let resource = after_on[..for_user_pos].trim();
     let user = after_on[for_user_pos + " FOR USER ".len()..]
         .trim()
@@ -1011,10 +1031,9 @@ fn parse_show_effective_policy(rest: &str, has_user: bool) -> sqe_core::Result<S
         ));
     }
 
-    Ok(StatementKind::ShowEffectivePolicy(ShowEffectivePolicyParams {
-        user,
-        table,
-    }))
+    Ok(StatementKind::ShowEffectivePolicy(
+        ShowEffectivePolicyParams { user, table },
+    ))
 }
 
 #[cfg(test)]
@@ -1108,9 +1127,8 @@ mod tests {
 
     #[test]
     fn test_create_table_if_not_exists() {
-        let result = parse_and_classify(
-            "CREATE TABLE IF NOT EXISTS ns.table (id BIGINT, name VARCHAR)",
-        );
+        let result =
+            parse_and_classify("CREATE TABLE IF NOT EXISTS ns.table (id BIGINT, name VARCHAR)");
         assert!(matches!(result, Ok(StatementKind::CreateTable(_))));
     }
 
@@ -1188,7 +1206,12 @@ mod tests {
     fn test_show_grants_on_resource() {
         let result = parse_and_classify("SHOW GRANTS ON my_catalog.my_ns.my_table");
         assert!(
-            matches!(result, Ok(StatementKind::ShowGrants(ShowGrantsTarget::OnResource { .. }))),
+            matches!(
+                result,
+                Ok(StatementKind::ShowGrants(
+                    ShowGrantsTarget::OnResource { .. }
+                ))
+            ),
             "Expected ShowGrants OnResource, got: {result:?}"
         );
     }
@@ -1198,7 +1221,10 @@ mod tests {
         let result = parse_and_classify("SHOW GRANTS TO GROUP \"SG-Risk-Analysts\"");
         assert!(result.is_ok());
         match result.unwrap() {
-            StatementKind::ShowGrants(ShowGrantsTarget::ToGrantee { grantee_type, grantee_name }) => {
+            StatementKind::ShowGrants(ShowGrantsTarget::ToGrantee {
+                grantee_type,
+                grantee_name,
+            }) => {
                 assert_eq!(grantee_type, "GROUP");
                 assert_eq!(grantee_name, "SG-Risk-Analysts");
             }
@@ -1210,7 +1236,12 @@ mod tests {
     fn test_show_grants_to_role() {
         let result = parse_and_classify("SHOW GRANTS TO ROLE \"admin\"");
         assert!(
-            matches!(result, Ok(StatementKind::ShowGrants(ShowGrantsTarget::ToGrantee { .. }))),
+            matches!(
+                result,
+                Ok(StatementKind::ShowGrants(
+                    ShowGrantsTarget::ToGrantee { .. }
+                ))
+            ),
             "Expected ShowGrants ToGrantee, got: {result:?}"
         );
     }
@@ -1236,7 +1267,8 @@ mod tests {
 
     #[test]
     fn test_check_access() {
-        let result = parse_and_classify("CHECK ACCESS SELECT ON my_catalog.my_ns.orders FOR USER \"alice\"");
+        let result =
+            parse_and_classify("CHECK ACCESS SELECT ON my_catalog.my_ns.orders FOR USER \"alice\"");
         assert!(
             matches!(result, Ok(StatementKind::CheckAccess(_))),
             "Expected CheckAccess, got: {result:?}"
@@ -1245,7 +1277,8 @@ mod tests {
 
     #[test]
     fn test_check_access_extracts_params() {
-        let result = parse_and_classify("CHECK ACCESS SELECT ON cat.ns.tbl FOR USER \"bob\"").unwrap();
+        let result =
+            parse_and_classify("CHECK ACCESS SELECT ON cat.ns.tbl FOR USER \"bob\"").unwrap();
         if let StatementKind::CheckAccess(params) = result {
             assert_eq!(params.privilege, "SELECT");
             assert_eq!(params.catalog.as_deref(), Some("cat"));
@@ -1422,8 +1455,7 @@ mod tests {
 
     #[test]
     fn test_check_access_four_part_name_errors() {
-        let result =
-            parse_and_classify("CHECK ACCESS SELECT ON a.b.c.d FOR USER \"alice\"");
+        let result = parse_and_classify("CHECK ACCESS SELECT ON a.b.c.d FOR USER \"alice\"");
         assert!(result.is_err(), "4-part resource name should be rejected");
         let err = format!("{}", result.unwrap_err());
         assert!(
@@ -1824,7 +1856,10 @@ mod tests {
                 let Statement::CreateTable(ct) = *stmt else {
                     panic!("expected inner CreateTable");
                 };
-                assert!(ct.like.is_none(), "plain create must not gain a LIKE clause");
+                assert!(
+                    ct.like.is_none(),
+                    "plain create must not gain a LIKE clause"
+                );
                 assert_eq!(ct.columns.len(), 2, "columns should be preserved");
             }
             other => panic!("Expected CreateTable, got: {other:?}"),
@@ -1835,10 +1870,9 @@ mod tests {
     fn test_set_properties_dotted_hyphenated_key() {
         // Dotted + hyphenated Iceberg property names must be quoted so they
         // parse; the whole statement classifies as AlterTableProps (#338).
-        let result = parse_and_classify(
-            "ALTER TABLE t SET PROPERTIES \"write.format.default\" = 'PARQUET'",
-        )
-        .unwrap();
+        let result =
+            parse_and_classify("ALTER TABLE t SET PROPERTIES \"write.format.default\" = 'PARQUET'")
+                .unwrap();
         assert!(
             matches!(result, StatementKind::AlterTableProps(_)),
             "Expected AlterTableProps, got: {result:?}"
@@ -2046,12 +2080,9 @@ mod tests {
 
     #[test]
     fn test_comment_name() {
-        let stmt = Parser::parse_sql(
-            &GenericDialect {},
-            "COMMENT ON TABLE t IS 'desc'",
-        )
-        .unwrap()
-        .remove(0);
+        let stmt = Parser::parse_sql(&GenericDialect {}, "COMMENT ON TABLE t IS 'desc'")
+            .unwrap()
+            .remove(0);
         let kind = StatementKind::Comment(Box::new(stmt));
         assert_eq!(kind.name(), "comment");
     }
@@ -2146,7 +2177,11 @@ mod tests {
         // instead of sqlparser's `Expected: end of statement, found: .`.
         let kind = parse_and_classify("ALTER TABLE t DROP COLUMN nested.subfield").unwrap();
         match kind {
-            StatementKind::DropNestedColumn { table, path, if_exists } => {
+            StatementKind::DropNestedColumn {
+                table,
+                path,
+                if_exists,
+            } => {
                 assert_eq!(table, "t");
                 assert_eq!(path, vec!["nested".to_string(), "subfield".to_string()]);
                 assert!(!if_exists);
@@ -2159,9 +2194,16 @@ mod tests {
     fn test_drop_nested_column_if_exists() {
         let kind = parse_and_classify("ALTER TABLE t DROP COLUMN IF EXISTS a.b.c").unwrap();
         match kind {
-            StatementKind::DropNestedColumn { table, path, if_exists } => {
+            StatementKind::DropNestedColumn {
+                table,
+                path,
+                if_exists,
+            } => {
                 assert_eq!(table, "t");
-                assert_eq!(path, vec!["a".to_string(), "b".to_string(), "c".to_string()]);
+                assert_eq!(
+                    path,
+                    vec!["a".to_string(), "b".to_string(), "c".to_string()]
+                );
                 assert!(if_exists);
             }
             other => panic!("expected DropNestedColumn, got: {other:?}"),
@@ -2173,14 +2215,21 @@ mod tests {
         // Regression: the nested-drop pre-scan must not steal a plain
         // (non-dotted) DROP COLUMN, which sqlparser parses natively.
         let kind = parse_and_classify("ALTER TABLE t DROP COLUMN x").unwrap();
-        assert!(matches!(kind, StatementKind::AlterSchema(_)), "got: {kind:?}");
+        assert!(
+            matches!(kind, StatementKind::AlterSchema(_)),
+            "got: {kind:?}"
+        );
     }
 
     #[test]
     fn detect_nested_drop_column_unit() {
         assert_eq!(
             detect_nested_drop_column("ALTER TABLE t DROP COLUMN a.b"),
-            Some(("t".to_string(), vec!["a".to_string(), "b".to_string()], false))
+            Some((
+                "t".to_string(),
+                vec!["a".to_string(), "b".to_string()],
+                false
+            ))
         );
         assert_eq!(
             detect_nested_drop_column("alter table ns.t drop column IF EXISTS a.b.c"),
@@ -2190,8 +2239,14 @@ mod tests {
                 true
             ))
         );
-        assert_eq!(detect_nested_drop_column("ALTER TABLE t DROP COLUMN x"), None);
-        assert_eq!(detect_nested_drop_column("ALTER TABLE t ADD COLUMN x INT"), None);
+        assert_eq!(
+            detect_nested_drop_column("ALTER TABLE t DROP COLUMN x"),
+            None
+        );
+        assert_eq!(
+            detect_nested_drop_column("ALTER TABLE t ADD COLUMN x INT"),
+            None
+        );
     }
 
     #[test]
@@ -2268,11 +2323,13 @@ mod tests {
 
     #[test]
     fn classify_add_partition_field() {
-        let kind =
-            parse_and_classify("ALTER TABLE ns.t ADD PARTITION FIELD year(ts)").unwrap();
+        let kind = parse_and_classify("ALTER TABLE ns.t ADD PARTITION FIELD year(ts)").unwrap();
         match kind {
             StatementKind::PartitionEvolution(b) => match *b {
-                PartitionEvolution::AddField { table, transform_sql } => {
+                PartitionEvolution::AddField {
+                    table,
+                    transform_sql,
+                } => {
                     assert_eq!(table, "ns.t");
                     assert_eq!(transform_sql, "year(ts)");
                 }
@@ -2284,8 +2341,7 @@ mod tests {
 
     #[test]
     fn classify_drop_partition_field() {
-        let kind =
-            parse_and_classify("ALTER TABLE ns.t DROP PARTITION FIELD region").unwrap();
+        let kind = parse_and_classify("ALTER TABLE ns.t DROP PARTITION FIELD region").unwrap();
         assert!(matches!(
             kind,
             StatementKind::PartitionEvolution(b)

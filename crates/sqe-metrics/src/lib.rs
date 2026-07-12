@@ -3,10 +3,10 @@
 //! Exposes the Prometheus registry + `/metrics` server ([`server`]), OTel
 //! init ([`otel`]), and the structured audit pipeline ([`audit`]).
 
-pub mod server;
 pub mod audit;
 pub mod otel;
 pub mod propagation;
+pub mod server;
 
 use prometheus::{
     Counter, CounterVec, Gauge, GaugeVec, Histogram, HistogramOpts, HistogramVec, IntCounter,
@@ -227,8 +227,9 @@ impl MetricsRegistry {
 
         let query_duration = register_histogram_vec(
             &registry,
-            HistogramOpts::new("sqe_query_duration_seconds", "Query execution duration")
-                .buckets(vec![0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0]),
+            HistogramOpts::new("sqe_query_duration_seconds", "Query execution duration").buckets(
+                vec![0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0],
+            ),
             &["statement_type"],
         )?;
 
@@ -238,8 +239,11 @@ impl MetricsRegistry {
             "Total rows returned across all queries",
         )?;
 
-        let active_sessions =
-            register_int_gauge(&registry, "sqe_active_sessions", "Number of active sessions")?;
+        let active_sessions = register_int_gauge(
+            &registry,
+            "sqe_active_sessions",
+            "Number of active sessions",
+        )?;
 
         let healthy_workers = register_int_gauge(
             &registry,
@@ -346,8 +350,11 @@ impl MetricsRegistry {
             "Number of sort spill events",
         )?;
 
-        let sort_spill_bytes =
-            register_counter(&registry, "sqe_sort_spill_bytes_total", "Bytes spilled for sorts")?;
+        let sort_spill_bytes = register_counter(
+            &registry,
+            "sqe_sort_spill_bytes_total",
+            "Bytes spilled for sorts",
+        )?;
 
         let join_spill_count = register_counter(
             &registry,
@@ -355,8 +362,11 @@ impl MetricsRegistry {
             "Join spill events (SortMergeJoin)",
         )?;
 
-        let join_spill_bytes =
-            register_counter(&registry, "sqe_join_spill_bytes_total", "Bytes spilled for joins")?;
+        let join_spill_bytes = register_counter(
+            &registry,
+            "sqe_join_spill_bytes_total",
+            "Bytes spilled for joins",
+        )?;
 
         // Shuffle metrics (Phase B — registered now, incremented when shuffle lands)
         let shuffle_bytes_sent = register_counter(
@@ -454,7 +464,9 @@ impl MetricsRegistry {
                 "sqe_s3_request_duration_seconds",
                 "S3 request latency in seconds",
             )
-            .buckets(vec![0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]),
+            .buckets(vec![
+                0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+            ]),
         )?;
 
         // Auth metrics
@@ -762,8 +774,14 @@ mod tests {
     fn test_metrics_registry_creation() {
         let metrics = MetricsRegistry::new().unwrap();
         // Touch each metric so Prometheus includes it in gather()
-        metrics.query_count.with_label_values(&["success", "query", ""]).inc_by(0.0);
-        metrics.query_duration.with_label_values(&["query"]).observe(0.0);
+        metrics
+            .query_count
+            .with_label_values(&["success", "query", ""])
+            .inc_by(0.0);
+        metrics
+            .query_duration
+            .with_label_values(&["query"])
+            .observe(0.0);
         metrics.rows_returned.inc_by(0.0);
         metrics.active_sessions.set(0);
         metrics.healthy_workers.set(0);
@@ -772,7 +790,10 @@ mod tests {
         metrics.cache_invalidations.inc_by(0.0);
         metrics.cache_size_bytes.set(0.0);
         metrics.cache_entries.set(0.0);
-        metrics.scheduler_decisions.with_label_values(&["local"]).inc_by(0);
+        metrics
+            .scheduler_decisions
+            .with_label_values(&["local"])
+            .inc_by(0);
         metrics.scheduler_task_count.observe(0.0);
         metrics.scheduler_task_size_mb.observe(0.0);
         metrics.scheduler_stragglers.inc_by(0);
@@ -795,18 +816,33 @@ mod tests {
         metrics.pages_pruned_index.inc_by(0.0);
         metrics.time_to_first_row.observe(0.1);
         // S3 I/O metrics
-        metrics.s3_requests_total.with_label_values(&["get", "success"]).inc_by(0);
+        metrics
+            .s3_requests_total
+            .with_label_values(&["get", "success"])
+            .inc_by(0);
         metrics.s3_bytes_read_total.inc_by(0);
         metrics.s3_bytes_written_total.inc_by(0);
         metrics.s3_request_duration_seconds.observe(0.01);
         // Auth metrics
-        metrics.auth_attempts_total.with_label_values(&["oidc", "success"]).inc_by(0);
+        metrics
+            .auth_attempts_total
+            .with_label_values(&["oidc", "success"])
+            .inc_by(0);
         metrics.auth_duration_seconds.observe(0.1);
-        metrics.token_refresh_total.with_label_values(&["success"]).inc_by(0);
+        metrics
+            .token_refresh_total
+            .with_label_values(&["success"])
+            .inc_by(0);
         // Adaptive sort metric
-        metrics.sorts_stripped_total.with_label_values(&["adaptive", "memory_pressure"]).inc_by(0);
+        metrics
+            .sorts_stripped_total
+            .with_label_values(&["adaptive", "memory_pressure"])
+            .inc_by(0);
         // Write-path orphan cleanup (COORD-06)
-        metrics.write_orphan_files_total.with_label_values(&["ctas", "leaked"]).inc_by(0);
+        metrics
+            .write_orphan_files_total
+            .with_label_values(&["ctas", "leaked"])
+            .inc_by(0);
         metrics.dashboard_auth_anonymous_denied_total.inc_by(0);
         // 17 original + 14 streaming + 7 new (S3 + auth) + 1 adaptive sort + 1 dashboard = 40 minimum
         assert!(metrics.registry.gather().len() >= 40);
@@ -815,14 +851,26 @@ mod tests {
     #[test]
     fn test_write_orphan_files_total() {
         let metrics = MetricsRegistry::new().unwrap();
-        metrics.write_orphan_files_total.with_label_values(&["insert", "leaked"]).inc_by(3);
-        metrics.write_orphan_files_total.with_label_values(&["insert", "deleted"]).inc_by(5);
+        metrics
+            .write_orphan_files_total
+            .with_label_values(&["insert", "leaked"])
+            .inc_by(3);
+        metrics
+            .write_orphan_files_total
+            .with_label_values(&["insert", "deleted"])
+            .inc_by(5);
         assert_eq!(
-            metrics.write_orphan_files_total.with_label_values(&["insert", "leaked"]).get(),
+            metrics
+                .write_orphan_files_total
+                .with_label_values(&["insert", "leaked"])
+                .get(),
             3
         );
         assert_eq!(
-            metrics.write_orphan_files_total.with_label_values(&["insert", "deleted"]).get(),
+            metrics
+                .write_orphan_files_total
+                .with_label_values(&["insert", "deleted"])
+                .get(),
             5
         );
     }
@@ -830,16 +878,28 @@ mod tests {
     #[test]
     fn test_query_count_increment() {
         let metrics = MetricsRegistry::new().unwrap();
-        metrics.query_count.with_label_values(&["success", "query", ""]).inc();
-        let count = metrics.query_count.with_label_values(&["success", "query", ""]).get();
+        metrics
+            .query_count
+            .with_label_values(&["success", "query", ""])
+            .inc();
+        let count = metrics
+            .query_count
+            .with_label_values(&["success", "query", ""])
+            .get();
         assert_eq!(count, 1.0);
     }
 
     #[test]
     fn test_query_duration_observe() {
         let metrics = MetricsRegistry::new().unwrap();
-        metrics.query_duration.with_label_values(&["query"]).observe(0.5);
-        let count = metrics.query_duration.with_label_values(&["query"]).get_sample_count();
+        metrics
+            .query_duration
+            .with_label_values(&["query"])
+            .observe(0.5);
+        let count = metrics
+            .query_duration
+            .with_label_values(&["query"])
+            .get_sample_count();
         assert_eq!(count, 1);
     }
 
@@ -915,20 +975,41 @@ mod tests {
     #[test]
     fn test_s3_metrics() {
         let metrics = MetricsRegistry::new().unwrap();
-        metrics.s3_requests_total.with_label_values(&["get", "success"]).inc();
-        metrics.s3_requests_total.with_label_values(&["get", "success"]).inc();
-        metrics.s3_requests_total.with_label_values(&["put", "success"]).inc();
-        metrics.s3_requests_total.with_label_values(&["get", "error"]).inc();
+        metrics
+            .s3_requests_total
+            .with_label_values(&["get", "success"])
+            .inc();
+        metrics
+            .s3_requests_total
+            .with_label_values(&["get", "success"])
+            .inc();
+        metrics
+            .s3_requests_total
+            .with_label_values(&["put", "success"])
+            .inc();
+        metrics
+            .s3_requests_total
+            .with_label_values(&["get", "error"])
+            .inc();
         assert_eq!(
-            metrics.s3_requests_total.with_label_values(&["get", "success"]).get(),
+            metrics
+                .s3_requests_total
+                .with_label_values(&["get", "success"])
+                .get(),
             2
         );
         assert_eq!(
-            metrics.s3_requests_total.with_label_values(&["put", "success"]).get(),
+            metrics
+                .s3_requests_total
+                .with_label_values(&["put", "success"])
+                .get(),
             1
         );
         assert_eq!(
-            metrics.s3_requests_total.with_label_values(&["get", "error"]).get(),
+            metrics
+                .s3_requests_total
+                .with_label_values(&["get", "error"])
+                .get(),
             1
         );
 
@@ -945,19 +1026,37 @@ mod tests {
     #[test]
     fn test_auth_metrics() {
         let metrics = MetricsRegistry::new().unwrap();
-        metrics.auth_attempts_total.with_label_values(&["oidc", "success"]).inc();
-        metrics.auth_attempts_total.with_label_values(&["oidc", "failed"]).inc();
-        metrics.auth_attempts_total.with_label_values(&["bearer", "success"]).inc();
+        metrics
+            .auth_attempts_total
+            .with_label_values(&["oidc", "success"])
+            .inc();
+        metrics
+            .auth_attempts_total
+            .with_label_values(&["oidc", "failed"])
+            .inc();
+        metrics
+            .auth_attempts_total
+            .with_label_values(&["bearer", "success"])
+            .inc();
         assert_eq!(
-            metrics.auth_attempts_total.with_label_values(&["oidc", "success"]).get(),
+            metrics
+                .auth_attempts_total
+                .with_label_values(&["oidc", "success"])
+                .get(),
             1
         );
         assert_eq!(
-            metrics.auth_attempts_total.with_label_values(&["oidc", "failed"]).get(),
+            metrics
+                .auth_attempts_total
+                .with_label_values(&["oidc", "failed"])
+                .get(),
             1
         );
         assert_eq!(
-            metrics.auth_attempts_total.with_label_values(&["bearer", "success"]).get(),
+            metrics
+                .auth_attempts_total
+                .with_label_values(&["bearer", "success"])
+                .get(),
             1
         );
 
@@ -965,24 +1064,57 @@ mod tests {
         metrics.auth_duration_seconds.observe(1.5);
         assert_eq!(metrics.auth_duration_seconds.get_sample_count(), 2);
 
-        metrics.token_refresh_total.with_label_values(&["success"]).inc();
-        metrics.token_refresh_total.with_label_values(&["failed"]).inc();
-        assert_eq!(metrics.token_refresh_total.with_label_values(&["success"]).get(), 1);
-        assert_eq!(metrics.token_refresh_total.with_label_values(&["failed"]).get(), 1);
+        metrics
+            .token_refresh_total
+            .with_label_values(&["success"])
+            .inc();
+        metrics
+            .token_refresh_total
+            .with_label_values(&["failed"])
+            .inc();
+        assert_eq!(
+            metrics
+                .token_refresh_total
+                .with_label_values(&["success"])
+                .get(),
+            1
+        );
+        assert_eq!(
+            metrics
+                .token_refresh_total
+                .with_label_values(&["failed"])
+                .get(),
+            1
+        );
     }
 
     #[test]
     fn test_sorts_stripped_metric() {
         let metrics = MetricsRegistry::new().unwrap();
-        metrics.sorts_stripped_total.with_label_values(&["adaptive", "memory_pressure"]).inc();
-        metrics.sorts_stripped_total.with_label_values(&["partition_only", "partition_only"]).inc();
-        metrics.sorts_stripped_total.with_label_values(&["adaptive", "memory_pressure"]).inc();
+        metrics
+            .sorts_stripped_total
+            .with_label_values(&["adaptive", "memory_pressure"])
+            .inc();
+        metrics
+            .sorts_stripped_total
+            .with_label_values(&["partition_only", "partition_only"])
+            .inc();
+        metrics
+            .sorts_stripped_total
+            .with_label_values(&["adaptive", "memory_pressure"])
+            .inc();
         assert_eq!(
-            metrics.sorts_stripped_total.with_label_values(&["adaptive", "memory_pressure"]).get(),
+            metrics
+                .sorts_stripped_total
+                .with_label_values(&["adaptive", "memory_pressure"])
+                .get(),
             2
         );
         assert_eq!(
-            metrics.sorts_stripped_total.with_label_values(&["partition_only", "partition_only"]).get(),
+            metrics
+                .sorts_stripped_total
+                .with_label_values(&["partition_only", "partition_only"])
+                .get(),
             1
         );
     }

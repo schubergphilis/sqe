@@ -23,10 +23,10 @@
 //! `WHEN MATCHED AND <cond>` clauses plus a predicated
 //! `WHEN NOT MATCHED AND <cond> THEN INSERT`.
 
+use sqe_core::SqeError;
 use sqlparser::ast::{
     Assignment, MergeAction, MergeClause, MergeClauseKind, MergeInsertKind, ObjectName,
 };
-use sqe_core::SqeError;
 
 /// Name of the synthetic boolean column that marks rows surviving the MERGE.
 /// It exists only inside the merge SELECT; the outer projection drops it.
@@ -474,12 +474,11 @@ pub(crate) fn resolve_update_expr(
             sqlparser::ast::AssignmentTarget::Tuple(names) => names
                 .first()
                 .map(|n| {
-                    let parts: Vec<String> = n
-                        .0
-                        .iter()
-                        .filter_map(|p| p.as_ident())
-                        .map(|i| i.value.clone())
-                        .collect();
+                    let parts: Vec<String> =
+                        n.0.iter()
+                            .filter_map(|p| p.as_ident())
+                            .map(|i| i.value.clone())
+                            .collect();
                     parts.last().cloned().unwrap_or_default()
                 })
                 .unwrap_or_default(),
@@ -613,7 +612,11 @@ mod tests {
                      THEN UPDATE SET valid_to = s.valid_to \
                    WHEN NOT MATCHED AND s.change_type = 'insert' \
                      THEN INSERT (dbt_scd_id, valid_to) VALUES (s.dbt_scd_id, s.valid_to)";
-        let out = build(sql, &["dbt_scd_id", "valid_to"], &["dbt_scd_id", "valid_to", "change_type"]);
+        let out = build(
+            sql,
+            &["dbt_scd_id", "valid_to"],
+            &["dbt_scd_id", "valid_to", "change_type"],
+        );
 
         // The matched predicate gates the update arm, rewritten to scratch refs.
         assert!(
@@ -629,7 +632,10 @@ mod tests {
             "insert predicate missing: {out}"
         );
         // Deleted/unclaimed rows are dropped by the keep filter.
-        assert!(out.ends_with(&format!("WHERE {MERGE_KEEP_COLUMN}")), "{out}");
+        assert!(
+            out.ends_with(&format!("WHERE {MERGE_KEEP_COLUMN}")),
+            "{out}"
+        );
         // Source-only rows failing the insert predicate are not inserted.
         // Source-only is now detected via the target presence flag, not the
         // first data column.
@@ -755,7 +761,8 @@ mod tests {
             panic!("NOT MATCHED + DELETE must be rejected");
         };
         assert!(
-            err.to_string().contains("Unsupported MERGE clause combination"),
+            err.to_string()
+                .contains("Unsupported MERGE clause combination"),
             "unexpected error: {err}"
         );
     }
@@ -772,7 +779,10 @@ mod tests {
         let Err(err) = classify_merge_clauses(&clauses, &n) else {
             panic!("Oracle UPDATE ... WHERE must be rejected");
         };
-        assert!(err.to_string().contains("Oracle-style sub-predicates"), "{err}");
+        assert!(
+            err.to_string().contains("Oracle-style sub-predicates"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -813,7 +823,10 @@ mod tests {
                    WHEN MATCHED AND users.name = s.name AND a.s.x = 's.literal' \
                      THEN UPDATE SET v = s.v";
         let out = build(sql, &["id", "v"], &["id", "v", "name"]);
-        assert!(out.contains("users.name"), "substring alias misfired: {out}");
+        assert!(
+            out.contains("users.name"),
+            "substring alias misfired: {out}"
+        );
         assert!(out.contains("a.s.x"), "dotted-path alias misfired: {out}");
         assert!(out.contains("'s.literal'"), "literal rewritten: {out}");
         assert!(
@@ -893,7 +906,10 @@ mod tests {
                    WHEN MATCHED AND s.op = 'u' THEN UPDATE SET v = s.v";
         let out = build(sql, &["id", "v"], &["id", "v", "op"]);
         // Data CASE falls back to the target column.
-        assert!(out.contains("ELSE __merge_target_x.\"v\" END AS \"v\""), "{out}");
+        assert!(
+            out.contains("ELSE __merge_target_x.\"v\" END AS \"v\""),
+            "{out}"
+        );
         // A matched row failing the predicate keeps (ELSE TRUE), it is not
         // deleted: the only FALSE arms are the source-only default.
         assert_eq!(out.matches("THEN FALSE").count(), 1, "{out}");
@@ -945,7 +961,12 @@ mod tests {
     }
 
     async fn run_sql(ctx: &SessionContext, sql: &str) -> Vec<RecordBatch> {
-        ctx.sql(sql).await.expect("plan").collect().await.expect("collect")
+        ctx.sql(sql)
+            .await
+            .expect("plan")
+            .collect()
+            .await
+            .expect("collect")
     }
 
     /// Collect (id, v) rows from result batches, sorted by id for a stable
@@ -956,7 +977,11 @@ mod tests {
             let ids = b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
             let vs = b.column(1).as_any().downcast_ref::<StringArray>().unwrap();
             for i in 0..b.num_rows() {
-                let id = if ids.is_null(i) { None } else { Some(ids.value(i)) };
+                let id = if ids.is_null(i) {
+                    None
+                } else {
+                    Some(ids.value(i))
+                };
                 let v = if vs.is_null(i) {
                     None
                 } else {
@@ -976,12 +1001,18 @@ mod tests {
         let ctx = SessionContext::new();
         ctx.register_batch(
             "__merge_target_x",
-            id_v_batch(vec![Some(1), Some(2), Some(3)], vec![Some("a"), Some("b"), Some("c")]),
+            id_v_batch(
+                vec![Some(1), Some(2), Some(3)],
+                vec![Some("a"), Some("b"), Some("c")],
+            ),
         )
         .unwrap();
         ctx.register_batch(
             "__merge_source_x",
-            id_v_batch(vec![Some(2), Some(3), Some(4)], vec![Some("del"), Some("B"), Some("D")]),
+            id_v_batch(
+                vec![Some(2), Some(3), Some(4)],
+                vec![Some("del"), Some("B"), Some("D")],
+            ),
         )
         .unwrap();
 
@@ -1037,8 +1068,16 @@ mod tests {
         let batches = run_sql(&ctx, &out).await;
         let total: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total, 1, "matched row must survive as one updated row");
-        let vs = batches[0].column(0).as_any().downcast_ref::<StringArray>().unwrap();
-        assert_eq!(vs.value(0), "new", "matched row must be updated, not dropped/inserted");
+        let vs = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(
+            vs.value(0),
+            "new",
+            "matched row must be updated, not dropped/inserted"
+        );
     }
 
     #[tokio::test]
@@ -1053,13 +1092,21 @@ mod tests {
             "__merge_target_x.id = __merge_source_x.id",
         );
         let count = |batches: Vec<RecordBatch>| -> i64 {
-            batches[0].column(0).as_any().downcast_ref::<Int64Array>().unwrap().value(0)
+            batches[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0)
         };
 
         // Duplicate source key 1 -> target row 1 matches twice -> violation.
         let ctx = SessionContext::new();
-        ctx.register_batch("__merge_target_x", id_v_batch(vec![Some(1)], vec![Some("a")]))
-            .unwrap();
+        ctx.register_batch(
+            "__merge_target_x",
+            id_v_batch(vec![Some(1)], vec![Some("a")]),
+        )
+        .unwrap();
         ctx.register_batch(
             "__merge_source_x",
             id_v_batch(vec![Some(1), Some(1)], vec![Some("x"), Some("y")]),
@@ -1067,12 +1114,18 @@ mod tests {
         .unwrap();
         let pair = count(run_sql(&ctx, &pair_sql).await);
         let matched = count(run_sql(&ctx, &matched_sql).await);
-        assert!(pair > matched, "duplicate source key must violate: {pair} vs {matched}");
+        assert!(
+            pair > matched,
+            "duplicate source key must violate: {pair} vs {matched}"
+        );
 
         // Unique source keys -> no violation.
         let ctx2 = SessionContext::new();
-        ctx2.register_batch("__merge_target_x", id_v_batch(vec![Some(1)], vec![Some("a")]))
-            .unwrap();
+        ctx2.register_batch(
+            "__merge_target_x",
+            id_v_batch(vec![Some(1)], vec![Some("a")]),
+        )
+        .unwrap();
         ctx2.register_batch(
             "__merge_source_x",
             id_v_batch(vec![Some(1), Some(2)], vec![Some("x"), Some("y")]),
@@ -1080,7 +1133,10 @@ mod tests {
         .unwrap();
         let pair2 = count(run_sql(&ctx2, &pair_sql).await);
         let matched2 = count(run_sql(&ctx2, &matched_sql).await);
-        assert!(pair2 <= matched2, "unique keys must not violate: {pair2} vs {matched2}");
+        assert!(
+            pair2 <= matched2,
+            "unique keys must not violate: {pair2} vs {matched2}"
+        );
     }
 
     use arrow_array::Int64Array;

@@ -38,9 +38,9 @@ fn unknown_flag_exits_two() {
         .arg("--definitely-not-a-flag")
         .assert()
         .code(2)
-        .stderr(predicate::str::contains("unexpected argument").or(
-            predicate::str::contains("error:"),
-        ));
+        .stderr(
+            predicate::str::contains("unexpected argument").or(predicate::str::contains("error:")),
+        );
 }
 
 #[test]
@@ -49,9 +49,7 @@ fn invalid_protocol_value_exits_two() {
         .args(["--protocol", "carrier-pigeon"])
         .assert()
         .code(2)
-        .stderr(predicate::str::contains("invalid value").or(
-            predicate::str::contains("error:"),
-        ));
+        .stderr(predicate::str::contains("invalid value").or(predicate::str::contains("error:")));
 }
 
 #[test]
@@ -89,9 +87,9 @@ fn memory_and_warehouse_are_mutually_exclusive() {
         .args(["--embedded", "--memory", "--warehouse", "/tmp/sqe-wh"])
         .assert()
         .code(2)
-        .stderr(predicate::str::contains("cannot be used with").or(
-            predicate::str::contains("error:"),
-        ));
+        .stderr(
+            predicate::str::contains("cannot be used with").or(predicate::str::contains("error:")),
+        );
 }
 
 #[test]

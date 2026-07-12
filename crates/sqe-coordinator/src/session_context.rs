@@ -76,21 +76,17 @@ pub(crate) async fn build_catalog_provider(
     if let Some(m) = prom_metrics {
         catalog_provider = catalog_provider.with_metrics(Arc::clone(m));
     }
-    let small_file_threshold_bytes =
-        cat_cfg.small_file_threshold_mb.saturating_mul(1024 * 1024);
-    catalog_provider =
-        catalog_provider.with_small_file_threshold(small_file_threshold_bytes);
-    catalog_provider =
-        catalog_provider.with_manifest_concurrency(cat_cfg.manifest_concurrency);
-    catalog_provider = catalog_provider
-        .with_prefetch_concurrency(prefetch_concurrency);
+    let small_file_threshold_bytes = cat_cfg.small_file_threshold_mb.saturating_mul(1024 * 1024);
+    catalog_provider = catalog_provider.with_small_file_threshold(small_file_threshold_bytes);
+    catalog_provider = catalog_provider.with_manifest_concurrency(cat_cfg.manifest_concurrency);
+    catalog_provider = catalog_provider.with_prefetch_concurrency(prefetch_concurrency);
     // Issue #132: Tier-1 dynamic-filter clustering gate (default off).
     catalog_provider = catalog_provider.with_runtime_filter_clustering(
         cat_cfg.runtime_filters.clustering_skip_enabled,
         cat_cfg.runtime_filters.uniform_threshold,
     );
-    catalog_provider = catalog_provider
-        .with_runtime_filter_wait_ms(cat_cfg.runtime_filters.wait_ms);
+    catalog_provider =
+        catalog_provider.with_runtime_filter_wait_ms(cat_cfg.runtime_filters.wait_ms);
     // Issue #369: bloom-filter row-group probing of sealed runtime filters.
     catalog_provider = catalog_provider.with_runtime_filter_bloom(
         cat_cfg.runtime_filters.bloom_probe,
@@ -111,26 +107,18 @@ async fn build_session_catalog(
     table_cache: Option<&TableMetadataCache>,
 ) -> Result<(Arc<SessionCatalog>, sqe_core::config::StorageConfig), Arc<SqeError>> {
     let auth = cat_cfg.auth.clone().unwrap_or_default();
-    let bearer = sqe_auth::per_catalog::resolve_bearer(
-        &auth,
-        session.access_token().expose(),
-    )
-    .await
-    .map_err(Arc::new)?;
+    let bearer = sqe_auth::per_catalog::resolve_bearer(&auth, session.access_token().expose())
+        .await
+        .map_err(Arc::new)?;
     let storage = cat_cfg
         .storage
         .clone()
         .unwrap_or_else(|| global_storage.clone());
 
     let session_catalog = Arc::new(
-        SessionCatalog::for_session_with(
-            cat_cfg,
-            &storage,
-            table_cache.cloned(),
-            &bearer,
-        )
-        .await
-        .map_err(Arc::new)?,
+        SessionCatalog::for_session_with(cat_cfg, &storage, table_cache.cloned(), &bearer)
+            .await
+            .map_err(Arc::new)?,
     );
 
     Ok((session_catalog, storage))
@@ -172,7 +160,10 @@ pub async fn create_session_context(
     // the key: the same user+token opening two connections against different
     // catalogs/schemas builds distinct DataFusion default-catalog contexts and
     // must not collide in the cache.
-    let token_hash = format!("{:x}", Sha256::digest(session.access_token().expose_bytes()));
+    let token_hash = format!(
+        "{:x}",
+        Sha256::digest(session.access_token().expose_bytes())
+    );
     let cache_key = format!(
         "{}:{}:{}:{}",
         session.user.username,
@@ -568,6 +559,7 @@ pub async fn create_session_context(
                         rows_scanned: r.rows_scanned,
                         spill_bytes: r.spill_bytes,
                         peak_memory_bytes: r.peak_memory_bytes,
+                        trace_id: r.trace_id.clone(),
                         fragments: r
                             .fragments_snapshot()
                             .into_iter()
@@ -1067,20 +1059,29 @@ s3_path_style = true
             .sql("SELECT is_role_in_session('engineer') AS r")
             .await
             .expect("plan is_role_in_session false");
-        let batches2 = df2.collect().await.expect("execute is_role_in_session false");
+        let batches2 = df2
+            .collect()
+            .await
+            .expect("execute is_role_in_session false");
         let col2 = batches2[0]
             .column(0)
             .as_any()
             .downcast_ref::<arrow::array::BooleanArray>()
             .expect("boolean array");
-        assert!(!col2.value(0), "is_role_in_session('engineer') should be false");
+        assert!(
+            !col2.value(0),
+            "is_role_in_session('engineer') should be false"
+        );
 
         // current_available_roles() -> JSON array of roles (sorted)
         let df3 = ctx
             .sql("SELECT current_available_roles() AS r")
             .await
             .expect("plan current_available_roles");
-        let batches3 = df3.collect().await.expect("execute current_available_roles");
+        let batches3 = df3
+            .collect()
+            .await
+            .expect("execute current_available_roles");
         let col3 = batches3[0]
             .column(0)
             .as_any()

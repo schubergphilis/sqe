@@ -22,9 +22,7 @@
 
 use std::sync::Arc;
 
-use arrow::array::{
-    Array, Decimal128Array, Int64Array, RecordBatch, StringArray,
-};
+use arrow::array::{Array, Decimal128Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use datafusion::catalog::TableProvider;
 use datafusion::datasource::{provider_as_source, MemTable, ViewTable};
@@ -33,9 +31,7 @@ use datafusion::prelude::SessionContext;
 
 use sqe_core::SessionUser;
 use sqe_policy::policy_store::InMemoryPolicyStore;
-use sqe_policy::{
-    plan_rewriter::PolicyPlanRewriter, MaskType, PolicyEnforcer, ResolvedPolicy,
-};
+use sqe_policy::{plan_rewriter::PolicyPlanRewriter, MaskType, PolicyEnforcer, ResolvedPolicy};
 
 fn user(name: &str) -> SessionUser {
     SessionUser {
@@ -151,7 +147,10 @@ async fn view_select_subset_applies_base_row_filter_and_mask() {
     let batches = enforce_and_run(&ctx, &rewriter, "SELECT salary, region FROM v").await;
 
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-    assert_eq!(rows, 2, "row filter region='EU' must apply through the view");
+    assert_eq!(
+        rows, 2,
+        "row filter region='EU' must apply through the view"
+    );
 
     let salary = batches[0].column_by_name("salary").unwrap();
     assert_eq!(
@@ -189,7 +188,10 @@ async fn view_projecting_subset_still_governed() {
     let batches = enforce_and_run(&ctx, &rewriter, "SELECT salary, region FROM v").await;
 
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-    assert_eq!(rows, 2, "base row filter must apply through a projecting view");
+    assert_eq!(
+        rows, 2,
+        "base row filter must apply through a projecting view"
+    );
     let salary = batches[0].column_by_name("salary").unwrap();
     assert_eq!(
         salary.null_count(),
@@ -235,9 +237,17 @@ async fn view_select_star_restricted_column_is_nulled() {
     let ssn = batches[0]
         .column_by_name("ssn")
         .expect("ssn must be present (forced NULL), not dropped");
-    assert_eq!(ssn.null_count(), ssn.len(), "restricted ssn must be entirely NULL");
+    assert_eq!(
+        ssn.null_count(),
+        ssn.len(),
+        "restricted ssn must be entirely NULL"
+    );
     let salary = batches[0].column_by_name("salary").unwrap();
-    assert_eq!(salary.null_count(), salary.len(), "salary mask must apply through a view");
+    assert_eq!(
+        salary.null_count(),
+        salary.len(),
+        "salary mask must apply through a view"
+    );
 }
 
 /// Test 5 (regression): a plain base-table `SELECT *` (no view) is governed: the
@@ -253,7 +263,11 @@ async fn plain_base_table_select_star_restricted_column_is_nulled() {
     let ssn = batches[0]
         .column_by_name("ssn")
         .expect("ssn must be present (forced NULL), not dropped");
-    assert_eq!(ssn.null_count(), ssn.len(), "restricted ssn must be entirely NULL");
+    assert_eq!(
+        ssn.null_count(),
+        ssn.len(),
+        "restricted ssn must be entirely NULL"
+    );
     let salary = batches[0].column_by_name("salary").unwrap();
     assert_eq!(salary.null_count(), salary.len(), "salary mask must apply");
 }

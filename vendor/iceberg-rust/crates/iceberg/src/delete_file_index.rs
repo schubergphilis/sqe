@@ -622,38 +622,41 @@ mod tests {
 
         let data_a = build_test_data_file("s3://bucket/data-a.parquet", &partition, spec_id);
         let data_b = build_test_data_file("s3://bucket/data-b.parquet", &partition, spec_id);
-        let delete_file_index = build_populated_delete_file_index(spec_id, vec![
-            (
-                10,
-                build_test_pos_delete_file(
-                    "s3://bucket/pos-delete-a.parquet",
-                    Some(data_a.file_path()),
-                    None,
-                    &partition,
-                    spec_id,
+        let delete_file_index = build_populated_delete_file_index(
+            spec_id,
+            vec![
+                (
+                    10,
+                    build_test_pos_delete_file(
+                        "s3://bucket/pos-delete-a.parquet",
+                        Some(data_a.file_path()),
+                        None,
+                        &partition,
+                        spec_id,
+                    ),
                 ),
-            ),
-            (
-                10,
-                build_test_pos_delete_file(
-                    "s3://bucket/pos-delete-b.parquet",
-                    Some(data_b.file_path()),
-                    None,
-                    &partition,
-                    spec_id,
+                (
+                    10,
+                    build_test_pos_delete_file(
+                        "s3://bucket/pos-delete-b.parquet",
+                        Some(data_b.file_path()),
+                        None,
+                        &partition,
+                        spec_id,
+                    ),
                 ),
-            ),
-            (
-                10,
-                build_test_pos_delete_file(
-                    "s3://bucket/pos-delete-any.parquet",
-                    None,
-                    None,
-                    &partition,
-                    spec_id,
+                (
+                    10,
+                    build_test_pos_delete_file(
+                        "s3://bucket/pos-delete-any.parquet",
+                        None,
+                        None,
+                        &partition,
+                        spec_id,
+                    ),
                 ),
-            ),
-        ]);
+            ],
+        );
 
         assert_eq!(
             get_sorted_delete_paths(&delete_file_index, &data_a, Some(0)),
@@ -679,31 +682,34 @@ mod tests {
 
         let data_a = build_test_data_file("s3://bucket/data-a.parquet", &partition, spec_id);
         let data_b = build_test_data_file("s3://bucket/data-b.parquet", &partition, spec_id);
-        let delete_file_index = build_populated_delete_file_index(spec_id, vec![
-            (
-                10,
-                build_test_pos_delete_file(
-                    "s3://bucket/pos-delete-a.parquet",
-                    None,
-                    Some((
-                        Datum::string(data_a.file_path()),
-                        Datum::string(data_a.file_path()),
-                    )),
-                    &partition,
-                    spec_id,
+        let delete_file_index = build_populated_delete_file_index(
+            spec_id,
+            vec![
+                (
+                    10,
+                    build_test_pos_delete_file(
+                        "s3://bucket/pos-delete-a.parquet",
+                        None,
+                        Some((
+                            Datum::string(data_a.file_path()),
+                            Datum::string(data_a.file_path()),
+                        )),
+                        &partition,
+                        spec_id,
+                    ),
                 ),
-            ),
-            (
-                10,
-                build_test_pos_delete_file(
-                    "s3://bucket/pos-delete-any.parquet",
-                    None,
-                    None,
-                    &partition,
-                    spec_id,
+                (
+                    10,
+                    build_test_pos_delete_file(
+                        "s3://bucket/pos-delete-any.parquet",
+                        None,
+                        None,
+                        &partition,
+                        spec_id,
+                    ),
                 ),
-            ),
-        ]);
+            ],
+        );
 
         assert_eq!(
             get_sorted_delete_paths(&delete_file_index, &data_a, Some(0)),
@@ -726,19 +732,22 @@ mod tests {
 
         let data_a = build_test_data_file("s3://bucket/data-a.parquet", &partition, spec_id);
         let data_b = build_test_data_file("s3://bucket/data-b.parquet", &partition, spec_id);
-        let delete_file_index = build_populated_delete_file_index(spec_id, vec![(
-            10,
-            build_test_pos_delete_file(
-                "s3://bucket/pos-delete-range.parquet",
-                None,
-                Some((
-                    Datum::string(data_a.file_path()),
-                    Datum::string(data_b.file_path()),
-                )),
-                &partition,
-                spec_id,
-            ),
-        )]);
+        let delete_file_index = build_populated_delete_file_index(
+            spec_id,
+            vec![(
+                10,
+                build_test_pos_delete_file(
+                    "s3://bucket/pos-delete-range.parquet",
+                    None,
+                    Some((
+                        Datum::string(data_a.file_path()),
+                        Datum::string(data_b.file_path()),
+                    )),
+                    &partition,
+                    spec_id,
+                ),
+            )],
+        );
 
         let deletes_for_a = delete_file_index.get_deletes_for_data_file(&data_a, Some(0));
         assert_eq!(deletes_for_a.len(), 1);
@@ -766,38 +775,41 @@ mod tests {
         let spec_id = 1;
 
         let data_a = build_test_data_file("s3://bucket/data-a.parquet", &partition, spec_id);
-        let delete_file_index = build_populated_delete_file_index(spec_id, vec![
-            (
-                5,
-                build_test_pos_delete_file(
-                    "s3://bucket/pos-delete-old.parquet",
-                    Some(data_a.file_path()),
-                    None,
-                    &partition,
-                    spec_id,
+        let delete_file_index = build_populated_delete_file_index(
+            spec_id,
+            vec![
+                (
+                    5,
+                    build_test_pos_delete_file(
+                        "s3://bucket/pos-delete-old.parquet",
+                        Some(data_a.file_path()),
+                        None,
+                        &partition,
+                        spec_id,
+                    ),
                 ),
-            ),
-            (
-                6,
-                build_test_pos_delete_file(
-                    "s3://bucket/pos-delete-new.parquet",
-                    Some(data_a.file_path()),
-                    None,
-                    &partition,
-                    spec_id,
+                (
+                    6,
+                    build_test_pos_delete_file(
+                        "s3://bucket/pos-delete-new.parquet",
+                        Some(data_a.file_path()),
+                        None,
+                        &partition,
+                        spec_id,
+                    ),
                 ),
-            ),
-            (
-                10,
-                build_test_pos_delete_file(
-                    "s3://bucket/pos-delete-other.parquet",
-                    Some("s3://bucket/data-b.parquet"),
-                    None,
-                    &partition,
-                    spec_id,
+                (
+                    10,
+                    build_test_pos_delete_file(
+                        "s3://bucket/pos-delete-other.parquet",
+                        Some("s3://bucket/data-b.parquet"),
+                        None,
+                        &partition,
+                        spec_id,
+                    ),
                 ),
-            ),
-        ]);
+            ],
+        );
 
         assert_eq!(
             get_sorted_delete_paths(&delete_file_index, &data_a, Some(6)),
@@ -812,19 +824,22 @@ mod tests {
 
         let data_a = build_test_data_file("s3://bucket/data-a.parquet", &partition, spec_id);
         let data_b = build_test_data_file("s3://bucket/data-b.parquet", &partition, spec_id);
-        let delete_file_index = build_populated_delete_file_index(spec_id, vec![(
-            10,
-            build_test_pos_delete_file(
-                "s3://bucket/pos-delete-invalid-bounds.parquet",
-                None,
-                Some((
-                    Datum::binary(vec![0xff, 0xfe]),
-                    Datum::binary(vec![0xff, 0xfe]),
-                )),
-                &partition,
-                spec_id,
-            ),
-        )]);
+        let delete_file_index = build_populated_delete_file_index(
+            spec_id,
+            vec![(
+                10,
+                build_test_pos_delete_file(
+                    "s3://bucket/pos-delete-invalid-bounds.parquet",
+                    None,
+                    Some((
+                        Datum::binary(vec![0xff, 0xfe]),
+                        Datum::binary(vec![0xff, 0xfe]),
+                    )),
+                    &partition,
+                    spec_id,
+                ),
+            )],
+        );
 
         assert_eq!(
             get_sorted_delete_paths(&delete_file_index, &data_a, Some(0)).len(),

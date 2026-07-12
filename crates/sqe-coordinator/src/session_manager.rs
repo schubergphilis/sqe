@@ -1,12 +1,12 @@
-use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use tracing::{debug, info, warn};
 
-use sqe_auth::{AuthProvider, FlightCredentials, Identity};
 use sqe_auth::Authenticator;
+use sqe_auth::{AuthProvider, FlightCredentials, Identity};
 use sqe_core::Session;
 
 fn now_micros() -> i64 {
@@ -249,7 +249,11 @@ impl SessionManager {
             token_expiry,
             identity.roles.clone(),
         )
-        .with_identity(identity.subject.clone(), identity.email.clone(), identity.groups.clone())
+        .with_identity(
+            identity.subject.clone(),
+            identity.email.clone(),
+            identity.groups.clone(),
+        )
     }
 
     /// Look up a session by its ID (bearer token).
@@ -274,11 +278,15 @@ impl SessionManager {
                         cached.expiry,
                     ));
                     let updated = Arc::new(updated);
-                    self.sessions.insert(session_id.to_string(), updated.clone());
+                    self.sessions
+                        .insert(session_id.to_string(), updated.clone());
                     self.record_activity(session_id);
                     debug!(session_id = %session_id, "Session updated with refreshed token");
                     if let Some(ref metrics) = self.metrics {
-                        metrics.token_refresh_total.with_label_values(&["success"]).inc();
+                        metrics
+                            .token_refresh_total
+                            .with_label_values(&["success"])
+                            .inc();
                     }
                     return Some(updated);
                 }
@@ -302,8 +310,10 @@ impl SessionManager {
         if let Some(entry) = self.last_activity.get(session_id) {
             entry.store(now_micros(), Ordering::Relaxed);
         } else {
-            self.last_activity
-                .insert(session_id.to_string(), Arc::new(AtomicI64::new(now_micros())));
+            self.last_activity.insert(
+                session_id.to_string(),
+                Arc::new(AtomicI64::new(now_micros())),
+            );
         }
     }
 
@@ -353,9 +363,12 @@ impl SessionManager {
 
         let json = serde_json::to_string_pretty(&sessions)
             .map_err(|e| format!("Failed to serialize sessions: {e}"))?;
-        std::fs::write(path, json)
-            .map_err(|e| format!("Failed to write session snapshot: {e}"))?;
-        tracing::debug!(path = path, count = sessions.len(), "Session snapshot saved");
+        std::fs::write(path, json).map_err(|e| format!("Failed to write session snapshot: {e}"))?;
+        tracing::debug!(
+            path = path,
+            count = sessions.len(),
+            "Session snapshot saved"
+        );
         Ok(())
     }
 
@@ -379,7 +392,10 @@ impl SessionManager {
                 );
             }
             Ok(_) => {
-                tracing::warn!(path = path, "Session snapshot has unexpected format, skipping restore");
+                tracing::warn!(
+                    path = path,
+                    "Session snapshot has unexpected format, skipping restore"
+                );
             }
             Err(e) => {
                 tracing::warn!(path = path, error = %e, "Failed to parse session snapshot, skipping restore");
@@ -691,7 +707,10 @@ mod tests {
 
         let removed = manager.sweep_expired_sessions(900, 28800);
 
-        assert_eq!(removed, 1, "One absolutely-expired session should have been swept");
+        assert_eq!(
+            removed, 1,
+            "One absolutely-expired session should have been swept"
+        );
         assert!(
             manager.sessions.get(&id).is_none(),
             "Absolutely-expired session must be absent after sweep"
@@ -739,21 +758,37 @@ mod tests {
         let mut idle_session = make_session("irene");
         idle_session.last_activity = Utc::now() - Duration::seconds(1200);
         let idle_id = idle_session.id.clone();
-        manager.sessions.insert(idle_id.clone(), Arc::new(idle_session));
+        manager
+            .sessions
+            .insert(idle_id.clone(), Arc::new(idle_session));
 
         // Absolutely-expired session (created 9 hours ago)
         let mut abs_session = make_session("jake");
         abs_session.created_at = Utc::now() - Duration::hours(9);
         abs_session.last_activity = Utc::now();
         let abs_id = abs_session.id.clone();
-        manager.sessions.insert(abs_id.clone(), Arc::new(abs_session));
+        manager
+            .sessions
+            .insert(abs_id.clone(), Arc::new(abs_session));
 
         let removed = manager.sweep_expired_sessions(900, 28800);
 
-        assert_eq!(removed, 2, "Exactly two expired sessions should have been swept");
-        assert!(manager.sessions.get(&active_id).is_some(), "Active session must survive sweep");
-        assert!(manager.sessions.get(&idle_id).is_none(), "Idle session must be swept");
-        assert!(manager.sessions.get(&abs_id).is_none(), "Absolutely-expired session must be swept");
+        assert_eq!(
+            removed, 2,
+            "Exactly two expired sessions should have been swept"
+        );
+        assert!(
+            manager.sessions.get(&active_id).is_some(),
+            "Active session must survive sweep"
+        );
+        assert!(
+            manager.sessions.get(&idle_id).is_none(),
+            "Idle session must be swept"
+        );
+        assert!(
+            manager.sessions.get(&abs_id).is_none(),
+            "Absolutely-expired session must be swept"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -840,7 +875,11 @@ mod tests {
         let large_timeout: u64 = 86400 * 365 * 100;
         let removed = manager.sweep_expired_sessions(large_timeout, large_timeout);
         assert_eq!(removed, 0, "No active sessions should be swept");
-        assert_eq!(manager.sessions.len(), 10, "All sessions should survive the sweep");
+        assert_eq!(
+            manager.sessions.len(),
+            10,
+            "All sessions should survive the sweep"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -966,13 +1005,13 @@ mod tests {
             }),
         ]);
 
-        let manager = SessionManager::with_provider_and_legacy(
-            Arc::new(chain),
-            Arc::clone(&legacy),
-        );
+        let manager =
+            SessionManager::with_provider_and_legacy(Arc::new(chain), Arc::clone(&legacy));
 
         let creds = FlightCredentials {
-            bearer_token: Some(sqe_core::SecretString::new("eyJtest.payload.sig".to_string())),
+            bearer_token: Some(sqe_core::SecretString::new(
+                "eyJtest.payload.sig".to_string(),
+            )),
             ..Default::default()
         };
 
@@ -995,7 +1034,9 @@ mod tests {
         let manager = SessionManager::new(legacy);
 
         let creds = FlightCredentials {
-            bearer_token: Some(sqe_core::SecretString::new("eyJtest.payload.sig".to_string())),
+            bearer_token: Some(sqe_core::SecretString::new(
+                "eyJtest.payload.sig".to_string(),
+            )),
             ..Default::default()
         };
 
@@ -1023,13 +1064,13 @@ mod tests {
             Arc::clone(&legacy) as Arc<dyn AuthProvider>,
         ]);
 
-        let manager = SessionManager::with_provider_and_legacy(
-            Arc::new(chain),
-            Arc::clone(&legacy),
-        );
+        let manager =
+            SessionManager::with_provider_and_legacy(Arc::new(chain), Arc::clone(&legacy));
 
         let creds = FlightCredentials {
-            bearer_token: Some(sqe_core::SecretString::new("eyJtest.payload.sig".to_string())),
+            bearer_token: Some(sqe_core::SecretString::new(
+                "eyJtest.payload.sig".to_string(),
+            )),
             ..Default::default()
         };
 

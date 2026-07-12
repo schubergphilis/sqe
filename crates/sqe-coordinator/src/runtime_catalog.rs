@@ -105,10 +105,13 @@ impl RuntimeCatalogRegistry {
 
         // 3) Wrap in WritableIcebergCatalog so DataFusion can run
         //    CREATE SCHEMA / CREATE TABLE through its normal pipeline.
-        let provider: Arc<dyn CatalogProvider> =
-            Arc::new(WritableIcebergCatalog::try_new(catalog.clone())
+        let provider: Arc<dyn CatalogProvider> = Arc::new(
+            WritableIcebergCatalog::try_new(catalog.clone())
                 .await
-                .map_err(|e| format!("failed to wrap catalog '{}' for DataFusion: {e}", stmt.name))?);
+                .map_err(|e| {
+                    format!("failed to wrap catalog '{}' for DataFusion: {e}", stmt.name)
+                })?,
+        );
 
         // 4) Capture the optional SECRET reference so DROP SECRET can
         //    refuse to drop a secret while a catalog depends on it.

@@ -44,9 +44,7 @@ pub fn rewrite_alter_execute(sql: &str) -> String {
         return sql.to_string();
     }
     match rewrite(sql) {
-        Some(candidate)
-            if candidate != sql && Parser::parse_sql(&dialect, &candidate).is_ok() =>
-        {
+        Some(candidate) if candidate != sql && Parser::parse_sql(&dialect, &candidate).is_ok() => {
             candidate
         }
         _ => sql.to_string(),
@@ -81,7 +79,8 @@ fn rewrite(sql: &str) -> Option<String> {
     }
 
     // ALTER TABLE ...
-    if !is_kw(&tokens[meaningful[0]], Keyword::ALTER) || !is_kw(&tokens[meaningful[1]], Keyword::TABLE)
+    if !is_kw(&tokens[meaningful[0]], Keyword::ALTER)
+        || !is_kw(&tokens[meaningful[1]], Keyword::TABLE)
     {
         return None;
     }
@@ -179,7 +178,10 @@ mod tests {
     #[test]
     fn optimize_bare_becomes_rewrite_data_files() {
         let out = rewrite_alter_execute("ALTER TABLE iceberg.default.t EXECUTE optimize");
-        assert_eq!(out, "CALL system.rewrite_data_files(table => 'iceberg.default.t')");
+        assert_eq!(
+            out,
+            "CALL system.rewrite_data_files(table => 'iceberg.default.t')"
+        );
         assert!(parses(&out));
     }
 
@@ -197,7 +199,10 @@ mod tests {
     #[test]
     fn optimize_two_part_name() {
         let out = rewrite_alter_execute("ALTER TABLE analytics.events EXECUTE optimize;");
-        assert_eq!(out, "CALL system.rewrite_data_files(table => 'analytics.events');");
+        assert_eq!(
+            out,
+            "CALL system.rewrite_data_files(table => 'analytics.events');"
+        );
         assert!(parses(&out));
     }
 

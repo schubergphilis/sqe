@@ -140,23 +140,61 @@ const MARKET_SEGMENTS: &[&str] = &[
     "HOUSEHOLD",
 ];
 
-const ORDER_PRIORITIES: &[&str] = &[
-    "1-URGENT",
-    "2-HIGH",
-    "3-MEDIUM",
-    "4-NOT SPECIFIED",
-    "5-LOW",
-];
+const ORDER_PRIORITIES: &[&str] = &["1-URGENT", "2-HIGH", "3-MEDIUM", "4-NOT SPECIFIED", "5-LOW"];
 
 const SHIP_MODES: &[&str] = &["REG AIR", "AIR", "RAIL", "SHIP", "TRUCK", "MAIL", "FOB"];
 
 const PART_COLORS: &[&str] = &[
-    "almond", "antique", "aquamarine", "azure", "beige", "bisque", "black", "blanched",
-    "blue", "blush", "brown", "burlywood", "burnished", "chartreuse", "chiffon", "chocolate",
-    "coral", "cornflower", "cornsilk", "cream", "cyan", "dark", "deep", "dim", "dodger",
-    "drab", "firebrick", "floral", "forest", "frosted", "gainsboro", "ghost", "goldenrod",
-    "green", "grey", "honeydew", "hot", "indian", "ivory", "khaki", "lace", "lavender",
-    "lawn", "lemon", "light", "lime", "linen", "magenta", "maroon", "medium",
+    "almond",
+    "antique",
+    "aquamarine",
+    "azure",
+    "beige",
+    "bisque",
+    "black",
+    "blanched",
+    "blue",
+    "blush",
+    "brown",
+    "burlywood",
+    "burnished",
+    "chartreuse",
+    "chiffon",
+    "chocolate",
+    "coral",
+    "cornflower",
+    "cornsilk",
+    "cream",
+    "cyan",
+    "dark",
+    "deep",
+    "dim",
+    "dodger",
+    "drab",
+    "firebrick",
+    "floral",
+    "forest",
+    "frosted",
+    "gainsboro",
+    "ghost",
+    "goldenrod",
+    "green",
+    "grey",
+    "honeydew",
+    "hot",
+    "indian",
+    "ivory",
+    "khaki",
+    "lace",
+    "lavender",
+    "lawn",
+    "lemon",
+    "light",
+    "lime",
+    "linen",
+    "magenta",
+    "maroon",
+    "medium",
 ];
 
 const PART_TYPES: &[&str] = &[
@@ -175,11 +213,31 @@ const PART_TYPES: &[&str] = &[
 ];
 
 const PART_CONTAINERS: &[&str] = &[
-    "SM CASE", "SM BOX", "SM BAG", "SM JAR", "SM PACK",
-    "LG CASE", "LG BOX", "LG BAG", "LG JAR", "LG PACK",
-    "MED CASE", "MED BOX", "MED BAG", "MED JAR", "MED PACK",
-    "JUMBO CASE", "JUMBO BOX", "JUMBO BAG", "JUMBO JAR", "JUMBO PACK",
-    "WRAP CASE", "WRAP BOX", "WRAP BAG", "WRAP JAR", "WRAP PACK",
+    "SM CASE",
+    "SM BOX",
+    "SM BAG",
+    "SM JAR",
+    "SM PACK",
+    "LG CASE",
+    "LG BOX",
+    "LG BAG",
+    "LG JAR",
+    "LG PACK",
+    "MED CASE",
+    "MED BOX",
+    "MED BAG",
+    "MED JAR",
+    "MED PACK",
+    "JUMBO CASE",
+    "JUMBO BOX",
+    "JUMBO BAG",
+    "JUMBO JAR",
+    "JUMBO PACK",
+    "WRAP CASE",
+    "WRAP BOX",
+    "WRAP BAG",
+    "WRAP JAR",
+    "WRAP PACK",
 ];
 
 /// SSB date range: 1992-01-01 to 1998-12-31
@@ -188,11 +246,27 @@ const SSB_YEAR_END: i32 = 1998;
 
 const DAYS_IN_MONTH: [u32; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
 const MONTH_NAMES: [&str; 12] = [
-    "January", "February", "March", "April", "May", "June",
-    "July", "August", "September", "October", "November", "December",
+    "January",
+    "February",
+    "March",
+    "April",
+    "May",
+    "June",
+    "July",
+    "August",
+    "September",
+    "October",
+    "November",
+    "December",
 ];
 const DAY_OF_WEEK_NAMES: [&str; 7] = [
-    "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday",
+    "Monday",
+    "Tuesday",
+    "Wednesday",
+    "Thursday",
+    "Friday",
+    "Saturday",
+    "Sunday",
 ];
 
 fn is_leap_year(year: i32) -> bool {
@@ -208,7 +282,11 @@ fn days_in_month(year: i32, month: u32) -> u32 {
 }
 
 fn days_in_year(year: i32) -> u32 {
-    if is_leap_year(year) { 366 } else { 365 }
+    if is_leap_year(year) {
+        366
+    } else {
+        365
+    }
 }
 
 fn selling_season(month: u32) -> &'static str {
@@ -263,7 +341,9 @@ pub(crate) fn all_date_keys() -> Vec<i32> {
 fn seed_for_table(name: &str) -> u64 {
     name.bytes()
         .enumerate()
-        .fold(0u64, |acc, (i, b)| acc ^ ((b as u64).wrapping_shl(i as u32 % 64)))
+        .fold(0u64, |acc, (i, b)| {
+            acc ^ ((b as u64).wrapping_shl(i as u32 % 64))
+        })
         .wrapping_add(0xBEEF_CAFE_1234_5678)
 }
 
@@ -349,7 +429,11 @@ fn generate_dim_date() -> (SchemaRef, Vec<RecordBatch>) {
         // vacuous.
         let yearmonth = format!("{}{}", &month_name[..3], year);
         let week_num = ((day_in_year - 1) / 7 + 1) as i32;
-        let last_day_in_month = if day == days_in_month(year, month) { 1i32 } else { 0 };
+        let last_day_in_month = if day == days_in_month(year, month) {
+            1i32
+        } else {
+            0
+        };
         let last_day_in_week = if dow_idx == 6 { 1i32 } else { 0 }; // Sunday
         let is_weekday = if dow_idx < 5 { 1i32 } else { 0 };
         let is_holiday = if (month == 1 && day == 1) || (month == 12 && day == 25) {
@@ -442,8 +526,7 @@ fn generate_customer(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
             c_nation.push(nation_name.to_string());
             c_region.push(region_name.to_string());
             c_phone.push(random_phone(&mut rng, nation_idx));
-            c_mktsegment
-                .push(MARKET_SEGMENTS[rng.gen_range(0..MARKET_SEGMENTS.len())].to_string());
+            c_mktsegment.push(MARKET_SEGMENTS[rng.gen_range(0..MARKET_SEGMENTS.len())].to_string());
         }
 
         let name_refs: Vec<&str> = c_name.iter().map(|s| s.as_str()).collect();
@@ -965,7 +1048,9 @@ mod tests {
         let gen = SsbGenerator;
         let output = "/tmp/sqe-bench-test-ssb-parquet";
 
-        let stats = gen.generate_table("dim_date", 1.0, output, &Default::default()).unwrap();
+        let stats = gen
+            .generate_table("dim_date", 1.0, output, &Default::default())
+            .unwrap();
         assert_eq!(stats.rows, 2557);
         assert_eq!(stats.files, 1);
         assert!(stats.bytes > 0);
@@ -978,7 +1063,9 @@ mod tests {
         let sf = 0.01_f64;
 
         for table in gen.tables() {
-            let stats = gen.generate_table(&table.name, sf, output, &Default::default()).unwrap();
+            let stats = gen
+                .generate_table(&table.name, sf, output, &Default::default())
+                .unwrap();
             let expected = (table.row_count)(sf);
             assert_eq!(
                 stats.rows, expected,
@@ -1002,7 +1089,10 @@ mod tests {
         // Verify sample values are in YYYYMMDD format within the SSB date range
         for i in 0..col.len().min(10) {
             let v = col.value(i);
-            assert!((19920101..=19981231).contains(&v), "datekey {v} out of range");
+            assert!(
+                (19920101..=19981231).contains(&v),
+                "datekey {v} out of range"
+            );
         }
     }
 
@@ -1021,7 +1111,9 @@ mod tests {
     #[test]
     fn test_unknown_table_errors() {
         let gen = SsbGenerator;
-        assert!(gen.generate_table("no_such_table", 1.0, "/tmp", &Default::default()).is_err());
+        assert!(gen
+            .generate_table("no_such_table", 1.0, "/tmp", &Default::default())
+            .is_err());
     }
 
     #[test]
@@ -1033,7 +1125,11 @@ mod tests {
         let idx = sch.index_of("p_brand").unwrap();
         let mut in_q22_range = 0usize;
         for b in &batches {
-            let col = b.column(idx).as_any().downcast_ref::<StringArray>().unwrap();
+            let col = b
+                .column(idx)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
             for i in 0..col.len() {
                 let v = col.value(i);
                 assert_eq!(v.len(), 9, "brand must be MFGR#mcnn, got '{v}'");
@@ -1042,7 +1138,10 @@ mod tests {
                 let c: u32 = digits[1..2].parse().unwrap();
                 let nn: u32 = digits[2..4].parse().unwrap();
                 assert!((1..=5).contains(&m) && (1..=5).contains(&c));
-                assert!((1..=40).contains(&nn), "brand number {nn} outside 01..40 in '{v}'");
+                assert!(
+                    (1..=40).contains(&nn),
+                    "brand number {nn} outside 01..40 in '{v}'"
+                );
                 if ("MFGR#2221".."MFGR#2229").contains(&v) {
                     in_q22_range += 1;
                 }
@@ -1061,8 +1160,16 @@ mod tests {
         let ym_idx = sch.index_of("d_yearmonth").unwrap();
         let mut dec_1997_rows = 0usize;
         for b in &batches {
-            let keys = b.column(key_idx).as_any().downcast_ref::<Int32Array>().unwrap();
-            let yms = b.column(ym_idx).as_any().downcast_ref::<StringArray>().unwrap();
+            let keys = b
+                .column(key_idx)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            let yms = b
+                .column(ym_idx)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
             for i in 0..keys.len() {
                 let v = yms.value(i);
                 assert_eq!(v.len(), 7, "d_yearmonth must be MonYYYY, got '{v}'");
@@ -1084,16 +1191,27 @@ mod tests {
         let idx = sch.index_of("c_city").unwrap();
         let mut united_ki = false;
         for b in &batches {
-            let col = b.column(idx).as_any().downcast_ref::<StringArray>().unwrap();
+            let col = b
+                .column(idx)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
             for i in 0..col.len() {
                 let v = col.value(i);
-                assert_eq!(v.chars().count(), 10, "city must be exactly 10 chars, got '{v}'");
+                assert_eq!(
+                    v.chars().count(),
+                    10,
+                    "city must be exactly 10 chars, got '{v}'"
+                );
                 assert!(v.chars().last().unwrap().is_ascii_digit());
                 if v.starts_with("UNITED KI") {
                     united_ki = true;
                 }
             }
         }
-        assert!(united_ki, "no 'UNITED KI*' city generated; q3.3/q3.4 stay vacuous");
+        assert!(
+            united_ki,
+            "no 'UNITED KI*' city generated; q3.3/q3.4 stay vacuous"
+        );
     }
 }

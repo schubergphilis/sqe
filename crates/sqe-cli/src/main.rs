@@ -283,7 +283,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             Protocol::Http => {
                 let url = format!("{scheme}://{}:{}", cli.host, cli.port);
-                Box::new(http::HttpClient::new(&url, &username, &password, cli.insecure))
+                Box::new(http::HttpClient::new(
+                    &url,
+                    &username,
+                    &password,
+                    cli.insecure,
+                ))
             }
         }
     };
@@ -363,9 +368,7 @@ async fn run_script(
                     );
                     failures += 1;
                     if stop_on_error {
-                        return Err(
-                            format!("aborted after statement {}", idx + 1).into()
-                        );
+                        return Err(format!("aborted after statement {}", idx + 1).into());
                     }
                 }
                 Ok(cmd) => {
@@ -436,13 +439,7 @@ async fn repl(
                     if let Some(parsed) = dotcommands::parse_dot_command(trimmed) {
                         match parsed {
                             Ok(cmd) => {
-                                if handle_dot_command(
-                                    cmd,
-                                    client,
-                                    &mut format,
-                                    &mut timer_on,
-                                )
-                                .await
+                                if handle_dot_command(cmd, client, &mut format, &mut timer_on).await
                                 {
                                     break;
                                 }
@@ -476,7 +473,14 @@ async fn repl(
                         .trim_end_matches(';')
                         .trim()
                         .strip_prefix("SET FORMAT")
-                        .map(|s| s.trim().trim_start_matches('=').trim().trim_matches('\'').trim_matches('"').to_ascii_lowercase());
+                        .map(|s| {
+                            s.trim()
+                                .trim_start_matches('=')
+                                .trim()
+                                .trim_matches('\'')
+                                .trim_matches('"')
+                                .to_ascii_lowercase()
+                        });
                     if let Some(val) = stripped {
                         if let Some(f) = OutputFormat::from_str(&val) {
                             format = f;
@@ -501,8 +505,7 @@ async fn repl(
                 }
             }
             Err(
-                rustyline::error::ReadlineError::Interrupted
-                | rustyline::error::ReadlineError::Eof,
+                rustyline::error::ReadlineError::Interrupted | rustyline::error::ReadlineError::Eof,
             ) => {
                 break;
             }
@@ -520,12 +523,7 @@ async fn repl(
 /// Run one SQL statement and print the result. Wraps the existing
 /// `client.execute` + display call so the REPL and the dot-command
 /// path can share the timer logic.
-async fn run_one(
-    client: &mut dyn SqlClient,
-    sql: &str,
-    format: &OutputFormat,
-    timer_on: bool,
-) {
+async fn run_one(client: &mut dyn SqlClient, sql: &str, format: &OutputFormat, timer_on: bool) {
     let start = std::time::Instant::now();
     match client.execute(sql).await {
         Ok(result) => {

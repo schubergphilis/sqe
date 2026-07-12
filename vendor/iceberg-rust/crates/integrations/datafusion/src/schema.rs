@@ -128,7 +128,6 @@ impl IcebergSchemaProvider {
 
 #[async_trait]
 impl SchemaProvider for IcebergSchemaProvider {
-
     fn table_names(&self) -> Vec<String> {
         self.tables
             .iter()
@@ -226,10 +225,13 @@ impl SchemaProvider for IcebergSchemaProvider {
                 .map_err(to_datafusion_error)?;
 
             // Create a new table provider using the catalog reference
-            let table_provider =
-                IcebergTableProvider::try_new(catalog.clone(), namespace.clone(), name_clone.clone())
-                    .await
-                    .map_err(to_datafusion_error)?;
+            let table_provider = IcebergTableProvider::try_new(
+                catalog.clone(),
+                namespace.clone(),
+                name_clone.clone(),
+            )
+            .await
+            .map_err(to_datafusion_error)?;
 
             // Store the new table provider
             tables.insert(name_clone, Arc::new(table_provider));
@@ -352,10 +354,13 @@ mod tests {
             Field::new("name", DataType::Utf8, true),
         ]));
 
-        let batch = RecordBatch::try_new(arrow_schema.clone(), vec![
-            Arc::new(Int32Array::from(vec![1, 2, 3])),
-            Arc::new(StringArray::from(vec!["Alice", "Bob", "Charlie"])),
-        ])
+        let batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(StringArray::from(vec!["Alice", "Bob", "Charlie"])),
+            ],
+        )
         .unwrap();
 
         let mem_table = MemTable::try_new(arrow_schema, vec![vec![batch]]).unwrap();

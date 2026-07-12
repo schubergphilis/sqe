@@ -23,7 +23,6 @@
 //! belt-and-braces measure against the in-memory Polaris's eventual
 //! consistency rather than a strict requirement.
 
-
 use arrow_array::{Array, Int64Array};
 
 /// Helper: count live data files for a table via the SQE TVF.
@@ -36,7 +35,9 @@ async fn live_data_file_count(
     let batches = handler
         .execute(
             session,
-            &format!("SELECT COUNT(*) FROM table_files('{namespace}', '{table}')"), None)
+            &format!("SELECT COUNT(*) FROM table_files('{namespace}', '{table}')"),
+            None,
+        )
         .await
         .expect("table_files scan");
     batches[0]
@@ -57,9 +58,9 @@ async fn snapshot_count(
     let batches = handler
         .execute(
             session,
-            &format!(
-                "SELECT COUNT(*) FROM table_snapshots('{namespace}', '{table}')"
-            ), None)
+            &format!("SELECT COUNT(*) FROM table_snapshots('{namespace}', '{table}')"),
+            None,
+        )
         .await
         .expect("table_snapshots scan");
     batches[0]
@@ -104,7 +105,9 @@ async fn assert_format_version_is_v3(
             &format!(
                 "SELECT * FROM table_snapshots('{namespace}', '{table_name}') \
                  LIMIT 1"
-            ), None)
+            ),
+            None,
+        )
         .await
         .expect("table_snapshots scan");
     // The TVF itself does not surface format-version yet; instead we
@@ -114,7 +117,9 @@ async fn assert_format_version_is_v3(
     let batches = handler
         .execute(
             session,
-            &format!("SHOW STATS FOR {namespace}.{table_name}"), None)
+            &format!("SHOW STATS FOR {namespace}.{table_name}"),
+            None,
+        )
         .await
         .expect("show stats");
     // SHOW STATS returns one row per column. Every V3 table emits
@@ -212,7 +217,9 @@ async fn insert_then_select_round_trips_v3_table() {
                 "INSERT INTO {fq} VALUES \
                  (1, TIMESTAMP '2026-04-26 10:00:00.123456789'), \
                  (2, TIMESTAMP '2026-04-26 10:00:01.987654321')"
-            ), None)
+            ),
+            None,
+        )
         .await
         .expect("INSERT");
 
@@ -263,16 +270,18 @@ async fn alter_add_column_with_default_on_v3_table() {
     handler
         .execute(
             &session,
-            &format!(
-                "INSERT INTO {fq} VALUES (1, TIMESTAMP '2026-04-26 10:00:00')"
-            ), None)
+            &format!("INSERT INTO {fq} VALUES (1, TIMESTAMP '2026-04-26 10:00:00')"),
+            None,
+        )
         .await
         .expect("INSERT pre-evolution");
 
     handler
         .execute(
             &session,
-            &format!("ALTER TABLE {fq} ADD COLUMN region STRING DEFAULT 'eu'"), None)
+            &format!("ALTER TABLE {fq} ADD COLUMN region STRING DEFAULT 'eu'"),
+            None,
+        )
         .await
         .expect("ALTER ADD COLUMN DEFAULT");
 
@@ -287,7 +296,9 @@ async fn alter_add_column_with_default_on_v3_table() {
                 "SELECT column_name FROM information_schema.columns \
                  WHERE table_schema = '{ns}' AND table_name = '{name}' \
                  AND column_name = 'region'"
-            ), None)
+            ),
+            None,
+        )
         .await
         .expect("information_schema.columns lookup");
     let total: i64 = cols.iter().map(|b| b.num_rows() as i64).sum();
@@ -328,7 +339,9 @@ async fn delete_cow_on_v3_table_drops_row() {
                 &format!(
                     "INSERT INTO {fq} VALUES \
                      ({i}, TIMESTAMP '2026-04-26 10:00:00.{i:09}')"
-                ), None)
+                ),
+                None,
+            )
             .await
             .expect("INSERT");
     }
@@ -383,7 +396,9 @@ async fn position_deletes_on_v3_table() {
                 &format!(
                     "INSERT INTO {fq} VALUES \
                      ({i}, TIMESTAMP '2026-04-26 10:00:00.{i:09}')"
-                ), None)
+                ),
+                None,
+            )
             .await
             .expect("INSERT");
     }
@@ -453,13 +468,19 @@ async fn equality_delete_update_on_v3_table() {
                 &format!(
                     "INSERT INTO {fq} VALUES \
                      ({i}, TIMESTAMP '2026-04-26 10:00:00.{i:09}', {i})"
-                ), None)
+                ),
+                None,
+            )
             .await
             .expect("INSERT");
     }
 
     handler
-        .execute(&session, &format!("UPDATE {fq} SET v = 99 WHERE id = 1"), None)
+        .execute(
+            &session,
+            &format!("UPDATE {fq} SET v = 99 WHERE id = 1"),
+            None,
+        )
         .await
         .expect("UPDATE MoR equality");
 
@@ -504,18 +525,16 @@ async fn merge_into_on_v3_table() {
         &handler,
         &session,
         &fq,
-        &format!(
-            "CREATE TABLE {fq} (id BIGINT, ts TIMESTAMP_NS(9), v BIGINT)"
-        ),
+        &format!("CREATE TABLE {fq} (id BIGINT, ts TIMESTAMP_NS(9), v BIGINT)"),
     )
     .await;
 
     handler
         .execute(
             &session,
-            &format!(
-                "INSERT INTO {fq} VALUES (1, TIMESTAMP '2026-04-26 10:00:00', 10)"
-            ), None)
+            &format!("INSERT INTO {fq} VALUES (1, TIMESTAMP '2026-04-26 10:00:00', 10)"),
+            None,
+        )
         .await
         .expect("seed INSERT");
 
@@ -530,7 +549,9 @@ async fn merge_into_on_v3_table() {
                  ON t.id = src.id \
                  WHEN MATCHED THEN UPDATE SET v = src.v \
                  WHEN NOT MATCHED THEN INSERT (id, ts, v) VALUES (src.id, src.ts, src.v)"
-            ), None)
+            ),
+            None,
+        )
         .await
         .expect("MERGE INTO");
 
@@ -601,7 +622,9 @@ async fn time_travel_on_v3_table() {
                 &format!(
                     "INSERT INTO {fq} VALUES \
                      ({i}, TIMESTAMP '2026-04-26 10:00:00.{i:09}')"
-                ), None)
+                ),
+                None,
+            )
             .await
             .expect("INSERT");
     }
@@ -663,9 +686,9 @@ async fn bloom_filter_property_round_trips_on_v3_table() {
     handler
         .execute(
             &session,
-            &format!(
-                "INSERT INTO {fq} VALUES (1, TIMESTAMP '2026-04-26 10:00:00')"
-            ), None)
+            &format!("INSERT INTO {fq} VALUES (1, TIMESTAMP '2026-04-26 10:00:00')"),
+            None,
+        )
         .await
         .expect("INSERT");
 
@@ -725,7 +748,9 @@ async fn rewrite_data_files_on_v3_table() {
                 &format!(
                     "INSERT INTO {fq} VALUES \
                      ({i}, TIMESTAMP '2026-04-26 10:00:00.{i:09}')"
-                ), None)
+                ),
+                None,
+            )
             .await
             .expect("INSERT");
     }
@@ -736,7 +761,9 @@ async fn rewrite_data_files_on_v3_table() {
     handler
         .execute(
             &session,
-            &format!("CALL system.rewrite_data_files(table => '{fq}')"), None)
+            &format!("CALL system.rewrite_data_files(table => '{fq}')"),
+            None,
+        )
         .await
         .expect("rewrite_data_files");
 
@@ -783,7 +810,9 @@ async fn for_version_as_of_on_v3_table() {
     handler
         .execute(
             &session,
-            &format!("INSERT INTO {fq} VALUES (1, TIMESTAMP '2026-04-26 10:00:00')"), None)
+            &format!("INSERT INTO {fq} VALUES (1, TIMESTAMP '2026-04-26 10:00:00')"),
+            None,
+        )
         .await
         .expect("INSERT 1");
 
@@ -794,7 +823,9 @@ async fn for_version_as_of_on_v3_table() {
             &format!(
                 "SELECT snapshot_id FROM table_snapshots('{ns}', '{name}') \
                  WHERE is_current_snapshot = TRUE"
-            ), None)
+            ),
+            None,
+        )
         .await
         .expect("snapshot_id pin");
     let pin_snap = pin_batches[0]
@@ -807,7 +838,9 @@ async fn for_version_as_of_on_v3_table() {
     handler
         .execute(
             &session,
-            &format!("INSERT INTO {fq} VALUES (2, TIMESTAMP '2026-04-26 10:01:00')"), None)
+            &format!("INSERT INTO {fq} VALUES (2, TIMESTAMP '2026-04-26 10:01:00')"),
+            None,
+        )
         .await
         .expect("INSERT 2");
 
@@ -817,9 +850,9 @@ async fn for_version_as_of_on_v3_table() {
     let pinned_batches = handler
         .execute(
             &session,
-            &format!(
-                "SELECT COUNT(*) FROM {fq} FOR VERSION AS OF {pin_snap}"
-            ), None)
+            &format!("SELECT COUNT(*) FROM {fq} FOR VERSION AS OF {pin_snap}"),
+            None,
+        )
         .await
         .expect("FOR VERSION AS OF query");
     let pinned_count = pinned_batches[0]
@@ -863,20 +896,26 @@ async fn cdc_incremental_scan_on_v3_table() {
     handler
         .execute(
             &session,
-            &format!("INSERT INTO {fq} VALUES (1, TIMESTAMP '2026-04-26 10:00:00')"), None)
+            &format!("INSERT INTO {fq} VALUES (1, TIMESTAMP '2026-04-26 10:00:00')"),
+            None,
+        )
         .await
         .expect("INSERT 1");
 
     handler
         .execute(
             &session,
-            &format!("INSERT INTO {fq} VALUES (2, TIMESTAMP '2026-04-26 10:01:00')"), None)
+            &format!("INSERT INTO {fq} VALUES (2, TIMESTAMP '2026-04-26 10:01:00')"),
+            None,
+        )
         .await
         .expect("INSERT 2");
     handler
         .execute(
             &session,
-            &format!("INSERT INTO {fq} VALUES (3, TIMESTAMP '2026-04-26 10:02:00')"), None)
+            &format!("INSERT INTO {fq} VALUES (3, TIMESTAMP '2026-04-26 10:02:00')"),
+            None,
+        )
         .await
         .expect("INSERT 3");
 
@@ -892,7 +931,9 @@ async fn cdc_incremental_scan_on_v3_table() {
             &format!(
                 "SELECT snapshot_id FROM table_snapshots('{ns}', '{name}') \
                  ORDER BY sequence_number DESC LIMIT 1"
-            ), None)
+            ),
+            None,
+        )
         .await
         .expect("end snapshot id");
     let end_snap = end_batches[0]
@@ -908,7 +949,9 @@ async fn cdc_incremental_scan_on_v3_table() {
             &format!(
                 "SELECT COUNT(*) FROM {fq} \
                  FOR INCREMENTAL BETWEEN SNAPSHOT 0 AND SNAPSHOT {end_snap}"
-            ), None)
+            ),
+            None,
+        )
         .await
         .expect("CDC scan");
     let delta_count = cdc_batches[0]
@@ -953,7 +996,9 @@ async fn type_promotion_int_to_bigint_on_v3_table() {
     handler
         .execute(
             &session,
-            &format!("ALTER TABLE {fq} ALTER COLUMN id SET DATA TYPE BIGINT"), None)
+            &format!("ALTER TABLE {fq} ALTER COLUMN id SET DATA TYPE BIGINT"),
+            None,
+        )
         .await
         .expect("ALTER COLUMN type promotion");
 
@@ -964,7 +1009,9 @@ async fn type_promotion_int_to_bigint_on_v3_table() {
                 "SELECT data_type FROM information_schema.columns \
                  WHERE table_schema = '{ns}' AND table_name = '{name}' \
                  AND column_name = 'id'"
-            ), None)
+            ),
+            None,
+        )
         .await
         .expect("information_schema lookup after promotion");
     let dtype = cols[0]
@@ -1011,7 +1058,9 @@ async fn statistics_on_v3_table() {
                 &format!(
                     "INSERT INTO {fq} VALUES \
                      ({i}, TIMESTAMP '2026-04-26 10:00:00.{i:09}')"
-                ), None)
+                ),
+                None,
+            )
             .await
             .expect("INSERT");
     }

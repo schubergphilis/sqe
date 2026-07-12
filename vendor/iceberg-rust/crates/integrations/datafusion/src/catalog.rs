@@ -83,7 +83,6 @@ impl IcebergCatalogProvider {
 }
 
 impl CatalogProvider for IcebergCatalogProvider {
-
     fn schema_names(&self) -> Vec<String> {
         self.schemas.keys().cloned().collect()
     }

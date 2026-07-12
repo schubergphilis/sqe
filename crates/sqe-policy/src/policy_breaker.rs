@@ -30,7 +30,11 @@ pub(crate) struct PolicyCircuitBreaker {
 }
 
 impl PolicyCircuitBreaker {
-    pub(crate) fn new(name: &'static str, failure_threshold: u32, recovery_timeout: Duration) -> Self {
+    pub(crate) fn new(
+        name: &'static str,
+        failure_threshold: u32,
+        recovery_timeout: Duration,
+    ) -> Self {
         Self {
             name,
             failure_count: AtomicU32::new(0),
@@ -60,7 +64,10 @@ impl PolicyCircuitBreaker {
                         )
                         .is_ok()
                 {
-                    info!("{} circuit breaker moving to half_open (probe allowed)", self.name);
+                    info!(
+                        "{} circuit breaker moving to half_open (probe allowed)",
+                        self.name
+                    );
                     return Ok(());
                 }
                 Err(format!("{} circuit breaker is open", self.name))
@@ -81,7 +88,10 @@ impl PolicyCircuitBreaker {
         if self.state.load(Ordering::Acquire) != STATE_CLOSED {
             self.state.store(STATE_CLOSED, Ordering::Release);
             self.failure_count.store(0, Ordering::Release);
-            info!("{} circuit breaker closed after successful probe", self.name);
+            info!(
+                "{} circuit breaker closed after successful probe",
+                self.name
+            );
         } else {
             self.failure_count.store(0, Ordering::Relaxed);
         }
@@ -93,7 +103,12 @@ impl PolicyCircuitBreaker {
         if count >= self.failure_threshold
             && self
                 .state
-                .compare_exchange(STATE_CLOSED, STATE_OPEN, Ordering::AcqRel, Ordering::Acquire)
+                .compare_exchange(
+                    STATE_CLOSED,
+                    STATE_OPEN,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
                 .is_ok()
         {
             warn!(
@@ -168,7 +183,7 @@ mod tests {
     fn half_open_probe_failure_reopens() {
         let b = PolicyCircuitBreaker::new("Test", 1, std::time::Duration::from_millis(0));
         b.record_failure(); // opens
-        let _ = b.check();  // -> half_open
+        let _ = b.check(); // -> half_open
         assert_eq!(b.state_code(), 1);
         b.record_failure(); // probe fails -> reopen
         assert_eq!(b.state_code(), 2);
@@ -178,21 +193,24 @@ mod tests {
     fn half_open_admits_only_the_cas_winner() {
         let b = PolicyCircuitBreaker::new("Test", 1, std::time::Duration::from_millis(0));
         b.record_failure(); // opens
-        // First check after recovery elapses wins the OPEN->HALF_OPEN CAS and
-        // is the single admitted probe.
+                            // First check after recovery elapses wins the OPEN->HALF_OPEN CAS and
+                            // is the single admitted probe.
         assert!(b.check().is_ok(), "CAS winner must be admitted");
         assert_eq!(b.state_code(), 1, "now half-open");
         // Every subsequent caller while half-open is denied (no thundering herd
         // of probes) and stays fail-closed until the probe resolves.
-        assert!(b.check().is_err(), "second concurrent caller must be denied");
+        assert!(
+            b.check().is_err(),
+            "second concurrent caller must be denied"
+        );
         assert!(b.check().is_err(), "third concurrent caller must be denied");
         assert_eq!(b.state_code(), 1, "still half-open, probe still in flight");
     }
 
     #[test]
     fn half_open_concurrent_callers_only_one_ok() {
-        use std::sync::Arc;
         use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Arc;
 
         let b = Arc::new(PolicyCircuitBreaker::new(
             "Test",

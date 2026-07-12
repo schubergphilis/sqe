@@ -45,7 +45,9 @@ async fn eval_i64(sql: &str) -> Option<i64> {
     if col.is_null(0) {
         return None;
     }
-    col.as_any().downcast_ref::<Int64Array>().map(|a| a.value(0))
+    col.as_any()
+        .downcast_ref::<Int64Array>()
+        .map(|a| a.value(0))
 }
 
 /// Execute SQL and return the first column of the first row as f64.
@@ -140,22 +142,19 @@ async fn test_day_of_year() {
 #[tokio::test]
 async fn test_hour() {
     // Use TimestampMicrosecond explicitly via CAST to microsecond precision
-    let v =
-        eval_i64("SELECT hour(CAST('2024-03-15 14:30:00' AS TIMESTAMP(6)))").await;
+    let v = eval_i64("SELECT hour(CAST('2024-03-15 14:30:00' AS TIMESTAMP(6)))").await;
     assert_eq!(v, Some(14));
 }
 
 #[tokio::test]
 async fn test_minute() {
-    let v =
-        eval_i64("SELECT minute(CAST('2024-03-15 14:30:00' AS TIMESTAMP(6)))").await;
+    let v = eval_i64("SELECT minute(CAST('2024-03-15 14:30:00' AS TIMESTAMP(6)))").await;
     assert_eq!(v, Some(30));
 }
 
 #[tokio::test]
 async fn test_second() {
-    let v =
-        eval_i64("SELECT second(CAST('2024-03-15 14:30:45' AS TIMESTAMP(6)))").await;
+    let v = eval_i64("SELECT second(CAST('2024-03-15 14:30:45' AS TIMESTAMP(6)))").await;
     assert_eq!(v, Some(45));
 }
 
@@ -168,10 +167,9 @@ async fn test_date_diff() {
     // Use DATE (Date32) inputs — date_diff handles Date32 and TimestampMicrosecond.
     // CAST(... AS TIMESTAMP) in DataFusion produces TimestampNanosecond, which is
     // not supported; use CAST(... AS DATE) for the day-level diff case.
-    let v = eval_i64(
-        "SELECT date_diff('day', CAST('2024-01-01' AS DATE), CAST('2024-01-10' AS DATE))",
-    )
-    .await;
+    let v =
+        eval_i64("SELECT date_diff('day', CAST('2024-01-01' AS DATE), CAST('2024-01-10' AS DATE))")
+            .await;
     assert_eq!(v, Some(9));
 }
 
@@ -204,10 +202,8 @@ async fn test_typeof() {
 
 #[tokio::test]
 async fn test_date_format() {
-    let v = eval_str(
-        "SELECT date_format(CAST('2024-03-15 14:30:00' AS TIMESTAMP), '%Y-%m-%d')",
-    )
-    .await;
+    let v =
+        eval_str("SELECT date_format(CAST('2024-03-15 14:30:00' AS TIMESTAMP), '%Y-%m-%d')").await;
     assert_eq!(v, Some("2024-03-15".to_string()));
 }
 
@@ -217,17 +213,14 @@ async fn test_date_format() {
 
 #[tokio::test]
 async fn test_json_extract() {
-    let v =
-        eval_str(r#"SELECT json_extract('{"name":"alice","age":30}', '$.name')"#).await;
+    let v = eval_str(r#"SELECT json_extract('{"name":"alice","age":30}', '$.name')"#).await;
     assert!(v.is_some(), "json_extract returned None");
     assert!(v.unwrap().contains("alice"), "Expected 'alice' in result");
 }
 
 #[tokio::test]
 async fn test_json_extract_scalar() {
-    let v =
-        eval_str(r#"SELECT json_extract_scalar('{"name":"alice","age":30}', '$.name')"#)
-            .await;
+    let v = eval_str(r#"SELECT json_extract_scalar('{"name":"alice","age":30}', '$.name')"#).await;
     assert_eq!(v, Some("alice".to_string()));
 }
 
@@ -298,22 +291,19 @@ async fn test_json_array_get_negative_index() {
 
 #[tokio::test]
 async fn test_url_extract_host() {
-    let v =
-        eval_str("SELECT url_extract_host('https://example.com:8080/path?q=1')").await;
+    let v = eval_str("SELECT url_extract_host('https://example.com:8080/path?q=1')").await;
     assert_eq!(v, Some("example.com".to_string()));
 }
 
 #[tokio::test]
 async fn test_url_extract_port() {
-    let v =
-        eval_str("SELECT url_extract_port('https://example.com:8080/path')").await;
+    let v = eval_str("SELECT url_extract_port('https://example.com:8080/path')").await;
     assert_eq!(v, Some("8080".to_string()));
 }
 
 #[tokio::test]
 async fn test_url_extract_path() {
-    let v =
-        eval_str("SELECT url_extract_path('https://example.com/some/path')").await;
+    let v = eval_str("SELECT url_extract_path('https://example.com/some/path')").await;
     assert_eq!(v, Some("/some/path".to_string()));
 }
 
@@ -325,17 +315,15 @@ async fn test_url_extract_protocol() {
 
 #[tokio::test]
 async fn test_url_extract_query() {
-    let v =
-        eval_str("SELECT url_extract_query('https://example.com?foo=bar&baz=1')").await;
+    let v = eval_str("SELECT url_extract_query('https://example.com?foo=bar&baz=1')").await;
     assert_eq!(v, Some("foo=bar&baz=1".to_string()));
 }
 
 #[tokio::test]
 async fn test_url_extract_parameter() {
-    let v = eval_str(
-        "SELECT url_extract_parameter('https://example.com?name=alice&age=30', 'name')",
-    )
-    .await;
+    let v =
+        eval_str("SELECT url_extract_parameter('https://example.com?name=alice&age=30', 'name')")
+            .await;
     assert_eq!(v, Some("alice".to_string()));
 }
 
@@ -417,7 +405,10 @@ async fn test_hamming_distance() {
 async fn test_normalize_nfc() {
     let v = eval_str("SELECT normalize('café', 'NFC')").await;
     assert!(v.is_some(), "normalize returned None");
-    assert!(v.unwrap().contains("caf"), "Expected 'café' or normalised form");
+    assert!(
+        v.unwrap().contains("caf"),
+        "Expected 'café' or normalised form"
+    );
 }
 
 #[tokio::test]
@@ -488,7 +479,10 @@ async fn test_from_iso8601_date() {
     let result = ctx.sql("SELECT from_iso8601_date('2024-03-15')").await;
     assert!(result.is_ok(), "from_iso8601_date failed: {result:?}");
     let batches = result.unwrap().collect().await;
-    assert!(batches.is_ok(), "from_iso8601_date collect failed: {batches:?}");
+    assert!(
+        batches.is_ok(),
+        "from_iso8601_date collect failed: {batches:?}"
+    );
 }
 
 #[tokio::test]
@@ -505,16 +499,13 @@ async fn test_current_timezone() {
 
 #[tokio::test]
 async fn test_timezone_hour_utc() {
-    let v =
-        eval_i64("SELECT timezone_hour(CAST('2024-03-15 14:30:00' AS TIMESTAMP))").await;
+    let v = eval_i64("SELECT timezone_hour(CAST('2024-03-15 14:30:00' AS TIMESTAMP))").await;
     assert_eq!(v, Some(0)); // UTC → offset hours = 0
 }
 
 #[tokio::test]
 async fn test_timezone_minute_utc() {
-    let v =
-        eval_i64("SELECT timezone_minute(CAST('2024-03-15 14:30:00' AS TIMESTAMP))")
-            .await;
+    let v = eval_i64("SELECT timezone_minute(CAST('2024-03-15 14:30:00' AS TIMESTAMP))").await;
     assert_eq!(v, Some(0)); // UTC → offset minutes = 0
 }
 
@@ -585,9 +576,7 @@ async fn test_width_bucket_builtin() {
     // will fail with an "Invalid function" error. When DataFusion adds it,
     // this test should be updated to verify correctness.
     let ctx = ctx().await;
-    let result = ctx
-        .sql("SELECT width_bucket(5.0, 0.0, 10.0, 5)")
-        .await;
+    let result = ctx.sql("SELECT width_bucket(5.0, 0.0, 10.0, 5)").await;
     // Expect parse/plan error since width_bucket is not registered
     assert!(
         result.is_err(),
@@ -620,7 +609,10 @@ async fn test_strpos_builtin() {
     let v = eval_str("SELECT CAST(strpos('hello world', 'world') AS VARCHAR)").await;
     assert!(v.is_some(), "strpos built-in returned None");
     let pos: i64 = v.unwrap().parse().expect("strpos result should be numeric");
-    assert!(pos > 0, "strpos should return positive 1-based position, got {pos}");
+    assert!(
+        pos > 0,
+        "strpos should return positive 1-based position, got {pos}"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -693,7 +685,10 @@ async fn test_to_json_string_with_quotes() {
     assert!(v.is_some(), "to_json returned None for string with quotes");
     let s = v.unwrap();
     // The result should be a valid JSON string with escaped inner quotes
-    assert!(s.starts_with('"'), "Expected JSON string to start with quote");
+    assert!(
+        s.starts_with('"'),
+        "Expected JSON string to start with quote"
+    );
     assert!(s.ends_with('"'), "Expected JSON string to end with quote");
 }
 
@@ -702,7 +697,10 @@ async fn test_to_json_float() {
     let v = eval_str("SELECT to_json(3.14)").await;
     assert!(v.is_some(), "to_json returned None for float");
     let s = v.unwrap();
-    assert!(s.contains("3.14"), "Expected '3.14' in to_json output, got: {s}");
+    assert!(
+        s.contains("3.14"),
+        "Expected '3.14' in to_json output, got: {s}"
+    );
 }
 
 // ─── Trino aliases batch (split, regex array returns, aggregates) ─────────
@@ -755,12 +753,17 @@ async fn test_regexp_extract_all_invalid_pattern_errors() {
     // Trino errors on invalid regex; confirm we surface the error rather
     // than silently returning NULL.
     let ctx = ctx().await;
-    let res = ctx.sql(r#"SELECT regexp_extract_all('x', '[unclosed')"#).await;
+    let res = ctx
+        .sql(r#"SELECT regexp_extract_all('x', '[unclosed')"#)
+        .await;
     let failed = match res {
         Err(_) => true,
         Ok(plan) => plan.collect().await.is_err(),
     };
-    assert!(failed, "regexp_extract_all with invalid pattern should error");
+    assert!(
+        failed,
+        "regexp_extract_all with invalid pattern should error"
+    );
 }
 
 #[tokio::test]
@@ -969,7 +972,10 @@ async fn test_variance_alias_resolves_to_var_samp() {
         .unwrap()
         .parse()
         .expect("var_samp result must parse as f64");
-    assert!((variance - 2.5).abs() < 1e-9, "variance([1..5]) should be 2.5, got {variance}");
+    assert!(
+        (variance - 2.5).abs() < 1e-9,
+        "variance([1..5]) should be 2.5, got {variance}"
+    );
     assert!(
         (variance - var_samp).abs() < 1e-9,
         "variance must equal var_samp ({variance} vs {var_samp})"
@@ -1022,7 +1028,9 @@ async fn test_approx_percentile_alias() {
         .expect("approx_percentile parse");
     let batches = df.collect().await.expect("approx_percentile execute");
     let s = array_value_to_string(batches[0].column(0), 0).unwrap();
-    let parsed: f64 = s.parse().expect("approx_percentile result must parse as f64");
+    let parsed: f64 = s
+        .parse()
+        .expect("approx_percentile result must parse as f64");
     assert!(
         (4.0..=6.0).contains(&parsed),
         "approx_percentile median should land near 5, got {parsed}"
@@ -1094,8 +1102,14 @@ async fn test_histogram_with_group_by() {
     let us_h = array_value_to_string(batches[0].column(1), 1).unwrap();
     assert!(eu_h.contains("shipped"), "EU should have shipped: {eu_h}");
     assert!(eu_h.contains("pending"), "EU should have pending: {eu_h}");
-    assert!(us_h.contains("cancelled"), "US should have cancelled: {us_h}");
-    assert!(!us_h.contains("shipped"), "US should not see EU values: {us_h}");
+    assert!(
+        us_h.contains("cancelled"),
+        "US should have cancelled: {us_h}"
+    );
+    assert!(
+        !us_h.contains("shipped"),
+        "US should not see EU values: {us_h}"
+    );
 }
 
 #[tokio::test]
@@ -1112,7 +1126,10 @@ async fn test_histogram_integer_keys() {
     let s = array_value_to_string(batches[0].column(0), 0).unwrap();
     // Count: 1->3, 2->2, 3->1.
     assert!(s.contains('1'), "histogram should contain key 1: {s}");
-    assert!(s.contains('2'), "histogram should contain key 2 / count: {s}");
+    assert!(
+        s.contains('2'),
+        "histogram should contain key 2 / count: {s}"
+    );
     assert!(s.contains('3'), "histogram should contain key 3: {s}");
 }
 
@@ -1151,7 +1168,10 @@ async fn test_map_agg_last_wins_on_duplicate_key() {
     let batches = df.collect().await.expect("map_agg dup execute");
     let s = array_value_to_string(batches[0].column(0), 0).unwrap();
     assert!(s.contains("99"), "last-wins value 99 missing: {s}");
-    assert!(!s.contains('1') || s.contains("99"), "first-write 1 should not appear without 99: {s}");
+    assert!(
+        !s.contains('1') || s.contains("99"),
+        "first-write 1 should not appear without 99: {s}"
+    );
 }
 
 #[tokio::test]
@@ -1224,7 +1244,10 @@ async fn test_map_agg_with_group_by() {
     let us_m = array_value_to_string(batches[0].column(1), 1).unwrap();
     assert!(eu_m.contains("k1") && eu_m.contains("k2"));
     assert!(us_m.contains("k3"));
-    assert!(!us_m.contains("k1"), "US map should not see EU keys: {us_m}");
+    assert!(
+        !us_m.contains("k1"),
+        "US map should not see EU keys: {us_m}"
+    );
 }
 
 // ─── Audit safety regressions (SQL-02 / SQL-03 / SQL-04) ─────────────────
@@ -1259,7 +1282,10 @@ async fn to_base_rejects_out_of_range_radix() {
     assert!(exec_errors("SELECT to_base(5, 1)").await);
     assert!(exec_errors("SELECT to_base(5, 40)").await);
     // A valid radix still works.
-    assert_eq!(eval_str("SELECT to_base(255, 16)").await.as_deref(), Some("ff"));
+    assert_eq!(
+        eval_str("SELECT to_base(255, 16)").await.as_deref(),
+        Some("ff")
+    );
 }
 
 #[tokio::test]
@@ -1268,7 +1294,10 @@ async fn from_hex_handles_non_ascii_without_panicking() {
     // It must now complete (returning some string) without aborting.
     assert!(!exec_errors("SELECT from_hex('café')").await);
     // The ASCII happy path is preserved: '41' hex -> 'A'.
-    assert_eq!(eval_str("SELECT from_hex('41')").await.as_deref(), Some("A"));
+    assert_eq!(
+        eval_str("SELECT from_hex('41')").await.as_deref(),
+        Some("A")
+    );
 }
 
 #[tokio::test]

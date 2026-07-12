@@ -103,7 +103,10 @@ impl std::fmt::Debug for Secret {
             Self::Basic { username, password } => f
                 .debug_struct("Secret::Basic")
                 .field("username", username)
-                .field("password", &if password.is_empty() { "None" } else { "<set>" })
+                .field(
+                    "password",
+                    &if password.is_empty() { "None" } else { "<set>" },
+                )
                 .finish(),
         }
     }
@@ -178,11 +181,7 @@ impl SecretStore {
 
     /// Drop a secret. Errors if the secret does not exist or if any
     /// catalog in `in_use_by` references it.
-    pub fn drop_secret(
-        &self,
-        name: &str,
-        in_use_by: &[String],
-    ) -> Result<(), SecretStoreError> {
+    pub fn drop_secret(&self, name: &str, in_use_by: &[String]) -> Result<(), SecretStoreError> {
         if !in_use_by.is_empty() {
             return Err(SecretStoreError::InUseBy(
                 name.to_string(),
@@ -273,9 +272,18 @@ mod tests {
             profile: Some("prod".to_string()),
         };
         let d = format!("{:?}", s);
-        assert!(!d.contains("AKIAEXAMPLEXXXXXXXXX"), "access_key leaked: {d}");
-        assert!(!d.contains("supersecret-key-value"), "secret_key leaked: {d}");
-        assert!(!d.contains("session-token-payload"), "session_token leaked: {d}");
+        assert!(
+            !d.contains("AKIAEXAMPLEXXXXXXXXX"),
+            "access_key leaked: {d}"
+        );
+        assert!(
+            !d.contains("supersecret-key-value"),
+            "secret_key leaked: {d}"
+        );
+        assert!(
+            !d.contains("session-token-payload"),
+            "session_token leaked: {d}"
+        );
         // Non-credential fields are still useful for diagnostics.
         assert!(d.contains("eu-central-1"), "region missing: {d}");
         assert!(d.contains("prod"), "profile missing: {d}");
@@ -355,8 +363,7 @@ mod tests {
         // AlreadyExists must convert into a `SqeError::Catalog` whose
         // string contains the right phrase so `error_code()` still classifies
         // it as DuplicateTable (issue #12 alignment).
-        let err: crate::error::SqeError =
-            SecretStoreError::AlreadyExists("x".to_string()).into();
+        let err: crate::error::SqeError = SecretStoreError::AlreadyExists("x".to_string()).into();
         match err {
             crate::error::SqeError::Catalog(ref m) => {
                 assert!(m.contains("already exists"), "got: {m}");

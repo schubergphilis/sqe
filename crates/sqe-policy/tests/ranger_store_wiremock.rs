@@ -189,10 +189,20 @@ async fn resolve_tags_fails_closed_on_fetch_error() {
     let (masks, filters, unmappable) = store.resolve_tags(&analyst(), &tags).await;
 
     assert!(masks.is_empty(), "fetch failure must yield no masks");
-    assert!(unmappable.is_empty(), "fetch failure must yield no unmappable tags");
-    assert_eq!(filters.len(), 1, "fetch failure must inject exactly one deny filter");
     assert!(
-        matches!(&filters[0], Expr::Literal(ScalarValue::Boolean(Some(false)), _)),
+        unmappable.is_empty(),
+        "fetch failure must yield no unmappable tags"
+    );
+    assert_eq!(
+        filters.len(),
+        1,
+        "fetch failure must inject exactly one deny filter"
+    );
+    assert!(
+        matches!(
+            &filters[0],
+            Expr::Literal(ScalarValue::Boolean(Some(false)), _)
+        ),
         "the deny filter must be lit(false), got: {:?}",
         filters[0]
     );

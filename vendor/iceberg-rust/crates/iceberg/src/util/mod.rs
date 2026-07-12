@@ -102,7 +102,9 @@ pub mod bin {
         }
 
         pub fn pack<F>(&self, items: Vec<T>, weight_func: F) -> Vec<Vec<T>>
-        where F: Fn(&T) -> u32 {
+        where
+            F: Fn(&T) -> u32,
+        {
             let mut bins: Vec<Bin<T>> = vec![];
             for item in items {
                 let cur_weight = weight_func(&item);
@@ -429,7 +431,9 @@ impl ReachableFileCleanupStrategy {
 
     /// Deletes files concurrently with the configured concurrency limit.
     async fn delete_files<I>(&self, paths: I) -> Result<()>
-    where I: IntoIterator<Item = String> {
+    where
+        I: IntoIterator<Item = String>,
+    {
         stream::iter(paths)
             .map(|path| {
                 let file_io = self.file_io.clone();
@@ -903,20 +907,22 @@ mod cleanup_tests {
 
         let file_io = FileIOBuilder::new("memory").build().unwrap();
 
-        let expired_manifest =
-            write_test_manifest(&file_io, "memory://manifests/expired.avro", 1, vec![(
-                ManifestStatus::Added,
-                "memory://data/file_c.parquet",
-            )])
-            .await;
+        let expired_manifest = write_test_manifest(
+            &file_io,
+            "memory://manifests/expired.avro",
+            1,
+            vec![(ManifestStatus::Added, "memory://data/file_c.parquet")],
+        )
+        .await;
 
         // The same file appears as Added in a surviving manifest.
-        let surviving_manifest =
-            write_test_manifest(&file_io, "memory://manifests/surviving.avro", 2, vec![(
-                ManifestStatus::Added,
-                "memory://data/file_c.parquet",
-            )])
-            .await;
+        let surviving_manifest = write_test_manifest(
+            &file_io,
+            "memory://manifests/surviving.avro",
+            2,
+            vec![(ManifestStatus::Added, "memory://data/file_c.parquet")],
+        )
+        .await;
 
         let manifests_to_delete: HashSet<_> = [expired_manifest].into_iter().collect();
         let referenced_manifests: HashSet<_> = [surviving_manifest].into_iter().collect();

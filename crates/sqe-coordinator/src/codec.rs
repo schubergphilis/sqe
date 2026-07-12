@@ -46,10 +46,8 @@ impl PhysicalExtensionCodec for SqePhysicalCodec {
                 })?;
 
             let schema_bytes = proto_schema.encode_to_vec();
-            let schema_proto_b64 = base64::Engine::encode(
-                &base64::engine::general_purpose::STANDARD,
-                &schema_bytes,
-            );
+            let schema_proto_b64 =
+                base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &schema_bytes);
 
             let encoded = EncodedDistributedScan {
                 scan_tasks: scan.scan_tasks().to_vec(),
@@ -75,8 +73,8 @@ impl PhysicalExtensionCodec for SqePhysicalCodec {
         _inputs: &[Arc<dyn ExecutionPlan>],
         _ctx: &TaskContext,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        let encoded: EncodedDistributedScan = serde_json::from_slice(buf)
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        let encoded: EncodedDistributedScan =
+            serde_json::from_slice(buf).map_err(|e| DataFusionError::External(Box::new(e)))?;
 
         let schema_bytes = base64::Engine::decode(
             &base64::engine::general_purpose::STANDARD,
@@ -94,11 +92,12 @@ impl PhysicalExtensionCodec for SqePhysicalCodec {
             ))))
         })?;
 
-        let schema = datafusion::arrow::datatypes::Schema::try_from(&proto_schema).map_err(|e| {
-            DataFusionError::External(Box::new(std::io::Error::other(format!(
-                "Schema conversion failed: {e}"
-            ))))
-        })?;
+        let schema =
+            datafusion::arrow::datatypes::Schema::try_from(&proto_schema).map_err(|e| {
+                DataFusionError::External(Box::new(std::io::Error::other(format!(
+                    "Schema conversion failed: {e}"
+                ))))
+            })?;
 
         Ok(Arc::new(DistributedScanExec::new(
             encoded.scan_tasks,
@@ -142,10 +141,7 @@ mod tests {
 
         let original = Arc::new(DistributedScanExec::new(
             vec![make_task("f1"), make_task("f2")],
-            vec![
-                "http://w1:50052".to_string(),
-                "http://w2:50052".to_string(),
-            ],
+            vec!["http://w1:50052".to_string(), "http://w2:50052".to_string()],
             schema.clone(),
         ));
 
@@ -156,16 +152,17 @@ mod tests {
             .expect("encode failed");
 
         let ctx = Arc::new(TaskContext::default());
-        let decoded = codec
-            .try_decode(&buf, &[], &ctx)
-            .expect("decode failed");
+        let decoded = codec.try_decode(&buf, &[], &ctx).expect("decode failed");
 
         let decoded_scan = decoded
             .downcast_ref::<DistributedScanExec>()
             .expect("Expected DistributedScanExec");
 
         assert_eq!(decoded_scan.scan_tasks().len(), 2);
-        assert_eq!(decoded_scan.worker_urls(), &["http://w1:50052", "http://w2:50052"]);
+        assert_eq!(
+            decoded_scan.worker_urls(),
+            &["http://w1:50052", "http://w2:50052"]
+        );
         assert_eq!(*decoded_scan.schema(), *schema);
     }
 

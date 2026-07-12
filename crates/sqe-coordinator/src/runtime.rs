@@ -98,11 +98,12 @@ pub fn build_coordinator_runtime(
     // so the same TVFs can read ad-hoc S3 buckets that were never
     // pre-registered as Iceberg catalogs. `file` paths use the default
     // registry's existing path.
-    let registry =
-        Arc::new(sqe_catalog::lazy_object_store::LazyHttpObjectStoreRegistry::with_s3_fallback(
+    let registry = Arc::new(
+        sqe_catalog::lazy_object_store::LazyHttpObjectStoreRegistry::with_s3_fallback(
             datafusion::execution::object_store::DefaultObjectStoreRegistry::new(),
             storage.clone(),
-        ));
+        ),
+    );
     let mut builder = RuntimeEnvBuilder::new()
         .with_memory_pool(memory_pool)
         .with_object_store_registry(registry)
@@ -123,8 +124,7 @@ pub fn build_coordinator_runtime(
         builder = builder.with_temp_file_path(&config.spill_dir);
     } else {
         // Disable disk manager — any attempt to spill will return an error.
-        let disk_builder =
-            DiskManagerBuilder::default().with_mode(DiskManagerMode::Disabled);
+        let disk_builder = DiskManagerBuilder::default().with_mode(DiskManagerMode::Disabled);
         builder = builder.with_disk_manager_builder(disk_builder);
     }
 
@@ -151,7 +151,8 @@ mod tests {
     #[test]
     fn test_default_memory_limit_applied() {
         let config = config_no_spill("8GB");
-        let runtime = build_coordinator_runtime(&config, &StorageConfig::default()).expect("should build");
+        let runtime =
+            build_coordinator_runtime(&config, &StorageConfig::default()).expect("should build");
 
         // 8GB = 8 * 1024^3 = 8_589_934_592 bytes
         let expected_bytes = 8 * 1024 * 1024 * 1024;
@@ -164,7 +165,8 @@ mod tests {
     #[test]
     fn test_custom_memory_limit_512mb() {
         let config = config_no_spill("512MB");
-        let runtime = build_coordinator_runtime(&config, &StorageConfig::default()).expect("should build with 512MB limit");
+        let runtime = build_coordinator_runtime(&config, &StorageConfig::default())
+            .expect("should build with 512MB limit");
 
         let expected_bytes = 512 * 1024 * 1024;
         match runtime.memory_pool.memory_limit() {
@@ -192,7 +194,8 @@ mod tests {
     #[test]
     fn test_spill_disabled() {
         let config = config_no_spill("1GB");
-        let runtime = build_coordinator_runtime(&config, &StorageConfig::default()).expect("should build with spill disabled");
+        let runtime = build_coordinator_runtime(&config, &StorageConfig::default())
+            .expect("should build with spill disabled");
 
         assert!(
             !runtime.disk_manager.tmp_files_enabled(),
@@ -212,8 +215,8 @@ mod tests {
             spill_dir: tmpdir.to_string_lossy().to_string(),
             ..config_no_spill("1GB")
         };
-        let runtime =
-            build_coordinator_runtime(&config, &StorageConfig::default()).expect("should build with spill enabled");
+        let runtime = build_coordinator_runtime(&config, &StorageConfig::default())
+            .expect("should build with spill enabled");
 
         assert!(
             runtime.disk_manager.tmp_files_enabled(),

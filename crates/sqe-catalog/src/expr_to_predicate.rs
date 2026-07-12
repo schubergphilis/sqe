@@ -128,7 +128,8 @@ fn to_iceberg_predicate(expr: &Expr) -> TransformedResult {
             _ => TransformedResult::NotTransformed,
         },
         Expr::Cast(c) => {
-            if *c.field.data_type() == DataType::Date32 || *c.field.data_type() == DataType::Date64 {
+            if *c.field.data_type() == DataType::Date32 || *c.field.data_type() == DataType::Date64
+            {
                 // Date casts truncate the expression — cannot safely push down.
                 return TransformedResult::NotTransformed;
             }

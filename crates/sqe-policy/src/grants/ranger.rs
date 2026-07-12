@@ -14,8 +14,8 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
 use super::{
-    AccessCheck, AccessCheckResult, GrantBackend, GrantEntry, GrantFilter, GrantStatement,
-    Grantee, RevokeStatement,
+    AccessCheck, AccessCheckResult, GrantBackend, GrantEntry, GrantFilter, GrantStatement, Grantee,
+    RevokeStatement,
 };
 
 /// Which resource levels a privilege applies to. Determines which keys go into
@@ -82,9 +82,7 @@ pub fn map_sql_to_ranger_access(sql_priv: &str) -> (Vec<String>, ResourceLevel) 
         ),
         "DROP SCHEMA" => (to_vec(&["namespace-drop"]), ResourceLevel::Namespace),
         "CREATE SCHEMA" | "CREATE" => (to_vec(&["namespace-create"]), ResourceLevel::Catalog),
-        "ALL" | "ALL PRIVILEGES" => {
-            (to_vec(&["catalog-content-manage"]), ResourceLevel::Catalog)
-        }
+        "ALL" | "ALL PRIVILEGES" => (to_vec(&["catalog-content-manage"]), ResourceLevel::Catalog),
         other => (vec![other.to_lowercase()], ResourceLevel::Table),
     }
 }
@@ -148,11 +146,14 @@ pub fn build_resource_map(
 /// resource-map injection, matching the Polaris backend's `validate_url_identifier`.
 fn validate_identifier(value: &str, what: &str) -> sqe_core::Result<()> {
     if value.is_empty() {
-        return Err(sqe_core::SqeError::Execution(format!("{what} must not be empty")));
+        return Err(sqe_core::SqeError::Execution(format!(
+            "{what} must not be empty"
+        )));
     }
-    if let Some(bad) = value.chars().find(|c| {
-        matches!(c, '/' | '?' | '#' | '%' | '\\') || c.is_whitespace() || c.is_control()
-    }) {
+    if let Some(bad) = value
+        .chars()
+        .find(|c| matches!(c, '/' | '?' | '#' | '%' | '\\') || c.is_whitespace() || c.is_control())
+    {
         return Err(sqe_core::SqeError::Execution(format!(
             "{what} '{value}' contains invalid character {bad:?}"
         )));
@@ -267,7 +268,9 @@ impl RangerGrantBackend {
             .json(body)
             .send()
             .await
-            .map_err(|e| sqe_core::SqeError::Execution(format!("Ranger {op} request failed: {e}")))?;
+            .map_err(|e| {
+                sqe_core::SqeError::Execution(format!("Ranger {op} request failed: {e}"))
+            })?;
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -405,7 +408,9 @@ impl RangerGrantBackend {
             .basic_auth(&self.admin_user, Some(&self.admin_password))
             .send()
             .await
-            .map_err(|e| sqe_core::SqeError::Execution(format!("Ranger policy fetch failed: {e}")))?;
+            .map_err(|e| {
+                sqe_core::SqeError::Execution(format!("Ranger policy fetch failed: {e}"))
+            })?;
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -415,9 +420,9 @@ impl RangerGrantBackend {
                 "Ranger policy fetch failed (HTTP {status})"
             )));
         }
-        resp.json().await.map_err(|e| {
-            sqe_core::SqeError::Execution(format!("Ranger policy parse failed: {e}"))
-        })
+        resp.json()
+            .await
+            .map_err(|e| sqe_core::SqeError::Execution(format!("Ranger policy parse failed: {e}")))
     }
 }
 
@@ -441,21 +446,34 @@ pub fn evaluate_access(
         e.privilege == access_type && e.resource == resource && principal_matches(e)
     };
 
-    if entries.iter().filter(|e| e.effect == "DENY").any(|e| relevant(&e)) {
+    if entries
+        .iter()
+        .filter(|e| e.effect == "DENY")
+        .any(|e| relevant(&e))
+    {
         return AccessCheckResult {
             allowed: false,
             reason: Some(format!("Denied by a DENY policy on {resource}")),
         };
     }
-    if let Some(e) = entries.iter().filter(|e| e.effect == "ALLOW").find(|e| relevant(e)) {
+    if let Some(e) = entries
+        .iter()
+        .filter(|e| e.effect == "ALLOW")
+        .find(|e| relevant(e))
+    {
         return AccessCheckResult {
             allowed: true,
-            reason: Some(format!("Allowed via {} '{}'", e.grantee_type, e.grantee_name)),
+            reason: Some(format!(
+                "Allowed via {} '{}'",
+                e.grantee_type, e.grantee_name
+            )),
         };
     }
     AccessCheckResult {
         allowed: false,
-        reason: Some(format!("No matching grant for {user} {access_type} on {resource}")),
+        reason: Some(format!(
+            "No matching grant for {user} {access_type} on {resource}"
+        )),
     }
 }
 
@@ -491,14 +509,25 @@ impl GrantBackend for RangerGrantBackend {
         let policies = self.fetch_policies().await?;
         let all = policies_to_entries(&policies);
         let filtered = match filter {
-            GrantFilter::ToGrantee(g) => {
-                all.into_iter().filter(|e| entry_matches_grantee(e, g)).collect()
-            }
-            GrantFilter::OnResource { catalog, namespace, table } => {
+            GrantFilter::ToGrantee(g) => all
+                .into_iter()
+                .filter(|e| entry_matches_grantee(e, g))
+                .collect(),
+            GrantFilter::OnResource {
+                catalog,
+                namespace,
+                table,
+            } => {
                 let mut prefix = Vec::new();
-                if let Some(c) = catalog { prefix.push(c.clone()); }
-                if let Some(n) = namespace { prefix.push(n.clone()); }
-                if let Some(t) = table { prefix.push(t.clone()); }
+                if let Some(c) = catalog {
+                    prefix.push(c.clone());
+                }
+                if let Some(n) = namespace {
+                    prefix.push(n.clone());
+                }
+                if let Some(t) = table {
+                    prefix.push(t.clone());
+                }
                 let prefix = prefix.join(".");
                 all.into_iter()
                     .filter(|e| resource_matches_prefix(&e.resource, &prefix))
@@ -536,15 +565,25 @@ impl GrantBackend for RangerGrantBackend {
         // type that defines the privilege (e.g. SELECT -> table-data-read).
         let primary = access.first().map(String::as_str).unwrap_or("");
         let mut parts = vec![catalog.to_string()];
-        if let Some(n) = &check.namespace { parts.push(n.clone()); }
-        if let Some(t) = &check.table { parts.push(t.clone()); }
+        if let Some(n) = &check.namespace {
+            parts.push(n.clone());
+        }
+        if let Some(t) = &check.table {
+            parts.push(t.clone());
+        }
         let resource = parts.join(".");
 
         let policies = self.fetch_policies().await?;
         let entries = policies_to_entries(&policies);
         // Roles unknown at this layer; match on the user dimension only. Role
         // grants are surfaced via SHOW GRANTS and enforced by Polaris.
-        Ok(evaluate_access(&entries, &check.user, &[], primary, &resource))
+        Ok(evaluate_access(
+            &entries,
+            &check.user,
+            &[],
+            primary,
+            &resource,
+        ))
     }
 
     fn backend_name(&self) -> &str {
@@ -600,7 +639,13 @@ mod tests {
 
     #[test]
     fn resource_map_table_level_full_path() {
-        let m = build_resource_map("POLARIS", "wh", Some("sales"), Some("orders"), ResourceLevel::Table);
+        let m = build_resource_map(
+            "POLARIS",
+            "wh",
+            Some("sales"),
+            Some("orders"),
+            ResourceLevel::Table,
+        );
         assert_eq!(m.get("root").map(String::as_str), Some("POLARIS"));
         assert_eq!(m.get("catalog").map(String::as_str), Some("wh"));
         assert_eq!(m.get("namespace").map(String::as_str), Some("sales"));
@@ -626,7 +671,13 @@ mod tests {
 
     #[test]
     fn resource_map_namespace_level_omits_table() {
-        let m = build_resource_map("POLARIS", "wh", Some("sales"), Some("orders"), ResourceLevel::Namespace);
+        let m = build_resource_map(
+            "POLARIS",
+            "wh",
+            Some("sales"),
+            Some("orders"),
+            ResourceLevel::Namespace,
+        );
         assert!(!m.contains_key("table"));
         assert_eq!(m.get("namespace").map(String::as_str), Some("sales"));
     }
@@ -718,15 +769,31 @@ mod tests {
     fn build_grant_revoke_select_to_role() {
         let b = test_backend();
         let body = b
-            .build_grant_revoke("SELECT", Some("wh"), Some("sales"), Some("orders"),
-                &Grantee::Role("analyst".into()))
+            .build_grant_revoke(
+                "SELECT",
+                Some("wh"),
+                Some("sales"),
+                Some("orders"),
+                &Grantee::Role("analyst".into()),
+            )
             .unwrap();
-        assert_eq!(body.access_types.first().map(String::as_str), Some("table-data-read"));
-        assert!(body.access_types.contains(&"table-properties-read".to_string()));
+        assert_eq!(
+            body.access_types.first().map(String::as_str),
+            Some("table-data-read")
+        );
+        assert!(body
+            .access_types
+            .contains(&"table-properties-read".to_string()));
         assert_eq!(body.roles, vec!["analyst".to_string()]);
         assert!(body.users.is_empty());
-        assert_eq!(body.resource.get("table").map(String::as_str), Some("orders"));
-        assert_eq!(body.resource.get("root").map(String::as_str), Some("POLARIS"));
+        assert_eq!(
+            body.resource.get("table").map(String::as_str),
+            Some("orders")
+        );
+        assert_eq!(
+            body.resource.get("root").map(String::as_str),
+            Some("POLARIS")
+        );
     }
 
     #[test]
@@ -742,7 +809,13 @@ mod tests {
     fn build_grant_revoke_rejects_bad_identifier() {
         let b = test_backend();
         let err = b
-            .build_grant_revoke("SELECT", Some("wh/../x"), None, None, &Grantee::User("a".into()))
+            .build_grant_revoke(
+                "SELECT",
+                Some("wh/../x"),
+                None,
+                None,
+                &Grantee::User("a".into()),
+            )
             .unwrap_err();
         assert!(matches!(err, sqe_core::SqeError::Execution(_)));
     }
@@ -821,11 +894,15 @@ mod tests {
 
     #[test]
     fn check_match_allows_when_user_has_access() {
-        let entries = vec![
-            GrantEntry { privilege: "table-data-read".into(), resource: "wh.sales.orders".into(),
-                grantee_type: "USER".into(), grantee_name: "alice".into(), effect: "ALLOW".into(),
-                granted_by: None, granted_at: None },
-        ];
+        let entries = vec![GrantEntry {
+            privilege: "table-data-read".into(),
+            resource: "wh.sales.orders".into(),
+            grantee_type: "USER".into(),
+            grantee_name: "alice".into(),
+            effect: "ALLOW".into(),
+            granted_by: None,
+            granted_at: None,
+        }];
         let r = evaluate_access(&entries, "alice", &[], "table-data-read", "wh.sales.orders");
         assert!(r.allowed);
     }
@@ -833,16 +910,39 @@ mod tests {
     #[test]
     fn check_match_deny_overrides_allow() {
         let entries = vec![
-            GrantEntry { privilege: "table-data-read".into(), resource: "wh.sales.orders".into(),
-                grantee_type: "ROLE".into(), grantee_name: "analyst".into(), effect: "ALLOW".into(),
-                granted_by: None, granted_at: None },
-            GrantEntry { privilege: "table-data-read".into(), resource: "wh.sales.orders".into(),
-                grantee_type: "USER".into(), grantee_name: "alice".into(), effect: "DENY".into(),
-                granted_by: None, granted_at: None },
+            GrantEntry {
+                privilege: "table-data-read".into(),
+                resource: "wh.sales.orders".into(),
+                grantee_type: "ROLE".into(),
+                grantee_name: "analyst".into(),
+                effect: "ALLOW".into(),
+                granted_by: None,
+                granted_at: None,
+            },
+            GrantEntry {
+                privilege: "table-data-read".into(),
+                resource: "wh.sales.orders".into(),
+                grantee_type: "USER".into(),
+                grantee_name: "alice".into(),
+                effect: "DENY".into(),
+                granted_by: None,
+                granted_at: None,
+            },
         ];
-        let r = evaluate_access(&entries, "alice", &["analyst".into()], "table-data-read", "wh.sales.orders");
+        let r = evaluate_access(
+            &entries,
+            "alice",
+            &["analyst".into()],
+            "table-data-read",
+            "wh.sales.orders",
+        );
         assert!(!r.allowed);
-        assert!(r.reason.as_deref().unwrap_or("").to_lowercase().contains("deny"));
+        assert!(r
+            .reason
+            .as_deref()
+            .unwrap_or("")
+            .to_lowercase()
+            .contains("deny"));
     }
 
     #[test]

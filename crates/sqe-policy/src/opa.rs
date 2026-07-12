@@ -51,7 +51,11 @@ pub struct OpaStore {
 }
 
 impl OpaStore {
-    pub fn new(opa_url: &str, policy_path: &str, cache_ttl_secs: u64) -> Result<Self, reqwest::Error> {
+    pub fn new(
+        opa_url: &str,
+        policy_path: &str,
+        cache_ttl_secs: u64,
+    ) -> Result<Self, reqwest::Error> {
         let cfg = OpaConfig {
             cache_ttl_secs,
             ..OpaConfig::default()
@@ -126,15 +130,15 @@ impl OpaStore {
 
     fn cache_key(user: &SessionUser, table: &str, namespace: &str) -> String {
         {
-        let mut roles_sorted = user.roles.clone();
-        roles_sorted.sort();
-        let roles_hash = {
-            use sha2::{Digest, Sha256};
-            let digest = Sha256::digest(roles_sorted.join(",").as_bytes());
-            format!("{:x}", digest).chars().take(16).collect::<String>()
-        };
-        format!("{}:{}:{}:{}", user.username, namespace, table, roles_hash)
-    }
+            let mut roles_sorted = user.roles.clone();
+            roles_sorted.sort();
+            let roles_hash = {
+                use sha2::{Digest, Sha256};
+                let digest = Sha256::digest(roles_sorted.join(",").as_bytes());
+                format!("{:x}", digest).chars().take(16).collect::<String>()
+            };
+            format!("{}:{}:{}:{}", user.username, namespace, table, roles_hash)
+        }
     }
 }
 
@@ -199,11 +203,9 @@ impl PolicyStore for OpaStore {
         // Fail closed when the breaker is open. The earlier code went
         // straight to the HTTP call and ate up to `timeout_secs` per
         // query when OPA was degraded.
-        self.breaker.check().map_err(|e| {
-            sqe_core::error::SqeError::Execution(format!(
-                "OPA unavailable: {e}"
-            ))
-        })?;
+        self.breaker
+            .check()
+            .map_err(|e| sqe_core::error::SqeError::Execution(format!("OPA unavailable: {e}")))?;
 
         let started = Instant::now();
         let url = format!("{}/v1/data/{}", self.opa_url, self.policy_path);
@@ -384,13 +386,19 @@ mod tests {
     #[test]
     fn test_parse_filter_expr() {
         let expr = parse_filter_expr("clearance >= 3").unwrap();
-        assert!(matches!(expr, datafusion::logical_expr::Expr::BinaryExpr(_)));
+        assert!(matches!(
+            expr,
+            datafusion::logical_expr::Expr::BinaryExpr(_)
+        ));
     }
 
     #[test]
     fn test_parse_filter_expr_string() {
         let expr = parse_filter_expr("department = 'engineering'").unwrap();
-        assert!(matches!(expr, datafusion::logical_expr::Expr::BinaryExpr(_)));
+        assert!(matches!(
+            expr,
+            datafusion::logical_expr::Expr::BinaryExpr(_)
+        ));
     }
 
     #[test]
@@ -427,37 +435,55 @@ mod tests {
     #[test]
     fn test_parse_filter_expr_eq() {
         let expr = parse_filter_expr("status = 'active'").unwrap();
-        assert!(matches!(expr, datafusion::logical_expr::Expr::BinaryExpr(_)));
+        assert!(matches!(
+            expr,
+            datafusion::logical_expr::Expr::BinaryExpr(_)
+        ));
     }
 
     #[test]
     fn test_parse_filter_expr_not_eq() {
         let expr = parse_filter_expr("deleted != 1").unwrap();
-        assert!(matches!(expr, datafusion::logical_expr::Expr::BinaryExpr(_)));
+        assert!(matches!(
+            expr,
+            datafusion::logical_expr::Expr::BinaryExpr(_)
+        ));
     }
 
     #[test]
     fn test_parse_filter_expr_lt() {
         let expr = parse_filter_expr("risk_score < 5").unwrap();
-        assert!(matches!(expr, datafusion::logical_expr::Expr::BinaryExpr(_)));
+        assert!(matches!(
+            expr,
+            datafusion::logical_expr::Expr::BinaryExpr(_)
+        ));
     }
 
     #[test]
     fn test_parse_filter_expr_lte() {
         let expr = parse_filter_expr("tier <= 3").unwrap();
-        assert!(matches!(expr, datafusion::logical_expr::Expr::BinaryExpr(_)));
+        assert!(matches!(
+            expr,
+            datafusion::logical_expr::Expr::BinaryExpr(_)
+        ));
     }
 
     #[test]
     fn test_parse_filter_expr_gt() {
         let expr = parse_filter_expr("age > 18").unwrap();
-        assert!(matches!(expr, datafusion::logical_expr::Expr::BinaryExpr(_)));
+        assert!(matches!(
+            expr,
+            datafusion::logical_expr::Expr::BinaryExpr(_)
+        ));
     }
 
     #[test]
     fn test_parse_filter_expr_float_literal() {
         let expr = parse_filter_expr("score >= 0.5").unwrap();
-        assert!(matches!(expr, datafusion::logical_expr::Expr::BinaryExpr(_)));
+        assert!(matches!(
+            expr,
+            datafusion::logical_expr::Expr::BinaryExpr(_)
+        ));
     }
 
     #[test]
@@ -494,13 +520,11 @@ mod tests {
         // rule does not exist. The resolver must NOT treat this as
         // "permit everything" — it must surface an error so operators notice
         // a missing bundle / typo in policy_path.
-        let response: OpaResponse =
-            serde_json::from_str(r#"{"result": null}"#).unwrap();
+        let response: OpaResponse = serde_json::from_str(r#"{"result": null}"#).unwrap();
         assert!(response.result.is_none());
 
         // And the absent-field form behaves the same way.
         let response: OpaResponse = serde_json::from_str("{}").unwrap();
         assert!(response.result.is_none());
     }
-
 }

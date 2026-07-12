@@ -272,8 +272,10 @@ impl TableMetadataCache {
     /// `table_ident.namespace()` + `.` + `table_ident.name()`).
     pub async fn invalidate_table_all_tokens(&self, ns_table_suffix: &str) {
         // Collect first, then invalidate, to avoid mutating the map mid-iter.
-        let keys =
-            select_keys_for_suffix(self.inner.iter().map(|(k, _)| (*k).clone()), ns_table_suffix);
+        let keys = select_keys_for_suffix(
+            self.inner.iter().map(|(k, _)| (*k).clone()),
+            ns_table_suffix,
+        );
         for key in keys {
             self.inner.invalidate(&key).await;
         }
@@ -313,13 +315,7 @@ impl TableMetadataCache {
         let suffix = format!("|{}.{}", namespace_display, table_name);
         for (key, entry) in self.inner.iter() {
             if key.ends_with(&suffix) {
-                return Some(
-                    entry
-                        .table
-                        .metadata()
-                        .properties()
-                        .clone(),
-                );
+                return Some(entry.table.metadata().properties().clone());
             }
         }
         None
@@ -464,8 +460,8 @@ impl std::fmt::Debug for SessionCatalog {
 /// session-catalog build; a plain `warn!` there would log on every login, so we
 /// dedup by backend kind.
 fn warn_shared_backend_identity_once(backend: &sqe_core::config::CatalogBackend) {
-    use std::sync::Once;
     use sqe_core::config::CatalogBackend;
+    use std::sync::Once;
 
     let (once, kind): (&'static Once, &'static str) = match backend {
         CatalogBackend::Rest => return, // REST forwards the user bearer; no warning.
@@ -612,14 +608,16 @@ impl SessionCatalog {
                 )
                 .await
             }
-            other => Self::for_session_other_backend_with(
-                catalog,
-                storage,
-                bearer_token,
-                table_cache.unwrap_or_else(|| TableMetadataCache::new(0)),
-                other,
-            )
-            .await,
+            other => {
+                Self::for_session_other_backend_with(
+                    catalog,
+                    storage,
+                    bearer_token,
+                    table_cache.unwrap_or_else(|| TableMetadataCache::new(0)),
+                    other,
+                )
+                .await
+            }
         }
     }
 
@@ -722,7 +720,11 @@ impl SessionCatalog {
             }
 
             #[cfg(feature = "glue")]
-            CatalogBackend::Glue { region, warehouse, endpoint } => {
+            CatalogBackend::Glue {
+                region,
+                warehouse,
+                endpoint,
+            } => {
                 use iceberg_catalog_glue::GLUE_CATALOG_PROP_WAREHOUSE;
                 let mut p = HashMap::new();
                 p.insert(GLUE_CATALOG_PROP_WAREHOUSE.to_string(), warehouse.clone());
@@ -759,7 +761,10 @@ impl SessionCatalog {
             }
 
             #[cfg(feature = "s3tables")]
-            CatalogBackend::S3tables { table_bucket_arn, endpoint_url } => {
+            CatalogBackend::S3tables {
+                table_bucket_arn,
+                endpoint_url,
+            } => {
                 use iceberg_catalog_s3tables::{
                     S3TABLES_CATALOG_PROP_ENDPOINT_URL, S3TABLES_CATALOG_PROP_TABLE_BUCKET_ARN,
                 };
@@ -912,19 +917,21 @@ impl SessionCatalog {
         } else {
             debug!(token_fingerprint = %token_fingerprint, "REST catalog cache miss, creating");
             let catalog = RestCatalogBuilder::default()
-                .load(
-                    format!("sqe-session-{}", &token_fingerprint),
-                    props,
-                )
+                .load(format!("sqe-session-{}", &token_fingerprint), props)
                 .await
-                .map_err(|e| SqeError::catalog_src(format!("Failed to create REST catalog: {e}"), e))?;
+                .map_err(|e| {
+                    SqeError::catalog_src(format!("Failed to create REST catalog: {e}"), e)
+                })?;
             let arc_catalog = Arc::new(catalog);
-            REST_CATALOG_CACHE.insert(catalog_key, arc_catalog.clone()).await;
+            REST_CATALOG_CACHE
+                .insert(catalog_key, arc_catalog.clone())
+                .await;
             arc_catalog
         };
 
         let http_client = http_client.unwrap_or_else(|| SHARED_HTTP_CLIENT.clone());
-        let circuit_breaker = circuit_breaker.unwrap_or_else(|| user_circuit_breaker(&token_fingerprint));
+        let circuit_breaker =
+            circuit_breaker.unwrap_or_else(|| user_circuit_breaker(&token_fingerprint));
 
         // Use the shared global cache when provided; fall back to a private
         // per-session cache (disabled — max_capacity 0) so that call sites that
@@ -1301,7 +1308,6 @@ impl SessionCatalog {
             table_ident.name()
         )
     }
-
 }
 
 /// HEAD-based ETag fetch usable from a background `tokio::spawn`.
@@ -1331,7 +1337,6 @@ async fn fetch_table_etag_inner(
 }
 
 impl SessionCatalog {
-
     /// Evict a table from the metadata cache.
     ///
     /// Call this after any DDL/DML operation that changes the table's metadata
@@ -1396,11 +1401,7 @@ impl SessionCatalog {
             .map(|s| s.as_str())
             .collect::<Vec<_>>()
             .join("\u{1F}"); // Iceberg REST uses unit separator for multi-level namespaces
-        let url = format!(
-            "{}/namespaces/{}/views",
-            self.rest_prefix(),
-            ns_str
-        );
+        let url = format!("{}/namespaces/{}/views", self.rest_prefix(), ns_str);
 
         let now_ms = chrono::Utc::now().timestamp_millis();
 
@@ -1442,10 +1443,14 @@ impl SessionCatalog {
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
             if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                return Err(SqeError::Catalog(format!("Rate limited by Polaris catalog: {text}")));
+                return Err(SqeError::Catalog(format!(
+                    "Rate limited by Polaris catalog: {text}"
+                )));
             }
             if status == reqwest::StatusCode::CONFLICT {
-                return Err(SqeError::Execution(format!("Catalog commit conflict: {text}")));
+                return Err(SqeError::Execution(format!(
+                    "Catalog commit conflict: {text}"
+                )));
             }
             return Err(SqeError::Catalog(format!(
                 "Failed to create view (HTTP {status}): {text}"
@@ -1458,10 +1463,7 @@ impl SessionCatalog {
 
     /// List views in a namespace via the Polaris REST API.
     #[instrument(skip(self), fields(namespace = ?namespace, warehouse = %self.warehouse))]
-    pub async fn list_views(
-        &self,
-        namespace: &NamespaceIdent,
-    ) -> sqe_core::Result<Vec<String>> {
+    pub async fn list_views(&self, namespace: &NamespaceIdent) -> sqe_core::Result<Vec<String>> {
         self.require_rest_backend("list_views")?;
         let ns_str = namespace
             .as_ref()
@@ -1488,10 +1490,14 @@ impl SessionCatalog {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
             if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                return Err(SqeError::Catalog(format!("Rate limited by Polaris catalog: {text}")));
+                return Err(SqeError::Catalog(format!(
+                    "Rate limited by Polaris catalog: {text}"
+                )));
             }
             if status == reqwest::StatusCode::CONFLICT {
-                return Err(SqeError::Execution(format!("Catalog commit conflict: {text}")));
+                return Err(SqeError::Execution(format!(
+                    "Catalog commit conflict: {text}"
+                )));
             }
             return Err(SqeError::Catalog(format!(
                 "Failed to list views (HTTP {status}): {text}"
@@ -1531,7 +1537,12 @@ impl SessionCatalog {
             .map(|s| s.as_str())
             .collect::<Vec<_>>()
             .join("\u{1F}");
-        let url = format!("{}/namespaces/{}/views/{}", self.rest_prefix(), ns_str, name);
+        let url = format!(
+            "{}/namespaces/{}/views/{}",
+            self.rest_prefix(),
+            ns_str,
+            name
+        );
 
         let mut req = self
             .http_client
@@ -1553,10 +1564,14 @@ impl SessionCatalog {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
             if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                return Err(SqeError::Catalog(format!("Rate limited by Polaris catalog: {text}")));
+                return Err(SqeError::Catalog(format!(
+                    "Rate limited by Polaris catalog: {text}"
+                )));
             }
             if status == reqwest::StatusCode::CONFLICT {
-                return Err(SqeError::Execution(format!("Catalog commit conflict: {text}")));
+                return Err(SqeError::Execution(format!(
+                    "Catalog commit conflict: {text}"
+                )));
             }
             return Err(SqeError::Catalog(format!(
                 "Failed to load view '{name}' (HTTP {status}): {text}"
@@ -1584,11 +1599,7 @@ impl SessionCatalog {
     ///
     /// Calls `DELETE /v1/{prefix}/namespaces/{namespace}/views/{view}`.
     #[instrument(skip(self), fields(namespace = ?namespace, view = %name, warehouse = %self.warehouse))]
-    pub async fn drop_view(
-        &self,
-        namespace: &NamespaceIdent,
-        name: &str,
-    ) -> sqe_core::Result<()> {
+    pub async fn drop_view(&self, namespace: &NamespaceIdent, name: &str) -> sqe_core::Result<()> {
         self.require_rest_backend("drop_view")?;
         let ns_str = namespace
             .as_ref()
@@ -1622,10 +1633,14 @@ impl SessionCatalog {
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
             if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                return Err(SqeError::Catalog(format!("Rate limited by Polaris catalog: {text}")));
+                return Err(SqeError::Catalog(format!(
+                    "Rate limited by Polaris catalog: {text}"
+                )));
             }
             if status == reqwest::StatusCode::CONFLICT {
-                return Err(SqeError::Execution(format!("Catalog commit conflict: {text}")));
+                return Err(SqeError::Execution(format!(
+                    "Catalog commit conflict: {text}"
+                )));
             }
             return Err(SqeError::Catalog(format!(
                 "Failed to drop view (HTTP {status}): {text}"
@@ -1691,19 +1706,22 @@ impl SessionCatalog {
         for (k, v) in trace_context_http_headers() {
             req = req.header(k, v);
         }
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| SqeError::catalog_src(format!("Failed to commit schema update: {e}"), e))?;
+        let resp = req.send().await.map_err(|e| {
+            SqeError::catalog_src(format!("Failed to commit schema update: {e}"), e)
+        })?;
 
         let status = resp.status();
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
             if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                return Err(SqeError::Catalog(format!("Rate limited by Polaris catalog: {text}")));
+                return Err(SqeError::Catalog(format!(
+                    "Rate limited by Polaris catalog: {text}"
+                )));
             }
             if status == reqwest::StatusCode::CONFLICT {
-                return Err(SqeError::Execution(format!("Catalog commit conflict: {text}")));
+                return Err(SqeError::Execution(format!(
+                    "Catalog commit conflict: {text}"
+                )));
             }
             return Err(SqeError::Catalog(format!(
                 "Failed to commit schema update for '{table_ident}' (HTTP {status}): {text}"
@@ -1776,10 +1794,7 @@ impl Catalog for SessionCatalogBridge {
         dispatch_catalog!(self.session.inner, drop_namespace(namespace))
     }
 
-    async fn list_tables(
-        &self,
-        namespace: &NamespaceIdent,
-    ) -> iceberg::Result<Vec<TableIdent>> {
+    async fn list_tables(&self, namespace: &NamespaceIdent) -> iceberg::Result<Vec<TableIdent>> {
         dispatch_catalog!(self.session.inner, list_tables(namespace))
     }
 
@@ -1792,7 +1807,10 @@ impl Catalog for SessionCatalogBridge {
         let result = dispatch_catalog!(self.session.inner, create_table(namespace, creation))?;
         // Invalidate any stale cache entry for this table name.
         let ident = TableIdent::new(namespace.clone(), table_name);
-        self.session.table_cache.invalidate(&self.session.table_cache_key(&ident)).await;
+        self.session
+            .table_cache
+            .invalidate(&self.session.table_cache_key(&ident))
+            .await;
         Ok(result)
     }
 
@@ -1818,11 +1836,7 @@ impl Catalog for SessionCatalogBridge {
         dispatch_catalog!(self.session.inner, table_exists(table))
     }
 
-    async fn rename_table(
-        &self,
-        src: &TableIdent,
-        dest: &TableIdent,
-    ) -> iceberg::Result<()> {
+    async fn rename_table(&self, src: &TableIdent, dest: &TableIdent) -> iceberg::Result<()> {
         dispatch_catalog!(self.session.inner, rename_table(src, dest))
     }
 
@@ -1848,7 +1862,9 @@ impl Catalog for SessionCatalogBridge {
 
 #[cfg(test)]
 mod cache_capacity_tests {
-    use super::{REST_CATALOG_CACHE_MAX_CAPACITY, iceberg_error_is_forbidden, select_keys_for_suffix};
+    use super::{
+        iceberg_error_is_forbidden, select_keys_for_suffix, REST_CATALOG_CACHE_MAX_CAPACITY,
+    };
 
     /// Cross-token invalidation must evict EVERY token's entry for the table,
     /// not just one. Two users (different token fingerprints) cached the same
@@ -1867,7 +1883,10 @@ mod cache_capacity_tests {
         got.sort();
         assert_eq!(
             got,
-            vec!["tokA|sales.orders".to_string(), "tokB|sales.orders".to_string()],
+            vec![
+                "tokA|sales.orders".to_string(),
+                "tokB|sales.orders".to_string()
+            ],
             "both tokens' entries for sales.orders must be selected; others untouched"
         );
     }

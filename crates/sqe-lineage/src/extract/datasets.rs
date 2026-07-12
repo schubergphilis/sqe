@@ -35,8 +35,7 @@ pub fn extract_inputs(plan: &LogicalPlan, lookup: &CatalogLookup) -> Vec<InputDa
             table_name, source, ..
         }) = node
         {
-            let Some((catalog, schema, table)) = parse_table_ref(&table_name.to_string())
-            else {
+            let Some((catalog, schema, table)) = parse_table_ref(&table_name.to_string()) else {
                 return Ok(TreeNodeRecursion::Continue);
             };
 
@@ -84,12 +83,8 @@ pub fn extract_outputs(plan: &LogicalPlan, lookup: &CatalogLookup) -> Vec<Output
     let _ = plan.apply(|node| {
         let target_name: Option<String> = match node {
             LogicalPlan::Dml(stmt) => Some(stmt.table_name.to_string()),
-            LogicalPlan::Ddl(DdlStatement::CreateMemoryTable(ct)) => {
-                Some(ct.name.to_string())
-            }
-            LogicalPlan::Ddl(DdlStatement::CreateExternalTable(ct)) => {
-                Some(ct.name.to_string())
-            }
+            LogicalPlan::Ddl(DdlStatement::CreateMemoryTable(ct)) => Some(ct.name.to_string()),
+            LogicalPlan::Ddl(DdlStatement::CreateExternalTable(ct)) => Some(ct.name.to_string()),
             LogicalPlan::Ddl(DdlStatement::CreateView(cv)) => Some(cv.name.to_string()),
             _ => None,
         };

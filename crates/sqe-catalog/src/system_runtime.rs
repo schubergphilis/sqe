@@ -1,7 +1,9 @@
 use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
-use arrow_array::builder::{BooleanBuilder, Int64Builder, StringBuilder, TimestampMillisecondBuilder};
+use arrow_array::builder::{
+    BooleanBuilder, Int64Builder, StringBuilder, TimestampMillisecondBuilder,
+};
 use arrow_array::{ArrayRef, RecordBatch};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -74,6 +76,7 @@ pub struct RuntimeQueryRecord {
     pub rows_scanned: u64,
     pub spill_bytes: u64,
     pub peak_memory_bytes: u64,
+    pub trace_id: Option<String>,
     pub fragments: Vec<RuntimeFragmentInfo>,
 }
 
@@ -132,13 +135,8 @@ impl std::fmt::Debug for RuntimeSchemaProvider {
 
 #[async_trait]
 impl SchemaProvider for RuntimeSchemaProvider {
-
     fn table_names(&self) -> Vec<String> {
-        vec![
-            "queries".into(),
-            "nodes".into(),
-            "tasks".into(),
-        ]
+        vec!["queries".into(), "nodes".into(), "tasks".into()]
     }
 
     fn table_exist(&self, name: &str) -> bool {
@@ -191,6 +189,7 @@ fn queries_schema() -> Schema {
         Field::new("rows_scanned", DataType::Int64, false),
         Field::new("spill_bytes", DataType::Int64, false),
         Field::new("peak_memory_bytes", DataType::Int64, false),
+        Field::new("trace_id", DataType::Utf8, true),
         Field::new("error_type", DataType::Utf8, true),
         Field::new("error_code", DataType::Utf8, true),
     ])
@@ -224,6 +223,7 @@ fn build_queries_table(records: &[RuntimeQueryRecord]) -> DFResult<Arc<dyn Table
     let mut rows_scanned_b = Int64Builder::new();
     let mut spill_bytes_b = Int64Builder::new();
     let mut peak_memory_bytes_b = Int64Builder::new();
+    let mut trace_id_b = StringBuilder::new();
     let mut error_type_b = StringBuilder::new();
     let mut error_code_b = StringBuilder::new();
 
@@ -260,6 +260,10 @@ fn build_queries_table(records: &[RuntimeQueryRecord]) -> DFResult<Arc<dyn Table
         rows_scanned_b.append_value(u64_to_i64_saturating(rec.rows_scanned));
         spill_bytes_b.append_value(u64_to_i64_saturating(rec.spill_bytes));
         peak_memory_bytes_b.append_value(u64_to_i64_saturating(rec.peak_memory_bytes));
+        match &rec.trace_id {
+            Some(s) => trace_id_b.append_value(s),
+            None => trace_id_b.append_null(),
+        }
         match &rec.error_type {
             Some(s) => error_type_b.append_value(s),
             None => error_type_b.append_null(),
@@ -292,6 +296,7 @@ fn build_queries_table(records: &[RuntimeQueryRecord]) -> DFResult<Arc<dyn Table
             Arc::new(rows_scanned_b.finish()) as ArrayRef,
             Arc::new(spill_bytes_b.finish()) as ArrayRef,
             Arc::new(peak_memory_bytes_b.finish()) as ArrayRef,
+            Arc::new(trace_id_b.finish()) as ArrayRef,
             Arc::new(error_type_b.finish()) as ArrayRef,
             Arc::new(error_code_b.finish()) as ArrayRef,
         ],
@@ -461,6 +466,7 @@ mod tests {
                 rows_scanned: 10,
                 spill_bytes: 0,
                 peak_memory_bytes: 2048,
+                trace_id: None,
                 fragments: vec![],
             },
             RuntimeQueryRecord {
@@ -482,6 +488,7 @@ mod tests {
                 rows_scanned: 0,
                 spill_bytes: 0,
                 peak_memory_bytes: 0,
+                trace_id: None,
                 fragments: vec![],
             },
             RuntimeQueryRecord {
@@ -503,6 +510,7 @@ mod tests {
                 rows_scanned: 0,
                 spill_bytes: 0,
                 peak_memory_bytes: 0,
+                trace_id: None,
                 fragments: vec![],
             },
         ]
@@ -513,12 +521,12 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_queries_table_has_21_columns() {
+    fn test_queries_table_has_22_columns() {
         let table = build_queries_table(&sample_records()).unwrap();
         assert_eq!(
             table.schema().fields().len(),
-            21,
-            "queries table must have exactly 21 columns"
+            22,
+            "queries table must have exactly 22 columns"
         );
     }
 
@@ -546,6 +554,7 @@ mod tests {
             "rows_scanned",
             "spill_bytes",
             "peak_memory_bytes",
+            "trace_id",
             "error_type",
             "error_code",
         ];
@@ -561,7 +570,7 @@ mod tests {
     #[test]
     fn test_queries_table_empty_records() {
         let table = build_queries_table(&[]).unwrap();
-        assert_eq!(table.schema().fields().len(), 21);
+        assert_eq!(table.schema().fields().len(), 22);
     }
 
     #[test]
@@ -571,7 +580,11 @@ mod tests {
             let field = schema.field_with_name(name).unwrap();
             match field.data_type() {
                 DataType::Timestamp(TimeUnit::Millisecond, Some(tz)) => {
-                    assert_eq!(tz.as_ref(), "UTC", "timestamp column {name} must use UTC timezone");
+                    assert_eq!(
+                        tz.as_ref(),
+                        "UTC",
+                        "timestamp column {name} must use UTC timezone"
+                    );
                 }
                 other => panic!("expected Timestamp(Millisecond, UTC) for {name}, got {other:?}"),
             }
@@ -596,7 +609,13 @@ mod tests {
     fn test_nodes_table_column_names() {
         let table = build_nodes_table("wh", "http://localhost:8080", &[]).unwrap();
         let schema = table.schema();
-        let expected = ["node_id", "http_uri", "node_version", "coordinator", "state"];
+        let expected = [
+            "node_id",
+            "http_uri",
+            "node_version",
+            "coordinator",
+            "state",
+        ];
         for (i, name) in expected.iter().enumerate() {
             assert_eq!(
                 schema.field(i).name(),
@@ -644,7 +663,13 @@ mod tests {
         let table = build_tasks_table(&sample_records(), "my-wh").unwrap();
         let schema = table.schema();
         let expected = [
-            "query_id", "task_id", "node_id", "state", "elapsed_ms", "input_rows", "output_rows",
+            "query_id",
+            "task_id",
+            "node_id",
+            "state",
+            "elapsed_ms",
+            "input_rows",
+            "output_rows",
         ];
         for (i, name) in expected.iter().enumerate() {
             assert_eq!(
@@ -692,6 +717,7 @@ mod tests {
             rows_scanned: 0,
             spill_bytes: 0,
             peak_memory_bytes: 0,
+            trace_id: None,
             fragments: vec![
                 RuntimeFragmentInfo {
                     task_id: "frag-0".to_string(),
@@ -740,6 +766,7 @@ mod tests {
             rows_scanned: 0,
             spill_bytes: 0,
             peak_memory_bytes: 0,
+            trace_id: None,
             fragments: vec![],
         }];
 
@@ -788,10 +815,7 @@ mod tests {
         );
         for name in &["queries", "nodes", "tasks"] {
             let result = provider.table(name).await;
-            assert!(
-                result.is_ok(),
-                "table({name}) should succeed"
-            );
+            assert!(result.is_ok(), "table({name}) should succeed");
             assert!(
                 result.unwrap().is_some(),
                 "table({name}) should return Some"

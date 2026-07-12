@@ -2,28 +2,28 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use arrow_array::RecordBatch;
-use arrow_array::{ArrayRef, BooleanArray, builder::StringBuilder};
+use arrow_array::{builder::StringBuilder, ArrayRef, BooleanArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::execution::SendableRecordBatchStream;
-use datafusion::physical_optimizer::PhysicalOptimizerRule;
-use datafusion::physical_plan::{execute_stream, ExecutionPlan};
-use datafusion::physical_plan::joins::HashJoinExec;
-use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::logical_expr::JoinType;
-use futures::TryStreamExt;
+use datafusion::physical_optimizer::PhysicalOptimizerRule;
+use datafusion::physical_plan::joins::HashJoinExec;
+use datafusion::physical_plan::{execute_stream, ExecutionPlan};
 use datafusion::prelude::SessionContext;
+use futures::TryStreamExt;
 use tracing::{debug, info, warn, Span};
 
-use sqlparser::ast::{Statement, TableFactor};
 use sqe_catalog::{IcebergScanExec, SessionCatalog};
 use sqe_core::{QueryConfig, SecretStore, Session, SortMode, SqeConfig, SqeError};
+use sqlparser::ast::{Statement, TableFactor};
 
 use crate::adaptive_sort;
-use sqe_policy::{PolicyEnforcer, PolicyStore};
 use sqe_policy::grants::{
     AccessCheck, GrantBackend, GrantFilter, GrantStatement, Grantee, RevokeStatement,
 };
+use sqe_policy::{PolicyEnforcer, PolicyStore};
 use sqe_sql::StatementKind;
 
 use crate::catalog_ops::CatalogOps;
@@ -177,17 +177,21 @@ impl QueryHandler {
             });
             maintenance_handler = maintenance_handler.with_query_history(f);
         }
-        let explain_handler = crate::explain::ExplainHandler::new(Arc::clone(&policy_enforcer), &config.query);
+        let explain_handler =
+            crate::explain::ExplainHandler::new(Arc::clone(&policy_enforcer), &config.query);
         let query_semaphore = if config.query.max_concurrent_queries > 0 {
-            Some(Arc::new(tokio::sync::Semaphore::new(config.query.max_concurrent_queries)))
+            Some(Arc::new(tokio::sync::Semaphore::new(
+                config.query.max_concurrent_queries,
+            )))
         } else {
             None
         };
 
         // Build shared DataFusion runtime with FairSpillPool for memory management
         // and optional spill-to-disk. This is built once and shared across all queries.
-        let runtime = crate::runtime::build_coordinator_runtime(&config.coordinator, &config.storage)
-            .map_err(|e| sqe_core::SqeError::Config(format!("Failed to build runtime: {e}")))?;
+        let runtime =
+            crate::runtime::build_coordinator_runtime(&config.coordinator, &config.storage)
+                .map_err(|e| sqe_core::SqeError::Config(format!("Failed to build runtime: {e}")))?;
 
         let per_user_memory_budget_bytes = if config.query.per_user_memory_budget == "0" {
             0
@@ -495,9 +499,7 @@ impl QueryHandler {
         }
 
         // Static mode: an unknown qualifier is an error. Never probe Polaris.
-        if self.config.query.catalog_discovery
-            != sqe_core::config::CatalogDiscovery::PolarisAuto
-        {
+        if self.config.query.catalog_discovery != sqe_core::config::CatalogDiscovery::PolarisAuto {
             let unknown = qualifiers
                 .iter()
                 .find(|q| !known.contains(*q))
@@ -579,9 +581,7 @@ impl QueryHandler {
         // coordinator's FairSpillPool is >95% utilized (Red).
         let pressure = crate::memory::check_pressure(&self.runtime.memory_pool);
         if let Some(ref metrics) = self.metrics {
-            metrics
-                .coordinator_memory_pressure
-                .set(pressure.as_gauge());
+            metrics.coordinator_memory_pressure.set(pressure.as_gauge());
             metrics
                 .coordinator_memory_used_bytes
                 .set(crate::memory::used_bytes(&self.runtime.memory_pool) as f64);
@@ -633,28 +633,27 @@ impl QueryHandler {
         // Per-user memory reservation. Reject when this user's in-flight
         // queries would push past their share of the global pool, before
         // the global red-band check fires for everyone else.
-        let _per_user_mem_reservation = if self.per_user_memory_budget_bytes > 0
-            && self.per_query_memory_bytes > 0
-        {
-            let username = session.user.username.clone();
-            match self.per_user_memory.try_reserve(
-                &username,
-                self.per_query_memory_bytes,
-                self.per_user_memory_budget_bytes,
-            ) {
-                Some(r) => Some(r),
-                None => {
-                    let used = self.per_user_memory.used_bytes(&username);
-                    return Err(SqeError::Execution(format!(
-                        "Per-user memory budget exceeded for '{}': {} bytes reserved, \
+        let _per_user_mem_reservation =
+            if self.per_user_memory_budget_bytes > 0 && self.per_query_memory_bytes > 0 {
+                let username = session.user.username.clone();
+                match self.per_user_memory.try_reserve(
+                    &username,
+                    self.per_query_memory_bytes,
+                    self.per_user_memory_budget_bytes,
+                ) {
+                    Some(r) => Some(r),
+                    None => {
+                        let used = self.per_user_memory.used_bytes(&username);
+                        return Err(SqeError::Execution(format!(
+                            "Per-user memory budget exceeded for '{}': {} bytes reserved, \
                          limit {} bytes. Wait for in-flight queries to complete.",
-                        username, used, self.per_user_memory_budget_bytes
-                    )));
+                            username, used, self.per_user_memory_budget_bytes
+                        )));
+                    }
                 }
-            }
-        } else {
-            None
-        };
+            } else {
+                None
+            };
 
         let _permit = if let Some(ref sem) = self.query_semaphore {
             match sem.clone().try_acquire_owned() {
@@ -676,9 +675,9 @@ impl QueryHandler {
         // PARTITIONED BY into sqlparser-friendly PARTITION BY. The returned
         // ClassifiableSql proves at the type level that the input is safe
         // to hand to the classifier (issue #117).
-        let kind = sqe_sql::parse_and_classify_typed(
-            &sqe_sql::pre_parse_pipeline(&sqe_sql::UserSql::from(sql))?,
-        )?;
+        let kind = sqe_sql::parse_and_classify_typed(&sqe_sql::pre_parse_pipeline(
+            &sqe_sql::UserSql::from(sql),
+        )?)?;
         let kind_name = kind.name().to_string();
 
         // Pre-flight: when a 3-part identifier names a catalog that the
@@ -717,6 +716,7 @@ impl QueryHandler {
             sql_length = sql.len(),
             "Executing query"
         );
+        let trace_id = sqe_metrics::propagation::current_trace_id();
         let cancel_token = self.query_tracker.start(
             query_id,
             &session.user.username,
@@ -731,8 +731,8 @@ impl QueryHandler {
         // OpenLineage: emit START event. The observer is sync and best-effort;
         // failures inside the observer (full channel, etc.) increment a metric
         // but do not affect query execution.
-        let ol_emit = self.lineage.is_some()
-            && should_emit(&kind, &self.config.metrics.openlineage);
+        let ol_emit =
+            self.lineage.is_some() && should_emit(&kind, &self.config.metrics.openlineage);
         if ol_emit {
             if let Some(ref obs) = self.lineage {
                 obs.on_query_start(sqe_lineage::QueryStartCtx {
@@ -756,7 +756,16 @@ impl QueryHandler {
                 if let Some(cached) = cache.lookup(&session.user.username, sql) {
                     debug!(username = %session.user.username, "Cache hit");
                     let rows: usize = cached.batches.iter().map(|b| b.num_rows()).sum();
-                    self.query_tracker.complete(&query_id, rows, 0, cached.tables_touched.clone(), 0, 0, 0, 0);
+                    self.query_tracker.complete(
+                        &query_id,
+                        rows,
+                        0,
+                        cached.tables_touched.clone(),
+                        0,
+                        0,
+                        0,
+                        0,
+                    );
                     if let Some(ref metrics) = self.metrics {
                         metrics
                             .query_count
@@ -772,7 +781,12 @@ impl QueryHandler {
                             let ol_ended_at = chrono::Utc::now();
                             obs.on_query_complete(sqe_lineage::QueryCompleteCtx {
                                 run_id: query_id,
-                                job_namespace: self.config.metrics.openlineage.job_namespace.clone(),
+                                job_namespace: self
+                                    .config
+                                    .metrics
+                                    .openlineage
+                                    .job_namespace
+                                    .clone(),
                                 sql: sql.to_string(),
                                 user: sqe_lineage::UserCtx {
                                     username: session.user.username.clone(),
@@ -797,7 +811,8 @@ impl QueryHandler {
         }
 
         // Mark query as running (planning phase complete)
-        self.query_tracker.running(&query_id, start.elapsed().as_millis() as u64);
+        self.query_tracker
+            .running(&query_id, start.elapsed().as_millis() as u64);
 
         // Determine the effective timeout for this session (role overrides may increase it)
         let timeout_secs = timeout_for_session(&self.config.query, session);
@@ -814,7 +829,17 @@ impl QueryHandler {
         let mut policy_summary: Option<sqe_policy::PolicySummary> = None;
         let execution_future = async {
             match &kind {
-                StatementKind::Query(_) => self.execute_query(session, sql, &query_id, &plan_metrics, &mut captured_plan, &mut policy_summary).await,
+                StatementKind::Query(_) => {
+                    self.execute_query(
+                        session,
+                        sql,
+                        &query_id,
+                        &plan_metrics,
+                        &mut captured_plan,
+                        &mut policy_summary,
+                    )
+                    .await
+                }
 
                 StatementKind::ShowCatalogs => self.handle_show_catalogs(session).await,
 
@@ -822,12 +847,13 @@ impl QueryHandler {
                     self.handle_show_schemas(session, filter).await
                 }
 
-                StatementKind::ShowTables(filter) => {
-                    self.handle_show_tables(session, filter).await
-                }
+                StatementKind::ShowTables(filter) => self.handle_show_tables(session, filter).await,
 
                 StatementKind::Utility(stmt) => {
-                    if let sqlparser::ast::Statement::Explain { analyze, statement, .. } = stmt.as_ref() {
+                    if let sqlparser::ast::Statement::Explain {
+                        analyze, statement, ..
+                    } = stmt.as_ref()
+                    {
                         let inner = statement.to_string();
                         let (ctx, _) = self.create_session_context(session).await?;
                         if *analyze {
@@ -835,9 +861,8 @@ impl QueryHandler {
                         } else {
                             self.explain_handler.plan(session, &inner, &ctx).await
                         }
-                    } else if let sqlparser::ast::Statement::ShowColumns {
-                        show_options, ..
-                    } = stmt.as_ref()
+                    } else if let sqlparser::ast::Statement::ShowColumns { show_options, .. } =
+                        stmt.as_ref()
                     {
                         // Trino: SHOW COLUMNS FROM ns.table -> rewrite as a
                         // query against information_schema.columns. Same pattern
@@ -857,8 +882,12 @@ impl QueryHandler {
                         // SHOW COLUMNS. EXPLAIN TABLE (a different alias) is not
                         // a column-listing request, so it is not redirected.
                         use sqlparser::ast::DescribeAlias;
-                        if matches!(describe_alias, DescribeAlias::Describe | DescribeAlias::Desc) {
-                            self.columns_for_table(session, &table_name.to_string()).await
+                        if matches!(
+                            describe_alias,
+                            DescribeAlias::Describe | DescribeAlias::Desc
+                        ) {
+                            self.columns_for_table(session, &table_name.to_string())
+                                .await
                         } else {
                             Err(SqeError::NotImplemented(format!(
                                 "Utility statement not supported: {stmt}"
@@ -878,9 +907,10 @@ impl QueryHandler {
                         // connection setup does not fail. Accepting only the
                         // SetTimeZone variant keeps every other unsupported SET
                         // shape surfacing its clear error below. (#351b)
-                        if let sqlparser::ast::Statement::Set(
-                            sqlparser::ast::Set::SetTimeZone { value, .. },
-                        ) = stmt.as_ref()
+                        if let sqlparser::ast::Statement::Set(sqlparser::ast::Set::SetTimeZone {
+                            value,
+                            ..
+                        }) = stmt.as_ref()
                         {
                             tracing::info!(
                                 requested_time_zone = %value,
@@ -889,7 +919,10 @@ impl QueryHandler {
                             );
                         }
                         Ok(Vec::new())
-                    } else if matches!(stmt.as_ref(), sqlparser::ast::Statement::ShowFunctions { .. }) {
+                    } else if matches!(
+                        stmt.as_ref(),
+                        sqlparser::ast::Statement::ShowFunctions { .. }
+                    ) {
                         // SHOW FUNCTIONS -> list the registered functions with
                         // Trino's column shape (#344).
                         self.handle_show_functions(session).await
@@ -921,9 +954,15 @@ impl QueryHandler {
 
                 StatementKind::Grant(ref stmt) => self.handle_grant(session, stmt).await,
                 StatementKind::Revoke(ref stmt) => self.handle_revoke(session, stmt).await,
-                StatementKind::ShowGrants(ref target) => self.handle_show_grants(session, target).await,
-                StatementKind::ShowEffectiveGrants(ref user) => self.handle_show_effective_grants(session, user).await,
-                StatementKind::CheckAccess(ref params) => self.handle_check_access(session, params).await,
+                StatementKind::ShowGrants(ref target) => {
+                    self.handle_show_grants(session, target).await
+                }
+                StatementKind::ShowEffectiveGrants(ref user) => {
+                    self.handle_show_effective_grants(session, user).await
+                }
+                StatementKind::CheckAccess(ref params) => {
+                    self.handle_check_access(session, params).await
+                }
                 StatementKind::ShowEffectivePolicy(ref params) => {
                     self.handle_show_effective_policy(session, params).await
                 }
@@ -955,7 +994,11 @@ impl QueryHandler {
                     crate::session_context::invalidate_session_cache(&session.user.username).await;
                     Ok(vec![])
                 }
-                StatementKind::DropNestedColumn { table, path, if_exists } => {
+                StatementKind::DropNestedColumn {
+                    table,
+                    path,
+                    if_exists,
+                } => {
                     self.catalog_ops
                         .drop_nested_column(session, table, path, *if_exists)
                         .await?;
@@ -1053,7 +1096,8 @@ impl QueryHandler {
                             }
                             let select_sql = sqe_sql::rewrite_named_tvf_args(&format!("{query}"));
                             let (ctx, _) = self.create_session_context(session).await?;
-                            let result = self.write_handler
+                            let result = self
+                                .write_handler
                                 .handle_ctas_streaming(
                                     session,
                                     stmt,
@@ -1063,7 +1107,10 @@ impl QueryHandler {
                                     &mut policy_summary,
                                 )
                                 .await;
-                            crate::session_context::invalidate_session_cache(&session.user.username).await;
+                            crate::session_context::invalidate_session_cache(
+                                &session.user.username,
+                            )
+                            .await;
                             result
                         } else {
                             Err(SqeError::Execution("CTAS without SELECT query".into()))
@@ -1147,7 +1194,9 @@ impl QueryHandler {
                 // The actual session mutation happens in the Trino HTTP layer via
                 // X-Trino-Set-Catalog / X-Trino-Set-Schema response headers.
                 StatementKind::Use(ref target) => {
-                    tracing::info!("USE {target} — session catalog/schema switch (no-op at engine level)");
+                    tracing::info!(
+                        "USE {target} — session catalog/schema switch (no-op at engine level)"
+                    );
                     Ok(vec![])
                 }
 
@@ -1184,17 +1233,18 @@ impl QueryHandler {
                             )
                             .await
                     } else {
-                        Err(SqeError::Execution("Failed to rewrite TRUNCATE as DELETE".into()))
+                        Err(SqeError::Execution(
+                            "Failed to rewrite TRUNCATE as DELETE".into(),
+                        ))
                     }
                 }
 
                 // CALL procedure — not supported
-                StatementKind::Call(_) => {
-                    Err(SqeError::NotImplemented(
-                        "CALL is not supported. SQE does not have stored procedures. \
-                         Use SQL statements directly instead.".into(),
-                    ))
-                }
+                StatementKind::Call(_) => Err(SqeError::NotImplemented(
+                    "CALL is not supported. SQE does not have stored procedures. \
+                         Use SQL statements directly instead."
+                        .into(),
+                )),
 
                 // CALL system.<maintenance procedure>(...) - Iceberg
                 // compaction, snapshot expiry, orphan file removal, manifest
@@ -1225,9 +1275,7 @@ impl QueryHandler {
                     //    than the Iceberg identifier. Nuke the whole result
                     //    cache after a procedure: maintenance procedures are
                     //    rare and the cache rebuilds cheaply on next read.
-                    crate::session_context::invalidate_session_cache(
-                        &session.user.username,
-                    ).await;
+                    crate::session_context::invalidate_session_cache(&session.user.username).await;
                     if let Some(ref qcache) = self.query_cache {
                         qcache.invalidate_all();
                     }
@@ -1237,7 +1285,8 @@ impl QueryHandler {
                 // COMMENT ON TABLE/COLUMN — store as Iceberg table property
                 StatementKind::Comment(ref stmt) => {
                     let (_, session_catalog) = self.create_session_context(session).await?;
-                    self.handle_comment_on(session, stmt, &session_catalog).await
+                    self.handle_comment_on(session, stmt, &session_catalog)
+                        .await
                 }
 
                 // SHOW STATS FOR table — Trino per-column stats result set
@@ -1259,9 +1308,7 @@ impl QueryHandler {
                     let source_sql = if let Statement::Merge(merge) = stmt.as_ref() {
                         merge_source_sql(&merge.source)?
                     } else {
-                        return Err(SqeError::Execution(
-                            "Expected MERGE statement".into(),
-                        ));
+                        return Err(SqeError::Execution("Expected MERGE statement".into()));
                     };
                     let (ctx, session_catalog) = self.create_session_context(session).await?;
                     // Capture the MERGE source plan from `execute_query`. The
@@ -1273,7 +1320,14 @@ impl QueryHandler {
                     // The MERGE source's policy summary is recorded against the
                     // outer MERGE statement's audit entry via `policy_summary`.
                     let source_batches = self
-                        .execute_query(session, &source_sql, &query_id, &plan_metrics, &mut merge_source_plan, &mut policy_summary)
+                        .execute_query(
+                            session,
+                            &source_sql,
+                            &query_id,
+                            &plan_metrics,
+                            &mut merge_source_plan,
+                            &mut policy_summary,
+                        )
                         .await?;
                     let merge_source_logical = match merge_source_plan {
                         Some(sqe_lineage::PlanOrHint::Plan(p)) => Some(*p),
@@ -1369,8 +1423,7 @@ impl QueryHandler {
         if let Err(ref err) = result {
             if matches!(
                 err.error_code(),
-                sqe_core::SqeErrorCode::AuthenticationFailed
-                    | sqe_core::SqeErrorCode::AccessDenied
+                sqe_core::SqeErrorCode::AuthenticationFailed | sqe_core::SqeErrorCode::AccessDenied
             ) {
                 warn!(
                     username = %session.user.username,
@@ -1401,7 +1454,10 @@ impl QueryHandler {
         };
         // Hoist plan metrics so they are in scope at the audit emit site below,
         // regardless of whether the query succeeded or failed.
-        let pm = plan_metrics.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let pm = plan_metrics
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         if result.is_ok() {
             self.query_tracker.complete(
                 &query_id,
@@ -1693,16 +1749,15 @@ impl QueryHandler {
                     .statement()
                     .and_then(|ast_stmt| Self::extract_grant_statement(ast_stmt).ok())
                     .map(|gs| {
-                        let name = gs.table
+                        let name = gs
+                            .table
                             .clone()
                             .or_else(|| gs.namespace.clone())
                             .or_else(|| gs.catalog.clone())
                             .unwrap_or_else(|| "*".to_string());
                         vec![sqe_metrics::audit::Resource {
                             catalog: gs.catalog,
-                            namespace: gs.namespace
-                                .map(|n| vec![n])
-                                .unwrap_or_default(),
+                            namespace: gs.namespace.map(|n| vec![n]).unwrap_or_default(),
                             name,
                             object_type: sqe_metrics::audit::ObjectType::Table,
                         }]
@@ -1998,36 +2053,35 @@ impl QueryHandler {
         // it releases when the result stream drops, not when the planning
         // call returns. Without this, large multi-second streams would
         // appear to free their budget immediately on admission.
-        let per_user_mem_reservation = if self.per_user_memory_budget_bytes > 0
-            && self.per_query_memory_bytes > 0
-        {
-            let username = session.user.username.clone();
-            match self.per_user_memory.try_reserve(
-                &username,
-                self.per_query_memory_bytes,
-                self.per_user_memory_budget_bytes,
-            ) {
-                Some(r) => Some(r),
-                None => {
-                    let used = self.per_user_memory.used_bytes(&username);
-                    return Err(SqeError::Execution(format!(
-                        "Per-user memory budget exceeded for '{}': {} bytes reserved, \
+        let per_user_mem_reservation =
+            if self.per_user_memory_budget_bytes > 0 && self.per_query_memory_bytes > 0 {
+                let username = session.user.username.clone();
+                match self.per_user_memory.try_reserve(
+                    &username,
+                    self.per_query_memory_bytes,
+                    self.per_user_memory_budget_bytes,
+                ) {
+                    Some(r) => Some(r),
+                    None => {
+                        let used = self.per_user_memory.used_bytes(&username);
+                        return Err(SqeError::Execution(format!(
+                            "Per-user memory budget exceeded for '{}': {} bytes reserved, \
                          limit {} bytes. Wait for in-flight queries to complete.",
-                        username, used, self.per_user_memory_budget_bytes
-                    )));
+                            username, used, self.per_user_memory_budget_bytes
+                        )));
+                    }
                 }
-            }
-        } else {
-            None
-        };
+            } else {
+                None
+            };
 
         // --- Classify ---------------------------------------------------------
         // See execute() for the pipeline rationale. The typed wrapper proves
         // at compile time that the classifier sees normalized SQL only
         // (issue #117).
-        let kind = sqe_sql::parse_and_classify_typed(
-            &sqe_sql::pre_parse_pipeline(&sqe_sql::UserSql::from(sql))?,
-        )?;
+        let kind = sqe_sql::parse_and_classify_typed(&sqe_sql::pre_parse_pipeline(
+            &sqe_sql::UserSql::from(sql),
+        )?)?;
         let kind_name = kind.name().to_string();
         if !matches!(kind, StatementKind::Query(_)) {
             return Err(SqeError::NotImplemented(
@@ -2066,7 +2120,15 @@ impl QueryHandler {
         );
 
         match self.open_stream(session, sql, &query_id, start).await {
-            Ok((schema, inner_stream, final_plan, tt_cleanup, tables_touched, policy_summary, audit_resources)) => {
+            Ok((
+                schema,
+                inner_stream,
+                final_plan,
+                tt_cleanup,
+                tables_touched,
+                policy_summary,
+                audit_resources,
+            )) => {
                 let actor = sqe_metrics::audit::Actor::from_parts(
                     session.user.username.clone(),
                     session.user.subject.clone(),
@@ -2161,8 +2223,9 @@ impl QueryHandler {
         let (ctx, session_catalog) = self.create_session_context(session).await?;
 
         let sql = self.handle_incremental(sql, &ctx, &session_catalog).await?;
-        let (sql, tt_cleanup) =
-            self.handle_time_travel(&sql, &ctx, session, &session_catalog).await?;
+        let (sql, tt_cleanup) = self
+            .handle_time_travel(&sql, &ctx, session, &session_catalog)
+            .await?;
         // Apply Trino-compat AST rewrites before planning, matching the
         // execute() path. Today this matters for the empty-input ROLLUP /
         // CUBE / GROUPING SETS wrap that works around apache/datafusion#21570;
@@ -2213,9 +2276,8 @@ impl QueryHandler {
 
         // Star-schema join reorder
         let physical_plan = if self.config.query.star_schema_reorder {
-            let rule = sqe_planner::StarSchemaReorderRule::new(
-                self.config.query.star_schema_min_ratio,
-            );
+            let rule =
+                sqe_planner::StarSchemaReorderRule::new(self.config.query.star_schema_min_ratio);
             match rule.optimize(
                 physical_plan.clone(),
                 &datafusion::config::ConfigOptions::new(),
@@ -2278,10 +2340,9 @@ impl QueryHandler {
         // CollectLeft and parallelizes only the probe). Default off until the
         // q72 benchmark gate passes.
         let physical_plan = if self.config.query.parallel_scan {
-            let byte_threshold = sqe_core::parse_memory_limit(
-                &self.config.query.distribution_threshold,
-            )
-            .unwrap_or(0);
+            let byte_threshold =
+                sqe_core::parse_memory_limit(&self.config.query.distribution_threshold)
+                    .unwrap_or(0);
             let state = ctx.state();
             let rule = crate::parallel_scan::ParallelScanRule::new(byte_threshold);
             match rule.optimize(physical_plan.clone(), state.config_options()) {
@@ -2323,7 +2384,15 @@ impl QueryHandler {
         let stream = execute_stream(Arc::clone(&final_plan), ctx.task_ctx())
             .map_err(|e| SqeError::Execution(format!("Query execution failed: {e}")))?;
 
-        Ok((schema, stream, final_plan, tt_cleanup, tables_touched, policy_summary, audit_resources))
+        Ok((
+            schema,
+            stream,
+            final_plan,
+            tt_cleanup,
+            tables_touched,
+            policy_summary,
+            audit_resources,
+        ))
     }
 
     /// Return the schema for a SQL statement without executing it.
@@ -2332,16 +2401,12 @@ impl QueryHandler {
     /// other statements (SHOW, DDL, DML) we return an empty schema since
     /// they are side-effect-only and Flight SQL only needs the schema for
     /// the `get_flight_info` response.
-    pub async fn get_schema(
-        &self,
-        session: &Session,
-        sql: &str,
-    ) -> sqe_core::Result<SchemaRef> {
+    pub async fn get_schema(&self, session: &Session, sql: &str) -> sqe_core::Result<SchemaRef> {
         // Run the pre-parse pipeline before handing to the classifier;
         // see `pipeline_types.rs` for the trust-boundary contract (issue #117).
-        let kind = sqe_sql::parse_and_classify_typed(
-            &sqe_sql::pre_parse_pipeline(&sqe_sql::UserSql::from(sql))?,
-        )?;
+        let kind = sqe_sql::parse_and_classify_typed(&sqe_sql::pre_parse_pipeline(
+            &sqe_sql::UserSql::from(sql),
+        )?)?;
 
         if matches!(kind, StatementKind::Query(_)) {
             // get_flight_info plans the result schema WITHOUT executing, so it
@@ -2361,9 +2426,7 @@ impl QueryHandler {
             // tables with their augmented schemas. The FOR INCREMENTAL clause
             // must be stripped before handle_time_travel sees it because that
             // step parses the SQL with sqlparser.
-            let sql_for_plan = self
-                .handle_incremental(sql, &ctx, &session_catalog)
-                .await?;
+            let sql_for_plan = self.handle_incremental(sql, &ctx, &session_catalog).await?;
             let (sql_for_plan, _tt_cleanup) = self
                 .handle_time_travel(&sql_for_plan, &ctx, session, &session_catalog)
                 .await?;
@@ -2419,9 +2482,9 @@ impl QueryHandler {
         numbered_sql: &str,
         param_count: usize,
     ) -> sqe_core::Result<Vec<Option<DataType>>> {
-        let kind = sqe_sql::parse_and_classify_typed(
-            &sqe_sql::pre_parse_pipeline(&sqe_sql::UserSql::from(numbered_sql))?,
-        )?;
+        let kind = sqe_sql::parse_and_classify_typed(&sqe_sql::pre_parse_pipeline(
+            &sqe_sql::UserSql::from(numbered_sql),
+        )?)?;
         if let Some(stmt) = kind.statement() {
             self.preflight_resolve_catalogs(stmt, session).await?;
         }
@@ -2496,10 +2559,8 @@ impl QueryHandler {
 
         // Get the logical plan and run policy enforcement
         let plan = df.logical_plan().clone();
-        let (enforced_plan, policy_summary) = self
-            .policy_enforcer
-            .evaluate(&session.user, plan)
-            .await?;
+        let (enforced_plan, policy_summary) =
+            self.policy_enforcer.evaluate(&session.user, plan).await?;
 
         debug!("Policy-enforced plan: {:?}", enforced_plan);
 
@@ -2512,7 +2573,9 @@ impl QueryHandler {
         // Capture the enforced plan for OpenLineage extraction. Cloning into
         // a Box keeps the lineage path independent of DataFusion's
         // execute_logical_plan consumption pattern below.
-        *plan_out = Some(sqe_lineage::PlanOrHint::Plan(Box::new(enforced_plan.clone())));
+        *plan_out = Some(sqe_lineage::PlanOrHint::Plan(Box::new(
+            enforced_plan.clone(),
+        )));
 
         // Create a new DataFrame from the enforced plan
         let enforced_df = ctx
@@ -2530,10 +2593,12 @@ impl QueryHandler {
         // small dimension tables are joined first and the large fact table is
         // probed last.
         let physical_plan = if self.config.query.star_schema_reorder {
-            let rule = sqe_planner::StarSchemaReorderRule::new(
-                self.config.query.star_schema_min_ratio,
-            );
-            match rule.optimize(physical_plan.clone(), &datafusion::config::ConfigOptions::new()) {
+            let rule =
+                sqe_planner::StarSchemaReorderRule::new(self.config.query.star_schema_min_ratio);
+            match rule.optimize(
+                physical_plan.clone(),
+                &datafusion::config::ConfigOptions::new(),
+            ) {
                 Ok(optimized) => optimized,
                 Err(e) => {
                     debug!(
@@ -2604,7 +2669,11 @@ impl QueryHandler {
         let configured_max = self.config.query.max_result_rows;
         let memory_ceiling: usize = {
             let bytes = crate::memory::limit_bytes(&self.runtime.memory_pool);
-            if bytes == 0 { 0 } else { bytes / 256 }
+            if bytes == 0 {
+                0
+            } else {
+                bytes / 256
+            }
         };
         let effective_max: usize = match (configured_max, memory_ceiling) {
             (0, 0) => 0, // neither cap configured. Falls back to OS behaviour.
@@ -2737,7 +2806,9 @@ impl QueryHandler {
         let iceberg_scan = match scan_node.downcast_ref::<IcebergScanExec>() {
             Some(s) => s,
             None => {
-                tracing::warn!("find_iceberg_scan returned unexpected node type, falling back to local");
+                tracing::warn!(
+                    "find_iceberg_scan returned unexpected node type, falling back to local"
+                );
                 return plan;
             }
         };
@@ -2768,15 +2839,18 @@ impl QueryHandler {
                 "Scan below distribution file threshold — executing locally"
             );
             if let Some(ref metrics) = self.metrics {
-                metrics.scheduler_decisions.with_label_values(&["local"]).inc();
+                metrics
+                    .scheduler_decisions
+                    .with_label_values(&["local"])
+                    .inc();
             }
             return plan;
         }
 
         // Also check the byte-size threshold using real sizes from the manifest.
-        let distribution_threshold = sqe_core::parse_memory_limit(
-            &self.config.query.distribution_threshold
-        ).unwrap_or(128 * 1024 * 1024);
+        let distribution_threshold =
+            sqe_core::parse_memory_limit(&self.config.query.distribution_threshold)
+                .unwrap_or(128 * 1024 * 1024);
 
         if distribution_threshold > 0 {
             let total_bytes: u64 = file_info.iter().map(|(_, size)| size).sum();
@@ -2788,7 +2862,10 @@ impl QueryHandler {
                     "Scan below distribution byte threshold — executing locally"
                 );
                 if let Some(ref metrics) = self.metrics {
-                    metrics.scheduler_decisions.with_label_values(&["local"]).inc();
+                    metrics
+                        .scheduler_decisions
+                        .with_label_values(&["local"])
+                        .inc();
                 }
                 return plan;
             }
@@ -2799,20 +2876,18 @@ impl QueryHandler {
         if total_files < num_workers {
             debug!(
                 total_files,
-                num_workers,
-                "Fewer files than workers, executing locally"
+                num_workers, "Fewer files than workers, executing locally"
             );
             if let Some(ref metrics) = self.metrics {
-                metrics.scheduler_decisions.with_label_values(&["local"]).inc();
+                metrics
+                    .scheduler_decisions
+                    .with_label_values(&["local"])
+                    .inc();
             }
             return plan;
         }
 
-        info!(
-            total_files,
-            num_workers,
-            "Distributing scan across workers"
-        );
+        info!(total_files, num_workers, "Distributing scan across workers");
 
         // 6. Get projected columns + Iceberg field IDs from the scan. Field
         // IDs (#43) let the worker project by the parquet PARQUET:field_id
@@ -2847,9 +2922,8 @@ impl QueryHandler {
         // pushdown can be disabled without a redeploy.
         let (predicate_proto, scan_limit): (Option<Vec<u8>>, Option<usize>) =
             if self.config.query.distributed_scan_pushdown {
-                let pred = crate::scan_pushdown::serialize_scan_predicate(
-                    iceberg_scan.df_filters(),
-                );
+                let pred =
+                    crate::scan_pushdown::serialize_scan_predicate(iceberg_scan.df_filters());
                 let lim = crate::scan_pushdown::extract_pushable_limit(&plan, &scan_node);
                 if pred.is_some() || lim.is_some() {
                     debug!(
@@ -2867,9 +2941,8 @@ impl QueryHandler {
         // target_size_bytes: read from config or fall back to 256 MiB.
         // max_bins: allow up to 3 tasks per worker so work is evenly spread
         // even when file sizes vary widely.
-        let target_size_bytes = sqe_core::parse_memory_limit(
-            &self.config.query.target_task_size
-        ).unwrap_or(256 * 1024 * 1024) as u64;
+        let target_size_bytes = sqe_core::parse_memory_limit(&self.config.query.target_task_size)
+            .unwrap_or(256 * 1024 * 1024) as u64;
         let max_bins = num_workers * 3;
         let file_groups = sqe_planner::bin_pack_files(file_info, target_size_bytes, max_bins);
 
@@ -2903,14 +2976,22 @@ impl QueryHandler {
         if scan_tasks.is_empty() {
             debug!("No non-empty scan tasks after splitting, executing locally");
             if let Some(ref metrics) = self.metrics {
-                metrics.scheduler_decisions.with_label_values(&["local"]).inc();
+                metrics
+                    .scheduler_decisions
+                    .with_label_values(&["local"])
+                    .inc();
             }
             return plan;
         }
 
         if let Some(ref metrics) = self.metrics {
-            metrics.scheduler_decisions.with_label_values(&["distributed"]).inc();
-            metrics.scheduler_task_count.observe(scan_tasks.len() as f64);
+            metrics
+                .scheduler_decisions
+                .with_label_values(&["distributed"])
+                .inc();
+            metrics
+                .scheduler_task_count
+                .observe(scan_tasks.len() as f64);
             for task in &scan_tasks {
                 let size_mb = task.file_sizes_bytes.iter().sum::<u64>() as f64 / (1024.0 * 1024.0);
                 metrics.scheduler_task_size_mb.observe(size_mb);
@@ -3025,18 +3106,17 @@ impl QueryHandler {
 
         // 12. Build the DistributedScanExec
         let schema = scan_node.schema();
-        let mut exec = crate::distributed_scan::DistributedScanExec::new(
-            scan_tasks,
-            worker_urls,
-            schema,
-        )
-        .with_fragment_callback(callback)
-        .with_pushed_down_filters(iceberg_scan.pushed_down_filters().to_vec())
-        .with_worker_secret(self.config.coordinator.worker_secret.expose().to_string())
-        .with_timeouts(
-            std::time::Duration::from_secs(self.config.coordinator.worker_connect_timeout_secs),
-            std::time::Duration::from_secs(self.config.coordinator.worker_rpc_timeout_secs),
-        );
+        let mut exec =
+            crate::distributed_scan::DistributedScanExec::new(scan_tasks, worker_urls, schema)
+                .with_fragment_callback(callback)
+                .with_pushed_down_filters(iceberg_scan.pushed_down_filters().to_vec())
+                .with_worker_secret(self.config.coordinator.worker_secret.expose().to_string())
+                .with_timeouts(
+                    std::time::Duration::from_secs(
+                        self.config.coordinator.worker_connect_timeout_secs,
+                    ),
+                    std::time::Duration::from_secs(self.config.coordinator.worker_rpc_timeout_secs),
+                );
 
         // Attach worker registry for health tracking / failover
         exec = exec.with_worker_registry(Arc::clone(registry));
@@ -3089,11 +3169,7 @@ impl QueryHandler {
         // Extract object name from the ShowCreate statement
         let table_name = match stmt {
             Statement::ShowCreate { obj_name, .. } => obj_name.to_string(),
-            _ => {
-                return Err(SqeError::Execution(
-                    "Expected ShowCreate statement".into(),
-                ))
-            }
+            _ => return Err(SqeError::Execution("Expected ShowCreate statement".into())),
         };
 
         // Query information_schema.columns for the table's column definitions,
@@ -3103,12 +3179,14 @@ impl QueryHandler {
         // back empty for tables outside the default catalog. (#2)
         let col_sql = info_schema_columns_query(&table_name);
 
-        let df = ctx.sql(&col_sql).await.map_err(|e| {
-            SqeError::Execution(format!("Failed to query column metadata: {e}"))
-        })?;
-        let batches = df.collect().await.map_err(|e| {
-            SqeError::Execution(format!("Failed to collect column metadata: {e}"))
-        })?;
+        let df = ctx
+            .sql(&col_sql)
+            .await
+            .map_err(|e| SqeError::Execution(format!("Failed to query column metadata: {e}")))?;
+        let batches = df
+            .collect()
+            .await
+            .map_err(|e| SqeError::Execution(format!("Failed to collect column metadata: {e}")))?;
 
         // Reconstruct CREATE TABLE DDL
         let mut ddl = format!("CREATE TABLE {table_name} (\n");
@@ -3173,11 +3251,7 @@ impl QueryHandler {
             ];
             let mut user_props: Vec<(&String, &String)> = props
                 .iter()
-                .filter(|(k, _)| {
-                    !SUPPRESSED_PREFIXES
-                        .iter()
-                        .any(|pre| k.starts_with(pre))
-                })
+                .filter(|(k, _)| !SUPPRESSED_PREFIXES.iter().any(|pre| k.starts_with(pre)))
                 .collect();
             user_props.sort_by(|a, b| a.0.cmp(b.0));
             if !user_props.is_empty() {
@@ -3276,14 +3350,15 @@ impl QueryHandler {
     /// the configured catalogs plus the session's own (X-Trino-Catalog) Polaris
     /// warehouse, deduplicated. JDBC schema sync (DatabaseMetaData.getCatalogs)
     /// then sees workspace catalogs, not just the default warehouse. (#5)
-    async fn handle_show_catalogs(
-        &self,
-        session: &Session,
-    ) -> sqe_core::Result<Vec<RecordBatch>> {
+    async fn handle_show_catalogs(&self, session: &Session) -> sqe_core::Result<Vec<RecordBatch>> {
         // Configured catalogs first (default warehouse leads), then the session
         // catalog if it is not already in the list.
-        let mut candidates: Vec<String> =
-            self.config.flattened_catalogs().into_iter().map(|(n, _)| n).collect();
+        let mut candidates: Vec<String> = self
+            .config
+            .flattened_catalogs()
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
         if let Some(session_catalog) = session.default_catalog.as_deref() {
             candidates.push(session_catalog.to_string());
         }
@@ -3292,7 +3367,11 @@ impl QueryHandler {
         }
         let mut catalog_names: Vec<String> = Vec::new();
         for name in candidates {
-            let name = if name.is_empty() { "default".to_string() } else { name };
+            let name = if name.is_empty() {
+                "default".to_string()
+            } else {
+                name
+            };
             if !catalog_names.contains(&name) {
                 catalog_names.push(name);
             }
@@ -3405,15 +3484,11 @@ impl QueryHandler {
 
         let (ctx, _) = self.create_session_context(session).await?;
         let df = ctx.sql(&col_sql).await.map_err(|e| {
-            SqeError::Execution(format!(
-                "failed to query information_schema.columns: {e}"
-            ))
+            SqeError::Execution(format!("failed to query information_schema.columns: {e}"))
         })?;
-        df.collect().await.map_err(|e| {
-            SqeError::Execution(format!(
-                "failed to collect column metadata: {e}"
-            ))
-        })
+        df.collect()
+            .await
+            .map_err(|e| SqeError::Execution(format!("failed to collect column metadata: {e}")))
     }
 
     /// Handle SHOW TABLES by listing tables in a namespace from the Polaris catalog.
@@ -3579,8 +3654,7 @@ impl QueryHandler {
         // SQL is rewritten so the original table reference (which lives
         // in the read-only Iceberg schema provider) is replaced with the
         // alias.
-        let (mut rewritten_for_version, version_specs) =
-            sqe_sql::extract_time_travel_spec(sql)?;
+        let (mut rewritten_for_version, version_specs) = sqe_sql::extract_time_travel_spec(sql)?;
         let mut version_resolved = !version_specs.is_empty();
         if version_resolved {
             for spec in &version_specs {
@@ -3608,8 +3682,9 @@ impl QueryHandler {
         };
 
         let dialect = GenericDialect {};
-        let mut statements = Parser::parse_sql(&dialect, &sql_for_ast)
-            .map_err(|e| SqeError::Execution(format!("Parse error in time travel detection: {e}")))?;
+        let mut statements = Parser::parse_sql(&dialect, &sql_for_ast).map_err(|e| {
+            SqeError::Execution(format!("Parse error in time travel detection: {e}"))
+        })?;
 
         if statements.is_empty() {
             return Ok((sql_for_ast, TimeTravelCleanup::new(ctx, cleanup_aliases)));
@@ -3622,25 +3697,31 @@ impl QueryHandler {
         if let sqlparser::ast::Statement::Query(ref mut query) = stmt {
             if let SetExpr::Select(ref mut select) = *query.body {
                 for twj in &mut select.from {
-                    if self.process_time_travel_table_factor(
-                        &mut twj.relation,
-                        ctx,
-                        session,
-                        session_catalog,
-                        cleanup,
-                        prefetch_concurrency,
-                    ).await? {
-                        found_time_travel = true;
-                    }
-                    for join in &mut twj.joins {
-                        if self.process_time_travel_table_factor(
-                            &mut join.relation,
+                    if self
+                        .process_time_travel_table_factor(
+                            &mut twj.relation,
                             ctx,
                             session,
                             session_catalog,
                             cleanup,
                             prefetch_concurrency,
-                        ).await? {
+                        )
+                        .await?
+                    {
+                        found_time_travel = true;
+                    }
+                    for join in &mut twj.joins {
+                        if self
+                            .process_time_travel_table_factor(
+                                &mut join.relation,
+                                ctx,
+                                session,
+                                session_catalog,
+                                cleanup,
+                                prefetch_concurrency,
+                            )
+                            .await?
+                        {
                             found_time_travel = true;
                         }
                     }
@@ -3775,16 +3856,14 @@ impl QueryHandler {
             .with_snapshot_id(snapshot_id)
             .with_prefetch_concurrency(prefetch_concurrency);
 
-        let alias = format!(
-            "__sqe_ver_{}_{}",
-            bare_table,
-            uuid::Uuid::now_v7().simple()
-        );
+        let alias = format!("__sqe_ver_{}_{}", bare_table, uuid::Uuid::now_v7().simple());
         let qualified = format!("datafusion.public.{alias}");
         ctx.register_table(qualified.as_str(), Arc::new(provider))
-            .map_err(|e| SqeError::Execution(format!(
-                "Failed to register time-travel provider for {bare_table}: {e}"
-            )))?;
+            .map_err(|e| {
+                SqeError::Execution(format!(
+                    "Failed to register time-travel provider for {bare_table}: {e}"
+                ))
+            })?;
 
         Ok(qualified)
     }
@@ -3818,7 +3897,12 @@ impl QueryHandler {
     ) -> sqe_core::Result<bool> {
         use sqlparser::ast::TableVersion;
 
-        if let TableFactor::Table { ref mut name, ref mut version, .. } = relation {
+        if let TableFactor::Table {
+            ref mut name,
+            ref mut version,
+            ..
+        } = relation
+        {
             if let Some(TableVersion::ForSystemTimeAsOf(ref expr)) = version {
                 let table_name = name.to_string();
                 let timestamp_ms = resolve_timestamp_expr(expr)?;
@@ -3836,16 +3920,19 @@ impl QueryHandler {
                     1 => ("default", parts[0]),
                     2 => (parts[0], parts[1]),
                     3 => (parts[1], parts[2]), // catalog.schema.table — skip catalog
-                    _ => return Err(SqeError::Execution(format!(
-                        "Unsupported table name format for time travel: {table_name}"
-                    ))),
+                    _ => {
+                        return Err(SqeError::Execution(format!(
+                            "Unsupported table name format for time travel: {table_name}"
+                        )))
+                    }
                 };
 
                 let ns_ident = iceberg::NamespaceIdent::new(namespace.to_string());
                 let table_ident = iceberg::TableIdent::new(ns_ident, bare_table.to_string());
                 let iceberg_table = session_catalog.load_table(&table_ident).await?;
 
-                let snapshot_id = find_snapshot_at_timestamp(iceberg_table.metadata(), timestamp_ms)?;
+                let snapshot_id =
+                    find_snapshot_at_timestamp(iceberg_table.metadata(), timestamp_ms)?;
 
                 tracing::info!(
                     table = %table_name,
@@ -3856,21 +3943,20 @@ impl QueryHandler {
 
                 // Build a snapshot-pinned SqeTableProvider and register it
                 // under a unique alias under datafusion.public.
-                let provider = sqe_catalog::table_provider::SqeTableProvider::try_new(iceberg_table)
-                    .await?
-                    .with_snapshot_id(snapshot_id)
-                    .with_prefetch_concurrency(prefetch_concurrency);
+                let provider =
+                    sqe_catalog::table_provider::SqeTableProvider::try_new(iceberg_table)
+                        .await?
+                        .with_snapshot_id(snapshot_id)
+                        .with_prefetch_concurrency(prefetch_concurrency);
 
-                let alias = format!(
-                    "__sqe_tt_{}_{}",
-                    bare_table,
-                    uuid::Uuid::now_v7().simple()
-                );
+                let alias = format!("__sqe_tt_{}_{}", bare_table, uuid::Uuid::now_v7().simple());
                 let qualified = format!("datafusion.public.{alias}");
                 ctx.register_table(qualified.as_str(), Arc::new(provider))
-                    .map_err(|e| SqeError::Execution(format!(
-                        "Failed to register time-travel provider for {bare_table}: {e}"
-                    )))?;
+                    .map_err(|e| {
+                        SqeError::Execution(format!(
+                            "Failed to register time-travel provider for {bare_table}: {e}"
+                        ))
+                    })?;
                 cleanup.push(qualified.clone());
 
                 // Rewrite the AST to point at the qualified alias so the
@@ -3958,12 +4044,9 @@ impl QueryHandler {
 
         // Plan the range. `plan_incremental` also calls `resolve_range`
         // internally, so range validation happens once.
-        let mut plan = sqe_catalog::incremental_scan::plan_incremental(
-            &iceberg_table,
-            spec.start,
-            spec.end,
-        )
-        .await?;
+        let mut plan =
+            sqe_catalog::incremental_scan::plan_incremental(&iceberg_table, spec.start, spec.end)
+                .await?;
 
         // Reconcile in-range deletes. Without a referenced-data-file map
         // (position deletes currently do not expose one through
@@ -3971,12 +4054,11 @@ impl QueryHandler {
         // which keeps equality deletes intact. This is the same defensive
         // default the helper uses in its unit tests.
         let empty_refs: HashMap<String, Option<String>> = HashMap::new();
-        let kept_deletes =
-            sqe_catalog::incremental_scan::reconcile_in_range_deletes(
-                &plan.data_files,
-                std::mem::take(&mut plan.delete_files),
-                &empty_refs,
-            );
+        let kept_deletes = sqe_catalog::incremental_scan::reconcile_in_range_deletes(
+            &plan.data_files,
+            std::mem::take(&mut plan.delete_files),
+            &empty_refs,
+        );
         plan.delete_files = kept_deletes;
 
         tracing::info!(
@@ -3998,12 +4080,11 @@ impl QueryHandler {
             })?;
 
         let file_io = iceberg_table.file_io().clone();
-        let provider =
-            sqe_catalog::incremental_provider::IncrementalTableProvider::new(
-                Arc::new(base_schema),
-                plan,
-                Some(file_io),
-            );
+        let provider = sqe_catalog::incremental_provider::IncrementalTableProvider::new(
+            Arc::new(base_schema),
+            plan,
+            Some(file_io),
+        );
 
         // Register under a unique alias in the `datafusion.public` schema,
         // which is a MemoryCatalogProvider and supports dynamic registration.
@@ -4144,9 +4225,7 @@ impl QueryHandler {
         // such as `TO ROLE "analysts"`. We want the bare value instead.
         // In sqlparser 0.54, ObjectName is Vec<Ident>; each Ident.value is the raw string.
         let grantee_name = match raw_grantee.name.as_ref() {
-            Some(sqlparser::ast::GranteeName::ObjectName(obj)) => {
-                object_name_parts(obj).join(".")
-            }
+            Some(sqlparser::ast::GranteeName::ObjectName(obj)) => object_name_parts(obj).join("."),
             Some(other) => other.to_string(),
             None => String::new(),
         };
@@ -4188,7 +4267,9 @@ impl QueryHandler {
         self.require_admin(session, "GRANT")?;
         let backend = self.require_grant_backend()?;
         let grant_stmt = Self::extract_grant_statement(stmt)?;
-        backend.grant(session.access_token().expose(), &grant_stmt).await?;
+        backend
+            .grant(session.access_token().expose(), &grant_stmt)
+            .await?;
         // Flush the policy cache only after the mutation succeeds so the new
         // grant is visible on the next query (issue #207).
         self.invalidate_policy_cache();
@@ -4213,7 +4294,9 @@ impl QueryHandler {
             table: grant_stmt.table,
             grantee: grant_stmt.grantee,
         };
-        backend.revoke(session.access_token().expose(), &revoke_stmt).await?;
+        backend
+            .revoke(session.access_token().expose(), &revoke_stmt)
+            .await?;
         // Flush the policy cache only after the mutation succeeds so the
         // revoked grant stops working immediately (issue #207).
         self.invalidate_policy_cache();
@@ -4251,7 +4334,9 @@ impl QueryHandler {
             }
         };
 
-        let entries = backend.show_grants(session.access_token().expose(), &filter).await?;
+        let entries = backend
+            .show_grants(session.access_token().expose(), &filter)
+            .await?;
         Self::grants_to_record_batch(&entries)
     }
 
@@ -4287,7 +4372,9 @@ impl QueryHandler {
         // the service-token path is unreachable for an unauthorised caller.
         self.require_self_or_admin(session, user, "SHOW EFFECTIVE GRANTS")?;
         let backend = self.require_grant_backend()?;
-        let entries = backend.show_effective(session.access_token().expose(), user).await?;
+        let entries = backend
+            .show_effective(session.access_token().expose(), user)
+            .await?;
         Self::grants_to_record_batch(&entries)
     }
 
@@ -4311,7 +4398,9 @@ impl QueryHandler {
             table: params.table.clone(),
         };
 
-        let resp = backend.check_access(session.access_token().expose(), &check).await?;
+        let resp = backend
+            .check_access(session.access_token().expose(), &check)
+            .await?;
 
         let schema = Arc::new(Schema::new(vec![
             Field::new("allowed", DataType::Boolean, false),
@@ -4366,8 +4455,10 @@ impl QueryHandler {
         // Load the table's column tags via the caller's token (catalog gates
         // read access). The returned TableIdent gives the policy key without a
         // second parse.
-        let (table_ident, col_tags) =
-            self.catalog_ops.load_column_tags(session, &params.table).await?;
+        let (table_ident, col_tags) = self
+            .catalog_ops
+            .load_column_tags(session, &params.table)
+            .await?;
 
         // Derive the (namespace, table) policy key the SAME way the rewriter
         // does (`resolve_policy_key`): the last DOT-separated component of the
@@ -4479,7 +4570,12 @@ impl QueryHandler {
         let mut masks: Vec<(&String, &sqe_policy::MaskType)> = policy.column_masks.iter().collect();
         masks.sort_by(|a, b| a.0.cmp(b.0));
         for (col, mask) in masks {
-            push("column_mask", Some(col), Self::mask_type_name(mask), "policy");
+            push(
+                "column_mask",
+                Some(col),
+                Self::mask_type_name(mask),
+                "policy",
+            );
         }
 
         // Restricted columns, sorted.
@@ -4632,8 +4728,8 @@ impl QueryHandler {
         stmt: &Statement,
         session_catalog: &Arc<SessionCatalog>,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
-        use sqlparser::ast::CommentObject;
         use crate::catalog_ops::resolve_table_ident;
+        use sqlparser::ast::CommentObject;
 
         let (object_type, object_name, comment_text) = match stmt {
             Statement::Comment {
@@ -4668,9 +4764,8 @@ impl QueryHandler {
                     .and_then(|p| p.as_ident())
                     .map(|i| i.value.clone())
                     .unwrap_or_default();
-                let table_parts = sqlparser::ast::ObjectName(
-                    object_name.0[..object_name.0.len() - 1].to_vec(),
-                );
+                let table_parts =
+                    sqlparser::ast::ObjectName(object_name.0[..object_name.0.len() - 1].to_vec());
                 (table_parts, format!("comment.{col_name}"))
             }
             other => {
@@ -4862,7 +4957,10 @@ impl QueryHandler {
         }
         let batch = RecordBatch::try_new(
             schema,
-            vec![Arc::new(name_b.finish()) as ArrayRef, Arc::new(type_b.finish()) as ArrayRef],
+            vec![
+                Arc::new(name_b.finish()) as ArrayRef,
+                Arc::new(type_b.finish()) as ArrayRef,
+            ],
         )
         .map_err(|e| SqeError::Execution(format!("Failed to build SHOW SECRETS result: {e}")))?;
 
@@ -4880,10 +4978,7 @@ impl QueryHandler {
     /// that don't decompose into Trino's one-row-per-signature type strings, so
     /// the type columns are left empty and every function is reported
     /// deterministic. Function Type is `scalar` / `aggregate` / `window`.
-    async fn handle_show_functions(
-        &self,
-        session: &Session,
-    ) -> sqe_core::Result<Vec<RecordBatch>> {
+    async fn handle_show_functions(&self, session: &Session) -> sqe_core::Result<Vec<RecordBatch>> {
         let (ctx, _) = self.create_session_context(session).await?;
         let state = ctx.state();
 
@@ -4981,10 +5076,9 @@ impl QueryHandler {
         match catalog.table_exists(&table_ident).await {
             Ok(true) => {
                 info!(table = %table_ident, "DROP existing table for CREATE OR REPLACE");
-                catalog
-                    .drop_table(&table_ident)
-                    .await
-                    .map_err(|e| SqeError::Catalog(format!("Failed to drop table for replace: {e}")))?;
+                catalog.drop_table(&table_ident).await.map_err(|e| {
+                    SqeError::Catalog(format!("Failed to drop table for replace: {e}"))
+                })?;
             }
             Ok(false) => {}
             Err(e) => {
@@ -4996,7 +5090,6 @@ impl QueryHandler {
 
         Ok(())
     }
-
 }
 
 /// RAII guard that deregisters time-travel pinned providers when the query
@@ -5118,7 +5211,10 @@ fn is_show_roles(stmt: &Statement) -> bool {
     let Statement::ShowVariable { variable } = stmt else {
         return false;
     };
-    let idents: Vec<String> = variable.iter().map(|i| i.value.to_ascii_uppercase()).collect();
+    let idents: Vec<String> = variable
+        .iter()
+        .map(|i| i.value.to_ascii_uppercase())
+        .collect();
     let parts: Vec<&str> = idents.iter().map(String::as_str).collect();
     matches!(
         parts.as_slice(),
@@ -5139,8 +5235,7 @@ fn replace_table_reference(sql: &str, needle: &str, replacement: &str) -> String
         // Verify word boundary. The character preceding `abs` must not be an
         // identifier character, and the character after `abs + needle.len()`
         // must also not be an identifier character (letter, digit, `_`, `.`).
-        let pre_ok = abs == 0
-            || !is_ident_char(sql.as_bytes()[abs - 1]);
+        let pre_ok = abs == 0 || !is_ident_char(sql.as_bytes()[abs - 1]);
         let end = abs + needle.len();
         let post_ok = end == sql.len() || !is_ident_char(sql.as_bytes()[end]);
         if pre_ok && post_ok {
@@ -5190,14 +5285,10 @@ fn resolve_timestamp_expr(expr: &sqlparser::ast::Expr) -> sqe_core::Result<i64> 
         Expr::Value(ValueWithSpan {
             value: Value::Number(n, _),
             ..
-        }) => {
-            n.parse::<i64>().map_err(|_| SqeError::Execution(
-                format!("Cannot parse time travel integer expression: {n}")
-            ))
-        }
-        Expr::Cast { expr: inner, .. } => {
-            resolve_timestamp_expr(inner)
-        }
+        }) => n.parse::<i64>().map_err(|_| {
+            SqeError::Execution(format!("Cannot parse time travel integer expression: {n}"))
+        }),
+        Expr::Cast { expr: inner, .. } => resolve_timestamp_expr(inner),
         other => Err(SqeError::Execution(format!(
             "Unsupported time travel expression: {other}. \
              Use TIMESTAMP '2026-01-01 00:00:00' or epoch milliseconds."
@@ -5264,10 +5355,12 @@ fn extract_order_by_columns(sql: &str) -> Vec<String> {
     if let Some(idx) = upper.rfind("ORDER BY") {
         let after = &sql[idx + 8..];
         let end = after
-            .find([')' , ';'])
+            .find([')', ';'])
             .or_else(|| {
                 let u = after.to_uppercase();
-                u.find("LIMIT").or_else(|| u.find("OFFSET")).or_else(|| u.find("FETCH"))
+                u.find("LIMIT")
+                    .or_else(|| u.find("OFFSET"))
+                    .or_else(|| u.find("FETCH"))
             })
             .unwrap_or(after.len());
         let cols_str = &after[..end];
@@ -5297,14 +5390,13 @@ pub(crate) fn extract_plan_metrics(plan: &Arc<dyn ExecutionPlan>) -> PlanMetrics
     let mut stack: Vec<Arc<dyn ExecutionPlan>> = vec![Arc::clone(plan)];
     while let Some(node) = stack.pop() {
         let name = node.name();
-        let is_scan = name.contains("Scan")
-            || name.contains("Parquet")
-            || name.contains("Csv");
+        let is_scan = name.contains("Scan") || name.contains("Parquet") || name.contains("Csv");
 
         if let Some(metrics) = node.metrics() {
             // Scan nodes: accumulate bytes/rows scanned
             if is_scan {
-                if let Some(ob) = metrics.sum(|m| matches!(m.value(), MetricValue::OutputBytes(_))) {
+                if let Some(ob) = metrics.sum(|m| matches!(m.value(), MetricValue::OutputBytes(_)))
+                {
                     bytes_scanned += ob.as_usize() as u64;
                 }
                 if let Some(or) = metrics.output_rows() {
@@ -5340,7 +5432,9 @@ pub(crate) fn extract_plan_metrics(plan: &Arc<dyn ExecutionPlan>) -> PlanMetrics
 /// NestedLoopJoinExec) contribute to join spill metrics. DataFusion's
 /// `MetricsSet` provides `spill_count()` and `spilled_bytes()` on each
 /// operator after execution.
-pub(crate) fn aggregate_spill_metrics(plan: &Arc<dyn ExecutionPlan>) -> (usize, usize, usize, usize) {
+pub(crate) fn aggregate_spill_metrics(
+    plan: &Arc<dyn ExecutionPlan>,
+) -> (usize, usize, usize, usize) {
     let mut sort_spill_count: usize = 0;
     let mut sort_spill_bytes: usize = 0;
     let mut join_spill_count: usize = 0;
@@ -5374,7 +5468,12 @@ pub(crate) fn aggregate_spill_metrics(plan: &Arc<dyn ExecutionPlan>) -> (usize, 
         }
     }
 
-    (sort_spill_count, sort_spill_bytes, join_spill_count, join_spill_bytes)
+    (
+        sort_spill_count,
+        sort_spill_bytes,
+        join_spill_count,
+        join_spill_bytes,
+    )
 }
 
 /// Walk a physical plan tree and pick the `IcebergScanExec` worth
@@ -5436,9 +5535,7 @@ fn collect_raw_iceberg_table_idents(
 /// is ever distributed (its `IcebergScanExec` replaced by a distributed exec)
 /// would no-op here, which is safe because workers do not raise the inlist
 /// threshold above DataFusion's default.
-fn strip_self_join_dynamic_filters(
-    plan: Arc<dyn ExecutionPlan>,
-) -> Arc<dyn ExecutionPlan> {
+fn strip_self_join_dynamic_filters(plan: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
     let original = Arc::clone(&plan);
     let result = plan.transform_up(|node| {
         let Some(hj) = node.downcast_ref::<HashJoinExec>() else {
@@ -5497,7 +5594,10 @@ fn find_iceberg_scan(plan: &Arc<dyn ExecutionPlan>) -> Option<Arc<dyn ExecutionP
             Ok(s) => s,
             Err(_) => return 0,
         };
-        match (stats.num_rows.get_value(), stats.total_byte_size.get_value()) {
+        match (
+            stats.num_rows.get_value(),
+            stats.total_byte_size.get_value(),
+        ) {
             (Some(rows), _) => *rows as u64,
             (None, Some(bytes)) => *bytes as u64,
             (None, None) => 0,
@@ -5541,7 +5641,8 @@ fn replace_scan_in_plan(
         .any(|(new, old)| !Arc::ptr_eq(new, old));
 
     if changed {
-        plan.clone().with_new_children(new_children)
+        plan.clone()
+            .with_new_children(new_children)
             .unwrap_or_else(|_| Arc::clone(plan))
     } else {
         Arc::clone(plan)
@@ -5658,12 +5759,14 @@ fn arrow_type_to_iceberg(dt: &DataType) -> serde_json::Value {
             let iceberg_fields: Vec<serde_json::Value> = fields
                 .iter()
                 .enumerate()
-                .map(|(i, f)| serde_json::json!({
-                    "id": i + 1,
-                    "name": f.name(),
-                    "required": !f.is_nullable(),
-                    "type": arrow_type_to_iceberg(f.data_type()),
-                }))
+                .map(|(i, f)| {
+                    serde_json::json!({
+                        "id": i + 1,
+                        "name": f.name(),
+                        "required": !f.is_nullable(),
+                        "type": arrow_type_to_iceberg(f.data_type()),
+                    })
+                })
                 .collect();
             serde_json::json!({
                 "type": "struct",
@@ -5711,7 +5814,9 @@ fn extract_otel_table_info(kind: &StatementKind) -> Option<(Option<String>, Opti
         }
     };
 
-    fn from_table_tables(ft: &sqlparser::ast::FromTable) -> Option<&Vec<sqlparser::ast::TableWithJoins>> {
+    fn from_table_tables(
+        ft: &sqlparser::ast::FromTable,
+    ) -> Option<&Vec<sqlparser::ast::TableWithJoins>> {
         match ft {
             sqlparser::ast::FromTable::WithFromKeyword(tables) => Some(tables),
             sqlparser::ast::FromTable::WithoutKeyword(tables) => Some(tables),
@@ -5751,7 +5856,9 @@ fn extract_otel_table_info(kind: &StatementKind) -> Option<(Option<String>, Opti
             }
             None
         }
-        StatementKind::CreateTable(stmt) | StatementKind::Ctas(stmt) | StatementKind::Drop(stmt) => {
+        StatementKind::CreateTable(stmt)
+        | StatementKind::Ctas(stmt)
+        | StatementKind::Drop(stmt) => {
             if let Statement::CreateTable(ct) = stmt.as_ref() {
                 return Some(from_object_name(&ct.name));
             }
@@ -5930,7 +6037,9 @@ fn build_describe_output(schema: &SchemaRef) -> sqe_core::Result<Vec<RecordBatch
         cat_b.append_null();
         sch_b.append_null();
         tbl_b.append_null();
-        type_b.append_value(sqe_trino_compat::types::arrow_to_trino_type(field.data_type()));
+        type_b.append_value(sqe_trino_compat::types::arrow_to_trino_type(
+            field.data_type(),
+        ));
         match field.data_type().primitive_width() {
             Some(w) => size_b.append_value(w as i64),
             None => size_b.append_null(),
@@ -6126,9 +6235,7 @@ fn merge_source_sql(source: &TableFactor) -> Result<String, SqeError> {
             // Derived source carries an explicit column-alias list, e.g.
             // `AS s(id, v)`. Re-apply it by wrapping the subquery: the alias's
             // Display renders `AS s (id, v)` with correct quoting/case.
-            Some(a) if !a.columns.is_empty() => {
-                Ok(format!("SELECT * FROM ({subquery}) {a}"))
-            }
+            Some(a) if !a.columns.is_empty() => Ok(format!("SELECT * FROM ({subquery}) {a}")),
             // No column-alias list: preserve the original behaviour exactly.
             _ => Ok(format!("{subquery}")),
         },
@@ -6239,9 +6346,7 @@ mod tests {
         );
         // CREATE MATERIALIZED VIEW -> unsupported, not silently a plain view.
         assert_eq!(
-            classify_materialized_view(&parse_one(
-                "CREATE MATERIALIZED VIEW mv AS SELECT 1 a"
-            )),
+            classify_materialized_view(&parse_one("CREATE MATERIALIZED VIEW mv AS SELECT 1 a")),
             Some(MaterializedViewStmt::Unsupported)
         );
         // Plain views and table drops are not MV statements.
@@ -6278,7 +6383,11 @@ mod tests {
         let b = &batches[0];
         // Trino's 7-column layout.
         assert_eq!(
-            b.schema().fields().iter().map(|f| f.name().as_str()).collect::<Vec<_>>(),
+            b.schema()
+                .fields()
+                .iter()
+                .map(|f| f.name().as_str())
+                .collect::<Vec<_>>(),
             vec![
                 "column_name",
                 "data_size",
@@ -6291,12 +6400,23 @@ mod tests {
         );
         // One row per column + a summary row.
         assert_eq!(b.num_rows(), 3);
-        let names = b.column(0).as_any().downcast_ref::<arrow_array::StringArray>().unwrap();
+        let names = b
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::StringArray>()
+            .unwrap();
         assert_eq!(names.value(0), "id");
         assert_eq!(names.value(1), "name");
         assert!(names.is_null(2), "summary row has NULL column_name");
-        let rc = b.column(4).as_any().downcast_ref::<arrow_array::Float64Array>().unwrap();
-        assert!(rc.is_null(0) && rc.is_null(1), "per-column row_count is NULL");
+        let rc = b
+            .column(4)
+            .as_any()
+            .downcast_ref::<arrow_array::Float64Array>()
+            .unwrap();
+        assert!(
+            rc.is_null(0) && rc.is_null(1),
+            "per-column row_count is NULL"
+        );
         assert_eq!(rc.value(2), 42.0, "summary row carries row_count");
     }
 
@@ -6313,14 +6433,16 @@ mod tests {
                 .try_with_sql(raw)
                 .and_then(|mut p| p.parse_expr())
                 .unwrap_or_else(|e| panic!("parse_expr('{raw}') failed: {e}"));
-            resolve_timestamp_expr(&expr)
-                .unwrap_or_else(|e| panic!("resolve('{raw}') failed: {e}"))
+            resolve_timestamp_expr(&expr).unwrap_or_else(|e| panic!("resolve('{raw}') failed: {e}"))
         };
         // `TIMESTAMP '...'` literal and a bare quoted date both resolve to
         // 2026-01-01 midnight UTC; they must agree.
         let ts_literal = resolve("TIMESTAMP '2026-01-01 00:00:00'");
         let bare_date = resolve("'2026-01-01'");
-        assert_eq!(ts_literal, bare_date, "TIMESTAMP literal == bare date midnight");
+        assert_eq!(
+            ts_literal, bare_date,
+            "TIMESTAMP literal == bare date midnight"
+        );
         assert!(ts_literal > 0);
         // Epoch millis pass through unchanged.
         assert_eq!(resolve("1700000000000"), 1_700_000_000_000);
@@ -6356,9 +6478,11 @@ mod tests {
         // DESCRIBE/SHOW COLUMNS silently return 0 rows (Metabase syncs 0
         // fields). Each part is unquoted the same way the SELECT planner does.
         let unquoted = info_schema_columns_query("ws_energy_co.gold.fct_revenue_monthly");
-        let quoted =
-            info_schema_columns_query(r#""ws_energy_co"."gold"."fct_revenue_monthly""#);
-        assert_eq!(quoted, unquoted, "quoted 3-part name must resolve like the unquoted form");
+        let quoted = info_schema_columns_query(r#""ws_energy_co"."gold"."fct_revenue_monthly""#);
+        assert_eq!(
+            quoted, unquoted,
+            "quoted 3-part name must resolve like the unquoted form"
+        );
 
         // A single quoted part is enough to break the naive split; cover it.
         let partial = info_schema_columns_query(r#"ws_energy_co.gold."fct_revenue_monthly""#);
@@ -6372,8 +6496,14 @@ mod tests {
         // An embedded dot inside a quoted part is one identifier, not a
         // qualifier boundary; an embedded `""` is a literal quote.
         let dotted = info_schema_columns_query(r#""we.ird"."col""umn""#);
-        assert!(dotted.contains("table_schema = 'we.ird'"), "dot stays in part: {dotted}");
-        assert!(dotted.contains(r#"table_name = 'col"umn'"#), "doubled quote collapses: {dotted}");
+        assert!(
+            dotted.contains("table_schema = 'we.ird'"),
+            "dot stays in part: {dotted}"
+        );
+        assert!(
+            dotted.contains(r#"table_name = 'col"umn'"#),
+            "doubled quote collapses: {dotted}"
+        );
     }
 
     #[test]
@@ -6468,8 +6598,8 @@ mod tests {
     #[test]
     fn effective_policy_batch_redacts_and_orders_rows() {
         let mut p = sqe_policy::ResolvedPolicy::default();
-        p.row_filters.push(datafusion::logical_expr::col("region")
-            .eq(datafusion::logical_expr::lit("EU")));
+        p.row_filters
+            .push(datafusion::logical_expr::col("region").eq(datafusion::logical_expr::lit("EU")));
         p.column_masks
             .insert("ssn".to_string(), sqe_policy::MaskType::Hash);
         // Redact carries a replacement string that MUST NOT appear in output.
@@ -6530,7 +6660,10 @@ mod tests {
     fn tags_batch_sorted_one_row_per_pair() {
         let mut map: std::collections::HashMap<String, Vec<String>> =
             std::collections::HashMap::new();
-        map.insert("email".to_string(), vec!["PII".to_string(), "CONTACT".to_string()]);
+        map.insert(
+            "email".to_string(),
+            vec!["PII".to_string(), "CONTACT".to_string()],
+        );
         map.insert("id".to_string(), vec!["PK".to_string()]);
 
         let batches = QueryHandler::tags_to_record_batch(&map).unwrap();
@@ -6549,8 +6682,7 @@ mod tests {
 
     #[test]
     fn tags_batch_empty_when_no_tags() {
-        let map: std::collections::HashMap<String, Vec<String>> =
-            std::collections::HashMap::new();
+        let map: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
         let batches = QueryHandler::tags_to_record_batch(&map).unwrap();
         assert_eq!(batches[0].num_rows(), 0);
     }
@@ -6690,8 +6822,14 @@ mod tests {
     // ─── read-side catalog extraction (SHOW SCHEMAS/TABLES FROM <catalog>) ──
     #[test]
     fn show_schemas_catalog_extracts_from_clause() {
-        assert_eq!(show_schemas_catalog("FROM ws_team_a"), Some("ws_team_a".to_string()));
-        assert_eq!(show_schemas_catalog("IN ws_team_a"), Some("ws_team_a".to_string()));
+        assert_eq!(
+            show_schemas_catalog("FROM ws_team_a"),
+            Some("ws_team_a".to_string())
+        );
+        assert_eq!(
+            show_schemas_catalog("IN ws_team_a"),
+            Some("ws_team_a".to_string())
+        );
     }
 
     #[test]
@@ -6948,7 +7086,10 @@ mod tests {
         );
         if let Ok(kind) = &result {
             assert!(
-                !matches!(kind, sqe_sql::StatementKind::Grant(_) | sqe_sql::StatementKind::Revoke(_)),
+                !matches!(
+                    kind,
+                    sqe_sql::StatementKind::Grant(_) | sqe_sql::StatementKind::Revoke(_)
+                ),
                 "DENY must never be treated as a Grant/Revoke, got: {kind:?}"
             );
         }
@@ -6993,7 +7134,8 @@ mod tests {
 
     #[test]
     fn should_emit_ddl_always_emits() {
-        let kind = sqe_sql::parse_and_classify("CREATE TABLE t (id INT)").expect("parse CREATE TABLE");
+        let kind =
+            sqe_sql::parse_and_classify("CREATE TABLE t (id INT)").expect("parse CREATE TABLE");
         assert!(matches!(kind, StatementKind::CreateTable(_)));
         assert!(should_emit(&kind, &ol_cfg(false)));
     }

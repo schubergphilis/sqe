@@ -10,10 +10,10 @@ use serde::Serialize;
 use tokio::signal;
 
 use sqe_catalog::grant_chameleon::ChameleonGrantBackend;
-use sqe_core::SqeConfig;
 use sqe_coordinator::flight_sql::SqeFlightSqlService;
 use sqe_coordinator::mode::Mode;
 use sqe_coordinator::{QueryHandler, SessionManager};
+use sqe_core::SqeConfig;
 use sqe_policy::grants::{polaris::PolarisGrantBackend, ranger::RangerGrantBackend, GrantBackend};
 use sqe_trino_compat::server::{NodeContext, TrinoAuthenticator, TrinoQueryExecutor};
 
@@ -153,9 +153,7 @@ async fn healthz() -> &'static str {
     "ok"
 }
 
-async fn readyz(
-    state: axum::extract::State<Arc<HealthState>>,
-) -> Response {
+async fn readyz(state: axum::extract::State<Arc<HealthState>>) -> Response {
     if !state.ready.load(Ordering::Relaxed) {
         return (axum::http::StatusCode::SERVICE_UNAVAILABLE, "not ready").into_response();
     }
@@ -228,9 +226,7 @@ struct WorkersStatus {
     healthy_urls: Vec<String>,
 }
 
-async fn cluster_status(
-    state: axum::extract::State<Arc<HealthState>>,
-) -> Json<ClusterStatus> {
+async fn cluster_status(state: axum::extract::State<Arc<HealthState>>) -> Json<ClusterStatus> {
     let ready = state.ready.load(Ordering::Relaxed);
 
     let workers = if let Some(ref registry) = state.worker_registry {
@@ -310,7 +306,11 @@ async fn api_workers(
             active_queries: 0,
             workers: healthy_urls
                 .into_iter()
-                .map(|url| sqe_coordinator::web_ui::WorkerDto { url, healthy: true, in_flight: 0 })
+                .map(|url| sqe_coordinator::web_ui::WorkerDto {
+                    url,
+                    healthy: true,
+                    in_flight: 0,
+                })
                 .collect(),
         },
     };
@@ -326,8 +326,10 @@ async fn api_overview(
         .unwrap_or(1);
 
     // Build (or synthesise) the NodeInfo.
-    let node_info = state.node_info.clone().unwrap_or_else(|| {
-        sqe_coordinator::web_ui::NodeInfo {
+    let node_info = state
+        .node_info
+        .clone()
+        .unwrap_or_else(|| sqe_coordinator::web_ui::NodeInfo {
             name: "SQE",
             version: sqe_core::VERSION,
             role: state.role,
@@ -340,8 +342,7 @@ async fn api_overview(
             storage: String::new(),
             memory_limit: None,
             max_concurrent_queries: 0,
-        }
-    });
+        });
 
     // Use the real tracker when available; fall back to an ephemeral empty one
     // (tracker is always Some on coordinator path; this branch is defensive).
@@ -449,7 +450,9 @@ fn start_health_server(port: u16, state: Arc<HealthState>) {
 // ── Graceful shutdown ──────────────────────────────────────────
 async fn shutdown_signal() {
     let ctrl_c = async {
-        signal::ctrl_c().await.expect("Failed to install Ctrl+C handler");
+        signal::ctrl_c()
+            .await
+            .expect("Failed to install Ctrl+C handler");
     };
 
     #[cfg(unix)]
@@ -543,7 +546,9 @@ impl TrinoAuthenticator for AuthenticatorAdapter {
                 .authenticate(&credentials)
                 .await
                 .map_err(|e| sqe_core::SqeError::Auth(e.to_string()))?;
-            return Ok(sqe_coordinator::auth_session::identity_to_session(identity, None));
+            return Ok(sqe_coordinator::auth_session::identity_to_session(
+                identity, None,
+            ));
         }
         self.authenticator
             .authenticate(username, password)
@@ -564,14 +569,16 @@ impl TrinoAuthenticator for AuthenticatorAdapter {
             ..Default::default()
         };
 
-        let identity = provider
-            .authenticate(&credentials)
-            .await
-            .map_err(|e| sqe_core::SqeError::Auth(format!("Bearer token validation failed: {e}")))?;
+        let identity = provider.authenticate(&credentials).await.map_err(|e| {
+            sqe_core::SqeError::Auth(format!("Bearer token validation failed: {e}"))
+        })?;
 
         // Fall back to the raw JWT as the catalog token when the provider did
         // not supply one (passthrough to Polaris).
-        Ok(sqe_coordinator::auth_session::identity_to_session(identity, Some(token)))
+        Ok(sqe_coordinator::auth_session::identity_to_session(
+            identity,
+            Some(token),
+        ))
     }
 }
 
@@ -599,7 +606,9 @@ impl TrinoQueryExecutor for QueryHandlerAdapter {
         prepared_sql: &str,
         kind: sqe_trino_compat::protocol::DescribeKind,
     ) -> Result<Vec<arrow_array::RecordBatch>, sqe_core::SqeError> {
-        self.handler.describe_prepared(session, prepared_sql, kind).await
+        self.handler
+            .describe_prepared(session, prepared_sql, kind)
+            .await
     }
 }
 
@@ -639,9 +648,7 @@ async fn async_main() -> anyhow::Result<()> {
 
     let config = SqeConfig::load(&config_path)
         .map_err(|e| anyhow::anyhow!("Failed to load config from {config_path}: {e}"))?;
-    config
-        .validate()
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    config.validate().map_err(|e| anyhow::anyhow!("{e}"))?;
 
     // Security warnings for production readiness
     if !config.coordinator.tls.is_enabled() {
@@ -705,9 +712,7 @@ async fn async_main() -> anyhow::Result<()> {
     }
 }
 
-fn build_grant_backend(
-    config: &SqeConfig,
-) -> anyhow::Result<Option<Arc<dyn GrantBackend>>> {
+fn build_grant_backend(config: &SqeConfig) -> anyhow::Result<Option<Arc<dyn GrantBackend>>> {
     use sqe_core::config::AccessControlBackend;
     match config.access_control.backend {
         AccessControlBackend::Chameleon if !config.access_control.url.is_empty() => {
@@ -822,9 +827,9 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
 
     // Created before the health server so the web UI can read it; the same Arc
     // is moved into the QueryHandler below.
-    let query_tracker = Arc::new(
-        sqe_coordinator::query_tracker::QueryTracker::new(&config.query_history),
-    );
+    let query_tracker = Arc::new(sqe_coordinator::query_tracker::QueryTracker::new(
+        &config.query_history,
+    ));
 
     // Build NodeInfo for the Overview endpoint from config (config is still in
     // scope at this point; it gets moved into the handlers below).
@@ -843,15 +848,16 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
         } else {
             config.storage.s3_endpoint.clone()
         };
-        let trino_http_port = (config.coordinator.trino_http_port != 0)
-            .then_some(config.coordinator.trino_http_port);
-        let quack_port = (config.coordinator.quack_port != 0)
-            .then_some(config.coordinator.quack_port);
-        let memory_limit = if config.query.max_query_memory.is_empty() || config.query.max_query_memory == "0" {
-            None
-        } else {
-            Some(config.query.max_query_memory.clone())
-        };
+        let trino_http_port =
+            (config.coordinator.trino_http_port != 0).then_some(config.coordinator.trino_http_port);
+        let quack_port =
+            (config.coordinator.quack_port != 0).then_some(config.coordinator.quack_port);
+        let memory_limit =
+            if config.query.max_query_memory.is_empty() || config.query.max_query_memory == "0" {
+                None
+            } else {
+                Some(config.query.max_query_memory.clone())
+            };
         sqe_coordinator::web_ui::NodeInfo {
             name: "SQE",
             version: sqe_core::VERSION,
@@ -870,7 +876,9 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
 
     // Metrics ring-buffer for the dashboard history endpoint (1 h at 5 s resolution).
     let metrics_history = if config.metrics.web_ui {
-        Some(Arc::new(sqe_coordinator::metrics_history::MetricsHistory::new(720)))
+        Some(Arc::new(
+            sqe_coordinator::metrics_history::MetricsHistory::new(720),
+        ))
     } else {
         None
     };
@@ -886,12 +894,14 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
     );
 
     sqe_metrics::server::start_metrics_server(metrics.clone(), config.metrics.prometheus_port);
-    tracing::info!("Prometheus metrics on port {}", config.metrics.prometheus_port);
+    tracing::info!(
+        "Prometheus metrics on port {}",
+        config.metrics.prometheus_port
+    );
 
     // Credential refresh tracker — shared between query handler and background task
-    let credential_tracker = Arc::new(
-        sqe_coordinator::credential_refresh::CredentialRefreshTracker::new(),
-    );
+    let credential_tracker =
+        Arc::new(sqe_coordinator::credential_refresh::CredentialRefreshTracker::new());
 
     if distributed {
         let interval =
@@ -968,9 +978,9 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
                 ticker.tick().await;
                 let sm_inner = sm.clone();
                 let path_inner = path.clone();
-                let result = tokio::task::spawn_blocking(move || {
-                    sm_inner.snapshot_to_file(&path_inner)
-                }).await;
+                let result =
+                    tokio::task::spawn_blocking(move || sm_inner.snapshot_to_file(&path_inner))
+                        .await;
                 match result {
                     Ok(Err(e)) => tracing::warn!(error = %e, "Session snapshot failed"),
                     Err(e) => tracing::warn!(error = %e, "Session snapshot task panicked"),
@@ -987,7 +997,10 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
 
     // Query tracker and result cache (query_tracker Arc already created above for the health server)
     let query_cache = if config.query_cache.enabled {
-        Some(Arc::new(sqe_coordinator::query_cache::ResultCache::new(&config.query_cache, Some(metrics.clone()))))
+        Some(Arc::new(sqe_coordinator::query_cache::ResultCache::new(
+            &config.query_cache,
+            Some(metrics.clone()),
+        )))
     } else {
         None
     };
@@ -1127,10 +1140,14 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
                     let cursor_path = format!("{spool_path}.cursor");
                     let shipper_metrics = sqe_metrics::audit::export::ShipperMetrics {
                         records_total: Some(metrics.audit_export_records_total.clone()),
-                        batch_failures_total: Some(metrics.audit_export_batch_failures_total.clone()),
+                        batch_failures_total: Some(
+                            metrics.audit_export_batch_failures_total.clone(),
+                        ),
                         spool_lag_bytes: Some(metrics.audit_export_spool_lag_bytes.clone()),
                         cursor_seq: Some(metrics.audit_export_cursor_seq.clone()),
-                        last_success_timestamp: Some(metrics.audit_export_last_success_timestamp.clone()),
+                        last_success_timestamp: Some(
+                            metrics.audit_export_last_success_timestamp.clone(),
+                        ),
                     };
                     let shipper = sqe_metrics::audit::export::OtlpLogShipper::new(
                         std::path::PathBuf::from(spool_path),
@@ -1155,9 +1172,7 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
             }
         }
     } else {
-        if config.metrics.audit_export.enabled
-            && config.metrics.audit_export.target != "otlp"
-        {
+        if config.metrics.audit_export.enabled && config.metrics.audit_export.target != "otlp" {
             tracing::warn!(
                 target = %config.metrics.audit_export.target,
                 "audit export: unknown target; only \"otlp\" is supported; shipper will not start"
@@ -1242,8 +1257,7 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
     // Bearer auth chain for the Trino-compat HTTP path. Reuses the same
     // chain instance the Flight SQL path uses so both endpoints accept
     // the same credentials with identical provider behaviour.
-    let bearer_provider: Option<Arc<dyn sqe_auth::AuthProvider>> =
-        Some(Arc::clone(&auth_chain));
+    let bearer_provider: Option<Arc<dyn sqe_auth::AuthProvider>> = Some(Arc::clone(&auth_chain));
 
     // Construct OAuth2 external auth state from [auth.external] config (if present).
     let oauth2_state: Option<Arc<sqe_trino_compat::oauth2::OAuth2State>> =
@@ -1308,7 +1322,10 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
             oauth2_state,
             trino_opts,
         );
-        tracing::info!("Trino-compat HTTP on port {}", config.coordinator.trino_http_port);
+        tracing::info!(
+            "Trino-compat HTTP on port {}",
+            config.coordinator.trino_http_port
+        );
     }
 
     // DuckDB Quack RPC endpoint (off by default). Shares the same AuthChain
@@ -1355,9 +1372,7 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!("Quack TLS config: {e}"))?;
             tokio::spawn(async move {
                 if let Err(e) = axum_server::bind_rustls(quack_addr, tls)
-                    .serve(
-                        quack_app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-                    )
+                    .serve(quack_app.into_make_service_with_connect_info::<std::net::SocketAddr>())
                     .await
                 {
                     tracing::error!(error = %e, "Quack RPC server (TLS) terminated unexpectedly");
@@ -1418,9 +1433,7 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
     }
 
     let serve_result = server_builder
-        .add_service(
-            arrow_flight::flight_service_server::FlightServiceServer::new(flight_service),
-        )
+        .add_service(arrow_flight::flight_service_server::FlightServiceServer::new(flight_service))
         .serve_with_shutdown(
             addr,
             shutdown_with_drain(ready.clone(), config.coordinator.shutdown_drain_secs),
@@ -1630,14 +1643,13 @@ fn build_lineage_observer(
         .iter()
         .map(|(name, c)| (name.clone(), c.catalog_url.clone()))
         .collect();
-    let catalog_lookup: sqe_lineage::extract::CatalogLookup =
-        Arc::new(move |name: &str| {
-            catalog_lookup_map
-                .get(name)
-                .cloned()
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| format!("sqe://{name}"))
-        });
+    let catalog_lookup: sqe_lineage::extract::CatalogLookup = Arc::new(move |name: &str| {
+        catalog_lookup_map
+            .get(name)
+            .cloned()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| format!("sqe://{name}"))
+    });
 
     let producer = if ol.producer.is_empty() {
         format!("https://github.com/sbp/sqe/v{}", env!("CARGO_PKG_VERSION"))
@@ -2033,16 +2045,22 @@ mod tests {
         });
 
         let response = readyz(axum::extract::State(state)).await;
-        assert_eq!(response.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
     }
 
     #[tokio::test]
     async fn api_queries_returns_tracked_queries() {
         let tracker = Arc::new(sqe_coordinator::query_tracker::QueryTracker::new(
-            &sqe_core::QueryHistoryConfig { max_entries: 100, ttl_secs: 60 },
+            &sqe_core::QueryHistoryConfig {
+                max_entries: 100,
+                ttl_secs: 60,
+            },
         ));
         let id = uuid::Uuid::now_v7();
-        tracker.start(id, "alice", Some("cli"), "SELECT 1", "s1", None, vec![]);
+        tracker.start(id, "alice", Some("cli"), "SELECT 1", "s1", None, vec![], None);
 
         let state = Arc::new(HealthState {
             ready: Arc::new(AtomicBool::new(true)),
@@ -2065,7 +2083,10 @@ mod tests {
 
         let Json(items) = api_queries(
             axum::extract::State(state),
-            axum::extract::Query(QueryListParams { state: None, limit: None }),
+            axum::extract::Query(QueryListParams {
+                state: None,
+                limit: None,
+            }),
         )
         .await;
         assert_eq!(items.len(), 1);
@@ -2095,7 +2116,10 @@ mod tests {
             success_audit_dedup: None,
         });
         let Json(resp) = api_metrics_history(axum::extract::State(state)).await;
-        assert_eq!(resp.bucket_seconds, sqe_coordinator::metrics_history::BUCKET_SECS);
+        assert_eq!(
+            resp.bucket_seconds,
+            sqe_coordinator::metrics_history::BUCKET_SECS
+        );
         assert!(resp.buckets.is_empty());
     }
 
@@ -2135,7 +2159,10 @@ mod tests {
             success_audit_dedup: None,
         });
         let Json(resp) = api_metrics_history(axum::extract::State(state)).await;
-        assert_eq!(resp.bucket_seconds, sqe_coordinator::metrics_history::BUCKET_SECS);
+        assert_eq!(
+            resp.bucket_seconds,
+            sqe_coordinator::metrics_history::BUCKET_SECS
+        );
         assert!(!resp.buckets.is_empty());
         // 3 samples at 0, 10_000, 20_000 ms all fall in the same 900-s bucket
         assert_eq!(resp.buckets.len(), 1);
@@ -2290,11 +2317,9 @@ mod tests {
                     .build(),
             )
         };
-        let counter = prometheus::IntCounter::new(
-            format!("sqe_test_success_{window_secs}"),
-            "test counter",
-        )
-        .unwrap();
+        let counter =
+            prometheus::IntCounter::new(format!("sqe_test_success_{window_secs}"), "test counter")
+                .unwrap();
         Arc::new(HealthState {
             ready: Arc::new(AtomicBool::new(true)),
             started_at: Instant::now(),
@@ -2340,9 +2365,18 @@ mod tests {
     fn health_state_dedup_window_zero_always_emits() {
         use sqe_coordinator::web_auth::BearerAdminState;
         let state = make_dedup_state(0);
-        assert!(state.should_emit_success_audit("alice"), "window=0 first call");
-        assert!(state.should_emit_success_audit("alice"), "window=0 second call");
-        assert!(state.should_emit_success_audit("alice"), "window=0 third call");
+        assert!(
+            state.should_emit_success_audit("alice"),
+            "window=0 first call"
+        );
+        assert!(
+            state.should_emit_success_audit("alice"),
+            "window=0 second call"
+        );
+        assert!(
+            state.should_emit_success_audit("alice"),
+            "window=0 third call"
+        );
     }
 
     #[test]

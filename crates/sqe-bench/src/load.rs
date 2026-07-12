@@ -132,10 +132,7 @@ fn is_resource_exhausted(err: &anyhow::Error) -> bool {
         || m.contains("95% utilized")
 }
 
-pub async fn load_benchmark(
-    client: &dyn BenchClient,
-    args: &LoadArgs<'_>,
-) -> anyhow::Result<()> {
+pub async fn load_benchmark(client: &dyn BenchClient, args: &LoadArgs<'_>) -> anyhow::Result<()> {
     let benchmark = args.benchmark;
     let scale = args.scale;
     let data_path = args.data_path;
@@ -167,10 +164,7 @@ pub async fn load_benchmark(
         .await;
 
     for table_def in gen.tables() {
-        let table_path = format!(
-            "{data_path}/{benchmark}/sf{scale}/{}",
-            table_def.name
-        );
+        let table_path = format!("{data_path}/{benchmark}/sf{scale}/{}", table_def.name);
 
         if clean {
             let _ = client
@@ -214,10 +208,7 @@ pub async fn load_benchmark(
         // listing comes back empty. The directory form lists the prefix
         // and the reader's `.parquet` extension filter selects the files.
         if table_path.contains("://") {
-            base_sql.push_str(&format!(
-                " AS SELECT * FROM read_parquet('{}/'",
-                table_path
-            ));
+            base_sql.push_str(&format!(" AS SELECT * FROM read_parquet('{}/'", table_path));
         } else {
             base_sql.push_str(&format!(
                 " AS SELECT * FROM read_parquet('{}/*.parquet'",
@@ -313,7 +304,10 @@ mod tests {
         // `orders` and `customer` exist in both TPC-H and TPC-C with
         // different key columns. A table-name-only lookup would wrongly
         // bloom tpcc.orders with TPC-H's o_orderkey/o_custkey.
-        assert_eq!(bloom_columns("tpch", "orders"), &["o_orderkey", "o_custkey"]);
+        assert_eq!(
+            bloom_columns("tpch", "orders"),
+            &["o_orderkey", "o_custkey"]
+        );
         assert!(bloom_columns("tpcc", "orders").is_empty());
         assert!(bloom_columns("tpcc", "customer").is_empty());
     }

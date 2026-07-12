@@ -99,7 +99,7 @@ async fn build_sqlite(
 
     use iceberg::CatalogBuilder;
     use iceberg_catalog_sql::{
-        SQL_CATALOG_PROP_URI, SQL_CATALOG_PROP_WAREHOUSE, SqlCatalogBuilder,
+        SqlCatalogBuilder, SQL_CATALOG_PROP_URI, SQL_CATALOG_PROP_WAREHOUSE,
     };
 
     let trimmed = location.trim();
@@ -125,7 +125,10 @@ async fn build_sqlite(
             )
         })?;
         let abs = path.canonicalize().map_err(|e| {
-            format!("could not canonicalise warehouse path {}: {e}", path.display())
+            format!(
+                "could not canonicalise warehouse path {}: {e}",
+                path.display()
+            )
         })?;
         let data_root = abs.join("iceberg");
         std::fs::create_dir_all(&data_root)
@@ -196,7 +199,7 @@ async fn build_iceberg_rest(
 
     use iceberg::CatalogBuilder;
     use iceberg_catalog_rest::{
-        REST_CATALOG_PROP_URI, REST_CATALOG_PROP_WAREHOUSE, RestCatalogBuilder,
+        RestCatalogBuilder, REST_CATALOG_PROP_URI, REST_CATALOG_PROP_WAREHOUSE,
     };
 
     let trimmed = location.trim();
@@ -211,7 +214,10 @@ async fn build_iceberg_rest(
 
     let mut props: HashMap<String, String> = HashMap::new();
     props.insert(REST_CATALOG_PROP_URI.to_string(), trimmed.to_string());
-    props.insert(REST_CATALOG_PROP_WAREHOUSE.to_string(), warehouse.to_string());
+    props.insert(
+        REST_CATALOG_PROP_WAREHOUSE.to_string(),
+        warehouse.to_string(),
+    );
 
     // SECRET (preferred) and TOKEN (inline) both end up in the
     // `token` prop the REST catalog reads. SECRET wins when both are
@@ -327,8 +333,8 @@ async fn build_glue(
 
     use iceberg::CatalogBuilder;
     use iceberg_catalog_glue::{
-        AWS_ACCESS_KEY_ID, AWS_PROFILE_NAME, AWS_REGION_NAME, AWS_SECRET_ACCESS_KEY,
-        AWS_SESSION_TOKEN, GLUE_CATALOG_PROP_WAREHOUSE, GlueCatalogBuilder,
+        GlueCatalogBuilder, AWS_ACCESS_KEY_ID, AWS_PROFILE_NAME, AWS_REGION_NAME,
+        AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN, GLUE_CATALOG_PROP_WAREHOUSE,
     };
 
     let trimmed = location.trim();
@@ -338,7 +344,10 @@ async fn build_glue(
         .ok_or_else(|| "option `WAREHOUSE` is required for TYPE glue".to_string())?;
 
     let mut props: HashMap<String, String> = HashMap::new();
-    props.insert(GLUE_CATALOG_PROP_WAREHOUSE.to_string(), warehouse.to_string());
+    props.insert(
+        GLUE_CATALOG_PROP_WAREHOUSE.to_string(),
+        warehouse.to_string(),
+    );
 
     // The Glue builder's `URI` prop carries the AWS endpoint. The
     // ATTACH `<location>` is the catalog ARN; we forward it as the
@@ -417,8 +426,8 @@ async fn build_s3tables(
 
     use iceberg::CatalogBuilder;
     use iceberg_catalog_s3tables::{
-        S3TABLES_CATALOG_PROP_ENDPOINT_URL, S3TABLES_CATALOG_PROP_TABLE_BUCKET_ARN,
-        S3TablesCatalogBuilder,
+        S3TablesCatalogBuilder, S3TABLES_CATALOG_PROP_ENDPOINT_URL,
+        S3TABLES_CATALOG_PROP_TABLE_BUCKET_ARN,
     };
 
     // String literals matching the s3tables crate's private utils
@@ -510,7 +519,7 @@ async fn build_hms(
 
     use iceberg::CatalogBuilder;
     use iceberg_catalog_hms::{
-        HMS_CATALOG_PROP_URI, HMS_CATALOG_PROP_WAREHOUSE, HmsCatalogBuilder,
+        HmsCatalogBuilder, HMS_CATALOG_PROP_URI, HMS_CATALOG_PROP_WAREHOUSE,
     };
 
     let trimmed = location.trim();

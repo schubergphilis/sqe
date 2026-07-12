@@ -1,10 +1,10 @@
 use std::fmt;
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow_array::builder::StringBuilder;
 use arrow_array::{ArrayRef, RecordBatch};
+use async_trait::async_trait;
 use datafusion::catalog::SchemaProvider;
 use datafusion::datasource::{MemTable, TableProvider};
 use datafusion::error::Result as DFResult;
@@ -72,7 +72,6 @@ impl InformationSchemaProvider {
 
 #[async_trait]
 impl SchemaProvider for InformationSchemaProvider {
-
     fn table_names(&self) -> Vec<String> {
         vec![
             "tables".to_string(),
@@ -323,7 +322,13 @@ impl InformationSchemaProvider {
         match self.session_catalog.list_namespaces().await {
             Ok(namespaces) => namespaces
                 .iter()
-                .map(|ns| ns.as_ref().iter().map(|s| s.as_str()).collect::<Vec<_>>().join("."))
+                .map(|ns| {
+                    ns.as_ref()
+                        .iter()
+                        .map(|s| s.as_str())
+                        .collect::<Vec<_>>()
+                        .join(".")
+                })
                 .collect(),
             Err(e) if listing_error_is_forbidden(&e) => {
                 debug!(error = %e, "information_schema: skipping catalog the principal is not authorized to list");
