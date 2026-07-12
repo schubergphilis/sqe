@@ -47,6 +47,16 @@ pub(crate) struct PlanMetrics {
     pub(crate) peak_memory_bytes: u64,
 }
 
+type OpenStreamResult = (
+    SchemaRef,
+    SendableRecordBatchStream,
+    Arc<dyn ExecutionPlan>,
+    TimeTravelCleanup,
+    Vec<String>,
+    sqe_policy::PolicySummary,
+    Vec<sqe_metrics::audit::Resource>,
+);
+
 /// Determine the effective query timeout for a session.
 ///
 /// If any of the user's roles appear in `config.role_overrides`, the highest
@@ -2148,15 +2158,7 @@ impl QueryHandler {
         sql: &str,
         query_id: &uuid::Uuid,
         start: std::time::Instant,
-    ) -> sqe_core::Result<(
-        SchemaRef,
-        SendableRecordBatchStream,
-        Arc<dyn ExecutionPlan>,
-        TimeTravelCleanup,
-        Vec<String>,
-        sqe_policy::PolicySummary,
-        Vec<sqe_metrics::audit::Resource>,
-    )> {
+    ) -> sqe_core::Result<OpenStreamResult> {
         let (ctx, session_catalog) = self.create_session_context(session).await?;
 
         let sql = self.handle_incremental(sql, &ctx, &session_catalog).await?;
