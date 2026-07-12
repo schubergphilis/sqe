@@ -1,0 +1,20 @@
+services:
+  dlt-tests:
+    build:
+      context: ./dlt
+    environment:
+      KEYCLOAK_TOKEN_URL: http://keycloak:8080/realms/iceberg-ranger/protocol/openid-connect/token
+      POLARIS_REST_URI: http://polaris:8181/api/catalog
+      POLARIS_WAREHOUSE: sales_wh
+      # Select the SQE client protocol: trino or flight.
+      SQE_TRANSPORT: ${SQE_TRANSPORT:-trino}
+      SQE_TRINO_URL: http://sqe:8080
+      SQE_FLIGHT_URI: grpc://sqe:50051
+      SP_ADMIN_CLIENT_ID: sp-admin
+      SP_ADMIN_SECRET: ${SP_ADMIN_SECRET:-sp-admin-secret}
+      # dlt pipeline state is disposable for this E2E suite.
+      DLT_DATA_DIR: /tmp/dlt
+    depends_on:
+      sqe:
+        condition: service_healthy
+    profiles: [dlt]
