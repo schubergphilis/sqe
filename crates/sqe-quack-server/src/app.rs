@@ -172,6 +172,7 @@ async fn identify() -> impl IntoResponse {
     )
 }
 
+#[tracing::instrument(skip_all, name = "quack.handle")]
 async fn handle_quack(
     State(state): State<Arc<QuackServerState>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
