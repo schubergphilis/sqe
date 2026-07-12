@@ -568,6 +568,7 @@ pub async fn create_session_context(
                         rows_scanned: r.rows_scanned,
                         spill_bytes: r.spill_bytes,
                         peak_memory_bytes: r.peak_memory_bytes,
+                        trace_id: r.trace_id.clone(),
                         fragments: r
                             .fragments_snapshot()
                             .into_iter()

@@ -422,9 +422,9 @@ mod tests {
     async fn query_list_returns_started_records_recent_first() {
         let t = tracker();
         let id1 = Uuid::now_v7();
-        t.start(id1, "alice", Some("cli"), "SELECT 1", "s1", None, vec![]);
+        t.start(id1, "alice", Some("cli"), "SELECT 1", "s1", None, vec![], None);
         let id2 = Uuid::now_v7();
-        t.start(id2, "bob", Some("flight_sql"), "SELECT 2", "s2", None, vec![]);
+        t.start(id2, "bob", Some("flight_sql"), "SELECT 2", "s2", None, vec![], None);
 
         let list = query_list(&t, None, 100);
         assert_eq!(list.len(), 2);
@@ -441,7 +441,7 @@ mod tests {
         let t = tracker();
         let id = Uuid::now_v7();
         let sql = "SELECT secret FROM t WHERE email = 'jane@x.com'";
-        t.start(id, "alice", None, sql, "s1", None, vec![]);
+        t.start(id, "alice", None, sql, "s1", None, vec![], None);
         t.running(&id, 5);
 
         let running = query_list(&t, Some("running"), 100);
@@ -462,7 +462,7 @@ mod tests {
     async fn query_list_respects_limit() {
         let t = tracker();
         for i in 0..10 {
-            t.start(Uuid::now_v7(), &format!("u{i}"), None, "SELECT 1", "s", None, vec![]);
+            t.start(Uuid::now_v7(), &format!("u{i}"), None, "SELECT 1", "s", None, vec![], None);
         }
         assert_eq!(query_list(&t, None, 3).len(), 3);
     }
@@ -474,7 +474,7 @@ mod tests {
         // Multibyte SQL must hash cleanly (the old byte-slice truncation could
         // split a char; hashing operates on bytes and never panics).
         let sql = "λ".repeat(600);
-        t.start(id, "alice", None, &sql, "s1", None, vec![]);
+        t.start(id, "alice", None, &sql, "s1", None, vec![], None);
         let list = query_list(&t, None, 100);
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].sql_hash, sql_digest(&sql));
@@ -485,7 +485,7 @@ mod tests {
         use crate::query_tracker::{FragmentInfo, FragmentState};
         let t = tracker();
         let id = Uuid::now_v7();
-        t.start(id, "alice", None, "SELECT *", "s1", None, vec!["analyst".to_string()]);
+        t.start(id, "alice", None, "SELECT *", "s1", None, vec!["analyst".to_string()], None);
         t.set_fragments(&id, vec![FragmentInfo {
             task_id: "frag-0".into(),
             worker_url: "http://w1:50052".into(),
@@ -516,7 +516,7 @@ mod tests {
         use crate::query_tracker::{FragmentInfo, FragmentState};
         let t = tracker();
         let id = Uuid::now_v7();
-        t.start(id, "alice", None, "SELECT *", "s1", None, vec![]);
+        t.start(id, "alice", None, "SELECT *", "s1", None, vec![], None);
         t.running(&id, 1);
         t.set_fragments(&id, vec![
             FragmentInfo { task_id: "f0".into(), worker_url: "http://w1:50052".into(),
@@ -600,18 +600,18 @@ mod tests {
 
         // Two finished queries with different execution times.
         let id1 = Uuid::now_v7();
-        t.start(id1, "alice", None, "SELECT 1", "s1", None, vec![]);
+        t.start(id1, "alice", None, "SELECT 1", "s1", None, vec![], None);
         t.running(&id1, 5);
         t.complete(&id1, 100, 200, vec!["t1".to_string()], 1024, 100, 0, 512 * 1024 * 1024);
 
         let id2 = Uuid::now_v7();
-        t.start(id2, "bob", None, "SELECT 2", "s2", None, vec![]);
+        t.start(id2, "bob", None, "SELECT 2", "s2", None, vec![], None);
         t.running(&id2, 3);
         t.complete(&id2, 50, 400, vec![], 2048, 50, 64, 256 * 1024 * 1024);
 
         // One failed query.
         let id3 = Uuid::now_v7();
-        t.start(id3, "carol", None, "BAD SQL", "s3", None, vec![]);
+        t.start(id3, "carol", None, "BAD SQL", "s3", None, vec![], None);
         t.running(&id3, 1);
         t.failed(&id3, &sqe_core::SqeError::Execution("syntax error".to_string()));
 
@@ -658,7 +658,7 @@ mod tests {
         let t = tracker();
         let id = Uuid::now_v7();
         let sql = "SELECT * FROM users WHERE email = 'a@b.com'";
-        t.start(id, "alice", None, sql, "s1", Some("10.0.0.7"), vec!["admin".to_string()]);
+        t.start(id, "alice", None, sql, "s1", Some("10.0.0.7"), vec!["admin".to_string()], None);
 
         let list = query_list(&t, None, 100);
         assert_eq!(list.len(), 1);
@@ -678,7 +678,7 @@ mod tests {
     async fn error_message_is_redacted_in_dto() {
         let t = tracker();
         let id = Uuid::now_v7();
-        t.start(id, "bob", None, "SELECT 1", "s1", None, vec![]);
+        t.start(id, "bob", None, "SELECT 1", "s1", None, vec![], None);
         // Simulate a failed query whose error message contains an email address.
         let err = sqe_core::SqeError::Execution(
             "constraint violation for user 'a@b.com'".to_string(),

@@ -74,6 +74,7 @@ pub struct RuntimeQueryRecord {
     pub rows_scanned: u64,
     pub spill_bytes: u64,
     pub peak_memory_bytes: u64,
+    pub trace_id: Option<String>,
     pub fragments: Vec<RuntimeFragmentInfo>,
 }
 
@@ -191,6 +192,7 @@ fn queries_schema() -> Schema {
         Field::new("rows_scanned", DataType::Int64, false),
         Field::new("spill_bytes", DataType::Int64, false),
         Field::new("peak_memory_bytes", DataType::Int64, false),
+        Field::new("trace_id", DataType::Utf8, true),
         Field::new("error_type", DataType::Utf8, true),
         Field::new("error_code", DataType::Utf8, true),
     ])
@@ -224,6 +226,7 @@ fn build_queries_table(records: &[RuntimeQueryRecord]) -> DFResult<Arc<dyn Table
     let mut rows_scanned_b = Int64Builder::new();
     let mut spill_bytes_b = Int64Builder::new();
     let mut peak_memory_bytes_b = Int64Builder::new();
+    let mut trace_id_b = StringBuilder::new();
     let mut error_type_b = StringBuilder::new();
     let mut error_code_b = StringBuilder::new();
 
@@ -260,6 +263,10 @@ fn build_queries_table(records: &[RuntimeQueryRecord]) -> DFResult<Arc<dyn Table
         rows_scanned_b.append_value(u64_to_i64_saturating(rec.rows_scanned));
         spill_bytes_b.append_value(u64_to_i64_saturating(rec.spill_bytes));
         peak_memory_bytes_b.append_value(u64_to_i64_saturating(rec.peak_memory_bytes));
+        match &rec.trace_id {
+            Some(s) => trace_id_b.append_value(s),
+            None => trace_id_b.append_null(),
+        }
         match &rec.error_type {
             Some(s) => error_type_b.append_value(s),
             None => error_type_b.append_null(),
@@ -292,6 +299,7 @@ fn build_queries_table(records: &[RuntimeQueryRecord]) -> DFResult<Arc<dyn Table
             Arc::new(rows_scanned_b.finish()) as ArrayRef,
             Arc::new(spill_bytes_b.finish()) as ArrayRef,
             Arc::new(peak_memory_bytes_b.finish()) as ArrayRef,
+            Arc::new(trace_id_b.finish()) as ArrayRef,
             Arc::new(error_type_b.finish()) as ArrayRef,
             Arc::new(error_code_b.finish()) as ArrayRef,
         ],
@@ -461,6 +469,7 @@ mod tests {
                 rows_scanned: 10,
                 spill_bytes: 0,
                 peak_memory_bytes: 2048,
+                trace_id: Some("0123456789abcdef0123456789abcdef".to_string()),
                 fragments: vec![],
             },
             RuntimeQueryRecord {
@@ -513,12 +522,12 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_queries_table_has_21_columns() {
+    fn test_queries_table_has_22_columns() {
         let table = build_queries_table(&sample_records()).unwrap();
         assert_eq!(
             table.schema().fields().len(),
-            21,
-            "queries table must have exactly 21 columns"
+            22,
+            "queries table must have exactly 22 columns"
         );
     }
 
@@ -546,6 +555,7 @@ mod tests {
             "rows_scanned",
             "spill_bytes",
             "peak_memory_bytes",
+            "trace_id",
             "error_type",
             "error_code",
         ];

@@ -719,7 +719,6 @@ impl QueryHandler {
 
         // Generate a query ID for lifecycle tracking
         let query_id = uuid::Uuid::now_v7();
-        let trace_id = sqe_metrics::propagation::current_trace_id();
         // Wall-clock start timestamp for OpenLineage. The Instant `start`
         // already captured monotonic time but OL events need RFC3339 timestamps.
         let ol_started_at = chrono::Utc::now();
@@ -729,6 +728,7 @@ impl QueryHandler {
             sql_length = sql.len(),
             "Executing query"
         );
+        let trace_id = sqe_metrics::propagation::current_trace_id();
 
         // Root span for the entire query (O3). Children (policy_rewrite,
         // DataFusion planning/execution, write, etc.) will be nested under it
@@ -747,6 +747,7 @@ impl QueryHandler {
             &session.id,
             client_ip.as_deref(),
             session.user.roles.clone(),
+            trace_id.clone(),
         );
 
         // OpenLineage: emit START event. The observer is sync and best-effort;
@@ -2097,6 +2098,7 @@ impl QueryHandler {
             &session.id,
             client_ip.as_deref(),
             session.user.roles.clone(),
+            trace_id,
         );
 
         match self.open_stream(session, sql, &query_id, start).await {

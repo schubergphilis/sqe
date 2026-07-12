@@ -907,7 +907,7 @@ async fn streaming_select_emits_canonical_query_event() {
     };
 
     let qid = fin.query_id;
-    tracker.start(qid, "auditor", None, "SELECT 1 AS x", "sess-streaming-1", None, vec![]);
+    tracker.start(qid, "auditor", None, "SELECT 1 AS x", "sess-streaming-1", None, vec![], None);
 
     // Drive the success path: create a single-batch stream and drain it.
     let arr = Int64Array::from_iter_values(0..5);
