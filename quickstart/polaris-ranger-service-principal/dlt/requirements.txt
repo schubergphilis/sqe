@@ -1,0 +1,7 @@
+dlt[filesystem,pyiceberg]>=1.28.1,<2
+dlthub>=0.9.1,<1
+adbc-driver-flightsql>=1.6,<2
+adbc-driver-manager>=1.6,<2
+pytest>=8,<9
+requests>=2.32,<3
+trino>=0.336,<1
