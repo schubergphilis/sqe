@@ -486,6 +486,17 @@ P2 and lower as before. No new criticals.
 
 See Prioritized Action Plan above and nextsteps.md for current NEXT pointers. The perf bottlenecks table is largely historical (fixes landed).
 
+## 2026-07-11 O3 Progress (root spans)
+- `sqe.query` root span at execute entry points (query_id + user).
+- `sqe.policy_rewrite` child span around policy enforcement.
+- Works with the trace_id on AuditEvent (O4) for correlation.
+- More phase spans (execute, spill, write_commit) can be added iteratively.
+
+## 2026-07-11 O6 Progress (Trino/Quack trace prop)
+- Added `attach_trace_context_from_headers` + HeaderMapExtractor in sqe-metrics/propagation.
+- Wired early in Trino submit_query and Quack handle_quack using the new helper.
+- Incoming traceparent now flows into SQE query spans and audit trace_id capture.
+
 ## Additional 2026-07-11 Progress (maintenance lineage O5)
 - `should_emit` now returns `true` for `StatementKind::Procedure` (was hard false).
 - Updated comment + renamed/fixed the unit test.

@@ -1057,6 +1057,9 @@ async fn submit_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
 
     let trino_headers = extract_trino_headers(&headers);
 
+    // O6: Trace propagation for Trino HTTP.
+    sqe_metrics::propagation::attach_trace_context_from_headers(&headers);
+
     let session = if let Some(token) = extract_bearer_token(&headers) {
         match state.authenticator.authenticate_bearer(&token).await {
             Ok(s) => s,

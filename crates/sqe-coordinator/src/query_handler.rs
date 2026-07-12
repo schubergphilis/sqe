@@ -729,6 +729,16 @@ impl QueryHandler {
             "Executing query"
         );
         let trace_id = sqe_metrics::propagation::current_trace_id();
+
+        // Root span for the entire query (O3). Children (policy_rewrite,
+        // DataFusion planning/execution, write, etc.) will be nested under it
+        // when the OTel layer is active.
+        let _root_query_span = tracing::info_span!(
+            "sqe.query",
+            query_id = %query_id,
+            user = %session.user.username,
+        );
+
         let cancel_token = self.query_tracker.start(
             query_id,
             &session.user.username,
@@ -2073,6 +2083,13 @@ impl QueryHandler {
             sql_length = sql.len(),
             "Starting streaming query"
         );
+
+        let _root_query_span = tracing::info_span!(
+            "sqe.query",
+            query_id = %query_id,
+            user = %session.user.username,
+        );
+
         let cancel_token = self.query_tracker.start(
             query_id,
             &session.user.username,
@@ -2196,8 +2213,13 @@ impl QueryHandler {
         // TrackedRecordBatchStream finalizer (not the `execute` path), so carry
         // the policy summary out to the caller, which stows it on the
         // StreamFinalizer for the audit emission at stream end.
-        let (enforced_plan, policy_summary) =
-            self.policy_enforcer.evaluate(&session.user, plan).await?;
+        let (enforced_plan, policy_summary) = {
+            let _policy_span = tracing::info_span!(
+                "sqe.policy_rewrite",
+                user = %session.user.username
+            );
+            self.policy_enforcer.evaluate(&session.user, plan).await?
+        };
         debug!("Policy-enforced plan (streaming): {:?}", enforced_plan);
         // Compute the structured resource list from the logical plan now,
         // before it is consumed by `execute_logical_plan`. The streaming
@@ -2510,10 +2532,15 @@ impl QueryHandler {
 
         // Get the logical plan and run policy enforcement
         let plan = df.logical_plan().clone();
-        let (enforced_plan, policy_summary) = self
-            .policy_enforcer
-            .evaluate(&session.user, plan)
-            .await?;
+        let (enforced_plan, policy_summary) = {
+            let _policy_span = tracing::info_span!(
+                "sqe.policy_rewrite",
+                user = %session.user.username
+            );
+            self.policy_enforcer
+                .evaluate(&session.user, plan)
+                .await?
+        };
 
         debug!("Policy-enforced plan: {:?}", enforced_plan);
 
