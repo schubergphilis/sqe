@@ -611,6 +611,8 @@ async fn audit_logger_round_trips_session_event() {
         query: None,
         session_id: Some("test-session-id-001".to_string()),
         client_ip: Some("127.0.0.1".to_string()),
+        trace_id: None,
+        query_id: None,
         integrity: sqe_metrics::audit::Integrity::default(),
     };
     audit.log_event(event);
@@ -877,6 +879,7 @@ async fn streaming_select_emits_canonical_query_event() {
         query_id: uuid::Uuid::now_v7(),
         username: "auditor".to_string(),
         session_id: "sess-streaming-1".to_string(),
+        trace_id: None,
         sql: "SELECT 1 AS x".to_string(),
         kind_name: "Query".to_string(),
         plan,
