@@ -220,6 +220,30 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_http_traceparent() {
+        install_propagator();
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            "traceparent",
+            "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"
+                .parse()
+                .unwrap(),
+        );
+
+        let cx = extract_trace_context_from_headers(&headers);
+        let span_context = cx.span().span_context().clone();
+        assert!(span_context.is_remote());
+        assert_eq!(
+            span_context.trace_id(),
+            TraceId::from_hex("0af7651916cd43dd8448eb211c80319c").unwrap()
+        );
+        assert_eq!(
+            span_context.span_id(),
+            SpanId::from_hex("b7ad6b7169203331").unwrap()
+        );
+    }
+
+    #[test]
     fn test_metadata_injector_set() {
         let mut metadata = MetadataMap::new();
         {
