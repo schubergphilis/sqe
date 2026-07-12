@@ -12,6 +12,7 @@ use datafusion::physical_plan::joins::HashJoinExec;
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::logical_expr::JoinType;
 use futures::TryStreamExt;
+use tracing::Instrument;
 use datafusion::prelude::SessionContext;
 use tracing::{debug, info, warn, Span};
 
@@ -725,7 +726,6 @@ impl QueryHandler {
             &session.id,
             client_ip.as_deref(),
             session.user.roles.clone(),
-            trace_id.clone(),
         );
 
         // OpenLineage: emit START event. The observer is sync and best-effort;
@@ -2053,7 +2053,6 @@ impl QueryHandler {
             sql_length = sql.len(),
             "Starting streaming query"
         );
-        let trace_id = sqe_metrics::propagation::current_trace_id();
         let cancel_token = self.query_tracker.start(
             query_id,
             &session.user.username,
@@ -2062,7 +2061,6 @@ impl QueryHandler {
             &session.id,
             client_ip.as_deref(),
             session.user.roles.clone(),
-            trace_id.clone(),
         );
 
         match self.open_stream(session, sql, &query_id, start).await {
@@ -2143,6 +2141,7 @@ impl QueryHandler {
     /// building, star-schema reorder, adaptive-sort, and `try_distribute`
     /// steps, but returns the opened [`SendableRecordBatchStream`] plus
     /// the final plan instead of draining into a `Vec<RecordBatch>`.
+    #[tracing::instrument(skip(self, session, sql, start), fields(username = %session.user.username, query_id = %query_id), name = "sqe.execute")]
     async fn open_stream(
         &self,
         session: &Session,
@@ -2172,8 +2171,10 @@ impl QueryHandler {
         let sql = sqe_sql::rewrite_named_tvf_args(&sql);
         let sql = sql.as_str();
 
+        let plan_span = tracing::info_span!("sqe.plan", query_id = %query_id);
         let df = ctx
             .sql(sql)
+            .instrument(plan_span)
             .await
             .map_err(|e| SqeError::Execution(format!("SQL planning failed: {e}")))?;
         let plan = df.logical_plan().clone();
@@ -2310,8 +2311,6 @@ impl QueryHandler {
 
         // Distribute scan across workers if possible.
         let final_plan = self.try_distribute(physical_plan, session, query_id).await;
-
-        let _execute_span = tracing::info_span!("sqe.execute", query_id = %query_id);
 
         // Planning complete — promote tracker to Running
         self.query_tracker
@@ -2451,7 +2450,7 @@ impl QueryHandler {
     /// caller can pass it to the OpenLineage observer's complete/fail hook.
     /// Plan capture happens after policy enforcement so the emitted lineage
     /// reflects the user's *enforced* view, not the raw user query.
-    #[tracing::instrument(skip(self, session, sql, query_id, plan_metrics, plan_out), fields(username = %session.user.username))]
+    #[tracing::instrument(skip(self, session, sql, plan_metrics, plan_out, summary_out), fields(username = %session.user.username, query_id = %query_id), name = "sqe.execute")]
     async fn execute_query(
         &self,
         session: &Session,
@@ -2488,9 +2487,10 @@ impl QueryHandler {
         let sql = sql.as_str();
 
         // Plan the query via DataFusion's SQL planner
-        let _plan_span = tracing::info_span!("sqe.plan", query_id = %query_id);
+        let plan_span = tracing::info_span!("sqe.plan", query_id = %query_id);
         let df = ctx
             .sql(sql)
+            .instrument(plan_span)
             .await
             .map_err(|e| SqeError::Execution(format!("SQL planning failed: {e}")))?;
 
@@ -2577,8 +2577,6 @@ impl QueryHandler {
 
         // Try to distribute scan work across workers
         let final_plan = self.try_distribute(physical_plan, session, query_id).await;
-
-        let _execute_span = tracing::info_span!("sqe.execute", query_id = %query_id);
 
         // Execute the (possibly distributed) plan.
         //
