@@ -2042,7 +2042,7 @@ mod tests {
             &sqe_core::QueryHistoryConfig { max_entries: 100, ttl_secs: 60 },
         ));
         let id = uuid::Uuid::now_v7();
-        tracker.start(id, "alice", Some("cli"), "SELECT 1", "s1", None, vec![]);
+        tracker.start(id, "alice", Some("cli"), "SELECT 1", "s1", None, vec![], None);
 
         let state = Arc::new(HealthState {
             ready: Arc::new(AtomicBool::new(true)),

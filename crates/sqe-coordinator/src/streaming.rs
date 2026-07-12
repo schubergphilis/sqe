@@ -878,7 +878,7 @@ mod tests {
         let tracker = test_tracker();
         let fin = test_finalizer(Arc::clone(&tracker), plan, runtime);
         let qid = fin.query_id;
-        tracker.start(qid, "test-user", None, "SELECT 1", "test-session", None, vec![]);
+        tracker.start(qid, "test-user", None, "SELECT 1", "test-session", None, vec![], None);
 
         let inner = fixed_stream(
             Arc::clone(&schema),
@@ -928,7 +928,7 @@ mod tests {
             denied: false,
         };
         let qid = fin.query_id;
-        tracker.start(qid, "test-user", None, "SELECT 1", "test-session", None, vec![]);
+        tracker.start(qid, "test-user", None, "SELECT 1", "test-session", None, vec![], None);
 
         let inner = fixed_stream(Arc::clone(&schema), vec![sample_batch(3)]);
         let mut stream = TrackedRecordBatchStream::new(inner, fin, None);
@@ -958,7 +958,7 @@ mod tests {
         let tracker = test_tracker();
         let fin = test_finalizer(Arc::clone(&tracker), plan, runtime);
         let qid = fin.query_id;
-        tracker.start(qid, "test-user", None, "SELECT 1", "test-session", None, vec![]);
+        tracker.start(qid, "test-user", None, "SELECT 1", "test-session", None, vec![], None);
 
         let inner = fixed_stream(
             Arc::clone(&schema),
@@ -981,7 +981,7 @@ mod tests {
         let tracker = test_tracker();
         let fin = test_finalizer(Arc::clone(&tracker), plan, runtime);
         let qid = fin.query_id;
-        tracker.start(qid, "test-user", None, "SELECT 1", "test-session", None, vec![]);
+        tracker.start(qid, "test-user", None, "SELECT 1", "test-session", None, vec![], None);
 
         let s = futures::stream::iter(vec![
             Ok(sample_batch(3)),
@@ -1007,7 +1007,7 @@ mod tests {
         let mut fin = test_finalizer(Arc::clone(&tracker), plan, runtime);
         fin.profile_mode = ProfileMode::All;
         let qid = fin.query_id;
-        tracker.start(qid, "test-user", None, "SELECT 1", "test-session", None, vec![]);
+        tracker.start(qid, "test-user", None, "SELECT 1", "test-session", None, vec![], None);
 
         let inner = fixed_stream(Arc::clone(&schema), vec![sample_batch(7)]);
         let mut stream = TrackedRecordBatchStream::new(inner, fin, None);
@@ -1035,7 +1035,7 @@ mod tests {
         let tracker = test_tracker();
         let fin = test_finalizer(Arc::clone(&tracker), plan, runtime);
         let qid = fin.query_id;
-        tracker.start(qid, "test-user", None, "SELECT 1", "test-session", None, vec![]);
+        tracker.start(qid, "test-user", None, "SELECT 1", "test-session", None, vec![], None);
 
         let inner = fixed_stream(Arc::clone(&schema), vec![sample_batch(7)]);
         let mut stream = TrackedRecordBatchStream::new(inner, fin, None);
@@ -1061,7 +1061,7 @@ mod tests {
         fin.profile_mode = ProfileMode::Slow;
         fin.slow_query_threshold_secs = 3600;
         let qid = fin.query_id;
-        tracker.start(qid, "test-user", None, "SELECT 1", "test-session", None, vec![]);
+        tracker.start(qid, "test-user", None, "SELECT 1", "test-session", None, vec![], None);
 
         let s = futures::stream::iter(vec![
             Ok(sample_batch(3)),
@@ -1128,7 +1128,7 @@ mod tests {
         fin.audit = Some(Arc::clone(&audit));
         fin.client_ip = Some("10.9.9.9".to_string());
         let qid = fin.query_id;
-        tracker.start(qid, "test-user", None, "SELECT 1", "test-session", None, vec![]);
+        tracker.start(qid, "test-user", None, "SELECT 1", "test-session", None, vec![], None);
 
         let inner = fixed_stream(Arc::clone(&schema), vec![sample_batch(1)]);
         let mut stream = TrackedRecordBatchStream::new(inner, fin, None);
@@ -1171,7 +1171,7 @@ mod tests {
         fin.audit = Some(Arc::clone(&audit));
         fin.client_ip = Some("10.9.9.9".to_string());
         let qid = fin.query_id;
-        tracker.start(qid, "test-user", None, "SELECT 1", "test-session", None, vec![]);
+        tracker.start(qid, "test-user", None, "SELECT 1", "test-session", None, vec![], None);
 
         let s = futures::stream::iter(vec![
             Err(DataFusionError::Execution("boom".to_string())),
@@ -1226,7 +1226,7 @@ mod tests {
         fin.audit = Some(Arc::clone(&audit));
         fin.client_ip = Some("10.9.9.9".to_string());
         let qid = fin.query_id;
-        tracker.start(qid, "test-user", None, "SELECT 1", "test-session", None, vec![]);
+        tracker.start(qid, "test-user", None, "SELECT 1", "test-session", None, vec![], None);
 
         // Drop the stream after one batch to trigger the cancel path.
         let inner = fixed_stream(Arc::clone(&schema), vec![sample_batch(1), sample_batch(1)]);
@@ -1262,7 +1262,7 @@ mod tests {
         let tracker = test_tracker();
         let finalizer = test_finalizer(tracker.clone(), plan, runtime);
         let qid = finalizer.query_id;
-        tracker.start(qid, "test-user", None, "SELECT 1", "test-session", None, vec![]);
+        tracker.start(qid, "test-user", None, "SELECT 1", "test-session", None, vec![], None);
 
         // Inner stream never produces a batch: a stalled execution pipeline.
         let pending = futures::stream::pending::<Result<RecordBatch, DataFusionError>>();
@@ -1379,7 +1379,7 @@ mod tests {
         let tracker = test_tracker();
         let finalizer = test_finalizer(Arc::clone(&tracker), plan, runtime);
         let qid = finalizer.query_id;
-        tracker.start(qid, "test-user", None, "SELECT 1", "test-session", None, vec![]);
+        tracker.start(qid, "test-user", None, "SELECT 1", "test-session", None, vec![], None);
 
         let pending = futures::stream::pending::<Result<RecordBatch, DataFusionError>>();
         let inner: SendableRecordBatchStream =
