@@ -474,10 +474,10 @@ P0 advanced in this pass:
 - Helm values now document production_mode, rate_limit, TLS/auth checklist items (!632).
 
 P1 advanced:
-- O4: `trace_id` + `query_id` on `AuditEvent` + helper + wiring across paths (!626).
-- O3: `sqe.query` root spans + `sqe.policy_rewrite` child spans added (!628).
+- O4: `trace_id` + `query_id` on `AuditEvent` + helper + wiring across paths (including flight_sql auth/session events to unblock 626); also added to QueryRecord / system.runtime.queries (!634).
+- O3: `sqe.query` root spans + `sqe.policy_rewrite` + `sqe.execute` + `sqe.write_commit` + `sqe.plan` child spans (expanded on this branch). Spill and catalog REST tracing still open.
 - O5: Maintenance procedures now emit OpenLineage (flipped should_emit + existing paths; !627).
-- O6: still open.
+- O6: Trino/Quack traceparent propagation wired (!630).
 - Structural items (god-crate, full CI) remain.
 
 See the appended 2026-07-11 sections lower in this file for details per MR.
@@ -505,4 +505,15 @@ See Prioritized Action Plan above and nextsteps.md for current NEXT pointers. Th
 - Branch: fix/audit-maintenance-lineage ; MR to be created/updated.
 
 See plan.md for details. Previous MRs: !625 (DML PolicyAudit), !626 (trace/query_id on AuditEvent).
+
+## 2026-07-11 Session Progress (otel/trace wiring)
+- Added `sqe_metrics::propagation::current_trace_id()` helper.
+- Extended `AuditEvent` with `trace_id` + `query_id` (with serde skip, test updates).
+- Wired capture + population in query_handler (buffered + streaming paths), StreamFinalizer, maintenance, web_auth, lib small emit, and OCSF tests.
+- All AuditEvent literals updated; legacy path uses None.
+- This advances O4 (trace_id on audit events). Root spans (O3) follow-up on same branch or next (info_span skeleton + instrument on execute_query / policy paths).
+- MR will be created for this change set.
+- Also see companion MR !625 for unconditional DML PolicyAudit (P0/O2).
+
+Next per plan: root spans, maintenance OL, Trino trace headers.
 

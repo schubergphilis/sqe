@@ -12,6 +12,7 @@ use datafusion::physical_plan::joins::HashJoinExec;
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::logical_expr::JoinType;
 use futures::TryStreamExt;
+use tracing::Instrument;
 use datafusion::prelude::SessionContext;
 use tracing::{debug, info, warn, Span};
 
@@ -45,6 +46,16 @@ pub(crate) struct PlanMetrics {
     pub(crate) spill_bytes: u64,
     pub(crate) peak_memory_bytes: u64,
 }
+
+type OpenStreamResult = (
+    SchemaRef,
+    SendableRecordBatchStream,
+    Arc<dyn ExecutionPlan>,
+    TimeTravelCleanup,
+    Vec<String>,
+    sqe_policy::PolicySummary,
+    Vec<sqe_metrics::audit::Resource>,
+);
 
 /// Determine the effective query timeout for a session.
 ///
@@ -708,6 +719,7 @@ impl QueryHandler {
 
         // Generate a query ID for lifecycle tracking
         let query_id = uuid::Uuid::now_v7();
+        let trace_id = sqe_metrics::propagation::current_trace_id();
         // Wall-clock start timestamp for OpenLineage. The Instant `start`
         // already captured monotonic time but OL events need RFC3339 timestamps.
         let ol_started_at = chrono::Utc::now();
@@ -1690,6 +1702,8 @@ impl QueryHandler {
                     }),
                     session_id: Some(session.id.clone()),
                     client_ip: client_ip.clone(),
+                    trace_id,
+                    query_id: Some(query_id.to_string()),
                     integrity: sqe_metrics::audit::Integrity::default(),
                 };
                 audit.log_event(event);
@@ -1756,6 +1770,8 @@ impl QueryHandler {
                     }),
                     session_id: Some(session.id.clone()),
                     client_ip: client_ip.clone(),
+                    trace_id: trace_id.clone(),
+                    query_id: Some(query_id.to_string()),
                     integrity: sqe_metrics::audit::Integrity::default(),
                 };
                 audit.log_event(grant_event);
@@ -1881,6 +1897,8 @@ impl QueryHandler {
                     }),
                     session_id: Some(session.id.clone()),
                     client_ip: client_ip.clone(),
+                    trace_id,
+                    query_id: Some(query_id.to_string()),
                     integrity: sqe_metrics::audit::Integrity::default(),
                 };
                 audit.log_event(ddl_event);
@@ -2056,8 +2074,10 @@ impl QueryHandler {
         // --- Start tracker ----------------------------------------------------
         let start = std::time::Instant::now();
         let query_id = uuid::Uuid::now_v7();
+        let trace_id = sqe_metrics::propagation::current_trace_id();
         info!(
             query_id = %query_id,
+            trace_id = ?trace_id,
             username = %session.user.username,
             sql_length = sql.len(),
             "Starting streaming query"
@@ -2108,6 +2128,7 @@ impl QueryHandler {
                     actor,
                     resources: audit_resources,
                     client_ip: client_ip.clone(),
+                    trace_id: sqe_metrics::propagation::current_trace_id(),
                 };
 
                 let tracked = crate::streaming::TrackedRecordBatchStream::with_permits_reservation_and_cancel_token(
@@ -2157,21 +2178,14 @@ impl QueryHandler {
     /// building, star-schema reorder, adaptive-sort, and `try_distribute`
     /// steps, but returns the opened [`SendableRecordBatchStream`] plus
     /// the final plan instead of draining into a `Vec<RecordBatch>`.
+    #[tracing::instrument(skip(self, session, sql, start), fields(username = %session.user.username, query_id = %query_id), name = "sqe.execute")]
     async fn open_stream(
         &self,
         session: &Session,
         sql: &str,
         query_id: &uuid::Uuid,
         start: std::time::Instant,
-    ) -> sqe_core::Result<(
-        SchemaRef,
-        SendableRecordBatchStream,
-        Arc<dyn ExecutionPlan>,
-        TimeTravelCleanup,
-        Vec<String>,
-        sqe_policy::PolicySummary,
-        Vec<sqe_metrics::audit::Resource>,
-    )> {
+    ) -> sqe_core::Result<OpenStreamResult> {
         let (ctx, session_catalog) = self.create_session_context(session).await?;
 
         let sql = self.handle_incremental(sql, &ctx, &session_catalog).await?;
@@ -2186,8 +2200,10 @@ impl QueryHandler {
         let sql = sqe_sql::rewrite_named_tvf_args(&sql);
         let sql = sql.as_str();
 
+        let plan_span = tracing::info_span!("sqe.plan", query_id = %query_id);
         let df = ctx
             .sql(sql)
+            .instrument(plan_span)
             .await
             .map_err(|e| SqeError::Execution(format!("SQL planning failed: {e}")))?;
         let plan = df.logical_plan().clone();
@@ -2468,7 +2484,7 @@ impl QueryHandler {
     /// caller can pass it to the OpenLineage observer's complete/fail hook.
     /// Plan capture happens after policy enforcement so the emitted lineage
     /// reflects the user's *enforced* view, not the raw user query.
-    #[tracing::instrument(skip(self, session, sql, query_id, plan_metrics, plan_out), fields(username = %session.user.username))]
+    #[tracing::instrument(skip(self, session, sql, plan_metrics, plan_out, summary_out), fields(username = %session.user.username, query_id = %query_id), name = "sqe.execute")]
     async fn execute_query(
         &self,
         session: &Session,
@@ -2505,8 +2521,10 @@ impl QueryHandler {
         let sql = sql.as_str();
 
         // Plan the query via DataFusion's SQL planner
+        let plan_span = tracing::info_span!("sqe.plan", query_id = %query_id);
         let df = ctx
             .sql(sql)
+            .instrument(plan_span)
             .await
             .map_err(|e| SqeError::Execution(format!("SQL planning failed: {e}")))?;
 

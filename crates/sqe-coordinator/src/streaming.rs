@@ -180,6 +180,8 @@ pub struct StreamFinalizer {
     /// from the `execute_stream` parameter so every streaming audit event
     /// (success, error, cancel) carries the originating address.
     pub client_ip: Option<String>,
+    /// W3C trace ID captured at query start for audit <-> trace correlation (O4).
+    pub trace_id: Option<String>,
 }
 
 impl StreamFinalizer {
@@ -289,6 +291,8 @@ impl StreamFinalizer {
                 }),
                 session_id: Some(self.session_id.clone()),
                 client_ip: self.client_ip.clone(),
+                trace_id: self.trace_id.clone(),
+                query_id: Some(self.query_id.to_string()),
                 integrity: Default::default(),
             };
             audit.log_event(event);
@@ -364,6 +368,8 @@ impl StreamFinalizer {
                 }),
                 session_id: Some(self.session_id.clone()),
                 client_ip: self.client_ip.clone(),
+                trace_id: self.trace_id.clone(),
+                query_id: Some(self.query_id.to_string()),
                 integrity: Default::default(),
             };
             audit.log_event(event);
@@ -424,6 +430,8 @@ impl StreamFinalizer {
                 }),
                 session_id: Some(self.session_id.clone()),
                 client_ip: self.client_ip.clone(),
+                trace_id: self.trace_id.clone(),
+                query_id: Some(self.query_id.to_string()),
                 integrity: Default::default(),
             };
             audit.log_event(event);
@@ -835,6 +843,7 @@ mod tests {
             actor: sqe_metrics::audit::Actor::default(),
             resources: Vec::new(),
             client_ip: None,
+            trace_id: None,
         }
     }
 
