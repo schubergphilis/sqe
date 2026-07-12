@@ -494,6 +494,7 @@ async fn rollback_ctas_partial_create(
 ///
 /// Backoff: exponential with jitter, capped at ~1s base. After `max_attempts`
 /// the last error propagates unchanged so the caller's error-mapping still runs.
+#[tracing::instrument(skip(catalog, build_and_commit), fields(table = %table_ident, op = %op), name = "sqe.write_commit")]
 async fn commit_with_retry<F, Fut>(
     catalog: &dyn Catalog,
     table_ident: &TableIdent,
@@ -504,8 +505,6 @@ where
     F: FnMut(IcebergTable) -> Fut,
     Fut: std::future::Future<Output = std::result::Result<IcebergTable, iceberg::Error>>,
 {
-    let _commit_span = tracing::info_span!("sqe.write_commit", op = %op, table = %table_ident.name);
-
     const MAX_ATTEMPTS: u32 = 4;
     let mut last_err: Option<iceberg::Error> = None;
     for attempt in 1..=MAX_ATTEMPTS {
