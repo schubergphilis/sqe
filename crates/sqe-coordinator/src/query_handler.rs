@@ -12,6 +12,7 @@ use datafusion::physical_plan::joins::HashJoinExec;
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::logical_expr::JoinType;
 use futures::TryStreamExt;
+use tracing::Instrument;
 use datafusion::prelude::SessionContext;
 use tracing::{debug, info, warn, Span};
 
@@ -45,6 +46,16 @@ pub(crate) struct PlanMetrics {
     pub(crate) spill_bytes: u64,
     pub(crate) peak_memory_bytes: u64,
 }
+
+type OpenStreamResult = (
+    SchemaRef,
+    SendableRecordBatchStream,
+    Arc<dyn ExecutionPlan>,
+    TimeTravelCleanup,
+    Vec<String>,
+    sqe_policy::PolicySummary,
+    Vec<sqe_metrics::audit::Resource>,
+);
 
 /// Determine the effective query timeout for a session.
 ///
@@ -726,7 +737,7 @@ impl QueryHandler {
             &session.id,
             client_ip.as_deref(),
             session.user.roles.clone(),
-            trace_id,
+            trace_id.clone(),
         );
 
         // OpenLineage: emit START event. The observer is sync and best-effort;
@@ -1682,6 +1693,8 @@ impl QueryHandler {
                     }),
                     session_id: Some(session.id.clone()),
                     client_ip: client_ip.clone(),
+                    trace_id,
+                    query_id: Some(query_id.to_string()),
                     integrity: sqe_metrics::audit::Integrity::default(),
                 };
                 audit.log_event(event);
@@ -1748,6 +1761,8 @@ impl QueryHandler {
                     }),
                     session_id: Some(session.id.clone()),
                     client_ip: client_ip.clone(),
+                    trace_id: trace_id.clone(),
+                    query_id: Some(query_id.to_string()),
                     integrity: sqe_metrics::audit::Integrity::default(),
                 };
                 audit.log_event(grant_event);
@@ -1873,6 +1888,8 @@ impl QueryHandler {
                     }),
                     session_id: Some(session.id.clone()),
                     client_ip: client_ip.clone(),
+                    trace_id,
+                    query_id: Some(query_id.to_string()),
                     integrity: sqe_metrics::audit::Integrity::default(),
                 };
                 audit.log_event(ddl_event);
@@ -2048,13 +2065,14 @@ impl QueryHandler {
         // --- Start tracker ----------------------------------------------------
         let start = std::time::Instant::now();
         let query_id = uuid::Uuid::now_v7();
+        let trace_id = sqe_metrics::propagation::current_trace_id();
         info!(
             query_id = %query_id,
+            trace_id = ?trace_id,
             username = %session.user.username,
             sql_length = sql.len(),
             "Starting streaming query"
         );
-        let trace_id = sqe_metrics::propagation::current_trace_id();
         let cancel_token = self.query_tracker.start(
             query_id,
             &session.user.username,
@@ -2095,6 +2113,7 @@ impl QueryHandler {
                     actor,
                     resources: audit_resources,
                     client_ip: client_ip.clone(),
+                    trace_id: sqe_metrics::propagation::current_trace_id(),
                 };
 
                 let tracked = crate::streaming::TrackedRecordBatchStream::with_permits_reservation_and_cancel_token(
@@ -2144,21 +2163,14 @@ impl QueryHandler {
     /// building, star-schema reorder, adaptive-sort, and `try_distribute`
     /// steps, but returns the opened [`SendableRecordBatchStream`] plus
     /// the final plan instead of draining into a `Vec<RecordBatch>`.
+    #[tracing::instrument(skip(self, session, sql, start), fields(username = %session.user.username, query_id = %query_id), name = "sqe.execute")]
     async fn open_stream(
         &self,
         session: &Session,
         sql: &str,
         query_id: &uuid::Uuid,
         start: std::time::Instant,
-    ) -> sqe_core::Result<(
-        SchemaRef,
-        SendableRecordBatchStream,
-        Arc<dyn ExecutionPlan>,
-        TimeTravelCleanup,
-        Vec<String>,
-        sqe_policy::PolicySummary,
-        Vec<sqe_metrics::audit::Resource>,
-    )> {
+    ) -> sqe_core::Result<OpenStreamResult> {
         let (ctx, session_catalog) = self.create_session_context(session).await?;
 
         let sql = self.handle_incremental(sql, &ctx, &session_catalog).await?;
@@ -2173,8 +2185,10 @@ impl QueryHandler {
         let sql = sqe_sql::rewrite_named_tvf_args(&sql);
         let sql = sql.as_str();
 
+        let plan_span = tracing::info_span!("sqe.plan", query_id = %query_id);
         let df = ctx
             .sql(sql)
+            .instrument(plan_span)
             .await
             .map_err(|e| SqeError::Execution(format!("SQL planning failed: {e}")))?;
         let plan = df.logical_plan().clone();
@@ -2311,8 +2325,6 @@ impl QueryHandler {
 
         // Distribute scan across workers if possible.
         let final_plan = self.try_distribute(physical_plan, session, query_id).await;
-
-        let _execute_span = tracing::info_span!("sqe.execute", query_id = %query_id);
 
         // Planning complete — promote tracker to Running
         self.query_tracker
@@ -2452,7 +2464,7 @@ impl QueryHandler {
     /// caller can pass it to the OpenLineage observer's complete/fail hook.
     /// Plan capture happens after policy enforcement so the emitted lineage
     /// reflects the user's *enforced* view, not the raw user query.
-    #[tracing::instrument(skip(self, session, sql, query_id, plan_metrics, plan_out), fields(username = %session.user.username))]
+    #[tracing::instrument(skip(self, session, sql, plan_metrics, plan_out, summary_out), fields(username = %session.user.username, query_id = %query_id), name = "sqe.execute")]
     async fn execute_query(
         &self,
         session: &Session,
@@ -2489,8 +2501,10 @@ impl QueryHandler {
         let sql = sql.as_str();
 
         // Plan the query via DataFusion's SQL planner
+        let plan_span = tracing::info_span!("sqe.plan", query_id = %query_id);
         let df = ctx
             .sql(sql)
+            .instrument(plan_span)
             .await
             .map_err(|e| SqeError::Execution(format!("SQL planning failed: {e}")))?;
 
@@ -2577,8 +2591,6 @@ impl QueryHandler {
 
         // Try to distribute scan work across workers
         let final_plan = self.try_distribute(physical_plan, session, query_id).await;
-
-        let _execute_span = tracing::info_span!("sqe.execute", query_id = %query_id);
 
         // Execute the (possibly distributed) plan.
         //
@@ -5986,15 +5998,15 @@ fn build_describe_input(param_types: &[Option<DataType>]) -> sqe_core::Result<Ve
 ///
 /// - SELECT (`Query`): opt-in via `cfg.emit_selects` -- read-only queries
 ///   are noisy and lineage tools rarely need them.
-/// - Maintenance procedures (`Procedure`): never emit. CALL system.optimize,
-///   expire_snapshots, etc. mutate snapshot history but produce no
-///   user-visible inputs/outputs that matter to lineage.
+/// - Maintenance procedures (`Procedure`): emit (full audit O5). CALL system.*
+///   (rewrite_data_files, expire_snapshots, etc.) mutate the table and should
+///   appear in the lineage graph as operations on the target table.
 /// - Everything else (DML writes, DDL, SHOW commands, transactions, USE,
 ///   GRANT/REVOKE): always emit. Sinks decide what to do with metadata events.
 fn should_emit(kind: &StatementKind, cfg: &sqe_core::config::OpenLineageConfig) -> bool {
     match kind {
         StatementKind::Query(_) => cfg.emit_selects,
-        StatementKind::Procedure(_) => false,
+        StatementKind::Procedure(_) => true,
         _ => true,
     }
 }
@@ -6972,15 +6984,14 @@ mod tests {
     }
 
     #[test]
-    fn should_emit_maintenance_procedure_never_emits() {
-        // CALL system.rewrite_data_files is classified as Procedure, the
-        // maintenance variant. Lineage events for snapshot rewrites add
-        // noise without a meaningful input/output set.
+    fn should_emit_maintenance_procedure_emits() {
+        // Per full audit O5: maintenance procedures should emit lineage events
+        // so that snapshot rewrites / expires appear in the graph.
         let kind = sqe_sql::parse_and_classify("CALL system.rewrite_data_files(table => 'ns.t')")
             .expect("parse CALL");
         assert!(matches!(kind, StatementKind::Procedure(_)));
-        assert!(!should_emit(&kind, &ol_cfg(false)));
-        assert!(!should_emit(&kind, &ol_cfg(true)));
+        assert!(should_emit(&kind, &ol_cfg(false)));
+        assert!(should_emit(&kind, &ol_cfg(true)));
     }
 
     #[test]

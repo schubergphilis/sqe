@@ -99,6 +99,8 @@ mod tests {
             query: Some(QueryInfo { text: Some("SELECT 1".into()), query_hash: "abc".into(), statement_type: "query".into() }),
             session_id: Some("sess-1".into()),
             client_ip: Some("10.0.0.1".into()),
+            trace_id: None,
+            query_id: None,
             integrity: Integrity::default(),
         }
     }
@@ -147,7 +149,7 @@ mod tests {
             outcome: Outcome::Success,
             resources: vec![],
             policy: None, timing: None, stats: None, query: None,
-            session_id: None, client_ip: None, integrity: Integrity::default(),
+            session_id: None, client_ip: None, trace_id: None, query_id: None, integrity: Integrity::default(),
         };
         assert_eq!(to_ocsf(&base(AuditKind::Auth))["class_uid"], 3002);
         assert_eq!(to_ocsf(&base(AuditKind::Session))["class_uid"], 3003);

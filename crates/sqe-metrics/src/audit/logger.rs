@@ -194,6 +194,8 @@ impl From<AuditEntry> for AuditEvent {
             }),
             session_id: e.session_id,
             client_ip: e.client_ip,
+            trace_id: None,
+            query_id: None,
             integrity: Integrity::default(),
         }
     }
