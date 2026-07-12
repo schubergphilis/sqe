@@ -10,6 +10,7 @@ repository.workspace = true
 sqe-quack-wire = { path = "../sqe-quack-wire" }
 sqe-auth = { path = "../sqe-auth" }
 sqe-core = { path = "../sqe-core" }
+sqe-metrics = { path = "../sqe-metrics" }
 axum = { workspace = true }
 tokio = { workspace = true }
 moka = { workspace = true }
