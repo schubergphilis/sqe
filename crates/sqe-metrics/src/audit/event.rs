@@ -95,6 +95,11 @@ pub struct Timing {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct QueryStats {
     pub rows_returned: usize,
+    /// Rows written/affected by a DML statement (INSERT/CTAS/UPDATE/DELETE/
+    /// MERGE). Omitted from the serialized event for reads and for writes that
+    /// reported no count, so SELECT audit records stay unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rows_written: Option<u64>,
     #[serde(default)]
     pub bytes_scanned: u64,
     #[serde(default)]
@@ -199,6 +204,7 @@ pub(crate) fn sample_query_event() -> AuditEvent {
         timing: Some(Timing { duration_ms: 42, queued_ms: 0, planning_ms: 5, execution_ms: 37 }),
         stats: Some(QueryStats {
             rows_returned: 10,
+            rows_written: None,
             bytes_scanned: 1024,
             rows_scanned: 100,
             spill_bytes: 0,
@@ -242,7 +248,7 @@ mod tests {
             }],
             policy: None,
             timing: Some(Timing { duration_ms: 42, queued_ms: 0, planning_ms: 5, execution_ms: 37 }),
-            stats: Some(QueryStats { rows_returned: 10, bytes_scanned: 1024, rows_scanned: 100, spill_bytes: 0, peak_memory_bytes: 0 }),
+            stats: Some(QueryStats { rows_returned: 10, rows_written: None, bytes_scanned: 1024, rows_scanned: 100, spill_bytes: 0, peak_memory_bytes: 0 }),
             query: Some(QueryInfo {
                 text: Some("SELECT 1".into()),
                 query_hash: "abc".into(),

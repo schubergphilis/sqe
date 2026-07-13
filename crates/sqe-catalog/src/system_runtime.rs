@@ -68,6 +68,8 @@ pub struct RuntimeQueryRecord {
     pub planning_ms: u64,
     pub execution_ms: u64,
     pub output_rows: usize,
+    /// Rows written/affected by a DML statement; `None` for reads.
+    pub rows_written: Option<u64>,
     pub error_type: Option<String>,
     pub error_code: Option<String>,
     pub bytes_scanned: u64,
@@ -195,6 +197,7 @@ fn queries_schema() -> Schema {
         Field::new("trace_id", DataType::Utf8, true),
         Field::new("error_type", DataType::Utf8, true),
         Field::new("error_code", DataType::Utf8, true),
+        Field::new("rows_written", DataType::Int64, true),
     ])
 }
 
@@ -229,6 +232,7 @@ fn build_queries_table(records: &[RuntimeQueryRecord]) -> DFResult<Arc<dyn Table
     let mut trace_id_b = StringBuilder::new();
     let mut error_type_b = StringBuilder::new();
     let mut error_code_b = StringBuilder::new();
+    let mut rows_written_b = Int64Builder::new();
 
     for rec in records {
         query_id_b.append_value(&rec.query_id);
@@ -275,6 +279,10 @@ fn build_queries_table(records: &[RuntimeQueryRecord]) -> DFResult<Arc<dyn Table
             Some(s) => error_code_b.append_value(s),
             None => error_code_b.append_null(),
         }
+        match rec.rows_written {
+            Some(n) => rows_written_b.append_value(u64_to_i64_saturating(n)),
+            None => rows_written_b.append_null(),
+        }
     }
 
     let batch = RecordBatch::try_new(
@@ -302,6 +310,7 @@ fn build_queries_table(records: &[RuntimeQueryRecord]) -> DFResult<Arc<dyn Table
             Arc::new(trace_id_b.finish()) as ArrayRef,
             Arc::new(error_type_b.finish()) as ArrayRef,
             Arc::new(error_code_b.finish()) as ArrayRef,
+            Arc::new(rows_written_b.finish()) as ArrayRef,
         ],
     )?;
 
@@ -470,6 +479,7 @@ mod tests {
                 spill_bytes: 0,
                 peak_memory_bytes: 2048,
                 trace_id: Some("0123456789abcdef0123456789abcdef".to_string()),
+                rows_written: None,
                 fragments: vec![],
             },
             RuntimeQueryRecord {
@@ -491,6 +501,8 @@ mod tests {
                 rows_scanned: 0,
                 spill_bytes: 0,
                 peak_memory_bytes: 0,
+                trace_id: None,
+                rows_written: None,
                 fragments: vec![],
             },
             RuntimeQueryRecord {
@@ -512,6 +524,8 @@ mod tests {
                 rows_scanned: 0,
                 spill_bytes: 0,
                 peak_memory_bytes: 0,
+                trace_id: None,
+                rows_written: None,
                 fragments: vec![],
             },
         ]
@@ -522,12 +536,12 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_queries_table_has_22_columns() {
+    fn test_queries_table_has_23_columns() {
         let table = build_queries_table(&sample_records()).unwrap();
         assert_eq!(
             table.schema().fields().len(),
-            22,
-            "queries table must have exactly 22 columns"
+            23,
+            "queries table must have exactly 23 columns"
         );
     }
 
@@ -558,6 +572,7 @@ mod tests {
             "trace_id",
             "error_type",
             "error_code",
+            "rows_written",
         ];
         for (i, name) in expected.iter().enumerate() {
             assert_eq!(
@@ -571,7 +586,7 @@ mod tests {
     #[test]
     fn test_queries_table_empty_records() {
         let table = build_queries_table(&[]).unwrap();
-        assert_eq!(table.schema().fields().len(), 21);
+        assert_eq!(table.schema().fields().len(), 23);
     }
 
     #[test]
@@ -702,6 +717,8 @@ mod tests {
             rows_scanned: 0,
             spill_bytes: 0,
             peak_memory_bytes: 0,
+            trace_id: None,
+            rows_written: None,
             fragments: vec![
                 RuntimeFragmentInfo {
                     task_id: "frag-0".to_string(),
@@ -750,6 +767,8 @@ mod tests {
             rows_scanned: 0,
             spill_bytes: 0,
             peak_memory_bytes: 0,
+            trace_id: None,
+            rows_written: None,
             fragments: vec![],
         }];
 

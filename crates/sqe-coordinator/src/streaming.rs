@@ -219,6 +219,21 @@ impl StreamFinalizer {
         };
         let (sort_spill_count, sort_spill_bytes, join_spill_count, join_spill_bytes) =
             aggregate_spill_metrics(&self.plan);
+        if sort_spill_count == 0 && join_spill_count == 0 {
+            return;
+        }
+        // O3: emit a `sqe.spill` span carrying the spill magnitudes so a trace
+        // shows which queries spilled and how much. This scope is synchronous
+        // (no await), so `.entered()` is safe here.
+        let _spill_span = tracing::info_span!(
+            "sqe.spill",
+            query_id = %self.query_id,
+            sort_spill_count,
+            sort_spill_bytes,
+            join_spill_count,
+            join_spill_bytes,
+        )
+        .entered();
         if sort_spill_count > 0 {
             metrics.sort_spill_count.inc_by(sort_spill_count as f64);
             metrics.sort_spill_bytes.inc_by(sort_spill_bytes as f64);

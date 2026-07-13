@@ -517,3 +517,47 @@ See plan.md for details. Previous MRs: !625 (DML PolicyAudit), !626 (trace/query
 
 Next per plan: root spans, maintenance OL, Trino trace headers.
 
+## 2026-07-13 Session Progress (remaining O2/O3/O5 + P0 Helm)
+
+Branch `fix/audit-remaining-p0-o2-o3-o5`, fresh off main. Closes the open tails
+left after the parallel-worktree remediation round.
+
+- **P0 Helm rate_limit wiring.** `deploy/helm/sqe/templates/configmap.yaml` now
+  renders `production_mode` and a `[rate_limit]` block, and `values.yaml`
+  un-comments the `rate_limit` skeleton. Previously the values were documented
+  but never reached the engine's rendered `sqe.toml`, so a production_mode
+  deploy would fail the engine's own validator (which requires
+  `rate_limit.enabled`). Config side (`sqe-core`) already read both.
+- **O5 maintenance lineage (completes !627).** Added a
+  `LineageHint::MaintenanceTable` variant + `extract_from_hint` arm (target table
+  recorded as both input and output) and wired the producer in the `CALL`
+  dispatch (`query_handler.rs`), so maintenance procedures now emit real dataset
+  lineage, not just start/complete events. `should_emit(Procedure)` was already
+  true.
+- **O3 spill + catalog spans.** New `sqe.spill` span (in
+  `StreamFinalizer::record_spill_metrics`, guarded on actual spill) carrying the
+  sort/join spill counts and bytes. Renamed the catalog REST `#[instrument]`
+  spans (`load_table`, `list_namespaces`, `list_tables`, `commit_schema_update`)
+  to `sqe.catalog` with an `op` field. **Slow-query always-sample was NOT done
+  in-process**: the head-based `TraceIdRatioBased` sampler cannot retroactively
+  keep a trace that turns out slow (the decision is made at query start). The
+  correct mechanism is OTel Collector tail-sampling keyed on query duration;
+  that is Collector config, not engine code. Spill magnitudes + `query_profile`
+  elapsed_ms give the Collector the fields to key on.
+- **O2 write stats (rows_written).** Added `rows_written: Option<u64>` to
+  `QueryRecord` (+ `set_rows_written`), `QueryStats` (serde-skip when None),
+  and the `system.runtime.queries` schema (new nullable `rows_written` column,
+  23 total). The buffered completion path recovers the affected count from the
+  DML result batch (`extract_affected_rows`) for INSERT/CTAS/UPDATE/DELETE/MERGE.
+  INSERT/CTAS streaming handlers now return a 1-row `rows_affected` batch (they
+  previously dropped the count with `Ok(vec![])`), matching the buffered path and
+  the other DML handlers, which also fixes Trino `updateCount` for
+  `INSERT ... SELECT`. Deeper per-file write stats remain out of scope.
+
+Incidental fix: `crates/sqe-catalog/src/system_runtime.rs` test module did not
+compile on main. The O4 trace_id work (!634) added `trace_id` to the struct /
+schema / builder but only one test literal and the `has_22` assertion; 5 record
+literals and the `empty_records` assertion (still 21) were never updated, so
+`cargo test -p sqe-catalog` failed to build the test target. This branch adds the
+missing `trace_id` fields and corrects the counts (now 23 with `rows_written`).
+
