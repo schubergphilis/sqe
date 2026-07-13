@@ -1665,7 +1665,7 @@ pub struct StorageConfig {
 /// All defaults are fail-closed: cloud object stores (`s3://`, `abfss://`,
 /// `gs://`, `hf://`) keep working out of the box; local paths and arbitrary
 /// `http(s)://` hosts are rejected unless explicitly enabled.
-#[derive(Debug, Deserialize, Clone, Default)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct TvfPolicy {
     /// When `true`, file TVFs may read absolute paths on the coordinator /
     /// worker filesystem (e.g. `/var/data/foo.parquet`). Default: `false`
@@ -1726,6 +1726,39 @@ pub struct TvfPolicy {
     /// administrators / service identities that own the storage anyway.
     #[serde(default)]
     pub object_store_admin_roles: Vec<String>,
+    /// When `true` (default), a TVF call carrying complete inline credentials
+    /// (`access_key`+`secret_key`, an Azure key/SAS token, or an inline GCS
+    /// service-account key) bypasses `allowed_object_store_prefixes` entirely:
+    /// the engine's storage key is not used, so the object store enforces
+    /// access with the caller-supplied credential.
+    ///
+    /// Set to `false` (SEC-04) to disable that bypass. Inline-credentialed
+    /// reads then still have to satisfy the normal gate
+    /// (`allowed_object_store_prefixes`, `object_store_admin_roles`, or a
+    /// trusted-local caller), so a multi-tenant coordinator cannot be turned
+    /// into an arbitrary fetcher by any user who passes their own keys.
+    /// Production deployments that do not intend users to bring their own
+    /// object-store credentials should set this `false`.
+    #[serde(default = "default_true")]
+    pub allow_inline_credentials: bool,
+}
+
+impl Default for TvfPolicy {
+    fn default() -> Self {
+        // Matches the serde defaults (fail-closed for local/http, deny-all for
+        // engine-credentialed object stores, inline-credential bypass enabled
+        // for back-compat). A manual impl is required because `allow_inline_
+        // credentials` defaults to `true`, which `#[derive(Default)]` cannot
+        // express for a `bool`.
+        Self {
+            allow_local_paths: false,
+            allow_http: false,
+            allowed_http_hosts: Vec::new(),
+            allowed_object_store_prefixes: Vec::new(),
+            object_store_admin_roles: Vec::new(),
+            allow_inline_credentials: true,
+        }
+    }
 }
 
 /// Identity of the caller invoking a file TVF, resolved at session-context
@@ -1952,7 +1985,7 @@ impl TvfPolicy {
         caller: &TvfCaller,
         inline_credentials: bool,
     ) -> Result<(), String> {
-        if caller.trusted || inline_credentials {
+        if caller.trusted || (inline_credentials && self.allow_inline_credentials) {
             return Ok(());
         }
         if !self.object_store_admin_roles.is_empty()
@@ -1999,15 +2032,20 @@ impl TvfPolicy {
             "TVF object-store access denied: no matching \
              `[storage.tvf] allowed_object_store_prefixes` entry"
         );
+        let inline_hint = if self.allow_inline_credentials {
+            ", or pass complete inline credentials (e.g. access_key/secret_key) \
+             so the engine's storage key is not used"
+        } else {
+            " (inline credentials do not bypass this gate: \
+             `[storage.tvf] allow_inline_credentials = false`)"
+        };
         Err(format!(
             "TVF: object-store path '{path}' denied for user '{principal}'. \
              Reads with the engine's storage credentials are limited to \
              `[storage.tvf] allowed_object_store_prefixes` ({} configured). \
              Add a matching prefix (the `{{user}}` placeholder expands to the \
              authenticated username), grant a role listed in \
-             `[storage.tvf] object_store_admin_roles`, or pass complete inline \
-             credentials (e.g. access_key/secret_key) so the engine's storage \
-             key is not used.",
+             `[storage.tvf] object_store_admin_roles`{inline_hint}.",
             self.allowed_object_store_prefixes.len()
         ))
     }
@@ -6087,11 +6125,49 @@ otlp_endpoint = ""
     }
 
     #[test]
+    fn tvf_inline_credentials_bypass_disabled_denies_unlisted_path() {
+        // SEC-04: with allow_inline_credentials = false, inline creds no longer
+        // bypass the prefix allowlist. A path outside the allowlist is denied
+        // even when the call carries its own credentials.
+        let policy = TvfPolicy {
+            allow_inline_credentials: false,
+            ..TvfPolicy::default()
+        };
+        let err = policy
+            .check_path("s3://their-own-bucket/x.csv", &caller("alice"), true)
+            .unwrap_err();
+        assert!(err.contains("denied"));
+        assert!(err.contains("allow_inline_credentials = false"));
+    }
+
+    #[test]
+    fn tvf_inline_credentials_bypass_disabled_still_allows_listed_path() {
+        // With the bypass off, an inline-credentialed read to an allowlisted
+        // prefix still succeeds (the path passes the normal gate).
+        let policy = TvfPolicy {
+            allow_inline_credentials: false,
+            allowed_object_store_prefixes: vec!["s3://scratch/{user}/".to_string()],
+            ..TvfPolicy::default()
+        };
+        assert!(policy
+            .check_path("s3://scratch/alice/data.csv", &caller("alice"), true)
+            .is_ok());
+    }
+
+    #[test]
     fn tvf_object_store_trusted_local_bypass() {
         let policy = TvfPolicy::default();
         assert!(policy
             .check_path("s3://bucket/x.csv", &TvfCaller::trusted_local(), false)
             .is_ok());
+    }
+
+    #[test]
+    fn tvf_inline_credentials_default_is_enabled() {
+        // Back-compat: the serde default and the Rust Default agree (true).
+        assert!(TvfPolicy::default().allow_inline_credentials);
+        let w: TvfPolicy = toml::from_str("").expect("empty [storage.tvf] deserializes");
+        assert!(w.allow_inline_credentials);
     }
 
     #[test]

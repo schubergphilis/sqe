@@ -49,7 +49,7 @@
 □ Remove anonymous + bearer_passthrough from auth chain
 □ [rate_limit] enabled = true
 □ [coordinator.tls] + ingress TLS for Trino/Quack/web
-□ [storage.tvf] prefix allowlist; allow_local_paths = false
+□ [storage.tvf] prefix allowlist; allow_local_paths = false; allow_inline_credentials = false (unless users bring their own object-store creds)
 □ Non-default worker_secret
 □ bearer_token with audience + issuer; policy backend wired
 □ admin_roles configured
@@ -560,4 +560,32 @@ schema / builder but only one test literal and the `has_22` assertion; 5 record
 literals and the `empty_records` assertion (still 21) were never updated, so
 `cargo test -p sqe-catalog` failed to build the test target. This branch adds the
 missing `trace_id` fields and corrects the counts (now 23 with `rows_written`).
+
+## 2026-07-13 Session Progress (SEC-04 inline TVF credentials)
+
+Branch `fix/audit-sec04-tvf-inline-creds`.
+
+- Added `[storage.tvf] allow_inline_credentials` (default `true`, so no behavior
+  change out of the box). When set `false`, a TVF call carrying its own inline
+  credentials (`access_key`+`secret_key`, Azure key/SAS, or inline GCS key) no
+  longer bypasses `allowed_object_store_prefixes`: the read must still pass the
+  normal gate (prefix allowlist, `object_store_admin_roles`, or trusted-local).
+  Closes the SEC-04 "disable inline creds" option; a multi-tenant coordinator
+  can no longer be turned into an arbitrary object-store fetcher by any user who
+  supplies their own keys.
+- `TvfPolicy::check_object_store` now ANDs the inline-credential bypass with the
+  new flag; the denial message adapts (it no longer suggests inline creds as a
+  remedy when the bypass is disabled).
+- Manual `impl Default for TvfPolicy` (bypass enabled) so the serde default and
+  the Rust `Default` agree; documented in `sqe.toml.example`.
+- Production checklist gains `[storage.tvf] allow_inline_credentials = false`
+  for deployments that do not intend users to bring their own credentials. Not
+  hard-enforced by the `production_mode` validator (legitimate bring-your-own-
+  bucket workflows exist); left as an operator choice.
+- Verified: `cargo test -p sqe-core` (tvf suite, incl. 3 new tests) + clippy
+  green.
+
+Remaining SEC items: SEC-03 (per-user OIDC for client_credentials, architectural),
+SEC-06 (native TLS / ingress). O7 Grafana dashboard and the O3 slow-query
+tail-sampling (Collector config) also still open.
 
