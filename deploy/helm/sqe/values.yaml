@@ -92,6 +92,32 @@ service:
   trinoHttpPort: 8080
   metricsPort: 9090
 
+# ── Ingress (TLS termination) ────────────────────────────────
+# SEC-06: the coordinator's HTTP listeners (Trino HTTP, web UI, Quack) are
+# plaintext by design. Terminate TLS at the ingress and keep
+# `security.allow_insecure_transport = false` in the engine config (enforced in
+# production_mode). Fronts the `trino-http` service port by default. Flight SQL
+# is gRPC: use `[coordinator.tls]` native TLS (or a gRPC-aware ingress) for it,
+# not this HTTP Ingress.
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+    # cert-manager.io/cluster-issuer: letsencrypt-prod
+    # nginx.ingress.kubernetes.io/backend-protocol: "HTTP"
+  hosts:
+    - host: sqe.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+          # Service port name to route to: trino-http (default) or metrics.
+          portName: trino-http
+  # Populate to enable TLS. Provision the secret separately (e.g. cert-manager).
+  tls: []
+    # - secretName: sqe-tls
+    #   hosts:
+    #     - sqe.example.com
+
 # ── SQE Configuration (renders to sqe.toml) ────────────────
 config:
   coordinator:

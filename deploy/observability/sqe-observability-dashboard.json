@@ -1,0 +1,200 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "title": "Memory Pressure",
+      "type": "gauge",
+      "gridPos": { "h": 8, "w": 6, "x": 0, "y": 0 },
+      "targets": [
+        { "expr": "sqe_coordinator_memory_pressure", "legendFormat": "Pressure" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "min": 0, "max": 3,
+          "thresholds": {
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 1 },
+              { "color": "orange", "value": 2 },
+              { "color": "red", "value": 3 }
+            ]
+          },
+          "mappings": [
+            { "type": "value", "options": { "0": { "text": "Green" }, "1": { "text": "Yellow" }, "2": { "text": "Orange (throttle)" }, "3": { "text": "Red (reject)" } } }
+          ]
+        }
+      }
+    },
+    {
+      "title": "Pool Used vs Limit vs RSS",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 6, "y": 0 },
+      "targets": [
+        { "expr": "sqe_coordinator_memory_used_bytes", "legendFormat": "Pool used" },
+        { "expr": "sqe_coordinator_memory_limit_bytes", "legendFormat": "Pool limit" },
+        { "expr": "sqe_coordinator_rss_bytes", "legendFormat": "Process RSS" }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "bytes", "custom": { "fillOpacity": 10 } }
+      }
+    },
+    {
+      "title": "Active Sessions",
+      "type": "stat",
+      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 0 },
+      "targets": [
+        { "expr": "sqe_active_sessions", "legendFormat": "Sessions" }
+      ]
+    },
+    {
+      "title": "Spill Rate (events/s)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "targets": [
+        { "expr": "rate(sqe_sort_spill_count_total[1m])", "legendFormat": "Sort spills/s" },
+        { "expr": "rate(sqe_join_spill_count_total[1m])", "legendFormat": "Join spills/s" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "ops" } }
+    },
+    {
+      "title": "Spill Rate (bytes/s)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "targets": [
+        { "expr": "rate(sqe_sort_spill_bytes_total[1m])", "legendFormat": "Sort bytes/s" },
+        { "expr": "rate(sqe_join_spill_bytes_total[1m])", "legendFormat": "Join bytes/s" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "Bps" } }
+    },
+    {
+      "title": "Audit Export Spool Lag",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "targets": [
+        { "expr": "sqe_audit_export_spool_lag_bytes", "legendFormat": "Spool lag (bytes)" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "custom": { "fillOpacity": 10 },
+          "thresholds": {
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 1048576 },
+              { "color": "red", "value": 10485760 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "title": "Audit Records Shipped (by status)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "targets": [
+        { "expr": "rate(sqe_audit_export_records_total[1m])", "legendFormat": "{{status}}/s" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "ops" } }
+    },
+    {
+      "title": "Audit Export Batch Failures",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 24 },
+      "targets": [
+        { "expr": "rate(sqe_audit_export_batch_failures_total[5m])", "legendFormat": "Failures/s" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "ops" } }
+    },
+    {
+      "title": "Seconds Since Last Successful Audit Export",
+      "type": "stat",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 24 },
+      "targets": [
+        { "expr": "time() - sqe_audit_export_last_success_timestamp", "legendFormat": "Age" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "thresholds": {
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 60 },
+              { "color": "red", "value": 300 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "title": "Audit Export Cursor Sequence",
+      "type": "stat",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 24 },
+      "targets": [
+        { "expr": "sqe_audit_export_cursor_seq", "legendFormat": "Cursor seq" }
+      ]
+    },
+    {
+      "title": "Lineage Events Dropped (channel full)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 32 },
+      "targets": [
+        { "expr": "rate(sqe_lineage_dropped_events_total[5m])", "legendFormat": "Dropped/s" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "thresholds": {
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 0.001 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "title": "Lineage Sink Errors",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 32 },
+      "targets": [
+        { "expr": "rate(sqe_lineage_sink_errors_total[5m])", "legendFormat": "Sink errors/s" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "ops" } }
+    },
+    {
+      "title": "Query Rate",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 40 },
+      "targets": [
+        { "expr": "rate(sqe_query_count_total[30s])", "legendFormat": "{{status}} {{statement_type}}" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "qps" } }
+    },
+    {
+      "title": "Query Duration (p50, p95, p99)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 40 },
+      "targets": [
+        { "expr": "histogram_quantile(0.50, rate(sqe_query_duration_seconds_bucket[5m]))", "legendFormat": "p50" },
+        { "expr": "histogram_quantile(0.95, rate(sqe_query_duration_seconds_bucket[5m]))", "legendFormat": "p95" },
+        { "expr": "histogram_quantile(0.99, rate(sqe_query_duration_seconds_bucket[5m]))", "legendFormat": "p99" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s" } }
+    }
+  ],
+  "refresh": "5s",
+  "schemaVersion": 39,
+  "tags": ["sqe", "observability", "audit"],
+  "templating": { "list": [] },
+  "time": { "from": "now-1h", "to": "now" },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "SQE Observability (Pool / Audit / Lineage)",
+  "uid": "sqe-observability",
+  "version": 1
+}
