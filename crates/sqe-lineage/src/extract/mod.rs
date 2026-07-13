@@ -181,5 +181,55 @@ pub fn extract_from_hint(
             };
             (vec![], vec![output])
         }
+        LineageHint::MaintenanceTable {
+            catalog,
+            schema,
+            table,
+        } => {
+            let namespace = lookup(catalog);
+            let name = format!("{schema}.{table}");
+            let facets = DatasetFacets {
+                schema: None,
+                dataSource: Some(DataSourceFacet {
+                    name: catalog.clone(),
+                    uri: namespace.clone(),
+                }),
+                columnLineage: None,
+            };
+            let input = InputDataset {
+                namespace: namespace.clone(),
+                name: name.clone(),
+                facets: facets.clone(),
+            };
+            let output = OutputDataset {
+                namespace,
+                name,
+                facets,
+                outputFacets: OutputDatasetFacets::default(),
+            };
+            (vec![input], vec![output])
+        }
+    }
+}
+
+#[cfg(test)]
+mod hint_tests {
+    use super::*;
+
+    #[test]
+    fn maintenance_hint_emits_target_as_input_and_output() {
+        let hint = LineageHint::MaintenanceTable {
+            catalog: "iceberg".into(),
+            schema: "analytics".into(),
+            table: "events".into(),
+        };
+        let lookup: CatalogLookup = Arc::new(|catalog| format!("https://catalog/{catalog}"));
+        let (inputs, outputs) = extract_from_hint(&hint, &lookup);
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(inputs[0].name, "analytics.events");
+        assert_eq!(outputs[0].name, "analytics.events");
+        assert_eq!(inputs[0].namespace, "https://catalog/iceberg");
+        assert_eq!(outputs[0].namespace, "https://catalog/iceberg");
     }
 }

@@ -1228,7 +1228,23 @@ impl QueryHandler {
                 // the call completes so the next query rebuilds the context
                 // against the fresh Polaris metadata.
                 StatementKind::Procedure(ref call) => {
-                    let _ = call; // table_ref kept for future per-table invalidation
+                    // O5: emit the maintenance target as a lineage dataset. The
+                    // procedure reads and rewrites its own table, so the target
+                    // is recorded as both input and output (extract_from_hint).
+                    if let Some(table) = call.table() {
+                        let catalog = table
+                            .catalog
+                            .clone()
+                            .or_else(|| session.default_catalog.clone())
+                            .unwrap_or_else(|| self.config.resolve_default_catalog());
+                        captured_plan = Some(sqe_lineage::PlanOrHint::Hint(
+                            sqe_lineage::LineageHint::MaintenanceTable {
+                                catalog,
+                                schema: table.namespace.clone(),
+                                table: table.name.clone(),
+                            },
+                        ));
+                    }
                     let result = self.maintenance_handler.handle(session, call).await;
 
                     // Maintenance procedures rewrite the table's snapshot
@@ -1412,6 +1428,15 @@ impl QueryHandler {
             .map(|b| b.iter().map(|r| r.num_rows()).sum())
             .unwrap_or(0);
 
+        // O2: rows written/affected by a DML statement, recovered from the
+        // 1-row `rows_affected` batch the write handlers return. `None` for
+        // reads and for writes that reported no count.
+        let rows_written: Option<u64> = if result.is_ok() && is_dml_write(&kind) {
+            result.as_ref().ok().and_then(|b| extract_affected_rows(b))
+        } else {
+            None
+        };
+
         let execution_ms = duration.as_millis() as u64;
         let tt_for_complete: Vec<String> = match captured_plan.as_ref() {
             Some(sqe_lineage::PlanOrHint::Plan(p)) => {
@@ -1435,6 +1460,9 @@ impl QueryHandler {
                 pm.spill_bytes,
                 pm.peak_memory_bytes,
             );
+            if let Some(n) = rows_written {
+                self.query_tracker.set_rows_written(&query_id, n);
+            }
 
             if let Some(ref cache) = self.query_cache {
                 if matches!(&kind, StatementKind::Query(_)) {
@@ -1686,6 +1714,7 @@ impl QueryHandler {
                     }),
                     stats: Some(sqe_metrics::audit::QueryStats {
                         rows_returned: rows,
+                        rows_written: None,
                         bytes_scanned: pm.bytes_scanned,
                         rows_scanned: pm.rows_scanned,
                         spill_bytes: pm.spill_bytes,
@@ -1868,6 +1897,7 @@ impl QueryHandler {
                 let stats = if is_dml {
                     Some(sqe_metrics::audit::QueryStats {
                         rows_returned: rows,
+                        rows_written,
                         bytes_scanned: pm.bytes_scanned,
                         rows_scanned: pm.rows_scanned,
                         spill_bytes: pm.spill_bytes,
@@ -6036,6 +6066,38 @@ fn should_emit(kind: &StatementKind, cfg: &sqe_core::config::OpenLineageConfig) 
         StatementKind::Procedure(_) => true,
         _ => true,
     }
+}
+
+/// True for DML statements that report a rows-affected count (INSERT, CTAS,
+/// UPDATE, DELETE, MERGE). Used to recover `rows_written` for O2 write stats.
+fn is_dml_write(kind: &StatementKind) -> bool {
+    matches!(
+        kind,
+        StatementKind::Insert(_)
+            | StatementKind::Ctas(_)
+            | StatementKind::Update(_)
+            | StatementKind::Delete(_)
+            | StatementKind::Merge(_)
+    )
+}
+
+/// Recover the affected-row count from a write handler's 1-row, 1-column
+/// `rows_affected` result batch (Int64 or UInt64). Returns `None` when the
+/// shape does not match (e.g. an empty result set), so a missing count stays
+/// `None` rather than being reported as zero.
+fn extract_affected_rows(batches: &[RecordBatch]) -> Option<u64> {
+    let batch = batches.first()?;
+    if batch.num_rows() != 1 || batch.num_columns() != 1 {
+        return None;
+    }
+    let arr = batch.column(0);
+    if let Some(a) = arr.as_any().downcast_ref::<arrow_array::Int64Array>() {
+        return Some(a.value(0).max(0) as u64);
+    }
+    if let Some(a) = arr.as_any().downcast_ref::<arrow_array::UInt64Array>() {
+        return Some(a.value(0));
+    }
+    None
 }
 
 /// Extract the target namespace name from sqlparser's `ShowStatementIn`
