@@ -6,6 +6,10 @@ services:
       KEYCLOAK_TOKEN_URL: http://keycloak:8080/realms/iceberg-ranger/protocol/openid-connect/token
       POLARIS_REST_URI: http://polaris:8181/api/catalog
       POLARIS_WAREHOUSE: sales_wh
+      S3_ENDPOINT: http://rustfs:9000
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY:-s3admin}
+      S3_SECRET_KEY: ${S3_SECRET_KEY:-s3adminpw}
+      S3_REGION: us-east-1
       # Select the SQE client protocol: trino or flight.
       SQE_TRANSPORT: ${SQE_TRANSPORT:-trino}
       SQE_TRINO_URL: http://sqe:8080
