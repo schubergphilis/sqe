@@ -49,7 +49,7 @@
 □ Remove anonymous + bearer_passthrough from auth chain
 □ [rate_limit] enabled = true
 □ [coordinator.tls] + ingress TLS for Trino/Quack/web
-□ [storage.tvf] prefix allowlist; allow_local_paths = false
+□ [storage.tvf] prefix allowlist; allow_local_paths = false; allow_inline_credentials = false (unless users bring their own object-store creds)
 □ Non-default worker_secret
 □ bearer_token with audience + issuer; policy backend wired
 □ admin_roles configured
@@ -578,4 +578,53 @@ hit `#[cfg(test)]` code" and closed them. The older `security_audit.md` cited
 `write_handler.rs:421,436 arrow_schema_to_iceberg(...).unwrap()`; those lines no
 longer exist and current production code has no such unwrap. Marking Q-02 invalid
 here and in `issue-groups.md` so it is not triaged a third time.
+
+
+## 2026-07-13 Session Progress (O7 observability dashboard)
+
+Branch `fix/audit-o7-observability-dashboard`. Closes the O7 gap ("Grafana
+dashboard: pool pressure + audit spool lag + lineage drops").
+
+- Added `deploy/observability/sqe-observability-dashboard.json`, an operational
+  dashboard complementing the perf-focused `sqe-benchmark-dashboard.json`. It is
+  auto-provisioned by the existing `grafana-dashboards.yml` file provider (all
+  JSON in the dashboards dir loads).
+- Panels use only metrics that actually exist today: `sqe_coordinator_memory_
+  pressure` / `_used` / `_limit` / `_rss_bytes` (pool pressure);
+  `sqe_{sort,join}_spill_{count,bytes}_total` (spill); `sqe_audit_export_spool_
+  lag_bytes`, `_records_total{status}`, `_batch_failures_total`,
+  `time() - _last_success_timestamp`, `_cursor_seq` (audit spool health);
+  `sqe_lineage_dropped_events_total`, `sqe_lineage_sink_errors_total` (lineage
+  drops); plus query rate + duration quantiles for context.
+- Thresholds encode the operational intent: spool-lag orange at 1 MiB / red at
+  10 MiB, last-successful-export age orange at 60s / red at 300s, any lineage
+  drop is red.
+
+## 2026-07-13 Session Progress (SEC-04 inline TVF credentials)
+
+Branch `fix/audit-sec04-tvf-inline-creds`.
+
+- Added `[storage.tvf] allow_inline_credentials` (default `true`, so no behavior
+  change out of the box). When set `false`, a TVF call carrying its own inline
+  credentials (`access_key`+`secret_key`, Azure key/SAS, or inline GCS key) no
+  longer bypasses `allowed_object_store_prefixes`: the read must still pass the
+  normal gate (prefix allowlist, `object_store_admin_roles`, or trusted-local).
+  Closes the SEC-04 "disable inline creds" option; a multi-tenant coordinator
+  can no longer be turned into an arbitrary object-store fetcher by any user who
+  supplies their own keys.
+- `TvfPolicy::check_object_store` now ANDs the inline-credential bypass with the
+  new flag; the denial message adapts (it no longer suggests inline creds as a
+  remedy when the bypass is disabled).
+- Manual `impl Default for TvfPolicy` (bypass enabled) so the serde default and
+  the Rust `Default` agree; documented in `sqe.toml.example`.
+- Production checklist gains `[storage.tvf] allow_inline_credentials = false`
+  for deployments that do not intend users to bring their own credentials. Not
+  hard-enforced by the `production_mode` validator (legitimate bring-your-own-
+  bucket workflows exist); left as an operator choice.
+- Verified: `cargo test -p sqe-core` (tvf suite, incl. 3 new tests) + clippy
+  green.
+
+Remaining SEC items: SEC-03 (per-user OIDC for client_credentials, architectural),
+SEC-06 (native TLS / ingress). O7 Grafana dashboard and the O3 slow-query
+tail-sampling (Collector config) also still open.
 
