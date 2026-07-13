@@ -22,6 +22,15 @@ pub enum LineageHint {
         table: String,
         columns: Vec<(String, String)>,
     },
+    /// A `CALL system.<proc>(target)` maintenance procedure. The target table
+    /// is both the input and output dataset (the procedure reads and rewrites
+    /// its own metadata/data), so lineage records it on both sides. No column
+    /// lineage: maintenance does not transform column values.
+    MaintenanceTable {
+        catalog: String,
+        schema: String,
+        table: String,
+    },
 }
 
 pub enum PlanOrHint {

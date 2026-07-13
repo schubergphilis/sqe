@@ -562,6 +562,7 @@ pub async fn create_session_context(
                         planning_ms: r.planning_ms,
                         execution_ms: r.execution_ms,
                         output_rows: r.output_rows,
+                        rows_written: r.rows_written,
                         error_type: r.error_type.clone(),
                         error_code: r.error_code.clone(),
                         bytes_scanned: r.bytes_scanned,

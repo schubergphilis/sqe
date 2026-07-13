@@ -985,7 +985,7 @@ impl SessionCatalog {
     }
 
     /// List all namespaces in the catalog.
-    #[instrument(skip(self), fields(warehouse = %self.warehouse))]
+    #[instrument(name = "sqe.catalog", skip(self), fields(op = "list_namespaces", warehouse = %self.warehouse))]
     pub async fn list_namespaces(&self) -> sqe_core::Result<Vec<NamespaceIdent>> {
         debug!(token_fingerprint = %self.token_fingerprint, "Listing namespaces");
         self.circuit_breaker
@@ -1055,7 +1055,7 @@ impl SessionCatalog {
     }
 
     /// List all tables in the given namespace.
-    #[instrument(skip(self), fields(namespace = ?namespace, warehouse = %self.warehouse))]
+    #[instrument(name = "sqe.catalog", skip(self), fields(op = "list_tables", namespace = ?namespace, warehouse = %self.warehouse))]
     pub async fn list_tables(
         &self,
         namespace: &NamespaceIdent,
@@ -1101,7 +1101,7 @@ impl SessionCatalog {
     /// cached metadata is reused without re-downloading.
     ///
     /// Use [`invalidate_table`] to evict an entry after DDL/DML.
-    #[instrument(skip(self), fields(table = %table_ident, warehouse = %self.warehouse))]
+    #[instrument(name = "sqe.catalog", skip(self), fields(op = "load_table", table = %table_ident, warehouse = %self.warehouse))]
     pub async fn load_table(&self, table_ident: &TableIdent) -> sqe_core::Result<Table> {
         let cache_key = self.table_cache_key(table_ident);
 
@@ -1655,7 +1655,7 @@ impl SessionCatalog {
     /// `TableUpdate` and `TableRequirement` are serialized directly; we build the
     /// JSON payload ourselves rather than going through `TableCommit::builder()`,
     /// whose `build()` method is crate-private in the upstream iceberg crate.
-    #[instrument(skip(self, updates, requirements), fields(table = %table_ident, warehouse = %self.warehouse))]
+    #[instrument(name = "sqe.catalog", skip(self, updates, requirements), fields(op = "commit_schema_update", table = %table_ident, warehouse = %self.warehouse))]
     pub async fn commit_schema_update(
         &self,
         table_ident: &TableIdent,

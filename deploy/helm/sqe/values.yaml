@@ -145,11 +145,13 @@ config:
     # config drift from the mount and write audit records to a path that has no
     # durable volume behind it.
 
-  # Rate limiting (P0 for production; enable when production_mode or explicitly).
-  # rate_limit:
-  #   enabled: true
-  #   per_user_queries_per_minute: 120
-  #   global_queries_per_minute: 5000
+  # Rate limiting. Required when coordinator.production_mode=true (the engine's
+  # production validator rejects rate_limit.enabled=false in that mode). Rendered
+  # into the [rate_limit] block of sqe.toml by templates/configmap.yaml.
+  rate_limit:
+    enabled: false
+    per_user_queries_per_minute: 120
+    global_queries_per_minute: 5000
 
 # -- Audit log (ISSUE-248) ----------------------------------------------------
 # The coordinator writes security-relevant audit records (one JSONL entry per

@@ -74,6 +74,12 @@ pub struct QueryRecord {
     pub planning_ms: u64,
     pub execution_ms: u64,
     pub output_rows: usize,
+    /// Rows written/affected by a DML statement (INSERT/CTAS/UPDATE/DELETE/
+    /// MERGE). `None` for reads and for statements with no write semantics.
+    /// Distinct from `output_rows`, which counts result-set rows (a write's
+    /// result set is a 1-row `rows_affected` batch or empty, so `output_rows`
+    /// alone cannot report how many rows a write changed).
+    pub rows_written: Option<u64>,
     pub error_type: Option<String>,
     pub error_code: Option<String>,
     pub error_message: Option<String>,
@@ -153,6 +159,7 @@ impl QueryTracker {
             planning_ms: 0,
             execution_ms: 0,
             output_rows: 0,
+            rows_written: None,
             error_type: None,
             error_code: None,
             error_message: None,
@@ -242,6 +249,18 @@ impl QueryTracker {
         if let Some(old) = self.history.get(query_id) {
             let mut record = (*old).clone();
             record.profile = Some(profile);
+            self.history.insert(*query_id, Arc::new(record));
+        }
+    }
+
+    /// Record the rows written/affected by a DML statement. Called from the
+    /// completion path once the affected count is recovered from the write
+    /// result. Mirrors [`Self::set_profile`]: a copy-on-write update of the
+    /// terminal record so it carries the count alongside the other stats.
+    pub fn set_rows_written(&self, query_id: &Uuid, rows_written: u64) {
+        if let Some(old) = self.history.get(query_id) {
+            let mut record = (*old).clone();
+            record.rows_written = Some(rows_written);
             self.history.insert(*query_id, Arc::new(record));
         }
     }

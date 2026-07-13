@@ -10,6 +10,7 @@ data:
     flight_sql_port = {{ .Values.config.coordinator.flight_sql_port }}
     trino_http_port = {{ .Values.config.coordinator.trino_http_port }}
     mode = {{ .Values.config.coordinator.mode | quote }}
+    production_mode = {{ .Values.coordinator.production_mode }}
     # DEP-02: the engine's tracked memory_limit defaults to 8GB in code, but
     # the coordinator pod is capped at 2Gi by default -- DataFusion would
     # allocate toward 8GB and the kernel OOMKills the pod long before spill
@@ -58,6 +59,11 @@ data:
 
     [policy]
     engine = {{ .Values.config.policy.engine | quote }}
+
+    [rate_limit]
+    enabled = {{ .Values.config.rate_limit.enabled }}
+    per_user_queries_per_minute = {{ .Values.config.rate_limit.per_user_queries_per_minute }}
+    global_queries_per_minute = {{ .Values.config.rate_limit.global_queries_per_minute }}
 
     [metrics]
     prometheus_port = {{ .Values.config.metrics.prometheus_port }}

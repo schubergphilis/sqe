@@ -35,6 +35,9 @@ pub fn to_ocsf(event: &AuditEvent) -> Value {
         unmapped.insert("spill_bytes".into(), json!(s.spill_bytes));
         unmapped.insert("peak_memory_bytes".into(), json!(s.peak_memory_bytes));
         unmapped.insert("rows_returned".into(), json!(s.rows_returned));
+        if let Some(rw) = s.rows_written {
+            unmapped.insert("rows_written".into(), json!(rw));
+        }
     }
     if let Some(p) = &event.policy {
         unmapped.insert("policy".into(), serde_json::to_value(p).unwrap_or(Value::Null));
@@ -95,7 +98,7 @@ mod tests {
             resources: vec![Resource { catalog: Some("polaris".into()), namespace: vec!["hr".into()], name: "employees".into(), object_type: ObjectType::Table }],
             policy: None,
             timing: Some(Timing { duration_ms: 42, queued_ms: 0, planning_ms: 5, execution_ms: 37 }),
-            stats: Some(QueryStats { rows_returned: 10, bytes_scanned: 2048, rows_scanned: 100, spill_bytes: 0, peak_memory_bytes: 0 }),
+            stats: Some(QueryStats { rows_returned: 10, rows_written: None, bytes_scanned: 2048, rows_scanned: 100, spill_bytes: 0, peak_memory_bytes: 0 }),
             query: Some(QueryInfo { text: Some("SELECT 1".into()), query_hash: "abc".into(), statement_type: "query".into() }),
             session_id: Some("sess-1".into()),
             client_ip: Some("10.0.0.1".into()),
