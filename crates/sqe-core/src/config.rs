@@ -3419,27 +3419,38 @@ impl SqeConfig {
             );
         }
 
-        // SEC-03: the config-held `client_credentials` provider hands one
-        // server-baked service token to every connection, collapsing all users
-        // to a single identity at Polaris/S3 and defeating per-user
-        // authorization. Reject it in production unless the operator explicitly
-        // acknowledges a single-shared-identity deployment. The per-connection
-        // `client_credentials_passthrough` provider (own creds per connection)
-        // is unaffected.
+        // SEC-03: a config-held `client_credentials` grant hands one server-baked
+        // service token to every connection, collapsing all users to a single
+        // identity at Polaris/S3 and defeating per-user authorization. Two
+        // sibling paths carry this risk and must be gated with parity:
+        //   1. `[auth].providers` — the Flight user-auth `ClientCredentials`
+        //      provider (shared identity for every connecting user).
+        //   2. `[catalog.auth]` / `[catalogs.*.auth]` — a catalog whose auth
+        //      method is `ClientCredentials` fetches one token per session and
+        //      reuses it, so that catalog sees one identity for all users.
+        // The per-connection `client_credentials_passthrough` provider (own
+        // creds per connection) is NOT flagged. Reject in production unless the
+        // operator acknowledges a deliberate single-shared-identity deployment.
+        let shared_identity_flight = self
+            .auth
+            .providers
+            .iter()
+            .any(|p| matches!(p, AuthProviderConfig::ClientCredentials { .. }));
+        let shared_identity_catalog = std::iter::once(&self.catalog)
+            .chain(self.catalogs.values())
+            .any(|c| matches!(c.auth, Some(CatalogAuthConfig::ClientCredentials { .. })));
         if !self.security.allow_shared_service_identity
-            && self
-                .auth
-                .providers
-                .iter()
-                .any(|p| matches!(p, AuthProviderConfig::ClientCredentials { .. }))
+            && (shared_identity_flight || shared_identity_catalog)
         {
             errors.push(
-                "production_mode: the config-held client_credentials auth provider \
-                 gives every connection one shared service identity (per-user \
-                 authorization at Polaris/S3 is lost). Use oidc_password \
-                 (per-user) or client_credentials_passthrough (per-connection), \
-                 or set security.allow_shared_service_identity = true to \
-                 acknowledge a deliberate single-service deployment."
+                "production_mode: a shared-service-identity auth mode is configured \
+                 (config-held client_credentials in [auth].providers and/or \
+                 [catalog(s).auth]); every connection would use one identity at \
+                 Polaris/S3, losing per-user authorization. Use oidc_password \
+                 (per-user) or client_credentials_passthrough (per-connection) for \
+                 user auth and SessionBearer for catalog auth, or set \
+                 security.allow_shared_service_identity = true to acknowledge a \
+                 deliberate single-service deployment."
                     .to_string(),
             );
         }
@@ -4706,6 +4717,27 @@ mod tests {
             client_id: "svc".to_string(),
             client_secret: "secret".to_string(),
         }];
+        config.security.allow_shared_service_identity = true;
+        assert!(config.validate_production().is_ok());
+    }
+
+    #[test]
+    fn validate_production_rejects_shared_catalog_client_credentials_by_default() {
+        // SEC-03 sibling path: a catalog whose auth is client_credentials reuses
+        // one service token, so the catalog sees one identity for all users.
+        let mut config = valid_production_config();
+        config.catalog.auth = Some(CatalogAuthConfig::ClientCredentials {
+            token_endpoint: "https://idp/token".to_string(),
+            client_id: "svc".to_string(),
+            client_secret: "secret".to_string(),
+            scope: None,
+        });
+        let err = config.validate_production().unwrap_err().to_string();
+        assert!(
+            err.contains("allow_shared_service_identity"),
+            "got: {err}"
+        );
+        // And accepted with the explicit opt-in.
         config.security.allow_shared_service_identity = true;
         assert!(config.validate_production().is_ok());
     }
