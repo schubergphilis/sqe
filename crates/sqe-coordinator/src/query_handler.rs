@@ -1352,7 +1352,7 @@ impl QueryHandler {
         //   - the per-query cancellation token (admin CancelQuery action)
         // The first one to fire wins. Cancellation skips the failed() write
         // because the tracker's cancel() already transitioned to Canceled.
-        let result = tokio::select! {
+        let mut result = tokio::select! {
             biased;
             _ = cancel_token.cancelled() => {
                 warn!(
@@ -1402,6 +1402,22 @@ impl QueryHandler {
                 sqe_catalog::invalidate_rest_catalog_cache_all().await;
                 crate::session_context::invalidate_session_cache(&session.user.username).await;
             }
+        }
+
+        // Every successful DML statement has the `rows_affected` contract
+        // advertised by `get_schema`. Some no-op write paths historically
+        // returned no batches (for example DELETE from an empty table), which
+        // made Flight SQL emit EOF instead of the declared one-column result.
+        if matches!(
+            kind,
+            StatementKind::Insert(_)
+                | StatementKind::Merge(_)
+                | StatementKind::Delete(_)
+                | StatementKind::Update(_)
+                | StatementKind::Truncate(_)
+        ) && matches!(&result, Ok(batches) if batches.is_empty())
+        {
+            result = Ok(crate::write_handler::affected_rows_batch(0));
         }
 
         // Record metrics and audit
@@ -1487,11 +1503,14 @@ impl QueryHandler {
                             cache.invalidate(&table_name);
                         }
                     }
-                    StatementKind::Merge(stmt) => {
-                        if let Statement::Merge(merge) = stmt.as_ref() {
-                            let table_name = merge.table.to_string();
-                            cache.invalidate(&table_name);
-                        }
+                    StatementKind::Merge(_) => {
+                        // Some SELECT plans reach the cache without a table
+                        // dependency in `tables_touched` (notably qualified
+                        // Iceberg reads used by custom Python destinations).
+                        // Such entries have no secondary-index bucket for a
+                        // targeted eviction. A successful MERGE must never
+                        // leave those pre-write results observable.
+                        cache.invalidate_all();
                     }
                     _ => {}
                 }
@@ -2363,10 +2382,11 @@ impl QueryHandler {
 
     /// Return the schema for a SQL statement without executing it.
     ///
-    /// Only pure SELECT/WITH queries are planned via DataFusion. For all
-    /// other statements (SHOW, DDL, DML) we return an empty schema since
-    /// they are side-effect-only and Flight SQL only needs the schema for
-    /// the `get_flight_info` response.
+    /// Only pure SELECT/WITH queries are planned via DataFusion. DML advertises
+    /// the same `rows_affected` result that the write handlers return; this is
+    /// required by Flight SQL clients, which reject a prepared statement when
+    /// its declared and actual result schemas differ. Other non-query
+    /// statements remain side-effect-only and use an empty schema.
     pub async fn get_schema(
         &self,
         session: &Session,
@@ -2410,9 +2430,22 @@ impl QueryHandler {
             // that schema-resolution required. Schema-only paths never read
             // batches, so dropping right after `df.schema()` is fine.
             Ok(Arc::new(df.schema().as_arrow().clone()))
+        } else if matches!(
+            kind,
+            StatementKind::Insert(_)
+                | StatementKind::Merge(_)
+                | StatementKind::Delete(_)
+                | StatementKind::Update(_)
+                | StatementKind::Truncate(_)
+        ) {
+            Ok(Arc::new(Schema::new(vec![Field::new(
+                "rows_affected",
+                DataType::Int64,
+                false,
+            )])))
         } else {
-            // Non-query statements: return empty schema. The actual execution
-            // happens in do_get_statement via execute().
+            // Other non-query statements: execution happens in
+            // do_get_statement via execute() and yields no result columns.
             Ok(Arc::new(Schema::empty()))
         }
     }
