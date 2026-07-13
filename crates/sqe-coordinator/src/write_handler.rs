@@ -1259,7 +1259,7 @@ impl WriteHandler {
         let cleanup_guard =
             WriteCleanupGuard::new(table.file_io().clone(), tracker.clone(), "ctas-streaming")
                 .with_metrics(self.metrics.clone());
-        let post_create: sqe_core::Result<()> = async {
+        let post_create: sqe_core::Result<usize> = async {
             let stream = df.execute_stream().await.map_err(|e| {
                 SqeError::Execution(format!("Failed to start execution stream: {e}"))
             })?;
@@ -1310,7 +1310,7 @@ impl WriteHandler {
                     "CTAS created empty table (no data to write)"
                 );
             }
-            Ok(())
+            Ok(total_rows)
         }
         .await;
 
@@ -1322,9 +1322,12 @@ impl WriteHandler {
             );
             rollback_ctas_partial_create(&catalog, &table, &table_ident).await;
         }
-        post_create?;
+        let total_rows = post_create?;
 
-        Ok(vec![])
+        // Report the written-row count as a 1-row `rows_affected` batch,
+        // consistent with the buffered INSERT path and the DELETE/UPDATE/MERGE
+        // handlers. The coordinator recovers it (O2) into query history + audit.
+        Ok(affected_rows_batch(total_rows))
     }
 
     /// Handle INSERT INTO ns.table SELECT ... — streaming variant.
@@ -1436,7 +1439,7 @@ impl WriteHandler {
         if total_rows == 0 {
             info!(table = %table_ident, "INSERT SELECT returned no rows — nothing to write");
             cleanup_guard.mark_committed();
-            return Ok(vec![]);
+            return Ok(affected_rows_batch(0));
         }
 
         if !data_files.is_empty() {
@@ -1472,7 +1475,10 @@ impl WriteHandler {
             cleanup_guard.mark_committed();
         }
 
-        Ok(vec![])
+        // Report the written-row count as a 1-row `rows_affected` batch,
+        // consistent with the buffered INSERT path and the DELETE/UPDATE/MERGE
+        // handlers. The coordinator recovers it (O2) into query history + audit.
+        Ok(affected_rows_batch(total_rows))
     }
 
     /// Handle CREATE TABLE [IF NOT EXISTS] ns.table (column definitions)
