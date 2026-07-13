@@ -545,6 +545,61 @@ mod case_union {
         let expected = Reference::new("id").is_in([Datum::long(1), Datum::long(2)]);
         assert_eq!(convert(in_list_expr("id", 0, &[1, 2])), Some(expected));
     }
+
+    // -- sqe#369 regression: cap the CASE union size (q21/q12) -----------------
+    //
+    // A partitioned join whose sealed CASE unions to a key set larger than the
+    // cap can neither be bloom-pruned (SBBF evaluator bails above
+    // `bloom_max_values`) nor stats-pruned (min/max IN bails above 200
+    // literals), so the converted `Predicate::Set` becomes a pure per-row
+    // parquet `RowFilter` cost with no row-group pruning benefit. Dropping the
+    // over-cap column restores the pre-`df5c59d` behavior for large sets (the
+    // CASE was untranslatable then) while keeping the win for small selective
+    // sets.
+    use iceberg_datafusion::physical_plan::physical_to_predicate::convert_physical_filters_to_predicate_capped;
+
+    fn convert_capped(expr: Arc<dyn PhysicalExpr>, max: usize) -> Option<Predicate> {
+        convert_physical_filters_to_predicate_capped(&[expr], max)
+    }
+
+    #[test]
+    fn case_union_over_cap_degrades_to_none() {
+        // Union across arms = {1,2,3,4}: four values, cap of 3 -> dropped.
+        let case = case_expr(
+            vec![
+                in_list_expr("id", 0, &[1, 2]),
+                in_list_expr("id", 0, &[3, 4]),
+            ],
+            lit(ScalarValue::Boolean(Some(false))),
+        );
+        assert_eq!(convert_capped(case, 3), None);
+    }
+
+    #[test]
+    fn case_union_at_cap_still_converts() {
+        // Off-by-one guard: a union of exactly `max` values is kept (matches
+        // the bloom evaluator treating sets up to `bloom_max_values` as usable).
+        let case = case_expr(
+            vec![
+                in_list_expr("id", 0, &[1, 2]),
+                in_list_expr("id", 0, &[3]),
+            ],
+            lit(ScalarValue::Boolean(Some(false))),
+        );
+        let expected =
+            Reference::new("id").is_in([Datum::long(1), Datum::long(2), Datum::long(3)]);
+        assert_eq!(convert_capped(case, 3), Some(expected));
+    }
+
+    #[test]
+    fn default_entry_point_uses_large_cap() {
+        // The uncapped public entry keeps translating small sets unchanged.
+        let case = case_expr(
+            vec![in_list_expr("id", 0, &[1, 2]), in_list_expr("id", 0, &[3])],
+            lit(ScalarValue::Boolean(Some(false))),
+        );
+        assert!(convert(case).is_some());
+    }
 }
 
 // ---------------------------------------------------------------------------
