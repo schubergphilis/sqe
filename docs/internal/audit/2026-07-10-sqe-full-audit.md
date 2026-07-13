@@ -103,7 +103,7 @@
 | ID | Finding | Evidence |
 |----|---------|----------|
 | Q-01 | Coordinator god-crate | `write_handler.rs` 8,262 LOC; `query_handler.rs` 6,927 |
-| Q-02 | `panic!` on DML paths | 13 in `write_handler.rs` |
+| Q-02 | ~~`panic!` on DML paths~~ **INVALID** (2026-07-13) | All 13 `panic!` are in `write_handler.rs`'s `#[cfg(test)]` module (from line 6628); production DML code has 0 `panic!` / `.unwrap()` / `.expect()`. See progress note. |
 | Q-04 | Write-path memory safety not CI-validated | Stack-gated per `nextsteps.md` |
 | Q-05 | Distributed execution untested in default CI | `test_distributed_select` ignored |
 
@@ -560,4 +560,22 @@ schema / builder but only one test literal and the `has_22` assertion; 5 record
 literals and the `empty_records` assertion (still 21) were never updated, so
 `cargo test -p sqe-catalog` failed to build the test target. This branch adds the
 missing `trace_id` fields and corrects the counts (now 23 with `rows_written`).
+
+## 2026-07-13 Verification (Q-02 is a false finding)
+
+Branch `fix/audit-q02-false-finding`. No code change: Q-02 does not reproduce.
+
+`write_handler.rs` has exactly one `#[cfg(test)]` boundary, at line 6628. All 13
+`panic!` calls (lines 6647-8301) and all 127 `.unwrap()`/`.expect()` calls sit
+after it, inside test functions where they are ordinary assertions ("parse this
+SQL, panic if the AST is not the expected shape"). The production write path
+(lines 1-6627) contains **0** `panic!`, `unreachable!`, `assert!`, `.unwrap()`,
+or `.expect()`.
+
+Q-02 is a re-listing of a finding already disproven once: the 2026-06-26
+grep-based triage (see `nextsteps.md`) recorded that "every panic/unwrap finding
+hit `#[cfg(test)]` code" and closed them. The older `security_audit.md` cited
+`write_handler.rs:421,436 arrow_schema_to_iceberg(...).unwrap()`; those lines no
+longer exist and current production code has no such unwrap. Marking Q-02 invalid
+here and in `issue-groups.md` so it is not triaged a third time.
 
