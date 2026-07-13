@@ -70,6 +70,14 @@ warehouse = "sales_wh"
 # Polaris. Without this, writes fall back to the default catalog.
 [query]
 catalog_discovery = "polaris-auto"
+# This is a Trino-compatibility quickstart: ORDER BY must remain a semantic
+# guarantee even when SQE is under memory pressure. The default adaptive mode
+# may strip a non-partition sort, which large/multi-file Flight results expose.
+sort_mode = "strict"
+# Keep planner/audit fallback aligned with the catalog used by this quickstart.
+# Some DML plan nodes retain schema + table after catalog routing, so this also
+# ensures their structured audit resources remain sales_wh.sales.<table>.
+default_catalog = "sales_wh"
 
 # ── Storage ─────────────────────────────────────────────────────────────────
 [storage]
@@ -95,3 +103,13 @@ idle_timeout_secs = 900
 
 [metrics]
 prometheus_port = 9090
+audit_log_path = "/tmp/sqe-audit.jsonl"
+
+[metrics.audit]
+# Write the canonical SQE audit model and its OCSF projection. The files live
+# in the disposable quickstart container at /tmp/sqe-audit.jsonl and
+# /tmp/sqe-audit.ocsf.jsonl and can be inspected with docker compose exec.
+format = "both"
+# Never enable this in the shared quickstart: query metadata and row counts are
+# sufficient for verification, while full result sets may contain sensitive data.
+superdebug_log_results = false
