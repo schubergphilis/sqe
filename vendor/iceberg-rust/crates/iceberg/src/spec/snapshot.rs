@@ -25,7 +25,6 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use typed_builder::TypedBuilder;
 
-use super::table_metadata::SnapshotLog;
 use crate::error::{Result, timestamp_ms_to_utc};
 use crate::io::FileIO;
 use crate::spec::{ManifestList, SchemaId, SchemaRef, TableMetadata};
@@ -209,14 +208,6 @@ impl Snapshot {
             // the version that you'd like to get (probably always the latest)
             table_metadata.format_version(),
         )
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn log(&self) -> SnapshotLog {
-        SnapshotLog {
-            timestamp_ms: self.timestamp_ms,
-            snapshot_id: self.snapshot_id,
-        }
     }
 
     /// The row-id of the first newly added row in this snapshot. All rows added in this snapshot will
