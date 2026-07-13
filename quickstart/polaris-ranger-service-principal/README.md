@@ -57,6 +57,24 @@ shape (`preferred_username` + `aud`), then drives SQE: seed as `sp-admin`,
 `SELECT` allowed as `sp-reader`, denied as `sp-denied`, write denied for the
 read-only SP, and a wrong secret rejected at auth.
 
+### Load Iceberg tables with dltHub
+
+The [`dlt/` example](./dlt/README.md) adds a Python 3.12 test container and
+demonstrates three ingestion front doors with the same `sp-admin` identity:
+
+- dlt's native Iceberg destination directly against Polaris REST;
+- a dlt custom SQL destination through SQE's Trino-compatible HTTP endpoint;
+- the same destination through SQE's Arrow Flight SQL endpoint.
+
+It covers full replacement, incremental upsert, snapshot and event-based SCD2,
+multi-batch loads, nullable and escaped values, before/after table snapshots,
+generated SQL, and canonical plus OCSF audit verification:
+
+```bash
+./dlt/run.sh --both          # reuse existing images
+./dlt/run.sh --build --both  # rebuild only when sources changed
+```
+
 ### Connecting yourself
 
 Any Flight SQL client uses the `client_id` as the username and the
@@ -83,9 +101,10 @@ No `client_id`/`client_secret` in config: those arrive per connection.
 
 ## Constraints worth knowing
 
-- **Flight SQL only.** The Trino-compat HTTP Basic-auth path does not route
-  through the provider chain (it calls the legacy authenticator directly), so the
-  passthrough provider is reachable over Flight SQL, not Trino HTTP Basic auth.
+- **Both SQL protocols are covered.** The runnable dlt suite verifies the same
+  service-principal credentials and Iceberg DML through Trino-compatible HTTP
+  and Arrow Flight SQL. The direct Polaris route uses a bearer token minted
+  with the same client credentials.
 - **Service-principal-only listener.** This provider consumes username/password,
   so it cannot share a listener with `oidc_password` (a human username would be
   tried as a `client_id` and rejected).

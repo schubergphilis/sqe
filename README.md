@@ -269,6 +269,7 @@ Engineering posts that double as design rationale:
 | [Shipping OpenLineage](docs/site/blog/2026-05-09-shipping-openlineage.md) | Column-level lineage from idea to merged MR |
 | [The Benchmark That Lied](docs/site/blog/2026-06-12-the-benchmark-that-lied.md) | Vacuous results, the DuckDB oracle, and the day Trino was wrong |
 | [The Filter That Rebuilt Itself 14,600 Times](docs/site/blog/2026-06-15-the-filter-that-rebuilt-itself.md) | A runtime filter re-snapshotted per batch made q12 161s instead of 2.7s |
+| [One dlt Pipeline, Three Roads to Apache Polaris](docs/site/blog/2026-07-13-dlt-three-roads-to-polaris.md) | Direct Iceberg REST, Trino HTTP, and Arrow Flight SQL ingestion into one governed catalog |
 
 Full archive in [`docs/site/blog/`](docs/site/blog/).
 
