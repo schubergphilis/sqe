@@ -12,9 +12,12 @@ from __future__ import annotations
 
 import os
 import shutil
+from contextvars import ContextVar
 from datetime import datetime, timezone
+from itertools import count
 from pathlib import Path
 from typing import Any, Iterable
+from urllib.parse import quote as url_quote
 from urllib.parse import urlparse
 
 import dlt
@@ -40,6 +43,12 @@ SQE_TRANSPORT = os.getenv("SQE_TRANSPORT", "trino").lower()
 CLIENT_ID = os.getenv("SP_ADMIN_CLIENT_ID", "sp-admin")
 CLIENT_SECRET = os.getenv("SP_ADMIN_SECRET", "sp-admin-secret")
 NAMESPACE = "sales"
+TRACE_GENERATED_SQL: ContextVar[bool] = ContextVar(
+    "trace_generated_sql", default=False
+)
+TRACE_QUERY_ID = count()
+TRACE_ROW_LIMIT = 20
+TRACE_SQL_LIMIT = 4_000
 
 
 INITIAL = [
@@ -72,6 +81,24 @@ SCD2_MULTI_CHANGE = [
         "effective_at": datetime(2026, 1, 3, 0, 0, 0),
     },
 ]
+
+
+def resilience_rows(start: int, stop: int, revision: str) -> list[dict[str, Any]]:
+    """Build deterministic data large enough to cross dlt's 1,000-row batches."""
+    rows = [
+        {
+            "id": row_id,
+            "name": f"customer-{row_id}-{revision}",
+            "tier": ("bronze", "silver", "gold")[row_id % 3],
+        }
+        for row_id in range(start, stop)
+    ]
+    # Exercise SQL escaping and UTF-8 consistently in both destinations.
+    if rows:
+        rows[0]["name"] = f"O'Reilly – 東京 🚀 ({revision})"
+        rows[-1]["name"] = f"backslash\\quote'edge ({revision})"
+        rows[-1]["tier"] = None
+    return rows
 
 
 def bearer_token() -> str:
@@ -117,6 +144,21 @@ def sqe_connection():
 
 
 def sql(statement: str) -> list[tuple[Any, ...]]:
+    if TRACE_GENERATED_SQL.get():
+        displayed_statement = statement
+        if len(statement) > TRACE_SQL_LIMIT:
+            half = TRACE_SQL_LIMIT // 2
+            displayed_statement = (
+                statement[:half]
+                + f"\n... <{len(statement) - TRACE_SQL_LIMIT} SQL characters omitted> ...\n"
+                + statement[-half:]
+            )
+        print(
+            f"\n--- SQL emitted by dlt custom SQE destination "
+            f"({SQE_TRANSPORT}, {len(statement)} characters) ---\n"
+            f"{displayed_statement}\n",
+            flush=True,
+        )
     connection = sqe_connection()
     try:
         cursor = connection.cursor()
@@ -159,6 +201,102 @@ def fq(table: str) -> str:
 
 def clean(table: str) -> None:
     sql(f"DROP TABLE IF EXISTS {fq(table)}")
+
+
+def table_exists(table: str) -> bool:
+    """Check authoritative Polaris state without a failed SQE audit event."""
+    base = POLARIS_URI.rstrip("/")
+    url = (
+        f"{base}/v1/{url_quote(WAREHOUSE, safe='')}/namespaces/"
+        f"{url_quote(NAMESPACE, safe='')}/tables/{url_quote(table, safe='')}"
+    )
+    response = requests.head(
+        url,
+        headers={"Authorization": f"Bearer {bearer_token()}"},
+        timeout=20,
+    )
+    if response.status_code == 404:
+        return False
+    response.raise_for_status()
+    return True
+
+
+def print_table(headers: tuple[str, ...], rows: list[tuple[Any, ...]]) -> None:
+    """Render a small deterministic table without adding a test dependency."""
+    if not rows:
+        print("<empty>", flush=True)
+        return
+    total = len(rows)
+    if total > TRACE_ROW_LIMIT:
+        head = TRACE_ROW_LIMIT // 2
+        tail = TRACE_ROW_LIMIT - head
+        rows = rows[:head] + rows[-tail:]
+        print(
+            f"<showing first {head} and last {tail} of {total} rows>",
+            flush=True,
+        )
+    rendered = [
+        ["NULL" if value is None else str(value) for value in row] for row in rows
+    ]
+    widths = [
+        max(len(headers[index]), *(len(row[index]) for row in rendered))
+        for index in range(len(headers))
+    ]
+    print(
+        " | ".join(
+            header.ljust(widths[index]) for index, header in enumerate(headers)
+        ),
+        flush=True,
+    )
+    print("-+-".join("-" * width for width in widths), flush=True)
+    for row in rendered:
+        print(
+            " | ".join(
+                value.ljust(widths[index]) for index, value in enumerate(row)
+            ),
+            flush=True,
+        )
+
+
+def trace_target_table(stage: str, path: str, table: str, history: bool) -> None:
+    """Print target state before/after a dlt run using SQE as the observer."""
+    print(f"\n=== {stage}: {path} target {fq(table)} ===", flush=True)
+    headers = (
+        ("id", "name", "tier", "_dlt_valid_from", "_dlt_valid_to")
+        if history
+        else ("id", "name", "tier")
+    )
+    selected = ",".join(headers)
+    order = "id,_dlt_valid_from" if history else "id"
+    if not table_exists(table):
+        print("<table does not exist yet>", flush=True)
+        return
+    # Native REST writes bypass SQE, so they cannot invalidate SQE's SQL-text
+    # query cache. A unique inert comment forces every displayed snapshot to
+    # be observed from current Iceberg metadata.
+    rows = sql(
+        f"SELECT {selected} FROM {fq(table)} ORDER BY {order} "
+        f"/* dlt_trace_{next(TRACE_QUERY_ID)} */"
+    )
+    print_table(headers, rows)
+
+
+def trace_input(path: str, table: str, mode: Any, rows: list[dict[str, Any]]) -> None:
+    print(
+        f"\n=== DLT INPUT: {path} target {fq(table)}; mode={mode!r} ===",
+        flush=True,
+    )
+    displayed = rows
+    if len(rows) > TRACE_ROW_LIMIT:
+        head = TRACE_ROW_LIMIT // 2
+        tail = TRACE_ROW_LIMIT - head
+        displayed = rows[:head] + rows[-tail:]
+        print(
+            f"<showing first {head} and last {tail} of {len(rows)} input rows>",
+            flush=True,
+        )
+    for row in displayed:
+        print(row, flush=True)
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -252,6 +390,15 @@ def native_run(
     primary_key: Any = "id",
     columns: Any = None,
 ) -> None:
+    rows = list(rows)
+    history = bool(columns and "_dlt_valid_from" in columns)
+    trace_target_table("BEFORE", "native Iceberg REST", table, history)
+    trace_input("native Iceberg REST", table, disposition, rows)
+    print(
+        "SQL generated by dlt: <none>; PyIceberg writes data files and commits "
+        "Iceberg metadata through Polaris REST.",
+        flush=True,
+    )
     info = pipeline.run(
         native_resource(
             table,
@@ -262,6 +409,7 @@ def native_run(
         )
     )
     assert not info.has_failed_jobs, str(info)
+    trace_target_table("AFTER", "native Iceberg REST", table, history)
 
 
 def native_scd2_run(pipeline, table: str, rows: Iterable[dict[str, Any]]) -> None:
@@ -274,11 +422,11 @@ def native_scd2_run(pipeline, table: str, rows: Iterable[dict[str, Any]]) -> Non
     # The history columns are SQL TIMESTAMP (without time zone). Keep the
     # Python value naive as well so dlt/PyIceberg does not infer timestamptz.
     boundary = datetime.now(timezone.utc).replace(tzinfo=None)
-    try:
+    if table_exists(table):
         existing = sql(
             f"SELECT id,name,tier,_dlt_valid_from,_dlt_valid_to FROM {fq(table)}"
         )
-    except Exception:
+    else:
         existing = []
 
     incoming = {row["id"]: row for row in rows}
@@ -288,7 +436,10 @@ def native_scd2_run(pipeline, table: str, rows: Iterable[dict[str, Any]]) -> Non
         current = incoming.get(row_id)
         if valid_to is None:
             active_ids.add(row_id)
-            if current is None or (name, tier) != (current["name"], current["tier"]):
+            if current is None or (name, tier) != (
+                current.get("name"),
+                current.get("tier"),
+            ):
                 valid_to = boundary
         history.append(
             {
@@ -305,7 +456,7 @@ def native_scd2_run(pipeline, table: str, rows: Iterable[dict[str, Any]]) -> Non
             (old for old in existing if old[0] == row_id and old[4] is None),
             None,
         )
-        if current is None or current[1:3] != (row["name"], row["tier"]):
+        if current is None or current[1:3] != (row.get("name"), row.get("tier")):
             history.append(
                 {
                     **row,
@@ -318,7 +469,11 @@ def native_scd2_run(pipeline, table: str, rows: Iterable[dict[str, Any]]) -> Non
         pipeline,
         table,
         history,
-        "replace",
+        # PyIceberg implements overwrite as delete + append. On a new table
+        # that delete is a harmless no-op but emits "Delete operation did not
+        # match any records". Use append for the initial history and replace
+        # only when there is an existing snapshot to supersede.
+        "replace" if existing else "append",
         primary_key=("id", "_dlt_valid_from"),
         columns={
             "_dlt_valid_from": {
@@ -339,11 +494,11 @@ def native_scd2_events_run(
     pipeline, table: str, events: Iterable[dict[str, Any]]
 ) -> None:
     """Apply ordered changes in memory and commit one native dlt snapshot."""
-    try:
+    if table_exists(table):
         existing = sql(
             f"SELECT id,name,tier,_dlt_valid_from,_dlt_valid_to FROM {fq(table)}"
         )
-    except Exception:
+    else:
         existing = []
     history = [
         {
@@ -365,8 +520,8 @@ def native_scd2_events_run(
             None,
         )
         if active and (active["name"], active["tier"]) == (
-            event["name"],
-            event["tier"],
+            event.get("name"),
+            event.get("tier"),
         ):
             continue
         if active:
@@ -374,8 +529,8 @@ def native_scd2_events_run(
         history.append(
             {
                 "id": event["id"],
-                "name": event["name"],
-                "tier": event["tier"],
+                "name": event.get("name"),
+                "tier": event.get("tier"),
                 "_dlt_valid_from": event["effective_at"],
                 "_dlt_valid_to": None,
             }
@@ -385,7 +540,7 @@ def native_scd2_events_run(
         pipeline,
         table,
         history,
-        "replace",
+        "replace" if existing else "append",
         primary_key=("id", "_dlt_valid_from"),
         columns={
             "_dlt_valid_from": {
@@ -408,6 +563,7 @@ class SqeTableLoader:
     def __init__(self, table: str, mode: str) -> None:
         self.table = table
         self.mode = mode
+        self._replace_initialized = False
 
     def load(self, rows: list[dict[str, Any]]) -> None:
         if not rows:
@@ -421,7 +577,12 @@ class SqeTableLoader:
             "_dlt_valid_from TIMESTAMP, _dlt_valid_to TIMESTAMP)"
         )
         if self.mode == "replace":
-            sql(f"DELETE FROM {fq(self.table)}")
+            # A dlt run invokes this destination once per normalized batch.
+            # Delete once per run, not once per batch, or a load larger than
+            # batch_size silently retains only its final batch.
+            if not self._replace_initialized:
+                sql(f"DELETE FROM {fq(self.table)}")
+                self._replace_initialized = True
             self._insert(rows)
         elif self.mode == "merge":
             self._merge(rows)
@@ -434,14 +595,14 @@ class SqeTableLoader:
 
     def _insert(self, rows: list[dict[str, Any]]) -> None:
         values = ",".join(
-            f"({quote(row['id'])},{quote(row['name'])},{quote(row['tier'])})"
+            f"({quote(row['id'])},{quote(row.get('name'))},{quote(row.get('tier'))})"
             for row in rows
         )
         sql(f"INSERT INTO {fq(self.table)} (id,name,tier) VALUES {values}")
 
     def _merge(self, rows: list[dict[str, Any]]) -> None:
         values = ",".join(
-            f"({quote(row['id'])},{quote(row['name'])},{quote(row['tier'])})"
+            f"({quote(row['id'])},{quote(row.get('name'))},{quote(row.get('tier'))})"
             for row in rows
         )
         sql(
@@ -466,13 +627,17 @@ class SqeTableLoader:
             changed = incoming.get(row_id)
             if changed is None:
                 source.append((row_id, name, tier, "expire"))
-            elif (name, tier) != (changed["name"], changed["tier"]):
-                source.append((row_id, changed["name"], changed["tier"], "expire"))
-                source.append((row_id, changed["name"], changed["tier"], "insert"))
+            elif (name, tier) != (changed.get("name"), changed.get("tier")):
+                source.append(
+                    (row_id, changed.get("name"), changed.get("tier"), "expire")
+                )
+                source.append(
+                    (row_id, changed.get("name"), changed.get("tier"), "insert")
+                )
 
         for row_id, row in incoming.items():
             if row_id not in active_ids:
-                source.append((row_id, row["name"], row["tier"], "insert"))
+                source.append((row_id, row.get("name"), row.get("tier"), "insert"))
 
         expiring = [row for row in source if row[3] == "expire"]
         if expiring:
@@ -510,7 +675,7 @@ class SqeTableLoader:
                 f"SELECT name,tier FROM {fq(self.table)} "
                 f"WHERE id={quote(event['id'])} AND _dlt_valid_to IS NULL"
             )
-            if active and active[0] == (event["name"], event["tier"]):
+            if active and active[0] == (event.get("name"), event.get("tier")):
                 continue
             if active:
                 sql(
@@ -522,8 +687,8 @@ class SqeTableLoader:
                 )
             sql(
                 f"MERGE INTO {fq(self.table)} AS target "
-                f"USING (VALUES ({quote(event['id'])},{quote(event['name'])},"
-                f"{quote(event['tier'])},TIMESTAMP {quote(boundary)})) "
+                f"USING (VALUES ({quote(event['id'])},{quote(event.get('name'))},"
+                f"{quote(event.get('tier'))},TIMESTAMP {quote(boundary)})) "
                 "AS source(id,name,tier,boundary) "
                 "ON target.id=source.id AND target._dlt_valid_to IS NULL "
                 "WHEN NOT MATCHED THEN INSERT "
@@ -533,6 +698,10 @@ class SqeTableLoader:
 
 
 def sqe_run(table: str, rows: Iterable[dict[str, Any]], mode: str) -> None:
+    rows = list(rows)
+    history = mode in ("scd2", "scd2_events")
+    trace_target_table("BEFORE", f"SQE/{SQE_TRANSPORT}", table, history)
+    trace_input(f"SQE/{SQE_TRANSPORT}", table, mode, rows)
     loader = SqeTableLoader(table, mode)
 
     @dlt.destination(
@@ -542,7 +711,11 @@ def sqe_run(table: str, rows: Iterable[dict[str, Any]], mode: str) -> None:
         loader_parallelism_strategy="sequential",
     )
     def sqe_destination(items, _table) -> None:
-        loader.load(list(items))
+        trace_token = TRACE_GENERATED_SQL.set(True)
+        try:
+            loader.load(list(items))
+        finally:
+            TRACE_GENERATED_SQL.reset(trace_token)
 
     pipeline_name = f"e2e_sqe_{table}"
     pipeline = dlt.pipeline(
@@ -551,9 +724,10 @@ def sqe_run(table: str, rows: Iterable[dict[str, Any]], mode: str) -> None:
         dataset_name=NAMESPACE,
     )
     primary_key = ("id", "effective_at") if mode == "scd2_events" else "id"
-    resource = dlt.resource(list(rows), name=table, primary_key=primary_key)
+    resource = dlt.resource(rows, name=table, primary_key=primary_key)
     info = pipeline.run(resource)
     assert not info.has_failed_jobs, str(info)
+    trace_target_table("AFTER", f"SQE/{SQE_TRANSPORT}", table, history)
 
 
 @pytest.mark.parametrize("path", ["native", "sqe"])
@@ -564,7 +738,9 @@ def test_replace_overwrites_the_table(path: str) -> None:
         if path == "native":
             clean_native_state()
             pipeline = native_pipeline(table)
-            native_run(pipeline, table, INITIAL, "replace")
+            # Seed a new table without asking PyIceberg to delete an empty
+            # snapshot; the second load is the replace behavior under test.
+            native_run(pipeline, table, INITIAL, "append")
             native_run(pipeline, table, CHANGED[:1], "replace")
         else:
             sqe_run(table, INITIAL, "replace")
@@ -585,7 +761,7 @@ def test_delta_merge_updates_and_inserts(path: str) -> None:
             clean_native_state()
             pipeline = native_pipeline(table)
             mode = {"disposition": "merge", "strategy": "upsert"}
-            native_run(pipeline, table, INITIAL, mode)
+            native_run(pipeline, table, INITIAL, "append")
             native_run(pipeline, table, CHANGED, mode)
         else:
             sqe_run(table, INITIAL, "merge")
@@ -662,5 +838,73 @@ def test_scd2_orders_multiple_changes_for_one_key_in_one_run(path: str) -> None:
             f"SELECT COUNT(*) FROM {fq(table)} "
             "WHERE id=1 AND _dlt_valid_to IS NULL"
         ) == [(1,)]
+    finally:
+        clean(table)
+
+
+@pytest.mark.parametrize("path", ["native", "sqe"])
+def test_large_replace_keeps_every_batch(path: str) -> None:
+    """Catch destinations that accidentally re-apply replace per dlt batch."""
+    table = f"dlt_{path}_large_replace"
+    initial = resilience_rows(1, 2006, "initial")
+    replacement = resilience_rows(10_000, 11_501, "replacement")
+    clean(table)
+    try:
+        if path == "native":
+            clean_native_state()
+            pipeline = native_pipeline(table)
+            native_run(pipeline, table, initial, "append")
+            native_run(pipeline, table, replacement, "replace")
+        else:
+            sqe_run(table, initial, "replace")
+            sqe_run(table, replacement, "replace")
+
+        assert sql(f"SELECT COUNT(*) FROM {fq(table)}") == [(1501,)]
+        assert sql(f"SELECT MIN(id),MAX(id) FROM {fq(table)}") == [
+            (10_000, 11_500)
+        ]
+        assert sql(
+            f"SELECT name,tier FROM {fq(table)} WHERE id IN (10000,11500) "
+            "ORDER BY id"
+        ) == [
+            ("O'Reilly – 東京 🚀 (replacement)", "silver"),
+            ("backslash\\quote'edge (replacement)", None),
+        ]
+    finally:
+        clean(table)
+
+
+@pytest.mark.parametrize("path", ["native", "sqe"])
+def test_large_delta_crosses_batches_without_losing_rows(path: str) -> None:
+    """Stress overlapping updates, inserts, nulls, UTF-8, and SQL quoting."""
+    table = f"dlt_{path}_large_merge"
+    initial = resilience_rows(1, 2506, "initial")
+    delta = resilience_rows(1001, 3506, "delta")
+    clean(table)
+    try:
+        if path == "native":
+            clean_native_state()
+            pipeline = native_pipeline(table)
+            native_run(pipeline, table, initial, "append")
+            native_run(
+                pipeline,
+                table,
+                delta,
+                {"disposition": "merge", "strategy": "upsert"},
+            )
+        else:
+            sqe_run(table, initial, "merge")
+            sqe_run(table, delta, "merge")
+
+        assert sql(f"SELECT COUNT(*) FROM {fq(table)}") == [(3505,)]
+        assert sql(
+            f"SELECT id,name,tier FROM {fq(table)} "
+            "WHERE id IN (1,1001,2505,3505) ORDER BY id"
+        ) == [
+            (1, "O'Reilly – 東京 🚀 (initial)", "silver"),
+            (1001, "O'Reilly – 東京 🚀 (delta)", "gold"),
+            (2505, "customer-2505-delta", "bronze"),
+            (3505, "backslash\\quote'edge (delta)", None),
+        ]
     finally:
         clean(table)
