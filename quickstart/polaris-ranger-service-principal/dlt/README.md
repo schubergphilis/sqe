@@ -33,18 +33,23 @@ Iceberg transaction directly or sends SQL DML through SQE.
 
 ## What is tested
 
-Each path runs the same three loading patterns:
+Each path runs the same four loading patterns:
 
 | Pattern | Initial load | Second load | Expected state |
 |---|---|---|---|
 | Replace/overwrite | IDs 1 and 2 | only ID 1 | The old contents are gone |
 | Delta/upsert | IDs 1 and 2 | update 1, add 3 | IDs 1, 2 and 3; ID 1 is updated |
 | SCD Type 2 | IDs 1 and 2 | change 1, add 3 | ID 1 has retired and active versions |
+| Ordered SCD Type 2 | ID 1 is bronze | one run contains silver, then gold | bronze and silver are closed in order; only gold is active |
 
-The native route uses dlt's Iceberg REST destination and its `replace`, `upsert`,
-and `scd2` strategies. The SQE route uses a small dlt custom destination in
-[`test_dlt_load_paths.py`](./test_dlt_load_paths.py). That adapter maps normalized
-dlt batches to SQE's Iceberg `DELETE`, `INSERT`, `MERGE`, and `UPDATE` support.
+The native route uses dlt's Iceberg REST destination for `replace` and `upsert`.
+That destination currently advertises `delete-insert` and `upsert`, but not
+dlt's built-in `scd2` strategy. The native SCD2 case therefore materializes the
+history rows in Python and loads the resulting snapshot through dlt's supported
+`replace` operation against Polaris REST. The SQE route uses a small dlt custom
+destination in [`test_dlt_load_paths.py`](./test_dlt_load_paths.py). That adapter
+maps normalized dlt batches to SQE's Iceberg `DELETE`, `INSERT`, `MERGE`, and
+`UPDATE` support.
 
 Why is the SQE adapter custom? dlt's generic SQLAlchemy Trino destination does
 not advertise merge or SCD2 because standard Trino tables have no primary-key
@@ -127,8 +132,8 @@ Arguments after the transport option are forwarded to pytest:
 ./dlt/run.sh --trino -k 'replace or delta' -vv
 ```
 
-The six logical cases are parameterized by ingestion path (`native` and `sqe`).
-With `--both`, those six cases execute over both verification/SQL transports.
+The logical cases are parameterized by ingestion path (`native` and `sqe`).
+With `--both`, every case executes over both verification/SQL transports.
 
 ## Configuration
 
@@ -141,14 +146,19 @@ The defaults are defined in [`docker-compose.dlt.yml`](../docker-compose.dlt.yml
 | `SQE_FLIGHT_URI` | `grpc://sqe:50051` | Arrow Flight SQL endpoint |
 | `POLARIS_REST_URI` | `http://polaris:8181/api/catalog` | Iceberg REST endpoint |
 | `POLARIS_WAREHOUSE` | `sales_wh` | Polaris catalog/SQE catalog |
+| `S3_ENDPOINT` | `http://rustfs:9000` | Internal RustFS S3 endpoint |
+| `S3_ACCESS_KEY` / `S3_SECRET_KEY` | development credentials | Static storage credentials |
+| `S3_REGION` | `us-east-1` | RustFS signing region |
 | `KEYCLOAK_TOKEN_URL` | internal Keycloak URL | Direct-path bearer-token issuer |
 | `SP_ADMIN_CLIENT_ID` | `sp-admin` | Ranger-authorized principal |
 | `SP_ADMIN_SECRET` | development secret | Client-credentials secret |
 | `DLT_DATA_DIR` | `/tmp/dlt` | Disposable dlt local state |
 
 The values use Compose service names because the runner executes inside the
-stack network. This is particularly important for Polaris-vended RustFS
-credentials: the advertised `rustfs:9000` endpoint is resolvable in that network.
+stack network. This is particularly important for the `rustfs:9000` endpoint,
+which is resolvable through Compose DNS. The demo catalog is configured with
+`stsUnavailable=true`, so the direct PyIceberg path uses the static development
+credentials above instead of requesting credential vending from Polaris.
 
 To override a value for a manual Compose invocation:
 
@@ -210,8 +220,9 @@ This suite validates destination behavior, not durable dlt state restoration.
 
 ### Direct Iceberg writes cannot reach RustFS
 
-Run the tests through `./dlt/run.sh`, not directly on the host. Polaris vends an
-internal object-store endpoint that is intentionally resolved via Compose DNS.
+Run the tests through `./dlt/run.sh`, not directly on the host. The direct
+PyIceberg destination uses the internal `rustfs:9000` endpoint, which is
+intentionally resolved via Compose DNS.
 
 ### A test process was interrupted
 
@@ -225,4 +236,3 @@ docker compose down -v
 ```
 
 The volume-removal command destroys only this quickstart's local demo data.
-
