@@ -2,8 +2,8 @@
 
 This is a vendored copy of the [RisingWave Labs iceberg-rust fork](https://github.com/risingwavelabs/iceberg-rust),
 branch `dev_rebase_main_20260303` at commit `813e54419b43`. The branch carries
-DataFusion 53.0 / Arrow 58 / Parquet 58 (RW PR #148, 2026-04-15) plus writer
-and transaction fixes on top.
+Arrow 58 / Parquet 58 (RW PR #148, 2026-04-15) plus writer and transaction
+fixes on top. SQE resolves the vendored crates in its DataFusion 54 workspace.
 
 ## Vendored crates
 
@@ -40,6 +40,24 @@ The RisingWave fork provides all of these.
 - RisingWave fork: `dev_rebase_main_20260303` @ `813e54419b43`
 - Apache upstream: tracking PRs #2185 (OverwriteAction) and #2203 (RowDeltaAction)
 - When upstream merges these, SQE will migrate to official apache/iceberg-rust
+
+Last audited on 2026-07-13. The RisingWave branch had advanced to
+`0d9e873c1262`; its three code commits after the vendored baseline are not yet
+backported:
+
+- `c3ac742` unifies the overwrite/rewrite transaction implementations. Its
+  public transaction entry points remain source-compatible, but it overlaps
+  SQE's CoW transaction path and requires the write regression suite.
+- `61a8941` reuses rewritten manifests during commit-conflict retries. This is
+  API-compatible but substantially rewrites `rewrite_manifests.rs` and needs
+  conflict/retry validation before adoption.
+- `0d9e873` streams manifest loading during orphan-file removal. This is
+  API-compatible; it remains pending maintenance-path validation.
+
+Apache `main` is audited selectively rather than merged wholesale: it has
+different transaction APIs, dependency versions, and MSRV requirements. Every
+accepted fix is listed below with its upstream PR and retained as a focused
+backport.
 
 ## SQE-only patches in this vendor copy
 
@@ -117,6 +135,16 @@ them quickly.
    pruning paths as a single `Predicate::Set` per column. Behavioral
    tests live in SQE at `crates/sqe-catalog/tests/bloom_probe_369.rs`.
    Not filed upstream yet.
+9. **Strict-metrics residual elimination**: scan planning now evaluates the
+   snapshot predicate against each data file's metrics. When the strict
+   evaluator proves every row matches, the `FileScanTask` carries no residual
+   predicate and the Arrow reader avoids redundant row-level evaluation. An
+   inconclusive result retains the predicate. This makes the existing strict
+   evaluator production code and removes its `dead_code` warning without a
+   lint suppression. Files: `crates/iceberg/src/scan/context.rs` and
+   `crates/iceberg/src/expr/visitors/strict_metrics_evaluator.rs`. This is an
+   SQE patch, not part of Apache #2616; Apache deliberately retains
+   `#[allow(dead_code)]` on strict visitors because it has no production caller.
 
 ## Cherry-picks from apache/iceberg-rust main
 
@@ -139,6 +167,12 @@ authorship and commit messages are preserved.
   helpers).
 - **#2360** EXPLAIN pushed-down limit — `IcebergTableScan` EXPLAIN
   output shows the pushed-down LIMIT.
+- **#2616** remove stale dead-code annotations — exact backport of Apache
+  commit `427670d5d113`: removes the now-unnecessary annotation from
+  `global_equality_deletes` and deletes the unused `Snapshot::log` helper.
+  The upstream change intentionally does not alter strict expression visitors;
+  SQE's production use of `StrictMetricsEvaluator` is documented separately as
+  SQE-only patch family 9.
 
 Three apache fixes were considered but skipped:
 

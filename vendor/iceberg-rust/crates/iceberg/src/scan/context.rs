@@ -23,6 +23,7 @@ use futures::{SinkExt, TryFutureExt};
 use itertools::Itertools;
 
 use crate::delete_file_index::DeleteFileIndex;
+use crate::expr::visitors::strict_metrics_evaluator::StrictMetricsEvaluator;
 use crate::expr::{Bind, BoundPredicate, Predicate};
 use crate::io::object_cache::ObjectCache;
 use crate::scan::{
@@ -126,6 +127,23 @@ impl ManifestEntryContext {
             )
             .await;
 
+        // Metrics can sometimes prove that every row in this file satisfies
+        // the scan predicate. In that case the predicate is no longer a
+        // residual and the Arrow reader can skip row-level evaluation. Keep
+        // it whenever the strict evaluator is inconclusive.
+        let predicate = match self.bound_predicates.as_deref() {
+            Some(predicates)
+                if StrictMetricsEvaluator::eval(
+                    &predicates.snapshot_bound_predicate,
+                    self.manifest_entry.data_file(),
+                )? =>
+            {
+                None
+            }
+            Some(predicates) => Some(predicates.snapshot_bound_predicate.clone()),
+            None => None,
+        };
+
         Ok(FileScanTask {
             file_size_in_bytes: self.manifest_entry.file_size_in_bytes(),
             start: 0,
@@ -139,9 +157,7 @@ impl ManifestEntryContext {
 
             schema: self.snapshot_schema,
             project_field_ids: self.field_ids.to_vec(),
-            predicate: self
-                .bound_predicates
-                .map(|x| x.as_ref().snapshot_bound_predicate.clone()),
+            predicate,
 
             deletes,
 
