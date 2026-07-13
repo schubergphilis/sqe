@@ -561,6 +561,26 @@ literals and the `empty_records` assertion (still 21) were never updated, so
 `cargo test -p sqe-catalog` failed to build the test target. This branch adds the
 missing `trace_id` fields and corrects the counts (now 23 with `rows_written`).
 
+## 2026-07-13 Session Progress (O7 observability dashboard)
+
+Branch `fix/audit-o7-observability-dashboard`. Closes the O7 gap ("Grafana
+dashboard: pool pressure + audit spool lag + lineage drops").
+
+- Added `deploy/observability/sqe-observability-dashboard.json`, an operational
+  dashboard complementing the perf-focused `sqe-benchmark-dashboard.json`. It is
+  auto-provisioned by the existing `grafana-dashboards.yml` file provider (all
+  JSON in the dashboards dir loads).
+- Panels use only metrics that actually exist today: `sqe_coordinator_memory_
+  pressure` / `_used` / `_limit` / `_rss_bytes` (pool pressure);
+  `sqe_{sort,join}_spill_{count,bytes}_total` (spill); `sqe_audit_export_spool_
+  lag_bytes`, `_records_total{status}`, `_batch_failures_total`,
+  `time() - _last_success_timestamp`, `_cursor_seq` (audit spool health);
+  `sqe_lineage_dropped_events_total`, `sqe_lineage_sink_errors_total` (lineage
+  drops); plus query rate + duration quantiles for context.
+- Thresholds encode the operational intent: spool-lag orange at 1 MiB / red at
+  10 MiB, last-successful-export age orange at 60s / red at 300s, any lineage
+  drop is red.
+
 ## 2026-07-13 Session Progress (SEC-04 inline TVF credentials)
 
 Branch `fix/audit-sec04-tvf-inline-creds`.
