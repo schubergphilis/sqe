@@ -574,11 +574,16 @@ per-user authorization.
 
 - Added `security.allow_shared_service_identity` (default `false`), mirroring the
   existing `allow_insecure_transport` opt-out pattern.
-- `production_mode` validation now rejects a config-held
-  `AuthProviderConfig::ClientCredentials` provider unless the flag is set,
-  pointing operators to `oidc_password` / `client_credentials_passthrough`. The
-  per-connection `ClientCredentialsPassthrough` provider is explicitly NOT
-  flagged (it carries its own identity) - a regression test asserts this.
+- `production_mode` validation now rejects a config-held `client_credentials`
+  grant unless the flag is set, across BOTH sibling paths (gate parity, per the
+  post-push security review): `AuthProviderConfig::ClientCredentials` in
+  `[auth].providers` (user auth) AND `CatalogAuthConfig::ClientCredentials` in
+  `[catalog.auth]` / `[catalogs.*.auth]` (catalog auth reused across the
+  session). Points operators to `oidc_password` / `client_credentials_passthrough`
+  and `SessionBearer` catalog auth. The per-connection
+  `ClientCredentialsPassthrough` provider is explicitly NOT flagged (it carries
+  its own identity) - regression tests assert both the passthrough allowance and
+  the catalog-path rejection.
 - Env override `SQE_SECURITY__ALLOW_SHARED_SERVICE_IDENTITY`; documented in
   `sqe.toml.example`.
 - Improve-not-break: no effect outside `production_mode`, the provider is not
