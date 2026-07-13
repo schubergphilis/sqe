@@ -173,6 +173,14 @@ s3_path_style = true
 # JWT roles (case-insensitive) allowed to read ANY object-store path with
 # the engine's credentials. Default empty = no override.
 # object_store_admin_roles = ["sqe-storage-admin"]
+#
+# Whether inline TVF credentials bypass the prefix allowlist above (SEC-04).
+# Default true: a call carrying its own access_key/secret_key (or Azure/GCS
+# equivalent) reads with those creds, so the object store enforces access and
+# the allowlist is skipped. Set false on a multi-tenant coordinator that does
+# NOT want users bringing their own object-store credentials; inline-cred reads
+# then still have to pass allowed_object_store_prefixes / object_store_admin_roles.
+# allow_inline_credentials = false
 
 # ── Wire-protocol security ────────────────────────────────────
 [security]
