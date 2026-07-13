@@ -130,7 +130,7 @@ fn quote_ident(name: &str) -> String {
 
 /// Build a single-row RecordBatch reporting affected row count.
 /// Matches Trino's DML response which returns the update count.
-fn affected_rows_batch(count: usize) -> Vec<RecordBatch> {
+pub(crate) fn affected_rows_batch(count: usize) -> Vec<RecordBatch> {
     use arrow_array::Int64Array;
     use arrow_schema::{DataType, Field};
     let schema = Arc::new(ArrowSchema::new(vec![Field::new(
@@ -3332,7 +3332,7 @@ impl WriteHandler {
             };
 
             let target_mem = if target_buf.is_empty() {
-                datafusion::datasource::MemTable::try_new(target_schema.clone(), vec![])
+                datafusion::datasource::MemTable::try_new(target_schema.clone(), vec![vec![]])
             } else {
                 datafusion::datasource::MemTable::try_new(
                     target_schema.clone(),
@@ -3533,6 +3533,7 @@ impl WriteHandler {
             .await
             .map_err(|e| SqeError::Execution(format!("Failed to commit MERGE: {e}")))?;
         cleanup_guard.mark_committed();
+        catalog.invalidate_table_all_tokens(&table_ident).await;
 
         info!(table = %table_ident, total_rows, "MERGE committed successfully");
         Ok(affected_rows_batch(total_rows))
@@ -3813,7 +3814,7 @@ impl WriteHandler {
             MergeScratchCleanup::new(ctx, vec![q_target.clone(), q_source.clone()]);
 
         let target_mem = if target_buf.is_empty() {
-            datafusion::datasource::MemTable::try_new(target_schema.clone(), vec![])
+            datafusion::datasource::MemTable::try_new(target_schema.clone(), vec![vec![]])
         } else {
             datafusion::datasource::MemTable::try_new(
                 target_schema.clone(),
@@ -4162,6 +4163,7 @@ impl WriteHandler {
             }
         })?;
         cleanup_guard.mark_committed();
+        catalog.invalidate_table_all_tokens(&table_ident).await;
 
         info!(
             table = %table_ident,

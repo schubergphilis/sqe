@@ -1343,6 +1343,15 @@ impl SessionCatalog {
         debug!(table = %table_ident, "Table cache invalidated");
     }
 
+    /// Evict every cached copy of a table, regardless of the bearer token that
+    /// populated it. DML commits must use this form because a Trino client may
+    /// receive a freshly exchanged access token for its next statement.
+    pub async fn invalidate_table_all_tokens(&self, table_ident: &TableIdent) {
+        let suffix = format!("{}.{}", table_ident.namespace(), table_ident.name());
+        self.table_cache.invalidate_table_all_tokens(&suffix).await;
+        debug!(table = %table_ident, "Table cache invalidated for all tokens");
+    }
+
     /// Check if a table exists.
     pub async fn table_exists(&self, table_ident: &TableIdent) -> sqe_core::Result<bool> {
         dispatch_catalog!(self.inner, table_exists(table_ident)).map_err(|e| {

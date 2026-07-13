@@ -69,7 +69,6 @@ type DeleteFileContextAndTask = (Arc<DeleteFileContext>, Arc<FileScanTask>);
 
 #[derive(Debug)]
 struct PopulatedDeleteFileIndex {
-    #[allow(dead_code)]
     global_equality_deletes: Vec<DeleteFileContextAndTask>,
     eq_deletes_by_partition: HashMap<Struct, Vec<DeleteFileContextAndTask>>,
     pos_deletes_by_partition: HashMap<Struct, Vec<DeleteFileContextAndTask>>,
