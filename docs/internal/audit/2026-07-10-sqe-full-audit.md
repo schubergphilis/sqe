@@ -38,7 +38,7 @@
 |----|-----|---------|--------|
 | SEC-01 | Critical | `bearer_passthrough` accepts any non-empty bearer | Never in prod without upstream JWT validation |
 | SEC-02 | Critical | `anonymous` provider returns fixed identity | Remove from prod auth chains |
-| SEC-03 | High | `client_credentials` shares one service token for all users | Per-user OIDC for multi-tenant |
+| SEC-03 | High | `client_credentials` shares one service token for all users | **Guarded (2026-07-13):** `production_mode` now rejects the config-held `client_credentials` provider unless `security.allow_shared_service_identity = true`; use `oidc_password` / `client_credentials_passthrough` for per-user identity |
 | SEC-04 | High | Inline TVF credentials bypass object-store prefix allowlist | Admin-only or disable inline creds |
 | SEC-05 | High | Rate limiting disabled by default | `[rate_limit] enabled = true` |
 | SEC-06 | High | Trino/Quack/web lack native TLS | Ingress termination + `allow_insecure_transport = false` |
@@ -560,4 +560,34 @@ schema / builder but only one test literal and the `has_22` assertion; 5 record
 literals and the `empty_records` assertion (still 21) were never updated, so
 `cargo test -p sqe-catalog` failed to build the test target. This branch adds the
 missing `trace_id` fields and corrects the counts (now 23 with `rows_written`).
+
+## 2026-07-13 Session Progress (SEC-03 shared-service-identity guard)
+
+Branch `fix/audit-sec03-shared-identity-guard`.
+
+SEC-03 is a deployment-posture issue, not a missing feature: SQE already ships
+per-identity auth (`oidc_password` per-user, `client_credentials_passthrough`
+per-connection). The risk is the config-held `client_credentials` provider,
+which obtains one server-baked service token and hands the SAME token to every
+connection, collapsing all users to one identity at Polaris/S3 and defeating
+per-user authorization.
+
+- Added `security.allow_shared_service_identity` (default `false`), mirroring the
+  existing `allow_insecure_transport` opt-out pattern.
+- `production_mode` validation now rejects a config-held
+  `AuthProviderConfig::ClientCredentials` provider unless the flag is set,
+  pointing operators to `oidc_password` / `client_credentials_passthrough`. The
+  per-connection `ClientCredentialsPassthrough` provider is explicitly NOT
+  flagged (it carries its own identity) - a regression test asserts this.
+- Env override `SQE_SECURITY__ALLOW_SHARED_SERVICE_IDENTITY`; documented in
+  `sqe.toml.example`.
+- Improve-not-break: no effect outside `production_mode`, the provider is not
+  removed, and a deliberate single-service deployment opts in via one flag
+  (visible in config diffs).
+- Verified: `cargo test -p sqe-core` (validate_production suite + 3 new tests) +
+  clippy green.
+
+Residual (genuinely architectural, not code): choosing `oidc_password` vs
+per-connection passthrough for a given tenant, and provisioning per-user IdP
+identities, remain deployment decisions.
 

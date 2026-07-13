@@ -2832,6 +2832,19 @@ pub struct SecurityConfig {
     /// cleartext and can be captured and replayed by an on-path observer.
     #[serde(default)]
     pub allow_insecure_transport: bool,
+    /// Opt-in escape hatch for the shared-service-identity auth mode (SEC-03).
+    /// The config-held `client_credentials` auth provider obtains one bearer
+    /// token from server-baked credentials and hands the SAME token to every
+    /// connection, so Polaris/S3 see one identity for all users and per-user
+    /// authorization at the data layer is lost. Leaving this `false` (the
+    /// default) makes `production_mode` refuse to start with such a provider,
+    /// steering multi-tenant deployments toward `oidc_password` (per-user) or
+    /// `client_credentials_passthrough` (per-connection service principal).
+    /// Set `true` only for a deliberate single-service deployment where every
+    /// caller legitimately shares one identity; the choice is then visible in
+    /// config diffs.
+    #[serde(default)]
+    pub allow_shared_service_identity: bool,
 }
 
 impl SecurityConfig {
@@ -3406,6 +3419,31 @@ impl SqeConfig {
             );
         }
 
+        // SEC-03: the config-held `client_credentials` provider hands one
+        // server-baked service token to every connection, collapsing all users
+        // to a single identity at Polaris/S3 and defeating per-user
+        // authorization. Reject it in production unless the operator explicitly
+        // acknowledges a single-shared-identity deployment. The per-connection
+        // `client_credentials_passthrough` provider (own creds per connection)
+        // is unaffected.
+        if !self.security.allow_shared_service_identity
+            && self
+                .auth
+                .providers
+                .iter()
+                .any(|p| matches!(p, AuthProviderConfig::ClientCredentials { .. }))
+        {
+            errors.push(
+                "production_mode: the config-held client_credentials auth provider \
+                 gives every connection one shared service identity (per-user \
+                 authorization at Polaris/S3 is lost). Use oidc_password \
+                 (per-user) or client_credentials_passthrough (per-connection), \
+                 or set security.allow_shared_service_identity = true to \
+                 acknowledge a deliberate single-service deployment."
+                    .to_string(),
+            );
+        }
+
         if !self.coordinator.worker_urls.is_empty()
             && self.coordinator.worker_secret.is_empty()
             && self.coordinator.allow_unauthenticated_workers
@@ -3544,6 +3582,10 @@ impl SqeConfig {
         env_override_bool(
             "SQE_SECURITY__ALLOW_INSECURE_TRANSPORT",
             &mut self.security.allow_insecure_transport,
+        );
+        env_override_bool(
+            "SQE_SECURITY__ALLOW_SHARED_SERVICE_IDENTITY",
+            &mut self.security.allow_shared_service_identity,
         );
 
         // Auth
@@ -4636,6 +4678,51 @@ mod tests {
             err.contains("security.allow_insecure_transport"),
             "got: {err}"
         );
+    }
+
+    #[test]
+    fn validate_production_rejects_shared_client_credentials_by_default() {
+        // SEC-03: config-held client_credentials = one shared identity for all.
+        let mut config = valid_production_config();
+        config.auth.providers = vec![AuthProviderConfig::ClientCredentials {
+            token_endpoint: "https://idp/token".to_string(),
+            client_id: "svc".to_string(),
+            client_secret: "secret".to_string(),
+        }];
+        let err = config.validate_production().unwrap_err().to_string();
+        assert!(
+            err.contains("allow_shared_service_identity")
+                && err.contains("client_credentials"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_production_accepts_shared_client_credentials_when_opted_in() {
+        // Deliberate single-service deployment: allowed with explicit opt-in.
+        let mut config = valid_production_config();
+        config.auth.providers = vec![AuthProviderConfig::ClientCredentials {
+            token_endpoint: "https://idp/token".to_string(),
+            client_id: "svc".to_string(),
+            client_secret: "secret".to_string(),
+        }];
+        config.security.allow_shared_service_identity = true;
+        assert!(config.validate_production().is_ok());
+    }
+
+    #[test]
+    fn validate_production_allows_client_credentials_passthrough() {
+        // Non-breakage: per-connection passthrough carries its OWN identity and
+        // must NOT be flagged by the SEC-03 guard.
+        let mut config = valid_production_config();
+        config.auth.providers = vec![AuthProviderConfig::ClientCredentialsPassthrough {
+            token_url: "https://idp/token".to_string(),
+            roles_claim: "realm_access.roles".to_string(),
+            subject_claim: "sub".to_string(),
+            scope: None,
+            fallthrough_on_reject: false,
+        }];
+        assert!(config.validate_production().is_ok());
     }
 
     #[test]
