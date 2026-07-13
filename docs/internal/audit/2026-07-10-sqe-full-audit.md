@@ -49,7 +49,7 @@
 □ Remove anonymous + bearer_passthrough from auth chain
 □ [rate_limit] enabled = true
 □ [coordinator.tls] + ingress TLS for Trino/Quack/web
-□ [storage.tvf] prefix allowlist; allow_local_paths = false
+□ [storage.tvf] prefix allowlist; allow_local_paths = false; allow_inline_credentials = false (unless users bring their own object-store creds)
 □ Non-default worker_secret
 □ bearer_token with audience + issuer; policy backend wired
 □ admin_roles configured
@@ -103,7 +103,7 @@
 | ID | Finding | Evidence |
 |----|---------|----------|
 | Q-01 | Coordinator god-crate | `write_handler.rs` 8,262 LOC; `query_handler.rs` 6,927 |
-| Q-02 | `panic!` on DML paths | 13 in `write_handler.rs` |
+| Q-02 | ~~`panic!` on DML paths~~ **INVALID** (2026-07-13) | All 13 `panic!` are in `write_handler.rs`'s `#[cfg(test)]` module (from line 6628); production DML code has 0 `panic!` / `.unwrap()` / `.expect()`. See progress note. |
 | Q-04 | Write-path memory safety not CI-validated | Stack-gated per `nextsteps.md` |
 | Q-05 | Distributed execution untested in default CI | `test_distributed_select` ignored |
 
@@ -595,4 +595,100 @@ per-user authorization.
 Residual (genuinely architectural, not code): choosing `oidc_password` vs
 per-connection passthrough for a given tenant, and provisioning per-user IdP
 identities, remain deployment decisions.
+
+## 2026-07-13 Session Progress (SEC-06 ingress TLS)
+
+Branch `fix/audit-sec06-ingress-tls`.
+
+SEC-06's recommended action is "ingress termination + allow_insecure_transport =
+false". The engine already enforces `security.allow_insecure_transport` (the
+production_mode validator rejects `true`) and supports native `[coordinator.tls]`
+for the Flight SQL gRPC path. The gap was in the Helm chart: it had NO ingress
+resource, so the recommended TLS-termination posture could not be deployed from
+the chart.
+
+- Added `deploy/helm/sqe/templates/ingress.yaml`: a standard
+  `networking.k8s.io/v1` Ingress gated by `ingress.enabled` (default `false`),
+  with `className`, `annotations`, host/path rules, and a `tls` block. Fronts the
+  coordinator's `trino-http` service port (the HTTP surface SEC-06 names:
+  Trino HTTP / web / Quack). Flight SQL gRPC is left to `[coordinator.tls]` or a
+  gRPC-aware ingress, documented in-template.
+- Added the `ingress:` block to `values.yaml` with a cert-manager annotation
+  example and a commented `tls:` stanza.
+- Validated: `helm template` renders 0 Ingress objects when disabled and a valid
+  TLS Ingress (correct coordinator/`trino-http` backend) when enabled;
+  `helm lint` clean.
+
+The engine listeners remain plaintext by design; native per-listener TLS on the
+axum servers was deliberately not added (larger, and off the audit's stated
+ingress-termination approach). Residual SEC-06 for operators: enable the ingress
+with a real cert + host and keep `allow_insecure_transport = false` (already on
+the production checklist).
+
+## 2026-07-13 Verification (Q-02 is a false finding)
+
+Branch `fix/audit-q02-false-finding`. No code change: Q-02 does not reproduce.
+
+`write_handler.rs` has exactly one `#[cfg(test)]` boundary, at line 6628. All 13
+`panic!` calls (lines 6647-8301) and all 127 `.unwrap()`/`.expect()` calls sit
+after it, inside test functions where they are ordinary assertions ("parse this
+SQL, panic if the AST is not the expected shape"). The production write path
+(lines 1-6627) contains **0** `panic!`, `unreachable!`, `assert!`, `.unwrap()`,
+or `.expect()`.
+
+Q-02 is a re-listing of a finding already disproven once: the 2026-06-26
+grep-based triage (see `nextsteps.md`) recorded that "every panic/unwrap finding
+hit `#[cfg(test)]` code" and closed them. The older `security_audit.md` cited
+`write_handler.rs:421,436 arrow_schema_to_iceberg(...).unwrap()`; those lines no
+longer exist and current production code has no such unwrap. Marking Q-02 invalid
+here and in `issue-groups.md` so it is not triaged a third time.
+
+
+## 2026-07-13 Session Progress (O7 observability dashboard)
+
+Branch `fix/audit-o7-observability-dashboard`. Closes the O7 gap ("Grafana
+dashboard: pool pressure + audit spool lag + lineage drops").
+
+- Added `deploy/observability/sqe-observability-dashboard.json`, an operational
+  dashboard complementing the perf-focused `sqe-benchmark-dashboard.json`. It is
+  auto-provisioned by the existing `grafana-dashboards.yml` file provider (all
+  JSON in the dashboards dir loads).
+- Panels use only metrics that actually exist today: `sqe_coordinator_memory_
+  pressure` / `_used` / `_limit` / `_rss_bytes` (pool pressure);
+  `sqe_{sort,join}_spill_{count,bytes}_total` (spill); `sqe_audit_export_spool_
+  lag_bytes`, `_records_total{status}`, `_batch_failures_total`,
+  `time() - _last_success_timestamp`, `_cursor_seq` (audit spool health);
+  `sqe_lineage_dropped_events_total`, `sqe_lineage_sink_errors_total` (lineage
+  drops); plus query rate + duration quantiles for context.
+- Thresholds encode the operational intent: spool-lag orange at 1 MiB / red at
+  10 MiB, last-successful-export age orange at 60s / red at 300s, any lineage
+  drop is red.
+
+## 2026-07-13 Session Progress (SEC-04 inline TVF credentials)
+
+Branch `fix/audit-sec04-tvf-inline-creds`.
+
+- Added `[storage.tvf] allow_inline_credentials` (default `true`, so no behavior
+  change out of the box). When set `false`, a TVF call carrying its own inline
+  credentials (`access_key`+`secret_key`, Azure key/SAS, or inline GCS key) no
+  longer bypasses `allowed_object_store_prefixes`: the read must still pass the
+  normal gate (prefix allowlist, `object_store_admin_roles`, or trusted-local).
+  Closes the SEC-04 "disable inline creds" option; a multi-tenant coordinator
+  can no longer be turned into an arbitrary object-store fetcher by any user who
+  supplies their own keys.
+- `TvfPolicy::check_object_store` now ANDs the inline-credential bypass with the
+  new flag; the denial message adapts (it no longer suggests inline creds as a
+  remedy when the bypass is disabled).
+- Manual `impl Default for TvfPolicy` (bypass enabled) so the serde default and
+  the Rust `Default` agree; documented in `sqe.toml.example`.
+- Production checklist gains `[storage.tvf] allow_inline_credentials = false`
+  for deployments that do not intend users to bring their own credentials. Not
+  hard-enforced by the `production_mode` validator (legitimate bring-your-own-
+  bucket workflows exist); left as an operator choice.
+- Verified: `cargo test -p sqe-core` (tvf suite, incl. 3 new tests) + clippy
+  green.
+
+Remaining SEC items: SEC-03 (per-user OIDC for client_credentials, architectural),
+SEC-06 (native TLS / ingress). O7 Grafana dashboard and the O3 slow-query
+tail-sampling (Collector config) also still open.
 

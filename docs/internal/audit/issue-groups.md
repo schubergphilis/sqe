@@ -79,7 +79,7 @@ Issues are grouped by theme. Each group gets an isolated git worktree under `.wo
 | ID | Severity | Issue | Notes |
 |----|----------|-------|-------|
 | Q-01 | Critical | Coordinator god-crate (`write_handler` 8K LOC) | Extract `sqe-write` crate |
-| Q-02 | High | 13 `panic!` in `write_handler` | Separate branch after DML audit |
+| Q-02 | ~~High~~ INVALID | ~~13 `panic!` in `write_handler`~~: all in `#[cfg(test)]`; production write path has 0 panic/unwrap/expect (verified 2026-07-13) | None; false finding (re-listed from closed 2026-06-26 triage) |
 | Q-04 | High | Write-path CI validation | Polaris+RustFS job |
 | Q-05 | High | Distributed CI smoke | Un-ignore distributed test |
 
