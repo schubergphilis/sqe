@@ -189,6 +189,16 @@ s3_path_style = true
 # so the opt-in is enabled here for dev. Remove it and configure
 # [coordinator.tls] before exposing the engine on an untrusted network.
 allow_insecure_transport = true  # dev only -- enable TLS for production
+#
+# allow_shared_service_identity (SEC-03): the config-held `client_credentials`
+# auth provider hands ONE server-baked service token to every connection, so
+# Polaris/S3 see a single identity for all users and per-user authorization at
+# the data layer is lost. In production_mode the engine refuses to start with
+# that provider unless this is set true. For multi-tenant access use
+# `oidc_password` (per-user) or `client_credentials_passthrough` (per-connection
+# service principal) instead. Set true only for a deliberate single-service
+# deployment where every caller legitimately shares one identity.
+# allow_shared_service_identity = false
 
 [policy]
 engine = "passthrough"
