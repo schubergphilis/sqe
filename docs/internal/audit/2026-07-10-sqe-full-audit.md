@@ -561,6 +561,35 @@ literals and the `empty_records` assertion (still 21) were never updated, so
 `cargo test -p sqe-catalog` failed to build the test target. This branch adds the
 missing `trace_id` fields and corrects the counts (now 23 with `rows_written`).
 
+## 2026-07-13 Session Progress (SEC-06 ingress TLS)
+
+Branch `fix/audit-sec06-ingress-tls`.
+
+SEC-06's recommended action is "ingress termination + allow_insecure_transport =
+false". The engine already enforces `security.allow_insecure_transport` (the
+production_mode validator rejects `true`) and supports native `[coordinator.tls]`
+for the Flight SQL gRPC path. The gap was in the Helm chart: it had NO ingress
+resource, so the recommended TLS-termination posture could not be deployed from
+the chart.
+
+- Added `deploy/helm/sqe/templates/ingress.yaml`: a standard
+  `networking.k8s.io/v1` Ingress gated by `ingress.enabled` (default `false`),
+  with `className`, `annotations`, host/path rules, and a `tls` block. Fronts the
+  coordinator's `trino-http` service port (the HTTP surface SEC-06 names:
+  Trino HTTP / web / Quack). Flight SQL gRPC is left to `[coordinator.tls]` or a
+  gRPC-aware ingress, documented in-template.
+- Added the `ingress:` block to `values.yaml` with a cert-manager annotation
+  example and a commented `tls:` stanza.
+- Validated: `helm template` renders 0 Ingress objects when disabled and a valid
+  TLS Ingress (correct coordinator/`trino-http` backend) when enabled;
+  `helm lint` clean.
+
+The engine listeners remain plaintext by design; native per-listener TLS on the
+axum servers was deliberately not added (larger, and off the audit's stated
+ingress-termination approach). Residual SEC-06 for operators: enable the ingress
+with a real cert + host and keep `allow_insecure_transport = false` (already on
+the production checklist).
+
 ## 2026-07-13 Verification (Q-02 is a false finding)
 
 Branch `fix/audit-q02-false-finding`. No code change: Q-02 does not reproduce.
