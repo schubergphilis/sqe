@@ -70,7 +70,7 @@ BENCH_BLOOM_FILTER="${BENCH_BLOOM_FILTER:-}"
 
 # Trino comparison mode: start a Trino container and validate results against it
 COMPARE_TRINO="${COMPARE_TRINO:-}"
-TRINO_PORT="38080"
+TRINO_PORT="${TRINO_PORT:-38080}"
 TRINO_IMAGE="${TRINO_IMAGE:-trinodb/trino:481}"
 # Optional container memory cap (e.g. TRINO_MEMORY=12g). The image sizes
 # the JVM heap at 80% of container memory; without a cap that is 80% of
@@ -236,7 +236,12 @@ if [ "$BENCH_WAREHOUSE" = "external" ]; then
     # writes, drop-with-purge), so it must carry the external endpoint
     # and credentials. Recreate so the env change applies; Polaris here
     # is in-memory, the bootstrap below repopulates it.
-    export POLARIS_S3_ENDPOINT="$BENCH_S3_ENDPOINT"
+    # BENCH_POLARIS_S3_ENDPOINT: how POLARIS (inside docker) reaches the
+    # warehouse when that differs from the host view. Needed when the
+    # external store runs natively on a macOS host: the host uses
+    # http://localhost:<port> while containers must use
+    # http://host.docker.internal:<port>.
+    export POLARIS_S3_ENDPOINT="${BENCH_POLARIS_S3_ENDPOINT:-$BENCH_S3_ENDPOINT}"
     export POLARIS_S3_ACCESS_KEY="$WH_S3_ACCESS_KEY"
     export POLARIS_S3_SECRET_KEY="$WH_S3_SECRET_KEY"
     export POLARIS_S3_REGION="$BENCH_S3_REGION"
