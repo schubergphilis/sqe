@@ -46,6 +46,15 @@ use datafusion::scalar::ScalarValue;
 use iceberg::expr::{DynamicPredicate, Predicate, Reference};
 use iceberg::spec::Datum;
 
+/// Default cap on the size of a runtime-filter membership set produced by
+/// [`convert_case`] (SQE PATCH sqe#369). Mirrors the `bloom_max_values`
+/// default: above this size neither the SBBF row-group evaluator (bails
+/// above `bloom_max_values`) nor stats-based `IN` pruning (bails above 200
+/// literals) can prune anything, so the converted `Predicate::Set` would only
+/// survive as a per-row parquet `RowFilter` — pure cost with no row-group
+/// benefit on large, non-selective join keys (the TPC-H q21/q12 regression).
+pub const DEFAULT_MAX_RUNTIME_FILTER_SET_VALUES: usize = 65536;
+
 /// Bridge that exposes a set of DataFusion runtime [`PhysicalExpr`]s
 /// (typically `DynamicFilterPhysicalExpr` from a `HashJoinExec` build
 /// side) to iceberg-rust's per-task scan pruning via the
@@ -66,20 +75,37 @@ use iceberg::spec::Datum;
 #[derive(Debug)]
 pub struct RuntimeFiltersDynamicPredicate {
     filters: Vec<Arc<dyn PhysicalExpr>>,
+    /// Cap on the per-column membership-set size produced from a partitioned
+    /// join's sealed CASE (sqe#369). Sourced from `bloom_max_values` at the
+    /// SQE callsite; the vendored `IcebergTableScan` path uses the default.
+    max_set_values: usize,
 }
 
 impl RuntimeFiltersDynamicPredicate {
     /// Wrap a set of runtime filters in an [`Arc`]'d
     /// [`DynamicPredicate`] suitable for
-    /// `TableScanBuilder::with_dynamic_predicate`.
+    /// `TableScanBuilder::with_dynamic_predicate`, using the default
+    /// membership-set cap ([`DEFAULT_MAX_RUNTIME_FILTER_SET_VALUES`]).
     pub fn new(filters: Vec<Arc<dyn PhysicalExpr>>) -> Arc<Self> {
-        Arc::new(Self { filters })
+        Self::new_with_max_set_values(filters, DEFAULT_MAX_RUNTIME_FILTER_SET_VALUES)
+    }
+
+    /// As [`new`](Self::new), but with an explicit membership-set cap so the
+    /// caller can align it with `[catalog.runtime_filters] bloom_max_values`.
+    pub fn new_with_max_set_values(
+        filters: Vec<Arc<dyn PhysicalExpr>>,
+        max_set_values: usize,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            filters,
+            max_set_values,
+        })
     }
 }
 
 impl DynamicPredicate for RuntimeFiltersDynamicPredicate {
     fn current(&self) -> Option<Predicate> {
-        convert_physical_filters_to_predicate(&self.filters)
+        convert_physical_filters_to_predicate_capped(&self.filters, self.max_set_values)
     }
 }
 
@@ -91,13 +117,25 @@ impl DynamicPredicate for RuntimeFiltersDynamicPredicate {
 pub fn convert_physical_filters_to_predicate(
     filters: &[Arc<dyn PhysicalExpr>],
 ) -> Option<Predicate> {
+    convert_physical_filters_to_predicate_capped(filters, DEFAULT_MAX_RUNTIME_FILTER_SET_VALUES)
+}
+
+/// As [`convert_physical_filters_to_predicate`], but caps the per-column
+/// membership set produced from a partitioned join's sealed CASE at
+/// `max_set_values` (sqe#369). A union larger than the cap drops that column
+/// (it cannot be row-group pruned anyway), restoring the pre-`df5c59d`
+/// behavior for large sets while keeping small selective sets.
+pub fn convert_physical_filters_to_predicate_capped(
+    filters: &[Arc<dyn PhysicalExpr>],
+    max_set_values: usize,
+) -> Option<Predicate> {
     filters
         .iter()
-        .filter_map(convert_physical)
+        .filter_map(|f| convert_physical(f, max_set_values))
         .reduce(Predicate::and)
 }
 
-fn convert_physical(expr: &Arc<dyn PhysicalExpr>) -> Option<Predicate> {
+fn convert_physical(expr: &Arc<dyn PhysicalExpr>, max_set_values: usize) -> Option<Predicate> {
     let any = expr.as_ref();
 
     // 1. DynamicFilterPhysicalExpr: unwrap to the current inner.
@@ -108,13 +146,13 @@ fn convert_physical(expr: &Arc<dyn PhysicalExpr>) -> Option<Predicate> {
         if is_literal_true(&inner) {
             return None;
         }
-        return convert_physical(&inner);
+        return convert_physical(&inner, max_set_values);
     }
 
     // 2. BinaryExpr: AND combines two predicates; comparisons against a
     //    literal map to iceberg::Predicate::Binary.
     if let Some(binary) = any.downcast_ref::<BinaryExpr>() {
-        return convert_binary(binary);
+        return convert_binary(binary, max_set_values);
     }
 
     // 3. InListExpr: IN-list of literals → Predicate::Set
@@ -128,7 +166,7 @@ fn convert_physical(expr: &Arc<dyn PhysicalExpr>) -> Option<Predicate> {
     //     ELSE false END`. Converted by unioning the per-arm membership
     //    sets into one `Predicate::Set` per column (sqe#369).
     if let Some(case) = any.downcast_ref::<CaseExpr>() {
-        return convert_case(case);
+        return convert_case(case, max_set_values);
     }
 
     None
@@ -154,7 +192,15 @@ fn convert_physical(expr: &Arc<dyn PhysicalExpr>) -> Option<Predicate> {
 ///   (`lit(true)` fallback arms, map-lookup pushdown for large build
 ///   sides, struct-keyed multi-column joins);
 /// - no single column is constrained by every arm (mixed-column arms).
-fn convert_case(case: &CaseExpr) -> Option<Predicate> {
+///
+/// Size cap (sqe#369): a column whose union exceeds `max_set_values` is
+/// dropped. Above that size the set can prune no row groups (the SBBF
+/// evaluator bails above `bloom_max_values`, stats-based `IN` bails above 200
+/// literals), so it would only survive as a per-row parquet `RowFilter` —
+/// pure cost with no pruning on large, non-selective join keys (TPC-H
+/// q21/q12). Dropping it returns the pre-`df5c59d` result (the CASE was
+/// untranslatable then) while small selective sets keep converting.
+fn convert_case(case: &CaseExpr, max_set_values: usize) -> Option<Predicate> {
     if let Some(else_expr) = case.else_expr() {
         if !is_literal_false(else_expr) {
             return None;
@@ -196,9 +242,23 @@ fn convert_case(case: &CaseExpr) -> Option<Predicate> {
 
     let mut result: Option<Predicate> = None;
     for col in common {
+        // Accumulate the union, short-circuiting the walk once it exceeds the
+        // cap: no point cloning the rest of a ~300K-key set we are going to
+        // drop. `> max_set_values` keeps a union of exactly the cap.
         let mut union: Vec<Datum> = Vec::new();
+        let mut over_cap = false;
         for arm in &arms {
             union.extend(arm[col].iter().cloned());
+            if union.len() > max_set_values {
+                over_cap = true;
+                break;
+            }
+        }
+        if over_cap {
+            // Too large to prune row groups; keeping it only buys a per-row
+            // RowFilter cost. Drop this column (sound: widens the
+            // over-approximation) and let the reader fall back.
+            continue;
         }
         let membership = if union.is_empty() {
             // Every arm carried an empty IN-list for this column:
@@ -212,6 +272,8 @@ fn convert_case(case: &CaseExpr) -> Option<Predicate> {
             None => membership,
         });
     }
+    // `None` when every common column was dropped: the reader falls back to
+    // the static predicate, exactly as before sqe#369 added the CASE arm.
     result
 }
 
@@ -278,14 +340,14 @@ fn collect_membership_sets(
     }
 }
 
-fn convert_binary(binary: &BinaryExpr) -> Option<Predicate> {
+fn convert_binary(binary: &BinaryExpr, max_set_values: usize) -> Option<Predicate> {
     use datafusion::logical_expr::Operator;
 
     match binary.op() {
         Operator::And => {
             // Best-effort: produce whichever side(s) translate.
-            let left = convert_physical(binary.left());
-            let right = convert_physical(binary.right());
+            let left = convert_physical(binary.left(), max_set_values);
+            let right = convert_physical(binary.right(), max_set_values);
             match (left, right) {
                 (Some(l), Some(r)) => Some(l.and(r)),
                 (Some(l), None) => Some(l),
@@ -296,8 +358,8 @@ fn convert_binary(binary: &BinaryExpr) -> Option<Predicate> {
         Operator::Or => {
             // Predicate::or requires both sides to translate; OR of
             // unknown loses correctness if we drop a branch.
-            let left = convert_physical(binary.left())?;
-            let right = convert_physical(binary.right())?;
+            let left = convert_physical(binary.left(), max_set_values)?;
+            let right = convert_physical(binary.right(), max_set_values)?;
             Some(left.or(right))
         }
         op @ (Operator::Eq
