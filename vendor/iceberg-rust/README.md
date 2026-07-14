@@ -132,9 +132,17 @@ them quickly.
    `crates/iceberg/src/scan/mod.rs`, plus the CASE-of-InLists union in
    `crates/integrations/datafusion/src/physical_plan/physical_to_predicate.rs`
    that lets a PARTITIONED hash join's sealed dynamic filter reach the
-   pruning paths as a single `Predicate::Set` per column. Behavioral
-   tests live in SQE at `crates/sqe-catalog/tests/bloom_probe_369.rs`.
-   Not filed upstream yet.
+   pruning paths as a single `Predicate::Set` per column. That union is
+   size-capped at `bloom_max_values` (plumbed via
+   `RuntimeFiltersDynamicPredicate::new_with_max_set_values`, default
+   `DEFAULT_MAX_RUNTIME_FILTER_SET_VALUES` = 65536): above the cap a set
+   prunes no row groups (SBBF bails above the cap, stats-`IN` above 200)
+   and would only survive as a per-row parquet `RowFilter`, so
+   `convert_case` drops the over-cap column and the reader falls back to
+   the static predicate. Without the cap, large non-selective join keys
+   (TPC-H q21/q12 at SF10) paid a giant RowFilter for zero pruning.
+   Behavioral tests live in SQE at
+   `crates/sqe-catalog/tests/bloom_probe_369.rs`. Not filed upstream yet.
 9. **Strict-metrics residual elimination**: scan planning now evaluates the
    snapshot predicate against each data file's metrics. When the strict
    evaluator proves every row matches, the `FileScanTask` carries no residual

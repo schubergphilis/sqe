@@ -1386,7 +1386,13 @@ impl ExecutionPlan for IcebergScanExec {
                     true
                 };
                 if register_tier1 {
-                    let dyn_pred = iceberg_datafusion::physical_plan::physical_to_predicate::RuntimeFiltersDynamicPredicate::new(pushed_down_filters.clone());
+                    // Cap the CASE-union membership set at `bloom_max_values`
+                    // (sqe#369): above it the set prunes no row groups and
+                    // would only cost a per-row RowFilter (TPC-H q21/q12).
+                    let dyn_pred = iceberg_datafusion::physical_plan::physical_to_predicate::RuntimeFiltersDynamicPredicate::new_with_max_set_values(
+                        pushed_down_filters.clone(),
+                        runtime_filter_bloom_max_values,
+                    );
                     sb = sb.with_dynamic_predicate(dyn_pred);
                 }
             }
