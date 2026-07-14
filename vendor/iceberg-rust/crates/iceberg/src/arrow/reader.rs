@@ -97,6 +97,24 @@ pub trait DecodeGate: Send + Sync + std::fmt::Debug {
         &self,
         estimated_bytes: u64,
     ) -> BoxFuture<'_, Result<Box<dyn std::any::Any + Send>>>;
+
+    /// SQE PATCH (sqe#scan-fetch-pipeline): admit the FETCH stage of a subtask (metadata
+    /// load + row-group column-chunk fetch + row-filter evaluation), whose
+    /// compressed input is approximately `estimated_bytes`. Only called on
+    /// the fetch-staged path ([`ArrowReaderBuilder::with_fetch_staging`]).
+    /// Implementations bound the number of subtasks concurrently in their
+    /// fetch stage (typically several times the decode permits, since the
+    /// fetch stage is I/O-latency-bound) and reserve the fetched bytes
+    /// against a memory pool. The default implementation admits
+    /// immediately with no bound, matching the pre-staging behaviour for
+    /// gates that only implement `admit`.
+    fn admit_fetch(
+        &self,
+        estimated_bytes: u64,
+    ) -> BoxFuture<'_, Result<Box<dyn std::any::Any + Send>>> {
+        let _ = estimated_bytes;
+        Box::pin(async { Ok(Box::new(()) as Box<dyn std::any::Any + Send>) })
+    }
 }
 
 /// Builder to create ArrowReader
@@ -113,6 +131,8 @@ pub struct ArrowReaderBuilder {
     // SQE PATCH (sqe#369): parquet bloom-filter (SBBF) row-group probing.
     bloom_filter_probing_enabled: bool,
     bloom_probe_max_values: usize,
+    // SQE PATCH (sqe#scan-fetch-pipeline): fetch/decode pipelining. `0` disables staging.
+    fetch_ahead: usize,
 }
 
 impl ArrowReaderBuilder {
@@ -133,7 +153,29 @@ impl ArrowReaderBuilder {
             bloom_filter_probing_enabled: true,
             bloom_probe_max_values:
                 crate::expr::sbbf_row_group_evaluator::DEFAULT_BLOOM_PROBE_MAX_VALUES,
+            fetch_ahead: 0,
         }
+    }
+
+    /// SQE PATCH (sqe#scan-fetch-pipeline): enable fetch/decode pipelining with up to
+    /// `fetch_ahead` subtasks per stream in their fetch stage. `0`
+    /// (default) keeps the single-stage behaviour, where one admission
+    /// gates a subtask's whole fetch + decode + emit lifetime.
+    ///
+    /// The single-stage path holds a decode permit across the subtask's
+    /// row-group FETCH, so in-flight I/O is capped at the decode permit
+    /// count even though the fetch stage is latency-bound, not CPU-bound
+    /// (measured: SSB SF10 star joins run ~11 permits deep with every
+    /// permit parked in the fetch await, sustaining only ~350MB/s).
+    /// Staged, a subtask needs only a fetch admission
+    /// ([`DecodeGate::admit_fetch`]) through metadata load, column-chunk
+    /// fetch, and row-filter evaluation, and swaps it for a decode
+    /// admission ([`DecodeGate::admit`]) before draining the decoded
+    /// batches, so I/O depth and decode parallelism are bounded
+    /// independently.
+    pub fn with_fetch_ahead(mut self, fetch_ahead: usize) -> Self {
+        self.fetch_ahead = fetch_ahead;
+        self
     }
 
     /// SQE PATCH (sqe#369): enable or disable parquet bloom-filter
@@ -234,6 +276,7 @@ impl ArrowReaderBuilder {
             decode_gate: self.decode_gate,
             bloom_filter_probing_enabled: self.bloom_filter_probing_enabled,
             bloom_probe_max_values: self.bloom_probe_max_values,
+            fetch_ahead: self.fetch_ahead,
         }
     }
 }
@@ -267,6 +310,8 @@ pub struct ArrowReader {
     /// SQE PATCH (sqe#369): see
     /// [`ArrowReaderBuilder::with_bloom_probe_max_values`].
     bloom_probe_max_values: usize,
+    /// SQE PATCH (sqe#scan-fetch-pipeline): see [`ArrowReaderBuilder::with_fetch_ahead`].
+    fetch_ahead: usize,
 }
 
 impl ArrowReader {
@@ -289,6 +334,10 @@ impl ArrowReader {
         // SQE PATCH (sqe#369)
         let bloom_filter_probing_enabled = self.bloom_filter_probing_enabled;
         let bloom_probe_max_values = self.bloom_probe_max_values;
+        // SQE PATCH (sqe#scan-fetch-pipeline): staged mode needs a decode gate to bound the
+        // fetch stage; without one the builder flag is ignored.
+        let fetch_staged = self.fetch_ahead > 0 && self.decode_gate.is_some();
+        let fetch_ahead = self.fetch_ahead;
 
         // Per-scan I/O metrics.  Cloned into both the data-file path
         // (`process_file_scan_task`) and the delete-file loader so the
@@ -351,7 +400,23 @@ impl ArrowReader {
             let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<RecordBatch>>(
                 concurrency_limit_data_files.saturating_mul(2),
             );
-            let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency_limit_data_files));
+            // SQE PATCH (sqe#scan-fetch-pipeline): staged, the per-stream dispatch bound is
+            // the fetch depth (the gate's decode permits still bound decode
+            // globally); a single-partition scan would otherwise cap its
+            // fetch pipeline at the decode-permit count.
+            let dispatch_limit = if fetch_staged {
+                fetch_ahead.max(concurrency_limit_data_files)
+            } else {
+                concurrency_limit_data_files
+            };
+            let semaphore = Arc::new(tokio::sync::Semaphore::new(dispatch_limit));
+            // SQE PATCH (sqe#scan-fetch-pipeline): stage-timing instrumentation. Counts the
+            // subtask workers currently between spawn and completion so a
+            // debug trace shows how much of the configured concurrency is
+            // actually in flight. Timing is a handful of `Instant::now()`
+            // calls per subtask/batch; the `debug!` lines are no-ops unless
+            // `iceberg::arrow::reader=debug` is enabled.
+            let inflight_workers = Arc::new(AtomicU64::new(0));
             crate::runtime::spawn(async move {
                 let mut tasks = std::pin::pin!(tasks);
                 'outer: while let Some(task_res) = tasks.next().await {
@@ -372,11 +437,20 @@ impl ArrowReader {
                         if tx.is_closed() {
                             break 'outer;
                         }
+                        // SQE PATCH (sqe#scan-fetch-pipeline): time the two dispatch waits.
+                        let estimate = if subtask.length > 0 {
+                            subtask.length
+                        } else {
+                            subtask.file_size_in_bytes
+                        };
+                        let dispatch_t = std::time::Instant::now();
                         let permit = match semaphore.clone().acquire_owned().await {
                             Ok(permit) => permit,
                             // The semaphore is never closed; bail defensively.
                             Err(_) => break 'outer,
                         };
+                        let wait_permit_ms = dispatch_t.elapsed().as_secs_f64() * 1e3;
+                        let admit_t = std::time::Instant::now();
                         // SQE PATCH (sqe#367): gate admission AFTER the
                         // per-read permit so the wait order is always
                         // per-read -> gate; both release together when the
@@ -384,14 +458,22 @@ impl ArrowReader {
                         // memory-pool reservation failure) fails the scan
                         // with the gate's typed error instead of decoding
                         // into an unaccounted allocation.
+                        //
+                        // SQE PATCH (sqe#scan-fetch-pipeline): on the staged path the
+                        // dispatch admission is the FETCH admission
+                        // (memory for the compressed bytes, fetch-depth
+                        // permit); the worker swaps it for a full decode
+                        // admission once the row group is fetched and
+                        // row-filtered. Unstaged keeps the single decode
+                        // admission across the whole subtask.
                         let admission = match &decode_gate {
                             Some(gate) => {
-                                let estimate = if subtask.length > 0 {
-                                    subtask.length
+                                let admit_result = if fetch_staged {
+                                    gate.admit_fetch(estimate).await
                                 } else {
-                                    subtask.file_size_in_bytes
+                                    gate.admit(estimate).await
                                 };
-                                match gate.admit(estimate).await {
+                                match admit_result {
                                     Ok(guard) => Some(guard),
                                     Err(err) => {
                                         let _ = tx.send(Err(err)).await;
@@ -401,6 +483,8 @@ impl ArrowReader {
                             }
                             None => None,
                         };
+                        let wait_admit_ms = admit_t.elapsed().as_secs_f64() * 1e3;
+                        let decode_gate = decode_gate.clone();
                         let tx = tx.clone();
                         let file_io = file_io.clone();
                         let delete_file_loader = delete_file_loader.clone();
@@ -408,12 +492,28 @@ impl ArrowReader {
                         let bytes_read = bytes_read.clone();
                         // SQE PATCH (sqe#369)
                         let row_groups_pruned_bloom = row_groups_pruned_bloom.clone();
+                        // SQE PATCH (sqe#scan-fetch-pipeline)
+                        let inflight_workers = Arc::clone(&inflight_workers);
+                        let subtask_path = subtask.data_file_path.clone();
+                        let subtask_start = subtask.start;
+                        let subtask_len = subtask.length;
                         crate::runtime::spawn(async move {
                             let _permit = permit;
-                            // SQE PATCH (sqe#367): held until every batch of
+                            // SQE PATCH (sqe#367): unstaged, this is the
+                            // decode admission, held until every batch of
                             // this subtask has been sent, so the gate's
                             // reservation covers the decode working set.
-                            let _admission = admission;
+                            // SQE PATCH (sqe#scan-fetch-pipeline): staged, this is the
+                            // FETCH admission; it is dropped once the
+                            // worker swaps to a decode admission below.
+                            let mut admission = admission;
+                            // SQE PATCH (sqe#scan-fetch-pipeline): per-stage timing. `open`
+                            // covers metadata load + filter/bloom setup,
+                            // `first_next` is dominated by the row-group
+                            // data fetch, later `next`s are decode, `send`
+                            // is emit backpressure.
+                            let inflight = inflight_workers.fetch_add(1, Ordering::Relaxed) + 1;
+                            let open_t = std::time::Instant::now();
                             let stream = Self::process_file_scan_task(
                                 subtask,
                                 batch_size,
@@ -429,18 +529,90 @@ impl ArrowReader {
                                 row_groups_pruned_bloom,
                             )
                             .await;
+                            let open_ms = open_t.elapsed().as_secs_f64() * 1e3;
                             match stream {
                                 Ok(mut stream) => {
-                                    while let Some(batch) = stream.next().await {
+                                    let mut first_next_ms = 0f64;
+                                    let mut decode_ms = 0f64;
+                                    let mut send_ms = 0f64;
+                                    let mut wait_decode_ms = 0f64;
+                                    let mut batches: u64 = 0;
+                                    loop {
+                                        let next_t = std::time::Instant::now();
+                                        let item = stream.next().await;
+                                        let next_ms = next_t.elapsed().as_secs_f64() * 1e3;
+                                        if batches == 0 {
+                                            first_next_ms = next_ms;
+                                            // SQE PATCH (sqe#scan-fetch-pipeline): the first
+                                            // poll fetched and row-filtered
+                                            // the subtask's row groups. On
+                                            // the staged path, swap the
+                                            // fetch admission for a decode
+                                            // admission (permit + decoded
+                                            // working-set reservation)
+                                            // before draining batches. The
+                                            // fetch admission is held until
+                                            // the decode admission is
+                                            // granted so the fetched bytes
+                                            // stay accounted and the
+                                            // pipeline depth stays capped
+                                            // at the fetch-permit count.
+                                            if fetch_staged {
+                                                if let Some(gate) = &decode_gate {
+                                                    let wait_t = std::time::Instant::now();
+                                                    match gate.admit(estimate).await {
+                                                        Ok(decode_admission) => {
+                                                            admission = Some(decode_admission);
+                                                        }
+                                                        Err(err) => {
+                                                            let _ = tx.send(Err(err)).await;
+                                                            inflight_workers
+                                                                .fetch_sub(1, Ordering::Relaxed);
+                                                            return;
+                                                        }
+                                                    }
+                                                    wait_decode_ms =
+                                                        wait_t.elapsed().as_secs_f64() * 1e3;
+                                                }
+                                            }
+                                        } else {
+                                            decode_ms += next_ms;
+                                        }
+                                        let Some(batch) = item else { break };
+                                        batches += 1;
+                                        let send_t = std::time::Instant::now();
                                         if tx.send(batch).await.is_err() {
+                                            inflight_workers.fetch_sub(1, Ordering::Relaxed);
                                             return; // consumer dropped
                                         }
+                                        send_ms += send_t.elapsed().as_secs_f64() * 1e3;
                                     }
+                                    tracing::debug!(
+                                        path = %subtask_path,
+                                        start = subtask_start,
+                                        len = subtask_len,
+                                        staged = fetch_staged,
+                                        inflight,
+                                        wait_permit_ms,
+                                        wait_admit_ms,
+                                        wait_decode_ms,
+                                        open_ms,
+                                        first_next_ms,
+                                        decode_ms,
+                                        send_ms,
+                                        batches,
+                                        "scan subtask stage timing"
+                                    );
+                                    // Read after the drain loop so the
+                                    // admission guard visibly lives to the
+                                    // end of the subtask.
+                                    drop(admission);
                                 }
                                 Err(err) => {
                                     let _ = tx.send(Err(err)).await;
                                 }
                             }
+                            inflight_workers.fetch_sub(1, Ordering::Relaxed);
                         });
                     }
                 }

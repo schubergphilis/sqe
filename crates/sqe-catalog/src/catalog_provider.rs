@@ -148,6 +148,9 @@ pub struct SqeCatalogProvider {
     /// filters, propagated downstream.
     runtime_filter_bloom_probe: bool,
     runtime_filter_bloom_max_values: usize,
+    /// Fetch/decode pipelining depth (sqe#scan-fetch-pipeline); see
+    /// `SqeTableProvider::with_scan_fetch_ahead`.
+    scan_fetch_ahead: Option<usize>,
 }
 
 impl std::fmt::Debug for SqeCatalogProvider {
@@ -264,6 +267,7 @@ impl SqeCatalogProvider {
             runtime_filter_wait_ms: crate::iceberg_scan::DEFAULT_RUNTIME_FILTER_WAIT_MS,
             runtime_filter_bloom_probe: true,
             runtime_filter_bloom_max_values: 65536,
+            scan_fetch_ahead: None,
         })
     }
 
@@ -324,6 +328,15 @@ impl SqeCatalogProvider {
         self
     }
 
+    /// Fetch/decode pipelining depth (sqe#scan-fetch-pipeline), from `[catalog]
+    /// scan_fetch_ahead`. `None` keeps the scan default (3x cores);
+    /// `Some(0)` disables staging.
+    #[must_use = "with_scan_fetch_ahead consumes self; bind the returned provider"]
+    pub fn with_scan_fetch_ahead(mut self, fetch_ahead: Option<usize>) -> Self {
+        self.scan_fetch_ahead = fetch_ahead;
+        self
+    }
+
     /// Create a catalog provider with pre-populated namespace names.
     /// Useful when the namespace list is already known.
     pub fn with_namespaces(
@@ -350,6 +363,7 @@ impl SqeCatalogProvider {
             runtime_filter_wait_ms: crate::iceberg_scan::DEFAULT_RUNTIME_FILTER_WAIT_MS,
             runtime_filter_bloom_probe: true,
             runtime_filter_bloom_max_values: 65536,
+            scan_fetch_ahead: None,
         }
     }
 
@@ -460,6 +474,7 @@ impl CatalogProvider for SqeCatalogProvider {
             self.runtime_filter_uniform_threshold,
         );
         provider = provider.with_runtime_filter_wait_ms(self.runtime_filter_wait_ms);
+        provider = provider.with_scan_fetch_ahead(self.scan_fetch_ahead);
         provider = provider.with_runtime_filter_bloom(
             self.runtime_filter_bloom_probe,
             self.runtime_filter_bloom_max_values,

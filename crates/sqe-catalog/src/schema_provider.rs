@@ -61,6 +61,9 @@ pub struct SqeSchemaProvider {
     /// filters, propagated to each `SqeTableProvider`.
     runtime_filter_bloom_probe: bool,
     runtime_filter_bloom_max_values: usize,
+    /// Fetch/decode pipelining depth (sqe#scan-fetch-pipeline); see
+    /// `SqeTableProvider::with_scan_fetch_ahead`.
+    scan_fetch_ahead: Option<usize>,
     /// Short-TTL cache of table_names() results so repeated planning
     /// lookups during a single dbt run do not pay two REST round trips
     /// per call.
@@ -93,6 +96,7 @@ impl SqeSchemaProvider {
             runtime_filter_wait_ms: crate::iceberg_scan::DEFAULT_RUNTIME_FILTER_WAIT_MS,
             runtime_filter_bloom_probe: true,
             runtime_filter_bloom_max_values: 65536,
+            scan_fetch_ahead: None,
             table_names_cache,
         }
     }
@@ -149,6 +153,15 @@ impl SqeSchemaProvider {
     pub fn with_runtime_filter_bloom(mut self, enabled: bool, max_values: usize) -> Self {
         self.runtime_filter_bloom_probe = enabled;
         self.runtime_filter_bloom_max_values = max_values;
+        self
+    }
+
+    /// Fetch/decode pipelining depth (sqe#scan-fetch-pipeline), forwarded to each table
+    /// provider. `None` keeps the scan default (3x cores); `Some(0)`
+    /// disables staging.
+    #[must_use = "with_scan_fetch_ahead consumes self; bind the returned provider"]
+    pub fn with_scan_fetch_ahead(mut self, fetch_ahead: Option<usize>) -> Self {
+        self.scan_fetch_ahead = fetch_ahead;
         self
     }
 
@@ -267,6 +280,7 @@ impl SchemaProvider for SqeSchemaProvider {
                                 self.runtime_filter_uniform_threshold,
                             )
                             .with_runtime_filter_wait_ms(self.runtime_filter_wait_ms)
+                            .with_scan_fetch_ahead(self.scan_fetch_ahead)
                             .with_runtime_filter_bloom(
                                 self.runtime_filter_bloom_probe,
                                 self.runtime_filter_bloom_max_values,

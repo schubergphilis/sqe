@@ -79,6 +79,9 @@ pub struct TableScanBuilder<'a> {
     bloom_filter_probing_enabled: bool,
     /// SQE PATCH (sqe#369): probe-cost cap, forwarded to the arrow reader.
     bloom_probe_max_values: usize,
+    /// SQE PATCH (sqe#scan-fetch-pipeline): fetch/decode pipelining depth, forwarded to
+    /// the arrow reader. `0` disables staging.
+    fetch_ahead: usize,
 }
 
 impl<'a> TableScanBuilder<'a> {
@@ -105,7 +108,17 @@ impl<'a> TableScanBuilder<'a> {
             bloom_filter_probing_enabled: true,
             bloom_probe_max_values:
                 crate::expr::sbbf_row_group_evaluator::DEFAULT_BLOOM_PROBE_MAX_VALUES,
+            fetch_ahead: 0,
         }
+    }
+
+    /// SQE PATCH (sqe#scan-fetch-pipeline): enable fetch/decode pipelining with up to
+    /// `fetch_ahead` subtasks per output stream in their fetch stage.
+    /// `0` (default) keeps single-stage admission. See
+    /// [`crate::arrow::ArrowReaderBuilder::with_fetch_ahead`].
+    pub fn with_fetch_ahead(mut self, fetch_ahead: usize) -> Self {
+        self.fetch_ahead = fetch_ahead;
+        self
     }
 
     /// SQE PATCH (sqe#367): attach a [`DecodeGate`] consulted before each
@@ -325,6 +338,7 @@ impl<'a> TableScanBuilder<'a> {
                         decode_gate: self.decode_gate.clone(),
                         bloom_filter_probing_enabled: self.bloom_filter_probing_enabled,
                         bloom_probe_max_values: self.bloom_probe_max_values,
+                        fetch_ahead: self.fetch_ahead,
                     });
                 };
                 current_snapshot_id.clone()
@@ -444,6 +458,7 @@ impl<'a> TableScanBuilder<'a> {
             decode_gate: self.decode_gate,
             bloom_filter_probing_enabled: self.bloom_filter_probing_enabled,
             bloom_probe_max_values: self.bloom_probe_max_values,
+            fetch_ahead: self.fetch_ahead,
         })
     }
 }
@@ -494,6 +509,9 @@ pub struct TableScan {
     /// SQE PATCH (sqe#369): probe-cost cap (see
     /// [`TableScanBuilder::with_bloom_probe_max_values`]).
     bloom_probe_max_values: usize,
+    /// SQE PATCH (sqe#scan-fetch-pipeline): fetch/decode pipelining depth (see
+    /// [`TableScanBuilder::with_fetch_ahead`]). Forwarded to the reader.
+    fetch_ahead: usize,
 }
 
 impl TableScan {
@@ -633,7 +651,8 @@ impl TableScan {
             .with_task_split_target_size(self.task_split_target_size)
             // SQE PATCH (sqe#369)
             .with_bloom_filter_probing_enabled(self.bloom_filter_probing_enabled)
-            .with_bloom_probe_max_values(self.bloom_probe_max_values);
+            .with_bloom_probe_max_values(self.bloom_probe_max_values)
+            .with_fetch_ahead(self.fetch_ahead);
 
         if let Some(batch_size) = self.batch_size {
             arrow_reader_builder = arrow_reader_builder.with_batch_size(batch_size);

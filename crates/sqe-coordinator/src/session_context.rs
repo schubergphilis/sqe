@@ -96,6 +96,9 @@ pub(crate) async fn build_catalog_provider(
         cat_cfg.runtime_filters.bloom_probe,
         cat_cfg.runtime_filters.bloom_max_values,
     );
+    // sqe#scan-fetch-pipeline: fetch/decode pipelining depth for the scan's subtask fetch
+    // stage. Unset keeps the scan default (3x cores); 0 disables staging.
+    catalog_provider = catalog_provider.with_scan_fetch_ahead(cat_cfg.scan_fetch_ahead);
 
     Ok((catalog_provider, session_catalog))
 }
