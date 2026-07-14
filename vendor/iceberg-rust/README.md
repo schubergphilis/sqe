@@ -143,7 +143,38 @@ them quickly.
    (TPC-H q21/q12 at SF10) paid a giant RowFilter for zero pruning.
    Behavioral tests live in SQE at
    `crates/sqe-catalog/tests/bloom_probe_369.rs`. Not filed upstream yet.
-9. **Strict-metrics residual elimination**: scan planning now evaluates the
+9. **Fetch/decode pipelining on the parallel read path (SQE
+   scan-fetch-pipeline; issue number assigned at MR time)**: the sqe#367
+   decode admission used to be acquired at subtask dispatch and held
+   across the subtask's WHOLE fetch + decode + emit lifetime, so
+   in-flight object-store I/O was capped at the decode-permit count
+   (`num_cpus`) even though the fetch stage (metadata load, row-group
+   column-chunk fetch, RowFilter evaluation) is store-latency-bound, not
+   CPU-bound. Measured on SSB SF10 star joins every permit parked in the
+   fetch await and the scan sustained ~350MB/s with 1.5 of 11 cores
+   busy. Staged (`ArrowReaderBuilder::with_fetch_ahead(n)` /
+   `TableScanBuilder::with_fetch_ahead(n)`, default 0 = off, upstream
+   behavior unchanged): dispatch acquires a FETCH admission via the new
+   `DecodeGate::admit_fetch` (default impl = unbounded no-op, so gates
+   that only implement `admit` keep pre-staging semantics), and the
+   worker swaps it for the full decode admission (`DecodeGate::admit`)
+   after the first stream poll (which performs the row-group fetch and
+   row filtering), before draining decoded batches. The fetch admission
+   is held until the decode admission is granted so fetched bytes stay
+   memory-accounted and pipeline depth stays capped. The per-stream
+   dispatch semaphore widens to `max(fetch_ahead,
+   concurrency_limit_data_files)` in staged mode. Includes debug-gated
+   per-subtask stage timing (`scan subtask stage timing` under
+   `iceberg::arrow::reader=debug`: dispatch waits, open, first poll,
+   decode, emit-park, in-flight gauge). SQE bounds the fetch stage in
+   `sqe-catalog::scan_memory::ScanDecodeGate::admit_fetch` (scan-wide
+   fetch permits, 1x compressed-byte reservation) and plumbs the depth
+   from `[catalog] scan_fetch_ahead` (unset = 3x cores, `0` = staging
+   off, env `SQE_CATALOG__SCAN_FETCH_AHEAD`). All sites marked
+   `SQE PATCH (sqe#scan-fetch-pipeline)`. Files:
+   `crates/iceberg/src/arrow/reader.rs`,
+   `crates/iceberg/src/scan/mod.rs`. Not filed upstream yet.
+10. **Strict-metrics residual elimination**: scan planning now evaluates the
    snapshot predicate against each data file's metrics. When the strict
    evaluator proves every row matches, the `FileScanTask` carries no residual
    predicate and the Arrow reader avoids redundant row-level evaluation. An
