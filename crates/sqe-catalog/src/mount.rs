@@ -238,6 +238,14 @@ async fn build_iceberg_rest(
         props.insert("prefix".to_string(), prefix.to_string());
     }
 
+    // S3 FileIO config for non-AWS endpoints (RustFS, StorageGRID, ...).
+    // Without these, the manifest-list/data-file reads fall back to the
+    // ambient AWS credential chain and fail with "region is missing" against
+    // a custom endpoint. Absent options leave that fallback in place.
+    for (k, v) in s3_props_from_options(options) {
+        props.insert(k, v);
+    }
+
     let catalog = RestCatalogBuilder::default()
         .load("sqe-attached-rest".to_string(), props)
         .await
@@ -253,6 +261,26 @@ async fn build_iceberg_rest(
     _secrets: &SecretStore,
 ) -> Result<Arc<dyn iceberg::Catalog>, String> {
     Err("TYPE iceberg_rest requires the `rest` cargo feature on sqe-catalog".to_string())
+}
+
+/// Map ATTACH `S3_*` options to the `s3.*` catalog FileIO props the REST
+/// catalog builder consumes (mirrors `rest_catalog.rs:868-894`). Only
+/// present options produce props; absent ones are skipped so ambient config
+/// still applies as a fallback.
+fn s3_props_from_options(options: &BTreeMap<String, OptionValue>) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for (opt_key, prop_key) in [
+        ("S3_ENDPOINT", "s3.endpoint"),
+        ("S3_REGION", "s3.region"),
+        ("S3_ACCESS_KEY", "s3.access-key-id"),
+        ("S3_SECRET_KEY", "s3.secret-access-key"),
+        ("S3_PATH_STYLE", "s3.path-style-access"),
+    ] {
+        if let Some(v) = options.get(opt_key).and_then(OptionValue::as_str) {
+            out.push((prop_key.to_string(), v.to_string()));
+        }
+    }
+    out
 }
 
 /// Resolve a `SECRET <name>` option against the secret store and
@@ -596,4 +624,53 @@ async fn build_hms(
     _secrets: &SecretStore,
 ) -> Result<Arc<dyn iceberg::Catalog>, String> {
     Err("TYPE hms requires the `hms` cargo feature on sqe-catalog".to_string())
+}
+
+#[cfg(test)]
+mod s3_option_tests {
+    use std::collections::BTreeMap;
+
+    use super::*;
+
+    fn opt(s: &str) -> OptionValue {
+        OptionValue::String(s.to_string())
+    }
+
+    #[test]
+    fn s3_options_map_to_props() {
+        let mut o = BTreeMap::new();
+        o.insert("S3_ENDPOINT".to_string(), opt("http://localhost:19000"));
+        o.insert("S3_REGION".to_string(), opt("us-east-1"));
+        o.insert("S3_ACCESS_KEY".to_string(), opt("ak"));
+        o.insert("S3_SECRET_KEY".to_string(), opt("sk"));
+        o.insert("S3_PATH_STYLE".to_string(), opt("true"));
+        let props: std::collections::HashMap<_, _> =
+            s3_props_from_options(&o).into_iter().collect();
+        assert_eq!(
+            props.get("s3.endpoint").map(String::as_str),
+            Some("http://localhost:19000")
+        );
+        assert_eq!(
+            props.get("s3.region").map(String::as_str),
+            Some("us-east-1")
+        );
+        assert_eq!(
+            props.get("s3.access-key-id").map(String::as_str),
+            Some("ak")
+        );
+        assert_eq!(
+            props.get("s3.secret-access-key").map(String::as_str),
+            Some("sk")
+        );
+        assert_eq!(
+            props.get("s3.path-style-access").map(String::as_str),
+            Some("true")
+        );
+    }
+
+    #[test]
+    fn absent_s3_options_yield_no_props() {
+        let o: BTreeMap<String, OptionValue> = BTreeMap::new();
+        assert!(s3_props_from_options(&o).is_empty());
+    }
 }
