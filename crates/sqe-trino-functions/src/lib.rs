@@ -20,6 +20,7 @@ pub mod aggregates;
 pub mod central_moments;
 pub mod coverage_fns;
 pub(crate) mod helpers;
+pub mod higher_order;
 pub mod histogram;
 pub mod map_aggregates;
 pub mod scalar_fns;
@@ -28,3 +29,15 @@ pub mod trino_functions_ext;
 
 pub use trino_functions::register_trino_functions;
 pub use trino_functions_ext::register_extended_trino_functions;
+
+/// Test-only session context that mirrors the SQL dialect the SQE coordinator
+/// runs in production (DuckDB, for `x -> expr` lambda parsing; see #354). Every
+/// UDF test builds its context through here so the suite validates these
+/// functions under the same parser real queries hit, catching any dialect-level
+/// parse divergence (reserved-word collisions, call-syntax changes).
+#[cfg(test)]
+pub(crate) fn duckdb_test_ctx() -> datafusion::prelude::SessionContext {
+    use datafusion::prelude::{SessionConfig, SessionContext};
+    let cfg = SessionConfig::new().set_str("datafusion.sql_parser.dialect", "DuckDB");
+    SessionContext::new_with_config(cfg)
+}

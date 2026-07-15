@@ -21,7 +21,7 @@ SQE is built on **Apache DataFusion 54** which provides the SQL execution engine
 | UPDATE | ✅ CoW + MoR (V12) | ✅ | ✅ | ✅ |
 | PIVOT/UNPIVOT | ❌ | ❌ | ⚠️ PIVOT only | ✅ |
 | QUALIFY | ❌ | ❌ | ❌ | ✅ |
-| Lambda expressions | ❌ | ✅ | ✅ | ✅ |
+| Lambda expressions | ✅ (array higher-order) | ✅ | ✅ | ✅ |
 | GROUPING SETS | ✅ | ✅ | ✅ | ✅ |
 | Iceberg time travel | ✅ FOR VERSION / SYSTEM\_TIME AS OF | ✅ | ✅ | ⚠️ Read-only via extension |
 | Iceberg branches & tags | ✅ ALTER TABLE CREATE BRANCH / TAG | ⚠️ Limited | ✅ | ❌ |
@@ -312,7 +312,7 @@ FROM orders;
 | `MAP(keys, values)` | ✅ | ✅ | ✅ |
 | `MAP_KEYS` / `MAP_VALUES` | ✅ | ✅ | ✅ |
 | `MAP_EXTRACT` | ✅ | ✅ | ✅ |
-| Lambda (`x -> x + 1`) | ❌ | ✅ | ✅ |
+| Lambda (`x -> x + 1`) | ✅ (array higher-order) | ✅ | ✅ |
 
 ---
 
@@ -452,7 +452,7 @@ The V8-V12 audit closed the file-format TVF and httpfs / hf:// gaps. SQE now mat
 The V12.x roadmap and parser-blocked items both feed this list. None of these are on the immediate roadmap.
 
 1. **PIVOT / UNPIVOT / QUALIFY / ASOF JOIN / FROM-first syntax**: DataFusion parser does not support. Tracked upstream.
-2. **List comprehensions and lambda expressions**: same, parser-blocked.
+2. **List comprehensions**: no DataFusion primitive. Array lambdas all work now: SQE parses with the DuckDB dialect. `filter` / `transform` alias DataFusion 54's `array_filter` / `array_transform`, `any_match` is `array_any_match`, and `all_match` / `none_match` / `reduce` are SQE UDFs on the same machinery.
 3. **Spatial, vector search, full-text search, Excel, Postgres scanner**: out of scope for our positioning. Use the right tool for each.
 4. **A 30 MB binary**: SQE's embedded build lands around 180 MB. The floor is higher because DataFusion + iceberg-rust + AWS SDK + delta-rs add up.
 5. **Glob expansion on `hf://` URLs (`**/*.parquet`)**: V12.2 in progress; the HF tree-API cache prerequisite shipped on `feat/hf-tree-cache`.

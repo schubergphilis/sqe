@@ -53,8 +53,12 @@ noting semantic differences and gaps.
 >   DF 54 has no physical dependent-join operator. Only laterals that decorrelate
 >   into ordinary joins run, and those already worked. Keep using the documented
 >   join/subquery rewrites.
-> - **Array lambdas** (`transform`, `filter`, `reduce`): still unsupported
->   ("Invalid function") since DataFusion has no higher-order-function support.
+> - **Array lambdas**: all six work: `transform`, `filter`, `any_match`,
+>   `all_match`, `none_match`, and `reduce`. SQE parses with the DuckDB dialect
+>   (which accepts `x -> expr`). `transform` / `filter` alias DataFusion 54's
+>   higher-order `array_transform` / `array_filter`, `any_match` is
+>   `array_any_match`, and `all_match` / `none_match` / `reduce` are SQE UDFs on
+>   the same machinery.
 > - **`PIVOT` / `UNPIVOT`, `ASOF JOIN`**: still rejected by the planner.
 >
 > The remaining gaps are unchanged: structural (Trino sketch types, Arrow type
@@ -186,6 +190,12 @@ Each section lists Trino functions with their SQE status:
 | `slice(array, start, length)` | `slice(array, start, length)` | ✅ | Trino compat UDF; 1-based, negative `start` counts from the end, `length` clamps to the array end |
 | `element_at(array, n)` | `element_at(array, n)` | ✅ | Trino compat UDF; 1-based, negative from the end, out-of-bounds returns NULL. Also handles `element_at(map, key)` returning the scalar value |
 | `contains(array, x)` | `contains(array, x)` | ✅ | Trino compat UDF; three-valued (NULL when `x` is absent but the array holds a NULL). The string `contains(haystack, needle)` form is preserved |
+| `filter(array, x -> pred)` | `filter(array, x -> pred)` | ✅ | Higher-order; aliases DataFusion 54's `array_filter`. Lambda syntax comes from the DuckDB parse dialect. 1-based binding, NULL/empty-array parity with Trino |
+| `transform(array, x -> expr)` | `transform(array, x -> expr)` | ✅ | Higher-order; aliases DataFusion 54's `array_transform`. Lambda syntax from the DuckDB parse dialect |
+| `any_match(array, x -> pred)` | `any_match(array, x -> pred)` | ✅ | Higher-order; DataFusion alias of `array_any_match` |
+| `all_match(array, x -> pred)` | `all_match(array, x -> pred)` | ✅ | Higher-order SQE UDF (`crates/sqe-trino-functions/src/higher_order.rs`); Trino NULL/empty semantics |
+| `none_match(array, x -> pred)` | `none_match(array, x -> pred)` | ✅ | Higher-order SQE UDF; Trino NULL/empty semantics |
+| `reduce(array, init, (s,x) -> combine, s -> finish)` | Same | ✅ | Higher-order SQE UDF; sequential left fold, NULL array yields NULL |
 
 ## Scalar Functions: Date/Time
 
