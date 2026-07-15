@@ -43,18 +43,16 @@ Expected: TPC-H SF0.01 loads and SQE stays running on flight port 60051. Note th
 
 - [ ] **Step 3: Attach that same Polaris as a second catalog `golden` and count rows**
 
-Open a Flight SQL session against the running coordinator (`localhost:60051`) and run, in one session:
+Use the existing `sqe-cli -e` single-statement runner (`crates/sqe-cli`). ATTACH is coordinator-wide and persists, so a separate invocation for the SELECT sees the attached catalog:
 
-```sql
-ATTACH 'http://polaris:8181/api/catalog' AS golden (
-  TYPE iceberg_rest,
-  WAREHOUSE 'quickstart_catalog',
-  TOKEN '<bearer-from-the-running-stack>'
-);
-SELECT count(*) FROM golden.tpch_sf0_01.lineitem;
+```bash
+cargo run -p sqe-cli -- --host localhost --port 60051 \
+  -e "ATTACH 'http://polaris:8181/api/catalog' AS golden (TYPE iceberg_rest, WAREHOUSE 'quickstart_catalog', TOKEN '<bearer-from-the-running-stack>')"
+cargo run -p sqe-cli -- --host localhost --port 60051 \
+  -e "SELECT count(*) FROM golden.tpch_sf0_01.lineitem"
 ```
 
-Use whatever Flight SQL client is convenient (the coordinator's own client, or a throwaway `sqe-bench attach`/`test` once Task 3 exists — for the spike, reuse the stack's existing client path). Substitute the real Polaris URL, warehouse name, and bearer token the running stack uses (see `scripts/benchmark-load.sh` env and the stack bootstrap).
+Substitute the real Polaris URL, warehouse name, and bearer token the running stack uses (see `scripts/benchmark-load.sh` env and the stack bootstrap). Confirm the exact `sqe-cli` connection flags in `crates/sqe-cli/src/main.rs`.
 
 Expected: a non-zero count matching the loaded row count. This proves (a) the attached catalog read `metadata.json` + manifests over the custom endpoint and (b) DataFusion's `register_s3_store_if_needed` read the data files.
 
@@ -83,7 +81,7 @@ Load each read-only suite's parquet into a persistent golden Polaris, once, idem
 **Interfaces:**
 - Consumes: `sqe-bench load` (existing), an existing golden Polaris URL.
 - Produces: golden Iceberg tables at namespace `<bench>_sf<scale>` in the golden Polaris. Env contract:
-  `BENCH_GOLDEN_POLARIS_URL`, `BENCH_GOLDEN_WAREHOUSE`, `BENCH_SCALE`, `BENCH_DATA_SOURCE` (s3:// parquet from Tier 1), `BENCH_S3_ENDPOINT`, `BENCH_S3_PROFILE`, and auth (`SQE_TOKEN_ENDPOINT`/`SQE_CLIENT_ID`/`SQE_CLIENT_SECRET` or `ICEBERG_BEARER_TOKEN`), `BENCH_FORCE`.
+  `BENCH_GOLDEN_POLARIS_URL`, `BENCH_GOLDEN_WAREHOUSE`, `BENCH_GOLDEN_TOKEN` (bearer for the REST skip-check + load auth), `BENCH_SCALE`, `BENCH_DATA_SOURCE` (s3:// parquet from Tier 1), `BENCH_S3_ENDPOINT`, `BENCH_S3_PROFILE`, and auth (`SQE_TOKEN_ENDPOINT`/`SQE_CLIENT_ID`/`SQE_CLIENT_SECRET` or `ICEBERG_BEARER_TOKEN`), `BENCH_FORCE`.
 
 - [ ] **Step 1: Write the failing test (dry-run guard)**
 
@@ -139,12 +137,18 @@ for BENCH in "${SUITES[@]}"; do
   fi
   NS="${BENCH}_sf${BENCH_SCALE}"
   echo "== publishing $BENCH -> $BENCH_GOLDEN_POLARIS_URL ns=$NS =="
-  # Skip-if-present: a table list that returns rows means already published.
-  if [ "$BENCH_FORCE" != "1" ] && "$BENCH_BIN" test "$BENCH" \
-        --scale "$BENCH_SCALE" --host "${BENCH_HOST:-localhost}" \
-        --catalog golden --namespace "$NS" --query q1 >/dev/null 2>&1; then
-    echo "SKIP $BENCH: golden namespace $NS already populated."
-    continue
+  # Skip-if-present: query the golden Polaris REST catalog directly for the
+  # namespace's table list. Nothing is ATTACHed at publish time, so this must
+  # not go through an attached `golden` catalog. Uses the Iceberg REST
+  # listTables endpoint with the golden bearer token.
+  if [ "$BENCH_FORCE" != "1" ]; then
+    LIST_URL="${BENCH_GOLDEN_POLARIS_URL%/}/v1/${BENCH_GOLDEN_WAREHOUSE}/namespaces/${NS}/tables"
+    COUNT=$(curl -sf -H "Authorization: Bearer ${BENCH_GOLDEN_TOKEN:-}" "$LIST_URL" \
+              2>/dev/null | python3 -c 'import sys,json;print(len(json.load(sys.stdin).get("identifiers",[])))' 2>/dev/null || echo 0)
+    if [ "${COUNT:-0}" -gt 0 ]; then
+      echo "SKIP $BENCH: golden namespace $NS already has $COUNT tables."
+      continue
+    fi
   fi
   "$BENCH_BIN" load "$BENCH" \
     --scale "$BENCH_SCALE" \
@@ -174,94 +178,21 @@ git commit -m "feat(bench): publish golden Iceberg tables once (benchmark-publis
 
 ---
 
-## Task 3: `sqe-bench attach` subcommand + `benchmark-attach-golden.sh`
+## Task 3: `benchmark-attach-golden.sh` (using existing `sqe-cli -e`)
 
-Issue the one-shot coordinator-wide `ATTACH` from a script. `sqe-bench` already has a Flight SQL client with `execute()`; add a thin `attach` subcommand that runs an arbitrary DDL statement, then a wrapper script that builds the `ATTACH` SQL from env.
+Issue the one-shot coordinator-wide `ATTACH` from a script. No new binary code: the existing `sqe-cli -e "<sql>"` (crates/sqe-cli/src/main.rs:312) runs a single statement over Flight, and ATTACH is coordinator-wide and persists, so one invocation is enough. Task 3 is just the wrapper script.
 
 **Files:**
-- Modify: `crates/sqe-bench/src/cli.rs` (add `Attach` variant), `crates/sqe-bench/src/main.rs` (dispatch), `crates/sqe-bench/src/client/flight.rs` (reuse `execute_update`).
 - Create: `scripts/benchmark-attach-golden.sh`
-- Test: `crates/sqe-bench/tests/attach_cli.rs`
+- Reference: `crates/sqe-cli/src/main.rs` (exact connection flags for `--host`/`--port`/auth and `-e`).
 
 **Interfaces:**
-- Consumes: Flight client `execute_update(&self, sql: &str) -> anyhow::Result<()>` (exists, flight.rs:175).
-- Produces: `sqe-bench attach --host <h> --port <p> --sql '<DDL>'` runs one statement and exits 0 on success. `benchmark-attach-golden.sh` builds and runs the `ATTACH '<url>' AS golden (TYPE iceberg_rest, WAREHOUSE '<wh>', TOKEN '<tok>')` statement.
+- Consumes: `sqe-cli -e "<sql>"` (exists).
+- Produces: `benchmark-attach-golden.sh` builds and runs `ATTACH '<url>' AS golden (TYPE iceberg_rest, WAREHOUSE '<wh>', TOKEN '<tok>')` against the coordinator, exiting 0 on success. After it runs, every session sees the `golden` catalog.
 
-- [ ] **Step 1: Write the failing test**
+- [ ] **Step 1: Write the failing test (env guard)**
 
-Create `crates/sqe-bench/tests/attach_cli.rs`:
-
-```rust
-// Verifies the `attach` subcommand parses and requires --sql.
-use std::process::Command;
-
-#[test]
-fn attach_requires_sql() {
-    let out = Command::new(env!("CARGO_BIN_EXE_sqe-bench"))
-        .args(["attach", "--host", "localhost", "--port", "60051"])
-        .output()
-        .expect("run sqe-bench");
-    assert!(!out.status.success(), "attach without --sql must fail");
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("--sql"), "error should mention --sql, got: {stderr}");
-}
-```
-
-- [ ] **Step 2: Run it to verify it fails**
-
-Run: `cargo test -p sqe-bench --test attach_cli`
-Expected: FAIL — the `attach` subcommand does not exist yet (clap errors with unknown subcommand, message will not mention `--sql`).
-
-- [ ] **Step 3: Add the `Attach` clap variant**
-
-In `crates/sqe-bench/src/cli.rs`, add to `enum Command`:
-
-```rust
-    /// Issue a single DDL statement (e.g. ATTACH) on a Flight SQL session.
-    Attach {
-        /// Coordinator host
-        #[arg(long, default_value = "localhost")]
-        host: String,
-        /// Coordinator port
-        #[arg(long, default_value_t = 60051u16)]
-        port: u16,
-        /// The SQL DDL statement to execute (e.g. an ATTACH statement)
-        #[arg(long)]
-        sql: String,
-        /// Username for authentication (OIDC password grant)
-        #[arg(long, env = "SQE_USER")]
-        username: Option<String>,
-        /// Password for authentication (OIDC password grant)
-        #[arg(long, env = "SQE_PASSWORD")]
-        password: Option<String>,
-    },
-```
-
-- [ ] **Step 4: Dispatch it in main.rs**
-
-In `crates/sqe-bench/src/main.rs`, add a match arm that connects the flight client and calls `execute_update`:
-
-```rust
-        Command::Attach { host, port, sql, username, password } => {
-            let client = client::flight::FlightBenchClient::connect(
-                &host, port, username.as_deref(), password.as_deref(),
-                /* token args as the existing connect signature requires */
-            ).await?;
-            client.execute_update(&sql).await?;
-            println!("attached: {sql}");
-        }
-```
-
-Match the exact `connect(...)` signature in `client/flight.rs` (auth args may differ). Reuse the same connect helper the `Test` arm uses.
-
-- [ ] **Step 5: Run the test to verify it passes**
-
-Run: `cargo test -p sqe-bench --test attach_cli`
-Expected: PASS.
-
-- [ ] **Step 6: Create the wrapper script**
-
-Create `scripts/benchmark-attach-golden.sh`:
+Create `scripts/benchmark-attach-golden.sh` with only the env guard first:
 
 ```bash
 #!/usr/bin/env bash
@@ -269,23 +200,43 @@ set -euo pipefail
 # Issue the one-shot coordinator-wide ATTACH for the golden catalog.
 # ATTACH is global and persists across sessions, so run this once after the
 # coordinator is up and before any `sqe-bench test --catalog golden`.
-
 : "${BENCH_GOLDEN_POLARIS_URL:?set BENCH_GOLDEN_POLARIS_URL}"
 : "${BENCH_GOLDEN_WAREHOUSE:?set BENCH_GOLDEN_WAREHOUSE}"
 : "${BENCH_GOLDEN_TOKEN:?set BENCH_GOLDEN_TOKEN}"
-HOST="${BENCH_HOST:-localhost}"
-PORT="${BENCH_PORT_FLIGHT:-60051}"
-BIN="${SQE_BENCH_BIN:-target/release/sqe-bench}"
-
-SQL="ATTACH '${BENCH_GOLDEN_POLARIS_URL}' AS golden (TYPE iceberg_rest, WAREHOUSE '${BENCH_GOLDEN_WAREHOUSE}', TOKEN '${BENCH_GOLDEN_TOKEN}')"
-"$BIN" attach --host "$HOST" --port "$PORT" --sql "$SQL"
 ```
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 2: Run it to verify it fails without env**
+
+Run: `bash scripts/benchmark-attach-golden.sh`
+Expected: exits non-zero complaining that `BENCH_GOLDEN_POLARIS_URL` is unset.
+
+- [ ] **Step 3: Implement the ATTACH invocation**
+
+Append:
 
 ```bash
-git add crates/sqe-bench/src/cli.rs crates/sqe-bench/src/main.rs crates/sqe-bench/tests/attach_cli.rs scripts/benchmark-attach-golden.sh
-git commit -m "feat(bench): add attach subcommand + benchmark-attach-golden.sh"
+HOST="${BENCH_HOST:-localhost}"
+PORT="${BENCH_PORT_FLIGHT:-60051}"
+SQL="ATTACH '${BENCH_GOLDEN_POLARIS_URL}' AS golden (TYPE iceberg_rest, WAREHOUSE '${BENCH_GOLDEN_WAREHOUSE}', TOKEN '${BENCH_GOLDEN_TOKEN}')"
+
+cargo run -q -p sqe-cli -- --host "$HOST" --port "$PORT" -e "$SQL"
+echo "attached golden: ${BENCH_GOLDEN_POLARIS_URL}"
+```
+
+Adjust `--host`/`--port` (and any auth flags) to the exact `sqe-cli` arg names in `crates/sqe-cli/src/main.rs`. If a prebuilt binary is preferred, call `target/release/sqe-cli` instead of `cargo run`.
+
+- [ ] **Step 4: Verify against the running stack**
+
+Run (coordinator up, golden published to local Polaris):
+`BENCH_GOLDEN_POLARIS_URL=http://localhost:18181/api/catalog BENCH_GOLDEN_WAREHOUSE=quickstart_catalog BENCH_GOLDEN_TOKEN=<tok> bash scripts/benchmark-attach-golden.sh`
+Then confirm: `cargo run -q -p sqe-cli -- --host localhost --port 60051 -e "SHOW CATALOGS"` lists `golden`.
+Expected: `golden` appears; attach exit code 0.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add scripts/benchmark-attach-golden.sh
+git commit -m "feat(bench): benchmark-attach-golden.sh (one-shot ATTACH via sqe-cli)"
 ```
 
 ---
