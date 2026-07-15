@@ -163,25 +163,26 @@ WHERE order_id > 100 AND tag LIKE 'priority_%';
 
 ## Lambda functions
 
-SQE parses SQL with the DuckDB dialect, so lambda syntax (`x -> expr`) is accepted. Five Trino higher-order array functions work:
+SQE parses SQL with the DuckDB dialect, so lambda syntax (`x -> expr`) is accepted. All six Trino higher-order array functions work:
 
 - `filter(array, x -> pred)`. Keeps the elements where the predicate holds.
 - `transform(array, x -> expr)`. Applies the expression to each element.
 - `any_match(array, x -> pred)`. True if any element matches.
 - `all_match(array, x -> pred)`. True if every element matches (empty array is true).
 - `none_match(array, x -> pred)`. True if no element matches.
+- `reduce(array, init, (s, x) -> combine, s -> finish)`. Left fold: threads an accumulator through the elements, then maps it to the result.
 
-`filter` and `transform` alias DataFusion 54's `array_filter` and `array_transform`; `any_match` is DataFusion's `array_any_match`. `all_match` and `none_match` are SQE UDFs built on the same machinery. Argument order, 1-based element binding, and NULL/empty-array semantics match Trino.
+`filter` and `transform` alias DataFusion 54's `array_filter` and `array_transform`; `any_match` is DataFusion's `array_any_match`. `all_match`, `none_match`, and `reduce` are SQE UDFs built on the same lambda machinery. Argument order, 1-based element binding, and NULL/empty-array semantics match Trino.
 
 ```sql
-SELECT filter(ARRAY[1, 2, 3, 4], x -> x > 2);      -- [3, 4]
-SELECT transform(ARRAY[1, 2, 3], x -> x * 10);     -- [10, 20, 30]
-SELECT all_match(ARRAY[2, 4, 6], x -> x % 2 = 0);  -- true
-SELECT none_match(ARRAY[1, 3, 5], x -> x % 2 = 0); -- true
+SELECT filter(ARRAY[1, 2, 3, 4], x -> x > 2);                     -- [3, 4]
+SELECT transform(ARRAY[1, 2, 3], x -> x * 10);                    -- [10, 20, 30]
+SELECT all_match(ARRAY[2, 4, 6], x -> x % 2 = 0);                 -- true
+SELECT none_match(ARRAY[1, 3, 5], x -> x % 2 = 0);                -- true
+SELECT reduce(ARRAY[1, 2, 3, 4], 0, (s, x) -> s + x, s -> s);     -- 10
 ```
 
 ## What is NOT registered
 
-- **`reduce(a, init, (s, x) -> combine, s -> finish)`**. Trino's two-lambda fold has no DataFusion primitive. Aggregate within a CTE instead. Tracked on #354.
 - **`zip(a, b)`** (parallel-iterate two arrays). Use `unnest` against an indexed pair instead.
 - **Snowflake `flatten` table function** (with PATH and OUTER options). Use `UNNEST` directly.

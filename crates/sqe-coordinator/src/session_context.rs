@@ -1160,6 +1160,10 @@ s3_path_style = true
                 "lambda none_match",
                 "SELECT none_match(make_array(1,3), x -> x % 2 = 0)",
             ),
+            (
+                "lambda reduce",
+                "SELECT reduce(make_array(1,2,3), CAST(0 AS bigint), (s, x) -> s + x, s -> s)",
+            ),
         ];
         for (family, sql) in cases {
             let plan = ctx.sql(sql).await;

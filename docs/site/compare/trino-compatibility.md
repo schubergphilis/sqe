@@ -53,12 +53,12 @@ noting semantic differences and gaps.
 >   DF 54 has no physical dependent-join operator. Only laterals that decorrelate
 >   into ordinary joins run, and those already worked. Keep using the documented
 >   join/subquery rewrites.
-> - **Array lambdas**: `transform`, `filter`, `any_match`, `all_match`, and
->   `none_match` now work. SQE parses with the DuckDB dialect (which accepts
->   `x -> expr`). `transform` / `filter` alias DataFusion 54's higher-order
->   `array_transform` / `array_filter`, `any_match` is `array_any_match`, and
->   `all_match` / `none_match` are SQE UDFs on the same machinery. Only `reduce`
->   (a two-lambda fold with no DataFusion primitive) remains unsupported.
+> - **Array lambdas**: all six work: `transform`, `filter`, `any_match`,
+>   `all_match`, `none_match`, and `reduce`. SQE parses with the DuckDB dialect
+>   (which accepts `x -> expr`). `transform` / `filter` alias DataFusion 54's
+>   higher-order `array_transform` / `array_filter`, `any_match` is
+>   `array_any_match`, and `all_match` / `none_match` / `reduce` are SQE UDFs on
+>   the same machinery.
 > - **`PIVOT` / `UNPIVOT`, `ASOF JOIN`**: still rejected by the planner.
 >
 > The remaining gaps are unchanged: structural (Trino sketch types, Arrow type
@@ -195,7 +195,7 @@ Each section lists Trino functions with their SQE status:
 | `any_match(array, x -> pred)` | `any_match(array, x -> pred)` | ✅ | Higher-order; DataFusion alias of `array_any_match` |
 | `all_match(array, x -> pred)` | `all_match(array, x -> pred)` | ✅ | Higher-order SQE UDF (`crates/sqe-trino-functions/src/higher_order.rs`); Trino NULL/empty semantics |
 | `none_match(array, x -> pred)` | `none_match(array, x -> pred)` | ✅ | Higher-order SQE UDF; Trino NULL/empty semantics |
-| `reduce(array, init, ...)` | — | ❌ | No DataFusion primitive. Two-lambda fold; tracked on #354 |
+| `reduce(array, init, (s,x) -> combine, s -> finish)` | Same | ✅ | Higher-order SQE UDF; sequential left fold, NULL array yields NULL |
 
 ## Scalar Functions: Date/Time
 
