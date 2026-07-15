@@ -1894,7 +1894,6 @@ fn scalar_to_json_string(v: &ScalarValue) -> String {
 mod parse_datetime_tests {
     use super::*;
     use arrow::array::{Array, TimestampMicrosecondArray};
-    use datafusion::prelude::SessionContext;
 
     #[test]
     fn joda_to_chrono_does_not_corrupt_repeated_letters() {
@@ -1906,7 +1905,7 @@ mod parse_datetime_tests {
     }
 
     async fn parse_dt(s: &str, fmt: &str) -> Option<i64> {
-        let ctx = SessionContext::new();
+        let ctx = crate::duckdb_test_ctx();
         register_extended_trino_functions(&ctx);
         let sql = format!("SELECT parse_datetime('{s}', '{fmt}')");
         let b = ctx.sql(&sql).await.unwrap().collect().await.unwrap();

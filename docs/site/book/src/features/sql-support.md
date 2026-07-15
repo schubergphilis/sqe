@@ -29,6 +29,21 @@ SELECT * FROM customers
 WHERE customer_id IN (SELECT customer_id FROM orders WHERE amount > 500);
 ```
 
+### Higher-order array functions
+
+SQE parses SQL with the DuckDB dialect, so Trino-style lambda syntax (`x -> expr`) is accepted. The DuckDB dialect keeps the same identifier quoting as the default parser; it just adds lambda support. Two higher-order array functions are aliased onto DataFusion 54's built-ins:
+
+```sql
+SELECT filter(ARRAY[1, 2, 3, 4], x -> x > 2);                  -- [3, 4]        (array_filter)
+SELECT transform(ARRAY[1, 2, 3], x -> x * 10);                 -- [10, 20, 30]  (array_transform)
+SELECT any_match(ARRAY[1, 2, 3], x -> x > 2);                  -- true          (array_any_match)
+SELECT all_match(ARRAY[2, 4, 6], x -> x % 2 = 0);              -- true          (SQE UDF)
+SELECT none_match(ARRAY[1, 3, 5], x -> x % 2 = 0);             -- true          (SQE UDF)
+SELECT reduce(ARRAY[1, 2, 3, 4], 0, (s, x) -> s + x, s -> s);  -- 10            (SQE UDF)
+```
+
+All six Trino array higher-order functions are covered. See the [array and map reference](../sql-reference/array-map.md).
+
 ### Window Functions
 
 ```sql
