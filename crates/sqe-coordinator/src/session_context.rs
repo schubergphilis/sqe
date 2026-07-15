@@ -275,6 +275,13 @@ pub async fn create_session_context(
                 // not 0.049999999999999996 (floating-point). Critical for correct
                 // BETWEEN predicates and aggregate precision.
                 .set_bool("datafusion.sql_parser.parse_float_as_decimal", true)
+                // Parse with the DuckDB SQL dialect instead of the default
+                // Generic. DuckDB keeps Generic's double-quoted-identifier and
+                // backtick behavior (no change to how existing SQL parses) but
+                // adds `x -> expr` lambda syntax, which unlocks the Trino
+                // higher-order array functions (filter/transform, aliased onto
+                // DataFusion's array_filter/array_transform). See #354.
+                .set_str("datafusion.sql_parser.dialect", "DuckDB")
                 // Broadcast threshold for hash joins: dimension tables below this
                 // size use CollectLeft mode (build entire table in memory, broadcast
                 // to probe side). Default 1MB is too low for TPC-DS dimension tables
@@ -1096,5 +1103,63 @@ s3_path_style = true
             r#"["admin","analyst"]"#,
             "current_available_roles() should return sorted JSON"
         );
+    }
+
+    /// Cross-family check that every custom UDF source the coordinator registers
+    /// on a session still plans under the DuckDB SQL dialect (the dialect the
+    /// session now uses so `x -> expr` lambdas parse; see #354). Guards against a
+    /// dialect regression: a reserved-word collision or changed call syntax that
+    /// stops a custom function resolving. The `sqe-trino-functions` suite covers
+    /// its own functions exhaustively under DuckDB; this pins the policy,
+    /// session-identity, JSON, and lambda families together in one place.
+    #[tokio::test]
+    async fn custom_udfs_plan_under_duckdb_dialect() {
+        use datafusion::prelude::{SessionConfig, SessionContext};
+
+        let cfg = SessionConfig::new().set_str("datafusion.sql_parser.dialect", "DuckDB");
+        let mut ctx = SessionContext::new_with_config(cfg);
+
+        // Mirror the coordinator's registration set (see the builder above).
+        ctx.register_udf(sqe_policy::sha256_udf::sha256_udf(None));
+        let identity = std::sync::Arc::new(sqe_policy::session_udf::SessionIdentity {
+            username: "alice".into(),
+            roles: vec!["analyst".into()],
+            database: Some("wh".into()),
+            schema: Some("public".into()),
+        });
+        for udf in sqe_policy::session_udf::session_udfs(identity) {
+            ctx.register_udf(udf);
+        }
+        sqe_trino_functions::register_trino_functions(&ctx);
+        sqe_trino_functions::register_extended_trino_functions(&ctx);
+        datafusion_functions_json::register_all(&mut ctx).expect("register json udfs");
+
+        // One representative call per custom-UDF family. Each must parse and
+        // build a logical plan under DuckDB; per-function logic is covered by the
+        // owning crate's own tests.
+        let cases = [
+            ("policy sha256", "SELECT sha256('secret')"),
+            ("session identity", "SELECT is_role_in_session('analyst')"),
+            ("trino scalar", "SELECT typeof(1)"),
+            (
+                "trino coverage",
+                "SELECT count_if(x > 1) FROM (VALUES (1),(2)) t(x)",
+            ),
+            ("trino extended", "SELECT soundex('robert')"),
+            ("json", "SELECT json_get('{\"a\":1}', 'a')"),
+            ("lambda filter", "SELECT filter(make_array(1,2,3), x -> x > 1)"),
+            (
+                "lambda transform",
+                "SELECT transform(make_array(1,2,3), x -> x * 2)",
+            ),
+        ];
+        for (family, sql) in cases {
+            let plan = ctx.sql(sql).await;
+            assert!(
+                plan.is_ok(),
+                "{family}: `{sql}` failed to plan under DuckDB: {:?}",
+                plan.err()
+            );
+        }
     }
 }

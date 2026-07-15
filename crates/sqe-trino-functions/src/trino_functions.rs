@@ -2406,11 +2406,10 @@ impl ScalarUDFImpl for JsonParse {
 mod tests {
     use super::*;
     use arrow::array::StringArray;
-    use datafusion::prelude::SessionContext;
 
     /// Helper: run SQL returning an Int64 result (date extraction functions now return Int64).
     async fn run_query(sql: &str) -> i64 {
-        let ctx = SessionContext::new();
+        let ctx = crate::duckdb_test_ctx();
         register_trino_functions(&ctx);
         let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
         let col = batches[0].column(0);
@@ -2485,7 +2484,7 @@ mod tests {
 
     /// Run SQL returning an i64 result, handling both Int64 and UInt64 return types.
     async fn run_query_i64(sql: &str) -> i64 {
-        let ctx = SessionContext::new();
+        let ctx = crate::duckdb_test_ctx();
         register_trino_functions(&ctx);
         let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
         let col = batches[0].column(0);
@@ -2504,7 +2503,7 @@ mod tests {
     }
 
     async fn run_query_string(sql: &str) -> String {
-        let ctx = SessionContext::new();
+        let ctx = crate::duckdb_test_ctx();
         register_trino_functions(&ctx);
         let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
         let col = batches[0].column(0);
@@ -2631,7 +2630,7 @@ mod tests {
     #[tokio::test]
     async fn to_unixtime_produces_epoch_seconds() {
         // DATE '1970-01-01' → 0.0
-        let ctx = SessionContext::new();
+        let ctx = crate::duckdb_test_ctx();
         register_trino_functions(&ctx);
         let batches = ctx
             .sql("SELECT to_unixtime(DATE '1970-01-01')")
@@ -2684,7 +2683,7 @@ mod tests {
     #[tokio::test]
     async fn trino_if_true_branch() {
         // if(1 = 1, 10, 20) → 10
-        let ctx = SessionContext::new();
+        let ctx = crate::duckdb_test_ctx();
         register_trino_functions(&ctx);
         let batches = ctx
             .sql("SELECT if(1 = 1, 10, 20)")
@@ -2706,7 +2705,7 @@ mod tests {
     #[tokio::test]
     async fn trino_if_false_branch() {
         // if(1 = 2, 10, 20) → 20
-        let ctx = SessionContext::new();
+        let ctx = crate::duckdb_test_ctx();
         register_trino_functions(&ctx);
         let batches = ctx
             .sql("SELECT if(1 = 2, 10, 20)")
@@ -2728,7 +2727,7 @@ mod tests {
 
     #[tokio::test]
     async fn snowflake_iff_true_branch() {
-        let ctx = SessionContext::new();
+        let ctx = crate::duckdb_test_ctx();
         register_trino_functions(&ctx);
         let batches = ctx
             .sql("SELECT iff(TRUE, 'yes', 'no')")
@@ -2748,7 +2747,7 @@ mod tests {
 
     #[tokio::test]
     async fn snowflake_iff_false_branch() {
-        let ctx = SessionContext::new();
+        let ctx = crate::duckdb_test_ctx();
         register_trino_functions(&ctx);
         let batches = ctx
             .sql("SELECT iff(FALSE, 'yes', 'no')")
@@ -2769,7 +2768,7 @@ mod tests {
     #[tokio::test]
     async fn snowflake_iff_null_condition_returns_else() {
         // Snowflake spec: NULL condition is treated as false, returns expr2.
-        let ctx = SessionContext::new();
+        let ctx = crate::duckdb_test_ctx();
         register_trino_functions(&ctx);
         let batches = ctx
             .sql("SELECT iff(CAST(NULL AS BOOLEAN), 'yes', 'no')")
@@ -2790,7 +2789,7 @@ mod tests {
     #[tokio::test]
     async fn snowflake_iff_with_predicate() {
         // iff(1 = 1, 10, 20) -> 10 — same shape as the if() test for parity.
-        let ctx = SessionContext::new();
+        let ctx = crate::duckdb_test_ctx();
         register_trino_functions(&ctx);
         let batches = ctx
             .sql("SELECT iff(1 = 1, 10, 20)")
@@ -2954,7 +2953,7 @@ mod tests {
         // Trino spec: year(time) is not supported. Our extract_component
         // surfaces a Plan error rather than silently returning 0. Confirm
         // we error on a Time64 input.
-        let ctx = SessionContext::new();
+        let ctx = crate::duckdb_test_ctx();
         register_trino_functions(&ctx);
         let res = ctx.sql("SELECT year(localtime())").await;
         // The error can land at planning or execution depending on
@@ -2970,7 +2969,7 @@ mod tests {
 
     /// Run SQL returning a Float64 result.
     async fn run_query_f64(sql: &str) -> f64 {
-        let ctx = SessionContext::new();
+        let ctx = crate::duckdb_test_ctx();
         register_trino_functions(&ctx);
         let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
         let col = batches[0].column(0);
@@ -3005,7 +3004,7 @@ mod tests {
 
     #[tokio::test]
     async fn mod_zero_divisor_errors() {
-        let ctx = SessionContext::new();
+        let ctx = crate::duckdb_test_ctx();
         register_trino_functions(&ctx);
         let res = ctx.sql("SELECT mod(10, 0)").await;
         let failed = match res {
@@ -3059,7 +3058,7 @@ mod tests {
 
     #[tokio::test]
     async fn codepoint_multi_char_errors() {
-        let ctx = SessionContext::new();
+        let ctx = crate::duckdb_test_ctx();
         register_trino_functions(&ctx);
         let res = ctx.sql("SELECT codepoint('ab')").await;
         let failed = match res {
@@ -3074,7 +3073,7 @@ mod tests {
         // A TIME-typed literal flows through Time64 -> hour() bridge.
         // We use TYPED literal via cast since DataFusion's parser may
         // not bind raw TIME 'HH:MM:SS' literals directly yet.
-        let ctx = SessionContext::new();
+        let ctx = crate::duckdb_test_ctx();
         register_trino_functions(&ctx);
         let batches = ctx
             .sql("SELECT hour(CAST('14:30:45' AS TIME))")
@@ -3093,7 +3092,7 @@ mod tests {
     #[tokio::test]
     async fn date_trunc_builtin_works() {
         // DataFusion's built-in date_trunc should match Trino signature
-        let ctx = SessionContext::new();
+        let ctx = crate::duckdb_test_ctx();
         register_trino_functions(&ctx);
         let batches = ctx
             .sql("SELECT date_trunc('month', TIMESTAMP '2024-06-15 10:30:00')")

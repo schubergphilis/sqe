@@ -6,6 +6,8 @@
 //!   are what BI/analytics SQL uses.
 //! - `sequence` (#349): Trino's name for DataFusion's inclusive `generate_series`.
 //! - `slice` (#349): 1-based sub-array with a length (not an end index).
+//! - Higher-order array functions (#354): `filter` / `transform` lambdas, aliased
+//!   onto DataFusion 54's `array_filter` / `array_transform`.
 
 use std::sync::Arc;
 
@@ -15,7 +17,8 @@ use arrow::datatypes::DataType;
 use datafusion::common::Result as DFResult;
 use datafusion::error::DataFusionError;
 use datafusion::logical_expr::{
-    ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility,
+    ColumnarValue, HigherOrderUDF, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature,
+    Volatility,
 };
 use datafusion::prelude::SessionContext;
 
@@ -38,6 +41,37 @@ pub fn register_scalar_fns(ctx: &SessionContext) {
         .clone()
         .with_aliases(["sequence"]);
     ctx.register_udf(sequence);
+
+    register_higher_order_aliases(ctx);
+}
+
+/// Register Trino names for DataFusion 54's higher-order (lambda) array
+/// functions.
+///
+/// DataFusion 54 ships the lambda framework and three higher-order functions:
+/// `array_filter`, `array_transform`, and `array_any_match`. Trino spells the
+/// first two `filter(array, x -> pred)` and `transform(array, x -> expr)`;
+/// argument order, 1-based lambda binding, and NULL/empty-array handling match,
+/// so a name alias is all that is needed. `any_match` is already a DataFusion
+/// alias for `array_any_match`, so it needs no work here.
+///
+/// Not covered (no DataFusion primitive, tracked on #354): `reduce` (Trino's
+/// two-lambda fold), and `all_match` / `none_match` (DataFusion ships only the
+/// `any_match` predicate). Those need a custom `HigherOrderUDFImpl` and are
+/// deliberately left to a follow-up rather than shimmed into wrong answers.
+fn register_higher_order_aliases(ctx: &SessionContext) {
+    for func in datafusion::functions_nested::all_default_higher_order_functions() {
+        let trino_alias = match func.name() {
+            "array_filter" => "filter",
+            "array_transform" => "transform",
+            _ => continue,
+        };
+        // Wrap the shipped impl with the Trino alias. `name()` still reports the
+        // DataFusion name, so `array_filter` / `array_transform` keep working.
+        let aliased =
+            HigherOrderUDF::new_from_shared_impl(Arc::clone(func.inner())).with_aliases([trino_alias]);
+        ctx.register_higher_order_function(Arc::new(aliased));
+    }
 }
 
 // ─── bitwise scalar functions (#346) ─────────────────────────────────────────
@@ -271,10 +305,9 @@ impl ScalarUDFImpl for Slice {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use datafusion::prelude::SessionContext;
 
     async fn scalar_i64(sql: &str) -> Option<i64> {
-        let ctx = SessionContext::new();
+        let ctx = crate::duckdb_test_ctx();
         register_scalar_fns(&ctx);
         let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
         let col = batches[0].column(0);
@@ -324,7 +357,7 @@ mod tests {
     }
 
     async fn array_i64(sql: &str) -> Vec<i64> {
-        let ctx = SessionContext::new();
+        let ctx = crate::duckdb_test_ctx();
         register_scalar_fns(&ctx);
         let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
         let list = batches[0]
@@ -364,6 +397,80 @@ mod tests {
         assert_eq!(
             array_i64("SELECT slice(make_array(1,2,3,4), 5, 2)").await,
             Vec::<i64>::new()
+        );
+    }
+
+    /// Run a query returning a single `array<bigint>` cell. `None` means the row
+    /// itself is NULL; otherwise the element list, preserving per-element NULLs.
+    async fn hof_i64(sql: &str) -> Option<Vec<Option<i64>>> {
+        let ctx = crate::duckdb_test_ctx();
+        register_scalar_fns(&ctx);
+        let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
+        let list = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        if list.is_null(0) {
+            return None;
+        }
+        let row = list.value(0);
+        let arr = row.as_any().downcast_ref::<Int64Array>().unwrap();
+        Some(arr.iter().collect())
+    }
+
+    fn vals(v: &[i64]) -> Option<Vec<Option<i64>>> {
+        Some(v.iter().map(|x| Some(*x)).collect())
+    }
+
+    #[tokio::test]
+    async fn filter_lambda_trino_alias() {
+        // Trino: filter(array, x -> pred) keeps matching elements in order.
+        assert_eq!(
+            hof_i64("SELECT filter(make_array(1,2,3,4), x -> x > 2)").await,
+            vals(&[3, 4])
+        );
+        // The DataFusion name still resolves: the alias did not clobber it.
+        assert_eq!(
+            hof_i64("SELECT array_filter(make_array(1,2,3,4), x -> x > 2)").await,
+            vals(&[3, 4])
+        );
+    }
+
+    #[tokio::test]
+    async fn transform_lambda_trino_alias() {
+        assert_eq!(
+            hof_i64("SELECT transform(make_array(1,2,3), x -> x * 10)").await,
+            vals(&[10, 20, 30])
+        );
+        assert_eq!(
+            hof_i64("SELECT array_transform(make_array(1,2,3), x -> x * 10)").await,
+            vals(&[10, 20, 30])
+        );
+    }
+
+    #[tokio::test]
+    async fn filter_lambda_dropping_all_yields_empty() {
+        // A predicate that matches nothing -> empty array, matching Trino.
+        assert_eq!(
+            hof_i64("SELECT filter(make_array(1,2), x -> x > 9)").await,
+            vals(&[])
+        );
+    }
+
+    #[tokio::test]
+    async fn higher_order_null_element_handling() {
+        // NULL element: transform applies the lambda per element; NULL * 10 is
+        // NULL, so the NULL slot survives in place (Trino parity).
+        assert_eq!(
+            hof_i64("SELECT transform(make_array(1, CAST(NULL AS bigint), 3), x -> x * 10)").await,
+            Some(vec![Some(10), None, Some(30)])
+        );
+        // NULL element under filter: the predicate is NULL (not true), so the
+        // NULL element is dropped, matching Trino's SQL three-valued logic.
+        assert_eq!(
+            hof_i64("SELECT filter(make_array(1, CAST(NULL AS bigint), 3), x -> x > 1)").await,
+            vals(&[3])
         );
     }
 }
