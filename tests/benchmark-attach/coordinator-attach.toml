@@ -19,6 +19,21 @@
 # This is a dev/bench-only auth posture (no local signature/expiry
 # validation of the bearer) -- do not reuse this file for a production
 # deployment.
+#
+# A second provider, `client_credentials`, restores plain --username/
+# --password support (Task 5, scripts/benchmark-test.sh): once
+# `[[auth.providers]]` is non-empty the coordinator's legacy `[auth]` OAuth2
+# fallback is bypassed entirely (crates/sqe-auth/src/factory.rs), so without
+# this entry every normal `sqe-bench load`/`test` call that authenticates via
+# Basic-auth handshake (bank/tpcc/tpce, and the read-only suites' load step
+# when NOT in attach mode) would fail closed with NotMyCredentials. This
+# provider wraps the same legacy Authenticator tests/sqe-test.toml's `[auth]`
+# block uses -- it mints its own service token from ITS OWN configured
+# client_id/client_secret regardless of what the client's username/password
+# actually are (crates/sqe-auth/src/authenticator.rs), so it does not
+# conflict with bearer_passthrough: a request carries either a bearer token
+# (routed to bearer_passthrough) or a username/password pair (routed here),
+# never both, and the chain falls through in provider order.
 [coordinator]
 flight_sql_port = 60051
 trino_http_port = 18080
@@ -34,6 +49,12 @@ prometheus_port = 19090
 type = "bearer_passthrough"
 user = "root"
 roles = ["service_admin"]
+
+[[auth.providers]]
+type = "client_credentials"
+token_endpoint = "http://localhost:18181/api/catalog/v1/oauth/tokens"
+client_id = "root"
+client_secret = "s3cr3t"
 
 [query]
 query_profile = "all"
