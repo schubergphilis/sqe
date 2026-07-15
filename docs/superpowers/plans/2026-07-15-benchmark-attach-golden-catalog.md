@@ -197,7 +197,9 @@ git commit -m "feat(attach): carry S3 endpoint/region/creds in ATTACH options + 
 
 ## Task 3: `benchmark-publish-iceberg.sh` — publish golden tables once
 
-Load each read-only suite's parquet into a persistent golden Polaris, once, idempotently. Mirrors `benchmark-publish-data.sh` (skip-if-present, `BENCH_FORCE=1` override) but the artifact is Iceberg tables via `sqe-bench load`, not raw parquet.
+Load each read-only suite's parquet into a persistent golden Polaris, once, idempotently. Mirrors `benchmark-publish-data.sh` (skip-if-present, `BENCH_FORCE=1` override) but the artifact is Iceberg tables, not raw parquet.
+
+> **IMPLEMENTATION NOTE (corrected during execution, commit `351e0ca`).** The step-by-step below assumed `sqe-bench load --catalog-uri/--warehouse` talks to Polaris directly. That flag combination does not exist: `sqe-bench load` is a client of a *running coordinator* (`--host/--port`), and `--catalog-uri/--warehouse` live only on `generate --sink iceberg`. The committed script therefore: (a) for tpch/ssb/tpcds/clickbench, stands up a **throwaway coordinator with the golden Polaris as its primary `[catalog]`** on dedicated ports (flight 60052 / trino 18082 / prom 19092), runs `sqe-bench load <bench> --host localhost --port 60052 --clean` with a `--username root --password ""` handshake, and tears it down via `trap cleanup EXIT`; (b) for bank, calls `sqe-bench generate bank --sink iceberg --catalog-uri … --warehouse …` directly (as `benchmark-load.sh` already does); (c) skips tpcbb (shares the tpcds namespace). It also guards against `SQE_CLIENT_ID/SECRET/TOKEN_ENDPOINT` leaking into `load`'s clap-env fallback (`env -u`). Env contract split into Tier-1 *source* creds (via `aws configure --profile`) and golden *destination* creds (`BENCH_GOLDEN_S3_ACCESS_KEY/SECRET`), consistent with Task 4. The committed script + `.superpowers/sdd/task-3-report.md` are the source of truth; the code steps below are retained for history. **Downstream:** publish owns its own coordinator, separate from the query coordinator Tasks 4/5 attach the golden catalog to.
 
 **Files:**
 - Create: `scripts/benchmark-publish-iceberg.sh`
