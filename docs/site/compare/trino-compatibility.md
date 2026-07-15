@@ -53,8 +53,11 @@ noting semantic differences and gaps.
 >   DF 54 has no physical dependent-join operator. Only laterals that decorrelate
 >   into ordinary joins run, and those already worked. Keep using the documented
 >   join/subquery rewrites.
-> - **Array lambdas** (`transform`, `filter`, `reduce`): still unsupported
->   ("Invalid function") since DataFusion has no higher-order-function support.
+> - **Array lambdas**: `transform` and `filter` now work. SQE parses with the
+>   DuckDB dialect (which accepts `x -> expr`) and aliases both onto DataFusion
+>   54's higher-order `array_transform` / `array_filter`. `reduce` (two-lambda
+>   fold) and `all_match` / `none_match` remain unsupported (no DataFusion
+>   primitive); `any_match` works.
 > - **`PIVOT` / `UNPIVOT`, `ASOF JOIN`**: still rejected by the planner.
 >
 > The remaining gaps are unchanged: structural (Trino sketch types, Arrow type
@@ -186,6 +189,10 @@ Each section lists Trino functions with their SQE status:
 | `slice(array, start, length)` | `slice(array, start, length)` | ✅ | Trino compat UDF; 1-based, negative `start` counts from the end, `length` clamps to the array end |
 | `element_at(array, n)` | `element_at(array, n)` | ✅ | Trino compat UDF; 1-based, negative from the end, out-of-bounds returns NULL. Also handles `element_at(map, key)` returning the scalar value |
 | `contains(array, x)` | `contains(array, x)` | ✅ | Trino compat UDF; three-valued (NULL when `x` is absent but the array holds a NULL). The string `contains(haystack, needle)` form is preserved |
+| `filter(array, x -> pred)` | `filter(array, x -> pred)` | ✅ | Higher-order; aliases DataFusion 54's `array_filter`. Lambda syntax comes from the DuckDB parse dialect. 1-based binding, NULL/empty-array parity with Trino |
+| `transform(array, x -> expr)` | `transform(array, x -> expr)` | ✅ | Higher-order; aliases DataFusion 54's `array_transform`. Lambda syntax from the DuckDB parse dialect |
+| `any_match(array, x -> pred)` | `any_match(array, x -> pred)` | ✅ | Higher-order; DataFusion alias of `array_any_match` |
+| `reduce(array, init, ...)` / `all_match` / `none_match` | — | ❌ | No DataFusion primitive. `reduce` is a two-lambda fold; `all_match` / `none_match` need the negated-predicate form of `any_match`. Tracked on #354 |
 
 ## Scalar Functions: Date/Time
 

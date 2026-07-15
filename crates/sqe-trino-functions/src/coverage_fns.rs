@@ -312,7 +312,7 @@ mod tests {
     use super::*;
 
     async fn one_i64(sql: &str) -> Option<i64> {
-        let ctx = SessionContext::new();
+        let ctx = crate::duckdb_test_ctx();
         register_coverage_fns(&ctx);
         let b = ctx.sql(sql).await.unwrap().collect().await.unwrap();
         let a = b[0].column(0).as_any().downcast_ref::<Int64Array>().unwrap();
@@ -324,7 +324,7 @@ mod tests {
     }
 
     async fn one_bool(sql: &str) -> Option<bool> {
-        let ctx = SessionContext::new();
+        let ctx = crate::duckdb_test_ctx();
         register_coverage_fns(&ctx);
         let b = ctx.sql(sql).await.unwrap().collect().await.unwrap();
         let a = b[0]

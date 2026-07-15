@@ -129,6 +129,10 @@ pub fn build_embedded_context(memory_limit_bytes: usize) -> anyhow::Result<Sessi
         // the comments in `sqe-coordinator/src/session_context.rs` for
         // the rationale on each flag.
         .set_bool("datafusion.sql_parser.parse_float_as_decimal", true)
+        // DuckDB dialect: adds `x -> expr` lambda syntax for the Trino
+        // higher-order array functions without changing identifier/quoting
+        // behavior. See sqe-coordinator/src/session_context.rs and #354.
+        .set_str("datafusion.sql_parser.dialect", "DuckDB")
         .set_usize(
             "datafusion.optimizer.hash_join_single_partition_threshold",
             64 * 1024 * 1024,
