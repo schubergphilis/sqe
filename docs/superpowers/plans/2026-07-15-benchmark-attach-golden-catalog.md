@@ -31,17 +31,19 @@ This task is a manual de-risking gate, not code. It must pass before Tasks 2+ ar
 - Consumes: running local stack (Polaris `:18181`, RustFS `:19000`), `scripts/benchmark-load.sh`.
 - Produces: a yes/no answer recorded in the plan. Gates all later tasks.
 
-- [ ] **Step 1: Ensure the local data stack is up**
+- [x] **Step 1: Ensure the local data stack is up**
 
 Run: `docker ps --format '{{.Names}}' | grep -E 'polaris|rustfs'`
 Expected: `sqlengine-polaris-1` and `sqlengine-rustfs-1` present. If not, bring up the test stack per `scripts/integration-test.sh`.
 
-- [ ] **Step 2: Load a tiny suite into the local Polaris (the future "golden")**
+- [x] **Step 2: Load a tiny suite into the local Polaris (the future "golden")**
 
 Run: `BENCH_SCALE=0.01 BENCH_KEEP_RUNNING=1 ./scripts/benchmark-load.sh tpch`
 Expected: TPC-H SF0.01 loads and SQE stays running on flight port 60051. Note the catalog/namespace it used (default namespace `tpch_sf0.01`).
 
-- [ ] **Step 3: Attach that same Polaris as a second catalog `golden` and count rows**
+Actual namespace was `tpch_sf0_01` (underscore, not a dot) — `bench_namespace`/`format_scale` (`crates/sqe-bench/src/main.rs`) already avoid the dot; the dot only appears in a cosmetic log line in `benchmark-load.sh`'s summary output. Warehouse is `test_warehouse`, not `quickstart_catalog`.
+
+- [x] **Step 3: Attach that same Polaris as a second catalog `golden` and count rows**
 
 Use the existing `sqe-cli -e` single-statement runner (`crates/sqe-cli`). ATTACH is coordinator-wide and persists, so a separate invocation for the SELECT sees the attached catalog:
 
@@ -56,12 +58,17 @@ Substitute the real Polaris URL, warehouse name, and bearer token the running st
 
 Expected: a non-zero count matching the loaded row count. This proves (a) the attached catalog read `metadata.json` + manifests over the custom endpoint and (b) DataFusion's `register_s3_store_if_needed` read the data files.
 
-- [ ] **Step 4: Record the outcome**
+- [x] **Step 4: Record the outcome**
 
 If PASS: append a line to this plan under Task 1 (`Phase 0: PASS on <date>`) and proceed to Task 2.
 If FAIL: STOP. Capture the exact error. Revisit the backend decision in the spec (fix `build_sqlite` S3 threading, or co-locate a golden Polaris with the writable warehouse) before building Phase 1. Do not proceed.
 
-- [ ] **Step 5: Commit the recorded outcome**
+**Phase 0: PASS on 2026-07-15.** `SELECT count(*) FROM golden.tpch_sf0_01.lineitem` returned `60000`, matching the local (non-attached) copy of the same table. Since `count(*)` alone can be answered from Iceberg manifest-list metadata without ever opening a Parquet file, this was followed up with `SELECT sum(l_quantity), min(l_shipdate) FROM golden.tpch_sf0_01.lineitem` (forces DataFusion to read actual column bytes) — result matched the local-catalog copy exactly (`sum = 1527864.00`, `min = 1992-01-03`), confirming genuine data-file reads over the custom S3 endpoint, not just a metadata-level answer. Full run log, exact commands, and two blockers hit along the way (both resolved without code changes) are in `.superpowers/sdd/task-1-report.md`. Summary of the two blockers:
+
+1. `ATTACH` requires an admin role (`service_admin`/`catalog_admin`) that the test stack's default `client_credentials` auth never grants (Polaris's own JWT has no `realm_access.roles` claim, so sessions get `roles: []`). Worked around for the spike with a `[[auth.providers]] type = "bearer_passthrough"` entry in a throwaway copy of the coordinator config (not committed to `tests/sqe-test.toml`), which assigns a fixed role list while still forwarding the caller's real bearer token as the session's catalog credential. Tasks 3/4 need to decide how `benchmark-attach-golden.sh` obtains an admin-capable credential against whatever coordinator it targets.
+2. **Real gap, not just environmental:** `crates/sqe-catalog/src/mount.rs::build_iceberg_rest` (the `ATTACH`-path catalog builder) sets only `uri`/`warehouse`/`token`/`prefix` — it never sets `s3.endpoint`/`s3.region`/`s3.access-key-id`/`s3.secret-access-key`/`s3.path-style-access` the way the default catalog builder (`crates/sqe-catalog/src/rest_catalog.rs:868-894`) does, and `ATTACH`'s SQL grammar has no options to carry them even if it did. Without them, FileIO fails with `region is missing` when it tries to read the manifest list from a non-AWS endpoint (RustFS/StorageGRID). Worked around for the spike by exporting `AWS_REGION`/`AWS_ENDPOINT_URL_S3`/`AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` in the coordinator process's environment (S3 FileIO falls back to the AWS SDK default chain). **Recommend Tasks 2/3 either standardize on setting these env vars wherever the golden-catalog coordinator runs, or add `S3_ENDPOINT`/`S3_REGION`/`S3_ACCESS_KEY`/`S3_SECRET_KEY` ATTACH options to `attach.rs` + `mount.rs` so the golden catalog's S3 config travels with the `ATTACH` statement instead of depending on ambient env vars.**
+
+- [x] **Step 5: Commit the recorded outcome**
 
 ```bash
 git add docs/superpowers/plans/2026-07-15-benchmark-attach-golden-catalog.md
