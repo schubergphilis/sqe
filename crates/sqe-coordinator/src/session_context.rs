@@ -1152,6 +1152,14 @@ s3_path_style = true
                 "lambda transform",
                 "SELECT transform(make_array(1,2,3), x -> x * 2)",
             ),
+            (
+                "lambda all_match",
+                "SELECT all_match(make_array(2,4), x -> x % 2 = 0)",
+            ),
+            (
+                "lambda none_match",
+                "SELECT none_match(make_array(1,3), x -> x % 2 = 0)",
+            ),
         ];
         for (family, sql) in cases {
             let plan = ctx.sql(sql).await;

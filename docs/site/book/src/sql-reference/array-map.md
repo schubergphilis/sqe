@@ -163,23 +163,25 @@ WHERE order_id > 100 AND tag LIKE 'priority_%';
 
 ## Lambda functions
 
-SQE parses SQL with the DuckDB dialect, so lambda syntax (`x -> expr`) is accepted. Two Trino higher-order array functions work:
+SQE parses SQL with the DuckDB dialect, so lambda syntax (`x -> expr`) is accepted. Five Trino higher-order array functions work:
 
 - `filter(array, x -> pred)`. Keeps the elements where the predicate holds.
 - `transform(array, x -> expr)`. Applies the expression to each element.
+- `any_match(array, x -> pred)`. True if any element matches.
+- `all_match(array, x -> pred)`. True if every element matches (empty array is true).
+- `none_match(array, x -> pred)`. True if no element matches.
 
-Both alias DataFusion 54's `array_filter` and `array_transform`. Argument order, 1-based element binding, and NULL/empty-array handling match Trino.
+`filter` and `transform` alias DataFusion 54's `array_filter` and `array_transform`; `any_match` is DataFusion's `array_any_match`. `all_match` and `none_match` are SQE UDFs built on the same machinery. Argument order, 1-based element binding, and NULL/empty-array semantics match Trino.
 
 ```sql
-SELECT filter(ARRAY[1, 2, 3, 4], x -> x > 2);   -- [3, 4]
-SELECT transform(ARRAY[1, 2, 3], x -> x * 10);  -- [10, 20, 30]
+SELECT filter(ARRAY[1, 2, 3, 4], x -> x > 2);      -- [3, 4]
+SELECT transform(ARRAY[1, 2, 3], x -> x * 10);     -- [10, 20, 30]
+SELECT all_match(ARRAY[2, 4, 6], x -> x % 2 = 0);  -- true
+SELECT none_match(ARRAY[1, 3, 5], x -> x % 2 = 0); -- true
 ```
 
 ## What is NOT registered
 
-- **`reduce(a, init, (s, x) -> combine, s -> finish)`**. Trino's two-lambda fold has no DataFusion primitive. Aggregate within a CTE instead.
-- **`all_match` / `none_match`**. DataFusion ships only the `any_match` predicate (already aliased as `any_match`). Express the others as `NOT any_match(...)` over a negated predicate.
+- **`reduce(a, init, (s, x) -> combine, s -> finish)`**. Trino's two-lambda fold has no DataFusion primitive. Aggregate within a CTE instead. Tracked on #354.
 - **`zip(a, b)`** (parallel-iterate two arrays). Use `unnest` against an indexed pair instead.
 - **Snowflake `flatten` table function** (with PATH and OUTER options). Use `UNNEST` directly.
-
-`reduce`, `all_match`, and `none_match` need a custom higher-order function; they are tracked on #354.

@@ -64,7 +64,7 @@ state.
 | `SELECT * REPLACE (expr AS col)` | works (DataFusion 54 native) | **done** (documented in V9) |
 | `FROM tbl SELECT ...` (FROM-first) | missing | not planned (DataFusion parser does not support) |
 | Struct / list / map literals (`{a: 1}`, `[1, 2]`, `MAP {...}`) | partial (nested types work, syntax less ergonomic) | not planned |
-| Lambdas (`filter`, `transform`) | have | **done**: SQE parses with the DuckDB dialect, so `x -> expr` works; `filter` / `transform` alias DataFusion 54's `array_filter` / `array_transform`. `reduce` / `all_match` / `none_match` still missing |
+| Lambdas (`filter`, `transform`, `any_match`, `all_match`, `none_match`) | have | **done**: SQE parses with the DuckDB dialect, so `x -> expr` works. `filter` / `transform` alias DataFusion 54's `array_filter` / `array_transform`; `all_match` / `none_match` are SQE UDFs. Only `reduce` (two-lambda fold) is still missing |
 | List comprehensions | missing | not planned (DataFusion does not support) |
 | `PIVOT` / `UNPIVOT` | missing | not planned (DataFusion does not support) |
 | `QUALIFY` | have (DataFusion SQL planner handles it) | done (row was stale; verified working, test `sql_compat 06_qualify`) |
@@ -242,7 +242,7 @@ block is upstream parser work or a positioning decision.
 | `PIVOT` / `UNPIVOT` | DataFusion planner rejects the parsed AST node (`Unsupported ast node Pivot`) |
 | `ASOF JOIN` | DataFusion has an open issue; not landed (parser wants `MATCH_CONDITION`) |
 | `FROM`-first syntax | DataFusion parser does not support |
-| List comprehensions, `reduce` / `all_match` / `none_match` lambdas | no DataFusion primitive (`filter` / `transform` do work) |
+| List comprehensions, `reduce` lambda | no DataFusion primitive (`filter` / `transform` / `any_match` / `all_match` / `none_match` do work) |
 | `postgres` / `mysql` / `sqlite` TVFs | positioning: SQE is Iceberg-first |
 | `spatial`, `vss`, `fts`, `excel` | niche; deferred until concrete demand |
 

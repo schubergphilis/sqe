@@ -43,6 +43,7 @@ pub fn register_scalar_fns(ctx: &SessionContext) {
     ctx.register_udf(sequence);
 
     register_higher_order_aliases(ctx);
+    crate::higher_order::register_match_predicates(ctx);
 }
 
 /// Register Trino names for DataFusion 54's higher-order (lambda) array
@@ -53,12 +54,13 @@ pub fn register_scalar_fns(ctx: &SessionContext) {
 /// first two `filter(array, x -> pred)` and `transform(array, x -> expr)`;
 /// argument order, 1-based lambda binding, and NULL/empty-array handling match,
 /// so a name alias is all that is needed. `any_match` is already a DataFusion
-/// alias for `array_any_match`, so it needs no work here.
+/// alias for `array_any_match`, so it needs no work here. `all_match` and
+/// `none_match` are custom `HigherOrderUDFImpl`s in [`crate::higher_order`]
+/// (registered separately from `register_scalar_fns`).
 ///
-/// Not covered (no DataFusion primitive, tracked on #354): `reduce` (Trino's
-/// two-lambda fold), and `all_match` / `none_match` (DataFusion ships only the
-/// `any_match` predicate). Those need a custom `HigherOrderUDFImpl` and are
-/// deliberately left to a follow-up rather than shimmed into wrong answers.
+/// Not covered (no DataFusion primitive, tracked on #354): `reduce`, Trino's
+/// two-lambda fold. It needs a multi-step lambda implementation and is left to
+/// a follow-up rather than shimmed into wrong answers.
 fn register_higher_order_aliases(ctx: &SessionContext) {
     for func in datafusion::functions_nested::all_default_higher_order_functions() {
         let trino_alias = match func.name() {
