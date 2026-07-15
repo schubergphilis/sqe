@@ -65,8 +65,8 @@ If FAIL: STOP. Capture the exact error. Revisit the backend decision in the spec
 
 **Phase 0: PASS on 2026-07-15.** `SELECT count(*) FROM golden.tpch_sf0_01.lineitem` returned `60000`, matching the local (non-attached) copy of the same table. Since `count(*)` alone can be answered from Iceberg manifest-list metadata without ever opening a Parquet file, this was followed up with `SELECT sum(l_quantity), min(l_shipdate) FROM golden.tpch_sf0_01.lineitem` (forces DataFusion to read actual column bytes) — result matched the local-catalog copy exactly (`sum = 1527864.00`, `min = 1992-01-03`), confirming genuine data-file reads over the custom S3 endpoint, not just a metadata-level answer. Full run log, exact commands, and two blockers hit along the way (both resolved without code changes) are in `.superpowers/sdd/task-1-report.md`. Summary of the two blockers:
 
-1. `ATTACH` requires an admin role (`service_admin`/`catalog_admin`) that the test stack's default `client_credentials` auth never grants (Polaris's own JWT has no `realm_access.roles` claim, so sessions get `roles: []`). Worked around for the spike with a `[[auth.providers]] type = "bearer_passthrough"` entry in a throwaway copy of the coordinator config (not committed to `tests/sqe-test.toml`), which assigns a fixed role list while still forwarding the caller's real bearer token as the session's catalog credential. Tasks 3/4 need to decide how `benchmark-attach-golden.sh` obtains an admin-capable credential against whatever coordinator it targets.
-2. **Real gap, not just environmental:** `crates/sqe-catalog/src/mount.rs::build_iceberg_rest` (the `ATTACH`-path catalog builder) sets only `uri`/`warehouse`/`token`/`prefix` — it never sets `s3.endpoint`/`s3.region`/`s3.access-key-id`/`s3.secret-access-key`/`s3.path-style-access` the way the default catalog builder (`crates/sqe-catalog/src/rest_catalog.rs:868-894`) does, and `ATTACH`'s SQL grammar has no options to carry them even if it did. Without them, FileIO fails with `region is missing` when it tries to read the manifest list from a non-AWS endpoint (RustFS/StorageGRID). Worked around for the spike by exporting `AWS_REGION`/`AWS_ENDPOINT_URL_S3`/`AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` in the coordinator process's environment (S3 FileIO falls back to the AWS SDK default chain). **Recommend Tasks 2/3 either standardize on setting these env vars wherever the golden-catalog coordinator runs, or add `S3_ENDPOINT`/`S3_REGION`/`S3_ACCESS_KEY`/`S3_SECRET_KEY` ATTACH options to `attach.rs` + `mount.rs` so the golden catalog's S3 config travels with the `ATTACH` statement instead of depending on ambient env vars.**
+1. `ATTACH` requires an admin role (`service_admin`/`catalog_admin`) that the test stack's default `client_credentials` auth never grants (Polaris's own JWT has no `realm_access.roles` claim, so sessions get `roles: []`). Worked around for the spike with a `[[auth.providers]] type = "bearer_passthrough"` entry in a throwaway copy of the coordinator config (not committed to `tests/sqe-test.toml`), which assigns a fixed role list while still forwarding the caller's real bearer token as the session's catalog credential. Task 2 (this plan's new ATTACH-config task) decides how `benchmark-attach-golden.sh` obtains an admin-capable credential against whatever coordinator it targets.
+2. **Real gap, not just environmental:** `crates/sqe-catalog/src/mount.rs::build_iceberg_rest` (the `ATTACH`-path catalog builder) sets only `uri`/`warehouse`/`token`/`prefix` — it never sets `s3.endpoint`/`s3.region`/`s3.access-key-id`/`s3.secret-access-key`/`s3.path-style-access` the way the default catalog builder (`crates/sqe-catalog/src/rest_catalog.rs:868-894`) does, and `ATTACH`'s SQL grammar has no options to carry them even if it did. Without them, FileIO fails with `region is missing` when it tries to read the manifest list from a non-AWS endpoint (RustFS/StorageGRID). Worked around for the spike by exporting `AWS_REGION`/`AWS_ENDPOINT_URL_S3`/`AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` in the coordinator process's environment (S3 FileIO falls back to the AWS SDK default chain). **Resolved in Task 2 (chose the proper fix): add `S3_ENDPOINT`/`S3_REGION`/`S3_ACCESS_KEY`/`S3_SECRET_KEY` ATTACH options to `attach.rs` + `mount.rs` so the golden catalog's S3 config travels with the `ATTACH` statement instead of depending on ambient env vars.**
 
 - [x] **Step 5: Commit the recorded outcome**
 
@@ -77,7 +77,125 @@ git commit -m "chore(bench): record Phase 0 attach spike outcome"
 
 ---
 
-## Task 2: `benchmark-publish-iceberg.sh` — publish golden tables once
+## Task 2: Add S3 options to ATTACH + bench attach coordinator config
+
+The Phase 0 spike (Task 1) proved attach works but ONLY via ambient `AWS_*` env vars: `build_iceberg_rest` in `mount.rs` never sets the `s3.*` FileIO props, so reading the manifest list from a non-AWS endpoint (RustFS/StorageGrid) fails with `region is missing`. Fix it properly so the golden catalog's S3 config travels in the `ATTACH` statement. Also commit a bench coordinator config that grants an admin role so `ATTACH` passes its admin gate (the spike used a throwaway `bearer_passthrough` provider).
+
+The ATTACH parser already collects arbitrary `KEY = 'value'` options into a `BTreeMap<String, OptionValue>` (verified in `attach.rs::parse_option_list`), so NO grammar change is needed. The work is: read five new options in `build_iceberg_rest`, plus the committed config.
+
+**Files:**
+- Modify: `crates/sqe-catalog/src/mount.rs` (add pure helper `s3_props_from_options`; call it in `build_iceberg_rest` after the existing `uri`/`warehouse`/`token`/`prefix` inserts).
+- Test: `crates/sqe-catalog/src/mount.rs` (unit test module for `s3_props_from_options`).
+- Create: `tests/benchmark-attach/coordinator-attach.toml` (bench coordinator config with a `bearer_passthrough` auth provider granting an admin role).
+- Reference: `crates/sqe-catalog/src/rest_catalog.rs:868-894` (exact `s3.*` prop keys), `crates/sqe-sql/src/attach.rs` (generic `parse_option_list`, `OptionValue::as_str`), `.superpowers/sdd/task-1-report.md` (the proven `bearer_passthrough` config snippet + the admin role names `service_admin`/`catalog_admin`), `crates/sqe-auth/src/factory.rs:241` + `crates/sqe-auth/src/bearer_passthrough.rs` (provider config fields `user`, `roles`; find the exact serde tag from `AuthProviderConfig`).
+
+**Interfaces:**
+- Consumes: nothing new (parser already collects options).
+- Produces: `ATTACH '<url>' AS golden (TYPE iceberg_rest, WAREHOUSE '<wh>', TOKEN '<tok>', S3_ENDPOINT '<url>', S3_REGION '<r>', S3_ACCESS_KEY '<k>', S3_SECRET_KEY '<s>', S3_PATH_STYLE 'true')` sets `s3.endpoint` / `s3.region` / `s3.access-key-id` / `s3.secret-access-key` / `s3.path-style-access` on the catalog props. Helper signature: `fn s3_props_from_options(options: &BTreeMap<String, OptionValue>) -> Vec<(String, String)>`. Tasks 3/4 consume these option names.
+
+- [ ] **Step 1: Write the failing test**
+
+Add to `crates/sqe-catalog/src/mount.rs` (bottom of file):
+
+```rust
+#[cfg(test)]
+mod s3_option_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    use sqe_sql::attach::OptionValue;
+
+    fn opt(s: &str) -> OptionValue { OptionValue::String(s.to_string()) }
+
+    #[test]
+    fn s3_options_map_to_props() {
+        let mut o = BTreeMap::new();
+        o.insert("S3_ENDPOINT".to_string(), opt("http://localhost:19000"));
+        o.insert("S3_REGION".to_string(), opt("us-east-1"));
+        o.insert("S3_ACCESS_KEY".to_string(), opt("ak"));
+        o.insert("S3_SECRET_KEY".to_string(), opt("sk"));
+        o.insert("S3_PATH_STYLE".to_string(), opt("true"));
+        let props: std::collections::HashMap<_, _> =
+            s3_props_from_options(&o).into_iter().collect();
+        assert_eq!(props.get("s3.endpoint").map(String::as_str), Some("http://localhost:19000"));
+        assert_eq!(props.get("s3.region").map(String::as_str), Some("us-east-1"));
+        assert_eq!(props.get("s3.access-key-id").map(String::as_str), Some("ak"));
+        assert_eq!(props.get("s3.secret-access-key").map(String::as_str), Some("sk"));
+        assert_eq!(props.get("s3.path-style-access").map(String::as_str), Some("true"));
+    }
+
+    #[test]
+    fn absent_s3_options_yield_no_props() {
+        let o: BTreeMap<String, OptionValue> = BTreeMap::new();
+        assert!(s3_props_from_options(&o).is_empty());
+    }
+}
+```
+
+Confirm the exact import path for `OptionValue` (it may be re-exported as `sqe_sql::attach::OptionValue` or `sqe_sql::OptionValue`); `mount.rs` already references `OptionValue`, so mirror its existing `use`.
+
+- [ ] **Step 2: Run it to verify it fails**
+
+Run: `cargo test -p sqe-catalog s3_option_tests`
+Expected: FAIL — `s3_props_from_options` is not defined.
+
+- [ ] **Step 3: Implement the helper and wire it into `build_iceberg_rest`**
+
+Add the helper (NOT behind the `rest` feature, so tests run without it):
+
+```rust
+/// Map ATTACH `S3_*` options to the `s3.*` catalog FileIO props the REST
+/// catalog builder consumes (mirrors `rest_catalog.rs:868-894`). Only
+/// present options produce props; absent ones are skipped so ambient config
+/// still applies as a fallback.
+fn s3_props_from_options(options: &BTreeMap<String, OptionValue>) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for (opt_key, prop_key) in [
+        ("S3_ENDPOINT", "s3.endpoint"),
+        ("S3_REGION", "s3.region"),
+        ("S3_ACCESS_KEY", "s3.access-key-id"),
+        ("S3_SECRET_KEY", "s3.secret-access-key"),
+        ("S3_PATH_STYLE", "s3.path-style-access"),
+    ] {
+        if let Some(v) = options.get(opt_key).and_then(OptionValue::as_str) {
+            out.push((prop_key.to_string(), v.to_string()));
+        }
+    }
+    out
+}
+```
+
+Then, in `build_iceberg_rest` (the `#[cfg(feature = "rest")]` one), after the existing `props.insert` calls for `uri`/`warehouse` and before `RestCatalogBuilder::default().load(...)`, add:
+
+```rust
+    for (k, v) in s3_props_from_options(options) {
+        props.insert(k, v);
+    }
+```
+
+- [ ] **Step 4: Run the test to verify it passes**
+
+Run: `cargo test -p sqe-catalog s3_option_tests`
+Expected: PASS (both tests).
+
+- [ ] **Step 5: Clippy + feature build**
+
+Run: `cargo clippy -p sqe-catalog --features rest -- -D warnings`
+Expected: no warnings. Confirms `build_iceberg_rest` still compiles with the new insert.
+
+- [ ] **Step 6: Create the bench attach coordinator config**
+
+Create `tests/benchmark-attach/coordinator-attach.toml`: start from `tests/sqe-test.toml` (or `tests/parity/coordinator-parity.toml`) and add a `bearer_passthrough` auth provider that assigns an admin role and forwards the caller's bearer as the catalog credential. Use the exact provider serde tag + fields from `crates/sqe-auth/src/factory.rs` and the working snippet recorded in `.superpowers/sdd/task-1-report.md`. The roles must include whatever the ATTACH admin gate checks (`service_admin`/`catalog_admin` per the spike). Add a header comment explaining this config exists so `ATTACH` passes its admin gate in the bench rig, and that it forwards the real bearer for catalog ACLs.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add crates/sqe-catalog/src/mount.rs tests/benchmark-attach/coordinator-attach.toml
+git commit -m "feat(attach): carry S3 endpoint/region/creds in ATTACH options + bench attach config"
+```
+
+---
+
+## Task 3: `benchmark-publish-iceberg.sh` — publish golden tables once
 
 Load each read-only suite's parquet into a persistent golden Polaris, once, idempotently. Mirrors `benchmark-publish-data.sh` (skip-if-present, `BENCH_FORCE=1` override) but the artifact is Iceberg tables via `sqe-bench load`, not raw parquet.
 
@@ -185,9 +303,9 @@ git commit -m "feat(bench): publish golden Iceberg tables once (benchmark-publis
 
 ---
 
-## Task 3: `benchmark-attach-golden.sh` (using existing `sqe-cli -e`)
+## Task 4: `benchmark-attach-golden.sh` (using existing `sqe-cli -e`)
 
-Issue the one-shot coordinator-wide `ATTACH` from a script. No new binary code: the existing `sqe-cli -e "<sql>"` (crates/sqe-cli/src/main.rs:312) runs a single statement over Flight, and ATTACH is coordinator-wide and persists, so one invocation is enough. Task 3 is just the wrapper script.
+Issue the one-shot coordinator-wide `ATTACH` from a script. No new binary code: the existing `sqe-cli -e "<sql>"` (crates/sqe-cli/src/main.rs:312) runs a single statement over Flight, and ATTACH is coordinator-wide and persists, so one invocation is enough. Task 4 is just the wrapper script.
 
 **Files:**
 - Create: `scripts/benchmark-attach-golden.sh`
@@ -224,13 +342,21 @@ Append:
 ```bash
 HOST="${BENCH_HOST:-localhost}"
 PORT="${BENCH_PORT_FLIGHT:-60051}"
-SQL="ATTACH '${BENCH_GOLDEN_POLARIS_URL}' AS golden (TYPE iceberg_rest, WAREHOUSE '${BENCH_GOLDEN_WAREHOUSE}', TOKEN '${BENCH_GOLDEN_TOKEN}')"
+# S3 config travels IN the ATTACH statement (Task 2 added these options), so
+# the golden catalog's FileIO reaches a custom endpoint without relying on
+# ambient AWS_* env vars on the coordinator.
+: "${BENCH_S3_ENDPOINT:?set BENCH_S3_ENDPOINT}"
+: "${BENCH_GOLDEN_S3_ACCESS_KEY:?set BENCH_GOLDEN_S3_ACCESS_KEY}"
+: "${BENCH_GOLDEN_S3_SECRET_KEY:?set BENCH_GOLDEN_S3_SECRET_KEY}"
+S3_REGION="${BENCH_S3_REGION:-us-east-1}"
+S3_PATH_STYLE="${BENCH_S3_PATH_STYLE:-true}"
+SQL="ATTACH '${BENCH_GOLDEN_POLARIS_URL}' AS golden (TYPE iceberg_rest, WAREHOUSE '${BENCH_GOLDEN_WAREHOUSE}', TOKEN '${BENCH_GOLDEN_TOKEN}', S3_ENDPOINT '${BENCH_S3_ENDPOINT}', S3_REGION '${S3_REGION}', S3_ACCESS_KEY '${BENCH_GOLDEN_S3_ACCESS_KEY}', S3_SECRET_KEY '${BENCH_GOLDEN_S3_SECRET_KEY}', S3_PATH_STYLE '${S3_PATH_STYLE}')"
 
 cargo run -q -p sqe-cli -- --host "$HOST" --port "$PORT" -e "$SQL"
 echo "attached golden: ${BENCH_GOLDEN_POLARIS_URL}"
 ```
 
-Adjust `--host`/`--port` (and any auth flags) to the exact `sqe-cli` arg names in `crates/sqe-cli/src/main.rs`. If a prebuilt binary is preferred, call `target/release/sqe-cli` instead of `cargo run`.
+Adjust `--host`/`--port` (and any auth flags) to the exact `sqe-cli` arg names in `crates/sqe-cli/src/main.rs`. If a prebuilt binary is preferred, call `target/release/sqe-cli` instead of `cargo run`. The coordinator this targets must run with the admin-capable config from Task 2 (`tests/benchmark-attach/coordinator-attach.toml`) so ATTACH passes its admin gate.
 
 - [ ] **Step 4: Verify against the running stack**
 
@@ -248,7 +374,7 @@ git commit -m "feat(bench): benchmark-attach-golden.sh (one-shot ATTACH via sqe-
 
 ---
 
-## Task 4: `benchmark-test.sh` attach mode + end-to-end parity smoke
+## Task 5: `benchmark-test.sh` attach mode + end-to-end parity smoke
 
 Wire an attach source into the run path: when `BENCH_DATA_SOURCE=attach`, skip generate+load for the read-only suites, attach golden once, and run `sqe-bench test --catalog golden`. Prove row-count parity against a freshly-loaded run.
 
@@ -257,7 +383,7 @@ Wire an attach source into the run path: when `BENCH_DATA_SOURCE=attach`, skip g
 - Reference: `crates/sqe-bench/src/test.rs` (`--catalog` qualification already exists), `benchmarks/expected/` (row-count baselines).
 
 **Interfaces:**
-- Consumes: Task 2 (golden tables exist), Task 3 (`benchmark-attach-golden.sh`), `sqe-bench test --catalog golden --namespace <ns>`.
+- Consumes: Task 3 (golden tables exist), Task 4 (`benchmark-attach-golden.sh`), `sqe-bench test --catalog golden --namespace <ns>`.
 - Produces: `BENCH_DATA_SOURCE=attach ./scripts/benchmark-test.sh <read-suite>` runs queries with zero load.
 
 - [ ] **Step 1: Write the failing parity check**
@@ -305,7 +431,7 @@ and thread `${BENCH_TEST_CATALOG:+--catalog $BENCH_TEST_CATALOG}` into every `sq
 
 - [ ] **Step 4: Run the parity smoke to verify it passes**
 
-Run (with golden published to local Polaris from Task 2, coordinator up, attach issued):
+Run (with golden published to local Polaris from Task 3, coordinator up, attach issued):
 `bash scripts/ci/attach-parity-smoke.sh`
 Expected: `PARITY OK: <n> rows both paths`.
 
@@ -323,7 +449,7 @@ git commit -m "feat(bench): attach mode in benchmark-test.sh + parity smoke"
 
 ---
 
-## Task 5: bench-internal shallow clone (Phase 2, gated on Tasks 1-4)
+## Task 6: bench-internal shallow clone (Phase 2, gated on Tasks 1-5)
 
 Add a clone step that makes a writable local copy of a golden table by copying its `metadata.json` into the local warehouse (rewriting `location` + write paths to local) and calling the existing `register_table`. Data files + manifests stay shared on the golden bucket.
 
@@ -333,7 +459,7 @@ Add a clone step that makes a writable local copy of a golden table by copying i
 - Reference: `crates/sqe-catalog/src/rest_catalog.rs:1838` (`register_table`), `crates/sqe-coordinator/src/maintenance.rs:161` (`system.register_table` CALL), the Iceberg `metadata.json` schema (`location`, `properties["write.data.path"]`, `properties["write.metadata.path"]`).
 
 **Interfaces:**
-- Consumes: golden catalog (Task 2), `register_table(ident, metadata_location)`.
+- Consumes: golden catalog (Task 3), `register_table(ident, metadata_location)`.
 - Produces: `sqe-bench clone --from golden.<ns>.<table> --to <localcat>.<ns>.<table>` creates a writable local table sharing golden data files. Function signature: `async fn shallow_clone(from: TableIdent, to: TableIdent, local_warehouse: &str) -> anyhow::Result<()>`.
 
 - [ ] **Step 1: Write the failing test**
@@ -408,16 +534,16 @@ git commit -m "feat(bench): shallow-clone step for write-suite golden tables"
 
 ---
 
-## Task 6: wire tpcc/tpce clone-then-write + golden-immutability check (Phase 2)
+## Task 7: wire tpcc/tpce clone-then-write + golden-immutability check (Phase 2)
 
 Use the clone step so the write suites run against a writable local copy while the golden tables stay untouched.
 
 **Files:**
 - Modify: `scripts/benchmark-test.sh` (write-suite branch), `scripts/ci/attach-parity-smoke.sh` (extend, or new `scripts/ci/clone-immutability-smoke.sh`).
-- Reference: Task 5 `sqe-bench clone`, `crates/sqe-catalog/src/iceberg_metadata_tvf.rs` (snapshot id read).
+- Reference: Task 6 `sqe-bench clone`, `crates/sqe-catalog/src/iceberg_metadata_tvf.rs` (snapshot id read).
 
 **Interfaces:**
-- Consumes: Task 5 (`sqe-bench clone`), golden tpcc/tpce tables (publish them via Task 2 with the write suites added to its suite list, or a `--include-write` flag).
+- Consumes: Task 6 (`sqe-bench clone`), golden tpcc/tpce tables (publish them via Task 3 with the write suites added to its suite list, or a `--include-write` flag).
 - Produces: `BENCH_DATA_SOURCE=attach ./scripts/benchmark-test.sh tpcc` clones then runs write DML; golden snapshot id unchanged.
 
 - [ ] **Step 1: Write the failing immutability check**
@@ -447,7 +573,7 @@ git commit -m "feat(bench): clone-then-write for tpcc/tpce with golden-immutabil
 
 ---
 
-## Task 7: docs + project-state updates
+## Task 8: docs + project-state updates
 
 **Files:**
 - Modify: `README.md` (roadmap), `nextsteps.md` (status), the design spec status line, and add a short usage section to `benchmarks/` docs or the scripts' header comments.
@@ -471,6 +597,6 @@ git commit -m "docs(bench): document attached-golden fast benchmark workflow"
 
 ## Self-Review
 
-- **Spec coverage:** Tier 1 (exists, no task). Tier 2 golden publish -> Task 2; attach -> Tasks 3-4; Tier 3 clone -> Tasks 5-6. Phase 0 spike -> Task 1. Error handling (loud attach failure, missing-golden guidance, clone conflict) -> covered in Task 2 skip-logic, Task 4 attach step, Task 6 branch; the "no silent fallback to load" constraint is enforced by attach mode skipping load unconditionally. Testing section -> Tasks 1, 4, 6. Location-pinning constraint -> Task 5 (`rewrite_metadata_for_local` keeps data paths).
+- **Spec coverage:** Tier 1 (exists, no task). ATTACH S3 config + admin cred -> Task 2. Tier 2 golden publish -> Task 3; attach -> Tasks 4-5; Tier 3 clone -> Tasks 6-7. Phase 0 spike -> Task 1. Error handling (loud attach failure, missing-golden guidance, clone conflict) -> covered in Task 3 skip-logic, Task 5 attach step, Task 7 branch; the "no silent fallback to load" constraint is enforced by attach mode skipping load unconditionally. Testing section -> Tasks 1, 5, 7. Location-pinning constraint -> Task 6 (`rewrite_metadata_for_local` keeps data paths).
 - **Placeholder scan:** each code step has concrete content; flag/signature exactness is deferred to the referenced source files by design (the CLI arg names are read from `cli.rs`), which is a lookup, not a placeholder.
-- **Type consistency:** `rewrite_metadata_for_local(&str, &str) -> Result<String>` used consistently in Task 5; `execute_update(&str)` matches flight.rs:175; `register_table(ident, metadata_location)` matches rest_catalog.rs:1838; catalog qualifier `golden` consistent across Tasks 3-6.
+- **Type consistency:** `rewrite_metadata_for_local(&str, &str) -> Result<String>` used consistently in Task 6; `s3_props_from_options(&BTreeMap<String, OptionValue>) -> Vec<(String, String)>` (Task 2) uses prop keys matching rest_catalog.rs:868-894; `register_table(ident, metadata_location)` matches rest_catalog.rs:1838; catalog qualifier `golden` consistent across Tasks 4-7.
