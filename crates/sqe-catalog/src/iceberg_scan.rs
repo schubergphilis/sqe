@@ -84,6 +84,15 @@ pub const DEFAULT_DIRECT_READ_CONCURRENCY: usize = 8;
 /// groups are smaller and the decode, not split planning, is the cost.
 pub const DEFAULT_SCAN_SPLIT_TARGET_SIZE: u64 = 32 * 1024 * 1024;
 
+/// Default fetch/decode pipelining depth (sqe#scan-fetch-pipeline) as a multiple of the
+/// CPU count. The fetch stage of a scan subtask is dominated by object
+/// store latency, not CPU, so several fetches per core keep the store's
+/// request pipeline full while the decode permits bound CPU and memory.
+/// Measured on SSB SF10 (32MB row-group subtasks against a local S3
+/// store): at 1x every decode permit parks in the fetch await and the
+/// scan sustains ~350MB/s; 3x saturates the store link.
+pub const DEFAULT_SCAN_FETCH_AHEAD_MULTIPLIER: usize = 3;
+
 /// Default number of output partitions for [`IcebergScanExec`].
 ///
 /// One partition means the scan runs serially on a single thread regardless of
@@ -191,6 +200,15 @@ pub struct IcebergScanExec {
     /// `target_partitions x num_cpus` (issue #367). Deliberately per scan
     /// node, not process-global: see `scan_memory` module docs.
     decode_permits: Arc<tokio::sync::Semaphore>,
+    /// Fetch/decode pipelining depth (sqe#scan-fetch-pipeline): number of subtasks that may
+    /// sit in their I/O-latency-bound fetch stage concurrently, scan-wide.
+    /// `0` disables staging (single-stage admission, the sqe#367 shape).
+    /// Sourced from `[catalog] scan_fetch_ahead`. Default 3x cores.
+    scan_fetch_ahead: usize,
+    /// Fetch-stage permits shared by every partition (and optimizer-rule
+    /// clone) of this scan node, sized `scan_fetch_ahead`. Rebuilt by
+    /// [`IcebergScanExec::with_scan_fetch_ahead`] at planning time.
+    fetch_permits: Arc<tokio::sync::Semaphore>,
 }
 
 impl IcebergScanExec {
@@ -264,7 +282,13 @@ impl IcebergScanExec {
         let decode_permits = Arc::new(tokio::sync::Semaphore::new(
             std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8),
         ));
-        Self { table, projected_schema, projection, predicates, df_filters, properties, metrics: ExecutionPlanMetricsSet::new(), snapshot_id: None, trust_sort_order: false, small_file_threshold_bytes: DEFAULT_SMALL_FILE_THRESHOLD_BYTES, pushed_down_filters: vec![], manifest_concurrency: DEFAULT_MANIFEST_CONCURRENCY, direct_read_concurrency: DEFAULT_DIRECT_READ_CONCURRENCY, target_partitions: DEFAULT_TARGET_PARTITIONS, cached_statistics: None, runtime_filter_clustering_skip: false, runtime_filter_uniform_threshold: 0.8, runtime_filter_wait_ms: DEFAULT_RUNTIME_FILTER_WAIT_MS, runtime_filter_bloom_probe: true, runtime_filter_bloom_max_values: 65536, decode_permits }
+        // Fetch stage is latency-bound, so its default depth is a multiple
+        // of the CPU-bound decode permits (sqe#scan-fetch-pipeline); measured on SSB SF10
+        // the pipeline is fetch-starved at 1x. See `with_scan_fetch_ahead`.
+        let scan_fetch_ahead = DEFAULT_SCAN_FETCH_AHEAD_MULTIPLIER
+            * std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8);
+        let fetch_permits = Arc::new(tokio::sync::Semaphore::new(scan_fetch_ahead));
+        Self { table, projected_schema, projection, predicates, df_filters, properties, metrics: ExecutionPlanMetricsSet::new(), snapshot_id: None, trust_sort_order: false, small_file_threshold_bytes: DEFAULT_SMALL_FILE_THRESHOLD_BYTES, pushed_down_filters: vec![], manifest_concurrency: DEFAULT_MANIFEST_CONCURRENCY, direct_read_concurrency: DEFAULT_DIRECT_READ_CONCURRENCY, target_partitions: DEFAULT_TARGET_PARTITIONS, cached_statistics: None, runtime_filter_clustering_skip: false, runtime_filter_uniform_threshold: 0.8, runtime_filter_wait_ms: DEFAULT_RUNTIME_FILTER_WAIT_MS, runtime_filter_bloom_probe: true, runtime_filter_bloom_max_values: 65536, decode_permits, scan_fetch_ahead, fetch_permits }
     }
 
     /// Attach pre-computed statistics aggregated from Iceberg manifests.
@@ -343,6 +367,24 @@ impl IcebergScanExec {
     pub fn with_runtime_filter_bloom(mut self, enabled: bool, max_values: usize) -> Self {
         self.runtime_filter_bloom_probe = enabled;
         self.runtime_filter_bloom_max_values = max_values;
+        self
+    }
+
+    /// Set the fetch/decode pipelining depth (sqe#scan-fetch-pipeline): how many scan
+    /// subtasks may sit in their I/O-latency-bound fetch stage (metadata
+    /// load + row-group column-chunk fetch + row-filter evaluation)
+    /// concurrently, scan-wide across all partitions. The CPU-bound decode
+    /// stage stays bounded by the `num_cpus` decode permits. `0` disables
+    /// staging: one admission covers a subtask's whole fetch + decode +
+    /// emit lifetime (the pre-sqe#scan-fetch-pipeline behavior), which caps in-flight I/O
+    /// at the decode-permit count and leaves remote object stores idle.
+    ///
+    /// Rebuilds the scan-wide fetch-permit semaphore, so call at planning
+    /// time (before `execute`), like the other builder-style setters.
+    #[must_use = "with_scan_fetch_ahead consumes self; bind the returned scan"]
+    pub fn with_scan_fetch_ahead(mut self, fetch_ahead: usize) -> Self {
+        self.scan_fetch_ahead = fetch_ahead;
+        self.fetch_permits = Arc::new(tokio::sync::Semaphore::new(fetch_ahead.max(1)));
         self
     }
 
@@ -450,6 +492,8 @@ impl IcebergScanExec {
             // Shared, not fresh: the rebuilt scan reads the same table in the
             // same query, so it stays under the same decode budget.
             decode_permits: self.decode_permits.clone(),
+            scan_fetch_ahead: self.scan_fetch_ahead,
+            fetch_permits: self.fetch_permits.clone(),
         }
     }
 
@@ -857,16 +901,29 @@ impl ExecutionPlan for IcebergScanExec {
         let runtime_filter_wait_ms = self.runtime_filter_wait_ms;
         let runtime_filter_bloom_probe = self.runtime_filter_bloom_probe;
         let runtime_filter_bloom_max_values = self.runtime_filter_bloom_max_values;
+        let scan_fetch_ahead = self.scan_fetch_ahead;
         // Decode admission (issue #367): every partition shares this scan
         // node's permits, and each admitted decode reserves its estimated
         // working set against the query's memory pool so pressure fails
-        // typed instead of OOM-killing the host.
-        let decode_gate = crate::scan_memory::ScanDecodeGate::new(
-            self.decode_permits.clone(),
-            context.runtime_env().memory_pool.clone(),
-            format!("iceberg-scan-decode:{}", self.table.identifier()),
-            crate::scan_memory::decode_tracking_enabled(),
-        );
+        // typed instead of OOM-killing the host. With fetch staging on
+        // (sqe#scan-fetch-pipeline), the gate additionally bounds the fetch stage with the
+        // scan-wide fetch permits and reserves fetched bytes 1x.
+        let decode_gate = if scan_fetch_ahead > 0 {
+            crate::scan_memory::ScanDecodeGate::new_with_fetch_permits(
+                self.decode_permits.clone(),
+                self.fetch_permits.clone(),
+                context.runtime_env().memory_pool.clone(),
+                format!("iceberg-scan-decode:{}", self.table.identifier()),
+                crate::scan_memory::decode_tracking_enabled(),
+            )
+        } else {
+            crate::scan_memory::ScanDecodeGate::new(
+                self.decode_permits.clone(),
+                context.runtime_env().memory_pool.clone(),
+                format!("iceberg-scan-decode:{}", self.table.identifier()),
+                crate::scan_memory::decode_tracking_enabled(),
+            )
+        };
         let baseline = BaselineMetrics::new(&self.metrics, partition);
         let _files_pruned_minmax = MetricBuilder::new(&self.metrics).counter("files_pruned_minmax", partition);
         let files_pruned_dynamic = MetricBuilder::new(&self.metrics).counter("files_pruned_dynamic", partition);
@@ -1326,6 +1383,10 @@ impl ExecutionPlan for IcebergScanExec {
             // decodes share the scan-wide permit budget and reserve their
             // estimated working set against the query pool.
             sb = sb.with_decode_gate(Arc::clone(&decode_gate) as Arc<dyn DecodeGate>);
+            // Fetch/decode pipelining (sqe#scan-fetch-pipeline): stage subtask fetch and
+            // decode under separate bounds so I/O depth is not capped by
+            // the decode permits. 0 keeps single-stage admission.
+            sb = sb.with_fetch_ahead(scan_fetch_ahead);
             // Bloom-filter row-group probing (issue #369): the vendored
             // reader tests sealed runtime-filter key sets against parquet
             // SBBFs and prunes row groups where every key is bloom-negative.

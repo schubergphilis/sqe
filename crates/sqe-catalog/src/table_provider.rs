@@ -56,6 +56,10 @@ pub struct SqeTableProvider {
     /// `bloom_max_values`.
     runtime_filter_bloom_probe: bool,
     runtime_filter_bloom_max_values: usize,
+    /// Fetch/decode pipelining depth (sqe#scan-fetch-pipeline), from `[catalog]
+    /// scan_fetch_ahead`. `None` = scan default (3x cores); `Some(0)` =
+    /// staging disabled; `Some(n)` = absolute depth.
+    scan_fetch_ahead: Option<usize>,
 }
 
 impl SqeTableProvider {
@@ -88,6 +92,7 @@ impl SqeTableProvider {
             runtime_filter_wait_ms: crate::iceberg_scan::DEFAULT_RUNTIME_FILTER_WAIT_MS,
             runtime_filter_bloom_probe: true,
             runtime_filter_bloom_max_values: 65536,
+            scan_fetch_ahead: None,
         })
     }
 
@@ -148,6 +153,15 @@ impl SqeTableProvider {
     pub fn with_runtime_filter_bloom(mut self, enabled: bool, max_values: usize) -> Self {
         self.runtime_filter_bloom_probe = enabled;
         self.runtime_filter_bloom_max_values = max_values;
+        self
+    }
+
+    /// Fetch/decode pipelining depth (sqe#scan-fetch-pipeline), from `[catalog]
+    /// scan_fetch_ahead`. Threads through to `IcebergScanExec`. `None`
+    /// keeps the scan's default (3x cores); `Some(0)` disables staging.
+    #[must_use = "with_scan_fetch_ahead consumes self; bind the returned provider"]
+    pub fn with_scan_fetch_ahead(mut self, fetch_ahead: Option<usize>) -> Self {
+        self.scan_fetch_ahead = fetch_ahead;
         self
     }
 
@@ -283,6 +297,9 @@ impl TableProvider for SqeTableProvider {
                 self.runtime_filter_bloom_probe,
                 self.runtime_filter_bloom_max_values,
             );
+        if let Some(fetch_ahead) = self.scan_fetch_ahead {
+            exec = exec.with_scan_fetch_ahead(fetch_ahead);
+        }
 
         // Pre-compute per-column min/max/null_count from manifest entries so
         // DataFusion's join-order optimizer sees real selectivity and picks

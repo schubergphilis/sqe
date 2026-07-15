@@ -1483,6 +1483,20 @@ pub struct CatalogConfig {
     /// Default: 64.
     #[serde(default = "default_manifest_concurrency")]
     pub manifest_concurrency: usize,
+    /// Fetch/decode pipelining depth for Iceberg scans (sqe#scan-fetch-pipeline): how many
+    /// scan subtasks may sit in their I/O-latency-bound fetch stage
+    /// (metadata load + row-group column-chunk fetch + row-filter
+    /// evaluation) concurrently, scan-wide. The CPU-bound decode stage
+    /// stays bounded by `num_cpus` decode permits, and fetched bytes are
+    /// reserved against the query memory pool, so raising this trades a
+    /// bounded amount of buffered compressed data for object-store
+    /// request-pipeline depth.
+    ///
+    /// Unset (default): 3x the CPU count. `0`: disable staging entirely
+    /// (single admission across fetch + decode + emit, the pre-sqe#scan-fetch-pipeline
+    /// behavior; A/B escape hatch). Any other value: absolute depth.
+    #[serde(default)]
+    pub scan_fetch_ahead: Option<usize>,
     /// Two-tier dynamic runtime-filter pushdown tuning (issue #132).
     #[serde(default)]
     pub runtime_filters: RuntimeFiltersConfig,
@@ -3714,6 +3728,13 @@ impl SqeConfig {
         env_override_u64("SQE_CATALOG__METADATA_CACHE_TTL_SECS", &mut self.catalog.metadata_cache_ttl_secs);
         env_override_u8("SQE_CATALOG__DEFAULT_TABLE_FORMAT_VERSION", &mut self.catalog.default_table_format_version);
         env_override_usize("SQE_CATALOG__MANIFEST_CONCURRENCY", &mut self.catalog.manifest_concurrency);
+        // sqe#scan-fetch-pipeline: A/B the fetch/decode pipelining depth without a config
+        // edit. `0` disables staging; unset keeps the config/default.
+        if let Ok(v) = std::env::var("SQE_CATALOG__SCAN_FETCH_AHEAD") {
+            if let Ok(n) = v.parse::<usize>() {
+                self.catalog.scan_fetch_ahead = Some(n);
+            }
+        }
 
         // Storage
         env_override_str("SQE_STORAGE__S3_ENDPOINT", &mut self.storage.s3_endpoint);
@@ -4295,6 +4316,7 @@ mod tests {
                 small_file_threshold_mb: 3,
                 parquet_compression: "zstd".to_string(),
                 manifest_concurrency: 64,
+                scan_fetch_ahead: None,
                 runtime_filters: RuntimeFiltersConfig::default(),
                 auth: None,
                 storage: None,
@@ -4941,6 +4963,7 @@ mod tests {
                 small_file_threshold_mb: 3,
                 parquet_compression: "zstd".to_string(),
                 manifest_concurrency: 64,
+                scan_fetch_ahead: None,
                 runtime_filters: RuntimeFiltersConfig::default(),
                 auth: None,
                 storage: None,
@@ -4971,6 +4994,7 @@ mod tests {
                     small_file_threshold_mb: 3,
                     parquet_compression: "zstd".to_string(),
                     manifest_concurrency: 64,
+                    scan_fetch_ahead: None,
                     runtime_filters: RuntimeFiltersConfig::default(),
                     auth: None,
                     storage: None,
@@ -5008,6 +5032,7 @@ mod tests {
                 small_file_threshold_mb: 3,
                 parquet_compression: "zstd".to_string(),
                 manifest_concurrency: 64,
+                scan_fetch_ahead: None,
                 runtime_filters: RuntimeFiltersConfig::default(),
                 auth: None,
                 storage: None,
