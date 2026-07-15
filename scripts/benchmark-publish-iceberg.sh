@@ -288,7 +288,7 @@ cleanup() {
   fi
   rm -f "$GOLDEN_COORD_CONFIG" "$GOLDEN_COORD_LOG"
 }
-trap cleanup EXIT
+trap cleanup EXIT INT TERM
 
 if [ "$NEEDS_COORDINATOR" = "1" ]; then
   start_golden_coordinator
@@ -367,8 +367,12 @@ for BENCH in "${SUITES[@]}"; do
   # exported ambiently in the caller's shell -- clap's env fallback on
   # `load`'s --client-id/--client-secret/--token-endpoint would otherwise
   # silently win over --username/--password even though this script never
-  # exports them itself.
+  # exports them itself. Same trap for SQE_NAMESPACE/SQE_CATALOG: those are
+  # also clap-env fallbacks on `load`, and an ambient SQE_NAMESPACE would
+  # make `load` write to a different namespace than the scale_fmt-derived
+  # one the REST skip-check above and `sqe-bench test` both expect.
   env -u SQE_TOKEN_ENDPOINT -u SQE_CLIENT_ID -u SQE_CLIENT_SECRET \
+    -u SQE_NAMESPACE -u SQE_CATALOG \
     "$BENCH_BIN" load "$BENCH" \
     --scale "$BENCH_SCALE" \
     --data "$BENCH_DATA_SOURCE" \
