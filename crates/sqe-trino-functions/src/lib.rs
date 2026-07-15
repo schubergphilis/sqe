@@ -20,6 +20,7 @@ pub mod aggregates;
 pub mod central_moments;
 pub mod coverage_fns;
 pub(crate) mod helpers;
+pub mod higher_order;
 pub mod histogram;
 pub mod map_aggregates;
 pub mod scalar_fns;
