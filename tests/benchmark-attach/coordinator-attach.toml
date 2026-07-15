@@ -1,0 +1,57 @@
+# SQE coordinator config for the benchmark-attach rig (Task 2/3/4 of the
+# "attach a golden Iceberg catalog" plan). Based on tests/sqe-test.toml, with
+# one addition: an explicit [[auth.providers]] entry using
+# `bearer_passthrough` so `ATTACH ... TYPE iceberg_rest` passes the
+# coordinator's admin gate (`require_admin`, crates/sqe-coordinator/src/
+# query_handler.rs), which requires a session role in `admin_roles`
+# (default ["service_admin", "catalog_admin"], crates/sqe-core/src/config.rs).
+#
+# Without this, the legacy `[auth]` OAuth2 client_credentials fallback derives
+# roles from the JWT's `roles_claim`, and Polaris's own client_credentials
+# token carries no such claim, so every session gets `roles: []` and ATTACH
+# always fails closed (proven in the Task 1 spike, see
+# .superpowers/sdd/task-1-report.md). `bearer_passthrough` instead (a)
+# forwards whatever bearer token the client presents verbatim as the
+# session's `catalog_token`, so Polaris/S3 ACL checks still run against the
+# real caller identity, and (b) assigns a fixed `roles` list from config,
+# independent of any JWT claim, satisfying the admin gate.
+#
+# This is a dev/bench-only auth posture (no local signature/expiry
+# validation of the bearer) -- do not reuse this file for a production
+# deployment.
+[coordinator]
+flight_sql_port = 60051
+trino_http_port = 18080
+memory_limit = "64GB"
+spill_to_disk = true
+spill_dir = "/tmp/sqe-bench-spill"
+spill_compression = "lz4"
+
+[metrics]
+prometheus_port = 19090
+
+[[auth.providers]]
+type = "bearer_passthrough"
+user = "root"
+roles = ["service_admin"]
+
+[query]
+query_profile = "all"
+max_result_rows = 10_000_000
+max_query_memory = "32GB"
+per_user_memory_budget = "0"
+timeout_secs = 1800
+
+[catalog]
+polaris_url = "http://localhost:18181/api/catalog"
+warehouse = "test_warehouse"
+
+[storage]
+s3_endpoint = "http://localhost:19000"
+s3_access_key = "s3admin"
+s3_secret_key = "s3admin"
+s3_region = "us-east-1"
+s3_path_style = true
+
+[storage.tvf]
+allow_local_paths = true
