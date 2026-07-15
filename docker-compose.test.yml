@@ -50,6 +50,15 @@ services:
       # to real AWS. The SDK env cannot force path-style, so the external
       # endpoint must support virtual-hosted addressing.
       AWS_ENDPOINT_URL_S3: ${POLARIS_S3_ENDPOINT:-http://rustfs:9000}
+    # Virtual-host-style resolution for an external warehouse served from
+    # the docker HOST (e.g. a native MinIO for fair-throughput benches on
+    # macOS, where the docker proxy caps container->host at ~250MB/s).
+    # Polaris' SDK-default metadata client cannot be forced to path-style
+    # (see AWS_ENDPOINT_URL_S3 note above), so `warehouse.<host>` must
+    # resolve; host-gateway points it at the host, and the store maps the
+    # Host header to the bucket (MinIO: set MINIO_DOMAIN).
+    extra_hosts:
+      - "warehouse.host.docker.internal:host-gateway"
     ports:
       - "18181:8181"
     healthcheck:

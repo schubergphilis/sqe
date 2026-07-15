@@ -62,6 +62,10 @@ pub fn decode_tracking_enabled() -> bool {
 #[derive(Debug)]
 pub struct ScanDecodeGate {
     permits: Arc<Semaphore>,
+    /// Fetch-stage permits (sqe#scan-fetch-pipeline): bounds how many subtasks may sit in
+    /// their I/O-latency-bound fetch stage concurrently, independent of
+    /// the CPU-bound decode permits above. `None` = fetch staging off.
+    fetch_permits: Option<Arc<Semaphore>>,
     pool: Arc<dyn MemoryPool>,
     /// Names the consumer in pool-denial errors, e.g.
     /// `iceberg-scan-decode:iceberg.tpch.lineitem`.
@@ -79,9 +83,57 @@ impl ScanDecodeGate {
     ) -> Arc<Self> {
         Arc::new(Self {
             permits,
+            fetch_permits: None,
             pool,
             label,
             track_memory,
+        })
+    }
+
+    /// Gate with a separate fetch-stage bound (sqe#scan-fetch-pipeline). `fetch_permits`
+    /// is shared across every partition of the scan node, like `permits`.
+    pub fn new_with_fetch_permits(
+        permits: Arc<Semaphore>,
+        fetch_permits: Arc<Semaphore>,
+        pool: Arc<dyn MemoryPool>,
+        label: String,
+        track_memory: bool,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            permits,
+            fetch_permits: Some(fetch_permits),
+            pool,
+            label,
+            track_memory,
+        })
+    }
+
+    /// Admit the FETCH stage of a subtask reading ~`estimated_bytes` of
+    /// compressed input: wait for a fetch permit, then reserve the
+    /// compressed size (1x — the fetch stage materializes compressed
+    /// column chunks, not the decoded working set) fail-fast. Falls back
+    /// to a full decode admission when no fetch permits were configured,
+    /// preserving single-stage semantics.
+    pub async fn admit_fetch(&self, estimated_bytes: u64) -> DFResult<DecodeAdmission> {
+        let Some(fetch_permits) = &self.fetch_permits else {
+            return self.admit(estimated_bytes).await;
+        };
+        let permit = fetch_permits
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        let reservation = if self.track_memory {
+            let estimate = usize::try_from(estimated_bytes).unwrap_or(usize::MAX);
+            let reservation = MemoryConsumer::new(self.label.clone()).register(&self.pool);
+            reservation.try_grow(estimate)?;
+            Some(reservation)
+        } else {
+            None
+        };
+        Ok(DecodeAdmission {
+            _permit: permit,
+            reservation,
         })
     }
 
@@ -123,6 +175,20 @@ impl DecodeGate for ScanDecodeGate {
                 // Carry the DataFusion message verbatim: it contains the
                 // "Resources exhausted"/"Failed to allocate" wording the
                 // coordinator classifies as RESOURCE_EXHAUSTED.
+                .map_err(|e| {
+                    iceberg::Error::new(iceberg::ErrorKind::Unexpected, e.to_string())
+                })?;
+            Ok(Box::new(admission) as Box<dyn Any + Send>)
+        })
+    }
+
+    fn admit_fetch(
+        &self,
+        estimated_bytes: u64,
+    ) -> BoxFuture<'_, iceberg::Result<Box<dyn Any + Send>>> {
+        Box::pin(async move {
+            let admission = ScanDecodeGate::admit_fetch(self, estimated_bytes)
+                .await
                 .map_err(|e| {
                     iceberg::Error::new(iceberg::ErrorKind::Unexpected, e.to_string())
                 })?;
@@ -171,6 +237,81 @@ mod tests {
             track,
         );
         (gate, pool)
+    }
+
+    /// Gate with independent fetch-stage permits (sqe#scan-fetch-pipeline).
+    fn staged_gate(
+        pool_bytes: usize,
+        permits: usize,
+        fetch_permits: usize,
+        track: bool,
+    ) -> (Arc<ScanDecodeGate>, Arc<dyn MemoryPool>) {
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(pool_bytes));
+        let gate = ScanDecodeGate::new_with_fetch_permits(
+            Arc::new(Semaphore::new(permits)),
+            Arc::new(Semaphore::new(fetch_permits)),
+            pool.clone(),
+            "iceberg-scan-decode:test".to_string(),
+            track,
+        );
+        (gate, pool)
+    }
+
+    #[tokio::test]
+    async fn admit_fetch_reserves_compressed_size_and_drop_releases() {
+        let (gate, pool) = staged_gate(1 << 30, 1, 4, true);
+        let admission = gate.admit_fetch(1024).await.expect("fetch admits");
+        // 1x compressed bytes, NOT the 4x decode estimate.
+        assert_eq!(admission.reserved_bytes(), 1024);
+        assert_eq!(pool.reserved(), 1024);
+        drop(admission);
+        assert_eq!(pool.reserved(), 0, "fetch reservation released on drop");
+    }
+
+    #[tokio::test]
+    async fn fetch_permits_bound_independently_of_decode_permits() {
+        // 1 decode permit, 2 fetch permits: two fetch admissions coexist
+        // with a held decode admission, the third fetch parks.
+        let (gate, _pool) = staged_gate(1 << 30, 1, 2, true);
+        let _decode = gate.admit(8).await.expect("decode admit");
+        let _f1 = gate.admit_fetch(8).await.expect("fetch 1");
+        let f2 = gate.admit_fetch(8).await.expect("fetch 2");
+        let mut f3 = Box::pin(gate.admit_fetch(8));
+        assert!(
+            f3.as_mut().now_or_never().is_none(),
+            "third fetch admission must park on the fetch permits"
+        );
+        drop(f2);
+        f3.await.expect("admitted after a fetch permit freed");
+    }
+
+    #[tokio::test]
+    async fn admit_fetch_denies_over_budget_typed_and_frees_permit() {
+        let (gate, pool) = staged_gate(64, 1, 1, true);
+        let err = gate.admit_fetch(1 << 20).await.expect_err("tiny pool denies");
+        assert!(
+            matches!(err, DataFusionError::ResourcesExhausted(_)),
+            "typed pool denial, got: {err}"
+        );
+        assert_eq!(pool.reserved(), 0, "denied fetch reserves nothing");
+        // The single fetch permit was returned on denial.
+        let ok = gate.admit_fetch(1).await.expect("permit was released");
+        assert!(ok.reserved_bytes() > 0);
+    }
+
+    #[tokio::test]
+    async fn admit_fetch_without_fetch_permits_falls_back_to_decode_admission() {
+        // Un-staged gate: admit_fetch == admit (single-stage semantics),
+        // including the 4x decode estimate and the decode permit.
+        let (gate, pool) = gate(1 << 30, 1, true);
+        let admission = gate.admit_fetch(1024).await.expect("fallback admits");
+        assert_eq!(
+            admission.reserved_bytes(),
+            1024 * DECODE_MEMORY_ESTIMATE_FACTOR as usize
+        );
+        assert_eq!(pool.reserved(), 1024 * DECODE_MEMORY_ESTIMATE_FACTOR as usize);
+        // It consumed the decode permit: a decode admit must park.
+        assert!(Box::pin(gate.admit(1)).now_or_never().is_none());
     }
 
     #[tokio::test]
