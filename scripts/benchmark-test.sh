@@ -94,17 +94,41 @@ SQE_PASSWORD="${SQE_PASSWORD:-}"
 # The generate step is skipped and the load's read_parquet() call gets the
 # bucket's credentials inline. The warehouse (where the Iceberg tables are
 # written) is unaffected — it stays on the test stack's RustFS.
+#
+# BENCH_DATA_SOURCE=attach skips generate AND load for the read-only suites:
+# a preloaded "golden" Iceberg catalog is ATTACHed once (scripts/
+# benchmark-attach-golden.sh) and every `sqe-bench test` call is qualified
+# with `--catalog golden` instead. tpcc/tpce (write workloads) and bank
+# (direct-to-Iceberg) are not published to golden, so they still
+# generate+load normally even in attach mode -- see is_attach_read_only()
+# below and scripts/benchmark-publish-iceberg.sh's ALL_READ_SUITES.
+#   BENCH_GOLDEN_POLARIS_URL=http://localhost:18181/api/catalog \
+#   BENCH_GOLDEN_WAREHOUSE=quickstart_catalog BENCH_GOLDEN_TOKEN=<bearer> \
+#   BENCH_S3_ENDPOINT=http://localhost:19000 \
+#   BENCH_GOLDEN_S3_ACCESS_KEY=... BENCH_GOLDEN_S3_SECRET_KEY=... \
+#   BENCH_DATA_SOURCE=attach BENCH_SCALE=0.01 ./scripts/benchmark-test.sh tpch
 BENCH_DATA_SOURCE="${BENCH_DATA_SOURCE:-generate}"
 BENCH_S3_PROFILE="${BENCH_S3_PROFILE:-default}"
 BENCH_S3_ENDPOINT="${BENCH_S3_ENDPOINT:-}"
 BENCH_S3_REGION="${BENCH_S3_REGION:-us-east-1}"
 
+ATTACH_READ_ONLY_SUITES=(tpch ssb tpcds tpcbb clickbench)
+is_attach_read_only() {
+    local b
+    for b in "${ATTACH_READ_ONLY_SUITES[@]}"; do
+        [ "$b" = "$1" ] && return 0
+    done
+    return 1
+}
+
 EXTERNAL_DATA=""
+ATTACH_MODE=""
 case "$BENCH_DATA_SOURCE" in
     s3://*) EXTERNAL_DATA=1 ;;
     generate) ;;
+    attach) ATTACH_MODE=1 ;;
     *)
-        echo "ERROR: BENCH_DATA_SOURCE must be 'generate' or an s3:// URL, got: '$BENCH_DATA_SOURCE'" >&2
+        echo "ERROR: BENCH_DATA_SOURCE must be 'generate', 'attach', or an s3:// URL, got: '$BENCH_DATA_SOURCE'" >&2
         exit 1
         ;;
 esac
@@ -164,6 +188,26 @@ if [ "$BENCH_WAREHOUSE" = "external" ]; then
         echo "ERROR: could not resolve S3 credentials from profile '$BENCH_S3_PROFILE'" >&2
         exit 1
     fi
+fi
+
+if [ -n "$ATTACH_MODE" ]; then
+    # coordinator-attach.toml (below) hardcodes the local test stack's
+    # Polaris/RustFS as the primary catalog, so it does not get the
+    # BENCH_WAREHOUSE=external templating tests/sqe-test.toml does.
+    if [ "$BENCH_WAREHOUSE" != "local" ]; then
+        echo "ERROR: BENCH_DATA_SOURCE=attach only supports BENCH_WAREHOUSE=local" >&2
+        exit 1
+    fi
+    # Fail fast, before build/docker: benchmark-attach-golden.sh re-checks
+    # these same vars, but that call happens after the stack and coordinator
+    # are already up. Catching a missing var here avoids burning that time
+    # and guarantees attach mode never silently falls back to a full load.
+    : "${BENCH_GOLDEN_POLARIS_URL:?BENCH_DATA_SOURCE=attach requires BENCH_GOLDEN_POLARIS_URL}"
+    : "${BENCH_GOLDEN_WAREHOUSE:?BENCH_DATA_SOURCE=attach requires BENCH_GOLDEN_WAREHOUSE}"
+    : "${BENCH_GOLDEN_TOKEN:?BENCH_DATA_SOURCE=attach requires BENCH_GOLDEN_TOKEN}"
+    : "${BENCH_S3_ENDPOINT:?BENCH_DATA_SOURCE=attach requires BENCH_S3_ENDPOINT (golden warehouse bucket)}"
+    : "${BENCH_GOLDEN_S3_ACCESS_KEY:?BENCH_DATA_SOURCE=attach requires BENCH_GOLDEN_S3_ACCESS_KEY}"
+    : "${BENCH_GOLDEN_S3_SECRET_KEY:?BENCH_DATA_SOURCE=attach requires BENCH_GOLDEN_S3_SECRET_KEY}"
 fi
 
 # Build profile: `release` (default) uses `cargo build --release` and
@@ -268,7 +312,15 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 echo "  Starting SQE coordinator..."
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 SQE_LOG_FILE="/tmp/sqe-bench-coord-$$.log"
-SQE_CONFIG="$ROOT_DIR/tests/sqe-test.toml"
+if [ -n "$ATTACH_MODE" ]; then
+    # coordinator-attach.toml is tests/sqe-test.toml plus a bearer_passthrough
+    # auth provider that grants the admin role ATTACH's require_admin gate
+    # needs (Task 2); same local Polaris/RustFS test stack otherwise, so
+    # bootstrap-test.sh above still applies unchanged.
+    SQE_CONFIG="$ROOT_DIR/tests/benchmark-attach/coordinator-attach.toml"
+else
+    SQE_CONFIG="$ROOT_DIR/tests/sqe-test.toml"
+fi
 
 # Generate a temp coordinator config when anything is external:
 # - External data source: read_parquet() carries an inline `endpoint =>`
@@ -532,6 +584,20 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# ── Attach golden catalog (BENCH_DATA_SOURCE=attach) ──────────
+# ATTACH is coordinator-wide and persists for the coordinator's lifetime, so
+# one shot here covers every suite in this run; scripts/benchmark-test.sh
+# threads --catalog golden into each `sqe-bench test` call below.
+BENCH_TEST_CATALOG=""
+if [ -n "$ATTACH_MODE" ]; then
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "  Attach mode: attaching golden catalog..."
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    bash "$SCRIPT_DIR/benchmark-attach-golden.sh"
+    BENCH_TEST_CATALOG="golden"
+fi
+
 # ── Run benchmarks ────────────────────────────────────────────
 TOTAL_PASS=0
 TOTAL_FAIL=0
@@ -551,8 +617,12 @@ for BENCH in "${BENCHMARKS[@]}"; do
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
     # TPC-BB reuses all TPC-DS tables.  Ensure they are generated and loaded
-    # before the TPC-BB-specific tables are added.
-    if [ "$BENCH" = "tpcbb" ] && [ -z "$TPCDS_LOADED" ]; then
+    # before the TPC-BB-specific tables are added. In attach mode the golden
+    # catalog already carries tpcds -- nothing to load.
+    if [ "$BENCH" = "tpcbb" ] && [ -n "$ATTACH_MODE" ]; then
+        echo ""
+        echo "  [pre] Attach mode: golden catalog already provides TPC-DS tables for TPC-BB"
+    elif [ "$BENCH" = "tpcbb" ] && [ -z "$TPCDS_LOADED" ]; then
         echo ""
         echo "  [pre] TPC-BB requires TPC-DS tables — generating and loading..."
         if [ -z "$EXTERNAL_DATA" ]; then
@@ -669,6 +739,12 @@ for BENCH in "${BENCHMARKS[@]}"; do
         done
     else
 
+    if [ -n "$ATTACH_MODE" ] && is_attach_read_only "$BENCH"; then
+        echo ""
+        echo "  [1-2/3] Attach mode: skipping generate+load, querying golden.$BENCH via catalog=$BENCH_TEST_CATALOG"
+        if [ "$BENCH" = "tpcds" ]; then TPCDS_LOADED=1; fi
+    else
+
     # ── Step 1: Generate ──────────────────────────────────────
     echo ""
     if [ -n "$EXTERNAL_DATA" ]; then
@@ -742,12 +818,21 @@ for BENCH in "${BENCHMARKS[@]}"; do
     echo "  ✓ Loaded in $((LOAD_END - LOAD_START))s"
     if [ "$BENCH" = "tpcds" ]; then TPCDS_LOADED=1; fi
 
+    fi # end attach-mode skip for read-only suites
+
     fi # end bank / staged-load branch
 
     # ── Step 3: Test ──────────────────────────────────────────
     echo ""
     echo "  [3/3] Running queries..."
-    TEST_START=$(date +%s)
+    # BENCH_TEST_CATALOG is set once for the whole run (ATTACH is
+    # coordinator-wide), but only the read-only suites actually live in the
+    # golden catalog -- tpcc/tpce/bank still loaded into the primary catalog
+    # above even in attach mode, so they must NOT get --catalog golden here.
+    CATALOG_ARGS=()
+    if [ -n "$ATTACH_MODE" ] && is_attach_read_only "$BENCH"; then
+        CATALOG_ARGS=(--catalog "$BENCH_TEST_CATALOG")
+    fi
     TEST_LOG="/tmp/sqe-bench-test-$$.log"
     "$BENCH_BIN" test "$BENCH" \
         --scale "$BENCH_SCALE" \
@@ -755,8 +840,8 @@ for BENCH in "${BENCHMARKS[@]}"; do
         --host "$BENCH_HOST" \
         --port "$BENCH_PORT" \
         --username "$SQE_USERNAME" \
-        --password "$SQE_PASSWORD" 2>&1 | tee "$TEST_LOG" || true
-    TEST_END=$(date +%s)
+        --password "$SQE_PASSWORD" \
+        ${CATALOG_ARGS[@]+"${CATALOG_ARGS[@]}"} 2>&1 | tee "$TEST_LOG" || true
 
     # Parse the BENCH_SUMMARY line: name:pass:fail:diff:skip:error:total:ms
     SUMMARY_LINE=$(grep "^BENCH_SUMMARY:" "$TEST_LOG" | tail -1)
