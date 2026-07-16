@@ -8,12 +8,88 @@ use std::io::Read;
 use std::sync::Arc;
 
 use datafusion::catalog::TableProvider;
+use datafusion::datasource::listing::ListingTableUrl;
 use datafusion::datasource::MemTable;
 use datafusion::error::{DataFusionError, Result as DFResult};
+use datafusion::execution::context::SessionContext;
+use datafusion::execution::runtime_env::RuntimeEnv;
+use object_store::{ObjectStore, ObjectStoreExt};
 
+use sqe_core::config::StorageConfig;
+
+use crate::file_tvf_common::{
+    register_azure_store_if_needed, register_gcs_store_if_needed, register_http_store_if_needed,
+    register_s3_store_if_needed, FileTvfArgs,
+};
 use crate::read_json::{JsonCompression, JsonFraming};
 
 const FN_NAME: &str = "read_json";
+
+/// Fetch the whole object, decompress, reshape to NDJSON, decode to a MemTable.
+/// The caller MUST have already run `enforce_tvf_path_policy` on `args` — this
+/// function fetches bytes directly via `object_store`, bypassing ListingTable,
+/// so the gate is the only thing preventing arbitrary local-path reads
+/// (`/etc/shadow`) or SSRF against link-local/metadata endpoints.
+pub(crate) async fn build_buffer_table(
+    args: &FileTvfArgs,
+    framing: JsonFraming,
+    codec: JsonCompression,
+    max_bytes: usize,
+    storage: &StorageConfig,
+    runtime_env: Option<&RuntimeEnv>,
+) -> DFResult<Arc<dyn TableProvider>> {
+    let listing_url = ListingTableUrl::parse(&args.path)?;
+
+    let tmp_ctx = SessionContext::new();
+    register_s3_store_if_needed(FN_NAME, &tmp_ctx, args, storage, runtime_env)?;
+    register_azure_store_if_needed(FN_NAME, &tmp_ctx, args, storage)?;
+    register_gcs_store_if_needed(FN_NAME, &tmp_ctx, args, storage)?;
+    register_http_store_if_needed(FN_NAME, &tmp_ctx, &args.path)?;
+
+    let store: Arc<dyn ObjectStore> = tmp_ctx.state().runtime_env().object_store(&listing_url)?;
+    let path = listing_url.prefix().clone();
+
+    let meta = store
+        .head(&path)
+        .await
+        .map_err(|e| DataFusionError::Plan(format!("{FN_NAME}: cannot stat '{}': {e}", args.path)))?;
+    if meta.size as usize > max_bytes {
+        return Err(DataFusionError::Plan(format!(
+            "{FN_NAME}: '{}' is {} bytes, exceeds max_buffer_bytes {} (raise max_buffer_bytes to read it)",
+            args.path, meta.size, max_bytes
+        )));
+    }
+
+    let raw = store
+        .get(&path)
+        .await
+        .map_err(|e| DataFusionError::Plan(format!("{FN_NAME}: fetch '{}' failed: {e}", args.path)))?
+        .bytes()
+        .await
+        .map_err(|e| DataFusionError::Plan(format!("{FN_NAME}: read '{}' failed: {e}", args.path)))?
+        .to_vec();
+
+    let ndjson = match codec {
+        JsonCompression::Zip => decompress_zip_to_ndjson(raw, framing)?,
+        other => {
+            let inner = decompress(raw, other)?;
+            let resolved = match framing {
+                JsonFraming::Auto => detect_framing(&inner),
+                f => f,
+            };
+            match resolved {
+                JsonFraming::Array => reshape_array_to_ndjson(&inner)?,
+                _ => inner,
+            }
+        }
+    };
+
+    decode_ndjson_to_memtable(&ndjson)
+}
+
+fn detect_framing(bytes: &[u8]) -> JsonFraming {
+    crate::read_json::detect_framing_from_bytes(bytes)
+}
 
 /// Parse a top-level JSON value. An array becomes one line per element; a
 /// bare object becomes a single line. Anything else is an error.
@@ -296,6 +372,37 @@ mod tests {
         }
         let nd = decompress_zip_to_ndjson(buf, JsonFraming::NewlineDelimited).unwrap();
         assert_eq!(String::from_utf8(nd).unwrap().lines().count(), 2);
+    }
+
+    #[tokio::test]
+    async fn buffer_size_guard_rejects_oversized() {
+        // Exercises the `head()`-based size guard in `build_buffer_table`
+        // directly (bypassing `enforce_tvf_path_policy`, which is the
+        // caller's job — see the security tests in `read_json.rs`). A tiny
+        // `max_bytes` cap must reject the file before any `get()` fetch.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.json");
+        std::fs::write(&path, b"[{\"a\":1},{\"a\":2}]").unwrap();
+
+        let args = FileTvfArgs {
+            path: path.display().to_string(),
+            ..Default::default()
+        };
+        let err = build_buffer_table(
+            &args,
+            JsonFraming::Array,
+            JsonCompression::None,
+            4, // smaller than the file
+            &StorageConfig::default(),
+            None,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("exceeds max_buffer_bytes"),
+            "expected a size-guard rejection, got: {err}"
+        );
     }
 
     #[test]

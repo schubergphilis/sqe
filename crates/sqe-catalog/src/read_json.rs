@@ -42,6 +42,10 @@ use crate::file_tvf_common::{
 
 const FN_NAME: &str = "read_json";
 
+/// Default cap for the buffer path (zip / full-array). Mislabeled huge inputs
+/// fail with a clear message instead of OOM. Overridable later via a named arg.
+const DEFAULT_MAX_BUFFER_BYTES: usize = 512 * 1024 * 1024;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum JsonFraming {
     Auto,
@@ -240,19 +244,44 @@ impl TableFunctionImpl for ReadJsonFunction {
             &self.caller,
         )?;
 
+        let framing = json_opts.framing.unwrap_or(JsonFraming::Auto);
         let compression = json_opts
             .compression
             .unwrap_or_else(|| compression_from_extension(&args.path));
 
-        // Router (buffer branch added in Task 6): framing first, then zip.
+        // Router: a top-level array (explicit `format => 'array'`) or a zip
+        // archive cannot be served by DataFusion's streaming JSON listing
+        // table, so both route to the buffer path (whole-object fetch +
+        // decode). Everything else streams. Both branches run only after
+        // `enforce_tvf_path_policy` above.
+        let use_buffer =
+            matches!(framing, JsonFraming::Array) || matches!(compression, JsonCompression::Zip);
+
         let storage = self.storage.clone();
         let runtime_env = self.runtime_env.clone();
-        let df_compression = streaming_compression(compression);
-        crate::runtime_bridge::block_on_compat(async move {
-            build_json_listing_table(&args, &json_opts, df_compression, &storage, runtime_env.as_deref())
+
+        if use_buffer {
+            let max_bytes = DEFAULT_MAX_BUFFER_BYTES;
+            crate::runtime_bridge::block_on_compat(async move {
+                crate::read_json_buffer::build_buffer_table(
+                    &args,
+                    framing,
+                    compression,
+                    max_bytes,
+                    &storage,
+                    runtime_env.as_deref(),
+                )
                 .await
-        })
-        .ok_or_else(|| DataFusionError::Plan(format!("{FN_NAME}: no tokio runtime available")))?
+            })
+            .ok_or_else(|| DataFusionError::Plan(format!("{FN_NAME}: no tokio runtime available")))?
+        } else {
+            let df_compression = streaming_compression(compression);
+            crate::runtime_bridge::block_on_compat(async move {
+                build_json_listing_table(&args, &json_opts, df_compression, &storage, runtime_env.as_deref())
+                    .await
+            })
+            .ok_or_else(|| DataFusionError::Plan(format!("{FN_NAME}: no tokio runtime available")))?
+        }
     }
 }
 
@@ -406,5 +435,74 @@ mod tests {
             .unwrap()
             .value(0);
         assert_eq!(n, 2);
+    }
+
+    #[tokio::test]
+    async fn reads_full_array_local() {
+        use datafusion::prelude::SessionContext;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.json");
+        std::fs::write(&path, b"[{\"a\":1},{\"a\":2},{\"a\":3}]").unwrap();
+
+        let storage = StorageConfig {
+            tvf: sqe_core::config::TvfPolicy {
+                allow_local_paths: true,
+                ..Default::default()
+            },
+            ..StorageConfig::default()
+        };
+        let ctx = SessionContext::new();
+        ctx.register_udtf("read_json", Arc::new(ReadJsonFunction::new(storage)));
+        let df = ctx
+            .sql(&format!(
+                "SELECT count(*) AS n FROM read_json('{}', 'format=array')",
+                path.display()
+            ))
+            .await
+            .unwrap();
+        let n = df.collect().await.unwrap()[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::Int64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(n, 3);
+    }
+
+    #[tokio::test]
+    async fn buffer_path_rejects_local_secret() {
+        use datafusion::prelude::SessionContext;
+        let ctx = SessionContext::new();
+        ctx.register_udtf(
+            "read_json",
+            Arc::new(ReadJsonFunction::new(StorageConfig::default())),
+        );
+        // Anonymous caller + a sensitive absolute path must be denied by
+        // policy, BEFORE any object-store fetch. format=array forces the
+        // buffer path (the streaming path would also be denied the same
+        // way, but this specifically exercises the buffer dispatch).
+        //
+        // The positional `'format=array'` form (rather than `format =>
+        // 'array'`) is used because this test calls `ctx.sql()` on a raw
+        // `SessionContext` that hasn't gone through the coordinator's
+        // `rewrite_named_tvf_args` preprocessing (see
+        // `crates/sqe-sql/src/tvf_named_args.rs`); DataFusion 54 rejects
+        // `FunctionArg::Named` at the SQL-planner level before it ever
+        // reaches this TVF's `call()`, so `format => 'array'` here would
+        // fail on an unrelated parser error instead of exercising the
+        // policy gate.
+        let res = ctx
+            .sql("SELECT * FROM read_json('/etc/shadow', 'format=array')")
+            .await;
+        // Either plan-time or collect-time error; assert it errors and never reads.
+        let err = match res {
+            Err(e) => e.to_string(),
+            Ok(df) => format!("{:?}", df.collect().await.err()),
+        };
+        assert!(
+            err.to_lowercase().contains("local filesystem paths are disabled")
+                || err.to_lowercase().contains("allow_local_paths"),
+            "expected a policy denial, got: {err}"
+        );
     }
 }
