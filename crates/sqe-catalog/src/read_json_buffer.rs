@@ -38,12 +38,15 @@ pub(crate) async fn build_buffer_table(
     storage: &StorageConfig,
     runtime_env: Option<&RuntimeEnv>,
 ) -> DFResult<Arc<dyn TableProvider>> {
+    let mut args = args.clone();
+    crate::file_tvf_common::rewrite_hf_path_in_place(FN_NAME, &mut args)?;
+
     let listing_url = ListingTableUrl::parse(&args.path)?;
 
     let tmp_ctx = SessionContext::new();
-    register_s3_store_if_needed(FN_NAME, &tmp_ctx, args, storage, runtime_env)?;
-    register_azure_store_if_needed(FN_NAME, &tmp_ctx, args, storage)?;
-    register_gcs_store_if_needed(FN_NAME, &tmp_ctx, args, storage)?;
+    register_s3_store_if_needed(FN_NAME, &tmp_ctx, &args, storage, runtime_env)?;
+    register_azure_store_if_needed(FN_NAME, &tmp_ctx, &args, storage)?;
+    register_gcs_store_if_needed(FN_NAME, &tmp_ctx, &args, storage)?;
     register_http_store_if_needed(FN_NAME, &tmp_ctx, &args.path)?;
 
     let store: Arc<dyn ObjectStore> = tmp_ctx.state().runtime_env().object_store(&listing_url)?;
