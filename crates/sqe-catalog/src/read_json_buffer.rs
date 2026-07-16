@@ -71,6 +71,64 @@ pub(crate) fn decompress(bytes: Vec<u8>, codec: JsonCompression) -> DFResult<Vec
     }
 }
 
+/// Read every JSON-extension entry from a zip archive, reshape each per the
+/// resolved framing, and concatenate into one NDJSON byte stream. Entries
+/// whose name does not end in .json/.jsonl/.ndjson are ignored. Zero JSON
+/// entries is an error.
+pub(crate) fn decompress_zip_to_ndjson(
+    bytes: Vec<u8>,
+    framing: JsonFraming,
+) -> DFResult<Vec<u8>> {
+    use std::io::Cursor;
+    let mut archive = zip::ZipArchive::new(Cursor::new(bytes))
+        .map_err(|e| DataFusionError::Plan(format!("{FN_NAME}: not a valid zip: {e}")))?;
+
+    let mut out = Vec::new();
+    let mut json_entries = 0usize;
+    for i in 0..archive.len() {
+        let mut entry = archive
+            .by_index(i)
+            .map_err(|e| DataFusionError::Plan(format!("{FN_NAME}: zip entry read failed: {e}")))?;
+        if entry.is_dir() {
+            continue;
+        }
+        let name = entry.name().to_ascii_lowercase();
+        if !(name.ends_with(".json") || name.ends_with(".jsonl") || name.ends_with(".ndjson")) {
+            continue;
+        }
+        let mut raw = Vec::new();
+        entry
+            .read_to_end(&mut raw)
+            .map_err(|e| DataFusionError::Plan(format!("{FN_NAME}: zip entry decompress failed: {e}")))?;
+
+        // Resolve framing per entry when Auto.
+        let entry_framing = match framing {
+            JsonFraming::Auto => crate::read_json::detect_framing_from_bytes(&raw),
+            other => other,
+        };
+        let nd = match entry_framing {
+            JsonFraming::Array => reshape_array_to_ndjson(&raw)?,
+            _ => {
+                // Ensure trailing newline so concatenation stays line-safe.
+                let mut v = raw;
+                if !v.ends_with(b"\n") {
+                    v.push(b'\n');
+                }
+                v
+            }
+        };
+        out.extend_from_slice(&nd);
+        json_entries += 1;
+    }
+
+    if json_entries == 0 {
+        return Err(DataFusionError::Plan(format!(
+            "{FN_NAME}: zip archive contains no .json/.jsonl/.ndjson entries"
+        )));
+    }
+    Ok(out)
+}
+
 pub(crate) fn decode_ndjson_to_memtable(ndjson: &[u8]) -> DFResult<Arc<dyn TableProvider>> {
     use arrow::json::reader::infer_json_schema;
     use arrow::json::ReaderBuilder;
@@ -168,5 +226,39 @@ mod tests {
         use crate::read_json::JsonCompression;
         assert!(decompress(vec![], JsonCompression::Zip).is_err());
         assert!(decompress(vec![], JsonCompression::Zstd).is_err());
+    }
+
+    #[test]
+    fn zip_concatenates_json_entries() {
+        use std::io::Write;
+        use zip::write::SimpleFileOptions;
+        let mut buf = Vec::new();
+        {
+            let mut zw = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            let opts = SimpleFileOptions::default();
+            zw.start_file("a.jsonl", opts).unwrap();
+            zw.write_all(b"{\"a\":1}\n").unwrap();
+            zw.start_file("README.txt", opts).unwrap(); // ignored (non-json)
+            zw.write_all(b"ignore me").unwrap();
+            zw.start_file("b.jsonl", opts).unwrap();
+            zw.write_all(b"{\"a\":2}\n").unwrap();
+            zw.finish().unwrap();
+        }
+        let nd = decompress_zip_to_ndjson(buf, JsonFraming::NewlineDelimited).unwrap();
+        assert_eq!(String::from_utf8(nd).unwrap().lines().count(), 2);
+    }
+
+    #[test]
+    fn zip_with_no_json_entry_errors() {
+        use std::io::Write;
+        use zip::write::SimpleFileOptions;
+        let mut buf = Vec::new();
+        {
+            let mut zw = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            zw.start_file("README.txt", SimpleFileOptions::default()).unwrap();
+            zw.write_all(b"nope").unwrap();
+            zw.finish().unwrap();
+        }
+        assert!(decompress_zip_to_ndjson(buf, JsonFraming::Auto).is_err());
     }
 }
