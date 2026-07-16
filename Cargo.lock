@@ -6385,6 +6385,7 @@ dependencies = [
  "datafusion",
  "datafusion-expr",
  "datasketches",
+ "flate2",
  "futures",
  "iceberg",
  "iceberg-catalog-glue",
