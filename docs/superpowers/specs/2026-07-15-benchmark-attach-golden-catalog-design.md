@@ -1,7 +1,7 @@
 # Benchmark: attach preloaded golden Iceberg tables to speed up testing
 
 Date: 2026-07-15
-Status: design approved, pending spec review
+Status: Phase 1 (read-path attach) delivered on this branch; Phase 2 (write-suite shallow clone) deferred to a follow-up branch
 Branch: feat/bench-attach-golden-catalog
 
 ## Problem
@@ -121,7 +121,7 @@ Exit gate: if the spike fails, stop and revisit the backend choice
 (fall back to fixing `build_sqlite` S3 threading, or a co-located
 golden Polaris) before building Phase 1.
 
-### Phase 1 - attach read-only golden catalog (the big win)
+### Phase 1 - attach read-only golden catalog (the big win) - DELIVERED
 
 - **`scripts/benchmark-publish-iceberg.sh`** (new): one-time load of the
   6 read-only suites' parquet -> golden Polaris on StorageGrid. Skip
@@ -140,7 +140,7 @@ golden Polaris) before building Phase 1.
 
 Result: tpch/ssb/tpcds/tpcbb/clickbench/bank run with no load step.
 
-### Phase 2 - write suites via shallow clone
+### Phase 2 - write suites via shallow clone - DEFERRED
 
 - Build the bench-internal clone step: given a golden table ident and a
   target local ident, copy `metadata.json` to the local warehouse with
