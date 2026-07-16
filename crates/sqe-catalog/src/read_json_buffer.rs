@@ -133,9 +133,40 @@ mod tests {
         assert_eq!(out, b"{\"a\":1}\n");
     }
 
-    #[test]
-    fn decode_ndjson_builds_two_row_table() {
+    #[tokio::test]
+    async fn decode_ndjson_builds_two_row_table() {
+        use datafusion::prelude::SessionContext;
+
         let table = decode_ndjson_to_memtable(b"{\"a\":1}\n{\"a\":2}\n").unwrap();
         assert_eq!(table.schema().fields().len(), 1);
+
+        let ctx = SessionContext::new();
+        ctx.register_table("t", table).unwrap();
+        let n = ctx
+            .sql("SELECT count(*) AS n FROM t")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap()[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::Int64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn reshape_rejects_top_level_scalar() {
+        assert!(reshape_array_to_ndjson(b"42").is_err());
+        assert!(reshape_array_to_ndjson(b"\"hello\"").is_err());
+    }
+
+    #[test]
+    fn decompress_zip_and_other_codecs_error() {
+        use crate::read_json::JsonCompression;
+        assert!(decompress(vec![], JsonCompression::Zip).is_err());
+        assert!(decompress(vec![], JsonCompression::Zstd).is_err());
     }
 }
