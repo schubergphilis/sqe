@@ -1,24 +1,53 @@
 //! `read_json(path, [named_args...])` table-valued function.
 //!
-//! Mirrors `read_csv` for newline-delimited JSON. DataFusion's
-//! [`JsonFormat`] handles both NDJSON (one JSON object per line) and
-//! line-by-line concatenated JSON; the `newline_delimited` named arg
-//! controls which.
+//! Mirrors `read_csv` for JSON. Two named args select the shape and the
+//! codec:
+//!
+//! - `format`: `auto` (default), `newline_delimited` (aliases `ndjson`,
+//!   `nd`), or `array` (alias `json`). `auto` resolves to NDJSON; a
+//!   top-level JSON array is only read as an array when `format =>
+//!   'array'` is passed explicitly, or the source is a `.zip` archive
+//!   (each entry auto-detects on its own). The legacy `newline_delimited`
+//!   bool arg is kept as an alias: `newline_delimited => 'false'` means
+//!   `format => 'array'`.
+//! - `compression` (alias `compress`): `auto` (default, detected from the
+//!   path extension), `none`, `gzip`, `zip`, `zstd`, `bz2`, `xz`.
+//! - `file_extension`: override the listing file extension. Default is
+//!   derived from the path, codec suffix included (e.g. `.jsonl.gz` for
+//!   `events.jsonl.gz`), so the listing filter matches files as they sit
+//!   on disk/object store.
 //!
 //! ```sql
+//! -- Plain NDJSON, streamed line by line.
 //! SELECT * FROM read_json('/data/events.jsonl');
 //!
-//! SELECT * FROM read_json('s3://bucket/events.json',
-//!     access_key         => 'AKIA...',
-//!     secret_key         => '...',
-//!     newline_delimited  => 'true');
+//! -- gzip NDJSON, still streamed (FileCompressionType handles the codec).
+//! SELECT * FROM read_json('s3://bucket/events.jsonl.gz',
+//!     access_key => 'AKIA...', secret_key => '...');
+//!
+//! -- Full JSON array: buffered, decompressed, and reshaped into NDJSON.
+//! SELECT * FROM read_json('/data/events.json', format => 'array');
+//!
+//! -- Zip archive: every JSON/NDJSON entry is concatenated; also buffered.
+//! SELECT * FROM read_json('/data/export.json.zip');
 //! ```
 //!
-//! The JSON-specific named args are:
+//! # Two execution paths
 //!
-//! - `newline_delimited`: bool. NDJSON mode. Default: true (DataFusion's
-//!   built-in default; explicit pass-through here in case it ever flips).
-//! - `file_extension`: override the listing file extension. Default `.json`.
+//! The router in `ReadJsonFunction::call` picks one of two paths after
+//! `enforce_tvf_path_policy` runs:
+//!
+//! - **Streaming path** (`build_json_listing_table`, this module): the
+//!   default for NDJSON with no compression or a compression DataFusion's
+//!   [`JsonFormat`] / [`FileCompressionType`] can stream (gzip, zstd,
+//!   bzip2, xz). Handles arbitrarily large files without buffering the
+//!   whole object.
+//! - **Buffer path** ([`crate::read_json_buffer`]): used when `format =>
+//!   'array'` is requested, or the compression is `zip`. Both cases fetch
+//!   the whole object, decompress/unzip it, reshape it into NDJSON, and
+//!   decode it into an in-memory `MemTable`. A size guard
+//!   (`DEFAULT_MAX_BUFFER_BYTES`) rejects inputs above the cap instead of
+//!   risking OOM on a mislabeled file.
 use std::sync::Arc;
 
 use datafusion::catalog::{TableFunctionImpl, TableProvider};
@@ -108,17 +137,6 @@ fn parse_json_compression(value: &str) -> DFResult<Option<JsonCompression>> {
             "{FN_NAME}: 'compression' must be one of auto, none, gzip, zip, zstd, bz2, xz; got '{other}'"
         ))),
     }
-}
-
-/// Strip a compression suffix so extension logic sees the format ext.
-/// `data.json.gz` -> `data.json`.
-fn strip_compression_ext(path: &str) -> &str {
-    for ext in [".gz", ".gzip", ".zip", ".bz2", ".bzip2", ".xz", ".zst", ".zstd"] {
-        if path.to_ascii_lowercase().ends_with(ext) {
-            return &path[..path.len() - ext.len()];
-        }
-    }
-    path
 }
 
 /// Map a path's trailing codec extension to a [`JsonCompression`].
@@ -307,12 +325,15 @@ async fn build_json_listing_table(
     // NDJSON is the only framing the streaming path serves.
     format = format.with_file_compression_type(compression);
 
-    // Listing extension ignores the codec suffix: `.json.gz` lists as `.json`.
-    let default_ext = strip_compression_ext(&args.path);
+    // The listing extension must match the file as it sits on disk/object
+    // store, codec suffix included: `events.jsonl.gz` lists as `.jsonl.gz`,
+    // not `.jsonl` (the codec suffix is stripped from the *content*, not
+    // from the *filename* ListingTable globs against).
+    let derived_extension = derive_file_extension(&args.path);
     let extension = json_opts
         .file_extension
         .as_deref()
-        .unwrap_or_else(|| extension_of(default_ext));
+        .unwrap_or(derived_extension.as_str());
     let listing_options =
         ListingOptions::new(Arc::new(format)).with_file_extension(extension);
 
@@ -332,12 +353,33 @@ async fn build_json_listing_table(
     Ok(Arc::new(table))
 }
 
-/// Return the file extension (with leading dot) of a path, or ".json".
-fn extension_of(path: &str) -> &str {
-    match path.rfind('.') {
-        Some(idx) => &path[idx..],
-        None => ".json",
+/// Pull the file extension from a path, including the compression suffix
+/// if present. `'/data/x.jsonl.gz'` -> `'.jsonl.gz'`. Falls back to
+/// `'.json'` when the path is a glob or has no extension. Mirrors
+/// `read_csv::derive_file_extension`.
+fn derive_file_extension(path: &str) -> String {
+    // Drop directory parts.
+    let basename = path.rsplit('/').next().unwrap_or(path);
+    // If the basename contains glob characters we use the conservative
+    // default; ListingTable's globbing will pick up files by that suffix.
+    if basename.contains('*') || basename.contains('?') {
+        return ".json".to_string();
     }
+    // Find the LAST dot for the codec suffix, then check if the byte
+    // before that suffix is also a recognized format extension.
+    let lower = basename.to_ascii_lowercase();
+    let codecs = [".gz", ".gzip", ".bz2", ".bzip2", ".xz", ".zst", ".zstd"];
+    for c in codecs {
+        if let Some(stripped) = lower.strip_suffix(c) {
+            if let Some(dot) = stripped.rfind('.') {
+                return format!("{}{c}", &stripped[dot..]);
+            }
+        }
+    }
+    if let Some(dot) = basename.rfind('.') {
+        return basename[dot..].to_string();
+    }
+    ".json".to_string()
 }
 
 #[cfg(test)]
@@ -396,6 +438,19 @@ mod tests {
         assert!(matches!(compression_from_extension("a.json.zip"), JsonCompression::Zip));
         assert!(matches!(compression_from_extension("a.json.zst"), JsonCompression::Zstd));
         assert!(matches!(compression_from_extension("a.json"), JsonCompression::None));
+    }
+
+    #[test]
+    fn derive_file_extension_keeps_codec_suffix() {
+        // The listing filter must match the file as it sits on disk, so
+        // the codec suffix stays in the derived extension (regression
+        // test for the streaming-gzip-NDJSON glob-miss bug).
+        assert_eq!(derive_file_extension("/data/x.json"), ".json");
+        assert_eq!(derive_file_extension("/data/x.jsonl.gz"), ".jsonl.gz");
+        assert_eq!(derive_file_extension("/data/x.json.zst"), ".json.zst");
+        assert_eq!(derive_file_extension("/data/x.ndjson.xz"), ".ndjson.xz");
+        assert_eq!(derive_file_extension("/data/glob/*.json"), ".json");
+        assert_eq!(derive_file_extension("/data/no_extension"), ".json");
     }
 
     #[test]
@@ -534,6 +589,133 @@ mod tests {
             err.contains("169.254.169.254") && err.contains("allowed_http_hosts"),
             "expected an IMDS/SSRF policy denial, got: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn reads_gzipped_ndjson_streaming() {
+        use datafusion::prelude::SessionContext;
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.jsonl.gz");
+        let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(b"{\"a\":1}\n{\"a\":2}\n{\"a\":3}\n").unwrap();
+        std::fs::write(&path, enc.finish().unwrap()).unwrap();
+
+        let storage = StorageConfig {
+            tvf: sqe_core::config::TvfPolicy {
+                allow_local_paths: true,
+                ..Default::default()
+            },
+            ..StorageConfig::default()
+        };
+        let ctx = SessionContext::new();
+        ctx.register_udtf("read_json", Arc::new(ReadJsonFunction::new(storage)));
+        // No `format` arg: plain NDJSON with a `.gz` suffix stays on the
+        // streaming path (`build_json_listing_table` +
+        // `FileCompressionType::GZIP`), unlike `reads_gzipped_array` below
+        // which forces the buffer path via `format => 'array'`.
+        let n = ctx
+            .sql(&format!("SELECT count(*) AS n FROM read_json('{}')", path.display()))
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap()[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::Int64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(n, 3);
+    }
+
+    #[tokio::test]
+    async fn reads_gzipped_array() {
+        use datafusion::prelude::SessionContext;
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.json.gz");
+        let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(b"[{\"a\":1},{\"a\":2}]").unwrap();
+        std::fs::write(&path, enc.finish().unwrap()).unwrap();
+
+        let storage = StorageConfig {
+            tvf: sqe_core::config::TvfPolicy {
+                allow_local_paths: true,
+                ..Default::default()
+            },
+            ..StorageConfig::default()
+        };
+        let ctx = SessionContext::new();
+        ctx.register_udtf("read_json", Arc::new(ReadJsonFunction::new(storage)));
+        // .gz auto-detects gzip; format=array forces the buffer path (array
+        // can't stream). Positional 'format=array' (not `format => 'array'`)
+        // because this raw SessionContext hasn't gone through the
+        // coordinator's named-TVF-arg rewrite; see
+        // `buffer_path_rejects_local_secret` above for the full rationale.
+        let n = ctx
+            .sql(&format!(
+                "SELECT count(*) AS n FROM read_json('{}', 'format=array')",
+                path.display()
+            ))
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap()[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::Int64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(n, 2);
+    }
+
+    #[tokio::test]
+    async fn reads_zip_of_ndjson() {
+        use datafusion::prelude::SessionContext;
+        use std::io::Write;
+        use zip::write::SimpleFileOptions;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.json.zip");
+        let mut buf = Vec::new();
+        {
+            let mut zw = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            zw.start_file("events.jsonl", SimpleFileOptions::default())
+                .unwrap();
+            zw.write_all(b"{\"a\":1}\n{\"a\":2}\n{\"a\":3}\n").unwrap();
+            zw.finish().unwrap();
+        }
+        std::fs::write(&path, buf).unwrap();
+
+        let storage = StorageConfig {
+            tvf: sqe_core::config::TvfPolicy {
+                allow_local_paths: true,
+                ..Default::default()
+            },
+            ..StorageConfig::default()
+        };
+        let ctx = SessionContext::new();
+        ctx.register_udtf("read_json", Arc::new(ReadJsonFunction::new(storage)));
+        // Zip always routes to the buffer path regardless of `format`, so no
+        // positional arg is needed here (unlike the array case above).
+        let n = ctx
+            .sql(&format!("SELECT count(*) AS n FROM read_json('{}')", path.display()))
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap()[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::Int64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(n, 3);
     }
 
     #[tokio::test]
