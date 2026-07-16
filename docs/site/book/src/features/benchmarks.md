@@ -224,7 +224,7 @@ See [read_parquet TVF](./read-parquet.md) for full syntax documentation.
 
 ## Fast benchmark runs via attached golden tables
 
-For the read-only suites (`tpch`, `ssb`, `tpcds`, `tpcbb`, `clickbench`, `bank`), the load step dominates wall-clock time and adds nothing to the query measurement: every run rewrites the same parquet into fresh Iceberg tables before a single query runs. Publish those tables once into a persistent Polaris, then attach them read-only on every subsequent run instead of reloading.
+For the read-only suites (`tpch`, `ssb`, `tpcds`, `clickbench`), the load step dominates wall-clock time and adds nothing to the query measurement: every run rewrites the same parquet into fresh Iceberg tables before a single query runs. Publish those tables once into a persistent Polaris, then attach them read-only on every subsequent run instead of reloading.
 
 Publish once:
 
@@ -248,7 +248,7 @@ BENCH_GOLDEN_S3_ACCESS_KEY=... BENCH_GOLDEN_S3_SECRET_KEY=... \
 BENCH_DATA_SOURCE=attach BENCH_SCALE=1 ./scripts/benchmark-test.sh tpch
 ```
 
-`benchmark-test.sh` attaches the golden catalog once (`scripts/benchmark-attach-golden.sh`) and queries each table as `golden.<namespace>.<table>` instead of generating and loading data. `tpcc` and `tpce` are write suites (their queries include DELETE/UPDATE via CoW), so they still generate and load normally even in attach mode; a shallow-clone path that would let them run against golden tables too, without mutating the shared copy, is planned but not yet built. Attach is loud by design: a missing or unreachable golden catalog fails the run with the ATTACH error rather than silently falling back to a full load, which would mask the exact cost this path removes.
+`benchmark-test.sh` attaches the golden catalog once (`scripts/benchmark-attach-golden.sh`) and queries each table as `golden.<namespace>.<table>` instead of generating and loading data. `tpcc` and `tpce` are write suites (their queries include DELETE/UPDATE via CoW), so they still generate and load normally even in attach mode; a shallow-clone path that would let them run against golden tables too, without mutating the shared copy, is planned but not yet built. `bank` and `tpcbb` also still generate and load normally in attach mode: `bank` is published to golden by `benchmark-publish-iceberg.sh`, but attach mode does not yet query it from there, and `tpcbb`'s own tables (`web_clickstreams`, `product_reviews`) are not published at all, since `tpcbb` shares `tpcds`'s namespace and only needs the two tables it adds. Wiring bank/tpcbb into attach mode is the deferred follow-up alongside the tpcc/tpce shallow-clone path. Attach is loud by design: a missing or unreachable golden catalog fails the run with the ATTACH error rather than silently falling back to a full load, which would mask the exact cost this path removes.
 
 ## Running Tests
 
