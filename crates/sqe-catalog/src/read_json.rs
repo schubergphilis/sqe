@@ -41,10 +41,35 @@ use crate::file_tvf_common::{
 
 const FN_NAME: &str = "read_json";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum JsonFraming {
+    Auto,
+    NewlineDelimited,
+    Array,
+}
+
+/// Local compression enum, distinct from DataFusion's `FileCompressionType`
+/// because it must also represent `Zip`, which `FileCompressionType` cannot.
+/// The streaming path (Task 2) maps the non-zip variants onto
+/// `FileCompressionType`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum JsonCompression {
+    None,
+    Gzip,
+    Zip,
+    Zstd,
+    Bz2,
+    Xz,
+}
+
 #[derive(Debug, Default)]
 struct JsonOpts {
+    // Legacy alias, kept for backward compatibility; removed in Task 3
+    // once `framing` fully replaces it.
     newline_delimited: Option<bool>,
     file_extension: Option<String>,
+    framing: Option<JsonFraming>,
+    compression: Option<JsonCompression>,
 }
 
 fn parse_bool(key: &str, value: &str) -> DFResult<bool> {
@@ -53,6 +78,32 @@ fn parse_bool(key: &str, value: &str) -> DFResult<bool> {
         "false" | "0" | "no" | "off" => Ok(false),
         _ => Err(DataFusionError::Plan(format!(
             "{FN_NAME}: '{key}' must be a boolean (true/false), got '{value}'"
+        ))),
+    }
+}
+
+fn parse_framing(value: &str) -> DFResult<JsonFraming> {
+    match value.to_ascii_lowercase().as_str() {
+        "auto" | "" => Ok(JsonFraming::Auto),
+        "newline_delimited" | "ndjson" | "nd" => Ok(JsonFraming::NewlineDelimited),
+        "array" | "json" => Ok(JsonFraming::Array),
+        other => Err(DataFusionError::Plan(format!(
+            "{FN_NAME}: 'format' must be one of auto, newline_delimited, array; got '{other}'"
+        ))),
+    }
+}
+
+fn parse_json_compression(value: &str) -> DFResult<Option<JsonCompression>> {
+    match value.to_ascii_lowercase().as_str() {
+        "auto" | "" => Ok(None),
+        "none" | "uncompressed" | "off" => Ok(Some(JsonCompression::None)),
+        "gz" | "gzip" => Ok(Some(JsonCompression::Gzip)),
+        "zip" => Ok(Some(JsonCompression::Zip)),
+        "zst" | "zstd" => Ok(Some(JsonCompression::Zstd)),
+        "bz2" | "bzip2" => Ok(Some(JsonCompression::Bz2)),
+        "xz" => Ok(Some(JsonCompression::Xz)),
+        other => Err(DataFusionError::Plan(format!(
+            "{FN_NAME}: 'compression' must be one of auto, none, gzip, zip, zstd, bz2, xz; got '{other}'"
         ))),
     }
 }
@@ -203,5 +254,35 @@ mod tests {
         assert!(parse_bool("newline_delimited", "1").unwrap());
         assert!(!parse_bool("newline_delimited", "false").unwrap());
         assert!(parse_bool("newline_delimited", "garbage").is_err());
+    }
+
+    #[test]
+    fn parse_framing_accepts_known_values() {
+        assert!(matches!(parse_framing("auto").unwrap(), JsonFraming::Auto));
+        assert!(matches!(parse_framing("array").unwrap(), JsonFraming::Array));
+        assert!(matches!(
+            parse_framing("newline_delimited").unwrap(),
+            JsonFraming::NewlineDelimited
+        ));
+        assert!(matches!(parse_framing("ARRAY").unwrap(), JsonFraming::Array));
+        assert!(parse_framing("bogus").is_err());
+    }
+
+    #[test]
+    fn parse_json_compression_accepts_known_values() {
+        assert!(parse_json_compression("auto").unwrap().is_none());
+        assert!(matches!(
+            parse_json_compression("gzip").unwrap(),
+            Some(JsonCompression::Gzip)
+        ));
+        assert!(matches!(
+            parse_json_compression("zip").unwrap(),
+            Some(JsonCompression::Zip)
+        ));
+        assert!(matches!(
+            parse_json_compression("none").unwrap(),
+            Some(JsonCompression::None)
+        ));
+        assert!(parse_json_compression("rar").is_err());
     }
 }

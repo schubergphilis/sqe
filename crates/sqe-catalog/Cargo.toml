@@ -140,6 +140,8 @@ prometheus = { workspace = true }
 regex = { workspace = true }
 # Puffin NDV sketches (apache-datasketches-theta-v1 blob body).
 datasketches = { workspace = true }
+# Zip archive reading for read_json(compression => 'zip').
+zip = { workspace = true }
 # Optional backend dependencies — gated by the corresponding cargo feature
 # above. None of these are pulled into a default `cargo build`.
 rusqlite = { version = "0.32", features = ["bundled"], optional = true }
