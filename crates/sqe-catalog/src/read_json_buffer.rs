@@ -63,7 +63,7 @@ pub(crate) fn decompress(bytes: Vec<u8>, codec: JsonCompression) -> DFResult<Vec
             Ok(out)
         }
         JsonCompression::Zip => Err(DataFusionError::Plan(format!(
-            "{FN_NAME}: zip handled by decompress_zip (see Task 5)"
+            "{FN_NAME}: zip handled by decompress_zip_to_ndjson (see Task 5)"
         ))),
         other => Err(DataFusionError::Plan(format!(
             "{FN_NAME}: codec {other:?} is not valid on the buffer path"
@@ -260,5 +260,59 @@ mod tests {
             zw.finish().unwrap();
         }
         assert!(decompress_zip_to_ndjson(buf, JsonFraming::Auto).is_err());
+    }
+
+    #[test]
+    fn zip_auto_mixes_array_and_ndjson_entries() {
+        use crate::read_json::JsonFraming;
+        use std::io::Write;
+        use zip::write::SimpleFileOptions;
+        let mut buf = Vec::new();
+        {
+            let mut zw = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            zw.start_file("a.json", SimpleFileOptions::default()).unwrap();
+            zw.write_all(b"[{\"a\":1},{\"a\":2}]").unwrap();
+            zw.start_file("b.jsonl", SimpleFileOptions::default()).unwrap();
+            zw.write_all(b"{\"a\":3}\n").unwrap();
+            zw.finish().unwrap();
+        }
+        let nd = decompress_zip_to_ndjson(buf, JsonFraming::Auto).unwrap();
+        assert_eq!(String::from_utf8(nd).unwrap().lines().count(), 3);
+    }
+
+    #[test]
+    fn zip_appends_missing_trailing_newline_between_entries() {
+        use crate::read_json::JsonFraming;
+        use std::io::Write;
+        use zip::write::SimpleFileOptions;
+        let mut buf = Vec::new();
+        {
+            let mut zw = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            zw.start_file("a.jsonl", SimpleFileOptions::default()).unwrap();
+            zw.write_all(b"{\"a\":1}").unwrap(); // no trailing newline
+            zw.start_file("b.jsonl", SimpleFileOptions::default()).unwrap();
+            zw.write_all(b"{\"a\":2}\n").unwrap();
+            zw.finish().unwrap();
+        }
+        let nd = decompress_zip_to_ndjson(buf, JsonFraming::NewlineDelimited).unwrap();
+        assert_eq!(String::from_utf8(nd).unwrap().lines().count(), 2);
+    }
+
+    #[test]
+    fn zip_skips_directory_entries() {
+        use std::io::Write;
+        use zip::write::SimpleFileOptions;
+        let mut buf = Vec::new();
+        {
+            let mut zw = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            zw.add_directory("data/", SimpleFileOptions::default())
+                .unwrap();
+            zw.start_file("data/a.jsonl", SimpleFileOptions::default())
+                .unwrap();
+            zw.write_all(b"{\"a\":1}\n").unwrap();
+            zw.finish().unwrap();
+        }
+        let nd = decompress_zip_to_ndjson(buf, JsonFraming::NewlineDelimited).unwrap();
+        assert_eq!(String::from_utf8(nd).unwrap().lines().count(), 1);
     }
 }
