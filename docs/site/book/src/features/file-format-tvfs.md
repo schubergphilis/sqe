@@ -96,7 +96,7 @@ SELECT * FROM read_json(
 |---|---|---|---|
 | `format` | `auto`, `newline_delimited` (aliases `ndjson`, `nd`), `array` (alias `json`) | `auto` | `auto` on a plain file resolves to NDJSON. A top-level JSON array is only read as an array when `format => 'array'` is passed explicitly (or the source is a `.zip`, see below). `newline_delimited => 'false'` is a legacy alias for `format => 'array'`. |
 | `compression` (alias `compress`) | `auto`, `none`, `gzip`, `zip`, `zstd`, `bz2`, `xz` | `auto` (detected from the path extension) | `.json.gz`, `.json.zip`, `.json.zst`, `.json.bz2`, `.json.xz` all dispatch automatically. |
-| `file_extension` | any extension string | derived from `<path>` with the compression suffix stripped | Overrides the listing extension when the path doesn't carry one. |
+| `file_extension` | any extension string | derived from `<path>`, codec suffix included (e.g. `.jsonl.gz`) | Overrides the listing extension when the path doesn't carry one. |
 
 Two execution paths back this TVF:
 
