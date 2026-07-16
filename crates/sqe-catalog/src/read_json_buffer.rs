@@ -142,11 +142,13 @@ pub(crate) fn decompress(bytes: Vec<u8>, codec: JsonCompression) -> DFResult<Vec
             Ok(out)
         }
         JsonCompression::Zip => Err(DataFusionError::Plan(format!(
-            "{FN_NAME}: zip handled by decompress_zip_to_ndjson (see Task 5)"
+            "{FN_NAME}: zip archives are decoded via decompress_zip_to_ndjson, not decompress"
         ))),
-        other => Err(DataFusionError::Plan(format!(
-            "{FN_NAME}: codec {other:?} is not valid on the buffer path"
-        ))),
+        JsonCompression::Zstd | JsonCompression::Bz2 | JsonCompression::Xz => {
+            Err(DataFusionError::Plan(format!(
+                "{FN_NAME}: compression {codec:?} is not supported with format=array or zip (only gzip, zip, or none)"
+            )))
+        }
     }
 }
 
