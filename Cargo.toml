@@ -183,6 +183,9 @@ datasketches = "0.2"
 # those extra compression backends.
 zip = { version = "2", default-features = false, features = ["deflate"] }
 
+# Gzip (de)compression for read_json(compression => 'gzip') buffer path.
+flate2 = { version = "1" }
+
 # ── Dev profile: fast incremental builds ───────────────────────
 [profile.dev]
 # Line-tables only — enough for backtraces/panics, much less to generate.
