@@ -505,4 +505,68 @@ mod tests {
             "expected a policy denial, got: {err}"
         );
     }
+
+    #[tokio::test]
+    async fn buffer_path_rejects_imds_url() {
+        use datafusion::prelude::SessionContext;
+        let ctx = SessionContext::new();
+        ctx.register_udtf(
+            "read_json",
+            Arc::new(ReadJsonFunction::new(StorageConfig::default())),
+        );
+        // Anonymous caller + an IMDS/SSRF-style URL must be denied by
+        // policy, BEFORE any object-store fetch. format=array forces the
+        // buffer path (same positional-arg rationale as
+        // `buffer_path_rejects_local_secret` above: a raw `SessionContext`
+        // hasn't gone through `rewrite_named_tvf_args`, so `format=array`
+        // must be passed positionally rather than as `format => 'array'`).
+        let res = ctx
+            .sql(
+                "SELECT * FROM read_json('http://169.254.169.254/latest/meta-data/', \
+                 'format=array')",
+            )
+            .await;
+        let err = match res {
+            Err(e) => e.to_string(),
+            Ok(df) => format!("{:?}", df.collect().await.err()),
+        };
+        assert!(
+            err.contains("169.254.169.254") && err.contains("allowed_http_hosts"),
+            "expected an IMDS/SSRF policy denial, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reads_full_array_via_newline_delimited_false_alias() {
+        use datafusion::prelude::SessionContext;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.json");
+        std::fs::write(&path, b"[{\"a\":1},{\"a\":2},{\"a\":3}]").unwrap();
+
+        let storage = StorageConfig {
+            tvf: sqe_core::config::TvfPolicy {
+                allow_local_paths: true,
+                ..Default::default()
+            },
+            ..StorageConfig::default()
+        };
+        let ctx = SessionContext::new();
+        ctx.register_udtf("read_json", Arc::new(ReadJsonFunction::new(storage)));
+        // `newline_delimited=false` is the legacy alias for `format=array`;
+        // this locks the newline_delimited => framing::Array => buffer route.
+        let df = ctx
+            .sql(&format!(
+                "SELECT count(*) AS n FROM read_json('{}', 'newline_delimited=false')",
+                path.display()
+            ))
+            .await
+            .unwrap();
+        let n = df.collect().await.unwrap()[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::Int64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(n, 3);
+    }
 }
