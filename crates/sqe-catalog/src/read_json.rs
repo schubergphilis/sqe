@@ -22,6 +22,7 @@
 use std::sync::Arc;
 
 use datafusion::catalog::{TableFunctionImpl, TableProvider};
+use datafusion::datasource::file_format::file_compression_type::FileCompressionType;
 use datafusion::datasource::file_format::json::JsonFormat;
 use datafusion::datasource::listing::{
     ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
@@ -64,12 +65,9 @@ pub(crate) enum JsonCompression {
 
 #[derive(Debug, Default)]
 struct JsonOpts {
-    // Legacy alias, kept for backward compatibility; removed in Task 3
-    // once `framing` fully replaces it.
-    newline_delimited: Option<bool>,
-    file_extension: Option<String>,
     framing: Option<JsonFraming>,
     compression: Option<JsonCompression>,
+    file_extension: Option<String>,
 }
 
 fn parse_bool(key: &str, value: &str) -> DFResult<bool> {
@@ -149,6 +147,19 @@ pub(crate) fn detect_framing_from_bytes(bytes: &[u8]) -> JsonFraming {
     JsonFraming::NewlineDelimited
 }
 
+/// Map the streaming-capable codecs onto DataFusion's `FileCompressionType`.
+/// `Zip` never reaches here (it routes to the buffer path); treat it as a bug.
+fn streaming_compression(c: JsonCompression) -> FileCompressionType {
+    match c {
+        JsonCompression::None => FileCompressionType::UNCOMPRESSED,
+        JsonCompression::Gzip => FileCompressionType::GZIP,
+        JsonCompression::Bz2 => FileCompressionType::BZIP2,
+        JsonCompression::Xz => FileCompressionType::XZ,
+        JsonCompression::Zstd => FileCompressionType::ZSTD,
+        JsonCompression::Zip => FileCompressionType::UNCOMPRESSED, // unreachable via router
+    }
+}
+
 #[derive(Debug)]
 pub struct ReadJsonFunction {
     storage: StorageConfig,
@@ -196,8 +207,18 @@ impl TableFunctionImpl for ReadJsonFunction {
 
         let args = parse_file_tvf_args(FN_NAME, exprs, |key, value| {
             match key {
+                "format" => match parse_framing(value) {
+                    Ok(f) => json_opts.framing = Some(f),
+                    Err(e) => parse_err = Some(e),
+                },
+                // Legacy alias: newline_delimited => format.
                 "newline_delimited" => match parse_bool("newline_delimited", value) {
-                    Ok(b) => json_opts.newline_delimited = Some(b),
+                    Ok(true) => json_opts.framing = Some(JsonFraming::NewlineDelimited),
+                    Ok(false) => json_opts.framing = Some(JsonFraming::Array),
+                    Err(e) => parse_err = Some(e),
+                },
+                "compression" | "compress" => match parse_json_compression(value) {
+                    Ok(c) => json_opts.compression = c,
                     Err(e) => parse_err = Some(e),
                 },
                 "file_extension" => json_opts.file_extension = Some(value.to_string()),
@@ -219,20 +240,26 @@ impl TableFunctionImpl for ReadJsonFunction {
             &self.caller,
         )?;
 
+        let compression = json_opts
+            .compression
+            .unwrap_or_else(|| compression_from_extension(&args.path));
+
+        // Router (buffer branch added in Task 6): framing first, then zip.
         let storage = self.storage.clone();
         let runtime_env = self.runtime_env.clone();
+        let df_compression = streaming_compression(compression);
         crate::runtime_bridge::block_on_compat(async move {
-            build_json_listing_table(&args, &json_opts, &storage, runtime_env.as_deref()).await
+            build_json_listing_table(&args, &json_opts, df_compression, &storage, runtime_env.as_deref())
+                .await
         })
-        .ok_or_else(|| {
-            DataFusionError::Plan(format!("{FN_NAME}: no tokio runtime available"))
-        })?
+        .ok_or_else(|| DataFusionError::Plan(format!("{FN_NAME}: no tokio runtime available")))?
     }
 }
 
 async fn build_json_listing_table(
     args: &FileTvfArgs,
     json_opts: &JsonOpts,
+    compression: FileCompressionType,
     storage: &StorageConfig,
     runtime_env: Option<&datafusion::execution::runtime_env::RuntimeEnv>,
 ) -> DFResult<Arc<dyn TableProvider>> {
@@ -248,25 +275,24 @@ async fn build_json_listing_table(
     register_http_store_if_needed(FN_NAME, &tmp_ctx, &args.path)?;
 
     let mut format = JsonFormat::default();
-    if let Some(nd) = json_opts.newline_delimited {
-        format = format.with_newline_delimited(nd);
-    }
+    // NDJSON is the only framing the streaming path serves.
+    format = format.with_file_compression_type(compression);
 
-    let extension = json_opts.file_extension.as_deref().unwrap_or(".json");
-    let listing_options = ListingOptions::new(Arc::new(format)).with_file_extension(extension);
+    // Listing extension ignores the codec suffix: `.json.gz` lists as `.json`.
+    let default_ext = strip_compression_ext(&args.path);
+    let extension = json_opts
+        .file_extension
+        .as_deref()
+        .unwrap_or_else(|| extension_of(default_ext));
+    let listing_options =
+        ListingOptions::new(Arc::new(format)).with_file_extension(extension);
 
     let state = tmp_ctx.state();
     crate::file_tvf_common::ensure_local_files_exist(
-        FN_NAME,
-        &state,
-        &listing_url,
-        extension,
-        &args.path,
+        FN_NAME, &state, &listing_url, extension, &args.path,
     )
     .await?;
-    let schema = listing_options
-        .infer_schema(&state, &listing_url)
-        .await?;
+    let schema = listing_options.infer_schema(&state, &listing_url).await?;
 
     let config = ListingTableConfig::new(listing_url)
         .with_listing_options(listing_options)
@@ -275,6 +301,14 @@ async fn build_json_listing_table(
     let table = ListingTable::try_new(config)?;
     debug!(path = %args.path, "read_json: built ListingTable");
     Ok(Arc::new(table))
+}
+
+/// Return the file extension (with leading dot) of a path, or ".json".
+fn extension_of(path: &str) -> &str {
+    match path.rfind('.') {
+        Some(idx) => &path[idx..],
+        None => ".json",
+    }
 }
 
 #[cfg(test)]
@@ -341,5 +375,36 @@ mod tests {
         assert!(matches!(detect_framing_from_bytes(b"\n\t[1,2]"), JsonFraming::Array));
         assert!(matches!(detect_framing_from_bytes(b"{\"a\":1}\n"), JsonFraming::NewlineDelimited));
         assert!(matches!(detect_framing_from_bytes(b""), JsonFraming::NewlineDelimited));
+    }
+
+    #[tokio::test]
+    async fn reads_plain_ndjson_local() {
+        use datafusion::prelude::SessionContext;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.jsonl");
+        std::fs::write(&path, b"{\"a\":1}\n{\"a\":2}\n").unwrap();
+
+        let storage = StorageConfig {
+            tvf: sqe_core::config::TvfPolicy {
+                allow_local_paths: true,
+                ..Default::default()
+            },
+            ..StorageConfig::default()
+        };
+        let ctx = SessionContext::new();
+        ctx.register_udtf("read_json", Arc::new(ReadJsonFunction::new(storage)));
+        let df = ctx
+            .sql(&format!("SELECT count(*) AS n FROM read_json('{}')", path.display()))
+            .await
+            .unwrap();
+        let batches = df.collect().await.unwrap();
+        // 2 rows expected.
+        let n = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::Int64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(n, 2);
     }
 }
