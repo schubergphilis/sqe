@@ -108,6 +108,47 @@ fn parse_json_compression(value: &str) -> DFResult<Option<JsonCompression>> {
     }
 }
 
+/// Strip a compression suffix so extension logic sees the format ext.
+/// `data.json.gz` -> `data.json`.
+fn strip_compression_ext(path: &str) -> &str {
+    for ext in [".gz", ".gzip", ".zip", ".bz2", ".bzip2", ".xz", ".zst", ".zstd"] {
+        if path.to_ascii_lowercase().ends_with(ext) {
+            return &path[..path.len() - ext.len()];
+        }
+    }
+    path
+}
+
+/// Map a path's trailing codec extension to a [`JsonCompression`].
+fn compression_from_extension(path: &str) -> JsonCompression {
+    let lower = path.to_ascii_lowercase();
+    if lower.ends_with(".gz") || lower.ends_with(".gzip") {
+        JsonCompression::Gzip
+    } else if lower.ends_with(".zip") {
+        JsonCompression::Zip
+    } else if lower.ends_with(".bz2") || lower.ends_with(".bzip2") {
+        JsonCompression::Bz2
+    } else if lower.ends_with(".xz") {
+        JsonCompression::Xz
+    } else if lower.ends_with(".zst") || lower.ends_with(".zstd") {
+        JsonCompression::Zstd
+    } else {
+        JsonCompression::None
+    }
+}
+
+/// Peek the first non-whitespace byte to decide framing. `[` => array.
+pub(crate) fn detect_framing_from_bytes(bytes: &[u8]) -> JsonFraming {
+    for &b in bytes {
+        match b {
+            b' ' | b'\t' | b'\r' | b'\n' => continue,
+            b'[' => return JsonFraming::Array,
+            _ => return JsonFraming::NewlineDelimited,
+        }
+    }
+    JsonFraming::NewlineDelimited
+}
+
 #[derive(Debug)]
 pub struct ReadJsonFunction {
     storage: StorageConfig,
@@ -284,5 +325,21 @@ mod tests {
             Some(JsonCompression::None)
         ));
         assert!(parse_json_compression("rar").is_err());
+    }
+
+    #[test]
+    fn compression_from_extension_maps_suffixes() {
+        assert!(matches!(compression_from_extension("a.json.gz"), JsonCompression::Gzip));
+        assert!(matches!(compression_from_extension("a.json.zip"), JsonCompression::Zip));
+        assert!(matches!(compression_from_extension("a.json.zst"), JsonCompression::Zstd));
+        assert!(matches!(compression_from_extension("a.json"), JsonCompression::None));
+    }
+
+    #[test]
+    fn detect_framing_peeks_first_nonws_byte() {
+        assert!(matches!(detect_framing_from_bytes(b"   [ {\"a\":1} ]"), JsonFraming::Array));
+        assert!(matches!(detect_framing_from_bytes(b"\n\t[1,2]"), JsonFraming::Array));
+        assert!(matches!(detect_framing_from_bytes(b"{\"a\":1}\n"), JsonFraming::NewlineDelimited));
+        assert!(matches!(detect_framing_from_bytes(b""), JsonFraming::NewlineDelimited));
     }
 }
