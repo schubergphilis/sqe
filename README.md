@@ -137,7 +137,7 @@ duckdb /tmp/dsdgen.db -c "INSTALL tpcds; LOAD tpcds; CALL dsdgen(sf=1)"
 scripts/validate-generator-tpcds.py --ours data/tpcds/sf1 --dsdgen-db /tmp/dsdgen.db
 ```
 
-Reruns of the six read-only suites (TPC-H, SSB, TPC-DS, TPC-BB, ClickBench, bank) do not need a fresh load every time. `scripts/benchmark-publish-iceberg.sh` publishes the Iceberg tables once into a persistent Polaris; `BENCH_DATA_SOURCE=attach ./scripts/benchmark-test.sh tpch` then attaches that catalog read-only and skips generate and load entirely. TPC-C and TPC-E are write suites and still generate and load normally; a shallow-clone path for them is the deferred follow-up. Full usage in [Benchmark Suite](docs/site/book/src/features/benchmarks.md#fast-benchmark-runs-via-attached-golden-tables).
+Reruns of four read-only suites (TPC-H, SSB, TPC-DS, ClickBench) do not need a fresh load every time. `scripts/benchmark-publish-iceberg.sh` publishes the Iceberg tables once into a persistent Polaris; `BENCH_DATA_SOURCE=attach ./scripts/benchmark-test.sh tpch` then attaches that catalog read-only and skips generate and load entirely. TPC-C, TPC-E, bank, and TPC-BB still generate and load normally in attach mode: TPC-C/TPC-E are write suites, bank is published to golden but attach mode does not yet query it from there, and TPC-BB's own tables (it shares TPC-DS's namespace) are not published. Bank/TPC-BB via attach, and a shallow-clone path for TPC-C/TPC-E, are the deferred follow-up. Full usage in [Benchmark Suite](docs/site/book/src/features/benchmarks.md#fast-benchmark-runs-via-attached-golden-tables).
 
 ## Architecture
 

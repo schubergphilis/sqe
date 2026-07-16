@@ -95,13 +95,18 @@ SQE_PASSWORD="${SQE_PASSWORD:-}"
 # bucket's credentials inline. The warehouse (where the Iceberg tables are
 # written) is unaffected — it stays on the test stack's RustFS.
 #
-# BENCH_DATA_SOURCE=attach skips generate AND load for the read-only suites:
-# a preloaded "golden" Iceberg catalog is ATTACHed once (scripts/
-# benchmark-attach-golden.sh) and every `sqe-bench test` call is qualified
-# with `--catalog golden` instead. tpcc/tpce (write workloads) and bank
-# (direct-to-Iceberg) are not published to golden, so they still
-# generate+load normally even in attach mode -- see is_attach_read_only()
-# below and scripts/benchmark-publish-iceberg.sh's ALL_READ_SUITES.
+# BENCH_DATA_SOURCE=attach skips generate AND load for the read-only suites
+# tpch/ssb/tpcds/clickbench: a preloaded "golden" Iceberg catalog is ATTACHed
+# once (scripts/benchmark-attach-golden.sh) and every `sqe-bench test` call
+# is qualified with `--catalog golden` instead. tpcc/tpce (write workloads)
+# still generate+load normally even in attach mode. bank IS published to
+# golden by benchmark-publish-iceberg.sh, but attach mode does not (yet)
+# query it from there, so it still generate+loads too. tpcbb is deliberately
+# NOT published (it shares tpcds's namespace but needs its own
+# web_clickstreams/product_reviews tables -- see crates/sqe-bench/src/
+# generate/tpcbb.rs), so it also still generate+loads, same as bank/tpcc/
+# tpce -- see is_attach_read_only() below and scripts/
+# benchmark-publish-iceberg.sh's ALL_READ_SUITES / tpcbb skip.
 #   BENCH_GOLDEN_POLARIS_URL=http://localhost:18181/api/catalog \
 #   BENCH_GOLDEN_WAREHOUSE=quickstart_catalog BENCH_GOLDEN_TOKEN=<bearer> \
 #   BENCH_S3_ENDPOINT=http://localhost:19000 \
@@ -112,7 +117,7 @@ BENCH_S3_PROFILE="${BENCH_S3_PROFILE:-default}"
 BENCH_S3_ENDPOINT="${BENCH_S3_ENDPOINT:-}"
 BENCH_S3_REGION="${BENCH_S3_REGION:-us-east-1}"
 
-ATTACH_READ_ONLY_SUITES=(tpch ssb tpcds tpcbb clickbench)
+ATTACH_READ_ONLY_SUITES=(tpch ssb tpcds clickbench)
 is_attach_read_only() {
     local b
     for b in "${ATTACH_READ_ONLY_SUITES[@]}"; do
@@ -617,14 +622,15 @@ for BENCH in "${BENCHMARKS[@]}"; do
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
     # TPC-BB reuses all TPC-DS tables.  Ensure they are generated and loaded
-    # before the TPC-BB-specific tables are added. In attach mode the golden
-    # catalog already carries tpcds -- nothing to load.
-    if [ "$BENCH" = "tpcbb" ] && [ -n "$ATTACH_MODE" ]; then
+    # before the TPC-BB-specific tables are added. tpcbb is NOT an attach
+    # read-only suite (its own web_clickstreams/product_reviews tables
+    # aren't published to golden), so it always needs a real TPC-DS copy in
+    # the PRIMARY catalog to join against -- including in attach mode, where
+    # golden's tpcds is a different catalog and doesn't help tpcbb. This runs
+    # regardless of ATTACH_MODE.
+    if [ "$BENCH" = "tpcbb" ] && [ -z "$TPCDS_LOADED" ]; then
         echo ""
-        echo "  [pre] Attach mode: golden catalog already provides TPC-DS tables for TPC-BB"
-    elif [ "$BENCH" = "tpcbb" ] && [ -z "$TPCDS_LOADED" ]; then
-        echo ""
-        echo "  [pre] TPC-BB requires TPC-DS tables — generating and loading..."
+        echo "  [pre] TPC-BB requires TPC-DS tables — generating and loading into the primary catalog..."
         if [ -z "$EXTERNAL_DATA" ]; then
             "$BENCH_BIN" generate tpcds \
                 --scale "$BENCH_SCALE" \
@@ -742,7 +748,11 @@ for BENCH in "${BENCHMARKS[@]}"; do
     if [ -n "$ATTACH_MODE" ] && is_attach_read_only "$BENCH"; then
         echo ""
         echo "  [1-2/3] Attach mode: skipping generate+load, querying golden.$BENCH via catalog=$BENCH_TEST_CATALOG"
-        if [ "$BENCH" = "tpcds" ]; then TPCDS_LOADED=1; fi
+        # Deliberately do NOT set TPCDS_LOADED=1 here even for BENCH=tpcds:
+        # that data lives only in the golden catalog, not the primary one,
+        # and TPCDS_LOADED gates the tpcbb prereq load above, which needs a
+        # real copy in the PRIMARY catalog. Leaving it unset makes tpcbb
+        # self-heal with its own tpcds load when it runs later in this suite.
     else
 
     # ── Step 1: Generate ──────────────────────────────────────
@@ -827,8 +837,9 @@ for BENCH in "${BENCHMARKS[@]}"; do
     echo "  [3/3] Running queries..."
     # BENCH_TEST_CATALOG is set once for the whole run (ATTACH is
     # coordinator-wide), but only the read-only suites actually live in the
-    # golden catalog -- tpcc/tpce/bank still loaded into the primary catalog
-    # above even in attach mode, so they must NOT get --catalog golden here.
+    # golden catalog -- tpcc/tpce/bank/tpcbb still loaded into the primary
+    # catalog above even in attach mode, so they must NOT get --catalog
+    # golden here.
     CATALOG_ARGS=()
     if [ -n "$ATTACH_MODE" ] && is_attach_read_only "$BENCH"; then
         CATALOG_ARGS=(--catalog "$BENCH_TEST_CATALOG")
