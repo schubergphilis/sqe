@@ -134,6 +134,12 @@ The command creates the namespace if it does not exist, then generates and
 commits each table in turn. Data is written in parallel shards for TPC-H and
 bank; the other generators write one shard per table.
 
+The sink buffers one full generation shard in memory before writing it, so
+peak memory scales with shard size: per-table for the serial generators, per
+`rows / --threads` for TPC-H and bank. At large scales, raise `--threads` to
+shrink each shard, or fall back to the parquet staging path (`generate` then
+`load`) if memory stays tight.
+
 Two flags control repeated runs against the same namespace:
 
 - `--resume` skips a table that already carries a
