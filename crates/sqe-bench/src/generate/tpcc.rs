@@ -1039,18 +1039,7 @@ impl BenchmarkGenerator for TpccGenerator {
     ) -> anyhow::Result<GenerateStats> {
         let start = std::time::Instant::now();
 
-        let (schema, batches) = match table {
-            "warehouse" => generate_warehouse(scale),
-            "district" => generate_district(scale),
-            "customer" => generate_customer(scale),
-            "hist" => generate_history(scale),
-            "orders" => generate_orders(scale),
-            "new_order" => generate_new_order(scale),
-            "order_line" => generate_order_line(scale),
-            "item" => generate_item(),
-            "stock" => generate_stock(scale),
-            _ => anyhow::bail!("Unknown TPC-C table: {table}"),
-        };
+        let (schema, batches) = build_tpcc_table(table, scale, _config)?;
 
         let full_output = format!("{output_dir}/tpcc/sf{scale}");
         let (files, bytes) =
@@ -1065,6 +1054,42 @@ impl BenchmarkGenerator for TpccGenerator {
             duration: start.elapsed(),
         })
     }
+
+    fn generate_batches(
+        &self,
+        table: &str,
+        scale: f64,
+        config: &super::GenerateConfig,
+    ) -> anyhow::Result<super::BatchSource> {
+        use super::{BatchShard, BatchSource};
+        let (schema, batches) = build_tpcc_table(table, scale, config)?;
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        let make: Box<dyn FnOnce() -> Box<dyn Iterator<Item = RecordBatch> + Send> + Send> =
+            Box::new(move || Box::new(batches.into_iter()));
+        Ok(BatchSource { schema, total_rows, shards: vec![BatchShard { make }] })
+    }
+}
+
+/// Build the (schema, batches) for one TPC-C table. Shared by
+/// `generate_table` (staged to Parquet) and `generate_batches`
+/// (direct-to-Iceberg sink).
+fn build_tpcc_table(
+    table: &str,
+    scale: f64,
+    _config: &super::GenerateConfig,
+) -> anyhow::Result<(SchemaRef, Vec<RecordBatch>)> {
+    Ok(match table {
+        "warehouse" => generate_warehouse(scale),
+        "district" => generate_district(scale),
+        "customer" => generate_customer(scale),
+        "hist" => generate_history(scale),
+        "orders" => generate_orders(scale),
+        "new_order" => generate_new_order(scale),
+        "order_line" => generate_order_line(scale),
+        "item" => generate_item(),
+        "stock" => generate_stock(scale),
+        _ => anyhow::bail!("Unknown TPC-C table: {table}"),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1192,5 +1217,22 @@ mod tests {
     #[test]
     fn test_name_is_tpcc() {
         assert_eq!(TpccGenerator.name(), "tpcc");
+    }
+
+    #[test]
+    fn tpcc_generate_batches_matches_generate_row_count() {
+        use crate::generate::GenerateConfig;
+        let g = TpccGenerator;
+        let cfg = GenerateConfig::default();
+        let t = g.tables()[0].name.clone();
+        let src = g.generate_batches(&t, 1.0, &cfg).unwrap();
+        let expected_total = src.total_rows;
+        let rows: usize = src
+            .shards
+            .into_iter()
+            .map(|s| (s.make)().map(|b| b.num_rows()).sum::<usize>())
+            .sum();
+        assert_eq!(rows, expected_total);
+        assert!(rows > 0);
     }
 }

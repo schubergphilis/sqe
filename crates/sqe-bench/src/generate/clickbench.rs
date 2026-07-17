@@ -733,13 +733,9 @@ impl BenchmarkGenerator for ClickBenchGenerator {
         output_dir: &str,
         _config: &super::GenerateConfig,
     ) -> anyhow::Result<GenerateStats> {
-        if table != "hits" {
-            anyhow::bail!("Unknown ClickBench table: {table}. Only 'hits' is defined.");
-        }
-
         let start = std::time::Instant::now();
 
-        let (schema, batches) = generate_hits(scale);
+        let (schema, batches) = build_clickbench_table(table, scale, _config)?;
 
         let full_output = format!("{output_dir}/clickbench/sf{scale}");
         let (files, bytes) =
@@ -754,6 +750,34 @@ impl BenchmarkGenerator for ClickBenchGenerator {
             duration: start.elapsed(),
         })
     }
+
+    fn generate_batches(
+        &self,
+        table: &str,
+        scale: f64,
+        config: &super::GenerateConfig,
+    ) -> anyhow::Result<super::BatchSource> {
+        use super::{BatchShard, BatchSource};
+        let (schema, batches) = build_clickbench_table(table, scale, config)?;
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        let make: Box<dyn FnOnce() -> Box<dyn Iterator<Item = RecordBatch> + Send> + Send> =
+            Box::new(move || Box::new(batches.into_iter()));
+        Ok(BatchSource { schema, total_rows, shards: vec![BatchShard { make }] })
+    }
+}
+
+/// Build the (schema, batches) for the ClickBench table. Shared by
+/// `generate_table` (staged to Parquet) and `generate_batches`
+/// (direct-to-Iceberg sink).
+fn build_clickbench_table(
+    table: &str,
+    scale: f64,
+    _config: &super::GenerateConfig,
+) -> anyhow::Result<(SchemaRef, Vec<RecordBatch>)> {
+    if table != "hits" {
+        anyhow::bail!("Unknown ClickBench table: {table}. Only 'hits' is defined.");
+    }
+    Ok(generate_hits(scale))
 }
 
 // ---------------------------------------------------------------------------
@@ -917,5 +941,22 @@ mod tests {
         assert!(field_names.contains(&"UTMSource"));
         assert!(field_names.contains(&"URLHash"));
         assert!(field_names.contains(&"CLID"));
+    }
+
+    #[test]
+    fn clickbench_generate_batches_matches_generate_row_count() {
+        use crate::generate::GenerateConfig;
+        let g = ClickBenchGenerator;
+        let cfg = GenerateConfig::default();
+        let t = g.tables()[0].name.clone();
+        let src = g.generate_batches(&t, 1.0, &cfg).unwrap();
+        let expected_total = src.total_rows;
+        let rows: usize = src
+            .shards
+            .into_iter()
+            .map(|s| (s.make)().map(|b| b.num_rows()).sum::<usize>())
+            .sum();
+        assert_eq!(rows, expected_total);
+        assert!(rows > 0);
     }
 }
