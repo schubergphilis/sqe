@@ -2276,47 +2276,7 @@ impl BenchmarkGenerator for TpceGenerator {
     ) -> anyhow::Result<GenerateStats> {
         let start = std::time::Instant::now();
 
-        let (schema, batches) = match table {
-            // Customer domain
-            "customer_account" => generate_customer_account(scale),
-            "customer" => generate_customer(scale),
-            "customer_taxrate" => generate_customer_taxrate(scale),
-            "account_permission" => generate_account_permission(scale),
-            "holding" => generate_holding(scale),
-            "holding_history" => generate_holding_history(scale),
-            "holding_summary" => generate_holding_summary(scale),
-            "watch_item" => generate_watch_item(scale),
-            "watch_list" => generate_watch_list(scale),
-            // Broker domain
-            "broker" => generate_broker(scale),
-            // Market domain
-            "trade" => generate_trade(scale),
-            "trade_history" => generate_trade_history(scale),
-            "trade_request" => generate_trade_request(scale),
-            "trade_type" => generate_trade_type(),
-            "settlement" => generate_settlement(scale),
-            "cash_transaction" => generate_cash_transaction(scale),
-            "commission_rate" => generate_commission_rate(),
-            // Company domain
-            "company" => generate_company(scale),
-            "company_competitor" => generate_company_competitor(scale),
-            "security" => generate_security(scale),
-            "daily_market" => generate_daily_market(scale),
-            "financial" => generate_financial(scale),
-            "last_trade" => generate_last_trade(scale),
-            "news_item" => generate_news_item(scale),
-            "news_xref" => generate_news_xref(scale),
-            // Reference tables
-            "address" => generate_address(scale),
-            "zip_code" => generate_zip_code(),
-            "status_type" => generate_status_type(),
-            "taxrate" => generate_taxrate(),
-            "exchange" => generate_exchange(),
-            "industry" => generate_industry(),
-            "sector" => generate_sector(),
-            "charge" => generate_charge(),
-            _ => anyhow::bail!("Unknown TPC-E table: {table}"),
-        };
+        let (schema, batches) = build_tpce_table(table, scale, _config)?;
 
         let full_output = format!("{output_dir}/tpce/sf{scale}");
         let (files, bytes) =
@@ -2331,6 +2291,71 @@ impl BenchmarkGenerator for TpceGenerator {
             duration: start.elapsed(),
         })
     }
+
+    fn generate_batches(
+        &self,
+        table: &str,
+        scale: f64,
+        config: &super::GenerateConfig,
+    ) -> anyhow::Result<super::BatchSource> {
+        use super::{BatchShard, BatchSource};
+        let (schema, batches) = build_tpce_table(table, scale, config)?;
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        let make: Box<dyn FnOnce() -> Box<dyn Iterator<Item = RecordBatch> + Send> + Send> =
+            Box::new(move || Box::new(batches.into_iter()));
+        Ok(BatchSource { schema, total_rows, shards: vec![BatchShard { make }] })
+    }
+}
+
+/// Build the (schema, batches) for one TPC-E table. Shared by
+/// `generate_table` (staged to Parquet) and `generate_batches`
+/// (direct-to-Iceberg sink).
+fn build_tpce_table(
+    table: &str,
+    scale: f64,
+    _config: &super::GenerateConfig,
+) -> anyhow::Result<(SchemaRef, Vec<RecordBatch>)> {
+    Ok(match table {
+        // Customer domain
+        "customer_account" => generate_customer_account(scale),
+        "customer" => generate_customer(scale),
+        "customer_taxrate" => generate_customer_taxrate(scale),
+        "account_permission" => generate_account_permission(scale),
+        "holding" => generate_holding(scale),
+        "holding_history" => generate_holding_history(scale),
+        "holding_summary" => generate_holding_summary(scale),
+        "watch_item" => generate_watch_item(scale),
+        "watch_list" => generate_watch_list(scale),
+        // Broker domain
+        "broker" => generate_broker(scale),
+        // Market domain
+        "trade" => generate_trade(scale),
+        "trade_history" => generate_trade_history(scale),
+        "trade_request" => generate_trade_request(scale),
+        "trade_type" => generate_trade_type(),
+        "settlement" => generate_settlement(scale),
+        "cash_transaction" => generate_cash_transaction(scale),
+        "commission_rate" => generate_commission_rate(),
+        // Company domain
+        "company" => generate_company(scale),
+        "company_competitor" => generate_company_competitor(scale),
+        "security" => generate_security(scale),
+        "daily_market" => generate_daily_market(scale),
+        "financial" => generate_financial(scale),
+        "last_trade" => generate_last_trade(scale),
+        "news_item" => generate_news_item(scale),
+        "news_xref" => generate_news_xref(scale),
+        // Reference tables
+        "address" => generate_address(scale),
+        "zip_code" => generate_zip_code(),
+        "status_type" => generate_status_type(),
+        "taxrate" => generate_taxrate(),
+        "exchange" => generate_exchange(),
+        "industry" => generate_industry(),
+        "sector" => generate_sector(),
+        "charge" => generate_charge(),
+        _ => anyhow::bail!("Unknown TPC-E table: {table}"),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -2517,5 +2542,22 @@ mod tests {
         let gen = crate::generate::get_generator("tpce").expect("tpce generator");
         assert_eq!(gen.name(), "tpce");
         assert_eq!(gen.tables().len(), 33);
+    }
+
+    #[test]
+    fn tpce_generate_batches_matches_generate_row_count() {
+        use crate::generate::GenerateConfig;
+        let g = TpceGenerator;
+        let cfg = GenerateConfig::default();
+        let t = g.tables()[0].name.clone();
+        let src = g.generate_batches(&t, 1.0, &cfg).unwrap();
+        let expected_total = src.total_rows;
+        let rows: usize = src
+            .shards
+            .into_iter()
+            .map(|s| (s.make)().map(|b| b.num_rows()).sum::<usize>())
+            .sum();
+        assert_eq!(rows, expected_total);
+        assert!(rows > 0);
     }
 }
