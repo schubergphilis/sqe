@@ -38,6 +38,11 @@ pub struct BatchShard {
 /// `shards` is the disjoint work list; serial generators return one shard,
 /// range-splitting generators (tpch, bank) return `config.threads` shards.
 pub struct BatchSource {
+    /// The table's Arrow schema. Part of the `BatchSource` contract for
+    /// consumers that validate or introspect the shape before writing; the
+    /// current `run_direct` driver derives its write schema from the
+    /// catalog table instead, so it does not read this field.
+    #[allow(dead_code)]
     pub schema: SchemaRef,
     pub total_rows: usize,
     pub shards: Vec<BatchShard>,
