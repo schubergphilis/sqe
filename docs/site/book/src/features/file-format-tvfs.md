@@ -86,16 +86,38 @@ SELECT * FROM read_csv('financial.ssv', sep => ';');
 ```sql
 SELECT * FROM read_json(
     '<path>',
-    [access_key | secret_key | endpoint | region | file_extension]
+    [access_key | secret_key | endpoint | region | file_extension,]
+    [format => 'auto|newline_delimited|array',]
+    [compression | compress => 'auto|none|gzip|zip|zstd|bz2|xz']
 );
 ```
 
-Reads NDJSON (one JSON document per line). Schema inference samples the first batch.
+| Arg | Values | Default | Notes |
+|---|---|---|---|
+| `format` | `auto`, `newline_delimited` (aliases `ndjson`, `nd`), `array` (alias `json`) | `auto` | `auto` on a plain file resolves to NDJSON. A top-level JSON array is only read as an array when `format => 'array'` is passed explicitly (or the source is a `.zip`, see below). `newline_delimited => 'false'` is a legacy alias for `format => 'array'`. |
+| `compression` (alias `compress`) | `auto`, `none`, `gzip`, `zip`, `zstd`, `bz2`, `xz` | `auto` (detected from the path extension) | `.json.gz`, `.json.zip`, `.json.zst`, `.json.bz2`, `.json.xz` all dispatch automatically. |
+| `file_extension` | any extension string | derived from `<path>`, codec suffix included (e.g. `.jsonl.gz`) | Overrides the listing extension when the path doesn't carry one. |
+
+Two execution paths back this TVF:
+
+- **Streaming path** (NDJSON, any supported compression except zip): DataFusion's built-in JSON listing table reads the file as a stream, the same way `read_csv` does. This is the default, and it handles arbitrarily large NDJSON files without buffering the whole object in memory.
+- **Buffer path** (`format => 'array'`, or any `.zip` source): the object is fetched whole, decompressed, and reshaped into NDJSON in memory before decoding. A top-level JSON array can't be streamed line-by-line, and a zip archive isn't a single compressed byte stream DataFusion's codecs understand, so both cases route here. A size guard rejects inputs larger than the buffer cap with a clear error instead of risking OOM on a mislabeled file.
 
 ```sql
+-- Plain NDJSON, local or remote
 SELECT * FROM read_json('/var/log/events.jsonl');
-SELECT * FROM read_json('s3://logs/2026-05-07/events.json.gz');
 SELECT * FROM read_json('hf://datasets/nyu-mll/glue/cola/train.jsonl');
+
+-- gzip NDJSON (streaming; auto-detected from .gz)
+SELECT * FROM read_json('s3://logs/2026-05-07/events.json.gz');
+
+-- full JSON array (buffer path; format must be explicit)
+SELECT * FROM read_json('/data/events.json', format => 'array');
+SELECT * FROM read_json('/data/events.json.gz', format => 'array');
+
+-- zip archive (buffer path; every JSON/NDJSON entry is concatenated,
+-- directory entries are skipped, array and NDJSON entries can mix)
+SELECT * FROM read_json('/data/export.json.zip');
 ```
 
 ## `read_delta`
