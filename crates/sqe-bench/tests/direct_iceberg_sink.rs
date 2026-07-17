@@ -22,7 +22,7 @@ use std::collections::HashMap;
 
 use futures::TryStreamExt;
 use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableIdent};
-use iceberg_catalog_rest::{RestCatalogBuilder, REST_CATALOG_PROP_URI, REST_CATALOG_PROP_WAREHOUSE};
+use iceberg_catalog_rest::RestCatalogBuilder;
 
 use sqe_bench::generate::{get_generator, GenerateConfig};
 use sqe_bench::sink::iceberg::{run_direct, IcebergTarget};
@@ -31,12 +31,7 @@ use sqe_bench::sink::iceberg::{run_direct, IcebergTarget};
 /// `quickstart/benchmark/docker-compose.yml` (Nessie over RustFS, no auth).
 /// Point these at a Polaris deployment (with `SQE_TEST_ICEBERG_CLIENT_ID`
 /// / `SQE_TEST_ICEBERG_CLIENT_SECRET` set) to exercise that path instead.
-struct TestTarget {
-    target: IcebergTarget,
-    catalog_props: HashMap<String, String>,
-}
-
-fn test_target() -> TestTarget {
+fn test_target() -> IcebergTarget {
     let catalog_uri = std::env::var("SQE_TEST_ICEBERG_CATALOG_URI")
         .unwrap_or_else(|_| "http://localhost:19120/iceberg/".to_string());
     let warehouse =
@@ -59,15 +54,7 @@ fn test_target() -> TestTarget {
         _ => None,
     };
 
-    let mut catalog_props = HashMap::from([
-        (REST_CATALOG_PROP_URI.to_string(), catalog_uri.clone()),
-        (REST_CATALOG_PROP_WAREHOUSE.to_string(), warehouse.clone()),
-    ]);
-    if let Some(ref cred) = credential {
-        catalog_props.insert("credential".to_string(), cred.clone());
-    }
-
-    let target = IcebergTarget {
+    IcebergTarget {
         catalog_uri,
         warehouse,
         namespace,
@@ -80,11 +67,6 @@ fn test_target() -> TestTarget {
         s3_secret_key: Some(s3_secret_key),
         s3_region: Some(s3_region),
         s3_path_style: true,
-    };
-
-    TestTarget {
-        target,
-        catalog_props,
     }
 }
 
@@ -138,10 +120,7 @@ async fn current_snapshot_id(
             (see SQE_TEST_ICEBERG_* env vars in this file's doc comment; defaults match \
             quickstart/benchmark's Nessie/RustFS compose stack)"]
 async fn tpch_direct_sink_writes_and_resumes() {
-    let TestTarget {
-        target,
-        catalog_props,
-    } = test_target();
+    let target = test_target();
     let scale = test_scale();
     let config = GenerateConfig::resolve(Some(2), None, None).expect("resolve GenerateConfig");
     let gen = get_generator("tpch").expect("tpch generator");
@@ -153,8 +132,12 @@ async fn tpch_direct_sink_writes_and_resumes() {
         .await
         .expect("first run_direct should write every table");
 
+    // Build the verify/read-back connection from the exact same property map
+    // `run_direct` writes through (URI, warehouse, credential, and all
+    // s3_* settings), so a scan failure here reflects a real catalog/storage
+    // mismatch rather than an under-specified test harness.
     let verify_catalog = RestCatalogBuilder::default()
-        .load("sqe-bench-it", catalog_props.clone())
+        .load("sqe-bench-it", target.catalog_props())
         .await
         .expect("verify catalog connects");
     let verify_catalog: Box<dyn Catalog> = Box::new(verify_catalog);

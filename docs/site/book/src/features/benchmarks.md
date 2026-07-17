@@ -145,8 +145,9 @@ Two flags control repeated runs against the same namespace:
   regardless of what state the namespace was in. `--clean` and `--resume`
   are mutually exclusive.
 
-Without either flag, a table that already exists and is not marked done gets
-rewritten: the sink does not merge into partial prior state.
+Without `--resume` or `--clean`, re-running `generate` against a table that
+already holds data commits another `fast_append` on top of it, duplicating
+every row. The done marker is only consulted when you pass `--resume`.
 
 Catalog and storage settings match the `load` command's `--s3-*` flags, plus
 the catalog's OAuth2 client-credentials pair (`--client-id`/`--client-secret`)

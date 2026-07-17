@@ -80,7 +80,11 @@ pub struct IcebergTarget {
 }
 
 impl IcebergTarget {
-    fn catalog_props(&self) -> HashMap<String, String> {
+    /// Build the full catalog-connection property map (URI, warehouse,
+    /// credentials, and S3 storage settings). `pub` so integration tests
+    /// (a separate crate) can open a verification catalog connection that is
+    /// provably identical to the one `run_direct` writes through.
+    pub fn catalog_props(&self) -> HashMap<String, String> {
         let mut props = HashMap::from([
             (REST_CATALOG_PROP_URI.to_string(), self.catalog_uri.clone()),
             (
