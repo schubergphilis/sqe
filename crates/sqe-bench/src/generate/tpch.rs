@@ -1053,6 +1053,67 @@ impl BenchmarkGenerator for TpchGenerator {
             gen_range,
         )
     }
+
+    fn generate_batches(
+        &self,
+        table: &str,
+        scale: f64,
+        config: &GenerateConfig,
+    ) -> anyhow::Result<crate::generate::BatchSource> {
+        use crate::generate::{config as gcfg, BatchShard, BatchSource};
+
+        // region/nation: tiny, single shard.
+        if table == "region" || table == "nation" {
+            let (schema, batches) = if table == "region" {
+                generate_region()
+            } else {
+                generate_nation()
+            };
+            let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+            let make: Box<dyn FnOnce() -> Box<dyn Iterator<Item = RecordBatch> + Send> + Send> =
+                Box::new(move || Box::new(batches.into_iter()));
+            return Ok(BatchSource {
+                schema,
+                total_rows: total,
+                shards: vec![BatchShard { make }],
+            });
+        }
+
+        let (total_rows, schema): (usize, SchemaRef) = match table {
+            "supplier" => (super::scaled(scale, 10_000.0).max(1), supplier_schema()),
+            "customer" => (super::scaled(scale, 150_000.0).max(1), customer_schema()),
+            "part" => (super::scaled(scale, 200_000.0).max(1), part_schema()),
+            "partsupp" => (super::scaled(scale, 800_000.0).max(1), partsupp_schema()),
+            "orders" => (super::scaled(scale, 1_500_000.0).max(1), orders_schema()),
+            "lineitem" => (super::scaled(scale, 6_000_000.0).max(1), lineitem_schema()),
+            _ => anyhow::bail!("Unknown TPC-H table: {table}"),
+        };
+        let base_seed = seed_for_table(table);
+        let threads = config.threads.max(1);
+        let ranges = gcfg::partition(total_rows, threads);
+
+        let mut shards = Vec::with_capacity(ranges.len());
+        for (part_idx, range) in ranges.into_iter().enumerate() {
+            let seed = gcfg::seed_for_table_partition(base_seed, part_idx);
+            let table = table.to_string();
+            let make: Box<dyn FnOnce() -> Box<dyn Iterator<Item = RecordBatch> + Send> + Send> =
+                Box::new(move || match table.as_str() {
+                    "supplier" => Box::new(generate_supplier_range(range, scale, seed)),
+                    "customer" => Box::new(generate_customer_range(range, scale, seed)),
+                    "part" => Box::new(generate_part_range(range, scale, seed)),
+                    "partsupp" => Box::new(generate_partsupp_range(range, scale, seed)),
+                    "orders" => Box::new(generate_orders_range(range, scale, seed)),
+                    "lineitem" => Box::new(generate_lineitem_range(range, scale, seed)),
+                    _ => unreachable!("filtered above"),
+                });
+            shards.push(BatchShard { make });
+        }
+        Ok(BatchSource {
+            schema,
+            total_rows,
+            shards,
+        })
+    }
 }
 
 /// Boxed closure type for per-table range-based generator dispatch.
@@ -1088,6 +1149,49 @@ mod tests {
         assert!(names.contains(&"partsupp"));
         assert!(names.contains(&"orders"));
         assert!(names.contains(&"lineitem"));
+    }
+
+    #[test]
+    fn tpch_generate_batches_row_count_matches_scale() {
+        use crate::generate::{BenchmarkGenerator, GenerateConfig};
+        let g = TpchGenerator;
+        let cfg = GenerateConfig { threads: 4, ..GenerateConfig::default() };
+        let src = g.generate_batches("supplier", 1.0, &cfg).unwrap();
+        // scaled(1.0, 10_000) = 10_000 suppliers.
+        assert_eq!(src.total_rows, 10_000);
+        let rows: usize = src.shards.into_iter()
+            .map(|s| (s.make)().map(|b| b.num_rows()).sum::<usize>())
+            .sum();
+        assert_eq!(rows, 10_000);
+    }
+
+    /// Determinism guard: `seed_for_table_partition(base_seed, 0) ==
+    /// base_seed` (XOR with 0), so at `threads == 1` the single shard's
+    /// seed and range are byte-identical to `parallel_generate_table`'s
+    /// serial fast path. Assert the shard count and row split at
+    /// threads=1 vs threads=4 to lock in that both paths cover the same
+    /// total rows with the expected shard-count shape.
+    #[test]
+    fn tpch_generate_batches_single_thread_matches_serial_shape() {
+        use crate::generate::{BenchmarkGenerator, GenerateConfig};
+        let g = TpchGenerator;
+        let cfg1 = GenerateConfig { threads: 1, ..GenerateConfig::default() };
+        let src1 = g.generate_batches("supplier", 0.01, &cfg1).unwrap();
+        assert_eq!(src1.shards.len(), 1);
+        assert_eq!(src1.total_rows, 100);
+        let rows1: usize = src1.shards.into_iter()
+            .map(|s| (s.make)().map(|b| b.num_rows()).sum::<usize>())
+            .sum();
+        assert_eq!(rows1, 100);
+
+        let cfg4 = GenerateConfig { threads: 4, ..GenerateConfig::default() };
+        let src4 = g.generate_batches("supplier", 0.01, &cfg4).unwrap();
+        assert_eq!(src4.shards.len(), 4);
+        assert_eq!(src4.total_rows, 100);
+        let rows4: usize = src4.shards.into_iter()
+            .map(|s| (s.make)().map(|b| b.num_rows()).sum::<usize>())
+            .sum();
+        assert_eq!(rows4, 100);
     }
 
     #[test]

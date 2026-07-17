@@ -28,6 +28,26 @@ pub struct TableDef {
     pub row_count: fn(f64) -> usize,
 }
 
+/// One unit of batch production: a boxed factory the driver calls on a
+/// blocking thread. `FnOnce` because a shard is produced exactly once.
+pub struct BatchShard {
+    pub make: Box<dyn FnOnce() -> Box<dyn Iterator<Item = arrow_array::RecordBatch> + Send> + Send>,
+}
+
+/// A table's rows exposed as Arrow batches for the Iceberg direct sink.
+/// `shards` is the disjoint work list; serial generators return one shard,
+/// range-splitting generators (tpch, bank) return `config.threads` shards.
+pub struct BatchSource {
+    /// The table's Arrow schema. Part of the `BatchSource` contract for
+    /// consumers that validate or introspect the shape before writing; the
+    /// current `run_direct` driver derives its write schema from the
+    /// catalog table instead, so it does not read this field.
+    #[allow(dead_code)]
+    pub schema: SchemaRef,
+    pub total_rows: usize,
+    pub shards: Vec<BatchShard>,
+}
+
 #[allow(dead_code)]
 #[derive(Debug)]
 pub struct GenerateStats {
@@ -49,6 +69,20 @@ pub trait BenchmarkGenerator: Send + Sync {
         output_dir: &str,
         config: &GenerateConfig,
     ) -> anyhow::Result<GenerateStats>;
+
+    /// Produce a table's rows as Arrow batches for the Iceberg direct sink.
+    /// Default: unsupported (generators opt in one at a time).
+    fn generate_batches(
+        &self,
+        table: &str,
+        _scale: f64,
+        _config: &GenerateConfig,
+    ) -> anyhow::Result<BatchSource> {
+        anyhow::bail!(
+            "{}: generate_batches not implemented for table {table}",
+            self.name()
+        )
+    }
 }
 
 /// Dispatch per-partition row generation across `config.threads` OS threads.
@@ -181,6 +215,36 @@ pub fn get_generator(name: &str) -> anyhow::Result<Box<dyn BenchmarkGenerator>> 
     }
 }
 
+
+#[cfg(test)]
+mod batch_source_tests {
+    use super::*;
+    use arrow_array::{Int32Array, RecordBatch};
+    use arrow_schema::{DataType, Field, Schema};
+    use std::sync::Arc;
+
+    #[test]
+    fn batch_shard_make_produces_rows() {
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
+        let s2 = schema.clone();
+        let shard = BatchShard {
+            make: Box::new(move || {
+                let b = RecordBatch::try_new(
+                    s2.clone(),
+                    vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+                )
+                .unwrap();
+                Box::new(std::iter::once(b))
+            }),
+        };
+        let src = BatchSource { schema, total_rows: 3, shards: vec![shard] };
+        let rows: usize = (src.shards.into_iter().next().unwrap().make)()
+            .map(|b| b.num_rows())
+            .sum();
+        assert_eq!(rows, 3);
+        assert_eq!(src.total_rows, 3);
+    }
+}
 
 #[cfg(test)]
 mod sweep_tests {
