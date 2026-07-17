@@ -37,6 +37,7 @@ pub mod read_csv;
 // in Cargo.toml once delta-rs ships DF 54 support.
 // pub mod read_delta;
 pub mod read_json;
+mod read_json_buffer;
 pub mod read_parquet;
 pub mod scan_memory;
 pub mod sort_order;

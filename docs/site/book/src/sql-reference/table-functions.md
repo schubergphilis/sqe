@@ -15,7 +15,7 @@ Detailed per-function docs: [File-format TVFs](../features/file-format-tvfs.md),
 |---|---|---|---|---|---|---|
 | `read_parquet(path, ...)` | `sqe-catalog` | Parquet on local FS / S3 / HTTPS / `hf://`. Inline auth args. `read_parquet.rs` | Hive table only | `infer_schema`+stage | `parquet` source | `read_parquet` |
 | `read_csv(path, ...)` | `sqe-catalog` | DuckDB-style aliases (`sep`, `delim`, `header`, `nullstr`, `compress`). Smart defaults from extension. `read_csv.rs` | - | `infer_schema`+stage | `csv` source | `read_csv` |
-| `read_json(path, ...)` | `sqe-catalog` | NDJSON (one document per line). `read_json.rs` | - | - | `json` source | `read_json` |
+| `read_json(path, ...)` | `sqe-catalog` | NDJSON by default; `format => 'array'` for a top-level JSON array, `.zip` archives auto-route to the buffer path. `read_json.rs` | - | - | `json` source | `read_json` |
 | `read_delta(path, ...)` | `sqe-catalog` | Read-only Delta Lake reader. Time travel via `version => N` or `timestamp => 'RFC3339'`. `read_delta.rs` | via connector | - | native | via extension |
 | `SELECT * FROM 'file.ext'` | `datafusion-builtin` | Quoted-string auto-detect. Dispatches by extension to one of the readers above. Requires `enable_url_table()`. | - | - | - | yes |
 
