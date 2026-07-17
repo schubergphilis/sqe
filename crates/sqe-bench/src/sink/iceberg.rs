@@ -265,6 +265,60 @@ fn bank_arrow_schema(table: &str) -> arrow_schema::SchemaRef {
     }
 }
 
+/// Ensure one table exists in `ns`, creating it (with an optional identity
+/// partition on `partition_col`) if missing. With `clean`, an existing
+/// table is dropped and recreated first.
+async fn ensure_table(
+    catalog: &dyn Catalog,
+    ns: &NamespaceIdent,
+    name: &str,
+    arrow_schema: &ArrowSchema,
+    partition_col: Option<&str>,
+    clean: bool,
+) -> anyhow::Result<TableCtx> {
+    let ident = TableIdent::new(ns.clone(), name.to_string());
+    if clean && catalog.table_exists(&ident).await? {
+        catalog
+            .drop_table(&ident)
+            .await
+            .with_context(|| format!("dropping table {name}"))?;
+        println!("Dropped table {ns:?}.{name}");
+    }
+    let table = if catalog.table_exists(&ident).await? {
+        catalog.load_table(&ident).await?
+    } else {
+        let schema = arrow_schema_to_schema(arrow_schema)
+            .with_context(|| format!("converting {name} schema"))?;
+        let creation = if let Some(col) = partition_col {
+            let spec = PartitionSpec::builder(schema.clone())
+                .add_partition_field(col, col, Transform::Identity)
+                .and_then(|b| b.build())
+                .with_context(|| format!("building {name} partition spec"))?;
+            TableCreation::builder()
+                .name(name.to_string())
+                .schema(schema)
+                .partition_spec(spec.into_unbound())
+                .build()
+        } else {
+            TableCreation::builder()
+                .name(name.to_string())
+                .schema(schema)
+                .build()
+        };
+        let table = catalog
+            .create_table(ns, creation)
+            .await
+            .with_context(|| format!("creating table {name}"))?;
+        println!("Created table {name}");
+        table
+    };
+    let write_schema = Arc::new(
+        schema_to_arrow_schema(table.metadata().current_schema())
+            .with_context(|| format!("deriving {name} write schema"))?,
+    );
+    Ok(TableCtx { table, write_schema })
+}
+
 /// Create the namespace and any missing bank tables; return handles.
 /// With `clean`, existing bank tables are dropped and recreated first.
 async fn ensure_tables(
@@ -287,51 +341,17 @@ async fn ensure_tables(
 
     let mut tables = HashMap::new();
     for name in BANK_TABLES {
-        let ident = TableIdent::new(ns.clone(), name.to_string());
-        if clean && catalog.table_exists(&ident).await? {
-            catalog
-                .drop_table(&ident)
-                .await
-                .with_context(|| format!("dropping table {name}"))?;
-            println!("Dropped table {namespace}.{name}");
-        }
-        let table = if catalog.table_exists(&ident).await? {
-            catalog.load_table(&ident).await?
-        } else {
-            let arrow_schema = bank_arrow_schema(name);
-            let schema = arrow_schema_to_schema(&arrow_schema)
-                .with_context(|| format!("converting {name} schema"))?;
-            let creation = if let Some(col) = bank::partition_column(name) {
-                let spec = PartitionSpec::builder(schema.clone())
-                    .add_partition_field(col, col, Transform::Identity)
-                    .and_then(|b| b.build())
-                    .with_context(|| format!("building {name} partition spec"))?;
-                TableCreation::builder()
-                    .name(name.to_string())
-                    .schema(schema)
-                    .partition_spec(spec.into_unbound())
-                    .build()
-            } else {
-                TableCreation::builder()
-                    .name(name.to_string())
-                    .schema(schema)
-                    .build()
-            };
-            let table = catalog
-                .create_table(&ns, creation)
-                .await
-                .with_context(|| format!("creating table {name}"))?;
-            println!("Created table {namespace}.{name}");
-            table
-        };
-        let write_schema = Arc::new(
-            schema_to_arrow_schema(table.metadata().current_schema())
-                .with_context(|| format!("deriving {name} write schema"))?,
-        );
-        tables.insert(name, TableCtx {
-            table,
-            write_schema,
-        });
+        let arrow_schema = bank_arrow_schema(name);
+        let table_ctx = ensure_table(
+            catalog,
+            &ns,
+            name,
+            &arrow_schema,
+            bank::partition_column(name),
+            clean,
+        )
+        .await?;
+        tables.insert(name, table_ctx);
     }
     Ok(tables)
 }
@@ -346,6 +366,52 @@ fn committed_days(table: &Table) -> HashSet<i32> {
         .filter_map(|k| k.strip_prefix(DAY_PROP_PREFIX))
         .filter_map(|d| parse_day(d).ok())
         .collect()
+}
+
+/// Write `batches` into `table_ctx`'s table as one or more data files
+/// (rolling over at `target_file_size`); returns the finished `DataFile`s
+/// without committing them. `file_prefix` should be deterministic per
+/// caller so a re-run of the same unit overwrites its own partial output
+/// from a crashed run.
+async fn write_shard(
+    writer_props: &WriterProperties,
+    target_file_size: usize,
+    table_ctx: &TableCtx,
+    file_prefix: String,
+    partition_key: Option<PartitionKey>,
+    batches: impl Iterator<Item = RecordBatch>,
+) -> anyhow::Result<Vec<DataFile>> {
+    let table = &table_ctx.table;
+    let location_gen = DefaultLocationGenerator::new(table.metadata().clone())
+        .context("building location generator")?;
+    let file_name_gen = DefaultFileNameGenerator::new(
+        file_prefix,
+        None,
+        iceberg::spec::DataFileFormat::Parquet,
+    );
+    let parquet_builder = ParquetWriterBuilder::new(
+        writer_props.clone(),
+        table.metadata().current_schema().clone(),
+    );
+    let rolling = RollingFileWriterBuilder::new(
+        parquet_builder,
+        target_file_size,
+        table.file_io().clone(),
+        location_gen,
+        file_name_gen,
+    );
+    let mut writer = DataFileWriterBuilder::new(rolling)
+        .build(partition_key)
+        .await
+        .context("building data file writer")?;
+    for batch in batches {
+        // Rebind to the table-derived arrow schema: column data types are
+        // identical, only field metadata (field ids) may differ in detail.
+        let batch = RecordBatch::try_new(table_ctx.write_schema.clone(), batch.columns().to_vec())
+            .context("rebinding batch to table schema")?;
+        writer.write(batch).await.context("writing batch")?;
+    }
+    writer.close().await.context("closing writer")
 }
 
 /// Write one unit's batches as data files; returns the finished
@@ -363,80 +429,67 @@ async fn write_unit(ctx: &RunCtx, unit: &Unit) -> anyhow::Result<Vec<DataFile>> 
         )
     });
 
-    let location_gen = DefaultLocationGenerator::new(table.metadata().clone())
-        .context("building location generator")?;
-    // Deterministic names: a re-run of the same unit produces the same
-    // file names and overwrites its own partial output from a crashed run.
-    let file_name_gen = DefaultFileNameGenerator::new(
-        unit.file_prefix(),
-        None,
-        iceberg::spec::DataFileFormat::Parquet,
-    );
-    let parquet_builder = ParquetWriterBuilder::new(
-        ctx.writer_props.clone(),
-        table.metadata().current_schema().clone(),
-    );
-    let rolling = RollingFileWriterBuilder::new(
-        parquet_builder,
+    write_shard(
+        &ctx.writer_props,
         ctx.target_file_size,
-        table.file_io().clone(),
-        location_gen,
-        file_name_gen,
-    );
-    let mut writer = DataFileWriterBuilder::new(rolling)
-        .build(partition_key)
-        .await
-        .context("building data file writer")?;
-
-    for batch in unit.batches(&ctx.plan) {
-        // Rebind to the table-derived arrow schema: column data types are
-        // identical, only field metadata (field ids) may differ in detail.
-        let batch = RecordBatch::try_new(tctx.write_schema.clone(), batch.columns().to_vec())
-            .context("rebinding batch to table schema")?;
-        writer.write(batch).await.context("writing batch")?;
-    }
-    writer.close().await.context("closing writer")
+        tctx,
+        unit.file_prefix(),
+        partition_key,
+        unit.batches(&ctx.plan),
+    )
+    .await
 }
 
-/// Commit `files` to `table_name` as one fast-append snapshot, tagging it
-/// with the day marker when the commit is for one trading day.
+/// Build the day-specific snapshot and table property maps for a bank
+/// commit. Dimension tables (no day) get no markers.
+fn day_props(day: Option<i32>) -> (HashMap<String, String>, HashMap<String, String>) {
+    match day {
+        Some(d) => (
+            HashMap::from([(SNAPSHOT_DAY_PROP.to_string(), format_day(d))]),
+            HashMap::from([(
+                format!("{DAY_PROP_PREFIX}{}", format_day(d)),
+                "done".to_string(),
+            )]),
+        ),
+        None => (HashMap::new(), HashMap::new()),
+    }
+}
+
+/// Commit `files` to the table as one fast-append snapshot, applying
+/// `snapshot_props` to the snapshot summary and `table_props` to the table
+/// properties (both committed atomically with the append).
 async fn commit_files(
-    ctx: &RunCtx,
-    table_name: &'static str,
-    day: Option<i32>,
+    catalog: &dyn Catalog,
+    table_ctx: &TableCtx,
+    commit_lock: &Mutex<()>,
     files: Vec<DataFile>,
+    snapshot_props: HashMap<String, String>,
+    table_props: HashMap<String, String>,
 ) -> anyhow::Result<()> {
     if files.is_empty() {
         return Ok(());
     }
-    let _guard = ctx.commit_lock.lock().await;
+    let _guard = commit_lock.lock().await;
     // Reload so the transaction bases on the latest metadata; commits from
     // other days may have landed since this handle was created.
-    let table = ctx
-        .catalog
-        .load_table(ctx.tables[table_name].table.identifier())
+    let table = catalog
+        .load_table(table_ctx.table.identifier())
         .await
         .context("reloading table before commit")?;
     let tx = Transaction::new(&table);
     let mut append = tx.fast_append().add_data_files(files);
-    if let Some(day) = day {
-        append = append.set_snapshot_properties(HashMap::from([(
-            SNAPSHOT_DAY_PROP.to_string(),
-            format_day(day),
-        )]));
+    if !snapshot_props.is_empty() {
+        append = append.set_snapshot_properties(snapshot_props);
     }
     let mut tx = append.apply(tx).context("applying append")?;
-    if let Some(day) = day {
-        // Durable resume marker; committed atomically with the append.
-        tx = tx
-            .update_table_properties()
-            .set(format!("{DAY_PROP_PREFIX}{}", format_day(day)), "done".to_string())
-            .apply(tx)
-            .context("applying day property")?;
+    if !table_props.is_empty() {
+        let mut upd = tx.update_table_properties();
+        for (k, v) in table_props {
+            upd = upd.set(k, v);
+        }
+        tx = upd.apply(tx).context("applying table properties")?;
     }
-    tx.commit(ctx.catalog.as_ref())
-        .await
-        .context("committing append")?;
+    tx.commit(catalog).await.context("committing append")?;
     Ok(())
 }
 
@@ -480,7 +533,16 @@ async fn run_group(
     let rows: u64 = files.iter().map(|f| f.record_count()).sum();
     let bytes: u64 = files.iter().map(|f| f.file_size_in_bytes()).sum();
     let count = files.len();
-    commit_files(&ctx, table_name, day, files).await?;
+    let (snapshot_props, table_props) = day_props(day);
+    commit_files(
+        ctx.catalog.as_ref(),
+        &ctx.tables[table_name],
+        &ctx.commit_lock,
+        files,
+        snapshot_props,
+        table_props,
+    )
+    .await?;
     let label = match day {
         Some(d) => format!("{table_name} {}", format_day(d)),
         None => table_name.to_string(),
@@ -696,6 +758,15 @@ mod tests {
         assert_eq!(total, 10_000_000);
 
         assert_eq!(small_table_shards(1).len(), 1);
+    }
+
+    #[test]
+    fn day_props_sets_snapshot_and_table_markers() {
+        let (snap, tprops) = day_props(Some(0));
+        assert!(snap.contains_key(SNAPSHOT_DAY_PROP));
+        assert!(tprops.keys().any(|k| k.starts_with(DAY_PROP_PREFIX)));
+        let (snap0, tprops0) = day_props(None);
+        assert!(snap0.is_empty() && tprops0.is_empty());
     }
 
     #[test]
