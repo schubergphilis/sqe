@@ -234,6 +234,22 @@ struct TableCtx {
     write_schema: Arc<ArrowSchema>,
 }
 
+impl TableCtx {
+    /// Cheap handle clone for fanning a table out across shard tasks:
+    /// `iceberg::table::Table` is `Clone` (it wraps `FileIO` + an `Arc`'d
+    /// metadata snapshot), so no `Arc<TableCtx>` wrapper is needed.
+    ///
+    /// `run_direct` (below) is the only caller; it is not wired into the
+    /// CLI dispatch until Task 6, so allow dead_code until then.
+    #[allow(dead_code)]
+    fn clone_handle(&self) -> TableCtx {
+        TableCtx {
+            table: self.table.clone(),
+            write_schema: self.write_schema.clone(),
+        }
+    }
+}
+
 /// Everything the worker tasks share.
 struct RunCtx {
     catalog: Box<dyn Catalog>,
@@ -715,6 +731,141 @@ pub async fn run_bank(
     Ok(())
 }
 
+/// Generic direct-to-Iceberg sink: write every table of `gen` straight into
+/// Iceberg, one fast_append per table, with a per-table resume marker.
+///
+/// Not yet wired into the CLI dispatch (that lands in Task 6), so allow
+/// dead_code for now -- matches the pattern already used for `TableDef`,
+/// `BatchSource`/`BatchShard`, and `generate_batches` in `generate/mod.rs`.
+#[allow(dead_code)]
+pub async fn run_direct(
+    target: &IcebergTarget,
+    gen: &dyn crate::generate::BenchmarkGenerator,
+    scale: f64,
+    config: &GenerateConfig,
+    clean: bool,
+    resume: bool,
+    target_file_size: usize,
+) -> anyhow::Result<()> {
+    const TABLE_DONE_PREFIX: &str = "sqe-bench.table.";
+
+    let catalog = RestCatalogBuilder::default()
+        .load("polaris", target.catalog_props())
+        .await
+        .context("connecting to catalog")?;
+    let catalog: Box<dyn Catalog> = Box::new(catalog);
+
+    let ns = NamespaceIdent::new(target.namespace.clone());
+    if !catalog
+        .namespace_exists(&ns)
+        .await
+        .context("checking namespace")?
+    {
+        catalog
+            .create_namespace(&ns, HashMap::new())
+            .await
+            .context("creating namespace")?;
+        println!("Created namespace {}", target.namespace);
+    }
+
+    let mut props_builder =
+        WriterProperties::builder().set_compression(config.compression.to_parquet());
+    if let Some(rgs) = config.row_group_size {
+        props_builder = props_builder.set_max_row_group_row_count(Some(rgs));
+    }
+    let writer_props = props_builder.build();
+    let commit_lock = Mutex::new(());
+
+    for table_def in gen.tables() {
+        let name = table_def.name.clone();
+        let done_key = format!("{TABLE_DONE_PREFIX}{name}");
+
+        // Resume: skip a table already marked done (unless clean forces a rebuild).
+        let table_ctx = ensure_table(
+            catalog.as_ref(),
+            &ns,
+            &name,
+            table_def.schema.as_ref(),
+            None,
+            clean,
+        )
+        .await?;
+        if resume && !clean {
+            if let Some(v) = table_ctx.table.metadata().properties().get(&done_key) {
+                if v == "done" {
+                    println!("  skip {name}: already committed");
+                    continue;
+                }
+            }
+        }
+
+        let src = gen.generate_batches(&name, scale, config)?;
+        let expected_rows = src.total_rows as u64;
+        let sem = Arc::new(Semaphore::new(config.threads.max(1)));
+        let mut handles = Vec::with_capacity(src.shards.len());
+        for (idx, shard) in src.shards.into_iter().enumerate() {
+            let sem = sem.clone();
+            let writer_props = writer_props.clone();
+            let tctx = table_ctx.clone_handle();
+            handles.push(tokio::spawn(async move {
+                let _permit = sem.acquire_owned().await.expect("semaphore closed");
+                // Sync producer on a blocking thread -> bounded channel -> async writer.
+                let (tx, mut rx) = tokio::sync::mpsc::channel::<RecordBatch>(4);
+                let make = shard.make;
+                let producer = tokio::task::spawn_blocking(move || {
+                    for b in make() {
+                        if tx.blocking_send(b).is_err() {
+                            break;
+                        }
+                    }
+                });
+                let mut batches = Vec::new();
+                while let Some(b) = rx.recv().await {
+                    batches.push(b);
+                }
+                producer.await.context("producer task panicked")?;
+                write_shard(
+                    &writer_props,
+                    target_file_size,
+                    &tctx,
+                    format!("{idx:04}"),
+                    None,
+                    batches.into_iter(),
+                )
+                .await
+            }));
+        }
+        let mut files = Vec::new();
+        for h in handles {
+            files.extend(h.await.context("shard task panicked")??);
+        }
+
+        let rows: u64 = files.iter().map(|f| f.record_count()).sum();
+        let bytes: u64 = files.iter().map(|f| f.file_size_in_bytes()).sum();
+        let nfiles = files.len();
+        let table_props = HashMap::from([(done_key, "done".to_string())]);
+        commit_files(
+            catalog.as_ref(),
+            &table_ctx,
+            &commit_lock,
+            files,
+            HashMap::new(),
+            table_props,
+        )
+        .await?;
+        if rows != expected_rows {
+            eprintln!(
+                "  warning: {name} committed {rows} rows, generator expected {expected_rows}"
+            );
+        }
+        println!(
+            "  committed {name}: {rows} rows (expected {expected_rows}), {nfiles} files, {}",
+            human_bytes(bytes)
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -787,5 +938,15 @@ mod tests {
             accounts: 0..0,
         };
         assert_eq!(b.file_prefix(), "customer-s0000");
+    }
+
+    /// `run_direct` names each shard's data files `{idx:04}`; this documents
+    /// the invariant that shard prefixes are disjoint and match the staging
+    /// `{part_idx:04}` convention, so a re-run overwrites its own partial
+    /// output rather than colliding with another shard's files.
+    #[test]
+    fn shard_prefix_is_zero_padded() {
+        assert_eq!(format!("{:04}", 3usize), "0003");
+        assert_eq!(format!("{:04}", 12usize), "0012");
     }
 }
