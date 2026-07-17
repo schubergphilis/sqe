@@ -18,7 +18,9 @@ use std::sync::Arc;
 use anyhow::Context;
 use arrow_array::RecordBatch;
 use arrow_schema::Schema as ArrowSchema;
-use iceberg::arrow::{arrow_schema_to_schema, schema_to_arrow_schema};
+use iceberg::arrow::{
+    arrow_schema_to_schema, arrow_schema_to_schema_auto_assign_ids, schema_to_arrow_schema,
+};
 use iceberg::spec::{DataFile, Literal, PartitionKey, PartitionSpec, Struct, Transform};
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
@@ -243,9 +245,7 @@ impl TableCtx {
     /// `iceberg::table::Table` is `Clone` (it wraps `FileIO` + an `Arc`'d
     /// metadata snapshot), so no `Arc<TableCtx>` wrapper is needed.
     ///
-    /// `run_direct` (below) is the only caller; it is not wired into the
-    /// CLI dispatch until Task 6, so allow dead_code until then.
-    #[allow(dead_code)]
+    /// `run_direct` (below) is the only caller.
     fn clone_handle(&self) -> TableCtx {
         TableCtx {
             table: self.table.clone(),
@@ -295,6 +295,7 @@ async fn ensure_table(
     arrow_schema: &ArrowSchema,
     partition_col: Option<&str>,
     clean: bool,
+    auto_assign_ids: bool,
 ) -> anyhow::Result<TableCtx> {
     let ident = TableIdent::new(ns.clone(), name.to_string());
     if clean && catalog.table_exists(&ident).await? {
@@ -307,8 +308,12 @@ async fn ensure_table(
     let table = if catalog.table_exists(&ident).await? {
         catalog.load_table(&ident).await?
     } else {
-        let schema = arrow_schema_to_schema(arrow_schema)
-            .with_context(|| format!("converting {name} schema"))?;
+        let schema = if auto_assign_ids {
+            arrow_schema_to_schema_auto_assign_ids(arrow_schema)
+        } else {
+            arrow_schema_to_schema(arrow_schema)
+        }
+        .with_context(|| format!("converting {name} schema"))?;
         let creation = if let Some(col) = partition_col {
             let spec = PartitionSpec::builder(schema.clone())
                 .add_partition_field(col, col, Transform::Identity)
@@ -369,6 +374,7 @@ async fn ensure_tables(
             &arrow_schema,
             bank::partition_column(name),
             clean,
+            false,
         )
         .await?;
         tables.insert(name, table_ctx);
@@ -737,11 +743,6 @@ pub async fn run_bank(
 
 /// Generic direct-to-Iceberg sink: write every table of `gen` straight into
 /// Iceberg, one fast_append per table, with a per-table resume marker.
-///
-/// Not yet wired into the CLI dispatch (that lands in Task 6), so allow
-/// dead_code for now -- matches the pattern already used for `TableDef`,
-/// `BatchSource`/`BatchShard`, and `generate_batches` in `generate/mod.rs`.
-#[allow(dead_code)]
 pub async fn run_direct(
     target: &IcebergTarget,
     gen: &dyn crate::generate::BenchmarkGenerator,
@@ -792,6 +793,7 @@ pub async fn run_direct(
             table_def.schema.as_ref(),
             None,
             clean,
+            true,
         )
         .await?;
         if resume && !clean {
@@ -890,6 +892,98 @@ mod tests {
                 assert_eq!(a.name(), b.name(), "{name}");
                 assert_eq!(a.data_type(), b.data_type(), "{name}.{}", a.name());
                 assert_eq!(a.is_nullable(), b.is_nullable(), "{name}.{}", a.name());
+            }
+        }
+    }
+
+    /// Full write-path round trip for every non-bank generator: schema
+    /// conversion (create, with auto-assigned field ids), schema-back
+    /// conversion (write_schema derivation), and the exact rebind
+    /// `write_shard` performs on every generated batch. A schema-only check
+    /// is not enough -- Iceberg's type normalization (timestamps forced to
+    /// microseconds, dictionary-encoded strings flattened to `Utf8`, etc.)
+    /// only surfaces once a real batch is rebound to the round-tripped
+    /// schema, which is what this test does.
+    #[test]
+    fn generic_generators_survive_write_path_round_trip() {
+        use crate::generate::{get_generator, GenerateConfig};
+
+        let config = GenerateConfig {
+            threads: 1,
+            ..GenerateConfig::default()
+        };
+        for bench in [
+            "tpch",
+            "ssb",
+            "tpcds",
+            "tpcc",
+            "tpce",
+            "tpcbb",
+            "clickbench",
+        ] {
+            let gen = get_generator(bench).unwrap_or_else(|e| panic!("{bench}: {e}"));
+            for table_def in gen.tables() {
+                let src = gen
+                    .generate_batches(&table_def.name, 0.01, &config)
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "{bench}.{}: generate_batches failed: {e}",
+                            table_def.name
+                        )
+                    });
+                let shard = src.shards.into_iter().next().unwrap_or_else(|| {
+                    panic!("{bench}.{}: no shards produced", table_def.name)
+                });
+                let batch = (shard.make)().next().unwrap_or_else(|| {
+                    panic!(
+                        "{bench}.{}: shard produced zero batches at scale 0.01",
+                        table_def.name
+                    )
+                });
+
+                let iceberg_schema = arrow_schema_to_schema_auto_assign_ids(&table_def.schema)
+                    .unwrap_or_else(|e| {
+                        panic!("{bench}.{}: to iceberg failed: {e}", table_def.name)
+                    });
+                let round_tripped = schema_to_arrow_schema(&iceberg_schema).unwrap_or_else(|e| {
+                    panic!("{bench}.{}: back to arrow failed: {e}", table_def.name)
+                });
+
+                RecordBatch::try_new(Arc::new(round_tripped.clone()), batch.columns().to_vec())
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "{bench}.{}: rebinding first batch to round-tripped schema \
+                             failed (this is exactly what write_shard does per-batch): {e}",
+                            table_def.name
+                        )
+                    });
+
+                assert_eq!(
+                    table_def.schema.fields().len(),
+                    round_tripped.fields().len(),
+                    "{bench}.{}: field count mismatch after round trip",
+                    table_def.name
+                );
+                for (a, b) in table_def
+                    .schema
+                    .fields()
+                    .iter()
+                    .zip(round_tripped.fields().iter())
+                {
+                    assert_eq!(
+                        a.name(),
+                        b.name(),
+                        "{bench}.{}: field name mismatch after round trip",
+                        table_def.name
+                    );
+                    assert_eq!(
+                        a.data_type(),
+                        b.data_type(),
+                        "{bench}.{}.{}: data type mismatch after round trip",
+                        table_def.name,
+                        a.name()
+                    );
+                }
             }
         }
     }
