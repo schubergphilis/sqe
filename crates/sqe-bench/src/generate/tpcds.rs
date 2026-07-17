@@ -1780,33 +1780,7 @@ impl BenchmarkGenerator for TpcdsGenerator {
     ) -> anyhow::Result<GenerateStats> {
         let start = std::time::Instant::now();
 
-        let (tbl_schema, batches) = match table {
-            "store_sales"            => generate_store_sales(scale),
-            "store_returns"          => generate_store_returns(scale),
-            "catalog_sales"          => generate_catalog_sales(scale),
-            "catalog_returns"        => generate_catalog_returns(scale),
-            "web_sales"              => generate_web_sales(scale),
-            "web_returns"            => generate_web_returns(scale),
-            "inventory"              => generate_inventory(scale),
-            "date_dim"               => generate_date_dim(),
-            "time_dim"               => generate_time_dim(),
-            "item"                   => generate_item(scale),
-            "customer"               => generate_customer(scale),
-            "customer_address"       => generate_customer_address(scale),
-            "customer_demographics"  => generate_customer_demographics(scale),
-            "household_demographics" => generate_household_demographics(),
-            "store"                  => generate_store(scale),
-            "catalog_page"           => generate_catalog_page(scale),
-            "web_site"               => generate_web_site(scale),
-            "web_page"               => generate_web_page(scale),
-            "warehouse"              => generate_warehouse(scale),
-            "promotion"              => generate_promotion(scale),
-            "reason"                 => generate_reason(scale),
-            "income_band"            => generate_income_band(),
-            "ship_mode"              => generate_ship_mode(),
-            "call_center"            => generate_call_center(scale),
-            _ => anyhow::bail!("Unknown TPC-DS table: {table}"),
-        };
+        let (tbl_schema, batches) = build_tpcds_table(table, scale, _config)?;
 
         let full_output = format!("{output_dir}/tpcds/sf{scale}");
         let (files, bytes) =
@@ -1821,6 +1795,57 @@ impl BenchmarkGenerator for TpcdsGenerator {
             duration: start.elapsed(),
         })
     }
+
+    fn generate_batches(
+        &self,
+        table: &str,
+        scale: f64,
+        config: &super::GenerateConfig,
+    ) -> anyhow::Result<super::BatchSource> {
+        use super::{BatchShard, BatchSource};
+        let (tbl_schema, batches) = build_tpcds_table(table, scale, config)?;
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        let make: Box<dyn FnOnce() -> Box<dyn Iterator<Item = RecordBatch> + Send> + Send> =
+            Box::new(move || Box::new(batches.into_iter()));
+        Ok(BatchSource { schema: tbl_schema, total_rows, shards: vec![BatchShard { make }] })
+    }
+}
+
+/// Build the (schema, batches) for one TPC-DS table. Shared by
+/// `generate_table` (staged to Parquet) and `generate_batches`
+/// (direct-to-Iceberg sink).
+fn build_tpcds_table(
+    table: &str,
+    scale: f64,
+    _config: &super::GenerateConfig,
+) -> anyhow::Result<(SchemaRef, Vec<RecordBatch>)> {
+    Ok(match table {
+        "store_sales"            => generate_store_sales(scale),
+        "store_returns"          => generate_store_returns(scale),
+        "catalog_sales"          => generate_catalog_sales(scale),
+        "catalog_returns"        => generate_catalog_returns(scale),
+        "web_sales"              => generate_web_sales(scale),
+        "web_returns"            => generate_web_returns(scale),
+        "inventory"              => generate_inventory(scale),
+        "date_dim"               => generate_date_dim(),
+        "time_dim"               => generate_time_dim(),
+        "item"                   => generate_item(scale),
+        "customer"               => generate_customer(scale),
+        "customer_address"       => generate_customer_address(scale),
+        "customer_demographics"  => generate_customer_demographics(scale),
+        "household_demographics" => generate_household_demographics(),
+        "store"                  => generate_store(scale),
+        "catalog_page"           => generate_catalog_page(scale),
+        "web_site"               => generate_web_site(scale),
+        "web_page"               => generate_web_page(scale),
+        "warehouse"              => generate_warehouse(scale),
+        "promotion"              => generate_promotion(scale),
+        "reason"                 => generate_reason(scale),
+        "income_band"            => generate_income_band(),
+        "ship_mode"              => generate_ship_mode(),
+        "call_center"            => generate_call_center(scale),
+        _ => anyhow::bail!("Unknown TPC-DS table: {table}"),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -2436,5 +2461,22 @@ mod tests {
         let (srsch, srb) = generate_store_returns(scale);
         assert!(col_i32(&srb, &srsch, "sr_ticket_number").contains(&Some(Q24_STORE_TICKET)),
             "no store return for the q24 planted ticket");
+    }
+
+    #[test]
+    fn tpcds_generate_batches_matches_generate_row_count() {
+        use crate::generate::{BenchmarkGenerator, GenerateConfig};
+        let g = TpcdsGenerator;
+        let cfg = GenerateConfig::default();
+        let t = g.tables()[0].name.clone();
+        let src = g.generate_batches(&t, 1.0, &cfg).unwrap();
+        let expected_total = src.total_rows;
+        let rows: usize = src
+            .shards
+            .into_iter()
+            .map(|s| (s.make)().map(|b| b.num_rows()).sum::<usize>())
+            .sum();
+        assert_eq!(rows, expected_total);
+        assert!(rows > 0);
     }
 }

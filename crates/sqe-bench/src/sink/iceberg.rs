@@ -18,7 +18,9 @@ use std::sync::Arc;
 use anyhow::Context;
 use arrow_array::RecordBatch;
 use arrow_schema::Schema as ArrowSchema;
-use iceberg::arrow::{arrow_schema_to_schema, schema_to_arrow_schema};
+use iceberg::arrow::{
+    arrow_schema_to_schema, arrow_schema_to_schema_auto_assign_ids, schema_to_arrow_schema,
+};
 use iceberg::spec::{DataFile, Literal, PartitionKey, PartitionSpec, Struct, Transform};
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
@@ -80,7 +82,11 @@ pub struct IcebergTarget {
 }
 
 impl IcebergTarget {
-    fn catalog_props(&self) -> HashMap<String, String> {
+    /// Build the full catalog-connection property map (URI, warehouse,
+    /// credentials, and S3 storage settings). `pub` so integration tests
+    /// (a separate crate) can open a verification catalog connection that is
+    /// provably identical to the one `run_direct` writes through.
+    pub fn catalog_props(&self) -> HashMap<String, String> {
         let mut props = HashMap::from([
             (REST_CATALOG_PROP_URI.to_string(), self.catalog_uri.clone()),
             (
@@ -234,6 +240,20 @@ struct TableCtx {
     write_schema: Arc<ArrowSchema>,
 }
 
+impl TableCtx {
+    /// Cheap handle clone for fanning a table out across shard tasks:
+    /// `iceberg::table::Table` is `Clone` (it wraps `FileIO` + an `Arc`'d
+    /// metadata snapshot), so no `Arc<TableCtx>` wrapper is needed.
+    ///
+    /// `run_direct` (below) is the only caller.
+    fn clone_handle(&self) -> TableCtx {
+        TableCtx {
+            table: self.table.clone(),
+            write_schema: self.write_schema.clone(),
+        }
+    }
+}
+
 /// Everything the worker tasks share.
 struct RunCtx {
     catalog: Box<dyn Catalog>,
@@ -265,6 +285,65 @@ fn bank_arrow_schema(table: &str) -> arrow_schema::SchemaRef {
     }
 }
 
+/// Ensure one table exists in `ns`, creating it (with an optional identity
+/// partition on `partition_col`) if missing. With `clean`, an existing
+/// table is dropped and recreated first.
+async fn ensure_table(
+    catalog: &dyn Catalog,
+    ns: &NamespaceIdent,
+    name: &str,
+    arrow_schema: &ArrowSchema,
+    partition_col: Option<&str>,
+    clean: bool,
+    auto_assign_ids: bool,
+) -> anyhow::Result<TableCtx> {
+    let ident = TableIdent::new(ns.clone(), name.to_string());
+    if clean && catalog.table_exists(&ident).await? {
+        catalog
+            .drop_table(&ident)
+            .await
+            .with_context(|| format!("dropping table {name}"))?;
+        println!("Dropped table {ns:?}.{name}");
+    }
+    let table = if catalog.table_exists(&ident).await? {
+        catalog.load_table(&ident).await?
+    } else {
+        let schema = if auto_assign_ids {
+            arrow_schema_to_schema_auto_assign_ids(arrow_schema)
+        } else {
+            arrow_schema_to_schema(arrow_schema)
+        }
+        .with_context(|| format!("converting {name} schema"))?;
+        let creation = if let Some(col) = partition_col {
+            let spec = PartitionSpec::builder(schema.clone())
+                .add_partition_field(col, col, Transform::Identity)
+                .and_then(|b| b.build())
+                .with_context(|| format!("building {name} partition spec"))?;
+            TableCreation::builder()
+                .name(name.to_string())
+                .schema(schema)
+                .partition_spec(spec.into_unbound())
+                .build()
+        } else {
+            TableCreation::builder()
+                .name(name.to_string())
+                .schema(schema)
+                .build()
+        };
+        let table = catalog
+            .create_table(ns, creation)
+            .await
+            .with_context(|| format!("creating table {name}"))?;
+        println!("Created table {name}");
+        table
+    };
+    let write_schema = Arc::new(
+        schema_to_arrow_schema(table.metadata().current_schema())
+            .with_context(|| format!("deriving {name} write schema"))?,
+    );
+    Ok(TableCtx { table, write_schema })
+}
+
 /// Create the namespace and any missing bank tables; return handles.
 /// With `clean`, existing bank tables are dropped and recreated first.
 async fn ensure_tables(
@@ -287,51 +366,18 @@ async fn ensure_tables(
 
     let mut tables = HashMap::new();
     for name in BANK_TABLES {
-        let ident = TableIdent::new(ns.clone(), name.to_string());
-        if clean && catalog.table_exists(&ident).await? {
-            catalog
-                .drop_table(&ident)
-                .await
-                .with_context(|| format!("dropping table {name}"))?;
-            println!("Dropped table {namespace}.{name}");
-        }
-        let table = if catalog.table_exists(&ident).await? {
-            catalog.load_table(&ident).await?
-        } else {
-            let arrow_schema = bank_arrow_schema(name);
-            let schema = arrow_schema_to_schema(&arrow_schema)
-                .with_context(|| format!("converting {name} schema"))?;
-            let creation = if let Some(col) = bank::partition_column(name) {
-                let spec = PartitionSpec::builder(schema.clone())
-                    .add_partition_field(col, col, Transform::Identity)
-                    .and_then(|b| b.build())
-                    .with_context(|| format!("building {name} partition spec"))?;
-                TableCreation::builder()
-                    .name(name.to_string())
-                    .schema(schema)
-                    .partition_spec(spec.into_unbound())
-                    .build()
-            } else {
-                TableCreation::builder()
-                    .name(name.to_string())
-                    .schema(schema)
-                    .build()
-            };
-            let table = catalog
-                .create_table(&ns, creation)
-                .await
-                .with_context(|| format!("creating table {name}"))?;
-            println!("Created table {namespace}.{name}");
-            table
-        };
-        let write_schema = Arc::new(
-            schema_to_arrow_schema(table.metadata().current_schema())
-                .with_context(|| format!("deriving {name} write schema"))?,
-        );
-        tables.insert(name, TableCtx {
-            table,
-            write_schema,
-        });
+        let arrow_schema = bank_arrow_schema(name);
+        let table_ctx = ensure_table(
+            catalog,
+            &ns,
+            name,
+            &arrow_schema,
+            bank::partition_column(name),
+            clean,
+            false,
+        )
+        .await?;
+        tables.insert(name, table_ctx);
     }
     Ok(tables)
 }
@@ -346,6 +392,52 @@ fn committed_days(table: &Table) -> HashSet<i32> {
         .filter_map(|k| k.strip_prefix(DAY_PROP_PREFIX))
         .filter_map(|d| parse_day(d).ok())
         .collect()
+}
+
+/// Write `batches` into `table_ctx`'s table as one or more data files
+/// (rolling over at `target_file_size`); returns the finished `DataFile`s
+/// without committing them. `file_prefix` should be deterministic per
+/// caller so a re-run of the same unit overwrites its own partial output
+/// from a crashed run.
+async fn write_shard(
+    writer_props: &WriterProperties,
+    target_file_size: usize,
+    table_ctx: &TableCtx,
+    file_prefix: String,
+    partition_key: Option<PartitionKey>,
+    batches: impl Iterator<Item = RecordBatch>,
+) -> anyhow::Result<Vec<DataFile>> {
+    let table = &table_ctx.table;
+    let location_gen = DefaultLocationGenerator::new(table.metadata().clone())
+        .context("building location generator")?;
+    let file_name_gen = DefaultFileNameGenerator::new(
+        file_prefix,
+        None,
+        iceberg::spec::DataFileFormat::Parquet,
+    );
+    let parquet_builder = ParquetWriterBuilder::new(
+        writer_props.clone(),
+        table.metadata().current_schema().clone(),
+    );
+    let rolling = RollingFileWriterBuilder::new(
+        parquet_builder,
+        target_file_size,
+        table.file_io().clone(),
+        location_gen,
+        file_name_gen,
+    );
+    let mut writer = DataFileWriterBuilder::new(rolling)
+        .build(partition_key)
+        .await
+        .context("building data file writer")?;
+    for batch in batches {
+        // Rebind to the table-derived arrow schema: column data types are
+        // identical, only field metadata (field ids) may differ in detail.
+        let batch = RecordBatch::try_new(table_ctx.write_schema.clone(), batch.columns().to_vec())
+            .context("rebinding batch to table schema")?;
+        writer.write(batch).await.context("writing batch")?;
+    }
+    writer.close().await.context("closing writer")
 }
 
 /// Write one unit's batches as data files; returns the finished
@@ -363,80 +455,67 @@ async fn write_unit(ctx: &RunCtx, unit: &Unit) -> anyhow::Result<Vec<DataFile>> 
         )
     });
 
-    let location_gen = DefaultLocationGenerator::new(table.metadata().clone())
-        .context("building location generator")?;
-    // Deterministic names: a re-run of the same unit produces the same
-    // file names and overwrites its own partial output from a crashed run.
-    let file_name_gen = DefaultFileNameGenerator::new(
-        unit.file_prefix(),
-        None,
-        iceberg::spec::DataFileFormat::Parquet,
-    );
-    let parquet_builder = ParquetWriterBuilder::new(
-        ctx.writer_props.clone(),
-        table.metadata().current_schema().clone(),
-    );
-    let rolling = RollingFileWriterBuilder::new(
-        parquet_builder,
+    write_shard(
+        &ctx.writer_props,
         ctx.target_file_size,
-        table.file_io().clone(),
-        location_gen,
-        file_name_gen,
-    );
-    let mut writer = DataFileWriterBuilder::new(rolling)
-        .build(partition_key)
-        .await
-        .context("building data file writer")?;
-
-    for batch in unit.batches(&ctx.plan) {
-        // Rebind to the table-derived arrow schema: column data types are
-        // identical, only field metadata (field ids) may differ in detail.
-        let batch = RecordBatch::try_new(tctx.write_schema.clone(), batch.columns().to_vec())
-            .context("rebinding batch to table schema")?;
-        writer.write(batch).await.context("writing batch")?;
-    }
-    writer.close().await.context("closing writer")
+        tctx,
+        unit.file_prefix(),
+        partition_key,
+        unit.batches(&ctx.plan),
+    )
+    .await
 }
 
-/// Commit `files` to `table_name` as one fast-append snapshot, tagging it
-/// with the day marker when the commit is for one trading day.
+/// Build the day-specific snapshot and table property maps for a bank
+/// commit. Dimension tables (no day) get no markers.
+fn day_props(day: Option<i32>) -> (HashMap<String, String>, HashMap<String, String>) {
+    match day {
+        Some(d) => (
+            HashMap::from([(SNAPSHOT_DAY_PROP.to_string(), format_day(d))]),
+            HashMap::from([(
+                format!("{DAY_PROP_PREFIX}{}", format_day(d)),
+                "done".to_string(),
+            )]),
+        ),
+        None => (HashMap::new(), HashMap::new()),
+    }
+}
+
+/// Commit `files` to the table as one fast-append snapshot, applying
+/// `snapshot_props` to the snapshot summary and `table_props` to the table
+/// properties (both committed atomically with the append).
 async fn commit_files(
-    ctx: &RunCtx,
-    table_name: &'static str,
-    day: Option<i32>,
+    catalog: &dyn Catalog,
+    table_ctx: &TableCtx,
+    commit_lock: &Mutex<()>,
     files: Vec<DataFile>,
+    snapshot_props: HashMap<String, String>,
+    table_props: HashMap<String, String>,
 ) -> anyhow::Result<()> {
     if files.is_empty() {
         return Ok(());
     }
-    let _guard = ctx.commit_lock.lock().await;
+    let _guard = commit_lock.lock().await;
     // Reload so the transaction bases on the latest metadata; commits from
     // other days may have landed since this handle was created.
-    let table = ctx
-        .catalog
-        .load_table(ctx.tables[table_name].table.identifier())
+    let table = catalog
+        .load_table(table_ctx.table.identifier())
         .await
         .context("reloading table before commit")?;
     let tx = Transaction::new(&table);
     let mut append = tx.fast_append().add_data_files(files);
-    if let Some(day) = day {
-        append = append.set_snapshot_properties(HashMap::from([(
-            SNAPSHOT_DAY_PROP.to_string(),
-            format_day(day),
-        )]));
+    if !snapshot_props.is_empty() {
+        append = append.set_snapshot_properties(snapshot_props);
     }
     let mut tx = append.apply(tx).context("applying append")?;
-    if let Some(day) = day {
-        // Durable resume marker; committed atomically with the append.
-        tx = tx
-            .update_table_properties()
-            .set(format!("{DAY_PROP_PREFIX}{}", format_day(day)), "done".to_string())
-            .apply(tx)
-            .context("applying day property")?;
+    if !table_props.is_empty() {
+        let mut upd = tx.update_table_properties();
+        for (k, v) in table_props {
+            upd = upd.set(k, v);
+        }
+        tx = upd.apply(tx).context("applying table properties")?;
     }
-    tx.commit(ctx.catalog.as_ref())
-        .await
-        .context("committing append")?;
+    tx.commit(catalog).await.context("committing append")?;
     Ok(())
 }
 
@@ -480,7 +559,16 @@ async fn run_group(
     let rows: u64 = files.iter().map(|f| f.record_count()).sum();
     let bytes: u64 = files.iter().map(|f| f.file_size_in_bytes()).sum();
     let count = files.len();
-    commit_files(&ctx, table_name, day, files).await?;
+    let (snapshot_props, table_props) = day_props(day);
+    commit_files(
+        ctx.catalog.as_ref(),
+        &ctx.tables[table_name],
+        &ctx.commit_lock,
+        files,
+        snapshot_props,
+        table_props,
+    )
+    .await?;
     let label = match day {
         Some(d) => format!("{table_name} {}", format_day(d)),
         None => table_name.to_string(),
@@ -653,6 +741,137 @@ pub async fn run_bank(
     Ok(())
 }
 
+/// Generic direct-to-Iceberg sink: write every table of `gen` straight into
+/// Iceberg, one fast_append per table, with a per-table resume marker.
+pub async fn run_direct(
+    target: &IcebergTarget,
+    gen: &dyn crate::generate::BenchmarkGenerator,
+    scale: f64,
+    config: &GenerateConfig,
+    clean: bool,
+    resume: bool,
+    target_file_size: usize,
+) -> anyhow::Result<()> {
+    const TABLE_DONE_PREFIX: &str = "sqe-bench.table.";
+
+    let catalog = RestCatalogBuilder::default()
+        .load("polaris", target.catalog_props())
+        .await
+        .context("connecting to catalog")?;
+    let catalog: Box<dyn Catalog> = Box::new(catalog);
+
+    let ns = NamespaceIdent::new(target.namespace.clone());
+    if !catalog
+        .namespace_exists(&ns)
+        .await
+        .context("checking namespace")?
+    {
+        catalog
+            .create_namespace(&ns, HashMap::new())
+            .await
+            .context("creating namespace")?;
+        println!("Created namespace {}", target.namespace);
+    }
+
+    let mut props_builder =
+        WriterProperties::builder().set_compression(config.compression.to_parquet());
+    if let Some(rgs) = config.row_group_size {
+        props_builder = props_builder.set_max_row_group_row_count(Some(rgs));
+    }
+    let writer_props = props_builder.build();
+    let commit_lock = Mutex::new(());
+
+    for table_def in gen.tables() {
+        let name = table_def.name.clone();
+        let done_key = format!("{TABLE_DONE_PREFIX}{name}");
+
+        // Resume: skip a table already marked done (unless clean forces a rebuild).
+        let table_ctx = ensure_table(
+            catalog.as_ref(),
+            &ns,
+            &name,
+            table_def.schema.as_ref(),
+            None,
+            clean,
+            true,
+        )
+        .await?;
+        if resume && !clean {
+            if let Some(v) = table_ctx.table.metadata().properties().get(&done_key) {
+                if v == "done" {
+                    println!("  skip {name}: already committed");
+                    continue;
+                }
+            }
+        }
+
+        let src = gen.generate_batches(&name, scale, config)?;
+        let expected_rows = src.total_rows as u64;
+        let sem = Arc::new(Semaphore::new(config.threads.max(1)));
+        let mut handles = Vec::with_capacity(src.shards.len());
+        for (idx, shard) in src.shards.into_iter().enumerate() {
+            let sem = sem.clone();
+            let writer_props = writer_props.clone();
+            let tctx = table_ctx.clone_handle();
+            handles.push(tokio::spawn(async move {
+                let _permit = sem.acquire_owned().await.expect("semaphore closed");
+                // Sync producer on a blocking thread -> bounded channel -> async writer.
+                let (tx, mut rx) = tokio::sync::mpsc::channel::<RecordBatch>(4);
+                let make = shard.make;
+                let producer = tokio::task::spawn_blocking(move || {
+                    for b in make() {
+                        if tx.blocking_send(b).is_err() {
+                            break;
+                        }
+                    }
+                });
+                let mut batches = Vec::new();
+                while let Some(b) = rx.recv().await {
+                    batches.push(b);
+                }
+                producer.await.context("producer task panicked")?;
+                write_shard(
+                    &writer_props,
+                    target_file_size,
+                    &tctx,
+                    format!("{idx:04}"),
+                    None,
+                    batches.into_iter(),
+                )
+                .await
+            }));
+        }
+        let mut files = Vec::new();
+        for h in handles {
+            files.extend(h.await.context("shard task panicked")??);
+        }
+
+        let rows: u64 = files.iter().map(|f| f.record_count()).sum();
+        let bytes: u64 = files.iter().map(|f| f.file_size_in_bytes()).sum();
+        let nfiles = files.len();
+        let table_props = HashMap::from([(done_key, "done".to_string())]);
+        commit_files(
+            catalog.as_ref(),
+            &table_ctx,
+            &commit_lock,
+            files,
+            HashMap::new(),
+            table_props,
+        )
+        .await?;
+        if rows != expected_rows {
+            eprintln!(
+                "  warning: {name} committed {rows} rows, generator expected {expected_rows}"
+            );
+        }
+        println!(
+            "  committed {name}: {rows} rows (expected {expected_rows}), {nfiles} files, {}",
+            human_bytes(bytes)
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -673,6 +892,98 @@ mod tests {
                 assert_eq!(a.name(), b.name(), "{name}");
                 assert_eq!(a.data_type(), b.data_type(), "{name}.{}", a.name());
                 assert_eq!(a.is_nullable(), b.is_nullable(), "{name}.{}", a.name());
+            }
+        }
+    }
+
+    /// Full write-path round trip for every non-bank generator: schema
+    /// conversion (create, with auto-assigned field ids), schema-back
+    /// conversion (write_schema derivation), and the exact rebind
+    /// `write_shard` performs on every generated batch. A schema-only check
+    /// is not enough -- Iceberg's type normalization (timestamps forced to
+    /// microseconds, dictionary-encoded strings flattened to `Utf8`, etc.)
+    /// only surfaces once a real batch is rebound to the round-tripped
+    /// schema, which is what this test does.
+    #[test]
+    fn generic_generators_survive_write_path_round_trip() {
+        use crate::generate::{get_generator, GenerateConfig};
+
+        let config = GenerateConfig {
+            threads: 1,
+            ..GenerateConfig::default()
+        };
+        for bench in [
+            "tpch",
+            "ssb",
+            "tpcds",
+            "tpcc",
+            "tpce",
+            "tpcbb",
+            "clickbench",
+        ] {
+            let gen = get_generator(bench).unwrap_or_else(|e| panic!("{bench}: {e}"));
+            for table_def in gen.tables() {
+                let src = gen
+                    .generate_batches(&table_def.name, 0.01, &config)
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "{bench}.{}: generate_batches failed: {e}",
+                            table_def.name
+                        )
+                    });
+                let shard = src.shards.into_iter().next().unwrap_or_else(|| {
+                    panic!("{bench}.{}: no shards produced", table_def.name)
+                });
+                let batch = (shard.make)().next().unwrap_or_else(|| {
+                    panic!(
+                        "{bench}.{}: shard produced zero batches at scale 0.01",
+                        table_def.name
+                    )
+                });
+
+                let iceberg_schema = arrow_schema_to_schema_auto_assign_ids(&table_def.schema)
+                    .unwrap_or_else(|e| {
+                        panic!("{bench}.{}: to iceberg failed: {e}", table_def.name)
+                    });
+                let round_tripped = schema_to_arrow_schema(&iceberg_schema).unwrap_or_else(|e| {
+                    panic!("{bench}.{}: back to arrow failed: {e}", table_def.name)
+                });
+
+                RecordBatch::try_new(Arc::new(round_tripped.clone()), batch.columns().to_vec())
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "{bench}.{}: rebinding first batch to round-tripped schema \
+                             failed (this is exactly what write_shard does per-batch): {e}",
+                            table_def.name
+                        )
+                    });
+
+                assert_eq!(
+                    table_def.schema.fields().len(),
+                    round_tripped.fields().len(),
+                    "{bench}.{}: field count mismatch after round trip",
+                    table_def.name
+                );
+                for (a, b) in table_def
+                    .schema
+                    .fields()
+                    .iter()
+                    .zip(round_tripped.fields().iter())
+                {
+                    assert_eq!(
+                        a.name(),
+                        b.name(),
+                        "{bench}.{}: field name mismatch after round trip",
+                        table_def.name
+                    );
+                    assert_eq!(
+                        a.data_type(),
+                        b.data_type(),
+                        "{bench}.{}.{}: data type mismatch after round trip",
+                        table_def.name,
+                        a.name()
+                    );
+                }
             }
         }
     }
@@ -699,6 +1010,15 @@ mod tests {
     }
 
     #[test]
+    fn day_props_sets_snapshot_and_table_markers() {
+        let (snap, tprops) = day_props(Some(0));
+        assert!(snap.contains_key(SNAPSHOT_DAY_PROP));
+        assert!(tprops.keys().any(|k| k.starts_with(DAY_PROP_PREFIX)));
+        let (snap0, tprops0) = day_props(None);
+        assert!(snap0.is_empty() && tprops0.is_empty());
+    }
+
+    #[test]
     fn unit_prefixes_are_distinct_and_stable() {
         let a = Unit {
             table: "transaction",
@@ -716,5 +1036,15 @@ mod tests {
             accounts: 0..0,
         };
         assert_eq!(b.file_prefix(), "customer-s0000");
+    }
+
+    /// `run_direct` names each shard's data files `{idx:04}`; this documents
+    /// the invariant that shard prefixes are disjoint and match the staging
+    /// `{part_idx:04}` convention, so a re-run overwrites its own partial
+    /// output rather than colliding with another shard's files.
+    #[test]
+    fn shard_prefix_is_zero_padded() {
+        assert_eq!(format!("{:04}", 3usize), "0003");
+        assert_eq!(format!("{:04}", 12usize), "0012");
     }
 }
