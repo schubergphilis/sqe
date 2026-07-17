@@ -66,7 +66,7 @@ pub enum Command {
         /// Output sink: `parquet` writes staging files to --output (the
         /// default; load them later with `sqe-bench load`); `iceberg`
         /// writes straight into Iceberg tables through the catalog REST
-        /// API. Currently only the `bank` benchmark supports `iceberg`.
+        /// API for any benchmark.
         #[arg(long, default_value = "parquet")]
         sink: Sink,
 
