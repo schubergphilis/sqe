@@ -114,6 +114,45 @@ Files are split at 128 MB for parallelism. Output is structured as:
         └── ... (8 tables total)
 ```
 
+## Direct-to-Iceberg Sink
+
+`generate --sink iceberg` skips the staging Parquet step entirely. Instead of
+writing files to `--output` for a later `load` run, it connects straight to
+the Iceberg REST catalog, creates the tables, and commits data files with one
+`fast_append` per table. The sink works for every generator benchmark (TPC-H,
+TPC-DS, SSB, TPC-C, TPC-E, TPC-BB, ClickBench, and bank), not just the bank
+demo schema that introduced the sink.
+
+```bash
+cargo run -p sqe-bench -- generate tpch --scale 10 --sink iceberg \
+  --catalog-uri http://localhost:8181/api/catalog \
+  --warehouse bench --namespace tpch \
+  --client-id ... --client-secret ...
+```
+
+The command creates the namespace if it does not exist, then generates and
+commits each table in turn. Data is written in parallel shards for TPC-H and
+bank; the other generators write one shard per table.
+
+Two flags control repeated runs against the same namespace:
+
+- `--resume` skips a table that already carries a
+  `sqe-bench.table.<name>=done` property, so an interrupted or repeated
+  `generate` run does not redo work or duplicate rows. The marker is set on
+  the table itself, not derived from snapshot history, because some
+  catalogs serve a trimmed snapshot list.
+- `--clean` drops and recreates every table first, so the run is idempotent
+  regardless of what state the namespace was in. `--clean` and `--resume`
+  are mutually exclusive.
+
+Without either flag, a table that already exists and is not marked done gets
+rewritten: the sink does not merge into partial prior state.
+
+Catalog and storage settings match the `load` command's `--s3-*` flags, plus
+the catalog's OAuth2 client-credentials pair (`--client-id`/`--client-secret`)
+or a pre-acquired `--bearer-token`. See `sqe-bench generate --help` for the
+full flag list.
+
 ## Loading Data
 
 The `load` command connects to SQE and creates Iceberg tables using `read_parquet()` + CTAS. No intermediate format conversion is needed. Parquet files are read directly and written as Iceberg.
@@ -380,7 +419,7 @@ pub trait BenchmarkGenerator {
 pub struct TableDef {
     pub name: String,
     pub schema: Arc<Schema>,             // Arrow schema
-    pub row_count_fn: fn(f64) -> usize,  // scale factor → row count
+    pub row_count_fn: fn(f64) -> usize,  // scale factor to row count
 }
 ```
 
