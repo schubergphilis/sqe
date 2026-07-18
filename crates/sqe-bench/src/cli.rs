@@ -297,6 +297,43 @@ pub enum Command {
         client_secret: Option<String>,
     },
 
+    /// Run one or more benchmark suites against a running coordinator using a
+    /// config profile: ATTACH the golden catalog, run queries with zero load,
+    /// emit BENCH_SUMMARY + JSON, and optionally compare against Trino.
+    Run {
+        /// Benchmark suites to run (tpch, ssb, tpcds, clickbench, ...).
+        #[arg(value_name = "SUITE", required = true)]
+        suites: Vec<String>,
+
+        /// Config profile: `local` | `storagegrid` | `r2` | `aws` | a .toml path.
+        #[arg(long, default_value = "local")]
+        profile: String,
+
+        /// Scale factor of the golden dataset (must match what was provisioned).
+        #[arg(long, default_value_t = 1.0)]
+        scale: f64,
+
+        /// Coordinator host to connect to.
+        #[arg(long, default_value = "localhost")]
+        host: String,
+
+        /// Coordinator Flight SQL port.
+        #[arg(long, default_value_t = 60051)]
+        port: u16,
+
+        /// Also run the Trino comparison and emit compare-*.json.
+        #[arg(long)]
+        compare_trino: bool,
+
+        /// Attach-vs-primary parity smoke instead of the full suite.
+        #[arg(long)]
+        smoke: bool,
+
+        /// Run only a single query id (e.g. `q05`).
+        #[arg(long)]
+        query: Option<String>,
+    },
+
     /// Compare SQE vs Trino: run identical benchmark queries against both and diff results
     Compare {
         /// Benchmark suite (tpch, tpcds, ssb)
@@ -406,6 +443,41 @@ mod tests {
                 assert_eq!(trino_url, "http://localhost:8080");
             }
             _ => panic!("expected Compare command"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod run_cli_tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn parses_run_with_multiple_suites() {
+        let cli = Cli::parse_from([
+            "sqe-bench", "run", "tpch", "ssb", "--profile", "local", "--scale", "10",
+        ]);
+        match cli.command {
+            Command::Run { suites, profile, scale, compare_trino, .. } => {
+                assert_eq!(suites, vec!["tpch", "ssb"]);
+                assert_eq!(profile, "local");
+                assert_eq!(scale, 10.0);
+                assert!(!compare_trino);
+            }
+            _ => panic!("expected Run"),
+        }
+    }
+
+    #[test]
+    fn run_defaults_host_and_port() {
+        let cli = Cli::parse_from(["sqe-bench", "run", "tpch", "--profile", "local"]);
+        match cli.command {
+            Command::Run { host, port, scale, .. } => {
+                assert_eq!(host, "localhost");
+                assert_eq!(port, 60051);
+                assert_eq!(scale, 1.0);
+            }
+            _ => panic!("expected Run"),
         }
     }
 }
