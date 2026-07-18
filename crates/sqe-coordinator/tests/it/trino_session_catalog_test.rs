@@ -201,27 +201,31 @@ async fn current_catalog_and_schema_return_session_values() {
     .await
     .expect("session context builds");
 
-    // This path is ctx.sql() directly, which does NOT apply the Trino-compat
-    // SQL rewrite. So use the forms that parse here: bare `current_catalog`
-    // (sqlparser reserved no-arg function) and the `current_schema()` call form.
-    // The bare `current_schema` -> `current_schema()` rewrite is covered by a
-    // unit test in sqe-sql (rewrite_trino_compat), and the full handler path
-    // applies that rewrite before planning.
+    // ctx.sql() directly does NOT apply the Trino-compat SQL rewrite, and the
+    // coordinator's session context sets DataFusion's own parser dialect to
+    // DuckDB (session_context.rs), under which bare `current_catalog` and
+    // bare `current_schema` both parse as plain column identifiers rather
+    // than the session UDF call. Run the same `rewrite_trino_compat` rewrite
+    // the production handler path applies (query_handler.rs) before planning,
+    // so this test proves the bare forms work end-to-end via the rewrite,
+    // not just the already-parenthesized call form.
     for (sql, expected) in [
         ("SELECT current_catalog", "ws_energy_co"),
+        ("SELECT current_schema", "gold"),
         ("SELECT current_schema()", "gold"),
     ] {
+        let rewritten = sqe_sql::rewrite_trino_compat(sql);
         let batches = ctx
-            .sql(sql)
+            .sql(&rewritten)
             .await
-            .unwrap_or_else(|e| panic!("`{sql}` must plan: {e}"))
+            .unwrap_or_else(|e| panic!("`{sql}` (rewritten: `{rewritten}`) must plan: {e}"))
             .collect()
             .await
-            .unwrap_or_else(|e| panic!("`{sql}` must execute: {e}"));
+            .unwrap_or_else(|e| panic!("`{sql}` (rewritten: `{rewritten}`) must execute: {e}"));
         let out = batches_to_string(&batches);
         assert!(
             out.contains(expected),
-            "`{sql}` must return {expected}, got: {out}"
+            "`{sql}` (rewritten: `{rewritten}`) must return {expected}, got: {out}"
         );
     }
 }
