@@ -22,6 +22,7 @@ pub fn bench_namespace(benchmark: &str, scale: f64) -> String {
     format!("{}_sf{}", benchmark, format_scale(scale))
 }
 mod report;
+mod run;
 mod test;
 
 use clap::Parser;
@@ -357,6 +358,33 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
 
-        cli::Command::Run { .. } => unimplemented!("Run dispatch lands in Task 5"),
+        cli::Command::Run {
+            suites,
+            profile,
+            scale,
+            host,
+            port,
+            compare_trino,
+            smoke,
+            query,
+        } => {
+            let golden_token = std::env::var("BENCH_GOLDEN_TOKEN").map_err(|_| {
+                anyhow::anyhow!("run requires BENCH_GOLDEN_TOKEN (bearer for the golden Polaris)")
+            })?;
+            let trino_endpoint = std::env::var("BENCH_TRINO_ENDPOINT").ok();
+            run::run(run::RunArgs {
+                suites,
+                profile,
+                scale,
+                host,
+                port,
+                compare_trino,
+                smoke,
+                query,
+                golden_token,
+                trino_endpoint,
+            })
+            .await
+        }
     }
 }
