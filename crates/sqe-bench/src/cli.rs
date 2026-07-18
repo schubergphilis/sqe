@@ -325,7 +325,7 @@ pub enum Command {
         #[arg(long)]
         compare_trino: bool,
 
-        /// Attach-vs-primary parity smoke instead of the full suite.
+        /// Attach-vs-primary parity smoke (not yet implemented).
         #[arg(long)]
         smoke: bool,
 

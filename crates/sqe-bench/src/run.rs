@@ -27,6 +27,12 @@ pub struct RunArgs {
 }
 
 pub async fn run(args: RunArgs) -> anyhow::Result<()> {
+    if args.smoke {
+        anyhow::bail!(
+            "--smoke parity mode is not yet implemented (tracked for a follow-up); omit --smoke to run the suites"
+        );
+    }
+
     let profile = profile::load_profile(&args.profile)?;
     let creds = profile::resolve_s3_credentials(&profile.s3)?;
 
@@ -48,7 +54,7 @@ pub async fn run(args: RunArgs) -> anyhow::Result<()> {
     // do not fail. Any other error is fatal (no silent fallback to load).
     if let Err(e) = bench_client.execute_update(&attach_sql).await {
         let msg = e.to_string();
-        if !msg.contains("already") {
+        if !msg.contains("already attached") {
             return Err(anyhow::anyhow!(
                 "ATTACH golden failed: {msg}. (statement: {})",
                 profile::redact_attach_sql(&attach_sql)
@@ -94,16 +100,12 @@ pub async fn run(args: RunArgs) -> anyhow::Result<()> {
             )
             .await?;
             let summary = &comparison_report.summary;
-            let mismatched = summary.total.saturating_sub(summary.matched);
             println!(
-                "compare {suite}: {} matched, {} mismatched (of {} total)",
-                summary.matched, mismatched, summary.total
+                "compare {suite}: {}/{} matched (row_diff {}, sqe_failed {}, trino_failed {}, both_failed {}, vacuous_bug {}); see compare JSON for full breakdown",
+                summary.matched, summary.total,
+                summary.row_diff, summary.sqe_failed, summary.trino_failed, summary.both_failed, summary.vacuous_bug,
             );
         }
-    }
-
-    if args.smoke {
-        println!("[sqe-bench] smoke mode: attach-vs-primary parity smoke not yet implemented; ran full suite instead");
     }
 
     if any_failure {
