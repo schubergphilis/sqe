@@ -168,7 +168,20 @@ fn aws_config_get(profile: &str, key: &str) -> anyhow::Result<String> {
     if !out.status.success() {
         anyhow::bail!("aws profile '{profile}' has no {key}");
     }
-    Ok(String::from_utf8(out.stdout)?.trim().to_string())
+    let value = String::from_utf8(out.stdout)?.trim().to_string();
+    if value.is_empty() {
+        anyhow::bail!("aws profile '{profile}' has an empty {key}");
+    }
+    Ok(value)
+}
+
+/// Escape a value for interpolation into a single-quoted SQL string literal,
+/// doubling any embedded `'` per standard SQL escaping. Without this, a
+/// secret containing a quote (e.g. `sup'ersecret`) would prematurely
+/// terminate its literal and corrupt the generated statement -- and would
+/// also make later redaction unable to find the true end of the value.
+fn sql_escape(v: &str) -> String {
+    v.replace('\'', "''")
 }
 
 /// Build the coordinator-wide `ATTACH` statement for the golden catalog.
@@ -190,13 +203,13 @@ pub fn build_attach_sql(
          S3_ACCESS_KEY '{ak}', \
          S3_SECRET_KEY '{sk}', \
          S3_PATH_STYLE '{path_style}')",
-        url = profile.polaris.url,
-        warehouse = profile.polaris.warehouse,
-        token = token,
-        endpoint = profile.s3.endpoint,
-        region = profile.s3.region,
-        ak = creds.access_key,
-        sk = creds.secret_key,
+        url = sql_escape(&profile.polaris.url),
+        warehouse = sql_escape(&profile.polaris.warehouse),
+        token = sql_escape(token),
+        endpoint = sql_escape(&profile.s3.endpoint),
+        region = sql_escape(&profile.s3.region),
+        ak = sql_escape(&creds.access_key),
+        sk = sql_escape(&creds.secret_key),
         path_style = profile.s3.path_style,
     )
 }
@@ -210,18 +223,54 @@ pub fn redact_attach_sql(sql: &str) -> String {
     out
 }
 
+/// Replace every `<OPT> '<value>'` occurrence with `<OPT> '***'`, where
+/// `<value>` may contain SQL-escaped quotes (`''`). Scanning must be
+/// escaping-aware: a doubled `''` inside the value is NOT the terminator,
+/// only a lone `'` is. Handles every occurrence of `opt` in the string, not
+/// just the first, since a naive single `find` would leave later
+/// occurrences of the same option un-redacted.
 fn redact_option(sql: &str, opt: &str) -> String {
-    // Replace `<OPT> '<value>'` with `<OPT> '***'`.
     let needle = format!("{opt} '");
-    let Some(start) = sql.find(&needle) else {
-        return sql.to_string();
-    };
-    let value_start = start + needle.len();
-    let Some(rel_end) = sql[value_start..].find('\'') else {
-        return sql.to_string();
-    };
-    let value_end = value_start + rel_end;
-    format!("{}***{}", &sql[..value_start], &sql[value_end..])
+    let mut out = String::with_capacity(sql.len());
+    let mut rest = sql;
+    loop {
+        let Some(start) = rest.find(&needle) else {
+            out.push_str(rest);
+            return out;
+        };
+        // Copy everything up to and including the opening quote.
+        let value_start = start + needle.len();
+        out.push_str(&rest[..value_start]);
+
+        // Scan the value, treating `''` as an escaped quote and a lone `'`
+        // as the terminator.
+        let value_bytes = &rest.as_bytes()[value_start..];
+        let mut i = 0;
+        let end_rel = loop {
+            match value_bytes.get(i) {
+                None => break value_bytes.len(),
+                Some(b'\'') => {
+                    if value_bytes.get(i + 1) == Some(&b'\'') {
+                        i += 2; // escaped quote, keep scanning
+                    } else {
+                        break i; // true terminator
+                    }
+                }
+                Some(_) => i += 1,
+            }
+        };
+
+        out.push_str("***");
+        let value_end = value_start + end_rel;
+        // Re-append the terminating quote (if present) and continue
+        // scanning the remainder for further occurrences of `opt`.
+        if value_end < rest.len() {
+            out.push('\'');
+            rest = &rest[value_end + 1..];
+        } else {
+            rest = &rest[value_end..];
+        }
+    }
 }
 
 #[cfg(test)]
@@ -398,5 +447,51 @@ client_secret_path = "/run/secrets/oauth"
         assert!(red.contains("TOKEN '***'"));
         // Non-secret options remain visible for debugging.
         assert!(red.contains("S3_ENDPOINT 'http://localhost:19000'"));
+    }
+
+    #[test]
+    fn build_attach_sql_escapes_quotes() {
+        let p = sample_profile();
+        let creds = S3Credentials {
+            access_key: "ak".to_string(),
+            secret_key: "sup'er'secret".to_string(),
+        };
+        let sql = build_attach_sql("golden", &p, &creds, "a'b");
+        // Embedded quotes must be doubled so the literal stays well-formed.
+        assert!(sql.contains("S3_SECRET_KEY 'sup''er''secret'"), "got: {sql}");
+        assert!(sql.contains("TOKEN 'a''b'"), "got: {sql}");
+    }
+
+    #[test]
+    fn redact_hides_secret_with_embedded_quote() {
+        let p = sample_profile();
+        let creds = S3Credentials {
+            access_key: "ak".to_string(),
+            secret_key: "sup'er'secret".to_string(),
+        };
+        let sql = build_attach_sql("golden", &p, &creds, "a'b");
+        let red = redact_attach_sql(&sql);
+
+        // The raw secret and token must not survive at all, in any form.
+        assert!(!red.contains("sup'er'secret"), "secret leaked: {red}");
+        assert!(!red.contains("sup''er''secret"), "escaped secret leaked: {red}");
+        assert!(!red.contains("a'b"), "token leaked: {red}");
+        // The specific fragment the old (non-escaping-aware) bug used to
+        // leave behind when a quote appeared inside the value.
+        assert!(!red.contains("er'secret"), "fragment leaked: {red}");
+        assert!(!red.contains("er''secret"), "fragment leaked: {red}");
+
+        assert!(red.contains("S3_SECRET_KEY '***'"), "got: {red}");
+        assert!(red.contains("TOKEN '***'"), "got: {red}");
+    }
+
+    #[test]
+    fn redact_all_occurrences() {
+        // Hand-built string with the same option appearing twice; the old
+        // implementation only redacted the first `find` match.
+        let sql = "ATTACH 'x' AS c (TOKEN 'x', OTHER 'y', TOKEN 'x')";
+        let red = redact_attach_sql(sql);
+        assert_eq!(red.matches("TOKEN '***'").count(), 2, "got: {red}");
+        assert!(!red.contains("TOKEN 'x'"), "raw token leaked: {red}");
     }
 }
