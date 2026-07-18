@@ -147,10 +147,17 @@ pub fn rewrite_trino_compat(sql: &str) -> String {
         || lower.contains("cube")
         || lower.contains("grouping sets");
     // `current_schema` (bare keyword) -> rewrite_bare_current_schema. sqlparser
-    // parses bare `current_schema` as a column identifier (unlike
-    // `current_catalog`, which it treats as a reserved no-arg function), so we
-    // rewrite it to the `current_schema()` call form the session UDF answers.
+    // parses bare `current_schema` as a column identifier, so we rewrite it to
+    // the `current_schema()` call form the session UDF answers.
     let has_current_schema = lower.contains("current_schema");
+    // `current_catalog` (bare keyword) -> rewrite_bare_current_catalog. Under
+    // the Generic dialect sqlparser treats bare `current_catalog` as a
+    // reserved no-arg function, but under the DuckDB dialect (which the
+    // coordinator's session context sets, see session_context.rs) it parses as
+    // a plain column identifier, reaching the planner as "No field named
+    // current_catalog". Rewrite it to the call form for the same reason as
+    // `current_schema` above.
+    let has_current_catalog = lower.contains("current_catalog");
     // `as uuid` / `as ipaddress` -> rewrite_cast_custom_to_varchar. Trino's
     // UUID and IPADDRESS types have no DataFusion equivalent (CAST -> a
     // NOT_SUPPORTED error); both are string-representable, so on the read path
@@ -200,6 +207,7 @@ pub fn rewrite_trino_compat(sql: &str) -> String {
         && !has_dollar
         && !has_grouping_set
         && !has_current_schema
+        && !has_current_catalog
         && !has_custom_cast
         && !has_utf8_literal
         && !has_row
@@ -378,6 +386,9 @@ impl VisitorMut for TrinoCompatVisitor {
             self.rewrites += 1;
         }
         if rewrite_bare_current_schema(expr) {
+            self.rewrites += 1;
+        }
+        if rewrite_bare_current_catalog(expr) {
             self.rewrites += 1;
         }
         if rewrite_utf8_typed_string(expr) {
@@ -954,8 +965,7 @@ fn rewrite_cast_as_json(expr: &mut Expr) -> bool {
 
 /// Rewrite a bare `current_schema` identifier into the `current_schema()`
 /// call form. sqlparser parses bare `current_schema` as a column identifier
-/// (so it reaches the planner as "No field named current_schema"), unlike
-/// `current_catalog`, which it treats as a reserved no-arg function. Trino
+/// (so it reaches the planner as "No field named current_schema"). Trino
 /// clients send the bare keyword; the call form resolves to the session UDF.
 /// Only unquoted identifiers are rewritten, so a quoted `"current_schema"`
 /// column reference is left untouched. Returns true if the rewrite fired.
@@ -979,6 +989,37 @@ fn rewrite_bare_current_schema(expr: &mut Expr) -> bool {
         null_treatment: None,
         over: None,
         within_group: vec![],
+    });
+    true
+}
+
+/// Rewrite a bare `current_catalog` reference into the `current_catalog()`
+/// call form, mirroring [`rewrite_bare_current_schema`]. `rewrite_trino_compat`
+/// parses with the Generic dialect, under which bare `current_catalog` is
+/// already a reserved no-arg `Function` (unlike `current_schema`, which the
+/// Generic dialect parses as a plain column `Identifier`) -- but `args` is
+/// `FunctionArguments::None`, meaning "no parentheses at all", which
+/// re-serializes back to the bare keyword. That is a problem downstream:
+/// the coordinator's session context sets DataFusion's own SQL parser dialect
+/// to DuckDB (see `session_context.rs`), and under DuckDB, bare
+/// `current_catalog` parses as a plain column identifier, reaching the
+/// planner as "No field named current_catalog". Forcing `args` into an empty
+/// `List` here makes the call form (`current_catalog()`) survive
+/// re-serialization, so it parses correctly under either dialect. Only
+/// unquoted, single-part function names are matched, so a quoted
+/// `"current_catalog"` column reference (which never parses as this `Function`
+/// shape) is left untouched. Returns true if the rewrite fired.
+fn rewrite_bare_current_catalog(expr: &mut Expr) -> bool {
+    let Expr::Function(func) = expr else {
+        return false;
+    };
+    if !function_name_is(func, "current_catalog") || func.args != FunctionArguments::None {
+        return false;
+    }
+    func.args = FunctionArguments::List(FunctionArgumentList {
+        duplicate_treatment: None,
+        args: vec![],
+        clauses: vec![],
     });
     true
 }
@@ -2106,6 +2147,28 @@ mod tests {
         let out = rewrite_trino_compat(r#"SELECT "current_schema" FROM t"#);
         assert!(
             !out.contains("current_schema()"),
+            "quoted column must not be rewritten: {out}"
+        );
+    }
+
+    #[test]
+    fn rewrites_bare_current_catalog_to_call_form() {
+        // Under the DuckDB dialect (the coordinator session's parser
+        // dialect) bare `current_catalog` parses as a column identifier, so
+        // it must be rewritten to `current_catalog()` for the session UDF.
+        let out = rewrite_trino_compat("SELECT current_catalog");
+        assert!(
+            out.to_lowercase().contains("current_catalog()"),
+            "bare current_catalog must become a call: {out}"
+        );
+    }
+
+    #[test]
+    fn quoted_current_catalog_column_is_left_untouched() {
+        // A quoted identifier is a real column reference, not the keyword.
+        let out = rewrite_trino_compat(r#"SELECT "current_catalog" FROM t"#);
+        assert!(
+            !out.contains("current_catalog()"),
             "quoted column must not be rewritten: {out}"
         );
     }
