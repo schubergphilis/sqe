@@ -250,6 +250,20 @@ BENCH_DATA_SOURCE=attach BENCH_SCALE=1 ./scripts/benchmark-test.sh tpch
 
 `benchmark-test.sh` attaches the golden catalog once (`scripts/benchmark-attach-golden.sh`) and queries each table as `golden.<namespace>.<table>` instead of generating and loading data. `tpcc` and `tpce` are write suites (their queries include DELETE/UPDATE via CoW), so they still generate and load normally even in attach mode; a shallow-clone path that would let them run against golden tables too, without mutating the shared copy, is planned but not yet built. `bank` and `tpcbb` also still generate and load normally in attach mode: `bank` is published to golden by `benchmark-publish-iceberg.sh`, but attach mode does not yet query it from there, and `tpcbb`'s own tables (`web_clickstreams`, `product_reviews`) are not published at all, since `tpcbb` shares `tpcds`'s namespace and only needs the two tables it adds. Wiring bank/tpcbb into attach mode is the deferred follow-up alongside the tpcc/tpce shallow-clone path. Attach is loud by design: a missing or unreachable golden catalog fails the run with the ATTACH error rather than silently falling back to a full load, which would mask the exact cost this path removes.
 
+## Unified harness (benchmark.sh + sqe-bench run)
+
+For the read-only suites (tpch, ssb, tpcds, clickbench), the unified harness combines data attachment with query execution in one command:
+
+```bash
+BENCH_PROFILE=local BENCH_SCALE=1 scripts/benchmark.sh tpch ssb tpcds clickbench
+```
+
+The `scripts/benchmark.sh` orchestrates two steps. First, it attaches the golden Iceberg catalog (published once via `benchmark-publish-iceberg.sh`). Second, it runs the suites through `sqe-bench run`, which executes all queries against the attached tables and emits JSON reports to `benchmarks/results/`.
+
+Configuration profiles live in `benchmarks/profiles/<name>.toml`. Profiles define the coordinator config, catalog credentials, and suite-specific settings. Credentials come from environment variables or AWS profiles, never stored in the TOML file itself. The profile loader redacts secrets on error and checks for committed keys at startup.
+
+Each read-only suite attaches golden (zero load); write suites (tpcc, tpce) are a follow-up plan. The old `benchmark-*.sh` scripts remain: the migration to unified is a later commit after parity is confirmed.
+
 ## Running Tests
 
 The `test` command executes all queries in the benchmark suite against the loaded data and reports correctness and timing.
