@@ -4,6 +4,7 @@ mod compare;
 mod comparison;
 mod generate;
 mod load;
+mod profile;
 mod sink;
 
 /// Format a scale factor as an identifier-safe string (no dots).
