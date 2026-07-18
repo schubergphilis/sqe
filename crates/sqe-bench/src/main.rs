@@ -356,5 +356,7 @@ async fn main() -> anyhow::Result<()> {
 
             Ok(())
         }
+
+        cli::Command::Run { .. } => unimplemented!("Run dispatch lands in Task 5"),
     }
 }
