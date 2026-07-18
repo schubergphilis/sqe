@@ -72,21 +72,54 @@ fn default_write_streams() -> u32 {
     8
 }
 
+/// Key names (case-insensitive, exact match) that are never allowed to
+/// appear anywhere in a committed profile document. These identify a value
+/// as a credential rather than configuration; matching is by key name, not
+/// by scanning raw text, so unrelated fields like `client_secret_path` or a
+/// `# rotate secret_key` comment don't false-trigger.
+const FORBIDDEN_SECRET_KEYS: &[&str] = &[
+    "secret_key",
+    "secret_access_key",
+    "aws_secret_access_key",
+    "client_secret",
+    "password",
+    "token",
+    "access_token",
+    "session_token",
+    "bearer_token",
+];
+
+/// Recursively walk a parsed TOML value, checking every table key against
+/// the forbidden secret-key-name set (case-insensitive, exact match).
+fn check_no_secret_keys(value: &toml::Value) -> anyhow::Result<()> {
+    if let toml::Value::Table(table) = value {
+        for (key, val) in table {
+            let lower = key.to_lowercase();
+            if FORBIDDEN_SECRET_KEYS.contains(&lower.as_str()) {
+                anyhow::bail!(
+                    "profile contains a forbidden inline secret key ('{key}'); \
+                     resolve credentials from env or an AWS profile instead"
+                );
+            }
+            check_no_secret_keys(val)?;
+        }
+    }
+    Ok(())
+}
+
 /// Parse a profile from a TOML string. Rejects any inline S3/OAuth secret so
 /// a committed profile can never carry a credential (constraint: no committed
 /// secrets). Callers use `load_profile` for the name/path resolution wrapper.
 pub fn parse_profile_str(s: &str) -> anyhow::Result<Profile> {
     // Guard: forbid secret-bearing keys anywhere in the document. These belong
-    // in env vars or a named AWS profile, never in a repo-tracked file.
-    for forbidden in ["secret_key", "secret-key", "client_secret", "client-secret", "token ="] {
-        if s.contains(forbidden) {
-            anyhow::bail!(
-                "profile contains a forbidden inline secret key ('{forbidden}'); \
-                 resolve credentials from env or an AWS profile instead"
-            );
-        }
-    }
-    let profile: Profile = toml::from_str(s)?;
+    // in env vars or a named AWS profile, never in a repo-tracked file. The
+    // check is key-name-aware (case-insensitive, exact match) rather than a
+    // raw substring scan, so it catches conventional names like
+    // `aws_secret_access_key` and `SECRET_KEY` while allowing benign fields
+    // such as `client_secret_path`.
+    let value: toml::Value = toml::from_str(s)?;
+    check_no_secret_keys(&value)?;
+    let profile: Profile = value.try_into()?;
     Ok(profile)
 }
 
@@ -175,5 +208,69 @@ warehouse = "w"
 "#;
         let err = parse_profile_str(toml).unwrap_err().to_string();
         assert!(err.contains("secret"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_aws_secret_access_key() {
+        let toml = r#"
+name = "bad"
+manage_stack = false
+[s3]
+endpoint = "http://x"
+region = "us-east-1"
+path_style = true
+warehouse_bucket = "b"
+aws_secret_access_key = "wJalrXUtnFEMI"
+[polaris]
+url = "http://p"
+warehouse = "w"
+"#;
+        let err = parse_profile_str(toml).unwrap_err().to_string();
+        assert!(err.contains("aws_secret_access_key"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_uppercase_secret_key() {
+        let toml = r#"
+name = "bad"
+manage_stack = false
+[s3]
+endpoint = "http://x"
+region = "us-east-1"
+path_style = true
+warehouse_bucket = "b"
+SECRET_KEY = "x"
+[polaris]
+url = "http://p"
+warehouse = "w"
+"#;
+        let err = parse_profile_str(toml).unwrap_err().to_string();
+        assert!(err.contains("SECRET_KEY"), "got: {err}");
+    }
+
+    #[test]
+    fn allows_secret_path_field_and_comment() {
+        // A `client_secret_path` field (an unknown, non-`deny_unknown_fields`
+        // field, so it round-trips harmlessly) and a comment mentioning
+        // "secret_key" must not false-trigger the guard: the guard is
+        // key-name-aware, not a raw substring scan over the document text.
+        let toml = r#"
+# rotate secret_key regularly per the ops runbook
+name = "local"
+manage_stack = true
+
+[s3]
+endpoint = "http://localhost:19000"
+region = "us-east-1"
+path_style = true
+warehouse_bucket = "test-warehouse"
+
+[polaris]
+url = "http://localhost:18181/api/catalog"
+warehouse = "test_warehouse"
+client_secret_path = "/run/secrets/oauth"
+"#;
+        let p = parse_profile_str(toml).expect("parse");
+        assert_eq!(p.name, "local");
     }
 }
