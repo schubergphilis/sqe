@@ -137,6 +137,93 @@ pub fn load_profile(name_or_path: &str) -> anyhow::Result<Profile> {
     parse_profile_str(&text)
 }
 
+/// Resolved S3 credentials. Held only in memory; never serialized or logged.
+pub struct S3Credentials {
+    pub access_key: String,
+    pub secret_key: String,
+}
+
+/// Resolve S3 credentials at runtime. If the profile names an AWS credentials
+/// profile, read it via `aws configure get` semantics through env; otherwise
+/// fall back to the standard AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY vars.
+/// Never reads secrets from the profile TOML (Task 1 forbids them).
+pub fn resolve_s3_credentials(s3: &S3Profile) -> anyhow::Result<S3Credentials> {
+    if let Some(prof) = &s3.aws_profile {
+        let access_key = aws_config_get(prof, "aws_access_key_id")?;
+        let secret_key = aws_config_get(prof, "aws_secret_access_key")?;
+        return Ok(S3Credentials { access_key, secret_key });
+    }
+    let access_key = std::env::var("AWS_ACCESS_KEY_ID")
+        .map_err(|_| anyhow::anyhow!("AWS_ACCESS_KEY_ID not set (and no aws_profile in profile)"))?;
+    let secret_key = std::env::var("AWS_SECRET_ACCESS_KEY")
+        .map_err(|_| anyhow::anyhow!("AWS_SECRET_ACCESS_KEY not set (and no aws_profile in profile)"))?;
+    Ok(S3Credentials { access_key, secret_key })
+}
+
+fn aws_config_get(profile: &str, key: &str) -> anyhow::Result<String> {
+    let out = std::process::Command::new("aws")
+        .args(["configure", "get", key, "--profile", profile])
+        .output()
+        .map_err(|e| anyhow::anyhow!("running `aws configure get {key}`: {e}"))?;
+    if !out.status.success() {
+        anyhow::bail!("aws profile '{profile}' has no {key}");
+    }
+    Ok(String::from_utf8(out.stdout)?.trim().to_string())
+}
+
+/// Build the coordinator-wide `ATTACH` statement for the golden catalog.
+/// Secrets travel inline (dev/bench posture — the coordinator config is
+/// localhost). Callers MUST log only `redact_attach_sql(&sql)`, never `sql`.
+pub fn build_attach_sql(
+    catalog: &str,
+    profile: &Profile,
+    creds: &S3Credentials,
+    token: &str,
+) -> String {
+    format!(
+        "ATTACH '{url}' AS {catalog} (\
+         TYPE iceberg_rest, \
+         WAREHOUSE '{warehouse}', \
+         TOKEN '{token}', \
+         S3_ENDPOINT '{endpoint}', \
+         S3_REGION '{region}', \
+         S3_ACCESS_KEY '{ak}', \
+         S3_SECRET_KEY '{sk}', \
+         S3_PATH_STYLE '{path_style}')",
+        url = profile.polaris.url,
+        warehouse = profile.polaris.warehouse,
+        token = token,
+        endpoint = profile.s3.endpoint,
+        region = profile.s3.region,
+        ak = creds.access_key,
+        sk = creds.secret_key,
+        path_style = profile.s3.path_style,
+    )
+}
+
+/// Redact secret-valued options in an ATTACH statement for safe logging.
+pub fn redact_attach_sql(sql: &str) -> String {
+    let mut out = sql.to_string();
+    for opt in ["S3_SECRET_KEY", "S3_ACCESS_KEY", "TOKEN"] {
+        out = redact_option(&out, opt);
+    }
+    out
+}
+
+fn redact_option(sql: &str, opt: &str) -> String {
+    // Replace `<OPT> '<value>'` with `<OPT> '***'`.
+    let needle = format!("{opt} '");
+    let Some(start) = sql.find(&needle) else {
+        return sql.to_string();
+    };
+    let value_start = start + needle.len();
+    let Some(rel_end) = sql[value_start..].find('\'') else {
+        return sql.to_string();
+    };
+    let value_end = value_start + rel_end;
+    format!("{}***{}", &sql[..value_start], &sql[value_end..])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -160,6 +247,10 @@ manifest = 64
 direct_read = 8
 write_streams = 8
 "#;
+
+    fn sample_profile() -> Profile {
+        parse_profile_str(LOCAL_TOML).unwrap()
+    }
 
     #[test]
     fn parses_a_full_profile() {
@@ -272,5 +363,40 @@ client_secret_path = "/run/secrets/oauth"
 "#;
         let p = parse_profile_str(toml).expect("parse");
         assert_eq!(p.name, "local");
+    }
+
+    #[test]
+    fn build_attach_sql_includes_s3_options() {
+        let p = sample_profile();
+        let creds = S3Credentials {
+            access_key: "ak".to_string(),
+            secret_key: "sk".to_string(),
+        };
+        let sql = build_attach_sql("golden", &p, &creds, "tok");
+        assert!(sql.starts_with("ATTACH 'http://localhost:18181/api/catalog' AS golden"));
+        assert!(sql.contains("TYPE iceberg_rest"));
+        assert!(sql.contains("WAREHOUSE 'test_warehouse'"));
+        assert!(sql.contains("S3_ENDPOINT 'http://localhost:19000'"));
+        assert!(sql.contains("S3_ACCESS_KEY 'ak'"));
+        assert!(sql.contains("S3_SECRET_KEY 'sk'"));
+        assert!(sql.contains("S3_PATH_STYLE 'true'"));
+        assert!(sql.contains("TOKEN 'tok'"));
+    }
+
+    #[test]
+    fn redact_hides_secret_and_token_values() {
+        let p = sample_profile();
+        let creds = S3Credentials {
+            access_key: "ak".to_string(),
+            secret_key: "supersecret".to_string(),
+        };
+        let sql = build_attach_sql("golden", &p, &creds, "bearer-xyz");
+        let red = redact_attach_sql(&sql);
+        assert!(!red.contains("supersecret"), "secret leaked: {red}");
+        assert!(!red.contains("bearer-xyz"), "token leaked: {red}");
+        assert!(red.contains("S3_SECRET_KEY '***'"));
+        assert!(red.contains("TOKEN '***'"));
+        // Non-secret options remain visible for debugging.
+        assert!(red.contains("S3_ENDPOINT 'http://localhost:19000'"));
     }
 }
