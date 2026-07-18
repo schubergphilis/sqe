@@ -43,3 +43,7 @@ testing/tempto/reports/
 testing/tempto/.gradle/
 testing/tempto/build/
 testing/tempto/*.hprof
+
+# Benchmark profiles carrying real credentials are never committed.
+benchmarks/profiles/*.local.toml
+benchmarks/profiles/*.secret.toml
