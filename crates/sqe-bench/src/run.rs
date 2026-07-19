@@ -37,8 +37,15 @@ pub async fn run(args: RunArgs) -> anyhow::Result<()> {
     let creds = profile::resolve_s3_credentials(&profile.s3)?;
 
     let endpoint = format!("http://{}:{}", args.host, args.port);
-    let bench_client =
-        client::create_client("flight", &endpoint, None, None, None, None, None).await?;
+    // The golden bearer authenticates the Flight session (the coordinator's
+    // bearer_passthrough provider maps it to an admin role for ATTACH) and is
+    // forwarded to the golden Polaris/S3. Without it the session is anonymous
+    // and ATTACH fails with "No authorization header".
+    let bench_client: Box<dyn client::BenchClient> =
+        Box::new(client::flight::FlightSqlBenchClient::with_token(
+            &endpoint,
+            &args.golden_token,
+        ));
 
     // ATTACH the golden catalog coordinator-wide, once, for every suite.
     let attach_sql =
@@ -86,13 +93,18 @@ pub async fn run(args: RunArgs) -> anyhow::Result<()> {
                 .trino_endpoint
                 .as_deref()
                 .ok_or_else(|| anyhow::anyhow!("--compare-trino needs BENCH_TRINO_ENDPOINT"))?;
+            // The comparison qualifies tables with bare 2-part `<ns>.<table>`
+            // names, so the Trino session needs a default catalog. `iceberg`
+            // matches the properties filename benchmark.sh writes for the
+            // compare Trino (iceberg.properties -> catalog `iceberg`). Mirrors
+            // the standalone `compare` verb; `create_client` leaves it unset.
             let trino_client =
-                client::create_client("trino", trino_ep, None, None, None, None, None).await?;
+                client::trino::TrinoBenchClient::new(trino_ep, None, None).with_catalog("iceberg");
             let comparison_report = comparison::run_comparison(
                 suite,
                 args.scale,
                 bench_client.as_ref(),
-                trino_client.as_ref(),
+                &trino_client,
                 &endpoint,
                 trino_ep,
                 args.query.as_deref(),
