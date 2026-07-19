@@ -98,8 +98,10 @@ pub async fn run(args: RunArgs) -> anyhow::Result<()> {
             // matches the properties filename benchmark.sh writes for the
             // compare Trino (iceberg.properties -> catalog `iceberg`). Mirrors
             // the standalone `compare` verb; `create_client` leaves it unset.
-            let trino_client =
-                client::trino::TrinoBenchClient::new(trino_ep, None, None).with_catalog("iceberg");
+            // `admin` user header is required (Trino rejects query submit with
+            // 401 otherwise); matches the standalone `compare` verb default.
+            let trino_client = client::trino::TrinoBenchClient::new(trino_ep, Some("admin"), None)
+                .with_catalog("iceberg");
             let comparison_report = comparison::run_comparison(
                 suite,
                 args.scale,

@@ -157,7 +157,9 @@ TRINOEOF
         echo -n "."; sleep 2
     done
     echo -n "==> Waiting for Trino catalog (20s)..."; sleep 20; echo " done"
-    export BENCH_TRINO_ENDPOINT="localhost:${TRINO_PORT}"
+    # Full URL incl. scheme: the Trino client uses it verbatim as the base of
+    # `<url>/v1/statement` (no scheme -> reqwest "builder error for url").
+    export BENCH_TRINO_ENDPOINT="http://localhost:${TRINO_PORT}"
 fi
 
 QUERY_FLAG=()
