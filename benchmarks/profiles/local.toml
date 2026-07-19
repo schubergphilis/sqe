@@ -1,0 +1,23 @@
+# Local benchmark profile: docker test stack (Polaris + RustFS) on localhost.
+# manage_stack=true => scripts/benchmark.sh brings the stack up and down.
+#
+# No secrets here. S3 credentials resolve at runtime from AWS_ACCESS_KEY_ID /
+# AWS_SECRET_ACCESS_KEY (the local RustFS quickstart default is s3admin/s3admin;
+# export them before running, or set aws_profile below to a named profile).
+name = "local"
+manage_stack = true
+
+[s3]
+endpoint = "http://localhost:19000"
+region = "us-east-1"
+path_style = true
+warehouse_bucket = "test-warehouse"
+
+[polaris]
+url = "http://localhost:18181/api/catalog"
+warehouse = "test_warehouse"
+
+[concurrency]
+manifest = 64
+direct_read = 8
+write_streams = 8
