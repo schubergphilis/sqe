@@ -308,10 +308,9 @@ pub enum QueryOutcome {
     WrongRows(String),
     Error(String),
     Timeout(u64),
-    /// Not yet produced by `classify_vs_expected` -- vacuous-result detection
-    /// (both sides zero rows) lands in a later task. Kept in the taxonomy
-    /// now so `legacy_bucket`/`print_summary`/JSON reporting are ready for it.
-    #[allow(dead_code)]
+    /// Produced by the suite driver (`suite.rs`), not `classify_vs_expected`
+    /// itself: a zero-row result that classifies `Pass` only because there is
+    /// no expected file to compare against is vacuous, not a real pass.
     Vacuous,
     Diff(String),
     Skip(String),

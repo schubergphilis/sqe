@@ -17,7 +17,6 @@ use crate::status::{classify_vs_expected, QueryOutcome};
 
 /// The result of a single-pass suite run: the per-query report results always,
 /// and the SQE-vs-Trino comparison when a Trino client was supplied.
-#[allow(dead_code)]
 pub struct SuiteOutcome {
     pub results: Vec<QueryResult>,
     pub comparison: Option<ComparisonReport>,
@@ -25,7 +24,6 @@ pub struct SuiteOutcome {
 
 /// Run a benchmark suite in a single pass. Loads the query files, then executes
 /// each query once against SQE (and once against Trino when `trino` is `Some`).
-#[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]
 pub async fn run_suite(
     sqe: &dyn BenchClient,
@@ -57,7 +55,6 @@ pub async fn run_suite(
 /// Inner driver: the file IO is done by `run_suite`; this owns the per-query
 /// loop. Split out so the in-binary single-pass test can inject a hand-built
 /// `Vec<QueryFile>` and counting `BenchClient`s without touching the filesystem.
-#[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]
 async fn run_suite_with_queries(
     sqe: &dyn BenchClient,

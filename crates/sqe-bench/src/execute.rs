@@ -1,14 +1,13 @@
 //! Single-query execution primitive: timeout + transport-error retry.
 //!
 //! Extracted from `test.rs`'s `run_benchmark_test` (timeout `tokio::select!`)
-//! and `comparison.rs`'s `run_comparison` (transport retry) so a later task
-//! can wire one execution path into the run loop instead of two divergent
-//! copies. Not yet wired in -- purely additive.
+//! and `comparison.rs`'s `run_comparison` (transport retry) so both paths run
+//! the same execution logic instead of two divergent copies. This is the
+//! single query-execution primitive `suite::run_suite` uses for every query.
 
 use crate::client::BenchClient;
 
 /// Result of running a single query once (including any retry).
-#[allow(dead_code)]
 pub struct QueryRun {
     /// Total rows returned on success; 0 on error or timeout.
     pub rows: usize,
@@ -25,7 +24,6 @@ pub struct QueryRun {
 ///      `query_timeout_secs` (e.g. the `-- timeout: Ns` header value).
 ///   2. `query_timeout_secs`, when positive.
 ///   3. Default 300s.
-#[allow(dead_code)]
 pub fn resolve_timeout(query_timeout_secs: u64) -> u64 {
     let default_timeout = if query_timeout_secs > 0 {
         query_timeout_secs
@@ -42,7 +40,6 @@ pub fn resolve_timeout(query_timeout_secs: u64) -> u64 {
 /// transport-shaped error (a fresh connection, since tonic channels reconnect
 /// lazily). Query-level errors (plan, execution) are not retried. Never
 /// panics -- all failure modes are reported via `QueryRun.result`.
-#[allow(dead_code)]
 pub async fn run_query(
     client: &dyn BenchClient,
     id: &str,
