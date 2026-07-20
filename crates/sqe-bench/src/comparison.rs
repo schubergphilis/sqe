@@ -158,7 +158,7 @@ pub async fn run_comparison(
         } else {
             crate::bench_namespace(benchmark, scale)
         };
-        let sql = crate::test::prefix_tables(&raw_sql, &namespace, benchmark);
+        let sql = crate::query::prefix_tables(&raw_sql, &namespace, benchmark);
         // Strip trailing semicolons -- Trino HTTP protocol rejects them.
         // Trim whitespace first (files end with \n after ;)
         let sql = sql.trim().trim_end_matches(';').trim().to_string();
