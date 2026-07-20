@@ -42,6 +42,7 @@ pub mod worker_registry;
 pub mod write_handler;
 pub mod write_memory;
 pub mod writer;
+pub mod zorder;
 
 pub use mode::Mode;
 pub use quack_executor::CoordinatorExecutor;

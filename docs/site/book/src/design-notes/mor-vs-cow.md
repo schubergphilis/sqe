@@ -93,12 +93,15 @@ equality deletes.
 - **DuckDB iceberg extension**: position-delete reads land in the 2025
   release; equality deletes are not yet supported.
 
-Delete-file consolidation on Merge-on-Read tables is not yet automatic.
-`system.rewrite_data_files` currently skips tables that carry live delete
-files: applying deletes during the rewrite lands in a later release. Until
-then, compaction runs on copy-on-write tables, and on Merge-on-Read tables
-only after their deletes have been materialized. Do not rely on
-`rewrite_data_files` to collapse live delete files.
+`system.rewrite_data_files` is delete-aware. It reads each file group
+through the Iceberg scan, so position and equality deletes are applied
+during the rewrite: the compacted files hold only surviving rows and
+deleted rows never reappear. The output is pinned to the sequence number
+of the snapshot it read, so an equality delete another writer commits
+mid-compaction still applies to the compacted files. Fully-covered
+position delete files are dropped in the same commit; equality deletes are
+left to age out through `expire_snapshots`. Compaction is safe to run on
+Merge-on-Read tables without materializing their deletes first.
 
 ## Primary keys
 

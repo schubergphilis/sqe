@@ -29,7 +29,8 @@ use tracing::{info, warn};
 use futures::TryStreamExt;
 
 use crate::writer::{
-    new_upload_tracker, parse_parquet_compression, write_data_files, WriteCleanupGuard,
+    new_upload_tracker, parse_parquet_compression, write_data_files_streaming, FanoutLimits,
+    WriteCleanupGuard,
 };
 
 /// Callback that returns a snapshot of recent SQL query texts.
@@ -49,6 +50,9 @@ pub struct MaintenanceHandler {
     audit: Option<Arc<sqe_metrics::audit::AuditLogger>>,
     table_cache: Option<TableMetadataCache>,
     query_history: Option<QueryHistoryFn>,
+    /// Shared DataFusion runtime (FairSpillPool + DiskManager) used by the
+    /// sort-compaction path so a large sort spills to disk instead of OOMing.
+    runtime: Option<Arc<datafusion::execution::runtime_env::RuntimeEnv>>,
 }
 
 impl MaintenanceHandler {
@@ -58,7 +62,18 @@ impl MaintenanceHandler {
             audit: None,
             table_cache: None,
             query_history: None,
+            runtime: None,
         }
+    }
+
+    /// Attach the shared coordinator runtime for spillable sort compaction.
+    #[must_use = "with_runtime consumes self; bind the returned handler"]
+    pub fn with_runtime(
+        mut self,
+        runtime: Arc<datafusion::execution::runtime_env::RuntimeEnv>,
+    ) -> Self {
+        self.runtime = Some(runtime);
+        self
     }
 
     #[must_use = "with_audit consumes self; bind the returned handler"]
@@ -99,6 +114,8 @@ impl MaintenanceHandler {
                 target_file_size_bytes,
                 min_input_files,
                 max_concurrent_file_group_rewrites,
+                strategy,
+                sort_order,
             } => {
                 self.rewrite_data_files(
                     session,
@@ -106,6 +123,8 @@ impl MaintenanceHandler {
                     *target_file_size_bytes,
                     *min_input_files,
                     *max_concurrent_file_group_rewrites,
+                    strategy.clone(),
+                    sort_order.clone(),
                 )
                 .await
             }
@@ -491,6 +510,17 @@ impl MaintenanceHandler {
         )))
     }
 
+    /// Delete-aware bin-pack rewrite with bounded conflict retry.
+    ///
+    /// A concurrent writer that commits between our read and our commit turns
+    /// the `RewriteFilesAction` commit into a retryable conflict. We retry the
+    /// whole load -> plan -> rewrite -> commit a bounded number of times. Each
+    /// attempt goes through `rewrite_data_files_once`, which re-loads the table,
+    /// so the sequence-number pin, scan plan, and file set always describe the
+    /// current snapshot: retrying with a stale pin would reopen the
+    /// concurrent-equality-delete correctness hole. A failed attempt's orphaned
+    /// output files are cleaned up by that attempt's `WriteCleanupGuard` on drop.
+    #[allow(clippy::too_many_arguments)]
     async fn rewrite_data_files(
         &self,
         session: &Session,
@@ -498,6 +528,59 @@ impl MaintenanceHandler {
         target_file_size_bytes: Option<u64>,
         min_input_files: Option<usize>,
         max_concurrent_file_group_rewrites: Option<usize>,
+        strategy: Option<String>,
+        sort_order: Option<String>,
+    ) -> sqe_core::Result<Vec<RecordBatch>> {
+        const MAX_COMMIT_ATTEMPTS: usize = 4;
+        let mut attempt: usize = 0;
+        loop {
+            attempt += 1;
+            match self
+                .rewrite_data_files_once(
+                    session,
+                    table_ref,
+                    target_file_size_bytes,
+                    min_input_files,
+                    max_concurrent_file_group_rewrites,
+                    strategy.clone(),
+                    sort_order.clone(),
+                )
+                .await
+            {
+                Ok(v) => return Ok(v),
+                Err(e) => {
+                    // classify_commit_error tags retryable conflicts in the
+                    // message ("retryable" / "conflict"). Anything else is a
+                    // permanent failure we surface immediately.
+                    let msg = e.to_string().to_lowercase();
+                    let retryable = msg.contains("retryable") || msg.contains("conflict");
+                    if retryable && attempt < MAX_COMMIT_ATTEMPTS {
+                        let backoff = std::time::Duration::from_millis(50 * (1u64 << (attempt - 1)));
+                        warn!(
+                            table = %to_table_ident(table_ref),
+                            attempt,
+                            backoff_ms = backoff.as_millis() as u64,
+                            "rewrite_data_files: retryable commit conflict; re-reading and retrying"
+                        );
+                        tokio::time::sleep(backoff).await;
+                        continue;
+                    }
+                    return Err(e);
+                }
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn rewrite_data_files_once(
+        &self,
+        session: &Session,
+        table_ref: &TableRef,
+        target_file_size_bytes: Option<u64>,
+        min_input_files: Option<usize>,
+        max_concurrent_file_group_rewrites: Option<usize>,
+        strategy: Option<String>,
+        sort_order: Option<String>,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         const DEFAULT_TARGET_FILE_SIZE_BYTES: u64 = 512 * 1024 * 1024;
         const DEFAULT_MIN_INPUT_FILES: usize = 5;
@@ -514,32 +597,47 @@ impl MaintenanceHandler {
         let ident = to_table_ident(table_ref);
         let table = load_table(&catalog, &ident).await?;
 
-        // Delete-safety guard (Phase 1). The current rewrite path reads raw
-        // Parquet without applying position/equality deletes; the rewritten
-        // files get new paths and a new sequence number, so the surviving
-        // delete files no longer match them (the referenced-data-file dangling
-        // check is an unimplemented TODO in the vendored fork). On a
-        // Merge-on-Read table that silently resurrects deleted rows. Until the
-        // delete-applying rewrite lands (Phase 2), refuse rather than corrupt.
-        let live_deletes = count_live_delete_files(&table).await?;
-        if live_deletes > 0 {
-            info!(
-                table = %ident,
-                live_deletes,
-                "rewrite_data_files: skipping, table has live delete files"
-            );
-            return Ok(vec![summary_batch(
-                call_name_rewrite(),
-                &ident,
-                0,
-                0,
-                0,
-                0,
-                format!(
-                    "skipped: {live_deletes} live delete file(s); delete-aware rewrite not yet supported"
-                ),
-            )?]);
-        }
+        // Delete-aware rewrite (Phase 2). Capture the current snapshot's
+        // sequence number BEFORE any work: the rewritten data files are pinned
+        // to this sequence number at commit time (see
+        // `set_new_data_file_sequence_number` below) so that equality deletes
+        // committed concurrently by another writer (at a higher sequence
+        // number) still apply to the compacted output. Plan the delete-aware
+        // read and collect the live delete files from the SAME table load so
+        // the scan tasks, data files, and sequence pin all describe one
+        // consistent snapshot.
+        let seq_at_start = table
+            .metadata_ref()
+            .current_snapshot()
+            .map(|s| s.sequence_number())
+            .unwrap_or(0);
+        let read_plan = plan_delete_aware_read(&table).await?;
+        let live_deletes = collect_live_delete_files(&table).await?;
+
+        // Resolve the sort strategy against the table schema (None = bin-pack).
+        // Sort compaction needs the shared spillable runtime; refuse rather than
+        // risk the known sort-on-write OOM if it was not wired in.
+        let arrow_schema: arrow_schema::SchemaRef = Arc::new(
+            iceberg::arrow::schema_to_arrow_schema(table.metadata().current_schema().as_ref())
+                .map_err(|e| {
+                    SqeError::Execution(format!("compaction schema conversion failed: {e}"))
+                })?,
+        );
+        let sort_spec =
+            parse_sort_spec(strategy.as_deref(), sort_order.as_deref(), &arrow_schema)?;
+        let sort_ctx: Option<Arc<SortCtx>> = match sort_spec {
+            None => None,
+            Some(spec) => {
+                let runtime = self.runtime.clone().ok_or_else(|| {
+                    SqeError::Execution(
+                        "rewrite_data_files: sort strategy requires the shared runtime; \
+                         not available in this handler"
+                            .into(),
+                    )
+                })?;
+                Some(Arc::new(SortCtx { runtime, spec }))
+            }
+        };
 
         let old_data_files = collect_live_data_files(&table).await?;
         let input_count = old_data_files.len();
@@ -630,14 +728,29 @@ impl MaintenanceHandler {
             tracker.clone(),
             "rewrite-data-files",
         );
+        let read_plan_arc = Arc::new(read_plan);
+        let live_deletes_arc = Arc::new(live_deletes);
         let results: Vec<(Vec<DataFile>, Vec<DataFile>, u64)> =
             stream::iter(eligible_groups.into_iter())
                 .map(|group| {
                     let table_for_group = table_arc.clone();
                     let tracker_for_group = tracker.clone();
+                    let plan_for_group = read_plan_arc.clone();
+                    let deletes_for_group = live_deletes_arc.clone();
+                    let schema_for_group = arrow_schema.clone();
+                    let sort_for_group = sort_ctx.clone();
                     async move {
-                        rewrite_group(&table_for_group, group, compression, tracker_for_group)
-                            .await
+                        rewrite_group(
+                            &table_for_group,
+                            &plan_for_group,
+                            &deletes_for_group,
+                            &schema_for_group,
+                            sort_for_group.as_deref(),
+                            group,
+                            compression,
+                            tracker_for_group,
+                        )
+                        .await
                     }
                 })
                 .buffer_unordered(max_concurrent.max(1))
@@ -650,20 +763,33 @@ impl MaintenanceHandler {
             rewritten_rows += group_rows;
         }
 
-        // Row-count invariant: the rows in the files we are deleting must
-        // equal the rows in the files we are adding. If not, we have a bug
-        // and must NOT commit.
+        // Row-count backstop. With delete application the added rows may be
+        // fewer than the removed rows (deleted rows are dropped), so the strict
+        // equality of the delete-free path no longer holds. The exact per-group
+        // cross-check (`expected_rows_after_deletes`) already ran inside
+        // `rewrite_group` and aborted before this point on any mismatch; here we
+        // only assert the global direction: a rewrite can never manufacture
+        // rows. `rewritten_rows` is the total the writer actually emitted.
         let removed_rows: u64 = old_files.iter().map(|f| f.record_count()).sum();
         let added_rows: u64 = new_files.iter().map(|f| f.record_count()).sum();
-        if added_rows != removed_rows {
+        if added_rows > removed_rows {
             return Err(SqeError::Execution(format!(
-                "rewrite_data_files row-count invariant violated: removed={removed_rows} \
-                 added={added_rows} (read_count={rewritten_rows}); aborting before commit"
+                "rewrite_data_files row-count invariant violated: added={added_rows} exceeds \
+                 removed={removed_rows} (read_count={rewritten_rows}); a rewrite cannot \
+                 increase row count; aborting before commit"
             )));
         }
 
         let output_count = new_files.len() as i64;
         let output_bytes: i64 = new_files.iter().map(|f| f.file_size_in_bytes() as i64).sum();
+
+        // Position delete files whose referenced data file we are removing are
+        // now dangling; drop them in the same commit so the delete-file layer
+        // shrinks along with the data. Equality deletes are left to age out.
+        let removed_data_paths: std::collections::HashSet<String> =
+            old_files.iter().map(|f| f.file_path().to_string()).collect();
+        let covered_deletes = covered_position_deletes(&removed_data_paths, &live_deletes_arc);
+        let removed_delete_count = covered_deletes.len() as i64;
 
         info!(
             table = %ident,
@@ -671,6 +797,7 @@ impl MaintenanceHandler {
             output_count,
             removed_rows,
             added_rows,
+            removed_delete_count,
             "rewrite_data_files: committing RewriteFilesAction"
         );
 
@@ -693,12 +820,27 @@ impl MaintenanceHandler {
         // into a hard error instead of a silent no-op. Combined with
         // enable_delete_filter_manager, the SnapshotProducer rewrites the
         // existing data manifests and marks the replaced files as deleted.
+        // set_new_data_file_sequence_number pins the compacted output to the
+        // sequence number of the snapshot we read (`seq_at_start`) instead of
+        // the new snapshot's. This is the conflict-correctness keystone for
+        // delete-aware compaction: an equality delete another writer commits
+        // concurrently (at a higher sequence number) still applies to the
+        // compacted files, because they carry the older sequence number. Without
+        // the pin, the new files would out-rank that delete and silently
+        // resurrect the rows it was meant to remove.
+        // `.delete_files` routes data-content files into removed_data_files and
+        // delete-content files into removed_delete_files, so chaining the
+        // covered position deletes onto the removed data files drops both in one
+        // atomic swap.
+        let files_to_remove: Vec<DataFile> =
+            old_files.iter().cloned().chain(covered_deletes).collect();
         let action = tx
             .rewrite_files()
             .set_enable_delete_filter_manager(true)
             .set_check_file_existence(true)
+            .set_new_data_file_sequence_number(seq_at_start)
             .add_data_files(new_files)
-            .delete_files(old_files.clone());
+            .delete_files(files_to_remove);
         let tx_applied = action
             .apply(tx)
             .map_err(|e| SqeError::Execution(format!("rewrite_files apply failed: {e}")))?;
@@ -1243,25 +1385,25 @@ async fn load_table(catalog: &Arc<dyn Catalog>, ident: &TableIdent) -> sqe_core:
 /// True when a manifest entry is a live delete file (position or equality).
 ///
 /// A live entry is one whose status is not `Deleted`; a delete file is any
-/// entry whose content type is not `Data`. `rewrite_data_files` cannot bin-pack
-/// a table with such entries: the raw-Parquet read path does not apply deletes,
-/// and the rewritten files get new paths/sequence numbers that the surviving
-/// deletes no longer match, so deleted rows would silently reappear.
+/// entry whose content type is not `Data`. The delete-aware rewrite uses this
+/// to collect the delete files it must apply during the read
+/// (`collect_live_delete_files`) and account for in the row cross-check.
 fn is_live_delete_entry(entry: &iceberg::spec::ManifestEntry) -> bool {
     entry.status() != ManifestStatus::Deleted
         && entry.content_type() != DataContentType::Data
 }
 
-/// Count live delete files (position + equality) in the current snapshot.
-/// Non-zero means `rewrite_data_files` must refuse to bin-pack (see
-/// `is_live_delete_entry`). Modeled on `collect_live_data_files`.
-async fn count_live_delete_files(table: &IcebergTable) -> sqe_core::Result<usize> {
+/// Collect the live delete files (position + equality) of the current snapshot.
+/// Mirrors `collect_live_data_files` but keeps delete-content entries instead of
+/// data entries. The delete-aware rewrite needs the delete `DataFile`s
+/// themselves (not just a count) to compute the post-delete row cross-check and
+/// to identify fully-covered position deletes for removal.
+async fn collect_live_delete_files(table: &IcebergTable) -> sqe_core::Result<Vec<DataFile>> {
     use futures::{StreamExt, TryStreamExt};
 
     let metadata_ref = table.metadata_ref();
-    let snapshot = match metadata_ref.current_snapshot() {
-        Some(s) => s,
-        None => return Ok(0),
+    let Some(snapshot) = metadata_ref.current_snapshot() else {
+        return Ok(vec![]);
     };
 
     let cache = table.object_cache();
@@ -1282,12 +1424,350 @@ async fn count_live_delete_files(table: &IcebergTable) -> sqe_core::Result<usize
             .await
             .map_err(|e| SqeError::Execution(format!("Failed to load manifest: {e}")))?;
 
-    let count = manifests
+    Ok(manifests
         .into_iter()
-        .flat_map(|m| m.entries().to_vec())
-        .filter(|e| is_live_delete_entry(e))
-        .count();
-    Ok(count)
+        .flat_map(|m| {
+            m.entries()
+                .iter()
+                .filter(|e| is_live_delete_entry(e))
+                .map(|e| e.data_file().clone())
+                .collect::<Vec<_>>()
+        })
+        .collect())
+}
+
+/// A snapshot-pinned, delete-aware read plan for a compaction pass.
+///
+/// `scan` is the configured `TableScan`; `tasks_by_path` maps each live data
+/// file's path to the `FileScanTask`s that cover it, with their applicable
+/// position and equality delete files attached. Reading a data file's tasks
+/// through `scan.read_tasks_to_arrow_with_metrics` applies those deletes, so the
+/// compacted output never carries logically-deleted rows.
+///
+/// Modeled on `WriteHandler::plan_delete_aware_read`; kept as a free function
+/// here so the maintenance path does not depend on the write handler's session
+/// context.
+struct DeleteAwareReadPlan {
+    scan: iceberg::scan::TableScan,
+    tasks_by_path: std::collections::HashMap<String, Vec<iceberg::scan::FileScanTask>>,
+}
+
+/// Build the delete-aware read plan for the current snapshot. Plan once, right
+/// after loading the table, so the task set matches the snapshot whose files the
+/// rewrite deletes.
+async fn plan_delete_aware_read(table: &IcebergTable) -> sqe_core::Result<DeleteAwareReadPlan> {
+    let scan = table
+        .scan()
+        .select_all()
+        .build()
+        .map_err(|e| SqeError::Execution(format!("Failed to build compaction read scan: {e}")))?;
+    let tasks: Vec<iceberg::scan::FileScanTask> = scan
+        .plan_files()
+        .await
+        .map_err(|e| SqeError::Execution(format!("Failed to plan compaction read: {e}")))?
+        .try_collect()
+        .await
+        .map_err(|e| SqeError::Execution(format!("Failed to plan compaction read: {e}")))?;
+    let mut tasks_by_path: std::collections::HashMap<String, Vec<iceberg::scan::FileScanTask>> =
+        std::collections::HashMap::new();
+    for task in tasks {
+        tasks_by_path
+            .entry(task.data_file_path.clone())
+            .or_default()
+            .push(task);
+    }
+    Ok(DeleteAwareReadPlan {
+        scan,
+        tasks_by_path,
+    })
+}
+
+/// Rows expected after applying deletes to `group`, or `None` when it cannot be
+/// computed exactly.
+///
+/// Only position-delete files whose `referenced_data_file` points at a file in
+/// the group are attributable, so their `record_count` subtracts cleanly.
+/// Equality deletes are value-based (they can match rows across many files at
+/// any lower sequence number) and position deletes without a
+/// `referenced_data_file` cannot be attributed to this group, so either makes
+/// the exact count unknowable. Callers fall back to the looser
+/// "cannot manufacture rows" bound in that case. Delete files are deduped by
+/// path so a delete referenced from multiple manifest entries counts once.
+fn expected_rows_after_deletes(group: &[DataFile], live_deletes: &[DataFile]) -> Option<u64> {
+    use std::collections::HashSet;
+    let group_paths: HashSet<&str> = group.iter().map(|f| f.file_path()).collect();
+    let base: u64 = group.iter().map(|f| f.record_count()).sum();
+    let mut deleted: u64 = 0;
+    let mut seen: HashSet<&str> = HashSet::new();
+    for d in live_deletes {
+        if !seen.insert(d.file_path()) {
+            continue;
+        }
+        match d.content_type() {
+            DataContentType::PositionDeletes => match d.referenced_data_file() {
+                Some(ref_path) if group_paths.contains(ref_path.as_str()) => {
+                    deleted += d.record_count();
+                }
+                // References a data file outside this group: not our concern.
+                Some(_) => {}
+                // Unattributable position delete: exact count unknowable.
+                None => return None,
+            },
+            // Value-based deletes: exact count unknowable.
+            DataContentType::EqualityDeletes => return None,
+            DataContentType::Data => {}
+        }
+    }
+    Some(base.saturating_sub(deleted))
+}
+
+/// Position delete files that are fully covered by the rewritten data set and so
+/// can be dropped in the same commit: their `referenced_data_file` points at a
+/// data file we are removing, so after the rewrite they reference a path that no
+/// longer exists.
+///
+/// Only position deletes with a `referenced_data_file` are returned. Equality
+/// deletes are value-based and may still match data files we are not touching
+/// (or, via the sequence-number pin, higher-sequence data), so they are left in
+/// place and aged out by `expire_snapshots`/`drop_delete_files_older_than`.
+/// Position deletes without a `referenced_data_file` cannot be attributed
+/// cheaply and are likewise left (harmless: they reference removed paths and
+/// match nothing). Deduped by path.
+fn covered_position_deletes(
+    removed_data_paths: &std::collections::HashSet<String>,
+    live_deletes: &[DataFile],
+) -> Vec<DataFile> {
+    use std::collections::HashSet;
+    let mut seen: HashSet<&str> = HashSet::new();
+    live_deletes
+        .iter()
+        .filter(|d| seen.insert(d.file_path()))
+        .filter(|d| d.content_type() == DataContentType::PositionDeletes)
+        .filter(|d| {
+            d.referenced_data_file()
+                .is_some_and(|p| removed_data_paths.contains(&p))
+        })
+        .cloned()
+        .collect()
+}
+
+/// How the rows in each rewritten group should be ordered before they are
+/// written back. `Columns` is a plain lexicographic sort; `ZOrder` clusters on
+/// a space-filling (Morton) curve for multi-dimensional locality.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SortSpec {
+    /// (column, ascending) pairs, applied in order.
+    Columns(Vec<(String, bool)>),
+    /// Z-order clustering across these columns.
+    ZOrder(Vec<String>),
+}
+
+impl SortSpec {
+    fn columns(&self) -> Vec<&str> {
+        match self {
+            SortSpec::Columns(c) => c.iter().map(|(n, _)| n.as_str()).collect(),
+            SortSpec::ZOrder(c) => c.iter().map(|n| n.as_str()).collect(),
+        }
+    }
+}
+
+/// Resolve the `strategy` / `sort_order` procedure args into a `SortSpec`,
+/// validated against the table schema. Returns `None` for the default bin-pack
+/// path (no sort). Validation lives here (not the parser) because it needs the
+/// schema. Mirrors Spark's `rewrite_data_files(strategy, sort_order)`.
+fn parse_sort_spec(
+    strategy: Option<&str>,
+    sort_order: Option<&str>,
+    schema: &arrow_schema::Schema,
+) -> sqe_core::Result<Option<SortSpec>> {
+    let strat = strategy.map(|s| s.trim().to_ascii_lowercase());
+    match strat.as_deref() {
+        Some(s) if s != "sort" && s != "binpack" => {
+            return Err(SqeError::Execution(format!(
+                "rewrite_data_files: unknown strategy '{s}'; expected 'binpack' or 'sort'"
+            )));
+        }
+        _ => {}
+    }
+    // A sort is requested when strategy is 'sort', or when only sort_order is
+    // given (strategy omitted). 'binpack' with a sort_order ignores the order.
+    let sort_requested = matches!(strat.as_deref(), Some("sort"))
+        || (strat.is_none() && sort_order.is_some());
+    if !sort_requested {
+        return Ok(None);
+    }
+
+    let order = sort_order
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            SqeError::Execution(
+                "rewrite_data_files: strategy => 'sort' requires a non-empty sort_order".into(),
+            )
+        })?;
+
+    let lower = order.to_ascii_lowercase();
+    let spec = if lower.starts_with("zorder(") && order.ends_with(')') {
+        let inner = &order[order.find('(').unwrap() + 1..order.len() - 1];
+        let cols: Vec<String> = inner
+            .split(',')
+            .map(|c| c.trim().to_string())
+            .filter(|c| !c.is_empty())
+            .collect();
+        if cols.is_empty() {
+            return Err(SqeError::Execution(
+                "rewrite_data_files: zorder(...) needs at least one column".into(),
+            ));
+        }
+        SortSpec::ZOrder(cols)
+    } else {
+        let mut cols: Vec<(String, bool)> = Vec::new();
+        for part in order.split(',') {
+            let toks: Vec<&str> = part.split_whitespace().collect();
+            if toks.is_empty() {
+                continue;
+            }
+            let asc = match toks.get(1).map(|s| s.to_ascii_uppercase()).as_deref() {
+                None | Some("ASC") => true,
+                Some("DESC") => false,
+                Some(other) => {
+                    return Err(SqeError::Execution(format!(
+                        "rewrite_data_files: invalid sort direction '{other}'; expected ASC or DESC"
+                    )));
+                }
+            };
+            cols.push((toks[0].to_string(), asc));
+        }
+        if cols.is_empty() {
+            return Err(SqeError::Execution(
+                "rewrite_data_files: sort_order is empty".into(),
+            ));
+        }
+        SortSpec::Columns(cols)
+    };
+
+    for name in spec.columns() {
+        if schema.field_with_name(name).is_err() {
+            return Err(SqeError::Execution(format!(
+                "rewrite_data_files: sort_order column '{name}' not found in table schema"
+            )));
+        }
+    }
+    Ok(Some(spec))
+}
+
+/// Everything the sort-compaction path needs beyond the bin-pack path: the
+/// shared spillable runtime and the resolved sort specification.
+struct SortCtx {
+    runtime: Arc<datafusion::execution::runtime_env::RuntimeEnv>,
+    spec: SortSpec,
+}
+
+/// A DataFusion `PartitionStream` that hands out a pre-built record-batch stream
+/// exactly once. Lets us feed the delete-applying compaction read into a
+/// `SortExec` (via a `StreamingTable`) so the sort spills to disk instead of
+/// buffering the whole group in memory.
+struct OneShotStream {
+    schema: arrow_schema::SchemaRef,
+    inner: std::sync::Mutex<Option<datafusion::execution::SendableRecordBatchStream>>,
+}
+
+impl std::fmt::Debug for OneShotStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OneShotStream")
+            .field("schema", &self.schema)
+            .finish_non_exhaustive()
+    }
+}
+
+impl datafusion::physical_plan::streaming::PartitionStream for OneShotStream {
+    fn schema(&self) -> &arrow_schema::SchemaRef {
+        &self.schema
+    }
+    fn execute(
+        &self,
+        _ctx: Arc<datafusion::execution::TaskContext>,
+    ) -> datafusion::execution::SendableRecordBatchStream {
+        match self.inner.lock().expect("OneShotStream poisoned").take() {
+            Some(s) => s,
+            None => Box::pin(datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
+                self.schema.clone(),
+                futures::stream::once(async {
+                    Err(datafusion::error::DataFusionError::Execution(
+                        "compaction sort source polled more than once".into(),
+                    ))
+                }),
+            )),
+        }
+    }
+}
+
+/// Sort a group's (delete-applied) record-batch stream on the shared spillable
+/// runtime, returning the sorted stream. Builds a single-partition
+/// `StreamingTable` over `input`, applies the sort (or z-order projection),
+/// and returns `df.execute_stream()`. DataFusion inserts a spillable `SortExec`
+/// because the session runs on the coordinator's FairSpillPool + DiskManager.
+async fn sort_group_stream(
+    ctx: &SortCtx,
+    input: datafusion::execution::SendableRecordBatchStream,
+    schema: arrow_schema::SchemaRef,
+) -> sqe_core::Result<datafusion::execution::SendableRecordBatchStream> {
+    use datafusion::prelude::{col, SessionConfig, SessionContext};
+
+    let session = SessionContext::new_with_config_rt(SessionConfig::new(), ctx.runtime.clone());
+    session.register_udf(crate::zorder::zorder_udf());
+
+    let provider = datafusion::catalog::streaming::StreamingTable::try_new(
+        schema.clone(),
+        vec![Arc::new(OneShotStream {
+            schema: schema.clone(),
+            inner: std::sync::Mutex::new(Some(input)),
+        })],
+    )
+    .map_err(|e| SqeError::Execution(format!("compaction sort: build source failed: {e}")))?;
+
+    const SRC: &str = "__sqe_compact_src";
+    session
+        .register_table(SRC, Arc::new(provider))
+        .map_err(|e| SqeError::Execution(format!("compaction sort: register source failed: {e}")))?;
+    let df = session
+        .table(SRC)
+        .await
+        .map_err(|e| SqeError::Execution(format!("compaction sort: read source failed: {e}")))?;
+
+    let sorted = match &ctx.spec {
+        SortSpec::Columns(cols) => {
+            let exprs = cols
+                .iter()
+                .map(|(name, asc)| col(name).sort(*asc, !*asc))
+                .collect::<Vec<_>>();
+            df.sort(exprs)
+                .map_err(|e| SqeError::Execution(format!("compaction sort failed: {e}")))?
+        }
+        SortSpec::ZOrder(cols) => {
+            // Project a Morton z-value, sort on it, then drop it so the written
+            // schema matches the table. Iceberg's SortOrder cannot express
+            // z-order, so no sort-order metadata is stamped (matches Spark).
+            let zargs = cols.iter().map(|c| col(c.as_str())).collect::<Vec<_>>();
+            let zexpr = crate::zorder::zorder_udf().call(zargs).alias("__sqe_zvalue");
+            let passthrough = schema
+                .fields()
+                .iter()
+                .map(|f| col(f.name()))
+                .collect::<Vec<_>>();
+            let mut projected = passthrough.clone();
+            projected.push(zexpr);
+            df.select(projected)
+                .and_then(|d| d.sort(vec![col("__sqe_zvalue").sort(true, false)]))
+                .and_then(|d| d.select(passthrough))
+                .map_err(|e| SqeError::Execution(format!("compaction z-order sort failed: {e}")))?
+        }
+    };
+
+    sorted
+        .execute_stream()
+        .await
+        .map_err(|e| SqeError::Execution(format!("compaction sort execution failed: {e}")))
 }
 
 /// Collect the live data files of the current snapshot. Mirrors the helper
@@ -1411,87 +1891,129 @@ fn pack_file_groups_partition_aware(files: &[DataFile], target_bytes: u64) -> Ve
     out
 }
 
-/// Read every Parquet file in `group`, combine the batches, and emit the
-/// combined contents as a fresh set of data files. Returns
-/// `(new_files, old_files, total_rows_read)` so the caller can build the
-/// commit payload and validate the row-count invariant.
+/// Rewrite one file group, applying its position and equality deletes, and emit
+/// the surviving rows as a fresh set of data files. Streams the delete-aware
+/// scan straight into the streaming writer so the group is never fully buffered
+/// in coordinator memory. Returns `(new_files, old_files, rows_written)`.
+///
+/// The read routes through the shared `DeleteAwareReadPlan`: every task for the
+/// group's data files (with its delete files attached) is fed to
+/// `read_tasks_to_arrow_with_metrics`, which applies the deletes during decode.
+/// Before returning, the exact post-delete row count is cross-checked against
+/// `expected_rows_after_deletes`; when that is knowable (position deletes with a
+/// `referenced_data_file`) any mismatch aborts before commit, and when it is not
+/// (equality deletes) the caller enforces the looser "cannot manufacture rows"
+/// bound.
+#[allow(clippy::too_many_arguments)]
 async fn rewrite_group(
     table: &IcebergTable,
+    plan: &DeleteAwareReadPlan,
+    live_deletes: &[DataFile],
+    arrow_schema: &arrow_schema::SchemaRef,
+    sort_ctx: Option<&SortCtx>,
     group: Vec<DataFile>,
     compression: parquet::basic::Compression,
     tracker: crate::writer::UploadedPaths,
 ) -> sqe_core::Result<(Vec<DataFile>, Vec<DataFile>, u64)> {
-    let mut batches: Vec<RecordBatch> = Vec::new();
-    let mut rows_read: u64 = 0;
+    use futures::StreamExt;
 
+    // Gather every scan task for the group's data files. Each task carries the
+    // delete files that apply to it; missing a file from the plan means we would
+    // read it without its deletes and resurrect deleted rows, so fail loud.
+    let mut tasks: Vec<iceberg::scan::FileScanTask> = Vec::new();
     for df in &group {
-        let file_batches = read_parquet_file(table, df.file_path()).await?;
-        for b in file_batches {
-            rows_read += b.num_rows() as u64;
-            if b.num_rows() > 0 {
-                batches.push(b);
+        match plan.tasks_by_path.get(df.file_path()) {
+            Some(t) => tasks.extend(t.iter().cloned()),
+            None => {
+                return Err(SqeError::Execution(format!(
+                    "delete-aware compaction: data file '{}' is missing from the scan plan; \
+                     refusing to read it without its delete files (data-file path mismatch \
+                     between the manifest and the scan planner)",
+                    df.file_path()
+                )));
             }
         }
     }
 
-    // Safety check: rows we read must equal the sum the manifest told us.
-    let expected: u64 = group.iter().map(|f| f.record_count()).sum();
-    if rows_read != expected {
-        return Err(SqeError::Execution(format!(
-            "rewrite_group: Parquet row count {rows_read} does not match manifest \
-             record_count {expected} for group of {} files",
-            group.len()
-        )));
-    }
-
-    if batches.is_empty() {
-        // Empty group: caller treats this as a no-op (nothing added, nothing removed).
+    if tasks.is_empty() {
+        // Empty group: caller treats this as a no-op (nothing added/removed).
         return Ok((vec![], vec![], 0));
     }
 
-    let new_files = write_data_files(table, batches, "rewrite", compression, tracker).await?;
-
-    Ok((new_files, group, rows_read))
-}
-
-/// Read a Parquet data file via the table's configured FileIO. Mirrors the
-/// helper in `WriteHandler::read_parquet_via_table` but lives here to avoid
-/// depending on that handler's session context.
-async fn read_parquet_file(
-    table: &IcebergTable,
-    file_path: &str,
-) -> sqe_core::Result<Vec<RecordBatch>> {
-    let file_io = table.file_io();
-    let input = file_io
-        .new_input(file_path)
-        .map_err(|e| SqeError::Execution(format!("Failed to open file '{file_path}': {e}")))?;
-
-    let input_file = input
-        .read()
-        .await
-        .map_err(|e| SqeError::Execution(format!("Failed to read file '{file_path}': {e}")))?;
-
-    let reader = parquet::arrow::arrow_reader::ArrowReaderBuilder::try_new(input_file)
+    // Feed the group's tasks through the scan's delete-applying reader, then
+    // adapt the Iceberg record-batch stream into a DataFusion stream for the
+    // streaming writer. The declared schema is the table's current schema in
+    // Arrow form; the writer re-stamps field IDs by position per batch.
+    let task_stream: iceberg::scan::FileScanTaskStream =
+        Box::pin(futures::stream::iter(tasks.into_iter().map(Ok)));
+    let scan_result = plan
+        .scan
+        .read_tasks_to_arrow_with_metrics(task_stream)
         .map_err(|e| {
-            SqeError::Execution(format!(
-                "Failed to create Parquet reader for '{file_path}': {e}"
-            ))
+            SqeError::Execution(format!("delete-aware compaction read failed: {e}"))
         })?;
+    let df_stream = scan_result.stream().map(|item| {
+        item.map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))
+    });
+    let sendable: datafusion::execution::SendableRecordBatchStream = Box::pin(
+        datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
+            arrow_schema.clone(),
+            df_stream,
+        ),
+    );
 
-    let reader = reader.build().map_err(|e| {
-        SqeError::Execution(format!(
-            "Failed to build Parquet reader for '{file_path}': {e}"
-        ))
-    })?;
+    // Sort strategy: route the delete-applied stream through a spillable
+    // DataFusion sort (or z-order clustering) before writing. Bin-pack writes
+    // the stream directly.
+    let writer_input = match sort_ctx {
+        Some(ctx) => sort_group_stream(ctx, sendable, arrow_schema.clone()).await?,
+        None => sendable,
+    };
 
-    let batches: Vec<RecordBatch> = reader
-        .into_iter()
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| {
-            SqeError::Execution(format!("Failed to read Parquet file '{file_path}': {e}"))
-        })?;
+    let (new_files, rows_written) = write_data_files_streaming(
+        table,
+        writer_input,
+        "rewrite",
+        compression,
+        tracker,
+        FanoutLimits::unbounded(),
+    )
+    .await?;
+    let rows_written = rows_written as u64;
 
-    Ok(batches)
+    // Per-group delete-accounting cross-check. This is the guard that makes the
+    // relaxed (added <= removed) invariant trustworthy: it catches a scan that
+    // silently fails to apply deletes (rows too high) or a writer that drops
+    // surviving rows (rows too low).
+    match expected_rows_after_deletes(&group, live_deletes) {
+        Some(expected) if rows_written != expected => {
+            return Err(SqeError::Execution(format!(
+                "compaction delete-accounting mismatch: wrote {rows_written} rows, expected \
+                 {expected} after applying position deletes to a group of {} files; aborting \
+                 before commit",
+                group.len()
+            )));
+        }
+        _ => {
+            // Equality / unattributable deletes: exact count unknowable. Enforce
+            // the looser bound that a rewrite can never manufacture rows.
+            let base: u64 = group.iter().map(|f| f.record_count()).sum();
+            if rows_written > base {
+                return Err(SqeError::Execution(format!(
+                    "compaction wrote {rows_written} rows from {base} input rows; deletes \
+                     cannot increase the row count; aborting before commit"
+                )));
+            }
+        }
+    }
+
+    if new_files.is_empty() {
+        // Whole group deleted away: nothing to add, but we still remove the old
+        // files. Return them so the caller drops them from the table.
+        return Ok((vec![], group, rows_written));
+    }
+
+    Ok((new_files, group, rows_written))
 }
 
 /// Build a single-row `RecordBatch` describing the procedure's effect.
@@ -1722,6 +2244,103 @@ mod tests {
             .data_file(data)
             .build();
         assert!(!is_live_delete_entry(&entry), "data file is not a delete");
+    }
+
+    // ---------------------------------------------------------------------
+    // Delete-accounting cross-check (expected_rows_after_deletes). Pure over
+    // DataFile metadata, so no live catalog needed.
+    // ---------------------------------------------------------------------
+
+    fn data_file_rows(path: &str, rows: u64) -> DataFile {
+        use iceberg::spec::{DataFileBuilder, DataFileFormat, Literal, Struct};
+        DataFileBuilder::default()
+            .content(DataContentType::Data)
+            .file_path(path.to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(rows * 8)
+            .record_count(rows)
+            .partition(Struct::from_iter([Some(Literal::long(0))]))
+            .partition_spec_id(0)
+            .build()
+            .expect("build data file")
+    }
+
+    fn pos_delete_file(path: &str, rows: u64, referenced: &str) -> DataFile {
+        use iceberg::spec::{DataFileBuilder, DataFileFormat, Struct};
+        DataFileBuilder::default()
+            .content(DataContentType::PositionDeletes)
+            .file_path(path.to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(rows * 8)
+            .record_count(rows)
+            .partition(Struct::empty())
+            .partition_spec_id(0)
+            .referenced_data_file(Some(referenced.to_string()))
+            .build()
+            .expect("build position delete file")
+    }
+
+    fn eq_delete_file(path: &str, rows: u64) -> DataFile {
+        use iceberg::spec::{DataFileBuilder, DataFileFormat, Struct};
+        DataFileBuilder::default()
+            .content(DataContentType::EqualityDeletes)
+            .file_path(path.to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(rows * 8)
+            .record_count(rows)
+            .partition(Struct::empty())
+            .partition_spec_id(0)
+            .equality_ids(Some(vec![1]))
+            .build()
+            .expect("build equality delete file")
+    }
+
+    #[test]
+    fn expected_rows_subtracts_referenced_position_deletes() {
+        let d = data_file_rows("s3://b/d1.parquet", 100);
+        let pd = pos_delete_file("s3://b/pd1.parquet", 10, "s3://b/d1.parquet");
+        assert_eq!(expected_rows_after_deletes(&[d], &[pd]), Some(90));
+    }
+
+    #[test]
+    fn expected_rows_ignores_position_delete_outside_group() {
+        let d = data_file_rows("s3://b/d1.parquet", 100);
+        let pd = pos_delete_file("s3://b/pd2.parquet", 5, "s3://b/other.parquet");
+        assert_eq!(expected_rows_after_deletes(&[d], &[pd]), Some(100));
+    }
+
+    #[test]
+    fn expected_rows_ambiguous_on_equality_delete() {
+        let d = data_file_rows("s3://b/d1.parquet", 100);
+        let ed = eq_delete_file("s3://b/ed1.parquet", 5);
+        assert_eq!(expected_rows_after_deletes(&[d], &[ed]), None);
+    }
+
+    #[test]
+    fn expected_rows_dedupes_delete_by_path() {
+        let d = data_file_rows("s3://b/d1.parquet", 100);
+        let pd = pos_delete_file("s3://b/pd1.parquet", 10, "s3://b/d1.parquet");
+        // Same delete file listed twice must only subtract once.
+        assert_eq!(expected_rows_after_deletes(&[d], &[pd.clone(), pd]), Some(90));
+    }
+
+    #[test]
+    fn covered_position_deletes_selects_only_referenced() {
+        let mut removed = std::collections::HashSet::new();
+        removed.insert("s3://b/d1.parquet".to_string());
+        let pd_in = pos_delete_file("s3://b/pd1.parquet", 10, "s3://b/d1.parquet");
+        let pd_out = pos_delete_file("s3://b/pd2.parquet", 5, "s3://b/d2.parquet");
+        let ed = eq_delete_file("s3://b/ed1.parquet", 3);
+        let got = covered_position_deletes(&removed, &[pd_in, pd_out, ed]);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].file_path(), "s3://b/pd1.parquet");
+    }
+
+    #[test]
+    fn covered_position_deletes_empty_when_none_referenced() {
+        let removed = std::collections::HashSet::new();
+        let pd = pos_delete_file("s3://b/pd1.parquet", 10, "s3://b/d1.parquet");
+        assert!(covered_position_deletes(&removed, &[pd]).is_empty());
     }
 
     #[test]
