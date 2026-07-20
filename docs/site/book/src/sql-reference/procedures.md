@@ -10,7 +10,7 @@ Source: `crates/sqe-sql/src/procedures.rs`. Handlers in `crates/sqe-coordinator/
 
 | Procedure | Origin | Required args | Optional args | Notes |
 |---|---|---|---|---|
-| `system.rewrite_data_files` | `sqe-sql` + `sqe-coordinator` | `table => 'ns.t'` | `target_file_size_bytes => N`, `min_input_files => N`, `max_concurrent_file_group_rewrites => N`, `strategy => 'binpack'\|'sort'`, `sort_order => 'col ASC, ...'\|'zorder(a, b)'` | Compacts small data files (delete-aware). Default target 512 MiB, min 5 files per group, max 4 concurrent groups. `strategy => 'sort'` orders each group's rows by `sort_order` (a column list or `zorder(...)`) via a spillable DataFusion sort before writing. |
+| `system.rewrite_data_files` | `sqe-sql` + `sqe-coordinator` | `table => 'ns.t'` | `target_file_size_bytes => N`, `min_input_files => N`, `max_concurrent_file_group_rewrites => N`, `strategy => 'binpack'\|'sort'`, `sort_order => 'col ASC, ...'\|'zorder(a, b)'`, `delete_file_threshold => N` | Compacts small data files (delete-aware). Default target 512 MiB, min 5 files per group, max 4 concurrent groups. `strategy => 'sort'` sorts a whole partition by `sort_order` (a column list or `zorder(...)`) via a spillable DataFusion sort and rolls output at the target size, producing files with disjoint key ranges. `delete_file_threshold => N` also rewrites any data file with at least N delete files applying to it, even when it is already large. |
 | `system.expire_snapshots` | `sqe-sql` + `sqe-coordinator` | `table => 'ns.t'` | `older_than => TIMESTAMP`, `retain_last => N` | Drops old snapshots. `older_than` and `retain_last` combine: a snapshot must be older than `older_than` and beyond the `retain_last` window before it is removed. |
 | `system.remove_orphan_files` | `sqe-sql` + `sqe-coordinator` | `table => 'ns.t'` | `older_than => TIMESTAMP` | Deletes files under the table prefix not referenced by any live snapshot. Default `older_than` is 3 days ago, to avoid racing with in-flight writes. |
 | `system.rewrite_manifests` | `sqe-sql` + `sqe-coordinator` | `table => 'ns.t'` | - | Consolidates many small manifest files into fewer larger ones. Speeds up planning on large tables. |
@@ -92,6 +92,27 @@ SELECT file_path, lower_bounds, upper_bounds
 FROM table_files('analytics', 'events')
 ORDER BY lower_bounds;
 ```
+
+### Clean up delete-heavy Merge-on-Read files
+
+On a Merge-on-Read table, repeated `DELETE`/`UPDATE`/`MERGE` accumulate delete
+files. A data file with many deletes is slow to read (every delete file has to
+be applied on scan). `delete_file_threshold` rewrites any data file with at
+least that many delete files applying to it, even when the file is already at or
+above the target size, so bin-pack would otherwise leave it alone.
+
+```sql
+CALL system.rewrite_data_files(
+    table => 'analytics.events',
+    delete_file_threshold => 10
+);
+```
+
+The count includes every delete file the scan attaches to the data file, both
+position and equality deletes. A low threshold on an equality-heavy table
+therefore rewrites broadly, since one equality delete can apply to many files.
+The option is off by default and is a no-op under `strategy => 'sort'`, which
+already rewrites the whole partition.
 
 ### Drop snapshots older than 30 days, keeping the last 10
 

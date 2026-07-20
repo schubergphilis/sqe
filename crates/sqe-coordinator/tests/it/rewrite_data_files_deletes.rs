@@ -212,6 +212,101 @@ async fn rewrite_preserves_deletes() {
     let _ = exec(&handler, &session, &format!("DROP TABLE IF EXISTS {table}")).await;
 }
 
+/// `delete_file_threshold`: a data file that has accumulated many delete files
+/// must be rewritten to shed them, even when it is the only file (below
+/// `min_input_files`) and would otherwise be skipped. Proven by contrast: the
+/// same table skips without the threshold and runs with it.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs docker-compose.test.yml + Polaris"]
+async fn rewrite_delete_file_threshold_triggers_on_delete_heavy_file() {
+    let (session, handler) = crate::common::setup_handler().await;
+    let namespace = "default";
+    let table_name = "rewrite_delete_threshold";
+    let table = format!("{namespace}.{table_name}");
+
+    let _ = exec(&handler, &session, &format!("DROP TABLE IF EXISTS {table}")).await;
+    // One data file (single INSERT) of 10 rows, Merge-on-Read deletes.
+    exec(
+        &handler,
+        &session,
+        &format!(
+            "CREATE TABLE {table} (id BIGINT) \
+             TBLPROPERTIES ('write.delete.mode' = 'merge-on-read')"
+        ),
+    )
+    .await;
+    let values: Vec<String> = (0..10).map(|i| format!("({i})")).collect();
+    exec(&handler, &session, &format!("INSERT INTO {table} VALUES {}", values.join(", "))).await;
+    assert_eq!(
+        live_data_file_count(&handler, &session, namespace, table_name).await,
+        1,
+        "setup: expected a single data file"
+    );
+
+    // Three separate DELETE commits -> three position delete files, all
+    // referencing that one data file. Distinct rows so no DELETE is a no-op.
+    for id in 0..3i64 {
+        exec(&handler, &session, &format!("DELETE FROM {table} WHERE id = {id}")).await;
+    }
+    assert_eq!(count_rows(&handler, &session, &table).await, 7);
+
+    // Contrast 1: no threshold + a min_input above the file count -> skipped.
+    let skipped = exec(
+        &handler,
+        &session,
+        &format!("CALL system.rewrite_data_files(table => '{table}', min_input_files => 100)"),
+    )
+    .await;
+    assert!(
+        status_of(&skipped).contains("skipped"),
+        "without a threshold, a single-file table below min_input must skip; got '{}'",
+        status_of(&skipped)
+    );
+
+    // Contrast 2: same min_input, but delete_file_threshold => 3 -> the
+    // delete-heavy file makes it eligible, so it runs.
+    let ran = exec(
+        &handler,
+        &session,
+        &format!(
+            "CALL system.rewrite_data_files(table => '{table}', min_input_files => 100, \
+             delete_file_threshold => 3)"
+        ),
+    )
+    .await;
+    assert!(
+        !status_of(&ran).contains("skipped"),
+        "delete_file_threshold must trigger the rewrite of a delete-heavy file; got '{}'",
+        status_of(&ran)
+    );
+
+    // Deleted rows stay gone.
+    assert_eq!(
+        count_rows(&handler, &session, &table).await,
+        7,
+        "rewrite must apply the accumulated deletes, not resurrect rows"
+    );
+
+    // The deletes are now shed: re-running with the same threshold finds no
+    // delete-heavy file and skips (proves the delete files were dropped).
+    let again = exec(
+        &handler,
+        &session,
+        &format!(
+            "CALL system.rewrite_data_files(table => '{table}', min_input_files => 100, \
+             delete_file_threshold => 3)"
+        ),
+    )
+    .await;
+    assert!(
+        status_of(&again).contains("skipped"),
+        "after compaction the delete files are gone, so a second threshold pass must skip; got '{}'",
+        status_of(&again)
+    );
+
+    let _ = exec(&handler, &session, &format!("DROP TABLE IF EXISTS {table}")).await;
+}
+
 /// Equality-delete path (the one the sequence-number pin exists for). A MoR
 /// UPDATE produces an equality delete plus a new data file; the rewrite must
 /// apply the equality delete (drop the stale row), keep the updated row, and
