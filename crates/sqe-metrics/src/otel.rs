@@ -22,7 +22,7 @@ use tracing_subscriber::EnvFilter;
 ///
 /// Returns an [`OtelGuard`] that flushes and shuts down providers on drop.
 pub fn init_telemetry(service_name: &str, otlp_endpoint: &str) -> OtelGuard {
-    init_telemetry_with_sampling(service_name, otlp_endpoint, 0.01)
+    init_telemetry_with_sampling(service_name, otlp_endpoint, "", 0.01)
 }
 
 /// Initialize the full observability stack with a configurable trace sampling rate.
@@ -33,14 +33,20 @@ pub fn init_telemetry(service_name: &str, otlp_endpoint: &str) -> OtelGuard {
 pub fn init_telemetry_with_sampling(
     service_name: &str,
     otlp_endpoint: &str,
+    traces_otlp_endpoint: &str,
     trace_sample_rate: f64,
 ) -> OtelGuard {
     let env_filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("sqe=info"));
 
-    let fmt_layer = tracing_subscriber::fmt::layer().json();
+    let fmt_layer = tracing_subscriber::fmt::layer()
+        .json()
+        .with_current_span(true)
+        .with_span_list(true);
 
-    if otlp_endpoint.is_empty() {
+    let trace_endpoint = if traces_otlp_endpoint.is_empty() { otlp_endpoint } else { traces_otlp_endpoint };
+
+    if trace_endpoint.is_empty() {
         // No OTel — just structured JSON logs
         let _ = tracing_subscriber::registry()
             .with(env_filter)
@@ -61,7 +67,7 @@ pub fn init_telemetry_with_sampling(
     // ── Traces ───────────────────────────────────────────────
     let trace_exporter = SpanExporter::builder()
         .with_tonic()
-        .with_endpoint(otlp_endpoint)
+        .with_endpoint(trace_endpoint)
         .build()
         .expect("Failed to create OTLP span exporter");
 
@@ -84,43 +90,44 @@ pub fn init_telemetry_with_sampling(
 
     let otel_trace_layer = OpenTelemetryLayer::new(tracer);
 
-    // ── Logs ─────────────────────────────────────────────────
-    let log_exporter = LogExporter::builder()
-        .with_tonic()
-        .with_endpoint(otlp_endpoint)
-        .build()
-        .expect("Failed to create OTLP log exporter");
+    // Logs and metrics retain the legacy all-signals endpoint. Configuring
+    // only traces_otlp_endpoint avoids sending unsupported signals to a
+    // trace-only collector pipeline.
+    let (logger_provider, meter_provider) = if otlp_endpoint.is_empty() {
+        (None, None)
+    } else {
+        let log_exporter = LogExporter::builder()
+            .with_tonic()
+            .with_endpoint(otlp_endpoint)
+            .build()
+            .expect("Failed to create OTLP log exporter");
+        let logger_provider = SdkLoggerProvider::builder()
+            .with_resource(resource.clone())
+            .with_batch_exporter(log_exporter)
+            .build();
+        let metric_exporter = MetricExporter::builder()
+            .with_tonic()
+            .with_endpoint(otlp_endpoint)
+            .build()
+            .expect("Failed to create OTLP metric exporter");
+        let meter_provider = SdkMeterProvider::builder()
+            .with_resource(resource)
+            .with_periodic_exporter(metric_exporter)
+            .build();
+        opentelemetry::global::set_meter_provider(meter_provider.clone());
+        (Some(logger_provider), Some(meter_provider))
+    };
 
-    let logger_provider = SdkLoggerProvider::builder()
-        .with_resource(resource.clone())
-        .with_batch_exporter(log_exporter)
-        .build();
-
-    // Filter to prevent telemetry-induced-telemetry loops
-    let otel_log_filter = EnvFilter::new("info")
-        .add_directive("hyper=off".parse().unwrap())
-        .add_directive("tonic=off".parse().unwrap())
-        .add_directive("h2=off".parse().unwrap())
-        .add_directive("reqwest=off".parse().unwrap())
-        .add_directive("tower=off".parse().unwrap())
-        .add_directive("tower_http=off".parse().unwrap());
-
-    let otel_log_layer =
-        OpenTelemetryTracingBridge::new(&logger_provider).with_filter(otel_log_filter);
-
-    // ── Metrics ──────────────────────────────────────────────
-    let metric_exporter = MetricExporter::builder()
-        .with_tonic()
-        .with_endpoint(otlp_endpoint)
-        .build()
-        .expect("Failed to create OTLP metric exporter");
-
-    let meter_provider = SdkMeterProvider::builder()
-        .with_resource(resource)
-        .with_periodic_exporter(metric_exporter)
-        .build();
-
-    opentelemetry::global::set_meter_provider(meter_provider.clone());
+    let otel_log_layer = logger_provider.as_ref().map(|provider| {
+        let filter = EnvFilter::new("info")
+            .add_directive("hyper=off".parse().unwrap())
+            .add_directive("tonic=off".parse().unwrap())
+            .add_directive("h2=off".parse().unwrap())
+            .add_directive("reqwest=off".parse().unwrap())
+            .add_directive("tower=off".parse().unwrap())
+            .add_directive("tower_http=off".parse().unwrap());
+        OpenTelemetryTracingBridge::new(provider).with_filter(filter)
+    });
 
     // ── Compose subscriber ───────────────────────────────────
     let _ = tracing_subscriber::registry()
@@ -131,15 +138,17 @@ pub fn init_telemetry_with_sampling(
         .try_init();
 
     tracing::info!(
-        otlp_endpoint = otlp_endpoint,
+        traces_otlp_endpoint = trace_endpoint,
+        all_signals_otlp_endpoint = otlp_endpoint,
         service = service_name,
-        "OpenTelemetry initialized (traces + metrics + logs)"
+        logs_and_metrics = !otlp_endpoint.is_empty(),
+        "OpenTelemetry initialized"
     );
 
     OtelGuard {
         tracer_provider: Some(tracer_provider),
-        meter_provider: Some(meter_provider),
-        logger_provider: Some(logger_provider),
+        meter_provider,
+        logger_provider,
     }
 }
 
@@ -169,6 +178,30 @@ impl Drop for OtelGuard {
 mod tests {
     use super::*;
 
+    #[derive(Clone, Default)]
+    struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    struct CaptureWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CaptureWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
+        type Writer = CaptureWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            CaptureWriter(self.0.clone())
+        }
+    }
+
     #[test]
     fn test_guard_drop_without_otel() {
         let guard = OtelGuard {
@@ -177,5 +210,55 @@ mod tests {
             logger_provider: None,
         };
         drop(guard);
+    }
+
+    #[test]
+    fn json_events_include_trace_span_and_safe_correlation_fields() {
+        use opentelemetry::trace::{
+            SpanContext, SpanId, TraceContextExt, TraceFlags, TraceId,
+        };
+        use tracing_opentelemetry::OpenTelemetrySpanExt;
+
+        let capture = Capture::default();
+        let provider = SdkTracerProvider::builder().build();
+        let tracer = provider.tracer("json-correlation-test");
+        let subscriber = tracing_subscriber::registry()
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .json()
+                    .with_span_list(true)
+                    .with_writer(capture.clone()),
+            )
+            .with(tracing_opentelemetry::layer().with_tracer(tracer));
+
+        tracing::subscriber::with_default(subscriber, || {
+            let remote = SpanContext::new(
+                TraceId::from_hex("0af7651916cd43dd8448eb211c80319c").unwrap(),
+                SpanId::from_hex("b7ad6b7169203331").unwrap(),
+                TraceFlags::SAMPLED,
+                true,
+                Default::default(),
+            );
+            let span = tracing::info_span!(
+                "flight_sql.request",
+                trace_id = tracing::field::Empty,
+                span_id = tracing::field::Empty,
+                request_id = "request-42",
+                session_id = "session-42",
+                query_id = "query-42",
+            );
+            span.set_parent(opentelemetry::Context::new().with_remote_span_context(remote))
+                .unwrap();
+            crate::propagation::record_trace_fields(&span);
+            span.in_scope(|| tracing::info!("ordinary tracing event"));
+        });
+
+        let output = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        assert!(output.contains("0af7651916cd43dd8448eb211c80319c"));
+        assert!(output.contains("\"span_id\":"));
+        assert!(output.contains("request-42"));
+        assert!(output.contains("session-42"));
+        assert!(output.contains("query-42"));
+        provider.shutdown().unwrap();
     }
 }

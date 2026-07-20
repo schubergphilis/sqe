@@ -289,12 +289,16 @@ impl FlightService for WorkerFlightService {
         })?;
 
         let worker_span = info_span!(
-            "worker_execute_scan",
+            "sqe.worker.scan",
             fragment_id = %scan_task.fragment_id,
             file_count = scan_task.data_file_paths.len(),
+            trace_id = tracing::field::Empty,
+            span_id = tracing::field::Empty,
+            otel.status_code = tracing::field::Empty,
         );
         // Link this span to the coordinator's trace
         let _set_parent_result = worker_span.set_parent(parent_cx);
+        sqe_metrics::propagation::record_trace_fields(&worker_span);
 
         let metrics = self.metrics.clone();
         let credential_store = self.credential_store.clone();
@@ -302,7 +306,9 @@ impl FlightService for WorkerFlightService {
         let footer_cache = self.footer_cache.clone();
         let scan_timeout = self.scan_timeout;
         let flight_compression = self.flight_compression;
-        async move {
+        let stream_span = worker_span.clone();
+        let result_span = worker_span.clone();
+        let result = async move {
             info!(
                 fragment_id = %scan_task.fragment_id,
                 file_count = scan_task.data_file_paths.len(),
@@ -384,13 +390,20 @@ impl FlightService for WorkerFlightService {
                 .with_options(ipc_opts)
                 .build(mapped_stream)
                 .map_err(Status::from);
+            let flight_stream = tracing_futures::Instrument::instrument(flight_stream, stream_span);
 
             Ok(Response::new(
                 Box::pin(flight_stream) as Self::DoGetStream
             ))
         }
         .instrument(worker_span)
-        .await
+        .await;
+        if result.is_ok() {
+            result_span.record("otel.status_code", "OK");
+        } else {
+            result_span.record("otel.status_code", "ERROR");
+        }
+        result
     }
 
     async fn do_action(

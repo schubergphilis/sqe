@@ -165,6 +165,7 @@ config:
   metrics:
     prometheus_port: 9090
     otlp_endpoint: ""
+    traces_otlp_endpoint: ""
     # ISSUE-248: audit_log_path is NOT set here. The path is derived from the
     # audit.* block below so the mounted volume and the rendered toml stay in
     # lockstep (audit.path + audit.fileName). Setting it here would let the

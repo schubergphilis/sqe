@@ -13,6 +13,8 @@ use std::collections::BTreeMap;
 use sqe_catalog::build_catalog;
 use sqe_core::{Secret, SecretStore};
 use sqe_sql::{CatalogKind, OptionValue};
+use tracing::Instrument;
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -22,6 +24,82 @@ const CONFIG_BODY: &str = r#"{"overrides":{},"defaults":{}}"#;
 
 /// Empty namespace list response shape.
 const EMPTY_NAMESPACES: &str = r#"{"namespaces":[]}"#;
+
+#[tokio::test]
+async fn polaris_requests_preserve_the_incoming_trace_id() {
+    use opentelemetry::trace::{
+        SpanContext, SpanId, TraceContextExt, TraceFlags, TraceId, TracerProvider,
+    };
+    use opentelemetry_sdk::propagation::TraceContextPropagator;
+    use opentelemetry_sdk::trace::SdkTracerProvider;
+    use tracing_subscriber::layer::SubscriberExt;
+
+    opentelemetry::global::set_text_map_propagator(TraceContextPropagator::new());
+    let provider = SdkTracerProvider::builder().build();
+    let tracer = provider.tracer("polaris-propagation-test");
+    let subscriber = tracing_subscriber::registry()
+        .with(tracing_opentelemetry::layer().with_tracer(tracer));
+    let _subscriber = tracing::subscriber::set_default(subscriber);
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/config"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(CONFIG_BODY))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1/namespaces"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(EMPTY_NAMESPACES))
+        .mount(&server)
+        .await;
+
+    let expected_trace_id = "0af7651916cd43dd8448eb211c80319c";
+    let remote = SpanContext::new(
+        TraceId::from_hex(expected_trace_id).unwrap(),
+        SpanId::from_hex("b7ad6b7169203331").unwrap(),
+        TraceFlags::SAMPLED,
+        true,
+        Default::default(),
+    );
+    let parent = tracing::info_span!("bff.request");
+    parent
+        .set_parent(opentelemetry::Context::new().with_remote_span_context(remote))
+        .unwrap();
+    let catalog_parent = parent.clone();
+
+    let mut options = BTreeMap::new();
+    options.insert(
+        "WAREHOUSE".to_string(),
+        OptionValue::String("trace_test".to_string()),
+    );
+    let catalog = build_catalog(
+        &server.uri(),
+        CatalogKind::IcebergRest,
+        &options,
+        &SecretStore::new(),
+    )
+    .instrument(parent)
+    .await
+    .unwrap();
+    catalog
+        .list_namespaces(None)
+        .instrument(catalog_parent)
+        .await
+        .unwrap();
+
+    let requests = server.received_requests().await.unwrap();
+    let traceparent = requests
+        .iter()
+        .find(|request| request.url.path() == "/v1/config")
+        .unwrap()
+        .headers
+        .get("traceparent")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(traceparent.starts_with(&format!("00-{expected_trace_id}-")));
+    provider.shutdown().unwrap();
+}
 
 #[tokio::test]
 async fn build_iceberg_rest_against_wiremock() {
