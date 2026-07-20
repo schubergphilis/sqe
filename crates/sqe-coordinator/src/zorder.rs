@@ -112,6 +112,9 @@ impl ScalarUDFImpl for ZOrderUdf {
 
 /// Encode one arrow array to a per-row order-preserving 8-byte key. A null in a
 /// row yields an all-zero key (sorts first).
+// Index-based loops write into a pre-sized `out` by row position while skipping
+// nulls; that reads clearer here than zip/enumerate gymnastics.
+#[allow(clippy::needless_range_loop)]
 fn encode_column(array: &ArrayRef) -> DFResult<Vec<[u8; KEY_BYTES_PER_COL]>> {
     let n = array.len();
     let mut out = vec![[0u8; KEY_BYTES_PER_COL]; n];
