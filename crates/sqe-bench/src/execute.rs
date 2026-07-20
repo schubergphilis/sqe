@@ -20,20 +20,6 @@ pub struct QueryRun {
     pub timed_out_after: Option<u64>,
 }
 
-/// Connection/transport-level failure, as opposed to a query-level error.
-/// These are safe to retry once: the query never reached execution, or the
-/// stream died for reasons unrelated to the SQL.
-// TODO(SP1 Task 5): dedup with comparison::is_transport_error
-fn is_transport_error(msg: &str) -> bool {
-    let m = msg.to_ascii_lowercase();
-    m.contains("h2 protocol error")
-        || m.contains("transport error")
-        || m.contains("connection reset")
-        || m.contains("connection refused")
-        || m.contains("broken pipe")
-        || m.contains("goaway")
-}
-
 /// Resolve the effective per-query timeout (seconds), highest priority first:
 ///   1. `BENCH_QUERY_TIMEOUT_SECS` env var: overrides everything, including
 ///      `query_timeout_secs` (e.g. the `-- timeout: Ns` header value).
@@ -57,7 +43,12 @@ pub fn resolve_timeout(query_timeout_secs: u64) -> u64 {
 /// lazily). Query-level errors (plan, execution) are not retried. Never
 /// panics -- all failure modes are reported via `QueryRun.result`.
 #[allow(dead_code)]
-pub async fn run_query(client: &dyn BenchClient, id: &str, sql: &str, timeout_secs: u64) -> QueryRun {
+pub async fn run_query(
+    client: &dyn BenchClient,
+    id: &str,
+    sql: &str,
+    timeout_secs: u64,
+) -> QueryRun {
     let start = std::time::Instant::now();
 
     // Use tokio::select! so the timeout fires even if the gRPC stream is
@@ -69,7 +60,7 @@ pub async fn run_query(client: &dyn BenchClient, id: &str, sql: &str, timeout_se
             if result
                 .as_ref()
                 .err()
-                .is_some_and(|e| is_transport_error(&e.to_string()))
+                .is_some_and(|e| crate::comparison::classify::is_transport_error(&e.to_string()))
             {
                 eprintln!(
                     "[bench] {id} transport error ({}), retrying once on a fresh connection",
@@ -139,7 +130,16 @@ mod tests {
 
     #[tokio::test]
     async fn timeout_yields_timed_out_after() {
-        let run = run_query(&Stub { delay_ms: 10_000, err: None }, "q", "SELECT 1", 1).await;
+        let run = run_query(
+            &Stub {
+                delay_ms: 10_000,
+                err: None,
+            },
+            "q",
+            "SELECT 1",
+            1,
+        )
+        .await;
         assert_eq!(run.timed_out_after, Some(1));
         assert!(run.result.is_err());
     }
