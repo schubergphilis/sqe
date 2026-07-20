@@ -1,6 +1,7 @@
 mod cli;
 mod client;
 mod comparison;
+mod execute;
 mod generate;
 mod load;
 mod profile;
