@@ -1,6 +1,6 @@
 use crate::client::BenchClient;
-use crate::compare::{compare_results, CompareStatus};
 use crate::query::{load_query_files, normalize_query_id, prefix_tables};
+use crate::status::{compare_results, load_expected, CompareStatus};
 
 // ---------------------------------------------------------------------------
 // Data types
@@ -194,22 +194,5 @@ pub async fn run_and_report(
     let path = crate::report::write_json_report(benchmark, scale, "flight", &results)?;
     println!("Report written to: {path}");
     Ok(results)
-}
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/// Try to load the expected results CSV for a query.
-///
-/// Returns `Ok(None)` when the file does not exist (query runs without
-/// validation), `Ok(Some(content))` when found, and `Err` for I/O errors.
-fn load_expected(benchmark: &str, scale: f64, query_id: &str) -> anyhow::Result<Option<String>> {
-    let path = format!("benchmarks/expected/{benchmark}/sf{scale}/{query_id}.csv");
-    match std::fs::read_to_string(&path) {
-        Ok(content) => Ok(Some(content)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e.into()),
-    }
 }
 

@@ -1,6 +1,5 @@
 mod cli;
 mod client;
-mod compare;
 mod comparison;
 mod generate;
 mod load;
@@ -24,6 +23,7 @@ pub fn bench_namespace(benchmark: &str, scale: f64) -> String {
 mod query;
 mod report;
 mod run;
+mod status;
 mod test;
 
 use clap::Parser;
