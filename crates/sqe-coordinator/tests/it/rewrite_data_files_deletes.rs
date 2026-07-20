@@ -53,6 +53,21 @@ async fn count_rows(
         .value(0)
 }
 
+/// Read a single Int64 scalar (first row, first column) from `sql`.
+async fn scalar_i64(
+    handler: &sqe_coordinator::QueryHandler,
+    session: &sqe_core::Session,
+    sql: &str,
+) -> i64 {
+    let b = exec(handler, session, sql).await;
+    b[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("Int64Array")
+        .value(0)
+}
+
 /// Live data-file count via SQE's `table_files` TVF (one row per live data
 /// file). Used to prove the rewrite consolidated rather than skipped.
 async fn live_data_file_count(
@@ -187,6 +202,85 @@ async fn rewrite_preserves_deletes() {
         count_rows(&handler, &session, &table).await,
         15,
         "rewrite_data_files must not resurrect deleted rows"
+    );
+    let after_files = live_data_file_count(&handler, &session, namespace, table_name).await;
+    assert!(
+        after_files < before_files,
+        "rewrite must consolidate: {before_files} -> {after_files}"
+    );
+
+    let _ = exec(&handler, &session, &format!("DROP TABLE IF EXISTS {table}")).await;
+}
+
+/// Equality-delete path (the one the sequence-number pin exists for). A MoR
+/// UPDATE produces an equality delete plus a new data file; the rewrite must
+/// apply the equality delete (drop the stale row), keep the updated row, and
+/// consolidate. The seq pin keeps the compacted output above the equality
+/// delete so it is not re-applied to the fresh value.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs docker-compose.test.yml + Polaris"]
+async fn rewrite_applies_equality_deletes() {
+    let (session, handler) = crate::common::setup_handler().await;
+    let namespace = "default";
+    let table_name = "rewrite_eq_delete";
+    let table = format!("{namespace}.{table_name}");
+
+    let _ = exec(&handler, &session, &format!("DROP TABLE IF EXISTS {table}")).await;
+    // MoR UPDATE needs a primary key (identifier_field_ids) to build the
+    // equality delete; without it the dispatcher falls back to copy-on-write.
+    exec(
+        &handler,
+        &session,
+        &format!(
+            "CREATE TABLE {table} (id BIGINT, v BIGINT) WITH (identifier_field_ids = 'id', \
+             'write.update.mode' = 'merge-on-read')"
+        ),
+    )
+    .await;
+    // One data file per INSERT.
+    for i in 0..8i64 {
+        exec(&handler, &session, &format!("INSERT INTO {table} VALUES ({i}, {})", i * 10)).await;
+    }
+    // MoR UPDATE: equality delete on id=5 + a new data file (id=5, v=99).
+    exec(&handler, &session, &format!("UPDATE {table} SET v = 99 WHERE id = 5")).await;
+    assert_eq!(count_rows(&handler, &session, &table).await, 8);
+    assert_eq!(
+        scalar_i64(&handler, &session, &format!("SELECT v FROM {table} WHERE id = 5")).await,
+        99,
+        "setup: UPDATE must take effect through the equality delete"
+    );
+
+    let before_files = live_data_file_count(&handler, &session, namespace, table_name).await;
+
+    let summary = exec(
+        &handler,
+        &session,
+        // min_input_files => 2 so the group is eligible regardless of file count.
+        &format!("CALL system.rewrite_data_files(table => '{table}', min_input_files => 2)"),
+    )
+    .await;
+    assert!(
+        !status_of(&summary).contains("skipped"),
+        "equality-delete rewrite must run, got '{}'",
+        status_of(&summary)
+    );
+
+    // Correctness: the stale (id=5, v=50) row stays gone, the updated value
+    // survives, and no rows were lost or resurrected.
+    assert_eq!(
+        count_rows(&handler, &session, &table).await,
+        8,
+        "row count must be preserved after compaction"
+    );
+    assert_eq!(
+        scalar_i64(&handler, &session, &format!("SELECT v FROM {table} WHERE id = 5")).await,
+        99,
+        "equality delete must be applied: updated value must survive, stale value must not return"
+    );
+    assert_eq!(
+        scalar_i64(&handler, &session, &format!("SELECT COUNT(*) FROM {table} WHERE v = 50")).await,
+        0,
+        "the pre-update value must not be resurrected"
     );
     let after_files = live_data_file_count(&handler, &session, namespace, table_name).await;
     assert!(

@@ -1748,7 +1748,7 @@ async fn sort_group_stream(
             // Project a Morton z-value, sort on it, then drop it so the written
             // schema matches the table. Iceberg's SortOrder cannot express
             // z-order, so no sort-order metadata is stamped (matches Spark).
-            let zargs = cols.iter().map(|c| col(c)).collect::<Vec<_>>();
+            let zargs = cols.iter().map(|c| col(c.as_str())).collect::<Vec<_>>();
             let zexpr = crate::zorder::zorder_udf().call(zargs).alias("__sqe_zvalue");
             let passthrough = schema
                 .fields()
