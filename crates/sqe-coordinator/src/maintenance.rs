@@ -50,6 +50,9 @@ pub struct MaintenanceHandler {
     audit: Option<Arc<sqe_metrics::audit::AuditLogger>>,
     table_cache: Option<TableMetadataCache>,
     query_history: Option<QueryHistoryFn>,
+    /// Shared DataFusion runtime (FairSpillPool + DiskManager) used by the
+    /// sort-compaction path so a large sort spills to disk instead of OOMing.
+    runtime: Option<Arc<datafusion::execution::runtime_env::RuntimeEnv>>,
 }
 
 impl MaintenanceHandler {
@@ -59,7 +62,18 @@ impl MaintenanceHandler {
             audit: None,
             table_cache: None,
             query_history: None,
+            runtime: None,
         }
+    }
+
+    /// Attach the shared coordinator runtime for spillable sort compaction.
+    #[must_use = "with_runtime consumes self; bind the returned handler"]
+    pub fn with_runtime(
+        mut self,
+        runtime: Arc<datafusion::execution::runtime_env::RuntimeEnv>,
+    ) -> Self {
+        self.runtime = Some(runtime);
+        self
     }
 
     #[must_use = "with_audit consumes self; bind the returned handler"]
@@ -100,6 +114,8 @@ impl MaintenanceHandler {
                 target_file_size_bytes,
                 min_input_files,
                 max_concurrent_file_group_rewrites,
+                strategy,
+                sort_order,
             } => {
                 self.rewrite_data_files(
                     session,
@@ -107,6 +123,8 @@ impl MaintenanceHandler {
                     *target_file_size_bytes,
                     *min_input_files,
                     *max_concurrent_file_group_rewrites,
+                    strategy.clone(),
+                    sort_order.clone(),
                 )
                 .await
             }
@@ -502,6 +520,7 @@ impl MaintenanceHandler {
     /// current snapshot: retrying with a stale pin would reopen the
     /// concurrent-equality-delete correctness hole. A failed attempt's orphaned
     /// output files are cleaned up by that attempt's `WriteCleanupGuard` on drop.
+    #[allow(clippy::too_many_arguments)]
     async fn rewrite_data_files(
         &self,
         session: &Session,
@@ -509,6 +528,8 @@ impl MaintenanceHandler {
         target_file_size_bytes: Option<u64>,
         min_input_files: Option<usize>,
         max_concurrent_file_group_rewrites: Option<usize>,
+        strategy: Option<String>,
+        sort_order: Option<String>,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         const MAX_COMMIT_ATTEMPTS: usize = 4;
         let mut attempt: usize = 0;
@@ -521,6 +542,8 @@ impl MaintenanceHandler {
                     target_file_size_bytes,
                     min_input_files,
                     max_concurrent_file_group_rewrites,
+                    strategy.clone(),
+                    sort_order.clone(),
                 )
                 .await
             {
@@ -556,6 +579,8 @@ impl MaintenanceHandler {
         target_file_size_bytes: Option<u64>,
         min_input_files: Option<usize>,
         max_concurrent_file_group_rewrites: Option<usize>,
+        strategy: Option<String>,
+        sort_order: Option<String>,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         const DEFAULT_TARGET_FILE_SIZE_BYTES: u64 = 512 * 1024 * 1024;
         const DEFAULT_MIN_INPUT_FILES: usize = 5;
@@ -588,6 +613,31 @@ impl MaintenanceHandler {
             .unwrap_or(0);
         let read_plan = plan_delete_aware_read(&table).await?;
         let live_deletes = collect_live_delete_files(&table).await?;
+
+        // Resolve the sort strategy against the table schema (None = bin-pack).
+        // Sort compaction needs the shared spillable runtime; refuse rather than
+        // risk the known sort-on-write OOM if it was not wired in.
+        let arrow_schema: arrow_schema::SchemaRef = Arc::new(
+            iceberg::arrow::schema_to_arrow_schema(table.metadata().current_schema().as_ref())
+                .map_err(|e| {
+                    SqeError::Execution(format!("compaction schema conversion failed: {e}"))
+                })?,
+        );
+        let sort_spec =
+            parse_sort_spec(strategy.as_deref(), sort_order.as_deref(), &arrow_schema)?;
+        let sort_ctx: Option<Arc<SortCtx>> = match sort_spec {
+            None => None,
+            Some(spec) => {
+                let runtime = self.runtime.clone().ok_or_else(|| {
+                    SqeError::Execution(
+                        "rewrite_data_files: sort strategy requires the shared runtime; \
+                         not available in this handler"
+                            .into(),
+                    )
+                })?;
+                Some(Arc::new(SortCtx { runtime, spec }))
+            }
+        };
 
         let old_data_files = collect_live_data_files(&table).await?;
         let input_count = old_data_files.len();
@@ -687,11 +737,15 @@ impl MaintenanceHandler {
                     let tracker_for_group = tracker.clone();
                     let plan_for_group = read_plan_arc.clone();
                     let deletes_for_group = live_deletes_arc.clone();
+                    let schema_for_group = arrow_schema.clone();
+                    let sort_for_group = sort_ctx.clone();
                     async move {
                         rewrite_group(
                             &table_for_group,
                             &plan_for_group,
                             &deletes_for_group,
+                            &schema_for_group,
+                            sort_for_group.as_deref(),
                             group,
                             compression,
                             tracker_for_group,
@@ -1497,6 +1551,225 @@ fn covered_position_deletes(
         .collect()
 }
 
+/// How the rows in each rewritten group should be ordered before they are
+/// written back. `Columns` is a plain lexicographic sort; `ZOrder` clusters on
+/// a space-filling (Morton) curve for multi-dimensional locality.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SortSpec {
+    /// (column, ascending) pairs, applied in order.
+    Columns(Vec<(String, bool)>),
+    /// Z-order clustering across these columns.
+    ZOrder(Vec<String>),
+}
+
+impl SortSpec {
+    fn columns(&self) -> Vec<&str> {
+        match self {
+            SortSpec::Columns(c) => c.iter().map(|(n, _)| n.as_str()).collect(),
+            SortSpec::ZOrder(c) => c.iter().map(|n| n.as_str()).collect(),
+        }
+    }
+}
+
+/// Resolve the `strategy` / `sort_order` procedure args into a `SortSpec`,
+/// validated against the table schema. Returns `None` for the default bin-pack
+/// path (no sort). Validation lives here (not the parser) because it needs the
+/// schema. Mirrors Spark's `rewrite_data_files(strategy, sort_order)`.
+fn parse_sort_spec(
+    strategy: Option<&str>,
+    sort_order: Option<&str>,
+    schema: &arrow_schema::Schema,
+) -> sqe_core::Result<Option<SortSpec>> {
+    let strat = strategy.map(|s| s.trim().to_ascii_lowercase());
+    match strat.as_deref() {
+        Some(s) if s != "sort" && s != "binpack" => {
+            return Err(SqeError::Execution(format!(
+                "rewrite_data_files: unknown strategy '{s}'; expected 'binpack' or 'sort'"
+            )));
+        }
+        _ => {}
+    }
+    // A sort is requested when strategy is 'sort', or when only sort_order is
+    // given (strategy omitted). 'binpack' with a sort_order ignores the order.
+    let sort_requested = matches!(strat.as_deref(), Some("sort"))
+        || (strat.is_none() && sort_order.is_some());
+    if !sort_requested {
+        return Ok(None);
+    }
+
+    let order = sort_order
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            SqeError::Execution(
+                "rewrite_data_files: strategy => 'sort' requires a non-empty sort_order".into(),
+            )
+        })?;
+
+    let lower = order.to_ascii_lowercase();
+    let spec = if lower.starts_with("zorder(") && order.ends_with(')') {
+        let inner = &order[order.find('(').unwrap() + 1..order.len() - 1];
+        let cols: Vec<String> = inner
+            .split(',')
+            .map(|c| c.trim().to_string())
+            .filter(|c| !c.is_empty())
+            .collect();
+        if cols.is_empty() {
+            return Err(SqeError::Execution(
+                "rewrite_data_files: zorder(...) needs at least one column".into(),
+            ));
+        }
+        SortSpec::ZOrder(cols)
+    } else {
+        let mut cols: Vec<(String, bool)> = Vec::new();
+        for part in order.split(',') {
+            let toks: Vec<&str> = part.split_whitespace().collect();
+            if toks.is_empty() {
+                continue;
+            }
+            let asc = match toks.get(1).map(|s| s.to_ascii_uppercase()).as_deref() {
+                None | Some("ASC") => true,
+                Some("DESC") => false,
+                Some(other) => {
+                    return Err(SqeError::Execution(format!(
+                        "rewrite_data_files: invalid sort direction '{other}'; expected ASC or DESC"
+                    )));
+                }
+            };
+            cols.push((toks[0].to_string(), asc));
+        }
+        if cols.is_empty() {
+            return Err(SqeError::Execution(
+                "rewrite_data_files: sort_order is empty".into(),
+            ));
+        }
+        SortSpec::Columns(cols)
+    };
+
+    for name in spec.columns() {
+        if schema.field_with_name(name).is_err() {
+            return Err(SqeError::Execution(format!(
+                "rewrite_data_files: sort_order column '{name}' not found in table schema"
+            )));
+        }
+    }
+    Ok(Some(spec))
+}
+
+/// Everything the sort-compaction path needs beyond the bin-pack path: the
+/// shared spillable runtime and the resolved sort specification.
+struct SortCtx {
+    runtime: Arc<datafusion::execution::runtime_env::RuntimeEnv>,
+    spec: SortSpec,
+}
+
+/// A DataFusion `PartitionStream` that hands out a pre-built record-batch stream
+/// exactly once. Lets us feed the delete-applying compaction read into a
+/// `SortExec` (via a `StreamingTable`) so the sort spills to disk instead of
+/// buffering the whole group in memory.
+struct OneShotStream {
+    schema: arrow_schema::SchemaRef,
+    inner: std::sync::Mutex<Option<datafusion::execution::SendableRecordBatchStream>>,
+}
+
+impl std::fmt::Debug for OneShotStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OneShotStream")
+            .field("schema", &self.schema)
+            .finish_non_exhaustive()
+    }
+}
+
+impl datafusion::physical_plan::streaming::PartitionStream for OneShotStream {
+    fn schema(&self) -> &arrow_schema::SchemaRef {
+        &self.schema
+    }
+    fn execute(
+        &self,
+        _ctx: Arc<datafusion::execution::TaskContext>,
+    ) -> datafusion::execution::SendableRecordBatchStream {
+        match self.inner.lock().expect("OneShotStream poisoned").take() {
+            Some(s) => s,
+            None => Box::pin(datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
+                self.schema.clone(),
+                futures::stream::once(async {
+                    Err(datafusion::error::DataFusionError::Execution(
+                        "compaction sort source polled more than once".into(),
+                    ))
+                }),
+            )),
+        }
+    }
+}
+
+/// Sort a group's (delete-applied) record-batch stream on the shared spillable
+/// runtime, returning the sorted stream. Builds a single-partition
+/// `StreamingTable` over `input`, applies the sort (or z-order projection),
+/// and returns `df.execute_stream()`. DataFusion inserts a spillable `SortExec`
+/// because the session runs on the coordinator's FairSpillPool + DiskManager.
+async fn sort_group_stream(
+    ctx: &SortCtx,
+    input: datafusion::execution::SendableRecordBatchStream,
+    schema: arrow_schema::SchemaRef,
+) -> sqe_core::Result<datafusion::execution::SendableRecordBatchStream> {
+    use datafusion::prelude::{col, SessionConfig, SessionContext};
+
+    let session = SessionContext::new_with_config_rt(SessionConfig::new(), ctx.runtime.clone());
+    session.register_udf(crate::zorder::zorder_udf());
+
+    let provider = datafusion::catalog::streaming::StreamingTable::try_new(
+        schema.clone(),
+        vec![Arc::new(OneShotStream {
+            schema: schema.clone(),
+            inner: std::sync::Mutex::new(Some(input)),
+        })],
+    )
+    .map_err(|e| SqeError::Execution(format!("compaction sort: build source failed: {e}")))?;
+
+    const SRC: &str = "__sqe_compact_src";
+    session
+        .register_table(SRC, Arc::new(provider))
+        .map_err(|e| SqeError::Execution(format!("compaction sort: register source failed: {e}")))?;
+    let df = session
+        .table(SRC)
+        .await
+        .map_err(|e| SqeError::Execution(format!("compaction sort: read source failed: {e}")))?;
+
+    let sorted = match &ctx.spec {
+        SortSpec::Columns(cols) => {
+            let exprs = cols
+                .iter()
+                .map(|(name, asc)| col(name).sort(*asc, !*asc))
+                .collect::<Vec<_>>();
+            df.sort(exprs)
+                .map_err(|e| SqeError::Execution(format!("compaction sort failed: {e}")))?
+        }
+        SortSpec::ZOrder(cols) => {
+            // Project a Morton z-value, sort on it, then drop it so the written
+            // schema matches the table. Iceberg's SortOrder cannot express
+            // z-order, so no sort-order metadata is stamped (matches Spark).
+            let zargs = cols.iter().map(|c| col(c)).collect::<Vec<_>>();
+            let zexpr = crate::zorder::zorder_udf().call(zargs).alias("__sqe_zvalue");
+            let passthrough = schema
+                .fields()
+                .iter()
+                .map(|f| col(f.name()))
+                .collect::<Vec<_>>();
+            let mut projected = passthrough.clone();
+            projected.push(zexpr);
+            df.select(projected)
+                .and_then(|d| d.sort(vec![col("__sqe_zvalue").sort(true, false)]))
+                .and_then(|d| d.select(passthrough))
+                .map_err(|e| SqeError::Execution(format!("compaction z-order sort failed: {e}")))?
+        }
+    };
+
+    sorted
+        .execute_stream()
+        .await
+        .map_err(|e| SqeError::Execution(format!("compaction sort execution failed: {e}")))
+}
+
 /// Collect the live data files of the current snapshot. Mirrors the helper
 /// in `WriteHandler` but does not need access to the compression config, so
 /// it stays in this module.
@@ -1631,10 +1904,13 @@ fn pack_file_groups_partition_aware(files: &[DataFile], target_bytes: u64) -> Ve
 /// `referenced_data_file`) any mismatch aborts before commit, and when it is not
 /// (equality deletes) the caller enforces the looser "cannot manufacture rows"
 /// bound.
+#[allow(clippy::too_many_arguments)]
 async fn rewrite_group(
     table: &IcebergTable,
     plan: &DeleteAwareReadPlan,
     live_deletes: &[DataFile],
+    arrow_schema: &arrow_schema::SchemaRef,
+    sort_ctx: Option<&SortCtx>,
     group: Vec<DataFile>,
     compression: parquet::basic::Compression,
     tracker: crate::writer::UploadedPaths,
@@ -1676,22 +1952,27 @@ async fn rewrite_group(
         .map_err(|e| {
             SqeError::Execution(format!("delete-aware compaction read failed: {e}"))
         })?;
-    let arrow_schema = Arc::new(
-        iceberg::arrow::schema_to_arrow_schema(table.metadata().current_schema().as_ref())
-            .map_err(|e| {
-                SqeError::Execution(format!("compaction schema conversion failed: {e}"))
-            })?,
-    );
     let df_stream = scan_result.stream().map(|item| {
         item.map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))
     });
     let sendable: datafusion::execution::SendableRecordBatchStream = Box::pin(
-        datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(arrow_schema, df_stream),
+        datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
+            arrow_schema.clone(),
+            df_stream,
+        ),
     );
+
+    // Sort strategy: route the delete-applied stream through a spillable
+    // DataFusion sort (or z-order clustering) before writing. Bin-pack writes
+    // the stream directly.
+    let writer_input = match sort_ctx {
+        Some(ctx) => sort_group_stream(ctx, sendable, arrow_schema.clone()).await?,
+        None => sendable,
+    };
 
     let (new_files, rows_written) = write_data_files_streaming(
         table,
-        sendable,
+        writer_input,
         "rewrite",
         compression,
         tracker,

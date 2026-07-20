@@ -215,6 +215,9 @@ impl QueryHandler {
         // and optional spill-to-disk. This is built once and shared across all queries.
         let runtime = crate::runtime::build_coordinator_runtime(&config.coordinator, &config.storage)
             .map_err(|e| sqe_core::SqeError::Config(format!("Failed to build runtime: {e}")))?;
+        // Share the runtime (FairSpillPool + DiskManager) with the maintenance
+        // handler so sort-compaction can spill instead of OOMing.
+        maintenance_handler = maintenance_handler.with_runtime(Arc::clone(&runtime));
 
         let per_user_memory_budget_bytes = if config.query.per_user_memory_budget == "0" {
             0
