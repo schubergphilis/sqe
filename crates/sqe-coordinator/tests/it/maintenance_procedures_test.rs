@@ -61,6 +61,36 @@ fn rewrite_manifests_classifies_as_procedure() {
 }
 
 #[test]
+fn rollback_to_snapshot_classifies_with_snapshot_id() {
+    let result = parse_and_classify(
+        "CALL system.rollback_to_snapshot(table => 'ns.t', snapshot_id => 42)",
+    )
+    .expect("parse ok");
+    match result {
+        StatementKind::Procedure(p) => assert!(
+            matches!(*p, ProcedureCall::RollbackToSnapshot { snapshot_id: 42, .. }),
+            "expected RollbackToSnapshot{{42}}, got {p:?}"
+        ),
+        other => panic!("expected Procedure, got {other:?}"),
+    }
+}
+
+#[test]
+fn set_current_snapshot_classifies_with_snapshot_id() {
+    let result = parse_and_classify(
+        "CALL system.set_current_snapshot(table => 'ns.t', snapshot_id => 42)",
+    )
+    .expect("parse ok");
+    match result {
+        StatementKind::Procedure(p) => assert!(
+            matches!(*p, ProcedureCall::SetCurrentSnapshot { snapshot_id: 42, .. }),
+            "expected SetCurrentSnapshot{{42}}, got {p:?}"
+        ),
+        other => panic!("expected Procedure, got {other:?}"),
+    }
+}
+
+#[test]
 fn unknown_procedure_falls_through_to_call_error() {
     let result = parse_and_classify("CALL system.not_a_real_procedure(table => 'ns.t')")
         .expect("parse ok");
@@ -418,4 +448,193 @@ async fn read_only_user_rejected_with_audit() {
         msg.contains("Access denied") || msg.contains("write privilege"),
         "expected denial message, got: {msg}"
     );
+}
+
+/// (snapshot_id, parent_id) rows from the `table_snapshots` metadata TVF.
+fn snapshot_rows(
+    batches: &[datafusion::arrow::record_batch::RecordBatch],
+) -> Vec<(i64, Option<i64>)> {
+    use arrow_array::{Array, Int64Array};
+    let mut out = Vec::new();
+    for b in batches {
+        let sid = b
+            .column_by_name("snapshot_id")
+            .expect("snapshot_id column")
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("snapshot_id Int64");
+        let pid = b
+            .column_by_name("parent_id")
+            .expect("parent_id column")
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("parent_id Int64");
+        for i in 0..b.num_rows() {
+            let parent = if pid.is_null(i) { None } else { Some(pid.value(i)) };
+            out.push((sid.value(i), parent));
+        }
+    }
+    out
+}
+
+/// rollback_to_snapshot moves the current pointer back so SELECTs read the
+/// earlier state. This is the load-bearing test: it asserts the READ path
+/// (COUNT after rollback), not just that the commit returned a summary.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn rollback_to_snapshot_reverts_data() {
+    let (session, handler) = crate::common::setup_handler().await;
+    let table = "default.maint_rollback_test";
+    let name = "maint_rollback_test";
+
+    let _ = handler
+        .execute(&session, &format!("DROP TABLE IF EXISTS {table}"), None)
+        .await;
+    handler
+        .execute(&session, &format!("CREATE TABLE {table} (id BIGINT)"), None)
+        .await
+        .expect("CREATE");
+    handler
+        .execute(&session, &format!("INSERT INTO {table} VALUES (1)"), None)
+        .await
+        .expect("INSERT 1"); // snapshot S1, count=1
+    handler
+        .execute(&session, &format!("INSERT INTO {table} VALUES (2)"), None)
+        .await
+        .expect("INSERT 2"); // snapshot S2, count=2
+
+    // Confirm we're at 2 rows before the rollback.
+    let pre = handler
+        .execute(&session, &format!("SELECT COUNT(*) FROM {table}"), None)
+        .await
+        .expect("count pre");
+    assert_eq!(extract_count(&pre), 2, "expected 2 rows before rollback");
+
+    // S1 = the root snapshot (NULL parent).
+    let rows = snapshot_rows(
+        &handler
+            .execute(
+                &session,
+                &format!("SELECT snapshot_id, parent_id FROM table_snapshots('default', '{name}')"),
+                None,
+            )
+            .await
+            .expect("table_snapshots"),
+    );
+    assert_eq!(rows.len(), 2, "expected two snapshots, got {rows:?}");
+    let s1 = rows.iter().find(|(_, p)| p.is_none()).expect("root snapshot").0;
+
+    let summary = handler
+        .execute(
+            &session,
+            &format!("CALL system.rollback_to_snapshot(table => '{table}', snapshot_id => {s1})"),
+            None,
+        )
+        .await
+        .expect("rollback_to_snapshot");
+    assert!(!summary.is_empty(), "rollback should return a summary batch");
+
+    // The load-bearing assertion: SELECT now reads the S1 state (1 row).
+    let post = handler
+        .execute(&session, &format!("SELECT COUNT(*) FROM {table}"), None)
+        .await
+        .expect("count post");
+    assert_eq!(
+        extract_count(&post),
+        1,
+        "rollback_to_snapshot must revert the visible row count to the target snapshot"
+    );
+
+    let _ = handler
+        .execute(&session, &format!("DROP TABLE IF EXISTS {table}"), None)
+        .await;
+}
+
+/// The ONLY behavioral difference between the two procedures: rollback
+/// requires the target to be an ancestor of the current snapshot;
+/// set_current_snapshot does not. After rolling back to S1, S2 is a
+/// descendant (not an ancestor), so rollback_to_snapshot(S2) must be rejected
+/// while set_current_snapshot(S2) succeeds and moves forward.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn rollback_rejects_non_ancestor_but_set_current_allows() {
+    let (session, handler) = crate::common::setup_handler().await;
+    let table = "default.maint_ancestry_test";
+    let name = "maint_ancestry_test";
+
+    let _ = handler
+        .execute(&session, &format!("DROP TABLE IF EXISTS {table}"), None)
+        .await;
+    handler
+        .execute(&session, &format!("CREATE TABLE {table} (id BIGINT)"), None)
+        .await
+        .expect("CREATE");
+    handler
+        .execute(&session, &format!("INSERT INTO {table} VALUES (1)"), None)
+        .await
+        .expect("INSERT 1");
+    handler
+        .execute(&session, &format!("INSERT INTO {table} VALUES (2)"), None)
+        .await
+        .expect("INSERT 2");
+
+    let rows = snapshot_rows(
+        &handler
+            .execute(
+                &session,
+                &format!("SELECT snapshot_id, parent_id FROM table_snapshots('default', '{name}')"),
+                None,
+            )
+            .await
+            .expect("table_snapshots"),
+    );
+    let s1 = rows.iter().find(|(_, p)| p.is_none()).expect("root").0;
+    let s2 = rows.iter().find(|(_, p)| p.is_some()).expect("child").0;
+
+    // Roll back to S1: current snapshot is now S1, S2 is a descendant.
+    handler
+        .execute(
+            &session,
+            &format!("CALL system.rollback_to_snapshot(table => '{table}', snapshot_id => {s1})"),
+            None,
+        )
+        .await
+        .expect("rollback to S1");
+
+    // rollback_to_snapshot(S2) must be REJECTED (S2 is not an ancestor of S1).
+    let err = handler
+        .execute(
+            &session,
+            &format!("CALL system.rollback_to_snapshot(table => '{table}', snapshot_id => {s2})"),
+            None,
+        )
+        .await
+        .expect_err("rollback to a non-ancestor must fail");
+    assert!(
+        err.to_string().contains("not an ancestor"),
+        "expected an ancestry error, got: {err}"
+    );
+
+    // set_current_snapshot(S2) must SUCCEED (arbitrary move, forward is fine).
+    handler
+        .execute(
+            &session,
+            &format!("CALL system.set_current_snapshot(table => '{table}', snapshot_id => {s2})"),
+            None,
+        )
+        .await
+        .expect("set_current_snapshot to S2");
+    let post = handler
+        .execute(&session, &format!("SELECT COUNT(*) FROM {table}"), None)
+        .await
+        .expect("count after set_current");
+    assert_eq!(
+        extract_count(&post),
+        2,
+        "set_current_snapshot must move the pointer forward to S2 (2 rows)"
+    );
+
+    let _ = handler
+        .execute(&session, &format!("DROP TABLE IF EXISTS {table}"), None)
+        .await;
 }
