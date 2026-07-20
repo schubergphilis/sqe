@@ -10,7 +10,7 @@ Source: `crates/sqe-sql/src/procedures.rs`. Handlers in `crates/sqe-coordinator/
 
 | Procedure | Origin | Required args | Optional args | Notes |
 |---|---|---|---|---|
-| `system.rewrite_data_files` | `sqe-sql` + `sqe-coordinator` | `table => 'ns.t'` | `target_file_size_bytes => N`, `min_input_files => N`, `max_concurrent_file_group_rewrites => N` | Bin-packs small data files into larger ones. Default target 512 MiB, min 5 files per group, max 4 concurrent groups. |
+| `system.rewrite_data_files` | `sqe-sql` + `sqe-coordinator` | `table => 'ns.t'` | `target_file_size_bytes => N`, `min_input_files => N`, `max_concurrent_file_group_rewrites => N`, `strategy => 'binpack'\|'sort'`, `sort_order => 'col ASC, ...'\|'zorder(a, b)'` | Compacts small data files (delete-aware). Default target 512 MiB, min 5 files per group, max 4 concurrent groups. `strategy => 'sort'` orders each group's rows by `sort_order` (a column list or `zorder(...)`) via a spillable DataFusion sort before writing. |
 | `system.expire_snapshots` | `sqe-sql` + `sqe-coordinator` | `table => 'ns.t'` | `older_than => TIMESTAMP`, `retain_last => N` | Drops old snapshots. `older_than` and `retain_last` combine: a snapshot must be older than `older_than` and beyond the `retain_last` window before it is removed. |
 | `system.remove_orphan_files` | `sqe-sql` + `sqe-coordinator` | `table => 'ns.t'` | `older_than => TIMESTAMP` | Deletes files under the table prefix not referenced by any live snapshot. Default `older_than` is 3 days ago, to avoid racing with in-flight writes. |
 | `system.rewrite_manifests` | `sqe-sql` + `sqe-coordinator` | `table => 'ns.t'` | - | Consolidates many small manifest files into fewer larger ones. Speeds up planning on large tables. |
@@ -49,6 +49,34 @@ Returns one summary row:
 | 142                  | 39283744832          | 8472810294831234567  |
 +----------------------+----------------------+----------------------+
 ```
+
+### Sort-compact for read pruning
+
+Load fast (unsorted), then compact into sorted files once. Each file group's
+rows are ordered by `sort_order` through a spillable DataFusion sort, so the
+rewrite stays memory-bounded even when a group is larger than RAM.
+
+```sql
+-- Lexicographic sort on one or more columns.
+CALL system.rewrite_data_files(
+    table => 'analytics.events',
+    strategy => 'sort',
+    sort_order => 'event_date ASC, user_id ASC'
+);
+
+-- Z-order clustering for multi-dimensional locality.
+CALL system.rewrite_data_files(
+    table => 'analytics.events',
+    strategy => 'sort',
+    sort_order => 'zorder(user_id, device_id)'
+);
+```
+
+Sorted files give the reader tight min/max stats per file, so predicate
+pruning skips more files. Z-order clusters several columns at once, which helps
+when queries filter on different subsets of those columns. Iceberg's sort-order
+metadata cannot express z-order, so none is stamped for the z-order case
+(matches Spark).
 
 ### Drop snapshots older than 30 days, keeping the last 10
 
