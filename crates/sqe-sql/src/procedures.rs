@@ -45,6 +45,14 @@ pub enum ProcedureCall {
         min_input_files: Option<usize>,
         /// Maximum concurrent rewrite groups. Default is 4.
         max_concurrent_file_group_rewrites: Option<usize>,
+        /// Rewrite strategy: `binpack` (default) or `sort`. Validated in the
+        /// handler where the table schema is available.
+        strategy: Option<String>,
+        /// Sort specification when `strategy => 'sort'`. Either a comma-
+        /// separated column list (`'col ASC, col2 DESC'`) or a z-order
+        /// clustering spec (`'zorder(a, b)'`). Parsed and validated against the
+        /// table schema in the handler.
+        sort_order: Option<String>,
     },
     /// Drop old snapshots via vendored `RemoveSnapshotAction`.
     ExpireSnapshots {
@@ -704,6 +712,8 @@ fn parse_rewrite_data_files(mut args: Vec<(String, Expr)>) -> sqe_core::Result<P
         "max_concurrent_file_group_rewrites",
         |e| expect_usize(e, "max_concurrent_file_group_rewrites"),
     )?;
+    let strategy = take_option(&mut args, "strategy", |e| expect_string(e, "strategy"))?;
+    let sort_order = take_option(&mut args, "sort_order", |e| expect_string(e, "sort_order"))?;
     expect_no_remaining(&args, "rewrite_data_files")?;
 
     Ok(ProcedureCall::RewriteDataFiles {
@@ -711,6 +721,8 @@ fn parse_rewrite_data_files(mut args: Vec<(String, Expr)>) -> sqe_core::Result<P
         target_file_size_bytes,
         min_input_files,
         max_concurrent_file_group_rewrites,
+        strategy,
+        sort_order,
     })
 }
 
@@ -806,12 +818,36 @@ mod tests {
                 target_file_size_bytes,
                 min_input_files,
                 max_concurrent_file_group_rewrites,
+                strategy,
+                sort_order,
             } => {
                 assert_eq!(table.namespace, "ns");
                 assert_eq!(table.name, "t");
                 assert!(target_file_size_bytes.is_none());
                 assert!(min_input_files.is_none());
                 assert!(max_concurrent_file_group_rewrites.is_none());
+                assert!(strategy.is_none());
+                assert!(sort_order.is_none());
+            }
+            other => panic!("Expected RewriteDataFiles, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_rewrite_data_files_sort_strategy() {
+        let stmt = parse_first(
+            "CALL system.rewrite_data_files(table => 'ns.t', strategy => 'sort', \
+             sort_order => 'a ASC, b DESC')",
+        );
+        let call = try_parse_call(&stmt).unwrap().expect("match");
+        match call {
+            ProcedureCall::RewriteDataFiles {
+                strategy,
+                sort_order,
+                ..
+            } => {
+                assert_eq!(strategy.as_deref(), Some("sort"));
+                assert_eq!(sort_order.as_deref(), Some("a ASC, b DESC"));
             }
             other => panic!("Expected RewriteDataFiles, got {other:?}"),
         }
