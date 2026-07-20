@@ -41,11 +41,9 @@ pub async fn run(args: RunArgs) -> anyhow::Result<()> {
     // bearer_passthrough provider maps it to an admin role for ATTACH) and is
     // forwarded to the golden Polaris/S3. Without it the session is anonymous
     // and ATTACH fails with "No authorization header".
-    let bench_client: Box<dyn client::BenchClient> =
-        Box::new(client::flight::FlightSqlBenchClient::with_token(
-            &endpoint,
-            &args.golden_token,
-        ));
+    let bench_client: Box<dyn client::BenchClient> = Box::new(
+        client::flight::FlightSqlBenchClient::with_token(&endpoint, &args.golden_token),
+    );
 
     // ATTACH the golden catalog coordinator-wide, once, for every suite.
     let attach_sql =
@@ -80,9 +78,16 @@ pub async fn run(args: RunArgs) -> anyhow::Result<()> {
         )
         .await?;
         if results.iter().any(|r| {
+            // Preserves the pre-refactor exit set exactly: the old
+            // `TestStatus::Error` bucket included timeouts (the timeout
+            // site built `TestStatus::Error(...)`), so `Timeout` stays in
+            // this set here. `is_real_failure` excludes `Timeout` -- that's
+            // a deliberate policy change owned by a later task, not this one.
             matches!(
-                r.status,
-                crate::test::TestStatus::Fail(_) | crate::test::TestStatus::Error(_)
+                r.outcome,
+                crate::status::QueryOutcome::WrongRows(_)
+                    | crate::status::QueryOutcome::Error(_)
+                    | crate::status::QueryOutcome::Timeout(_)
             )
         }) {
             any_failure = true;

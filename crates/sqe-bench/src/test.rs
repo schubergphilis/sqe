@@ -1,25 +1,7 @@
 use crate::client::BenchClient;
 use crate::query::{load_query_files, normalize_query_id, prefix_tables};
-use crate::status::{compare_results, load_expected, CompareStatus};
-
-// ---------------------------------------------------------------------------
-// Data types
-// ---------------------------------------------------------------------------
-
-pub struct QueryResult {
-    pub id: String,
-    pub status: TestStatus,
-    pub duration: std::time::Duration,
-    pub rows: usize,
-}
-
-pub enum TestStatus {
-    Pass,
-    Fail(String),
-    Diff(String),
-    Skip(String),
-    Error(String),
-}
+use crate::report::QueryResult;
+use crate::status::{classify_vs_expected, QueryOutcome};
 
 // ---------------------------------------------------------------------------
 // Test runner
@@ -61,7 +43,7 @@ pub async fn run_benchmark_test(
         if !query.requires.is_empty() {
             results.push(QueryResult {
                 id: query.id.clone(),
-                status: TestStatus::Skip(format!("requires: {}", query.requires.join(", "))),
+                outcome: QueryOutcome::Skip(format!("requires: {}", query.requires.join(", "))),
                 duration: std::time::Duration::ZERO,
                 rows: 0,
             });
@@ -122,7 +104,7 @@ pub async fn run_benchmark_test(
             None => {
                 results.push(QueryResult {
                     id: query.id.clone(),
-                    status: TestStatus::Error(format!("Timed out after {timeout_secs}s")),
+                    outcome: QueryOutcome::Timeout(timeout_secs),
                     duration: start.elapsed(),
                     rows: 0,
                 });
@@ -131,7 +113,7 @@ pub async fn run_benchmark_test(
             Some(Err(e)) => {
                 results.push(QueryResult {
                     id: query.id.clone(),
-                    status: TestStatus::Error(e.to_string()),
+                    outcome: QueryOutcome::Error(e.to_string()),
                     duration: start.elapsed(),
                     rows: 0,
                 });
@@ -147,28 +129,20 @@ pub async fn run_benchmark_test(
                 if std::env::var("BENCH_DEBUG").is_ok() && rows < 200 {
                     eprintln!("[bench] {} result ({} rows):", query.id, rows);
                     for batch in &batches {
-                        match arrow::util::pretty::pretty_format_batches(std::slice::from_ref(batch)) {
+                        match arrow::util::pretty::pretty_format_batches(std::slice::from_ref(
+                            batch,
+                        )) {
                             Ok(s) => eprintln!("{}", s),
                             Err(e) => eprintln!("[bench] pretty-format error: {e}"),
                         }
                     }
                 }
 
-                let status = match load_expected(benchmark, scale, &query.id) {
-                    Ok(Some(expected)) => match compare_results(&batches, &expected, 1e-4) {
-                        Ok(CompareStatus::Pass) => TestStatus::Pass,
-                        Ok(CompareStatus::Diff(msg)) => TestStatus::Diff(msg),
-                        Ok(CompareStatus::Fail(msg)) => TestStatus::Fail(msg),
-                        Err(e) => TestStatus::Error(format!("compare error: {e}")),
-                    },
-                    // No expected file — just verify the query executes
-                    Ok(None) => TestStatus::Pass,
-                    Err(e) => TestStatus::Error(format!("failed to load expected: {e}")),
-                };
+                let outcome = classify_vs_expected(benchmark, scale, &query.id, &batches);
 
                 results.push(QueryResult {
                     id: query.id.clone(),
-                    status,
+                    outcome,
                     duration,
                     rows,
                 });
@@ -195,4 +169,3 @@ pub async fn run_and_report(
     println!("Report written to: {path}");
     Ok(results)
 }
-

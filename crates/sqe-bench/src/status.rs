@@ -7,7 +7,8 @@
 //!   2. The richer `QueryOutcome` taxonomy layered on top of it, plus the
 //!      `legacy_bucket`/`is_real_failure` mappings that keep the stable
 //!      `BENCH_SUMMARY` line and JSON schema byte-compatible while letting
-//!      the run loop and exit code treat timeouts/vacuous results distinctly.
+//!      the run loop (`test.rs`) and exit code (`run.rs`) treat
+//!      timeouts/vacuous results distinctly.
 
 use arrow_array::{
     cast::AsArray, Array, Float32Array, Float64Array, RecordBatch,
@@ -301,23 +302,22 @@ pub fn load_expected(benchmark: &str, scale: f64, query_id: &str) -> anyhow::Res
 /// summary and the run's exit code can treat timeouts and vacuous results
 /// distinctly. Mapped back to the legacy buckets by `legacy_bucket` for the
 /// stable `BENCH_SUMMARY` line and JSON schema.
-///
-/// Not yet wired into `run_benchmark_test`'s loop -- that lands in a later
-/// task, hence the `#[allow(dead_code)]` on the public surface below.
 #[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)]
 pub enum QueryOutcome {
     Pass,
     WrongRows(String),
     Error(String),
     Timeout(u64),
+    /// Not yet produced by `classify_vs_expected` -- vacuous-result detection
+    /// (both sides zero rows) lands in a later task. Kept in the taxonomy
+    /// now so `legacy_bucket`/`print_summary`/JSON reporting are ready for it.
+    #[allow(dead_code)]
     Vacuous,
     Diff(String),
     Skip(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum LegacyBucket { Pass, Fail, Diff, Skip, Error }
 
 /// The run fails only on genuine correctness/execution failures. Timeouts and
@@ -331,7 +331,6 @@ pub fn is_real_failure(o: &QueryOutcome) -> bool {
 /// `BENCH_SUMMARY` line and JSON `summary` stay byte-compatible. Timeout folds
 /// into Error exactly as the pre-refactor code did (it built
 /// `TestStatus::Error("Timed out ...")`); Vacuous folds into Pass.
-#[allow(dead_code)]
 pub fn legacy_bucket(o: &QueryOutcome) -> LegacyBucket {
     match o {
         QueryOutcome::Pass | QueryOutcome::Vacuous => LegacyBucket::Pass,
@@ -344,7 +343,6 @@ pub fn legacy_bucket(o: &QueryOutcome) -> LegacyBucket {
 
 /// Classify an executed SQE result against the expected-rows manifest.
 /// Mirrors the pre-refactor logic in `run_benchmark_test`.
-#[allow(dead_code)]
 pub fn classify_vs_expected(
     benchmark: &str,
     scale: f64,
