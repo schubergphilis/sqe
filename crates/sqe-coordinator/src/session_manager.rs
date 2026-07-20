@@ -60,6 +60,12 @@ pub struct SessionManager {
 const DEFAULT_MAX_SESSIONS: usize = 10_000;
 
 impl SessionManager {
+    fn update_active_sessions_metric(&self) {
+        if let Some(ref metrics) = self.metrics {
+            metrics.active_sessions.set(self.sessions.len() as i64);
+        }
+    }
+
     /// Create a new `SessionManager` with the legacy `Authenticator`.
     ///
     /// The `Authenticator` is used both as an `AuthProvider` (via its trait impl)
@@ -169,6 +175,7 @@ impl SessionManager {
                 Some(id) => {
                     if self.sessions.remove(&id).is_some() {
                         self.last_activity.remove(&id);
+                        self.update_active_sessions_metric();
                         warn!(
                             session_id = %id,
                             cap = self.max_sessions,
@@ -207,6 +214,7 @@ impl SessionManager {
         self.sessions.insert(session_id.clone(), session.clone());
         self.last_activity
             .insert(session_id.clone(), Arc::new(AtomicI64::new(now_micros())));
+        self.update_active_sessions_metric();
 
         info!(user_id = %identity.user_id, "Session created");
         debug!(session_id = %session_id, user_id = %identity.user_id, "Session details");
@@ -291,6 +299,7 @@ impl SessionManager {
             warn!(session_id = %session_id, "Session token expired, evicting");
             self.sessions.remove(session_id);
             self.last_activity.remove(session_id);
+            self.update_active_sessions_metric();
             return None;
         }
 
@@ -391,6 +400,7 @@ impl SessionManager {
     pub fn remove_session(&self, id: &str) {
         if self.sessions.remove(id).is_some() {
             self.last_activity.remove(id);
+            self.update_active_sessions_metric();
             debug!(session_id = %id, "Session removed");
         }
     }
@@ -440,6 +450,7 @@ impl SessionManager {
         }
 
         if removed > 0 {
+            self.update_active_sessions_metric();
             info!(count = removed, "Swept expired sessions");
         }
 
@@ -966,10 +977,12 @@ mod tests {
             }),
         ]);
 
+        let metrics = Arc::new(sqe_metrics::MetricsRegistry::new().unwrap());
         let manager = SessionManager::with_provider_and_legacy(
             Arc::new(chain),
             Arc::clone(&legacy),
-        );
+        )
+        .with_metrics(Arc::clone(&metrics));
 
         let creds = FlightCredentials {
             bearer_token: Some(sqe_core::SecretString::new("eyJtest.payload.sig".to_string())),
@@ -983,6 +996,9 @@ mod tests {
 
         assert_eq!(session.user.username, "alice");
         assert_eq!(session.access_token().expose(), "eyJtest.payload.sig");
+        assert_eq!(metrics.active_sessions.get(), 1);
+        manager.remove_session(&session.id);
+        assert_eq!(metrics.active_sessions.get(), 0);
     }
 
     /// Negative control: the legacy single-Authenticator wiring (the

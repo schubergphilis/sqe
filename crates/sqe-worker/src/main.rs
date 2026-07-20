@@ -14,6 +14,7 @@ async fn main() -> anyhow::Result<()> {
     let _otel_guard = sqe_metrics::otel::init_telemetry_with_sampling(
         "sqe-worker",
         &config.metrics.otlp_endpoint,
+        &config.metrics.traces_otlp_endpoint,
         config.metrics.trace_sample_rate,
     );
 

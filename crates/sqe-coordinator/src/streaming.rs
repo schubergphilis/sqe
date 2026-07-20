@@ -42,7 +42,7 @@ use tokio::time::Sleep;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
-use crate::query_handler::{aggregate_spill_metrics, extract_plan_metrics};
+use crate::query_handler::{aggregate_spill_metrics, extract_iceberg_scan_metrics, extract_plan_metrics};
 use crate::query_tracker::QueryTracker;
 
 /// Hard cap on a rendered profile. Deep plans with long predicate lists can
@@ -182,9 +182,46 @@ pub struct StreamFinalizer {
     pub client_ip: Option<String>,
     /// W3C trace ID captured at query start for audit <-> trace correlation (O4).
     pub trace_id: Option<String>,
+    pub query_span: tracing::Span,
 }
 
 impl StreamFinalizer {
+    fn finish_query_span(&self, status: &str, rows: usize, error: Option<&str>) {
+        let scan = extract_iceberg_scan_metrics(&self.plan);
+        self.query_span.record("sqe.status", status);
+        self.query_span.record("sqe.rows_returned", rows as u64);
+        self.query_span.record("sqe.scan.files_total", scan.files_total);
+        self.query_span.record("sqe.scan.files_read", scan.files_read);
+        self.query_span.record("sqe.scan.files_pruned_minmax", scan.files_pruned_minmax);
+        self.query_span.record("sqe.scan.files_pruned_dynamic", scan.files_pruned_dynamic);
+        self.query_span.record("sqe.scan.bytes_read", scan.bytes_read);
+        self.query_span.record("sqe.scan.rows_decoded", scan.rows_decoded);
+        if let Some(error) = error {
+            self.query_span.record("error.message", error);
+            self.query_span.record("otel.status_code", "ERROR");
+        } else {
+            self.query_span.record("otel.status_code", "OK");
+        }
+    }
+
+    fn record_scan_metrics(&self) {
+        let Some(ref metrics) = self.metrics else { return; };
+        let scan = extract_iceberg_scan_metrics(&self.plan);
+        metrics.scan_files_total.with_label_values(&["planned"]).inc_by(scan.files_planned);
+        metrics.scan_files_total.with_label_values(&["read"]).inc_by(scan.files_read);
+        metrics.scan_files_total.with_label_values(&["pruned_minmax"]).inc_by(scan.files_pruned_minmax);
+        metrics.scan_files_total.with_label_values(&["pruned_dynamic"]).inc_by(scan.files_pruned_dynamic);
+        metrics.scan_bytes_total.with_label_values(&["planned"]).inc_by(scan.bytes_planned);
+        metrics.scan_bytes_total.with_label_values(&["read"]).inc_by(scan.bytes_read);
+        metrics.scan_rows_total.with_label_values(&["prefilter"]).inc_by(scan.rows_prefilter);
+        metrics.scan_rows_total.with_label_values(&["decoded"]).inc_by(scan.rows_decoded);
+        metrics.scan_rows_total.with_label_values(&["output"]).inc_by(scan.rows_output);
+        metrics.scan_rows_total.with_label_values(&["filtered_dynamic"]).inc_by(scan.rows_filtered_dynamic);
+        metrics.scan_row_groups_pruned_total.inc_by(scan.row_groups_pruned_bloom);
+        metrics.files_pruned_minmax.inc_by(scan.files_pruned_minmax as f64);
+        metrics.s3_bytes_read_total.inc_by(scan.bytes_read);
+    }
+
     /// Map the policy decision summary into the canonical audit type.
     ///
     /// `PolicySummary` lives in `sqe-policy`; `PolicyAudit` lives in
@@ -261,6 +298,9 @@ impl StreamFinalizer {
             pm.spill_bytes,
             pm.peak_memory_bytes,
         );
+        if let Some(ref metrics) = self.metrics {
+            metrics.active_queries.set(self.tracker.active_count() as i64);
+        }
         crate::memory::observe_query_end(&self.runtime.memory_pool, &self.query_id);
 
         if let Some(ref metrics) = self.metrics {
@@ -281,6 +321,8 @@ impl StreamFinalizer {
             }
         }
         self.record_spill_metrics();
+        self.record_scan_metrics();
+        self.finish_query_span("success", rows, None);
 
         if let Some(ref audit) = self.audit {
             let policy = self.policy_summary_to_audit();
@@ -341,6 +383,9 @@ impl StreamFinalizer {
     fn on_error(self, rows: usize, err: &sqe_core::SqeError) {
         let duration = self.start.elapsed();
         self.tracker.failed(&self.query_id, err);
+        if let Some(ref metrics) = self.metrics {
+            metrics.active_queries.set(self.tracker.active_count() as i64);
+        }
         crate::memory::observe_query_end(&self.runtime.memory_pool, &self.query_id);
 
         if let Some(ref metrics) = self.metrics {
@@ -354,6 +399,8 @@ impl StreamFinalizer {
                 .observe(duration.as_secs_f64());
         }
         self.record_spill_metrics();
+        self.record_scan_metrics();
+        self.finish_query_span("error", rows, Some(&err.to_string()));
 
         if let Some(ref audit) = self.audit {
             let policy = self.policy_summary_to_audit();
@@ -400,6 +447,9 @@ impl StreamFinalizer {
     fn on_cancel(self, rows: usize) {
         let duration = self.start.elapsed();
         self.tracker.canceled(&self.query_id);
+        if let Some(ref metrics) = self.metrics {
+            metrics.active_queries.set(self.tracker.active_count() as i64);
+        }
         crate::memory::observe_query_end(&self.runtime.memory_pool, &self.query_id);
 
         if let Some(ref metrics) = self.metrics {
@@ -451,6 +501,8 @@ impl StreamFinalizer {
             };
             audit.log_event(event);
         }
+        self.record_scan_metrics();
+        self.finish_query_span("cancelled", rows, Some("cancelled by client"));
     }
 }
 
@@ -677,6 +729,8 @@ impl Stream for TrackedRecordBatchStream {
     type Item = Result<RecordBatch, DataFusionError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let query_span = self.finalizer.as_ref().map(|f| f.query_span.clone());
+        let _query_guard = query_span.as_ref().map(|span| span.enter());
         if self.cancelled {
             return Poll::Ready(None);
         }
@@ -859,6 +913,7 @@ mod tests {
             resources: Vec::new(),
             client_ip: None,
             trace_id: None,
+            query_span: tracing::Span::none(),
         }
     }
 
@@ -891,9 +946,12 @@ mod tests {
     async fn tracked_stream_counts_rows_on_success() {
         let (plan, schema, runtime) = trivial_plan().await;
         let tracker = test_tracker();
-        let fin = test_finalizer(Arc::clone(&tracker), plan, runtime);
+        let mut fin = test_finalizer(Arc::clone(&tracker), plan, runtime);
+        let metrics = Arc::new(sqe_metrics::MetricsRegistry::new().unwrap());
+        fin.metrics = Some(Arc::clone(&metrics));
         let qid = fin.query_id;
         tracker.start(qid, "test-user", None, "SELECT 1", "test-session", None, vec![], None);
+        metrics.active_queries.set(1);
 
         let inner = fixed_stream(
             Arc::clone(&schema),
@@ -912,6 +970,7 @@ mod tests {
         let record = find_record(&tracker, qid);
         assert_eq!(record.state, QueryState::Finished);
         assert_eq!(record.output_rows, 35);
+        assert_eq!(metrics.active_queries.get(), 0);
     }
 
     /// Task 2 conversion: a masked / filtered / denied SELECT records the
