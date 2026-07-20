@@ -665,16 +665,24 @@ impl MaintenanceHandler {
             )?]);
         }
 
-        // Greedy bin-pack small files into groups under `target_bytes`. Files
-        // already at or above target are skipped (no win from re-emitting
-        // them). Sort descending by size so the larger small-files anchor
-        // each group and leftover capacity soaks up the smallest files.
+        // Grouping strategy depends on whether we are sorting.
         //
-        // Partition-aware: never bin-pack across partition boundaries. A
-        // cross-partition group would fan back out to ~1 output file per
-        // partition on write (write_data_files re-splits per row), paying full
-        // I/O for near-zero consolidation.
-        let groups = pack_file_groups_partition_aware(&old_data_files, target_bytes);
+        // Bin-pack (no sort): greedy-pack small files into groups under
+        // `target_bytes`; files already at or above target are skipped (no win
+        // from re-emitting them). Partition-aware so a cross-partition group
+        // does not fan back out to ~1 file per partition on write.
+        //
+        // Sort / z-order: pack the WHOLE partition into a single group,
+        // including files already at or above target. The group is sorted as
+        // one stream and the rolling writer cuts it at `target_bytes`, so the
+        // output files carry disjoint key ranges (the property that makes the
+        // layout prunable at scale). Per-group sorting would instead leave each
+        // output file spanning the full key domain -> no pruning.
+        let groups = if sort_ctx.is_some() {
+            group_files_by_partition(&old_data_files)
+        } else {
+            pack_file_groups_partition_aware(&old_data_files, target_bytes)
+        };
 
         // Only groups with >= min_input members are worth rewriting; smaller
         // groups would trade one commit for no real reduction.
@@ -749,6 +757,7 @@ impl MaintenanceHandler {
                             group,
                             compression,
                             tracker_for_group,
+                            target_bytes,
                         )
                         .await
                     }
@@ -1891,6 +1900,24 @@ fn pack_file_groups_partition_aware(files: &[DataFile], target_bytes: u64) -> Ve
     out
 }
 
+/// Group every file of a partition into a single group, one group per
+/// partition, ignoring file size. Used by the sort/z-order strategy: the whole
+/// partition must be sorted as one stream so the rolling writer can cut it into
+/// files with disjoint key ranges. Unlike `pack_file_groups`, this keeps files
+/// already at or above the target size, because a large unsorted file still has
+/// to be re-laid-out to participate in the sorted layout.
+fn group_files_by_partition(files: &[DataFile]) -> Vec<Vec<DataFile>> {
+    use std::collections::BTreeMap;
+    let mut by_partition: BTreeMap<String, Vec<DataFile>> = BTreeMap::new();
+    for f in files {
+        by_partition
+            .entry(partition_key(f))
+            .or_default()
+            .push(f.clone());
+    }
+    by_partition.into_values().collect()
+}
+
 /// Rewrite one file group, applying its position and equality deletes, and emit
 /// the surviving rows as a fresh set of data files. Streams the delete-aware
 /// scan straight into the streaming writer so the group is never fully buffered
@@ -1914,6 +1941,7 @@ async fn rewrite_group(
     group: Vec<DataFile>,
     compression: parquet::basic::Compression,
     tracker: crate::writer::UploadedPaths,
+    target_bytes: u64,
 ) -> sqe_core::Result<(Vec<DataFile>, Vec<DataFile>, u64)> {
     use futures::StreamExt;
 
@@ -1977,6 +2005,11 @@ async fn rewrite_group(
         compression,
         tracker,
         FanoutLimits::unbounded(),
+        // Roll output at the requested target so a globally-sorted partition
+        // stream is cut into multiple files with disjoint key ranges (the
+        // property that makes sort compaction prunable at scale). Bin-pack
+        // groups are already packed under target, so this is a no-op for them.
+        Some(target_bytes),
     )
     .await?;
     let rows_written = rows_written as u64;
@@ -2200,6 +2233,37 @@ mod tests {
         }
         let total: usize = groups.iter().map(|g| g.len()).sum();
         assert_eq!(total, 4);
+    }
+
+    #[test]
+    fn group_files_by_partition_keeps_whole_partition_including_large_files() {
+        // Sort strategy grouping: one group per partition, containing every
+        // file regardless of size. A file at/above target (which bin-pack would
+        // drop) must still be included so it can be re-laid-out into the sorted
+        // layout.
+        let target = 1024u64;
+        let files = vec![
+            data_file_part("p1-small", 10, 0, 1),
+            data_file_part("p1-huge", target * 4, 0, 1), // bin-pack would drop this
+            data_file_part("p2-a", 10, 0, 2),
+            data_file_part("p2-b", 10, 0, 2),
+        ];
+        let groups = group_files_by_partition(&files);
+        // Exactly one group per partition.
+        assert_eq!(groups.len(), 2, "one group per partition, got {}", groups.len());
+        // Every group is single-partition and no file was dropped.
+        for g in &groups {
+            let keys: std::collections::HashSet<String> = g.iter().map(partition_key).collect();
+            assert_eq!(keys.len(), 1, "each group must be single-partition, got {keys:?}");
+        }
+        let total: usize = groups.iter().map(|g| g.len()).sum();
+        assert_eq!(total, 4, "no file may be dropped, including the large one");
+        // The large file must be present (bin-pack would have excluded it).
+        let has_huge = groups
+            .iter()
+            .flatten()
+            .any(|f| f.file_path() == "p1-huge");
+        assert!(has_huge, "sort grouping must keep files at/above target");
     }
 
     #[test]

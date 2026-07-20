@@ -52,9 +52,15 @@ Returns one summary row:
 
 ### Sort-compact for read pruning
 
-Load fast (unsorted), then compact into sorted files once. Each file group's
-rows are ordered by `sort_order` through a spillable DataFusion sort, so the
-rewrite stays memory-bounded even when a group is larger than RAM.
+Load fast (unsorted), then compact into sorted files once. The sort strategy
+gathers a whole partition into one stream, orders it by `sort_order` through a
+spillable DataFusion sort, and rolls the output at `target_file_size_bytes`.
+Sorting the partition as a single stream is what makes the result prunable: the
+output files come out with disjoint key ranges instead of each file spanning the
+full domain. The sort spills to disk, so the rewrite stays memory-bounded even
+when a partition is larger than RAM. Unlike bin-pack, the sort strategy also
+rewrites files already at or above the target size, because they still have to
+be re-laid-out to join the sorted layout.
 
 ```sql
 -- Lexicographic sort on one or more columns.
@@ -77,6 +83,15 @@ pruning skips more files. Z-order clusters several columns at once, which helps
 when queries filter on different subsets of those columns. Iceberg's sort-order
 metadata cannot express z-order, so none is stamped for the z-order case
 (matches Spark).
+
+Verify the layout with `table_files`: after a sort compaction the `lower_bounds`
+/ `upper_bounds` of the output files should not overlap on the sort column.
+
+```sql
+SELECT file_path, lower_bounds, upper_bounds
+FROM table_files('analytics', 'events')
+ORDER BY lower_bounds;
+```
 
 ### Drop snapshots older than 30 days, keeping the last 10
 

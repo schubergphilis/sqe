@@ -292,6 +292,158 @@ async fn rewrite_zorder_strategy_preserves_rows() {
     let _ = handler.execute(&session, &format!("DROP TABLE IF EXISTS {table}"), None).await;
 }
 
+/// Read one Utf8 column across all batches into a Vec (scan order).
+async fn read_str_col(
+    handler: &sqe_coordinator::QueryHandler,
+    session: &sqe_core::Session,
+    sql: &str,
+    col: usize,
+) -> Vec<String> {
+    use arrow_array::StringArray;
+    let batches = handler.execute(session, sql, None).await.expect("query");
+    let mut out = Vec::new();
+    for b in &batches {
+        let c = b.column(col).as_any().downcast_ref::<StringArray>().expect("Utf8");
+        for i in 0..c.len() {
+            out.push(c.value(i).to_string());
+        }
+    }
+    out
+}
+
+/// Extract the integer bound for `field_id` from a `{"1":0,"2":7}`-shaped JSON
+/// string as emitted by `table_files.lower_bounds` / `.upper_bounds`. Returns
+/// None when the field is absent. Deliberately tiny: values for BIGINT columns
+/// render bare, so a substring parse is enough for the test.
+fn parse_bound(json: &str, field_id: i32) -> Option<i64> {
+    let key = format!("\"{field_id}\":");
+    let start = json.find(&key)? + key.len();
+    let rest = &json[start..];
+    let end = rest.find([',', '}']).unwrap_or(rest.len());
+    rest[..end].trim().parse::<i64>().ok()
+}
+
+/// The core Phase-3 pruning property: a sort compaction whose output spills into
+/// MORE THAN ONE file must lay those files out with DISJOINT key ranges on the
+/// sort column. Per-group sorting (the pre-fix behaviour) would instead leave
+/// every output file spanning the full key domain, so `WHERE col = k` could
+/// prune nothing. This is what makes sort compaction actually help at scale, and
+/// the small-file benchmark (which lands in a single output file) never
+/// exercises it.
+///
+/// The setup interleaves `id` across input files so each source file spans the
+/// whole id domain (overlapping ranges, the worst case). A tiny
+/// `target_file_size_bytes` forces the globally-sorted stream to roll into
+/// several output files; those must come out with non-overlapping, ordered id
+/// ranges.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs docker-compose.test.yml + Polaris"]
+async fn rewrite_sort_produces_disjoint_file_ranges() {
+    let (session, handler) = crate::common::setup_handler().await;
+    let namespace = "default";
+    let table_name = "rewrite_disjoint_ranges";
+    let table = format!("{namespace}.{table_name}");
+    let _ = handler.execute(&session, &format!("DROP TABLE IF EXISTS {table}"), None).await;
+    handler
+        .execute(&session, &format!("CREATE TABLE {table} (id BIGINT, v BIGINT)"), None)
+        .await
+        .expect("CREATE");
+
+    // > 8192 rows so the DataFusion sort emits more than one output batch, and a
+    // tiny target so the rolling writer cuts between batches into >= 2 files.
+    const FILES: i64 = 40;
+    const ROWS_PER_FILE: i64 = 300; // 12000 rows total
+    const TOTAL: i64 = FILES * ROWS_PER_FILE;
+    for f in 0..FILES {
+        // id = r * FILES + f interleaves ids so file f spans [f, f + (ROWS-1)*FILES]
+        // = nearly the whole domain; every source file overlaps every other.
+        let values: Vec<String> = (0..ROWS_PER_FILE)
+            .map(|r| {
+                let id = r * FILES + f;
+                format!("({id}, {})", id * 2)
+            })
+            .collect();
+        handler
+            .execute(&session, &format!("INSERT INTO {table} VALUES {}", values.join(", ")), None)
+            .await
+            .expect("INSERT");
+    }
+
+    // Sort-compact on id, rolling output at a tiny target to force multiple files.
+    let summary = handler
+        .execute(
+            &session,
+            &format!(
+                "CALL system.rewrite_data_files(table => '{table}', min_input_files => 2, \
+                 strategy => 'sort', sort_order => 'id ASC', target_file_size_bytes => 1024)"
+            ),
+            None,
+        )
+        .await
+        .expect("rewrite sort");
+    assert!(
+        !status_col(&summary).contains("skipped"),
+        "sort compaction must run, got '{}'",
+        status_col(&summary)
+    );
+
+    // Row set preserved and complete.
+    let ids = read_i64_col(&handler, &session, &format!("SELECT id FROM {table} ORDER BY id")).await;
+    assert_eq!(ids, (0..TOTAL).collect::<Vec<_>>(), "row set must be preserved exactly");
+
+    // Read per-file id bounds. `id` is field id 1 (first column).
+    let lowers = read_str_col(
+        &handler,
+        &session,
+        &format!("SELECT lower_bounds FROM table_files('{namespace}', '{table_name}')"),
+        0,
+    )
+    .await;
+    let uppers = read_str_col(
+        &handler,
+        &session,
+        &format!("SELECT upper_bounds FROM table_files('{namespace}', '{table_name}')"),
+        0,
+    )
+    .await;
+    assert_eq!(lowers.len(), uppers.len());
+    assert!(
+        lowers.len() >= 2,
+        "test must produce >= 2 output files to exercise pruning; got {} (raise TOTAL or lower target)",
+        lowers.len()
+    );
+
+    // Collect [lower, upper] on id per file and sort by lower.
+    let mut ranges: Vec<(i64, i64)> = lowers
+        .iter()
+        .zip(uppers.iter())
+        .map(|(lo, hi)| {
+            (
+                parse_bound(lo, 1).unwrap_or_else(|| panic!("missing lower bound for id in {lo}")),
+                parse_bound(hi, 1).unwrap_or_else(|| panic!("missing upper bound for id in {hi}")),
+            )
+        })
+        .collect();
+    ranges.sort_by_key(|(lo, _)| *lo);
+
+    // Each file's range is well-formed and disjoint from the next (ids are
+    // unique, so ranges must not even touch).
+    for w in ranges.windows(2) {
+        let (_, prev_hi) = w[0];
+        let (next_lo, _) = w[1];
+        assert!(
+            prev_hi < next_lo,
+            "output files must have disjoint id ranges after sort compaction; \
+             got overlapping/adjacent ranges {ranges:?}"
+        );
+    }
+    for (lo, hi) in &ranges {
+        assert!(lo <= hi, "each file range must be well-formed, got ({lo}, {hi})");
+    }
+
+    let _ = handler.execute(&session, &format!("DROP TABLE IF EXISTS {table}"), None).await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn rewrite_skips_below_min_input_files() {
