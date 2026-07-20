@@ -9,6 +9,7 @@
 #   BENCH_PROFILE   profile name/path (default: local)
 #   BENCH_SCALE     scale factor (default: 1)
 #   BENCH_COMPARE   set to 1 to add --compare-trino
+#   BENCH_QUERY_TIMEOUT_SECS  per-query timeout override (default: per-file header or 300s)
 #   BENCH_GOLDEN_TOKEN, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY  passed through
 set -euo pipefail
 
