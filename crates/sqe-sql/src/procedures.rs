@@ -10,7 +10,8 @@
 //! ## Supported procedures
 //!
 //! - `system.rewrite_data_files(table => 'ns.t'[, target_file_size_bytes => N,
-//!   min_input_files => N, max_concurrent_file_group_rewrites => N])`
+//!   min_input_files => N, max_concurrent_file_group_rewrites => N,
+//!   strategy => 'binpack'|'sort', sort_order => '...', delete_file_threshold => N])`
 //! - `system.expire_snapshots(table => 'ns.t'[, older_than => TIMESTAMP,
 //!   retain_last => N])`
 //! - `system.remove_orphan_files(table => 'ns.t'[, older_than => TIMESTAMP])`
@@ -53,6 +54,14 @@ pub enum ProcedureCall {
         /// clustering spec (`'zorder(a, b)'`). Parsed and validated against the
         /// table schema in the handler.
         sort_order: Option<String>,
+        /// Rewrite any data file with at least this many delete files applying
+        /// to it, even when the file is already at or above the target size
+        /// (bin-pack would otherwise leave it alone). Counts every delete file
+        /// the scan planner attaches to the data file, including equality
+        /// deletes, so a low threshold on an equality-heavy table rewrites
+        /// broadly. Off (`None`) by default. No-op under `strategy => 'sort'`,
+        /// which already rewrites the whole partition.
+        delete_file_threshold: Option<usize>,
     },
     /// Drop old snapshots via vendored `RemoveSnapshotAction`.
     ExpireSnapshots {
@@ -714,6 +723,9 @@ fn parse_rewrite_data_files(mut args: Vec<(String, Expr)>) -> sqe_core::Result<P
     )?;
     let strategy = take_option(&mut args, "strategy", |e| expect_string(e, "strategy"))?;
     let sort_order = take_option(&mut args, "sort_order", |e| expect_string(e, "sort_order"))?;
+    let delete_file_threshold = take_option(&mut args, "delete_file_threshold", |e| {
+        expect_usize(e, "delete_file_threshold")
+    })?;
     expect_no_remaining(&args, "rewrite_data_files")?;
 
     Ok(ProcedureCall::RewriteDataFiles {
@@ -723,6 +735,7 @@ fn parse_rewrite_data_files(mut args: Vec<(String, Expr)>) -> sqe_core::Result<P
         max_concurrent_file_group_rewrites,
         strategy,
         sort_order,
+        delete_file_threshold,
     })
 }
 
@@ -820,6 +833,7 @@ mod tests {
                 max_concurrent_file_group_rewrites,
                 strategy,
                 sort_order,
+                delete_file_threshold,
             } => {
                 assert_eq!(table.namespace, "ns");
                 assert_eq!(table.name, "t");
@@ -828,6 +842,7 @@ mod tests {
                 assert!(max_concurrent_file_group_rewrites.is_none());
                 assert!(strategy.is_none());
                 assert!(sort_order.is_none());
+                assert!(delete_file_threshold.is_none());
             }
             other => panic!("Expected RewriteDataFiles, got {other:?}"),
         }
@@ -848,6 +863,23 @@ mod tests {
             } => {
                 assert_eq!(strategy.as_deref(), Some("sort"));
                 assert_eq!(sort_order.as_deref(), Some("a ASC, b DESC"));
+            }
+            other => panic!("Expected RewriteDataFiles, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_rewrite_data_files_delete_file_threshold() {
+        let stmt = parse_first(
+            "CALL system.rewrite_data_files(table => 'ns.t', delete_file_threshold => 3)",
+        );
+        let call = try_parse_call(&stmt).unwrap().expect("match");
+        match call {
+            ProcedureCall::RewriteDataFiles {
+                delete_file_threshold,
+                ..
+            } => {
+                assert_eq!(delete_file_threshold, Some(3));
             }
             other => panic!("Expected RewriteDataFiles, got {other:?}"),
         }
