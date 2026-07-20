@@ -306,10 +306,12 @@ In `rewrite_data_files`, immediately after `let table = load_table(&catalog, &id
 
 ```rust
         // Delete-safety guard (Phase 1). The current rewrite path reads raw
-        // Parquet without applying position/equality deletes, and the commit
-        // drops orphaned delete files. On a Merge-on-Read table that silently
-        // resurrects deleted rows. Until the delete-applying rewrite lands
-        // (Phase 2), refuse rather than corrupt.
+        // Parquet without applying position/equality deletes; the rewritten
+        // files get new paths and a new sequence number, so the surviving
+        // delete files no longer match them (the referenced-data-file dangling
+        // check is an unimplemented TODO in the vendored fork). On a
+        // Merge-on-Read table that silently resurrects deleted rows. Until the
+        // delete-applying rewrite lands (Phase 2), refuse rather than corrupt.
         let live_deletes = count_live_delete_files(&table).await?;
         if live_deletes > 0 {
             info!(
