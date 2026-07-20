@@ -124,6 +124,7 @@ When no OPA / Cedar policy store is wired, an engine-level heuristic acts as the
 - **`remove_orphan_files` with no `older_than`** uses the 3-day default, which is conservative against compaction or COPY jobs in flight. Override with `older_than` only after confirming no concurrent writers.
 - **`expire_snapshots` is destructive** for time-travel queries. Once a snapshot is expired, `FOR VERSION AS OF <id>` for that snapshot fails. Document a retention window your team agrees on, and stick to it.
 - **`rewrite_data_files` rewrites entire data files**, not row groups. Two consecutive calls can churn the same files; rely on the `min_input_files` floor (default 5) to keep churn bounded.
+- **`rewrite_data_files` skips Merge-on-Read tables with live delete files.** The current rewrite does not apply position or equality deletes, so it returns a skipped status on any table that carries them rather than risk resurrecting deleted rows. Delete-aware rewrite is planned. It groups files per partition, so partitioned tables consolidate within each partition.
 - **Run procedures in a quiet window.** A concurrent writer that commits mid-run can cause `rewrite_data_files` to return a retryable error. The other procedures tolerate concurrency and reconcile against the live snapshot.
 
 ## Commit failures
