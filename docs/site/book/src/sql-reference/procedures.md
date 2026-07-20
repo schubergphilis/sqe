@@ -124,14 +124,15 @@ When no OPA / Cedar policy store is wired, an engine-level heuristic acts as the
 - **`remove_orphan_files` with no `older_than`** uses the 3-day default, which is conservative against compaction or COPY jobs in flight. Override with `older_than` only after confirming no concurrent writers.
 - **`expire_snapshots` is destructive** for time-travel queries. Once a snapshot is expired, `FOR VERSION AS OF <id>` for that snapshot fails. Document a retention window your team agrees on, and stick to it.
 - **`rewrite_data_files` rewrites entire data files**, not row groups. Two consecutive calls can churn the same files; rely on the `min_input_files` floor (default 5) to keep churn bounded.
-- **`rewrite_data_files` skips Merge-on-Read tables with live delete files.** The current rewrite does not apply position or equality deletes, so it returns a skipped status on any table that carries them rather than risk resurrecting deleted rows. Delete-aware rewrite is planned. It groups files per partition, so partitioned tables consolidate within each partition.
+- **`rewrite_data_files` is delete-aware on Merge-on-Read tables.** It reads each file group through the Iceberg scan, so position and equality deletes are applied during the rewrite and deleted rows never reappear. The compacted output is pinned to the sequence number of the snapshot it read, so an equality delete another writer commits mid-compaction still applies to the compacted files. Fully-covered position delete files are dropped in the same commit; equality deletes are left to age out via `expire_snapshots`. It groups files per partition, so partitioned tables consolidate within each partition.
+- **`rewrite_data_files` retries on conflict.** A concurrent writer that commits between the read and the commit produces a retryable conflict; the procedure re-reads and retries with backoff a bounded number of times before surfacing the conflict.
 - **Run procedures in a quiet window.** A concurrent writer that commits mid-run can cause `rewrite_data_files` to return a retryable error. The other procedures tolerate concurrency and reconcile against the live snapshot.
 
 ## Commit failures
 
 Every procedure commits through the same REST catalog path that CTAS and INSERT use, so commit failures surface as `SqeError::Execution` and fall into two buckets:
 
-- **Retryable.** The message contains `conflict` or `retry`. The iceberg-rust retry loop has already given up, so the caller schedules another run after a back-off.
+- **Retryable.** The message contains `conflict` or `retry`. `rewrite_data_files` already re-reads and retries a bounded number of times internally; a retryable error surfaced to the caller means those attempts were exhausted, so schedule another run after a back-off. The other procedures surface the conflict directly.
 - **Permanent.** Everything else. Check the message for the upstream cause.
 
 ## What is not exposed
