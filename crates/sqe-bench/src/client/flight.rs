@@ -47,6 +47,17 @@ impl FlightSqlBenchClient {
         })
     }
 
+    /// Connect using a pre-obtained bearer token, sent as the Flight
+    /// Authorization on every request. Used by the `run` verb, whose golden
+    /// bearer both authenticates the session (via the coordinator's
+    /// bearer_passthrough provider) and is forwarded to the golden Polaris.
+    pub fn with_token(host: &str, token: &str) -> Self {
+        Self {
+            host: host.to_string(),
+            token: Some(token.to_string()),
+        }
+    }
+
     /// Create a fresh FlightSqlServiceClient with the stored token.
     async fn new_client(&self) -> anyhow::Result<FlightSqlServiceClient<Channel>> {
         let channel = build_channel(&self.host).await?;
