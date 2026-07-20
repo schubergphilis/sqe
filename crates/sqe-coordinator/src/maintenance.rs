@@ -492,7 +492,64 @@ impl MaintenanceHandler {
         )))
     }
 
+    /// Delete-aware bin-pack rewrite with bounded conflict retry.
+    ///
+    /// A concurrent writer that commits between our read and our commit turns
+    /// the `RewriteFilesAction` commit into a retryable conflict. We retry the
+    /// whole load -> plan -> rewrite -> commit a bounded number of times. Each
+    /// attempt goes through `rewrite_data_files_once`, which re-loads the table,
+    /// so the sequence-number pin, scan plan, and file set always describe the
+    /// current snapshot: retrying with a stale pin would reopen the
+    /// concurrent-equality-delete correctness hole. A failed attempt's orphaned
+    /// output files are cleaned up by that attempt's `WriteCleanupGuard` on drop.
     async fn rewrite_data_files(
+        &self,
+        session: &Session,
+        table_ref: &TableRef,
+        target_file_size_bytes: Option<u64>,
+        min_input_files: Option<usize>,
+        max_concurrent_file_group_rewrites: Option<usize>,
+    ) -> sqe_core::Result<Vec<RecordBatch>> {
+        const MAX_COMMIT_ATTEMPTS: usize = 4;
+        let mut attempt: usize = 0;
+        loop {
+            attempt += 1;
+            match self
+                .rewrite_data_files_once(
+                    session,
+                    table_ref,
+                    target_file_size_bytes,
+                    min_input_files,
+                    max_concurrent_file_group_rewrites,
+                )
+                .await
+            {
+                Ok(v) => return Ok(v),
+                Err(e) => {
+                    // classify_commit_error tags retryable conflicts in the
+                    // message ("retryable" / "conflict"). Anything else is a
+                    // permanent failure we surface immediately.
+                    let msg = e.to_string().to_lowercase();
+                    let retryable = msg.contains("retryable") || msg.contains("conflict");
+                    if retryable && attempt < MAX_COMMIT_ATTEMPTS {
+                        let backoff = std::time::Duration::from_millis(50 * (1u64 << (attempt - 1)));
+                        warn!(
+                            table = %to_table_ident(table_ref),
+                            attempt,
+                            backoff_ms = backoff.as_millis() as u64,
+                            "rewrite_data_files: retryable commit conflict; re-reading and retrying"
+                        );
+                        tokio::time::sleep(backoff).await;
+                        continue;
+                    }
+                    return Err(e);
+                }
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn rewrite_data_files_once(
         &self,
         session: &Session,
         table_ref: &TableRef,
