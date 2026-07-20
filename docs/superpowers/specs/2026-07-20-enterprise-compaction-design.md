@@ -15,8 +15,16 @@ enterprise, high-performance, resilient story:
 
 1. **Correctness.** `rewrite_data_files` is not delete-aware. On a Merge-on-Read
    table (data files + position/equality deletes) it reads raw Parquet without
-   applying deletes and, at commit, drops the now-orphaned delete files. The
-   result is silent resurrection of logically-deleted rows. The published book
+   applying deletes (`maintenance.rs:read_parquet_file`), and the rewritten data
+   files get new paths and a new sequence number. The surviving position deletes
+   still reference the old file paths, so they no longer match the rewritten
+   data; equality deletes at a lower sequence number also stop applying. The
+   referenced-data-file dangling check that would otherwise drop those deletes is
+   an unimplemented TODO in the vendored fork
+   (`vendor/iceberg-rust/crates/iceberg/src/transaction/manifest_filter.rs:420`;
+   `remove_dangling_deletes_for` at :457 only flags that filtering is needed, it
+   does not drop the deletes). No error path fires. The result is silent
+   resurrection of logically-deleted rows. The published book
    (`docs/site/book/src/design-notes/mor-vs-cow.md:97`) currently *recommends*
    running this procedure on MoR tables, so the docs point users at the
    corrupting path.
