@@ -47,6 +47,22 @@ pub(crate) struct PlanMetrics {
     pub(crate) peak_memory_bytes: u64,
 }
 
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct IcebergScanMetrics {
+    pub files_total: u64,
+    pub files_planned: u64,
+    pub files_read: u64,
+    pub files_pruned_minmax: u64,
+    pub files_pruned_dynamic: u64,
+    pub bytes_planned: u64,
+    pub bytes_read: u64,
+    pub rows_prefilter: u64,
+    pub rows_decoded: u64,
+    pub rows_output: u64,
+    pub rows_filtered_dynamic: u64,
+    pub row_groups_pruned_bloom: u64,
+}
+
 type OpenStreamResult = (
     SchemaRef,
     SendableRecordBatchStream,
@@ -728,16 +744,25 @@ impl QueryHandler {
             sql_length = sql.len(),
             "Executing query"
         );
-        let trace_id = sqe_metrics::propagation::current_trace_id();
-
-        // Root span for the entire query (O3). Children (policy_rewrite,
-        // DataFusion planning/execution, write, etc.) will be nested under it
-        // when the OTel layer is active.
-        let _root_query_span = tracing::info_span!(
+        let query_span = tracing::info_span!(
             "sqe.query",
             query_id = %query_id,
+            sqe.query.id = %query_id,
+            sqe.session.id = %session.id,
+            session_id = %session.id,
+            trace_id = tracing::field::Empty,
+            span_id = tracing::field::Empty,
             user = %session.user.username,
+            sqe.status = tracing::field::Empty,
+            sqe.rows_returned = tracing::field::Empty,
+            sqe.bytes_scanned = tracing::field::Empty,
+            sqe.rows_scanned = tracing::field::Empty,
+            error.message = tracing::field::Empty,
+            otel.status_code = tracing::field::Empty,
         );
+        sqe_metrics::propagation::record_trace_fields(&query_span);
+        let _query_guard = query_span.enter();
+        let trace_id = sqe_metrics::propagation::current_trace_id();
 
         let cancel_token = self.query_tracker.start(
             query_id,
@@ -749,6 +774,9 @@ impl QueryHandler {
             session.user.roles.clone(),
             trace_id.clone(),
         );
+        if let Some(ref metrics) = self.metrics {
+            metrics.active_queries.set(self.query_tracker.active_count() as i64);
+        }
 
         // OpenLineage: emit START event. The observer is sync and best-effort;
         // failures inside the observer (full channel, etc.) increment a metric
@@ -780,12 +808,18 @@ impl QueryHandler {
                     let rows: usize = cached.batches.iter().map(|b| b.num_rows()).sum();
                     self.query_tracker.complete(&query_id, rows, 0, cached.tables_touched.clone(), 0, 0, 0, 0);
                     if let Some(ref metrics) = self.metrics {
+                        metrics.active_queries.set(self.query_tracker.active_count() as i64);
                         metrics
                             .query_count
                             .with_label_values(&["success", &kind_name, ""])
                             .inc();
                         metrics.rows_returned.inc_by(rows as f64);
                     }
+                    query_span.record("sqe.status", "success");
+                    query_span.record("sqe.rows_returned", rows as u64);
+                    query_span.record("sqe.bytes_scanned", 0_u64);
+                    query_span.record("sqe.rows_scanned", 0_u64);
+                    query_span.record("otel.status_code", "OK");
                     // OpenLineage: cache hits still get a COMPLETE event so the
                     // run shows up end-to-end. The plan field is None because
                     // the post-policy plan was not re-derived on the fast path.
@@ -1548,7 +1582,19 @@ impl QueryHandler {
             self.query_tracker.failed(&query_id, e);
         }
 
+        query_span.record("sqe.status", status);
+        query_span.record("sqe.rows_returned", rows as u64);
+        query_span.record("sqe.bytes_scanned", pm.bytes_scanned);
+        query_span.record("sqe.rows_scanned", pm.rows_scanned);
+        if let Err(ref e) = result {
+            query_span.record("error.message", e.to_string());
+            query_span.record("otel.status_code", "ERROR");
+        } else {
+            query_span.record("otel.status_code", "OK");
+        }
+
         if let Some(ref metrics) = self.metrics {
+            metrics.active_queries.set(self.query_tracker.active_count() as i64);
             let error_code = match &result {
                 Err(e) => e.error_code().name(),
                 Ok(_) => "",
@@ -2124,6 +2170,28 @@ impl QueryHandler {
         // --- Start tracker ----------------------------------------------------
         let start = std::time::Instant::now();
         let query_id = uuid::Uuid::now_v7();
+        let query_span = tracing::info_span!(
+            "sqe.query",
+            query_id = %query_id,
+            sqe.query.id = %query_id,
+            sqe.session.id = %session.id,
+            session_id = %session.id,
+            trace_id = tracing::field::Empty,
+            span_id = tracing::field::Empty,
+            user = %session.user.username,
+            sqe.status = tracing::field::Empty,
+            sqe.rows_returned = tracing::field::Empty,
+            sqe.scan.files_total = tracing::field::Empty,
+            sqe.scan.files_read = tracing::field::Empty,
+            sqe.scan.files_pruned_minmax = tracing::field::Empty,
+            sqe.scan.files_pruned_dynamic = tracing::field::Empty,
+            sqe.scan.bytes_read = tracing::field::Empty,
+            sqe.scan.rows_decoded = tracing::field::Empty,
+            error.message = tracing::field::Empty,
+            otel.status_code = tracing::field::Empty,
+        );
+        sqe_metrics::propagation::record_trace_fields(&query_span);
+        let _query_guard = query_span.enter();
         let trace_id = sqe_metrics::propagation::current_trace_id();
         info!(
             query_id = %query_id,
@@ -2131,12 +2199,6 @@ impl QueryHandler {
             username = %session.user.username,
             sql_length = sql.len(),
             "Starting streaming query"
-        );
-
-        let _root_query_span = tracing::info_span!(
-            "sqe.query",
-            query_id = %query_id,
-            user = %session.user.username,
         );
 
         let cancel_token = self.query_tracker.start(
@@ -2147,8 +2209,11 @@ impl QueryHandler {
             &session.id,
             client_ip.as_deref(),
             session.user.roles.clone(),
-            trace_id,
+            trace_id.clone(),
         );
+        if let Some(ref metrics) = self.metrics {
+            metrics.active_queries.set(self.query_tracker.active_count() as i64);
+        }
 
         match self.open_stream(session, sql, &query_id, start).await {
             Ok((schema, inner_stream, final_plan, tt_cleanup, tables_touched, policy_summary, audit_resources)) => {
@@ -2179,7 +2244,8 @@ impl QueryHandler {
                     actor,
                     resources: audit_resources,
                     client_ip: client_ip.clone(),
-                    trace_id: sqe_metrics::propagation::current_trace_id(),
+                    trace_id,
+                    query_span: query_span.clone(),
                 };
 
                 let tracked = crate::streaming::TrackedRecordBatchStream::with_permits_reservation_and_cancel_token(
@@ -2207,7 +2273,11 @@ impl QueryHandler {
                 // (held in this function's scope) drops here and the
                 // semaphore slot is released.
                 self.query_tracker.failed(&query_id, &e);
+                query_span.record("sqe.status", "error");
+                query_span.record("error.message", e.to_string());
+                query_span.record("otel.status_code", "ERROR");
                 if let Some(ref metrics) = self.metrics {
+                    metrics.active_queries.set(self.query_tracker.active_count() as i64);
                     metrics
                         .query_count
                         .with_label_values(&["error", &kind_name, e.error_code().name()])
@@ -2822,6 +2892,9 @@ impl QueryHandler {
 
         // 2. Get healthy workers — if none, fall back to local
         let healthy = registry.healthy_workers().await;
+        if let Some(ref metrics) = self.metrics {
+            metrics.healthy_workers.set(healthy.len() as i64);
+        }
         if healthy.is_empty() {
             debug!("No healthy workers available, executing locally");
             return plan;
@@ -5431,6 +5504,51 @@ pub(crate) fn extract_plan_metrics(plan: &Arc<dyn ExecutionPlan>) -> PlanMetrics
         spill_bytes,
         peak_memory_bytes: 0,
     }
+}
+
+pub(crate) fn extract_iceberg_scan_metrics(plan: &Arc<dyn ExecutionPlan>) -> IcebergScanMetrics {
+    let mut result = IcebergScanMetrics::default();
+    let mut stack: Vec<Arc<dyn ExecutionPlan>> = vec![Arc::clone(plan)];
+    while let Some(node) = stack.pop() {
+        if let Some(scan) = node.downcast_ref::<IcebergScanExec>() {
+            let snapshot = scan.snapshot_id()
+                .and_then(|id| scan.table().metadata().snapshot_by_id(id))
+                .or_else(|| scan.table().metadata().current_snapshot());
+            let table_files = snapshot
+                .and_then(|s| s.summary().additional_properties.get("total-data-files"))
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(0);
+            let named = |name: &str| -> u64 {
+                node.metrics()
+                    .and_then(|m| m.sum_by_name(name))
+                    .map(|v| v.as_usize() as u64)
+                    .unwrap_or(0)
+            };
+            let planned = named("data_files_planned");
+            let pruned_dynamic = named("files_pruned_dynamic");
+            result.files_total = result.files_total.saturating_add(table_files);
+            result.files_planned = result.files_planned.saturating_add(planned);
+            result.files_pruned_minmax = result.files_pruned_minmax
+                .saturating_add(table_files.saturating_sub(planned));
+            result.files_pruned_dynamic = result.files_pruned_dynamic.saturating_add(pruned_dynamic);
+            result.files_read = result.files_read.saturating_add(planned.saturating_sub(pruned_dynamic));
+            result.bytes_planned = result.bytes_planned.saturating_add(named("bytes_planned"));
+            result.bytes_read = result.bytes_read.saturating_add(named("bytes_scanned"));
+            result.rows_prefilter = result.rows_prefilter.saturating_add(named("rows_prefilter"));
+            result.rows_decoded = result.rows_decoded.saturating_add(named("rows_decoded"));
+            result.rows_output = result.rows_output.saturating_add(
+                node.metrics().and_then(|m| m.output_rows()).unwrap_or(0) as u64,
+            );
+            result.rows_filtered_dynamic = result.rows_filtered_dynamic
+                .saturating_add(named("rows_filtered_dynamic"));
+            result.row_groups_pruned_bloom = result.row_groups_pruned_bloom
+                .saturating_add(named("row_groups_pruned_bloom"));
+        }
+        for child in node.children() {
+            stack.push(Arc::clone(child));
+        }
+    }
+    result
 }
 
 /// Walk a physical plan tree and aggregate spill metrics from all operators.

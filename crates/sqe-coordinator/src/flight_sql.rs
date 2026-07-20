@@ -1,6 +1,7 @@
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use arrow_array::{Array, RecordBatch};
 use arrow_flight::encode::FlightDataEncoderBuilder;
@@ -44,7 +45,9 @@ use futures::{Stream, StreamExt, TryStreamExt, stream};
 use prost::Message;
 use tonic::metadata::MetadataValue;
 use tonic::{Request, Response, Status, Streaming};
-use tracing::{debug, info, warn};
+use tower::{Layer, Service};
+use tracing::{debug, info, warn, Instrument};
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use sqe_core::SqeConfig;
 use sqe_sql::{StatementKind, parse_and_classify_typed, pre_parse_pipeline, UserSql};
@@ -58,6 +61,68 @@ use crate::worker_registry::WorkerRegistry;
 // keep working without changes.
 pub use crate::flight_sql_helpers::FetchResults;
 use crate::flight_sql_helpers::{FlightStream, sqe_error_to_status};
+
+/// Instruments every Flight SQL RPC before tonic dispatches to a handler.
+///
+/// Doing this at the service boundary ensures authentication, session lookup,
+/// planning, prepared statements, actions, and stream construction all inherit
+/// the remote W3C parent. The instrumented future also keeps that context when
+/// tonic moves request work between runtime tasks.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FlightTraceLayer;
+
+impl<S> Layer<S> for FlightTraceLayer {
+    type Service = FlightTraceService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        FlightTraceService { inner }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct FlightTraceService<S> {
+    inner: S,
+}
+
+impl<S, B> Service<tonic::codegen::http::Request<B>> for FlightTraceService<S>
+where
+    S: Service<tonic::codegen::http::Request<B>>,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = tracing::instrument::Instrumented<S::Future>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, request: tonic::codegen::http::Request<B>) -> Self::Future {
+        let parent = sqe_metrics::propagation::extract_trace_context_from_headers(request.headers());
+        let correlation = sqe_metrics::propagation::correlation_ids_from_headers(request.headers());
+        let span = tracing::info_span!(
+            "flight_sql.request",
+            rpc.system = "grpc",
+            rpc.method = %request.uri().path(),
+            trace_id = tracing::field::Empty,
+            span_id = tracing::field::Empty,
+            request_id = tracing::field::Empty,
+            session_id = tracing::field::Empty,
+            http.request_id = tracing::field::Empty,
+            sqe.session.id = tracing::field::Empty,
+        );
+        let _ = span.set_parent(parent);
+        sqe_metrics::propagation::record_trace_fields(&span);
+        if let Some(request_id) = correlation.request_id.as_deref() {
+            span.record("request_id", request_id);
+            span.record("http.request_id", request_id);
+        }
+        if let Some(session_id) = correlation.session_id.as_deref() {
+            span.record("session_id", session_id);
+            span.record("sqe.session.id", session_id);
+        }
+        self.inner.call(request).instrument(span)
+    }
+}
 
 /// Populate the full Flight SQL `SqlInfo` table.
 ///
@@ -2351,6 +2416,44 @@ mod tests {
     use arrow_flight::sql::metadata::{SqlInfoDataBuilder, XdbcTypeInfo, XdbcTypeInfoDataBuilder};
     use arrow_flight::sql::{Nullable, Searchable, SqlInfo, XdbcDataType};
     use arrow_schema::{DataType, Field, Schema};
+
+    #[tokio::test]
+    async fn flight_trace_layer_uses_remote_w3c_parent() {
+        use opentelemetry::trace::TracerProvider;
+        use opentelemetry_sdk::propagation::TraceContextPropagator;
+        use opentelemetry_sdk::trace::SdkTracerProvider;
+        use tower::{ServiceExt, service_fn};
+        use tracing_subscriber::layer::SubscriberExt;
+
+        opentelemetry::global::set_text_map_propagator(TraceContextPropagator::new());
+        let provider = SdkTracerProvider::builder().build();
+        let tracer = provider.tracer("flight-propagation-test");
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_opentelemetry::layer().with_tracer(tracer));
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+
+        let service = FlightTraceLayer.layer(service_fn(
+            |_request: tonic::codegen::http::Request<()>| async move {
+                Ok::<_, std::convert::Infallible>(tonic::codegen::http::Response::new(
+                    sqe_metrics::propagation::current_trace_id(),
+                ))
+            },
+        ));
+        let mut request = tonic::codegen::http::Request::new(());
+        request.headers_mut().insert(
+            "traceparent",
+            "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"
+                .parse()
+                .unwrap(),
+        );
+
+        let response = service.oneshot(request).await.unwrap();
+        assert_eq!(
+            response.into_body().as_deref(),
+            Some("0af7651916cd43dd8448eb211c80319c")
+        );
+        provider.shutdown().unwrap();
+    }
 
     // -----------------------------------------------------------------------
     // batches_to_stream: empty input

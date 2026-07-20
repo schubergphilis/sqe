@@ -21,11 +21,13 @@ use std::fmt::{Debug, Formatter};
 use gcp_auth::TokenProvider;
 use http::StatusCode;
 use iceberg::{Error, ErrorKind, Result};
+use opentelemetry::propagation::Injector;
 use reqwest::header::HeaderMap;
 use reqwest::{Client, IntoUrl, Method, Request, RequestBuilder, Response};
 use serde::de::DeserializeOwned;
 use tokio::sync::Mutex;
-use tracing::{debug, warn};
+use tracing::{debug, info_span, warn, Instrument};
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use crate::types::{ErrorResponse, TokenResponse};
 use crate::{GCP_CLOUD_PLATFORM_SCOPE, RestCatalogConfig};
@@ -64,6 +66,19 @@ pub(crate) struct HttpClient {
     /// where some outbound REST calls were arriving at Polaris without
     /// the bearer header under concurrency.
     auth_required: bool,
+}
+
+struct HeaderInjector<'a>(&'a mut HeaderMap);
+
+impl Injector for HeaderInjector<'_> {
+    fn set(&mut self, key: &str, value: String) {
+        if let (Ok(name), Ok(value)) = (
+            reqwest::header::HeaderName::from_bytes(key.as_bytes()),
+            reqwest::header::HeaderValue::from_str(&value),
+        ) {
+            self.0.insert(name, value);
+        }
+    }
 }
 
 impl Debug for HttpClient {
@@ -234,7 +249,7 @@ impl HttpClient {
             http::HeaderValue::from_static("application/x-www-form-urlencoded"),
         );
         let auth_url = auth_req.url().clone();
-        let auth_resp = self.client.execute(auth_req).await?;
+        let auth_resp = self.execute(auth_req).await?;
 
         let auth_res: TokenResponse = if auth_resp.status() == StatusCode::OK {
             let text = auth_resp
@@ -451,7 +466,48 @@ impl HttpClient {
     /// Executes the given `Request` and returns a `Response`.
     pub async fn execute(&self, mut request: Request) -> Result<Response> {
         request.headers_mut().extend(self.extra_headers.clone());
-        Ok(self.client.execute(request).await?)
+        let method = request.method().clone();
+        let path = request.url().path().to_string();
+        let host = request.url().host_str().unwrap_or_default().to_string();
+        let span = info_span!(
+            "iceberg.rest.request",
+            db.system.name = "iceberg",
+            http.request.method = %method,
+            server.address = %host,
+            url.path = %path,
+            http.response.status_code = tracing::field::Empty,
+            error.type = tracing::field::Empty,
+            otel.status_code = tracing::field::Empty,
+        );
+        async move {
+            let context = tracing::Span::current().context();
+            opentelemetry::global::get_text_map_propagator(|propagator| {
+                propagator.inject_context(&context, &mut HeaderInjector(request.headers_mut()));
+            });
+            match self.client.execute(request).await {
+                Ok(response) => {
+                    let status = response.status();
+                    tracing::Span::current().record(
+                        "http.response.status_code",
+                        status.as_u16(),
+                    );
+                    if status.is_client_error() || status.is_server_error() {
+                        tracing::Span::current().record("error.type", "http_status");
+                        tracing::Span::current().record("otel.status_code", "ERROR");
+                    } else {
+                        tracing::Span::current().record("otel.status_code", "OK");
+                    }
+                    Ok(response)
+                }
+                Err(error) => {
+                    tracing::Span::current().record("error.type", "transport");
+                    tracing::Span::current().record("otel.status_code", "ERROR");
+                    Err(error.into())
+                }
+            }
+        }
+        .instrument(span)
+        .await
     }
 
     // Queries the Iceberg REST catalog after authentication with the given `Request` and

@@ -224,6 +224,9 @@ prometheus_port = 9090
 # OTLP gRPC endpoint for traces, metrics, and logs (e.g. "http://otel-collector:4317")
 # Leave empty to disable OpenTelemetry export (structured JSON logs only)
 otlp_endpoint = ""
+# Trace-only OTLP gRPC endpoint. Prefer this when metrics are scraped from
+# /metrics and logs are collected from stdout.
+traces_otlp_endpoint = ""
 # Security audit log (one JSONL entry per statement: who ran what, when, against
 # which tables). Empty disables it (the logger is a no-op). The default is empty
 # here because an unwritable path is fatal at startup, and a single example file
@@ -243,6 +246,7 @@ audit_log_path = ""
 # OpenTelemetry trace sampling (0.0–1.0). Default when omitted: 0.01 (1% of queries).
 # Set to 1.0 to trace every query (expensive at high QPS). Set to 0.0 to disable tracing.
 # trace_sample_rate = 0.01
+# Environment override: SQE_METRICS__TRACE_SAMPLE_RATE=1.0
 
 # OTLP audit export: tails the OCSF spool and ships records to a SIEM collector.
 # Off by default. Requires audit_log_path (or metrics.audit format = "ocsf"/"both").

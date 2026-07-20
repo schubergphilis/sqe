@@ -117,6 +117,7 @@ pub struct MetricsRegistry {
     pub query_count: CounterVec,
     pub query_duration: HistogramVec,
     pub rows_returned: Counter,
+    pub active_queries: IntGauge,
     pub active_sessions: IntGauge,
     pub healthy_workers: IntGauge,
     pub cache_hits: Counter,
@@ -162,6 +163,10 @@ pub struct MetricsRegistry {
     pub files_pruned_minmax: Counter,
     pub files_pruned_bloom: Counter,
     pub pages_pruned_index: Counter,
+    pub scan_files_total: IntCounterVec,
+    pub scan_bytes_total: IntCounterVec,
+    pub scan_rows_total: IntCounterVec,
+    pub scan_row_groups_pruned_total: IntCounter,
 
     // Latency
     pub time_to_first_row: Histogram,
@@ -236,6 +241,12 @@ impl MetricsRegistry {
             &registry,
             "sqe_rows_returned_total",
             "Total rows returned across all queries",
+        )?;
+
+        let active_queries = register_int_gauge(
+            &registry,
+            "sqe_active_queries",
+            "Number of active queries",
         )?;
 
         let active_sessions =
@@ -416,6 +427,30 @@ impl MetricsRegistry {
             &registry,
             "sqe_pages_pruned_index_total",
             "Pages skipped by page index",
+        )?;
+
+        let scan_files_total = register_int_counter_vec(
+            &registry,
+            "sqe_scan_files_total",
+            "Iceberg scan files by outcome",
+            &["outcome"],
+        )?;
+        let scan_bytes_total = register_int_counter_vec(
+            &registry,
+            "sqe_scan_bytes_total",
+            "Iceberg scan bytes by stage",
+            &["stage"],
+        )?;
+        let scan_rows_total = register_int_counter_vec(
+            &registry,
+            "sqe_scan_rows_total",
+            "Iceberg scan rows by stage",
+            &["stage"],
+        )?;
+        let scan_row_groups_pruned_total = register_int_counter(
+            &registry,
+            "sqe_scan_row_groups_pruned_total",
+            "Iceberg row groups pruned by bloom filters",
         )?;
 
         // Latency
@@ -600,6 +635,7 @@ impl MetricsRegistry {
             query_count,
             query_duration,
             rows_returned,
+            active_queries,
             active_sessions,
             healthy_workers,
             cache_hits,
@@ -631,6 +667,10 @@ impl MetricsRegistry {
             files_pruned_minmax,
             files_pruned_bloom,
             pages_pruned_index,
+            scan_files_total,
+            scan_bytes_total,
+            scan_rows_total,
+            scan_row_groups_pruned_total,
             time_to_first_row,
             s3_requests_total,
             s3_bytes_read_total,
@@ -766,6 +806,7 @@ mod tests {
         metrics.query_duration.with_label_values(&["query"]).observe(0.0);
         metrics.rows_returned.inc_by(0.0);
         metrics.active_sessions.set(0);
+        metrics.active_queries.set(0);
         metrics.healthy_workers.set(0);
         metrics.cache_hits.inc_by(0.0);
         metrics.cache_misses.inc_by(0.0);
@@ -793,6 +834,10 @@ mod tests {
         metrics.files_pruned_minmax.inc_by(0.0);
         metrics.files_pruned_bloom.inc_by(0.0);
         metrics.pages_pruned_index.inc_by(0.0);
+        metrics.scan_files_total.with_label_values(&["planned"]).inc_by(0);
+        metrics.scan_bytes_total.with_label_values(&["read"]).inc_by(0);
+        metrics.scan_rows_total.with_label_values(&["output"]).inc_by(0);
+        metrics.scan_row_groups_pruned_total.inc_by(0);
         metrics.time_to_first_row.observe(0.1);
         // S3 I/O metrics
         metrics.s3_requests_total.with_label_values(&["get", "success"]).inc_by(0);

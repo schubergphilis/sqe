@@ -694,6 +694,7 @@ async fn async_main() -> anyhow::Result<()> {
     let _otel_guard = sqe_metrics::otel::init_telemetry_with_sampling(
         service_name,
         &config.metrics.otlp_endpoint,
+        &config.metrics.traces_otlp_endpoint,
         config.metrics.trace_sample_rate,
     );
 
@@ -1418,6 +1419,7 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
     }
 
     let serve_result = server_builder
+        .layer(sqe_coordinator::flight_sql::FlightTraceLayer)
         .add_service(
             arrow_flight::flight_service_server::FlightServiceServer::new(flight_service),
         )

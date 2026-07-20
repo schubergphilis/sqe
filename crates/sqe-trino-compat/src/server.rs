@@ -10,7 +10,8 @@ use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{delete, get, post};
 use axum::Router;
 use moka::sync::Cache as MokaCache;
-use tracing::{error, info, warn};
+use tracing::{error, info, warn, Instrument};
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 use uuid::Uuid;
 
 use sqe_core::Session;
@@ -1027,21 +1028,30 @@ fn build_paginated_result(
     }
 }
 
-#[tracing::instrument(
-    skip_all,
-    fields(
-        db.system.name = "sqe",
-        db.operation.name = tracing::field::Empty,
-        db.namespace = tracing::field::Empty,
-    ),
-    name = "trino.submit_query",
-)]
 async fn submit_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
     State(state): State<Arc<TrinoState<A, Q>>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     body: String,
 ) -> Response {
+    let parent = sqe_metrics::propagation::extract_trace_context_from_headers(&headers);
+    let correlation = sqe_metrics::propagation::correlation_ids_from_headers(&headers);
+    let span = tracing::info_span!(
+        "trino.submit_query",
+        db.system.name = "sqe",
+        db.operation.name = tracing::field::Empty,
+        db.namespace = tracing::field::Empty,
+        trace_id = tracing::field::Empty,
+        span_id = tracing::field::Empty,
+        request_id = tracing::field::Empty,
+        session_id = tracing::field::Empty,
+        http.request_id = tracing::field::Empty,
+        sqe.session.id = tracing::field::Empty,
+    );
+    let _ = span.set_parent(parent);
+    sqe_metrics::propagation::record_trace_fields(&span);
+    record_correlation_fields(&span, &correlation);
+    async move {
     let sql = body.trim();
     if sql.is_empty() {
         return error_response(StatusCode::BAD_REQUEST, "Empty query");
@@ -1056,9 +1066,6 @@ async fn submit_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
         .to_string();
 
     let trino_headers = extract_trino_headers(&headers);
-
-    // O6: Trace propagation for Trino HTTP.
-    sqe_metrics::propagation::attach_trace_context_from_headers(&headers);
 
     let session = if let Some(token) = extract_bearer_token(&headers) {
         match state.authenticator.authenticate_bearer(&token).await {
@@ -1282,6 +1289,13 @@ async fn submit_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
     let page_size = state.page_size;
     let owner = session.user.username.clone();
 
+    let execution_span = tracing::info_span!(
+        "trino.query.execution",
+        sqe.query.id = %query_id,
+        trace_id = tracing::field::Empty,
+        span_id = tracing::field::Empty,
+    );
+    sqe_metrics::propagation::record_trace_fields(&execution_span);
     let task = tokio::spawn(async move {
         // Drop guard: if `run_statement` panics (or the task is otherwise torn
         // down) without a terminal status set, force `Failed` on unwind so the
@@ -1339,7 +1353,8 @@ async fn submit_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
             }
         }
         task_handle.notify.notify_waiters();
-    });
+    }
+    .instrument(execution_span));
     *handle.abort.lock().unwrap() = Some(task.abort_handle());
 
     // Bounded wait: return the first page inline if the query finished, else a
@@ -1394,15 +1409,34 @@ async fn submit_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
         apply_session_headers(resp.headers_mut(), update);
     }
     resp
+    }
+    .instrument(span)
+    .await
 }
 
-#[tracing::instrument(skip_all, name = "trino.get_results")]
 async fn get_results<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
     State(state): State<Arc<TrinoState<A, Q>>>,
     ConnectInfo(_peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Path((id, token)): Path<(String, String)>,
 ) -> Response {
+    let parent = sqe_metrics::propagation::extract_trace_context_from_headers(&headers);
+    let correlation = sqe_metrics::propagation::correlation_ids_from_headers(&headers);
+    let span = tracing::info_span!(
+        "trino.get_results",
+        sqe.query.id = %id,
+        query_id = %id,
+        trace_id = tracing::field::Empty,
+        span_id = tracing::field::Empty,
+        request_id = tracing::field::Empty,
+        session_id = tracing::field::Empty,
+        http.request_id = tracing::field::Empty,
+        sqe.session.id = tracing::field::Empty,
+    );
+    let _ = span.set_parent(parent);
+    sqe_metrics::propagation::record_trace_fields(&span);
+    record_correlation_fields(&span, &correlation);
+    async move {
     // Authenticate the caller before exposing any result data.
     let session = if let Some(token) = extract_bearer_token(&headers) {
         match state.authenticator.authenticate_bearer(&token).await {
@@ -1488,9 +1522,11 @@ async fn get_results<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
             (StatusCode::NOT_FOUND, Json(response)).into_response()
         }
     }
+    }
+    .instrument(span)
+    .await
 }
 
-#[tracing::instrument(skip_all, name = "trino.get_queued_results")]
 async fn get_queued_results<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
     State(state): State<Arc<TrinoState<A, Q>>>,
     ConnectInfo(_peer): ConnectInfo<SocketAddr>,
@@ -1498,6 +1534,23 @@ async fn get_queued_results<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
     Path((id, token)): Path<(String, String)>,
     axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
 ) -> Response {
+    let parent = sqe_metrics::propagation::extract_trace_context_from_headers(&headers);
+    let correlation = sqe_metrics::propagation::correlation_ids_from_headers(&headers);
+    let span = tracing::info_span!(
+        "trino.get_queued_results",
+        sqe.query.id = %id,
+        query_id = %id,
+        trace_id = tracing::field::Empty,
+        span_id = tracing::field::Empty,
+        request_id = tracing::field::Empty,
+        session_id = tracing::field::Empty,
+        http.request_id = tracing::field::Empty,
+        sqe.session.id = tracing::field::Empty,
+    );
+    let _ = span.set_parent(parent);
+    sqe_metrics::propagation::record_trace_fields(&span);
+    record_correlation_fields(&span, &correlation);
+    async move {
     let session = if let Some(bearer) = extract_bearer_token(&headers) {
         match state.authenticator.authenticate_bearer(&bearer).await {
             Ok(s) => s,
@@ -1608,6 +1661,9 @@ async fn get_queued_results<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
         )
             .into_response(),
     }
+    }
+    .instrument(span)
+    .await
 }
 
 async fn cancel_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
@@ -1616,6 +1672,23 @@ async fn cancel_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
+    let parent = sqe_metrics::propagation::extract_trace_context_from_headers(&headers);
+    let correlation = sqe_metrics::propagation::correlation_ids_from_headers(&headers);
+    let span = tracing::info_span!(
+        "trino.cancel_query",
+        sqe.query.id = %id,
+        query_id = %id,
+        trace_id = tracing::field::Empty,
+        span_id = tracing::field::Empty,
+        request_id = tracing::field::Empty,
+        session_id = tracing::field::Empty,
+        http.request_id = tracing::field::Empty,
+        sqe.session.id = tracing::field::Empty,
+    );
+    let _ = span.set_parent(parent);
+    sqe_metrics::propagation::record_trace_fields(&span);
+    record_correlation_fields(&span, &correlation);
+    async move {
     // Authenticate the caller.
     let session = if let Some(token) = extract_bearer_token(&headers) {
         match state.authenticator.authenticate_bearer(&token).await {
@@ -1667,6 +1740,23 @@ async fn cancel_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
     state.results.invalidate(&id);
     state.queries.invalidate(&id);
     StatusCode::NO_CONTENT.into_response()
+    }
+    .instrument(span)
+    .await
+}
+
+fn record_correlation_fields(
+    span: &tracing::Span,
+    correlation: &sqe_metrics::propagation::CorrelationIds,
+) {
+    if let Some(request_id) = correlation.request_id.as_deref() {
+        span.record("request_id", request_id);
+        span.record("http.request_id", request_id);
+    }
+    if let Some(session_id) = correlation.session_id.as_deref() {
+        span.record("session_id", session_id);
+        span.record("sqe.session.id", session_id);
+    }
 }
 
 fn extract_bearer_token(headers: &HeaderMap) -> Option<String> {
@@ -1872,6 +1962,107 @@ mod tests {
         ) -> Result<Vec<arrow_array::RecordBatch>, sqe_core::SqeError> {
             Err(sqe_core::SqeError::Execution("mock".to_string()))
         }
+    }
+
+    struct TraceRecordingAuth {
+        observed: std::sync::Mutex<Vec<Option<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl TrinoAuthenticator for TraceRecordingAuth {
+        async fn authenticate(
+            &self,
+            user: &str,
+            _: &str,
+        ) -> Result<Session, sqe_core::SqeError> {
+            self.observed
+                .lock()
+                .unwrap()
+                .push(sqe_metrics::propagation::current_trace_id());
+            Ok(Session::new(
+                user.to_string(),
+                sqe_core::SecretString::new("mock-token".to_string()),
+                None,
+                chrono::Utc::now() + chrono::Duration::hours(1),
+                vec![],
+            ))
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn submit_poll_and_cancel_use_the_remote_trace_id() {
+        use opentelemetry::trace::TracerProvider;
+        use opentelemetry_sdk::propagation::TraceContextPropagator;
+        use opentelemetry_sdk::trace::SdkTracerProvider;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        opentelemetry::global::set_text_map_propagator(TraceContextPropagator::new());
+        let exporter = opentelemetry_sdk::trace::InMemorySpanExporter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter)
+            .build();
+        let tracer = provider.tracer("trino-propagation-test");
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_opentelemetry::layer().with_tracer(tracer));
+        tracing::subscriber::set_global_default(subscriber).unwrap();
+
+        let auth = Arc::new(TraceRecordingAuth {
+            observed: std::sync::Mutex::new(Vec::new()),
+        });
+        let state = Arc::new(TrinoState {
+            authenticator: auth.clone(),
+            query_handler: Arc::new(MockQuery),
+            results: build_result_cache(),
+            queries: build_query_registry(),
+            node: NodeContext {
+                version: "test".to_string(),
+                ready: Arc::new(AtomicBool::new(true)),
+                started_at: Instant::now(),
+            },
+            page_size: DEFAULT_PAGE_SIZE,
+            port: 8080,
+            oauth2: None,
+            security: SecurityConfig::default(),
+            auth_rate_limiter: None,
+            expose_version: false,
+        });
+        let trace_id = "0af7651916cd43dd8448eb211c80319c";
+        let headers = || {
+            let mut headers = basic_auth_header("test", "pw");
+            headers.insert(
+                "traceparent",
+                format!("00-{trace_id}-b7ad6b7169203331-01")
+                    .parse()
+                    .unwrap(),
+            );
+            headers
+        };
+
+        let _ = submit_query(
+            State(state.clone()),
+            test_peer(),
+            headers(),
+            "SELECT 1".to_string(),
+        )
+        .await;
+        let _ = get_results(
+            State(state.clone()),
+            test_peer(),
+            headers(),
+            Path(("query-42".to_string(), "bad-page".to_string())),
+        )
+        .await;
+        let _ = cancel_query(
+            State(state),
+            test_peer(),
+            headers(),
+            Path("query-42".to_string()),
+        )
+        .await;
+
+        let observed = auth.observed.lock().unwrap().clone();
+        assert_eq!(observed, vec![Some(trace_id.to_string()); 3]);
+        provider.shutdown().unwrap();
     }
 
     /// Captures the SQL strings the executor is asked to run, so a test can

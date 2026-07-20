@@ -175,6 +175,8 @@ global_queries_per_minute = 1000
 [metrics]
 prometheus_port = 9090          # Prometheus /metrics endpoint
 otlp_endpoint = ""              # OTLP gRPC endpoint (empty = disabled)
+traces_otlp_endpoint = ""       # trace-only OTLP gRPC endpoint
+trace_sample_rate = 0.01         # 0.0 to 1.0
 audit_log_path = ""             # Audit JSONL file (empty = disabled)
 ```
 
@@ -235,6 +237,8 @@ Every config field can be overridden via environment variable. Convention: `SQE_
 | **Metrics** | | |
 | `SQE_METRICS__PROMETHEUS_PORT` | `metrics.prometheus_port` | u16 |
 | `SQE_METRICS__OTLP_ENDPOINT` | `metrics.otlp_endpoint` | string |
+| `SQE_METRICS__TRACES_OTLP_ENDPOINT` | `metrics.traces_otlp_endpoint` | string |
+| `SQE_METRICS__TRACE_SAMPLE_RATE` | `metrics.trace_sample_rate` | f64 |
 | `SQE_METRICS__AUDIT_LOG_PATH` | `metrics.audit_log_path` | string |
 
 Boolean values accept: `true`/`false`, `1`/`0`, `yes`/`no`.

@@ -307,7 +307,7 @@ Full archive in [`docs/site/blog/`](docs/site/blog/).
 | Catalogs | Polaris, Nessie, Unity Catalog OSS, AWS Glue, AWS S3 Tables, Hive Metastore, JDBC, Hadoop |
 | Wire Protocols | Arrow Flight SQL + Trino HTTP |
 | Storage | S3, Ceph, R2, ADLS Gen2, GCS, local filesystem, HuggingFace `hf://` |
-| Observability | OpenTelemetry, Prometheus, OpenLineage 2-0-2, read-only web UI (queries/tasks/workers/metrics dashboard with 12h history) on the health port |
+| Observability | OpenTelemetry with trace-only or all-signal OTLP, Prometheus query/session/Iceberg scan metrics, OpenLineage 2-0-2, read-only web UI (queries/tasks/workers/metrics dashboard with 12h history) on the health port |
 | License | Apache 2.0 |
 
 
