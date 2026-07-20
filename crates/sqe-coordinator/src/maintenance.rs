@@ -143,15 +143,118 @@ impl MaintenanceHandler {
             ProcedureCall::DropTable { table, purge } => {
                 self.drop_table(session, table, *purge).await
             }
-            ProcedureCall::SetCurrentSnapshot { .. }
-            | ProcedureCall::RollbackToSnapshot { .. } => Err(SqeError::Execution(
-                format!(
-                    "CALL system.{}: snapshot pointer operations are not yet implemented; \
-                     track via the SQL extensions roadmap",
-                    call.name()
-                ),
-            )),
+            ProcedureCall::SetCurrentSnapshot { table, snapshot_id } => {
+                self.move_main_ref(session, table, *snapshot_id, false, "set_current_snapshot")
+                    .await
+            }
+            ProcedureCall::RollbackToSnapshot { table, snapshot_id } => {
+                self.move_main_ref(session, table, *snapshot_id, true, "rollback_to_snapshot")
+                    .await
+            }
         }
+    }
+
+    /// Move the `main` branch ref to an existing snapshot, repointing the
+    /// table's current snapshot. Both `set_current_snapshot` and
+    /// `rollback_to_snapshot` are this one metadata-only commit; the only
+    /// difference is `require_ancestor`:
+    ///
+    /// - `set_current_snapshot` (false): repoint to ANY snapshot in the table.
+    /// - `rollback_to_snapshot` (true): the target must be an ancestor of the
+    ///   current snapshot (you can only roll backward along the current
+    ///   history), matching Spark/Iceberg semantics and preventing an
+    ///   accidental forward jump onto a divergent line.
+    ///
+    /// No snapshots are removed — the snapshot log (audit trail) is preserved;
+    /// only the `main` pointer moves. SELECTs read the target state once the
+    /// table cache is invalidated below.
+    async fn move_main_ref(
+        &self,
+        session: &Session,
+        table_ref: &TableRef,
+        snapshot_id: i64,
+        require_ancestor: bool,
+        op_name: &'static str,
+    ) -> sqe_core::Result<Vec<RecordBatch>> {
+        use iceberg::spec::MAIN_BRANCH;
+
+        let catalog = self
+            .create_catalog_bridge(session, table_ref.catalog.as_deref())
+            .await?;
+        let ident = to_table_ident(table_ref);
+        let table = load_table(&catalog, &ident).await?;
+
+        let before = table.metadata().current_snapshot_id().unwrap_or(-1);
+
+        // Target must exist in the table's snapshot history.
+        if table.metadata().snapshot_by_id(snapshot_id).is_none() {
+            return Err(SqeError::Execution(format!(
+                "CALL system.{op_name}: snapshot id {snapshot_id} not found in table '{ident}' history"
+            )));
+        }
+
+        // Rollback safety: target must be an ancestor of the current snapshot.
+        // Walk the parent chain from current; set_current_snapshot skips this.
+        if require_ancestor {
+            let mut cursor = table.metadata().current_snapshot_id();
+            let mut is_ancestor = false;
+            while let Some(id) = cursor {
+                if id == snapshot_id {
+                    is_ancestor = true;
+                    break;
+                }
+                cursor = table
+                    .metadata()
+                    .snapshot_by_id(id)
+                    .and_then(|s| s.parent_snapshot_id());
+            }
+            if !is_ancestor {
+                return Err(SqeError::Execution(format!(
+                    "CALL system.rollback_to_snapshot: snapshot id {snapshot_id} is not an ancestor \
+                     of the current snapshot of '{ident}'; use set_current_snapshot to move to an \
+                     arbitrary snapshot"
+                )));
+            }
+        }
+
+        // Repoint `main` at the target. create_branch with the default
+        // if_not_exists=false updates the existing ref (if_not_exists=true
+        // would silently no-op on an existing branch). This resets main's
+        // retention to Branch{None,None,None}, which is the intended default
+        // for these operations.
+        let tx = Transaction::new(&table);
+        let action = tx.create_branch(MAIN_BRANCH).with_snapshot_id(snapshot_id);
+        let tx = action
+            .apply(tx)
+            .map_err(|e| SqeError::Execution(format!("{op_name} apply failed: {e}")))?;
+        let committed = tx
+            .commit(catalog.as_ref())
+            .await
+            .map_err(|e| classify_commit_error(e, op_name))?;
+
+        // Invalidate the table cache so subsequent SELECTs see the moved
+        // pointer immediately instead of a stale pre-move snapshot.
+        sqe_catalog::invalidate_rest_catalog_cache_all().await;
+
+        let after = committed.metadata().current_snapshot_id().unwrap_or(-1);
+
+        info!(
+            user = %session.user.username,
+            table = %ident,
+            before_snapshot = before,
+            after_snapshot = after,
+            "{op_name}: committed main ref move"
+        );
+
+        Ok(vec![summary_batch(
+            op_name,
+            &ident,
+            before,
+            after,
+            0,
+            0,
+            format!("snapshot {before} -> {after}"),
+        )?])
     }
 
     /// Register an existing Iceberg table by pointing the catalog at its
