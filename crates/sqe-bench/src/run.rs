@@ -5,7 +5,7 @@
 //! Read-path only. Every suite here is treated as a golden read suite. Write
 //! suites (reset/copy) are a separate follow-up.
 
-use crate::{client, comparison, profile, test};
+use crate::{client, profile, report, status, suite};
 
 /// Golden catalog alias attached coordinator-wide for the run.
 const GOLDEN_CATALOG: &str = "golden";
@@ -67,58 +67,79 @@ pub async fn run(args: RunArgs) -> anyhow::Result<()> {
         }
     }
 
+    // Build the Trino client ONCE (compare mode) so each query's single SQE run
+    // is paired with a single Trino run inside the one `run_suite` pass. The
+    // `admin` user header is required (Trino rejects query submit with 401
+    // otherwise) and `iceberg` matches the properties filename benchmark.sh
+    // writes for the compare Trino (iceberg.properties -> catalog `iceberg`).
+    // Mirrors the standalone `compare` verb defaults. Guard the missing endpoint
+    // here so `--compare-trino` without BENCH_TRINO_ENDPOINT still fails fast.
+    let trino_client: Option<Box<dyn client::BenchClient>> = if args.compare_trino {
+        let trino_ep = args
+            .trino_endpoint
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("--compare-trino needs BENCH_TRINO_ENDPOINT"))?;
+        Some(Box::new(
+            client::trino::TrinoBenchClient::new(trino_ep, Some("admin"), None)
+                .with_catalog("iceberg"),
+        ))
+    } else {
+        None
+    };
+
+    // Catalog resolution reproduces the two verified paths exactly. `run_suite`
+    // applies the catalog prefix to the ONE namespace BOTH engines read:
+    //   * SQE-only (no compare): `Some("golden")` -> SQE reads `golden.<ns>`
+    //     via the attached golden catalog (the pre-refactor test path).
+    //   * Compare: `None` -> both engines read bare `<ns>`; SQE resolves via its
+    //     golden-default session, Trino via `.with_catalog("iceberg")`. Passing
+    //     `Some("golden")` here would prefix Trino's SQL with `golden.`, which
+    //     Trino parses as catalog=golden and fails to resolve.
+    // The report JSON is identical either way -- the namespace is not serialized;
+    // only rows/pass/diff are, and those do not change with the prefix.
+    let catalog = if args.compare_trino {
+        None
+    } else {
+        Some(GOLDEN_CATALOG)
+    };
+
     let mut any_failure = false;
     for suite in &args.suites {
         println!("\n=== {suite} (sf{}) via golden ===", args.scale);
-        let results = test::run_and_report(
+
+        // Single pass: SQE runs each query once (and Trino once, in compare
+        // mode). The report results and the optional comparison both come from
+        // this one sweep -- no separate compare re-execution of SQE.
+        let out = suite::run_suite(
             bench_client.as_ref(),
+            trino_client.as_deref(),
             suite,
             args.scale,
             args.query.as_deref(),
+            catalog,
+            None,
+            &endpoint,
+            args.trino_endpoint.as_deref(),
         )
         .await?;
-        if results.iter().any(|r| {
-            // Preserves the pre-refactor exit set exactly: the old
-            // `TestStatus::Error` bucket included timeouts (the timeout
-            // site built `TestStatus::Error(...)`), so `Timeout` stays in
-            // this set here. `is_real_failure` excludes `Timeout` -- that's
-            // a deliberate policy change owned by a later task, not this one.
-            matches!(
-                r.outcome,
-                crate::status::QueryOutcome::WrongRows(_)
-                    | crate::status::QueryOutcome::Error(_)
-                    | crate::status::QueryOutcome::Timeout(_)
-            )
-        }) {
-            any_failure = true;
-        }
 
-        if args.compare_trino {
-            let trino_ep = args
-                .trino_endpoint
-                .as_deref()
-                .ok_or_else(|| anyhow::anyhow!("--compare-trino needs BENCH_TRINO_ENDPOINT"))?;
-            // The comparison qualifies tables with bare 2-part `<ns>.<table>`
-            // names, so the Trino session needs a default catalog. `iceberg`
-            // matches the properties filename benchmark.sh writes for the
-            // compare Trino (iceberg.properties -> catalog `iceberg`). Mirrors
-            // the standalone `compare` verb; `create_client` leaves it unset.
-            // `admin` user header is required (Trino rejects query submit with
-            // 401 otherwise); matches the standalone `compare` verb default.
-            let trino_client = client::trino::TrinoBenchClient::new(trino_ep, Some("admin"), None)
-                .with_catalog("iceberg");
-            let comparison_report = comparison::run_comparison(
-                suite,
-                args.scale,
-                bench_client.as_ref(),
-                &trino_client,
-                &endpoint,
-                trino_ep,
-                args.query.as_deref(),
-                "benchmarks/results",
-            )
-            .await?;
-            let summary = &comparison_report.summary;
+        report::print_summary(suite, args.scale, "flight", &out.results);
+        let path = report::write_json_report(suite, args.scale, "flight", &out.results)?;
+        println!("Report written to: {path}");
+
+        // Exit policy: fail the run only on genuine correctness/execution
+        // failures (`Error | WrongRows`). Timeouts and vacuous results are
+        // surfaced in the summary but do not fail the run (SP1 design).
+        any_failure |= out
+            .results
+            .iter()
+            .any(|r| status::is_real_failure(&r.outcome));
+
+        if let Some(cmp) = out.comparison {
+            let cpath =
+                report::write_comparison_report(&cmp, suite, args.scale, "benchmarks/results")?;
+            println!("Compare report written to: {cpath}");
+            let summary = &cmp.summary;
             println!(
                 "compare {suite}: {}/{} matched (row_diff {}, sqe_failed {}, trino_failed {}, both_failed {}, vacuous_bug {}); see compare JSON for full breakdown",
                 summary.matched, summary.total,

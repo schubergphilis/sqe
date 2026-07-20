@@ -250,17 +250,8 @@ pub async fn run_comparison(
     };
 
     // Save JSON report
-    let output_path = std::path::Path::new(output_dir);
-    std::fs::create_dir_all(output_path)?;
-    let filename = format!(
-        "compare-{}-sf{}-{}.json",
-        benchmark,
-        crate::format_scale(scale),
-        chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S")
-    );
-    let report_path = output_path.join(&filename);
-    std::fs::write(&report_path, serde_json::to_string_pretty(&report)?)?;
-    info!("Report saved to {}", report_path.display());
+    let report_path = crate::report::write_comparison_report(&report, benchmark, scale, output_dir)?;
+    info!("Report saved to {}", report_path);
 
     // Print markdown summary
     println!(

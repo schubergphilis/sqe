@@ -322,7 +322,6 @@ pub enum LegacyBucket { Pass, Fail, Diff, Skip, Error }
 
 /// The run fails only on genuine correctness/execution failures. Timeouts and
 /// vacuous results are surfaced but do not fail the run (see SP1 design).
-#[allow(dead_code)]
 pub fn is_real_failure(o: &QueryOutcome) -> bool {
     matches!(o, QueryOutcome::Error(_) | QueryOutcome::WrongRows(_))
 }

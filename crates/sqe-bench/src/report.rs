@@ -171,6 +171,30 @@ pub fn write_json_report(
     Ok(path)
 }
 
+/// Serialise a `ComparisonReport` to a JSON file under `output_dir` and return
+/// the written path. The filename format `compare-{bench}-sf{scale}-{ts}.json`
+/// is glob-matched by committed results + chart tooling, so it must stay stable.
+/// Only the filename timestamp is generated here; `report.timestamp` (the
+/// rfc3339 field set at report-build time) is left untouched.
+pub(crate) fn write_comparison_report(
+    report: &ComparisonReport,
+    benchmark: &str,
+    scale: f64,
+    output_dir: &str,
+) -> anyhow::Result<String> {
+    let output_path = std::path::Path::new(output_dir);
+    std::fs::create_dir_all(output_path)?;
+    let filename = format!(
+        "compare-{}-sf{}-{}.json",
+        benchmark,
+        crate::format_scale(scale),
+        chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S")
+    );
+    let report_path = output_path.join(&filename);
+    std::fs::write(&report_path, serde_json::to_string_pretty(report)?)?;
+    Ok(report_path.display().to_string())
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
