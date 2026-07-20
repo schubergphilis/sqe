@@ -514,6 +514,33 @@ impl MaintenanceHandler {
         let ident = to_table_ident(table_ref);
         let table = load_table(&catalog, &ident).await?;
 
+        // Delete-safety guard (Phase 1). The current rewrite path reads raw
+        // Parquet without applying position/equality deletes; the rewritten
+        // files get new paths and a new sequence number, so the surviving
+        // delete files no longer match them (the referenced-data-file dangling
+        // check is an unimplemented TODO in the vendored fork). On a
+        // Merge-on-Read table that silently resurrects deleted rows. Until the
+        // delete-applying rewrite lands (Phase 2), refuse rather than corrupt.
+        let live_deletes = count_live_delete_files(&table).await?;
+        if live_deletes > 0 {
+            info!(
+                table = %ident,
+                live_deletes,
+                "rewrite_data_files: skipping, table has live delete files"
+            );
+            return Ok(vec![summary_batch(
+                call_name_rewrite(),
+                &ident,
+                0,
+                0,
+                0,
+                0,
+                format!(
+                    "skipped: {live_deletes} live delete file(s); delete-aware rewrite not yet supported"
+                ),
+            )?]);
+        }
+
         let old_data_files = collect_live_data_files(&table).await?;
         let input_count = old_data_files.len();
         let total_bytes: i64 = old_data_files
@@ -1213,6 +1240,56 @@ async fn load_table(catalog: &Arc<dyn Catalog>, ident: &TableIdent) -> sqe_core:
         .map_err(|e| SqeError::Catalog(format!("Failed to load table '{ident}': {e}")))
 }
 
+/// True when a manifest entry is a live delete file (position or equality).
+///
+/// A live entry is one whose status is not `Deleted`; a delete file is any
+/// entry whose content type is not `Data`. `rewrite_data_files` cannot bin-pack
+/// a table with such entries: the raw-Parquet read path does not apply deletes,
+/// and the rewritten files get new paths/sequence numbers that the surviving
+/// deletes no longer match, so deleted rows would silently reappear.
+fn is_live_delete_entry(entry: &iceberg::spec::ManifestEntry) -> bool {
+    entry.status() != ManifestStatus::Deleted
+        && entry.content_type() != DataContentType::Data
+}
+
+/// Count live delete files (position + equality) in the current snapshot.
+/// Non-zero means `rewrite_data_files` must refuse to bin-pack (see
+/// `is_live_delete_entry`). Modeled on `collect_live_data_files`.
+async fn count_live_delete_files(table: &IcebergTable) -> sqe_core::Result<usize> {
+    use futures::{StreamExt, TryStreamExt};
+
+    let metadata_ref = table.metadata_ref();
+    let snapshot = match metadata_ref.current_snapshot() {
+        Some(s) => s,
+        None => return Ok(0),
+    };
+
+    let cache = table.object_cache();
+    let manifest_list = cache
+        .get_manifest_list(snapshot, &metadata_ref)
+        .await
+        .map_err(|e| SqeError::Execution(format!("Failed to load manifest list: {e}")))?;
+
+    const CONCURRENCY: usize = 8;
+    let manifests: Vec<Arc<iceberg::spec::Manifest>> =
+        futures::stream::iter(manifest_list.entries().iter().cloned())
+            .map(|mf| {
+                let cache = cache.clone();
+                async move { cache.get_manifest(&mf).await }
+            })
+            .buffer_unordered(CONCURRENCY)
+            .try_collect()
+            .await
+            .map_err(|e| SqeError::Execution(format!("Failed to load manifest: {e}")))?;
+
+    let count = manifests
+        .into_iter()
+        .flat_map(|m| m.entries().to_vec())
+        .filter(|e| is_live_delete_entry(e))
+        .count();
+    Ok(count)
+}
+
 /// Collect the live data files of the current snapshot. Mirrors the helper
 /// in `WriteHandler` but does not need access to the compression config, so
 /// it stays in this module.
@@ -1601,6 +1678,50 @@ mod tests {
         }
         let total: usize = groups.iter().map(|g| g.len()).sum();
         assert_eq!(total, 4);
+    }
+
+    #[test]
+    fn is_live_delete_entry_flags_position_deletes() {
+        use iceberg::spec::{
+            DataFileBuilder, DataFileFormat, ManifestEntry, ManifestStatus, Struct,
+        };
+        let df = DataFileBuilder::default()
+            .content(DataContentType::PositionDeletes)
+            .file_path("pd".to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(1)
+            .record_count(1)
+            .partition(Struct::empty())
+            .partition_spec_id(0)
+            .build()
+            .expect("build delete file");
+        let entry = ManifestEntry::builder()
+            .status(ManifestStatus::Added)
+            .data_file(df)
+            .build();
+        assert!(is_live_delete_entry(&entry));
+    }
+
+    #[test]
+    fn is_live_delete_entry_rejects_data_and_deleted() {
+        use iceberg::spec::{
+            DataFileBuilder, DataFileFormat, Literal, ManifestEntry, ManifestStatus, Struct,
+        };
+        let data = DataFileBuilder::default()
+            .content(DataContentType::Data)
+            .file_path("d".to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(1)
+            .record_count(1)
+            .partition(Struct::from_iter([Some(Literal::long(0))]))
+            .partition_spec_id(0)
+            .build()
+            .expect("build data file");
+        let entry = ManifestEntry::builder()
+            .status(ManifestStatus::Added)
+            .data_file(data)
+            .build();
+        assert!(!is_live_delete_entry(&entry), "data file is not a delete");
     }
 
     #[test]
