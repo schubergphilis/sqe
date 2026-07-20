@@ -292,20 +292,36 @@ async fn rewrite_zorder_strategy_preserves_rows() {
     let _ = handler.execute(&session, &format!("DROP TABLE IF EXISTS {table}"), None).await;
 }
 
-/// Read one Utf8 column across all batches into a Vec (scan order).
-async fn read_str_col(
+/// Read per-file `(lower, upper)` id bounds from `table_files` in a single
+/// query so each row keeps its own pair (field id 1 = the `id` column). Two
+/// separate queries would rely on both returning rows in the same order.
+async fn read_id_ranges(
     handler: &sqe_coordinator::QueryHandler,
     session: &sqe_core::Session,
-    sql: &str,
-    col: usize,
-) -> Vec<String> {
+    namespace: &str,
+    table_name: &str,
+) -> Vec<(i64, i64)> {
     use arrow_array::StringArray;
-    let batches = handler.execute(session, sql, None).await.expect("query");
+    let batches = handler
+        .execute(
+            session,
+            &format!(
+                "SELECT lower_bounds, upper_bounds FROM table_files('{namespace}', '{table_name}')"
+            ),
+            None,
+        )
+        .await
+        .expect("bounds query");
     let mut out = Vec::new();
     for b in &batches {
-        let c = b.column(col).as_any().downcast_ref::<StringArray>().expect("Utf8");
-        for i in 0..c.len() {
-            out.push(c.value(i).to_string());
+        let lo = b.column(0).as_any().downcast_ref::<StringArray>().expect("Utf8 lower");
+        let hi = b.column(1).as_any().downcast_ref::<StringArray>().expect("Utf8 upper");
+        for i in 0..b.num_rows() {
+            let l = parse_bound(lo.value(i), 1)
+                .unwrap_or_else(|| panic!("missing lower bound for id in {}", lo.value(i)));
+            let u = parse_bound(hi.value(i), 1)
+                .unwrap_or_else(|| panic!("missing upper bound for id in {}", hi.value(i)));
+            out.push((l, u));
         }
     }
     out
@@ -391,39 +407,16 @@ async fn rewrite_sort_produces_disjoint_file_ranges() {
     let ids = read_i64_col(&handler, &session, &format!("SELECT id FROM {table} ORDER BY id")).await;
     assert_eq!(ids, (0..TOTAL).collect::<Vec<_>>(), "row set must be preserved exactly");
 
-    // Read per-file id bounds. `id` is field id 1 (first column).
-    let lowers = read_str_col(
-        &handler,
-        &session,
-        &format!("SELECT lower_bounds FROM table_files('{namespace}', '{table_name}')"),
-        0,
-    )
-    .await;
-    let uppers = read_str_col(
-        &handler,
-        &session,
-        &format!("SELECT upper_bounds FROM table_files('{namespace}', '{table_name}')"),
-        0,
-    )
-    .await;
-    assert_eq!(lowers.len(), uppers.len());
+    // Read per-file id bounds. `id` is field id 1 (first column). Fetch both
+    // bound columns in ONE query so each row keeps its own (lower, upper) pair;
+    // two separate queries would rely on identical row ordering to zip.
+    let ranges = read_id_ranges(&handler, &session, namespace, table_name).await;
     assert!(
-        lowers.len() >= 2,
+        ranges.len() >= 2,
         "test must produce >= 2 output files to exercise pruning; got {} (raise TOTAL or lower target)",
-        lowers.len()
+        ranges.len()
     );
-
-    // Collect [lower, upper] on id per file and sort by lower.
-    let mut ranges: Vec<(i64, i64)> = lowers
-        .iter()
-        .zip(uppers.iter())
-        .map(|(lo, hi)| {
-            (
-                parse_bound(lo, 1).unwrap_or_else(|| panic!("missing lower bound for id in {lo}")),
-                parse_bound(hi, 1).unwrap_or_else(|| panic!("missing upper bound for id in {hi}")),
-            )
-        })
-        .collect();
+    let mut ranges = ranges;
     ranges.sort_by_key(|(lo, _)| *lo);
 
     // Each file's range is well-formed and disjoint from the next (ids are
@@ -440,6 +433,107 @@ async fn rewrite_sort_produces_disjoint_file_ranges() {
     for (lo, hi) in &ranges {
         assert!(lo <= hi, "each file range must be well-formed, got ({lo}, {hi})");
     }
+
+    let _ = handler.execute(&session, &format!("DROP TABLE IF EXISTS {table}"), None).await;
+}
+
+/// The two features this branch touches, combined: sort compaction on a
+/// Merge-on-Read table that carries position deletes. Whole-partition grouping
+/// is new for the sort path, and delete application happens per-file inside the
+/// scan; this proves they compose. After the sort-compact the deleted rows must
+/// stay gone, the surviving rows must be complete, and the multi-file output
+/// must still come out with disjoint id ranges.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs docker-compose.test.yml + Polaris"]
+async fn rewrite_sort_applies_deletes_and_keeps_disjoint_ranges() {
+    let (session, handler) = crate::common::setup_handler().await;
+    let namespace = "default";
+    let table_name = "rewrite_sort_mor_deletes";
+    let table = format!("{namespace}.{table_name}");
+    let _ = handler.execute(&session, &format!("DROP TABLE IF EXISTS {table}"), None).await;
+    handler
+        .execute(
+            &session,
+            &format!(
+                "CREATE TABLE {table} (id BIGINT, v BIGINT) \
+                 TBLPROPERTIES ('write.delete.mode' = 'merge-on-read')"
+            ),
+            None,
+        )
+        .await
+        .expect("CREATE");
+
+    const FILES: i64 = 40;
+    const ROWS_PER_FILE: i64 = 300; // 12000 rows total
+    const TOTAL: i64 = FILES * ROWS_PER_FILE;
+    const DELETED_BELOW: i64 = 2000; // delete ids [0, 2000)
+    for f in 0..FILES {
+        let values: Vec<String> = (0..ROWS_PER_FILE)
+            .map(|r| {
+                let id = r * FILES + f;
+                format!("({id}, {})", id * 2)
+            })
+            .collect();
+        handler
+            .execute(&session, &format!("INSERT INTO {table} VALUES {}", values.join(", ")), None)
+            .await
+            .expect("INSERT");
+    }
+
+    // MoR DELETE -> position deletes spread across the interleaved files.
+    handler
+        .execute(&session, &format!("DELETE FROM {table} WHERE id < {DELETED_BELOW}"), None)
+        .await
+        .expect("DELETE");
+    let survivors = TOTAL - DELETED_BELOW;
+    let count_before = read_i64_col(&handler, &session, &format!("SELECT COUNT(*) FROM {table}")).await;
+    assert_eq!(count_before, vec![survivors], "setup: DELETE must take effect");
+
+    // Sort-compact with a tiny target to force multiple output files.
+    let summary = handler
+        .execute(
+            &session,
+            &format!(
+                "CALL system.rewrite_data_files(table => '{table}', min_input_files => 2, \
+                 strategy => 'sort', sort_order => 'id ASC', target_file_size_bytes => 1024)"
+            ),
+            None,
+        )
+        .await
+        .expect("rewrite sort");
+    assert!(
+        !status_col(&summary).contains("skipped"),
+        "sort compaction must run, got '{}'",
+        status_col(&summary)
+    );
+
+    // Correctness: deleted rows stay gone, survivors are complete and exact.
+    let ids = read_i64_col(&handler, &session, &format!("SELECT id FROM {table} ORDER BY id")).await;
+    assert_eq!(
+        ids,
+        (DELETED_BELOW..TOTAL).collect::<Vec<_>>(),
+        "surviving row set must be exactly the non-deleted ids"
+    );
+
+    // Layout: multiple output files with disjoint id ranges.
+    let mut ranges = read_id_ranges(&handler, &session, namespace, table_name).await;
+    assert!(
+        ranges.len() >= 2,
+        "expected >= 2 output files, got {}",
+        ranges.len()
+    );
+    ranges.sort_by_key(|(lo, _)| *lo);
+    for w in ranges.windows(2) {
+        assert!(
+            w[0].1 < w[1].0,
+            "output files must have disjoint id ranges, got {ranges:?}"
+        );
+    }
+    // No file can reference a deleted id.
+    assert!(
+        ranges.iter().all(|(lo, _)| *lo >= DELETED_BELOW),
+        "no output file may carry a deleted id, got {ranges:?}"
+    );
 
     let _ = handler.execute(&session, &format!("DROP TABLE IF EXISTS {table}"), None).await;
 }
