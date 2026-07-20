@@ -10,6 +10,8 @@
 
 ## Global Constraints
 
+- **CRATE STRUCTURE (overrides any task step that says otherwise):** `sqe-bench` is a bin+lib crate. The benchmark modules (`cli`, `client`, `compare`, `comparison`, `report`, `run`, `test`, `profile`, `load`) are declared in **`main.rs`** (`mod <name>;`), NOT `lib.rs` (which only exports `generate`/`sink`). New modules (`query`, `execute`, `status`, `suite`) are added to the `mod` list in **`main.rs`**. Unit tests run under **`cargo test -p sqe-bench --bin sqe-bench <filter>`**, NOT `--lib`. Wherever a task step below says "lib.rs" or "`--lib`", read it as "main.rs" / "`--bin sqe-bench`".
+- **NAMING:** a `compare` module already exists (`compare.rs` = the `Compare` verb handler). The `comparison.rs` split therefore keeps the name `comparison` and becomes a directory `comparison/{mod.rs, classify.rs}` — do NOT create a `compare/` tree. The comparison JSON types (`ComparisonReport`, `ComparisonSummary`, `QueryComparison`, `CompareStatusReport`) ALREADY live in `report.rs` and STAY there — there is no `comparison/report.rs`.
 - The `BENCH_SUMMARY:<bench>:<pass>:<fail>:<diff>:<skip>:<error>:<total>:<total_ms>` stdout line is UNCHANGED (8 colon-separated fields, same buckets). Shell parsers depend on it.
 - The report JSON (`BenchmarkReport`/`Summary`/`QueryReportEntry`, status strings `pass|fail|diff|skip|error`) and compare JSON (`ComparisonReport`/`ComparisonSummary`/`QueryComparison`/`CompareStatusReport`) schemas are UNCHANGED.
 - Exit policy: a run exits non-zero IFF at least one query outcome is `Error` or `WrongRows`. `Timeout`, `Vacuous`, `Diff`, `Skip` never fail the run.
@@ -54,7 +56,7 @@ Task order below is dependency-safe: extract leaf modules first (no behavior cha
 
 - [ ] **Step 4: Build + test.**
 
-Run: `cargo test -p sqe-bench --lib query 2>&1 | tail -20`
+Run: `cargo test -p sqe-bench --bin sqe-bench query 2>&1 | tail -20`
 Expected: the moved `prefix_tables` tests PASS; crate compiles.
 
 - [ ] **Step 5: Commit.**
@@ -119,7 +121,7 @@ mod outcome_tests {
 }
 ```
 
-- [ ] **Step 2b: Run it to see it fail.** Run: `cargo test -p sqe-bench --lib outcome_tests 2>&1 | tail -15`. Expected: FAIL — `QueryOutcome`, `LegacyBucket`, `is_real_failure`, `legacy_bucket` not defined.
+- [ ] **Step 2b: Run it to see it fail.** Run: `cargo test -p sqe-bench --bin sqe-bench outcome_tests 2>&1 | tail -15`. Expected: FAIL — `QueryOutcome`, `LegacyBucket`, `is_real_failure`, `legacy_bucket` not defined.
 
 - [ ] **Step 3: Implement the taxonomy.** Add to `status.rs`:
 
@@ -185,7 +187,7 @@ pub fn classify_vs_expected(
 
 (Adjust the `RecordBatch` import path to match the crate's existing usage in `test.rs`.)
 
-- [ ] **Step 4: Run to verify pass.** Run: `cargo test -p sqe-bench --lib status 2>&1 | tail -15`. Expected: PASS (moved `compare_results` tests + new `outcome_tests`).
+- [ ] **Step 4: Run to verify pass.** Run: `cargo test -p sqe-bench --bin sqe-bench status 2>&1 | tail -15`. Expected: PASS (moved `compare_results` tests + new `outcome_tests`).
 
 - [ ] **Step 5: Commit.**
 
@@ -203,7 +205,7 @@ git commit -m "refactor(bench): extract status module + QueryOutcome taxonomy, e
 - Modify: `crates/sqe-bench/src/lib.rs`
 
 **Interfaces:**
-- Consumes: `crate::client::BenchClient`, `crate::status::QueryOutcome`, `crate::compare::classify::is_transport_error` (moved in Task 5 — until then, inline a local copy; Task 5 dedups).
+- Consumes: `crate::client::BenchClient`, `crate::status::QueryOutcome`, `crate::comparison::classify::is_transport_error` (moved in Task 5 — until then, inline a local copy; Task 5 dedups).
 - Produces:
   - `execute::QueryRun { rows: usize, duration: std::time::Duration, result: Result<Vec<arrow_array::RecordBatch>, String>, timed_out_after: Option<u64> }`.
   - `execute::run_query(client: &dyn BenchClient, id: &str, sql: &str, timeout_secs: u64) -> QueryRun` — runs the query once with the existing `tokio::select!` timeout; on a transport-shaped error, retries once on a fresh connection (as `comparison.rs` does today); never panics.
@@ -246,11 +248,11 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run to see it fail.** Run: `cargo test -p sqe-bench --lib execute 2>&1 | tail -15`. Expected: FAIL — `run_query`/`resolve_timeout`/`QueryRun` not defined.
+- [ ] **Step 2: Run to see it fail.** Run: `cargo test -p sqe-bench --bin sqe-bench execute 2>&1 | tail -15`. Expected: FAIL — `run_query`/`resolve_timeout`/`QueryRun` not defined.
 
 - [ ] **Step 3: Implement.** Port the timeout `tokio::select!` block and the transport retry out of `run_benchmark_test`/`run_comparison` into `run_query`. `QueryRun.rows` = sum of `batch.num_rows()` on success, else 0. `resolve_timeout` copies the env>header>300 logic from Task-2 source. Add `pub mod execute;` to `lib.rs`.
 
-- [ ] **Step 4: Run to verify pass.** Run: `cargo test -p sqe-bench --lib execute 2>&1 | tail -15`. Expected: PASS.
+- [ ] **Step 4: Run to verify pass.** Run: `cargo test -p sqe-bench --bin sqe-bench execute 2>&1 | tail -15`. Expected: PASS.
 
 - [ ] **Step 5: Commit.**
 
@@ -276,7 +278,7 @@ git commit -m "refactor(bench): execute::run_query primitive (one execution, tim
 
 - [ ] **Step 3: Update `report.rs` unit tests.** Change `make_results()` to build `QueryOutcome` values; keep the `count_results_correct` and `write_json_report_creates_file` assertions (they check the legacy buckets/strings, which must still hold). Add one case asserting a `Timeout(60)` result serializes with `status == "error"` and a `Vacuous` result with `status == "pass"`.
 
-- [ ] **Step 4: Run tests.** Run: `cargo test -p sqe-bench --lib report 2>&1 | tail -20`. Expected: PASS; `BENCH_SUMMARY` field order/count unchanged.
+- [ ] **Step 4: Run tests.** Run: `cargo test -p sqe-bench --bin sqe-bench report 2>&1 | tail -20`. Expected: PASS; `BENCH_SUMMARY` field order/count unchanged.
 
 - [ ] **Step 5: Commit.**
 
@@ -287,29 +289,29 @@ git commit -m "refactor(bench): report.rs maps QueryOutcome to stable legacy buc
 
 ---
 
-### Task 5: Split `comparison.rs` into `compare/` (mechanical, no behavior change)
+### Task 5: Split `comparison.rs` into `comparison/` (mechanical, no behavior change)
 
 **Files:**
-- Create: `crates/sqe-bench/src/compare/mod.rs`, `crates/sqe-bench/src/compare/classify.rs`, `crates/sqe-bench/src/compare/report.rs`
+- Create: `crates/sqe-bench/src/comparison/mod.rs`, `crates/sqe-bench/src/comparison/classify.rs`
 - Delete: `crates/sqe-bench/src/comparison.rs`
-- Modify: `crates/sqe-bench/src/lib.rs`, `crates/sqe-bench/src/run.rs`, `crates/sqe-bench/src/main.rs` (any `comparison::` references)
+- Modify: `crates/sqe-bench/src/main.rs` (the `mod comparison;` line stays as-is — it now resolves to the directory; verify no `comparison::` callers break)
 
 **Interfaces:**
-- Produces: `compare::run_comparison(...)` (same signature as today's `comparison::run_comparison`), `compare::classify::classify_status(...)` and `compare::classify::is_transport_error(&str) -> bool`, `compare::report::*` (re-export of `ComparisonReport` etc. from `crate::report`).
+- Produces: `comparison::run_comparison(...)` (same signature as today), `comparison::classify::classify_status(...)`, `comparison::classify::is_transport_error(&str) -> bool`, `comparison::classify::load_expected_rows(...)`. The JSON types (`ComparisonReport`, etc.) stay in `crate::report` and are used from there — NOT moved.
 
-- [ ] **Step 1: Create the module tree.** Move `classify_status`, `is_transport_error`, `load_expected_rows`, and the `CompareStatus`-classification helpers into `compare/classify.rs`. Move `run_comparison` + the record/summary assembly into `compare/mod.rs`. Keep the `ComparisonReport`/`ComparisonSummary` JSON writer path in `compare/report.rs` (thin wrappers over the types that already live in `crate::report`). Move `comparison.rs`'s `#[cfg(test)]` tests next to the functions they cover.
+- [ ] **Step 1: Create the directory module.** `git rm crates/sqe-bench/src/comparison.rs` and create `comparison/mod.rs` + `comparison/classify.rs`. Move `classify_status`, `is_transport_error`, `load_expected_rows`, and the DML-detection + canonical helpers into `comparison/classify.rs` (all `pub(crate)` or `pub` as needed). Move `run_comparison` + the record/summary assembly into `comparison/mod.rs`, with `pub mod classify;` at its top and `use crate::report::{ComparisonReport, ...}` for the JSON types (which stay in `report.rs`). Move `comparison.rs`'s `#[cfg(test)]` tests next to the functions they cover.
 
-- [ ] **Step 2: Rewire.** `lib.rs`: replace `pub mod comparison;` with `pub mod compare;`. Update `run.rs` and `main.rs`: `comparison::run_comparison` → `compare::run_comparison`. `rg 'comparison::' crates/sqe-bench` must return nothing after. `git rm crates/sqe-bench/src/comparison.rs`.
+- [ ] **Step 2: Verify the module path.** The `mod comparison;` line in `main.rs` now resolves to `comparison/mod.rs` — no declaration change needed. Confirm all existing `comparison::run_comparison` / `crate::comparison::*` callers (in `run.rs`, `compare.rs`, `main.rs`) still resolve: `rg 'comparison::' crates/sqe-bench` — every hit must map to an item now exported from `comparison/{mod,classify}.rs`.
 
-- [ ] **Step 3: Point `execute.rs` at the shared `is_transport_error`.** Replace the inlined copy from Task 3 with `crate::compare::classify::is_transport_error`.
+- [ ] **Step 3: Point `execute.rs` at the shared `is_transport_error`.** Replace the inlined copy from Task 3 with `crate::comparison::classify::is_transport_error`.
 
-- [ ] **Step 4: Build + test.** Run: `cargo test -p sqe-bench --lib compare 2>&1 | tail -20`. Expected: PASS; crate compiles; behavior identical.
+- [ ] **Step 4: Build + test.** Run: `cargo test -p sqe-bench --bin sqe-bench comparison 2>&1 | tail -20`. Expected: PASS; crate compiles; behavior identical.
 
 - [ ] **Step 5: Commit.**
 
 ```bash
 git add -A crates/sqe-bench/src/
-git commit -m "refactor(bench): split comparison.rs into compare/{mod,classify,report}"
+git commit -m "refactor(bench): split comparison.rs into comparison/{mod,classify}"
 ```
 
 ---
@@ -321,7 +323,7 @@ git commit -m "refactor(bench): split comparison.rs into compare/{mod,classify,r
 - Modify: `crates/sqe-bench/src/lib.rs`
 
 **Interfaces:**
-- Consumes: `query`, `execute::{run_query, resolve_timeout}`, `status::{QueryOutcome, classify_vs_expected}`, `report::QueryResult`, `compare::classify::classify_status`, `report::{ComparisonReport, QueryComparison, ...}`.
+- Consumes: `query`, `execute::{run_query, resolve_timeout}`, `status::{QueryOutcome, classify_vs_expected}`, `report::QueryResult`, `comparison::classify::classify_status`, `report::{ComparisonReport, QueryComparison, ...}`.
 - Produces:
   - `suite::SuiteOutcome { results: Vec<report::QueryResult>, comparison: Option<report::ComparisonReport> }`.
   - `suite::run_suite(sqe: &dyn BenchClient, trino: Option<&dyn BenchClient>, benchmark: &str, scale: f64, query_filter: Option<&str>, catalog: Option<&str>, namespace_override: Option<&str>, sqe_endpoint: &str, trino_endpoint: Option<&str>) -> anyhow::Result<SuiteOutcome>`.
@@ -330,7 +332,7 @@ git commit -m "refactor(bench): split comparison.rs into compare/{mod,classify,r
 
 - [ ] **Step 2: Run to see it fail/skip.** Run: `cargo test -p sqe-bench --test single_pass_gated 2>&1 | tail -15`. Expected: compiles; SKIPS cleanly without `BENCH_STACK_UP=1` (prints a skip notice, exits 0) — matching `run_attach_gated`.
 
-- [ ] **Step 3: Implement `run_suite`.** Build the namespace exactly as `run_benchmark_test` does (tpcbb→tpcds; `catalog` prefix). Load queries once via `query::load_query_files`. For each query: honor `query_filter` (via `query::normalize_query_id`); `requires` non-empty → push `QueryOutcome::Skip`; else `sql = query::prefix_tables(...)`, `timeout = execute::resolve_timeout(query.timeout_secs)`, `sqe = execute::run_query(sqe, &query.id, &sql, timeout)`. Map `sqe` → `QueryOutcome`: `timed_out_after=Some(n)` → `Timeout(n)`; `result=Err(e)` → `Error(e)`; `result=Ok(batches)` → `classify_vs_expected(benchmark, scale, &query.id, &batches)`, but if `sqe.rows==0` and that classification is `Pass` with no expected file, use `Vacuous`. Push `report::QueryResult`. When `trino` is `Some`, skip DML (reuse the DML detection from `compare/mod.rs`), run `execute::run_query(trino, ...)` once, and build a `QueryComparison` via `compare::classify::classify_status(...)`. Assemble `Option<ComparisonReport>` only when `trino.is_some()`. Add `pub mod suite;`.
+- [ ] **Step 3: Implement `run_suite`.** Build the namespace exactly as `run_benchmark_test` does (tpcbb→tpcds; `catalog` prefix). Load queries once via `query::load_query_files`. For each query: honor `query_filter` (via `query::normalize_query_id`); `requires` non-empty → push `QueryOutcome::Skip`; else `sql = query::prefix_tables(...)`, `timeout = execute::resolve_timeout(query.timeout_secs)`, `sqe = execute::run_query(sqe, &query.id, &sql, timeout)`. Map `sqe` → `QueryOutcome`: `timed_out_after=Some(n)` → `Timeout(n)`; `result=Err(e)` → `Error(e)`; `result=Ok(batches)` → `classify_vs_expected(benchmark, scale, &query.id, &batches)`, but if `sqe.rows==0` and that classification is `Pass` with no expected file, use `Vacuous`. Push `report::QueryResult`. When `trino` is `Some`, skip DML (reuse the DML detection from `comparison/classify.rs`), run `execute::run_query(trino, ...)` once, and build a `QueryComparison` via `comparison::classify::classify_status(...)`. Assemble `Option<ComparisonReport>` only when `trino.is_some()`. Add `pub mod suite;`.
 
 - [ ] **Step 4: Run gated test (if stack available).** Run: `BENCH_STACK_UP=1 RUST_MIN_STACK=67108864 cargo test -p sqe-bench --test single_pass_gated 2>&1 | tail -15`. Expected: PASS (SQE invoked once; comparison present). If no stack in this environment, confirm the SKIP path and note it.
 
@@ -376,7 +378,7 @@ git commit -m "refactor(bench): run verb + test wrappers use single-pass run_sui
 
 - [ ] **Step 1: clippy.** Run: `cargo clippy -p sqe-bench --all-targets -- -D warnings 2>&1 | tail -20`. Expected: clean. Fix any warnings inline.
 
-- [ ] **Step 2: Full unit suite.** Run: `cargo test -p sqe-bench --lib 2>&1 | tail -15`. Expected: all PASS.
+- [ ] **Step 2: Full unit suite.** Run: `cargo test -p sqe-bench --bin sqe-bench 2>&1 | tail -15`. Expected: all PASS.
 
 - [ ] **Step 3: Live single-pass compare smoke (if stack up).** With the golden stack running: `BENCH_PROFILE=local BENCH_SCALE=1 BENCH_COMPARE=1 BENCH_QUERY=q01 scripts/benchmark.sh tpch`. Expected: q01 matches on both engines; `[bench] Running q01` appears exactly once (single pass); exit 0.
 
