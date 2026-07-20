@@ -36,6 +36,7 @@ mod multi_catalog_routing_test;
 mod partition_e2e;
 mod partition_evolution_e2e;
 mod quack_e2e;
+mod rewrite_data_files_deletes;
 mod rewrite_data_files_real;
 mod sql_compat_test;
 mod trino_describe_test;
