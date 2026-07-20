@@ -89,6 +89,32 @@ pub(crate) fn classify_status(
     }
 }
 
+/// Detect a DML statement (UPDATE / DELETE / INSERT / MERGE). Comparison mode
+/// skips these: running the same DML against both engines would mutate the one
+/// shared table and corrupt the data. DML correctness is verified by the
+/// regular sqe-bench test, not by compare. Moved verbatim from
+/// `run_comparison`'s inline block so the single-pass `suite::run_suite` driver
+/// and `run_comparison` share one detector.
+pub(crate) fn is_dml(sql: &str) -> bool {
+    let sql_upper = sql.trim().to_uppercase();
+    let is_dml = sql_upper.starts_with("UPDATE ")
+        || sql_upper.starts_with("DELETE ")
+        || sql_upper.starts_with("INSERT ")
+        || sql_upper.starts_with("MERGE ");
+    // Also check after stripping comments (-- name: ...)
+    let first_stmt = sql
+        .lines()
+        .find(|l| !l.trim().starts_with("--") && !l.trim().is_empty())
+        .unwrap_or("")
+        .trim()
+        .to_uppercase();
+    is_dml
+        || first_stmt.starts_with("UPDATE ")
+        || first_stmt.starts_with("DELETE ")
+        || first_stmt.starts_with("INSERT ")
+        || first_stmt.starts_with("MERGE ")
+}
+
 /// Connection/transport-level failure, as opposed to a query-level error.
 /// These are safe to retry once: the query never reached execution, or the
 /// stream died for reasons unrelated to the SQL.

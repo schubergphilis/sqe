@@ -25,6 +25,7 @@ mod query;
 mod report;
 mod run;
 mod status;
+mod suite;
 mod test;
 
 use clap::Parser;
