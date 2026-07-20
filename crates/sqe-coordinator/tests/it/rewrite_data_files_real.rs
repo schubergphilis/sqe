@@ -153,6 +153,145 @@ async fn rewrite_merges_small_files_preserves_rows() {
         .await;
 }
 
+/// Read a whole Int64 column across all batches into a Vec (scan order).
+async fn read_i64_col(
+    handler: &sqe_coordinator::QueryHandler,
+    session: &sqe_core::Session,
+    sql: &str,
+) -> Vec<i64> {
+    let batches = handler.execute(session, sql, None).await.expect("query");
+    let mut out = Vec::new();
+    for b in &batches {
+        let col = b.column(0).as_any().downcast_ref::<Int64Array>().expect("Int64");
+        for i in 0..col.len() {
+            out.push(col.value(i));
+        }
+    }
+    out
+}
+
+fn status_col(summary: &[arrow_array::RecordBatch]) -> String {
+    use arrow_array::StringArray;
+    summary[0]
+        .column_by_name("status")
+        .expect("status")
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("StringArray")
+        .value(0)
+        .to_string()
+}
+
+/// Sort-strategy compaction physically orders the rewritten rows.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn rewrite_sort_strategy_orders_rows() {
+    let (session, handler) = crate::common::setup_handler().await;
+    let namespace = "default";
+    let table_name = "rewrite_real_sort";
+    let table = format!("{namespace}.{table_name}");
+    let _ = handler.execute(&session, &format!("DROP TABLE IF EXISTS {table}"), None).await;
+    handler
+        .execute(&session, &format!("CREATE TABLE {table} (id BIGINT, v BIGINT)"), None)
+        .await
+        .expect("CREATE");
+
+    // Insert in scrambled order, one data file per INSERT.
+    let scrambled = [9i64, 3, 7, 1, 11, 5, 0, 8, 2, 10, 4, 6];
+    for id in scrambled {
+        handler
+            .execute(&session, &format!("INSERT INTO {table} VALUES ({id}, {})", id * 10), None)
+            .await
+            .expect("INSERT");
+    }
+    let before_files = live_data_file_count(&handler, &session, namespace, table_name).await;
+    assert!(before_files >= 12, "setup: expected >= 12 files, got {before_files}");
+
+    let summary = handler
+        .execute(
+            &session,
+            &format!(
+                "CALL system.rewrite_data_files(table => '{table}', strategy => 'sort', \
+                 sort_order => 'id ASC')"
+            ),
+            None,
+        )
+        .await
+        .expect("rewrite sort");
+    assert!(
+        !status_col(&summary).contains("skipped"),
+        "sort compaction must run, got '{}'",
+        status_col(&summary)
+    );
+
+    let after_files = live_data_file_count(&handler, &session, namespace, table_name).await;
+    assert!(after_files < before_files, "must consolidate: {before_files} -> {after_files}");
+
+    // Row set preserved.
+    let sorted = read_i64_col(&handler, &session, &format!("SELECT id FROM {table} ORDER BY id")).await;
+    assert_eq!(sorted, (0..12).collect::<Vec<_>>(), "row set must be preserved");
+
+    // When the result is a single file, the scan returns file order, so a
+    // sorted rewrite must yield physically ascending ids (proves the sort ran,
+    // not just a bin-pack).
+    if after_files == 1 {
+        let physical = read_i64_col(&handler, &session, &format!("SELECT id FROM {table}")).await;
+        assert!(
+            physical.windows(2).all(|w| w[0] <= w[1]),
+            "sort compaction must physically order rows, got {physical:?}"
+        );
+    }
+
+    let _ = handler.execute(&session, &format!("DROP TABLE IF EXISTS {table}"), None).await;
+}
+
+/// Z-order-strategy compaction runs and preserves the row set (physical
+/// clustering is a benchmark concern; correctness is that no rows are lost).
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn rewrite_zorder_strategy_preserves_rows() {
+    let (session, handler) = crate::common::setup_handler().await;
+    let namespace = "default";
+    let table_name = "rewrite_real_zorder";
+    let table = format!("{namespace}.{table_name}");
+    let _ = handler.execute(&session, &format!("DROP TABLE IF EXISTS {table}"), None).await;
+    handler
+        .execute(&session, &format!("CREATE TABLE {table} (id BIGINT, v BIGINT)"), None)
+        .await
+        .expect("CREATE");
+
+    let scrambled = [9i64, 3, 7, 1, 11, 5, 0, 8, 2, 10, 4, 6];
+    for id in scrambled {
+        handler
+            .execute(&session, &format!("INSERT INTO {table} VALUES ({id}, {})", 120 - id), None)
+            .await
+            .expect("INSERT");
+    }
+    let before_files = live_data_file_count(&handler, &session, namespace, table_name).await;
+    assert!(before_files >= 12);
+
+    let summary = handler
+        .execute(
+            &session,
+            &format!(
+                "CALL system.rewrite_data_files(table => '{table}', strategy => 'sort', \
+                 sort_order => 'zorder(id, v)')"
+            ),
+            None,
+        )
+        .await
+        .expect("rewrite zorder");
+    assert!(!status_col(&summary).contains("skipped"), "zorder compaction must run");
+
+    let after_files = live_data_file_count(&handler, &session, namespace, table_name).await;
+    assert!(after_files < before_files, "must consolidate: {before_files} -> {after_files}");
+
+    let sorted = read_i64_col(&handler, &session, &format!("SELECT id FROM {table} ORDER BY id")).await;
+    assert_eq!(sorted, (0..12).collect::<Vec<_>>(), "row set must be preserved");
+
+    let _ = handler.execute(&session, &format!("DROP TABLE IF EXISTS {table}"), None).await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn rewrite_skips_below_min_input_files() {
