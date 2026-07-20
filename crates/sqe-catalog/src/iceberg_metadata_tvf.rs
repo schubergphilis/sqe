@@ -537,6 +537,13 @@ fn files_schema() -> Arc<Schema> {
         Field::new("value_counts", DataType::Utf8, true),
         Field::new("null_value_counts", DataType::Utf8, true),
         Field::new("partition", DataType::Utf8, false),
+        // Per-file column bounds as JSON maps of {field_id: value}. These let a
+        // user verify a compaction/sort produced a prunable layout: after a sort
+        // compaction the output files should carry disjoint [lower, upper]
+        // ranges on the sort column. Values render via Datum's Display, so
+        // numbers are bare and strings are quoted (both valid JSON values).
+        Field::new("lower_bounds", DataType::Utf8, true),
+        Field::new("upper_bounds", DataType::Utf8, true),
     ]))
 }
 
@@ -580,6 +587,18 @@ fn int_map_to_json(map: &std::collections::HashMap<i32, u64>) -> String {
     format!("{{{}}}", pairs.join(","))
 }
 
+/// Serialise a `{field_id: Datum}` bound map to a JSON object. Datum's Display
+/// renders numbers bare and strings quoted, so each value is already a valid
+/// JSON value. Keys are sorted for deterministic output.
+fn bounds_map_to_json(map: &std::collections::HashMap<i32, iceberg::spec::Datum>) -> String {
+    if map.is_empty() {
+        return "{}".to_string();
+    }
+    let mut pairs: Vec<String> = map.iter().map(|(k, v)| format!("\"{}\":{}", k, v)).collect();
+    pairs.sort();
+    format!("{{{}}}", pairs.join(","))
+}
+
 async fn build_files_batch(table: &Table, schema: &SchemaRef) -> DFResult<RecordBatch> {
     use iceberg::spec::{DataContentType, ManifestStatus};
 
@@ -593,6 +612,8 @@ async fn build_files_batch(table: &Table, schema: &SchemaRef) -> DFResult<Record
     let mut value_counts_b = StringBuilder::new();
     let mut null_value_counts_b = StringBuilder::new();
     let mut partition_b = StringBuilder::new();
+    let mut lower_bounds_b = StringBuilder::new();
+    let mut upper_bounds_b = StringBuilder::new();
 
     if let Some(snapshot) = metadata.current_snapshot() {
         match snapshot.load_manifest_list(table.file_io(), metadata).await {
@@ -626,6 +647,9 @@ async fn build_files_batch(table: &Table, schema: &SchemaRef) -> DFResult<Record
                                     .map(|f| f.as_ref().map_or("null".to_string(), |v| format!("{v:?}")))
                                     .collect();
                                 partition_b.append_value(format!("[{}]", parts.join(",")));
+
+                                lower_bounds_b.append_value(bounds_map_to_json(df.lower_bounds()));
+                                upper_bounds_b.append_value(bounds_map_to_json(df.upper_bounds()));
                             }
                         }
                         Err(e) => {
@@ -659,6 +683,8 @@ async fn build_files_batch(table: &Table, schema: &SchemaRef) -> DFResult<Record
             Arc::new(value_counts_b.finish()) as ArrayRef,
             Arc::new(null_value_counts_b.finish()) as ArrayRef,
             Arc::new(partition_b.finish()) as ArrayRef,
+            Arc::new(lower_bounds_b.finish()) as ArrayRef,
+            Arc::new(upper_bounds_b.finish()) as ArrayRef,
         ],
     )?;
 
