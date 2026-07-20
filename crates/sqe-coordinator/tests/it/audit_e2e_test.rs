@@ -904,6 +904,7 @@ async fn streaming_select_emits_canonical_query_event() {
             object_type: ObjectType::Table,
         }],
         client_ip: None,
+        query_span: tracing::Span::none(),
     };
 
     let qid = fin.query_id;

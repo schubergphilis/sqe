@@ -27,7 +27,7 @@ use datafusion::physical_plan::{
 };
 use datafusion_proto::bytes::Serializeable;
 use futures::{Stream, StreamExt, TryStreamExt};
-use tracing::{error, info, info_span, warn};
+use tracing::{error, info, info_span, warn, Instrument};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use sqe_metrics::propagation::inject_trace_context;
@@ -768,7 +768,8 @@ impl ExecutionPlan for DistributedScanExec {
                 "Fragment execution failed after all retries with no local fallback"
             );
             Err(err)
-        };
+        }
+        .instrument(dispatch_span.clone());
 
         // Wrap the two-phase logic into a single stream:
         // once(resolve_future) produces Result<Stream, Error>, try_flatten

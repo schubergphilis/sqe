@@ -7,7 +7,7 @@ use iceberg::table::Table;
 use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableIdent, TableRequirement, TableUpdate};
 use iceberg_catalog_rest::{RestCatalog, RestCatalogBuilder};
 use moka::future::Cache as MokaCache;
-use tracing::{debug, info, instrument, warn};
+use tracing::{debug, info, instrument, warn, Instrument};
 use uuid::Uuid;
 
 use sqe_core::config::{SqeConfig, StorageConfig};
@@ -1245,13 +1245,20 @@ impl SessionCatalog {
                     let url = self.table_url(table_ident);
                     let table_cache = self.table_cache.clone();
                     let table_ident_log = table_ident.clone();
+                    let etag_span = tracing::info_span!(
+                        "iceberg.rest.etag",
+                        db.system.name = "iceberg",
+                        catalog.operation = "load_table_etag",
+                        table = %table_ident,
+                    );
                     tokio::spawn(async move {
                         let etag = fetch_table_etag_inner(&http_client, &bearer_token, &url).await;
                         if let Some(e) = etag.as_deref() {
                             debug!(table = %table_ident_log, etag = %e, "Captured ETag for table");
                         }
                         table_cache.update_etag(&cache_key, etag).await;
-                    });
+                    }
+                    .instrument(etag_span));
                 }
             }
             // Auth failures (401/403) are per-principal decisions, not faults:

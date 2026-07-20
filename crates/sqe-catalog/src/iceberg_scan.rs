@@ -446,6 +446,7 @@ impl IcebergScanExec {
 
     pub fn table(&self) -> &Table { &self.table }
     pub fn predicates(&self) -> Option<&Predicate> { self.predicates.as_ref() }
+    pub fn snapshot_id(&self) -> Option<i64> { self.snapshot_id }
     pub fn df_filters(&self) -> &[Expr] { &self.df_filters }
     pub fn projection(&self) -> Option<&[String]> { self.projection.as_deref() }
     pub fn pushed_down_filters(&self) -> &[Arc<dyn PhysicalExpr>] { &self.pushed_down_filters }
@@ -878,8 +879,19 @@ impl ExecutionPlan for IcebergScanExec {
     }
 
     fn execute(&self, partition: usize, context: Arc<TaskContext>) -> DFResult<SendableRecordBatchStream> {
-        let span = info_span!("iceberg_scan", table=%self.table.identifier(), partition=partition, predicates=?self.predicates);
-        let _guard = span.enter();
+        let span = info_span!(
+            "iceberg_scan",
+            table = %self.table.identifier(),
+            partition,
+            predicates = ?self.predicates,
+            files_planned = tracing::field::Empty,
+            files_read = tracing::field::Empty,
+            bytes_planned = tracing::field::Empty,
+            bytes_read = tracing::field::Empty,
+            rows_decoded = tracing::field::Empty,
+            rows_output = tracing::field::Empty,
+        );
+        let _guard = span.clone().entered();
         if partition >= self.target_partitions {
             return Err(DataFusionError::Internal(format!(
                 "IcebergScanExec partition {partition} out of range (target_partitions = {})",
@@ -935,6 +947,7 @@ impl ExecutionPlan for IcebergScanExec {
         // rows that streamed through while a dynamic filter was still the
         // lit(true) placeholder, i.e. the build side had not sealed yet.
         let planning_time = MetricBuilder::new(&self.metrics).subset_time("planning_time", partition);
+        let data_files_planned = MetricBuilder::new(&self.metrics).counter("data_files_planned", partition);
         let files_matched = MetricBuilder::new(&self.metrics).counter("files_matched", partition);
         let bytes_planned = MetricBuilder::new(&self.metrics).counter("bytes_planned", partition);
         let bytes_scanned = MetricBuilder::new(&self.metrics).counter("bytes_scanned", partition);
@@ -957,7 +970,7 @@ impl ExecutionPlan for IcebergScanExec {
         if !has_snapshot {
             let empty_batch = RecordBatch::new_empty(schema.clone());
             let stream = futures::stream::once(async move { Ok::<_, DataFusionError>(empty_batch) });
-            return Ok(Box::pin(IcebergRecordBatchStream { schema, inner: Box::pin(stream), baseline }));
+            return Ok(Box::pin(IcebergRecordBatchStream { schema, inner: Box::pin(stream), baseline, span, metrics: self.metrics.clone() }));
         }
 
         // Type alias to avoid repeating the full BoxStream type in early-returns.
@@ -1077,6 +1090,7 @@ impl ExecutionPlan for IcebergScanExec {
                 // read. On the split path these are counted from the assigned
                 // splits instead (see below).
                 files_matched.add(file_entries.len());
+                data_files_planned.add(file_entries.len());
                 bytes_planned.add(file_entries.iter().map(|(_, sz)| *sz as usize).sum());
             }
 
@@ -1485,6 +1499,12 @@ impl ExecutionPlan for IcebergScanExec {
                     total_partitions,
                     partition,
                 );
+                // Every partition sees the same whole-file plan before split
+                // assignment. Count it once so profiles distinguish physical
+                // data files from execution split count.
+                if partition == 0 {
+                    data_files_planned.add(file_entries.len());
+                }
                 // `files_matched` counts assigned SPLITS on this path (not whole
                 // files), so its cross-partition sum is the total split count;
                 // `bytes_planned` still sums to the table's total bytes. A whole
@@ -1684,7 +1704,7 @@ impl ExecutionPlan for IcebergScanExec {
                 .boxed();
             Ok::<BatchStream, DataFusionError>(s)
         })).try_flatten();
-        Ok(Box::pin(IcebergRecordBatchStream { schema, inner: Box::pin(stream), baseline }))
+        Ok(Box::pin(IcebergRecordBatchStream { schema, inner: Box::pin(stream), baseline, span, metrics: self.metrics.clone() }))
     }
 }
 
@@ -2376,13 +2396,19 @@ struct IcebergRecordBatchStream {
     schema: SchemaRef,
     inner: Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>>,
     baseline: BaselineMetrics,
+    span: tracing::Span,
+    metrics: ExecutionPlanMetricsSet,
 }
 
 impl Stream for IcebergRecordBatchStream {
     type Item = DFResult<RecordBatch>;
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
-        let poll = { let _timer = this.baseline.elapsed_compute().timer(); this.inner.as_mut().poll_next(cx) };
+        let poll = {
+            let _span_guard = this.span.enter();
+            let _timer = this.baseline.elapsed_compute().timer();
+            this.inner.as_mut().poll_next(cx)
+        };
         if let Poll::Ready(Some(Ok(ref batch))) = poll { this.baseline.record_output(batch.num_rows()); }
         poll
     }
@@ -2390,6 +2416,26 @@ impl Stream for IcebergRecordBatchStream {
 
 impl datafusion::physical_plan::RecordBatchStream for IcebergRecordBatchStream {
     fn schema(&self) -> SchemaRef { self.schema.clone() }
+}
+
+impl Drop for IcebergRecordBatchStream {
+    fn drop(&mut self) {
+        let metrics = self.metrics.clone_inner();
+        let named = |name: &str| {
+            metrics
+                .sum_by_name(name)
+                .map(|v| v.as_usize() as u64)
+                .unwrap_or(0)
+        };
+        let planned = named("data_files_planned");
+        let pruned_dynamic = named("files_pruned_dynamic");
+        self.span.record("files_planned", planned);
+        self.span.record("files_read", planned.saturating_sub(pruned_dynamic));
+        self.span.record("bytes_planned", named("bytes_planned"));
+        self.span.record("bytes_read", named("bytes_scanned"));
+        self.span.record("rows_decoded", named("rows_decoded"));
+        self.span.record("rows_output", metrics.output_rows().unwrap_or(0) as u64);
+    }
 }
 
 #[cfg(test)]

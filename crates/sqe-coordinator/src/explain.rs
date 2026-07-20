@@ -537,7 +537,9 @@ fn walk_full(node: &Arc<dyn ExecutionPlan>, rows: &mut Vec<FullRow>) {
 
     if let Some(scan) = node.downcast_ref::<IcebergScanExec>() {
         let table = scan.table();
-        let snap = table.metadata().current_snapshot();
+        let snap = scan.snapshot_id()
+            .and_then(|id| table.metadata().snapshot_by_id(id))
+            .or_else(|| table.metadata().current_snapshot());
         let props = snap.map(|s| s.summary().additional_properties.clone());
 
         let parse_i64 = |key: &str| -> Option<i64> {
@@ -554,7 +556,15 @@ fn walk_full(node: &Arc<dyn ExecutionPlan>, rows: &mut Vec<FullRow>) {
         let estimated_rows = parse_i64("total-records");
         let estimated_bytes = parse_i64("total-files-size");
         let files_total = parse_i32("total-data-files");
-        let files_scanned = files_total;
+        let files_planned = metrics.as_ref()
+            .and_then(|m| m.sum_by_name("data_files_planned"))
+            .map(|v| v.as_usize());
+        let files_pruned_dynamic = metrics.as_ref()
+            .and_then(|m| m.sum_by_name("files_pruned_dynamic"))
+            .map(|v| v.as_usize())
+            .unwrap_or(0);
+        let files_scanned = files_planned
+            .map(|planned| planned.saturating_sub(files_pruned_dynamic) as i32);
 
         rows.push(FullRow {
             step, operation, estimated_rows, estimated_bytes, files_scanned, files_total,

@@ -2640,6 +2640,10 @@ pub struct MetricsConfig {
     pub prometheus_port: u16,
     #[serde(default)]
     pub otlp_endpoint: String,
+    /// Trace-only OTLP/gRPC endpoint. `otlp_endpoint` remains the legacy
+    /// all-signals option for deployments with trace, metric, and log pipelines.
+    #[serde(default)]
+    pub traces_otlp_endpoint: String,
     #[serde(default)]
     pub audit_log_path: String,
     /// OTel trace sampling rate (0.0 to 1.0). Default: 0.01 (1%).
@@ -2672,6 +2676,7 @@ impl Default for MetricsConfig {
         Self {
             prometheus_port: 9090,
             otlp_endpoint: String::new(),
+            traces_otlp_endpoint: String::new(),
             audit_log_path: String::new(),
             trace_sample_rate: default_trace_sample_rate(),
             openlineage: OpenLineageConfig::default(),
@@ -3409,6 +3414,9 @@ impl SqeConfig {
                 "metrics.openlineage.replay_interval_secs must be > 0 (tokio::time::interval rejects zero periods)".to_string(),
             );
         }
+        if !(0.0..=1.0).contains(&self.metrics.trace_sample_rate) {
+            errors.push("metrics.trace_sample_rate must be between 0.0 and 1.0".to_string());
+        }
 
         validate_urls(self, &mut errors);
         validate_byte_sizes(self, &mut errors);
@@ -3770,6 +3778,8 @@ impl SqeConfig {
         // Metrics
         env_override_u16("SQE_METRICS__PROMETHEUS_PORT", &mut self.metrics.prometheus_port);
         env_override_str("SQE_METRICS__OTLP_ENDPOINT", &mut self.metrics.otlp_endpoint);
+        env_override_str("SQE_METRICS__TRACES_OTLP_ENDPOINT", &mut self.metrics.traces_otlp_endpoint);
+        env_override_f64("SQE_METRICS__TRACE_SAMPLE_RATE", &mut self.metrics.trace_sample_rate);
         env_override_str("SQE_METRICS__AUDIT_LOG_PATH", &mut self.metrics.audit_log_path);
         env_override_str("SQE_METRICS__AUDIT__FORMAT", &mut self.metrics.audit.format);
         env_override_bool(
@@ -3970,6 +3980,7 @@ fn validate_urls(config: &SqeConfig, errors: &mut Vec<String>) {
 
     check("storage.s3_endpoint", &config.storage.s3_endpoint);
     check("metrics.otlp_endpoint", &config.metrics.otlp_endpoint);
+    check("metrics.traces_otlp_endpoint", &config.metrics.traces_otlp_endpoint);
     check("metrics.openlineage.http_endpoint", &config.metrics.openlineage.http_endpoint);
 
     check("auth.keycloak_url", &config.auth.keycloak_url);
@@ -4064,6 +4075,16 @@ fn env_override_u64(key: &str, target: &mut u64) {
             *target = parsed;
         } else {
             tracing::warn!("{key}={val:?} is not a valid u64, ignoring");
+        }
+    }
+}
+
+fn env_override_f64(key: &str, target: &mut f64) {
+    if let Ok(val) = std::env::var(key) {
+        if let Ok(parsed) = val.parse() {
+            *target = parsed;
+        } else {
+            tracing::warn!("{key}={val:?} is not a valid number, ignoring");
         }
     }
 }
@@ -4591,6 +4612,19 @@ mod tests {
             err.contains("metrics.openlineage.replay_interval_secs must be > 0"),
             "Expected zero replay interval error, got: {err}"
         );
+    }
+
+    #[test]
+    fn test_validate_rejects_trace_sample_rate_outside_unit_interval() {
+        for rate in [-0.01, 1.01] {
+            let mut config = valid_config();
+            config.metrics.trace_sample_rate = rate;
+            let err = config.validate().unwrap_err().to_string();
+            assert!(
+                err.contains("metrics.trace_sample_rate must be between 0.0 and 1.0"),
+                "Expected trace sample rate error, got: {err}"
+            );
+        }
     }
 
     #[test]
@@ -5837,6 +5871,22 @@ otlp_endpoint = ""
         std::env::remove_var("SQE_METRICS__OPENLINEAGE__ENABLED");
         std::env::remove_var("SQE_METRICS__OPENLINEAGE__SPOOL_MAX_BYTES");
         std::env::remove_var("SQE_METRICS__OPENLINEAGE__CHANNEL_CAPACITY");
+    }
+
+    #[test]
+    fn env_overrides_apply_to_trace_export() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::set_var("SQE_METRICS__TRACES_OTLP_ENDPOINT", "http://otel-collector:4317");
+        std::env::set_var("SQE_METRICS__TRACE_SAMPLE_RATE", "1.0");
+
+        let mut cfg = valid_config();
+        cfg.apply_env_overrides();
+
+        assert_eq!(cfg.metrics.traces_otlp_endpoint, "http://otel-collector:4317");
+        assert_eq!(cfg.metrics.trace_sample_rate, 1.0);
+
+        std::env::remove_var("SQE_METRICS__TRACES_OTLP_ENDPOINT");
+        std::env::remove_var("SQE_METRICS__TRACE_SAMPLE_RATE");
     }
 
     #[test]

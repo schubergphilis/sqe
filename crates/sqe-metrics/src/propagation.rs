@@ -9,6 +9,49 @@ use opentelemetry::trace::TraceContextExt;
 use tonic::metadata::{MetadataKey, MetadataMap, MetadataValue};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
+pub const CORRELATION_ID_MAX_LEN: usize = 128;
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct CorrelationIds {
+    pub request_id: Option<String>,
+    pub session_id: Option<String>,
+}
+
+fn validate_correlation_id(value: &str) -> Option<String> {
+    (!value.is_empty()
+        && value.len() <= CORRELATION_ID_MAX_LEN
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._:-".contains(&byte)))
+    .then(|| value.to_string())
+}
+
+pub fn correlation_ids_from_metadata(metadata: &MetadataMap) -> CorrelationIds {
+    CorrelationIds {
+        request_id: metadata
+            .get("x-request-id")
+            .and_then(|value| value.to_str().ok())
+            .and_then(validate_correlation_id),
+        session_id: metadata
+            .get("x-session-id")
+            .and_then(|value| value.to_str().ok())
+            .and_then(validate_correlation_id),
+    }
+}
+
+pub fn correlation_ids_from_headers(headers: &axum::http::HeaderMap) -> CorrelationIds {
+    CorrelationIds {
+        request_id: headers
+            .get("x-request-id")
+            .and_then(|value| value.to_str().ok())
+            .and_then(validate_correlation_id),
+        session_id: headers
+            .get("x-session-id")
+            .and_then(|value| value.to_str().ok())
+            .and_then(validate_correlation_id),
+    }
+}
+
 /// Adapter that implements [`Injector`] for tonic's [`MetadataMap`].
 ///
 /// Used by the coordinator to inject the current trace context into
@@ -173,6 +216,27 @@ pub fn current_trace_id() -> Option<String> {
     }
 }
 
+/// Return the current active span ID (16-char lowercase hex).
+pub fn current_span_id() -> Option<String> {
+    let cx = tracing::Span::current().context();
+    let span_ref = cx.span();
+    let sc = span_ref.span_context();
+    sc.is_valid().then(|| format!("{:016x}", sc.span_id()))
+}
+
+/// Record lowercase W3C trace and span identifiers on a span that declares
+/// `trace_id` and `span_id` fields. JSON logging includes these ancestor span
+/// fields for ordinary tracing events emitted anywhere below the boundary.
+pub fn record_trace_fields(span: &tracing::Span) {
+    let cx = span.context();
+    let span_ref = cx.span();
+    let sc = span_ref.span_context();
+    if sc.is_valid() {
+        span.record("trace_id", format_args!("{:032x}", sc.trace_id()));
+        span.record("span_id", format_args!("{:016x}", sc.span_id()));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -259,6 +323,66 @@ mod tests {
             span_context.span_id(),
             SpanId::from_hex("b7ad6b7169203331").unwrap()
         );
+    }
+
+
+    #[test]
+    fn correlation_ids_accept_only_bounded_safe_values() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("x-request-id", "req_01:abc.def-2".parse().unwrap());
+        headers.insert("x-session-id", "contains spaces".parse().unwrap());
+        let ids = correlation_ids_from_headers(&headers);
+        assert_eq!(ids.request_id.as_deref(), Some("req_01:abc.def-2"));
+        assert_eq!(ids.session_id, None);
+
+        let oversized = "a".repeat(CORRELATION_ID_MAX_LEN + 1);
+        let mut metadata = MetadataMap::new();
+        metadata.insert("x-request-id", oversized.parse().unwrap());
+        metadata.insert("x-session-id", "session-42".parse().unwrap());
+        let ids = correlation_ids_from_metadata(&metadata);
+        assert_eq!(ids.request_id, None);
+        assert_eq!(ids.session_id.as_deref(), Some("session-42"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn concurrent_requests_do_not_leak_trace_context() {
+        use opentelemetry::trace::TracerProvider;
+        use opentelemetry_sdk::trace::SdkTracerProvider;
+        use tracing::Instrument;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        install_propagator();
+        let provider = SdkTracerProvider::builder().build();
+        let tracer = provider.tracer("concurrent-propagation-test");
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_opentelemetry::layer().with_tracer(tracer));
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+
+        async fn observe(trace_id: &str) -> Option<String> {
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert(
+                "traceparent",
+                format!("00-{trace_id}-b7ad6b7169203331-01")
+                    .parse()
+                    .unwrap(),
+            );
+            let span = tracing::info_span!("request");
+            span.set_parent(extract_trace_context_from_headers(&headers))
+                .unwrap();
+            async {
+                tokio::task::yield_now().await;
+                current_trace_id()
+            }
+            .instrument(span)
+            .await
+        }
+
+        let first_id = "0af7651916cd43dd8448eb211c80319c";
+        let second_id = "4bf92f3577b34da6a3ce929d0e0e4736";
+        let (first, second) = tokio::join!(observe(first_id), observe(second_id));
+        assert_eq!(first.as_deref(), Some(first_id));
+        assert_eq!(second.as_deref(), Some(second_id));
+        provider.shutdown().unwrap();
     }
 
     #[test]
