@@ -68,25 +68,7 @@ pub async fn run_comparison(
         // Skip DML queries (UPDATE, DELETE, INSERT, MERGE) in comparison mode.
         // Both engines would modify the same table, causing data corruption.
         // DML correctness is verified by the regular sqe-bench test, not compare.
-        let sql_upper = sql.trim().to_uppercase();
-        let is_dml = sql_upper.starts_with("UPDATE ")
-            || sql_upper.starts_with("DELETE ")
-            || sql_upper.starts_with("INSERT ")
-            || sql_upper.starts_with("MERGE ");
-        // Also check after stripping comments (-- name: ...)
-        let first_stmt = sql
-            .lines()
-            .find(|l| !l.trim().starts_with("--") && !l.trim().is_empty())
-            .unwrap_or("")
-            .trim()
-            .to_uppercase();
-        let is_dml = is_dml
-            || first_stmt.starts_with("UPDATE ")
-            || first_stmt.starts_with("DELETE ")
-            || first_stmt.starts_with("INSERT ")
-            || first_stmt.starts_with("MERGE ");
-
-        if is_dml {
+        if classify::is_dml(&sql) {
             info!("  {} ... SKIPPED (DML)", query_name);
             continue;
         }
