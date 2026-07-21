@@ -131,12 +131,14 @@ impl MaintenancePrincipal {
         };
         // TODO(4b): `refresh_catalog_token` only returns the token, not a
         // new expiry, and M2M `authenticate` never populates
-        // `Identity::expires_at` either (the real lifetime lives in the
-        // provider's private token cache). Keeping the old `token_expiry`
-        // is the least-wrong choice available today, but it means a
-        // just-refreshed session still reports as "expiring soon" via
-        // `is_token_expiring`/`token_expiry`. Revisit once the provider
-        // surfaces the new expiry through its public API.
+        // `Identity::expires_at` either. At mint time, `session_from_identity`
+        // fabricates `token_expiry = now + 1h` because `Identity::expires_at`
+        // is always None. If the real IdP token lives under an hour, this
+        // UNDER-reports expiry, and a consumer that trusts `token_expiry()`
+        // could attempt to use a dead token. CRITICAL: never trust
+        // `token_expiry()` on a maintenance session. The future scheduler must
+        // refresh unconditionally before any commit, not gated on
+        // `token_expiry()`.
         session.rotate_credentials(Credentials::new(
             new_token,
             session.refresh_token().cloned(),
@@ -184,7 +186,11 @@ mod tests {
     fn from_config_rejects_empty_client_id() {
         let mut cfg = bogus_config();
         cfg.client_id = String::new();
-        assert!(MaintenancePrincipal::from_config(&cfg).is_err());
+        match MaintenancePrincipal::from_config(&cfg) {
+            Ok(_) => panic!("expected empty client_id to be rejected"),
+            Err(SqeError::Config(_)) => {}
+            Err(other) => panic!("expected Config error, got {other:?}"),
+        }
     }
 
     fn fake_identity(user_id: &str) -> Identity {
@@ -217,13 +223,16 @@ mod tests {
     }
 
     #[test]
-    fn session_from_identity_is_not_a_session_manager_session() {
-        // Structural check: nothing here touches a SessionManager. The
-        // absence of any SessionManager import/type in this module is the
-        // isolation guarantee; this test just documents the expectation
-        // that mint_session's output is a bare, unregistered Session.
+    fn session_from_identity_carries_all_identity_fields() {
+        // Verify that the minted session is fully formed: it carries the
+        // identity's roles, groups, subject, and email as well as user_id
+        // and token. This confirms it is a complete, standalone session
+        // independent of any SessionManager.
         let identity = fake_identity("svc-sqe-maintenance");
         let session = MaintenancePrincipal::session_from_identity(&identity, "job-7");
-        assert!(session.id.starts_with("maintenance-job-"));
+        assert_eq!(session.user.roles, vec!["maintenance".to_string()]);
+        assert!(session.user.groups.is_empty());
+        assert!(session.user.subject.is_none());
+        assert!(session.user.email.is_none());
     }
 }
