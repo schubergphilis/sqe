@@ -69,6 +69,50 @@ pub async fn setup_handler() -> (sqe_core::Session, sqe_coordinator::QueryHandle
     (session, handler)
 }
 
+/// Resolve a `host:port` string to its candidate socket addresses.
+///
+/// `SocketAddr::from_str` is purely syntactic and does not resolve hostnames,
+/// so it fails on `"localhost:50052"` even though that is the exact default
+/// used throughout the distributed test docs. `ToSocketAddrs` performs actual
+/// hostname resolution (via the system resolver / `/etc/hosts`), so
+/// `"localhost:50052"` resolves correctly here.
+fn resolve_host_port(host_port: &str) -> std::io::Result<Vec<std::net::SocketAddr>> {
+    use std::net::ToSocketAddrs;
+    let addrs: Vec<std::net::SocketAddr> = host_port.to_socket_addrs()?.collect();
+    if addrs.is_empty() {
+        return Err(std::io::Error::other(format!(
+            "'{host_port}' resolved to no addresses"
+        )));
+    }
+    Ok(addrs)
+}
+
+/// Try every resolved candidate address and succeed if any of them accepts a
+/// TCP connection within `timeout`. `localhost` can resolve `::1` before
+/// `127.0.0.1` (or vice versa) depending on the host's resolver config, and
+/// only one of the two may actually be listening, so all candidates must be
+/// tried rather than just the first.
+///
+/// Uses `tokio::net::TcpStream::connect` (not the blocking
+/// `std::net::TcpStream::connect_timeout`) so the check does not block the
+/// async worker thread it runs on inside `#[tokio::test(flavor =
+/// "multi_thread")]`.
+async fn is_any_addr_reachable(
+    addrs: &[std::net::SocketAddr],
+    timeout: std::time::Duration,
+) -> bool {
+    for addr in addrs {
+        let connected = tokio::time::timeout(timeout, tokio::net::TcpStream::connect(addr))
+            .await
+            .map(|r| r.is_ok())
+            .unwrap_or(false);
+        if connected {
+            return true;
+        }
+    }
+    false
+}
+
 /// Authenticate as root and return (session, handler) wired to a live worker
 /// fleet, mirroring `integration_test.rs::test_distributed_select`'s
 /// construction. Used by distributed-dispatch tests (query-path dispatch and,
@@ -102,20 +146,20 @@ pub async fn setup_handler_with_workers(
         let host_port = url
             .strip_prefix("http://")
             .unwrap_or_else(|| panic!("worker URL must be http://host:port, got '{url}'"));
-        let addr: std::net::SocketAddr = host_port
-            .parse()
+        let addrs = resolve_host_port(host_port)
             .unwrap_or_else(|e| panic!("invalid worker URL '{url}': {e}"));
-        let reachable = std::net::TcpStream::connect_timeout(
-            &addr,
-            std::time::Duration::from_secs(2),
-        );
+        let port = addrs
+            .first()
+            .map(|a| a.port())
+            .unwrap_or_else(|| panic!("worker URL '{url}' resolved to no addresses"));
+        let reachable = is_any_addr_reachable(&addrs, std::time::Duration::from_secs(2)).await;
         assert!(
-            reachable.is_ok(),
+            reachable,
             "worker unreachable at {url}: a distributed test must fail loudly, not fall \
              back to local execution. Start a worker there, e.g.:\n  \
              SQE_WORKER__FLIGHT_PORT={} cargo run -p sqe-worker -- {}\n\
              or pass --ignored to skip.",
-            addr.port(),
+            port,
             test_config_path(),
         );
     }
@@ -194,5 +238,35 @@ pub fn print_results(label: &str, sql: &str, batches: &[arrow_array::RecordBatch
     match arrow::util::pretty::pretty_format_batches(batches) {
         Ok(table) => println!("{table}"),
         Err(e) => println!("(could not format: {e})"),
+    }
+}
+
+#[cfg(test)]
+mod host_port_resolution_tests {
+    use super::resolve_host_port;
+
+    /// Regression test for the bug fixed in `setup_handler_with_workers`:
+    /// `SocketAddr::from_str` cannot resolve hostnames, so
+    /// `"localhost:50052".parse::<SocketAddr>()` returns `Err` even though
+    /// `localhost` is the exact default host documented for distributed
+    /// tests. `resolve_host_port` must accept it.
+    #[test]
+    fn resolves_localhost_host_port() {
+        let addrs = resolve_host_port("localhost:50052")
+            .expect("resolve_host_port must resolve 'localhost:50052'");
+        assert!(!addrs.is_empty(), "expected at least one resolved address");
+        assert!(
+            addrs.iter().all(|a| a.port() == 50052),
+            "all resolved addresses must keep the requested port: {addrs:?}"
+        );
+    }
+
+    #[test]
+    fn resolves_literal_ipv4_host_port() {
+        let addrs = resolve_host_port("127.0.0.1:50052")
+            .expect("resolve_host_port must resolve a literal IPv4 address");
+        assert_eq!(addrs.len(), 1);
+        assert_eq!(addrs[0].port(), 50052);
+        assert!(addrs[0].ip().is_loopback());
     }
 }
