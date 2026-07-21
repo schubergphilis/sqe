@@ -117,6 +117,7 @@ impl MaintenanceHandler {
                 strategy,
                 sort_order,
                 delete_file_threshold,
+                rewrite_all,
             } => {
                 self.rewrite_data_files(
                     session,
@@ -127,6 +128,7 @@ impl MaintenanceHandler {
                     strategy.clone(),
                     sort_order.clone(),
                     *delete_file_threshold,
+                    rewrite_all.unwrap_or(false),
                 )
                 .await
             }
@@ -534,6 +536,7 @@ impl MaintenanceHandler {
         strategy: Option<String>,
         sort_order: Option<String>,
         delete_file_threshold: Option<usize>,
+        rewrite_all: bool,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         const MAX_COMMIT_ATTEMPTS: usize = 4;
         let mut attempt: usize = 0;
@@ -549,6 +552,7 @@ impl MaintenanceHandler {
                     strategy.clone(),
                     sort_order.clone(),
                     delete_file_threshold,
+                    rewrite_all,
                 )
                 .await
             {
@@ -587,6 +591,7 @@ impl MaintenanceHandler {
         strategy: Option<String>,
         sort_order: Option<String>,
         delete_file_threshold: Option<usize>,
+        rewrite_all: bool,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         const DEFAULT_TARGET_FILE_SIZE_BYTES: u64 = 512 * 1024 * 1024;
         const DEFAULT_MIN_INPUT_FILES: usize = 5;
@@ -671,9 +676,10 @@ impl MaintenanceHandler {
             };
 
         // Skip a table below `min_input_files` UNLESS a delete-heavy file makes
-        // it worth rewriting anyway (apply accumulated deletes). The
-        // delete_file_threshold path deliberately overrides the file-count floor.
-        if input_count < min_input && delete_heavy.is_empty() {
+        // it worth rewriting anyway (apply accumulated deletes) or the caller
+        // asked to rewrite everything. Both deliberately override the file-count
+        // floor.
+        if input_count < min_input && delete_heavy.is_empty() && !rewrite_all {
             info!(
                 table = %ident,
                 input_count,
@@ -690,6 +696,19 @@ impl MaintenanceHandler {
                 "skipped: below min_input_files".to_string(),
             )?]);
         }
+
+        // Files kept even when at or above target: delete-heavy files always, and
+        // every file when `rewrite_all` forces a full re-encode. `rewrite_all` is
+        // a superset of `delete_heavy`, so it wins when set. Bin-pack still packs
+        // small files under target; a large force-included file anchors its own
+        // group (rewritten alone to apply its deletes / re-encode).
+        let all_paths: std::collections::HashSet<String>;
+        let force_include: &std::collections::HashSet<String> = if rewrite_all {
+            all_paths = old_data_files.iter().map(|f| f.file_path().to_string()).collect();
+            &all_paths
+        } else {
+            &delete_heavy
+        };
 
         // Grouping strategy depends on whether we are sorting.
         //
@@ -709,16 +728,19 @@ impl MaintenanceHandler {
         let groups = if sort_ctx.is_some() {
             group_files_by_partition(&old_data_files)
         } else {
-            pack_file_groups_partition_aware(&old_data_files, target_bytes, &delete_heavy)
+            pack_file_groups_partition_aware(&old_data_files, target_bytes, force_include)
         };
 
         // A group is worth rewriting when it meets `min_input` (real
-        // consolidation) OR it contains a delete-heavy file (apply accumulated
-        // deletes, even if the group is small or the file is large).
+        // consolidation), the caller forced `rewrite_all`, OR it contains a
+        // delete-heavy file (apply accumulated deletes, even if the group is
+        // small or the file is large).
         let eligible_groups: Vec<Vec<DataFile>> = groups
             .into_iter()
             .filter(|g| {
-                g.len() >= min_input || g.iter().any(|f| delete_heavy.contains(f.file_path()))
+                g.len() >= min_input
+                    || rewrite_all
+                    || g.iter().any(|f| delete_heavy.contains(f.file_path()))
             })
             .collect();
 

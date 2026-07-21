@@ -10,7 +10,7 @@ Source: `crates/sqe-sql/src/procedures.rs`. Handlers in `crates/sqe-coordinator/
 
 | Procedure | Origin | Required args | Optional args | Notes |
 |---|---|---|---|---|
-| `system.rewrite_data_files` | `sqe-sql` + `sqe-coordinator` | `table => 'ns.t'` | `target_file_size_bytes => N`, `min_input_files => N`, `max_concurrent_file_group_rewrites => N`, `strategy => 'binpack'\|'sort'`, `sort_order => 'col ASC, ...'\|'zorder(a, b)'`, `delete_file_threshold => N` | Compacts small data files (delete-aware). Default target 512 MiB, min 5 files per group, max 4 concurrent groups. `strategy => 'sort'` sorts a whole partition by `sort_order` (a column list or `zorder(...)`) via a spillable DataFusion sort and rolls output at the target size, producing files with disjoint key ranges. `delete_file_threshold => N` also rewrites any data file with at least N delete files applying to it, even when it is already large. |
+| `system.rewrite_data_files` | `sqe-sql` + `sqe-coordinator` | `table => 'ns.t'` | `target_file_size_bytes => N`, `min_input_files => N`, `max_concurrent_file_group_rewrites => N`, `strategy => 'binpack'\|'sort'`, `sort_order => 'col ASC, ...'\|'zorder(a, b)'`, `delete_file_threshold => N` | Compacts small data files (delete-aware). Default target 512 MiB, min 5 files per group, max 4 concurrent groups. `strategy => 'sort'` sorts a whole partition by `sort_order` (a column list or `zorder(...)`) via a spillable DataFusion sort and rolls output at the target size, producing files with disjoint key ranges. `delete_file_threshold => N` also rewrites any data file with at least N delete files applying to it, even when it is already large. `rewrite_all => true` forces a rewrite of every file regardless of size or file count. |
 | `system.expire_snapshots` | `sqe-sql` + `sqe-coordinator` | `table => 'ns.t'` | `older_than => TIMESTAMP`, `retain_last => N` | Drops old snapshots. `older_than` and `retain_last` combine: a snapshot must be older than `older_than` and beyond the `retain_last` window before it is removed. |
 | `system.remove_orphan_files` | `sqe-sql` + `sqe-coordinator` | `table => 'ns.t'` | `older_than => TIMESTAMP` | Deletes files under the table prefix not referenced by any live snapshot. Default `older_than` is 3 days ago, to avoid racing with in-flight writes. |
 | `system.rewrite_manifests` | `sqe-sql` + `sqe-coordinator` | `table => 'ns.t'` | - | Consolidates many small manifest files into fewer larger ones. Speeds up planning on large tables. |
@@ -113,6 +113,25 @@ position and equality deletes. A low threshold on an equality-heavy table
 therefore rewrites broadly, since one equality delete can apply to many files.
 The option is off by default and is a no-op under `strategy => 'sort'`, which
 already rewrites the whole partition.
+
+### Force a full rewrite
+
+`rewrite_all => true` rewrites every data file, including files already at or
+above the target size and partitions below `min_input_files`. It applies all
+deletes and re-encodes at the target size. Use it to force a clean pass after a
+schema or partition-spec change, or to apply accumulated deletes across a whole
+table in one commit.
+
+```sql
+CALL system.rewrite_data_files(
+    table => 'analytics.events',
+    rewrite_all => true
+);
+```
+
+Because it re-encodes everything, it costs a full read and write of the table.
+It is off by default and subsumed by `strategy => 'sort'`, which already
+rewrites the whole partition.
 
 ### Drop snapshots older than 30 days, keeping the last 10
 

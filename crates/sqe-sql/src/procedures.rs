@@ -11,7 +11,8 @@
 //!
 //! - `system.rewrite_data_files(table => 'ns.t'[, target_file_size_bytes => N,
 //!   min_input_files => N, max_concurrent_file_group_rewrites => N,
-//!   strategy => 'binpack'|'sort', sort_order => '...', delete_file_threshold => N])`
+//!   strategy => 'binpack'|'sort', sort_order => '...', delete_file_threshold => N,
+//!   rewrite_all => true])`
 //! - `system.expire_snapshots(table => 'ns.t'[, older_than => TIMESTAMP,
 //!   retain_last => N])`
 //! - `system.remove_orphan_files(table => 'ns.t'[, older_than => TIMESTAMP])`
@@ -62,6 +63,12 @@ pub enum ProcedureCall {
         /// broadly. Off (`None`) by default. No-op under `strategy => 'sort'`,
         /// which already rewrites the whole partition.
         delete_file_threshold: Option<usize>,
+        /// Force a rewrite of every data file, including files already at or
+        /// above the target size and partitions below `min_input_files`. Applies
+        /// all deletes and re-encodes at the target size. Off (`false`) by
+        /// default. Subsumed by `strategy => 'sort'`, which already rewrites the
+        /// whole partition.
+        rewrite_all: Option<bool>,
     },
     /// Drop old snapshots via vendored `RemoveSnapshotAction`.
     ExpireSnapshots {
@@ -726,6 +733,7 @@ fn parse_rewrite_data_files(mut args: Vec<(String, Expr)>) -> sqe_core::Result<P
     let delete_file_threshold = take_option(&mut args, "delete_file_threshold", |e| {
         expect_usize(e, "delete_file_threshold")
     })?;
+    let rewrite_all = take_option(&mut args, "rewrite_all", |e| expect_bool(e, "rewrite_all"))?;
     expect_no_remaining(&args, "rewrite_data_files")?;
 
     Ok(ProcedureCall::RewriteDataFiles {
@@ -736,6 +744,7 @@ fn parse_rewrite_data_files(mut args: Vec<(String, Expr)>) -> sqe_core::Result<P
         strategy,
         sort_order,
         delete_file_threshold,
+        rewrite_all,
     })
 }
 
@@ -834,6 +843,7 @@ mod tests {
                 strategy,
                 sort_order,
                 delete_file_threshold,
+                rewrite_all,
             } => {
                 assert_eq!(table.namespace, "ns");
                 assert_eq!(table.name, "t");
@@ -843,6 +853,7 @@ mod tests {
                 assert!(strategy.is_none());
                 assert!(sort_order.is_none());
                 assert!(delete_file_threshold.is_none());
+                assert!(rewrite_all.is_none());
             }
             other => panic!("Expected RewriteDataFiles, got {other:?}"),
         }
@@ -863,6 +874,19 @@ mod tests {
             } => {
                 assert_eq!(strategy.as_deref(), Some("sort"));
                 assert_eq!(sort_order.as_deref(), Some("a ASC, b DESC"));
+            }
+            other => panic!("Expected RewriteDataFiles, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_rewrite_data_files_rewrite_all() {
+        let stmt =
+            parse_first("CALL system.rewrite_data_files(table => 'ns.t', rewrite_all => true)");
+        let call = try_parse_call(&stmt).unwrap().expect("match");
+        match call {
+            ProcedureCall::RewriteDataFiles { rewrite_all, .. } => {
+                assert_eq!(rewrite_all, Some(true));
             }
             other => panic!("Expected RewriteDataFiles, got {other:?}"),
         }
