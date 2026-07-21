@@ -12,6 +12,7 @@
 //! and call into this crate's primitives with already-resolved inputs.
 
 pub mod rewrite;
+pub mod wire;
 pub mod write_memory;
 pub mod writer;
 pub mod zorder;
@@ -21,4 +22,8 @@ pub use rewrite::{
     group_files_by_partition, pack_file_groups, pack_file_groups_partition_aware,
     plan_delete_aware_read, rewrite_group, sort_group_stream, DeleteAwareReadPlan, SortCtx,
     SortSpec,
+};
+pub use wire::{
+    sign, verify, CompactGroupFrame, CompactGroupRequest, CompactGroupResponse, S3Conn,
+    SortSpecWire,
 };
