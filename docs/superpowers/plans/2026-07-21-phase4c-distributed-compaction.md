@@ -56,9 +56,9 @@ Note: keep the extraction MINIMAL - move only what the worker path needs plus wh
 
 **Interfaces produced:** worker handles `do_action("compact_file_group")`: verify worker-secret + HMAC over the request bytes; decode `CompactGroupRequest`; build `FileIO` from `s3`; `StaticTable::from_metadata_file(metadata_location)`; assert `current_snapshot().snapshot_id() == snapshot_id` (refuse otherwise); `plan_delete_aware_read` restricted to `group_file_paths` (fail loud if any path missing); delete-applying read; optional `sort` via the worker's DataFusion runtime; rolling write via the shared streaming writer to the table data location; per-group `expected_rows_after_deletes` cross-check; `write_data_files_to_avro`; stream `Progress` then `Done`. Workers never touch a catalog token.
 
-- [ ] Step 1: Failing test (unit where possible; integration behind the distributed harness): a `compact_file_group` request over a single-file group returns a `Done` frame with avro `DataFile`s whose `read_data_files_from_avro` round-trips, and rejects a request whose `snapshot_id` does not match the metadata.
-- [ ] Step 2-4: implement + test; the delete-application + row cross-check reuse `sqe-compaction`. Verify a missing-path in the group fails loud (resurrection guard).
-- [ ] Step 5: clippy; commit `feat(worker): compact_file_group rewrite action`.
+- [x] Step 1: Failing test (unit where possible; integration behind the distributed harness): a `compact_file_group` request over a single-file group returns a `Done` frame with avro `DataFile`s whose `read_data_files_from_avro` round-trips, and rejects a request whose `snapshot_id` does not match the metadata.
+- [x] Step 2-4: implement + test; the delete-application + row cross-check reuse `sqe-compaction`. Verify a missing-path in the group fails loud (resurrection guard).
+- [x] Step 5: clippy; commit `feat(worker): compact_file_group rewrite action`.
 
 ---
 
