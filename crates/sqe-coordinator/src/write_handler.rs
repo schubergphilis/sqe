@@ -4210,14 +4210,17 @@ impl WriteHandler {
             if new_data_files.is_empty() {
                 return Ok(());
             }
-            let tx = Transaction::new(&table);
-            let action = tx.fast_append().add_data_files(new_data_files);
-            let tx = action
-                .apply(tx)
-                .map_err(|e| SqeError::Execution(format!("append apply failed: {e}")))?;
-            tx.commit(catalog)
-                .await
-                .map_err(|e| SqeError::Execution(format!("Failed to commit INSERT: {e}")))?;
+            commit_with_retry(catalog, table_ident, "insert", move |fresh_table| {
+                let files = new_data_files.clone();
+                async move {
+                    let tx = Transaction::new(&fresh_table);
+                    let action = tx.fast_append().add_data_files(files);
+                    let tx = action.apply(tx)?;
+                    tx.commit(catalog).await
+                }
+            })
+            .await
+            .map_err(|e| SqeError::Execution(format!("Failed to commit INSERT: {e}")))?;
             return Ok(());
         }
 
