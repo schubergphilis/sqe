@@ -80,9 +80,9 @@ Note: keep the extraction MINIMAL - move only what the worker path needs plus wh
 
 **Interfaces produced:** `rewrite_data_files` (and the scheduler active path) consult `distribution.mode`: `auto` -> distributed when `WorkerRegistry` reports `>= min_workers` healthy, else local; `local` -> always coordinator-local; `require` -> error/skip if fleet below `min_workers` (scheduled jobs skip loudly with an audit + metric; interactive `CALL` errors). Manual `CALL system.rewrite_data_files` defaults to `prefer`/`auto` per config; a per-call `distributed => 'require'|'local'` override optional.
 
-- [ ] Step 1: Failing unit test: mode resolution (`auto` with N>=min -> distributed, with N<min -> local; `require` with N<min -> skip/err; `local` -> local) as a pure decision function over (mode, healthy_count, min_workers).
-- [ ] Step 2-4: implement + wire; ensure `local`/no-fleet path is byte-identical to today. Integration: `require` below floor skips loudly (scheduled) and errors (manual).
-- [ ] Step 5: clippy; commit `feat(compaction): distribution.mode auto/local/require`.
+- [x] Step 1: Failing unit test: mode resolution (`auto` with N>=min -> distributed, with N<min -> local; `require` with N<min -> skip/err; `local` -> local) as a pure decision function over (mode, healthy_count, min_workers).
+- [x] Step 2-4: implement + wire; ensure `local`/no-fleet path is byte-identical to today. Integration: `require` below floor skips loudly (scheduled) and errors (manual).
+- [x] Step 5: clippy; commit `feat(compaction): distribution.mode auto/local/require`.
 
 ---
 

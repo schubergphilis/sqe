@@ -24,7 +24,8 @@ use iceberg::spec::Schema as IcebergSchema;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg::{Catalog, NamespaceIdent, TableCreation, TableIdent};
 use sqe_core::config::{
-    MaintenanceCompactionConfig, MaintenanceConfig, MaintenanceMode, MaintenancePrincipalConfig,
+    DistributionMode, MaintenanceCompactionConfig, MaintenanceConfig,
+    MaintenanceDistributionConfig, MaintenanceMode, MaintenancePrincipalConfig,
     MaintenanceSchedulerConfig,
 };
 use sqe_core::{SecretStore, SecretString};
@@ -965,6 +966,163 @@ async fn active_tick_skips_table_with_no_eligible_debt_and_audits_it() {
     assert!(
         skipped_events[0].contains("no eligible compaction debt"),
         "skip reason must be actionable in the audit line: {}",
+        skipped_events[0]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4c Task 5: `distribution.mode` routing.
+// ---------------------------------------------------------------------------
+
+/// An opted-in table WITH eligible compaction debt, under
+/// `distribution.mode = "require"`, when the handler has no worker registry
+/// attached at all (so `healthy_worker_count()` is always `0`, `< any
+/// min_workers >= 1`): the active tick must skip loudly rather than fall
+/// back to a coordinator-local rewrite. The table is left completely
+/// untouched (same file count, same snapshot id), a `skipped`
+/// `maintenance_log` row is written, the dedicated
+/// `sqe_maintenance_skipped_total{reason="insufficient_workers"}` metric
+/// fires, and an `AuditKind::Maintenance` skip event names the cause.
+#[tokio::test]
+async fn active_tick_require_mode_skips_loudly_when_no_workers_are_healthy() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let catalog = sqlite_catalog(&dir).await;
+
+    // 5 small files, min_input_files=2 below: this table clears the
+    // eligibility gate, so the ONLY reason it can end up skipped is the
+    // distribution-mode routing this test exercises.
+    let opted_ident = create_table(&catalog, "ns", "require_no_workers", true).await;
+    seed_small_files(&catalog, &opted_ident, 5).await;
+    let files_before = live_data_file_count(&catalog, &opted_ident).await;
+    assert_eq!(files_before, 5, "seed helper must produce exactly 5 live files");
+    let opted_snapshot_before = catalog
+        .load_table(&opted_ident)
+        .await
+        .expect("reload opted table")
+        .metadata()
+        .current_snapshot_id();
+
+    create_maintenance_log_table(&catalog).await;
+
+    let idp = mock_idp().await;
+    let mut cfg = active_maintenance_config(&idp, 2);
+    cfg.distribution = MaintenanceDistributionConfig {
+        mode: DistributionMode::Require,
+        min_workers: 1,
+        ..Default::default()
+    };
+    let principal = Arc::new(
+        MaintenancePrincipal::from_config(cfg.principal.as_ref().expect("principal set"))
+            .expect("build principal"),
+    );
+    let metrics = Arc::new(MetricsRegistry::new().expect("metrics registry builds"));
+
+    let audit_dir = tempfile::tempdir().expect("audit tempdir");
+    let audit_path = audit_dir.path().join("audit.jsonl");
+    let audit = Arc::new(
+        AuditLogger::with_config(audit_path.to_str().expect("utf8 path"), AuditFormat::Native)
+            .expect("audit logger builds"),
+    );
+
+    let injected_catalog = catalog.clone();
+    let catalog_factory: sqe_coordinator::maintenance_scheduler::CatalogFactory =
+        Arc::new(move |_session: &sqe_core::Session| {
+            let catalog = injected_catalog.clone();
+            Box::pin(async move { Ok(catalog) })
+        });
+    // Deliberately NOT `.with_worker_registry(...)`: this handler has no
+    // registry at all, so `healthy_worker_count()` is `0` and `require`
+    // mode with `min_workers = 1` must skip, never silently compact locally.
+    let handler = Arc::new(sqe_coordinator::maintenance::MaintenanceHandler::new(minimal_sqe_config()));
+
+    let scheduler = MaintenanceScheduler::new(
+        cfg,
+        principal,
+        metrics.clone(),
+        Some(audit.clone()),
+        catalog_factory,
+        handler,
+    );
+
+    scheduler.advisory_tick().await.expect("active tick succeeds");
+
+    // --- Never touched: same file count, same snapshot ---
+    let files_after = live_data_file_count(&catalog, &opted_ident).await;
+    assert_eq!(
+        files_after, files_before,
+        "distribution.mode=require below the healthy-worker floor must never fall back to a local rewrite"
+    );
+    let opted_snapshot_after = catalog
+        .load_table(&opted_ident)
+        .await
+        .expect("reload opted table")
+        .metadata()
+        .current_snapshot_id();
+    assert_eq!(
+        opted_snapshot_before, opted_snapshot_after,
+        "a skipped table must not get a new snapshot"
+    );
+
+    // --- maintenance_log: one row, status="skipped" ---
+    let rows = scan_log_rows(&catalog).await;
+    let opted_rows: Vec<&LogRowView> =
+        rows.iter().filter(|r| r.table_name == "ns.require_no_workers").collect();
+    assert_eq!(opted_rows.len(), 1, "expected exactly one job row for the opted table");
+    assert_eq!(opted_rows[0].status, "skipped");
+
+    // --- Metrics: the dedicated insufficient-workers counter fires ---
+    let skipped_insufficient = metrics
+        .registry
+        .gather()
+        .into_iter()
+        .find(|f| f.name() == "sqe_maintenance_skipped_total")
+        .and_then(|f| {
+            f.get_metric()
+                .iter()
+                .find(|m| {
+                    m.get_label()
+                        .iter()
+                        .any(|l| l.name() == "reason" && l.value() == "insufficient_workers")
+                })
+                .map(|m| m.get_counter().value())
+        });
+    assert_eq!(
+        skipped_insufficient,
+        Some(1.0),
+        "expected exactly one sqe_maintenance_skipped_total{{reason=\"insufficient_workers\"}} sample"
+    );
+
+    // --- The generic job-total skip counter also fires (same shape as any other skip) ---
+    let job_skipped = metrics
+        .registry
+        .gather()
+        .into_iter()
+        .find(|f| f.name() == "sqe_maintenance_job_total")
+        .and_then(|f| {
+            f.get_metric()
+                .iter()
+                .find(|m| m.get_label().iter().any(|l| l.name() == "status" && l.value() == "skipped"))
+                .map(|m| m.get_counter().value())
+        });
+    assert_eq!(job_skipped, Some(1.0));
+
+    // --- Audit: one Maintenance skip event, naming the cause ---
+    audit.flush();
+    let audit_content = std::fs::read_to_string(&audit_path).unwrap_or_default();
+    let skipped_events: Vec<&str> = audit_content
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter(|l| l.contains("\"kind\":\"maintenance\"") && l.contains("skipped"))
+        .collect();
+    assert_eq!(skipped_events.len(), 1, "expected exactly one skip audit event, got: {skipped_events:?}");
+    assert!(
+        skipped_events[0].contains("\"status\":\"success\""),
+        "a skip is a correct no-op decision, not a failure: {}",
+        skipped_events[0]
+    );
+    assert!(
+        skipped_events[0].contains("insufficient_workers"),
+        "skip reason must name the cause in the audit line: {}",
         skipped_events[0]
     );
 }

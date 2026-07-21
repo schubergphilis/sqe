@@ -241,6 +241,14 @@ pub struct MetricsRegistry {
     /// across all successful jobs (Phase 4b). Never incremented for
     /// `failed`/`skipped` jobs, which write nothing.
     pub maintenance_bytes_rewritten_total: IntCounter,
+    /// Active-mode jobs skipped, by specific reason (Phase 4c Task 5).
+    /// Deliberately separate from `maintenance_job_total{status="skipped"}`
+    /// (which fires for every skip cause, including "no eligible compaction
+    /// debt"): this one is keyed by `reason` so an operator can alert on
+    /// `reason="insufficient_workers"` -- `distribution.mode = "require"`
+    /// with the fleet below `min_workers` -- specifically, without that
+    /// signal being drowned out by routine no-debt skips.
+    pub maintenance_skipped_total: IntCounterVec,
 }
 
 impl MetricsRegistry {
@@ -696,6 +704,14 @@ impl MetricsRegistry {
             "Bytes written by active-mode compaction's output files, summed across successful jobs",
         )?;
 
+        // Phase 4c Task 5: `distribution.mode` routing.
+        let maintenance_skipped_total = register_int_counter_vec(
+            &registry,
+            "sqe_maintenance_skipped_total",
+            "Active-mode compaction jobs skipped, by specific reason (e.g. insufficient_workers)",
+            &["reason"],
+        )?;
+
         Ok(Self {
             registry,
             query_count,
@@ -766,6 +782,7 @@ impl MetricsRegistry {
             maintenance_tick_errors,
             maintenance_job_total,
             maintenance_bytes_rewritten_total,
+            maintenance_skipped_total,
         })
     }
 }

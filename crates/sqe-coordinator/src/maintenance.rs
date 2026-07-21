@@ -28,6 +28,7 @@ use sqe_sql::{NamespaceRef, ProcedureCall, TableRef};
 use tracing::{info, warn};
 use futures::TryStreamExt;
 
+use crate::worker_registry::{WorkerLoadTracker, WorkerRegistry};
 use crate::writer::{new_upload_tracker, parse_parquet_compression, WriteCleanupGuard};
 
 /// Delete-aware bin-pack/sort rewrite primitives moved to `sqe-compaction`
@@ -62,6 +63,20 @@ pub struct MaintenanceHandler {
     /// Shared DataFusion runtime (FairSpillPool + DiskManager) used by the
     /// sort-compaction path so a large sort spills to disk instead of OOMing.
     runtime: Option<Arc<datafusion::execution::runtime_env::RuntimeEnv>>,
+    /// The coordinator's worker fleet view (Phase 4c Task 5). `None` means
+    /// this handler was never wired to a fleet -- [`Self::healthy_worker_count`]
+    /// then always reports `0`, which is exactly what makes `distribution.mode
+    /// = "auto"` resolve to `Local` and keeps the single-node/no-fleet path
+    /// byte-identical to pre-Task-5 behavior (see [`resolve_execution`]).
+    worker_registry: Option<Arc<WorkerRegistry>>,
+    /// In-flight group count per worker, used to place `compact_file_group`
+    /// dispatches. Deliberately a SEPARATE tracker from the query path's scan
+    /// dispatch (`QueryHandler::worker_load`): a maintenance rewrite group and
+    /// a query scan fragment are different kinds of work, and conflating
+    /// their load counts would let one starve placement decisions for the
+    /// other. Always present (cheap to construct) even when `worker_registry`
+    /// is `None`, since only the distributed path ever reads it.
+    worker_load: Arc<WorkerLoadTracker>,
 }
 
 impl MaintenanceHandler {
@@ -72,6 +87,8 @@ impl MaintenanceHandler {
             table_cache: None,
             query_history: None,
             runtime: None,
+            worker_registry: None,
+            worker_load: Arc::new(WorkerLoadTracker::new()),
         }
     }
 
@@ -107,6 +124,108 @@ impl MaintenanceHandler {
         self
     }
 
+    /// Attach the coordinator's worker registry (Phase 4c Task 5) so
+    /// `rewrite_data_files`'s `distribution.mode` routing can see the live
+    /// healthy-worker count instead of always assuming zero workers.
+    ///
+    /// Never call this in a configuration where `[coordinator]` has no
+    /// worker fleet: an empty/never-healthy registry behaves identically to
+    /// `None` (see [`Self::healthy_worker_count`]), so wiring it unconditionally
+    /// at every construction site is safe -- the single-node/no-fleet path
+    /// stays on `Local` either way.
+    #[must_use = "with_worker_registry consumes self; bind the returned handler"]
+    pub fn with_worker_registry(mut self, registry: Arc<WorkerRegistry>) -> Self {
+        self.worker_registry = Some(registry);
+        self
+    }
+
+    /// Healthy worker count as `distribution.mode` resolution sees it: `0`
+    /// when no registry was ever attached (see [`Self::with_worker_registry`]),
+    /// otherwise the registry's live count. This is the ONLY place
+    /// `resolve_execution`'s `healthy_workers` input comes from in production
+    /// code; the scheduler's active path reads it through this same method
+    /// (via `self.handler`) so the manual `CALL` path and the scheduler can
+    /// never disagree about how many workers are healthy right now.
+    pub(crate) async fn healthy_worker_count(&self) -> usize {
+        match &self.worker_registry {
+            Some(registry) => registry.healthy_workers().await.len(),
+            None => 0,
+        }
+    }
+
+    /// Build the S3 connection details a worker needs for `compact_file_group`,
+    /// from this coordinator's own storage config. Mirrors the flattened
+    /// `s3_*` fields `QueryHandler::try_distribute` already sends workers on
+    /// the scan path (`query_handler.rs`'s `ScanTask` construction) field for
+    /// field, so a worker's object-store construction behaves identically
+    /// whether the bytes arrived via a scan ticket or a compaction group.
+    fn s3_conn(&self) -> sqe_compaction::wire::S3Conn {
+        let storage = &self.config.storage;
+        sqe_compaction::wire::S3Conn {
+            endpoint: storage.s3_endpoint.clone(),
+            region: storage.s3_region.clone(),
+            access_key: storage.s3_access_key.clone(),
+            secret_key: storage.s3_secret_key.expose().to_string(),
+            session_token: String::new(),
+            path_style: storage.s3_path_style,
+            allow_http: storage.s3_endpoint.starts_with("http://"),
+        }
+    }
+
+    /// Distributed rewrite, with every coordinator-owned dependency
+    /// (`s3_conn`, `worker_registry`, `worker_load`, `worker_secret`,
+    /// `distribution` config) pulled from `self` instead of threaded in by
+    /// the caller. This is what Task 5's `distribution.mode` routing calls
+    /// from both `handle()`'s manual `CALL` arm and the active-mode
+    /// scheduler; [`Self::rewrite_data_files_distributed`] itself keeps its
+    /// Task 4 signature (explicit everything) unchanged.
+    ///
+    /// Callers must only reach this after [`resolve_execution`] has already
+    /// returned [`ExecutionPlan::Distributed`] -- that is what guarantees
+    /// `self.worker_registry` is `Some` here (a healthy count `>= 1` is only
+    /// possible with a registry attached).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn rewrite_data_files_distributed_with_defaults(
+        &self,
+        catalog: &Arc<dyn Catalog>,
+        table_ref: &TableRef,
+        job_id: &str,
+        target_file_size_bytes: Option<u64>,
+        min_input_files: Option<usize>,
+        strategy: Option<String>,
+        sort_order: Option<String>,
+        delete_file_threshold: Option<usize>,
+        snapshot_properties: Option<std::collections::HashMap<String, String>>,
+    ) -> sqe_core::Result<RewriteOutcome> {
+        let registry = self.worker_registry.clone().ok_or_else(|| {
+            SqeError::Execution(
+                "rewrite_data_files_distributed: resolved to Distributed but no worker \
+                 registry is attached to this handler (internal wiring bug)"
+                    .into(),
+            )
+        })?;
+        let s3 = self.s3_conn();
+        let worker_secret = self.config.coordinator.worker_secret.expose().to_string();
+        let dist = self.config.maintenance.distribution.clone();
+        self.rewrite_data_files_distributed(
+            catalog,
+            table_ref,
+            job_id,
+            &s3,
+            &registry,
+            &self.worker_load,
+            &worker_secret,
+            &dist,
+            target_file_size_bytes,
+            min_input_files,
+            strategy,
+            sort_order,
+            delete_file_threshold,
+            snapshot_properties,
+        )
+        .await
+    }
+
     /// Entry point from the query handler. Resolves the target table via the
     /// session's catalog, enforces write privilege, then dispatches to the
     /// per-procedure implementation.
@@ -126,6 +245,7 @@ impl MaintenanceHandler {
                 strategy,
                 sort_order,
                 delete_file_threshold,
+                distributed,
             } => {
                 // Manual `CALL system.rewrite_data_files` always commits with
                 // no snapshot-property stamp. Job-identity stamping
@@ -140,19 +260,59 @@ impl MaintenanceHandler {
                 let catalog = self
                     .create_catalog_bridge(session, table.catalog.as_deref())
                     .await?;
-                let outcome = self
-                    .rewrite_data_files(
-                        &catalog,
-                        table,
-                        *target_file_size_bytes,
-                        *min_input_files,
-                        *max_concurrent_file_group_rewrites,
-                        strategy.clone(),
-                        sort_order.clone(),
-                        *delete_file_threshold,
-                        None,
-                    )
-                    .await?;
+
+                // Phase 4c Task 5: `distribution.mode` routing. `distributed`
+                // is the optional per-call override (`distributed =>
+                // 'auto'|'local'|'require'`); absent, the configured
+                // `[maintenance.distribution] mode` applies. `require` below
+                // the healthy-worker floor is an `Err` here -- the manual
+                // `CALL` surface is interactive, so a caller who explicitly
+                // asked to require the fleet gets a loud failure, never a
+                // silent coordinator-local rewrite.
+                let mode = match distributed {
+                    Some(raw) => parse_distribution_mode_override(raw)?,
+                    None => self.config.maintenance.distribution.mode,
+                };
+                let dist = self.config.maintenance.distribution.clone();
+                let healthy = self.healthy_worker_count().await;
+                let outcome = match resolve_execution(mode, healthy, dist.min_workers) {
+                    ExecutionPlan::SkipInsufficientWorkers => {
+                        return Err(SqeError::Execution(format!(
+                            "CALL system.rewrite_data_files: distribution mode 'require' \
+                             needs >= {} healthy workers, only {healthy} are healthy",
+                            dist.min_workers
+                        )));
+                    }
+                    ExecutionPlan::Local => {
+                        self.rewrite_data_files(
+                            &catalog,
+                            table,
+                            *target_file_size_bytes,
+                            *min_input_files,
+                            *max_concurrent_file_group_rewrites,
+                            strategy.clone(),
+                            sort_order.clone(),
+                            *delete_file_threshold,
+                            None,
+                        )
+                        .await?
+                    }
+                    ExecutionPlan::Distributed => {
+                        let job_id = uuid::Uuid::now_v7().to_string();
+                        self.rewrite_data_files_distributed_with_defaults(
+                            &catalog,
+                            table,
+                            &job_id,
+                            *target_file_size_bytes,
+                            *min_input_files,
+                            strategy.clone(),
+                            sort_order.clone(),
+                            *delete_file_threshold,
+                            None,
+                        )
+                        .await?
+                    }
+                };
                 Ok(vec![rewrite_outcome_batch(&to_table_ident(table), &outcome)?])
             }
             ProcedureCall::ExpireSnapshots {
@@ -1063,10 +1223,13 @@ impl MaintenanceHandler {
     /// attempt fans the bin-packed groups out to the worker fleet
     /// (`compact_file_group`) instead of rewriting them on the coordinator.
     ///
-    /// Reserved for Task 5's `distribution.mode` routing to call; nothing in
-    /// `handle()` or the active-mode scheduler calls this yet, and the
-    /// coordinator-local path above is unchanged.
-    #[allow(dead_code, clippy::too_many_arguments)]
+    /// Called by [`Self::rewrite_data_files_distributed_with_defaults`]
+    /// (Phase 4c Task 5), which both `handle()`'s manual `CALL` arm and the
+    /// active-mode scheduler go through once [`resolve_execution`] has
+    /// decided [`ExecutionPlan::Distributed`]. This lower-level method keeps
+    /// its Task 4 signature (every dependency explicit) so its own unit
+    /// tests are unaffected by the Task 5 wiring.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn rewrite_data_files_distributed(
         &self,
         catalog: &Arc<dyn Catalog>,
@@ -1829,6 +1992,90 @@ impl MaintenanceHandler {
     }
 }
 
+/// Where a rewrite job actually runs, once `distribution.mode` has been
+/// resolved against the live worker fleet (Phase 4c Task 5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExecutionPlan {
+    /// Run coordinator-local, via [`MaintenanceHandler::rewrite_data_files`].
+    Local,
+    /// Fan out to the worker fleet, via
+    /// [`MaintenanceHandler::rewrite_data_files_distributed_with_defaults`].
+    Distributed,
+    /// `distribution.mode = "require"` but the fleet is below `min_workers`
+    /// healthy: the job must NOT silently fall back to `Local`. The caller
+    /// decides how loud that is -- the scheduler's active path records a
+    /// `skipped` job (log row + audit + metric) and moves on; the manual
+    /// `CALL system.rewrite_data_files` path returns an `Err` to the caller.
+    SkipInsufficientWorkers,
+}
+
+/// Pure decision function behind `distribution.mode` routing. Takes no
+/// handler/registry/config type so it is trivially unit-testable (see the
+/// `resolve_execution_*` tests below) and so both call sites -- the manual
+/// `CALL` arm in [`MaintenanceHandler::handle`] and the scheduler's
+/// `active_one_table` -- resolve the exact same way from the exact same
+/// three inputs, with no risk of the two switch statements drifting apart.
+///
+/// - `Local`: always coordinator-local, regardless of fleet size. This is
+///   what makes an operator's explicit `mode = "local"` an unconditional
+///   override, and it is also why a deployment that never attaches a worker
+///   registry (or attaches one with zero healthy workers) never even
+///   evaluates the other two arms differently -- see `Auto`/`Require` below.
+/// - `Auto` (the default): `Distributed` once `healthy_workers >= min_workers`,
+///   otherwise `Local`. A single-node/no-fleet deployment always has
+///   `healthy_workers == 0 < min_workers` (`min_workers` defaults to `2`,
+///   and `0` is never `>= 1` even with the floor lowered), so `Auto` degrades
+///   to `Local` there -- the byte-identical-to-pre-Task-5 guarantee.
+/// - `Require`: `Distributed` once the floor is met, otherwise
+///   `SkipInsufficientWorkers` -- never `Local`. This is the whole point of
+///   `require`: an operator who set it wants a hard signal (a loud skip or
+///   an error) instead of a rewrite quietly running on the coordinator when
+///   the fleet it was sized for isn't there.
+pub(crate) fn resolve_execution(
+    mode: sqe_core::config::DistributionMode,
+    healthy_workers: usize,
+    min_workers: usize,
+) -> ExecutionPlan {
+    use sqe_core::config::DistributionMode;
+
+    match mode {
+        DistributionMode::Local => ExecutionPlan::Local,
+        DistributionMode::Auto => {
+            if healthy_workers >= min_workers {
+                ExecutionPlan::Distributed
+            } else {
+                ExecutionPlan::Local
+            }
+        }
+        DistributionMode::Require => {
+            if healthy_workers >= min_workers {
+                ExecutionPlan::Distributed
+            } else {
+                ExecutionPlan::SkipInsufficientWorkers
+            }
+        }
+    }
+}
+
+/// Parse the manual `CALL system.rewrite_data_files(..., distributed => '...')`
+/// per-call override into a [`sqe_core::config::DistributionMode`].
+/// Case-insensitive, matching the TOML config's `#[serde(rename_all =
+/// "lowercase")]` on the same enum. An unrecognized value is a loud parse
+/// error rather than a silent fallback to the configured default -- a typo
+/// here must not quietly change which fleet-vs-local decision gets made.
+fn parse_distribution_mode_override(raw: &str) -> sqe_core::Result<sqe_core::config::DistributionMode> {
+    use sqe_core::config::DistributionMode;
+    match raw.to_ascii_lowercase().as_str() {
+        "auto" => Ok(DistributionMode::Auto),
+        "local" => Ok(DistributionMode::Local),
+        "require" => Ok(DistributionMode::Require),
+        other => Err(SqeError::Execution(format!(
+            "CALL system.rewrite_data_files: invalid 'distributed' value '{other}'; \
+             expected 'auto', 'local', or 'require'"
+        ))),
+    }
+}
+
 fn call_name_rewrite() -> &'static str {
     "rewrite_data_files"
 }
@@ -2489,5 +2736,111 @@ mod tests {
             "S3://MyBucket/wh/ns/t/",
             "s3://mybucket/wh/ns"
         ));
+    }
+
+    // ---- resolve_execution (Phase 4c Task 5) -------------------------------
+    //
+    // 3 modes x 3 floor conditions (above / at / below) = 9 cases, matching
+    // the task brief's "9 (mode x above/below floor) combinations".
+
+    use sqe_core::config::DistributionMode;
+
+    #[test]
+    fn resolve_execution_local_mode_ignores_fleet_when_above_floor() {
+        assert_eq!(
+            resolve_execution(DistributionMode::Local, 5, 2),
+            ExecutionPlan::Local
+        );
+    }
+
+    #[test]
+    fn resolve_execution_local_mode_ignores_fleet_at_floor() {
+        assert_eq!(
+            resolve_execution(DistributionMode::Local, 2, 2),
+            ExecutionPlan::Local
+        );
+    }
+
+    #[test]
+    fn resolve_execution_local_mode_ignores_fleet_below_floor() {
+        assert_eq!(
+            resolve_execution(DistributionMode::Local, 0, 2),
+            ExecutionPlan::Local
+        );
+    }
+
+    #[test]
+    fn resolve_execution_auto_mode_distributes_above_floor() {
+        assert_eq!(
+            resolve_execution(DistributionMode::Auto, 5, 2),
+            ExecutionPlan::Distributed
+        );
+    }
+
+    #[test]
+    fn resolve_execution_auto_mode_distributes_at_floor() {
+        assert_eq!(
+            resolve_execution(DistributionMode::Auto, 2, 2),
+            ExecutionPlan::Distributed
+        );
+    }
+
+    #[test]
+    fn resolve_execution_auto_mode_falls_back_to_local_below_floor() {
+        // The single-node/no-fleet case: `healthy_workers == 0` is always
+        // `< min_workers` (min_workers defaults to 2, and 0 workers is
+        // never `>= 1` even with the floor lowered), so `Auto` degrades to
+        // `Local` -- the byte-identical-to-pre-Task-5 guarantee.
+        assert_eq!(
+            resolve_execution(DistributionMode::Auto, 0, 2),
+            ExecutionPlan::Local
+        );
+    }
+
+    #[test]
+    fn resolve_execution_require_mode_distributes_above_floor() {
+        assert_eq!(
+            resolve_execution(DistributionMode::Require, 5, 2),
+            ExecutionPlan::Distributed
+        );
+    }
+
+    #[test]
+    fn resolve_execution_require_mode_distributes_at_floor() {
+        assert_eq!(
+            resolve_execution(DistributionMode::Require, 2, 2),
+            ExecutionPlan::Distributed
+        );
+    }
+
+    #[test]
+    fn resolve_execution_require_mode_skips_below_floor_never_falls_back_to_local() {
+        assert_eq!(
+            resolve_execution(DistributionMode::Require, 0, 2),
+            ExecutionPlan::SkipInsufficientWorkers
+        );
+    }
+
+    // ---- parse_distribution_mode_override ----------------------------------
+
+    #[test]
+    fn parse_distribution_mode_override_accepts_known_values_case_insensitively() {
+        assert_eq!(
+            parse_distribution_mode_override("auto").unwrap(),
+            DistributionMode::Auto
+        );
+        assert_eq!(
+            parse_distribution_mode_override("LOCAL").unwrap(),
+            DistributionMode::Local
+        );
+        assert_eq!(
+            parse_distribution_mode_override("Require").unwrap(),
+            DistributionMode::Require
+        );
+    }
+
+    #[test]
+    fn parse_distribution_mode_override_rejects_unknown_value() {
+        assert!(parse_distribution_mode_override("yolo").is_err());
     }
 }

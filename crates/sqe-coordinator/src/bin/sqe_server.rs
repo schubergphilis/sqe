@@ -1109,7 +1109,15 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
         let mut maintenance_handler_builder =
             sqe_coordinator::maintenance::MaintenanceHandler::new(config.clone())
                 .with_table_cache(table_cache.clone())
-                .with_audit(Arc::clone(&audit));
+                .with_audit(Arc::clone(&audit))
+                // Phase 4c Task 5: same registry the interactive `CALL` path's
+                // `MaintenanceHandler` gets (see `QueryHandler::new`), so the
+                // scheduler's active-mode `distribution.mode` routing sees the
+                // real healthy-worker count too. Wiring it unconditionally
+                // (even when `distributed` is false) is safe: a registry with
+                // no seeded/heartbeat-discovered workers, or one whose health
+                // checks never started, reports `0` healthy either way.
+                .with_worker_registry(Arc::clone(&worker_registry));
         if config.maintenance.mode == sqe_core::config::MaintenanceMode::Active {
             let maintenance_runtime = sqe_coordinator::runtime::build_coordinator_runtime(
                 &config.coordinator,

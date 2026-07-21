@@ -542,20 +542,72 @@ impl MaintenanceScheduler {
             ("sqe.maintenance.trigger".to_string(), "scheduled".to_string()),
         ]);
 
-        let result = self
-            .handler
-            .rewrite_data_files(
-                &commit_catalog,
-                &table_ref,
-                Some(params.target_file_size_bytes),
-                Some(params.min_input_files),
-                None, // max_concurrent_file_group_rewrites: handler default; not part of the Phase 4b per-table override surface.
-                strategy,
-                None, // sort_order: not part of the Phase 4b per-table override surface.
-                Some(params.delete_file_threshold),
-                Some(snapshot_properties),
-            )
-            .await;
+        // Phase 4c Task 5: `distribution.mode` routing. `resolve_execution`
+        // is the SAME pure function `handle()`'s manual `CALL` arm uses, fed
+        // by the SAME `healthy_worker_count()` accessor on `self.handler`
+        // (the only place a worker registry is attached), so a scheduled
+        // tick and an interactive `CALL` can never disagree about whether
+        // the fleet clears the floor right now.
+        //
+        // `require` below the floor is a LOUD skip here, never a silent
+        // fallback to `Local`: a `skipped` maintenance_log row, the existing
+        // `AuditKind::Maintenance` skip event (via `record_skipped_job`), and
+        // a dedicated `sqe_maintenance_skipped_total{reason="insufficient_workers"}`
+        // sample an operator can alert on independently of the generic
+        // `sqe_maintenance_job_total{status="skipped"}` counter (which also
+        // fires for "no eligible debt").
+        let dist = &self.cfg.distribution;
+        let healthy = self.handler.healthy_worker_count().await;
+        let result = match crate::maintenance::resolve_execution(dist.mode, healthy, dist.min_workers) {
+            crate::maintenance::ExecutionPlan::SkipInsufficientWorkers => {
+                warn!(
+                    table = %name,
+                    healthy_workers = healthy,
+                    min_workers = dist.min_workers,
+                    "active_tick: skipped, distribution.mode=require but the fleet is below min_workers"
+                );
+                self.record_skipped_insufficient_workers(
+                    catalog,
+                    &job_id,
+                    ident,
+                    started_at_ms,
+                    healthy,
+                    dist.min_workers,
+                )
+                .await;
+                return;
+            }
+            crate::maintenance::ExecutionPlan::Local => {
+                self.handler
+                    .rewrite_data_files(
+                        &commit_catalog,
+                        &table_ref,
+                        Some(params.target_file_size_bytes),
+                        Some(params.min_input_files),
+                        None, // max_concurrent_file_group_rewrites: handler default; not part of the Phase 4b per-table override surface.
+                        strategy,
+                        None, // sort_order: not part of the Phase 4b per-table override surface.
+                        Some(params.delete_file_threshold),
+                        Some(snapshot_properties),
+                    )
+                    .await
+            }
+            crate::maintenance::ExecutionPlan::Distributed => {
+                self.handler
+                    .rewrite_data_files_distributed_with_defaults(
+                        &commit_catalog,
+                        &table_ref,
+                        &job_id,
+                        Some(params.target_file_size_bytes),
+                        Some(params.min_input_files),
+                        strategy,
+                        None, // sort_order: not part of the Phase 4b per-table override surface.
+                        Some(params.delete_file_threshold),
+                        Some(snapshot_properties),
+                    )
+                    .await
+            }
+        };
 
         let finished_at_ms = chrono::Utc::now().timestamp_millis();
         match result {
@@ -680,6 +732,36 @@ impl MaintenanceScheduler {
                 reason,
             ));
         }
+    }
+
+    /// Record a `require`-mode skip caused by the fleet being below
+    /// `min_workers` healthy (Phase 4c Task 5). Delegates the log row, the
+    /// generic `sqe_maintenance_job_total{status="skipped"}` sample, and the
+    /// audit event to [`Self::record_skipped_job`] (so a "skip" always looks
+    /// the same shape regardless of cause), then ALSO increments the
+    /// dedicated `sqe_maintenance_skipped_total{reason="insufficient_workers"}`
+    /// counter -- a signal an operator can alert on specifically ("my fleet
+    /// fell below the floor I required") without conflating it with the
+    /// unrelated "table had no eligible compaction debt" skip.
+    async fn record_skipped_insufficient_workers(
+        &self,
+        catalog: &Arc<dyn Catalog>,
+        job_id: &str,
+        ident: &TableIdent,
+        started_at_ms: i64,
+        healthy_workers: usize,
+        min_workers: usize,
+    ) {
+        let reason = format!(
+            "insufficient_workers: distribution.mode=require needs >= {min_workers} \
+             healthy workers, only {healthy_workers} are healthy"
+        );
+        self.record_skipped_job(catalog, job_id, ident, started_at_ms, &reason)
+            .await;
+        self.metrics
+            .maintenance_skipped_total
+            .with_label_values(&["insufficient_workers"])
+            .inc();
     }
 
     /// Best-effort `maintenance_log` append, shared by every active-mode
