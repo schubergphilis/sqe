@@ -597,3 +597,80 @@ async fn rewrite_skips_below_min_input_files() {
         .execute(&session, &format!("DROP TABLE IF EXISTS {table}"), None)
         .await;
 }
+
+/// `rewrite_all => true` forces a rewrite even when the table is below
+/// `min_input_files`. Proven by contrast: the same few-file table skips a
+/// default rewrite (and one with a high min_input) and consolidates with
+/// `rewrite_all`.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs docker-compose.test.yml + Polaris"]
+async fn rewrite_all_forces_below_min_input() {
+    let (session, handler) = crate::common::setup_handler().await;
+    let namespace = "default";
+    let table_name = "rewrite_all_force";
+    let table = format!("{namespace}.{table_name}");
+    let _ = handler.execute(&session, &format!("DROP TABLE IF EXISTS {table}"), None).await;
+    handler
+        .execute(&session, &format!("CREATE TABLE {table} (id BIGINT)"), None)
+        .await
+        .expect("CREATE");
+
+    // Three files, below the default min_input_files=5.
+    for i in 0..3i64 {
+        handler
+            .execute(&session, &format!("INSERT INTO {table} VALUES ({i})"), None)
+            .await
+            .expect("INSERT");
+    }
+    let before_files = live_data_file_count(&handler, &session, namespace, table_name).await;
+    assert_eq!(before_files, 3);
+
+    // Contrast: a high min_input with no rewrite_all skips.
+    let skipped = handler
+        .execute(
+            &session,
+            &format!("CALL system.rewrite_data_files(table => '{table}', min_input_files => 100)"),
+            None,
+        )
+        .await
+        .expect("rewrite");
+    assert!(
+        status_col(&skipped).contains("skipped"),
+        "without rewrite_all a below-min table must skip; got '{}'",
+        status_col(&skipped)
+    );
+    assert_eq!(
+        live_data_file_count(&handler, &session, namespace, table_name).await,
+        3,
+        "the skipped rewrite must not touch files"
+    );
+
+    // rewrite_all forces the rewrite despite min_input.
+    let ran = handler
+        .execute(
+            &session,
+            &format!(
+                "CALL system.rewrite_data_files(table => '{table}', min_input_files => 100, \
+                 rewrite_all => true)"
+            ),
+            None,
+        )
+        .await
+        .expect("rewrite_all");
+    assert!(
+        !status_col(&ran).contains("skipped"),
+        "rewrite_all must force the rewrite; got '{}'",
+        status_col(&ran)
+    );
+
+    // Consolidated and row set preserved.
+    let after_files = live_data_file_count(&handler, &session, namespace, table_name).await;
+    assert!(
+        after_files < before_files,
+        "rewrite_all must consolidate: {before_files} -> {after_files}"
+    );
+    let ids = read_i64_col(&handler, &session, &format!("SELECT id FROM {table} ORDER BY id")).await;
+    assert_eq!(ids, vec![0, 1, 2], "row set must be preserved");
+
+    let _ = handler.execute(&session, &format!("DROP TABLE IF EXISTS {table}"), None).await;
+}
