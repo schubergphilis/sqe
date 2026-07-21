@@ -140,6 +140,11 @@ traffic). Omitting `distributed` entirely uses the configured
 compaction](../design-notes/distributed-compaction.md) for how a
 distributed call plans, dispatches, and commits.
 
+`max_concurrent_file_group_rewrites` only bounds concurrency on the
+coordinator-local path; a distributed rewrite is instead bounded by
+`[maintenance.distribution] max_inflight_groups_per_worker` (per-worker,
+not global), configured in [Configuration](../deployment/configuration.md).
+
 ### Check compaction debt before deciding whether to run a rewrite
 
 `table_health` is read-only: it reuses the same file-collection and bin-pack

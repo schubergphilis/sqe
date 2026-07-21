@@ -2021,16 +2021,21 @@ pub(crate) enum ExecutionPlan {
 ///   override, and it is also why a deployment that never attaches a worker
 ///   registry (or attaches one with zero healthy workers) never even
 ///   evaluates the other two arms differently -- see `Auto`/`Require` below.
-/// - `Auto` (the default): `Distributed` once `healthy_workers >= min_workers`,
-///   otherwise `Local`. A single-node/no-fleet deployment always has
-///   `healthy_workers == 0 < min_workers` (`min_workers` defaults to `2`,
-///   and `0` is never `>= 1` even with the floor lowered), so `Auto` degrades
-///   to `Local` there -- the byte-identical-to-pre-Task-5 guarantee.
+/// - `Auto` (the default): `Distributed` once
+///   `healthy_workers >= min_workers.max(1)`, otherwise `Local`. The
+///   `.max(1)` floor means distributed execution always needs at least one
+///   healthy worker, even when an operator sets `min_workers = 0`. A
+///   single-node/no-fleet deployment always has `healthy_workers == 0`,
+///   which is never `>= 1`, so `Auto` degrades to `Local` there -- the
+///   byte-identical-to-pre-Task-5 guarantee holds regardless of how
+///   `min_workers` is configured.
 /// - `Require`: `Distributed` once the floor is met, otherwise
 ///   `SkipInsufficientWorkers` -- never `Local`. This is the whole point of
 ///   `require`: an operator who set it wants a hard signal (a loud skip or
 ///   an error) instead of a rewrite quietly running on the coordinator when
-///   the fleet it was sized for isn't there.
+///   the fleet it was sized for isn't there. The same `.max(1)` floor
+///   applies here too, so `min_workers = 0` with zero healthy workers still
+///   skips rather than "distributing" to nothing.
 pub(crate) fn resolve_execution(
     mode: sqe_core::config::DistributionMode,
     healthy_workers: usize,
@@ -2038,17 +2043,21 @@ pub(crate) fn resolve_execution(
 ) -> ExecutionPlan {
     use sqe_core::config::DistributionMode;
 
+    // Distributed execution always requires at least one healthy worker,
+    // regardless of how low an operator sets `min_workers` (including 0).
+    let floor = min_workers.max(1);
+
     match mode {
         DistributionMode::Local => ExecutionPlan::Local,
         DistributionMode::Auto => {
-            if healthy_workers >= min_workers {
+            if healthy_workers >= floor {
                 ExecutionPlan::Distributed
             } else {
                 ExecutionPlan::Local
             }
         }
         DistributionMode::Require => {
-            if healthy_workers >= min_workers {
+            if healthy_workers >= floor {
                 ExecutionPlan::Distributed
             } else {
                 ExecutionPlan::SkipInsufficientWorkers
@@ -2741,7 +2750,11 @@ mod tests {
     // ---- resolve_execution (Phase 4c Task 5) -------------------------------
     //
     // 3 modes x 3 floor conditions (above / at / below) = 9 cases, matching
-    // the task brief's "9 (mode x above/below floor) combinations".
+    // the task brief's "9 (mode x above/below floor) combinations". Plus a
+    // `min_workers = 0` edge-case group (4c whole-phase review fix): the
+    // distributed threshold is `min_workers.max(1)`, so `auto`/`require`
+    // must not resolve to `Distributed` with zero healthy workers just
+    // because the configured floor is 0.
 
     use sqe_core::config::DistributionMode;
 
@@ -2818,6 +2831,45 @@ mod tests {
         assert_eq!(
             resolve_execution(DistributionMode::Require, 0, 2),
             ExecutionPlan::SkipInsufficientWorkers
+        );
+    }
+
+    // ---- resolve_execution: min_workers = 0 edge cases (4c review fix) -----
+    //
+    // `min_workers = 0` must not let `auto`/`require` treat "zero healthy
+    // workers" as satisfying the floor. The distributed threshold is
+    // `min_workers.max(1)`, so these degrade the same way the `min_workers =
+    // 2` cases above do at 0 healthy workers.
+
+    #[test]
+    fn resolve_execution_auto_mode_min_workers_zero_falls_back_to_local_at_zero_workers() {
+        assert_eq!(
+            resolve_execution(DistributionMode::Auto, 0, 0),
+            ExecutionPlan::Local
+        );
+    }
+
+    #[test]
+    fn resolve_execution_require_mode_min_workers_zero_skips_at_zero_workers() {
+        assert_eq!(
+            resolve_execution(DistributionMode::Require, 0, 0),
+            ExecutionPlan::SkipInsufficientWorkers
+        );
+    }
+
+    #[test]
+    fn resolve_execution_auto_mode_min_workers_zero_distributes_with_one_worker() {
+        assert_eq!(
+            resolve_execution(DistributionMode::Auto, 1, 0),
+            ExecutionPlan::Distributed
+        );
+    }
+
+    #[test]
+    fn resolve_execution_require_mode_min_workers_zero_distributes_with_one_worker() {
+        assert_eq!(
+            resolve_execution(DistributionMode::Require, 1, 0),
+            ExecutionPlan::Distributed
         );
     }
 

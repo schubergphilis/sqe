@@ -20,8 +20,8 @@
 //!   scheduler's path, not this one; see `maintenance.rs`'s comment on
 //!   `handle()`'s `RewriteDataFiles` arm)
 //!
-//! Two independent fixtures are covered, matching the two MoR delete
-//! taxonomies already proven for the *local* path in
+//! Three independent fixtures are covered. The first two match the two MoR
+//! delete taxonomies already proven for the *local* path in
 //! `rewrite_data_files_deletes.rs` (kept as two separate DDL shapes rather
 //! than one combined table, since a table with both `write.delete.mode` and
 //! `write.update.mode` set to merge-on-read carrying both delete kinds at
@@ -35,6 +35,23 @@
 //! - [`equality_delete_parity`]: `UPDATE` on a table with
 //!   `identifier_field_ids` (equality delete + a fresh data file), mirroring
 //!   `rewrite_data_files_deletes.rs`'s `rewrite_applies_equality_deletes`.
+//!
+//! The third fixture targets a residual risk the two above never exercise:
+//! every table above is unpartitioned, so every `DataFile` round-tripped
+//! through `compact_file_group`'s wire format (worker encode -> Arrow Flight
+//! -> coordinator decode with `partition_type`/`partition_spec_id`, see
+//! `sqe_compaction::wire`) carries an *empty* partition struct. A real
+//! deployment compacts partitioned tables far more often than not, and an
+//! empty-partition round trip cannot catch a bug in how the non-empty case
+//! is encoded, addressed, or committed.
+//!
+//! - [`partitioned_with_deletes_parity`]: `PARTITIONED BY (region)` (identity
+//!   transform) with position deletes, asserting everything
+//!   [`position_delete_parity`] asserts PLUS that every surviving row's data
+//!   file still carries the correct partition value after the distributed
+//!   rewrite -- i.e. the partition struct survived the avro round trip
+//!   intact and files were not attributed to the wrong partition or merged
+//!   across partition boundaries.
 //!
 //! Each fixture forces multiple bin-pack groups (not just multiple files) by
 //! measuring the actual per-file byte size after seeding and setting
@@ -356,6 +373,128 @@ async fn seed_equality_delete_fixture(
     .await;
 }
 
+/// The `region` an id's row belongs to under [`seed_partitioned_position_delete_fixture`]'s
+/// alternating identity-partition assignment.
+fn region_of(id: i64) -> &'static str {
+    if id % 2 == 0 {
+        "eu"
+    } else {
+        "us"
+    }
+}
+
+/// Seed a PARTITIONED position-delete MoR fixture: `rows` single-row data
+/// files (`id`, `region` alternating `'eu'`/`'us'` per [`region_of`], `v =
+/// id * 10`) under an identity partition spec on `region`, then `DELETE FROM
+/// ... WHERE id < delete_below` (position deletes). Unlike
+/// [`seed_position_delete_fixture`], every data file here carries a
+/// non-empty partition struct, exercising the avro round trip
+/// [`partitioned_with_deletes_parity`] targets.
+async fn seed_partitioned_position_delete_fixture(
+    handler: &sqe_coordinator::QueryHandler,
+    session: &sqe_core::Session,
+    table: &str,
+    rows: i64,
+    delete_below: i64,
+) {
+    let _ = exec(handler, session, &format!("DROP TABLE IF EXISTS {table}")).await;
+    exec(
+        handler,
+        session,
+        &format!(
+            "CREATE TABLE {table} (id BIGINT, region STRING, v BIGINT) \
+             PARTITIONED BY (region) \
+             TBLPROPERTIES ('write.delete.mode' = 'merge-on-read')"
+        ),
+    )
+    .await;
+    for i in 0..rows {
+        let region = region_of(i);
+        exec(
+            handler,
+            session,
+            &format!("INSERT INTO {table} VALUES ({i}, '{region}', {})", i * 10),
+        )
+        .await;
+    }
+    exec(handler, session, &format!("DELETE FROM {table} WHERE id < {delete_below}")).await;
+}
+
+/// Full surviving row set as `(id, region, v)` triples, ordered by `id`.
+/// Partitioned-fixture counterpart of [`collect_id_v_rows`].
+async fn collect_id_region_v_rows(
+    handler: &sqe_coordinator::QueryHandler,
+    session: &sqe_core::Session,
+    table: &str,
+) -> Vec<(i64, String, i64)> {
+    let b = exec(handler, session, &format!("SELECT id, region, v FROM {table} ORDER BY id")).await;
+    let mut out = Vec::new();
+    for batch in &b {
+        let ids = batch.column(0).as_any().downcast_ref::<Int64Array>().expect("id Int64Array");
+        let regions =
+            batch.column(1).as_any().downcast_ref::<StringArray>().expect("region StringArray");
+        let vs = batch.column(2).as_any().downcast_ref::<Int64Array>().expect("v Int64Array");
+        for i in 0..batch.num_rows() {
+            out.push((ids.value(i), regions.value(i).to_string(), vs.value(i)));
+        }
+    }
+    out
+}
+
+/// Row count for a table filtered to a single partition value, via a plain
+/// predicate on the partition column (`region`). Used to prove the
+/// *read path* still resolves partitioned data correctly post-rewrite, as a
+/// cross-check against the raw manifest-level partition assertion in
+/// [`partition_record_counts`].
+async fn count_rows_in_region(
+    handler: &sqe_coordinator::QueryHandler,
+    session: &sqe_core::Session,
+    table: &str,
+    region: &str,
+) -> i64 {
+    count_rows(handler, session, &format!("(SELECT * FROM {table} WHERE region = '{region}')"))
+        .await
+}
+
+/// `(partition, record_count)` for every live data file in the current
+/// snapshot, straight from the `table_files()` metadata TVF. This is the
+/// manifest-level ground truth for which partition each surviving data file
+/// was committed under -- the exact information a broken
+/// `partition_type`/`partition_spec_id` decode on the coordinator side (see
+/// this file's module doc) would corrupt or misattribute.
+async fn partition_record_counts(
+    handler: &sqe_coordinator::QueryHandler,
+    session: &sqe_core::Session,
+    namespace: &str,
+    table_name: &str,
+) -> Vec<(String, i64)> {
+    let b = exec(
+        handler,
+        session,
+        &format!("SELECT partition, record_count FROM table_files('{namespace}', '{table_name}')"),
+    )
+    .await;
+    let mut out = Vec::new();
+    for batch in &b {
+        let partitions = batch
+            .column_by_name("partition")
+            .expect("partition column")
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("partition StringArray");
+        let counts = batch
+            .column_by_name("record_count")
+            .expect("record_count column")
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("record_count Int64Array");
+        for i in 0..batch.num_rows() {
+            out.push((partitions.value(i).to_string(), counts.value(i)));
+        }
+    }
+    out
+}
+
 /// Position-delete parity: distributed rewrite of an N-group table on >= 2
 /// workers matches a coordinator-local rewrite of the same fixture.
 #[tokio::test(flavor = "multi_thread")]
@@ -505,6 +644,155 @@ async fn equality_delete_parity() {
 
     assert_one_new_replace_snapshot(&handler, &session, namespace, dist_name, &dist_snapshots_before)
         .await;
+
+    let _ = exec(&handler, &session, &format!("DROP TABLE IF EXISTS {dist_table}")).await;
+    let _ = exec(&handler, &session, &format!("DROP TABLE IF EXISTS {local_table}")).await;
+}
+
+/// Partitioned position-delete parity: same correctness properties as
+/// [`position_delete_parity`], on an identity-partitioned (`region`) table,
+/// PLUS proof that surviving rows still land in the correct partition after
+/// the distributed rewrite.
+///
+/// This is the fixture that exercises the non-empty-partition `DataFile`
+/// avro round trip described in this file's module doc: unlike every other
+/// fixture here, `pack_file_groups_partition_aware` (see
+/// `sqe_compaction::rewrite`) must group these files per-partition, the
+/// worker must encode each group's partition struct onto the wire, and the
+/// coordinator must decode it with the right `partition_type`/
+/// `partition_spec_id` before committing -- exactly the path the two
+/// unpartitioned fixtures above never touch.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs docker-compose.test.yml + Polaris + 2 live sqe-worker processes"]
+async fn partitioned_with_deletes_parity() {
+    let (session, handler) = crate::common::setup_handler_with_workers(&worker_urls()).await;
+    let namespace = "default";
+    let dist_name = "rewrite_dist_parity_part_distributed";
+    let local_name = "rewrite_dist_parity_part_local";
+    let dist_table = format!("{namespace}.{dist_name}");
+    let local_table = format!("{namespace}.{local_name}");
+
+    const ROWS: i64 = 16;
+    const DELETE_BELOW: i64 = 3;
+
+    seed_partitioned_position_delete_fixture(&handler, &session, &dist_table, ROWS, DELETE_BELOW)
+        .await;
+    seed_partitioned_position_delete_fixture(&handler, &session, &local_table, ROWS, DELETE_BELOW)
+        .await;
+
+    // Fixtures must start byte-identical (same recipe, independently seeded).
+    let pre_dist = collect_id_region_v_rows(&handler, &session, &dist_table).await;
+    let pre_local = collect_id_region_v_rows(&handler, &session, &local_table).await;
+    assert_eq!(pre_dist, pre_local, "both fixtures must start with identical content");
+
+    let expected: Vec<(i64, String, i64)> = (DELETE_BELOW..ROWS)
+        .map(|id| (id, region_of(id).to_string(), id * 10))
+        .collect();
+    assert_eq!(pre_dist, expected, "setup invariant: deletes must already be visible pre-rewrite");
+
+    let expected_eu = expected.iter().filter(|(_, r, _)| r == "eu").count() as i64;
+    let expected_us = expected.iter().filter(|(_, r, _)| r == "us").count() as i64;
+    assert!(expected_eu > 0 && expected_us > 0, "fixture must leave rows in both partitions");
+
+    let before_files_dist = live_data_file_count(&handler, &session, namespace, dist_name).await;
+    let before_files_local = live_data_file_count(&handler, &session, namespace, local_name).await;
+    assert!(
+        before_files_dist >= 8,
+        "setup invariant: need enough small files to form multiple bin-pack groups, got {before_files_dist}"
+    );
+    assert_eq!(before_files_dist, before_files_local);
+
+    let before_partitions_dist =
+        partition_record_counts(&handler, &session, namespace, dist_name).await;
+    let before_distinct_partitions: HashSet<String> =
+        before_partitions_dist.iter().map(|(p, _)| p.clone()).collect();
+    assert_eq!(
+        before_distinct_partitions.len(),
+        2,
+        "setup invariant: fixture must span exactly 2 partitions (eu, us), got {before_distinct_partitions:?}"
+    );
+
+    // Force multiple groups: target ~2.5x the largest single-row file, so
+    // pack_file_groups_partition_aware fits about 2 files per group per
+    // partition instead of everything into one.
+    let max_size = max_file_size_bytes(&handler, &session, namespace, dist_name).await;
+    let target_bytes = (max_size * 5) / 2;
+
+    let dist_snapshots_before = snapshot_ids(&handler, &session, namespace, dist_name).await;
+
+    run_rewrite(&handler, &session, &dist_table, target_bytes, "require").await;
+    run_rewrite(&handler, &session, &local_table, target_bytes, "local").await;
+
+    // Correctness parity: the two paths must be indistinguishable.
+    let post_dist = collect_id_region_v_rows(&handler, &session, &dist_table).await;
+    let post_local = collect_id_region_v_rows(&handler, &session, &local_table).await;
+    assert_eq!(
+        post_dist, post_local,
+        "distributed rewrite must produce the same surviving rows as a coordinator-local \
+         rewrite of the same fixture"
+    );
+    assert_eq!(
+        post_dist, expected,
+        "deleted rows must stay deleted (not resurrected) and no other row must be lost"
+    );
+    assert_eq!(count_rows(&handler, &session, &dist_table).await, expected.len() as i64);
+
+    // Consolidation on both paths.
+    let after_files_dist = live_data_file_count(&handler, &session, namespace, dist_name).await;
+    let after_files_local = live_data_file_count(&handler, &session, namespace, local_name).await;
+    assert!(
+        after_files_dist < before_files_dist,
+        "distributed rewrite must consolidate: {before_files_dist} -> {after_files_dist}"
+    );
+    assert!(
+        after_files_local < before_files_local,
+        "local rewrite must consolidate: {before_files_local} -> {after_files_local}"
+    );
+
+    // Exactly one new snapshot, stamped.
+    assert_one_new_replace_snapshot(&handler, &session, namespace, dist_name, &dist_snapshots_before)
+        .await;
+
+    // Partition correctness: rows must land in the correct partition after
+    // the distributed rewrite, at both the read-path and manifest level.
+    let post_eu = count_rows_in_region(&handler, &session, &dist_table, "eu").await;
+    let post_us = count_rows_in_region(&handler, &session, &dist_table, "us").await;
+    assert_eq!(post_eu, expected_eu, "predicate-pruned read on region='eu' must match expected count");
+    assert_eq!(post_us, expected_us, "predicate-pruned read on region='us' must match expected count");
+
+    let after_partitions_dist =
+        partition_record_counts(&handler, &session, namespace, dist_name).await;
+    let after_distinct_partitions: HashSet<String> =
+        after_partitions_dist.iter().map(|(p, _)| p.clone()).collect();
+    assert_eq!(
+        after_distinct_partitions.len(),
+        2,
+        "distributed rewrite must preserve exactly 2 partitions (not collapse or misattribute), \
+         got {after_distinct_partitions:?}"
+    );
+
+    // Every live file's manifest-level record count must sum, per distinct
+    // partition value, to exactly the two expected per-region counts -- this
+    // is the assertion that would catch a broken partition_type/
+    // partition_spec_id decode on the coordinator side: a bug there would
+    // either merge the two partitions into one, split one partition's files
+    // under the wrong key, or silently drop the partition struct (which
+    // `table_files()` would then report as an unexpected third "empty"
+    // partition value).
+    let mut sums_by_partition: std::collections::BTreeMap<String, i64> =
+        std::collections::BTreeMap::new();
+    for (partition, record_count) in &after_partitions_dist {
+        *sums_by_partition.entry(partition.clone()).or_insert(0) += record_count;
+    }
+    let mut actual_sums: Vec<i64> = sums_by_partition.values().copied().collect();
+    actual_sums.sort_unstable();
+    let mut expected_sums = vec![expected_eu, expected_us];
+    expected_sums.sort_unstable();
+    assert_eq!(
+        actual_sums, expected_sums,
+        "post-rewrite per-partition record-count sums must equal the two expected per-region \
+         counts (order-independent): partitions={sums_by_partition:?}"
+    );
 
     let _ = exec(&handler, &session, &format!("DROP TABLE IF EXISTS {dist_table}")).await;
     let _ = exec(&handler, &session, &format!("DROP TABLE IF EXISTS {local_table}")).await;

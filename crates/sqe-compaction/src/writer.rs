@@ -29,6 +29,7 @@ use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
 use iceberg::writer::file_writer::ParquetWriterBuilder;
 use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
 use parquet::basic::{Compression, ZstdLevel};
+use sqe_core::SqeError;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
@@ -268,8 +269,6 @@ pub async fn write_data_files_streaming(
     fanout: FanoutLimits,
     target_file_size: Option<u64>,
 ) -> sqe_core::Result<(Vec<DataFile>, usize)> {
-    use sqe_core::SqeError;
-
     let inner_loc = DefaultLocationGenerator::new(table.metadata().clone())
         .map_err(|e| SqeError::Execution(format!("Location generator error: {e}")))?;
     let location_generator = TrackingLocationGenerator::new(inner_loc, tracker);
@@ -480,8 +479,6 @@ pub fn new_upload_tracker() -> UploadedPaths {
 /// batches to be present -- it marks all columns as nullable (the safe
 /// default for Iceberg) and takes types from the Iceberg schema directly.
 fn build_stamped_schema(iceberg_schema: &IcebergSchema) -> sqe_core::Result<Arc<ArrowSchema>> {
-    use sqe_core::SqeError;
-
     let expected_arrow_schema =
         schema_to_arrow_schema(iceberg_schema).map_err(|e| {
             SqeError::Execution(format!("Failed to derive expected Arrow schema: {e}"))
@@ -499,7 +496,7 @@ fn build_stamped_schema(iceberg_schema: &IcebergSchema) -> sqe_core::Result<Arc<
                 .unwrap_or((i + 1) as i32);
             let mut meta = arrow_field.metadata().clone();
             meta.insert("PARQUET:field_id".to_string(), field_id.to_string());
-            // Mark all columns nullable — safe default; avoids cross-batch null scan.
+            // Mark all columns nullable. Safe default; avoids cross-batch null scan.
             Arc::new(
                 arrow_schema::Field::new(arrow_field.name(), arrow_field.data_type().clone(), true)
                     .with_metadata(meta),
@@ -518,8 +515,6 @@ fn apply_stamped_schema(
     batch: RecordBatch,
     stamped_schema: &Arc<ArrowSchema>,
 ) -> sqe_core::Result<RecordBatch> {
-    use sqe_core::SqeError;
-
     let new_columns: Result<Vec<_>, _> = batch
         .columns()
         .iter()
@@ -676,8 +671,6 @@ impl<B: IcebergWriterBuilder> BoundedFanoutWriter<B> {
     /// writer, cutting over least-recently-written writers as needed to honour
     /// `max_open` and `byte_budget`.
     pub async fn write(&mut self, batch: RecordBatch) -> sqe_core::Result<()> {
-        use sqe_core::SqeError;
-
         if batch.num_rows() == 0 {
             return Ok(());
         }
@@ -737,8 +730,6 @@ impl<B: IcebergWriterBuilder> BoundedFanoutWriter<B> {
     /// Close every open writer and return all `DataFile`s (from cutovers and
     /// the final flush).
     pub async fn close(mut self) -> sqe_core::Result<Vec<DataFile>> {
-        use sqe_core::SqeError;
-
         let keys: Vec<Struct> = self.open.keys().cloned().collect();
         for key in keys {
             if let Some(mut writer) = self.open.remove(&key) {
@@ -757,8 +748,6 @@ impl<B: IcebergWriterBuilder> BoundedFanoutWriter<B> {
         &mut self,
         partition_key: &PartitionKey,
     ) -> sqe_core::Result<&mut B::R> {
-        use sqe_core::SqeError;
-
         let key = partition_key.data().clone();
         if !self.open.contains_key(&key) {
             let writer = self
@@ -779,8 +768,6 @@ impl<B: IcebergWriterBuilder> BoundedFanoutWriter<B> {
     /// collecting its `DataFile`s. Returns `false` when there is nothing left to
     /// evict (empty, or only `protect` remains).
     async fn cut_over_lrw(&mut self, protect: Option<&Struct>) -> sqe_core::Result<bool> {
-        use sqe_core::SqeError;
-
         let victim = self
             .open
             .keys()
