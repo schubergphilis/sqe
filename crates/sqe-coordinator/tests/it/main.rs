@@ -40,6 +40,7 @@ mod quack_e2e;
 mod rewrite_data_files_deletes;
 mod rewrite_data_files_real;
 mod sql_compat_test;
+mod table_health_test;
 mod trino_describe_test;
 mod trino_metadata_test;
 mod trino_session_catalog_test;

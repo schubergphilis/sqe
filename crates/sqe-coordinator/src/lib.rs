@@ -36,6 +36,7 @@ pub mod scan_pushdown;
 pub mod scheduler;
 pub mod streaming;
 pub mod suggest_bloom;
+pub mod table_health;
 pub mod session_manager;
 pub mod web_auth;
 pub mod web_ui;
