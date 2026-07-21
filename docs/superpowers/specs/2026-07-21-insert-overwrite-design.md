@@ -156,11 +156,15 @@ not written-and-declared. Any environmental blocker is surfaced, not hidden.
 
 ## Trino parity
 
-Standard Trino may not accept `INSERT OVERWRITE` as syntax at all (it uses a
-session property `insert-existing-partitions-behavior`). Before asserting any
-parity, confirm what Trino does with the literal statement. If Trino rejects
-the syntax, the parity acceptance criterion is dropped explicitly rather than
-faked. Parity is not a blocker for this MR.
+Verified (2026-07-21): standard Trino does NOT accept `INSERT OVERWRITE` as SQL
+syntax. Adding it is an open Trino feature request (trinodb/trino#11602), and
+native Iceberg overwrite is still in development (trinodb/trino#26178). Trino
+instead controls overwrite through the `insert_existing_partitions_behavior`
+session property on a plain `INSERT`. The literal statement is therefore not
+shared between the two engines, so the parity acceptance criterion is DROPPED:
+there is no equivalent Trino statement to compare against. SQE's explicit
+`INSERT OVERWRITE` (Spark/Hive-style) is beyond Trino's current SQL surface,
+not behind it. Parity is not a blocker for this MR.
 
 ## Out of scope (follow-ups)
 
