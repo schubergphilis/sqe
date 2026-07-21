@@ -532,6 +532,7 @@ async fn scan_id_values(catalog: &Arc<dyn Catalog>, ident: &TableIdent) -> Vec<i
 }
 
 /// One row of `sqe_system.maintenance_log`, decoded for assertions.
+#[derive(Debug)]
 struct LogRowView {
     table_name: String,
     status: String,
@@ -543,7 +544,15 @@ struct LogRowView {
     snapshot_id: Option<i64>,
 }
 
-/// Scan `sqe_system.maintenance_log` and decode every row.
+/// Scan `sqe_system.maintenance_log` and decode every JOB row (advisory
+/// report, active success/failed/skipped). Excludes lease bookkeeping rows
+/// (`trigger = "lease"`, `status` `"claimed"`/`"released"` -- see
+/// `crate::maintenance_lease`'s module docs): those share this table but are
+/// not job rows, and every existing caller of this helper predates the
+/// Phase 4d lease and asserts about job rows specifically (e.g. "exactly one
+/// row for this table"), so folding lease bookkeeping into the same count
+/// would be testing the wrong thing, not a stricter version of the same
+/// thing.
 async fn scan_log_rows(catalog: &Arc<dyn Catalog>) -> Vec<LogRowView> {
     use arrow_array::{Array, StringArray};
 
@@ -571,6 +580,12 @@ async fn scan_log_rows(catalog: &Arc<dyn Catalog>) -> Vec<LogRowView> {
             .as_any()
             .downcast_ref::<StringArray>()
             .expect("table_name is Utf8");
+        let trigger_col = batch
+            .column_by_name("trigger")
+            .expect("trigger col")
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("trigger is Utf8");
         let status_col = batch
             .column_by_name("status")
             .expect("status col")
@@ -615,6 +630,11 @@ async fn scan_log_rows(catalog: &Arc<dyn Catalog>) -> Vec<LogRowView> {
             .expect("snapshot_id is Int64");
 
         for i in 0..batch.num_rows() {
+            if trigger_col.value(i) == "lease" {
+                // Lease bookkeeping row (Phase 4d), not a job row: see this
+                // function's doc comment.
+                continue;
+            }
             rows.push(LogRowView {
                 table_name: table_name_col.value(i).to_string(),
                 status: status_col.value(i).to_string(),
@@ -1323,5 +1343,234 @@ async fn advisory_tick_on_active_fixture_still_mutates_nothing() {
     assert!(
         job_family.is_none() || job_family.unwrap().get_metric().is_empty(),
         "advisory mode must never increment sqe_maintenance_job_total"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4d Task 3: catalog HA lease wired into the active scheduler.
+// ---------------------------------------------------------------------------
+
+/// Count `sqe_system.maintenance_log` rows that are lease bookkeeping
+/// (`trigger = "lease"`), regardless of table. Used to assert `lease =
+/// "none"` produces zero lease traffic (Phase 4c-identical behavior), and
+/// (for the contention test) that the lease rows a `catalog`-mode tick
+/// writes exist at all.
+async fn count_lease_rows(catalog: &Arc<dyn Catalog>) -> usize {
+    use arrow_array::{Array, StringArray};
+
+    let log_ident = TableIdent::new(NamespaceIdent::new("sqe_system".to_string()), "maintenance_log".to_string());
+    let log_table = catalog.load_table(&log_ident).await.expect("reload log table");
+    let batches: Vec<RecordBatch> = log_table
+        .scan()
+        .build()
+        .expect("build log scan")
+        .to_arrow()
+        .await
+        .expect("scan log to arrow")
+        .try_collect()
+        .await
+        .expect("collect log batches");
+
+    let mut count = 0;
+    for batch in &batches {
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        let trigger_col = batch
+            .column_by_name("trigger")
+            .expect("trigger col")
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("trigger is Utf8");
+        for i in 0..batch.num_rows() {
+            if trigger_col.value(i) == "lease" {
+                count += 1;
+            }
+        }
+    }
+    count
+}
+
+/// Build a `MaintenanceSchedulerConfig`-carrying `active`-mode config with an
+/// explicit `lease` mode, otherwise identical to [`active_maintenance_config`].
+fn active_maintenance_config_with_lease(
+    idp: &MockServer,
+    min_input_files: usize,
+    lease: sqe_core::config::LeaseMode,
+    lease_ttl_secs: u64,
+) -> MaintenanceConfig {
+    let mut cfg = active_maintenance_config(idp, min_input_files);
+    cfg.scheduler.lease = lease;
+    cfg.scheduler.lease_ttl_secs = lease_ttl_secs;
+    cfg.scheduler.single_scheduler_acknowledged = true;
+    cfg
+}
+
+/// `lease = "none"` must be byte-identical to pre-4d (Phase 4c) behavior:
+/// the table still compacts, but NOT ONE row of lease bookkeeping is ever
+/// written to `sqe_system.maintenance_log` -- no `try_acquire`/`release`
+/// catalog traffic at all.
+#[tokio::test]
+async fn active_tick_lease_none_compacts_with_zero_lease_traffic() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let catalog = sqlite_catalog(&dir).await;
+
+    let opted_ident = create_table(&catalog, "ns", "lease_none_opted", true).await;
+    seed_small_files(&catalog, &opted_ident, 5).await;
+    let files_before = live_data_file_count(&catalog, &opted_ident).await;
+    assert_eq!(files_before, 5);
+
+    create_maintenance_log_table(&catalog).await;
+
+    let idp = mock_idp().await;
+    let cfg = active_maintenance_config_with_lease(&idp, 2, sqe_core::config::LeaseMode::None, 60);
+    let principal = Arc::new(
+        MaintenancePrincipal::from_config(cfg.principal.as_ref().expect("principal set"))
+            .expect("build principal"),
+    );
+    let metrics = Arc::new(MetricsRegistry::new().expect("metrics registry builds"));
+
+    let injected_catalog = catalog.clone();
+    let catalog_factory: sqe_coordinator::maintenance_scheduler::CatalogFactory =
+        Arc::new(move |_session: &sqe_core::Session| {
+            let catalog = injected_catalog.clone();
+            Box::pin(async move { Ok(catalog) })
+        });
+    let handler = Arc::new(sqe_coordinator::maintenance::MaintenanceHandler::new(minimal_sqe_config()));
+
+    let scheduler = MaintenanceScheduler::new(cfg, principal, metrics.clone(), None, catalog_factory, handler);
+    scheduler.advisory_tick().await.expect("active tick succeeds");
+
+    let files_after = live_data_file_count(&catalog, &opted_ident).await;
+    assert!(files_after < files_before, "lease=none must still compact exactly like Phase 4c");
+
+    let rows = scan_log_rows(&catalog).await;
+    let opted_rows: Vec<&LogRowView> = rows.iter().filter(|r| r.table_name == "ns.lease_none_opted").collect();
+    assert_eq!(opted_rows.len(), 1);
+    assert_eq!(opted_rows[0].status, "success");
+
+    assert_eq!(
+        count_lease_rows(&catalog).await,
+        0,
+        "lease = \"none\" must never write a single lease bookkeeping row"
+    );
+    assert_eq!(
+        metrics.maintenance_lease_skipped_total.get(),
+        0,
+        "lease = \"none\" must never increment the lease-skip counter either"
+    );
+}
+
+/// The Step 1 TDD test: with `lease = "catalog"`, a table already claimed by
+/// another coordinator (simulated here by directly holding the lease as
+/// holder `"coordinator-a"`, representing a coordinator mid-compaction) is
+/// NOT double-compacted by a second coordinator (`scheduler_b`, a real
+/// `MaintenanceScheduler` with a DIFFERENT holder_id) ticking in the same
+/// window: `scheduler_b` observes the held lease and skips, writing no job
+/// row. After `coordinator-a` releases, a LATER tick from `scheduler_b`
+/// acquires the lease itself and actually compacts.
+#[tokio::test]
+async fn active_tick_catalog_lease_prevents_concurrent_compaction_then_recovers_after_release() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let catalog = sqlite_catalog(&dir).await;
+
+    let opted_ident = create_table(&catalog, "ns", "lease_contended", true).await;
+    seed_small_files(&catalog, &opted_ident, 5).await;
+    let files_before = live_data_file_count(&catalog, &opted_ident).await;
+    assert_eq!(files_before, 5);
+
+    create_maintenance_log_table(&catalog).await;
+
+    let job_key = opted_ident.to_string();
+    let state_table = "sqe_system.maintenance_log";
+    let ttl_secs = 60;
+
+    // `coordinator-a` claims the lease first -- as if it is already mid-tick
+    // (or mid-compaction) for this exact table when `coordinator-b`'s
+    // window starts. This is the "one window, two coordinators" scenario
+    // the brief describes, using the real `maintenance_lease` primitive
+    // (Task 2) directly for the "other" coordinator's side, and a real
+    // `MaintenanceScheduler` for `coordinator-b`'s side.
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let handle_a = sqe_coordinator::maintenance_lease::try_acquire(
+        &catalog,
+        state_table,
+        &job_key,
+        "coordinator-a",
+        ttl_secs,
+        now_ms,
+    )
+    .await
+    .expect("coordinator-a acquires the lease")
+    .expect("no one else holds it yet, so this must be Some");
+
+    let idp = mock_idp().await;
+    let cfg = active_maintenance_config_with_lease(&idp, 2, sqe_core::config::LeaseMode::Catalog, ttl_secs);
+    let principal = Arc::new(
+        MaintenancePrincipal::from_config(cfg.principal.as_ref().expect("principal set"))
+            .expect("build principal"),
+    );
+    let metrics = Arc::new(MetricsRegistry::new().expect("metrics registry builds"));
+
+    let injected_catalog = catalog.clone();
+    let catalog_factory: sqe_coordinator::maintenance_scheduler::CatalogFactory =
+        Arc::new(move |_session: &sqe_core::Session| {
+            let catalog = injected_catalog.clone();
+            Box::pin(async move { Ok(catalog) })
+        });
+    let handler = Arc::new(sqe_coordinator::maintenance::MaintenanceHandler::new(minimal_sqe_config()));
+
+    let scheduler_b = MaintenanceScheduler::new(cfg, principal, metrics.clone(), None, catalog_factory, handler)
+        .with_holder_id("coordinator-b");
+
+    // --- Window 1: coordinator-a still holds the lease; coordinator-b skips ---
+    scheduler_b.advisory_tick().await.expect("scheduler_b tick 1 succeeds (a routine skip, not an error)");
+
+    let files_after_tick1 = live_data_file_count(&catalog, &opted_ident).await;
+    assert_eq!(
+        files_after_tick1, files_before,
+        "coordinator-b must NOT have compacted while coordinator-a holds the lease"
+    );
+    let rows_after_tick1 = scan_log_rows(&catalog).await;
+    assert!(
+        rows_after_tick1.iter().all(|r| r.table_name != "ns.lease_contended"),
+        "a lease-skip must not write a maintenance_log job row: {rows_after_tick1:?}",
+    );
+    assert_eq!(
+        metrics.maintenance_lease_skipped_total.get(),
+        1,
+        "coordinator-b's lease-skip must increment the dedicated counter"
+    );
+
+    // --- coordinator-a finishes and releases ---
+    let release_now_ms = chrono::Utc::now().timestamp_millis();
+    sqe_coordinator::maintenance_lease::release(handle_a, &catalog, state_table, release_now_ms)
+        .await
+        .expect("coordinator-a releases cleanly");
+
+    // --- Window 2 (a later tick): coordinator-b now acquires and compacts ---
+    scheduler_b.advisory_tick().await.expect("scheduler_b tick 2 succeeds");
+
+    let files_after_tick2 = live_data_file_count(&catalog, &opted_ident).await;
+    assert!(
+        files_after_tick2 < files_before,
+        "after coordinator-a released, coordinator-b must acquire the lease and actually compact"
+    );
+    let rows_after_tick2 = scan_log_rows(&catalog).await;
+    let opted_rows: Vec<&LogRowView> =
+        rows_after_tick2.iter().filter(|r| r.table_name == "ns.lease_contended").collect();
+    assert_eq!(opted_rows.len(), 1, "exactly one job row: coordinator-b's successful compaction");
+    assert_eq!(opted_rows[0].status, "success");
+
+    // `crate::maintenance_lease`'s CAS design keeps exactly one LIVE lease
+    // row per job_key at a time (every claim/release deletes the prior live
+    // row and replaces it -- see that module's docs), so a table scan here
+    // sees only the latest state, not the whole history. It is non-zero
+    // (unlike the `lease = "none"` test above), confirming `catalog` mode
+    // really did write lease bookkeeping.
+    assert_eq!(
+        count_lease_rows(&catalog).await,
+        1,
+        "expected exactly one LIVE lease row (coordinator-b's final release tombstone)"
     );
 }

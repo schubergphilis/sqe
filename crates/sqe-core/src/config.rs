@@ -3751,6 +3751,24 @@ impl SqeConfig {
             );
         }
 
+        // Phase 4d Task 3: `lease = "kubernetes"` (a K8s Lease object backend)
+        // is out of scope for this phase -- only the catalog-native lease
+        // (Task 2) is wired into the scheduler. Reject it loudly at startup
+        // rather than silently falling back to some other behavior; an
+        // operator who wants HA today should use `lease = "catalog"`
+        // (the default).
+        if self.maintenance.scheduler.enabled
+            && self.maintenance.scheduler.lease == LeaseMode::Kubernetes
+        {
+            errors.push(
+                "maintenance.scheduler.lease = \"kubernetes\" is not implemented yet (Phase 4d \
+                 only wires the catalog-native lease); set lease = \"catalog\" (default, works \
+                 for multi-coordinator HA today) or lease = \"none\" with \
+                 single_scheduler_acknowledged = true (single-coordinator deployments only)."
+                    .to_string(),
+            );
+        }
+
         // Best-effort warning (not a hard error): a maintenance principal
         // sharing a client_id with an interactive auth provider makes audit
         // trails ambiguous about which identity acted. The maintenance
@@ -4809,6 +4827,30 @@ group_heartbeat_timeout_secs = 60
         assert!(err.contains("single_scheduler_acknowledged"), "got: {err}");
 
         config.maintenance.scheduler.single_scheduler_acknowledged = true;
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn maintenance_scheduler_enabled_with_kubernetes_lease_is_rejected() {
+        // Phase 4d Task 3: `lease = "kubernetes"` is out of scope (only the
+        // catalog-native lease is wired into the scheduler); an enabled
+        // scheduler must not silently start with a backend that does not
+        // exist.
+        let mut config = valid_config();
+        config.maintenance.scheduler.enabled = true;
+        config.maintenance.scheduler.lease = LeaseMode::Kubernetes;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("kubernetes") && err.contains("not implemented"), "got: {err}");
+
+        // Disabled scheduler: the lease backend never matters (no tick loop
+        // ever runs), so `kubernetes` is not rejected in that case.
+        config.maintenance.scheduler.enabled = false;
+        assert!(config.validate().is_ok());
+
+        // The default lease (Catalog) and an explicit opt-in None must both
+        // still validate fine with the scheduler enabled.
+        config.maintenance.scheduler.enabled = true;
+        config.maintenance.scheduler.lease = LeaseMode::Catalog;
         assert!(config.validate().is_ok());
     }
 

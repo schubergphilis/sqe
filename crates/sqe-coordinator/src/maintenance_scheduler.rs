@@ -68,11 +68,12 @@ use std::sync::Arc;
 
 use croner::Cron;
 use iceberg::{Catalog, TableIdent};
-use sqe_core::config::{MaintenanceCompactionConfig, MaintenanceConfig, MaintenanceMode};
+use sqe_core::config::{LeaseMode, MaintenanceCompactionConfig, MaintenanceConfig, MaintenanceMode};
 use sqe_core::{Session, SqeError};
 use sqe_sql::TableRef;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
+use crate::maintenance_lease::{self, LeaseHandle};
 use crate::maintenance_log;
 use crate::maintenance_principal::MaintenancePrincipal;
 /// Table property that opts a table into this scheduler. Reuses
@@ -114,6 +115,28 @@ pub fn default_catalog_factory(
     })
 }
 
+/// Build a stable `holder_id` for this coordinator process's catalog HA
+/// lease (Phase 4d Task 3): `"<hostname>-<pid>"` when the environment
+/// exposes a hostname (checked via the `HOSTNAME` then `POD_NAME` env vars,
+/// the same precedence `sqe-worker::advertise` uses for pod identity), a
+/// fresh `crate::maintenance_lease::generate_holder_id` (v4 UUID) otherwise.
+/// `std::process::id()` never fails, so the UUID fallback only triggers on
+/// the "no hostname available" half of the pair, not the pid half.
+///
+/// Called exactly once, at [`MaintenanceScheduler::new`] -- see that
+/// struct's doc comment for why this must stay stable for the whole process
+/// lifetime rather than being recomputed per tick.
+pub fn stable_holder_id() -> String {
+    let hostname = std::env::var("HOSTNAME")
+        .ok()
+        .filter(|h| !h.trim().is_empty())
+        .or_else(|| std::env::var("POD_NAME").ok().filter(|h| !h.trim().is_empty()));
+    match hostname {
+        Some(h) => format!("{}-{}", h.trim(), std::process::id()),
+        None => crate::maintenance_lease::generate_holder_id(),
+    }
+}
+
 /// The advisory and active auto-compaction scheduler.
 ///
 /// Holds everything one tick needs: the config gate/knobs, the dedicated
@@ -133,6 +156,15 @@ pub fn default_catalog_factory(
 /// engine's, so the caller wires it in only when Active mode is configured
 /// (see `sqe_server.rs`). In `Advisory` mode `handler` is built without a
 /// runtime: the advisory arm never calls `handler.rewrite_data_files`.
+///
+/// `holder_id` (Phase 4d Task 3) is this coordinator process's identity for
+/// the catalog HA lease (`crate::maintenance_lease`): [`stable_holder_id`]
+/// computes it ONCE, here in `new`, and it is never regenerated per tick --
+/// a holder_id that changed tick-to-tick would make `try_acquire`'s
+/// still-mine/held-by-other decision in `crate::maintenance_lease::lease_acquirable`
+/// see a *different* holder on every renewal attempt, breaking the very
+/// identity the lease is keyed on. Override via [`Self::with_holder_id`]
+/// (tests only; production always uses the `new`-time default).
 pub struct MaintenanceScheduler {
     cfg: MaintenanceConfig,
     principal: Arc<MaintenancePrincipal>,
@@ -140,6 +172,7 @@ pub struct MaintenanceScheduler {
     audit: Option<Arc<sqe_metrics::audit::AuditLogger>>,
     catalog_factory: CatalogFactory,
     handler: Arc<crate::maintenance::MaintenanceHandler>,
+    holder_id: String,
 }
 
 impl MaintenanceScheduler {
@@ -158,7 +191,19 @@ impl MaintenanceScheduler {
             audit,
             catalog_factory,
             handler,
+            holder_id: stable_holder_id(),
         }
+    }
+
+    /// Override this scheduler's lease `holder_id`. Tests only (e.g.
+    /// simulating two DIFFERENT coordinators sharing one state table by
+    /// building two `MaintenanceScheduler`s with distinct holder ids);
+    /// production code always keeps the stable per-process default `new`
+    /// computes.
+    #[cfg(any(test, feature = "test-sqlite"))]
+    pub fn with_holder_id(mut self, holder_id: impl Into<String>) -> Self {
+        self.holder_id = holder_id.into();
+        self
     }
 
     /// One tick: mint a session, discover tables under the default
@@ -558,56 +603,173 @@ impl MaintenanceScheduler {
         // fires for "no eligible debt").
         let dist = &self.cfg.distribution;
         let healthy = self.handler.healthy_worker_count().await;
-        let result = match crate::maintenance::resolve_execution(dist.mode, healthy, dist.min_workers) {
-            crate::maintenance::ExecutionPlan::SkipInsufficientWorkers => {
-                warn!(
-                    table = %name,
-                    healthy_workers = healthy,
-                    min_workers = dist.min_workers,
-                    "active_tick: skipped, distribution.mode=require but the fleet is below min_workers"
-                );
-                self.record_skipped_insufficient_workers(
-                    catalog,
-                    &job_id,
-                    ident,
-                    started_at_ms,
-                    healthy,
-                    dist.min_workers,
-                )
+        let plan = crate::maintenance::resolve_execution(dist.mode, healthy, dist.min_workers);
+        if matches!(plan, crate::maintenance::ExecutionPlan::SkipInsufficientWorkers) {
+            warn!(
+                table = %name,
+                healthy_workers = healthy,
+                min_workers = dist.min_workers,
+                "active_tick: skipped, distribution.mode=require but the fleet is below min_workers"
+            );
+            self.record_skipped_insufficient_workers(catalog, &job_id, ident, started_at_ms, healthy, dist.min_workers)
                 .await;
-                return;
-            }
-            crate::maintenance::ExecutionPlan::Local => {
-                self.handler
-                    .rewrite_data_files(
-                        &commit_catalog,
-                        &table_ref,
-                        Some(params.target_file_size_bytes),
-                        Some(params.min_input_files),
-                        None, // max_concurrent_file_group_rewrites: handler default; not part of the Phase 4b per-table override surface.
-                        strategy,
-                        None, // sort_order: not part of the Phase 4b per-table override surface.
-                        Some(params.delete_file_threshold),
-                        Some(snapshot_properties),
-                    )
-                    .await
-            }
-            crate::maintenance::ExecutionPlan::Distributed => {
-                self.handler
-                    .rewrite_data_files_distributed_with_defaults(
-                        &commit_catalog,
-                        &table_ref,
-                        &job_id,
-                        Some(params.target_file_size_bytes),
-                        Some(params.min_input_files),
-                        strategy,
-                        None, // sort_order: not part of the Phase 4b per-table override surface.
-                        Some(params.delete_file_threshold),
-                        Some(snapshot_properties),
-                    )
-                    .await
+            return;
+        }
+
+        // Phase 4d Task 3: acquire the HA lease immediately before the ONE
+        // expensive step this function performs (the rewrite dispatch right
+        // below), not any earlier -- the eligibility check, mint, refresh,
+        // and commit-catalog build above are all cheap or already needed
+        // regardless of which coordinator ends up doing the work. `job_key`
+        // is `name` (the table ident string), matching the brief and
+        // `crate::maintenance_lease`'s module docs.
+        //
+        // Correctness never depends on this lease: Iceberg's optimistic
+        // commit (`Transaction::commit`) already prevents two coordinators
+        // from double-committing a rewrite for the same table -- see
+        // `crate::maintenance_lease`'s module docs. This step exists only to
+        // avoid a second coordinator also paying for the (expensive)
+        // scan+rewrite+encode work Iceberg would throw away anyway.
+        let lease_handle = match self.cfg.scheduler.lease {
+            LeaseMode::None => None,
+            // `Kubernetes` is rejected at config-validation startup
+            // (`SqeConfig::validate`) when the scheduler is enabled -- Phase
+            // 4d only implements the catalog-native backend. Treat it the
+            // same as `Catalog` here defensively (validate() should already
+            // have refused to start), rather than silently running unleased.
+            LeaseMode::Catalog | LeaseMode::Kubernetes => {
+                let acquire_now_ms = chrono::Utc::now().timestamp_millis();
+                match maintenance_lease::try_acquire(
+                    catalog,
+                    &self.cfg.scheduler.state_table,
+                    &name,
+                    &self.holder_id,
+                    self.cfg.scheduler.lease_ttl_secs,
+                    acquire_now_ms,
+                )
+                .await
+                {
+                    Ok(Some(handle)) => {
+                        if let Some(audit) = &self.audit {
+                            audit.log_event(build_lease_audit_event(
+                                ident,
+                                &self.principal.user_id,
+                                &job_id,
+                                "acquired",
+                                &handle,
+                            ));
+                        }
+                        Some(handle)
+                    }
+                    Ok(None) => {
+                        // Routine under multi-coordinator deployments: NOT a
+                        // failure, NOT a `maintenance_log` job row (no job
+                        // was even attempted, so there is nothing job-shaped
+                        // to log) -- just a debug log and a dedicated
+                        // counter an operator can watch to confirm the lease
+                        // is doing its job.
+                        debug!(
+                            table = %name,
+                            holder_id = %self.holder_id,
+                            "active_tick: another coordinator holds the catalog lease for this table; skipping this tick"
+                        );
+                        self.metrics.maintenance_lease_skipped_total.inc();
+                        return;
+                    }
+                    Err(e) => {
+                        // A lease *operational* failure (state table
+                        // missing/unreadable, catalog hiccup) must never
+                        // block an otherwise-eligible compaction -- the
+                        // lease is advisory, not a correctness or
+                        // availability gate. Proceed unleased, best-effort,
+                        // exactly as `lease = "none"` would.
+                        warn!(
+                            table = %name,
+                            error = %e,
+                            "active_tick: lease acquisition failed; proceeding without it \
+                             (best-effort, the lease is never a correctness gate)"
+                        );
+                        None
+                    }
+                }
             }
         };
+
+        let rewrite_future: Pin<
+            Box<dyn Future<Output = sqe_core::Result<crate::maintenance::RewriteOutcome>> + Send + '_>,
+        > = match plan {
+            crate::maintenance::ExecutionPlan::SkipInsufficientWorkers => {
+                unreachable!("handled above, before the lease was acquired")
+            }
+            crate::maintenance::ExecutionPlan::Local => Box::pin(self.handler.rewrite_data_files(
+                &commit_catalog,
+                &table_ref,
+                Some(params.target_file_size_bytes),
+                Some(params.min_input_files),
+                None, // max_concurrent_file_group_rewrites: handler default; not part of the Phase 4b per-table override surface.
+                strategy,
+                None, // sort_order: not part of the Phase 4b per-table override surface.
+                Some(params.delete_file_threshold),
+                Some(snapshot_properties),
+            )),
+            crate::maintenance::ExecutionPlan::Distributed => {
+                Box::pin(self.handler.rewrite_data_files_distributed_with_defaults(
+                    &commit_catalog,
+                    &table_ref,
+                    &job_id,
+                    Some(params.target_file_size_bytes),
+                    Some(params.min_input_files),
+                    strategy,
+                    None, // sort_order: not part of the Phase 4b per-table override surface.
+                    Some(params.delete_file_threshold),
+                    Some(snapshot_properties),
+                ))
+            }
+        };
+
+        let (result, released_handle) = match lease_handle {
+            Some(handle) => {
+                let (result, handle) = run_with_lease_renewal(
+                    rewrite_future,
+                    handle,
+                    Arc::clone(&commit_catalog),
+                    self.cfg.scheduler.state_table.clone(),
+                    self.cfg.scheduler.lease_ttl_secs,
+                )
+                .await;
+                (result, Some(handle))
+            }
+            None => (rewrite_future.await, None),
+        };
+
+        // Always release -- success or failure -- so the lease never
+        // lingers to TTL once this coordinator is done with the table.
+        // Best-effort: a release failure is logged and swallowed, same as
+        // every other lease operation (see the module docs).
+        if let Some(handle) = released_handle {
+            let release_now_ms = chrono::Utc::now().timestamp_millis();
+            let handle_for_audit = handle.clone();
+            match maintenance_lease::release(handle, catalog, &self.cfg.scheduler.state_table, release_now_ms).await {
+                Ok(()) => {
+                    if let Some(audit) = &self.audit {
+                        audit.log_event(build_lease_audit_event(
+                            ident,
+                            &self.principal.user_id,
+                            &job_id,
+                            "released",
+                            &handle_for_audit,
+                        ));
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        table = %name,
+                        error = %e,
+                        "active_tick: lease release failed (best-effort; the claim will expire via ttl)"
+                    );
+                }
+            }
+        }
 
         let finished_at_ms = chrono::Utc::now().timestamp_millis();
         match result {
@@ -1005,6 +1167,101 @@ fn build_skipped_audit_event(
         trace_id: None,
         query_id: None,
         integrity: sqe_metrics::audit::Integrity::default(),
+    }
+}
+
+/// Build the `AuditKind::Maintenance` event for a catalog HA lease acquire
+/// or release (Phase 4d Task 3). Distinct from the job-outcome events above:
+/// this fires around the lease bookkeeping itself (`action` is `"acquired"`
+/// or `"released"`), independent of whether the rewrite it protects goes on
+/// to succeed, fail, or (in the `Ok(None)` "held by another coordinator"
+/// case, which never reaches this function at all -- see `active_one_table`)
+/// isn't attempted this tick.
+fn build_lease_audit_event(
+    ident: &TableIdent,
+    principal_user: &str,
+    job_id: &str,
+    action: &str,
+    handle: &LeaseHandle,
+) -> sqe_metrics::audit::AuditEvent {
+    sqe_metrics::audit::AuditEvent {
+        time: chrono::Utc::now(),
+        kind: sqe_metrics::audit::AuditKind::Maintenance,
+        actor: sqe_metrics::audit::Actor::from_parts(
+            principal_user.to_string(),
+            None,
+            None,
+            vec!["maintenance".to_string()],
+            vec![],
+        ),
+        outcome: sqe_metrics::audit::Outcome::Success,
+        resources: vec![sqe_metrics::audit::Resource {
+            catalog: None,
+            namespace: ident.namespace().to_vec(),
+            name: ident.name().to_string(),
+            object_type: sqe_metrics::audit::ObjectType::Table,
+        }],
+        policy: None,
+        timing: None,
+        stats: None,
+        query: Some(sqe_metrics::audit::QueryInfo {
+            text: Some(format!(
+                "active_tick: catalog lease {action}: holder={} expires_at_ms={}",
+                handle.holder_id, handle.expires_at_ms
+            )),
+            query_hash: sqe_metrics::audit::query_hash(&format!("maintenance-lease-{action}:{}", ident)),
+            statement_type: "maintenance_lease".to_string(),
+        }),
+        session_id: Some(job_id.to_string()),
+        client_ip: None,
+        trace_id: None,
+        query_id: None,
+        integrity: sqe_metrics::audit::Integrity::default(),
+    }
+}
+
+/// Run `fut` to completion, renewing `handle`'s lease at roughly half its
+/// TTL for as long as `fut` is still running (Phase 4d Task 3: "renew before
+/// the commit if the job is long"). A long-running `rewrite_data_files`/
+/// `rewrite_data_files_distributed_with_defaults` call never yields a
+/// natural "about to commit" checkpoint back to this module, so this races
+/// the compaction future against a renewal ticker instead of hooking a
+/// specific pre-commit point -- functionally equivalent (the lease never
+/// goes more than ~ttl/2 without a fresh renewal while the job runs) without
+/// requiring a callback into `MaintenanceHandler`.
+///
+/// Best-effort, like every other lease operation: a renewal failure (lost
+/// the race to another coordinator's steal, transient catalog conflict) is
+/// logged and swallowed, NEVER propagated into `fut`'s result or used to
+/// cancel it -- the lease is advisory (see `crate::maintenance_lease`'s
+/// module docs), so losing it mid-job must not abort an already-in-flight
+/// rewrite that Iceberg's own optimistic commit will arbitrate correctly
+/// regardless.
+async fn run_with_lease_renewal<'a, T>(
+    fut: Pin<Box<dyn Future<Output = sqe_core::Result<T>> + Send + 'a>>,
+    mut handle: LeaseHandle,
+    catalog: Arc<dyn Catalog>,
+    state_table: String,
+    ttl_secs: u64,
+) -> (sqe_core::Result<T>, LeaseHandle) {
+    let mut fut = fut;
+    let renew_every = std::time::Duration::from_secs((ttl_secs / 2).max(1));
+    let mut ticker = tokio::time::interval(renew_every);
+    ticker.tick().await; // the first tick fires immediately; consume it so renewal starts one full half-TTL period in, not instantly.
+    loop {
+        tokio::select! {
+            res = &mut fut => return (res, handle),
+            _ = ticker.tick() => {
+                let now_ms = chrono::Utc::now().timestamp_millis();
+                if let Err(e) = maintenance_lease::renew(&mut handle, &catalog, &state_table, ttl_secs, now_ms).await {
+                    warn!(
+                        job_key = %handle.job_key,
+                        error = %e,
+                        "active_tick: lease renew failed mid-job (best-effort, continuing the job anyway)"
+                    );
+                }
+            }
+        }
     }
 }
 
