@@ -11,12 +11,18 @@
 //! the commit/`RewriteFilesAction` path) remain in `sqe-coordinator::maintenance`
 //! and call into this crate's primitives with already-resolved inputs.
 
+pub mod dispatch;
 pub mod rewrite;
 pub mod wire;
 pub mod write_memory;
 pub mod writer;
 pub mod zorder;
 
+pub use dispatch::{
+    aggregate_group_outcomes, decode_group_response, least_loaded_worker,
+    place_groups_largest_first, AggregatedRewrite, GroupOutcome, GroupPlacement, PlacementPlan,
+    WorkerLoad,
+};
 pub use rewrite::{
     covered_position_deletes, delete_heavy_files, expected_rows_after_deletes,
     group_files_by_partition, pack_file_groups, pack_file_groups_partition_aware,

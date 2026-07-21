@@ -1058,6 +1058,357 @@ impl MaintenanceHandler {
         })
     }
 
+    /// Distributed counterpart to [`Self::rewrite_data_files`] (Phase 4c
+    /// Task 4): bounded conflict retry, same as the local path, but each
+    /// attempt fans the bin-packed groups out to the worker fleet
+    /// (`compact_file_group`) instead of rewriting them on the coordinator.
+    ///
+    /// Reserved for Task 5's `distribution.mode` routing to call; nothing in
+    /// `handle()` or the active-mode scheduler calls this yet, and the
+    /// coordinator-local path above is unchanged.
+    #[allow(dead_code, clippy::too_many_arguments)]
+    pub(crate) async fn rewrite_data_files_distributed(
+        &self,
+        catalog: &Arc<dyn Catalog>,
+        table_ref: &TableRef,
+        job_id: &str,
+        s3: &sqe_compaction::wire::S3Conn,
+        registry: &Arc<crate::worker_registry::WorkerRegistry>,
+        load_tracker: &crate::worker_registry::WorkerLoadTracker,
+        worker_secret: &str,
+        dist: &sqe_core::config::MaintenanceDistributionConfig,
+        target_file_size_bytes: Option<u64>,
+        min_input_files: Option<usize>,
+        strategy: Option<String>,
+        sort_order: Option<String>,
+        delete_file_threshold: Option<usize>,
+        snapshot_properties: Option<std::collections::HashMap<String, String>>,
+    ) -> sqe_core::Result<RewriteOutcome> {
+        const MAX_COMMIT_ATTEMPTS: usize = 4;
+        let mut attempt: usize = 0;
+        loop {
+            attempt += 1;
+            match self
+                .rewrite_data_files_distributed_once(
+                    catalog,
+                    table_ref,
+                    job_id,
+                    s3,
+                    registry,
+                    load_tracker,
+                    worker_secret,
+                    dist,
+                    target_file_size_bytes,
+                    min_input_files,
+                    strategy.clone(),
+                    sort_order.clone(),
+                    delete_file_threshold,
+                    snapshot_properties.clone(),
+                )
+                .await
+            {
+                Ok(v) => return Ok(v),
+                Err(e) => {
+                    // Same retry classification as the local path: a
+                    // concurrent writer that commits between our read and
+                    // our commit (or a group that has to be re-planned)
+                    // surfaces as a retryable conflict; re-plan and
+                    // re-dispatch from scratch rather than patch the stale
+                    // attempt, for the same correctness reason
+                    // `rewrite_data_files` re-reads on retry.
+                    let msg = e.to_string().to_lowercase();
+                    let retryable = msg.contains("retryable") || msg.contains("conflict");
+                    if retryable && attempt < MAX_COMMIT_ATTEMPTS {
+                        let backoff = std::time::Duration::from_millis(50 * (1u64 << (attempt - 1)));
+                        warn!(
+                            table = %to_table_ident(table_ref),
+                            attempt,
+                            backoff_ms = backoff.as_millis() as u64,
+                            "rewrite_data_files_distributed: retryable commit conflict; \
+                             re-planning and re-dispatching"
+                        );
+                        tokio::time::sleep(backoff).await;
+                        continue;
+                    }
+                    return Err(e);
+                }
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn rewrite_data_files_distributed_once(
+        &self,
+        catalog: &Arc<dyn Catalog>,
+        table_ref: &TableRef,
+        job_id: &str,
+        s3: &sqe_compaction::wire::S3Conn,
+        registry: &Arc<crate::worker_registry::WorkerRegistry>,
+        load_tracker: &crate::worker_registry::WorkerLoadTracker,
+        worker_secret: &str,
+        dist: &sqe_core::config::MaintenanceDistributionConfig,
+        target_file_size_bytes: Option<u64>,
+        min_input_files: Option<usize>,
+        strategy: Option<String>,
+        sort_order: Option<String>,
+        delete_file_threshold: Option<usize>,
+        snapshot_properties: Option<std::collections::HashMap<String, String>>,
+    ) -> sqe_core::Result<RewriteOutcome> {
+        const DEFAULT_TARGET_FILE_SIZE_BYTES: u64 = 512 * 1024 * 1024;
+        const DEFAULT_MIN_INPUT_FILES: usize = 5;
+
+        let target_bytes = target_file_size_bytes.unwrap_or(DEFAULT_TARGET_FILE_SIZE_BYTES);
+        let min_input = min_input_files.unwrap_or(DEFAULT_MIN_INPUT_FILES);
+
+        let ident = to_table_ident(table_ref);
+        let table = load_table(catalog, &ident).await?;
+
+        let metadata_location = table
+            .metadata_location_result()
+            .map_err(|e| {
+                SqeError::Execution(format!(
+                    "rewrite_data_files_distributed: table has no metadata location: {e}"
+                ))
+            })?
+            .to_string();
+
+        // Same sequence-number pin as the local path (see the extensive
+        // comment on `rewrite_data_files_once`): the rewritten data files
+        // are pinned to the snapshot we read here so a concurrently
+        // committed equality delete at a higher sequence number still
+        // applies to the compacted output.
+        let seq_at_start = table
+            .metadata_ref()
+            .current_snapshot()
+            .map(|s| s.sequence_number())
+            .unwrap_or(0);
+        let snapshot_id = table
+            .metadata_ref()
+            .current_snapshot()
+            .map(|s| s.snapshot_id())
+            .unwrap_or(0);
+
+        let read_plan = plan_delete_aware_read(&table).await?;
+        let live_deletes = collect_live_delete_files(&table).await?;
+
+        let arrow_schema: arrow_schema::SchemaRef = Arc::new(
+            iceberg::arrow::schema_to_arrow_schema(table.metadata().current_schema().as_ref())
+                .map_err(|e| {
+                    SqeError::Execution(format!("compaction schema conversion failed: {e}"))
+                })?,
+        );
+        // The sort is resolved here (same parser the local path uses) but
+        // applied on the WORKER, not the coordinator: each request below
+        // carries the resolved spec so the worker builds its own SortCtx
+        // against its own runtime. The coordinator never needs a spillable
+        // runtime for the distributed path.
+        let sort_spec = parse_sort_spec(strategy.as_deref(), sort_order.as_deref(), &arrow_schema)?;
+        let sort_wire: Option<sqe_compaction::wire::SortSpecWire> =
+            sort_spec.as_ref().map(std::convert::Into::into);
+
+        let old_data_files = collect_live_data_files(&table).await?;
+        let input_count = old_data_files.len();
+        let total_bytes: i64 = old_data_files
+            .iter()
+            .map(|f| f.file_size_in_bytes() as i64)
+            .sum();
+
+        let delete_heavy: std::collections::HashSet<String> =
+            match (sort_spec.is_some(), delete_file_threshold) {
+                (false, Some(threshold)) if threshold > 0 => {
+                    delete_heavy_files(&read_plan.tasks_by_path, threshold)
+                }
+                _ => std::collections::HashSet::new(),
+            };
+
+        if input_count < min_input && delete_heavy.is_empty() {
+            info!(
+                table = %ident,
+                input_count,
+                min_input,
+                "rewrite_data_files_distributed: skipping, below min_input_files"
+            );
+            return Ok(RewriteOutcome {
+                files_in: input_count as i64,
+                files_out: 0,
+                bytes_in: total_bytes,
+                bytes_out: 0,
+                rows_removed: 0,
+                snapshot_id: None,
+                files_rewritten: 0,
+                skipped_reason: Some("below min_input_files".to_string()),
+            });
+        }
+
+        let groups = if sort_spec.is_some() {
+            group_files_by_partition(&old_data_files)
+        } else {
+            pack_file_groups_partition_aware(&old_data_files, target_bytes, &delete_heavy)
+        };
+
+        let eligible_groups: Vec<Vec<DataFile>> = groups
+            .into_iter()
+            .filter(|g| {
+                g.len() >= min_input || g.iter().any(|f| delete_heavy.contains(f.file_path()))
+            })
+            .collect();
+
+        if eligible_groups.is_empty() {
+            info!(
+                table = %ident,
+                input_count,
+                "rewrite_data_files_distributed: no groups meet min_input_files after packing"
+            );
+            return Ok(RewriteOutcome {
+                files_in: input_count as i64,
+                files_out: 0,
+                bytes_in: total_bytes,
+                bytes_out: 0,
+                rows_removed: 0,
+                snapshot_id: None,
+                files_rewritten: 0,
+                skipped_reason: Some("no eligible groups".to_string()),
+            });
+        }
+
+        info!(
+            table = %ident,
+            input_count,
+            target_bytes,
+            group_count = eligible_groups.len(),
+            max_inflight_per_worker = dist.max_inflight_groups_per_worker,
+            "rewrite_data_files_distributed: dispatching groups to worker fleet"
+        );
+
+        let compression = self.config.catalog.parquet_compression.clone();
+        let group_timeout = std::time::Duration::from_secs(dist.group_timeout_secs);
+        let heartbeat_timeout = std::time::Duration::from_secs(dist.group_heartbeat_timeout_secs);
+
+        // Dispatch every group; on success this holds one CompactGroupResponse
+        // per group (order not significant, each carries its own group_id).
+        // A group that exhausts `group_attempts` fails the whole job before
+        // any commit is attempted (no partial commit).
+        let responses = crate::compaction_dispatch::dispatch_and_collect_groups(
+            job_id,
+            &ident.to_string(),
+            &metadata_location,
+            snapshot_id,
+            &eligible_groups,
+            target_bytes,
+            &compression,
+            sort_wire.as_ref(),
+            s3,
+            registry,
+            load_tracker,
+            worker_secret,
+            dist.max_inflight_groups_per_worker,
+            dist.group_attempts,
+            group_timeout,
+            heartbeat_timeout,
+        )
+        .await?;
+
+        // Decode each worker's Avro DataFiles against THIS table load's
+        // schema/partition type/spec id/format version -- none of that rides
+        // in CompactGroupResponse itself (see its doc comment).
+        let partition_type = table.metadata().default_partition_type().clone();
+        let partition_spec_id = table.metadata().default_partition_spec_id();
+        let format_version = table.metadata().format_version();
+        let schema = table.metadata().current_schema().clone();
+
+        let outcomes: Vec<sqe_compaction::dispatch::GroupOutcome> = responses
+            .iter()
+            .map(|r| {
+                sqe_compaction::dispatch::decode_group_response(
+                    r,
+                    schema.as_ref(),
+                    partition_spec_id,
+                    &partition_type,
+                    format_version,
+                )
+            })
+            .collect::<sqe_core::Result<Vec<_>>>()?;
+
+        let old_files: Vec<DataFile> = eligible_groups.into_iter().flatten().collect();
+
+        // Global added <= removed invariant, re-run over the FULL job (the
+        // per-group `expected_rows_after_deletes` cross-check already ran on
+        // each worker before it returned); any violation aborts before the
+        // commit below.
+        let aggregated = sqe_compaction::dispatch::aggregate_group_outcomes(outcomes, &old_files)?;
+
+        let output_count = aggregated.new_files.len() as i64;
+        let output_bytes: i64 = aggregated
+            .new_files
+            .iter()
+            .map(|f| f.file_size_in_bytes() as i64)
+            .sum();
+
+        // Position delete files fully covered by the removed data files are
+        // dropped in the same commit, exactly like the local path.
+        let removed_data_paths: std::collections::HashSet<String> =
+            old_files.iter().map(|f| f.file_path().to_string()).collect();
+        let covered_deletes = covered_position_deletes(&removed_data_paths, &live_deletes);
+        let removed_delete_count = covered_deletes.len() as i64;
+
+        info!(
+            table = %ident,
+            input_count = old_files.len(),
+            output_count,
+            added_rows = aggregated.added_rows,
+            removed_rows = aggregated.removed_rows,
+            removed_delete_count,
+            "rewrite_data_files_distributed: committing RewriteFilesAction"
+        );
+
+        // Commit via RewriteFilesAction: the EXACT same sequence
+        // `rewrite_data_files_once` uses (seq pin, check_file_existence,
+        // enable_delete_filter_manager, snapshot stamp, covered position
+        // deletes dropped in the same atomic swap). Commit authority never
+        // leaves the coordinator: workers only produced files in object
+        // storage, this is the one and only state change to the table.
+        let tx = Transaction::new(&table);
+        let files_to_remove: Vec<DataFile> =
+            old_files.iter().cloned().chain(covered_deletes).collect();
+        let mut action = tx
+            .rewrite_files()
+            .set_enable_delete_filter_manager(true)
+            .set_check_file_existence(true)
+            .set_new_data_file_sequence_number(seq_at_start)
+            .add_data_files(aggregated.new_files)
+            .delete_files(files_to_remove);
+        if let Some(props) = snapshot_properties {
+            action.set_snapshot_properties(props);
+        }
+        let tx_applied = action
+            .apply(tx)
+            .map_err(|e| SqeError::Execution(format!("rewrite_files apply failed: {e}")))?;
+
+        let committed = tx_applied
+            .commit(catalog.as_ref())
+            .await
+            .map_err(|e| classify_commit_error(e, "rewrite_data_files_distributed"))?;
+        let new_snapshot_id = committed.metadata().current_snapshot_id();
+
+        let cache_key = format!("{}.{}", ident.namespace(), ident.name());
+        if let Some(tc) = &self.table_cache {
+            tc.invalidate(&cache_key).await;
+        }
+
+        let rows_removed = (aggregated.removed_rows - aggregated.added_rows) as i64;
+
+        Ok(RewriteOutcome {
+            files_in: input_count as i64,
+            files_out: output_count,
+            bytes_in: total_bytes,
+            bytes_out: output_bytes,
+            rows_removed,
+            snapshot_id: new_snapshot_id,
+            files_rewritten: old_files.len() as i64,
+            skipped_reason: None,
+        })
+    }
+
     async fn expire_snapshots(
         &self,
         session: &Session,
