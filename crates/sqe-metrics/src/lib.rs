@@ -217,6 +217,27 @@ pub struct MetricsRegistry {
     /// requests that do not write an audit line. This keeps access observable
     /// in Prometheus even when the audit-coalesce window suppresses the line.
     pub dashboard_auth_success_total: IntCounter,
+
+    // Maintenance / advisory auto-compaction scheduler (Phase 4a, Task 5).
+    // Per-table gauges are keyed by fully-qualified `ns.table`; this is a
+    // deliberate high-cardinality label (one series per opted-in table).
+    // Acceptable at Phase 4a's opt-in scale; revisit if the opted-in table
+    // count grows into the thousands.
+    /// Live data files below `target_file_size_bytes`, by table.
+    pub table_small_files: GaugeVec,
+    /// Live delete files (position + equality), by table.
+    pub table_delete_files: GaugeVec,
+    /// Bytes covered by the pure bin-pack eligible groups, by table.
+    pub maintenance_est_rewrite_bytes: GaugeVec,
+    /// Advisory tick loop failures (a whole tick erroring out, not a
+    /// per-table analysis failure -- those are caught and logged, not
+    /// counted here, so one bad table never inflates this counter).
+    pub maintenance_tick_errors: IntCounter,
+    /// Worker fleet size as last observed by the maintenance scheduler.
+    /// Registered in Task 5; wiring `WorkerRegistry`'s live count into this
+    /// gauge is deferred (`MaintenanceScheduler` does not hold a
+    /// `WorkerRegistry` handle yet -- see maintenance_scheduler.rs docs).
+    pub maintenance_fleet_workers: IntGauge,
 }
 
 impl MetricsRegistry {
@@ -630,6 +651,40 @@ impl MetricsRegistry {
              requests that do not write an audit line.",
         )?;
 
+        // Maintenance / advisory auto-compaction scheduler (Phase 4a, Task 5)
+        let table_small_files = register_gauge_vec(
+            &registry,
+            "sqe_table_small_files",
+            "Live data files below the target compaction file size, by table",
+            &["table"],
+        )?;
+
+        let table_delete_files = register_gauge_vec(
+            &registry,
+            "sqe_table_delete_files",
+            "Live delete files (position + equality), by table",
+            &["table"],
+        )?;
+
+        let maintenance_est_rewrite_bytes = register_gauge_vec(
+            &registry,
+            "sqe_maintenance_est_rewrite_bytes",
+            "Bytes covered by pure bin-pack eligible compaction groups, by table",
+            &["table"],
+        )?;
+
+        let maintenance_tick_errors = register_int_counter(
+            &registry,
+            "sqe_maintenance_tick_errors_total",
+            "Advisory/active scheduler tick failures (whole-tick errors, not per-table)",
+        )?;
+
+        let maintenance_fleet_workers = register_int_gauge(
+            &registry,
+            "sqe_maintenance_fleet_workers",
+            "Worker fleet size as last observed by the maintenance scheduler",
+        )?;
+
         Ok(Self {
             registry,
             query_count,
@@ -694,6 +749,11 @@ impl MetricsRegistry {
             audit_export_last_success_timestamp,
             dashboard_auth_anonymous_denied_total,
             dashboard_auth_success_total,
+            table_small_files,
+            table_delete_files,
+            maintenance_est_rewrite_bytes,
+            maintenance_tick_errors,
+            maintenance_fleet_workers,
         })
     }
 }

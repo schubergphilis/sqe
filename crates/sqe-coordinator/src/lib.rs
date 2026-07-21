@@ -13,6 +13,7 @@ pub mod channel_pool;
 pub mod maintenance;
 pub mod maintenance_log;
 pub mod maintenance_principal;
+pub mod maintenance_scheduler;
 pub mod merge_sql;
 pub mod merge_target_provider;
 pub mod tls;
