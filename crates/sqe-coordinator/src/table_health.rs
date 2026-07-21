@@ -71,10 +71,11 @@ pub struct TableHealth {
     /// `eligible_groups`: excludes delete-heavy-only groups.
     pub est_rewrite_bytes: u64,
     /// Timestamp (epoch ms) of the most recent snapshot stamped by a
-    /// compaction job, or `None` if none has run. Always `None` in Phase 4a:
-    /// nothing stamps a `sqe.maintenance.job-id` into a snapshot summary
-    /// yet. The active scheduler (Phase 4b+) sets this from the newest
-    /// snapshot carrying that property.
+    /// compaction job, or `None` if none has run. Echoes `analyze_table_health`'s
+    /// `last_compaction_ms` parameter, which the caller computes from the
+    /// already-loaded `IcebergTable`'s snapshot log via
+    /// `crate::maintenance::last_compaction_snapshot_ms` (the newest
+    /// snapshot whose summary carries any `sqe.maintenance.*` property).
     pub last_compaction_snapshot_ms: Option<i64>,
     /// Whether `sqe.maintenance.enabled == "true"` is set on the table, i.e.
     /// whether the (later) advisory scheduler would consider this table.
@@ -95,12 +96,19 @@ pub struct TableHealth {
 /// wrapper also carries a live `TableScan`, which only a real table can
 /// produce; keeping this function's inputs to plain data lets tests build
 /// them with synthetic `FileScanTask`s instead of a docker-backed table.
+///
+/// `last_compaction_ms` is likewise collected by the caller (via
+/// `crate::maintenance::last_compaction_snapshot_ms`, which walks the
+/// already-loaded `IcebergTable`'s snapshot log) rather than computed here:
+/// this function stays pure and never touches a live table, snapshot log,
+/// or catalog.
 pub fn analyze_table_health(
     data: &[DataFile],
     deletes: &[DataFile],
     tasks_by_path: &HashMap<String, Vec<FileScanTask>>,
     cfg: &MaintenanceCompactionConfig,
     props: &HashMap<String, String>,
+    last_compaction_ms: Option<i64>,
 ) -> TableHealth {
     let target = cfg.target_file_size_bytes;
 
@@ -148,7 +156,7 @@ pub fn analyze_table_health(
         delete_heavy_files: delete_heavy.len() as u64,
         eligible_groups: eligible_groups.len() as u64,
         est_rewrite_bytes,
-        last_compaction_snapshot_ms: None,
+        last_compaction_snapshot_ms: last_compaction_ms,
         maintenance_enabled,
     }
 }
@@ -324,6 +332,7 @@ mod tests {
             &HashMap::new(),
             &cfg(1024, 5, 2),
             &HashMap::new(),
+            None,
         );
         assert_eq!(health.live_data_files, 0);
         assert_eq!(health.small_files, 0);
@@ -352,6 +361,7 @@ mod tests {
             &HashMap::new(),
             &cfg(target, 5, 2),
             &HashMap::new(),
+            None,
         );
         assert_eq!(health.live_data_files, 10);
         assert_eq!(health.small_files, 3);
@@ -367,6 +377,7 @@ mod tests {
             &HashMap::new(),
             &cfg(1000, 5, 2),
             &HashMap::new(),
+            None,
         );
         assert_eq!(health.delete_files, 2);
     }
@@ -380,7 +391,7 @@ mod tests {
             scan_task("light", &["d1"]),
         ]);
         let files = vec![data_file_of_size("heavy", 100), data_file_of_size("light", 100)];
-        let health = analyze_table_health(&files, &[], &tasks, &cfg(1000, 5, 2), &HashMap::new());
+        let health = analyze_table_health(&files, &[], &tasks, &cfg(1000, 5, 2), &HashMap::new(), None);
         assert_eq!(health.delete_heavy_files, 1);
     }
 
@@ -390,7 +401,7 @@ mod tests {
         // rewrite_data_files_once guard).
         let tasks = tasks_by_path(vec![scan_task("a", &["d1"])]);
         let files = vec![data_file_of_size("a", 100)];
-        let health = analyze_table_health(&files, &[], &tasks, &cfg(1000, 5, 0), &HashMap::new());
+        let health = analyze_table_health(&files, &[], &tasks, &cfg(1000, 5, 0), &HashMap::new(), None);
         assert_eq!(health.delete_heavy_files, 0);
     }
 
@@ -410,6 +421,7 @@ mod tests {
             &HashMap::new(),
             &cfg(target, min_input, 2),
             &HashMap::new(),
+            None,
         );
 
         let expected_groups = crate::maintenance::pack_file_groups_partition_aware(
@@ -439,6 +451,7 @@ mod tests {
             &HashMap::new(),
             &cfg(target, 5, 2),
             &HashMap::new(),
+            None,
         );
         assert_eq!(health.eligible_groups, 0);
         assert_eq!(health.est_rewrite_bytes, 0);
@@ -456,6 +469,7 @@ mod tests {
             &HashMap::new(),
             &cfg(target, 3, 2),
             &HashMap::new(),
+            None,
         );
         assert_eq!(health.eligible_groups, 1);
         assert_eq!(health.est_rewrite_bytes, 500);
@@ -474,6 +488,7 @@ mod tests {
             &HashMap::new(),
             &cfg(1_000_000, 5, 2),
             &HashMap::new(),
+            None,
         );
         assert_eq!(health.avg_file_bytes, 200);
         assert_eq!(health.p50_file_bytes, 200);
@@ -484,7 +499,7 @@ mod tests {
         let files = vec![data_file_of_size("a", 100)];
         let mut props = HashMap::new();
         props.insert("sqe.maintenance.enabled".to_string(), "true".to_string());
-        let health = analyze_table_health(&files, &[], &HashMap::new(), &cfg(1000, 5, 2), &props);
+        let health = analyze_table_health(&files, &[], &HashMap::new(), &cfg(1000, 5, 2), &props, None);
         assert!(health.maintenance_enabled);
     }
 
@@ -492,7 +507,7 @@ mod tests {
     fn maintenance_enabled_defaults_false() {
         let files = vec![data_file_of_size("a", 100)];
         let health =
-            analyze_table_health(&files, &[], &HashMap::new(), &cfg(1000, 5, 2), &HashMap::new());
+            analyze_table_health(&files, &[], &HashMap::new(), &cfg(1000, 5, 2), &HashMap::new(), None);
         assert!(!health.maintenance_enabled);
     }
 
@@ -501,16 +516,34 @@ mod tests {
         let files = vec![data_file_of_size("a", 100)];
         let mut props = HashMap::new();
         props.insert("sqe.maintenance.enabled".to_string(), "false".to_string());
-        let health = analyze_table_health(&files, &[], &HashMap::new(), &cfg(1000, 5, 2), &props);
+        let health = analyze_table_health(&files, &[], &HashMap::new(), &cfg(1000, 5, 2), &props, None);
         assert!(!health.maintenance_enabled);
     }
 
     #[test]
-    fn last_compaction_snapshot_ms_always_none_in_phase_4a() {
+    fn last_compaction_snapshot_ms_absent_when_no_compaction_ever_ran() {
         let files = vec![data_file_of_size("a", 100)];
         let health =
-            analyze_table_health(&files, &[], &HashMap::new(), &cfg(1000, 5, 2), &HashMap::new());
+            analyze_table_health(&files, &[], &HashMap::new(), &cfg(1000, 5, 2), &HashMap::new(), None);
         assert_eq!(health.last_compaction_snapshot_ms, None);
+    }
+
+    #[test]
+    fn last_compaction_snapshot_ms_echoes_caller_supplied_value() {
+        // `analyze_table_health` is pure: it never computes this itself, it
+        // only echoes whatever the caller (which walked the loaded table's
+        // snapshot log via `crate::maintenance::last_compaction_snapshot_ms`)
+        // passed in.
+        let files = vec![data_file_of_size("a", 100)];
+        let health = analyze_table_health(
+            &files,
+            &[],
+            &HashMap::new(),
+            &cfg(1000, 5, 2),
+            &HashMap::new(),
+            Some(1_700_000_000_000),
+        );
+        assert_eq!(health.last_compaction_snapshot_ms, Some(1_700_000_000_000));
     }
 
     #[test]

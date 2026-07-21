@@ -466,6 +466,7 @@ impl MaintenanceHandler {
         let table = load_table(&catalog, &ident).await?;
 
         let (data_files, delete_files, tasks_by_path) = collect_health_inputs(&table).await?;
+        let last_compaction_ms = last_compaction_snapshot_ms(&table);
 
         let health = crate::table_health::analyze_table_health(
             &data_files,
@@ -473,6 +474,7 @@ impl MaintenanceHandler {
             &tasks_by_path,
             &self.config.maintenance.compaction,
             table.metadata().properties(),
+            last_compaction_ms,
         );
 
         info!(
@@ -1697,6 +1699,42 @@ pub(crate) async fn collect_health_inputs(
     let delete_files = collect_live_delete_files(table).await?;
     let read_plan = plan_delete_aware_read(table).await?;
     Ok((data_files, delete_files, read_plan.tasks_by_path))
+}
+
+/// Table property prefix a compaction job stamps onto the snapshot it
+/// commits (`sqe.maintenance.job-id`, `sqe.maintenance.principal`,
+/// `sqe.maintenance.trigger`; see `active_one_table`'s `snapshot_properties`
+/// in `maintenance_scheduler.rs`). Shared here so
+/// [`last_compaction_snapshot_ms`] and the stamping call site can never
+/// disagree about which prefix marks a "this snapshot was a compaction job"
+/// snapshot.
+pub(crate) const MAINTENANCE_SNAPSHOT_PROPERTY_PREFIX: &str = "sqe.maintenance.";
+
+/// Timestamp (epoch ms) of the most recent snapshot in `table`'s snapshot
+/// log whose summary carries any `sqe.maintenance.*` property, or `None` if
+/// no snapshot ever did. Feeds
+/// [`crate::table_health::TableHealth::last_compaction_snapshot_ms`] (via
+/// its `analyze_table_health` parameter): `analyze_table_health` itself
+/// stays pure and never touches a live `IcebergTable`, so this is the one
+/// place that walks `table.metadata().snapshots()` to answer "when did a
+/// compaction job last touch this table."
+///
+/// Synchronous and I/O-free: `TableMetadata::snapshots()` only reads the
+/// already-loaded metadata, not the object store, so callers that already
+/// have a loaded `IcebergTable` (the `table_health` handler and the
+/// scheduler) can call this directly without an extra catalog round trip.
+pub(crate) fn last_compaction_snapshot_ms(table: &IcebergTable) -> Option<i64> {
+    table
+        .metadata()
+        .snapshots()
+        .filter(|s| {
+            s.summary()
+                .additional_properties
+                .keys()
+                .any(|k| k.starts_with(MAINTENANCE_SNAPSHOT_PROPERTY_PREFIX))
+        })
+        .map(|s| s.timestamp_ms())
+        .max()
 }
 
 /// Rows expected after applying deletes to `group`, or `None` when it cannot be

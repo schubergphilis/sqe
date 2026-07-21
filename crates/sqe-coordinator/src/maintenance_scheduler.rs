@@ -295,6 +295,7 @@ impl MaintenanceScheduler {
         let table = crate::maintenance::load_table(catalog, ident).await?;
         let (data_files, delete_files, tasks_by_path) =
             crate::maintenance::collect_health_inputs(&table).await?;
+        let last_compaction_ms = crate::maintenance::last_compaction_snapshot_ms(&table);
 
         let health = crate::table_health::analyze_table_health(
             &data_files,
@@ -302,6 +303,7 @@ impl MaintenanceScheduler {
             &tasks_by_path,
             &self.cfg.compaction,
             table.metadata().properties(),
+            last_compaction_ms,
         );
 
         let name = ident.to_string();
@@ -354,17 +356,24 @@ impl MaintenanceScheduler {
     ///
     /// Always computes and emits the same health gauges [`analyze_one_table`]
     /// does (an operator watching Grafana sees the same signal regardless of
-    /// mode), then either skips (no eligible debt) or runs a real
-    /// `rewrite_data_files` commit through `self.handler` -- the SAME method
-    /// `CALL system.rewrite_data_files` uses -- under a freshly minted
-    /// maintenance session.
+    /// mode), then either skips (no eligible debt, recorded via
+    /// [`record_skipped_job`]: log row, metric, and audit event) or runs a
+    /// real `rewrite_data_files` commit through `self.handler` -- the SAME
+    /// method `CALL system.rewrite_data_files` uses -- under a freshly
+    /// minted maintenance session.
     ///
-    /// Infallible by design: every failure path (load, mint, refresh,
-    /// catalog build, or the rewrite itself) is caught here, turned into a
-    /// `failed` `maintenance_log` row plus a `sqe_maintenance_job_total`
-    /// sample, and swallowed. One table's compaction failing must never
-    /// abort the tick or block any other opted-in table from being
-    /// considered.
+    /// Infallible by design: every failure path from the eligibility check
+    /// onward (mint, write-privilege check, refresh's own commit-catalog
+    /// build, or the rewrite itself) is caught here, turned into a `failed`
+    /// `maintenance_log` row, a `sqe_maintenance_job_total` sample, AND
+    /// (Phase 4b review, Fix 1) an `AuditKind::Maintenance` audit event
+    /// carrying the failure reason, via [`record_failed_job`], then
+    /// swallowed. The two EARLIER failure points, `load_table` and
+    /// `collect_health_inputs`, happen before `job_id`/`started_at_ms` even
+    /// exist; those are logged and skipped (matching pre-4b behavior) with
+    /// no log row, metric, or audit event, since there is no job to
+    /// attribute one to. One table's compaction failing must never abort
+    /// the tick or block any other opted-in table from being considered.
     async fn active_one_table(&self, catalog: &Arc<dyn Catalog>, ident: &TableIdent, now_ms: i64) {
         let name = ident.to_string();
 
@@ -404,12 +413,14 @@ impl MaintenanceScheduler {
             strategy: params.strategy.clone(),
         };
 
+        let last_compaction_ms = crate::maintenance::last_compaction_snapshot_ms(&table);
         let health = crate::table_health::analyze_table_health(
             &data_files,
             &delete_files,
             &tasks_by_path,
             &effective_cfg,
             table.metadata().properties(),
+            last_compaction_ms,
         );
 
         // Same observability as advisory mode, regardless of whether this
@@ -442,18 +453,8 @@ impl MaintenanceScheduler {
         let has_eligible_work = health.eligible_groups > 0 || health.delete_heavy_files > 0;
         if !has_eligible_work {
             info!(table = %name, "active_tick: skipped, no eligible compaction debt");
-            let row = maintenance_log::skipped_row(
-                &job_id,
-                &name,
-                &self.principal.user_id,
-                started_at_ms,
-                "no eligible compaction debt",
-            );
-            self.append_job_row(catalog, &row).await;
-            self.metrics
-                .maintenance_job_total
-                .with_label_values(&["skipped"])
-                .inc();
+            self.record_skipped_job(catalog, &job_id, ident, started_at_ms, "no eligible compaction debt")
+                .await;
             return;
         }
 
@@ -461,7 +462,7 @@ impl MaintenanceScheduler {
             Ok(s) => s,
             Err(e) => {
                 warn!(table = %name, error = %e, "active_tick: failed to mint maintenance session");
-                self.record_failed_job(catalog, &job_id, &name, started_at_ms, &e.to_string())
+                self.record_failed_job(catalog, &job_id, ident, started_at_ms, &e.to_string())
                     .await;
                 return;
             }
@@ -479,7 +480,7 @@ impl MaintenanceScheduler {
             self.record_failed_job(
                 catalog,
                 &job_id,
-                &name,
+                ident,
                 started_at_ms,
                 "minted maintenance session lacks write privilege",
             )
@@ -507,7 +508,7 @@ impl MaintenanceScheduler {
             Ok(c) => c,
             Err(e) => {
                 warn!(table = %name, error = %e, "active_tick: failed to build commit catalog");
-                self.record_failed_job(catalog, &job_id, &name, started_at_ms, &e.to_string())
+                self.record_failed_job(catalog, &job_id, ident, started_at_ms, &e.to_string())
                     .await;
                 return;
             }
@@ -517,7 +518,7 @@ impl MaintenanceScheduler {
             Ok(t) => t,
             Err(e) => {
                 warn!(table = %name, error = %e, "active_tick: failed to build table reference");
-                self.record_failed_job(catalog, &job_id, &name, started_at_ms, &e.to_string())
+                self.record_failed_job(catalog, &job_id, ident, started_at_ms, &e.to_string())
                     .await;
                 return;
             }
@@ -561,18 +562,8 @@ impl MaintenanceScheduler {
             Ok(outcome) if outcome.skipped_reason.is_some() => {
                 let reason = outcome.skipped_reason.unwrap_or_default();
                 info!(table = %name, reason = %reason, "active_tick: rewrite_data_files skipped");
-                let row = maintenance_log::skipped_row(
-                    &job_id,
-                    &name,
-                    &self.principal.user_id,
-                    started_at_ms,
-                    &reason,
-                );
-                self.append_job_row(catalog, &row).await;
-                self.metrics
-                    .maintenance_job_total
-                    .with_label_values(&["skipped"])
-                    .inc();
+                self.record_skipped_job(catalog, &job_id, ident, started_at_ms, &reason)
+                    .await;
             }
             Ok(outcome) => {
                 info!(
@@ -616,27 +607,30 @@ impl MaintenanceScheduler {
             }
             Err(e) => {
                 warn!(table = %name, error = %e, "active_tick: compaction failed");
-                self.record_failed_job(catalog, &job_id, &name, started_at_ms, &e.to_string())
+                self.record_failed_job(catalog, &job_id, ident, started_at_ms, &e.to_string())
                     .await;
             }
         }
     }
 
     /// Build and append a `failed` `maintenance_log` row plus its metric
-    /// sample. Shared by every `active_one_table` error path so the
-    /// job-total counter and the ledger can never disagree about whether a
-    /// job counted as failed.
+    /// sample, and (Design doc-6 review) emit the matching
+    /// `AuditKind::Maintenance` audit event. Shared by every
+    /// `active_one_table` error path so the job-total counter, the ledger,
+    /// and the audit trail can never disagree about whether a job counted
+    /// as failed.
     async fn record_failed_job(
         &self,
         catalog: &Arc<dyn Catalog>,
         job_id: &str,
-        table: &str,
+        ident: &TableIdent,
         started_at_ms: i64,
         error: &str,
     ) {
+        let name = ident.to_string();
         let row = maintenance_log::failed_row(
             job_id,
-            table,
+            &name,
             &self.principal.user_id,
             started_at_ms,
             chrono::Utc::now().timestamp_millis(),
@@ -647,6 +641,45 @@ impl MaintenanceScheduler {
             .maintenance_job_total
             .with_label_values(&["failed"])
             .inc();
+        if let Some(audit) = &self.audit {
+            audit.log_event(build_failed_audit_event(
+                ident,
+                &self.principal.user_id,
+                job_id,
+                error,
+            ));
+        }
+    }
+
+    /// Build and append a `skipped` `maintenance_log` row plus its metric
+    /// sample and matching `AuditKind::Maintenance` audit event. Shared by
+    /// both `active_one_table` skip paths (no eligible debt, and
+    /// `rewrite_data_files` itself reporting `skipped_reason`) so the
+    /// job-total counter, the ledger, and the audit trail can never
+    /// disagree about whether a job counted as skipped.
+    async fn record_skipped_job(
+        &self,
+        catalog: &Arc<dyn Catalog>,
+        job_id: &str,
+        ident: &TableIdent,
+        started_at_ms: i64,
+        reason: &str,
+    ) {
+        let name = ident.to_string();
+        let row = maintenance_log::skipped_row(job_id, &name, &self.principal.user_id, started_at_ms, reason);
+        self.append_job_row(catalog, &row).await;
+        self.metrics
+            .maintenance_job_total
+            .with_label_values(&["skipped"])
+            .inc();
+        if let Some(audit) = &self.audit {
+            audit.log_event(build_skipped_audit_event(
+                ident,
+                &self.principal.user_id,
+                job_id,
+                reason,
+            ));
+        }
     }
 
     /// Best-effort `maintenance_log` append, shared by every active-mode
@@ -786,6 +819,103 @@ fn build_active_audit_event(
                 outcome.files_in, outcome.files_out, outcome.bytes_out, outcome.rows_removed, outcome.snapshot_id
             )),
             query_hash: sqe_metrics::audit::query_hash(&format!("maintenance-active:{}", ident)),
+            statement_type: "maintenance_active".to_string(),
+        }),
+        session_id: Some(job_id.to_string()),
+        client_ip: None,
+        trace_id: None,
+        query_id: None,
+        integrity: sqe_metrics::audit::Integrity::default(),
+    }
+}
+
+/// Build the `AuditKind::Maintenance` event for one table's active-mode
+/// compaction job that FAILED (Phase 4b review, design doc section 6:
+/// failures and denials must be audited, not just metered and logged).
+/// `Outcome::Failure` mirrors the shape `authorize_or_deny`'s denial event
+/// uses (`crate::maintenance::authorize_or_deny`): an `error_type` tag plus
+/// the human-readable `message`, so every failure this scheduler ever
+/// records, an authorization refusal or a mint/refresh/commit error, looks
+/// the same to a downstream SIEM regardless of which check tripped it.
+fn build_failed_audit_event(
+    ident: &TableIdent,
+    principal_user: &str,
+    job_id: &str,
+    error: &str,
+) -> sqe_metrics::audit::AuditEvent {
+    sqe_metrics::audit::AuditEvent {
+        time: chrono::Utc::now(),
+        kind: sqe_metrics::audit::AuditKind::Maintenance,
+        actor: sqe_metrics::audit::Actor::from_parts(
+            principal_user.to_string(),
+            None,
+            None,
+            vec!["maintenance".to_string()],
+            vec![],
+        ),
+        outcome: sqe_metrics::audit::Outcome::Failure {
+            error_type: Some("MaintenanceJobFailed".to_string()),
+            error_code: None,
+            message: Some(error.to_string()),
+        },
+        resources: vec![sqe_metrics::audit::Resource {
+            catalog: None,
+            namespace: ident.namespace().to_vec(),
+            name: ident.name().to_string(),
+            object_type: sqe_metrics::audit::ObjectType::Table,
+        }],
+        policy: None,
+        timing: None,
+        stats: None,
+        query: Some(sqe_metrics::audit::QueryInfo {
+            text: Some(format!("active_tick: rewrite_data_files failed: {error}")),
+            query_hash: sqe_metrics::audit::query_hash(&format!("maintenance-active-failed:{}", ident)),
+            statement_type: "maintenance_active".to_string(),
+        }),
+        session_id: Some(job_id.to_string()),
+        client_ip: None,
+        trace_id: None,
+        query_id: None,
+        integrity: sqe_metrics::audit::Integrity::default(),
+    }
+}
+
+/// Build the `AuditKind::Maintenance` event for one table's active-mode
+/// compaction job that was SKIPPED (no eligible compaction debt, or
+/// `rewrite_data_files` itself reported a `skipped_reason`). A skip is a
+/// correct no-op decision, not a failure, so `outcome` stays
+/// `Outcome::Success` (there is no `message` field on that variant); the
+/// skip reason travels in `query.text` instead, the same place
+/// [`build_active_audit_event`] puts its committed-outcome description.
+fn build_skipped_audit_event(
+    ident: &TableIdent,
+    principal_user: &str,
+    job_id: &str,
+    reason: &str,
+) -> sqe_metrics::audit::AuditEvent {
+    sqe_metrics::audit::AuditEvent {
+        time: chrono::Utc::now(),
+        kind: sqe_metrics::audit::AuditKind::Maintenance,
+        actor: sqe_metrics::audit::Actor::from_parts(
+            principal_user.to_string(),
+            None,
+            None,
+            vec!["maintenance".to_string()],
+            vec![],
+        ),
+        outcome: sqe_metrics::audit::Outcome::Success,
+        resources: vec![sqe_metrics::audit::Resource {
+            catalog: None,
+            namespace: ident.namespace().to_vec(),
+            name: ident.name().to_string(),
+            object_type: sqe_metrics::audit::ObjectType::Table,
+        }],
+        policy: None,
+        timing: None,
+        stats: None,
+        query: Some(sqe_metrics::audit::QueryInfo {
+            text: Some(format!("active_tick: rewrite_data_files skipped: {reason}")),
+            query_hash: sqe_metrics::audit::query_hash(&format!("maintenance-active-skipped:{}", ident)),
             statement_type: "maintenance_active".to_string(),
         }),
         session_id: Some(job_id.to_string()),

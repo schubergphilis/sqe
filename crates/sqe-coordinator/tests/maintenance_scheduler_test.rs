@@ -854,6 +854,242 @@ async fn active_tick_honors_per_table_override_that_global_config_would_have_ski
     );
 }
 
+/// An opted-in table with NO eligible compaction debt (one file, well under
+/// `min_input_files`, no delete files) must be recorded as `skipped`: a
+/// `maintenance_log` row with `status="skipped"`, a
+/// `sqe_maintenance_job_total{status="skipped"}` sample, and (4b review, Fix
+/// 1) an `AuditKind::Maintenance` audit event carrying the skip reason --
+/// a skip is a real tick decision, not a silent no-op.
+#[tokio::test]
+async fn active_tick_skips_table_with_no_eligible_debt_and_audits_it() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let catalog = sqlite_catalog(&dir).await;
+
+    // 1 file, min_input_files=2 below: no group ever meets the threshold,
+    // and there are no delete files, so `has_eligible_work` is false.
+    let opted_ident = create_table(&catalog, "ns", "active_no_debt", true).await;
+    seed_small_files(&catalog, &opted_ident, 1).await;
+    let files_before = live_data_file_count(&catalog, &opted_ident).await;
+    assert_eq!(files_before, 1);
+    let opted_snapshot_before = catalog
+        .load_table(&opted_ident)
+        .await
+        .expect("reload opted table")
+        .metadata()
+        .current_snapshot_id();
+
+    create_maintenance_log_table(&catalog).await;
+
+    let idp = mock_idp().await;
+    let cfg = active_maintenance_config(&idp, 2);
+    let principal = Arc::new(
+        MaintenancePrincipal::from_config(cfg.principal.as_ref().expect("principal set"))
+            .expect("build principal"),
+    );
+    let metrics = Arc::new(MetricsRegistry::new().expect("metrics registry builds"));
+
+    let audit_dir = tempfile::tempdir().expect("audit tempdir");
+    let audit_path = audit_dir.path().join("audit.jsonl");
+    let audit = Arc::new(
+        AuditLogger::with_config(audit_path.to_str().expect("utf8 path"), AuditFormat::Native)
+            .expect("audit logger builds"),
+    );
+
+    let injected_catalog = catalog.clone();
+    let catalog_factory: sqe_coordinator::maintenance_scheduler::CatalogFactory =
+        Arc::new(move |_session: &sqe_core::Session| {
+            let catalog = injected_catalog.clone();
+            Box::pin(async move { Ok(catalog) })
+        });
+    let handler = Arc::new(sqe_coordinator::maintenance::MaintenanceHandler::new(minimal_sqe_config()));
+
+    let scheduler = MaintenanceScheduler::new(
+        cfg,
+        principal,
+        metrics.clone(),
+        Some(audit.clone()),
+        catalog_factory,
+        handler,
+    );
+
+    scheduler.advisory_tick().await.expect("active tick succeeds");
+
+    // --- Never touched: same file count, same snapshot ---
+    let files_after = live_data_file_count(&catalog, &opted_ident).await;
+    assert_eq!(files_after, files_before, "a skipped table must not be rewritten");
+    let opted_snapshot_after = catalog
+        .load_table(&opted_ident)
+        .await
+        .expect("reload opted table")
+        .metadata()
+        .current_snapshot_id();
+    assert_eq!(
+        opted_snapshot_before, opted_snapshot_after,
+        "a skipped table must not get a new snapshot"
+    );
+
+    // --- maintenance_log: one row, status="skipped", reason recorded ---
+    let rows = scan_log_rows(&catalog).await;
+    let opted_rows: Vec<&LogRowView> = rows.iter().filter(|r| r.table_name == "ns.active_no_debt").collect();
+    assert_eq!(opted_rows.len(), 1, "expected exactly one job row for the opted table");
+    assert_eq!(opted_rows[0].status, "skipped");
+
+    // --- Metrics: one skipped sample ---
+    let job_skipped = metrics
+        .registry
+        .gather()
+        .into_iter()
+        .find(|f| f.name() == "sqe_maintenance_job_total")
+        .and_then(|f| {
+            f.get_metric()
+                .iter()
+                .find(|m| m.get_label().iter().any(|l| l.name() == "status" && l.value() == "skipped"))
+                .map(|m| m.get_counter().value())
+        });
+    assert_eq!(job_skipped, Some(1.0));
+
+    // --- Audit: one Maintenance event, outcome success, reason in the text ---
+    audit.flush();
+    let audit_content = std::fs::read_to_string(&audit_path).unwrap_or_default();
+    let skipped_events: Vec<&str> = audit_content
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter(|l| l.contains("\"kind\":\"maintenance\"") && l.contains("skipped"))
+        .collect();
+    assert_eq!(skipped_events.len(), 1, "expected exactly one skip audit event, got: {skipped_events:?}");
+    assert!(
+        skipped_events[0].contains("\"status\":\"success\""),
+        "a skip is a correct no-op decision, not a failure: {}",
+        skipped_events[0]
+    );
+    assert!(
+        skipped_events[0].contains("no eligible compaction debt"),
+        "skip reason must be actionable in the audit line: {}",
+        skipped_events[0]
+    );
+}
+
+/// A commit-catalog build failure (the `catalog_factory` call inside
+/// `active_one_table`, AFTER eligibility passes and the session is minted)
+/// must be recorded as `failed`: a `maintenance_log` row with
+/// `status="failed"`, a `sqe_maintenance_job_total{status="failed"}` sample,
+/// and (4b review, Fix 1) an `AuditKind::Maintenance` audit event with
+/// `Outcome::Failure` carrying the error message.
+///
+/// `catalog_factory` is rigged to succeed exactly once (the tick-level
+/// discovery call in `advisory_tick`) and fail on every later call (the
+/// per-table commit-catalog build in `active_one_table`), so the table
+/// reaches the real compaction attempt and fails deep in the pipeline
+/// rather than being skipped or never discovered.
+#[tokio::test]
+async fn active_tick_records_failed_job_and_audits_it() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let catalog = sqlite_catalog(&dir).await;
+
+    let opted_ident = create_table(&catalog, "ns", "active_fails", true).await;
+    seed_small_files(&catalog, &opted_ident, 5).await;
+    let files_before = live_data_file_count(&catalog, &opted_ident).await;
+    assert_eq!(files_before, 5);
+
+    create_maintenance_log_table(&catalog).await;
+
+    let idp = mock_idp().await;
+    let cfg = active_maintenance_config(&idp, 2);
+    let principal = Arc::new(
+        MaintenancePrincipal::from_config(cfg.principal.as_ref().expect("principal set"))
+            .expect("build principal"),
+    );
+    let metrics = Arc::new(MetricsRegistry::new().expect("metrics registry builds"));
+
+    let audit_dir = tempfile::tempdir().expect("audit tempdir");
+    let audit_path = audit_dir.path().join("audit.jsonl");
+    let audit = Arc::new(
+        AuditLogger::with_config(audit_path.to_str().expect("utf8 path"), AuditFormat::Native)
+            .expect("audit logger builds"),
+    );
+
+    let injected_catalog = catalog.clone();
+    let call_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let catalog_factory: sqe_coordinator::maintenance_scheduler::CatalogFactory = {
+        let call_count = call_count.clone();
+        Arc::new(move |_session: &sqe_core::Session| {
+            let catalog = injected_catalog.clone();
+            let call_count = call_count.clone();
+            Box::pin(async move {
+                let n = call_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if n == 0 {
+                    // Tick-level discovery call: must succeed so the table
+                    // is actually found and reaches the eligibility check.
+                    Ok(catalog)
+                } else {
+                    // Every later call (the per-table commit-catalog build):
+                    // fail, forcing `active_one_table`'s `record_failed_job`
+                    // path.
+                    Err(sqe_core::SqeError::Catalog("injected commit-catalog failure".to_string()))
+                }
+            })
+        })
+    };
+    let handler = Arc::new(sqe_coordinator::maintenance::MaintenanceHandler::new(minimal_sqe_config()));
+
+    let scheduler = MaintenanceScheduler::new(
+        cfg,
+        principal,
+        metrics.clone(),
+        Some(audit.clone()),
+        catalog_factory,
+        handler,
+    );
+
+    scheduler.advisory_tick().await.expect("active tick succeeds despite the per-table failure");
+
+    // --- Never touched: same file count ---
+    let files_after = live_data_file_count(&catalog, &opted_ident).await;
+    assert_eq!(files_after, files_before, "a failed job must not have rewritten anything");
+
+    // --- maintenance_log: one row, status="failed", error recorded ---
+    let rows = scan_log_rows(&catalog).await;
+    let opted_rows: Vec<&LogRowView> = rows.iter().filter(|r| r.table_name == "ns.active_fails").collect();
+    assert_eq!(opted_rows.len(), 1, "expected exactly one job row for the opted table");
+    assert_eq!(opted_rows[0].status, "failed");
+
+    // --- Metrics: one failed sample ---
+    let job_failed = metrics
+        .registry
+        .gather()
+        .into_iter()
+        .find(|f| f.name() == "sqe_maintenance_job_total")
+        .and_then(|f| {
+            f.get_metric()
+                .iter()
+                .find(|m| m.get_label().iter().any(|l| l.name() == "status" && l.value() == "failed"))
+                .map(|m| m.get_counter().value())
+        });
+    assert_eq!(job_failed, Some(1.0));
+
+    // --- Audit: one Maintenance event, Outcome::Failure, error in the text ---
+    audit.flush();
+    let audit_content = std::fs::read_to_string(&audit_path).unwrap_or_default();
+    let failed_events: Vec<&str> = audit_content
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter(|l| l.contains("\"kind\":\"maintenance\"") && l.contains("\"status\":\"failure\""))
+        .collect();
+    assert_eq!(failed_events.len(), 1, "expected exactly one failure audit event, got: {failed_events:?}");
+    assert!(
+        failed_events[0].contains("injected commit-catalog failure"),
+        "failure reason must be actionable in the audit line: {}",
+        failed_events[0]
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(failed_events[0])
+            .expect("valid JSON audit line")["resources"][0]["name"]
+            .as_str(),
+        Some("active_fails"),
+        "the failure event must identify the table it failed on"
+    );
+}
+
 /// The exact same many-small-files fixture as the active-mode test above,
 /// but run through an `advisory`-mode tick: nothing must be mutated. This
 /// is the direct A/B companion the Phase 4b brief calls for -- same tables,
