@@ -75,6 +75,7 @@ sqe-quack-client = { path = "../sqe-quack-client" }
 sqe-lineage = { path = "../sqe-lineage" }
 prometheus = { workspace = true }
 chrono = { workspace = true }
+croner = { workspace = true }
 axum = { workspace = true }
 reqwest = { workspace = true }
 clap = { workspace = true }

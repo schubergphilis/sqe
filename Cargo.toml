@@ -168,6 +168,10 @@ unicode-normalization = "0.1"
 rust-stemmers = "1"
 # Timezone support for with_timezone/at_timezone
 chrono-tz = "0.10"
+# Cron expression parsing/evaluation for the maintenance scheduler's
+# `schedule` config (`crates/sqe-coordinator/src/maintenance_scheduler.rs`).
+# MIT-licensed, chrono-native, actively maintained.
+croner = "3"
 # Regex for Trino regexp_extract/extract_all/split
 regex = "1"
 futures = "0.3"
