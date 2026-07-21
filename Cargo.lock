@@ -6480,6 +6480,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "sqe-compaction"
+version = "0.37.0"
+dependencies = [
+ "arrow",
+ "arrow-array",
+ "arrow-schema",
+ "datafusion",
+ "futures",
+ "iceberg",
+ "parquet",
+ "sqe-catalog",
+ "sqe-core",
+ "sqe-metrics",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "sqe-coordinator"
 version = "0.37.0"
 dependencies = [
@@ -6520,6 +6540,7 @@ dependencies = [
  "sha2 0.10.9",
  "sqe-auth",
  "sqe-catalog",
+ "sqe-compaction",
  "sqe-core",
  "sqe-lineage",
  "sqe-metrics",

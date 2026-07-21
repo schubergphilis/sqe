@@ -9,6 +9,7 @@ members = [
     "crates/sqe-planner",
     "crates/sqe-trino-functions",
     "crates/sqe-coordinator",
+    "crates/sqe-compaction",
     "crates/sqe-worker",
     "crates/sqe-trino-compat",
     "crates/sqe-metrics",
