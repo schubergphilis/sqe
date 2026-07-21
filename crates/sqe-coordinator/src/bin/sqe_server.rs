@@ -1088,25 +1088,38 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
         );
         // Dedicated `MaintenanceHandler` for the scheduler's active-mode arm
         // (Phase 4b), separate from the one `QueryHandler` builds for the
-        // interactive `CALL system.rewrite_data_files` path below. It needs
-        // its own DataFusion runtime so a per-table `strategy => "sort"`
-        // override can spill instead of OOMing; that means a second
+        // interactive `CALL system.rewrite_data_files` path below.
+        // `Advisory` mode's `analyze_one_table` never touches this handler
+        // (it only calls `table_health`, which needs no DataFusion runtime),
+        // so the handler is built without a runtime there. Only in `Active`
+        // mode does `active_one_table` call `handler.rewrite_data_files`,
+        // and only a per-table `strategy => "sort"` override needs the
+        // runtime (to spill instead of OOMing); that runtime is a second
         // `FairSpillPool` competing for host memory alongside the query
-        // engine's, which is an accepted Phase 4b tradeoff (this handler is
-        // only reachable when `[maintenance] mode = "active"` AND at least
-        // one table opts in). The scheduler never resolves a catalog
-        // through this handler's own `create_catalog_bridge`; it always
-        // passes in a catalog it already built via `catalog_factory` (see
+        // engine's, and building it unconditionally would let Active-mode
+        // compaction run concurrently with queries at up to ~2x the
+        // operator's configured `memory_limit`, contradicting the
+        // single-shared-budget invariant `runtime.rs` documents. So it is
+        // built and attached ONLY when `mode == Active`.
+        // TODO(4c): share the coordinator query runtime instead of a second pool.
+        // The scheduler never resolves a catalog through this handler's own
+        // `create_catalog_bridge`; it always passes in a catalog it already
+        // built via `catalog_factory` (see
         // `maintenance_scheduler.rs::active_one_table`).
-        let maintenance_runtime =
-            sqe_coordinator::runtime::build_coordinator_runtime(&config.coordinator, &config.storage)
-                .map_err(|e| anyhow::anyhow!("failed to build maintenance scheduler runtime: {e}"))?;
-        let maintenance_handler = Arc::new(
+        let mut maintenance_handler_builder =
             sqe_coordinator::maintenance::MaintenanceHandler::new(config.clone())
-                .with_runtime(maintenance_runtime)
                 .with_table_cache(table_cache.clone())
-                .with_audit(Arc::clone(&audit)),
-        );
+                .with_audit(Arc::clone(&audit));
+        if config.maintenance.mode == sqe_core::config::MaintenanceMode::Active {
+            let maintenance_runtime = sqe_coordinator::runtime::build_coordinator_runtime(
+                &config.coordinator,
+                &config.storage,
+            )
+            .map_err(|e| anyhow::anyhow!("failed to build maintenance scheduler runtime: {e}"))?;
+            maintenance_handler_builder =
+                maintenance_handler_builder.with_runtime(maintenance_runtime);
+        }
+        let maintenance_handler = Arc::new(maintenance_handler_builder);
         let maintenance_scheduler = sqe_coordinator::maintenance_scheduler::MaintenanceScheduler::new(
             config.maintenance.clone(),
             maintenance_principal,

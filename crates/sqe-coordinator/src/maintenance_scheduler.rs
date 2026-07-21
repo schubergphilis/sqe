@@ -1,4 +1,5 @@
-//! Advisory auto-compaction scheduler loop (Phase 4a, Task 5).
+//! Advisory and active auto-compaction scheduler loop (Phase 4a Task 5,
+//! extended by Phase 4b's active-mode arm).
 //!
 //! `MaintenanceScheduler` ties together the earlier Phase 4a pieces into a
 //! background tick loop:
@@ -18,14 +19,20 @@
 //!   one write this subsystem performs: a best-effort append to the ledger
 //!   table. It is not a mutation of any *user* table.
 //!
-//! # Mutates nothing
+//! # Advisory mutates nothing; Active commits rewrites
 //!
-//! `advisory_tick` never rewrites, deletes, or otherwise commits against a
-//! discovered user table. It loads each table read-only (`load_table`,
-//! `collect_health_inputs`, `analyze_table_health`), then only *reports*:
-//! Prometheus gauges, an `AuditKind::Maintenance` event, and a best-effort
-//! `maintenance_log` row. The `[maintenance]` `Active` mode (real rewrites)
-//! is a later phase.
+//! In `Advisory` mode, `advisory_tick` never rewrites, deletes, or otherwise
+//! commits against a discovered user table. It loads each table read-only
+//! (`load_table`, `collect_health_inputs`, `analyze_table_health`), then only
+//! *reports*: Prometheus gauges, an `AuditKind::Maintenance` event, and a
+//! best-effort `maintenance_log` row.
+//!
+//! In `Active` mode (Phase 4b), `advisory_tick` delegates each due,
+//! opted-in table to `active_one_table` instead, which refreshes the
+//! maintenance session's token and commits a `rewrite_data_files` rewrite
+//! for that table through the scheduler's own `MaintenanceHandler`.
+//! `active_one_table` is the only place in this file that ever commits to
+//! a user table.
 //!
 //! # Off mode is total absence, not a runtime no-op
 //!
@@ -114,15 +121,16 @@ pub fn default_catalog_factory(
 /// `rewrite_data_files` code path `CALL system.rewrite_data_files` uses.
 ///
 /// `handler` is a dedicated `MaintenanceHandler` instance for the scheduler,
-/// not the one the interactive query path's `QueryHandler` owns: it needs
-/// its own DataFusion runtime (`with_runtime`, for sort/z-order compaction)
-/// and this scheduler never resolves a catalog through it (see
-/// `active_one_table`, which calls `handler.rewrite_data_files` with a
-/// catalog it already built via `catalog_factory`, bypassing
-/// `MaintenanceHandler::create_catalog_bridge` entirely). Building a second
-/// runtime does mean a second `FairSpillPool` instance competing for the
-/// same host memory as the query engine's; see the module docs for the
-/// tradeoff this accepts in Phase 4b.
+/// not the one the interactive query path's `QueryHandler` owns, and this
+/// scheduler never resolves a catalog through it (see `active_one_table`,
+/// which calls `handler.rewrite_data_files` with a catalog it already built
+/// via `catalog_factory`, bypassing `MaintenanceHandler::create_catalog_bridge`
+/// entirely). In `mode == Active` it also carries its own DataFusion runtime
+/// (`with_runtime`, for sort/z-order compaction); that is a second
+/// `FairSpillPool` instance competing for the same host memory as the query
+/// engine's, so the caller wires it in only when Active mode is configured
+/// (see `sqe_server.rs`). In `Advisory` mode `handler` is built without a
+/// runtime: the advisory arm never calls `handler.rewrite_data_files`.
 pub struct MaintenanceScheduler {
     cfg: MaintenanceConfig,
     principal: Arc<MaintenancePrincipal>,
@@ -151,27 +159,32 @@ impl MaintenanceScheduler {
         }
     }
 
-    /// One advisory pass: mint a session, discover tables under the default
+    /// One tick: mint a session, discover tables under the default
     /// warehouse (single-catalog in 4a), filter to those opted in via
-    /// `sqe.maintenance.enabled = 'true'`, analyze each due table, and emit
-    /// metrics/audit/log rows. Never mutates a user table.
+    /// `sqe.maintenance.enabled = 'true'`, and process each due table.
+    /// In `Advisory` mode this only reads and reports: it analyzes each due
+    /// table and emits metrics/audit/log rows, mutating nothing. In `Active`
+    /// mode each due table is instead delegated to `active_one_table`,
+    /// which refreshes the session's token and commits a rewrite for that
+    /// table.
     ///
     /// A failure discovering or loading one table (or a lower-level catalog
     /// hiccup while listing one namespace) is logged and skipped rather
     /// than aborting the whole tick: one bad table must not blind the
     /// scheduler to every other table's compaction debt.
     ///
-    /// Deliberately does not call `MaintenancePrincipal::refresh`. Task 2's
-    /// carried-forward warning is that a maintenance session's
-    /// `token_expiry()` is fabricated (`now + 1h`) and must never be
-    /// trusted for a long-running job that COMMITS. `advisory_tick` mints a
-    /// brand-new session at the top of every tick and only performs
-    /// read-only catalog calls plus one best-effort log append; a tick that
-    /// somehow runs past real token expiry degrades to a logged per-table
-    /// warning (or a warned, swallowed `maintenance_log` append failure),
-    /// not a silent wrong-privilege commit. The Active-mode rewrite path
-    /// (a later phase) is the one that must refresh unconditionally before
-    /// its commit.
+    /// `advisory_tick` itself deliberately does not call
+    /// `MaintenancePrincipal::refresh`. Task 2's carried-forward warning is
+    /// that a maintenance session's `token_expiry()` is fabricated
+    /// (`now + 1h`) and must never be trusted for a long-running job that
+    /// COMMITS. This function mints a brand-new session at the top of every
+    /// tick; in `Advisory` mode that session is only used for read-only
+    /// catalog calls plus one best-effort log append, so a tick that somehow
+    /// runs past real token expiry degrades to a logged per-table warning
+    /// (or a warned, swallowed `maintenance_log` append failure), not a
+    /// silent wrong-privilege commit. In `Active` mode, `active_one_table`
+    /// is the one that refreshes the token unconditionally before its
+    /// commit.
     pub async fn advisory_tick(&self) -> sqe_core::Result<()> {
         let job_id = uuid::Uuid::now_v7().to_string();
         let session = self.principal.mint_session(&job_id).await?;
