@@ -157,6 +157,7 @@
 - [Iceberg Caching Strategy](./design-notes/iceberg-caching-strategy.md)
 - [Change Data Capture](./design-notes/cdc.md)
 - [Merge-on-Read vs Copy-on-Write](./design-notes/mor-vs-cow.md)
+- [Distributed Compaction](./design-notes/distributed-compaction.md)
 - [Runtime Filter Pushdown](./design-notes/runtime-filter-pushdown.md)
 - [SSB SF1 Trace](./design-notes/ssb-sf1-trace.md)
 - [Quack Protocol](./design-notes/quack-protocol.md)
