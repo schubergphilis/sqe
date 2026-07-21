@@ -249,6 +249,14 @@ pub struct MetricsRegistry {
     /// with the fleet below `min_workers` -- specifically, without that
     /// signal being drowned out by routine no-debt skips.
     pub maintenance_skipped_total: IntCounterVec,
+    /// Active-mode table-ticks that observed another coordinator's live
+    /// `catalog` lease and skipped compacting this tick (Phase 4d Task 3).
+    /// Routine under multi-coordinator deployments -- NOT a
+    /// `sqe_maintenance_job_total{status="skipped"}` sample (no job was even
+    /// attempted, so there is nothing to log as a job), just a signal an
+    /// operator can use to confirm the lease is doing its job (avoiding
+    /// redundant rewrites) rather than every coordinator racing every tick.
+    pub maintenance_lease_skipped_total: IntCounter,
 }
 
 impl MetricsRegistry {
@@ -712,6 +720,13 @@ impl MetricsRegistry {
             &["reason"],
         )?;
 
+        // Phase 4d Task 3: catalog lease wiring.
+        let maintenance_lease_skipped_total = register_int_counter(
+            &registry,
+            "sqe_maintenance_lease_skipped_total",
+            "Active-mode table-ticks skipped because another coordinator holds the catalog lease",
+        )?;
+
         Ok(Self {
             registry,
             query_count,
@@ -783,6 +798,7 @@ impl MetricsRegistry {
             maintenance_job_total,
             maintenance_bytes_rewritten_total,
             maintenance_skipped_total,
+            maintenance_lease_skipped_total,
         })
     }
 }
