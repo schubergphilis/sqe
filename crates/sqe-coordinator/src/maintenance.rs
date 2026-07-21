@@ -1395,6 +1395,48 @@ impl MaintenanceHandler {
             tc.invalidate(&cache_key).await;
         }
 
+        // Same post-commit sanity check as the local path: reload and
+        // confirm the live file count matches expectation. Purely
+        // observability (a mismatch only warns, matching
+        // `rewrite_data_files_once`), but worth keeping identical here since
+        // it is the one place that would catch a catalog-state-propagation
+        // bug specific to the distributed commit path.
+        match catalog.load_table(&ident).await {
+            Ok(reloaded) => match collect_live_data_files(&reloaded).await {
+                Ok(live_files) => {
+                    let live_after = live_files.len();
+                    let expected_after =
+                        output_count + (input_count as i64 - old_files.len() as i64);
+                    info!(
+                        table = %ident,
+                        live_after,
+                        expected_after,
+                        "rewrite_data_files_distributed: post-commit verification"
+                    );
+                    if live_after as i64 != expected_after {
+                        warn!(
+                            table = %ident,
+                            live_after,
+                            expected_after,
+                            "rewrite_data_files_distributed: live file count after commit \
+                             does not match expectation"
+                        );
+                    }
+                }
+                Err(e) => warn!(
+                    table = %ident,
+                    error = %e,
+                    "rewrite_data_files_distributed: post-commit verification: failed to \
+                     collect live data files"
+                ),
+            },
+            Err(e) => warn!(
+                table = %ident,
+                error = %e,
+                "rewrite_data_files_distributed: post-commit verification: reload failed"
+            ),
+        }
+
         let rows_removed = (aggregated.removed_rows - aggregated.added_rows) as i64;
 
         Ok(RewriteOutcome {
