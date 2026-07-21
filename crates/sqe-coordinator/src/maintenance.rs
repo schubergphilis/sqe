@@ -122,18 +122,29 @@ impl MaintenanceHandler {
                 // no snapshot-property stamp. Job-identity stamping
                 // (`sqe.maintenance.job-id` / `.principal` / `.trigger`) is
                 // reserved for the Phase 4b scheduler's internal call path.
-                self.rewrite_data_files(
-                    session,
-                    table,
-                    *target_file_size_bytes,
-                    *min_input_files,
-                    *max_concurrent_file_group_rewrites,
-                    strategy.clone(),
-                    sort_order.clone(),
-                    *delete_file_threshold,
-                    None,
-                )
-                .await
+                //
+                // `rewrite_data_files`/`rewrite_data_files_once` take an
+                // already-resolved `catalog` (not a `Session`) so the Phase
+                // 4b scheduler can call them directly with the catalog it
+                // already built via its own `catalog_factory` seam, without
+                // going through `create_catalog_bridge` a second time.
+                let catalog = self
+                    .create_catalog_bridge(session, table.catalog.as_deref())
+                    .await?;
+                let outcome = self
+                    .rewrite_data_files(
+                        &catalog,
+                        table,
+                        *target_file_size_bytes,
+                        *min_input_files,
+                        *max_concurrent_file_group_rewrites,
+                        strategy.clone(),
+                        sort_order.clone(),
+                        *delete_file_threshold,
+                        None,
+                    )
+                    .await?;
+                Ok(vec![rewrite_outcome_batch(&to_table_ident(table), &outcome)?])
             }
             ProcedureCall::ExpireSnapshots {
                 table,
@@ -574,10 +585,28 @@ impl MaintenanceHandler {
     /// current snapshot: retrying with a stale pin would reopen the
     /// concurrent-equality-delete correctness hole. A failed attempt's orphaned
     /// output files are cleaned up by that attempt's `WriteCleanupGuard` on drop.
+    /// Delete-aware bin-pack rewrite with bounded conflict retry, over an
+    /// already-resolved `catalog`.
+    ///
+    /// `catalog` (rather than a `Session`) is the entry point so this method
+    /// -- and the retried-per-attempt `rewrite_data_files_once` beneath it --
+    /// can be called two ways that must reuse EXACTLY the same code:
+    ///
+    /// 1. `handle()`'s `RewriteDataFiles` arm builds `catalog` via
+    ///    `create_catalog_bridge` from the interactive session, for
+    ///    `CALL system.rewrite_data_files`.
+    /// 2. The Phase 4b active-mode scheduler (`maintenance_scheduler.rs`)
+    ///    builds `catalog` via its own `catalog_factory` seam from a minted
+    ///    maintenance `Session`, and passes `snapshot_properties` carrying
+    ///    the `sqe.maintenance.*` job-identity stamp -- something the manual
+    ///    CALL path never does (see the `handle()` comment above).
+    ///
+    /// `pub(crate)` (not private): the scheduler lives in a sibling module of
+    /// this crate, not a descendant of this one.
     #[allow(clippy::too_many_arguments)]
-    async fn rewrite_data_files(
+    pub(crate) async fn rewrite_data_files(
         &self,
-        session: &Session,
+        catalog: &Arc<dyn Catalog>,
         table_ref: &TableRef,
         target_file_size_bytes: Option<u64>,
         min_input_files: Option<usize>,
@@ -586,14 +615,14 @@ impl MaintenanceHandler {
         sort_order: Option<String>,
         delete_file_threshold: Option<usize>,
         snapshot_properties: Option<std::collections::HashMap<String, String>>,
-    ) -> sqe_core::Result<Vec<RecordBatch>> {
+    ) -> sqe_core::Result<RewriteOutcome> {
         const MAX_COMMIT_ATTEMPTS: usize = 4;
         let mut attempt: usize = 0;
         loop {
             attempt += 1;
             match self
                 .rewrite_data_files_once(
-                    session,
+                    catalog,
                     table_ref,
                     target_file_size_bytes,
                     min_input_files,
@@ -632,7 +661,7 @@ impl MaintenanceHandler {
     #[allow(clippy::too_many_arguments)]
     async fn rewrite_data_files_once(
         &self,
-        session: &Session,
+        catalog: &Arc<dyn Catalog>,
         table_ref: &TableRef,
         target_file_size_bytes: Option<u64>,
         min_input_files: Option<usize>,
@@ -641,7 +670,7 @@ impl MaintenanceHandler {
         sort_order: Option<String>,
         delete_file_threshold: Option<usize>,
         snapshot_properties: Option<std::collections::HashMap<String, String>>,
-    ) -> sqe_core::Result<Vec<RecordBatch>> {
+    ) -> sqe_core::Result<RewriteOutcome> {
         const DEFAULT_TARGET_FILE_SIZE_BYTES: u64 = 512 * 1024 * 1024;
         const DEFAULT_MIN_INPUT_FILES: usize = 5;
         const DEFAULT_MAX_CONCURRENT_GROUPS: usize = 4;
@@ -651,11 +680,8 @@ impl MaintenanceHandler {
         let max_concurrent =
             max_concurrent_file_group_rewrites.unwrap_or(DEFAULT_MAX_CONCURRENT_GROUPS);
 
-        let catalog = self
-            .create_catalog_bridge(session, table_ref.catalog.as_deref())
-            .await?;
         let ident = to_table_ident(table_ref);
-        let table = load_table(&catalog, &ident).await?;
+        let table = load_table(catalog, &ident).await?;
 
         // Delete-aware rewrite (Phase 2). Capture the current snapshot's
         // sequence number BEFORE any work: the rewritten data files are pinned
@@ -734,15 +760,16 @@ impl MaintenanceHandler {
                 min_input,
                 "rewrite_data_files: skipping, below min_input_files"
             );
-            return Ok(vec![summary_batch(
-                call_name_rewrite(),
-                &ident,
-                input_count as i64,
-                0,
-                total_bytes,
-                0,
-                "skipped: below min_input_files".to_string(),
-            )?]);
+            return Ok(RewriteOutcome {
+                files_in: input_count as i64,
+                files_out: 0,
+                bytes_in: total_bytes,
+                bytes_out: 0,
+                rows_removed: 0,
+                snapshot_id: None,
+                files_rewritten: 0,
+                skipped_reason: Some("below min_input_files".to_string()),
+            });
         }
 
         // Grouping strategy depends on whether we are sorting.
@@ -782,15 +809,16 @@ impl MaintenanceHandler {
                 input_count,
                 "rewrite_data_files: no groups meet min_input_files after packing"
             );
-            return Ok(vec![summary_batch(
-                call_name_rewrite(),
-                &ident,
-                input_count as i64,
-                0,
-                total_bytes,
-                0,
-                "skipped: no eligible groups".to_string(),
-            )?]);
+            return Ok(RewriteOutcome {
+                files_in: input_count as i64,
+                files_out: 0,
+                bytes_in: total_bytes,
+                bytes_out: 0,
+                rows_removed: 0,
+                snapshot_id: None,
+                files_rewritten: 0,
+                skipped_reason: Some("no eligible groups".to_string()),
+            });
         }
 
         info!(
@@ -946,11 +974,12 @@ impl MaintenanceHandler {
             .apply(tx)
             .map_err(|e| SqeError::Execution(format!("rewrite_files apply failed: {e}")))?;
 
-        tx_applied
+        let committed = tx_applied
             .commit(catalog.as_ref())
             .await
             .map_err(|e| classify_commit_error(e, "rewrite_data_files"))?;
         cleanup_guard.mark_committed();
+        let new_snapshot_id = committed.metadata().current_snapshot_id();
 
         // After the commit, invalidate the shared TableMetadataCache entry so
         // subsequent load_table calls (including the table_files TVF used by
@@ -998,15 +1027,24 @@ impl MaintenanceHandler {
         // alone keep their rows; rewritten files swap in equal-row replacements.
         let _ = total_input_rows; // tracked for observability
 
-        Ok(vec![summary_batch(
-            call_name_rewrite(),
-            &ident,
-            input_count as i64,
-            output_count,
-            total_bytes,
-            output_bytes,
-            format!("committed rewritten={}", old_files.len()),
-        )?])
+        // `rows_removed`: rows physically eliminated by this rewrite via
+        // delete application (removed_rows counts every row in the OLD
+        // files being replaced; added_rows counts what the writer actually
+        // emitted for the NEW files -- the gap is rows a covered delete
+        // dropped). The row-count invariant checked above guarantees
+        // added_rows <= removed_rows, so this never underflows.
+        let rows_removed = (removed_rows - added_rows) as i64;
+
+        Ok(RewriteOutcome {
+            files_in: input_count as i64,
+            files_out: output_count,
+            bytes_in: total_bytes,
+            bytes_out: output_bytes,
+            rows_removed,
+            snapshot_id: new_snapshot_id,
+            files_rewritten: old_files.len() as i64,
+            skipped_reason: None,
+        })
     }
 
     async fn expire_snapshots(
@@ -1389,6 +1427,64 @@ impl MaintenanceHandler {
 
 fn call_name_rewrite() -> &'static str {
     "rewrite_data_files"
+}
+
+/// Structured result of one `rewrite_data_files`/`rewrite_data_files_once`
+/// run. Both callers of that method need this:
+///
+/// - `handle()`'s `RewriteDataFiles` arm renders it into the `CALL`
+///   surface's generic `summary_batch` `RecordBatch` (see
+///   [`rewrite_outcome_batch`]).
+/// - The Phase 4b active-mode scheduler needs the individual counts
+///   directly to build a `maintenance_log` job row
+///   (`maintenance_log::success_row`), which a formatted summary string
+///   cannot losslessly round-trip (no `rows_removed` / `snapshot_id`
+///   columns in `summary_batch`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RewriteOutcome {
+    /// Live data files in the table before this run.
+    pub files_in: i64,
+    /// New data files this run wrote. `0` when `skipped_reason` is set.
+    pub files_out: i64,
+    /// Total bytes of `files_in`.
+    pub bytes_in: i64,
+    /// Total bytes of `files_out`. `0` when `skipped_reason` is set.
+    pub bytes_out: i64,
+    /// Rows eliminated by delete application during this rewrite (rows in
+    /// the replaced old files minus rows the writer re-emitted for the new
+    /// files). `0` when `skipped_reason` is set.
+    pub rows_removed: i64,
+    /// The snapshot id this run committed, if it committed one. `None` when
+    /// `skipped_reason` is set.
+    pub snapshot_id: Option<i64>,
+    /// Number of OLD input files this run actually replaced (a subset of
+    /// `files_in` restricted to eligible groups). `0` when `skipped_reason`
+    /// is set.
+    pub files_rewritten: i64,
+    /// Set (to a short human-readable reason) when the call committed
+    /// nothing: below `min_input_files`, or no eligible groups after
+    /// packing.
+    pub skipped_reason: Option<String>,
+}
+
+/// Render a [`RewriteOutcome`] into the generic `summary_batch` shape the
+/// `CALL system.rewrite_data_files` surface has always returned. Preserves
+/// the pre-refactor `status` text exactly: `"skipped: {reason}"` or
+/// `"committed rewritten={files_rewritten}"`.
+fn rewrite_outcome_batch(ident: &TableIdent, outcome: &RewriteOutcome) -> sqe_core::Result<RecordBatch> {
+    let status = match &outcome.skipped_reason {
+        Some(reason) => format!("skipped: {reason}"),
+        None => format!("committed rewritten={}", outcome.files_rewritten),
+    };
+    summary_batch(
+        call_name_rewrite(),
+        ident,
+        outcome.files_in,
+        outcome.files_out,
+        outcome.bytes_in,
+        outcome.bytes_out,
+        status,
+    )
 }
 
 /// Strip a single trailing `/` if present so two locations that differ only

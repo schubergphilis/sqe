@@ -233,6 +233,14 @@ pub struct MetricsRegistry {
     /// per-table analysis failure -- those are caught and logged, not
     /// counted here, so one bad table never inflates this counter).
     pub maintenance_tick_errors: IntCounter,
+    /// Active-mode compaction jobs, by terminal status
+    /// (`success`/`failed`/`skipped`). One increment per opted-in, due
+    /// table the active scheduler considered in a tick (Phase 4b).
+    pub maintenance_job_total: IntCounterVec,
+    /// Bytes written by active-mode compaction's output files, summed
+    /// across all successful jobs (Phase 4b). Never incremented for
+    /// `failed`/`skipped` jobs, which write nothing.
+    pub maintenance_bytes_rewritten_total: IntCounter,
 }
 
 impl MetricsRegistry {
@@ -674,6 +682,20 @@ impl MetricsRegistry {
             "Advisory/active scheduler tick failures (whole-tick errors, not per-table)",
         )?;
 
+        // Phase 4b active-mode autonomous compaction.
+        let maintenance_job_total = register_int_counter_vec(
+            &registry,
+            "sqe_maintenance_job_total",
+            "Active-mode compaction jobs, by terminal status (success/failed/skipped)",
+            &["status"],
+        )?;
+
+        let maintenance_bytes_rewritten_total = register_int_counter(
+            &registry,
+            "sqe_maintenance_bytes_rewritten_total",
+            "Bytes written by active-mode compaction's output files, summed across successful jobs",
+        )?;
+
         Ok(Self {
             registry,
             query_count,
@@ -742,6 +764,8 @@ impl MetricsRegistry {
             table_delete_files,
             maintenance_est_rewrite_bytes,
             maintenance_tick_errors,
+            maintenance_job_total,
+            maintenance_bytes_rewritten_total,
         })
     }
 }

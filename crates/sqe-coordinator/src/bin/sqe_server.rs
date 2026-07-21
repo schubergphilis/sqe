@@ -1086,12 +1086,34 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
             config.clone(),
             Some(table_cache.clone()),
         );
+        // Dedicated `MaintenanceHandler` for the scheduler's active-mode arm
+        // (Phase 4b), separate from the one `QueryHandler` builds for the
+        // interactive `CALL system.rewrite_data_files` path below. It needs
+        // its own DataFusion runtime so a per-table `strategy => "sort"`
+        // override can spill instead of OOMing; that means a second
+        // `FairSpillPool` competing for host memory alongside the query
+        // engine's, which is an accepted Phase 4b tradeoff (this handler is
+        // only reachable when `[maintenance] mode = "active"` AND at least
+        // one table opts in). The scheduler never resolves a catalog
+        // through this handler's own `create_catalog_bridge`; it always
+        // passes in a catalog it already built via `catalog_factory` (see
+        // `maintenance_scheduler.rs::active_one_table`).
+        let maintenance_runtime =
+            sqe_coordinator::runtime::build_coordinator_runtime(&config.coordinator, &config.storage)
+                .map_err(|e| anyhow::anyhow!("failed to build maintenance scheduler runtime: {e}"))?;
+        let maintenance_handler = Arc::new(
+            sqe_coordinator::maintenance::MaintenanceHandler::new(config.clone())
+                .with_runtime(maintenance_runtime)
+                .with_table_cache(table_cache.clone())
+                .with_audit(Arc::clone(&audit)),
+        );
         let maintenance_scheduler = sqe_coordinator::maintenance_scheduler::MaintenanceScheduler::new(
             config.maintenance.clone(),
             maintenance_principal,
             metrics.clone(),
             Some(audit.clone()),
             catalog_factory,
+            maintenance_handler,
         );
         if config.maintenance.scheduler.enabled {
             _task_guards.push(maintenance_scheduler.spawn());
