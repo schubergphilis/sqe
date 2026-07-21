@@ -1,3 +1,15 @@
+//! Expected-vs-actual comparison and the per-query outcome taxonomy.
+//!
+//! This module owns two related things:
+//!   1. The SQE-vs-expected-CSV comparator (`CompareStatus`, `compare_results`,
+//!      `load_expected`) -- moved here verbatim from the crate's former
+//!      `compare.rs`/`test.rs` split.
+//!   2. The richer `QueryOutcome` taxonomy layered on top of it, plus the
+//!      `legacy_bucket`/`is_real_failure` mappings that keep the stable
+//!      `BENCH_SUMMARY` line and JSON schema byte-compatible while letting
+//!      the run loop (`test.rs`) and exit code (`run.rs`) treat
+//!      timeouts/vacuous results distinctly.
+
 use arrow_array::{
     cast::AsArray, Array, Float32Array, Float64Array, RecordBatch,
 };
@@ -269,6 +281,84 @@ fn detect_float_columns(batches: &[RecordBatch], headers: &[String]) -> Vec<bool
     }
 }
 
+/// Try to load the expected results CSV for a query.
+///
+/// Returns `Ok(None)` when the file does not exist (query runs without
+/// validation), `Ok(Some(content))` when found, and `Err` for I/O errors.
+pub fn load_expected(benchmark: &str, scale: f64, query_id: &str) -> anyhow::Result<Option<String>> {
+    let path = format!("benchmarks/expected/{benchmark}/sf{scale}/{query_id}.csv");
+    match std::fs::read_to_string(&path) {
+        Ok(content) => Ok(Some(content)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// QueryOutcome taxonomy
+// ---------------------------------------------------------------------------
+
+/// Per-query outcome, richer than the legacy 5 report buckets so the human
+/// summary and the run's exit code can treat timeouts and vacuous results
+/// distinctly. Mapped back to the legacy buckets by `legacy_bucket` for the
+/// stable `BENCH_SUMMARY` line and JSON schema.
+#[derive(Debug, Clone, PartialEq)]
+pub enum QueryOutcome {
+    Pass,
+    WrongRows(String),
+    Error(String),
+    Timeout(u64),
+    /// Produced by the suite driver (`suite.rs`), not `classify_vs_expected`
+    /// itself: a zero-row result that classifies `Pass` only because there is
+    /// no expected file to compare against is vacuous, not a real pass.
+    Vacuous,
+    Diff(String),
+    Skip(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LegacyBucket { Pass, Fail, Diff, Skip, Error }
+
+/// The run fails only on genuine correctness/execution failures. Timeouts and
+/// vacuous results are surfaced but do not fail the run (see SP1 design).
+pub fn is_real_failure(o: &QueryOutcome) -> bool {
+    matches!(o, QueryOutcome::Error(_) | QueryOutcome::WrongRows(_))
+}
+
+/// Collapse a `QueryOutcome` onto the five legacy report buckets so the
+/// `BENCH_SUMMARY` line and JSON `summary` stay byte-compatible. Timeout folds
+/// into Error exactly as the pre-refactor code did (it built
+/// `TestStatus::Error("Timed out ...")`); Vacuous folds into Pass.
+pub fn legacy_bucket(o: &QueryOutcome) -> LegacyBucket {
+    match o {
+        QueryOutcome::Pass | QueryOutcome::Vacuous => LegacyBucket::Pass,
+        QueryOutcome::WrongRows(_) => LegacyBucket::Fail,
+        QueryOutcome::Diff(_) => LegacyBucket::Diff,
+        QueryOutcome::Skip(_) => LegacyBucket::Skip,
+        QueryOutcome::Error(_) | QueryOutcome::Timeout(_) => LegacyBucket::Error,
+    }
+}
+
+/// Classify an executed SQE result against the expected-rows manifest.
+/// Mirrors the pre-refactor logic in `run_benchmark_test`.
+pub fn classify_vs_expected(
+    benchmark: &str,
+    scale: f64,
+    id: &str,
+    batches: &[RecordBatch],
+) -> QueryOutcome {
+    match load_expected(benchmark, scale, id) {
+        Ok(Some(expected)) => match compare_results(batches, &expected, 1e-4) {
+            Ok(CompareStatus::Pass) => QueryOutcome::Pass,
+            Ok(CompareStatus::Diff(m)) => QueryOutcome::Diff(m),
+            Ok(CompareStatus::Fail(m)) => QueryOutcome::WrongRows(m),
+            Err(e) => QueryOutcome::Error(format!("compare error: {e}")),
+        },
+        Ok(None) => QueryOutcome::Pass,
+        Err(e) => QueryOutcome::Error(format!("failed to load expected: {e}")),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Unit tests
 // ---------------------------------------------------------------------------
@@ -417,5 +507,36 @@ mod tests {
         let csv = "amount\n123.45\n";
         let result = compare_results(&[batch], csv, 1e-4).unwrap();
         assert!(matches!(result, CompareStatus::Pass), "trailing zeros should match: {result:?}");
+    }
+}
+
+#[cfg(test)]
+mod outcome_tests {
+    use super::*;
+
+    #[test]
+    fn is_real_failure_only_error_and_wrongrows() {
+        assert!(is_real_failure(&QueryOutcome::Error("x".into())));
+        assert!(is_real_failure(&QueryOutcome::WrongRows("x".into())));
+        for o in [
+            QueryOutcome::Pass,
+            QueryOutcome::Timeout(60),
+            QueryOutcome::Vacuous,
+            QueryOutcome::Diff("x".into()),
+            QueryOutcome::Skip("x".into()),
+        ] {
+            assert!(!is_real_failure(&o), "{o:?} must not be a real failure");
+        }
+    }
+
+    #[test]
+    fn legacy_bucket_maps_new_variants_onto_five() {
+        assert_eq!(legacy_bucket(&QueryOutcome::Pass), LegacyBucket::Pass);
+        assert_eq!(legacy_bucket(&QueryOutcome::Vacuous), LegacyBucket::Pass);
+        assert_eq!(legacy_bucket(&QueryOutcome::WrongRows("x".into())), LegacyBucket::Fail);
+        assert_eq!(legacy_bucket(&QueryOutcome::Diff("x".into())), LegacyBucket::Diff);
+        assert_eq!(legacy_bucket(&QueryOutcome::Skip("x".into())), LegacyBucket::Skip);
+        assert_eq!(legacy_bucket(&QueryOutcome::Error("x".into())), LegacyBucket::Error);
+        assert_eq!(legacy_bucket(&QueryOutcome::Timeout(60)), LegacyBucket::Error);
     }
 }

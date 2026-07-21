@@ -1,7 +1,7 @@
 mod cli;
 mod client;
-mod compare;
 mod comparison;
+mod execute;
 mod generate;
 mod load;
 mod profile;
@@ -21,8 +21,11 @@ pub fn format_scale(scale: f64) -> String {
 pub fn bench_namespace(benchmark: &str, scale: f64) -> String {
     format!("{}_sf{}", benchmark, format_scale(scale))
 }
+mod query;
 mod report;
 mod run;
+mod status;
+mod suite;
 mod test;
 
 use clap::Parser;
