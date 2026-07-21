@@ -494,8 +494,13 @@ async fn rollback_ctas_partial_create(
 ///
 /// Backoff: exponential with jitter, capped at ~1s base. After `max_attempts`
 /// the last error propagates unchanged so the caller's error-mapping still runs.
+/// `pub(crate)` so `maintenance_log::append_row` can reuse it too: the
+/// ledger table is also the multi-coordinator lease table
+/// (`MaintenanceSchedulerConfig::lease = Catalog`), so append commits need
+/// the same retry-on-conflict behavior as any other writer, not a
+/// single-shot commit.
 #[tracing::instrument(skip(catalog, build_and_commit), fields(table = %table_ident, op = %op), name = "sqe.write_commit")]
-async fn commit_with_retry<F, Fut>(
+pub(crate) async fn commit_with_retry<F, Fut>(
     catalog: &dyn Catalog,
     table_ident: &TableIdent,
     op: &str,

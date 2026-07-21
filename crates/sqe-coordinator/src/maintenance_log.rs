@@ -70,7 +70,13 @@
 //! [`append_row`] does not hand-roll an Iceberg transaction. It reuses the
 //! same append machinery `INSERT INTO` uses in `write_handler.rs`:
 //! `crate::writer::write_data_files` turns the one-row `RecordBatch` into a
-//! Parquet data file, and a plain `Transaction::fast_append` commits it.
+//! Parquet data file, and `crate::write_handler::commit_with_retry` commits
+//! a `Transaction::fast_append` with the same backoff-and-retry-on-conflict
+//! behavior every other writer gets. That matters here specifically because
+//! `sqe_system.maintenance_log` is also the multi-coordinator lease table
+//! (`MaintenanceSchedulerConfig::lease = Catalog`): more than one coordinator
+//! can commit to it around the same time, so a single-shot commit would
+//! surface routine conflicts as `Err` instead of retrying past them.
 //! `crate::writer::WriteCleanupGuard` cleans up the written Parquet file if
 //! the commit never lands (e.g. the process is killed between write and
 //! commit).
@@ -88,6 +94,7 @@ use sqe_core::SqeError;
 
 use crate::catalog_ops::is_namespace_not_found;
 use crate::table_health::TableHealth;
+use crate::write_handler::commit_with_retry;
 use crate::writer::{new_upload_tracker, parse_parquet_compression, write_data_files, WriteCleanupGuard};
 
 /// Default `ns.table` for the ledger, matching
@@ -131,12 +138,16 @@ pub struct MaintenanceLogRow {
 ///
 /// An advisory row reports compaction debt without rewriting anything, so
 /// it has no real "job" duration: `started_at_ms` and `finished_at_ms` are
-/// both `ts_ms`. `files_in` mirrors `health.live_data_files` (the table's
-/// total live file count); `bytes_in` mirrors `health.est_rewrite_bytes`
-/// (the estimated bytes a real rewrite would touch), because that is the
-/// debt signal an advisory row exists to surface, not the table's total
-/// size. `files_out` / `bytes_out` / `rows_removed` are `0` and
-/// `snapshot_id` / `error` are `None`: no rewrite happened.
+/// both `ts_ms`. `files_in` and `bytes_in` deliberately describe the SAME
+/// scope, the table's total live footprint (`health.live_data_files` /
+/// `health.avg_file_bytes * health.live_data_files`), so `bytes_in /
+/// files_in` in this generic ledger is a meaningful average file size
+/// rather than mixing a total file count against a debt-subset byte count.
+/// The richer debt signal (`health.eligible_groups` /
+/// `health.est_rewrite_bytes`, the bytes a rewrite would actually touch)
+/// belongs to `CALL system.table_health`, not this fixed-shape ledger row.
+/// `files_out` / `bytes_out` / `rows_removed` are `0` and `snapshot_id` /
+/// `error` are `None`: no rewrite happened.
 pub fn advisory_row(table: &str, principal: &str, health: &TableHealth, ts_ms: i64) -> MaintenanceLogRow {
     MaintenanceLogRow {
         job_id: Uuid::now_v7().to_string(),
@@ -148,7 +159,7 @@ pub fn advisory_row(table: &str, principal: &str, health: &TableHealth, ts_ms: i
         status: "advisory".to_string(),
         files_in: health.live_data_files as i64,
         files_out: 0,
-        bytes_in: health.est_rewrite_bytes as i64,
+        bytes_in: (health.avg_file_bytes * health.live_data_files) as i64,
         bytes_out: 0,
         rows_removed: 0,
         snapshot_id: None,
@@ -287,14 +298,24 @@ pub async fn append_row(
         return Ok(());
     }
 
-    let tx = Transaction::new(&table);
-    let action = tx.fast_append().add_data_files(data_files);
-    let tx = action
-        .apply(tx)
-        .map_err(|e| SqeError::Execution(format!("maintenance_log: fast_append apply failed: {e}")))?;
-    tx.commit(catalog.as_ref())
-        .await
-        .map_err(|e| SqeError::Execution(format!("maintenance_log: commit failed: {e}")))?;
+    // commit_with_retry re-loads the table fresh on each attempt and retries
+    // past retryable conflicts (see the module docs: this ledger is also the
+    // multi-coordinator lease table, so concurrent commits are expected, not
+    // exceptional).
+    let files_for_retry = data_files;
+    let catalog_for_commit = catalog.clone();
+    commit_with_retry(catalog.as_ref(), &ident, "maintenance-log-append", move |fresh_table| {
+        let files = files_for_retry.clone();
+        let cat = catalog_for_commit.clone();
+        async move {
+            let tx = Transaction::new(&fresh_table);
+            let action = tx.fast_append().add_data_files(files);
+            let tx = action.apply(tx)?;
+            tx.commit(cat.as_ref()).await
+        }
+    })
+    .await
+    .map_err(|e| SqeError::Execution(format!("maintenance_log: failed to commit append: {e}")))?;
     cleanup_guard.mark_committed();
 
     Ok(())
@@ -334,10 +355,18 @@ mod tests {
     }
 
     #[test]
-    fn advisory_row_maps_bytes_in_from_est_rewrite_bytes() {
+    fn advisory_row_maps_bytes_in_from_total_footprint_not_debt_subset() {
+        // bytes_in must be the same scope as files_in (total live footprint),
+        // not health.est_rewrite_bytes (only the eligible-group subset) --
+        // otherwise bytes_in / files_in in the ledger is not a meaningful
+        // average file size.
         let health = sample_health();
         let row = advisory_row("ns.t", "svc", &health, 1_000);
-        assert_eq!(row.bytes_in, health.est_rewrite_bytes as i64);
+        assert_eq!(row.bytes_in, (health.avg_file_bytes * health.live_data_files) as i64);
+        assert_ne!(
+            row.bytes_in, health.est_rewrite_bytes as i64,
+            "sample_health's est_rewrite_bytes must differ from the total footprint for this test to be meaningful"
+        );
     }
 
     #[test]
