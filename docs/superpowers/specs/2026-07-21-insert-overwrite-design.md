@@ -175,6 +175,14 @@ not behind it. Parity is not a blocker for this MR.
   start; the existing paths remain #376's scope.
 - Trino wire-parity harness run (depends on Trino accepting the syntax).
 
+## Known limitations
+
+- Dynamic-partition matching compares partition `Struct` values directly, which
+  is not partition-spec-evolution aware: if a table's partition spec evolved,
+  two structurally-equal partition values written under different specs could be
+  treated as the same partition. This is an unusual scenario and out of scope
+  for this change; the common stable-spec case is correct and tested.
+
 ## Acceptance criteria
 
 - `INSERT OVERWRITE … SELECT` replaces (not appends) data; verified by
