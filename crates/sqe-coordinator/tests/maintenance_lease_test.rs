@@ -69,6 +69,7 @@ async fn first_ever_claim_bootstraps_and_is_acquired() {
     assert_eq!(handle.holder_id, "holder-1");
     assert_eq!(handle.expires_at_ms, 1_000 + 60_000);
     assert!(!handle.claim_path.is_empty());
+    assert_eq!(handle.stolen_from, None, "a first-ever (non-steal) claim must not carry a stolen_from");
 }
 
 #[tokio::test]
@@ -109,6 +110,7 @@ async fn same_holder_reacquiring_its_own_live_claim_is_idempotent() {
     // what `renew` is for).
     assert_eq!(h1_again.claim_path, h1.claim_path);
     assert_eq!(h1_again.expires_at_ms, h1.expires_at_ms);
+    assert_eq!(h1_again.stolen_from, None, "OwnLive is never a steal");
 }
 
 #[tokio::test]
@@ -159,6 +161,10 @@ async fn expired_lease_is_steal_acquirable() {
         .expect("holder-2 must be able to steal an expired lease");
     assert_eq!(stolen.holder_id, "holder-2");
     assert_eq!(stolen.expires_at_ms, 2_000 + 60_000);
+    // Phase 4d Task 3: a steal surfaces the previous holder on the returned
+    // handle (`stolen_from`), so a caller (the scheduler's audit emission)
+    // can tell a steal apart from a routine acquire without re-deriving it.
+    assert_eq!(stolen.stolen_from.as_deref(), Some("holder-1"));
 }
 
 #[tokio::test]

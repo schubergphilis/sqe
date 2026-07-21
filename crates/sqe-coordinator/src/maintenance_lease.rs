@@ -130,12 +130,24 @@ pub fn generate_holder_id() -> String {
 /// A held (or just-acquired) lease. `claim_path` is the live data file
 /// backing this claim in `maintenance_log` -- the exact file [`renew`] and
 /// [`release`] must delete-and-replace to keep the CAS chain unbroken.
+///
+/// `stolen_from` (Phase 4d Task 3) is `Some(previous_holder_id)` only when
+/// THIS acquisition won the claim by stealing an expired lease from a
+/// different holder (see [`AcquireDecision::Acquirable`]'s `stolen_from`);
+/// it is `None` for a fresh claim (no prior row), a re-acquire of an
+/// already-released row, or an idempotent re-acquire of this same holder's
+/// own still-live claim ([`AcquireDecision::OwnLive`]). Exists so a caller
+/// (the scheduler's audit emission) can tell a steal apart from a routine
+/// acquire without re-deriving it -- [`try_acquire`] already computed this
+/// exact distinction internally (see its own `info!` log on a steal) but
+/// previously did not surface it past that log line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LeaseHandle {
     pub job_key: String,
     pub holder_id: String,
     pub expires_at_ms: i64,
     pub claim_path: String,
+    pub stolen_from: Option<String>,
 }
 
 /// The pure, catalog-free view of "the latest lease row for one `job_key`"
@@ -486,6 +498,7 @@ pub async fn try_acquire(
                     holder_id: holder_id.to_string(),
                     expires_at_ms: state.expires_at_ms,
                     claim_path: state.claim_path,
+                    stolen_from: None,
                 }));
             }
             AcquireDecision::Acquirable { stolen_from } => {
@@ -509,6 +522,7 @@ pub async fn try_acquire(
                             holder_id: holder_id.to_string(),
                             expires_at_ms,
                             claim_path: new_path,
+                            stolen_from: stolen_from.clone(),
                         }));
                     }
                     CasOutcome::Lost => return Ok(None),

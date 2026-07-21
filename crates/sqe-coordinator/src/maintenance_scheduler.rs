@@ -651,13 +651,18 @@ impl MaintenanceScheduler {
                 {
                     Ok(Some(handle)) => {
                         if let Some(audit) = &self.audit {
-                            audit.log_event(build_lease_audit_event(
-                                ident,
-                                &self.principal.user_id,
-                                &job_id,
-                                "acquired",
-                                &handle,
-                            ));
+                            // A steal (this acquire won by claiming a
+                            // DIFFERENT holder's expired lease) is audited as
+                            // its own distinct action, not folded into a
+                            // plain "acquired" event -- "acquire / steal /
+                            // release" are three things the brief asks to be
+                            // able to tell apart in the audit trail, and
+                            // `LeaseHandle::stolen_from` (Task 2's
+                            // `try_acquire`, surfaced for exactly this) is
+                            // what makes that possible without re-deriving
+                            // it here.
+                            let action = if handle.stolen_from.is_some() { "stolen" } else { "acquired" };
+                            audit.log_event(build_lease_audit_event(ident, &self.principal.user_id, &job_id, action, &handle));
                         }
                         Some(handle)
                     }
@@ -1170,11 +1175,15 @@ fn build_skipped_audit_event(
     }
 }
 
-/// Build the `AuditKind::Maintenance` event for a catalog HA lease acquire
-/// or release (Phase 4d Task 3). Distinct from the job-outcome events above:
-/// this fires around the lease bookkeeping itself (`action` is `"acquired"`
-/// or `"released"`), independent of whether the rewrite it protects goes on
-/// to succeed, fail, or (in the `Ok(None)` "held by another coordinator"
+/// Build the `AuditKind::Maintenance` event for a catalog HA lease acquire,
+/// steal, or release (Phase 4d Task 3). Distinct from the job-outcome events
+/// above: this fires around the lease bookkeeping itself (`action` is
+/// `"acquired"`, `"stolen"`, or `"released"` -- the caller picks `"stolen"`
+/// over `"acquired"` when `handle.stolen_from.is_some()`, and this function
+/// always appends `stolen_from=<prev holder>` to the text when it is set,
+/// regardless of `action`, so a steal is identifiable even on its later
+/// `"released"` event), independent of whether the rewrite it protects goes
+/// on to succeed, fail, or (in the `Ok(None)` "held by another coordinator"
 /// case, which never reaches this function at all -- see `active_one_table`)
 /// isn't attempted this tick.
 fn build_lease_audit_event(
@@ -1205,10 +1214,16 @@ fn build_lease_audit_event(
         timing: None,
         stats: None,
         query: Some(sqe_metrics::audit::QueryInfo {
-            text: Some(format!(
-                "active_tick: catalog lease {action}: holder={} expires_at_ms={}",
-                handle.holder_id, handle.expires_at_ms
-            )),
+            text: Some(match &handle.stolen_from {
+                Some(prev) => format!(
+                    "active_tick: catalog lease {action}: holder={} expires_at_ms={} stolen_from={prev}",
+                    handle.holder_id, handle.expires_at_ms
+                ),
+                None => format!(
+                    "active_tick: catalog lease {action}: holder={} expires_at_ms={}",
+                    handle.holder_id, handle.expires_at_ms
+                ),
+            }),
             query_hash: sqe_metrics::audit::query_hash(&format!("maintenance-lease-{action}:{}", ident)),
             statement_type: "maintenance_lease".to_string(),
         }),
