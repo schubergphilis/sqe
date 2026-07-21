@@ -531,11 +531,67 @@ cron fire time exactly, but the cron schedule is still parsed and
 enforced as normal. A table is never treated as always-due just because
 its jitter is zero.
 
-`lease` is the double-fire guard for multi-coordinator deployments:
-`"catalog"` (default) claims a lease row in the state table, `"none"` runs
-unleased and requires `single_scheduler_acknowledged = true`, `"kubernetes"`
-is a later-phase backend. `tick_secs` and `lease_ttl_secs` must both be
-greater than zero; either at zero fails validation.
+### The lease ladder
+
+`lease` is the double-fire guard for multi-coordinator deployments: which
+backend (if any) the scheduler uses to keep two coordinators from both
+compacting the same table in the same window. Three settings:
+
+- `"none"`. No lease. Fine for a single-coordinator deployment, and only
+  for one: validation rejects `scheduler.enabled = true` with
+  `lease = "none"` unless `single_scheduler_acknowledged = true` is also
+  set, an explicit operator opt-in rather than a silent default. Running
+  the in-process scheduler unleased against more than one coordinator can
+  make them both dispatch a rewrite for the same table at once; see
+  "Multi-coordinator HA" below for why that wastes work rather than
+  corrupting data.
+- `"catalog"` (default). Before dispatching the one expensive step of a
+  tick, the rewrite itself, the scheduler claims a lease row in
+  `state_table` (`sqe_system.maintenance_log`). A coordinator that finds
+  the lease already held by another holder skips its tick for that table.
+  `lease_ttl_secs` (default 300) bounds how long a crashed holder's claim
+  stays valid: past the TTL with no renewal, the next coordinator to check
+  steals the expired lease instead of waiting forever. Claiming and
+  releasing the lease each commit a row to `state_table`, so catalog mode
+  costs a couple of extra state-table commits per due table per tick
+  beyond `lease = "none"`. A single-coordinator deployment that does not
+  need the guard can set `lease = "none"` (with
+  `single_scheduler_acknowledged = true`) to skip that overhead.
+- `"kubernetes"`. Not implemented in this release. Validation rejects it
+  outright when `scheduler.enabled = true`, naming `"catalog"` (works
+  today for multi-coordinator HA) or `"none"` (single-coordinator only)
+  as the settings that actually start. Reserved for a future Kubernetes
+  `Lease`-object backend.
+
+`tick_secs` and `lease_ttl_secs` must both be greater than zero; either at
+zero fails validation.
+
+### Multi-coordinator HA
+
+Two supported ways to run the maintenance subsystem safely across more
+than one coordinator:
+
+- Set `scheduler.enabled = true` with `lease = "catalog"` (the default)
+  on every coordinator. Each one ticks independently against the same
+  cron schedule and the same tables; the catalog lease arbitrates so only
+  one of them actually dispatches a rewrite for a given table in a given
+  window, and the others skip that tick for that table.
+- Leave `scheduler.enabled = false` on every coordinator and drive timing
+  externally instead: a Kubernetes `CronJob` with
+  `concurrencyPolicy: Forbid` that issues the maintenance `CALL` (e.g.
+  `CALL system.rewrite_data_files(...)`) on its own schedule.
+  `concurrencyPolicy: Forbid` guarantees the CronJob itself never overlaps
+  its own runs, so this shape is HA-safe with no internal lease at all:
+  there is only ever one caller in flight.
+
+Neither shape depends on the lease for correctness. If a lease operation
+fails, or two coordinators somehow compact the same table concurrently
+anyway, Iceberg's optimistic-concurrency commit still guarantees exactly
+one of them wins; the other re-plans against the winner's new snapshot and
+finds a no-op. The lease only avoids paying for the loser's redundant scan
+and rewrite. See
+[Distributed compaction](../design-notes/distributed-compaction.md#multi-coordinator-ha-the-lease-is-an-efficiency-layer-not-a-correctness-mechanism)
+for the full argument.
 
 ### Per-table overrides
 
@@ -734,6 +790,7 @@ SQE validates config at startup and fails fast on errors:
 - `maintenance.mode` other than `"off"` requires a `[maintenance.principal]` block
 - `maintenance.scheduler.tick_secs` and `maintenance.scheduler.lease_ttl_secs` must both be greater than zero
 - `maintenance.scheduler.enabled = true` with `lease = "none"` requires `single_scheduler_acknowledged = true`
+- `maintenance.scheduler.enabled = true` with `lease = "kubernetes"` is rejected outright (not implemented; use `"catalog"` or `"none"`)
 
 ## Priority Order
 

@@ -169,6 +169,56 @@ output from other failure paths. Correctness comes from never committing
 a stale plan; cleanup of writes that turned out to be unneeded is a
 separate, deliberately decoupled concern.
 
+## Multi-coordinator HA: the lease is an efficiency layer, not a correctness mechanism
+
+Phase 4d adds a multi-coordinator HA lease
+(`crates/sqe-coordinator/src/maintenance_lease.rs`) so that when more than
+one coordinator runs the maintenance scheduler
+(`maintenance.scheduler.lease = "catalog"`, see
+[Configuration](../deployment/configuration.md)), only one of them
+dispatches a rewrite for a given table in a given tick. The lease is a row
+appended to `sqe_system.maintenance_log`, claimed with an Iceberg
+optimistic-concurrency commit
+(`Transaction::rewrite_files().delete_files([current_claim]).add_data_files([new_claim]).set_check_file_existence(true)`)
+immediately before the scheduler dispatches the one expensive step of a
+tick, the rewrite itself, and released the same way after. A coordinator
+that finds the lease already held by a live holder skips its tick for that
+table rather than attempting the rewrite at all.
+
+State the invariant plainly: this lease is an efficiency layer, not a
+correctness mechanism. Correctness against two coordinators double-
+compacting the same table is already established above, in "Commit-
+conflict retries": the coordinator that owns a rewrite job commits it with
+`Transaction::rewrite_files()`, pinned to the snapshot it read and gated
+by `set_check_file_existence(true)`. If two coordinators ever plan and
+dispatch a rewrite for the same table at the same time, whether because
+the lease was never configured (`lease = "none"`), a lease operation
+failed and the scheduler proceeded unleased rather than blocking an
+otherwise-eligible compaction, or a lease was legitimately stolen mid-job,
+exactly one commit still wins. The loser's commit hits a file-existence
+check against files the winner already deleted, fails as a non-retryable
+conflict, and that coordinator's job ends having modified nothing. Nothing
+about the lease's presence, absence, or failure changes this outcome. The
+lease exists only to stop a second coordinator from paying for the loser's
+redundant scan, delete-apply, and re-encode work when Iceberg would have
+discarded that work anyway.
+
+A holder crash mid-job is the same guarantee working the other way.
+Because the rewrite is one atomic Iceberg commit, a coordinator that dies
+mid-scan or mid-write has committed nothing: the table is untouched. The
+lease it held simply outlives it until `lease_ttl_secs` (default 300s)
+elapses, at which point the next coordinator to check the lease finds the
+claim expired and steals it. No cleanup or reconciliation step is required
+against the table itself; the only "recovery" is the next coordinator
+picking the table back up on its own next due tick. (The lease's very
+first claim for a brand-new table has no existing lease row to
+compare-and-swap against and uses an unprotected append instead, so two
+coordinators racing that one first-ever claim can both succeed; every
+claim after that is fully exclusive. That first-claim race is a documented,
+accepted gap in the lease's own exclusivity, not a gap in table
+correctness: the Iceberg commit above still decides the table outcome
+regardless.)
+
 ## What stays the same as the local path
 
 The worker-side rewrite calls the exact same primitive the coordinator's
