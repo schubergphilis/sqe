@@ -92,12 +92,15 @@ impl MaintenancePrincipal {
             token_expiry,
             identity.roles.clone(),
         )
-        .with_identity(identity.subject.clone(), identity.email.clone(), identity.groups.clone());
+        .with_identity(identity.subject.clone(), identity.email.clone(), identity.groups.clone())
+        // Explicit in-engine write-authority marker (Phase 4b). Set here,
+        // once, by the maintenance principal's own minting path only.
+        // `MaintenanceHandler::authorize_or_deny` honors this independent
+        // of the role-name heuristic so autonomous compaction is authorized
+        // by design, not by accident of "unknown role defaults to allow".
+        // Polaris still enforces authorization server-side.
+        .with_maintenance_authority(true);
 
-        // TODO(4b): explicit write-authority marker. `Session` has no
-        // internal/maintenance flag yet; policy enforcement for the
-        // maintenance identity relies on the roles/user_id configured for
-        // the Polaris principal until that marker lands.
         session.id = format!("maintenance-job-{job_id}");
         session
     }
@@ -220,6 +223,17 @@ mod tests {
         let session = MaintenancePrincipal::session_from_identity(&identity, "job-1");
         assert_eq!(session.user.username, "svc-sqe-maintenance");
         assert_eq!(session.access_token().expose(), "fake-token");
+    }
+
+    #[test]
+    fn session_from_identity_carries_maintenance_authority() {
+        // Even though `fake_identity` sets a plain "maintenance" role (not a
+        // "write"/"admin"-named one), the minted session must carry the
+        // explicit maintenance-authority marker so it passes the write gate
+        // independent of the role-name heuristic.
+        let identity = fake_identity("svc-sqe-maintenance");
+        let session = MaintenancePrincipal::session_from_identity(&identity, "job-9");
+        assert!(session.has_maintenance_authority());
     }
 
     #[test]
