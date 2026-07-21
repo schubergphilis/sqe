@@ -83,6 +83,21 @@ struct PendingGroup {
     excluded: HashSet<String>,
 }
 
+/// True when `excluded` already contains every currently-healthy worker
+/// URL, meaning a group carrying this exclusion set can never be placed
+/// again without the healthy set changing -- which nothing in this dispatch
+/// loop can make happen for an application-level failure (see
+/// `DispatchError::is_transport`), since `excluded` only ever grows.
+/// `excluded.is_empty()` (a group that has never failed) is never "stuck".
+///
+/// This is the stall guard for [`dispatch_and_collect_groups`]'s dispatch
+/// loop: without it, a group that has exhausted every healthy worker but
+/// still has `attempts_left > 0` would spin the loop's 200ms backoff
+/// forever instead of failing the job.
+fn is_permanently_stuck(excluded: &HashSet<String>, healthy: &[String]) -> bool {
+    !excluded.is_empty() && healthy.iter().all(|url| excluded.contains(url))
+}
+
 /// Build the `CompactGroupRequest` for one group. `group_id` doubles as the
 /// group's index into the caller's original group list, so the caller can
 /// zip responses back to their input `DataFile`s by id without needing the
@@ -123,6 +138,47 @@ fn build_compact_request(
 /// Mirrors `distributed_scan::dispatch_to_worker`'s pool-invalidation
 /// behavior: a channel that errors with `Unavailable`/`DeadlineExceeded` is
 /// evicted from the pool so the next attempt reconnects fresh.
+///
+/// Classifies a failed dispatch so the retry loop can tell a
+/// transport-level fault (connection refused, deadline exceeded, a worker
+/// that goes silent mid-stream) from an application-level failure the
+/// worker's `compact_file_group` handler returned deliberately -- e.g. the
+/// resurrection guard, a delete-accounting mismatch, or a bad signature.
+/// Only the former is evidence the WORKER is unhealthy; the latter is
+/// evidence about the GROUP (or the request), and fails identically on any
+/// other worker too, so [`dispatch_and_collect_groups`] must not mark the
+/// worker unhealthy for it -- doing so would let one poison group take a
+/// perfectly healthy worker out of the fleet for every other job.
+#[derive(Debug)]
+struct DispatchError {
+    message: String,
+    /// `true` when the failure indicates the WORKER (connection, timeout)
+    /// rather than the GROUP/request is at fault.
+    is_transport: bool,
+}
+
+impl std::fmt::Display for DispatchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl DispatchError {
+    fn transport(message: String) -> Self {
+        Self {
+            message,
+            is_transport: true,
+        }
+    }
+
+    fn application(message: String) -> Self {
+        Self {
+            message,
+            is_transport: false,
+        }
+    }
+}
+
 async fn dispatch_group_to_worker(
     request: &CompactGroupRequest,
     worker_url: &str,
@@ -130,14 +186,14 @@ async fn dispatch_group_to_worker(
     worker_secret: &str,
     group_timeout: Duration,
     heartbeat_timeout: Duration,
-) -> SqeResult<CompactGroupResponse> {
+) -> Result<CompactGroupResponse, DispatchError> {
     let body = request.to_bytes().map_err(|e| {
-        SqeError::Execution(format!("failed to encode CompactGroupRequest: {e}"))
+        DispatchError::application(format!("failed to encode CompactGroupRequest: {e}"))
     })?;
 
     let channel = pool.get(worker_url).await.map_err(|e| {
         pool.invalidate(worker_url);
-        SqeError::Execution(format!("failed to connect to worker {worker_url}: {e}"))
+        DispatchError::transport(format!("failed to connect to worker {worker_url}: {e}"))
     })?;
     let mut client = FlightServiceClient::new(channel);
 
@@ -153,7 +209,7 @@ async fn dispatch_group_to_worker(
     let mut grpc_request = tonic::Request::new(action);
     if !worker_secret.is_empty() {
         let secret_value = worker_secret.parse().map_err(|e| {
-            SqeError::Execution(format!(
+            DispatchError::application(format!(
                 "worker_secret cannot be encoded as a metadata header value: {e}"
             ))
         })?;
@@ -162,7 +218,7 @@ async fn dispatch_group_to_worker(
             .insert(WORKER_SECRET_HEADER, secret_value);
         if let Some(sig) = signature {
             let sig_value = sig.parse().map_err(|e| {
-                SqeError::Execution(format!(
+                DispatchError::application(format!(
                     "compaction signature cannot be encoded as a metadata header value: {e}"
                 ))
             })?;
@@ -172,48 +228,66 @@ async fn dispatch_group_to_worker(
         }
     }
 
+    // do_action itself does not stream incrementally today: the worker
+    // computes the whole group rewrite before emitting either frame (see
+    // `sqe_worker::flight_service`'s `compact_file_group` arm), so
+    // `group_timeout` wrapping this call is the real end-to-end bound.
     let response = tokio::time::timeout(group_timeout, client.do_action(grpc_request))
         .await
         .map_err(|_| {
             pool.invalidate(worker_url);
-            SqeError::Execution(format!(
+            DispatchError::transport(format!(
                 "worker {worker_url} compact_file_group exceeded the {}s group timeout",
                 group_timeout.as_secs()
             ))
         })?
         .map_err(|e| {
-            if matches!(
+            let transport = matches!(
                 e.code(),
                 tonic::Code::Unavailable | tonic::Code::DeadlineExceeded
-            ) {
+            );
+            if transport {
                 pool.invalidate(worker_url);
             }
-            SqeError::Execution(format!(
-                "worker {worker_url} compact_file_group failed: {e}"
-            ))
+            let message = format!("worker {worker_url} compact_file_group failed: {e}");
+            if transport {
+                DispatchError::transport(message)
+            } else {
+                // e.g. Status::internal (resurrection guard, delete-accounting
+                // mismatch, snapshot-pin mismatch) or Status::unauthenticated
+                // (bad secret/signature): a request/group problem, not a
+                // worker-health problem.
+                DispatchError::application(message)
+            }
         })?;
 
     let mut stream = response.into_inner();
     let mut done: Option<CompactGroupResponse> = None;
     loop {
+        // Bounds the wait for each individual frame. The worker only ever
+        // sends its two frames back-to-back once the rewrite is fully done
+        // (see the comment on the `do_action` call above), so today this is
+        // mostly a defensive bound against a connection that goes silent
+        // after headers -- it will matter more once/if the worker starts
+        // streaming true incremental progress.
         let next = tokio::time::timeout(heartbeat_timeout, stream.message())
             .await
             .map_err(|_| {
-                SqeError::Execution(format!(
+                DispatchError::transport(format!(
                     "worker {worker_url} compact_file_group produced no frame within the \
                      {}s heartbeat timeout",
                     heartbeat_timeout.as_secs()
                 ))
             })?
             .map_err(|e| {
-                SqeError::Execution(format!(
+                DispatchError::transport(format!(
                     "worker {worker_url} compact_file_group stream error: {e}"
                 ))
             })?;
         let Some(result) = next else { break };
         let frame = sqe_compaction::wire::CompactGroupFrame::from_bytes(&result.body)
             .map_err(|e| {
-                SqeError::Execution(format!(
+                DispatchError::application(format!(
                     "worker {worker_url}: failed to decode CompactGroupFrame: {e}"
                 ))
             })?;
@@ -224,7 +298,10 @@ async fn dispatch_group_to_worker(
     }
 
     done.ok_or_else(|| {
-        SqeError::Execution(format!(
+        // The stream ended (transport-level EOF) without ever delivering a
+        // Done frame: the connection dropped mid-transfer, which is a
+        // worker/connection signal, not a group signal.
+        DispatchError::transport(format!(
             "worker {worker_url} closed the compact_file_group stream without a Done frame"
         ))
     })
@@ -287,6 +364,23 @@ pub(crate) async fn dispatch_and_collect_groups(
                 "distributed compaction job {job_id}: no healthy workers available; \
                  {} group(s) undispatched",
                 pending.len()
+            )));
+        }
+
+        // Stall guard: a retried group's `excluded` set only grows, and
+        // application-level failures (see `DispatchError::is_transport`)
+        // deliberately do NOT shrink `healthy`. If a group has already
+        // failed on every worker currently healthy, no future iteration of
+        // this loop can ever place it -- waiting would spin the 200ms
+        // backoff below forever. Fail the job now instead.
+        if let Some(stuck) = pending
+            .iter()
+            .find(|g| is_permanently_stuck(&g.excluded, &healthy))
+        {
+            return Err(SqeError::Execution(format!(
+                "distributed compaction job {job_id}: group {} has failed on every currently \
+                 healthy worker ({:?}); no worker left to retry on",
+                stuck.group_id, stuck.excluded
             )));
         }
 
@@ -402,13 +496,22 @@ pub(crate) async fn dispatch_and_collect_groups(
                         group_id = group.group_id,
                         worker = %worker_url,
                         attempts_left = group.attempts_left,
+                        transport = e.is_transport,
                         error = %e,
                         "distributed compaction: group dispatch failed"
                     );
-                    // A dispatch failure is a stronger signal than a missed
-                    // health check; drop the worker immediately, matching
-                    // distributed_scan's fragment-failover behavior.
-                    registry.mark_unhealthy(&worker_url).await;
+                    // Only a transport-class failure (connection, timeout,
+                    // a worker that goes silent) is evidence the WORKER is
+                    // unhealthy; drop it immediately, matching
+                    // distributed_scan's fragment-failover behavior. An
+                    // application-level failure (resurrection guard,
+                    // delete-accounting mismatch, bad signature) is
+                    // evidence about the GROUP/request, fails identically
+                    // on any other worker, and must not take a healthy
+                    // worker out of the fleet for every other job.
+                    if e.is_transport {
+                        registry.mark_unhealthy(&worker_url).await;
+                    }
                     group.excluded.insert(worker_url.clone());
                     group.attempts_left = group.attempts_left.saturating_sub(1);
                     if group.attempts_left == 0 {
@@ -441,6 +544,61 @@ mod tests {
             path_style: true,
             allow_http: true,
         }
+    }
+
+    // ---- is_permanently_stuck (stall guard) --------------------------------
+
+    #[test]
+    fn a_group_that_never_failed_is_never_stuck() {
+        let healthy = vec!["w1".to_string(), "w2".to_string()];
+        assert!(!is_permanently_stuck(&HashSet::new(), &healthy));
+    }
+
+    #[test]
+    fn a_group_excluded_from_every_healthy_worker_is_stuck() {
+        let healthy = vec!["w1".to_string(), "w2".to_string()];
+        let mut excluded = HashSet::new();
+        excluded.insert("w1".to_string());
+        excluded.insert("w2".to_string());
+        assert!(is_permanently_stuck(&excluded, &healthy));
+    }
+
+    #[test]
+    fn a_group_excluded_from_only_some_healthy_workers_is_not_stuck() {
+        let healthy = vec!["w1".to_string(), "w2".to_string(), "w3".to_string()];
+        let mut excluded = HashSet::new();
+        excluded.insert("w1".to_string());
+        assert!(!is_permanently_stuck(&excluded, &healthy));
+    }
+
+    #[test]
+    fn a_group_excluded_from_a_now_shrunk_healthy_set_is_stuck() {
+        // Simulates: w1 and w2 both failed this group (transport errors,
+        // both marked unhealthy and excluded); only w3 remains healthy and
+        // has not been excluded yet -> not stuck.
+        let healthy = vec!["w3".to_string()];
+        let mut excluded = HashSet::new();
+        excluded.insert("w1".to_string());
+        excluded.insert("w2".to_string());
+        assert!(!is_permanently_stuck(&excluded, &healthy));
+
+        // Once w3 also fails and gets excluded, with no other healthy
+        // worker left, the group is stuck.
+        excluded.insert("w3".to_string());
+        assert!(is_permanently_stuck(&excluded, &healthy));
+    }
+
+    // ---- DispatchError classification --------------------------------------
+
+    #[test]
+    fn dispatch_error_constructors_tag_the_right_category() {
+        let transport = DispatchError::transport("connection refused".to_string());
+        assert!(transport.is_transport);
+        assert_eq!(transport.to_string(), "connection refused");
+
+        let application = DispatchError::application("resurrection guard tripped".to_string());
+        assert!(!application.is_transport);
+        assert_eq!(application.to_string(), "resurrection guard tripped");
     }
 
     // ---- build_compact_request -------------------------------------------
