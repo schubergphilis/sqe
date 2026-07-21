@@ -10,6 +10,7 @@ pub mod policy_wiring;
 pub mod tag_source_impl;
 pub mod catalog_ops;
 pub mod channel_pool;
+pub mod compaction_dispatch;
 pub mod maintenance;
 pub mod maintenance_log;
 pub mod maintenance_principal;

@@ -1,0 +1,557 @@
+//! Coordinator-side Arrow Flight glue for the distributed `compact_file_group`
+//! job runner (Phase 4c Task 4).
+//!
+//! Mirrors the dispatch pattern already used for scan tickets
+//! (`distributed_scan::dispatch_to_worker`) and credential pushes
+//! (`credential_refresh::push_credentials_to_worker_inner`): build/reuse a
+//! Flight channel, sign the exact wire bytes, attach the worker-secret and
+//! signature headers, call `do_action`, and drain the response stream. What
+//! is new here: the action is `"compact_file_group"`, the response is a
+//! `CompactGroupFrame` stream (a `Progress` heartbeat then one `Done`), and
+//! failed groups are retried on a *different* healthy worker up to
+//! `group_attempts` times before the whole job fails (no partial commit).
+//!
+//! The pure placement/decode/aggregation logic this module drives lives in
+//! `sqe_compaction::dispatch`, which has no Flight/tonic dependency and is
+//! unit-tested there. This module is the network-facing half: the
+//! `WorkerRegistry`/`WorkerLoadTracker` bookkeeping, the retry loop, and the
+//! `do_action` RPC itself, none of which are practical to unit test without
+//! a live worker (see the `#[ignore]`d integration test at the bottom).
+//!
+//! Nothing calls [`dispatch_and_collect_groups`] yet: it is called by
+//! `maintenance::rewrite_data_files_distributed_once` (Phase 4c Task 4),
+//! which is itself not yet wired into `MaintenanceHandler::handle()` or the
+//! active-mode scheduler -- that wiring is Task 5's `distribution.mode`
+//! routing. `#![allow(dead_code)]` covers this whole module until then; it
+//! is fully exercised by the unit tests below.
+#![allow(dead_code)]
+
+use std::collections::HashSet;
+use std::sync::Arc;
+use std::time::Duration;
+
+use arrow_flight::flight_service_client::FlightServiceClient;
+use arrow_flight::Action;
+use futures::stream::FuturesUnordered;
+use futures::StreamExt;
+use iceberg::spec::DataFile;
+use sqe_compaction::wire::{CompactGroupRequest, CompactGroupResponse, S3Conn, SortSpecWire};
+use sqe_core::{Result as SqeResult, SqeError};
+use tracing::warn;
+
+use crate::channel_pool::ChannelPool;
+use crate::worker_registry::{WorkerLoadTracker, WorkerRegistry};
+
+/// Metadata header carrying the shared coordinator/worker secret. Same name
+/// as `distributed_scan`'s and `credential_refresh`'s constants (not
+/// reused directly: each dispatch site keeps its own copy, matching the
+/// existing repo convention rather than introducing a new shared-constants
+/// module for a single string).
+const WORKER_SECRET_HEADER: &str = "x-sqe-worker-secret";
+
+/// Metadata header carrying the HMAC-SHA256 tag (hex) over the exact
+/// `CompactGroupRequest` wire bytes. Must match
+/// `sqe_worker::flight_service::COMPACT_SIGNATURE_HEADER` exactly, or every
+/// signed request fails the worker's `verify_compaction_signature` check.
+pub(crate) const COMPACT_SIGNATURE_HEADER: &str = "x-sqe-compact-signature";
+
+/// Compute the HMAC signature for a `CompactGroupRequest`'s wire bytes, or
+/// `None` when `secret` is empty (dev mode: the deployment opted into
+/// `worker.allow_unauthenticated`, so there is nothing to sign and the
+/// header is omitted entirely). Delegates the HMAC computation itself to
+/// `sqe_compaction::wire::sign` so the coordinator and worker share exactly
+/// one signing implementation; only the empty-secret bypass convention is
+/// mirrored from `distributed_scan::sign_ticket`.
+pub(crate) fn sign_compact_request(secret: &str, bytes: &[u8]) -> Option<String> {
+    if secret.is_empty() {
+        return None;
+    }
+    Some(sqe_compaction::wire::sign(bytes, secret))
+}
+
+/// One file group awaiting (or retrying) dispatch. Carries just what the
+/// dispatch loop needs -- paths and total size -- not full `DataFile`s,
+/// since those are already held by the caller (used to build `old_files`
+/// for the commit) and would be redundant to clone into every in-flight
+/// attempt.
+#[derive(Debug, Clone)]
+struct PendingGroup {
+    group_id: u32,
+    file_paths: Vec<String>,
+    total_bytes: u64,
+    attempts_left: usize,
+    excluded: HashSet<String>,
+}
+
+/// Build the `CompactGroupRequest` for one group. `group_id` doubles as the
+/// group's index into the caller's original group list, so the caller can
+/// zip responses back to their input `DataFile`s by id without needing the
+/// dispatch loop to round-trip them.
+#[allow(clippy::too_many_arguments)]
+fn build_compact_request(
+    job_id: &str,
+    group_id: u32,
+    table_ident: &str,
+    metadata_location: &str,
+    snapshot_id: i64,
+    group_file_paths: Vec<String>,
+    target_file_size_bytes: u64,
+    compression: &str,
+    sort: Option<&SortSpecWire>,
+    s3: &S3Conn,
+) -> CompactGroupRequest {
+    CompactGroupRequest {
+        job_id: job_id.to_string(),
+        group_id,
+        table_ident: table_ident.to_string(),
+        metadata_location: metadata_location.to_string(),
+        snapshot_id,
+        group_file_paths,
+        target_file_size_bytes,
+        compression: compression.to_string(),
+        sort: sort.cloned(),
+        s3: s3.clone(),
+    }
+}
+
+/// Dispatch one signed `CompactGroupRequest` to `worker_url` via
+/// `do_action("compact_file_group")` and collect the terminal `Done` frame.
+///
+/// `heartbeat_timeout` bounds the wait for each individual frame (so a
+/// worker that goes silent mid-stream is detected before the full
+/// `group_timeout`); `group_timeout` bounds the whole call end to end.
+/// Mirrors `distributed_scan::dispatch_to_worker`'s pool-invalidation
+/// behavior: a channel that errors with `Unavailable`/`DeadlineExceeded` is
+/// evicted from the pool so the next attempt reconnects fresh.
+async fn dispatch_group_to_worker(
+    request: &CompactGroupRequest,
+    worker_url: &str,
+    pool: &ChannelPool,
+    worker_secret: &str,
+    group_timeout: Duration,
+    heartbeat_timeout: Duration,
+) -> SqeResult<CompactGroupResponse> {
+    let body = request.to_bytes().map_err(|e| {
+        SqeError::Execution(format!("failed to encode CompactGroupRequest: {e}"))
+    })?;
+
+    let channel = pool.get(worker_url).await.map_err(|e| {
+        pool.invalidate(worker_url);
+        SqeError::Execution(format!("failed to connect to worker {worker_url}: {e}"))
+    })?;
+    let mut client = FlightServiceClient::new(channel);
+
+    // Sign the exact wire bytes before they are moved into the Action body,
+    // mirroring the scan-ticket signing convention (#206) applied to this
+    // RPC in Task 2/3.
+    let signature = sign_compact_request(worker_secret, &body);
+
+    let action = Action {
+        r#type: "compact_file_group".to_string(),
+        body: bytes::Bytes::from(body),
+    };
+    let mut grpc_request = tonic::Request::new(action);
+    if !worker_secret.is_empty() {
+        let secret_value = worker_secret.parse().map_err(|e| {
+            SqeError::Execution(format!(
+                "worker_secret cannot be encoded as a metadata header value: {e}"
+            ))
+        })?;
+        grpc_request
+            .metadata_mut()
+            .insert(WORKER_SECRET_HEADER, secret_value);
+        if let Some(sig) = signature {
+            let sig_value = sig.parse().map_err(|e| {
+                SqeError::Execution(format!(
+                    "compaction signature cannot be encoded as a metadata header value: {e}"
+                ))
+            })?;
+            grpc_request
+                .metadata_mut()
+                .insert(COMPACT_SIGNATURE_HEADER, sig_value);
+        }
+    }
+
+    let response = tokio::time::timeout(group_timeout, client.do_action(grpc_request))
+        .await
+        .map_err(|_| {
+            pool.invalidate(worker_url);
+            SqeError::Execution(format!(
+                "worker {worker_url} compact_file_group exceeded the {}s group timeout",
+                group_timeout.as_secs()
+            ))
+        })?
+        .map_err(|e| {
+            if matches!(
+                e.code(),
+                tonic::Code::Unavailable | tonic::Code::DeadlineExceeded
+            ) {
+                pool.invalidate(worker_url);
+            }
+            SqeError::Execution(format!(
+                "worker {worker_url} compact_file_group failed: {e}"
+            ))
+        })?;
+
+    let mut stream = response.into_inner();
+    let mut done: Option<CompactGroupResponse> = None;
+    loop {
+        let next = tokio::time::timeout(heartbeat_timeout, stream.message())
+            .await
+            .map_err(|_| {
+                SqeError::Execution(format!(
+                    "worker {worker_url} compact_file_group produced no frame within the \
+                     {}s heartbeat timeout",
+                    heartbeat_timeout.as_secs()
+                ))
+            })?
+            .map_err(|e| {
+                SqeError::Execution(format!(
+                    "worker {worker_url} compact_file_group stream error: {e}"
+                ))
+            })?;
+        let Some(result) = next else { break };
+        let frame = sqe_compaction::wire::CompactGroupFrame::from_bytes(&result.body)
+            .map_err(|e| {
+                SqeError::Execution(format!(
+                    "worker {worker_url}: failed to decode CompactGroupFrame: {e}"
+                ))
+            })?;
+        match frame {
+            sqe_compaction::wire::CompactGroupFrame::Progress { .. } => {}
+            sqe_compaction::wire::CompactGroupFrame::Done(resp) => done = Some(resp),
+        }
+    }
+
+    done.ok_or_else(|| {
+        SqeError::Execution(format!(
+            "worker {worker_url} closed the compact_file_group stream without a Done frame"
+        ))
+    })
+}
+
+/// Dispatch every group of a distributed rewrite job to the worker fleet,
+/// retrying a failed group on a different healthy worker up to
+/// `group_attempts` times, and return every group's [`CompactGroupResponse`]
+/// once all have succeeded.
+///
+/// On a group exhausting its retries, returns `Err` immediately: per the
+/// design, a distributed rewrite either commits everything or nothing, so
+/// there is no point continuing to dispatch remaining groups once one has
+/// permanently failed (any group already in flight is simply dropped;
+/// whatever it already wrote to object storage becomes an orphan reclaimed
+/// by the age-thresholded orphan sweep, not cleaned up here).
+///
+/// `groups` are the coordinator's own bin-packed file groups (as produced by
+/// `pack_file_groups_partition_aware`/`group_files_by_partition`); this
+/// function only needs their paths and total size, not the full `DataFile`s
+/// (the caller already holds those for the `old_files` side of the commit).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn dispatch_and_collect_groups(
+    job_id: &str,
+    table_ident: &str,
+    metadata_location: &str,
+    snapshot_id: i64,
+    groups: &[Vec<DataFile>],
+    target_file_size_bytes: u64,
+    compression: &str,
+    sort: Option<&SortSpecWire>,
+    s3: &S3Conn,
+    registry: &Arc<WorkerRegistry>,
+    load_tracker: &WorkerLoadTracker,
+    worker_secret: &str,
+    max_inflight_per_worker: usize,
+    group_attempts: usize,
+    group_timeout: Duration,
+    heartbeat_timeout: Duration,
+) -> SqeResult<Vec<CompactGroupResponse>> {
+    let mut pending: Vec<PendingGroup> = groups
+        .iter()
+        .enumerate()
+        .map(|(i, files)| PendingGroup {
+            group_id: i as u32,
+            file_paths: files.iter().map(|f| f.file_path().to_string()).collect(),
+            total_bytes: files.iter().map(|f| f.file_size_in_bytes()).sum(),
+            attempts_left: group_attempts.max(1),
+            excluded: HashSet::new(),
+        })
+        .collect();
+
+    let mut responses: Vec<CompactGroupResponse> = Vec::with_capacity(pending.len());
+    let pool = registry.channel_pool();
+
+    while !pending.is_empty() {
+        let healthy = registry.healthy_workers().await;
+        if healthy.is_empty() {
+            return Err(SqeError::Execution(format!(
+                "distributed compaction job {job_id}: no healthy workers available; \
+                 {} group(s) undispatched",
+                pending.len()
+            )));
+        }
+
+        let mut loads: Vec<sqe_compaction::dispatch::WorkerLoad> = healthy
+            .iter()
+            .map(|url| sqe_compaction::dispatch::WorkerLoad {
+                url: url.clone(),
+                in_flight: load_tracker.in_flight(url) as usize,
+            })
+            .collect();
+
+        // Fresh groups (never failed) go through the batch, largest-first
+        // placement; groups already carrying an exclusion get placed
+        // individually so they land on a worker other than the one that
+        // just failed them, which the batch placement cannot express.
+        let mut fresh_idx: Vec<usize> = Vec::new();
+        let mut retry_idx: Vec<usize> = Vec::new();
+        for (i, g) in pending.iter().enumerate() {
+            if g.excluded.is_empty() {
+                fresh_idx.push(i);
+            } else {
+                retry_idx.push(i);
+            }
+        }
+
+        let mut wave: Vec<(usize, String)> = Vec::new();
+
+        if !fresh_idx.is_empty() {
+            let sizes: Vec<u64> = fresh_idx.iter().map(|&i| pending[i].total_bytes).collect();
+            let plan = sqe_compaction::dispatch::place_groups_largest_first(
+                &sizes,
+                &loads,
+                max_inflight_per_worker,
+            );
+            for p in plan.placed {
+                wave.push((fresh_idx[p.group_index], p.worker_url));
+            }
+        }
+        // Reflect what the fresh wave just claimed before placing retries
+        // against the same snapshot, so retries do not overshoot a worker
+        // the fresh wave already filled to capacity.
+        for (_, url) in &wave {
+            if let Some(w) = loads.iter_mut().find(|w| w.url == *url) {
+                w.in_flight += 1;
+            }
+        }
+        for &i in &retry_idx {
+            if let Some(url) = sqe_compaction::dispatch::least_loaded_worker(
+                &loads,
+                max_inflight_per_worker,
+                &pending[i].excluded,
+            ) {
+                if let Some(w) = loads.iter_mut().find(|w| w.url == url) {
+                    w.in_flight += 1;
+                }
+                wave.push((i, url));
+            }
+        }
+
+        if wave.is_empty() {
+            // Every healthy worker is at capacity (or excluded for every
+            // pending retry); back off briefly rather than busy-loop.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            continue;
+        }
+
+        // Remove placed groups from `pending` in descending index order so
+        // earlier removals do not invalidate later indices.
+        wave.sort_by_key(|(i, _)| std::cmp::Reverse(*i));
+        let mut taken: Vec<(PendingGroup, String)> = Vec::new();
+        for (i, url) in wave {
+            taken.push((pending.remove(i), url));
+        }
+
+        let mut futs = FuturesUnordered::new();
+        for (group, worker_url) in taken {
+            let guard = load_tracker.reserve(&worker_url);
+            let request = build_compact_request(
+                job_id,
+                group.group_id,
+                table_ident,
+                metadata_location,
+                snapshot_id,
+                group.file_paths.clone(),
+                target_file_size_bytes,
+                compression,
+                sort,
+                s3,
+            );
+            let pool = pool.clone();
+            let secret = worker_secret.to_string();
+            futs.push(async move {
+                let _guard = guard;
+                let result = dispatch_group_to_worker(
+                    &request,
+                    &worker_url,
+                    &pool,
+                    &secret,
+                    group_timeout,
+                    heartbeat_timeout,
+                )
+                .await;
+                (group, worker_url, result)
+            });
+        }
+
+        while let Some((mut group, worker_url, result)) = futs.next().await {
+            match result {
+                Ok(resp) => responses.push(resp),
+                Err(e) => {
+                    warn!(
+                        job_id,
+                        group_id = group.group_id,
+                        worker = %worker_url,
+                        attempts_left = group.attempts_left,
+                        error = %e,
+                        "distributed compaction: group dispatch failed"
+                    );
+                    // A dispatch failure is a stronger signal than a missed
+                    // health check; drop the worker immediately, matching
+                    // distributed_scan's fragment-failover behavior.
+                    registry.mark_unhealthy(&worker_url).await;
+                    group.excluded.insert(worker_url.clone());
+                    group.attempts_left = group.attempts_left.saturating_sub(1);
+                    if group.attempts_left == 0 {
+                        return Err(SqeError::Execution(format!(
+                            "distributed compaction job {job_id}: group {} exhausted retries \
+                             (last failure on {worker_url}): {e}",
+                            group.group_id
+                        )));
+                    }
+                    pending.push(group);
+                }
+            }
+        }
+    }
+
+    Ok(responses)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_s3() -> S3Conn {
+        S3Conn {
+            endpoint: "http://localhost:9000".to_string(),
+            region: "us-east-1".to_string(),
+            access_key: "ak".to_string(),
+            secret_key: "sk".to_string(),
+            session_token: String::new(),
+            path_style: true,
+            allow_http: true,
+        }
+    }
+
+    // ---- build_compact_request -------------------------------------------
+
+    #[test]
+    fn build_compact_request_carries_every_field_through() {
+        let sort = SortSpecWire::Columns(vec![("a".to_string(), true)]);
+        let req = build_compact_request(
+            "job-1",
+            3,
+            "catalog.ns.tbl",
+            "s3://bucket/warehouse/tbl/metadata/v3.metadata.json",
+            42,
+            vec!["s3://bucket/data/f1.parquet".to_string()],
+            128 * 1024 * 1024,
+            "zstd",
+            Some(&sort),
+            &sample_s3(),
+        );
+        assert_eq!(req.job_id, "job-1");
+        assert_eq!(req.group_id, 3);
+        assert_eq!(req.table_ident, "catalog.ns.tbl");
+        assert_eq!(req.snapshot_id, 42);
+        assert_eq!(req.group_file_paths, vec!["s3://bucket/data/f1.parquet".to_string()]);
+        assert_eq!(req.compression, "zstd");
+        assert_eq!(req.sort, Some(sort));
+    }
+
+    // ---- signing + the worker's expected header name ----------------------
+
+    /// Pins the exact header name the coordinator must send: it must match
+    /// `sqe_worker::flight_service::COMPACT_SIGNATURE_HEADER` byte for byte,
+    /// or every signed request is rejected by `verify_compaction_signature`.
+    #[test]
+    fn compact_signature_header_matches_the_workers_expected_name() {
+        assert_eq!(COMPACT_SIGNATURE_HEADER, "x-sqe-compact-signature");
+    }
+
+    #[test]
+    fn signed_request_verifies_against_the_shared_secret_and_rejects_a_wrong_one() {
+        let req = build_compact_request(
+            "job-1",
+            0,
+            "catalog.ns.tbl",
+            "s3://bucket/meta.json",
+            1,
+            vec!["s3://bucket/f1.parquet".to_string()],
+            1024,
+            "zstd",
+            None,
+            &sample_s3(),
+        );
+        let bytes = req.to_bytes().unwrap();
+        let secret = "shared-worker-secret";
+        let sig = sign_compact_request(secret, &bytes).expect("non-empty secret must sign");
+
+        assert!(sqe_compaction::wire::verify(&bytes, &sig, secret));
+        assert!(!sqe_compaction::wire::verify(&bytes, &sig, "wrong-secret"));
+    }
+
+    #[test]
+    fn sign_compact_request_omits_signature_in_dev_mode_with_empty_secret() {
+        let bytes = b"whatever-body".to_vec();
+        assert_eq!(sign_compact_request("", &bytes), None);
+    }
+
+    #[test]
+    fn a_tampered_body_fails_verification() {
+        let req = build_compact_request(
+            "job-1",
+            0,
+            "catalog.ns.tbl",
+            "s3://bucket/meta.json",
+            1,
+            vec!["s3://bucket/f1.parquet".to_string()],
+            1024,
+            "zstd",
+            None,
+            &sample_s3(),
+        );
+        let mut bytes = req.to_bytes().unwrap();
+        let secret = "shared-worker-secret";
+        let sig = sign_compact_request(secret, &bytes).unwrap();
+        let mid = bytes.len() / 2;
+        bytes[mid] ^= 0xFF;
+        assert!(!sqe_compaction::wire::verify(&bytes, &sig, secret));
+    }
+
+    // ---- full coordinator+worker Flight integration -----------------------
+    //
+    // Not runnable in this environment: needs a live worker Flight service
+    // (and, transitively, S3-compatible storage + a real Iceberg table for
+    // the worker's `compact_file_group` action to operate against). Manual
+    // run against the docker quickstart stack:
+    //
+    // 1. Start a worker: `cargo run -p sqe-worker -- --port 50061 ...`
+    // 2. Register it in a `WorkerRegistry` and mark it healthy.
+    // 3. Call `dispatch_and_collect_groups` with real groups from a live
+    //    table's `collect_live_data_files`, a real `metadata_location`,
+    //    S3 credentials for the same bucket, and the shared worker secret.
+    // 4. Assert every group's `CompactGroupResponse` decodes via
+    //    `sqe_compaction::dispatch::decode_group_response` against the same
+    //    table's schema/partition type/spec id/format version.
+    #[tokio::test]
+    #[ignore = "requires a live worker Flight service; run manually against the quickstart stack"]
+    async fn dispatch_and_collect_groups_against_a_live_worker() {
+        // Intentionally left as documentation: see the comment above for the
+        // manual procedure. A synthetic in-process FlightService could
+        // replace this once one exists for worker-side testing; today
+        // `sqe-worker`'s own tests spin up a real tonic server per test
+        // (see `flight_service.rs`'s `compact_file_group_*` tests), which
+        // this module cannot cheaply reuse without a shared test harness.
+    }
+}
