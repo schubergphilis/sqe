@@ -620,14 +620,76 @@ system.table_health`. `table_health`'s `last_compaction_snapshot_ms`
 column is reserved for this but is not yet wired to read it; it always
 returns `NULL` in this release.
 
-### Distribution is coordinator-local in this release
+### Distribution: `mode` picks coordinator-local vs the worker fleet
 
-`[maintenance.distribution]` is parsed and validated, but nothing in the
-scheduler or the rewrite handler reads it yet: every active-mode
-compaction in this release runs coordinator-local, regardless of
-`distribution.mode`. Worker fan-out for large rewrite jobs is a later
-phase; treat the `[maintenance.distribution]` block as forward-compatible
-configuration surface, not a live switch, until that phase ships.
+`[maintenance.distribution]` is active: `mode` decides whether an
+active-mode rewrite runs on the coordinator alone or fans its file groups
+out to the worker fleet. See [Distributed
+compaction](../design-notes/distributed-compaction.md) for the full data
+flow (planning, dispatch, worker rewrite, coordinator commit).
+
+- `"auto"` (default). Coordinator-local when the healthy worker count is
+  below `min_workers`, fans out to the fleet once it reaches
+  `min_workers`.
+- `"local"`. Always coordinator-local, even with a fleet present.
+- `"require"`. Always fans out; never runs coordinator-local. Below
+  `min_workers` it does not fall back to `"local"`, and the two call
+  paths react differently, on purpose:
+  - A scheduled active-mode tick SKIPS the job loudly: a `skipped`
+    `sqe_system.maintenance_log` row, the existing `AuditKind::Maintenance`
+    skip event, and a dedicated
+    `sqe_maintenance_skipped_total{reason="insufficient_workers"}` metric
+    sample an operator can alert on independently of the generic
+    `sqe_maintenance_job_total{status="skipped"}` counter (which also
+    fires for "no eligible debt").
+  - A manual `CALL system.rewrite_data_files(..., distributed =>
+    'require')` ERRORS instead: an interactive caller who explicitly asked
+    to require the fleet gets a loud failure, never a silent
+    coordinator-local rewrite.
+
+`CALL system.rewrite_data_files` also accepts a per-call `distributed =>
+'auto'|'local'|'require'` argument that overrides the configured `mode`
+for that one call; omit it to use `[maintenance.distribution] mode`. See
+[CALL procedures](../sql-reference/procedures.md).
+
+Other knobs, all under `[maintenance.distribution]`:
+
+- `min_workers` (default `2`). The healthy-worker floor `"auto"` and
+  `"require"` compare against.
+- `max_inflight_groups_per_worker` (default `1`). Hard per-worker cap on
+  concurrently dispatched groups. A worker at the cap is never chosen for
+  a new group; a group that cannot fit anywhere is deferred and retried
+  briefly, never force-assigned past the cap.
+- `group_attempts` (default `2`). Retries for one failed group, each on a
+  worker other than the one that just failed it. A group that exhausts
+  every currently-healthy worker, or every attempt, fails the whole
+  job -- a distributed rewrite either commits everything or nothing;
+  dispatch never continues once one group has permanently failed.
+- `group_timeout_secs` (default `3600`). The real end-to-end bound on one
+  group dispatch attempt: from the coordinator's `do_action` call to that
+  group's terminal `Done` frame. A worker computes the entire rewrite
+  (read, delete-apply, re-encode) before it emits any frame at all, so
+  nothing about a hung or slow worker is visible until either this fires
+  or the worker finally responds. Size it for the slowest group you
+  expect to dispatch.
+- `group_heartbeat_timeout_secs` (default `120`). Bounds the wait between
+  frames only, once a worker has started responding (its first `Progress`
+  heartbeat). It does NOT bound the worker's compute phase before that
+  first frame -- that is `group_timeout_secs`'s job. A worker wedged
+  mid-compute produces no frames at all and is caught only by
+  `group_timeout_secs`, never by this field.
+
+**Accepted trade-off: orphans on a commit-conflict retry.** A concurrent
+writer that commits between the coordinator's read and its
+`RewriteFilesAction` commit produces a retryable conflict. On retry the
+coordinator re-plans and re-dispatches the whole job from scratch rather
+than patch the stale attempt, the same correctness rule the local path
+already follows. Whatever the superseded attempt's workers already wrote
+to S3 is never referenced by any commit and becomes an orphan, left for
+`CALL system.remove_orphan_files`'s normal age-thresholded sweep to
+reclaim. The trade-off is deliberate: correctness comes from never
+committing a stale plan, not from cleaning up every write the moment its
+result turns out to be unneeded.
 
 ### Safety notes
 
@@ -648,11 +710,16 @@ configuration surface, not a live switch, until that phase ships.
   running `CALL system.rollback_to_snapshot(table => 'ns.t', snapshot_id
   => <id>)` undoes the compaction as long as that prior snapshot has not
   aged out.
-- **Coordinator-local in this release.** Active-mode compaction always
-  runs on the coordinator that owns the lease, regardless of
-  `distribution.mode`; size `target_file_size_bytes` and
-  `max_concurrent_jobs` with that single-process footprint in mind until
-  worker fan-out ships.
+- **`distribution.mode` decides the footprint.** `"local"`, and `"auto"`
+  below `min_workers`, run coordinator-local: size `target_file_size_bytes`
+  and `max_concurrent_jobs` for that single-process footprint. `"auto"`
+  at or above `min_workers`, and `"require"`, fan groups out to the
+  worker fleet instead; see [Distributed
+  compaction](../design-notes/distributed-compaction.md).
+- **Commit authority never leaves the coordinator.** In distributed mode
+  workers read and write S3 directly but never obtain a catalog token and
+  never commit; the coordinator validates every worker's output and
+  commits one atomic `RewriteFilesAction`, exactly like the local path.
 
 ## Validation
 
