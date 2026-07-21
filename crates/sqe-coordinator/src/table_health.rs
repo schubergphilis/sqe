@@ -39,7 +39,7 @@ use sqe_core::config::MaintenanceCompactionConfig;
 /// Table property that opts a table into the (later) advisory scheduler.
 /// `table_health` reports whether the scheduler would even consider this
 /// table; the scheduler itself does not exist yet in Phase 4a.
-const MAINTENANCE_ENABLED_PROPERTY: &str = "sqe.maintenance.enabled";
+pub(crate) const MAINTENANCE_ENABLED_PROPERTY: &str = "sqe.maintenance.enabled";
 
 /// Compaction-debt snapshot for one table.
 ///

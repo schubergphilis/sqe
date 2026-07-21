@@ -449,14 +449,12 @@ impl MaintenanceHandler {
         let ident = to_table_ident(table_ref);
         let table = load_table(&catalog, &ident).await?;
 
-        let data_files = collect_live_data_files(&table).await?;
-        let delete_files = collect_live_delete_files(&table).await?;
-        let read_plan = plan_delete_aware_read(&table).await?;
+        let (data_files, delete_files, tasks_by_path) = collect_health_inputs(&table).await?;
 
         let health = crate::table_health::analyze_table_health(
             &data_files,
             &delete_files,
-            &read_plan.tasks_by_path,
+            &tasks_by_path,
             &self.config.maintenance.compaction,
             table.metadata().properties(),
         );
@@ -1464,7 +1462,7 @@ fn to_table_ident(table_ref: &TableRef) -> TableIdent {
     TableIdent::new(ns, table_ref.name.clone())
 }
 
-async fn load_table(catalog: &Arc<dyn Catalog>, ident: &TableIdent) -> sqe_core::Result<IcebergTable> {
+pub(crate) async fn load_table(catalog: &Arc<dyn Catalog>, ident: &TableIdent) -> sqe_core::Result<IcebergTable> {
     catalog
         .load_table(ident)
         .await
@@ -1569,6 +1567,26 @@ async fn plan_delete_aware_read(table: &IcebergTable) -> sqe_core::Result<Delete
         scan,
         tasks_by_path,
     })
+}
+
+/// Collect the three inputs [`crate::table_health::analyze_table_health`]
+/// needs for one table, in the exact sequence `table_health()` (the `CALL
+/// system.table_health` handler, above) uses: live data files, live delete
+/// files, and the delete-aware read plan's per-path task map. Consolidated
+/// into one seam so the advisory scheduler (`maintenance_scheduler.rs`)
+/// promotes a single `pub(crate)` function instead of reaching into three
+/// private collectors plus the private `DeleteAwareReadPlan` struct.
+pub(crate) async fn collect_health_inputs(
+    table: &IcebergTable,
+) -> sqe_core::Result<(
+    Vec<DataFile>,
+    Vec<DataFile>,
+    std::collections::HashMap<String, Vec<iceberg::scan::FileScanTask>>,
+)> {
+    let data_files = collect_live_data_files(table).await?;
+    let delete_files = collect_live_delete_files(table).await?;
+    let read_plan = plan_delete_aware_read(table).await?;
+    Ok((data_files, delete_files, read_plan.tasks_by_path))
 }
 
 /// Rows expected after applying deletes to `group`, or `None` when it cannot be

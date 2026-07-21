@@ -1,0 +1,503 @@
+//! Advisory auto-compaction scheduler loop (Phase 4a, Task 5).
+//!
+//! `MaintenanceScheduler` ties together the earlier Phase 4a pieces into a
+//! background tick loop:
+//!
+//! - Task 1 (`sqe_core::config::MaintenanceConfig`) supplies the gate
+//!   (`mode`), the tick cadence and per-table jitter (`scheduler`), and the
+//!   compaction-debt sizing knobs (`compaction`).
+//! - Task 2 (`crate::maintenance_principal::MaintenancePrincipal`) mints an
+//!   ephemeral, job-scoped `Session` for each tick. That session is never
+//!   registered with a `SessionManager` and never touches the interactive
+//!   auth chain.
+//! - Task 3 (`crate::table_health::analyze_table_health`) is the pure
+//!   analysis; this module only wires its inputs (via
+//!   `crate::maintenance::collect_health_inputs`) and its outputs (metrics,
+//!   audit, log).
+//! - Task 4 (`crate::maintenance_log::{advisory_row, append_row}`) is the
+//!   one write this subsystem performs: a best-effort append to the ledger
+//!   table. It is not a mutation of any *user* table.
+//!
+//! # Mutates nothing
+//!
+//! `advisory_tick` never rewrites, deletes, or otherwise commits against a
+//! discovered user table. It loads each table read-only (`load_table`,
+//! `collect_health_inputs`, `analyze_table_health`), then only *reports*:
+//! Prometheus gauges, an `AuditKind::Maintenance` event, and a best-effort
+//! `maintenance_log` row. The `[maintenance]` `Active` mode (real rewrites)
+//! is a later phase.
+//!
+//! # Off mode is total absence, not a runtime no-op
+//!
+//! `MaintenanceScheduler` deliberately has no path that constructs a
+//! `MaintenancePrincipal` on its own -- the caller (coordinator bootstrap in
+//! `sqe_server.rs`) is the only place that decides whether the principal
+//! and this scheduler exist at all. When `[maintenance] mode = "off"`
+//! (the default), bootstrap constructs neither: there is no
+//! `MaintenanceScheduler` value anywhere in the process, not merely one
+//! whose loop declines to run. That is the actual isolation guarantee;
+//! see the wiring in `sqe_server.rs`'s `run_coordinator`.
+//!
+//! # `catalog_factory`: the test seam
+//!
+//! Building an `Arc<dyn Catalog>` for a minted session in production goes
+//! through `SessionCatalog::for_session`, which only speaks to the REST
+//! (Polaris) backend meaningfully in this codebase's test environment (the
+//! sqlite-backed test harness used by `maintenance_log_test.rs` bypasses
+//! `SessionCatalog` entirely via `sqe_catalog::mount::build_catalog`).
+//! `catalog_factory` decouples "how do I turn a minted session into a
+//! catalog handle" from `advisory_tick`'s discovery/analysis logic, so the
+//! `#[cfg(feature = "test-sqlite")]` end-to-end test in
+//! `tests/maintenance_scheduler_test.rs` can inject a closure that ignores
+//! the session and hands back a pre-built sqlite catalog, while still
+//! exercising the real `MaintenancePrincipal::mint_session` call (against a
+//! wiremock IdP) for everything upstream of catalog construction.
+
+use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+
+use iceberg::{Catalog, TableIdent};
+use sqe_core::config::{MaintenanceConfig, MaintenanceMode};
+use sqe_core::{Session, SqeError};
+use tracing::{info, warn};
+
+use crate::maintenance_principal::MaintenancePrincipal;
+/// Table property that opts a table into this scheduler. Reuses
+/// `table_health`'s constant so the `CALL system.table_health` report and
+/// the scheduler can never disagree about which property gates advisory
+/// analysis.
+use crate::table_health::MAINTENANCE_ENABLED_PROPERTY;
+
+/// Builds an `Arc<dyn Catalog>` for a minted maintenance `Session`.
+///
+/// See the module docs' "`catalog_factory`: the test seam" section. Boxed
+/// (not generic) so `MaintenanceScheduler` stays an ordinary `Send`able
+/// struct instead of infecting every call site with a type parameter.
+pub type CatalogFactory = Arc<
+    dyn Fn(&Session) -> Pin<Box<dyn Future<Output = sqe_core::Result<Arc<dyn Catalog>>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// Build the production `CatalogFactory`: one `SessionCatalog` per tick,
+/// scoped to the bearer token the minted maintenance session carries.
+/// Mirrors `MaintenanceHandler::create_catalog_bridge`'s default-warehouse
+/// branch; Phase 4a is single-catalog, so the Polaris-auto multi-catalog
+/// resolution branch that method also has is intentionally not reproduced
+/// here.
+pub fn default_catalog_factory(
+    config: sqe_core::SqeConfig,
+    table_cache: Option<sqe_catalog::TableMetadataCache>,
+) -> CatalogFactory {
+    Arc::new(move |session: &Session| {
+        let config = config.clone();
+        let table_cache = table_cache.clone();
+        let token = session.access_token().expose().to_string();
+        Box::pin(async move {
+            let session_catalog =
+                Arc::new(sqe_catalog::SessionCatalog::for_session(&config, table_cache, &token).await?);
+            Ok(session_catalog.as_catalog() as Arc<dyn Catalog>)
+        })
+    })
+}
+
+/// The advisory (and, in a later phase, active) auto-compaction scheduler.
+///
+/// Holds everything one tick needs: the config gate/knobs, the dedicated
+/// service principal, a metrics handle, an optional audit sink, and the
+/// catalog-construction seam described in the module docs.
+pub struct MaintenanceScheduler {
+    cfg: MaintenanceConfig,
+    principal: Arc<MaintenancePrincipal>,
+    metrics: Arc<sqe_metrics::MetricsRegistry>,
+    audit: Option<Arc<sqe_metrics::audit::AuditLogger>>,
+    catalog_factory: CatalogFactory,
+}
+
+impl MaintenanceScheduler {
+    pub fn new(
+        cfg: MaintenanceConfig,
+        principal: Arc<MaintenancePrincipal>,
+        metrics: Arc<sqe_metrics::MetricsRegistry>,
+        audit: Option<Arc<sqe_metrics::audit::AuditLogger>>,
+        catalog_factory: CatalogFactory,
+    ) -> Self {
+        Self {
+            cfg,
+            principal,
+            metrics,
+            audit,
+            catalog_factory,
+        }
+    }
+
+    /// One advisory pass: mint a session, discover tables under the default
+    /// warehouse (single-catalog in 4a), filter to those opted in via
+    /// `sqe.maintenance.enabled = 'true'`, analyze each due table, and emit
+    /// metrics/audit/log rows. Never mutates a user table.
+    ///
+    /// A failure discovering or loading one table (or a lower-level catalog
+    /// hiccup while listing one namespace) is logged and skipped rather
+    /// than aborting the whole tick: one bad table must not blind the
+    /// scheduler to every other table's compaction debt.
+    ///
+    /// Deliberately does not call `MaintenancePrincipal::refresh`. Task 2's
+    /// carried-forward warning is that a maintenance session's
+    /// `token_expiry()` is fabricated (`now + 1h`) and must never be
+    /// trusted for a long-running job that COMMITS. `advisory_tick` mints a
+    /// brand-new session at the top of every tick and only performs
+    /// read-only catalog calls plus one best-effort log append; a tick that
+    /// somehow runs past real token expiry degrades to a logged per-table
+    /// warning (or a warned, swallowed `maintenance_log` append failure),
+    /// not a silent wrong-privilege commit. The Active-mode rewrite path
+    /// (a later phase) is the one that must refresh unconditionally before
+    /// its commit.
+    pub async fn advisory_tick(&self) -> sqe_core::Result<()> {
+        let job_id = uuid::Uuid::now_v7().to_string();
+        let session = self.principal.mint_session(&job_id).await?;
+        let catalog = (self.catalog_factory)(&session).await?;
+
+        let namespaces = catalog.list_namespaces(None).await.map_err(|e| {
+            SqeError::Catalog(format!("advisory_tick: failed to list namespaces: {e}"))
+        })?;
+
+        let mut props_by_table: Vec<(String, HashMap<String, String>)> = Vec::new();
+        let mut idents_by_table: HashMap<String, TableIdent> = HashMap::new();
+
+        for ns in &namespaces {
+            let tables = match catalog.list_tables(ns).await {
+                Ok(t) => t,
+                Err(e) => {
+                    warn!(
+                        namespace = %ns,
+                        error = %e,
+                        "advisory_tick: failed to list tables; skipping namespace"
+                    );
+                    continue;
+                }
+            };
+            for ident in tables {
+                match crate::maintenance::load_table(&catalog, &ident).await {
+                    Ok(table) => {
+                        let name = ident.to_string();
+                        props_by_table.push((name.clone(), table.metadata().properties().clone()));
+                        idents_by_table.insert(name, ident);
+                    }
+                    Err(e) => {
+                        warn!(
+                            table = %ident,
+                            error = %e,
+                            "advisory_tick: failed to load table; skipping"
+                        );
+                    }
+                }
+            }
+        }
+
+        let enabled = select_enabled(&props_by_table);
+        let now_ms = chrono::Utc::now().timestamp_millis();
+
+        for name in enabled {
+            if !table_due(
+                &name,
+                &self.cfg.scheduler.schedule,
+                self.cfg.scheduler.jitter_secs,
+                now_ms,
+            ) {
+                continue;
+            }
+            let Some(ident) = idents_by_table.get(&name) else {
+                continue;
+            };
+            if let Err(e) = self.analyze_one_table(&catalog, ident, &job_id, now_ms).await {
+                warn!(
+                    table = %name,
+                    error = %e,
+                    "advisory_tick: per-table analysis failed; continuing with other tables"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Analyze one table's compaction debt and report it. Read-only: the
+    /// only write is the best-effort `maintenance_log` append, and even
+    /// that failure is swallowed (logged, not propagated) so it never
+    /// blocks the next table in the same tick.
+    async fn analyze_one_table(
+        &self,
+        catalog: &Arc<dyn Catalog>,
+        ident: &TableIdent,
+        job_id: &str,
+        now_ms: i64,
+    ) -> sqe_core::Result<()> {
+        let table = crate::maintenance::load_table(catalog, ident).await?;
+        let (data_files, delete_files, tasks_by_path) =
+            crate::maintenance::collect_health_inputs(&table).await?;
+
+        let health = crate::table_health::analyze_table_health(
+            &data_files,
+            &delete_files,
+            &tasks_by_path,
+            &self.cfg.compaction,
+            table.metadata().properties(),
+        );
+
+        let name = ident.to_string();
+        self.metrics
+            .table_small_files
+            .with_label_values(&[&name])
+            .set(health.small_files as f64);
+        self.metrics
+            .table_delete_files
+            .with_label_values(&[&name])
+            .set(health.delete_files as f64);
+        self.metrics
+            .maintenance_est_rewrite_bytes
+            .with_label_values(&[&name])
+            .set(health.est_rewrite_bytes as f64);
+
+        if let Some(audit) = &self.audit {
+            audit.log_event(build_maintenance_audit_event(
+                ident,
+                &self.principal.user_id,
+                job_id,
+                &health,
+            ));
+        }
+
+        let row = crate::maintenance_log::advisory_row(&name, &self.principal.user_id, &health, now_ms);
+        if let Err(e) =
+            crate::maintenance_log::append_row(catalog, &self.cfg.scheduler.state_table, &row).await
+        {
+            warn!(
+                table = %name,
+                error = %e,
+                "advisory_tick: maintenance_log append failed (best-effort, not fatal)"
+            );
+        }
+
+        info!(
+            table = %name,
+            small_files = health.small_files,
+            delete_files = health.delete_files,
+            eligible_groups = health.eligible_groups,
+            est_rewrite_bytes = health.est_rewrite_bytes,
+            "advisory_tick: recorded table health"
+        );
+
+        Ok(())
+    }
+
+    /// Spawn the supervised tick loop.
+    ///
+    /// Callers must only call this when `cfg.mode != Off` -- in `Off` mode
+    /// bootstrap never constructs a `MaintenanceScheduler` at all (see the
+    /// module docs). Inside the loop, a tick only runs when the mode is
+    /// `Advisory` or `Active`; that check is redundant with the
+    /// never-construct-in-Off-mode invariant today, but keeps the loop body
+    /// correct on its own terms if that invariant is ever loosened.
+    pub fn spawn(self) -> sqe_core::TaskGuard {
+        sqe_core::spawn_supervised("maintenance-scheduler", move |token| async move {
+            let tick_secs = self.cfg.scheduler.tick_secs.max(1);
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(tick_secs));
+            loop {
+                tokio::select! {
+                    _ = token.cancelled() => break,
+                    _ = ticker.tick() => {
+                        if matches!(self.cfg.mode, MaintenanceMode::Advisory | MaintenanceMode::Active) {
+                            if let Err(e) = self.advisory_tick().await {
+                                warn!(error = %e, "advisory tick failed");
+                                self.metrics.maintenance_tick_errors.inc();
+                            }
+                        }
+                    }
+                }
+            }
+        })
+    }
+}
+
+/// Build the `AuditKind::Maintenance` event for one analyzed table.
+///
+/// `actor` is the maintenance principal (never the interactive caller: this
+/// runs on a background loop, not in response to a user request).
+/// `session_id` carries the tick's job ID so every audit line, metric
+/// sample, and `maintenance_log` row from the same tick share a
+/// correlatable identifier.
+fn build_maintenance_audit_event(
+    ident: &TableIdent,
+    principal_user: &str,
+    job_id: &str,
+    health: &crate::table_health::TableHealth,
+) -> sqe_metrics::audit::AuditEvent {
+    sqe_metrics::audit::AuditEvent {
+        time: chrono::Utc::now(),
+        kind: sqe_metrics::audit::AuditKind::Maintenance,
+        actor: sqe_metrics::audit::Actor::from_parts(
+            principal_user.to_string(),
+            None,
+            None,
+            vec!["maintenance".to_string()],
+            vec![],
+        ),
+        outcome: sqe_metrics::audit::Outcome::Success,
+        resources: vec![sqe_metrics::audit::Resource {
+            catalog: None,
+            namespace: ident.namespace().to_vec(),
+            name: ident.name().to_string(),
+            object_type: sqe_metrics::audit::ObjectType::Table,
+        }],
+        policy: None,
+        timing: None,
+        stats: None,
+        query: Some(sqe_metrics::audit::QueryInfo {
+            text: Some(format!(
+                "advisory_tick: table_health small_files={} delete_files={} \
+                 eligible_groups={} est_rewrite_bytes={}",
+                health.small_files, health.delete_files, health.eligible_groups, health.est_rewrite_bytes
+            )),
+            query_hash: sqe_metrics::audit::query_hash(&format!(
+                "maintenance-advisory:{}",
+                ident
+            )),
+            statement_type: "maintenance_advisory".to_string(),
+        }),
+        session_id: Some(job_id.to_string()),
+        client_ip: None,
+        trace_id: None,
+        query_id: None,
+        integrity: sqe_metrics::audit::Integrity::default(),
+    }
+}
+
+/// Select the tables opted into the scheduler: `props.get(MAINTENANCE_ENABLED_PROPERTY) == Some("true")`.
+///
+/// Pure and unit-testable: takes already-collected `(table, props)` pairs
+/// rather than touching a catalog itself.
+pub fn select_enabled(tables: &[(String, HashMap<String, String>)]) -> Vec<String> {
+    tables
+        .iter()
+        .filter(|(_, props)| {
+            props
+                .get(MAINTENANCE_ENABLED_PROPERTY)
+                .map(|v| v == "true")
+                .unwrap_or(false)
+        })
+        .map(|(name, _)| name.clone())
+        .collect()
+}
+
+/// Deterministic per-table jitter offset in `[0, jitter_secs)`.
+///
+/// Manual FNV-1a rather than `std::collections::hash_map::DefaultHasher`:
+/// the standard library explicitly does not guarantee `DefaultHasher`'s
+/// algorithm is stable across releases, which would make `table_due`'s
+/// behavior (and this function's own unit tests) depend on the exact
+/// toolchain a build happens to use. FNV-1a is a fixed, simple algorithm
+/// with no such caveat.
+fn jitter_offset_secs(ident: &str, jitter_secs: u64) -> u64 {
+    if jitter_secs == 0 {
+        return 0;
+    }
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in ident.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash % jitter_secs
+}
+
+/// True when table `ident` is due for an advisory pass at `now_ms`.
+///
+/// `schedule` (a cron string, e.g. `MaintenanceSchedulerConfig::schedule`)
+/// is accepted but not yet parsed: full cron scheduling is deferred past
+/// Phase 4a. In its place, a table is due once per `jitter_secs`-second
+/// window, at a deterministic per-table second offset within that window
+/// (`jitter_offset_secs`), so many tables opted in at once do not all fire
+/// on the same tick. `jitter_secs == 0` disables windowing (every tick is
+/// due for every table); the scheduler's config default is nonzero, but a
+/// caller that wants unconditional "due if enabled" behavior (as the design
+/// brief allows for 4a) can set it to zero.
+pub fn table_due(ident: &str, _schedule: &str, jitter_secs: u64, now_ms: i64) -> bool {
+    if jitter_secs == 0 {
+        return true;
+    }
+    let now_secs = now_ms.max(0) as u64 / 1000;
+    now_secs % jitter_secs == jitter_offset_secs(ident, jitter_secs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn table_due_is_deterministic_for_same_inputs() {
+        let a = table_due("ns.t1", "0 2 * * *", 900, 1_700_000_000_000);
+        let b = table_due("ns.t1", "0 2 * * *", 900, 1_700_000_000_000);
+        assert_eq!(a, b, "same ident/schedule/jitter/now must always agree");
+    }
+
+    #[test]
+    fn table_due_true_at_its_jitter_offset_second() {
+        let jitter_secs = 900;
+        let offset = jitter_offset_secs("ns.t1", jitter_secs);
+        let now_ms = (offset as i64) * 1000;
+        assert!(
+            table_due("ns.t1", "0 2 * * *", jitter_secs, now_ms),
+            "table must be due exactly at its own jitter offset second"
+        );
+    }
+
+    #[test]
+    fn table_due_false_one_second_off_its_offset() {
+        let jitter_secs = 900;
+        let offset = jitter_offset_secs("ns.t1", jitter_secs);
+        let off_by_one_ms = (((offset + 1) % jitter_secs) as i64) * 1000;
+        assert!(
+            !table_due("ns.t1", "0 2 * * *", jitter_secs, off_by_one_ms),
+            "table must not be due one second off its own jitter offset"
+        );
+    }
+
+    #[test]
+    fn table_due_offsets_differ_across_distinct_idents() {
+        // Not a hard requirement of the hash (collisions are legal), but
+        // this specific pair must not collide or the fixtures above would
+        // not actually be exercising distinct windows.
+        let a = jitter_offset_secs("ns.a", 900);
+        let b = jitter_offset_secs("ns.completely_different_table_name", 900);
+        assert_ne!(a, b, "fixture idents collided; pick different fixtures");
+    }
+
+    #[test]
+    fn table_due_always_true_when_jitter_disabled() {
+        assert!(table_due("ns.t1", "0 2 * * *", 0, 0));
+        assert!(table_due("ns.t1", "0 2 * * *", 0, 123_456_789));
+    }
+
+    #[test]
+    fn select_enabled_filters_by_property() {
+        let tables = vec![
+            (
+                "ns.on".to_string(),
+                HashMap::from([(MAINTENANCE_ENABLED_PROPERTY.to_string(), "true".to_string())]),
+            ),
+            (
+                "ns.off".to_string(),
+                HashMap::from([(MAINTENANCE_ENABLED_PROPERTY.to_string(), "false".to_string())]),
+            ),
+            ("ns.missing".to_string(), HashMap::new()),
+        ];
+        let enabled = select_enabled(&tables);
+        assert_eq!(enabled, vec!["ns.on".to_string()]);
+    }
+
+    #[test]
+    fn select_enabled_empty_input_returns_empty() {
+        assert!(select_enabled(&[]).is_empty());
+    }
+}

@@ -1055,6 +1055,62 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
 
     let audit = Arc::new(audit_logger);
 
+    // Advisory/active auto-compaction scheduler (Phase 4a, Task 5). `Off`
+    // mode (the default) constructs NOTHING here: neither the dedicated
+    // maintenance service principal nor the `MaintenanceScheduler` value
+    // exist anywhere in the process. That absence -- not a runtime no-op --
+    // is the isolation guarantee `[maintenance] mode = "off"` promises; the
+    // principal is never reachable from the interactive auth chain because
+    // it is never constructed at all when mode is off.
+    //
+    // `config.maintenance.scheduler.enabled` is a second, independent gate:
+    // an operator can run `mode = "advisory"` purely so `CALL
+    // system.table_health` and a future external-trigger RPC work, while
+    // leaving the in-process tick loop off (`scheduler.enabled = false`,
+    // the config default) for a Kubernetes-CronJob-driven deployment. Both
+    // the principal and the `MaintenanceScheduler` are still built in that
+    // case (so the external trigger path has something to call into later);
+    // only `_task_guards.push(scheduler.spawn())` is skipped.
+    if config.maintenance.mode != sqe_core::config::MaintenanceMode::Off {
+        let principal_cfg = config.maintenance.principal.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "maintenance.mode is not \"off\" but [maintenance.principal] is unset; \
+                 this should have been rejected by config validation at startup"
+            )
+        })?;
+        let maintenance_principal = Arc::new(
+            sqe_coordinator::maintenance_principal::MaintenancePrincipal::from_config(principal_cfg)
+                .map_err(|e| anyhow::anyhow!("failed to build maintenance principal: {e}"))?,
+        );
+        let catalog_factory = sqe_coordinator::maintenance_scheduler::default_catalog_factory(
+            config.clone(),
+            Some(table_cache.clone()),
+        );
+        let maintenance_scheduler = sqe_coordinator::maintenance_scheduler::MaintenanceScheduler::new(
+            config.maintenance.clone(),
+            maintenance_principal,
+            metrics.clone(),
+            Some(audit.clone()),
+            catalog_factory,
+        );
+        if config.maintenance.scheduler.enabled {
+            _task_guards.push(maintenance_scheduler.spawn());
+            tracing::info!(
+                mode = ?config.maintenance.mode,
+                tick_secs = config.maintenance.scheduler.tick_secs,
+                jitter_secs = config.maintenance.scheduler.jitter_secs,
+                "Started maintenance advisory scheduler loop"
+            );
+        } else {
+            drop(maintenance_scheduler);
+            tracing::info!(
+                mode = ?config.maintenance.mode,
+                "maintenance.mode is not \"off\" but maintenance.scheduler.enabled is false; \
+                 the in-process tick loop will not run (external-trigger deployment expected)"
+            );
+        }
+    }
+
     // Health server. Started here (after audit init) so the audit logger can be
     // threaded into HealthState and dashboard-access events are captured from
     // the first request. Probes (/healthz, /readyz) are still served immediately
