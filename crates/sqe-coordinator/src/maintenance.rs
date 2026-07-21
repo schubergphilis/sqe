@@ -116,6 +116,7 @@ impl MaintenanceHandler {
                 max_concurrent_file_group_rewrites,
                 strategy,
                 sort_order,
+                delete_file_threshold,
             } => {
                 self.rewrite_data_files(
                     session,
@@ -125,6 +126,7 @@ impl MaintenanceHandler {
                     *max_concurrent_file_group_rewrites,
                     strategy.clone(),
                     sort_order.clone(),
+                    *delete_file_threshold,
                 )
                 .await
             }
@@ -521,6 +523,7 @@ impl MaintenanceHandler {
     /// concurrent-equality-delete correctness hole. A failed attempt's orphaned
     /// output files are cleaned up by that attempt's `WriteCleanupGuard` on drop.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     async fn rewrite_data_files(
         &self,
         session: &Session,
@@ -530,6 +533,7 @@ impl MaintenanceHandler {
         max_concurrent_file_group_rewrites: Option<usize>,
         strategy: Option<String>,
         sort_order: Option<String>,
+        delete_file_threshold: Option<usize>,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         const MAX_COMMIT_ATTEMPTS: usize = 4;
         let mut attempt: usize = 0;
@@ -544,6 +548,7 @@ impl MaintenanceHandler {
                     max_concurrent_file_group_rewrites,
                     strategy.clone(),
                     sort_order.clone(),
+                    delete_file_threshold,
                 )
                 .await
             {
@@ -581,6 +586,7 @@ impl MaintenanceHandler {
         max_concurrent_file_group_rewrites: Option<usize>,
         strategy: Option<String>,
         sort_order: Option<String>,
+        delete_file_threshold: Option<usize>,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         const DEFAULT_TARGET_FILE_SIZE_BYTES: u64 = 512 * 1024 * 1024;
         const DEFAULT_MIN_INPUT_FILES: usize = 5;
@@ -647,7 +653,27 @@ impl MaintenanceHandler {
             .sum();
         let total_input_rows: u64 = old_data_files.iter().map(|f| f.record_count()).sum();
 
-        if input_count < min_input {
+        // Delete-heavy data files: those with at least `delete_file_threshold`
+        // delete files applying to them. The scan planner attaches every
+        // applicable delete file (position AND equality) to each data file's
+        // tasks, so this count matches the read cost. These files are worth
+        // rewriting even when they are already at or above the target size (to
+        // apply the accumulated deletes and shed the delete-file layer), which
+        // bin-pack would otherwise leave alone. Empty unless the caller set a
+        // threshold. Moot under `strategy => 'sort'`, which already rewrites the
+        // whole partition, so it is only computed for the bin-pack path.
+        let delete_heavy: std::collections::HashSet<String> =
+            match (sort_ctx.is_some(), delete_file_threshold) {
+                (false, Some(threshold)) if threshold > 0 => {
+                    delete_heavy_files(&read_plan, threshold)
+                }
+                _ => std::collections::HashSet::new(),
+            };
+
+        // Skip a table below `min_input_files` UNLESS a delete-heavy file makes
+        // it worth rewriting anyway (apply accumulated deletes). The
+        // delete_file_threshold path deliberately overrides the file-count floor.
+        if input_count < min_input && delete_heavy.is_empty() {
             info!(
                 table = %ident,
                 input_count,
@@ -665,22 +691,35 @@ impl MaintenanceHandler {
             )?]);
         }
 
-        // Greedy bin-pack small files into groups under `target_bytes`. Files
-        // already at or above target are skipped (no win from re-emitting
-        // them). Sort descending by size so the larger small-files anchor
-        // each group and leftover capacity soaks up the smallest files.
+        // Grouping strategy depends on whether we are sorting.
         //
-        // Partition-aware: never bin-pack across partition boundaries. A
-        // cross-partition group would fan back out to ~1 output file per
-        // partition on write (write_data_files re-splits per row), paying full
-        // I/O for near-zero consolidation.
-        let groups = pack_file_groups_partition_aware(&old_data_files, target_bytes);
+        // Bin-pack (no sort): greedy-pack small files into groups under
+        // `target_bytes`. Files already at or above target are skipped (no win
+        // from re-emitting them) unless they are delete-heavy, in which case
+        // `force_include` keeps them so their deletes get applied. Partition-
+        // aware so a cross-partition group does not fan back out to ~1 file per
+        // partition on write.
+        //
+        // Sort / z-order: pack the WHOLE partition into a single group,
+        // including files already at or above target. The group is sorted as
+        // one stream and the rolling writer cuts it at `target_bytes`, so the
+        // output files carry disjoint key ranges (the property that makes the
+        // layout prunable at scale). Per-group sorting would instead leave each
+        // output file spanning the full key domain -> no pruning.
+        let groups = if sort_ctx.is_some() {
+            group_files_by_partition(&old_data_files)
+        } else {
+            pack_file_groups_partition_aware(&old_data_files, target_bytes, &delete_heavy)
+        };
 
-        // Only groups with >= min_input members are worth rewriting; smaller
-        // groups would trade one commit for no real reduction.
+        // A group is worth rewriting when it meets `min_input` (real
+        // consolidation) OR it contains a delete-heavy file (apply accumulated
+        // deletes, even if the group is small or the file is large).
         let eligible_groups: Vec<Vec<DataFile>> = groups
             .into_iter()
-            .filter(|g| g.len() >= min_input)
+            .filter(|g| {
+                g.len() >= min_input || g.iter().any(|f| delete_heavy.contains(f.file_path()))
+            })
             .collect();
 
         if eligible_groups.is_empty() {
@@ -749,6 +788,7 @@ impl MaintenanceHandler {
                             group,
                             compression,
                             tracker_for_group,
+                            target_bytes,
                         )
                         .await
                     }
@@ -1827,11 +1867,20 @@ async fn collect_live_data_files(
 /// The algorithm sorts files descending by size so larger small-files anchor
 /// each group and the remaining capacity is filled with the smallest files.
 /// Simple, deterministic, and good enough for the maintenance use case.
-pub(crate) fn pack_file_groups(files: &[DataFile], target_bytes: u64) -> Vec<Vec<DataFile>> {
-    // Filter files that are already at or above target: no point re-emitting.
+pub(crate) fn pack_file_groups(
+    files: &[DataFile],
+    target_bytes: u64,
+    force_include: &std::collections::HashSet<String>,
+) -> Vec<Vec<DataFile>> {
+    // Filter files that are already at or above target: no point re-emitting,
+    // unless a file is force-included (delete-heavy) and must be rewritten to
+    // apply its accumulated deletes. A force-included file at/above target ends
+    // up anchoring its own group (nothing else fits), so it is rewritten alone.
     let mut small: Vec<DataFile> = files
         .iter()
-        .filter(|f| f.file_size_in_bytes() < target_bytes)
+        .filter(|f| {
+            f.file_size_in_bytes() < target_bytes || force_include.contains(f.file_path())
+        })
         .cloned()
         .collect();
     // Descending by size.
@@ -1875,7 +1924,11 @@ fn partition_key(f: &DataFile) -> String {
 /// roughly one output file per partition, paying full read+write I/O for near
 /// zero consolidation. Grouping per partition is what makes compaction actually
 /// reduce file counts on partitioned tables.
-fn pack_file_groups_partition_aware(files: &[DataFile], target_bytes: u64) -> Vec<Vec<DataFile>> {
+fn pack_file_groups_partition_aware(
+    files: &[DataFile],
+    target_bytes: u64,
+    force_include: &std::collections::HashSet<String>,
+) -> Vec<Vec<DataFile>> {
     use std::collections::BTreeMap;
     let mut by_partition: BTreeMap<String, Vec<DataFile>> = BTreeMap::new();
     for f in files {
@@ -1886,9 +1939,51 @@ fn pack_file_groups_partition_aware(files: &[DataFile], target_bytes: u64) -> Ve
     }
     let mut out: Vec<Vec<DataFile>> = Vec::new();
     for (_key, part_files) in by_partition {
-        out.extend(pack_file_groups(&part_files, target_bytes));
+        out.extend(pack_file_groups(&part_files, target_bytes, force_include));
     }
     out
+}
+
+/// Data file paths carrying at least `threshold` distinct delete files in the
+/// read plan. The scan planner attaches every applicable delete file (position
+/// and equality) to a data file's `FileScanTask`s, so distinct
+/// `deletes[].data_file_path` across all of a file's tasks is the count of
+/// delete files that must be read to serve that data file. Deduped per data
+/// file so a file split into multiple tasks counts each delete once.
+fn delete_heavy_files(
+    plan: &DeleteAwareReadPlan,
+    threshold: usize,
+) -> std::collections::HashSet<String> {
+    use std::collections::HashSet;
+    let mut out = HashSet::new();
+    for (path, tasks) in &plan.tasks_by_path {
+        let distinct: HashSet<&str> = tasks
+            .iter()
+            .flat_map(|t| t.deletes.iter().map(|d| d.data_file_path.as_str()))
+            .collect();
+        if distinct.len() >= threshold {
+            out.insert(path.clone());
+        }
+    }
+    out
+}
+
+/// Group every file of a partition into a single group, one group per
+/// partition, ignoring file size. Used by the sort/z-order strategy: the whole
+/// partition must be sorted as one stream so the rolling writer can cut it into
+/// files with disjoint key ranges. Unlike `pack_file_groups`, this keeps files
+/// already at or above the target size, because a large unsorted file still has
+/// to be re-laid-out to participate in the sorted layout.
+fn group_files_by_partition(files: &[DataFile]) -> Vec<Vec<DataFile>> {
+    use std::collections::BTreeMap;
+    let mut by_partition: BTreeMap<String, Vec<DataFile>> = BTreeMap::new();
+    for f in files {
+        by_partition
+            .entry(partition_key(f))
+            .or_default()
+            .push(f.clone());
+    }
+    by_partition.into_values().collect()
 }
 
 /// Rewrite one file group, applying its position and equality deletes, and emit
@@ -1914,6 +2009,7 @@ async fn rewrite_group(
     group: Vec<DataFile>,
     compression: parquet::basic::Compression,
     tracker: crate::writer::UploadedPaths,
+    target_bytes: u64,
 ) -> sqe_core::Result<(Vec<DataFile>, Vec<DataFile>, u64)> {
     use futures::StreamExt;
 
@@ -1977,6 +2073,11 @@ async fn rewrite_group(
         compression,
         tracker,
         FanoutLimits::unbounded(),
+        // Roll output at the requested target so a globally-sorted partition
+        // stream is cut into multiple files with disjoint key ranges (the
+        // property that makes sort compaction prunable at scale). Bin-pack
+        // groups are already packed under target, so this is a no-op for them.
+        Some(target_bytes),
     )
     .await?;
     let rows_written = rows_written as u64;
@@ -2145,6 +2246,12 @@ mod tests {
     // live catalog because `pack_file_groups` is pure data manipulation.
     // ---------------------------------------------------------------------
 
+    /// Empty force-include set: the default for bin-pack tests that don't
+    /// exercise delete_file_threshold.
+    fn no_force() -> std::collections::HashSet<String> {
+        std::collections::HashSet::new()
+    }
+
     fn data_file_of_size(path: &str, size: u64) -> DataFile {
         use iceberg::spec::{DataFileBuilder, DataFileFormat, Literal, Struct};
         DataFileBuilder::default()
@@ -2193,13 +2300,44 @@ mod tests {
             data_file_part("p2-a", 10, 0, 2),
             data_file_part("p2-b", 10, 0, 2),
         ];
-        let groups = pack_file_groups_partition_aware(&files, 1024);
+        let groups = pack_file_groups_partition_aware(&files, 1024, &no_force());
         for g in &groups {
             let keys: std::collections::HashSet<String> = g.iter().map(partition_key).collect();
             assert_eq!(keys.len(), 1, "each group must be single-partition, got {keys:?}");
         }
         let total: usize = groups.iter().map(|g| g.len()).sum();
         assert_eq!(total, 4);
+    }
+
+    #[test]
+    fn group_files_by_partition_keeps_whole_partition_including_large_files() {
+        // Sort strategy grouping: one group per partition, containing every
+        // file regardless of size. A file at/above target (which bin-pack would
+        // drop) must still be included so it can be re-laid-out into the sorted
+        // layout.
+        let target = 1024u64;
+        let files = vec![
+            data_file_part("p1-small", 10, 0, 1),
+            data_file_part("p1-huge", target * 4, 0, 1), // bin-pack would drop this
+            data_file_part("p2-a", 10, 0, 2),
+            data_file_part("p2-b", 10, 0, 2),
+        ];
+        let groups = group_files_by_partition(&files);
+        // Exactly one group per partition.
+        assert_eq!(groups.len(), 2, "one group per partition, got {}", groups.len());
+        // Every group is single-partition and no file was dropped.
+        for g in &groups {
+            let keys: std::collections::HashSet<String> = g.iter().map(partition_key).collect();
+            assert_eq!(keys.len(), 1, "each group must be single-partition, got {keys:?}");
+        }
+        let total: usize = groups.iter().map(|g| g.len()).sum();
+        assert_eq!(total, 4, "no file may be dropped, including the large one");
+        // The large file must be present (bin-pack would have excluded it).
+        let has_huge = groups
+            .iter()
+            .flatten()
+            .any(|f| f.file_path() == "p1-huge");
+        assert!(has_huge, "sort grouping must keep files at/above target");
     }
 
     #[test]
@@ -2350,8 +2488,8 @@ mod tests {
             data_file_part("b", 300, 0, 0),
             data_file_part("c", 300, 0, 0),
         ];
-        let pa = pack_file_groups_partition_aware(&files, 1024);
-        let global = pack_file_groups(&files, 1024);
+        let pa = pack_file_groups_partition_aware(&files, 1024, &no_force());
+        let global = pack_file_groups(&files, 1024, &no_force());
         let pa_sizes: usize = pa.iter().map(|g| g.len()).sum();
         let gl_sizes: usize = global.iter().map(|g| g.len()).sum();
         assert_eq!(pa_sizes, gl_sizes);
@@ -2359,7 +2497,7 @@ mod tests {
 
     #[test]
     fn pack_empty_input_returns_empty() {
-        let out = pack_file_groups(&[], 1024);
+        let out = pack_file_groups(&[], 1024, &no_force());
         assert!(out.is_empty());
     }
 
@@ -2370,10 +2508,37 @@ mod tests {
             data_file_of_size("a", target),     // equal to target
             data_file_of_size("b", target + 1), // above target
         ];
-        let out = pack_file_groups(&files, target);
+        let out = pack_file_groups(&files, target, &no_force());
         assert!(
             out.is_empty(),
             "files at or above target must not be packed"
+        );
+    }
+
+    #[test]
+    fn pack_force_include_keeps_file_at_or_above_target() {
+        // A delete-heavy file at/above target is normally dropped, but
+        // force_include keeps it so its deletes can be applied. It anchors its
+        // own group (nothing else fits above target).
+        let target = 1024;
+        let big = data_file_of_size("delete-heavy-big", target * 2);
+        let small = data_file_of_size("small", 100);
+        let files = vec![big, small];
+        let mut force = std::collections::HashSet::new();
+        force.insert("delete-heavy-big".to_string());
+
+        let out = pack_file_groups(&files, target, &force);
+        let all: Vec<&str> = out.iter().flatten().map(|f| f.file_path()).collect();
+        assert!(
+            all.contains(&"delete-heavy-big"),
+            "force-included file at/above target must be kept, got {all:?}"
+        );
+        // Without force_include the same big file is dropped.
+        let out_plain = pack_file_groups(&files, target, &no_force());
+        let plain: Vec<&str> = out_plain.iter().flatten().map(|f| f.file_path()).collect();
+        assert!(
+            !plain.contains(&"delete-heavy-big"),
+            "without force_include the large file must be dropped, got {plain:?}"
         );
     }
 
@@ -2383,7 +2548,7 @@ mod tests {
         let files: Vec<_> = (0..10)
             .map(|i| data_file_of_size(&format!("f{i}"), 100))
             .collect();
-        let out = pack_file_groups(&files, target);
+        let out = pack_file_groups(&files, target, &no_force());
         // 10 * 100 == 1000 == target; exactly one group at the boundary.
         assert_eq!(out.len(), 1, "expected one packed group, got {}", out.len());
         assert_eq!(out[0].len(), 10);
@@ -2397,7 +2562,7 @@ mod tests {
         let files: Vec<_> = (0..11)
             .map(|i| data_file_of_size(&format!("f{i}"), 100))
             .collect();
-        let out = pack_file_groups(&files, target);
+        let out = pack_file_groups(&files, target, &no_force());
         // Greedy descending-first packing: first 10 fill the first group
         // (sum=1000, fits because current+size<=target). The 11th starts a
         // fresh group.
@@ -2414,7 +2579,7 @@ mod tests {
             data_file_of_size("big", 800),
             data_file_of_size("medium", 300),
         ];
-        let out = pack_file_groups(&files, target);
+        let out = pack_file_groups(&files, target, &no_force());
         // Descending order: 800 first in group. Then 300: 800+300>1000, new
         // group. Then 50: 800+50<=1000, placed in first.
         assert_eq!(out.len(), 2);

@@ -10,7 +10,7 @@ Source: `crates/sqe-sql/src/procedures.rs`. Handlers in `crates/sqe-coordinator/
 
 | Procedure | Origin | Required args | Optional args | Notes |
 |---|---|---|---|---|
-| `system.rewrite_data_files` | `sqe-sql` + `sqe-coordinator` | `table => 'ns.t'` | `target_file_size_bytes => N`, `min_input_files => N`, `max_concurrent_file_group_rewrites => N`, `strategy => 'binpack'\|'sort'`, `sort_order => 'col ASC, ...'\|'zorder(a, b)'` | Compacts small data files (delete-aware). Default target 512 MiB, min 5 files per group, max 4 concurrent groups. `strategy => 'sort'` orders each group's rows by `sort_order` (a column list or `zorder(...)`) via a spillable DataFusion sort before writing. |
+| `system.rewrite_data_files` | `sqe-sql` + `sqe-coordinator` | `table => 'ns.t'` | `target_file_size_bytes => N`, `min_input_files => N`, `max_concurrent_file_group_rewrites => N`, `strategy => 'binpack'\|'sort'`, `sort_order => 'col ASC, ...'\|'zorder(a, b)'`, `delete_file_threshold => N` | Compacts small data files (delete-aware). Default target 512 MiB, min 5 files per group, max 4 concurrent groups. `strategy => 'sort'` sorts a whole partition by `sort_order` (a column list or `zorder(...)`) via a spillable DataFusion sort and rolls output at the target size, producing files with disjoint key ranges. `delete_file_threshold => N` also rewrites any data file with at least N delete files applying to it, even when it is already large. |
 | `system.expire_snapshots` | `sqe-sql` + `sqe-coordinator` | `table => 'ns.t'` | `older_than => TIMESTAMP`, `retain_last => N` | Drops old snapshots. `older_than` and `retain_last` combine: a snapshot must be older than `older_than` and beyond the `retain_last` window before it is removed. |
 | `system.remove_orphan_files` | `sqe-sql` + `sqe-coordinator` | `table => 'ns.t'` | `older_than => TIMESTAMP` | Deletes files under the table prefix not referenced by any live snapshot. Default `older_than` is 3 days ago, to avoid racing with in-flight writes. |
 | `system.rewrite_manifests` | `sqe-sql` + `sqe-coordinator` | `table => 'ns.t'` | - | Consolidates many small manifest files into fewer larger ones. Speeds up planning on large tables. |
@@ -52,9 +52,15 @@ Returns one summary row:
 
 ### Sort-compact for read pruning
 
-Load fast (unsorted), then compact into sorted files once. Each file group's
-rows are ordered by `sort_order` through a spillable DataFusion sort, so the
-rewrite stays memory-bounded even when a group is larger than RAM.
+Load fast (unsorted), then compact into sorted files once. The sort strategy
+gathers a whole partition into one stream, orders it by `sort_order` through a
+spillable DataFusion sort, and rolls the output at `target_file_size_bytes`.
+Sorting the partition as a single stream is what makes the result prunable: the
+output files come out with disjoint key ranges instead of each file spanning the
+full domain. The sort spills to disk, so the rewrite stays memory-bounded even
+when a partition is larger than RAM. Unlike bin-pack, the sort strategy also
+rewrites files already at or above the target size, because they still have to
+be re-laid-out to join the sorted layout.
 
 ```sql
 -- Lexicographic sort on one or more columns.
@@ -77,6 +83,36 @@ pruning skips more files. Z-order clusters several columns at once, which helps
 when queries filter on different subsets of those columns. Iceberg's sort-order
 metadata cannot express z-order, so none is stamped for the z-order case
 (matches Spark).
+
+Verify the layout with `table_files`: after a sort compaction the `lower_bounds`
+/ `upper_bounds` of the output files should not overlap on the sort column.
+
+```sql
+SELECT file_path, lower_bounds, upper_bounds
+FROM table_files('analytics', 'events')
+ORDER BY lower_bounds;
+```
+
+### Clean up delete-heavy Merge-on-Read files
+
+On a Merge-on-Read table, repeated `DELETE`/`UPDATE`/`MERGE` accumulate delete
+files. A data file with many deletes is slow to read (every delete file has to
+be applied on scan). `delete_file_threshold` rewrites any data file with at
+least that many delete files applying to it, even when the file is already at or
+above the target size, so bin-pack would otherwise leave it alone.
+
+```sql
+CALL system.rewrite_data_files(
+    table => 'analytics.events',
+    delete_file_threshold => 10
+);
+```
+
+The count includes every delete file the scan attaches to the data file, both
+position and equality deletes. A low threshold on an equality-heavy table
+therefore rewrites broadly, since one equality delete can apply to many files.
+The option is off by default and is a no-op under `strategy => 'sort'`, which
+already rewrites the whole partition.
 
 ### Drop snapshots older than 30 days, keeping the last 10
 
