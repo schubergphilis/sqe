@@ -220,10 +220,13 @@ fn maintenance_config(idp: &MockServer, min_input_files: usize) -> MaintenanceCo
             refresh_skew_secs: 60,
         }),
         scheduler: MaintenanceSchedulerConfig {
-            // jitter_secs = 0 disables the deterministic jitter window
-            // (see `table_due`), so the opted-in table is unconditionally
-            // due regardless of wall-clock time when the test runs.
+            // jitter_secs = 0 means zero jitter *delay* (see `table_due`);
+            // it does NOT bypass the schedule check. Pair it with a
+            // permissive every-minute schedule so the opted-in table is
+            // due at the real wall-clock time the test happens to run,
+            // regardless of what that time is.
             jitter_secs: 0,
+            schedule: "* * * * *".to_string(),
             state_table: "sqe_system.maintenance_log".to_string(),
             ..Default::default()
         },
