@@ -63,8 +63,10 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
+use std::str::FromStr;
 use std::sync::Arc;
 
+use croner::Cron;
 use iceberg::{Catalog, TableIdent};
 use sqe_core::config::{MaintenanceCompactionConfig, MaintenanceConfig, MaintenanceMode};
 use sqe_core::{Session, SqeError};
@@ -229,11 +231,22 @@ impl MaintenanceScheduler {
 
         let enabled = select_enabled(&props_by_table);
         let now_ms = chrono::Utc::now().timestamp_millis();
+        // Lookup for `resolve_schedule`'s per-table `sqe.maintenance.compaction.schedule`
+        // override; built once per tick from the same discovery pass `select_enabled`
+        // just filtered, so the gate and the override resolution can never see
+        // different properties for the same table.
+        let props_by_name: HashMap<&str, &HashMap<String, String>> = props_by_table
+            .iter()
+            .map(|(name, props)| (name.as_str(), props))
+            .collect();
 
         for name in enabled {
+            let empty_props = HashMap::new();
+            let table_props = props_by_name.get(name.as_str()).copied().unwrap_or(&empty_props);
+            let schedule = resolve_schedule(&self.cfg.scheduler.schedule, table_props);
             if !table_due(
                 &name,
-                &self.cfg.scheduler.schedule,
+                &schedule,
                 self.cfg.scheduler.jitter_secs,
                 self.cfg.scheduler.tick_secs,
                 now_ms,
@@ -816,6 +829,25 @@ pub const COMPACTION_DELETE_FILE_THRESHOLD_PROPERTY: &str =
     "sqe.maintenance.compaction.delete-file-threshold";
 /// Table property that overrides `[maintenance.compaction].strategy`.
 pub const COMPACTION_STRATEGY_PROPERTY: &str = "sqe.maintenance.compaction.strategy";
+/// Table property that overrides `[maintenance.scheduler].schedule` (the
+/// global cron expression). See [`resolve_schedule`] and [`table_due`].
+pub const COMPACTION_SCHEDULE_PROPERTY: &str = "sqe.maintenance.compaction.schedule";
+
+/// Resolve the effective cron `schedule` for one table: a
+/// `sqe.maintenance.compaction.schedule` table property overrides
+/// `[maintenance.scheduler].schedule`; an absent or blank override falls
+/// back to the global value. Pure, and deliberately does not validate the
+/// cron syntax itself -- [`table_due`] is the single place that parses (and
+/// reports on) an invalid cron string, so the two can never disagree about
+/// what "invalid" means.
+pub fn resolve_schedule(global_schedule: &str, table_props: &HashMap<String, String>) -> String {
+    table_props
+        .get(COMPACTION_SCHEDULE_PROPERTY)
+        .map(|v| v.trim())
+        .filter(|v| !v.is_empty())
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| global_schedule.to_string())
+}
 
 /// Resolve per-table compaction params: a `sqe.maintenance.compaction.*`
 /// table property overrides the matching `[maintenance.compaction]` global
@@ -927,46 +959,111 @@ fn jitter_offset_secs(ident: &str, jitter_secs: u64) -> u64 {
     hash % jitter_secs
 }
 
-/// True when table `ident` is due for an advisory pass at `now_ms`.
+/// Process-wide dedup for the "invalid cron schedule" warning: keyed on
+/// `ident` + the exact (rejected) schedule string, so a table logs at most
+/// once per distinct bad value rather than once per tick forever, but still
+/// re-warns if the operator edits the property to a DIFFERENT (still
+/// invalid) string. Mutating this on every `table_due` call for an invalid
+/// schedule does not make `table_due` impure in the sense that matters here:
+/// it never reads wall-clock or any other ambient state, and it never
+/// changes the function's *return value* for given inputs (always `false`
+/// on a parse error) -- only whether a side-effecting log line fires.
+fn warned_invalid_schedules() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    static WARNED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    WARNED.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+fn warn_invalid_schedule_once(ident: &str, schedule: &str, error: &croner::errors::CronError) {
+    let key = format!("{ident}\u{1}{schedule}");
+    let mut warned = warned_invalid_schedules()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if warned.insert(key) {
+        warn!(
+            table = %ident,
+            schedule = %schedule,
+            error = %error,
+            "table_due: invalid cron schedule; skipping this table until the schedule is fixed"
+        );
+    }
+}
+
+/// True when table `ident` is due for an advisory (or active) pass at
+/// `now_ms`.
 ///
-/// `schedule` (a cron string, e.g. `MaintenanceSchedulerConfig::schedule`)
-/// is accepted but not yet parsed: full cron scheduling is deferred past
-/// Phase 4a. In its place, a table is due once per `jitter_secs`-second
-/// window, at a deterministic per-table second offset within that window
-/// (`jitter_offset_secs`), so many tables opted in at once do not all fire
-/// on the same tick. `jitter_secs == 0` disables windowing (every tick is
-/// due for every table); the scheduler's config default is nonzero, but a
-/// caller that wants unconditional "due if enabled" behavior (as the design
-/// brief allows for 4a) can set it to zero.
+/// `schedule` is a standard 5-field cron expression (minute hour dom month
+/// dow), e.g. `MaintenanceSchedulerConfig::schedule`'s daily-02:00 default
+/// `"0 2 * * *"`, evaluated via `croner`. A fleet-wide schedule would still
+/// fire every opted-in table on the exact same tick, so `jitter_offset_secs`
+/// adds a deterministic per-table delay (in `[0, jitter_secs)`) on top of
+/// the cron's own fire time before the tick-window check below: the
+/// EFFECTIVE fire instant this function checks against `now_ms` is
+/// `cron_fire_time + jitter_offset_secs(ident, jitter_secs)`, not the raw
+/// cron fire time itself.
 ///
-/// The due predicate is a half-open window `[offset, offset + tick_secs)`
-/// (mod `jitter_secs`), not a single second. The scheduler loop only
-/// samples `now` once per `tick_secs` (see `spawn`); a single-second-wide
-/// window can fall entirely between two samples whenever `tick_secs` does
-/// not evenly divide into `jitter_secs`'s residues the loop actually visits
-/// (e.g. the default `tick_secs = 60` / `jitter_secs = 900` only ever lands
-/// on 15 of the 900 possible residues from a given process start, starving
-/// the other ~98% of per-table offsets forever). Widening the window to
-/// `tick_secs` wide guarantees every offset is covered by some sampled tick
-/// once per `jitter_secs` period, at the cost of a table occasionally
-/// firing on two adjacent ticks at a window boundary -- acceptable since
-/// this scheduler is advisory-only (read-only, idempotent).
-pub fn table_due(ident: &str, _schedule: &str, jitter_secs: u64, tick_secs: u64, now_ms: i64) -> bool {
+/// `jitter_secs == 0` disables both the jitter delay AND the schedule check
+/// entirely (every tick is due for every table), the same escape hatch the
+/// pre-cron implementation offered; some tests rely on this to get
+/// deterministic single-tick behavior regardless of wall-clock time (see
+/// `tests/maintenance_scheduler_test.rs`'s `jitter_secs = 0` fixtures). The
+/// scheduler's config default (`900`) is nonzero, so production always
+/// honors `schedule`.
+///
+/// Due predicate: the table is due iff the effective fire instant falls in
+/// the half-open window `(now_ms - tick_secs, now_ms]`. This is the same
+/// tick-window shape the pre-cron implementation used (a `tick_secs`-wide
+/// window, not a single second) and for the same reason: the scheduler loop
+/// only samples `now` once per `tick_secs` (see `spawn`), and a
+/// `tick_secs`-wide window is exactly what makes consecutive sampled ticks
+/// tile the timeline with no gaps, so no effective fire instant is ever
+/// starved between two samples. Unlike the pre-cron version, there is no
+/// modulo/aliasing concern here: the old bug came from comparing a
+/// coarse-grid `now_secs % jitter_secs` against a single-second window at an
+/// arbitrary (non-tick-aligned) offset; here the window is a plain absolute
+/// half-open interval, so it is covered by the sampled-tick grid regardless
+/// of that grid's phase.
+///
+/// Implementation: shift `now_ms` backward by the jitter offset to get
+/// `adjusted_now`, then ask `croner` for the cron's most recent fire at or
+/// before `adjusted_now` (`find_previous_occurrence(.., inclusive = true)`);
+/// the table is due iff that fire is strictly after `adjusted_now -
+/// tick_secs` seconds, which is algebraically the same window shifted back
+/// by the offset, since `effective_fire = fire + offset` and
+/// `now - tick_secs < effective_fire <= now` iff
+/// `adjusted_now - tick_secs < fire <= adjusted_now` where
+/// `adjusted_now = now - offset`.
+///
+/// An invalid cron `schedule` (fails to parse) or a `croner` search error
+/// (e.g. an unsatisfiable pattern) is logged once per `(ident, schedule)`
+/// pair and treated as "never due" -- this function never panics and never
+/// falls back to "always due" on a bad schedule.
+pub fn table_due(ident: &str, schedule: &str, jitter_secs: u64, tick_secs: u64, now_ms: i64) -> bool {
     if jitter_secs == 0 {
         return true;
     }
-    let now_secs = now_ms.max(0) as u64 / 1000;
-    let r = now_secs % jitter_secs;
-    let offset = jitter_offset_secs(ident, jitter_secs);
-    let end = offset + tick_secs;
-    if end <= jitter_secs {
-        r >= offset && r < end
-    } else {
-        // Window wraps past the end of the jitter period; split into the
-        // tail segment [offset, jitter_secs) and the wrapped head segment
-        // [0, end - jitter_secs).
-        r >= offset || r < end - jitter_secs
-    }
+
+    let cron = match Cron::from_str(schedule) {
+        Ok(c) => c,
+        Err(e) => {
+            warn_invalid_schedule_once(ident, schedule, &e);
+            return false;
+        }
+    };
+
+    let offset_secs = jitter_offset_secs(ident, jitter_secs);
+    let adjusted_now_ms = now_ms - (offset_secs as i64) * 1000;
+    let Some(adjusted_now) = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(adjusted_now_ms) else {
+        return false;
+    };
+
+    let prev_fire = match cron.find_previous_occurrence(&adjusted_now, true) {
+        Ok(t) => t,
+        Err(_) => return false,
+    };
+
+    let window_start_ms = adjusted_now_ms - (tick_secs as i64) * 1000;
+    prev_fire.timestamp_millis() > window_start_ms
 }
 
 #[cfg(test)]
@@ -1133,37 +1230,9 @@ mod tests {
     }
 
     #[test]
-    fn table_due_true_at_its_jitter_offset_second() {
-        let jitter_secs = 900;
-        let tick_secs = 60;
-        let offset = jitter_offset_secs("ns.t1", jitter_secs);
-        let now_ms = (offset as i64) * 1000;
-        assert!(
-            table_due("ns.t1", "0 2 * * *", jitter_secs, tick_secs, now_ms),
-            "table must be due at its own jitter offset second (window's inclusive start)"
-        );
-    }
-
-    #[test]
-    fn table_due_false_outside_window() {
-        let jitter_secs = 900;
-        let tick_secs = 60;
-        let offset = jitter_offset_secs("ns.t1", jitter_secs);
-        // One second before the window's start (mod jitter_secs) is outside
-        // the half-open [offset, offset + tick_secs) window regardless of
-        // tick_secs, unlike "offset + 1" which now falls inside a
-        // tick_secs-wide window.
-        let before_ms = (((offset + jitter_secs - 1) % jitter_secs) as i64) * 1000;
-        assert!(
-            !table_due("ns.t1", "0 2 * * *", jitter_secs, tick_secs, before_ms),
-            "table must not be due one second before its own window opens"
-        );
-    }
-
-    #[test]
     fn table_due_offsets_differ_across_distinct_idents() {
         // Not a hard requirement of the hash (collisions are legal), but
-        // this specific pair must not collide or the fixtures above would
+        // this specific pair must not collide or the fixtures below would
         // not actually be exercising distinct windows.
         let a = jitter_offset_secs("ns.a", 900);
         let b = jitter_offset_secs("ns.completely_different_table_name", 900);
@@ -1172,69 +1241,125 @@ mod tests {
 
     #[test]
     fn table_due_always_true_when_jitter_disabled() {
+        // `jitter_secs == 0` is the pre-cron escape hatch: it bypasses the
+        // schedule check entirely (not just the jitter delay), which is
+        // exactly what `tests/maintenance_scheduler_test.rs` relies on for
+        // deterministic single-tick fixtures regardless of wall-clock time.
         assert!(table_due("ns.t1", "0 2 * * *", 0, 60, 0));
         assert!(table_due("ns.t1", "0 2 * * *", 0, 60, 123_456_789));
+        // Even a syntactically invalid schedule is bypassed when jitter is
+        // disabled, since the schedule is never parsed on this path.
+        assert!(table_due("ns.t1", "not a cron expression", 0, 60, 123_456_789));
     }
 
-    /// Reproduces the tick-cadence aliasing bug directly: with the
-    /// production defaults (`jitter_secs = 900`, `tick_secs = 60`), the
-    /// scheduler loop only ever samples `now_secs` at multiples of
-    /// `tick_secs` from some fixed process-start offset. This test walks
-    /// exactly that lattice (`now_secs = k * tick_secs` for one full
-    /// `jitter_secs` period) and asserts a table is due on at least one --
-    /// and, since a `tick_secs`-wide window over a `tick_secs`-spaced
-    /// lattice contains exactly one lattice point, exactly one -- of those
-    /// ticks. Against the old 1-second-window logic this fails whenever the
-    /// table's jitter offset is not itself a multiple of `tick_secs`, which
-    /// is the ~14/15 common case; the fixture ident below is chosen to land
-    /// in that case so the test actually discriminates old vs. new
-    /// behavior rather than passing on both by luck.
+    /// Fixed UTC instant helper for cron fixtures: avoids depending on the
+    /// local timezone `chrono::Local` would pull in, and panics (rather than
+    /// silently picking an ambiguous instant) on a malformed fixture -- there
+    /// is no DST in UTC, so `.single()` always succeeds for a valid
+    /// (y, mo, d, h, mi, s) tuple.
+    fn utc_ms(y: i32, mo: u32, d: u32, h: u32, mi: u32, s: u32) -> i64 {
+        use chrono::TimeZone;
+        chrono::Utc
+            .with_ymd_and_hms(y, mo, d, h, mi, s)
+            .single()
+            .expect("valid fixture datetime")
+            .timestamp_millis()
+    }
+
     #[test]
-    fn table_due_not_starved_across_full_tick_grid() {
+    fn table_due_true_in_tick_window_covering_daily_0200_fire() {
+        // Daily "0 2 * * *" is due within the tick window covering its own
+        // (jitter-delayed) fire instant.
+        let ident = "ns.cron_fixture_a";
+        let schedule = "0 2 * * *";
         let jitter_secs = 900;
         let tick_secs = 60;
-        let ident = "ns.grid_fixture_table";
 
-        let offset = jitter_offset_secs(ident, jitter_secs);
-        assert_ne!(
-            offset % tick_secs,
-            0,
-            "fixture ident's offset must NOT be tick-aligned, or this test can't tell old code from new"
-        );
-
-        let ticks = jitter_secs / tick_secs;
-        let mut due_count = 0;
-        for k in 0..ticks {
-            let now_secs = k * tick_secs;
-            let now_ms = (now_secs as i64) * 1000;
-            if table_due(ident, "0 2 * * *", jitter_secs, tick_secs, now_ms) {
-                due_count += 1;
-            }
-        }
+        let fire_ms = utc_ms(2026, 3, 5, 2, 0, 0);
+        let offset_secs = jitter_offset_secs(ident, jitter_secs);
+        let effective_fire_ms = fire_ms + (offset_secs as i64) * 1000;
 
         assert!(
-            due_count >= 1,
-            "table must be due on at least one sampled tick per jitter_secs period, got 0 (starved)"
-        );
-        assert_eq!(
-            due_count, 1,
-            "a tick_secs-wide window over a tick_secs-spaced grid must be hit exactly once, got {due_count}"
+            table_due(ident, schedule, jitter_secs, tick_secs, effective_fire_ms),
+            "table must be due at its own effective (schedule + jitter) fire instant"
         );
     }
 
-    /// Companion to `table_due_not_starved_across_full_tick_grid`: two
-    /// distinct idents opted into the scheduler must not always fire on the
-    /// same sampled tick, or the staggering `jitter_offset_secs` exists to
-    /// provide is defeated. Picks idents whose offsets fall in different
-    /// `tick_secs`-wide buckets (not merely "different offsets", which
-    /// could still collide in the same bucket) so the assertion is
-    /// meaningful.
     #[test]
-    fn table_due_staggers_across_distinct_idents() {
+    fn table_due_false_at_1400_for_daily_0200_schedule() {
+        // 14:00 UTC the same day is nowhere near the daily 02:00 fire (even
+        // with up to `jitter_secs` of delay), so the table must not be due.
+        let ident = "ns.cron_fixture_a";
+        let schedule = "0 2 * * *";
         let jitter_secs = 900;
         let tick_secs = 60;
-        let a = "ns.grid_fixture_table";
-        let b = "ns.completely_different_table_name";
+
+        let now_ms = utc_ms(2026, 3, 5, 14, 0, 0);
+        assert!(!table_due(ident, schedule, jitter_secs, tick_secs, now_ms));
+    }
+
+    #[test]
+    fn table_due_false_one_tick_before_effective_fire() {
+        let ident = "ns.cron_fixture_a";
+        let schedule = "0 2 * * *";
+        let jitter_secs = 900;
+        let tick_secs = 60;
+
+        let fire_ms = utc_ms(2026, 3, 5, 2, 0, 0);
+        let offset_secs = jitter_offset_secs(ident, jitter_secs);
+        let effective_fire_ms = fire_ms + (offset_secs as i64) * 1000;
+
+        assert!(
+            !table_due(ident, schedule, jitter_secs, tick_secs, effective_fire_ms - 1_000),
+            "table must not be due one second before its tick window opens"
+        );
+    }
+
+    #[test]
+    fn table_due_true_throughout_tick_window_then_false_after() {
+        // The due window is `tick_secs` wide (half-open, ending at the next
+        // tick boundary), the same anti-aliasing shape the pre-cron
+        // implementation used: the scheduler loop only samples `now` once
+        // per `tick_secs`, so a single-instant-wide window could fall
+        // entirely between two samples. Widening to `tick_secs` guarantees
+        // the sampled-tick grid always covers the effective fire instant
+        // exactly once, regardless of the grid's phase.
+        let ident = "ns.cron_fixture_a";
+        let schedule = "0 2 * * *";
+        let jitter_secs = 900;
+        let tick_secs = 60;
+
+        let fire_ms = utc_ms(2026, 3, 5, 2, 0, 0);
+        let offset_secs = jitter_offset_secs(ident, jitter_secs);
+        let effective_fire_ms = fire_ms + (offset_secs as i64) * 1000;
+
+        assert!(table_due(
+            ident,
+            schedule,
+            jitter_secs,
+            tick_secs,
+            effective_fire_ms + (tick_secs as i64 - 1) * 1000
+        ));
+        assert!(!table_due(
+            ident,
+            schedule,
+            jitter_secs,
+            tick_secs,
+            effective_fire_ms + (tick_secs as i64) * 1000
+        ));
+    }
+
+    #[test]
+    fn table_due_staggers_same_schedule_across_distinct_idents() {
+        // Two tables sharing the exact same fleet-wide cron schedule must
+        // not both become due on the other's tick: the jitter delay exists
+        // precisely so a shared "0 2 * * *" does not fire every opted-in
+        // table on the same tick.
+        let schedule = "0 2 * * *";
+        let jitter_secs = 900;
+        let tick_secs = 60;
+        let a = "ns.cron_fixture_a";
+        let b = "ns.cron_fixture_b";
 
         let offset_a = jitter_offset_secs(a, jitter_secs);
         let offset_b = jitter_offset_secs(b, jitter_secs);
@@ -1244,20 +1369,76 @@ mod tests {
             "fixture idents must land in different tick_secs buckets, or this test can't show staggering"
         );
 
-        let ticks = jitter_secs / tick_secs;
-        let mut both_due_on_same_tick = false;
-        for k in 0..ticks {
-            let now_ms = ((k * tick_secs) as i64) * 1000;
-            let due_a = table_due(a, "0 2 * * *", jitter_secs, tick_secs, now_ms);
-            let due_b = table_due(b, "0 2 * * *", jitter_secs, tick_secs, now_ms);
-            if due_a && due_b {
-                both_due_on_same_tick = true;
-            }
-        }
+        let fire_ms = utc_ms(2026, 3, 5, 2, 0, 0);
+        let now_ms_a = fire_ms + (offset_a as i64) * 1000;
+        let now_ms_b = fire_ms + (offset_b as i64) * 1000;
+
+        assert!(table_due(a, schedule, jitter_secs, tick_secs, now_ms_a));
+        assert!(
+            !table_due(b, schedule, jitter_secs, tick_secs, now_ms_a),
+            "b must not be due on a's tick"
+        );
+        assert!(table_due(b, schedule, jitter_secs, tick_secs, now_ms_b));
+        assert!(
+            !table_due(a, schedule, jitter_secs, tick_secs, now_ms_b),
+            "a must not be due on b's tick"
+        );
+    }
+
+    #[test]
+    fn table_due_invalid_cron_is_skipped_not_panicked() {
+        let now_ms = utc_ms(2026, 3, 5, 2, 0, 0);
+        assert!(!table_due("ns.bad_schedule", "not a cron expression", 900, 60, now_ms));
+        // Calling it again (exercising the warn-once dedup path) must still
+        // just return false, never panic.
+        assert!(!table_due("ns.bad_schedule", "not a cron expression", 900, 60, now_ms));
+    }
+
+    #[test]
+    fn resolve_schedule_falls_back_to_global_when_no_override() {
+        assert_eq!(resolve_schedule("0 2 * * *", &HashMap::new()), "0 2 * * *");
+    }
+
+    #[test]
+    fn resolve_schedule_per_table_override_wins() {
+        let mut props = HashMap::new();
+        props.insert(COMPACTION_SCHEDULE_PROPERTY.to_string(), "0 3 * * *".to_string());
+        assert_eq!(resolve_schedule("0 2 * * *", &props), "0 3 * * *");
+    }
+
+    #[test]
+    fn resolve_schedule_blank_override_falls_back_to_global() {
+        let mut props = HashMap::new();
+        props.insert(COMPACTION_SCHEDULE_PROPERTY.to_string(), "   ".to_string());
+        assert_eq!(resolve_schedule("0 2 * * *", &props), "0 2 * * *");
+    }
+
+    #[test]
+    fn table_due_per_table_override_schedule_wins_over_global() {
+        // The global schedule fires at 02:00 and the per-table override at
+        // 03:00; at 03:00 the table must be due under the resolved
+        // (per-table) schedule even though the global schedule alone would
+        // not be due then.
+        let ident = "ns.cron_override_fixture";
+        let jitter_secs = 900;
+        let tick_secs = 60;
+        let mut props = HashMap::new();
+        props.insert(COMPACTION_SCHEDULE_PROPERTY.to_string(), "0 3 * * *".to_string());
+
+        let global_schedule = "0 2 * * *".to_string();
+        let resolved = resolve_schedule(&global_schedule, &props);
+        assert_eq!(resolved, "0 3 * * *");
+
+        let offset_secs = jitter_offset_secs(ident, jitter_secs);
+        let override_fire_ms = utc_ms(2026, 3, 5, 3, 0, 0) + (offset_secs as i64) * 1000;
 
         assert!(
-            !both_due_on_same_tick,
-            "distinct idents in different offset buckets must not fire on the same sampled tick"
+            table_due(ident, &resolved, jitter_secs, tick_secs, override_fire_ms),
+            "resolved (per-table override) schedule must be due at its own 03:00 fire"
+        );
+        assert!(
+            !table_due(ident, &global_schedule, jitter_secs, tick_secs, override_fire_ms),
+            "the unresolved global 02:00 schedule must not be due at the override's 03:00 fire"
         );
     }
 
