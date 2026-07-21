@@ -204,6 +204,7 @@ impl MaintenanceScheduler {
                 &name,
                 &self.cfg.scheduler.schedule,
                 self.cfg.scheduler.jitter_secs,
+                self.cfg.scheduler.tick_secs,
                 now_ms,
             ) {
                 continue;
@@ -422,12 +423,35 @@ fn jitter_offset_secs(ident: &str, jitter_secs: u64) -> u64 {
 /// due for every table); the scheduler's config default is nonzero, but a
 /// caller that wants unconditional "due if enabled" behavior (as the design
 /// brief allows for 4a) can set it to zero.
-pub fn table_due(ident: &str, _schedule: &str, jitter_secs: u64, now_ms: i64) -> bool {
+///
+/// The due predicate is a half-open window `[offset, offset + tick_secs)`
+/// (mod `jitter_secs`), not a single second. The scheduler loop only
+/// samples `now` once per `tick_secs` (see `spawn`); a single-second-wide
+/// window can fall entirely between two samples whenever `tick_secs` does
+/// not evenly divide into `jitter_secs`'s residues the loop actually visits
+/// (e.g. the default `tick_secs = 60` / `jitter_secs = 900` only ever lands
+/// on 15 of the 900 possible residues from a given process start, starving
+/// the other ~98% of per-table offsets forever). Widening the window to
+/// `tick_secs` wide guarantees every offset is covered by some sampled tick
+/// once per `jitter_secs` period, at the cost of a table occasionally
+/// firing on two adjacent ticks at a window boundary -- acceptable since
+/// this scheduler is advisory-only (read-only, idempotent).
+pub fn table_due(ident: &str, _schedule: &str, jitter_secs: u64, tick_secs: u64, now_ms: i64) -> bool {
     if jitter_secs == 0 {
         return true;
     }
     let now_secs = now_ms.max(0) as u64 / 1000;
-    now_secs % jitter_secs == jitter_offset_secs(ident, jitter_secs)
+    let r = now_secs % jitter_secs;
+    let offset = jitter_offset_secs(ident, jitter_secs);
+    let end = offset + tick_secs;
+    if end <= jitter_secs {
+        r >= offset && r < end
+    } else {
+        // Window wraps past the end of the jitter period; split into the
+        // tail segment [offset, jitter_secs) and the wrapped head segment
+        // [0, end - jitter_secs).
+        r >= offset || r < end - jitter_secs
+    }
 }
 
 #[cfg(test)]
@@ -436,30 +460,36 @@ mod tests {
 
     #[test]
     fn table_due_is_deterministic_for_same_inputs() {
-        let a = table_due("ns.t1", "0 2 * * *", 900, 1_700_000_000_000);
-        let b = table_due("ns.t1", "0 2 * * *", 900, 1_700_000_000_000);
-        assert_eq!(a, b, "same ident/schedule/jitter/now must always agree");
+        let a = table_due("ns.t1", "0 2 * * *", 900, 60, 1_700_000_000_000);
+        let b = table_due("ns.t1", "0 2 * * *", 900, 60, 1_700_000_000_000);
+        assert_eq!(a, b, "same ident/schedule/jitter/tick/now must always agree");
     }
 
     #[test]
     fn table_due_true_at_its_jitter_offset_second() {
         let jitter_secs = 900;
+        let tick_secs = 60;
         let offset = jitter_offset_secs("ns.t1", jitter_secs);
         let now_ms = (offset as i64) * 1000;
         assert!(
-            table_due("ns.t1", "0 2 * * *", jitter_secs, now_ms),
-            "table must be due exactly at its own jitter offset second"
+            table_due("ns.t1", "0 2 * * *", jitter_secs, tick_secs, now_ms),
+            "table must be due at its own jitter offset second (window's inclusive start)"
         );
     }
 
     #[test]
-    fn table_due_false_one_second_off_its_offset() {
+    fn table_due_false_outside_window() {
         let jitter_secs = 900;
+        let tick_secs = 60;
         let offset = jitter_offset_secs("ns.t1", jitter_secs);
-        let off_by_one_ms = (((offset + 1) % jitter_secs) as i64) * 1000;
+        // One second before the window's start (mod jitter_secs) is outside
+        // the half-open [offset, offset + tick_secs) window regardless of
+        // tick_secs, unlike "offset + 1" which now falls inside a
+        // tick_secs-wide window.
+        let before_ms = (((offset + jitter_secs - 1) % jitter_secs) as i64) * 1000;
         assert!(
-            !table_due("ns.t1", "0 2 * * *", jitter_secs, off_by_one_ms),
-            "table must not be due one second off its own jitter offset"
+            !table_due("ns.t1", "0 2 * * *", jitter_secs, tick_secs, before_ms),
+            "table must not be due one second before its own window opens"
         );
     }
 
@@ -475,8 +505,93 @@ mod tests {
 
     #[test]
     fn table_due_always_true_when_jitter_disabled() {
-        assert!(table_due("ns.t1", "0 2 * * *", 0, 0));
-        assert!(table_due("ns.t1", "0 2 * * *", 0, 123_456_789));
+        assert!(table_due("ns.t1", "0 2 * * *", 0, 60, 0));
+        assert!(table_due("ns.t1", "0 2 * * *", 0, 60, 123_456_789));
+    }
+
+    /// Reproduces the tick-cadence aliasing bug directly: with the
+    /// production defaults (`jitter_secs = 900`, `tick_secs = 60`), the
+    /// scheduler loop only ever samples `now_secs` at multiples of
+    /// `tick_secs` from some fixed process-start offset. This test walks
+    /// exactly that lattice (`now_secs = k * tick_secs` for one full
+    /// `jitter_secs` period) and asserts a table is due on at least one --
+    /// and, since a `tick_secs`-wide window over a `tick_secs`-spaced
+    /// lattice contains exactly one lattice point, exactly one -- of those
+    /// ticks. Against the old 1-second-window logic this fails whenever the
+    /// table's jitter offset is not itself a multiple of `tick_secs`, which
+    /// is the ~14/15 common case; the fixture ident below is chosen to land
+    /// in that case so the test actually discriminates old vs. new
+    /// behavior rather than passing on both by luck.
+    #[test]
+    fn table_due_not_starved_across_full_tick_grid() {
+        let jitter_secs = 900;
+        let tick_secs = 60;
+        let ident = "ns.grid_fixture_table";
+
+        let offset = jitter_offset_secs(ident, jitter_secs);
+        assert_ne!(
+            offset % tick_secs,
+            0,
+            "fixture ident's offset must NOT be tick-aligned, or this test can't tell old code from new"
+        );
+
+        let ticks = jitter_secs / tick_secs;
+        let mut due_count = 0;
+        for k in 0..ticks {
+            let now_secs = k * tick_secs;
+            let now_ms = (now_secs as i64) * 1000;
+            if table_due(ident, "0 2 * * *", jitter_secs, tick_secs, now_ms) {
+                due_count += 1;
+            }
+        }
+
+        assert!(
+            due_count >= 1,
+            "table must be due on at least one sampled tick per jitter_secs period, got 0 (starved)"
+        );
+        assert_eq!(
+            due_count, 1,
+            "a tick_secs-wide window over a tick_secs-spaced grid must be hit exactly once, got {due_count}"
+        );
+    }
+
+    /// Companion to `table_due_not_starved_across_full_tick_grid`: two
+    /// distinct idents opted into the scheduler must not always fire on the
+    /// same sampled tick, or the staggering `jitter_offset_secs` exists to
+    /// provide is defeated. Picks idents whose offsets fall in different
+    /// `tick_secs`-wide buckets (not merely "different offsets", which
+    /// could still collide in the same bucket) so the assertion is
+    /// meaningful.
+    #[test]
+    fn table_due_staggers_across_distinct_idents() {
+        let jitter_secs = 900;
+        let tick_secs = 60;
+        let a = "ns.grid_fixture_table";
+        let b = "ns.completely_different_table_name";
+
+        let offset_a = jitter_offset_secs(a, jitter_secs);
+        let offset_b = jitter_offset_secs(b, jitter_secs);
+        assert_ne!(
+            offset_a / tick_secs,
+            offset_b / tick_secs,
+            "fixture idents must land in different tick_secs buckets, or this test can't show staggering"
+        );
+
+        let ticks = jitter_secs / tick_secs;
+        let mut both_due_on_same_tick = false;
+        for k in 0..ticks {
+            let now_ms = ((k * tick_secs) as i64) * 1000;
+            let due_a = table_due(a, "0 2 * * *", jitter_secs, tick_secs, now_ms);
+            let due_b = table_due(b, "0 2 * * *", jitter_secs, tick_secs, now_ms);
+            if due_a && due_b {
+                both_due_on_same_tick = true;
+            }
+        }
+
+        assert!(
+            !both_due_on_same_tick,
+            "distinct idents in different offset buckets must not fire on the same sampled tick"
+        );
     }
 
     #[test]

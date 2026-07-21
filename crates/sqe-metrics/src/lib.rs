@@ -233,11 +233,6 @@ pub struct MetricsRegistry {
     /// per-table analysis failure -- those are caught and logged, not
     /// counted here, so one bad table never inflates this counter).
     pub maintenance_tick_errors: IntCounter,
-    /// Worker fleet size as last observed by the maintenance scheduler.
-    /// Registered in Task 5; wiring `WorkerRegistry`'s live count into this
-    /// gauge is deferred (`MaintenanceScheduler` does not hold a
-    /// `WorkerRegistry` handle yet -- see maintenance_scheduler.rs docs).
-    pub maintenance_fleet_workers: IntGauge,
 }
 
 impl MetricsRegistry {
@@ -679,12 +674,6 @@ impl MetricsRegistry {
             "Advisory/active scheduler tick failures (whole-tick errors, not per-table)",
         )?;
 
-        let maintenance_fleet_workers = register_int_gauge(
-            &registry,
-            "sqe_maintenance_fleet_workers",
-            "Worker fleet size as last observed by the maintenance scheduler",
-        )?;
-
         Ok(Self {
             registry,
             query_count,
@@ -753,7 +742,6 @@ impl MetricsRegistry {
             table_delete_files,
             maintenance_est_rewrite_bytes,
             maintenance_tick_errors,
-            maintenance_fleet_workers,
         })
     }
 }
