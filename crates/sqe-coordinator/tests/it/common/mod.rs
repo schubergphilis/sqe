@@ -69,6 +69,82 @@ pub async fn setup_handler() -> (sqe_core::Session, sqe_coordinator::QueryHandle
     (session, handler)
 }
 
+/// Authenticate as root and return (session, handler) wired to a live worker
+/// fleet, mirroring `integration_test.rs::test_distributed_select`'s
+/// construction. Used by distributed-dispatch tests (query-path dispatch and,
+/// as of Phase 4c Task 6, `CALL system.rewrite_data_files(..., distributed =>
+/// 'require')` compaction dispatch) that need a real `WorkerRegistry` with
+/// reachable worker URLs instead of `setup_handler`'s no-fleet handler.
+///
+/// Fails loudly (not silently) when a URL is unreachable -- issue #122's
+/// lesson applies here too: a distributed test that falls back to local
+/// execution and still passes hides real dispatch regressions.
+///
+/// `worker_urls` entries must be `http://host:port`. Each is checked for TCP
+/// reachability before being marked healthy in the registry.
+#[allow(dead_code)]
+pub async fn setup_handler_with_workers(
+    worker_urls: &[String],
+) -> (sqe_core::Session, sqe_coordinator::QueryHandler) {
+    init_tracing();
+    let config =
+        sqe_core::SqeConfig::load(&test_config_path()).expect("Failed to load test config");
+    let authenticator = sqe_auth::Authenticator::new(&config.auth)
+        .await
+        .expect("Failed to create authenticator");
+    let session = authenticator
+        .authenticate("root", "")
+        .await
+        .expect("Auth failed for root");
+    let policy: Arc<dyn sqe_policy::PolicyEnforcer> = Arc::new(sqe_policy::PassthroughEnforcer);
+
+    for url in worker_urls {
+        let host_port = url
+            .strip_prefix("http://")
+            .unwrap_or_else(|| panic!("worker URL must be http://host:port, got '{url}'"));
+        let addr: std::net::SocketAddr = host_port
+            .parse()
+            .unwrap_or_else(|e| panic!("invalid worker URL '{url}': {e}"));
+        let reachable = std::net::TcpStream::connect_timeout(
+            &addr,
+            std::time::Duration::from_secs(2),
+        );
+        assert!(
+            reachable.is_ok(),
+            "worker unreachable at {url}: a distributed test must fail loudly, not fall \
+             back to local execution. Start a worker there, e.g.:\n  \
+             SQE_WORKER__FLIGHT_PORT={} cargo run -p sqe-worker -- {}\n\
+             or pass --ignored to skip.",
+            addr.port(),
+            test_config_path(),
+        );
+    }
+
+    let registry = Arc::new(sqe_coordinator::worker_registry::WorkerRegistry::new(
+        worker_urls.to_vec(),
+    ));
+    for url in worker_urls {
+        registry.mark_healthy(url).await;
+    }
+
+    let query_tracker = Arc::new(
+        sqe_coordinator::query_tracker::QueryTracker::new(&config.query_history),
+    );
+    let query_cache = if config.query_cache.enabled {
+        Some(Arc::new(sqe_coordinator::query_cache::ResultCache::new(&config.query_cache, None)))
+    } else {
+        None
+    };
+    let handler = sqe_coordinator::QueryHandler::new(
+        policy, None, config, Some(registry), None, None, None, query_tracker, query_cache,
+        None, // grant_backend
+        None, // lineage observer
+        sqe_coordinator::RuntimeCatalogRegistry::default(),
+        sqe_core::SecretStore::default(),
+    ).expect("Failed to create QueryHandler");
+    (session, handler)
+}
+
 /// Format a single cell value from an Arrow column for display / comparison.
 // Used by sql_compat_test.rs; integration_test.rs uses print_results instead.
 #[allow(dead_code)]
