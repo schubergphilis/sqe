@@ -18,6 +18,20 @@
 //! `state_table`) is a real operational problem and is returned as `Err` so
 //! the caller can decide whether to log it, retry, or surface it.
 //!
+//! # Also the lease table (Phase 4d, Task 2)
+//!
+//! `crate::maintenance_lease` stores the multi-coordinator HA lease as rows
+//! in this SAME table (`trigger = "lease"`, `table_name` holding the lease's
+//! `job_key`), rather than a dedicated lease table. See that module's docs
+//! for the full design; this module only needs to know two things: (1)
+//! [`resolve_state_table_ident`] and [`row_to_record_batch`] are `pub(crate)`
+//! specifically so the lease module can resolve the same `state_table`
+//! config value and build rows with the same fixed column order without
+//! duplicating either; (2) no schema change was needed to add the lease --
+//! it fits entirely inside the 14 columns below via the `trigger`/`status`
+//! values `maintenance_lease` uses, so the operator's `CREATE TABLE` DDL is
+//! unchanged.
+//!
 //! # Fixed row schema
 //!
 //! [`row_to_record_batch`] builds a single-row Arrow `RecordBatch` whose
@@ -316,7 +330,7 @@ pub fn maintenance_log_arrow_schema() -> Arc<ArrowSchema> {
 
 /// Shape one `MaintenanceLogRow` into the single-row `RecordBatch`
 /// [`append_row`] writes.
-fn row_to_record_batch(row: &MaintenanceLogRow) -> sqe_core::Result<RecordBatch> {
+pub(crate) fn row_to_record_batch(row: &MaintenanceLogRow) -> sqe_core::Result<RecordBatch> {
     RecordBatch::try_new(
         maintenance_log_arrow_schema(),
         vec![
@@ -344,7 +358,12 @@ fn row_to_record_batch(row: &MaintenanceLogRow) -> sqe_core::Result<RecordBatch>
 ///
 /// Falls back to [`DEFAULT_MAINTENANCE_LOG_TABLE`] when `state_table` is
 /// empty or has no `.` qualifier, rather than guessing at a namespace.
-fn resolve_state_table_ident(state_table: &str) -> TableIdent {
+///
+/// `pub(crate)` so `maintenance_lease.rs` can resolve the same
+/// `state_table` config value to the same `TableIdent` the ledger writer
+/// uses: the lease lives in this table too (see `maintenance_lease.rs`'s
+/// module docs), and the two resolvers must never diverge.
+pub(crate) fn resolve_state_table_ident(state_table: &str) -> TableIdent {
     let candidate = if state_table.trim().is_empty() {
         DEFAULT_MAINTENANCE_LOG_TABLE
     } else {

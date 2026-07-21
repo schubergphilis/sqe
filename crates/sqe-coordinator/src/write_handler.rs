@@ -570,7 +570,13 @@ fn cow_conflict_backoff_ms(attempt: u32) -> u64 {
 /// Max attempts for a CoW UPDATE/DELETE that loses an optimistic-concurrency race.
 const COW_MAX_ATTEMPTS: u32 = 4;
 
-fn is_conflict_message(msg: &str) -> bool {
+/// `pub(crate)` so `maintenance_lease.rs` can classify a losing claim commit
+/// with the exact same transient-conflict heuristic `commit_with_retry` uses
+/// (a real conflict, e.g. the SQL catalog's optimistic-concurrency CAS loss,
+/// warrants a bounded retry; the `ErrorKind::DataInvalid` from a lost
+/// `check_file_existence` lease race does not match this heuristic and must
+/// be classified separately -- see `lease_cas_spike_test.rs` / Task 1).
+pub(crate) fn is_conflict_message(msg: &str) -> bool {
     let lower = msg.to_lowercase();
     lower.contains("commitconflict")
         || lower.contains("commit conflict")

@@ -12,6 +12,7 @@ pub mod catalog_ops;
 pub mod channel_pool;
 pub mod compaction_dispatch;
 pub mod maintenance;
+pub mod maintenance_lease;
 pub mod maintenance_log;
 pub mod maintenance_principal;
 pub mod maintenance_scheduler;
