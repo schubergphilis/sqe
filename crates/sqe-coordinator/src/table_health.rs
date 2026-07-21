@@ -6,11 +6,20 @@
 //! `rewrite_data_files` uses to plan a real rewrite
 //! (`collect_live_data_files`, `collect_live_delete_files`,
 //! `plan_delete_aware_read`, `delete_heavy_files`,
-//! `pack_file_groups_partition_aware`, all in
-//! `crate::maintenance`), so the numbers this reports match what a
-//! subsequent `rewrite_data_files` call would actually see. The later
-//! advisory scheduler task reuses [`analyze_table_health`] directly to emit
-//! per-table metrics without going through the `CALL` surface.
+//! `pack_file_groups_partition_aware`, all in `crate::maintenance`). The
+//! later advisory scheduler task reuses [`analyze_table_health`] directly to
+//! emit per-table metrics without going through the `CALL` surface.
+//!
+//! `eligible_groups` / `est_rewrite_bytes` report the PURE bin-pack count
+//! (`pack_file_groups_partition_aware` with no forced inclusions, filtered on
+//! `min_input_files`) and therefore UNDER-count relative to a subsequent
+//! `rewrite_data_files(delete_file_threshold => N)` call: that call also
+//! force-includes and rewrites any group containing a delete-heavy file even
+//! when the group is smaller than `min_input_files`. `delete_heavy_files`
+//! (this struct's own field) is exactly that set; a caller that wants the
+//! full picture should treat "small-file debt" (`eligible_groups`) and
+//! "delete-heavy debt" (`delete_heavy_files`) as two separate signals rather
+//! than assuming the former subsumes the latter.
 //!
 //! [`analyze_table_health`] itself is pure: it takes already-collected
 //! `DataFile`/delete/task data and never touches the catalog, object store,
@@ -51,12 +60,15 @@ pub struct TableHealth {
     /// Number of data files with at least `delete_file_threshold` distinct
     /// delete files applying to them.
     pub delete_heavy_files: u64,
-    /// Number of bin-pack groups that would be rewritten by
-    /// `rewrite_data_files` under the current compaction config
-    /// (`group.len() >= min_input_files`).
+    /// Number of pure bin-pack groups meeting `min_input_files`
+    /// (`group.len() >= min_input_files`, no forced inclusions). This is the
+    /// small-file debt signal only: it does NOT include groups a
+    /// `rewrite_data_files(delete_file_threshold => N)` call would also
+    /// rewrite purely because they contain a delete-heavy file (see
+    /// `delete_heavy_files`, a separate signal).
     pub eligible_groups: u64,
-    /// Total bytes of the data files in `eligible_groups`: the read+write
-    /// volume a `rewrite_data_files` call would move.
+    /// Total bytes of the data files in `eligible_groups`. Same caveat as
+    /// `eligible_groups`: excludes delete-heavy-only groups.
     pub est_rewrite_bytes: u64,
     /// Timestamp (epoch ms) of the most recent snapshot stamped by a
     /// compaction job, or `None` if none has run. Always `None` in Phase 4a:
