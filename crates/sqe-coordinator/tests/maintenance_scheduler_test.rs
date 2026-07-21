@@ -764,6 +764,17 @@ async fn active_tick_compacts_opted_table_and_leaves_others_untouched() {
         });
     assert_eq!(job_success, Some(1.0));
 
+    let bytes_rewritten = metrics
+        .registry
+        .gather()
+        .into_iter()
+        .find(|f| f.name() == "sqe_maintenance_bytes_rewritten_total")
+        .and_then(|f| f.get_metric().first().map(|m| m.get_counter().value()));
+    assert!(
+        bytes_rewritten.unwrap_or(0.0) > 0.0,
+        "expected sqe_maintenance_bytes_rewritten_total > 0, got {bytes_rewritten:?}"
+    );
+
     // --- Audit: one Maintenance event carrying the "committed" query text ---
     audit.flush();
     let audit_content = std::fs::read_to_string(&audit_path).unwrap_or_default();
