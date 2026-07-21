@@ -500,6 +500,7 @@ pub async fn write_data_files_streaming(
     compression: Compression,
     tracker: UploadedPaths,
     fanout: FanoutLimits,
+    target_file_size: Option<u64>,
 ) -> sqe_core::Result<(Vec<DataFile>, usize)> {
     let inner_loc = DefaultLocationGenerator::new(table.metadata().clone())
         .map_err(|e| SqeError::Execution(format!("Location generator error: {e}")))?;
@@ -518,12 +519,25 @@ pub async fn write_data_files_streaming(
         table.metadata().current_schema().clone(),
     );
 
-    let rolling_writer_builder = RollingFileWriterBuilder::new_with_default_file_size(
-        parquet_writer_builder,
-        table.file_io().clone(),
-        location_generator,
-        file_name_generator,
-    );
+    // Roll output at the caller's requested size when given (compaction pins
+    // this to `target_file_size_bytes` so a globally-sorted stream is cut into
+    // multiple files with disjoint key ranges). Otherwise fall back to the
+    // Iceberg default target size (the ingest paths take this branch).
+    let rolling_writer_builder = match target_file_size {
+        Some(size) => RollingFileWriterBuilder::new(
+            parquet_writer_builder,
+            size as usize,
+            table.file_io().clone(),
+            location_generator,
+            file_name_generator,
+        ),
+        None => RollingFileWriterBuilder::new_with_default_file_size(
+            parquet_writer_builder,
+            table.file_io().clone(),
+            location_generator,
+            file_name_generator,
+        ),
+    };
 
     let data_file_writer_builder = DataFileWriterBuilder::new(rolling_writer_builder);
 
@@ -699,7 +713,7 @@ pub async fn write_data_files_streaming_with_metrics(
     fanout: FanoutLimits,
 ) -> sqe_core::Result<(Vec<DataFile>, usize)> {
     let (data_files, total_rows) =
-        write_data_files_streaming(table, stream, file_prefix, compression, tracker, fanout)
+        write_data_files_streaming(table, stream, file_prefix, compression, tracker, fanout, None)
             .await?;
 
     if let Some(m) = metrics {
