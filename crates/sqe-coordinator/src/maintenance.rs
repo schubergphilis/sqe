@@ -172,6 +172,7 @@ impl MaintenanceHandler {
                 self.move_main_ref(session, table, *snapshot_id, true, "rollback_to_snapshot")
                     .await
             }
+            ProcedureCall::TableHealth { table } => self.table_health(session, table).await,
         }
     }
 
@@ -428,6 +429,51 @@ impl MaintenanceHandler {
         )
     }
 
+    /// Read-only compaction-debt report: `CALL system.table_health`.
+    ///
+    /// Collects the same file/delete/read-plan data `rewrite_data_files`
+    /// would use (`collect_live_data_files`, `collect_live_delete_files`,
+    /// `plan_delete_aware_read`), hands it to the pure
+    /// [`crate::table_health::analyze_table_health`], and returns the
+    /// resulting summary. Never mutates the table and never requires write
+    /// privilege (bypassed in [`authorize_or_deny`] like
+    /// `suggest_bloom_filter_columns`).
+    async fn table_health(
+        &self,
+        session: &Session,
+        table_ref: &TableRef,
+    ) -> sqe_core::Result<Vec<RecordBatch>> {
+        let catalog = self
+            .create_catalog_bridge(session, table_ref.catalog.as_deref())
+            .await?;
+        let ident = to_table_ident(table_ref);
+        let table = load_table(&catalog, &ident).await?;
+
+        let data_files = collect_live_data_files(&table).await?;
+        let delete_files = collect_live_delete_files(&table).await?;
+        let read_plan = plan_delete_aware_read(&table).await?;
+
+        let health = crate::table_health::analyze_table_health(
+            &data_files,
+            &delete_files,
+            &read_plan.tasks_by_path,
+            &self.config.maintenance.compaction,
+            table.metadata().properties(),
+        );
+
+        info!(
+            table = %ident,
+            live_data_files = health.live_data_files,
+            small_files = health.small_files,
+            delete_files = health.delete_files,
+            delete_heavy_files = health.delete_heavy_files,
+            eligible_groups = health.eligible_groups,
+            "table_health: computed compaction-debt report"
+        );
+
+        Ok(vec![crate::table_health::table_health_batch(&health)])
+    }
+
     /// Privilege check. Maintenance procedures mutate table state; we insist
     /// on a write-capable session. The read-only check is intentionally
     /// conservative: any role containing "read" or "select" in its name
@@ -442,7 +488,10 @@ impl MaintenanceHandler {
         call: &ProcedureCall,
     ) -> sqe_core::Result<()> {
         // Read-only procedures bypass the write-privilege gate.
-        if matches!(call, ProcedureCall::SuggestBloomFilterColumns { .. }) {
+        if matches!(
+            call,
+            ProcedureCall::SuggestBloomFilterColumns { .. } | ProcedureCall::TableHealth { .. }
+        ) {
             return Ok(());
         }
         // `purge_orphan_locations` in dry_run mode is also read-only.
@@ -665,7 +714,7 @@ impl MaintenanceHandler {
         let delete_heavy: std::collections::HashSet<String> =
             match (sort_ctx.is_some(), delete_file_threshold) {
                 (false, Some(threshold)) if threshold > 0 => {
-                    delete_heavy_files(&read_plan, threshold)
+                    delete_heavy_files(&read_plan.tasks_by_path, threshold)
                 }
                 _ => std::collections::HashSet::new(),
             };
@@ -1924,7 +1973,7 @@ fn partition_key(f: &DataFile) -> String {
 /// roughly one output file per partition, paying full read+write I/O for near
 /// zero consolidation. Grouping per partition is what makes compaction actually
 /// reduce file counts on partitioned tables.
-fn pack_file_groups_partition_aware(
+pub(crate) fn pack_file_groups_partition_aware(
     files: &[DataFile],
     target_bytes: u64,
     force_include: &std::collections::HashSet<String>,
@@ -1944,19 +1993,26 @@ fn pack_file_groups_partition_aware(
     out
 }
 
-/// Data file paths carrying at least `threshold` distinct delete files in the
-/// read plan. The scan planner attaches every applicable delete file (position
-/// and equality) to a data file's `FileScanTask`s, so distinct
+/// Data file paths carrying at least `threshold` distinct delete files, keyed
+/// by a delete-aware read plan's per-file task list (`DeleteAwareReadPlan::
+/// tasks_by_path`). The scan planner attaches every applicable delete file
+/// (position and equality) to a data file's `FileScanTask`s, so distinct
 /// `deletes[].data_file_path` across all of a file's tasks is the count of
 /// delete files that must be read to serve that data file. Deduped per data
 /// file so a file split into multiple tasks counts each delete once.
-fn delete_heavy_files(
-    plan: &DeleteAwareReadPlan,
+///
+/// Takes the task map directly (rather than the `DeleteAwareReadPlan`
+/// wrapper, which also carries a live `TableScan` that only a real table can
+/// produce) so this stays pure and unit-testable with synthetic
+/// `FileScanTask`s; `table_health::analyze_table_health` reuses it the same
+/// way.
+pub(crate) fn delete_heavy_files(
+    tasks_by_path: &std::collections::HashMap<String, Vec<iceberg::scan::FileScanTask>>,
     threshold: usize,
 ) -> std::collections::HashSet<String> {
     use std::collections::HashSet;
     let mut out = HashSet::new();
-    for (path, tasks) in &plan.tasks_by_path {
+    for (path, tasks) in tasks_by_path {
         let distinct: HashSet<&str> = tasks
             .iter()
             .flat_map(|t| t.deletes.iter().map(|d| d.data_file_path.as_str()))
