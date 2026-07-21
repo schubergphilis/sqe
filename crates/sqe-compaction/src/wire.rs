@@ -439,6 +439,32 @@ mod tests {
         assert!(!verify(&bytes, "not-a-valid-hex-sig", secret));
     }
 
+    /// Pins the empty-secret behavior described in `sign`'s doc comment:
+    /// unlike the scan-ticket path's "empty secret means dev mode, skip
+    /// verification" convention, `wire::verify` never blanket-accepts. An
+    /// empty secret still produces a real (if predictable) tag, and only an
+    /// exact match against it passes. A future edit that special-cases an
+    /// empty secret into an automatic `true` here would be a security
+    /// regression for any deployment that forgot to set the worker secret;
+    /// this test fails first.
+    #[test]
+    fn empty_secret_does_not_blanket_accept_but_is_self_consistent() {
+        let bytes = sample_request().to_bytes().unwrap();
+
+        // An arbitrary signature is not accepted just because the secret is
+        // empty.
+        assert!(!verify(&bytes, "anything", ""));
+        assert!(!verify(&bytes, "", ""));
+
+        // But signing and verifying with the same empty secret is still
+        // internally consistent (it is a real HMAC tag, just a
+        // predictable/weak one -- callers must not rely on an empty secret
+        // for real security, matching the scan-ticket path's own framing of
+        // an empty secret as "allow_unauthenticated dev mode").
+        let sig = sign(&bytes, "");
+        assert!(verify(&bytes, &sig, ""));
+    }
+
     #[test]
     fn sort_spec_wire_roundtrips_columns() {
         let spec = SortSpec::Columns(vec![
