@@ -118,6 +118,10 @@ impl MaintenanceHandler {
                 sort_order,
                 delete_file_threshold,
             } => {
+                // Manual `CALL system.rewrite_data_files` always commits with
+                // no snapshot-property stamp. Job-identity stamping
+                // (`sqe.maintenance.job-id` / `.principal` / `.trigger`) is
+                // reserved for the Phase 4b scheduler's internal call path.
                 self.rewrite_data_files(
                     session,
                     table,
@@ -127,6 +131,7 @@ impl MaintenanceHandler {
                     strategy.clone(),
                     sort_order.clone(),
                     *delete_file_threshold,
+                    None,
                 )
                 .await
             }
@@ -570,7 +575,6 @@ impl MaintenanceHandler {
     /// concurrent-equality-delete correctness hole. A failed attempt's orphaned
     /// output files are cleaned up by that attempt's `WriteCleanupGuard` on drop.
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     async fn rewrite_data_files(
         &self,
         session: &Session,
@@ -581,6 +585,7 @@ impl MaintenanceHandler {
         strategy: Option<String>,
         sort_order: Option<String>,
         delete_file_threshold: Option<usize>,
+        snapshot_properties: Option<std::collections::HashMap<String, String>>,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         const MAX_COMMIT_ATTEMPTS: usize = 4;
         let mut attempt: usize = 0;
@@ -596,6 +601,7 @@ impl MaintenanceHandler {
                     strategy.clone(),
                     sort_order.clone(),
                     delete_file_threshold,
+                    snapshot_properties.clone(),
                 )
                 .await
             {
@@ -634,6 +640,7 @@ impl MaintenanceHandler {
         strategy: Option<String>,
         sort_order: Option<String>,
         delete_file_threshold: Option<usize>,
+        snapshot_properties: Option<std::collections::HashMap<String, String>>,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         const DEFAULT_TARGET_FILE_SIZE_BYTES: u64 = 512 * 1024 * 1024;
         const DEFAULT_MIN_INPUT_FILES: usize = 5;
@@ -921,13 +928,20 @@ impl MaintenanceHandler {
         // atomic swap.
         let files_to_remove: Vec<DataFile> =
             old_files.iter().cloned().chain(covered_deletes).collect();
-        let action = tx
+        let mut action = tx
             .rewrite_files()
             .set_enable_delete_filter_manager(true)
             .set_check_file_existence(true)
             .set_new_data_file_sequence_number(seq_at_start)
             .add_data_files(new_files)
             .delete_files(files_to_remove);
+        // Job-identity stamp for autonomous compactions (Phase 4b scheduler).
+        // The manual `CALL system.rewrite_data_files` path always passes
+        // `None` here, so its committed snapshot summary is byte-identical
+        // to before this parameter existed.
+        if let Some(props) = snapshot_properties {
+            action.set_snapshot_properties(props);
+        }
         let tx_applied = action
             .apply(tx)
             .map_err(|e| SqeError::Execution(format!("rewrite_files apply failed: {e}")))?;
