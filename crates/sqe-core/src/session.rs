@@ -60,6 +60,18 @@ pub struct Session {
     /// `iceberg.compression_codec` Trino session property (`X-Trino-Session`).
     /// When set, write paths use it instead of `config.catalog.parquet_compression`.
     pub compression_codec: Option<String>,
+    /// Explicit, internal write-authority marker for the in-process
+    /// maintenance principal (Phase 4b active auto-compaction).
+    ///
+    /// This is set to `true` ONLY by `MaintenancePrincipal::session_from_identity`
+    /// (`sqe-coordinator/src/maintenance_principal.rs`), never by any
+    /// auth/wire/config deserialization path. It grants IN-ENGINE write
+    /// authorization for `MaintenanceHandler::authorize_or_deny`
+    /// (`session_has_write_privilege`) so autonomous compaction is
+    /// authorized explicitly rather than by accident of the "unknown role
+    /// defaults to allow" heuristic. Polaris remains the real server-side
+    /// enforcer; this field does not bypass it.
+    maintenance_authority: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -98,6 +110,7 @@ impl Session {
             source: None,
             write_branch: None,
             compression_codec: None,
+            maintenance_authority: false,
         }
     }
 
@@ -173,6 +186,29 @@ impl Session {
         self.user.email = email;
         self.user.groups = groups;
         self
+    }
+
+    /// Returns a new session with the explicit maintenance write-authority
+    /// marker set. Intended to be called exactly once, by
+    /// `MaintenancePrincipal::session_from_identity`, when minting the
+    /// ephemeral session the compaction scheduler runs under. No other call
+    /// site should invoke this: the marker is never derived from a token,
+    /// wire request, or config value, so nothing an external caller sends can
+    /// set it.
+    #[must_use = "with_maintenance_authority consumes self; bind the returned Session"]
+    pub fn with_maintenance_authority(mut self, yes: bool) -> Self {
+        self.maintenance_authority = yes;
+        self
+    }
+
+    /// Returns `true` if this session carries the explicit maintenance
+    /// write-authority marker set by `with_maintenance_authority`. Consulted
+    /// by `sqe_coordinator::maintenance::session_has_write_privilege` to
+    /// grant write access to the maintenance principal's session independent
+    /// of the role-name heuristic. Polaris still enforces authorization
+    /// server-side; this only affects in-engine gating.
+    pub fn has_maintenance_authority(&self) -> bool {
+        self.maintenance_authority
     }
 
     pub fn token_fingerprint(&self) -> String {
@@ -337,6 +373,24 @@ mod tests {
         assert_eq!(s.user.subject.as_deref(), Some("u-1"));
         assert_eq!(s.user.email.as_deref(), Some("alice@x.io"));
         assert_eq!(s.user.groups, vec!["hr".to_string()]);
+    }
+
+    #[test]
+    fn maintenance_authority_defaults_to_false() {
+        let session = make_session();
+        assert!(!session.has_maintenance_authority());
+    }
+
+    #[test]
+    fn with_maintenance_authority_true_is_reported_by_accessor() {
+        let session = make_session().with_maintenance_authority(true);
+        assert!(session.has_maintenance_authority());
+    }
+
+    #[test]
+    fn with_maintenance_authority_false_is_reported_by_accessor() {
+        let session = make_session().with_maintenance_authority(true).with_maintenance_authority(false);
+        assert!(!session.has_maintenance_authority());
     }
 
     #[test]

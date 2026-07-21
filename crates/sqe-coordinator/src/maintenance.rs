@@ -2245,9 +2245,17 @@ fn summary_batch(
     Ok(batch)
 }
 
-/// Treat the session as write-capable when no explicit read-only role is set.
+/// Treat the session as write-capable when it carries the explicit
+/// maintenance-authority marker, or when no explicit read-only role is set.
 ///
 /// Rules, applied in order:
+/// 0. If `session.has_maintenance_authority()` is true, the session is
+///    write-capable, full stop. This is the explicit Phase 4b authorization
+///    path for the in-process maintenance principal (set only by
+///    `MaintenancePrincipal::session_from_identity`); it is checked before
+///    and independent of the role-name heuristic below, so the maintenance
+///    session's write authority never depends on how its Polaris roles
+///    happen to be named.
 /// 1. If any role name matches `^read` or `^select` (case-insensitive),
 ///    AND no role contains "write" or "admin", the session is read-only.
 /// 2. Otherwise the session is write-capable.
@@ -2256,6 +2264,10 @@ fn summary_batch(
 /// the policy enforcement wiring lands; this function is the engine-level
 /// fallback and is the source of truth for the `#[ignore]` integration tests.
 pub(crate) fn session_has_write_privilege(session: &Session) -> bool {
+    if session.has_maintenance_authority() {
+        return true;
+    }
+
     let roles = &session.user.roles;
     if roles.is_empty() {
         return true;
@@ -2327,6 +2339,26 @@ mod tests {
         // whose policy enforcement runs elsewhere (OPA/Cedar/Polaris).
         let session = session_with_roles(vec!["analyst"]);
         assert!(session_has_write_privilege(&session));
+    }
+
+    #[test]
+    fn write_privilege_maintenance_authority_overrides_read_only_roles() {
+        // A session carrying the explicit maintenance-authority marker must
+        // pass the write gate even if its roles would otherwise mark it
+        // read-only. This is the Phase 4b explicit authorization path: the
+        // maintenance session must not depend on how its Polaris roles
+        // happen to be spelled.
+        let session = session_with_roles(vec!["readonly"]).with_maintenance_authority(true);
+        assert!(session_has_write_privilege(&session));
+    }
+
+    #[test]
+    fn write_privilege_normal_read_only_session_without_marker_still_denied() {
+        // Without the explicit marker, a normal read-only session is denied
+        // exactly as before: the new marker must not weaken the existing
+        // role-name heuristic for non-maintenance sessions.
+        let session = session_with_roles(vec!["readonly"]);
+        assert!(!session_has_write_privilege(&session));
     }
 
     // ---------------------------------------------------------------------
