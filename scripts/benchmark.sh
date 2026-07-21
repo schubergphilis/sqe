@@ -9,7 +9,13 @@
 #   BENCH_PROFILE   profile name/path (default: local)
 #   BENCH_SCALE     scale factor (default: 1)
 #   BENCH_COMPARE   set to 1 to add --compare-trino
-#   BENCH_QUERY_TIMEOUT_SECS  per-query timeout override (default: per-file header or 300s)
+#   BENCH_QUERY_TIMEOUT_SECS  per-query timeout override. Unset -> a
+#                   scale-aware default (300s below sf10, 900s at sf10+).
+#   BENCH_MEMORY_LIMIT  coordinator memory_limit override (e.g. 24GB). Unset ->
+#                   the committed coordinator-attach.toml value (64GB). Lower it
+#                   below physical RAM at large scale so the engine SPILLS
+#                   before the OS OOM-kills it (the memory-budget OOM trap).
+#   BENCH_TRINO_MEMORY  Trino query.max-memory[-per-node] (default: 8GB).
 #   BENCH_GOLDEN_TOKEN, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY  passed through
 set -euo pipefail
 
@@ -20,6 +26,22 @@ PROFILE="${BENCH_PROFILE:-local}"
 SCALE="${BENCH_SCALE:-1}"
 SUITES=("$@")
 [ ${#SUITES[@]} -gt 0 ] || { echo "usage: benchmark.sh <suite...>" >&2; exit 1; }
+
+# Scale-aware knobs. Heavy queries at sf10+ blow past the 300s per-query
+# default; give them more headroom unless the caller pinned a value. awk does
+# the float compare because SCALE may be fractional (0.1) or integral (10).
+if [ -z "${BENCH_QUERY_TIMEOUT_SECS:-}" ]; then
+    if awk "BEGIN{exit !(${SCALE} >= 10)}"; then
+        BENCH_QUERY_TIMEOUT_SECS=900
+    else
+        BENCH_QUERY_TIMEOUT_SECS=300
+    fi
+    export BENCH_QUERY_TIMEOUT_SECS
+fi
+# Trino per-query memory (compare mode). SF10 joins/aggs need more than the
+# 8GB baseline; override per box with BENCH_TRINO_MEMORY.
+TRINO_MEMORY="${BENCH_TRINO_MEMORY:-8GB}"
+echo "==> scale sf${SCALE}: per-query timeout ${BENCH_QUERY_TIMEOUT_SECS}s, coordinator memory_limit ${BENCH_MEMORY_LIMIT:-<config default>}, trino memory ${TRINO_MEMORY}"
 
 PROFILE_FILE="benchmarks/profiles/${PROFILE}.toml"
 [ -f "$PROFILE_FILE" ] || { echo "ERROR: no profile $PROFILE_FILE" >&2; exit 1; }
@@ -35,9 +57,13 @@ fi
 COORD_PID=""
 STACK_UP=""
 TRINO_CONTAINER=""
+COORD_CFG=""
+COORD_TEMPLATE="$ROOT_DIR/tests/benchmark-attach/coordinator-attach.toml"
 cleanup() {
     [ -n "$COORD_PID" ] && kill "$COORD_PID" 2>/dev/null || true
     [ -n "$TRINO_CONTAINER" ] && docker stop trino-bench >/dev/null 2>&1 || true
+    # Drop the templated coordinator config only if we generated one.
+    [ -n "$COORD_CFG" ] && [ "$COORD_CFG" != "$COORD_TEMPLATE" ] && rm -f "$COORD_CFG" || true
     # Never `docker compose down` here. Polaris runs POLARIS_PERSISTENCE_TYPE=
     # in-memory, so tearing the stack down wipes the pre-published golden
     # catalog that attach mode exists to reuse. Leave the stack up for
@@ -57,12 +83,31 @@ if [ "$MANAGE_STACK" = 1 ]; then
     STACK_UP=1
 fi
 
+# Stale-coordinator guard. We health-wait on :60051 below; if a coordinator
+# from a killed prior run is still bound there, that wait would pass against
+# the STALE process and we would silently benchmark the wrong binary/config.
+# Fail fast BEFORE spawning ours.
+if nc -z localhost 60051 2>/dev/null; then
+    echo "ERROR: something is already listening on :60051 (a stale coordinator from a killed run?)." >&2
+    echo "       Kill it and retry:  lsof -ti tcp:60051 | xargs kill" >&2
+    exit 1
+fi
+
 echo "==> Starting coordinator (attach config)"
 # The coordinator takes its config as a positional arg (defaults to sqe.toml).
+# Template the committed config when BENCH_MEMORY_LIMIT overrides memory_limit
+# (the committed default stays authoritative when unset).
+COORD_CFG="$COORD_TEMPLATE"
+if [ -n "${BENCH_MEMORY_LIMIT:-}" ]; then
+    COORD_CFG="/tmp/sqe-bench-coord-cfg-$$.toml"
+    sed "s/^memory_limit = .*/memory_limit = \"${BENCH_MEMORY_LIMIT}\"/" \
+        "$COORD_TEMPLATE" > "$COORD_CFG"
+    echo "    memory_limit overridden -> ${BENCH_MEMORY_LIMIT} ($COORD_CFG)"
+fi
 COORD_LOG="/tmp/sqe-bench-coord-$$.log"
 RUST_LOG="${RUST_LOG:-sqe=info,warn}" \
     target/release/sqe-coordinator \
-    "$ROOT_DIR/tests/benchmark-attach/coordinator-attach.toml" \
+    "$COORD_CFG" \
     > "$COORD_LOG" 2>&1 &
 COORD_PID=$!
 echo "    coordinator log: $COORD_LOG"
@@ -132,13 +177,13 @@ s3.path-style-access=true
 s3.aws-access-key=${AWS_ACCESS_KEY_ID}
 s3.aws-secret-key=${AWS_SECRET_ACCESS_KEY}
 TRINOEOF
-    cat > /tmp/trino-bench/config.properties << 'TRINOEOF'
+    cat > /tmp/trino-bench/config.properties << TRINOEOF
 coordinator=true
 node-scheduler.include-coordinator=true
 http-server.http.port=8080
 discovery.uri=http://localhost:8080
-query.max-memory=8GB
-query.max-memory-per-node=8GB
+query.max-memory=${TRINO_MEMORY}
+query.max-memory-per-node=${TRINO_MEMORY}
 TRINOEOF
 
     docker stop trino-bench >/dev/null 2>&1 || true
