@@ -26,7 +26,7 @@ flight_compression = "lz4"      # IPC compression for client DoGet responses
 shuffle_compression = "zstd"    # IPC compression for internal DoExchange shuffle
 
 [coordinator.tls]
-cert_file = ""                  # PEM certificate — TLS enabled when both cert + key are set
+cert_file = ""                  # PEM certificate (TLS enabled when both cert + key are set)
 key_file = ""                   # PEM private key
 ca_file = ""                    # Optional PEM CA for mTLS client certificate verification
 
@@ -130,14 +130,14 @@ backend = "none"                # none (default) | polaris | ranger | chameleon
 engine = "passthrough"
 
 [session]
-idle_timeout_secs = 900         # 15 min — sessions idle longer are expired
-absolute_timeout_secs = 28800   # 8 hours — hard session lifetime cap
+idle_timeout_secs = 900         # 15 min, sessions idle longer are expired
+absolute_timeout_secs = 28800   # 8 hours, hard session lifetime cap
 persistence = "memory"          # "memory" (default) or "file"
 persistence_path = "/tmp/sqe-sessions.json"  # Path for file-based persistence
 snapshot_interval_secs = 60     # How often file persistence snapshots sessions to disk
 
 [query]
-timeout_secs = 300              # 5 min — max execution time per query
+timeout_secs = 300              # 5 min, max execution time per query
 max_result_rows = 1000000       # Max rows per query (0 = unlimited)
 max_concurrent_queries = 100    # Concurrency limit (0 = unlimited)
 max_query_memory = "256MB"      # Per-query memory limit

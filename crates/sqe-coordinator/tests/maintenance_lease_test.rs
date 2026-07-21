@@ -220,6 +220,49 @@ async fn renew_after_lease_lost_to_a_steal_returns_err() {
 }
 
 #[tokio::test]
+async fn release_after_lease_stolen_does_not_clobber_new_holder() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let catalog = sqlite_catalog(&dir).await;
+    create_maintenance_log_table(&catalog).await;
+
+    let h1 = try_acquire(&catalog, STATE_TABLE, JOB_KEY, "holder-1", 1, 1_000)
+        .await
+        .expect("try_acquire succeeds")
+        .expect("holder-1 acquires");
+
+    // Let it expire and get stolen by holder-2.
+    let mut h2 = try_acquire(&catalog, STATE_TABLE, JOB_KEY, "holder-2", 60, 5_000)
+        .await
+        .expect("try_acquire succeeds")
+        .expect("holder-2 steals the expired lease");
+
+    // holder-1 (unaware its lease was stolen out from under it) now calls
+    // release. This must be a no-op: it must NOT delete holder-2's live
+    // claim and replace it with holder-1's stale tombstone (the bug this
+    // regression test guards against).
+    release(h1, &catalog, STATE_TABLE, 6_000)
+        .await
+        .expect("release after a steal must be a no-op success, not an error");
+
+    // holder-2's live claim must still be present and must still deny a
+    // third holder -- if holder-1's release had clobbered it with a
+    // tombstone, this would wrongly succeed.
+    let denied = try_acquire(&catalog, STATE_TABLE, JOB_KEY, "holder-3", 60, 6_500)
+        .await
+        .expect("try_acquire succeeds");
+    assert!(
+        denied.is_none(),
+        "holder-1's stale release must not have clobbered holder-2's live claim with a tombstone"
+    );
+
+    // holder-2 must still be able to renew its own claim -- proof the live
+    // row is genuinely still holder-2's (not just "some non-empty row").
+    renew(&mut h2, &catalog, STATE_TABLE, 60, 7_000)
+        .await
+        .expect("holder-2 must still hold and be able to renew its lease after holder-1's stale release");
+}
+
+#[tokio::test]
 async fn concurrent_try_acquire_for_the_same_job_key_exactly_one_wins() {
     let dir = tempfile::tempdir().expect("tempdir");
     let catalog = sqlite_catalog(&dir).await;

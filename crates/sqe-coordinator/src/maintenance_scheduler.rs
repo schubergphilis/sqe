@@ -754,7 +754,12 @@ impl MaintenanceScheduler {
         if let Some(handle) = released_handle {
             let release_now_ms = chrono::Utc::now().timestamp_millis();
             let handle_for_audit = handle.clone();
-            match maintenance_lease::release(handle, catalog, &self.cfg.scheduler.state_table, release_now_ms).await {
+            // Use `commit_catalog` (the refreshed per-job catalog), not the
+            // tick-level discovery `catalog`: `renew` (in
+            // `run_with_lease_renewal`) already uses `commit_catalog`, and a
+            // long job's discovery-time token can be stale by the time it
+            // finishes, same rationale as the commit-catalog rebuild above.
+            match maintenance_lease::release(handle, &commit_catalog, &self.cfg.scheduler.state_table, release_now_ms).await {
                 Ok(()) => {
                     if let Some(audit) = &self.audit {
                         audit.log_event(build_lease_audit_event(
