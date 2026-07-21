@@ -968,6 +968,10 @@ fn jitter_offset_secs(ident: &str, jitter_secs: u64) -> u64 {
 /// it never reads wall-clock or any other ambient state, and it never
 /// changes the function's *return value* for given inputs (always `false`
 /// on a parse error) -- only whether a side-effecting log line fires.
+///
+/// Intentionally unbounded: it never evicts entries, but in practice it is
+/// bounded by the number of distinct (table, invalid-schedule-string) pairs
+/// ever seen, which tracks table/config count, not tick count.
 fn warned_invalid_schedules() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
     static WARNED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
         std::sync::OnceLock::new();
@@ -994,21 +998,24 @@ fn warn_invalid_schedule_once(ident: &str, schedule: &str, error: &croner::error
 ///
 /// `schedule` is a standard 5-field cron expression (minute hour dom month
 /// dow), e.g. `MaintenanceSchedulerConfig::schedule`'s daily-02:00 default
-/// `"0 2 * * *"`, evaluated via `croner`. A fleet-wide schedule would still
-/// fire every opted-in table on the exact same tick, so `jitter_offset_secs`
-/// adds a deterministic per-table delay (in `[0, jitter_secs)`) on top of
-/// the cron's own fire time before the tick-window check below: the
-/// EFFECTIVE fire instant this function checks against `now_ms` is
-/// `cron_fire_time + jitter_offset_secs(ident, jitter_secs)`, not the raw
-/// cron fire time itself.
+/// `"0 2 * * *"`, evaluated via `croner` in UTC (see `MaintenanceSchedulerConfig::schedule`'s
+/// doc comment). A fleet-wide schedule would still fire every opted-in
+/// table on the exact same tick, so `jitter_offset_secs` adds a
+/// deterministic per-table delay (in `[0, jitter_secs)`) on top of the
+/// cron's own fire time before the tick-window check below: the EFFECTIVE
+/// fire instant this function checks against `now_ms` is `cron_fire_time +
+/// jitter_offset_secs(ident, jitter_secs)`, not the raw cron fire time
+/// itself.
 ///
-/// `jitter_secs == 0` disables both the jitter delay AND the schedule check
-/// entirely (every tick is due for every table), the same escape hatch the
-/// pre-cron implementation offered; some tests rely on this to get
-/// deterministic single-tick behavior regardless of wall-clock time (see
-/// `tests/maintenance_scheduler_test.rs`'s `jitter_secs = 0` fixtures). The
-/// scheduler's config default (`900`) is nonzero, so production always
-/// honors `schedule`.
+/// `jitter_secs == 0` means zero jitter delay (the effective fire instant
+/// equals the raw cron fire time) -- it does NOT bypass the schedule check.
+/// `schedule` is always parsed and validated, and the normal tick-window
+/// check below always applies; an invalid cron with `jitter_secs == 0` is
+/// therefore never always-due, matching every other `jitter_secs` value.
+/// Tests that want deterministic single-tick behavior regardless of
+/// wall-clock time should pair `jitter_secs = 0` with a permissive
+/// every-tick schedule (e.g. `"* * * * *"`), not rely on a bypass (see
+/// `tests/maintenance_scheduler_test.rs`).
 ///
 /// Due predicate: the table is due iff the effective fire instant falls in
 /// the half-open window `(now_ms - tick_secs, now_ms]`. This is the same
@@ -1039,10 +1046,6 @@ fn warn_invalid_schedule_once(ident: &str, schedule: &str, error: &croner::error
 /// pair and treated as "never due" -- this function never panics and never
 /// falls back to "always due" on a bad schedule.
 pub fn table_due(ident: &str, schedule: &str, jitter_secs: u64, tick_secs: u64, now_ms: i64) -> bool {
-    if jitter_secs == 0 {
-        return true;
-    }
-
     let cron = match Cron::from_str(schedule) {
         Ok(c) => c,
         Err(e) => {
@@ -1051,6 +1054,9 @@ pub fn table_due(ident: &str, schedule: &str, jitter_secs: u64, tick_secs: u64, 
         }
     };
 
+    // `jitter_offset_secs` returns 0 when `jitter_secs == 0` (its own guard,
+    // not this call site's), so this is safe against divide-by-zero and
+    // yields zero jitter delay rather than bypassing the schedule check.
     let offset_secs = jitter_offset_secs(ident, jitter_secs);
     let adjusted_now_ms = now_ms - (offset_secs as i64) * 1000;
     let Some(adjusted_now) = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(adjusted_now_ms) else {
@@ -1240,16 +1246,37 @@ mod tests {
     }
 
     #[test]
-    fn table_due_always_true_when_jitter_disabled() {
-        // `jitter_secs == 0` is the pre-cron escape hatch: it bypasses the
-        // schedule check entirely (not just the jitter delay), which is
-        // exactly what `tests/maintenance_scheduler_test.rs` relies on for
-        // deterministic single-tick fixtures regardless of wall-clock time.
-        assert!(table_due("ns.t1", "0 2 * * *", 0, 60, 0));
-        assert!(table_due("ns.t1", "0 2 * * *", 0, 60, 123_456_789));
-        // Even a syntactically invalid schedule is bypassed when jitter is
-        // disabled, since the schedule is never parsed on this path.
-        assert!(table_due("ns.t1", "not a cron expression", 0, 60, 123_456_789));
+    fn table_due_jitter_disabled_invalid_cron_is_never_always_due() {
+        // `jitter_secs == 0` must NOT resurrect the removed pre-cron bypass:
+        // an invalid cron combined with zero jitter must still be treated as
+        // "never due", not "always due". This is the exact regression this
+        // fix closes (Task 4 review).
+        assert!(!table_due("ns.t1", "not a cron expression", 0, 60, 0));
+        assert!(!table_due("ns.t1", "not a cron expression", 0, 60, 123_456_789));
+    }
+
+    #[test]
+    fn table_due_jitter_disabled_still_honors_schedule_window() {
+        // `jitter_secs == 0` means zero jitter *delay* (the effective fire
+        // instant equals the raw cron fire time exactly, since
+        // `jitter_offset_secs` returns 0 for `jitter_secs == 0`), not a
+        // schedule bypass: the table must be due only inside the daily
+        // 02:00 window, not at an arbitrary tick.
+        let ident = "ns.t1";
+        let schedule = "0 2 * * *";
+        let tick_secs = 60;
+
+        let fire_ms = utc_ms(2026, 3, 5, 2, 0, 0);
+        assert!(
+            table_due(ident, schedule, 0, tick_secs, fire_ms),
+            "must be due at the exact (unjittered) cron fire instant"
+        );
+
+        let unrelated_ms = utc_ms(2026, 3, 5, 14, 0, 0);
+        assert!(
+            !table_due(ident, schedule, 0, tick_secs, unrelated_ms),
+            "must not be due at an arbitrary tick far from the schedule's fire instant"
+        );
     }
 
     /// Fixed UTC instant helper for cron fixtures: avoids depending on the

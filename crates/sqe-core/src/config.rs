@@ -3167,7 +3167,8 @@ pub struct MaintenanceSchedulerConfig {
     #[serde(default = "default_maintenance_tick_secs")]
     pub tick_secs: u64,
     /// Global default cron-style schedule for per-table jobs. Per-table
-    /// `sqe.maintenance.compaction.schedule` overrides this.
+    /// `sqe.maintenance.compaction.schedule` overrides this. Evaluated in
+    /// UTC, not the host's local timezone.
     #[serde(default = "default_maintenance_schedule")]
     pub schedule: String,
     /// Deterministic per-table jitter window (seconds) so many tables due
