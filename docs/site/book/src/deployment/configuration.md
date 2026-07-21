@@ -442,10 +442,19 @@ scopes = ["openid", "profile"]
 `[maintenance]` configures SQE's background compaction subsystem: a
 non-human service principal, an in-coordinator scheduler loop, and the
 sizing knobs `CALL system.rewrite_data_files` and `CALL
-system.table_health` both use. As of Phase 4a the subsystem is advisory
-only: it can report compaction debt but cannot mutate a table. Active
-compaction (the scheduler actually calling `rewrite_data_files` on a
-timer) ships in a later phase.
+system.table_health` both use. Phase 4a shipped the advisory arm: it
+reports compaction debt but never mutates a table. Phase 4b adds the
+active arm: with `mode = "active"`, the scheduler commits real
+`rewrite_data_files` rewrites against opted-in, due tables on a cron
+schedule, through the same code path `CALL system.rewrite_data_files`
+uses interactively.
+
+Advisory is the recommended first step for any new deployment. Run it
+long enough to see real compaction debt and validate the schedule and
+per-table knobs before opting a table into active mode. Active mode
+mutates data files and commits new snapshots; treat the switch from
+advisory to active per table as a deliberate, reviewed change, not a
+default.
 
 ### The mode ladder
 
@@ -457,9 +466,12 @@ operator chooses explicitly:
 - `"advisory"`. The scheduler loop (if `scheduler.enabled = true`) discovers
   opted-in tables and publishes health/metrics per table, the same report
   `CALL system.table_health` returns. Nothing is rewritten.
-- `"active"`. The scheduler runs real `rewrite_data_files` jobs on a
-  schedule. Ships in a later phase; setting `mode = "active"` today has no
-  code path wired to it yet.
+- `"active"`. The scheduler commits real `rewrite_data_files` rewrites, on
+  the configured cron schedule, against tables that are both due and
+  opted in via the per-table `sqe.maintenance.enabled` property. A due,
+  opted-in table with no eligible compaction debt is skipped (a `skipped`
+  `maintenance_log` row, not a rewrite); see "The three gates" and
+  "`sqe_system.maintenance_log`" below.
 
 Any mode beyond `"off"` requires a `[maintenance.principal]` block.
 Validation rejects the config otherwise, so a typo'd `mode` value cannot
@@ -501,10 +513,23 @@ suits external-trigger deployments: leave the in-process loop off and drive
 timing from a Kubernetes `CronJob` (`concurrencyPolicy: Forbid`) that issues
 the maintenance `CALL` on its own schedule. Set `enabled = true` to run the
 tick loop inside the coordinator instead; it wakes every `tick_secs`
-seconds, evaluates `schedule` (a cron expression, overridable per table via
-a `sqe.maintenance.compaction.schedule` table property) with `jitter_secs`
-of per-table jitter so a whole fleet due at once does not thunder against
-Polaris/S3 simultaneously.
+seconds and evaluates `schedule` for every opted-in table.
+
+`schedule` is a standard 5-field cron expression (minute hour day-of-month
+month day-of-week), e.g. the default `"0 2 * * *"` for daily at 02:00.
+SQE evaluates it in UTC, never the host's local timezone. A per-table
+`sqe.maintenance.compaction.schedule` property overrides the global
+`schedule` for that table; see "Per-table overrides" below.
+
+`jitter_secs` adds a deterministic, per-table delay on top of each cron
+fire time, so a fleet of tables sharing one schedule does not all fire in
+the same tick and thunder against Polaris/S3 simultaneously. The delay is
+a hash of the table's identifier modulo `jitter_secs`, so it is stable
+across ticks and restarts for a given table. `jitter_secs = 0` removes
+that stagger delay only: the effective fire instant then equals the raw
+cron fire time exactly, but the cron schedule is still parsed and
+enforced as normal. A table is never treated as always-due just because
+its jitter is zero.
 
 `lease` is the double-fire guard for multi-coordinator deployments:
 `"catalog"` (default) claims a lease row in the state table, `"none"` runs
@@ -512,33 +537,122 @@ unleased and requires `single_scheduler_acknowledged = true`, `"kubernetes"`
 is a later-phase backend. `tick_secs` and `lease_ttl_secs` must both be
 greater than zero; either at zero fails validation.
 
+### Per-table overrides
+
+A table owner can override the global schedule and every
+`[maintenance.compaction]` sizing knob for one table, without touching the
+coordinator's config file, via `ALTER TABLE ... SET TBLPROPERTIES`:
+
+| Table property | Overrides |
+|---|---|
+| `sqe.maintenance.compaction.schedule` | `maintenance.scheduler.schedule` |
+| `sqe.maintenance.compaction.target-file-size-bytes` | `maintenance.compaction.target_file_size_bytes` |
+| `sqe.maintenance.compaction.min-input-files` | `maintenance.compaction.min_input_files` |
+| `sqe.maintenance.compaction.delete-file-threshold` | `maintenance.compaction.delete_file_threshold` |
+| `sqe.maintenance.compaction.strategy` | `maintenance.compaction.strategy` |
+
+An absent or blank property falls back to the global config value. A
+numeric override that fails to parse also falls back to the global
+value; the scheduler logs a warning naming the property and the rejected
+value rather than failing the whole tick over one bad property on one
+table. In active mode the resolved, per-table value is what both gates
+eligibility and drives the rewrite: a table that loosens an override
+(for example a lower `min-input-files`) is evaluated against its own
+knob, not the global default it opted out of.
+
 ### The three gates
 
-Autonomous mutation (a later phase) requires all three to line up. The
-Phase 4a advisory scheduler loop already respects the first two when
-deciding which tables to discover and report on:
+Autonomous mutation requires all three to line up. The advisory scheduler
+loop already respects the first two when deciding which tables to
+discover and report on; active mode additionally needs the third to hold
+before it will commit anything:
 
 1. Global `maintenance.mode` is `"advisory"` or `"active"` (never `"off"`).
 2. The table owner has set the per-table property `sqe.maintenance.enabled
    = true` via `ALTER TABLE`. A table without this property is never
    selected, no matter what `mode` is set to.
-3. The maintenance principal holds a least-privilege Polaris grant, exactly
-   `TABLE_READ_DATA` (plus `TABLE_WRITE_DATA` once active mode ships) on
-   the opted-in namespace, no `CREATE`/`DROP`/admin. Polaris enforces this
-   server-side as defense-in-depth on top of SQE's own gates. A table with
-   the property but no grant fails loud (audit event plus metric), never a
-   silent skip.
+3. The maintenance principal holds a least-privilege Polaris grant on the
+   opted-in namespace: `TABLE_READ_DATA` for advisory mode, plus
+   `TABLE_WRITE_DATA` for active mode, no `CREATE`/`DROP`/admin either way.
+   Polaris enforces this server-side as defense-in-depth on top of SQE's
+   own gates. In active mode, a table with the property but no write grant
+   never silently skips: the rewrite attempt fails, and SQE records a
+   `failed` `sqe_system.maintenance_log` row plus a
+   `sqe_maintenance_job_total{status="failed"}` metric sample for it.
 
 ### `sqe_system.maintenance_log`
 
 `maintenance.scheduler.state_table` (default `sqe_system.maintenance_log`)
-holds job history, last-run state, and the catalog lease rows. Phase 4a
-treats this table as operator-created: nothing in SQE creates it, and the
+holds job history, last-run state, and the catalog lease rows. SQE treats
+this table as operator-created: nothing in SQE creates it, and the
 scheduler degrades to warn-and-skip rather than failing hard when the table
 is absent. Create it once with a schema matching `(job_id, table, trigger,
 principal, started_at, finished_at, status, files_in, files_out, bytes_in,
 bytes_out, rows_removed, snapshot_id, error)` before turning on
 `scheduler.enabled`.
+
+`status` is `"advisory"` for every table an advisory-mode tick analyzes.
+In active mode a due, opted-in table produces exactly one terminal row per
+tick: `"success"` for a committed rewrite, `"skipped"` when the table had
+no eligible compaction debt (or the underlying rewrite itself chose to
+skip), or `"failed"` for any error along the way (session mint, token
+refresh, catalog build, or the rewrite commit itself). One table's
+failure never aborts the tick or blocks any other opted-in table from
+being considered.
+
+An audit event (`AuditKind::Maintenance`) accompanies every advisory-mode
+analysis and every active-mode `"success"` commit. `"skipped"` and
+`"failed"` rows are not paired with an audit event; the `maintenance_log`
+row plus the `sqe_maintenance_job_total{status=...}` metric sample are
+the record of those outcomes.
+
+### Snapshot stamping
+
+Every active-mode commit stamps three Iceberg snapshot-summary
+properties: `sqe.maintenance.job-id` (ties the snapshot back to its
+`maintenance_log` row), `sqe.maintenance.principal` (the maintenance
+service identity that committed it), and `sqe.maintenance.trigger`
+(currently always `"scheduled"`). A compaction snapshot is therefore
+attributable in the table's own history, independent of the state table:
+inspect the snapshot summary directly (Iceberg snapshot metadata, or a
+future `DESCRIBE HISTORY`-style surface) rather than `CALL
+system.table_health`. `table_health`'s `last_compaction_snapshot_ms`
+column is reserved for this but is not yet wired to read it; it always
+returns `NULL` in this release.
+
+### Distribution is coordinator-local in this release
+
+`[maintenance.distribution]` is parsed and validated, but nothing in the
+scheduler or the rewrite handler reads it yet: every active-mode
+compaction in this release runs coordinator-local, regardless of
+`distribution.mode`. Worker fan-out for large rewrite jobs is a later
+phase; treat the `[maintenance.distribution]` block as forward-compatible
+configuration surface, not a live switch, until that phase ships.
+
+### Safety notes
+
+- **Advisory first.** Run advisory mode against a table long enough to see
+  its real compaction debt and validate the schedule and per-table knobs
+  before opting that table into active mode.
+- **Opt-in is per table, twice over.** A table is only ever touched by
+  active mode when its owner has both set `sqe.maintenance.enabled = true`
+  and granted the maintenance principal `TABLE_WRITE_DATA` in Polaris.
+  Neither alone is sufficient.
+- **Least-privilege grant.** Give the maintenance principal only
+  `TABLE_READ_DATA` / `TABLE_WRITE_DATA` on the opted-in namespace, never
+  `CREATE`/`DROP`/admin.
+- **Compactions are reversible within the retention window.** A
+  compaction commit is an ordinary Iceberg snapshot; the data files and
+  manifests it superseded remain in place until `expire_snapshots` removes
+  them. Reading a compacted table's history back to a prior snapshot and
+  running `CALL system.rollback_to_snapshot(table => 'ns.t', snapshot_id
+  => <id>)` undoes the compaction as long as that prior snapshot has not
+  aged out.
+- **Coordinator-local in this release.** Active-mode compaction always
+  runs on the coordinator that owns the lease, regardless of
+  `distribution.mode`; size `target_file_size_bytes` and
+  `max_concurrent_jobs` with that single-process footprint in mind until
+  worker fan-out ships.
 
 ## Validation
 
