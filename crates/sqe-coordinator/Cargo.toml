@@ -29,6 +29,7 @@ path = "src/bin/sqe_server.rs"
 sqe-core = { path = "../sqe-core" }
 sqe-auth = { path = "../sqe-auth" }
 sqe-catalog = { path = "../sqe-catalog" }
+sqe-compaction = { path = "../sqe-compaction" }
 sqe-sql = { path = "../sqe-sql" }
 sqe-policy = { path = "../sqe-policy" }
 sqe-planner = { path = "../sqe-planner" }

@@ -44,9 +44,14 @@ pub mod web_auth;
 pub mod web_ui;
 pub mod worker_registry;
 pub mod write_handler;
-pub mod write_memory;
 pub mod writer;
-pub mod zorder;
+
+/// `write_memory` (pool-tracked write buffers) moved to `sqe-compaction` so
+/// the worker-side compaction/write path can reuse it without depending on
+/// this crate. Re-exported under its original path so
+/// `crate::write_memory::{TrackedBatchBuffer, WriteReservation}` call sites
+/// in `write_handler.rs`/`writer.rs` compile unchanged.
+pub use sqe_compaction::write_memory;
 
 pub use mode::Mode;
 pub use quack_executor::CoordinatorExecutor;
