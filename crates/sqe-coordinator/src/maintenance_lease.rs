@@ -619,11 +619,23 @@ pub async fn renew(
 
 /// Release `handle`'s lease: replaces the live claim file with a
 /// `"released"` tombstone row (never leaves zero live rows -- see the
-/// module docs' bootstrap-gap rationale). Best-effort past the first
-/// attempt: if the claim is already gone (expired and stolen by someone
-/// else, or already released), that means the caller no longer holds the
-/// lease anyway, which is exactly the postcondition `release` promises, so
-/// this returns `Ok(())` rather than an error.
+/// module docs' bootstrap-gap rationale). Best-effort: if `handle`'s claim
+/// is no longer the live claim for `job_key` -- because it already expired
+/// and was stolen by a different holder, or was already released -- this
+/// returns `Ok(())` WITHOUT writing anything, rather than deleting
+/// whatever live claim currently occupies `job_key` (possibly a DIFFERENT
+/// holder's, post-steal) and replacing it with this holder's stale
+/// tombstone. That clobber was a real bug: after a steal, a release that
+/// only checked "is there something to delete" would delete the NEW
+/// holder's live claim and write this (old, no-longer-owning) holder's
+/// tombstone over it, letting a third coordinator see the tombstone and
+/// start compacting alongside the new holder -- defeating the lease.
+/// Mirrors `renew`'s ownership check (match on both `claim_path` and
+/// `holder_id`, not just "some live row exists") rather than only
+/// checking "is there a live row at all". Either way -- no live row, or a
+/// live row owned by someone else -- the postcondition `release` promises
+/// ("this holder doesn't hold the lease") already holds, so `Ok(())` is
+/// correct without a write.
 pub async fn release(
     handle: LeaseHandle,
     catalog: &Arc<dyn Catalog>,
@@ -639,14 +651,31 @@ pub async fn release(
         })?;
 
         let rows = read_lease_rows(&table, &handle.job_key).await?;
-        let delete_targets: Vec<DataFile> = rows.into_iter().map(|r| r.data_file).collect();
-        if delete_targets.is_empty() {
-            // Already gone (raced by someone else's steal, or already
-            // released): the postcondition "this holder doesn't have it
-            // live" already holds.
-            return Ok(());
+        let current_is_still_ours = rows
+            .iter()
+            .find(|r| r.state.claim_path == handle.claim_path && !r.state.released)
+            .map(|r| r.state.holder_id == handle.holder_id);
+        match current_is_still_ours {
+            None => {
+                // No live row matches this handle's claim_path (already
+                // gone: raced by someone else's steal, or already
+                // released). The postcondition "this holder doesn't have
+                // it live" already holds.
+                return Ok(());
+            }
+            Some(false) => {
+                // A live row matches this claim_path but is now held by a
+                // DIFFERENT holder (this handle's lease lapsed and was
+                // stolen, and the new holder has since re-acquired over
+                // the same path -- or, more commonly, a different live
+                // row for job_key belongs to someone else). Do not delete
+                // it. This holder no longer holds the lease either way.
+                return Ok(());
+            }
+            Some(true) => {}
         }
 
+        let delete_targets: Vec<DataFile> = rows.into_iter().map(|r| r.data_file).collect();
         let row = lease_row(&handle.job_key, &handle.holder_id, now_ms, now_ms, LEASE_STATUS_RELEASED, None);
         let (new_file, cleanup_guard) = write_lease_file(&table, &row, "maintenance-lease-release").await?;
 
