@@ -167,6 +167,132 @@ pub fn advisory_row(table: &str, principal: &str, health: &TableHealth, ts_ms: i
     }
 }
 
+/// Build the `status = "running"` row a (later) caller could append at the
+/// start of an active-mode compaction job, before the rewrite commits, so an
+/// operator watching the ledger mid-run can distinguish "in flight" from
+/// "never started" / "crashed before any row landed". Not yet called by the
+/// Phase 4b scheduler (see `maintenance_scheduler.rs`'s active arm, which
+/// only appends the terminal `success`/`failed`/`skipped` row); provided now
+/// so the constructor's field mapping is fixed and unit-tested ahead of that
+/// wiring.
+///
+/// `started_at_ms` and `finished_at_ms` are both `ts_ms`: the row is a
+/// snapshot of an in-progress job, not a completed one, so "finished" has no
+/// real value yet. `trigger` is `"scheduled"` (Phase 4b active-mode jobs),
+/// distinct from [`advisory_row`]'s pre-existing `"scheduler"` (Phase 4a).
+pub fn running_row(job_id: &str, table: &str, principal: &str, ts_ms: i64) -> MaintenanceLogRow {
+    MaintenanceLogRow {
+        job_id: job_id.to_string(),
+        table: table.to_string(),
+        trigger: "scheduled".to_string(),
+        principal: principal.to_string(),
+        started_at_ms: ts_ms,
+        finished_at_ms: ts_ms,
+        status: "running".to_string(),
+        files_in: 0,
+        files_out: 0,
+        bytes_in: 0,
+        bytes_out: 0,
+        rows_removed: 0,
+        snapshot_id: None,
+        error: None,
+    }
+}
+
+/// Build the `status = "success"` row the Phase 4b active-mode scheduler
+/// records for one table it actually compacted. `job_id` ties this row back
+/// to the same job's audit event and metric samples.
+#[allow(clippy::too_many_arguments)]
+pub fn success_row(
+    job_id: &str,
+    table: &str,
+    principal: &str,
+    started_at_ms: i64,
+    finished_at_ms: i64,
+    files_in: i64,
+    files_out: i64,
+    bytes_in: i64,
+    bytes_out: i64,
+    rows_removed: i64,
+    snapshot_id: Option<i64>,
+) -> MaintenanceLogRow {
+    MaintenanceLogRow {
+        job_id: job_id.to_string(),
+        table: table.to_string(),
+        trigger: "scheduled".to_string(),
+        principal: principal.to_string(),
+        started_at_ms,
+        finished_at_ms,
+        status: "success".to_string(),
+        files_in,
+        files_out,
+        bytes_in,
+        bytes_out,
+        rows_removed,
+        snapshot_id,
+        error: None,
+    }
+}
+
+/// Build the `status = "failed"` row the Phase 4b active-mode scheduler
+/// records when a table's compaction job raises an error (mint/refresh
+/// failure, catalog error, or the rewrite itself failing). Counts are always
+/// zero: a failed job has no reliable partial byte/file/row counts to
+/// report, and reporting a partial number invites an operator to
+/// misinterpret it as a completed rewrite's stats.
+pub fn failed_row(
+    job_id: &str,
+    table: &str,
+    principal: &str,
+    started_at_ms: i64,
+    finished_at_ms: i64,
+    error: &str,
+) -> MaintenanceLogRow {
+    MaintenanceLogRow {
+        job_id: job_id.to_string(),
+        table: table.to_string(),
+        trigger: "scheduled".to_string(),
+        principal: principal.to_string(),
+        started_at_ms,
+        finished_at_ms,
+        status: "failed".to_string(),
+        files_in: 0,
+        files_out: 0,
+        bytes_in: 0,
+        bytes_out: 0,
+        rows_removed: 0,
+        snapshot_id: None,
+        error: Some(error.to_string()),
+    }
+}
+
+/// Build the `status = "skipped"` row the Phase 4b active-mode scheduler
+/// records for a due, opted-in table it deliberately did not compact (no
+/// eligible compaction debt this tick). Distinct from [`advisory_row`]:
+/// this row means "active mode considered this table and chose not to act",
+/// not "advisory mode never acts on anything". `reason` is carried in the
+/// `error` column -- the fixed schema has no dedicated "reason" column, and
+/// "why nothing happened" is exactly what that column is for on a
+/// non-`success` row.
+pub fn skipped_row(job_id: &str, table: &str, principal: &str, ts_ms: i64, reason: &str) -> MaintenanceLogRow {
+    MaintenanceLogRow {
+        job_id: job_id.to_string(),
+        table: table.to_string(),
+        trigger: "scheduled".to_string(),
+        principal: principal.to_string(),
+        started_at_ms: ts_ms,
+        finished_at_ms: ts_ms,
+        status: "skipped".to_string(),
+        files_in: 0,
+        files_out: 0,
+        bytes_in: 0,
+        bytes_out: 0,
+        rows_removed: 0,
+        snapshot_id: None,
+        error: Some(reason.to_string()),
+    }
+}
+
 /// The fixed Arrow schema documented at the top of this file. Column order
 /// is load-bearing: see the module docs.
 pub fn maintenance_log_arrow_schema() -> Arc<ArrowSchema> {
@@ -534,6 +660,93 @@ mod tests {
         let ident = resolve_state_table_ident("no_dot_here");
         assert_eq!(ident.namespace().as_ref(), &vec!["sqe_system".to_string()]);
         assert_eq!(ident.name(), "maintenance_log");
+    }
+
+    #[test]
+    fn running_row_maps_status_and_trigger() {
+        let row = running_row("job-1", "ns.t", "svc", 1_000);
+        assert_eq!(row.status, "running");
+        assert_eq!(row.trigger, "scheduled");
+        assert_eq!(row.job_id, "job-1");
+        assert_eq!(row.table, "ns.t");
+        assert_eq!(row.principal, "svc");
+        assert_eq!(row.started_at_ms, 1_000);
+        assert_eq!(row.finished_at_ms, 1_000);
+    }
+
+    #[test]
+    fn running_row_zeroes_counts_and_has_no_snapshot_or_error() {
+        let row = running_row("job-1", "ns.t", "svc", 1_000);
+        assert_eq!(row.files_in, 0);
+        assert_eq!(row.files_out, 0);
+        assert_eq!(row.bytes_in, 0);
+        assert_eq!(row.bytes_out, 0);
+        assert_eq!(row.rows_removed, 0);
+        assert_eq!(row.snapshot_id, None);
+        assert_eq!(row.error, None);
+    }
+
+    #[test]
+    fn success_row_maps_status_trigger_and_all_counts() {
+        let row = success_row("job-2", "ns.orders", "svc", 100, 200, 10, 3, 1000, 300, 42, Some(99));
+        assert_eq!(row.status, "success");
+        assert_eq!(row.trigger, "scheduled");
+        assert_eq!(row.job_id, "job-2");
+        assert_eq!(row.table, "ns.orders");
+        assert_eq!(row.principal, "svc");
+        assert_eq!(row.started_at_ms, 100);
+        assert_eq!(row.finished_at_ms, 200);
+        assert_eq!(row.files_in, 10);
+        assert_eq!(row.files_out, 3);
+        assert_eq!(row.bytes_in, 1000);
+        assert_eq!(row.bytes_out, 300);
+        assert_eq!(row.rows_removed, 42);
+        assert_eq!(row.snapshot_id, Some(99));
+        assert_eq!(row.error, None);
+    }
+
+    #[test]
+    fn success_row_allows_none_snapshot_id() {
+        // Defensive: a caller could construct a success row before it has
+        // resolved a snapshot id (should not happen in practice, but the
+        // constructor must not silently coerce None into something else).
+        let row = success_row("job-2", "ns.orders", "svc", 100, 200, 10, 3, 1000, 300, 42, None);
+        assert_eq!(row.snapshot_id, None);
+    }
+
+    #[test]
+    fn failed_row_maps_status_trigger_and_error_zeroes_counts() {
+        let row = failed_row("job-3", "ns.t", "svc", 100, 250, "boom: commit conflict");
+        assert_eq!(row.status, "failed");
+        assert_eq!(row.trigger, "scheduled");
+        assert_eq!(row.job_id, "job-3");
+        assert_eq!(row.table, "ns.t");
+        assert_eq!(row.principal, "svc");
+        assert_eq!(row.started_at_ms, 100);
+        assert_eq!(row.finished_at_ms, 250);
+        assert_eq!(row.error, Some("boom: commit conflict".to_string()));
+        assert_eq!(row.files_in, 0);
+        assert_eq!(row.files_out, 0);
+        assert_eq!(row.bytes_in, 0);
+        assert_eq!(row.bytes_out, 0);
+        assert_eq!(row.rows_removed, 0);
+        assert_eq!(row.snapshot_id, None);
+    }
+
+    #[test]
+    fn skipped_row_maps_status_trigger_and_reason_zeroes_counts() {
+        let row = skipped_row("job-4", "ns.t", "svc", 500, "no eligible compaction debt");
+        assert_eq!(row.status, "skipped");
+        assert_eq!(row.trigger, "scheduled");
+        assert_eq!(row.job_id, "job-4");
+        assert_eq!(row.table, "ns.t");
+        assert_eq!(row.principal, "svc");
+        assert_eq!(row.started_at_ms, 500);
+        assert_eq!(row.finished_at_ms, 500);
+        assert_eq!(row.error, Some("no eligible compaction debt".to_string()));
+        assert_eq!(row.files_in, 0);
+        assert_eq!(row.files_out, 0);
+        assert_eq!(row.snapshot_id, None);
     }
 
     #[test]

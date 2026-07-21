@@ -59,10 +59,12 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use iceberg::{Catalog, TableIdent};
-use sqe_core::config::{MaintenanceConfig, MaintenanceMode};
+use sqe_core::config::{MaintenanceCompactionConfig, MaintenanceConfig, MaintenanceMode};
 use sqe_core::{Session, SqeError};
+use sqe_sql::TableRef;
 use tracing::{info, warn};
 
+use crate::maintenance_log;
 use crate::maintenance_principal::MaintenancePrincipal;
 /// Table property that opts a table into this scheduler. Reuses
 /// `table_health`'s constant so the `CALL system.table_health` report and
@@ -103,17 +105,31 @@ pub fn default_catalog_factory(
     })
 }
 
-/// The advisory (and, in a later phase, active) auto-compaction scheduler.
+/// The advisory and active auto-compaction scheduler.
 ///
 /// Holds everything one tick needs: the config gate/knobs, the dedicated
-/// service principal, a metrics handle, an optional audit sink, and the
-/// catalog-construction seam described in the module docs.
+/// service principal, a metrics handle, an optional audit sink, the
+/// catalog-construction seam described in the module docs, and (Phase 4b)
+/// a `MaintenanceHandler` so the active arm can reuse the EXACT same
+/// `rewrite_data_files` code path `CALL system.rewrite_data_files` uses.
+///
+/// `handler` is a dedicated `MaintenanceHandler` instance for the scheduler,
+/// not the one the interactive query path's `QueryHandler` owns: it needs
+/// its own DataFusion runtime (`with_runtime`, for sort/z-order compaction)
+/// and this scheduler never resolves a catalog through it (see
+/// `active_one_table`, which calls `handler.rewrite_data_files` with a
+/// catalog it already built via `catalog_factory`, bypassing
+/// `MaintenanceHandler::create_catalog_bridge` entirely). Building a second
+/// runtime does mean a second `FairSpillPool` instance competing for the
+/// same host memory as the query engine's; see the module docs for the
+/// tradeoff this accepts in Phase 4b.
 pub struct MaintenanceScheduler {
     cfg: MaintenanceConfig,
     principal: Arc<MaintenancePrincipal>,
     metrics: Arc<sqe_metrics::MetricsRegistry>,
     audit: Option<Arc<sqe_metrics::audit::AuditLogger>>,
     catalog_factory: CatalogFactory,
+    handler: Arc<crate::maintenance::MaintenanceHandler>,
 }
 
 impl MaintenanceScheduler {
@@ -123,6 +139,7 @@ impl MaintenanceScheduler {
         metrics: Arc<sqe_metrics::MetricsRegistry>,
         audit: Option<Arc<sqe_metrics::audit::AuditLogger>>,
         catalog_factory: CatalogFactory,
+        handler: Arc<crate::maintenance::MaintenanceHandler>,
     ) -> Self {
         Self {
             cfg,
@@ -130,6 +147,7 @@ impl MaintenanceScheduler {
             metrics,
             audit,
             catalog_factory,
+            handler,
         }
     }
 
@@ -212,12 +230,25 @@ impl MaintenanceScheduler {
             let Some(ident) = idents_by_table.get(&name) else {
                 continue;
             };
-            if let Err(e) = self.analyze_one_table(&catalog, ident, &job_id, now_ms).await {
-                warn!(
-                    table = %name,
-                    error = %e,
-                    "advisory_tick: per-table analysis failed; continuing with other tables"
-                );
+            // Active mode compacts (Phase 4b); every other mode (today only
+            // `Advisory` reaches this loop -- `Off` never constructs a
+            // scheduler at all) keeps the pre-4b read-only report. This is
+            // the entire "advisory/off unchanged" boundary: `active_one_table`
+            // is the ONLY place in this file that ever commits to a user
+            // table.
+            match self.cfg.mode {
+                MaintenanceMode::Active => {
+                    self.active_one_table(&catalog, ident, now_ms).await;
+                }
+                _ => {
+                    if let Err(e) = self.analyze_one_table(&catalog, ident, &job_id, now_ms).await {
+                        warn!(
+                            table = %name,
+                            error = %e,
+                            "advisory_tick: per-table analysis failed; continuing with other tables"
+                        );
+                    }
+                }
             }
         }
 
@@ -291,6 +322,322 @@ impl MaintenanceScheduler {
         );
 
         Ok(())
+    }
+
+    /// Compact one due, opted-in table under `active` mode (Phase 4b).
+    ///
+    /// Always computes and emits the same health gauges [`analyze_one_table`]
+    /// does (an operator watching Grafana sees the same signal regardless of
+    /// mode), then either skips (no eligible debt) or runs a real
+    /// `rewrite_data_files` commit through `self.handler` -- the SAME method
+    /// `CALL system.rewrite_data_files` uses -- under a freshly minted
+    /// maintenance session.
+    ///
+    /// Infallible by design: every failure path (load, mint, refresh,
+    /// catalog build, or the rewrite itself) is caught here, turned into a
+    /// `failed` `maintenance_log` row plus a `sqe_maintenance_job_total`
+    /// sample, and swallowed. One table's compaction failing must never
+    /// abort the tick or block any other opted-in table from being
+    /// considered.
+    async fn active_one_table(&self, catalog: &Arc<dyn Catalog>, ident: &TableIdent, now_ms: i64) {
+        let name = ident.to_string();
+
+        let table = match crate::maintenance::load_table(catalog, ident).await {
+            Ok(t) => t,
+            Err(e) => {
+                warn!(table = %name, error = %e, "active_tick: failed to load table; skipping");
+                return;
+            }
+        };
+        let (data_files, delete_files, tasks_by_path) =
+            match crate::maintenance::collect_health_inputs(&table).await {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!(
+                        table = %name,
+                        error = %e,
+                        "active_tick: failed to collect health inputs; skipping"
+                    );
+                    return;
+                }
+            };
+
+        // Resolve per-table overrides BEFORE computing health: three of the
+        // four overridable knobs (target_file_size_bytes, min_input_files,
+        // delete_file_threshold) directly determine eligibility. Computing
+        // health from the GLOBAL config while the rewrite below uses the
+        // per-table-resolved `params` would let a table that LOOSENS an
+        // override (e.g. a lower `min-input-files`) get skipped by a gate
+        // that never saw its own override -- the opposite of "per-table
+        // overrides win over global config".
+        let params = resolve_compaction_params(&self.cfg.compaction, table.metadata().properties());
+        let effective_cfg = MaintenanceCompactionConfig {
+            target_file_size_bytes: params.target_file_size_bytes,
+            min_input_files: params.min_input_files,
+            delete_file_threshold: params.delete_file_threshold,
+            strategy: params.strategy.clone(),
+        };
+
+        let health = crate::table_health::analyze_table_health(
+            &data_files,
+            &delete_files,
+            &tasks_by_path,
+            &effective_cfg,
+            table.metadata().properties(),
+        );
+
+        // Same observability as advisory mode, regardless of whether this
+        // tick goes on to actually compact. Gauges reflect the EFFECTIVE
+        // (per-table-resolved) knobs too, so they agree with the gate and
+        // the rewrite below, not with a global config a table has opted
+        // out of via its own override.
+        self.metrics
+            .table_small_files
+            .with_label_values(&[&name])
+            .set(health.small_files as f64);
+        self.metrics
+            .table_delete_files
+            .with_label_values(&[&name])
+            .set(health.delete_files as f64);
+        self.metrics
+            .maintenance_est_rewrite_bytes
+            .with_label_values(&[&name])
+            .set(health.est_rewrite_bytes as f64);
+
+        let job_id = uuid::Uuid::now_v7().to_string();
+        let started_at_ms = now_ms;
+
+        // Eligibility: small-file debt (eligible_groups) OR ANY delete-heavy
+        // file. `>= delete_file_threshold` (a per-file delete-COUNT
+        // threshold) does not apply here -- `delete_heavy_files` already
+        // is a file COUNT that met that threshold; requiring it to also
+        // clear the threshold would skip a table with exactly one
+        // delete-heavy file under the (very common) default threshold of 2.
+        let has_eligible_work = health.eligible_groups > 0 || health.delete_heavy_files > 0;
+        if !has_eligible_work {
+            info!(table = %name, "active_tick: skipped, no eligible compaction debt");
+            let row = maintenance_log::skipped_row(
+                &job_id,
+                &name,
+                &self.principal.user_id,
+                started_at_ms,
+                "no eligible compaction debt",
+            );
+            self.append_job_row(catalog, &row).await;
+            self.metrics
+                .maintenance_job_total
+                .with_label_values(&["skipped"])
+                .inc();
+            return;
+        }
+
+        let mut session = match self.principal.mint_session(&job_id).await {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(table = %name, error = %e, "active_tick: failed to mint maintenance session");
+                self.record_failed_job(catalog, &job_id, &name, started_at_ms, &e.to_string())
+                    .await;
+                return;
+            }
+        };
+
+        // Defensive: `MaintenancePrincipal::session_from_identity` always
+        // sets `has_maintenance_authority(true)`, but a compaction commit
+        // is exactly the kind of consequential action that must not
+        // silently proceed if that ever regresses.
+        if !crate::maintenance::session_has_write_privilege(&session) {
+            warn!(
+                table = %name,
+                "active_tick: minted maintenance session unexpectedly lacks write privilege; refusing to compact"
+            );
+            self.record_failed_job(
+                catalog,
+                &job_id,
+                &name,
+                started_at_ms,
+                "minted maintenance session lacks write privilege",
+            )
+            .await;
+            return;
+        }
+
+        // Refresh the token right before the commit: `Session::token_expiry()`
+        // on a maintenance session is fabricated (see
+        // `MaintenancePrincipal::refresh`'s doc comment) and must never be
+        // trusted. Best-effort -- a refresh failure is logged and the
+        // mint-time token is used as-is (still valid for a short job); the
+        // eventual commit fails cleanly on a genuinely dead token rather
+        // than silently using the wrong privilege.
+        if let Err(e) = self.principal.refresh(&mut session).await {
+            warn!(table = %name, error = %e, "active_tick: token refresh failed; proceeding with the mint-time token");
+        }
+
+        // Build the COMMIT catalog from the (possibly refreshed) session.
+        // The tick's own `catalog` parameter was built from the tick-level
+        // discovery session, not this table's job session; rebuilding here
+        // is what makes the refresh above actually reach the commit instead
+        // of being a no-op.
+        let commit_catalog = match (self.catalog_factory)(&session).await {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(table = %name, error = %e, "active_tick: failed to build commit catalog");
+                self.record_failed_job(catalog, &job_id, &name, started_at_ms, &e.to_string())
+                    .await;
+                return;
+            }
+        };
+
+        let table_ref = match table_ref_from_ident(ident) {
+            Ok(t) => t,
+            Err(e) => {
+                warn!(table = %name, error = %e, "active_tick: failed to build table reference");
+                self.record_failed_job(catalog, &job_id, &name, started_at_ms, &e.to_string())
+                    .await;
+                return;
+            }
+        };
+
+        // `params` was already resolved above (before the health/eligibility
+        // check); reused here so the gate and the rewrite can never disagree
+        // about the effective per-table knobs.
+        // "binpack" (the default) means no explicit strategy: `None` lets
+        // `rewrite_data_files_once` take its own bin-pack default without
+        // requiring the shared DataFusion runtime a sort/z-order strategy
+        // needs.
+        let strategy = if params.strategy.eq_ignore_ascii_case("binpack") {
+            None
+        } else {
+            Some(params.strategy.clone())
+        };
+        let snapshot_properties = HashMap::from([
+            ("sqe.maintenance.job-id".to_string(), job_id.clone()),
+            ("sqe.maintenance.principal".to_string(), self.principal.user_id.clone()),
+            ("sqe.maintenance.trigger".to_string(), "scheduled".to_string()),
+        ]);
+
+        let result = self
+            .handler
+            .rewrite_data_files(
+                &commit_catalog,
+                &table_ref,
+                Some(params.target_file_size_bytes),
+                Some(params.min_input_files),
+                None, // max_concurrent_file_group_rewrites: handler default; not part of the Phase 4b per-table override surface.
+                strategy,
+                None, // sort_order: not part of the Phase 4b per-table override surface.
+                Some(params.delete_file_threshold),
+                Some(snapshot_properties),
+            )
+            .await;
+
+        let finished_at_ms = chrono::Utc::now().timestamp_millis();
+        match result {
+            Ok(outcome) if outcome.skipped_reason.is_some() => {
+                let reason = outcome.skipped_reason.unwrap_or_default();
+                info!(table = %name, reason = %reason, "active_tick: rewrite_data_files skipped");
+                let row = maintenance_log::skipped_row(
+                    &job_id,
+                    &name,
+                    &self.principal.user_id,
+                    started_at_ms,
+                    &reason,
+                );
+                self.append_job_row(catalog, &row).await;
+                self.metrics
+                    .maintenance_job_total
+                    .with_label_values(&["skipped"])
+                    .inc();
+            }
+            Ok(outcome) => {
+                info!(
+                    table = %name,
+                    files_in = outcome.files_in,
+                    files_out = outcome.files_out,
+                    bytes_out = outcome.bytes_out,
+                    rows_removed = outcome.rows_removed,
+                    snapshot_id = ?outcome.snapshot_id,
+                    "active_tick: compaction committed"
+                );
+                if let Some(audit) = &self.audit {
+                    audit.log_event(build_active_audit_event(
+                        ident,
+                        &self.principal.user_id,
+                        &job_id,
+                        &outcome,
+                    ));
+                }
+                let row = maintenance_log::success_row(
+                    &job_id,
+                    &name,
+                    &self.principal.user_id,
+                    started_at_ms,
+                    finished_at_ms,
+                    outcome.files_in,
+                    outcome.files_out,
+                    outcome.bytes_in,
+                    outcome.bytes_out,
+                    outcome.rows_removed,
+                    outcome.snapshot_id,
+                );
+                self.append_job_row(catalog, &row).await;
+                self.metrics
+                    .maintenance_job_total
+                    .with_label_values(&["success"])
+                    .inc();
+                self.metrics
+                    .maintenance_bytes_rewritten_total
+                    .inc_by(outcome.bytes_out.max(0) as u64);
+            }
+            Err(e) => {
+                warn!(table = %name, error = %e, "active_tick: compaction failed");
+                self.record_failed_job(catalog, &job_id, &name, started_at_ms, &e.to_string())
+                    .await;
+            }
+        }
+    }
+
+    /// Build and append a `failed` `maintenance_log` row plus its metric
+    /// sample. Shared by every `active_one_table` error path so the
+    /// job-total counter and the ledger can never disagree about whether a
+    /// job counted as failed.
+    async fn record_failed_job(
+        &self,
+        catalog: &Arc<dyn Catalog>,
+        job_id: &str,
+        table: &str,
+        started_at_ms: i64,
+        error: &str,
+    ) {
+        let row = maintenance_log::failed_row(
+            job_id,
+            table,
+            &self.principal.user_id,
+            started_at_ms,
+            chrono::Utc::now().timestamp_millis(),
+            error,
+        );
+        self.append_job_row(catalog, &row).await;
+        self.metrics
+            .maintenance_job_total
+            .with_label_values(&["failed"])
+            .inc();
+    }
+
+    /// Best-effort `maintenance_log` append, shared by every active-mode
+    /// terminal row. Mirrors `analyze_one_table`'s advisory-row append: a
+    /// failure to write the ledger is logged, never propagated, and never
+    /// blocks the next table.
+    async fn append_job_row(&self, catalog: &Arc<dyn Catalog>, row: &maintenance_log::MaintenanceLogRow) {
+        if let Err(e) =
+            maintenance_log::append_row(catalog, &self.cfg.scheduler.state_table, row).await
+        {
+            warn!(
+                table = %row.table,
+                status = %row.status,
+                error = %e,
+                "active_tick: maintenance_log append failed (best-effort, not fatal)"
+            );
+        }
     }
 
     /// Spawn the supervised tick loop.
@@ -372,6 +719,161 @@ fn build_maintenance_audit_event(
         trace_id: None,
         query_id: None,
         integrity: sqe_metrics::audit::Integrity::default(),
+    }
+}
+
+/// Build the `AuditKind::Maintenance` event for one table this tick actually
+/// compacted (Phase 4b active mode). Distinct from
+/// [`build_maintenance_audit_event`] (which reports health without acting):
+/// this one's `query.text` and `stats` describe what was committed, not what
+/// was merely observed.
+fn build_active_audit_event(
+    ident: &TableIdent,
+    principal_user: &str,
+    job_id: &str,
+    outcome: &crate::maintenance::RewriteOutcome,
+) -> sqe_metrics::audit::AuditEvent {
+    sqe_metrics::audit::AuditEvent {
+        time: chrono::Utc::now(),
+        kind: sqe_metrics::audit::AuditKind::Maintenance,
+        actor: sqe_metrics::audit::Actor::from_parts(
+            principal_user.to_string(),
+            None,
+            None,
+            vec!["maintenance".to_string()],
+            vec![],
+        ),
+        outcome: sqe_metrics::audit::Outcome::Success,
+        resources: vec![sqe_metrics::audit::Resource {
+            catalog: None,
+            namespace: ident.namespace().to_vec(),
+            name: ident.name().to_string(),
+            object_type: sqe_metrics::audit::ObjectType::Table,
+        }],
+        policy: None,
+        timing: None,
+        stats: None,
+        query: Some(sqe_metrics::audit::QueryInfo {
+            text: Some(format!(
+                "active_tick: rewrite_data_files committed files_in={} files_out={} \
+                 bytes_out={} rows_removed={} snapshot_id={:?}",
+                outcome.files_in, outcome.files_out, outcome.bytes_out, outcome.rows_removed, outcome.snapshot_id
+            )),
+            query_hash: sqe_metrics::audit::query_hash(&format!("maintenance-active:{}", ident)),
+            statement_type: "maintenance_active".to_string(),
+        }),
+        session_id: Some(job_id.to_string()),
+        client_ip: None,
+        trace_id: None,
+        query_id: None,
+        integrity: sqe_metrics::audit::Integrity::default(),
+    }
+}
+
+/// Build a `sqe_sql::TableRef` from a discovered `TableIdent`, the reverse
+/// of `crate::maintenance::to_table_ident` (which this crate keeps private
+/// to that module). Round-trips correctly for the single-segment namespaces
+/// every table constructed in this codebase uses (`NamespaceIdent::new`);
+/// see `TableIdent`'s `Display` impl (`{namespace}.{name}`, and
+/// `NamespaceIdent`'s `Display` joins its segments with `.` too), which is
+/// exactly the 2-part form `TableRef::parse` accepts.
+fn table_ref_from_ident(ident: &TableIdent) -> sqe_core::Result<TableRef> {
+    TableRef::parse(&ident.to_string())
+}
+
+/// Per-table compaction knobs after resolving `[maintenance.compaction]`
+/// overrides. Mirrors `MaintenanceCompactionConfig`'s shape (this is the
+/// per-table-resolved form of that global config), not `RewriteOutcome`
+/// (which is `rewrite_data_files`'s per-run RESULT, not its input params).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompactionParams {
+    pub target_file_size_bytes: u64,
+    pub min_input_files: usize,
+    pub delete_file_threshold: usize,
+    pub strategy: String,
+}
+
+/// Table property that overrides `[maintenance.compaction].target_file_size_bytes`.
+pub const COMPACTION_TARGET_FILE_SIZE_BYTES_PROPERTY: &str =
+    "sqe.maintenance.compaction.target-file-size-bytes";
+/// Table property that overrides `[maintenance.compaction].min_input_files`.
+pub const COMPACTION_MIN_INPUT_FILES_PROPERTY: &str = "sqe.maintenance.compaction.min-input-files";
+/// Table property that overrides `[maintenance.compaction].delete_file_threshold`.
+pub const COMPACTION_DELETE_FILE_THRESHOLD_PROPERTY: &str =
+    "sqe.maintenance.compaction.delete-file-threshold";
+/// Table property that overrides `[maintenance.compaction].strategy`.
+pub const COMPACTION_STRATEGY_PROPERTY: &str = "sqe.maintenance.compaction.strategy";
+
+/// Resolve per-table compaction params: a `sqe.maintenance.compaction.*`
+/// table property overrides the matching `[maintenance.compaction]` global
+/// config field; an absent or malformed override falls back to the global
+/// value. Pure: takes the already-collected global config and table
+/// properties, touches no catalog.
+///
+/// "Malformed" (fails to parse as the target numeric type) is treated
+/// exactly like "absent": fall back to the global default and log a
+/// warning identifying which property and value were rejected, rather than
+/// erroring the whole tick over one bad property string on one table.
+pub fn resolve_compaction_params(
+    cfg: &MaintenanceCompactionConfig,
+    table_props: &HashMap<String, String>,
+) -> CompactionParams {
+    CompactionParams {
+        target_file_size_bytes: resolve_u64_override(
+            table_props,
+            COMPACTION_TARGET_FILE_SIZE_BYTES_PROPERTY,
+            cfg.target_file_size_bytes,
+        ),
+        min_input_files: resolve_usize_override(
+            table_props,
+            COMPACTION_MIN_INPUT_FILES_PROPERTY,
+            cfg.min_input_files,
+        ),
+        delete_file_threshold: resolve_usize_override(
+            table_props,
+            COMPACTION_DELETE_FILE_THRESHOLD_PROPERTY,
+            cfg.delete_file_threshold,
+        ),
+        strategy: table_props
+            .get(COMPACTION_STRATEGY_PROPERTY)
+            .map(|v| v.trim())
+            .filter(|v| !v.is_empty())
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| cfg.strategy.clone()),
+    }
+}
+
+fn resolve_u64_override(table_props: &HashMap<String, String>, key: &str, default: u64) -> u64 {
+    match table_props.get(key) {
+        None => default,
+        Some(raw) => match raw.parse::<u64>() {
+            Ok(v) => v,
+            Err(_) => {
+                warn!(
+                    property = key,
+                    value = %raw,
+                    "resolve_compaction_params: malformed override, falling back to global config"
+                );
+                default
+            }
+        },
+    }
+}
+
+fn resolve_usize_override(table_props: &HashMap<String, String>, key: &str, default: usize) -> usize {
+    match table_props.get(key) {
+        None => default,
+        Some(raw) => match raw.parse::<usize>() {
+            Ok(v) => v,
+            Err(_) => {
+                warn!(
+                    property = key,
+                    value = %raw,
+                    "resolve_compaction_params: malformed override, falling back to global config"
+                );
+                default
+            }
+        },
     }
 }
 
@@ -457,6 +959,158 @@ pub fn table_due(ident: &str, _schedule: &str, jitter_secs: u64, tick_secs: u64,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn default_compaction_cfg() -> MaintenanceCompactionConfig {
+        MaintenanceCompactionConfig {
+            target_file_size_bytes: 512 * 1024 * 1024,
+            min_input_files: 5,
+            delete_file_threshold: 2,
+            strategy: "binpack".to_string(),
+        }
+    }
+
+    #[test]
+    fn resolve_compaction_params_falls_back_to_global_when_no_props() {
+        let cfg = default_compaction_cfg();
+        let params = resolve_compaction_params(&cfg, &HashMap::new());
+        assert_eq!(params.target_file_size_bytes, cfg.target_file_size_bytes);
+        assert_eq!(params.min_input_files, cfg.min_input_files);
+        assert_eq!(params.delete_file_threshold, cfg.delete_file_threshold);
+        assert_eq!(params.strategy, cfg.strategy);
+    }
+
+    #[test]
+    fn resolve_compaction_params_per_table_override_wins_target_file_size_bytes() {
+        let cfg = default_compaction_cfg();
+        let mut props = HashMap::new();
+        props.insert(
+            COMPACTION_TARGET_FILE_SIZE_BYTES_PROPERTY.to_string(),
+            "1000".to_string(),
+        );
+        let params = resolve_compaction_params(&cfg, &props);
+        assert_eq!(params.target_file_size_bytes, 1000);
+        // Every other field still falls back to global.
+        assert_eq!(params.min_input_files, cfg.min_input_files);
+    }
+
+    #[test]
+    fn resolve_compaction_params_per_table_override_wins_min_input_files() {
+        let cfg = default_compaction_cfg();
+        let mut props = HashMap::new();
+        props.insert(COMPACTION_MIN_INPUT_FILES_PROPERTY.to_string(), "3".to_string());
+        let params = resolve_compaction_params(&cfg, &props);
+        assert_eq!(params.min_input_files, 3);
+    }
+
+    #[test]
+    fn resolve_compaction_params_per_table_override_wins_delete_file_threshold() {
+        let cfg = default_compaction_cfg();
+        let mut props = HashMap::new();
+        props.insert(
+            COMPACTION_DELETE_FILE_THRESHOLD_PROPERTY.to_string(),
+            "1".to_string(),
+        );
+        let params = resolve_compaction_params(&cfg, &props);
+        assert_eq!(params.delete_file_threshold, 1);
+    }
+
+    #[test]
+    fn resolve_compaction_params_per_table_override_wins_strategy() {
+        let cfg = default_compaction_cfg();
+        let mut props = HashMap::new();
+        props.insert(COMPACTION_STRATEGY_PROPERTY.to_string(), "sort".to_string());
+        let params = resolve_compaction_params(&cfg, &props);
+        assert_eq!(params.strategy, "sort");
+    }
+
+    #[test]
+    fn resolve_compaction_params_all_overrides_apply_together() {
+        let cfg = default_compaction_cfg();
+        let mut props = HashMap::new();
+        props.insert(
+            COMPACTION_TARGET_FILE_SIZE_BYTES_PROPERTY.to_string(),
+            "2048".to_string(),
+        );
+        props.insert(COMPACTION_MIN_INPUT_FILES_PROPERTY.to_string(), "7".to_string());
+        props.insert(
+            COMPACTION_DELETE_FILE_THRESHOLD_PROPERTY.to_string(),
+            "4".to_string(),
+        );
+        props.insert(COMPACTION_STRATEGY_PROPERTY.to_string(), "zorder".to_string());
+        let params = resolve_compaction_params(&cfg, &props);
+        assert_eq!(
+            params,
+            CompactionParams {
+                target_file_size_bytes: 2048,
+                min_input_files: 7,
+                delete_file_threshold: 4,
+                strategy: "zorder".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_compaction_params_malformed_u64_falls_back_to_global() {
+        let cfg = default_compaction_cfg();
+        let mut props = HashMap::new();
+        props.insert(
+            COMPACTION_TARGET_FILE_SIZE_BYTES_PROPERTY.to_string(),
+            "not-a-number".to_string(),
+        );
+        let params = resolve_compaction_params(&cfg, &props);
+        assert_eq!(params.target_file_size_bytes, cfg.target_file_size_bytes);
+    }
+
+    #[test]
+    fn resolve_compaction_params_malformed_usize_falls_back_to_global() {
+        let cfg = default_compaction_cfg();
+        let mut props = HashMap::new();
+        props.insert(COMPACTION_MIN_INPUT_FILES_PROPERTY.to_string(), "-3".to_string());
+        let params = resolve_compaction_params(&cfg, &props);
+        assert_eq!(params.min_input_files, cfg.min_input_files);
+    }
+
+    #[test]
+    fn resolve_compaction_params_negative_delete_file_threshold_falls_back_to_global() {
+        let cfg = default_compaction_cfg();
+        let mut props = HashMap::new();
+        props.insert(
+            COMPACTION_DELETE_FILE_THRESHOLD_PROPERTY.to_string(),
+            "abc".to_string(),
+        );
+        let params = resolve_compaction_params(&cfg, &props);
+        assert_eq!(params.delete_file_threshold, cfg.delete_file_threshold);
+    }
+
+    #[test]
+    fn resolve_compaction_params_empty_strategy_override_falls_back_to_global() {
+        // An empty string override must not silently become the active
+        // strategy (which would then fail schema validation deeper in the
+        // rewrite path); it should behave exactly like an absent property.
+        let cfg = default_compaction_cfg();
+        let mut props = HashMap::new();
+        props.insert(COMPACTION_STRATEGY_PROPERTY.to_string(), "".to_string());
+        let params = resolve_compaction_params(&cfg, &props);
+        assert_eq!(params.strategy, cfg.strategy);
+    }
+
+    #[test]
+    fn resolve_compaction_params_whitespace_only_strategy_override_falls_back_to_global() {
+        let cfg = default_compaction_cfg();
+        let mut props = HashMap::new();
+        props.insert(COMPACTION_STRATEGY_PROPERTY.to_string(), "   ".to_string());
+        let params = resolve_compaction_params(&cfg, &props);
+        assert_eq!(params.strategy, cfg.strategy);
+    }
+
+    #[test]
+    fn table_ref_from_ident_round_trips_ns_dot_table() {
+        let ident = TableIdent::new(iceberg::NamespaceIdent::new("ns".to_string()), "t".to_string());
+        let table_ref = table_ref_from_ident(&ident).expect("parses");
+        assert_eq!(table_ref.namespace, "ns");
+        assert_eq!(table_ref.name, "t");
+        assert_eq!(table_ref.catalog, None);
+    }
 
     #[test]
     fn table_due_is_deterministic_for_same_inputs() {
