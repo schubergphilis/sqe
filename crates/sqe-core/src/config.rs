@@ -3275,8 +3275,30 @@ pub struct MaintenanceDistributionConfig {
     pub max_inflight_groups_per_worker: usize,
     #[serde(default = "default_maintenance_group_attempts")]
     pub group_attempts: usize,
+    /// Wall-clock bound on ONE `compact_file_group` dispatch attempt, from
+    /// the moment the coordinator calls `do_action` to the moment it
+    /// receives that group's terminal `Done` frame. This is the real
+    /// end-to-end bound on a group: the worker computes the whole rewrite
+    /// (read, delete-apply, re-encode) before it emits ANY frame, so nothing
+    /// about a hung or slow-but-silent worker is visible until either this
+    /// timeout fires or the worker finally responds. Size it for the
+    /// slowest group you expect to dispatch, not for "how often should I
+    /// expect a heartbeat" -- see `group_heartbeat_timeout_secs` below for
+    /// why that is a different, narrower question.
     #[serde(default = "default_maintenance_group_timeout_secs")]
     pub group_timeout_secs: u64,
+    /// Wall-clock bound between frames ONCE a worker has started responding
+    /// to a dispatched group (i.e. after its first `Progress` heartbeat).
+    /// This does NOT bound how long the worker's compute phase itself can
+    /// run before it emits that first frame -- Task 3's worker action
+    /// computes the entire group (scan, delete-apply, re-encode) before it
+    /// streams anything back, so a worker wedged mid-compute produces no
+    /// frames at all and is caught only by `group_timeout_secs` above, not
+    /// by this field. `group_heartbeat_timeout_secs` only detects a worker
+    /// that responded, then went silent -- e.g. a connection that started
+    /// streaming and then stalled. True incremental progress reporting
+    /// (so this field could bound compute-phase hangs too) is a tracked
+    /// follow-up, not implemented here.
     #[serde(default = "default_maintenance_group_heartbeat_timeout_secs")]
     pub group_heartbeat_timeout_secs: u64,
 }

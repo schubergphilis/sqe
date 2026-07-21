@@ -18,13 +18,10 @@
 //! `do_action` RPC itself, none of which are practical to unit test without
 //! a live worker (see the `#[ignore]`d integration test at the bottom).
 //!
-//! Nothing calls [`dispatch_and_collect_groups`] yet: it is called by
-//! `maintenance::rewrite_data_files_distributed_once` (Phase 4c Task 4),
-//! which is itself not yet wired into `MaintenanceHandler::handle()` or the
-//! active-mode scheduler -- that wiring is Task 5's `distribution.mode`
-//! routing. `#![allow(dead_code)]` covers this whole module until then; it
-//! is fully exercised by the unit tests below.
-#![allow(dead_code)]
+//! [`dispatch_and_collect_groups`] is called by
+//! `maintenance::rewrite_data_files_distributed_once`, itself reachable from
+//! `MaintenanceHandler::handle()` and the active-mode scheduler once
+//! `distribution.mode` resolves to `Distributed` (Phase 4c Task 5).
 
 use std::collections::HashSet;
 use std::sync::Arc;

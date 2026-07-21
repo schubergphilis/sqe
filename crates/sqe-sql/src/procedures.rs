@@ -11,7 +11,8 @@
 //!
 //! - `system.rewrite_data_files(table => 'ns.t'[, target_file_size_bytes => N,
 //!   min_input_files => N, max_concurrent_file_group_rewrites => N,
-//!   strategy => 'binpack'|'sort', sort_order => '...', delete_file_threshold => N])`
+//!   strategy => 'binpack'|'sort', sort_order => '...', delete_file_threshold => N,
+//!   distributed => 'auto'|'local'|'require'])`
 //! - `system.expire_snapshots(table => 'ns.t'[, older_than => TIMESTAMP,
 //!   retain_last => N])`
 //! - `system.remove_orphan_files(table => 'ns.t'[, older_than => TIMESTAMP])`
@@ -66,6 +67,13 @@ pub enum ProcedureCall {
         /// broadly. Off (`None`) by default. No-op under `strategy => 'sort'`,
         /// which already rewrites the whole partition.
         delete_file_threshold: Option<usize>,
+        /// Per-call override of `[maintenance.distribution] mode` (Phase 4c
+        /// Task 5): `'auto'`, `'local'`, or `'require'` (case-insensitive).
+        /// `None` (default) means "use the configured `distribution.mode`".
+        /// Kept as a raw string here -- validated against `DistributionMode`
+        /// in the coordinator handler, which already owns that type, rather
+        /// than giving this parser crate a dependency on `sqe-core::config`.
+        distributed: Option<String>,
     },
     /// Drop old snapshots via vendored `RemoveSnapshotAction`.
     ExpireSnapshots {
@@ -739,6 +747,7 @@ fn parse_rewrite_data_files(mut args: Vec<(String, Expr)>) -> sqe_core::Result<P
     let delete_file_threshold = take_option(&mut args, "delete_file_threshold", |e| {
         expect_usize(e, "delete_file_threshold")
     })?;
+    let distributed = take_option(&mut args, "distributed", |e| expect_string(e, "distributed"))?;
     expect_no_remaining(&args, "rewrite_data_files")?;
 
     Ok(ProcedureCall::RewriteDataFiles {
@@ -749,6 +758,7 @@ fn parse_rewrite_data_files(mut args: Vec<(String, Expr)>) -> sqe_core::Result<P
         strategy,
         sort_order,
         delete_file_threshold,
+        distributed,
     })
 }
 
@@ -855,6 +865,7 @@ mod tests {
                 strategy,
                 sort_order,
                 delete_file_threshold,
+                distributed,
             } => {
                 assert_eq!(table.namespace, "ns");
                 assert_eq!(table.name, "t");
@@ -864,6 +875,7 @@ mod tests {
                 assert!(strategy.is_none());
                 assert!(sort_order.is_none());
                 assert!(delete_file_threshold.is_none());
+                assert!(distributed.is_none());
             }
             other => panic!("Expected RewriteDataFiles, got {other:?}"),
         }
@@ -901,6 +913,20 @@ mod tests {
                 ..
             } => {
                 assert_eq!(delete_file_threshold, Some(3));
+            }
+            other => panic!("Expected RewriteDataFiles, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_rewrite_data_files_distributed_override() {
+        let stmt = parse_first(
+            "CALL system.rewrite_data_files(table => 'ns.t', distributed => 'require')",
+        );
+        let call = try_parse_call(&stmt).unwrap().expect("match");
+        match call {
+            ProcedureCall::RewriteDataFiles { distributed, .. } => {
+                assert_eq!(distributed.as_deref(), Some("require"));
             }
             other => panic!("Expected RewriteDataFiles, got {other:?}"),
         }

@@ -191,6 +191,15 @@ impl QueryHandler {
         if let Some(ref a) = audit {
             maintenance_handler = maintenance_handler.with_audit(Arc::clone(a));
         }
+        // Phase 4c Task 5: wire the same worker registry the query path
+        // already got as a constructor argument, so the interactive `CALL
+        // system.rewrite_data_files(...)`'s `distribution.mode` routing sees
+        // the real healthy-worker count. A `None` here (no fleet configured)
+        // makes `healthy_worker_count()` always report `0`, which is what
+        // keeps a single-node deployment on the coordinator-local path.
+        if let Some(ref registry) = worker_registry {
+            maintenance_handler = maintenance_handler.with_worker_registry(Arc::clone(registry));
+        }
         // Wire the query tracker in as a history callback so
         // `suggest_bloom_filter_columns` can walk recent SQL texts.
         {
