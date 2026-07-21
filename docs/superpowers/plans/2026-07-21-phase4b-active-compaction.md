@@ -25,9 +25,9 @@
 
 **Interfaces produced:** `rewrite_data_files_once(..., snapshot_properties: Option<HashMap<String,String>>)` (internal); the `RewriteFilesAction` commit calls `.set_snapshot_properties(props)` when `Some`. The public `CALL system.rewrite_data_files` path passes `None` (unchanged behavior); the scheduler passes `Some({sqe.maintenance.job-id, sqe.maintenance.principal, sqe.maintenance.trigger})`.
 
-- [ ] Step 1: Failing test — a unit or integration assertion that a rewrite invoked with snapshot properties produces a snapshot whose summary carries them (integration `#[ignore]`/test-sqlite: run rewrite with props, reload table, assert `current_snapshot().summary()` contains the keys). Confirm the manual `CALL` path is unaffected (props None).
+- [ ] Step 1: Failing test: a unit or integration assertion that a rewrite invoked with snapshot properties produces a snapshot whose summary carries them (integration `#[ignore]`/test-sqlite: run rewrite with props, reload table, assert `current_snapshot().summary()` contains the keys). Confirm the manual `CALL` path is unaffected (props None).
 - [ ] Step 2: Run -> FAIL.
-- [ ] Step 3: Implement — add the param, chain `.set_snapshot_properties(props)` on the action when `Some`. Verify `RewriteFilesAction::set_snapshot_properties` signature in `vendor/iceberg-rust/.../transaction/rewrite_files.rs`. Update the manual dispatch call site to pass `None`.
+- [ ] Step 3: Implement: add the param, chain `.set_snapshot_properties(props)` on the action when `Some`. Verify `RewriteFilesAction::set_snapshot_properties` signature in `vendor/iceberg-rust/.../transaction/rewrite_files.rs`. Update the manual dispatch call site to pass `None`.
 - [ ] Step 4: Run -> PASS. `cargo clippy -p sqe-coordinator --all-targets -- -D warnings`.
 - [ ] Step 5: Commit `feat(maintenance): stamp compaction snapshots with job identity`.
 
@@ -39,7 +39,7 @@
 
 **Interfaces produced:** a `Session` carries an explicit internal maintenance-authority marker (a dedicated method e.g. `with_maintenance_authority(bool)` + accessor, or a reserved sentinel role constant `SQE_MAINTENANCE_ROLE`). `authorize_or_deny` grants write to a session bearing the marker without consulting the role-name heuristic. Polaris still enforces server-side.
 
-- [ ] Step 1: Failing unit test — `session_has_write_privilege` (or a new `is_maintenance_authorized`) returns true for a session minted with the marker even if its roles would otherwise be read-only; and a normal read-only session without the marker is still denied.
+- [ ] Step 1: Failing unit test: `session_has_write_privilege` (or a new `is_maintenance_authorized`) returns true for a session minted with the marker even if its roles would otherwise be read-only; and a normal read-only session without the marker is still denied.
 - [ ] Step 2: Run -> FAIL.
 - [ ] Step 3: Implement the marker on `Session` (minimal, internal), set it in `MaintenancePrincipal::mint_session`, and make `authorize_or_deny` accept it. Keep the existing role-name path for non-maintenance sessions unchanged. Do NOT weaken any existing check.
 - [ ] Step 4: Run -> PASS. Clippy clean.
@@ -67,7 +67,7 @@
 
 **Interfaces produced:** `table_due` evaluates the cron expression against wall-clock (next-fire within the current tick window), retaining deterministic per-table jitter. Invalid cron -> log once + skip that table (never panic).
 
-- [ ] Step 1: Failing unit test — a daily `"0 2 * * *"` schedule is due only in the 02:00 tick window, not at 14:00; per-table override wins; invalid cron is skipped not panicked.
+- [ ] Step 1: Failing unit test: a daily `"0 2 * * *"` schedule is due only in the 02:00 tick window, not at 14:00; per-table override wins; invalid cron is skipped not panicked.
 - [ ] Step 2: Run -> FAIL.
 - [ ] Step 3: Add the dep; implement cron evaluation in `table_due` (keep the 4a tick-window fix so it is not aliased). Keep jitter as an offset within the scheduled window.
 - [ ] Step 4: Run -> PASS. Clippy clean.
