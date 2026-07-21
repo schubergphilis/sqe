@@ -1460,7 +1460,7 @@ fn is_live_delete_entry(entry: &iceberg::spec::ManifestEntry) -> bool {
 /// data entries. The delete-aware rewrite needs the delete `DataFile`s
 /// themselves (not just a count) to compute the post-delete row cross-check and
 /// to identify fully-covered position deletes for removal.
-async fn collect_live_delete_files(table: &IcebergTable) -> sqe_core::Result<Vec<DataFile>> {
+pub(crate) async fn collect_live_delete_files(table: &IcebergTable) -> sqe_core::Result<Vec<DataFile>> {
     use futures::{StreamExt, TryStreamExt};
 
     let metadata_ref = table.metadata_ref();
@@ -1595,7 +1595,7 @@ fn expected_rows_after_deletes(group: &[DataFile], live_deletes: &[DataFile]) ->
 /// Position deletes without a `referenced_data_file` cannot be attributed
 /// cheaply and are likewise left (harmless: they reference removed paths and
 /// match nothing). Deduped by path.
-fn covered_position_deletes(
+pub(crate) fn covered_position_deletes(
     removed_data_paths: &std::collections::HashSet<String>,
     live_deletes: &[DataFile],
 ) -> Vec<DataFile> {
