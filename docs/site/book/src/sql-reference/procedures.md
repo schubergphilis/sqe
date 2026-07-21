@@ -15,6 +15,7 @@ Source: `crates/sqe-sql/src/procedures.rs`. Handlers in `crates/sqe-coordinator/
 | `system.remove_orphan_files` | `sqe-sql` + `sqe-coordinator` | `table => 'ns.t'` | `older_than => TIMESTAMP` | Deletes files under the table prefix not referenced by any live snapshot. Default `older_than` is 3 days ago, to avoid racing with in-flight writes. |
 | `system.rewrite_manifests` | `sqe-sql` + `sqe-coordinator` | `table => 'ns.t'` | - | Consolidates many small manifest files into fewer larger ones. Speeds up planning on large tables. |
 | `system.suggest_bloom_filter_columns` | `sqe-sql` + `sqe-coordinator` | `table => 'ns.t'` | `history_limit => N` | SQE-specific. Walks the last N finished queries (default 1000), counts equality predicates per column, returns ranked suggestions for `write.parquet.bloom-filter-columns`. |
+| `system.table_health` | `sqe-sql` + `sqe-coordinator` | `table => 'ns.t'` | - | SQE-specific (Phase 4a advisory auto-compaction). Read-only compaction-debt report: live/small file counts, avg/p50 file size, delete-file and delete-heavy counts, eligible bin-pack groups, estimated rewrite bytes, last compaction snapshot, and whether the table has opted into the maintenance scheduler. Never rewrites anything. |
 
 ## Comparison to other engines
 
@@ -114,6 +115,34 @@ therefore rewrites broadly, since one equality delete can apply to many files.
 The option is off by default and is a no-op under `strategy => 'sort'`, which
 already rewrites the whole partition.
 
+### Check compaction debt before deciding whether to run a rewrite
+
+`table_health` is read-only: it reuses the same file-collection and bin-pack
+logic `rewrite_data_files` uses to plan a rewrite, but never writes a file or
+commits a snapshot. It bypasses the write-privilege gate entirely, so a
+`SELECT`-only session can run it.
+
+```sql
+CALL system.table_health(table => 'analytics.events');
+```
+
+Returns one summary row:
+
+```text
++-----------------+-------------+----------------+----------------+--------------+---------------------+------------------+--------------------+-----------------------------+----------------------+
+| live_data_files | small_files | avg_file_bytes | p50_file_bytes | delete_files | delete_heavy_files  | eligible_groups  | est_rewrite_bytes  | last_compaction_snapshot_ms| maintenance_enabled  |
++-----------------+-------------+----------------+----------------+--------------+---------------------+------------------+--------------------+-----------------------------+----------------------+
+| 1842            | 611         | 41943040       | 33554432       | 96           | 12                  | 7                | 2248146944         | NULL                       | true                 |
++-----------------+-------------+----------------+----------------+--------------+---------------------+------------------+--------------------+-----------------------------+----------------------+
+```
+
+Column notes:
+
+- `small_files` counts live data files below `[maintenance.compaction].target_file_size_bytes` (default 512 MiB).
+- `eligible_groups` / `est_rewrite_bytes` report pure bin-pack debt: groups that meet `min_input_files` on file count alone. `delete_heavy_files` is a separate signal, files with at least `delete_file_threshold` delete files applying to them. A later `rewrite_data_files(delete_file_threshold => N)` call rewrites the union of both sets, so treat the two counts as additive, not `eligible_groups` already including delete-heavy files.
+- `last_compaction_snapshot_ms` is always `NULL` in Phase 4a: nothing stamps a `sqe.maintenance.job-id` into a snapshot summary yet. A later phase's active scheduler populates it.
+- `maintenance_enabled` reflects the `sqe.maintenance.enabled` table property, whether the (later) advisory/active scheduler would even consider this table. It does not mean a rewrite ran; Phase 4a's scheduler only reports, it mutates nothing.
+
 ### Drop snapshots older than 30 days, keeping the last 10
 
 ```sql
@@ -178,6 +207,7 @@ Procedures inherit the calling user's grants on the target table:
 - `system.rewrite_data_files`, `system.rewrite_manifests` need `MODIFY` (writes new files, commits a snapshot).
 - `system.expire_snapshots`, `system.remove_orphan_files` need `MODIFY` and `DROP` (alters retention, deletes files).
 - `system.suggest_bloom_filter_columns` is read-only against query history; `SELECT` on the table is enough.
+- `system.table_health` is read-only against the table's live metadata; `SELECT` on the table is enough. It bypasses the write-privilege gate entirely, unlike every other procedure in this table.
 
 A user without the right grant gets a clear "policy denied" error instead of a generic execution failure.
 

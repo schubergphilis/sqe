@@ -178,6 +178,49 @@ otlp_endpoint = ""              # OTLP gRPC endpoint (empty = disabled)
 traces_otlp_endpoint = ""       # trace-only OTLP gRPC endpoint
 trace_sample_rate = 0.01         # 0.0 to 1.0
 audit_log_path = ""             # Audit JSONL file (empty = disabled)
+
+# Advisory / active auto-compaction (Phase 4a+). Off by default: no
+# maintenance principal is constructed and no scheduler task runs
+# unless mode is set. See "Maintenance (auto-compaction)" below.
+[maintenance]
+mode = "off"                    # "off" (default) | "advisory" | "active"
+
+# Required only when mode != "off" (validation rejects mode without this block).
+# [maintenance.principal]
+# token_endpoint = "https://idp.example.com/realms/sqe/protocol/openid-connect/token"
+# client_id = "sqe-maintenance"
+# client_secret = ""            # TOML-only in Phase 4a; no env var override yet
+# scope = "PRINCIPAL_ROLE:sqe_maintenance"
+# user_id = "svc-sqe-maintenance"   # audit display identity
+# roles = ["maintenance"]
+# refresh_skew_secs = 60
+
+[maintenance.scheduler]
+enabled = false                 # in-process tick loop off by default; drive via
+                                 # an external Kubernetes CronJob instead, or flip
+                                 # this on for an in-coordinator loop
+tick_secs = 60                  # how often the loop wakes up when enabled
+schedule = "0 2 * * *"          # global default cron; per-table property overrides
+jitter_secs = 900               # per-table jitter so a fleet doesn't all fire at once
+max_concurrent_jobs = 1
+lease = "catalog"               # "none" | "catalog" | "kubernetes"
+lease_ttl_secs = 300
+state_table = "sqe_system.maintenance_log"  # operator-created; see note below
+single_scheduler_acknowledged = false       # required true for enabled=true + lease="none"
+
+[maintenance.compaction]
+target_file_size_bytes = 536870912   # 512 MiB
+min_input_files = 5
+delete_file_threshold = 2
+strategy = "binpack"             # "binpack" | "sort" | "zorder"
+
+[maintenance.distribution]
+mode = "auto"                    # "auto" (default) | "local" | "require"
+min_workers = 2
+max_inflight_groups_per_worker = 1
+group_attempts = 2
+group_timeout_secs = 3600
+group_heartbeat_timeout_secs = 120
 ```
 
 ## Environment Variable Overrides
@@ -394,6 +437,109 @@ client_id = "sqe-cli-device"
 scopes = ["openid", "profile"]
 ```
 
+## Maintenance (auto-compaction)
+
+`[maintenance]` configures SQE's background compaction subsystem: a
+non-human service principal, an in-coordinator scheduler loop, and the
+sizing knobs `CALL system.rewrite_data_files` and `CALL
+system.table_health` both use. As of Phase 4a the subsystem is advisory
+only: it can report compaction debt but cannot mutate a table. Active
+compaction (the scheduler actually calling `rewrite_data_files` on a
+timer) ships in a later phase.
+
+### The mode ladder
+
+`maintenance.mode` gates the whole subsystem and only moves up a ladder an
+operator chooses explicitly:
+
+- `"off"` (default). No maintenance principal is constructed, no scheduler
+  task is spawned, `[maintenance.principal]` is not required.
+- `"advisory"`. The scheduler loop (if `scheduler.enabled = true`) discovers
+  opted-in tables and publishes health/metrics per table, the same report
+  `CALL system.table_health` returns. Nothing is rewritten.
+- `"active"`. The scheduler runs real `rewrite_data_files` jobs on a
+  schedule. Ships in a later phase; setting `mode = "active"` today has no
+  code path wired to it yet.
+
+Any mode beyond `"off"` requires a `[maintenance.principal]` block.
+Validation rejects the config otherwise, so a typo'd `mode` value cannot
+silently run with no credentials.
+
+`mode = "off"` is total absence, not a runtime no-op: coordinator bootstrap
+constructs neither the maintenance principal nor the scheduler task when
+`mode` is `"off"`, so there is nothing in the process that could reach a
+table, not merely a loop that declines to run. `CALL system.table_health`
+is unaffected by `mode`: it is a plain read-only procedure available to any
+session with `SELECT` on the table, regardless of the maintenance
+subsystem's state.
+
+### The maintenance principal
+
+`[maintenance.principal]` is a dedicated OAuth2 client-credentials (M2M)
+identity used solely by the maintenance scheduler. It is never added to
+the interactive auth chain (`[[auth.providers]]`), so the query path
+cannot authenticate as this principal even by accident. Fields:
+`token_endpoint`, `client_id`, `client_secret`, `scope`, `user_id` (the
+audit display identity for events this principal emits), `roles`, and
+`refresh_skew_secs` (pre-emptive token refresh before expiry, default 60).
+
+`client_secret` is a `SecretString`: it never round-trips through a
+config-dump path and zeroizes on drop, same treatment as `auth.client_secret`.
+Unlike `auth.client_secret`, there is no `SQE_MAINTENANCE__...` environment
+variable override wired up in Phase 4a, so keep it out of a checked-in TOML
+file and mount it in via a file-based secret instead.
+
+Startup validation warns (not an error) if `maintenance.principal.client_id`
+matches a configured auth-provider `client_id`: sharing an identity between
+the interactive and maintenance paths makes audit trails ambiguous about
+which one acted.
+
+### The scheduler loop
+
+`[maintenance.scheduler].enabled` defaults to `false`. A `false` value
+suits external-trigger deployments: leave the in-process loop off and drive
+timing from a Kubernetes `CronJob` (`concurrencyPolicy: Forbid`) that issues
+the maintenance `CALL` on its own schedule. Set `enabled = true` to run the
+tick loop inside the coordinator instead; it wakes every `tick_secs`
+seconds, evaluates `schedule` (a cron expression, overridable per table via
+a `sqe.maintenance.compaction.schedule` table property) with `jitter_secs`
+of per-table jitter so a whole fleet due at once does not thunder against
+Polaris/S3 simultaneously.
+
+`lease` is the double-fire guard for multi-coordinator deployments:
+`"catalog"` (default) claims a lease row in the state table, `"none"` runs
+unleased and requires `single_scheduler_acknowledged = true`, `"kubernetes"`
+is a later-phase backend. `tick_secs` and `lease_ttl_secs` must both be
+greater than zero; either at zero fails validation.
+
+### The three gates
+
+Autonomous mutation (a later phase) requires all three to line up. The
+Phase 4a advisory scheduler loop already respects the first two when
+deciding which tables to discover and report on:
+
+1. Global `maintenance.mode` is `"advisory"` or `"active"` (never `"off"`).
+2. The table owner has set the per-table property `sqe.maintenance.enabled
+   = true` via `ALTER TABLE`. A table without this property is never
+   selected, no matter what `mode` is set to.
+3. The maintenance principal holds a least-privilege Polaris grant, exactly
+   `TABLE_READ_DATA` (plus `TABLE_WRITE_DATA` once active mode ships) on
+   the opted-in namespace, no `CREATE`/`DROP`/admin. Polaris enforces this
+   server-side as defense-in-depth on top of SQE's own gates. A table with
+   the property but no grant fails loud (audit event plus metric), never a
+   silent skip.
+
+### `sqe_system.maintenance_log`
+
+`maintenance.scheduler.state_table` (default `sqe_system.maintenance_log`)
+holds job history, last-run state, and the catalog lease rows. Phase 4a
+treats this table as operator-created: nothing in SQE creates it, and the
+scheduler degrades to warn-and-skip rather than failing hard when the table
+is absent. Create it once with a schema matching `(job_id, table, trigger,
+principal, started_at, finished_at, status, files_in, files_out, bytes_in,
+bytes_out, rows_removed, snapshot_id, error)` before turning on
+`scheduler.enabled`.
+
 ## Validation
 
 SQE validates config at startup and fails fast on errors:
@@ -404,6 +550,9 @@ SQE validates config at startup and fails fast on errors:
 - `coordinator.flight_sql_port` must differ from `coordinator.trino_http_port`
 - `coordinator.flight_sql_port` must differ from `metrics.prometheus_port`
 - TLS: if either cert or key is set, both must be set; referenced files must exist
+- `maintenance.mode` other than `"off"` requires a `[maintenance.principal]` block
+- `maintenance.scheduler.tick_secs` and `maintenance.scheduler.lease_ttl_secs` must both be greater than zero
+- `maintenance.scheduler.enabled = true` with `lease = "none"` requires `single_scheduler_acknowledged = true`
 
 ## Priority Order
 
