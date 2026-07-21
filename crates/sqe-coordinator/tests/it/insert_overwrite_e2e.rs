@@ -5,8 +5,13 @@
 //! ```text
 //! docker compose -f docker-compose.test.yml up -d
 //! ./scripts/bootstrap-test.sh
-//! cargo test -p sqe-coordinator --test it -- --ignored insert_overwrite
+//! RUST_MIN_STACK=33554432 cargo test -p sqe-coordinator --test it -- --ignored insert_overwrite
 //! ```
+//!
+//! RUST_MIN_STACK must be raised: the write e2e paths overflow the default
+//! 2 MiB test-thread stack (same requirement as the sibling write suites),
+//! which aborts the whole test process with SIGABRT rather than failing one
+//! test. 32 MiB is comfortable.
 
 use arrow_array::{Array, Int64Array, StringArray};
 use std::collections::HashMap;
