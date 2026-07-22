@@ -39,9 +39,17 @@ use crate::writer::{new_upload_tracker, parse_parquet_compression, WriteCleanupG
 /// visibility) because `table_health.rs` and `write_handler.rs` (the #378
 /// INSERT OVERWRITE / CoW delete-cleanup path) reach them via
 /// `crate::maintenance::`.
+///
+/// `is_live_delete_entry` / `collect_live_delete_files` were later
+/// deduplicated into `sqe-compaction` too (a follow-up cleanup: they were a
+/// byte-identical copy shared with `sqe-worker::compaction`). Only
+/// `collect_live_delete_files` needs a `pub(crate)` re-export here (used
+/// throughout this file and by `write_handler.rs`); `is_live_delete_entry`
+/// is imported directly where this file's unit tests exercise it.
 use sqe_compaction::{group_files_by_partition, plan_delete_aware_read, rewrite_group, SortCtx, SortSpec};
 pub(crate) use sqe_compaction::{
-    covered_position_deletes, delete_heavy_files, pack_file_groups_partition_aware,
+    collect_live_delete_files, covered_position_deletes, delete_heavy_files,
+    pack_file_groups_partition_aware,
 };
 
 /// Callback that returns a snapshot of recent SQL query texts.
@@ -2283,60 +2291,6 @@ pub(crate) async fn load_table(catalog: &Arc<dyn Catalog>, ident: &TableIdent) -
         .map_err(|e| SqeError::Catalog(format!("Failed to load table '{ident}': {e}")))
 }
 
-/// True when a manifest entry is a live delete file (position or equality).
-///
-/// A live entry is one whose status is not `Deleted`; a delete file is any
-/// entry whose content type is not `Data`. The delete-aware rewrite uses this
-/// to collect the delete files it must apply during the read
-/// (`collect_live_delete_files`) and account for in the row cross-check.
-fn is_live_delete_entry(entry: &iceberg::spec::ManifestEntry) -> bool {
-    entry.status() != ManifestStatus::Deleted
-        && entry.content_type() != DataContentType::Data
-}
-
-/// Collect the live delete files (position + equality) of the current snapshot.
-/// Mirrors `collect_live_data_files` but keeps delete-content entries instead of
-/// data entries. The delete-aware rewrite needs the delete `DataFile`s
-/// themselves (not just a count) to compute the post-delete row cross-check and
-/// to identify fully-covered position deletes for removal.
-pub(crate) async fn collect_live_delete_files(table: &IcebergTable) -> sqe_core::Result<Vec<DataFile>> {
-    use futures::{StreamExt, TryStreamExt};
-
-    let metadata_ref = table.metadata_ref();
-    let Some(snapshot) = metadata_ref.current_snapshot() else {
-        return Ok(vec![]);
-    };
-
-    let cache = table.object_cache();
-    let manifest_list = cache
-        .get_manifest_list(snapshot, &metadata_ref)
-        .await
-        .map_err(|e| SqeError::Execution(format!("Failed to load manifest list: {e}")))?;
-
-    const CONCURRENCY: usize = 8;
-    let manifests: Vec<Arc<iceberg::spec::Manifest>> =
-        futures::stream::iter(manifest_list.entries().iter().cloned())
-            .map(|mf| {
-                let cache = cache.clone();
-                async move { cache.get_manifest(&mf).await }
-            })
-            .buffer_unordered(CONCURRENCY)
-            .try_collect()
-            .await
-            .map_err(|e| SqeError::Execution(format!("Failed to load manifest: {e}")))?;
-
-    Ok(manifests
-        .into_iter()
-        .flat_map(|m| {
-            m.entries()
-                .iter()
-                .filter(|e| is_live_delete_entry(e))
-                .map(|e| e.data_file().clone())
-                .collect::<Vec<_>>()
-        })
-        .collect())
-}
-
 /// Collect the three inputs [`crate::table_health::analyze_table_health`]
 /// needs for one table, in the exact sequence `table_health()` (the `CALL
 /// system.table_health` handler, above) uses: live data files, live delete
@@ -2619,6 +2573,7 @@ pub(crate) fn session_has_write_privilege(session: &Session) -> bool {
 mod tests {
     use super::*;
     use chrono::Duration;
+    use sqe_compaction::is_live_delete_entry;
 
     fn session_with_roles(roles: Vec<&str>) -> Session {
         Session::new(
