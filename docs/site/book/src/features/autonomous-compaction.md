@@ -124,10 +124,14 @@ requested, and write new Parquet directly against S3, using their own S3
 credentials and no catalog token at all. Commit authority never leaves the
 coordinator: it validates every worker's output, re-checks the row-count
 invariant across the whole job, and commits one atomic snapshot that swaps
-every old file for every new file at once. A job either commits
-everything or nothing. See [Distributed
-compaction](../design-notes/distributed-compaction.md) for the full
-planning, dispatch, and commit flow.
+every old file for every new file at once. By default a job either commits
+everything or nothing. Opting into `[maintenance.distribution]
+partial_progress` trades that guarantee for incremental batch commits on
+very large tables, at the cost of a larger commit-conflict surface. See
+[Configuration](../deployment/configuration.md) for the knob, and
+[Distributed compaction](../design-notes/distributed-compaction.md) for
+the full planning, dispatch, and commit flow, including the
+partial-progress commit model.
 
 ## High availability
 
