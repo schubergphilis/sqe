@@ -1078,6 +1078,12 @@ impl MaintenanceHandler {
                             compression,
                             tracker_for_group,
                             target_bytes,
+                            // The coordinator-local `CALL system.rewrite_data_files`
+                            // path has no heartbeat to feed (there is no
+                            // dispatch RPC to bound); only the distributed
+                            // worker path (`sqe-worker::compaction`) supplies
+                            // a progress reporter.
+                            None,
                         )
                         .await
                     }

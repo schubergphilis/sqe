@@ -295,9 +295,10 @@ pub async fn write_data_files_streaming_with_metrics(
     tracker: UploadedPaths,
     fanout: FanoutLimits,
 ) -> sqe_core::Result<(Vec<DataFile>, usize)> {
-    let (data_files, total_rows) =
-        write_data_files_streaming(table, stream, file_prefix, compression, tracker, fanout, None)
-            .await?;
+    let (data_files, total_rows) = write_data_files_streaming(
+        table, stream, file_prefix, compression, tracker, fanout, None, None,
+    )
+    .await?;
 
     if let Some(m) = metrics {
         let total_bytes: u64 = data_files.iter().map(|df| df.file_size_in_bytes()).sum();

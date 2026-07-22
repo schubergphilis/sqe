@@ -477,6 +477,13 @@ pub async fn sort_group_stream(
 /// `referenced_data_file`) any mismatch aborts before commit, and when it is not
 /// (equality deletes) the caller enforces the looser "cannot manufacture rows"
 /// bound.
+///
+/// `progress`, when `Some`, is forwarded straight through to
+/// `write_data_files_streaming` so the caller can observe incremental
+/// rows-written during the rewrite (used by `sqe-worker`'s distributed
+/// `compact_file_group` action to emit heartbeat frames). The coordinator's
+/// own local `CALL system.rewrite_data_files` path passes `None` and is
+/// unaffected.
 #[allow(clippy::too_many_arguments)]
 pub async fn rewrite_group(
     table: &IcebergTable,
@@ -488,6 +495,7 @@ pub async fn rewrite_group(
     compression: parquet::basic::Compression,
     tracker: UploadedPaths,
     target_bytes: u64,
+    progress: Option<crate::progress::ProgressReporter>,
 ) -> sqe_core::Result<(Vec<DataFile>, Vec<DataFile>, u64)> {
     use futures::StreamExt;
 
@@ -556,6 +564,7 @@ pub async fn rewrite_group(
         // property that makes sort compaction prunable at scale). Bin-pack
         // groups are already packed under target, so this is a no-op for them.
         Some(target_bytes),
+        progress,
     )
     .await?;
     let rows_written = rows_written as u64;
