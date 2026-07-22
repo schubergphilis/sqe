@@ -9,7 +9,14 @@
 //! is new here: the action is `"compact_file_group"`, the response is a
 //! `CompactGroupFrame` stream (a `Progress` heartbeat then one `Done`), and
 //! failed groups are retried on a *different* healthy worker up to
-//! `group_attempts` times before the whole job fails (no partial commit).
+//! `group_attempts` times before [`dispatch_and_collect_groups`] itself
+//! fails -- ONE call to this function is always all-or-nothing for the
+//! groups it was given. (Phase 4d Task 3: `maintenance::commit_eligible_groups`
+//! may now call this function once PER BATCH when `partial_progress` is
+//! opted in, so a job as a whole can end up with some batches committed and
+//! a later one failing; that batching/partial-commit decision lives entirely
+//! in `maintenance.rs`, not here -- this function's own contract, "this
+//! call's groups commit together or not at all", is unchanged.)
 //!
 //! The pure placement/decode/aggregation logic this module drives lives in
 //! `sqe_compaction::dispatch`, which has no Flight/tonic dependency and is
@@ -19,9 +26,11 @@
 //! a live worker (see the `#[ignore]`d integration test at the bottom).
 //!
 //! [`dispatch_and_collect_groups`] is called by
-//! `maintenance::rewrite_data_files_distributed_once`, itself reachable from
-//! `MaintenanceHandler::handle()` and the active-mode scheduler once
-//! `distribution.mode` resolves to `Distributed` (Phase 4c Task 5).
+//! `maintenance::rewrite_data_files_distributed_once` via
+//! [`WorkerFleetDispatcher`] (a [`GroupBatchDispatcher`] implementation),
+//! itself reachable from `MaintenanceHandler::handle()` and the active-mode
+//! scheduler once `distribution.mode` resolves to `Distributed` (Phase 4c
+//! Task 5).
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -29,9 +38,11 @@ use std::time::Duration;
 
 use arrow_flight::flight_service_client::FlightServiceClient;
 use arrow_flight::Action;
+use async_trait::async_trait;
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
-use iceberg::spec::DataFile;
+use iceberg::spec::{DataFile, FormatVersion, Schema, StructType};
+use sqe_compaction::dispatch::{decode_group_response, GroupOutcome};
 use sqe_compaction::wire::{CompactGroupRequest, CompactGroupResponse, S3Conn, SortSpecWire};
 use sqe_core::{Result as SqeResult, SqeError};
 use tracing::warn;
@@ -554,6 +565,83 @@ pub(crate) async fn dispatch_and_collect_groups(
     }
 
     Ok(responses)
+}
+
+/// Dispatches one batch of file groups and decodes each group's response
+/// into a [`GroupOutcome`]. `maintenance::MaintenanceHandler::commit_eligible_groups`
+/// drives this trait rather than calling [`dispatch_and_collect_groups`] +
+/// `decode_group_response` directly, so its batch-commit / partial-progress
+/// bookkeeping (Phase 4d Task 3) can be exercised in tests against a
+/// synthetic implementation, without a live worker fleet.
+#[async_trait]
+pub(crate) trait GroupBatchDispatcher: Send + Sync {
+    async fn dispatch(&self, batch: &[Vec<DataFile>]) -> SqeResult<Vec<GroupOutcome>>;
+}
+
+/// Production [`GroupBatchDispatcher`]: dispatches to the real worker fleet
+/// via [`dispatch_and_collect_groups`] and decodes each response against the
+/// table load the job planned against. Every field is owned (not borrowed)
+/// so the dispatcher can be built once per job and handed to
+/// `commit_eligible_groups` as a plain `&dyn GroupBatchDispatcher` without
+/// threading extra lifetimes through the batching loop.
+#[allow(clippy::too_many_arguments)]
+pub(crate) struct WorkerFleetDispatcher {
+    pub job_id: String,
+    pub table_ident: String,
+    pub metadata_location: String,
+    pub snapshot_id: i64,
+    pub target_file_size_bytes: u64,
+    pub compression: String,
+    pub sort: Option<SortSpecWire>,
+    pub s3: S3Conn,
+    pub registry: Arc<WorkerRegistry>,
+    pub load_tracker: WorkerLoadTracker,
+    pub worker_secret: String,
+    pub max_inflight_per_worker: usize,
+    pub group_attempts: usize,
+    pub group_timeout: Duration,
+    pub heartbeat_timeout: Duration,
+    pub schema: Arc<Schema>,
+    pub partition_spec_id: i32,
+    pub partition_type: StructType,
+    pub format_version: FormatVersion,
+}
+
+#[async_trait]
+impl GroupBatchDispatcher for WorkerFleetDispatcher {
+    async fn dispatch(&self, batch: &[Vec<DataFile>]) -> SqeResult<Vec<GroupOutcome>> {
+        let responses = dispatch_and_collect_groups(
+            &self.job_id,
+            &self.table_ident,
+            &self.metadata_location,
+            self.snapshot_id,
+            batch,
+            self.target_file_size_bytes,
+            &self.compression,
+            self.sort.as_ref(),
+            &self.s3,
+            &self.registry,
+            &self.load_tracker,
+            &self.worker_secret,
+            self.max_inflight_per_worker,
+            self.group_attempts,
+            self.group_timeout,
+            self.heartbeat_timeout,
+        )
+        .await?;
+        responses
+            .iter()
+            .map(|r| {
+                decode_group_response(
+                    r,
+                    self.schema.as_ref(),
+                    self.partition_spec_id,
+                    &self.partition_type,
+                    self.format_version,
+                )
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]

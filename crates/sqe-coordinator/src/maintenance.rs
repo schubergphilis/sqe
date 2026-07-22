@@ -960,6 +960,8 @@ impl MaintenanceHandler {
                 snapshot_id: None,
                 files_rewritten: 0,
                 skipped_reason: Some("below min_input_files".to_string()),
+                partial: false,
+                partial_error: None,
             });
         }
 
@@ -1025,6 +1027,8 @@ impl MaintenanceHandler {
                 snapshot_id: None,
                 files_rewritten: 0,
                 skipped_reason: Some("no eligible groups".to_string()),
+                partial: false,
+                partial_error: None,
             });
         }
 
@@ -1257,6 +1261,8 @@ impl MaintenanceHandler {
             snapshot_id: new_snapshot_id,
             files_rewritten: old_files.len() as i64,
             skipped_reason: None,
+            partial: false,
+            partial_error: None,
         })
     }
 
@@ -1445,6 +1451,8 @@ impl MaintenanceHandler {
                 snapshot_id: None,
                 files_rewritten: 0,
                 skipped_reason: Some("below min_input_files".to_string()),
+                partial: false,
+                partial_error: None,
             });
         }
 
@@ -1489,6 +1497,8 @@ impl MaintenanceHandler {
                 snapshot_id: None,
                 files_rewritten: 0,
                 skipped_reason: Some("no eligible groups".to_string()),
+                partial: false,
+                partial_error: None,
             });
         }
 
@@ -1505,58 +1515,271 @@ impl MaintenanceHandler {
         let group_timeout = std::time::Duration::from_secs(dist.group_timeout_secs);
         let heartbeat_timeout = std::time::Duration::from_secs(dist.group_heartbeat_timeout_secs);
 
-        // Dispatch every group; on success this holds one CompactGroupResponse
-        // per group (order not significant, each carries its own group_id).
-        // A group that exhausts `group_attempts` fails the whole job before
-        // any commit is attempted (no partial commit).
-        let responses = crate::compaction_dispatch::dispatch_and_collect_groups(
-            job_id,
-            &ident.to_string(),
-            &metadata_location,
-            snapshot_id,
-            &eligible_groups,
-            target_bytes,
-            &compression,
-            sort_wire.as_ref(),
-            s3,
-            registry,
-            load_tracker,
-            worker_secret,
-            dist.max_inflight_groups_per_worker,
-            dist.group_attempts,
-            group_timeout,
-            heartbeat_timeout,
-        )
-        .await?;
-
         // Decode each worker's Avro DataFiles against THIS table load's
         // schema/partition type/spec id/format version -- none of that rides
-        // in CompactGroupResponse itself (see its doc comment).
+        // in CompactGroupResponse itself (see its doc comment). Resolved once,
+        // up front: every batch below (whether this job ends up as one
+        // all-or-nothing commit, the default, or several `partial_progress`
+        // batches) decodes against the same planned-against table load.
         let partition_type = table.metadata().default_partition_type().clone();
         let partition_spec_id = table.metadata().default_partition_spec_id();
         let format_version = table.metadata().format_version();
         let schema = table.metadata().current_schema().clone();
 
-        let outcomes: Vec<sqe_compaction::dispatch::GroupOutcome> = responses
-            .iter()
-            .map(|r| {
-                sqe_compaction::dispatch::decode_group_response(
-                    r,
-                    schema.as_ref(),
-                    partition_spec_id,
-                    &partition_type,
-                    format_version,
-                )
-            })
-            .collect::<sqe_core::Result<Vec<_>>>()?;
+        let dispatcher = crate::compaction_dispatch::WorkerFleetDispatcher {
+            job_id: job_id.to_string(),
+            table_ident: ident.to_string(),
+            metadata_location: metadata_location.clone(),
+            snapshot_id,
+            target_file_size_bytes: target_bytes,
+            compression,
+            sort: sort_wire,
+            s3: s3.clone(),
+            registry: Arc::clone(registry),
+            load_tracker: load_tracker.clone(),
+            worker_secret: worker_secret.to_string(),
+            max_inflight_per_worker: dist.max_inflight_groups_per_worker,
+            group_attempts: dist.group_attempts,
+            group_timeout,
+            heartbeat_timeout,
+            schema,
+            partition_spec_id,
+            partition_type,
+            format_version,
+        };
 
-        let old_files: Vec<DataFile> = eligible_groups.into_iter().flatten().collect();
+        // Dispatch + commit every eligible group.
+        //
+        // Default (`partial_progress` off, the pre-Task-3 behavior): one
+        // all-or-nothing `RewriteFilesAction` over every group -- any group
+        // exhausting its retries fails the whole job before any commit is
+        // attempted, byte-identical to before this field existed.
+        //
+        // Opted in: disjoint batches of `partial_progress_batch` groups,
+        // each its own commit; a terminal group failure after some batches
+        // already committed reports `partial = true` instead of failing the
+        // whole job. See [`Self::commit_eligible_groups`]'s doc comment for
+        // the seq-pin / `check_file_existence` correctness argument that
+        // holds across batches.
+        Self::commit_eligible_groups(
+            catalog,
+            table,
+            &ident,
+            eligible_groups,
+            dist.partial_progress,
+            dist.partial_progress_batch,
+            seq_at_start,
+            &live_deletes,
+            snapshot_properties,
+            self.table_cache.as_ref(),
+            input_count,
+            total_bytes,
+            &dispatcher,
+        )
+        .await
+    }
 
-        // Global added <= removed invariant, re-run over the FULL job (the
-        // per-group `expected_rows_after_deletes` cross-check already ran on
-        // each worker before it returned); any violation aborts before the
-        // commit below.
-        let aggregated = sqe_compaction::dispatch::aggregate_group_outcomes(outcomes, &old_files)?;
+    /// Commit `eligible_groups`'s rewrite either as one atomic
+    /// `RewriteFilesAction` (default, `partial_progress = false`,
+    /// byte-identical to the pre-Task-3 behavior) or, when opted in, in
+    /// disjoint batches of `partial_progress_batch` groups each getting its
+    /// own `RewriteFilesAction` commit (Phase 4d Task 3: opt-in
+    /// partial-progress commits).
+    ///
+    /// `dispatcher` abstracts "dispatch this batch of groups to the worker
+    /// fleet and decode the responses" so this function's batching/commit/
+    /// partial bookkeeping can be driven by a synthetic
+    /// [`crate::compaction_dispatch::GroupBatchDispatcher`] in tests,
+    /// without a live worker fleet (see
+    /// `crate::compaction_dispatch::WorkerFleetDispatcher` for the
+    /// production implementation).
+    ///
+    /// # Per-batch commit sequence
+    ///
+    /// Every batch's `RewriteFilesAction` uses the EXACT same sequence as
+    /// the pre-Task-3 single commit: `set_enable_delete_filter_manager(true)`,
+    /// `set_check_file_existence(true)`, `set_new_data_file_sequence_number`
+    /// pinned to `seq_at_start`, the snapshot-property stamp, and
+    /// `add_data_files(batch_new).delete_files(batch_old +
+    /// batch_covered_deletes)`. The `added <= removed` row invariant
+    /// (`aggregate_group_outcomes`) is re-checked per batch, over just that
+    /// batch's own files.
+    ///
+    /// # Why `seq_at_start` never moves
+    ///
+    /// `seq_at_start` is the sequence number of the snapshot this job
+    /// planned against, captured ONCE by the caller before any batch runs.
+    /// Every batch's compacted output is pinned to it -- never to the
+    /// snapshot that batch actually commits against -- so a concurrent
+    /// equality delete committed at any point during this job, including
+    /// between two of our own batch commits, still out-ranks the compacted
+    /// files and continues to apply to them. Pinning batch K+1 to the
+    /// snapshot batch K just created instead would let a delete that landed
+    /// between K and K+1 dodge the rows batch K+1 rewrites, silently
+    /// resurrecting them. So the pin is fixed at plan time and reused
+    /// verbatim for every batch, exactly like the non-batched path reuses it
+    /// for its one commit.
+    ///
+    /// # Why disjoint batches keep `check_file_existence` valid across commits
+    ///
+    /// `eligible_groups` partitions every file into exactly one group, and
+    /// batching only chunks that partition further, so no data file appears
+    /// in two batches. After batch K commits, the table's live file set has
+    /// batch K's input files removed and its output files added; batch
+    /// K+1's input files are a disjoint set neither committed nor touched
+    /// by K, so they are still exactly where they were. `check_file_existence
+    /// (true)` on batch K+1's commit finds them and validates cleanly,
+    /// unless a concurrent EXTERNAL writer removed one -- exactly the same
+    /// conflict `check_file_existence` exists to catch on the non-batched
+    /// path, just now surfaced once per batch instead of once per job.
+    ///
+    /// # Position deletes stay disjoint too
+    ///
+    /// `covered_position_deletes` is computed per batch against the SAME
+    /// `live_deletes` snapshot the caller collected once at plan time, but
+    /// restricted to that batch's own removed data-file paths. A position
+    /// delete file has exactly one `referenced_data_file`, so it can only
+    /// ever be "covered" by the one batch (if any) that removes its
+    /// referenced file -- batches can never race to claim the same delete
+    /// file.
+    ///
+    /// # Return value
+    ///
+    /// Returns `Ok` with `partial = true` when `partial_progress` is on, at
+    /// least one batch already committed, and a later batch's dispatch/
+    /// aggregate/commit failed; the already-committed batches are never
+    /// rolled back. Returns `Err` -- no commit at all -- when
+    /// `partial_progress` is off, or when it is on but the very first batch
+    /// failed before anything committed (there is nothing "partial" about
+    /// zero commits).
+    #[allow(clippy::too_many_arguments)]
+    async fn commit_eligible_groups(
+        catalog: &Arc<dyn Catalog>,
+        mut table: IcebergTable,
+        ident: &TableIdent,
+        eligible_groups: Vec<Vec<DataFile>>,
+        partial_progress: bool,
+        partial_progress_batch: usize,
+        seq_at_start: i64,
+        live_deletes: &[DataFile],
+        snapshot_properties: Option<std::collections::HashMap<String, String>>,
+        table_cache: Option<&TableMetadataCache>,
+        input_count: usize,
+        total_bytes: i64,
+        dispatcher: &dyn crate::compaction_dispatch::GroupBatchDispatcher,
+    ) -> sqe_core::Result<RewriteOutcome> {
+        // `partial_progress` off: one chunk containing every eligible group,
+        // i.e. exactly the pre-Task-3 single dispatch-then-commit call.
+        let batch_size = if partial_progress { partial_progress_batch.max(1) } else { usize::MAX };
+        let batches: Vec<&[Vec<DataFile>]> = eligible_groups.chunks(batch_size).collect();
+        let total_batches = batches.len();
+
+        let mut files_out_total: i64 = 0;
+        let mut bytes_out_total: i64 = 0;
+        let mut rows_removed_total: i64 = 0;
+        let mut files_rewritten_total: i64 = 0;
+        let mut last_snapshot_id: Option<i64> = None;
+        let mut committed_batches = 0usize;
+        let mut live_expected = input_count as i64;
+
+        for (batch_idx, batch) in batches.into_iter().enumerate() {
+            let result = Self::commit_one_batch(
+                catalog,
+                &table,
+                ident,
+                batch,
+                seq_at_start,
+                live_deletes,
+                snapshot_properties.clone(),
+                table_cache,
+                live_expected,
+                dispatcher,
+            )
+            .await;
+
+            match result {
+                Ok(batch_result) => {
+                    files_out_total += batch_result.output_count;
+                    bytes_out_total += batch_result.output_bytes;
+                    rows_removed_total += batch_result.rows_removed;
+                    files_rewritten_total += batch_result.old_file_count;
+                    last_snapshot_id = batch_result.new_snapshot_id;
+                    live_expected = batch_result.live_expected_after;
+                    table = batch_result.committed_table;
+                    committed_batches += 1;
+                }
+                Err(e) => {
+                    if partial_progress && committed_batches > 0 {
+                        warn!(
+                            table = %ident,
+                            batch_idx,
+                            total_batches,
+                            committed_batches,
+                            error = %e,
+                            "rewrite_data_files_distributed: partial_progress terminal group \
+                             failure after some batches already committed; reporting partial \
+                             success instead of failing the whole job"
+                        );
+                        return Ok(RewriteOutcome {
+                            files_in: input_count as i64,
+                            files_out: files_out_total,
+                            bytes_in: total_bytes,
+                            bytes_out: bytes_out_total,
+                            rows_removed: rows_removed_total,
+                            snapshot_id: last_snapshot_id,
+                            files_rewritten: files_rewritten_total,
+                            skipped_reason: None,
+                            partial: true,
+                            partial_error: Some(e.to_string()),
+                        });
+                    }
+                    return Err(e);
+                }
+            }
+        }
+
+        Ok(RewriteOutcome {
+            files_in: input_count as i64,
+            files_out: files_out_total,
+            bytes_in: total_bytes,
+            bytes_out: bytes_out_total,
+            rows_removed: rows_removed_total,
+            snapshot_id: last_snapshot_id,
+            files_rewritten: files_rewritten_total,
+            skipped_reason: None,
+            partial: false,
+            partial_error: None,
+        })
+    }
+
+    /// Dispatch, aggregate, and commit ONE batch (a `RewriteFilesAction`
+    /// over just that batch's groups). See
+    /// [`Self::commit_eligible_groups`]'s doc comment for the correctness
+    /// argument justifying reusing `seq_at_start` and
+    /// `check_file_existence(true)` unchanged across batches.
+    #[allow(clippy::too_many_arguments)]
+    async fn commit_one_batch(
+        catalog: &Arc<dyn Catalog>,
+        table: &IcebergTable,
+        ident: &TableIdent,
+        batch: &[Vec<DataFile>],
+        seq_at_start: i64,
+        live_deletes: &[DataFile],
+        snapshot_properties: Option<std::collections::HashMap<String, String>>,
+        table_cache: Option<&TableMetadataCache>,
+        live_expected_before: i64,
+        dispatcher: &dyn crate::compaction_dispatch::GroupBatchDispatcher,
+    ) -> sqe_core::Result<BatchCommitResult> {
+        let outcomes = dispatcher.dispatch(batch).await?;
+
+        let batch_old_files: Vec<DataFile> = batch.iter().flatten().cloned().collect();
+
+        // Row invariant, re-run per batch (the per-group
+        // `expected_rows_after_deletes` cross-check already ran on the
+        // WORKER before it returned); any violation aborts before this
+        // batch's commit, leaving any earlier batches' commits intact.
+        let aggregated =
+            sqe_compaction::dispatch::aggregate_group_outcomes(outcomes, &batch_old_files)?;
 
         let output_count = aggregated.new_files.len() as i64;
         let output_bytes: i64 = aggregated
@@ -1565,16 +1788,17 @@ impl MaintenanceHandler {
             .map(|f| f.file_size_in_bytes() as i64)
             .sum();
 
-        // Position delete files fully covered by the removed data files are
-        // dropped in the same commit, exactly like the local path.
+        // Position delete files fully covered by THIS batch's removed data
+        // files (never another batch's -- see the disjointness argument on
+        // `commit_eligible_groups`).
         let removed_data_paths: std::collections::HashSet<String> =
-            old_files.iter().map(|f| f.file_path().to_string()).collect();
-        let covered_deletes = covered_position_deletes(&removed_data_paths, &live_deletes);
+            batch_old_files.iter().map(|f| f.file_path().to_string()).collect();
+        let covered_deletes = covered_position_deletes(&removed_data_paths, live_deletes);
         let removed_delete_count = covered_deletes.len() as i64;
 
         info!(
             table = %ident,
-            input_count = old_files.len(),
+            input_count = batch_old_files.len(),
             output_count,
             added_rows = aggregated.added_rows,
             removed_rows = aggregated.removed_rows,
@@ -1588,9 +1812,9 @@ impl MaintenanceHandler {
         // deletes dropped in the same atomic swap). Commit authority never
         // leaves the coordinator: workers only produced files in object
         // storage, this is the one and only state change to the table.
-        let tx = Transaction::new(&table);
+        let tx = Transaction::new(table);
         let files_to_remove: Vec<DataFile> =
-            old_files.iter().cloned().chain(covered_deletes).collect();
+            batch_old_files.iter().cloned().chain(covered_deletes).collect();
         let mut action = tx
             .rewrite_files()
             .set_enable_delete_filter_manager(true)
@@ -1612,33 +1836,34 @@ impl MaintenanceHandler {
         let new_snapshot_id = committed.metadata().current_snapshot_id();
 
         let cache_key = format!("{}.{}", ident.namespace(), ident.name());
-        if let Some(tc) = &self.table_cache {
+        if let Some(tc) = table_cache {
             tc.invalidate(&cache_key).await;
         }
 
-        // Same post-commit sanity check as the local path: reload and
-        // confirm the live file count matches expectation. Purely
-        // observability (a mismatch only warns, matching
-        // `rewrite_data_files_once`), but worth keeping identical here since
-        // it is the one place that would catch a catalog-state-propagation
-        // bug specific to the distributed commit path.
-        match catalog.load_table(&ident).await {
+        let rows_removed = (aggregated.removed_rows - aggregated.added_rows) as i64;
+        let live_expected_after = live_expected_before - batch_old_files.len() as i64 + output_count;
+
+        // Same post-commit sanity check as the pre-Task-3 single-commit
+        // path, now run once per batch: reload and confirm the live file
+        // count matches expectation. Purely observability (a mismatch only
+        // warns), but worth keeping identical here since it is the one
+        // place that would catch a catalog-state-propagation bug specific
+        // to the distributed commit path.
+        match catalog.load_table(ident).await {
             Ok(reloaded) => match collect_live_data_files(&reloaded).await {
                 Ok(live_files) => {
-                    let live_after = live_files.len();
-                    let expected_after =
-                        output_count + (input_count as i64 - old_files.len() as i64);
+                    let live_after = live_files.len() as i64;
                     info!(
                         table = %ident,
                         live_after,
-                        expected_after,
+                        expected_after = live_expected_after,
                         "rewrite_data_files_distributed: post-commit verification"
                     );
-                    if live_after as i64 != expected_after {
+                    if live_after != live_expected_after {
                         warn!(
                             table = %ident,
                             live_after,
-                            expected_after,
+                            expected_after = live_expected_after,
                             "rewrite_data_files_distributed: live file count after commit \
                              does not match expectation"
                         );
@@ -1658,17 +1883,14 @@ impl MaintenanceHandler {
             ),
         }
 
-        let rows_removed = (aggregated.removed_rows - aggregated.added_rows) as i64;
-
-        Ok(RewriteOutcome {
-            files_in: input_count as i64,
-            files_out: output_count,
-            bytes_in: total_bytes,
-            bytes_out: output_bytes,
+        Ok(BatchCommitResult {
+            output_count,
+            output_bytes,
             rows_removed,
-            snapshot_id: new_snapshot_id,
-            files_rewritten: old_files.len() as i64,
-            skipped_reason: None,
+            old_file_count: batch_old_files.len() as i64,
+            new_snapshot_id,
+            committed_table: committed,
+            live_expected_after,
         })
     }
 
@@ -2147,6 +2369,27 @@ fn call_name_rewrite() -> &'static str {
     "rewrite_data_files"
 }
 
+/// One batch's committed result, as returned by
+/// [`MaintenanceHandler::commit_one_batch`] to
+/// [`MaintenanceHandler::commit_eligible_groups`]. `committed_table` is the
+/// post-commit `Table` `Transaction::commit` returned, reused as the base
+/// for the NEXT batch's `Transaction::new` so it reflects this batch's
+/// snapshot without an extra catalog round trip (the separate
+/// `catalog.load_table` reload in `commit_one_batch` is a best-effort
+/// verification step only, not the source of truth for chaining batches).
+struct BatchCommitResult {
+    output_count: i64,
+    output_bytes: i64,
+    rows_removed: i64,
+    old_file_count: i64,
+    new_snapshot_id: Option<i64>,
+    committed_table: IcebergTable,
+    /// Running "expected live file count" after this batch, threaded into
+    /// the next batch's post-commit sanity check the same way the
+    /// pre-Task-3 single-commit path computed it in one shot.
+    live_expected_after: i64,
+}
+
 /// Structured result of one `rewrite_data_files`/`rewrite_data_files_once`
 /// run. Both callers of that method need this:
 ///
@@ -2183,15 +2426,37 @@ pub(crate) struct RewriteOutcome {
     /// nothing: below `min_input_files`, or no eligible groups after
     /// packing.
     pub skipped_reason: Option<String>,
+    /// `true` when this outcome reflects a `partial_progress` (Phase 4d
+    /// Task 3) batched commit that stopped early after a terminal group
+    /// failure, having already committed one or more earlier batches.
+    /// Always `false` on the coordinator-local path and on the distributed
+    /// path when `partial_progress` is off (default): those either commit
+    /// everything in one atomic `RewriteFilesAction` or nothing at all, so
+    /// there is never a partial outcome to report. `files_in`/`files_out`/
+    /// `bytes_in`/`bytes_out`/`rows_removed`/`files_rewritten`/
+    /// `snapshot_id` reflect only the batches that actually committed.
+    pub partial: bool,
+    /// The terminal group failure's error message when `partial` is
+    /// `true`. `None` otherwise (including on every non-partial outcome).
+    pub partial_error: Option<String>,
 }
 
 /// Render a [`RewriteOutcome`] into the generic `summary_batch` shape the
 /// `CALL system.rewrite_data_files` surface has always returned. Preserves
-/// the pre-refactor `status` text exactly: `"skipped: {reason}"` or
-/// `"committed rewritten={files_rewritten}"`.
+/// the pre-Task-3 `status` text exactly for every non-partial outcome:
+/// `"skipped: {reason}"` or `"committed rewritten={files_rewritten}"`. A
+/// partial outcome (only reachable when `distribution.partial_progress` is
+/// opted in) gets its own `"partial: ..."` text so an operator reading the
+/// `CALL` surface's summary can tell "fully committed" from "some batches
+/// committed, then a group failed" at a glance.
 fn rewrite_outcome_batch(ident: &TableIdent, outcome: &RewriteOutcome) -> sqe_core::Result<RecordBatch> {
     let status = match &outcome.skipped_reason {
         Some(reason) => format!("skipped: {reason}"),
+        None if outcome.partial => format!(
+            "partial: rewritten={} ({})",
+            outcome.files_rewritten,
+            outcome.partial_error.as_deref().unwrap_or("terminal group failure")
+        ),
         None => format!("committed rewritten={}", outcome.files_rewritten),
     };
     summary_batch(
@@ -2899,5 +3164,278 @@ mod tests {
     #[test]
     fn parse_distribution_mode_override_rejects_unknown_value() {
         assert!(parse_distribution_mode_override("yolo").is_err());
+    }
+
+    // ---------------------------------------------------------------------
+    // Phase 4d Task 3: opt-in partial-progress batched commits
+    //
+    // `MaintenanceHandler::commit_eligible_groups` is the code the
+    // distributed rewrite job actually runs; `dispatch_and_collect_groups`
+    // (the network-facing half, `compaction_dispatch.rs`) is bypassed here
+    // via a synthetic `GroupBatchDispatcher` so this exercises the
+    // batching/commit/partial-status logic deterministically against a
+    // real SQLite-backed Iceberg catalog, without a live worker fleet.
+    // Run with `cargo test -p sqe-coordinator --features test-sqlite`.
+    // ---------------------------------------------------------------------
+    #[cfg(feature = "test-sqlite")]
+    mod partial_progress_batching {
+        use super::*;
+        use iceberg::spec::{DataFileBuilder, DataFileFormat, Struct};
+        use iceberg::TableCreation;
+        use tempfile::TempDir;
+
+        async fn sqlite_catalog(dir: &TempDir) -> Arc<dyn Catalog> {
+            let location = dir.path().to_str().expect("tempdir path is UTF-8");
+            sqe_catalog::mount::build_catalog(
+                location,
+                sqe_sql::CatalogKind::Sqlite,
+                &std::collections::BTreeMap::new(),
+                &sqe_core::SecretStore::new(),
+            )
+            .await
+            .expect("sqlite catalog builds")
+        }
+
+        fn minimal_schema() -> iceberg::spec::Schema {
+            iceberg::spec::Schema::builder()
+                .with_fields(vec![iceberg::spec::NestedField::required(
+                    1,
+                    "id",
+                    iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Long),
+                )
+                .into()])
+                .build()
+                .expect("build schema")
+        }
+
+        /// A fabricated data file. Physical bytes are never read:
+        /// `check_file_existence` (see `validate_data_file_changes` in the
+        /// vendored `transaction/snapshot.rs`) validates removed files
+        /// against the current snapshot's MANIFESTS, not the object store,
+        /// so a file only needs to be registered via a prior commit (this
+        /// test's `fast_append` below), never actually written to disk.
+        fn fabricated_data_file(path: &str, record_count: u64, bytes: u64) -> iceberg::spec::DataFile {
+            DataFileBuilder::default()
+                .content(DataContentType::Data)
+                .file_path(path.to_string())
+                .file_format(DataFileFormat::Parquet)
+                .file_size_in_bytes(bytes)
+                .record_count(record_count)
+                .partition(Struct::from_iter(std::iter::empty()))
+                .partition_spec_id(0)
+                .build()
+                .expect("build data file")
+        }
+
+        /// Build a fresh table with 6 committed data files (`record_count`
+        /// 10 each, so total rows = 60), grouped into 3 eligible groups of 2
+        /// files. Returns `(catalog, ident, table, eligible_groups,
+        /// seq_at_start)`. Each test gets its own tempdir/catalog/table so
+        /// the two scenarios (partial_progress on vs off) can never bleed
+        /// state into each other.
+        async fn table_with_six_files(
+            table_name: &str,
+        ) -> (
+            Arc<dyn Catalog>,
+            TableIdent,
+            IcebergTable,
+            Vec<Vec<DataFile>>,
+            i64,
+        ) {
+            let dir = tempfile::tempdir().expect("tempdir");
+            // Leak the TempDir so it outlives this function (the sqlite
+            // catalog's backing file must stay on disk for the rest of the
+            // test); acceptable in a test process that exits promptly.
+            let dir: &'static TempDir = Box::leak(Box::new(dir));
+            let catalog = sqlite_catalog(dir).await;
+
+            let ns = NamespaceIdent::new("default".to_string());
+            catalog
+                .create_namespace(&ns, std::collections::HashMap::new())
+                .await
+                .expect("create namespace");
+            let creation = TableCreation::builder()
+                .name(table_name.to_string())
+                .schema(minimal_schema())
+                .build();
+            let table = catalog.create_table(&ns, creation).await.expect("create table");
+
+            let paths: Vec<String> = (1..=6)
+                .map(|i| format!("mem://{table_name}/data/f{i}.parquet"))
+                .collect();
+            let initial_files: Vec<DataFile> = paths
+                .iter()
+                .map(|p| fabricated_data_file(p, 10, 100))
+                .collect();
+
+            let tx = Transaction::new(&table);
+            let action = tx.fast_append().add_data_files(initial_files.clone());
+            let tx_applied = action.apply(tx).expect("apply fast_append");
+            tx_applied.commit(catalog.as_ref()).await.expect("commit fast_append");
+
+            let ident = TableIdent::new(ns, table_name.to_string());
+            let table = catalog.load_table(&ident).await.expect("reload table");
+            let seq_at_start = table
+                .metadata()
+                .current_snapshot()
+                .expect("initial snapshot exists")
+                .sequence_number();
+
+            // 3 groups of 2 files each, in the same order as `paths`.
+            let eligible_groups: Vec<Vec<DataFile>> = initial_files
+                .chunks(2)
+                .map(<[DataFile]>::to_vec)
+                .collect();
+
+            (catalog, ident, table, eligible_groups, seq_at_start)
+        }
+
+        /// Synthetic [`crate::compaction_dispatch::GroupBatchDispatcher`]:
+        /// fails any batch containing `poison_path`, otherwise "compacts"
+        /// each group in the batch into one consolidated file carrying the
+        /// group's summed row count and byte size (preserving the
+        /// `added <= removed` row invariant exactly, satisfying it with
+        /// equality).
+        struct PoisonPathDispatcher {
+            poison_path: String,
+        }
+
+        #[async_trait::async_trait]
+        impl crate::compaction_dispatch::GroupBatchDispatcher for PoisonPathDispatcher {
+            async fn dispatch(
+                &self,
+                batch: &[Vec<DataFile>],
+            ) -> sqe_core::Result<Vec<sqe_compaction::dispatch::GroupOutcome>> {
+                if batch.iter().flatten().any(|f| f.file_path() == self.poison_path) {
+                    return Err(SqeError::Execution(format!(
+                        "synthetic dispatch failure: group containing poisoned file {}",
+                        self.poison_path
+                    )));
+                }
+                Ok(batch
+                    .iter()
+                    .enumerate()
+                    .map(|(i, group)| {
+                        let rows: u64 = group.iter().map(iceberg::spec::DataFile::record_count).sum();
+                        let bytes: u64 =
+                            group.iter().map(iceberg::spec::DataFile::file_size_in_bytes).sum();
+                        let new_path = format!(
+                            "mem://partial_progress_test/data/consolidated-{}-{}.parquet",
+                            i,
+                            uuid::Uuid::now_v7()
+                        );
+                        let new_file = fabricated_data_file(&new_path, rows, bytes.max(1));
+                        sqe_compaction::dispatch::GroupOutcome {
+                            group_id: i as u32,
+                            new_files: vec![new_file],
+                            rows_written: rows,
+                            bytes_written: bytes,
+                            uploaded_paths: vec![],
+                        }
+                    })
+                    .collect())
+            }
+        }
+
+        async fn total_rows(catalog: &Arc<dyn Catalog>, ident: &TableIdent) -> u64 {
+            let reloaded = catalog.load_table(ident).await.expect("reload table");
+            collect_live_data_files(&reloaded)
+                .await
+                .expect("collect live data files")
+                .iter()
+                .map(iceberg::spec::DataFile::record_count)
+                .sum()
+        }
+
+        #[tokio::test]
+        async fn partial_progress_on_commits_earlier_batches_and_reports_partial() {
+            let (catalog, ident, table, eligible_groups, seq_at_start) =
+                table_with_six_files("partial_on_test").await;
+            // Group 3 (files f5, f6) is the LAST group -- poison its first
+            // file so the terminal failure lands on the last batch, exactly
+            // like the brief's "forced failure on the last group" scenario.
+            let poison_path = eligible_groups[2][0].file_path().to_string();
+            let dispatcher = PoisonPathDispatcher { poison_path: poison_path.clone() };
+
+            let outcome = MaintenanceHandler::commit_eligible_groups(
+                &catalog,
+                table,
+                &ident,
+                eligible_groups,
+                /* partial_progress */ true,
+                /* partial_progress_batch */ 1,
+                seq_at_start,
+                &[],
+                None,
+                None,
+                6,
+                600,
+                &dispatcher,
+            )
+            .await
+            .expect("partial_progress must report Ok, not fail the whole job");
+
+            assert!(outcome.partial, "outcome must be marked partial");
+            assert!(outcome.partial_error.is_some(), "partial outcome must carry the failure reason");
+            assert_eq!(outcome.files_rewritten, 4, "2 committed batches x 2 files each");
+            assert_eq!(outcome.files_out, 2, "one consolidated file per committed batch");
+            assert!(outcome.snapshot_id.is_some(), "the 2nd batch's commit must be reported");
+
+            // Table reflects exactly the 2 successful batches: 2 new
+            // consolidated files + the last group's 2 untouched files (f5,
+            // f6, since batch 3 never committed) = 4 live files.
+            let reloaded = catalog.load_table(&ident).await.expect("reload table");
+            let live_files = collect_live_data_files(&reloaded).await.expect("collect live files");
+            assert_eq!(live_files.len(), 4, "2 consolidated + 2 untouched from the failed batch");
+
+            // 3 snapshots total: the initial fast_append + 2 successful
+            // batch commits. The 3rd (failed) batch never commits, so it
+            // must not add a snapshot.
+            assert_eq!(reloaded.metadata().snapshots().count(), 3);
+
+            // Row count is preserved exactly: nothing was lost or
+            // manufactured across the 2 real commits plus the 2 untouched
+            // files.
+            assert_eq!(total_rows(&catalog, &ident).await, 60);
+        }
+
+        #[tokio::test]
+        async fn partial_progress_off_leaves_table_unchanged_on_the_same_forced_failure() {
+            let (catalog, ident, table, eligible_groups, seq_at_start) =
+                table_with_six_files("partial_off_test").await;
+            let poison_path = eligible_groups[2][0].file_path().to_string();
+            let dispatcher = PoisonPathDispatcher { poison_path };
+
+            let result = MaintenanceHandler::commit_eligible_groups(
+                &catalog,
+                table,
+                &ident,
+                eligible_groups,
+                /* partial_progress */ false,
+                /* partial_progress_batch */ 1, // ignored when partial_progress is false
+                seq_at_start,
+                &[],
+                None,
+                None,
+                6,
+                600,
+                &dispatcher,
+            )
+            .await;
+
+            assert!(
+                result.is_err(),
+                "partial_progress off must fail the whole job on any group failure, like today"
+            );
+
+            // Table is byte-identical to before the call: still 6 live
+            // files, still exactly the one snapshot from the initial
+            // fast_append -- no batch ever committed.
+            let reloaded = catalog.load_table(&ident).await.expect("reload table");
+            let live_files = collect_live_data_files(&reloaded).await.expect("collect live files");
+            assert_eq!(live_files.len(), 6, "no commit at all must have happened");
+            assert_eq!(reloaded.metadata().snapshots().count(), 1);
+            assert_eq!(total_rows(&catalog, &ident).await, 60);
+        }
     }
 }

@@ -304,6 +304,48 @@ pub fn failed_row(
     }
 }
 
+/// Build the `status = "partial"` row the active-mode scheduler records
+/// (Phase 4d Task 3) when a distributed rewrite ran with
+/// `distribution.partial_progress` opted in and a terminal group failure hit
+/// after one or more batches had already committed. Unlike [`failed_row`],
+/// the count fields here are real and non-zero: they reflect exactly the
+/// batches that committed before the job stopped (see
+/// `maintenance::RewriteOutcome`'s `partial`/`partial_error` fields). `error`
+/// carries the terminal failure's message, same convention as
+/// [`skipped_row`]'s `reason`.
+#[allow(clippy::too_many_arguments)]
+pub fn partial_row(
+    job_id: &str,
+    table: &str,
+    principal: &str,
+    started_at_ms: i64,
+    finished_at_ms: i64,
+    files_in: i64,
+    files_out: i64,
+    bytes_in: i64,
+    bytes_out: i64,
+    rows_removed: i64,
+    snapshot_id: Option<i64>,
+    error: &str,
+) -> MaintenanceLogRow {
+    MaintenanceLogRow {
+        job_id: job_id.to_string(),
+        table: table.to_string(),
+        trigger: "scheduled".to_string(),
+        principal: principal.to_string(),
+        started_at_ms,
+        finished_at_ms,
+        status: "partial".to_string(),
+        files_in,
+        files_out,
+        bytes_in,
+        bytes_out,
+        rows_removed,
+        snapshot_id,
+        error: Some(error.to_string()),
+    }
+}
+
 /// Build the `status = "skipped"` row the Phase 4b active-mode scheduler
 /// records for a due, opted-in table it deliberately did not compact (no
 /// eligible compaction debt this tick). Distinct from [`advisory_row`]:
@@ -755,6 +797,43 @@ mod tests {
         // constructor must not silently coerce None into something else).
         let row = success_row("job-2", "ns.orders", "svc", 100, 200, 10, 3, 1000, 300, 42, None);
         assert_eq!(row.snapshot_id, None);
+    }
+
+    #[test]
+    fn partial_row_maps_status_trigger_counts_and_error() {
+        // Unlike failed_row, a partial row's counts are real (whatever the
+        // already-committed batches produced), not zeroed.
+        let row = partial_row(
+            "job-4",
+            "ns.orders",
+            "svc",
+            100,
+            300,
+            10,
+            2,
+            1000,
+            200,
+            15,
+            Some(77),
+            "distributed compaction job job-4: group 2 exhausted retries",
+        );
+        assert_eq!(row.status, "partial");
+        assert_eq!(row.trigger, "scheduled");
+        assert_eq!(row.job_id, "job-4");
+        assert_eq!(row.table, "ns.orders");
+        assert_eq!(row.principal, "svc");
+        assert_eq!(row.started_at_ms, 100);
+        assert_eq!(row.finished_at_ms, 300);
+        assert_eq!(row.files_in, 10);
+        assert_eq!(row.files_out, 2);
+        assert_eq!(row.bytes_in, 1000);
+        assert_eq!(row.bytes_out, 200);
+        assert_eq!(row.rows_removed, 15);
+        assert_eq!(row.snapshot_id, Some(77));
+        assert_eq!(
+            row.error,
+            Some("distributed compaction job job-4: group 2 exhausted retries".to_string())
+        );
     }
 
     #[test]
