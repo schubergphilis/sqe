@@ -12,6 +12,7 @@
 //! and call into this crate's primitives with already-resolved inputs.
 
 pub mod dispatch;
+pub mod progress;
 pub mod rewrite;
 pub mod wire;
 pub mod write_memory;
@@ -20,9 +21,10 @@ pub mod zorder;
 
 pub use dispatch::{
     aggregate_group_outcomes, decode_group_response, least_loaded_worker,
-    place_groups_largest_first, AggregatedRewrite, GroupOutcome, GroupPlacement, PlacementPlan,
-    WorkerLoad,
+    next_group_assignment, place_groups_largest_first, AggregatedRewrite, GroupOutcome,
+    GroupPlacement, PendingSlot, PlacementPlan, WorkerLoad,
 };
+pub use progress::ProgressReporter;
 pub use rewrite::{
     collect_live_delete_files, covered_position_deletes, delete_heavy_files,
     expected_rows_after_deletes, group_files_by_partition, is_live_delete_entry,

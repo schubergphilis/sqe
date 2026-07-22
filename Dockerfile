@@ -50,9 +50,16 @@ ARG TARGETARCH
 COPY --from=planner /build/recipe.json recipe.json
 # Vendored iceberg-rust crates (path dependencies in Cargo.toml)
 COPY vendor/ vendor/
-RUN --mount=type=cache,id=sqe-cargo-registry-${TARGETARCH},target=/usr/local/cargo/registry \
-    --mount=type=cache,id=sqe-cargo-git-${TARGETARCH},target=/usr/local/cargo/git \
-    --mount=type=cache,id=sqe-sccache-${TARGETARCH},target=/sccache \
+# `sharing=locked` on the registry/git/sccache mounts: their cache `id`s are
+# shared verbatim with Dockerfile.full and Dockerfile.bench, so two builds
+# running concurrently (e.g. building both images in parallel) race on the
+# SAME cache mount. Default (unlocked) sharing lets both writers unpack into
+# it at once, which corrupts the registry -- symptom: `failed to unpack
+# package ...`, `.cargo-ok: File exists (os error 17)`. Locked serializes
+# access instead of corrupting it; a concurrent build waits, it doesn't fail.
+RUN --mount=type=cache,id=sqe-cargo-registry-${TARGETARCH},sharing=locked,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=sqe-cargo-git-${TARGETARCH},sharing=locked,target=/usr/local/cargo/git \
+    --mount=type=cache,id=sqe-sccache-${TARGETARCH},sharing=locked,target=/sccache \
     cargo chef cook --release --recipe-path recipe.json \
       --no-default-features \
       --package sqe-coordinator --package sqe-worker --package sqe-cli && \
@@ -67,9 +74,9 @@ COPY vendor/ vendor/
 # xtask must be present for workspace resolution, even though we don't
 # build its binary here.
 COPY xtask/ xtask/
-RUN --mount=type=cache,id=sqe-cargo-registry-${TARGETARCH},target=/usr/local/cargo/registry \
-    --mount=type=cache,id=sqe-cargo-git-${TARGETARCH},target=/usr/local/cargo/git \
-    --mount=type=cache,id=sqe-sccache-${TARGETARCH},target=/sccache \
+RUN --mount=type=cache,id=sqe-cargo-registry-${TARGETARCH},sharing=locked,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=sqe-cargo-git-${TARGETARCH},sharing=locked,target=/usr/local/cargo/git \
+    --mount=type=cache,id=sqe-sccache-${TARGETARCH},sharing=locked,target=/sccache \
     --mount=type=cache,id=sqe-target-release-${TARGETARCH},target=/build/target,sharing=locked,from=deps,source=/build/target \
     cargo build --release --no-default-features \
       --bin sqe-server --bin sqe-worker --bin sqe-cli && \

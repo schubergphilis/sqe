@@ -46,9 +46,9 @@ FROM chef AS deps
 ARG TARGETARCH
 COPY --from=planner /build/recipe.json recipe.json
 COPY vendor/ vendor/
-RUN --mount=type=cache,id=sqe-cargo-registry-${TARGETARCH},target=/usr/local/cargo/registry \
-    --mount=type=cache,id=sqe-cargo-git-${TARGETARCH},target=/usr/local/cargo/git \
-    --mount=type=cache,id=sqe-sccache-${TARGETARCH},target=/sccache \
+RUN --mount=type=cache,id=sqe-cargo-registry-${TARGETARCH},sharing=locked,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=sqe-cargo-git-${TARGETARCH},sharing=locked,target=/usr/local/cargo/git \
+    --mount=type=cache,id=sqe-sccache-${TARGETARCH},sharing=locked,target=/sccache \
     cargo chef cook --release --recipe-path recipe.json \
       --features sqe-catalog/full-backends \
       --package sqe-coordinator --package sqe-worker --package sqe-cli && \
@@ -60,9 +60,9 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
 COPY vendor/ vendor/
 COPY xtask/ xtask/
-RUN --mount=type=cache,id=sqe-cargo-registry-${TARGETARCH},target=/usr/local/cargo/registry \
-    --mount=type=cache,id=sqe-cargo-git-${TARGETARCH},target=/usr/local/cargo/git \
-    --mount=type=cache,id=sqe-sccache-${TARGETARCH},target=/sccache \
+RUN --mount=type=cache,id=sqe-cargo-registry-${TARGETARCH},sharing=locked,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=sqe-cargo-git-${TARGETARCH},sharing=locked,target=/usr/local/cargo/git \
+    --mount=type=cache,id=sqe-sccache-${TARGETARCH},sharing=locked,target=/sccache \
     --mount=type=cache,id=sqe-target-release-full-${TARGETARCH},target=/build/target,sharing=locked,from=deps,source=/build/target \
     cargo build --release \
       --features sqe-catalog/full-backends \

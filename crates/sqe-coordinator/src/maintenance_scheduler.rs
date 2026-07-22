@@ -791,6 +791,59 @@ impl MaintenanceScheduler {
                 self.record_skipped_job(catalog, &job_id, ident, started_at_ms, &reason)
                     .await;
             }
+            Ok(outcome) if outcome.partial => {
+                // Phase 4d Task 3: `distribution.partial_progress` opted in
+                // and a terminal group failure hit after some batches had
+                // already committed. This is neither a clean success nor a
+                // job that committed nothing -- record it distinctly so an
+                // operator scanning `maintenance_log` can tell "fully
+                // compacted" from "partially compacted, needs a re-run" at
+                // a glance, and so `success`'s job-total counter never
+                // silently absorbs a job that did not finish.
+                let reason = outcome.partial_error.clone().unwrap_or_default();
+                warn!(
+                    table = %name,
+                    files_in = outcome.files_in,
+                    files_out = outcome.files_out,
+                    bytes_out = outcome.bytes_out,
+                    rows_removed = outcome.rows_removed,
+                    snapshot_id = ?outcome.snapshot_id,
+                    reason = %reason,
+                    "active_tick: distributed rewrite committed partial progress before a \
+                     terminal group failure"
+                );
+                if let Some(audit) = &self.audit {
+                    audit.log_event(build_partial_audit_event(
+                        ident,
+                        &self.principal.user_id,
+                        &job_id,
+                        &outcome,
+                        &reason,
+                    ));
+                }
+                let row = maintenance_log::partial_row(
+                    &job_id,
+                    &name,
+                    &self.principal.user_id,
+                    started_at_ms,
+                    finished_at_ms,
+                    outcome.files_in,
+                    outcome.files_out,
+                    outcome.bytes_in,
+                    outcome.bytes_out,
+                    outcome.rows_removed,
+                    outcome.snapshot_id,
+                    &reason,
+                );
+                self.append_job_row(catalog, &row).await;
+                self.metrics
+                    .maintenance_job_total
+                    .with_label_values(&["partial"])
+                    .inc();
+                self.metrics
+                    .maintenance_bytes_rewritten_total
+                    .inc_by(outcome.bytes_out.max(0) as u64);
+            }
             Ok(outcome) => {
                 info!(
                     table = %name,
@@ -1075,6 +1128,59 @@ fn build_active_audit_event(
                 outcome.files_in, outcome.files_out, outcome.bytes_out, outcome.rows_removed, outcome.snapshot_id
             )),
             query_hash: sqe_metrics::audit::query_hash(&format!("maintenance-active:{}", ident)),
+            statement_type: "maintenance_active".to_string(),
+        }),
+        session_id: Some(job_id.to_string()),
+        client_ip: None,
+        trace_id: None,
+        query_id: None,
+        integrity: sqe_metrics::audit::Integrity::default(),
+    }
+}
+
+/// Build the `AuditKind::Maintenance` event for one table's active-mode
+/// distributed rewrite that committed PARTIAL progress (Phase 4d Task 3:
+/// `distribution.partial_progress` opted in, a terminal group failure hit
+/// after one or more batches had already committed). `outcome` stays
+/// `Outcome::Success` -- the job did commit real, correct work, just not
+/// all of it -- but `query.text` carries both the committed counts and the
+/// terminal failure's message, so this event is never confused with a
+/// clean `build_active_audit_event` success by a reader scanning `text`
+/// alone.
+fn build_partial_audit_event(
+    ident: &TableIdent,
+    principal_user: &str,
+    job_id: &str,
+    outcome: &crate::maintenance::RewriteOutcome,
+    reason: &str,
+) -> sqe_metrics::audit::AuditEvent {
+    sqe_metrics::audit::AuditEvent {
+        time: chrono::Utc::now(),
+        kind: sqe_metrics::audit::AuditKind::Maintenance,
+        actor: sqe_metrics::audit::Actor::from_parts(
+            principal_user.to_string(),
+            None,
+            None,
+            vec!["maintenance".to_string()],
+            vec![],
+        ),
+        outcome: sqe_metrics::audit::Outcome::Success,
+        resources: vec![sqe_metrics::audit::Resource {
+            catalog: None,
+            namespace: ident.namespace().to_vec(),
+            name: ident.name().to_string(),
+            object_type: sqe_metrics::audit::ObjectType::Table,
+        }],
+        policy: None,
+        timing: None,
+        stats: None,
+        query: Some(sqe_metrics::audit::QueryInfo {
+            text: Some(format!(
+                "active_tick: rewrite_data_files partial: committed files_in={} files_out={} \
+                 bytes_out={} rows_removed={} snapshot_id={:?}, then stopped: {reason}",
+                outcome.files_in, outcome.files_out, outcome.bytes_out, outcome.rows_removed, outcome.snapshot_id
+            )),
+            query_hash: sqe_metrics::audit::query_hash(&format!("maintenance-active-partial:{}", ident)),
             statement_type: "maintenance_active".to_string(),
         }),
         session_id: Some(job_id.to_string()),
