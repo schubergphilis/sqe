@@ -19,24 +19,24 @@
 //! (Task 1), the same primitive `CALL system.rewrite_data_files` uses on the
 //! coordinator. This module only adapts a worker's inputs (S3 creds instead
 //! of a catalog session, one pre-selected group instead of a bin-packed
-//! set) to that shared primitive.
+//! set) to that shared primitive. The live-delete-file collection
+//! (`collect_live_delete_files`) is likewise imported from `sqe-compaction`
+//! rather than duplicated: both this module and the coordinator's
+//! `maintenance.rs` used to carry a byte-identical copy, deduplicated into
+//! `sqe_compaction::rewrite` as a follow-up cleanup.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use futures::{StreamExt, TryStreamExt};
-
 use datafusion::prelude::SessionContext;
 use iceberg::io::{FileIO, FileIOBuilder};
 use iceberg::scan::FileScanTask;
-use iceberg::spec::{
-    write_data_files_to_avro, DataContentType, DataFile, DataFileBuilder, ManifestStatus, Struct,
-};
+use iceberg::spec::{write_data_files_to_avro, DataFile, DataFileBuilder, Struct};
 use iceberg::table::{StaticTable, Table as IcebergTable};
 use iceberg::TableIdent;
 use sqe_compaction::wire::{CompactGroupRequest, CompactGroupResponse, S3Conn};
 use sqe_compaction::writer::{new_upload_tracker, parse_parquet_compression};
-use sqe_compaction::{plan_delete_aware_read, rewrite_group, SortCtx};
+use sqe_compaction::{collect_live_delete_files, plan_delete_aware_read, rewrite_group, SortCtx};
 use sqe_core::{Result as SqeResult, SqeError};
 
 /// Build a catalog-free `FileIO` from a [`S3Conn`]. Mirrors the S3 property
@@ -139,61 +139,6 @@ fn resolve_group_data_files(
             data_file_from_task(first)
         })
         .collect()
-}
-
-/// True when a manifest entry is a live delete file (position or equality).
-/// Copied from `sqe_coordinator::maintenance::is_live_delete_entry`: workers
-/// cannot depend on `sqe-coordinator` (the dependency would be a cycle, and
-/// that crate also pulls in the catalog bridge/session types workers must
-/// never link), so this tiny predicate is duplicated rather than shared.
-fn is_live_delete_entry(entry: &iceberg::spec::ManifestEntry) -> bool {
-    entry.status() != ManifestStatus::Deleted && entry.content_type() != DataContentType::Data
-}
-
-/// Collect the live delete files (position + equality) of the table's
-/// current snapshot, by walking its manifest list/manifests directly via
-/// `FileIO` (no catalog call). Copied from
-/// `sqe_coordinator::maintenance::collect_live_delete_files` for the same
-/// reason as [`is_live_delete_entry`]: this is the audited, already-shipped
-/// algorithm `CALL system.rewrite_data_files` uses to build the
-/// `live_deletes` that `rewrite_group`'s row cross-check depends on, and
-/// duplicating a manifest scan is safer than trusting an independent
-/// derivation from the read plan to agree with it. A future refactor could
-/// promote this to `sqe-compaction` so both call sites share one copy.
-async fn collect_live_delete_files(table: &IcebergTable) -> SqeResult<Vec<DataFile>> {
-    let metadata_ref = table.metadata_ref();
-    let Some(snapshot) = metadata_ref.current_snapshot() else {
-        return Ok(vec![]);
-    };
-
-    let cache = table.object_cache();
-    let manifest_list = cache
-        .get_manifest_list(snapshot, &metadata_ref)
-        .await
-        .map_err(|e| SqeError::Execution(format!("Failed to load manifest list: {e}")))?;
-
-    const CONCURRENCY: usize = 8;
-    let manifests: Vec<Arc<iceberg::spec::Manifest>> =
-        futures::stream::iter(manifest_list.entries().iter().cloned())
-            .map(|mf| {
-                let cache = cache.clone();
-                async move { cache.get_manifest(&mf).await }
-            })
-            .buffer_unordered(CONCURRENCY)
-            .try_collect()
-            .await
-            .map_err(|e| SqeError::Execution(format!("Failed to load manifest: {e}")))?;
-
-    Ok(manifests
-        .into_iter()
-        .flat_map(|m| {
-            m.entries()
-                .iter()
-                .filter(|e| is_live_delete_entry(e))
-                .map(|e| e.data_file().clone())
-                .collect::<Vec<_>>()
-        })
-        .collect())
 }
 
 /// Parse `table_ident` (`catalog.namespace.table`, dot-separated) into a
@@ -330,7 +275,7 @@ pub async fn compact_file_group(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use iceberg::spec::{DataFileFormat, FormatVersion, NestedField, PrimitiveType};
+    use iceberg::spec::{DataContentType, DataFileFormat, FormatVersion, NestedField, PrimitiveType};
     use sqe_compaction::wire::SortSpecWire;
     use std::io::Write as _;
 
