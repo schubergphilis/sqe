@@ -1,4 +1,7 @@
 include:
+  - project: 'vpf-data-ai/aikido'
+    ref: 'v0.1.3'
+    file: '/ci/templates/guardrails.yml'
   - project: 'vpf-data-ai/libraries/ci-cd-pipelines/build-publish-docker-images'
     ref: main
     file: '.gitlab-ci-template.yml'
