@@ -3307,18 +3307,32 @@ pub struct MaintenanceDistributionConfig {
     /// the job behaves exactly as before, one atomic commit, any failure
     /// commits nothing at all.
     ///
-    /// When `true`, a terminal group failure (one that exhausts its
-    /// retries, or a stalled/undispatchable group) after one or more
-    /// batches have already committed reports `status = "partial"` in
+    /// When `true`, each batch after the first successful commit gets its
+    /// own commit-conflict retry: a retryable conflict (a concurrent writer
+    /// advanced the snapshot between this batch's read and its commit) is
+    /// retried in place, up to 4 attempts with exponential backoff, by
+    /// reloading the table and recommitting the SAME worker-produced files
+    /// -- nothing is re-dispatched to the worker fleet. Only once that
+    /// retry is exhausted (or the failure is not a conflict at all -- a
+    /// stalled/undispatchable group, say) does the batch count as a
+    /// TERMINAL failure. A terminal failure after one or more batches have
+    /// already committed reports `status = "partial"` in
     /// `sqe_system.maintenance_log` instead of failing the whole job --
-    /// see `rewrite_data_files_distributed_once` in `sqe-coordinator`. If
-    /// the very first batch fails before anything commits, the job still
-    /// fails outright (there is nothing "partial" about zero commits).
+    /// see `commit_eligible_groups` in `sqe-coordinator` for the full
+    /// retry-layering argument. The very first batch's failure (including a
+    /// retryable conflict) is not retried at this layer at all: it bubbles
+    /// up and the OUTER `rewrite_data_files_distributed` retry loop
+    /// re-plans and re-dispatches the whole job instead, exactly as it did
+    /// before this field existed -- which is also why `partial_progress =
+    /// false` (always exactly one batch) is untouched by the per-batch
+    /// retry.
     ///
     /// Trades a larger commit-conflict surface (N commits instead of 1,
     /// each independently racing concurrent writers) for incremental
     /// durability on very large tables where losing an entire multi-hour
-    /// job to one late group failure is expensive.
+    /// job to one late group failure is expensive. The per-batch retry
+    /// above closes most of that gap for transient conflicts; only a
+    /// genuinely terminal failure still surfaces as `partial`.
     #[serde(default)]
     pub partial_progress: bool,
     /// Number of eligible groups committed per `RewriteFilesAction` when
