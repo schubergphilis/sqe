@@ -1,6 +1,6 @@
 supplier = "Schuberg Philis"
-owner = "vpf-data-ai/chameleon/applications"
-contact = "security@schubergphilis.com"
+owner = "VPF Data&AI"
+contact = "jjverhoeks@schubergphilis.com"
 
 [[asset]]
 name = "sqlengine"
