@@ -1529,8 +1529,6 @@ impl MaintenanceHandler {
         let dispatcher = crate::compaction_dispatch::WorkerFleetDispatcher {
             job_id: job_id.to_string(),
             table_ident: ident.to_string(),
-            metadata_location: metadata_location.clone(),
-            snapshot_id,
             target_file_size_bytes: target_bytes,
             compression,
             sort: sort_wire,
@@ -1569,6 +1567,8 @@ impl MaintenanceHandler {
             dist.partial_progress,
             dist.partial_progress_batch,
             seq_at_start,
+            &metadata_location,
+            snapshot_id,
             &live_deletes,
             snapshot_properties,
             self.table_cache.as_ref(),
@@ -1657,14 +1657,26 @@ impl MaintenanceHandler {
     ///   why that default path is untouched by this fix.
     /// - This function's INNER retry (inside [`Self::commit_one_batch`])
     ///   owns retrying a retryable commit conflict on any batch AFTER the
-    ///   first has already committed (`committed_batches > 0`). It reloads
-    ///   the table and rebuilds+recommits the SAME `RewriteFilesAction` --
-    ///   the worker-produced files were already written to object storage
-    ///   by `dispatcher.dispatch` and stay valid (pinned to `seq_at_start`,
-    ///   not to whichever snapshot ends up committing them), so nothing is
-    ///   re-dispatched to the worker fleet, only the commit is retried, up
-    ///   to `MAX_COMMIT_ATTEMPTS` with the same exponential backoff the
-    ///   outer loop uses.
+    ///   first has already committed (`committed_batches > 0`). Unlike an
+    ///   earlier version of this fix, it does NOT reuse the first dispatch's
+    ///   worker output: it reloads the table to get a fresh
+    ///   `metadata_location`/current `snapshot_id`, RE-DISPATCHES the same
+    ///   batch of groups against that fresh snapshot, re-aggregates the new
+    ///   outcomes, and only then rebuilds and retries the
+    ///   `RewriteFilesAction`, up to `MAX_COMMIT_ATTEMPTS` with the same
+    ///   exponential backoff the outer loop uses. Reusing stale worker
+    ///   output was unsound: those files were produced by workers reading
+    ///   only the PLAN-TIME snapshot, so a concurrent commit that landed a
+    ///   POSITION delete on one of this batch's own input files (the thing
+    ///   that makes the commit retryable in the first place) would never be
+    ///   observed -- the position delete's `(old_file_path, pos)` no longer
+    ///   matches anything once the old file is replaced by the compacted
+    ///   output, silently resurrecting the deleted rows. Re-dispatching
+    ///   against the reloaded snapshot means the worker applies whatever
+    ///   position AND equality deletes are current as of that reload, so the
+    ///   rows stay deleted. `seq_at_start` itself never changes across a
+    ///   retry (see "Why `seq_at_start` never moves" above) -- only the
+    ///   snapshot workers are told to READ from does.
     ///
     /// Because the inner layer only ever activates for `committed_batches >
     /// 0`, and the outer layer only ever sees an `Err` bubble out of a
@@ -1672,7 +1684,11 @@ impl MaintenanceHandler {
     /// batch space and never stack: there is no 4x4 = 16-attempt blowup.
     /// Before this fix, a retryable conflict on batch 2+ hit neither layer:
     /// it fell straight into the `partial = true` fallback below with no
-    /// retry at all, even though the underlying conflict was transient.
+    /// retry at all, even though the underlying conflict was transient. An
+    /// intermediate version of this fix (commit 5d9bebe) DID retry, but by
+    /// recommitting the stale worker output rather than re-dispatching --
+    /// which fixed the "no retry at all" gap but introduced the row-
+    /// resurrection bug described above; this version closes that gap too.
     ///
     /// # Return value
     ///
@@ -1693,6 +1709,8 @@ impl MaintenanceHandler {
         partial_progress: bool,
         partial_progress_batch: usize,
         seq_at_start: i64,
+        metadata_location: &str,
+        snapshot_id: i64,
         live_deletes: &[DataFile],
         snapshot_properties: Option<std::collections::HashMap<String, String>>,
         table_cache: Option<&TableMetadataCache>,
@@ -1730,6 +1748,8 @@ impl MaintenanceHandler {
                 ident,
                 batch,
                 seq_at_start,
+                metadata_location,
+                snapshot_id,
                 live_deletes,
                 snapshot_properties.clone(),
                 table_cache,
@@ -1797,25 +1817,57 @@ impl MaintenanceHandler {
     /// Dispatch, aggregate, and commit ONE batch (a `RewriteFilesAction`
     /// over just that batch's groups). See
     /// [`Self::commit_eligible_groups`]'s doc comment for the correctness
-    /// argument justifying reusing `seq_at_start` and
-    /// `check_file_existence(true)` unchanged across batches, and for the
-    /// "Commit-conflict retry layering" section this function implements
-    /// the inner half of.
+    /// argument justifying reusing `seq_at_start` unchanged across batches
+    /// and for the "Commit-conflict retry layering" section this function
+    /// implements the inner half of.
     ///
-    /// `dispatcher.dispatch` runs exactly ONCE, win or lose: a dispatch
-    /// failure is not retried here (that is the OUTER
-    /// `rewrite_data_files_distributed` loop's job, via a full
-    /// re-plan-and-redispatch). Only the COMMIT step, via
-    /// [`Self::commit_aggregated_batch`], is retried in place when
-    /// `retry_on_conflict` is set and the failure is a
-    /// [`classify_commit_error`]-tagged retryable conflict: the
-    /// worker-produced files already exist in object storage and are simply
-    /// recommitted (rebuilding the `Transaction` from a freshly reloaded
-    /// `table`) rather than re-dispatched. `retry_on_conflict` is `false`
-    /// for the first batch to attempt a commit in the job (see the caller),
-    /// which keeps that case -- and therefore the whole
-    /// `partial_progress = false` default path -- an unretried single
-    /// attempt, byte-identical to before this fix.
+    /// For the FIRST attempt of every batch, `dispatcher.dispatch` runs
+    /// exactly once, against the caller-supplied `metadata_location`/
+    /// `snapshot_id` (the job's plan-time snapshot) -- byte-identical to
+    /// before this fix. `retry_on_conflict` is `false` for the first batch
+    /// to attempt a commit in the job (see the caller), which skips every
+    /// check added below entirely and means the loop never iterates more
+    /// than once for that batch, so the whole `partial_progress = false`
+    /// default path stays an unretried single dispatch + single commit
+    /// attempt.
+    ///
+    /// When `retry_on_conflict` is set (batch 2+, after at least one earlier
+    /// batch has already committed), this function does NOT simply wait for
+    /// `commit_aggregated_batch` to return a retryable `Err` before acting:
+    /// **it cannot rely on that `Err` ever appearing.**
+    /// `iceberg::transaction::Transaction::commit`'s `do_commit`
+    /// (`vendor/iceberg-rust/crates/iceberg/src/transaction/mod.rs`)
+    /// silently reloads the table and REPLAYS every action's `commit()` --
+    /// unchanged, over the SAME already-computed `added_data_files`/
+    /// `removed_data_files` -- whenever it finds its base stale, and only
+    /// gives up (surfacing an `Err` to us) once ITS OWN internal retry
+    /// budget (`commit.retry.*` table properties) is exhausted. A single,
+    /// one-shot concurrent write is absorbed entirely inside that call: we
+    /// never see an `Err` for it. `RewriteFilesAction` has no equivalent of
+    /// upstream Iceberg's `validateNoNewDeletesForDataFiles` check, so this
+    /// silent reapply can commit a compacted file that does not reflect a
+    /// position delete some other writer added to one of this batch's own
+    /// input files after our worker read them -- silent resurrection, and
+    /// it happens INSIDE the vendored `commit()` call, below the level an
+    /// `Err`-catching retry could ever observe.
+    ///
+    /// So for batch 2+, BEFORE every commit attempt (not just after a
+    /// caught `Err`), this function reloads the table itself and checks
+    /// whether any position delete in the reload references one of this
+    /// batch's own input files AND was not already known to the dispatch
+    /// that just ran (i.e. is NOT in `cur_live_deletes`). If so, the
+    /// worker output just produced cannot reflect it: re-dispatch against
+    /// the reload's `metadata_location`/`snapshot_id` instead of
+    /// committing, so the worker gets a chance to read it and exclude those
+    /// rows. This closes the realistic single-race window entirely (see
+    /// the regression test `batch_commit_conflict_from_own_position_delete_does_not_resurrect_rows`).
+    /// A sub-millisecond window remains between this reload and
+    /// `do_commit`'s own internal reload (a delete landing in exactly that
+    /// gap), which cannot be closed without the missing vendor-side
+    /// validation; the commit-`Err` retry below remains as a secondary net
+    /// for a conflict this check did not preempt (e.g. an unrelated
+    /// concurrent writer, or `commit.retry.*` exhausted by sustained
+    /// contention), bounded the same way.
     #[allow(clippy::too_many_arguments)]
     async fn commit_one_batch(
         catalog: &Arc<dyn Catalog>,
@@ -1823,6 +1875,8 @@ impl MaintenanceHandler {
         ident: &TableIdent,
         batch: &[Vec<DataFile>],
         seq_at_start: i64,
+        metadata_location: &str,
+        snapshot_id: i64,
         live_deletes: &[DataFile],
         snapshot_properties: Option<std::collections::HashMap<String, String>>,
         table_cache: Option<&TableMetadataCache>,
@@ -1830,33 +1884,115 @@ impl MaintenanceHandler {
         dispatcher: &dyn crate::compaction_dispatch::GroupBatchDispatcher,
         retry_on_conflict: bool,
     ) -> sqe_core::Result<BatchCommitResult> {
-        let outcomes = dispatcher.dispatch(batch).await?;
-
         let batch_old_files: Vec<DataFile> = batch.iter().flatten().cloned().collect();
-
-        // Row invariant, re-run per batch (the per-group
-        // `expected_rows_after_deletes` cross-check already ran on the
-        // WORKER before it returned); any violation aborts before this
-        // batch's commit, leaving any earlier batches' commits intact. Not
-        // retried on conflict (there is nothing to retry: this is a data
-        // problem, not a stale-snapshot problem).
-        let aggregated =
-            sqe_compaction::dispatch::aggregate_group_outcomes(outcomes, &batch_old_files)?;
+        let batch_old_paths: std::collections::HashSet<String> =
+            batch_old_files.iter().map(|f| f.file_path().to_string()).collect();
 
         const MAX_COMMIT_ATTEMPTS: usize = 4;
         let mut attempt: usize = 0;
         let mut reloaded_table: Option<IcebergTable> = None;
+        // Attempt 1 dispatches against exactly the caller's
+        // `metadata_location`/`snapshot_id`/`live_deletes`; owned copies so
+        // a retry (or the pre-commit check below) can swap in fresh ones
+        // without touching the caller's borrowed originals.
+        let mut cur_metadata_location: String = metadata_location.to_string();
+        let mut cur_snapshot_id: i64 = snapshot_id;
+        let mut cur_live_deletes: Vec<DataFile> = live_deletes.to_vec();
+
         loop {
             attempt += 1;
+
+            // Re-dispatched on every attempt after the first (only reached
+            // via a `continue` below), so the worker reads whatever deletes
+            // are current as of `cur_snapshot_id` instead of a stale
+            // plan-time view.
+            let outcomes = dispatcher
+                .dispatch(batch, &cur_metadata_location, cur_snapshot_id)
+                .await?;
+
+            // Row invariant, re-run per attempt (the per-group
+            // `expected_rows_after_deletes` cross-check already ran on the
+            // WORKER before it returned); any violation aborts before this
+            // batch's commit, leaving any earlier batches' commits intact.
+            // Not retried on conflict (there is nothing to retry: this is a
+            // data problem, not a stale-snapshot problem).
+            let aggregated =
+                sqe_compaction::dispatch::aggregate_group_outcomes(outcomes, &batch_old_files)?;
+
+            if retry_on_conflict {
+                // See the doc comment above: check for a concurrent
+                // position delete on one of THIS batch's own input files
+                // BEFORE committing, because a retryable `Err` out of
+                // `commit_aggregated_batch` below is not guaranteed to
+                // appear even when one landed.
+                let reload = load_table(catalog, ident).await?;
+                let reload_live_deletes = collect_live_delete_files(&reload).await?;
+                let known_paths: std::collections::HashSet<&str> =
+                    cur_live_deletes.iter().map(DataFile::file_path).collect();
+                let new_covering_delete = reload_live_deletes.iter().any(|d| {
+                    d.content_type() == DataContentType::PositionDeletes
+                        && d.referenced_data_file().is_some_and(|p| batch_old_paths.contains(&p))
+                        && !known_paths.contains(d.file_path())
+                });
+
+                if new_covering_delete {
+                    if attempt < MAX_COMMIT_ATTEMPTS {
+                        warn!(
+                            table = %ident,
+                            attempt,
+                            "rewrite_data_files_distributed: detected a concurrent position \
+                             delete on a partial_progress batch's own input file; \
+                             re-dispatching this batch against the current snapshot instead of \
+                             committing worker output that predates it"
+                        );
+                        cur_metadata_location = reload
+                            .metadata_location_result()
+                            .map_err(|e| {
+                                SqeError::Execution(format!(
+                                    "rewrite_data_files_distributed: reloaded table has no \
+                                     metadata location: {e}"
+                                ))
+                            })?
+                            .to_string();
+                        cur_snapshot_id = reload
+                            .metadata_ref()
+                            .current_snapshot()
+                            .map(|s| s.snapshot_id())
+                            .unwrap_or(0);
+                        cur_live_deletes = reload_live_deletes;
+                        reloaded_table = Some(reload);
+                        continue;
+                    }
+                    // Retries exhausted and a concurrent delete is still
+                    // landing on this batch's own files: never commit
+                    // output known to predate it (that would be the exact
+                    // resurrection this check exists to prevent). Fail the
+                    // batch instead; the caller reports `partial` if any
+                    // earlier batch already committed.
+                    return Err(SqeError::Execution(format!(
+                        "rewrite_data_files_distributed: a concurrent position delete keeps \
+                         landing on this batch's own input files after {attempt} re-dispatch \
+                         attempt(s); aborting this batch's commit rather than risk committing \
+                         stale (pre-delete) worker output"
+                    )));
+                }
+
+                // No new covering delete: still adopt this reload as the
+                // commit base and delete set, keeping `check_file_existence`
+                // and `covered_position_deletes` maximally current.
+                cur_live_deletes = reload_live_deletes;
+                reloaded_table = Some(reload);
+            }
+
             let current_table: &IcebergTable = reloaded_table.as_ref().unwrap_or(table);
             let result = Self::commit_aggregated_batch(
                 catalog,
                 current_table,
                 ident,
                 &batch_old_files,
-                aggregated.clone(),
+                aggregated,
                 seq_at_start,
-                live_deletes,
+                &cur_live_deletes,
                 snapshot_properties.clone(),
                 table_cache,
                 live_expected_before,
@@ -1866,6 +2002,12 @@ impl MaintenanceHandler {
             match result {
                 Ok(v) => return Ok(v),
                 Err(e) => {
+                    // Secondary net: a conflict this function's own
+                    // pre-commit check did not preempt (e.g. an unrelated
+                    // concurrent writer, or the vendored `Transaction::
+                    // commit`'s own internal retry budget exhausted by
+                    // sustained contention). Reload and re-dispatch, same
+                    // as above, rather than recommitting stale output.
                     let msg = e.to_string().to_lowercase();
                     let retryable = msg.contains("retryable") || msg.contains("conflict");
                     if retry_on_conflict && retryable && attempt < MAX_COMMIT_ATTEMPTS {
@@ -1876,12 +2018,28 @@ impl MaintenanceHandler {
                             attempt,
                             backoff_ms = backoff.as_millis() as u64,
                             "rewrite_data_files_distributed: retryable commit conflict on a \
-                             partial_progress batch commit; reloading the table and retrying \
-                             just this batch's commit (worker outputs are reused, not \
-                             re-dispatched)"
+                             partial_progress batch commit; reloading the table and \
+                             re-dispatching this batch against the current snapshot before \
+                             retrying the commit"
                         );
                         tokio::time::sleep(backoff).await;
-                        reloaded_table = Some(load_table(catalog, ident).await?);
+                        let reloaded = load_table(catalog, ident).await?;
+                        cur_metadata_location = reloaded
+                            .metadata_location_result()
+                            .map_err(|e| {
+                                SqeError::Execution(format!(
+                                    "rewrite_data_files_distributed: reloaded table has no \
+                                     metadata location: {e}"
+                                ))
+                            })?
+                            .to_string();
+                        cur_snapshot_id = reloaded
+                            .metadata_ref()
+                            .current_snapshot()
+                            .map(|s| s.snapshot_id())
+                            .unwrap_or(0);
+                        cur_live_deletes = collect_live_delete_files(&reloaded).await?;
+                        reloaded_table = Some(reloaded);
                         continue;
                     }
                     return Err(e);
@@ -3369,6 +3527,8 @@ mod tests {
             IcebergTable,
             Vec<Vec<DataFile>>,
             i64,
+            String,
+            i64,
         ) {
             let dir = tempfile::tempdir().expect("tempdir");
             // Leak the TempDir so it outlives this function (the sqlite
@@ -3408,6 +3568,15 @@ mod tests {
                 .current_snapshot()
                 .expect("initial snapshot exists")
                 .sequence_number();
+            let metadata_location = table
+                .metadata_location_result()
+                .expect("initial metadata location exists")
+                .to_string();
+            let snapshot_id = table
+                .metadata()
+                .current_snapshot()
+                .expect("initial snapshot exists")
+                .snapshot_id();
 
             // 3 groups of 2 files each, in the same order as `paths`.
             let eligible_groups: Vec<Vec<DataFile>> = initial_files
@@ -3415,7 +3584,7 @@ mod tests {
                 .map(<[DataFile]>::to_vec)
                 .collect();
 
-            (catalog, ident, table, eligible_groups, seq_at_start)
+            (catalog, ident, table, eligible_groups, seq_at_start, metadata_location, snapshot_id)
         }
 
         /// Synthetic [`crate::compaction_dispatch::GroupBatchDispatcher`]:
@@ -3433,6 +3602,8 @@ mod tests {
             async fn dispatch(
                 &self,
                 batch: &[Vec<DataFile>],
+                _metadata_location: &str,
+                _snapshot_id: i64,
             ) -> sqe_core::Result<Vec<sqe_compaction::dispatch::GroupOutcome>> {
                 if batch.iter().flatten().any(|f| f.file_path() == self.poison_path) {
                     return Err(SqeError::Execution(format!(
@@ -3484,8 +3655,15 @@ mod tests {
         /// conflict from the underlying catalog. `triggered` ensures the
         /// injection fires exactly once, modeling a one-shot transient race
         /// rather than a permanently wedged table, so the fix's
-        /// reload-and-recommit retry is expected to succeed on its next
-        /// attempt.
+        /// reload-and-redispatch retry is expected to succeed on its next
+        /// attempt. This dispatcher's "compacted" output only depends on
+        /// `batch` (deterministic row/byte sums), so being re-dispatched on
+        /// retry (the fix's behavior) reproduces the same aggregate counts
+        /// as the old reuse-the-first-output behavior for THIS scenario
+        /// (the injected concurrent write is a benign append unrelated to
+        /// the batch's own files, not a resurrection-triggering position
+        /// delete on one of them -- see `DeleteInjectingDispatcher` below
+        /// for that case).
         struct ConflictOnceDispatcher {
             conflict_after_path: String,
             catalog: Arc<dyn Catalog>,
@@ -3498,6 +3676,8 @@ mod tests {
             async fn dispatch(
                 &self,
                 batch: &[Vec<DataFile>],
+                _metadata_location: &str,
+                _snapshot_id: i64,
             ) -> sqe_core::Result<Vec<sqe_compaction::dispatch::GroupOutcome>> {
                 let should_inject = batch
                     .iter()
@@ -3562,7 +3742,7 @@ mod tests {
 
         #[tokio::test]
         async fn partial_progress_on_commits_earlier_batches_and_reports_partial() {
-            let (catalog, ident, table, eligible_groups, seq_at_start) =
+            let (catalog, ident, table, eligible_groups, seq_at_start, metadata_location, snapshot_id) =
                 table_with_six_files("partial_on_test").await;
             // Group 3 (files f5, f6) is the LAST group -- poison its first
             // file so the terminal failure lands on the last batch, exactly
@@ -3578,6 +3758,8 @@ mod tests {
                 /* partial_progress */ true,
                 /* partial_progress_batch */ 1,
                 seq_at_start,
+                &metadata_location,
+                snapshot_id,
                 &[],
                 None,
                 None,
@@ -3614,7 +3796,7 @@ mod tests {
 
         #[tokio::test]
         async fn partial_progress_off_leaves_table_unchanged_on_the_same_forced_failure() {
-            let (catalog, ident, table, eligible_groups, seq_at_start) =
+            let (catalog, ident, table, eligible_groups, seq_at_start, metadata_location, snapshot_id) =
                 table_with_six_files("partial_off_test").await;
             let poison_path = eligible_groups[2][0].file_path().to_string();
             let dispatcher = PoisonPathDispatcher { poison_path };
@@ -3627,6 +3809,8 @@ mod tests {
                 /* partial_progress */ false,
                 /* partial_progress_batch */ 1, // ignored when partial_progress is false
                 seq_at_start,
+                &metadata_location,
+                snapshot_id,
                 &[],
                 None,
                 None,
@@ -3662,7 +3846,7 @@ mod tests {
 
         #[tokio::test]
         async fn batch_commit_conflict_after_first_batch_is_retried_and_job_completes() {
-            let (catalog, ident, table, eligible_groups, seq_at_start) =
+            let (catalog, ident, table, eligible_groups, seq_at_start, metadata_location, snapshot_id) =
                 table_with_six_files("conflict_retry_test").await;
             // Group index 1 (files f3, f4) is the 2nd batch when
             // partial_progress_batch = 1, i.e. `committed_batches == 1`
@@ -3684,6 +3868,8 @@ mod tests {
                 /* partial_progress */ true,
                 /* partial_progress_batch */ 1,
                 seq_at_start,
+                &metadata_location,
+                snapshot_id,
                 &[],
                 None,
                 None,
@@ -3722,6 +3908,225 @@ mod tests {
             // All 60 original rows are preserved across the 3 real batch
             // commits, plus the 5 rows the injected concurrent commit added.
             assert_eq!(total_rows(&catalog, &ident).await, 65);
+        }
+
+        // ---------------------------------------------------------------
+        // CRITICAL regression: the inner retry must not resurrect rows
+        //
+        // Unlike `ConflictOnceDispatcher` above (whose injected concurrent
+        // write is a benign, unrelated `fast_append`), this dispatcher
+        // injects a concurrent POSITION delete that references one of the
+        // SAME batch's own input files -- exactly the scenario the review
+        // flagged: reusing stale worker output on the inner retry recommits
+        // rows the concurrent delete already removed, because the
+        // compacted output's new file path no longer matches the position
+        // delete's `(old_file_path, pos)`. This test fails against the
+        // pre-fix code (which recommits the first, naive dispatch's output
+        // unchanged) and passes only once the inner retry re-dispatches
+        // against the reloaded snapshot.
+        // ---------------------------------------------------------------
+
+        /// Synthetic dispatcher reproducing the resurrection bug. The FIRST
+        /// time it is asked to dispatch a batch containing `victim_path`,
+        /// it commits a concurrent POSITION delete directly through the
+        /// catalog, referencing `victim_path` itself -- one of THAT BATCH'S
+        /// OWN input files -- simulating a concurrent `DELETE FROM` landing
+        /// mid-job (not an unrelated file, unlike `ConflictOnceDispatcher`'s
+        /// benign append). It then returns a "naive" consolidated output
+        /// that does NOT subtract the deleted rows, modeling a worker that
+        /// only ever read the job's plan-time snapshot.
+        ///
+        /// Every SUBSEQUENT call for the same batch -- only reachable if
+        /// the caller re-dispatches on the resulting commit conflict, i.e.
+        /// only after the fix -- returns a CORRECTED output with the
+        /// concurrently-deleted rows subtracted, modeling a worker that
+        /// re-read the current snapshot and applied the now-visible
+        /// position delete. Before the fix, `commit_one_batch` never calls
+        /// `dispatch` a second time for a retried commit (it just recommits
+        /// the first, naive output against the reloaded table), so running
+        /// this test against pre-fix code recommits the naive (un-deleted)
+        /// row count -- the resurrection bug. After the fix, the
+        /// re-dispatch call produces the corrected output and the deleted
+        /// rows stay deleted.
+        struct DeleteInjectingDispatcher {
+            victim_path: String,
+            deleted_rows: u64,
+            catalog: Arc<dyn Catalog>,
+            ident: TableIdent,
+            triggered: std::sync::atomic::AtomicBool,
+            victim_dispatch_count: std::sync::atomic::AtomicUsize,
+        }
+
+        #[async_trait::async_trait]
+        impl crate::compaction_dispatch::GroupBatchDispatcher for DeleteInjectingDispatcher {
+            async fn dispatch(
+                &self,
+                batch: &[Vec<DataFile>],
+                _metadata_location: &str,
+                _snapshot_id: i64,
+            ) -> sqe_core::Result<Vec<sqe_compaction::dispatch::GroupOutcome>> {
+                let is_victim_batch =
+                    batch.iter().flatten().any(|f| f.file_path() == self.victim_path);
+
+                if is_victim_batch && !self.triggered.swap(true, std::sync::atomic::Ordering::SeqCst)
+                {
+                    // Simulate a concurrent `DELETE FROM ... WHERE ...`
+                    // landing a position delete on one of THIS batch's own
+                    // input files, after the previous batch committed but
+                    // before this one does -- the exact trigger for the
+                    // resurrection bug.
+                    let fresh = self
+                        .catalog
+                        .load_table(&self.ident)
+                        .await
+                        .expect("reload table for injected concurrent position delete");
+                    let pos_delete = iceberg::spec::DataFileBuilder::default()
+                        .content(DataContentType::PositionDeletes)
+                        .file_path(format!(
+                            "mem://resurrection_test/deletes/pos-{}.parquet",
+                            uuid::Uuid::now_v7()
+                        ))
+                        .file_format(DataFileFormat::Parquet)
+                        .file_size_in_bytes(64)
+                        .record_count(self.deleted_rows)
+                        .partition(Struct::from_iter(std::iter::empty()))
+                        .partition_spec_id(0)
+                        .referenced_data_file(Some(self.victim_path.clone()))
+                        .build()
+                        .expect("build position delete file");
+                    let tx = Transaction::new(&fresh);
+                    let action = tx.row_delta().add_delete_files(vec![pos_delete]);
+                    let tx_applied = action.apply(tx).expect("apply concurrent row_delta");
+                    tx_applied
+                        .commit(self.catalog.as_ref())
+                        .await
+                        .expect("commit concurrent position delete");
+                }
+
+                // Whether THIS call is the naive first dispatch or a
+                // corrected re-dispatch is decided purely by call count for
+                // the victim batch: the first call always injects the
+                // delete above and returns naive output (a real worker
+                // reading the plan-time snapshot would have no way to see a
+                // delete that did not exist yet); any later call for the
+                // same batch only happens if the caller re-dispatches after
+                // a commit conflict, so it returns the corrected output.
+                let victim_call_index = if is_victim_batch {
+                    self.victim_dispatch_count
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                } else {
+                    0
+                };
+
+                Ok(batch
+                    .iter()
+                    .enumerate()
+                    .map(|(i, group)| {
+                        let rows: u64 = group.iter().map(iceberg::spec::DataFile::record_count).sum();
+                        let bytes: u64 =
+                            group.iter().map(iceberg::spec::DataFile::file_size_in_bytes).sum();
+                        let is_victim_group =
+                            group.iter().any(|f| f.file_path() == self.victim_path);
+                        let effective_rows = if is_victim_group && victim_call_index > 0 {
+                            // Corrected: the re-dispatch "sees" the
+                            // concurrently-committed position delete and
+                            // excludes its rows from the compacted output.
+                            rows.saturating_sub(self.deleted_rows)
+                        } else {
+                            // Naive: full input row count, no delete
+                            // applied -- exactly what a stale, reused
+                            // worker output looks like.
+                            rows
+                        };
+                        let new_path = format!(
+                            "mem://resurrection_test/data/consolidated-{}-{}.parquet",
+                            i,
+                            uuid::Uuid::now_v7()
+                        );
+                        let new_file = fabricated_data_file(&new_path, effective_rows, bytes.max(1));
+                        sqe_compaction::dispatch::GroupOutcome {
+                            group_id: i as u32,
+                            new_files: vec![new_file],
+                            rows_written: effective_rows,
+                            bytes_written: bytes,
+                            uploaded_paths: vec![],
+                        }
+                    })
+                    .collect())
+            }
+        }
+
+        #[tokio::test]
+        async fn batch_commit_conflict_from_own_position_delete_does_not_resurrect_rows() {
+            let (catalog, ident, table, eligible_groups, seq_at_start, metadata_location, snapshot_id) =
+                table_with_six_files("resurrection_test").await;
+            // Group index 1 (files f3, f4) is the 2nd batch when
+            // partial_progress_batch = 1, i.e. `committed_batches == 1`
+            // (> 0) at the time its commit is attempted -- the same
+            // retry-eligible position as `ConflictOnceDispatcher`'s
+            // scenario, but this time the concurrent write targets one of
+            // THIS batch's own files (f3) with a position delete instead of
+            // an unrelated append.
+            let victim_path = eligible_groups[1][0].file_path().to_string();
+            let deleted_rows = 4u64;
+            let dispatcher = DeleteInjectingDispatcher {
+                victim_path,
+                deleted_rows,
+                catalog: Arc::clone(&catalog),
+                ident: ident.clone(),
+                triggered: std::sync::atomic::AtomicBool::new(false),
+                victim_dispatch_count: std::sync::atomic::AtomicUsize::new(0),
+            };
+
+            let outcome = MaintenanceHandler::commit_eligible_groups(
+                &catalog,
+                table,
+                &ident,
+                eligible_groups,
+                /* partial_progress */ true,
+                /* partial_progress_batch */ 1,
+                seq_at_start,
+                &metadata_location,
+                snapshot_id,
+                &[],
+                None,
+                None,
+                6,
+                600,
+                &dispatcher,
+            )
+            .await
+            .expect("the injected conflict is retryable and must not fail the job");
+
+            assert!(
+                !outcome.partial,
+                "a retryable commit conflict on batch 2 must be fully absorbed by the inner \
+                 per-batch retry, not reported as a partial-progress fallback"
+            );
+            assert!(
+                outcome.partial_error.is_none(),
+                "no terminal failure occurred, so there is nothing to report as a partial error"
+            );
+            assert_eq!(outcome.files_rewritten, 6, "all 3 batches x 2 files each eventually commit");
+            assert_eq!(outcome.files_out, 3, "one consolidated file per batch");
+
+            // The critical assertion: total live rows must reflect the
+            // concurrently-deleted rows STAYING deleted (60 - 4 = 56), not
+            // resurrected back to 60. Before the fix, the inner retry
+            // recommits the first (naive, pre-delete) dispatch's output
+            // unchanged, so this would read 60.
+            assert_eq!(
+                total_rows(&catalog, &ident).await,
+                56,
+                "the 4 concurrently-deleted rows must stay deleted, not resurrect in the \
+                 compacted output"
+            );
+
+            // And no rows were incorrectly dropped either: exactly 3
+            // consolidated files (one per batch), no orphaned extras.
+            let reloaded = catalog.load_table(&ident).await.expect("reload table");
+            let live_files = collect_live_data_files(&reloaded).await.expect("collect live files");
+            assert_eq!(live_files.len(), 3, "one consolidated data file per batch, nothing extra");
         }
     }
 }

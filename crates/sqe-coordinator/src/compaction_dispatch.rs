@@ -573,9 +573,23 @@ pub(crate) async fn dispatch_and_collect_groups(
 /// `decode_group_response` directly, so its batch-commit / partial-progress
 /// bookkeeping (Phase 4d Task 3) can be exercised in tests against a
 /// synthetic implementation, without a live worker fleet.
+///
+/// `metadata_location`/`snapshot_id` are supplied PER CALL, not captured once
+/// at construction: `maintenance::MaintenanceHandler::commit_one_batch`'s
+/// inner commit-conflict retry (Phase 4d Task 3 hardening fix) re-dispatches
+/// a batch against a freshly reloaded table on a retryable conflict, so the
+/// same dispatcher instance must be able to target a different snapshot on
+/// each call rather than reusing the first call's (possibly stale) worker
+/// output. See that function's doc comment for the resurrection bug this
+/// closes.
 #[async_trait]
 pub(crate) trait GroupBatchDispatcher: Send + Sync {
-    async fn dispatch(&self, batch: &[Vec<DataFile>]) -> SqeResult<Vec<GroupOutcome>>;
+    async fn dispatch(
+        &self,
+        batch: &[Vec<DataFile>],
+        metadata_location: &str,
+        snapshot_id: i64,
+    ) -> SqeResult<Vec<GroupOutcome>>;
 }
 
 /// Production [`GroupBatchDispatcher`]: dispatches to the real worker fleet
@@ -584,12 +598,15 @@ pub(crate) trait GroupBatchDispatcher: Send + Sync {
 /// so the dispatcher can be built once per job and handed to
 /// `commit_eligible_groups` as a plain `&dyn GroupBatchDispatcher` without
 /// threading extra lifetimes through the batching loop.
+///
+/// `metadata_location`/`snapshot_id` are deliberately NOT fields here (unlike
+/// every other per-job constant): the caller passes them into every
+/// [`Self::dispatch`] call instead, so a commit-conflict retry can redirect
+/// dispatch at a freshly reloaded snapshot without rebuilding the dispatcher.
 #[allow(clippy::too_many_arguments)]
 pub(crate) struct WorkerFleetDispatcher {
     pub job_id: String,
     pub table_ident: String,
-    pub metadata_location: String,
-    pub snapshot_id: i64,
     pub target_file_size_bytes: u64,
     pub compression: String,
     pub sort: Option<SortSpecWire>,
@@ -609,12 +626,17 @@ pub(crate) struct WorkerFleetDispatcher {
 
 #[async_trait]
 impl GroupBatchDispatcher for WorkerFleetDispatcher {
-    async fn dispatch(&self, batch: &[Vec<DataFile>]) -> SqeResult<Vec<GroupOutcome>> {
+    async fn dispatch(
+        &self,
+        batch: &[Vec<DataFile>],
+        metadata_location: &str,
+        snapshot_id: i64,
+    ) -> SqeResult<Vec<GroupOutcome>> {
         let responses = dispatch_and_collect_groups(
             &self.job_id,
             &self.table_ident,
-            &self.metadata_location,
-            self.snapshot_id,
+            metadata_location,
+            snapshot_id,
             batch,
             self.target_file_size_bytes,
             &self.compression,
