@@ -3301,6 +3301,33 @@ pub struct MaintenanceDistributionConfig {
     /// follow-up, not implemented here.
     #[serde(default = "default_maintenance_group_heartbeat_timeout_secs")]
     pub group_heartbeat_timeout_secs: u64,
+    /// Opt-in (Phase 4d Task 3): commit successful groups in batches of
+    /// `partial_progress_batch` instead of collecting every group and
+    /// committing ONE all-or-nothing `RewriteFilesAction`. Default `false`:
+    /// the job behaves exactly as before, one atomic commit, any failure
+    /// commits nothing at all.
+    ///
+    /// When `true`, a terminal group failure (one that exhausts its
+    /// retries, or a stalled/undispatchable group) after one or more
+    /// batches have already committed reports `status = "partial"` in
+    /// `sqe_system.maintenance_log` instead of failing the whole job --
+    /// see `rewrite_data_files_distributed_once` in `sqe-coordinator`. If
+    /// the very first batch fails before anything commits, the job still
+    /// fails outright (there is nothing "partial" about zero commits).
+    ///
+    /// Trades a larger commit-conflict surface (N commits instead of 1,
+    /// each independently racing concurrent writers) for incremental
+    /// durability on very large tables where losing an entire multi-hour
+    /// job to one late group failure is expensive.
+    #[serde(default)]
+    pub partial_progress: bool,
+    /// Number of eligible groups committed per `RewriteFilesAction` when
+    /// `partial_progress` is `true`. Ignored when `partial_progress` is
+    /// `false` (the whole job is always exactly one commit then). Must be
+    /// `>= 1` when `partial_progress` is `true` (`validate()` rejects `0`).
+    /// Default: `10`.
+    #[serde(default = "default_maintenance_partial_progress_batch")]
+    pub partial_progress_batch: usize,
 }
 
 impl Default for MaintenanceDistributionConfig {
@@ -3312,6 +3339,8 @@ impl Default for MaintenanceDistributionConfig {
             group_attempts: default_maintenance_group_attempts(),
             group_timeout_secs: default_maintenance_group_timeout_secs(),
             group_heartbeat_timeout_secs: default_maintenance_group_heartbeat_timeout_secs(),
+            partial_progress: false,
+            partial_progress_batch: default_maintenance_partial_progress_batch(),
         }
     }
 }
@@ -3347,6 +3376,7 @@ fn default_maintenance_max_inflight_groups_per_worker() -> usize { 1 }
 fn default_maintenance_group_attempts() -> usize { 2 }
 fn default_maintenance_group_timeout_secs() -> u64 { 3600 }
 fn default_maintenance_group_heartbeat_timeout_secs() -> u64 { 120 }
+fn default_maintenance_partial_progress_batch() -> usize { 10 }
 
 fn default_idle_timeout() -> u64 { 900 }       // 15 minutes
 fn default_absolute_timeout() -> u64 { 28800 }  // 8 hours
@@ -3765,6 +3795,22 @@ impl SqeConfig {
                  only wires the catalog-native lease); set lease = \"catalog\" (default, works \
                  for multi-coordinator HA today) or lease = \"none\" with \
                  single_scheduler_acknowledged = true (single-coordinator deployments only)."
+                    .to_string(),
+            );
+        }
+
+        // Phase 4d Task 3: partial-progress batches must contain at least
+        // one group each. Only meaningful when `partial_progress` is
+        // enabled -- a `0` batch size with `partial_progress = false` is
+        // inert (the field is never read on that path) and not worth
+        // rejecting.
+        if self.maintenance.distribution.partial_progress
+            && self.maintenance.distribution.partial_progress_batch < 1
+        {
+            errors.push(
+                "maintenance.distribution.partial_progress is true but \
+                 partial_progress_batch is 0; each batch must commit at least \
+                 one group (set partial_progress_batch >= 1)"
                     .to_string(),
             );
         }
@@ -4728,6 +4774,8 @@ max_inflight_groups_per_worker = 2
 group_attempts = 3
 group_timeout_secs = 1800
 group_heartbeat_timeout_secs = 60
+partial_progress = true
+partial_progress_batch = 5
 "#;
         let cfg: SqeConfig = toml::from_str(toml).expect("full [maintenance] block parses");
         assert_eq!(cfg.maintenance.mode, MaintenanceMode::Advisory);
@@ -4758,6 +4806,8 @@ group_heartbeat_timeout_secs = 60
         assert_eq!(dist.group_attempts, 3);
         assert_eq!(dist.group_timeout_secs, 1800);
         assert_eq!(dist.group_heartbeat_timeout_secs, 60);
+        assert!(dist.partial_progress);
+        assert_eq!(dist.partial_progress_batch, 5);
     }
 
     #[test]
@@ -4789,6 +4839,31 @@ group_heartbeat_timeout_secs = 60
         assert_eq!(d.group_attempts, 2);
         assert_eq!(d.group_timeout_secs, 3600);
         assert_eq!(d.group_heartbeat_timeout_secs, 120);
+        assert!(!d.partial_progress);
+        assert_eq!(d.partial_progress_batch, 10);
+    }
+
+    #[test]
+    fn maintenance_partial_progress_batch_zero_rejected_when_enabled() {
+        let mut config = valid_config();
+        config.maintenance.distribution.partial_progress = true;
+        config.maintenance.distribution.partial_progress_batch = 0;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("partial_progress_batch is 0"),
+            "expected partial_progress_batch=0 rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn maintenance_partial_progress_batch_zero_accepted_when_disabled() {
+        // partial_progress_batch is inert when partial_progress is false
+        // (the default): a 0 value there is never read, so it must not be
+        // rejected.
+        let mut config = valid_config();
+        config.maintenance.distribution.partial_progress = false;
+        config.maintenance.distribution.partial_progress_batch = 0;
+        config.validate().expect("batch=0 is inert when partial_progress is disabled");
     }
 
     #[test]
