@@ -524,6 +524,15 @@ build-sqe:
     # without a signature available yet.
     - sha256sum sbom-sqe.cdx.json image-digest.txt > SHA256SUMS
     - cat SHA256SUMS
+    # Publish the image SBOM to the aikido central SBOM store (generic package
+    # registry) when configured; cleanly no-ops if the group vars are unset.
+    - |
+      if [ -n "${AIKIDO_SBOM_PROJECT_ID:-}" ] && [ -n "${AIKIDO_SBOM_DEPLOY_TOKEN:-}" ]; then
+        URL="${CI_API_V4_URL}/projects/${AIKIDO_SBOM_PROJECT_ID}/packages/generic/${CI_PROJECT_PATH_SLUG}/${CI_COMMIT_SHA}/sbom.cdx.json"
+        curl --fail --silent --show-error --header "DEPLOY-TOKEN: ${AIKIDO_SBOM_DEPLOY_TOKEN}" --upload-file sbom-sqe.cdx.json "$URL" && echo "uploaded SBOM -> aikido central store"
+      else
+        echo "aikido central SBOM store not configured; skipping upload"
+      fi
     # TODO(operator): keyless image signing. cosign is not provisioned on
     # these runners. Once a runner has cosign + GitLab OIDC id_tokens wired,
     # add the following (and grant the job an id_token) to sign the digest:
