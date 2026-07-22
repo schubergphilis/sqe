@@ -10,7 +10,12 @@ pub mod policy_wiring;
 pub mod tag_source_impl;
 pub mod catalog_ops;
 pub mod channel_pool;
+pub mod compaction_dispatch;
 pub mod maintenance;
+pub mod maintenance_lease;
+pub mod maintenance_log;
+pub mod maintenance_principal;
+pub mod maintenance_scheduler;
 pub mod merge_sql;
 pub mod merge_target_provider;
 pub mod tls;
@@ -35,14 +40,20 @@ pub mod scan_pushdown;
 pub mod scheduler;
 pub mod streaming;
 pub mod suggest_bloom;
+pub mod table_health;
 pub mod session_manager;
 pub mod web_auth;
 pub mod web_ui;
 pub mod worker_registry;
 pub mod write_handler;
-pub mod write_memory;
 pub mod writer;
-pub mod zorder;
+
+/// `write_memory` (pool-tracked write buffers) moved to `sqe-compaction` so
+/// the worker-side compaction/write path can reuse it without depending on
+/// this crate. Re-exported under its original path so
+/// `crate::write_memory::{TrackedBatchBuffer, WriteReservation}` call sites
+/// in `write_handler.rs`/`writer.rs` compile unchanged.
+pub use sqe_compaction::write_memory;
 
 pub use mode::Mode;
 pub use quack_executor::CoordinatorExecutor;

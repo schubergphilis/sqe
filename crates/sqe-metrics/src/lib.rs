@@ -217,6 +217,46 @@ pub struct MetricsRegistry {
     /// requests that do not write an audit line. This keeps access observable
     /// in Prometheus even when the audit-coalesce window suppresses the line.
     pub dashboard_auth_success_total: IntCounter,
+
+    // Maintenance / advisory auto-compaction scheduler (Phase 4a, Task 5).
+    // Per-table gauges are keyed by fully-qualified `ns.table`; this is a
+    // deliberate high-cardinality label (one series per opted-in table).
+    // Acceptable at Phase 4a's opt-in scale; revisit if the opted-in table
+    // count grows into the thousands.
+    /// Live data files below `target_file_size_bytes`, by table.
+    pub table_small_files: GaugeVec,
+    /// Live delete files (position + equality), by table.
+    pub table_delete_files: GaugeVec,
+    /// Bytes covered by the pure bin-pack eligible groups, by table.
+    pub maintenance_est_rewrite_bytes: GaugeVec,
+    /// Advisory tick loop failures (a whole tick erroring out, not a
+    /// per-table analysis failure -- those are caught and logged, not
+    /// counted here, so one bad table never inflates this counter).
+    pub maintenance_tick_errors: IntCounter,
+    /// Active-mode compaction jobs, by terminal status
+    /// (`success`/`failed`/`skipped`). One increment per opted-in, due
+    /// table the active scheduler considered in a tick (Phase 4b).
+    pub maintenance_job_total: IntCounterVec,
+    /// Bytes written by active-mode compaction's output files, summed
+    /// across all successful jobs (Phase 4b). Never incremented for
+    /// `failed`/`skipped` jobs, which write nothing.
+    pub maintenance_bytes_rewritten_total: IntCounter,
+    /// Active-mode jobs skipped, by specific reason (Phase 4c Task 5).
+    /// Deliberately separate from `maintenance_job_total{status="skipped"}`
+    /// (which fires for every skip cause, including "no eligible compaction
+    /// debt"): this one is keyed by `reason` so an operator can alert on
+    /// `reason="insufficient_workers"` -- `distribution.mode = "require"`
+    /// with the fleet below `min_workers` -- specifically, without that
+    /// signal being drowned out by routine no-debt skips.
+    pub maintenance_skipped_total: IntCounterVec,
+    /// Active-mode table-ticks that observed another coordinator's live
+    /// `catalog` lease and skipped compacting this tick (Phase 4d Task 3).
+    /// Routine under multi-coordinator deployments -- NOT a
+    /// `sqe_maintenance_job_total{status="skipped"}` sample (no job was even
+    /// attempted, so there is nothing to log as a job), just a signal an
+    /// operator can use to confirm the lease is doing its job (avoiding
+    /// redundant rewrites) rather than every coordinator racing every tick.
+    pub maintenance_lease_skipped_total: IntCounter,
 }
 
 impl MetricsRegistry {
@@ -630,6 +670,63 @@ impl MetricsRegistry {
              requests that do not write an audit line.",
         )?;
 
+        // Maintenance / advisory auto-compaction scheduler (Phase 4a, Task 5)
+        let table_small_files = register_gauge_vec(
+            &registry,
+            "sqe_table_small_files",
+            "Live data files below the target compaction file size, by table",
+            &["table"],
+        )?;
+
+        let table_delete_files = register_gauge_vec(
+            &registry,
+            "sqe_table_delete_files",
+            "Live delete files (position + equality), by table",
+            &["table"],
+        )?;
+
+        let maintenance_est_rewrite_bytes = register_gauge_vec(
+            &registry,
+            "sqe_maintenance_est_rewrite_bytes",
+            "Bytes covered by pure bin-pack eligible compaction groups, by table",
+            &["table"],
+        )?;
+
+        let maintenance_tick_errors = register_int_counter(
+            &registry,
+            "sqe_maintenance_tick_errors_total",
+            "Advisory/active scheduler tick failures (whole-tick errors, not per-table)",
+        )?;
+
+        // Phase 4b active-mode autonomous compaction.
+        let maintenance_job_total = register_int_counter_vec(
+            &registry,
+            "sqe_maintenance_job_total",
+            "Active-mode compaction jobs, by terminal status (success/failed/skipped)",
+            &["status"],
+        )?;
+
+        let maintenance_bytes_rewritten_total = register_int_counter(
+            &registry,
+            "sqe_maintenance_bytes_rewritten_total",
+            "Bytes written by active-mode compaction's output files, summed across successful jobs",
+        )?;
+
+        // Phase 4c Task 5: `distribution.mode` routing.
+        let maintenance_skipped_total = register_int_counter_vec(
+            &registry,
+            "sqe_maintenance_skipped_total",
+            "Active-mode compaction jobs skipped, by specific reason (e.g. insufficient_workers)",
+            &["reason"],
+        )?;
+
+        // Phase 4d Task 3: catalog lease wiring.
+        let maintenance_lease_skipped_total = register_int_counter(
+            &registry,
+            "sqe_maintenance_lease_skipped_total",
+            "Active-mode table-ticks skipped because another coordinator holds the catalog lease",
+        )?;
+
         Ok(Self {
             registry,
             query_count,
@@ -694,6 +791,14 @@ impl MetricsRegistry {
             audit_export_last_success_timestamp,
             dashboard_auth_anonymous_denied_total,
             dashboard_auth_success_total,
+            table_small_files,
+            table_delete_files,
+            maintenance_est_rewrite_bytes,
+            maintenance_tick_errors,
+            maintenance_job_total,
+            maintenance_bytes_rewritten_total,
+            maintenance_skipped_total,
+            maintenance_lease_skipped_total,
         })
     }
 }

@@ -1055,6 +1055,105 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
 
     let audit = Arc::new(audit_logger);
 
+    // Advisory/active auto-compaction scheduler (Phase 4a, Task 5). `Off`
+    // mode (the default) constructs NOTHING here: neither the dedicated
+    // maintenance service principal nor the `MaintenanceScheduler` value
+    // exist anywhere in the process. That absence -- not a runtime no-op --
+    // is the isolation guarantee `[maintenance] mode = "off"` promises; the
+    // principal is never reachable from the interactive auth chain because
+    // it is never constructed at all when mode is off.
+    //
+    // `config.maintenance.scheduler.enabled` is a second, independent gate:
+    // an operator can run `mode = "advisory"` purely so `CALL
+    // system.table_health` and a future external-trigger RPC work, while
+    // leaving the in-process tick loop off (`scheduler.enabled = false`,
+    // the config default) for a Kubernetes-CronJob-driven deployment. Both
+    // the principal and the `MaintenanceScheduler` are still built in that
+    // case (so the external trigger path has something to call into later);
+    // only `_task_guards.push(scheduler.spawn())` is skipped.
+    if config.maintenance.mode != sqe_core::config::MaintenanceMode::Off {
+        let principal_cfg = config.maintenance.principal.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "maintenance.mode is not \"off\" but [maintenance.principal] is unset; \
+                 this should have been rejected by config validation at startup"
+            )
+        })?;
+        let maintenance_principal = Arc::new(
+            sqe_coordinator::maintenance_principal::MaintenancePrincipal::from_config(principal_cfg)
+                .map_err(|e| anyhow::anyhow!("failed to build maintenance principal: {e}"))?,
+        );
+        let catalog_factory = sqe_coordinator::maintenance_scheduler::default_catalog_factory(
+            config.clone(),
+            Some(table_cache.clone()),
+        );
+        // Dedicated `MaintenanceHandler` for the scheduler's active-mode arm
+        // (Phase 4b), separate from the one `QueryHandler` builds for the
+        // interactive `CALL system.rewrite_data_files` path below.
+        // `Advisory` mode's `analyze_one_table` never touches this handler
+        // (it only calls `table_health`, which needs no DataFusion runtime),
+        // so the handler is built without a runtime there. Only in `Active`
+        // mode does `active_one_table` call `handler.rewrite_data_files`,
+        // and only a per-table `strategy => "sort"` override needs the
+        // runtime (to spill instead of OOMing); that runtime is a second
+        // `FairSpillPool` competing for host memory alongside the query
+        // engine's, and building it unconditionally would let Active-mode
+        // compaction run concurrently with queries at up to ~2x the
+        // operator's configured `memory_limit`, contradicting the
+        // single-shared-budget invariant `runtime.rs` documents. So it is
+        // built and attached ONLY when `mode == Active`.
+        // TODO(4c): share the coordinator query runtime instead of a second pool.
+        // The scheduler never resolves a catalog through this handler's own
+        // `create_catalog_bridge`; it always passes in a catalog it already
+        // built via `catalog_factory` (see
+        // `maintenance_scheduler.rs::active_one_table`).
+        let mut maintenance_handler_builder =
+            sqe_coordinator::maintenance::MaintenanceHandler::new(config.clone())
+                .with_table_cache(table_cache.clone())
+                .with_audit(Arc::clone(&audit))
+                // Phase 4c Task 5: same registry the interactive `CALL` path's
+                // `MaintenanceHandler` gets (see `QueryHandler::new`), so the
+                // scheduler's active-mode `distribution.mode` routing sees the
+                // real healthy-worker count too. Wiring it unconditionally
+                // (even when `distributed` is false) is safe: a registry with
+                // no seeded/heartbeat-discovered workers, or one whose health
+                // checks never started, reports `0` healthy either way.
+                .with_worker_registry(Arc::clone(&worker_registry));
+        if config.maintenance.mode == sqe_core::config::MaintenanceMode::Active {
+            let maintenance_runtime = sqe_coordinator::runtime::build_coordinator_runtime(
+                &config.coordinator,
+                &config.storage,
+            )
+            .map_err(|e| anyhow::anyhow!("failed to build maintenance scheduler runtime: {e}"))?;
+            maintenance_handler_builder =
+                maintenance_handler_builder.with_runtime(maintenance_runtime);
+        }
+        let maintenance_handler = Arc::new(maintenance_handler_builder);
+        let maintenance_scheduler = sqe_coordinator::maintenance_scheduler::MaintenanceScheduler::new(
+            config.maintenance.clone(),
+            maintenance_principal,
+            metrics.clone(),
+            Some(audit.clone()),
+            catalog_factory,
+            maintenance_handler,
+        );
+        if config.maintenance.scheduler.enabled {
+            _task_guards.push(maintenance_scheduler.spawn());
+            tracing::info!(
+                mode = ?config.maintenance.mode,
+                tick_secs = config.maintenance.scheduler.tick_secs,
+                jitter_secs = config.maintenance.scheduler.jitter_secs,
+                "Started maintenance advisory scheduler loop"
+            );
+        } else {
+            drop(maintenance_scheduler);
+            tracing::info!(
+                mode = ?config.maintenance.mode,
+                "maintenance.mode is not \"off\" but maintenance.scheduler.enabled is false; \
+                 the in-process tick loop will not run (external-trigger deployment expected)"
+            );
+        }
+    }
+
     // Health server. Started here (after audit init) so the audit logger can be
     // threaded into HealthState and dashboard-access events are captured from
     // the first request. Probes (/healthz, /readyz) are still served immediately

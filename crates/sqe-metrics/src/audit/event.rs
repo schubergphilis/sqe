@@ -13,6 +13,11 @@ pub enum AuditKind {
     Grant,
     AdminDdl,
     PolicyDecision,
+    /// Advisory/active maintenance subsystem activity (Phase 4a auto-
+    /// compaction scheduler): a per-table compaction-debt analysis pass, or
+    /// (later) a rewrite job. Never a user query or an interactive admin
+    /// action; the actor is always the dedicated maintenance principal.
+    Maintenance,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

@@ -10,11 +10,12 @@ Source: `crates/sqe-sql/src/procedures.rs`. Handlers in `crates/sqe-coordinator/
 
 | Procedure | Origin | Required args | Optional args | Notes |
 |---|---|---|---|---|
-| `system.rewrite_data_files` | `sqe-sql` + `sqe-coordinator` | `table => 'ns.t'` | `target_file_size_bytes => N`, `min_input_files => N`, `max_concurrent_file_group_rewrites => N`, `strategy => 'binpack'\|'sort'`, `sort_order => 'col ASC, ...'\|'zorder(a, b)'`, `delete_file_threshold => N` | Compacts small data files (delete-aware). Default target 512 MiB, min 5 files per group, max 4 concurrent groups. `strategy => 'sort'` sorts a whole partition by `sort_order` (a column list or `zorder(...)`) via a spillable DataFusion sort and rolls output at the target size, producing files with disjoint key ranges. `delete_file_threshold => N` also rewrites any data file with at least N delete files applying to it, even when it is already large. `rewrite_all => true` forces a rewrite of every file regardless of size or file count. |
+| `system.rewrite_data_files` | `sqe-sql` + `sqe-coordinator` | `table => 'ns.t'` | `target_file_size_bytes => N`, `min_input_files => N`, `max_concurrent_file_group_rewrites => N`, `strategy => 'binpack'\|'sort'`, `sort_order => 'col ASC, ...'\|'zorder(a, b)'`, `delete_file_threshold => N`, `distributed => 'auto'\|'local'\|'require'`, `rewrite_all => true` | Compacts small data files (delete-aware). Default target 512 MiB, min 5 files per group, max 4 concurrent groups. `strategy => 'sort'` sorts a whole partition by `sort_order` (a column list or `zorder(...)`) via a spillable DataFusion sort and rolls output at the target size, producing files with disjoint key ranges. `delete_file_threshold => N` also rewrites any data file with at least N delete files applying to it, even when it is already large. `rewrite_all => true` forces a rewrite of every file regardless of size or file count. `distributed => ...` overrides `[maintenance.distribution] mode` for this one call (see [Configuration](../deployment/configuration.md) and [Distributed compaction](../design-notes/distributed-compaction.md)); omit it to use the configured mode. A manual `CALL` commits with no extra snapshot properties; the auto-compaction scheduler (see [Maintenance (auto-compaction)](../deployment/configuration.md#maintenance-auto-compaction)) calls this same handler internally and stamps `sqe.maintenance.job-id`/`principal`/`trigger` onto the snapshot it commits, so an autonomous compaction is attributable in the table's history while a manual one is not. |
 | `system.expire_snapshots` | `sqe-sql` + `sqe-coordinator` | `table => 'ns.t'` | `older_than => TIMESTAMP`, `retain_last => N` | Drops old snapshots. `older_than` and `retain_last` combine: a snapshot must be older than `older_than` and beyond the `retain_last` window before it is removed. |
 | `system.remove_orphan_files` | `sqe-sql` + `sqe-coordinator` | `table => 'ns.t'` | `older_than => TIMESTAMP` | Deletes files under the table prefix not referenced by any live snapshot. Default `older_than` is 3 days ago, to avoid racing with in-flight writes. |
 | `system.rewrite_manifests` | `sqe-sql` + `sqe-coordinator` | `table => 'ns.t'` | - | Consolidates many small manifest files into fewer larger ones. Speeds up planning on large tables. |
 | `system.suggest_bloom_filter_columns` | `sqe-sql` + `sqe-coordinator` | `table => 'ns.t'` | `history_limit => N` | SQE-specific. Walks the last N finished queries (default 1000), counts equality predicates per column, returns ranked suggestions for `write.parquet.bloom-filter-columns`. |
+| `system.table_health` | `sqe-sql` + `sqe-coordinator` | `table => 'ns.t'` | - | SQE-specific (auto-compaction maintenance subsystem, see [Maintenance (auto-compaction)](../deployment/configuration.md#maintenance-auto-compaction)). Read-only compaction-debt report: live/small file counts, avg/p50 file size, delete-file and delete-heavy counts, eligible bin-pack groups, estimated rewrite bytes, last compaction snapshot, and whether the table has opted into the maintenance scheduler. Never rewrites anything, and available regardless of `maintenance.mode`. |
 
 ## Comparison to other engines
 
@@ -114,6 +115,36 @@ therefore rewrites broadly, since one equality delete can apply to many files.
 The option is off by default and is a no-op under `strategy => 'sort'`, which
 already rewrites the whole partition.
 
+### Override the distribution mode for one call
+
+`distributed => 'auto'|'local'|'require'` overrides
+`[maintenance.distribution] mode` (see
+[Configuration](../deployment/configuration.md)) for this one `CALL`,
+without touching the coordinator's config file. `'require'` fails the
+call immediately if fewer than `min_workers` workers are currently
+healthy, rather than silently falling back to a coordinator-local
+rewrite:
+
+```sql
+CALL system.rewrite_data_files(
+    table => 'analytics.events',
+    distributed => 'require'
+);
+```
+
+`'local'` forces a coordinator-local rewrite even with a healthy fleet
+present, useful for a one-off run you want to keep off the workers (a
+small table, or a maintenance window where the fleet is busy with query
+traffic). Omitting `distributed` entirely uses the configured
+`[maintenance.distribution] mode`. See [Distributed
+compaction](../design-notes/distributed-compaction.md) for how a
+distributed call plans, dispatches, and commits.
+
+`max_concurrent_file_group_rewrites` only bounds concurrency on the
+coordinator-local path; a distributed rewrite is instead bounded by
+`[maintenance.distribution] max_inflight_groups_per_worker` (per-worker,
+not global), configured in [Configuration](../deployment/configuration.md).
+
 ### Force a full rewrite
 
 `rewrite_all => true` rewrites every data file, including files already at or
@@ -131,7 +162,37 @@ CALL system.rewrite_data_files(
 
 Because it re-encodes everything, it costs a full read and write of the table.
 It is off by default and subsumed by `strategy => 'sort'`, which already
-rewrites the whole partition.
+rewrites the whole partition. `rewrite_all` is supported on both the
+coordinator-local and distributed paths: it forces every file into the group
+plan and bypasses the `min_input_files` floor on either path.
+
+### Check compaction debt before deciding whether to run a rewrite
+
+`table_health` is read-only: it reuses the same file-collection and bin-pack
+logic `rewrite_data_files` uses to plan a rewrite, but never writes a file or
+commits a snapshot. It bypasses the write-privilege gate entirely, so a
+`SELECT`-only session can run it.
+
+```sql
+CALL system.table_health(table => 'analytics.events');
+```
+
+Returns one summary row:
+
+```text
++-----------------+-------------+----------------+----------------+--------------+---------------------+------------------+--------------------+-----------------------------+----------------------+
+| live_data_files | small_files | avg_file_bytes | p50_file_bytes | delete_files | delete_heavy_files  | eligible_groups  | est_rewrite_bytes  | last_compaction_snapshot_ms| maintenance_enabled  |
++-----------------+-------------+----------------+----------------+--------------+---------------------+------------------+--------------------+-----------------------------+----------------------+
+| 1842            | 611         | 41943040       | 33554432       | 96           | 12                  | 7                | 2248146944         | NULL                       | true                 |
++-----------------+-------------+----------------+----------------+--------------+---------------------+------------------+--------------------+-----------------------------+----------------------+
+```
+
+Column notes:
+
+- `small_files` counts live data files below `[maintenance.compaction].target_file_size_bytes` (default 512 MiB).
+- `eligible_groups` / `est_rewrite_bytes` report pure bin-pack debt: groups that meet `min_input_files` on file count alone. `delete_heavy_files` is a separate signal, files with at least `delete_file_threshold` delete files applying to them. A later `rewrite_data_files(delete_file_threshold => N)` call rewrites the union of both sets, so treat the two counts as additive, not `eligible_groups` already including delete-heavy files.
+- `last_compaction_snapshot_ms` is always `NULL`. Active-mode compactions do stamp `sqe.maintenance.job-id`/`principal`/`trigger` onto the snapshot they commit (see the `system.rewrite_data_files` note above), but `table_health` does not yet read that snapshot property back; check the table's snapshot history directly for compaction attribution until a later phase wires this column up.
+- `maintenance_enabled` reflects the `sqe.maintenance.enabled` table property, i.e. whether the advisory/active scheduler would even consider this table. It does not mean a rewrite ran: advisory mode never mutates, and active mode may still find no eligible compaction debt on a given tick.
 
 ### Drop snapshots older than 30 days, keeping the last 10
 
@@ -197,6 +258,7 @@ Procedures inherit the calling user's grants on the target table:
 - `system.rewrite_data_files`, `system.rewrite_manifests` need `MODIFY` (writes new files, commits a snapshot).
 - `system.expire_snapshots`, `system.remove_orphan_files` need `MODIFY` and `DROP` (alters retention, deletes files).
 - `system.suggest_bloom_filter_columns` is read-only against query history; `SELECT` on the table is enough.
+- `system.table_health` is read-only against the table's live metadata; `SELECT` on the table is enough. It bypasses the write-privilege gate entirely, unlike every other procedure in this table.
 
 A user without the right grant gets a clear "policy denied" error instead of a generic execution failure.
 

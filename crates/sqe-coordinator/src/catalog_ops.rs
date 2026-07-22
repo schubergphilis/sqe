@@ -1688,7 +1688,12 @@ fn is_table_not_found(err: &iceberg::Error) -> bool {
 }
 
 /// Check if an iceberg error indicates a namespace was not found.
-fn is_namespace_not_found(err: &iceberg::Error) -> bool {
+///
+/// `pub(crate)` so `maintenance_log::append_row` can reuse it: `table_exists`
+/// on a missing-namespace state table can surface as an error on some
+/// catalog backends rather than a clean `Ok(false)`, and that case is
+/// "state table absent" too (see maintenance_log.rs's best-effort skip).
+pub(crate) fn is_namespace_not_found(err: &iceberg::Error) -> bool {
     is_namespace_not_found_msg(&err.to_string().to_lowercase())
 }
 

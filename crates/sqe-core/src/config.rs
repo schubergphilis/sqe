@@ -45,6 +45,12 @@ pub struct SqeConfig {
     pub query_cache: QueryCacheConfig,
     #[serde(default)]
     pub query_history: QueryHistoryConfig,
+    /// Advisory / active auto-compaction maintenance subsystem (Phase 4a+).
+    /// Defaults to `mode = "off"`: the maintenance service principal is
+    /// never constructed and no scheduler task is spawned unless the
+    /// operator opts in. See [`MaintenanceConfig`].
+    #[serde(default)]
+    pub maintenance: MaintenanceConfig,
 }
 
 /// Controls adaptive sort stripping behavior.
@@ -3058,6 +3064,290 @@ impl Default for SessionConfig {
     }
 }
 
+/// Advisory / active auto-compaction maintenance subsystem config
+/// (Phase 4a: `[maintenance]`). Gates the entire subsystem: `mode = "off"`
+/// (the default) means the maintenance service principal is never
+/// constructed and no scheduler task is spawned. `mode` beyond `"off"`
+/// requires a `[maintenance.principal]` block (enforced in `validate()`);
+/// the maintenance principal is structurally never added to the
+/// interactive auth chain (`AuthConfig::providers`), only ever constructed
+/// from this dedicated block.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct MaintenanceConfig {
+    #[serde(default)]
+    pub mode: MaintenanceMode,
+    /// Dedicated service-principal credentials for the maintenance
+    /// scheduler. `None` (the default) means advisory/active mode cannot
+    /// run; see `validate()`. Never read by the interactive auth chain.
+    #[serde(default)]
+    pub principal: Option<MaintenancePrincipalConfig>,
+    #[serde(default)]
+    pub scheduler: MaintenanceSchedulerConfig,
+    #[serde(default)]
+    pub compaction: MaintenanceCompactionConfig,
+    #[serde(default)]
+    pub distribution: MaintenanceDistributionConfig,
+}
+
+/// Gate for the maintenance subsystem. `Off` (default) constructs no
+/// principal and spawns no scheduler task. `Advisory` reports compaction
+/// debt without mutating any table. `Active` runs real compaction jobs
+/// (Phase 4b+).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MaintenanceMode {
+    #[default]
+    Off,
+    Advisory,
+    Active,
+}
+
+/// Dedicated OAuth2/OIDC client_credentials (M2M) principal used solely by
+/// the maintenance scheduler. Modeled separately from `AuthProviderConfig`
+/// on purpose: this block is never consulted by `build_auth_chain`, so the
+/// interactive query path cannot accidentally authenticate as this
+/// principal.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MaintenancePrincipalConfig {
+    /// OAuth2 token endpoint for the client_credentials grant.
+    #[serde(default)]
+    pub token_endpoint: String,
+    #[serde(default)]
+    pub client_id: String,
+    /// OAuth2 client_secret. `SecretString` renders `<set>`/`<unset>` in
+    /// `Debug`, has no `Serialize` impl (so a config-dump path cannot
+    /// round-trip the raw value even by accident), and zeroizes on drop.
+    /// This principal authenticates a write-capable service identity, so
+    /// it gets the same treatment as every other credential in the config
+    /// (`auth.client_secret`, `coordinator.worker_secret`), not the lighter
+    /// `String`-plus-hand-redacted-Debug treatment used for HTTP-sink keys
+    /// like `OpenLineageConfig::api_key`.
+    #[serde(default)]
+    pub client_secret: SecretString,
+    /// Optional OAuth `scope` sent with the client_credentials grant
+    /// (e.g. a Polaris `PRINCIPAL_ROLE:...` scope).
+    #[serde(default)]
+    pub scope: Option<String>,
+    /// Audit display identity for events emitted by this principal.
+    #[serde(default)]
+    pub user_id: String,
+    #[serde(default)]
+    pub roles: Vec<String>,
+    /// Pre-emptively refresh the M2M token this many seconds before
+    /// expiry. Default: 60.
+    #[serde(default = "default_maintenance_refresh_skew_secs")]
+    pub refresh_skew_secs: u64,
+}
+
+impl Default for MaintenancePrincipalConfig {
+    fn default() -> Self {
+        Self {
+            token_endpoint: String::new(),
+            client_id: String::new(),
+            client_secret: SecretString::default(),
+            scope: None,
+            user_id: String::new(),
+            roles: Vec::new(),
+            refresh_skew_secs: default_maintenance_refresh_skew_secs(),
+        }
+    }
+}
+
+/// How the in-process maintenance scheduler loop is driven.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MaintenanceSchedulerConfig {
+    /// Run the scheduler tick loop in-process. `false` (default) suits
+    /// external-trigger deployments (e.g. a Kubernetes CronJob calling a
+    /// maintenance RPC/procedure instead).
+    #[serde(default)]
+    pub enabled: bool,
+    /// How often the scheduler loop wakes up to evaluate due tables
+    /// (seconds). Feeds `tokio::time::interval`, which panics on zero;
+    /// `validate()` rejects zero.
+    #[serde(default = "default_maintenance_tick_secs")]
+    pub tick_secs: u64,
+    /// Global default cron-style schedule for per-table jobs. Per-table
+    /// `sqe.maintenance.compaction.schedule` overrides this. Evaluated in
+    /// UTC, not the host's local timezone.
+    #[serde(default = "default_maintenance_schedule")]
+    pub schedule: String,
+    /// Deterministic per-table jitter window (seconds) so many tables due
+    /// at once do not all fire in the same tick.
+    #[serde(default = "default_maintenance_jitter_secs")]
+    pub jitter_secs: u64,
+    #[serde(default = "default_maintenance_max_concurrent_jobs")]
+    pub max_concurrent_jobs: usize,
+    /// Double-fire guard for multi-coordinator deployments. `catalog`
+    /// (default) claims a lease in the Iceberg state table; `none` runs
+    /// with no lease and requires `single_scheduler_acknowledged = true`;
+    /// `kubernetes` uses a K8s Lease object (later phase).
+    #[serde(default)]
+    pub lease: LeaseMode,
+    /// Lease TTL in seconds. Feeds `tokio::time::interval`-driven renewal;
+    /// `validate()` rejects zero.
+    #[serde(default = "default_maintenance_lease_ttl_secs")]
+    pub lease_ttl_secs: u64,
+    /// Fully-qualified Iceberg table (`ns.table`) that stores job history,
+    /// last-run state, and (later) the lease. Operator-created; the
+    /// scheduler degrades to warn-and-skip if it is absent.
+    #[serde(default = "default_maintenance_state_table")]
+    pub state_table: String,
+    /// Explicit operator opt-out of the lease when `enabled = true` and
+    /// `lease = "none"`. Required `true` in that combination; otherwise
+    /// `validate()` rejects the config (running an unleased scheduler
+    /// against more than one coordinator can double-fire compaction jobs).
+    #[serde(default)]
+    pub single_scheduler_acknowledged: bool,
+}
+
+impl Default for MaintenanceSchedulerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            tick_secs: default_maintenance_tick_secs(),
+            schedule: default_maintenance_schedule(),
+            jitter_secs: default_maintenance_jitter_secs(),
+            max_concurrent_jobs: default_maintenance_max_concurrent_jobs(),
+            lease: LeaseMode::default(),
+            lease_ttl_secs: default_maintenance_lease_ttl_secs(),
+            state_table: default_maintenance_state_table(),
+            single_scheduler_acknowledged: false,
+        }
+    }
+}
+
+/// Double-fire guard backend for the maintenance scheduler.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LeaseMode {
+    /// No lease. Requires `single_scheduler_acknowledged = true`.
+    None,
+    /// Claim a lease row in the `sqe_system.maintenance_log` Iceberg table
+    /// (default).
+    #[default]
+    Catalog,
+    /// Use a Kubernetes `Lease` object (later phase).
+    Kubernetes,
+}
+
+/// Compaction sizing/eligibility knobs shared by the advisory analyzer and
+/// (later) the active rewrite planner.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MaintenanceCompactionConfig {
+    /// Target output file size in bytes. Default: 512 MiB.
+    #[serde(default = "default_maintenance_target_file_size_bytes")]
+    pub target_file_size_bytes: u64,
+    #[serde(default = "default_maintenance_min_input_files")]
+    pub min_input_files: usize,
+    /// A file with at least this many associated position/equality delete
+    /// files is "delete-heavy" and eligible for rewrite even if its data
+    /// size alone would not warrant one.
+    #[serde(default = "default_maintenance_delete_file_threshold")]
+    pub delete_file_threshold: usize,
+    /// Rewrite strategy: `"binpack"` (default), `"sort"`, or `"zorder"`.
+    #[serde(default = "default_maintenance_strategy")]
+    pub strategy: String,
+}
+
+impl Default for MaintenanceCompactionConfig {
+    fn default() -> Self {
+        Self {
+            target_file_size_bytes: default_maintenance_target_file_size_bytes(),
+            min_input_files: default_maintenance_min_input_files(),
+            delete_file_threshold: default_maintenance_delete_file_threshold(),
+            strategy: default_maintenance_strategy(),
+        }
+    }
+}
+
+/// Adaptive execution knobs: run local when alone, fan out to the worker
+/// fleet when present.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MaintenanceDistributionConfig {
+    /// `"auto"` (default): coordinator-local when no fleet is present,
+    /// fans out to workers when one is. `"local"` forces coordinator-only
+    /// execution. `"require"` fails a job rather than run it locally.
+    #[serde(default)]
+    pub mode: DistributionMode,
+    #[serde(default = "default_maintenance_min_workers")]
+    pub min_workers: usize,
+    #[serde(default = "default_maintenance_max_inflight_groups_per_worker")]
+    pub max_inflight_groups_per_worker: usize,
+    #[serde(default = "default_maintenance_group_attempts")]
+    pub group_attempts: usize,
+    /// Wall-clock bound on ONE `compact_file_group` dispatch attempt, from
+    /// the moment the coordinator calls `do_action` to the moment it
+    /// receives that group's terminal `Done` frame. This is the real
+    /// end-to-end bound on a group: the worker computes the whole rewrite
+    /// (read, delete-apply, re-encode) before it emits ANY frame, so nothing
+    /// about a hung or slow-but-silent worker is visible until either this
+    /// timeout fires or the worker finally responds. Size it for the
+    /// slowest group you expect to dispatch, not for "how often should I
+    /// expect a heartbeat" -- see `group_heartbeat_timeout_secs` below for
+    /// why that is a different, narrower question.
+    #[serde(default = "default_maintenance_group_timeout_secs")]
+    pub group_timeout_secs: u64,
+    /// Wall-clock bound between frames ONCE a worker has started responding
+    /// to a dispatched group (i.e. after its first `Progress` heartbeat).
+    /// This does NOT bound how long the worker's compute phase itself can
+    /// run before it emits that first frame -- Task 3's worker action
+    /// computes the entire group (scan, delete-apply, re-encode) before it
+    /// streams anything back, so a worker wedged mid-compute produces no
+    /// frames at all and is caught only by `group_timeout_secs` above, not
+    /// by this field. `group_heartbeat_timeout_secs` only detects a worker
+    /// that responded, then went silent -- e.g. a connection that started
+    /// streaming and then stalled. True incremental progress reporting
+    /// (so this field could bound compute-phase hangs too) is a tracked
+    /// follow-up, not implemented here.
+    #[serde(default = "default_maintenance_group_heartbeat_timeout_secs")]
+    pub group_heartbeat_timeout_secs: u64,
+}
+
+impl Default for MaintenanceDistributionConfig {
+    fn default() -> Self {
+        Self {
+            mode: DistributionMode::default(),
+            min_workers: default_maintenance_min_workers(),
+            max_inflight_groups_per_worker: default_maintenance_max_inflight_groups_per_worker(),
+            group_attempts: default_maintenance_group_attempts(),
+            group_timeout_secs: default_maintenance_group_timeout_secs(),
+            group_heartbeat_timeout_secs: default_maintenance_group_heartbeat_timeout_secs(),
+        }
+    }
+}
+
+/// How a maintenance rewrite job picks between coordinator-local execution
+/// and fanning groups out to the worker fleet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DistributionMode {
+    /// Coordinator-local when no fleet is present, fans out when one is
+    /// (default).
+    #[default]
+    Auto,
+    /// Always run coordinator-local, even with a fleet present.
+    Local,
+    /// Always fan out; fail the job rather than run it locally.
+    Require,
+}
+
+fn default_maintenance_refresh_skew_secs() -> u64 { 60 }
+fn default_maintenance_tick_secs() -> u64 { 60 }
+fn default_maintenance_schedule() -> String { "0 2 * * *".to_string() }
+fn default_maintenance_jitter_secs() -> u64 { 900 }
+fn default_maintenance_max_concurrent_jobs() -> usize { 1 }
+fn default_maintenance_lease_ttl_secs() -> u64 { 300 }
+fn default_maintenance_state_table() -> String { "sqe_system.maintenance_log".to_string() }
+fn default_maintenance_target_file_size_bytes() -> u64 { 512 * 1024 * 1024 }
+fn default_maintenance_min_input_files() -> usize { 5 }
+fn default_maintenance_delete_file_threshold() -> usize { 2 }
+fn default_maintenance_strategy() -> String { "binpack".to_string() }
+fn default_maintenance_min_workers() -> usize { 2 }
+fn default_maintenance_max_inflight_groups_per_worker() -> usize { 1 }
+fn default_maintenance_group_attempts() -> usize { 2 }
+fn default_maintenance_group_timeout_secs() -> u64 { 3600 }
+fn default_maintenance_group_heartbeat_timeout_secs() -> u64 { 120 }
+
 fn default_idle_timeout() -> u64 { 900 }       // 15 minutes
 fn default_absolute_timeout() -> u64 { 28800 }  // 8 hours
 fn default_session_persistence() -> String { "memory".to_string() }
@@ -3416,6 +3706,90 @@ impl SqeConfig {
         }
         if !(0.0..=1.0).contains(&self.metrics.trace_sample_rate) {
             errors.push("metrics.trace_sample_rate must be between 0.0 and 1.0".to_string());
+        }
+
+        // Maintenance / auto-compaction (Phase 4a+): advisory and active
+        // modes authenticate the scheduler via a dedicated service
+        // principal, never the interactive auth chain. Reject the misconfig
+        // where a mode beyond "off" is requested without a principal block:
+        // the scheduler would have nothing to authenticate with.
+        if self.maintenance.mode != MaintenanceMode::Off && self.maintenance.principal.is_none() {
+            errors.push(
+                "maintenance.mode is not \"off\" but [maintenance.principal] is not set; \
+                 advisory/active mode requires a dedicated service principal to \
+                 authenticate the scheduler"
+                    .to_string(),
+            );
+        }
+
+        // tokio::time::interval panics if the period is zero.
+        if self.maintenance.scheduler.tick_secs == 0 {
+            errors.push(
+                "maintenance.scheduler.tick_secs must be > 0 (tokio::time::interval rejects zero periods)".to_string(),
+            );
+        }
+        if self.maintenance.scheduler.lease_ttl_secs == 0 {
+            errors.push(
+                "maintenance.scheduler.lease_ttl_secs must be > 0 (tokio::time::interval rejects zero periods)".to_string(),
+            );
+        }
+
+        // An in-process scheduler running with no lease and no explicit
+        // operator acknowledgment risks two coordinators both compacting
+        // the same table concurrently. Require an explicit opt-in.
+        if self.maintenance.scheduler.enabled
+            && self.maintenance.scheduler.lease == LeaseMode::None
+            && !self.maintenance.scheduler.single_scheduler_acknowledged
+        {
+            errors.push(
+                "maintenance.scheduler.enabled is true with lease = \"none\" but \
+                 single_scheduler_acknowledged is false; running the in-process scheduler \
+                 with no lease against more than one coordinator can double-fire compaction \
+                 jobs. Set single_scheduler_acknowledged = true to opt in (single-coordinator \
+                 deployments only), or set lease = \"catalog\"."
+                    .to_string(),
+            );
+        }
+
+        // Phase 4d Task 3: `lease = "kubernetes"` (a K8s Lease object backend)
+        // is out of scope for this phase -- only the catalog-native lease
+        // (Task 2) is wired into the scheduler. Reject it loudly at startup
+        // rather than silently falling back to some other behavior; an
+        // operator who wants HA today should use `lease = "catalog"`
+        // (the default).
+        if self.maintenance.scheduler.enabled
+            && self.maintenance.scheduler.lease == LeaseMode::Kubernetes
+        {
+            errors.push(
+                "maintenance.scheduler.lease = \"kubernetes\" is not implemented yet (Phase 4d \
+                 only wires the catalog-native lease); set lease = \"catalog\" (default, works \
+                 for multi-coordinator HA today) or lease = \"none\" with \
+                 single_scheduler_acknowledged = true (single-coordinator deployments only)."
+                    .to_string(),
+            );
+        }
+
+        // Best-effort warning (not a hard error): a maintenance principal
+        // sharing a client_id with an interactive auth provider makes audit
+        // trails ambiguous about which identity acted. The maintenance
+        // provider is never added to the auth chain (build_auth_chain is
+        // untouched); this only flags an operator naming collision.
+        if let Some(principal) = &self.maintenance.principal {
+            let shares_client_id = (!self.auth.client_id.is_empty()
+                && self.auth.client_id == principal.client_id)
+                || self
+                    .auth
+                    .providers
+                    .iter()
+                    .any(|p| maintenance_provider_client_id(p) == Some(principal.client_id.as_str()));
+            if shares_client_id && !principal.client_id.is_empty() {
+                tracing::warn!(
+                    client_id = %principal.client_id,
+                    "maintenance.principal.client_id matches a configured auth provider \
+                     client_id; audit trails may conflate the maintenance principal with an \
+                     interactive client"
+                );
+            }
         }
 
         validate_urls(self, &mut errors);
@@ -3951,6 +4325,19 @@ fn validate_byte_sizes(config: &SqeConfig, errors: &mut Vec<String>) {
     check("storage.prefetch_buffer", &config.storage.prefetch_buffer);
 }
 
+/// Extract the OAuth2 `client_id` from an `AuthProviderConfig` variant that
+/// carries one. Used only for the best-effort maintenance-principal /
+/// interactive-provider collision warning in `validate()`; variants with no
+/// notion of `client_id` (bearer/mTLS/anonymous/passthrough) return `None`.
+fn maintenance_provider_client_id(provider: &AuthProviderConfig) -> Option<&str> {
+    match provider {
+        AuthProviderConfig::OidcPassword { client_id, .. }
+        | AuthProviderConfig::ClientCredentials { client_id, .. }
+        | AuthProviderConfig::TokenExchange { client_id, .. } => Some(client_id.as_str()),
+        _ => None,
+    }
+}
+
 /// Validate every URL-shaped string in the config. Empty values are
 /// skipped (they're either optional or caught by required-field checks
 /// elsewhere). Each failure produces a precise field-name error so the
@@ -4277,6 +4664,205 @@ mod tests {
         assert_eq!(config.heartbeat_interval_secs, 5);
     }
 
+    // Phase 4a `[maintenance]` config section. Note: unlike the brief's
+    // sketch, `toml::from_str("")` does not parse into a full `SqeConfig`
+    // (coordinator/auth/catalog are required top-level keys with no
+    // `#[serde(default)]`), so the parse-based tests below include a
+    // minimal-but-required TOML skeleton rather than an empty string.
+
+    #[test]
+    fn maintenance_defaults_to_off_when_absent() {
+        let toml = r#"
+[coordinator]
+[auth]
+[catalog]
+catalog_url = ""
+"#;
+        let cfg: SqeConfig =
+            toml::from_str(toml).expect("minimal config with no [maintenance] section parses");
+        assert_eq!(cfg.maintenance.mode, MaintenanceMode::Off);
+        assert!(cfg.maintenance.principal.is_none());
+    }
+
+    #[test]
+    fn maintenance_full_block_parses() {
+        let toml = r#"
+[coordinator]
+[auth]
+[catalog]
+catalog_url = ""
+
+[maintenance]
+mode = "advisory"
+
+[maintenance.principal]
+token_endpoint = "https://idp.example.com/realms/sqe/protocol/openid-connect/token"
+client_id = "sqe-maintenance"
+client_secret = "shh"
+scope = "PRINCIPAL_ROLE:sqe_maintenance"
+user_id = "svc-sqe-maintenance"
+roles = ["maintenance"]
+refresh_skew_secs = 45
+
+[maintenance.scheduler]
+enabled = true
+tick_secs = 30
+schedule = "0 3 * * *"
+jitter_secs = 300
+max_concurrent_jobs = 2
+lease = "catalog"
+lease_ttl_secs = 120
+state_table = "sqe_system.maintenance_log"
+single_scheduler_acknowledged = false
+
+[maintenance.compaction]
+target_file_size_bytes = 268435456
+min_input_files = 3
+delete_file_threshold = 1
+strategy = "sort"
+
+[maintenance.distribution]
+mode = "local"
+min_workers = 1
+max_inflight_groups_per_worker = 2
+group_attempts = 3
+group_timeout_secs = 1800
+group_heartbeat_timeout_secs = 60
+"#;
+        let cfg: SqeConfig = toml::from_str(toml).expect("full [maintenance] block parses");
+        assert_eq!(cfg.maintenance.mode, MaintenanceMode::Advisory);
+
+        let principal = cfg.maintenance.principal.expect("principal block present");
+        assert_eq!(principal.client_id, "sqe-maintenance");
+        assert_eq!(principal.user_id, "svc-sqe-maintenance");
+        assert_eq!(principal.roles, vec!["maintenance".to_string()]);
+        assert_eq!(principal.refresh_skew_secs, 45);
+        assert_eq!(principal.scope, Some("PRINCIPAL_ROLE:sqe_maintenance".to_string()));
+
+        let sched = &cfg.maintenance.scheduler;
+        assert!(sched.enabled);
+        assert_eq!(sched.tick_secs, 30);
+        assert_eq!(sched.lease, LeaseMode::Catalog);
+        assert_eq!(sched.lease_ttl_secs, 120);
+
+        let compaction = &cfg.maintenance.compaction;
+        assert_eq!(compaction.target_file_size_bytes, 268_435_456);
+        assert_eq!(compaction.min_input_files, 3);
+        assert_eq!(compaction.delete_file_threshold, 1);
+        assert_eq!(compaction.strategy, "sort");
+
+        let dist = &cfg.maintenance.distribution;
+        assert_eq!(dist.mode, DistributionMode::Local);
+        assert_eq!(dist.min_workers, 1);
+        assert_eq!(dist.max_inflight_groups_per_worker, 2);
+        assert_eq!(dist.group_attempts, 3);
+        assert_eq!(dist.group_timeout_secs, 1800);
+        assert_eq!(dist.group_heartbeat_timeout_secs, 60);
+    }
+
+    #[test]
+    fn maintenance_scheduler_defaults_match_design() {
+        let d = MaintenanceSchedulerConfig::default();
+        assert!(!d.enabled);
+        assert_eq!(d.tick_secs, 60);
+        assert_eq!(d.schedule, "0 2 * * *");
+        assert_eq!(d.jitter_secs, 900);
+        assert_eq!(d.max_concurrent_jobs, 1);
+        assert_eq!(d.lease, LeaseMode::Catalog);
+        assert_eq!(d.lease_ttl_secs, 300);
+        assert_eq!(d.state_table, "sqe_system.maintenance_log");
+        assert!(!d.single_scheduler_acknowledged);
+    }
+
+    #[test]
+    fn maintenance_compaction_and_distribution_defaults_match_design() {
+        let c = MaintenanceCompactionConfig::default();
+        assert_eq!(c.target_file_size_bytes, 512 * 1024 * 1024);
+        assert_eq!(c.min_input_files, 5);
+        assert_eq!(c.delete_file_threshold, 2);
+        assert_eq!(c.strategy, "binpack");
+
+        let d = MaintenanceDistributionConfig::default();
+        assert_eq!(d.mode, DistributionMode::Auto);
+        assert_eq!(d.min_workers, 2);
+        assert_eq!(d.max_inflight_groups_per_worker, 1);
+        assert_eq!(d.group_attempts, 2);
+        assert_eq!(d.group_timeout_secs, 3600);
+        assert_eq!(d.group_heartbeat_timeout_secs, 120);
+    }
+
+    #[test]
+    fn maintenance_active_without_principal_is_rejected() {
+        let mut config = valid_config();
+        config.maintenance.mode = MaintenanceMode::Advisory;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("maintenance.principal"),
+            "advisory/active mode needs a principal block, got: {err}"
+        );
+    }
+
+    #[test]
+    fn maintenance_zero_tick_rejected() {
+        let mut config = valid_config();
+        config.maintenance.scheduler.tick_secs = 0;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("tick_secs"), "got: {err}");
+    }
+
+    #[test]
+    fn maintenance_zero_lease_ttl_rejected() {
+        let mut config = valid_config();
+        config.maintenance.scheduler.lease_ttl_secs = 0;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("lease_ttl_secs"), "got: {err}");
+    }
+
+    #[test]
+    fn maintenance_scheduler_enabled_without_lease_requires_ack() {
+        let mut config = valid_config();
+        config.maintenance.scheduler.enabled = true;
+        config.maintenance.scheduler.lease = LeaseMode::None;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("single_scheduler_acknowledged"), "got: {err}");
+
+        config.maintenance.scheduler.single_scheduler_acknowledged = true;
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn maintenance_scheduler_enabled_with_kubernetes_lease_is_rejected() {
+        // Phase 4d Task 3: `lease = "kubernetes"` is out of scope (only the
+        // catalog-native lease is wired into the scheduler); an enabled
+        // scheduler must not silently start with a backend that does not
+        // exist.
+        let mut config = valid_config();
+        config.maintenance.scheduler.enabled = true;
+        config.maintenance.scheduler.lease = LeaseMode::Kubernetes;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("kubernetes") && err.contains("not implemented"), "got: {err}");
+
+        // Disabled scheduler: the lease backend never matters (no tick loop
+        // ever runs), so `kubernetes` is not rejected in that case.
+        config.maintenance.scheduler.enabled = false;
+        assert!(config.validate().is_ok());
+
+        // The default lease (Catalog) and an explicit opt-in None must both
+        // still validate fine with the scheduler enabled.
+        config.maintenance.scheduler.enabled = true;
+        config.maintenance.scheduler.lease = LeaseMode::Catalog;
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn maintenance_off_mode_passes_validation_without_principal() {
+        // Default mode ("off") never requires a principal block.
+        let config = valid_config();
+        assert_eq!(config.maintenance.mode, MaintenanceMode::Off);
+        assert!(config.maintenance.principal.is_none());
+        assert!(config.validate().is_ok());
+    }
+
     /// Helper to build a valid config for validation tests.
     fn valid_config() -> SqeConfig {
         SqeConfig {
@@ -4353,6 +4939,7 @@ mod tests {
             query: QueryConfig::default(),
             query_cache: QueryCacheConfig::default(),
             query_history: QueryHistoryConfig::default(),
+            maintenance: MaintenanceConfig::default(),
         }
     }
 

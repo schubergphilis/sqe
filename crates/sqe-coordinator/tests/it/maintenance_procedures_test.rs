@@ -91,6 +91,26 @@ fn set_current_snapshot_classifies_with_snapshot_id() {
 }
 
 #[test]
+fn table_health_classifies_as_procedure() {
+    // Read-only compaction-debt report (Phase 4a, task 3). Must classify
+    // exactly like `suggest_bloom_filter_columns`: a plain `Procedure`, with
+    // no write-classification path anywhere in the parser/classifier layer.
+    let result = parse_and_classify("CALL system.table_health(table => 'ns.t')")
+        .expect("parse ok");
+    match result {
+        StatementKind::Procedure(p) => {
+            match *p {
+                ProcedureCall::TableHealth { table } => {
+                    assert_eq!(table.as_string(), "ns.t");
+                }
+                other => panic!("expected TableHealth, got {other:?}"),
+            }
+        }
+        other => panic!("expected Procedure, got {other:?}"),
+    }
+}
+
+#[test]
 fn unknown_procedure_falls_through_to_call_error() {
     let result = parse_and_classify("CALL system.not_a_real_procedure(table => 'ns.t')")
         .expect("parse ok");

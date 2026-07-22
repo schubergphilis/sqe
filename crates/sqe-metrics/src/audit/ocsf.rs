@@ -79,7 +79,9 @@ fn class_for(kind: &AuditKind) -> (u32, u32) {
         AuditKind::Auth => (3002, 3),
         AuditKind::Session => (3003, 3),
         AuditKind::Grant => (3001, 3),
-        AuditKind::AdminDdl => (3004, 3),
+        // Maintenance shares AdminDdl's class: both are system/operational
+        // change activity rather than a user query or interactive session.
+        AuditKind::AdminDdl | AuditKind::Maintenance => (3004, 3),
     }
 }
 
