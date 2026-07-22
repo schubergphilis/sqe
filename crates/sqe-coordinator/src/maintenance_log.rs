@@ -32,6 +32,22 @@
 //! values `maintenance_lease` uses, so the operator's `CREATE TABLE` DDL is
 //! unchanged.
 //!
+//! **Reader warning:** `sqe_system.maintenance_log` therefore holds TWO kinds
+//! of row that look identical to a naive scan -- real job history
+//! (`trigger` in `"scheduled"`/`"scheduler"`, appended by [`append_row`]) and
+//! lease bookkeeping (`trigger = "lease"`, appended/updated by
+//! `maintenance_lease.rs`'s claim/renew/release/steal). Nothing in this
+//! module or `maintenance_lease.rs` reads the table back for reporting
+//! today, so this has never mattered in practice -- but ANY future
+//! read-back consumer (a `SHOW MAINTENANCE HISTORY`-style surface, a
+//! last-run-per-table dedupe query, a debt/health dashboard, etc.) MUST
+//! filter `trigger <> 'lease'` before treating a row as compaction job
+//! history, or it will misreport lease claim/release churn as compaction
+//! runs (inflated job counts, bogus `files_in`/`files_out`/`bytes_*`
+//! entries -- lease rows zero those fields but a naive `SUM`/`COUNT` still
+//! counts the row). See `maintenance_lease.rs`'s `LEASE_TRIGGER` constant
+//! for the exact sentinel value to exclude.
+//!
 //! # Fixed row schema
 //!
 //! [`row_to_record_batch`] builds a single-row Arrow `RecordBatch` whose
@@ -121,6 +137,14 @@ pub const DEFAULT_MAINTENANCE_LOG_TABLE: &str = "sqe_system.maintenance_log";
 /// to. Count fields are `i64` (not `u64`): Iceberg's `long` type is signed,
 /// and there is no unsigned Arrow integer type this table's schema could
 /// declare from SQL.
+///
+/// WARNING for future read-back consumers: a `MaintenanceLogRow` you build
+/// here is always real job history, but the underlying Iceberg table also
+/// carries `maintenance_lease.rs`'s lease bookkeeping rows (`trigger =
+/// "lease"`). Any code that reads `sqe_system.maintenance_log` BACK (a
+/// `SHOW`-style surface, last-run-per-table dedupe, a history/debt report)
+/// must filter `trigger <> 'lease'` first -- see the module doc's "Reader
+/// warning" for why a naive scan misreports lease churn as compaction runs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MaintenanceLogRow {
     /// Unique ID for this job/analysis run.
