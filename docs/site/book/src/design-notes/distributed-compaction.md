@@ -7,8 +7,8 @@ coordinator.
 
 See [Configuration](../deployment/configuration.md) for the
 `[maintenance.distribution]` config block (`mode`, `min_workers`,
-timeouts) and [CALL procedures](../sql-reference/procedures.md) for the
-per-call `distributed => 'auto'|'local'|'require'` override.
+timeouts, `partial_progress`) and [CALL procedures](../sql-reference/procedures.md)
+for the per-call `distributed => 'auto'|'local'|'require'` override.
 
 ## Summary
 
@@ -150,24 +150,180 @@ of the fleet for every other job. A group that has failed on every
 currently-healthy worker, or has exhausted every attempt, fails the whole
 job.
 
+## Continuous dispatch pipelining
+
+Dispatch keeps every healthy worker filled up to
+`max_inflight_groups_per_worker` at all times. As soon as any in-flight
+group resolves, whether it succeeds or needs a retry attempt on a
+different worker, the freed slot is refilled immediately from the pending
+queue instead of waiting for every other group in the same wave to finish
+first. Earlier dispatch ran in waves: compute a batch of assignments,
+spawn all of them, wait for the whole batch to drain, then compute the
+next one, so a worker that finished its one group early sat idle until
+every sibling group in that wave also finished. The pure refill decision
+(`next_group_assignment` in `sqe_compaction::dispatch`) is unit-tested for
+largest-group-first priority, cap enforcement, exclusion-set fallthrough,
+no double-assignment, and no assignment once every worker is saturated.
+
+Pipelining changes only scheduling. Per-group retry on a different worker
+(`group_attempts`), the transport-vs-application failure classification,
+the stall guard, and the aggregate-then-commit step described above are
+unchanged: pipelining decides which worker gets the next group and when,
+not what happens once a group's output comes back. A job compacting a
+given set of groups produces the same committed files whether dispatch
+ran the old wave-based scheduler or the new continuous one; only the
+wall-clock time to get there changes, because a fast worker no longer
+waits on a slow sibling in the same wave before picking up its next group.
+
+## Live progress and the heartbeat timeout
+
+Before this change, a worker's `compact_file_group` action computed an
+entire group, the delete-applying read, optional sort, and rolling
+write, before it emitted anything at all: `Progress` and `Done` arrived
+back-to-back once the whole rewrite had already finished. Under that
+scheme `group_heartbeat_timeout_secs` only ever bounded the wait for a
+frame once the worker had already produced its first one; a worker
+wedged mid-compute produced no frames at all and was only caught by the
+much coarser `group_timeout_secs`, the end-to-end bound on the whole
+dispatch attempt (default 3600s).
+
+Workers now emit a `Progress` frame every `PROGRESS_INTERVAL_BATCHES`
+record batches (a fixed internal constant, currently 8) processed during
+the write loop, across every write path: plain rewrite, sort, and
+z-order. The coordinator's per-frame wait, `group_heartbeat_timeout_secs`,
+resets on every frame it receives, so a fresh frame arrives well inside
+that window as long as the worker keeps making forward progress.
+`group_heartbeat_timeout_secs` is therefore a meaningful mid-compute
+liveness bound now, not just a frame-delivery one: a worker that stalls
+partway through, a wedged read or a hung write, stops producing frames
+and is caught here. Its group is retried on a different healthy worker,
+exactly like any other retryable dispatch failure, up to `group_attempts`.
+
+`PROGRESS_INTERVAL_BATCHES` is not an operator-facing knob; the only
+tuning surface is `group_heartbeat_timeout_secs` itself, sized to
+however long an operator is willing to wait between progress signals
+before treating a worker as stalled. Output is unchanged: only frames
+were added to the wire protocol, and the data files a worker writes are
+identical to before.
+
 ## Commit-conflict retries and orphaned worker output
 
 A concurrent writer that commits between the coordinator's read and its
 `RewriteFilesAction` commit produces a retryable conflict, exactly like
-the local (non-distributed) rewrite path. On that retry the coordinator
-re-plans the job from scratch (fresh snapshot, fresh groups) and
-re-dispatches every group again, rather than trying to patch the stale
-attempt against the new snapshot.
+the local (non-distributed) rewrite path. When that conflict actually
+surfaces as an `Err`, the coordinator re-plans the job from scratch
+(fresh snapshot, fresh groups) and re-dispatches every group again, rather
+than trying to patch the stale attempt against the new snapshot.
+
+That last sentence has a load-bearing qualifier: **when it surfaces as an
+`Err`.** The vendored `iceberg::transaction::Transaction::commit`
+(`vendor/iceberg-rust/crates/iceberg/src/transaction/mod.rs`, `do_commit`)
+silently reloads the table and REPLAYS the same `RewriteFilesAction`
+unchanged whenever it detects its base is stale, and only returns an `Err`
+to the coordinator once its own internal commit-retry budget
+(`commit.retry.*` table properties) is exhausted. A single, one-shot
+concurrent writer is absorbed entirely inside that call -- the coordinator
+never sees an `Err` for it, so the "re-plan from scratch" retry described
+above never runs. `RewriteFilesAction` has no equivalent of upstream
+Iceberg's `validateNoNewDeletesForDataFiles` check, so if that one
+concurrent writer landed a position delete on one of the files this job
+is compacting, the silently-replayed commit can still resurrect the
+deleted rows -- see the "Partial-progress commits" section below for how
+`partial_progress` batches guard against this specifically, and note that
+the DEFAULT (non-batched) path is exposed to the identical window, closing
+it only requires the missing vendor-side validation.
 
 The prior attempt's workers may already have written Parquet files to
-S3 before the conflict was detected. Those files are never referenced by
-any commit, the retry produced an entirely new set of output files, so
-they become orphans. That is an accepted trade-off, not a bug: reclaiming
-them is `CALL system.remove_orphan_files`'s job, on its normal
-age-thresholded sweep, the same mechanism that already reclaims orphaned
-output from other failure paths. Correctness comes from never committing
-a stale plan; cleanup of writes that turned out to be unneeded is a
-separate, deliberately decoupled concern.
+S3 before a conflict was detected (whether that conflict surfaced to the
+coordinator or was absorbed internally by `Transaction::commit`). Any
+files an actual re-plan produced but did not end up committing are never
+referenced by any commit, so they become orphans. That is an accepted
+trade-off, not a bug: reclaiming them is `CALL system.remove_orphan_files`'s
+job, on its normal age-thresholded sweep, the same mechanism that already
+reclaims orphaned output from other failure paths. Correctness comes from
+never committing a stale plan; cleanup of writes that turned out to be
+unneeded is a separate, deliberately decoupled concern.
+
+## Partial-progress commits (opt-in)
+
+`[maintenance.distribution] partial_progress` (default `false`) lets a
+distributed rewrite commit its successful groups in batches instead of
+holding everything until the whole job finishes. Off, the job behaves
+exactly as before: `commit_eligible_groups` treats every eligible group as
+a single batch, so a terminal failure anywhere still commits nothing.
+
+On, eligible groups are chunked into batches of `partial_progress_batch`
+(default 10), and each batch commits as its own
+`Transaction::rewrite_files()`, in the identical sequence the
+single-commit path already uses: the sequence number pinned once at plan
+time (`seq_at_start`), never advanced between batches, the same
+`set_check_file_existence(true)` gate, the same snapshot-property stamp,
+and the same added-rows-not-exceeding-removed-rows invariant, checked
+over just that batch's own files.
+
+Correctness does not depend on batching being disjoint by luck.
+`eligible_groups` partitions every input data file into exactly one group
+up front, and batching only chunks that partition further, so no data
+file, and no position-delete file (each has exactly one
+`referenced_data_file`), ever appears in two batches. After batch K
+commits, batch K+1's input files are still exactly where they were:
+`check_file_existence` on K+1's commit finds them, unless a concurrent
+external writer removed one, exactly the same conflict it already catches
+on the non-batched path. Pinning every batch to the same `seq_at_start`,
+rather than to whichever snapshot each batch actually lands on, keeps a
+concurrent equality delete from dodging a later batch's rewritten rows.
+
+That handles equality deletes. Position deletes need a second guard,
+because pinning `seq_at_start` does nothing for them: a position delete
+matches by `(file_path, position)`, not by sequence number, and once a
+batch's input file is replaced by its compacted output the position
+delete's path matches nothing at all. If a concurrent writer lands a
+position delete on one of THIS batch's own input files after the batch's
+worker output was produced but before it commits, that output does not
+reflect the delete -- and, per the previous section, `Transaction::commit`
+can silently replay that stale output rather than surfacing a catchable
+`Err`. So for every batch after the first (`committed_batches > 0`), the
+coordinator does not simply wait for a retryable `Err`: **before every
+commit attempt** it reloads the table and checks whether any position
+delete now references one of this batch's own input files that it did not
+already know about. If so, it re-dispatches the same groups against the
+reloaded snapshot -- so the worker output actually reflects the delete --
+before ever attempting to commit, instead of committing what it already
+has. This closes the realistic single-race window for batches after the
+first. A sub-millisecond gap remains between the coordinator's own reload
+and `Transaction::commit`'s internal one (a delete landing in exactly that
+gap); closing it needs the missing vendor-side
+`validateNoNewDeletesForDataFiles`-equivalent check, which is out of scope
+here. The first batch shares that same residual, unclosed window -- see
+the caveat in the previous section.
+
+A retryable commit conflict that the pre-commit check above did not
+already preempt -- an unrelated concurrent writer, or `Transaction::
+commit`'s own internal retry budget exhausted by sustained contention --
+is still retried for any batch after the first: the coordinator reloads
+the table and RE-DISPATCHES the same groups against the reload before
+recommitting, up to the same retry budget the outer job-level retry uses.
+It does not recommit the prior attempt's worker output unchanged (an
+earlier version of this logic did, which is what let the position-delete
+race above resurrect rows in the first place). The first batch's failure
+is not retried at this inner layer at all; it bubbles up for the outer
+`rewrite_data_files_distributed` loop to handle by re-planning and
+re-dispatching the whole job, exactly as it did before `partial_progress`
+existed -- with the same "may be silently absorbed by `Transaction::commit`
+first" caveat from the previous section. Only a batch failure that is not
+retryable, or one whose retries are exhausted, after at least one batch
+has already committed, is terminal: the already-committed batches are
+never rolled back, and the job reports `status = "partial"` in
+`sqe_system.maintenance_log` with the partial byte/file/row counts and the
+error that ended it, instead of failing the job outright.
+
+`partial_progress` trades a larger commit-conflict surface, N commits
+instead of one, each independently racing concurrent writers, for
+incremental durability on very large tables, where losing an entire
+multi-hour job to one late group failure is expensive. It is opt-in for
+that reason: the default keeps the simpler, fully atomic guarantee, the
+whole job commits or none of it does, for tables where a single
+conflict-driven re-plan is cheap enough to just re-run.
 
 ## Multi-coordinator HA: the lease is an efficiency layer, not a correctness mechanism
 

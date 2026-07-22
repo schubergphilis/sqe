@@ -36,8 +36,21 @@ use iceberg::table::{StaticTable, Table as IcebergTable};
 use iceberg::TableIdent;
 use sqe_compaction::wire::{CompactGroupRequest, CompactGroupResponse, S3Conn};
 use sqe_compaction::writer::{new_upload_tracker, parse_parquet_compression};
-use sqe_compaction::{collect_live_delete_files, plan_delete_aware_read, rewrite_group, SortCtx};
+use sqe_compaction::{
+    collect_live_delete_files, plan_delete_aware_read, rewrite_group, ProgressReporter, SortCtx,
+};
 use sqe_core::{Result as SqeResult, SqeError};
+
+/// How many record batches the worker rewrite loop processes between
+/// `CompactGroupFrame::Progress` frames. Chosen small enough that a hang on
+/// any single batch (deletes-applying decode, or a rolling-writer flush) is
+/// bounded well under the coordinator's `group_heartbeat_timeout` (default
+/// on the order of tens of seconds), without spamming a frame per single
+/// (often small) Arrow batch. Not currently operator-configurable: the
+/// coordinator's heartbeat timeout is the tunable knob for how much slack a
+/// deployment wants; this interval only needs to be "frequent enough" under
+/// any reasonable heartbeat_timeout.
+const PROGRESS_INTERVAL_BATCHES: usize = 8;
 
 /// Build a catalog-free `FileIO` from a [`S3Conn`]. Mirrors the S3 property
 /// names the coordinator's per-session `RestCatalog` already injects for
@@ -163,6 +176,7 @@ async fn compact_pinned_table(
     session_ctx: &SessionContext,
     table: IcebergTable,
     request: &CompactGroupRequest,
+    progress_tx: Option<tokio::sync::mpsc::UnboundedSender<u64>>,
 ) -> SqeResult<CompactGroupResponse> {
     // Snapshot pin assertion. The coordinator planned this group's file list
     // and delete accounting against a specific snapshot; if the table has
@@ -202,6 +216,27 @@ async fn compact_pinned_table(
     let compression = parse_parquet_compression(&request.compression);
     let tracker = new_upload_tracker();
 
+    // Wrap the caller's progress channel (if any) in a `ProgressReporter` so
+    // the streaming writer only has to call `on_batch` unconditionally; the
+    // interval throttling lives here, not in the writer loop. `do_action`
+    // (flight_service.rs) forwards every value received on `progress_tx` as
+    // a `CompactGroupFrame::Progress` frame as soon as it arrives, so the
+    // coordinator's `group_heartbeat_timeout` -- which rearms on every frame
+    // -- now bounds a stall in the delete-applying read or the rolling write
+    // itself, not just the final frame delivery.
+    let progress = progress_tx.map(|tx| {
+        ProgressReporter::new(
+            PROGRESS_INTERVAL_BATCHES,
+            Box::new(move |rows_read| {
+                // The receiver only goes away if `do_action` already
+                // returned (client disconnected or the response stream was
+                // dropped); dropping a progress tick in that case is
+                // correct, not lossy in any way that matters.
+                let _ = tx.send(rows_read);
+            }),
+        )
+    });
+
     let (new_files, _old_files, rows_written) = rewrite_group(
         &table,
         &plan,
@@ -212,6 +247,7 @@ async fn compact_pinned_table(
         compression,
         tracker.clone(),
         request.target_file_size_bytes,
+        progress,
     )
     .await
     .map_err(|e| SqeError::Execution(format!("compact_file_group: rewrite failed: {e}")))?;
@@ -252,9 +288,20 @@ async fn compact_pinned_table(
 /// the snapshot check, delete-aware rewrite, and Avro encoding. The worker
 /// never obtains a catalog token and never commits; the coordinator (Task 4)
 /// commits the returned `DataFile`s.
+///
+/// `progress_tx`, when `Some`, receives one cumulative rows-read value every
+/// [`PROGRESS_INTERVAL_BATCHES`] record batches processed during the
+/// delete-applying read + rolling write; `do_action`
+/// (`flight_service.rs`) drains it concurrently with this future and turns
+/// each value into a `CompactGroupFrame::Progress` frame sent back to the
+/// coordinator immediately, before the rewrite as a whole finishes. `None`
+/// (used by every unit test in this module below) disables progress
+/// reporting entirely; the rewrite itself is byte-for-byte identical either
+/// way.
 pub async fn compact_file_group(
     session_ctx: &SessionContext,
     request: &CompactGroupRequest,
+    progress_tx: Option<tokio::sync::mpsc::UnboundedSender<u64>>,
 ) -> SqeResult<CompactGroupResponse> {
     let file_io = build_file_io(&request.s3)?;
     let ident = parse_table_ident(&request.table_ident)?;
@@ -269,7 +316,7 @@ pub async fn compact_file_group(
                 ))
             })?;
 
-    compact_pinned_table(session_ctx, static_table.into_table(), request).await
+    compact_pinned_table(session_ctx, static_table.into_table(), request, progress_tx).await
 }
 
 #[cfg(test)]
@@ -456,7 +503,7 @@ mod tests {
         let table = local_table_with_snapshot(555);
         let request = sample_request(vec!["s3://bucket/data/f1.parquet".to_string()], 999);
         let ctx = SessionContext::new();
-        let err = compact_pinned_table(&ctx, table, &request).await.unwrap_err();
+        let err = compact_pinned_table(&ctx, table, &request, None).await.unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("snapshot mismatch"), "error must name the mismatch: {msg}");
         assert!(msg.contains("999") && msg.contains("555"), "error must cite both ids: {msg}");
@@ -470,7 +517,7 @@ mod tests {
         let table = local_table_with_snapshot(555);
         let request = sample_request(vec!["s3://bucket/data/f1.parquet".to_string()], 555);
         let ctx = SessionContext::new();
-        let err = compact_pinned_table(&ctx, table, &request).await.unwrap_err();
+        let err = compact_pinned_table(&ctx, table, &request, None).await.unwrap_err();
         assert!(
             !err.to_string().contains("snapshot mismatch"),
             "matching snapshot must pass the pin guard: {err}"
@@ -589,7 +636,8 @@ mod tests {
         };
 
         let ctx = SessionContext::new();
-        let response = compact_file_group(&ctx, &request).await.expect("compaction failed");
+        let response =
+            compact_file_group(&ctx, &request, None).await.expect("compaction failed");
 
         // Schema/partition_type here are placeholders: a real manual run
         // should load them from the same table's metadata.json used above
