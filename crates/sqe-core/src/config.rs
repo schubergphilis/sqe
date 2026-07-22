@@ -3289,18 +3289,71 @@ pub struct MaintenanceDistributionConfig {
     pub group_timeout_secs: u64,
     /// Wall-clock bound between frames ONCE a worker has started responding
     /// to a dispatched group (i.e. after its first `Progress` heartbeat).
-    /// This does NOT bound how long the worker's compute phase itself can
-    /// run before it emits that first frame -- Task 3's worker action
-    /// computes the entire group (scan, delete-apply, re-encode) before it
-    /// streams anything back, so a worker wedged mid-compute produces no
-    /// frames at all and is caught only by `group_timeout_secs` above, not
-    /// by this field. `group_heartbeat_timeout_secs` only detects a worker
-    /// that responded, then went silent -- e.g. a connection that started
-    /// streaming and then stalled. True incremental progress reporting
-    /// (so this field could bound compute-phase hangs too) is a tracked
-    /// follow-up, not implemented here.
+    /// Incremental progress reporting IS implemented: the worker's
+    /// `compact_file_group` action streams a `Progress` frame every
+    /// `PROGRESS_INTERVAL_BATCHES` record batches during the delete-applying
+    /// read + rolling write (`sqe_worker::compaction`), so this field now
+    /// bounds a mid-compute stall too, not just post-first-frame silence --
+    /// a worker that goes quiet mid-scan produces no further frames and is
+    /// caught here, on the same timer, rather than only at the coarser
+    /// `group_timeout_secs` end-to-end bound above.
     #[serde(default = "default_maintenance_group_heartbeat_timeout_secs")]
     pub group_heartbeat_timeout_secs: u64,
+    /// Opt-in (Phase 4d Task 3): commit successful groups in batches of
+    /// `partial_progress_batch` instead of collecting every group and
+    /// committing ONE all-or-nothing `RewriteFilesAction`. Default `false`:
+    /// the job behaves exactly as before, one atomic commit, any failure
+    /// commits nothing at all.
+    ///
+    /// When `true`, each batch after the first successful commit gets its
+    /// own commit-conflict handling. Before every commit attempt, the
+    /// coordinator reloads the table and checks whether a concurrent writer
+    /// has landed a NEW position delete on one of THIS batch's own input
+    /// files; if so, it RE-DISPATCHES the same groups against the reloaded
+    /// snapshot (so the worker output actually reflects the delete) instead
+    /// of committing what it already has. This check runs proactively, not
+    /// only on a caught commit-conflict error, because the vendored
+    /// `iceberg::transaction::Transaction::commit` silently reloads and
+    /// replays a stale action when it finds one on its own, without ever
+    /// surfacing an `Err` for a single, one-shot race -- recommitting the
+    /// same worker-produced files unchanged in that case would resurrect
+    /// rows a concurrent delete already removed. A retryable conflict this
+    /// check did not preempt (an unrelated concurrent writer, or
+    /// `Transaction::commit`'s own retry budget exhausted) is still retried
+    /// the same way, up to 4 attempts with exponential backoff. Only once
+    /// retries are exhausted (or the failure is not a conflict at all -- a
+    /// stalled/undispatchable group, say) does the batch count as a
+    /// TERMINAL failure. A terminal failure after one or more batches have
+    /// already committed reports `status = "partial"` in
+    /// `sqe_system.maintenance_log` instead of failing the whole job --
+    /// see `commit_eligible_groups` / `commit_one_batch` in
+    /// `sqe-coordinator` for the full argument. The very first batch's
+    /// failure is not retried at this layer at all: it bubbles up and the
+    /// OUTER `rewrite_data_files_distributed` retry loop re-plans and
+    /// re-dispatches the whole job instead, exactly as it did before this
+    /// field existed -- which is also why `partial_progress = false`
+    /// (always exactly one batch) is untouched by the per-batch retry. That
+    /// outer/first-batch path shares the same "`Transaction::commit` may
+    /// silently absorb a single race" exposure and does not get the
+    /// proactive position-delete check above; closing that gap needs the
+    /// missing vendor-side `validateNoNewDeletesForDataFiles`-equivalent
+    /// check.
+    ///
+    /// Trades a larger commit-conflict surface (N commits instead of 1,
+    /// each independently racing concurrent writers) for incremental
+    /// durability on very large tables where losing an entire multi-hour
+    /// job to one late group failure is expensive. The per-batch retry
+    /// above closes most of that gap for transient conflicts; only a
+    /// genuinely terminal failure still surfaces as `partial`.
+    #[serde(default)]
+    pub partial_progress: bool,
+    /// Number of eligible groups committed per `RewriteFilesAction` when
+    /// `partial_progress` is `true`. Ignored when `partial_progress` is
+    /// `false` (the whole job is always exactly one commit then). Must be
+    /// `>= 1` when `partial_progress` is `true` (`validate()` rejects `0`).
+    /// Default: `10`.
+    #[serde(default = "default_maintenance_partial_progress_batch")]
+    pub partial_progress_batch: usize,
 }
 
 impl Default for MaintenanceDistributionConfig {
@@ -3312,6 +3365,8 @@ impl Default for MaintenanceDistributionConfig {
             group_attempts: default_maintenance_group_attempts(),
             group_timeout_secs: default_maintenance_group_timeout_secs(),
             group_heartbeat_timeout_secs: default_maintenance_group_heartbeat_timeout_secs(),
+            partial_progress: false,
+            partial_progress_batch: default_maintenance_partial_progress_batch(),
         }
     }
 }
@@ -3347,6 +3402,7 @@ fn default_maintenance_max_inflight_groups_per_worker() -> usize { 1 }
 fn default_maintenance_group_attempts() -> usize { 2 }
 fn default_maintenance_group_timeout_secs() -> u64 { 3600 }
 fn default_maintenance_group_heartbeat_timeout_secs() -> u64 { 120 }
+fn default_maintenance_partial_progress_batch() -> usize { 10 }
 
 fn default_idle_timeout() -> u64 { 900 }       // 15 minutes
 fn default_absolute_timeout() -> u64 { 28800 }  // 8 hours
@@ -3765,6 +3821,22 @@ impl SqeConfig {
                  only wires the catalog-native lease); set lease = \"catalog\" (default, works \
                  for multi-coordinator HA today) or lease = \"none\" with \
                  single_scheduler_acknowledged = true (single-coordinator deployments only)."
+                    .to_string(),
+            );
+        }
+
+        // Phase 4d Task 3: partial-progress batches must contain at least
+        // one group each. Only meaningful when `partial_progress` is
+        // enabled -- a `0` batch size with `partial_progress = false` is
+        // inert (the field is never read on that path) and not worth
+        // rejecting.
+        if self.maintenance.distribution.partial_progress
+            && self.maintenance.distribution.partial_progress_batch < 1
+        {
+            errors.push(
+                "maintenance.distribution.partial_progress is true but \
+                 partial_progress_batch is 0; each batch must commit at least \
+                 one group (set partial_progress_batch >= 1)"
                     .to_string(),
             );
         }
@@ -4728,6 +4800,8 @@ max_inflight_groups_per_worker = 2
 group_attempts = 3
 group_timeout_secs = 1800
 group_heartbeat_timeout_secs = 60
+partial_progress = true
+partial_progress_batch = 5
 "#;
         let cfg: SqeConfig = toml::from_str(toml).expect("full [maintenance] block parses");
         assert_eq!(cfg.maintenance.mode, MaintenanceMode::Advisory);
@@ -4758,6 +4832,8 @@ group_heartbeat_timeout_secs = 60
         assert_eq!(dist.group_attempts, 3);
         assert_eq!(dist.group_timeout_secs, 1800);
         assert_eq!(dist.group_heartbeat_timeout_secs, 60);
+        assert!(dist.partial_progress);
+        assert_eq!(dist.partial_progress_batch, 5);
     }
 
     #[test]
@@ -4789,6 +4865,31 @@ group_heartbeat_timeout_secs = 60
         assert_eq!(d.group_attempts, 2);
         assert_eq!(d.group_timeout_secs, 3600);
         assert_eq!(d.group_heartbeat_timeout_secs, 120);
+        assert!(!d.partial_progress);
+        assert_eq!(d.partial_progress_batch, 10);
+    }
+
+    #[test]
+    fn maintenance_partial_progress_batch_zero_rejected_when_enabled() {
+        let mut config = valid_config();
+        config.maintenance.distribution.partial_progress = true;
+        config.maintenance.distribution.partial_progress_batch = 0;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("partial_progress_batch is 0"),
+            "expected partial_progress_batch=0 rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn maintenance_partial_progress_batch_zero_accepted_when_disabled() {
+        // partial_progress_batch is inert when partial_progress is false
+        // (the default): a 0 value there is never read, so it must not be
+        // rejected.
+        let mut config = valid_config();
+        config.maintenance.distribution.partial_progress = false;
+        config.maintenance.distribution.partial_progress_batch = 0;
+        config.validate().expect("batch=0 is inert when partial_progress is disabled");
     }
 
     #[test]

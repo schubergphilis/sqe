@@ -221,6 +221,8 @@ max_inflight_groups_per_worker = 1
 group_attempts = 2
 group_timeout_secs = 3600
 group_heartbeat_timeout_secs = 120
+partial_progress = false
+partial_progress_batch = 10
 ```
 
 ## Environment Variable Overrides
@@ -729,11 +731,33 @@ Other knobs, all under `[maintenance.distribution]`:
   or the worker finally responds. Size it for the slowest group you
   expect to dispatch.
 - `group_heartbeat_timeout_secs` (default `120`). Bounds the wait between
-  frames only, once a worker has started responding (its first `Progress`
-  heartbeat). It does NOT bound the worker's compute phase before that
-  first frame -- that is `group_timeout_secs`'s job. A worker wedged
-  mid-compute produces no frames at all and is caught only by
-  `group_timeout_secs`, never by this field.
+  frames once a worker has started responding (its first `Progress`
+  heartbeat). Workers now emit a `Progress` frame every few record batches
+  while the rewrite is still running, an internal fixed cadence, not a
+  config knob, so a fresh frame arrives well inside this window as long as
+  the worker keeps making forward progress. That makes this field a real
+  mid-compute liveness bound: a worker that stalls partway through, a
+  wedged read or a hung write, stops producing frames and is caught here
+  instead of only at the coarser `group_timeout_secs`. A stalled worker's
+  group is retried on a different healthy worker, up to `group_attempts`.
+- `partial_progress` (default `false`). Opt-in: commit successful groups
+  in batches of `partial_progress_batch` instead of collecting every group
+  and committing one all-or-nothing `RewriteFilesAction`. Off, the job
+  behaves exactly as before: one atomic commit for the whole job, any
+  failure commits nothing. On, a terminal failure after one or more
+  batches have already committed keeps those batches (they are never
+  rolled back) and records `status = "partial"` in
+  `sqe_system.maintenance_log` instead of failing the whole job. Trades a
+  larger commit-conflict surface, N commits instead of one, each
+  independently racing concurrent writers, for incremental durability on
+  very large tables, where losing an entire multi-hour job to one late
+  group failure is expensive. See [Distributed
+  compaction](../design-notes/distributed-compaction.md) for the full
+  per-batch commit sequence and retry layering.
+- `partial_progress_batch` (default `10`). Number of eligible groups
+  committed per `RewriteFilesAction` when `partial_progress` is `true`.
+  Ignored when `partial_progress` is `false`. Must be at least 1 when
+  `partial_progress` is `true`; validation rejects `0`.
 
 **Accepted trade-off: orphans on a commit-conflict retry.** A concurrent
 writer that commits between the coordinator's read and its
@@ -746,6 +770,13 @@ to S3 is never referenced by any commit and becomes an orphan, left for
 reclaim. The trade-off is deliberate: correctness comes from never
 committing a stale plan, not from cleaning up every write the moment its
 result turns out to be unneeded.
+
+The whole-job re-plan above applies to the first commit of a job, with
+`partial_progress` on or off. With `partial_progress` on, a conflict on a
+later batch is instead retried in place against the same worker-produced
+files, no re-plan and no orphaned output, up to the same retry budget; see
+[Distributed compaction](../design-notes/distributed-compaction.md) for
+the retry-layering detail.
 
 ### Safety notes
 
@@ -791,6 +822,7 @@ SQE validates config at startup and fails fast on errors:
 - `maintenance.scheduler.tick_secs` and `maintenance.scheduler.lease_ttl_secs` must both be greater than zero
 - `maintenance.scheduler.enabled = true` with `lease = "none"` requires `single_scheduler_acknowledged = true`
 - `maintenance.scheduler.enabled = true` with `lease = "kubernetes"` is rejected outright (not implemented; use `"catalog"` or `"none"`)
+- `maintenance.distribution.partial_progress = true` requires `maintenance.distribution.partial_progress_batch` to be at least 1
 
 ## Priority Order
 

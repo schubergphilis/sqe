@@ -517,31 +517,64 @@ impl FlightService for WorkerFlightService {
                     "Received compact_file_group request"
                 );
 
-                let response = compact_file_group(&self.session_ctx, &request)
-                    .await
-                    .map_err(|e| {
-                        Status::internal(format!(
-                            "compact_file_group failed for group {group_id}: {e}"
-                        ))
-                    })?;
+                // Run the rewrite on its own task and drain its progress
+                // channel concurrently, so `Progress` frames reach the
+                // coordinator WHILE the rewrite is still running instead of
+                // being buffered until it finishes. This is what makes the
+                // coordinator's `group_heartbeat_timeout` (which rearms on
+                // every frame it receives, see
+                // `compaction_dispatch::dispatch_group_to_worker`) a real
+                // bound on a mid-compute stall: previously both frames were
+                // only ever produced back-to-back after the whole group was
+                // computed, so the heartbeat only ever bounded frame
+                // delivery, never the compute itself.
+                let (progress_tx, progress_rx) = tokio::sync::mpsc::unbounded_channel::<u64>();
+                let session_ctx = self.session_ctx.clone();
+                let request_for_task = request.clone();
+                let rewrite_task = tokio::spawn(async move {
+                    compact_file_group(&session_ctx, &request_for_task, Some(progress_tx)).await
+                });
 
-                let frames = [
-                    CompactGroupFrame::Progress {
-                        group_id,
-                        rows_read: response.rows_written,
-                    },
-                    CompactGroupFrame::Done(response),
-                ];
-                let mut results = Vec::with_capacity(frames.len());
-                for frame in frames {
+                let progress_stream =
+                    tokio_stream::wrappers::UnboundedReceiverStream::new(progress_rx).map(
+                        move |rows_read| {
+                            let frame = CompactGroupFrame::Progress { group_id, rows_read };
+                            let body = frame.to_bytes().map_err(|e| {
+                                Status::internal(format!(
+                                    "Failed to encode CompactGroupFrame: {e}"
+                                ))
+                            })?;
+                            Ok(arrow_flight::Result {
+                                body: bytes::Bytes::from(body),
+                            })
+                        },
+                    );
+
+                let done_stream = stream::once(async move {
+                    let response = match rewrite_task.await {
+                        Ok(Ok(resp)) => resp,
+                        Ok(Err(e)) => {
+                            return Err(Status::internal(format!(
+                                "compact_file_group failed for group {group_id}: {e}"
+                            )));
+                        }
+                        Err(join_err) => {
+                            return Err(Status::internal(format!(
+                                "compact_file_group task for group {group_id} panicked: \
+                                 {join_err}"
+                            )));
+                        }
+                    };
+                    let frame = CompactGroupFrame::Done(response);
                     let body = frame.to_bytes().map_err(|e| {
                         Status::internal(format!("Failed to encode CompactGroupFrame: {e}"))
                     })?;
-                    results.push(Ok(arrow_flight::Result {
+                    Ok(arrow_flight::Result {
                         body: bytes::Bytes::from(body),
-                    }));
-                }
-                Ok(Response::new(Box::pin(stream::iter(results))))
+                    })
+                });
+
+                Ok(Response::new(Box::pin(progress_stream.chain(done_stream))))
             }
             other => Err(Status::unimplemented(format!(
                 "Unknown action type: {other}"
@@ -838,6 +871,29 @@ mod tests {
         }
     }
 
+    /// Drain a `do_action` response stream until either a stream item error
+    /// (returns it) or the stream ends without ever erroring (panics).
+    ///
+    /// `compact_file_group` streams `Progress` frames concurrently with the
+    /// rewrite (see the `do_action` handler), so a downstream failure (no
+    /// real S3/StaticTable in these tests) can no longer surface as the
+    /// `do_action` call's own `Result::Err`: it only appears once the
+    /// spawned rewrite task resolves and the `Done` frame's construction
+    /// fails. This mirrors `unwrap_err` for tests that need to authenticate
+    /// through the gates and then observe that downstream failure.
+    async fn drain_to_first_error(
+        response: Response<<WorkerFlightService as FlightService>::DoActionStream>,
+    ) -> Status {
+        let mut stream = response.into_inner();
+        loop {
+            match stream.next().await {
+                Some(Ok(_)) => continue,
+                Some(Err(e)) => return e,
+                None => panic!("do_action stream ended without ever producing an error"),
+            }
+        }
+    }
+
     #[tokio::test]
     async fn do_get_rejects_missing_secret_header() {
         let svc = make_service("expected-secret");
@@ -1129,7 +1185,10 @@ mod tests {
         // Both gates pass with a correctly-signed, well-formed request;
         // execution then fails downstream (no real S3/StaticTable in this
         // environment), but NOT with Unauthenticated, proving both gates
-        // let the call through.
+        // let the call through. The failure now surfaces as a stream item
+        // error (the rewrite runs concurrently with the response stream,
+        // see the `do_action` handler), not as `do_action`'s own `Err`, so
+        // `do_action` itself must return `Ok` here.
         let svc = make_service("expected-secret");
         let body = make_compact_request_bytes();
         let signature = sqe_compaction::wire::sign(&body, "expected-secret");
@@ -1144,7 +1203,8 @@ mod tests {
         request
             .metadata_mut()
             .insert(COMPACT_SIGNATURE_HEADER, signature.parse().unwrap());
-        let err = unwrap_err(svc.do_action(request).await);
+        let response = unwrap_ok(svc.do_action(request).await);
+        let err = drain_to_first_error(response).await;
         assert_ne!(err.code(), tonic::Code::Unauthenticated);
     }
 
@@ -1153,14 +1213,16 @@ mod tests {
         // Empty worker_secret is dev mode (opt-in via
         // worker.allow_unauthenticated): both gates are skipped, and
         // failure comes only from downstream execution (no real S3), not
-        // from Unauthenticated.
+        // from Unauthenticated. As above, that failure now surfaces as a
+        // stream item error rather than `do_action`'s own `Err`.
         let svc = make_service("");
         let action = Action {
             r#type: "compact_file_group".to_string(),
             body: bytes::Bytes::from(make_compact_request_bytes()),
         };
         let request = Request::new(action);
-        let err = unwrap_err(svc.do_action(request).await);
+        let response = unwrap_ok(svc.do_action(request).await);
+        let err = drain_to_first_error(response).await;
         assert_ne!(err.code(), tonic::Code::Unauthenticated);
     }
 
