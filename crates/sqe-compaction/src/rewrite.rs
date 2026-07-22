@@ -7,16 +7,24 @@
 //! 1). What stayed behind in `maintenance.rs`: `rewrite_data_files` /
 //! `rewrite_data_files_once` (the retry loop + the commit via
 //! `RewriteFilesAction`, which needs a `Session`/catalog bridge), the
-//! `collect_live_data_files` / `collect_live_delete_files` catalog scans, and
-//! `parse_sort_spec` (parses the `CALL` procedure's string arguments into a
-//! [`SortSpec`], not a compaction primitive itself). Those callers still
-//! reach every symbol below via `crate::maintenance::` re-exports.
+//! `collect_live_data_files` catalog scan (still catalog-shaped enough to
+//! stay put), and `parse_sort_spec` (parses the `CALL` procedure's string
+//! arguments into a [`SortSpec`], not a compaction primitive itself). Those
+//! callers still reach every symbol below via `crate::maintenance::`
+//! re-exports.
+//!
+//! `is_live_delete_entry` / `collect_live_delete_files` were later
+//! deduplicated into this module (they were byte-identical copies in
+//! `sqe-coordinator::maintenance` and `sqe-worker::compaction`, both walking
+//! an `IcebergTable`'s manifest list with no catalog dependency): both crates
+//! already depend on `sqe-compaction`, so this is a pure move, not a new
+//! dependency edge.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use futures::TryStreamExt;
-use iceberg::spec::{DataContentType, DataFile};
+use futures::{StreamExt, TryStreamExt};
+use iceberg::spec::{DataContentType, DataFile, ManifestStatus};
 use iceberg::table::Table as IcebergTable;
 use sqe_core::SqeError;
 
@@ -65,6 +73,62 @@ pub async fn plan_delete_aware_read(table: &IcebergTable) -> sqe_core::Result<De
         scan,
         tasks_by_path,
     })
+}
+
+/// True when a manifest entry is a live delete file (position or equality).
+///
+/// A live entry is one whose status is not `Deleted`; a delete file is any
+/// entry whose content type is not `Data`. The delete-aware rewrite uses this
+/// to collect the delete files it must apply during the read
+/// (`collect_live_delete_files`) and account for in the row cross-check.
+pub fn is_live_delete_entry(entry: &iceberg::spec::ManifestEntry) -> bool {
+    entry.status() != ManifestStatus::Deleted && entry.content_type() != DataContentType::Data
+}
+
+/// Collect the live delete files (position + equality) of the current snapshot.
+/// Mirrors `collect_live_data_files` but keeps delete-content entries instead of
+/// data entries. The delete-aware rewrite needs the delete `DataFile`s
+/// themselves (not just a count) to compute the post-delete row cross-check and
+/// to identify fully-covered position deletes for removal.
+///
+/// Shared by `sqe-coordinator`'s `CALL system.rewrite_data_files` and
+/// `sqe-worker`'s `compact_file_group` action: both walk an `IcebergTable`'s
+/// manifest list directly (no catalog call), so this is catalog-independent
+/// and safe to depend on from a worker.
+pub async fn collect_live_delete_files(table: &IcebergTable) -> sqe_core::Result<Vec<DataFile>> {
+    let metadata_ref = table.metadata_ref();
+    let Some(snapshot) = metadata_ref.current_snapshot() else {
+        return Ok(vec![]);
+    };
+
+    let cache = table.object_cache();
+    let manifest_list = cache
+        .get_manifest_list(snapshot, &metadata_ref)
+        .await
+        .map_err(|e| SqeError::Execution(format!("Failed to load manifest list: {e}")))?;
+
+    const CONCURRENCY: usize = 8;
+    let manifests: Vec<Arc<iceberg::spec::Manifest>> =
+        futures::stream::iter(manifest_list.entries().iter().cloned())
+            .map(|mf| {
+                let cache = cache.clone();
+                async move { cache.get_manifest(&mf).await }
+            })
+            .buffer_unordered(CONCURRENCY)
+            .try_collect()
+            .await
+            .map_err(|e| SqeError::Execution(format!("Failed to load manifest: {e}")))?;
+
+    Ok(manifests
+        .into_iter()
+        .flat_map(|m| {
+            m.entries()
+                .iter()
+                .filter(|e| is_live_delete_entry(e))
+                .map(|e| e.data_file().clone())
+                .collect::<Vec<_>>()
+        })
+        .collect())
 }
 
 /// Rows expected after applying deletes to `group`, or `None` when it cannot be
