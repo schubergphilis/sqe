@@ -132,6 +132,64 @@ pub fn least_loaded_worker(
         .map(|w| w.url.clone())
 }
 
+/// One pending group's inputs to the continuous-scheduler refill decision
+/// [`next_group_assignment`]: its total size (for largest-first priority)
+/// and its exclusion set (worker URLs it must not land on again, e.g. after
+/// a prior attempt already failed on that worker).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingSlot {
+    pub total_bytes: u64,
+    pub excluded: HashSet<String>,
+}
+
+/// Continuous-scheduler refill decision: pick exactly ONE (pending group,
+/// worker) assignment for the next free slot, given every group still
+/// waiting to be dispatched and each healthy worker's current in-flight
+/// count.
+///
+/// Unlike [`place_groups_largest_first`], which plans a whole wave up front
+/// and requires the caller to wait for the whole wave to drain before
+/// planning the next one, this is meant to be called every time a slot
+/// might have opened up (a dispatch just completed, or a fresh pass at
+/// startup) so a worker that finishes early is refilled immediately instead
+/// of idling until the slowest group in a shared wave finishes. The caller
+/// re-snapshots `workers`' `in_flight` counts (and removes the assigned
+/// group from `pending`) before calling again.
+///
+/// Priority rules, matching [`place_groups_largest_first`]/
+/// [`least_loaded_worker`] exactly: the largest pending group is considered
+/// first; among workers eligible for that group (under
+/// `max_inflight_per_worker` and not in the group's `excluded` set), the
+/// least-loaded one wins, ties broken by position. A group with no eligible
+/// worker right now is skipped in favor of the next-largest group that does
+/// have one (this is what lets a retried group's exclusion set coexist with
+/// fresh groups still being placeable). Ties in size preserve input order
+/// (stable sort), same as [`place_groups_largest_first`].
+///
+/// Returns `None` when no pending group can be placed on any worker right
+/// now -- every eligible worker is at cap for every remaining group, or
+/// every worker is excluded for every remaining group. The caller should
+/// back off and retry once something changes (a slot frees, or the healthy
+/// set changes).
+pub fn next_group_assignment(
+    pending: &[PendingSlot],
+    workers: &[WorkerLoad],
+    max_inflight_per_worker: usize,
+) -> Option<(usize, String)> {
+    let mut order: Vec<usize> = (0..pending.len()).collect();
+    // Stable sort: equal sizes keep their original relative order, matching
+    // place_groups_largest_first's tie-break.
+    order.sort_by_key(|&i| std::cmp::Reverse(pending[i].total_bytes));
+    for i in order {
+        if let Some(url) =
+            least_loaded_worker(workers, max_inflight_per_worker, &pending[i].excluded)
+        {
+            return Some((i, url));
+        }
+    }
+    None
+}
+
 /// One group's decoded rewrite result: the worker's Avro-encoded
 /// `DataFile`s, resolved into real `DataFile`s against the coordinator's own
 /// view of the table (schema, partition type/spec id, format version -- none
@@ -363,6 +421,130 @@ mod tests {
         // w1 is at cap (2 >= max 2), w2 is excluded.
         let picked = least_loaded_worker(&workers, 2, &excluded);
         assert_eq!(picked, None);
+    }
+
+    // ---- next_group_assignment (continuous refill decision) -------------
+
+    fn slot(total_bytes: u64) -> PendingSlot {
+        PendingSlot {
+            total_bytes,
+            excluded: HashSet::new(),
+        }
+    }
+
+    fn slot_excluding(total_bytes: u64, excluded: &[&str]) -> PendingSlot {
+        PendingSlot {
+            total_bytes,
+            excluded: excluded.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn next_assignment_picks_the_largest_pending_group_for_a_free_worker() {
+        let pending = vec![slot(100), slot(500), slot(200)];
+        let workers = vec![worker("w1", 0), worker("w2", 0)];
+        let (idx, url) = next_group_assignment(&pending, &workers, 1).unwrap();
+        assert_eq!(idx, 1, "the 500-byte group is largest and goes first");
+        assert_eq!(url, "w1", "ties in load broken by worker position");
+    }
+
+    #[test]
+    fn next_assignment_skips_a_worker_at_cap() {
+        let pending = vec![slot(100)];
+        // w1 is already at the cap of 1; only w2 has room.
+        let workers = vec![worker("w1", 1), worker("w2", 0)];
+        let (idx, url) = next_group_assignment(&pending, &workers, 1).unwrap();
+        assert_eq!(idx, 0);
+        assert_eq!(url, "w2");
+    }
+
+    #[test]
+    fn next_assignment_returns_none_when_every_worker_is_at_cap() {
+        let pending = vec![slot(100), slot(200)];
+        let workers = vec![worker("w1", 2), worker("w2", 2)];
+        assert_eq!(next_group_assignment(&pending, &workers, 2), None);
+    }
+
+    #[test]
+    fn next_assignment_returns_none_on_an_empty_pending_list() {
+        let workers = vec![worker("w1", 0)];
+        assert_eq!(next_group_assignment(&[], &workers, 1), None);
+    }
+
+    #[test]
+    fn next_assignment_returns_none_with_no_workers() {
+        let pending = vec![slot(100)];
+        assert_eq!(next_group_assignment(&pending, &[], 1), None);
+    }
+
+    #[test]
+    fn next_assignment_falls_through_a_stuck_retry_to_a_smaller_placeable_group() {
+        // The largest (retried) group is excluded from the only worker; the
+        // continuous scheduler must not stall the whole queue on it -- it
+        // should place the next-largest group that CAN go somewhere.
+        let pending = vec![slot_excluding(500, &["w1"]), slot(100)];
+        let workers = vec![worker("w1", 0)];
+        let (idx, url) = next_group_assignment(&pending, &workers, 1).unwrap();
+        assert_eq!(idx, 1, "falls through to the smaller, placeable group");
+        assert_eq!(url, "w1");
+    }
+
+    #[test]
+    fn next_assignment_returns_none_when_all_pending_groups_are_excluded_from_every_worker() {
+        let pending = vec![slot_excluding(500, &["w1", "w2"])];
+        let workers = vec![worker("w1", 0), worker("w2", 0)];
+        assert_eq!(next_group_assignment(&pending, &workers, 1), None);
+    }
+
+    #[test]
+    fn next_assignment_places_every_group_exactly_once_respecting_the_cap() {
+        // Simulates the real usage pattern: call repeatedly, removing the
+        // assigned group and bumping that worker's in-flight count each
+        // time, until no more assignments are possible.
+        let mut in_flight: std::collections::HashMap<String, usize> =
+            [("w1".to_string(), 0), ("w2".to_string(), 0)]
+                .into_iter()
+                .collect();
+        let sizes = [50u64, 40, 30, 20, 10, 5];
+        let mut pending: Vec<PendingSlot> = sizes.iter().map(|&b| slot(b)).collect();
+        let cap = 2;
+        let mut placements: Vec<(u64, String)> = Vec::new();
+
+        loop {
+            let workers: Vec<WorkerLoad> = in_flight
+                .iter()
+                .map(|(url, &n)| WorkerLoad {
+                    url: url.clone(),
+                    in_flight: n,
+                })
+                .collect();
+            match next_group_assignment(&pending, &workers, cap) {
+                Some((idx, url)) => {
+                    let placed = pending.remove(idx);
+                    *in_flight.get_mut(&url).unwrap() += 1;
+                    placements.push((placed.total_bytes, url));
+                }
+                None => break,
+            }
+        }
+
+        // Capacity is workers.len() * cap = 4; the two smallest (10, 5)
+        // never get placed this round.
+        assert_eq!(placements.len(), 4);
+        let mut placed_sizes: Vec<u64> = placements.iter().map(|(b, _)| *b).collect();
+        placed_sizes.sort_unstable();
+        assert_eq!(placed_sizes, vec![20, 30, 40, 50]);
+
+        // No worker exceeded the cap, and (by construction, since `pending`
+        // shrinks by one each time) no group was assigned twice.
+        let mut per_worker: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        for (_, url) in &placements {
+            *per_worker.entry(url.clone()).or_default() += 1;
+        }
+        for count in per_worker.values() {
+            assert!(*count <= cap, "no worker may exceed the cap of {cap}");
+        }
     }
 
     // ---- decode_group_response / aggregate_group_outcomes --------------
