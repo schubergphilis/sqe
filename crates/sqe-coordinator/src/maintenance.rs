@@ -33,15 +33,16 @@ use crate::writer::{new_upload_tracker, parse_parquet_compression, WriteCleanupG
 
 /// Delete-aware bin-pack/sort rewrite primitives moved to `sqe-compaction`
 /// (Phase 4c Task 1) so the worker-side `compact_file_group` action can reuse
-/// them without depending on this crate. `delete_heavy_files` and
-/// `pack_file_groups_partition_aware` are re-exported at `pub(crate)`
-/// visibility (matching their pre-move visibility) because
-/// `table_health.rs` reaches them via `crate::maintenance::`.
-use sqe_compaction::{
-    covered_position_deletes, group_files_by_partition, plan_delete_aware_read, rewrite_group,
-    SortCtx, SortSpec,
+/// them without depending on this crate. `delete_heavy_files`,
+/// `pack_file_groups_partition_aware`, and `covered_position_deletes` are
+/// re-exported at `pub(crate)` visibility (matching their pre-move
+/// visibility) because `table_health.rs` and `write_handler.rs` (the #378
+/// INSERT OVERWRITE / CoW delete-cleanup path) reach them via
+/// `crate::maintenance::`.
+use sqe_compaction::{group_files_by_partition, plan_delete_aware_read, rewrite_group, SortCtx, SortSpec};
+pub(crate) use sqe_compaction::{
+    covered_position_deletes, delete_heavy_files, pack_file_groups_partition_aware,
 };
-pub(crate) use sqe_compaction::{delete_heavy_files, pack_file_groups_partition_aware};
 
 /// Callback that returns a snapshot of recent SQL query texts.
 ///
@@ -2298,7 +2299,7 @@ fn is_live_delete_entry(entry: &iceberg::spec::ManifestEntry) -> bool {
 /// data entries. The delete-aware rewrite needs the delete `DataFile`s
 /// themselves (not just a count) to compute the post-delete row cross-check and
 /// to identify fully-covered position deletes for removal.
-async fn collect_live_delete_files(table: &IcebergTable) -> sqe_core::Result<Vec<DataFile>> {
+pub(crate) async fn collect_live_delete_files(table: &IcebergTable) -> sqe_core::Result<Vec<DataFile>> {
     use futures::{StreamExt, TryStreamExt};
 
     let metadata_ref = table.metadata_ref();
