@@ -1,9 +1,20 @@
-use crate::test::{QueryResult, TestStatus};
+use crate::status::{legacy_bucket, LegacyBucket, QueryOutcome};
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
 // Report types
 // ---------------------------------------------------------------------------
+
+/// A single query's run result. `outcome` carries the richer `QueryOutcome`
+/// taxonomy; the report layer (this module) collapses it onto the stable
+/// legacy buckets via `legacy_bucket` so `BENCH_SUMMARY` and the JSON schema
+/// stay byte-compatible.
+pub struct QueryResult {
+    pub id: String,
+    pub outcome: QueryOutcome,
+    pub duration: std::time::Duration,
+    pub rows: usize,
+}
 
 #[derive(Serialize)]
 pub struct BenchmarkReport {
@@ -51,12 +62,13 @@ pub fn print_summary(benchmark: &str, scale: f64, protocol: &str, results: &[Que
     println!("{}", "\u{2500}".repeat(60));
 
     for r in results {
-        let (icon, msg) = match &r.status {
-            TestStatus::Pass => ("v", String::new()),
-            TestStatus::Fail(m) => ("X", format!("  ({m})")),
-            TestStatus::Diff(m) => ("~", format!("  ({m})")),
-            TestStatus::Skip(m) => ("-", format!("  ({m})")),
-            TestStatus::Error(m) => ("!", format!("  ({m})")),
+        let (icon, msg) = match &r.outcome {
+            QueryOutcome::Pass | QueryOutcome::Vacuous => ("v", String::new()),
+            QueryOutcome::WrongRows(m) => ("X", format!("  ({m})")),
+            QueryOutcome::Diff(m) => ("~", format!("  ({m})")),
+            QueryOutcome::Skip(m) => ("-", format!("  ({m})")),
+            QueryOutcome::Error(m) => ("!", format!("  ({m})")),
+            QueryOutcome::Timeout(n) => ("!", format!("  (Timed out after {n}s)")),
         };
         println!(
             "{icon} {:<8} {:>8.2}s {:>10} rows{msg}",
@@ -75,10 +87,22 @@ pub fn print_summary(benchmark: &str, scale: f64, protocol: &str, results: &[Que
         total_ms as f64 / 1_000.0
     );
 
+    // Extra visibility for the new outcomes folded into the legacy buckets
+    // above: timeouts collapse into `error`, vacuous into `pass`. Counted
+    // directly from `results` (not via `legacy_bucket`) so they're additive
+    // and don't perturb the BENCH_SUMMARY line below.
+    let timeout = results
+        .iter()
+        .filter(|r| matches!(r.outcome, QueryOutcome::Timeout(_)))
+        .count();
+    let vacuous = results
+        .iter()
+        .filter(|r| matches!(r.outcome, QueryOutcome::Vacuous))
+        .count();
+    println!("Extra: {timeout} timeout, {vacuous} vacuous (non-failing)");
+
     // Machine-readable summary line for shell script parsing
-    println!(
-        "BENCH_SUMMARY:{benchmark}:{pass}:{fail}:{diff}:{skip}:{error}:{total}:{total_ms}"
-    );
+    println!("BENCH_SUMMARY:{benchmark}:{pass}:{fail}:{diff}:{skip}:{error}:{total}:{total_ms}");
 }
 
 // ---------------------------------------------------------------------------
@@ -99,12 +123,20 @@ pub fn write_json_report(
     let queries: Vec<QueryReportEntry> = results
         .iter()
         .map(|r| {
-            let (status_str, message) = match &r.status {
-                TestStatus::Pass => ("pass".to_string(), None),
-                TestStatus::Fail(m) => ("fail".to_string(), Some(m.clone())),
-                TestStatus::Diff(m) => ("diff".to_string(), Some(m.clone())),
-                TestStatus::Skip(m) => ("skip".to_string(), Some(m.clone())),
-                TestStatus::Error(m) => ("error".to_string(), Some(m.clone())),
+            let status_str = match legacy_bucket(&r.outcome) {
+                LegacyBucket::Pass => "pass".to_string(),
+                LegacyBucket::Fail => "fail".to_string(),
+                LegacyBucket::Diff => "diff".to_string(),
+                LegacyBucket::Skip => "skip".to_string(),
+                LegacyBucket::Error => "error".to_string(),
+            };
+            let message = match &r.outcome {
+                QueryOutcome::WrongRows(m)
+                | QueryOutcome::Diff(m)
+                | QueryOutcome::Skip(m)
+                | QueryOutcome::Error(m) => Some(m.clone()),
+                QueryOutcome::Timeout(n) => Some(format!("Timed out after {n}s")),
+                QueryOutcome::Pass | QueryOutcome::Vacuous => None,
             };
             QueryReportEntry {
                 id: r.id.clone(),
@@ -133,12 +165,34 @@ pub fn write_json_report(
         queries,
     };
 
-    let path = format!(
-        "benchmarks/results/{benchmark}-sf{scale}-{protocol}-{timestamp}.json"
-    );
+    let path = format!("benchmarks/results/{benchmark}-sf{scale}-{protocol}-{timestamp}.json");
     std::fs::create_dir_all("benchmarks/results/")?;
     std::fs::write(&path, serde_json::to_string_pretty(&report)?)?;
     Ok(path)
+}
+
+/// Serialise a `ComparisonReport` to a JSON file under `output_dir` and return
+/// the written path. The filename format `compare-{bench}-sf{scale}-{ts}.json`
+/// is glob-matched by committed results + chart tooling, so it must stay stable.
+/// Only the filename timestamp is generated here; `report.timestamp` (the
+/// rfc3339 field set at report-build time) is left untouched.
+pub(crate) fn write_comparison_report(
+    report: &ComparisonReport,
+    benchmark: &str,
+    scale: f64,
+    output_dir: &str,
+) -> anyhow::Result<String> {
+    let output_path = std::path::Path::new(output_dir);
+    std::fs::create_dir_all(output_path)?;
+    let filename = format!(
+        "compare-{}-sf{}-{}.json",
+        benchmark,
+        crate::format_scale(scale),
+        chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S")
+    );
+    let report_path = output_path.join(&filename);
+    std::fs::write(&report_path, serde_json::to_string_pretty(report)?)?;
+    Ok(report_path.display().to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -149,23 +203,23 @@ pub fn write_json_report(
 fn count_results(results: &[QueryResult]) -> (usize, usize, usize, usize, usize, u64) {
     let pass = results
         .iter()
-        .filter(|r| matches!(r.status, TestStatus::Pass))
+        .filter(|r| legacy_bucket(&r.outcome) == LegacyBucket::Pass)
         .count();
     let fail = results
         .iter()
-        .filter(|r| matches!(r.status, TestStatus::Fail(_)))
+        .filter(|r| legacy_bucket(&r.outcome) == LegacyBucket::Fail)
         .count();
     let diff = results
         .iter()
-        .filter(|r| matches!(r.status, TestStatus::Diff(_)))
+        .filter(|r| legacy_bucket(&r.outcome) == LegacyBucket::Diff)
         .count();
     let skip = results
         .iter()
-        .filter(|r| matches!(r.status, TestStatus::Skip(_)))
+        .filter(|r| legacy_bucket(&r.outcome) == LegacyBucket::Skip)
         .count();
     let error = results
         .iter()
-        .filter(|r| matches!(r.status, TestStatus::Error(_)))
+        .filter(|r| legacy_bucket(&r.outcome) == LegacyBucket::Error)
         .count();
     let total_ms: u64 = results.iter().map(|r| r.duration.as_millis() as u64).sum();
     (pass, fail, diff, skip, error, total_ms)
@@ -264,25 +318,24 @@ pub struct ComparisonSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test::{QueryResult, TestStatus};
 
     fn make_results() -> Vec<QueryResult> {
         vec![
             QueryResult {
                 id: "q01".to_string(),
-                status: TestStatus::Pass,
+                outcome: QueryOutcome::Pass,
                 duration: std::time::Duration::from_millis(120),
                 rows: 4,
             },
             QueryResult {
                 id: "q02".to_string(),
-                status: TestStatus::Fail("row count mismatch".to_string()),
+                outcome: QueryOutcome::WrongRows("row count mismatch".to_string()),
                 duration: std::time::Duration::from_millis(88),
                 rows: 0,
             },
             QueryResult {
                 id: "q03".to_string(),
-                status: TestStatus::Skip("requires: lateral_join".to_string()),
+                outcome: QueryOutcome::Skip("requires: lateral_join".to_string()),
                 duration: std::time::Duration::ZERO,
                 rows: 0,
             },
@@ -316,6 +369,40 @@ mod tests {
         assert_eq!(v["queries"][1]["message"], "row count mismatch");
 
         // Clean up
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn timeout_serializes_as_error_with_message() {
+        let results = vec![QueryResult {
+            id: "q04".to_string(),
+            outcome: QueryOutcome::Timeout(60),
+            duration: std::time::Duration::from_secs(60),
+            rows: 0,
+        }];
+        let path = write_json_report("tpch-timeout-test", 0.001, "flight", &results).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(v["queries"][0]["status"], "error");
+        assert_eq!(v["queries"][0]["message"], "Timed out after 60s");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn vacuous_serializes_as_pass_with_no_message() {
+        let results = vec![QueryResult {
+            id: "q05".to_string(),
+            outcome: QueryOutcome::Vacuous,
+            duration: std::time::Duration::from_millis(10),
+            rows: 0,
+        }];
+        let path = write_json_report("tpch-vacuous-test", 0.001, "flight", &results).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(v["queries"][0]["status"], "pass");
+        assert!(v["queries"][0]["message"].is_null());
+
         let _ = std::fs::remove_file(&path);
     }
 }

@@ -715,6 +715,7 @@ impl MaintenanceScheduler {
                 strategy,
                 None, // sort_order: not part of the Phase 4b per-table override surface.
                 Some(params.delete_file_threshold),
+                false, // rewrite_all: not part of the Phase 4b per-table override surface; the scheduler never forces a full-table rewrite.
                 Some(snapshot_properties),
             )),
             crate::maintenance::ExecutionPlan::Distributed => {
@@ -727,6 +728,7 @@ impl MaintenanceScheduler {
                     strategy,
                     None, // sort_order: not part of the Phase 4b per-table override surface.
                     Some(params.delete_file_threshold),
+                    false, // rewrite_all: not part of the Phase 4b per-table override surface; the scheduler never forces a full-table rewrite.
                     Some(snapshot_properties),
                 ))
             }

@@ -195,6 +195,7 @@ impl MaintenanceHandler {
         strategy: Option<String>,
         sort_order: Option<String>,
         delete_file_threshold: Option<usize>,
+        rewrite_all: bool,
         snapshot_properties: Option<std::collections::HashMap<String, String>>,
     ) -> sqe_core::Result<RewriteOutcome> {
         let registry = self.worker_registry.clone().ok_or_else(|| {
@@ -221,6 +222,7 @@ impl MaintenanceHandler {
             strategy,
             sort_order,
             delete_file_threshold,
+            rewrite_all,
             snapshot_properties,
         )
         .await
@@ -246,6 +248,7 @@ impl MaintenanceHandler {
                 sort_order,
                 delete_file_threshold,
                 distributed,
+                rewrite_all,
             } => {
                 // Manual `CALL system.rewrite_data_files` always commits with
                 // no snapshot-property stamp. Job-identity stamping
@@ -260,6 +263,8 @@ impl MaintenanceHandler {
                 let catalog = self
                     .create_catalog_bridge(session, table.catalog.as_deref())
                     .await?;
+
+                let rewrite_all = rewrite_all.unwrap_or(false);
 
                 // Phase 4c Task 5: `distribution.mode` routing. `distributed`
                 // is the optional per-call override (`distributed =>
@@ -293,6 +298,7 @@ impl MaintenanceHandler {
                             strategy.clone(),
                             sort_order.clone(),
                             *delete_file_threshold,
+                            rewrite_all,
                             None,
                         )
                         .await?
@@ -308,6 +314,7 @@ impl MaintenanceHandler {
                             strategy.clone(),
                             sort_order.clone(),
                             *delete_file_threshold,
+                            rewrite_all,
                             None,
                         )
                         .await?
@@ -785,6 +792,7 @@ impl MaintenanceHandler {
         strategy: Option<String>,
         sort_order: Option<String>,
         delete_file_threshold: Option<usize>,
+        rewrite_all: bool,
         snapshot_properties: Option<std::collections::HashMap<String, String>>,
     ) -> sqe_core::Result<RewriteOutcome> {
         const MAX_COMMIT_ATTEMPTS: usize = 4;
@@ -801,6 +809,7 @@ impl MaintenanceHandler {
                     strategy.clone(),
                     sort_order.clone(),
                     delete_file_threshold,
+                    rewrite_all,
                     snapshot_properties.clone(),
                 )
                 .await
@@ -840,6 +849,7 @@ impl MaintenanceHandler {
         strategy: Option<String>,
         sort_order: Option<String>,
         delete_file_threshold: Option<usize>,
+        rewrite_all: bool,
         snapshot_properties: Option<std::collections::HashMap<String, String>>,
     ) -> sqe_core::Result<RewriteOutcome> {
         const DEFAULT_TARGET_FILE_SIZE_BYTES: u64 = 512 * 1024 * 1024;
@@ -922,9 +932,10 @@ impl MaintenanceHandler {
             };
 
         // Skip a table below `min_input_files` UNLESS a delete-heavy file makes
-        // it worth rewriting anyway (apply accumulated deletes). The
-        // delete_file_threshold path deliberately overrides the file-count floor.
-        if input_count < min_input && delete_heavy.is_empty() {
+        // it worth rewriting anyway (apply accumulated deletes) or the caller
+        // asked to rewrite everything. Both deliberately override the file-count
+        // floor.
+        if input_count < min_input && delete_heavy.is_empty() && !rewrite_all {
             info!(
                 table = %ident,
                 input_count,
@@ -942,6 +953,19 @@ impl MaintenanceHandler {
                 skipped_reason: Some("below min_input_files".to_string()),
             });
         }
+
+        // Files kept even when at or above target: delete-heavy files always, and
+        // every file when `rewrite_all` forces a full re-encode. `rewrite_all` is
+        // a superset of `delete_heavy`, so it wins when set. Bin-pack still packs
+        // small files under target; a large force-included file anchors its own
+        // group (rewritten alone to apply its deletes / re-encode).
+        let all_paths: std::collections::HashSet<String>;
+        let force_include: &std::collections::HashSet<String> = if rewrite_all {
+            all_paths = old_data_files.iter().map(|f| f.file_path().to_string()).collect();
+            &all_paths
+        } else {
+            &delete_heavy
+        };
 
         // Grouping strategy depends on whether we are sorting.
         //
@@ -961,16 +985,19 @@ impl MaintenanceHandler {
         let groups = if sort_ctx.is_some() {
             group_files_by_partition(&old_data_files)
         } else {
-            pack_file_groups_partition_aware(&old_data_files, target_bytes, &delete_heavy)
+            pack_file_groups_partition_aware(&old_data_files, target_bytes, force_include)
         };
 
         // A group is worth rewriting when it meets `min_input` (real
-        // consolidation) OR it contains a delete-heavy file (apply accumulated
-        // deletes, even if the group is small or the file is large).
+        // consolidation), the caller forced `rewrite_all`, OR it contains a
+        // delete-heavy file (apply accumulated deletes, even if the group is
+        // small or the file is large).
         let eligible_groups: Vec<Vec<DataFile>> = groups
             .into_iter()
             .filter(|g| {
-                g.len() >= min_input || g.iter().any(|f| delete_heavy.contains(f.file_path()))
+                g.len() >= min_input
+                    || rewrite_all
+                    || g.iter().any(|f| delete_heavy.contains(f.file_path()))
             })
             .collect();
 
@@ -1245,6 +1272,7 @@ impl MaintenanceHandler {
         strategy: Option<String>,
         sort_order: Option<String>,
         delete_file_threshold: Option<usize>,
+        rewrite_all: bool,
         snapshot_properties: Option<std::collections::HashMap<String, String>>,
     ) -> sqe_core::Result<RewriteOutcome> {
         const MAX_COMMIT_ATTEMPTS: usize = 4;
@@ -1266,6 +1294,7 @@ impl MaintenanceHandler {
                     strategy.clone(),
                     sort_order.clone(),
                     delete_file_threshold,
+                    rewrite_all,
                     snapshot_properties.clone(),
                 )
                 .await
@@ -1315,6 +1344,7 @@ impl MaintenanceHandler {
         strategy: Option<String>,
         sort_order: Option<String>,
         delete_file_threshold: Option<usize>,
+        rewrite_all: bool,
         snapshot_properties: Option<std::collections::HashMap<String, String>>,
     ) -> sqe_core::Result<RewriteOutcome> {
         const DEFAULT_TARGET_FILE_SIZE_BYTES: u64 = 512 * 1024 * 1024;
@@ -1384,7 +1414,7 @@ impl MaintenanceHandler {
                 _ => std::collections::HashSet::new(),
             };
 
-        if input_count < min_input && delete_heavy.is_empty() {
+        if input_count < min_input && delete_heavy.is_empty() && !rewrite_all {
             info!(
                 table = %ident,
                 input_count,
@@ -1403,16 +1433,29 @@ impl MaintenanceHandler {
             });
         }
 
+        // Same force-include semantics as the local path: when `rewrite_all`
+        // is set, every file is force-included so bin-pack does not skip
+        // files already at or above target.
+        let all_paths: std::collections::HashSet<String>;
+        let force_include: &std::collections::HashSet<String> = if rewrite_all {
+            all_paths = old_data_files.iter().map(|f| f.file_path().to_string()).collect();
+            &all_paths
+        } else {
+            &delete_heavy
+        };
+
         let groups = if sort_spec.is_some() {
             group_files_by_partition(&old_data_files)
         } else {
-            pack_file_groups_partition_aware(&old_data_files, target_bytes, &delete_heavy)
+            pack_file_groups_partition_aware(&old_data_files, target_bytes, force_include)
         };
 
         let eligible_groups: Vec<Vec<DataFile>> = groups
             .into_iter()
             .filter(|g| {
-                g.len() >= min_input || g.iter().any(|f| delete_heavy.contains(f.file_path()))
+                g.len() >= min_input
+                    || rewrite_all
+                    || g.iter().any(|f| delete_heavy.contains(f.file_path()))
             })
             .collect();
 
