@@ -225,10 +225,14 @@ async fn dispatch_group_to_worker(
         }
     }
 
-    // do_action itself does not stream incrementally today: the worker
-    // computes the whole group rewrite before emitting either frame (see
-    // `sqe_worker::flight_service`'s `compact_file_group` arm), so
-    // `group_timeout` wrapping this call is the real end-to-end bound.
+    // `do_action` itself returns as soon as the worker accepts the request
+    // and spawns the rewrite (see `sqe_worker::flight_service`'s
+    // `compact_file_group` arm): the rewrite runs concurrently with the
+    // response stream below, which is what lets `Progress` frames arrive
+    // mid-compute rather than only once the whole group is done.
+    // `group_timeout` still wraps this call as the end-to-end bound in case
+    // the worker never even accepts the request (auth/decode failure before
+    // any stream is returned).
     let response = tokio::time::timeout(group_timeout, client.do_action(grpc_request))
         .await
         .map_err(|_| {
@@ -261,12 +265,16 @@ async fn dispatch_group_to_worker(
     let mut stream = response.into_inner();
     let mut done: Option<CompactGroupResponse> = None;
     loop {
-        // Bounds the wait for each individual frame. The worker only ever
-        // sends its two frames back-to-back once the rewrite is fully done
-        // (see the comment on the `do_action` call above), so today this is
-        // mostly a defensive bound against a connection that goes silent
-        // after headers -- it will matter more once/if the worker starts
-        // streaming true incremental progress.
+        // Bounds the wait for each individual frame. The worker emits a
+        // `Progress` frame every `PROGRESS_INTERVAL_BATCHES` record batches
+        // it processes during the delete-applying read + rolling write
+        // (`sqe_worker::compaction`), so as long as it is making forward
+        // progress a fresh frame arrives well inside `heartbeat_timeout` and
+        // this `timeout(..).await` is re-armed on every loop iteration --
+        // i.e. every real frame resets the window. A worker that stalls
+        // mid-compute (wedged read, hung write, deadlock) stops producing
+        // frames entirely and is caught here, not just at the coarser
+        // `group_timeout` end-to-end bound.
         let next = tokio::time::timeout(heartbeat_timeout, stream.message())
             .await
             .map_err(|_| {
@@ -277,9 +285,27 @@ async fn dispatch_group_to_worker(
                 ))
             })?
             .map_err(|e| {
-                DispatchError::transport(format!(
-                    "worker {worker_url} compact_file_group stream error: {e}"
-                ))
+                // A mid-stream gRPC error can now legitimately be either
+                // class: an application-level failure (resurrection guard,
+                // delete-accounting mismatch, snapshot-pin mismatch) surfaces
+                // here too once the worker streams concurrently with the
+                // rewrite, not only as the initial `do_action` call's `Err`
+                // (see the classification above). Apply the identical
+                // code-based split so a poison group does not incorrectly
+                // mark a healthy worker unhealthy.
+                let transport = matches!(
+                    e.code(),
+                    tonic::Code::Unavailable | tonic::Code::DeadlineExceeded
+                );
+                if transport {
+                    pool.invalidate(worker_url);
+                }
+                let message = format!("worker {worker_url} compact_file_group stream error: {e}");
+                if transport {
+                    DispatchError::transport(message)
+                } else {
+                    DispatchError::application(message)
+                }
             })?;
         let Some(result) = next else { break };
         let frame = sqe_compaction::wire::CompactGroupFrame::from_bytes(&result.body)
