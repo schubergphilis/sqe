@@ -1,0 +1,16 @@
+supplier = "Schuberg Philis"
+owner = "VPF Data&AI"
+contact = "jjverhoeks@schubergphilis.com"
+
+[[asset]]
+name = "sqlengine"
+path = "."
+criticality = "high"
+data_classification = "internal"
+
+[config]
+image_scan = true
+sast = true
+hardening = true
+secret_scan = true
+sbom_verify = true

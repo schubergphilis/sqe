@@ -260,6 +260,16 @@ pub fn parse_parquet_compression(s: &str) -> Compression {
 /// `tracker`'s paths with a [`WriteCleanupGuard`] so a cancellation between
 /// the last batch and the Iceberg commit deletes the parquet files instead of
 /// orphaning them on S3 (#58).
+///
+/// `progress`, when `Some`, is ticked once per batch via
+/// [`ProgressReporter::on_batch`] with the cumulative row count so far. This
+/// is the only fine-grained hook into an otherwise single `.await`-per-batch
+/// loop; `sqe-worker`'s `compact_file_group` action uses it to emit
+/// `CompactGroupFrame::Progress` frames mid-rewrite so the coordinator's
+/// `group_heartbeat_timeout` bounds a stalled read/write, not just frame
+/// delivery. Every other caller (the coordinator's own ingest/CTAS/rewrite
+/// paths) passes `None` and is byte-for-byte unaffected.
+#[allow(clippy::too_many_arguments)]
 pub async fn write_data_files_streaming(
     table: &Table,
     mut stream: SendableRecordBatchStream,
@@ -268,6 +278,7 @@ pub async fn write_data_files_streaming(
     tracker: UploadedPaths,
     fanout: FanoutLimits,
     target_file_size: Option<u64>,
+    mut progress: Option<crate::progress::ProgressReporter>,
 ) -> sqe_core::Result<(Vec<DataFile>, usize)> {
     let inner_loc = DefaultLocationGenerator::new(table.metadata().clone())
         .map_err(|e| SqeError::Execution(format!("Location generator error: {e}")))?;
@@ -346,6 +357,9 @@ pub async fn write_data_files_streaming(
                 .write(stamped)
                 .await
                 .map_err(|e| SqeError::Execution(format!("Write error: {e}")))?;
+            if let Some(p) = progress.as_mut() {
+                p.on_batch(total_rows as u64);
+            }
         }
 
         if total_rows == 0 {
@@ -399,6 +413,9 @@ pub async fn write_data_files_streaming(
                 let stamped = apply_stamped_schema(batch, &stamped_schema)?;
                 total_rows += stamped.num_rows();
                 writer.write(stamped).await?;
+                if let Some(p) = progress.as_mut() {
+                    p.on_batch(total_rows as u64);
+                }
             }
             let cutovers = writer.cutovers();
             let data_files = writer.close().await?;
@@ -433,6 +450,9 @@ pub async fn write_data_files_streaming(
                 writer.write(stamped).await.map_err(|e| {
                     SqeError::Execution(format!("Partitioned write error: {e}"))
                 })?;
+                if let Some(p) = progress.as_mut() {
+                    p.on_batch(total_rows as u64);
+                }
             }
 
             if total_rows == 0 {
@@ -1038,5 +1058,169 @@ mod tests {
         assert_eq!(per[&region_struct("ASIA")], (1, 1));
         let total: u64 = files.iter().map(|f| f.record_count()).sum();
         assert_eq!(total, 5);
+    }
+
+    // ---- write_data_files_streaming progress wiring --------------------
+    //
+    // Exercises the actual batch loop `write_data_files_streaming` hooks
+    // (unlike `progress.rs`'s tests, which drive `ProgressReporter` in
+    // isolation): a real local-fs Table, a real multi-batch DataFusion
+    // stream, and a real `RollingFileWriterBuilder`/`ParquetWriterBuilder`
+    // write. No S3 involved, so this stays a plain `cargo test` (not
+    // `#[ignore]`d): the streaming writer never talks to a catalog or an
+    // object store here, just the local filesystem.
+
+    /// Minimal unpartitioned, snapshot-less local `Table`: just enough
+    /// metadata for `write_data_files_streaming` to derive a schema, a
+    /// partition spec, and a `DefaultLocationGenerator` rooted at `dir`.
+    /// `current_snapshot_id`/`snapshots` are omitted entirely (the write
+    /// path never reads them); only a real catalog commit would need them.
+    fn local_write_table(dir: &TempDir) -> Table {
+        let json = format!(
+            r#"{{
+              "format-version": 2,
+              "table-uuid": "9c12d441-03fe-4693-9a96-a0705ddf69c1",
+              "location": "{}",
+              "last-sequence-number": 1,
+              "last-updated-ms": 1602638573590,
+              "last-column-id": 1,
+              "current-schema-id": 0,
+              "schemas": [
+                {{"type": "struct", "schema-id": 0, "fields": [
+                  {{"id": 1, "name": "id", "required": true, "type": "int"}}
+                ]}}
+              ],
+              "default-spec-id": 0,
+              "partition-specs": [{{"spec-id": 0, "fields": []}}],
+              "last-partition-id": 999,
+              "default-sort-order-id": 0,
+              "sort-orders": [{{"order-id": 0, "fields": []}}],
+              "properties": {{}}
+            }}"#,
+            dir.path().to_str().unwrap()
+        );
+        let metadata: iceberg::spec::TableMetadata = serde_json::from_str(&json).unwrap();
+        let file_io = iceberg::io::FileIOBuilder::new_fs_io().build().unwrap();
+        Table::builder()
+            .metadata(metadata)
+            .identifier(iceberg::TableIdent::from_strs(["ns", "tbl"]).unwrap())
+            .file_io(file_io)
+            .build()
+            .unwrap()
+    }
+
+    /// One single-column `id` batch of `n` rows starting at `start`, with the
+    /// Parquet field-id metadata `apply_stamped_schema` needs to re-stamp are
+    /// not required on the input side: `write_data_files_streaming` derives
+    /// its own stamped schema from the Iceberg schema and casts every batch
+    /// into it, so a plain unstamped Arrow batch is enough here.
+    fn id_batch(start: i32, n: i32) -> RecordBatch {
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "id",
+            arrow_schema::DataType::Int32,
+            false,
+        )]));
+        RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int32Array::from((start..start + n).collect::<Vec<_>>()))],
+        )
+        .unwrap()
+    }
+
+    /// Adapt a fixed list of batches into the `SendableRecordBatchStream`
+    /// `write_data_files_streaming` consumes, mirroring how
+    /// `rewrite_group` adapts its Iceberg scan stream.
+    fn batches_to_stream(
+        schema: arrow_schema::SchemaRef,
+        batches: Vec<RecordBatch>,
+    ) -> SendableRecordBatchStream {
+        let s = futures::stream::iter(
+            batches
+                .into_iter()
+                .map(Ok::<RecordBatch, datafusion::error::DataFusionError>),
+        );
+        Box::pin(datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(schema, s))
+    }
+
+    #[tokio::test]
+    async fn streaming_write_reports_progress_every_interval_batches() {
+        let dir = TempDir::new().unwrap();
+        let table = local_write_table(&dir);
+        let arrow_schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "id",
+            arrow_schema::DataType::Int32,
+            false,
+        )]));
+
+        // 10 batches of 3 rows each = 30 rows total; interval of 4 batches
+        // should fire at batch 4 (12 rows) and batch 8 (24 rows), matching
+        // `ProgressReporter`'s own interval semantics (see progress.rs).
+        let batches: Vec<RecordBatch> = (0..10).map(|i| id_batch(i * 3, 3)).collect();
+        let stream = batches_to_stream(arrow_schema, batches);
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen_for_cb = seen.clone();
+        let progress = crate::progress::ProgressReporter::new(
+            4,
+            Box::new(move |rows| seen_for_cb.lock().unwrap().push(rows)),
+        );
+
+        let tracker = new_upload_tracker();
+        let (data_files, total_rows) = write_data_files_streaming(
+            &table,
+            stream,
+            "test",
+            Compression::UNCOMPRESSED,
+            tracker,
+            FanoutLimits::unbounded(),
+            None,
+            Some(progress),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(total_rows, 30, "progress hooking must not change the write itself");
+        assert!(!data_files.is_empty());
+        let total_written: u64 = data_files.iter().map(|f| f.record_count()).sum();
+        assert_eq!(total_written, 30);
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(*seen, vec![12, 24], "must fire at batch 4 (12 rows) and batch 8 (24 rows)");
+        assert!(seen.windows(2).all(|w| w[1] > w[0]), "rows_read must be monotonically increasing");
+    }
+
+    #[tokio::test]
+    async fn streaming_write_without_progress_is_unaffected() {
+        // `progress: None` (every existing caller other than the worker's
+        // compaction path) must produce byte-identical output to the same
+        // write with a progress reporter attached, just without any
+        // callback firing.
+        let dir = TempDir::new().unwrap();
+        let table = local_write_table(&dir);
+        let arrow_schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "id",
+            arrow_schema::DataType::Int32,
+            false,
+        )]));
+        let batches: Vec<RecordBatch> = (0..5).map(|i| id_batch(i * 2, 2)).collect();
+        let stream = batches_to_stream(arrow_schema, batches);
+
+        let tracker = new_upload_tracker();
+        let (data_files, total_rows) = write_data_files_streaming(
+            &table,
+            stream,
+            "test",
+            Compression::UNCOMPRESSED,
+            tracker,
+            FanoutLimits::unbounded(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(total_rows, 10);
+        let total_written: u64 = data_files.iter().map(|f| f.record_count()).sum();
+        assert_eq!(total_written, 10);
     }
 }
