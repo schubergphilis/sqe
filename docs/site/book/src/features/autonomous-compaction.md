@@ -47,6 +47,13 @@ files regardless of strategy:
   target size. The threshold is the lever for delete-heavy Merge-on-Read
   tables, where the file itself is fine but every scan pays to apply a
   stack of deletes against it.
+- **`rewrite_all => true`**. Forces a rewrite of every data file, including
+  files already at or above the target size and partitions below
+  `min_input_files`. It applies all deletes and re-encodes at the target
+  size. Use it to force a clean pass after a schema or partition-spec
+  change, or to apply accumulated deletes across a whole table in one
+  commit. Off by default; subsumed by `strategy => 'sort'`, which already
+  rewrites the whole partition.
 
 `CALL system.table_health('ns', 't')` is the read-only companion: it reuses
 the same file-collection and bin-pack logic as a rewrite, but never writes
