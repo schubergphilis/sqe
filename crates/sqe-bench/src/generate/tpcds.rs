@@ -768,6 +768,13 @@ const MAX_BASKET_LINES: usize = 25;
 /// ticket-level grouping stays coherent.
 const FK_NULL_RATE: f64 = 0.04;
 
+/// NULL rate for `inv_quantity_on_hand`, matching dsdgen's ~5% nNullPct.
+/// q39 keys on the per-(warehouse, item, month) coefficient of variation
+/// (STDDEV_SAMP/AVG) of the non-null quantities and filters cov > 1.5; with
+/// zero NULLs our groups were under-dispersed relative to official data and
+/// q39 came up vacuous at low scale (official sf0.1: 4 rows, ours: 0).
+const INV_QTY_NULL_RATE: f64 = 0.05;
+
 /// Header fields and line items of one ticket/order, derived purely from
 /// (salt, ticket). All lines of a ticket share the header fields; only the
 /// item and quantity vary per line.
@@ -1310,11 +1317,19 @@ fn generate_inventory(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
         let wh = j % whs + 1;
         // date_dim sk 1 = 1998-01-01; weekly snapshots land every 7 days.
         let date_sk = (week * 7 + 2).min(73_048) as i32;
+        // Draw the quantity first (keeps the value distribution uniform), then
+        // decide NULL, matching dsdgen's ~5% nNullPct. See INV_QTY_NULL_RATE.
+        let qty = rng.gen_range(0..=1000i32);
+        let inv_qty = if rng.gen_bool(INV_QTY_NULL_RATE) {
+            ColVal::I32(None)
+        } else {
+            i!(qty)
+        };
         vec![
             i!(date_sk),
             i!(item.min(items) as i32),
             i!(wh as i32),
-            i!(rng.gen_range(0..=1000i32)),
+            inv_qty,
         ]
     })
 }
@@ -2250,6 +2265,21 @@ mod tests {
         let frac = nulls as f64 / customers.len() as f64;
         assert!((0.01..=0.08).contains(&frac),
             "ss_customer_sk null fraction {frac} outside 1%..8%");
+    }
+
+    #[test]
+    fn inventory_quantity_null_rate_matches_dsdgen() {
+        // q39 computes the coefficient of variation (STDDEV_SAMP/AVG) of
+        // inv_quantity_on_hand per (warehouse, item, month) and filters
+        // cov > 1.5. dsdgen nulls this column at ~5% (nNullPct); with zero
+        // NULLs our per-group dispersion fell short and q39 was vacuous at
+        // low scale. Guard the null fraction stays near dsdgen's 5%.
+        let (sch, batches) = generate_inventory(0.01);
+        let qtys = col_i32(&batches, &sch, "inv_quantity_on_hand");
+        let nulls = qtys.iter().filter(|q| q.is_none()).count();
+        let frac = nulls as f64 / qtys.len() as f64;
+        assert!((0.02..=0.08).contains(&frac),
+            "inv_quantity_on_hand null fraction {frac} outside 2%..8% (dsdgen ~5%)");
     }
 
     #[test]

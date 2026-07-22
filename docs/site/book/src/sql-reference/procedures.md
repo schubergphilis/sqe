@@ -10,7 +10,7 @@ Source: `crates/sqe-sql/src/procedures.rs`. Handlers in `crates/sqe-coordinator/
 
 | Procedure | Origin | Required args | Optional args | Notes |
 |---|---|---|---|---|
-| `system.rewrite_data_files` | `sqe-sql` + `sqe-coordinator` | `table => 'ns.t'` | `target_file_size_bytes => N`, `min_input_files => N`, `max_concurrent_file_group_rewrites => N`, `strategy => 'binpack'\|'sort'`, `sort_order => 'col ASC, ...'\|'zorder(a, b)'`, `delete_file_threshold => N`, `distributed => 'auto'\|'local'\|'require'` | Compacts small data files (delete-aware). Default target 512 MiB, min 5 files per group, max 4 concurrent groups. `strategy => 'sort'` sorts a whole partition by `sort_order` (a column list or `zorder(...)`) via a spillable DataFusion sort and rolls output at the target size, producing files with disjoint key ranges. `delete_file_threshold => N` also rewrites any data file with at least N delete files applying to it, even when it is already large. `distributed => ...` overrides `[maintenance.distribution] mode` for this one call (see [Configuration](../deployment/configuration.md) and [Distributed compaction](../design-notes/distributed-compaction.md)); omit it to use the configured mode. A manual `CALL` commits with no extra snapshot properties; the auto-compaction scheduler (see [Maintenance (auto-compaction)](../deployment/configuration.md#maintenance-auto-compaction)) calls this same handler internally and stamps `sqe.maintenance.job-id`/`principal`/`trigger` onto the snapshot it commits, so an autonomous compaction is attributable in the table's history while a manual one is not. |
+| `system.rewrite_data_files` | `sqe-sql` + `sqe-coordinator` | `table => 'ns.t'` | `target_file_size_bytes => N`, `min_input_files => N`, `max_concurrent_file_group_rewrites => N`, `strategy => 'binpack'\|'sort'`, `sort_order => 'col ASC, ...'\|'zorder(a, b)'`, `delete_file_threshold => N`, `distributed => 'auto'\|'local'\|'require'`, `rewrite_all => true` | Compacts small data files (delete-aware). Default target 512 MiB, min 5 files per group, max 4 concurrent groups. `strategy => 'sort'` sorts a whole partition by `sort_order` (a column list or `zorder(...)`) via a spillable DataFusion sort and rolls output at the target size, producing files with disjoint key ranges. `delete_file_threshold => N` also rewrites any data file with at least N delete files applying to it, even when it is already large. `rewrite_all => true` forces a rewrite of every file regardless of size or file count. `distributed => ...` overrides `[maintenance.distribution] mode` for this one call (see [Configuration](../deployment/configuration.md) and [Distributed compaction](../design-notes/distributed-compaction.md)); omit it to use the configured mode. A manual `CALL` commits with no extra snapshot properties; the auto-compaction scheduler (see [Maintenance (auto-compaction)](../deployment/configuration.md#maintenance-auto-compaction)) calls this same handler internally and stamps `sqe.maintenance.job-id`/`principal`/`trigger` onto the snapshot it commits, so an autonomous compaction is attributable in the table's history while a manual one is not. |
 | `system.expire_snapshots` | `sqe-sql` + `sqe-coordinator` | `table => 'ns.t'` | `older_than => TIMESTAMP`, `retain_last => N` | Drops old snapshots. `older_than` and `retain_last` combine: a snapshot must be older than `older_than` and beyond the `retain_last` window before it is removed. |
 | `system.remove_orphan_files` | `sqe-sql` + `sqe-coordinator` | `table => 'ns.t'` | `older_than => TIMESTAMP` | Deletes files under the table prefix not referenced by any live snapshot. Default `older_than` is 3 days ago, to avoid racing with in-flight writes. |
 | `system.rewrite_manifests` | `sqe-sql` + `sqe-coordinator` | `table => 'ns.t'` | - | Consolidates many small manifest files into fewer larger ones. Speeds up planning on large tables. |
@@ -144,6 +144,27 @@ distributed call plans, dispatches, and commits.
 coordinator-local path; a distributed rewrite is instead bounded by
 `[maintenance.distribution] max_inflight_groups_per_worker` (per-worker,
 not global), configured in [Configuration](../deployment/configuration.md).
+
+### Force a full rewrite
+
+`rewrite_all => true` rewrites every data file, including files already at or
+above the target size and partitions below `min_input_files`. It applies all
+deletes and re-encodes at the target size. Use it to force a clean pass after a
+schema or partition-spec change, or to apply accumulated deletes across a whole
+table in one commit.
+
+```sql
+CALL system.rewrite_data_files(
+    table => 'analytics.events',
+    rewrite_all => true
+);
+```
+
+Because it re-encodes everything, it costs a full read and write of the table.
+It is off by default and subsumed by `strategy => 'sort'`, which already
+rewrites the whole partition. `rewrite_all` is supported on both the
+coordinator-local and distributed paths: it forces every file into the group
+plan and bypasses the `min_input_files` floor on either path.
 
 ### Check compaction debt before deciding whether to run a rewrite
 
