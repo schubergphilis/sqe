@@ -2063,8 +2063,11 @@ impl WriteHandler {
                     return Ok(vec![]);
                 }
                 info!(table = %table_ident, file_count = old_data_files.len(), attempt, "DELETE: truncating table (no WHERE clause)");
+                let files_to_remove = self
+                    .extend_with_superseded_deletes(&table, old_data_files)
+                    .await?;
                 let tx = Transaction::new(&table);
-                let action = tx.rewrite_files().delete_files(old_data_files);
+                let action = tx.rewrite_files().delete_files(files_to_remove);
                 let commit_result = match action.apply(tx) {
                     Ok(tx) => tx.commit(catalog.as_catalog().as_ref()).await,
                     Err(e) => Err(e),
@@ -2188,11 +2191,14 @@ impl WriteHandler {
                 "DELETE: committing CoW rewrite"
             );
 
+            let files_to_remove = self
+                .extend_with_superseded_deletes(&table, to_rewrite)
+                .await?;
             let tx = Transaction::new(&table);
             let action = tx
                 .rewrite_files()
                 .add_data_files(new_data_files)
-                .delete_files(to_rewrite);
+                .delete_files(files_to_remove);
             let commit_result = match action.apply(tx) {
                 Ok(tx) => tx.commit(catalog.as_catalog().as_ref()).await,
                 Err(e) => Err(e),
@@ -2287,8 +2293,11 @@ impl WriteHandler {
                 file_count = old_data_files.len(),
                 "MoR DELETE: no WHERE clause, truncating table via CoW"
             );
+            let files_to_remove = self
+                .extend_with_superseded_deletes(&table, old_data_files)
+                .await?;
             let tx = Transaction::new(&table);
-            let action = tx.rewrite_files().delete_files(old_data_files);
+            let action = tx.rewrite_files().delete_files(files_to_remove);
             let tx = action.apply(tx).map_err(|e| {
                 SqeError::Execution(format!("Failed to apply truncate transaction: {e}"))
             })?;
@@ -2466,8 +2475,11 @@ impl WriteHandler {
                 file_count = old_data_files.len(),
                 "equality DELETE: no WHERE clause, falling back to CoW truncate"
             );
+            let files_to_remove = self
+                .extend_with_superseded_deletes(&table, old_data_files)
+                .await?;
             let tx = Transaction::new(&table);
-            let action = tx.rewrite_files().delete_files(old_data_files);
+            let action = tx.rewrite_files().delete_files(files_to_remove);
             let tx = action.apply(tx).map_err(|e| {
                 SqeError::Execution(format!("Failed to apply truncate transaction: {e}"))
             })?;
@@ -2813,11 +2825,14 @@ impl WriteHandler {
                 "UPDATE: committing CoW rewrite"
             );
 
+            let files_to_remove = self
+                .extend_with_superseded_deletes(&table, to_rewrite)
+                .await?;
             let tx = Transaction::new(&table);
             let action = tx
                 .rewrite_files()
                 .add_data_files(new_data_files)
-                .delete_files(to_rewrite);
+                .delete_files(files_to_remove);
             let commit_result = match action.apply(tx) {
                 Ok(tx) => tx.commit(catalog.as_catalog().as_ref()).await,
                 Err(e) => Err(e),
@@ -3519,13 +3534,16 @@ impl WriteHandler {
             return Ok(vec![]);
         }
 
+        let files_to_remove = self
+            .extend_with_superseded_deletes(&table, old_data_files)
+            .await?;
         let tx = Transaction::new(&table);
         let mut action = tx.rewrite_files();
         if !new_data_files.is_empty() {
             action = action.add_data_files(new_data_files);
         }
-        if !old_data_files.is_empty() {
-            action = action.delete_files(old_data_files);
+        if !files_to_remove.is_empty() {
+            action = action.delete_files(files_to_remove);
         }
         let tx = action
             .apply(tx)
@@ -4215,8 +4233,6 @@ impl WriteHandler {
         new_data_files: Vec<DataFile>,
         overwrite: bool,
     ) -> sqe_core::Result<()> {
-        use std::collections::HashSet;
-
         if !overwrite {
             if new_data_files.is_empty() {
                 return Ok(());
@@ -4277,24 +4293,18 @@ impl WriteHandler {
                 return Ok(());
             }
 
-            // Drop position-delete files whose data files are all being removed.
-            let removed_paths: HashSet<String> =
-                removed_data.iter().map(|d| d.file_path().to_string()).collect();
-            let live_deletes = crate::maintenance::collect_live_delete_files(&table).await?;
-            let covered_deletes =
-                crate::maintenance::covered_position_deletes(&removed_paths, &live_deletes);
-
-            let files_to_remove: Vec<DataFile> = removed_data
-                .iter()
-                .cloned()
-                .chain(covered_deletes.into_iter())
-                .collect();
+            // Drop position-delete files whose data files are all being
+            // removed, in the same atomic swap (#376).
+            let removed_data_count = removed_data.len();
+            let files_to_remove = self
+                .extend_with_superseded_deletes(&table, removed_data)
+                .await?;
 
             info!(
                 table = %table_ident,
                 partitioned,
                 new_files = new_data_files.len(),
-                removed_data = removed_data.len(),
+                removed_data = removed_data_count,
                 attempt,
                 "INSERT OVERWRITE: committing atomic swap"
             );
@@ -4333,6 +4343,31 @@ impl WriteHandler {
                 }
             }
         }
+    }
+
+    /// Extend an about-to-be-removed set of data files with the position-delete
+    /// files those data files fully supersede, so a copy-on-write rewrite drops
+    /// dangling delete-file debris in the same commit (#376). This is the same
+    /// cleanup the compaction path performs (`maintenance.rs`).
+    ///
+    /// Only position deletes whose referenced data file is entirely within
+    /// `removed_data` are added. Equality deletes (which apply by value +
+    /// sequence number, not by data-file path) and position deletes that still
+    /// cover a surviving data file are left untouched: removing either could
+    /// resurrect rows in files this rewrite keeps.
+    async fn extend_with_superseded_deletes(
+        &self,
+        table: &IcebergTable,
+        removed_data: Vec<DataFile>,
+    ) -> sqe_core::Result<Vec<DataFile>> {
+        use std::collections::HashSet;
+        let removed_paths: HashSet<String> = removed_data
+            .iter()
+            .map(|d| d.file_path().to_string())
+            .collect();
+        let live_deletes = crate::maintenance::collect_live_delete_files(table).await?;
+        let covered = crate::maintenance::covered_position_deletes(&removed_paths, &live_deletes);
+        Ok(removed_data.into_iter().chain(covered).collect())
     }
 
     /// Collect all current DataFile objects from the table's manifest entries.
