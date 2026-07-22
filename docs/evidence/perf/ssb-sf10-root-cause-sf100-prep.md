@@ -34,12 +34,14 @@ decomposes into three layers:
    filters arm correctly and cut decode proportionally at every practical key count.
    What they cannot cut is bytes read (uniformly scattered FKs put matches in every
    row group) or the key-column decode of the full fact table, and all of it
-   funnels through one output stream. Measured directly: q4.1's coordinator
-   CPU-seconds equal its wall time at ~1 core average, so the wall is serialized
-   CPU, not storage wait; the same work across the box's cores is ~1.5s. At 10x
-   the rows, the funnel loses to Trino's split-parallel pipelines. The one prior
-   attempt at output parallelism (#235) was perf-neutral, so this layer needs
-   profiling before more construction.
+   funnels through one output stream. Caveat added 2026-07-06: a symbolized
+   profile on the dev box showed decode itself running parallel on 12 threads
+   there, throttled by the Docker-for-Mac network path rather than by the
+   funnel, so the funnel hypothesis stands on rig-side evidence (fetch_time
+   dominance, Bucket-A, ClickBench) and needs rig profiling to confirm against
+   the alternative, fetch-path efficiency. Either way, the one prior attempt at
+   output parallelism (#235) was perf-neutral, so this layer needs profiling
+   before more construction.
 
 ## 1. Where the gap lives
 
@@ -225,29 +227,54 @@ Three verdicts fall out:
   went 727ms at SF1 to 10,261ms at SF10 for q4.1, roughly 14x for 10x rows on a
   memory-tight box.
 
-A CPU-vs-I/O discrimination probe settles the "is this just heavy storage I/O"
-question. On ssb_sf10 (11-core box), q4.1's coordinator CPU-seconds equal its wall
-time (10.5-11.4 CPU-s vs 10.8-11.9s wall, 95-97 percent) at an average of 0.96
-cores, peak 1.8. The coordinator is fully CPU-busy on one core for the whole query:
-not idle-waiting on storage (CPU would sit far below wall) and not multi-core
-saturated (cores would sit far above 1). A warm rerun of a one-column full scan was
-no faster than cold (2.9s then 3.2s), and the local S3 server peaked at 1-4 cores
-without ever stalling the coordinator, so storage overlaps off the critical path.
-Notable: even with 4 files and the intra-file split, average cores stay below 1,
-meaning the decode subtasks are effectively serialized by backpressure from the
-single output consumer rather than running concurrently. The ~11 CPU-seconds of
-decode, filter evaluation, and join work would be ~1.5s spread across the 11 cores.
-Serialization is the wall; faster storage would move nothing.
+A CPU-vs-I/O discrimination probe first read q4.1's "CPU-seconds equal wall at
+0.96 average cores" as CPU serialized on one core. A symbolized 1ms-sample
+profile of q4.3 mid-flight then CORRECTED that reading, in two steps.
+
+First, the decode is not serialized. The profile shows the decode work (zstd page
+decompression dominates, then parquet RLE and bit-pack decode; filter-probe
+kernels are a rounding error) spread across 12 runtime threads, each mostly
+parked. The vendored reader's per-subtask spawn fan-out works as designed; the
+workers are starved, not serialized. The "wall equals CPU at one core" arithmetic
+was pacing, not pinning.
+
+Second, what starves them on THIS box is the network path, and it is asymmetric
+between the engines. Measured directly with a 537MB lineorder parquet: host to
+rustfs through the Docker-for-Mac port-forward (SQE's path here; the coordinator
+runs natively) moves 123MB/s; the same object fetched container-to-container
+inside the Docker network (Trino's path) completes in 2.6s including container
+startup, at least 2-3x faster. Every SF10 query wall on this box then reduces to
+bytes_scanned divided by ~120MB/s plus a fixed ~1.3s floor: q1.1 454MB is 4.5s,
+q2.1 783MB is 6.5s, all three q4.x 1,178MB are 10-11s regardless of filter
+selectivity. The q4.3 anomaly (best filtering, worst ratio) dissolves: same
+bytes, same wall. The earlier warm-rerun test that "ruled out storage" was
+misread; the OS page cache does not bypass the NAT hop.
+
+Consequences: cross-engine ratios measured on this box are a methodology
+artifact (the known port-forward bandwidth trap), and its 0.55x matching the
+clean rig's 0.53x is coincidence, two different limiting mechanisms. The
+clean-rig numbers (both engines containerized, Linux) remain the engine signal.
+The single-output-partition funnel hypothesis for the RIG gap now rests on the
+rig-side evidence alone (fetch_time dominance, the Bucket-A analysis, ClickBench
+winning) and must be settled by profiling ON THE RIG, with fetch-throughput and
+S3-request-count instrumentation, because the profile also raises a second
+rig-side candidate: fetch-path efficiency (opendal ranged-GET pattern,
+per-request sigv4 signing visible in the stacks) versus Trino's reader.
 
 The full 13-query timed set seals the null end to end: default cap total 84.3s,
 raised cap total 84.4s (per-query deltas all sub-second noise; q1.1/q3.4 sanity
 checks show no regression from the raise either). Result JSONs:
 `benchmarks/results/ssb-sf10-flight-2026-07-05T14:30:24.json` (default) and
 `...T14:32:14.json` (raised cap). The ~84s total vs the clean rig's 31.8s reflects
-the 8GB memory cap plus swap pressure on this box, which is also why the Trino
-compare was deliberately not run here: a Trino JVM grabs its heap eagerly at
-startup on a box with ~120MB truly free, and any ratio against a memory-capped SQE
-would be non-comparable anyway. The fresh SF10 compare belongs on the clean rig.
+the 8GB memory cap plus swap pressure on this box.
+
+A head-to-head compare WAS later run on this box after the user freed memory
+(2026-07-06, Trino 465 at 3GB heap in-network, 13/13 rows match): SQE 90.4s vs
+Trino 50.0s, 0.55x: `benchmarks/results/compare-ssb-sf10-2026-07-06T08:58:51.json`,
+plus an SQE-only sweep `ssb-sf10-flight-2026-07-06T08:44:09.json` (87.3s). Per the
+network-path finding above, treat that ratio as confounded: SQE fetched through
+the 123MB/s port-forward, Trino in-network. The clean rig remains the venue for
+honest ratios.
 
 ## 7. Fix plan, ranked (amended)
 
