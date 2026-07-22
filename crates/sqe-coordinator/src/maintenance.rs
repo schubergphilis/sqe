@@ -86,6 +86,17 @@ pub struct MaintenanceHandler {
     /// other. Always present (cheap to construct) even when `worker_registry`
     /// is `None`, since only the distributed path ever reads it.
     worker_load: Arc<WorkerLoadTracker>,
+    /// TEST-ONLY synchronization seam (`#[cfg(test)]`, so it compiles only
+    /// for this crate's own unit test binary -- never for a release build or
+    /// an external integration test). See `RewriteRaceSeam`'s doc comment and
+    /// the `#[cfg(test)] mod tests` test
+    /// `concurrent_position_delete_during_local_rewrite_does_not_resurrect_rows`
+    /// for how it is used to land a concurrent commit deterministically
+    /// inside `rewrite_data_files_once`'s conflict window, instead of racing
+    /// wall-clock timing. Always `None` unless a test opts in via
+    /// `with_test_race_seam`; `MaintenanceHandler::new` never sets it.
+    #[cfg(test)]
+    race_seam: Option<Arc<RewriteRaceSeam>>,
 }
 
 impl MaintenanceHandler {
@@ -98,7 +109,19 @@ impl MaintenanceHandler {
             runtime: None,
             worker_registry: None,
             worker_load: Arc::new(WorkerLoadTracker::new()),
+            #[cfg(test)]
+            race_seam: None,
         }
+    }
+
+    /// TEST-ONLY: attach a [`RewriteRaceSeam`] so the first attempt of
+    /// `rewrite_data_files_once` pauses right before its final commit. See
+    /// the field doc comment on `race_seam` above.
+    #[cfg(test)]
+    #[must_use = "with_test_race_seam consumes self; bind the returned handler"]
+    fn with_test_race_seam(mut self, seam: Arc<RewriteRaceSeam>) -> Self {
+        self.race_seam = Some(seam);
+        self
     }
 
     /// Attach the shared coordinator runtime for spillable sort compaction.
@@ -887,6 +910,18 @@ impl MaintenanceHandler {
             .current_snapshot()
             .map(|s| s.sequence_number())
             .unwrap_or(0);
+        // The plan-baseline snapshot id, captured from this SAME table load.
+        // Passed to `set_validate_from_snapshot_id` below (VENDOR PATCH
+        // fix/compaction-concurrent-delete-conflict): if a concurrent MoR
+        // position delete lands on one of the data files this rewrite
+        // replaces after this baseline, the commit is rejected as a
+        // retryable conflict instead of silently resurrecting the deleted
+        // rows (a dangling position delete that no longer matches any live
+        // file path once the rewrite lands its compacted output under a new
+        // path). `None` on a brand-new/empty table: there is no snapshot to
+        // validate against, and `removed_data_files` is empty anyway in that
+        // case (see `validate_no_new_position_deletes`'s empty-set fast path).
+        let plan_snapshot_id = table.metadata_ref().current_snapshot().map(|s| s.snapshot_id());
         let read_plan = plan_delete_aware_read(&table).await?;
         let live_deletes = collect_live_delete_files(&table).await?;
 
@@ -1173,11 +1208,24 @@ impl MaintenanceHandler {
         // atomic swap.
         let files_to_remove: Vec<DataFile> =
             old_files.iter().cloned().chain(covered_deletes).collect();
+        // set_validate_from_snapshot_id(plan_snapshot_id) is the position-delete
+        // conflict-correctness keystone (VENDOR PATCH
+        // fix/compaction-concurrent-delete-conflict): see the comment on
+        // `plan_snapshot_id`'s capture above and
+        // `RewriteFilesAction::set_validate_from_snapshot_id`'s doc comment in
+        // `vendor/iceberg-rust/crates/iceberg/src/transaction/rewrite_files.rs`
+        // for the full rationale. A hit surfaces as a retryable conflict error
+        // from `.commit()` below, which `classify_commit_error` flags and the
+        // `rewrite_data_files` retry wrapper (this method's caller) turns into
+        // a full re-plan against the fresh snapshot -- so the new delete gets
+        // applied to the retry's compacted output instead of being silently
+        // dropped.
         let mut action = tx
             .rewrite_files()
             .set_enable_delete_filter_manager(true)
             .set_check_file_existence(true)
             .set_new_data_file_sequence_number(seq_at_start)
+            .set_validate_from_snapshot_id(plan_snapshot_id)
             .add_data_files(new_files)
             .delete_files(files_to_remove);
         // Job-identity stamp for autonomous compactions (Phase 4b scheduler).
@@ -1190,6 +1238,23 @@ impl MaintenanceHandler {
         let tx_applied = action
             .apply(tx)
             .map_err(|e| SqeError::Execution(format!("rewrite_files apply failed: {e}")))?;
+
+        // TEST-ONLY (see `race_seam`'s doc comment): pauses the FIRST attempt
+        // right here -- after the plan baseline was captured from a table
+        // load that is now stale, and after this attempt finished computing
+        // its compacted output, but BEFORE the commit below -- so a test can
+        // deterministically land a concurrent commit inside the conflict
+        // window `set_validate_from_snapshot_id` guards. `fired` makes this
+        // one-shot: a retry (a fresh call to this method after a rejected
+        // first attempt) runs straight through, matching real retry behavior.
+        // Compiled only under `#[cfg(test)]`; always a no-op in production.
+        #[cfg(test)]
+        if let Some(seam) = self.race_seam.as_ref() {
+            if !seam.fired.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                seam.ready.notify_one();
+                seam.go.notified().await;
+            }
+        }
 
         let committed = tx_applied
             .commit(catalog.as_ref())
@@ -1401,6 +1466,16 @@ impl MaintenanceHandler {
             .current_snapshot()
             .map(|s| s.snapshot_id())
             .unwrap_or(0);
+        // The plan-baseline snapshot id for `set_validate_from_snapshot_id`
+        // (VENDOR PATCH fix/compaction-concurrent-delete-conflict; see the
+        // twin comment in `rewrite_data_files_once`). Deliberately a SEPARATE
+        // `Option<i64>` from `snapshot_id` above: `snapshot_id` feeds the wire
+        // dispatch to workers and defaults to `0` (a real, if unlikely,
+        // snapshot id) when the table has no current snapshot yet, whereas the
+        // validator needs a true `None` in that case -- `Some(0)` would make
+        // it look for a baseline snapshot that was never captured and either
+        // false-positive-conflict or match the wrong snapshot by coincidence.
+        let plan_snapshot_id = table.metadata_ref().current_snapshot().map(|s| s.snapshot_id());
 
         let read_plan = plan_delete_aware_read(&table).await?;
         let live_deletes = collect_live_delete_files(&table).await?;
@@ -1567,6 +1642,7 @@ impl MaintenanceHandler {
             dist.partial_progress,
             dist.partial_progress_batch,
             seq_at_start,
+            plan_snapshot_id,
             &metadata_location,
             snapshot_id,
             &live_deletes,
@@ -1709,6 +1785,7 @@ impl MaintenanceHandler {
         partial_progress: bool,
         partial_progress_batch: usize,
         seq_at_start: i64,
+        plan_snapshot_id: Option<i64>,
         metadata_location: &str,
         snapshot_id: i64,
         live_deletes: &[DataFile],
@@ -1748,6 +1825,7 @@ impl MaintenanceHandler {
                 ident,
                 batch,
                 seq_at_start,
+                plan_snapshot_id,
                 metadata_location,
                 snapshot_id,
                 live_deletes,
@@ -1875,6 +1953,7 @@ impl MaintenanceHandler {
         ident: &TableIdent,
         batch: &[Vec<DataFile>],
         seq_at_start: i64,
+        plan_snapshot_id: Option<i64>,
         metadata_location: &str,
         snapshot_id: i64,
         live_deletes: &[DataFile],
@@ -1898,6 +1977,24 @@ impl MaintenanceHandler {
         let mut cur_metadata_location: String = metadata_location.to_string();
         let mut cur_snapshot_id: i64 = snapshot_id;
         let mut cur_live_deletes: Vec<DataFile> = live_deletes.to_vec();
+        // The `set_validate_from_snapshot_id` baseline for THIS attempt's
+        // commit. Starts at the caller's job-wide `plan_snapshot_id` (attempt
+        // 1, no reload yet -- identical to the non-batched path). Every time
+        // this loop reloads the table (either arm below), it must move
+        // forward to that reload's snapshot id: the vendored
+        // `validate_no_new_position_deletes` check treats ANY live position
+        // delete newer than the baseline that references one of this batch's
+        // own files as an unconditional conflict, with no way to know this
+        // same commit's `cur_live_deletes`/`covered_position_deletes` already
+        // accounted for it. Leaving the baseline pinned to the job-wide
+        // `plan_snapshot_id` would make that vendor check re-flag the exact
+        // delete this loop's own pre-commit re-dispatch just correctly
+        // incorporated, permanently failing the batch instead of committing
+        // the now-correct output. Moving it to the reload keeps the vendor
+        // check in its intended "secondary net" role (only catching a delete
+        // that lands in the sub-millisecond gap between this reload and the
+        // vendored `Transaction::commit`'s own internal reload).
+        let mut cur_plan_snapshot_id: Option<i64> = plan_snapshot_id;
 
         loop {
             attempt += 1;
@@ -1959,6 +2056,8 @@ impl MaintenanceHandler {
                             .current_snapshot()
                             .map(|s| s.snapshot_id())
                             .unwrap_or(0);
+                        cur_plan_snapshot_id =
+                            reload.metadata_ref().current_snapshot().map(|s| s.snapshot_id());
                         cur_live_deletes = reload_live_deletes;
                         reloaded_table = Some(reload);
                         continue;
@@ -1980,6 +2079,8 @@ impl MaintenanceHandler {
                 // No new covering delete: still adopt this reload as the
                 // commit base and delete set, keeping `check_file_existence`
                 // and `covered_position_deletes` maximally current.
+                cur_plan_snapshot_id =
+                    reload.metadata_ref().current_snapshot().map(|s| s.snapshot_id());
                 cur_live_deletes = reload_live_deletes;
                 reloaded_table = Some(reload);
             }
@@ -1992,6 +2093,7 @@ impl MaintenanceHandler {
                 &batch_old_files,
                 aggregated,
                 seq_at_start,
+                cur_plan_snapshot_id,
                 &cur_live_deletes,
                 snapshot_properties.clone(),
                 table_cache,
@@ -2038,6 +2140,8 @@ impl MaintenanceHandler {
                             .current_snapshot()
                             .map(|s| s.snapshot_id())
                             .unwrap_or(0);
+                        cur_plan_snapshot_id =
+                            reloaded.metadata_ref().current_snapshot().map(|s| s.snapshot_id());
                         cur_live_deletes = collect_live_delete_files(&reloaded).await?;
                         reloaded_table = Some(reloaded);
                         continue;
@@ -2062,6 +2166,7 @@ impl MaintenanceHandler {
         batch_old_files: &[DataFile],
         aggregated: sqe_compaction::dispatch::AggregatedRewrite,
         seq_at_start: i64,
+        plan_snapshot_id: Option<i64>,
         live_deletes: &[DataFile],
         snapshot_properties: Option<std::collections::HashMap<String, String>>,
         table_cache: Option<&TableMetadataCache>,
@@ -2106,6 +2211,7 @@ impl MaintenanceHandler {
             .set_enable_delete_filter_manager(true)
             .set_check_file_existence(true)
             .set_new_data_file_sequence_number(seq_at_start)
+            .set_validate_from_snapshot_id(plan_snapshot_id)
             .add_data_files(aggregated.new_files)
             .delete_files(files_to_remove);
         if let Some(props) = snapshot_properties {
@@ -3126,6 +3232,45 @@ pub(crate) fn session_has_write_privilege(session: &Session) -> bool {
     true
 }
 
+/// TEST-ONLY (`#[cfg(test)]`) two-way handshake used by
+/// `rewrite_data_files_once` (see the `race_seam` field on
+/// [`MaintenanceHandler`]) to pause the first attempt right before its final
+/// commit and let a test land a concurrent write deterministically inside
+/// the conflict window, instead of racing wall-clock timing:
+///
+/// 1. The rewrite reaches the pause point (after loading the table, capturing
+///    the plan baseline, and computing its compacted output -- everything
+///    that makes this attempt's view of the table stale) and calls
+///    `ready.notify_one()`, then blocks on `go.notified()`.
+/// 2. The test, having awaited `ready.notified()`, is guaranteed the rewrite
+///    is now paused with its baseline already captured. It commits the
+///    concurrent write.
+/// 3. The test calls `go.notify_one()`, releasing the rewrite to attempt its
+///    commit against the now-advanced table.
+///
+/// `fired` makes step 1 one-shot: a retried attempt (a fresh call to
+/// `rewrite_data_files_once` after this one was rejected) runs straight
+/// through without pausing again, matching real retry behavior (only the
+/// first attempt races the concurrent writer; the retry re-reads and re-plans
+/// against the table the concurrent write already landed on).
+#[cfg(test)]
+struct RewriteRaceSeam {
+    ready: tokio::sync::Notify,
+    go: tokio::sync::Notify,
+    fired: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(test)]
+impl RewriteRaceSeam {
+    fn new() -> Self {
+        Self {
+            ready: tokio::sync::Notify::new(),
+            go: tokio::sync::Notify::new(),
+            fired: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3452,6 +3597,232 @@ mod tests {
         assert!(parse_distribution_mode_override("yolo").is_err());
     }
 
+    // -------------------------------------------------------------------
+    // Concurrent-position-delete-during-compaction guard (VENDOR PATCH
+    // fix/compaction-concurrent-delete-conflict): proves the coordinator-
+    // local `rewrite_data_files` path does not resurrect a row deleted by a
+    // concurrent MoR DELETE that lands mid-compaction.
+    //
+    // `rewrite_files_new_delete_conflict_test.rs` already proves the
+    // vendored `RewriteFilesAction::set_validate_from_snapshot_id` primitive
+    // in isolation. This test instead drives the REAL call path
+    // (`rewrite_data_files_once`, the same method the public `handle()` /
+    // `rewrite_data_files` retry wrapper calls), through a real SQLite-
+    // backed catalog with real Parquet data and a real position delete
+    // file, to prove the wiring in THIS file (not just the vendored
+    // primitive) closes the resurrection hole end to end.
+    //
+    // The race is forced deterministically via `RewriteRaceSeam` rather than
+    // wall-clock timing: without it, the concurrent DELETE would have to
+    // land inside the narrow window between this attempt's stale table load
+    // and its commit, which cannot be guaranteed by sleeping.
+    //
+    // Run with `cargo test -p sqe-coordinator --lib --features test-sqlite
+    // maintenance::tests::concurrent_position_delete`.
+    #[cfg(feature = "test-sqlite")]
+    mod concurrent_delete_race {
+        use super::*;
+        use arrow_array::Array;
+        use iceberg::spec::Schema as IcebergSchema;
+        use iceberg::TableCreation;
+
+        async fn race_sqlite_catalog(dir: &tempfile::TempDir) -> Arc<dyn Catalog> {
+            let location = dir.path().to_str().expect("tempdir path is UTF-8");
+            sqe_catalog::mount::build_catalog(
+                location,
+                sqe_sql::CatalogKind::Sqlite,
+                &std::collections::BTreeMap::new(),
+                &sqe_core::SecretStore::new(),
+            )
+            .await
+            .expect("sqlite catalog builds")
+        }
+
+        fn race_one_col_arrow_schema() -> Arc<Schema> {
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]))
+        }
+
+        fn race_test_config() -> SqeConfig {
+            toml::from_str("[coordinator]\n[auth]\n[catalog]\ncatalog_url = \"\"\n")
+                .expect("minimal SqeConfig parses")
+        }
+
+        /// Reload the table and read every live data file's `id` column back
+        /// directly (bypassing any delete-application scan machinery, since
+        /// the whole point is to confirm the COMMITTED data files themselves
+        /// no longer contain the deleted row).
+        async fn race_live_ids(catalog: &Arc<dyn Catalog>, ident: &TableIdent) -> Vec<i64> {
+            let table = catalog.load_table(ident).await.expect("reload table");
+            let files = collect_live_data_files(&table).await.expect("collect live data files");
+            let mut ids = Vec::new();
+            for f in files {
+                let input = table.file_io().new_input(f.file_path()).expect("new_input");
+                let bytes = input.read().await.expect("read file bytes");
+                let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(bytes)
+                    .expect("open parquet")
+                    .build()
+                    .expect("build reader");
+                for batch in reader {
+                    let batch = batch.expect("read batch");
+                    let col = batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .expect("id column is Int64Array");
+                    for i in 0..col.len() {
+                        ids.push(col.value(i));
+                    }
+                }
+            }
+            ids.sort_unstable();
+            ids
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn concurrent_position_delete_during_local_rewrite_does_not_resurrect_rows() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let catalog = race_sqlite_catalog(&dir).await;
+            let ns = NamespaceIdent::new("default".to_string());
+            catalog
+                .create_namespace(&ns, std::collections::HashMap::new())
+                .await
+                .expect("create namespace");
+
+            let iceberg_schema: IcebergSchema =
+                iceberg::arrow::arrow_schema_to_schema_auto_assign_ids(&race_one_col_arrow_schema())
+                    .expect("arrow schema converts to iceberg schema");
+            let creation = TableCreation::builder()
+                .name("race_test".to_string())
+                .schema(iceberg_schema)
+                .build();
+            catalog.create_table(&ns, creation).await.expect("create table");
+            let ident = TableIdent::new(ns.clone(), "race_test".to_string());
+
+            // Seed ONE data file with three rows: id 0, 1, 2.
+            let seed_table = catalog.load_table(&ident).await.expect("load table for seeding");
+            let batch = RecordBatch::try_new(
+                race_one_col_arrow_schema(),
+                vec![Arc::new(Int64Array::from(vec![0i64, 1, 2]))],
+            )
+            .expect("build seed batch");
+            let compression = parse_parquet_compression("zstd");
+            let tracker = new_upload_tracker();
+            let seeded = crate::writer::write_data_files(
+                &seed_table,
+                vec![batch],
+                "seed",
+                compression,
+                tracker,
+            )
+            .await
+            .expect("write seed data file");
+            assert_eq!(seeded.len(), 1, "setup: expected a single seed data file");
+            let old_path = seeded[0].file_path().to_string();
+
+            let tx = Transaction::new(&seed_table);
+            let action = tx.fast_append().add_data_files(seeded);
+            let tx = action.apply(tx).expect("apply fast_append");
+            tx.commit(catalog.as_ref()).await.expect("commit seed data file");
+
+            // Race machinery: attempt 1 pauses right before its commit.
+            let seam = Arc::new(RewriteRaceSeam::new());
+            let handler = MaintenanceHandler::new(race_test_config())
+                .with_test_race_seam(seam.clone());
+
+            let table_ref = TableRef::parse("default.race_test").expect("parse table ref");
+            let catalog_for_task = catalog.clone();
+
+            let rewrite_task = tokio::spawn(async move {
+                handler
+                    .rewrite_data_files_once(
+                        &catalog_for_task,
+                        &table_ref,
+                        None,
+                        Some(1),
+                        None,
+                        None,
+                        None,
+                        None,
+                        true, // rewrite_all: force the lone file into the rewrite
+                        None,
+                    )
+                    .await
+            });
+
+            // Attempt 1 has now loaded the table, captured its (soon-to-be
+            // stale) plan baseline, and finished computing its compacted
+            // output; only the commit remains.
+            seam.ready.notified().await;
+
+            // Concurrent writer: a MoR position DELETE lands on the very
+            // file being rewritten, marking the row at position 1 (id=1) as
+            // deleted -- the row-resurrection hazard this patch closes.
+            let table_at_s0 = catalog.load_table(&ident).await.expect("reload at s0");
+            let delete_files = crate::writer::write_position_delete_files(
+                &table_at_s0,
+                vec![(old_path.clone(), 1)],
+                compression,
+            )
+            .await
+            .expect("write position delete file");
+            let tx2 = Transaction::new(&table_at_s0);
+            let action2 = tx2.row_delta().add_delete_files(delete_files);
+            let tx2 = action2.apply(tx2).expect("apply row_delta");
+            tx2.commit(catalog.as_ref())
+                .await
+                .expect("commit concurrent position delete");
+
+            // Release attempt 1: its stale in-memory table has no idea about
+            // the delete above, so `set_validate_from_snapshot_id` must
+            // reject its commit as a retryable conflict instead of
+            // committing the 3-row compacted output over the new delete.
+            seam.go.notify_one();
+
+            let attempt1 = rewrite_task.await.expect("task join");
+            let err = attempt1.expect_err(
+                "attempt 1 must be rejected: a new position delete landed on the file being \
+                 rewritten after its plan baseline; committing anyway would resurrect id=1",
+            );
+            let msg = err.to_string().to_lowercase();
+            assert!(
+                msg.contains("conflict") || msg.contains("retry"),
+                "rejection must be classified retryable so the outer `rewrite_data_files` \
+                 retry wrapper retries instead of surfacing a hard failure, got: {msg}"
+            );
+
+            // Retry (mirrors `rewrite_data_files`'s retry wrapper): a fresh
+            // handler with no seam re-runs `rewrite_data_files_once`,
+            // reloading the table -- now at S1, with the position delete
+            // live -- and re-planning against it.
+            let retry_handler = MaintenanceHandler::new(race_test_config());
+            let outcome = retry_handler
+                .rewrite_data_files_once(
+                    &catalog,
+                    &TableRef::parse("default.race_test").expect("parse table ref"),
+                    None,
+                    Some(1),
+                    None,
+                    None,
+                    None,
+                    None,
+                    true,
+                    None,
+                )
+                .await
+                .expect("retry attempt must succeed against the now-current snapshot");
+            assert!(outcome.skipped_reason.is_none(), "retry must actually run, not skip");
+
+            // Correctness: id=1 must stay deleted, not resurrected by
+            // attempt 1's stale (pre-delete) compacted output.
+            let ids = race_live_ids(&catalog, &ident).await;
+            assert_eq!(
+                ids,
+                vec![0, 2],
+                "concurrently-deleted row (id=1) must not resurrect; got {ids:?}"
+            );
+        }
+    }
+
     // ---------------------------------------------------------------------
     // Phase 4d Task 3: opt-in partial-progress batched commits
     //
@@ -3758,6 +4129,7 @@ mod tests {
                 /* partial_progress */ true,
                 /* partial_progress_batch */ 1,
                 seq_at_start,
+                Some(snapshot_id),
                 &metadata_location,
                 snapshot_id,
                 &[],
@@ -3809,6 +4181,7 @@ mod tests {
                 /* partial_progress */ false,
                 /* partial_progress_batch */ 1, // ignored when partial_progress is false
                 seq_at_start,
+                Some(snapshot_id),
                 &metadata_location,
                 snapshot_id,
                 &[],
@@ -3868,6 +4241,7 @@ mod tests {
                 /* partial_progress */ true,
                 /* partial_progress_batch */ 1,
                 seq_at_start,
+                Some(snapshot_id),
                 &metadata_location,
                 snapshot_id,
                 &[],
@@ -4086,6 +4460,7 @@ mod tests {
                 /* partial_progress */ true,
                 /* partial_progress_batch */ 1,
                 seq_at_start,
+                Some(snapshot_id),
                 &metadata_location,
                 snapshot_id,
                 &[],
