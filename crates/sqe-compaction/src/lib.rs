@@ -20,8 +20,8 @@ pub mod zorder;
 
 pub use dispatch::{
     aggregate_group_outcomes, decode_group_response, least_loaded_worker,
-    place_groups_largest_first, AggregatedRewrite, GroupOutcome, GroupPlacement, PlacementPlan,
-    WorkerLoad,
+    next_group_assignment, place_groups_largest_first, AggregatedRewrite, GroupOutcome,
+    GroupPlacement, PendingSlot, PlacementPlan, WorkerLoad,
 };
 pub use rewrite::{
     collect_live_delete_files, covered_position_deletes, delete_heavy_files,

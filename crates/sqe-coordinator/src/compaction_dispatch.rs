@@ -309,12 +309,27 @@ async fn dispatch_group_to_worker(
 /// `group_attempts` times, and return every group's [`CompactGroupResponse`]
 /// once all have succeeded.
 ///
+/// Uses a CONTINUOUS scheduler, not a wave: every healthy worker is kept
+/// filled up to `max_inflight_per_worker` at all times, and as soon as any
+/// in-flight group resolves, the freed slot is refilled immediately from the
+/// pending queue (largest group first) rather than waiting for every other
+/// group dispatched alongside it to also finish. This is what
+/// `sqe_compaction::dispatch::next_group_assignment` decides one assignment
+/// at a time; see its doc comment for the exact priority rules (largest
+/// pending group first, ties broken by input order, a group whose only
+/// eligible workers are excluded or at cap is skipped in favor of the next
+/// one that fits). The retry/exclusion/stall-guard/classification semantics
+/// below are identical to the previous wave-based scheduler; only the
+/// wall-clock scheduling changed.
+///
 /// On a group exhausting its retries, returns `Err` immediately: per the
 /// design, a distributed rewrite either commits everything or nothing, so
 /// there is no point continuing to dispatch remaining groups once one has
-/// permanently failed (any group already in flight is simply dropped;
-/// whatever it already wrote to object storage becomes an orphan reclaimed
-/// by the age-thresholded orphan sweep, not cleaned up here).
+/// permanently failed (any group already in flight -- including, in this
+/// continuous scheduler, groups dispatched well before the failing one --
+/// is simply dropped; whatever it already wrote to object storage becomes
+/// an orphan reclaimed by the age-thresholded orphan sweep, not cleaned up
+/// here). The same applies when the stall guard trips.
 ///
 /// `groups` are the coordinator's own bin-packed file groups (as produced by
 /// `pack_file_groups_partition_aware`/`group_files_by_partition`); this
@@ -353,107 +368,69 @@ pub(crate) async fn dispatch_and_collect_groups(
 
     let mut responses: Vec<CompactGroupResponse> = Vec::with_capacity(pending.len());
     let pool = registry.channel_pool();
+    let mut futs = FuturesUnordered::new();
 
-    while !pending.is_empty() {
-        let healthy = registry.healthy_workers().await;
-        if healthy.is_empty() {
-            return Err(SqeError::Execution(format!(
-                "distributed compaction job {job_id}: no healthy workers available; \
-                 {} group(s) undispatched",
-                pending.len()
-            )));
-        }
-
-        // Stall guard: a retried group's `excluded` set only grows, and
-        // application-level failures (see `DispatchError::is_transport`)
-        // deliberately do NOT shrink `healthy`. If a group has already
-        // failed on every worker currently healthy, no future iteration of
-        // this loop can ever place it -- waiting would spin the 200ms
-        // backoff below forever. Fail the job now instead.
-        if let Some(stuck) = pending
-            .iter()
-            .find(|g| is_permanently_stuck(&g.excluded, &healthy))
-        {
-            return Err(SqeError::Execution(format!(
-                "distributed compaction job {job_id}: group {} has failed on every currently \
-                 healthy worker ({:?}); no worker left to retry on",
-                stuck.group_id, stuck.excluded
-            )));
-        }
-
-        let mut loads: Vec<sqe_compaction::dispatch::WorkerLoad> = healthy
-            .iter()
-            .map(|url| sqe_compaction::dispatch::WorkerLoad {
-                url: url.clone(),
-                in_flight: load_tracker.in_flight(url) as usize,
-            })
-            .collect();
-
-        // Fresh groups (never failed) go through the batch, largest-first
-        // placement; groups already carrying an exclusion get placed
-        // individually so they land on a worker other than the one that
-        // just failed them, which the batch placement cannot express.
-        let mut fresh_idx: Vec<usize> = Vec::new();
-        let mut retry_idx: Vec<usize> = Vec::new();
-        for (i, g) in pending.iter().enumerate() {
-            if g.excluded.is_empty() {
-                fresh_idx.push(i);
-            } else {
-                retry_idx.push(i);
+    while !pending.is_empty() || !futs.is_empty() {
+        // Refill pass: keep assigning pending groups to free worker slots
+        // until either nothing is left to assign, or nothing more fits
+        // right now (every healthy worker at cap, or every remaining group
+        // excluded from every healthy worker). This runs every time we get
+        // here -- including immediately after a single in-flight group
+        // resolves below -- which is the crux of the continuous scheduler:
+        // a worker that just freed up is refilled on the spot instead of
+        // waiting for a whole wave of sibling groups to also finish.
+        loop {
+            if pending.is_empty() {
+                break;
             }
-        }
+            let healthy = registry.healthy_workers().await;
+            if healthy.is_empty() {
+                break;
+            }
 
-        let mut wave: Vec<(usize, String)> = Vec::new();
+            // Stall guard: a retried group's `excluded` set only grows, and
+            // application-level failures (see `DispatchError::is_transport`)
+            // deliberately do NOT shrink `healthy`. If a group has already
+            // failed on every worker currently healthy, no future pass can
+            // ever place it -- waiting would spin the 200ms backoff below
+            // forever. Fail the job now instead. (Any other groups still
+            // in-flight in `futs` at this point are dropped, same as the
+            // retry-exhaustion path below; see the module doc.)
+            if let Some(stuck) = pending
+                .iter()
+                .find(|g| is_permanently_stuck(&g.excluded, &healthy))
+            {
+                return Err(SqeError::Execution(format!(
+                    "distributed compaction job {job_id}: group {} has failed on every currently \
+                     healthy worker ({:?}); no worker left to retry on",
+                    stuck.group_id, stuck.excluded
+                )));
+            }
 
-        if !fresh_idx.is_empty() {
-            let sizes: Vec<u64> = fresh_idx.iter().map(|&i| pending[i].total_bytes).collect();
-            let plan = sqe_compaction::dispatch::place_groups_largest_first(
-                &sizes,
+            let loads: Vec<sqe_compaction::dispatch::WorkerLoad> = healthy
+                .iter()
+                .map(|url| sqe_compaction::dispatch::WorkerLoad {
+                    url: url.clone(),
+                    in_flight: load_tracker.in_flight(url) as usize,
+                })
+                .collect();
+            let slots: Vec<sqe_compaction::dispatch::PendingSlot> = pending
+                .iter()
+                .map(|g| sqe_compaction::dispatch::PendingSlot {
+                    total_bytes: g.total_bytes,
+                    excluded: g.excluded.clone(),
+                })
+                .collect();
+
+            let Some((idx, worker_url)) = sqe_compaction::dispatch::next_group_assignment(
+                &slots,
                 &loads,
                 max_inflight_per_worker,
-            );
-            for p in plan.placed {
-                wave.push((fresh_idx[p.group_index], p.worker_url));
-            }
-        }
-        // Reflect what the fresh wave just claimed before placing retries
-        // against the same snapshot, so retries do not overshoot a worker
-        // the fresh wave already filled to capacity.
-        for (_, url) in &wave {
-            if let Some(w) = loads.iter_mut().find(|w| w.url == *url) {
-                w.in_flight += 1;
-            }
-        }
-        for &i in &retry_idx {
-            if let Some(url) = sqe_compaction::dispatch::least_loaded_worker(
-                &loads,
-                max_inflight_per_worker,
-                &pending[i].excluded,
-            ) {
-                if let Some(w) = loads.iter_mut().find(|w| w.url == url) {
-                    w.in_flight += 1;
-                }
-                wave.push((i, url));
-            }
-        }
+            ) else {
+                break;
+            };
 
-        if wave.is_empty() {
-            // Every healthy worker is at capacity (or excluded for every
-            // pending retry); back off briefly rather than busy-loop.
-            tokio::time::sleep(Duration::from_millis(200)).await;
-            continue;
-        }
-
-        // Remove placed groups from `pending` in descending index order so
-        // earlier removals do not invalidate later indices.
-        wave.sort_by_key(|(i, _)| std::cmp::Reverse(*i));
-        let mut taken: Vec<(PendingGroup, String)> = Vec::new();
-        for (i, url) in wave {
-            taken.push((pending.remove(i), url));
-        }
-
-        let mut futs = FuturesUnordered::new();
-        for (group, worker_url) in taken {
+            let group = pending.remove(idx);
             let guard = load_tracker.reserve(&worker_url);
             let request = build_compact_request(
                 job_id,
@@ -484,42 +461,68 @@ pub(crate) async fn dispatch_and_collect_groups(
             });
         }
 
-        while let Some((mut group, worker_url, result)) = futs.next().await {
-            match result {
-                Ok(resp) => responses.push(resp),
-                Err(e) => {
-                    warn!(
-                        job_id,
-                        group_id = group.group_id,
-                        worker = %worker_url,
-                        attempts_left = group.attempts_left,
-                        transport = e.is_transport,
-                        error = %e,
-                        "distributed compaction: group dispatch failed"
-                    );
-                    // Only a transport-class failure (connection, timeout,
-                    // a worker that goes silent) is evidence the WORKER is
-                    // unhealthy; drop it immediately, matching
-                    // distributed_scan's fragment-failover behavior. An
-                    // application-level failure (resurrection guard,
-                    // delete-accounting mismatch, bad signature) is
-                    // evidence about the GROUP/request, fails identically
-                    // on any other worker, and must not take a healthy
-                    // worker out of the fleet for every other job.
-                    if e.is_transport {
-                        registry.mark_unhealthy(&worker_url).await;
-                    }
-                    group.excluded.insert(worker_url.clone());
-                    group.attempts_left = group.attempts_left.saturating_sub(1);
-                    if group.attempts_left == 0 {
-                        return Err(SqeError::Execution(format!(
-                            "distributed compaction job {job_id}: group {} exhausted retries \
-                             (last failure on {worker_url}): {e}",
-                            group.group_id
-                        )));
-                    }
-                    pending.push(group);
+        if futs.is_empty() {
+            // Nothing in flight, and the refill pass above placed nothing:
+            // either there are no healthy workers at all, or pending is
+            // empty (loop condition would already be false) and we should
+            // not be here. Re-check healthy explicitly for the error
+            // message; a transient empty healthy set that recovers is
+            // handled by the backoff-and-retry below.
+            let healthy = registry.healthy_workers().await;
+            if healthy.is_empty() {
+                return Err(SqeError::Execution(format!(
+                    "distributed compaction job {job_id}: no healthy workers available; \
+                     {} group(s) undispatched",
+                    pending.len()
+                )));
+            }
+            // Every healthy worker is at capacity; back off briefly rather
+            // than busy-loop.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            continue;
+        }
+
+        // Wait for exactly ONE in-flight group to resolve, then loop back
+        // to the refill pass above to fill the slot it just freed --
+        // instead of draining the rest of `futs` first (the old wave
+        // behavior).
+        let (mut group, worker_url, result) =
+            futs.next().await.expect("futs is non-empty, checked above");
+
+        match result {
+            Ok(resp) => responses.push(resp),
+            Err(e) => {
+                warn!(
+                    job_id,
+                    group_id = group.group_id,
+                    worker = %worker_url,
+                    attempts_left = group.attempts_left,
+                    transport = e.is_transport,
+                    error = %e,
+                    "distributed compaction: group dispatch failed"
+                );
+                // Only a transport-class failure (connection, timeout,
+                // a worker that goes silent) is evidence the WORKER is
+                // unhealthy; drop it immediately, matching
+                // distributed_scan's fragment-failover behavior. An
+                // application-level failure (resurrection guard,
+                // delete-accounting mismatch, bad signature) is
+                // evidence about the GROUP/request, fails identically
+                // on any other worker, and must not take a healthy
+                // worker out of the fleet for every other job.
+                if e.is_transport {
+                    registry.mark_unhealthy(&worker_url).await;
                 }
+                group.excluded.insert(worker_url.clone());
+                group.attempts_left = group.attempts_left.saturating_sub(1);
+                if group.attempts_left == 0 {
+                    return Err(SqeError::Execution(format!(
+                        "distributed compaction job {job_id}: group {} exhausted retries \
+                         (last failure on {worker_url}): {e}",
+                        group.group_id
+                    )));
+                }
+                pending.push(group);
             }
         }
     }
