@@ -3289,16 +3289,14 @@ pub struct MaintenanceDistributionConfig {
     pub group_timeout_secs: u64,
     /// Wall-clock bound between frames ONCE a worker has started responding
     /// to a dispatched group (i.e. after its first `Progress` heartbeat).
-    /// This does NOT bound how long the worker's compute phase itself can
-    /// run before it emits that first frame -- Task 3's worker action
-    /// computes the entire group (scan, delete-apply, re-encode) before it
-    /// streams anything back, so a worker wedged mid-compute produces no
-    /// frames at all and is caught only by `group_timeout_secs` above, not
-    /// by this field. `group_heartbeat_timeout_secs` only detects a worker
-    /// that responded, then went silent -- e.g. a connection that started
-    /// streaming and then stalled. True incremental progress reporting
-    /// (so this field could bound compute-phase hangs too) is a tracked
-    /// follow-up, not implemented here.
+    /// Incremental progress reporting IS implemented: the worker's
+    /// `compact_file_group` action streams a `Progress` frame every
+    /// `PROGRESS_INTERVAL_BATCHES` record batches during the delete-applying
+    /// read + rolling write (`sqe_worker::compaction`), so this field now
+    /// bounds a mid-compute stall too, not just post-first-frame silence --
+    /// a worker that goes quiet mid-scan produces no further frames and is
+    /// caught here, on the same timer, rather than only at the coarser
+    /// `group_timeout_secs` end-to-end bound above.
     #[serde(default = "default_maintenance_group_heartbeat_timeout_secs")]
     pub group_heartbeat_timeout_secs: u64,
     /// Opt-in (Phase 4d Task 3): commit successful groups in batches of
@@ -3308,24 +3306,38 @@ pub struct MaintenanceDistributionConfig {
     /// commits nothing at all.
     ///
     /// When `true`, each batch after the first successful commit gets its
-    /// own commit-conflict retry: a retryable conflict (a concurrent writer
-    /// advanced the snapshot between this batch's read and its commit) is
-    /// retried in place, up to 4 attempts with exponential backoff, by
-    /// reloading the table and recommitting the SAME worker-produced files
-    /// -- nothing is re-dispatched to the worker fleet. Only once that
-    /// retry is exhausted (or the failure is not a conflict at all -- a
+    /// own commit-conflict handling. Before every commit attempt, the
+    /// coordinator reloads the table and checks whether a concurrent writer
+    /// has landed a NEW position delete on one of THIS batch's own input
+    /// files; if so, it RE-DISPATCHES the same groups against the reloaded
+    /// snapshot (so the worker output actually reflects the delete) instead
+    /// of committing what it already has. This check runs proactively, not
+    /// only on a caught commit-conflict error, because the vendored
+    /// `iceberg::transaction::Transaction::commit` silently reloads and
+    /// replays a stale action when it finds one on its own, without ever
+    /// surfacing an `Err` for a single, one-shot race -- recommitting the
+    /// same worker-produced files unchanged in that case would resurrect
+    /// rows a concurrent delete already removed. A retryable conflict this
+    /// check did not preempt (an unrelated concurrent writer, or
+    /// `Transaction::commit`'s own retry budget exhausted) is still retried
+    /// the same way, up to 4 attempts with exponential backoff. Only once
+    /// retries are exhausted (or the failure is not a conflict at all -- a
     /// stalled/undispatchable group, say) does the batch count as a
     /// TERMINAL failure. A terminal failure after one or more batches have
     /// already committed reports `status = "partial"` in
     /// `sqe_system.maintenance_log` instead of failing the whole job --
-    /// see `commit_eligible_groups` in `sqe-coordinator` for the full
-    /// retry-layering argument. The very first batch's failure (including a
-    /// retryable conflict) is not retried at this layer at all: it bubbles
-    /// up and the OUTER `rewrite_data_files_distributed` retry loop
-    /// re-plans and re-dispatches the whole job instead, exactly as it did
-    /// before this field existed -- which is also why `partial_progress =
-    /// false` (always exactly one batch) is untouched by the per-batch
-    /// retry.
+    /// see `commit_eligible_groups` / `commit_one_batch` in
+    /// `sqe-coordinator` for the full argument. The very first batch's
+    /// failure is not retried at this layer at all: it bubbles up and the
+    /// OUTER `rewrite_data_files_distributed` retry loop re-plans and
+    /// re-dispatches the whole job instead, exactly as it did before this
+    /// field existed -- which is also why `partial_progress = false`
+    /// (always exactly one batch) is untouched by the per-batch retry. That
+    /// outer/first-batch path shares the same "`Transaction::commit` may
+    /// silently absorb a single race" exposure and does not get the
+    /// proactive position-delete check above; closing that gap needs the
+    /// missing vendor-side `validateNoNewDeletesForDataFiles`-equivalent
+    /// check.
     ///
     /// Trades a larger commit-conflict surface (N commits instead of 1,
     /// each independently racing concurrent writers) for incremental
