@@ -12,11 +12,15 @@
 //! - `system.rewrite_data_files(table => 'ns.t'[, target_file_size_bytes => N,
 //!   min_input_files => N, max_concurrent_file_group_rewrites => N,
 //!   strategy => 'binpack'|'sort', sort_order => '...', delete_file_threshold => N,
-//!   rewrite_all => true])`
+//!   distributed => 'auto'|'local'|'require', rewrite_all => true])`
 //! - `system.expire_snapshots(table => 'ns.t'[, older_than => TIMESTAMP,
 //!   retain_last => N])`
 //! - `system.remove_orphan_files(table => 'ns.t'[, older_than => TIMESTAMP])`
 //! - `system.rewrite_manifests(table => 'ns.t')`
+//! - `system.table_health(table => 'ns.t')` -- read-only compaction-debt
+//!   report (small/delete-heavy file counts, eligible rewrite groups,
+//!   estimated rewrite bytes). Never mutates the table and never requires
+//!   write privilege (Phase 4a advisory compaction, task 3).
 //!
 //! Options use Iceberg's named-argument syntax (`name => value`). Unknown
 //! options produce a parse error so typos fail fast instead of being silently
@@ -63,6 +67,13 @@ pub enum ProcedureCall {
         /// broadly. Off (`None`) by default. No-op under `strategy => 'sort'`,
         /// which already rewrites the whole partition.
         delete_file_threshold: Option<usize>,
+        /// Per-call override of `[maintenance.distribution] mode` (Phase 4c
+        /// Task 5): `'auto'`, `'local'`, or `'require'` (case-insensitive).
+        /// `None` (default) means "use the configured `distribution.mode`".
+        /// Kept as a raw string here -- validated against `DistributionMode`
+        /// in the coordinator handler, which already owns that type, rather
+        /// than giving this parser crate a dependency on `sqe-core::config`.
+        distributed: Option<String>,
         /// Force a rewrite of every data file, including files already at or
         /// above the target size and partitions below `min_input_files`. Applies
         /// all deletes and re-encodes at the target size. Off (`false`) by
@@ -147,6 +158,12 @@ pub enum ProcedureCall {
         /// Target snapshot id. Must exist in the table's snapshot log.
         snapshot_id: i64,
     },
+    /// Read-only compaction-debt report (Phase 4a advisory compaction, task
+    /// 3). Reports small-file / delete-heavy-file counts and estimated
+    /// rewrite volume without mutating the table or requiring write
+    /// privilege. The later advisory scheduler reuses the same analysis to
+    /// emit per-table metrics.
+    TableHealth { table: TableRef },
 }
 
 impl ProcedureCall {
@@ -163,6 +180,7 @@ impl ProcedureCall {
             ProcedureCall::DropTable { .. } => "drop_table",
             ProcedureCall::SetCurrentSnapshot { .. } => "set_current_snapshot",
             ProcedureCall::RollbackToSnapshot { .. } => "rollback_to_snapshot",
+            ProcedureCall::TableHealth { .. } => "table_health",
         }
     }
 
@@ -178,7 +196,8 @@ impl ProcedureCall {
             | ProcedureCall::RegisterTable { table, .. }
             | ProcedureCall::DropTable { table, .. }
             | ProcedureCall::SetCurrentSnapshot { table, .. }
-            | ProcedureCall::RollbackToSnapshot { table, .. } => Some(table),
+            | ProcedureCall::RollbackToSnapshot { table, .. }
+            | ProcedureCall::TableHealth { table } => Some(table),
             ProcedureCall::PurgeOrphanLocations { .. } => None,
         }
     }
@@ -312,6 +331,7 @@ pub fn try_parse_call(stmt: &Statement) -> sqe_core::Result<Option<ProcedureCall
         "drop_table" => parse_drop_table(args).map(Some),
         "set_current_snapshot" => parse_set_current_snapshot(args).map(Some),
         "rollback_to_snapshot" => parse_rollback_to_snapshot(args).map(Some),
+        "table_health" => parse_table_health(args).map(Some),
         _ => Ok(None),
     }
 }
@@ -733,6 +753,7 @@ fn parse_rewrite_data_files(mut args: Vec<(String, Expr)>) -> sqe_core::Result<P
     let delete_file_threshold = take_option(&mut args, "delete_file_threshold", |e| {
         expect_usize(e, "delete_file_threshold")
     })?;
+    let distributed = take_option(&mut args, "distributed", |e| expect_string(e, "distributed"))?;
     let rewrite_all = take_option(&mut args, "rewrite_all", |e| expect_bool(e, "rewrite_all"))?;
     expect_no_remaining(&args, "rewrite_data_files")?;
 
@@ -744,6 +765,7 @@ fn parse_rewrite_data_files(mut args: Vec<(String, Expr)>) -> sqe_core::Result<P
         strategy,
         sort_order,
         delete_file_threshold,
+        distributed,
         rewrite_all,
     })
 }
@@ -774,6 +796,14 @@ fn parse_rewrite_manifests(mut args: Vec<(String, Expr)>) -> sqe_core::Result<Pr
     let table = take_table(&mut args)?;
     expect_no_remaining(&args, "rewrite_manifests")?;
     Ok(ProcedureCall::RewriteManifests { table })
+}
+
+/// Parse `CALL system.table_health(table => 'ns.t')`. Read-only: no options
+/// beyond the target table.
+fn parse_table_health(mut args: Vec<(String, Expr)>) -> sqe_core::Result<ProcedureCall> {
+    let table = take_table(&mut args)?;
+    expect_no_remaining(&args, "table_health")?;
+    Ok(ProcedureCall::TableHealth { table })
 }
 
 fn parse_suggest_bloom_filter_columns(
@@ -843,6 +873,7 @@ mod tests {
                 strategy,
                 sort_order,
                 delete_file_threshold,
+                distributed,
                 rewrite_all,
             } => {
                 assert_eq!(table.namespace, "ns");
@@ -853,6 +884,7 @@ mod tests {
                 assert!(strategy.is_none());
                 assert!(sort_order.is_none());
                 assert!(delete_file_threshold.is_none());
+                assert!(distributed.is_none());
                 assert!(rewrite_all.is_none());
             }
             other => panic!("Expected RewriteDataFiles, got {other:?}"),
@@ -904,6 +936,20 @@ mod tests {
                 ..
             } => {
                 assert_eq!(delete_file_threshold, Some(3));
+            }
+            other => panic!("Expected RewriteDataFiles, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_rewrite_data_files_distributed_override() {
+        let stmt = parse_first(
+            "CALL system.rewrite_data_files(table => 'ns.t', distributed => 'require')",
+        );
+        let call = try_parse_call(&stmt).unwrap().expect("match");
+        match call {
+            ProcedureCall::RewriteDataFiles { distributed, .. } => {
+                assert_eq!(distributed.as_deref(), Some("require"));
             }
             other => panic!("Expected RewriteDataFiles, got {other:?}"),
         }
@@ -1302,6 +1348,50 @@ mod tests {
             }
             other => panic!("unexpected variant: {other:?}"),
         }
+    }
+
+    // ── table_health (Phase 4a advisory compaction, task 3) ─────────────
+
+    #[test]
+    fn parses_table_health() {
+        let stmt = parse_first("CALL system.table_health(table => 'ns.t')");
+        let call = try_parse_call(&stmt).unwrap().expect("match");
+        match call {
+            ProcedureCall::TableHealth { table } => {
+                assert_eq!(table.as_string(), "ns.t");
+            }
+            other => panic!("Expected TableHealth, got {other:?}"),
+        }
+        assert_eq!(
+            try_parse_call(&parse_first("CALL system.table_health(table => 'ns.t')"))
+                .unwrap()
+                .expect("match")
+                .name(),
+            "table_health"
+        );
+    }
+
+    #[test]
+    fn table_health_requires_table() {
+        let stmt = parse_first("CALL system.table_health()");
+        let err = try_parse_call(&stmt).expect_err("missing table should reject");
+        assert!(err.to_string().contains("requires a `table =>"));
+    }
+
+    #[test]
+    fn table_health_rejects_unknown_arg() {
+        let stmt = parse_first(
+            "CALL system.table_health(table => 'ns.t', history_limit => 500)",
+        );
+        let err = try_parse_call(&stmt).expect_err("unknown arg should reject");
+        assert!(err.to_string().contains("history_limit"));
+    }
+
+    #[test]
+    fn table_health_table_accessor_returns_target() {
+        let stmt = parse_first("CALL system.table_health(table => 'cat.ns.t')");
+        let call = try_parse_call(&stmt).unwrap().expect("match");
+        assert_eq!(call.table().unwrap().as_string(), "cat.ns.t");
     }
 
     #[test]

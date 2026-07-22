@@ -1601,6 +1601,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "croner"
+version = "3.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4aa42bcd3d846ebf66e15bd528d1087f75d1c6c1c66ebff626178a106353c576"
+dependencies = [
+ "chrono",
+ "derive_builder",
+ "strum",
+]
+
+[[package]]
 name = "crossbeam-channel"
 version = "0.5.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6469,6 +6480,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "sqe-compaction"
+version = "0.37.0"
+dependencies = [
+ "arrow",
+ "arrow-array",
+ "arrow-schema",
+ "datafusion",
+ "futures",
+ "hmac 0.12.1",
+ "iceberg",
+ "parquet",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "sqe-catalog",
+ "sqe-core",
+ "sqe-metrics",
+ "subtle",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "sqe-coordinator"
 version = "0.37.0"
 dependencies = [
@@ -6485,6 +6521,7 @@ dependencies = [
  "bytes",
  "chrono",
  "clap",
+ "croner",
  "dashmap",
  "datafusion",
  "datafusion-expr",
@@ -6508,6 +6545,7 @@ dependencies = [
  "sha2 0.10.9",
  "sqe-auth",
  "sqe-catalog",
+ "sqe-compaction",
  "sqe-core",
  "sqe-lineage",
  "sqe-metrics",
@@ -6772,6 +6810,7 @@ dependencies = [
  "datafusion-proto",
  "futures",
  "hmac 0.12.1",
+ "iceberg",
  "if-addrs",
  "object_store",
  "opentelemetry",
@@ -6781,10 +6820,12 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "sqe-catalog",
+ "sqe-compaction",
  "sqe-core",
  "sqe-metrics",
  "sqe-planner",
  "subtle",
+ "tempfile",
  "tokio",
  "tokio-stream",
  "tonic",

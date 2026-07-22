@@ -19,8 +19,10 @@ use sqe_catalog::FooterCache;
 use sqe_core::FlightCompression;
 use sqe_metrics::WorkerMetricsRegistry;
 use sqe_metrics::propagation::extract_trace_context;
+use sqe_compaction::wire::{CompactGroupFrame, CompactGroupRequest};
 use sqe_planner::ScanTask;
 
+use crate::compaction::compact_file_group;
 use crate::credential_channel::{CredentialStore, RefreshableCredentials};
 use crate::executor;
 use crate::shuffle::{ExchangeDescriptor, ShuffleManager};
@@ -48,6 +50,14 @@ const WORKER_SECRET_HEADER: &str = "x-sqe-worker-secret";
 /// coordinator authored the exact file paths, credentials, predicate, and
 /// limit. Empty `worker_secret` (dev mode) skips this check.
 const SCAN_SIGNATURE_HEADER: &str = "x-sqe-scan-signature";
+
+/// Metadata header carrying the HMAC-SHA256 tag (hex, via
+/// `sqe_compaction::wire::sign`) over the raw `CompactGroupRequest` wire
+/// bytes (Phase 4c Task 3). Mirrors `SCAN_SIGNATURE_HEADER`: the worker
+/// recomputes the tag over the exact bytes it received and constant-time
+/// compares before decoding, so a tampered compaction request (swapped file
+/// path, forged S3 credentials) fails here rather than being executed.
+const COMPACT_SIGNATURE_HEADER: &str = "x-sqe-compact-signature";
 
 /// Lowercase hex encoding for the 32-byte HMAC tag (#206). Kept local to avoid
 /// an extra crate dependency for such a small need.
@@ -230,6 +240,36 @@ impl WorkerFlightService {
             || !bool::from(provided_bytes.ct_eq(expected_bytes))
         {
             return Err(Status::unauthenticated("Invalid scan task signature"));
+        }
+        Ok(())
+    }
+
+    /// Verify the HMAC-SHA256 signature over the raw `CompactGroupRequest`
+    /// bytes (Phase 4c Task 3). Delegates the tag computation to
+    /// `sqe_compaction::wire::verify` (rather than recomputing the HMAC
+    /// locally, as [`Self::verify_scan_signature`] does for scan tickets) so
+    /// the worker and the Task 4 coordinator job runner that signs these
+    /// requests share one signing implementation instead of two parallel
+    /// HMAC call sites that could drift apart.
+    ///
+    /// When `worker_secret` is empty the deployment opted into
+    /// `worker.allow_unauthenticated`; there is no key to sign with, so this
+    /// returns `Ok(())`, exactly like `verify_scan_signature`'s dev-mode
+    /// path.
+    fn verify_compaction_signature(
+        &self,
+        metadata: &tonic::metadata::MetadataMap,
+        body: &[u8],
+    ) -> Result<(), Status> {
+        if self.worker_secret.is_empty() {
+            return Ok(());
+        }
+        let provided = metadata
+            .get(COMPACT_SIGNATURE_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if !sqe_compaction::wire::verify(body, provided, &self.worker_secret) {
+            return Err(Status::unauthenticated("Invalid compaction request signature"));
         }
         Ok(())
     }
@@ -453,6 +493,56 @@ impl FlightService for WorkerFlightService {
                 };
                 Ok(Response::new(Box::pin(stream::once(async { Ok(result) }))))
             }
+            "compact_file_group" => {
+                // Compaction requests carry S3 credentials for the group's
+                // input/output files and drive a real rewrite. Require the
+                // worker secret AND the request-specific HMAC (#Phase 4c
+                // Task 3, mirrors the do_get scan-ticket gate from #206)
+                // over the exact wire bytes before decoding.
+                self.verify_worker_secret(&metadata)?;
+                self.verify_compaction_signature(&metadata, &action.body)?;
+
+                let request = CompactGroupRequest::from_bytes(&action.body).map_err(|e| {
+                    Status::invalid_argument(format!(
+                        "Failed to decode CompactGroupRequest: {e}"
+                    ))
+                })?;
+                let group_id = request.group_id;
+
+                info!(
+                    job_id = %request.job_id,
+                    group_id,
+                    table = %request.table_ident,
+                    file_count = request.group_file_paths.len(),
+                    "Received compact_file_group request"
+                );
+
+                let response = compact_file_group(&self.session_ctx, &request)
+                    .await
+                    .map_err(|e| {
+                        Status::internal(format!(
+                            "compact_file_group failed for group {group_id}: {e}"
+                        ))
+                    })?;
+
+                let frames = [
+                    CompactGroupFrame::Progress {
+                        group_id,
+                        rows_read: response.rows_written,
+                    },
+                    CompactGroupFrame::Done(response),
+                ];
+                let mut results = Vec::with_capacity(frames.len());
+                for frame in frames {
+                    let body = frame.to_bytes().map_err(|e| {
+                        Status::internal(format!("Failed to encode CompactGroupFrame: {e}"))
+                    })?;
+                    results.push(Ok(arrow_flight::Result {
+                        body: bytes::Bytes::from(body),
+                    }));
+                }
+                Ok(Response::new(Box::pin(stream::iter(results))))
+            }
             other => Err(Status::unimplemented(format!(
                 "Unknown action type: {other}"
             ))),
@@ -665,6 +755,11 @@ impl FlightService for WorkerFlightService {
             ActionType {
                 r#type: "refresh_credentials".to_string(),
                 description: "Accept refreshed S3 credentials from coordinator".to_string(),
+            },
+            ActionType {
+                r#type: "compact_file_group".to_string(),
+                description: "Rewrite one Iceberg file group for distributed compaction"
+                    .to_string(),
             },
         ];
         Ok(Response::new(Box::pin(stream::iter(
@@ -925,5 +1020,161 @@ mod tests {
         let mut stream = response.into_inner();
         let first = stream.next().await.expect("body").expect("ok");
         assert_eq!(first.body.as_ref(), b"ok");
+    }
+
+    // ---- compact_file_group (Phase 4c Task 3) --------------------------
+    //
+    // These exercise only the worker-secret + HMAC gate and request decode;
+    // there is no real S3/StaticTable in this environment, so a
+    // successfully-authenticated call still fails downstream (asserted via
+    // `assert_ne!(.., Unauthenticated)`, mirroring `do_get`'s own signed-but-
+    // no-real-backend tests above).
+
+    fn make_compact_request_bytes() -> Vec<u8> {
+        sqe_compaction::wire::CompactGroupRequest {
+            job_id: "job-sig".to_string(),
+            group_id: 1,
+            table_ident: "catalog.ns.tbl".to_string(),
+            metadata_location: "s3://bucket/warehouse/tbl/metadata/v1.metadata.json".to_string(),
+            snapshot_id: 42,
+            group_file_paths: vec!["s3://bucket/data/f1.parquet".to_string()],
+            target_file_size_bytes: 128 * 1024 * 1024,
+            compression: "zstd".to_string(),
+            sort: None,
+            s3: sqe_compaction::wire::S3Conn {
+                endpoint: String::new(),
+                region: String::new(),
+                access_key: String::new(),
+                secret_key: String::new(),
+                session_token: String::new(),
+                path_style: false,
+                allow_http: false,
+            },
+        }
+        .to_bytes()
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn compact_file_group_rejects_missing_secret_header() {
+        let svc = make_service("expected-secret");
+        let action = Action {
+            r#type: "compact_file_group".to_string(),
+            body: bytes::Bytes::from(make_compact_request_bytes()),
+        };
+        let request = Request::new(action);
+        let err = unwrap_err(svc.do_action(request).await);
+        assert_eq!(err.code(), tonic::Code::Unauthenticated);
+    }
+
+    #[tokio::test]
+    async fn compact_file_group_rejects_wrong_secret() {
+        let svc = make_service("expected-secret");
+        let action = Action {
+            r#type: "compact_file_group".to_string(),
+            body: bytes::Bytes::from(make_compact_request_bytes()),
+        };
+        let mut request = Request::new(action);
+        request
+            .metadata_mut()
+            .insert(WORKER_SECRET_HEADER, "wrong".parse().unwrap());
+        let err = unwrap_err(svc.do_action(request).await);
+        assert_eq!(err.code(), tonic::Code::Unauthenticated);
+    }
+
+    #[tokio::test]
+    async fn compact_file_group_rejects_missing_signature() {
+        // Right worker secret, no compaction signature header: the HMAC
+        // gate must reject before decoding the request.
+        let svc = make_service("expected-secret");
+        let action = Action {
+            r#type: "compact_file_group".to_string(),
+            body: bytes::Bytes::from(make_compact_request_bytes()),
+        };
+        let mut request = Request::new(action);
+        request
+            .metadata_mut()
+            .insert(WORKER_SECRET_HEADER, "expected-secret".parse().unwrap());
+        let err = unwrap_err(svc.do_action(request).await);
+        assert_eq!(err.code(), tonic::Code::Unauthenticated);
+    }
+
+    #[tokio::test]
+    async fn compact_file_group_rejects_tampered_body() {
+        // A signature valid for the ORIGINAL bytes must fail once the body
+        // is mutated (e.g. a swapped file path or forged S3 credential).
+        let svc = make_service("expected-secret");
+        let original = make_compact_request_bytes();
+        let signature = sqe_compaction::wire::sign(&original, "expected-secret");
+        let mut tampered = original.clone();
+        let last = tampered.len() - 1;
+        tampered[last] ^= 0xff;
+        let action = Action {
+            r#type: "compact_file_group".to_string(),
+            body: bytes::Bytes::from(tampered),
+        };
+        let mut request = Request::new(action);
+        request
+            .metadata_mut()
+            .insert(WORKER_SECRET_HEADER, "expected-secret".parse().unwrap());
+        request
+            .metadata_mut()
+            .insert(COMPACT_SIGNATURE_HEADER, signature.parse().unwrap());
+        let err = unwrap_err(svc.do_action(request).await);
+        assert_eq!(err.code(), tonic::Code::Unauthenticated);
+    }
+
+    #[tokio::test]
+    async fn compact_file_group_accepts_correct_secret_and_signature_then_fails_downstream() {
+        // Both gates pass with a correctly-signed, well-formed request;
+        // execution then fails downstream (no real S3/StaticTable in this
+        // environment), but NOT with Unauthenticated, proving both gates
+        // let the call through.
+        let svc = make_service("expected-secret");
+        let body = make_compact_request_bytes();
+        let signature = sqe_compaction::wire::sign(&body, "expected-secret");
+        let action = Action {
+            r#type: "compact_file_group".to_string(),
+            body: bytes::Bytes::from(body),
+        };
+        let mut request = Request::new(action);
+        request
+            .metadata_mut()
+            .insert(WORKER_SECRET_HEADER, "expected-secret".parse().unwrap());
+        request
+            .metadata_mut()
+            .insert(COMPACT_SIGNATURE_HEADER, signature.parse().unwrap());
+        let err = unwrap_err(svc.do_action(request).await);
+        assert_ne!(err.code(), tonic::Code::Unauthenticated);
+    }
+
+    #[tokio::test]
+    async fn compact_file_group_empty_secret_skips_signature_check() {
+        // Empty worker_secret is dev mode (opt-in via
+        // worker.allow_unauthenticated): both gates are skipped, and
+        // failure comes only from downstream execution (no real S3), not
+        // from Unauthenticated.
+        let svc = make_service("");
+        let action = Action {
+            r#type: "compact_file_group".to_string(),
+            body: bytes::Bytes::from(make_compact_request_bytes()),
+        };
+        let request = Request::new(action);
+        let err = unwrap_err(svc.do_action(request).await);
+        assert_ne!(err.code(), tonic::Code::Unauthenticated);
+    }
+
+    #[tokio::test]
+    async fn compact_file_group_rejects_malformed_body_after_auth_passes() {
+        // Empty secret => auth gates skipped => decode failure surfaces as
+        // InvalidArgument, not Unauthenticated or Internal.
+        let svc = make_service("");
+        let action = Action {
+            r#type: "compact_file_group".to_string(),
+            body: bytes::Bytes::from_static(b"not json"),
+        };
+        let request = Request::new(action);
+        let err = unwrap_err(svc.do_action(request).await);
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
     }
 }
