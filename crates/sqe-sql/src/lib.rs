@@ -47,3 +47,55 @@ pub use v3_types::{
     detect_ns_timestamp, extract_default_literal, is_tz_variant, is_v3_only_type,
     DefaultError, DefaultLiteral, NsTimestamp,
 };
+
+#[cfg(test)]
+mod insert_overwrite_parse_tests {
+    use sqlparser::ast::Statement;
+    use sqlparser::dialect::GenericDialect;
+    use sqlparser::parser::Parser;
+
+    fn parse_one(sql: &str) -> Statement {
+        Parser::parse_sql(&GenericDialect {}, sql)
+            .expect("parse")
+            .pop()
+            .expect("one statement")
+    }
+
+    #[test]
+    fn insert_overwrite_sets_overwrite_flag() {
+        for sql in [
+            "INSERT OVERWRITE t SELECT 1 AS id",
+            "INSERT OVERWRITE INTO t SELECT 1 AS id",
+            "INSERT OVERWRITE TABLE t SELECT 1 AS id",
+        ] {
+            match parse_one(sql) {
+                Statement::Insert(ins) => {
+                    assert!(ins.overwrite, "overwrite flag not set for: {sql}");
+                    assert!(ins.partitioned.is_none(), "unexpected PARTITION for: {sql}");
+                }
+                other => panic!("expected Insert, got {other:?} for {sql}"),
+            }
+        }
+    }
+
+    #[test]
+    fn plain_insert_does_not_set_overwrite() {
+        match parse_one("INSERT INTO t SELECT 1 AS id") {
+            Statement::Insert(ins) => assert!(!ins.overwrite),
+            other => panic!("expected Insert, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn insert_overwrite_static_partition_is_captured() {
+        // Static Hive PARTITION clause must be visible so the handler can
+        // reject it loudly rather than mishandle it.
+        match parse_one("INSERT OVERWRITE t PARTITION (region='eu') SELECT 1 AS id") {
+            Statement::Insert(ins) => {
+                assert!(ins.overwrite);
+                assert!(ins.partitioned.is_some(), "static PARTITION not captured");
+            }
+            other => panic!("expected Insert, got {other:?}"),
+        }
+    }
+}
