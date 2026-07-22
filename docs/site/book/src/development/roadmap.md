@@ -57,6 +57,7 @@ SQL write operations and catalog DDL.
 - `CREATE TABLE AS SELECT`
 - `CREATE OR REPLACE TABLE`
 - `INSERT INTO SELECT`
+- `INSERT OVERWRITE SELECT` (full-table replace; dynamic partition overwrite on partitioned tables, preserving untouched partitions)
 - `CREATE VIEW` / `DROP VIEW`
 - `CREATE SCHEMA` / `DROP SCHEMA`
 - `DROP TABLE` / `DROP TABLE IF EXISTS`
