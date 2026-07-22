@@ -203,10 +203,15 @@ impl RewriteFilesAction {
     // rewrite was *planned* against), `commit()` scans the CURRENT/reloaded
     // snapshot's delete manifests for any live position-delete entry with a
     // data sequence number newer than the baseline whose `referenced_data_file`
-    // is one of this action's `removed_data_files`. If found, it returns a
-    // retryable conflict `Err` instead of proceeding, so the stale compacted
-    // output is never committed. This mirrors Iceberg-Java's
-    // `SnapshotProducer.validateAddedDataFiles` /
+    // is one of this action's `removed_data_files` (or has no
+    // `referenced_data_file` at all -- see the multi-file fail-safe on
+    // `validate_no_new_position_deletes` below). If found, it returns a
+    // conflict `Err` instead of proceeding, so the stale compacted output is
+    // never committed. The conflict message text (not `Error::retryable()`)
+    // is what SQE's outer re-plan loop keys on -- see
+    // `validate_no_new_position_deletes`'s doc comment for why the two
+    // retry mechanisms are deliberately decoupled here. This mirrors
+    // Iceberg-Java's `SnapshotProducer.validateAddedDataFiles` /
     // `RewriteFiles.validateFromSnapshot` +
     // `MergingSnapshotProducer.validateNoNewDeletesForDataFiles`.
     //
@@ -231,6 +236,18 @@ impl RewriteFilesAction {
     // bottom of this file. No other vendored file is touched. Re-apply by
     // porting this whole comment block, the field, the setter, the `commit()`
     // guard, and the free function.
+    //
+    // UPDATE (multi-file position-delete fail-safe): `validate_no_new_position_deletes`
+    // also treats a live, newer-than-baseline `PositionDeletes` entry whose
+    // `referenced_data_file()` is `None` as an unconditional conflict. Iceberg-rust's
+    // `PositionDeleteFileWriter` only stamps `referenced_data_file` when the writer saw
+    // exactly one distinct data-file path over its lifetime
+    // (`writer/base_writer/position_delete_file_writer.rs`); a delete spanning >= 2 data
+    // files (the common case for a MoR `DELETE` whose predicate matches rows in more than
+    // one file) always has `referenced_data_file() == None`. Without this fail-safe such a
+    // delete would be silently skipped by the `if let Some(referenced_path) = ...` check
+    // below, reopening the exact row-resurrection hole this whole patch exists to close.
+    // See `validate_no_new_position_deletes`'s doc comment for the full rationale.
     pub fn set_validate_from_snapshot_id(mut self, snapshot_id: Option<i64>) -> Self {
         self.validate_from_snapshot_id = snapshot_id;
         self
@@ -464,17 +481,44 @@ impl Default for RewriteFilesAction {
 //   1. has a data sequence number strictly greater than the baseline
 //      snapshot's sequence number (i.e. it was committed *after* the plan
 //      baseline, not merely carried forward from before it), AND
-//   2. has a `referenced_data_file` matching one of `removed_data_file_paths`
-//      (i.e. it targets one of the data files this rewrite is replacing).
+//   2. EITHER has a `referenced_data_file` matching one of
+//      `removed_data_file_paths` (i.e. it targets one of the data files this
+//      rewrite is replacing), OR has `referenced_data_file() == None`.
 //
-// A hit means a concurrent MoR delete landed on a data file mid-compaction;
-// this returns a retryable conflict `Err` so the caller re-plans rather than
-// committing stale compacted output over an undetectable dangling delete.
+//      The `None` case is a deliberate fail-safe, not an edge case: iceberg-rust's
+//      `PositionDeleteFileWriter` (`writer/base_writer/position_delete_file_writer.rs`)
+//      only stamps `referenced_data_file` when the writer observed exactly one
+//      distinct data-file path over its whole lifetime; a position-delete file
+//      spanning two or more data files (the common shape for a MoR `DELETE` whose
+//      predicate matches rows across multiple files -- see SQE's
+//      `write_handler.rs` MoR delete path, which accumulates matches across ALL
+//      scanned data files before writing) always has `referenced_data_file() ==
+//      None`. We cannot recover which paths it actually touches without reading
+//      the delete file's own `file_path` column (an explicit, costlier follow-up,
+//      not done here), so we cannot prove it is disjoint from
+//      `removed_data_file_paths`. Treating it as a conflict unconditionally is
+//      the only fail-safe option: this converges (the next re-plan captures a
+//      newer baseline, so the same delete's sequence number is no longer above
+//      it, and the delete-aware read folds it into the fresh compacted output),
+//      and it never resurrects rows.
+//
+// A hit means a concurrent MoR delete landed (or *may* have landed, in the
+// `None` case) on a data file mid-compaction; this returns a conflict `Err`
+// -- textually flagged as retryable so SQE's outer re-plan loop
+// (`classify_commit_error` in `crates/sqe-coordinator/src/maintenance.rs`,
+// which keys on the substrings "conflict"/"retry" in the message, not on
+// `Error::retryable()`) picks it up immediately, but NOT marked
+// `.with_retryable(true)` so the vendored `Transaction::commit` backoff loop
+// (`transaction/mod.rs`, which DOES key on `Error::retryable()`) does not
+// burn its retry budget re-running the identical doomed commit against an
+// unchanged baseline before surfacing to that outer loop -- so the caller
+// re-plans rather than committing stale compacted output over an
+// undetectable (or unprovably-disjoint) dangling delete.
 //
 // If `baseline_snapshot_id` is no longer present in the table's snapshot
 // history (e.g. concurrently expired by `expire_snapshots`), we cannot prove
-// no new deletes landed, so we fail safe and also return a retryable
-// conflict rather than silently skip validation.
+// no new deletes landed, so we fail safe and also return a conflict rather
+// than silently skip validation.
 async fn validate_no_new_position_deletes(
     table: &Table,
     target_branch: &str,
@@ -509,8 +553,7 @@ async fn validate_no_new_position_deletes(
                  current snapshot {} so any new deletes are applied to fresh compacted output.",
                 current_snapshot.snapshot_id()
             ),
-        )
-        .with_retryable(true));
+        ));
     };
     let baseline_sequence_number = baseline_snapshot.sequence_number();
 
@@ -538,24 +581,51 @@ async fn validate_no_new_position_deletes(
                 continue;
             }
 
-            if let Some(referenced_path) = entry.data_file().referenced_data_file()
-                && removed_data_file_paths.contains(&referenced_path)
-            {
-                return Err(Error::new(
-                    ErrorKind::DataInvalid,
-                    format!(
-                        "Conflict (retryable): found new position delete file '{}' \
-                         (sequence number {seq}) committed after baseline snapshot \
-                         {baseline_snapshot_id} (sequence number {baseline_sequence_number}) \
-                         that applies to data file '{referenced_path}', which this rewrite is \
-                         replacing. Re-plan the rewrite against the current snapshot {} so the \
-                         new delete is applied to fresh compacted output instead of being \
-                         silently dropped.",
-                        entry.file_path(),
-                        current_snapshot.snapshot_id()
-                    ),
-                )
-                .with_retryable(true));
+            match entry.data_file().referenced_data_file() {
+                Some(referenced_path) => {
+                    if removed_data_file_paths.contains(&referenced_path) {
+                        return Err(Error::new(
+                            ErrorKind::DataInvalid,
+                            format!(
+                                "Conflict (retryable): found new position delete file '{}' \
+                                 (sequence number {seq}) committed after baseline snapshot \
+                                 {baseline_snapshot_id} (sequence number \
+                                 {baseline_sequence_number}) that applies to data file \
+                                 '{referenced_path}', which this rewrite is replacing. Re-plan \
+                                 the rewrite against the current snapshot {} so the new delete \
+                                 is applied to fresh compacted output instead of being silently \
+                                 dropped.",
+                                entry.file_path(),
+                                current_snapshot.snapshot_id()
+                            ),
+                        ));
+                    }
+                }
+                None => {
+                    // Fail-safe: this position delete file's writer observed
+                    // more than one distinct data-file path, so iceberg-rust
+                    // never stamped `referenced_data_file` (see the doc
+                    // comment above this function). We cannot prove it does
+                    // not touch any file in `removed_data_file_paths`
+                    // without reading its `file_path` column contents (a
+                    // costlier follow-up, not done here), so treat it as a
+                    // conflict unconditionally rather than silently skip it.
+                    return Err(Error::new(
+                        ErrorKind::DataInvalid,
+                        format!(
+                            "Conflict (retryable): found new position delete file '{}' \
+                             (sequence number {seq}) committed after baseline snapshot \
+                             {baseline_snapshot_id} (sequence number {baseline_sequence_number}) \
+                             with no `referenced_data_file` (it spans two or more data files), \
+                             so it cannot be proven disjoint from the data file(s) this rewrite \
+                             is replacing. Re-plan the rewrite against the current snapshot {} \
+                             so the new delete is applied to fresh compacted output instead of \
+                             risking a silently dropped delete.",
+                            entry.file_path(),
+                            current_snapshot.snapshot_id()
+                        ),
+                    ));
+                }
             }
         }
     }
