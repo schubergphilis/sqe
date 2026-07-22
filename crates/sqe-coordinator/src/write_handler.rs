@@ -1355,15 +1355,26 @@ impl WriteHandler {
         plan_out: &mut Option<sqe_lineage::PlanOrHint>,
         policy_summary_out: &mut Option<sqe_policy::PolicySummary>,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
-        let (table_name, explicit_columns) = match stmt {
-            Statement::Insert(ins) => match &ins.table {
-                sqlparser::ast::TableObject::TableName(name) => (name, &ins.columns),
-                other => {
-                    return Err(SqeError::Execution(format!(
-                        "INSERT INTO table functions not supported: {other}"
-                    )));
+        let (table_name, explicit_columns, overwrite) = match stmt {
+            Statement::Insert(ins) => {
+                if ins.partitioned.is_some() {
+                    return Err(SqeError::NotImplemented(
+                        "INSERT OVERWRITE with a static PARTITION (col=val) clause is not supported; \
+                         omit the PARTITION clause for dynamic partition overwrite"
+                            .into(),
+                    ));
                 }
-            },
+                match &ins.table {
+                    sqlparser::ast::TableObject::TableName(name) => {
+                        (name, &ins.columns, ins.overwrite)
+                    }
+                    other => {
+                        return Err(SqeError::Execution(format!(
+                            "INSERT INTO table functions not supported: {other}"
+                        )));
+                    }
+                }
+            }
             other => {
                 return Err(SqeError::Execution(format!(
                     "Expected Insert statement, got: {other}"
@@ -1376,6 +1387,7 @@ impl WriteHandler {
         info!(
             username = %session.user.username,
             table = %table_ident,
+            overwrite,
             "Executing INSERT INTO SELECT (streaming)"
         );
 
@@ -1447,44 +1459,28 @@ impl WriteHandler {
         )
         .await?;
 
-        if total_rows == 0 {
+        if total_rows == 0 && !overwrite {
             info!(table = %table_ident, "INSERT SELECT returned no rows — nothing to write");
             cleanup_guard.mark_committed();
             return Ok(affected_rows_batch(0));
         }
 
-        if !data_files.is_empty() {
-            let files_for_retry = data_files.clone();
-            let catalog_for_commit = catalog.clone();
-            commit_with_retry(
-                catalog.as_ref(),
-                &table_ident,
-                "insert",
-                move |fresh_table| {
-                    let files = files_for_retry.clone();
-                    let cat = catalog_for_commit.clone();
-                    async move {
-                        let tx = Transaction::new(&fresh_table);
-                        let action = tx.fast_append().add_data_files(files);
-                        let tx = action.apply(tx)?;
-                        tx.commit(cat.as_ref()).await
-                    }
-                },
-            )
-            .await
-            .map_err(|e| {
-                SqeError::Execution(format!("Failed to commit INSERT transaction: {e}"))
-            })?;
-            cleanup_guard.mark_committed();
+        self.commit_written_files(
+            catalog.as_ref(),
+            table,
+            &table_ident,
+            data_files,
+            overwrite,
+        )
+        .await?;
+        cleanup_guard.mark_committed();
 
-            info!(
-                table = %table_ident,
-                total_rows,
-                "INSERT INTO committed successfully (streaming)"
-            );
-        } else {
-            cleanup_guard.mark_committed();
-        }
+        info!(
+            table = %table_ident,
+            total_rows,
+            overwrite,
+            "INSERT committed successfully (streaming)"
+        );
 
         // Report the written-row count as a 1-row `rows_affected` batch,
         // consistent with the buffered INSERT path and the DELETE/UPDATE/MERGE
@@ -1718,15 +1714,24 @@ impl WriteHandler {
         stmt: &Statement,
         batches: Vec<RecordBatch>,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
-        let table_name = match stmt {
-            Statement::Insert(ins) => match &ins.table {
-                sqlparser::ast::TableObject::TableName(name) => name,
-                other => {
-                    return Err(SqeError::Execution(format!(
-                        "INSERT INTO table functions not supported: {other}"
-                    )));
+        let (table_name, overwrite) = match stmt {
+            Statement::Insert(ins) => {
+                if ins.partitioned.is_some() {
+                    return Err(SqeError::NotImplemented(
+                        "INSERT OVERWRITE with a static PARTITION (col=val) clause is not supported; \
+                         omit the PARTITION clause for dynamic partition overwrite"
+                            .into(),
+                    ));
                 }
-            },
+                match &ins.table {
+                    sqlparser::ast::TableObject::TableName(name) => (name, ins.overwrite),
+                    other => {
+                        return Err(SqeError::Execution(format!(
+                            "INSERT INTO table functions not supported: {other}"
+                        )));
+                    }
+                }
+            }
             other => {
                 return Err(SqeError::Execution(format!(
                     "Expected Insert statement, got: {other}"
@@ -1742,10 +1747,11 @@ impl WriteHandler {
             username = %session.user.username,
             table = %table_ident,
             total_rows,
+            overwrite,
             "Executing INSERT INTO SELECT"
         );
 
-        if total_rows == 0 {
+        if total_rows == 0 && !overwrite {
             info!(table = %table_ident, "INSERT SELECT returned no rows — nothing to write");
             return Ok(vec![]);
         }
@@ -1781,43 +1787,21 @@ impl WriteHandler {
         )
         .await?;
 
-        if !data_files.is_empty() {
-            let files_for_retry = data_files.clone();
-            let catalog_for_commit = catalog.clone();
-            commit_with_retry(
-                catalog.as_ref(),
-                &table_ident,
-                "insert",
-                move |fresh_table| {
-                    let files = files_for_retry.clone();
-                    let cat = catalog_for_commit.clone();
-                    async move {
-                        let tx = Transaction::new(&fresh_table);
-                        let action = tx.fast_append().add_data_files(files);
-                        let tx = action.apply(tx)?;
-                        tx.commit(cat.as_ref()).await
-                    }
-                },
-            )
-            .await
-            .map_err(|e| {
-                SqeError::Execution(format!("Failed to commit INSERT transaction: {e}"))
-            })?;
-            cleanup_guard.mark_committed();
+        self.commit_written_files(catalog.as_ref(), table, &table_ident, data_files, overwrite)
+            .await?;
+        cleanup_guard.mark_committed();
 
-            if let Some(stats_batches) = stats_snapshot {
-                self.maybe_emit_puffin_sidecar(&catalog, &table_ident, &stats_batches)
-                    .await;
-            }
-
-            info!(
-                table = %table_ident,
-                total_rows,
-                "INSERT INTO committed successfully"
-            );
-        } else {
-            cleanup_guard.mark_committed();
+        if let Some(stats_batches) = stats_snapshot {
+            self.maybe_emit_puffin_sidecar(&catalog, &table_ident, &stats_batches)
+                .await;
         }
+
+        info!(
+            table = %table_ident,
+            total_rows,
+            overwrite,
+            "INSERT INTO committed successfully"
+        );
 
         Ok(affected_rows_batch(total_rows)) // DML success with affected row count
     }
@@ -4195,6 +4179,161 @@ impl WriteHandler {
     // -------------------------------------------------------------------------
     // CoW helper methods
     // -------------------------------------------------------------------------
+
+    /// Commit already-written data files, either as an append (overwrite=false)
+    /// or as an atomic overwrite swap (overwrite=true).
+    ///
+    /// Overwrite semantics:
+    /// - Unpartitioned table (or a spec with no fields): full replace. Every
+    ///   current data file is removed.
+    /// - Partitioned table: dynamic overwrite. Only current data files whose
+    ///   partition value appears in `new_data_files` are removed; untouched
+    ///   partitions are preserved.
+    ///
+    /// In both cases the position-delete files covering the removed data files
+    /// are dropped in the same commit (no superseded-delete debris). Equality
+    /// deletes are left alone: `covered_position_deletes` only targets position
+    /// deletes, and stale equality deletes are harmless here because the new
+    /// data files land at a higher sequence number and are never matched by an
+    /// older equality delete.
+    ///
+    /// A zero-length `new_data_files` with overwrite=true is a truncate on an
+    /// unpartitioned table and a no-op on a partitioned one (no partitions
+    /// touched). Callers MUST route zero-row overwrites here rather than taking
+    /// an "empty SELECT" early return.
+    ///
+    /// `catalog` is `&dyn Catalog` (the bridge handed out by
+    /// `create_catalog_bridge`), not `&SessionCatalog`: both INSERT entrypoints
+    /// only hold the erased catalog trait object. `SessionCatalogBridge::load_table`
+    /// delegates through `SessionCatalog::load_table` (cache-aware), so this loses
+    /// no behaviour versus going through `SessionCatalog` directly.
+    async fn commit_written_files(
+        &self,
+        catalog: &dyn Catalog,
+        mut table: IcebergTable,
+        table_ident: &TableIdent,
+        new_data_files: Vec<DataFile>,
+        overwrite: bool,
+    ) -> sqe_core::Result<()> {
+        use std::collections::HashSet;
+
+        if !overwrite {
+            if new_data_files.is_empty() {
+                return Ok(());
+            }
+            commit_with_retry(catalog, table_ident, "insert", move |fresh_table| {
+                let files = new_data_files.clone();
+                async move {
+                    let tx = Transaction::new(&fresh_table);
+                    let action = tx.fast_append().add_data_files(files);
+                    let tx = action.apply(tx)?;
+                    tx.commit(catalog).await
+                }
+            })
+            .await
+            .map_err(|e| SqeError::Execution(format!("Failed to commit INSERT: {e}")))?;
+            return Ok(());
+        }
+
+        // Partitioned iff the default spec has fields.
+        let partitioned = !table
+            .metadata()
+            .default_partition_spec()
+            .fields()
+            .is_empty();
+
+        // Distinct partitions touched by the new files (dynamic overwrite).
+        // `Struct` derives PartialEq/Eq/Hash; partition cardinality per write
+        // is small, so a Vec + linear membership check is fine.
+        let touched_partitions: Vec<iceberg::spec::Struct> = if partitioned {
+            let mut v: Vec<iceberg::spec::Struct> = Vec::new();
+            for f in &new_data_files {
+                let p = f.partition().clone();
+                if !v.contains(&p) {
+                    v.push(p);
+                }
+            }
+            v
+        } else {
+            Vec::new()
+        };
+
+        let mut attempt = 1u32;
+        loop {
+            let all_old = self.collect_data_files(&table).await?;
+
+            let removed_data: Vec<DataFile> = if !partitioned {
+                all_old
+            } else {
+                all_old
+                    .into_iter()
+                    .filter(|df| touched_partitions.contains(df.partition()))
+                    .collect()
+            };
+
+            // Nothing to replace and nothing to add: genuine no-op.
+            if removed_data.is_empty() && new_data_files.is_empty() {
+                info!(table = %table_ident, "INSERT OVERWRITE: no partitions touched and no new rows; no-op");
+                return Ok(());
+            }
+
+            // Drop position-delete files whose data files are all being removed.
+            let removed_paths: HashSet<String> =
+                removed_data.iter().map(|d| d.file_path().to_string()).collect();
+            let live_deletes = crate::maintenance::collect_live_delete_files(&table).await?;
+            let covered_deletes =
+                crate::maintenance::covered_position_deletes(&removed_paths, &live_deletes);
+
+            let files_to_remove: Vec<DataFile> = removed_data
+                .iter()
+                .cloned()
+                .chain(covered_deletes.into_iter())
+                .collect();
+
+            info!(
+                table = %table_ident,
+                partitioned,
+                new_files = new_data_files.len(),
+                removed_data = removed_data.len(),
+                attempt,
+                "INSERT OVERWRITE: committing atomic swap"
+            );
+
+            let tx = Transaction::new(&table);
+            let mut action = tx.rewrite_files().add_data_files(new_data_files.clone());
+            if !files_to_remove.is_empty() {
+                action = action.delete_files(files_to_remove);
+            }
+            let commit_result = match action.apply(tx) {
+                Ok(tx) => tx.commit(catalog).await,
+                Err(e) => Err(e),
+            };
+            match commit_result {
+                Ok(_) => {
+                    info!(table = %table_ident, "INSERT OVERWRITE committed successfully");
+                    return Ok(());
+                }
+                Err(e)
+                    if (e.retryable() || is_conflict_message(&e.to_string()))
+                        && attempt < COW_MAX_ATTEMPTS =>
+                {
+                    let sleep_ms = cow_conflict_backoff_ms(attempt);
+                    warn!(table = %table_ident, op = "insert-overwrite", attempt, backoff_ms = sleep_ms, error = %e, "commit conflict; reloading table and retrying");
+                    tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
+                    table = catalog
+                        .load_table(table_ident)
+                        .await
+                        .map_err(|e| SqeError::Catalog(format!("Failed to reload table: {e}")))?;
+                    attempt += 1;
+                }
+                Err(e) => {
+                    return Err(SqeError::Execution(format!(
+                        "Failed to commit INSERT OVERWRITE: {e}"
+                    )));
+                }
+            }
+        }
+    }
 
     /// Collect all current DataFile objects from the table's manifest entries.
     ///

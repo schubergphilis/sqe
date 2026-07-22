@@ -31,6 +31,7 @@ mod grant_dispatch_test;
 mod grant_introspection_gate_test;
 mod in_subquery_view_rewrite;
 mod incremental_scan_e2e;
+mod insert_overwrite_e2e;
 mod integration_test;
 mod maintenance_procedures_test;
 mod mor_update_merge_integration;
