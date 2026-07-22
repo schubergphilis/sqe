@@ -420,3 +420,54 @@ async fn mor_delete_then_cow_update_round_trip() {
 
     let _ = exec(&handler, &session, &format!("DROP TABLE IF EXISTS {fq}")).await;
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// #376: a copy-on-write rewrite that fully supersedes a MoR position-delete
+// file must drop that delete file in the same commit, leaving no dangling
+// manifest debris. Reads stayed correct before the fix; the cost was extra
+// delete-manifest entries accumulating per CoW commit on MoR-touched tables.
+// ─────────────────────────────────────────────────────────────────────────
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs docker-compose.test.yml + Polaris"]
+async fn cow_rewrite_drops_superseded_position_deletes_376() {
+    let (session, handler) = crate::common::setup_handler().await;
+    let ns = "default";
+    let name = "cow_debris_376";
+    let fq = format!("{ns}.{name}");
+
+    // MoR table: DELETE writes a position-delete file without rewriting data.
+    seed_three_files(&handler, &session, &fq, "'write.delete.mode' = 'merge-on-read'").await;
+    exec(&handler, &session, &format!("DELETE FROM {fq} WHERE id = 1")).await;
+    let (_, del_summary) = latest_snapshot(&handler, &session, ns, name).await;
+    assert!(
+        summary_count(&del_summary, "added-delete-files") >= 1,
+        "MoR DELETE must write a position-delete file; summary={del_summary:?}"
+    );
+
+    // UPDATE on a CTAS table (no primary key) falls back to CoW and rewrites
+    // the data files. The step-above delete file targets a rewritten data
+    // file, so it is fully superseded and must be removed in the same commit.
+    exec(&handler, &session, &format!("UPDATE {fq} SET v = v + 1")).await;
+    let (op, upd_summary) = latest_snapshot(&handler, &session, ns, name).await;
+    assert!(
+        summary_count(&upd_summary, "removed-delete-files") >= 1
+            || summary_count(&upd_summary, "removed-position-delete-files") >= 1,
+        "CoW rewrite must drop the superseded position-delete file (#376); \
+         operation={op} summary={upd_summary:?}"
+    );
+
+    // Read correctness: the deleted row must not resurrect, and the update
+    // must have applied to the survivors.
+    assert_eq!(
+        scalar_i64(&handler, &session, &format!("SELECT COUNT(*) FROM {fq}")).await,
+        2,
+        "deleted row must stay deleted after the CoW rewrite"
+    );
+    assert_eq!(
+        scalar_i64(&handler, &session, &format!("SELECT COUNT(*) FROM {fq} WHERE id = 1")).await,
+        0,
+        "id=1 was deleted; the CoW rewrite must not bring it back"
+    );
+
+    let _ = exec(&handler, &session, &format!("DROP TABLE IF EXISTS {fq}")).await;
+}
