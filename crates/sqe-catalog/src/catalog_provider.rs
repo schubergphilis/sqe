@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use datafusion::catalog::{CatalogProvider, SchemaProvider};
 use futures::StreamExt;
 use iceberg::NamespaceIdent;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use sqe_core::config::StorageConfig;
 use sqe_core::SessionUser;
@@ -23,6 +23,48 @@ const NAMESPACE_PROBE_CONCURRENCY: usize = 8;
 /// Polaris list-namespaces storm; one probe per window per provider is
 /// enough to pick up externally committed namespaces.
 const NAMESPACE_RELIST_COOLDOWN: Duration = Duration::from_secs(5);
+
+/// Decide whether a namespace-listing failure at catalog construction should
+/// degrade to an empty namespace list (catalog still registers, exposes nothing)
+/// rather than aborting the whole session-context build.
+///
+/// Two cases degrade:
+///
+///   * **Forbidden (AccessDenied)** — always, on every path. The catalog stays
+///     visible (SHOW CATALOGS / system.jdbc.catalogs) but exposes no namespaces
+///     to this principal; per-operation checks still protect the data. (#5)
+///   * **Unresolvable static anchor** — only when `degrade_unresolvable` is set.
+///     A static `[catalogs.*]` anchor whose Polaris warehouse does not exist
+///     ("Unable to find warehouse main_warehouse") must not take down the whole
+///     data plane and block unrelated `ws_<slug>.*` catalogs. It registers empty
+///     and self-heals via the miss-triggered re-list once the warehouse exists.
+///     (#501)
+///
+/// Transient / infra faults (Polaris 5xx, timeouts, circuit-breaker open, rate
+/// limiting, a rejected bearer) always propagate so the session build fails
+/// loudly and clients retry, instead of the fault masquerading as an empty
+/// catalog. The dynamic discovery path passes `degrade_unresolvable = false`,
+/// keeping its documented Err -> None -> config-default fallback.
+fn should_degrade_to_empty_namespaces(err: &sqe_core::SqeError, degrade_unresolvable: bool) -> bool {
+    use sqe_core::SqeErrorCode;
+    let code = err.error_code();
+    if code == SqeErrorCode::AccessDenied {
+        return true;
+    }
+    if !degrade_unresolvable {
+        return false;
+    }
+    // Static-anchor resilience: degrade on an unresolvable/absent warehouse, but
+    // never on a transient fault the caller should retry.
+    !matches!(
+        code,
+        SqeErrorCode::CatalogUnavailable
+            | SqeErrorCode::CircuitBreakerOpen
+            | SqeErrorCode::QueryTimeout
+            | SqeErrorCode::ResourceExhausted
+            | SqeErrorCode::AuthenticationFailed
+    )
+}
 
 /// Answer "is `name` in the namespace snapshot?", re-listing live on a miss.
 ///
@@ -198,6 +240,10 @@ impl SqeCatalogProvider {
             policy_store,
             session_user,
             true,
+            // Convenience/legacy constructor: keep the original hard-fail
+            // semantics on an unresolvable catalog. Only the static-anchor loop
+            // opts into degrade-to-empty via `build_catalog_provider`.
+            false,
         )
         .await
     }
@@ -221,12 +267,16 @@ impl SqeCatalogProvider {
         policy_store: Option<Arc<dyn PolicyStore>>,
         session_user: Option<SessionUser>,
         namespace_visibility_filter: bool,
+        degrade_unresolvable: bool,
     ) -> sqe_core::Result<Self> {
-        // A principal not authorized to list this catalog's namespaces gets an
-        // empty list, not a hard error: the catalog still registers (so it
-        // appears in SHOW CATALOGS / system.jdbc.catalogs) but exposes no
-        // namespaces to this caller, instead of aborting the whole session
-        // context build. Per-operation checks still protect the data. (#5)
+        // A failed namespace listing degrades to an empty list (catalog still
+        // registers, exposes nothing) instead of aborting the whole session
+        // context build, in two cases decided by
+        // `should_degrade_to_empty_namespaces`:
+        //   * the principal is forbidden to LIST (always), or (#5)
+        //   * `degrade_unresolvable` is set and the catalog is an unresolvable
+        //     static anchor whose warehouse does not exist (#501).
+        // Transient/infra faults always propagate so the build fails loudly.
         let cached_namespaces = match Self::list_visible_namespace_names(
             Arc::clone(&session_catalog),
             namespace_visibility_filter,
@@ -234,11 +284,20 @@ impl SqeCatalogProvider {
         .await
         {
             Ok(names) => names,
-            Err(e) if e.error_code() == sqe_core::SqeErrorCode::AccessDenied => {
-                debug!(
-                    warehouse = %warehouse,
-                    "principal not authorized to list namespaces; registering catalog with none visible"
-                );
+            Err(e) if should_degrade_to_empty_namespaces(&e, degrade_unresolvable) => {
+                if e.error_code() == sqe_core::SqeErrorCode::AccessDenied {
+                    debug!(
+                        warehouse = %warehouse,
+                        "principal not authorized to list namespaces; registering catalog with none visible"
+                    );
+                } else {
+                    warn!(
+                        warehouse = %warehouse,
+                        error = %e,
+                        "static anchor catalog is unresolvable; registering it with no namespaces so \
+                         unrelated catalogs still serve queries (self-heals once the warehouse exists)"
+                    );
+                }
                 Vec::new()
             }
             Err(e) => return Err(e),
@@ -622,5 +681,73 @@ mod tests {
             contains_or_refresh(&names, &last, Duration::from_secs(5), "bank", || None);
         assert!(!found);
         assert_eq!(*names.read().unwrap(), vec!["public"]);
+    }
+
+    /// A caller forbidden to LIST always degrades to an empty namespace list —
+    /// on both the static and the discovery path — so the catalog still
+    /// registers (visible in SHOW CATALOGS) but exposes nothing to this
+    /// principal. (#5)
+    #[test]
+    fn access_denied_degrades_regardless_of_flag() {
+        let forbidden = sqe_core::SqeError::Catalog("403 forbidden".to_string());
+        assert_eq!(forbidden.error_code(), sqe_core::SqeErrorCode::AccessDenied);
+        assert!(should_degrade_to_empty_namespaces(&forbidden, false));
+        assert!(should_degrade_to_empty_namespaces(&forbidden, true));
+    }
+
+    /// #501: an unresolvable *static* anchor must degrade to empty so unrelated
+    /// catalogs still serve queries — but only when the caller opted into anchor
+    /// resilience (`degrade_unresolvable = true`). The discovery path keeps its
+    /// Err -> None -> config-default fallback.
+    ///
+    /// The real runtime error: `load_config` renders the Polaris `/v1/config`
+    /// 404 as "...unexpected status code, status: 404 Not Found, json:
+    /// {...Unable to find warehouse...}", which `SessionCatalog::list_namespaces`
+    /// wraps as "Failed to list namespaces: ...". That string carries both "not
+    /// found" and "namespaces", so `classify_catalog_error` lands it on
+    /// `SchemaNotFound`. The second case is a defensive one: a body with no
+    /// "not found"/"404" marker classifies as the generic `CatalogError`. Both
+    /// must degrade when flagged and propagate otherwise.
+    #[test]
+    fn absent_static_anchor_degrades_only_when_flagged() {
+        let realistic_404 = sqe_core::SqeError::Catalog(
+            "Failed to list namespaces: Unexpected => Received response with unexpected \
+             status code, status: 404 Not Found, json: {\"error\":{\"message\":\"Unable to \
+             find warehouse main_warehouse\"}}"
+                .to_string(),
+        );
+        assert_eq!(
+            realistic_404.error_code(),
+            sqe_core::SqeErrorCode::SchemaNotFound
+        );
+        assert!(should_degrade_to_empty_namespaces(&realistic_404, true));
+        assert!(!should_degrade_to_empty_namespaces(&realistic_404, false));
+
+        let generic = sqe_core::SqeError::Catalog(
+            "Failed to list namespaces: Unable to find warehouse main_warehouse".to_string(),
+        );
+        assert_eq!(generic.error_code(), sqe_core::SqeErrorCode::CatalogError);
+        assert!(should_degrade_to_empty_namespaces(&generic, true));
+        assert!(!should_degrade_to_empty_namespaces(&generic, false));
+    }
+
+    /// Transient/infra faults fail the session build loudly even for a static
+    /// anchor: a Polaris outage or a bad bearer must surface as a retryable
+    /// error, never masquerade as an empty catalog.
+    #[test]
+    fn transient_faults_never_degrade() {
+        let unavailable = sqe_core::SqeError::Catalog("503 service unavailable".to_string());
+        assert_eq!(
+            unavailable.error_code(),
+            sqe_core::SqeErrorCode::CatalogUnavailable
+        );
+        assert!(!should_degrade_to_empty_namespaces(&unavailable, true));
+
+        let unauth = sqe_core::SqeError::Catalog("401 unauthorized".to_string());
+        assert_eq!(
+            unauth.error_code(),
+            sqe_core::SqeErrorCode::AuthenticationFailed
+        );
+        assert!(!should_degrade_to_empty_namespaces(&unauth, true));
     }
 }

@@ -50,6 +50,13 @@ static SESSION_CONTEXT_CACHE: LazyLock<Cache<String, (SessionContext, Arc<Sessio
 /// Returns `(catalog_provider, session_catalog)` so the caller can register
 /// the provider under `cat_name` and optionally promote it to the primary
 /// `SessionCatalog`.
+///
+/// `degrade_unresolvable` controls what happens when the catalog's namespace
+/// listing fails because the warehouse is absent/unresolvable. The static
+/// `[catalogs.*]` loop passes `true` so a missing anchor (e.g. `main_warehouse`
+/// not seeded) registers empty instead of aborting the whole session and
+/// blocking unrelated catalogs (#501). Dynamic discovery passes `false` to keep
+/// its Err -> None -> config-default fallback.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn build_catalog_provider(
     cat_cfg: &sqe_core::config::CatalogConfig,
@@ -59,6 +66,7 @@ pub(crate) async fn build_catalog_provider(
     table_cache: Option<&TableMetadataCache>,
     policy_store: Option<&Arc<dyn PolicyStore>>,
     prom_metrics: Option<&Arc<sqe_metrics::MetricsRegistry>>,
+    degrade_unresolvable: bool,
 ) -> Result<(SqeCatalogProvider, Arc<SessionCatalog>), Arc<SqeError>> {
     let (session_catalog, storage) =
         build_session_catalog(cat_cfg, session, global_storage, table_cache).await?;
@@ -70,6 +78,7 @@ pub(crate) async fn build_catalog_provider(
         policy_store.cloned(),
         Some(session.user.clone()),
         cat_cfg.namespace_visibility_filter,
+        degrade_unresolvable,
     )
     .await
     .map_err(Arc::new)?;
@@ -479,6 +488,10 @@ pub async fn create_session_context(
                     table_cache,
                     policy_store,
                     prom_metrics,
+                    // Static anchor: never let an unresolvable warehouse abort
+                    // the whole session build and take down unrelated catalogs
+                    // (#501). It registers empty and self-heals on re-list.
+                    true,
                 )
                 .await?;
                 ctx.register_catalog(cat_name, Arc::new(catalog_provider));
@@ -843,6 +856,10 @@ pub(crate) async fn discover_catalog_provider(
         table_cache,
         policy_store,
         prom_metrics,
+        // Discovery keeps its Err -> None -> config-default fallback: an
+        // unresolvable discovered warehouse must not register as an empty
+        // catalog and hijack the session default.
+        false,
     )
     .await
     {
