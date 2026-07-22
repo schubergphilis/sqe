@@ -787,13 +787,16 @@ async fn for_version_as_of_on_v3_table() {
         .await
         .expect("INSERT 1");
 
-    // Capture the snapshot id BEFORE INSERT 2/3.
+    // Capture the current snapshot id BEFORE INSERT 2/3. The #320
+    // table_snapshots schema dropped the is_current_snapshot column, so the
+    // current snapshot is the most recently committed one (latest
+    // committed_at, snapshot_id tie-break).
     let pin_batches = handler
         .execute(
             &session,
             &format!(
                 "SELECT snapshot_id FROM table_snapshots('{ns}', '{name}') \
-                 WHERE is_current_snapshot = TRUE"
+                 ORDER BY committed_at DESC, snapshot_id DESC LIMIT 1"
             ), None)
         .await
         .expect("snapshot_id pin");
@@ -891,7 +894,7 @@ async fn cdc_incremental_scan_on_v3_table() {
             &session,
             &format!(
                 "SELECT snapshot_id FROM table_snapshots('{ns}', '{name}') \
-                 ORDER BY sequence_number DESC LIMIT 1"
+                 ORDER BY committed_at DESC, snapshot_id DESC LIMIT 1"
             ), None)
         .await
         .expect("end snapshot id");
