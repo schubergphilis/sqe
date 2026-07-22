@@ -1643,15 +1643,47 @@ impl MaintenanceHandler {
     /// referenced file -- batches can never race to claim the same delete
     /// file.
     ///
+    /// # Commit-conflict retry layering (Task 3 hardening)
+    ///
+    /// Two retry layers exist across this job, and they are deliberately
+    /// scoped to never both fire for the same commit:
+    ///
+    /// - The OUTER loop, [`Self::rewrite_data_files_distributed`], retries a
+    ///   retryable `Err` by re-planning and re-dispatching the WHOLE job
+    ///   from scratch (fresh table load, fresh groups, fresh worker
+    ///   dispatch). It owns retrying a failure of the FIRST batch to commit
+    ///   in a job (`committed_batches == 0` at failure time) -- exactly the
+    ///   only batch that exists when `partial_progress` is off, which is
+    ///   why that default path is untouched by this fix.
+    /// - This function's INNER retry (inside [`Self::commit_one_batch`])
+    ///   owns retrying a retryable commit conflict on any batch AFTER the
+    ///   first has already committed (`committed_batches > 0`). It reloads
+    ///   the table and rebuilds+recommits the SAME `RewriteFilesAction` --
+    ///   the worker-produced files were already written to object storage
+    ///   by `dispatcher.dispatch` and stay valid (pinned to `seq_at_start`,
+    ///   not to whichever snapshot ends up committing them), so nothing is
+    ///   re-dispatched to the worker fleet, only the commit is retried, up
+    ///   to `MAX_COMMIT_ATTEMPTS` with the same exponential backoff the
+    ///   outer loop uses.
+    ///
+    /// Because the inner layer only ever activates for `committed_batches >
+    /// 0`, and the outer layer only ever sees an `Err` bubble out of a
+    /// `committed_batches == 0` failure, the two layers partition the
+    /// batch space and never stack: there is no 4x4 = 16-attempt blowup.
+    /// Before this fix, a retryable conflict on batch 2+ hit neither layer:
+    /// it fell straight into the `partial = true` fallback below with no
+    /// retry at all, even though the underlying conflict was transient.
+    ///
     /// # Return value
     ///
     /// Returns `Ok` with `partial = true` when `partial_progress` is on, at
     /// least one batch already committed, and a later batch's dispatch/
-    /// aggregate/commit failed; the already-committed batches are never
-    /// rolled back. Returns `Err` -- no commit at all -- when
+    /// aggregate/commit TERMINALLY failed (non-retryable, or retryable with
+    /// the inner retry's attempts exhausted); the already-committed batches
+    /// are never rolled back. Returns `Err` -- no commit at all -- when
     /// `partial_progress` is off, or when it is on but the very first batch
     /// failed before anything committed (there is nothing "partial" about
-    /// zero commits).
+    /// zero commits) -- that `Err` is what the outer loop retries.
     #[allow(clippy::too_many_arguments)]
     async fn commit_eligible_groups(
         catalog: &Arc<dyn Catalog>,
@@ -1683,6 +1715,15 @@ impl MaintenanceHandler {
         let mut live_expected = input_count as i64;
 
         for (batch_idx, batch) in batches.into_iter().enumerate() {
+            // See the "Commit-conflict retry layering" doc section above:
+            // only batches committing AFTER the first success get the
+            // inner commit-conflict retry. The first batch's failure keeps
+            // bubbling as `Err` for the OUTER loop to retry, unchanged --
+            // this is what keeps the `partial_progress = false` path (always
+            // exactly one batch, so always `committed_batches == 0` here)
+            // byte-identical to before this fix.
+            let retry_on_conflict = committed_batches > 0;
+
             let result = Self::commit_one_batch(
                 catalog,
                 &table,
@@ -1694,6 +1735,7 @@ impl MaintenanceHandler {
                 table_cache,
                 live_expected,
                 dispatcher,
+                retry_on_conflict,
             )
             .await;
 
@@ -1756,7 +1798,24 @@ impl MaintenanceHandler {
     /// over just that batch's groups). See
     /// [`Self::commit_eligible_groups`]'s doc comment for the correctness
     /// argument justifying reusing `seq_at_start` and
-    /// `check_file_existence(true)` unchanged across batches.
+    /// `check_file_existence(true)` unchanged across batches, and for the
+    /// "Commit-conflict retry layering" section this function implements
+    /// the inner half of.
+    ///
+    /// `dispatcher.dispatch` runs exactly ONCE, win or lose: a dispatch
+    /// failure is not retried here (that is the OUTER
+    /// `rewrite_data_files_distributed` loop's job, via a full
+    /// re-plan-and-redispatch). Only the COMMIT step, via
+    /// [`Self::commit_aggregated_batch`], is retried in place when
+    /// `retry_on_conflict` is set and the failure is a
+    /// [`classify_commit_error`]-tagged retryable conflict: the
+    /// worker-produced files already exist in object storage and are simply
+    /// recommitted (rebuilding the `Transaction` from a freshly reloaded
+    /// `table`) rather than re-dispatched. `retry_on_conflict` is `false`
+    /// for the first batch to attempt a commit in the job (see the caller),
+    /// which keeps that case -- and therefore the whole
+    /// `partial_progress = false` default path -- an unretried single
+    /// attempt, byte-identical to before this fix.
     #[allow(clippy::too_many_arguments)]
     async fn commit_one_batch(
         catalog: &Arc<dyn Catalog>,
@@ -1769,6 +1828,7 @@ impl MaintenanceHandler {
         table_cache: Option<&TableMetadataCache>,
         live_expected_before: i64,
         dispatcher: &dyn crate::compaction_dispatch::GroupBatchDispatcher,
+        retry_on_conflict: bool,
     ) -> sqe_core::Result<BatchCommitResult> {
         let outcomes = dispatcher.dispatch(batch).await?;
 
@@ -1777,10 +1837,78 @@ impl MaintenanceHandler {
         // Row invariant, re-run per batch (the per-group
         // `expected_rows_after_deletes` cross-check already ran on the
         // WORKER before it returned); any violation aborts before this
-        // batch's commit, leaving any earlier batches' commits intact.
+        // batch's commit, leaving any earlier batches' commits intact. Not
+        // retried on conflict (there is nothing to retry: this is a data
+        // problem, not a stale-snapshot problem).
         let aggregated =
             sqe_compaction::dispatch::aggregate_group_outcomes(outcomes, &batch_old_files)?;
 
+        const MAX_COMMIT_ATTEMPTS: usize = 4;
+        let mut attempt: usize = 0;
+        let mut reloaded_table: Option<IcebergTable> = None;
+        loop {
+            attempt += 1;
+            let current_table: &IcebergTable = reloaded_table.as_ref().unwrap_or(table);
+            let result = Self::commit_aggregated_batch(
+                catalog,
+                current_table,
+                ident,
+                &batch_old_files,
+                aggregated.clone(),
+                seq_at_start,
+                live_deletes,
+                snapshot_properties.clone(),
+                table_cache,
+                live_expected_before,
+            )
+            .await;
+
+            match result {
+                Ok(v) => return Ok(v),
+                Err(e) => {
+                    let msg = e.to_string().to_lowercase();
+                    let retryable = msg.contains("retryable") || msg.contains("conflict");
+                    if retry_on_conflict && retryable && attempt < MAX_COMMIT_ATTEMPTS {
+                        let backoff =
+                            std::time::Duration::from_millis(50 * (1u64 << (attempt - 1)));
+                        warn!(
+                            table = %ident,
+                            attempt,
+                            backoff_ms = backoff.as_millis() as u64,
+                            "rewrite_data_files_distributed: retryable commit conflict on a \
+                             partial_progress batch commit; reloading the table and retrying \
+                             just this batch's commit (worker outputs are reused, not \
+                             re-dispatched)"
+                        );
+                        tokio::time::sleep(backoff).await;
+                        reloaded_table = Some(load_table(catalog, ident).await?);
+                        continue;
+                    }
+                    return Err(e);
+                }
+            }
+        }
+    }
+
+    /// Commit one already-aggregated batch (worker outcomes decoded, row
+    /// invariant already checked by the caller) against `table`. Split out
+    /// of [`Self::commit_one_batch`] so its commit-conflict retry loop can
+    /// re-invoke JUST this step -- rebuilding the `Transaction` against a
+    /// freshly reloaded `table` -- without re-dispatching to the worker
+    /// fleet or re-running the row-invariant check.
+    #[allow(clippy::too_many_arguments)]
+    async fn commit_aggregated_batch(
+        catalog: &Arc<dyn Catalog>,
+        table: &IcebergTable,
+        ident: &TableIdent,
+        batch_old_files: &[DataFile],
+        aggregated: sqe_compaction::dispatch::AggregatedRewrite,
+        seq_at_start: i64,
+        live_deletes: &[DataFile],
+        snapshot_properties: Option<std::collections::HashMap<String, String>>,
+        table_cache: Option<&TableMetadataCache>,
+        live_expected_before: i64,
+    ) -> sqe_core::Result<BatchCommitResult> {
         let output_count = aggregated.new_files.len() as i64;
         let output_bytes: i64 = aggregated
             .new_files
@@ -3337,6 +3465,91 @@ mod tests {
             }
         }
 
+        /// Synthetic dispatcher covering the Task 3 hardening gap: like
+        /// [`PoisonPathDispatcher`]'s happy path, every batch "compacts"
+        /// cleanly into one consolidated file per group. But the FIRST time
+        /// it is asked to dispatch a batch containing `conflict_after_path`,
+        /// it first lands an unrelated, ordinary `fast_append` directly on
+        /// the same table through the same catalog -- simulating a
+        /// concurrent external writer -- which advances the table's
+        /// snapshot out from under the (now-stale) `table` handle that
+        /// `commit_eligible_groups` is about to build that batch's
+        /// `RewriteFilesAction` against. The vendored SQL catalog's
+        /// `update_table` (`vendor/iceberg-rust/crates/catalog/sql/src/
+        /// catalog.rs`) re-validates the transaction's requirements against
+        /// a FRESH reload before applying, so this reliably produces a real
+        /// `ErrorKind::CatalogCommitConflicts` ("commit conflict",
+        /// retryable) on that batch's first commit attempt -- not a
+        /// simulated/injected error string, an actual optimistic-concurrency
+        /// conflict from the underlying catalog. `triggered` ensures the
+        /// injection fires exactly once, modeling a one-shot transient race
+        /// rather than a permanently wedged table, so the fix's
+        /// reload-and-recommit retry is expected to succeed on its next
+        /// attempt.
+        struct ConflictOnceDispatcher {
+            conflict_after_path: String,
+            catalog: Arc<dyn Catalog>,
+            ident: TableIdent,
+            triggered: std::sync::atomic::AtomicBool,
+        }
+
+        #[async_trait::async_trait]
+        impl crate::compaction_dispatch::GroupBatchDispatcher for ConflictOnceDispatcher {
+            async fn dispatch(
+                &self,
+                batch: &[Vec<DataFile>],
+            ) -> sqe_core::Result<Vec<sqe_compaction::dispatch::GroupOutcome>> {
+                let should_inject = batch
+                    .iter()
+                    .flatten()
+                    .any(|f| f.file_path() == self.conflict_after_path)
+                    && !self.triggered.swap(true, std::sync::atomic::Ordering::SeqCst);
+
+                if should_inject {
+                    let fresh = self
+                        .catalog
+                        .load_table(&self.ident)
+                        .await
+                        .expect("reload table for injected concurrent commit");
+                    let extra_path = format!(
+                        "mem://conflict_retry_test/data/concurrent-{}.parquet",
+                        uuid::Uuid::now_v7()
+                    );
+                    let extra_file = fabricated_data_file(&extra_path, 5, 50);
+                    let tx = Transaction::new(&fresh);
+                    let action = tx.fast_append().add_data_files(vec![extra_file]);
+                    let tx_applied = action.apply(tx).expect("apply concurrent fast_append");
+                    tx_applied
+                        .commit(self.catalog.as_ref())
+                        .await
+                        .expect("commit concurrent fast_append");
+                }
+
+                Ok(batch
+                    .iter()
+                    .enumerate()
+                    .map(|(i, group)| {
+                        let rows: u64 = group.iter().map(iceberg::spec::DataFile::record_count).sum();
+                        let bytes: u64 =
+                            group.iter().map(iceberg::spec::DataFile::file_size_in_bytes).sum();
+                        let new_path = format!(
+                            "mem://conflict_retry_test/data/consolidated-{}-{}.parquet",
+                            i,
+                            uuid::Uuid::now_v7()
+                        );
+                        let new_file = fabricated_data_file(&new_path, rows, bytes.max(1));
+                        sqe_compaction::dispatch::GroupOutcome {
+                            group_id: i as u32,
+                            new_files: vec![new_file],
+                            rows_written: rows,
+                            bytes_written: bytes,
+                            uploaded_paths: vec![],
+                        }
+                    })
+                    .collect())
+            }
+        }
+
         async fn total_rows(catalog: &Arc<dyn Catalog>, ident: &TableIdent) -> u64 {
             let reloaded = catalog.load_table(ident).await.expect("reload table");
             collect_live_data_files(&reloaded)
@@ -3436,6 +3649,79 @@ mod tests {
             assert_eq!(live_files.len(), 6, "no commit at all must have happened");
             assert_eq!(reloaded.metadata().snapshots().count(), 1);
             assert_eq!(total_rows(&catalog, &ident).await, 60);
+        }
+
+        // ---------------------------------------------------------------
+        // Task 3 hardening: batch commit-conflict retry
+        //
+        // Covers the review gap directly: a retryable commit conflict on a
+        // batch AFTER the first one has already committed must be retried
+        // in place (reload + recommit, no re-dispatch) instead of being
+        // swallowed straight into `partial = true` with zero retries.
+        // ---------------------------------------------------------------
+
+        #[tokio::test]
+        async fn batch_commit_conflict_after_first_batch_is_retried_and_job_completes() {
+            let (catalog, ident, table, eligible_groups, seq_at_start) =
+                table_with_six_files("conflict_retry_test").await;
+            // Group index 1 (files f3, f4) is the 2nd batch when
+            // partial_progress_batch = 1, i.e. `committed_batches == 1`
+            // (> 0) at the time its commit is attempted -- exactly the case
+            // this fix adds retry for.
+            let conflict_after_path = eligible_groups[1][0].file_path().to_string();
+            let dispatcher = ConflictOnceDispatcher {
+                conflict_after_path,
+                catalog: Arc::clone(&catalog),
+                ident: ident.clone(),
+                triggered: std::sync::atomic::AtomicBool::new(false),
+            };
+
+            let outcome = MaintenanceHandler::commit_eligible_groups(
+                &catalog,
+                table,
+                &ident,
+                eligible_groups,
+                /* partial_progress */ true,
+                /* partial_progress_batch */ 1,
+                seq_at_start,
+                &[],
+                None,
+                None,
+                6,
+                600,
+                &dispatcher,
+            )
+            .await
+            .expect("the injected conflict is retryable and must not fail the job");
+
+            assert!(
+                !outcome.partial,
+                "a retryable commit conflict on batch 2 must be fully absorbed by the inner \
+                 per-batch retry, not reported as a partial-progress fallback"
+            );
+            assert!(
+                outcome.partial_error.is_none(),
+                "no terminal failure occurred, so there is nothing to report as a partial error"
+            );
+            assert_eq!(outcome.files_rewritten, 6, "all 3 batches x 2 files each eventually commit");
+            assert_eq!(outcome.files_out, 3, "one consolidated file per batch");
+
+            let reloaded = catalog.load_table(&ident).await.expect("reload table");
+            let live_files = collect_live_data_files(&reloaded).await.expect("collect live files");
+            // 3 consolidated files (one per batch) + 1 extra file from the
+            // injected concurrent commit that triggered the conflict.
+            assert_eq!(live_files.len(), 4);
+
+            // Snapshots: initial fast_append + the injected concurrent
+            // fast_append + 3 successful batch commits. The batch-2 commit
+            // attempt that hit the conflict never produces a snapshot of
+            // its own (the SQL catalog's CAS rejects it before writing new
+            // metadata), so retrying does not inflate this count.
+            assert_eq!(reloaded.metadata().snapshots().count(), 5);
+
+            // All 60 original rows are preserved across the 3 real batch
+            // commits, plus the 5 rows the injected concurrent commit added.
+            assert_eq!(total_rows(&catalog, &ident).await, 65);
         }
     }
 }
