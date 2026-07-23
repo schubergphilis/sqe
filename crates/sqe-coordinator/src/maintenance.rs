@@ -397,6 +397,14 @@ impl MaintenanceHandler {
                     .await
             }
             ProcedureCall::TableHealth { table } => self.table_health(session, table).await,
+            // Self-scoped cache refresh is intercepted by the query router
+            // (`query_handler`) and never dispatched through the table-scoped
+            // maintenance handler. Guard the exhaustiveness check without
+            // pulling cache logic into this handler.
+            ProcedureCall::RefreshCatalogCache => Err(SqeError::Execution(
+                "refresh_catalog_cache is handled by the query router, not the maintenance handler"
+                    .to_string(),
+            )),
         }
     }
 
