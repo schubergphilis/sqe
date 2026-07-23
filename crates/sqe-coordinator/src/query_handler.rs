@@ -1291,31 +1291,65 @@ impl QueryHandler {
                             },
                         ));
                     }
-                    let result = self.maintenance_handler.handle(session, call).await;
+                    if matches!(**call, sqe_sql::ProcedureCall::RefreshCatalogCache) {
+                        // Self-scoped catalog refresh. NOT a table maintenance
+                        // op: it skips the table-scoped maintenance
+                        // authorization + lineage path, and it must NOT touch
+                        // any process-global cache, or an unprivileged SQL user
+                        // could force a cross-tenant flush. So it drops ONLY the
+                        // caller's own SessionContext -- no REST-catalog drop, no
+                        // result-cache wipe (both of those are global). The
+                        // caller's next query rebuilds its SessionContext and
+                        // re-enumerates catalogs; a newly created catalog is a
+                        // fresh REST-catalog key, so the rebuild discovers it
+                        // without a global REST drop. The global rebind case is
+                        // the admin-gated `POST /api/v1/catalogs/refresh`.
+                        crate::session_context::invalidate_session_cache(
+                            &session.user.username,
+                        ).await;
+                        let schema = Arc::new(Schema::new(vec![
+                            Field::new("scope", DataType::Utf8, false),
+                            Field::new("status", DataType::Utf8, false),
+                        ]));
+                        RecordBatch::try_new(
+                            schema,
+                            vec![
+                                Arc::new(arrow_array::StringArray::from(vec![format!(
+                                    "session:{}",
+                                    session.user.username
+                                )])),
+                                Arc::new(arrow_array::StringArray::from(vec!["refreshed"])),
+                            ],
+                        )
+                        .map(|b| vec![b])
+                        .map_err(|e| SqeError::Execution(e.to_string()))
+                    } else {
+                        let result = self.maintenance_handler.handle(session, call).await;
 
-                    // Maintenance procedures rewrite the table's snapshot
-                    // history. Two caches must drop their entries before the
-                    // next read or the user sees stale results:
-                    //
-                    // 1. SESSION_CONTEXT_CACHE keeps a per-user DataFusion
-                    //    SessionContext. Its registered table_files /
-                    //    table_snapshots TVFs return MemTables built from the
-                    //    pre-rewrite metadata. moka's remove + flush of
-                    //    pending tasks drops the entry immediately.
-                    // 2. ResultCache (query_cache) keys by SQL text. The
-                    //    per-table invalidation does NOT cover queries that
-                    //    referenced the table through a TVF: the TableScan
-                    //    carries the function name (`table_files`) rather
-                    //    than the Iceberg identifier. Nuke the whole result
-                    //    cache after a procedure: maintenance procedures are
-                    //    rare and the cache rebuilds cheaply on next read.
-                    crate::session_context::invalidate_session_cache(
-                        &session.user.username,
-                    ).await;
-                    if let Some(ref qcache) = self.query_cache {
-                        qcache.invalidate_all();
+                        // Maintenance procedures rewrite the table's snapshot
+                        // history. Two caches must drop their entries before the
+                        // next read or the user sees stale results:
+                        //
+                        // 1. SESSION_CONTEXT_CACHE keeps a per-user DataFusion
+                        //    SessionContext. Its registered table_files /
+                        //    table_snapshots TVFs return MemTables built from the
+                        //    pre-rewrite metadata. moka's remove + flush of
+                        //    pending tasks drops the entry immediately.
+                        // 2. ResultCache (query_cache) keys by SQL text. The
+                        //    per-table invalidation does NOT cover queries that
+                        //    referenced the table through a TVF: the TableScan
+                        //    carries the function name (`table_files`) rather
+                        //    than the Iceberg identifier. Nuke the whole result
+                        //    cache after a procedure: maintenance procedures are
+                        //    rare and the cache rebuilds cheaply on next read.
+                        crate::session_context::invalidate_session_cache(
+                            &session.user.username,
+                        ).await;
+                        if let Some(ref qcache) = self.query_cache {
+                            qcache.invalidate_all();
+                        }
+                        result
                     }
-                    result
                 }
 
                 // COMMENT ON TABLE/COLUMN — store as Iceberg table property

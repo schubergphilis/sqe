@@ -590,6 +590,15 @@ pub struct CoordinatorConfig {
     /// `SQE_PRODUCTION_MODE` / `SQE_COORDINATOR__PRODUCTION_MODE`.
     #[serde(default)]
     pub production_mode: bool,
+    /// TTL (seconds) for the per-user `SessionContext` cache. Doubles as the
+    /// passive backstop for catalog-set discovery: a newly created/rebound
+    /// Polaris catalog is only seen once a session rebuild re-enumerates
+    /// catalogs, so this bounds worst-case staleness when the
+    /// `POST /api/v1/catalogs/refresh` admin endpoint (the instant path) is not
+    /// called. Lower = fresher catalogs, higher session-rebuild churn under
+    /// concurrency. Default: 60 s. Env `SQE_COORDINATOR__SESSION_CONTEXT_CACHE_TTL_SECS`.
+    #[serde(default = "default_session_context_cache_ttl_secs")]
+    pub session_context_cache_ttl_secs: u64,
 }
 
 /// HTTP/2 + TCP knobs applied to every tonic Server / Client this
@@ -3417,6 +3426,7 @@ fn default_credential_refresh_interval_secs() -> u64 { 60 }
 fn default_credential_push_connect_timeout_secs() -> u64 { 5 }
 fn default_credential_push_request_timeout_secs() -> u64 { 10 }
 fn default_shutdown_drain_secs() -> u64 { 25 }  // < helm terminationGracePeriodSeconds
+fn default_session_context_cache_ttl_secs() -> u64 { 60 }
 fn default_query_timeout() -> u64 { 300 }       // 5 minutes
 fn default_max_result_rows() -> usize { 1_000_000 }
 fn default_max_concurrent_queries() -> usize { 100 }
@@ -4068,6 +4078,10 @@ impl SqeConfig {
         env_override_u64(
             "SQE_COORDINATOR__CREDENTIAL_PUSH_REQUEST_TIMEOUT_SECS",
             &mut self.coordinator.credential_push_request_timeout_secs,
+        );
+        env_override_u64(
+            "SQE_COORDINATOR__SESSION_CONTEXT_CACHE_TTL_SECS",
+            &mut self.coordinator.session_context_cache_ttl_secs,
         );
         // Coordinator memory knobs use short, un-namespaced env names because
         // operators reach for them under OOM pressure and a mistyped
@@ -4996,6 +5010,7 @@ partial_progress_batch = 5
                 credential_push_request_timeout_secs: default_credential_push_request_timeout_secs(),
                 shutdown_drain_secs: default_shutdown_drain_secs(),
                 production_mode: false,
+                session_context_cache_ttl_secs: default_session_context_cache_ttl_secs(),
             },
             worker: WorkerConfig::default(),
             auth: AuthConfig {
@@ -7288,6 +7303,25 @@ otlp_endpoint = ""
             "#
         );
         toml::from_str(&toml_src).expect("valid coordinator config")
+    }
+
+    #[test]
+    fn session_context_cache_ttl_defaults_to_60s() {
+        let cfg = coord_with_secret("s");
+        assert_eq!(cfg.session_context_cache_ttl_secs, 60);
+    }
+
+    #[test]
+    fn session_context_cache_ttl_env_override_applies() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::set_var("SQE_COORDINATOR__SESSION_CONTEXT_CACHE_TTL_SECS", "5");
+
+        let mut cfg = valid_config();
+        assert_ne!(cfg.coordinator.session_context_cache_ttl_secs, 5);
+        cfg.apply_env_overrides();
+        assert_eq!(cfg.coordinator.session_context_cache_ttl_secs, 5);
+
+        std::env::remove_var("SQE_COORDINATOR__SESSION_CONTEXT_CACHE_TTL_SECS");
     }
 
     #[test]
