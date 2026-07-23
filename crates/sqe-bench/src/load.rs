@@ -132,6 +132,31 @@ fn is_resource_exhausted(err: &anyhow::Error) -> bool {
         || m.contains("95% utilized")
 }
 
+/// Strip the S3 credentials from an error before it is surfaced.
+///
+/// The load CTAS embeds the S3 access/secret keys inline in the SQL text
+/// (`read_parquet` exposes no bind-parameter form), and the coordinator may
+/// echo the failing statement back in its error message. A failed load must
+/// not spill the credential into logs, so replace the known key values with
+/// `***`. The original error is returned unchanged when it contains neither
+/// value, preserving its source chain (e.g. for `is_resource_exhausted`).
+fn redact_s3_secrets(err: anyhow::Error, s3: &S3Args) -> anyhow::Error {
+    let original = err.to_string();
+    let mut redacted = original.clone();
+    for cred in [s3.secret_key.as_deref(), s3.access_key.as_deref()]
+        .into_iter()
+        .flatten()
+        .filter(|c| !c.is_empty())
+    {
+        redacted = redacted.replace(cred, "***");
+    }
+    if redacted == original {
+        err
+    } else {
+        anyhow::anyhow!("{redacted}")
+    }
+}
+
 pub async fn load_benchmark(
     client: &dyn BenchClient,
     args: &LoadArgs<'_>,
@@ -262,6 +287,7 @@ pub async fn load_benchmark(
             Some(key) if !partitioned => {
                 let sorted_sql = format!("{base_sql} ORDER BY {key}");
                 if let Err(e) = client.execute_update(&sorted_sql).await {
+                    let e = redact_s3_secrets(e, s3_args);
                     if is_resource_exhausted(&e) {
                         eprintln!(
                             "  ! sort-on-write OOM on {}.{} (key {key}); failing over to unsorted write",
@@ -274,14 +300,20 @@ pub async fn load_benchmark(
                                 table_def.name
                             ))
                             .await;
-                        client.execute_update(&base_sql).await?;
+                        client
+                            .execute_update(&base_sql)
+                            .await
+                            .map_err(|e| redact_s3_secrets(e, s3_args))?;
                     } else {
                         return Err(e);
                     }
                 }
             }
             _ => {
-                client.execute_update(&base_sql).await?;
+                client
+                    .execute_update(&base_sql)
+                    .await
+                    .map_err(|e| redact_s3_secrets(e, s3_args))?;
             }
         }
         println!("  Done: {}.{}", qualified_ns, table_def.name);
@@ -324,5 +356,50 @@ mod tests {
         // explicit list here; unknown suites get nothing.
         assert!(bloom_columns("tpcds", "store_sales").is_empty());
         assert!(bloom_columns("clickbench", "hits").is_empty());
+    }
+
+    fn s3(access: Option<&str>, secret: Option<&str>) -> S3Args {
+        S3Args {
+            access_key: access.map(str::to_string),
+            secret_key: secret.map(str::to_string),
+            endpoint: None,
+            region: "us-east-1".to_string(),
+        }
+    }
+
+    #[test]
+    fn redact_strips_both_credentials_from_error_text() {
+        let s3 = s3(Some("AKIAEXAMPLE"), Some("super-secret-value"));
+        let err = anyhow::anyhow!(
+            "Query failed: syntax at secret_key => 'super-secret-value', access_key => 'AKIAEXAMPLE'"
+        );
+        let msg = redact_s3_secrets(err, &s3).to_string();
+        assert!(!msg.contains("super-secret-value"), "secret leaked: {msg}");
+        assert!(!msg.contains("AKIAEXAMPLE"), "access key leaked: {msg}");
+        assert!(msg.contains("***"));
+    }
+
+    #[test]
+    fn redact_preserves_resource_exhausted_detection() {
+        // Redaction must not clobber the markers is_resource_exhausted keys on.
+        let s3 = s3(None, Some("s3cr3t"));
+        let err = anyhow::anyhow!("Query failed: Resources exhausted: failed to allocate");
+        let redacted = redact_s3_secrets(err, &s3);
+        assert!(is_resource_exhausted(&redacted));
+    }
+
+    #[test]
+    fn redact_is_noop_when_no_credentials_present_in_message() {
+        let s3 = s3(Some("AKIAEXAMPLE"), Some("super-secret-value"));
+        let err = anyhow::anyhow!("connection refused");
+        assert_eq!(redact_s3_secrets(err, &s3).to_string(), "connection refused");
+    }
+
+    #[test]
+    fn redact_ignores_empty_credentials() {
+        // An empty secret string must not turn every char boundary into ***.
+        let s3 = s3(Some(""), Some(""));
+        let err = anyhow::anyhow!("plain error");
+        assert_eq!(redact_s3_secrets(err, &s3).to_string(), "plain error");
     }
 }

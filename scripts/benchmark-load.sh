@@ -232,7 +232,7 @@ for BENCH in "${BENCHMARKS[@]}"; do
         echo ""
         echo "  [1-2/2] Generating straight into Iceberg (12 days x ${BANK_ROWS_PER_DAY} rows/day)..."
         LOAD_START=$(date +%s)
-        if ! "$BENCH_BIN" generate bank \
+        if ! AWS_SECRET_ACCESS_KEY="$S3_SECRET_KEY" "$BENCH_BIN" generate bank \
             --sink iceberg \
             --days 12 \
             --rows-per-day "$BANK_ROWS_PER_DAY" \
@@ -245,7 +245,6 @@ for BENCH in "${BENCHMARKS[@]}"; do
             --scope 'PRINCIPAL_ROLE:ALL' \
             --s3-endpoint "$S3_ENDPOINT" \
             --s3-access-key "$S3_ACCESS_KEY" \
-            --s3-secret-key "$S3_SECRET_KEY" \
             --s3-region "$S3_REGION" \
             --s3-path-style \
             --clean 2>&1; then
@@ -288,7 +287,7 @@ for BENCH in "${BENCHMARKS[@]}"; do
         *) BLOOM_ARGS=(--bloom-filter); echo "  (bloom filters ON for join-key columns)" ;;
     esac
     LOAD_START=$(date +%s)
-    if ! "$BENCH_BIN" load "$BENCH" \
+    if ! AWS_SECRET_ACCESS_KEY="$DATA_S3_SECRET_KEY" "$BENCH_BIN" load "$BENCH" \
         --scale "$BENCH_SCALE" \
         --data "$DATA_PATH" \
         --protocol "$BENCH_PROTOCOL" \
@@ -297,7 +296,6 @@ for BENCH in "${BENCHMARKS[@]}"; do
         --username "$SQE_USERNAME" \
         --password "$SQE_PASSWORD" \
         --s3-access-key "$DATA_S3_ACCESS_KEY" \
-        --s3-secret-key "$DATA_S3_SECRET_KEY" \
         --s3-endpoint "$DATA_S3_ENDPOINT" \
         --s3-region "$DATA_S3_REGION" \
         ${BLOOM_ARGS[@]+"${BLOOM_ARGS[@]}"} \
