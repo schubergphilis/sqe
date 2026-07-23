@@ -14,3 +14,9 @@ sast = true
 hardening = true
 secret_scan = true
 sbom_verify = true
+
+[[registry]]
+type = "harbor"
+repo = "repo.sovereign-data.org/chameleon"
+username_var = "REGISTRY_USERNAME"
+password_var = "REGISTRY_PASSWORD"
