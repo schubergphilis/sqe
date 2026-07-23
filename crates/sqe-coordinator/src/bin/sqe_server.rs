@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use axum::response::{IntoResponse, Json, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::Router;
 use clap::Parser;
 use serde::Serialize;
@@ -374,6 +374,58 @@ async fn api_metrics_history(
     Json(response)
 }
 
+/// Optional request body for `POST /api/v1/catalogs/refresh`.
+///
+/// Absent body (or `{}`) invalidates every session's caches; `{"username":
+/// "<u>"}` scopes the session-cache drop to that user. The shared REST-catalog
+/// cache is always dropped regardless (it is keyed by url+warehouse+token, not
+/// by user).
+#[derive(serde::Deserialize, Default)]
+struct CatalogRefreshBody {
+    #[serde(default)]
+    username: Option<String>,
+}
+
+#[derive(Serialize)]
+struct CatalogRefreshResponse {
+    /// What was invalidated: `"all"` or `"session:<username>"`.
+    invalidated: String,
+}
+
+/// Admin-gated catalog cache refresh (event-driven invalidation hook).
+///
+/// The platform's workspace-provisioning path calls this right after it creates
+/// or rebinds a Polaris catalog, so SQE drops its cached SessionContexts (the
+/// catalog provider set) and RestCatalog instances immediately instead of
+/// waiting out the TTL backstop. Without it, a freshly created workspace
+/// catalog is invisible to reads until an unrelated write/DDL rebuilds the
+/// session: the #368 miss-triggered re-list only refreshes namespaces *within*
+/// an already-registered catalog, never the catalog set itself.
+///
+/// No new invalidation logic lives here -- it wires the two existing
+/// process-global invalidators. `Option<Json<_>>` so a bodyless POST succeeds
+/// and invalidates all (bare `Json<T>` 422s on an empty body).
+async fn api_catalogs_refresh(
+    body: Option<Json<CatalogRefreshBody>>,
+) -> Json<CatalogRefreshResponse> {
+    let invalidated = match body.and_then(|Json(b)| b.username) {
+        Some(username) => {
+            sqe_coordinator::session_context::invalidate_session_cache(&username).await;
+            format!("session:{username}")
+        }
+        None => {
+            sqe_coordinator::session_context::invalidate_all_session_caches().await;
+            "all".to_string()
+        }
+    };
+    // Always drop the shared REST-catalog cache too: a rebind changes the
+    // Polaris binding for a catalog name, and that cache (plus each entry's
+    // `/v1/config` OnceCell) is keyed by url+warehouse+token, not by user.
+    sqe_catalog::invalidate_rest_catalog_cache_all().await;
+    tracing::info!(invalidated = %invalidated, "catalog cache refresh via admin endpoint");
+    Json(CatalogRefreshResponse { invalidated })
+}
+
 async fn dashboard() -> Response {
     // WEB-05: send nosniff plus a tight CSP. The dashboard is a self-contained
     // single page (inline styles/scripts, same-origin fetches only), so a
@@ -415,6 +467,7 @@ fn build_health_router(state: Arc<HealthState>) -> Router {
             .route("/api/v1/queries/{id}", get(api_query_detail))
             .route("/api/v1/workers", get(api_workers))
             .route("/api/v1/metrics/history", get(api_metrics_history))
+            .route("/api/v1/catalogs/refresh", post(api_catalogs_refresh))
             .route_layer(axum::middleware::from_fn_with_state(
                 state.clone(),
                 sqe_coordinator::web_auth::require_admin_bearer::<HealthState>,
@@ -769,6 +822,13 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
     // view, and the query handler can never drift out of agreement. See
     // `distributed_enabled` for why heartbeat discovery keys off the secret.
     let distributed = distributed_enabled(&config.coordinator);
+
+    // Push the configured SessionContext-cache TTL into the process-global cache
+    // before any session is built, so the `LazyLock` initializer reads the
+    // configured value instead of the compiled-in default.
+    sqe_coordinator::session_context::configure_session_cache_ttl(
+        config.coordinator.session_context_cache_ttl_secs,
+    );
 
     // Health endpoints on metrics port + 1 (or 9091 default)
     let health_port = config.metrics.prometheus_port + 1;
@@ -2370,6 +2430,70 @@ mod tests {
             .uri("/api/v1/queries")
             .header("Authorization", "Bearer admin-tok")
             .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    }
+
+    // ── POST /api/v1/catalogs/refresh (admin-gated) ────────────────────────
+
+    #[tokio::test]
+    async fn catalogs_refresh_no_token_is_401() {
+        use tower::ServiceExt;
+        let state = make_guarded_state();
+        let app = build_health_router(state);
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/v1/catalogs/refresh")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn catalogs_refresh_non_admin_is_403() {
+        use tower::ServiceExt;
+        let state = make_guarded_state();
+        let app = build_health_router(state);
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/v1/catalogs/refresh")
+            .header("Authorization", "Bearer user-tok")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::FORBIDDEN);
+    }
+
+    /// Bodyless POST must succeed (invalidate-all) -- proves the
+    /// `Option<Json<_>>` extractor does not 422 on an empty body.
+    #[tokio::test]
+    async fn catalogs_refresh_admin_empty_body_is_200() {
+        use tower::ServiceExt;
+        let state = make_guarded_state();
+        let app = build_health_router(state);
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/v1/catalogs/refresh")
+            .header("Authorization", "Bearer admin-tok")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn catalogs_refresh_admin_with_username_is_200() {
+        use tower::ServiceExt;
+        let state = make_guarded_state();
+        let app = build_health_router(state);
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/v1/catalogs/refresh")
+            .header("Authorization", "Bearer admin-tok")
+            .header("Content-Type", "application/json")
+            .body(axum::body::Body::from(r#"{"username":"alice"}"#))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), axum::http::StatusCode::OK);

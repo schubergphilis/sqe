@@ -164,6 +164,15 @@ pub enum ProcedureCall {
     /// privilege. The later advisory scheduler reuses the same analysis to
     /// emit per-table metrics.
     TableHealth { table: TableRef },
+    /// Self-scoped catalog cache refresh (`CALL system.refresh_catalog_cache()`).
+    /// Drops the caller's own cached `SessionContext`, so the caller's next query
+    /// re-enumerates catalogs and picks up a catalog created out-of-band (e.g. by
+    /// the platform) without waiting out the TTL. Table-less and scoped to the
+    /// caller only: it touches no process-global cache, needs no write privilege,
+    /// and has no cross-tenant effect. The global, admin-gated equivalent (which
+    /// also drops the shared REST-catalog cache for the rebind case) is
+    /// `POST /api/v1/catalogs/refresh`.
+    RefreshCatalogCache,
 }
 
 impl ProcedureCall {
@@ -181,6 +190,7 @@ impl ProcedureCall {
             ProcedureCall::SetCurrentSnapshot { .. } => "set_current_snapshot",
             ProcedureCall::RollbackToSnapshot { .. } => "rollback_to_snapshot",
             ProcedureCall::TableHealth { .. } => "table_health",
+            ProcedureCall::RefreshCatalogCache => "refresh_catalog_cache",
         }
     }
 
@@ -198,7 +208,7 @@ impl ProcedureCall {
             | ProcedureCall::SetCurrentSnapshot { table, .. }
             | ProcedureCall::RollbackToSnapshot { table, .. }
             | ProcedureCall::TableHealth { table } => Some(table),
-            ProcedureCall::PurgeOrphanLocations { .. } => None,
+            ProcedureCall::PurgeOrphanLocations { .. } | ProcedureCall::RefreshCatalogCache => None,
         }
     }
 
@@ -332,6 +342,9 @@ pub fn try_parse_call(stmt: &Statement) -> sqe_core::Result<Option<ProcedureCall
         "set_current_snapshot" => parse_set_current_snapshot(args).map(Some),
         "rollback_to_snapshot" => parse_rollback_to_snapshot(args).map(Some),
         "table_health" => parse_table_health(args).map(Some),
+        // Table-less, argument-less. Any positional/named args are ignored
+        // rather than rejected so callers can pass a harmless no-op.
+        "refresh_catalog_cache" => Ok(Some(ProcedureCall::RefreshCatalogCache)),
         _ => Ok(None),
     }
 }
@@ -1369,6 +1382,16 @@ mod tests {
                 .name(),
             "table_health"
         );
+    }
+
+    #[test]
+    fn parses_refresh_catalog_cache() {
+        let stmt = parse_first("CALL system.refresh_catalog_cache()");
+        let call = try_parse_call(&stmt).unwrap().expect("match");
+        assert!(matches!(call, ProcedureCall::RefreshCatalogCache));
+        assert_eq!(call.name(), "refresh_catalog_cache");
+        // Table-less: no maintenance target.
+        assert!(call.table().is_none());
     }
 
     #[test]
