@@ -1,4 +1,4 @@
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 
 use datafusion::catalog::{CatalogProvider, MemoryCatalogProvider, MemorySchemaProvider};
 use datafusion::execution::runtime_env::RuntimeEnv;
@@ -18,9 +18,18 @@ use crate::runtime_catalog::RuntimeCatalogRegistry;
 ///
 /// The cache holds `(SessionContext, Arc<SessionCatalog>)` pairs so that warm
 /// queries skip the ~50 ms registration overhead (UDFs, TVFs, catalog setup).
-/// Entries expire after 5 minutes (matching default idle session TTL) and the
-/// cache holds at most `SESSION_CONTEXT_CACHE_MAX_CAPACITY` entries to bound
-/// memory usage.
+/// Entries expire after `SESSION_CONTEXT_CACHE_TTL` and the cache holds at most
+/// `SESSION_CONTEXT_CACHE_MAX_CAPACITY` entries to bound memory usage.
+///
+/// The TTL doubles as the *passive backstop* for catalog-set discovery: a newly
+/// created/rebound Polaris catalog (e.g. a second `ws_<slug>` workspace) is only
+/// seen once a session rebuild re-enumerates catalogs, and the #368
+/// miss-triggered re-list only refreshes namespaces *within* an already
+/// registered catalog, never the catalog set. The
+/// `POST /api/v1/catalogs/refresh` admin endpoint is the instant path (the
+/// platform calls it on catalog create/bind); this TTL bounds worst-case
+/// staleness if that call never arrives. Kept short (60s) so passive recovery
+/// is fast; the endpoint means the common case never waits on it.
 ///
 /// DataFusion's `SessionContext` is `Clone` and wraps an `Arc<SessionState>`
 /// internally, so a clone is O(1): only the Arc ref-count changes.
@@ -31,11 +40,34 @@ use crate::runtime_catalog::RuntimeCatalogRegistry;
 /// LRU-thrashing; the 300s TTL still expires idle entries to bound memory.
 const SESSION_CONTEXT_CACHE_MAX_CAPACITY: u64 = 2000;
 
+/// Default TTL (seconds) for `SESSION_CONTEXT_CACHE` when the coordinator has
+/// not configured one. Kept short so a new/rebound Polaris catalog is picked
+/// up quickly by the passive backstop; the `POST /api/v1/catalogs/refresh`
+/// endpoint is the instant path for the common case.
+const DEFAULT_SESSION_CONTEXT_CACHE_TTL_SECS: u64 = 60;
+
+/// Coordinator-configured TTL for `SESSION_CONTEXT_CACHE`, wired from
+/// `coordinator.session_context_cache_ttl_secs` via
+/// [`configure_session_cache_ttl`] at startup. Read once by the cache's
+/// `LazyLock` initializer, so it must be set before the first cache access;
+/// unset (worker path, tests) falls back to
+/// `DEFAULT_SESSION_CONTEXT_CACHE_TTL_SECS`.
+static SESSION_CONTEXT_CACHE_TTL_SECS: OnceLock<u64> = OnceLock::new();
+
+/// Set the `SESSION_CONTEXT_CACHE` TTL from coordinator config. Idempotent-ish:
+/// only the first call (which must precede the first cache access) wins; later
+/// calls are ignored. Call once, early in coordinator startup.
+pub fn configure_session_cache_ttl(secs: u64) {
+    let _ = SESSION_CONTEXT_CACHE_TTL_SECS.set(secs);
+}
+
 static SESSION_CONTEXT_CACHE: LazyLock<Cache<String, (SessionContext, Arc<SessionCatalog>)>> =
     LazyLock::new(|| {
+        let ttl_secs = *SESSION_CONTEXT_CACHE_TTL_SECS
+            .get_or_init(|| DEFAULT_SESSION_CONTEXT_CACHE_TTL_SECS);
         Cache::builder()
             .max_capacity(SESSION_CONTEXT_CACHE_MAX_CAPACITY)
-            .time_to_live(std::time::Duration::from_secs(300))
+            .time_to_live(std::time::Duration::from_secs(ttl_secs))
             .build()
     });
 

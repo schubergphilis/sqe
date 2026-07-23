@@ -64,6 +64,31 @@ are stable and safe to scrape directly:
 | `GET /api/v1/metrics/history` | time-bucketed series for the charts |
 | `GET /api/v1/status` | Ballista/DataFusion-style cluster status |
 
+## Admin endpoints
+
+Mutating endpoints on the same port sit behind the same bearer + admin gate as
+the dashboard.
+
+| Endpoint | Effect |
+|---|---|
+| `POST /api/v1/catalogs/refresh` | Invalidates SQE's catalog caches so a catalog created or rebound out-of-band becomes visible immediately, instead of waiting out `coordinator.session_context_cache_ttl_secs`. Drops every session's cached `SessionContext` and the shared REST-catalog cache. An optional JSON body `{"username": "<u>"}` scopes the session drop to one user; a bodyless POST invalidates all sessions. Returns `{"invalidated": "all" \| "session:<u>"}`. |
+
+The platform's workspace-provisioning path calls this right after it creates or
+binds a Polaris catalog, so a new workspace catalog is queryable at once. A
+pure-SQL client that only needs to refresh its own view can instead run `CALL
+system.refresh_catalog_cache()` (see [CALL procedures](../sql-reference/procedures.md)).
+
+```bash
+# Global refresh (admin bearer required):
+curl -XPOST -H "Authorization: Bearer $ADMIN_TOKEN" \
+  http://coordinator:9091/api/v1/catalogs/refresh
+
+# Scope the session drop to one user:
+curl -XPOST -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" -d '{"username":"alice"}' \
+  http://coordinator:9091/api/v1/catalogs/refresh
+```
+
 ## How it is built
 
 - One HTML page with vanilla JavaScript, embedded in the binary with

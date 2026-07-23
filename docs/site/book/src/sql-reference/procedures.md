@@ -16,6 +16,7 @@ Source: `crates/sqe-sql/src/procedures.rs`. Handlers in `crates/sqe-coordinator/
 | `system.rewrite_manifests` | `sqe-sql` + `sqe-coordinator` | `table => 'ns.t'` | - | Consolidates many small manifest files into fewer larger ones. Speeds up planning on large tables. |
 | `system.suggest_bloom_filter_columns` | `sqe-sql` + `sqe-coordinator` | `table => 'ns.t'` | `history_limit => N` | SQE-specific. Walks the last N finished queries (default 1000), counts equality predicates per column, returns ranked suggestions for `write.parquet.bloom-filter-columns`. |
 | `system.table_health` | `sqe-sql` + `sqe-coordinator` | `table => 'ns.t'` | - | SQE-specific (auto-compaction maintenance subsystem, see [Maintenance (auto-compaction)](../deployment/configuration.md#maintenance-auto-compaction)). Read-only compaction-debt report: live/small file counts, avg/p50 file size, delete-file and delete-heavy counts, eligible bin-pack groups, estimated rewrite bytes, last compaction snapshot, and whether the table has opted into the maintenance scheduler. Never rewrites anything, and available regardless of `maintenance.mode`. |
+| `system.refresh_catalog_cache` | `sqe-sql` + `sqe-coordinator` | - | - | SQE-specific. Table-less. Drops the calling session's own cached `SessionContext`, so the next query re-enumerates catalogs and sees a catalog created out-of-band (for example by the platform) without waiting out the session-cache TTL. Self-scoped: it touches only the caller's view and no process-global cache, needs no write privilege, and has no cross-tenant effect. Returns one row (`scope`, `status`). The global, admin-gated equivalent (which also drops the shared REST-catalog cache, covering catalog rebinds) is the `POST /api/v1/catalogs/refresh` endpoint on the health port (see [Web UI and admin endpoints](../operations/web-ui.md)). |
 
 ## Comparison to other engines
 
@@ -259,6 +260,7 @@ Procedures inherit the calling user's grants on the target table:
 - `system.expire_snapshots`, `system.remove_orphan_files` need `MODIFY` and `DROP` (alters retention, deletes files).
 - `system.suggest_bloom_filter_columns` is read-only against query history; `SELECT` on the table is enough.
 - `system.table_health` is read-only against the table's live metadata; `SELECT` on the table is enough. It bypasses the write-privilege gate entirely, unlike every other procedure in this table.
+- `system.refresh_catalog_cache` is self-scoped (it refreshes only the caller's own session view) and bypasses the write-privilege gate, like `system.table_health`. A global flush across all sessions is intentionally not a SQL procedure: use the admin-gated `POST /api/v1/catalogs/refresh` endpoint instead.
 
 A user without the right grant gets a clear "policy denied" error instead of a generic execution failure.
 
