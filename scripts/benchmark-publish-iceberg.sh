@@ -331,7 +331,7 @@ for BENCH in "${SUITES[@]}"; do
     else
       BANK_AUTH_ARGS=(--bearer-token "$ICEBERG_BEARER_TOKEN")
     fi
-    "$BENCH_BIN" generate bank \
+    AWS_SECRET_ACCESS_KEY="$BENCH_GOLDEN_S3_SECRET_KEY" "$BENCH_BIN" generate bank \
       --sink iceberg \
       --days 12 \
       --rows-per-day "$BANK_ROWS_PER_DAY" \
@@ -342,7 +342,6 @@ for BENCH in "${SUITES[@]}"; do
       "${BANK_AUTH_ARGS[@]}" \
       --s3-endpoint "$BENCH_S3_ENDPOINT" \
       --s3-access-key "$BENCH_GOLDEN_S3_ACCESS_KEY" \
-      --s3-secret-key "$BENCH_GOLDEN_S3_SECRET_KEY" \
       --s3-region "$BENCH_S3_REGION" \
       --s3-path-style \
       --clean
@@ -351,8 +350,13 @@ for BENCH in "${SUITES[@]}"; do
 
   # ── everything else: `sqe-bench load` against the throwaway coordinator ──
   DATA_S3_ARGS=()
+  # Secret goes through the environment (AWS_SECRET_ACCESS_KEY, clap's env
+  # fallback), never argv, so it is not visible in `ps`. Set only when creds
+  # are present, so an absent secret stays None rather than Some("").
+  DATA_S3_SECRET_ENV=()
   if [ -n "$DATA_S3_ACCESS_KEY" ]; then
-    DATA_S3_ARGS=(--s3-access-key "$DATA_S3_ACCESS_KEY" --s3-secret-key "$DATA_S3_SECRET_KEY" --s3-endpoint "$BENCH_S3_ENDPOINT" --s3-region "$BENCH_S3_REGION")
+    DATA_S3_ARGS=(--s3-access-key "$DATA_S3_ACCESS_KEY" --s3-endpoint "$BENCH_S3_ENDPOINT" --s3-region "$BENCH_S3_REGION")
+    DATA_S3_SECRET_ENV=(AWS_SECRET_ACCESS_KEY="$DATA_S3_SECRET_KEY")
   fi
   # NOTE: the coordinator's legacy ClientCredentials authenticator mints its
   # OWN token on `handshake(user, pass)` (the config's [auth] client_id/
@@ -373,6 +377,7 @@ for BENCH in "${SUITES[@]}"; do
   # one the REST skip-check above and `sqe-bench test` both expect.
   env -u SQE_TOKEN_ENDPOINT -u SQE_CLIENT_ID -u SQE_CLIENT_SECRET \
     -u SQE_NAMESPACE -u SQE_CATALOG \
+    ${DATA_S3_SECRET_ENV[@]+"${DATA_S3_SECRET_ENV[@]}"} \
     "$BENCH_BIN" load "$BENCH" \
     --scale "$BENCH_SCALE" \
     --data "$BENCH_DATA_SOURCE" \
