@@ -1,0 +1,99 @@
+{
+  // Renovate configuration for SQE.
+  //
+  // Local dry-run (no token, scans the working directory):
+  //   renovate --platform=local --dry-run=full     # full: extract + lookup updates
+  //   renovate --platform=local --dry-run=extract   # extract only, no network (fast)
+  //
+  // The repo canonical remote is GitLab; GitHub is a mirror. Nothing here is
+  // platform-specific, so it works under either.
+  $schema: "https://docs.renovatebot.com/renovate-schema.json",
+
+  extends: [
+    "config:recommended",
+    ":dependencyDashboard",
+    // The repo uses conventional commits (feat/fix/chore/docs); keep Renovate
+    // PRs in the same style.
+    ":semanticCommits",
+  ],
+
+  // Never scan generated build output or vendored third-party trees.
+  //
+  // vendor/iceberg-rust is a managed fork carrying a custom rebase (DataFusion
+  // 53 + writer features ahead of the upstream apache tags). Its crate
+  // manifests must move only via a deliberate rebase, never an automated bump,
+  // so the whole tree is excluded. The root workspace already
+  // `exclude = ["vendor/iceberg-rust"]` and pulls it in as a path dependency.
+  ignorePaths: [
+    "**/target/**",
+    "vendor/**",
+    "**/node_modules/**",
+  ],
+
+  // Keep PR volume manageable against the ~100 real workspace dependencies.
+  prConcurrentLimit: 10,
+  prHourlyLimit: 3,
+
+  // Weekly Cargo.lock refresh for transitive security/patch updates that don't
+  // change the manifests.
+  lockFileMaintenance: {
+    enabled: true,
+    schedule: ["before 5am on monday"],
+  },
+
+  packageRules: [
+    // 1. Fold routine Rust minor/patch bumps into a single PR to cut noise.
+    //    Major bumps stay separate so they get individual review.
+    {
+      matchManagers: ["cargo"],
+      matchUpdateTypes: ["minor", "patch"],
+      groupName: "rust minor and patch",
+    },
+
+    // 2. The DataFusion / Arrow / Parquet ecosystem is API-coupled and pinned
+    //    in lockstep with the vendored iceberg-rust fork. Group them into one
+    //    PR (overrides rule 1) and label for careful review -- a version skew
+    //    here breaks the build. Bumping these usually means re-checking the
+    //    vendor rebase, so treat them as a deliberate, reviewed change.
+    {
+      matchManagers: ["cargo"],
+      matchPackageNames: [
+        "datafusion",
+        "datafusion-*",
+        "arrow",
+        "arrow-*",
+        "parquet",
+        "object_store",
+        "sqlparser",
+      ],
+      groupName: "datafusion/arrow stack",
+      labels: ["dependencies", "datafusion-stack"],
+      // Not automerged: these need a human + a green build.
+      automerge: false,
+    },
+
+    // 3. Container images in the quickstart / test docker-compose stacks
+    //    (Polaris, MinIO/RustFS, Keycloak, etc.). Grouped and non-automerged:
+    //    a bumped image can silently break a quickstart's assumptions.
+    {
+      matchManagers: ["docker-compose", "dockerfile"],
+      groupName: "container images",
+      automerge: false,
+    },
+
+    // 4. AWS CDK dependencies live only in the quickstart demo projects. Group
+    //    them; they are examples, not shipped code, so lower urgency.
+    {
+      matchManagers: ["npm"],
+      matchFileNames: ["quickstart/**"],
+      groupName: "aws cdk quickstart deps",
+    },
+
+    // 5. The Aikido CI platform includes (ci/templates/*.yml @ ref). Keeping
+    //    the guardrails/test/deploy templates current is worth a dedicated PR.
+    {
+      matchManagers: ["gitlabci", "gitlabci-include"],
+      groupName: "aikido ci templates",
+    },
+  ],
+}
