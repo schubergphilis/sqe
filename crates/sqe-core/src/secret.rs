@@ -285,7 +285,7 @@ mod tests {
     fn basic_debug_does_not_leak_password() {
         let s = Secret::Basic {
             username: "alice".to_string(),
-            password: "hunter2-very-private".to_string(),
+            password: "hunter2-very-private".to_string(), // gitleaks:allow (test fixture)
         };
         let d = format!("{:?}", s);
         assert!(!d.contains("hunter2-very-private"), "password leaked: {d}");
@@ -410,7 +410,7 @@ mod tests {
             .create(
                 "bearer_test",
                 Secret::Bearer {
-                    token: "0123456789abcdef".to_string(),
+                    token: "0123456789abcdef".to_string(), // gitleaks:allow (test fixture)
                 },
             )
             .unwrap();
