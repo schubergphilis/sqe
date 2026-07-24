@@ -1,0 +1,67 @@
+# gitleaks configuration for SQE.
+#
+# Extends the built-in default ruleset and allowlists the known false positives
+# in this repo. gitleaks auto-discovers this file when it scans from the repo
+# root, so it is honored by:
+#   * local runs        -> gitleaks dir .        (or gitleaks detect)
+#   * the CI gate        -> aikido-secret-scan job (gitleaks detect --no-git)
+# without any --config flag.
+#
+# Design rule: keep suppressions as narrow as possible so real secrets are still
+# caught. Prefer, in order:
+#   1. an inline `gitleaks:allow` comment on the offending line (travels with the
+#      code, cannot mask a leak in any other file) -- used for the test fixtures
+#      in crates/sqe-core/src/secret.rs,
+#   2. a path-scoped allowlist (condition = "AND": placeholder allowed ONLY in
+#      the docs/scripts that use it),
+#   3. an exact-value allowlist for a unique, unmistakable example string.
+# Broad, unscoped regexes are avoided: a loose pattern can unmask a real secret
+# that merely contains the same substring.
+#
+# NOTE: this scans committed content only. It does NOT catch runtime leaks such
+# as a secret written to a log at execution time -- those need a code fix.
+
+[extend]
+useDefault = true
+
+# 1. Generated build output and vendored third-party code. Never our secrets;
+#    scanned upstream, not here. Also keeps the scan fast (34MB vs 620MB).
+[[allowlists]]
+description = "Build output and vendored code"
+paths = [
+    '''(^|/)target/''',
+    '''(^|/)docs/target/''',
+    '''(^|/)vendor/''',
+]
+
+# 2. Documentation and test-script credential placeholders. condition = "AND"
+#    means a hit is allowed ONLY when it is both in one of these paths AND matches
+#    a placeholder pattern -- the same string in engine source is still flagged.
+[[allowlists]]
+description = "Doc / test-script credential placeholders (path-scoped)"
+condition = "AND"
+paths = [
+    '''(^|/)docs/''',
+    '''(^|/)openspec/''',
+    '''(^|/)testing/''',
+    '''(^|/)scripts/''',
+]
+regexes = [
+    '''your-password''',
+    '''\bs3cr3t\b''',
+    '''sqe_k?_?abc123def456''',
+]
+
+# 3. Unique example values matched by their exact content. Each is specific
+#    enough that it cannot collide with a real secret.
+[[allowlists]]
+description = "Unique example values"
+regexes = [
+    # Example API key in api_key.rs doc-comment / configuration.md
+    '''sqe_k?_?abc123def456''',
+    # PKCS#1 RSA key used only for JWT-signing tests (bearer_token.rs
+    # TEST_RSA_PRIVATE_KEY_PEM); matched by its unique leading bytes so a real
+    # RSA key cannot be masked. Lives inside a string literal, so it cannot take
+    # an inline gitleaks:allow comment.
+    '''MIIEowIBAAKCAQEAvX0NLGQkeecTCMwoDPx6Qkutsf0PWBEjZnNm4vkmTTvHD1F0''',
+]
