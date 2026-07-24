@@ -1,6 +1,65 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "description": [
+    "SQE Renovate config. Local dry-run: renovate --platform=local --dry-run=full.",
+    "The local platform reads files from git, so this file must be committed to be picked up.",
+    "Canonical remote is GitLab; GitHub is a mirror. Nothing here is platform-specific."
+  ],
   "extends": [
-    "config:recommended"
+    "config:recommended",
+    ":dependencyDashboard",
+    ":semanticCommits"
+  ],
+  "ignorePaths": [
+    "**/target/**",
+    "vendor/**",
+    "**/node_modules/**"
+  ],
+  "prConcurrentLimit": 10,
+  "prHourlyLimit": 3,
+  "lockFileMaintenance": {
+    "enabled": true,
+    "schedule": ["before 5am on monday"]
+  },
+  "packageRules": [
+    {
+      "description": "Fold routine Rust minor/patch bumps into one PR; majors stay separate for individual review.",
+      "matchManagers": ["cargo"],
+      "matchUpdateTypes": ["minor", "patch"],
+      "groupName": "rust minor and patch"
+    },
+    {
+      "description": "DataFusion/Arrow/Parquet are API-coupled and pinned in lockstep with the vendored iceberg-rust fork. Group into one reviewed PR (overrides the rule above); a version skew here breaks the build, and a bump usually means re-checking the vendor rebase.",
+      "matchManagers": ["cargo"],
+      "matchPackageNames": [
+        "datafusion",
+        "datafusion-*",
+        "arrow",
+        "arrow-*",
+        "parquet",
+        "object_store",
+        "sqlparser"
+      ],
+      "groupName": "datafusion/arrow stack",
+      "labels": ["dependencies", "datafusion-stack"],
+      "automerge": false
+    },
+    {
+      "description": "Container images in the quickstart/test docker-compose stacks (Polaris, MinIO/RustFS, Keycloak, etc.). Non-automerged: a bumped image can silently break a quickstart's assumptions.",
+      "matchManagers": ["docker-compose", "dockerfile"],
+      "groupName": "container images",
+      "automerge": false
+    },
+    {
+      "description": "AWS CDK deps live only in the quickstart demo projects; examples, not shipped code, so lower urgency.",
+      "matchManagers": ["npm"],
+      "matchFileNames": ["quickstart/**"],
+      "groupName": "aws cdk quickstart deps"
+    },
+    {
+      "description": "Aikido CI platform includes (ci/templates/*.yml @ ref); keeping the guardrails/test/deploy templates current warrants a dedicated PR.",
+      "matchManagers": ["gitlabci", "gitlabci-include"],
+      "groupName": "aikido ci templates"
+    }
   ]
 }
