@@ -636,7 +636,7 @@ for BENCH in "${BENCHMARKS[@]}"; do
                 --scale "$BENCH_SCALE" \
                 --output "$BENCH_DATA_DIR" 2>&1 || true
         fi
-        "$BENCH_BIN" load tpcds \
+        AWS_SECRET_ACCESS_KEY="$DATA_S3_SECRET_KEY" "$BENCH_BIN" load tpcds \
             --scale "$BENCH_SCALE" \
             --data "$DATA_PATH" \
             --protocol "$BENCH_PROTOCOL" \
@@ -645,7 +645,6 @@ for BENCH in "${BENCHMARKS[@]}"; do
             --username "$SQE_USERNAME" \
             --password "$SQE_PASSWORD" \
             --s3-access-key "$DATA_S3_ACCESS_KEY" \
-            --s3-secret-key "$DATA_S3_SECRET_KEY" \
             --s3-endpoint "$DATA_S3_ENDPOINT" \
             --s3-region "$DATA_S3_REGION" \
             --clean 2>&1 || {
@@ -686,7 +685,7 @@ for BENCH in "${BENCHMARKS[@]}"; do
         LOAD_ATTEMPTS=2
         LOAD_OK=0
         for attempt in $(seq 1 "$LOAD_ATTEMPTS"); do
-            if "$BENCH_BIN" generate bank \
+            if AWS_SECRET_ACCESS_KEY="$BANK_S3_SECRET_KEY" "$BENCH_BIN" generate bank \
                 --sink iceberg \
                 --days 12 \
                 --rows-per-day "$BANK_ROWS_PER_DAY" \
@@ -699,7 +698,6 @@ for BENCH in "${BENCHMARKS[@]}"; do
                 --scope 'PRINCIPAL_ROLE:ALL' \
                 --s3-endpoint "$BANK_S3_ENDPOINT" \
                 --s3-access-key "$BANK_S3_ACCESS_KEY" \
-                --s3-secret-key "$BANK_S3_SECRET_KEY" \
                 --s3-region "$BANK_S3_REGION" \
                 --s3-path-style \
                 --clean 2>&1; then
@@ -796,7 +794,7 @@ for BENCH in "${BENCHMARKS[@]}"; do
     LOAD_ATTEMPTS=2
     LOAD_OK=0
     for attempt in $(seq 1 "$LOAD_ATTEMPTS"); do
-        if "$BENCH_BIN" load "$BENCH" \
+        if AWS_SECRET_ACCESS_KEY="$DATA_S3_SECRET_KEY" "$BENCH_BIN" load "$BENCH" \
             --scale "$BENCH_SCALE" \
             --data "$DATA_PATH" \
             --protocol "$BENCH_PROTOCOL" \
@@ -805,7 +803,6 @@ for BENCH in "${BENCHMARKS[@]}"; do
             --username "$SQE_USERNAME" \
             --password "$SQE_PASSWORD" \
             --s3-access-key "$DATA_S3_ACCESS_KEY" \
-            --s3-secret-key "$DATA_S3_SECRET_KEY" \
             --s3-endpoint "$DATA_S3_ENDPOINT" \
             --s3-region "$DATA_S3_REGION" \
             ${BLOOM_ARGS[@]+"${BLOOM_ARGS[@]}"} \

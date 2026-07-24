@@ -191,6 +191,7 @@ run_load() {
     local bench=$1 log=$2
     echo "  [load] $bench"
     BENCH_CLIENT_TIMEOUT_SECS=$BENCH_CLIENT_TIMEOUT_SECS \
+      AWS_SECRET_ACCESS_KEY="$S3_SECRET_KEY" \
       "$BENCH_BIN" load "$bench" \
         --scale "$BENCH_SCALE" \
         --data "$BENCH_DATA_DIR" \
@@ -199,7 +200,6 @@ run_load() {
         --username "$SQE_USERNAME" --password "$SQE_PASSWORD" \
         --s3-endpoint "$S3_ENDPOINT" \
         --s3-access-key "$S3_ACCESS_KEY" \
-        --s3-secret-key "$S3_SECRET_KEY" \
         --s3-region "$S3_REGION" \
         --clean >>"$log" 2>&1
 }
