@@ -256,6 +256,22 @@ impl TableMetadataCache {
         self.inner.invalidate(key).await;
     }
 
+    /// Evict EVERY cached table entry, across all token fingerprints and
+    /// tables. Called from the admin-gated `POST /api/v1/catalogs/refresh`
+    /// handler so a catalog created or rebound out-of-band is visible on the
+    /// immediate next read instead of surviving the 1 hour hard TTL.
+    ///
+    /// Process-global, like [`invalidate_rest_catalog_cache_all`]: SQE keeps no
+    /// `username -> token_fingerprint` reverse index, so per-user scoping is not
+    /// possible here without a side-band map. Because it clears every tenant's
+    /// entries, it must stay behind the admin gate -- never wire it into the
+    /// self-scoped `CALL system.refresh_catalog_cache()` path.
+    pub async fn invalidate_all(&self) {
+        self.inner.invalidate_all();
+        self.inner.run_pending_tasks().await;
+        debug!("TableMetadataCache invalidated (catalog refresh)");
+    }
+
     /// Evict EVERY cache entry for `(namespace, table)` regardless of which
     /// token fingerprint it was cached under.
     ///
@@ -1929,6 +1945,75 @@ mod cache_capacity_tests {
             cache.entry_count()
         );
     }
+
+    /// Minimal in-memory `Table` for cache tests: a valid v1 metadata document
+    /// plus a filesystem `FileIO`. `disable_cache()` skips the per-table
+    /// `ObjectCache` (no I/O). Identifier is required by the builder but the
+    /// cache is keyed by the string we pass to `insert`, so its value is
+    /// irrelevant to what we assert.
+    fn test_table() -> iceberg::table::Table {
+        const META_V1: &str = r#"{
+            "format-version": 1,
+            "table-uuid": "d20125c8-7284-442c-9aea-15fee620737c",
+            "location": "s3://bucket/test/location",
+            "last-updated-ms": 1602638573874,
+            "last-column-id": 1,
+            "schema": {
+                "type": "struct",
+                "fields": [{"id": 1, "name": "x", "required": true, "type": "long"}]
+            },
+            "partition-spec": [],
+            "properties": {},
+            "current-snapshot-id": -1,
+            "snapshots": []
+        }"#;
+        let metadata: iceberg::spec::TableMetadata = serde_json::from_str(META_V1).unwrap();
+        let file_io = iceberg::io::FileIOBuilder::new_fs_io().build().unwrap();
+        iceberg::table::Table::builder()
+            .metadata(metadata)
+            .identifier(TableIdent::new(NamespaceIdent::new("ns".to_string()), "t".to_string()))
+            .file_io(file_io)
+            .disable_cache()
+            .build()
+            .unwrap()
+    }
+
+    /// `invalidate_all` must evict EVERY entry, across all token fingerprints
+    /// and tables -- the process-global drop the admin catalog-refresh endpoint
+    /// relies on so an out-of-band catalog rebind is visible on the next read
+    /// instead of surviving the 1 hour hard TTL.
+    #[tokio::test]
+    async fn invalidate_all_evicts_every_table_entry() {
+        let cache = TableMetadataCache::new(60);
+        cache.insert("tokenA|ns.t1".to_string(), test_table()).await;
+        cache.insert("tokenB|ns.t2".to_string(), test_table()).await;
+        assert!(cache.get_fresh("tokenA|ns.t1").await.is_some());
+        assert!(cache.get_fresh("tokenB|ns.t2").await.is_some());
+
+        cache.invalidate_all().await;
+
+        assert!(
+            cache.get_fresh("tokenA|ns.t1").await.is_none(),
+            "entry under token A survived global invalidation"
+        );
+        assert!(
+            cache.get_fresh("tokenB|ns.t2").await.is_none(),
+            "entry under token B survived global invalidation"
+        );
+        assert_eq!(cache.entry_count(), 0, "cache should be empty after invalidate_all");
+    }
+
+    /// A zero-TTL (disabled) cache never stores entries, so `invalidate_all` is
+    /// a safe no-op rather than a panic.
+    #[tokio::test]
+    async fn invalidate_all_on_disabled_cache_is_noop() {
+        let cache = TableMetadataCache::new(0);
+        cache.insert("tokenA|ns.t1".to_string(), test_table()).await;
+        cache.invalidate_all().await;
+        assert_eq!(cache.entry_count(), 0);
+    }
+
+    use super::{NamespaceIdent, TableIdent, TableMetadataCache};
 
     /// Shape 1: the typed ErrorResponse/ErrorModel path. The status only
     /// survives as a `code` context entry on a DataInvalid error.
