@@ -1304,6 +1304,15 @@ impl QueryHandler {
                         // fresh REST-catalog key, so the rebuild discovers it
                         // without a global REST drop. The global rebind case is
                         // the admin-gated `POST /api/v1/catalogs/refresh`.
+                        //
+                        // The shared TableMetadataCache is deliberately NOT
+                        // dropped here: `invalidate_all` is process-global and
+                        // would let any authenticated user flush every tenant's
+                        // entries. It caches present tables only (no negative
+                        // caching), so a freshly created table has nothing to
+                        // evict, and the session-cache drop above already
+                        // rebuilds this caller's namespace snapshot. The global
+                        // table-cache drop lives in `api_catalogs_refresh`.
                         crate::session_context::invalidate_session_cache(
                             &session.user.username,
                         ).await;
