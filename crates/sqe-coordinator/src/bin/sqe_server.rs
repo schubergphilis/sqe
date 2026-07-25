@@ -89,6 +89,10 @@ struct HealthState {
     /// audited within the current window; skip the audit line but still count.
     /// `None` means no dedup (window == 0 or run_worker/tests).
     success_audit_dedup: Option<moka::sync::Cache<String, ()>>,
+    /// Shared global table metadata cache, so the admin catalog-refresh handler
+    /// can drop it alongside the session + REST-catalog caches. Populated in
+    /// `run_coordinator`; `None` in `run_worker` and tests.
+    table_cache: Option<sqe_catalog::TableMetadataCache>,
 }
 
 impl sqe_coordinator::web_auth::BearerAdminState for HealthState {
@@ -402,10 +406,12 @@ struct CatalogRefreshResponse {
 /// session: the #368 miss-triggered re-list only refreshes namespaces *within*
 /// an already-registered catalog, never the catalog set itself.
 ///
-/// No new invalidation logic lives here -- it wires the two existing
-/// process-global invalidators. `Option<Json<_>>` so a bodyless POST succeeds
-/// and invalidates all (bare `Json<T>` 422s on an empty body).
+/// No new invalidation logic lives here -- it wires the existing process-global
+/// invalidators. `Option<Json<_>>` so a bodyless POST succeeds and invalidates
+/// all (bare `Json<T>` 422s on an empty body). `State` must precede the body
+/// extractor: `Option<Json<_>>` consumes the request and has to come last.
 async fn api_catalogs_refresh(
+    state: axum::extract::State<Arc<HealthState>>,
     body: Option<Json<CatalogRefreshBody>>,
 ) -> Json<CatalogRefreshResponse> {
     let invalidated = match body.and_then(|Json(b)| b.username) {
@@ -422,6 +428,16 @@ async fn api_catalogs_refresh(
     // Polaris binding for a catalog name, and that cache (plus each entry's
     // `/v1/config` OnceCell) is keyed by url+warehouse+token, not by user.
     sqe_catalog::invalidate_rest_catalog_cache_all().await;
+    // And the shared table metadata cache: a table rebound out-of-band leaves a
+    // stale present entry (1 hour hard TTL) under whatever token first loaded
+    // it. Without this drop, an immediate readback after a workspace catalog is
+    // created/rebound returns the stale metadata (or, via the still-empty
+    // provider snapshot, "table not found") until the TTL lapses. This endpoint
+    // is admin-gated, so the process-global drop is safe here -- unlike the
+    // self-scoped `CALL system.refresh_catalog_cache()` path, which must not.
+    if let Some(tc) = &state.table_cache {
+        tc.invalidate_all().await;
+    }
     tracing::info!(invalidated = %invalidated, "catalog cache refresh via admin endpoint");
     Json(CatalogRefreshResponse { invalidated })
 }
@@ -1242,6 +1258,9 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
         audit: Some(Arc::clone(&audit)),
         anonymous_denied: Some(metrics.dashboard_auth_anonymous_denied_total.clone()),
         dashboard_success: Some(metrics.dashboard_auth_success_total.clone()),
+        // Same shared cache the QueryHandler uses; drop it on catalog refresh.
+        // Cloned (not moved) because `with_table_cache` below still needs it.
+        table_cache: Some(table_cache.clone()),
         success_audit_dedup: {
             let window = config.metrics.audit.dashboard_access_audit_window_secs;
             if window == 0 {
@@ -1632,6 +1651,9 @@ async fn run_worker(config: SqeConfig) -> anyhow::Result<()> {
         anonymous_denied: None,
         dashboard_success: None,
         success_audit_dedup: None,
+        // Workers do not serve the catalog-refresh endpoint or hold the shared
+        // table cache.
+        table_cache: None,
     });
     start_health_server(health_port, health_state);
 
@@ -2007,6 +2029,7 @@ mod tests {
             anonymous_denied: None,
             dashboard_success: None,
             success_audit_dedup: None,
+            table_cache: None,
         });
 
         let Json(status) = cluster_status(axum::extract::State(state)).await;
@@ -2034,6 +2057,7 @@ mod tests {
             anonymous_denied: None,
             dashboard_success: None,
             success_audit_dedup: None,
+            table_cache: None,
         });
 
         let Json(status) = cluster_status(axum::extract::State(state)).await;
@@ -2067,6 +2091,7 @@ mod tests {
             anonymous_denied: None,
             dashboard_success: None,
             success_audit_dedup: None,
+            table_cache: None,
         });
 
         let Json(status) = cluster_status(axum::extract::State(state)).await;
@@ -2097,6 +2122,7 @@ mod tests {
             anonymous_denied: None,
             dashboard_success: None,
             success_audit_dedup: None,
+            table_cache: None,
         });
 
         let response = readyz(axum::extract::State(state)).await;
@@ -2126,6 +2152,7 @@ mod tests {
             anonymous_denied: None,
             dashboard_success: None,
             success_audit_dedup: None,
+            table_cache: None,
         });
 
         let response = readyz(axum::extract::State(state)).await;
@@ -2191,6 +2218,7 @@ mod tests {
             anonymous_denied: None,
             dashboard_success: None,
             success_audit_dedup: None,
+            table_cache: None,
         });
 
         let response = readyz(axum::extract::State(state)).await;
@@ -2222,6 +2250,7 @@ mod tests {
             anonymous_denied: None,
             dashboard_success: None,
             success_audit_dedup: None,
+            table_cache: None,
         });
 
         let Json(items) = api_queries(
@@ -2254,6 +2283,7 @@ mod tests {
             anonymous_denied: None,
             dashboard_success: None,
             success_audit_dedup: None,
+            table_cache: None,
         });
         let Json(resp) = api_metrics_history(axum::extract::State(state)).await;
         assert_eq!(resp.bucket_seconds, sqe_coordinator::metrics_history::BUCKET_SECS);
@@ -2294,12 +2324,117 @@ mod tests {
             anonymous_denied: None,
             dashboard_success: None,
             success_audit_dedup: None,
+            table_cache: None,
         });
         let Json(resp) = api_metrics_history(axum::extract::State(state)).await;
         assert_eq!(resp.bucket_seconds, sqe_coordinator::metrics_history::BUCKET_SECS);
         assert!(!resp.buckets.is_empty());
         // 3 samples at 0, 10_000, 20_000 ms all fall in the same 900-s bucket
         assert_eq!(resp.buckets.len(), 1);
+    }
+
+    /// A minimal, valid v1 table + filesystem FileIO -- enough to populate the
+    /// TableMetadataCache. `disable_cache()` skips the per-table ObjectCache
+    /// (no I/O). The cache is keyed by the string passed to `insert`, so the
+    /// identifier value is irrelevant to what the test asserts.
+    fn test_table() -> iceberg::table::Table {
+        const META_V1: &str = r#"{
+            "format-version": 1,
+            "table-uuid": "d20125c8-7284-442c-9aea-15fee620737c",
+            "location": "s3://bucket/test/location",
+            "last-updated-ms": 1602638573874,
+            "last-column-id": 1,
+            "schema": {
+                "type": "struct",
+                "fields": [{"id": 1, "name": "x", "required": true, "type": "long"}]
+            },
+            "partition-spec": [],
+            "properties": {},
+            "current-snapshot-id": -1,
+            "snapshots": []
+        }"#;
+        let metadata: iceberg::spec::TableMetadata = serde_json::from_str(META_V1).unwrap();
+        let file_io = iceberg::io::FileIOBuilder::new_fs_io().build().unwrap();
+        iceberg::table::Table::builder()
+            .metadata(metadata)
+            .identifier(iceberg::TableIdent::new(
+                iceberg::NamespaceIdent::new("ns".to_string()),
+                "t".to_string(),
+            ))
+            .file_io(file_io)
+            .disable_cache()
+            .build()
+            .unwrap()
+    }
+
+    /// Handler wiring: `api_catalogs_refresh` must drop the shared
+    /// TableMetadataCache when the HealthState carries one, so a table rebound
+    /// out-of-band is not served stale on the immediate next readback (the bug
+    /// this fix targets). A bodyless POST takes the invalidate-all path.
+    #[tokio::test]
+    async fn api_catalogs_refresh_invalidates_table_cache() {
+        let cache = sqe_catalog::TableMetadataCache::new(60);
+        cache.insert("tok|ns.t".to_string(), test_table()).await;
+        assert!(
+            cache.get_fresh("tok|ns.t").await.is_some(),
+            "precondition: entry should be cached"
+        );
+
+        let state = Arc::new(HealthState {
+            ready: Arc::new(AtomicBool::new(true)),
+            started_at: Instant::now(),
+            role: "coordinator",
+            worker_registry: None,
+            query_tracker: None,
+            web_ui: false,
+            catalog_url: String::new(),
+            node_info: None,
+            metrics_history: None,
+            bearer_provider: None,
+            auth_cfg: None,
+            security_cfg: None,
+            audit: None,
+            anonymous_denied: None,
+            dashboard_success: None,
+            success_audit_dedup: None,
+            table_cache: Some(cache.clone()),
+        });
+
+        let Json(resp) = api_catalogs_refresh(axum::extract::State(state), None).await;
+
+        assert_eq!(resp.invalidated, "all");
+        assert!(
+            cache.get_fresh("tok|ns.t").await.is_none(),
+            "table cache entry survived the refresh handler"
+        );
+        assert_eq!(cache.entry_count(), 0);
+    }
+
+    /// The handler must not panic when no table cache is wired (worker role /
+    /// tests): the `Option` guard skips the invalidation cleanly.
+    #[tokio::test]
+    async fn api_catalogs_refresh_without_table_cache_is_ok() {
+        let state = Arc::new(HealthState {
+            ready: Arc::new(AtomicBool::new(true)),
+            started_at: Instant::now(),
+            role: "coordinator",
+            worker_registry: None,
+            query_tracker: None,
+            web_ui: false,
+            catalog_url: String::new(),
+            node_info: None,
+            metrics_history: None,
+            bearer_provider: None,
+            auth_cfg: None,
+            security_cfg: None,
+            audit: None,
+            anonymous_denied: None,
+            dashboard_success: None,
+            success_audit_dedup: None,
+            table_cache: None,
+        });
+        let Json(resp) = api_catalogs_refresh(axum::extract::State(state), None).await;
+        assert_eq!(resp.invalidated, "all");
     }
 
     // ── Route-level bearer + admin guard tests ─────────────────────────────────
@@ -2378,6 +2513,7 @@ mod tests {
             anonymous_denied: None,
             dashboard_success: None,
             success_audit_dedup: None,
+            table_cache: None,
         })
     }
 
@@ -2537,6 +2673,7 @@ mod tests {
             anonymous_denied: None,
             dashboard_success: Some(counter),
             success_audit_dedup: cache,
+            table_cache: None,
         })
     }
 
