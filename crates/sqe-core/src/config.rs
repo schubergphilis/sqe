@@ -809,6 +809,118 @@ fn default_budget_granularity() -> String {
     "64KB".to_string()
 }
 
+/// Worker spill substrate configuration (`[worker.spill]`).
+///
+/// `directory` is the single spill root for the local backend. Legacy
+/// `worker.spill_dir` maps onto it when `directory` is empty. Setting both to
+/// different paths is a config error.
+#[derive(Debug, Deserialize, Clone)]
+pub struct WorkerSpillConfig {
+    /// Master switch. When false, no SpillManager is opened at worker start.
+    /// Defaults to following `worker.spill_to_disk` at resolve time when left
+    /// at the serde default (true); call sites that need explicit off set
+    /// `enabled = false`.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Spill backend: `local` (default), `s3`, or `tiered`. Only `local` is
+    /// implemented in Phase 3; other values fail startup with a typed error
+    /// until their backend lands.
+    #[serde(default = "default_spill_backend")]
+    pub backend: String,
+    /// Spill root directory for local/tiered backends. Empty means use
+    /// `worker.spill_dir` (deprecated alias).
+    #[serde(default)]
+    pub directory: String,
+    /// Hard disk/object budget for spill segments.
+    #[serde(default = "default_spill_max_bytes")]
+    pub max_bytes: String,
+    /// Minimum free disk bytes that must remain after spill writes (local).
+    #[serde(default = "default_spill_min_free")]
+    pub min_free_bytes: String,
+    /// Target size for a single spill segment before rotation.
+    #[serde(default = "default_spill_segment_target")]
+    pub segment_target_size: String,
+    #[serde(default = "default_spill_max_concurrent_io")]
+    pub max_concurrent_writes: usize,
+    #[serde(default = "default_spill_max_concurrent_io")]
+    pub max_concurrent_reads: usize,
+    /// Delete orphaned scopes older than this age at worker start.
+    #[serde(default = "default_true")]
+    pub cleanup_on_start: bool,
+    /// Orphan age threshold (e.g. `"24h"`). Parsed as hours when suffixed with
+    /// `h`, otherwise as seconds.
+    #[serde(default = "default_spill_orphan_age")]
+    pub orphan_age: String,
+}
+
+fn default_spill_backend() -> String {
+    "local".to_string()
+}
+fn default_spill_max_bytes() -> String {
+    "1TB".to_string()
+}
+fn default_spill_min_free() -> String {
+    "1GB".to_string()
+}
+fn default_spill_segment_target() -> String {
+    "256MB".to_string()
+}
+fn default_spill_max_concurrent_io() -> usize {
+    4
+}
+fn default_spill_orphan_age() -> String {
+    "24h".to_string()
+}
+
+impl Default for WorkerSpillConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            backend: default_spill_backend(),
+            directory: String::new(),
+            max_bytes: default_spill_max_bytes(),
+            min_free_bytes: default_spill_min_free(),
+            segment_target_size: default_spill_segment_target(),
+            max_concurrent_writes: default_spill_max_concurrent_io(),
+            max_concurrent_reads: default_spill_max_concurrent_io(),
+            cleanup_on_start: true,
+            orphan_age: default_spill_orphan_age(),
+        }
+    }
+}
+
+impl WorkerSpillConfig {
+    /// Effective spill directory: explicit `directory`, else legacy `spill_dir`.
+    pub fn resolved_directory<'a>(&'a self, spill_dir_alias: &'a str) -> &'a str {
+        if !self.directory.is_empty() {
+            &self.directory
+        } else {
+            spill_dir_alias
+        }
+    }
+
+    /// Parse orphan age into a [`std::time::Duration`].
+    pub fn orphan_age_duration(&self) -> crate::error::Result<std::time::Duration> {
+        let s = self.orphan_age.trim();
+        if let Some(h) = s.strip_suffix('h').or_else(|| s.strip_suffix('H')) {
+            let hours: u64 = h.parse().map_err(|e| {
+                crate::error::SqeError::Config(format!("invalid spill.orphan_age '{s}': {e}"))
+            })?;
+            return Ok(std::time::Duration::from_secs(hours.saturating_mul(3600)));
+        }
+        if let Some(d) = s.strip_suffix('d').or_else(|| s.strip_suffix('D')) {
+            let days: u64 = d.parse().map_err(|e| {
+                crate::error::SqeError::Config(format!("invalid spill.orphan_age '{s}': {e}"))
+            })?;
+            return Ok(std::time::Duration::from_secs(days.saturating_mul(86400)));
+        }
+        let secs: u64 = s.parse().map_err(|e| {
+            crate::error::SqeError::Config(format!("invalid spill.orphan_age '{s}': {e}"))
+        })?;
+        Ok(std::time::Duration::from_secs(secs))
+    }
+}
+
 #[derive(Deserialize, Clone)]
 pub struct WorkerConfig {
     #[serde(default)]
@@ -835,8 +947,14 @@ pub struct WorkerConfig {
     pub memory: WorkerMemoryConfig,
     #[serde(default = "default_true")]
     pub spill_to_disk: bool,
+    /// Deprecated alias for `[worker.spill].directory`. If both are set to
+    /// different paths, config validation fails. Prefer `worker.spill.directory`.
     #[serde(default = "default_spill_dir")]
     pub spill_dir: String,
+    /// Spill substrate configuration (Phase 3). When `enabled` and backend is
+    /// local, the worker opens a [`sqe_spill::SpillManager`] at bootstrap.
+    #[serde(default)]
+    pub spill: WorkerSpillConfig,
     /// Maximum duration in seconds for a single scan task. Default: 600 (10 minutes).
     /// Set to 0 to disable the timeout.
     #[serde(default = "default_scan_timeout")]
@@ -869,6 +987,7 @@ impl Default for WorkerConfig {
             memory: WorkerMemoryConfig::default(),
             spill_to_disk: true,
             spill_dir: default_spill_dir(),
+            spill: WorkerSpillConfig::default(),
             scan_timeout_secs: default_scan_timeout(),
             worker_secret: String::new(),
             allow_unauthenticated: false,
@@ -957,6 +1076,7 @@ impl std::fmt::Debug for WorkerConfig {
             .field("memory", &self.memory)
             .field("spill_to_disk", &self.spill_to_disk)
             .field("spill_dir", &self.spill_dir)
+            .field("spill", &self.spill)
             .field("scan_timeout_secs", &self.scan_timeout_secs)
             .field(
                 "worker_secret",
@@ -4550,6 +4670,12 @@ fn validate_byte_sizes(config: &SqeConfig, errors: &mut Vec<String>) {
         "worker.memory.budget_granularity",
         &config.worker.memory.budget_granularity,
     );
+    check("worker.spill.max_bytes", &config.worker.spill.max_bytes);
+    check("worker.spill.min_free_bytes", &config.worker.spill.min_free_bytes);
+    check(
+        "worker.spill.segment_target_size",
+        &config.worker.spill.segment_target_size,
+    );
     check("storage.coalesce_threshold", &config.storage.coalesce_threshold);
     check("storage.footer_cache_size", &config.storage.footer_cache_size);
     check("storage.prefetch_buffer", &config.storage.prefetch_buffer);
@@ -4566,6 +4692,62 @@ fn validate_byte_sizes(config: &SqeConfig, errors: &mut Vec<String>) {
                      operator/shuffle/spill_io budgets"
                 ));
             }
+        }
+    }
+
+    // Spill directory: single root. Fail if both spill_dir and spill.directory
+    // are set to different non-empty paths.
+    let spill = &config.worker.spill;
+    if !spill.directory.is_empty()
+        && !config.worker.spill_dir.is_empty()
+        && spill.directory != config.worker.spill_dir
+    {
+        errors.push(format!(
+            "worker.spill.directory ({:?}) and worker.spill_dir ({:?}) both set \
+             to different paths; set only one (prefer worker.spill.directory)",
+            spill.directory, config.worker.spill_dir
+        ));
+    }
+    if spill.enabled && config.worker.spill_to_disk {
+        let dir = spill.resolved_directory(&config.worker.spill_dir);
+        match spill.backend.as_str() {
+            "local" | "tiered" => {
+                if dir.is_empty() {
+                    errors.push(
+                        "worker.spill.enabled with backend local/tiered requires \
+                         worker.spill.directory (or legacy worker.spill_dir)"
+                            .into(),
+                    );
+                }
+            }
+            "s3" => {
+                // S3 backend lands later; fail startup until implemented so
+                // configs are not silently ignored.
+                errors.push(
+                    "worker.spill.backend = \"s3\" is not implemented yet; use \
+                     backend = \"local\" or disable spill"
+                        .into(),
+                );
+            }
+            other => {
+                errors.push(format!(
+                    "worker.spill.backend = {other:?} is not supported \
+                     (expected local | s3 | tiered)"
+                ));
+            }
+        }
+        if let Ok(max_b) = parse_memory_limit(&spill.max_bytes) {
+            if let Ok(seg) = parse_memory_limit(&spill.segment_target_size) {
+                if max_b < seg.saturating_mul(2) {
+                    errors.push(format!(
+                        "worker.spill.max_bytes ({max_b}) must be at least two \
+                         segment_target_size ({seg}) budgets"
+                    ));
+                }
+            }
+        }
+        if let Err(e) = spill.orphan_age_duration() {
+            errors.push(format!("worker.spill.orphan_age: {e}"));
         }
     }
 }
