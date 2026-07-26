@@ -128,6 +128,7 @@ mod tests {
 
     #[tokio::test]
     async fn manager_roundtrip_and_guard_cleanup() {
+        let _serial = crate::fault::serial_test_guard();
         let tmp = tempfile::tempdir().unwrap();
         let store = Arc::new(
             LocalSegmentStore::open(tmp.path(), 1 << 30, 0, 2, 2).unwrap(),

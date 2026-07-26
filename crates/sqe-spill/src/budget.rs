@@ -17,6 +17,44 @@ use crate::error::{BudgetError, Result};
 /// this size so the semaphore can track capacity with a bounded permit count.
 pub const DEFAULT_BUDGET_GRANULARITY: usize = 64 * 1024;
 
+/// Default fraction of a shuffle/scan parent budget reserved for spill-read
+/// and merge headroom (1/4 = 25%). Writers must not consume this slice so a
+/// slow consumer can still stream spilled segments without waiting for
+/// writers to free memory.
+pub const DEFAULT_READ_HEADROOM_NUM: usize = 1;
+pub const DEFAULT_READ_HEADROOM_DEN: usize = 4;
+
+/// Split a parent capacity into `(writer_capacity, read_headroom)`.
+///
+/// `read_headroom` is at least one accounting unit when `capacity > 0`, and
+/// `writer_capacity + read_headroom == capacity` (modulo zero-capacity).
+pub fn split_read_headroom(
+    capacity: usize,
+    headroom_num: usize,
+    headroom_den: usize,
+) -> (usize, usize) {
+    if capacity == 0 {
+        return (0, 0);
+    }
+    let den = headroom_den.max(1);
+    let num = headroom_num.min(den);
+    let mut headroom = capacity.saturating_mul(num) / den;
+    if headroom == 0 && num > 0 {
+        headroom = 1;
+    }
+    if headroom >= capacity {
+        // Always leave the writer at least 1 byte of capacity when possible.
+        headroom = capacity.saturating_sub(1);
+    }
+    let writer = capacity.saturating_sub(headroom);
+    (writer.max(1), headroom.max(1).min(capacity.saturating_sub(writer)))
+}
+
+/// Convenience: default 25% read headroom.
+pub fn split_default_read_headroom(capacity: usize) -> (usize, usize) {
+    split_read_headroom(capacity, DEFAULT_READ_HEADROOM_NUM, DEFAULT_READ_HEADROOM_DEN)
+}
+
 /// A named byte budget with a hard capacity.
 ///
 /// Admission is two-layer:
@@ -409,5 +447,30 @@ mod tests {
         t2.await.unwrap();
         let seen = order.lock().unwrap().clone();
         assert_eq!(seen, vec![1, 2], "semaphore waiters should run FIFO");
+    }
+
+    #[test]
+    fn split_read_headroom_default_quarter() {
+        let (w, r) = split_default_read_headroom(1024);
+        assert_eq!(w + r, 1024);
+        assert_eq!(r, 256);
+        assert_eq!(w, 768);
+    }
+
+    #[test]
+    fn split_read_headroom_tiny_capacity() {
+        // Prefer leaving the writer at least 1 byte; headroom may be 0.
+        let (w, r) = split_default_read_headroom(1);
+        assert_eq!(w, 1);
+        assert_eq!(r, 0);
+        let (w4, r4) = split_default_read_headroom(4);
+        assert_eq!(w4 + r4, 4);
+        assert_eq!(r4, 1);
+        assert_eq!(w4, 3);
+    }
+
+    #[test]
+    fn split_read_headroom_zero() {
+        assert_eq!(split_default_read_headroom(0), (0, 0));
     }
 }
