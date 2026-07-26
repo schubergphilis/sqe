@@ -1,6 +1,7 @@
 pub mod distributed_aggregate;
 pub mod distributed_join;
 pub mod distributed_sort;
+pub mod external_aggregate;
 pub mod grace_hash_join;
 pub mod join_strategy;
 pub mod predicate_transfer;
@@ -25,6 +26,11 @@ pub use distributed_join::{
 pub use distributed_sort::{
     compute_range_boundaries, needs_sampling, sample_based_boundaries, DistributedSortExec,
     DistributedSortRule, DEFAULT_DISTRIBUTED_SORT_THRESHOLD, MIN_EXECUTORS_FOR_DISTRIBUTED_SORT,
+};
+pub use external_aggregate::{
+    ensure_decomposable, external_hash_aggregate, AggregateConsumer, DecomposableAgg,
+    DfAggregateSpillCase, DfAggregateSpillGateReport, ExternalAggregateConfig,
+    ExternalAggregateError, ExternalAggregateProfile,
 };
 pub use grace_hash_join::{
     choose_local_join_strategy, grace_inner_join, GraceHashJoinConfig, GraceJoinConsumer,
