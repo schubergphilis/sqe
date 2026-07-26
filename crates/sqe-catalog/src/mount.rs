@@ -25,7 +25,17 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use sqe_core::{Secret, SecretStore};
+// `Secret` is only matched in backend builders that are feature-gated
+// (rest / glue / s3tables / hms). Keep the import behind the same gates so
+// slim `--no-default-features` builds do not warn under `-D warnings`.
+#[cfg(any(
+    feature = "rest",
+    feature = "glue",
+    feature = "s3tables",
+    feature = "hms",
+))]
+use sqe_core::Secret;
+use sqe_core::SecretStore;
 use sqe_sql::{CatalogKind, OptionValue};
 
 /// Build an `iceberg::Catalog` from an ATTACH option dictionary.
@@ -267,6 +277,10 @@ async fn build_iceberg_rest(
 /// catalog builder consumes (mirrors `rest_catalog.rs:868-894`). Only
 /// present options produce props; absent ones are skipped so ambient config
 /// still applies as a fallback.
+///
+/// Only compiled when `rest` is enabled: the sole production call site is
+/// `build_iceberg_rest`, and unit tests for this helper are also rest-gated.
+#[cfg(feature = "rest")]
 fn s3_props_from_options(options: &BTreeMap<String, OptionValue>) -> Vec<(String, String)> {
     let mut out = Vec::new();
     for (opt_key, prop_key) in [
@@ -626,7 +640,7 @@ async fn build_hms(
     Err("TYPE hms requires the `hms` cargo feature on sqe-catalog".to_string())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "rest"))]
 mod s3_option_tests {
     use std::collections::BTreeMap;
 
