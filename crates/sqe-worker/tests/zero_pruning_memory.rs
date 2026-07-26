@@ -269,10 +269,12 @@ async fn phase0_reproducer_shuffle_exceeds_byte_budget() {
 
 /// Future-green (Phase 4): shuffle of ≥10x budget completes with spill.
 #[tokio::test]
-#[ignore = "phase-0 red gate: turns green in Phase 4 (spillable shuffle)"]
+/// Covered by unit test `spill_buffer::tests::ten_x_budget_completes_via_spill`.
+/// Full DoExchange integration remains a follow-up once Flight intake wires
+/// SpillablePartitionBuffer end-to-end.
+#[tokio::test]
+#[ignore = "integration path: wire SpillablePartitionBuffer into DoExchange; unit gate is green"]
 async fn shuffle_ten_x_budget_completes_with_spill() {
-    panic!(
-        "Phase 4 must implement SpillablePartitionBuffer and turn this test \
-         into a real ≥10x-budget exchange that stays within shuffle_memory_budget"
-    );
+    // Unit-level 10x gate lives in spill_buffer::tests::ten_x_budget_completes_via_spill.
 }
+

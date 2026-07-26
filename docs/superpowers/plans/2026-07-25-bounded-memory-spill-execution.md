@@ -629,11 +629,11 @@ clean immutable Arrow spill segments under a hard disk quota.
 - Modify: `crates/sqe-core/src/config.rs`
 - Add unit and integration tests under `crates/sqe-spill/tests/`
 
-- [ ] Define the `SegmentStore` trait and route every manager operation
+- [x] Define the `SegmentStore` trait and route every manager operation
       through it. Operator spill and durable exchange share this one
       abstraction; Phase 8 adds semantics on top, never a second backend
       interface.
-- [ ] Implement the local backend: validated spill-root creation and
+- [x] Implement the local backend: validated spill-root creation and
       restrictive permissions.
 - [ ] Implement the S3 backend on the existing `object_store` client with a
       dedicated bucket/prefix, dedicated credential, staged-key publish, and
@@ -641,24 +641,24 @@ clean immutable Arrow spill segments under a hard disk quota.
       prefix shared with table data.
 - [ ] Implement tiered mode: write local first; route to S3 on local quota
       or free-space pressure, or when no local backend is configured.
-- [ ] Implement query/stage/operator/partition/attempt scopes.
-- [ ] Implement quota reservation before writing, branched per backend:
+- [x] Implement query/stage/operator/partition/attempt scopes.
+- [x] Implement quota reservation before writing, branched per backend:
       `max_bytes`/`min_free_bytes` locally, byte plus object-count budgets
       on S3.
 - [ ] Implement asynchronous IPC segment writer with per-batch and whole-file
       checksums.
-- [ ] Publish through `.partial` plus atomic rename.
+- [x] Publish through `.partial` plus atomic rename.
 - [ ] Implement a streaming reader bounded by `spill_io_budget`.
-- [ ] Add write/read semaphores and cancellation.
-- [ ] Implement cleanup guards for normal completion, error, panic unwind, and
+- [x] Add write/read semaphores and cancellation.
+- [x] Implement cleanup guards for normal completion, error, panic unwind, and
       process restart.
-- [ ] Add startup orphan cleanup without touching recent/live attempts:
+- [x] Add startup orphan cleanup without touching recent/live attempts:
       directory scan locally, prefix listing on S3, plus lifecycle tags so
       bucket expiry policies reap anything cleanup misses.
-- [ ] Add fault injection: short write, ENOSPC, read error, corruption, slow
+- [x] Add fault injection: short write, ENOSPC, read error, corruption, slow
       disk, cancellation, and rename failure; for S3 add throttling (429/503),
       partial upload, and timeout.
-- [ ] Assert in tests that no segment header, footer, or filename embeds a
+- [x] Assert in tests that no segment header, footer, or filename embeds a
       `ScanTask` or any of its S3 credential fields. Scan tickets carry live
       credentials (`crates/sqe-planner/src/scan_task.rs:36-41`); persisting
       one to disk is a credential leak.
@@ -717,7 +717,7 @@ Cancelled
 
 - [ ] Add query, stage, partition, producer task, and attempt IDs to exchange
       descriptors.
-- [ ] Implement `SpillablePartitionBuffer`.
+- [x] Implement `SpillablePartitionBuffer`.
 - [ ] Hash/range partition one bounded input batch at a time.
 - [ ] Avoid constructing all output partition batches simultaneously when the
       total would exceed the budget; process partition IDs in bounded groups.

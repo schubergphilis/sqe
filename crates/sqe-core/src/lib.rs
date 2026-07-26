@@ -10,7 +10,7 @@ pub mod table_properties;
 pub use config::{
     AuthProviderConfig, DeviceAuthConfig, ExternalAuthConfig, FlightCompression, ProfileMode,
     QueryCacheConfig, QueryConfig, QueryHistoryConfig, ResolvedWorkerMemory, SortMode, SqeConfig,
-    WorkerMemoryConfig, parse_memory_limit,
+    WorkerMemoryConfig, WorkerSpillConfig, parse_memory_limit,
 };
 pub use error::{CatalogOp, Result, SqeError, SqeErrorCode};
 pub use secret::{Secret, SecretStore, SecretStoreError};
