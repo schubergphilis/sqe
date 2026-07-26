@@ -206,10 +206,20 @@ impl SpillablePartitionBuffer {
         // Guard remains armed → cleanup on drop.
     }
 
+    /// Cancel intake: drop resident memory and leave the scope guard armed so
+    /// spilled segments are deleted on drop. Safe to call from DoExchange when
+    /// the client disconnects or a superseding attempt wins mid-stream.
     pub fn cancel(&mut self) {
         self.state = PartitionBufferState::Cancelled;
         self.memory.clear();
         self.memory_bytes = 0;
+        // Segments stay listed until Drop of `_guard` deletes the scope; clear
+        // the local list so collect/drain cannot observe cancelled data.
+        self.segments.clear();
+        self.fail_msg = Some("cancelled".to_string());
+        if let Some(ref m) = self.metrics {
+            m.shuffle_resident_bytes.set(0.0);
+        }
     }
 
     /// Drain remaining in-memory batches and spill segments into a Vec of
@@ -627,6 +637,93 @@ mod tests {
     }
 
     /// Mirrors DoExchange spill intake: append under budget, finish, stream.
+    #[tokio::test]
+    async fn cancel_after_spill_drops_resident_and_blocks_drain() {
+        let (manager, budget, tmp) = setup(32 * 1024).await;
+        let scope = SpillScope::new("q-cancel-spill", "s", "sh", 0, 0);
+        let mut buf =
+            SpillablePartitionBuffer::new(manager, scope.clone(), schema(), budget.clone(), None);
+        for i in 0..30 {
+            buf.append(batch(i * 1000, 256)).await.unwrap();
+        }
+        // Likely spilled; cancel must still zero resident and refuse drain.
+        buf.cancel();
+        assert_eq!(buf.state(), PartitionBufferState::Cancelled);
+        assert_eq!(buf.resident_bytes(), 0);
+        assert_eq!(budget.used_bytes(), 0);
+        let drain = buf.into_drain_stream().await;
+        assert!(drain.is_err(), "cancelled buffer must not open a drain");
+        drop(drain);
+        // Guard cleanup is async on drop of buffer... buffer already moved/dropped
+        // after into_drain_stream failed? into_drain_stream takes self by value only
+        // on Ok path — on Err, self is not consumed. Wait, into_drain_stream takes mut self
+        // by value, so on Err early return before finish... looking at code:
+        // into_drain_stream takes mut self by value, so on Cancelled it returns Err
+        // and drops self (and armed guard). Good.
+        tokio::task::yield_now().await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let scope_dir = tmp.path().join(scope.relative_dir());
+        assert!(
+            !scope_dir.exists(),
+            "cancelled scope should be cleaned: {}",
+            scope_dir.display()
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_producers_slow_consumer() {
+        // Four partitions append concurrently under a shared-style budget each;
+        // a slow drain of each partition still sees full row counts.
+        let budget_bytes = 128 * 1024;
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            LocalSegmentStore::open(tmp.path(), 1 << 30, 0, 8, 8).unwrap(),
+        );
+        let manager = Arc::new(SpillManager::new(
+            store,
+            std::time::Duration::from_secs(0),
+        ));
+
+        let mut handles = Vec::new();
+        for p in 0..4u32 {
+            let manager = manager.clone();
+            handles.push(tokio::spawn(async move {
+                let pool = Arc::new(FairSpillPool::new(budget_bytes.max(1024 * 1024)));
+                let budget = ByteBudget::new(format!("p{p}"), budget_bytes, Some(pool));
+                let scope = SpillScope::new("q-conc", "s", "sh", p, 0);
+                let mut buf =
+                    SpillablePartitionBuffer::new(manager, scope, schema(), budget, None);
+                let mut peak = 0usize;
+                for i in 0..40 {
+                    buf.append(batch((p as i64) * 100_000 + i * 1000, 512))
+                        .await
+                        .unwrap();
+                    peak = peak.max(buf.resident_bytes());
+                    assert!(peak <= budget_bytes + 128 * 1024);
+                }
+                let m = buf.finish().await.unwrap();
+                // Slow consumer: yield between batches.
+                let mut drain = buf.into_drain_stream().await.unwrap();
+                let mut rows = 0usize;
+                while let Some(item) = drain.next().await {
+                    rows += item.unwrap().num_rows();
+                    tokio::task::yield_now().await;
+                }
+                (m.rows, rows, peak)
+            }));
+        }
+
+        let mut total_rows = 0u64;
+        for h in handles {
+            let (manifest_rows, drained, peak) = h.await.unwrap();
+            assert_eq!(manifest_rows, drained as u64);
+            assert_eq!(manifest_rows, 40 * 512);
+            assert!(peak <= budget_bytes + 128 * 1024);
+            total_rows += manifest_rows;
+        }
+        assert_eq!(total_rows, 4 * 40 * 512);
+    }
+
     #[tokio::test]
     async fn do_exchange_style_ten_x_intake_stays_bounded() {
         let budget_bytes = 256 * 1024;
