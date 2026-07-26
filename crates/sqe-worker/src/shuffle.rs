@@ -24,6 +24,9 @@ use tracing::debug;
 /// Describes the type of data exchange for a DoExchange call.
 ///
 /// Serialized as JSON in the first FlightData message's descriptor `cmd` field.
+///
+/// Phase 4 adds optional attempt / producer identity fields (default 0 / empty
+/// for older producers) so late data from a losing task attempt can be rejected.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum ExchangeDescriptor {
     /// Receive hash-partitioned data for a join or aggregate.
@@ -31,12 +34,23 @@ pub enum ExchangeDescriptor {
         query_id: String,
         stage_id: String,
         partition_id: u32,
+        /// Task attempt id. Late data from a lower attempt is rejected once a
+        /// higher attempt is committed for this partition.
+        #[serde(default)]
+        attempt_id: u32,
+        /// Opaque producer task id (optional; empty for older clients).
+        #[serde(default)]
+        producer_task_id: String,
     },
     /// Receive range-partitioned data for a distributed sort.
     RangePartition {
         query_id: String,
         stage_id: String,
         range_bounds: Vec<String>,
+        #[serde(default)]
+        attempt_id: u32,
+        #[serde(default)]
+        producer_task_id: String,
     },
 }
 
@@ -74,6 +88,83 @@ impl ExchangeDescriptor {
             ExchangeDescriptor::HashPartition { partition_id, .. } => *partition_id,
             ExchangeDescriptor::RangePartition { .. } => 0,
         }
+    }
+
+    /// Task attempt id (0 when omitted by older producers).
+    pub fn attempt_id(&self) -> u32 {
+        match self {
+            ExchangeDescriptor::HashPartition { attempt_id, .. } => *attempt_id,
+            ExchangeDescriptor::RangePartition { attempt_id, .. } => *attempt_id,
+        }
+    }
+
+    /// Producer task id string (empty when omitted).
+    pub fn producer_task_id(&self) -> &str {
+        match self {
+            ExchangeDescriptor::HashPartition {
+                producer_task_id, ..
+            } => producer_task_id.as_str(),
+            ExchangeDescriptor::RangePartition {
+                producer_task_id, ..
+            } => producer_task_id.as_str(),
+        }
+    }
+}
+
+// ───────────────────────────── AttemptGate ────────────────────────────────────
+
+/// Tracks the highest committed attempt id per (query, stage, partition).
+///
+/// Late data from a lower attempt is rejected so a retried producer cannot
+/// poison results after a winner has already been accepted.
+#[derive(Clone, Default)]
+pub struct AttemptGate {
+    winners: Arc<Mutex<HashMap<(String, String, u32), u32>>>,
+}
+
+impl AttemptGate {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Returns true if `attempt_id` is still admissible (equal to or greater
+    /// than the current winner). Updates the winner when `attempt_id` is higher.
+    pub async fn admit(
+        &self,
+        query_id: &str,
+        stage_id: &str,
+        partition_id: u32,
+        attempt_id: u32,
+    ) -> bool {
+        let key = (
+            query_id.to_string(),
+            stage_id.to_string(),
+            partition_id,
+        );
+        let mut map = self.winners.lock().await;
+        match map.get(&key).copied() {
+            Some(winner) if attempt_id < winner => false,
+            Some(winner) if attempt_id == winner => true,
+            _ => {
+                map.insert(key, attempt_id);
+                true
+            }
+        }
+    }
+
+    /// Current winner for a partition, if any.
+    pub async fn winner(
+        &self,
+        query_id: &str,
+        stage_id: &str,
+        partition_id: u32,
+    ) -> Option<u32> {
+        let key = (
+            query_id.to_string(),
+            stage_id.to_string(),
+            partition_id,
+        );
+        self.winners.lock().await.get(&key).copied()
     }
 }
 
@@ -252,13 +343,21 @@ type StageKey = (String, String);
 #[derive(Clone)]
 pub struct ShuffleManager {
     receivers: Arc<Mutex<HashMap<StageKey, Arc<ShuffleReceiver>>>>,
+    /// Attempt admission for late-data rejection (Phase 4).
+    attempts: AttemptGate,
 }
 
 impl ShuffleManager {
     pub fn new() -> Self {
         Self {
             receivers: Arc::new(Mutex::new(HashMap::new())),
+            attempts: AttemptGate::new(),
         }
+    }
+
+    /// Shared attempt gate for DoExchange intake.
+    pub fn attempts(&self) -> &AttemptGate {
+        &self.attempts
     }
 
     /// Register a new ShuffleReceiver for a (query_id, stage_id).
@@ -535,10 +634,14 @@ mod tests {
             query_id: "q1".to_string(),
             stage_id: "s1".to_string(),
             partition_id: 3,
+            attempt_id: 2,
+            producer_task_id: "prod-a".to_string(),
         };
         let bytes = desc.to_bytes().unwrap();
         let decoded = ExchangeDescriptor::from_bytes(&bytes).unwrap();
         assert_eq!(desc, decoded);
+        assert_eq!(decoded.attempt_id(), 2);
+        assert_eq!(decoded.producer_task_id(), "prod-a");
     }
 
     #[test]
@@ -547,10 +650,22 @@ mod tests {
             query_id: "q2".to_string(),
             stage_id: "s2".to_string(),
             range_bounds: vec!["10".to_string(), "20".to_string()],
+            attempt_id: 0,
+            producer_task_id: String::new(),
         };
         let bytes = desc.to_bytes().unwrap();
         let decoded = ExchangeDescriptor::from_bytes(&bytes).unwrap();
         assert_eq!(desc, decoded);
+    }
+
+    #[test]
+    fn test_exchange_descriptor_legacy_json_defaults_attempt() {
+        // Older producers omit attempt_id / producer_task_id.
+        let json = br#"{"HashPartition":{"query_id":"q","stage_id":"s","partition_id":1}}"#;
+        let decoded = ExchangeDescriptor::from_bytes(json).unwrap();
+        assert_eq!(decoded.partition_id(), 1);
+        assert_eq!(decoded.attempt_id(), 0);
+        assert_eq!(decoded.producer_task_id(), "");
     }
 
     #[test]
@@ -559,8 +674,21 @@ mod tests {
             query_id: "q1".to_string(),
             stage_id: "s1".to_string(),
             partition_id: 0,
+            attempt_id: 0,
+            producer_task_id: String::new(),
         };
         assert_eq!(desc.stage_key(), ("q1".to_string(), "s1".to_string()));
+    }
+
+    #[tokio::test]
+    async fn attempt_gate_rejects_late_data() {
+        let gate = AttemptGate::new();
+        assert!(gate.admit("q", "s", 0, 1).await);
+        assert!(gate.admit("q", "s", 0, 1).await); // same attempt ok
+        assert!(!gate.admit("q", "s", 0, 0).await); // older rejected
+        assert!(gate.admit("q", "s", 0, 2).await); // newer wins
+        assert!(!gate.admit("q", "s", 0, 1).await);
+        assert_eq!(gate.winner("q", "s", 0).await, Some(2));
     }
 
     // ─── ShuffleReceiver tests ───
