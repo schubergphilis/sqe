@@ -7,7 +7,11 @@ pub mod sql_params;
 pub mod supervised_task;
 pub mod table_properties;
 
-pub use config::{AuthProviderConfig, DeviceAuthConfig, ExternalAuthConfig, FlightCompression, ProfileMode, QueryCacheConfig, QueryConfig, QueryHistoryConfig, SortMode, SqeConfig, parse_memory_limit};
+pub use config::{
+    AuthProviderConfig, DeviceAuthConfig, ExternalAuthConfig, FlightCompression, ProfileMode,
+    QueryCacheConfig, QueryConfig, QueryHistoryConfig, ResolvedWorkerMemory, SortMode, SqeConfig,
+    WorkerMemoryConfig, parse_memory_limit,
+};
 pub use error::{CatalogOp, Result, SqeError, SqeErrorCode};
 pub use secret::{Secret, SecretStore, SecretStoreError};
 pub use secret_string::SecretString;

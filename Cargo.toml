@@ -13,6 +13,7 @@ members = [
     "crates/sqe-worker",
     "crates/sqe-trino-compat",
     "crates/sqe-metrics",
+    "crates/sqe-spill",
     "crates/sqe-lineage",
     "crates/sqe-quack-wire",
     "crates/sqe-quack-server",

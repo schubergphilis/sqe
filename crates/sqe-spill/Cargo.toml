@@ -1,0 +1,21 @@
+[package]
+name = "sqe-spill"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Byte budgets, accounted buffers, and (later) spill segment storage for SQE"
+
+[lib]
+name = "sqe_spill"
+path = "src/lib.rs"
+
+[dependencies]
+datafusion = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }
