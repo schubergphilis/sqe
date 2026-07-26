@@ -8,12 +8,14 @@
 //! - [`RangePartitioner`]: Splits a RecordBatch using sort-key boundaries for range partitioning.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use arrow_array::{ArrayRef, RecordBatch, UInt32Array};
 use arrow_schema::SchemaRef;
 use datafusion::common::hash_utils::create_hashes;
 use serde::{Deserialize, Serialize};
+use sqe_metrics::WorkerMetricsRegistry;
 use tokio::sync::{mpsc, Mutex};
 use tracing::debug;
 
@@ -78,12 +80,21 @@ impl ExchangeDescriptor {
 // ───────────────────────────── ShuffleReceiver ────────────────────────────────
 
 /// Default bounded channel capacity per partition.
-const DEFAULT_CHANNEL_CAPACITY: usize = 64;
+///
+/// Phase 0 documents that a batch-count bound does **not** bound resident
+/// bytes. Phase 4 replaces each partition buffer with a spillable,
+/// byte-budgeted `SpillablePartitionBuffer`.
+pub const DEFAULT_CHANNEL_CAPACITY: usize = 64;
 
 /// Holds per-partition mpsc channels for receiving shuffled RecordBatches.
 ///
 /// The sender side is used by the DoExchange handler when data arrives.
 /// The receiver side is consumed by the downstream operator (e.g., ShuffleReaderExec).
+///
+/// Resident bytes across all partitions are tracked in `resident_bytes` and
+/// published to [`WorkerMetricsRegistry::shuffle_resident_bytes`] when metrics
+/// are attached. Tracking is best-effort Phase 0 instrumentation: the channel
+/// itself remains item-bounded, not byte-bounded.
 pub struct ShuffleReceiver {
     /// Per-partition senders — DoExchange handler writes here.
     senders: HashMap<u32, mpsc::Sender<RecordBatch>>,
@@ -91,6 +102,11 @@ pub struct ShuffleReceiver {
     receivers: Mutex<HashMap<u32, mpsc::Receiver<RecordBatch>>>,
     /// Schema of the data being shuffled.
     schema: SchemaRef,
+    /// Sum of `get_array_memory_size()` across batches currently in any
+    /// partition channel. Incremented on successful send, decremented on recv.
+    resident_bytes: Arc<AtomicUsize>,
+    /// Optional worker metrics for the shuffle_resident_bytes gauge.
+    metrics: Option<Arc<WorkerMetricsRegistry>>,
 }
 
 impl ShuffleReceiver {
@@ -98,6 +114,16 @@ impl ShuffleReceiver {
     ///
     /// Each partition gets a bounded mpsc channel with `capacity` buffer slots.
     pub fn new(num_partitions: u32, schema: SchemaRef, capacity: usize) -> Self {
+        Self::new_with_metrics(num_partitions, schema, capacity, None)
+    }
+
+    /// Create a ShuffleReceiver that publishes resident-byte gauges.
+    pub fn new_with_metrics(
+        num_partitions: u32,
+        schema: SchemaRef,
+        capacity: usize,
+        metrics: Option<Arc<WorkerMetricsRegistry>>,
+    ) -> Self {
         let mut senders = HashMap::new();
         let mut receivers = HashMap::new();
 
@@ -111,6 +137,8 @@ impl ShuffleReceiver {
             senders,
             receivers: Mutex::new(receivers),
             schema,
+            resident_bytes: Arc::new(AtomicUsize::new(0)),
+            metrics,
         }
     }
 
@@ -120,20 +148,95 @@ impl ShuffleReceiver {
     }
 
     /// Get a sender for a given partition. Used by the DoExchange handler.
+    ///
+    /// Prefer [`Self::send_batch`] when resident-byte tracking is required:
+    /// raw sends bypass the gauge.
     pub fn sender(&self, partition_id: u32) -> Option<&mpsc::Sender<RecordBatch>> {
         self.senders.get(&partition_id)
+    }
+
+    /// Send a batch into a partition, updating the resident-byte gauge.
+    ///
+    /// Returns `Err(batch)` if the channel is closed (receiver dropped).
+    pub async fn send_batch(
+        &self,
+        partition_id: u32,
+        batch: RecordBatch,
+    ) -> Result<(), RecordBatch> {
+        let sender = match self.senders.get(&partition_id) {
+            Some(s) => s,
+            None => return Err(batch),
+        };
+        let bytes = batch.get_array_memory_size();
+        match sender.send(batch).await {
+            Ok(()) => {
+                self.resident_bytes.fetch_add(bytes, Ordering::Relaxed);
+                self.publish_resident();
+                Ok(())
+            }
+            Err(e) => Err(e.0),
+        }
     }
 
     /// Take the receiver for a given partition. This can only be called once per partition.
     ///
     /// Returns `None` if the receiver was already taken or the partition doesn't exist.
-    pub async fn take_receiver(&self, partition_id: u32) -> Option<mpsc::Receiver<RecordBatch>> {
-        self.receivers.lock().await.remove(&partition_id)
+    /// The returned stream decrements resident-byte accounting as batches are pulled.
+    pub async fn take_receiver(
+        &self,
+        partition_id: u32,
+    ) -> Option<TrackedPartitionReceiver> {
+        let rx = self.receivers.lock().await.remove(&partition_id)?;
+        Some(TrackedPartitionReceiver {
+            inner: rx,
+            resident_bytes: self.resident_bytes.clone(),
+            metrics: self.metrics.clone(),
+        })
+    }
+
+    /// Current resident bytes across all partition channels.
+    pub fn resident_bytes(&self) -> usize {
+        self.resident_bytes.load(Ordering::Relaxed)
     }
 
     /// Get the schema of the shuffled data.
     pub fn schema(&self) -> &SchemaRef {
         &self.schema
+    }
+
+    fn publish_resident(&self) {
+        if let Some(ref m) = self.metrics {
+            m.shuffle_resident_bytes
+                .set(self.resident_bytes.load(Ordering::Relaxed) as f64);
+        }
+    }
+}
+
+/// Partition receiver that decrements shuffle resident-byte accounting on
+/// every successful `recv`. Dropping the receiver does **not** automatically
+/// drain remaining batches; call sites that abandon a partition should drain
+/// or accept a residual gauge until the `ShuffleReceiver` is dropped.
+pub struct TrackedPartitionReceiver {
+    inner: mpsc::Receiver<RecordBatch>,
+    resident_bytes: Arc<AtomicUsize>,
+    metrics: Option<Arc<WorkerMetricsRegistry>>,
+}
+
+impl TrackedPartitionReceiver {
+    /// Receive the next batch, updating resident-byte accounting.
+    pub async fn recv(&mut self) -> Option<RecordBatch> {
+        let batch = self.inner.recv().await?;
+        let bytes = batch.get_array_memory_size();
+        let _ = self.resident_bytes.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |cur| Some(cur.saturating_sub(bytes)),
+        );
+        if let Some(ref m) = self.metrics {
+            m.shuffle_resident_bytes
+                .set(self.resident_bytes.load(Ordering::Relaxed) as f64);
+        }
+        Some(batch)
     }
 }
 
