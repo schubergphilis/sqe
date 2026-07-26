@@ -11,16 +11,52 @@ whole-query restart after an ordinary worker failure.
 
 **Primary invariant:** Total resident data owned by SQE is bounded by explicit
 byte budgets. Scans use backpressure rather than spill. Blocking operators and
-distributed exchange spill partitioned state to NVMe. Resilient execution can
-persist completed exchange output to object storage.
+distributed exchange spill partitioned state to the configured spill backend:
+local NVMe, S3-compatible object storage, or tiered (local first, S3 for
+overflow/durability). Either backend is optional per deployment; at least one
+must be usable when spill is enabled. Resilient execution can persist
+completed exchange output to object storage.
 
 **Reference design:** DuckDB-style streaming vector pipelines, one memory
 governor for temporary state, spillable pages/segments, radix partitioning, and
 partition-wise completion; Trino-style distributed stage exchange and task
 retry; DataFusion/Arrow remain SQE's execution foundation.
 
-**Tech stack:** Rust, Tokio, Arrow, Arrow IPC, Arrow Flight, DataFusion,
-iceberg-rust, local NVMe, optional S3-compatible durable exchange.
+**Tech stack:** Rust, Tokio, Arrow 58, Arrow IPC, Arrow Flight, DataFusion
+54.0.0, the vendored iceberg-rust fork (`vendor/iceberg-rust/`, RisingWave
+`dev_rebase_main_20260303` @ `813e54419b43`, pinned in the root
+`Cargo.toml:55-63`; not a released apache 0.8.x/0.9.x tag), local NVMe,
+optional S3-compatible spill and durable exchange.
+
+## Related plans, in-flight work, and vendor reality
+
+This plan supersedes
+`docs/internal/plans/2026-06-21-memory-safety-oom-prevention.md`
+(NodeMemoryGovernor, AdmissionGate, shuffle spill tier, `can_spill=false`
+fix). That plan's spec branch `feat/memory-safety-oom-spec` (github remote,
+unmerged, paused) carries task-level detail worth mining, but do not run
+both plans. Where they conflict, this plan wins.
+
+Merged work to build on, not re-implement:
+
+- `ScanDecodeGate` (`crates/sqe-catalog/src/scan_memory.rs`, commit
+  `f65b808`): decode admission plus per-decode `MemoryConsumer` pool
+  reservation on the embedded/coordinator Iceberg scan path. Phase 1's
+  `ByteBudget`-on-`MemoryConsumer` design matches it deliberately.
+- Fetch/decode pipelining (merged via `6ed409f`, vendor patch family 9):
+  staged fetch admission (`DecodeGate::admit_fetch`) on the vendored reader.
+- `TrackedBatchBuffer` (`crates/sqe-compaction/src/write_memory.rs`):
+  pool-tracked write-path buffering, already on main.
+- Memory-safe partitioned write (`fix/memory-safe-partitioned-write`,
+  merged): skips the sort on partitioned CTAS.
+
+Vendor patch exposure: SQE-local patch families 7 (`DecodeGate`, sqe#367)
+and 9 (fetch staging) live in
+`vendor/iceberg-rust/crates/iceberg/src/arrow/reader.rs` and
+`crates/iceberg/src/scan/mod.rs` (see `vendor/iceberg-rust/README.md`).
+Phases 1 and 2 change behavior in exactly that admission area. Any semantic
+change must update the vendor README patch list so the next fork rebase
+carries it forward.
 
 ## Why this work is required
 
@@ -37,15 +73,33 @@ handle:
 - a slow client or downstream stage;
 - data and exchange volume much larger than RAM.
 
-The current code has four concrete unsafe boundaries:
+The current code has four concrete unsafe boundaries (verified 2026-07-26):
 
-1. `sqe-worker::executor::execute_scan_streaming` grows one fragment reservation
-   for every emitted batch and does not shrink it after consumption.
-2. the scan channel is bounded at 16 record batches, not bytes;
-3. shuffle channels are bounded at 64 record batches per partition, not bytes,
-   and have no spill path;
-4. missing join statistics are treated as zero bytes, preserving a
-   non-spillable hash join.
+1. `sqe-worker::executor::execute_scan_streaming` registers one
+   `MemoryConsumer` per fragment
+   (`crates/sqe-worker/src/executor.rs:142-144`) and calls
+   `reservation.try_grow(batch.get_array_memory_size())` for every emitted
+   batch (`executor.rs:210` and `executor.rs:327`). Nothing ever shrinks the
+   reservation; it releases only when the producer task drops. Two failures
+   follow: any scan whose cumulative output exceeds `worker.memory_limit`
+   fails with `ResourcesExhausted` even when actual resident bytes are tiny,
+   and the pool's view never matches real residency, so the limit does not
+   bound RSS.
+2. the scan channel is bounded at 16 record batches, not bytes
+   (`mpsc::channel::<anyhow::Result<RecordBatch>>(16)` at
+   `executor.rs:176-177`);
+3. shuffle channels are bounded at 64 record batches per partition
+   (`DEFAULT_CHANNEL_CAPACITY: usize = 64` at
+   `crates/sqe-worker/src/shuffle.rs:81`, one `mpsc::channel(capacity)` of
+   `RecordBatch` per partition at `shuffle.rs:105`), not bytes, and the
+   module has no spill path;
+4. missing or inexact join statistics are treated as zero bytes
+   (`estimate_build_side_size` at
+   `crates/sqe-planner/src/join_strategy.rs:121-137` returns 0 on a stats
+   error or a non-exact `total_byte_size`), and the rule converts to
+   sort-merge only when `build_side_size > threshold`
+   (`join_strategy.rs:87`), so unknown inputs keep the non-spillable
+   `HashJoinExec`.
 
 ## Scope
 
@@ -123,6 +177,12 @@ batch size, not on total table size.
 Add explicit configuration. Names may be adjusted to existing conventions, but
 the concepts and validation are required.
 
+The worker config already has `memory_limit`, `spill_to_disk`, and `spill_dir`
+(`crates/sqe-core/src/config.rs:784-789`). `[worker.spill].directory` replaces
+`worker.spill_dir` as the single spill root; keep `spill_dir` as a deprecated
+alias that maps onto it, and fail validation if both are set to different
+paths. Do not ship two spill directory settings.
+
 ```toml
 [worker.memory]
 # Existing worker.memory_limit remains the hard tracked limit.
@@ -136,6 +196,8 @@ budget_granularity = "64KB"
 
 [worker.spill]
 enabled = true
+backend = "local" # local | s3 | tiered
+# Required for local/tiered; omit for s3-only deployments.
 directory = "/var/lib/sqe/spill"
 max_bytes = "1TB"
 min_free_bytes = "20GB"
@@ -145,6 +207,19 @@ max_concurrent_writes = 4
 max_concurrent_reads = 4
 cleanup_on_start = true
 orphan_age = "24h"
+
+[worker.spill.s3]
+# Required for s3/tiered; omit for local-only deployments.
+# Reuses the engine's existing object_store S3 client; no new dependency.
+endpoint = ""
+region = ""
+bucket = ""
+prefix = "sqe-spill/"
+max_bytes = "10TB"
+max_objects = 1000000
+# Dedicated spill credential; never a table-vended STS credential.
+access_key = ""
+secret_key = ""
 
 [query.execution]
 scan_morsel_target_size = "128MB"
@@ -165,16 +240,56 @@ Validation rules:
 
 - individual sub-budgets must not imply more than the worker tracked limit;
 - tracked limit plus process headroom must be below the pod/cgroup limit;
-- spill directory must be writable and on an allowed explicit path;
+- spill enabled requires at least one usable backend: `backend = "local"` or
+  `"tiered"` requires `directory`; `backend = "s3"` or `"tiered"` requires
+  `[worker.spill.s3]` bucket and credential; a spill-enabled config with no
+  usable backend fails startup;
+- spill directory (when configured) must be writable and on an allowed
+  explicit path;
+- the S3 spill bucket/prefix must be dedicated to spill: reject the
+  warehouse/table bucket or any prefix shared with table data;
+- S3 spill credentials are distinct from table-vended STS credentials;
 - spill quota must exceed at least two segment targets;
-- `min_free_bytes` must remain available after startup probes;
+- `min_free_bytes` must remain available after startup probes (local
+  backend);
 - production rejects memory-only exchange for resilient/multi-TB workload
   classes;
 - durable exchange credentials are distinct from table-vended credentials.
 
+`[query.exchange].mode` and `[worker.spill].backend` are related but distinct
+axes: exchange mode selects memory/local/durable exchange semantics; spill
+backend selects where operator and exchange spill segments physically live.
+`mode = "durable"` requires the S3 spill backend to be enabled.
+
 ## New shared execution primitives
 
-Create a new `crates/sqe-spill` crate. Keep it catalog- and network-agnostic.
+Create a new `crates/sqe-spill` crate (verified absent from the workspace).
+Keep it catalog- and network-agnostic.
+
+### Relation to DataFusion's MemoryPool
+
+SQE already runs DataFusion memory management. The worker builds a
+`FairSpillPool` sized by `worker.memory_limit`
+(`crates/sqe-worker/src/runtime.rs:41`) and wires DataFusion operator spill
+through the `DiskManager` at `worker.spill_dir`
+(`crates/sqe-worker/src/runtime.rs:22-25`). The coordinator has a
+greedy/fair pool choice (`crates/sqe-core/src/config.rs:502-518`) and
+pressure-based admission (`crates/sqe-coordinator/src/memory.rs`). A second
+independent worker-wide limit would fight this: bytes charged only to
+`ByteBudget` would be invisible to DataFusion operators, and the two systems
+would together admit more than `worker.memory_limit`.
+
+Decision: the DataFusion `MemoryPool` remains the single source of truth for
+the worker tracked limit. Each `ByteBudget` is backed by a `MemoryConsumer`
+registered on the worker pool. `acquire` performs `try_grow` (or waits at the
+budget's own capacity), and permit `Drop` performs `shrink`. Scan, Flight, and
+shuffle buffer bytes therefore appear in pool accounting, and DataFusion
+operators see correspondingly less headroom while those buffers are resident.
+Sub-budget capacities are validated so their sum stays at or below the pool
+limit. DataFusion-managed spill (sort runs) keeps using the `DiskManager`;
+point its temp path at a subdirectory of the `SpillManager` root so disk
+quota and free-space probes observe both, and treat `DiskManager` files as
+observed-but-unaccounted until upstream exposes accounting hooks.
 
 ### `ByteBudget`
 
@@ -212,23 +327,54 @@ separate permit until the Arrow input is released.
 ### `SpillManager`
 
 ```rust
-pub struct SpillManager { /* root, quota, I/O gates, registry */ }
+pub struct SpillManager { /* backends, quota, I/O gates, registry */ }
 pub struct SpillScope { /* query/stage/operator/attempt */ }
 pub struct SpillSegment { /* immutable committed descriptor */ }
+
+pub trait SegmentStore: Send + Sync {
+    /* write .partial, publish atomically, stream-read by range,
+       delete scope, list orphans; local-disk and S3 implementations */
+}
 ```
+
+The storage backend is abstract from the start. `SpillManager` writes and
+reads immutable segments through `SegmentStore`; local NVMe and
+S3-compatible object storage are the two implementations, selected by
+`[worker.spill].backend` (`local`, `s3`, or `tiered`). Every spill consumer
+(join build, aggregate state, sort runs, shuffle partitions, durable
+exchange) targets the same interface. Tiered mode prefers local disk for
+hot, short-lived spill and uses S3 for overflow, durability, or when no
+local disk exists; S3 has higher latency and per-request cost, so it is
+never the default for latency-sensitive spill when a local disk is
+available. Reuse the engine's existing `object_store` client (workspace
+dependency, `crates/sqe-worker/Cargo.toml:34`; builder pattern in
+`build_object_store_with_creds`, `crates/sqe-worker/src/executor.rs:158`)
+and the `StorageConfig` S3 field conventions
+(`crates/sqe-core/src/config.rs:1624`); add no new S3 dependency.
 
 Required behavior:
 
-- creates directories only below the configured validated root;
+- creates directories/keys only below the configured validated root or
+  dedicated bucket/prefix;
 - scopes files by opaque query, stage, operator, partition, and attempt IDs;
-- writes to an attempt-local `.partial` file and atomically publishes;
+- writes to an attempt-local `.partial` file (local) or staged key (S3) and
+  atomically publishes;
 - tracks logical, physical, resident I/O, and quota bytes;
-- refuses writes before violating quota or `min_free_bytes`;
+- refuses writes before violating quota: `max_bytes`/`min_free_bytes` on
+  local, byte and object-count budgets on S3 (no free-space probe exists
+  there);
 - supports cancellation;
-- deletes scope contents on successful completion or terminal failure;
-- cleans abandoned attempts older than the configured age at startup;
-- never follows symlinks out of the configured root;
-- uses restrictive permissions;
+- deletes scope contents on successful completion or terminal failure, on
+  both backends;
+- cleans abandoned attempts older than the configured age at startup
+  (directory scan locally, prefix listing plus lifecycle tags on S3);
+- never follows symlinks out of the configured root (local);
+- refuses a bucket/prefix shared with table data (S3 analogue of the
+  unsafe-broad-path guard);
+- uses restrictive permissions locally and server-side encryption per
+  deployment policy on S3;
+- streams reads on both backends: local sequential reads, S3 range GETs;
+  never a full-object GET of a segment;
 - exposes a test-only deterministic fault injector.
 
 ### Spill segment format
@@ -295,10 +441,25 @@ bytes at every boundary before changing implementation.
 - [ ] Record a baseline JSON artifact with wall time, bytes, peak RSS, tracked
       peak, and failure reason.
 - [ ] Keep the tests ignored or marked as expected failure only until their
-      owning phase turns them green. Add a tracking comment and exact command.
+      owning phase turns them green. Add a tracking comment and the exact
+      command, e.g.
+      `cargo test -p sqe-worker --test zero_pruning_memory -- --ignored`.
+- [ ] Keep every Phase 0 test runnable on a laptop: local temp-dir Parquet
+      plus a `file://` or local object store, no Polaris, no N-times-RAM
+      host. The larger-than-memory illusion comes from the 64 MiB configured
+      limit, not from real RAM exhaustion.
 
-**Gate:** Baselines reliably reproduce cumulative scan reservation growth and
-batch-count queue variability.
+**Gate (all objectively checkable):**
+
+- the zero-pruning scan test fails with a `ResourcesExhausted` error caused
+  by the cumulative fragment reservation (`executor.rs:210`/`executor.rs:327`)
+  once cumulative batch bytes exceed the 64 MiB limit;
+- the wide-batch slow-consumer test records queue-resident bytes exceeding
+  4 times the narrow-batch case at the same 16-batch bound;
+- the unknown-statistics join test asserts the physical plan still contains
+  `HashJoinExec`;
+- the baseline JSON artifact exists and records wall time, bytes, peak RSS,
+  tracked peak, and failure reason for each reproducer.
 
 ---
 
@@ -348,13 +509,25 @@ while keeping resident scan and Flight buffers within configured budgets.
 the batch is removed from the scan queue. Ownership has moved to the encoder,
 not disappeared. Release it after the encoder no longer owns the batch.
 
+**Scope note (two scan paths):** SQE has two scan paths. The
+embedded/coordinator path goes through the vendored `IcebergTableScan` and
+is already byte-admitted by `ScanDecodeGate`
+(`crates/sqe-catalog/src/scan_memory.rs`): per-scan-node decode semaphore
+plus fail-fast `try_grow` pool reservations. Phase 1 targets the worker
+distributed `ScanTask` path (`crates/sqe-worker/src/executor.rs`), which has
+neither. Reuse the `ScanDecodeGate` pattern and keep the two paths from
+double-charging the same bytes when a query crosses both.
+
 **Gate:**
 
 - a scan of at least 20 times the worker memory limit completes;
 - peak tracked scan+Flight bytes stay within budget plus one accounting unit;
 - RSS stays below the documented process headroom;
-- pausing the client stops additional S3/decode work within a bounded window;
-- cancellation returns all byte permits.
+- pausing the client for 30 seconds caps additional fetched-plus-decoded
+  bytes at `scan_budget + flight_budget` plus one in-flight batch; no further
+  S3 GETs are issued once those budgets are full;
+- cancellation returns all byte permits (pool used bytes return to the
+  pre-query value).
 
 ---
 
@@ -394,7 +567,21 @@ pub struct ScanMorsel {
 - [ ] Preserve Iceberg snapshot ID, deletes, projection, predicate, field IDs,
       and credential scope in the signed task.
 - [ ] Version the signed `ScanTask` encoding and reject unsupported versions.
-- [ ] Replace `num_workers * 3` static bins with a larger pending morsel queue.
+- [ ] Replace the `max_bins = num_workers * 3` static binning
+      (`crates/sqe-coordinator/src/query_handler.rs:3103`) with a larger
+      pending morsel queue.
+- [ ] Align with the existing split machinery instead of inventing a second
+      one. The vendored fork already splits large whole-file tasks into
+      byte-range subtasks that resolve to row groups at read time
+      (`TableScanBuilder::with_task_split_target_size`,
+      `vendor/iceberg-rust/crates/iceberg/src/scan/mod.rs:148-155`;
+      `split_file_scan_task` in
+      `vendor/iceberg-rust/crates/iceberg/src/arrow/reader.rs:397-433`), and
+      SQE enables it on the embedded path
+      (`crates/sqe-catalog/src/iceberg_scan.rs:1394`,
+      `DEFAULT_SCAN_SPLIT_TARGET_SIZE`). A `ScanMorsel` may therefore carry a
+      byte range rather than explicit row-group indices; the distributed
+      `ScanTask` ticket is what lacks ranges today.
 - [ ] Start with coordinator push scheduling, then add worker pull/lease if the
       existing Flight protocol makes pull practical.
 - [ ] Limit active morsels from live worker byte pressure, CPU, spill backlog,
@@ -402,15 +589,21 @@ pub struct ScanMorsel {
 - [ ] Retry an individual morsel on another worker using its stable morsel ID.
 - [ ] Deduplicate duplicate attempt output at the coordinator.
 - [ ] Add work-stealing tests with one slow worker and one large file.
-- [ ] Add delete-aware row-group correctness tests. If iceberg-rust cannot
-      safely restrict deletes to a row-group morsel, retain file-level morsels
-      for that table rather than weakening correctness.
+- [ ] Add delete-aware row-group correctness tests. The hedge is confirmed
+      against current code: SQE distributes byte-range splits only for
+      delete-free scans (`use_split_assignment = total_partitions > 1 &&
+      !use_direct && !has_deletes` at
+      `crates/sqe-catalog/src/iceberg_scan.rs:1063`). Preserve that gate: if
+      the fork cannot safely restrict deletes to a sub-file morsel, retain
+      file-level morsels for that table rather than weakening correctness.
 
 **Gate:**
 
 - one multi-gigabyte Parquet file uses multiple workers/cores;
 - each row is returned exactly once under retry;
-- a 10x worker speed imbalance does not create a query-length straggler;
+- with one worker throttled to one tenth speed on a scan of at least 16
+  morsels, query wall time stays within 1.5 times the balanced-cluster run
+  (work stealing moves morsels off the slow worker);
 - memory remains within the Phase 1 bound.
 
 ---
@@ -425,6 +618,10 @@ clean immutable Arrow spill segments under a hard disk quota.
 - Create: `crates/sqe-spill/src/manager.rs`
 - Create: `crates/sqe-spill/src/scope.rs`
 - Create: `crates/sqe-spill/src/segment.rs`
+- Create: `crates/sqe-spill/src/store.rs` (`SegmentStore` trait)
+- Create: `crates/sqe-spill/src/store_local.rs`
+- Create: `crates/sqe-spill/src/store_s3.rs` (may land as its own MR; must
+  land before Phase 8)
 - Create: `crates/sqe-spill/src/format.rs`
 - Create: `crates/sqe-spill/src/quota.rs`
 - Create: `crates/sqe-spill/src/fault.rs`
@@ -432,9 +629,22 @@ clean immutable Arrow spill segments under a hard disk quota.
 - Modify: `crates/sqe-core/src/config.rs`
 - Add unit and integration tests under `crates/sqe-spill/tests/`
 
-- [ ] Implement validated spill-root creation and restrictive permissions.
+- [ ] Define the `SegmentStore` trait and route every manager operation
+      through it. Operator spill and durable exchange share this one
+      abstraction; Phase 8 adds semantics on top, never a second backend
+      interface.
+- [ ] Implement the local backend: validated spill-root creation and
+      restrictive permissions.
+- [ ] Implement the S3 backend on the existing `object_store` client with a
+      dedicated bucket/prefix, dedicated credential, staged-key publish, and
+      range-read streaming. Reject table-vended STS credentials and any
+      prefix shared with table data.
+- [ ] Implement tiered mode: write local first; route to S3 on local quota
+      or free-space pressure, or when no local backend is configured.
 - [ ] Implement query/stage/operator/partition/attempt scopes.
-- [ ] Implement quota reservation before writing.
+- [ ] Implement quota reservation before writing, branched per backend:
+      `max_bytes`/`min_free_bytes` locally, byte plus object-count budgets
+      on S3.
 - [ ] Implement asynchronous IPC segment writer with per-batch and whole-file
       checksums.
 - [ ] Publish through `.partial` plus atomic rename.
@@ -442,26 +652,38 @@ clean immutable Arrow spill segments under a hard disk quota.
 - [ ] Add write/read semaphores and cancellation.
 - [ ] Implement cleanup guards for normal completion, error, panic unwind, and
       process restart.
-- [ ] Add startup orphan cleanup without touching recent/live attempts.
+- [ ] Add startup orphan cleanup without touching recent/live attempts:
+      directory scan locally, prefix listing on S3, plus lifecycle tags so
+      bucket expiry policies reap anything cleanup misses.
 - [ ] Add fault injection: short write, ENOSPC, read error, corruption, slow
-      disk, cancellation, and rename failure.
+      disk, cancellation, and rename failure; for S3 add throttling (429/503),
+      partial upload, and timeout.
+- [ ] Assert in tests that no segment header, footer, or filename embeds a
+      `ScanTask` or any of its S3 credential fields. Scan tickets carry live
+      credentials (`crates/sqe-planner/src/scan_task.rs:36-41`); persisting
+      one to disk is a credential leak.
 - [ ] Add metrics and structured spill lifecycle tracing.
 - [ ] Document capacity planning and Kubernetes ephemeral-volume requirements.
 
-**Gate:**
+**Gate (run once per enabled backend: local, S3 against a local MinIO/RustFS,
+and tiered):**
 
 - round-trip preserves schema, ordering within a segment, rows, and nulls;
 - corruption and truncation fail typed;
-- quota is never exceeded;
-- cancellation leaves no published or partial orphan;
-- reading a segment never loads the whole segment into memory.
+- quota is never exceeded (local bytes/free-space; S3 bytes/object count);
+- cancellation leaves no published or partial orphan on either backend;
+- reading a segment never loads the whole segment into memory; the S3 reader
+  issues range GETs only;
+- a local-only config with no S3 keys and an s3-only config with no
+  `directory` both start and spill; a spill-enabled config with neither
+  backend fails startup with a typed config error.
 
 ---
 
 ## Phase 4: Spillable distributed shuffle
 
 **Outcome:** Exchange at least 10 times aggregate worker RAM completes through
-NVMe spill with bounded receiver memory.
+the configured spill backend with bounded receiver memory.
 
 **Files:**
 
@@ -469,8 +691,14 @@ NVMe spill with bounded receiver memory.
 - Modify: `crates/sqe-worker/src/flight_service.rs`
 - Modify: `crates/sqe-planner/src/shuffle_exec.rs`
 - Modify: `crates/sqe-planner/src/stage_planner.rs`
-- Modify: coordinator distributed stage execution
+- Modify: `crates/sqe-planner/src/distributed_join.rs` and
+  `crates/sqe-planner/src/distributed_sort.rs` (stage orchestration lives in
+  these exec nodes plus `stage_planner.rs`, not in a separate coordinator
+  scheduler module)
 - Add: shuffle spill integration and chaos tests
+
+**Dependency:** requires the Phase 3 `SpillManager`, segment format, and
+fault injector. Do not fork a shuffle-private spill writer.
 
 Replace each `mpsc<RecordBatch>` partition with a stateful buffer:
 
@@ -528,6 +756,13 @@ Cancelled
 - Modify: coordinator plan/profile reporting
 - Add: skew and unknown-statistics tests
 
+**DataFusion 54 reality (verified in the vendored workspace's
+`datafusion-physical-plan-54.0.0` source):** sort-merge join spills its
+buffered state (spill handling across `src/joins/sort_merge_join/`), so the
+5a fallback leans on an existing spill path. The hash join build side has no
+spill path (`src/joins/hash_join/` contains no `SpillManager`), so building
+the Grace/radix join in 5b is warranted, not duplication.
+
 ### Phase 5a: Immediate safe fallback
 
 - [ ] Change unknown build-side statistics from "zero/keep hash" to
@@ -540,9 +775,16 @@ This is deliberately conservative and can ship before the adaptive join.
 
 ### Phase 5b: Grace/radix hash join
 
+**Dependency note:** the negotiating governor ships in Phase 7. Until then,
+"the worker governor" means a fixed per-operator grant carved from
+`operator_budget` via `ByteBudget`. Define the `ReclaimableConsumer` trait in
+`sqe-spill` during this phase so 5b registrations upgrade to negotiated
+grants in Phase 7 without an interface change.
+
 - [ ] Register desired and minimum memory with the worker governor.
 - [ ] Begin in-memory build only under an explicit grant.
-- [ ] At the soft watermark, partition build and probe by unused hash bits.
+- [ ] At the soft watermark (`external_join_soft_limit`), partition build and
+      probe by unused hash bits.
 - [ ] Keep fitting partitions resident and spill only excess partitions.
 - [ ] Join one partition pair at a time and release it immediately.
 - [ ] Recursively repartition a partition that still exceeds its grant.
@@ -578,9 +820,23 @@ This is deliberately conservative and can ship before the adaptive join.
 
 ### External aggregation
 
+**DataFusion 54 reality:** grouped hash aggregation already spills.
+`GroupedHashAggregateStream` carries a `SpillState` with DataFusion's own
+`SpillManager` and merges sorted spill files
+(`datafusion-physical-plan-54.0.0/src/aggregates/row_hash.rs:78-107`). The
+known gap is emission behavior, not absence of spill: DataFusion 53/54's
+partial aggregate cannot emit early under a constant GROUP BY ordering key,
+surfacing raw `ResourcesExhausted` (documented at
+`crates/sqe-core/src/config.rs:507-516`). Order of work: first configure and
+gate DataFusion's existing aggregate spill under the common governor; build
+the radix-partitioned external aggregation below only for the cases where
+the DataFusion path fails its larger-than-memory gate.
+
+- [ ] Run the Phase 6 aggregate gate against DataFusion's built-in spill
+      first and record which cases pass; skip custom work for those cases.
 - [ ] Use small thread/task-local pre-aggregation tables with a fixed grant.
 - [ ] Flush partial tuples into radix-partitioned spill pages/segments when the
-      table reaches its soft watermark.
+      table reaches its soft watermark (`external_aggregate_soft_limit`).
 - [ ] Unpin/release flushed state immediately.
 - [ ] Over-partition so active final partitions fit under concurrent grants.
 - [ ] Combine one partition at a time, emit results, and release it.
@@ -595,6 +851,16 @@ This is deliberately conservative and can ship before the adaptive join.
 ### Sort
 
 - [ ] Verify DataFusion sort run creation is charged to the common governor.
+- [ ] Reproduce and gate the known merge-phase failure: sort-on-write CTAS at
+      SF10 hard-OOMs because merge reservations go through
+      `ExternalSorterMerge` with `can_spill=false` (see
+      `docs/internal/plans/2026-06-21-memory-safety-oom-prevention.md`).
+      DataFusion 54 still splits the consumers this way: the sort consumer
+      is created `.with_can_spill(true)` while the separate
+      `ExternalSorterMerge[{partition_id}]` consumer is not
+      (`datafusion-physical-plan-54.0.0/src/sorts/sort.rs:284-288`). The fix
+      must degrade to a typed error or a capped-fan-in merge, never an OS
+      OOM.
 - [ ] Reserve protected merge buffers before admitting sort work.
 - [ ] Cap merge fan-in and recursively merge when needed.
 - [ ] Account both Arrow input and encoded spill buffers during run creation.
@@ -633,6 +899,15 @@ pub trait ReclaimableConsumer: Send + Sync {
 }
 ```
 
+- [ ] Reconcile with the existing machinery instead of stacking on it. The
+      worker pool is a `FairSpillPool` today
+      (`crates/sqe-worker/src/runtime.rs:41`), and dividing the pool by
+      registered consumers already caused the documented TPC-DS q39 pool/N
+      pathology (`crates/sqe-core/src/config.rs:507-516`). The governor
+      replaces fair division: switch the worker pool to greedy-with-tracking
+      and let the governor own grant arbitration. Coordinator pressure-based
+      admission (`crates/sqe-coordinator/src/memory.rs`) and
+      `query.per_user_memory_budget` stay as the cross-query layer above it.
 - [ ] Register every blocking consumer by query and workload class.
 - [ ] Guarantee minimum viable grants only when total minima fit.
 - [ ] Distribute remaining memory using weighted fair shares.
@@ -657,16 +932,23 @@ resilient multi-TB queries.
 
 **Files:**
 
-- Create: durable exchange object-store backend in `sqe-spill`
-- Modify: stage planner and coordinator query state
+- Modify: `crates/sqe-spill/src/store_s3.rs` (durable-exchange semantics on
+  the existing S3 `SegmentStore` backend from Phase 3)
+- Modify: `crates/sqe-planner/src/stage_planner.rs` and
+  `crates/sqe-coordinator/src/query_tracker.rs` (stage/attempt state)
 - Modify: shuffle writer/reader manifests
-- Modify: credential configuration
+- Modify: credential configuration in `crates/sqe-core/src/config.rs`
 - Add: worker-kill and object-store fault tests
 
-- [ ] Abstract local and object-store segment backends behind one immutable
-      segment interface.
+**Dependency:** the S3 `SegmentStore` backend from Phase 3 is the storage
+layer. Phase 8 adds durable-exchange semantics on top of it: attempt
+manifests, winner commit, and segment reuse. It does not introduce a second
+object-store backend or segment format.
+
+- [ ] Reuse the Phase 3 `SegmentStore` abstraction; extend, never fork it.
 - [ ] Use a dedicated exchange bucket/prefix and credential, not a table-vended
-      credential.
+      credential (this generalizes the Phase 3 S3-spill rule; exchange may use
+      its own prefix under the spill bucket or a separate bucket).
 - [ ] Publish task-attempt manifests atomically after every segment is durable.
 - [ ] Commit one winning attempt per task.
 - [ ] Reuse completed upstream segments on retry.
@@ -738,9 +1020,10 @@ multi-TB workload classes.
 - logical-to-physical compression ratio;
 - write/read duration and throughput;
 - partition count and recursion depth;
-- quota used/free and disk free;
-- checksum, quota, ENOSPC, cleanup, and retry failures;
-- orphan cleanup count/bytes.
+- quota used/free and disk free (local); byte/object budget used and request
+  counts (S3);
+- checksum, quota, ENOSPC, throttling, cleanup, and retry failures;
+- orphan cleanup count/bytes per backend.
 
 ### Scheduling
 
@@ -752,9 +1035,16 @@ multi-TB workload classes.
 
 ## Operational safeguards
 
-- Put spill on dedicated local NVMe or a dedicated Kubernetes ephemeral volume,
-  not the container root filesystem.
-- Alert at spill quota 70/85/95 percent and `min_free_bytes` approach.
+- Put local spill on dedicated NVMe or a dedicated Kubernetes ephemeral
+  volume, not the container root filesystem.
+- Put S3 spill in a dedicated bucket or prefix with a lifecycle expiry
+  policy as the cleanup backstop; never share the warehouse bucket.
+- Prefer local disk for hot, short-lived spill in tiered mode; S3 pays
+  request latency and per-request cost, so it serves overflow, durability,
+  and diskless pods.
+- Alert at spill quota 70/85/95 percent and `min_free_bytes` approach
+  (local), and at byte/object-budget 70/85/95 percent plus sustained 429/503
+  throttling (S3).
 - Protect the worker from pod eviction by including expected ephemeral storage
   requests/limits.
 - Remove spill contents through scope cleanup, never a broad recursive deletion
