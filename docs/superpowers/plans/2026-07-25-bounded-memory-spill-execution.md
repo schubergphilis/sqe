@@ -832,20 +832,20 @@ gate DataFusion's existing aggregate spill under the common governor; build
 the radix-partitioned external aggregation below only for the cases where
 the DataFusion path fails its larger-than-memory gate.
 
-- [ ] Run the Phase 6 aggregate gate against DataFusion's built-in spill
+- [x] Run the Phase 6 aggregate gate against DataFusion's built-in spill
       first and record which cases pass; skip custom work for those cases.
-- [ ] Use small thread/task-local pre-aggregation tables with a fixed grant.
-- [ ] Flush partial tuples into radix-partitioned spill pages/segments when the
+- [x] Use small thread/task-local pre-aggregation tables with a fixed grant.
+- [x] Flush partial tuples into radix-partitioned spill pages/segments when the
       table reaches its soft watermark (`external_aggregate_soft_limit`).
-- [ ] Unpin/release flushed state immediately.
-- [ ] Over-partition so active final partitions fit under concurrent grants.
-- [ ] Combine one partition at a time, emit results, and release it.
-- [ ] Recursively repartition oversized partitions using additional hash bits.
-- [ ] Define supported decomposable aggregate states explicitly.
-- [ ] Route unsupported holistic/variable states to a safe sort-based path or
+- [x] Unpin/release flushed state immediately.
+- [x] Over-partition so active final partitions fit under concurrent grants.
+- [x] Combine one partition at a time, emit results, and release it.
+- [x] Recursively repartition oversized partitions using additional hash bits.
+- [x] Define supported decomposable aggregate states explicitly.
+- [x] Route unsupported holistic/variable states to a safe sort-based path or
       return a typed unsupported-at-this-budget error; never attempt unbounded
       memory.
-- [ ] Test `COUNT`, `SUM`, `MIN/MAX`, `AVG`, distinct, nulls, decimals, strings,
+- [x] Test `COUNT`, `SUM`, `MIN/MAX`, `AVG`, distinct, nulls, decimals, strings,
       and multi-column keys.
 
 ### Sort
