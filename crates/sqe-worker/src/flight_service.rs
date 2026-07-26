@@ -389,6 +389,9 @@ impl FlightService for WorkerFlightService {
         let scan_task = ScanTask::from_bytes(&ticket.ticket).map_err(|e| {
             Status::invalid_argument(format!("Failed to decode ScanTask: {e}"))
         })?;
+        scan_task.validate_version().map_err(|e| {
+            Status::invalid_argument(format!("ScanTask version rejected: {e}"))
+        })?;
 
         let worker_span = info_span!(
             "sqe.worker.scan",
@@ -917,6 +920,12 @@ mod tests {
     /// wire bytes (and so decoding succeeds past the signature gate).
     fn make_scan_task_bytes() -> Vec<u8> {
         sqe_planner::ScanTask {
+            version: 1,
+            morsel_id: None,
+            row_group_start: None,
+            row_group_end: None,
+            start_byte: None,
+            end_byte: None,
             fragment_id: "frag-sig".to_string(),
             data_file_paths: vec!["s3://bucket/f.parquet".to_string()],
             file_sizes_bytes: vec![1024],

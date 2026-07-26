@@ -91,6 +91,12 @@ pub fn local_scan_task(object_keys: Vec<String>, file_sizes: Vec<u64>) -> ScanTa
         .map(|k| format!("s3://test-bucket/{k}"))
         .collect();
     ScanTask {
+            version: 1,
+            morsel_id: None,
+            row_group_start: None,
+            row_group_end: None,
+            start_byte: None,
+            end_byte: None,
         fragment_id: "phase0-frag".to_string(),
         data_file_paths,
         file_sizes_bytes: file_sizes,

@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::scan_morsel::{SCAN_TASK_VERSION_CURRENT, SCAN_TASK_VERSION_V1, SCAN_TASK_VERSION_V2};
+
 /// Lightweight message sent from coordinator to worker describing
 /// which Parquet files to scan and how to access them.
 ///
@@ -7,8 +9,16 @@ use serde::{Deserialize, Serialize};
 /// S3 credentials are included so workers don't need Polaris access.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct ScanTask {
+    /// Ticket encoding version. `1` = whole-file (pre-morsel); `2` = optional
+    /// row-group / byte-range morsel fields. Workers reject unsupported
+    /// versions. Missing field deserializes as v1 for old coordinators.
+    #[serde(default = "default_scan_task_version")]
+    pub version: u32,
     /// Unique identifier for this fragment.
     pub fragment_id: String,
+    /// Optional stable morsel id for retry / dedup (Phase 2).
+    #[serde(default)]
+    pub morsel_id: Option<String>,
     /// S3 URLs of Parquet data files to scan.
     pub data_file_paths: Vec<String>,
     /// Size in bytes per file, parallel to `data_file_paths`.
@@ -16,6 +26,20 @@ pub struct ScanTask {
     /// treat an empty vec as "unknown" and fall back to file-count cost.
     #[serde(default)]
     pub file_sizes_bytes: Vec<u64>,
+    /// Inclusive start row-group for the first file when this task is a
+    /// sub-file morsel. `None` = whole file(s).
+    #[serde(default)]
+    pub row_group_start: Option<u32>,
+    /// Exclusive end row-group for the first file. `None` with a start means
+    /// "through the last group".
+    #[serde(default)]
+    pub row_group_end: Option<u32>,
+    /// Optional compressed byte range start (inclusive) for the first file.
+    #[serde(default)]
+    pub start_byte: Option<u64>,
+    /// Optional compressed byte range end (exclusive) for the first file.
+    #[serde(default)]
+    pub end_byte: Option<u64>,
     /// Column names to project (empty = all columns). Used as a fallback when
     /// the parquet file lacks PARQUET:field_id metadata or when the
     /// coordinator did not supply field IDs.
@@ -66,6 +90,11 @@ pub struct ScanTask {
     pub limit: Option<usize>,
 }
 
+fn default_scan_task_version() -> u32 {
+    // Old tickets without a version field are whole-file (v1).
+    SCAN_TASK_VERSION_V1
+}
+
 impl std::fmt::Debug for ScanTask {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let session_token_display = if self.s3_session_token.is_empty() {
@@ -75,9 +104,13 @@ impl std::fmt::Debug for ScanTask {
         };
         let total_bytes: u64 = self.file_sizes_bytes.iter().sum();
         f.debug_struct("ScanTask")
+            .field("version", &self.version)
             .field("fragment_id", &self.fragment_id)
+            .field("morsel_id", &self.morsel_id)
             .field("data_file_paths", &self.data_file_paths)
             .field("total_bytes", &total_bytes)
+            .field("row_group_start", &self.row_group_start)
+            .field("row_group_end", &self.row_group_end)
             .field("projected_columns", &self.projected_columns)
             .field("s3_endpoint", &self.s3_endpoint)
             .field("s3_region", &self.s3_region)
@@ -102,6 +135,27 @@ impl ScanTask {
     pub fn from_bytes(bytes: &[u8]) -> serde_json::Result<Self> {
         serde_json::from_slice(bytes)
     }
+
+    /// Reject tickets whose version this worker does not understand.
+    pub fn validate_version(&self) -> Result<(), String> {
+        match self.version {
+            SCAN_TASK_VERSION_V1 | SCAN_TASK_VERSION_V2 => Ok(()),
+            other => Err(format!(
+                "unsupported ScanTask version {other}; this worker supports \
+                 {SCAN_TASK_VERSION_V1}..={SCAN_TASK_VERSION_CURRENT}"
+            )),
+        }
+    }
+
+    /// True when this task is restricted to a row-group or byte sub-range of
+    /// the first file (a Phase 2 morsel).
+    pub fn is_morsel(&self) -> bool {
+        self.row_group_start.is_some()
+            || self.row_group_end.is_some()
+            || self.start_byte.is_some()
+            || self.end_byte.is_some()
+            || self.morsel_id.is_some()
+    }
 }
 
 #[cfg(test)]
@@ -111,6 +165,12 @@ mod tests {
     #[test]
     fn test_scan_task_roundtrip() {
         let task = ScanTask {
+            version: SCAN_TASK_VERSION_V1,
+            morsel_id: None,
+            row_group_start: None,
+            row_group_end: None,
+            start_byte: None,
+            end_byte: None,
             fragment_id: "frag-001".to_string(),
             data_file_paths: vec![
                 "s3://bucket/data/file1.parquet".to_string(),
@@ -144,6 +204,12 @@ mod tests {
     #[test]
     fn test_scan_task_empty_projection_means_all_columns() {
         let task = ScanTask {
+            version: SCAN_TASK_VERSION_V1,
+            morsel_id: None,
+            row_group_start: None,
+            row_group_end: None,
+            start_byte: None,
+            end_byte: None,
             fragment_id: "frag-002".to_string(),
             data_file_paths: vec!["s3://bucket/data/file1.parquet".to_string()],
             file_sizes_bytes: vec![],
@@ -193,6 +259,12 @@ mod tests {
     #[test]
     fn test_debug_redacts_credentials() {
         let task = ScanTask {
+            version: SCAN_TASK_VERSION_V1,
+            morsel_id: None,
+            row_group_start: None,
+            row_group_end: None,
+            start_byte: None,
+            end_byte: None,
             fragment_id: "frag-001".to_string(),
             data_file_paths: vec![],
             file_sizes_bytes: vec![],
@@ -222,6 +294,12 @@ mod tests {
         // backs the Flight ticket.
         let predicate_bytes = vec![1u8, 2, 3, 4, 5];
         let task = ScanTask {
+            version: SCAN_TASK_VERSION_V1,
+            morsel_id: None,
+            row_group_start: None,
+            row_group_end: None,
+            start_byte: None,
+            end_byte: None,
             fragment_id: "frag-pred".to_string(),
             data_file_paths: vec!["s3://bucket/data/file1.parquet".to_string()],
             file_sizes_bytes: vec![1024],

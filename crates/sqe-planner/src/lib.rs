@@ -3,6 +3,7 @@ pub mod distributed_join;
 pub mod distributed_sort;
 pub mod join_strategy;
 pub mod predicate_transfer;
+pub mod scan_morsel;
 pub mod scan_task;
 pub mod shuffle_exec;
 pub mod single_distinct_count;
@@ -30,6 +31,7 @@ pub use predicate_transfer::{
     build_predicate_transfer, extract_distinct_from_batches, extract_distinct_values,
     PredicateTransfer, MAX_PREDICATE_TRANSFER_VALUES,
 };
+pub use scan_morsel::{group_row_groups_into_morsels, ScanMorsel, RowGroupSlice, SCAN_TASK_VERSION_CURRENT, SCAN_TASK_VERSION_V1, SCAN_TASK_VERSION_V2, DEFAULT_MORSEL_TARGET_BYTES, DEFAULT_MORSEL_MAX_BYTES};
 pub use scan_task::ScanTask;
 pub use shuffle_exec::{ShufflePartitioning, ShuffleReaderExec, ShuffleWriterExec};
 pub use single_distinct_count::SingleDistinctCountCompanionRule;

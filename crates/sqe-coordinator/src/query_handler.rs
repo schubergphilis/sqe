@@ -3095,12 +3095,14 @@ impl QueryHandler {
 
         // 7. Split (path, size) pairs into size-balanced bins using bin-packing.
         // target_size_bytes: read from config or fall back to 256 MiB.
-        // max_bins: allow up to 3 tasks per worker so work is evenly spread
-        // even when file sizes vary widely.
+        // max_bins: Phase 2 raises the pending-task queue well above the old
+        // `num_workers * 3` static binning so morsel-scale work can pile up
+        // for work stealing / wave scheduling. Cap at a generous multiple of
+        // the worker count rather than the file count alone.
         let target_size_bytes = sqe_core::parse_memory_limit(
             &self.config.query.target_task_size
         ).unwrap_or(256 * 1024 * 1024) as u64;
-        let max_bins = num_workers * 3;
+        let max_bins = (num_workers * 32).max(num_workers * 3).max(1);
         let file_groups = sqe_planner::bin_pack_files(file_info, target_size_bytes, max_bins);
 
         // 8. Build ScanTasks — paths and sizes are parallel vecs within each group
@@ -3112,6 +3114,12 @@ impl QueryHandler {
                 let (data_file_paths, file_sizes_bytes): (Vec<String>, Vec<u64>) =
                     group.into_iter().unzip();
                 sqe_planner::ScanTask {
+            version: 1,
+            morsel_id: None,
+            row_group_start: None,
+            row_group_end: None,
+            start_byte: None,
+            end_byte: None,
                     fragment_id: uuid::Uuid::now_v7().to_string(),
                     data_file_paths,
                     file_sizes_bytes,
