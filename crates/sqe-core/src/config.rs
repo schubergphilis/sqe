@@ -4698,8 +4698,14 @@ fn validate_byte_sizes(config: &SqeConfig, errors: &mut Vec<String>) {
     // Spill directory: single root. Fail if both spill_dir and spill.directory
     // are set to different non-empty paths.
     let spill = &config.worker.spill;
+    // `spill_dir` carries a serde default (`default_spill_dir()`), so it is
+    // never empty. Treat that default as "unset" so a user who sets only the
+    // preferred `spill.directory` does not trip a false conflict against the
+    // legacy alias's default and fail startup. Only a genuine, explicit dual
+    // set to different non-default paths is a real conflict.
     if !spill.directory.is_empty()
         && !config.worker.spill_dir.is_empty()
+        && config.worker.spill_dir != default_spill_dir()
         && spill.directory != config.worker.spill_dir
     {
         errors.push(format!(
@@ -7717,6 +7723,36 @@ otlp_endpoint = ""
         config.query.per_user_memory_budget = "0".to_string();
         // "0" disables the gate, so the size relationship is irrelevant.
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_spill_directory_without_touching_legacy_alias() {
+        // The recommended single-field config: set only worker.spill.directory
+        // and leave the legacy worker.spill_dir at its serde default. Because
+        // the default is non-empty, an earlier version of the conflict check
+        // failed startup here. It must pass.
+        let mut config = valid_config();
+        config.worker.spill.directory = "/mnt/nvme/sqe-spill".to_string();
+        // spill_dir left at default_spill_dir() ("/tmp/sqe-spill").
+        assert_eq!(config.worker.spill_dir, default_spill_dir());
+        assert!(
+            config.validate().is_ok(),
+            "single-field spill.directory must not conflict with the default alias: {:?}",
+            config.validate()
+        );
+    }
+
+    #[test]
+    fn validate_rejects_conflicting_explicit_spill_dirs() {
+        // Both explicitly set to different non-default paths is a real conflict.
+        let mut config = valid_config();
+        config.worker.spill.directory = "/mnt/a/sqe-spill".to_string();
+        config.worker.spill_dir = "/mnt/b/sqe-spill".to_string();
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("worker.spill.directory") && err.contains("worker.spill_dir"),
+            "expected dual-set spill-dir conflict, got: {err}"
+        );
     }
 
     #[test]
