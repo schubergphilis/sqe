@@ -781,20 +781,20 @@ This is deliberately conservative and can ship before the adaptive join.
 `sqe-spill` during this phase so 5b registrations upgrade to negotiated
 grants in Phase 7 without an interface change.
 
-- [ ] Register desired and minimum memory with the worker governor.
-- [ ] Begin in-memory build only under an explicit grant.
-- [ ] At the soft watermark (`external_join_soft_limit`), partition build and
+- [x] Register desired and minimum memory with the worker governor.
+- [x] Begin in-memory build only under an explicit grant.
+- [x] At the soft watermark (`external_join_soft_limit`), partition build and
       probe by unused hash bits.
-- [ ] Keep fitting partitions resident and spill only excess partitions.
-- [ ] Join one partition pair at a time and release it immediately.
-- [ ] Recursively repartition a partition that still exceeds its grant.
-- [ ] Detect heavy hitters/skew and isolate them rather than recursively hashing
+- [x] Keep fitting partitions resident and spill only excess partitions.
+- [x] Join one partition pair at a time and release it immediately.
+- [x] Recursively repartition a partition that still exceeds its grant.
+- [x] Detect heavy hitters/skew and isolate them rather than recursively hashing
       forever.
-- [ ] Cap recursion and fall back to sort-merge for pathological partitions.
-- [ ] Support inner/semi/anti first; add outer joins only with explicit matched
+- [x] Cap recursion and fall back to sort-merge for pathological partitions.
+- [x] Support inner/semi/anti first; add outer joins only with explicit matched
       state and correctness tests.
 - [ ] Preserve null-equality and join-filter semantics.
-- [ ] Profile chosen strategy, estimate, observed build bytes, partitions,
+- [x] Profile chosen strategy, estimate, observed build bytes, partitions,
       recursion depth, skew, and spill.
 
 **Gate:**
