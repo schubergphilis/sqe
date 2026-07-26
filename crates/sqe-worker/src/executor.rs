@@ -1,5 +1,7 @@
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
@@ -10,14 +12,14 @@ use datafusion::physical_expr::create_physical_expr;
 use datafusion::physical_plan::PhysicalExpr;
 use datafusion::prelude::SessionContext;
 use datafusion_proto::bytes::Serializeable;
+use futures::{Stream, StreamExt, TryStreamExt};
 use object_store::aws::AmazonS3Builder;
-use object_store::{ObjectStore, ObjectStoreExt};
 use object_store::path::Path as ObjectPath;
+use object_store::{ObjectStore, ObjectStoreExt};
 use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
 use parquet::arrow::async_reader::ParquetObjectReader;
 use parquet::arrow::ParquetRecordBatchStreamBuilder;
 use parquet::file::metadata::ParquetMetaData;
-use futures::{Stream, StreamExt, TryStreamExt};
 use sqe_catalog::late_materialize;
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, info, warn};
@@ -33,6 +35,14 @@ use crate::credential_channel::RefreshableCredentials;
 pub type ScanBatchStream =
     Pin<Box<dyn Stream<Item = anyhow::Result<RecordBatch>> + Send + 'static>>;
 
+/// Secondary item-count bound on the scan mpsc channel.
+///
+/// Phase 0 documents that a batch-count bound does **not** bound resident
+/// bytes (wide Utf8 batches make the same 16 slots hold vastly different
+/// footprints). Phase 1 replaces this with a byte-admitted channel and keeps
+/// a small item cap only as a scheduling guard.
+pub const SCAN_CHANNEL_ITEM_CAPACITY: usize = 16;
+
 /// Per-file Parquet batch stream returned by [`open_parquet_stream`].
 type ParquetBatchStream =
     Pin<Box<dyn Stream<Item = Result<RecordBatch, parquet::errors::ParquetError>> + Send>>;
@@ -42,6 +52,40 @@ type OpenedParquet = anyhow::Result<(ParquetBatchStream, SchemaRef, u64)>;
 
 /// A boxed, in-flight open of one Parquet file (#234 depth-1 prefetch).
 type PendingOpen = Pin<Box<dyn std::future::Future<Output = OpenedParquet> + Send>>;
+
+/// Wraps the scan mpsc receiver so queue-resident bytes are decremented when
+/// the consumer takes a batch. The producer increments the same counter before
+/// `send`. Phase 0 surfaces the gauge; Phase 1 pairs it with true ownership
+/// permits that move with the batch into the Flight encoder.
+struct QueueTrackedScanStream {
+    inner: tokio_stream::wrappers::ReceiverStream<anyhow::Result<RecordBatch>>,
+    queue_bytes: Arc<AtomicUsize>,
+    metrics: Option<Arc<WorkerMetricsRegistry>>,
+}
+
+impl Stream for QueueTrackedScanStream {
+    type Item = anyhow::Result<RecordBatch>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        match Pin::new(&mut self.inner).poll_next(cx) {
+            Poll::Ready(Some(Ok(batch))) => {
+                let sz = batch.get_array_memory_size();
+                // Saturating decrement: metrics must never wrap on desync.
+                let _ = self.queue_bytes.fetch_update(
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                    |cur| Some(cur.saturating_sub(sz)),
+                );
+                if let Some(ref m) = self.metrics {
+                    m.scan_queue_resident_bytes
+                        .set(self.queue_bytes.load(Ordering::Relaxed) as f64);
+                }
+                Poll::Ready(Some(Ok(batch)))
+            }
+            other => other,
+        }
+    }
+}
 
 
 /// Decode the coordinator's pushed-down predicate (#233) from its serialized
@@ -126,6 +170,10 @@ fn build_physical_predicate(
 /// the schema before the result stream is polled. A background task chains
 /// the per-file streams into an mpsc channel; if the consumer drops the
 /// returned stream, the channel closes and the task exits.
+///
+/// Builds an S3 [`ObjectStore`] from the task's credentials. Prefer
+/// [`execute_scan_streaming_with_store`] for local-filesystem or in-memory
+/// tests that must not depend on S3/MinIO.
 pub async fn execute_scan_streaming(
     task: ScanTask,
     metrics: Option<Arc<WorkerMetricsRegistry>>,
@@ -137,9 +185,54 @@ pub async fn execute_scan_streaming(
     if task.data_file_paths.is_empty() {
         anyhow::bail!("ScanTask has no data files");
     }
+    let store: Arc<dyn ObjectStore> = Arc::new(build_object_store_with_creds(
+        &task,
+        &task.s3_access_key,
+        &task.s3_secret_key,
+        &task.s3_session_token,
+    )?);
+    execute_scan_streaming_with_store(
+        task,
+        metrics,
+        session_ctx,
+        store,
+        credential_rx,
+        footer_cache,
+        coordinator_metrics,
+        true, // allow credential-driven store rebuild
+    )
+    .await
+}
+
+/// Like [`execute_scan_streaming`], but uses a caller-supplied [`ObjectStore`].
+///
+/// Used by Phase 0 memory-safety reproducers to drive the distributed scan
+/// path against a local temp-dir Parquet fixture (`LocalFileSystem` or
+/// `InMemory`) without S3, Polaris, or N-times-RAM hosts.
+///
+/// When `allow_credential_refresh` is `false`, the store is fixed for the
+/// lifetime of the scan (correct for local/in-memory fixtures).
+#[allow(clippy::too_many_arguments)]
+pub async fn execute_scan_streaming_with_store(
+    task: ScanTask,
+    metrics: Option<Arc<WorkerMetricsRegistry>>,
+    session_ctx: SessionContext,
+    initial_store: Arc<dyn ObjectStore>,
+    credential_rx: Option<watch::Receiver<Option<RefreshableCredentials>>>,
+    footer_cache: Option<Arc<FooterCache>>,
+    coordinator_metrics: Option<Arc<MetricsRegistry>>,
+    allow_credential_refresh: bool,
+) -> anyhow::Result<(SchemaRef, ScanBatchStream)> {
+    if task.data_file_paths.is_empty() {
+        anyhow::bail!("ScanTask has no data files");
+    }
 
     let start = std::time::Instant::now();
     let pool = session_ctx.runtime_env().memory_pool.clone();
+    // Phase 0 unsafe boundary: one MemoryConsumer per fragment, grown on every
+    // emitted batch, never shrunk until the producer task drops. Cumulative
+    // output larger than worker.memory_limit fails with ResourcesExhausted even
+    // when actual resident bytes are tiny (see zero_pruning_memory tests).
     let consumer = MemoryConsumer::new(format!("scan:{}", task.fragment_id));
     let reservation = consumer.register(&pool);
 
@@ -155,12 +248,6 @@ pub async fn execute_scan_streaming(
     // Open the first file synchronously so we know the schema before
     // returning the stream.
     let first_path = task.data_file_paths[0].clone();
-    let initial_store: Arc<dyn ObjectStore> = Arc::new(build_object_store_with_creds(
-        &task,
-        &task.s3_access_key,
-        &task.s3_secret_key,
-        &task.s3_session_token,
-    )?);
 
     let (mut first_stream, first_schema, first_bytes) = open_parquet_stream(
         &task,
@@ -173,8 +260,16 @@ pub async fn execute_scan_streaming(
     )
     .await?;
 
+    // Charge the compressed file size as fetch-resident while the file is
+    // open. Phase 1 will shrink this when the fetch buffer is released; Phase 0
+    // only surfaces the gauge for the red-gate baseline.
+    if let Some(ref m) = metrics {
+        m.scan_fetch_resident_bytes.set(first_bytes as f64);
+    }
+
     let (tx, rx) =
-        mpsc::channel::<anyhow::Result<RecordBatch>>(16);
+        mpsc::channel::<anyhow::Result<RecordBatch>>(SCAN_CHANNEL_ITEM_CAPACITY);
+    let queue_bytes = Arc::new(AtomicUsize::new(0));
 
     // Share the task and the per-file open inputs by Arc so each prefetch
     // future (below) can own its inputs without borrowing producer locals.
@@ -186,6 +281,7 @@ pub async fn execute_scan_streaming(
     let predicate_clone = predicate.clone();
     let session_ctx_clone = session_ctx.clone();
     let credential_rx_clone = credential_rx.clone();
+    let queue_bytes_producer = queue_bytes.clone();
 
     tokio::spawn(async move {
         let task = task_for_producer;
@@ -195,10 +291,55 @@ pub async fn execute_scan_streaming(
         let predicate = predicate_clone;
         let _session_ctx = session_ctx_clone;
         let credential_rx = credential_rx_clone;
+        let queue_bytes = queue_bytes_producer;
 
         let initial_store: Arc<dyn ObjectStore> = initial_store;
         let mut total_rows: usize = 0;
         let mut total_bytes: u64 = first_bytes;
+
+        /// Charge one decoded batch against the fragment reservation and the
+        /// queue-resident gauge, then send it. Returns `false` if the consumer
+        /// dropped the channel (producer should exit).
+        async fn emit_batch(
+            tx: &mpsc::Sender<anyhow::Result<RecordBatch>>,
+            reservation: &datafusion::execution::memory_pool::MemoryReservation,
+            queue_bytes: &AtomicUsize,
+            metrics: &Option<Arc<WorkerMetricsRegistry>>,
+            batch: RecordBatch,
+        ) -> bool {
+            let batch_bytes = batch.get_array_memory_size();
+            if let Err(e) = reservation.try_grow(batch_bytes) {
+                let _ = tx.send(Err(anyhow::Error::new(e))).await;
+                return false;
+            }
+            if let Some(m) = metrics {
+                // Phase 0: reservation is cumulative (never shrinks), so this
+                // gauge grows with bytes processed, not true residency.
+                m.scan_decode_resident_bytes
+                    .set(reservation.size() as f64);
+            }
+            // Track queue occupancy before send so a full channel still reports
+            // the bytes it holds once send completes (or while blocked).
+            queue_bytes.fetch_add(batch_bytes, Ordering::Relaxed);
+            if let Some(m) = metrics {
+                m.scan_queue_resident_bytes
+                    .set(queue_bytes.load(Ordering::Relaxed) as f64);
+            }
+            if tx.send(Ok(batch)).await.is_err() {
+                // Consumer dropped: reverse the queue charge for the unsent batch.
+                let _ = queue_bytes.fetch_update(
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                    |cur| Some(cur.saturating_sub(batch_bytes)),
+                );
+                if let Some(m) = metrics {
+                    m.scan_queue_resident_bytes
+                        .set(queue_bytes.load(Ordering::Relaxed) as f64);
+                }
+                return false;
+            }
+            true
+        }
 
         // Drain the first file's batches.
         let mut first_file_bytes: usize = 0;
@@ -207,11 +348,7 @@ pub async fn execute_scan_streaming(
                 Ok(batch) => {
                     total_rows += batch.num_rows();
                     first_file_bytes += batch.get_array_memory_size();
-                    if let Err(e) = reservation.try_grow(batch.get_array_memory_size()) {
-                        let _ = tx.send(Err(anyhow::Error::new(e))).await;
-                        return;
-                    }
-                    if tx.send(Ok(batch)).await.is_err() {
+                    if !emit_batch(&tx, &reservation, &queue_bytes, &metrics, batch).await {
                         return;
                     }
                 }
@@ -239,9 +376,13 @@ pub async fn execute_scan_streaming(
         // current file's batches drain into the channel, the next file's footer
         // is already being fetched. Credentials and the object store advance
         // sequentially (single owner of `credential_rx`, best-effort as before).
-        // The mpsc(16) backpressure bounds in-flight memory.
+        // The mpsc item-capacity backpressure bounds *count*, not bytes.
         let mut store: Arc<dyn ObjectStore> = initial_store;
-        let mut credential_rx = credential_rx;
+        let mut credential_rx = if allow_credential_refresh {
+            credential_rx
+        } else {
+            None
+        };
         let mut idx = 1usize; // file 0 was opened synchronously above
 
         // Helper closure to build the open future for file `idx` using the
@@ -287,6 +428,11 @@ pub async fn execute_scan_streaming(
                 }
             };
             total_bytes += bytes;
+            if let Some(ref m) = metrics {
+                // Approximate: last opened file's compressed size. Phase 1
+                // tracks per-fetch buffers precisely.
+                m.scan_fetch_resident_bytes.set(bytes as f64);
+            }
 
             // Advance credentials, then kick off the NEXT file's open so its
             // footer fetch overlaps with this file's drain below.
@@ -324,11 +470,7 @@ pub async fn execute_scan_streaming(
                 match batch_res {
                     Ok(batch) => {
                         total_rows += batch.num_rows();
-                        if let Err(e) = reservation.try_grow(batch.get_array_memory_size()) {
-                            let _ = tx.send(Err(anyhow::Error::new(e))).await;
-                            return;
-                        }
-                        if tx.send(Ok(batch)).await.is_err() {
+                        if !emit_batch(&tx, &reservation, &queue_bytes, &metrics, batch).await {
                             return;
                         }
                     }
@@ -367,11 +509,15 @@ pub async fn execute_scan_streaming(
             m.rows_scanned.inc_by(total_rows as f64);
             m.bytes_read.inc_by(total_bytes as f64);
             m.fragment_duration.observe(elapsed.as_secs_f64());
+            m.scan_fetch_resident_bytes.set(0.0);
         }
     });
 
-    let out_stream: ScanBatchStream =
-        Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx));
+    let out_stream: ScanBatchStream = Box::pin(QueueTrackedScanStream {
+        inner: tokio_stream::wrappers::ReceiverStream::new(rx),
+        queue_bytes,
+        metrics,
+    });
     Ok((first_schema, out_stream))
 }
 

@@ -418,33 +418,33 @@ bytes at every boundary before changing implementation.
 - Modify: `crates/sqe-metrics/src/lib.rs` or the existing worker metric modules
 - Modify: benchmark harness files under `crates/sqe-bench/`
 
-- [ ] Add a generated Parquet fixture that is at least 20 times the configured
+- [x] Add a generated Parquet fixture that is at least 20 times the configured
       worker memory limit without requiring a 20-times-RAM test host. Generate
       it incrementally in a temporary directory.
-- [ ] Add a no-filter, no-pruning projected scan test with a 64 MiB worker
+- [x] Add a no-filter, no-pruning projected scan test with a 64 MiB worker
       memory limit.
-- [ ] Add a slow Flight consumer test that pauses between batches and records
+- [x] Add a slow Flight consumer test that pauses between batches and records
       peak tracked bytes/RSS.
-- [ ] Add a wide-variable-length batch test so batch-count bounds visibly fail
+- [x] Add a wide-variable-length batch test so batch-count bounds visibly fail
       to bound bytes.
-- [ ] Add a shuffle test whose input is at least 10 times the configured
+- [x] Add a shuffle test whose input is at least 10 times the configured
       shuffle memory budget.
-- [ ] Add an unknown-statistics join plan test proving the current plan keeps
+- [x] Add an unknown-statistics join plan test proving the current plan keeps
       `HashJoinExec`.
-- [ ] Add metrics:
+- [x] Add metrics:
       `scan_fetch_resident_bytes`, `scan_decode_resident_bytes`,
       `scan_queue_resident_bytes`, `flight_encode_resident_bytes`,
       `flight_inflight_bytes`, `shuffle_resident_bytes`,
       `operator_resident_bytes`, `spill_bytes_written`,
       `spill_bytes_read`, `spill_files`, `spill_failures`,
       and `memory_backpressure_seconds`.
-- [ ] Record a baseline JSON artifact with wall time, bytes, peak RSS, tracked
+- [x] Record a baseline JSON artifact with wall time, bytes, peak RSS, tracked
       peak, and failure reason.
-- [ ] Keep the tests ignored or marked as expected failure only until their
+- [x] Keep the tests ignored or marked as expected failure only until their
       owning phase turns them green. Add a tracking comment and the exact
       command, e.g.
       `cargo test -p sqe-worker --test zero_pruning_memory -- --ignored`.
-- [ ] Keep every Phase 0 test runnable on a laptop: local temp-dir Parquet
+- [x] Keep every Phase 0 test runnable on a laptop: local temp-dir Parquet
       plus a `file://` or local object store, no Polaris, no N-times-RAM
       host. The larger-than-memory illusion comes from the 64 MiB configured
       limit, not from real RAM exhaustion.
