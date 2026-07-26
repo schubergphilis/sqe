@@ -496,9 +496,18 @@ mod tests {
         RecordBatch::try_new(schema(), vec![Arc::new(Int64Array::from(vals))]).unwrap()
     }
 
+    /// Serialises spill I/O tests so the process-global fault injector cannot
+    /// poison parallel test runs. Keep the returned guard alive for the whole
+    /// test body.
     async fn setup(
         soft_budget: usize,
-    ) -> (Arc<SpillManager>, ByteBudget, tempfile::TempDir) {
+    ) -> (
+        Arc<SpillManager>,
+        ByteBudget,
+        tempfile::TempDir,
+        std::sync::MutexGuard<'static, ()>,
+    ) {
+        let guard = sqe_spill::serial_test_guard();
         let tmp = tempfile::tempdir().unwrap();
         let store = Arc::new(
             LocalSegmentStore::open(tmp.path(), 1 << 30, 0, 4, 4).unwrap(),
@@ -509,13 +518,13 @@ mod tests {
         ));
         let pool = Arc::new(FairSpillPool::new(soft_budget.max(1024 * 1024)));
         let budget = ByteBudget::new("shuffle-part", soft_budget, Some(pool));
-        (manager, budget, tmp)
+        (manager, budget, tmp, guard)
     }
 
     #[tokio::test]
     async fn spills_at_soft_watermark_and_roundtrips() {
         // Tiny budget forces spill after a few batches.
-        let (manager, budget, _tmp) = setup(64 * 1024).await;
+        let (manager, budget, _tmp, _serial) = setup(64 * 1024).await;
         let scope = SpillScope::new("q-spill", "stage0", "shuffle", 0, 0);
         let mut buf = SpillablePartitionBuffer::new(
             manager,
@@ -551,7 +560,7 @@ mod tests {
     async fn ten_x_budget_completes_via_spill() {
         // 256 KiB budget; append ~3 MiB of batches (≈12x).
         let budget_bytes = 256 * 1024;
-        let (manager, budget, _tmp) = setup(budget_bytes).await;
+        let (manager, budget, _tmp, _serial) = setup(budget_bytes).await;
         let scope = SpillScope::new("q-10x", "s", "sh", 0, 0);
         let mut buf =
             SpillablePartitionBuffer::new(manager, scope, schema(), budget, None);
@@ -585,7 +594,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancel_releases_memory() {
-        let (manager, budget, _tmp) = setup(1024 * 1024).await;
+        let (manager, budget, _tmp, _serial) = setup(1024 * 1024).await;
         let scope = SpillScope::new("q-cancel", "s", "sh", 0, 0);
         let mut buf =
             SpillablePartitionBuffer::new(manager, scope, schema(), budget.clone(), None);
@@ -601,7 +610,7 @@ mod tests {
     #[tokio::test]
     async fn drain_stream_yields_all_rows_and_cleans_up() {
         let budget_bytes = 64 * 1024;
-        let (manager, budget, tmp) = setup(budget_bytes).await;
+        let (manager, budget, tmp, _serial) = setup(budget_bytes).await;
         let scope = SpillScope::new("q-drain", "s", "sh", 0, 0);
         let mut buf =
             SpillablePartitionBuffer::new(manager.clone(), scope.clone(), schema(), budget, None);
@@ -639,7 +648,7 @@ mod tests {
     /// Mirrors DoExchange spill intake: append under budget, finish, stream.
     #[tokio::test]
     async fn cancel_after_spill_drops_resident_and_blocks_drain() {
-        let (manager, budget, tmp) = setup(32 * 1024).await;
+        let (manager, budget, tmp, _serial) = setup(32 * 1024).await;
         let scope = SpillScope::new("q-cancel-spill", "s", "sh", 0, 0);
         let mut buf =
             SpillablePartitionBuffer::new(manager, scope.clone(), schema(), budget.clone(), None);
@@ -671,9 +680,131 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn chaos_disk_full_fails_only_affected_partition() {
+        use sqe_spill::{install_faults, SpillFault};
+        let (manager, budget, _tmp, _serial) = setup(64 * 1024).await;
+        // Healthy partition first.
+        let scope_ok = SpillScope::new("q-chaos", "s", "sh", 0, 0);
+        let mut ok =
+            SpillablePartitionBuffer::new(manager.clone(), scope_ok, schema(), budget.clone(), None);
+        ok.append(batch(0, 10)).await.unwrap();
+        let m = ok.finish().await.unwrap();
+        assert_eq!(m.rows, 10);
+        ok.cleanup().await.unwrap();
+
+        // Inject disk-full on the next spill write path.
+        install_faults(vec![SpillFault::DiskFull]);
+        let scope_bad = SpillScope::new("q-chaos", "s", "sh", 1, 0);
+        // Fresh budget so this partition is independent.
+        let pool = Arc::new(FairSpillPool::new(1024 * 1024));
+        let budget_bad = ByteBudget::new("bad", 8 * 1024, Some(pool));
+        let mut bad = SpillablePartitionBuffer::new(
+            manager.clone(),
+            scope_bad,
+            schema(),
+            budget_bad,
+            None,
+        );
+        // Force spill by filling past soft watermark with many small batches.
+        let mut saw_err = false;
+        for i in 0..200 {
+            match bad.append(batch(i * 100, 128)).await {
+                Ok(()) => {}
+                Err(e) => {
+                    saw_err = true;
+                    let msg = e.to_string();
+                    assert!(
+                        msg.contains("disk")
+                            || msg.contains("SpillDiskFull")
+                            || msg.contains("spill")
+                            || msg.contains("quota")
+                            || msg.contains("full")
+                            || msg.contains("free-space")
+                            || msg.contains("available"),
+                        "unexpected error: {msg}"
+                    );
+                    bad.fail(msg);
+                    break;
+                }
+            }
+        }
+        // If soft watermark never hit (tiny data), force spill.
+        if !saw_err {
+            let err = bad.spill_memory().await;
+            assert!(err.is_err(), "expected disk-full on forced spill");
+            bad.fail(err.unwrap_err().to_string());
+            saw_err = true;
+        }
+        assert!(saw_err);
+        // Dropping the failed buffer must not panic; guard cleans scope.
+        drop(bad);
+    }
+
+    #[tokio::test]
+    async fn chaos_corrupt_segment_fails_drain() {
+        use sqe_spill::{install_faults, SpillFault};
+        let (manager, budget, _tmp, _serial) = setup(16 * 1024).await;
+        let scope = SpillScope::new("q-corr", "s", "sh", 0, 0);
+        let mut buf =
+            SpillablePartitionBuffer::new(manager, scope, schema(), budget, None);
+        for i in 0..30 {
+            buf.append(batch(i * 500, 256)).await.unwrap();
+        }
+        let _ = buf.finish().await.unwrap();
+        install_faults(vec![SpillFault::CorruptOnRead]);
+        let mut drain = buf.into_drain_stream().await.unwrap();
+        let mut saw_err = false;
+        while let Some(item) = drain.next().await {
+            if item.is_err() {
+                saw_err = true;
+                break;
+            }
+        }
+        assert!(saw_err, "corrupt segment must surface on drain");
+    }
+
+    #[tokio::test]
+    async fn chaos_duplicate_attempt_rejected_by_gate() {
+        use crate::shuffle::AttemptGate;
+        let gate = AttemptGate::new();
+        assert!(gate.admit("q", "s", 0, 1).await);
+        // Older attempt loses.
+        assert!(!gate.admit("q", "s", 0, 0).await);
+        // Same winner still ok.
+        assert!(gate.admit("q", "s", 0, 1).await);
+        // Newer supersedes.
+        assert!(gate.admit("q", "s", 0, 2).await);
+        assert!(!gate.admit("q", "s", 0, 1).await);
+    }
+
+    #[tokio::test]
+    async fn chaos_drop_buffer_mid_intake_cleans_scope() {
+        let (manager, budget, tmp, _serial) = setup(32 * 1024).await;
+        let scope = SpillScope::new("q-drop", "s", "sh", 0, 0);
+        let scope_dir = tmp.path().join(scope.relative_dir());
+        {
+            let mut buf =
+                SpillablePartitionBuffer::new(manager, scope.clone(), schema(), budget, None);
+            for i in 0..20 {
+                buf.append(batch(i * 1000, 256)).await.unwrap();
+            }
+            // Simulate worker shutdown: drop without finish/cleanup.
+            drop(buf);
+        }
+        tokio::task::yield_now().await;
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        assert!(
+            !scope_dir.exists(),
+            "scope guard must clean on drop: {}",
+            scope_dir.display()
+        );
+    }
+
+    #[tokio::test]
     async fn concurrent_producers_slow_consumer() {
         // Four partitions append concurrently under a shared-style budget each;
         // a slow drain of each partition still sees full row counts.
+        let _serial = sqe_spill::serial_test_guard();
         let budget_bytes = 128 * 1024;
         let tmp = tempfile::tempdir().unwrap();
         let store = Arc::new(
@@ -727,7 +858,7 @@ mod tests {
     #[tokio::test]
     async fn do_exchange_style_ten_x_intake_stays_bounded() {
         let budget_bytes = 256 * 1024;
-        let (manager, budget, _tmp) = setup(budget_bytes).await;
+        let (manager, budget, _tmp, _serial) = setup(budget_bytes).await;
         let scope = SpillScope::new("q-dx", "stage0", "do_exchange", 0, 1);
         let mut buf =
             SpillablePartitionBuffer::new(manager, scope, schema(), budget, None);

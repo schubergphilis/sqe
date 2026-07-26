@@ -727,10 +727,10 @@ Cancelled
       bytes, and checksums.
 - [x] Reject late data from a losing/obsolete task attempt.
 - [x] Propagate downstream cancellation to DoExchange intake and spill writers.
-- [ ] Protect spill-read/merge headroom from scan and shuffle writers.
+- [x] Protect spill-read/merge headroom from scan and shuffle writers.
 - [x] Expose per-partition skew, resident bytes, spill bytes, and blocked time.
 - [x] Test multiple concurrent producers and one slow consumer.
-- [ ] Test worker shutdown, disk-full, corrupted segment, duplicate attempt,
+- [x] Test worker shutdown, disk-full, corrupted segment, duplicate attempt,
       and cancellation.
 
 **Gate:**
