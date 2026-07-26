@@ -670,6 +670,37 @@ async fn open_parquet_stream(
         }
     }
 
+    // Phase 2 morsel: restrict to a row-group range when the ticket carries one.
+    // Indices are inclusive start / exclusive end on the first file only.
+    if task.row_group_start.is_some() || task.row_group_end.is_some() {
+        let meta = builder.metadata();
+        let n_groups = meta.num_row_groups();
+        let start = task.row_group_start.unwrap_or(0) as usize;
+        let end = task
+            .row_group_end
+            .map(|e| e as usize)
+            .unwrap_or(n_groups)
+            .min(n_groups);
+        if start < end {
+            let groups: Vec<usize> = (start..end).collect();
+            builder = builder.with_row_groups(groups);
+            debug!(
+                fragment_id = %task.fragment_id,
+                row_group_start = start,
+                row_group_end = end,
+                "Applying morsel row-group range"
+            );
+        } else {
+            warn!(
+                fragment_id = %task.fragment_id,
+                start,
+                end,
+                n_groups,
+                "Invalid morsel row-group range; reading whole file"
+            );
+        }
+    }
+
     // Take the schema from the BUILT stream, not the builder:
     // `builder.schema()` is always the full parquet file schema, while the
     // stream's schema reflects the applied ProjectionMask. The caller hands
@@ -1217,6 +1248,12 @@ mod tests {
 
     fn task_with_predicate(predicate_proto: Option<Vec<u8>>, limit: Option<usize>) -> ScanTask {
         ScanTask {
+            version: 1,
+            morsel_id: None,
+            row_group_start: None,
+            row_group_end: None,
+            start_byte: None,
+            end_byte: None,
             fragment_id: "frag-pred".to_string(),
             data_file_paths: vec!["s3://bucket/f.parquet".to_string()],
             file_sizes_bytes: vec![1024],
@@ -1405,6 +1442,12 @@ mod tests {
         // The bucket/path machinery uses s3:// URLs; the object key resolves to
         // "data/f.parquet" matching the blob written above.
         ScanTask {
+            version: 1,
+            morsel_id: None,
+            row_group_start: None,
+            row_group_end: None,
+            start_byte: None,
+            end_byte: None,
             fragment_id: "frag-head".to_string(),
             data_file_paths: vec!["s3://bucket/data/f.parquet".to_string()],
             file_sizes_bytes: vec![],
