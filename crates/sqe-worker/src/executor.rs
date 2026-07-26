@@ -670,34 +670,85 @@ async fn open_parquet_stream(
         }
     }
 
-    // Phase 2 morsel: restrict to a row-group range when the ticket carries one.
-    // Indices are inclusive start / exclusive end on the first file only.
-    if task.row_group_start.is_some() || task.row_group_end.is_some() {
+    // Phase 2 morsel: restrict row groups when the ticket carries an explicit
+    // row-group range and/or a compressed byte range. Byte ranges are resolved
+    // against footer metadata (no data-page reads), matching the vendored
+    // iceberg-rust `filter_row_groups_by_byte_range` approach.
+    {
         let meta = builder.metadata();
         let n_groups = meta.num_row_groups();
-        let start = task.row_group_start.unwrap_or(0) as usize;
-        let end = task
-            .row_group_end
-            .map(|e| e as usize)
-            .unwrap_or(n_groups)
-            .min(n_groups);
-        if start < end {
-            let groups: Vec<usize> = (start..end).collect();
-            builder = builder.with_row_groups(groups);
-            debug!(
-                fragment_id = %task.fragment_id,
-                row_group_start = start,
-                row_group_end = end,
-                "Applying morsel row-group range"
-            );
-        } else {
-            warn!(
-                fragment_id = %task.fragment_id,
-                start,
-                end,
-                n_groups,
-                "Invalid morsel row-group range; reading whole file"
-            );
+        let mut selected: Option<Vec<usize>> = None;
+
+        if task.row_group_start.is_some() || task.row_group_end.is_some() {
+            let start = task.row_group_start.unwrap_or(0) as usize;
+            let end = task
+                .row_group_end
+                .map(|e| e as usize)
+                .unwrap_or(n_groups)
+                .min(n_groups);
+            if start < end {
+                selected = Some((start..end).collect());
+            } else {
+                warn!(
+                    fragment_id = %task.fragment_id,
+                    start,
+                    end,
+                    n_groups,
+                    "Invalid morsel row-group range; ignoring"
+                );
+            }
+        }
+
+        if let (Some(range_start), Some(range_end)) = (task.start_byte, task.end_byte) {
+            if range_start < range_end {
+                let mut by_byte = Vec::new();
+                // Prefer column-chunk file offsets; fall back to cumulative
+                // compressed size when offsets are absent.
+                let mut cursor = 0u64;
+                for i in 0..n_groups {
+                    let rg = meta.row_group(i);
+                    let compressed = rg.compressed_size() as u64;
+                    let rg_start = rg
+                        .columns()
+                        .first()
+                        .map(|c| c.file_offset() as u64)
+                        .filter(|&off| off > 0)
+                        .unwrap_or(cursor);
+                    let rg_end = rg_start.saturating_add(compressed);
+                    // Overlap with [range_start, range_end).
+                    if rg_start < range_end && rg_end > range_start {
+                        by_byte.push(i);
+                    }
+                    cursor = cursor.saturating_add(compressed);
+                }
+                if by_byte.is_empty() {
+                    warn!(
+                        fragment_id = %task.fragment_id,
+                        range_start,
+                        range_end,
+                        n_groups,
+                        "Byte-range morsel matched no row groups; reading whole file"
+                    );
+                } else if let Some(ref mut explicit) = selected {
+                    // Intersect explicit row-group range with byte selection.
+                    explicit.retain(|g| by_byte.contains(g));
+                } else {
+                    selected = Some(by_byte);
+                }
+            }
+        }
+
+        if let Some(groups) = selected {
+            if !groups.is_empty() {
+                debug!(
+                    fragment_id = %task.fragment_id,
+                    group_count = groups.len(),
+                    first = groups.first(),
+                    last = groups.last(),
+                    "Applying morsel row-group selection"
+                );
+                builder = builder.with_row_groups(groups);
+            }
         }
     }
 

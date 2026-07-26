@@ -130,6 +130,92 @@ pub fn group_row_groups_into_morsels(
     out
 }
 
+/// Split a single file into byte-range morsels without reading the Parquet
+/// footer. The worker resolves each range to row groups at open time (same
+/// idea as the vendored `split_file_scan_task` byte-range path).
+///
+/// Files at or below `target_bytes` yield a single whole-file morsel.
+/// Larger files are sliced into consecutive ranges of about `target_bytes`,
+/// never exceeding `max_bytes` except for the final partial slice.
+///
+/// **Deletes:** callers must pass `allow_subfile_split = false` when the
+/// snapshot has delete files; the result is then always one whole-file morsel.
+pub fn plan_file_byte_morsels(
+    file_path: &str,
+    file_size_bytes: u64,
+    target_bytes: u64,
+    max_bytes: u64,
+    decoded_factor: u64,
+    allow_subfile_split: bool,
+) -> Vec<ScanMorsel> {
+    let target = target_bytes.max(1);
+    let max_b = max_bytes.max(target);
+
+    if !allow_subfile_split || file_size_bytes <= target {
+        return vec![ScanMorsel {
+            morsel_id: format!("{file_path}#file"),
+            file_path: file_path.to_string(),
+            file_size_bytes,
+            row_group_start: 0,
+            row_group_end: None,
+            start_byte: None,
+            end_byte: None,
+            compressed_bytes_estimate: file_size_bytes,
+            decoded_bytes_estimate: file_size_bytes.saturating_mul(decoded_factor),
+        }];
+    }
+
+    let chunk = target.min(max_b);
+    let mut out = Vec::new();
+    let mut start = 0u64;
+    let mut idx = 0u32;
+    while start < file_size_bytes {
+        let end = (start + chunk).min(file_size_bytes);
+        let compressed = end - start;
+        out.push(ScanMorsel {
+            morsel_id: format!("{file_path}#b{start}-{end}"),
+            file_path: file_path.to_string(),
+            file_size_bytes,
+            row_group_start: 0,
+            row_group_end: None,
+            start_byte: Some(start),
+            end_byte: Some(end),
+            compressed_bytes_estimate: compressed,
+            decoded_bytes_estimate: compressed.saturating_mul(decoded_factor),
+        });
+        start = end;
+        idx += 1;
+        let _ = idx;
+    }
+    out
+}
+
+/// Expand a list of whole files into scan morsels for distributed assignment.
+///
+/// When `allow_subfile_split` is false (delete-bearing snapshots), every file
+/// stays as one morsel. Otherwise files larger than `target_bytes` are
+/// byte-range split so a multi-gigabyte file becomes many worker tasks.
+pub fn plan_scan_morsels(
+    files: &[(String, u64)],
+    target_bytes: u64,
+    max_bytes: u64,
+    allow_subfile_split: bool,
+) -> Vec<ScanMorsel> {
+    const DECODED_FACTOR: u64 = 4;
+    let mut out = Vec::with_capacity(files.len());
+    for (path, size) in files {
+        out.extend(plan_file_byte_morsels(
+            path,
+            *size,
+            target_bytes,
+            max_bytes,
+            DECODED_FACTOR,
+            allow_subfile_split,
+        ));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -198,5 +284,61 @@ mod tests {
         assert_eq!(morsels[0].row_group_start, 0);
         assert!(morsels[0].row_group_end.is_none());
         assert_eq!(morsels[0].compressed_bytes_estimate, 1000);
+    }
+
+    #[test]
+    fn byte_morsels_split_large_file() {
+        let mb = 1024 * 1024u64;
+        let morsels = plan_file_byte_morsels(
+            "s3://b/big.parquet",
+            500 * mb,
+            128 * mb,
+            256 * mb,
+            4,
+            true,
+        );
+        assert!(morsels.len() >= 3, "expected multiple morsels, got {}", morsels.len());
+        let total: u64 = morsels.iter().map(|m| m.compressed_bytes_estimate).sum();
+        assert_eq!(total, 500 * mb);
+        assert!(morsels.iter().all(|m| m.start_byte.is_some() && m.end_byte.is_some()));
+        // Ranges must be contiguous and non-overlapping.
+        let mut cursor = 0u64;
+        for m in &morsels {
+            assert_eq!(m.start_byte.unwrap(), cursor);
+            cursor = m.end_byte.unwrap();
+        }
+        assert_eq!(cursor, 500 * mb);
+    }
+
+    #[test]
+    fn deletes_force_whole_file_morsel() {
+        let mb = 1024 * 1024u64;
+        let morsels = plan_file_byte_morsels(
+            "s3://b/del.parquet",
+            500 * mb,
+            128 * mb,
+            256 * mb,
+            4,
+            false, // has deletes
+        );
+        assert_eq!(morsels.len(), 1);
+        assert!(morsels[0].start_byte.is_none());
+        assert!(morsels[0].end_byte.is_none());
+    }
+
+    #[test]
+    fn plan_scan_morsels_mixes_small_and_large() {
+        let mb = 1024 * 1024u64;
+        let files = vec![
+            ("s3://b/small.parquet".into(), 10 * mb),
+            ("s3://b/large.parquet".into(), 300 * mb),
+        ];
+        let morsels = plan_scan_morsels(&files, 128 * mb, 256 * mb, true);
+        // small = 1, large = at least 2
+        assert!(morsels.len() >= 3);
+        assert_eq!(
+            morsels.iter().filter(|m| m.file_path.contains("small")).count(),
+            1
+        );
     }
 }

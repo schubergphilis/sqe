@@ -560,17 +560,17 @@ pub struct ScanMorsel {
 }
 ```
 
-- [ ] Extend scan planning to read Parquet footer row-group offsets without
+- [x] Extend scan planning to read Parquet footer row-group offsets without
       reading data pages.
 - [x] Group adjacent row groups into 64-128 MiB target morsels, capped at the
       configured maximum.
-- [ ] Preserve Iceberg snapshot ID, deletes, projection, predicate, field IDs,
+- [x] Preserve Iceberg snapshot ID, deletes, projection, predicate, field IDs,
       and credential scope in the signed task.
 - [x] Version the signed `ScanTask` encoding and reject unsupported versions.
 - [x] Replace the `max_bins = num_workers * 3` static binning
       (`crates/sqe-coordinator/src/query_handler.rs:3103`) with a larger
       pending morsel queue.
-- [ ] Align with the existing split machinery instead of inventing a second
+- [x] Align with the existing split machinery instead of inventing a second
       one. The vendored fork already splits large whole-file tasks into
       byte-range subtasks that resolve to row groups at read time
       (`TableScanBuilder::with_task_split_target_size`,
