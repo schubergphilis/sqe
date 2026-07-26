@@ -25,7 +25,7 @@ pub use distributed_sort::{
     compute_range_boundaries, needs_sampling, sample_based_boundaries, DistributedSortExec,
     DistributedSortRule, DEFAULT_DISTRIBUTED_SORT_THRESHOLD, MIN_EXECUTORS_FOR_DISTRIBUTED_SORT,
 };
-pub use join_strategy::JoinStrategyRule;
+pub use join_strategy::{BuildSizeEstimate, JoinStrategyRule};
 pub use star_schema_reorder::{StarSchemaReorderRule, DEFAULT_MIN_RATIO};
 pub use predicate_transfer::{
     build_predicate_transfer, extract_distinct_from_batches, extract_distinct_values,
