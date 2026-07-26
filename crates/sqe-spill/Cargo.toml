@@ -12,10 +12,18 @@ name = "sqe_spill"
 path = "src/lib.rs"
 
 [dependencies]
+arrow-array = { workspace = true }
+arrow-ipc = { workspace = true }
+arrow-schema = { workspace = true }
+async-trait = { workspace = true }
+crc32fast = "1.4"
 datafusion = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }
