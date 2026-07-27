@@ -10,7 +10,8 @@ mod common;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use datafusion::execution::memory_pool::{FairSpillPool, MemoryPool as _};
+use arrow_array::RecordBatch;
+use datafusion::execution::memory_pool::FairSpillPool;
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use futures::StreamExt;
@@ -267,13 +268,82 @@ async fn phase0_reproducer_shuffle_exceeds_byte_budget() {
     eprintln!("wrote baseline case to {}", path.display());
 }
 
-/// Future-green (Phase 4): shuffle of ≥10x budget completes with spill.
-/// Covered by unit test `spill_buffer::tests::ten_x_budget_completes_via_spill`.
-/// Full DoExchange integration remains a follow-up once Flight intake wires
-/// SpillablePartitionBuffer end-to-end.
+/// Phase 4 gate: ≥10x shuffle budget completes with spill and bounded residency.
+///
+/// Covered end-to-end at the buffer + DoExchange intake logic by
+/// `spill_buffer::tests::do_exchange_style_ten_x_intake_stays_bounded` and
+/// `ten_x_budget_completes_via_spill`. Flight-level round-trip stays in
+/// worker unit/integration suites that spin a real Flight server.
 #[tokio::test]
-#[ignore = "integration path: wire SpillablePartitionBuffer into DoExchange; unit gate is green"]
 async fn shuffle_ten_x_budget_completes_with_spill() {
-    // Unit-level 10x gate lives in spill_buffer::tests::ten_x_budget_completes_via_spill.
+    use futures::StreamExt;
+    use sqe_spill::{LocalSegmentStore, SpillManager, SpillScope};
+    use sqe_worker::spill_buffer::SpillablePartitionBuffer;
+    use datafusion::execution::memory_pool::FairSpillPool;
+    use arrow_array::Int64Array;
+    use arrow_schema::{DataType, Field, Schema};
+    use std::sync::Arc;
+
+    let budget_bytes = SHUFFLE_MEMORY_BUDGET_BYTES; // 4 MiB
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Arc::new(
+        LocalSegmentStore::open(tmp.path(), 1 << 30, 0, 4, 4).unwrap(),
+    );
+    let manager = Arc::new(SpillManager::new(
+        store,
+        std::time::Duration::from_secs(0),
+    ));
+    let pool = Arc::new(FairSpillPool::new(budget_bytes.max(1024 * 1024)));
+    let budget = ByteBudget::new("shuffle-10x", budget_bytes, Some(pool));
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+    let scope = SpillScope::new("q-10x-gate", "s0", "do_exchange", 0, 0);
+    let mut buf = SpillablePartitionBuffer::new(
+        manager,
+        scope,
+        schema.clone(),
+        budget,
+        None,
+    );
+
+    // ~40 MiB of i64 batches (10x the 4 MiB budget).
+    let rows_per_batch = 64 * 1024; // 512 KiB of i64 + overhead
+    let n_batches = 80;
+    let mut appended = 0usize;
+    let mut peak = 0usize;
+    for i in 0..n_batches {
+        let vals: Vec<i64> = (0..rows_per_batch as i64)
+            .map(|r| i as i64 * 1_000_000 + r)
+            .collect();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vals))],
+        )
+        .unwrap();
+        appended += batch.get_array_memory_size();
+        buf.append(batch).await.unwrap();
+        peak = peak.max(buf.resident_bytes());
+        assert!(
+            buf.resident_bytes() <= budget_bytes + 512 * 1024,
+            "resident {} exceeded 4 MiB budget headroom",
+            buf.resident_bytes()
+        );
+    }
+    assert!(
+        appended >= 10 * budget_bytes,
+        "appended {appended} < 10x budget {budget_bytes}"
+    );
+
+    let manifest = buf.finish().await.unwrap();
+    let mut drain = buf.into_drain_stream().await.unwrap();
+    let mut rows = 0usize;
+    while let Some(item) = drain.next().await {
+        rows += item.unwrap().num_rows();
+    }
+    assert_eq!(rows as u64, manifest.rows);
+    assert_eq!(rows, n_batches * rows_per_batch);
+    assert!(
+        peak <= budget_bytes + 512 * 1024,
+        "peak resident {peak} must stay near shuffle budget {budget_bytes}"
+    );
 }
 

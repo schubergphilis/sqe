@@ -57,13 +57,15 @@ pub fn build_worker_service(
     let footer_cache = build_footer_cache(config, &metrics);
 
     let spill_manager = build_spill_manager(config)?;
+    let shuffle_budget = resolve_shuffle_budget(config);
 
     let mut service = WorkerFlightService::new(metrics, session_ctx)
         .with_scan_timeout(config.worker.scan_timeout_secs)
         .with_flight_compression(shuffle_compression)
         .with_shuffle_compression(shuffle_compression)
         .with_footer_cache(footer_cache)
-        .with_worker_secret(config.worker.worker_secret.clone());
+        .with_worker_secret(config.worker.worker_secret.clone())
+        .with_shuffle_memory_budget(shuffle_budget);
     if let Some(sm) = spill_manager {
         service = service.with_spill_manager(sm);
     }
@@ -125,6 +127,21 @@ pub fn build_worker_service(
     }
 
     Ok(service)
+}
+
+/// Resolve the shuffle partition byte budget from worker memory config.
+fn resolve_shuffle_budget(config: &SqeConfig) -> usize {
+    let limit = parse_memory_limit(&config.worker.memory_limit).unwrap_or(8 * 1024 * 1024 * 1024);
+    match config.worker.memory.resolve_bytes(limit as usize) {
+        Ok(resolved) => resolved.shuffle_memory_budget.max(64 * 1024),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "Failed to resolve worker.memory sub-budgets; using 12.5% of memory_limit for shuffle"
+            );
+            (limit as usize / 8).max(64 * 1024)
+        }
+    }
 }
 
 /// Open a local [`SpillManager`] when spill is enabled, or `None` when disabled.

@@ -23,12 +23,13 @@ use sqe_metrics::WorkerMetricsRegistry;
 use sqe_metrics::propagation::extract_trace_context;
 use sqe_compaction::wire::{CompactGroupFrame, CompactGroupRequest};
 use sqe_planner::ScanTask;
-use sqe_spill::{BytePermit, SpillManager};
+use sqe_spill::{ByteBudget, BytePermit, SpillManager, SpillScope};
 
 use crate::compaction::compact_file_group;
 use crate::credential_channel::{CredentialStore, RefreshableCredentials};
 use crate::executor;
 use crate::shuffle::{ExchangeDescriptor, ShuffleManager};
+use crate::spill_buffer::SpillablePartitionBuffer;
 
 /// Streams `RecordBatch`es into the Flight encoder while holding each batch's
 /// scan-budget permit until the encoder polls the next item (or the stream
@@ -163,7 +164,15 @@ pub struct WorkerFlightService {
     worker_secret: String,
     /// Shared spill manager for shuffle / operator spill (Phase 3+).
     spill_manager: Option<Arc<SpillManager>>,
+    /// Byte budget for shuffle partition buffers (from
+    /// `worker.memory.shuffle_memory_budget`). Used when DoExchange intakes
+    /// into [`SpillablePartitionBuffer`].
+    shuffle_memory_budget: usize,
 }
+
+/// Default shuffle budget when not configured (64 MiB) — enough for laptop
+/// tests and small clusters without an explicit sub-budget.
+const DEFAULT_SHUFFLE_MEMORY_BUDGET: usize = 64 * 1024 * 1024;
 
 impl WorkerFlightService {
     pub fn new(metrics: Arc<WorkerMetricsRegistry>, session_ctx: SessionContext) -> Self {
@@ -178,6 +187,7 @@ impl WorkerFlightService {
             shuffle_compression: FlightCompression::Zstd,
             worker_secret: String::new(),
             spill_manager: None,
+            shuffle_memory_budget: DEFAULT_SHUFFLE_MEMORY_BUDGET,
         }
     }
 
@@ -201,6 +211,7 @@ impl WorkerFlightService {
             shuffle_compression: FlightCompression::Zstd,
             worker_secret: String::new(),
             spill_manager: None,
+            shuffle_memory_budget: DEFAULT_SHUFFLE_MEMORY_BUDGET,
         }
     }
 
@@ -249,9 +260,21 @@ impl WorkerFlightService {
         self
     }
 
+    /// Set the shuffle partition byte budget used by spillable DoExchange.
+    #[must_use = "with_shuffle_memory_budget consumes self; bind the returned service"]
+    pub fn with_shuffle_memory_budget(mut self, bytes: usize) -> Self {
+        self.shuffle_memory_budget = bytes.max(64 * 1024);
+        self
+    }
+
     /// Spill manager when local spill is enabled at bootstrap.
     pub fn spill_manager(&self) -> Option<&Arc<SpillManager>> {
         self.spill_manager.as_ref()
+    }
+
+    /// Configured shuffle memory budget in bytes.
+    pub fn shuffle_memory_budget(&self) -> usize {
+        self.shuffle_memory_budget
     }
 
     /// Constant-time check of the `x-sqe-worker-secret` metadata header.
@@ -360,6 +383,158 @@ impl WorkerFlightService {
     /// Returns a reference to the shuffle manager.
     pub fn shuffle_manager(&self) -> &ShuffleManager {
         &self.shuffle_manager
+    }
+
+    /// Spillable DoExchange path: append into a per-attempt
+    /// [`SpillablePartitionBuffer`], finish (force residual spill), then stream
+    /// segments back without holding the full exchange volume in RAM.
+    async fn do_exchange_spill(
+        &self,
+        query_id: &str,
+        stage_id: &str,
+        partition_id: u32,
+        attempt_id: u32,
+        spill_manager: Arc<SpillManager>,
+        mut flight_batch_stream: FlightRecordBatchStream,
+    ) -> Result<Response<BoxStream<FlightData>>, Status> {
+        let attempt_gate = self.shuffle_manager.attempts().clone();
+        let budget_bytes = self.shuffle_memory_budget;
+        // Dedicated pool so shuffle residency is tracked independently of the
+        // operator pool; capacity matches the shuffle sub-budget.
+        let pool = Arc::new(datafusion::execution::memory_pool::FairSpillPool::new(
+            budget_bytes.max(1024 * 1024),
+        ));
+        let budget = ByteBudget::new(
+            format!("shuffle-{query_id}-{stage_id}-p{partition_id}"),
+            budget_bytes,
+            Some(pool),
+        );
+        let scope = SpillScope::new(
+            query_id,
+            stage_id,
+            "do_exchange",
+            partition_id,
+            attempt_id,
+        );
+
+        // Lazy buffer: schema comes from the first non-empty batch.
+        let mut buffer: Option<SpillablePartitionBuffer> = None;
+        let mut batch_count = 0u64;
+        let mut rejected = 0u64;
+        let mut peak_resident = 0usize;
+        let mut schema: Option<arrow_schema::SchemaRef> = None;
+
+        while let Some(batch_result) = flight_batch_stream.next().await {
+            match batch_result {
+                Ok(batch) => {
+                    if batch.num_rows() == 0 {
+                        continue;
+                    }
+                    if !attempt_gate
+                        .admit(query_id, stage_id, partition_id, attempt_id)
+                        .await
+                    {
+                        rejected += 1;
+                        break;
+                    }
+                    if buffer.is_none() {
+                        schema = Some(batch.schema());
+                        buffer = Some(SpillablePartitionBuffer::new(
+                            spill_manager.clone(),
+                            scope.clone(),
+                            batch.schema(),
+                            budget.clone(),
+                            Some(self.metrics.clone()),
+                        ));
+                    }
+                    let buf = buffer.as_mut().expect("buffer just created");
+                    if let Err(e) = buf.append(batch).await {
+                        buf.fail(e.to_string());
+                        return Err(Status::resource_exhausted(format!(
+                            "shuffle spill intake failed: {e}"
+                        )));
+                    }
+                    peak_resident = peak_resident.max(buf.resident_bytes());
+                    batch_count += 1;
+                }
+                Err(e) => {
+                    if let Some(ref mut buf) = buffer {
+                        buf.fail(e.to_string());
+                    }
+                    return Err(Status::internal(format!(
+                        "Error decoding flight data in DoExchange: {e}"
+                    )));
+                }
+            }
+        }
+
+        debug!(
+            query_id = %query_id,
+            stage_id = %stage_id,
+            partition_id = partition_id,
+            attempt_id = attempt_id,
+            batch_count = batch_count,
+            rejected_late = rejected,
+            peak_resident = peak_resident,
+            budget = budget_bytes,
+            "DoExchange spill intake complete"
+        );
+
+        // Empty exchange: no schema observed — return an empty Flight stream.
+        let Some(schema) = schema else {
+            let shuffle_opts = ipc_options_for(self.shuffle_compression)?;
+            let empty = futures::stream::empty::<
+                Result<RecordBatch, arrow_flight::error::FlightError>,
+            >();
+            let flight_stream = FlightDataEncoderBuilder::new()
+                .with_schema(Arc::new(arrow_schema::Schema::empty()))
+                .with_options(shuffle_opts)
+                .build(empty)
+                .map_err(Status::from);
+            return Ok(Response::new(
+                Box::pin(flight_stream) as BoxStream<FlightData>
+            ));
+        };
+
+        let mut buffer = buffer.expect("schema implies buffer");
+        let manifest = buffer.finish().await.map_err(|e| {
+            Status::internal(format!("shuffle spill finish failed: {e}"))
+        })?;
+        info!(
+            query_id = %query_id,
+            stage_id = %stage_id,
+            partition_id = partition_id,
+            rows = manifest.rows,
+            batches = manifest.batches,
+            segments = manifest.segments,
+            physical_bytes = manifest.physical_bytes,
+            peak_resident = peak_resident,
+            "DoExchange spill partition finished"
+        );
+
+        let drain = buffer.into_drain_stream().await.map_err(|e| {
+            Status::internal(format!("shuffle spill drain open failed: {e}"))
+        })?;
+
+        let output_stream = drain.map(|item| {
+            item.map_err(|e| {
+                arrow_flight::error::FlightError::Tonic(Box::new(Status::internal(e.to_string())))
+            })
+        });
+
+        let shuffle_opts = ipc_options_for(self.shuffle_compression)?;
+        self.metrics
+            .flight_encode_resident_bytes
+            .set(peak_resident as f64);
+        let flight_stream = FlightDataEncoderBuilder::new()
+            .with_schema(schema)
+            .with_options(shuffle_opts)
+            .build(output_stream)
+            .map_err(Status::from);
+
+        Ok(Response::new(
+            Box::pin(flight_stream) as BoxStream<FlightData>
+        ))
     }
 
     pub fn into_server(self) -> FlightServiceServer<Self> {
@@ -784,44 +959,53 @@ impl FlightService for WorkerFlightService {
             )));
         }
 
-        // 2. Look up the ShuffleReceiver for this (query_id, stage_id).
+        // 3. Decode incoming RecordBatches. Chain the first message (which may
+        //    also contain data) with the rest of the request stream.
+        let remaining_stream = stream.map_err(|e| {
+            arrow_flight::error::FlightError::Tonic(Box::new(e))
+        });
+        let first_stream = futures::stream::once(async move { Ok(first_msg) });
+        let combined = first_stream.chain(remaining_stream);
+        let flight_batch_stream =
+            FlightRecordBatchStream::new_from_flight_data(combined);
+
+        // Prefer spillable intake when a SpillManager is configured: bounded
+        // resident memory under shuffle_memory_budget with soft-watermark
+        // spill. Falls back to the legacy mpsc ShuffleReceiver path otherwise.
+        if let Some(spill_manager) = self.spill_manager.clone() {
+            return self
+                .do_exchange_spill(
+                    query_id.as_str(),
+                    stage_id.as_str(),
+                    partition_id,
+                    attempt_id,
+                    spill_manager,
+                    flight_batch_stream,
+                )
+                .await;
+        }
+
+        let mut flight_batch_stream = flight_batch_stream;
+
+        // ── Legacy mpsc path (no spill substrate) ──────────────────────────
         let shuffle_receiver = self
             .shuffle_manager
             .get(&query_id, &stage_id)
             .await
             .ok_or_else(|| {
                 Status::not_found(format!(
-                    "No shuffle receiver registered for query={query_id}, stage={stage_id}"
+                    "No shuffle receiver registered for query={query_id}, stage={stage_id} \
+                     (and spill is disabled)"
                 ))
             })?;
 
-        // Confirm the partition exists before spawning intake.
         if shuffle_receiver.sender(partition_id).is_none() {
             return Err(Status::not_found(format!(
                 "No sender for partition {partition_id} in query={query_id}, stage={stage_id}"
             )));
         }
 
-        // 3. Decode and buffer incoming RecordBatches.
-        //    Chain the first message (which may also contain data) with the rest.
-        let remaining_stream = stream.map_err(|e| {
-            arrow_flight::error::FlightError::Tonic(Box::new(e))
-        });
-        let first_stream = futures::stream::once(async move { Ok(first_msg) });
-        let combined =
-            first_stream.chain(remaining_stream);
-
-        let mut flight_batch_stream =
-            FlightRecordBatchStream::new_from_flight_data(combined);
-
         let schema = shuffle_receiver.schema().clone();
-
-        // Spawn a task to receive batches and forward to the mpsc channel.
-        // Uses send_batch so shuffle_resident_bytes tracks live channel occupancy
-        // (Phase 0 instrumentation for the batch-count-bound safety gate).
-        // When a SpillManager is present, producers should prefer
-        // SpillablePartitionBuffer (unit-tested); DoExchange still uses the
-        // memory channel path until the coordinator registers spillable stages.
         let query_id_clone = query_id.clone();
         let stage_id_clone = stage_id.clone();
         let intake_receiver = shuffle_receiver.clone();
@@ -835,8 +1019,6 @@ impl FlightService for WorkerFlightService {
                         if batch.num_rows() == 0 {
                             continue;
                         }
-                        // Re-check attempt on every batch so a superseding
-                        // attempt mid-stream stops the loser immediately.
                         if !attempt_gate
                             .admit(&query_id_clone, &stage_id_clone, partition_id, attempt_id)
                             .await
@@ -878,12 +1060,10 @@ impl FlightService for WorkerFlightService {
                 attempt_id = attempt_id,
                 batch_count = batch_count,
                 rejected_late = rejected,
-                "DoExchange intake complete"
+                "DoExchange intake complete (mpsc path)"
             );
-            // Intake task ends; remaining senders close when ShuffleReceiver drops.
         });
 
-        // 4. Return a stream that drains the partition channel.
         let rx = shuffle_receiver
             .take_receiver(partition_id)
             .await
@@ -894,14 +1074,11 @@ impl FlightService for WorkerFlightService {
                 ))
             })?;
 
-        // Wrap the tracked receiver as a futures::Stream of RecordBatch.
         let output_stream = futures::stream::unfold(rx, |mut rx| async move {
             rx.recv().await.map(|batch| (batch, rx))
         });
 
         let shuffle_opts = ipc_options_for(self.shuffle_compression)?;
-        // Approximate flight encode residency as "we are about to stream this
-        // partition". Phase 1 pairs this with AccountedFlightStream permits.
         self.metrics
             .flight_encode_resident_bytes
             .set(shuffle_receiver.resident_bytes() as f64);

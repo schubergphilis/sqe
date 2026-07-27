@@ -3,12 +3,20 @@
 //! Appends accounted in-memory batches until a soft watermark, then spills
 //! immutable Arrow segments through the shared [`SpillManager`]. Readers
 //! drain residual memory batches first, then stream committed segments.
+//!
+//! DoExchange intake creates one buffer per accepted partition attempt,
+//! appends decoded batches under the shuffle byte budget, finishes (forcing
+//! residual spill), then streams segments back to the caller without
+//! re-materializing the full exchange volume in RAM.
 
+use std::collections::VecDeque;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
-use futures::StreamExt;
+use futures::{Stream, StreamExt};
 use sqe_metrics::WorkerMetricsRegistry;
 use sqe_spill::{
     Accounted, ByteBudget, SpillManager, SpillScope, SpillScopeGuard, SpillSegment,
@@ -222,7 +230,7 @@ impl SpillablePartitionBuffer {
 
     /// Drain remaining in-memory batches and spill segments into a Vec of
     /// batches (for tests / small partitions). Production readers should
-    /// stream segments.
+    /// prefer [`Self::into_drain_stream`].
     pub async fn collect_all(&mut self) -> anyhow::Result<Vec<RecordBatch>> {
         if self.state == PartitionBufferState::Failed {
             anyhow::bail!(
@@ -256,6 +264,51 @@ impl SpillablePartitionBuffer {
         Ok(out)
     }
 
+    /// Finish the partition (if still open) and return a streaming drain that
+    /// yields residual memory batches then spill segments one batch at a time.
+    ///
+    /// The drain deletes the spill scope when fully consumed or dropped, so
+    /// callers do not need a separate `cleanup` after a successful stream.
+    pub async fn into_drain_stream(mut self) -> anyhow::Result<PartitionDrainStream> {
+        if self.state == PartitionBufferState::Failed {
+            anyhow::bail!(
+                "partition failed: {}",
+                self.fail_msg.as_deref().unwrap_or("unknown")
+            );
+        }
+        if self.state == PartitionBufferState::Cancelled {
+            anyhow::bail!("partition cancelled");
+        }
+        // Ensure residuals are spilled so the drain only needs segment I/O
+        // (keeps post-finish resident memory near zero).
+        if self.state == PartitionBufferState::Open {
+            let _ = self.finish().await?;
+        }
+
+        let mut memory = VecDeque::new();
+        for accounted in std::mem::take(&mut self.memory) {
+            let (batch, _) = accounted.into_parts();
+            memory.push_back(batch);
+        }
+        self.memory_bytes = 0;
+
+        // Disarm the buffer guard: PartitionDrainStream owns cleanup.
+        if let Some(g) = self._guard.take() {
+            g.disarm();
+        }
+
+        Ok(PartitionDrainStream {
+            manager: self.manager.clone(),
+            scope: self.scope.clone(),
+            metrics: self.metrics.clone(),
+            memory,
+            segments: std::mem::take(&mut self.segments),
+            segment_idx: 0,
+            current: None,
+            cleaned: false,
+        })
+    }
+
     /// Delete spilled segments after a successful read (or abandon).
     pub async fn cleanup(&mut self) -> anyhow::Result<()> {
         self.manager
@@ -273,6 +326,148 @@ impl SpillablePartitionBuffer {
         if let Some(ref m) = self.metrics {
             m.shuffle_resident_bytes.set(self.memory_bytes as f64);
             m.spill_files.set(self.segments.len() as f64);
+        }
+    }
+}
+
+/// Streaming reader over a finished [`SpillablePartitionBuffer`].
+///
+/// Yields residual in-memory batches first, then each spill segment's batches.
+/// Deletes the spill scope on full consumption or drop (best-effort async
+/// cleanup via `tokio::spawn` on drop when the runtime is available).
+pub struct PartitionDrainStream {
+    manager: Arc<SpillManager>,
+    scope: SpillScope,
+    metrics: Option<Arc<WorkerMetricsRegistry>>,
+    memory: VecDeque<RecordBatch>,
+    segments: Vec<SpillSegment>,
+    segment_idx: usize,
+    current: Option<futures::stream::BoxStream<'static, sqe_spill::Result<RecordBatch>>>,
+    cleaned: bool,
+}
+
+impl PartitionDrainStream {
+    /// Explicit cleanup (also runs on drop if not already cleaned).
+    pub async fn cleanup(&mut self) -> anyhow::Result<()> {
+        if self.cleaned {
+            return Ok(());
+        }
+        self.cleaned = true;
+        self.manager
+            .delete_scope(&self.scope)
+            .await
+            .map_err(|e| anyhow::anyhow!("spill cleanup: {e}"))?;
+        self.segments.clear();
+        self.memory.clear();
+        self.current = None;
+        if let Some(ref m) = self.metrics {
+            m.spill_files.set(0.0);
+            m.shuffle_resident_bytes.set(0.0);
+        }
+        Ok(())
+    }
+}
+
+impl Stream for PartitionDrainStream {
+    type Item = anyhow::Result<RecordBatch>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        // 1. Residual memory batches (usually empty after finish).
+        if let Some(batch) = self.memory.pop_front() {
+            if let Some(ref m) = self.metrics {
+                m.spill_bytes_read
+                    .inc_by(batch.get_array_memory_size() as f64);
+            }
+            return Poll::Ready(Some(Ok(batch)));
+        }
+
+        // 2. Current segment stream.
+        loop {
+            if let Some(ref mut cur) = self.current {
+                match Pin::new(cur).poll_next(cx) {
+                    Poll::Ready(Some(Ok(batch))) => {
+                        if let Some(ref m) = self.metrics {
+                            m.spill_bytes_read
+                                .inc_by(batch.get_array_memory_size() as f64);
+                        }
+                        return Poll::Ready(Some(Ok(batch)));
+                    }
+                    Poll::Ready(Some(Err(e))) => {
+                        return Poll::Ready(Some(Err(anyhow::anyhow!("spill stream: {e}"))));
+                    }
+                    Poll::Ready(None) => {
+                        self.current = None;
+                        self.segment_idx += 1;
+                        // fall through to open next segment
+                    }
+                    Poll::Pending => return Poll::Pending,
+                }
+            }
+
+            // 3. Open next segment, or finish.
+            if self.segment_idx >= self.segments.len() {
+                // Schedule cleanup without blocking the poll.
+                if !self.cleaned {
+                    self.cleaned = true;
+                    let manager = self.manager.clone();
+                    let scope = self.scope.clone();
+                    let metrics = self.metrics.clone();
+                    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                        handle.spawn(async move {
+                            if let Err(e) = manager.delete_scope(&scope).await {
+                                warn!(%scope, error = %e, "drain stream cleanup failed");
+                            }
+                            if let Some(m) = metrics {
+                                m.spill_files.set(0.0);
+                                m.shuffle_resident_bytes.set(0.0);
+                            }
+                        });
+                    }
+                }
+                return Poll::Ready(None);
+            }
+
+            let seg = &self.segments[self.segment_idx];
+            // open_reader is async; we cannot await inside poll_next.
+            // Use a one-shot future stored in `current` via a small helper stream.
+            let manager = self.manager.clone();
+            let seg = seg.clone();
+            let fut_stream = futures::stream::once(async move {
+                match manager.open_reader(&seg).await {
+                    Ok(reader) => Ok(reader),
+                    Err(e) => Err(e),
+                }
+            })
+            .map(|res| match res {
+                Ok(reader) => reader.into_stream(),
+                Err(e) => futures::stream::once(async move { Err(e) }).boxed(),
+            })
+            .flatten()
+            .boxed();
+            self.current = Some(fut_stream);
+        }
+    }
+}
+
+impl Drop for PartitionDrainStream {
+    fn drop(&mut self) {
+        if self.cleaned {
+            return;
+        }
+        self.cleaned = true;
+        let manager = self.manager.clone();
+        let scope = self.scope.clone();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                if let Err(e) = manager.delete_scope(&scope).await {
+                    warn!(%scope, error = %e, "PartitionDrainStream drop cleanup failed");
+                }
+            });
+        } else {
+            warn!(
+                %scope,
+                "PartitionDrainStream dropped without runtime; spill scope may leak until orphan cleanup"
+            );
         }
     }
 }
@@ -445,5 +640,89 @@ mod tests {
         assert_eq!(buf.state(), PartitionBufferState::Cancelled);
         // Budget fully free after cancel.
         assert_eq!(budget.used_bytes(), 0);
+    }
+
+    #[tokio::test]
+    async fn drain_stream_yields_all_rows_and_cleans_up() {
+        let budget_bytes = 64 * 1024;
+        let (manager, budget, tmp) = setup(budget_bytes).await;
+        let scope = SpillScope::new("q-drain", "s", "sh", 0, 0);
+        let mut buf =
+            SpillablePartitionBuffer::new(manager.clone(), scope.clone(), schema(), budget, None);
+
+        let mut peak = 0usize;
+        for i in 0..40 {
+            buf.append(batch(i * 1000, 512)).await.unwrap();
+            peak = peak.max(buf.resident_bytes());
+        }
+        // Soft spill should have kept residency near the budget.
+        assert!(
+            peak <= budget_bytes + 128 * 1024,
+            "peak resident {peak} far above budget {budget_bytes}"
+        );
+
+        let mut drain = buf.into_drain_stream().await.unwrap();
+        let mut rows = 0usize;
+        while let Some(item) = drain.next().await {
+            rows += item.unwrap().num_rows();
+        }
+        assert_eq!(rows, 40 * 512);
+
+        // Scope directory should be gone after stream completion.
+        let scope_dir = tmp.path().join(scope.relative_dir());
+        // Give the spawned cleanup task a tick.
+        tokio::task::yield_now().await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !scope_dir.exists(),
+            "expected spill scope cleaned after drain: {}",
+            scope_dir.display()
+        );
+    }
+
+    /// Mirrors DoExchange spill intake: append under budget, finish, stream.
+    #[tokio::test]
+    async fn do_exchange_style_ten_x_intake_stays_bounded() {
+        let budget_bytes = 256 * 1024;
+        let (manager, budget, _tmp) = setup(budget_bytes).await;
+        let scope = SpillScope::new("q-dx", "stage0", "do_exchange", 0, 1);
+        let mut buf =
+            SpillablePartitionBuffer::new(manager, scope, schema(), budget, None);
+
+        let mut appended = 0usize;
+        let mut peak = 0usize;
+        for i in 0..120 {
+            let b = batch(i * 10_000, 4096);
+            appended += b.get_array_memory_size();
+            buf.append(b).await.unwrap();
+            peak = peak.max(buf.resident_bytes());
+            assert!(
+                buf.resident_bytes() <= budget_bytes + 128 * 1024,
+                "resident {} exceeded budget headroom during intake",
+                buf.resident_bytes()
+            );
+        }
+        assert!(
+            appended >= 10 * budget_bytes,
+            "need ≥10x budget input, got {appended} vs {budget_bytes}"
+        );
+
+        let manifest = buf.finish().await.unwrap();
+        assert_eq!(manifest.rows, 120 * 4096);
+        assert!(
+            manifest.segments > 0,
+            "expected at least one spill segment for 10x intake"
+        );
+
+        let mut drain = buf.into_drain_stream().await.unwrap();
+        let mut rows = 0usize;
+        while let Some(item) = drain.next().await {
+            rows += item.unwrap().num_rows();
+        }
+        assert_eq!(rows as u64, manifest.rows);
+        assert!(
+            peak <= budget_bytes + 128 * 1024,
+            "peak resident {peak} must stay near budget {budget_bytes}"
+        );
     }
 }
