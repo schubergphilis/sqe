@@ -24,6 +24,7 @@ pub mod scope;
 pub mod segment;
 pub mod store;
 pub mod store_local;
+pub mod store_s3;
 
 pub use accounted::Accounted;
 pub use budget::{
@@ -54,3 +55,8 @@ pub use scope::SpillScope;
 pub use segment::{SpillSegment, SEGMENT_FORMAT_VERSION, SEGMENT_MAGIC};
 pub use store::{SegmentReader, SegmentStore, SegmentWriter};
 pub use store_local::LocalSegmentStore;
+pub use store_s3::{
+    lifecycle_attributes, lifecycle_tags_for_partial, lifecycle_tags_for_segment, S3SegmentStore,
+    S3SpillConfig, LIFECYCLE_PURPOSE_KEY, LIFECYCLE_PURPOSE_PARTIAL, LIFECYCLE_PURPOSE_SEGMENT,
+    LIFECYCLE_QUERY_KEY, LIFECYCLE_TAG_KEY, LIFECYCLE_TAG_VALUE,
+};

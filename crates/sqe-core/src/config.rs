@@ -822,9 +822,7 @@ pub struct WorkerSpillConfig {
     /// `enabled = false`.
     #[serde(default = "default_true")]
     pub enabled: bool,
-    /// Spill backend: `local` (default), `s3`, or `tiered`. Only `local` is
-    /// implemented in Phase 3; other values fail startup with a typed error
-    /// until their backend lands.
+    /// Spill backend: `local` (default), `s3`, or `tiered`.
     #[serde(default = "default_spill_backend")]
     pub backend: String,
     /// Spill root directory for local/tiered backends. Empty means use
@@ -851,6 +849,48 @@ pub struct WorkerSpillConfig {
     /// `h`, otherwise as seconds.
     #[serde(default = "default_spill_orphan_age")]
     pub orphan_age: String,
+    /// Dedicated S3 location and credentials for the `s3` / `tiered` backends.
+    /// Never use table-vended STS here.
+    #[serde(default)]
+    pub s3: WorkerSpillS3Config,
+}
+
+/// S3 spill backend config (`[worker.spill.s3]`).
+///
+/// Must use a **dedicated** bucket/prefix and long-lived credential. Objects
+/// are tagged `sqe-spill=true` for lifecycle expiry rules.
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct WorkerSpillS3Config {
+    #[serde(default)]
+    pub bucket: String,
+    /// Key prefix (e.g. `sqe-spill/`). Must not overlap warehouse/table data.
+    #[serde(default = "default_spill_s3_prefix")]
+    pub prefix: String,
+    #[serde(default)]
+    pub region: String,
+    /// Optional endpoint for MinIO / RustFS / path-style gateways.
+    #[serde(default)]
+    pub endpoint: String,
+    #[serde(default)]
+    pub access_key_id: String,
+    #[serde(default)]
+    pub secret_access_key: String,
+    #[serde(default)]
+    pub allow_http: bool,
+    /// Force path-style addressing (MinIO-friendly). Default true when
+    /// endpoint is set at resolve time in bootstrap.
+    #[serde(default = "default_true")]
+    pub path_style: bool,
+    /// Object-count budget (in addition to `max_bytes`).
+    #[serde(default = "default_spill_s3_max_objects")]
+    pub max_objects: u64,
+}
+
+fn default_spill_s3_prefix() -> String {
+    "sqe-spill/".to_string()
+}
+fn default_spill_s3_max_objects() -> u64 {
+    1_000_000
 }
 
 fn default_spill_backend() -> String {
@@ -885,6 +925,7 @@ impl Default for WorkerSpillConfig {
             max_concurrent_reads: default_spill_max_concurrent_io(),
             cleanup_on_start: true,
             orphan_age: default_spill_orphan_age(),
+            s3: WorkerSpillS3Config::default(),
         }
     }
 }

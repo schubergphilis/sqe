@@ -16,9 +16,11 @@ arrow-array = { workspace = true }
 arrow-ipc = { workspace = true }
 arrow-schema = { workspace = true }
 async-trait = { workspace = true }
+bytes = { workspace = true }
 crc32fast = "1.4"
 datafusion = { workspace = true }
 futures = { workspace = true }
+object_store = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

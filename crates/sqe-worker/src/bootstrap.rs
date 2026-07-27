@@ -21,7 +21,9 @@ use prometheus::Counter;
 use sqe_catalog::FooterCache;
 use sqe_core::{parse_memory_limit, FlightCompression, SqeConfig};
 use sqe_metrics::WorkerMetricsRegistry;
-use sqe_spill::{LocalSegmentStore, MemoryGovernor, SpillManager};
+use sqe_spill::{
+    LocalSegmentStore, MemoryGovernor, S3SegmentStore, S3SpillConfig, SpillManager,
+};
 
 use crate::advertise::derive_advertise_url;
 use crate::flight_service::WorkerFlightService;
@@ -188,38 +190,65 @@ fn build_spill_manager(config: &SqeConfig) -> anyhow::Result<Option<Arc<SpillMan
         tracing::info!("Worker spill substrate disabled");
         return Ok(None);
     }
-    match spill.backend.as_str() {
-        "local" => {}
-        other => {
-            return Err(anyhow::anyhow!(
-                "worker.spill.backend = {other:?} is not available in this build \
-                 (Phase 3 implements local only)"
-            ));
-        }
-    }
-    let dir = spill
-        .resolved_directory(&config.worker.spill_dir)
-        .to_string();
-    if dir.is_empty() {
-        return Err(anyhow::anyhow!(
-            "spill enabled but no directory configured \
-             (set worker.spill.directory or worker.spill_dir)"
-        ));
-    }
     let max_bytes = parse_memory_limit(&spill.max_bytes).map_err(|e| {
         anyhow::anyhow!("worker.spill.max_bytes: {e}")
     })? as u64;
-    let min_free = parse_memory_limit(&spill.min_free_bytes).map_err(|e| {
-        anyhow::anyhow!("worker.spill.min_free_bytes: {e}")
-    })? as u64;
-    let store = Arc::new(LocalSegmentStore::open(
-        &dir,
-        max_bytes,
-        min_free,
-        spill.max_concurrent_writes,
-        spill.max_concurrent_reads,
-    )?);
     let orphan_age = spill.orphan_age_duration().map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let store: Arc<dyn sqe_spill::SegmentStore> = match spill.backend.as_str() {
+        "local" => {
+            let dir = spill
+                .resolved_directory(&config.worker.spill_dir)
+                .to_string();
+            if dir.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "spill enabled but no directory configured \
+                     (set worker.spill.directory or worker.spill_dir)"
+                ));
+            }
+            let min_free = parse_memory_limit(&spill.min_free_bytes).map_err(|e| {
+                anyhow::anyhow!("worker.spill.min_free_bytes: {e}")
+            })? as u64;
+            Arc::new(LocalSegmentStore::open(
+                &dir,
+                max_bytes,
+                min_free,
+                spill.max_concurrent_writes,
+                spill.max_concurrent_reads,
+            )?)
+        }
+        "s3" => {
+            let s3 = &spill.s3;
+            let s3_cfg = S3SpillConfig {
+                bucket: s3.bucket.clone(),
+                prefix: s3.prefix.clone(),
+                region: s3.region.clone(),
+                endpoint: s3.endpoint.clone(),
+                access_key_id: s3.access_key_id.clone(),
+                secret_access_key: s3.secret_access_key.clone(),
+                allow_http: s3.allow_http,
+                path_style: s3.path_style || !s3.endpoint.is_empty(),
+                max_bytes,
+                max_objects: s3.max_objects,
+                max_concurrent_writes: spill.max_concurrent_writes,
+                max_concurrent_reads: spill.max_concurrent_reads,
+            };
+            Arc::new(S3SegmentStore::from_config(&s3_cfg)?)
+        }
+        "tiered" => {
+            return Err(anyhow::anyhow!(
+                "worker.spill.backend = \"tiered\" is not available yet \
+                 (local and s3 backends are supported)"
+            ));
+        }
+        other => {
+            return Err(anyhow::anyhow!(
+                "worker.spill.backend = {other:?} is unknown \
+                 (supported: local, s3)"
+            ));
+        }
+    };
+
     let manager = Arc::new(SpillManager::new(store, orphan_age));
     // Orphan cleanup runs async on first use of the manager; avoid
     // block_on during bootstrap (the runtime may already be running).
@@ -233,10 +262,10 @@ fn build_spill_manager(config: &SqeConfig) -> anyhow::Result<Option<Arc<SpillMan
         });
     }
     tracing::info!(
-        spill_dir = %dir,
+        backend = %spill.backend,
         max_bytes,
         cleanup_on_start = spill.cleanup_on_start,
-        "Worker spill manager ready (local backend)"
+        "Worker spill manager ready"
     );
     Ok(Some(manager))
 }
