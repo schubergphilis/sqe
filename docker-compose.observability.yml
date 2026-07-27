@@ -14,7 +14,7 @@
 
 services:
   victoriametrics:
-    image: victoriametrics/victoria-metrics:v1.117.1
+    image: victoriametrics/victoria-metrics:v1.148.0
     command:
       - "-promscrape.config=/etc/prometheus/scrape.yml"
       - "-retentionPeriod=7d"
@@ -27,7 +27,7 @@ services:
     mem_limit: 128m
 
   grafana:
-    image: grafana/grafana:11.6.0
+    image: grafana/grafana:11.6.16
     environment:
       GF_SECURITY_ADMIN_USER: admin
       GF_SECURITY_ADMIN_PASSWORD: admin
