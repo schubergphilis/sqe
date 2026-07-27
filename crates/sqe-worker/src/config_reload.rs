@@ -10,6 +10,10 @@
 //!
 //! Fields that require process restart (ports, spill backend/dir, secrets, TLS)
 //! are logged when they change; previous values keep running.
+//!
+//! **Ports never hot-apply.** Changing `worker.flight_port` or
+//! `metrics.prometheus_port` in the file only emits a warning; the process
+//! keeps listening on the sockets opened at boot until restart.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -65,7 +69,10 @@ pub struct HotReloadHandles {
 /// Config identity that cannot be hot-reloaded safely.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BootConfigIdentity {
+    /// Bound at process start; port changes in sqe.toml are **ignored**.
     pub flight_port: u16,
+    /// Metrics scrape port bound at start (if metrics server is up).
+    pub prometheus_port: u16,
     pub coordinator_url: String,
     pub worker_secret_set: bool,
     pub allow_unauthenticated: bool,
@@ -79,6 +86,7 @@ impl BootConfigIdentity {
     pub fn from_config(config: &SqeConfig) -> Self {
         Self {
             flight_port: config.worker.flight_port,
+            prometheus_port: config.metrics.prometheus_port,
             coordinator_url: config.worker.coordinator_url.clone(),
             worker_secret_set: !config.worker.worker_secret.is_empty(),
             allow_unauthenticated: config.worker.allow_unauthenticated,
@@ -265,24 +273,47 @@ pub fn apply_memory_hot_reload(
     }
 }
 
-fn warn_restart_required(boot: &BootConfigIdentity, next: &SqeConfig) {
+/// Log restart-required fields that changed in `next` vs boot identity.
+///
+/// Port / listen-address changes **never** take effect on reload: the process
+/// keeps the sockets opened at start. Returns `true` if any such field differed.
+pub fn warn_restart_required(boot: &BootConfigIdentity, next: &SqeConfig) -> bool {
     let now = BootConfigIdentity::from_config(next);
     if boot == &now {
-        return;
+        return false;
     }
+    let mut any = false;
     if boot.flight_port != now.flight_port {
+        any = true;
         warn!(
-            previous = boot.flight_port,
-            new = now.flight_port,
-            "worker.flight_port changed; restart required (not hot-reloaded)"
+            listening_on = boot.flight_port,
+            config_value = now.flight_port,
+            "worker.flight_port changed in config but does NOT take effect on \
+             hot-reload — still listening on the boot port. Restart the worker \
+             to bind the new port."
+        );
+    }
+    if boot.prometheus_port != now.prometheus_port {
+        any = true;
+        warn!(
+            listening_on = boot.prometheus_port,
+            config_value = now.prometheus_port,
+            "metrics.prometheus_port changed in config but does NOT take effect \
+             on hot-reload — still scraping the boot port. Restart to rebind."
         );
     }
     if boot.coordinator_url != now.coordinator_url {
-        warn!("worker.coordinator_url changed; restart required (heartbeat keeps boot URL)");
+        any = true;
+        warn!(
+            boot_coordinator_url = %boot.coordinator_url,
+            config_coordinator_url = %now.coordinator_url,
+            "worker.coordinator_url changed; restart required (heartbeat keeps boot URL)"
+        );
     }
     if boot.worker_secret_set != now.worker_secret_set
         || boot.allow_unauthenticated != now.allow_unauthenticated
     {
+        any = true;
         warn!("worker auth settings changed; restart required (not hot-reloaded)");
     }
     if boot.spill_enabled != now.spill_enabled
@@ -290,11 +321,13 @@ fn warn_restart_required(boot: &BootConfigIdentity, next: &SqeConfig) {
         || boot.spill_dir != now.spill_dir
         || boot.spill_to_disk != now.spill_to_disk
     {
+        any = true;
         warn!(
             "worker spill backend/directory/enable changed; restart required \
              (open stores are not re-created)"
         );
     }
+    any
 }
 
 fn file_mtime(path: &Path) -> Option<SystemTime> {
@@ -409,6 +442,7 @@ mod tests {
             hot: hot.clone(),
             boot_identity: BootConfigIdentity {
                 flight_port: 50052,
+                prometheus_port: 9090,
                 coordinator_url: String::new(),
                 worker_secret_set: false,
                 allow_unauthenticated: true,
@@ -419,6 +453,59 @@ mod tests {
             },
         };
         (handles, pool, governor, hot)
+    }
+
+    fn minimal_cfg(worker_flight_port: u16, prometheus_port: u16) -> SqeConfig {
+        use std::io::Write;
+        let mut f = tempfile::NamedTempFile::new().expect("tempfile");
+        write!(
+            f,
+            r#"
+[coordinator]
+[auth]
+[catalog]
+catalog_url = ""
+
+[worker]
+flight_port = {worker_flight_port}
+allow_unauthenticated = true
+
+[metrics]
+prometheus_port = {prometheus_port}
+"#
+        )
+        .expect("write");
+        SqeConfig::load(f.path().to_str().unwrap()).expect("minimal worker config")
+    }
+
+    #[test]
+    fn port_change_warns_and_does_not_mutate_boot_listen_identity() {
+        let boot_cfg = minimal_cfg(50052, 9090);
+        let boot = BootConfigIdentity::from_config(&boot_cfg);
+        assert_eq!(boot.flight_port, 50052);
+        assert_eq!(boot.prometheus_port, 9090);
+
+        let next = minimal_cfg(50099, 9191);
+        assert!(
+            warn_restart_required(&boot, &next),
+            "port deltas must surface restart-required warnings"
+        );
+        // Boot identity is immutable for the process lifetime — hot-reload
+        // never rebinds sockets, so the effective listen ports stay at boot.
+        assert_eq!(boot.flight_port, 50052);
+        assert_eq!(boot.prometheus_port, 9090);
+        assert_ne!(
+            BootConfigIdentity::from_config(&next).flight_port,
+            boot.flight_port
+        );
+    }
+
+    #[test]
+    fn unchanged_ports_do_not_warn_restart() {
+        let boot_cfg = minimal_cfg(50052, 9090);
+        let boot = BootConfigIdentity::from_config(&boot_cfg);
+        let next = minimal_cfg(50052, 9090);
+        assert!(!warn_restart_required(&boot, &next));
     }
 
     #[test]
