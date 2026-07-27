@@ -21,7 +21,7 @@
 
 services:
   spark-iceberg:
-    image: apache/spark:4.0.0
+    image: apache/spark:4.2.0
     container_name: sqe-spark-iceberg
     depends_on:
       polaris:

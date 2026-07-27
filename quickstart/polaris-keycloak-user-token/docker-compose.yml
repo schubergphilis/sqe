@@ -23,7 +23,7 @@ services:
   # name so every token's issuer claim is http://keycloak:8080/realms/iceberg,
   # which is exactly what Polaris validates against.
   keycloak:
-    image: quay.io/keycloak/keycloak:26.5.4
+    image: quay.io/keycloak/keycloak:26.7.0
     command: start-dev
     environment:
       KC_BOOTSTRAP_ADMIN_USERNAME: admin
@@ -50,7 +50,7 @@ services:
   # adorsys/keycloak-config-cli applies _shared/keycloak/realm-iceberg.json
   # and substitutes $(env:NAME) placeholders (client secret, root password).
   keycloak-config:
-    image: adorsys/keycloak-config-cli:6.4.1-26
+    image: adorsys/keycloak-config-cli:6.5.1-26
     environment:
       KEYCLOAK_URL: http://keycloak:8080
       KEYCLOAK_USER: admin
@@ -149,7 +149,7 @@ services:
 
   # ── bucket-init — create the warehouse bucket (RustFS needs real S3) ──
   bucket-init:
-    image: amazon/aws-cli:2.31.15
+    image: amazon/aws-cli:2.36.7
     entrypoint: ["sh", "-c"]
     command:
       - |
@@ -167,7 +167,7 @@ services:
 
   # ── polaris-setup — one-shot RBAC + catalog + namespace bootstrap ─────
   polaris-setup:
-    image: curlimages/curl:8.14.1
+    image: curlimages/curl:8.21.0
     entrypoint: ["sh", "/bootstrap.sh"]
     environment:
       POLARIS_URL: http://polaris:8181
