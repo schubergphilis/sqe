@@ -5,6 +5,7 @@ pub mod credential_channel;
 pub mod executor;
 pub mod flight_service;
 pub mod heartbeat;
+pub mod operator_memory;
 pub mod runtime;
 pub mod shuffle;
 pub mod spill_buffer;

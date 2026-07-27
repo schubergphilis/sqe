@@ -24,8 +24,9 @@ use sqe_metrics::propagation::extract_trace_context;
 use sqe_compaction::wire::{CompactGroupFrame, CompactGroupRequest};
 use sqe_planner::ScanTask;
 use sqe_spill::{
-    split_default_read_headroom, AdmissionRequest, ByteBudget, BytePermit, MemoryGovernor,
-    ReclaimableConsumer, SpillManager, SpillScope, WorkloadClass,
+    split_default_read_headroom, AdmissionRequest, AttemptManifest, ByteBudget, BytePermit,
+    ExchangeAttemptStore, LiveConsumerRegistry, MemoryGovernor, ReclaimableConsumer,
+    SpillManager, SpillScope, TaskKey, WorkloadClass,
 };
 
 use crate::compaction::compact_file_group;
@@ -174,6 +175,10 @@ pub struct WorkerFlightService {
     /// Worker-wide temporary memory governor (Phase 7). Admits shuffle /
     /// operator grants so concurrent stages cannot race the FairSpillPool.
     memory_governor: Option<Arc<MemoryGovernor>>,
+    /// Live reclaimable operators (join/agg/sort) registered under the governor.
+    live_consumers: Arc<LiveConsumerRegistry>,
+    /// Durable exchange attempt manifests (Phase 8).
+    exchange_store: Arc<ExchangeAttemptStore>,
 }
 
 /// Lightweight reclaimable consumer for one DoExchange partition grant.
@@ -217,6 +222,8 @@ impl WorkerFlightService {
             spill_manager: None,
             shuffle_memory_budget: DEFAULT_SHUFFLE_MEMORY_BUDGET,
             memory_governor: None,
+            live_consumers: Arc::new(LiveConsumerRegistry::new()),
+            exchange_store: Arc::new(ExchangeAttemptStore::new()),
         }
     }
 
@@ -242,6 +249,8 @@ impl WorkerFlightService {
             spill_manager: None,
             shuffle_memory_budget: DEFAULT_SHUFFLE_MEMORY_BUDGET,
             memory_governor: None,
+            live_consumers: Arc::new(LiveConsumerRegistry::new()),
+            exchange_store: Arc::new(ExchangeAttemptStore::new()),
         }
     }
 
@@ -312,6 +321,16 @@ impl WorkerFlightService {
     /// Memory governor when wired at bootstrap.
     pub fn memory_governor(&self) -> Option<&Arc<MemoryGovernor>> {
         self.memory_governor.as_ref()
+    }
+
+    /// Live consumer registry for join/agg/sort reclaim.
+    pub fn live_consumers(&self) -> &Arc<LiveConsumerRegistry> {
+        &self.live_consumers
+    }
+
+    /// Durable exchange attempt store (Phase 8).
+    pub fn exchange_store(&self) -> &Arc<ExchangeAttemptStore> {
+        &self.exchange_store
     }
 
     /// Configured shuffle memory budget in bytes.
@@ -441,6 +460,15 @@ impl WorkerFlightService {
     ) -> Result<Response<BoxStream<FlightData>>, Status> {
         let attempt_gate = self.shuffle_manager.attempts().clone();
         let budget_bytes = self.shuffle_memory_budget;
+
+        // Phase 8: reject late data against durable exchange winner registry.
+        let task_key = TaskKey::new(query_id, stage_id, format!("p{partition_id}"), partition_id);
+        if !self.exchange_store.admit(&task_key, attempt_id) {
+            return Err(Status::aborted(format!(
+                "rejecting late exchange attempt query={query_id} stage={stage_id} \
+                 partition={partition_id} attempt={attempt_id}"
+            )));
+        }
 
         // Phase 7: admit a shuffle partition grant through the worker governor
         // when configured. RAII guard releases the grant on all exit paths.
@@ -642,6 +670,35 @@ impl WorkerFlightService {
             peak_resident = peak_resident,
             "DoExchange spill partition finished"
         );
+
+        // Phase 8: publish durable attempt manifest and commit as winner so
+        // retries can reuse segments and late lower attempts are rejected.
+        let task_id = format!("p{partition_id}");
+        let mut attempt_manifest = AttemptManifest::new(
+            query_id,
+            stage_id,
+            &task_id,
+            partition_id,
+            attempt_id,
+        );
+        attempt_manifest.rows = manifest.rows;
+        attempt_manifest.batches = manifest.batches;
+        attempt_manifest.logical_bytes = manifest.logical_bytes;
+        attempt_manifest.physical_bytes = manifest.physical_bytes;
+        attempt_manifest.segments = (0..manifest.segments)
+            .map(|i| format!("seg-{i:08}"))
+            .collect();
+        if let Err(e) = self.exchange_store.publish(attempt_manifest) {
+            warn!(error = %e, "Failed to publish exchange attempt manifest");
+        } else {
+            let key = TaskKey::new(query_id, stage_id, &task_id, partition_id);
+            if let Err(e) = self.exchange_store.commit_winner(&key, attempt_id) {
+                // Higher winner already committed — treat as late attempt.
+                return Err(Status::aborted(format!(
+                    "exchange winner commit rejected: {e}"
+                )));
+            }
+        }
 
         let drain = buffer.into_drain_stream().await.map_err(|e| {
             Status::internal(format!("shuffle spill drain open failed: {e}"))
