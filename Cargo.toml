@@ -22,9 +22,8 @@ members = [
     "crates/sqe-bench",
     "xtask",
 ]
-# Exclude vendored iceberg-rust. It has its own workspace.
-# SQE references the crates via path deps, not workspace members.
-exclude = ["vendor/iceberg-rust"]
+# Exclude vendored trees. They are referenced via path / [patch], not members.
+exclude = ["vendor/iceberg-rust", "vendor/jiter"]
 
 [workspace.package]
 version = "0.37.0"
@@ -238,3 +237,10 @@ lto = false              # Skip LTO — the link-time RAM peak is what
 codegen-units = 16       # More parallel codegen per crate; faster wall time.
 incremental = true       # Reuse artifacts across iterations — huge for loop work.
 strip = false            # Keep symbols; benchmarks want readable traces.
+
+# jiter 0.15 pins optional pyo3 ^0.28 (GHSA-36hh-v3qg-5jq4 / RUSTSEC-2026-0176).
+# datafusion-functions-json requires jiter 0.15; jiter 0.16 (pyo3 0.29) is
+# semver-incompatible. Vendor jiter 0.15 with pyo3 optional dep raised to 0.29.
+# python feature remains off for SQE builds; the lock still records pyo3.
+[patch.crates-io]
+jiter = { path = "vendor/jiter" }
