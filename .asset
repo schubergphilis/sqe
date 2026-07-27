@@ -15,6 +15,20 @@ hardening = true
 secret_scan = true
 sbom_verify = true
 
+# Repo-owned license waiver. Per-repo/per-library exceptions live HERE, not in
+# aikido's central policy/license-policy.json (which holds only group-wide rules).
+# Read by sbom_license_check.py, which stamps this project on before matching, so a
+# .asset can never waive anything for another repo. Requires aikido >= v0.9.0 (the
+# first release whose pinned tools image can read .asset).
+[[license_exception]]
+id = "OSS-LGPL-R-EFI-UEFI-ONLY-2026"
+component = "pkg:cargo/r-efi@*"
+licenses = ["LGPL-2.1-or-later", "LGPL-*"]
+scope = "platform-optional-not-linked"
+owner = "vpf-data-ai/chameleon sqlengine maintainers"
+reason = "r-efi is UEFI firmware ABI bindings pulled only as a target-specific dependency of getrandom (0.3+/0.4) for target_os=uefi. SQE does not build or ship UEFI binaries; Linux/macOS/Windows server artifacts do not link r-efi. No drop-in replacement exists for getrandom's UEFI backend. Prefer removing if getrandom drops the dep; until then treat as platform-optional not-linked."
+expires = "2027-07-27"
+
 [[registry]]
 type = "harbor"
 repo = "repo.sovereign-data.org/chameleon"
