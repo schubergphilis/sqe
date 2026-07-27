@@ -116,6 +116,12 @@ mod tests {
 
     fn make_task(id: &str) -> ScanTask {
         ScanTask {
+            version: 1,
+            morsel_id: None,
+            row_group_start: None,
+            row_group_end: None,
+            start_byte: None,
+            end_byte: None,
             fragment_id: id.to_string(),
             data_file_paths: vec!["s3://bucket/file.parquet".to_string()],
             file_sizes_bytes: vec![],

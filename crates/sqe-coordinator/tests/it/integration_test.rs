@@ -324,6 +324,12 @@ async fn test_local_fallback_without_workers() {
 #[test]
 fn test_scan_task_roundtrip() {
     let task = sqe_planner::ScanTask {
+            version: 1,
+            morsel_id: None,
+            row_group_start: None,
+            row_group_end: None,
+            start_byte: None,
+            end_byte: None,
         fragment_id: "test-001".to_string(),
         data_file_paths: vec![
             "s3://bucket/data/file1.parquet".to_string(),
