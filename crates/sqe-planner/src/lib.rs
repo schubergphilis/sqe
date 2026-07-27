@@ -5,6 +5,7 @@ pub mod external_aggregate;
 pub mod grace_hash_join;
 pub mod join_strategy;
 pub mod sort_memory;
+pub mod sort_memory_rule;
 pub mod predicate_transfer;
 pub mod scan_morsel;
 pub mod scan_task;
@@ -37,10 +38,13 @@ pub use grace_hash_join::{
     choose_local_join_strategy, grace_inner_join, GraceHashJoinConfig, GraceJoinConsumer,
     GraceJoinProfile, LocalJoinStrategy, DEFAULT_GRACE_PARTITIONS, DEFAULT_MAX_RECURSION,
 };
-pub use join_strategy::{BuildSizeEstimate, JoinStrategyRule};
+pub use join_strategy::{
+    BuildSizeEstimate, JoinStrategyRule, DEFAULT_HASH_JOIN_THRESHOLD,
+};
 pub use sort_memory::{
     SortAdmissionError, SortConsumer, SortMemoryPolicy, DEFAULT_SORT_MERGE_FANIN,
 };
+pub use sort_memory_rule::SortMemoryRule;
 pub use star_schema_reorder::{StarSchemaReorderRule, DEFAULT_MIN_RATIO};
 pub use predicate_transfer::{
     build_predicate_transfer, extract_distinct_from_batches, extract_distinct_values,
