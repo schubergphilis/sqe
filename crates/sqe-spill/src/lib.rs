@@ -14,9 +14,11 @@
 pub mod accounted;
 pub mod budget;
 pub mod error;
+pub mod exchange;
 pub mod fault;
 pub mod governor;
 pub mod manager;
+pub mod operator_admit;
 pub mod reclaim;
 pub mod scope;
 pub mod segment;
@@ -34,9 +36,16 @@ pub use fault::{
     SpillFault,
 };
 pub use manager::{SpillManager, SpillScopeGuard};
+pub use exchange::{
+    exchange_scope, read_manifest, write_manifest_atomic, AttemptManifest, AttemptState,
+    ExchangeAttemptStore, SharedExchangeAttemptStore, TaskKey, ATTEMPT_MANIFEST_VERSION,
+};
 pub use governor::{
     AdmissionDecision, AdmissionRequest, GrantGuard, MemoryGovernor, SharedMemoryGovernor,
     WorkloadClass,
+};
+pub use operator_admit::{
+    admit_operator, LiveConsumerRegistry, OperatorConsumer, OperatorGrantGuard,
 };
 pub use reclaim::{
     GrantRegistry, MemoryGrant, ReclaimableConsumer, SharedGrantRegistry,

@@ -945,20 +945,20 @@ layer. Phase 8 adds durable-exchange semantics on top of it: attempt
 manifests, winner commit, and segment reuse. It does not introduce a second
 object-store backend or segment format.
 
-- [ ] Reuse the Phase 3 `SegmentStore` abstraction; extend, never fork it.
-- [ ] Use a dedicated exchange bucket/prefix and credential, not a table-vended
+- [x] Reuse the Phase 3 `SegmentStore` abstraction; extend, never fork it.
+- [x] Use a dedicated exchange bucket/prefix and credential, not a table-vended
       credential (this generalizes the Phase 3 S3-spill rule; exchange may use
       its own prefix under the spill bucket or a separate bucket).
-- [ ] Publish task-attempt manifests atomically after every segment is durable.
-- [ ] Commit one winning attempt per task.
-- [ ] Reuse completed upstream segments on retry.
-- [ ] Reject losing-attempt output.
+- [x] Publish task-attempt manifests atomically after every segment is durable.
+- [x] Commit one winning attempt per task.
+- [x] Reuse completed upstream segments on retry.
+- [x] Reject losing-attempt output.
 - [ ] Add lifecycle tags and object-store expiry policies.
 - [ ] Encrypt transport and server-side objects according to deployment policy.
 - [ ] Persist enough coordinator stage state to retry workers during the
       coordinator's lifetime. Coordinator restart recovery remains a later
       phase unless included explicitly.
-- [ ] Test worker kill during write, after publish, and during downstream read.
+- [x] Test worker kill during write, after publish, and during downstream read.
 - [ ] Test throttling, partial upload, timeout, and duplicate completion.
 
 **Gate:** Killing one worker after an upstream stage completes retries only the
