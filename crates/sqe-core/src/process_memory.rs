@@ -24,17 +24,31 @@
 //!
 //! ## Lifecycle (config vs kernel)
 //!
-//! - **`sqe.toml` / `worker.memory_limit`**: loaded once at process start. There
-//!   is no hot-reload of the DataFusion pool, governor, or spill budgets. Change
-//!   the file and **restart** the worker.
-//! - **Kernel / cgroup limit**: can move under a live process (Kubernetes
-//!   in-place resize, `systemd` property changes, nested limit rewrites). Each
-//!   call to [`runtime_memory_info`] re-reads `/sys` and `/proc`. Use
-//!   [`spawn_runtime_memory_watch`] to log when the live enforced limit drifts
-//!   from the value seen at boot relative to the configured need.
-//! - Mid-run we **do not** resize the memory pool automatically: in-flight
-//!   grants and reservations would be inconsistent. Operators get a loud log
-//!   and must restart (or raise the cgroup) when need no longer fits.
+//! Two independent control planes:
+//!
+//! 1. **`sqe.toml` / `worker.memory_limit`** — process config. Loaded once at
+//!    start. No hot-reload of the DataFusion pool, governor, or spill budgets.
+//!    Change the file and **restart** the worker.
+//! 2. **Kernel cgroup control files** — apply **live without restarting the
+//!    container**. Writes to cgroup v2 `memory.max` / `cpu.max` (or v1
+//!    `memory.limit_in_bytes` / `cpu.cfs_quota_us`) take effect immediately.
+//!    Kubernetes in-place pod resize (InPlacePodVerticalScaling) has the
+//!    kubelet update those files under a still-running container (subject to
+//!    `resizePolicy`; some cases still force restart). Manual `docker update`
+//!    / `systemctl set-property` works the same way, but the runtime may
+//!    overwrite non-API changes on reconcile.
+//!
+//! Each [`runtime_memory_info`] call re-reads `/sys` and `/proc`. The watch
+//! ([`spawn_runtime_memory_watch`]) classifies live memory shrinks:
+//!
+//! - **Below working set** (`memory.current` or RSS): kernel reclaims; if it
+//!   cannot fit under the new limit it **OOM-kills** (memory shrink risk).
+//!   CPU limit lowers only throttle — no kill.
+//! - **Below configured need but still above working set**: pool/governor no
+//!   longer match the cgroup; log error, no auto-resize of in-process budgets.
+//!
+//! Mid-run we never resize the memory pool automatically: in-flight grants
+//! would be inconsistent. The kernel OOM path is independent of that choice.
 
 use std::fmt;
 use std::time::Duration;
@@ -208,6 +222,87 @@ impl RuntimeMemoryInfo {
             _ => false,
         }
     }
+
+    /// Best available live working-set signal for OOM-risk checks.
+    ///
+    /// Prefers cgroup `memory.current` / `memory.usage_in_bytes` (whole cgroup,
+    /// what the kernel compares against `memory.max`). Falls back to process
+    /// RSS when cgroup usage is unreadable.
+    pub fn working_set_bytes(&self) -> Option<u64> {
+        self.cgroup
+            .memory_current_bytes
+            .or(self.process_rss_bytes)
+            .filter(|&n| n > 0)
+    }
+
+    /// Live enforced limit is strictly below the working set.
+    ///
+    /// On cgroup v2, writing a lower `memory.max` applies immediately; the
+    /// kernel reclaims and OOM-kills if usage cannot fit. Same class of risk
+    /// on v1 `memory.limit_in_bytes`.
+    pub fn enforced_below_working_set(&self) -> bool {
+        match (self.enforced_memory_limit_bytes, self.working_set_bytes()) {
+            (Some(enforced), Some(ws)) if enforced > 0 => enforced < ws,
+            _ => false,
+        }
+    }
+
+    /// Classify pressure of the live cgroup limit vs working set and config.
+    pub fn assess_enforced_pressure(
+        &self,
+        configured_need_bytes: u64,
+    ) -> EnforcedLimitPressure {
+        let Some(enforced) = self.enforced_memory_limit_bytes.filter(|&n| n > 0) else {
+            return EnforcedLimitPressure::NoEnforcedLimit;
+        };
+        let working_set = self.working_set_bytes();
+        if let Some(ws) = working_set {
+            if enforced < ws {
+                return EnforcedLimitPressure::OomRisk {
+                    enforced_bytes: enforced,
+                    working_set_bytes: ws,
+                };
+            }
+        }
+        if configured_need_bytes > enforced {
+            return EnforcedLimitPressure::ConfigExceedsLimit {
+                enforced_bytes: enforced,
+                configured_need_bytes,
+                working_set_bytes: working_set.unwrap_or(0),
+            };
+        }
+        EnforcedLimitPressure::WithinLimits {
+            enforced_bytes: enforced,
+            configured_need_bytes,
+            working_set_bytes: working_set.unwrap_or(0),
+        }
+    }
+}
+
+/// How the live cgroup limit sits relative to usage and process config.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnforcedLimitPressure {
+    /// No finite cgroup memory max (or non-Linux).
+    NoEnforcedLimit,
+    /// `memory.max` (etc.) is below current cgroup usage / RSS — reclaim then
+    /// possible OOM-kill. Independent of whether the container was restarted.
+    OomRisk {
+        enforced_bytes: u64,
+        working_set_bytes: u64,
+    },
+    /// Limit still above working set, but below `memory_limit + headroom`.
+    /// In-process pool is oversized until restart; kernel may not kill yet.
+    ConfigExceedsLimit {
+        enforced_bytes: u64,
+        configured_need_bytes: u64,
+        working_set_bytes: u64,
+    },
+    /// Enforced limit covers both working set and configured need.
+    WithinLimits {
+        enforced_bytes: u64,
+        configured_need_bytes: u64,
+        working_set_bytes: u64,
+    },
 }
 
 /// Diff between two probes (cgroup/container/OS — not sqe.toml).
@@ -239,6 +334,24 @@ impl RuntimeMemoryChange {
 
     pub fn any(&self) -> bool {
         self.enforced_limit_changed || self.container_changed || self.cgroup_path_changed
+    }
+
+    /// Finite limit decreased (live cgroup shrink, e.g. in-place pod resize).
+    pub fn enforced_shrank(&self) -> bool {
+        match (self.previous_enforced_bytes, self.current_enforced_bytes) {
+            (Some(prev), Some(cur)) => cur < prev,
+            // Unlimited (None) is not a tighter cap; finite -> unlimited is relief.
+            _ => false,
+        }
+    }
+
+    /// Finite limit increased, or unlimited became a higher finite value.
+    pub fn enforced_grew(&self) -> bool {
+        match (self.previous_enforced_bytes, self.current_enforced_bytes) {
+            (Some(prev), Some(cur)) => cur > prev,
+            (None, Some(_)) => true,
+            _ => false,
+        }
     }
 }
 
@@ -319,13 +432,16 @@ pub fn enforced_memory_limit_source() -> &'static str {
     runtime_memory_info().enforced_memory_limit_source
 }
 
-/// Periodically re-probe container/cgroup/OS memory and log when the **live
-/// kernel limit** moves relative to boot or no longer covers `configured_need_bytes`.
+/// Periodically re-probe container/cgroup/OS memory.
 ///
-/// This does **not** reload `sqe.toml`. Pool size and governor budgets stay at
-/// the values fixed when the process started. When the live cgroup shrinks
-/// below the configured need, we log at error level; the operator must
-/// restart with a lower `worker.memory_limit` or raise the cgroup.
+/// Cgroup limit files apply **live** (no container restart). This watch does
+/// **not** reload `sqe.toml` or resize the in-process pool. It logs:
+///
+/// - **OOM risk** when the new `memory.max` is below cgroup usage / RSS
+///   (kernel reclaim; kill if reclaim fails).
+/// - **Config mismatch** when the limit is below `memory_limit + headroom`
+///   but still above the working set (pool oversized until restart).
+/// - Growth / shrink of the finite limit for ops visibility.
 ///
 /// Returns a [`JoinHandle`] so callers can abort on shutdown if desired.
 /// Matches the worker heartbeat pattern (process-lifetime background task).
@@ -344,15 +460,20 @@ pub fn spawn_runtime_memory_watch(
             interval_secs = interval.as_secs(),
             configured_need_bytes,
             enforced_memory_limit_bytes = last.enforced_memory_limit_bytes.unwrap_or(0),
+            cgroup_memory_current_bytes = last.cgroup.memory_current_bytes.unwrap_or(0),
+            process_rss_bytes = last.process_rss_bytes.unwrap_or(0),
             enforced_source = last.enforced_memory_limit_source,
+            cgroup_version = %last.cgroup.version,
             os = %last.os,
             container = %last.container,
-            "Watching live container/cgroup/OS memory (sqe.toml memory settings are not hot-reloaded)"
+            "Watching live cgroup memory.max (applies without container restart; \
+             sqe.toml pool size is not hot-reloaded)"
         );
         loop {
             tokio::time::sleep(interval).await;
             let now = runtime_memory_info();
             let change = RuntimeMemoryChange::between(&last, &now);
+            let pressure = now.assess_enforced_pressure(configured_need_bytes);
 
             if change.any() {
                 tracing::warn!(
@@ -361,36 +482,77 @@ pub fn spawn_runtime_memory_watch(
                     previous_source = change.previous_source,
                     current_source = change.current_source,
                     enforced_limit_changed = change.enforced_limit_changed,
+                    enforced_shrank = change.enforced_shrank(),
+                    enforced_grew = change.enforced_grew(),
                     container_changed = change.container_changed,
                     cgroup_path_changed = change.cgroup_path_changed,
                     container = %now.container,
+                    cgroup_version = %now.cgroup.version,
                     cgroup_path = now.cgroup.path.as_deref().unwrap_or(""),
+                    cgroup_memory_current_bytes = now.cgroup.memory_current_bytes.unwrap_or(0),
                     process_rss_bytes = now.process_rss_bytes.unwrap_or(0),
                     host_total_bytes = now.host.total_bytes.unwrap_or(0),
-                    "Live runtime memory environment changed (cgroup/container/OS; not sqe.toml)"
+                    "Live cgroup/container memory environment changed (kernel applies \
+                     memory.max without restart; in-process pool unchanged)"
                 );
             }
 
-            if now.configured_need_exceeds_enforced(configured_need_bytes) {
-                let enforced = now.enforced_memory_limit_bytes.unwrap_or(0);
-                tracing::error!(
-                    configured_need_bytes,
-                    enforced_memory_limit_bytes = enforced,
-                    enforced_source = now.enforced_memory_limit_source,
-                    os = %now.os,
-                    container = %now.container,
-                    cgroup_version = %now.cgroup.version,
-                    "Configured memory_limit+headroom no longer fits live cgroup limit. \
-                     Pool size is fixed until restart — lower worker.memory_limit and restart, \
-                     or raise the container/cgroup memory limit."
-                );
-            } else if change.enforced_limit_changed {
-                tracing::info!(
-                    configured_need_bytes,
-                    enforced_memory_limit_bytes = now.enforced_memory_limit_bytes.unwrap_or(0),
-                    enforced_source = now.enforced_memory_limit_source,
-                    "Live enforced memory limit still covers configured need"
-                );
+            match pressure {
+                EnforcedLimitPressure::OomRisk {
+                    enforced_bytes,
+                    working_set_bytes,
+                } => {
+                    // Live shrink below usage: reclaim then OOM-kill risk.
+                    tracing::error!(
+                        enforced_memory_limit_bytes = enforced_bytes,
+                        working_set_bytes,
+                        cgroup_memory_current_bytes =
+                            now.cgroup.memory_current_bytes.unwrap_or(0),
+                        process_rss_bytes = now.process_rss_bytes.unwrap_or(0),
+                        configured_need_bytes,
+                        enforced_source = now.enforced_memory_limit_source,
+                        cgroup_version = %now.cgroup.version,
+                        container = %now.container,
+                        "Live cgroup memory limit is below current working set. \
+                         Kernel will reclaim; if usage cannot fit, the process is \
+                         OOM-killed. Raise the cgroup limit or free memory immediately \
+                         (spill/restart). CPU limit changes only throttle; memory shrinks kill."
+                    );
+                }
+                EnforcedLimitPressure::ConfigExceedsLimit {
+                    enforced_bytes,
+                    configured_need_bytes: need,
+                    working_set_bytes,
+                } => {
+                    tracing::error!(
+                        configured_need_bytes = need,
+                        enforced_memory_limit_bytes = enforced_bytes,
+                        working_set_bytes,
+                        enforced_source = now.enforced_memory_limit_source,
+                        cgroup_version = %now.cgroup.version,
+                        container = %now.container,
+                        "Live cgroup limit is below worker.memory_limit+headroom but still \
+                         above working set. In-process pool stays oversized until restart — \
+                         lower memory_limit and restart, or raise the cgroup limit \
+                         (K8s in-place resize / memory.max)."
+                    );
+                }
+                EnforcedLimitPressure::WithinLimits { .. }
+                    if change.enforced_limit_changed =>
+                {
+                    tracing::info!(
+                        configured_need_bytes,
+                        enforced_memory_limit_bytes =
+                            now.enforced_memory_limit_bytes.unwrap_or(0),
+                        working_set_bytes = now.working_set_bytes().unwrap_or(0),
+                        enforced_source = now.enforced_memory_limit_source,
+                        enforced_grew = change.enforced_grew(),
+                        enforced_shrank = change.enforced_shrank(),
+                        "Live cgroup memory limit still covers working set and configured need"
+                    );
+                }
+                EnforcedLimitPressure::NoEnforcedLimit | EnforcedLimitPressure::WithinLimits { .. } => {
+                }
             }
 
             last = now;
@@ -933,5 +1095,57 @@ mod tests {
         assert!(info.configured_need_exceeds_enforced(2048));
         assert!(!info.configured_need_exceeds_enforced(512));
         assert!(!info.configured_need_exceeds_enforced(1024));
+    }
+
+    #[test]
+    fn pressure_oom_when_limit_below_working_set() {
+        let mut info = runtime_memory_info();
+        info.enforced_memory_limit_bytes = Some(100);
+        info.cgroup.memory_current_bytes = Some(500);
+        info.process_rss_bytes = Some(400);
+        assert!(info.enforced_below_working_set());
+        assert_eq!(info.working_set_bytes(), Some(500));
+        assert!(matches!(
+            info.assess_enforced_pressure(50),
+            EnforcedLimitPressure::OomRisk {
+                enforced_bytes: 100,
+                working_set_bytes: 500,
+            }
+        ));
+    }
+
+    #[test]
+    fn pressure_config_exceeds_when_usage_still_fits() {
+        let mut info = runtime_memory_info();
+        info.enforced_memory_limit_bytes = Some(1000);
+        info.cgroup.memory_current_bytes = Some(200);
+        match info.assess_enforced_pressure(5000) {
+            EnforcedLimitPressure::ConfigExceedsLimit {
+                enforced_bytes,
+                configured_need_bytes,
+                working_set_bytes,
+            } => {
+                assert_eq!(enforced_bytes, 1000);
+                assert_eq!(configured_need_bytes, 5000);
+                assert_eq!(working_set_bytes, 200);
+            }
+            other => panic!("expected ConfigExceedsLimit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn enforced_shrank_and_grew() {
+        let mut prev = runtime_memory_info();
+        let mut next = prev.clone();
+        prev.enforced_memory_limit_bytes = Some(2000);
+        next.enforced_memory_limit_bytes = Some(1000);
+        let shrink = RuntimeMemoryChange::between(&prev, &next);
+        assert!(shrink.enforced_shrank());
+        assert!(!shrink.enforced_grew());
+
+        next.enforced_memory_limit_bytes = Some(4000);
+        let grow = RuntimeMemoryChange::between(&prev, &next);
+        assert!(grow.enforced_grew());
+        assert!(!grow.enforced_shrank());
     }
 }
