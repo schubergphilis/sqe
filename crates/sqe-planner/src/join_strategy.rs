@@ -22,6 +22,7 @@ use datafusion::config::ConfigOptions;
 use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_expr::{LexOrdering, PhysicalExpr, PhysicalSortExpr};
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
+use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::joins::utils::JoinFilter;
 use datafusion::physical_plan::joins::{HashJoinExec, SortMergeJoinExec};
 use datafusion::physical_plan::projection::ProjectionExec;
@@ -305,9 +306,23 @@ fn convert_to_sort_merge_join(
 /// which is the invariant sort-merge join relies on; this applies the same
 /// grouping to an inherited filter and remaps the expression to match.
 ///
+/// Grouping is the canonical form, not just the one form that happens to work
+/// here. Sort-merge join has two filter paths with opposite conventions:
+/// `materializing_stream` regroups by side via `get_filter_columns`, while
+/// `bitwise_stream`'s `evaluate_filter_for_inner_row` materializes in
+/// `column_indices` order. An interleaved filter satisfies only the second; a
+/// grouped one satisfies both, because the two orders coincide once the sides
+/// are grouped. Do not drop the grouping on the grounds that one path
+/// tolerates the original order.
+///
+/// Note `ColumnIndex::index` is deliberately left alone: both paths address the
+/// full, unprojected input-side batch (`batch.columns()`), exactly as
+/// `HashJoinExec` does, so only the *positions within the filter's intermediate
+/// schema* change.
+///
 /// Returns `Ok(None)` when the filter reads a `JoinSide::None` column (the mark
-/// column of a mark join), which `get_filter_columns` drops entirely and no
-/// reordering can rescue.
+/// column of a mark join), which `get_filter_columns` drops entirely and
+/// `evaluate_filter_for_inner_row` rejects outright -- no reordering rescues it.
 fn regroup_join_filter_for_sort_merge(filter: &JoinFilter) -> Result<Option<JoinFilter>> {
     let column_indices = filter.column_indices();
 
@@ -377,13 +392,40 @@ fn regroup_join_filter_for_sort_merge(filter: &JoinFilter) -> Result<Option<Join
     Ok(Some(JoinFilter::new(expression, regrouped_indices, schema)))
 }
 
-/// Wrap the input plan in a `SortExec` if it is not already sorted on the
-/// required sort expressions. If the input's output ordering already
-/// satisfies the required ordering, return it as-is.
+/// Coalesce the input to a single partition, then wrap it in a `SortExec` if it
+/// is not already sorted on the required sort expressions.
+///
+/// `SortMergeJoinExec::required_input_distribution` asks for
+/// `Distribution::HashPartitioned` on the join keys per side, which a single
+/// partition satisfies. The coalesce is not optional: this rule runs *after*
+/// DataFusion's `EnforceDistribution`/`EnforceSorting`, so whatever it builds
+/// executes verbatim and nothing downstream inserts the exchange.
+///
+/// A bare `SortExec` over a multi-partition input is the trap. `SortExec::new`
+/// leaves `preserve_partitioning` false, which declares a single output
+/// partition, so `execute(0)` consumes only input partition 0 and the other
+/// partitions are silently dropped -- no error, just missing rows. TPC-H q02
+/// returned 3 rows instead of 48 (`SortExec` reporting 8192 rows over a scan
+/// that produced 80,000), q18 44 of 100, and q21 varied run to run because
+/// round-robin batch assignment varies.
+///
+/// Coalescing rather than hash-repartitioning both sides is deliberate: it
+/// serializes the join but cannot change the node's output partition count in a
+/// way the unchanged parent operators were not built for. See the module note
+/// on running this rule inside the optimizer pipeline instead.
 fn ensure_sorted(
     input: Arc<dyn ExecutionPlan>,
     required_sort: &[PhysicalSortExpr],
 ) -> Arc<dyn ExecutionPlan> {
+    // Coalesce first: this both satisfies the single-partition requirement and
+    // discards any per-partition ordering, so the sortedness check below has to
+    // run on the coalesced plan to stay honest.
+    let input: Arc<dyn ExecutionPlan> = if input.output_partitioning().partition_count() > 1 {
+        Arc::new(CoalescePartitionsExec::new(input))
+    } else {
+        input
+    };
+
     // Check if the input is already sorted on the required columns.
     if is_sorted_on(&input, required_sort) {
         return input;
@@ -479,6 +521,72 @@ mod tests {
             )
             .unwrap(),
         )
+    }
+
+    /// A multi-partition input must be coalesced before the `SortExec`.
+    ///
+    /// `SortExec::new` leaves `preserve_partitioning` false, so it declares one
+    /// output partition and `execute(0)` reads only input partition 0. Because
+    /// this rule runs after `EnforceDistribution`, nothing downstream inserts
+    /// the coalesce, and the remaining partitions are dropped with no error --
+    /// TPC-H q02 returned 3 rows of 48.
+    #[test]
+    fn ensure_sorted_coalesces_multi_partition_input() {
+        let schema = test_schema();
+        let multi: Arc<dyn ExecutionPlan> = Arc::new(
+            datafusion::physical_plan::repartition::RepartitionExec::try_new(
+                make_memory_plan(schema.clone()),
+                datafusion::physical_plan::Partitioning::RoundRobinBatch(4),
+            )
+            .unwrap(),
+        );
+        assert_eq!(multi.output_partitioning().partition_count(), 4);
+
+        let sort_exprs = vec![PhysicalSortExpr::new(
+            datafusion::physical_expr::expressions::col("id", &schema).unwrap(),
+            SortOptions::default(),
+        )];
+        let sorted = ensure_sorted(multi, &sort_exprs);
+
+        assert_eq!(
+            sorted.output_partitioning().partition_count(),
+            1,
+            "sort-merge join input must be a single partition"
+        );
+        let sort_exec = sorted
+            .downcast_ref::<SortExec>()
+            .expect("unsorted input should be wrapped in a SortExec");
+        assert!(
+            sort_exec.children()[0]
+                .downcast_ref::<CoalescePartitionsExec>()
+                .is_some(),
+            "SortExec must sit above a CoalescePartitionsExec, else it reads \
+             only partition 0 and silently drops the rest"
+        );
+    }
+
+    /// A single-partition input needs no coalesce.
+    #[test]
+    fn ensure_sorted_leaves_single_partition_input_uncoalesced() {
+        let schema = test_schema();
+        let single = make_memory_plan(schema.clone());
+        // The empty LazyMemoryExec helper reports 0 partitions; either way it is
+        // not multi-partition, which is what matters here.
+        assert!(single.output_partitioning().partition_count() <= 1);
+
+        let sort_exprs = vec![PhysicalSortExpr::new(
+            datafusion::physical_expr::expressions::col("id", &schema).unwrap(),
+            SortOptions::default(),
+        )];
+        let sorted = ensure_sorted(single, &sort_exprs);
+
+        let sort_exec = sorted.downcast_ref::<SortExec>().expect("should sort");
+        assert!(
+            sort_exec.children()[0]
+                .downcast_ref::<CoalescePartitionsExec>()
+                .is_none(),
+            "no coalesce should be inserted for an already-single-partition input"
+        );
     }
 
     /// Build a two-column join filter whose intermediate schema is
