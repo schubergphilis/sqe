@@ -730,13 +730,27 @@ async fn open_parquet_stream(
                     cursor = cursor.saturating_add(compressed);
                 }
                 if by_byte.is_empty() {
-                    warn!(
+                    // A byte-range morsel whose range contains no row-group
+                    // start owns no row groups: each overlapping row group
+                    // begins inside an adjacent morsel and is read there.
+                    // Select nothing. Falling through to a whole-file read
+                    // (the old behaviour) would read those row groups a second
+                    // time, and since morsels run as independent fragments with
+                    // no dedup, duplicate every one of the file's rows in the
+                    // result. Common for the tail sliver when the coordinator
+                    // tiles a file at fixed byte offsets, so log at debug.
+                    debug!(
                         fragment_id = %task.fragment_id,
                         range_start,
                         range_end,
                         n_groups,
-                        "Byte-range morsel matched no row groups; reading whole file"
+                        "Byte-range morsel matched no row groups; selecting none"
                     );
+                    if let Some(ref mut explicit) = selected {
+                        explicit.clear();
+                    } else {
+                        selected = Some(Vec::new());
+                    }
                 } else if let Some(ref mut explicit) = selected {
                     // Intersect explicit row-group range with byte selection.
                     explicit.retain(|g| by_byte.contains(g));
@@ -746,17 +760,19 @@ async fn open_parquet_stream(
             }
         }
 
+        // `Some(groups)` is an explicit selection and is applied verbatim, even
+        // when empty: an empty selection means "this morsel owns no row groups"
+        // and must read nothing. `None` means no morsel restriction was given,
+        // so the whole file is read.
         if let Some(groups) = selected {
-            if !groups.is_empty() {
-                debug!(
-                    fragment_id = %task.fragment_id,
-                    group_count = groups.len(),
-                    first = groups.first(),
-                    last = groups.last(),
-                    "Applying morsel row-group selection"
-                );
-                builder = builder.with_row_groups(groups);
-            }
+            debug!(
+                fragment_id = %task.fragment_id,
+                group_count = groups.len(),
+                first = groups.first(),
+                last = groups.last(),
+                "Applying morsel row-group selection"
+            );
+            builder = builder.with_row_groups(groups);
         }
     }
 
@@ -1570,6 +1586,65 @@ mod tests {
             1,
             "exactly one HEAD must be issued when the size is unknown"
         );
+    }
+
+    /// Regression (#381): a byte-range morsel whose range contains no
+    /// row-group start offset must read ZERO rows. The single row group starts
+    /// at/near the file header, so a window at the very end of the file owns no
+    /// row group. Before the fix, an empty byte selection fell through to a
+    /// whole-file read, and because tiling morsels run as independent fragments
+    /// with no dedup, every row of the file was duplicated at SF10+.
+    #[tokio::test]
+    async fn open_parquet_stream_byte_range_without_row_group_start_reads_nothing() {
+        let (store, _head, size) = write_parquet_blob().await;
+        let mut task = scan_task_for_blob();
+        task.start_byte = Some(size - 1);
+        task.end_byte = Some(size);
+        let (stream, _schema, _bytes) = open_parquet_stream(
+            &task,
+            &task.data_file_paths[0],
+            store,
+            None,
+            None,
+            Some(size),
+            None,
+        )
+        .await
+        .expect("open should succeed");
+        let batches: Vec<_> = stream.collect().await;
+        let rows: usize = batches
+            .into_iter()
+            .map(|r| r.expect("batch ok").num_rows())
+            .sum();
+        assert_eq!(rows, 0, "tail byte-range morsel must read no rows, got {rows}");
+    }
+
+    /// Companion to the regression above: a byte range that DOES contain the
+    /// row group's start still reads all of its rows, proving the
+    /// empty-selection fix did not break the normal morsel path.
+    #[tokio::test]
+    async fn open_parquet_stream_byte_range_covering_row_group_reads_all_rows() {
+        let (store, _head, size) = write_parquet_blob().await;
+        let mut task = scan_task_for_blob();
+        task.start_byte = Some(0);
+        task.end_byte = Some(size);
+        let (stream, _schema, _bytes) = open_parquet_stream(
+            &task,
+            &task.data_file_paths[0],
+            store,
+            None,
+            None,
+            Some(size),
+            None,
+        )
+        .await
+        .expect("open should succeed");
+        let batches: Vec<_> = stream.collect().await;
+        let rows: usize = batches
+            .into_iter()
+            .map(|r| r.expect("batch ok").num_rows())
+            .sum();
+        assert_eq!(rows, 3, "full-file byte range must read all rows, got {rows}");
     }
 
     /// End-to-end (#233): a pushed-down predicate installs a late-materialization
