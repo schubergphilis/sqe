@@ -12,16 +12,16 @@ workflow:
 
 include:
   - project: 'vpf-data-ai/aikido'
-    ref: 'v0.7.1'
+    ref: 'v0.8.2'
     file: '/ci/templates/guardrails.yml'
   - project: 'vpf-data-ai/aikido'
-    ref: 'v0.7.1'
+    ref: 'v0.8.2'
     file: '/ci/templates/test-rust.yml'
   - project: 'vpf-data-ai/aikido'
-    ref: 'v0.7.1'
+    ref: 'v0.8.2'
     file: '/ci/templates/deploy.yml'
   - project: 'vpf-data-ai/aikido'
-    ref: 'v0.7.1'
+    ref: 'v0.8.2'
     file: '/ci/templates/release.yml'
   - template: Security/Secret-Detection.gitlab-ci.yml
 
