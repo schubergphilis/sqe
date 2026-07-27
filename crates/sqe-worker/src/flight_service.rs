@@ -169,9 +169,10 @@ pub struct WorkerFlightService {
     /// Shared spill manager for shuffle / operator spill (Phase 3+).
     spill_manager: Option<Arc<SpillManager>>,
     /// Byte budget for shuffle partition buffers (from
-    /// `worker.memory.shuffle_memory_budget`). Used when DoExchange intakes
-    /// into [`SpillablePartitionBuffer`].
-    shuffle_memory_budget: usize,
+    /// `worker.memory.shuffle_memory_budget`). Atomic for hot config reload.
+    shuffle_memory_budget: Arc<std::sync::atomic::AtomicUsize>,
+    /// Scan timeout seconds (0 = none). Atomic for hot config reload.
+    scan_timeout_secs: Arc<std::sync::atomic::AtomicU64>,
     /// Worker-wide temporary memory governor (Phase 7). Admits shuffle /
     /// operator grants so concurrent stages cannot race the FairSpillPool.
     memory_governor: Option<Arc<MemoryGovernor>>,
@@ -220,7 +221,10 @@ impl WorkerFlightService {
             shuffle_compression: FlightCompression::Zstd,
             worker_secret: String::new(),
             spill_manager: None,
-            shuffle_memory_budget: DEFAULT_SHUFFLE_MEMORY_BUDGET,
+            shuffle_memory_budget: Arc::new(std::sync::atomic::AtomicUsize::new(
+                DEFAULT_SHUFFLE_MEMORY_BUDGET,
+            )),
+            scan_timeout_secs: Arc::new(std::sync::atomic::AtomicU64::new(600)),
             memory_governor: None,
             live_consumers: Arc::new(LiveConsumerRegistry::new()),
             exchange_store: Arc::new(ExchangeAttemptStore::new()),
@@ -247,7 +251,10 @@ impl WorkerFlightService {
             shuffle_compression: FlightCompression::Zstd,
             worker_secret: String::new(),
             spill_manager: None,
-            shuffle_memory_budget: DEFAULT_SHUFFLE_MEMORY_BUDGET,
+            shuffle_memory_budget: Arc::new(std::sync::atomic::AtomicUsize::new(
+                DEFAULT_SHUFFLE_MEMORY_BUDGET,
+            )),
+            scan_timeout_secs: Arc::new(std::sync::atomic::AtomicU64::new(600)),
             memory_governor: None,
             live_consumers: Arc::new(LiveConsumerRegistry::new()),
             exchange_store: Arc::new(ExchangeAttemptStore::new()),
@@ -261,10 +268,24 @@ impl WorkerFlightService {
         self
     }
 
-    /// Set the scan timeout from config.
+    /// Set the scan timeout from config (also shared with hot-reload atom).
     #[must_use = "with_scan_timeout consumes self; bind the returned service"]
     pub fn with_scan_timeout(mut self, timeout_secs: u64) -> Self {
         self.scan_timeout = std::time::Duration::from_secs(timeout_secs);
+        self.scan_timeout_secs
+            .store(timeout_secs, std::sync::atomic::Ordering::Release);
+        self
+    }
+
+    /// Share the scan-timeout atom with hot-reload (keeps existing value).
+    #[must_use = "with_scan_timeout_atom consumes self; bind the returned service"]
+    pub fn with_scan_timeout_atom(mut self, atom: Arc<std::sync::atomic::AtomicU64>) -> Self {
+        atom.store(
+            self.scan_timeout_secs
+                .load(std::sync::atomic::Ordering::Acquire),
+            std::sync::atomic::Ordering::Release,
+        );
+        self.scan_timeout_secs = atom;
         self
     }
 
@@ -301,8 +322,26 @@ impl WorkerFlightService {
 
     /// Set the shuffle partition byte budget used by spillable DoExchange.
     #[must_use = "with_shuffle_memory_budget consumes self; bind the returned service"]
-    pub fn with_shuffle_memory_budget(mut self, bytes: usize) -> Self {
-        self.shuffle_memory_budget = bytes.max(64 * 1024);
+    pub fn with_shuffle_memory_budget(self, bytes: usize) -> Self {
+        self.shuffle_memory_budget.store(
+            bytes.max(64 * 1024),
+            std::sync::atomic::Ordering::Release,
+        );
+        self
+    }
+
+    /// Share the shuffle-budget atom with hot-reload.
+    #[must_use = "with_shuffle_memory_budget_atom consumes self; bind the returned service"]
+    pub fn with_shuffle_memory_budget_atom(
+        mut self,
+        atom: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Self {
+        // Adopt the shared hot-reload atom as-is. It is already seeded with the
+        // resolved shuffle budget by `WorkerHotConfig::new`. Copying this
+        // service's default (64 MiB) value into it, as the old direction did,
+        // clobbered the configured budget on every boot until the next
+        // sqe.toml change forced a hot-reload to write the real value back.
+        self.shuffle_memory_budget = atom;
         self
     }
 
@@ -336,6 +375,19 @@ impl WorkerFlightService {
     /// Configured shuffle memory budget in bytes.
     pub fn shuffle_memory_budget(&self) -> usize {
         self.shuffle_memory_budget
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Live scan timeout, honouring hot-reloaded `scan_timeout_secs` when set.
+    pub fn live_scan_timeout(&self) -> std::time::Duration {
+        let secs = self
+            .scan_timeout_secs
+            .load(std::sync::atomic::Ordering::Acquire);
+        if secs == 0 {
+            std::time::Duration::ZERO
+        } else {
+            std::time::Duration::from_secs(secs)
+        }
     }
 
     /// Constant-time check of the `x-sqe-worker-secret` metadata header.
@@ -459,7 +511,7 @@ impl WorkerFlightService {
         mut flight_batch_stream: FlightRecordBatchStream,
     ) -> Result<Response<BoxStream<FlightData>>, Status> {
         let attempt_gate = self.shuffle_manager.attempts().clone();
-        let budget_bytes = self.shuffle_memory_budget;
+        let budget_bytes = self.shuffle_memory_budget();
 
         // Phase 8: reject late data against durable exchange winner registry.
         let task_key = TaskKey::new(query_id, stage_id, format!("p{partition_id}"), partition_id);
@@ -843,7 +895,7 @@ impl FlightService for WorkerFlightService {
         let credential_store = self.credential_store.clone();
         let session_ctx = self.session_ctx.clone();
         let footer_cache = self.footer_cache.clone();
-        let scan_timeout = self.scan_timeout;
+        let scan_timeout = self.live_scan_timeout();
         let flight_compression = self.flight_compression;
         let stream_span = worker_span.clone();
         let result_span = worker_span.clone();

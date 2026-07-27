@@ -1,29 +1,28 @@
 //! Worker runtime configuration for DataFusion.
 //!
 //! Configures the DataFusion [`SessionContext`] with memory limits and
-//! spill-to-disk support based on [`WorkerConfig`].
+//! spill-to-disk support based on [`WorkerConfig`]. Uses a
+//! [`ResizableFairSpillPool`] so hot config reload can change the limit.
 
 use std::sync::Arc;
 
 use datafusion::execution::disk_manager::{DiskManagerBuilder, DiskManagerMode};
-use datafusion::execution::memory_pool::FairSpillPool;
+use datafusion::execution::memory_pool::MemoryPool;
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::prelude::{SessionConfig, SessionContext};
+use sqe_spill::ResizableFairSpillPool;
 use tracing::info;
 
 use sqe_core::config::WorkerConfig;
 use sqe_core::parse_memory_limit;
 
-/// Build a DataFusion [`SessionContext`] configured with the memory limit
-/// and spill-to-disk settings from [`WorkerConfig`].
+/// Build a DataFusion [`SessionContext`] and the shared resizable memory pool.
 ///
-/// - Memory is managed via a [`FairSpillPool`] set directly on the runtime
-///   via `RuntimeEnvBuilder::with_memory_pool`.
-/// - When `spill_to_disk` is `true`, the spill directory is set to
-///   `config.spill_dir` via `RuntimeEnvBuilder::with_temp_file_path`.
-/// - When `spill_to_disk` is `false`, the disk manager is disabled via
-///   `DiskManagerBuilder::default().with_mode(DiskManagerMode::Disabled)`.
-pub fn build_session_context(config: &WorkerConfig) -> anyhow::Result<SessionContext> {
+/// The pool is returned so bootstrap can wire hot-reload without downcasting
+/// through `dyn MemoryPool`.
+pub fn build_session_context(
+    config: &WorkerConfig,
+) -> anyhow::Result<(SessionContext, Arc<ResizableFairSpillPool>)> {
     let memory_bytes = parse_memory_limit(&config.memory_limit).map_err(|e| {
         anyhow::anyhow!("Invalid worker memory_limit '{}': {e}", config.memory_limit)
     })?;
@@ -36,28 +35,47 @@ pub fn build_session_context(config: &WorkerConfig) -> anyhow::Result<SessionCon
         "Configuring DataFusion runtime"
     );
 
-    // Use FairSpillPool directly — it divides memory fairly among spillable
-    // operators and triggers spill when the limit is reached.
-    let memory_pool = Arc::new(FairSpillPool::new(memory_bytes));
+    let memory_pool = Arc::new(ResizableFairSpillPool::new(memory_bytes));
+    let ctx = build_session_context_with_pool(config, memory_pool.clone())?;
+    Ok((ctx, memory_pool))
+}
 
-    let mut builder = RuntimeEnvBuilder::new().with_memory_pool(memory_pool);
+/// Build a session context using an existing resizable pool (tests / custom wiring).
+pub fn build_session_context_with_pool(
+    config: &WorkerConfig,
+    memory_pool: Arc<ResizableFairSpillPool>,
+) -> anyhow::Result<SessionContext> {
+    let memory_bytes = memory_pool.pool_size();
+    let pool: Arc<dyn MemoryPool> = memory_pool;
+    let mut builder = RuntimeEnvBuilder::new().with_memory_pool(pool);
 
     if config.spill_to_disk {
         builder = builder.with_temp_file_path(&config.spill_dir);
     } else {
-        // Disable disk manager — any attempt to spill will return an error.
         let disk_builder =
             DiskManagerBuilder::default().with_mode(DiskManagerMode::Disabled);
         builder = builder.with_disk_manager_builder(disk_builder);
     }
 
     let runtime = Arc::new(builder.build()?);
-    let session_config = SessionConfig::new()
+
+    let sort_spill_reservation = (memory_bytes / 4).max(1024 * 1024);
+    let sort_in_place = (memory_bytes / 16).max(64 * 1024);
+    let mut session_config = SessionConfig::new()
         .set_bool("datafusion.execution.parquet.pushdown_filters", true)
         .set_bool("datafusion.execution.parquet.reorder_filters", true);
-    let ctx = SessionContext::new_with_config_rt(session_config, runtime);
+    {
+        let opts = session_config.options_mut();
+        opts.execution.sort_spill_reservation_bytes = sort_spill_reservation;
+        opts.execution.sort_in_place_threshold_bytes = sort_in_place;
+    }
+    info!(
+        sort_spill_reservation_bytes = sort_spill_reservation,
+        sort_in_place_threshold_bytes = sort_in_place,
+        "Configured DataFusion sort spill reservation (merge headroom)"
+    );
 
-    Ok(ctx)
+    Ok(SessionContext::new_with_config_rt(session_config, runtime))
 }
 
 #[cfg(test)]
@@ -65,8 +83,6 @@ mod tests {
     use super::*;
     use datafusion::execution::memory_pool::MemoryLimit;
 
-    /// Helper: create a WorkerConfig with spill disabled so tests that only
-    /// care about memory limits don't need to create temporary directories.
     fn config_no_spill(memory_limit: &str) -> WorkerConfig {
         WorkerConfig {
             memory_limit: memory_limit.to_string(),
@@ -77,23 +93,22 @@ mod tests {
 
     #[test]
     fn test_default_memory_limit_applied() {
-        // Use spill_to_disk=false to avoid filesystem side effects.
         let config = config_no_spill("8GB");
-        let ctx = build_session_context(&config).expect("should build");
+        let (ctx, pool) = build_session_context(&config).expect("should build");
         let runtime = ctx.runtime_env();
 
-        // 8GB = 8 * 1024^3 = 8_589_934_592 bytes
         let expected_bytes = 8 * 1024 * 1024 * 1024;
         match runtime.memory_pool.memory_limit() {
             MemoryLimit::Finite(limit) => assert_eq!(limit, expected_bytes),
             _ => panic!("Expected Finite memory limit"),
         }
+        assert_eq!(pool.pool_size(), expected_bytes);
     }
 
     #[test]
     fn test_custom_memory_limit_512mb() {
         let config = config_no_spill("512MB");
-        let ctx = build_session_context(&config).expect("should build with 512MB limit");
+        let (ctx, _) = build_session_context(&config).expect("should build with 512MB limit");
         let runtime = ctx.runtime_env();
 
         let expected_bytes = 512 * 1024 * 1024;
@@ -106,7 +121,7 @@ mod tests {
     #[test]
     fn test_memory_limit_1gb() {
         let config = config_no_spill("1GB");
-        let ctx = build_session_context(&config).expect("should build with 1GB limit");
+        let (ctx, _) = build_session_context(&config).expect("should build with 1GB limit");
         let runtime = ctx.runtime_env();
 
         let expected_bytes = 1024 * 1024 * 1024;
@@ -122,7 +137,7 @@ mod tests {
             spill_to_disk: false,
             ..Default::default()
         };
-        let ctx = build_session_context(&config).expect("should build with spill disabled");
+        let (ctx, _) = build_session_context(&config).expect("should build with spill disabled");
         let runtime = ctx.runtime_env();
 
         assert!(
@@ -139,7 +154,7 @@ mod tests {
             spill_dir: tmpdir.to_string_lossy().to_string(),
             ..Default::default()
         };
-        let ctx = build_session_context(&config).expect("should build with spill enabled");
+        let (ctx, _) = build_session_context(&config).expect("should build with spill enabled");
         let runtime = ctx.runtime_env();
 
         assert!(
@@ -157,5 +172,16 @@ mod tests {
         };
         let result = build_session_context(&config);
         assert!(result.is_err(), "Should error on invalid memory limit");
+    }
+
+    #[test]
+    fn hot_resize_pool_visible_on_runtime() {
+        let config = config_no_spill("64MB");
+        let (ctx, pool) = build_session_context(&config).expect("build");
+        pool.set_pool_size(128 * 1024 * 1024);
+        match ctx.runtime_env().memory_pool.memory_limit() {
+            MemoryLimit::Finite(n) => assert_eq!(n, 128 * 1024 * 1024),
+            _ => panic!("expected finite"),
+        }
     }
 }
