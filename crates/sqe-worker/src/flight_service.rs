@@ -336,11 +336,11 @@ impl WorkerFlightService {
         mut self,
         atom: Arc<std::sync::atomic::AtomicUsize>,
     ) -> Self {
-        atom.store(
-            self.shuffle_memory_budget
-                .load(std::sync::atomic::Ordering::Acquire),
-            std::sync::atomic::Ordering::Release,
-        );
+        // Adopt the shared hot-reload atom as-is. It is already seeded with the
+        // resolved shuffle budget by `WorkerHotConfig::new`. Copying this
+        // service's default (64 MiB) value into it, as the old direction did,
+        // clobbered the configured budget on every boot until the next
+        // sqe.toml change forced a hot-reload to write the real value back.
         self.shuffle_memory_budget = atom;
         self
     }

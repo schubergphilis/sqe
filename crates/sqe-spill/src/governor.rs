@@ -258,12 +258,17 @@ impl MemoryGovernor {
         let minimum = req.minimum_bytes.max(1).min(req.desired_bytes.max(1));
         let desired = req.desired_bytes.max(minimum);
 
+        // Read the pool-size atomics *under* the state lock. `try_resize_pool`
+        // mutates them while holding this same lock, so reading them before
+        // acquiring it would let an admission straddle a concurrent hot-reload
+        // shrink and over-admit past the new (smaller) distributable pool.
+        // The accessors are plain atomic loads (no state lock), so this cannot
+        // deadlock.
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         let distributable = self.distributable_bytes();
         let headroom = self.headroom_bytes();
         let pool_bytes = self.pool_bytes();
         let soft_limit = self.soft_limit_bytes();
-
-        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         let new_minima = state.minima_sum.saturating_add(minimum);
         if new_minima > distributable {
             self.rejections.fetch_add(1, Ordering::Relaxed);
