@@ -26,9 +26,10 @@
 //!
 //! Two independent control planes:
 //!
-//! 1. **`sqe.toml` / `worker.memory_limit`** — process config. Loaded once at
-//!    start. No hot-reload of the DataFusion pool, governor, or spill budgets.
-//!    Change the file and **restart** the worker.
+//! 1. **`sqe.toml` / `worker.memory_limit`** — process config. Memory knobs
+//!    (`worker.memory_limit`, `[worker.memory]`, scan timeout) are
+//!    **hot-reloaded** by the worker (poll mtime, resize pool/governor). Ports,
+//!    secrets, and spill backends still require restart.
 //! 2. **Kernel cgroup control files** — apply **live without restarting the
 //!    container**. Writes to cgroup v2 `memory.max` / `cpu.max` (or v1
 //!    `memory.limit_in_bytes` / `cpu.cfs_quota_us`) take effect immediately.
@@ -51,6 +52,8 @@
 //! would be inconsistent. The kernel OOM path is independent of that choice.
 
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 #[cfg(target_os = "linux")]
@@ -434,19 +437,21 @@ pub fn enforced_memory_limit_source() -> &'static str {
 
 /// Periodically re-probe container/cgroup/OS memory.
 ///
-/// Cgroup limit files apply **live** (no container restart). This watch does
-/// **not** reload `sqe.toml` or resize the in-process pool. It logs:
+/// Cgroup limit files apply **live** (no container restart). The configured
+/// need is an [`AtomicU64`] so **hot config reload** can update
+/// `memory_limit + process_headroom` without restarting this task.
+///
+/// Logs:
 ///
 /// - **OOM risk** when the new `memory.max` is below cgroup usage / RSS
 ///   (kernel reclaim; kill if reclaim fails).
-/// - **Config mismatch** when the limit is below `memory_limit + headroom`
-///   but still above the working set (pool oversized until restart).
+/// - **Config mismatch** when the limit is below configured need but still
+///   above the working set (hot-reload should shrink the pool; until then warn).
 /// - Growth / shrink of the finite limit for ops visibility.
 ///
 /// Returns a [`JoinHandle`] so callers can abort on shutdown if desired.
-/// Matches the worker heartbeat pattern (process-lifetime background task).
 pub fn spawn_runtime_memory_watch(
-    configured_need_bytes: u64,
+    configured_need_bytes: Arc<AtomicU64>,
     interval: Duration,
 ) -> tokio::task::JoinHandle<()> {
     let interval = if interval.is_zero() {
@@ -458,7 +463,7 @@ pub fn spawn_runtime_memory_watch(
         let mut last = runtime_memory_info();
         tracing::info!(
             interval_secs = interval.as_secs(),
-            configured_need_bytes,
+            configured_need_bytes = configured_need_bytes.load(Ordering::Acquire),
             enforced_memory_limit_bytes = last.enforced_memory_limit_bytes.unwrap_or(0),
             cgroup_memory_current_bytes = last.cgroup.memory_current_bytes.unwrap_or(0),
             process_rss_bytes = last.process_rss_bytes.unwrap_or(0),
@@ -466,13 +471,13 @@ pub fn spawn_runtime_memory_watch(
             cgroup_version = %last.cgroup.version,
             os = %last.os,
             container = %last.container,
-            "Watching live cgroup memory.max (applies without container restart; \
-             sqe.toml pool size is not hot-reloaded)"
+            "Watching live cgroup memory.max (need atom updated by config hot-reload)"
         );
         loop {
             tokio::time::sleep(interval).await;
             let now = runtime_memory_info();
             let change = RuntimeMemoryChange::between(&last, &now);
+            let configured_need_bytes = configured_need_bytes.load(Ordering::Acquire);
             let pressure = now.assess_enforced_pressure(configured_need_bytes);
 
             if change.any() {
@@ -532,9 +537,8 @@ pub fn spawn_runtime_memory_watch(
                         cgroup_version = %now.cgroup.version,
                         container = %now.container,
                         "Live cgroup limit is below worker.memory_limit+headroom but still \
-                         above working set. In-process pool stays oversized until restart — \
-                         lower memory_limit and restart, or raise the cgroup limit \
-                         (K8s in-place resize / memory.max)."
+                         above working set. Hot-reload sqe.toml to a lower memory_limit \
+                         (or raise the cgroup). Until then the pool may over-admit vs kernel."
                     );
                 }
                 EnforcedLimitPressure::WithinLimits { .. }

@@ -29,10 +29,10 @@ async fn main() -> anyhow::Result<()> {
     );
 
 
-    // Build a configured DataFusion SessionContext with memory limits and spill-to-disk.
+    // Build a configured DataFusion SessionContext with a resizable memory pool.
     // The context is created early to fail fast on invalid config (e.g. bad memory_limit).
-    // It is passed into WorkerFlightService so every scan execution respects the pool.
-    let session_ctx = runtime::build_session_context(&config.worker)?;
+    // Pool is shared so hot config reload can change memory_limit without rebuild.
+    let (session_ctx, memory_pool) = runtime::build_session_context(&config.worker)?;
 
     let port = config.worker.flight_port;
     let addr = format!("0.0.0.0:{port}").parse()?;
@@ -52,8 +52,14 @@ async fn main() -> anyhow::Result<()> {
     // with `sqe-server --mode worker` so both worker paths stay identical
     // (#219). The advertise URL is derived here and must be routable: an
     // undeliverable URL aborts boot instead of poisoning the registry (#220).
-    let flight_service =
-        sqe_worker::bootstrap::build_worker_service(&config, worker_metrics, session_ctx)?;
+    // Hot-reload watches `config_path` for worker.memory_limit / sub-budgets.
+    let flight_service = sqe_worker::bootstrap::build_worker_service_with_hot_reload(
+        &config,
+        worker_metrics,
+        session_ctx,
+        Some(memory_pool),
+        Some(&config_path),
+    )?;
 
     // Optional TLS (QUACK-07): workers reuse the coordinator's TLS config.
     let tls_config = sqe_worker::tls::build_server_tls_config(&config.coordinator.tls)

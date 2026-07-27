@@ -13,6 +13,8 @@
 //! binary keeps its own TLS-build and `serve` loop (they differ: sqe-server
 //! adds a health server and graceful shutdown).
 
+use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -22,11 +24,15 @@ use sqe_catalog::FooterCache;
 use sqe_core::{parse_memory_limit, FlightCompression, SqeConfig};
 use sqe_metrics::WorkerMetricsRegistry;
 use sqe_spill::{
-    LocalSegmentStore, MemoryGovernor, S3SegmentStore, S3SpillConfig, SpillManager,
-    TieredSegmentStore,
+    LocalSegmentStore, MemoryGovernor, ResizableFairSpillPool, S3SegmentStore, S3SpillConfig,
+    SpillManager, TieredSegmentStore,
 };
 
 use crate::advertise::derive_advertise_url;
+use crate::config_reload::{
+    resolve_memory_budgets, spawn_config_reload_watch, BootConfigIdentity, HotReloadHandles,
+    WorkerHotConfig, DEFAULT_CONFIG_RELOAD_INTERVAL,
+};
 use crate::flight_service::WorkerFlightService;
 use crate::heartbeat;
 
@@ -49,6 +55,18 @@ pub fn build_worker_service(
     metrics: Arc<WorkerMetricsRegistry>,
     session_ctx: SessionContext,
 ) -> anyhow::Result<WorkerFlightService> {
+    build_worker_service_with_hot_reload(config, metrics, session_ctx, None, None)
+}
+
+/// Like [`build_worker_service`], with optional resizable pool + config path for
+/// memory hot-reload and live cgroup need tracking.
+pub fn build_worker_service_with_hot_reload(
+    config: &SqeConfig,
+    metrics: Arc<WorkerMetricsRegistry>,
+    session_ctx: SessionContext,
+    memory_pool: Option<Arc<ResizableFairSpillPool>>,
+    config_path: Option<&str>,
+) -> anyhow::Result<WorkerFlightService> {
     let shuffle_compression =
         FlightCompression::from_config(&config.coordinator.shuffle_compression)
             .unwrap_or(FlightCompression::Zstd);
@@ -59,11 +77,28 @@ pub fn build_worker_service(
     // worker metrics registry so footer hit-rate is observable.
     let footer_cache = build_footer_cache(config, &metrics);
 
-    validate_process_headroom(config)?;
+    let budgets = resolve_memory_budgets(config)?;
+    let hot = Arc::new(WorkerHotConfig::new(
+        budgets.memory_limit_bytes,
+        budgets.shuffle_budget_bytes,
+        budgets.configured_need_bytes,
+        budgets.scan_timeout_secs,
+    ));
+    // Fail-closed cgroup check + live cgroup watch (shares hot.configured_need).
+    validate_process_headroom(
+        config,
+        budgets.configured_need_bytes,
+        Arc::clone(&hot.configured_need_bytes),
+    )?;
 
     let spill_manager = build_spill_manager(config)?;
-    let shuffle_budget = resolve_shuffle_budget(config);
-    let memory_governor = build_memory_governor(config);
+    let memory_governor = Arc::new(MemoryGovernor::new(budgets.governor_pool_bytes));
+    tracing::info!(
+        pool_bytes = memory_governor.pool_bytes(),
+        distributable = memory_governor.distributable_bytes(),
+        headroom = memory_governor.headroom_bytes(),
+        "Worker memory governor ready"
+    );
 
     let mut service = WorkerFlightService::new(metrics, session_ctx)
         .with_scan_timeout(config.worker.scan_timeout_secs)
@@ -71,10 +106,25 @@ pub fn build_worker_service(
         .with_shuffle_compression(shuffle_compression)
         .with_footer_cache(footer_cache)
         .with_worker_secret(config.worker.worker_secret.clone())
-        .with_shuffle_memory_budget(shuffle_budget)
-        .with_memory_governor(memory_governor);
+        .with_shuffle_memory_budget_atom(Arc::clone(&hot.shuffle_budget_bytes))
+        .with_scan_timeout_atom(Arc::clone(&hot.scan_timeout_secs))
+        .with_memory_governor(memory_governor.clone());
     if let Some(sm) = spill_manager {
         service = service.with_spill_manager(sm);
+    }
+
+    if let (Some(pool), Some(path)) = (memory_pool, config_path) {
+        let handles = HotReloadHandles {
+            pool,
+            governor: memory_governor,
+            hot,
+            boot_identity: BootConfigIdentity::from_config(config),
+        };
+        let _ = spawn_config_reload_watch(
+            PathBuf::from(path),
+            handles,
+            DEFAULT_CONFIG_RELOAD_INTERVAL,
+        );
     }
 
     // Plaintext warning (config validation already fail-closes on non-loopback
@@ -136,40 +186,17 @@ pub fn build_worker_service(
     Ok(service)
 }
 
-/// Resolve the shuffle partition byte budget from worker memory config.
-fn resolve_shuffle_budget(config: &SqeConfig) -> usize {
-    let limit = parse_memory_limit(&config.worker.memory_limit).unwrap_or(8 * 1024 * 1024 * 1024);
-    match config.worker.memory.resolve_bytes(limit as usize) {
-        Ok(resolved) => resolved.shuffle_memory_budget.max(64 * 1024),
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                "Failed to resolve worker.memory sub-budgets; using 12.5% of memory_limit for shuffle"
-            );
-            (limit as usize / 8).max(64 * 1024)
-        }
-    }
-}
-
-/// Fail closed when configured memory_limit + process_headroom exceed a known
-/// **enforced** limit (Linux cgroup, nested walk). Always logs a full OS /
-/// container / cgroup / host-memory snapshot so operators can see which layer
-/// is authoritative. macOS/Windows have no cgroup: snapshot only, no fail-closed.
-///
-/// After boot validation, starts a background watch that re-reads the live
-/// cgroup/OS limit. `sqe.toml` itself is **not** hot-reloaded — pool/governor
-/// sizes stay fixed until process restart.
-fn validate_process_headroom(config: &SqeConfig) -> anyhow::Result<()> {
+/// Fail closed when configured need exceeds a known **enforced** cgroup limit.
+/// Logs a full OS/container/cgroup/host snapshot. Starts a live cgroup watch
+/// that reads `configured_need` from `need_atom` (updated by hot config reload).
+fn validate_process_headroom(
+    config: &SqeConfig,
+    need: u64,
+    need_atom: Arc<std::sync::atomic::AtomicU64>,
+) -> anyhow::Result<()> {
     let limit = parse_memory_limit(&config.worker.memory_limit).unwrap_or(0) as u64;
-    let headroom = match config
-        .worker
-        .memory
-        .resolve_bytes(limit as usize)
-    {
-        Ok(r) => r.process_headroom as u64,
-        Err(_) => parse_memory_limit("2GB").unwrap_or(2 * 1024 * 1024 * 1024) as u64,
-    };
-    let need = limit.saturating_add(headroom);
+    let headroom = need.saturating_sub(limit);
+    need_atom.store(need, Ordering::Release);
     let mem = sqe_core::runtime_memory_info();
 
     tracing::info!(
@@ -214,8 +241,6 @@ fn validate_process_headroom(config: &SqeConfig) -> anyhow::Result<()> {
             );
         }
         None => {
-            // No cgroup hard limit: host totals are advisory only (and often the
-            // node total inside a container — never use them to fail closed alone).
             tracing::info!(
                 memory_limit = limit,
                 process_headroom = headroom,
@@ -228,44 +253,12 @@ fn validate_process_headroom(config: &SqeConfig) -> anyhow::Result<()> {
         }
     }
 
-    // Live cgroup can move after boot (pod resize). Configured pool size cannot.
-    // Dropping the JoinHandle does not abort the task (same pattern as heartbeat).
     let _ = sqe_core::spawn_runtime_memory_watch(
-        need,
+        need_atom,
         sqe_core::DEFAULT_RUNTIME_MEMORY_WATCH_INTERVAL,
     );
 
     Ok(())
-}
-
-/// Build the worker temporary-memory governor from operator + shuffle budgets.
-///
-/// Pool size = `operator_budget + shuffle_memory_budget` (chargeable blocking
-/// work). Scan/flight stay outside this pool for now; the governor carves its
-/// own spill-read/merge headroom from the pool.
-fn build_memory_governor(config: &SqeConfig) -> Arc<MemoryGovernor> {
-    let limit = parse_memory_limit(&config.worker.memory_limit).unwrap_or(8 * 1024 * 1024 * 1024);
-    let pool = match config.worker.memory.resolve_bytes(limit as usize) {
-        Ok(r) => r
-            .operator_budget
-            .saturating_add(r.shuffle_memory_budget)
-            .max(1024 * 1024),
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                "Failed to resolve memory sub-budgets for governor; using 50% of memory_limit"
-            );
-            (limit as usize / 2).max(1024 * 1024)
-        }
-    };
-    let gov = Arc::new(MemoryGovernor::new(pool));
-    tracing::info!(
-        pool_bytes = gov.pool_bytes(),
-        distributable = gov.distributable_bytes(),
-        headroom = gov.headroom_bytes(),
-        "Worker memory governor ready"
-    );
-    gov
 }
 
 /// Open a local [`SpillManager`] when spill is enabled, or `None` when disabled.
