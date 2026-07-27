@@ -714,9 +714,17 @@ async fn open_parquet_stream(
                         .map(|c| c.file_offset() as u64)
                         .filter(|&off| off > 0)
                         .unwrap_or(cursor);
-                    let rg_end = rg_start.saturating_add(compressed);
-                    // Overlap with [range_start, range_end).
-                    if rg_start < range_end && rg_end > range_start {
+                    // Assign each row group to exactly ONE morsel: the byte
+                    // range that contains its start offset. The coordinator
+                    // emits contiguous, non-overlapping ranges that tile
+                    // [0, file_size), so start-offset containment selects
+                    // every row group exactly once. An overlap test
+                    // (`rg_start < range_end && rg_end > range_start`) would
+                    // assign a row group straddling a morsel boundary to BOTH
+                    // adjacent morsels; the two morsels run as independent
+                    // fragments with no dedup, so its rows would be read twice
+                    // and duplicated in the query result.
+                    if rg_start >= range_start && rg_start < range_end {
                         by_byte.push(i);
                     }
                     cursor = cursor.saturating_add(compressed);

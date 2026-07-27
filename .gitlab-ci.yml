@@ -12,21 +12,31 @@ workflow:
 
 include:
   - project: 'vpf-data-ai/aikido'
-    ref: 'v0.7.1'
+    ref: 'v0.8.2'
     file: '/ci/templates/guardrails.yml'
   - project: 'vpf-data-ai/aikido'
-    ref: 'v0.7.1'
+    ref: 'v0.8.2'
     file: '/ci/templates/test-rust.yml'
   - project: 'vpf-data-ai/aikido'
-    ref: 'v0.7.1'
+    ref: 'v0.8.2'
     file: '/ci/templates/deploy.yml'
   - project: 'vpf-data-ai/aikido'
-    ref: 'v0.7.1'
+    ref: 'v0.8.2'
     file: '/ci/templates/release.yml'
   - template: Security/Secret-Detection.gitlab-ci.yml
 
 variables:
   AIKIDO_IMAGE_NAME: "sqlengine/sqe"
+
+# Cold Rust build ceiling. aikido builds with rootless Kaniko, which does NOT
+# honor this repo's BuildKit `RUN --mount=type=cache` + sccache mounts, so the
+# full workspace + vendored iceberg-rust recompiles from scratch and can exceed
+# GitLab's default 1h job ceiling. Overlay a higher ceiling onto aikido's
+# included `aikido-build` job (same-name job merge) until the registry-backed
+# build cache lands (aikido follow-up). This is a CEILING, not a duration: a
+# warm/fast build finishes early and is unaffected.
+aikido-build:
+  timeout: 3h
 
 # ===== repo-specific integration suites (docker-in-docker), hosted here =====
 integration-test:
