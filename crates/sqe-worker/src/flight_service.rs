@@ -24,7 +24,8 @@ use sqe_metrics::propagation::extract_trace_context;
 use sqe_compaction::wire::{CompactGroupFrame, CompactGroupRequest};
 use sqe_planner::ScanTask;
 use sqe_spill::{
-    split_default_read_headroom, ByteBudget, BytePermit, SpillManager, SpillScope,
+    split_default_read_headroom, AdmissionRequest, ByteBudget, BytePermit, MemoryGovernor,
+    ReclaimableConsumer, SpillManager, SpillScope, WorkloadClass,
 };
 
 use crate::compaction::compact_file_group;
@@ -170,6 +171,31 @@ pub struct WorkerFlightService {
     /// `worker.memory.shuffle_memory_budget`). Used when DoExchange intakes
     /// into [`SpillablePartitionBuffer`].
     shuffle_memory_budget: usize,
+    /// Worker-wide temporary memory governor (Phase 7). Admits shuffle /
+    /// operator grants so concurrent stages cannot race the FairSpillPool.
+    memory_governor: Option<Arc<MemoryGovernor>>,
+}
+
+/// Lightweight reclaimable consumer for one DoExchange partition grant.
+struct ShufflePartitionConsumer {
+    name: String,
+    desired: usize,
+    minimum: usize,
+}
+
+impl ReclaimableConsumer for ShufflePartitionConsumer {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn desired_bytes(&self) -> usize {
+        self.desired
+    }
+    fn minimum_bytes(&self) -> usize {
+        self.minimum
+    }
+    fn try_reclaim(&self, _target: usize) -> usize {
+        0
+    }
 }
 
 /// Default shuffle budget when not configured (64 MiB) — enough for laptop
@@ -190,6 +216,7 @@ impl WorkerFlightService {
             worker_secret: String::new(),
             spill_manager: None,
             shuffle_memory_budget: DEFAULT_SHUFFLE_MEMORY_BUDGET,
+            memory_governor: None,
         }
     }
 
@@ -214,6 +241,7 @@ impl WorkerFlightService {
             worker_secret: String::new(),
             spill_manager: None,
             shuffle_memory_budget: DEFAULT_SHUFFLE_MEMORY_BUDGET,
+            memory_governor: None,
         }
     }
 
@@ -269,9 +297,21 @@ impl WorkerFlightService {
         self
     }
 
+    /// Attach the worker-wide memory governor (Phase 7).
+    #[must_use = "with_memory_governor consumes self; bind the returned service"]
+    pub fn with_memory_governor(mut self, governor: Arc<MemoryGovernor>) -> Self {
+        self.memory_governor = Some(governor);
+        self
+    }
+
     /// Spill manager when local spill is enabled at bootstrap.
     pub fn spill_manager(&self) -> Option<&Arc<SpillManager>> {
         self.spill_manager.as_ref()
+    }
+
+    /// Memory governor when wired at bootstrap.
+    pub fn memory_governor(&self) -> Option<&Arc<MemoryGovernor>> {
+        self.memory_governor.as_ref()
     }
 
     /// Configured shuffle memory budget in bytes.
@@ -401,10 +441,64 @@ impl WorkerFlightService {
     ) -> Result<Response<BoxStream<FlightData>>, Status> {
         let attempt_gate = self.shuffle_manager.attempts().clone();
         let budget_bytes = self.shuffle_memory_budget;
-        // Carve spill-read/merge headroom out of the shuffle budget so writers
-        // cannot pin the entire sub-budget while a drain still needs memory
-        // for segment reads (Phase 4 headroom protection).
-        let (writer_cap, read_headroom) = split_default_read_headroom(budget_bytes);
+
+        // Phase 7: admit a shuffle partition grant through the worker governor
+        // when configured. RAII guard releases the grant on all exit paths.
+        let grant_name = format!("{stage_id}-p{partition_id}-a{attempt_id}");
+        let consumer = ShufflePartitionConsumer {
+            name: grant_name.clone(),
+            desired: budget_bytes,
+            // Minimum: enough for one soft-watermark slice so a partition can
+            // always spill-progress rather than fail admission immediately.
+            minimum: (budget_bytes / 8).max(64 * 1024),
+        };
+        // Hold for the full DoExchange spill path; Drop releases the grant.
+        let mut _grant_guard: Option<sqe_spill::GrantGuard> = None;
+        let granted_capacity = if let Some(gov) = self.memory_governor.clone() {
+            match gov.try_admit_guarded(
+                AdmissionRequest {
+                    query_id: query_id.to_string(),
+                    name: grant_name.clone(),
+                    class: WorkloadClass::Shuffle,
+                    desired_bytes: consumer.desired,
+                    minimum_bytes: consumer.minimum,
+                },
+                &consumer,
+            ) {
+                Ok((grant, guard)) => {
+                    let cap = grant.capacity_bytes();
+                    debug!(
+                        query_id = %query_id,
+                        stage_id = %stage_id,
+                        partition_id = partition_id,
+                        granted = cap,
+                        desired = budget_bytes,
+                        admissions = gov.admissions(),
+                        "DoExchange shuffle grant admitted"
+                    );
+                    _grant_guard = Some(guard);
+                    cap
+                }
+                Err(sqe_spill::AdmissionDecision::Rejected {
+                    reason,
+                    pool_bytes,
+                    minima_sum,
+                }) => {
+                    return Err(Status::resource_exhausted(format!(
+                        "shuffle memory admission rejected for query={query_id} \
+                         stage={stage_id} partition={partition_id}: {reason} \
+                         (pool={pool_bytes}, minima={minima_sum})"
+                    )));
+                }
+                Err(sqe_spill::AdmissionDecision::Granted(_)) => budget_bytes,
+            }
+        } else {
+            budget_bytes
+        };
+
+        // Carve spill-read/merge headroom out of the *granted* capacity so
+        // writers cannot pin the entire grant while a drain still needs memory.
+        let (writer_cap, read_headroom) = split_default_read_headroom(granted_capacity);
         let pool = Arc::new(datafusion::execution::memory_pool::FairSpillPool::new(
             writer_cap.max(1024 * 1024),
         ));
@@ -413,8 +507,6 @@ impl WorkerFlightService {
             writer_cap,
             Some(pool),
         );
-        // Reserved (not acquired yet): documents that read_headroom stays free
-        // for drain/merge; metrics publish the split for operators.
         let _read_headroom = read_headroom;
         debug!(
             query_id = %query_id,
@@ -422,6 +514,7 @@ impl WorkerFlightService {
             partition_id = partition_id,
             writer_cap = writer_cap,
             read_headroom = read_headroom,
+            granted_capacity = granted_capacity,
             parent_budget = budget_bytes,
             "DoExchange shuffle budget split (writer + spill-read headroom)"
         );
@@ -554,11 +647,19 @@ impl WorkerFlightService {
             Status::internal(format!("shuffle spill drain open failed: {e}"))
         })?;
 
-        let output_stream = drain.map(|item| {
-            item.map_err(|e| {
-                arrow_flight::error::FlightError::Tonic(Box::new(Status::internal(e.to_string())))
-            })
-        });
+        // Keep the governor grant alive until the client finishes draining
+        // (or disconnects). Dropping it at the end of this function would free
+        // the grant while FlightData is still in flight.
+        let output_stream = GrantHeldStream {
+            inner: Box::pin(drain.map(|item| {
+                item.map_err(|e| {
+                    arrow_flight::error::FlightError::Tonic(Box::new(Status::internal(
+                        e.to_string(),
+                    )))
+                })
+            })),
+            _guard: _grant_guard,
+        };
 
         let shuffle_opts = ipc_options_for(self.shuffle_compression)?;
         self.metrics
@@ -581,6 +682,24 @@ impl WorkerFlightService {
 }
 
 type BoxStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'static>>;
+
+/// Holds a governor [`sqe_spill::GrantGuard`] for the lifetime of a Flight
+/// response stream so shuffle memory is not released mid-drain.
+struct GrantHeldStream<S> {
+    inner: Pin<Box<S>>,
+    _guard: Option<sqe_spill::GrantGuard>,
+}
+
+impl<S> Stream for GrantHeldStream<S>
+where
+    S: Stream + Unpin,
+{
+    type Item = S::Item;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.inner).poll_next(cx)
+    }
+}
 
 /// Detect client disconnect / RPC cancellation on the DoExchange request stream.
 fn is_exchange_cancelled(err: &arrow_flight::error::FlightError) -> bool {

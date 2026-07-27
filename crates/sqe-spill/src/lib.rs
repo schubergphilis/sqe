@@ -35,7 +35,8 @@ pub use fault::{
 };
 pub use manager::{SpillManager, SpillScopeGuard};
 pub use governor::{
-    AdmissionDecision, AdmissionRequest, MemoryGovernor, SharedMemoryGovernor, WorkloadClass,
+    AdmissionDecision, AdmissionRequest, GrantGuard, MemoryGovernor, SharedMemoryGovernor,
+    WorkloadClass,
 };
 pub use reclaim::{
     GrantRegistry, MemoryGrant, ReclaimableConsumer, SharedGrantRegistry,
