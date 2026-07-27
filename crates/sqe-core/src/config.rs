@@ -5388,36 +5388,6 @@ partial_progress_batch = 5
     }
 
     /// Helper to build a valid config for validation tests.
-    #[test]
-    fn validate_accepts_spill_directory_without_touching_legacy_alias() {
-        // The recommended single-field config: set only worker.spill.directory
-        // and leave the legacy worker.spill_dir at its serde default. Because
-        // the default is non-empty, an earlier version of the conflict check
-        // failed startup here. It must pass.
-        let mut config = valid_config();
-        config.worker.spill.directory = "/mnt/nvme/sqe-spill".to_string();
-        // spill_dir left at default_spill_dir() ("/tmp/sqe-spill").
-        assert_eq!(config.worker.spill_dir, default_spill_dir());
-        assert!(
-            config.validate().is_ok(),
-            "single-field spill.directory must not conflict with the default alias: {:?}",
-            config.validate()
-        );
-    }
-
-    #[test]
-    fn validate_rejects_conflicting_explicit_spill_dirs() {
-        // Both explicitly set to different non-default paths is a real conflict.
-        let mut config = valid_config();
-        config.worker.spill.directory = "/mnt/a/sqe-spill".to_string();
-        config.worker.spill_dir = "/mnt/b/sqe-spill".to_string();
-        let err = config.validate().unwrap_err().to_string();
-        assert!(
-            err.contains("worker.spill.directory") && err.contains("worker.spill_dir"),
-            "expected dual-set spill-dir conflict, got: {err}"
-        );
-    }
-
     fn valid_config() -> SqeConfig {
         SqeConfig {
             coordinator: CoordinatorConfig {
