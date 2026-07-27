@@ -635,7 +635,7 @@ clean immutable Arrow spill segments under a hard disk quota.
       interface.
 - [x] Implement the local backend: validated spill-root creation and
       restrictive permissions.
-- [ ] Implement the S3 backend on the existing `object_store` client with a
+- [x] Implement the S3 backend on the existing `object_store` client with a
       dedicated bucket/prefix, dedicated credential, staged-key publish, and
       range-read streaming. Reject table-vended STS credentials and any
       prefix shared with table data.
