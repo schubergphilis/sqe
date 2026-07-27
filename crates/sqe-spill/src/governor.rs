@@ -63,6 +63,48 @@ pub enum AdmissionDecision {
     },
 }
 
+/// RAII release of a governor grant when the holder is dropped (success,
+/// cancel, or panic). Call [`GrantGuard::disarm`] only if ownership of the
+/// grant is transferred elsewhere.
+pub struct GrantGuard {
+    governor: Arc<MemoryGovernor>,
+    query_id: String,
+    name: String,
+    armed: bool,
+}
+
+impl GrantGuard {
+    pub fn new(governor: Arc<MemoryGovernor>, query_id: impl Into<String>, name: impl Into<String>) -> Self {
+        Self {
+            governor,
+            query_id: query_id.into(),
+            name: name.into(),
+            armed: true,
+        }
+    }
+
+    pub fn query_id(&self) -> &str {
+        &self.query_id
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Prevent release on drop (caller takes responsibility).
+    pub fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for GrantGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.governor.release(&self.query_id, &self.name);
+        }
+    }
+}
+
 /// Process-wide governor for one worker.
 pub struct MemoryGovernor {
     /// Total bytes managed (typically operator_budget + shuffle, minus headroom).
@@ -193,6 +235,25 @@ impl MemoryGovernor {
             desired,
             minimum,
         ))
+    }
+
+    /// Admit and return a [`GrantGuard`] that releases on drop.
+    ///
+    /// Convenience for call sites that hold a grant for a single task/scope.
+    pub fn try_admit_guarded(
+        self: &Arc<Self>,
+        req: AdmissionRequest,
+        consumer: &dyn ReclaimableConsumer,
+    ) -> Result<(MemoryGrant, GrantGuard), AdmissionDecision> {
+        let query_id = req.query_id.clone();
+        let name = req.name.clone();
+        match self.try_admit(req, consumer) {
+            AdmissionDecision::Granted(grant) => {
+                let guard = GrantGuard::new(self.clone(), query_id, name);
+                Ok((grant, guard))
+            }
+            other => Err(other),
+        }
     }
 
     /// Release a previously admitted grant by query/name.
@@ -347,5 +408,57 @@ mod tests {
             gov.headroom_bytes() + gov.distributable_bytes(),
             gov.pool_bytes()
         );
+    }
+
+    #[test]
+    fn grant_guard_releases_on_drop() {
+        let gov = Arc::new(MemoryGovernor::new(16 * 1024 * 1024));
+        let d = Dummy {
+            name: "shuffle",
+            desired: 4 * 1024 * 1024,
+            minimum: 512 * 1024,
+        };
+        {
+            let (grant, _guard) = gov
+                .try_admit_guarded(
+                    req("q", "p0", WorkloadClass::Shuffle, d.desired, d.minimum),
+                    &d,
+                )
+                .expect("admit");
+            assert!(grant.capacity_bytes() > 0);
+            assert_eq!(gov.active_count(), 1);
+        }
+        assert_eq!(gov.active_count(), 0);
+    }
+
+    #[test]
+    fn four_concurrent_classes_share_pool() {
+        let gov = Arc::new(MemoryGovernor::new(64 * 1024 * 1024));
+        let classes = [
+            WorkloadClass::Join,
+            WorkloadClass::Aggregate,
+            WorkloadClass::Sort,
+            WorkloadClass::Shuffle,
+        ];
+        let mut guards = Vec::new();
+        for (i, class) in classes.iter().enumerate() {
+            let d = Dummy {
+                name: "op",
+                desired: 20 * 1024 * 1024,
+                minimum: 2 * 1024 * 1024,
+            };
+            let (g, guard) = gov
+                .try_admit_guarded(
+                    req(&format!("q{i}"), "op", *class, d.desired, d.minimum),
+                    &d,
+                )
+                .unwrap_or_else(|e| panic!("admit {class:?}: {e:?}"));
+            assert!(g.capacity_bytes() >= d.minimum);
+            guards.push(guard);
+        }
+        assert_eq!(gov.active_count(), 4);
+        assert!(gov.granted_sum() <= gov.distributable_bytes());
+        drop(guards);
+        assert_eq!(gov.active_count(), 0);
     }
 }
