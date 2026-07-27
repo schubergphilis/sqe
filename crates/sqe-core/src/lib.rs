@@ -10,6 +10,8 @@ pub mod table_properties;
 
 pub use process_memory::{
     enforced_memory_limit_bytes, enforced_memory_limit_source, process_rss_bytes,
+    runtime_memory_info, CgroupMemoryInfo, CgroupVersion, ContainerKind, HostMemoryInfo, OsKind,
+    RuntimeMemoryInfo,
 };
 
 pub use config::{

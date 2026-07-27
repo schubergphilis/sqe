@@ -151,9 +151,10 @@ fn resolve_shuffle_budget(config: &SqeConfig) -> usize {
     }
 }
 
-/// Fail closed when configured memory_limit + process_headroom exceed a
-/// known **enforced** memory limit (Linux cgroup). On macOS/Windows there is
-/// no portable container limit, so this is a no-op with a debug log.
+/// Fail closed when configured memory_limit + process_headroom exceed a known
+/// **enforced** limit (Linux cgroup, nested walk). Always logs a full OS /
+/// container / cgroup / host-memory snapshot so operators can see which layer
+/// is authoritative. macOS/Windows have no cgroup: snapshot only, no fail-closed.
 fn validate_process_headroom(config: &SqeConfig) -> anyhow::Result<()> {
     let limit = parse_memory_limit(&config.worker.memory_limit).unwrap_or(0) as u64;
     let headroom = match config
@@ -165,13 +166,36 @@ fn validate_process_headroom(config: &SqeConfig) -> anyhow::Result<()> {
         Err(_) => parse_memory_limit("2GB").unwrap_or(2 * 1024 * 1024 * 1024) as u64,
     };
     let need = limit.saturating_add(headroom);
-    let source = sqe_core::enforced_memory_limit_source();
-    match sqe_core::enforced_memory_limit_bytes() {
+    let mem = sqe_core::runtime_memory_info();
+
+    tracing::info!(
+        os = %mem.os,
+        container = %mem.container,
+        cgroup_version = %mem.cgroup.version,
+        cgroup_path = mem.cgroup.path.as_deref().unwrap_or(""),
+        cgroup_limit_file = mem.cgroup.limit_file.as_deref().unwrap_or(""),
+        cgroup_memory_max_bytes = mem.cgroup.memory_max_bytes.unwrap_or(0),
+        cgroup_memory_current_bytes = mem.cgroup.memory_current_bytes.unwrap_or(0),
+        host_total_bytes = mem.host.total_bytes.unwrap_or(0),
+        host_available_bytes = mem.host.available_bytes.unwrap_or(0),
+        process_rss_bytes = mem.process_rss_bytes.unwrap_or(0),
+        enforced_memory_limit_bytes = mem.enforced_memory_limit_bytes.unwrap_or(0),
+        enforced_source = mem.enforced_memory_limit_source,
+        worker_memory_limit = limit,
+        process_headroom = headroom,
+        "Runtime memory environment (container/cgroup/OS)"
+    );
+
+    match mem.enforced_memory_limit_bytes {
         Some(enforced) if enforced > 0 && need > enforced => {
             return Err(anyhow::anyhow!(
                 "worker.memory_limit ({limit}) + process_headroom ({headroom}) = {need} \
-                 exceeds enforced memory limit ({enforced}, source={source}). \
-                 Lower memory_limit or raise the container/cgroup limit."
+                 exceeds enforced memory limit ({enforced}, source={}, os={}, container={}, \
+                 cgroup={}). Lower memory_limit or raise the container/cgroup limit.",
+                mem.enforced_memory_limit_source,
+                mem.os,
+                mem.container,
+                mem.cgroup.version,
             ));
         }
         Some(enforced) => {
@@ -179,17 +203,23 @@ fn validate_process_headroom(config: &SqeConfig) -> anyhow::Result<()> {
                 memory_limit = limit,
                 process_headroom = headroom,
                 enforced_memory_limit = enforced,
-                source,
-                "Process headroom validated against OS/container limit"
+                source = mem.enforced_memory_limit_source,
+                container = %mem.container,
+                cgroup_version = %mem.cgroup.version,
+                "Process headroom validated against container/cgroup limit"
             );
         }
         None => {
-            // macOS, Windows, or Linux without a cgroup limit: do not fail closed.
-            tracing::debug!(
+            // No cgroup hard limit: host totals are advisory only (and often the
+            // node total inside a container — never use them to fail closed alone).
+            tracing::info!(
                 memory_limit = limit,
                 process_headroom = headroom,
-                source,
-                "No enforced container memory limit on this platform; skipping headroom fail-closed check"
+                source = mem.enforced_memory_limit_source,
+                os = %mem.os,
+                container = %mem.container,
+                host_total_bytes = mem.host.total_bytes.unwrap_or(0),
+                "No enforced cgroup memory limit; skipping headroom fail-closed check"
             );
         }
     }
