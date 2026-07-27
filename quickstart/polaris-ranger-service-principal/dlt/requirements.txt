@@ -1,8 +1,8 @@
 # dlthub 0.27 implements the pre-1.28 destination-client interface. Pin the
 # matching dlt patch release; 1.27.1 is intentionally skipped because it was
 # yanked for an incremental-merge data-loss bug.
-dlt[filesystem,hub,pyiceberg]==1.27.2
-dlthub==0.27.0
+dlt[filesystem,hub,pyiceberg]==1.29.1
+dlthub==0.29.0
 adbc-driver-flightsql>=1.6,<2
 adbc-driver-manager>=1.6,<2
 pytest>=8,<9
