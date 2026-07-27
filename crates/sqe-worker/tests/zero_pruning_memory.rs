@@ -268,7 +268,6 @@ async fn phase0_reproducer_shuffle_exceeds_byte_budget() {
 }
 
 /// Future-green (Phase 4): shuffle of ≥10x budget completes with spill.
-#[tokio::test]
 /// Covered by unit test `spill_buffer::tests::ten_x_budget_completes_via_spill`.
 /// Full DoExchange integration remains a follow-up once Flight intake wires
 /// SpillablePartitionBuffer end-to-end.
