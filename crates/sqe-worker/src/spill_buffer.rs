@@ -855,6 +855,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn append_does_not_deadlock_between_half_and_watermark() {
+        // Regression for the acquire-before-spill deadlock. A batch sized
+        // between half and the soft-watermark fraction of the per-partition
+        // budget previously hung `append`: it acquired budget before the
+        // watermark spill, so the second such batch waited forever for budget
+        // that only a spill (downstream of the acquire) could release.
+        let probe = batch(0, 200_000);
+        let bytes = probe.get_array_memory_size();
+        // Budget in ((4/3)·bytes, 2·bytes): one batch fits and stays under the
+        // 3/4 watermark, but two batches cannot be co-resident.
+        let capacity = bytes * 8 / 5;
+        assert!(bytes < capacity, "single batch must fit the budget");
+        assert!(
+            bytes * SOFT_WATERMARK_DEN < capacity * SOFT_WATERMARK_NUM,
+            "one batch must stay under the soft watermark"
+        );
+        assert!(bytes * 2 > capacity, "two batches must not be co-resident");
+
+        let (manager, _budget, _tmp, _serial) = setup(capacity).await;
+        let pool = Arc::new(FairSpillPool::new(capacity.max(1024 * 1024)));
+        let budget = ByteBudget::new("deadlock-probe", capacity, Some(pool));
+        let scope = SpillScope::new("q-dl", "s", "sh", 0, 0);
+        let mut buf =
+            SpillablePartitionBuffer::new(manager, scope, schema(), budget, None);
+
+        let run = async {
+            for i in 0..4i64 {
+                buf.append(batch(i * 1_000_000, 200_000)).await.unwrap();
+            }
+            buf.finish().await.unwrap()
+        };
+        let manifest = tokio::time::timeout(std::time::Duration::from_secs(10), run)
+            .await
+            .expect("append must not deadlock between half-budget and watermark");
+        assert_eq!(manifest.rows, 4 * 200_000);
+    }
+
+    #[tokio::test]
     async fn concurrent_producers_slow_consumer() {
         // Four partitions append concurrently under a shared-style budget each;
         // a slow drain of each partition still sees full row counts.

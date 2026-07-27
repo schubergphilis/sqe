@@ -6846,6 +6846,7 @@ dependencies = [
 name = "sqe-planner"
 version = "0.37.0"
 dependencies = [
+ "anyhow",
  "arrow",
  "arrow-array",
  "arrow-schema",
@@ -6854,6 +6855,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sqe-core",
+ "sqe-spill",
  "tokio",
  "tracing",
 ]

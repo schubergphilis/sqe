@@ -15,6 +15,7 @@ pub mod accounted;
 pub mod budget;
 pub mod error;
 pub mod fault;
+pub mod governor;
 pub mod manager;
 pub mod reclaim;
 pub mod scope;
@@ -33,6 +34,9 @@ pub use fault::{
     SpillFault,
 };
 pub use manager::{SpillManager, SpillScopeGuard};
+pub use governor::{
+    AdmissionDecision, AdmissionRequest, MemoryGovernor, SharedMemoryGovernor, WorkloadClass,
+};
 pub use reclaim::{
     GrantRegistry, MemoryGrant, ReclaimableConsumer, SharedGrantRegistry,
 };
