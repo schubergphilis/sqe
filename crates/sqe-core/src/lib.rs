@@ -1,11 +1,16 @@
 pub mod config;
 pub mod error;
+pub mod process_memory;
 pub mod secret;
 pub mod secret_string;
 pub mod session;
 pub mod sql_params;
 pub mod supervised_task;
 pub mod table_properties;
+
+pub use process_memory::{
+    enforced_memory_limit_bytes, enforced_memory_limit_source, process_rss_bytes,
+};
 
 pub use config::{
     AuthProviderConfig, DeviceAuthConfig, ExternalAuthConfig, FlightCompression, ProfileMode,

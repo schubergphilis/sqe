@@ -336,39 +336,10 @@ pub fn wide_batch(rows: usize, payload_len: usize) -> RecordBatch {
     .expect("wide batch")
 }
 
-/// Best-effort process RSS in bytes. Linux uses `/proc/self/status`; macOS
-/// shells out to `ps`. Returns 0 when unavailable so baselines stay complete.
+/// Best-effort process RSS in bytes (portable via `sqe_core`).
+/// Returns 0 when unavailable so baselines stay complete.
 pub fn process_rss_bytes() -> u64 {
-    if let Some(v) = process_rss_bytes_inner() {
-        v
-    } else {
-        0
-    }
-}
-
-fn process_rss_bytes_inner() -> Option<u64> {
-    #[cfg(target_os = "linux")]
-    {
-        let status = fs::read_to_string("/proc/self/status").ok()?;
-        let line = status.lines().find(|l| l.starts_with("VmRSS:"))?;
-        let kb: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
-        return Some(kb * 1024);
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let pid = std::process::id().to_string();
-        let output = std::process::Command::new("ps")
-            .args(["-o", "rss=", "-p", &pid])
-            .output()
-            .ok()?;
-        let s = String::from_utf8(output.stdout).ok()?;
-        let kb: u64 = s.trim().parse().ok()?;
-        return Some(kb * 1024);
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        None
-    }
+    sqe_core::process_rss_bytes().unwrap_or(0)
 }
 
 /// Tracks the high-water mark of a metric sampler while a reproducer runs.

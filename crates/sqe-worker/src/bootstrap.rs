@@ -152,8 +152,8 @@ fn resolve_shuffle_budget(config: &SqeConfig) -> usize {
 }
 
 /// Fail closed when configured memory_limit + process_headroom exceed a
-/// known cgroup limit (when readable). Prevents starting a worker that will
-/// OOM-kill under load.
+/// known **enforced** memory limit (Linux cgroup). On macOS/Windows there is
+/// no portable container limit, so this is a no-op with a debug log.
 fn validate_process_headroom(config: &SqeConfig) -> anyhow::Result<()> {
     let limit = parse_memory_limit(&config.worker.memory_limit).unwrap_or(0) as u64;
     let headroom = match config
@@ -165,44 +165,35 @@ fn validate_process_headroom(config: &SqeConfig) -> anyhow::Result<()> {
         Err(_) => parse_memory_limit("2GB").unwrap_or(2 * 1024 * 1024 * 1024) as u64,
     };
     let need = limit.saturating_add(headroom);
-    if let Some(cgroup) = read_cgroup_memory_max() {
-        if cgroup > 0 && need > cgroup {
+    let source = sqe_core::enforced_memory_limit_source();
+    match sqe_core::enforced_memory_limit_bytes() {
+        Some(enforced) if enforced > 0 && need > enforced => {
             return Err(anyhow::anyhow!(
                 "worker.memory_limit ({limit}) + process_headroom ({headroom}) = {need} \
-                 exceeds cgroup memory.max ({cgroup}). Lower memory_limit or raise the container limit."
+                 exceeds enforced memory limit ({enforced}, source={source}). \
+                 Lower memory_limit or raise the container/cgroup limit."
             ));
         }
-        tracing::info!(
-            memory_limit = limit,
-            process_headroom = headroom,
-            cgroup_memory_max = cgroup,
-            "Process headroom validated against cgroup"
-        );
-    }
-    Ok(())
-}
-
-fn read_cgroup_memory_max() -> Option<u64> {
-    // cgroup v2
-    for path in [
-        "/sys/fs/cgroup/memory.max",
-        "/sys/fs/cgroup/memory/memory.limit_in_bytes",
-    ] {
-        if let Ok(s) = std::fs::read_to_string(path) {
-            let t = s.trim();
-            if t == "max" {
-                return None;
-            }
-            if let Ok(v) = t.parse::<u64>() {
-                // Kernel often uses a huge sentinel for unlimited.
-                if v > (1u64 << 60) {
-                    return None;
-                }
-                return Some(v);
-            }
+        Some(enforced) => {
+            tracing::info!(
+                memory_limit = limit,
+                process_headroom = headroom,
+                enforced_memory_limit = enforced,
+                source,
+                "Process headroom validated against OS/container limit"
+            );
+        }
+        None => {
+            // macOS, Windows, or Linux without a cgroup limit: do not fail closed.
+            tracing::debug!(
+                memory_limit = limit,
+                process_headroom = headroom,
+                source,
+                "No enforced container memory limit on this platform; skipping headroom fail-closed check"
+            );
         }
     }
-    None
+    Ok(())
 }
 
 /// Build the worker temporary-memory governor from operator + shuffle budgets.
