@@ -14,6 +14,7 @@
 pub mod accounted;
 pub mod budget;
 pub mod error;
+pub mod fault;
 pub mod manager;
 pub mod scope;
 pub mod segment;
@@ -23,6 +24,7 @@ pub mod store_local;
 pub use accounted::Accounted;
 pub use budget::{ByteBudget, BytePermit, DEFAULT_BUDGET_GRANULARITY};
 pub use error::{BudgetError, Result};
+pub use fault::{clear_faults, faults_injected, install_faults, take_fault, SpillFault};
 pub use manager::{SpillManager, SpillScopeGuard};
 pub use scope::SpillScope;
 pub use segment::{SpillSegment, SEGMENT_FORMAT_VERSION, SEGMENT_MAGIC};

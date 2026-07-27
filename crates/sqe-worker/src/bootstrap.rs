@@ -21,6 +21,7 @@ use prometheus::Counter;
 use sqe_catalog::FooterCache;
 use sqe_core::{parse_memory_limit, FlightCompression, SqeConfig};
 use sqe_metrics::WorkerMetricsRegistry;
+use sqe_spill::{LocalSegmentStore, SpillManager};
 
 use crate::advertise::derive_advertise_url;
 use crate::flight_service::WorkerFlightService;
@@ -55,12 +56,17 @@ pub fn build_worker_service(
     // worker metrics registry so footer hit-rate is observable.
     let footer_cache = build_footer_cache(config, &metrics);
 
-    let service = WorkerFlightService::new(metrics, session_ctx)
+    let spill_manager = build_spill_manager(config)?;
+
+    let mut service = WorkerFlightService::new(metrics, session_ctx)
         .with_scan_timeout(config.worker.scan_timeout_secs)
         .with_flight_compression(shuffle_compression)
         .with_shuffle_compression(shuffle_compression)
         .with_footer_cache(footer_cache)
         .with_worker_secret(config.worker.worker_secret.clone());
+    if let Some(sm) = spill_manager {
+        service = service.with_spill_manager(sm);
+    }
 
     // Plaintext warning (config validation already fail-closes on non-loopback
     // distributed setups without TLS or the opt-in; this covers the waived /
@@ -119,6 +125,71 @@ pub fn build_worker_service(
     }
 
     Ok(service)
+}
+
+/// Open a local [`SpillManager`] when spill is enabled, or `None` when disabled.
+///
+/// Runs orphan cleanup on start when configured. Fails loudly on unsupported
+/// backends or unusable spill directories so misconfig cannot silently disable
+/// spill in production.
+fn build_spill_manager(config: &SqeConfig) -> anyhow::Result<Option<Arc<SpillManager>>> {
+    let spill = &config.worker.spill;
+    // Respect both the legacy spill_to_disk flag and the new spill.enabled.
+    if !spill.enabled || !config.worker.spill_to_disk {
+        tracing::info!("Worker spill substrate disabled");
+        return Ok(None);
+    }
+    match spill.backend.as_str() {
+        "local" => {}
+        other => {
+            return Err(anyhow::anyhow!(
+                "worker.spill.backend = {other:?} is not available in this build \
+                 (Phase 3 implements local only)"
+            ));
+        }
+    }
+    let dir = spill
+        .resolved_directory(&config.worker.spill_dir)
+        .to_string();
+    if dir.is_empty() {
+        return Err(anyhow::anyhow!(
+            "spill enabled but no directory configured \
+             (set worker.spill.directory or worker.spill_dir)"
+        ));
+    }
+    let max_bytes = parse_memory_limit(&spill.max_bytes).map_err(|e| {
+        anyhow::anyhow!("worker.spill.max_bytes: {e}")
+    })? as u64;
+    let min_free = parse_memory_limit(&spill.min_free_bytes).map_err(|e| {
+        anyhow::anyhow!("worker.spill.min_free_bytes: {e}")
+    })? as u64;
+    let store = Arc::new(LocalSegmentStore::open(
+        &dir,
+        max_bytes,
+        min_free,
+        spill.max_concurrent_writes,
+        spill.max_concurrent_reads,
+    )?);
+    let orphan_age = spill.orphan_age_duration().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let manager = Arc::new(SpillManager::new(store, orphan_age));
+    // Orphan cleanup runs async on first use of the manager; avoid
+    // block_on during bootstrap (the runtime may already be running).
+    if spill.cleanup_on_start {
+        let mgr = manager.clone();
+        tokio::spawn(async move {
+            match mgr.cleanup_orphans_on_start().await {
+                Ok(n) => tracing::info!(orphans_cleaned = n, "Spill orphan cleanup complete"),
+                Err(e) => tracing::warn!(error = %e, "Spill orphan cleanup failed"),
+            }
+        });
+    }
+    tracing::info!(
+        spill_dir = %dir,
+        max_bytes,
+        cleanup_on_start = spill.cleanup_on_start,
+        "Worker spill manager ready (local backend)"
+    );
+    Ok(Some(manager))
 }
 
 /// Build the Parquet footer cache and register its hit/miss counters on the
