@@ -20,6 +20,7 @@ pub mod governor;
 pub mod manager;
 pub mod operator_admit;
 pub mod reclaim;
+pub mod resizable_pool;
 pub mod scope;
 pub mod segment;
 pub mod store;
@@ -46,6 +47,7 @@ pub use governor::{
     AdmissionDecision, AdmissionRequest, GrantGuard, MemoryGovernor, SharedMemoryGovernor,
     WorkloadClass,
 };
+pub use resizable_pool::ResizableFairSpillPool;
 pub use operator_admit::{
     admit_operator, LiveConsumerRegistry, OperatorConsumer, OperatorGrantGuard,
 };

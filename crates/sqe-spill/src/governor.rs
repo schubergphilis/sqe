@@ -114,13 +114,14 @@ pub const GOVERNOR_SOFT_WATERMARK_DEN: usize = 100;
 /// Process-wide governor for one worker.
 pub struct MemoryGovernor {
     /// Total bytes managed (typically operator_budget + shuffle, minus headroom).
-    pool_bytes: usize,
+    /// Atomic so hot config reload can resize without replacing the Arc.
+    pool_bytes: AtomicUsize,
     /// Reserved spill-read / merge headroom not handed to writers.
-    headroom_bytes: usize,
+    headroom_bytes: AtomicUsize,
     /// Distributable capacity (= pool - headroom).
-    distributable: usize,
+    distributable: AtomicUsize,
     /// Soft watermark on distributable (above = under pressure).
-    soft_limit: usize,
+    soft_limit: AtomicUsize,
     state: Mutex<GovernorState>,
     admissions: AtomicUsize,
     rejections: AtomicUsize,
@@ -149,15 +150,16 @@ struct ActiveGrant {
 impl MemoryGovernor {
     /// Create a governor over `pool_bytes`, carving default read headroom.
     pub fn new(pool_bytes: usize) -> Self {
-        let (distributable, headroom) = split_default_read_headroom(pool_bytes.max(1));
+        let pool_bytes = pool_bytes.max(1);
+        let (distributable, headroom) = split_default_read_headroom(pool_bytes);
         let soft_limit = distributable
             .saturating_mul(GOVERNOR_SOFT_WATERMARK_NUM)
             / GOVERNOR_SOFT_WATERMARK_DEN.max(1);
         Self {
-            pool_bytes: pool_bytes.max(1),
-            headroom_bytes: headroom,
-            distributable,
-            soft_limit: soft_limit.max(1),
+            pool_bytes: AtomicUsize::new(pool_bytes),
+            headroom_bytes: AtomicUsize::new(headroom),
+            distributable: AtomicUsize::new(distributable),
+            soft_limit: AtomicUsize::new(soft_limit.max(1)),
             state: Mutex::new(GovernorState::default()),
             admissions: AtomicUsize::new(0),
             rejections: AtomicUsize::new(0),
@@ -166,23 +168,73 @@ impl MemoryGovernor {
     }
 
     pub fn pool_bytes(&self) -> usize {
-        self.pool_bytes
+        self.pool_bytes.load(Ordering::Acquire)
     }
 
     pub fn headroom_bytes(&self) -> usize {
-        self.headroom_bytes
+        self.headroom_bytes.load(Ordering::Acquire)
     }
 
     pub fn distributable_bytes(&self) -> usize {
-        self.distributable
+        self.distributable.load(Ordering::Acquire)
     }
 
     pub fn soft_limit_bytes(&self) -> usize {
-        self.soft_limit
+        self.soft_limit.load(Ordering::Acquire)
     }
 
     pub fn under_pressure(&self) -> bool {
-        self.granted_sum() >= self.soft_limit
+        self.granted_sum() >= self.soft_limit_bytes()
+    }
+
+    /// Hot-reload: resize the governor pool (operator + shuffle chargeable work).
+    ///
+    /// Fails if active grant **minima** cannot fit in the new distributable
+    /// capacity. When current grants exceed the new distributable, bookkeeping
+    /// is shrunk toward minima first; still-over is an error so we never
+    /// silently over-admit after a shrink.
+    pub fn try_resize_pool(&self, new_pool_bytes: usize) -> Result<(), String> {
+        let new_pool = new_pool_bytes.max(1);
+        let (distributable, headroom) = split_default_read_headroom(new_pool);
+        let soft_limit = distributable
+            .saturating_mul(GOVERNOR_SOFT_WATERMARK_NUM)
+            / GOVERNOR_SOFT_WATERMARK_DEN.max(1);
+        let soft_limit = soft_limit.max(1);
+
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if state.minima_sum > distributable {
+            return Err(format!(
+                "cannot resize governor to {new_pool}: active minima {} exceed new distributable {distributable}",
+                state.minima_sum
+            ));
+        }
+        if state.granted_sum > distributable {
+            let need = state.granted_sum - distributable;
+            let _ = Self::shrink_active_toward_minima(&mut state, need);
+            self.reclaims.fetch_add(1, Ordering::Relaxed);
+            if state.granted_sum > distributable {
+                return Err(format!(
+                    "cannot resize governor to {new_pool}: granted {} still exceeds distributable {distributable} after reclaim toward minima",
+                    state.granted_sum
+                ));
+            }
+        }
+
+        let prev = self.pool_bytes.swap(new_pool, Ordering::AcqRel);
+        self.headroom_bytes.store(headroom, Ordering::Release);
+        self.distributable.store(distributable, Ordering::Release);
+        self.soft_limit.store(soft_limit, Ordering::Release);
+        tracing::info!(
+            previous_pool_bytes = prev,
+            new_pool_bytes = new_pool,
+            distributable,
+            headroom,
+            soft_limit,
+            granted_sum = state.granted_sum,
+            minima_sum = state.minima_sum,
+            "MemoryGovernor pool resized (hot config reload)"
+        );
+        Ok(())
     }
 
     pub fn admissions(&self) -> usize {
@@ -206,23 +258,28 @@ impl MemoryGovernor {
         let minimum = req.minimum_bytes.max(1).min(req.desired_bytes.max(1));
         let desired = req.desired_bytes.max(minimum);
 
+        let distributable = self.distributable_bytes();
+        let headroom = self.headroom_bytes();
+        let pool_bytes = self.pool_bytes();
+        let soft_limit = self.soft_limit_bytes();
+
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         let new_minima = state.minima_sum.saturating_add(minimum);
-        if new_minima > self.distributable {
+        if new_minima > distributable {
             self.rejections.fetch_add(1, Ordering::Relaxed);
             return AdmissionDecision::Rejected {
                 reason: format!(
                     "minima {} exceed distributable pool {} (headroom {} reserved)",
-                    new_minima, self.distributable, self.headroom_bytes
+                    new_minima, distributable, headroom
                 ),
-                pool_bytes: self.pool_bytes,
+                pool_bytes,
                 minima_sum: new_minima,
             };
         }
 
         // Under soft watermark pressure: only hand out minima and try to free
         // residual from existing grants first.
-        let pressure = state.granted_sum >= self.soft_limit;
+        let pressure = state.granted_sum >= soft_limit;
         if pressure {
             let _ = Self::shrink_active_toward_minima(&mut state, minimum);
             self.reclaims.fetch_add(1, Ordering::Relaxed);
@@ -230,8 +287,7 @@ impl MemoryGovernor {
 
         // Fair residual: base = minimum, plus share of free residual weighted
         // by class. Cap at desired. Under pressure, skip the bonus.
-        let free = self
-            .distributable
+        let free = distributable
             .saturating_sub(state.granted_sum)
             .saturating_sub(minimum);
         let weight = req.class.weight();
@@ -243,14 +299,14 @@ impl MemoryGovernor {
         let grant_size = minimum.saturating_add(bonus).min(desired).max(minimum);
 
         // Prevent one query from claiming the entire residual.
-        let per_query_cap = self.distributable / 2 + minimum;
+        let per_query_cap = distributable / 2 + minimum;
         let grant_size = grant_size.min(per_query_cap);
 
-        if state.granted_sum.saturating_add(grant_size) > self.distributable {
+        if state.granted_sum.saturating_add(grant_size) > distributable {
             self.rejections.fetch_add(1, Ordering::Relaxed);
             return AdmissionDecision::Rejected {
                 reason: "insufficient free capacity after fair share".into(),
-                pool_bytes: self.pool_bytes,
+                pool_bytes,
                 minima_sum: new_minima,
             };
         }
@@ -419,6 +475,36 @@ mod tests {
         fn try_reclaim(&self, _: usize) -> usize {
             0
         }
+    }
+
+    #[test]
+    fn try_resize_pool_grows_and_shrinks_when_idle() {
+        let gov = MemoryGovernor::new(16 * 1024 * 1024);
+        assert_eq!(gov.pool_bytes(), 16 * 1024 * 1024);
+        gov.try_resize_pool(32 * 1024 * 1024).expect("grow");
+        assert_eq!(gov.pool_bytes(), 32 * 1024 * 1024);
+        gov.try_resize_pool(8 * 1024 * 1024).expect("shrink idle");
+        assert_eq!(gov.pool_bytes(), 8 * 1024 * 1024);
+    }
+
+    #[test]
+    fn try_resize_pool_rejects_below_active_minima() {
+        let gov = Arc::new(MemoryGovernor::new(16 * 1024 * 1024));
+        let d = Dummy {
+            name: "j",
+            desired: 8 * 1024 * 1024,
+            minimum: 4 * 1024 * 1024,
+        };
+        match gov.try_admit(
+            req("q", "j", WorkloadClass::Join, d.desired, d.minimum),
+            &d,
+        ) {
+            AdmissionDecision::Granted(_) => {}
+            other => panic!("expected grant, got {other:?}"),
+        }
+        // New pool so small that headroom leaves distributable < 4MiB minima.
+        let err = gov.try_resize_pool(1024 * 1024).expect_err("must reject");
+        assert!(err.contains("minima"), "{err}");
     }
 
     fn req(q: &str, name: &str, class: WorkloadClass, desired: usize, minimum: usize) -> AdmissionRequest {
