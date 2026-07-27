@@ -47,7 +47,7 @@ pub use governor::{
     AdmissionDecision, AdmissionRequest, GrantGuard, MemoryGovernor, SharedMemoryGovernor,
     WorkloadClass,
 };
-pub use resizable_pool::ResizableFairSpillPool;
+pub use resizable_pool::{ResizableFairSpillPool, ShrinkBelowUse};
 pub use operator_admit::{
     admit_operator, LiveConsumerRegistry, OperatorConsumer, OperatorGrantGuard,
 };
