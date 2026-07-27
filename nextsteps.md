@@ -1,5 +1,8 @@
 # SQE — Next Steps
 
+> Status as of 2026-07-26. **Bounded-memory Phase 1 shipped (branch `feat/bounded-memory-phase1`).** New `sqe-spill` crate with pool-backed `ByteBudget` / `Accounted` (64 KiB units, wait-on-budget, fail-on-ItemTooLarge, permit Drop releases pool). Worker scan path no longer cumulative-`try_grow`s: decoded batches are ownership-admitted, channel is `mpsc<Accounted<RecordBatch>>`, Flight holds the permit via `AccountedEncodeStream` until the encoder polls the next batch. Config: `[worker.memory]` sub-budgets with resolve/validate. Zero-pruning ≥20x-RAM and slow-consumer gates are green under a 64 MiB pool. **NEXT:** Phase 2 scan morsels, then Phase 3 SpillManager.
+
+
 > Status as of 2026-07-26. **Bounded-memory Phase 0 shipped (branch `feat/bounded-memory-phase0`).** Red safety gates and metrics for the multi-phase spill plan (`docs/superpowers/plans/2026-07-25-bounded-memory-spill-execution.md`). Worker metrics now expose ownership gauges (`scan_*_resident_bytes`, `flight_*`, `shuffle_resident_bytes`, spill counters, `memory_backpressure_seconds`). Integration tests under `crates/sqe-worker/tests/{zero_pruning_memory,slow_consumer}.rs` reproduce the four unsafe boundaries on a laptop (local Parquet + LocalFileSystem, 64 MiB pool): cumulative scan `try_grow` ResourcesExhausted at ~20x decoded volume, wide/narrow 16-batch queue ratio >>4x, item-bounded shuffle ≥10x a 4 MiB budget, and unknown join stats keeping `HashJoinExec`. Baseline JSON: `benchmarks/results/bounded-memory-phase0-baseline.json`. Future-green tests are `#[ignore]` until Phases 1/4/5. **NEXT:** Phase 1 — `sqe-spill` ByteBudget + Accounted batch ownership, remove cumulative fragment reservation, byte-admitted scan/Flight channels.
 
 

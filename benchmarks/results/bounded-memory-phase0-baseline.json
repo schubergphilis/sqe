@@ -1,7 +1,7 @@
 {
   "plan": "2026-07-25-bounded-memory-spill-execution",
   "phase": "0",
-  "generated_at_rfc3339": "1785068367Z",
+  "generated_at_rfc3339": "1785069202Z",
   "worker_memory_limit_bytes": 67108864,
   "cases": [
     {
@@ -9,30 +9,40 @@
       "wall_time_ms": 0,
       "bytes_input": 67323392,
       "bytes_decoded_or_buffered": 67323392,
-      "peak_rss_bytes": 98942976,
+      "peak_rss_bytes": 99450880,
       "peak_tracked_bytes": 67323392,
       "failure_reason": "item-bounded shuffle held 67323392 bytes at capacity 64 against budget 4194304",
       "notes": "capacity=64, batch≈1MiB, budget=4194304"
     },
     {
       "name": "slow_consumer_wide_rows",
-      "wall_time_ms": 6837,
+      "wall_time_ms": 8048,
       "bytes_input": 2926695,
-      "bytes_decoded_or_buffered": 67015088,
-      "peak_rss_bytes": 46399488,
-      "peak_tracked_bytes": 67015088,
-      "failure_reason": "Resources exhausted: Failed to allocate additional 268.2 KB for scan:phase0-frag with 63.9 MB already allocated for this reservation - 91.6 KB remain available for the total memory pool: fair(pool_size: 64.0 MB)",
-      "notes": "rows=249856, peak_queue=4669084, pause_ms=25, limit=67108864"
+      "bytes_decoded_or_buffered": 269158960,
+      "peak_rss_bytes": 46383104,
+      "peak_tracked_bytes": 8847360,
+      "failure_reason": null,
+      "notes": "phase1 green: rows=1003520, peak_queue=5570560, peak_tracked=8847360, limit=67108864"
     },
     {
       "name": "wide_batch_queue_vs_narrow",
       "wall_time_ms": 0,
       "bytes_input": 0,
       "bytes_decoded_or_buffered": 67309952,
-      "peak_rss_bytes": 96927744,
+      "peak_rss_bytes": 98926592,
       "peak_tracked_bytes": 67309952,
       "failure_reason": null,
       "notes": "narrow_bytes=132608, wide_bytes=67309952, ratio=507.59, item_cap=16"
+    },
+    {
+      "name": "zero_pruning_scan_completes_under_byte_budget",
+      "wall_time_ms": 1562,
+      "bytes_input": 14607867,
+      "bytes_decoded_or_buffered": 1343597584,
+      "peak_rss_bytes": 111493120,
+      "peak_tracked_bytes": 13959168,
+      "failure_reason": null,
+      "notes": "phase1 green: rows=5009408, decoded_estimate=1342863784, peak_tracked=13959168, limit=67108864"
     },
     {
       "name": "zero_pruning_scan_resources_exhausted",

@@ -6,7 +6,7 @@ use std::task::{Context, Poll};
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use datafusion::common::DFSchema;
-use datafusion::execution::memory_pool::MemoryConsumer;
+use datafusion::execution::memory_pool::{MemoryConsumer, MemoryLimit};
 use datafusion::logical_expr::Expr;
 use datafusion::physical_expr::create_physical_expr;
 use datafusion::physical_plan::PhysicalExpr;
@@ -21,6 +21,7 @@ use parquet::arrow::async_reader::ParquetObjectReader;
 use parquet::arrow::ParquetRecordBatchStreamBuilder;
 use parquet::file::metadata::ParquetMetaData;
 use sqe_catalog::late_materialize;
+use sqe_spill::{Accounted, ByteBudget};
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, info, warn};
 use url::Url;
@@ -31,16 +32,23 @@ use sqe_planner::ScanTask;
 
 use crate::credential_channel::RefreshableCredentials;
 
-/// Stream of `RecordBatch`es produced by [`execute_scan_streaming`].
+/// A decoded batch that carries its scan-budget permit until the consumer
+/// (Flight encoder or test drain) drops it.
+pub type AccountedBatch = Accounted<RecordBatch>;
+
+/// Stream of accounted `RecordBatch`es produced by [`execute_scan_streaming`].
+///
+/// Each successful item holds a live [`sqe_spill::BytePermit`]. Dropping the
+/// item (or moving the permit into the Flight encoder) releases scan budget
+/// and pool reservation. Cancellation / client disconnect drops queued items
+/// and returns permits immediately.
 pub type ScanBatchStream =
-    Pin<Box<dyn Stream<Item = anyhow::Result<RecordBatch>> + Send + 'static>>;
+    Pin<Box<dyn Stream<Item = anyhow::Result<AccountedBatch>> + Send + 'static>>;
 
 /// Secondary item-count bound on the scan mpsc channel.
 ///
-/// Phase 0 documents that a batch-count bound does **not** bound resident
-/// bytes (wide Utf8 batches make the same 16 slots hold vastly different
-/// footprints). Phase 1 replaces this with a byte-admitted channel and keeps
-/// a small item cap only as a scheduling guard.
+/// Byte admission is enforced by [`ByteBudget`]; this item cap is only a
+/// scheduling guard so a burst of tiny batches cannot monopolise the runtime.
 pub const SCAN_CHANNEL_ITEM_CAPACITY: usize = 16;
 
 /// Per-file Parquet batch stream returned by [`open_parquet_stream`].
@@ -53,24 +61,23 @@ type OpenedParquet = anyhow::Result<(ParquetBatchStream, SchemaRef, u64)>;
 /// A boxed, in-flight open of one Parquet file (#234 depth-1 prefetch).
 type PendingOpen = Pin<Box<dyn std::future::Future<Output = OpenedParquet> + Send>>;
 
-/// Wraps the scan mpsc receiver so queue-resident bytes are decremented when
-/// the consumer takes a batch. The producer increments the same counter before
-/// `send`. Phase 0 surfaces the gauge; Phase 1 pairs it with true ownership
-/// permits that move with the batch into the Flight encoder.
+/// Wraps the scan mpsc receiver so queue-resident gauges track accounted
+/// batches. The permit travels with the batch; this wrapper only adjusts the
+/// queue gauge (not the budget charge).
 struct QueueTrackedScanStream {
-    inner: tokio_stream::wrappers::ReceiverStream<anyhow::Result<RecordBatch>>,
+    inner: tokio_stream::wrappers::ReceiverStream<anyhow::Result<AccountedBatch>>,
     queue_bytes: Arc<AtomicUsize>,
     metrics: Option<Arc<WorkerMetricsRegistry>>,
+    scan_budget: ByteBudget,
 }
 
 impl Stream for QueueTrackedScanStream {
-    type Item = anyhow::Result<RecordBatch>;
+    type Item = anyhow::Result<AccountedBatch>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         match Pin::new(&mut self.inner).poll_next(cx) {
             Poll::Ready(Some(Ok(batch))) => {
-                let sz = batch.get_array_memory_size();
-                // Saturating decrement: metrics must never wrap on desync.
+                let sz = batch.charged_bytes();
                 let _ = self.queue_bytes.fetch_update(
                     Ordering::Relaxed,
                     Ordering::Relaxed,
@@ -79,12 +86,30 @@ impl Stream for QueueTrackedScanStream {
                 if let Some(ref m) = self.metrics {
                     m.scan_queue_resident_bytes
                         .set(self.queue_bytes.load(Ordering::Relaxed) as f64);
+                    // Decode residency = live scan-budget charge (ownership, not history).
+                    m.scan_decode_resident_bytes
+                        .set(self.scan_budget.used_bytes() as f64);
                 }
                 Poll::Ready(Some(Ok(batch)))
             }
             other => other,
         }
     }
+}
+
+/// Build a default scan budget from the session pool when the caller did not
+/// supply one (standalone tests / legacy call sites).
+fn default_scan_budget(session_ctx: &SessionContext) -> ByteBudget {
+    let pool = session_ctx.runtime_env().memory_pool.clone();
+    let limit = match pool.memory_limit() {
+        MemoryLimit::Finite(n) => n,
+        // Unbounded pool: give the scan a generous but finite budget so
+        // ItemTooLarge still works and tests stay deterministic.
+        _ => 512 * 1024 * 1024,
+    };
+    // 50% of the pool for scan so operators/Flight retain headroom when no
+    // explicit [worker.memory] config is wired.
+    ByteBudget::new("scan", limit / 2, Some(pool))
 }
 
 
@@ -163,17 +188,13 @@ fn build_physical_predicate(
 /// projection columns only for surviving rows. This can reduce S3 I/O by
 /// 10-50x for selective queries on wide tables.
 /// Streaming variant of [`execute_scan`]: returns the schema synchronously
-/// and yields `RecordBatch`es from the in-flight Parquet streams without
-/// materialising the full scan in memory.
+/// and yields accounted `RecordBatch`es from the in-flight Parquet streams
+/// without materialising the full scan in memory.
 ///
-/// The first Parquet file is opened in this call so the caller can return
-/// the schema before the result stream is polled. A background task chains
-/// the per-file streams into an mpsc channel; if the consumer drops the
-/// returned stream, the channel closes and the task exits.
-///
-/// Builds an S3 [`ObjectStore`] from the task's credentials. Prefer
-/// [`execute_scan_streaming_with_store`] for local-filesystem or in-memory
-/// tests that must not depend on S3/MinIO.
+/// Builds an S3 [`ObjectStore`] from the task's credentials and a default
+/// scan [`ByteBudget`] from the session pool. Prefer
+/// [`execute_scan_streaming_with_store`] for local fixtures or an explicit
+/// budget from `[worker.memory]`.
 pub async fn execute_scan_streaming(
     task: ScanTask,
     metrics: Option<Arc<WorkerMetricsRegistry>>,
@@ -191,6 +212,7 @@ pub async fn execute_scan_streaming(
         &task.s3_secret_key,
         &task.s3_session_token,
     )?);
+    let scan_budget = default_scan_budget(&session_ctx);
     execute_scan_streaming_with_store(
         task,
         metrics,
@@ -199,19 +221,18 @@ pub async fn execute_scan_streaming(
         credential_rx,
         footer_cache,
         coordinator_metrics,
-        true, // allow credential-driven store rebuild
+        true,
+        Some(scan_budget),
     )
     .await
 }
 
-/// Like [`execute_scan_streaming`], but uses a caller-supplied [`ObjectStore`].
+/// Like [`execute_scan_streaming`], but uses a caller-supplied [`ObjectStore`]
+/// and optional scan [`ByteBudget`].
 ///
-/// Used by Phase 0 memory-safety reproducers to drive the distributed scan
-/// path against a local temp-dir Parquet fixture (`LocalFileSystem` or
-/// `InMemory`) without S3, Polaris, or N-times-RAM hosts.
-///
-/// When `allow_credential_refresh` is `false`, the store is fixed for the
-/// lifetime of the scan (correct for local/in-memory fixtures).
+/// When `scan_budget` is `None`, a default budget is derived from the session
+/// pool (half the finite limit). When `allow_credential_refresh` is `false`,
+/// the store is fixed for the lifetime of the scan.
 #[allow(clippy::too_many_arguments)]
 pub async fn execute_scan_streaming_with_store(
     task: ScanTask,
@@ -222,31 +243,19 @@ pub async fn execute_scan_streaming_with_store(
     footer_cache: Option<Arc<FooterCache>>,
     coordinator_metrics: Option<Arc<MetricsRegistry>>,
     allow_credential_refresh: bool,
+    scan_budget: Option<ByteBudget>,
 ) -> anyhow::Result<(SchemaRef, ScanBatchStream)> {
     if task.data_file_paths.is_empty() {
         anyhow::bail!("ScanTask has no data files");
     }
 
     let start = std::time::Instant::now();
-    let pool = session_ctx.runtime_env().memory_pool.clone();
-    // Phase 0 unsafe boundary: one MemoryConsumer per fragment, grown on every
-    // emitted batch, never shrunk until the producer task drops. Cumulative
-    // output larger than worker.memory_limit fails with ResourcesExhausted even
-    // when actual resident bytes are tiny (see zero_pruning_memory tests).
-    let consumer = MemoryConsumer::new(format!("scan:{}", task.fragment_id));
-    let reservation = consumer.register(&pool);
+    let scan_budget = scan_budget.unwrap_or_else(|| default_scan_budget(&session_ctx));
 
-    // Decode the coordinator's pushed-down predicate once (#233). The
-    // PhysicalExpr is rebuilt per-file inside open_parquet_stream because it
-    // must bind to that file's schema.
+    // Decode the coordinator's pushed-down predicate once (#233).
     let predicate = decode_pushed_predicate(&task);
-    // Per-fragment LIMIT hint (#233): stop emitting once this many rows have
-    // shipped. The coordinator's GlobalLimitExec still enforces the global
-    // limit, so an over-count here is harmless.
     let row_limit = task.limit;
 
-    // Open the first file synchronously so we know the schema before
-    // returning the stream.
     let first_path = task.data_file_paths[0].clone();
 
     let (mut first_stream, first_schema, first_bytes) = open_parquet_stream(
@@ -260,28 +269,41 @@ pub async fn execute_scan_streaming_with_store(
     )
     .await?;
 
-    // Charge the compressed file size as fetch-resident while the file is
-    // open. Phase 1 will shrink this when the fetch buffer is released; Phase 0
-    // only surfaces the gauge for the red-gate baseline.
+    // Fetch-resident: charge a capped estimate of the open file's compressed
+    // size against the scan budget while the file streams. Dropped when the
+    // file's batches are fully drained (or the producer exits).
+    let fetch_charge = (first_bytes as usize).min(scan_budget.capacity_bytes() / 8).max(1);
+    let initial_fetch_permit = match scan_budget.try_acquire(fetch_charge) {
+        Ok(p) => Some(p),
+        Err(e) => {
+            // Non-fatal: proceed without fetch charge if the budget is already
+            // tight; decode admission still protects RAM.
+            debug!(error = %e, "scan fetch budget admit skipped");
+            None
+        }
+    };
     if let Some(ref m) = metrics {
-        m.scan_fetch_resident_bytes.set(first_bytes as f64);
+        m.scan_fetch_resident_bytes.set(
+            initial_fetch_permit
+                .as_ref()
+                .map(|p| p.charged_bytes())
+                .unwrap_or(0) as f64,
+        );
     }
 
     let (tx, rx) =
-        mpsc::channel::<anyhow::Result<RecordBatch>>(SCAN_CHANNEL_ITEM_CAPACITY);
+        mpsc::channel::<anyhow::Result<AccountedBatch>>(SCAN_CHANNEL_ITEM_CAPACITY);
     let queue_bytes = Arc::new(AtomicUsize::new(0));
 
-    // Share the task and the per-file open inputs by Arc so each prefetch
-    // future (below) can own its inputs without borrowing producer locals.
     let task = Arc::new(task);
     let task_for_producer = task.clone();
     let metrics_clone = metrics.clone();
     let coord_metrics_clone = coordinator_metrics.clone();
     let footer_cache_clone = footer_cache.clone();
     let predicate_clone = predicate.clone();
-    let session_ctx_clone = session_ctx.clone();
     let credential_rx_clone = credential_rx.clone();
     let queue_bytes_producer = queue_bytes.clone();
+    let scan_budget_producer = scan_budget.clone();
 
     tokio::spawn(async move {
         let task = task_for_producer;
@@ -289,52 +311,57 @@ pub async fn execute_scan_streaming_with_store(
         let coordinator_metrics = coord_metrics_clone;
         let footer_cache = footer_cache_clone;
         let predicate = predicate_clone;
-        let _session_ctx = session_ctx_clone;
         let credential_rx = credential_rx_clone;
         let queue_bytes = queue_bytes_producer;
+        let scan_budget = scan_budget_producer;
 
         let initial_store: Arc<dyn ObjectStore> = initial_store;
         let mut total_rows: usize = 0;
         let mut total_bytes: u64 = first_bytes;
+        let mut fetch_permit = initial_fetch_permit;
 
-        /// Charge one decoded batch against the fragment reservation and the
-        /// queue-resident gauge, then send it. Returns `false` if the consumer
-        /// dropped the channel (producer should exit).
+        /// Admit one decoded batch against the scan budget (waits for capacity),
+        /// wrap it in [`Accounted`], and send it. Returns `false` on fatal error
+        /// or consumer disconnect.
         async fn emit_batch(
-            tx: &mpsc::Sender<anyhow::Result<RecordBatch>>,
-            reservation: &datafusion::execution::memory_pool::MemoryReservation,
+            tx: &mpsc::Sender<anyhow::Result<AccountedBatch>>,
+            scan_budget: &ByteBudget,
             queue_bytes: &AtomicUsize,
             metrics: &Option<Arc<WorkerMetricsRegistry>>,
             batch: RecordBatch,
         ) -> bool {
             let batch_bytes = batch.get_array_memory_size();
-            if let Err(e) = reservation.try_grow(batch_bytes) {
-                let _ = tx.send(Err(anyhow::Error::new(e))).await;
-                return false;
-            }
+            let permit = match scan_budget.acquire(batch_bytes).await {
+                Ok(p) => p,
+                Err(e) => {
+                    let _ = tx.send(Err(anyhow::anyhow!(e))).await;
+                    return false;
+                }
+            };
             if let Some(m) = metrics {
-                // Phase 0: reservation is cumulative (never shrinks), so this
-                // gauge grows with bytes processed, not true residency.
                 m.scan_decode_resident_bytes
-                    .set(reservation.size() as f64);
+                    .set(scan_budget.used_bytes() as f64);
             }
-            // Track queue occupancy before send so a full channel still reports
-            // the bytes it holds once send completes (or while blocked).
-            queue_bytes.fetch_add(batch_bytes, Ordering::Relaxed);
+            let charged = permit.charged_bytes();
+            queue_bytes.fetch_add(charged, Ordering::Relaxed);
             if let Some(m) = metrics {
                 m.scan_queue_resident_bytes
                     .set(queue_bytes.load(Ordering::Relaxed) as f64);
             }
-            if tx.send(Ok(batch)).await.is_err() {
-                // Consumer dropped: reverse the queue charge for the unsent batch.
+            let accounted = Accounted::new(batch, permit, batch_bytes);
+            if tx.send(Ok(accounted)).await.is_err() {
+                // Consumer dropped: Accounted is dropped by send error path
+                // (value not moved), so the permit releases. Reverse queue gauge.
                 let _ = queue_bytes.fetch_update(
                     Ordering::Relaxed,
                     Ordering::Relaxed,
-                    |cur| Some(cur.saturating_sub(batch_bytes)),
+                    |cur| Some(cur.saturating_sub(charged)),
                 );
                 if let Some(m) = metrics {
                     m.scan_queue_resident_bytes
                         .set(queue_bytes.load(Ordering::Relaxed) as f64);
+                    m.scan_decode_resident_bytes
+                        .set(scan_budget.used_bytes() as f64);
                 }
                 return false;
             }
@@ -348,7 +375,7 @@ pub async fn execute_scan_streaming_with_store(
                 Ok(batch) => {
                     total_rows += batch.num_rows();
                     first_file_bytes += batch.get_array_memory_size();
-                    if !emit_batch(&tx, &reservation, &queue_bytes, &metrics, batch).await {
+                    if !emit_batch(&tx, &scan_budget, &queue_bytes, &metrics, batch).await {
                         return;
                     }
                 }
@@ -357,7 +384,6 @@ pub async fn execute_scan_streaming_with_store(
                     return;
                 }
             }
-            // Early-stop once the per-fragment limit hint is satisfied.
             if let Some(limit) = row_limit {
                 if total_rows >= limit {
                     debug!(
@@ -370,24 +396,21 @@ pub async fn execute_scan_streaming_with_store(
                 }
             }
         }
+        // File fully drained: release fetch charge.
+        drop(fetch_permit.take());
+        if let Some(ref m) = metrics {
+            m.scan_fetch_resident_bytes.set(0.0);
+        }
         debug!(file = %first_path, rows = first_file_bytes, "first-file batches drained");
 
-        // Pipeline subsequent files (#234) with depth-1 prefetch: while the
-        // current file's batches drain into the channel, the next file's footer
-        // is already being fetched. Credentials and the object store advance
-        // sequentially (single owner of `credential_rx`, best-effort as before).
-        // The mpsc item-capacity backpressure bounds *count*, not bytes.
         let mut store: Arc<dyn ObjectStore> = initial_store;
         let mut credential_rx = if allow_credential_refresh {
             credential_rx
         } else {
             None
         };
-        let mut idx = 1usize; // file 0 was opened synchronously above
+        let mut idx = 1usize;
 
-        // Helper closure to build the open future for file `idx` using the
-        // current store, so the next file's footer fetch overlaps the current
-        // file's drain.
         let start_next_open = |idx: usize, store: Arc<dyn ObjectStore>| -> PendingOpen {
             let task = task.clone();
             let footer_cache = footer_cache.clone();
@@ -409,7 +432,6 @@ pub async fn execute_scan_streaming_with_store(
             })
         };
 
-        // Kick off the first prefetch (file index 1) if it exists.
         let mut pending = if idx < task.data_file_paths.len() {
             let fut = start_next_open(idx, store.clone());
             idx += 1;
@@ -419,7 +441,6 @@ pub async fn execute_scan_streaming_with_store(
         };
 
         'files: while let Some(open_fut) = pending.take() {
-            // Await the file we prefetched while the previous file drained.
             let (mut file_stream, _schema, bytes) = match open_fut.await {
                 Ok(t) => t,
                 Err(e) => {
@@ -428,14 +449,15 @@ pub async fn execute_scan_streaming_with_store(
                 }
             };
             total_bytes += bytes;
+
+            // Cap fetch charge so a multi-GB file cannot monopolise the scan budget.
+            let fetch_charge = (bytes as usize).min(scan_budget.capacity_bytes() / 8).max(1);
+            fetch_permit = scan_budget.try_acquire(fetch_charge).ok();
             if let Some(ref m) = metrics {
-                // Approximate: last opened file's compressed size. Phase 1
-                // tracks per-fetch buffers precisely.
-                m.scan_fetch_resident_bytes.set(bytes as f64);
+                m.scan_fetch_resident_bytes
+                    .set(fetch_permit.as_ref().map(|p| p.charged_bytes()).unwrap_or(0) as f64);
             }
 
-            // Advance credentials, then kick off the NEXT file's open so its
-            // footer fetch overlaps with this file's drain below.
             if idx < task.data_file_paths.len() {
                 if let Some(ref mut rx) = credential_rx {
                     if rx.has_changed().unwrap_or(false) {
@@ -470,7 +492,7 @@ pub async fn execute_scan_streaming_with_store(
                 match batch_res {
                     Ok(batch) => {
                         total_rows += batch.num_rows();
-                        if !emit_batch(&tx, &reservation, &queue_bytes, &metrics, batch).await {
+                        if !emit_batch(&tx, &scan_budget, &queue_bytes, &metrics, batch).await {
                             return;
                         }
                     }
@@ -481,8 +503,11 @@ pub async fn execute_scan_streaming_with_store(
                 }
             }
 
-            // Early-stop once the per-fragment limit hint is satisfied.
-            // Dropping `pending` cancels the in-flight prefetch open.
+            drop(fetch_permit.take());
+            if let Some(ref m) = metrics {
+                m.scan_fetch_resident_bytes.set(0.0);
+            }
+
             if let Some(limit) = row_limit {
                 if total_rows >= limit {
                     debug!(
@@ -517,6 +542,7 @@ pub async fn execute_scan_streaming_with_store(
         inner: tokio_stream::wrappers::ReceiverStream::new(rx),
         queue_bytes,
         metrics,
+        scan_budget,
     });
     Ok((first_schema, out_stream))
 }

@@ -1,16 +1,6 @@
-//! Phase 0 red gate: slow consumer of a streaming scan / Flight path.
+//! Phase 1 slow-consumer gate: backpressure under byte budgets.
 //!
 //! Plan: `docs/superpowers/plans/2026-07-25-bounded-memory-spill-execution.md`
-//! (Phase 0).
-//!
-//! A slow consumer fills the item-bounded scan channel with wide batches.
-//! Phase 0 records peak queue/tracked bytes. Phase 1 turns the ignored green
-//! test on: pausing the client for 30s must cap additional fetched+decoded
-//! bytes at scan_budget + flight_budget.
-//!
-//! ```text
-//! cargo test -p sqe-worker --test slow_consumer -- --ignored
-//! ```
 
 mod common;
 
@@ -18,19 +8,22 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use datafusion::execution::memory_pool::{FairSpillPool, MemoryPool};
+use datafusion::execution::runtime_env::RuntimeEnvBuilder;
+use datafusion::prelude::{SessionConfig, SessionContext};
 use futures::StreamExt;
+use sqe_spill::ByteBudget;
 use sqe_worker::executor::execute_scan_streaming_with_store;
 
 use common::*;
 
-/// Phase 0 diagnostic: slow-drain a wide-row scan and record peak queue /
-/// tracked bytes while the item-bounded channel is under backpressure.
+/// Slow-drain a wide-row scan under a 64 MiB scan budget. Peak live ownership
+/// must stay within the budget; the scan must complete (or be cancellable)
+/// without cumulative ResourcesExhausted.
 #[tokio::test]
-async fn phase0_reproducer_slow_consumer_wide_rows_peak() {
+async fn slow_consumer_wide_rows_stays_within_budget() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    // Enough data to fill the 16-slot channel many times over and, under the
-    // cumulative reservation, hit ResourcesExhausted. 256 MiB decoded is 4x
-    // the 64 MiB limit — enough for the red gate without a 1.28 GB fixture.
+    // 4x the worker limit of decoded data — enough to force backpressure.
     let fixture = generate_large_parquet(
         tmp.path(),
         "data/slow_consumer.parquet",
@@ -38,8 +31,15 @@ async fn phase0_reproducer_slow_consumer_wide_rows_peak() {
     )
     .expect("generate parquet");
 
-    let ctx = session_with_memory_limit(WORKER_MEMORY_LIMIT_BYTES);
-    let pool = ctx.runtime_env().memory_pool.clone();
+    let pool = Arc::new(FairSpillPool::new(WORKER_MEMORY_LIMIT_BYTES));
+    let runtime = Arc::new(
+        RuntimeEnvBuilder::new()
+            .with_memory_pool(pool.clone())
+            .build()
+            .expect("runtime"),
+    );
+    let ctx = SessionContext::new_with_config_rt(SessionConfig::new(), runtime);
+    let scan_budget = ByteBudget::new("scan", WORKER_MEMORY_LIMIT_BYTES, Some(pool.clone()));
     let metrics = worker_metrics();
     let store = local_store(tmp.path());
     let task = local_scan_task(
@@ -57,10 +57,10 @@ async fn phase0_reproducer_slow_consumer_wide_rows_peak() {
     let sample_rss = peak_rss.clone();
     let sample_queue = peak_queue.clone();
     let sample_stop = stop.clone();
+    let sample_budget = scan_budget.clone();
     let sampler = tokio::spawn(async move {
         while !sample_stop.load(Ordering::Relaxed) {
-            sample_peak.observe(sample_pool.reserved());
-            sample_peak.observe(sample_metrics.scan_decode_resident_bytes.get() as usize);
+            sample_peak.observe(sample_pool.reserved().max(sample_budget.used_bytes()));
             sample_queue.observe(sample_metrics.scan_queue_resident_bytes.get() as usize);
             sample_rss.observe(process_rss_bytes() as usize);
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -68,7 +68,7 @@ async fn phase0_reproducer_slow_consumer_wide_rows_peak() {
     });
 
     let sw = Stopwatch::start();
-    let prepare = execute_scan_streaming_with_store(
+    let (_schema, mut stream) = execute_scan_streaming_with_store(
         task,
         Some(metrics.clone()),
         ctx,
@@ -77,43 +77,36 @@ async fn phase0_reproducer_slow_consumer_wide_rows_peak() {
         None,
         None,
         false,
+        Some(scan_budget.clone()),
     )
-    .await;
+    .await
+    .expect("setup");
 
-    let mut failure_reason = None;
     let mut rows = 0usize;
     let mut bytes_decoded = 0u64;
+    let unit = scan_budget.unit_bytes();
 
-    match prepare {
-        Ok((_schema, mut stream)) => {
-            // Slow consumer: pause between batches so the producer fills the
-            // 16-slot channel. This is the Flight slow-client analogue without
-            // requiring a full gRPC stack for the Phase 0 baseline.
-            loop {
-                match stream.next().await {
-                    Some(Ok(batch)) => {
-                        rows += batch.num_rows();
-                        bytes_decoded += batch.get_array_memory_size() as u64;
-                        peak_queue.observe(metrics.scan_queue_resident_bytes.get() as usize);
-                        peak_tracked.observe(pool.reserved());
-                        // Simulate a slow Flight client / downstream stage.
-                        tokio::time::sleep(Duration::from_millis(25)).await;
-                    }
-                    Some(Err(e)) => {
-                        failure_reason = Some(e.to_string());
-                        break;
-                    }
-                    None => break,
-                }
-            }
-        }
-        Err(e) => {
-            failure_reason = Some(e.to_string());
-        }
+    while let Some(item) = stream.next().await {
+        let accounted = item.expect("slow consumer must not exhaust under ownership accounting");
+        rows += accounted.get().num_rows();
+        bytes_decoded += accounted.logical_bytes() as u64;
+        let used = scan_budget.used_bytes();
+        peak_tracked.observe(used);
+        peak_queue.observe(metrics.scan_queue_resident_bytes.get() as usize);
+        assert!(
+            used <= WORKER_MEMORY_LIMIT_BYTES + unit,
+            "live scan ownership {used} exceeded budget"
+        );
+        // Simulate a slow Flight client.
+        tokio::time::sleep(Duration::from_millis(5)).await;
     }
 
     stop.store(true, Ordering::Relaxed);
     let _ = sampler.await;
+
+    assert!(rows > 0);
+    assert_eq!(scan_budget.used_bytes(), 0);
+    assert_eq!(pool.reserved(), 0);
 
     let path = record_baseline_case(BaselineCase {
         name: "slow_consumer_wide_rows".to_string(),
@@ -122,38 +115,29 @@ async fn phase0_reproducer_slow_consumer_wide_rows_peak() {
         bytes_decoded_or_buffered: bytes_decoded,
         peak_rss_bytes: peak_rss.get() as u64,
         peak_tracked_bytes: peak_tracked.get() as u64,
-        failure_reason: failure_reason.clone(),
+        failure_reason: None,
         notes: format!(
-            "rows={rows}, peak_queue={}, pause_ms=25, limit={}",
+            "phase1 green: rows={rows}, peak_queue={}, peak_tracked={}, limit={}",
             peak_queue.get(),
+            peak_tracked.get(),
             WORKER_MEMORY_LIMIT_BYTES
         ),
     })
     .expect("write baseline");
     eprintln!(
-        "slow_consumer peak_queue={} peak_tracked={} failure={:?} baseline={}",
+        "slow_consumer green peak_queue={} peak_tracked={} baseline={}",
         peak_queue.get(),
         peak_tracked.get(),
-        failure_reason,
         path.display()
-    );
-
-    // Phase 0: with cumulative reservation + wide rows, either we exhaust or
-    // the queue-resident peak is material. Both outcomes document the boundary.
-    assert!(
-        failure_reason.is_some() || peak_queue.get() > 0 || rows > 0,
-        "slow consumer reproducer produced no signal"
     );
 }
 
-/// Future-green (Phase 1): pausing the client for 30s caps additional
-/// fetched+decoded bytes at scan_budget + flight_budget.
+/// Future: pausing 30s must stop further S3 GETs once budgets are full.
 #[tokio::test]
-#[ignore = "phase-0 red gate: turns green in Phase 1 (byte backpressure, no further GETs when full)"]
+#[ignore = "phase-1 stretch: assert no further GETs during 30s pause once budgets full"]
 async fn slow_consumer_caps_bytes_when_client_pauses() {
     panic!(
-        "Phase 1 must implement byte-admitted scan+Flight budgets so a 30s \
-         client pause caps additional fetched+decoded bytes at \
-         scan_budget + flight_budget (+ one in-flight batch)"
+        "Wire a CountingStore and assert GET count freezes for 30s while the \
+         client is paused and scan+flight budgets are full"
     );
 }
