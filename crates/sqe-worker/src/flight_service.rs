@@ -435,6 +435,9 @@ impl WorkerFlightService {
                         .await
                     {
                         rejected += 1;
+                        if let Some(ref mut buf) = buffer {
+                            buf.cancel();
+                        }
                         break;
                     }
                     if buffer.is_none() {
@@ -458,8 +461,18 @@ impl WorkerFlightService {
                     batch_count += 1;
                 }
                 Err(e) => {
+                    // Client disconnect / RPC cancel must not finish partial data.
                     if let Some(ref mut buf) = buffer {
-                        buf.fail(e.to_string());
+                        if is_exchange_cancelled(&e) {
+                            buf.cancel();
+                        } else {
+                            buf.fail(e.to_string());
+                        }
+                    }
+                    if is_exchange_cancelled(&e) {
+                        return Err(Status::cancelled(format!(
+                            "DoExchange cancelled mid-intake: {e}"
+                        )));
                     }
                     return Err(Status::internal(format!(
                         "Error decoding flight data in DoExchange: {e}"
@@ -479,6 +492,15 @@ impl WorkerFlightService {
             budget = budget_bytes,
             "DoExchange spill intake complete"
         );
+
+        if rejected > 0 {
+            // Drop buffer (armed guard cleans spill) without shipping partial rows.
+            drop(buffer);
+            return Err(Status::aborted(format!(
+                "rejecting late shuffle data for query={query_id} stage={stage_id} \
+                 partition={partition_id} attempt={attempt_id} after {batch_count} batches"
+            )));
+        }
 
         // Empty exchange: no schema observed — return an empty Flight stream.
         let Some(schema) = schema else {
@@ -543,6 +565,25 @@ impl WorkerFlightService {
 }
 
 type BoxStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'static>>;
+
+/// Detect client disconnect / RPC cancellation on the DoExchange request stream.
+fn is_exchange_cancelled(err: &arrow_flight::error::FlightError) -> bool {
+    match err {
+        arrow_flight::error::FlightError::Tonic(status) => {
+            matches!(
+                status.code(),
+                tonic::Code::Cancelled | tonic::Code::Aborted
+            )
+        }
+        other => {
+            let s = other.to_string().to_ascii_lowercase();
+            s.contains("cancel")
+                || s.contains("broken pipe")
+                || s.contains("connection reset")
+                || s.contains("h2 protocol error")
+        }
+    }
+}
 
 #[tonic::async_trait]
 impl FlightService for WorkerFlightService {
