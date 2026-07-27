@@ -911,8 +911,8 @@ pub trait ReclaimableConsumer: Send + Sync {
 - [x] Register every blocking consumer by query and workload class.
 - [x] Guarantee minimum viable grants only when total minima fit.
 - [x] Distribute remaining memory using weighted fair shares.
-- [ ] Reduce grants at a soft process/worker watermark.
-- [ ] Trigger asynchronous spill/repartition and wait for reclaimed bytes
+- [x] Reduce grants at a soft process/worker watermark.
+- [x] Trigger asynchronous spill/repartition and wait for reclaimed bytes
       before admitting new large work.
 - [x] Preserve spill read/merge and control-plane headroom.
 - [x] Reject admission before execution when summed minima cannot fit.

@@ -12,6 +12,10 @@ use crate::budget::ByteBudget;
 
 /// A consumer that can release memory under pressure (join build, aggregate
 /// state, sort runs, shuffle buffers).
+///
+/// Phase 7 extends this with live registration on the [`crate::MemoryGovernor`].
+/// Defaults keep existing implementors compiling; override `current_bytes` /
+/// `try_reclaim` when the operator can actually shrink.
 pub trait ReclaimableConsumer: Send + Sync {
     /// Human-readable name for metrics and logs.
     fn name(&self) -> &str;
@@ -21,6 +25,11 @@ pub trait ReclaimableConsumer: Send + Sync {
 
     /// Hard minimum below which the operator must spill or fail.
     fn minimum_bytes(&self) -> usize;
+
+    /// Bytes currently held (default: desired).
+    fn current_bytes(&self) -> usize {
+        self.desired_bytes()
+    }
 
     /// Best-effort reclaim of up to `target` bytes. Returns bytes actually
     /// freed (may be less). Must not block the calling task indefinitely.
