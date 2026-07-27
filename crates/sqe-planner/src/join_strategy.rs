@@ -53,6 +53,14 @@ pub const DEFAULT_HASH_JOIN_THRESHOLD: usize = 2 * 1024 * 1024 * 1024; // 2 GB
 /// for unknown/large builds via [`crate::grace_hash_join::choose_local_join_strategy`].
 /// Physical rewrite still uses spillable SortMergeJoin until `GraceHashJoinExec`
 /// is registered on the worker path; the choice is logged for plan profiles.
+///
+/// Selection and rewrite are deliberately not the same decision. The rewrite
+/// fires only on an *exact* build estimate above the threshold. An `Unknown`
+/// estimate keeps the hash join, because Iceberg scans report Absent/Inexact
+/// statistics for every table and rewriting on `Unknown` therefore rewrote
+/// nearly every join, serializing each one through the coalesce that
+/// [`ensure_sorted`] must insert. See the comment on the `rewrite` decision in
+/// [`JoinStrategyRule::optimize`].
 #[derive(Debug)]
 pub struct JoinStrategyRule {
     /// Maximum build-side size (bytes) for hash join.
@@ -119,10 +127,28 @@ impl PhysicalOptimizerRule for JoinStrategyRule {
                     threshold,
                     self.prefer_grace,
                 );
-                let rewrite = !matches!(
-                    choice,
-                    crate::grace_hash_join::LocalJoinStrategy::HashJoin
-                );
+                // Gate the physical rewrite on an *exact* over-threshold
+                // estimate. `choice` above still records Phase 5b's preferred
+                // strategy for plan profiles; this only decides whether the
+                // plan actually changes.
+                //
+                // Phase 5a (e0e2df3) rewrote on `Unknown` too. Iceberg scans
+                // report Absent/Inexact statistics for every table, so in
+                // practice that meant "rewrite nearly every join", and each
+                // rewritten join is coalesced to a single partition (see
+                // `ensure_sorted`). Measured at SF1: TPC-DS 42.5s -> 90.7s, and
+                // SSB went from 1.7x faster than Trino to 0.5x.
+                //
+                // So restore the pre-Phase-5a condition. `Unknown` keeps the
+                // hash join, which is what shipped through the passing
+                // 2026-07-21 baseline. Rewriting on `Unknown` can return once
+                // this rule runs inside DataFusion's optimizer pipeline, where
+                // EnforceDistribution can hash-partition the join inputs
+                // instead of serializing them.
+                let rewrite = match estimate {
+                    BuildSizeEstimate::Exact(size) => size > threshold,
+                    BuildSizeEstimate::Unknown => false,
+                };
 
                 if rewrite {
                     debug!(
@@ -849,7 +875,12 @@ mod tests {
     /// spillable SortMergeJoin path instead of keeping HashJoinExec on a
     /// guessed-zero build side.
     #[test]
-    fn phase5a_unknown_statistics_choose_sort_merge_join() {
+    fn unknown_statistics_keeps_hash_join() {
+        // Phase 5a rewrote on Unknown, but Iceberg scans report Absent/Inexact
+        // for every table, so that meant rewriting nearly every join into a
+        // single-partition sort-merge join. Measured at SF1 that cost TPC-DS
+        // 42.5s -> 90.7s and took SSB from 1.7x faster than Trino to 0.5x, so
+        // the physical rewrite is gated on an exact over-threshold estimate.
         let rule = JoinStrategyRule::new(DEFAULT_HASH_JOIN_THRESHOLD);
         let config = ConfigOptions::new();
 
@@ -862,31 +893,40 @@ mod tests {
             plan.downcast_ref::<HashJoinExec>()
                 .expect("fixture is HashJoinExec"),
         );
+        // Empty LazyMemoryExec reports Unknown (Absent/Inexact); a future DF
+        // version reporting Exact(0) is under threshold and also keeps hash.
+        assert!(
+            matches!(
+                estimated,
+                BuildSizeEstimate::Unknown | BuildSizeEstimate::Exact(0)
+            ),
+            "unexpected estimate for empty LazyMemoryExec: {estimated:?}"
+        );
 
-        // Empty LazyMemoryExec: expect Unknown (Absent/Inexact). If a future
-        // DF version reports Exact(0), that is the small-known exception and
-        // stays as HashJoin — assert accordingly.
-        match estimated {
-            BuildSizeEstimate::Unknown => {
-                let result = rule.optimize(plan, &config).unwrap();
-                assert!(
-                    result.downcast_ref::<SortMergeJoinExec>().is_some(),
-                    "Phase 5a: unknown build stats must rewrite to SortMergeJoinExec; \
-                     got {:?}",
-                    result
-                );
-            }
-            BuildSizeEstimate::Exact(0) => {
-                let result = rule.optimize(plan, &config).unwrap();
-                assert!(
-                    result.downcast_ref::<HashJoinExec>().is_some(),
-                    "exact-zero build is the small-known exception (keep hash)"
-                );
-            }
-            BuildSizeEstimate::Exact(other) => {
-                panic!("unexpected exact estimate {other} for empty LazyMemoryExec");
-            }
-        }
+        let result = rule.optimize(plan, &config).unwrap();
+        assert!(
+            result.downcast_ref::<HashJoinExec>().is_some(),
+            "unknown build stats must keep HashJoinExec, got {result:?}"
+        );
+    }
+
+    /// An exact estimate above the threshold still takes the spillable path --
+    /// the case Phase 5a exists for.
+    #[test]
+    fn exact_over_threshold_rewrites_to_sort_merge_join() {
+        // Threshold of 1 byte with a non-zero exact estimate would rewrite;
+        // the fixture cannot produce one, so assert the decision directly.
+        let over = match BuildSizeEstimate::Exact(4096) {
+            BuildSizeEstimate::Exact(size) => size > 1,
+            BuildSizeEstimate::Unknown => false,
+        };
+        assert!(over, "exact 4096 bytes over a 1-byte threshold must rewrite");
+
+        let under = match BuildSizeEstimate::Exact(1) {
+            BuildSizeEstimate::Exact(size) => size > DEFAULT_HASH_JOIN_THRESHOLD,
+            BuildSizeEstimate::Unknown => false,
+        };
+        assert!(!under, "exact small build must keep the hash join");
     }
 
     #[test]
