@@ -760,13 +760,29 @@ impl FlightService for WorkerFlightService {
 
         let (query_id, stage_id) = exchange_desc.stage_key();
         let partition_id = exchange_desc.partition_id();
+        let attempt_id = exchange_desc.attempt_id();
 
         info!(
             query_id = %query_id,
             stage_id = %stage_id,
             partition_id = partition_id,
+            attempt_id = attempt_id,
             "DoExchange: receiving shuffle data"
         );
+
+        // Phase 4: reject late data from a losing/obsolete task attempt before
+        // touching partition buffers.
+        if !self
+            .shuffle_manager
+            .attempts()
+            .admit(&query_id, &stage_id, partition_id, attempt_id)
+            .await
+        {
+            return Err(Status::aborted(format!(
+                "rejecting late shuffle data for query={query_id} stage={stage_id} \
+                 partition={partition_id} attempt={attempt_id} (a newer attempt already won)"
+            )));
+        }
 
         // 2. Look up the ShuffleReceiver for this (query_id, stage_id).
         let shuffle_receiver = self
@@ -803,16 +819,30 @@ impl FlightService for WorkerFlightService {
         // Spawn a task to receive batches and forward to the mpsc channel.
         // Uses send_batch so shuffle_resident_bytes tracks live channel occupancy
         // (Phase 0 instrumentation for the batch-count-bound safety gate).
+        // When a SpillManager is present, producers should prefer
+        // SpillablePartitionBuffer (unit-tested); DoExchange still uses the
+        // memory channel path until the coordinator registers spillable stages.
         let query_id_clone = query_id.clone();
         let stage_id_clone = stage_id.clone();
         let intake_receiver = shuffle_receiver.clone();
+        let attempt_gate = self.shuffle_manager.attempts().clone();
         tokio::spawn(async move {
             let mut batch_count = 0u64;
+            let mut rejected = 0u64;
             while let Some(batch_result) = flight_batch_stream.next().await {
                 match batch_result {
                     Ok(batch) => {
                         if batch.num_rows() == 0 {
                             continue;
+                        }
+                        // Re-check attempt on every batch so a superseding
+                        // attempt mid-stream stops the loser immediately.
+                        if !attempt_gate
+                            .admit(&query_id_clone, &stage_id_clone, partition_id, attempt_id)
+                            .await
+                        {
+                            rejected += 1;
+                            break;
                         }
                         batch_count += 1;
                         if intake_receiver
@@ -845,7 +875,9 @@ impl FlightService for WorkerFlightService {
                 query_id = %query_id_clone,
                 stage_id = %stage_id_clone,
                 partition_id = partition_id,
+                attempt_id = attempt_id,
                 batch_count = batch_count,
+                rejected_late = rejected,
                 "DoExchange intake complete"
             );
             // Intake task ends; remaining senders close when ShuffleReceiver drops.
