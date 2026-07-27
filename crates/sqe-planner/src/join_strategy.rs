@@ -327,6 +327,42 @@ mod tests {
         );
     }
 
+    /// Phase 0 red gate (bounded-memory plan): unknown / unavailable build-side
+    /// statistics are treated as **zero bytes**, so the rule keeps the
+    /// non-spillable `HashJoinExec`. Phase 5a flips this to "unknown → choose
+    /// spillable" (sort-merge fallback until Grace hash lands).
+    ///
+    /// `LazyMemoryExec` with an empty partition list yields no exact
+    /// `total_byte_size`, so `estimate_build_side_size` returns 0 today.
+    #[test]
+    fn phase0_unknown_statistics_keep_hash_join_exec() {
+        let rule = JoinStrategyRule::new(DEFAULT_HASH_JOIN_THRESHOLD);
+        let config = ConfigOptions::new();
+
+        let schema = test_schema();
+        // Empty memory plan: stats are absent/inexact → estimate 0.
+        let left = make_memory_plan(schema.clone());
+        let right = make_memory_plan(schema.clone());
+        let plan = make_hash_join(left, right, &schema, &schema, JoinType::Inner);
+
+        let estimated = estimate_build_side_size(
+            plan.downcast_ref::<HashJoinExec>()
+                .expect("fixture is HashJoinExec"),
+        );
+        assert_eq!(
+            estimated, 0,
+            "Phase 0: unknown stats must estimate as 0 (unsafe keep-hash path)"
+        );
+
+        let result = rule.optimize(plan, &config).unwrap();
+        assert!(
+            result.downcast_ref::<HashJoinExec>().is_some(),
+            "Phase 0 gate: unknown build-side stats must keep HashJoinExec; \
+             got {:?}",
+            result
+        );
+    }
+
     #[test]
     fn test_rule_rewrites_to_smj_above_threshold() {
         // Use a threshold of 0 bytes (but not zero — which disables the rule).

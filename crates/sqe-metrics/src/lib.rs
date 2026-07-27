@@ -828,7 +828,13 @@ impl HasRegistry for MetricsRegistry {
 /// Metrics registry for SQE workers.
 ///
 /// Tracks per-worker counters for fragments executed, rows scanned, bytes read,
-/// and a histogram of fragment execution durations.
+/// fragment durations, and the Phase 0 memory-boundary gauges used by the
+/// bounded-memory / spill rollout (`docs/superpowers/plans/2026-07-25-bounded-memory-spill-execution.md`).
+///
+/// Resident-byte gauges are ownership-based: they report bytes held *now*, not
+/// cumulative bytes processed. Phase 0 instruments the existing (incorrect)
+/// cumulative scan reservation so the red gates have a visible signal; Phase 1
+/// rewires them to true ownership accounting via `ByteBudget`.
 #[derive(Clone)]
 pub struct WorkerMetricsRegistry {
     pub registry: Registry,
@@ -840,6 +846,32 @@ pub struct WorkerMetricsRegistry {
     pub bytes_read: Counter,
     /// Histogram of per-fragment execution time in seconds.
     pub fragment_duration: Histogram,
+
+    // ── Phase 0 memory-boundary gauges / counters ─────────────────────────
+    /// Compressed fetch buffers currently resident in the worker scan path.
+    pub scan_fetch_resident_bytes: Gauge,
+    /// Decoded Arrow batches currently charged against the scan reservation.
+    pub scan_decode_resident_bytes: Gauge,
+    /// Decoded batches sitting in the scan mpsc queue awaiting consumption.
+    pub scan_queue_resident_bytes: Gauge,
+    /// Arrow batches currently held by the Flight encoder (pre-send).
+    pub flight_encode_resident_bytes: Gauge,
+    /// Encoded FlightData currently in flight / awaiting gRPC release.
+    pub flight_inflight_bytes: Gauge,
+    /// RecordBatches currently buffered in shuffle partition channels.
+    pub shuffle_resident_bytes: Gauge,
+    /// Operator-owned temporary state currently tracked (joins/aggs/sorts).
+    pub operator_resident_bytes: Gauge,
+    /// Total spill bytes written by this worker (all operators/exchanges).
+    pub spill_bytes_written: Counter,
+    /// Total spill bytes read by this worker.
+    pub spill_bytes_read: Counter,
+    /// Number of live spill files/segments.
+    pub spill_files: Gauge,
+    /// Spill failures (quota, I/O, corruption) by this worker.
+    pub spill_failures: Counter,
+    /// Seconds spent blocked on memory admission / backpressure.
+    pub memory_backpressure_seconds: Counter,
 }
 
 impl WorkerMetricsRegistry {
@@ -875,12 +907,85 @@ impl WorkerMetricsRegistry {
             ]),
         )?;
 
+        let scan_fetch_resident_bytes = register_gauge(
+            &registry,
+            "sqe_worker_scan_fetch_resident_bytes",
+            "Compressed scan fetch buffers currently resident in the worker",
+        )?;
+        let scan_decode_resident_bytes = register_gauge(
+            &registry,
+            "sqe_worker_scan_decode_resident_bytes",
+            "Decoded Arrow batches currently charged to the scan memory reservation",
+        )?;
+        let scan_queue_resident_bytes = register_gauge(
+            &registry,
+            "sqe_worker_scan_queue_resident_bytes",
+            "Decoded batches sitting in the scan queue awaiting consumption",
+        )?;
+        let flight_encode_resident_bytes = register_gauge(
+            &registry,
+            "sqe_worker_flight_encode_resident_bytes",
+            "Arrow batches currently held by the Flight encoder",
+        )?;
+        let flight_inflight_bytes = register_gauge(
+            &registry,
+            "sqe_worker_flight_inflight_bytes",
+            "Encoded FlightData currently in flight awaiting gRPC release",
+        )?;
+        let shuffle_resident_bytes = register_gauge(
+            &registry,
+            "sqe_worker_shuffle_resident_bytes",
+            "RecordBatches currently buffered in shuffle partition channels",
+        )?;
+        let operator_resident_bytes = register_gauge(
+            &registry,
+            "sqe_worker_operator_resident_bytes",
+            "Operator temporary state currently tracked by the worker",
+        )?;
+        let spill_bytes_written = register_counter(
+            &registry,
+            "sqe_worker_spill_bytes_written_total",
+            "Total spill bytes written by this worker",
+        )?;
+        let spill_bytes_read = register_counter(
+            &registry,
+            "sqe_worker_spill_bytes_read_total",
+            "Total spill bytes read by this worker",
+        )?;
+        let spill_files = register_gauge(
+            &registry,
+            "sqe_worker_spill_files",
+            "Number of live spill files or segments on this worker",
+        )?;
+        let spill_failures = register_counter(
+            &registry,
+            "sqe_worker_spill_failures_total",
+            "Spill failures (quota, I/O, corruption) on this worker",
+        )?;
+        let memory_backpressure_seconds = register_counter(
+            &registry,
+            "sqe_worker_memory_backpressure_seconds_total",
+            "Seconds spent blocked on memory admission or backpressure",
+        )?;
+
         Ok(Self {
             registry,
             fragments_executed,
             rows_scanned,
             bytes_read,
             fragment_duration,
+            scan_fetch_resident_bytes,
+            scan_decode_resident_bytes,
+            scan_queue_resident_bytes,
+            flight_encode_resident_bytes,
+            flight_inflight_bytes,
+            shuffle_resident_bytes,
+            operator_resident_bytes,
+            spill_bytes_written,
+            spill_bytes_read,
+            spill_files,
+            spill_failures,
+            memory_backpressure_seconds,
         })
     }
 }
@@ -1147,7 +1252,31 @@ mod tests {
         m.rows_scanned.inc_by(0.0);
         m.bytes_read.inc_by(0.0);
         m.fragment_duration.observe(0.0);
-        assert!(m.registry.gather().len() >= 4);
+        m.scan_fetch_resident_bytes.set(0.0);
+        m.scan_decode_resident_bytes.set(0.0);
+        m.scan_queue_resident_bytes.set(0.0);
+        m.flight_encode_resident_bytes.set(0.0);
+        m.flight_inflight_bytes.set(0.0);
+        m.shuffle_resident_bytes.set(0.0);
+        m.operator_resident_bytes.set(0.0);
+        m.spill_bytes_written.inc_by(0.0);
+        m.spill_bytes_read.inc_by(0.0);
+        m.spill_files.set(0.0);
+        m.spill_failures.inc_by(0.0);
+        m.memory_backpressure_seconds.inc_by(0.0);
+        // Legacy 4 + 12 Phase 0 memory-boundary metrics.
+        assert!(m.registry.gather().len() >= 16);
+    }
+
+    #[test]
+    fn test_worker_phase0_memory_gauges_roundtrip() {
+        let m = WorkerMetricsRegistry::new().unwrap();
+        m.scan_queue_resident_bytes.set(42.0 * 1024.0 * 1024.0);
+        m.shuffle_resident_bytes.set(7.0 * 1024.0 * 1024.0);
+        m.spill_failures.inc();
+        assert_eq!(m.scan_queue_resident_bytes.get(), 42.0 * 1024.0 * 1024.0);
+        assert_eq!(m.shuffle_resident_bytes.get(), 7.0 * 1024.0 * 1024.0);
+        assert_eq!(m.spill_failures.get(), 1.0);
     }
 
     #[test]
