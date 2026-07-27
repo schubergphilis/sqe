@@ -93,7 +93,12 @@ pub fn lifecycle_attributes(scope: &SpillScope, purpose: &str) -> Attributes {
 // ───────────────────────────── Config ────────────────────────────────────────
 
 /// Dedicated S3 credentials and location for spill (not table STS).
-#[derive(Debug, Clone)]
+///
+/// `Debug` is hand-written so `secret_access_key` never renders through
+/// `{:?}`, a panic, or an error chain. `sqe-spill` does not depend on
+/// `sqe-core`, so this mirrors the `SecretString` redaction guarantee that
+/// guards the config-side `WorkerSpillS3Config` (CORE-01).
+#[derive(Clone)]
 pub struct S3SpillConfig {
     pub bucket: String,
     /// Key prefix under the bucket (e.g. `sqe-spill/`). Must not overlap
@@ -109,6 +114,25 @@ pub struct S3SpillConfig {
     pub max_objects: u64,
     pub max_concurrent_writes: usize,
     pub max_concurrent_reads: usize,
+}
+
+impl std::fmt::Debug for S3SpillConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("S3SpillConfig")
+            .field("bucket", &self.bucket)
+            .field("prefix", &self.prefix)
+            .field("region", &self.region)
+            .field("endpoint", &self.endpoint)
+            .field("access_key_id", &self.access_key_id)
+            .field("secret_access_key", &"<redacted>")
+            .field("allow_http", &self.allow_http)
+            .field("path_style", &self.path_style)
+            .field("max_bytes", &self.max_bytes)
+            .field("max_objects", &self.max_objects)
+            .field("max_concurrent_writes", &self.max_concurrent_writes)
+            .field("max_concurrent_reads", &self.max_concurrent_reads)
+            .finish()
+    }
 }
 
 impl S3SpillConfig {
