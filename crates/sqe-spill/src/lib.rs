@@ -20,11 +20,13 @@ pub mod governor;
 pub mod manager;
 pub mod operator_admit;
 pub mod reclaim;
+pub mod resizable_pool;
 pub mod scope;
 pub mod segment;
 pub mod store;
 pub mod store_local;
 pub mod store_s3;
+pub mod store_tiered;
 
 pub use accounted::Accounted;
 pub use budget::{
@@ -45,6 +47,7 @@ pub use governor::{
     AdmissionDecision, AdmissionRequest, GrantGuard, MemoryGovernor, SharedMemoryGovernor,
     WorkloadClass,
 };
+pub use resizable_pool::{ResizableFairSpillPool, ShrinkBelowUse};
 pub use operator_admit::{
     admit_operator, LiveConsumerRegistry, OperatorConsumer, OperatorGrantGuard,
 };
@@ -60,3 +63,4 @@ pub use store_s3::{
     S3SpillConfig, LIFECYCLE_PURPOSE_KEY, LIFECYCLE_PURPOSE_PARTIAL, LIFECYCLE_PURPOSE_SEGMENT,
     LIFECYCLE_QUERY_KEY, LIFECYCLE_TAG_KEY, LIFECYCLE_TAG_VALUE,
 };
+pub use store_tiered::TieredSegmentStore;

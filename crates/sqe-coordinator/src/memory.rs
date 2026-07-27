@@ -126,14 +126,12 @@ pub fn tracked_pool_report(n: usize) -> Option<String> {
     TRACKED_POOL.get().map(|p| p.report_top(n))
 }
 
-/// Current process resident set size in bytes, from `/proc/self/status`
-/// (`VmRSS`). Returns `None` where procfs is unavailable (macOS dev boxes);
-/// the retention gates run on Linux.
+/// Current process resident set size in bytes (portable).
+///
+/// Linux: `/proc/self/status` VmRSS. macOS: `ps`. Windows: best-effort / none.
+/// See [`sqe_core::process_rss_bytes`].
 pub fn process_rss_bytes() -> Option<usize> {
-    let status = std::fs::read_to_string("/proc/self/status").ok()?;
-    let line = status.lines().find(|l| l.starts_with("VmRSS:"))?;
-    let kb: usize = line.split_whitespace().nth(1)?.parse().ok()?;
-    Some(kb * 1024)
+    sqe_core::process_rss_bytes().map(|b| b as usize)
 }
 
 /// Pool residue above this after a query completes triggers a consumer-report

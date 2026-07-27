@@ -771,7 +771,7 @@ async fn async_main() -> anyhow::Result<()> {
 
     match mode {
         Mode::Coordinator => run_coordinator(config).await,
-        Mode::Worker => run_worker(config).await,
+        Mode::Worker => run_worker(config, config_path).await,
     }
 }
 
@@ -1618,7 +1618,7 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
 }
 
 // ── Worker ─────────────────────────────────────────────────────
-async fn run_worker(config: SqeConfig) -> anyhow::Result<()> {
+async fn run_worker(config: SqeConfig, config_path: String) -> anyhow::Result<()> {
     let started_at = Instant::now();
     let ready = Arc::new(AtomicBool::new(false));
 
@@ -1669,15 +1669,22 @@ async fn run_worker(config: SqeConfig) -> anyhow::Result<()> {
         config.metrics.prometheus_port,
     );
 
-    let session_ctx = sqe_worker::runtime::build_session_context(&config.worker)?;
+    let (session_ctx, memory_pool) =
+        sqe_worker::runtime::build_session_context(&config.worker)?;
 
     // Build the fully-wired Flight service and start the heartbeat task via the
     // shared worker bootstrap. Previously run_worker built the service WITHOUT
     // .with_worker_secret(), without the footer cache, and never started the
     // heartbeat -- so Helm-deployed workers (which run `--mode worker`) were
     // unauthenticated, uncached, and invisible to the coordinator (#219).
-    let flight_service =
-        sqe_worker::bootstrap::build_worker_service(&config, worker_metrics, session_ctx)?;
+    // Hot-reload watches config_path for worker memory budgets.
+    let flight_service = sqe_worker::bootstrap::build_worker_service_with_hot_reload(
+        &config,
+        worker_metrics,
+        session_ctx,
+        Some(memory_pool),
+        Some(&config_path),
+    )?;
 
     // Mark ready
     ready.store(true, Ordering::Relaxed);
