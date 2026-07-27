@@ -155,6 +155,10 @@ fn resolve_shuffle_budget(config: &SqeConfig) -> usize {
 /// **enforced** limit (Linux cgroup, nested walk). Always logs a full OS /
 /// container / cgroup / host-memory snapshot so operators can see which layer
 /// is authoritative. macOS/Windows have no cgroup: snapshot only, no fail-closed.
+///
+/// After boot validation, starts a background watch that re-reads the live
+/// cgroup/OS limit. `sqe.toml` itself is **not** hot-reloaded — pool/governor
+/// sizes stay fixed until process restart.
 fn validate_process_headroom(config: &SqeConfig) -> anyhow::Result<()> {
     let limit = parse_memory_limit(&config.worker.memory_limit).unwrap_or(0) as u64;
     let headroom = match config
@@ -223,6 +227,14 @@ fn validate_process_headroom(config: &SqeConfig) -> anyhow::Result<()> {
             );
         }
     }
+
+    // Live cgroup can move after boot (pod resize). Configured pool size cannot.
+    // Dropping the JoinHandle does not abort the task (same pattern as heartbeat).
+    let _ = sqe_core::spawn_runtime_memory_watch(
+        need,
+        sqe_core::DEFAULT_RUNTIME_MEMORY_WATCH_INTERVAL,
+    );
+
     Ok(())
 }
 
