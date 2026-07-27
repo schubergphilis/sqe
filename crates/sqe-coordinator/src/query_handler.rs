@@ -3024,18 +3024,31 @@ impl QueryHandler {
             }
         }
 
-        // 6. Check if there are enough files to justify distribution
+        // 6. Check if there is enough work to justify distribution.
+        // Phase 2: fewer files than workers is OK when total bytes can be
+        // morsel-split across workers (one multi-GB file → many morsels).
         let num_workers = healthy.len();
         if total_files < num_workers {
+            let total_bytes: u64 = file_info.iter().map(|(_, size)| size).sum();
+            let min_split_bytes = sqe_planner::DEFAULT_MORSEL_TARGET_BYTES;
+            if total_bytes < min_split_bytes {
+                debug!(
+                    total_files,
+                    num_workers,
+                    total_bytes,
+                    "Fewer files than workers and too small to morsel-split — local"
+                );
+                if let Some(ref metrics) = self.metrics {
+                    metrics.scheduler_decisions.with_label_values(&["local"]).inc();
+                }
+                return plan;
+            }
             debug!(
                 total_files,
                 num_workers,
-                "Fewer files than workers, executing locally"
+                total_bytes,
+                "Fewer files than workers but large enough for byte-range morsels"
             );
-            if let Some(ref metrics) = self.metrics {
-                metrics.scheduler_decisions.with_label_values(&["local"]).inc();
-            }
-            return plan;
         }
 
         info!(
@@ -3093,39 +3106,148 @@ impl QueryHandler {
                 (None, None)
             };
 
-        // 7. Split (path, size) pairs into size-balanced bins using bin-packing.
-        // target_size_bytes: read from config or fall back to 256 MiB.
-        // max_bins: allow up to 3 tasks per worker so work is evenly spread
-        // even when file sizes vary widely.
+        // 7. Plan scan morsels, then bin-pack into worker tasks.
+        //
+        // Delete-free snapshots: large files are split into byte-range morsels
+        // (~target size) so one multi-GB Parquet file fans out across workers.
+        // The worker resolves each byte range to row groups at open time.
+        // Snapshots with delete files keep file-level morsels only — sub-file
+        // ranges would skip delete application (same gate as embedded
+        // `use_split_assignment` in iceberg_scan.rs).
         let target_size_bytes = sqe_core::parse_memory_limit(
             &self.config.query.target_task_size
         ).unwrap_or(256 * 1024 * 1024) as u64;
-        let max_bins = num_workers * 3;
-        let file_groups = sqe_planner::bin_pack_files(file_info, target_size_bytes, max_bins);
+        let morsel_target = sqe_planner::DEFAULT_MORSEL_TARGET_BYTES.min(target_size_bytes);
+        let morsel_max = sqe_planner::DEFAULT_MORSEL_MAX_BYTES.max(morsel_target);
 
-        // 8. Build ScanTasks — paths and sizes are parallel vecs within each group
+        let allow_subfile_split = match iceberg_scan.snapshot_has_deletes().await {
+            Ok(has_deletes) => {
+                if has_deletes {
+                    debug!(
+                        "Snapshot has delete files — keeping file-level morsels \
+                         (no sub-file byte ranges)"
+                    );
+                }
+                !has_deletes
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "Failed to probe snapshot deletes; keeping file-level morsels"
+                );
+                false
+            }
+        };
+
+        let morsels = sqe_planner::plan_scan_morsels(
+            &file_info,
+            morsel_target,
+            morsel_max,
+            allow_subfile_split,
+        );
+        debug!(
+            morsel_count = morsels.len(),
+            file_count = file_info.len(),
+            allow_subfile_split,
+            morsel_target,
+            "Planned scan morsels for distribution"
+        );
+
+        // Bin-pack morsels by compressed estimate. max_bins is a large pending
+        // queue (Phase 2) so work can rebalance later.
+        let max_bins = (num_workers * 32).max(num_workers * 3).max(1);
+        let morsel_units: Vec<(String, u64)> = morsels
+            .iter()
+            .map(|m| (m.morsel_id.clone(), m.compressed_bytes_estimate.max(1)))
+            .collect();
+        let morsel_groups =
+            sqe_planner::bin_pack_files(morsel_units, target_size_bytes, max_bins);
+
+        // Index morsels by id for task construction.
+        let morsel_by_id: std::collections::HashMap<&str, &sqe_planner::ScanMorsel> = morsels
+            .iter()
+            .map(|m| (m.morsel_id.as_str(), m))
+            .collect();
+
+        // 8. Build ScanTasks — one morsel per task when sub-file split is on
+        // (each morsel is already sized); when packing grouped multiple small
+        // whole-file morsels, emit multi-file tasks without ranges.
         let storage = &self.config.storage;
-        let scan_tasks: Vec<sqe_planner::ScanTask> = file_groups
+        let scan_tasks: Vec<sqe_planner::ScanTask> = morsel_groups
             .into_iter()
             .filter(|group| !group.is_empty())
-            .map(|group| {
-                let (data_file_paths, file_sizes_bytes): (Vec<String>, Vec<u64>) =
-                    group.into_iter().unzip();
-                sqe_planner::ScanTask {
-                    fragment_id: uuid::Uuid::now_v7().to_string(),
-                    data_file_paths,
-                    file_sizes_bytes,
-                    projected_columns: projected_cols.clone(),
-                    projected_field_ids: projected_field_ids.clone(),
-                    s3_endpoint: storage.s3_endpoint.clone(),
-                    s3_region: storage.s3_region.clone(),
-                    s3_access_key: storage.s3_access_key.clone(),
-                    s3_secret_key: storage.s3_secret_key.expose().to_string(),
-                    s3_session_token: String::new(),
-                    s3_path_style: storage.s3_path_style,
-                    s3_allow_http: storage.s3_endpoint.starts_with("http://"),
-                    predicate_proto: predicate_proto.clone(),
-                    limit: scan_limit,
+            .flat_map(|group| {
+                let group_morsels: Vec<&sqe_planner::ScanMorsel> = group
+                    .iter()
+                    .filter_map(|(id, _)| morsel_by_id.get(id.as_str()).copied())
+                    .collect();
+                if group_morsels.is_empty() {
+                    return Vec::new();
+                }
+
+                // If every morsel is a whole-file unit (no byte range), pack
+                // them into one multi-file ScanTask (legacy shape).
+                let all_whole_file = group_morsels
+                    .iter()
+                    .all(|m| m.start_byte.is_none() && m.end_byte.is_none());
+
+                if all_whole_file {
+                    let data_file_paths: Vec<String> =
+                        group_morsels.iter().map(|m| m.file_path.clone()).collect();
+                    let file_sizes_bytes: Vec<u64> = group_morsels
+                        .iter()
+                        .map(|m| m.file_size_bytes)
+                        .collect();
+                    vec![sqe_planner::ScanTask {
+                        version: sqe_planner::SCAN_TASK_VERSION_V1,
+                        morsel_id: None,
+                        row_group_start: None,
+                        row_group_end: None,
+                        start_byte: None,
+                        end_byte: None,
+                        fragment_id: uuid::Uuid::now_v7().to_string(),
+                        data_file_paths,
+                        file_sizes_bytes,
+                        projected_columns: projected_cols.clone(),
+                        projected_field_ids: projected_field_ids.clone(),
+                        s3_endpoint: storage.s3_endpoint.clone(),
+                        s3_region: storage.s3_region.clone(),
+                        s3_access_key: storage.s3_access_key.clone(),
+                        s3_secret_key: storage.s3_secret_key.expose().to_string(),
+                        s3_session_token: String::new(),
+                        s3_path_style: storage.s3_path_style,
+                        s3_allow_http: storage.s3_endpoint.starts_with("http://"),
+                        predicate_proto: predicate_proto.clone(),
+                        limit: scan_limit,
+                    }]
+                } else {
+                    // Byte-range morsels: one ScanTask per morsel (single file
+                    // + range). Version 2 so workers apply range resolution.
+                    group_morsels
+                        .into_iter()
+                        .map(|m| sqe_planner::ScanTask {
+                            version: sqe_planner::SCAN_TASK_VERSION_V2,
+                            morsel_id: Some(m.morsel_id.clone()),
+                            row_group_start: None,
+                            row_group_end: None,
+                            start_byte: m.start_byte,
+                            end_byte: m.end_byte,
+                            fragment_id: uuid::Uuid::now_v7().to_string(),
+                            data_file_paths: vec![m.file_path.clone()],
+                            file_sizes_bytes: vec![m.file_size_bytes],
+                            projected_columns: projected_cols.clone(),
+                            projected_field_ids: projected_field_ids.clone(),
+                            s3_endpoint: storage.s3_endpoint.clone(),
+                            s3_region: storage.s3_region.clone(),
+                            s3_access_key: storage.s3_access_key.clone(),
+                            s3_secret_key: storage.s3_secret_key.expose().to_string(),
+                            s3_session_token: String::new(),
+                            s3_path_style: storage.s3_path_style,
+                            s3_allow_http: storage.s3_endpoint.starts_with("http://"),
+                            predicate_proto: predicate_proto.clone(),
+                            limit: scan_limit,
+                        })
+                        .collect()
                 }
             })
             .collect();

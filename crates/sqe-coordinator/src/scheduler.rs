@@ -213,6 +213,12 @@ mod tests {
 
     fn make_task(id: &str, file_count: usize, file_size_mb: u64) -> ScanTask {
         ScanTask {
+            version: 1,
+            morsel_id: None,
+            row_group_start: None,
+            row_group_end: None,
+            start_byte: None,
+            end_byte: None,
             fragment_id: id.to_string(),
             data_file_paths: (0..file_count)
                 .map(|i| format!("s3://bucket/file{i}.parquet"))
@@ -236,6 +242,12 @@ mod tests {
 
     fn make_task_with_sizes(id: &str, sizes: &[u64]) -> ScanTask {
         ScanTask {
+            version: 1,
+            morsel_id: None,
+            row_group_start: None,
+            row_group_end: None,
+            start_byte: None,
+            end_byte: None,
             fragment_id: id.to_string(),
             data_file_paths: (0..sizes.len())
                 .map(|i| format!("s3://bucket/file{i}.parquet"))
@@ -675,6 +687,12 @@ mod tests {
         let file_path = "s3://bucket/dashboard/metrics.parquet".to_string();
 
         let task1 = ScanTask {
+            version: 1,
+            morsel_id: None,
+            row_group_start: None,
+            row_group_end: None,
+            start_byte: None,
+            end_byte: None,
             fragment_id: "q1_scan".to_string(),
             data_file_paths: vec![file_path.clone()],
             file_sizes_bytes: vec![100 * MB],
@@ -691,6 +709,12 @@ mod tests {
             limit: None,
         };
         let task2 = ScanTask {
+            version: 1,
+            morsel_id: None,
+            row_group_start: None,
+            row_group_end: None,
+            start_byte: None,
+            end_byte: None,
             fragment_id: "q2_scan".to_string(),
             data_file_paths: vec![file_path.clone()],
             file_sizes_bytes: vec![100 * MB],

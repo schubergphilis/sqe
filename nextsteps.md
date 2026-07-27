@@ -1,5 +1,8 @@
 # SQE — Next Steps
 
+> Status as of 2026-07-26. **Bounded-memory Phase 2 foundation in progress (branch `feat/bounded-memory-phase2`).** `ScanMorsel` + `group_row_groups_into_morsels`, versioned `ScanTask` (v1/v2) with row-group/byte-range fields and worker `validate_version`, worker applies `with_row_groups` for morsel tickets, coordinator `max_bins` raised to `num_workers * 32`. Footer-driven morsel planning and work-stealing still open. Stacks on Phase 0+1 ownership accounting. **NEXT:** wire footer row-group planning into query_handler (delete-aware gate), then Phase 3 SpillManager.
+
+
 > Status as of 2026-07-26. **Bounded-memory Phase 1 shipped (branch `feat/bounded-memory-phase1`).** New `sqe-spill` crate with pool-backed `ByteBudget` / `Accounted` (64 KiB units, wait-on-budget, fail-on-ItemTooLarge, permit Drop releases pool). Worker scan path no longer cumulative-`try_grow`s: decoded batches are ownership-admitted, channel is `mpsc<Accounted<RecordBatch>>`, Flight holds the permit via `AccountedEncodeStream` until the encoder polls the next batch. Config: `[worker.memory]` sub-budgets with resolve/validate. Zero-pruning ≥20x-RAM and slow-consumer gates are green under a 64 MiB pool. **NEXT:** Phase 2 scan morsels, then Phase 3 SpillManager.
 
 
