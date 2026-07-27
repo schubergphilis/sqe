@@ -1,6 +1,7 @@
 //! Local NVMe / filesystem spill backend.
 
 use crate::error::{BudgetError, Result};
+use crate::fault::{take_fault, SpillFault};
 use crate::scope::SpillScope;
 use crate::segment::{SpillSegment, SEGMENT_FORMAT_VERSION, SEGMENT_MAGIC};
 use crate::store::{SegmentReader, SegmentStore, SegmentWriter};
@@ -83,6 +84,22 @@ impl LocalSegmentStore {
     }
 
     fn reserve_quota(&self, need: u64) -> Result<()> {
+        // Deterministic fault injection (test only; inert in production).
+        if take_fault(SpillFault::DiskFull) {
+            return Err(BudgetError::SpillDiskFull {
+                need: self.min_free_bytes.max(need),
+                available: 0,
+            });
+        }
+        if take_fault(SpillFault::QuotaExceeded) {
+            return Err(BudgetError::SpillQuotaExceeded {
+                scope: "local".into(),
+                need,
+                free: 0,
+                max: self.max_bytes,
+            });
+        }
+
         let used = self.used_bytes.load(Ordering::Relaxed);
         if used.saturating_add(need) > self.max_bytes {
             return Err(BudgetError::SpillQuotaExceeded {
@@ -200,6 +217,12 @@ impl SegmentStore for LocalSegmentStore {
             .map_err(|_| BudgetError::Cancelled {
                 budget: "spill-read".into(),
             })?;
+        if take_fault(SpillFault::CorruptOnRead) {
+            return Err(BudgetError::SegmentCorrupt {
+                path: segment.path.display().to_string(),
+                reason: "injected corruption on open_reader".into(),
+            });
+        }
         let path = segment.path.clone();
         let file = File::open(&path).map_err(|e| BudgetError::SpillIo {
             path: path.display().to_string(),
@@ -353,6 +376,15 @@ struct LocalSegmentWriter {
 #[async_trait]
 impl SegmentWriter for LocalSegmentWriter {
     async fn write_batch(&mut self, batch: &RecordBatch) -> Result<()> {
+        if take_fault(SpillFault::ShortWrite) {
+            return Err(BudgetError::SpillIo {
+                path: self.partial_path.display().to_string(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "injected short write",
+                ),
+            });
+        }
         let ipc = self
             .ipc
             .as_mut()
@@ -386,7 +418,14 @@ impl SegmentWriter for LocalSegmentWriter {
         let checksum = crc32fast::hash(&body);
         let physical_bytes = body.len() as u64;
 
-        // Atomic publish.
+        // Atomic publish (fault inject before rename).
+        if take_fault(SpillFault::RenameFailure) {
+            let _ = fs::remove_file(&self.partial_path);
+            return Err(BudgetError::SpillIo {
+                path: self.final_path.display().to_string(),
+                source: std::io::Error::other("injected rename failure"),
+            });
+        }
         fs::rename(&self.partial_path, &self.final_path).map_err(|e| BudgetError::SpillIo {
             path: self.final_path.display().to_string(),
             source: e,
@@ -518,6 +557,7 @@ mod tests {
 
     #[tokio::test]
     async fn roundtrip_preserves_rows() {
+        let _serial = crate::fault::serial_test_guard();
         let tmp = tempfile::tempdir().unwrap();
         let store = LocalSegmentStore::open(tmp.path(), 1 << 30, 0, 2, 2).unwrap();
         let scope = SpillScope::new("q", "s", "op", 0, 0);
@@ -566,5 +606,72 @@ mod tests {
         assert!(!s.contains("AKIASECRET") || scope.query_id == "AKIASECRET");
         // Path must stay under root.
         assert!(dir.starts_with(tmp.path()));
+    }
+
+    #[tokio::test]
+    async fn fault_disk_full_fails_create_writer_only() {
+        use crate::fault::{install_faults, FaultSession, SpillFault};
+        let _session = FaultSession::new(vec![SpillFault::DiskFull]);
+        let tmp = tempfile::tempdir().unwrap();
+        let store = LocalSegmentStore::open(tmp.path(), 1 << 30, 0, 1, 1).unwrap();
+        let scope = SpillScope::new("q-diskfull", "s", "op", 0, 0);
+        let schema = batch(1).schema();
+        let err = store.create_writer(&scope, 0, schema).await;
+        assert!(
+            matches!(err, Err(BudgetError::SpillDiskFull { .. })),
+            "got {}",
+            err.err().map(|e| e.to_string()).unwrap_or_default()
+        );
+        // Clear injected plan mid-session and retry.
+        install_faults(vec![]);
+        let mut w = store
+            .create_writer(&scope, 1, batch(1).schema())
+            .await
+            .unwrap();
+        w.write_batch(&batch(1)).await.unwrap();
+        let _ = w.finish().await.unwrap();
+        store.delete_scope(&scope).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fault_corrupt_on_read() {
+        use crate::fault::{install_faults, serial_test_guard, SpillFault};
+        let _serial = serial_test_guard();
+        let tmp = tempfile::tempdir().unwrap();
+        let store = LocalSegmentStore::open(tmp.path(), 1 << 30, 0, 1, 1).unwrap();
+        let scope = SpillScope::new("q-corrupt", "s", "op", 0, 0);
+        let mut w = store
+            .create_writer(&scope, 0, batch(1).schema())
+            .await
+            .unwrap();
+        w.write_batch(&batch(7)).await.unwrap();
+        let seg = w.finish().await.unwrap();
+
+        install_faults(vec![SpillFault::CorruptOnRead]);
+        let err = store.open_reader(&seg).await;
+        assert!(matches!(err, Err(BudgetError::SegmentCorrupt { .. })));
+        store.delete_scope(&scope).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fault_short_write_does_not_publish() {
+        use crate::fault::{FaultSession, SpillFault};
+        let _session = FaultSession::new(vec![SpillFault::ShortWrite]);
+        let tmp = tempfile::tempdir().unwrap();
+        let store = LocalSegmentStore::open(tmp.path(), 1 << 30, 0, 1, 1).unwrap();
+        let scope = SpillScope::new("q-short", "s", "op", 0, 0);
+        let mut w = store
+            .create_writer(&scope, 0, batch(1).schema())
+            .await
+            .unwrap();
+        let err = w.write_batch(&batch(1)).await;
+        assert!(matches!(err, Err(BudgetError::SpillIo { .. })), "got {err:?}");
+        // Abort path: no published segment file.
+        let _ = w.abort().await;
+        let final_path = scope
+            .absolute_dir(tmp.path())
+            .join(crate::segment::SpillSegment::segment_file_name(0));
+        assert!(!final_path.exists());
+        store.delete_scope(&scope).await.unwrap();
     }
 }

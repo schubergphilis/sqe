@@ -22,9 +22,15 @@ pub mod store;
 pub mod store_local;
 
 pub use accounted::Accounted;
-pub use budget::{ByteBudget, BytePermit, DEFAULT_BUDGET_GRANULARITY};
+pub use budget::{
+    split_default_read_headroom, split_read_headroom, ByteBudget, BytePermit,
+    DEFAULT_BUDGET_GRANULARITY, DEFAULT_READ_HEADROOM_DEN, DEFAULT_READ_HEADROOM_NUM,
+};
 pub use error::{BudgetError, Result};
-pub use fault::{clear_faults, faults_injected, install_faults, take_fault, SpillFault};
+pub use fault::{
+    clear_faults, faults_injected, install_faults, serial_test_guard, take_fault, FaultSession,
+    SpillFault,
+};
 pub use manager::{SpillManager, SpillScopeGuard};
 pub use scope::SpillScope;
 pub use segment::{SpillSegment, SEGMENT_FORMAT_VERSION, SEGMENT_MAGIC};
