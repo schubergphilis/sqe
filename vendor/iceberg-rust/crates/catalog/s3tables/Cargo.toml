@@ -26,7 +26,7 @@ readme = "README.md"
 categories = ["database"]
 description = "Apache Iceberg Rust S3Tables Catalog"
 keywords = ["iceberg", "sql", "catalog"]
-license = { workspace = true }
+license = "Apache-2.0"
 repository = { workspace = true }
 
 [dependencies]
