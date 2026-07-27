@@ -27,10 +27,6 @@ include:
 
 variables:
   AIKIDO_IMAGE_NAME: "sqlengine/sqe"
-  # Live policy/scripts until aikido-tools image is rebuilt with CDLA + r-efi
-  # exception + SQE reviewed_evidence (aikido!51). After tools image digest
-  # updates, this override can be removed and AIKIDO_HOME from the image used.
-  AIKIDO_POLICY_REF: "fix/license-cdla-r-efi"
 
 # Cold Rust build ceiling. aikido builds with rootless Kaniko, which does NOT
 # honor this repo's BuildKit `RUN --mount=type=cache` + sccache mounts, so the
@@ -58,25 +54,6 @@ aikido-sbom:
         --exclude '**/target/**' \
         -o "cyclonedx-json@1.6=$AIKIDO_SBOM"
       python3 "$AIKIDO_HOME/scripts/sbom_enrich.py" --sbom "$AIKIDO_SBOM" --asset "$CI_PROJECT_DIR/.asset"
-
-# Policy is baked into AIKIDO_TOOLS_IMAGE; override the license job to clone a
-# live policy ref so CDLA / r-efi / first-party Apache evidence apply before
-# the next tools image rebuild.
-aikido-license-policy:
-  before_script:
-    - |
-      set -euo pipefail
-      git clone --depth 1 --branch "$AIKIDO_POLICY_REF" \
-        "${CI_SERVER_PROTOCOL}://gitlab-ci-token:${CI_JOB_TOKEN}@${CI_SERVER_HOST}/vpf-data-ai/aikido.git" \
-        /tmp/aikido-live
-  script:
-    - |
-      python3 /tmp/aikido-live/scripts/sbom_license_check.py \
-        --sbom "$AIKIDO_SBOM" \
-        --policy /tmp/aikido-live/policy/license-policy.json \
-        --project "$CI_PROJECT_PATH" \
-        --json license-report.json \
-        --strict
 
 # ===== repo-specific integration suites (docker-in-docker), hosted here =====
 integration-test:
