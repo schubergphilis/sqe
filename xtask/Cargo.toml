@@ -4,6 +4,7 @@ version = "0.0.0"
 edition.workspace = true
 rust-version.workspace = true
 publish = false
+license = "Apache-2.0"
 
 # xtask is a cargo convention for repo-local dev tooling.
 # Invoke via `cargo xtask <subcommand>`. See `.cargo/config.toml` for the alias.

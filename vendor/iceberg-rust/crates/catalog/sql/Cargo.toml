@@ -25,7 +25,7 @@ version = { workspace = true }
 categories = ["database"]
 description = "Apache Iceberg Rust Sql Catalog"
 keywords = ["iceberg", "sql", "catalog"]
-license = { workspace = true }
+license = "Apache-2.0"
 repository = { workspace = true }
 
 [dependencies]

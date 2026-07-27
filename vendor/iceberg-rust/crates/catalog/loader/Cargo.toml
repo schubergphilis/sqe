@@ -25,7 +25,7 @@ version = { workspace = true }
 categories = ["database"]
 description = "Apache Iceberg Catalog Loader API"
 keywords = ["iceberg", "catalog"]
-license = { workspace = true }
+license = "Apache-2.0"
 repository = { workspace = true }
 
 # SQE patch: backends are gated behind cargo features so a slim build

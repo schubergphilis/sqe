@@ -3,7 +3,7 @@ name = "sqe-trino-functions"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-license.workspace = true
+license = "Apache-2.0"
 repository.workspace = true
 
 # Trino-compatible scalar UDFs for DataFusion.

@@ -25,7 +25,7 @@ version = { workspace = true }
 categories = ["database"]
 description = "Apache Iceberg DataFusion Integration"
 keywords = ["iceberg", "integrations", "datafusion"]
-license = { workspace = true }
+license = "Apache-2.0"
 repository = { workspace = true }
 
 [dependencies]
