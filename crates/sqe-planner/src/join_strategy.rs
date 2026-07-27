@@ -18,9 +18,11 @@ use datafusion::arrow::compute::SortOptions;
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::Result;
 use datafusion::config::ConfigOptions;
-use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
+use datafusion::physical_expr::expressions::Column;
+use datafusion::physical_expr::{LexOrdering, PhysicalExpr, PhysicalSortExpr};
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::joins::{HashJoinExec, SortMergeJoinExec};
+use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 use tracing::{debug, trace};
@@ -185,6 +187,11 @@ fn estimate_build_side_size(hash_join: &HashJoinExec) -> BuildSizeEstimate {
 
 /// Convert a `HashJoinExec` to a `SortMergeJoinExec`, adding `SortExec` nodes
 /// on both inputs if they are not already sorted on the join keys.
+///
+/// A `HashJoinExec` may carry an output projection, which `SortMergeJoinExec`
+/// has no parameter for; the projection is re-applied as an explicit
+/// `ProjectionExec` so the rewritten subtree keeps the schema the hash join
+/// advertised. See the comment at the tail of this function.
 fn convert_to_sort_merge_join(
     hash_join: &HashJoinExec,
 ) -> Result<Arc<dyn ExecutionPlan>> {
@@ -218,7 +225,7 @@ fn convert_to_sort_merge_join(
     // Build sort options vector (one per join key) for SortMergeJoinExec.
     let sort_options: Vec<SortOptions> = on.iter().map(|_| SortOptions::default()).collect();
 
-    let smj = SortMergeJoinExec::try_new(
+    let smj: Arc<dyn ExecutionPlan> = Arc::new(SortMergeJoinExec::try_new(
         sorted_left,
         sorted_right,
         on,
@@ -226,9 +233,38 @@ fn convert_to_sort_merge_join(
         join_type,
         sort_options,
         null_equality,
-    )?;
+    )?);
 
-    Ok(Arc::new(smj))
+    // `HashJoinExec` can carry an output projection (`Option<ProjectionRef>`);
+    // `SortMergeJoinExec::try_new` takes no projection and always emits the
+    // full `build_join_schema(left, right, join_type)` output. Both execs
+    // build that same full schema, and the hash join's projection indices
+    // address it, so re-applying them as a `ProjectionExec` reproduces the
+    // hash join's schema exactly.
+    //
+    // Dropping the projection instead makes the rewritten node emit more
+    // columns than it advertised, while every parent operator keeps indexing
+    // into the projected schema. The failure then surfaces far from here as a
+    // type error on an unrelated column -- TPC-H q12 (`Int64 == Utf8`), q19
+    // (`expected Decimal128(15, 2) but found Utf8 at column index 0`) and SSB
+    // q1.1-q1.3 (`Int32 * Float64`). Note that `schema_check()` cannot catch
+    // this: the coordinator invokes this rule directly rather than through
+    // DataFusion's optimizer, so the framework never runs that check.
+    let Some(projection) = hash_join.projection.as_ref() else {
+        return Ok(smj);
+    };
+
+    let join_schema = smj.schema();
+    let exprs = projection
+        .iter()
+        .map(|&idx| {
+            let name = join_schema.field(idx).name();
+            let col: Arc<dyn PhysicalExpr> = Arc::new(Column::new(name, idx));
+            (col, name.clone())
+        })
+        .collect::<Vec<_>>();
+
+    Ok(Arc::new(ProjectionExec::try_new(exprs, smj)?))
 }
 
 /// Wrap the input plan in a `SortExec` if it is not already sorted on the
@@ -332,6 +368,82 @@ mod tests {
             )
             .unwrap(),
         )
+    }
+
+    /// A `HashJoinExec` carrying an output projection must keep that exact
+    /// output schema after the rewrite. `SortMergeJoinExec` has no projection
+    /// parameter and emits the full left++right schema, so a rewrite that
+    /// forgets the projection changes the node's schema underneath its parents
+    /// and breaks the query with a type error on an unrelated column
+    /// (TPC-H q12/q19, SSB q1.1-q1.3).
+    #[test]
+    fn convert_preserves_hash_join_output_projection() {
+        let schema = test_schema();
+        let left = make_memory_plan(schema.clone());
+        let right = make_memory_plan(schema.clone());
+
+        // Full join schema is [id, name, value, id, name, value]; project a
+        // subset that reorders and mixes types so a dropped projection cannot
+        // coincidentally still line up.
+        let projection = vec![2, 3, 1];
+        let on = vec![(
+            datafusion::physical_expr::expressions::col("id", &schema).unwrap(),
+            datafusion::physical_expr::expressions::col("id", &schema).unwrap(),
+        )];
+        let hash_join = HashJoinExec::try_new(
+            left,
+            right,
+            on,
+            None, // filter
+            &JoinType::Inner,
+            Some(projection),
+            PartitionMode::CollectLeft,
+            NullEquality::NullEqualsNothing,
+            false,
+        )
+        .unwrap();
+
+        let expected = hash_join.schema();
+        assert_eq!(
+            expected.fields().len(),
+            3,
+            "projected hash join should expose exactly the 3 projected columns"
+        );
+
+        let rewritten = convert_to_sort_merge_join(&hash_join).unwrap();
+
+        assert_eq!(
+            rewritten.schema(),
+            expected,
+            "rewritten plan must keep the hash join's projected output schema"
+        );
+        assert_eq!(
+            rewritten.schema().field(0).data_type(),
+            &DataType::Float64,
+            "projection order must survive the rewrite"
+        );
+    }
+
+    /// Control for the test above: with no projection the rewrite must not
+    /// introduce a `ProjectionExec`, and the schema is the full join schema.
+    #[test]
+    fn convert_without_projection_returns_bare_sort_merge_join() {
+        let schema = test_schema();
+        let left = make_memory_plan(schema.clone());
+        let right = make_memory_plan(schema.clone());
+        let hash_join = make_hash_join(left, right, &schema, &schema, JoinType::Inner);
+        let hash_join = hash_join
+            .downcast_ref::<HashJoinExec>()
+            .expect("make_hash_join builds a HashJoinExec");
+
+        let rewritten = convert_to_sort_merge_join(hash_join).unwrap();
+
+        assert!(
+            rewritten.downcast_ref::<SortMergeJoinExec>().is_some(),
+            "unprojected join should rewrite to a bare SortMergeJoinExec"
+        );
+        assert_eq!(rewritten.schema(), hash_join.schema());
+        assert_eq!(rewritten.schema().fields().len(), 6);
     }
 
     #[test]
