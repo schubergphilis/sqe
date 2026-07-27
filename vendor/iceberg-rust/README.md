@@ -185,6 +185,22 @@ them quickly.
    SQE patch, not part of Apache #2616; Apache deliberately retains
    `#[allow(dead_code)]` on strict visitors because it has no production caller.
 
+11. **REST `execute()` no longer clobbers per-request headers (SQE issue
+   #388)**: `HttpClient::execute` applied the catalog-wide `extra_headers` with
+   `HeaderMap::extend`, which overwrites same-key values. That silently undid
+   `exchange_credential_for_token`'s deliberate content-type override, so the
+   client-credentials token request went out with a form-urlencoded body under
+   the `Content-Type: application/json` hardcoded in
+   `RestCatalogConfig::extra_headers`. Polaris rejects that with a 415
+   `@Consumes` mismatch, which broke every credential-authenticated flow --
+   the `bank` benchmark could not load at any scale. Now the extra headers are
+   only filled in where the request has not already set them, so an explicit
+   per-request header wins; `request()` already applies them, so `execute()`
+   only has to cover requests built without it. Marked `SQE PATCH (sqe#388)`.
+   Files: `crates/catalog/rest/src/client.rs`. Upstream almost certainly has
+   the same bug (the override and its explanatory comment are upstream code);
+   worth reporting so this patch can eventually be dropped.
+
 ## Cherry-picks from apache/iceberg-rust main
 
 Six fixes from apache main applied on top of the RW base. RisingWave

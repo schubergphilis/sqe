@@ -1317,6 +1317,57 @@ mod tests {
         assert_eq!(token, Some("ey000000000000".to_string()));
     }
 
+    /// SQE PATCH (sqe#388): the client-credentials token request must reach the
+    /// wire as `application/x-www-form-urlencoded`.
+    ///
+    /// `exchange_credential_for_token` overrides the `application/json` content
+    /// type that `RestCatalogConfig::extra_headers` hardcodes, but `execute()`
+    /// used to re-apply the extra headers with `HeaderMap::extend`, which
+    /// overwrites and put `application/json` back. A form-encoded body under a
+    /// JSON content type makes Polaris answer 415 (`@Consumes` mismatch), which
+    /// broke every credential-authenticated flow.
+    #[tokio::test]
+    async fn test_oauth_token_request_is_form_urlencoded() {
+        let mut server = Server::new_async().await;
+        let oauth_mock = server
+            .mock("POST", "/v1/oauth/tokens")
+            .match_header("content-type", "application/x-www-form-urlencoded")
+            .match_body(mockito::Matcher::Regex(
+                "grant_type=client_credentials".to_string(),
+            ))
+            .with_status(200)
+            .with_body(
+                r#"{
+                "access_token": "ey000000000000",
+                "token_type": "Bearer",
+                "issued_token_type": "urn:ietf:params:oauth:token-type:access_token",
+                "expires_in": 86400
+                }"#,
+            )
+            .expect(1)
+            .create_async()
+            .await;
+        let config_mock = create_config_mock(&mut server).await;
+
+        let mut props = HashMap::new();
+        props.insert("credential".to_string(), "client1:secret1".to_string());
+
+        let catalog = RestCatalog::new(
+            RestCatalogConfig::builder()
+                .uri(server.url())
+                .props(props)
+                .build(),
+        );
+
+        let token = catalog.context().await.unwrap().client.token().await;
+
+        // The mock only matches a form-urlencoded content type, so reaching the
+        // token here proves the header survived `execute()`.
+        oauth_mock.assert_async().await;
+        config_mock.assert_async().await;
+        assert_eq!(token, Some("ey000000000000".to_string()));
+    }
+
     #[tokio::test]
     async fn test_invalidate_token() {
         let mut server = Server::new_async().await;
