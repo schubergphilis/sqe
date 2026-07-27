@@ -6735,7 +6735,15 @@ dependencies = [
 name = "sqe-spill"
 version = "0.37.0"
 dependencies = [
+ "arrow-array",
+ "arrow-ipc",
+ "arrow-schema",
+ "async-trait",
+ "crc32fast",
  "datafusion",
+ "futures",
+ "serde",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
