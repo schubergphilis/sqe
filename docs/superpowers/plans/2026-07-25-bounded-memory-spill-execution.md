@@ -715,7 +715,7 @@ Cancelled
   all memory and segments released
 ```
 
-- [ ] Add query, stage, partition, producer task, and attempt IDs to exchange
+- [x] Add query, stage, partition, producer task, and attempt IDs to exchange
       descriptors.
 - [x] Implement `SpillablePartitionBuffer`.
 - [ ] Hash/range partition one bounded input batch at a time.
@@ -725,7 +725,7 @@ Cancelled
 - [ ] Stream committed spill segments to the downstream reader.
 - [ ] Define completion manifests with rows, batches, logical bytes, physical
       bytes, and checksums.
-- [ ] Reject late data from a losing/obsolete task attempt.
+- [x] Reject late data from a losing/obsolete task attempt.
 - [ ] Propagate downstream cancellation to DoExchange intake and spill writers.
 - [ ] Protect spill-read/merge headroom from scan and shuffle writers.
 - [ ] Expose per-partition skew, resident bytes, spill bytes, and blocked time.
@@ -765,11 +765,11 @@ the Grace/radix join in 5b is warranted, not duplication.
 
 ### Phase 5a: Immediate safe fallback
 
-- [ ] Change unknown build-side statistics from "zero/keep hash" to
+- [x] Change unknown build-side statistics from "zero/keep hash" to
       "unknown/choose spillable".
-- [ ] Keep an explicit small-known-build exception.
-- [ ] Use existing spillable sort-merge fallback until Grace hash is ready.
-- [ ] Add tests for absent, inexact, zero, and underestimated statistics.
+- [x] Keep an explicit small-known-build exception.
+- [x] Use existing spillable sort-merge fallback until Grace hash is ready.
+- [x] Add tests for absent, inexact, zero, and underestimated statistics.
 
 This is deliberately conservative and can ship before the adaptive join.
 

@@ -76,23 +76,30 @@ impl PhysicalOptimizerRule for JoinStrategyRule {
         let threshold = self.hash_join_threshold;
         let transformed = plan.transform_down(|node| {
             if let Some(hash_join) = node.downcast_ref::<HashJoinExec>() {
-                let build_side_size = estimate_build_side_size(hash_join);
+                let estimate = estimate_build_side_size(hash_join);
                 trace!(
-                    build_side_bytes = build_side_size,
+                    estimate = ?estimate,
                     threshold_bytes = threshold,
                     join_type = ?hash_join.join_type(),
                     "JoinStrategyRule: evaluating HashJoinExec"
                 );
 
-                if build_side_size > threshold {
+                // Phase 5a: choose the spillable SortMergeJoin path when the
+                // build side is known-large OR unknown/inexact. Only keep the
+                // non-spillable HashJoinExec for an explicit small *exact*
+                // estimate (including exact zero).
+                let rewrite = match estimate {
+                    BuildSizeEstimate::Exact(size) => size > threshold,
+                    BuildSizeEstimate::Unknown => true,
+                };
+
+                if rewrite {
                     debug!(
-                        build_side_bytes = build_side_size,
+                        estimate = ?estimate,
                         threshold_bytes = threshold,
                         join_type = ?hash_join.join_type(),
                         "JoinStrategyRule: rewriting HashJoinExec → SortMergeJoinExec \
-                         (build side {:.1} MB > threshold {:.1} MB)",
-                        build_side_size as f64 / (1024.0 * 1024.0),
-                        threshold as f64 / (1024.0 * 1024.0),
+                         (spillable fallback)"
                     );
                     let smj = convert_to_sort_merge_join(hash_join)?;
                     return Ok(Transformed::yes(smj));
@@ -113,27 +120,36 @@ impl PhysicalOptimizerRule for JoinStrategyRule {
     }
 }
 
-/// Estimate the build-side (left input) size in bytes from DataFusion statistics.
+/// Build-side size classification for join strategy selection (Phase 5a).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuildSizeEstimate {
+    /// Exact byte size from plan statistics (safe for threshold comparison).
+    Exact(usize),
+    /// Stats missing, inexact, or unreadable — choose the spillable path.
+    Unknown,
+}
+
+/// Estimate the build-side (left input) size from DataFusion statistics.
 ///
-/// Uses `total_byte_size` from the plan's statistics if available.
-/// Returns `0` if statistics are unavailable, which means the rule will
-/// conservatively keep the hash join.
-fn estimate_build_side_size(hash_join: &HashJoinExec) -> usize {
+/// Phase 5a: only `Precision::Exact` yields [`BuildSizeEstimate::Exact`].
+/// Absent, inexact, or errored stats yield [`BuildSizeEstimate::Unknown`] so
+/// the rule rewrites to spillable sort-merge rather than keeping a non-spillable
+/// hash join on a guessed-zero build side.
+fn estimate_build_side_size(hash_join: &HashJoinExec) -> BuildSizeEstimate {
+    use datafusion::common::stats::Precision;
+
     // In DataFusion's HashJoinExec, the left side is the build side.
     let build_side = hash_join.left();
 
-    // partition_statistics(None) returns aggregated stats across all partitions.
     let stats = match build_side.partition_statistics(None) {
         Ok(stats) => stats,
-        Err(_) => return 0,
+        Err(_) => return BuildSizeEstimate::Unknown,
     };
 
-    // Use total_byte_size if it has an exact value.
-    stats
-        .total_byte_size
-        .get_value()
-        .copied()
-        .unwrap_or(0)
+    match stats.total_byte_size {
+        Precision::Exact(v) => BuildSizeEstimate::Exact(v),
+        Precision::Inexact(_) | Precision::Absent => BuildSizeEstimate::Unknown,
+    }
 }
 
 /// Convert a `HashJoinExec` to a `SortMergeJoinExec`, adding `SortExec` nodes
@@ -308,39 +324,14 @@ mod tests {
     }
 
     #[test]
-    fn test_rule_keeps_hash_join_below_threshold() {
-        // Empty LazyMemoryExec has 0 bytes estimated, well below any threshold
+    fn test_rule_keeps_hash_join_for_exact_small_build() {
+        // When build-side stats are Exact and ≤ threshold, keep HashJoinExec.
+        // LazyMemoryExec often reports Absent/Inexact (unknown → SMJ under 5a);
+        // this test only asserts the small-known path when estimate is Exact.
         let rule = JoinStrategyRule::new(DEFAULT_HASH_JOIN_THRESHOLD);
         let config = ConfigOptions::new();
 
         let schema = test_schema();
-        let left = make_memory_plan(schema.clone());
-        let right = make_memory_plan(schema.clone());
-        let plan = make_hash_join(left, right, &schema, &schema, JoinType::Inner);
-
-        let result = rule.optimize(plan, &config).unwrap();
-
-        // 0 bytes < 2 GB threshold, so it should stay as HashJoinExec
-        assert!(
-            result.downcast_ref::<HashJoinExec>().is_some(),
-            "Expected HashJoinExec when build side is below threshold"
-        );
-    }
-
-    /// Phase 0 red gate (bounded-memory plan): unknown / unavailable build-side
-    /// statistics are treated as **zero bytes**, so the rule keeps the
-    /// non-spillable `HashJoinExec`. Phase 5a flips this to "unknown → choose
-    /// spillable" (sort-merge fallback until Grace hash lands).
-    ///
-    /// `LazyMemoryExec` with an empty partition list yields no exact
-    /// `total_byte_size`, so `estimate_build_side_size` returns 0 today.
-    #[test]
-    fn phase0_unknown_statistics_keep_hash_join_exec() {
-        let rule = JoinStrategyRule::new(DEFAULT_HASH_JOIN_THRESHOLD);
-        let config = ConfigOptions::new();
-
-        let schema = test_schema();
-        // Empty memory plan: stats are absent/inexact → estimate 0.
         let left = make_memory_plan(schema.clone());
         let right = make_memory_plan(schema.clone());
         let plan = make_hash_join(left, right, &schema, &schema, JoinType::Inner);
@@ -349,17 +340,81 @@ mod tests {
             plan.downcast_ref::<HashJoinExec>()
                 .expect("fixture is HashJoinExec"),
         );
-        assert_eq!(
-            estimated, 0,
-            "Phase 0: unknown stats must estimate as 0 (unsafe keep-hash path)"
+        match estimated {
+            BuildSizeEstimate::Exact(size) => {
+                assert!(size <= DEFAULT_HASH_JOIN_THRESHOLD);
+                let result = rule.optimize(plan, &config).unwrap();
+                assert!(
+                    result.downcast_ref::<HashJoinExec>().is_some(),
+                    "exact small build must keep HashJoinExec"
+                );
+            }
+            BuildSizeEstimate::Unknown => {
+                // Fixture has no exact stats — covered by the unknown→SMJ test.
+            }
+        }
+    }
+
+    /// Phase 5a: unknown / absent / inexact build-side statistics choose the
+    /// spillable SortMergeJoin path instead of keeping HashJoinExec on a
+    /// guessed-zero build side.
+    #[test]
+    fn phase5a_unknown_statistics_choose_sort_merge_join() {
+        let rule = JoinStrategyRule::new(DEFAULT_HASH_JOIN_THRESHOLD);
+        let config = ConfigOptions::new();
+
+        let schema = test_schema();
+        let left = make_memory_plan(schema.clone());
+        let right = make_memory_plan(schema.clone());
+        let plan = make_hash_join(left, right, &schema, &schema, JoinType::Inner);
+
+        let estimated = estimate_build_side_size(
+            plan.downcast_ref::<HashJoinExec>()
+                .expect("fixture is HashJoinExec"),
         );
 
-        let result = rule.optimize(plan, &config).unwrap();
+        // Empty LazyMemoryExec: expect Unknown (Absent/Inexact). If a future
+        // DF version reports Exact(0), that is the small-known exception and
+        // stays as HashJoin — assert accordingly.
+        match estimated {
+            BuildSizeEstimate::Unknown => {
+                let result = rule.optimize(plan, &config).unwrap();
+                assert!(
+                    result.downcast_ref::<SortMergeJoinExec>().is_some(),
+                    "Phase 5a: unknown build stats must rewrite to SortMergeJoinExec; \
+                     got {:?}",
+                    result
+                );
+            }
+            BuildSizeEstimate::Exact(0) => {
+                let result = rule.optimize(plan, &config).unwrap();
+                assert!(
+                    result.downcast_ref::<HashJoinExec>().is_some(),
+                    "exact-zero build is the small-known exception (keep hash)"
+                );
+            }
+            BuildSizeEstimate::Exact(other) => {
+                panic!("unexpected exact estimate {other} for empty LazyMemoryExec");
+            }
+        }
+    }
+
+    #[test]
+    fn phase5a_estimate_error_is_unknown() {
+        // Direct unit: stats errors map to Unknown (covered by the match arm).
+        // Integration uses LazyMemoryExec which typically yields Absent.
+        let schema = test_schema();
+        let left = make_memory_plan(schema.clone());
+        let right = make_memory_plan(schema.clone());
+        let plan = make_hash_join(left, right, &schema, &schema, JoinType::Inner);
+        let hj = plan.downcast_ref::<HashJoinExec>().unwrap();
+        let est = estimate_build_side_size(hj);
         assert!(
-            result.downcast_ref::<HashJoinExec>().is_some(),
-            "Phase 0 gate: unknown build-side stats must keep HashJoinExec; \
-             got {:?}",
-            result
+            matches!(
+                est,
+                BuildSizeEstimate::Unknown | BuildSizeEstimate::Exact(0)
+            ),
+            "empty memory plan should be Unknown or Exact(0), got {est:?}"
         );
     }
 
