@@ -15,12 +15,14 @@
 use std::sync::Arc;
 
 use datafusion::arrow::compute::SortOptions;
+use datafusion::arrow::datatypes::Schema;
 use datafusion::common::tree_node::{Transformed, TreeNode};
-use datafusion::common::Result;
+use datafusion::common::{internal_err, JoinSide, Result};
 use datafusion::config::ConfigOptions;
 use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_expr::{LexOrdering, PhysicalExpr, PhysicalSortExpr};
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
+use datafusion::physical_plan::joins::utils::JoinFilter;
 use datafusion::physical_plan::joins::{HashJoinExec, SortMergeJoinExec};
 use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
@@ -134,8 +136,16 @@ impl PhysicalOptimizerRule for JoinStrategyRule {
                             crate::grace_hash_join::LocalJoinStrategy::GraceHashJoin
                         )
                     );
-                    let smj = convert_to_sort_merge_join(hash_join)?;
-                    return Ok(Transformed::yes(smj));
+                    // `None` means the join cannot be expressed as a sort-merge
+                    // join; keep the hash join rather than emit a broken plan.
+                    if let Some(smj) = convert_to_sort_merge_join(hash_join)? {
+                        return Ok(Transformed::yes(smj));
+                    }
+                    debug!(
+                        join_type = ?hash_join.join_type(),
+                        "JoinStrategyRule: keeping HashJoinExec (filter not \
+                         expressible as sort-merge)"
+                    );
                 }
             }
             Ok(Transformed::no(node))
@@ -192,12 +202,22 @@ fn estimate_build_side_size(hash_join: &HashJoinExec) -> BuildSizeEstimate {
 /// has no parameter for; the projection is re-applied as an explicit
 /// `ProjectionExec` so the rewritten subtree keeps the schema the hash join
 /// advertised. See the comment at the tail of this function.
+///
+/// Returns `Ok(None)` when the join cannot be expressed as a sort-merge join
+/// and must stay a hash join -- currently only when its filter reads a
+/// `JoinSide::None` column (mark joins).
 fn convert_to_sort_merge_join(
     hash_join: &HashJoinExec,
-) -> Result<Arc<dyn ExecutionPlan>> {
+) -> Result<Option<Arc<dyn ExecutionPlan>>> {
     let join_type = *hash_join.join_type();
     let on = hash_join.on().to_vec();
-    let filter = hash_join.filter().cloned();
+    let filter = match hash_join.filter() {
+        Some(filter) => match regroup_join_filter_for_sort_merge(filter)? {
+            Some(regrouped) => Some(regrouped),
+            None => return Ok(None),
+        },
+        None => None,
+    };
     let null_equality = hash_join.null_equality();
     let left = Arc::clone(hash_join.left());
     let right = Arc::clone(hash_join.right());
@@ -251,7 +271,7 @@ fn convert_to_sort_merge_join(
     // this: the coordinator invokes this rule directly rather than through
     // DataFusion's optimizer, so the framework never runs that check.
     let Some(projection) = hash_join.projection.as_ref() else {
-        return Ok(smj);
+        return Ok(Some(smj));
     };
 
     let join_schema = smj.schema();
@@ -264,7 +284,97 @@ fn convert_to_sort_merge_join(
         })
         .collect::<Vec<_>>();
 
-    Ok(Arc::new(ProjectionExec::try_new(exprs, smj)?))
+    Ok(Some(Arc::new(ProjectionExec::try_new(exprs, smj)?)))
+}
+
+/// Reorder a `JoinFilter`'s intermediate columns into left-then-right order so
+/// `SortMergeJoinExec` can evaluate it.
+///
+/// The two join execs disagree about how the filter's intermediate batch is
+/// materialized. `HashJoinExec` feeds `column_indices` straight to
+/// `build_batch_from_indices`, so any order works. Sort-merge join's
+/// `get_filter_columns` instead *regroups*: it collects every `JoinSide::Left`
+/// column, then every `JoinSide::Right` one. A filter whose `column_indices`
+/// interleave the sides is therefore evaluated against a permuted batch while
+/// its expression still addresses the original positions, so a column is read
+/// as its neighbour -- TPC-H q19 (filter order `[right, left, left, left]`,
+/// read as `expected Decimal128(15, 2) but found Utf8`) and q20 (two columns
+/// exactly swapped, `expected Int32 but found Decimal128(27, 3)`).
+///
+/// DataFusion's own `JoinFilter::build_column_indices` emits the grouped order,
+/// which is the invariant sort-merge join relies on; this applies the same
+/// grouping to an inherited filter and remaps the expression to match.
+///
+/// Returns `Ok(None)` when the filter reads a `JoinSide::None` column (the mark
+/// column of a mark join), which `get_filter_columns` drops entirely and no
+/// reordering can rescue.
+fn regroup_join_filter_for_sort_merge(filter: &JoinFilter) -> Result<Option<JoinFilter>> {
+    let column_indices = filter.column_indices();
+
+    if column_indices.iter().any(|c| c.side == JoinSide::None) {
+        return Ok(None);
+    }
+
+    // The order sort-merge join will materialize: all Left, then all Right,
+    // each keeping its original relative order.
+    let mut permutation: Vec<usize> = Vec::with_capacity(column_indices.len());
+    for side in [JoinSide::Left, JoinSide::Right] {
+        permutation.extend(
+            column_indices
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| c.side == side)
+                .map(|(idx, _)| idx),
+        );
+    }
+
+    // Already grouped: the common case, and nothing to rewrite.
+    if permutation.iter().enumerate().all(|(new, &old)| new == old) {
+        return Ok(Some(filter.clone()));
+    }
+
+    // Original position -> position after regrouping.
+    let mut remap = vec![0usize; permutation.len()];
+    for (new_idx, &old_idx) in permutation.iter().enumerate() {
+        remap[old_idx] = new_idx;
+    }
+
+    let old_schema = filter.schema();
+    let schema = Arc::new(Schema::new(
+        permutation
+            .iter()
+            .map(|&idx| old_schema.field(idx).clone())
+            .collect::<Vec<_>>(),
+    ));
+
+    let expression = Arc::clone(filter.expression())
+        .transform_down(|expr| {
+            let Some(col) = expr.downcast_ref::<Column>() else {
+                return Ok(Transformed::no(expr));
+            };
+            let Some(&new_idx) = remap.get(col.index()) else {
+                return internal_err!(
+                    "join filter expression references column index {} outside its \
+                     {}-column intermediate schema",
+                    col.index(),
+                    remap.len()
+                );
+            };
+            if new_idx == col.index() {
+                return Ok(Transformed::no(expr));
+            }
+            Ok(Transformed::yes(
+                Arc::new(Column::new(col.name(), new_idx)) as Arc<dyn PhysicalExpr>
+            ))
+        })?
+        .data;
+
+    let regrouped_indices = permutation
+        .iter()
+        .map(|&idx| column_indices[idx].clone())
+        .collect();
+
+    Ok(Some(JoinFilter::new(expression, regrouped_indices, schema)))
 }
 
 /// Wrap the input plan in a `SortExec` if it is not already sorted on the
@@ -328,6 +438,7 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion::common::NullEquality;
     use datafusion::logical_expr::JoinType;
+    use datafusion::physical_plan::joins::utils::ColumnIndex;
     use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
     use datafusion::physical_plan::memory::LazyMemoryExec;
 
@@ -370,6 +481,134 @@ mod tests {
         )
     }
 
+    /// Build a two-column join filter whose intermediate schema is
+    /// `[Int32 (from right), Utf8 (from left)]` -- i.e. the sides interleaved,
+    /// which is what sort-merge join cannot evaluate as-is. The expression
+    /// references both columns so the remap is observable.
+    fn interleaved_filter() -> JoinFilter {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("from_right", DataType::Int32, true),
+            Field::new("from_left", DataType::Utf8, true),
+        ]));
+        let expr = datafusion::physical_expr::expressions::binary(
+            Arc::new(Column::new("from_right", 0)),
+            datafusion::logical_expr::Operator::Eq,
+            Arc::new(Column::new("from_right", 0)),
+            &schema,
+        )
+        .unwrap();
+        let column_indices = vec![
+            ColumnIndex {
+                index: 1,
+                side: JoinSide::Right,
+            },
+            ColumnIndex {
+                index: 0,
+                side: JoinSide::Left,
+            },
+        ];
+        JoinFilter::new(expr, column_indices, schema)
+    }
+
+    /// Sort-merge join's `get_filter_columns` materializes all left-side filter
+    /// columns before all right-side ones. An inherited hash-join filter that
+    /// interleaves the sides must be permuted to match, with the expression's
+    /// column indices remapped, or it reads each column as its neighbour
+    /// (TPC-H q19, q20).
+    #[test]
+    fn regroup_filter_orders_left_columns_before_right() {
+        let regrouped = regroup_join_filter_for_sort_merge(&interleaved_filter())
+            .unwrap()
+            .expect("a Left/Right-only filter is always expressible");
+
+        // Left-side column now comes first.
+        assert_eq!(
+            regrouped
+                .column_indices()
+                .iter()
+                .map(|c| c.side)
+                .collect::<Vec<_>>(),
+            vec![JoinSide::Left, JoinSide::Right],
+            "left-side filter columns must precede right-side ones"
+        );
+        assert_eq!(regrouped.column_indices()[0].index, 0);
+        assert_eq!(regrouped.column_indices()[1].index, 1);
+
+        // Schema follows the same permutation.
+        assert_eq!(regrouped.schema().field(0).name(), "from_left");
+        assert_eq!(regrouped.schema().field(0).data_type(), &DataType::Utf8);
+        assert_eq!(regrouped.schema().field(1).name(), "from_right");
+        assert_eq!(regrouped.schema().field(1).data_type(), &DataType::Int32);
+
+        // The expression referenced index 0 ("from_right"), which moved to 1.
+        let rendered = format!("{}", regrouped.expression());
+        assert!(
+            rendered.contains("from_right@1") && !rendered.contains("from_right@0"),
+            "expression indices must be remapped to the new positions, got: {rendered}"
+        );
+    }
+
+    /// A filter already in left-then-right order needs no rewrite.
+    #[test]
+    fn regroup_filter_leaves_already_grouped_filter_alone() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("l", DataType::Int32, true),
+            Field::new("r", DataType::Int32, true),
+        ]));
+        let expr = datafusion::physical_expr::expressions::binary(
+            Arc::new(Column::new("l", 0)),
+            datafusion::logical_expr::Operator::Eq,
+            Arc::new(Column::new("r", 1)),
+            &schema,
+        )
+        .unwrap();
+        let filter = JoinFilter::new(
+            expr,
+            JoinFilter::build_column_indices(vec![0], vec![0]),
+            schema,
+        );
+
+        let regrouped = regroup_join_filter_for_sort_merge(&filter).unwrap().unwrap();
+
+        assert_eq!(format!("{}", regrouped.expression()), "l@0 = r@1");
+        assert_eq!(
+            regrouped
+                .column_indices()
+                .iter()
+                .map(|c| c.side)
+                .collect::<Vec<_>>(),
+            vec![JoinSide::Left, JoinSide::Right]
+        );
+    }
+
+    /// `get_filter_columns` drops `JoinSide::None` columns (a mark join's mark
+    /// column) entirely, so no permutation makes such a filter work. The join
+    /// must stay a hash join.
+    #[test]
+    fn regroup_filter_rejects_mark_side_column() {
+        let mut filter = interleaved_filter();
+        let indices = vec![
+            ColumnIndex {
+                index: 0,
+                side: JoinSide::Left,
+            },
+            ColumnIndex {
+                index: 0,
+                side: JoinSide::None,
+            },
+        ];
+        filter = JoinFilter::new(
+            Arc::clone(filter.expression()),
+            indices,
+            Arc::clone(filter.schema()),
+        );
+
+        assert!(
+            regroup_join_filter_for_sort_merge(&filter).unwrap().is_none(),
+            "a mark-side filter column must block the sort-merge rewrite"
+        );
+    }
+
     /// A `HashJoinExec` carrying an output projection must keep that exact
     /// output schema after the rewrite. `SortMergeJoinExec` has no projection
     /// parameter and emits the full left++right schema, so a rewrite that
@@ -410,7 +649,7 @@ mod tests {
             "projected hash join should expose exactly the 3 projected columns"
         );
 
-        let rewritten = convert_to_sort_merge_join(&hash_join).unwrap();
+        let rewritten = convert_to_sort_merge_join(&hash_join).unwrap().unwrap();
 
         assert_eq!(
             rewritten.schema(),
@@ -436,7 +675,7 @@ mod tests {
             .downcast_ref::<HashJoinExec>()
             .expect("make_hash_join builds a HashJoinExec");
 
-        let rewritten = convert_to_sort_merge_join(hash_join).unwrap();
+        let rewritten = convert_to_sort_merge_join(hash_join).unwrap().unwrap();
 
         assert!(
             rewritten.downcast_ref::<SortMergeJoinExec>().is_some(),
@@ -590,7 +829,7 @@ mod tests {
         .unwrap();
 
         // Directly test the conversion function
-        let result = convert_to_sort_merge_join(&hash_join).unwrap();
+        let result = convert_to_sort_merge_join(&hash_join).unwrap().unwrap();
         assert!(
             result.downcast_ref::<SortMergeJoinExec>().is_some(),
             "Expected SortMergeJoinExec after conversion"
@@ -636,7 +875,9 @@ mod tests {
                 result.err()
             );
 
-            let smj = result.unwrap();
+            let smj = result
+                .unwrap()
+                .expect("filterless join is always expressible as sort-merge");
             assert!(
                 smj.downcast_ref::<SortMergeJoinExec>().is_some(),
                 "Expected SortMergeJoinExec for join type {join_type:?}"
@@ -667,7 +908,7 @@ mod tests {
         )
         .unwrap();
 
-        let smj = convert_to_sort_merge_join(&hash_join).unwrap();
+        let smj = convert_to_sort_merge_join(&hash_join).unwrap().unwrap();
         let smj = smj
             .downcast_ref::<SortMergeJoinExec>()
             .expect("Expected SortMergeJoinExec");
