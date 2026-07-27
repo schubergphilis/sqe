@@ -25,6 +25,7 @@ pub mod segment;
 pub mod store;
 pub mod store_local;
 pub mod store_s3;
+pub mod store_tiered;
 
 pub use accounted::Accounted;
 pub use budget::{
@@ -60,3 +61,4 @@ pub use store_s3::{
     S3SpillConfig, LIFECYCLE_PURPOSE_KEY, LIFECYCLE_PURPOSE_PARTIAL, LIFECYCLE_PURPOSE_SEGMENT,
     LIFECYCLE_QUERY_KEY, LIFECYCLE_TAG_KEY, LIFECYCLE_TAG_VALUE,
 };
+pub use store_tiered::TieredSegmentStore;

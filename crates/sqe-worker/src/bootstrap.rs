@@ -23,6 +23,7 @@ use sqe_core::{parse_memory_limit, FlightCompression, SqeConfig};
 use sqe_metrics::WorkerMetricsRegistry;
 use sqe_spill::{
     LocalSegmentStore, MemoryGovernor, S3SegmentStore, S3SpillConfig, SpillManager,
+    TieredSegmentStore,
 };
 
 use crate::advertise::derive_advertise_url;
@@ -57,6 +58,8 @@ pub fn build_worker_service(
     // (the cache works whether or not they are scraped); register them on the
     // worker metrics registry so footer hit-rate is observable.
     let footer_cache = build_footer_cache(config, &metrics);
+
+    validate_process_headroom(config)?;
 
     let spill_manager = build_spill_manager(config)?;
     let shuffle_budget = resolve_shuffle_budget(config);
@@ -148,6 +151,60 @@ fn resolve_shuffle_budget(config: &SqeConfig) -> usize {
     }
 }
 
+/// Fail closed when configured memory_limit + process_headroom exceed a
+/// known cgroup limit (when readable). Prevents starting a worker that will
+/// OOM-kill under load.
+fn validate_process_headroom(config: &SqeConfig) -> anyhow::Result<()> {
+    let limit = parse_memory_limit(&config.worker.memory_limit).unwrap_or(0) as u64;
+    let headroom = match config
+        .worker
+        .memory
+        .resolve_bytes(limit as usize)
+    {
+        Ok(r) => r.process_headroom as u64,
+        Err(_) => parse_memory_limit("2GB").unwrap_or(2 * 1024 * 1024 * 1024) as u64,
+    };
+    let need = limit.saturating_add(headroom);
+    if let Some(cgroup) = read_cgroup_memory_max() {
+        if cgroup > 0 && need > cgroup {
+            return Err(anyhow::anyhow!(
+                "worker.memory_limit ({limit}) + process_headroom ({headroom}) = {need} \
+                 exceeds cgroup memory.max ({cgroup}). Lower memory_limit or raise the container limit."
+            ));
+        }
+        tracing::info!(
+            memory_limit = limit,
+            process_headroom = headroom,
+            cgroup_memory_max = cgroup,
+            "Process headroom validated against cgroup"
+        );
+    }
+    Ok(())
+}
+
+fn read_cgroup_memory_max() -> Option<u64> {
+    // cgroup v2
+    for path in [
+        "/sys/fs/cgroup/memory.max",
+        "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+    ] {
+        if let Ok(s) = std::fs::read_to_string(path) {
+            let t = s.trim();
+            if t == "max" {
+                return None;
+            }
+            if let Ok(v) = t.parse::<u64>() {
+                // Kernel often uses a huge sentinel for unlimited.
+                if v > (1u64 << 60) {
+                    return None;
+                }
+                return Some(v);
+            }
+        }
+    }
+    None
+}
+
 /// Build the worker temporary-memory governor from operator + shuffle budgets.
 ///
 /// Pool size = `operator_budget + shuffle_memory_budget` (chargeable blocking
@@ -236,15 +293,46 @@ fn build_spill_manager(config: &SqeConfig) -> anyhow::Result<Option<Arc<SpillMan
             Arc::new(S3SegmentStore::from_config(&s3_cfg)?)
         }
         "tiered" => {
-            return Err(anyhow::anyhow!(
-                "worker.spill.backend = \"tiered\" is not available yet \
-                 (local and s3 backends are supported)"
-            ));
+            let dir = spill
+                .resolved_directory(&config.worker.spill_dir)
+                .to_string();
+            if dir.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "tiered spill requires worker.spill.directory (or spill_dir)"
+                ));
+            }
+            let min_free = parse_memory_limit(&spill.min_free_bytes).map_err(|e| {
+                anyhow::anyhow!("worker.spill.min_free_bytes: {e}")
+            })? as u64;
+            let local = Arc::new(LocalSegmentStore::open(
+                &dir,
+                max_bytes,
+                min_free,
+                spill.max_concurrent_writes,
+                spill.max_concurrent_reads,
+            )?);
+            let s3c = &spill.s3;
+            let s3_cfg = S3SpillConfig {
+                bucket: s3c.bucket.clone(),
+                prefix: s3c.prefix.clone(),
+                region: s3c.region.clone(),
+                endpoint: s3c.endpoint.clone(),
+                access_key_id: s3c.access_key_id.clone(),
+                secret_access_key: s3c.secret_access_key.clone(),
+                allow_http: s3c.allow_http,
+                path_style: s3c.path_style || !s3c.endpoint.is_empty(),
+                max_bytes,
+                max_objects: s3c.max_objects,
+                max_concurrent_writes: spill.max_concurrent_writes,
+                max_concurrent_reads: spill.max_concurrent_reads,
+            };
+            let s3 = Arc::new(S3SegmentStore::from_config(&s3_cfg)?);
+            Arc::new(TieredSegmentStore::new(local, s3))
         }
         other => {
             return Err(anyhow::anyhow!(
                 "worker.spill.backend = {other:?} is unknown \
-                 (supported: local, s3)"
+                 (supported: local, s3, tiered)"
             ));
         }
     };

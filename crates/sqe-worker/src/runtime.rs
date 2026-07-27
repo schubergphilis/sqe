@@ -52,9 +52,27 @@ pub fn build_session_context(config: &WorkerConfig) -> anyhow::Result<SessionCon
     }
 
     let runtime = Arc::new(builder.build()?);
-    let session_config = SessionConfig::new()
+
+    // Protect ExternalSorterMerge (can_spill=false) with a large spill
+    // reservation carved from the worker limit: 25% for merge headroom,
+    // in-place threshold at 1/16 of the limit so large sorts externalize early.
+    let sort_spill_reservation = (memory_bytes / 4).max(1024 * 1024);
+    let sort_in_place = (memory_bytes / 16).max(64 * 1024);
+    let mut session_config = SessionConfig::new()
         .set_bool("datafusion.execution.parquet.pushdown_filters", true)
         .set_bool("datafusion.execution.parquet.reorder_filters", true);
+    // Prefer options_mut when available for typed fields.
+    {
+        let opts = session_config.options_mut();
+        opts.execution.sort_spill_reservation_bytes = sort_spill_reservation;
+        opts.execution.sort_in_place_threshold_bytes = sort_in_place;
+    }
+    info!(
+        sort_spill_reservation_bytes = sort_spill_reservation,
+        sort_in_place_threshold_bytes = sort_in_place,
+        "Configured DataFusion sort spill reservation (merge headroom)"
+    );
+
     let ctx = SessionContext::new_with_config_rt(session_config, runtime);
 
     Ok(ctx)

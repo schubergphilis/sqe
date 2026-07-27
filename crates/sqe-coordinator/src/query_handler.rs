@@ -2506,6 +2506,22 @@ impl QueryHandler {
             physical_plan
         };
 
+        // Spillable join fallback (unknown/large build → SortMergeJoin).
+        let physical_plan = {
+            let rule =
+                sqe_planner::JoinStrategyRule::new(sqe_planner::DEFAULT_HASH_JOIN_THRESHOLD);
+            match rule.optimize(
+                physical_plan.clone(),
+                &datafusion::config::ConfigOptions::new(),
+            ) {
+                Ok(optimized) => optimized,
+                Err(e) => {
+                    debug!(error = %e, "JoinStrategyRule failed, using original plan");
+                    physical_plan
+                }
+            }
+        };
+
         // Adaptive sort stripping
         let sort_mode = SortMode::parse(&self.config.query.sort_mode);
         let pressure = crate::memory::check_pressure(&self.runtime.memory_pool);
@@ -2518,6 +2534,22 @@ impl QueryHandler {
         if let Some(warning) = adaptive_sort::format_sort_warning(&sort_decisions, sort_mode) {
             debug!(warning = %warning, "Adaptive sort stripping applied (streaming)");
         }
+
+        // Fail closed when remaining SortExec nodes cannot reserve merge
+        // headroom (ExternalSorterMerge is non-spillable in DF 54).
+        let physical_plan = {
+            let sort_grant = sqe_core::parse_memory_limit(&self.config.query.max_query_memory)
+                .unwrap_or(256 * 1024 * 1024)
+                .max(8 * 1024 * 1024);
+            let rule = sqe_planner::SortMemoryRule::new(sort_grant);
+            rule.optimize(
+                physical_plan,
+                &datafusion::config::ConfigOptions::new(),
+            )
+            .map_err(|e| {
+                SqeError::Execution(format!("Sort memory admission failed: {e}"))
+            })?
+        };
 
         // Distribute scan across workers if possible.
         let final_plan = self.try_distribute(physical_plan, session, query_id).await;
@@ -2791,6 +2823,22 @@ impl QueryHandler {
             physical_plan
         };
 
+        // Spillable join fallback (unknown/large build → SortMergeJoin).
+        let physical_plan = {
+            let rule =
+                sqe_planner::JoinStrategyRule::new(sqe_planner::DEFAULT_HASH_JOIN_THRESHOLD);
+            match rule.optimize(
+                physical_plan.clone(),
+                &datafusion::config::ConfigOptions::new(),
+            ) {
+                Ok(optimized) => optimized,
+                Err(e) => {
+                    debug!(error = %e, "JoinStrategyRule failed, using original plan");
+                    physical_plan
+                }
+            }
+        };
+
         // Apply adaptive sort stripping based on sort_mode config and memory pressure.
         let sort_mode = SortMode::parse(&self.config.query.sort_mode);
         let pressure = crate::memory::check_pressure(&self.runtime.memory_pool);
@@ -2803,6 +2851,21 @@ impl QueryHandler {
         if let Some(warning) = adaptive_sort::format_sort_warning(&sort_decisions, sort_mode) {
             debug!(warning = %warning, "Adaptive sort stripping applied");
         }
+
+        // Fail closed when remaining SortExec nodes cannot reserve merge headroom.
+        let physical_plan = {
+            let sort_grant = sqe_core::parse_memory_limit(&self.config.query.max_query_memory)
+                .unwrap_or(256 * 1024 * 1024)
+                .max(8 * 1024 * 1024);
+            let rule = sqe_planner::SortMemoryRule::new(sort_grant);
+            rule.optimize(
+                physical_plan,
+                &datafusion::config::ConfigOptions::new(),
+            )
+            .map_err(|e| {
+                SqeError::Execution(format!("Sort memory admission failed: {e}"))
+            })?
+        };
 
         // Try to distribute scan work across workers
         let final_plan = self.try_distribute(physical_plan, session, query_id).await;
