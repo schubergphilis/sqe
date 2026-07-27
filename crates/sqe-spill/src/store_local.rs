@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use futures::stream::BoxStream;
 use futures::StreamExt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -224,49 +224,75 @@ impl SegmentStore for LocalSegmentStore {
             });
         }
         let path = segment.path.clone();
-        let file = File::open(&path).map_err(|e| BudgetError::SpillIo {
+        // Read the whole encoded segment so its integrity is verified BEFORE
+        // any batch is yielded. Segments are bounded by `segment_target_size`,
+        // and only the *encoded* body is resident here; `into_stream` decodes
+        // batches lazily, one at a time, from this buffer. Verifying nothing
+        // (the previous behavior) let bit rot or a clean-boundary truncation
+        // return corrupted or short data silently, producing wrong query
+        // results from a downstream join/sort.
+        let body = fs::read(&path).map_err(|e| BudgetError::SpillIo {
             path: path.display().to_string(),
             source: e,
         })?;
-        let mut reader = BufReader::new(file);
-        let mut magic = [0u8; 8];
-        reader
-            .read_exact(&mut magic)
-            .map_err(|e| BudgetError::SegmentCorrupt {
-                path: path.display().to_string(),
-                reason: format!("short header: {e}"),
-            })?;
-        if &magic != SEGMENT_MAGIC {
+        if body.len() < 12 {
             return Err(BudgetError::SegmentCorrupt {
                 path: path.display().to_string(),
-                reason: format!("bad magic {magic:?}"),
+                reason: format!("truncated header: {} bytes", body.len()),
             });
         }
-        let mut ver_buf = [0u8; 4];
-        reader
-            .read_exact(&mut ver_buf)
-            .map_err(|e| BudgetError::SegmentCorrupt {
+        if &body[..8] != SEGMENT_MAGIC {
+            return Err(BudgetError::SegmentCorrupt {
                 path: path.display().to_string(),
-                reason: format!("short version: {e}"),
-            })?;
-        let version = u32::from_le_bytes(ver_buf);
+                reason: format!("bad magic {:?}", &body[..8]),
+            });
+        }
+        let version = u32::from_le_bytes([body[8], body[9], body[10], body[11]]);
         if version != SEGMENT_FORMAT_VERSION {
             return Err(BudgetError::UnsupportedSegmentVersion {
                 path: path.display().to_string(),
                 version,
             });
         }
-        let ipc = StreamReader::try_new(reader, None).map_err(|e| {
+        // Whole-file checksum. `finish()` hashes the entire published file, so
+        // any bit flip or tamper that keeps the file parseable is caught here.
+        let actual = crc32fast::hash(&body);
+        if actual != segment.checksum {
+            return Err(BudgetError::SegmentCorrupt {
+                path: path.display().to_string(),
+                reason: format!(
+                    "checksum mismatch: expected {:#010x}, found {:#010x}",
+                    segment.checksum, actual
+                ),
+            });
+        }
+        // The IPC stream starts after the 8-byte magic + 4-byte version header.
+        let mut cursor = std::io::Cursor::new(body);
+        cursor.set_position(12);
+        let ipc = StreamReader::try_new(cursor, None).map_err(|e| {
             BudgetError::SegmentCorrupt {
                 path: path.display().to_string(),
                 reason: format!("IPC open: {e}"),
             }
         })?;
         let schema = ipc.schema();
+        // Schema fingerprint guard: a descriptor paired with a wrong-schema
+        // file must not be read as if it matched.
+        let actual_fp = schema_fingerprint(&schema);
+        if actual_fp != segment.schema_fingerprint {
+            return Err(BudgetError::SegmentCorrupt {
+                path: path.display().to_string(),
+                reason: format!(
+                    "schema fingerprint mismatch: expected {}, found {}",
+                    segment.schema_fingerprint, actual_fp
+                ),
+            });
+        }
         Ok(Box::new(LocalSegmentReader {
             path,
             schema,
             ipc: Some(ipc),
+            expected_rows: segment.row_count,
             _read_permit: _permit,
         }))
     }
@@ -459,8 +485,21 @@ impl SegmentWriter for LocalSegmentWriter {
 struct LocalSegmentReader {
     path: PathBuf,
     schema: SchemaRef,
-    ipc: Option<StreamReader<BufReader<File>>>,
+    ipc: Option<StreamReader<std::io::Cursor<Vec<u8>>>>,
+    /// Row count recorded in the descriptor; verified at end-of-stream.
+    expected_rows: u64,
     _read_permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+/// Lazy decode state for one segment stream. Holds the read-semaphore permit
+/// for the stream's whole lifetime so concurrent spill I/O stays rate-limited.
+struct StreamState {
+    reader: Option<StreamReader<std::io::Cursor<Vec<u8>>>>,
+    rows: u64,
+    expected: u64,
+    path: PathBuf,
+    verified: bool,
+    _permit: tokio::sync::OwnedSemaphorePermit,
 }
 
 #[async_trait]
@@ -469,27 +508,62 @@ impl SegmentReader for LocalSegmentReader {
         self.schema.clone()
     }
 
-    fn into_stream(mut self: Box<Self>) -> BoxStream<'static, Result<RecordBatch>> {
-        let path = self.path.clone();
-        let mut batches = Vec::new();
-        if let Some(reader) = self.ipc.take() {
-            for item in reader {
-                match item {
-                    Ok(batch) => batches.push(Ok(batch)),
-                    Err(e) => {
-                        batches.push(Err(BudgetError::SegmentCorrupt {
-                            path: path.display().to_string(),
-                            reason: e.to_string(),
-                        }));
-                        break;
+    fn into_stream(self: Box<Self>) -> BoxStream<'static, Result<RecordBatch>> {
+        let LocalSegmentReader {
+            path,
+            schema: _,
+            ipc,
+            expected_rows,
+            _read_permit,
+        } = *self;
+        let state = StreamState {
+            reader: ipc,
+            rows: 0,
+            expected: expected_rows,
+            path,
+            verified: false,
+            _permit: _read_permit,
+        };
+        futures::stream::unfold(state, |mut st| async move {
+            // Decode one batch per poll: only the encoded body is resident, and
+            // decoded batches are handed off one at a time.
+            if let Some(reader) = st.reader.as_mut() {
+                match reader.next() {
+                    Some(Ok(batch)) => {
+                        st.rows += batch.num_rows() as u64;
+                        return Some((Ok(batch), st));
                     }
+                    Some(Err(e)) => {
+                        let err = Err(BudgetError::SegmentCorrupt {
+                            path: st.path.display().to_string(),
+                            reason: e.to_string(),
+                        });
+                        st.reader = None;
+                        return Some((err, st));
+                    }
+                    None => st.reader = None,
                 }
             }
-        }
-        // Materialize the batch list for the stream (segments are already
-        // bounded by segment_target_size; full-segment materialization of the
-        // *index* is fine — we still stream RecordBatches one at a time).
-        futures::stream::iter(batches).boxed()
+            // End of stream: verify the row count exactly once. A segment
+            // truncated at a clean Arrow message boundary makes the reader
+            // return `None` with no decode error; only the recorded row count
+            // reveals the short read.
+            if !st.verified {
+                st.verified = true;
+                if st.rows != st.expected {
+                    let err = Err(BudgetError::SegmentCorrupt {
+                        path: st.path.display().to_string(),
+                        reason: format!(
+                            "row count mismatch: expected {}, read {}",
+                            st.expected, st.rows
+                        ),
+                    });
+                    return Some((err, st));
+                }
+            }
+            None
+        })
+        .boxed()
     }
 }
 
@@ -579,6 +653,64 @@ mod tests {
 
         store.delete_scope(&scope).await.unwrap();
         assert!(!seg.path.exists());
+    }
+
+    #[tokio::test]
+    async fn read_rejects_checksum_mismatch() {
+        let _serial = crate::fault::serial_test_guard();
+        let tmp = tempfile::tempdir().unwrap();
+        let store = LocalSegmentStore::open(tmp.path(), 1 << 30, 0, 2, 2).unwrap();
+        let scope = SpillScope::new("q", "s", "op", 0, 0);
+        let mut w = store
+            .create_writer(&scope, 0, batch(1).schema())
+            .await
+            .unwrap();
+        w.write_batch(&batch(1)).await.unwrap();
+        let seg = w.finish().await.unwrap();
+
+        // Flip a byte in the IPC body. The old reader ignored the stored
+        // checksum and would have returned corrupted data silently.
+        let mut bytes = fs::read(&seg.path).unwrap();
+        let idx = bytes.len() - 1;
+        bytes[idx] ^= 0xFF;
+        fs::write(&seg.path, &bytes).unwrap();
+
+        let err = store.open_reader(&seg).await;
+        let is_corrupt = matches!(err, Err(BudgetError::SegmentCorrupt { .. }));
+        let detail = err
+            .err()
+            .map_or_else(|| "Ok(reader)".to_string(), |e| format!("{e:?}"));
+        assert!(
+            is_corrupt,
+            "corrupted segment must be rejected on open, got {detail}"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_rejects_truncated_segment() {
+        let _serial = crate::fault::serial_test_guard();
+        let tmp = tempfile::tempdir().unwrap();
+        let store = LocalSegmentStore::open(tmp.path(), 1 << 30, 0, 2, 2).unwrap();
+        let scope = SpillScope::new("q", "s", "op", 0, 0);
+        let mut w = store
+            .create_writer(&scope, 0, batch(1).schema())
+            .await
+            .unwrap();
+        w.write_batch(&batch(1)).await.unwrap();
+        w.write_batch(&batch(10)).await.unwrap();
+        let seg = w.finish().await.unwrap();
+
+        // Truncate the published segment. The old reader would have returned
+        // whatever batches decoded cleanly before EOF as a short read.
+        let bytes = fs::read(&seg.path).unwrap();
+        fs::write(&seg.path, &bytes[..bytes.len() / 2]).unwrap();
+
+        let err = store.open_reader(&seg).await;
+        let is_corrupt = matches!(err, Err(BudgetError::SegmentCorrupt { .. }));
+        let detail = err
+            .err()
+            .map_or_else(|| "Ok(reader)".to_string(), |e| format!("{e:?}"));
+        assert!(is_corrupt, "truncated segment must be rejected, got {detail}");
     }
 
     #[tokio::test]
