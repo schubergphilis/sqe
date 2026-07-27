@@ -400,9 +400,18 @@ impl FlightService for WorkerFlightService {
             // Stream lifetime carries the guard; once the encoder finishes
             // (or the client disconnects mid-stream) the guard drops and the
             // credential entry is removed via `tokio::spawn`.
+            // Surface encode-side residency while batches move from the scan
+            // queue into the Flight encoder. Phase 1 replaces this with true
+            // AccountedFlightStream ownership permits.
+            let encode_metrics = metrics.clone();
             let mapped_stream = batch_stream
-                .map(|item| match item {
-                    Ok(batch) => Ok(batch),
+                .map(move |item| match item {
+                    Ok(batch) => {
+                        encode_metrics
+                            .flight_encode_resident_bytes
+                            .set(batch.get_array_memory_size() as f64);
+                        Ok(batch)
+                    }
                     Err(e) => Err(arrow_flight::error::FlightError::from_external_error(
                         Box::new(std::io::Error::other(e.to_string())),
                     )),
@@ -425,10 +434,20 @@ impl FlightService for WorkerFlightService {
 
             let schema_arc = Arc::new((*schema).clone());
             let ipc_opts = ipc_options_for(flight_compression)?;
+            let flight_metrics = metrics.clone();
             let flight_stream = FlightDataEncoderBuilder::new()
                 .with_schema(schema_arc)
                 .with_options(ipc_opts)
                 .build(mapped_stream)
+                .map(move |item| {
+                    if let Ok(ref flight_data) = item {
+                        // FlightData body length is the best Phase 0 proxy for
+                        // encoded bytes awaiting gRPC release.
+                        let n = flight_data.data_body.len() + flight_data.data_header.len();
+                        flight_metrics.flight_inflight_bytes.set(n as f64);
+                    }
+                    item
+                })
                 .map_err(Status::from);
             let flight_stream = tracing_futures::Instrument::instrument(flight_stream, stream_span);
 
@@ -681,14 +700,12 @@ impl FlightService for WorkerFlightService {
                 ))
             })?;
 
-        let sender = shuffle_receiver
-            .sender(partition_id)
-            .ok_or_else(|| {
-                Status::not_found(format!(
-                    "No sender for partition {partition_id} in query={query_id}, stage={stage_id}"
-                ))
-            })?
-            .clone();
+        // Confirm the partition exists before spawning intake.
+        if shuffle_receiver.sender(partition_id).is_none() {
+            return Err(Status::not_found(format!(
+                "No sender for partition {partition_id} in query={query_id}, stage={stage_id}"
+            )));
+        }
 
         // 3. Decode and buffer incoming RecordBatches.
         //    Chain the first message (which may also contain data) with the rest.
@@ -705,8 +722,11 @@ impl FlightService for WorkerFlightService {
         let schema = shuffle_receiver.schema().clone();
 
         // Spawn a task to receive batches and forward to the mpsc channel.
+        // Uses send_batch so shuffle_resident_bytes tracks live channel occupancy
+        // (Phase 0 instrumentation for the batch-count-bound safety gate).
         let query_id_clone = query_id.clone();
         let stage_id_clone = stage_id.clone();
+        let intake_receiver = shuffle_receiver.clone();
         tokio::spawn(async move {
             let mut batch_count = 0u64;
             while let Some(batch_result) = flight_batch_stream.next().await {
@@ -716,7 +736,11 @@ impl FlightService for WorkerFlightService {
                             continue;
                         }
                         batch_count += 1;
-                        if sender.send(batch).await.is_err() {
+                        if intake_receiver
+                            .send_batch(partition_id, batch)
+                            .await
+                            .is_err()
+                        {
                             warn!(
                                 query_id = %query_id_clone,
                                 stage_id = %stage_id_clone,
@@ -745,7 +769,7 @@ impl FlightService for WorkerFlightService {
                 batch_count = batch_count,
                 "DoExchange intake complete"
             );
-            // Sender is dropped here, closing the channel for the receiver side.
+            // Intake task ends; remaining senders close when ShuffleReceiver drops.
         });
 
         // 4. Return a stream that drains the partition channel.
@@ -759,12 +783,17 @@ impl FlightService for WorkerFlightService {
                 ))
             })?;
 
-        // Wrap the mpsc receiver as a futures::Stream of RecordBatch.
+        // Wrap the tracked receiver as a futures::Stream of RecordBatch.
         let output_stream = futures::stream::unfold(rx, |mut rx| async move {
             rx.recv().await.map(|batch| (batch, rx))
         });
 
         let shuffle_opts = ipc_options_for(self.shuffle_compression)?;
+        // Approximate flight encode residency as "we are about to stream this
+        // partition". Phase 1 pairs this with AccountedFlightStream permits.
+        self.metrics
+            .flight_encode_resident_bytes
+            .set(shuffle_receiver.resident_bytes() as f64);
         let flight_stream = FlightDataEncoderBuilder::new()
             .with_schema(schema)
             .with_options(shuffle_opts)
