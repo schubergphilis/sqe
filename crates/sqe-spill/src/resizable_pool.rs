@@ -47,6 +47,10 @@ impl ResizableFairSpillPool {
     }
 
     /// Update the finite limit used by subsequent `try_grow` calls.
+    ///
+    /// Prefer [`try_set_pool_size`] for hot reload: a shrink below current
+    /// reservation is refused so in-flight operators are not suddenly
+    /// over-limit without reclaim.
     pub fn set_pool_size(&self, pool_size: usize) {
         let pool_size = pool_size.max(1);
         let prev = self.pool_size.swap(pool_size, Ordering::AcqRel);
@@ -58,6 +62,43 @@ impl ResizableFairSpillPool {
                 "ResizableFairSpillPool limit updated (hot config reload)"
             );
         }
+    }
+
+    /// Set the pool limit, or refuse a shrink when `new_size < reserved()`.
+    ///
+    /// Returns `Ok(previous)` on apply, `Err(ShrinkBelowUse { .. })` when the
+    /// smaller window would sit under current use (caller should ignore + log).
+    pub fn try_set_pool_size(&self, pool_size: usize) -> Result<usize, ShrinkBelowUse> {
+        let pool_size = pool_size.max(1);
+        let reserved = self.reserved();
+        let previous = self.pool_size();
+        if pool_size < previous && pool_size < reserved {
+            return Err(ShrinkBelowUse {
+                requested_bytes: pool_size,
+                reserved_bytes: reserved,
+                current_limit_bytes: previous,
+            });
+        }
+        self.set_pool_size(pool_size);
+        Ok(previous)
+    }
+}
+
+/// Hot-reload refused to shrink the pool below live reservation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShrinkBelowUse {
+    pub requested_bytes: usize,
+    pub reserved_bytes: usize,
+    pub current_limit_bytes: usize,
+}
+
+impl std::fmt::Display for ShrinkBelowUse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "requested {} < reserved {} (current limit {})",
+            self.requested_bytes, self.reserved_bytes, self.current_limit_bytes
+        )
     }
 }
 
@@ -206,8 +247,27 @@ mod tests {
         let consumer = MemoryConsumer::new("t").with_can_spill(true);
         let r = consumer.register(&pool);
         r.try_grow(32 * 1024).expect("half should fit");
+        // Forced shrink (internal) still allows testing fair-share try_grow.
         concrete.set_pool_size(16 * 1024);
-        // Per-spiller fair share is now 16KiB; already at 32KiB so further grow fails.
         assert!(r.try_grow(1).is_err());
+    }
+
+    #[test]
+    fn try_set_pool_size_refuses_shrink_below_reserved() {
+        let concrete = Arc::new(ResizableFairSpillPool::new(64 * 1024));
+        let pool: Arc<dyn MemoryPool> = concrete.clone();
+        let consumer = MemoryConsumer::new("t").with_can_spill(true);
+        let r = consumer.register(&pool);
+        r.try_grow(40 * 1024).expect("grow");
+        let err = concrete
+            .try_set_pool_size(16 * 1024)
+            .expect_err("must refuse shrink under use");
+        assert_eq!(err.reserved_bytes, 40 * 1024);
+        assert_eq!(concrete.pool_size(), 64 * 1024);
+        // Grow or shrink that still covers reserved is fine.
+        concrete
+            .try_set_pool_size(48 * 1024)
+            .expect("shrink above reserved");
+        assert_eq!(concrete.pool_size(), 48 * 1024);
     }
 }

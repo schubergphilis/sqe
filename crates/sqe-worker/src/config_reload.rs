@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+use datafusion::execution::memory_pool::MemoryPool;
 use sqe_core::{parse_memory_limit, runtime_memory_info, SqeConfig};
 use sqe_spill::{MemoryGovernor, ResizableFairSpillPool};
 use tracing::{error, info, warn};
@@ -131,12 +132,32 @@ pub struct ResolvedMemoryBudgets {
     pub scan_timeout_secs: u64,
 }
 
+/// Result of applying a hot-reload snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HotReloadOutcome {
+    /// All requested windows applied.
+    FullyApplied,
+    /// At least one smaller window was ignored because current use is larger.
+    /// Caller should **not** advance mtime so the next poll retries when load drops.
+    ShrinkIgnoredPendingUse,
+}
+
 /// Apply memory budgets to live handles after cgroup validation.
+///
+/// **Shrinks below current use are ignored** (error log, keep previous window):
+/// - DataFusion pool when `new_limit < reserved`
+/// - Governor when active grants/minima cannot fit the new pool
+///
+/// Growths, timeouts, and shrinks that still fit usage apply. Partial apply
+/// returns [`HotReloadOutcome::ShrinkIgnoredPendingUse`] (not an Err) so a
+/// blocked shrink does not block scan_timeout updates.
 pub fn apply_memory_hot_reload(
     handles: &HotReloadHandles,
     budgets: &ResolvedMemoryBudgets,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<HotReloadOutcome> {
     // Same fail-closed rule as boot: need must fit live cgroup when known.
+    // This rejects *raising* configured need above the kernel limit, not
+    // in-process shrinks under load (those are ignored separately below).
     let mem = runtime_memory_info();
     if let Some(enforced) = mem.enforced_memory_limit_bytes {
         if enforced > 0 && budgets.configured_need_bytes > enforced {
@@ -150,41 +171,98 @@ pub fn apply_memory_hot_reload(
         }
     }
 
-    handles
-        .governor
-        .try_resize_pool(budgets.governor_pool_bytes)
-        .map_err(|e| anyhow::anyhow!("hot-reload governor resize: {e}"))?;
+    let prev_limit = handles.pool.pool_size();
+    let reserved = handles.pool.reserved();
+    let mut applied_limit = prev_limit;
+    let mut pool_shrink_ignored = false;
+    match handles.pool.try_set_pool_size(budgets.memory_limit_bytes) {
+        Ok(_) => {
+            applied_limit = handles.pool.pool_size();
+        }
+        Err(e) => {
+            pool_shrink_ignored = true;
+            error!(
+                requested_memory_limit_bytes = e.requested_bytes,
+                reserved_bytes = e.reserved_bytes,
+                current_limit_bytes = e.current_limit_bytes,
+                "Ignoring hot-reload shrink of worker.memory_limit: current use is \
+                 larger than the new window. Keeping previous limit until usage drops \
+                 or the process restarts."
+            );
+        }
+    }
 
-    handles.pool.set_pool_size(budgets.memory_limit_bytes);
+    let prev_gov = handles.governor.pool_bytes();
+    let mut applied_gov = prev_gov;
+    let mut governor_shrink_ignored = false;
+    match handles.governor.try_resize_pool(budgets.governor_pool_bytes) {
+        Ok(()) => {
+            applied_gov = handles.governor.pool_bytes();
+        }
+        Err(e) => {
+            governor_shrink_ignored = true;
+            error!(
+                requested_governor_pool_bytes = budgets.governor_pool_bytes,
+                current_governor_pool_bytes = prev_gov,
+                granted_sum = handles.governor.granted_sum(),
+                reason = %e,
+                "Ignoring hot-reload shrink of governor pool: current grants/use \
+                 exceed the new window. Keeping previous governor capacity."
+            );
+        }
+    }
 
-    handles
-        .hot
-        .memory_limit_bytes
-        .store(budgets.memory_limit_bytes, Ordering::Release);
-    handles
-        .hot
-        .shuffle_budget_bytes
-        .store(budgets.shuffle_budget_bytes, Ordering::Release);
-    handles
-        .hot
-        .configured_need_bytes
-        .store(budgets.configured_need_bytes, Ordering::Release);
+    // Only publish atoms for windows we actually applied. If pool shrink was
+    // ignored, keep previous memory_limit + configured_need so the cgroup
+    // watch matches the live pool.
+    if !pool_shrink_ignored {
+        handles
+            .hot
+            .memory_limit_bytes
+            .store(applied_limit, Ordering::Release);
+        handles
+            .hot
+            .configured_need_bytes
+            .store(budgets.configured_need_bytes, Ordering::Release);
+    }
+    if !governor_shrink_ignored {
+        handles
+            .hot
+            .shuffle_budget_bytes
+            .store(budgets.shuffle_budget_bytes, Ordering::Release);
+    }
     handles
         .hot
         .scan_timeout_secs
         .store(budgets.scan_timeout_secs, Ordering::Release);
 
-    info!(
-        memory_limit_bytes = budgets.memory_limit_bytes,
-        governor_pool_bytes = budgets.governor_pool_bytes,
-        shuffle_budget_bytes = budgets.shuffle_budget_bytes,
-        process_headroom_bytes = budgets.process_headroom_bytes,
-        configured_need_bytes = budgets.configured_need_bytes,
-        scan_timeout_secs = budgets.scan_timeout_secs,
-        enforced_cgroup = mem.enforced_memory_limit_bytes.unwrap_or(0),
-        "Applied worker memory hot-reload"
-    );
-    Ok(())
+    if pool_shrink_ignored || governor_shrink_ignored {
+        error!(
+            requested_memory_limit_bytes = budgets.memory_limit_bytes,
+            applied_memory_limit_bytes = applied_limit,
+            pool_reserved_bytes = reserved,
+            requested_governor_pool_bytes = budgets.governor_pool_bytes,
+            applied_governor_pool_bytes = applied_gov,
+            pool_shrink_ignored,
+            governor_shrink_ignored,
+            scan_timeout_secs = budgets.scan_timeout_secs,
+            "Hot-reload partially applied: one or more smaller windows ignored \
+             because current use is larger; will retry while config stays smaller"
+        );
+        Ok(HotReloadOutcome::ShrinkIgnoredPendingUse)
+    } else {
+        info!(
+            memory_limit_bytes = applied_limit,
+            governor_pool_bytes = applied_gov,
+            shuffle_budget_bytes = budgets.shuffle_budget_bytes,
+            process_headroom_bytes = budgets.process_headroom_bytes,
+            configured_need_bytes = budgets.configured_need_bytes,
+            scan_timeout_secs = budgets.scan_timeout_secs,
+            enforced_cgroup = mem.enforced_memory_limit_bytes.unwrap_or(0),
+            "Applied worker memory hot-reload"
+        );
+        Ok(HotReloadOutcome::FullyApplied)
+    }
 }
 
 fn warn_restart_required(boot: &BootConfigIdentity, next: &SqeConfig) {
@@ -269,18 +347,23 @@ pub fn spawn_config_reload_watch(
                                 last_mtime = mtime;
                                 continue;
                             }
-                            if let Err(e) = apply_memory_hot_reload(&handles, &budgets) {
-                                error!(
-                                    error = %e,
-                                    config_path = %config_path.display(),
-                                    "Memory hot-reload rejected; keeping previous budgets"
-                                );
-                                // Do not advance mtime so a later fix re-tries? Or advance
-                                // so we do not spin. Advance: operator can touch file again.
-                                last_mtime = mtime;
-                                continue;
+                            match apply_memory_hot_reload(&handles, &budgets) {
+                                Ok(HotReloadOutcome::FullyApplied) => {
+                                    last_mtime = mtime;
+                                }
+                                Ok(HotReloadOutcome::ShrinkIgnoredPendingUse) => {
+                                    // Keep last_mtime behind so we re-attempt every
+                                    // interval until usage falls under the new window.
+                                }
+                                Err(e) => {
+                                    error!(
+                                        error = %e,
+                                        config_path = %config_path.display(),
+                                        "Memory hot-reload rejected; keeping previous budgets"
+                                    );
+                                    last_mtime = mtime;
+                                }
                             }
-                            last_mtime = mtime;
                         }
                         Err(e) => {
                             error!(
@@ -307,14 +390,17 @@ pub fn spawn_config_reload_watch(
 mod tests {
     use super::*;
 
-    #[test]
-    fn apply_memory_hot_reload_resizes_pool_and_governor() {
-        let pool = Arc::new(ResizableFairSpillPool::new(200 * 1024 * 1024));
-        let governor = Arc::new(MemoryGovernor::new(150 * 1024 * 1024));
+    fn test_handles(
+        pool_bytes: usize,
+        gov_bytes: usize,
+    ) -> (HotReloadHandles, Arc<ResizableFairSpillPool>, Arc<MemoryGovernor>, Arc<WorkerHotConfig>)
+    {
+        let pool = Arc::new(ResizableFairSpillPool::new(pool_bytes));
+        let governor = Arc::new(MemoryGovernor::new(gov_bytes));
         let hot = Arc::new(WorkerHotConfig::new(
-            200 * 1024 * 1024,
+            pool_bytes,
             50 * 1024 * 1024,
-            200 * 1024 * 1024 + 256 * 1024 * 1024,
+            pool_bytes as u64 + 256 * 1024 * 1024,
             600,
         ));
         let handles = HotReloadHandles {
@@ -332,6 +418,13 @@ mod tests {
                 spill_to_disk: false,
             },
         };
+        (handles, pool, governor, hot)
+    }
+
+    #[test]
+    fn apply_memory_hot_reload_resizes_pool_and_governor() {
+        let (handles, pool, governor, hot) =
+            test_handles(200 * 1024 * 1024, 150 * 1024 * 1024);
 
         let budgets = ResolvedMemoryBudgets {
             memory_limit_bytes: 400 * 1024 * 1024,
@@ -341,7 +434,10 @@ mod tests {
             configured_need_bytes: 400 * 1024 * 1024 + 256 * 1024 * 1024,
             scan_timeout_secs: 120,
         };
-        apply_memory_hot_reload(&handles, &budgets).expect("apply");
+        assert_eq!(
+            apply_memory_hot_reload(&handles, &budgets).expect("apply"),
+            HotReloadOutcome::FullyApplied
+        );
         assert_eq!(pool.pool_size(), 400 * 1024 * 1024);
         assert_eq!(governor.pool_bytes(), 250 * 1024 * 1024);
         assert_eq!(
@@ -357,5 +453,45 @@ mod tests {
             hot.configured_need_bytes.load(Ordering::Acquire),
             budgets.configured_need_bytes
         );
+    }
+
+    #[test]
+    fn apply_ignores_pool_shrink_when_reserved_exceeds_new_window() {
+        use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool};
+
+        let (handles, pool, _governor, hot) =
+            test_handles(64 * 1024 * 1024, 32 * 1024 * 1024);
+        let dyn_pool: Arc<dyn MemoryPool> = pool.clone();
+        let consumer = MemoryConsumer::new("busy").with_can_spill(true);
+        let r = consumer.register(&dyn_pool);
+        r.try_grow(48 * 1024 * 1024).expect("reserve half+");
+
+        let prev_limit = pool.pool_size();
+        let prev_need = hot.configured_need_bytes.load(Ordering::Acquire);
+        let budgets = ResolvedMemoryBudgets {
+            memory_limit_bytes: 16 * 1024 * 1024, // below reserved
+            governor_pool_bytes: 32 * 1024 * 1024,
+            shuffle_budget_bytes: 8 * 1024 * 1024,
+            process_headroom_bytes: 1 * 1024 * 1024,
+            configured_need_bytes: 17 * 1024 * 1024,
+            scan_timeout_secs: 30,
+        };
+        assert_eq!(
+            apply_memory_hot_reload(&handles, &budgets).expect("partial ok"),
+            HotReloadOutcome::ShrinkIgnoredPendingUse
+        );
+        assert_eq!(pool.pool_size(), prev_limit, "pool limit kept");
+        assert_eq!(
+            hot.memory_limit_bytes.load(Ordering::Acquire),
+            prev_limit,
+            "hot atom not lowered"
+        );
+        assert_eq!(
+            hot.configured_need_bytes.load(Ordering::Acquire),
+            prev_need,
+            "need atom not lowered when pool shrink ignored"
+        );
+        // Timeout still applies.
+        assert_eq!(hot.scan_timeout_secs.load(Ordering::Acquire), 30);
     }
 }
