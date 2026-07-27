@@ -22,10 +22,22 @@
 //! | macOS    | none (no cgroup) | `ps` | `sysctl hw.memsize` |
 //! | Windows  | none (no Job Object probe) | none | none |
 //!
-//! Call [`runtime_memory_info`] once at startup for a full snapshot suitable
-//! for structured logs. Convenience wrappers keep existing call sites small.
+//! ## Lifecycle (config vs kernel)
+//!
+//! - **`sqe.toml` / `worker.memory_limit`**: loaded once at process start. There
+//!   is no hot-reload of the DataFusion pool, governor, or spill budgets. Change
+//!   the file and **restart** the worker.
+//! - **Kernel / cgroup limit**: can move under a live process (Kubernetes
+//!   in-place resize, `systemd` property changes, nested limit rewrites). Each
+//!   call to [`runtime_memory_info`] re-reads `/sys` and `/proc`. Use
+//!   [`spawn_runtime_memory_watch`] to log when the live enforced limit drifts
+//!   from the value seen at boot relative to the configured need.
+//! - Mid-run we **do not** resize the memory pool automatically: in-flight
+//!   grants and reservations would be inconsistent. Operators get a loud log
+//!   and must restart (or raise the cgroup) when need no longer fits.
 
 use std::fmt;
+use std::time::Duration;
 
 #[cfg(target_os = "linux")]
 use std::fs;
@@ -187,11 +199,58 @@ impl RuntimeMemoryInfo {
         self.enforced_memory_limit_bytes
             .is_some_and(|n| n > 0)
     }
+
+    /// True when `configured_need` (typically `memory_limit + process_headroom`)
+    /// exceeds the live enforced cgroup limit.
+    pub fn configured_need_exceeds_enforced(&self, configured_need_bytes: u64) -> bool {
+        match self.enforced_memory_limit_bytes {
+            Some(enforced) if enforced > 0 => configured_need_bytes > enforced,
+            _ => false,
+        }
+    }
 }
+
+/// Diff between two probes (cgroup/container/OS — not sqe.toml).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeMemoryChange {
+    pub enforced_limit_changed: bool,
+    pub container_changed: bool,
+    pub cgroup_path_changed: bool,
+    pub previous_enforced_bytes: Option<u64>,
+    pub current_enforced_bytes: Option<u64>,
+    pub previous_source: &'static str,
+    pub current_source: &'static str,
+}
+
+impl RuntimeMemoryChange {
+    pub fn between(prev: &RuntimeMemoryInfo, next: &RuntimeMemoryInfo) -> Self {
+        Self {
+            enforced_limit_changed: prev.enforced_memory_limit_bytes
+                != next.enforced_memory_limit_bytes
+                || prev.enforced_memory_limit_source != next.enforced_memory_limit_source,
+            container_changed: prev.container != next.container,
+            cgroup_path_changed: prev.cgroup.path != next.cgroup.path,
+            previous_enforced_bytes: prev.enforced_memory_limit_bytes,
+            current_enforced_bytes: next.enforced_memory_limit_bytes,
+            previous_source: prev.enforced_memory_limit_source,
+            current_source: next.enforced_memory_limit_source,
+        }
+    }
+
+    pub fn any(&self) -> bool {
+        self.enforced_limit_changed || self.container_changed || self.cgroup_path_changed
+    }
+}
+
+/// Default interval for [`spawn_runtime_memory_watch`].
+pub const DEFAULT_RUNTIME_MEMORY_WATCH_INTERVAL: Duration = Duration::from_secs(30);
 
 // ─── Public entry points ─────────────────────────────────────────────────────
 
 /// Probe OS, container markers, cgroup, host memory, and process RSS.
+///
+/// Always re-reads kernel interfaces (no process-wide cache). Safe to call
+/// from a background watch; cheap relative to query work (a few small files).
 pub fn runtime_memory_info() -> RuntimeMemoryInfo {
     let os = current_os();
     let process_rss_bytes = process_rss_bytes();
@@ -258,6 +317,85 @@ pub fn enforced_memory_limit_bytes() -> Option<u64> {
 /// Short source tag for the enforced limit (for logs / metrics labels).
 pub fn enforced_memory_limit_source() -> &'static str {
     runtime_memory_info().enforced_memory_limit_source
+}
+
+/// Periodically re-probe container/cgroup/OS memory and log when the **live
+/// kernel limit** moves relative to boot or no longer covers `configured_need_bytes`.
+///
+/// This does **not** reload `sqe.toml`. Pool size and governor budgets stay at
+/// the values fixed when the process started. When the live cgroup shrinks
+/// below the configured need, we log at error level; the operator must
+/// restart with a lower `worker.memory_limit` or raise the cgroup.
+///
+/// Returns a [`JoinHandle`] so callers can abort on shutdown if desired.
+/// Matches the worker heartbeat pattern (process-lifetime background task).
+pub fn spawn_runtime_memory_watch(
+    configured_need_bytes: u64,
+    interval: Duration,
+) -> tokio::task::JoinHandle<()> {
+    let interval = if interval.is_zero() {
+        DEFAULT_RUNTIME_MEMORY_WATCH_INTERVAL
+    } else {
+        interval
+    };
+    tokio::spawn(async move {
+        let mut last = runtime_memory_info();
+        tracing::info!(
+            interval_secs = interval.as_secs(),
+            configured_need_bytes,
+            enforced_memory_limit_bytes = last.enforced_memory_limit_bytes.unwrap_or(0),
+            enforced_source = last.enforced_memory_limit_source,
+            os = %last.os,
+            container = %last.container,
+            "Watching live container/cgroup/OS memory (sqe.toml memory settings are not hot-reloaded)"
+        );
+        loop {
+            tokio::time::sleep(interval).await;
+            let now = runtime_memory_info();
+            let change = RuntimeMemoryChange::between(&last, &now);
+
+            if change.any() {
+                tracing::warn!(
+                    previous_enforced_bytes = change.previous_enforced_bytes.unwrap_or(0),
+                    current_enforced_bytes = change.current_enforced_bytes.unwrap_or(0),
+                    previous_source = change.previous_source,
+                    current_source = change.current_source,
+                    enforced_limit_changed = change.enforced_limit_changed,
+                    container_changed = change.container_changed,
+                    cgroup_path_changed = change.cgroup_path_changed,
+                    container = %now.container,
+                    cgroup_path = now.cgroup.path.as_deref().unwrap_or(""),
+                    process_rss_bytes = now.process_rss_bytes.unwrap_or(0),
+                    host_total_bytes = now.host.total_bytes.unwrap_or(0),
+                    "Live runtime memory environment changed (cgroup/container/OS; not sqe.toml)"
+                );
+            }
+
+            if now.configured_need_exceeds_enforced(configured_need_bytes) {
+                let enforced = now.enforced_memory_limit_bytes.unwrap_or(0);
+                tracing::error!(
+                    configured_need_bytes,
+                    enforced_memory_limit_bytes = enforced,
+                    enforced_source = now.enforced_memory_limit_source,
+                    os = %now.os,
+                    container = %now.container,
+                    cgroup_version = %now.cgroup.version,
+                    "Configured memory_limit+headroom no longer fits live cgroup limit. \
+                     Pool size is fixed until restart — lower worker.memory_limit and restart, \
+                     or raise the container/cgroup memory limit."
+                );
+            } else if change.enforced_limit_changed {
+                tracing::info!(
+                    configured_need_bytes,
+                    enforced_memory_limit_bytes = now.enforced_memory_limit_bytes.unwrap_or(0),
+                    enforced_source = now.enforced_memory_limit_source,
+                    "Live enforced memory limit still covers configured need"
+                );
+            }
+
+            last = now;
+        }
+    })
 }
 
 fn current_os() -> OsKind {
@@ -766,5 +904,34 @@ mod tests {
         assert_eq!(ContainerKind::Kubernetes.as_str(), "kubernetes");
         assert!(ContainerKind::Docker.is_container());
         assert!(!ContainerKind::BareMetal.is_container());
+    }
+
+    #[test]
+    fn runtime_memory_change_detects_enforced_drift() {
+        let a = runtime_memory_info();
+        let mut b = a.clone();
+        assert!(!RuntimeMemoryChange::between(&a, &b).any());
+
+        b.enforced_memory_limit_bytes = Some(
+            b.enforced_memory_limit_bytes
+                .unwrap_or(0)
+                .saturating_add(1)
+                .max(1),
+        );
+        let change = RuntimeMemoryChange::between(&a, &b);
+        assert!(change.enforced_limit_changed);
+        assert!(change.any());
+    }
+
+    #[test]
+    fn configured_need_exceeds_only_when_enforced_known() {
+        let mut info = runtime_memory_info();
+        info.enforced_memory_limit_bytes = None;
+        assert!(!info.configured_need_exceeds_enforced(u64::MAX));
+
+        info.enforced_memory_limit_bytes = Some(1024);
+        assert!(info.configured_need_exceeds_enforced(2048));
+        assert!(!info.configured_need_exceeds_enforced(512));
+        assert!(!info.configured_need_exceeds_enforced(1024));
     }
 }
