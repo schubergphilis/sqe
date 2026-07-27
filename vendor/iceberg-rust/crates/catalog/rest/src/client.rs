@@ -465,7 +465,24 @@ impl HttpClient {
 
     /// Executes the given `Request` and returns a `Response`.
     pub async fn execute(&self, mut request: Request) -> Result<Response> {
-        request.headers_mut().extend(self.extra_headers.clone());
+        // SQE PATCH (sqe#388): fill in the catalog-wide extra headers without
+        // clobbering a header the caller deliberately set on this request.
+        //
+        // This was `request.headers_mut().extend(self.extra_headers.clone())`.
+        // `HeaderMap::extend` overwrites same-key values, so it silently undid
+        // `exchange_credential_for_token`'s content-type override: the token
+        // request went out with a form-urlencoded body under
+        // `Content-Type: application/json` (hardcoded in
+        // `RestCatalogConfig::extra_headers`), and Polaris rejected it with a
+        // 415 `@Consumes` mismatch, breaking every client-credentials flow.
+        //
+        // `request()` above already applies these headers, so this only has to
+        // cover requests built without it.
+        for (name, value) in self.extra_headers.iter() {
+            if !request.headers().contains_key(name) {
+                request.headers_mut().insert(name, value.clone());
+            }
+        }
         let method = request.method().clone();
         let path = request.url().path().to_string();
         let host = request.url().host_str().unwrap_or_default().to_string();
