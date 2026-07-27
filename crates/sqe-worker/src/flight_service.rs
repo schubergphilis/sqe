@@ -23,7 +23,7 @@ use sqe_metrics::WorkerMetricsRegistry;
 use sqe_metrics::propagation::extract_trace_context;
 use sqe_compaction::wire::{CompactGroupFrame, CompactGroupRequest};
 use sqe_planner::ScanTask;
-use sqe_spill::BytePermit;
+use sqe_spill::{BytePermit, SpillManager};
 
 use crate::compaction::compact_file_group;
 use crate::credential_channel::{CredentialStore, RefreshableCredentials};
@@ -161,6 +161,8 @@ pub struct WorkerFlightService {
     /// the worker accepts unauthenticated traffic (operators must opt in
     /// via `worker.allow_unauthenticated = true`, enforced at config load).
     worker_secret: String,
+    /// Shared spill manager for shuffle / operator spill (Phase 3+).
+    spill_manager: Option<Arc<SpillManager>>,
 }
 
 impl WorkerFlightService {
@@ -175,6 +177,7 @@ impl WorkerFlightService {
             flight_compression: FlightCompression::Zstd,
             shuffle_compression: FlightCompression::Zstd,
             worker_secret: String::new(),
+            spill_manager: None,
         }
     }
 
@@ -197,6 +200,7 @@ impl WorkerFlightService {
             flight_compression: FlightCompression::Zstd,
             shuffle_compression: FlightCompression::Zstd,
             worker_secret: String::new(),
+            spill_manager: None,
         }
     }
 
@@ -236,6 +240,18 @@ impl WorkerFlightService {
     pub fn with_worker_secret(mut self, secret: String) -> Self {
         self.worker_secret = secret;
         self
+    }
+
+    /// Attach the worker-wide spill manager (Phase 3).
+    #[must_use = "with_spill_manager consumes self; bind the returned service"]
+    pub fn with_spill_manager(mut self, manager: Arc<SpillManager>) -> Self {
+        self.spill_manager = Some(manager);
+        self
+    }
+
+    /// Spill manager when local spill is enabled at bootstrap.
+    pub fn spill_manager(&self) -> Option<&Arc<SpillManager>> {
+        self.spill_manager.as_ref()
     }
 
     /// Constant-time check of the `x-sqe-worker-secret` metadata header.
