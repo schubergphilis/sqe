@@ -225,7 +225,7 @@ fn build_spill_manager(config: &SqeConfig) -> anyhow::Result<Option<Arc<SpillMan
                 region: s3.region.clone(),
                 endpoint: s3.endpoint.clone(),
                 access_key_id: s3.access_key_id.clone(),
-                secret_access_key: s3.secret_access_key.clone(),
+                secret_access_key: s3.secret_access_key.expose().to_string(),
                 allow_http: s3.allow_http,
                 path_style: s3.path_style || !s3.endpoint.is_empty(),
                 max_bytes,
