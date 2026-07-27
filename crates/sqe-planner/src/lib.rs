@@ -1,6 +1,7 @@
 pub mod distributed_aggregate;
 pub mod distributed_join;
 pub mod distributed_sort;
+pub mod grace_hash_join;
 pub mod join_strategy;
 pub mod predicate_transfer;
 pub mod scan_morsel;
@@ -24,6 +25,10 @@ pub use distributed_join::{
 pub use distributed_sort::{
     compute_range_boundaries, needs_sampling, sample_based_boundaries, DistributedSortExec,
     DistributedSortRule, DEFAULT_DISTRIBUTED_SORT_THRESHOLD, MIN_EXECUTORS_FOR_DISTRIBUTED_SORT,
+};
+pub use grace_hash_join::{
+    choose_local_join_strategy, grace_inner_join, GraceHashJoinConfig, GraceJoinConsumer,
+    GraceJoinProfile, LocalJoinStrategy, DEFAULT_GRACE_PARTITIONS, DEFAULT_MAX_RECURSION,
 };
 pub use join_strategy::{BuildSizeEstimate, JoinStrategyRule};
 pub use star_schema_reorder::{StarSchemaReorderRule, DEFAULT_MIN_RATIO};

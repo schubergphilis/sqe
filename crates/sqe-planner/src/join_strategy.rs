@@ -43,11 +43,19 @@ pub const DEFAULT_HASH_JOIN_THRESHOLD: usize = 2 * 1024 * 1024 * 1024; // 2 GB
 ///
 /// The rewrite adds `SortExec` nodes on both inputs if they are not already
 /// sorted on the join key columns.
+///
+/// Phase 5b: strategy *selection* prefers [`crate::grace_hash_join::LocalJoinStrategy::GraceHashJoin`]
+/// for unknown/large builds via [`crate::grace_hash_join::choose_local_join_strategy`].
+/// Physical rewrite still uses spillable SortMergeJoin until `GraceHashJoinExec`
+/// is registered on the worker path; the choice is logged for plan profiles.
 #[derive(Debug)]
 pub struct JoinStrategyRule {
     /// Maximum build-side size (bytes) for hash join.
     /// Above this, rewrite to `SortMergeJoinExec`.
     hash_join_threshold: usize,
+    /// When true (default), unknown/large builds select Grace in profiles;
+    /// physical rewrite remains SMJ until Grace exec is wired end-to-end.
+    prefer_grace: bool,
 }
 
 impl JoinStrategyRule {
@@ -58,7 +66,15 @@ impl JoinStrategyRule {
     pub fn new(hash_join_threshold: usize) -> Self {
         Self {
             hash_join_threshold,
+            prefer_grace: true,
         }
+    }
+
+    /// Prefer Grace hash join in strategy selection for unknown/large builds.
+    #[must_use]
+    pub fn with_prefer_grace(mut self, prefer: bool) -> Self {
+        self.prefer_grace = prefer;
+        self
     }
 }
 
@@ -84,22 +100,37 @@ impl PhysicalOptimizerRule for JoinStrategyRule {
                     "JoinStrategyRule: evaluating HashJoinExec"
                 );
 
-                // Phase 5a: choose the spillable SortMergeJoin path when the
-                // build side is known-large OR unknown/inexact. Only keep the
-                // non-spillable HashJoinExec for an explicit small *exact*
-                // estimate (including exact zero).
-                let rewrite = match estimate {
-                    BuildSizeEstimate::Exact(size) => size > threshold,
-                    BuildSizeEstimate::Unknown => true,
+                // Phase 5a/5b: spillable path when build is known-large OR
+                // unknown/inexact. Only keep non-spillable HashJoinExec for an
+                // explicit small *exact* estimate. Strategy selection records
+                // Grace preference; physical plan uses SMJ until Grace exec
+                // is registered on the execute path.
+                let exact = match estimate {
+                    BuildSizeEstimate::Exact(size) => Some(size),
+                    BuildSizeEstimate::Unknown => None,
                 };
+                let choice = crate::grace_hash_join::choose_local_join_strategy(
+                    exact,
+                    threshold,
+                    self.prefer_grace,
+                );
+                let rewrite = !matches!(
+                    choice,
+                    crate::grace_hash_join::LocalJoinStrategy::HashJoin
+                );
 
                 if rewrite {
                     debug!(
                         estimate = ?estimate,
                         threshold_bytes = threshold,
+                        strategy = ?choice,
                         join_type = ?hash_join.join_type(),
                         "JoinStrategyRule: rewriting HashJoinExec → SortMergeJoinExec \
-                         (spillable fallback)"
+                         (spillable; Grace selected={})",
+                        matches!(
+                            choice,
+                            crate::grace_hash_join::LocalJoinStrategy::GraceHashJoin
+                        )
                     );
                     let smj = convert_to_sort_merge_join(hash_join)?;
                     return Ok(Transformed::yes(smj));

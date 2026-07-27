@@ -16,6 +16,7 @@ pub mod budget;
 pub mod error;
 pub mod fault;
 pub mod manager;
+pub mod reclaim;
 pub mod scope;
 pub mod segment;
 pub mod store;
@@ -32,6 +33,9 @@ pub use fault::{
     SpillFault,
 };
 pub use manager::{SpillManager, SpillScopeGuard};
+pub use reclaim::{
+    GrantRegistry, MemoryGrant, ReclaimableConsumer, SharedGrantRegistry,
+};
 pub use scope::SpillScope;
 pub use segment::{SpillSegment, SEGMENT_FORMAT_VERSION, SEGMENT_MAGIC};
 pub use store::{SegmentReader, SegmentStore, SegmentWriter};
