@@ -688,15 +688,25 @@ impl WorkerFlightService {
         attempt_manifest.segments = (0..manifest.segments)
             .map(|i| format!("seg-{i:08}"))
             .collect();
-        if let Err(e) = self.exchange_store.publish(attempt_manifest) {
-            warn!(error = %e, "Failed to publish exchange attempt manifest");
-        } else {
-            let key = TaskKey::new(query_id, stage_id, &task_id, partition_id);
-            if let Err(e) = self.exchange_store.commit_winner(&key, attempt_id) {
-                // Higher winner already committed — treat as late attempt.
+        match self.exchange_store.publish(attempt_manifest) {
+            Err(e) => {
+                // publish() rejects only when this attempt is strictly lower
+                // than an already-committed winner, i.e. it is a stale loser.
+                // Falling through to drain would stream the losing attempt's
+                // rows to the consumer and duplicate the winner's output on
+                // retry, so abort rather than warn-and-continue.
                 return Err(Status::aborted(format!(
-                    "exchange winner commit rejected: {e}"
+                    "exchange attempt superseded by a committed winner: {e}"
                 )));
+            }
+            Ok(()) => {
+                let key = TaskKey::new(query_id, stage_id, &task_id, partition_id);
+                if let Err(e) = self.exchange_store.commit_winner(&key, attempt_id) {
+                    // Higher winner already committed — treat as late attempt.
+                    return Err(Status::aborted(format!(
+                        "exchange winner commit rejected: {e}"
+                    )));
+                }
             }
         }
 
