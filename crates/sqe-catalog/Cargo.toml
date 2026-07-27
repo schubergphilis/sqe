@@ -146,7 +146,7 @@ zip = { workspace = true }
 flate2 = { workspace = true }
 # Optional backend dependencies — gated by the corresponding cargo feature
 # above. None of these are pulled into a default `cargo build`.
-rusqlite = { version = "0.32", features = ["bundled"], optional = true }
+rusqlite = { version = "0.40", features = ["bundled"], optional = true }
 iceberg-catalog-hms = { workspace = true, optional = true }
 iceberg-catalog-glue = { workspace = true, optional = true }
 iceberg-catalog-sql = { workspace = true, optional = true }
