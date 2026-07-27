@@ -4,7 +4,9 @@ use crate::scope::SpillScope;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-/// Current on-disk segment format version (Arrow IPC payloads + CRC trailer).
+/// Current on-disk segment format version (magic + version header followed by
+/// an Arrow IPC stream; the integrity CRC is stored out-of-band in the
+/// [`SpillSegment`] descriptor, not appended as a trailer).
 pub const SEGMENT_FORMAT_VERSION: u32 = 1;
 
 /// Magic bytes identifying an SQE spill segment file.
@@ -26,7 +28,10 @@ pub struct SpillSegment {
     pub logical_bytes: u64,
     /// On-disk / object size in bytes.
     pub physical_bytes: u64,
-    /// Whole-segment CRC32C of the file body (excluding trailer).
+    /// CRC32 (IEEE, via `crc32fast`) over the entire segment file including
+    /// the magic + version header. Stored out-of-band in this descriptor; the
+    /// reader recomputes it over the whole file and compares before trusting
+    /// the payload.
     pub checksum: u32,
     pub format_version: u32,
 }

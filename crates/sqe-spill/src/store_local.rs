@@ -255,7 +255,10 @@ impl SegmentStore for LocalSegmentStore {
             });
         }
         // Whole-file checksum. `finish()` hashes the entire published file, so
-        // any bit flip or tamper that keeps the file parseable is caught here.
+        // bit rot or a truncated/partial write is caught here before the
+        // payload is trusted. CRC32 detects corruption, not tampering (an
+        // attacker with write access can recompute it); the descriptor is the
+        // trust anchor.
         let actual = crc32fast::hash(&body);
         if actual != segment.checksum {
             return Err(BudgetError::SegmentCorrupt {
