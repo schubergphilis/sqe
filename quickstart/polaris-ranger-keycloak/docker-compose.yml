@@ -27,7 +27,7 @@
 services:
   # ── Keycloak — identity provider ──────────────────────────────────────
   keycloak:
-    image: quay.io/keycloak/keycloak:26.5.4
+    image: quay.io/keycloak/keycloak:26.7.0
     command: start-dev
     environment:
       KC_BOOTSTRAP_ADMIN_USERNAME: admin
@@ -48,7 +48,7 @@ services:
       start_period: 20s
 
   keycloak-config:
-    image: adorsys/keycloak-config-cli:6.4.1-26
+    image: adorsys/keycloak-config-cli:6.5.1-26
     environment:
       KEYCLOAK_URL: http://keycloak:8080
       KEYCLOAK_USER: admin
@@ -84,7 +84,7 @@ services:
       start_period: 20s
 
   bucket-init:
-    image: amazon/aws-cli:2.31.15
+    image: amazon/aws-cli:2.36.7
     entrypoint: ["sh", "-c"]
     command:
       - |
@@ -102,7 +102,7 @@ services:
 
   # ── Ranger Admin database ─────────────────────────────────────────────
   ranger-db:
-    image: postgres:13.16
+    image: postgres:13.23
     environment:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-rangerR0cks!}
     volumes:
@@ -142,7 +142,7 @@ services:
 
   # ── ranger-setup — register service-def + service, seed admin grant ───
   ranger-setup:
-    image: curlimages/curl:8.14.1
+    image: curlimages/curl:8.21.0
     entrypoint: ["sh", "/bootstrap-ranger.sh"]
     environment:
       RANGER_URL: http://ranger-admin:6080
@@ -223,7 +223,7 @@ services:
 
   # ── polaris-setup — catalogs, namespaces, principals, principal-roles ─
   polaris-setup:
-    image: curlimages/curl:8.14.1
+    image: curlimages/curl:8.21.0
     entrypoint: ["sh", "/bootstrap-data.sh"]
     environment:
       POLARIS_URL: http://polaris:8181

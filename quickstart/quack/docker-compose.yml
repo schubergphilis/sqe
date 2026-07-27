@@ -31,7 +31,7 @@ services:
 
   # ── bucket-init — create the warehouse bucket (RustFS needs real S3) ──
   bucket-init:
-    image: amazon/aws-cli:2.31.15
+    image: amazon/aws-cli:2.36.7
     entrypoint: ["sh", "-c"]
     command:
       - |
@@ -51,7 +51,7 @@ services:
   # In-memory version store (nothing persists across `down`). The Iceberg REST
   # surface is mounted at /iceberg; storage points at RustFS.
   nessie:
-    image: ghcr.io/projectnessie/nessie:0.107.5
+    image: ghcr.io/projectnessie/nessie:0.108.3
     environment:
       NESSIE_VERSION_STORE_TYPE: IN_MEMORY
       QUARKUS_HTTP_PORT: "19120"

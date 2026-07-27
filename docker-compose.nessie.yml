@@ -20,7 +20,7 @@
 
 services:
   nessie:
-    image: ghcr.io/projectnessie/nessie:0.107.5
+    image: ghcr.io/projectnessie/nessie:0.108.3
     environment:
       # In-memory version store keeps the test stack self-contained;
       # nothing persists across `docker compose down`.

@@ -31,7 +31,7 @@
 # Ranger plugin config files (ranger-spark-security.xml, ranger-spark-audit.xml)
 # are mounted from the host into /opt/spark/conf/ at runtime.
 
-FROM apache/spark:3.5.4-scala2.12-java17-ubuntu
+FROM apache/spark:3.5.8-scala2.12-java17-ubuntu
 
 USER root
 
