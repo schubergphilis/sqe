@@ -23,7 +23,9 @@ use sqe_metrics::WorkerMetricsRegistry;
 use sqe_metrics::propagation::extract_trace_context;
 use sqe_compaction::wire::{CompactGroupFrame, CompactGroupRequest};
 use sqe_planner::ScanTask;
-use sqe_spill::{ByteBudget, BytePermit, SpillManager, SpillScope};
+use sqe_spill::{
+    split_default_read_headroom, ByteBudget, BytePermit, SpillManager, SpillScope,
+};
 
 use crate::compaction::compact_file_group;
 use crate::credential_channel::{CredentialStore, RefreshableCredentials};
@@ -399,15 +401,29 @@ impl WorkerFlightService {
     ) -> Result<Response<BoxStream<FlightData>>, Status> {
         let attempt_gate = self.shuffle_manager.attempts().clone();
         let budget_bytes = self.shuffle_memory_budget;
-        // Dedicated pool so shuffle residency is tracked independently of the
-        // operator pool; capacity matches the shuffle sub-budget.
+        // Carve spill-read/merge headroom out of the shuffle budget so writers
+        // cannot pin the entire sub-budget while a drain still needs memory
+        // for segment reads (Phase 4 headroom protection).
+        let (writer_cap, read_headroom) = split_default_read_headroom(budget_bytes);
         let pool = Arc::new(datafusion::execution::memory_pool::FairSpillPool::new(
-            budget_bytes.max(1024 * 1024),
+            writer_cap.max(1024 * 1024),
         ));
         let budget = ByteBudget::new(
             format!("shuffle-{query_id}-{stage_id}-p{partition_id}"),
-            budget_bytes,
+            writer_cap,
             Some(pool),
+        );
+        // Reserved (not acquired yet): documents that read_headroom stays free
+        // for drain/merge; metrics publish the split for operators.
+        let _read_headroom = read_headroom;
+        debug!(
+            query_id = %query_id,
+            stage_id = %stage_id,
+            partition_id = partition_id,
+            writer_cap = writer_cap,
+            read_headroom = read_headroom,
+            parent_budget = budget_bytes,
+            "DoExchange shuffle budget split (writer + spill-read headroom)"
         );
         let scope = SpillScope::new(
             query_id,
