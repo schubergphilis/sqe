@@ -64,4 +64,40 @@ regexes = [
     # RSA key cannot be masked. Lives inside a string literal, so it cannot take
     # an inline gitleaks:allow comment.
     '''MIIEowIBAAKCAQEAvX0NLGQkeecTCMwoDPx6Qkutsf0PWBEjZnNm4vkmTTvHD1F0''',
+    # Test fixtures in crates/sqe-core/src/secret.rs. These carry inline
+    # `gitleaks:allow` comments in the working tree, but the history scan
+    # (aikido-secret-scan-history) reads old blobs where the comment was not
+    # present yet, so the inline form cannot suppress them. Both are unmistakable
+    # dummies used to assert that Debug redaction works.
+    '''hunter2-very-private''',
+    '''0123456789abcdef''',
+    # Documented example API key. The `abc123def456` variant is already listed
+    # above; this is the second placeholder value used in the deployment docs
+    # (historically docs/deployment.md, now under docs/site/).
+    '''sqe_k?_?xyz789ghi012''',
+]
+
+# 4. History-only false positives that cannot be expressed as a value match.
+#    The aikido-secret-scan-history job scans every commit, so a finding in a
+#    blob that predates a rename or an inline `gitleaks:allow` stays flagged
+#    forever and no working-tree edit can clear it.
+#
+#    These two test scripts build Trino-compat HTTP calls whose credentials come
+#    from shell variables ($SQE_USER, $TRINO_PASSWORD, ...), which the curl-auth
+#    rules match on shape alone. The allowlist is scoped three ways at once
+#    (condition = "AND"): only these two files, only a line that actually
+#    contains a `$`-interpolated value, and only via `regexTarget = "line"`.
+#    A hardcoded literal such as `curl -u admin:s3cr3tpw` has no `$` on the line
+#    and is still reported. Verified against a probe repo: a planted
+#    non-placeholder AWS secret in scripts/distributed-test.sh is still caught.
+[[allowlists]]
+description = "Variable-interpolated curl auth in test scripts (history scan)"
+condition = "AND"
+paths = [
+    '''(^|/)scripts/distributed-test\.sh$''',
+    '''(^|/)scripts/verify_trino_compatibility\.sh$''',
+]
+regexTarget = "line"
+regexes = [
+    '''curl[^\n]*\$\{?[A-Za-z_][A-Za-z0-9_]*''',
 ]
