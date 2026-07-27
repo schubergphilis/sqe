@@ -400,12 +400,114 @@ impl Default for ShuffleManager {
     }
 }
 
+// ───────────────────────────── Bounded partition groups ───────────────────────
+
+/// Default cap on simultaneous materialised partition-slice bytes when grouping
+/// (`partition_grouped`). Tuned for laptop 64 MiB workers; callers with a
+/// known shuffle sub-budget should pass that instead.
+pub const DEFAULT_PARTITION_GROUP_BYTES: usize = 4 * 1024 * 1024;
+
+/// Approximate logical size of a partition slice with `n_rows` out of
+/// `batch.num_rows()` total (pro-rata of `get_array_memory_size`).
+fn approx_slice_bytes(batch: &RecordBatch, n_rows: usize) -> usize {
+    if batch.num_rows() == 0 || n_rows == 0 {
+        return 0;
+    }
+    let total = batch.get_array_memory_size();
+    // Ceiling division so a non-empty slice is never estimated as zero.
+    total
+        .saturating_mul(n_rows)
+        .div_ceil(batch.num_rows())
+        .max(1)
+}
+
+/// Materialise non-empty partition slices for the given partition IDs only.
+fn take_partitions(
+    batch: &RecordBatch,
+    partition_indices: &[Vec<u32>],
+    partition_ids: &[usize],
+) -> anyhow::Result<Vec<(u32, RecordBatch)>> {
+    let mut result = Vec::with_capacity(partition_ids.len());
+    for &pid in partition_ids {
+        let indices = &partition_indices[pid];
+        if indices.is_empty() {
+            continue;
+        }
+        let indices_array = UInt32Array::from(indices.clone());
+        let taken_columns: Vec<_> = batch
+            .columns()
+            .iter()
+            .map(|col| {
+                arrow::compute::take(col.as_ref(), &indices_array, None)
+                    .map_err(|e| anyhow::anyhow!("take failed: {e}"))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let partition_batch = RecordBatch::try_new(batch.schema(), taken_columns)?;
+        result.push((pid as u32, partition_batch));
+    }
+    Ok(result)
+}
+
+/// Pack non-empty partition IDs into groups whose approximate materialised
+/// size stays under `max_group_bytes`. A single partition that alone exceeds
+/// the cap still forms its own group (cannot split further without row
+/// slicing).
+fn group_partition_ids(
+    batch: &RecordBatch,
+    partition_indices: &[Vec<u32>],
+    max_group_bytes: usize,
+) -> Vec<Vec<usize>> {
+    let cap = max_group_bytes.max(1);
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    let mut current: Vec<usize> = Vec::new();
+    let mut current_bytes = 0usize;
+
+    for (pid, indices) in partition_indices.iter().enumerate() {
+        if indices.is_empty() {
+            continue;
+        }
+        let slice_bytes = approx_slice_bytes(batch, indices.len());
+        if !current.is_empty() && current_bytes.saturating_add(slice_bytes) > cap {
+            groups.push(std::mem::take(&mut current));
+            current_bytes = 0;
+        }
+        current.push(pid);
+        current_bytes = current_bytes.saturating_add(slice_bytes);
+    }
+    if !current.is_empty() {
+        groups.push(current);
+    }
+    groups
+}
+
+/// Materialise partition slices in bounded groups so peak concurrent output
+/// is approximately `max_group_bytes` rather than the full fan-out of all
+/// partitions at once.
+fn materialise_partition_groups(
+    batch: &RecordBatch,
+    partition_indices: Vec<Vec<u32>>,
+    max_group_bytes: usize,
+) -> anyhow::Result<Vec<Vec<(u32, RecordBatch)>>> {
+    let id_groups = group_partition_ids(batch, &partition_indices, max_group_bytes);
+    let mut out = Vec::with_capacity(id_groups.len());
+    for ids in id_groups {
+        let group = take_partitions(batch, &partition_indices, &ids)?;
+        if !group.is_empty() {
+            out.push(group);
+        }
+    }
+    Ok(out)
+}
+
 // ───────────────────────────── HashPartitioner ────────────────────────────────
 
 /// Splits a RecordBatch by hashing key columns modulo the number of partitions.
 ///
 /// Uses DataFusion's `create_hashes()` for consistent hashing, then
 /// `arrow::compute::take()` to extract rows for each partition.
+///
+/// Prefer [`Self::partition_grouped`] when the fan-out would materialise more
+/// partition slices than the shuffle byte budget can hold at once.
 pub struct HashPartitioner {
     /// Column names to hash on.
     key_columns: Vec<String>,
@@ -422,20 +524,45 @@ impl HashPartitioner {
         }
     }
 
+    pub fn num_partitions(&self) -> usize {
+        self.num_partitions
+    }
+
     /// Partition a RecordBatch by hashing the key columns.
     ///
     /// Returns a Vec of (partition_id, RecordBatch) pairs. Empty partitions
-    /// are omitted from the result.
+    /// are omitted from the result. Equivalent to a single group from
+    /// [`Self::partition_grouped`] with an unbounded group size.
     pub fn partition(&self, batch: &RecordBatch) -> anyhow::Result<Vec<(u32, RecordBatch)>> {
+        let groups = self.partition_grouped(batch, usize::MAX)?;
+        Ok(groups.into_iter().flatten().collect())
+    }
+
+    /// Hash-partition one input batch, materialising output slices in groups
+    /// whose approximate combined size stays under `max_group_bytes`.
+    ///
+    /// Assignment (hashes + row indices) is computed once for the whole batch;
+    /// only `take()` materialisation is grouped so peak concurrent output
+    /// memory is bounded.
+    pub fn partition_grouped(
+        &self,
+        batch: &RecordBatch,
+        max_group_bytes: usize,
+    ) -> anyhow::Result<Vec<Vec<(u32, RecordBatch)>>> {
         if batch.num_rows() == 0 {
             return Ok(vec![]);
         }
 
         if self.num_partitions == 1 {
-            return Ok(vec![(0, batch.clone())]);
+            return Ok(vec![vec![(0, batch.clone())]]);
         }
 
-        // Extract key column arrays as ArrayRef
+        let partition_indices = self.assign_rows(batch)?;
+        materialise_partition_groups(batch, partition_indices, max_group_bytes)
+    }
+
+    /// Assign each row to a partition id (no materialisation).
+    fn assign_rows(&self, batch: &RecordBatch) -> anyhow::Result<Vec<Vec<u32>>> {
         let key_arrays: Vec<ArrayRef> = self
             .key_columns
             .iter()
@@ -447,10 +574,9 @@ impl HashPartitioner {
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
 
-        // Compute hashes for all rows using DataFusion's hasher.
         // DF 54 switched the hash backend from ahash to foldhash; `RandomState` is now
-        // an alias for `foldhash::fast::FixedState`. We use a fixed (seed-0) state so the
-        // shuffle is deterministic across all nodes, matching DF's own REPARTITION_RANDOM_STATE.
+        // an alias for `foldhash::fast::FixedState`. Fixed seed-0 state keeps the
+        // shuffle deterministic across nodes (DF REPARTITION_RANDOM_STATE).
         let mut hashes = vec![0u64; batch.num_rows()];
         create_hashes(
             &key_arrays,
@@ -458,42 +584,13 @@ impl HashPartitioner {
             &mut hashes,
         )?;
 
-        // Assign rows to partitions: hash % num_partitions
         let num_partitions = self.num_partitions as u64;
-        let partition_assignments: Vec<u32> = hashes
-            .iter()
-            .map(|h| (h % num_partitions) as u32)
-            .collect();
-
-        // Build per-partition row indices
         let mut partition_indices: Vec<Vec<u32>> = vec![Vec::new(); self.num_partitions];
-        for (row_idx, &partition_id) in partition_assignments.iter().enumerate() {
-            partition_indices[partition_id as usize].push(row_idx as u32);
+        for (row_idx, h) in hashes.iter().enumerate() {
+            let partition_id = (h % num_partitions) as usize;
+            partition_indices[partition_id].push(row_idx as u32);
         }
-
-        // Split the batch by partition using take()
-        let mut result = Vec::new();
-        for (partition_id, indices) in partition_indices.into_iter().enumerate() {
-            if indices.is_empty() {
-                continue;
-            }
-            let indices_array = UInt32Array::from(indices);
-
-            // Use arrow::compute::take on each column
-            let taken_columns: Vec<_> = batch
-                .columns()
-                .iter()
-                .map(|col| {
-                    arrow::compute::take(col.as_ref(), &indices_array, None)
-                        .map_err(|e| anyhow::anyhow!("take failed: {e}"))
-                })
-                .collect::<anyhow::Result<Vec<_>>>()?;
-
-            let partition_batch = RecordBatch::try_new(batch.schema(), taken_columns)?;
-            result.push((partition_id as u32, partition_batch));
-        }
-
-        Ok(result)
+        Ok(partition_indices)
     }
 }
 
@@ -530,29 +627,45 @@ impl RangePartitioner {
         }
     }
 
+    pub fn num_partitions(&self) -> usize {
+        self.num_partitions
+    }
+
     /// Partition a RecordBatch by range on the key column.
     ///
     /// Returns a Vec of (partition_id, RecordBatch) pairs. Empty partitions
-    /// are omitted.
+    /// are omitted. Equivalent to unbounded [`Self::partition_grouped`].
     pub fn partition(&self, batch: &RecordBatch) -> anyhow::Result<Vec<(u32, RecordBatch)>> {
+        let groups = self.partition_grouped(batch, usize::MAX)?;
+        Ok(groups.into_iter().flatten().collect())
+    }
+
+    /// Range-partition one input batch with bounded materialisation groups
+    /// (same contract as [`HashPartitioner::partition_grouped`]).
+    pub fn partition_grouped(
+        &self,
+        batch: &RecordBatch,
+        max_group_bytes: usize,
+    ) -> anyhow::Result<Vec<Vec<(u32, RecordBatch)>>> {
         if batch.num_rows() == 0 {
             return Ok(vec![]);
         }
 
         if self.num_partitions == 1 {
-            return Ok(vec![(0, batch.clone())]);
+            return Ok(vec![vec![(0, batch.clone())]]);
         }
 
-        // Extract the key column
-        let key_col = batch
-            .column_by_name(&self.key_column)
-            .ok_or_else(|| {
-                anyhow::anyhow!("Key column '{}' not found in batch", self.key_column)
-            })?;
+        let partition_indices = self.assign_rows(batch)?;
+        materialise_partition_groups(batch, partition_indices, max_group_bytes)
+    }
 
-        // Downcast to Int64Array for binary search against i64 boundaries.
-        // For a production system, we'd support more types; for now Int64 covers
-        // the most common sort keys (timestamps, IDs, etc.).
+    fn assign_rows(&self, batch: &RecordBatch) -> anyhow::Result<Vec<Vec<u32>>> {
+        let key_col = batch.column_by_name(&self.key_column).ok_or_else(|| {
+            anyhow::anyhow!("Key column '{}' not found in batch", self.key_column)
+        })?;
+
+        // Int64 covers the common sort keys (timestamps, IDs). Wider type
+        // support can land without changing the grouping contract.
         let key_array = key_col
             .as_any()
             .downcast_ref::<arrow_array::Int64Array>()
@@ -563,38 +676,13 @@ impl RangePartitioner {
                 )
             })?;
 
-        // Assign each row to a partition via binary search
         let mut partition_indices: Vec<Vec<u32>> = vec![Vec::new(); self.num_partitions];
         for row_idx in 0..batch.num_rows() {
             let value = key_array.value(row_idx);
-            // Binary search: find first boundary > value
-            let partition_id = self
-                .boundaries
-                .partition_point(|b| *b <= value);
+            let partition_id = self.boundaries.partition_point(|b| *b <= value);
             partition_indices[partition_id].push(row_idx as u32);
         }
-
-        // Split the batch by partition
-        let mut result = Vec::new();
-        for (partition_id, indices) in partition_indices.into_iter().enumerate() {
-            if indices.is_empty() {
-                continue;
-            }
-            let indices_array = UInt32Array::from(indices);
-            let taken_columns: Vec<_> = batch
-                .columns()
-                .iter()
-                .map(|col| {
-                    arrow::compute::take(col.as_ref(), &indices_array, None)
-                        .map_err(|e| anyhow::anyhow!("take failed: {e}"))
-                })
-                .collect::<anyhow::Result<Vec<_>>>()?;
-
-            let partition_batch = RecordBatch::try_new(batch.schema(), taken_columns)?;
-            result.push((partition_id as u32, partition_batch));
-        }
-
-        Ok(result)
+        Ok(partition_indices)
     }
 }
 
@@ -1057,5 +1145,78 @@ mod tests {
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].0, 2); // Last partition
         assert_eq!(result[0].1.num_rows(), 3);
+    }
+
+    // ─── Bounded partition groups (Phase 4) ───
+
+    #[test]
+    fn hash_partition_grouped_preserves_all_rows() {
+        let batch = make_batch((0..64).collect(), vec!["x"; 64]);
+        let partitioner = HashPartitioner::new(vec!["id".to_string()], 16);
+        let flat = partitioner.partition(&batch).unwrap();
+        let groups = partitioner
+            .partition_grouped(&batch, 256) // tiny cap forces multiple groups
+            .unwrap();
+        assert!(
+            groups.len() > 1,
+            "expected multiple groups under tiny cap, got {}",
+            groups.len()
+        );
+        let grouped_rows: usize = groups
+            .iter()
+            .flat_map(|g| g.iter().map(|(_, b)| b.num_rows()))
+            .sum();
+        let flat_rows: usize = flat.iter().map(|(_, b)| b.num_rows()).sum();
+        assert_eq!(grouped_rows, 64);
+        assert_eq!(grouped_rows, flat_rows);
+
+        // Groups are non-empty and cover every non-empty partition exactly once.
+        let mut seen = std::collections::HashSet::new();
+        for g in &groups {
+            assert!(!g.is_empty());
+            for (pid, _) in g {
+                assert!(seen.insert(*pid), "partition {pid} appears in multiple groups");
+            }
+        }
+        assert_eq!(seen.len(), flat.len());
+    }
+
+    #[test]
+    fn hash_partition_grouped_unbounded_is_single_group() {
+        let batch = make_batch(vec![1, 2, 3, 4], vec!["a", "b", "c", "d"]);
+        let partitioner = HashPartitioner::new(vec!["id".to_string()], 4);
+        let groups = partitioner.partition_grouped(&batch, usize::MAX).unwrap();
+        assert_eq!(groups.len(), 1);
+        let flat_from_groups: Vec<_> = groups.into_iter().flatten().collect();
+        let flat = partitioner.partition(&batch).unwrap();
+        assert_eq!(flat_from_groups.len(), flat.len());
+    }
+
+    #[test]
+    fn range_partition_grouped_preserves_rows() {
+        let ids: Vec<i64> = (0..100).collect();
+        let names: Vec<&str> = vec!["n"; 100];
+        let batch = make_range_batch(ids, names);
+        let partitioner = RangePartitioner::new("id".to_string(), vec![25, 50, 75]);
+        let groups = partitioner.partition_grouped(&batch, 512).unwrap();
+        let rows: usize = groups
+            .iter()
+            .flat_map(|g| g.iter().map(|(_, b)| b.num_rows()))
+            .sum();
+        assert_eq!(rows, 100);
+        // With 4 partitions and a small cap we usually get >1 group.
+        assert!(!groups.is_empty());
+    }
+
+    #[test]
+    fn group_partition_ids_respects_byte_cap() {
+        // Two equal non-empty partitions; tiny cap forces one partition per group.
+        let batch = make_batch(vec![0, 1], vec!["a", "b"]);
+        // Force assignments: use enough partitions that each row likely lands alone.
+        let indices = vec![vec![0u32], vec![1u32], vec![]];
+        let groups = group_partition_ids(&batch, &indices, 1);
+        assert_eq!(groups.len(), 2, "each non-empty partition should be its own group");
+        assert_eq!(groups[0], vec![0]);
+        assert_eq!(groups[1], vec![1]);
     }
 }

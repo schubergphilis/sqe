@@ -718,18 +718,18 @@ Cancelled
 - [x] Add query, stage, partition, producer task, and attempt IDs to exchange
       descriptors.
 - [x] Implement `SpillablePartitionBuffer`.
-- [ ] Hash/range partition one bounded input batch at a time.
-- [ ] Avoid constructing all output partition batches simultaneously when the
+- [x] Hash/range partition one bounded input batch at a time.
+- [x] Avoid constructing all output partition batches simultaneously when the
       total would exceed the budget; process partition IDs in bounded groups.
 - [x] Spill at the soft watermark before a hard allocation failure.
 - [x] Stream committed spill segments to the downstream reader.
 - [x] Define completion manifests with rows, batches, logical bytes, physical
       bytes, and checksums.
 - [x] Reject late data from a losing/obsolete task attempt.
-- [ ] Propagate downstream cancellation to DoExchange intake and spill writers.
+- [x] Propagate downstream cancellation to DoExchange intake and spill writers.
 - [ ] Protect spill-read/merge headroom from scan and shuffle writers.
 - [x] Expose per-partition skew, resident bytes, spill bytes, and blocked time.
-- [ ] Test multiple concurrent producers and one slow consumer.
+- [x] Test multiple concurrent producers and one slow consumer.
 - [ ] Test worker shutdown, disk-full, corrupted segment, duplicate attempt,
       and cancellation.
 
