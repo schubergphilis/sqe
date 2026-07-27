@@ -1,6 +1,8 @@
 use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
+use arrow_array::RecordBatch;
 use arrow_flight::decode::FlightRecordBatchStream;
 use arrow_flight::encode::FlightDataEncoderBuilder;
 use arrow_flight::flight_service_server::{FlightService, FlightServiceServer};
@@ -21,11 +23,71 @@ use sqe_metrics::WorkerMetricsRegistry;
 use sqe_metrics::propagation::extract_trace_context;
 use sqe_compaction::wire::{CompactGroupFrame, CompactGroupRequest};
 use sqe_planner::ScanTask;
+use sqe_spill::BytePermit;
 
 use crate::compaction::compact_file_group;
 use crate::credential_channel::{CredentialStore, RefreshableCredentials};
 use crate::executor;
 use crate::shuffle::{ExchangeDescriptor, ShuffleManager};
+
+/// Streams `RecordBatch`es into the Flight encoder while holding each batch's
+/// scan-budget permit until the encoder polls the next item (or the stream
+/// ends / is dropped on client disconnect).
+///
+/// This is the Phase 1 `AccountedFlightStream` ownership wrapper: Arrow
+/// residency is charged until encoding no longer needs the batch, then the
+/// permit drops. Encoded FlightData is metered separately via the inflight
+/// gauge on the outer map.
+struct AccountedEncodeStream<S> {
+    inner: Pin<Box<S>>,
+    /// Permit for the batch most recently yielded to the encoder.
+    held_permit: Option<BytePermit>,
+    metrics: Arc<WorkerMetricsRegistry>,
+}
+
+impl<S> Stream for AccountedEncodeStream<S>
+where
+    S: Stream<Item = Result<executor::AccountedBatch, arrow_flight::error::FlightError>>,
+{
+    type Item = Result<RecordBatch, arrow_flight::error::FlightError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        // Release the previous batch's permit only when the encoder asks for
+        // the next one (or when we see end-of-stream below).
+        match Pin::new(&mut self.inner).poll_next(cx) {
+            Poll::Ready(Some(Ok(accounted))) => {
+                let charged = accounted.charged_bytes();
+                let (batch, permit) = accounted.into_parts();
+                // Drop the previous permit now that the encoder has finished
+                // with that batch (it polled for the next).
+                self.held_permit = Some(permit);
+                self.metrics
+                    .flight_encode_resident_bytes
+                    .set(charged as f64);
+                Poll::Ready(Some(Ok(batch)))
+            }
+            Poll::Ready(Some(Err(e))) => {
+                self.held_permit = None;
+                self.metrics.flight_encode_resident_bytes.set(0.0);
+                Poll::Ready(Some(Err(e)))
+            }
+            Poll::Ready(None) => {
+                self.held_permit = None;
+                self.metrics.flight_encode_resident_bytes.set(0.0);
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl<S> Drop for AccountedEncodeStream<S> {
+    fn drop(&mut self) {
+        // Client disconnect / cancellation: release any held encode permit.
+        self.held_permit = None;
+        self.metrics.flight_encode_resident_bytes.set(0.0);
+    }
+}
 
 /// Build [`IpcWriteOptions`] for a given compression setting.
 fn ipc_options_for(compression: FlightCompression) -> Result<IpcWriteOptions, Status> {
@@ -400,25 +462,19 @@ impl FlightService for WorkerFlightService {
             // Stream lifetime carries the guard; once the encoder finishes
             // (or the client disconnects mid-stream) the guard drops and the
             // credential entry is removed via `tokio::spawn`.
-            // Surface encode-side residency while batches move from the scan
-            // queue into the Flight encoder. Phase 1 replaces this with true
-            // AccountedFlightStream ownership permits.
-            let encode_metrics = metrics.clone();
+            // AccountedFlightStream: retain each batch's scan-budget permit
+            // until the Flight encoder polls for the next batch (or the
+            // client disconnects and the stream drops).
             let mapped_stream = batch_stream
-                .map(move |item| match item {
-                    Ok(batch) => {
-                        encode_metrics
-                            .flight_encode_resident_bytes
-                            .set(batch.get_array_memory_size() as f64);
-                        Ok(batch)
-                    }
+                .map(|item| match item {
+                    Ok(accounted) => Ok(accounted),
                     Err(e) => Err(arrow_flight::error::FlightError::from_external_error(
                         Box::new(std::io::Error::other(e.to_string())),
                     )),
                 })
                 .chain(stream::once(async move {
                     drop(cleanup_guard);
-                    Err::<arrow_array::RecordBatch, arrow_flight::error::FlightError>(
+                    Err::<executor::AccountedBatch, arrow_flight::error::FlightError>(
                         arrow_flight::error::FlightError::from_external_error(
                             Box::new(std::io::Error::other("__SQE_CLEANUP_SENTINEL__")),
                         ),
@@ -432,17 +488,21 @@ impl FlightService for WorkerFlightService {
                     }
                 });
 
+            let batch_for_encoder = AccountedEncodeStream {
+                inner: Box::pin(mapped_stream),
+                held_permit: None,
+                metrics: metrics.clone(),
+            };
+
             let schema_arc = Arc::new((*schema).clone());
             let ipc_opts = ipc_options_for(flight_compression)?;
             let flight_metrics = metrics.clone();
             let flight_stream = FlightDataEncoderBuilder::new()
                 .with_schema(schema_arc)
                 .with_options(ipc_opts)
-                .build(mapped_stream)
+                .build(batch_for_encoder)
                 .map(move |item| {
                     if let Ok(ref flight_data) = item {
-                        // FlightData body length is the best Phase 0 proxy for
-                        // encoded bytes awaiting gRPC release.
                         let n = flight_data.data_body.len() + flight_data.data_header.len();
                         flight_metrics.flight_inflight_bytes.set(n as f64);
                     }

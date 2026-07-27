@@ -20,6 +20,7 @@ sqe-catalog = { path = "../sqe-catalog" }
 sqe-planner = { path = "../sqe-planner" }
 sqe-compaction = { path = "../sqe-compaction" }
 sqe-metrics = { path = "../sqe-metrics" }
+sqe-spill = { path = "../sqe-spill" }
 iceberg = { workspace = true }
 datafusion = { workspace = true }
 datafusion-proto = { workspace = true }

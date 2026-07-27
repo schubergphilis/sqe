@@ -481,29 +481,29 @@ while keeping resident scan and Flight buffers within configured budgets.
 - Modify: `crates/sqe-core/src/config.rs`
 - Modify: configuration documentation and examples
 
-- [ ] Implement and unit-test `ByteBudget`, including rounding, cancellation,
+- [x] Implement and unit-test `ByteBudget`, including rounding, cancellation,
       oversized items, fairness, and permit release on error/panic unwind.
-- [ ] Implement `Accounted<T>` and tests proving moves do not change the
+- [x] Implement `Accounted<T>` and tests proving moves do not change the
       charge and `Drop` releases it exactly once.
-- [ ] Remove the fragment-lifetime cumulative `reservation.try_grow(...)`
+- [x] Remove the fragment-lifetime cumulative `reservation.try_grow(...)`
       behavior from `execute_scan_streaming`.
-- [ ] Charge fetched compressed bytes only while the fetch buffer is resident.
-- [ ] Charge decoded Arrow batches by `get_array_memory_size()` while owned by
+- [x] Charge fetched compressed bytes only while the fetch buffer is resident.
+- [x] Charge decoded Arrow batches by `get_array_memory_size()` while owned by
       the worker pipeline.
-- [ ] Replace `mpsc<RecordBatch>(16)` with a byte-admitted
+- [x] Replace `mpsc<RecordBatch>(16)` with a byte-admitted
       `mpsc<Accounted<RecordBatch>>`; keep a small item cap only as a secondary
       scheduling guard.
-- [ ] Implement an `AccountedFlightStream` or equivalent encoder ownership
+- [x] Implement an `AccountedFlightStream` or equivalent encoder ownership
       wrapper. It must retain the Arrow permit while encoding and charge
       encoded `FlightData` until gRPC releases/sends it.
-- [ ] Ensure cancellation or client disconnect drops queued and encoding
+- [x] Ensure cancellation or client disconnect drops queued and encoding
       permits immediately.
 - [ ] Keep decode concurrency and byte admission separate: concurrency protects
       CPU; byte admission protects RAM.
 - [ ] Add process-headroom startup validation against cgroup/container memory
       where available.
-- [ ] Add a slow-consumer integration test with wide rows.
-- [ ] Turn the Phase 0 zero-pruning scan test green.
+- [x] Add a slow-consumer integration test with wide rows.
+- [x] Turn the Phase 0 zero-pruning scan test green.
 
 **Important implementation note:** Do not release an Arrow permit merely when
 the batch is removed from the scan queue. Ownership has moved to the encoder,

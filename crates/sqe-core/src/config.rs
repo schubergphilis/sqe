@@ -763,6 +763,52 @@ impl TlsConfig {
     }
 }
 
+/// Sub-budget configuration for worker memory admission (bounded-memory plan).
+///
+/// All sizes are human-readable (`"2GB"`, `"512MB"`). Empty / default values
+/// are resolved as fractions of [`WorkerConfig::memory_limit`] at startup so
+/// existing configs keep working. Sub-budget sum must not exceed the tracked
+/// worker limit (validated in `SqeConfig::validate`).
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct WorkerMemoryConfig {
+    /// Reserved for the Rust runtime, allocator fragmentation, gRPC, and
+    /// control-plane traffic. Not charged to DataFusion; used for cgroup /
+    /// process headroom validation. Default: `"2GB"`.
+    #[serde(default = "default_process_headroom")]
+    pub process_headroom: String,
+    /// Byte budget for decoded scan batches in the worker pipeline. Default:
+    /// 25% of `worker.memory_limit`.
+    #[serde(default)]
+    pub scan_budget: String,
+    /// Byte budget for Flight encode / in-flight encoded data. Default: 12.5%
+    /// of `worker.memory_limit`.
+    #[serde(default)]
+    pub flight_budget: String,
+    /// Byte budget for blocking operator state (joins/aggs/sorts). Default:
+    /// 50% of `worker.memory_limit`.
+    #[serde(default)]
+    pub operator_budget: String,
+    /// Byte budget for shuffle partition buffers. Default: 12.5% of
+    /// `worker.memory_limit`.
+    #[serde(default)]
+    pub shuffle_memory_budget: String,
+    /// Byte budget for spill I/O read/write buffers. Default: remainder, at
+    /// least 64 MiB when the limit allows.
+    #[serde(default)]
+    pub spill_io_budget: String,
+    /// Accounting unit for [`sqe_spill::ByteBudget`]. Default: `"64KB"`.
+    #[serde(default = "default_budget_granularity")]
+    pub budget_granularity: String,
+}
+
+fn default_process_headroom() -> String {
+    "2GB".to_string()
+}
+
+fn default_budget_granularity() -> String {
+    "64KB".to_string()
+}
+
 #[derive(Deserialize, Clone)]
 pub struct WorkerConfig {
     #[serde(default)]
@@ -783,6 +829,10 @@ pub struct WorkerConfig {
     pub heartbeat_interval_secs: u64,
     #[serde(default = "default_memory")]
     pub memory_limit: String,
+    /// Sub-budgets for scan / Flight / operators / shuffle / spill I/O.
+    /// See [`WorkerMemoryConfig`].
+    #[serde(default)]
+    pub memory: WorkerMemoryConfig,
     #[serde(default = "default_true")]
     pub spill_to_disk: bool,
     #[serde(default = "default_spill_dir")]
@@ -816,12 +866,80 @@ impl Default for WorkerConfig {
             advertise_url: String::new(),
             heartbeat_interval_secs: default_heartbeat(),
             memory_limit: default_memory(),
+            memory: WorkerMemoryConfig::default(),
             spill_to_disk: true,
             spill_dir: default_spill_dir(),
             scan_timeout_secs: default_scan_timeout(),
             worker_secret: String::new(),
             allow_unauthenticated: false,
         }
+    }
+}
+
+impl WorkerMemoryConfig {
+    /// Resolve sub-budgets into absolute byte sizes given the worker tracked
+    /// limit. Empty fields fall back to fractions of `memory_limit_bytes`.
+    pub fn resolve_bytes(&self, memory_limit_bytes: usize) -> crate::error::Result<ResolvedWorkerMemory> {
+        let parse_or = |raw: &str, fallback: usize| -> crate::error::Result<usize> {
+            if raw.is_empty() {
+                Ok(fallback)
+            } else {
+                parse_memory_limit(raw)
+            }
+        };
+
+        // Fractions of the tracked limit. Defaults sum to 100% so an empty
+        // [worker.memory] table always validates.
+        // scan 20% + flight 10% + operator 40% + shuffle 20% + spill_io 10%.
+        let scan = parse_or(&self.scan_budget, memory_limit_bytes / 5)?;
+        let flight = parse_or(&self.flight_budget, memory_limit_bytes / 10)?;
+        let operator = parse_or(&self.operator_budget, (memory_limit_bytes * 2) / 5)?;
+        let shuffle = parse_or(&self.shuffle_memory_budget, memory_limit_bytes / 5)?;
+        let spill_fallback = memory_limit_bytes
+            .saturating_sub(scan + flight + operator + shuffle)
+            .max(memory_limit_bytes / 10);
+        let spill_io = parse_or(&self.spill_io_budget, spill_fallback)?;
+        let headroom = parse_or(
+            &self.process_headroom,
+            parse_memory_limit("2GB").unwrap_or(2 * 1024 * 1024 * 1024),
+        )?;
+        let granularity = parse_or(
+            &self.budget_granularity,
+            parse_memory_limit("64KB").unwrap_or(64 * 1024),
+        )?;
+
+        Ok(ResolvedWorkerMemory {
+            process_headroom: headroom,
+            scan_budget: scan,
+            flight_budget: flight,
+            operator_budget: operator,
+            shuffle_memory_budget: shuffle,
+            spill_io_budget: spill_io,
+            budget_granularity: granularity.max(1),
+        })
+    }
+}
+
+/// Absolute byte sizes resolved from [`WorkerMemoryConfig`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolvedWorkerMemory {
+    pub process_headroom: usize,
+    pub scan_budget: usize,
+    pub flight_budget: usize,
+    pub operator_budget: usize,
+    pub shuffle_memory_budget: usize,
+    pub spill_io_budget: usize,
+    pub budget_granularity: usize,
+}
+
+impl ResolvedWorkerMemory {
+    /// Sum of chargeable sub-budgets (excludes process headroom).
+    pub fn chargeable_sum(&self) -> usize {
+        self.scan_budget
+            + self.flight_budget
+            + self.operator_budget
+            + self.shuffle_memory_budget
+            + self.spill_io_budget
     }
 }
 
@@ -836,6 +954,7 @@ impl std::fmt::Debug for WorkerConfig {
             .field("advertise_url", &self.advertise_url)
             .field("heartbeat_interval_secs", &self.heartbeat_interval_secs)
             .field("memory_limit", &self.memory_limit)
+            .field("memory", &self.memory)
             .field("spill_to_disk", &self.spill_to_disk)
             .field("spill_dir", &self.spill_dir)
             .field("scan_timeout_secs", &self.scan_timeout_secs)
@@ -4406,9 +4525,49 @@ fn validate_byte_sizes(config: &SqeConfig, errors: &mut Vec<String>) {
 
     check("coordinator.memory_limit", &config.coordinator.memory_limit);
     check("worker.memory_limit", &config.worker.memory_limit);
+    check(
+        "worker.memory.process_headroom",
+        &config.worker.memory.process_headroom,
+    );
+    check("worker.memory.scan_budget", &config.worker.memory.scan_budget);
+    check(
+        "worker.memory.flight_budget",
+        &config.worker.memory.flight_budget,
+    );
+    check(
+        "worker.memory.operator_budget",
+        &config.worker.memory.operator_budget,
+    );
+    check(
+        "worker.memory.shuffle_memory_budget",
+        &config.worker.memory.shuffle_memory_budget,
+    );
+    check(
+        "worker.memory.spill_io_budget",
+        &config.worker.memory.spill_io_budget,
+    );
+    check(
+        "worker.memory.budget_granularity",
+        &config.worker.memory.budget_granularity,
+    );
     check("storage.coalesce_threshold", &config.storage.coalesce_threshold);
     check("storage.footer_cache_size", &config.storage.footer_cache_size);
     check("storage.prefetch_buffer", &config.storage.prefetch_buffer);
+
+    // Sub-budgets must not sum above the worker tracked limit (they share one
+    // MemoryPool). Empty fields use resolve defaults.
+    if let Ok(limit) = parse_memory_limit(&config.worker.memory_limit) {
+        if let Ok(resolved) = config.worker.memory.resolve_bytes(limit) {
+            let sum = resolved.chargeable_sum();
+            if sum > limit {
+                errors.push(format!(
+                    "worker.memory sub-budgets sum to {sum} bytes which exceeds \
+                     worker.memory_limit ({limit} bytes); reduce scan/flight/\
+                     operator/shuffle/spill_io budgets"
+                ));
+            }
+        }
+    }
 }
 
 /// Extract the OAuth2 `client_id` from an `AuthProviderConfig` variant that

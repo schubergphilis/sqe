@@ -6732,6 +6732,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "sqe-spill"
+version = "0.37.0"
+dependencies = [
+ "datafusion",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "sqe-sql"
 version = "0.37.0"
 dependencies = [
@@ -6824,6 +6834,7 @@ dependencies = [
  "sqe-core",
  "sqe-metrics",
  "sqe-planner",
+ "sqe-spill",
  "subtle",
  "tempfile",
  "tokio",
