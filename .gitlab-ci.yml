@@ -42,6 +42,23 @@ variables:
 aikido-build:
   timeout: 3h
 
+# Exclude demo/quickstart Python trees from the source SBOM so commercial
+# EULA packages (dlthub) and docs samples are not license-gated as product deps.
+# Also keep syft focused on the engine workspace.
+aikido-sbom:
+  script:
+    - |
+      set -euo pipefail
+      syft "dir:$CI_PROJECT_DIR" \
+        --source-name "$CI_PROJECT_NAME" \
+        --source-version "$CI_COMMIT_SHORT_SHA" \
+        --exclude '**/quickstart/**' \
+        --exclude '**/docs/**' \
+        --exclude '**/adapters/**' \
+        --exclude '**/target/**' \
+        -o "cyclonedx-json@1.6=$AIKIDO_SBOM"
+      python3 "$AIKIDO_HOME/scripts/sbom_enrich.py" --sbom "$AIKIDO_SBOM" --asset "$CI_PROJECT_DIR/.asset"
+
 # Policy is baked into AIKIDO_TOOLS_IMAGE; override the license job to clone a
 # live policy ref so CDLA / r-efi / first-party Apache evidence apply before
 # the next tools image rebuild.
