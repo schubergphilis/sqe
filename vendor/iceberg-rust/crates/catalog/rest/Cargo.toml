@@ -25,7 +25,7 @@ version = { workspace = true }
 categories = ["database"]
 description = "Apache Iceberg Rust REST API"
 keywords = ["iceberg", "rest", "catalog"]
-license = { workspace = true }
+license = "Apache-2.0"
 repository = { workspace = true }
 
 [features]
