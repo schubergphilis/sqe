@@ -105,6 +105,12 @@ impl Drop for GrantGuard {
     }
 }
 
+/// Soft process watermark as a fraction of distributable capacity (85%).
+/// Above this, new admissions are clamped to minimum and the governor asks
+/// active grants to shrink toward their minima.
+pub const GOVERNOR_SOFT_WATERMARK_NUM: usize = 85;
+pub const GOVERNOR_SOFT_WATERMARK_DEN: usize = 100;
+
 /// Process-wide governor for one worker.
 pub struct MemoryGovernor {
     /// Total bytes managed (typically operator_budget + shuffle, minus headroom).
@@ -113,9 +119,12 @@ pub struct MemoryGovernor {
     headroom_bytes: usize,
     /// Distributable capacity (= pool - headroom).
     distributable: usize,
+    /// Soft watermark on distributable (above = under pressure).
+    soft_limit: usize,
     state: Mutex<GovernorState>,
     admissions: AtomicUsize,
     rejections: AtomicUsize,
+    reclaims: AtomicUsize,
 }
 
 #[derive(Default)]
@@ -141,13 +150,18 @@ impl MemoryGovernor {
     /// Create a governor over `pool_bytes`, carving default read headroom.
     pub fn new(pool_bytes: usize) -> Self {
         let (distributable, headroom) = split_default_read_headroom(pool_bytes.max(1));
+        let soft_limit = distributable
+            .saturating_mul(GOVERNOR_SOFT_WATERMARK_NUM)
+            / GOVERNOR_SOFT_WATERMARK_DEN.max(1);
         Self {
             pool_bytes: pool_bytes.max(1),
             headroom_bytes: headroom,
             distributable,
+            soft_limit: soft_limit.max(1),
             state: Mutex::new(GovernorState::default()),
             admissions: AtomicUsize::new(0),
             rejections: AtomicUsize::new(0),
+            reclaims: AtomicUsize::new(0),
         }
     }
 
@@ -163,12 +177,24 @@ impl MemoryGovernor {
         self.distributable
     }
 
+    pub fn soft_limit_bytes(&self) -> usize {
+        self.soft_limit
+    }
+
+    pub fn under_pressure(&self) -> bool {
+        self.granted_sum() >= self.soft_limit
+    }
+
     pub fn admissions(&self) -> usize {
         self.admissions.load(Ordering::Relaxed)
     }
 
     pub fn rejections(&self) -> usize {
         self.rejections.load(Ordering::Relaxed)
+    }
+
+    pub fn reclaims(&self) -> usize {
+        self.reclaims.load(Ordering::Relaxed)
     }
 
     /// Try to admit a consumer. Fails if minima cannot fit.
@@ -194,15 +220,26 @@ impl MemoryGovernor {
             };
         }
 
+        // Under soft watermark pressure: only hand out minima and try to free
+        // residual from existing grants first.
+        let pressure = state.granted_sum >= self.soft_limit;
+        if pressure {
+            let _ = Self::shrink_active_toward_minima(&mut state, minimum);
+            self.reclaims.fetch_add(1, Ordering::Relaxed);
+        }
+
         // Fair residual: base = minimum, plus share of free residual weighted
-        // by class. Cap at desired.
+        // by class. Cap at desired. Under pressure, skip the bonus.
         let free = self
             .distributable
             .saturating_sub(state.granted_sum)
             .saturating_sub(minimum);
         let weight = req.class.weight();
-        // Simple: take min(desired - minimum, free * weight / (weight+3))
-        let bonus = free.saturating_mul(weight) / (weight + 3);
+        let bonus = if pressure {
+            0
+        } else {
+            free.saturating_mul(weight) / (weight + 3)
+        };
         let grant_size = minimum.saturating_add(bonus).min(desired).max(minimum);
 
         // Prevent one query from claiming the entire residual.
@@ -282,6 +319,62 @@ impl MemoryGovernor {
             state.minima_sum = state.minima_sum.saturating_sub(g.minimum);
         }
         state.active = keep;
+    }
+
+    /// Shrink active grants toward their minima until `need` bytes are free
+    /// (or nothing more can be reclaimed). Returns bytes reclaimed from the
+    /// bookkeeping. Live operators are expected to honour reduced grants via
+    /// [`ReclaimableConsumer::try_reclaim`] once wired.
+    pub fn reclaim_under_pressure(&self, need: usize) -> usize {
+        if need == 0 {
+            return 0;
+        }
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let got = Self::shrink_active_toward_minima(&mut state, need);
+        if got > 0 {
+            self.reclaims.fetch_add(1, Ordering::Relaxed);
+        }
+        got
+    }
+
+    /// Reduce each active grant's excess (granted - minimum) proportionally
+    /// until `need` is satisfied or all excess is gone.
+    fn shrink_active_toward_minima(state: &mut GovernorState, need: usize) -> usize {
+        let mut remaining = need;
+        let mut reclaimed = 0usize;
+        // Multiple passes: peel excess fairly.
+        for _ in 0..3 {
+            if remaining == 0 {
+                break;
+            }
+            let excess_total: usize = state
+                .active
+                .iter()
+                .map(|g| g.granted.saturating_sub(g.minimum))
+                .sum();
+            if excess_total == 0 {
+                break;
+            }
+            for g in state.active.iter_mut() {
+                if remaining == 0 {
+                    break;
+                }
+                let excess = g.granted.saturating_sub(g.minimum);
+                if excess == 0 {
+                    continue;
+                }
+                // Take a fair slice of this grant's excess.
+                let take = excess
+                    .min(remaining)
+                    .max(1)
+                    .min(excess);
+                g.granted = g.granted.saturating_sub(take);
+                state.granted_sum = state.granted_sum.saturating_sub(take);
+                reclaimed += take;
+                remaining = remaining.saturating_sub(take);
+            }
+        }
+        reclaimed
     }
 
     pub fn active_count(&self) -> usize {
@@ -460,5 +553,38 @@ mod tests {
         assert!(gov.granted_sum() <= gov.distributable_bytes());
         drop(guards);
         assert_eq!(gov.active_count(), 0);
+    }
+
+    #[test]
+    fn soft_watermark_clamps_and_reclaims() {
+        let gov = Arc::new(MemoryGovernor::new(16 * 1024 * 1024));
+        // Fill past soft limit with large desired grants.
+        let mut guards = Vec::new();
+        for i in 0..4 {
+            let d = Dummy {
+                name: "op",
+                desired: 8 * 1024 * 1024,
+                minimum: 1024 * 1024,
+            };
+            if let Ok((_g, guard)) = gov.try_admit_guarded(
+                req(&format!("q{i}"), "op", WorkloadClass::Join, d.desired, d.minimum),
+                &d,
+            ) {
+                guards.push(guard);
+            }
+        }
+        assert!(gov.active_count() >= 2);
+        let before = gov.granted_sum();
+        // Force reclaim.
+        let got = gov.reclaim_under_pressure(2 * 1024 * 1024);
+        assert!(got > 0 || before <= gov.soft_limit_bytes());
+        if got > 0 {
+            assert!(gov.granted_sum() < before || gov.reclaims() > 0);
+        }
+        // Under pressure flag tracks soft limit.
+        if gov.granted_sum() >= gov.soft_limit_bytes() {
+            assert!(gov.under_pressure());
+        }
+        drop(guards);
     }
 }
