@@ -899,7 +899,7 @@ pub trait ReclaimableConsumer: Send + Sync {
 }
 ```
 
-- [ ] Reconcile with the existing machinery instead of stacking on it. The
+- [x] Reconcile with the existing machinery instead of stacking on it. The
       worker pool is a `FairSpillPool` today
       (`crates/sqe-worker/src/runtime.rs:41`), and dividing the pool by
       registered consumers already caused the documented TPC-DS q39 pool/N
@@ -908,16 +908,16 @@ pub trait ReclaimableConsumer: Send + Sync {
       and let the governor own grant arbitration. Coordinator pressure-based
       admission (`crates/sqe-coordinator/src/memory.rs`) and
       `query.per_user_memory_budget` stay as the cross-query layer above it.
-- [ ] Register every blocking consumer by query and workload class.
-- [ ] Guarantee minimum viable grants only when total minima fit.
-- [ ] Distribute remaining memory using weighted fair shares.
+- [x] Register every blocking consumer by query and workload class.
+- [x] Guarantee minimum viable grants only when total minima fit.
+- [x] Distribute remaining memory using weighted fair shares.
 - [ ] Reduce grants at a soft process/worker watermark.
 - [ ] Trigger asynchronous spill/repartition and wait for reclaimed bytes
       before admitting new large work.
-- [ ] Preserve spill read/merge and control-plane headroom.
-- [ ] Reject admission before execution when summed minima cannot fit.
-- [ ] Prevent one query with many plan nodes from claiming all grants.
-- [ ] Add concurrency tests with simultaneous joins, aggregates, sorts, and
+- [x] Preserve spill read/merge and control-plane headroom.
+- [x] Reject admission before execution when summed minima cannot fit.
+- [x] Prevent one query with many plan nodes from claiming all grants.
+- [x] Add concurrency tests with simultaneous joins, aggregates, sorts, and
       shuffle.
 
 **Gate:** Four concurrent larger-than-memory queries complete or are fairly

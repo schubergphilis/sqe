@@ -21,7 +21,7 @@ use prometheus::Counter;
 use sqe_catalog::FooterCache;
 use sqe_core::{parse_memory_limit, FlightCompression, SqeConfig};
 use sqe_metrics::WorkerMetricsRegistry;
-use sqe_spill::{LocalSegmentStore, SpillManager};
+use sqe_spill::{LocalSegmentStore, MemoryGovernor, SpillManager};
 
 use crate::advertise::derive_advertise_url;
 use crate::flight_service::WorkerFlightService;
@@ -58,6 +58,7 @@ pub fn build_worker_service(
 
     let spill_manager = build_spill_manager(config)?;
     let shuffle_budget = resolve_shuffle_budget(config);
+    let memory_governor = build_memory_governor(config);
 
     let mut service = WorkerFlightService::new(metrics, session_ctx)
         .with_scan_timeout(config.worker.scan_timeout_secs)
@@ -65,7 +66,8 @@ pub fn build_worker_service(
         .with_shuffle_compression(shuffle_compression)
         .with_footer_cache(footer_cache)
         .with_worker_secret(config.worker.worker_secret.clone())
-        .with_shuffle_memory_budget(shuffle_budget);
+        .with_shuffle_memory_budget(shuffle_budget)
+        .with_memory_governor(memory_governor);
     if let Some(sm) = spill_manager {
         service = service.with_spill_manager(sm);
     }
@@ -142,6 +144,36 @@ fn resolve_shuffle_budget(config: &SqeConfig) -> usize {
             (limit as usize / 8).max(64 * 1024)
         }
     }
+}
+
+/// Build the worker temporary-memory governor from operator + shuffle budgets.
+///
+/// Pool size = `operator_budget + shuffle_memory_budget` (chargeable blocking
+/// work). Scan/flight stay outside this pool for now; the governor carves its
+/// own spill-read/merge headroom from the pool.
+fn build_memory_governor(config: &SqeConfig) -> Arc<MemoryGovernor> {
+    let limit = parse_memory_limit(&config.worker.memory_limit).unwrap_or(8 * 1024 * 1024 * 1024);
+    let pool = match config.worker.memory.resolve_bytes(limit as usize) {
+        Ok(r) => r
+            .operator_budget
+            .saturating_add(r.shuffle_memory_budget)
+            .max(1024 * 1024),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "Failed to resolve memory sub-budgets for governor; using 50% of memory_limit"
+            );
+            (limit as usize / 2).max(1024 * 1024)
+        }
+    };
+    let gov = Arc::new(MemoryGovernor::new(pool));
+    tracing::info!(
+        pool_bytes = gov.pool_bytes(),
+        distributable = gov.distributable_bytes(),
+        headroom = gov.headroom_bytes(),
+        "Worker memory governor ready"
+    );
+    gov
 }
 
 /// Open a local [`SpillManager`] when spill is enabled, or `None` when disabled.
