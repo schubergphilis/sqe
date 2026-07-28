@@ -120,7 +120,12 @@ moka = { version = "0.12", features = ["future", "sync"] }
 governor = "0.8"
 
 # Auth
-jsonwebtoken = "11"
+# jsonwebtoken 11 ships NO crypto provider by default (`default = ["use_pem"]`);
+# exactly one of `rust_crypto` / `aws_lc_rs` must be selected or every
+# verification panics at runtime with "Could not automatically determine the
+# process-level CryptoProvider". `rust_crypto` keeps the JWT path pure Rust,
+# with no aws-lc-sys C toolchain dependency at build time.
+jsonwebtoken = { version = "11", features = ["rust_crypto"] }
 
 # Observability
 tracing = "0.1"
