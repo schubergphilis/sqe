@@ -30,7 +30,7 @@
 //! and Task 4 are expected to call `wire::sign` / `wire::verify` for the
 //! compaction RPC; the scan-ticket path is untouched.
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use subtle::ConstantTimeEq;

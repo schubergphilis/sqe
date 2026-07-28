@@ -1398,7 +1398,7 @@ impl ScalarUDFImpl for Checksum {
                 let mut hasher = Sha256::new();
                 hasher.update(format!("{:?}", v).as_bytes());
                 let result = hasher.finalize();
-                let hex = format!("{:x}", result).chars().take(16).collect::<String>();
+                let hex = hex::encode(result).chars().take(16).collect::<String>();
                 Ok(ColumnarValue::Scalar(ScalarValue::Utf8(Some(hex))))
             }
             ColumnarValue::Array(arr) => {
@@ -1414,7 +1414,7 @@ impl ScalarUDFImpl for Checksum {
                             let mut hasher = Sha256::new();
                             hasher.update(format!("{:?}", s).as_bytes());
                             let digest = hasher.finalize();
-                            format!("{:x}", digest).chars().take(16).collect::<String>()
+                            hex::encode(digest).chars().take(16).collect::<String>()
                         })
                     })
                     .collect();

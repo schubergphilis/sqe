@@ -216,7 +216,7 @@ pub async fn create_session_context(
     // the key: the same user+token opening two connections against different
     // catalogs/schemas builds distinct DataFusion default-catalog contexts and
     // must not collide in the cache.
-    let token_hash = format!("{:x}", Sha256::digest(session.access_token().expose_bytes()));
+    let token_hash = hex::encode(Sha256::digest(session.access_token().expose_bytes()));
     let cache_key = format!(
         "{}:{}:{}:{}",
         session.user.username,

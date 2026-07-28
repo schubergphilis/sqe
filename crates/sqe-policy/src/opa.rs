@@ -131,7 +131,7 @@ impl OpaStore {
         let roles_hash = {
             use sha2::{Digest, Sha256};
             let digest = Sha256::digest(roles_sorted.join(",").as_bytes());
-            format!("{:x}", digest).chars().take(16).collect::<String>()
+            hex::encode(digest).chars().take(16).collect::<String>()
         };
         format!("{}:{}:{}:{}", user.username, namespace, table, roles_hash)
     }

@@ -100,7 +100,7 @@ impl ResultCache {
         let normalized: String = sql.split_whitespace().collect::<Vec<_>>().join(" ").to_uppercase();
         let input = format!("{user}:{normalized}");
         let hash = Sha256::digest(input.as_bytes());
-        format!("{hash:x}")
+        hex::encode(hash)
     }
 
     /// Check if a query should bypass the cache (non-deterministic functions).

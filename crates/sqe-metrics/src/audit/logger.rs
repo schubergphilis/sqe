@@ -94,7 +94,7 @@ pub fn query_hash(sql: &str) -> String {
         .join(" ")
         .to_uppercase();
     let hash = Sha256::digest(normalised.as_bytes());
-    format!("{hash:x}")
+    hex::encode(hash)
 }
 
 /// Compute a chain hash over raw bytes: `sha256(prev_hash || body_bytes)`.
@@ -105,7 +105,7 @@ fn chain_hash_raw(prev_hash: &str, body: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(prev_hash.as_bytes());
     hasher.update(body);
-    format!("{:x}", hasher.finalize())
+    hex::encode(hasher.finalize())
 }
 
 /// Inject an `Integrity` block into a serialized JSON object string.
