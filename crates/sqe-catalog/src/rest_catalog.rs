@@ -660,7 +660,7 @@ impl SessionCatalog {
         let token_fingerprint = {
             use sha2::{Digest, Sha256};
             let hash = Sha256::digest(bearer_token.as_bytes());
-            format!("{:x}", hash)[..16].to_string()
+            hex::encode(hash)[..16].to_string()
         };
 
         info!(
@@ -853,7 +853,7 @@ impl SessionCatalog {
         let token_fingerprint = {
             use sha2::{Digest, Sha256};
             let hash = Sha256::digest(bearer_token.as_bytes());
-            format!("{:x}", hash)[..16].to_string()
+            hex::encode(hash)[..16].to_string()
         };
 
         info!(

@@ -45,11 +45,35 @@ use arrow_array::{Array, RecordBatch};
 use arrow_array::cast::AsArray;
 use arrow_schema::DataType;
 use datasketches::theta::ThetaSketch;
+
 use iceberg::io::FileIO;
 use iceberg::puffin::{APACHE_DATASKETCHES_THETA_V1, Blob, CompressionCodec, PuffinWriter};
 use iceberg::spec::{Schema as IcebergSchema, StatisticsFile};
 use iceberg::spec::BlobMetadata as SpecBlobMetadata;
 use tracing::{debug, warn};
+
+/// Canonicalize an f64 the way Java's `Double.doubleToLongBits` does, before
+/// feeding it to a theta sketch.
+///
+/// datasketches 0.2 provided `ThetaSketch::update_f64`, which applied this
+/// canonicalization internally "for compatibility with Java"; 0.3 removed both
+/// the typed update methods and the canonicalization, leaving only the generic
+/// `update<T: Hash>`. Puffin theta sketches are a persisted, cross-engine
+/// statistics format, so calling `update(value)` directly -- as rustc's
+/// suggestion for the removed method proposes -- would silently change the
+/// hashed bytes for -0.0 and NaN, disagreeing both with other DataSketches
+/// implementations and with sketches this engine wrote previously. Keep the
+/// 0.2 behaviour here, where the format requirement is visible.
+fn canonical_double(value: f64) -> i64 {
+    if value.is_nan() {
+        // Java's Double.doubleToLongBits() canonical NaN.
+        0x7ff8000000000000i64
+    } else {
+        // -0.0 + 0.0 == +0.0 under IEEE754 roundTiesToEven, which Rust
+        // guarantees, so this collapses signed zero branchlessly.
+        (value + 0.0).to_bits() as i64
+    }
+}
 
 /// Iceberg table property enabling Puffin NDV sidecar emission.
 pub const PROP_PUFFIN_STATS: &str = "write.puffin.stats";
@@ -204,7 +228,7 @@ fn feed_column_into_sketch(sketch: &mut ThetaSketch, column: &dyn Array) {
             let arr = column.as_primitive::<arrow_array::types::Float64Type>();
             for i in 0..arr.len() {
                 if arr.is_valid(i) {
-                    sketch.update_f64(arr.value(i));
+                    sketch.update(canonical_double(arr.value(i)));
                 }
             }
         }
@@ -212,7 +236,9 @@ fn feed_column_into_sketch(sketch: &mut ThetaSketch, column: &dyn Array) {
             let arr = column.as_primitive::<arrow_array::types::Float32Type>();
             for i in 0..arr.len() {
                 if arr.is_valid(i) {
-                    sketch.update_f32(arr.value(i));
+                    // datasketches 0.2 defined `update_f32(v)` as
+                    // `update_f64(v as f64)`; widen first to keep the same hash.
+                    sketch.update(canonical_double(f64::from(arr.value(i))));
                 }
             }
         }
@@ -364,6 +390,40 @@ pub async fn write_puffin_sidecar(
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+
+    /// Puffin theta sketches are a persisted, cross-engine format, so the f64
+    /// canonicalization must match Java's `Double.doubleToLongBits` exactly.
+    /// datasketches 0.3 dropped the `update_f64` that used to do this, so the
+    /// behaviour now lives in this crate and needs pinning.
+    #[test]
+    fn canonical_double_matches_java_bits() {
+        // Signed zero collapses: -0.0 and 0.0 must hash identically, or a
+        // column containing both would over-count distinct values.
+        assert_eq!(super::canonical_double(-0.0), super::canonical_double(0.0));
+        assert_eq!(super::canonical_double(0.0), 0i64);
+
+        // All NaNs map to Java's single canonical NaN bit pattern.
+        assert_eq!(super::canonical_double(f64::NAN), 0x7ff8000000000000i64);
+        assert_eq!(super::canonical_double(-f64::NAN), 0x7ff8000000000000i64);
+
+        // Ordinary values are raw IEEE754 bits, reinterpreted as i64.
+        assert_eq!(super::canonical_double(1.0), 1.0f64.to_bits() as i64);
+        assert_eq!(super::canonical_double(-2.5), (-2.5f64).to_bits() as i64);
+    }
+
+    /// datasketches 0.2 defined `update_f32(v)` as `update_f64(v as f64)`, so
+    /// widening before canonicalization is what preserves existing sketches.
+    #[test]
+    fn f32_widens_before_canonicalization() {
+        assert_eq!(
+            super::canonical_double(f64::from(1.5f32)),
+            super::canonical_double(1.5f64)
+        );
+        assert_eq!(
+            super::canonical_double(f64::from(-0.0f32)),
+            super::canonical_double(0.0f64)
+        );
+    }
 
     use arrow_array::{Int64Array, StringArray};
     use arrow_schema::{DataType as ArrowDataType, Field, Schema as ArrowSchema};

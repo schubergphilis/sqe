@@ -30,7 +30,9 @@ use std::collections::HashMap;
 
 use async_trait::async_trait;
 use chrono::Utc;
-use hmac::{Hmac, Mac};
+// hmac 0.13 no longer surfaces `new_from_slice` through `Mac`; it lives on
+// `KeyInit`. Import only, no behavioural change to the SigV4 signing below.
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
 use tracing::{debug, warn};
 
