@@ -84,7 +84,7 @@ iceberg-catalog-s3tables = { path = "vendor/iceberg-rust/crates/catalog/s3tables
 # default pulls every backend's transitive AWS SDK / Thrift / sqlx
 # weight unconditionally.
 iceberg-catalog-loader = { path = "vendor/iceberg-rust/crates/catalog/loader", default-features = false }
-sqlx = { version = "0.8.1", default-features = false }
+sqlx = { version = "0.9.0", default-features = false }
 
 # SQL parser — SQE pins this directly for the `visitor` feature (VisitMut derive
 # used by sqe-sql for AST rewrites like Trino-compat CAST(v AS JSON) -> to_json(v)).
@@ -101,7 +101,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"
 
 # HTTP
 axum = "0.8"
-reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+reqwest = { version = "0.13", features = ["json", "rustls-tls"], default-features = false }
 
 # gRPC (Arrow Flight) — arrow-flight 57 requires tonic 0.14
 tonic = { version = "0.14", features = ["transport", "tls-ring"] }
@@ -110,14 +110,14 @@ prost = "0.14"
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-toml = "0.8"
+toml = "0.9"
 
 # Concurrency / Caching
 dashmap = "6"
 moka = { version = "0.12", features = ["future", "sync"] }
 
 # Rate limiting
-governor = "0.8"
+governor = "0.10"
 
 # Auth
 jsonwebtoken = "9"
@@ -126,11 +126,11 @@ jsonwebtoken = "9"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 prometheus = "0.14"
-opentelemetry = "0.31"
-opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
-opentelemetry-otlp = { version = "0.31", features = ["grpc-tonic", "trace", "metrics", "logs"] }
-tracing-opentelemetry = "0.32"
-opentelemetry-appender-tracing = "0.31"
+opentelemetry = "0.32"
+opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.32", features = ["grpc-tonic", "trace", "metrics", "logs"] }
+tracing-opentelemetry = "0.33"
+opentelemetry-appender-tracing = "0.32"
 
 # Error handling
 thiserror = "2"
@@ -141,13 +141,13 @@ clap = { version = "4", features = ["derive", "env"] }
 
 # Data generation
 csv = "1"
-rand = "0.8"
+rand = "0.10"
 
 # Crypto
-sha2 = "0.10"
-hmac = "0.12"
+sha2 = "0.11"
+hmac = "0.13"
 hex = "0.4"
-base64 = "0.22"
+base64 = "0.23"
 subtle = "2"
 zeroize = "1"
 
@@ -181,7 +181,7 @@ tokio-util = "0.7"
 # Puffin NDV sketches — pure-Rust Apache DataSketches theta implementation.
 # Used by `crates/sqe-catalog/src/puffin_stats.rs` to write theta sketches
 # into Puffin sidecar files for the Iceberg statistics file list.
-datasketches = "0.2"
+datasketches = "0.3"
 
 # Zip archive reading for read_json(compression => 'zip'). deflate-only
 # (no bzip2/lzma/zstd zip methods needed); default-features off to skip
