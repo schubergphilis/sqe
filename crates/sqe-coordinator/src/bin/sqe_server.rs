@@ -471,26 +471,34 @@ async fn dashboard() -> Response {
 /// `route_layer` applied only to that sub-router.
 ///
 /// `/api/v1/catalogs/refresh` is a control-plane hook, not part of the
-/// read-only dashboard, so it registers unconditionally with its own
-/// `require_admin_bearer` layer. It used to live inside the `web_ui` group,
-/// where `metrics.web_ui = false` (the default, and TOML-only -- there is no
-/// `SQE_METRICS__*` override) silently removed the route while `/healthz` kept
-/// answering 200 on the same port. An operator could not tell that apart from a
-/// build predating the endpoint, and catalog invalidation never fired.
+/// read-only dashboard, so on a coordinator it registers regardless of
+/// `web_ui`, with its own `require_admin_bearer` layer. It used to live inside
+/// the `web_ui` group, where `metrics.web_ui = false` (the default, and
+/// TOML-only -- there is no `SQE_METRICS__*` override) silently removed the
+/// route while `/healthz` kept answering 200 on the same port. An operator
+/// could not tell that apart from a build predating the endpoint, and catalog
+/// invalidation never fired.
 fn build_health_router(state: Arc<HealthState>) -> Router {
     let open = Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
         .route("/api/v1/status", get(cluster_status));
 
-    let admin_hooks = Router::new()
-        .route("/api/v1/catalogs/refresh", post(api_catalogs_refresh))
-        .route_layer(axum::middleware::from_fn_with_state(
-            state.clone(),
-            sqe_coordinator::web_auth::require_admin_bearer::<HealthState>,
-        ));
-
-    let app = open.merge(admin_hooks);
+    // Coordinator-only: a worker holds no shared table cache and no session
+    // cache, so the hook would 200 having invalidated nothing. `run_worker`
+    // also wires no `bearer_provider`, so it would answer a permanent 401 --
+    // either way the route would be a lie on a worker. Keep it off there.
+    let app = if state.role == "coordinator" {
+        let admin_hooks = Router::new()
+            .route("/api/v1/catalogs/refresh", post(api_catalogs_refresh))
+            .route_layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                sqe_coordinator::web_auth::require_admin_bearer::<HealthState>,
+            ));
+        open.merge(admin_hooks)
+    } else {
+        open
+    };
 
     let app = if state.web_ui {
         let web = Router::new()
@@ -2782,6 +2790,45 @@ mod tests {
             resp.status(),
             axum::http::StatusCode::UNAUTHORIZED,
             "refresh hook must fail closed when no auth provider is configured"
+        );
+    }
+
+    /// A worker must NOT serve the refresh hook. It holds no shared table cache
+    /// and no session cache, so the call would report success having
+    /// invalidated nothing. `/healthz` stays open there.
+    #[tokio::test]
+    async fn catalogs_refresh_absent_on_worker() {
+        use tower::ServiceExt;
+        let state = Arc::new(HealthState {
+            ready: Arc::new(AtomicBool::new(true)),
+            started_at: Instant::now(),
+            role: "worker",
+            worker_registry: None,
+            query_tracker: None,
+            web_ui: false,
+            catalog_url: String::new(),
+            node_info: None,
+            metrics_history: None,
+            bearer_provider: None,
+            auth_cfg: None,
+            security_cfg: None,
+            audit: None,
+            anonymous_denied: None,
+            dashboard_success: None,
+            success_audit_dedup: None,
+            table_cache: None,
+        });
+        let app = build_health_router(state);
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/v1/catalogs/refresh")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::NOT_FOUND,
+            "workers must not serve the catalog-refresh hook"
         );
     }
 
