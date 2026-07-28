@@ -31,6 +31,11 @@ repository = { workspace = true }
 [dependencies]
 async-trait = { workspace = true }
 iceberg = { workspace = true }
-sqlx = { version = "0.8.1", features = ["any"], default-features = false }
+# MUST match the workspace sqlx version. `vendor/iceberg-rust` is excluded
+# from the workspace (root Cargo.toml `exclude`), so this cannot inherit
+# `workspace = true`. A mismatch pulls a second sqlx, and with it a second
+# libsqlite3-sys -- both of which declare `links = "sqlite3"`, which cargo
+# refuses, blocking any rusqlite bump with a resolution error far from here.
+sqlx = { version = "0.9.0", features = ["any"], default-features = false }
 strum = { workspace = true }
 

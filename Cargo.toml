@@ -84,7 +84,7 @@ iceberg-catalog-s3tables = { path = "vendor/iceberg-rust/crates/catalog/s3tables
 # default pulls every backend's transitive AWS SDK / Thrift / sqlx
 # weight unconditionally.
 iceberg-catalog-loader = { path = "vendor/iceberg-rust/crates/catalog/loader", default-features = false }
-sqlx = { version = "0.8.1", default-features = false }
+sqlx = { version = "0.9.0", default-features = false }
 
 # SQL parser — SQE pins this directly for the `visitor` feature (VisitMut derive
 # used by sqe-sql for AST rewrites like Trino-compat CAST(v AS JSON) -> to_json(v)).

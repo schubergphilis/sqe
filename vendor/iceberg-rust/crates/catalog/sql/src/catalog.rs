@@ -29,6 +29,14 @@ use iceberg::{
     TableCommit, TableCreation, TableIdent,
 };
 use sqlx::any::{AnyPoolOptions, AnyQueryResult, AnyRow, install_default_drivers};
+// SQE PATCH (sqe#deps-sqlx-0.9): sqlx 0.9 gates dynamic SQL strings behind
+// `SqlSafeStr`, implemented only for `&'static str`. The four call sites below
+// build their SQL by `format!`-ing module-level `static &str` constants (table
+// and column names) and pass every runtime value -- catalog name, namespace,
+// table name -- through `.bind()` as a query parameter. `replace_placeholders`
+// only rewrites `?` into `$N`; it never splices data into the string. Audited
+// on that basis and wrapped in `AssertSqlSafe`, which is what sqlx 0.9 asks for.
+use sqlx::AssertSqlSafe;
 use sqlx::{Any, AnyPool, Row, Transaction};
 
 use crate::error::{
@@ -278,7 +286,7 @@ impl SqlCatalog {
             .await
             .map_err(from_sqlx_error)?;
 
-        sqlx::query(&format!(
+        sqlx::query(AssertSqlSafe(format!(
             "CREATE TABLE IF NOT EXISTS {CATALOG_TABLE_NAME} (
                 {CATALOG_FIELD_CATALOG_NAME} VARCHAR(255) NOT NULL,
                 {CATALOG_FIELD_TABLE_NAMESPACE} VARCHAR(255) NOT NULL,
@@ -287,19 +295,19 @@ impl SqlCatalog {
                 {CATALOG_FIELD_PREVIOUS_METADATA_LOCATION_PROP} VARCHAR(1000),
                 {CATALOG_FIELD_RECORD_TYPE} VARCHAR(5),
                 PRIMARY KEY ({CATALOG_FIELD_CATALOG_NAME}, {CATALOG_FIELD_TABLE_NAMESPACE}, {CATALOG_FIELD_TABLE_NAME}))"
-        ))
+        )))
         .execute(&pool)
         .await
         .map_err(from_sqlx_error)?;
 
-        sqlx::query(&format!(
+        sqlx::query(AssertSqlSafe(format!(
             "CREATE TABLE IF NOT EXISTS {NAMESPACE_TABLE_NAME} (
                 {CATALOG_FIELD_CATALOG_NAME} VARCHAR(255) NOT NULL,
                 {NAMESPACE_FIELD_NAME} VARCHAR(255) NOT NULL,
                 {NAMESPACE_FIELD_PROPERTY_KEY} VARCHAR(255),
                 {NAMESPACE_FIELD_PROPERTY_VALUE} VARCHAR(1000),
                 PRIMARY KEY ({CATALOG_FIELD_CATALOG_NAME}, {NAMESPACE_FIELD_NAME}, {NAMESPACE_FIELD_PROPERTY_KEY}))"
-        ))
+        )))
         .execute(&pool)
         .await
         .map_err(from_sqlx_error)?;
@@ -339,7 +347,7 @@ impl SqlCatalog {
     async fn fetch_rows(&self, query: &str, args: Vec<Option<&str>>) -> Result<Vec<AnyRow>> {
         let query_with_placeholders = self.replace_placeholders(query);
 
-        let mut sqlx_query = sqlx::query(&query_with_placeholders);
+        let mut sqlx_query = sqlx::query(AssertSqlSafe(query_with_placeholders));
         for arg in args {
             sqlx_query = sqlx_query.bind(arg);
         }
@@ -359,7 +367,7 @@ impl SqlCatalog {
     ) -> Result<AnyQueryResult> {
         let query_with_placeholders = self.replace_placeholders(query);
 
-        let mut sqlx_query = sqlx::query(&query_with_placeholders);
+        let mut sqlx_query = sqlx::query(AssertSqlSafe(query_with_placeholders));
         for arg in args {
             sqlx_query = sqlx_query.bind(arg);
         }

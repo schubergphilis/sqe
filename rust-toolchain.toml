@@ -1,2 +1,11 @@
 [toolchain]
-channel = "1.92.0"
+# Bumped 1.92.0 -> 1.97.1 to clear the MSRV floor that blocked several
+# dependency updates: sqlx 0.9 requires rustc 1.94.0, and the aws-sdk /
+# aws-config 1.10 family requires 1.94.1. sqlx 0.9 in turn lifts
+# libsqlite3-sys to 0.38, which resolves the `links = "sqlite3"` conflict
+# blocking rusqlite 0.40.
+#
+# This pins the toolchain used for development and CI. The crates' declared
+# minimum supported Rust version stays `rust-version = "1.85"` in Cargo.toml;
+# this bump does not raise what downstream consumers need.
+channel = "1.97.1"
