@@ -62,7 +62,7 @@ aikido-sbom:
 # ===== repo-specific integration suites (docker-in-docker), hosted here =====
 integration-test:
   stage: test
-  image: docker:24
+  image: docker:29
   # docker-in-docker. The job's `docker compose up` against
   # docker-compose.test.yml needs a real Docker daemon, which the sibling
   # `docker:24-dind` service provides. Explicit `alias: docker` ensures the
@@ -73,7 +73,7 @@ integration-test:
   # explicit command the daemon binds to 2376 with self-signed certs and
   # the job hits `Cannot connect to the Docker daemon at tcp://docker:2375`.
   services:
-    - name: docker:24-dind
+    - name: docker:29-dind
       alias: docker
       command: ["--tls=false", "--host=tcp://0.0.0.0:2375"]
   variables:
@@ -105,9 +105,9 @@ integration-test:
 # system.runtime.tasks visibility do not regress.
 distributed-smoke:
   stage: test
-  image: docker:24
+  image: docker:29
   services:
-    - name: docker:24-dind
+    - name: docker:29-dind
       alias: docker
       command: ["--tls=false", "--host=tcp://0.0.0.0:2375"]
   variables:
@@ -138,9 +138,9 @@ distributed-smoke:
 # distributed`. Generous timeout: each scenario builds or pulls images.
 scenario-test:
   stage: test
-  image: docker:24
+  image: docker:29
   services:
-    - name: docker:24-dind
+    - name: docker:29-dind
       alias: docker
       command: ["--tls=false", "--host=tcp://0.0.0.0:2375"]
   variables:
@@ -193,9 +193,9 @@ scenario-test:
 # stack). This job invokes them with `--check` so the gated run actually asserts.
 scenario-test-aws:
   stage: test
-  image: docker:24
+  image: docker:29
   services:
-    - name: docker:24-dind
+    - name: docker:29-dind
       alias: docker
       command: ["--tls=false", "--host=tcp://0.0.0.0:2375"]
   variables:
