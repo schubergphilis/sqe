@@ -120,7 +120,7 @@ moka = { version = "0.12", features = ["future", "sync"] }
 governor = "0.8"
 
 # Auth
-jsonwebtoken = "9"
+jsonwebtoken = "11"
 
 # Observability
 tracing = "0.1"
