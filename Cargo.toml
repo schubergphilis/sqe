@@ -159,6 +159,17 @@ csv = "1"
 # 475 call sites across 9 files would also need the gen_range ->
 # random_range / thread_rng -> rng renames. Bump deliberately, with a
 # generator re-validation, not as part of a dependency refresh.
+# HELD at 0.8 -- the 0.10 migration was attempted and reverted (see #390).
+# rand does not guarantee output stability across releases and the sqe-bench
+# generators seed StdRng explicitly, so 0.10 changes the data produced for a
+# given seed. Measured effect at SF1 TPC-DS: matched 99/99 with 0 vacuous-bug
+# before, 97/99 with 2 after -- q29 and q85 return zero rows where the spec
+# says non-empty. Both need sales-to-returns chains with correlated customer
+# demographics, so the new sampling changed that correlation. All 4360 unit
+# tests and the 230-query suite still pass, which is exactly why this needs a
+# differential compare-trino run rather than a green build to validate.
+# The API rename itself is mechanical (486 sites, gen_range -> random_range,
+# and rand::Rng -> rand::RngExt for the generation methods).
 rand = "0.8"
 
 # Crypto
