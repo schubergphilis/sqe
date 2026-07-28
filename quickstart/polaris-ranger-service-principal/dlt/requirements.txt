@@ -5,6 +5,6 @@ dlt[filesystem,hub,pyiceberg]==1.29.1
 dlthub==0.29.0
 adbc-driver-flightsql>=1.6,<2
 adbc-driver-manager>=1.6,<2
-pytest>=8,<9
+pytest>=9,<10
 requests>=2.32,<3
 trino>=0.336,<1
