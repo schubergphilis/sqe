@@ -14,15 +14,18 @@ query path.
 - Open `http://<coordinator-host>:<metrics_port + 1>/`. With the default
   `metrics.prometheus_port = 9090`, that is `http://localhost:9091/`.
 - The same port also serves `/healthz`, `/readyz`, and `/api/v1/status`.
-- The UI is on by default. Turn it off with:
+- The UI is **off by default**. Turn it on with:
 
   ```toml
   [metrics]
-  web_ui = false
+  web_ui = true
   ```
 
-  When off, `/healthz`, `/readyz`, and `/api/v1/status` still respond; the
-  dashboard and the `/api/v1/queries*` endpoints return 404.
+  This is TOML-only: there is no `SQE_METRICS__*` environment override for it.
+
+  When off, `/healthz`, `/readyz`, `/api/v1/status`, and the admin endpoints
+  below still respond; the dashboard and the `/api/v1/queries*` endpoints
+  return 404.
 
 ## Security
 
@@ -67,7 +70,11 @@ are stable and safe to scrape directly:
 ## Admin endpoints
 
 Mutating endpoints on the same port sit behind the same bearer + admin gate as
-the dashboard.
+the dashboard. Unlike the dashboard, they are **always registered**, whether or
+not `metrics.web_ui` is on: they are control-plane hooks, not part of the
+read-only UI, and coupling catalog invalidation to "dashboard enabled" made the
+hook silently unavailable on a default deployment. The gate fails closed, so
+with no auth provider configured they answer 401 rather than running.
 
 | Endpoint | Effect |
 |---|---|
