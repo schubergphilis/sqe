@@ -27,6 +27,10 @@ include:
 
 variables:
   AIKIDO_IMAGE_NAME: "sqlengine/sqe"
+  # Live policy/scripts until aikido-tools image is rebuilt with CDLA + r-efi
+  # exception + SQE reviewed_evidence (aikido!51). After tools image digest
+  # updates, this override can be removed and AIKIDO_HOME from the image used.
+  AIKIDO_POLICY_REF: "v0.9.0"
 
 # Cold Rust build ceiling. aikido builds with rootless Kaniko, which does NOT
 # honor this repo's BuildKit `RUN --mount=type=cache` + sccache mounts, so the
