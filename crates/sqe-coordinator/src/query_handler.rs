@@ -4518,23 +4518,31 @@ impl QueryHandler {
                     _ => (None, Some(name.to_string()), None),
                 }
             }
-            Some(sqlparser::ast::GrantObjects::AllTablesInSchema { schemas })
-                if !schemas.is_empty() =>
-            {
-                let name = &schemas[0];
-                let parts: Vec<String> = object_name_parts(name);
-                match parts.len() {
-                    1 => (None, Some(parts[0].clone()), None),
-                    2 => (Some(parts[0].clone()), Some(parts[1].clone()), None),
-                    _ => (None, Some(name.to_string()), None),
-                }
-            }
-            Some(sqlparser::ast::GrantObjects::FutureTablesInSchema { schemas })
-                if !schemas.is_empty() =>
-            {
-                // Ranger has no "future-only" resource; a table wildcard ("*")
-                // covers existing and future tables in the schema. We document
-                // this as the SQE meaning of ON FUTURE TABLES.
+            // ON ALL TABLES IN SCHEMA and ON FUTURE TABLES IN SCHEMA both map
+            // to a TABLE-level resource with the wildcard "*".
+            //
+            // `ON ALL` used to map to a namespace-level resource (table: None),
+            // which made the statement a silent no-op: namespace-level SELECT
+            // is namespace-list + namespace-properties-read and deliberately
+            // carries NO table-data-read, and Ranger does not widen a
+            // namespace policy to the tables beneath it (no implicit
+            // isRecursive, no defaulted table wildcard). Granting that shape
+            // parsed, reported success, and conferred nothing on any table.
+            //
+            // The fix belongs here and NOT in the grant profile: adding
+            // table-data-read at the namespace level would silently widen
+            // every namespace-scoped grant.
+            //
+            // Parity limit, accepted deliberately: Ranger has no future-only
+            // resource, so a "*" table policy covers existing AND future
+            // tables and the two statements necessarily collapse to the same
+            // policy. Snowflake distinguishes them. SQE treats ON FUTURE as a
+            // superset that also covers existing tables rather than rejecting
+            // it, and the docs say so.
+            Some(
+                sqlparser::ast::GrantObjects::AllTablesInSchema { schemas }
+                | sqlparser::ast::GrantObjects::FutureTablesInSchema { schemas },
+            ) if !schemas.is_empty() => {
                 let name = &schemas[0];
                 let parts: Vec<String> = object_name_parts(name);
                 match parts.len() {
@@ -7369,6 +7377,108 @@ mod tests {
         assert_eq!(stmt.catalog, None);
         assert_eq!(stmt.namespace.as_deref(), Some("sales"));
         assert_eq!(stmt.table.as_deref(), Some("*"));
+    }
+
+    /// `ON ALL TABLES IN SCHEMA` must produce a TABLE-level resource with the
+    /// wildcard "*". It used to produce a namespace-level resource (table:
+    /// None), which Ranger does not widen to the tables beneath it, so the
+    /// grant parsed, reported success, and conferred nothing on any table.
+    #[test]
+    fn extract_grant_statement_all_tables_in_schema_is_table_wildcard() {
+        use sqe_policy::grants::Grantee;
+        use sqlparser::dialect::GenericDialect;
+        use sqlparser::parser::Parser;
+
+        let sql = "GRANT SELECT ON ALL TABLES IN SCHEMA my_catalog.sales TO ROLE analyst";
+        let stmts = Parser::parse_sql(&GenericDialect {}, sql).unwrap();
+        let stmt = QueryHandler::extract_grant_statement(&stmts[0]).unwrap();
+
+        assert_eq!(stmt.privilege, "SELECT");
+        assert_eq!(stmt.catalog.as_deref(), Some("my_catalog"));
+        assert_eq!(stmt.namespace.as_deref(), Some("sales"));
+        assert_eq!(
+            stmt.table.as_deref(),
+            Some("*"),
+            "ON ALL TABLES must be a table-level wildcard, not a namespace resource"
+        );
+        assert!(matches!(stmt.grantee, Grantee::Role(ref n) if n == "analyst"));
+    }
+
+    #[test]
+    fn extract_grant_statement_all_tables_single_part_schema() {
+        use sqlparser::dialect::GenericDialect;
+        use sqlparser::parser::Parser;
+
+        let sql = "GRANT SELECT ON ALL TABLES IN SCHEMA sales TO alice";
+        let stmts = Parser::parse_sql(&GenericDialect {}, sql).unwrap();
+        let stmt = QueryHandler::extract_grant_statement(&stmts[0]).unwrap();
+
+        assert_eq!(stmt.catalog, None);
+        assert_eq!(stmt.namespace.as_deref(), Some("sales"));
+        assert_eq!(stmt.table.as_deref(), Some("*"));
+    }
+
+    /// REVOKE must resolve the same resource shape as GRANT, or a revoke of an
+    /// `ON ALL TABLES` grant would target a different policy than the grant
+    /// wrote and silently leave access in place.
+    #[test]
+    fn extract_revoke_statement_all_tables_in_schema_is_table_wildcard() {
+        use sqlparser::dialect::GenericDialect;
+        use sqlparser::parser::Parser;
+
+        let sql = "REVOKE SELECT ON ALL TABLES IN SCHEMA my_catalog.sales FROM ROLE analyst";
+        let stmts = Parser::parse_sql(&GenericDialect {}, sql).unwrap();
+        let stmt = QueryHandler::extract_grant_statement(&stmts[0]).unwrap();
+
+        assert_eq!(stmt.catalog.as_deref(), Some("my_catalog"));
+        assert_eq!(stmt.namespace.as_deref(), Some("sales"));
+        assert_eq!(stmt.table.as_deref(), Some("*"));
+    }
+
+    /// ON ALL and ON FUTURE collapse to the same resource: Ranger has no
+    /// future-only resource, so a "*" table policy covers existing and future
+    /// tables alike. Pinned so the collapse is a deliberate, visible choice
+    /// rather than an accident.
+    #[test]
+    fn extract_grant_statement_all_and_future_tables_collapse() {
+        use sqlparser::dialect::GenericDialect;
+        use sqlparser::parser::Parser;
+
+        let all = "GRANT SELECT ON ALL TABLES IN SCHEMA c.s TO ROLE r";
+        let future = "GRANT SELECT ON FUTURE TABLES IN SCHEMA c.s TO ROLE r";
+
+        let all_stmt = QueryHandler::extract_grant_statement(
+            &Parser::parse_sql(&GenericDialect {}, all).unwrap()[0],
+        )
+        .unwrap();
+        let future_stmt = QueryHandler::extract_grant_statement(
+            &Parser::parse_sql(&GenericDialect {}, future).unwrap()[0],
+        )
+        .unwrap();
+
+        assert_eq!(all_stmt.catalog, future_stmt.catalog);
+        assert_eq!(all_stmt.namespace, future_stmt.namespace);
+        assert_eq!(all_stmt.table, future_stmt.table);
+    }
+
+    /// `ON SCHEMA` stays a namespace-level resource. Only the ALL/FUTURE TABLES
+    /// forms became table wildcards -- a plain schema grant must not be widened
+    /// to the tables beneath it.
+    #[test]
+    fn extract_grant_statement_on_schema_stays_namespace_level() {
+        use sqlparser::dialect::GenericDialect;
+        use sqlparser::parser::Parser;
+
+        let sql = "GRANT USAGE ON SCHEMA my_catalog.sales TO ROLE analyst";
+        let stmts = Parser::parse_sql(&GenericDialect {}, sql).unwrap();
+        let stmt = QueryHandler::extract_grant_statement(&stmts[0]).unwrap();
+
+        assert_eq!(stmt.catalog.as_deref(), Some("my_catalog"));
+        assert_eq!(stmt.namespace.as_deref(), Some("sales"));
+        assert_eq!(
+            stmt.table, None,
+            "ON SCHEMA must stay namespace-level, not become a table wildcard"
+        );
     }
 
     #[test]
