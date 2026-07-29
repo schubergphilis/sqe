@@ -29,6 +29,15 @@ owner = "vpf-data-ai/chameleon sqlengine maintainers"
 reason = "r-efi is UEFI firmware ABI bindings pulled only as a target-specific dependency of getrandom (0.3+/0.4) for target_os=uefi. SQE does not build or ship UEFI binaries; Linux/macOS/Windows server artifacts do not link r-efi. No drop-in replacement exists for getrandom's UEFI backend. Prefer removing if getrandom drops the dep; until then treat as platform-optional not-linked."
 expires = "2027-07-27"
 
+[[license_exception]]
+id = "OSS-BSD1-FIAT-CRYPTO-2026"
+component = "pkg:cargo/fiat-crypto@*"
+licenses = ["BSD-1-Clause"]
+scope = "permissive-not-on-list"
+owner = "vpf-data-ai/chameleon sqlengine maintainers"
+reason = "fiat-crypto provides formally-verified field-arithmetic primitives, pulled transitively by p256/p384 which jsonwebtoken 11 requires via its `rust_crypto` provider feature (jsonwebtoken 11 ships no crypto provider by default, and without one every JWT verification panics -- see !738). BSD-1-Clause is a permissive OSI-style licence, strictly more permissive than the BSD-2/BSD-3 already on the approved list; it is simply absent from that list. No copyleft or attribution-beyond-notice obligation. The alternative provider, `aws_lc_rs`, avoids this dependency but requires a C toolchain (aws-lc-sys) at build time, which is worse for reproducible and cross-platform builds. Revisit if the group policy adds BSD-1-Clause, or if jsonwebtoken gains a pure-Rust provider without the p256/p384 path."
+expires = "2027-07-29"
+
 [[registry]]
 type = "harbor"
 repo = "repo.sovereign-data.org/chameleon"
