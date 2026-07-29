@@ -375,7 +375,25 @@ fn seed_for_table(name: &str) -> u64 {
             acc ^ ((b as u64).wrapping_shl(i as u32 % 64))
         })
         .wrapping_add(0xCAFE_BABE_1234_5678)
+        .wrapping_add(seed_salt())
 }
+/// Optional seed perturbation, from `BENCH_SEED_SALT` (default 0).
+///
+/// Zero leaves every generated value byte-identical to before, so committed
+/// baselines are unaffected. A non-zero salt reshuffles all random draws while
+/// keeping row counts, schemas and the deterministic planted rows intact.
+///
+/// This exists to audit generator fidelity: a query whose result flips to empty
+/// under a different salt is satisfied by coincidence, not by construction, and
+/// needs a planted row (see the Q24/Q25 constants in tpcds.rs). Without it,
+/// every RNG or dependency change silently reshuffles which queries are lucky.
+fn seed_salt() -> u64 {
+    std::env::var("BENCH_SEED_SALT")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
 
 fn random_date(rng: &mut StdRng) -> i32 {
     DS_DATE_START + rng.gen_range(0..DS_DATE_RANGE)
@@ -755,6 +773,12 @@ const Q24_ITEM: i32 = 3;
 const Q24_STORE_SK: i32 = 3;
 const Q24_ADDR_SK: i32 = 4;
 const Q24_ZIP: &str = "10144"; // a ZIP_POOL entry
+
+/// q79 needs a store with `s_number_employees BETWEEN 200 AND 295` (and
+/// `d_dow = 1`, which date_dim satisfies deterministically). The employee count
+/// is a 10..500 draw, so the 96-wide window is a ~20% chance per store and
+/// there are only a handful of stores below SF1. Plant store sk 1 mid-band.
+const Q79_STORE_EMPLOYEES: i32 = 250;
 
 /// Maximum line items per ticket/order. Lines are uniform in 1..=25 so the
 /// `HAVING count(*) BETWEEN 15 AND 20` windows in q34/q46/q68/q73/q79 match
@@ -1551,7 +1575,14 @@ fn generate_store(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
         vec![
             i!(sk), s!(random_id(rng)), d!(random_date(rng)), scd2_rec_end_date(row, rng),
             closed, s!(random_name(rng)),
-            i!(rng.gen_range(10..500i32)), i!(rng.gen_range(1000..100_000i32)),
+            // q79 filters s_number_employees BETWEEN 200 AND 295: a 96-wide
+            // band out of the 10..500 draw, so at small scales (2-3 stores)
+            // usually no store lands in it and the query empties. Plant store
+            // sk 1 into the band, same technique as the q24 market_id plant
+            // below. Verified fragile: q79 is vacuous under BENCH_SEED_SALT
+            // 1 and 2 and passes only on the unsalted seed.
+            i!(if row == 0 { Q79_STORE_EMPLOYEES } else { rng.gen_range(10..500i32) }),
+            i!(rng.gen_range(1000..100_000i32)),
             s!(random_str(rng, CC_HOURS)), s!(random_name(rng)),
             // s_store_sk 3 (row 2) is forced to market 8 for the q24 plant.
             i!({ let m = rng.gen_range(1..10i32); if row == 2 { 8 } else { m } }),

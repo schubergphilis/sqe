@@ -59,7 +59,25 @@ fn seed_for_table(name: &str) -> u64 {
             acc ^ ((b as u64).wrapping_shl(i as u32 % 64))
         })
         .wrapping_add(0xBB00_BB00_BB00_BB00)
+        .wrapping_add(seed_salt())
 }
+/// Optional seed perturbation, from `BENCH_SEED_SALT` (default 0).
+///
+/// Zero leaves every generated value byte-identical to before, so committed
+/// baselines are unaffected. A non-zero salt reshuffles all random draws while
+/// keeping row counts, schemas and the deterministic planted rows intact.
+///
+/// This exists to audit generator fidelity: a query whose result flips to empty
+/// under a different salt is satisfied by coincidence, not by construction, and
+/// needs a planted row (see the Q24/Q25 constants in tpcds.rs). Without it,
+/// every RNG or dependency change silently reshuffles which queries are lucky.
+fn seed_salt() -> u64 {
+    std::env::var("BENCH_SEED_SALT")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
 
 // ---------------------------------------------------------------------------
 // Random helpers
