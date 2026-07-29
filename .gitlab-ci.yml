@@ -59,6 +59,61 @@ aikido-sbom:
         -o "cyclonedx-json@1.6=$AIKIDO_SBOM"
       python3 "$AIKIDO_HOME/scripts/sbom_enrich.py" --sbom "$AIKIDO_SBOM" --asset "$CI_PROJECT_DIR/.asset"
 
+# ===== blocking correctness gate (#386) =====
+# The shared `aikido-test-rust` job already runs `cargo test --all`, but it is
+# `allow_failure: true` (advisory by design, so verify never blocks the security
+# guardrails) and its rules skip it unless Rust files changed. Advisory is the
+# wrong mode for these two checks: every way `main` broke in the 2026-07-27/28
+# window went in through a pipeline where nothing blocked.
+#
+#   - reqwest 0.13 bumped in Cargo.toml without regenerating Cargo.lock, so the
+#     workspace did not resolve at all (`--locked` catches this in seconds).
+#   - jsonwebtoken 11 merged with no crypto provider feature selected, so every
+#     JWT verification panicked at runtime. It COMPILED cleanly -- only running
+#     the tests catches it, which is why this gate runs `test`, not `check`.
+#   - two merges duplicated unit tests, breaking only the test build.
+#
+# Deliberately narrow and blocking: manifest/lock consistency, then behaviour.
+# Everything advisory (clippy, audit, deny) stays in aikido-test-rust.
+cargo-gate:
+  stage: test
+  # rustup in the image honours rust-toolchain.toml, so the pinned toolchain is
+  # used rather than whatever the base image ships. Keeps the gate honest if the
+  # pin moves.
+  image: rust:slim
+  variables:
+    # Deep async state machines in the scan path overflow the default 2MB test
+    # thread stack (see docs: write e2e tests need this too).
+    RUST_MIN_STACK: "33554432"
+    CARGO_TERM_COLOR: "always"
+  cache:
+    key: "cargo-gate-$CI_COMMIT_REF_SLUG"
+    paths: ["target/", ".cargo/registry/"]
+  before_script:
+    - |
+      set -euo pipefail
+      apt-get update -qq
+      apt-get install -y -qq --no-install-recommends \
+        clang mold cmake protobuf-compiler libssl-dev pkg-config >/dev/null
+  script:
+    - |
+      set -euo pipefail
+      # 1. Manifest and lockfile must agree. Fails in seconds on the renovate
+      #    "bumped Cargo.toml, never regenerated Cargo.lock" pattern.
+      echo "== cargo metadata --locked =="
+      cargo metadata --locked --format-version 1 > /dev/null
+      # 2. Behaviour. `cargo check` is NOT sufficient: the jsonwebtoken crypto
+      #    provider is resolved at runtime, so a tree with panicking auth
+      #    type-checks perfectly.
+      echo "== cargo test --workspace =="
+      cargo test --workspace --all-features
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+      when: never
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes: ["**/*.rs", "**/Cargo.toml", "**/Cargo.lock", "rust-toolchain.toml"]
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+
 # ===== repo-specific integration suites (docker-in-docker), hosted here =====
 integration-test:
   stage: test
