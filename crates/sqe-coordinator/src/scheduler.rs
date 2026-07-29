@@ -149,7 +149,7 @@ impl FragmentScheduler for WeightedScheduler {
             .enumerate()
             .map(|(i, t)| (i, estimate_cost(t)))
             .collect();
-        indexed_tasks.sort_by(|a, b| b.1.cmp(&a.1));
+        indexed_tasks.sort_by_key(|t| std::cmp::Reverse(t.1));
 
         // Pre-allocate the result vector with placeholders
         let mut assignments: Vec<Option<Assignment>> = vec![None; tasks.len()];

@@ -493,14 +493,9 @@ pub fn parse_show_session(sql: &str) -> Option<Option<String>> {
     let upper = trimmed.to_uppercase();
     let rest = if upper == "SHOW SESSION" {
         ""
-    } else if let Some(r) = upper
+    } else { upper
         .strip_prefix("SHOW SESSION ")
-        .map(|_| trimmed["SHOW SESSION ".len()..].trim())
-    {
-        r
-    } else {
-        return None;
-    };
+        .map(|_| trimmed["SHOW SESSION ".len()..].trim())? };
     if rest.is_empty() {
         return Some(None);
     }

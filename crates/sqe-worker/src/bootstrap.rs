@@ -120,7 +120,9 @@ pub fn build_worker_service_with_hot_reload(
             hot,
             boot_identity: BootConfigIdentity::from_config(config),
         };
-        let _ = spawn_config_reload_watch(
+        // Detached on purpose: the watcher owns its own loop for the life of
+        // the process, so the JoinHandle is dropped rather than awaited.
+        let _config_reload_task = spawn_config_reload_watch(
             PathBuf::from(path),
             handles,
             DEFAULT_CONFIG_RELOAD_INTERVAL,
@@ -253,7 +255,8 @@ fn validate_process_headroom(
         }
     }
 
-    let _ = sqe_core::spawn_runtime_memory_watch(
+    // Detached on purpose, as above: already spawned inside the call.
+    let _runtime_memory_task = sqe_core::spawn_runtime_memory_watch(
         need_atom,
         sqe_core::DEFAULT_RUNTIME_MEMORY_WATCH_INTERVAL,
     );

@@ -618,6 +618,13 @@ fn free_space_bytes(path: &Path) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+    // `fault::serial_test_guard()` returns a `MutexGuard<'static, ()>` over a
+    // process-global mutex and is documented to be held for the whole test body:
+    // it serialises tests that install or observe fault injection. Holding it
+    // across awaits is the contract, not a bug -- each #[tokio::test] gets its
+    // own runtime, so there is no executor to starve and no second task to
+    // deadlock against.
+    #![allow(clippy::await_holding_lock)]
     use super::*;
     use arrow_array::{Int64Array, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};

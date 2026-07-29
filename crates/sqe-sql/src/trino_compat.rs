@@ -748,12 +748,11 @@ fn apply_recursive_cte_column_aliases(query: &mut Query) -> bool {
                     };
                     changed = true;
                 }
-                SelectItem::ExprWithAlias { alias, .. } => {
-                    if alias.value != col.name.value {
+                SelectItem::ExprWithAlias { alias, .. }
+                    if alias.value != col.name.value => {
                         *alias = col.name.clone();
                         changed = true;
                     }
-                }
                 _ => {}
             }
         }
@@ -1044,7 +1043,6 @@ fn rewrite_metadata_dollar_table(factor: &mut TableFactor) -> bool {
         name,
         alias: _,
         args,
-        version: _,
         ..
     } = factor
     else {
