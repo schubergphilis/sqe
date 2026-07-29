@@ -76,6 +76,19 @@
       "description": "Aikido CI platform includes (ci/templates/*.yml @ ref); keeping the guardrails/test/deploy templates current warrants a dedicated PR.",
       "matchManagers": ["gitlabci", "gitlabci-include"],
       "groupName": "aikido ci templates"
+    },
+    {
+      "description": [
+        "jsonwebtoken is held below 10 deliberately. 11 ships NO crypto provider by default,",
+        "so a tree that type-checks perfectly panics on every JWT verification at runtime --",
+        "which is exactly how it reached main unnoticed (!728, then !738 to fix, then reverted).",
+        "A bot cannot validate that, because `cargo check` and `cargo build` both pass.",
+        "Any move to 10+ needs an explicit provider feature and a test that verifies a real",
+        "token, so it has to be a human change, not a version bump."
+      ],
+      "matchManagers": ["cargo"],
+      "matchPackageNames": ["jsonwebtoken"],
+      "allowedVersions": "<10"
     }
   ]
 }
