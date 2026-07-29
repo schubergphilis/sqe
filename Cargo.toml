@@ -120,16 +120,19 @@ moka = { version = "0.12", features = ["future", "sync"] }
 governor = "0.10"
 
 # Auth
-# HELD at 9. The 11.x bump arrived via renovate !728 unvalidated and cost two
-# separate failures: 11 ships NO crypto provider by default, so every JWT
-# verification panicked at runtime (it compiled clean -- !738), and the
-# `rust_crypto` provider that fixes it pulls p256/p384 and transitively
-# fiat-crypto, whose BSD-1-Clause licence is absent from the group policy
-# allow-list. The other provider, `aws_lc_rs`, needs a C toolchain
-# (aws-lc-sys) at build time. 9.x needs no provider selection and its
-# licence set is already approved. Revisit 11 once BSD-1-Clause is on the
-# central allow-list (it is permissive, and the policy intends to allow
-# reviewed permissive ids) -- then it is a clean bump.
+# PINNED at 9 by decision, not by blocker. The 11.x bump arrived via renovate
+# !728 unvalidated and cost two separate failures: 11 ships NO crypto provider
+# by default, so every JWT verification panicked at runtime while compiling
+# perfectly clean (!738), and the `rust_crypto` provider that fixes that pulls
+# p256/p384 and transitively fiat-crypto. The other provider, `aws_lc_rs`,
+# needs a C toolchain (aws-lc-sys) at build time, which is worse for
+# reproducible cross-platform builds.
+#
+# 9.x needs no provider selection at all, so there is no runtime-only failure
+# mode to guard against, and it carries a smaller crypto dependency tree. Do
+# not let a bot bump this: renovate is configured to treat it as a major, and
+# any move to 11 has to come with an explicit provider feature and a test that
+# actually verifies a token rather than merely type-checking.
 jsonwebtoken = "9"
 
 # Observability
