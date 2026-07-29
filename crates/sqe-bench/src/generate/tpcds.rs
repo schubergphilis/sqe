@@ -774,6 +774,12 @@ const Q24_STORE_SK: i32 = 3;
 const Q24_ADDR_SK: i32 = 4;
 const Q24_ZIP: &str = "10144"; // a ZIP_POOL entry
 
+/// q79 needs a store with `s_number_employees BETWEEN 200 AND 295` (and
+/// `d_dow = 1`, which date_dim satisfies deterministically). The employee count
+/// is a 10..500 draw, so the 96-wide window is a ~20% chance per store and
+/// there are only a handful of stores below SF1. Plant store sk 1 mid-band.
+const Q79_STORE_EMPLOYEES: i32 = 250;
+
 /// Maximum line items per ticket/order. Lines are uniform in 1..=25 so the
 /// `HAVING count(*) BETWEEN 15 AND 20` windows in q34/q46/q68/q73/q79 match
 /// a healthy fraction of tickets. The old generator emitted exactly one line
@@ -1569,7 +1575,14 @@ fn generate_store(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
         vec![
             i!(sk), s!(random_id(rng)), d!(random_date(rng)), scd2_rec_end_date(row, rng),
             closed, s!(random_name(rng)),
-            i!(rng.gen_range(10..500i32)), i!(rng.gen_range(1000..100_000i32)),
+            // q79 filters s_number_employees BETWEEN 200 AND 295: a 96-wide
+            // band out of the 10..500 draw, so at small scales (2-3 stores)
+            // usually no store lands in it and the query empties. Plant store
+            // sk 1 into the band, same technique as the q24 market_id plant
+            // below. Verified fragile: q79 is vacuous under BENCH_SEED_SALT
+            // 1 and 2 and passes only on the unsalted seed.
+            i!(if row == 0 { Q79_STORE_EMPLOYEES } else { rng.gen_range(10..500i32) }),
+            i!(rng.gen_range(1000..100_000i32)),
             s!(random_str(rng, CC_HOURS)), s!(random_name(rng)),
             // s_store_sk 3 (row 2) is forced to market 8 for the q24 plant.
             i!({ let m = rng.gen_range(1..10i32); if row == 2 { 8 } else { m } }),
