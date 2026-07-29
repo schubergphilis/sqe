@@ -929,7 +929,7 @@ impl SessionCatalog {
             debug!(token_fingerprint = %token_fingerprint, "REST catalog cache miss, creating");
             let catalog = RestCatalogBuilder::default()
                 .load(
-                    format!("sqe-session-{}", &token_fingerprint),
+                    format!("sqe-session-{}", token_fingerprint),
                     props,
                 )
                 .await

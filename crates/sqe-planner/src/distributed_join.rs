@@ -494,11 +494,9 @@ impl ShuffleHashJoinPlan {
     /// Estimate the memory per executor for the build side.
     pub fn estimated_memory_per_executor(&self) -> usize {
         let build_size = estimate_side_size(&self.build_side);
-        if self.num_partitions > 0 {
-            build_size / self.num_partitions
-        } else {
-            build_size
-        }
+        build_size
+            .checked_div(self.num_partitions)
+            .unwrap_or(build_size)
     }
 }
 

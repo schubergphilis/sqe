@@ -420,7 +420,7 @@ impl QueryHandler {
         // shaving wall-clock for warehouses with many schemas.
         const MAX_INFLIGHT: usize = 16;
 
-        let entries: Vec<(String, Vec<String>)> = futures::stream::iter(namespaces.into_iter())
+        let entries: Vec<(String, Vec<String>)> = futures::stream::iter(namespaces)
             .map(|ns| {
                 let catalog = Arc::clone(&catalog);
                 async move {

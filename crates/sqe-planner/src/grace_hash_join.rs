@@ -14,11 +14,15 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_array::{Array, ArrayRef, Int64Array, RecordBatch, UInt32Array};
-use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use arrow_schema::{Field, Schema, SchemaRef};
 use datafusion::common::hash_utils::create_hashes;
 use datafusion::logical_expr::JoinType;
 use sqe_spill::{MemoryGrant, ReclaimableConsumer};
 use tracing::debug;
+
+/// Split output: (kept batches, spilled batches, per-partition key columns).
+/// Named so the splitting helper's signature stays readable.
+type SplitBatches = (Vec<RecordBatch>, Vec<RecordBatch>, Vec<Vec<i64>>);
 
 /// Default radix fan-out (must be > 1).
 pub const DEFAULT_GRACE_PARTITIONS: usize = 16;
@@ -505,7 +509,7 @@ fn isolate_heavy_hitters(
     batches: &[RecordBatch],
     key_indices: &[usize],
     frac: f64,
-) -> anyhow::Result<(Vec<RecordBatch>, Vec<RecordBatch>, Vec<Vec<i64>>)> {
+) -> anyhow::Result<SplitBatches> {
     let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     if total_rows == 0 {
         return Ok((vec![], vec![], vec![]));
@@ -611,6 +615,9 @@ fn take_rows(batch: &RecordBatch, idx: &[u32]) -> anyhow::Result<RecordBatch> {
 mod tests {
     use super::*;
     use arrow_array::Int64Array;
+    // Only the tests build Fields, so `DataType` is imported here rather than at
+    // module scope where it reads as unused when the lib is compiled alone.
+    use arrow_schema::DataType;
     use sqe_spill::MemoryGrant;
 
     fn batch(ids: Vec<i64>, vals: Vec<i64>) -> RecordBatch {
@@ -764,8 +771,8 @@ mod tests {
         ]));
         let empty = RecordBatch::new_empty(schema);
         let (out, _) = grace_inner_join(
-            &[empty.clone()],
-            &[empty],
+            std::slice::from_ref(&empty),
+            std::slice::from_ref(&empty),
             &[0],
             &[0],
             JoinType::Inner,

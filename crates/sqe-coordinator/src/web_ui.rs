@@ -268,7 +268,7 @@ pub fn query_list(
         .filter(|s| s != "all" && !s.is_empty());
 
     let mut records = tracker.records();
-    records.sort_by(|a, b| b.created.cmp(&a.created));
+    records.sort_by_key(|r| std::cmp::Reverse(r.created));
 
     records
         .into_iter()
