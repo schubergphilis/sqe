@@ -120,18 +120,27 @@ field names (`accessTypes`, `delegateAdmin`, `enableAudit`,
 `replaceExistingPermissions`, `isRecursive`). Audit is on; delegate-admin,
 replace-existing, and recursive are off.
 
-### Future tables in a schema
+### All tables and future tables in a schema
 
-`GRANT SELECT ON FUTURE TABLES IN SCHEMA sales_wh.sales TO ROLE analyst` grants
-the privilege across every table in the namespace. SQE translates it to a Ranger
-policy with a table wildcard (`table = "*"`). New tables created later in
-`sales` are covered automatically, with no follow-up grant.
+`GRANT SELECT ON ALL TABLES IN SCHEMA sales_wh.sales TO ROLE analyst` grants the
+privilege across every table in the namespace. So does `ON FUTURE TABLES IN
+SCHEMA`. SQE translates both to a Ranger policy with a table wildcard
+(`table = "*"`). New tables created later in `sales` are covered automatically,
+with no follow-up grant.
 
-One difference from Snowflake: Snowflake's FUTURE grant applies only to objects
-created after the grant. Ranger has no future-only resource, so SQE's wildcard
-also covers tables that already exist in the schema. The grant means "every
-table in this schema, present and future." Use a table-specific grant when you
-need to scope to a single existing table.
+The two forms are equivalent in SQE, which is one difference from Snowflake:
+Snowflake's FUTURE grant applies only to objects created after the grant, and its
+ALL grant only to objects that already exist. Ranger has no future-only resource,
+so the wildcard necessarily covers both. Either statement means "every table in
+this schema, present and future." Use a table-specific grant when you need to
+scope to a single existing table.
+
+Do not confuse either form with `GRANT ... ON SCHEMA`, which stays a
+namespace-level resource and does **not** reach the tables inside it. Namespace
+`SELECT` is `namespace-list` plus `namespace-properties-read` and deliberately
+carries no `table-data-read`; Ranger does not widen a namespace policy to the
+tables beneath it. A namespace grant lets a role see that the schema and its
+tables exist, not read their rows.
 
 ### Identifier validation
 

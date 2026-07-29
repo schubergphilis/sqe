@@ -469,11 +469,36 @@ async fn dashboard() -> Response {
 /// serve k8s liveness/readiness probes and LB health checks. The `web_ui`
 /// route group (dashboard + JSON API) is gated behind bearer + admin auth via
 /// `route_layer` applied only to that sub-router.
+///
+/// `/api/v1/catalogs/refresh` is a control-plane hook, not part of the
+/// read-only dashboard, so on a coordinator it registers regardless of
+/// `web_ui`, with its own `require_admin_bearer` layer. It used to live inside
+/// the `web_ui` group, where `metrics.web_ui = false` (the default, and
+/// TOML-only -- there is no `SQE_METRICS__*` override) silently removed the
+/// route while `/healthz` kept answering 200 on the same port. An operator
+/// could not tell that apart from a build predating the endpoint, and catalog
+/// invalidation never fired.
 fn build_health_router(state: Arc<HealthState>) -> Router {
     let open = Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
         .route("/api/v1/status", get(cluster_status));
+
+    // Coordinator-only: a worker holds no shared table cache and no session
+    // cache, so the hook would 200 having invalidated nothing. `run_worker`
+    // also wires no `bearer_provider`, so it would answer a permanent 401 --
+    // either way the route would be a lie on a worker. Keep it off there.
+    let app = if state.role == "coordinator" {
+        let admin_hooks = Router::new()
+            .route("/api/v1/catalogs/refresh", post(api_catalogs_refresh))
+            .route_layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                sqe_coordinator::web_auth::require_admin_bearer::<HealthState>,
+            ));
+        open.merge(admin_hooks)
+    } else {
+        open
+    };
 
     let app = if state.web_ui {
         let web = Router::new()
@@ -483,14 +508,13 @@ fn build_health_router(state: Arc<HealthState>) -> Router {
             .route("/api/v1/queries/{id}", get(api_query_detail))
             .route("/api/v1/workers", get(api_workers))
             .route("/api/v1/metrics/history", get(api_metrics_history))
-            .route("/api/v1/catalogs/refresh", post(api_catalogs_refresh))
             .route_layer(axum::middleware::from_fn_with_state(
                 state.clone(),
                 sqe_coordinator::web_auth::require_admin_bearer::<HealthState>,
             ));
-        open.merge(web)
+        app.merge(web)
     } else {
-        open
+        app
     };
 
     app.with_state(state)
@@ -2497,6 +2521,10 @@ mod tests {
     }
 
     fn make_guarded_state() -> Arc<HealthState> {
+        make_guarded_state_with_web_ui(true)
+    }
+
+    fn make_guarded_state_with_web_ui(web_ui: bool) -> Arc<HealthState> {
         let provider: Arc<dyn sqe_auth::AuthProvider> = Arc::new(StubAuthProvider {
             admin_roles: vec!["sqe-admin".into()],
         });
@@ -2509,7 +2537,7 @@ mod tests {
             role: "coordinator",
             worker_registry: None,
             query_tracker: None,
-            web_ui: true,
+            web_ui,
             catalog_url: String::new(),
             node_info: None,
             metrics_history: None,
@@ -2637,6 +2665,183 @@ mod tests {
             .header("Authorization", "Bearer admin-tok")
             .header("Content-Type", "application/json")
             .body(axum::body::Body::from(r#"{"username":"alice"}"#))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    }
+
+    // ── /api/v1/catalogs/refresh with the dashboard OFF ────────────────────
+    //
+    // `metrics.web_ui` defaults to false and is TOML-only (no `SQE_METRICS__*`
+    // override), so the default deployment is the one that matters here. The
+    // refresh hook used to be registered inside the `web_ui` group, which made
+    // it 404 on a default config while `/healthz` still answered 200 -- the
+    // platform's catalog-invalidation hook silently never worked.
+
+    /// The control-plane hook is reachable with the dashboard off, and still
+    /// guarded: no token -> 401, NOT 404.
+    #[tokio::test]
+    async fn catalogs_refresh_registered_without_web_ui_no_token_is_401() {
+        use tower::ServiceExt;
+        let state = make_guarded_state_with_web_ui(false);
+        let app = build_health_router(state);
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/v1/catalogs/refresh")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::UNAUTHORIZED,
+            "refresh hook must be registered (and guarded) when web_ui is off"
+        );
+    }
+
+    #[tokio::test]
+    async fn catalogs_refresh_without_web_ui_non_admin_is_403() {
+        use tower::ServiceExt;
+        let state = make_guarded_state_with_web_ui(false);
+        let app = build_health_router(state);
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/v1/catalogs/refresh")
+            .header("Authorization", "Bearer user-tok")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::FORBIDDEN);
+    }
+
+    /// The load-bearing case: an admin token drives invalidation on a default
+    /// (`web_ui = false`) deployment.
+    #[tokio::test]
+    async fn catalogs_refresh_without_web_ui_admin_is_200() {
+        use tower::ServiceExt;
+        let state = make_guarded_state_with_web_ui(false);
+        let app = build_health_router(state);
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/v1/catalogs/refresh")
+            .header("Authorization", "Bearer admin-tok")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    }
+
+    /// Decoupling the hook must not leak the dashboard: with `web_ui = false`
+    /// the operator UI and its JSON API stay absent entirely.
+    #[tokio::test]
+    async fn dashboard_routes_absent_without_web_ui() {
+        use tower::ServiceExt;
+        for uri in ["/", "/api/v1/overview", "/api/v1/queries", "/api/v1/workers"] {
+            let state = make_guarded_state_with_web_ui(false);
+            let app = build_health_router(state);
+            let req = axum::http::Request::builder()
+                .uri(uri)
+                .header("Authorization", "Bearer admin-tok")
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let resp = app.oneshot(req).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                axum::http::StatusCode::NOT_FOUND,
+                "{uri} must not be served when web_ui is off"
+            );
+        }
+    }
+
+    /// The guard must FAIL CLOSED when no auth provider is wired. This is the
+    /// load-bearing invariant of registering the hook unconditionally: the
+    /// route is now present on every deployment, so `require_admin_bearer` is
+    /// the only thing standing in front of it. A future refactor that made the
+    /// guard fail open would expose a control-plane endpoint by default.
+    #[tokio::test]
+    async fn catalogs_refresh_without_auth_configured_is_401() {
+        use tower::ServiceExt;
+        let state = Arc::new(HealthState {
+            ready: Arc::new(AtomicBool::new(true)),
+            started_at: Instant::now(),
+            role: "coordinator",
+            worker_registry: None,
+            query_tracker: None,
+            web_ui: false,
+            catalog_url: String::new(),
+            node_info: None,
+            metrics_history: None,
+            bearer_provider: None,
+            auth_cfg: None,
+            security_cfg: None,
+            audit: None,
+            anonymous_denied: None,
+            dashboard_success: None,
+            success_audit_dedup: None,
+            table_cache: None,
+        });
+        let app = build_health_router(state);
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/v1/catalogs/refresh")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::UNAUTHORIZED,
+            "refresh hook must fail closed when no auth provider is configured"
+        );
+    }
+
+    /// A worker must NOT serve the refresh hook. It holds no shared table cache
+    /// and no session cache, so the call would report success having
+    /// invalidated nothing. `/healthz` stays open there.
+    #[tokio::test]
+    async fn catalogs_refresh_absent_on_worker() {
+        use tower::ServiceExt;
+        let state = Arc::new(HealthState {
+            ready: Arc::new(AtomicBool::new(true)),
+            started_at: Instant::now(),
+            role: "worker",
+            worker_registry: None,
+            query_tracker: None,
+            web_ui: false,
+            catalog_url: String::new(),
+            node_info: None,
+            metrics_history: None,
+            bearer_provider: None,
+            auth_cfg: None,
+            security_cfg: None,
+            audit: None,
+            anonymous_denied: None,
+            dashboard_success: None,
+            success_audit_dedup: None,
+            table_cache: None,
+        });
+        let app = build_health_router(state);
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/v1/catalogs/refresh")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::NOT_FOUND,
+            "workers must not serve the catalog-refresh hook"
+        );
+    }
+
+    /// `/healthz` stays open with the dashboard off -- the pairing that made
+    /// the original bug look like a stale build.
+    #[tokio::test]
+    async fn healthz_open_without_web_ui() {
+        use tower::ServiceExt;
+        let state = make_guarded_state_with_web_ui(false);
+        let app = build_health_router(state);
+        let req = axum::http::Request::builder()
+            .uri("/healthz")
+            .body(axum::body::Body::empty())
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), axum::http::StatusCode::OK);
