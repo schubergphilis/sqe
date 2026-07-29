@@ -12,7 +12,7 @@ repositories {
 
 dependencies {
     // Brings in tempto-core, trino-jdbc, and the iceberg product-test classes transitively.
-    implementation("io.trino:trino-product-tests:465")
+    implementation("io.trino:trino-product-tests:476")
 }
 
 application {
