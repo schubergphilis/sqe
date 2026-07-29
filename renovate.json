@@ -29,6 +29,22 @@
       "groupName": "rust minor and patch"
     },
     {
+      "description": [
+        "Cargo treats a 0.x MINOR bump as semver-BREAKING: 0.12 -> 0.13 is an incompatible release.",
+        "Renovate classifies it as `minor`, so the rule above folded ten breaking bumps into a single",
+        "37-package 'routine' MR (!728) -- reqwest, sqlx, sha2, hmac, base64, toml, governor,",
+        "datasketches, rusqlite, opentelemetry. That MR could not regenerate Cargo.lock, said so in an",
+        "'Artifact update problem' comment, and merged anyway; main then failed to resolve at all.",
+        "Keep pre-1.0 minors out of the routine batch so each arrives reviewable on its own."
+      ],
+      "matchManagers": ["cargo"],
+      "matchCurrentVersion": "<1.0.0",
+      "matchUpdateTypes": ["minor"],
+      "groupName": "rust 0.x breaking (pre-1.0 minor)",
+      "labels": ["dependencies", "breaking-0x"],
+      "automerge": false
+    },
+    {
       "description": "DataFusion/Arrow/Parquet are API-coupled and pinned in lockstep with the vendored iceberg-rust fork. Group into one reviewed PR (overrides the rule above); a version skew here breaks the build, and a bump usually means re-checking the vendor rebase.",
       "matchManagers": ["cargo"],
       "matchPackageNames": [
