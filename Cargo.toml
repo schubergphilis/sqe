@@ -120,12 +120,17 @@ moka = { version = "0.12", features = ["future", "sync"] }
 governor = "0.8"
 
 # Auth
-# jsonwebtoken 11 ships NO crypto provider by default (`default = ["use_pem"]`);
-# exactly one of `rust_crypto` / `aws_lc_rs` must be selected or every
-# verification panics at runtime with "Could not automatically determine the
-# process-level CryptoProvider". `rust_crypto` keeps the JWT path pure Rust,
-# with no aws-lc-sys C toolchain dependency at build time.
-jsonwebtoken = { version = "11", features = ["rust_crypto"] }
+# HELD at 9. The 11.x bump arrived via renovate !728 unvalidated and cost two
+# separate failures: 11 ships NO crypto provider by default, so every JWT
+# verification panicked at runtime (it compiled clean -- !738), and the
+# `rust_crypto` provider that fixes it pulls p256/p384 and transitively
+# fiat-crypto, whose BSD-1-Clause licence is absent from the group policy
+# allow-list. The other provider, `aws_lc_rs`, needs a C toolchain
+# (aws-lc-sys) at build time. 9.x needs no provider selection and its
+# licence set is already approved. Revisit 11 once BSD-1-Clause is on the
+# central allow-list (it is permissive, and the policy intends to allow
+# reviewed permissive ids) -- then it is a clean bump.
+jsonwebtoken = "9"
 
 # Observability
 tracing = "0.1"
