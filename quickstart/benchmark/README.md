@@ -18,14 +18,15 @@ test. The default is TPC-H at scale factor 0.01, which finishes in seconds.
 | `rustfs` + `bucket-init` | S3-compatible warehouse storage. |
 | `nessie` | The Iceberg REST catalog (auth-less). |
 | `sqe` | The coordinator (Flight SQL on 50051). Reads the generated Parquet to build the tables. |
-| `sqe-bench` | One-shot tool: `generate` -> `load` -> `test`. Built from `Dockerfile.bench`. |
+| `sqe-bench` | One-shot tool: `generate` -> `load` -> `test`. Built from the shared Dockerfile's `bench-runtime` target. |
 
 ## Prerequisites
 
 - Docker (with Compose v2).
-- Two SQE images. They build from this repo on first run if absent:
-  - `sqe-quickstart:latest` (coordinator, `Dockerfile`)
-  - `sqe-bench:latest` (`Dockerfile.bench`)
+- Two SQE runtime images. They share one Rust builder stage and build from this
+  repo on first run if absent:
+  - `sqe-quickstart:latest` (`Dockerfile` target `runtime`)
+  - `sqe-bench:latest` (`Dockerfile` target `bench-runtime`)
 
 ## Run it
 
@@ -93,10 +94,10 @@ ports, and `SQE_IMAGE`.
 ### `docker-compose.yml`
 
 Brings up RustFS + Nessie + the coordinator, and a one-shot `sqe-bench` service
-(built from `Dockerfile.bench`, behind a compose profile) that runs
-generate/load/test. The `bench-data` volume is mounted into both the coordinator
-and `sqe-bench` at the same path so the coordinator can read what the generator
-wrote.
+(built from the shared Dockerfile's `bench-runtime` target, behind a compose
+profile) that runs generate/load/test. The `bench-data` volume is mounted into
+both the coordinator and `sqe-bench` at the same path so the coordinator can
+read what the generator wrote.
 
 ## Output
 
