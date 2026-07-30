@@ -133,6 +133,7 @@ dashmap = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
 sha2 = { workspace = true }
+hex = { workspace = true }
 iceberg-datafusion = { workspace = true }
 parquet = { workspace = true }
 bytes = { workspace = true }
@@ -146,7 +147,11 @@ zip = { workspace = true }
 flate2 = { workspace = true }
 # Optional backend dependencies — gated by the corresponding cargo feature
 # above. None of these are pulled into a default `cargo build`.
-rusqlite = { version = "0.32", features = ["bundled"], optional = true }
+# 0.39 is the newest rusqlite compatible with sqlx 0.9: rusqlite 0.40 needs
+# libsqlite3-sys ^0.38, while sqlx 0.9 pins libsqlite3-sys ">=0.30.1, <0.38".
+# Both declare `links = "sqlite3"`, so cargo permits only one in the graph.
+# Bump to 0.40 once sqlx widens that bound.
+rusqlite = { version = "0.39", features = ["bundled"], optional = true }
 iceberg-catalog-hms = { workspace = true, optional = true }
 iceberg-catalog-glue = { workspace = true, optional = true }
 iceberg-catalog-sql = { workspace = true, optional = true }
@@ -164,8 +169,8 @@ sqlx = { workspace = true, optional = true }
 # Kept as direct deps so the credential-layering helper can name the
 # `SdkConfig` / `Credentials` types directly without going through one
 # of the SDK crates' re-exports.
-aws-config = { version = "1.8", optional = true }
-aws-credential-types = { version = "1.2", optional = true }
+aws-config = { version = "1.10", optional = true }
+aws-credential-types = { version = "1.3", optional = true }
 
 [dev-dependencies]
 opentelemetry = { workspace = true }

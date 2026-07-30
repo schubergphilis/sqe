@@ -150,11 +150,9 @@ impl MemoryPool for ResizableFairSpillPool {
         match reservation.consumer().can_spill() {
             true => {
                 let spill_available = pool_size.saturating_sub(state.unspillable);
-                let available = if state.num_spill == 0 {
-                    spill_available
-                } else {
-                    spill_available / state.num_spill
-                };
+                let available = spill_available
+                    .checked_div(state.num_spill)
+                    .unwrap_or(spill_available);
                 if reservation.size() + additional > available {
                     return Err(insufficient_capacity_err(
                         reservation,

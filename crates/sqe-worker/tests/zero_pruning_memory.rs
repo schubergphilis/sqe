@@ -99,7 +99,7 @@ async fn zero_pruning_scan_completes_under_byte_budget() {
     )
     .await
     .expect("Phase 1: scan setup must succeed under byte budgets");
-    assert!(schema.fields().len() >= 1);
+    assert!(!schema.fields().is_empty());
 
     let mut rows = 0usize;
     let mut bytes_decoded = 0u64;

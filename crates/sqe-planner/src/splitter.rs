@@ -46,7 +46,7 @@ pub fn bin_pack_files(
 
     // Sort largest first (first-fit-decreasing heuristic)
     let mut sorted = files;
-    sorted.sort_by(|a, b| b.1.cmp(&a.1));
+    sorted.sort_by_key(|f| std::cmp::Reverse(f.1));
 
     let mut bins: Vec<(u64, Vec<(String, u64)>)> = vec![]; // (total_size, files)
 

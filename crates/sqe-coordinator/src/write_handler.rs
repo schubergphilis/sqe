@@ -6573,8 +6573,7 @@ pub(crate) fn build_partition_spec(
     // endpoint rejects. Assigning the standard 1000+ ids up front keeps
     // the wire format compatible.
     let mut fields = Vec::with_capacity(exprs.len());
-    let mut next_field_id: i32 = 1000;
-    for partition_expr in exprs {
+    for (next_field_id, partition_expr) in (1000_i32..).zip(exprs) {
         let (source_name, target_name, transform) =
             parse_partition_transform(partition_expr)?;
         let source_id = iceberg_schema
@@ -6594,7 +6593,6 @@ pub(crate) fn build_partition_spec(
             name: target_name,
             transform,
         });
-        next_field_id += 1;
     }
 
     let spec = UnboundPartitionSpec::builder()

@@ -433,7 +433,7 @@ impl WorkerFlightService {
         if self.worker_secret.is_empty() {
             return Ok(());
         }
-        use hmac::{Hmac, Mac};
+        use hmac::{Hmac, KeyInit, Mac};
         use sha2::Sha256;
         use subtle::ConstantTimeEq;
 
@@ -1429,7 +1429,7 @@ mod tests {
     /// Recompute the HMAC-SHA256 tag (hex) the coordinator would attach, used
     /// by the #206 signature tests to forge a valid header.
     fn sign(secret: &str, bytes: &[u8]) -> String {
-        use hmac::{Hmac, Mac};
+        use hmac::{Hmac, KeyInit, Mac};
         use sha2::Sha256;
         let mut mac = <Hmac<Sha256>>::new_from_slice(secret.as_bytes()).unwrap();
         mac.update(bytes);

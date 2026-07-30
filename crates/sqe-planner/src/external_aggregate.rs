@@ -338,9 +338,9 @@ fn emit_table(
 
     let mut fields = Vec::new();
     let mut arrays: Vec<ArrayRef> = Vec::new();
-    for i in 0..n_keys {
+    for (i, col) in key_cols.iter().enumerate().take(n_keys) {
         fields.push(Field::new(format!("key_{i}"), DataType::Int64, false));
-        arrays.push(Arc::new(Int64Array::from(key_cols[i].clone())));
+        arrays.push(Arc::new(Int64Array::from(col.clone())));
     }
     for (ai, agg) in aggs.iter().enumerate() {
         fields.push(Field::new(agg.name(), DataType::Int64, false));

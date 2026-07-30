@@ -192,7 +192,7 @@ pub const DASHBOARD_HTML: &str = include_str!("web_ui/dashboard.html");
 fn sql_digest(sql: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(sql.as_bytes());
-    format!("{:x}", hasher.finalize())
+    hex::encode(hasher.finalize())
 }
 
 #[derive(Serialize, PartialEq, Debug)]
@@ -268,7 +268,7 @@ pub fn query_list(
         .filter(|s| s != "all" && !s.is_empty());
 
     let mut records = tracker.records();
-    records.sort_by(|a, b| b.created.cmp(&a.created));
+    records.sort_by_key(|r| std::cmp::Reverse(r.created));
 
     records
         .into_iter()

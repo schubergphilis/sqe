@@ -117,9 +117,12 @@ impl ExchangeDescriptor {
 ///
 /// Late data from a lower attempt is rejected so a retried producer cannot
 /// poison results after a winner has already been accepted.
+/// (query_id, stage_id, partition) -> highest accepted attempt id.
+type WinnerMap = HashMap<(String, String, u32), u32>;
+
 #[derive(Clone, Default)]
 pub struct AttemptGate {
-    winners: Arc<Mutex<HashMap<(String, String, u32), u32>>>,
+    winners: Arc<Mutex<WinnerMap>>,
 }
 
 impl AttemptGate {

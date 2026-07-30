@@ -410,7 +410,7 @@ pub fn process_rss_bytes() -> Option<u64> {
     }
     #[cfg(target_os = "macos")]
     {
-        return process_rss_macos();
+        process_rss_macos()
     }
     #[cfg(target_os = "windows")]
     {
@@ -902,7 +902,7 @@ fn host_memory_info() -> HostMemoryInfo {
     }
     #[cfg(target_os = "macos")]
     {
-        return host_memory_macos();
+        host_memory_macos()
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
@@ -993,7 +993,7 @@ mod tests {
         assert_eq!(parse_memory_limit_value("0"), None);
         assert_eq!(parse_memory_limit_value("1048576"), Some(1048576));
         assert_eq!(
-            parse_memory_limit_value(&((1u64 << 62)).to_string()),
+            parse_memory_limit_value(&(1u64 << 62).to_string()),
             None
         );
     }

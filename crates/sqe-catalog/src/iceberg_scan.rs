@@ -1030,7 +1030,7 @@ impl ExecutionPlan for IcebergScanExec {
             // latency. For over-partitioned tables with many small files this also
             // groups tiny files at the end where their overhead is amortised.
             let total_scan_bytes: u64 = file_entries.iter().map(|(_, sz)| *sz).sum();
-            file_entries.sort_by(|a, b| b.1.cmp(&a.1));
+            file_entries.sort_by_key(|e| std::cmp::Reverse(e.1));
             debug!(
                 file_count = file_entries.len(),
                 total_scan_bytes = total_scan_bytes,

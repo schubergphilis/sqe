@@ -490,7 +490,7 @@ impl SegmentStore for S3SegmentStore {
         let mut keys = Vec::new();
         while let Some(item) = list.next().await {
             let meta = item.map_err(|e| map_os_err(prefix.as_ref(), e))?;
-            keys.push((meta.location, meta.size as u64));
+            keys.push((meta.location, meta.size));
         }
         for (loc, size) in keys {
             if let Err(e) = self.store.delete(&loc).await {
@@ -641,7 +641,7 @@ impl SegmentWriter for S3SegmentWriter {
                 partial_opts,
             )
             .await
-            .map_err(|e| map_os_err(&self.partial_key.to_string(), e))?;
+            .map_err(|e| map_os_err(self.partial_key.as_ref(), e))?;
 
         // Publish: put final with segment tags (copy not always tagged on all backends).
         let mut final_opts = PutOptions::from(lifecycle_tags_for_segment(&self.scope));
@@ -654,7 +654,7 @@ impl SegmentWriter for S3SegmentWriter {
                 final_opts,
             )
             .await
-            .map_err(|e| map_os_err(&self.final_key.to_string(), e))?;
+            .map_err(|e| map_os_err(self.final_key.as_ref(), e))?;
 
         // Delete partial staging object.
         let _ = self.store.delete(&self.partial_key).await;
