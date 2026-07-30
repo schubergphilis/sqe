@@ -1137,7 +1137,7 @@ async fn submit_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
     let sql_hash = {
         use sha2::{Digest, Sha256};
         let normalised: String = sql.split_whitespace().collect::<Vec<_>>().join(" ").to_uppercase();
-        format!("{:x}", Sha256::digest(normalised.as_bytes()))
+        hex::encode(Sha256::digest(normalised.as_bytes()))
     };
     info!(
         user = %session.user.username,

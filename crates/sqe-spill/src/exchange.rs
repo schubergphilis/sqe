@@ -258,10 +258,10 @@ impl ExchangeAttemptStore {
 
     /// True if this attempt is still admissible (no higher winner).
     pub fn admit(&self, key: &TaskKey, attempt_id: u32) -> bool {
-        match self.winners.lock().unwrap_or_else(|p| p.into_inner()).get(key) {
-            Some(w) if attempt_id < *w => false,
-            _ => true,
-        }
+        !matches!(
+            self.winners.lock().unwrap_or_else(|p| p.into_inner()).get(key),
+            Some(w) if attempt_id < *w
+        )
     }
 
     /// Fetch a reusable committed/published manifest for retry.

@@ -213,7 +213,7 @@ impl Session {
 
     pub fn token_fingerprint(&self) -> String {
         use sha2::{Digest, Sha256};
-        let hash = format!("{:x}", Sha256::digest(self.access_token.expose_bytes()));
+        let hash = hex::encode(Sha256::digest(self.access_token.expose_bytes()));
         format!("{}-{}", self.user.username, &hash[..16])
     }
 

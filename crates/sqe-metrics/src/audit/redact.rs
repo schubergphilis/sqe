@@ -120,7 +120,7 @@ pub fn mask_gdpr_columns(
                 let mut h = Sha256::new();
                 h.update(salt.as_bytes());
                 h.update(col.to_lowercase().as_bytes());
-                let hex = format!("{:x}", h.finalize());
+                let hex = hex::encode(h.finalize());
                 format!("col_{}", &hex[..8])
             }
         };

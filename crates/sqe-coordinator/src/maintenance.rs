@@ -1106,7 +1106,7 @@ impl MaintenanceHandler {
         let read_plan_arc = Arc::new(read_plan);
         let live_deletes_arc = Arc::new(live_deletes);
         let results: Vec<(Vec<DataFile>, Vec<DataFile>, u64)> =
-            stream::iter(eligible_groups.into_iter())
+            stream::iter(eligible_groups)
                 .map(|group| {
                     let table_for_group = table_arc.clone();
                     let tracker_for_group = tracker.clone();

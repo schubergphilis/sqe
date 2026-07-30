@@ -58,7 +58,7 @@ fn compute_hash(event: &AuditEvent) -> String {
     let mut hasher = Sha256::new();
     hasher.update(clone.integrity.prev_hash.as_bytes());
     hasher.update(body.as_bytes());
-    format!("{:x}", hasher.finalize())
+    hex::encode(hasher.finalize())
 }
 
 #[derive(Debug)]
@@ -105,6 +105,46 @@ mod tests {
         assert_eq!(b.integrity.seq, 1);
         assert_eq!(b.integrity.prev_hash, a.integrity.hash);
         verify_chain(&[a, b]).unwrap();
+    }
+
+    /// The chain hash must stay a 64-character, fully zero-padded lowercase hex
+    /// string.
+    ///
+    /// `compute_hash` used to render the digest with `format!("{:x}", ..)`,
+    /// which sha2 0.11 no longer supports (it returns `Array<u8, N>` instead of
+    /// `GenericArray`). The replacement is `hex::encode`. The digest bytes are
+    /// unchanged either way, so previously written chains still verify -- but a
+    /// hand-rolled per-byte `{:x}` would silently drop leading zeros (0x0a ->
+    /// "a" instead of "0a"), shortening roughly one byte in sixteen and
+    /// breaking verification only for some records. Assert the invariant that
+    /// rules that out.
+    #[test]
+    fn chain_hash_is_padded_lowercase_hex() {
+        let mut chain = HashChain::new();
+        let mut event = sample_query_event();
+        chain.stamp(&mut event);
+        let hash = &event.integrity.hash;
+
+        assert_eq!(
+            hash.len(),
+            64,
+            "sha256 must render as exactly 64 hex chars (32 bytes x 2), got {}: {hash}",
+            hash.len()
+        );
+        assert!(
+            hash.chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)),
+            "hash must be lowercase hex, got {hash}"
+        );
+    }
+
+    /// Guards the zero-padding property directly, independent of whatever the
+    /// sample event happens to hash to: every byte value must occupy two hex
+    /// characters, including those below 0x10.
+    #[test]
+    fn hex_encoding_zero_pads_every_byte() {
+        assert_eq!(hex::encode([0x0a_u8]), "0a");
+        assert_eq!(hex::encode([0x00_u8, 0x01, 0x0f]), "00010f");
+        assert_eq!(hex::encode([0u8; 32]).len(), 64);
     }
 
     #[test]

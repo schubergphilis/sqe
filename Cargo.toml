@@ -84,7 +84,7 @@ iceberg-catalog-s3tables = { path = "vendor/iceberg-rust/crates/catalog/s3tables
 # default pulls every backend's transitive AWS SDK / Thrift / sqlx
 # weight unconditionally.
 iceberg-catalog-loader = { path = "vendor/iceberg-rust/crates/catalog/loader", default-features = false }
-sqlx = { version = "0.8.1", default-features = false }
+sqlx = { version = "0.9.0", default-features = false }
 
 # SQL parser — SQE pins this directly for the `visitor` feature (VisitMut derive
 # used by sqe-sql for AST rewrites like Trino-compat CAST(v AS JSON) -> to_json(v)).
@@ -101,7 +101,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"
 
 # HTTP
 axum = "0.8"
-reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+reqwest = { version = "0.13", features = ["json", "rustls", "form", "query"], default-features = false }
 
 # gRPC (Arrow Flight) — arrow-flight 57 requires tonic 0.14
 tonic = { version = "0.14", features = ["transport", "tls-ring"] }
@@ -110,37 +110,40 @@ prost = "0.14"
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-toml = "0.8"
+toml = "0.9"
 
 # Concurrency / Caching
 dashmap = "6"
 moka = { version = "0.12", features = ["future", "sync"] }
 
 # Rate limiting
-governor = "0.8"
+governor = "0.10"
 
 # Auth
-# HELD at 9. The 11.x bump arrived via renovate !728 unvalidated and cost two
-# separate failures: 11 ships NO crypto provider by default, so every JWT
-# verification panicked at runtime (it compiled clean -- !738), and the
-# `rust_crypto` provider that fixes it pulls p256/p384 and transitively
-# fiat-crypto, whose BSD-1-Clause licence is absent from the group policy
-# allow-list. The other provider, `aws_lc_rs`, needs a C toolchain
-# (aws-lc-sys) at build time. 9.x needs no provider selection and its
-# licence set is already approved. Revisit 11 once BSD-1-Clause is on the
-# central allow-list (it is permissive, and the policy intends to allow
-# reviewed permissive ids) -- then it is a clean bump.
+# PINNED at 9 by decision, not by blocker. The 11.x bump arrived via renovate
+# !728 unvalidated and cost two separate failures: 11 ships NO crypto provider
+# by default, so every JWT verification panicked at runtime while compiling
+# perfectly clean (!738), and the `rust_crypto` provider that fixes that pulls
+# p256/p384 and transitively fiat-crypto. The other provider, `aws_lc_rs`,
+# needs a C toolchain (aws-lc-sys) at build time, which is worse for
+# reproducible cross-platform builds.
+#
+# 9.x needs no provider selection at all, so there is no runtime-only failure
+# mode to guard against, and it carries a smaller crypto dependency tree. Do
+# not let a bot bump this: renovate is configured to treat it as a major, and
+# any move to 11 has to come with an explicit provider feature and a test that
+# actually verifies a token rather than merely type-checking.
 jsonwebtoken = "9"
 
 # Observability
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 prometheus = "0.14"
-opentelemetry = "0.31"
-opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
-opentelemetry-otlp = { version = "0.31", features = ["grpc-tonic", "trace", "metrics", "logs"] }
-tracing-opentelemetry = "0.32"
-opentelemetry-appender-tracing = "0.31"
+opentelemetry = "0.32"
+opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.32", features = ["grpc-tonic", "trace", "metrics", "logs"] }
+tracing-opentelemetry = "0.33"
+opentelemetry-appender-tracing = "0.32"
 
 # Error handling
 thiserror = "2"
@@ -151,13 +154,32 @@ clap = { version = "4", features = ["derive", "env"] }
 
 # Data generation
 csv = "1"
+# HELD at 0.8: sqe-bench generators seed StdRng explicitly
+# (`StdRng::seed_from_u64`) and rand does not guarantee identical output
+# across releases, so bumping silently changes generated benchmark data
+# for the same seed -- invalidating comparability with the committed
+# baselines in benchmarks/results/ and the DuckDB-oracle fidelity checks.
+# 475 call sites across 9 files would also need the gen_range ->
+# random_range / thread_rng -> rng renames. Bump deliberately, with a
+# generator re-validation, not as part of a dependency refresh.
+# HELD at 0.8 -- the 0.10 migration was attempted and reverted (see #390).
+# rand does not guarantee output stability across releases and the sqe-bench
+# generators seed StdRng explicitly, so 0.10 changes the data produced for a
+# given seed. Measured effect at SF1 TPC-DS: matched 99/99 with 0 vacuous-bug
+# before, 97/99 with 2 after -- q29 and q85 return zero rows where the spec
+# says non-empty. Both need sales-to-returns chains with correlated customer
+# demographics, so the new sampling changed that correlation. All 4360 unit
+# tests and the 230-query suite still pass, which is exactly why this needs a
+# differential compare-trino run rather than a green build to validate.
+# The API rename itself is mechanical (486 sites, gen_range -> random_range,
+# and rand::Rng -> rand::RngExt for the generation methods).
 rand = "0.8"
 
 # Crypto
-sha2 = "0.10"
-hmac = "0.12"
+sha2 = "0.11"
+hmac = "0.13"
 hex = "0.4"
-base64 = "0.22"
+base64 = "0.23"
 subtle = "2"
 zeroize = "1"
 
@@ -191,7 +213,7 @@ tokio-util = "0.7"
 # Puffin NDV sketches — pure-Rust Apache DataSketches theta implementation.
 # Used by `crates/sqe-catalog/src/puffin_stats.rs` to write theta sketches
 # into Puffin sidecar files for the Iceberg statistics file list.
-datasketches = "0.2"
+datasketches = { version = "0.3", features = ["theta"] }
 
 # Zip archive reading for read_json(compression => 'zip'). deflate-only
 # (no bzip2/lzma/zstd zip methods needed); default-features off to skip

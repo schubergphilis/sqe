@@ -42,14 +42,22 @@ gcp_auth = "0.12"
 http = { workspace = true }
 iceberg = { workspace = true }
 itertools = { workspace = true }
-opentelemetry = "0.31"
+# MUST match the workspace opentelemetry version. `vendor/iceberg-rust` is
+# excluded from the workspace (root Cargo.toml `exclude`), so this cannot
+# inherit `workspace = true` and drifts silently. A mismatch puts two
+# opentelemetry versions in the graph, each with its OWN global propagator
+# registry: the binary installs the propagator into one, this client reads
+# the other, finds none, and emits no `traceparent` header. Everything still
+# compiles; distributed tracing just stops. See sqe-catalog
+# tests/mount_rest_test.rs::polaris_requests_preserve_the_incoming_trace_id.
+opentelemetry = "0.32"
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_derive = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }
 tracing = { workspace = true }
-tracing-opentelemetry = "0.32"
+tracing-opentelemetry = "0.33"
 typed-builder = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
 # Optional AWS SigV4 signer for the AWS Iceberg REST endpoints. Pinned

@@ -559,7 +559,7 @@ prometheus_port = {prometheus_port}
             memory_limit_bytes: 16 * 1024 * 1024, // below reserved
             governor_pool_bytes: 32 * 1024 * 1024,
             shuffle_budget_bytes: 8 * 1024 * 1024,
-            process_headroom_bytes: 1 * 1024 * 1024,
+            process_headroom_bytes: 1024 * 1024,
             configured_need_bytes: 17 * 1024 * 1024,
             scan_timeout_secs: 30,
         };

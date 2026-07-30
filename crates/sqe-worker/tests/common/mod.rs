@@ -175,8 +175,7 @@ pub fn generate_large_parquet(
     while decoded_bytes < target_decoded_bytes {
         let ids: Vec<i64> = (next_id..next_id + ROWS_PER_BATCH as i64).collect();
         next_id += ROWS_PER_BATCH as i64;
-        let payloads: Vec<&str> = std::iter::repeat(payload.as_str())
-            .take(ROWS_PER_BATCH)
+        let payloads: Vec<&str> = std::iter::repeat_n(payload.as_str(), ROWS_PER_BATCH)
             .collect();
 
         let batch = RecordBatch::try_new(
@@ -285,8 +284,7 @@ pub fn generate_wide_parquet(
     for _ in 0..num_batches {
         let ids: Vec<i64> = (next_id..next_id + rows_per_batch as i64).collect();
         next_id += rows_per_batch as i64;
-        let payloads: Vec<&str> = std::iter::repeat(payload.as_str())
-            .take(rows_per_batch)
+        let payloads: Vec<&str> = std::iter::repeat_n(payload.as_str(), rows_per_batch)
             .collect();
         let batch = RecordBatch::try_new(
             schema.clone(),
@@ -325,7 +323,7 @@ pub fn wide_batch(rows: usize, payload_len: usize) -> RecordBatch {
     ]));
     let payload = "S".repeat(payload_len);
     let ids: Vec<i64> = (0..rows as i64).collect();
-    let payloads: Vec<&str> = std::iter::repeat(payload.as_str()).take(rows).collect();
+    let payloads: Vec<&str> = std::iter::repeat_n(payload.as_str(), rows).collect();
     RecordBatch::try_new(
         schema,
         vec![

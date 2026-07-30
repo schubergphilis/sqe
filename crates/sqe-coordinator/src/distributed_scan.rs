@@ -57,7 +57,7 @@ const SCAN_SIGNATURE_HEADER: &str = "x-sqe-scan-signature";
 /// Returns `None` when `secret` is empty: an empty key means the deployment
 /// opted into `worker.allow_unauthenticated`, so there is nothing to sign.
 pub(crate) fn sign_ticket(secret: &str, bytes: &[u8]) -> Option<String> {
-    use hmac::{Hmac, Mac};
+    use hmac::{Hmac, KeyInit, Mac};
     use sha2::Sha256;
     if secret.is_empty() {
         return None;
