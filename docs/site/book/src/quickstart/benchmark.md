@@ -22,8 +22,9 @@ The run has three phases:
 3. **Test**: `sqe-bench test` runs every `.sql` in the suite over Flight SQL
    and reports pass / fail / error plus a per-query timing table.
 
-`sqe-bench` is a separate image built from `Dockerfile.bench`. Both images build
-from this repo on first run if absent.
+`sqe-bench` remains a separate runtime image and entrypoint, but it and the
+coordinator are targets of the same Dockerfile. BuildKit compiles their shared
+Rust dependency graph once when both images are built.
 
 ## What it demonstrates
 

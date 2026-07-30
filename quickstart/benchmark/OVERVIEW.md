@@ -18,7 +18,7 @@ profile on your machine.
 | `rustfs` + `bucket-init` | S3-compatible warehouse storage. |
 | `nessie` | Iceberg REST catalog (auth-less). |
 | `sqe` | Coordinator: Flight SQL on 50051. Reads generated Parquet via `read_parquet`. |
-| `sqe-bench` | One-shot tool: `generate` → `load` → `test`. Built from `Dockerfile.bench`. |
+| `sqe-bench` | One-shot tool: `generate` → `load` → `test`. Built from the shared Dockerfile's `bench-runtime` target. |
 
 ## Configuration
 

@@ -5,8 +5,9 @@
 # Nessie (auth-less) over RustFS, so the focus stays on the engine, not on auth.
 #
 # Two SQE images are involved:
-#   - sqe        : the coordinator (Dockerfile)        -> serves Flight SQL on 50051
-#   - sqe-bench  : the bench data tool (Dockerfile.bench) -> generate / load / test
+#   - sqe        : the coordinator (Dockerfile target runtime)
+#   - sqe-bench  : the bench data tool (Dockerfile target bench-runtime)
+# Both targets share one Rust compile stage.
 #
 # sqe-bench `generate` writes Parquet to a volume the coordinator also mounts;
 # `load` then issues CTAS-over-read_parquet, so the coordinator reads those files
@@ -87,6 +88,7 @@ services:
     build:
       context: ../..
       dockerfile: Dockerfile
+      target: runtime
     command: ["--config", "/etc/sqe/sqe.toml"]
     environment:
       RUST_LOG: "info"
@@ -114,7 +116,8 @@ services:
     image: sqe-bench:latest
     build:
       context: ../..
-      dockerfile: Dockerfile.bench
+      dockerfile: Dockerfile
+      target: bench-runtime
     user: "0:0"
     profiles: ["bench"]
     volumes:
