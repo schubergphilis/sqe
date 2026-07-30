@@ -624,31 +624,49 @@ fn detect_container_linux(cgroup_path: Option<&str>) -> ContainerKind {
     }
 
     // 3. cgroup path markers used by runtimes / kubelet.
-    if let Some(p) = cgroup_path {
-        let lower = p.to_ascii_lowercase();
-        if lower.contains("kubepods") || lower.contains("kubelet") {
-            return ContainerKind::Kubernetes;
-        }
-        if lower.contains("docker") {
-            return ContainerKind::Docker;
-        }
-        if lower.contains("podman") || lower.contains("libpod") {
-            return ContainerKind::Podman;
-        }
-        if lower.contains("containerd") || lower.contains("cri-containerd") {
-            return ContainerKind::Containerd;
-        }
-        if lower.contains("lxc") {
-            return ContainerKind::Lxc;
-        }
-        // Generic containerd/docker style: .../system.slice/docker-*.scope or
-        // long hex ids under cgroup paths are weak signals only.
-        if lower.contains("/docker-") || lower.contains("crio-") {
-            return ContainerKind::Generic;
-        }
+    if let Some(kind) = cgroup_path.and_then(container_kind_from_cgroup_path) {
+        return kind;
     }
 
     ContainerKind::BareMetal
+}
+
+/// Classify a cgroup path by the markers container runtimes and the kubelet
+/// leave in it. `None` means no marker matched, which the caller reads as bare
+/// metal.
+///
+/// Split out of [`detect_container_linux`] so it can be tested: this half is
+/// pure string inspection, while its caller probes env vars and marker files
+/// first and returns before ever reaching a cgroup path. A test that drove the
+/// combined function passed on a dev machine and failed on the Docker-based CI
+/// runner, where `/.dockerenv` exists and short-circuits to `Docker`.
+///
+/// Compiled outside Linux only under `cfg(test)` so the classification stays
+/// covered on any host without leaving dead code in non-Linux builds.
+#[cfg(any(target_os = "linux", test))]
+fn container_kind_from_cgroup_path(cgroup_path: &str) -> Option<ContainerKind> {
+    let lower = cgroup_path.to_ascii_lowercase();
+    if lower.contains("kubepods") || lower.contains("kubelet") {
+        return Some(ContainerKind::Kubernetes);
+    }
+    if lower.contains("docker") {
+        return Some(ContainerKind::Docker);
+    }
+    if lower.contains("podman") || lower.contains("libpod") {
+        return Some(ContainerKind::Podman);
+    }
+    if lower.contains("containerd") || lower.contains("cri-containerd") {
+        return Some(ContainerKind::Containerd);
+    }
+    if lower.contains("lxc") {
+        return Some(ContainerKind::Lxc);
+    }
+    // Generic containerd/docker style: .../system.slice/docker-*.scope or
+    // long hex ids under cgroup paths are weak signals only.
+    if lower.contains("/docker-") || lower.contains("crio-") {
+        return Some(ContainerKind::Generic);
+    }
+    None
 }
 
 #[cfg(target_os = "linux")]
@@ -1043,25 +1061,47 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "linux")]
     fn container_kind_from_cgroup_path_markers() {
+        // Asserts on the pure classifier, never on `detect_container_linux`:
+        // that one consults KUBERNETES_SERVICE_HOST, $container, /.dockerenv and
+        // /run/.containerenv first, so its result depends on the host running
+        // the test rather than on the path passed in.
+
+        // kubepods wins over the cri-containerd marker in the same path.
         assert_eq!(
-            detect_container_linux(Some(
+            container_kind_from_cgroup_path(
                 "/kubepods.slice/kubepods-burstable.slice/cri-containerd-abc.scope"
-            )),
-            ContainerKind::Kubernetes
+            ),
+            Some(ContainerKind::Kubernetes)
         );
         assert_eq!(
-            detect_container_linux(Some("/docker/abc123")),
-            ContainerKind::Docker
+            container_kind_from_cgroup_path("/docker/abc123"),
+            Some(ContainerKind::Docker)
         );
         assert_eq!(
-            detect_container_linux(Some("/machine.slice/libpod-xyz.scope")),
-            ContainerKind::Podman
+            container_kind_from_cgroup_path("/machine.slice/libpod-xyz.scope"),
+            Some(ContainerKind::Podman)
         );
-        // Without env/files, empty path → bare metal (test env may still set
-        // KUBERNETES_SERVICE_HOST — only assert marker paths above).
-        let _ = detect_container_linux(Some("/user.slice"));
+        assert_eq!(
+            container_kind_from_cgroup_path("/system.slice/containerd.service"),
+            Some(ContainerKind::Containerd)
+        );
+        assert_eq!(
+            container_kind_from_cgroup_path("/lxc/ct0"),
+            Some(ContainerKind::Lxc)
+        );
+        assert_eq!(
+            container_kind_from_cgroup_path("/system.slice/crio-abc.scope"),
+            Some(ContainerKind::Generic)
+        );
+        // Case-insensitive: the classifier lowercases before matching.
+        assert_eq!(
+            container_kind_from_cgroup_path("/KubePods.slice/pod0"),
+            Some(ContainerKind::Kubernetes)
+        );
+        // No marker: the caller reads None as bare metal.
+        assert_eq!(container_kind_from_cgroup_path("/user.slice"), None);
+        assert_eq!(container_kind_from_cgroup_path(""), None);
     }
 
     #[test]
