@@ -30,7 +30,10 @@ ENV RUSTFLAGS="-C linker=clang -C link-arg=-fuse-ld=lld"
 ENV RUSTC_WRAPPER=sccache
 # sccache config: local disk cache (in Docker BuildKit cache mount)
 ENV SCCACHE_DIR=/sccache
-ENV SCCACHE_CACHE_SIZE=2G
+# Shared by every SQE Docker target in the active BuildKit builder.  The
+# DataFusion/Arrow graph can evict useful objects quickly from the old 2 GiB
+# limit when switching between the server and benchmark binaries.
+ENV SCCACHE_CACHE_SIZE=5G
 
 WORKDIR /build
 
@@ -47,11 +50,12 @@ RUN cargo chef prepare --recipe-path recipe.json
 # ── Stage 3: Build dependencies (cached unless recipe changes) ─
 FROM chef AS deps
 ARG TARGETARCH
+ARG CARGO_PROFILE=release
 COPY --from=planner /build/recipe.json recipe.json
 # Vendored iceberg-rust crates (path dependencies in Cargo.toml)
 COPY vendor/ vendor/
 # `sharing=locked` on the registry/git/sccache mounts: their cache `id`s are
-# shared verbatim with Dockerfile.full and Dockerfile.bench, so two builds
+# shared verbatim with Dockerfile.full and the legacy Dockerfile.bench, so builds
 # running concurrently (e.g. building both images in parallel) race on the
 # SAME cache mount. Default (unlocked) sharing lets both writers unpack into
 # it at once, which corrupts the registry -- symptom: `failed to unpack
@@ -60,14 +64,16 @@ COPY vendor/ vendor/
 RUN --mount=type=cache,id=sqe-cargo-registry-${TARGETARCH},sharing=locked,target=/usr/local/cargo/registry \
     --mount=type=cache,id=sqe-cargo-git-${TARGETARCH},sharing=locked,target=/usr/local/cargo/git \
     --mount=type=cache,id=sqe-sccache-${TARGETARCH},sharing=locked,target=/sccache \
-    cargo chef cook --release --recipe-path recipe.json \
+    cargo chef cook --profile "${CARGO_PROFILE}" --recipe-path recipe.json \
       --no-default-features \
-      --package sqe-coordinator --package sqe-worker --package sqe-cli && \
+      --package sqe-coordinator --package sqe-worker --package sqe-cli \
+      --package sqe-bench && \
     sccache --show-stats
 
 # ── Stage 4: Build application (only workspace crates recompile) ─
 FROM deps AS builder
 ARG TARGETARCH
+ARG CARGO_PROFILE=release
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
 COPY vendor/ vendor/
@@ -77,15 +83,39 @@ COPY xtask/ xtask/
 RUN --mount=type=cache,id=sqe-cargo-registry-${TARGETARCH},sharing=locked,target=/usr/local/cargo/registry \
     --mount=type=cache,id=sqe-cargo-git-${TARGETARCH},sharing=locked,target=/usr/local/cargo/git \
     --mount=type=cache,id=sqe-sccache-${TARGETARCH},sharing=locked,target=/sccache \
-    --mount=type=cache,id=sqe-target-release-${TARGETARCH},target=/build/target,sharing=locked,from=deps,source=/build/target \
-    cargo build --release --no-default-features \
-      --bin sqe-server --bin sqe-worker --bin sqe-cli && \
+    --mount=type=cache,id=sqe-target-${CARGO_PROFILE}-${TARGETARCH},target=/build/target,sharing=locked,from=deps,source=/build/target \
+    cargo build --profile "${CARGO_PROFILE}" --no-default-features \
+      --bin sqe-server --bin sqe-worker --bin sqe-cli --bin sqe-bench && \
     mkdir -p /build/out && \
-    cp target/release/sqe-server target/release/sqe-worker target/release/sqe-cli /build/out/ && \
+    cp "target/${CARGO_PROFILE}/sqe-server" "target/${CARGO_PROFILE}/sqe-worker" \
+      "target/${CARGO_PROFILE}/sqe-cli" "target/${CARGO_PROFILE}/sqe-bench" /build/out/ && \
     sccache --show-stats
 
-# ── Stage 5: Runtime image ────────────────────────────────────
-FROM debian:bookworm-slim
+# ── Stage 5: Shared runtime base ──────────────────────────────
+FROM debian:bookworm-slim AS runtime-base
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates libssl3 curl && \
+    rm -rf /var/lib/apt/lists/* && \
+    groupadd -r sqe && useradd -r -g sqe -u 1000 sqe
+
+USER sqe
+
+# The two runtime targets below intentionally share the expensive `builder`
+# stage. `docker compose build` therefore compiles and links all four binaries
+# once, while retaining distinct image entrypoints for the long-running server
+# and the one-shot benchmark generator.
+FROM runtime-base AS bench-runtime
+
+LABEL org.opencontainers.image.title="sqe-bench" \
+      org.opencontainers.image.description="TPC benchmark data generator for SQE"
+
+COPY --from=builder /build/out/sqe-bench /usr/local/bin/
+
+ENTRYPOINT ["sqe-bench"]
+
+# Keep the server runtime last so a plain `docker build .` remains compatible.
+FROM runtime-base AS runtime
 
 ARG VERSION=dev
 ARG BUILD_DATE
@@ -98,14 +128,9 @@ LABEL org.opencontainers.image.title="sqe" \
       org.opencontainers.image.revision="${GIT_REVISION}" \
       org.opencontainers.image.source="https://github.com/schuberg/sqe"
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates libssl3 curl && \
-    rm -rf /var/lib/apt/lists/* && \
-    groupadd -r sqe && useradd -r -g sqe -u 1000 sqe
+COPY --from=builder /build/out/sqe-server /build/out/sqe-worker \
+    /build/out/sqe-cli /usr/local/bin/
 
-COPY --from=builder /build/out/ /usr/local/bin/
-
-USER sqe
 EXPOSE 50051 50052 8080 9090 9091
 
 HEALTHCHECK --interval=10s --timeout=3s --start-period=10s --retries=3 \
