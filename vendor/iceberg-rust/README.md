@@ -37,13 +37,27 @@ The RisingWave fork provides all of these.
 
 ## Upstream tracking
 
-- RisingWave fork: `dev_rebase_main_20260303` @ `813e54419b43`
+- RisingWave fork: `dev_rebase_main_20260303`, vendored baseline `813e54419b43` plus three backports (see below); branch tip at last audit `ac90a10d`
 - Apache upstream: tracking PRs #2185 (OverwriteAction) and #2203 (RowDeltaAction)
 - When upstream merges these, SQE will migrate to official apache/iceberg-rust
 
-Last audited on 2026-07-13. The RisingWave branch had advanced to
-`0d9e873c1262`; its three code commits after the vendored baseline are not yet
-backported:
+Last audited on 2026-07-30. The RisingWave branch had advanced to
+`ac90a10d`, 11 commits past the vendored baseline. Three of them are
+backported as focused commits on top of this snapshot:
+
+- `f31001cd` (RW #187) lenient decode of truncated string metric bounds.
+- `ee489f56` (RW #188) drop dangling deletion vectors when data files are
+  rewritten. Relevant to SQE's compaction path. Note this is manifest bloat
+  and pinned Puffin files, NOT row resurrection: a stale DV binds to a
+  data-file path that no longer exists, so it applies to nothing.
+- `edf72a59` (RW #190) resolve predicate field IDs via the Arrow schema when
+  Parquet leaves lack them. Lands in `reader.rs` alongside three SQE patch
+  families and still applied cleanly.
+
+That `ee489f56` applies cleanly is itself useful: it means the dangling-DV fix
+does *not* depend on `c3ac742` below.
+
+Still not backported:
 
 - `c3ac742` unifies the overwrite/rewrite transaction implementations. Its
   public transaction entry points remain source-compatible, but it overlaps
@@ -53,11 +67,32 @@ backported:
   conflict/retry validation before adoption.
 - `0d9e873` streams manifest loading during orphan-file removal. This is
   API-compatible; it remains pending maintenance-path validation.
+- `0b65d716` (RW #185) bounds rewrite-manifests memory and calibrates the
+  manifest size estimate. **Blocked on `61a8941`**: 4 of its 5
+  `rewrite_manifests.rs` hunks do not apply without it, and it also deletes
+  `crates/iceberg/src/utils.rs`, which this tree no longer has (apache renamed
+  it to `util/mod.rs`). Wanted for the OOM-safety program, so it is worth
+  taking together with `61a8941` as one validated piece.
+- `550393d0` (RW #186) fails cleanly instead of panicking on truncated data
+  files. Needs a hand port: the `reader.rs` hunk only lands with fuzz against
+  SQE's drifted copy, and its one `spec/manifest/writer.rs` hunk (+5/-3 in
+  `datum_serialized_len`) does not apply. Small, but not mechanical.
+- `08a18f41` / `ac90a10d` add trait impls and exports for `DeleteVector`.
+  API surface only; take when something needs them.
 
 Apache `main` is audited selectively rather than merged wholesale: it has
 different transaction APIs, dependency versions, and MSRV requirements. Every
 accepted fix is listed below with its upstream PR and retained as a focused
 backport.
+
+Apache cut **v0.10.0** on 2026-07-21. It does not replace this fork and is not
+a de-vendoring path: it has no rewrite/overwrite transaction actions, no
+`PositionDeleteFileWriter` or `DeletionVectorWriter`, and no `expr::dynamic`,
+while its `iceberg-datafusion` targets DataFusion 53 (SQE is on 54, so that
+would be a downgrade). Its MSRV is `rust-version = "1.94"`, which is the floor
+for taking apache cherry-picks. Use 0.10.0 as the audit baseline for the next
+apache sweep instead: apache `main` is roughly four months past this fork's
+`dev_rebase_main_20260303` base.
 
 ## SQE-only patches in this vendor copy
 
