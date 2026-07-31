@@ -78,7 +78,7 @@ SQE_BUILD_ARGS := \
 	--build-arg VERSION=$(IMAGE_TAG)
 
 .PHONY: help all check dev release rustbook ebook ebook-pdf ebook-epub ebook-html \
-        benchmark-charts test clippy fmt fmt-check clean clean-rust clean-rustbook \
+        benchmark-charts test test-access-control clippy fmt fmt-check clean clean-rust clean-rustbook \
         clean-ebook clean-benchmark-charts clean-images check-tools maintain \
         build build-sqe sbom sbom-sqe sqe-config images \
         login buildx-builder push push-sqe leak-scan
@@ -92,6 +92,7 @@ help:
 	@echo "    make dev          Debug build of sqe-cli + sqe-server (fast compile)"
 	@echo "    make release      Release build of sqe-cli + sqe-server (LTO, optimised)"
 	@echo "    make test         cargo test --workspace"
+	@echo "    make test-access-control  Ranger/Polaris access-control e2e (brings up the Ranger stack)"
 	@echo "    make clippy       cargo clippy --all-targets -- -D warnings"
 	@echo "    make fmt          cargo fmt --all"
 	@echo "    make fmt-check    cargo fmt --all --check"
@@ -153,6 +154,12 @@ test:
 	@echo "==> Running unit tests"
 	$(CARGO) test --workspace --exclude sqe-cli
 	$(CARGO) test --package sqe-cli --no-default-features
+
+# ── Access-control e2e (Polaris + Ranger + Keycloak) ──────────────────────
+# Brings up a subset of quickstart/polaris-ranger-keycloak and runs the Rust
+# access-control suite against it. Ranger Admin's first boot takes 2-4 minutes.
+test-access-control:
+	@scripts/access-control-test.sh
 
 clippy:
 	@echo "==> Running clippy"

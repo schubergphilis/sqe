@@ -189,6 +189,130 @@ pub async fn setup_handler_with_workers(
     (session, handler)
 }
 
+// ── Access-control e2e helpers (see tests/it/access_control_e2e.rs) ─────────
+
+/// Path to the Ranger e2e config, resolved from the workspace root like
+/// `test_config_path()`.
+#[allow(dead_code)]
+pub fn ranger_config_path() -> String {
+    let manifest_dir =
+        std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
+    let workspace_root = std::path::Path::new(&manifest_dir)
+        .parent()
+        .and_then(|p| p.parent())
+        .unwrap_or(std::path::Path::new("."));
+    workspace_root
+        .join("tests")
+        .join("sqe-ranger-test.toml")
+        .to_string_lossy()
+        .to_string()
+}
+
+/// True when the caller opted into the access-control e2e suite.
+///
+/// The suite needs the `quickstart/polaris-ranger-keycloak` stack, which is NOT
+/// the stack `scripts/integration-test.sh` brings up. `#[ignore]` alone is not
+/// enough, because that script runs `cargo test -p sqe-coordinator -- --ignored`
+/// and would force-run these. Opt in with `SQE_AC_E2E=1`
+/// (`scripts/access-control-test.sh` sets it).
+#[allow(dead_code)]
+pub fn ac_enabled() -> bool {
+    std::env::var("SQE_AC_E2E").as_deref() == Ok("1")
+}
+
+/// Process-wide serialization for the access-control tests. They share Ranger
+/// state, the policy cache, and the fixture tables.
+#[allow(dead_code)]
+pub fn serial() -> &'static tokio::sync::Mutex<()> {
+    static S: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    S.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+/// Build a `QueryHandler` wired to the REAL Ranger enforcer and Ranger grant
+/// backend from `tests/sqe-ranger-test.toml`.
+///
+/// Returns the handler and the `TableMetadataCache` it shares with the policy
+/// enforcer. The SAME cache instance must reach both: `CacheTagSource` reads
+/// column tags out of it, and a separate cache reports tag state as unknown,
+/// which fails closed.
+#[allow(dead_code)]
+pub async fn setup_ranger_handler(
+) -> (sqe_coordinator::QueryHandler, sqe_catalog::TableMetadataCache) {
+    init_tracing();
+    let config = sqe_core::SqeConfig::load(&ranger_config_path())
+        .expect("load tests/sqe-ranger-test.toml");
+    let table_cache = sqe_catalog::TableMetadataCache::new(30);
+    let (enforcer, store) = sqe_coordinator::policy_wiring::build_policy_enforcer(
+        &config.policy,
+        Some(table_cache.clone()),
+        None,
+    )
+    .expect("build ranger policy enforcer");
+    let grant_backend = sqe_coordinator::policy_wiring::build_grant_backend(&config)
+        .expect("build ranger grant backend");
+    let query_tracker = Arc::new(sqe_coordinator::query_tracker::QueryTracker::new(
+        &config.query_history,
+    ));
+    let handler = sqe_coordinator::QueryHandler::new(
+        enforcer,
+        store,
+        config,
+        None, // worker_registry
+        None, // credential_tracker
+        None, // metrics
+        None, // audit
+        query_tracker,
+        None, // query_cache
+        grant_backend,
+        None, // lineage
+        sqe_coordinator::RuntimeCatalogRegistry::default(),
+        sqe_core::SecretStore::default(),
+    )
+    .expect("build QueryHandler")
+    .with_table_cache(table_cache.clone());
+    (handler, table_cache)
+}
+
+/// Authenticate a quickstart user through Keycloak ROPC. Password convention is
+/// `<user>123` (alice123, bob123, carol123, dave123).
+#[allow(dead_code)]
+pub async fn ranger_session(user: &str) -> sqe_core::Session {
+    let config = sqe_core::SqeConfig::load(&ranger_config_path())
+        .expect("load tests/sqe-ranger-test.toml");
+    let authenticator = sqe_auth::Authenticator::new(&config.auth)
+        .await
+        .expect("create authenticator");
+    authenticator
+        .authenticate(user, &format!("{user}123"))
+        .await
+        .unwrap_or_else(|e| panic!("Keycloak ROPC failed for {user}: {e}"))
+}
+
+/// Retry `f` until it returns `Ok` or 30s elapse. Panics with the last failure.
+///
+/// Policy changes made over the Ranger REST API become visible only after the
+/// policy cache TTL (`policy.ranger.cache-ttl-secs = 2` in the test config), so
+/// assertions need a bounded wait. Never use a bare sleep: it either flakes or
+/// wastes wall clock, and it hides which assertion was still failing.
+#[allow(dead_code)]
+pub async fn eventually<F, Fut, T>(what: &str, mut f: F) -> T
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, String>>,
+{
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let last = match f().await {
+            Ok(v) => return v,
+            Err(e) => e,
+        };
+        if std::time::Instant::now() >= deadline {
+            panic!("timed out after 30s waiting for {what}; last failure: {last}");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+}
+
 /// Format a single cell value from an Arrow column for display / comparison.
 // Used by sql_compat_test.rs; integration_test.rs uses print_results instead.
 #[allow(dead_code)]
