@@ -66,8 +66,7 @@ async fn fixture_round_trip_creates_services_and_policies() {
     let _guard = crate::common::serial().lock().await;
     let ranger = RangerAdmin::from_env();
     ranger.require_reachable().await;
-    ranger.ensure_services().await.expect("ensure services");
-    ranger.delete_test_policies().await.expect("clean prefix");
+    ranger.bootstrap().await.expect("ranger bootstrap");
 
     // A minimal mask policy, created and then read back over REST.
     let name = format!("{PREFIX}roundtrip");
@@ -174,8 +173,10 @@ async fn ac_setup() -> AcCtx {
     let (handler, _cache) = crate::common::setup_ranger_handler().await;
     let ranger = RangerAdmin::from_env();
     ranger.require_reachable().await;
-    ranger.ensure_services().await.expect("ensure services");
-    ranger.delete_test_policies().await.expect("clean prefix");
+    // One idempotent call does the whole Ranger-side bootstrap: tag-servicedef
+    // row-filter capability, the two test-owned services and their link, and a
+    // clean sqe-ac-e2e- policy slate.
+    ranger.bootstrap().await.expect("ranger bootstrap");
     clear_audit_deny_items(&ranger).await;
 
     let carol = crate::common::ranger_session("carol").await;
@@ -1004,44 +1005,55 @@ async fn tag_column_mask_applies_from_iceberg_property() {
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs quickstart/polaris-ranger-keycloak; run scripts/access-control-test.sh"]
-async fn tag_row_filters_are_unsupported_by_ranger() {
+async fn tag_row_filter_restricts_rows() {
     ac_gate!();
     let _guard = crate::common::serial().lock().await;
     let ctx = ac_setup().await;
+    grant_read_to_both_roles(&ctx).await;
 
-    // Ranger 2.8's `tag` servicedef defines NO row-filter resource hierarchy and
-    // NO row-filter access types:
-    //   GET /service/public/v2/api/servicedef/name/tag
-    //   -> dataMaskDef.maskTypes = ["hive:MASK", "hive:MASK_SHOW_LAST_4", ...]
-    //      rowFilterDef.accessTypes = []
-    // So a tag-based row filter cannot be expressed at all, and SQE's
-    // `resolve_tag_policies` rowfilter branch (POLICY_TYPE_ROWFILTER over the
-    // tagPolicies bundle) is unreachable on this Ranger version. That is a
-    // platform gap, not an SQE defect: tag MASKS work (see
-    // tag_column_mask_applies_from_iceberg_property) and resource row filters
-    // work (see resource_row_filter_restricts_rows).
-    //
-    // This test pins the limitation so the day Ranger gains the capability it
-    // fails and tells us to write the real coverage, instead of the gap sitting
-    // silently in a spec.
-    let err = ctx
-        .ranger
+    // Precondition, stated rather than inferred from an error: Ranger can only
+    // hold a tag ROW FILTER policy once the tag servicedef has a rowFilterDef.
+    // Ranger propagates dataMaskDef into the tag servicedef unconditionally but
+    // rowFilterDef only when Ranger Admin sets
+    // `ranger.servicedef.autopropagate.rowfilterdef.to.tag=true` (default
+    // false), so `RangerAdmin::bootstrap` patches it in. See
+    // ranger_fixture::ensure_tag_rowfilter_support.
+    assert!(
+        ctx.ranger
+            .tag_rowfilter_supported()
+            .await
+            .expect("query tag servicedef"),
+        "tag servicedef has no rowFilterDef; bootstrap should have added it"
+    );
+
+    set_column_tag(&ctx, "region", "RESTRICTED").await;
+    ctx.ranger
         .create_policy(tag_rowfilter_policy(
             &format!("{PREFIX}tag-rowfilter"),
             "RESTRICTED",
             "region = 'EU'",
         ))
         .await
-        .expect_err(
-            "Ranger accepted a tag row-filter policy: it has gained rowFilterDef support. \
-             Replace this test with real tag row-filter coverage (bob sees only EU rows) and \
-             re-check resolve_tag_policies' POLICY_TYPE_ROWFILTER branch against a live bundle.",
-        );
-    let msg = err.to_string();
-    assert!(
-        msg.contains("row filter") || msg.contains("resource hierarchies"),
-        "expected a rowFilterDef validation failure from Ranger, got: {msg}"
+        .expect("create tag row filter");
+
+    let sql = format!("SELECT id FROM {ORDERS} ORDER BY id");
+    let bob = crate::common::eventually("bob's tag row filter to apply", || async {
+        match ctx.handler.execute(&ctx.bob, &sql, None).await {
+            Ok(b) if total_rows(&b) == 2 => Ok(b),
+            Ok(b) => Err(format!("expected 2 rows, got {}", total_rows(&b))),
+            Err(e) => Err(format!("query failed: {e}")),
+        }
+    })
+    .await;
+    assert_eq!(
+        col_strings(&bob, "id"),
+        vec!["1", "3"],
+        "the tag row filter keeps only the EU rows"
     );
+
+    // alice is analyst-only: the tag policy targets engineer.
+    let alice = exec_ok(&ctx, &ctx.alice, &sql).await;
+    assert_eq!(col_strings(&alice, "id"), vec!["1", "2", "3"]);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1247,13 +1259,13 @@ async fn capture_live_tag_bundle() {
     let _guard = crate::common::serial().lock().await;
     let ctx = ac_setup().await;
 
-    // The capture needs a tag-linked DATAMASK policy. The placeholder testdata
-    // also asked for a tag-linked ROWFILTER, which is unobtainable: Ranger 2.8's
-    // tag servicedef has no rowFilterDef hierarchy, so such a policy cannot be
-    // created (see tag_row_filters_are_unsupported_by_ranger). The unit test this
-    // capture feeds -- resolve_tag_policies_against_live_sample -- accepts "at
-    // least one mask OR one row filter", so a mask-only capture is sufficient.
+    // The capture carries BOTH a tag-linked DATAMASK and a tag-linked ROWFILTER,
+    // which is exactly what the placeholder testdata asked for. The row filter is
+    // only creatable because `bootstrap` gave the tag servicedef a rowFilterDef
+    // (Ranger does not propagate one by default -- see
+    // ranger_fixture::ensure_tag_rowfilter_support).
     set_column_tag(&ctx, "ssn", "PII").await;
+    set_column_tag(&ctx, "region", "RESTRICTED").await;
     ctx.ranger
         .create_policy(tag_mask_policy(
             &format!("{PREFIX}tag-mask-pii"),
@@ -1262,6 +1274,14 @@ async fn capture_live_tag_bundle() {
         ))
         .await
         .expect("create tag mask");
+    ctx.ranger
+        .create_policy(tag_rowfilter_policy(
+            &format!("{PREFIX}tag-rowfilter"),
+            "RESTRICTED",
+            "region = 'EU'",
+        ))
+        .await
+        .expect("create tag row filter");
 
     let bundle = crate::common::eventually("the bundle to carry the tag datamask", || async {
         let b = ctx
@@ -1273,18 +1293,23 @@ async fn capture_live_tag_bundle() {
             .as_array()
             .cloned()
             .unwrap_or_default();
-        // policyType 1 == datamask, and it must carry our PII tag resource.
-        let has_pii_mask = policies.iter().any(|p| {
-            p["policyType"] == 1
-                && p["resources"]["tag"]["values"]
-                    .as_array()
-                    .is_some_and(|v| v.iter().any(|t| t == "PII"))
-        });
-        if has_pii_mask {
+        // policyType 1 == datamask on PII, 2 == rowfilter on RESTRICTED.
+        let tagged = |p: &serde_json::Value, tag: &str| {
+            p["resources"]["tag"]["values"]
+                .as_array()
+                .is_some_and(|v| v.iter().any(|t| t == tag))
+        };
+        let has_pii_mask = policies
+            .iter()
+            .any(|p| p["policyType"] == 1 && tagged(p, "PII"));
+        let has_row_filter = policies
+            .iter()
+            .any(|p| p["policyType"] == 2 && tagged(p, "RESTRICTED"));
+        if has_pii_mask && has_row_filter {
             Ok(b)
         } else {
             Err(format!(
-                "no PII datamask among {} tag policies",
+                "mask={has_pii_mask} rowfilter={has_row_filter} among {} tag policies",
                 policies.len()
             ))
         }

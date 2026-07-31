@@ -813,8 +813,8 @@
       "version": 1
     }
   ],
-  "policyUpdateTime": 1785515169196,
-  "policyVersion": 86,
+  "policyUpdateTime": 1785517605221,
+  "policyVersion": 124,
   "serviceConfig": {
     "ranger.plugin.audit.filters": "[ {'accessResult': 'DENIED', 'isAudited': true}, {'actions':['METADATA OPERATION'], 'isAudited': false}, {'users':['hive','hue'],'actions':['SHOW_ROLES'],'isAudited':false} ]",
     "ranger.plugins.conf.ldap.groupname.caseconversion": "none",
@@ -2473,8 +2473,8 @@
             ]
           }
         ],
-        "guid": "ad37ba1c-d5bb-4589-8965-83167a404afb",
-        "id": 70,
+        "guid": "e1936f23-0891-4957-a78e-a308f33cdd3f",
+        "id": 88,
         "isAuditEnabled": true,
         "isDenyAllElse": false,
         "isEnabled": true,
@@ -2493,10 +2493,49 @@
         "service": "sqe_ac_tag",
         "serviceType": "tag",
         "version": 1
+      },
+      {
+        "guid": "3d22c388-3c34-493a-9f62-84d4e8c0a453",
+        "id": 89,
+        "isAuditEnabled": true,
+        "isDenyAllElse": false,
+        "isEnabled": true,
+        "name": "sqe-ac-e2e-tag-rowfilter",
+        "policyPriority": 0,
+        "policyType": 2,
+        "resources": {
+          "tag": {
+            "isExcludes": false,
+            "isRecursive": false,
+            "values": [
+              "RESTRICTED"
+            ]
+          }
+        },
+        "rowFilterPolicyItems": [
+          {
+            "accesses": [
+              {
+                "isAllowed": true,
+                "type": "hive:select"
+              }
+            ],
+            "delegateAdmin": false,
+            "roles": [
+              "engineer"
+            ],
+            "rowFilterInfo": {
+              "filterExpr": "region = 'EU'"
+            }
+          }
+        ],
+        "service": "sqe_ac_tag",
+        "serviceType": "tag",
+        "version": 1
       }
     ],
-    "policyUpdateTime": 1785515169205,
-    "policyVersion": 16,
+    "policyUpdateTime": 1785517605222,
+    "policyVersion": 32,
     "serviceConfig": {
       "ranger.plugin.audit.filters": "[ {'accessResult': 'DENIED', 'isAudited': true} ]",
       "ranger.plugins.conf.ldap.groupname.caseconversion": "none",
@@ -2627,6 +2666,7 @@
         }
       ],
       "createTime": 1785511713414,
+      "createdBy": "Admin",
       "dataMaskDef": {
         "accessTypes": [
           {
@@ -3004,9 +3044,42 @@
           "uiHint": "{ \"singleValue\":true }"
         }
       ],
-      "rowFilterDef": {},
-      "updateTime": 1785511721207,
-      "version": 23
+      "rowFilterDef": {
+        "accessTypes": [
+          {
+            "category": "READ",
+            "itemId": 3004,
+            "label": "hive:select",
+            "name": "select"
+          }
+        ],
+        "resources": [
+          {
+            "description": "TAG",
+            "excludesSupported": false,
+            "isValidLeaf": true,
+            "itemId": 1,
+            "label": "TAG",
+            "level": 1,
+            "lookupSupported": true,
+            "mandatory": true,
+            "matcher": "org.apache.ranger.plugin.resourcematcher.RangerDefaultResourceMatcher",
+            "matcherOptions": {
+              "__accessTypeRestrictions": "[]",
+              "__isValidLeaf": "true",
+              "ignoreCase": "false",
+              "wildCard": "false"
+            },
+            "name": "tag",
+            "recursiveSupported": false,
+            "type": "string",
+            "uiHint": "{ \"singleValue\":true }"
+          }
+        ]
+      },
+      "updateTime": 1785517173755,
+      "updatedBy": "Admin",
+      "version": 24
     },
     "serviceId": 5,
     "serviceName": "sqe_ac_tag"
