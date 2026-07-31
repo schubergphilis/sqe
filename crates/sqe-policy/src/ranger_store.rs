@@ -24,10 +24,16 @@ use crate::{MaskType, PolicyStore, ResolvedPolicy, TagMaskSpec};
 
 // --- Ranger policy bundle model (ServicePolicies) ---
 
-// TODO(phase3): verify tagPolicies shape against a live tag-linked bundle
 /// Nested tag-service policy bundle. Present when Ranger has at least one
 /// tag-based policy. Structure mirrors the top-level `ServicePolicies` but
 /// with `tag` resources instead of database/table/column.
+///
+/// Shape VERIFIED against a live Ranger 2.8 bundle, captured by
+/// `access_control_e2e::capture_live_tag_bundle` into
+/// `src/testdata/tag_bundle_live_sample.json` and asserted by
+/// `resolve_tag_policies_against_live_sample`. The capture also showed that live
+/// tag policies name their mask types with the owning component's prefix
+/// (`hive:MASK_SHOW_LAST_4`), which `normalize_mask_type` handles.
 #[derive(Debug, Deserialize, Default)]
 pub(crate) struct TagPolicies {
     /// Same `RangerPolicy` type as resource policies; `resources` map carries
@@ -363,10 +369,6 @@ fn item_matches(
     matched
 }
 
-/// Map a Ranger hive data-mask type to an SQE `MaskType`.
-///  - `Ok(Some(mask))` supported,
-///  - `Ok(None)` for MASK_NONE (explicit exemption: no mask, not restricted),
-///  - `Err(())` for not-yet-supported types (caller restricts the column, fail-closed).
 /// Normalize a Ranger data-mask type name.
 ///
 /// TAG-service policies qualify the mask type with the owning component
@@ -389,6 +391,10 @@ fn normalize_mask_type(mask_type: &str) -> &str {
     }
 }
 
+/// Map a Ranger hive data-mask type to an SQE `MaskType`.
+///  - `Ok(Some(mask))` supported,
+///  - `Ok(None)` for MASK_NONE (explicit exemption: no mask, not restricted),
+///  - `Err(())` for not-yet-supported types (caller restricts the column, fail-closed).
 fn map_mask(info: &DataMaskInfo, column: &str, identity: &SessionIdentity) -> Result<Option<MaskType>, ()> {
     match normalize_mask_type(info.data_mask_type.as_str()) {
         "MASK_NULL" => Ok(Some(MaskType::Nullify)),
@@ -1426,11 +1432,15 @@ mod tests {
     /// deserializes to `None` and this test fails, surfacing the shape drift
     /// instead of silently returning raw PII columns.
     ///
-    /// `#[ignore]`-d until `tag_bundle_live_sample.json` is replaced with a real
-    /// capture during the Ranger-backend validation run. Dropping in the JSON
-    /// and removing `#[ignore]` makes this an active gate; no code change needed.
+    /// ACTIVE as of the Ranger-backend validation run: the capture in
+    /// `testdata/tag_bundle_live_sample.json` came from a live Ranger 2.8 via
+    /// `access_control_e2e::capture_live_tag_bundle` (re-capture with
+    /// `SQE_AC_CAPTURE=1 scripts/access-control-test.sh capture_live_tag_bundle`).
+    /// The capture carries a `hive:MASK_SHOW_LAST_4` datamask on tag `PII` for
+    /// role `engineer`. It carries no tag ROW FILTER because Ranger 2.8 cannot
+    /// express one (its tag servicedef has no rowFilterDef hierarchy), which is
+    /// why this test accepts "at least one mask OR one row filter".
     #[test]
-    #[ignore = "pending a real tagPolicies capture; see testdata/tag_bundle_live_sample.json"]
     fn resolve_tag_policies_against_live_sample() {
         let sp: ServicePolicies = serde_json::from_str(TAG_BUNDLE_LIVE_SAMPLE)
             .expect("captured live sample must be valid ServicePolicies JSON");

@@ -1116,3 +1116,189 @@ async fn unmappable_tag_mask_fails_closed() {
         "analyst-only alice is unaffected by the engineer-scoped broken tag mask"
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Introspection + live bundle capture
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Every string cell of every batch, for statements whose column layout is not
+/// part of the contract under test (SHOW GRANTS, CHECK ACCESS). Iterates each
+/// batch's own columns positionally so differing batch schemas cannot panic.
+fn all_cells(batches: &[RecordBatch]) -> Vec<String> {
+    let mut cells = Vec::new();
+    for b in batches {
+        for idx in 0..b.num_columns() {
+            let arr = b.column(idx);
+            for row in 0..b.num_rows() {
+                cells.push(crate::common::fmt_val(arr.as_ref(), row));
+            }
+        }
+    }
+    cells
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs quickstart/polaris-ranger-keycloak; run scripts/access-control-test.sh"]
+async fn show_grants_lists_both_roles() {
+    ac_gate!();
+    let _guard = crate::common::serial().lock().await;
+    let ctx = ac_setup().await;
+
+    exec_ok(
+        &ctx,
+        &ctx.carol,
+        &format!("GRANT SELECT ON {ORDERS} TO ROLE \"analyst\""),
+    )
+    .await;
+    exec_ok(
+        &ctx,
+        &ctx.carol,
+        &format!("GRANT SELECT ON {ORDERS} TO ROLE \"engineer\""),
+    )
+    .await;
+
+    let cells = crate::common::eventually("SHOW GRANTS to list both roles", || async {
+        match ctx
+            .handler
+            .execute(&ctx.carol, &format!("SHOW GRANTS ON {ORDERS}"), None)
+            .await
+        {
+            Ok(b) => {
+                let cells = all_cells(&b);
+                let has_both = cells.iter().any(|c| c == "analyst")
+                    && cells.iter().any(|c| c == "engineer");
+                if has_both {
+                    Ok(cells)
+                } else {
+                    Err(format!("grantees not both listed yet: {cells:?}"))
+                }
+            }
+            Err(e) => Err(format!("SHOW GRANTS failed: {e}")),
+        }
+    })
+    .await;
+
+    // Asserted on decoded Arrow cells, not on printed text: the shell harness
+    // greps the rendered table, which also matches a role name appearing in an
+    // error message or an unrelated column.
+    assert!(cells.iter().any(|c| c == "analyst"));
+    assert!(cells.iter().any(|c| c == "engineer"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs quickstart/polaris-ranger-keycloak; run scripts/access-control-test.sh"]
+async fn check_access_reflects_user_grants() {
+    ac_gate!();
+    let _guard = crate::common::serial().lock().await;
+    let ctx = ac_setup().await;
+
+    exec_ok(
+        &ctx,
+        &ctx.carol,
+        &format!("GRANT SELECT ON {AUDIT} TO USER \"bob\""),
+    )
+    .await;
+
+    let bob_cells = crate::common::eventually("CHECK ACCESS to report bob allowed", || async {
+        match ctx
+            .handler
+            .execute(
+                &ctx.carol,
+                &format!("CHECK ACCESS SELECT ON {AUDIT} FOR USER \"bob\""),
+                None,
+            )
+            .await
+        {
+            Ok(b) => {
+                let cells = all_cells(&b);
+                if cells.iter().any(|c| c.eq_ignore_ascii_case("true")) {
+                    Ok(cells)
+                } else {
+                    Err(format!("no true cell yet: {cells:?}"))
+                }
+            }
+            Err(e) => Err(format!("CHECK ACCESS failed: {e}")),
+        }
+    })
+    .await;
+    assert!(bob_cells.iter().any(|c| c.eq_ignore_ascii_case("true")));
+
+    let dave = exec_ok(
+        &ctx,
+        &ctx.carol,
+        &format!("CHECK ACCESS SELECT ON {AUDIT} FOR USER \"dave\""),
+    )
+    .await;
+    let dave_cells = all_cells(&dave);
+    assert!(
+        dave_cells.iter().any(|c| c.eq_ignore_ascii_case("false")),
+        "dave holds no grant on audit; CHECK ACCESS must report false. cells: {dave_cells:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs quickstart/polaris-ranger-keycloak; run scripts/access-control-test.sh"]
+async fn capture_live_tag_bundle() {
+    ac_gate!();
+    if std::env::var("SQE_AC_CAPTURE").as_deref() != Ok("1") {
+        eprintln!("skipping capture: set SQE_AC_CAPTURE=1 to overwrite the testdata bundle");
+        return;
+    }
+    let _guard = crate::common::serial().lock().await;
+    let ctx = ac_setup().await;
+
+    // The capture needs a tag-linked DATAMASK policy. The placeholder testdata
+    // also asked for a tag-linked ROWFILTER, which is unobtainable: Ranger 2.8's
+    // tag servicedef has no rowFilterDef hierarchy, so such a policy cannot be
+    // created (see tag_row_filters_are_unsupported_by_ranger). The unit test this
+    // capture feeds -- resolve_tag_policies_against_live_sample -- accepts "at
+    // least one mask OR one row filter", so a mask-only capture is sufficient.
+    set_column_tag(&ctx, "ssn", "PII").await;
+    ctx.ranger
+        .create_policy(tag_mask_policy(
+            &format!("{PREFIX}tag-mask-pii"),
+            "PII",
+            serde_json::json!({"dataMaskType": "hive:MASK_SHOW_LAST_4"}),
+        ))
+        .await
+        .expect("create tag mask");
+
+    let bundle = crate::common::eventually("the bundle to carry the tag datamask", || async {
+        let b = ctx
+            .ranger
+            .download_bundle(HIVE_SERVICE)
+            .await
+            .map_err(|e| e.to_string())?;
+        let policies = b["tagPolicies"]["policies"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        // policyType 1 == datamask, and it must carry our PII tag resource.
+        let has_pii_mask = policies.iter().any(|p| {
+            p["policyType"] == 1
+                && p["resources"]["tag"]["values"]
+                    .as_array()
+                    .is_some_and(|v| v.iter().any(|t| t == "PII"))
+        });
+        if has_pii_mask {
+            Ok(b)
+        } else {
+            Err(format!(
+                "no PII datamask among {} tag policies",
+                policies.len()
+            ))
+        }
+    })
+    .await;
+
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("crates/")
+        .join("sqe-policy/src/testdata/tag_bundle_live_sample.json");
+    std::fs::write(
+        &path,
+        serde_json::to_string_pretty(&bundle).expect("serialize bundle"),
+    )
+    .unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
+    eprintln!("captured live tag bundle -> {}", path.display());
+}
