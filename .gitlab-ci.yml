@@ -229,6 +229,58 @@ scenario-test:
         - docker-compose*.yml
   timeout: 2h
 
+# ── Access-control e2e (Polaris + Ranger + Keycloak) ───────────
+# The Rust access-control suite (crates/sqe-coordinator/tests/it/
+# access_control_e2e.rs) against the polaris-ranger-keycloak quickstart stack:
+# grant/revoke, Ranger deny precedence, column masks, keyed hash masks, row
+# filters, tag-based masks and tag fail-closed. Same docker-in-docker setup as
+# scenario-test, plus a Rust toolchain because the tests ARE a cargo test binary.
+#
+# NOTE ON SIGNAL: while the shared dind runner is unhealthy this job cannot fail
+# meaningfully, so a green pipeline here is not evidence. Gate policy changes on
+# a local `make test-access-control` until dind is trustworthy again.
+access-control-test:
+  stage: test
+  image: docker:29
+  services:
+    - name: docker:29-dind
+      alias: docker
+      command: ["--tls=false", "--host=tcp://0.0.0.0:2375"]
+  variables:
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_TLS_CERTDIR: ""
+    DOCKER_DRIVER: overlay2
+    # Ranger Admin's first boot is 2-4 minutes; the script polls with this
+    # deadline before giving up and reporting the last HTTP status.
+    AC_RANGER_TIMEOUT: "600"
+  before_script:
+    - apk add --no-cache bash curl docker-compose rust cargo cmake protobuf-dev openssl-dev pkgconfig clang mold python3
+  script:
+    - ./scripts/access-control-test.sh
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes:
+        - crates/sqe-policy/**/*
+        - crates/sqe-coordinator/src/policy_wiring.rs
+        - crates/sqe-coordinator/tests/it/access_control_e2e.rs
+        - crates/sqe-coordinator/tests/it/common/**/*
+        - quickstart/polaris-ranger-keycloak/**/*
+        - scripts/access-control-test.sh
+        - tests/sqe-ranger-test.toml
+      when: manual
+      allow_failure: true
+    - if: '$CI_COMMIT_BRANCH == "main" && $CI_PIPELINE_SOURCE == "push"'
+      changes:
+        - crates/sqe-policy/**/*
+        - crates/sqe-coordinator/src/policy_wiring.rs
+        - crates/sqe-coordinator/tests/it/access_control_e2e.rs
+        - crates/sqe-coordinator/tests/it/common/**/*
+        - quickstart/polaris-ranger-keycloak/**/*
+        - scripts/access-control-test.sh
+        - tests/sqe-ranger-test.toml
+  timeout: 1h
+
 # ── AWS cloud-backed scenario tests (opt-in, needs AWS creds) ──
 # Runs the AWS quickstarts (aws-glue, aws-s3-tables, glue-lake-formation) end to
 # end: each run.sh CDK-deploys throwaway Glue / S3 Tables / Lake Formation

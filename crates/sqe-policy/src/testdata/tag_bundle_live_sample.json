@@ -1,9 +1,3014 @@
 {
-  "__placeholder__": "Replace this file with a REAL bundle captured from a live Ranger during the Ranger-backend validation run: GET /service/plugins/policies/download/<service>. The capture MUST contain at least one tag-linked datamask policy and one tag-linked rowfilter policy under the top-level `tagPolicies` block. Once dropped in, remove the #[ignore] on resolve_tag_policies_against_live_sample in ranger_store.rs and adjust the asserted user/roles/tags constants to match the capture. The empty bundle below keeps the placeholder valid JSON (the #[ignore]-d test stays inert until replaced).",
-  "policyVersion": 0,
-  "policies": [],
+  "auditMode": "audit-default",
+  "policies": [
+    {
+      "description": "Policy for all - global",
+      "guid": "e2a242a0-b568-408e-97e1-4caf4c268d66",
+      "id": 19,
+      "isAuditEnabled": true,
+      "isDenyAllElse": false,
+      "isEnabled": true,
+      "name": "all - global",
+      "policyItems": [
+        {
+          "accesses": [
+            {
+              "isAllowed": true,
+              "type": "select"
+            },
+            {
+              "isAllowed": true,
+              "type": "update"
+            },
+            {
+              "isAllowed": true,
+              "type": "create"
+            },
+            {
+              "isAllowed": true,
+              "type": "drop"
+            },
+            {
+              "isAllowed": true,
+              "type": "alter"
+            },
+            {
+              "isAllowed": true,
+              "type": "index"
+            },
+            {
+              "isAllowed": true,
+              "type": "lock"
+            },
+            {
+              "isAllowed": true,
+              "type": "read"
+            },
+            {
+              "isAllowed": true,
+              "type": "write"
+            },
+            {
+              "isAllowed": true,
+              "type": "repladmin"
+            },
+            {
+              "isAllowed": true,
+              "type": "serviceadmin"
+            },
+            {
+              "isAllowed": true,
+              "type": "tempudfadmin"
+            },
+            {
+              "isAllowed": true,
+              "type": "refresh"
+            },
+            {
+              "isAllowed": true,
+              "type": "all"
+            }
+          ],
+          "delegateAdmin": true,
+          "users": [
+            "admin"
+          ]
+        }
+      ],
+      "policyPriority": 0,
+      "policyType": 0,
+      "resources": {
+        "global": {
+          "isExcludes": false,
+          "isRecursive": false,
+          "values": [
+            "*"
+          ]
+        }
+      },
+      "service": "sqe_ac_hive",
+      "serviceType": "hive",
+      "version": 1
+    },
+    {
+      "description": "Policy for all - database, table, column",
+      "guid": "d40b154a-7250-4373-9584-0a6a07209787",
+      "id": 20,
+      "isAuditEnabled": true,
+      "isDenyAllElse": false,
+      "isEnabled": true,
+      "name": "all - database, table, column",
+      "policyItems": [
+        {
+          "accesses": [
+            {
+              "isAllowed": true,
+              "type": "select"
+            },
+            {
+              "isAllowed": true,
+              "type": "update"
+            },
+            {
+              "isAllowed": true,
+              "type": "create"
+            },
+            {
+              "isAllowed": true,
+              "type": "drop"
+            },
+            {
+              "isAllowed": true,
+              "type": "alter"
+            },
+            {
+              "isAllowed": true,
+              "type": "index"
+            },
+            {
+              "isAllowed": true,
+              "type": "lock"
+            },
+            {
+              "isAllowed": true,
+              "type": "read"
+            },
+            {
+              "isAllowed": true,
+              "type": "write"
+            },
+            {
+              "isAllowed": true,
+              "type": "repladmin"
+            },
+            {
+              "isAllowed": true,
+              "type": "serviceadmin"
+            },
+            {
+              "isAllowed": true,
+              "type": "tempudfadmin"
+            },
+            {
+              "isAllowed": true,
+              "type": "refresh"
+            },
+            {
+              "isAllowed": true,
+              "type": "all"
+            }
+          ],
+          "delegateAdmin": true,
+          "users": [
+            "admin"
+          ]
+        },
+        {
+          "accesses": [
+            {
+              "isAllowed": true,
+              "type": "all"
+            }
+          ],
+          "delegateAdmin": true,
+          "users": [
+            "{OWNER}"
+          ]
+        }
+      ],
+      "policyPriority": 0,
+      "policyType": 0,
+      "resources": {
+        "column": {
+          "isExcludes": false,
+          "isRecursive": false,
+          "values": [
+            "*"
+          ]
+        },
+        "database": {
+          "isExcludes": false,
+          "isRecursive": false,
+          "values": [
+            "*"
+          ]
+        },
+        "table": {
+          "isExcludes": false,
+          "isRecursive": false,
+          "values": [
+            "*"
+          ]
+        }
+      },
+      "service": "sqe_ac_hive",
+      "serviceType": "hive",
+      "version": 1
+    },
+    {
+      "description": "Policy for all - database, table",
+      "guid": "5752ff52-32ec-4692-a06e-871e29d358e0",
+      "id": 21,
+      "isAuditEnabled": true,
+      "isDenyAllElse": false,
+      "isEnabled": true,
+      "name": "all - database, table",
+      "policyItems": [
+        {
+          "accesses": [
+            {
+              "isAllowed": true,
+              "type": "select"
+            },
+            {
+              "isAllowed": true,
+              "type": "update"
+            },
+            {
+              "isAllowed": true,
+              "type": "create"
+            },
+            {
+              "isAllowed": true,
+              "type": "drop"
+            },
+            {
+              "isAllowed": true,
+              "type": "alter"
+            },
+            {
+              "isAllowed": true,
+              "type": "index"
+            },
+            {
+              "isAllowed": true,
+              "type": "lock"
+            },
+            {
+              "isAllowed": true,
+              "type": "read"
+            },
+            {
+              "isAllowed": true,
+              "type": "write"
+            },
+            {
+              "isAllowed": true,
+              "type": "repladmin"
+            },
+            {
+              "isAllowed": true,
+              "type": "serviceadmin"
+            },
+            {
+              "isAllowed": true,
+              "type": "tempudfadmin"
+            },
+            {
+              "isAllowed": true,
+              "type": "refresh"
+            },
+            {
+              "isAllowed": true,
+              "type": "all"
+            }
+          ],
+          "delegateAdmin": true,
+          "users": [
+            "admin"
+          ]
+        },
+        {
+          "accesses": [
+            {
+              "isAllowed": true,
+              "type": "all"
+            }
+          ],
+          "delegateAdmin": true,
+          "users": [
+            "{OWNER}"
+          ]
+        }
+      ],
+      "policyPriority": 0,
+      "policyType": 0,
+      "resources": {
+        "database": {
+          "isExcludes": false,
+          "isRecursive": false,
+          "values": [
+            "*"
+          ]
+        },
+        "table": {
+          "isExcludes": false,
+          "isRecursive": false,
+          "values": [
+            "*"
+          ]
+        }
+      },
+      "service": "sqe_ac_hive",
+      "serviceType": "hive",
+      "version": 1
+    },
+    {
+      "description": "Policy for all - database",
+      "guid": "4c23929a-135f-4219-85f6-2acf5753a27e",
+      "id": 22,
+      "isAuditEnabled": true,
+      "isDenyAllElse": false,
+      "isEnabled": true,
+      "name": "all - database",
+      "policyItems": [
+        {
+          "accesses": [
+            {
+              "isAllowed": true,
+              "type": "select"
+            },
+            {
+              "isAllowed": true,
+              "type": "update"
+            },
+            {
+              "isAllowed": true,
+              "type": "create"
+            },
+            {
+              "isAllowed": true,
+              "type": "drop"
+            },
+            {
+              "isAllowed": true,
+              "type": "alter"
+            },
+            {
+              "isAllowed": true,
+              "type": "index"
+            },
+            {
+              "isAllowed": true,
+              "type": "lock"
+            },
+            {
+              "isAllowed": true,
+              "type": "read"
+            },
+            {
+              "isAllowed": true,
+              "type": "write"
+            },
+            {
+              "isAllowed": true,
+              "type": "repladmin"
+            },
+            {
+              "isAllowed": true,
+              "type": "serviceadmin"
+            },
+            {
+              "isAllowed": true,
+              "type": "tempudfadmin"
+            },
+            {
+              "isAllowed": true,
+              "type": "refresh"
+            },
+            {
+              "isAllowed": true,
+              "type": "all"
+            }
+          ],
+          "delegateAdmin": true,
+          "users": [
+            "admin"
+          ]
+        },
+        {
+          "accesses": [
+            {
+              "isAllowed": true,
+              "type": "create"
+            }
+          ],
+          "delegateAdmin": false,
+          "groups": [
+            "public"
+          ]
+        },
+        {
+          "accesses": [
+            {
+              "isAllowed": true,
+              "type": "all"
+            }
+          ],
+          "delegateAdmin": true,
+          "users": [
+            "{OWNER}"
+          ]
+        }
+      ],
+      "policyPriority": 0,
+      "policyType": 0,
+      "resources": {
+        "database": {
+          "isExcludes": false,
+          "isRecursive": false,
+          "values": [
+            "*"
+          ]
+        }
+      },
+      "service": "sqe_ac_hive",
+      "serviceType": "hive",
+      "version": 1
+    },
+    {
+      "description": "Policy for all - hiveservice",
+      "guid": "e6f30641-b334-422d-b662-56048b26487d",
+      "id": 23,
+      "isAuditEnabled": true,
+      "isDenyAllElse": false,
+      "isEnabled": true,
+      "name": "all - hiveservice",
+      "policyItems": [
+        {
+          "accesses": [
+            {
+              "isAllowed": true,
+              "type": "select"
+            },
+            {
+              "isAllowed": true,
+              "type": "update"
+            },
+            {
+              "isAllowed": true,
+              "type": "create"
+            },
+            {
+              "isAllowed": true,
+              "type": "drop"
+            },
+            {
+              "isAllowed": true,
+              "type": "alter"
+            },
+            {
+              "isAllowed": true,
+              "type": "index"
+            },
+            {
+              "isAllowed": true,
+              "type": "lock"
+            },
+            {
+              "isAllowed": true,
+              "type": "read"
+            },
+            {
+              "isAllowed": true,
+              "type": "write"
+            },
+            {
+              "isAllowed": true,
+              "type": "repladmin"
+            },
+            {
+              "isAllowed": true,
+              "type": "serviceadmin"
+            },
+            {
+              "isAllowed": true,
+              "type": "tempudfadmin"
+            },
+            {
+              "isAllowed": true,
+              "type": "refresh"
+            },
+            {
+              "isAllowed": true,
+              "type": "all"
+            }
+          ],
+          "delegateAdmin": true,
+          "users": [
+            "admin"
+          ]
+        }
+      ],
+      "policyPriority": 0,
+      "policyType": 0,
+      "resources": {
+        "hiveservice": {
+          "isExcludes": false,
+          "isRecursive": false,
+          "values": [
+            "*"
+          ]
+        }
+      },
+      "service": "sqe_ac_hive",
+      "serviceType": "hive",
+      "version": 1
+    },
+    {
+      "description": "Policy for all - database, udf",
+      "guid": "3a146f46-2e43-4716-9e13-45799be56dd0",
+      "id": 24,
+      "isAuditEnabled": true,
+      "isDenyAllElse": false,
+      "isEnabled": true,
+      "name": "all - database, udf",
+      "policyItems": [
+        {
+          "accesses": [
+            {
+              "isAllowed": true,
+              "type": "select"
+            },
+            {
+              "isAllowed": true,
+              "type": "update"
+            },
+            {
+              "isAllowed": true,
+              "type": "create"
+            },
+            {
+              "isAllowed": true,
+              "type": "drop"
+            },
+            {
+              "isAllowed": true,
+              "type": "alter"
+            },
+            {
+              "isAllowed": true,
+              "type": "index"
+            },
+            {
+              "isAllowed": true,
+              "type": "lock"
+            },
+            {
+              "isAllowed": true,
+              "type": "read"
+            },
+            {
+              "isAllowed": true,
+              "type": "write"
+            },
+            {
+              "isAllowed": true,
+              "type": "repladmin"
+            },
+            {
+              "isAllowed": true,
+              "type": "serviceadmin"
+            },
+            {
+              "isAllowed": true,
+              "type": "tempudfadmin"
+            },
+            {
+              "isAllowed": true,
+              "type": "refresh"
+            },
+            {
+              "isAllowed": true,
+              "type": "all"
+            }
+          ],
+          "delegateAdmin": true,
+          "users": [
+            "admin"
+          ]
+        },
+        {
+          "accesses": [
+            {
+              "isAllowed": true,
+              "type": "all"
+            }
+          ],
+          "delegateAdmin": true,
+          "users": [
+            "{OWNER}"
+          ]
+        }
+      ],
+      "policyPriority": 0,
+      "policyType": 0,
+      "resources": {
+        "database": {
+          "isExcludes": false,
+          "isRecursive": false,
+          "values": [
+            "*"
+          ]
+        },
+        "udf": {
+          "isExcludes": false,
+          "isRecursive": false,
+          "values": [
+            "*"
+          ]
+        }
+      },
+      "service": "sqe_ac_hive",
+      "serviceType": "hive",
+      "version": 1
+    },
+    {
+      "description": "Policy for all - url",
+      "guid": "95ebd695-ca62-4766-99e3-6ddccc03d0fa",
+      "id": 25,
+      "isAuditEnabled": true,
+      "isDenyAllElse": false,
+      "isEnabled": true,
+      "name": "all - url",
+      "policyItems": [
+        {
+          "accesses": [
+            {
+              "isAllowed": true,
+              "type": "select"
+            },
+            {
+              "isAllowed": true,
+              "type": "update"
+            },
+            {
+              "isAllowed": true,
+              "type": "create"
+            },
+            {
+              "isAllowed": true,
+              "type": "drop"
+            },
+            {
+              "isAllowed": true,
+              "type": "alter"
+            },
+            {
+              "isAllowed": true,
+              "type": "index"
+            },
+            {
+              "isAllowed": true,
+              "type": "lock"
+            },
+            {
+              "isAllowed": true,
+              "type": "read"
+            },
+            {
+              "isAllowed": true,
+              "type": "write"
+            },
+            {
+              "isAllowed": true,
+              "type": "repladmin"
+            },
+            {
+              "isAllowed": true,
+              "type": "serviceadmin"
+            },
+            {
+              "isAllowed": true,
+              "type": "tempudfadmin"
+            },
+            {
+              "isAllowed": true,
+              "type": "refresh"
+            },
+            {
+              "isAllowed": true,
+              "type": "all"
+            }
+          ],
+          "delegateAdmin": true,
+          "users": [
+            "admin"
+          ]
+        }
+      ],
+      "policyPriority": 0,
+      "policyType": 0,
+      "resources": {
+        "url": {
+          "isExcludes": false,
+          "isRecursive": true,
+          "values": [
+            "*"
+          ]
+        }
+      },
+      "service": "sqe_ac_hive",
+      "serviceType": "hive",
+      "version": 1
+    },
+    {
+      "guid": "9126ca2b-522b-4ea3-8d71-4706367a6990",
+      "id": 26,
+      "isAuditEnabled": true,
+      "isDenyAllElse": false,
+      "isEnabled": true,
+      "name": "default database tables columns",
+      "policyItems": [
+        {
+          "accesses": [
+            {
+              "isAllowed": true,
+              "type": "create"
+            }
+          ],
+          "delegateAdmin": false,
+          "groups": [
+            "public"
+          ]
+        }
+      ],
+      "policyPriority": 0,
+      "policyType": 0,
+      "resources": {
+        "column": {
+          "isExcludes": false,
+          "isRecursive": false,
+          "values": [
+            "*"
+          ]
+        },
+        "database": {
+          "isExcludes": false,
+          "isRecursive": false,
+          "values": [
+            "default"
+          ]
+        },
+        "table": {
+          "isExcludes": false,
+          "isRecursive": false,
+          "values": [
+            "*"
+          ]
+        }
+      },
+      "service": "sqe_ac_hive",
+      "serviceType": "hive",
+      "version": 1
+    },
+    {
+      "guid": "58ac8305-fb7d-4f64-a0d4-5084951c0e6e",
+      "id": 27,
+      "isAuditEnabled": true,
+      "isDenyAllElse": false,
+      "isEnabled": true,
+      "name": "Information_schema database tables columns",
+      "policyItems": [
+        {
+          "accesses": [
+            {
+              "isAllowed": true,
+              "type": "select"
+            }
+          ],
+          "delegateAdmin": false,
+          "groups": [
+            "public"
+          ]
+        }
+      ],
+      "policyPriority": 0,
+      "policyType": 0,
+      "resources": {
+        "column": {
+          "isExcludes": false,
+          "isRecursive": false,
+          "values": [
+            "*"
+          ]
+        },
+        "database": {
+          "isExcludes": false,
+          "isRecursive": false,
+          "values": [
+            "information_schema"
+          ]
+        },
+        "table": {
+          "isExcludes": false,
+          "isRecursive": false,
+          "values": [
+            "*"
+          ]
+        }
+      },
+      "service": "sqe_ac_hive",
+      "serviceType": "hive",
+      "version": 1
+    }
+  ],
+  "policyUpdateTime": 1785515169196,
+  "policyVersion": 86,
+  "serviceConfig": {
+    "ranger.plugin.audit.filters": "[ {'accessResult': 'DENIED', 'isAudited': true}, {'actions':['METADATA OPERATION'], 'isAudited': false}, {'users':['hive','hue'],'actions':['SHOW_ROLES'],'isAudited':false} ]",
+    "ranger.plugins.conf.ldap.groupname.caseconversion": "none",
+    "ranger.plugins.conf.ldap.username.caseconversion": "none",
+    "ranger.plugins.conf.mapping.groupname.handler": "org.apache.ranger.ugsyncutil.transform.RegEx",
+    "ranger.plugins.conf.mapping.regex.separator": "/",
+    "ranger.plugins.conf.mapping.username.handler": "org.apache.ranger.ugsyncutil.transform.RegEx"
+  },
+  "serviceDef": {
+    "accessTypes": [
+      {
+        "category": "READ",
+        "itemId": 1,
+        "label": "select",
+        "name": "select"
+      },
+      {
+        "category": "UPDATE",
+        "itemId": 2,
+        "label": "update",
+        "name": "update"
+      },
+      {
+        "category": "CREATE",
+        "itemId": 3,
+        "label": "Create",
+        "name": "create"
+      },
+      {
+        "category": "DELETE",
+        "itemId": 4,
+        "label": "Drop",
+        "name": "drop"
+      },
+      {
+        "category": "CREATE",
+        "itemId": 5,
+        "label": "Alter",
+        "name": "alter"
+      },
+      {
+        "category": "MANAGE",
+        "itemId": 6,
+        "label": "Index",
+        "name": "index"
+      },
+      {
+        "category": "MANAGE",
+        "itemId": 7,
+        "label": "Lock",
+        "name": "lock"
+      },
+      {
+        "category": "READ",
+        "itemId": 9,
+        "label": "Read",
+        "name": "read"
+      },
+      {
+        "category": "UPDATE",
+        "itemId": 10,
+        "label": "Write",
+        "name": "write"
+      },
+      {
+        "category": "MANAGE",
+        "itemId": 11,
+        "label": "ReplAdmin",
+        "name": "repladmin"
+      },
+      {
+        "category": "MANAGE",
+        "itemId": 12,
+        "label": "Service Admin",
+        "name": "serviceadmin"
+      },
+      {
+        "category": "MANAGE",
+        "itemId": 13,
+        "label": "Temporary UDF Admin",
+        "name": "tempudfadmin"
+      },
+      {
+        "category": "MANAGE",
+        "itemId": 14,
+        "label": "Refresh",
+        "name": "refresh"
+      },
+      {
+        "impliedGrants": [
+          "select",
+          "update",
+          "create",
+          "drop",
+          "alter",
+          "index",
+          "lock",
+          "read",
+          "write",
+          "repladmin",
+          "serviceadmin",
+          "refresh"
+        ],
+        "itemId": 8,
+        "label": "All",
+        "name": "all"
+      }
+    ],
+    "configs": [
+      {
+        "itemId": 1,
+        "label": "Username",
+        "mandatory": true,
+        "name": "username",
+        "type": "string"
+      },
+      {
+        "itemId": 2,
+        "label": "Password",
+        "mandatory": true,
+        "name": "password",
+        "type": "password"
+      },
+      {
+        "defaultValue": "org.apache.hive.jdbc.HiveDriver",
+        "itemId": 3,
+        "mandatory": true,
+        "name": "jdbc.driverClassName",
+        "type": "string"
+      },
+      {
+        "itemId": 4,
+        "mandatory": true,
+        "name": "jdbc.url",
+        "type": "string",
+        "uiHint": "{\"TextFieldWithIcon\":true, \"info\": \"1.For Remote Mode, eg.<br>jdbc:hive2://&lt;host&gt;:&lt;port&gt;<br>2.For Embedded Mode (no host or port), eg.<br>jdbc:hive2:///;initFile=&lt;file&gt;<br>3.For HTTP Mode, eg.<br>jdbc:hive2://&lt;host&gt;:&lt;port&gt;/;<br>transportMode=http;httpPath=&lt;httpPath&gt;<br>4.For SSL Mode, eg.<br>jdbc:hive2://&lt;host&gt;:&lt;port&gt;/;ssl=true;<br>sslTrustStore=tStore;trustStorePassword=pw<br>5.For ZooKeeper Mode, eg.<br>jdbc:hive2://&lt;host&gt;/;serviceDiscoveryMode=<br>zooKeeper;zooKeeperNamespace=hiveserver2<br>6.For Kerberos Mode, eg.<br>jdbc:hive2://&lt;host&gt;:&lt;port&gt;/;<br>principal=hive/domain@EXAMPLE.COM<br>\"}"
+      },
+      {
+        "itemId": 5,
+        "label": "Common Name for Certificate",
+        "mandatory": false,
+        "name": "commonNameForCertificate",
+        "type": "string"
+      },
+      {
+        "defaultValue": "[ {'accessResult': 'DENIED', 'isAudited': true}, {'actions':['METADATA OPERATION'], 'isAudited': false}, {'users':['hive','hue'],'actions':['SHOW_ROLES'],'isAudited':false} ]",
+        "itemId": 6,
+        "label": "Ranger Default Audit Filters",
+        "mandatory": false,
+        "name": "ranger.plugin.audit.filters",
+        "type": "string"
+      }
+    ],
+    "createTime": 1785511714032,
+    "dataMaskDef": {
+      "accessTypes": [
+        {
+          "category": "READ",
+          "itemId": 1,
+          "label": "select",
+          "name": "select"
+        }
+      ],
+      "maskTypes": [
+        {
+          "description": "Replace lowercase with 'x', uppercase with 'X', digits with '0'",
+          "itemId": 1,
+          "label": "Redact",
+          "name": "MASK",
+          "transformer": "mask({col})"
+        },
+        {
+          "description": "Show last 4 characters; replace rest with 'x'",
+          "itemId": 2,
+          "label": "Partial mask: show last 4",
+          "name": "MASK_SHOW_LAST_4",
+          "transformer": "mask_show_last_n({col}, 4, 'x', 'x', 'x', -1, '1')"
+        },
+        {
+          "description": "Show first 4 characters; replace rest with 'x'",
+          "itemId": 3,
+          "label": "Partial mask: show first 4",
+          "name": "MASK_SHOW_FIRST_4",
+          "transformer": "mask_show_first_n({col}, 4, 'x', 'x', 'x', -1, '1')"
+        },
+        {
+          "description": "Hash the value",
+          "itemId": 4,
+          "label": "Hash",
+          "name": "MASK_HASH",
+          "transformer": "mask_hash({col})"
+        },
+        {
+          "description": "Replace with NULL",
+          "itemId": 5,
+          "label": "Nullify",
+          "name": "MASK_NULL"
+        },
+        {
+          "description": "No masking",
+          "itemId": 6,
+          "label": "Unmasked (retain original value)",
+          "name": "MASK_NONE"
+        },
+        {
+          "description": "Date: show only year",
+          "itemId": 12,
+          "label": "Date: show only year",
+          "name": "MASK_DATE_SHOW_YEAR",
+          "transformer": "mask({col}, 'x', 'x', 'x', -1, '1', 1, 0, -1)"
+        },
+        {
+          "description": "Custom",
+          "itemId": 13,
+          "label": "Custom",
+          "name": "CUSTOM"
+        }
+      ],
+      "resources": [
+        {
+          "description": "Hive Database",
+          "excludesSupported": false,
+          "isValidLeaf": false,
+          "itemId": 1,
+          "label": "Hive Database",
+          "level": 10,
+          "lookupSupported": true,
+          "mandatory": true,
+          "matcher": "org.apache.ranger.plugin.resourcematcher.RangerDefaultResourceMatcher",
+          "matcherOptions": {
+            "ignoreCase": "true",
+            "wildCard": "false"
+          },
+          "name": "database",
+          "recursiveSupported": false,
+          "type": "string",
+          "uiHint": "{ \"singleValue\":true }"
+        },
+        {
+          "description": "Hive Table",
+          "excludesSupported": false,
+          "isValidLeaf": false,
+          "itemId": 2,
+          "label": "Hive Table",
+          "level": 20,
+          "lookupSupported": true,
+          "mandatory": true,
+          "matcher": "org.apache.ranger.plugin.resourcematcher.RangerDefaultResourceMatcher",
+          "matcherOptions": {
+            "ignoreCase": "true",
+            "wildCard": "false"
+          },
+          "name": "table",
+          "parent": "database",
+          "recursiveSupported": false,
+          "type": "string",
+          "uiHint": "{ \"singleValue\":true }"
+        },
+        {
+          "description": "Hive Column",
+          "excludesSupported": false,
+          "isValidLeaf": true,
+          "itemId": 4,
+          "label": "Hive Column",
+          "level": 30,
+          "lookupSupported": true,
+          "mandatory": true,
+          "matcher": "org.apache.ranger.plugin.resourcematcher.RangerDefaultResourceMatcher",
+          "matcherOptions": {
+            "ignoreCase": "true",
+            "wildCard": "false"
+          },
+          "name": "column",
+          "parent": "table",
+          "recursiveSupported": false,
+          "type": "string",
+          "uiHint": "{ \"singleValue\":true }"
+        }
+      ]
+    },
+    "description": "Hive Server2",
+    "displayName": "Hadoop SQL",
+    "guid": "3e1afb5a-184a-4e82-9d9c-87a5cacc243c",
+    "id": 3,
+    "implClass": "org.apache.ranger.services.hive.RangerServiceHive",
+    "isEnabled": true,
+    "label": "Hive Server2",
+    "markerAccessTypes": [
+      {
+        "impliedGrants": [
+          "create",
+          "alter"
+        ],
+        "itemId": 15,
+        "label": "_CREATE",
+        "name": "_CREATE"
+      },
+      {
+        "impliedGrants": [
+          "select",
+          "read"
+        ],
+        "itemId": 16,
+        "label": "_READ",
+        "name": "_READ"
+      },
+      {
+        "impliedGrants": [
+          "update",
+          "write"
+        ],
+        "itemId": 17,
+        "label": "_UPDATE",
+        "name": "_UPDATE"
+      },
+      {
+        "impliedGrants": [
+          "drop"
+        ],
+        "itemId": 18,
+        "label": "_DELETE",
+        "name": "_DELETE"
+      },
+      {
+        "impliedGrants": [
+          "tempudfadmin",
+          "serviceadmin",
+          "index",
+          "lock",
+          "refresh",
+          "repladmin"
+        ],
+        "itemId": 19,
+        "label": "_MANAGE",
+        "name": "_MANAGE"
+      },
+      {
+        "impliedGrants": [
+          "drop",
+          "all",
+          "select",
+          "read",
+          "update",
+          "index",
+          "refresh",
+          "tempudfadmin",
+          "serviceadmin",
+          "create",
+          "lock",
+          "repladmin",
+          "write",
+          "alter"
+        ],
+        "itemId": 20,
+        "label": "_ALL",
+        "name": "_ALL"
+      }
+    ],
+    "name": "hive",
+    "options": {
+      "enableDenyAndExceptionsInPolicies": "true",
+      "enableTagBasedPolicies": "true"
+    },
+    "policyConditions": [
+      {
+        "description": "Boolean expression",
+        "evaluator": "org.apache.ranger.plugin.conditionevaluator.RangerScriptConditionEvaluator",
+        "evaluatorOptions": {
+          "engineName": "JavaScript",
+          "ui.isMultiline": "true"
+        },
+        "itemId": 1,
+        "label": "Enter boolean expression",
+        "name": "_expression",
+        "uiHint": "{ \"isMultiline\":true }"
+      }
+    ],
+    "resources": [
+      {
+        "description": "Global",
+        "excludesSupported": false,
+        "isValidLeaf": true,
+        "itemId": 7,
+        "label": "Global",
+        "level": 10,
+        "lookupSupported": false,
+        "mandatory": true,
+        "matcher": "org.apache.ranger.plugin.resourcematcher.RangerDefaultResourceMatcher",
+        "matcherOptions": {
+          "ignoreCase": "false",
+          "wildCard": "true"
+        },
+        "name": "global",
+        "recursiveSupported": false,
+        "type": "string"
+      },
+      {
+        "description": "URL",
+        "excludesSupported": false,
+        "isValidLeaf": true,
+        "itemId": 5,
+        "label": "URL",
+        "level": 10,
+        "lookupSupported": false,
+        "mandatory": true,
+        "matcher": "org.apache.ranger.plugin.resourcematcher.RangerURLResourceMatcher",
+        "matcherOptions": {
+          "ignoreCase": "false",
+          "wildCard": "true"
+        },
+        "name": "url",
+        "recursiveSupported": true,
+        "type": "string"
+      },
+      {
+        "description": "Hive Service",
+        "excludesSupported": false,
+        "isValidLeaf": true,
+        "itemId": 6,
+        "label": "Hive Service",
+        "level": 10,
+        "lookupSupported": false,
+        "mandatory": true,
+        "matcher": "org.apache.ranger.plugin.resourcematcher.RangerDefaultResourceMatcher",
+        "matcherOptions": {
+          "ignoreCase": "false",
+          "wildCard": "true"
+        },
+        "name": "hiveservice",
+        "recursiveSupported": false,
+        "type": "string"
+      },
+      {
+        "description": "Hive Database",
+        "excludesSupported": true,
+        "isValidLeaf": true,
+        "itemId": 1,
+        "label": "Hive Database",
+        "level": 10,
+        "lookupSupported": true,
+        "mandatory": true,
+        "matcher": "org.apache.ranger.plugin.resourcematcher.RangerDefaultResourceMatcher",
+        "matcherOptions": {
+          "ignoreCase": "true",
+          "wildCard": "true"
+        },
+        "name": "database",
+        "recursiveSupported": false,
+        "type": "string"
+      },
+      {
+        "description": "Hive Table",
+        "excludesSupported": true,
+        "isValidLeaf": true,
+        "itemId": 2,
+        "label": "Hive Table",
+        "level": 20,
+        "lookupSupported": true,
+        "mandatory": true,
+        "matcher": "org.apache.ranger.plugin.resourcematcher.RangerDefaultResourceMatcher",
+        "matcherOptions": {
+          "ignoreCase": "true",
+          "wildCard": "true"
+        },
+        "name": "table",
+        "parent": "database",
+        "recursiveSupported": false,
+        "type": "string"
+      },
+      {
+        "description": "Hive UDF",
+        "excludesSupported": true,
+        "isValidLeaf": true,
+        "itemId": 3,
+        "label": "Hive UDF",
+        "level": 20,
+        "lookupSupported": true,
+        "mandatory": true,
+        "matcher": "org.apache.ranger.plugin.resourcematcher.RangerDefaultResourceMatcher",
+        "matcherOptions": {
+          "ignoreCase": "true",
+          "wildCard": "true"
+        },
+        "name": "udf",
+        "parent": "database",
+        "recursiveSupported": false,
+        "type": "string"
+      },
+      {
+        "description": "Hive Column",
+        "excludesSupported": true,
+        "isValidLeaf": true,
+        "itemId": 4,
+        "label": "Hive Column",
+        "level": 30,
+        "lookupSupported": true,
+        "mandatory": true,
+        "matcher": "org.apache.ranger.plugin.resourcematcher.RangerDefaultResourceMatcher",
+        "matcherOptions": {
+          "ignoreCase": "true",
+          "wildCard": "true"
+        },
+        "name": "column",
+        "parent": "table",
+        "recursiveSupported": false,
+        "type": "string"
+      }
+    ],
+    "rowFilterDef": {
+      "accessTypes": [
+        {
+          "category": "READ",
+          "itemId": 1,
+          "label": "select",
+          "name": "select"
+        }
+      ],
+      "resources": [
+        {
+          "description": "Hive Database",
+          "excludesSupported": false,
+          "isValidLeaf": false,
+          "itemId": 1,
+          "label": "Hive Database",
+          "level": 10,
+          "lookupSupported": true,
+          "mandatory": true,
+          "matcher": "org.apache.ranger.plugin.resourcematcher.RangerDefaultResourceMatcher",
+          "matcherOptions": {
+            "ignoreCase": "true",
+            "wildCard": "false"
+          },
+          "name": "database",
+          "recursiveSupported": false,
+          "type": "string",
+          "uiHint": "{ \"singleValue\":true }"
+        },
+        {
+          "description": "Hive Table",
+          "excludesSupported": false,
+          "isValidLeaf": true,
+          "itemId": 2,
+          "label": "Hive Table",
+          "level": 20,
+          "lookupSupported": true,
+          "mandatory": true,
+          "matcher": "org.apache.ranger.plugin.resourcematcher.RangerDefaultResourceMatcher",
+          "matcherOptions": {
+            "ignoreCase": "true",
+            "wildCard": "false"
+          },
+          "name": "table",
+          "parent": "database",
+          "recursiveSupported": false,
+          "type": "string",
+          "uiHint": "{ \"singleValue\":true }"
+        }
+      ]
+    },
+    "updateTime": 1785511714032,
+    "version": 1
+  },
+  "serviceId": 4,
+  "serviceName": "sqe_ac_hive",
   "tagPolicies": {
-    "serviceName": "tag",
-    "policies": []
+    "auditMode": "audit-default",
+    "policies": [
+      {
+        "denyPolicyItems": [
+          {
+            "accesses": [
+              {
+                "isAllowed": true,
+                "type": "hdfs:read"
+              },
+              {
+                "isAllowed": true,
+                "type": "hdfs:write"
+              },
+              {
+                "isAllowed": true,
+                "type": "hdfs:execute"
+              },
+              {
+                "isAllowed": true,
+                "type": "hbase:read"
+              },
+              {
+                "isAllowed": true,
+                "type": "hbase:write"
+              },
+              {
+                "isAllowed": true,
+                "type": "hbase:create"
+              },
+              {
+                "isAllowed": true,
+                "type": "hbase:admin"
+              },
+              {
+                "isAllowed": true,
+                "type": "hbase:execute"
+              },
+              {
+                "isAllowed": true,
+                "type": "hive:select"
+              },
+              {
+                "isAllowed": true,
+                "type": "hive:update"
+              },
+              {
+                "isAllowed": true,
+                "type": "hive:create"
+              },
+              {
+                "isAllowed": true,
+                "type": "hive:drop"
+              },
+              {
+                "isAllowed": true,
+                "type": "hive:alter"
+              },
+              {
+                "isAllowed": true,
+                "type": "hive:index"
+              },
+              {
+                "isAllowed": true,
+                "type": "hive:lock"
+              },
+              {
+                "isAllowed": true,
+                "type": "hive:read"
+              },
+              {
+                "isAllowed": true,
+                "type": "hive:write"
+              },
+              {
+                "isAllowed": true,
+                "type": "hive:repladmin"
+              },
+              {
+                "isAllowed": true,
+                "type": "hive:serviceadmin"
+              },
+              {
+                "isAllowed": true,
+                "type": "hive:tempudfadmin"
+              },
+              {
+                "isAllowed": true,
+                "type": "hive:refresh"
+              },
+              {
+                "isAllowed": true,
+                "type": "hive:all"
+              },
+              {
+                "isAllowed": true,
+                "type": "kms:create"
+              },
+              {
+                "isAllowed": true,
+                "type": "kms:delete"
+              },
+              {
+                "isAllowed": true,
+                "type": "kms:rollover"
+              },
+              {
+                "isAllowed": true,
+                "type": "kms:setkeymaterial"
+              },
+              {
+                "isAllowed": true,
+                "type": "kms:get"
+              },
+              {
+                "isAllowed": true,
+                "type": "kms:getkeys"
+              },
+              {
+                "isAllowed": true,
+                "type": "kms:getmetadata"
+              },
+              {
+                "isAllowed": true,
+                "type": "kms:generateeek"
+              },
+              {
+                "isAllowed": true,
+                "type": "kms:decrypteek"
+              },
+              {
+                "isAllowed": true,
+                "type": "knox:allow"
+              },
+              {
+                "isAllowed": true,
+                "type": "storm:submitTopology"
+              },
+              {
+                "isAllowed": true,
+                "type": "storm:fileUpload"
+              },
+              {
+                "isAllowed": true,
+                "type": "storm:fileDownload"
+              },
+              {
+                "isAllowed": true,
+                "type": "storm:killTopology"
+              },
+              {
+                "isAllowed": true,
+                "type": "storm:rebalance"
+              },
+              {
+                "isAllowed": true,
+                "type": "storm:activate"
+              },
+              {
+                "isAllowed": true,
+                "type": "storm:deactivate"
+              },
+              {
+                "isAllowed": true,
+                "type": "storm:getTopologyConf"
+              },
+              {
+                "isAllowed": true,
+                "type": "storm:getTopology"
+              },
+              {
+                "isAllowed": true,
+                "type": "storm:getUserTopology"
+              },
+              {
+                "isAllowed": true,
+                "type": "storm:getTopologyInfo"
+              },
+              {
+                "isAllowed": true,
+                "type": "storm:uploadNewCredentials"
+              },
+              {
+                "isAllowed": true,
+                "type": "yarn:submit-app"
+              },
+              {
+                "isAllowed": true,
+                "type": "yarn:admin-queue"
+              },
+              {
+                "isAllowed": true,
+                "type": "kafka:publish"
+              },
+              {
+                "isAllowed": true,
+                "type": "kafka:consume"
+              },
+              {
+                "isAllowed": true,
+                "type": "kafka:configure"
+              },
+              {
+                "isAllowed": true,
+                "type": "kafka:describe"
+              },
+              {
+                "isAllowed": true,
+                "type": "kafka:kafka_admin"
+              },
+              {
+                "isAllowed": true,
+                "type": "kafka:create"
+              },
+              {
+                "isAllowed": true,
+                "type": "kafka:delete"
+              },
+              {
+                "isAllowed": true,
+                "type": "kafka:idempotent_write"
+              },
+              {
+                "isAllowed": true,
+                "type": "kafka:describe_configs"
+              },
+              {
+                "isAllowed": true,
+                "type": "kafka:alter_configs"
+              },
+              {
+                "isAllowed": true,
+                "type": "kafka:cluster_action"
+              },
+              {
+                "isAllowed": true,
+                "type": "kafka:alter"
+              },
+              {
+                "isAllowed": true,
+                "type": "solr:query"
+              },
+              {
+                "isAllowed": true,
+                "type": "solr:update"
+              },
+              {
+                "isAllowed": true,
+                "type": "schema-registry:create"
+              },
+              {
+                "isAllowed": true,
+                "type": "schema-registry:read"
+              },
+              {
+                "isAllowed": true,
+                "type": "schema-registry:update"
+              },
+              {
+                "isAllowed": true,
+                "type": "schema-registry:delete"
+              },
+              {
+                "isAllowed": true,
+                "type": "nifi:READ"
+              },
+              {
+                "isAllowed": true,
+                "type": "nifi:WRITE"
+              },
+              {
+                "isAllowed": true,
+                "type": "nifi-registry:READ"
+              },
+              {
+                "isAllowed": true,
+                "type": "nifi-registry:WRITE"
+              },
+              {
+                "isAllowed": true,
+                "type": "nifi-registry:DELETE"
+              },
+              {
+                "isAllowed": true,
+                "type": "atlas:type-create"
+              },
+              {
+                "isAllowed": true,
+                "type": "atlas:type-update"
+              },
+              {
+                "isAllowed": true,
+                "type": "atlas:type-delete"
+              },
+              {
+                "isAllowed": true,
+                "type": "atlas:entity-read"
+              },
+              {
+                "isAllowed": true,
+                "type": "atlas:entity-create"
+              },
+              {
+                "isAllowed": true,
+                "type": "atlas:entity-update"
+              },
+              {
+                "isAllowed": true,
+                "type": "atlas:entity-delete"
+              },
+              {
+                "isAllowed": true,
+                "type": "atlas:entity-add-classification"
+              },
+              {
+                "isAllowed": true,
+                "type": "atlas:entity-update-classification"
+              },
+              {
+                "isAllowed": true,
+                "type": "atlas:entity-remove-classification"
+              },
+              {
+                "isAllowed": true,
+                "type": "atlas:admin-export"
+              },
+              {
+                "isAllowed": true,
+                "type": "atlas:admin-import"
+              },
+              {
+                "isAllowed": true,
+                "type": "atlas:add-relationship"
+              },
+              {
+                "isAllowed": true,
+                "type": "atlas:update-relationship"
+              },
+              {
+                "isAllowed": true,
+                "type": "atlas:remove-relationship"
+              },
+              {
+                "isAllowed": true,
+                "type": "atlas:admin-purge"
+              },
+              {
+                "isAllowed": true,
+                "type": "atlas:entity-add-label"
+              },
+              {
+                "isAllowed": true,
+                "type": "atlas:entity-remove-label"
+              },
+              {
+                "isAllowed": true,
+                "type": "atlas:entity-update-business-metadata"
+              },
+              {
+                "isAllowed": true,
+                "type": "atlas:type-read"
+              },
+              {
+                "isAllowed": true,
+                "type": "atlas:admin-audits"
+              },
+              {
+                "isAllowed": true,
+                "type": "sqoop:READ"
+              },
+              {
+                "isAllowed": true,
+                "type": "sqoop:WRITE"
+              },
+              {
+                "isAllowed": true,
+                "type": "kylin:QUERY"
+              },
+              {
+                "isAllowed": true,
+                "type": "kylin:OPERATION"
+              },
+              {
+                "isAllowed": true,
+                "type": "kylin:MANAGEMENT"
+              },
+              {
+                "isAllowed": true,
+                "type": "kylin:ADMIN"
+              },
+              {
+                "isAllowed": true,
+                "type": "elasticsearch:all"
+              },
+              {
+                "isAllowed": true,
+                "type": "elasticsearch:monitor"
+              },
+              {
+                "isAllowed": true,
+                "type": "elasticsearch:manage"
+              },
+              {
+                "isAllowed": true,
+                "type": "elasticsearch:view_index_metadata"
+              },
+              {
+                "isAllowed": true,
+                "type": "elasticsearch:read"
+              },
+              {
+                "isAllowed": true,
+                "type": "elasticsearch:read_cross_cluster"
+              },
+              {
+                "isAllowed": true,
+                "type": "elasticsearch:index"
+              },
+              {
+                "isAllowed": true,
+                "type": "elasticsearch:create"
+              },
+              {
+                "isAllowed": true,
+                "type": "elasticsearch:delete"
+              },
+              {
+                "isAllowed": true,
+                "type": "elasticsearch:write"
+              },
+              {
+                "isAllowed": true,
+                "type": "elasticsearch:delete_index"
+              },
+              {
+                "isAllowed": true,
+                "type": "elasticsearch:create_index"
+              },
+              {
+                "isAllowed": true,
+                "type": "trino:select"
+              },
+              {
+                "isAllowed": true,
+                "type": "trino:insert"
+              },
+              {
+                "isAllowed": true,
+                "type": "trino:create"
+              },
+              {
+                "isAllowed": true,
+                "type": "trino:drop"
+              },
+              {
+                "isAllowed": true,
+                "type": "trino:delete"
+              },
+              {
+                "isAllowed": true,
+                "type": "trino:use"
+              },
+              {
+                "isAllowed": true,
+                "type": "trino:alter"
+              },
+              {
+                "isAllowed": true,
+                "type": "trino:grant"
+              },
+              {
+                "isAllowed": true,
+                "type": "trino:revoke"
+              },
+              {
+                "isAllowed": true,
+                "type": "trino:show"
+              },
+              {
+                "isAllowed": true,
+                "type": "trino:impersonate"
+              },
+              {
+                "isAllowed": true,
+                "type": "trino:execute"
+              },
+              {
+                "isAllowed": true,
+                "type": "trino:read_sysinfo"
+              },
+              {
+                "isAllowed": true,
+                "type": "trino:write_sysinfo"
+              },
+              {
+                "isAllowed": true,
+                "type": "trino:all"
+              },
+              {
+                "isAllowed": true,
+                "type": "presto:select"
+              },
+              {
+                "isAllowed": true,
+                "type": "presto:insert"
+              },
+              {
+                "isAllowed": true,
+                "type": "presto:create"
+              },
+              {
+                "isAllowed": true,
+                "type": "presto:drop"
+              },
+              {
+                "isAllowed": true,
+                "type": "presto:delete"
+              },
+              {
+                "isAllowed": true,
+                "type": "presto:use"
+              },
+              {
+                "isAllowed": true,
+                "type": "presto:alter"
+              },
+              {
+                "isAllowed": true,
+                "type": "presto:grant"
+              },
+              {
+                "isAllowed": true,
+                "type": "presto:revoke"
+              },
+              {
+                "isAllowed": true,
+                "type": "presto:show"
+              },
+              {
+                "isAllowed": true,
+                "type": "presto:impersonate"
+              },
+              {
+                "isAllowed": true,
+                "type": "presto:execute"
+              },
+              {
+                "isAllowed": true,
+                "type": "presto:all"
+              },
+              {
+                "isAllowed": true,
+                "type": "ozone:read"
+              },
+              {
+                "isAllowed": true,
+                "type": "ozone:write"
+              },
+              {
+                "isAllowed": true,
+                "type": "ozone:create"
+              },
+              {
+                "isAllowed": true,
+                "type": "ozone:list"
+              },
+              {
+                "isAllowed": true,
+                "type": "ozone:delete"
+              },
+              {
+                "isAllowed": true,
+                "type": "ozone:read_acl"
+              },
+              {
+                "isAllowed": true,
+                "type": "ozone:write_acl"
+              },
+              {
+                "isAllowed": true,
+                "type": "ozone:assume_role"
+              },
+              {
+                "isAllowed": true,
+                "type": "ozone:assume_role"
+              },
+              {
+                "isAllowed": true,
+                "type": "kudu:select"
+              },
+              {
+                "isAllowed": true,
+                "type": "kudu:insert"
+              },
+              {
+                "isAllowed": true,
+                "type": "kudu:update"
+              },
+              {
+                "isAllowed": true,
+                "type": "kudu:delete"
+              },
+              {
+                "isAllowed": true,
+                "type": "kudu:alter"
+              },
+              {
+                "isAllowed": true,
+                "type": "kudu:create"
+              },
+              {
+                "isAllowed": true,
+                "type": "kudu:drop"
+              },
+              {
+                "isAllowed": true,
+                "type": "kudu:metadata"
+              },
+              {
+                "isAllowed": true,
+                "type": "kudu:all"
+              },
+              {
+                "isAllowed": true,
+                "type": "nestedstructure:read"
+              },
+              {
+                "isAllowed": true,
+                "type": "nestedstructure:write"
+              },
+              {
+                "isAllowed": true,
+                "type": "polaris:service-access-manage"
+              },
+              {
+                "isAllowed": true,
+                "type": "polaris:catalog-create"
+              },
+              {
+                "isAllowed": true,
+                "type": "polaris:catalog-drop"
+              },
+              {
+                "isAllowed": true,
+                "type": "polaris:catalog-list"
+              },
+              {
+                "isAllowed": true,
+                "type": "polaris:catalog-access-manage"
+              },
+              {
+                "isAllowed": true,
+                "type": "polaris:catalog-content-manage"
+              },
+              {
+                "isAllowed": true,
+                "type": "polaris:catalog-grants-list"
+              },
+              {
+                "isAllowed": true,
+                "type": "polaris:catalog-grants-manage"
+              },
+              {
+                "isAllowed": true,
+                "type": "polaris:catalog-metadata-full"
+              },
+              {
+                "isAllowed": true,
+                "type": "polaris:catalog-metadata-manage"
+              },
+              {
+                "isAllowed": true,
+                "type": "polaris:catalog-policy-attach"
+              },
+              {
+                "isAllowed": true,
+                "type": "polaris:catalog-policy-detach"
+              },
+              {
+                "isAllowed": true,
+                "type": "polaris:catalog-properties-read"
+              },
+              {
+                "isAllowed": true,
+                "type": "polaris:catalog-properties-write"
+              },
+              {
+                "isAllowed": true,
+                "type": "polaris:catalog-role-create"
+              },
+              {
+                "isAllowed": true,
+                "type": "polaris:catalog-role-drop"
+              },
+              {
+                "isAllowed": true,
+                "type": "polaris:catalog-role-list"
+              },
+              {
+                "isAllowed": true,
+                "type": "polaris:catalog-role-usage"
+              },
+              {
+                "isAllowed": true,
+                "type": "polaris:catalog-role-grants-for-grantee-manage"
+              },
+              {
+                "isAllowed": true,
+                "type": "polaris:catalog-role-grants-list"
+              },
+              {
+                "isAllowed": true,
+                "type": "polaris:catalog-role-grants-manage"
+              },
+              {
+                "isAllowed": true,
+                "type": "polaris:catalog-role-metadata-full"
+              },
+              {
+                "isAllowed": true,
+                "type": "polaris:catalog-role-properties-read"
+              },
+              {
+                "isAllowed": true,
+                "type": "polaris:catalog-role-properties-write"
+              },
+              {
+                "isAllowed": true,
+                "type": "polaris:namespace-create"
+              },
+              {
+                "isAllowed": true,
+                "type": "polaris:namespace-drop"
+              },
+              {
+                "isAllowed": true,
+                "type": "polaris:namespace-list"
+              },
+              {
+                "isAllowed": true,
+                "type": "polaris:namespace-grants-list"
+              },
+              {
+                "isAllowed": true,
+                "type": "polaris:namespace-grants-manage"
+              },
+              {
+                "isAllowed": true,
+                "type": "polaris:namespace-metadata-full"
+              },
+              {
+                "isAllowed": true,
+                "type": "polaris:namespace-policy-attach"
+              },
+              {
+                "isAllowed": true,
+                "type": "polaris:namespace-policy-detach"
+              },
+              {
+                "isAllowed": true,
+                "type": "polaris:namespace-properties-read"
+              },
+              {
+                "isAllowed": true,
+                "type": "polaris:namespace-properties-write"
+              },
+              {
+                "isAllowed": true,
+                "type": "polaris:policy-create"
+              },
+              {
+                "isAllowed": true,
+                "type": "polaris:policy-drop"
+              },
+              {
+                "isAllowed": true,
+                "type": "polaris:policy-list"
+              },
+              {
+                "isAllowed": true,
+                "type": "polaris:policy-read"
+              },
+              {
+                "isAllowed": true,
+                "type": "polaris:policy-write"
+              },
+              {
+                "isAllowed": true,
+                "type": "polaris:policy-attach"
+              },
+              {
+                "isAllowed": true,
+                "type": "polaris:policy-detach"
+              },
+              {
+                "isAllowed": true,
+                "type": "polaris:policy-grants-manage"
+              },
+              {
+                "isAllowed": true,
+                "type": "polaris:policy-metadata-full"
+              },
+              {
+                "isAllowed": true,
+                "type": "polaris:principal-create"
+              },
+              {
+                "isAllowed": true,
+                "type": "polaris:principal-drop"
+              },
+              {
+                "isAllowed": true,
+                "type": "polaris:principal-list"
+              },
+              {
+                "isAllowed": true,
+                "type": "polaris:principal-credentials-reset"
+              },
+              {
+                "isAllowed": true,
+                "type": "polaris:principal-credentials-rotate"
+              },
+              {
+                "isAllowed": true,
+                "type": "polaris:principal-grants-list"
+              },
+              {
+                "isAllowed": true,
+                "type": "polaris:principal-grants-manage"
+              },
+              {
+                "isAllowed": true,
+                "type": "polaris:principal-grants-for-grantee-manage"
+              },
+              {
+                "isAllowed": true,
+                "type": "polaris:principal-metadata-full"
+              },
+              {
+                "isAllowed": true,
+                "type": "polaris:principal-properties-read"
+              },
+              {
+                "isAllowed": true,
+                "type": "polaris:principal-properties-write"
+              },
+              {
+                "isAllowed": true,
+                "type": "polaris:principal-role-create"
+              },
+              {
+                "isAllowed": true,
+                "type": "polaris:principal-role-drop"
+              },
+              {
+                "isAllowed": true,
+                "type": "polaris:principal-role-list"
+              },
+              {
+                "isAllowed": true,
+                "type": "polaris:principal-role-usage"
+              },
+              {
+                "isAllowed": true,
+                "type": "polaris:principal-role-grants-list"
+              },
+              {
+                "isAllowed": true,
+                "type": "polaris:principal-role-grants-manage"
+              },
+              {
+                "isAllowed": true,
+                "type": "polaris:principal-role-grants-for-grantee-manage"
+              },
+              {
+                "isAllowed": true,
+                "type": "polaris:principal-role-metadata-full"
+              },
+              {
+                "isAllowed": true,
+                "type": "polaris:principal-role-properties-read"
+              },
+              {
+                "isAllowed": true,
+                "type": "polaris:principal-role-properties-write"
+              },
+              {
+                "isAllowed": true,
+                "type": "polaris:table-create"
+              },
+              {
+                "isAllowed": true,
+                "type": "polaris:table-drop"
+              },
+              {
+                "isAllowed": true,
+                "type": "polaris:table-list"
+              },
+              {
+                "isAllowed": true,
+                "type": "polaris:table-data-read"
+              },
+              {
+                "isAllowed": true,
+                "type": "polaris:table-data-write"
+              },
+              {
+                "isAllowed": true,
+                "type": "polaris:table-grants-list"
+              },
+              {
+                "isAllowed": true,
+                "type": "polaris:table-grants-manage"
+              },
+              {
+                "isAllowed": true,
+                "type": "polaris:table-metadata-full"
+              },
+              {
+                "isAllowed": true,
+                "type": "polaris:table-policy-attach"
+              },
+              {
+                "isAllowed": true,
+                "type": "polaris:table-policy-detach"
+              },
+              {
+                "isAllowed": true,
+                "type": "polaris:table-properties-read"
+              },
+              {
+                "isAllowed": true,
+                "type": "polaris:table-properties-write"
+              },
+              {
+                "isAllowed": true,
+                "type": "polaris:table-properties-set"
+              },
+              {
+                "isAllowed": true,
+                "type": "polaris:table-properties-remove"
+              },
+              {
+                "isAllowed": true,
+                "type": "polaris:table-uuid-assign"
+              },
+              {
+                "isAllowed": true,
+                "type": "polaris:table-format-version-upgrade"
+              },
+              {
+                "isAllowed": true,
+                "type": "polaris:table-schema-add"
+              },
+              {
+                "isAllowed": true,
+                "type": "polaris:table-schema-set-current"
+              },
+              {
+                "isAllowed": true,
+                "type": "polaris:table-partition-spec-add"
+              },
+              {
+                "isAllowed": true,
+                "type": "polaris:table-partition-specs-remove"
+              },
+              {
+                "isAllowed": true,
+                "type": "polaris:table-sort-order-add"
+              },
+              {
+                "isAllowed": true,
+                "type": "polaris:table-sort-order-set-default"
+              },
+              {
+                "isAllowed": true,
+                "type": "polaris:table-snapshot-add"
+              },
+              {
+                "isAllowed": true,
+                "type": "polaris:table-snapshots-remove"
+              },
+              {
+                "isAllowed": true,
+                "type": "polaris:table-snapshot-ref-set"
+              },
+              {
+                "isAllowed": true,
+                "type": "polaris:table-snapshot-ref-remove"
+              },
+              {
+                "isAllowed": true,
+                "type": "polaris:table-location-set"
+              },
+              {
+                "isAllowed": true,
+                "type": "polaris:table-statistics-set"
+              },
+              {
+                "isAllowed": true,
+                "type": "polaris:table-statistics-remove"
+              },
+              {
+                "isAllowed": true,
+                "type": "polaris:table-structure-manage"
+              },
+              {
+                "isAllowed": true,
+                "type": "polaris:view-create"
+              },
+              {
+                "isAllowed": true,
+                "type": "polaris:view-drop"
+              },
+              {
+                "isAllowed": true,
+                "type": "polaris:view-list"
+              },
+              {
+                "isAllowed": true,
+                "type": "polaris:view-grants-list"
+              },
+              {
+                "isAllowed": true,
+                "type": "polaris:view-grants-manage"
+              },
+              {
+                "isAllowed": true,
+                "type": "polaris:view-metadata-full"
+              },
+              {
+                "isAllowed": true,
+                "type": "polaris:view-properties-read"
+              },
+              {
+                "isAllowed": true,
+                "type": "polaris:view-properties-write"
+              }
+            ],
+            "conditions": [
+              {
+                "type": "accessed-after-expiry",
+                "values": [
+                  "yes"
+                ]
+              }
+            ],
+            "delegateAdmin": false,
+            "groups": [
+              "public"
+            ]
+          }
+        ],
+        "description": "Policy for data with EXPIRES_ON tag",
+        "guid": "d50d7392-7d69-4971-a022-c8336bf14294",
+        "id": 28,
+        "isAuditEnabled": true,
+        "isDenyAllElse": false,
+        "isEnabled": true,
+        "name": "EXPIRES_ON",
+        "policyPriority": 0,
+        "policyType": 0,
+        "resources": {
+          "tag": {
+            "isExcludes": false,
+            "isRecursive": false,
+            "values": [
+              "EXPIRES_ON"
+            ]
+          }
+        },
+        "service": "sqe_ac_tag",
+        "serviceType": "tag",
+        "version": 1
+      },
+      {
+        "dataMaskPolicyItems": [
+          {
+            "accesses": [
+              {
+                "isAllowed": true,
+                "type": "hive:select"
+              }
+            ],
+            "dataMaskInfo": {
+              "dataMaskType": "hive:MASK_SHOW_LAST_4"
+            },
+            "delegateAdmin": false,
+            "roles": [
+              "engineer"
+            ]
+          }
+        ],
+        "guid": "ad37ba1c-d5bb-4589-8965-83167a404afb",
+        "id": 70,
+        "isAuditEnabled": true,
+        "isDenyAllElse": false,
+        "isEnabled": true,
+        "name": "sqe-ac-e2e-tag-mask-pii",
+        "policyPriority": 0,
+        "policyType": 1,
+        "resources": {
+          "tag": {
+            "isExcludes": false,
+            "isRecursive": false,
+            "values": [
+              "PII"
+            ]
+          }
+        },
+        "service": "sqe_ac_tag",
+        "serviceType": "tag",
+        "version": 1
+      }
+    ],
+    "policyUpdateTime": 1785515169205,
+    "policyVersion": 16,
+    "serviceConfig": {
+      "ranger.plugin.audit.filters": "[ {'accessResult': 'DENIED', 'isAudited': true} ]",
+      "ranger.plugins.conf.ldap.groupname.caseconversion": "none",
+      "ranger.plugins.conf.ldap.username.caseconversion": "none",
+      "ranger.plugins.conf.mapping.groupname.handler": "org.apache.ranger.ugsyncutil.transform.RegEx",
+      "ranger.plugins.conf.mapping.regex.separator": "/",
+      "ranger.plugins.conf.mapping.username.handler": "org.apache.ranger.ugsyncutil.transform.RegEx"
+    },
+    "serviceDef": {
+      "accessTypes": [
+        {
+          "category": "READ",
+          "itemId": 3004,
+          "label": "select",
+          "name": "select"
+        },
+        {
+          "category": "UPDATE",
+          "itemId": 3005,
+          "label": "update",
+          "name": "update"
+        },
+        {
+          "category": "CREATE",
+          "itemId": 3006,
+          "label": "Create",
+          "name": "create"
+        },
+        {
+          "category": "DELETE",
+          "itemId": 3007,
+          "label": "Drop",
+          "name": "drop"
+        },
+        {
+          "category": "CREATE",
+          "itemId": 3008,
+          "label": "Alter",
+          "name": "alter"
+        },
+        {
+          "category": "MANAGE",
+          "itemId": 3009,
+          "label": "Index",
+          "name": "index"
+        },
+        {
+          "category": "MANAGE",
+          "itemId": 3010,
+          "label": "Lock",
+          "name": "lock"
+        },
+        {
+          "category": "READ",
+          "itemId": 3012,
+          "label": "Read",
+          "name": "read"
+        },
+        {
+          "category": "UPDATE",
+          "itemId": 3013,
+          "label": "Write",
+          "name": "write"
+        },
+        {
+          "category": "MANAGE",
+          "itemId": 3014,
+          "label": "ReplAdmin",
+          "name": "repladmin"
+        },
+        {
+          "category": "MANAGE",
+          "itemId": 3015,
+          "label": "Service Admin",
+          "name": "serviceadmin"
+        },
+        {
+          "category": "MANAGE",
+          "itemId": 3016,
+          "label": "Temporary UDF Admin",
+          "name": "tempudfadmin"
+        },
+        {
+          "category": "MANAGE",
+          "itemId": 3017,
+          "label": "Refresh",
+          "name": "refresh"
+        },
+        {
+          "impliedGrants": [
+            "drop",
+            "serviceadmin",
+            "select",
+            "read",
+            "update",
+            "create",
+            "index",
+            "lock",
+            "refresh",
+            "repladmin",
+            "write",
+            "alter"
+          ],
+          "itemId": 3011,
+          "label": "All",
+          "name": "all"
+        }
+      ],
+      "configs": [
+        {
+          "defaultValue": "[ {'accessResult': 'DENIED', 'isAudited': true} ]",
+          "itemId": 1,
+          "label": "Ranger Default Audit Filters",
+          "mandatory": false,
+          "name": "ranger.plugin.audit.filters",
+          "type": "string"
+        }
+      ],
+      "contextEnrichers": [
+        {
+          "enricher": "org.apache.ranger.plugin.contextenricher.RangerTagEnricher",
+          "enricherOptions": {
+            "tagRefresherPollingInterval": "60000",
+            "tagRetrieverClassName": "org.apache.ranger.plugin.contextenricher.RangerAdminTagRetriever"
+          },
+          "itemId": 1,
+          "name": "TagEnricher"
+        }
+      ],
+      "createTime": 1785511713414,
+      "dataMaskDef": {
+        "accessTypes": [
+          {
+            "category": "READ",
+            "itemId": 3004,
+            "label": "select",
+            "name": "select"
+          }
+        ],
+        "maskTypes": [
+          {
+            "description": "Replace lowercase with 'x', uppercase with 'X', digits with '0'",
+            "itemId": 3004,
+            "label": "Redact",
+            "name": "hive:MASK",
+            "transformer": "mask({col})"
+          },
+          {
+            "description": "Show last 4 characters; replace rest with 'x'",
+            "itemId": 3005,
+            "label": "Partial mask: show last 4",
+            "name": "hive:MASK_SHOW_LAST_4",
+            "transformer": "mask_show_last_n({col}, 4, 'x', 'x', 'x', -1, '1')"
+          },
+          {
+            "description": "Show first 4 characters; replace rest with 'x'",
+            "itemId": 3006,
+            "label": "Partial mask: show first 4",
+            "name": "hive:MASK_SHOW_FIRST_4",
+            "transformer": "mask_show_first_n({col}, 4, 'x', 'x', 'x', -1, '1')"
+          },
+          {
+            "description": "Hash the value",
+            "itemId": 3007,
+            "label": "Hash",
+            "name": "hive:MASK_HASH",
+            "transformer": "mask_hash({col})"
+          },
+          {
+            "description": "Replace with NULL",
+            "itemId": 3008,
+            "label": "Nullify",
+            "name": "hive:MASK_NULL"
+          },
+          {
+            "description": "No masking",
+            "itemId": 3009,
+            "label": "Unmasked (retain original value)",
+            "name": "hive:MASK_NONE"
+          },
+          {
+            "description": "Date: show only year",
+            "itemId": 3015,
+            "label": "Date: show only year",
+            "name": "hive:MASK_DATE_SHOW_YEAR",
+            "transformer": "mask({col}, 'x', 'x', 'x', -1, '1', 1, 0, -1)"
+          },
+          {
+            "description": "Custom",
+            "itemId": 3016,
+            "label": "Custom",
+            "name": "hive:CUSTOM"
+          },
+          {
+            "description": "Replace lowercase with 'x', uppercase with 'X', digits with '0'",
+            "itemId": 203204,
+            "label": "Redact",
+            "name": "trino:MASK",
+            "transformer": "cast(regexp_replace(regexp_replace(regexp_replace({col},'([A-Z])', 'X'),'([a-z])','x'),'([0-9])','0') as {type})"
+          },
+          {
+            "description": "Show last 4 characters; replace rest with 'X'",
+            "itemId": 203205,
+            "label": "Partial mask: show last 4",
+            "name": "trino:MASK_SHOW_LAST_4",
+            "transformer": "cast(regexp_replace({col}, '(.*)(.{4}$)', x -> regexp_replace(x[1], '.', 'X') || x[2]) as {type})"
+          },
+          {
+            "description": "Show first 4 characters; replace rest with 'x'",
+            "itemId": 203206,
+            "label": "Partial mask: show first 4",
+            "name": "trino:MASK_SHOW_FIRST_4",
+            "transformer": "cast(regexp_replace({col}, '(^.{4})(.*)', x -> x[1] || regexp_replace(x[2], '.', 'X')) as {type})"
+          },
+          {
+            "description": "Hash the value of a varchar with sha256",
+            "itemId": 203207,
+            "label": "Hash",
+            "name": "trino:MASK_HASH",
+            "transformer": "cast(to_hex(sha256(to_utf8({col}))) as {type})"
+          },
+          {
+            "description": "Replace with NULL",
+            "itemId": 203208,
+            "label": "Nullify",
+            "name": "trino:MASK_NULL"
+          },
+          {
+            "description": "No masking",
+            "itemId": 203209,
+            "label": "Unmasked (retain original value)",
+            "name": "trino:MASK_NONE"
+          },
+          {
+            "description": "Date: show only year",
+            "itemId": 203215,
+            "label": "Date: show only year",
+            "name": "trino:MASK_DATE_SHOW_YEAR",
+            "transformer": "date_trunc('year', {col})"
+          },
+          {
+            "description": "Custom",
+            "itemId": 203216,
+            "label": "Custom",
+            "name": "trino:CUSTOM"
+          },
+          {
+            "description": "Replace lowercase with 'x', uppercase with 'X', digits with '0'",
+            "itemId": 17018,
+            "label": "Redact",
+            "name": "presto:MASK",
+            "transformer": "cast(regexp_replace(regexp_replace(regexp_replace({col},'([A-Z])', 'X'),'([a-z])','x'),'([0-9])','0') as {type})"
+          },
+          {
+            "description": "Show last 4 characters; replace rest with 'X'",
+            "itemId": 17019,
+            "label": "Partial mask: show last 4",
+            "name": "presto:MASK_SHOW_LAST_4",
+            "transformer": "cast(regexp_replace({col}, '(.*)(.{4}$)', x -> regexp_replace(x[1], '.', 'X') || x[2]) as {type})"
+          },
+          {
+            "description": "Show first 4 characters; replace rest with 'x'",
+            "itemId": 17020,
+            "label": "Partial mask: show first 4",
+            "name": "presto:MASK_SHOW_FIRST_4",
+            "transformer": "cast(regexp_replace({col}, '(^.{4})(.*)', x -> x[1] || regexp_replace(x[2], '.', 'X')) as {type})"
+          },
+          {
+            "description": "Hash the value of a varchar with sha256",
+            "itemId": 17021,
+            "label": "Hash",
+            "name": "presto:MASK_HASH",
+            "transformer": "cast(to_hex(sha256(to_utf8({col}))) as {type})"
+          },
+          {
+            "description": "Replace with NULL",
+            "itemId": 17022,
+            "label": "Nullify",
+            "name": "presto:MASK_NULL"
+          },
+          {
+            "description": "No masking",
+            "itemId": 17023,
+            "label": "Unmasked (retain original value)",
+            "name": "presto:MASK_NONE"
+          },
+          {
+            "description": "Date: show only year",
+            "itemId": 17029,
+            "label": "Date: show only year",
+            "name": "presto:MASK_DATE_SHOW_YEAR",
+            "transformer": "date_trunc('year', {col})"
+          },
+          {
+            "description": "Custom",
+            "itemId": 17030,
+            "label": "Custom",
+            "name": "presto:CUSTOM"
+          },
+          {
+            "description": "Replace lowercase with 'x', uppercase with 'X', digits with '0'",
+            "itemId": 205206,
+            "label": "Redact",
+            "name": "nestedstructure:MASK",
+            "transformer": "mask({field})"
+          },
+          {
+            "description": "Show last 4 characters; replace rest with 'x'",
+            "itemId": 205207,
+            "label": "Partial mask: show last 4",
+            "name": "nestedstructure:MASK_SHOW_LAST_4",
+            "transformer": "mask_show_last_n({field}, 4, 'x', 'x', 'x', -1, '1')"
+          },
+          {
+            "description": "Show first 4 characters; replace rest with 'x'",
+            "itemId": 205208,
+            "label": "Partial mask: show first 4",
+            "name": "nestedstructure:MASK_SHOW_FIRST_4",
+            "transformer": "mask_show_first_n({field}, 4, 'x', 'x', 'x', -1, '1')"
+          },
+          {
+            "description": "Hash the value",
+            "itemId": 205209,
+            "label": "Hash",
+            "name": "nestedstructure:MASK_HASH",
+            "transformer": "mask_hash({field})"
+          },
+          {
+            "description": "Replace with NULL",
+            "itemId": 205210,
+            "label": "Nullify",
+            "name": "nestedstructure:MASK_NULL"
+          },
+          {
+            "description": "No masking",
+            "itemId": 205211,
+            "label": "Unmasked (retain original value)",
+            "name": "nestedstructure:MASK_NONE"
+          },
+          {
+            "description": "Date: show only year",
+            "itemId": 205217,
+            "label": "Date: show only year",
+            "name": "nestedstructure:MASK_DATE_SHOW_YEAR",
+            "transformer": "mask({field}, 'x', 'x', 'x', -1, '1', 1, 0, -1)"
+          },
+          {
+            "description": "Custom",
+            "itemId": 205218,
+            "label": "Custom",
+            "name": "nestedstructure:CUSTOM"
+          }
+        ],
+        "resources": [
+          {
+            "description": "TAG",
+            "excludesSupported": false,
+            "isValidLeaf": true,
+            "itemId": 1,
+            "label": "TAG",
+            "level": 1,
+            "lookupSupported": true,
+            "mandatory": true,
+            "matcher": "org.apache.ranger.plugin.resourcematcher.RangerDefaultResourceMatcher",
+            "matcherOptions": {
+              "__accessTypeRestrictions": "[]",
+              "__isValidLeaf": "true",
+              "ignoreCase": "false",
+              "wildCard": "false"
+            },
+            "name": "tag",
+            "recursiveSupported": false,
+            "type": "string",
+            "uiHint": "{ \"singleValue\":true }"
+          }
+        ]
+      },
+      "description": "TAG Service Definition",
+      "displayName": "tag",
+      "guid": "0d047248-baff-4cf9-8e9e-d5d377284b2e",
+      "id": 100,
+      "implClass": "org.apache.ranger.services.tag.RangerServiceTag",
+      "isEnabled": true,
+      "label": "TAG",
+      "markerAccessTypes": [
+        {
+          "impliedGrants": [
+            "create",
+            "alter"
+          ],
+          "itemId": 206309,
+          "label": "_CREATE",
+          "name": "_CREATE"
+        },
+        {
+          "impliedGrants": [
+            "select",
+            "read"
+          ],
+          "itemId": 206310,
+          "label": "_READ",
+          "name": "_READ"
+        },
+        {
+          "impliedGrants": [
+            "update",
+            "write"
+          ],
+          "itemId": 206311,
+          "label": "_UPDATE",
+          "name": "_UPDATE"
+        },
+        {
+          "impliedGrants": [
+            "drop"
+          ],
+          "itemId": 206312,
+          "label": "_DELETE",
+          "name": "_DELETE"
+        },
+        {
+          "impliedGrants": [
+            "tempudfadmin",
+            "serviceadmin",
+            "index",
+            "refresh",
+            "lock",
+            "repladmin"
+          ],
+          "itemId": 206313,
+          "label": "_MANAGE",
+          "name": "_MANAGE"
+        },
+        {
+          "impliedGrants": [
+            "all",
+            "drop",
+            "read",
+            "select",
+            "refresh",
+            "update",
+            "index",
+            "tempudfadmin",
+            "serviceadmin",
+            "create",
+            "lock",
+            "repladmin",
+            "write",
+            "alter"
+          ],
+          "itemId": 206314,
+          "label": "_ALL",
+          "name": "_ALL"
+        }
+      ],
+      "name": "tag",
+      "options": {
+        "enableDenyAndExceptionsInPolicies": "true",
+        "enableTagBasedPolicies": "true",
+        "ui.pages": "tag-based-policies"
+      },
+      "policyConditions": [
+        {
+          "description": "Accessed after expiry_date? (yes/no)",
+          "evaluator": "org.apache.ranger.plugin.conditionevaluator.RangerScriptTemplateConditionEvaluator",
+          "evaluatorOptions": {
+            "scriptTemplate": "ctx.isAccessedAfter('expiry_date');"
+          },
+          "itemId": 1,
+          "label": "Accessed after expiry_date (yes/no)?",
+          "name": "accessed-after-expiry",
+          "uiHint": "{ \"singleValue\":true }"
+        },
+        {
+          "description": "Boolean expression",
+          "evaluator": "org.apache.ranger.plugin.conditionevaluator.RangerScriptConditionEvaluator",
+          "evaluatorOptions": {
+            "engineName": "JavaScript",
+            "ui.isMultiline": "true"
+          },
+          "itemId": 2,
+          "label": "Enter boolean expression",
+          "name": "expression",
+          "uiHint": "{ \"isMultiline\":true }"
+        }
+      ],
+      "resources": [
+        {
+          "description": "TAG",
+          "excludesSupported": false,
+          "isValidLeaf": true,
+          "itemId": 1,
+          "label": "TAG",
+          "level": 1,
+          "lookupSupported": true,
+          "mandatory": true,
+          "matcher": "org.apache.ranger.plugin.resourcematcher.RangerDefaultResourceMatcher",
+          "matcherOptions": {
+            "ignoreCase": "false",
+            "wildCard": "false"
+          },
+          "name": "tag",
+          "recursiveSupported": false,
+          "type": "string",
+          "uiHint": "{ \"singleValue\":true }"
+        }
+      ],
+      "rowFilterDef": {},
+      "updateTime": 1785511721207,
+      "version": 23
+    },
+    "serviceId": 5,
+    "serviceName": "sqe_ac_tag"
   }
 }

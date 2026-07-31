@@ -191,7 +191,7 @@ impl RangerAdmin {
         if !resp.status().is_success() {
             bail!("GET policies for {service} -> HTTP {}", resp.status());
         }
-        Ok(resp.json().await.context("parse policies json")?)
+        resp.json().await.context("parse policies json")
     }
 
     /// Create a policy. Returns its Ranger id.
@@ -281,6 +281,6 @@ impl RangerAdmin {
         if !resp.status().is_success() {
             bail!("download bundle for {service} -> HTTP {}", resp.status());
         }
-        Ok(resp.json().await.context("parse bundle json")?)
+        resp.json().await.context("parse bundle json")
     }
 }
