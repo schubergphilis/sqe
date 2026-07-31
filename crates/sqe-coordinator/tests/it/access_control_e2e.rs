@@ -309,6 +309,9 @@ fn total_rows(batches: &[RecordBatch]) -> usize {
 /// This is the discrimination the shell harness cannot make: it greps for
 /// `not found`, which a typo'd identifier also produces. Running the SAME text
 /// as an admin proves the statement is valid, so the failure is authorization.
+/// The denial is waited for, not assumed: `ac_setup` REVOKEs any grants a
+/// previous test left, and Polaris caches Ranger policies, so an allow can still
+/// be served for a few seconds after the revoke lands in Ranger.
 async fn assert_denied_but_valid(ctx: &AcCtx, denied: &Session, sql: &str) {
     let as_admin = ctx.handler.execute(&ctx.carol, sql, None).await;
     assert!(
@@ -317,13 +320,17 @@ async fn assert_denied_but_valid(ctx: &AcCtx, denied: &Session, sql: &str) {
          denial from an invalid statement. Error: {:?}",
         as_admin.err()
     );
-    let result = ctx.handler.execute(denied, sql, None).await;
-    assert!(
-        result.is_err(),
-        "`{sql}` must be denied for {} but returned {} rows",
-        denied.user.username,
-        result.map(|b| total_rows(&b)).unwrap_or(0)
-    );
+    let user = denied.user.username.clone();
+    crate::common::eventually(&format!("`{sql}` to be denied for {user}"), || async {
+        match ctx.handler.execute(denied, sql, None).await {
+            Err(_) => Ok(()),
+            Ok(b) => Err(format!(
+                "still allowed for {user} with {} rows",
+                total_rows(&b)
+            )),
+        }
+    })
+    .await;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -652,4 +659,224 @@ async fn revoke_disables_access() {
         }
     })
     .await;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Fine-grained: resource-based masks and row filters (the `hive` service path)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Both roles get plain read access on orders, so the fine-grained cases differ
+/// only in masking: alice (analyst only) is the unmasked baseline, bob
+/// (analyst + engineer) is the masked subject.
+async fn grant_read_to_both_roles(ctx: &AcCtx) {
+    exec_ok(
+        ctx,
+        &ctx.carol,
+        &format!("GRANT SELECT ON {ORDERS} TO ROLE \"analyst\""),
+    )
+    .await;
+    exec_ok(
+        ctx,
+        &ctx.carol,
+        &format!("GRANT SELECT ON {ORDERS} TO ROLE \"engineer\""),
+    )
+    .await;
+    crate::common::eventually("both roles to read orders", || async {
+        let a = ctx
+            .handler
+            .execute(&ctx.alice, &format!("SELECT id FROM {ORDERS}"), None)
+            .await;
+        let b = ctx
+            .handler
+            .execute(&ctx.bob, &format!("SELECT id FROM {ORDERS}"), None)
+            .await;
+        match (a, b) {
+            (Ok(x), Ok(y)) if total_rows(&x) == 3 && total_rows(&y) == 3 => Ok(()),
+            (a, b) => Err(format!(
+                "alice={:?} bob={:?}",
+                a.map(|v| total_rows(&v)),
+                b.map(|v| total_rows(&v))
+            )),
+        }
+    })
+    .await;
+}
+
+/// A datamask policy on the test-owned hive service for role `engineer`.
+/// `database` is `ac` because SQE sends the LAST namespace component.
+fn hive_mask_policy(name: &str, column: &str, mask: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "service": HIVE_SERVICE,
+        "name": name,
+        "policyType": 1,
+        "isEnabled": true,
+        "resources": {
+            "database": {"values": ["ac"]},
+            "table": {"values": ["orders"]},
+            "column": {"values": [column]}
+        },
+        "dataMaskPolicyItems": [{
+            "roles": ["engineer"],
+            "accesses": [{"type": "select", "isAllowed": true}],
+            "dataMaskInfo": mask
+        }]
+    })
+}
+
+/// A row-filter policy on the test-owned hive service for role `engineer`.
+fn hive_rowfilter_policy(name: &str, filter: &str) -> serde_json::Value {
+    serde_json::json!({
+        "service": HIVE_SERVICE,
+        "name": name,
+        "policyType": 2,
+        "isEnabled": true,
+        "resources": {
+            "database": {"values": ["ac"]},
+            "table": {"values": ["orders"]}
+        },
+        "rowFilterPolicyItems": [{
+            "roles": ["engineer"],
+            "accesses": [{"type": "select", "isAllowed": true}],
+            "rowFilterInfo": {"filterExpr": filter}
+        }]
+    })
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs quickstart/polaris-ranger-keycloak; run scripts/access-control-test.sh"]
+async fn resource_column_masks_apply_to_engineer_only() {
+    ac_gate!();
+    let _guard = crate::common::serial().lock().await;
+    let ctx = ac_setup().await;
+    grant_read_to_both_roles(&ctx).await;
+
+    ctx.ranger
+        .create_policy(hive_mask_policy(
+            &format!("{PREFIX}mask-amount"),
+            "amount",
+            serde_json::json!({"dataMaskType": "MASK_NULL"}),
+        ))
+        .await
+        .expect("create amount mask");
+    ctx.ranger
+        .create_policy(hive_mask_policy(
+            &format!("{PREFIX}mask-ssn"),
+            "ssn",
+            serde_json::json!({"dataMaskType": "MASK_SHOW_LAST_4"}),
+        ))
+        .await
+        .expect("create ssn mask");
+
+    let sql = format!("SELECT amount, ssn FROM {ORDERS} ORDER BY id");
+
+    // bob: amount nulled, ssn show-last-4, all three rows still present (no row
+    // filter in this case, so a short result would mean a mask failed closed).
+    let bob = crate::common::eventually("bob's masks to apply", || async {
+        match ctx.handler.execute(&ctx.bob, &sql, None).await {
+            Ok(b) if col_strings(&b, "amount").iter().all(|v| v == "NULL") => Ok(b),
+            Ok(b) => Err(format!("amount not masked: {:?}", col_strings(&b, "amount"))),
+            Err(e) => Err(format!("query failed: {e}")),
+        }
+    })
+    .await;
+    assert_eq!(total_rows(&bob), 3, "masking must not drop rows");
+    assert_eq!(
+        col_strings(&bob, "amount"),
+        vec!["NULL", "NULL", "NULL"],
+        "MASK_NULL nulls the column (fmt_val renders NULL as the string \"NULL\")"
+    );
+    assert_eq!(
+        col_strings(&bob, "ssn"),
+        vec!["xxx-xx-1111", "xxx-xx-2222", "xxx-xx-3333"],
+        "MASK_SHOW_LAST_4 keeps separators and the last four digits"
+    );
+
+    // alice is analyst-only: the engineer policies do not apply to her.
+    let alice = exec_ok(&ctx, &ctx.alice, &sql).await;
+    assert_eq!(col_strings(&alice, "amount"), vec!["10.00", "20.00", "30.00"]);
+    assert_eq!(
+        col_strings(&alice, "ssn"),
+        vec!["111-11-1111", "222-22-2222", "333-33-3333"]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs quickstart/polaris-ranger-keycloak; run scripts/access-control-test.sh"]
+async fn hash_mask_is_keyed_hmac() {
+    ac_gate!();
+    let _guard = crate::common::serial().lock().await;
+    let ctx = ac_setup().await;
+    grant_read_to_both_roles(&ctx).await;
+
+    ctx.ranger
+        .create_policy(hive_mask_policy(
+            &format!("{PREFIX}mask-hash"),
+            "email",
+            serde_json::json!({"dataMaskType": "MASK_HASH"}),
+        ))
+        .await
+        .expect("create hash mask");
+
+    // Expected digests are HMAC-SHA256(key = policy.mask_key) hex, computed
+    // out-of-band so this is an independent oracle rather than the UDF checking
+    // itself:
+    //   printf 'a@x' | openssl dgst -sha256 -hmac 'sqe-ac-e2e-mask-key' -r
+    const EXPECTED: [&str; 3] = [
+        "491c535df5b10e029c37a1a2a49638fe8db57b96d0b83dac522fc0d6cf701109", // a@x
+        "e38ff56157e4e2dd387e7e0fd085ba18dbe36132ee3e8ac0af93177f35813c85", // b@x
+        "136bdc217df93c518ff03832f856d060be664ed5d22539151d4e10d6bd6ecd33", // c@x
+    ];
+
+    let sql = format!("SELECT email FROM {ORDERS} ORDER BY id");
+    let bob = crate::common::eventually("bob's hash mask to apply", || async {
+        match ctx.handler.execute(&ctx.bob, &sql, None).await {
+            Ok(b) if col_strings(&b, "email") == EXPECTED.to_vec() => Ok(b),
+            Ok(b) => Err(format!("got {:?}", col_strings(&b, "email"))),
+            Err(e) => Err(format!("query failed: {e}")),
+        }
+    })
+    .await;
+    assert_eq!(col_strings(&bob, "email"), EXPECTED.to_vec());
+
+    // Plain SHA-256 of "a@x" would be a DIFFERENT digest. Asserting the keyed
+    // value is what proves policy.mask_key reached the UDF (issue #37).
+    let alice = exec_ok(&ctx, &ctx.alice, &sql).await;
+    assert_eq!(col_strings(&alice, "email"), vec!["a@x", "b@x", "c@x"]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs quickstart/polaris-ranger-keycloak; run scripts/access-control-test.sh"]
+async fn resource_row_filter_restricts_rows() {
+    ac_gate!();
+    let _guard = crate::common::serial().lock().await;
+    let ctx = ac_setup().await;
+    grant_read_to_both_roles(&ctx).await;
+
+    ctx.ranger
+        .create_policy(hive_rowfilter_policy(
+            &format!("{PREFIX}rowfilter"),
+            "region = 'EU'",
+        ))
+        .await
+        .expect("create row filter");
+
+    let sql = format!("SELECT id, region FROM {ORDERS} ORDER BY id");
+    let bob = crate::common::eventually("bob's row filter to apply", || async {
+        match ctx.handler.execute(&ctx.bob, &sql, None).await {
+            Ok(b) if total_rows(&b) == 2 => Ok(b),
+            Ok(b) => Err(format!("expected 2 rows, got {}", total_rows(&b))),
+            Err(e) => Err(format!("query failed: {e}")),
+        }
+    })
+    .await;
+    assert_eq!(
+        col_strings(&bob, "id"),
+        vec!["1", "3"],
+        "only the EU rows survive"
+    );
+    assert_eq!(col_strings(&bob, "region"), vec!["EU", "EU"]);
+
+    // alice is unaffected: the filter targets role engineer.
+    let alice = exec_ok(&ctx, &ctx.alice, &sql).await;
+    assert_eq!(col_strings(&alice, "id"), vec!["1", "2", "3"]);
 }
