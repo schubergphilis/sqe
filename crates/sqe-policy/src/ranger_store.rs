@@ -367,8 +367,30 @@ fn item_matches(
 ///  - `Ok(Some(mask))` supported,
 ///  - `Ok(None)` for MASK_NONE (explicit exemption: no mask, not restricted),
 ///  - `Err(())` for not-yet-supported types (caller restricts the column, fail-closed).
+/// Normalize a Ranger data-mask type name.
+///
+/// TAG-service policies qualify the mask type with the owning component
+/// (`hive:MASK_SHOW_LAST_4`), because the `tag` servicedef aggregates the mask
+/// types of every component it can decorate (hive, trino, presto,
+/// nestedstructure). Resource-service policies use the bare name
+/// (`MASK_SHOW_LAST_4`). Verified against a live Ranger 2.8:
+/// `GET /service/public/v2/api/servicedef/name/tag` lists only prefixed forms.
+///
+/// SQE downloads a hive-type service, so it accepts the bare form and the
+/// `hive:` form. Another component's prefix is deliberately left unmatched:
+/// a `trino:`-scoped mask was authored for a different engine, and leaving it
+/// unmatched makes the caller fail closed (the tagged column is restricted)
+/// rather than silently applying another engine's policy.
+fn normalize_mask_type(mask_type: &str) -> &str {
+    match mask_type.split_once(':') {
+        Some(("hive", rest)) => rest,
+        Some(_) => mask_type,
+        None => mask_type,
+    }
+}
+
 fn map_mask(info: &DataMaskInfo, column: &str, identity: &SessionIdentity) -> Result<Option<MaskType>, ()> {
-    match info.data_mask_type.as_str() {
+    match normalize_mask_type(info.data_mask_type.as_str()) {
         "MASK_NULL" => Ok(Some(MaskType::Nullify)),
         "MASK_NONE" => Ok(None),
         "MASK_HASH" => Ok(Some(MaskType::Hash)),
@@ -593,7 +615,8 @@ pub(crate) fn resolve_tag_policies(
                     // Store the raw template as TagMaskSpec::Custom; merge_tag_masks
                     // performs the substitution and parses the expression per column.
                     // On parse failure the rewriter restricts the column (fail-closed).
-                    if item.data_mask_info.data_mask_type == MASK_TYPE_CUSTOM {
+                    if normalize_mask_type(&item.data_mask_info.data_mask_type) == MASK_TYPE_CUSTOM
+                    {
                         if let Some(template) = &item.data_mask_info.value_expr {
                             masks.insert(tag_value.clone(), TagMaskSpec::Custom(template.clone()));
                         } else {
@@ -754,6 +777,27 @@ impl PolicyStore for RangerStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Tag-service mask types carry the owning component's prefix. Verified
+    /// against a live Ranger 2.8 tag servicedef, which lists ONLY prefixed
+    /// forms (`hive:MASK_SHOW_LAST_4`, `trino:MASK_NULL`, ...). Before this
+    /// normalization every tag-based mask fell through to the unsupported arm
+    /// and the tagged column was restricted instead of masked.
+    #[test]
+    fn mask_type_component_prefix_is_normalized() {
+        assert_eq!(normalize_mask_type("MASK_SHOW_LAST_4"), "MASK_SHOW_LAST_4");
+        assert_eq!(
+            normalize_mask_type("hive:MASK_SHOW_LAST_4"),
+            "MASK_SHOW_LAST_4"
+        );
+        assert_eq!(normalize_mask_type("hive:CUSTOM"), "CUSTOM");
+        // Another engine's mask stays unmatched, so the caller fails closed
+        // rather than applying a policy authored for Trino.
+        assert_eq!(
+            normalize_mask_type("trino:MASK_NULL"),
+            "trino:MASK_NULL"
+        );
+    }
 
     const BUNDLE: &str = r#"{
       "policyVersion": 7,
