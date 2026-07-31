@@ -250,8 +250,11 @@ access-control-test:
     DOCKER_HOST: tcp://docker:2375
     DOCKER_TLS_CERTDIR: ""
     DOCKER_DRIVER: overlay2
-    # Ranger Admin's first boot is 2-4 minutes; the script polls with this
-    # deadline before giving up and reporting the last HTTP status.
+    # Ranger Admin's first boot is 2-4 minutes locally; the script polls with
+    # this deadline before giving up and reporting the last HTTP status. The
+    # deadline covers readiness polling only, NOT the image pulls that precede
+    # it, so a cold dind runner spends its pull time against the job's 1h
+    # timeout rather than this one. Raise both together if pulls dominate.
     AC_RANGER_TIMEOUT: "600"
   before_script:
     - apk add --no-cache bash curl docker-compose rust cargo cmake protobuf-dev openssl-dev pkgconfig clang mold python3
