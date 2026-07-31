@@ -880,3 +880,239 @@ async fn resource_row_filter_restricts_rows() {
     let alice = exec_ok(&ctx, &ctx.alice, &sql).await;
     assert_eq!(col_strings(&alice, "id"), vec!["1", "2", "3"]);
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Fine-grained: TAG-based masks and row filters
+//
+// This is the least-validated path in the policy stack. ranger_store.rs carried
+// `TODO(phase3): verify tagPolicies shape against a live tag-linked bundle`, and
+// its testdata bundle was a placeholder, so the tagPolicies deserialization had
+// never met a real Ranger response before these tests.
+//
+// Chain under test: SET TAG DDL -> `sqe.column-tags` Iceberg property ->
+// CacheTagSource (reads the shared TableMetadataCache) -> Ranger tagPolicies ->
+// mask / row filter / fail-closed restriction.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A datamask policy on the test-owned TAG service. `resolve_tag_policies`
+/// matches on `is_enabled`, the `tag` resource values, and the policy item's
+/// users/roles/groups. It does not filter on access types, so the `accesses`
+/// entry here is realism, not a requirement.
+fn tag_mask_policy(name: &str, tag: &str, mask: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "service": TAG_SERVICE,
+        "name": name,
+        "policyType": 1,
+        "isEnabled": true,
+        "resources": {"tag": {"values": [tag]}},
+        "dataMaskPolicyItems": [{
+            "roles": ["engineer"],
+            "accesses": [{"type": "hive:select", "isAllowed": true}],
+            "dataMaskInfo": mask
+        }]
+    })
+}
+
+fn tag_rowfilter_policy(name: &str, tag: &str, filter: &str) -> serde_json::Value {
+    serde_json::json!({
+        "service": TAG_SERVICE,
+        "name": name,
+        "policyType": 2,
+        "isEnabled": true,
+        "resources": {"tag": {"values": [tag]}},
+        "rowFilterPolicyItems": [{
+            "roles": ["engineer"],
+            "accesses": [{"type": "hive:select", "isAllowed": true}],
+            "rowFilterInfo": {"filterExpr": filter}
+        }]
+    })
+}
+
+/// Attach a column tag through SQL, so the DDL path is covered too. Tags land in
+/// the Iceberg table property `sqe.column-tags` and are read back by
+/// `CacheTagSource` from the shared `TableMetadataCache`.
+async fn set_column_tag(ctx: &AcCtx, column: &str, tag: &str) {
+    exec_ok(
+        ctx,
+        &ctx.carol,
+        &format!("ALTER TABLE {ORDERS} MODIFY COLUMN {column} SET TAG {tag} = 'true'"),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs quickstart/polaris-ranger-keycloak; run scripts/access-control-test.sh"]
+async fn tag_column_mask_applies_from_iceberg_property() {
+    ac_gate!();
+    let _guard = crate::common::serial().lock().await;
+    let ctx = ac_setup().await;
+    grant_read_to_both_roles(&ctx).await;
+
+    // No RESOURCE mask on ssn in this test. If one existed, a passing result
+    // could be the resource path doing the work while the tag path is broken.
+    // ac_setup() already deleted every sqe-ac-e2e- policy; assert it.
+    let hive_policies = ctx
+        .ranger
+        .get_policies(HIVE_SERVICE)
+        .await
+        .expect("list hive policies");
+    assert!(
+        !hive_policies
+            .iter()
+            .any(|p| p["name"].as_str().is_some_and(|n| n.starts_with(PREFIX))),
+        "no test resource policy may exist here, or this test cannot attribute the mask \
+         to the tag path"
+    );
+
+    set_column_tag(&ctx, "ssn", "PII").await;
+    ctx.ranger
+        .create_policy(tag_mask_policy(
+            &format!("{PREFIX}tag-mask-pii"),
+            "PII",
+            // Tag-service mask types are component-qualified: the `tag`
+            // servicedef only defines prefixed forms (hive:, trino:, presto:,
+            // nestedstructure:). A bare "MASK_SHOW_LAST_4" is rejected by
+            // Ranger with "is not a valid datamask-type".
+            serde_json::json!({"dataMaskType": "hive:MASK_SHOW_LAST_4"}),
+        ))
+        .await
+        .expect("create tag mask");
+
+    let sql = format!("SELECT ssn FROM {ORDERS} ORDER BY id");
+    let bob = crate::common::eventually("bob's tag mask to apply", || async {
+        match ctx.handler.execute(&ctx.bob, &sql, None).await {
+            Ok(b)
+                if col_strings(&b, "ssn")
+                    == vec!["xxx-xx-1111", "xxx-xx-2222", "xxx-xx-3333"] =>
+            {
+                Ok(b)
+            }
+            Ok(b) => Err(format!("got {:?}", col_strings(&b, "ssn"))),
+            Err(e) => Err(format!("query failed: {e}")),
+        }
+    })
+    .await;
+    assert_eq!(total_rows(&bob), 3, "a tag mask must not drop rows");
+
+    let alice = exec_ok(&ctx, &ctx.alice, &sql).await;
+    assert_eq!(
+        col_strings(&alice, "ssn"),
+        vec!["111-11-1111", "222-22-2222", "333-33-3333"],
+        "the tag policy targets role engineer; analyst-only alice is unmasked"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs quickstart/polaris-ranger-keycloak; run scripts/access-control-test.sh"]
+async fn tag_row_filters_are_unsupported_by_ranger() {
+    ac_gate!();
+    let _guard = crate::common::serial().lock().await;
+    let ctx = ac_setup().await;
+
+    // Ranger 2.8's `tag` servicedef defines NO row-filter resource hierarchy and
+    // NO row-filter access types:
+    //   GET /service/public/v2/api/servicedef/name/tag
+    //   -> dataMaskDef.maskTypes = ["hive:MASK", "hive:MASK_SHOW_LAST_4", ...]
+    //      rowFilterDef.accessTypes = []
+    // So a tag-based row filter cannot be expressed at all, and SQE's
+    // `resolve_tag_policies` rowfilter branch (POLICY_TYPE_ROWFILTER over the
+    // tagPolicies bundle) is unreachable on this Ranger version. That is a
+    // platform gap, not an SQE defect: tag MASKS work (see
+    // tag_column_mask_applies_from_iceberg_property) and resource row filters
+    // work (see resource_row_filter_restricts_rows).
+    //
+    // This test pins the limitation so the day Ranger gains the capability it
+    // fails and tells us to write the real coverage, instead of the gap sitting
+    // silently in a spec.
+    let err = ctx
+        .ranger
+        .create_policy(tag_rowfilter_policy(
+            &format!("{PREFIX}tag-rowfilter"),
+            "RESTRICTED",
+            "region = 'EU'",
+        ))
+        .await
+        .expect_err(
+            "Ranger accepted a tag row-filter policy: it has gained rowFilterDef support. \
+             Replace this test with real tag row-filter coverage (bob sees only EU rows) and \
+             re-check resolve_tag_policies' POLICY_TYPE_ROWFILTER branch against a live bundle.",
+        );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("row filter") || msg.contains("resource hierarchies"),
+        "expected a rowFilterDef validation failure from Ranger, got: {msg}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs quickstart/polaris-ranger-keycloak; run scripts/access-control-test.sh"]
+async fn unmappable_tag_mask_fails_closed() {
+    ac_gate!();
+    let _guard = crate::common::serial().lock().await;
+    let ctx = ac_setup().await;
+    grant_read_to_both_roles(&ctx).await;
+
+    set_column_tag(&ctx, "email", "SECRET").await;
+    // CUSTOM with no valueExpr: nothing to substitute. resolve_tag_policies
+    // marks the tag unmappable and the rewriter must RESTRICT every column
+    // bearing it, rather than returning the raw value.
+    ctx.ranger
+        .create_policy(tag_mask_policy(
+            &format!("{PREFIX}tag-mask-broken"),
+            "SECRET",
+            serde_json::json!({"dataMaskType": "hive:CUSTOM"}),
+        ))
+        .await
+        .expect("create broken tag mask");
+
+    let sql = format!("SELECT id, email FROM {ORDERS} ORDER BY id");
+
+    // Fail-closed here means NULLIFIED IN PLACE, not removed from the schema.
+    // `plan_rewriter.rs` (the `restricted_columns` arm of the projection rewrite)
+    // aliases a Nullify mask to the column's QUALIFIED name so an explicit
+    // `SELECT id, email` keeps planning; dropping the field would break the
+    // user's outer reference. So the contract is: the column survives, every
+    // value is NULL, and no raw value appears anywhere in the result.
+    let bob = crate::common::eventually("the unmappable tag to nullify email", || async {
+        match ctx.handler.execute(&ctx.bob, &sql, None).await {
+            // A hard error is also acceptable fail-closed behaviour.
+            Err(_) => Ok(Vec::new()),
+            Ok(batches) => {
+                let emails = col_strings(&batches, "email");
+                if emails.iter().all(|v| v == "NULL") {
+                    Ok(batches)
+                } else {
+                    Err(format!("email not nullified: {emails:?}"))
+                }
+            }
+        }
+    })
+    .await;
+
+    // Nothing leaked in any column of any batch. Iterate each batch's own
+    // columns positionally: reading a name from one batch and looking it up
+    // across all of them would panic if batch schemas ever differ.
+    for b in &bob {
+        for (idx, field) in b.schema().fields().iter().enumerate() {
+            let arr = b.column(idx);
+            for row in 0..b.num_rows() {
+                let v = crate::common::fmt_val(arr.as_ref(), row);
+                assert!(
+                    !v.contains("@x"),
+                    "raw email value `{v}` leaked in column `{}`",
+                    field.name()
+                );
+            }
+        }
+    }
+
+    // The NULLs must be caused by the broken tag policy, not by the column being
+    // empty or by some unrelated denial: alice is analyst-only, the tag policy
+    // targets engineer, so she still sees the raw values.
+    let alice = exec_ok(&ctx, &ctx.alice, &sql).await;
+    assert_eq!(
+        col_strings(&alice, "email"),
+        vec!["a@x", "b@x", "c@x"],
+        "analyst-only alice is unaffected by the engineer-scoped broken tag mask"
+    );
+}

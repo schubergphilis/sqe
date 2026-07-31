@@ -306,26 +306,61 @@ pub async fn ranger_session(user: &str) -> sqe_core::Session {
         .unwrap_or_else(|e| panic!("Keycloak ROPC failed for {user}: {e}"))
 }
 
-/// Retry `f` until it returns `Ok` or 30s elapse. Panics with the last failure.
+/// Default budget for `eventually`.
 ///
-/// Policy changes made over the Ranger REST API become visible only after the
-/// policy cache TTL (`policy.ranger.cache-ttl-secs = 2` in the test config), so
-/// assertions need a bounded wait. Never use a bare sleep: it either flakes or
-/// wastes wall clock, and it hides which assertion was still failing.
+/// Two different propagation delays stack up in the access-control suite:
+///
+/// - SQE's own policy cache (`policy.ranger.cache-ttl-secs = 2` in the test
+///   config), which covers masks and row filters read from Ranger directly.
+/// - Polaris's embedded Ranger plugin, which POLLS Ranger on an interval
+///   (30s by default). Coarse-gate changes -- GRANT, REVOKE, and deny-item
+///   edits -- are not visible to Polaris until that refresh, so a 30s budget
+///   sits exactly on the boundary and flakes. Measured: a revoked allow was
+///   still being served at 30s.
+///
+/// 120s is comfortably past the poll interval. It costs nothing on the happy
+/// path (every assertion here settles in seconds) and only extends the wait
+/// when something is genuinely wrong, where the reported last failure is what
+/// matters anyway.
 #[allow(dead_code)]
-pub async fn eventually<F, Fut, T>(what: &str, mut f: F) -> T
+pub const EVENTUALLY_BUDGET: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Retry `f` until it returns `Ok` or `EVENTUALLY_BUDGET` elapses. Panics with
+/// the last failure.
+///
+/// Never use a bare sleep instead: it either flakes or wastes wall clock, and it
+/// hides which assertion was still failing.
+#[allow(dead_code)]
+pub async fn eventually<F, Fut, T>(what: &str, f: F) -> T
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<T, String>>,
 {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    eventually_within(EVENTUALLY_BUDGET, what, f).await
+}
+
+/// `eventually` with an explicit budget.
+#[allow(dead_code)]
+pub async fn eventually_within<F, Fut, T>(
+    budget: std::time::Duration,
+    what: &str,
+    mut f: F,
+) -> T
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, String>>,
+{
+    let deadline = std::time::Instant::now() + budget;
     loop {
         let last = match f().await {
             Ok(v) => return v,
             Err(e) => e,
         };
         if std::time::Instant::now() >= deadline {
-            panic!("timed out after 30s waiting for {what}; last failure: {last}");
+            panic!(
+                "timed out after {}s waiting for {what}; last failure: {last}",
+                budget.as_secs()
+            );
         }
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
