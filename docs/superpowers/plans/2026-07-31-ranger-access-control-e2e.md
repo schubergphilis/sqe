@@ -53,6 +53,8 @@ Expected: `IDENTICAL`. If it prints a diff, STOP and report it: a behavioral dif
 
 - [ ] **Step 2: Write the failing test in `policy_wiring.rs`**
 
+Note: this is the only test in this plan that joins the DEFAULT suite (`cargo test -p sqe-coordinator --lib`, which `make test` and the cargo gate run), so it must pass with nothing listening on port 26080. That is safe: `RangerGrantBackend::new` (`crates/sqe-policy/src/grants/ranger.rs:190`) only builds a `reqwest::Client` and copies strings. It performs no I/O. Re-confirm with `sed -n 190,212p crates/sqe-policy/src/grants/ranger.rs` before running; if that ever changes, keep only the `PASSTHROUGH_TOML` assertion in the default suite.
+
 Append to `crates/sqe-coordinator/src/policy_wiring.rs`:
 
 ```rust
@@ -548,13 +550,22 @@ wait_for "polaris"      "$POLARIS_URL/q/health"
 wait_for "keycloak"     "$KEYCLOAK_URL/realms/iceberg-ranger/.well-known/openid-configuration"
 
 cd "$ROOT_DIR"
+
+# Scope the filter to this module. A bare substring (e.g. `tag_`) under
+# `--ignored` would match ignored tests in OTHER modules of the same `it` binary
+# and force-run them against this stack, which is not the one they need.
+FILTER="access_control_e2e"
+if [ "$#" -gt 0 ]; then
+    FILTER="access_control_e2e::$1"
+fi
+
 echo ""
-echo "Running access-control e2e suite..."
+echo "Running access-control e2e suite (filter: $FILTER)..."
 SQE_AC_E2E=1 \
 RUST_LOG="${RUST_LOG:-sqe_coordinator=info,sqe_policy=debug,sqe_catalog=info,sqe_auth=info,warn}" \
 RUST_MIN_STACK="${RUST_MIN_STACK:-33554432}" \
     cargo test -p sqe-coordinator --test it -- \
-    --ignored --test-threads=1 --nocapture "${@:-access_control_e2e}"
+    --ignored --test-threads=1 --nocapture "$FILTER"
 ```
 
 - [ ] **Step 6: Make it executable and add the make target**
@@ -563,7 +574,21 @@ RUST_MIN_STACK="${RUST_MIN_STACK:-33554432}" \
 chmod +x scripts/access-control-test.sh
 ```
 
-In `Makefile`, add `test-access-control` to `.PHONY` (the line containing `benchmark-charts test audit ...`), add this target after the `test:` target:
+In `Makefile`, add `test-access-control` to `.PHONY`. On `main` the relevant line (Makefile:81) reads:
+
+```make
+        benchmark-charts test clippy fmt fmt-check clean clean-rust clean-rustbook \
+```
+
+so change it to:
+
+```make
+        benchmark-charts test test-access-control clippy fmt fmt-check clean clean-rust clean-rustbook \
+```
+
+If the branch `chore/makefile-audit-bench-targets` has already merged, that line instead reads `benchmark-charts test audit audit-advisories audit-deny audit-licenses \` and `test-access-control` goes there. This plan does not otherwise depend on that branch.
+
+Add this target after the `test:` target:
 
 ```make
 # ── Access-control e2e (Polaris + Ranger + Keycloak) ──────────────────────
@@ -1060,14 +1085,49 @@ struct AcCtx {
     _cache: sqe_catalog::TableMetadataCache,
 }
 
+/// Clear `denyPolicyItems` from the polaris-service policy covering the audit
+/// fixture table.
+///
+/// `ranger_deny_overrides_allow` adds a deny item to that policy, and nothing
+/// else removes it: REVOKE strips ALLOW items, and the prefix cleanup only
+/// covers the two test-owned services. Without this, the suite is not idempotent
+/// -- on the second run that test starts with alice already denied and burns its
+/// 30s `eventually` budget waiting for a baseline allow that can never arrive.
+/// Uses the same resource matcher as `add_deny_item_to_audit_policy`.
+async fn clear_audit_deny_items(ranger: &RangerAdmin) {
+    let policies = ranger.get_policies("polaris").await.unwrap_or_default();
+    for mut p in policies {
+        let is_audit_policy = p["resources"]["table"]["values"] == serde_json::json!(["audit"])
+            && p["resources"]["namespace"]["values"] == serde_json::json!(["ac"])
+            && p["resources"]["catalog"]["values"] == serde_json::json!(["ops_wh"]);
+        if !is_audit_policy {
+            continue;
+        }
+        let has_denies = p["denyPolicyItems"]
+            .as_array()
+            .is_some_and(|items| !items.is_empty());
+        if !has_denies {
+            continue;
+        }
+        let Some(id) = p["id"].as_i64() else { continue };
+        p["denyPolicyItems"] = serde_json::json!([]);
+        ranger
+            .update_policy(id, p)
+            .await
+            .expect("clear denyPolicyItems on the audit policy");
+    }
+}
+
 /// Bring the suite to a known state: services present, no `sqe-ac-e2e-`
-/// policies, no test grants, fixture tables holding exactly three / two rows.
+/// policies, no leftover deny items, no test grants, fixture tables holding
+/// exactly three / two rows.
 async fn ac_setup() -> AcCtx {
     let (handler, _cache) = crate::common::setup_ranger_handler().await;
     let ranger = RangerAdmin::from_env();
     ranger.require_reachable().await;
     ranger.ensure_services().await.expect("ensure services");
     ranger.delete_test_policies().await.expect("clean prefix");
+    clear_audit_deny_items(&ranger).await;
 
     let carol = crate::common::ranger_session("carol").await;
     let alice = crate::common::ranger_session("alice").await;
@@ -1910,16 +1970,21 @@ async fn unmappable_tag_mask_fails_closed() {
     })
     .await;
 
-    // Whatever happened must not have leaked the value anywhere else.
+    // Whatever happened must not have leaked the value anywhere else. Iterate
+    // each batch's own columns positionally: reading a name from one batch and
+    // looking it up across all of them would panic if batch schemas ever differ.
     if let Ok(batches) = ctx.handler.execute(&ctx.bob, &sql, None).await {
         for b in &batches {
-            for f in b.schema().fields() {
-                let vals = col_strings(&batches, f.name());
-                assert!(
-                    !vals.iter().any(|v| v.contains("@x")),
-                    "raw email value leaked in column `{}`: {vals:?}",
-                    f.name()
-                );
+            for (idx, field) in b.schema().fields().iter().enumerate() {
+                let arr = b.column(idx);
+                for row in 0..b.num_rows() {
+                    let v = crate::common::fmt_val(arr.as_ref(), row);
+                    assert!(
+                        !v.contains("@x"),
+                        "raw email value `{v}` leaked in column `{}`",
+                        field.name()
+                    );
+                }
             }
         }
     }
