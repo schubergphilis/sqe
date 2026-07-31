@@ -2,6 +2,9 @@
 //! Each file in tests/ is its own binary; include this via `mod common;`.
 #![allow(dead_code)]
 
+/// Ranger Admin REST fixtures for `access_control_e2e`.
+pub mod ranger_fixture;
+
 use std::sync::Arc;
 
 /// Initialize the tracing subscriber once for the entire test binary.
@@ -191,10 +194,25 @@ pub async fn setup_handler_with_workers(
 
 // ── Access-control e2e helpers (see tests/it/access_control_e2e.rs) ─────────
 
-/// Path to the Ranger e2e config, resolved from the workspace root like
-/// `test_config_path()`.
+/// Path to the Ranger e2e config.
+///
+/// `SQE_AC_CONFIG` wins when set: `scripts/access-control-test.sh` writes a copy
+/// of the committed config with the quickstart's ACTUAL published ports
+/// substituted in. Those ports are not fixed. A developer whose 26080 is already
+/// taken by another Ranger gets `RANGER_PORT=46080` in their `.env`, and a
+/// hardcoded config would then talk to the wrong Ranger and fail with confusing
+/// errors (observed: "Role name: engineer does not exist in ranger admin", from
+/// an unrelated Ranger instance).
+///
+/// The committed `tests/sqe-ranger-test.toml` carries the `.env.example`
+/// defaults, so it works standalone when those ports are free.
 #[allow(dead_code)]
 pub fn ranger_config_path() -> String {
+    if let Ok(p) = std::env::var("SQE_AC_CONFIG") {
+        if !p.is_empty() {
+            return p;
+        }
+    }
     let manifest_dir =
         std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
     let workspace_root = std::path::Path::new(&manifest_dir)

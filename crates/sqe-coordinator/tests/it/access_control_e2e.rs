@@ -19,6 +19,8 @@
 //! exact row counts, and denial-versus-typo discrimination (the same SQL is run
 //! as a privileged user to prove the identifier is valid).
 
+use crate::common::ranger_fixture::{RangerAdmin, HIVE_SERVICE, PREFIX, TAG_SERVICE};
+
 /// Skip-or-run gate. Returns early when the suite was not opted into.
 macro_rules! ac_gate {
     () => {
@@ -51,4 +53,58 @@ async fn ranger_wiring_smoke_carol_can_query() {
         .expect("SELECT 1 as carol through the Ranger-wired handler");
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(rows, 1, "SELECT 1 must return exactly one row");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs quickstart/polaris-ranger-keycloak; run scripts/access-control-test.sh"]
+async fn fixture_round_trip_creates_services_and_policies() {
+    ac_gate!();
+    let _guard = crate::common::serial().lock().await;
+    let ranger = RangerAdmin::from_env();
+    ranger.require_reachable().await;
+    ranger.ensure_services().await.expect("ensure services");
+    ranger.delete_test_policies().await.expect("clean prefix");
+
+    // A minimal mask policy, created and then read back over REST.
+    let name = format!("{PREFIX}roundtrip");
+    ranger
+        .create_policy(serde_json::json!({
+            "service": HIVE_SERVICE,
+            "name": name,
+            "policyType": 1,
+            "isEnabled": true,
+            "resources": {
+                "database": {"values": ["ac"]},
+                "table": {"values": ["orders"]},
+                "column": {"values": ["amount"]}
+            },
+            "dataMaskPolicyItems": [{
+                "roles": ["engineer"],
+                "accesses": [{"type": "select", "isAllowed": true}],
+                "dataMaskInfo": {"dataMaskType": "MASK_NULL"}
+            }]
+        }))
+        .await
+        .expect("create policy");
+
+    let policies = ranger.get_policies(HIVE_SERVICE).await.expect("list policies");
+    assert!(
+        policies
+            .iter()
+            .any(|p| p["name"].as_str() == Some(name.as_str())),
+        "the created policy must be listed on {HIVE_SERVICE}"
+    );
+
+    // The tag service must be linked to the hive service, otherwise the
+    // downloaded bundle carries no `tagPolicies` block and every tag test would
+    // fail for the wrong reason.
+    let bundle = ranger.download_bundle(HIVE_SERVICE).await.expect("download bundle");
+    assert!(
+        bundle.get("tagPolicies").is_some(),
+        "bundle for {HIVE_SERVICE} must contain tagPolicies once {TAG_SERVICE} is linked; got keys {:?}",
+        bundle.as_object().map(|o| o.keys().collect::<Vec<_>>())
+    );
+
+    let removed = ranger.delete_test_policies().await.expect("cleanup");
+    assert!(removed >= 1, "cleanup must delete at least the policy we made");
 }

@@ -17,9 +17,6 @@ ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 STACK_DIR="$ROOT_DIR/quickstart/polaris-ranger-keycloak"
 
 RANGER_TIMEOUT="${AC_RANGER_TIMEOUT:-300}"
-RANGER_URL="${AC_RANGER_URL:-http://localhost:26080}"
-POLARIS_URL="${AC_POLARIS_URL:-http://localhost:28181}"
-KEYCLOAK_URL="${AC_KEYCLOAK_URL:-http://localhost:38080}"
 
 if [ "${1:-}" = "--down" ]; then
     cd "$STACK_DIR" && docker compose down -v
@@ -30,6 +27,17 @@ fi
 cd "$STACK_DIR"
 [ -f .env ] || { echo "creating .env from .env.example"; cp .env.example .env; }
 set -a; . ./.env; set +a
+
+# Resolve the endpoints from the stack's OWN .env rather than assuming the
+# .env.example defaults. Ports are not fixed: when 26080 is already taken by
+# another Ranger, a developer's .env carries RANGER_PORT=46080, and a hardcoded
+# config then talks to the WRONG Ranger. That failure is deeply confusing
+# (observed: "Role name: engineer does not exist in ranger admin", raised by an
+# unrelated Ranger instance that happened to own the port).
+RANGER_URL="${AC_RANGER_URL:-http://localhost:${RANGER_PORT:-26080}}"
+POLARIS_URL="${AC_POLARIS_URL:-http://localhost:${POLARIS_PORT:-28181}}"
+KEYCLOAK_URL="${AC_KEYCLOAK_URL:-http://localhost:${KEYCLOAK_PORT:-38080}}"
+RUSTFS_URL="http://localhost:${RUSTFS_PORT:-29000}"
 
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo "  Access-control stack (Ranger first boot takes 2-4 min)"
@@ -93,6 +101,18 @@ wait_for "keycloak"     "$KEYCLOAK_URL/realms/iceberg-ranger/.well-known/openid-
 
 cd "$ROOT_DIR"
 
+# Write a config with the resolved endpoints and point the tests at it. The
+# committed tests/sqe-ranger-test.toml keeps the .env.example ports, so it stays
+# usable standalone; this copy adapts to whatever the stack actually published.
+mkdir -p target
+RESOLVED_CONFIG="$ROOT_DIR/target/sqe-ranger-test.resolved.toml"
+sed -e "s|localhost:26080|localhost:${RANGER_PORT:-26080}|g" \
+    -e "s|localhost:28181|localhost:${POLARIS_PORT:-28181}|g" \
+    -e "s|localhost:38080|localhost:${KEYCLOAK_PORT:-38080}|g" \
+    -e "s|localhost:29000|localhost:${RUSTFS_PORT:-29000}|g" \
+    "$ROOT_DIR/tests/sqe-ranger-test.toml" > "$RESOLVED_CONFIG"
+echo "  config: $RESOLVED_CONFIG (ranger=$RANGER_URL polaris=$POLARIS_URL keycloak=$KEYCLOAK_URL storage=$RUSTFS_URL)"
+
 # Scope the filter to this module. A bare substring (e.g. `tag_`) under
 # `--ignored` would match ignored tests in OTHER modules of the same `it` binary
 # and force-run them against this stack, which is not the one they need.
@@ -104,6 +124,8 @@ fi
 echo ""
 echo "Running access-control e2e suite (filter: $FILTER)..."
 SQE_AC_E2E=1 \
+SQE_AC_CONFIG="$RESOLVED_CONFIG" \
+AC_RANGER_URL="$RANGER_URL" \
 RUST_LOG="${RUST_LOG:-sqe_coordinator=info,sqe_policy=debug,sqe_catalog=info,sqe_auth=info,warn}" \
 RUST_MIN_STACK="${RUST_MIN_STACK:-33554432}" \
     cargo test -p sqe-coordinator --test it -- \
