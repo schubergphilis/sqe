@@ -4,11 +4,10 @@ use std::time::Instant;
 
 use sqe_core::SqeConfig;
 
-use sqe_catalog::grant_chameleon::ChameleonGrantBackend;
 use sqe_coordinator::flight_sql::SqeFlightSqlService;
 use sqe_coordinator::QueryHandler;
 use sqe_coordinator::SessionManager;
-use sqe_policy::grants::{polaris::PolarisGrantBackend, ranger::RangerGrantBackend, GrantBackend};
+use sqe_policy::grants::GrantBackend;
 
 // Trino adapter types
 use sqe_trino_compat::server::{NodeContext, TrinoAuthenticator, TrinoQueryExecutor};
@@ -401,7 +400,8 @@ async fn async_main() -> anyhow::Result<()> {
         );
     }
 
-    let grant_backend: Option<Arc<dyn GrantBackend>> = build_grant_backend(&config)?;
+    let grant_backend: Option<Arc<dyn GrantBackend>> =
+        sqe_coordinator::policy_wiring::build_grant_backend(&config)?;
 
     // Initialize query handler
     let query_handler = Arc::new(
@@ -628,57 +628,4 @@ fn build_oauth2_state(
         pending_store,
         base_url,
     })
-}
-
-fn build_grant_backend(
-    config: &SqeConfig,
-) -> anyhow::Result<Option<Arc<dyn GrantBackend>>> {
-    use sqe_core::config::AccessControlBackend;
-    match config.access_control.backend {
-        AccessControlBackend::Chameleon if !config.access_control.url.is_empty() => {
-            tracing::info!(
-                backend = "chameleon",
-                url = %config.access_control.url,
-                "Access control backend configured"
-            );
-            let client = Arc::new(sqe_catalog::AccessControlClient::new(
-                &config.access_control.url,
-            )?);
-            Ok(Some(Arc::new(ChameleonGrantBackend::new(client))))
-        }
-        AccessControlBackend::Polaris if !config.access_control.url.is_empty() => {
-            tracing::info!(
-                backend = "polaris",
-                url = %config.access_control.url,
-                "Access control backend configured"
-            );
-            Ok(Some(Arc::new(PolarisGrantBackend::new(
-                &config.access_control.url,
-                config.access_control.client_id.clone(),
-                config.access_control.client_secret.clone(),
-            )?)))
-        }
-        AccessControlBackend::Ranger if !config.access_control.url.is_empty() => {
-            let r = &config.access_control.ranger;
-            tracing::info!(
-                backend = "ranger",
-                url = %config.access_control.url,
-                service = %r.service_name,
-                "Access control backend configured"
-            );
-            Ok(Some(Arc::new(RangerGrantBackend::new(
-                &config.access_control.url,
-                &r.service_name,
-                &r.admin_user,
-                r.admin_password.expose(),
-                &r.realm,
-                r.timeout_secs,
-                r.accept_invalid_certs,
-            )?)))
-        }
-        AccessControlBackend::None
-        | AccessControlBackend::Chameleon
-        | AccessControlBackend::Polaris
-        | AccessControlBackend::Ranger => Ok(None),
-    }
 }
