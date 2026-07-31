@@ -192,12 +192,34 @@ async fn ac_setup() -> AcCtx {
 
     // Fixture tables. Dropped and recreated so a leftover table from an aborted
     // run cannot skew row counts.
-    for t in [ORDERS, AUDIT] {
-        handler
-            .execute(&carol, &format!("DROP TABLE IF EXISTS {t}"), None)
-            .await
-            .unwrap_or_else(|e| panic!("drop {t}: {e}"));
-    }
+    //
+    // The audit table needs a bounded retry rather than a bare DROP. A deny item
+    // left by `ranger_deny_overrides_allow` targets role `analyst`, and CAROL IS
+    // A MEMBER of analyst (ranger-setup: analyst -> alice, bob, carol), so the
+    // deny blocks the admin too. `clear_audit_deny_items` above removes it, but
+    // Polaris caches Ranger policies, so the clear is not visible instantly.
+    // The whole audit sequence retries as a unit. `DROP TABLE IF EXISTS` is NOT
+    // a usable readiness probe on its own: while the table is policy-hidden the
+    // DROP reports success (nothing to drop), and the following CREATE then
+    // fails because the table does in fact exist. Retrying drop -> create ->
+    // insert together converges as soon as the deny drains.
+    crate::common::eventually("carol to (re)create the audit fixture", || async {
+        for stmt in [
+            format!("DROP TABLE IF EXISTS {AUDIT}"),
+            format!("CREATE TABLE {AUDIT} (id BIGINT, event VARCHAR)"),
+            format!("INSERT INTO {AUDIT} VALUES (1,'login'),(2,'logout')"),
+        ] {
+            if let Err(e) = handler.execute(&carol, &stmt, None).await {
+                return Err(format!("`{stmt}` failed: {e}"));
+            }
+        }
+        Ok(())
+    })
+    .await;
+    handler
+        .execute(&carol, &format!("DROP TABLE IF EXISTS {ORDERS}"), None)
+        .await
+        .unwrap_or_else(|e| panic!("drop {ORDERS}: {e}"));
     handler
         .execute(
             &carol,
@@ -222,23 +244,6 @@ async fn ac_setup() -> AcCtx {
         )
         .await
         .expect("insert orders");
-    handler
-        .execute(
-            &carol,
-            &format!("CREATE TABLE {AUDIT} (id BIGINT, event VARCHAR)"),
-            None,
-        )
-        .await
-        .expect("create audit");
-    handler
-        .execute(
-            &carol,
-            &format!("INSERT INTO {AUDIT} VALUES (1,'login'),(2,'logout')"),
-            None,
-        )
-        .await
-        .expect("insert audit");
-
     // Remove any grants a previous run left on the fixture tables, so "denied
     // before grant" starts from a true denial.
     for stmt in [
@@ -248,6 +253,7 @@ async fn ac_setup() -> AcCtx {
         format!("REVOKE SELECT ON {AUDIT} FROM ROLE \"analyst\""),
         format!("REVOKE SELECT ON {AUDIT} FROM ROLE \"engineer\""),
         format!("REVOKE SELECT ON {AUDIT} FROM USER \"bob\""),
+        format!("REVOKE SELECT ON {AUDIT} FROM USER \"dave\""),
     ] {
         let _ = handler.execute(&carol, &stmt, None).await;
     }
@@ -370,4 +376,280 @@ async fn grant_select_to_role_enables_exact_rows() {
         vec!["10.00", "20.00", "30.00"],
         "fmt_val renders Float64 with two decimals"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs quickstart/polaris-ranger-keycloak; run scripts/access-control-test.sh"]
+async fn role_grant_and_user_grant_both_apply() {
+    ac_gate!();
+    let _guard = crate::common::serial().lock().await;
+    let ctx = ac_setup().await;
+
+    exec_ok(
+        &ctx,
+        &ctx.carol,
+        &format!("GRANT SELECT ON {ORDERS} TO ROLE \"engineer\""),
+    )
+    .await;
+    exec_ok(
+        &ctx,
+        &ctx.carol,
+        &format!("GRANT SELECT ON {AUDIT} TO USER \"bob\""),
+    )
+    .await;
+
+    // bob reads orders through the engineer ROLE.
+    let orders = crate::common::eventually("bob's role grant on orders", || async {
+        match ctx
+            .handler
+            .execute(&ctx.bob, &format!("SELECT id FROM {ORDERS} ORDER BY id"), None)
+            .await
+        {
+            Ok(b) if total_rows(&b) == 3 => Ok(b),
+            Ok(b) => Err(format!("expected 3 rows, got {}", total_rows(&b))),
+            Err(e) => Err(format!("still denied: {e}")),
+        }
+    })
+    .await;
+    assert_eq!(col_strings(&orders, "id"), vec!["1", "2", "3"]);
+
+    // bob reads audit through a direct USER grant, with no role involved.
+    let audit = crate::common::eventually("bob's user grant on audit", || async {
+        match ctx
+            .handler
+            .execute(&ctx.bob, &format!("SELECT event FROM {AUDIT} ORDER BY id"), None)
+            .await
+        {
+            Ok(b) if total_rows(&b) == 2 => Ok(b),
+            Ok(b) => Err(format!("expected 2 rows, got {}", total_rows(&b))),
+            Err(e) => Err(format!("still denied: {e}")),
+        }
+    })
+    .await;
+    assert_eq!(col_strings(&audit, "event"), vec!["login", "logout"]);
+
+    // dave holds no role and no user grant.
+    assert_denied_but_valid(&ctx, &ctx.dave, &format!("SELECT id FROM {ORDERS}")).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs quickstart/polaris-ranger-keycloak; run scripts/access-control-test.sh"]
+async fn write_privileges_are_separate_from_read() {
+    ac_gate!();
+    let _guard = crate::common::serial().lock().await;
+    let ctx = ac_setup().await;
+
+    for stmt in [
+        format!("GRANT SELECT ON {ORDERS} TO ROLE \"analyst\""),
+        format!("GRANT SELECT ON {ORDERS} TO ROLE \"engineer\""),
+        format!("GRANT INSERT ON {ORDERS} TO ROLE \"engineer\""),
+    ] {
+        exec_ok(&ctx, &ctx.carol, &stmt).await;
+    }
+
+    // bob (engineer) can write, and the row is visible afterwards.
+    crate::common::eventually("bob's INSERT to be allowed", || async {
+        match ctx
+            .handler
+            .execute(
+                &ctx.bob,
+                &format!("INSERT INTO {ORDERS} VALUES (4,'EU',40.0,'444-44-4444','d@x')"),
+                None,
+            )
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(e) => Err(format!("INSERT still denied: {e}")),
+        }
+    })
+    .await;
+    let after = exec_ok(&ctx, &ctx.carol, &format!("SELECT id FROM {ORDERS} ORDER BY id")).await;
+    assert_eq!(col_strings(&after, "id"), vec!["1", "2", "3", "4"]);
+
+    // alice (analyst) holds SELECT only: no INSERT, no DROP.
+    let insert = ctx
+        .handler
+        .execute(
+            &ctx.alice,
+            &format!("INSERT INTO {ORDERS} VALUES (9,'x',0.0,'000-00-0000','z@x')"),
+            None,
+        )
+        .await;
+    assert!(
+        insert.is_err(),
+        "alice holds SELECT only; INSERT must be denied"
+    );
+
+    let drop = ctx
+        .handler
+        .execute(&ctx.alice, &format!("DROP TABLE {ORDERS}"), None)
+        .await;
+    assert!(drop.is_err(), "alice holds SELECT only; DROP must be denied");
+
+    // Prove the DROP really did not happen.
+    let still_there =
+        exec_ok(&ctx, &ctx.carol, &format!("SELECT id FROM {ORDERS} ORDER BY id")).await;
+    assert_eq!(
+        total_rows(&still_there),
+        4,
+        "the denied DROP must not have removed the table"
+    );
+}
+
+/// Add a `denyPolicyItems` entry for role `engineer` to the EXISTING Ranger
+/// policy that SQE's `GRANT SELECT ON ops_wh.ac.audit` created.
+///
+/// The deny targets `engineer`, not `analyst`, so the test has a control user.
+/// Ranger's role store (ranger-setup) is analyst -> alice, bob, carol and
+/// engineer -> bob, carol, so denying engineer hits bob while leaving
+/// analyst-only alice untouched. Denying analyst would hit alice, bob AND carol
+/// (the admin), leaving nobody to compare against.
+///
+/// Ranger keeps one policy per resource, so deny precedence has to be expressed
+/// by editing that policy rather than creating a second one. Matching is on the
+/// catalog / namespace / table resource values, exactly as the demo harness does
+/// it (quickstart/polaris-ranger-keycloak/test.sh step 6).
+async fn add_deny_item_to_audit_policy(ctx: &AcCtx) {
+    let policies = ctx
+        .ranger
+        .get_policies("polaris")
+        .await
+        .expect("list polaris policies");
+    let mut target = policies
+        .into_iter()
+        .find(|p| {
+            p["resources"]["table"]["values"] == serde_json::json!(["audit"])
+                && p["resources"]["namespace"]["values"] == serde_json::json!(["ac"])
+                && p["resources"]["catalog"]["values"] == serde_json::json!(["ops_wh"])
+        })
+        .expect("SQE's GRANT must have created a polaris policy for ops_wh.ac.audit");
+
+    let id = target["id"].as_i64().expect("policy id");
+    let deny = serde_json::json!({
+        "roles": ["engineer"],
+        "accesses": [
+            {"type": "table-properties-read", "isAllowed": true},
+            {"type": "table-data-read", "isAllowed": true}
+        ]
+    });
+    match target.get_mut("denyPolicyItems").and_then(|v| v.as_array_mut()) {
+        Some(items) => items.push(deny),
+        None => target["denyPolicyItems"] = serde_json::json!([deny]),
+    }
+    ctx.ranger
+        .update_policy(id, target)
+        .await
+        .expect("add denyPolicyItems to the audit policy");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs quickstart/polaris-ranger-keycloak; run scripts/access-control-test.sh"]
+async fn ranger_deny_overrides_allow() {
+    ac_gate!();
+    let _guard = crate::common::serial().lock().await;
+    let ctx = ac_setup().await;
+
+    exec_ok(
+        &ctx,
+        &ctx.carol,
+        &format!("GRANT SELECT ON {AUDIT} TO ROLE \"analyst\""),
+    )
+    .await;
+    exec_ok(
+        &ctx,
+        &ctx.carol,
+        &format!("GRANT SELECT ON {AUDIT} TO ROLE \"engineer\""),
+    )
+    .await;
+
+    // Both can read before the deny lands.
+    crate::common::eventually("alice and bob to read audit", || async {
+        let a = ctx
+            .handler
+            .execute(&ctx.alice, &format!("SELECT event FROM {AUDIT}"), None)
+            .await;
+        let b = ctx
+            .handler
+            .execute(&ctx.bob, &format!("SELECT event FROM {AUDIT}"), None)
+            .await;
+        match (a, b) {
+            (Ok(x), Ok(y)) if total_rows(&x) == 2 && total_rows(&y) == 2 => Ok(()),
+            (a, b) => Err(format!(
+                "alice={:?} bob={:?}",
+                a.map(|v| total_rows(&v)),
+                b.map(|v| total_rows(&v))
+            )),
+        }
+    })
+    .await;
+
+    add_deny_item_to_audit_policy(&ctx).await;
+
+    // Deny beats allow for bob (engineer), even though his analyst membership
+    // still carries an allow on the same resource.
+    crate::common::eventually("the deny to take effect for bob", || async {
+        match ctx
+            .handler
+            .execute(&ctx.bob, &format!("SELECT event FROM {AUDIT}"), None)
+            .await
+        {
+            Err(_) => Ok(()),
+            Ok(b) => Err(format!("still allowed with {} rows", total_rows(&b))),
+        }
+    })
+    .await;
+
+    // ...and alice, analyst-only, keeps her access. This is what proves the deny
+    // is scoped to the engineer role rather than a blanket outage of the table.
+    let alice_rows = exec_ok(&ctx, &ctx.alice, &format!("SELECT event FROM {AUDIT}")).await;
+    assert_eq!(
+        total_rows(&alice_rows),
+        2,
+        "the engineer deny must not affect analyst-only alice"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs quickstart/polaris-ranger-keycloak; run scripts/access-control-test.sh"]
+async fn revoke_disables_access() {
+    ac_gate!();
+    let _guard = crate::common::serial().lock().await;
+    let ctx = ac_setup().await;
+
+    exec_ok(
+        &ctx,
+        &ctx.carol,
+        &format!("GRANT SELECT ON {ORDERS} TO ROLE \"analyst\""),
+    )
+    .await;
+    crate::common::eventually("alice's grant", || async {
+        match ctx
+            .handler
+            .execute(&ctx.alice, &format!("SELECT id FROM {ORDERS}"), None)
+            .await
+        {
+            Ok(b) if total_rows(&b) == 3 => Ok(()),
+            Ok(b) => Err(format!("expected 3 rows, got {}", total_rows(&b))),
+            Err(e) => Err(format!("still denied: {e}")),
+        }
+    })
+    .await;
+
+    exec_ok(
+        &ctx,
+        &ctx.carol,
+        &format!("REVOKE SELECT ON {ORDERS} FROM ROLE \"analyst\""),
+    )
+    .await;
+    crate::common::eventually("the revoke to take effect", || async {
+        match ctx
+            .handler
+            .execute(&ctx.alice, &format!("SELECT id FROM {ORDERS}"), None)
+            .await
+        {
+            Err(_) => Ok(()),
+            Ok(b) => Err(format!("still allowed with {} rows", total_rows(&b))),
+        }
+    })
+    .await;
 }
