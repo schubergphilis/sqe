@@ -1422,6 +1422,8 @@ mod tests {
     /// it (role bound to the datamask/rowfilter items, tag on the resources).
     const LIVE_SAMPLE_ROLE: &str = "engineer";
     const LIVE_SAMPLE_TAG: &str = "PII";
+    /// Tag carrying the row-filter policy in the capture.
+    const LIVE_SAMPLE_FILTER_TAG: &str = "RESTRICTED";
 
     /// HIGH-tagpolicies-shape-unvalidated: deserialize a bundle captured from a
     /// LIVE Ranger and assert `resolve_tag_policies` returns a non-empty result
@@ -1436,10 +1438,16 @@ mod tests {
     /// `testdata/tag_bundle_live_sample.json` came from a live Ranger 2.8 via
     /// `access_control_e2e::capture_live_tag_bundle` (re-capture with
     /// `SQE_AC_CAPTURE=1 scripts/access-control-test.sh capture_live_tag_bundle`).
-    /// The capture carries a `hive:MASK_SHOW_LAST_4` datamask on tag `PII` for
-    /// role `engineer`. It carries no tag ROW FILTER because Ranger 2.8 cannot
-    /// express one (its tag servicedef has no rowFilterDef hierarchy), which is
-    /// why this test accepts "at least one mask OR one row filter".
+    ///
+    /// It carries BOTH tag policy types, so this asserts both branches against
+    /// real data: a `hive:MASK_SHOW_LAST_4` datamask on tag `PII` and a row
+    /// filter `region = 'EU'` on tag `RESTRICTED`, both bound to role
+    /// `engineer`. The row filter is only present because the e2e bootstrap
+    /// gives the tag servicedef a `rowFilterDef` -- Ranger propagates
+    /// `dataMaskDef` into the tag servicedef unconditionally but `rowFilterDef`
+    /// only when Ranger Admin sets
+    /// `ranger.servicedef.autopropagate.rowfilterdef.to.tag=true` (default
+    /// false).
     #[test]
     fn resolve_tag_policies_against_live_sample() {
         let sp: ServicePolicies = serde_json::from_str(TAG_BUNDLE_LIVE_SAMPLE)
@@ -1450,17 +1458,29 @@ mod tests {
              shape drifted and tag masking would silently no-op)"
         );
 
-        let tags: HashSet<String> = [LIVE_SAMPLE_TAG.to_string()].into_iter().collect();
+        let tags: HashSet<String> = [
+            LIVE_SAMPLE_TAG.to_string(),
+            LIVE_SAMPLE_FILTER_TAG.to_string(),
+        ]
+        .into_iter()
+        .collect();
         let id = SessionIdentity {
             username: "live-sample-user".into(),
             roles: vec![LIVE_SAMPLE_ROLE.into()],
             ..Default::default()
         };
-        let (masks, filters, _unmappable) = resolve_tag_policies(&sp, &id, &tags);
+        let (masks, filters, unmappable) = resolve_tag_policies(&sp, &id, &tags);
         assert!(
-            !masks.is_empty() || !filters.is_empty(),
-            "live tagPolicies capture must yield at least one mask or row filter; \
-             got empty (shape mismatch or wrong role/tag constants)"
+            masks.contains_key(LIVE_SAMPLE_TAG),
+            "live capture must resolve a mask for tag {LIVE_SAMPLE_TAG}; got masks {:?}, \
+             unmappable {unmappable:?} (a shape drift or an unhandled component-prefixed \
+             mask type lands here)",
+            masks.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            filters.iter().any(|(tag, _)| tag == LIVE_SAMPLE_FILTER_TAG),
+            "live capture must resolve a row filter for tag {LIVE_SAMPLE_FILTER_TAG}; got {:?}",
+            filters.iter().map(|(t, _)| t).collect::<Vec<_>>()
         );
     }
 }

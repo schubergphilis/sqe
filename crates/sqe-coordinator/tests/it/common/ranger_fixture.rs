@@ -97,6 +97,111 @@ impl RangerAdmin {
         Ok(Some(resp.json().await.context("parse service json")?))
     }
 
+    /// One entry point for everything the suite needs on the Ranger side:
+    /// the tag servicedef's row-filter capability, the two test-owned services
+    /// and their link, and a clean `sqe-ac-e2e-` policy slate. Idempotent, so
+    /// every test can call it in setup.
+    ///
+    /// Returns how many stale test policies were removed.
+    pub async fn bootstrap(&self) -> anyhow::Result<usize> {
+        self.ensure_tag_rowfilter_support().await?;
+        self.ensure_services().await?;
+        self.delete_test_policies().await
+    }
+
+    /// Give the built-in `tag` servicedef a `rowFilterDef`, so tag-based ROW
+    /// FILTER policies can be created at all.
+    ///
+    /// Ranger populates the tag servicedef from each component servicedef, but
+    /// asymmetrically: `dataMaskDef` is propagated unconditionally, while
+    /// `rowFilterDef` is propagated only when Ranger Admin runs with
+    /// `ranger.servicedef.autopropagate.rowfilterdef.to.tag=true`
+    /// (`AbstractServiceStore`, default FALSE). Out of the box the tag
+    /// servicedef therefore has a populated `dataMaskDef` and an empty
+    /// `rowFilterDef: {}`, and Ranger rejects a tag row-filter policy with
+    /// "tag policy can specify values for one of the following resource sets:
+    /// does not have any resource hierarchies".
+    ///
+    /// This mirrors `dataMaskDef`'s single `tag` resource hierarchy into
+    /// `rowFilterDef` and adds `hive:select` as the row-filter access type,
+    /// which is what the auto-propagation would have written. It is a
+    /// TEST-ENVIRONMENT patch: a Ranger upgrade or `docker compose down -v`
+    /// resets it. The durable fix for a real deployment is the config property,
+    /// set in `ranger-admin-site.xml`.
+    ///
+    /// No-op when `rowFilterDef` already carries resources, so it survives both
+    /// a previously-patched stack and a properly-configured Ranger.
+    pub async fn ensure_tag_rowfilter_support(&self) -> anyhow::Result<()> {
+        let Some(mut tag_def) = self.servicedef_by_name("tag").await? else {
+            bail!("built-in `tag` servicedef is missing from this Ranger");
+        };
+        let already = tag_def["rowFilterDef"]["resources"]
+            .as_array()
+            .is_some_and(|r| !r.is_empty());
+        if already {
+            return Ok(());
+        }
+        let mask_resources = tag_def["dataMaskDef"]["resources"].clone();
+        if !mask_resources.as_array().is_some_and(|r| !r.is_empty()) {
+            bail!(
+                "tag servicedef has no dataMaskDef.resources to mirror; Ranger has not \
+                 propagated any component servicedef into it yet"
+            );
+        }
+        tag_def["rowFilterDef"] = serde_json::json!({
+            "resources": mask_resources,
+            "accessTypes": [{"itemId": 1, "name": "hive:select", "label": "hive:select"}],
+        });
+        sanitize_aggregate_servicedef(&mut tag_def);
+        let id = tag_def["id"].as_i64().context("tag servicedef id")?;
+        let resp = self
+            .req(
+                reqwest::Method::PUT,
+                &format!("/service/public/v2/api/servicedef/{id}"),
+            )
+            .json(&tag_def)
+            .send()
+            .await
+            .context("PUT tag servicedef with rowFilterDef")?;
+        if !resp.status().is_success() {
+            bail!(
+                "patch tag servicedef rowFilterDef -> HTTP {}: {}",
+                resp.status(),
+                resp.text().await.unwrap_or_default()
+            );
+        }
+        Ok(())
+    }
+
+    async fn servicedef_by_name(&self, name: &str) -> anyhow::Result<Option<Value>> {
+        let resp = self
+            .req(
+                reqwest::Method::GET,
+                &format!("/service/public/v2/api/servicedef/name/{name}"),
+            )
+            .send()
+            .await
+            .context("GET servicedef by name")?;
+        if resp.status().as_u16() == 404 {
+            return Ok(None);
+        }
+        if !resp.status().is_success() {
+            bail!("GET servicedef {name} -> HTTP {}", resp.status());
+        }
+        Ok(Some(resp.json().await.context("parse servicedef json")?))
+    }
+
+    /// True when the tag servicedef can express row filters. Lets a test state
+    /// the platform precondition it depends on instead of guessing from an error.
+    pub async fn tag_rowfilter_supported(&self) -> anyhow::Result<bool> {
+        let Some(tag_def) = self.servicedef_by_name("tag").await? else {
+            return Ok(false);
+        };
+        Ok(tag_def["rowFilterDef"]["resources"]
+            .as_array()
+            .is_some_and(|r| !r.is_empty()))
+    }
+
     /// Create `sqe_ac_hive` (type hive) and `sqe_ac_tag` (type tag) if absent,
     /// then link the tag service to the hive service. Idempotent.
     pub async fn ensure_services(&self) -> anyhow::Result<()> {
@@ -283,4 +388,59 @@ impl RangerAdmin {
         }
         resp.json().await.context("parse bundle json")
     }
+}
+
+/// Make Ranger's auto-generated `tag` servicedef pass Ranger's OWN validator.
+///
+/// The tag servicedef is assembled by Ranger from every registered component
+/// servicedef, and the result does not round-trip: submitting it back verbatim
+/// is rejected. Observed on Ranger 2.8.0 with the stock set of component defs:
+///
+///   - duplicate access type name `ozone:assume_role` and duplicate itemId
+///     201209 ("duplicate access type name ... in access types")
+///   - elasticsearch implied grants naming access types that are absent from
+///     the aggregate list (`elasticsearch:indices_bulk`,
+///     `indices_search_shards`, `indices_index`, `indices_put`)
+///
+/// Both are defects in what Ranger generated, not in what we add. This drops the
+/// duplicate entries (keeping the first of each name/itemId) and prunes implied
+/// grants that reference access types the def does not declare. Nothing else is
+/// touched, and the components involved (ozone, elasticsearch) are not part of
+/// this stack.
+fn sanitize_aggregate_servicedef(def: &mut Value) {
+    let Some(access_types) = def["accessTypes"].as_array() else {
+        return;
+    };
+
+    // Pass 1: dedupe by name AND by itemId, keeping the first occurrence.
+    let mut seen_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut seen_item_ids: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    let mut deduped: Vec<Value> = Vec::with_capacity(access_types.len());
+    for at in access_types {
+        let name = at["name"].as_str().unwrap_or_default().to_string();
+        let item_id = at["itemId"].as_i64().unwrap_or(-1);
+        if !seen_names.insert(name) || !seen_item_ids.insert(item_id) {
+            continue;
+        }
+        deduped.push(at.clone());
+    }
+
+    // Pass 2: prune implied grants that name an access type the def no longer
+    // declares (or never declared).
+    let declared: std::collections::HashSet<String> = deduped
+        .iter()
+        .filter_map(|at| at["name"].as_str().map(str::to_string))
+        .collect();
+    for at in &mut deduped {
+        if let Some(implied) = at["impliedGrants"].as_array() {
+            let kept: Vec<Value> = implied
+                .iter()
+                .filter(|g| g.as_str().is_some_and(|n| declared.contains(n)))
+                .cloned()
+                .collect();
+            at["impliedGrants"] = Value::Array(kept);
+        }
+    }
+
+    def["accessTypes"] = Value::Array(deduped);
 }
