@@ -256,9 +256,23 @@ pub fn serial() -> &'static tokio::sync::Mutex<()> {
 #[allow(dead_code)]
 pub async fn setup_ranger_handler(
 ) -> (sqe_coordinator::QueryHandler, sqe_catalog::TableMetadataCache) {
+    setup_ranger_handler_with(|_| {}).await
+}
+
+/// `setup_ranger_handler`, with a hook to mutate the loaded config first.
+///
+/// Used to build a deliberately broken handler (for example a `policy.ranger.url`
+/// pointing at a dead port) so fail-closed behaviour can be tested without
+/// stopping containers out from under the rest of the suite.
+#[allow(dead_code)]
+pub async fn setup_ranger_handler_with(
+    mutate: impl FnOnce(&mut sqe_core::SqeConfig),
+) -> (sqe_coordinator::QueryHandler, sqe_catalog::TableMetadataCache) {
     init_tracing();
-    let config = sqe_core::SqeConfig::load(&ranger_config_path())
+    let mut config = sqe_core::SqeConfig::load(&ranger_config_path())
         .expect("load tests/sqe-ranger-test.toml");
+    mutate(&mut config);
+    let config = config;
     let table_cache = sqe_catalog::TableMetadataCache::new(30);
     let (enforcer, store) = sqe_coordinator::policy_wiring::build_policy_enforcer(
         &config.policy,

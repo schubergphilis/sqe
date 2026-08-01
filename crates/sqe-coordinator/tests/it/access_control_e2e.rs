@@ -1327,3 +1327,66 @@ async fn capture_live_tag_bundle() {
     .unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
     eprintln!("captured live tag bundle -> {}", path.display());
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Operational edge: unknown tag state must deny, not leak
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs quickstart/polaris-ranger-keycloak; run scripts/access-control-test.sh"]
+async fn unknown_tag_state_denies() {
+    ac_gate!();
+    let _guard = crate::common::serial().lock().await;
+    let ctx = ac_setup().await;
+    grant_read_to_both_roles(&ctx).await;
+
+    let sql = format!("SELECT id, ssn FROM {ORDERS} ORDER BY id");
+
+    // Control: on the suite's handler bob reads all three rows. Its
+    // TableMetadataCache saw this table during fixture DDL, so `CacheTagSource`
+    // can answer "known: no tags" and the rewriter does no tag work.
+    let warm = exec_ok(&ctx, &ctx.bob, &sql).await;
+    assert_eq!(
+        total_rows(&warm),
+        3,
+        "precondition: bob must read normally when tag state is known"
+    );
+
+    // Same user, same grant, same SQL -- but a handler whose TableMetadataCache
+    // has never seen this table. `TagSource::column_tags` returns None
+    // (UNKNOWN, not "no tags"), and the contract in tag_source.rs is that the
+    // caller MUST fail closed: a mask or tag row filter might exist that we
+    // cannot see, so treating unknown as untagged would silently skip a
+    // security control. plan_rewriter logs
+    // "Tag state unknown (cache miss or disabled); denying access" and injects a
+    // deny-all row filter.
+    let (cold, _cache) = crate::common::setup_ranger_handler().await;
+    let denied = cold
+        .execute(&ctx.bob, &sql, None)
+        .await
+        .expect("the deny is a row filter, so the statement itself still succeeds");
+    assert_eq!(
+        total_rows(&denied),
+        0,
+        "unknown tag state must deny, got {:?}",
+        col_strings(&denied, "ssn")
+    );
+
+    // The decisive check: nothing leaked through the deny.
+    for b in &denied {
+        for idx in 0..b.num_columns() {
+            let arr = b.column(idx);
+            for row in 0..b.num_rows() {
+                let v = crate::common::fmt_val(arr.as_ref(), row);
+                assert!(
+                    !v.contains("111-11-1111"),
+                    "raw ssn leaked while tag state was unknown: {v}"
+                );
+            }
+        }
+    }
+
+    // The warm handler is unaffected: the deny is per-scan, not global state.
+    let after = exec_ok(&ctx, &ctx.bob, &sql).await;
+    assert_eq!(total_rows(&after), 3);
+}
