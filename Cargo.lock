@@ -6667,6 +6667,7 @@ dependencies = [
  "subtle",
  "tempfile",
  "tokio",
+ "tokio-stream",
  "tokio-util",
  "toml",
  "tonic",
