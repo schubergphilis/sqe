@@ -90,6 +90,11 @@ tower = { version = "0.5", features = ["util"] }
 
 [dev-dependencies]
 opentelemetry_sdk = { workspace = true }
+# Test-only: TcpListenerStream, so the Flight SQL smoke test can serve on an
+# OS-assigned port. Both production entry points hand tonic a SocketAddr and
+# let it bind, which cannot report the port back.
+tokio-stream = "0.1"
+
 toml = { workspace = true }
 sqe-core = { path = "../sqe-core" }
 sqe-auth = { path = "../sqe-auth" }
