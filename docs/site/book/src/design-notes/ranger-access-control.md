@@ -223,6 +223,49 @@ gate: the baseline traverse set (`catalog-list`, `catalog-properties-read`,
 `table-properties-read`, so `GRANT SELECT` is what actually lets a member load
 and read a table, and `REVOKE` takes it away.
 
+## Who may grant: the caller, checked by Ranger
+
+SQE sends the **authenticated caller** as the Ranger `grantor`, never its own
+service identity, and Ranger decides whether that caller may grant.
+
+This is an authority check, not an audit field. Verified against a live Ranger
+2.8: a POST to `/service/plugins/services/grant/{service}` carrying
+`grantor: "dave"` is refused with
+
+```
+HTTP 403 {"msgDesc":"User doesn't have necessary permission to grant access"}
+```
+
+even though the request authenticates with admin REST credentials. Ranger
+authorizes the named grantor. So passing the real caller makes grant authority
+**resource-scoped** (does this user hold delegate admin on THIS table?) rather
+than merely role-scoped, and Ranger's audit record names the human instead of
+`admin`.
+
+`WITH GRANT OPTION` maps to Ranger's `delegateAdmin`, which is how that authority
+is handed on. Without it nobody except the principals seeded at bootstrap could
+ever grant.
+
+The `[auth] admin_roles` gate on GRANT and REVOKE stays in place as defence in
+depth. The two checks answer different questions: the role gate is coarse and
+local ("may this session issue grant statements at all"), while Ranger's is
+per-resource. The gate also still matters for the `polaris` access-control
+backend, which swaps the caller's token for a service token (issue #204) and so
+has no equivalent check of its own.
+
+### Migration note
+
+**This is a behaviour change for existing deployments.** A caller who holds an
+SQE admin role but NOT `delegateAdmin` in Ranger could previously grant (every
+grant was performed as the Ranger admin user) and will now be refused 403.
+
+Grant delegate authority to whoever should be able to grant. The quickstart does
+this at bootstrap: `post_grant` sends `"delegateAdmin": true` for the `root` user
+and the `sqe_admin` role, which is why `carol` can still grant after this change.
+For an existing stack, either add a Ranger policy giving the administrator
+delegate admin on the resources they manage, or grant it through SQL with
+`WITH GRANT OPTION`.
+
 ## Configuration
 
 The `ranger` access-control backend is configured with two TOML blocks. The
