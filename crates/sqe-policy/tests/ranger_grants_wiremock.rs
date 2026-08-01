@@ -29,6 +29,8 @@ fn grant_stmt() -> GrantStatement {
         namespace: Some("sales".to_string()),
         table: Some("orders".to_string()),
         grantee: Grantee::Role("analyst".to_string()),
+        grantor: None,
+        with_grant_option: false,
     }
 }
 

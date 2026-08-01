@@ -223,6 +223,8 @@ mod tests {
             namespace: Some("ns".into()),
             table: Some("tbl".into()),
             grantee: Grantee::Role("analysts".into()),
+            grantor: None,
+            with_grant_option: false,
         };
         let req = to_grant_request(&stmt);
         assert_eq!(req.privilege, "SELECT");
@@ -242,6 +244,7 @@ mod tests {
             namespace: Some("ns".into()),
             table: Some("tbl".into()),
             grantee: Grantee::User("alice".into()),
+            grantor: None,
         };
         let req = to_revoke_request(&stmt);
         assert_eq!(req.privilege, "INSERT");

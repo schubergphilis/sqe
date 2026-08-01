@@ -59,6 +59,23 @@ pub struct GrantStatement {
     pub namespace: Option<String>,
     pub table: Option<String>,
     pub grantee: Grantee,
+    /// The authenticated user issuing the statement.
+    ///
+    /// Ranger authorizes a grant against THIS name, not against the REST
+    /// credentials SQE connects with (verified: a POST carrying
+    /// `grantor: "dave"` is refused 403 "User doesn't have necessary permission
+    /// to grant access" even when the call authenticates as admin). So passing
+    /// the real caller is what makes grant authority resource-scoped instead of
+    /// role-scoped, and it makes Ranger's audit record name the human.
+    ///
+    /// `None` falls back to the backend's configured admin user, which is the
+    /// pre-existing behaviour and keeps test doubles and non-session callers
+    /// working.
+    pub grantor: Option<String>,
+    /// `WITH GRANT OPTION`: the grantee may re-grant what it was given. Maps to
+    /// Ranger's `delegateAdmin`. Without this, only principals seeded with
+    /// delegate authority at bootstrap can ever grant.
+    pub with_grant_option: bool,
 }
 
 /// A parsed REVOKE statement ready for backend dispatch.
@@ -69,6 +86,9 @@ pub struct RevokeStatement {
     pub namespace: Option<String>,
     pub table: Option<String>,
     pub grantee: Grantee,
+    /// See `GrantStatement::grantor`. Revoking is also authorized against the
+    /// grantor, so a caller can only revoke what it has authority over.
+    pub grantor: Option<String>,
 }
 
 /// Backend-neutral grantee. Each backend maps this to its own model.
