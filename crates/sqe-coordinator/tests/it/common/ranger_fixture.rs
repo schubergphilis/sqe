@@ -444,3 +444,79 @@ fn sanitize_aggregate_servicedef(def: &mut Value) {
 
     def["accessTypes"] = Value::Array(deduped);
 }
+
+/// Stop and start the `ranger-admin` container of the quickstart stack.
+///
+/// Used by the policy-breaker test, which needs a REAL outage: pointing a second
+/// handler at a dead port does not work, because a fresh handler's cold
+/// `TableMetadataCache` denies for an unrelated reason (unknown tag state) and
+/// the test passes vacuously. The only way to isolate the outage is to take
+/// Ranger away from a handler that is already warm.
+pub struct RangerContainer {
+    stack_dir: std::path::PathBuf,
+}
+
+impl RangerContainer {
+    pub fn new() -> Self {
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let root = manifest
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("workspace root");
+        Self {
+            stack_dir: root.join("quickstart/polaris-ranger-keycloak"),
+        }
+    }
+
+    fn compose(&self, args: &[&str]) -> anyhow::Result<()> {
+        let out = std::process::Command::new("docker")
+            .arg("compose")
+            .arg("--project-directory")
+            .arg(&self.stack_dir)
+            .arg("-f")
+            .arg(self.stack_dir.join("docker-compose.yml"))
+            .args(args)
+            .output()
+            .context("run docker compose")?;
+        if !out.status.success() {
+            bail!(
+                "docker compose {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        Ok(())
+    }
+
+    pub fn stop(&self) -> anyhow::Result<()> {
+        self.compose(&["stop", "ranger-admin"])
+    }
+
+    pub fn start(&self) -> anyhow::Result<()> {
+        self.compose(&["start", "ranger-admin"])
+    }
+}
+
+/// Restarts `ranger-admin` on drop, so a panicking test cannot leave the
+/// container stopped and poison every test that follows. `Drop` cannot be async,
+/// which is why the container control above is a blocking `std::process`.
+pub struct RangerOutage {
+    container: RangerContainer,
+}
+
+impl RangerOutage {
+    /// Stop `ranger-admin` and return a guard that restarts it.
+    pub fn begin() -> anyhow::Result<Self> {
+        let container = RangerContainer::new();
+        container.stop()?;
+        Ok(Self { container })
+    }
+}
+
+impl Drop for RangerOutage {
+    fn drop(&mut self) {
+        if let Err(e) = self.container.start() {
+            eprintln!("WARNING: failed to restart ranger-admin after the outage test: {e}");
+        }
+    }
+}
