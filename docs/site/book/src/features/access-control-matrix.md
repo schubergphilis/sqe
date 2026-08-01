@@ -75,6 +75,46 @@ rely on it: it grants table operations on a name that Polaris handles as a view.
 To gate views today, author the policy directly in Ranger against the access
 types you need.
 
+### What DOES work on views, verified
+
+Views are supported objects: an admin can create and query them. Two questions
+matter more than the grant surface, and both were tested live against the
+quickstart stack.
+
+**Column masks survive a view. There is no bypass.** A view that projects a
+masked column returns the MASKED value, because the view expands to a
+`TableScan` of the base table and the plan rewriter runs on that scan. Verified
+with a user who is both an admin (so the view loads) and a member of the masked
+role: `xxx-xx-1111` reading the base table, `xxx-xx-1111` reading the view.
+Creating a view over a protected table is not a way around masking.
+
+**A non-admin cannot read a view at all.** Because no SQL privilege emits a
+`view-*` access type, a user without the admin grant gets "table not found"
+(Polaris hides rather than 403s). So the practical position today is: views are
+an admin-only surface, and masking still applies there.
+
+**Row filters break on views when the filter references an unprojected column.**
+This is a real defect, and it is view-specific. A row filter on `region` against
+a view declared as `SELECT id, ssn FROM orders` fails the whole query:
+
+```
+Plan rewrite failed: Internal error: Failed to create policy filter:
+Schema error: No field named region.
+Valid fields are ...orders.id, ...orders.ssn
+```
+
+The same filter on a DIRECT query with the same narrow projection
+(`SELECT id, ssn FROM orders`) works and returns the filtered rows, so this is
+not the general case: SQE injects the filter below the user projection and it
+resolves fine. Only the view path fails.
+
+Behaviour is fail-closed (a hard error, no rows, nothing leaked) but the message
+is a DataFusion internal error that names neither the policy nor the view. This
+is the same class as Kyuubi's `#6889`, which the quickstart bootstrap already
+cites as the reason no row-filter policy is seeded for the Spark cross-compare.
+Until it is fixed, a row filter and a narrow view over the same table are
+mutually exclusive.
+
 ## Data gate (SQE plan rewriting)
 
 ### Column masks
@@ -160,12 +200,13 @@ flush the cache on commit. The window is asserted at both edges by
 
 | Gap | Detail |
 |---|---|
-| View-level grants | No `view` resource level and no privilege mapping. See above. |
+| View-level grants | No `view` resource level and no privilege mapping, so views are admin-only. See above. |
+| Row filters through views | A filter referencing a column the view does not project fails the query with a DataFusion schema error. Fail-closed, but the message names neither the policy nor the view. Direct queries with the same projection work. |
 | Ranger glob patterns | Only exact match and bare `*` are matched. `orders*` is not, and a policy written that way silently never fires. Pinned by `ranger_glob_patterns_are_not_matched`. |
 | Namespace flattening | `resolve_policy_key` passes only the LAST dotted component as the Ranger `database`, so `a.b.sales` and `sales` collide. Pinned by `resolve_policy_key_multilevel_takes_last_namespace_component`. |
 | Tag parity with Spark | Spark reads tag associations from the Ranger or Atlas tag store, not from Iceberg properties. Masks are shared; associations are not. |
 | ALL vs FUTURE tables | Ranger has no future-only resource, so both collapse to one wildcard policy. Snowflake distinguishes them. |
-| `opa` and `cedar` engines | Defined in config, not wired. Selecting one errors rather than degrading to passthrough, pinned by `unwired_policy_engines_fail_loudly_rather_than_degrade`. |
+| `opa` and `cedar` engines | Legacy config values from an earlier design, superseded by `ranger`. Not wired, and selecting one errors rather than degrading to passthrough (pinned by `unwired_policy_engines_fail_loudly_rather_than_degrade`). They are not planned work; `ranger` is the backend. |
 | Tag propagation | A column derived from a tagged column in a CTAS starts untagged. |
 
 ## Where to go next

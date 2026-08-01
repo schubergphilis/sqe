@@ -268,10 +268,14 @@ catalog_url = "http://localhost:59997"
         );
     }
 
-    /// The support matrix states that `opa` and `cedar` are defined in config but
-    /// not wired, and that selecting one errors. Pinned here so the docs cannot
-    /// drift from the code in either direction: if either engine is implemented,
-    /// this test fails and the matrix row has to be updated in the same change.
+    /// `opa` and `cedar` are LEGACY config values from an earlier design.
+    /// `ranger` is the policy backend; neither of the other two is planned work.
+    /// They remain accepted by the config parser for compatibility, and
+    /// selecting one must error rather than degrade.
+    ///
+    /// Pinned so the docs cannot drift from the code in either direction: if one
+    /// is ever implemented, this test fails and the matrix row has to be updated
+    /// in the same change.
     ///
     /// Erroring is the right behaviour rather than silently degrading to
     /// passthrough. A governance backend that quietly enforces nothing is worse
