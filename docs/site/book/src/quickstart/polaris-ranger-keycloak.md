@@ -185,6 +185,39 @@ The quickstart seeds a `MASK_NULL` policy on `orders.amount` and a CUSTOM show-l
 `xxx-xx-1111` for ssn and an empty amount cell; alice (analyst-only) sees the raw values. No
 row-filter policy is seeded (see the SQE <-> Spark cross-compare below for why).
 
+**Tag row filters need a Ranger Admin property this stack does not set.** Tag column masks work
+out of the box. Tag row filters do not, and the reason is a capability Ranger withholds by
+default rather than anything in SQE: Ranger copies each component's `dataMaskDef` into the `tag`
+service definition unconditionally, but copies its `rowFilterDef` only when Ranger Admin runs
+with `ranger.servicedef.autopropagate.rowfilterdef.to.tag=true` in `ranger-admin-site.xml`.
+Without it, POSTing a tag row-filter policy is rejected with "tag policy can specify values for
+one of the following resource sets: does not have any resource hierarchies", which names
+resources rather than the missing capability. Nothing here is version-gated, and upgrading Ranger
+does not change it. The access-control e2e suite patches the capability in over REST at bootstrap
+so its tag row-filter case runs against this stack unmodified. See
+[Fine-grained Enforcement](../design-notes/ranger-fine-grained-enforcement.md) for the property
+and the round-trip caveat.
+
+Note also that a `tag`-service policy must name its mask type in component-qualified form
+(`hive:MASK_SHOW_LAST_4`), never the bare name. Ranger's tag service definition only ever
+defines the prefixed variants.
+
+## How this stack is tested in CI
+
+`test.sh` and `parity-test.sh` are the shell harnesses, and they classify by grepping CLI output.
+That is fine for a demo and not enough for a security control: the denial check matches
+`not found`, which is also what a typo'd table name prints.
+
+The Rust tier carries the real assertions. `make test-access-control` brings up a subset of this
+stack (no `sqe`, `data-seed` or `spark` container, so the demo fixtures and `parity-test.sh` are
+untouched) and runs 20 cases in `crates/sqe-coordinator/tests/it/access_control_e2e.rs` against
+an in-process query handler wired to the real Ranger enforcer and grant backend, authenticating
+alice/bob/carol/dave through Keycloak and asserting decoded Arrow values. Every denial is proven
+by first running the identical SQL as an admin, so "denied" is distinguishable from "invalid
+statement". Coverage includes grant/revoke, role versus user grants, deny precedence, resource
+masks and row filters, keyed-HMAC hash masks against an out-of-band digest, tag masks and tag row
+filters, and three fail-closed paths (Ranger unreachable, tag state unknown, unmappable mask).
+
 ## SQE <-> Spark cross-compare
 
 `parity-test.sh` runs `SELECT id, ssn FROM sales_wh.sales.orders` as `bob` (role `engineer`) in
