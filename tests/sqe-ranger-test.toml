@@ -1,0 +1,94 @@
+# SQE config for the access-control e2e test (crates/sqe-coordinator/tests/it/
+# access_control_e2e.rs). Mirrors quickstart/polaris-ranger-keycloak/sqe.toml
+# with three deliberate differences, all marked below.
+#
+# Ports are the quickstart's host-published ones (.env.example).
+
+[coordinator]
+flight_sql_port = 60071
+trino_http_port = 28081
+mode = "hybrid"
+
+[worker]
+memory_limit = "4GB"
+spill_dir = "/tmp/sqe-ac-spill"
+
+# keycloak_url is REQUIRED here even though the coordinator warns that
+# [[auth.providers]] takes precedence: `sqe_auth::Authenticator::new` (the path
+# `common::ranger_session` uses) selects its OIDC-password backend from this
+# field, and dropping it makes every ROPC exchange fail. The provider chain
+# below is what the Flight SQL handshake would use in production.
+[auth]
+keycloak_url = "http://localhost:38080"
+realm = "iceberg-ranger"
+client_id = "sqe-client"
+client_secret = "sqe-secret-change-me"
+ssl_verification = false
+admin_roles = ["sqe_admin"]
+
+[[auth.providers]]
+type = "oidc_password"
+token_url = "http://localhost:38080/realms/iceberg-ranger/protocol/openid-connect/token"
+client_id = "sqe-client"
+client_secret = "sqe-secret-change-me"
+roles_claim = "realm_access.roles"
+accept_invalid_certs = true
+
+[catalogs.sales_wh]
+polaris_url = "http://localhost:28181/api/catalog"
+warehouse = "sales_wh"
+metadata_cache_ttl_secs = 30
+default_table_format_version = 2
+
+[catalogs.ops_wh]
+polaris_url = "http://localhost:28181/api/catalog"
+warehouse = "ops_wh"
+metadata_cache_ttl_secs = 30
+default_table_format_version = 2
+
+[catalog]
+polaris_url = "http://localhost:28181/api/catalog"
+warehouse = "sales_wh"
+
+[query]
+catalog_discovery = "polaris-auto"
+
+[storage]
+s3_endpoint = "http://localhost:29000"
+s3_region = "us-east-1"
+s3_access_key = "s3admin"
+s3_secret_key = "s3adminpw"
+s3_path_style = true
+s3_allow_http = true
+
+# Difference 1: mask_key is set, so MASK_HASH runs as keyed HMAC-SHA256
+# (issue #37) and the test can assert an exact digest.
+[policy]
+engine = "ranger"
+mask_key = "sqe-ac-e2e-mask-key"
+
+# Difference 2: service-name is the test-owned service, not the demo's `hive`.
+# Difference 3: a 2s cache TTL so REST-created policies land quickly.
+[policy.ranger]
+url = "http://localhost:26080"
+service-name = "sqe_ac_hive"
+admin-user = "admin"
+admin-password = "rangerR0cks!"
+cache-ttl-secs = 2
+
+[access_control]
+backend = "ranger"
+url = "http://localhost:26080"
+
+# service-name MUST stay "polaris": it has to match Polaris's
+# polaris.authorization.ranger.service-name. realm = "*" is not optional --
+# Polaris sends a `root` resource on every authorization request, and without a
+# matching value every policy SQE writes is accepted and then never matches.
+[access_control.ranger]
+service-name = "polaris"
+admin-user = "admin"
+admin-password = "rangerR0cks!"
+realm = "*"
+
+[session]
+idle_timeout_secs = 900

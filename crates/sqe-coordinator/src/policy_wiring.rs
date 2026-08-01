@@ -7,7 +7,10 @@
 
 use std::sync::Arc;
 
+use sqe_catalog::grant_chameleon::ChameleonGrantBackend;
 use sqe_core::config::{PolicyConfig, PolicyEngine};
+use sqe_core::SqeConfig;
+use sqe_policy::grants::{polaris::PolarisGrantBackend, ranger::RangerGrantBackend, GrantBackend};
 use sqe_policy::plan_rewriter::PolicyPlanRewriter;
 use sqe_policy::{PassthroughEnforcer, PolicyEnforcer, PolicyStore};
 
@@ -102,6 +105,64 @@ pub fn build_policy_enforcer(
     }
 }
 
+/// Construct the GRANT/REVOKE backend from `config.access_control`.
+///
+/// Shared by both coordinator binaries (`main.rs`, `bin/sqe_server.rs`) and by
+/// the access-control e2e test, for the same reason `build_policy_enforcer` is
+/// shared: three copies of this wiring would drift.
+pub fn build_grant_backend(
+    config: &SqeConfig,
+) -> anyhow::Result<Option<Arc<dyn GrantBackend>>> {
+    use sqe_core::config::AccessControlBackend;
+    match config.access_control.backend {
+        AccessControlBackend::Chameleon if !config.access_control.url.is_empty() => {
+            tracing::info!(
+                backend = "chameleon",
+                url = %config.access_control.url,
+                "Access control backend configured"
+            );
+            let client = Arc::new(sqe_catalog::AccessControlClient::new(
+                &config.access_control.url,
+            )?);
+            Ok(Some(Arc::new(ChameleonGrantBackend::new(client))))
+        }
+        AccessControlBackend::Polaris if !config.access_control.url.is_empty() => {
+            tracing::info!(
+                backend = "polaris",
+                url = %config.access_control.url,
+                "Access control backend configured"
+            );
+            Ok(Some(Arc::new(PolarisGrantBackend::new(
+                &config.access_control.url,
+                config.access_control.client_id.clone(),
+                config.access_control.client_secret.clone(),
+            )?)))
+        }
+        AccessControlBackend::Ranger if !config.access_control.url.is_empty() => {
+            let r = &config.access_control.ranger;
+            tracing::info!(
+                backend = "ranger",
+                url = %config.access_control.url,
+                service = %r.service_name,
+                "Access control backend configured"
+            );
+            Ok(Some(Arc::new(RangerGrantBackend::new(
+                &config.access_control.url,
+                &r.service_name,
+                &r.admin_user,
+                r.admin_password.expose(),
+                &r.realm,
+                r.timeout_secs,
+                r.accept_invalid_certs,
+            )?)))
+        }
+        AccessControlBackend::None
+        | AccessControlBackend::Chameleon
+        | AccessControlBackend::Polaris
+        | AccessControlBackend::Ranger => Ok(None),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -149,6 +210,61 @@ mod tests {
             result.is_ok(),
             "ranger + empty mask_key must build (warn, not reject): {:?}",
             result.err()
+        );
+    }
+
+    // ── build_grant_backend ────────────────────────────────────────────────
+    // These two run in the DEFAULT suite (`cargo test -p sqe-coordinator
+    // --lib`), so they must pass with nothing listening on port 26080.
+    // `RangerGrantBackend::new` only builds a reqwest client and copies
+    // strings (crates/sqe-policy/src/grants/ranger.rs:190): no I/O.
+
+    const RANGER_TOML: &str = r#"
+[coordinator]
+
+[auth]
+
+[catalog]
+catalog_url = "http://localhost:59997"
+
+[access_control]
+backend = "ranger"
+url = "http://localhost:26080"
+
+[access_control.ranger]
+service-name = "polaris"
+admin-user = "admin"
+admin-password = "rangerR0cks!"
+realm = "*"
+"#;
+
+    const PASSTHROUGH_TOML: &str = r#"
+[coordinator]
+
+[auth]
+
+[catalog]
+catalog_url = "http://localhost:59997"
+"#;
+
+    #[test]
+    fn ranger_config_yields_a_grant_backend() {
+        let config: sqe_core::SqeConfig = toml::from_str(RANGER_TOML).expect("parse ranger toml");
+        let backend = build_grant_backend(&config).expect("build ranger grant backend");
+        assert!(
+            backend.is_some(),
+            "access_control.backend = ranger with a url must yield a grant backend"
+        );
+    }
+
+    #[test]
+    fn no_access_control_config_yields_no_backend() {
+        let config: sqe_core::SqeConfig =
+            toml::from_str(PASSTHROUGH_TOML).expect("parse passthrough toml");
+        let backend = build_grant_backend(&config).expect("build passthrough grant backend");
+        assert!(
+            backend.is_none(),
+            "no access_control backend configured must yield None, not a live client"
         );
     }
 

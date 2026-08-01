@@ -2,6 +2,9 @@
 //! Each file in tests/ is its own binary; include this via `mod common;`.
 #![allow(dead_code)]
 
+/// Ranger Admin REST fixtures for `access_control_e2e`.
+pub mod ranger_fixture;
+
 use std::sync::Arc;
 
 /// Initialize the tracing subscriber once for the entire test binary.
@@ -187,6 +190,194 @@ pub async fn setup_handler_with_workers(
         sqe_core::SecretStore::default(),
     ).expect("Failed to create QueryHandler");
     (session, handler)
+}
+
+// ── Access-control e2e helpers (see tests/it/access_control_e2e.rs) ─────────
+
+/// Path to the Ranger e2e config.
+///
+/// `SQE_AC_CONFIG` wins when set: `scripts/access-control-test.sh` writes a copy
+/// of the committed config with the quickstart's ACTUAL published ports
+/// substituted in. Those ports are not fixed. A developer whose 26080 is already
+/// taken by another Ranger gets `RANGER_PORT=46080` in their `.env`, and a
+/// hardcoded config would then talk to the wrong Ranger and fail with confusing
+/// errors (observed: "Role name: engineer does not exist in ranger admin", from
+/// an unrelated Ranger instance).
+///
+/// The committed `tests/sqe-ranger-test.toml` carries the `.env.example`
+/// defaults, so it works standalone when those ports are free.
+#[allow(dead_code)]
+pub fn ranger_config_path() -> String {
+    if let Ok(p) = std::env::var("SQE_AC_CONFIG") {
+        if !p.is_empty() {
+            return p;
+        }
+    }
+    let manifest_dir =
+        std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
+    let workspace_root = std::path::Path::new(&manifest_dir)
+        .parent()
+        .and_then(|p| p.parent())
+        .unwrap_or(std::path::Path::new("."));
+    workspace_root
+        .join("tests")
+        .join("sqe-ranger-test.toml")
+        .to_string_lossy()
+        .to_string()
+}
+
+/// True when the caller opted into the access-control e2e suite.
+///
+/// The suite needs the `quickstart/polaris-ranger-keycloak` stack, which is NOT
+/// the stack `scripts/integration-test.sh` brings up. `#[ignore]` alone is not
+/// enough, because that script runs `cargo test -p sqe-coordinator -- --ignored`
+/// and would force-run these. Opt in with `SQE_AC_E2E=1`
+/// (`scripts/access-control-test.sh` sets it).
+#[allow(dead_code)]
+pub fn ac_enabled() -> bool {
+    std::env::var("SQE_AC_E2E").as_deref() == Ok("1")
+}
+
+/// Process-wide serialization for the access-control tests. They share Ranger
+/// state, the policy cache, and the fixture tables.
+#[allow(dead_code)]
+pub fn serial() -> &'static tokio::sync::Mutex<()> {
+    static S: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    S.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+/// Build a `QueryHandler` wired to the REAL Ranger enforcer and Ranger grant
+/// backend from `tests/sqe-ranger-test.toml`.
+///
+/// Returns the handler and the `TableMetadataCache` it shares with the policy
+/// enforcer. The SAME cache instance must reach both: `CacheTagSource` reads
+/// column tags out of it, and a separate cache reports tag state as unknown,
+/// which fails closed.
+#[allow(dead_code)]
+pub async fn setup_ranger_handler(
+) -> (sqe_coordinator::QueryHandler, sqe_catalog::TableMetadataCache) {
+    setup_ranger_handler_with(|_| {}).await
+}
+
+/// `setup_ranger_handler`, with a hook to mutate the loaded config first.
+///
+/// Used to build a deliberately broken handler (for example a `policy.ranger.url`
+/// pointing at a dead port) so fail-closed behaviour can be tested without
+/// stopping containers out from under the rest of the suite.
+#[allow(dead_code)]
+pub async fn setup_ranger_handler_with(
+    mutate: impl FnOnce(&mut sqe_core::SqeConfig),
+) -> (sqe_coordinator::QueryHandler, sqe_catalog::TableMetadataCache) {
+    init_tracing();
+    let mut config = sqe_core::SqeConfig::load(&ranger_config_path())
+        .expect("load tests/sqe-ranger-test.toml");
+    mutate(&mut config);
+    let config = config;
+    let table_cache = sqe_catalog::TableMetadataCache::new(30);
+    let (enforcer, store) = sqe_coordinator::policy_wiring::build_policy_enforcer(
+        &config.policy,
+        Some(table_cache.clone()),
+        None,
+    )
+    .expect("build ranger policy enforcer");
+    let grant_backend = sqe_coordinator::policy_wiring::build_grant_backend(&config)
+        .expect("build ranger grant backend");
+    let query_tracker = Arc::new(sqe_coordinator::query_tracker::QueryTracker::new(
+        &config.query_history,
+    ));
+    let handler = sqe_coordinator::QueryHandler::new(
+        enforcer,
+        store,
+        config,
+        None, // worker_registry
+        None, // credential_tracker
+        None, // metrics
+        None, // audit
+        query_tracker,
+        None, // query_cache
+        grant_backend,
+        None, // lineage
+        sqe_coordinator::RuntimeCatalogRegistry::default(),
+        sqe_core::SecretStore::default(),
+    )
+    .expect("build QueryHandler")
+    .with_table_cache(table_cache.clone());
+    (handler, table_cache)
+}
+
+/// Authenticate a quickstart user through Keycloak ROPC. Password convention is
+/// `<user>123` (alice123, bob123, carol123, dave123).
+#[allow(dead_code)]
+pub async fn ranger_session(user: &str) -> sqe_core::Session {
+    let config = sqe_core::SqeConfig::load(&ranger_config_path())
+        .expect("load tests/sqe-ranger-test.toml");
+    let authenticator = sqe_auth::Authenticator::new(&config.auth)
+        .await
+        .expect("create authenticator");
+    authenticator
+        .authenticate(user, &format!("{user}123"))
+        .await
+        .unwrap_or_else(|e| panic!("Keycloak ROPC failed for {user}: {e}"))
+}
+
+/// Default budget for `eventually`.
+///
+/// Two different propagation delays stack up in the access-control suite:
+///
+/// - SQE's own policy cache (`policy.ranger.cache-ttl-secs = 2` in the test
+///   config), which covers masks and row filters read from Ranger directly.
+/// - Polaris's embedded Ranger plugin, which POLLS Ranger on an interval
+///   (30s by default). Coarse-gate changes -- GRANT, REVOKE, and deny-item
+///   edits -- are not visible to Polaris until that refresh, so a 30s budget
+///   sits exactly on the boundary and flakes. Measured: a revoked allow was
+///   still being served at 30s.
+///
+/// 120s is comfortably past the poll interval. It costs nothing on the happy
+/// path (every assertion here settles in seconds) and only extends the wait
+/// when something is genuinely wrong, where the reported last failure is what
+/// matters anyway.
+#[allow(dead_code)]
+pub const EVENTUALLY_BUDGET: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Retry `f` until it returns `Ok` or `EVENTUALLY_BUDGET` elapses. Panics with
+/// the last failure.
+///
+/// Never use a bare sleep instead: it either flakes or wastes wall clock, and it
+/// hides which assertion was still failing.
+#[allow(dead_code)]
+pub async fn eventually<F, Fut, T>(what: &str, f: F) -> T
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, String>>,
+{
+    eventually_within(EVENTUALLY_BUDGET, what, f).await
+}
+
+/// `eventually` with an explicit budget.
+#[allow(dead_code)]
+pub async fn eventually_within<F, Fut, T>(
+    budget: std::time::Duration,
+    what: &str,
+    mut f: F,
+) -> T
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, String>>,
+{
+    let deadline = std::time::Instant::now() + budget;
+    loop {
+        let last = match f().await {
+            Ok(v) => return v,
+            Err(e) => e,
+        };
+        if std::time::Instant::now() >= deadline {
+            panic!(
+                "timed out after {}s waiting for {what}; last failure: {last}",
+                budget.as_secs()
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
 }
 
 /// Format a single cell value from an Arrow column for display / comparison.
