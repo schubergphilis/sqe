@@ -101,3 +101,33 @@ regexTarget = "line"
 regexes = [
     '''curl[^\n]*\$\{?[A-Za-z_][A-Za-z0-9_]*''',
 ]
+
+# 5. Same history-only class, different value: the Ranger access-control plan
+#    quotes runnable `curl -s -u admin:'rangerR0cks!'` recipes against the local
+#    quickstart. `rangerR0cks!` is the quickstart's PUBLISHED default, already in
+#    docker-compose.yml, ranger/install.properties and the quickstart README as a
+#    `${RANGER_ADMIN_PASSWORD:-rangerR0cks!}` default. It gates nothing outside a
+#    developer's laptop.
+#
+#    Why an allowlist and not an edit: `aikido-secret-scan-history` reads every
+#    commit, so the finding lives in the blob at 288e5b6 forever and no
+#    working-tree change can clear it. Rewriting main's history to remove three
+#    doc lines would be far worse than the finding.
+#
+#    Scoped three ways (condition = "AND"): only this one file, only a line
+#    carrying this exact known-public value, and via `regexTarget = "line"`. A
+#    different credential in the same file is still reported, and this value in
+#    any other path is still reported. Note the unquoted `-u admin:rangerR0cks!`
+#    form in docs/internal/plans/2026-06-18-ranger-access-control-backend.md does
+#    NOT trip `curl-auth-user` and needs no entry -- the rule matches the quoted
+#    shape.
+[[allowlists]]
+description = "Quickstart default Ranger password in a plan doc (history scan)"
+condition = "AND"
+paths = [
+    '''(^|/)docs/superpowers/plans/2026-07-31-ranger-access-control-e2e\.md$''',
+]
+regexTarget = "line"
+regexes = [
+    '''curl[^\n]*-u admin:'rangerR0cks!'''',
+]
