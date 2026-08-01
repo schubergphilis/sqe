@@ -66,6 +66,46 @@ SHOW TAGS ON sales.orders;
 
 The Snowflake form works too: `ALTER TABLE ... MODIFY COLUMN ssn SET TAG PII = 'true'`. `SET TAGS` merges, changing only the columns you name. Storing the association as a table property means it travels with the data through clone, rename, and replicate, and covers federated catalogs Polaris cannot gate. Tag parity with Spark stops at the association: Spark reads it from the Ranger or Atlas tag store, so full tag parity would need an Iceberg-to-Ranger tag sync, which is optional and not built.
 
+Author the mask type under the `hive:` prefix (`hive:MASK_SHOW_LAST_4`). Ranger's `tag` service definition never defines bare mask names: it aggregates the mask types of every component it can decorate, so the entries are `hive:MASK_SHOW_LAST_4`, `trino:MASK_NULL`, and so on. SQE accepts the bare and `hive:` forms and deliberately leaves another component's prefix unmatched, which restricts the tagged column rather than applying another engine's policy.
+
+## Tag row filters need one Ranger Admin property
+
+A `tag`-service policy can carry a row filter as well as a mask, so every table with a column tagged `PII` is filtered by one rule. Ranger ships this switched off, and it is not a version limitation:
+
+```xml
+<property>
+  <name>ranger.servicedef.autopropagate.rowfilterdef.to.tag</name>
+  <value>true</value>
+</property>
+```
+
+Ranger copies each component's `dataMaskDef` into the tag service definition unconditionally, but copies its `rowFilterDef` only when that property is set in `ranger-admin-site.xml`. Without it, tag masks work and tag row filters cannot be authored at all: the POST is rejected with
+
+```
+tag policy can specify values for one of the following resource sets:
+ does not have any resource hierarchies
+```
+
+which names resources rather than the missing capability, so it reads like a malformed policy. See [Ranger tag storage](../design-notes/ranger-tag-storage-decision.md) for the source-level detail.
+
+## What happens when policy lookup fails
+
+Every failure mode denies rather than falling back to unfiltered data:
+
+| Condition | Behaviour |
+|---|---|
+| Ranger unreachable | Deny all rows. The circuit breaker opens, and enforcement resumes on its own once Ranger returns. |
+| Tag state unknown (the table's metadata is not in cache) | Deny all rows. Unknown is not the same as untagged: a mask might exist that SQE cannot see. |
+| Mask type SQE cannot map, including a `CUSTOM` expression that fails to parse | Restrict the column. It is nullified in place, not dropped, so the query still plans. |
+
+Each of these is pinned by a test in `crates/sqe-coordinator/tests/it/access_control_e2e.rs` against a live Ranger, including one that stops the `ranger-admin` container mid-suite.
+
+## Admin-side edits are honored on a delay
+
+`cache-ttl-secs` bounds an over-permissive window. SQE caches the resolved policy per user and table, so a mask or row filter authored directly in the Ranger console is not applied until that entry expires, up to `cache-ttl-secs` later. A query that ran before the edit keeps its old decision for the rest of the TTL.
+
+Grants issued through SQE (`GRANT`, `REVOKE`) are not affected, since those flush the cache. Lower the TTL if prompt propagation of console-authored edits matters more than fetch load against Ranger Admin. The tag path re-reads the column-to-tag map on every call and has no such window.
+
 ## The in-engine SQL surface
 
 Independent of Ranger, SQE parses a native grant surface (`GRANT ... ROWS WHERE`, `GRANT ... MASKED WITH`, `SHOW EFFECTIVE GRANTS`, `CHECK ACCESS`) that the `in-memory` engine enforces. See [Security & Policy](../architecture/security.md) and [GRANT and REVOKE](../sql-reference/grant-revoke.md).
