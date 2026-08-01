@@ -212,7 +212,7 @@ all five resolve fully. This is the documented MVP behavior.
 ## Tag-based masking
 
 Tag-based masking splits into two independently-stored halves. The decision is
-recorded in `docs/ranger-tag-storage-decision.md`.
+recorded in [Ranger tag storage](./ranger-tag-storage-decision.md).
 
 1. **The mask-per-tag RULE** ("any column tagged `PII` is masked show-last-4")
    lives in Apache Ranger as a `tag`-service policy, returned in the download
@@ -237,6 +237,69 @@ ALTER TABLE sales.orders UNSET TAGS (salary);
 Snowflake's column-tag syntax works too. The tag name becomes the label; SQE has
 no tag values, so the assigned value is ignored. `ALTER COLUMN` is accepted as a
 synonym for `MODIFY COLUMN`.
+
+### Authoring the tag policy: mask types carry a component prefix
+
+A `tag`-service policy must name the mask type in component-qualified form:
+
+```json
+"dataMaskInfo": { "dataMaskType": "hive:MASK_SHOW_LAST_4" }
+```
+
+Ranger's `tag` service definition does not define bare mask names. It aggregates
+the mask types of every component it can decorate, so its `dataMaskDef` lists
+`hive:MASK_SHOW_LAST_4`, `hive:CUSTOM`, `trino:MASK_NULL` and so on. Ranger
+rejects a policy naming a bare type with HTTP 400.
+
+SQE reads a `hive`-type service, so `map_mask` normalizes the `hive:` prefix and
+accepts either form. Another component's prefix is deliberately left unmatched,
+which restricts the tagged column rather than applying a foreign engine's
+policy.
+
+This mattered in practice. Until 2026-07-31 the mapper matched bare names only,
+so every tag mask fell through to the unsupported arm and the tagged column was
+RESTRICTED instead of masked. Fail-closed, so no value ever leaked, but the
+feature was inert from the day it shipped. Nothing caught it because the
+harness of the day asserted the absence of raw digits, and a restricted column
+has no digits either. The regression test is
+`mask_type_component_prefix_is_normalized` plus the live-Ranger case
+`tag_column_mask_applies_from_iceberg_property`.
+
+### Tag row filters need a Ranger Admin property
+
+A `tag`-service policy can carry a row filter as well as a mask (policyType 2 on
+the tag service), so one rule filters every table holding a column with the tag.
+SQE supports it, and Ranger ships the capability switched off:
+
+```xml
+<property>
+  <name>ranger.servicedef.autopropagate.rowfilterdef.to.tag</name>
+  <value>true</value>
+</property>
+```
+
+in `ranger-admin-site.xml`. Ranger copies each component's `dataMaskDef` into the
+tag service definition unconditionally, but copies its `rowFilterDef` only when
+that property is true (`AbstractServiceStore`, default `false`). This is not a
+version limitation and no upgrade changes it.
+
+Without the property the tag service definition carries a populated
+`dataMaskDef` and an empty `rowFilterDef`, and the policy POST is rejected with
+
+```
+tag policy can specify values for one of the following resource sets:
+ does not have any resource hierarchies
+```
+
+The message names resource hierarchies rather than the missing capability, so it
+reads like a malformed resource block. It is not: the resource block is fine and
+the definition simply cannot express a row filter.
+
+One caveat if you patch the definition over REST rather than setting the
+property: Ranger's own aggregate `tag` definition does not round-trip through
+Ranger's validator. It carries a duplicate `ozone:assume_role` access type and
+elasticsearch implied grants naming access types the definition never declares,
+both of which must be pruned before the PUT is accepted.
 
 ```sql
 ALTER TABLE sales.orders MODIFY COLUMN email SET TAG PII = 'true';
@@ -315,7 +378,7 @@ There are three authoring surfaces, one per layer.
 
 - **Coarse catalog layer.** SQL `GRANT` / `REVOKE`. The access-control backend
   writes the `polaris` Ranger service; Polaris enforces. See
-  `docs/ranger-access-control.md`.
+  [Ranger access control](./ranger-access-control.md).
 - **Fine-grained row filters and column masks.** Authored as policies on the
   `hive` Ranger service (row-filter policyType 2, data-mask policyType 1),
   through the Ranger Admin UI or REST. SQE downloads and enforces them. The same
@@ -324,6 +387,26 @@ There are three authoring surfaces, one per layer.
   Snowflake `MODIFY|ALTER COLUMN ... SET TAG` forms work too). The DDL writes the
   `sqe.column-tags` table property. The mask-per-tag rule itself is a `hive`/`tag`
   service policy in Ranger.
+
+### Propagation delay, per surface
+
+The two SQL surfaces take effect immediately: `GRANT`, `REVOKE` and
+`SET TAGS` / `UNSET TAGS` flush the resolved-policy cache after the mutation
+commits, so the next query re-resolves (issue #207).
+
+A policy authored in the Ranger UI or over REST does not, because SQE learns
+about it only on the next download. The resolved-policy cache holds for
+`[policy.ranger] cache-ttl-secs`, which bounds an over-permissive window: a user
+who queried the table before the edit keeps the old decision until their cache
+entry expires. Tightening a mask in the console is therefore eventually
+consistent, up to the TTL.
+
+The tag path is exempt on the association side, since `resolve_tags` re-reads the
+column-to-tag map on every call. The tag RULE still comes from the cached bundle.
+
+Lower `cache-ttl-secs` if prompt propagation of console-authored edits matters
+more than download load against Ranger Admin. The window is pinned at both edges
+by `cache_ttl_bounds_policy_staleness`.
 
 ## Catalog path vs fine-grained path
 
