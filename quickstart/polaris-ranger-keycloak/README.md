@@ -197,6 +197,19 @@ exits non-zero on any failure, so a green run is the pass.
   the four users.
 - **Roles come from Ranger, not the token.** Polaris drops the token's realm
   roles; the working user-to-role mapping is Ranger role membership.
+- **Tag ROW FILTERS need a Ranger Admin property this stack does not set.**
+  Ranger copies a component's `dataMaskDef` into the `tag` servicedef
+  unconditionally, but copies its `rowFilterDef` only when
+  `ranger.servicedef.autopropagate.rowfilterdef.to.tag=true`, which defaults to
+  false. Without it, POSTing a tag row-filter policy fails with "tag policy can
+  specify values for one of the following resource sets: does not have any
+  resource hierarchies". Tag column masks work either way. Nothing here is
+  version-gated: this holds on Ranger 2.8, and upgrading does not change it. The
+  access-control e2e suite patches the capability in over REST at bootstrap, so
+  its tag row-filter case runs against this stack unmodified. For a real
+  deployment, set the property in `ranger-admin-site.xml`: the snippet and the
+  source-level detail are in
+  `docs/site/book/src/design-notes/ranger-tag-storage-decision.md`.
 - **Spark 4.0 is not used.** `kyuubi-spark-authz_2.13` is not on Maven Central,
   so the parity test pins Spark 3.5 (Scala 2.12) + the shaded Kyuubi authz jar.
   See `spark/Dockerfile`.
