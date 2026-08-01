@@ -403,12 +403,34 @@ JSON
   run ok alice "SELECT id, region FROM $T ORDER BY id" \
     "alice (not engineer): region raw, so the tag rule is role-scoped too" 'EU' 'XX'
 
-  echo; bold "=== 5b. Tag fail-closed: a tag with no rule hides the column ==="
+  echo; bold "=== 5b. Tag fail-closed: an UNMAPPABLE rule hides the column ==="
+  dim "Two different things, easy to conflate. A tag with NO rule is inert: nothing"
+  dim "is being enforced, so the column comes back raw. A tag WITH a rule SQE"
+  dim "cannot map is a protection it cannot honour, so the column is restricted."
+  dim "Verified both ways while writing this script."
+  run ok carol "ALTER TABLE $T UNSET TAGS (region)" "clear the GEO tag first"
   run ok carol "ALTER TABLE $T SET TAGS (region = ('NO_RULE_FOR_THIS'))" \
-    "retag region with a tag that has no policy anywhere"
+    "tag region with a tag that has no policy anywhere"
+  run ok carol "SHOW TAGS ON $T" "confirm region carries ONLY the no-rule tag" \
+    'NO_RULE_FOR_THIS' 'GEO'
   run ok bob "SELECT id, region FROM $T ORDER BY id" \
-    "bob: region comes back NULL. Unknown protection denies rather than leaking" \
+    "bob: region is RAW. A tag with no rule enforces nothing" 'EU' 'XX'
+
+  # An unmappable rule: hive:CUSTOM with no valueExpr has nothing to substitute,
+  # so SQE cannot build the mask and must restrict the column instead of
+  # returning it. Same contract as a mask type from another component's prefix.
+  tag_policy acdemo-tag-broken "$(cat <<JSON
+{"service":"$TAG_SERVICE","name":"acdemo-tag-broken","policyType":1,"isEnabled":true,
+ "resources":{"tag":{"values":["NO_RULE_FOR_THIS"]}},
+ "dataMaskPolicyItems":[{"roles":["engineer"],"accesses":[{"type":"hive:select","isAllowed":true}],
+ "dataMaskInfo":{"dataMaskType":"hive:CUSTOM"}}]}
+JSON
+)"
+  run ok bob "SELECT id, region FROM $T ORDER BY id" \
+    "bob: region NULL now. An unmappable rule restricts rather than leaking" \
     'region' 'EU|XX'
+  run ok alice "SELECT id, region FROM $T ORDER BY id" \
+    "alice is unaffected: the broken rule targets engineer only" 'EU' ''
   run ok carol "ALTER TABLE $T UNSET TAGS (region)" "remove the tag again"
 
   echo; bold "═══ 6. Introspection ═══"
