@@ -76,6 +76,9 @@ pub struct GrantStatement {
     /// Ranger's `delegateAdmin`. Without this, only principals seeded with
     /// delegate authority at bootstrap can ever grant.
     pub with_grant_option: bool,
+    /// Whether the named object is a table or a view. Selects the access-type
+    /// set; the resource shape is the same either way.
+    pub object: GrantObjectKind,
 }
 
 /// A parsed REVOKE statement ready for backend dispatch.
@@ -89,6 +92,25 @@ pub struct RevokeStatement {
     /// See `GrantStatement::grantor`. Revoking is also authorized against the
     /// grantor, so a caller can only revoke what it has authority over.
     pub grantor: Option<String>,
+    /// See `GrantStatement::object`.
+    pub object: GrantObjectKind,
+}
+
+/// What kind of object a GRANT names.
+///
+/// Polaris models views with their own access types (`view-properties-read`,
+/// `view-list`, `view-create`, `view-drop`, ...) but with NO separate resource
+/// level: a view is addressed by putting its name in the `table` resource slot.
+/// Verified against a live Polaris 1.6 -- granting `view-properties-read` on
+/// `{catalog, namespace, table: <view name>}` lets the grantee load the view.
+///
+/// So the resource shape is identical to a table's and only the access-type set
+/// differs, which is why this is a separate axis from `ResourceLevel`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GrantObjectKind {
+    #[default]
+    Table,
+    View,
 }
 
 /// Backend-neutral grantee. Each backend maps this to its own model.

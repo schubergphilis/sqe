@@ -223,6 +223,37 @@ gate: the baseline traverse set (`catalog-list`, `catalog-properties-read`,
 `table-properties-read`, so `GRANT SELECT` is what actually lets a member load
 and read a table, and `REVOKE` takes it away.
 
+## Views
+
+`GRANT SELECT ON VIEW cat.ns.v` works, and so do `ON ALL VIEWS IN SCHEMA` and
+`ON FUTURE VIEWS IN SCHEMA`. Two facts shape how, both established against a
+live Polaris 1.6 rather than inferred from the service-def.
+
+**A view has no resource level of its own.** The `polaris` service-def declares
+`root -> catalog -> namespace -> table` and no `view`. A view is addressed by
+putting its NAME in the `table` slot; only the access-type set differs. Granting
+`view-properties-read` + `view-list` on `{catalog, namespace, table: <view>}` is
+what lets a grantee load the view, so that is what `SELECT ON VIEW` emits.
+
+**A view is NOT a privilege boundary.** SQE expands the view's SQL and plans
+against the base tables, so the reader needs its own grant on those tables too.
+Granting only the view produces
+
+```
+Failed to plan view 'v' SQL: table 'cat.ns.orders' not found
+```
+
+which is the base-table denial surfacing through the view. This differs from
+Snowflake secure views and Databricks views, where the definer's privileges
+apply and the reader needs nothing on the base table. There is no definer's-
+rights mode here: a view cannot be used to expose a subset of a table to someone
+who may not read the table. Use a row filter or a column mask for that, which is
+the mechanism SQE does support.
+
+Column masks and row filters DO still apply through a view, because the rewrite
+happens on the expanded scan. A view is therefore safe (it cannot launder a
+masked column) but not sufficient (it cannot stand in for a grant).
+
 ## Who may grant: the caller, checked by Ranger
 
 SQE sends the **authenticated caller** as the Ranger `grantor`, never its own
