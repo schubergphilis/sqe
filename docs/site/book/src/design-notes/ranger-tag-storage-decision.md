@@ -95,3 +95,55 @@ sync is required.
 
 This reuses the entire enforcement path already shipped in Phase 1/2A; Phase 3 is
 the tag SOURCE + the tag-policy resolution, not new enforcement.
+
+## Operating note: tag row filters need a Ranger flag (validated 2026-07-31)
+
+Both halves above work against a live Apache Ranger 2.8, proven end to end by
+`crates/sqe-coordinator/tests/it/access_control_e2e.rs` (`make
+test-access-control`). Two behaviours are worth knowing before you deploy this.
+
+**Tag mask types are component-qualified.** Ranger's `tag` service definition
+does not define bare mask names. It aggregates the mask types of every component
+that can be decorated, so the entries are `hive:MASK_SHOW_LAST_4`,
+`hive:CUSTOM`, `trino:MASK_NULL` and so on. SQE reads a `hive`-type service, so
+it accepts the bare form and the `hive:` form; a mask authored under another
+component's prefix is deliberately left unmatched, which restricts the tagged
+column (fail-closed) rather than applying another engine's policy.
+
+**Tag ROW FILTERS are off by default, and it is not a version limitation.**
+Ranger propagates each component's `dataMaskDef` into the tag service definition
+unconditionally, but propagates `rowFilterDef` only when Ranger Admin runs with
+
+```xml
+<property>
+  <name>ranger.servicedef.autopropagate.rowfilterdef.to.tag</name>
+  <value>true</value>
+</property>
+```
+
+in `ranger-admin-site.xml` (`AbstractServiceStore`, default `false`). Without it
+the tag service definition carries a populated `dataMaskDef` and an empty
+`rowFilterDef: {}`, and Ranger rejects a tag row-filter policy with:
+
+```text
+tag policy can specify values for one of the following resource sets:
+does not have any resource hierarchies
+```
+
+Set the property, restart Ranger Admin, then re-save a component service
+definition so the propagation runs. Tag row filters then behave exactly like
+resource row filters in SQE: `resolve_tag_policies` returns them keyed by tag and
+the rewriter ANDs them above the scan.
+
+The e2e suite cannot assume an operator-configured Ranger, so its fixture patches
+the capability in over the REST API instead
+(`ranger_fixture::ensure_tag_rowfilter_support`). That is a test-environment
+shortcut, reset by a Ranger upgrade or a volume wipe. Production deployments
+should use the property.
+
+One trap if you ever PUT the tag service definition yourself: Ranger's own
+aggregate does not round-trip through Ranger's validator. On 2.8.0 with the stock
+component set it carries a duplicate `ozone:assume_role` access type (duplicate
+itemId 201209) and elasticsearch implied grants naming access types the
+definition never declares, so a verbatim re-submit is rejected. Deduplicate and
+prune those first.
