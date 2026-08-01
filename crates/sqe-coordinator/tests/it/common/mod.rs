@@ -268,12 +268,30 @@ pub async fn setup_ranger_handler(
 pub async fn setup_ranger_handler_with(
     mutate: impl FnOnce(&mut sqe_core::SqeConfig),
 ) -> (sqe_coordinator::QueryHandler, sqe_catalog::TableMetadataCache) {
+    setup_ranger_handler_sharing(None, mutate).await
+}
+
+/// `setup_ranger_handler_with`, optionally reusing an existing
+/// `TableMetadataCache` instead of starting from a cold one.
+///
+/// Pass `Some(cache)` when the second handler must differ from the first in
+/// EXACTLY ONE respect (a config value under test). A cold cache is not a
+/// neutral starting point: `CacheTagSource` reports unknown tag state, the
+/// rewriter fails closed, and the handler needs an indeterminate number of
+/// queries before it reads normally (measured: up to 60s). Sharing the warm
+/// cache keeps catalog metadata out of the experiment.
+#[allow(dead_code)]
+pub async fn setup_ranger_handler_sharing(
+    existing_cache: Option<sqe_catalog::TableMetadataCache>,
+    mutate: impl FnOnce(&mut sqe_core::SqeConfig),
+) -> (sqe_coordinator::QueryHandler, sqe_catalog::TableMetadataCache) {
     init_tracing();
     let mut config = sqe_core::SqeConfig::load(&ranger_config_path())
         .expect("load tests/sqe-ranger-test.toml");
     mutate(&mut config);
     let config = config;
-    let table_cache = sqe_catalog::TableMetadataCache::new(30);
+    let table_cache =
+        existing_cache.unwrap_or_else(|| sqe_catalog::TableMetadataCache::new(30));
     let (enforcer, store) = sqe_coordinator::policy_wiring::build_policy_enforcer(
         &config.policy,
         Some(table_cache.clone()),
