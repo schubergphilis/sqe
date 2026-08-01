@@ -4482,6 +4482,12 @@ impl QueryHandler {
                 .collect()
         }
 
+        let with_grant_option = match stmt {
+            Statement::Grant(g) => g.with_grant_option,
+            // REVOKE has no WITH GRANT OPTION; `REVOKE GRANT OPTION FOR` is a
+            // separate form sqlparser models elsewhere and SQE does not map it.
+            _ => false,
+        };
         let (privileges, objects, grantees) = match stmt {
             Statement::Grant(g) => (&g.privileges, &g.objects, &g.grantees),
             Statement::Revoke(r) => (&r.privileges, &r.objects, &r.grantees),
@@ -4593,6 +4599,10 @@ impl QueryHandler {
             namespace,
             table,
             grantee,
+            // Filled in by the caller from the session: the extractor is a pure
+            // function of the parsed statement and has no identity.
+            grantor: None,
+            with_grant_option,
         })
     }
 
@@ -4610,7 +4620,15 @@ impl QueryHandler {
         // path is unreachable for non-admins.
         self.require_admin(session, "GRANT")?;
         let backend = self.require_grant_backend()?;
-        let grant_stmt = Self::extract_grant_statement(stmt)?;
+        let mut grant_stmt = Self::extract_grant_statement(stmt)?;
+        // Always act as the authenticated caller, never as SQE's service
+        // identity. Ranger authorizes the grant against this name, so a caller
+        // can only grant what it holds delegate authority over, and the Ranger
+        // audit record names the human rather than "admin". The `require_admin`
+        // role gate above stays as defence in depth: it is coarse (role-based),
+        // this is resource-scoped, and the Polaris backend still swaps in a
+        // service token (issue #204) so it has no equivalent check of its own.
+        grant_stmt.grantor = Some(session.user.username.clone());
         backend.grant(session.access_token().expose(), &grant_stmt).await?;
         // Flush the policy cache only after the mutation succeeds so the new
         // grant is visible on the next query (issue #207).
@@ -4635,6 +4653,10 @@ impl QueryHandler {
             namespace: grant_stmt.namespace,
             table: grant_stmt.table,
             grantee: grant_stmt.grantee,
+            // Same reasoning as GRANT: revoking is authorized against the
+            // grantor too, so a caller cannot revoke what it has no authority
+            // over.
+            grantor: Some(session.user.username.clone()),
         };
         backend.revoke(session.access_token().expose(), &revoke_stmt).await?;
         // Flush the policy cache only after the mutation succeeds so the
