@@ -1390,3 +1390,106 @@ async fn unknown_tag_state_denies() {
     let after = exec_ok(&ctx, &ctx.bob, &sql).await;
     assert_eq!(total_rows(&after), 3);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs quickstart/polaris-ranger-keycloak; run scripts/access-control-test.sh"]
+async fn ranger_outage_fails_closed() {
+    ac_gate!();
+    let _guard = crate::common::serial().lock().await;
+    let ctx = ac_setup().await;
+    grant_read_to_both_roles(&ctx).await;
+
+    // A mask makes the outage consequential: while Ranger is reachable bob's ssn
+    // is masked, so if an outage were to drop policy enforcement the raw value
+    // would appear. Fail-closed must deny instead.
+    ctx.ranger
+        .create_policy(hive_mask_policy(
+            &format!("{PREFIX}mask-ssn"),
+            "ssn",
+            serde_json::json!({"dataMaskType": "MASK_SHOW_LAST_4"}),
+        ))
+        .await
+        .expect("create ssn mask");
+
+    let sql = format!("SELECT id, ssn FROM {ORDERS} ORDER BY id");
+
+    // Warm the handler while Ranger is up. This matters: the outage has to be
+    // the ONLY thing that changes. A cold handler denies for an unrelated reason
+    // (unknown tag state), which is what made an earlier version of this test
+    // pass vacuously.
+    let warm = crate::common::eventually("bob's mask to apply before the outage", || async {
+        match ctx.handler.execute(&ctx.bob, &sql, None).await {
+            Ok(b) if col_strings(&b, "ssn").iter().all(|v| v.starts_with("xxx-xx-")) => Ok(b),
+            Ok(b) => Err(format!("mask not applied yet: {:?}", col_strings(&b, "ssn"))),
+            Err(e) => Err(format!("query failed: {e}")),
+        }
+    })
+    .await;
+    assert_eq!(total_rows(&warm), 3);
+
+    {
+        // Guard restarts ranger-admin on drop, including on panic, so a failure
+        // here cannot poison the rest of the suite.
+        let _outage = crate::common::ranger_fixture::RangerOutage::begin()
+            .expect("stop ranger-admin");
+
+        // The resolved-policy cache holds for policy.ranger.cache-ttl-secs (2s in
+        // the test config), so the deny appears once the cache expires and the
+        // next resolve cannot reach Ranger.
+        let denied = crate::common::eventually("the outage to fail closed", || async {
+            match ctx.handler.execute(&ctx.bob, &sql, None).await {
+                Ok(b) if total_rows(&b) == 0 => Ok(b),
+                Ok(b) => Err(format!(
+                    "still returning {} rows: {:?}",
+                    total_rows(&b),
+                    col_strings(&b, "ssn")
+                )),
+                // A hard error is equally fail-closed.
+                Err(_) => Ok(Vec::new()),
+            }
+        })
+        .await;
+
+        for b in &denied {
+            for idx in 0..b.num_columns() {
+                let arr = b.column(idx);
+                for row in 0..b.num_rows() {
+                    let v = crate::common::fmt_val(arr.as_ref(), row);
+                    assert!(
+                        !v.contains("111-11-1111"),
+                        "raw ssn leaked while Ranger was down: {v}"
+                    );
+                }
+            }
+        }
+    } // guard drops here: ranger-admin restarts
+
+    // Recovery: once Ranger is back the same handler serves masked rows again,
+    // which proves the deny was the outage and not a permanent breaker latch.
+    // Ranger's restart is slower than the default budget allows.
+    let recovered = crate::common::eventually_within(
+        std::time::Duration::from_secs(300),
+        "ranger to recover and masking to resume",
+        || async {
+            match ctx.handler.execute(&ctx.bob, &sql, None).await {
+                Ok(b)
+                    if total_rows(&b) == 3
+                        && col_strings(&b, "ssn").iter().all(|v| v.starts_with("xxx-xx-")) =>
+                {
+                    Ok(b)
+                }
+                Ok(b) => Err(format!(
+                    "{} rows, ssn {:?}",
+                    total_rows(&b),
+                    col_strings(&b, "ssn")
+                )),
+                Err(e) => Err(format!("query failed: {e}")),
+            }
+        },
+    )
+    .await;
+    assert_eq!(
+        col_strings(&recovered, "ssn"),
+        vec!["xxx-xx-1111", "xxx-xx-2222", "xxx-xx-3333"]
+    );
+}
