@@ -35,8 +35,8 @@ The `polaris` service-def resource hierarchy is
 | Namespace | `GRANT USAGE ON SCHEMA cat.ns TO ROLE r` | Yes | No |
 | Namespace create | `GRANT CREATE TABLE ON SCHEMA cat.ns` | Yes | No |
 | Catalog | `GRANT CREATE SCHEMA ON cat` | Yes | No |
-| All tables in schema | `GRANT SELECT ON ALL TABLES IN SCHEMA cat.ns` | Yes, as a table wildcard | Unit-tested |
-| Future tables in schema | `GRANT SELECT ON FUTURE TABLES IN SCHEMA cat.ns` | Yes, same policy as ALL | Unit-tested |
+| All tables in schema | `GRANT SELECT ON ALL TABLES IN SCHEMA cat.ns` | Yes, as a table wildcard | Yes, including a table created after the grant |
+| Future tables in schema | `GRANT SELECT ON FUTURE TABLES IN SCHEMA cat.ns` | Yes, same policy as ALL | Unit-tested (shape); the ALL case proves the behaviour |
 | Deny precedence | Ranger deny item overrides an allow | Yes | Yes |
 | Revoke | `REVOKE SELECT ON cat.ns.tbl FROM ROLE r` | Yes | Yes |
 | Introspection | `SHOW GRANTS`, `CHECK ACCESS` | Yes | Yes |
@@ -85,12 +85,12 @@ The full Ranger `hive` built-in vocabulary is implemented.
 |---|---|---|
 | `MASK_NULL` | typed NULL, row count unchanged | Yes |
 | `MASK_SHOW_LAST_4` | `111-11-1111` becomes `xxx-xx-1111` | Yes |
-| `MASK_SHOW_FIRST_4` | first 4 kept, rest `x` | Unit-tested |
-| `MASK` | `X` / `x` / `n` per char class, punctuation kept | Unit-tested |
+| `MASK_SHOW_FIRST_4` | `111-11-1111` becomes `111-xx-xxxx` | Yes |
+| `MASK` | `X` / `x` / `n` per char class, punctuation kept. `EU` becomes `XX` | Yes |
 | `MASK_HASH` | HMAC-SHA256 hex, keyed by `policy.mask_key` | Yes, against an out-of-band digest |
-| `MASK_DATE_SHOW_YEAR` | date truncated to year | Unit-tested |
-| `CUSTOM` | arbitrary SQL with `{col}` | Unit-tested; used in the Spark parity run |
-| `MASK_NONE` | explicit exemption | Unit-tested |
+| `MASK_DATE_SHOW_YEAR` | `2021-05-04` becomes `2021-01-01` | Yes |
+| `CUSTOM` | arbitrary SQL with `{col}` | Yes |
+| `MASK_NONE` | explicit exemption | Unit-tested. It depends on Ranger policy EVALUATION ORDER, which is a property of the policy set rather than one policy, so an e2e case needs explicit priorities |
 
 The hash case is asserted against a digest computed outside the engine
 (`openssl dgst -sha256 -hmac`), so the implementation is not checking itself. A
@@ -105,7 +105,7 @@ mask key reached the UDF.
 | Column restriction | column nullified in place, stays in the schema so `SELECT col` still plans | Yes |
 | Tag column mask | mask applies to every column carrying the tag, association from the Iceberg `sqe.column-tags` property | Yes |
 | Tag row filter | one rule filters every table holding a tagged column | Yes, with the Ranger property below |
-| Precedence | restriction beats mask; resource mask beats tag mask; row filters AND together | Unit-tested |
+| Precedence | restriction beats mask; resource mask beats tag mask; row filters AND together | Resource-beats-tag proven live; the rest unit-tested |
 | Role-conditional masking | `current_user()`, `current_role()`, `is_role_in_session()` const-folded per session | Unit-tested |
 | Masks block predicate pushdown | `WHERE ssn = '...'` evaluates the masked value, never the raw one | Unit-tested |
 
@@ -136,7 +136,16 @@ tag service definition never defines bare names.
 |---|---|---|
 | Ranger unreachable | deny all rows; enforcement resumes after recovery | Yes, by stopping the container mid-test |
 | Tag state unknown | deny all rows. Unknown is not "untagged" | Yes |
-| Unmappable mask type | column restricted, never returned raw | Yes |
+| Unmappable mask type, resource or tag | column restricted, never returned raw | Yes |
+| Tag carrying NO rule | **inert**: the column is returned raw | Yes |
+
+The last two rows are easy to conflate and they behave differently, so it is
+worth being explicit. A tag with no policy anywhere is not a protection, so
+there is nothing to fail closed about and the column reads normally. A tag whose
+policy names a mask SQE cannot build (a `CUSTOM` with no expression, or another
+component's prefix such as `trino:MASK_NULL`) IS a protection SQE cannot honour,
+so the column is restricted. Tagging a column does not protect it by itself;
+the rule in Ranger is what protects it.
 | Unparseable row filter | becomes `lit(false)`, deny all | Unit-tested |
 | Table not mappable to a policy key | deny all rows | Unit-tested |
 
@@ -152,11 +161,11 @@ flush the cache on commit. The window is asserted at both edges by
 | Gap | Detail |
 |---|---|
 | View-level grants | No `view` resource level and no privilege mapping. See above. |
-| Ranger glob patterns | Only exact match and bare `*` are matched. `orders*` is not. |
-| Namespace flattening | Only the LAST dotted component becomes the Ranger `database`, so `a.b.sales` and `sales` collide. |
+| Ranger glob patterns | Only exact match and bare `*` are matched. `orders*` is not, and a policy written that way silently never fires. Pinned by `ranger_glob_patterns_are_not_matched`. |
+| Namespace flattening | `resolve_policy_key` passes only the LAST dotted component as the Ranger `database`, so `a.b.sales` and `sales` collide. Pinned by `resolve_policy_key_multilevel_takes_last_namespace_component`. |
 | Tag parity with Spark | Spark reads tag associations from the Ranger or Atlas tag store, not from Iceberg properties. Masks are shared; associations are not. |
 | ALL vs FUTURE tables | Ranger has no future-only resource, so both collapse to one wildcard policy. Snowflake distinguishes them. |
-| `opa` and `cedar` engines | Defined in config, not wired. Selecting them errors. |
+| `opa` and `cedar` engines | Defined in config, not wired. Selecting one errors rather than degrading to passthrough, pinned by `unwired_policy_engines_fail_loudly_rather_than_degrade`. |
 | Tag propagation | A column derived from a tagged column in a CTAS starts untagged. |
 
 ## Where to go next
