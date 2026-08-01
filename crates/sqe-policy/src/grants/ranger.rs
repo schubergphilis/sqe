@@ -109,7 +109,18 @@ pub fn map_sql_to_ranger_access_for(
     }
     match sql_priv.to_uppercase().as_str() {
         "SELECT" => (to_vec(READ_ACCESS), ResourceLevel::Table),
-        "INSERT" => (to_vec(WRITE_ACCESS), ResourceLevel::Table),
+        // Every data mutation resolves to the same Polaris access-type set.
+        // UPDATE and DELETE in SQE are copy-on-write or merge-on-read: both load
+        // the table, write new data files and commit a snapshot, which is
+        // exactly what INSERT does, so there is no narrower set to give them.
+        // MODIFY is the Databricks spelling and covers INSERT/UPDATE/DELETE.
+        //
+        // Before this, these fell through to the pass-through arm and were sent
+        // as a literal access type ("update"), which the servicedef does not
+        // declare, so Ranger answered a bare HTTP 400.
+        "INSERT" | "UPDATE" | "DELETE" | "MODIFY" => {
+            (to_vec(WRITE_ACCESS), ResourceLevel::Table)
+        }
         "DROP" => (to_vec(&["table-drop"]), ResourceLevel::Table),
         "CREATE TABLE" => (to_vec(&["table-create"]), ResourceLevel::Namespace),
         "USAGE" => (
@@ -121,9 +132,30 @@ pub fn map_sql_to_ranger_access_for(
         "ALL" | "ALL PRIVILEGES" => {
             (to_vec(&["catalog-content-manage"]), ResourceLevel::Catalog)
         }
+        // Deliberate escape hatch: an unrecognised privilege is passed through
+        // lowercased so an operator can name a Polaris access type directly
+        // (e.g. `GRANT "table-snapshot-add" ON ...`). Ranger rejects anything the
+        // servicedef does not declare, and `post_grant_revoke` turns that 400
+        // into a message naming the privilege.
         other => (vec![other.to_lowercase()], ResourceLevel::Table),
     }
 }
+
+/// Privileges with an explicit mapping, for error messages.
+pub const MAPPED_PRIVILEGES: &[&str] = &[
+    "SELECT",
+    "INSERT",
+    "UPDATE",
+    "DELETE",
+    "MODIFY",
+    "DROP",
+    "CREATE TABLE",
+    "CREATE VIEW",
+    "CREATE SCHEMA",
+    "DROP SCHEMA",
+    "USAGE",
+    "ALL PRIVILEGES",
+];
 
 /// The Ranger `GrantRevokeRequest` payload. Field renames match Ranger's
 /// `org.apache.ranger.plugin.model.RangerPolicy.GrantRevokeRequest` JSON.
@@ -174,6 +206,44 @@ pub fn build_resource_map(
         }
     }
     m
+}
+
+/// Do two deny items name the same grantee with the same access types?
+///
+/// Ranger returns a stored policy item with every optional field populated, so
+/// the item SQE builds is never byte-equal to the one Ranger echoes back. Only
+/// the grantee lists and the access-type set carry meaning for deduplication.
+fn deny_items_equivalent(a: &serde_json::Value, b: &serde_json::Value) -> bool {
+    fn names(v: &serde_json::Value, key: &str) -> Vec<String> {
+        let mut out: Vec<String> = v
+            .get(key)
+            .and_then(serde_json::Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|x| x.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        out.sort();
+        out
+    }
+    fn accesses(v: &serde_json::Value) -> Vec<String> {
+        let mut out: Vec<String> = v
+            .get("accesses")
+            .and_then(serde_json::Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|x| x.get("type").and_then(|t| t.as_str()).map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        out.sort();
+        out
+    }
+    names(a, "users") == names(b, "users")
+        && names(a, "roles") == names(b, "roles")
+        && names(a, "groups") == names(b, "groups")
+        && accesses(a) == accesses(b)
 }
 
 /// Reject identifier values that could inject into the Ranger resource map.
@@ -313,7 +383,116 @@ impl RangerGrantBackend {
     }
 
     /// POST a GrantRevokeRequest to the grant or revoke endpoint.
-    async fn post_grant_revoke(&self, op: &str, body: &GrantRevokeRequest) -> sqe_core::Result<()> {
+    /// The policy whose resource map matches `want` EXACTLY, or `None`.
+    ///
+    /// Ranger permits only ONE policy per exact resource per service: creating a
+    /// second is rejected with "Another policy already exists for matching
+    /// resource". So a deny cannot live in a policy of its own and has to be
+    /// merged into whichever policy already covers the resource. Discovered by
+    /// trying the cleaner design first.
+    ///
+    /// Compared in Rust over the service's policy list rather than with Ranger's
+    /// `resource:` query parameters, because those match by prefix and
+    /// containment; an exact comparison is what the uniqueness rule actually is.
+    async fn policy_by_resource(
+        &self,
+        want: &BTreeMap<String, String>,
+    ) -> sqe_core::Result<Option<serde_json::Value>> {
+        let url = format!(
+            "{}/service/public/v2/api/policy?serviceName={}",
+            self.admin_url, self.service_name
+        );
+        let resp = self
+            .client
+            .get(&url)
+            .basic_auth(&self.admin_user, Some(&self.admin_password))
+            .send()
+            .await
+            .map_err(|e| {
+                sqe_core::SqeError::Execution(format!("Ranger policy list failed: {e}"))
+            })?;
+        if !resp.status().is_success() {
+            return Err(sqe_core::SqeError::Execution(format!(
+                "Ranger policy list failed (HTTP {})",
+                resp.status()
+            )));
+        }
+        let policies: Vec<serde_json::Value> = resp.json().await.map_err(|e| {
+            sqe_core::SqeError::Execution(format!("Ranger policy list parse failed: {e}"))
+        })?;
+        Ok(policies.into_iter().find(|p| {
+            let Some(res) = p.get("resources").and_then(serde_json::Value::as_object) else {
+                return false;
+            };
+            if res.len() != want.len() {
+                return false;
+            }
+            want.iter().all(|(k, v)| {
+                res.get(k)
+                    .and_then(|e| e.get("values"))
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|vals| vals.len() == 1 && vals[0] == serde_json::json!(v))
+            })
+        }))
+    }
+
+    async fn post_policy(&self, body: &serde_json::Value) -> sqe_core::Result<()> {
+        let url = format!("{}/service/public/v2/api/policy", self.admin_url);
+        self.send_policy(self.client.post(&url), body, "create").await
+    }
+
+    async fn put_policy(&self, id: i64, body: &serde_json::Value) -> sqe_core::Result<()> {
+        let url = format!("{}/service/public/v2/api/policy/{id}", self.admin_url);
+        self.send_policy(self.client.put(&url), body, "update").await
+    }
+
+    async fn send_policy(
+        &self,
+        req: reqwest::RequestBuilder,
+        body: &serde_json::Value,
+        what: &str,
+    ) -> sqe_core::Result<()> {
+        let resp = req
+            .basic_auth(&self.admin_user, Some(&self.admin_password))
+            // State-changing Ranger REST calls need the CSRF header.
+            .header("X-XSRF-HEADER", "x")
+            .json(body)
+            .send()
+            .await
+            .map_err(|e| {
+                sqe_core::SqeError::Execution(format!("Ranger policy {what} failed: {e}"))
+            })?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            warn!(http_status = %status, ranger_body = %text, "Ranger policy {what} failed");
+            return Err(sqe_core::SqeError::Execution(format!(
+                "Ranger policy {what} failed (HTTP {status}){}",
+                if text.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!(". Ranger said: {}", text.trim())
+                }
+            )));
+        }
+        Ok(())
+    }
+
+    async fn post_grant_revoke_with_privilege(
+        &self,
+        op: &str,
+        privilege: &str,
+        body: &GrantRevokeRequest,
+    ) -> sqe_core::Result<()> {
+        self.post_grant_revoke_inner(op, Some(privilege), body).await
+    }
+
+    async fn post_grant_revoke_inner(
+        &self,
+        op: &str,
+        privilege: Option<&str>,
+        body: &GrantRevokeRequest,
+    ) -> sqe_core::Result<()> {
         let url = format!(
             "{}/service/plugins/services/{op}/{}",
             self.admin_url, self.service_name
@@ -331,8 +510,34 @@ impl RangerGrantBackend {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
             warn!(http_status = %status, ranger_body = %text, op, "Ranger {op} failed");
+            // A bare "HTTP 400" tells the caller nothing. The overwhelmingly
+            // common cause is a privilege with no mapping, which is sent through
+            // as a literal access type the servicedef does not declare, so name
+            // it and list what IS mapped.
+            let hint = match (status.as_u16(), privilege) {
+                (400, Some(p)) if !MAPPED_PRIVILEGES.contains(&p.to_uppercase().as_str()) => {
+                    format!(
+                        ". Privilege '{p}' has no mapping and was sent to Ranger as the \
+                         access type '{}', which the service definition does not declare. \
+                         Mapped privileges: {}. A native Polaris access type may also be \
+                         named directly.",
+                        p.to_lowercase(),
+                        MAPPED_PRIVILEGES.join(", ")
+                    )
+                }
+                // Ranger answers 403 when the GRANTOR lacks delegate admin on the
+                // resource, which reads as a permissions bug unless it is named.
+                (403, _) => format!(
+                    ". The grantor '{}' needs delegate admin on this resource in Ranger \
+                     (grant it WITH GRANT OPTION, or add a Ranger policy). Ranger said: {}",
+                    body.grantor,
+                    text.trim()
+                ),
+                _ if !text.trim().is_empty() => format!(". Ranger said: {}", text.trim()),
+                _ => String::new(),
+            };
             return Err(sqe_core::SqeError::Execution(format!(
-                "Ranger {op} failed (HTTP {status})"
+                "Ranger {op} failed (HTTP {status}){hint}"
             )));
         }
         debug!(op, service = %self.service_name, "Ranger {op} completed");
@@ -535,7 +740,7 @@ impl GrantBackend for RangerGrantBackend {
             body.grantor = g.to_string();
         }
         body.delegate_admin = stmt.with_grant_option;
-        self.post_grant_revoke("grant", &body).await
+        self.post_grant_revoke_with_privilege("grant", &stmt.privilege, &body).await
     }
 
     async fn revoke(&self, _token: &str, stmt: &RevokeStatement) -> sqe_core::Result<()> {
@@ -551,7 +756,125 @@ impl GrantBackend for RangerGrantBackend {
             validate_identifier(g, "grantor")?;
             body.grantor = g.to_string();
         }
-        self.post_grant_revoke("revoke", &body).await
+        self.post_grant_revoke_with_privilege("revoke", &stmt.privilege, &body).await
+    }
+
+    /// DENY goes through the POLICY api, not grant/revoke.
+    ///
+    /// Ranger's `/services/grant` endpoint writes allow items only; there is no
+    /// field on `GrantRevokeRequest` for a deny. Deny lives as
+    /// `denyPolicyItems` on a policy, so this finds or creates one policy per
+    /// resource, named deterministically, and merges the deny item into it.
+    ///
+    /// One policy per resource, rather than appending to whatever policy already
+    /// covers the resource: touching an operator's hand-written policy to add a
+    /// deny would be a surprising side effect, and a deterministic name keeps the
+    /// statement idempotent.
+    ///
+    /// CAVEAT, deliberate and documented: the policy API authorizes the
+    /// authenticated REST user, not a `grantor` field, so unlike GRANT this is
+    /// NOT resource-scoped to the caller. The `[auth] admin_roles` gate is the
+    /// only check. Ranger offers no grantor-scoped deny.
+    async fn deny(&self, _token: &str, stmt: &GrantStatement) -> sqe_core::Result<()> {
+        let (access_types, level) =
+            map_sql_to_ranger_access_for(stmt.object, &stmt.privilege);
+        let catalog = stmt.catalog.as_deref().ok_or_else(|| {
+            sqe_core::SqeError::Execution(
+                "Ranger DENY requires a catalog (use catalog.namespace.table)".into(),
+            )
+        })?;
+        validate_identifier(catalog, "catalog")?;
+        if let Some(ns) = stmt.namespace.as_deref() {
+            validate_identifier(ns, "namespace")?;
+        }
+        if let Some(t) = stmt.table.as_deref() {
+            validate_identifier(t, "table")?;
+        }
+        validate_identifier(stmt.grantee.name(), "grantee")?;
+
+        let resource = build_resource_map(
+            &self.realm,
+            catalog,
+            stmt.namespace.as_deref(),
+            stmt.table.as_deref(),
+            level,
+        );
+        // Deterministic, resource-derived name so a repeated DENY updates the
+        // same policy instead of piling up duplicates.
+        let name = format!(
+            "sqe-deny-{}",
+            resource
+                .iter()
+                .filter(|(k, _)| k.as_str() != "root")
+                .map(|(_, v)| v.as_str())
+                .collect::<Vec<_>>()
+                .join("-")
+        );
+
+        let accesses: Vec<serde_json::Value> = access_types
+            .iter()
+            .map(|t| serde_json::json!({"type": t, "isAllowed": true}))
+            .collect();
+        let mut item = serde_json::Map::new();
+        match &stmt.grantee {
+            Grantee::User(n) => {
+                item.insert("users".into(), serde_json::json!([n]));
+            }
+            Grantee::Role(n) => {
+                item.insert("roles".into(), serde_json::json!([n]));
+            }
+            Grantee::Group(n) => {
+                item.insert("groups".into(), serde_json::json!([n]));
+            }
+        }
+        item.insert("accesses".into(), serde_json::Value::Array(accesses));
+        let deny_item = serde_json::Value::Object(item);
+
+        let existing = self.policy_by_resource(&resource).await?;
+        match existing {
+            Some(mut policy) => {
+                let items = policy
+                    .get_mut("denyPolicyItems")
+                    .and_then(|v| v.as_array_mut());
+                match items {
+                    Some(arr) => {
+                        // Compare SEMANTICALLY, not by JSON equality. Ranger
+                        // normalises a stored item (it fills in `users: []`,
+                        // `groups: []`, `conditions: []`, `delegateAdmin`), so a
+                        // freshly built item never equals the stored form and an
+                        // exact comparison appended a duplicate on every rerun.
+                        if !arr.iter().any(|e| deny_items_equivalent(e, &deny_item)) {
+                            arr.push(deny_item);
+                        }
+                    }
+                    None => {
+                        policy["denyPolicyItems"] = serde_json::json!([deny_item]);
+                    }
+                }
+                let id = policy
+                    .get("id")
+                    .and_then(serde_json::Value::as_i64)
+                    .ok_or_else(|| {
+                        sqe_core::SqeError::Execution("Ranger policy has no id".into())
+                    })?;
+                self.put_policy(id, &policy).await
+            }
+            None => {
+                let body = serde_json::json!({
+                    "service": self.service_name,
+                    "name": name,
+                    "policyType": 0,
+                    "isEnabled": true,
+                    "resources": resource
+                        .iter()
+                        .map(|(k, v)| (k.clone(), serde_json::json!({"values": [v]})))
+                        .collect::<serde_json::Map<_, _>>(),
+                    "policyItems": [],
+                    "denyPolicyItems": [deny_item],
+                });
+                self.post_policy(&body).await
+            }
+        }
     }
 
     async fn show_grants(
@@ -818,6 +1141,50 @@ mod tests {
     /// `view-list` on `{catalog, namespace, table: <view name>}` is what lets a
     /// grantee load the view. There is no `view` resource level in the
     /// servicedef, so the shape is a table's and only the access types differ.
+    /// Deny items must dedupe semantically, or a repeated DENY grows the policy
+    /// without bound. Ranger echoes a stored item with every optional field
+    /// filled in, so byte equality never holds. Observed: two identical deny
+    /// items after running the same DENY twice.
+    #[test]
+    fn deny_items_dedupe_ignoring_ranger_normalisation() {
+        let fresh = serde_json::json!({
+            "roles": ["analyst"],
+            "accesses": [
+                {"type": "table-data-read", "isAllowed": true},
+                {"type": "table-list", "isAllowed": true}
+            ]
+        });
+        // The same item as Ranger stores it.
+        let stored = serde_json::json!({
+            "users": [],
+            "groups": [],
+            "roles": ["analyst"],
+            "conditions": [],
+            "delegateAdmin": false,
+            "accesses": [
+                {"type": "table-list", "isAllowed": true},
+                {"type": "table-data-read", "isAllowed": true}
+            ]
+        });
+        assert_ne!(fresh, stored, "byte equality must not hold, else the test is moot");
+        assert!(
+            deny_items_equivalent(&fresh, &stored),
+            "normalisation and access-type order must not defeat dedup"
+        );
+
+        let other_role = serde_json::json!({
+            "roles": ["engineer"],
+            "accesses": [{"type": "table-data-read", "isAllowed": true}]
+        });
+        assert!(!deny_items_equivalent(&fresh, &other_role), "a different grantee is a different item");
+
+        let fewer = serde_json::json!({
+            "roles": ["analyst"],
+            "accesses": [{"type": "table-data-read", "isAllowed": true}]
+        });
+        assert!(!deny_items_equivalent(&fresh, &fewer), "a different access set is a different item");
+    }
+
     #[test]
     fn view_grant_uses_view_access_types_on_the_table_slot() {
         let b = test_backend();

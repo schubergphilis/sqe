@@ -24,6 +24,22 @@ pub trait GrantBackend: Send + Sync {
     /// Remove a privilege grant.
     async fn revoke(&self, token: &str, stmt: &RevokeStatement) -> sqe_core::Result<()>;
 
+    /// Write an explicit DENY.
+    ///
+    /// Separate from `grant` because the backends express it differently: Ranger
+    /// carries deny as `denyPolicyItems` on a policy, which its grant/revoke
+    /// endpoint cannot write at all, so this goes through the policy API.
+    ///
+    /// Defaults to unsupported so a backend without a deny concept says so
+    /// instead of silently doing nothing, which for a deny would be the
+    /// dangerous direction: the caller would believe access was blocked.
+    async fn deny(&self, _token: &str, _stmt: &GrantStatement) -> sqe_core::Result<()> {
+        Err(sqe_core::SqeError::NotImplemented(format!(
+            "DENY is not supported by the {} access-control backend",
+            self.backend_name()
+        )))
+    }
+
     /// List grants matching a filter (by resource or by grantee).
     async fn show_grants(
         &self,

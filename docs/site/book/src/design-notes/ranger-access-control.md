@@ -254,6 +254,39 @@ Column masks and row filters DO still apply through a view, because the rewrite
 happens on the expanded scan. A view is therefore safe (it cannot launder a
 masked column) but not sufficient (it cannot stand in for a grant).
 
+## DENY
+
+`DENY <privilege> ON <object> TO <grantee>` writes an explicit denial, which
+Ranger evaluates ahead of any allow.
+
+It does NOT go through the grant endpoint. `/services/grant` writes allow items
+only and has no field for a denial, so DENY uses the policy API and merges a
+`denyPolicyItems` entry into the policy covering the resource.
+
+**It merges into an existing policy rather than creating its own, because Ranger
+forbids the alternative.** Only one policy may exist per exact resource per
+service; a second is rejected with
+
+```
+Validation failure: error code[3010], reason[Another policy already exists for
+matching resource: policy-name=[...], service=[polaris]]
+```
+
+So a dedicated deny policy is impossible, and the deny lands on whichever policy
+already covers that resource. Repeating the statement is idempotent: items are
+deduplicated on grantee plus access-type set, not on JSON equality, because
+Ranger echoes a stored item with every optional field populated (`users: []`,
+`conditions: []`, `delegateAdmin`) and a byte comparison appended a duplicate
+every time.
+
+Two asymmetries with GRANT, both deliberate:
+
+- **Not scoped to the caller's delegate authority.** The policy API authorizes
+  the authenticated REST user and takes no `grantor`, so `[auth] admin_roles` is
+  the only check. Ranger offers no grantor-scoped deny.
+- **No `UNDENY`.** Removing a denial means editing the policy in Ranger. `REVOKE`
+  removes an allow; it does not touch deny items.
+
 ## Who may grant: the caller, checked by Ranger
 
 SQE sends the **authenticated caller** as the Ranger `grantor`, never its own
