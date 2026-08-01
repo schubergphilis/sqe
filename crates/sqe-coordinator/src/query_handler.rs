@@ -4500,8 +4500,24 @@ impl QueryHandler {
 
         let privilege = format!("{privileges}");
 
+        // Views use the SAME resource shape as tables (the view name goes in the
+        // `table` slot); only the access-type set differs. Verified against a
+        // live Polaris 1.6: `view-properties-read` + `view-list` on
+        // `{catalog, namespace, table: <view>}` lets the grantee load the view.
+        let object = match objects {
+            Some(
+                sqlparser::ast::GrantObjects::Views(_)
+                | sqlparser::ast::GrantObjects::AllViewsInSchema { .. }
+                | sqlparser::ast::GrantObjects::FutureViewsInSchema { .. },
+            ) => sqe_policy::grants::GrantObjectKind::View,
+            _ => sqe_policy::grants::GrantObjectKind::Table,
+        };
+
         let (catalog, namespace, table) = match objects {
-            Some(sqlparser::ast::GrantObjects::Tables(tables)) if !tables.is_empty() => {
+            Some(
+                sqlparser::ast::GrantObjects::Tables(tables)
+                | sqlparser::ast::GrantObjects::Views(tables),
+            ) if !tables.is_empty() => {
                 let name = &tables[0];
                 let parts: Vec<String> = object_name_parts(name);
                 match parts.len() {
@@ -4514,6 +4530,13 @@ impl QueryHandler {
                     ),
                     _ => (None, None, Some(name.to_string())),
                 }
+            }
+            // `ON DATABASE cat` is a CATALOG-level resource. Without this arm it
+            // fell through to (None, None, None) and errored with "requires a
+            // catalog" despite naming one.
+            Some(sqlparser::ast::GrantObjects::Databases(dbs)) if !dbs.is_empty() => {
+                let parts: Vec<String> = object_name_parts(&dbs[0]);
+                (parts.first().cloned(), None, None)
             }
             Some(sqlparser::ast::GrantObjects::Schemas(schemas)) if !schemas.is_empty() => {
                 let name = &schemas[0];
@@ -4547,7 +4570,9 @@ impl QueryHandler {
             // it, and the docs say so.
             Some(
                 sqlparser::ast::GrantObjects::AllTablesInSchema { schemas }
-                | sqlparser::ast::GrantObjects::FutureTablesInSchema { schemas },
+                | sqlparser::ast::GrantObjects::FutureTablesInSchema { schemas }
+                | sqlparser::ast::GrantObjects::AllViewsInSchema { schemas }
+                | sqlparser::ast::GrantObjects::FutureViewsInSchema { schemas },
             ) if !schemas.is_empty() => {
                 let name = &schemas[0];
                 let parts: Vec<String> = object_name_parts(name);
@@ -4603,6 +4628,7 @@ impl QueryHandler {
             // function of the parsed statement and has no identity.
             grantor: None,
             with_grant_option,
+            object,
         })
     }
 
@@ -4657,6 +4683,7 @@ impl QueryHandler {
             // grantor too, so a caller cannot revoke what it has no authority
             // over.
             grantor: Some(session.user.username.clone()),
+            object: grant_stmt.object,
         };
         backend.revoke(session.access_token().expose(), &revoke_stmt).await?;
         // Flush the policy cache only after the mutation succeeds so the
@@ -7324,6 +7351,59 @@ mod tests {
     }
 
     // ── extract_grant_statement tests ──────────────────────────────────
+
+    /// `ON VIEW` and `ON DATABASE` used to fall through to (None, None, None) and
+    /// fail with "Ranger GRANT requires a catalog" despite naming a qualified
+    /// object. Both now resolve, and a view is tagged so the backend emits view
+    /// access types against the table resource slot.
+    #[test]
+    fn extract_grant_statement_view_and_database_objects() {
+        use sqlparser::dialect::GenericDialect;
+        use sqlparser::parser::Parser;
+
+        let stmts = Parser::parse_sql(
+            &GenericDialect {},
+            "GRANT SELECT ON VIEW my_catalog.my_schema.my_view TO alice",
+        )
+        .unwrap();
+        let v = QueryHandler::extract_grant_statement(&stmts[0]).unwrap();
+        assert_eq!(v.catalog.as_deref(), Some("my_catalog"));
+        assert_eq!(v.namespace.as_deref(), Some("my_schema"));
+        assert_eq!(v.table.as_deref(), Some("my_view"));
+        assert_eq!(v.object, sqe_policy::grants::GrantObjectKind::View);
+
+        // ALL VIEWS IN SCHEMA gets the same table wildcard as ALL TABLES, and
+        // stays tagged as a view.
+        let stmts = Parser::parse_sql(
+            &GenericDialect {},
+            "GRANT SELECT ON ALL VIEWS IN SCHEMA my_catalog.my_schema TO alice",
+        )
+        .unwrap();
+        let av = QueryHandler::extract_grant_statement(&stmts[0]).unwrap();
+        assert_eq!(av.table.as_deref(), Some("*"));
+        assert_eq!(av.object, sqe_policy::grants::GrantObjectKind::View);
+
+        // ON DATABASE is a catalog-level resource: catalog only, no namespace.
+        let stmts = Parser::parse_sql(
+            &GenericDialect {},
+            "GRANT USAGE ON DATABASE my_catalog TO alice",
+        )
+        .unwrap();
+        let d = QueryHandler::extract_grant_statement(&stmts[0]).unwrap();
+        assert_eq!(d.catalog.as_deref(), Some("my_catalog"));
+        assert_eq!(d.namespace, None);
+        assert_eq!(d.table, None);
+        assert_eq!(d.object, sqe_policy::grants::GrantObjectKind::Table);
+
+        // A plain table is unchanged and still tagged as a table.
+        let stmts = Parser::parse_sql(
+            &GenericDialect {},
+            "GRANT SELECT ON my_catalog.my_schema.t TO alice",
+        )
+        .unwrap();
+        let t = QueryHandler::extract_grant_statement(&stmts[0]).unwrap();
+        assert_eq!(t.object, sqe_policy::grants::GrantObjectKind::Table);
+    }
 
     #[test]
     fn extract_grant_statement_basic_table() {

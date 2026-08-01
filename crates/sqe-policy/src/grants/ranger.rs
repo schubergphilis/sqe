@@ -14,8 +14,8 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
 use super::{
-    AccessCheck, AccessCheckResult, GrantBackend, GrantEntry, GrantFilter, GrantStatement,
-    Grantee, RevokeStatement,
+    AccessCheck, AccessCheckResult, GrantBackend, GrantEntry, GrantFilter, GrantObjectKind,
+    GrantStatement, Grantee, RevokeStatement,
 };
 
 /// Which resource levels a privilege applies to. Determines which keys go into
@@ -61,6 +61,17 @@ const WRITE_ACCESS: &[&str] = &[
     "table-list",
 ];
 
+/// Reading a VIEW through SQE loads the view metadata and then plans its SQL.
+/// Polaris checks `view-properties-read` for the load and `view-list` for
+/// discovery. Verified live: these on `{catalog, namespace, table: <view>}` are
+/// what let a grantee load the view.
+///
+/// NOTE: this does NOT confer access to the view's base tables. SQE expands the
+/// view SQL and plans against the underlying tables, so the reader needs its own
+/// grant there. A view is therefore not a privilege boundary the way a Snowflake
+/// secure view is; see design-notes/ranger-access-control.md.
+const VIEW_READ_ACCESS: &[&str] = &["view-properties-read", "view-list"];
+
 fn to_vec(xs: &[&str]) -> Vec<String> {
     xs.iter().map(|s| s.to_string()).collect()
 }
@@ -71,6 +82,31 @@ fn to_vec(xs: &[&str]) -> Vec<String> {
 /// Unknown privileges pass through lowercased so callers can use native Ranger
 /// access-type names directly.
 pub fn map_sql_to_ranger_access(sql_priv: &str) -> (Vec<String>, ResourceLevel) {
+    map_sql_to_ranger_access_for(GrantObjectKind::Table, sql_priv)
+}
+
+/// `map_sql_to_ranger_access`, aware of whether the object is a table or a view.
+///
+/// A view uses the same resource shape as a table (its name goes in the `table`
+/// slot) and differs only in the access types Polaris checks.
+pub fn map_sql_to_ranger_access_for(
+    object: GrantObjectKind,
+    sql_priv: &str,
+) -> (Vec<String>, ResourceLevel) {
+    if object == GrantObjectKind::View {
+        return match sql_priv.to_uppercase().as_str() {
+            "SELECT" => (to_vec(VIEW_READ_ACCESS), ResourceLevel::Table),
+            "DROP" => (to_vec(&["view-drop"]), ResourceLevel::Table),
+            "CREATE VIEW" => (to_vec(&["view-create"]), ResourceLevel::Namespace),
+            "ALL" | "ALL PRIVILEGES" => {
+                (to_vec(&["view-metadata-full"]), ResourceLevel::Table)
+            }
+            // Unknown privileges pass through as raw Ranger access types, same
+            // as the table path, so an operator can name a Polaris access type
+            // directly.
+            other => (vec![other.to_lowercase()], ResourceLevel::Table),
+        };
+    }
     match sql_priv.to_uppercase().as_str() {
         "SELECT" => (to_vec(READ_ACCESS), ResourceLevel::Table),
         "INSERT" => (to_vec(WRITE_ACCESS), ResourceLevel::Table),
@@ -214,9 +250,31 @@ impl RangerGrantBackend {
     /// Validate the resource identifiers in a grant/revoke statement and build
     /// the (resource_map, access_type, users, roles) tuple shared by grant and
     /// revoke.
+    /// Table-object convenience wrapper, kept so existing callers and tests read
+    /// unchanged.
+    #[cfg(test)]
     fn build_grant_revoke(
         &self,
         privilege: &str,
+        catalog: Option<&str>,
+        namespace: Option<&str>,
+        table: Option<&str>,
+        grantee: &Grantee,
+    ) -> sqe_core::Result<GrantRevokeRequest> {
+        self.build_grant_revoke_for(
+            privilege,
+            GrantObjectKind::Table,
+            catalog,
+            namespace,
+            table,
+            grantee,
+        )
+    }
+
+    fn build_grant_revoke_for(
+        &self,
+        privilege: &str,
+        object: GrantObjectKind,
         catalog: Option<&str>,
         namespace: Option<&str>,
         table: Option<&str>,
@@ -236,7 +294,7 @@ impl RangerGrantBackend {
         }
         validate_identifier(grantee.name(), "grantee")?;
 
-        let (access, level) = map_sql_to_ranger_access(privilege);
+        let (access, level) = map_sql_to_ranger_access_for(object, privilege);
         let resource = build_resource_map(&self.realm, catalog, namespace, table, level);
         let (users, roles) = grantee_to_fields(grantee)?;
 
@@ -462,8 +520,9 @@ pub fn evaluate_access(
 #[async_trait]
 impl GrantBackend for RangerGrantBackend {
     async fn grant(&self, _token: &str, stmt: &GrantStatement) -> sqe_core::Result<()> {
-        let mut body = self.build_grant_revoke(
+        let mut body = self.build_grant_revoke_for(
             &stmt.privilege,
+            stmt.object,
             stmt.catalog.as_deref(),
             stmt.namespace.as_deref(),
             stmt.table.as_deref(),
@@ -480,8 +539,9 @@ impl GrantBackend for RangerGrantBackend {
     }
 
     async fn revoke(&self, _token: &str, stmt: &RevokeStatement) -> sqe_core::Result<()> {
-        let mut body = self.build_grant_revoke(
+        let mut body = self.build_grant_revoke_for(
             &stmt.privilege,
+            stmt.object,
             stmt.catalog.as_deref(),
             stmt.namespace.as_deref(),
             stmt.table.as_deref(),
@@ -752,6 +812,53 @@ mod tests {
     /// This test pins the wiring: the caller's name reaches the request body,
     /// and WITH GRANT OPTION becomes delegateAdmin. If the grantor silently fell
     /// back to the admin user, every caller would inherit admin's authority.
+    /// A view grant uses the TABLE resource slot with VIEW access types.
+    ///
+    /// Verified against a live Polaris 1.6: granting `view-properties-read` +
+    /// `view-list` on `{catalog, namespace, table: <view name>}` is what lets a
+    /// grantee load the view. There is no `view` resource level in the
+    /// servicedef, so the shape is a table's and only the access types differ.
+    #[test]
+    fn view_grant_uses_view_access_types_on_the_table_slot() {
+        let b = test_backend();
+        let body = b
+            .build_grant_revoke_for(
+                "SELECT",
+                GrantObjectKind::View,
+                Some("wh"),
+                Some("sales"),
+                Some("v_orders"),
+                &Grantee::Role("analyst".into()),
+            )
+            .expect("build view grant");
+        assert_eq!(
+            body.resource.get("table").map(String::as_str),
+            Some("v_orders"),
+            "the view name goes in the table slot; there is no view resource level"
+        );
+        assert!(body.access_types.contains(&"view-properties-read".to_string()));
+        assert!(body.access_types.contains(&"view-list".to_string()));
+        assert!(
+            !body.access_types.contains(&"table-data-read".to_string()),
+            "a view grant must NOT confer table data access: SQE expands the view \
+             and the reader needs its own grant on the base table"
+        );
+
+        // The same privilege on a TABLE is unchanged.
+        let tbl = b
+            .build_grant_revoke_for(
+                "SELECT",
+                GrantObjectKind::Table,
+                Some("wh"),
+                Some("sales"),
+                Some("orders"),
+                &Grantee::Role("analyst".into()),
+            )
+            .expect("build table grant");
+        assert!(tbl.access_types.contains(&"table-data-read".to_string()));
+        assert!(!tbl.access_types.contains(&"view-properties-read".to_string()));
+    }
+
     #[test]
     fn grantor_and_delegate_admin_reach_the_request_body() {
         let store = test_backend();
@@ -763,6 +870,7 @@ mod tests {
             grantee: Grantee::Role("analyst".into()),
             grantor: Some("carol".into()),
             with_grant_option: true,
+            object: GrantObjectKind::Table,
         };
         let mut body = store
             .build_grant_revoke(

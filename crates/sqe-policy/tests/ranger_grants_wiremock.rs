@@ -31,6 +31,7 @@ fn grant_stmt() -> GrantStatement {
         grantee: Grantee::Role("analyst".to_string()),
         grantor: None,
         with_grant_option: false,
+        object: Default::default(),
     }
 }
 
