@@ -130,8 +130,10 @@ struct AcCtx {
     alice: Session,
     bob: Session,
     dave: Session,
-    // Held so the cache the policy enforcer reads stays alive for the test.
-    _cache: sqe_catalog::TableMetadataCache,
+    /// The cache the policy enforcer reads. Held so it stays alive for the
+    /// test, and shared with any second handler that must differ from
+    /// `handler` in exactly one config value.
+    cache: sqe_catalog::TableMetadataCache,
 }
 
 /// Clear `denyPolicyItems` from the polaris-service policy covering the audit
@@ -170,7 +172,7 @@ async fn clear_audit_deny_items(ranger: &RangerAdmin) {
 /// policies, no leftover deny items, no test grants, fixture tables holding
 /// exactly three / two rows.
 async fn ac_setup() -> AcCtx {
-    let (handler, _cache) = crate::common::setup_ranger_handler().await;
+    let (handler, cache) = crate::common::setup_ranger_handler().await;
     let ranger = RangerAdmin::from_env();
     ranger.require_reachable().await;
     // One idempotent call does the whole Ranger-side bootstrap: tag-servicedef
@@ -266,7 +268,7 @@ async fn ac_setup() -> AcCtx {
         alice,
         bob,
         dave,
-        _cache,
+        cache,
     }
 }
 
@@ -1360,6 +1362,12 @@ async fn unknown_tag_state_denies() {
     // security control. plan_rewriter logs
     // "Tag state unknown (cache miss or disabled); denying access" and injects a
     // deny-all row filter.
+    //
+    // This case rests on the cold handler staying cold for the ONE query below.
+    // Do not "improve" `setup_ranger_handler` to pre-populate the table cache:
+    // the deny would stop happening and this test would pass by no longer
+    // exercising the contract. A test that needs a warm second handler should
+    // ask for one explicitly with `setup_ranger_handler_sharing`.
     let (cold, _cache) = crate::common::setup_ranger_handler().await;
     let denied = cold
         .execute(&ctx.bob, &sql, None)
@@ -1492,4 +1500,145 @@ async fn ranger_outage_fails_closed() {
         col_strings(&recovered, "ssn"),
         vec!["xxx-xx-1111", "xxx-xx-2222", "xxx-xx-3333"]
     );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Operational edge: the policy cache TTL bounds how stale a mask can be
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `policy.ranger.cache-ttl-secs` documents a bounded over-permissive window:
+/// a mask authored directly in Ranger Admin is not honored until the cached
+/// `ResolvedPolicy` expires. This pins BOTH edges of that window.
+///
+/// Two handlers differing in exactly one config value:
+///
+/// - `ctx.handler`, at the suite's 2s TTL, is the FRESH side.
+/// - `slow`, at 30s, is the STALE side.
+///
+/// The mutation that discriminates, verified: drop `slow` to a 5s TTL, shorter
+/// than `STALE_PROBE_SECS`, and edge 2 goes red with the masked values. Without
+/// the two-handler pairing a single-handler version of this test would pass on
+/// whichever timer happens to be slowest, which is exactly how an earlier
+/// fail-closed test in this file passed vacuously.
+///
+/// A column mask on the test-owned `hive` service is the right mutation to
+/// drive it with. SQE reads that service itself, over
+/// `policies/download/{service}`, so the only cache in the path is the one
+/// under test. A GRANT or REVOKE would instead route through Polaris's coarse
+/// gate and its own plugin poll, and the result would measure that timer.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs quickstart/polaris-ranger-keycloak; run scripts/access-control-test.sh"]
+async fn cache_ttl_bounds_policy_staleness() {
+    ac_gate!();
+    let _guard = crate::common::serial().lock().await;
+    let ctx = ac_setup().await;
+    grant_read_to_both_roles(&ctx).await;
+
+    /// Long enough to hold across the probe with room for a slow box, short
+    /// enough that the expiry edge still lands inside a sane budget.
+    const STALE_TTL_SECS: u64 = 30;
+    /// Cache age at which the stale read is taken: well past the 2s fresh TTL,
+    /// well short of `STALE_TTL_SECS`.
+    ///
+    /// This wait is deliberate, not incidental. Elapsed time IS the variable
+    /// under test. Without it the probe lands ~0.5s after the seeding read and
+    /// passes for ANY ttl >= 1s, which is how the first draft of this test
+    /// still passed with the stale handler mutated down to 1s.
+    const STALE_PROBE_SECS: u64 = 10;
+
+    // Shares ctx's warm TableMetadataCache, so the ONLY difference between the
+    // two handlers is the policy-cache TTL. With a cold cache this handler
+    // fails closed on unknown tag state for an indeterminate time (measured:
+    // 60s), and a warm-up loop cannot then tell when the policy entry was
+    // actually inserted -- it can succeed on a cache HIT for an entry already
+    // most of a TTL old. That is precisely how an earlier draft went flaky.
+    let (slow, _slow_cache) =
+        crate::common::setup_ranger_handler_sharing(Some(ctx.cache.clone()), |c| {
+            c.policy.ranger.cache_ttl_secs = STALE_TTL_SECS;
+        })
+        .await;
+
+    let sql = format!("SELECT id, ssn FROM {ORDERS} ORDER BY id");
+    let raw = vec!["111-11-1111", "222-22-2222", "333-33-3333"];
+
+    // Seed both handlers before the policy exists, so each holds a cached
+    // "no mask for bob" decision. `slow` has an empty policy cache, so this is
+    // necessarily a miss-then-insert: the clock below starts on the insert.
+    let warm_fresh = exec_ok(&ctx, &ctx.bob, &sql).await;
+    assert_eq!(col_strings(&warm_fresh, "ssn"), raw, "precondition: no mask");
+    let warm_slow = slow
+        .execute(&ctx.bob, &sql, None)
+        .await
+        .expect("the long-TTL handler must read on its first try with a warm table cache");
+    assert_eq!(
+        col_strings(&warm_slow, "ssn"),
+        raw,
+        "precondition: the long-TTL handler cached an unmasked decision"
+    );
+    let warmed_at = std::time::Instant::now();
+
+    ctx.ranger
+        .create_policy(hive_mask_policy(
+            &format!("{PREFIX}mask-ssn"),
+            "ssn",
+            serde_json::json!({"dataMaskType": "MASK_SHOW_LAST_4"}),
+        ))
+        .await
+        .expect("create ssn mask");
+
+    // Edge 1 -- expiry: the 2s TTL lets the new mask through.
+    crate::common::eventually("the short-TTL handler to pick up the new mask", || async {
+        match ctx.handler.execute(&ctx.bob, &sql, None).await {
+            Ok(b) if col_strings(&b, "ssn").iter().all(|v| v.starts_with("xxx-xx-")) => Ok(()),
+            Ok(b) => Err(format!("still raw: {:?}", col_strings(&b, "ssn"))),
+            Err(e) => Err(format!("query failed: {e}")),
+        }
+    })
+    .await;
+
+    // Edge 2 -- staleness: the 30s handler must still be serving its cached
+    // decision at an age where the fresh handler has long since refreshed.
+    // Guarded on elapsed time, because if the probe somehow landed past the
+    // stale TTL the claim below would be meaningless and a pass would be a lie.
+    let probe_at = warmed_at + std::time::Duration::from_secs(STALE_PROBE_SECS);
+    if let Some(remaining) = probe_at.checked_duration_since(std::time::Instant::now()) {
+        tokio::time::sleep(remaining).await;
+    }
+    let elapsed = warmed_at.elapsed();
+    assert!(
+        elapsed >= std::time::Duration::from_secs(STALE_PROBE_SECS),
+        "probe taken too early to mean anything"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(STALE_TTL_SECS),
+        "cannot assert staleness: the fresh handler took {}s, past the {STALE_TTL_SECS}s \
+         stale TTL, so the long-TTL handler may legitimately have refreshed",
+        elapsed.as_secs()
+    );
+    let stale = slow
+        .execute(&ctx.bob, &sql, None)
+        .await
+        .expect("stale read must still succeed");
+    assert_eq!(
+        col_strings(&stale, "ssn"),
+        raw,
+        "a cached decision must be served for the whole TTL, unaffected by the \
+         Ranger-side edit {}s ago",
+        elapsed.as_secs()
+    );
+
+    // Edge 3 -- the window is BOUNDED. Staleness that never ends is not a cache,
+    // it is a missed policy change. Budget = TTL plus slack for the fetch.
+    crate::common::eventually_within(
+        std::time::Duration::from_secs(STALE_TTL_SECS + 60),
+        "the long-TTL handler to expire its cache and apply the mask",
+        || async {
+            match slow.execute(&ctx.bob, &sql, None).await {
+                Ok(b) if col_strings(&b, "ssn").iter().all(|v| v.starts_with("xxx-xx-")) => Ok(()),
+                Ok(b) => Err(format!("still stale: {:?}", col_strings(&b, "ssn"))),
+                Err(e) => Err(format!("query failed: {e}")),
+            }
+        },
+    )
+    .await;
 }
