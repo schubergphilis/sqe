@@ -964,6 +964,43 @@ mod tests {
         }
     }
 
+    /// Documented limit, pinned so a change is deliberate: Ranger GLOB patterns
+    /// are not matched. Only an exact value and a bare `*` match.
+    ///
+    /// This is characterization, not aspiration. An operator who writes
+    /// `orders*` in the Ranger console gets a policy that silently never fires,
+    /// which is the worst failure mode a governance tool has, so the limit is
+    /// worth an executable statement rather than a sentence in a doc. If glob
+    /// support is added, this test SHOULD fail and be rewritten.
+    #[test]
+    fn ranger_glob_patterns_are_not_matched() {
+        let glob = RangerResource {
+            values: vec!["orders*".to_string()],
+            is_excludes: false,
+        };
+        assert!(
+            !resource_matches(&glob, "orders"),
+            "a prefix glob must not match; if this fails, glob support landed"
+        );
+        assert!(!resource_matches(&glob, "orders_2024"));
+        assert!(
+            resource_matches(&glob, "orders*"),
+            "the pattern only matches its own literal text"
+        );
+
+        let star = RangerResource {
+            values: vec!["*".to_string()],
+            is_excludes: false,
+        };
+        assert!(resource_matches(&star, "anything"), "a bare * matches");
+
+        let empty = RangerResource {
+            values: vec![],
+            is_excludes: false,
+        };
+        assert!(!resource_matches(&empty, "orders"), "no values matches nothing");
+    }
+
     #[test]
     fn flattens_iceberg_to_hive_database() {
         assert_eq!(hive_database("sales"), "sales");
