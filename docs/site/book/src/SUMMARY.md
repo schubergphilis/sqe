@@ -34,6 +34,7 @@
 - [Write Path](./features/write-path.md)
 - [Autonomous Compaction](./features/autonomous-compaction.md)
 - [Fine-grained access control (row filters, masking)](./features/fine-grained-access-control.md)
+- [Access control: support matrix](./features/access-control-matrix.md)
 - [read\_parquet TVF](./features/read-parquet.md)
 - [File-format TVFs (read\_csv / read\_json / read\_delta)](./features/file-format-tvfs.md)
 - [Observability](./features/observability.md)
