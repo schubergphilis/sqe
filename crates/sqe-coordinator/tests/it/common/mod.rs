@@ -434,6 +434,20 @@ pub fn fmt_val(col: &dyn arrow_array::Array, row: usize) -> String {
     if let Some(a) = col.as_any().downcast_ref::<arrow_array::BooleanArray>() {
         return a.value(row).to_string();
     }
+    // Dates render ISO (yyyy-mm-dd) so a date-masking assertion can be written
+    // as a literal. Date32 counts days from the epoch; Date64 counts millis.
+    if let Some(a) = col.as_any().downcast_ref::<arrow_array::Date32Array>() {
+        return a
+            .value_as_date(row)
+            .map(|d| d.to_string())
+            .unwrap_or_else(|| format!("?(Date32 {})", a.value(row)));
+    }
+    if let Some(a) = col.as_any().downcast_ref::<arrow_array::Date64Array>() {
+        return a
+            .value_as_date(row)
+            .map(|d| d.to_string())
+            .unwrap_or_else(|| format!("?(Date64 {})", a.value(row)));
+    }
     // Fallback: show the Arrow type name so unknown types are diagnosable
     format!("?({:?})", col.data_type())
 }

@@ -228,7 +228,7 @@ async fn ac_setup() -> AcCtx {
             &carol,
             &format!(
                 "CREATE TABLE {ORDERS} (id BIGINT, region VARCHAR, amount DOUBLE, \
-                 ssn VARCHAR, email VARCHAR)"
+                 ssn VARCHAR, email VARCHAR, signed_on DATE)"
             ),
             None,
         )
@@ -239,9 +239,9 @@ async fn ac_setup() -> AcCtx {
             &carol,
             &format!(
                 "INSERT INTO {ORDERS} VALUES \
-                 (1,'EU',10.0,'111-11-1111','a@x'), \
-                 (2,'US',20.0,'222-22-2222','b@x'), \
-                 (3,'EU',30.0,'333-33-3333','c@x')"
+                 (1,'EU',10.0,'111-11-1111','a@x',DATE '2021-05-04'), \
+                 (2,'US',20.0,'222-22-2222','b@x',DATE '2022-06-05'), \
+                 (3,'EU',30.0,'333-33-3333','c@x',DATE '2023-07-06')"
             ),
             None,
         )
@@ -463,7 +463,10 @@ async fn write_privileges_are_separate_from_read() {
             .handler
             .execute(
                 &ctx.bob,
-                &format!("INSERT INTO {ORDERS} VALUES (4,'EU',40.0,'444-44-4444','d@x')"),
+                &format!(
+                    "INSERT INTO {ORDERS} VALUES \
+                     (4,'EU',40.0,'444-44-4444','d@x',DATE '2024-08-07')"
+                ),
                 None,
             )
             .await
@@ -481,7 +484,10 @@ async fn write_privileges_are_separate_from_read() {
         .handler
         .execute(
             &ctx.alice,
-            &format!("INSERT INTO {ORDERS} VALUES (9,'x',0.0,'000-00-0000','z@x')"),
+            &format!(
+                "INSERT INTO {ORDERS} VALUES \
+                 (9,'x',0.0,'000-00-0000','z@x',DATE '2020-01-01')"
+            ),
             None,
         )
         .await;
@@ -1641,4 +1647,237 @@ async fn cache_ttl_bounds_policy_staleness() {
         },
     )
     .await;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Closing the "documented but only unit-tested" rows of the support matrix
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The four mask types the matrix listed as unit-tested only, asserted against a
+/// live Ranger in one pass: `MASK`, `MASK_SHOW_FIRST_4`, `MASK_DATE_SHOW_YEAR`
+/// and `CUSTOM`.
+///
+/// One case rather than four, because they share the whole expensive part (stack,
+/// grants, fixture) and differ only in the policy body. Each column carries a
+/// different mask type, so a single query proves all four and also proves they do
+/// not interfere.
+///
+/// `MASK_NONE` is deliberately absent: it is an exemption that depends on Ranger
+/// policy EVALUATION ORDER, and ordering is a property of the policy set rather
+/// than of one policy, so it needs its own case with explicit priorities. It
+/// stays unit-tested and the matrix says so.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs quickstart/polaris-ranger-keycloak; run scripts/access-control-test.sh"]
+async fn remaining_mask_types_apply_live() {
+    ac_gate!();
+    let _guard = crate::common::serial().lock().await;
+    let ctx = ac_setup().await;
+    grant_read_to_both_roles(&ctx).await;
+
+    // region 'EU' -> 'XX': MASK maps uppercase to X.
+    ctx.ranger
+        .create_policy(hive_mask_policy(
+            &format!("{PREFIX}mask-full"),
+            "region",
+            serde_json::json!({"dataMaskType": "MASK"}),
+        ))
+        .await
+        .expect("create MASK policy");
+    // ssn '111-11-1111' -> '111-xx-xxxx': first four kept, rest x.
+    ctx.ranger
+        .create_policy(hive_mask_policy(
+            &format!("{PREFIX}mask-first4"),
+            "ssn",
+            serde_json::json!({"dataMaskType": "MASK_SHOW_FIRST_4"}),
+        ))
+        .await
+        .expect("create MASK_SHOW_FIRST_4 policy");
+    // signed_on 2021-05-04 -> 2021-01-01: truncated to the year.
+    ctx.ranger
+        .create_policy(hive_mask_policy(
+            &format!("{PREFIX}mask-date"),
+            "signed_on",
+            serde_json::json!({"dataMaskType": "MASK_DATE_SHOW_YEAR"}),
+        ))
+        .await
+        .expect("create MASK_DATE_SHOW_YEAR policy");
+    // email 'a@x' -> 'redacted:x': a portable expression, no Hive UDF.
+    ctx.ranger
+        .create_policy(hive_mask_policy(
+            &format!("{PREFIX}mask-custom"),
+            "email",
+            serde_json::json!({
+                "dataMaskType": "CUSTOM",
+                "valueExpr": "concat('redacted:', substr({col}, 3, 1))"
+            }),
+        ))
+        .await
+        .expect("create CUSTOM policy");
+
+    let sql =
+        format!("SELECT region, ssn, signed_on, email FROM {ORDERS} ORDER BY id");
+
+    let bob = crate::common::eventually("all four mask types to apply", || async {
+        match ctx.handler.execute(&ctx.bob, &sql, None).await {
+            Ok(b) if col_strings(&b, "region").first().map(String::as_str) == Some("XX") => Ok(b),
+            Ok(b) => Err(format!("region not redacted yet: {:?}", col_strings(&b, "region"))),
+            Err(e) => Err(format!("query failed: {e}")),
+        }
+    })
+    .await;
+
+    assert_eq!(total_rows(&bob), 3, "masking must not drop rows");
+    assert_eq!(
+        col_strings(&bob, "region"),
+        vec!["XX", "XX", "XX"],
+        "MASK maps every uppercase letter to X"
+    );
+    assert_eq!(
+        col_strings(&bob, "ssn"),
+        vec!["111-xx-xxxx", "222-xx-xxxx", "333-xx-xxxx"],
+        "MASK_SHOW_FIRST_4 keeps the first four characters"
+    );
+    assert_eq!(
+        col_strings(&bob, "signed_on"),
+        vec!["2021-01-01", "2022-01-01", "2023-01-01"],
+        "MASK_DATE_SHOW_YEAR truncates to the year"
+    );
+    assert_eq!(
+        col_strings(&bob, "email"),
+        vec!["redacted:x", "redacted:x", "redacted:x"],
+        "CUSTOM substitutes the {{col}} placeholder and evaluates the expression"
+    );
+
+    // alice is analyst-only, so none of the engineer policies touch her. This is
+    // the control that proves the values above are masks and not the fixture.
+    let alice = exec_ok(&ctx, &ctx.alice, &sql).await;
+    assert_eq!(col_strings(&alice, "region"), vec!["EU", "US", "EU"]);
+    assert_eq!(col_strings(&alice, "ssn").first().map(String::as_str), Some("111-11-1111"));
+    assert_eq!(col_strings(&alice, "signed_on").first().map(String::as_str), Some("2021-05-04"));
+    assert_eq!(col_strings(&alice, "email"), vec!["a@x", "b@x", "c@x"]);
+}
+
+/// Precedence: a RESOURCE mask on a column beats a TAG mask on the same column.
+///
+/// The matrix listed precedence as unit-tested only. The two masks are chosen so
+/// the winner is unambiguous: the resource mask shows the last four digits, the
+/// tag mask would nullify. `xxx-xx-1111` can only come from the resource rule,
+/// and NULL can only come from the tag rule, so the assertion cannot pass under
+/// the wrong precedence.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs quickstart/polaris-ranger-keycloak; run scripts/access-control-test.sh"]
+async fn resource_mask_beats_tag_mask_live() {
+    ac_gate!();
+    let _guard = crate::common::serial().lock().await;
+    let ctx = ac_setup().await;
+    grant_read_to_both_roles(&ctx).await;
+
+    set_column_tag(&ctx, "ssn", "PII").await;
+    ctx.ranger
+        .create_policy(tag_mask_policy(
+            &format!("{PREFIX}tag-nullify-pii"),
+            "PII",
+            serde_json::json!({"dataMaskType": "hive:MASK_NULL"}),
+        ))
+        .await
+        .expect("create tag mask");
+    ctx.ranger
+        .create_policy(hive_mask_policy(
+            &format!("{PREFIX}mask-ssn-last4"),
+            "ssn",
+            serde_json::json!({"dataMaskType": "MASK_SHOW_LAST_4"}),
+        ))
+        .await
+        .expect("create resource mask");
+
+    let sql = format!("SELECT id, ssn FROM {ORDERS} ORDER BY id");
+    let bob = crate::common::eventually("the resource mask to win over the tag mask", || async {
+        match ctx.handler.execute(&ctx.bob, &sql, None).await {
+            Ok(b) if col_strings(&b, "ssn").iter().all(|v| v.starts_with("xxx-xx-")) => Ok(b),
+            Ok(b) => Err(format!("got {:?}", col_strings(&b, "ssn"))),
+            Err(e) => Err(format!("query failed: {e}")),
+        }
+    })
+    .await;
+    assert_eq!(
+        col_strings(&bob, "ssn"),
+        vec!["xxx-xx-1111", "xxx-xx-2222", "xxx-xx-3333"],
+        "the resource mask must win; NULL here would mean the tag mask won"
+    );
+}
+
+/// `GRANT SELECT ON ALL TABLES IN SCHEMA` covers every table in the namespace
+/// with one statement.
+///
+/// The matrix listed this as unit-tested only, and the unit test asserts the
+/// resolved resource shape (table `"*"`). That shape was WRONG once in a way a
+/// shape assertion alone would not have caught: `ON ALL` used to map to a
+/// namespace-level resource, which parsed, reported success, and conferred
+/// nothing on any table. This proves the read actually works, on two tables, one
+/// of which is created AFTER the grant.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs quickstart/polaris-ranger-keycloak; run scripts/access-control-test.sh"]
+async fn all_tables_in_schema_grant_covers_the_namespace() {
+    ac_gate!();
+    let _guard = crate::common::serial().lock().await;
+    let ctx = ac_setup().await;
+
+    let second = "sales_wh.ac.orders_extra";
+    let _ = ctx
+        .handler
+        .execute(&ctx.carol, &format!("DROP TABLE IF EXISTS {second}"), None)
+        .await;
+
+    // alice cannot read the fixture table yet: ac_setup revoked every test grant.
+    assert_denied_but_valid(&ctx, &ctx.alice, &format!("SELECT id FROM {ORDERS}")).await;
+
+    exec_ok(
+        &ctx,
+        &ctx.carol,
+        "GRANT SELECT ON ALL TABLES IN SCHEMA sales_wh.ac TO ROLE \"analyst\"",
+    )
+    .await;
+
+    // Existing table.
+    let first = crate::common::eventually("the wildcard grant to enable the existing table", || async {
+        match ctx.handler.execute(&ctx.alice, &format!("SELECT id FROM {ORDERS}"), None).await {
+            Ok(b) if total_rows(&b) == 3 => Ok(b),
+            Ok(b) => Err(format!("{} rows", total_rows(&b))),
+            Err(e) => Err(format!("query failed: {e}")),
+        }
+    })
+    .await;
+    assert_eq!(total_rows(&first), 3);
+
+    // A table created AFTER the grant. Ranger has no future-only resource, so the
+    // wildcard covers it; this is the documented difference from Snowflake, where
+    // ON ALL and ON FUTURE are distinct.
+    exec_ok(&ctx, &ctx.carol, &format!("CREATE TABLE {second} (id BIGINT)")).await;
+    exec_ok(&ctx, &ctx.carol, &format!("INSERT INTO {second} VALUES (7)")).await;
+    let later = crate::common::eventually("the wildcard grant to cover a new table", || async {
+        match ctx.handler.execute(&ctx.alice, &format!("SELECT id FROM {second}"), None).await {
+            Ok(b) if total_rows(&b) == 1 => Ok(b),
+            Ok(b) => Err(format!("{} rows", total_rows(&b))),
+            Err(e) => Err(format!("query failed: {e}")),
+        }
+    })
+    .await;
+    assert_eq!(
+        col_strings(&later, "id"),
+        vec!["7"],
+        "a table created after the wildcard grant is covered too"
+    );
+
+    let _ = ctx
+        .handler
+        .execute(
+            &ctx.carol,
+            "REVOKE SELECT ON ALL TABLES IN SCHEMA sales_wh.ac FROM ROLE \"analyst\"",
+            None,
+        )
+        .await;
+    let _ = ctx
+        .handler
+        .execute(&ctx.carol, &format!("DROP TABLE IF EXISTS {second}"), None)
+        .await;
 }

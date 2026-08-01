@@ -268,6 +268,54 @@ catalog_url = "http://localhost:59997"
         );
     }
 
+    /// `opa` and `cedar` are LEGACY config values from an earlier design.
+    /// `ranger` is the policy backend; neither of the other two is planned work.
+    /// They remain accepted by the config parser for compatibility, and
+    /// selecting one must error rather than degrade.
+    ///
+    /// Pinned so the docs cannot drift from the code in either direction: if one
+    /// is ever implemented, this test fails and the matrix row has to be updated
+    /// in the same change.
+    ///
+    /// Erroring is the right behaviour rather than silently degrading to
+    /// passthrough. A governance backend that quietly enforces nothing is worse
+    /// than one that refuses to start.
+    #[test]
+    fn unwired_policy_engines_fail_loudly_rather_than_degrade() {
+        for engine in [PolicyEngine::Opa, PolicyEngine::Cedar] {
+            let config = PolicyConfig {
+                engine,
+                ..Default::default()
+            };
+            let msg = match build_policy_enforcer(&config, None, None) {
+                Ok(_) => panic!(
+                    "an unwired policy engine must not build an enforcer; \
+                     {engine:?} silently succeeded"
+                ),
+                Err(e) => format!("{e}"),
+            };
+            assert!(
+                msg.contains("opa") || msg.contains("cedar"),
+                "the error must name the engine that is unavailable, got: {msg}"
+            );
+        }
+    }
+
+    /// `ranger` without a URL is a misconfiguration, not a reason to enforce
+    /// nothing. Same argument as above.
+    #[test]
+    fn ranger_without_a_url_is_rejected() {
+        let config = PolicyConfig {
+            engine: PolicyEngine::Ranger,
+            ..Default::default()
+        };
+        let msg = match build_policy_enforcer(&config, None, None) {
+            Ok(_) => panic!("ranger with an empty url must be rejected"),
+            Err(e) => format!("{e}"),
+        };
+        assert!(msg.contains("policy.ranger.url"), "got: {msg}");
+    }
+
     /// Fix 1: attaching a metrics registry to the Ranger store must not break
     /// construction (the store is wired via `with_metrics`).
     #[test]
