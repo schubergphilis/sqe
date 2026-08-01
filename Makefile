@@ -7,8 +7,10 @@
 #   - pandoc (docs/site/ebook/Makefile): the PDF / EPUB ebook
 #
 # This Makefile orchestrates them so a contributor can run `make rustbook`
-# without remembering the mdbook invocation, and `make all` to build
-# everything in one shot.
+# without remembering the mdbook invocation. `make all` is the full gate:
+# supply-chain audit, unit tests, deployable image, benchmark sweep (add
+# `make all_trino` for the SQE-vs-Trino comparison). The old docs+image
+# meaning of `all` is now `make docs-and-image`.
 
 # ── Configuration ─────────────────────────────────────────────────────────
 CARGO        ?= cargo
@@ -77,8 +79,25 @@ SQE_BUILD_ARGS := \
 	--build-arg GIT_REVISION=$(GIT_REVISION) \
 	--build-arg VERSION=$(IMAGE_TAG)
 
-.PHONY: help all check dev release rustbook ebook ebook-pdf ebook-epub ebook-html \
-        benchmark-charts test test-access-control clippy fmt fmt-check clean clean-rust clean-rustbook \
+# ── Benchmarks ─────────────────────────────────────────────────────────────
+# `make benchmark_sf1` etc. wrap scripts/benchmark-make-run.sh, which wraps
+# scripts/benchmark-test.sh (brings up its own Polaris + RustFS test stack).
+# Committed baseline numbers must come from PROFILE=release.
+BENCH_PROFILE  ?= release
+BENCH_SUITES   ?=
+BENCH_LOG_DIR  ?= /tmp/sqe-bench-logs
+TRINO_MEMORY   ?= 8g
+BENCH_RUN      := scripts/benchmark-make-run.sh
+BENCH_ENV       = PROFILE=$(BENCH_PROFILE) BENCH_LOG_DIR=$(BENCH_LOG_DIR)
+
+.PHONY: help all all_trino docs-and-image check dev release rustbook ebook \
+        ebook-pdf ebook-epub ebook-html \
+        benchmark-charts test test-access-control audit audit-advisories \
+        audit-deny audit-licenses \
+        benchmark_sf0.1 benchmark_sf1 benchmark_sf10 benchmark_all \
+        benchmark_sf0.1_trino benchmark_sf1_trino benchmark_sf10_trino \
+        benchmark_all_trino \
+        clippy fmt fmt-check clean clean-rust clean-rustbook \
         clean-ebook clean-benchmark-charts clean-images check-tools maintain \
         build build-sqe sbom sbom-sqe sqe-config images \
         login buildx-builder push push-sqe leak-scan
@@ -97,6 +116,24 @@ help:
 	@echo "    make fmt          cargo fmt --all"
 	@echo "    make fmt-check    cargo fmt --all --check"
 	@echo ""
+	@echo "  Supply chain:"
+	@echo "    make audit        cargo audit + cargo deny check (advisories, bans, sources)"
+	@echo "    make audit-advisories  cargo audit only (RUSTSEC advisory scan)"
+	@echo "    make audit-deny   cargo deny check only (advisories, bans, sources)"
+	@echo "    make audit-licenses    cargo deny check licenses (needs a [licenses] allow list)"
+	@echo ""
+	@echo "  Benchmarks (bring up their own Polaris + RustFS stack):"
+	@echo "    make benchmark_sf0.1   All suites at SF0.1 (fast smoke)"
+	@echo "    make benchmark_sf1     All suites at SF1"
+	@echo "    make benchmark_sf10    All suites at SF10 (heavy)"
+	@echo "    make benchmark_all     SF0.1 + SF1 + SF10, in that order"
+	@echo "    Append _trino to any of them to also compare results against Trino,"
+	@echo "    e.g. make benchmark_sf1_trino"
+	@echo "    Knobs: BENCH_SUITES=\"tpch ssb\" (default: all suites)"
+	@echo "           BENCH_PROFILE=dev-release (default release; baselines need release)"
+	@echo "           TRINO_MEMORY=$(TRINO_MEMORY) (comparison mode only)"
+	@echo "           BENCH_LOG_DIR=$(BENCH_LOG_DIR)"
+	@echo ""
 	@echo "  Documentation:"
 	@echo "    make rustbook         Build the mdbook (HTML) at $(BOOK_OUT)"
 	@echo "    make ebook            Build the ebook (PDF + EPUB) under $(EBOOK_DIR)/build"
@@ -114,7 +151,10 @@ help:
 	@echo "    make push         Multi-arch buildx build + push ($(PUSH_SQE):$(IMAGE_TAG) and :$(LATEST_TAG))"
 	@echo ""
 	@echo "  Combined:"
-	@echo "    make all          dev build + rustbook + ebook + image build + sbom"
+	@echo "    make all          audit + test + image build + benchmark_all (hours, not minutes:"
+	@echo "                      full Dockerfile.full compile then SF0.1+SF1+SF10 over all suites)"
+	@echo "    make all_trino    Same, with the SQE-vs-Trino comparison on"
+	@echo "    make docs-and-image  dev build + rustbook + ebook + image build + sbom"
 	@echo ""
 	@echo "  Cleanup:"
 	@echo "    make clean        Remove all build artefacts (cargo + book + ebook)"
@@ -129,7 +169,27 @@ help:
 	@echo "    make check-tools  Verify cargo / mdbook / pandoc / d2 / mmdc are present"
 	@echo "    make leak-scan    Scan docs/site for secrets/PII before publishing"
 
-all: dev rustbook ebook build sbom
+# `all` is the full gate: supply chain, unit tests, the deployable image, then
+# the benchmark sweep. `all_trino` is the same with SQE-vs-Trino comparison on.
+# The previous meaning of `all` (docs + image) lives on as `docs-and-image`.
+# Steps are recipe lines, not prerequisites, so they stay ordered under `-j`:
+# the benchmark stack owns fixed ports and must not overlap with anything.
+# This is a long gate, not a quick check: `build` compiles Dockerfile.full and
+# the benchmark step cargo-builds sqe-bench/sqe-coordinator separately, then
+# sweeps three scale factors. For a fast pre-push loop use `make audit test`.
+all:
+	$(MAKE) audit
+	$(MAKE) test
+	$(MAKE) build
+	$(MAKE) benchmark_all
+
+all_trino:
+	$(MAKE) audit
+	$(MAKE) test
+	$(MAKE) build
+	$(MAKE) benchmark_all_trino
+
+docs-and-image: dev rustbook ebook build sbom
 
 # ── Code: cargo builds ────────────────────────────────────────────────────
 check:
@@ -160,6 +220,63 @@ test:
 # access-control suite against it. Ranger Admin's first boot takes 2-4 minutes.
 test-access-control:
 	@scripts/access-control-test.sh
+# ── Supply chain: advisories, bans, sources ───────────────────────────────
+# No extra flags: the ignore lists live in .cargo/audit.toml and deny.toml and
+# deliberately differ (see the note at the top of deny.toml).
+audit: audit-advisories audit-deny
+
+audit-advisories:
+	@command -v cargo-audit >/dev/null 2>&1 || \
+		{ echo "cargo-audit not found. Install with: cargo install cargo-audit"; exit 1; }
+	@echo "==> cargo audit (RUSTSEC advisories)"
+	$(CARGO) audit
+
+# License checking is deliberately NOT part of `audit`: deny.toml has no
+# [licenses] section, and cargo-deny >= 0.16 rejects every license that is not
+# explicitly allowed -- so `cargo deny check licenses` fails on MIT and
+# Apache-2.0 today. `make audit-licenses` runs it for whoever adds that policy.
+audit-deny:
+	@command -v cargo-deny >/dev/null 2>&1 || \
+		{ echo "cargo-deny not found. Install with: cargo install cargo-deny"; exit 1; }
+	@echo "==> cargo deny check (advisories, bans, sources)"
+	$(CARGO) deny check advisories bans sources
+
+audit-licenses:
+	@command -v cargo-deny >/dev/null 2>&1 || \
+		{ echo "cargo-deny not found. Install with: cargo install cargo-deny"; exit 1; }
+	@echo "==> cargo deny check licenses (needs a [licenses] allow list in deny.toml)"
+	$(CARGO) deny check licenses
+
+# ── Benchmarks ────────────────────────────────────────────────────────────
+# One suite sweep per scale factor; the _trino variants add --compare-trino
+# and fail the run if a Trino outage silently skipped any comparison.
+benchmark_sf0.1:
+	@$(BENCH_ENV) $(BENCH_RUN) 0.1 $(BENCH_SUITES)
+
+benchmark_sf1:
+	@$(BENCH_ENV) $(BENCH_RUN) 1 $(BENCH_SUITES)
+
+benchmark_sf10:
+	@$(BENCH_ENV) $(BENCH_RUN) 10 $(BENCH_SUITES)
+
+benchmark_all:
+	@$(BENCH_ENV) $(BENCH_RUN) 0.1 $(BENCH_SUITES)
+	@$(BENCH_ENV) $(BENCH_RUN) 1 $(BENCH_SUITES)
+	@$(BENCH_ENV) $(BENCH_RUN) 10 $(BENCH_SUITES)
+
+benchmark_sf0.1_trino:
+	@$(BENCH_ENV) TRINO_MEMORY=$(TRINO_MEMORY) $(BENCH_RUN) 0.1 --compare-trino $(BENCH_SUITES)
+
+benchmark_sf1_trino:
+	@$(BENCH_ENV) TRINO_MEMORY=$(TRINO_MEMORY) $(BENCH_RUN) 1 --compare-trino $(BENCH_SUITES)
+
+benchmark_sf10_trino:
+	@$(BENCH_ENV) TRINO_MEMORY=$(TRINO_MEMORY) $(BENCH_RUN) 10 --compare-trino $(BENCH_SUITES)
+
+benchmark_all_trino:
+	@$(BENCH_ENV) TRINO_MEMORY=$(TRINO_MEMORY) $(BENCH_RUN) 0.1 --compare-trino $(BENCH_SUITES)
+	@$(BENCH_ENV) TRINO_MEMORY=$(TRINO_MEMORY) $(BENCH_RUN) 1 --compare-trino $(BENCH_SUITES)
+	@$(BENCH_ENV) TRINO_MEMORY=$(TRINO_MEMORY) $(BENCH_RUN) 10 --compare-trino $(BENCH_SUITES)
 
 clippy:
 	@echo "==> Running clippy"
@@ -304,7 +421,7 @@ clean-images:
 # ── Diagnostics ───────────────────────────────────────────────────────────
 check-tools:
 	@echo "==> Checking required tools"
-	@for tool in cargo rustc mdbook mdbook-mermaid pandoc d2 mmdc; do \
+	@for tool in cargo rustc cargo-audit cargo-deny mdbook mdbook-mermaid pandoc d2 mmdc; do \
 		if command -v $$tool >/dev/null 2>&1; then \
 			printf "  [ok]  %-18s %s\n" "$$tool" "$$(command -v $$tool)"; \
 		else \
@@ -312,6 +429,7 @@ check-tools:
 		fi; \
 	done
 	@echo ""
+	@echo "  audit needs:     cargo-audit, cargo-deny"
 	@echo "  rustbook needs:  mdbook, mdbook-mermaid"
 	@echo "  ebook needs:     pandoc, pandoc-crossref, d2, mmdc, xelatex (or weasyprint)"
 	@echo "  ebook PDF needs: rsvg-convert (librsvg) or cairosvg for SVG -> PDF"
