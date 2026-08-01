@@ -86,6 +86,10 @@ Every uncertain path denies rather than leaks. The rule is not a feature flag; i
 
 The download is guarded by a circuit breaker. Repeated Ranger failures trip it, and an open breaker returns an error, which the rewriter treats as deny-all. Resolved policies cache in a moka TTL cache keyed by username, namespace, table, and the sorted role list, and the cache invalidates when table properties change.
 
+Three of those branches are now pinned by tests that run against a live Ranger rather than a stub. One stops the `ranger-admin` container mid-suite and asserts the query returns zero rows with no raw value anywhere, then asserts masking resumes after the restart, which is what separates a fail-closed deny from a breaker latched permanently open. One denies when tag state is unknown, because a metadata cache that has never seen the table cannot distinguish "no tags" from "tags I cannot read". One authors a mask type SQE cannot map and asserts the column is restricted rather than returned.
+
+The cache has a cost, and it is the one thing in this design that is not fail-closed. It is fail-stale. A mask tightened in the Ranger console is not honored until the cached entry expires, so a user who queried the table a moment before the edit keeps the looser decision for up to `cache-ttl-secs`. The window is bounded and now asserted at both edges, but it is real, and it points the other way from every other default here. Grants issued through SQE do not have it, because those flush the cache on commit. Lower the TTL if console-authored tightening needs to land faster than fetch load allows.
+
 ::: {.sovereignty}
 **Sovereignty principle:** Fail closed is not pessimism. It is the only safe default when the policy source can be unreachable. A governance system that returns raw data when it cannot reach its policy server has no governance at all; it has a network dependency masquerading as one. SQE denies on doubt, every time, and pays for it with a `lit(false)` instead of a leak.
 :::
@@ -145,9 +149,40 @@ ALTER TABLE sales_wh.sales.orders
 
 The write goes through a Polaris `updateProperties` commit, after which SQE invalidates the table and the policy cache so the new tags show up on the next query without waiting for the TTL.
 
-Storing associations as a table property, rather than in the Ranger or Atlas tag store, wins on four counts. The associations cover federated catalogs Polaris cannot gate. They need no Atlas or tagsync deployment. They travel with the data through clone, replicate, and rename. And SQE already reads the table metadata on every scan, so reading one more property is free. The full rationale is in `docs/ranger-tag-storage-decision.md`.
+Storing associations as a table property, rather than in the Ranger or Atlas tag store, wins on four counts. The associations cover federated catalogs Polaris cannot gate. They need no Atlas or tagsync deployment. They travel with the data through clone, replicate, and rename. And SQE already reads the table metadata on every scan, so reading one more property is free.
 
 The merge has a locked precedence contract, because tags and resource policies can both touch the same column. Restricted columns always win; a tag cannot un-restrict a column. A resource mask wins over a tag mask. Tag row filters are ANDed with resource row filters, most restrictive. Within a column, the first matching tag in stored order wins, deterministically. An unmappable tag whose column has no resource mask restricts the column, fail-closed.
+
+## The tag mask that was never a mask
+
+That precedence contract had unit tests. Every one of them passed. The feature did not work.
+
+The tests resolved tags through a fake tag source, which is the right tool for asserting a precedence rule: it lets you construct the exact combination of resource mask, tag mask, and restriction you want to pin. What a fake cannot tell you is whether the string on the other side of the real system matches.
+
+It does not. Ranger's `tag` service definition never defines bare mask names. It aggregates the mask types of every component it can decorate, so its `dataMaskDef` reads `hive:MASK_SHOW_LAST_4`, `hive:CUSTOM`, `trino:MASK_NULL`, and so on down the list. SQE's mapper matched bare names. Nothing ever matched.
+
+The saving grace was the fail-closed default. An unmapped mask type restricts the column, so a tagged SSN came back missing rather than raw. No value leaked in any release. But the tagged column had been restricted instead of masked from the day the feature shipped, and it stayed that way for months.
+
+What let it hide that long was the shape of the assertion. The harness of the day checked that no raw digits appeared in the output. A restricted column has no digits in it. The test and the bug agreed.
+
+::: {.fieldreport}
+**Field report:** The fix is a nine-line normalizer that strips a `hive:` prefix and leaves any other component's prefix unmatched, so a `trino:` mask still fails closed rather than being applied by the wrong engine. Finding it took a test that authored a real policy in a real Ranger and then looked at the decoded value. That test is nine lines too. The ratio is worth remembering: the code that catches a class of bug is often the same size as the code that fixes one instance of it, and only one of the two keeps working after you walk away.
+:::
+
+## The row filter Ranger will not let you write
+
+Tag policies carry row filters as well as masks, so one rule can filter every table holding a column tagged `PII`. Ours was rejected by Ranger with a message about resources:
+
+```
+tag policy can specify values for one of the following resource sets:
+ does not have any resource hierarchies
+```
+
+We read the resource block several times. The resource block was fine.
+
+Ranger copies each component's `dataMaskDef` into the tag service definition unconditionally. It copies the `rowFilterDef` only when Ranger Admin runs with `ranger.servicedef.autopropagate.rowfilterdef.to.tag=true`, and that property defaults to false. So the tag definition arrives with a populated mask vocabulary and an empty filter vocabulary, and a policy that names a row filter cannot be expressed against it. The error names resource hierarchies because the definition genuinely has none for that policy type, which is the truth stated at the wrong altitude.
+
+Set the property and tag row filters work end to end. No upgrade is involved; we checked whether a newer Ranger would help before finding the flag, and it would not have. The full rationale is in the Ranger tag storage design note.
 
 
 ## The byte that proves it
