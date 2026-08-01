@@ -18,6 +18,7 @@
 
 mod common;
 
+mod access_control_e2e;
 mod analyze_statement_test;
 mod attach_dispatch_test;
 mod attach_rest_test;

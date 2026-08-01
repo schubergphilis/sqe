@@ -24,10 +24,16 @@ use crate::{MaskType, PolicyStore, ResolvedPolicy, TagMaskSpec};
 
 // --- Ranger policy bundle model (ServicePolicies) ---
 
-// TODO(phase3): verify tagPolicies shape against a live tag-linked bundle
 /// Nested tag-service policy bundle. Present when Ranger has at least one
 /// tag-based policy. Structure mirrors the top-level `ServicePolicies` but
 /// with `tag` resources instead of database/table/column.
+///
+/// Shape VERIFIED against a live Ranger 2.8 bundle, captured by
+/// `access_control_e2e::capture_live_tag_bundle` into
+/// `src/testdata/tag_bundle_live_sample.json` and asserted by
+/// `resolve_tag_policies_against_live_sample`. The capture also showed that live
+/// tag policies name their mask types with the owning component's prefix
+/// (`hive:MASK_SHOW_LAST_4`), which `normalize_mask_type` handles.
 #[derive(Debug, Deserialize, Default)]
 pub(crate) struct TagPolicies {
     /// Same `RangerPolicy` type as resource policies; `resources` map carries
@@ -363,12 +369,34 @@ fn item_matches(
     matched
 }
 
+/// Normalize a Ranger data-mask type name.
+///
+/// TAG-service policies qualify the mask type with the owning component
+/// (`hive:MASK_SHOW_LAST_4`), because the `tag` servicedef aggregates the mask
+/// types of every component it can decorate (hive, trino, presto,
+/// nestedstructure). Resource-service policies use the bare name
+/// (`MASK_SHOW_LAST_4`). Verified against a live Ranger 2.8:
+/// `GET /service/public/v2/api/servicedef/name/tag` lists only prefixed forms.
+///
+/// SQE downloads a hive-type service, so it accepts the bare form and the
+/// `hive:` form. Another component's prefix is deliberately left unmatched:
+/// a `trino:`-scoped mask was authored for a different engine, and leaving it
+/// unmatched makes the caller fail closed (the tagged column is restricted)
+/// rather than silently applying another engine's policy.
+fn normalize_mask_type(mask_type: &str) -> &str {
+    match mask_type.split_once(':') {
+        Some(("hive", rest)) => rest,
+        Some(_) => mask_type,
+        None => mask_type,
+    }
+}
+
 /// Map a Ranger hive data-mask type to an SQE `MaskType`.
 ///  - `Ok(Some(mask))` supported,
 ///  - `Ok(None)` for MASK_NONE (explicit exemption: no mask, not restricted),
 ///  - `Err(())` for not-yet-supported types (caller restricts the column, fail-closed).
 fn map_mask(info: &DataMaskInfo, column: &str, identity: &SessionIdentity) -> Result<Option<MaskType>, ()> {
-    match info.data_mask_type.as_str() {
+    match normalize_mask_type(info.data_mask_type.as_str()) {
         "MASK_NULL" => Ok(Some(MaskType::Nullify)),
         "MASK_NONE" => Ok(None),
         "MASK_HASH" => Ok(Some(MaskType::Hash)),
@@ -593,7 +621,8 @@ pub(crate) fn resolve_tag_policies(
                     // Store the raw template as TagMaskSpec::Custom; merge_tag_masks
                     // performs the substitution and parses the expression per column.
                     // On parse failure the rewriter restricts the column (fail-closed).
-                    if item.data_mask_info.data_mask_type == MASK_TYPE_CUSTOM {
+                    if normalize_mask_type(&item.data_mask_info.data_mask_type) == MASK_TYPE_CUSTOM
+                    {
                         if let Some(template) = &item.data_mask_info.value_expr {
                             masks.insert(tag_value.clone(), TagMaskSpec::Custom(template.clone()));
                         } else {
@@ -754,6 +783,27 @@ impl PolicyStore for RangerStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Tag-service mask types carry the owning component's prefix. Verified
+    /// against a live Ranger 2.8 tag servicedef, which lists ONLY prefixed
+    /// forms (`hive:MASK_SHOW_LAST_4`, `trino:MASK_NULL`, ...). Before this
+    /// normalization every tag-based mask fell through to the unsupported arm
+    /// and the tagged column was restricted instead of masked.
+    #[test]
+    fn mask_type_component_prefix_is_normalized() {
+        assert_eq!(normalize_mask_type("MASK_SHOW_LAST_4"), "MASK_SHOW_LAST_4");
+        assert_eq!(
+            normalize_mask_type("hive:MASK_SHOW_LAST_4"),
+            "MASK_SHOW_LAST_4"
+        );
+        assert_eq!(normalize_mask_type("hive:CUSTOM"), "CUSTOM");
+        // Another engine's mask stays unmatched, so the caller fails closed
+        // rather than applying a policy authored for Trino.
+        assert_eq!(
+            normalize_mask_type("trino:MASK_NULL"),
+            "trino:MASK_NULL"
+        );
+    }
 
     const BUNDLE: &str = r#"{
       "policyVersion": 7,
@@ -1372,6 +1422,8 @@ mod tests {
     /// it (role bound to the datamask/rowfilter items, tag on the resources).
     const LIVE_SAMPLE_ROLE: &str = "engineer";
     const LIVE_SAMPLE_TAG: &str = "PII";
+    /// Tag carrying the row-filter policy in the capture.
+    const LIVE_SAMPLE_FILTER_TAG: &str = "RESTRICTED";
 
     /// HIGH-tagpolicies-shape-unvalidated: deserialize a bundle captured from a
     /// LIVE Ranger and assert `resolve_tag_policies` returns a non-empty result
@@ -1382,11 +1434,21 @@ mod tests {
     /// deserializes to `None` and this test fails, surfacing the shape drift
     /// instead of silently returning raw PII columns.
     ///
-    /// `#[ignore]`-d until `tag_bundle_live_sample.json` is replaced with a real
-    /// capture during the Ranger-backend validation run. Dropping in the JSON
-    /// and removing `#[ignore]` makes this an active gate; no code change needed.
+    /// ACTIVE as of the Ranger-backend validation run: the capture in
+    /// `testdata/tag_bundle_live_sample.json` came from a live Ranger 2.8 via
+    /// `access_control_e2e::capture_live_tag_bundle` (re-capture with
+    /// `SQE_AC_CAPTURE=1 scripts/access-control-test.sh capture_live_tag_bundle`).
+    ///
+    /// It carries BOTH tag policy types, so this asserts both branches against
+    /// real data: a `hive:MASK_SHOW_LAST_4` datamask on tag `PII` and a row
+    /// filter `region = 'EU'` on tag `RESTRICTED`, both bound to role
+    /// `engineer`. The row filter is only present because the e2e bootstrap
+    /// gives the tag servicedef a `rowFilterDef` -- Ranger propagates
+    /// `dataMaskDef` into the tag servicedef unconditionally but `rowFilterDef`
+    /// only when Ranger Admin sets
+    /// `ranger.servicedef.autopropagate.rowfilterdef.to.tag=true` (default
+    /// false).
     #[test]
-    #[ignore = "pending a real tagPolicies capture; see testdata/tag_bundle_live_sample.json"]
     fn resolve_tag_policies_against_live_sample() {
         let sp: ServicePolicies = serde_json::from_str(TAG_BUNDLE_LIVE_SAMPLE)
             .expect("captured live sample must be valid ServicePolicies JSON");
@@ -1396,17 +1458,29 @@ mod tests {
              shape drifted and tag masking would silently no-op)"
         );
 
-        let tags: HashSet<String> = [LIVE_SAMPLE_TAG.to_string()].into_iter().collect();
+        let tags: HashSet<String> = [
+            LIVE_SAMPLE_TAG.to_string(),
+            LIVE_SAMPLE_FILTER_TAG.to_string(),
+        ]
+        .into_iter()
+        .collect();
         let id = SessionIdentity {
             username: "live-sample-user".into(),
             roles: vec![LIVE_SAMPLE_ROLE.into()],
             ..Default::default()
         };
-        let (masks, filters, _unmappable) = resolve_tag_policies(&sp, &id, &tags);
+        let (masks, filters, unmappable) = resolve_tag_policies(&sp, &id, &tags);
         assert!(
-            !masks.is_empty() || !filters.is_empty(),
-            "live tagPolicies capture must yield at least one mask or row filter; \
-             got empty (shape mismatch or wrong role/tag constants)"
+            masks.contains_key(LIVE_SAMPLE_TAG),
+            "live capture must resolve a mask for tag {LIVE_SAMPLE_TAG}; got masks {:?}, \
+             unmappable {unmappable:?} (a shape drift or an unhandled component-prefixed \
+             mask type lands here)",
+            masks.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            filters.iter().any(|(tag, _)| tag == LIVE_SAMPLE_FILTER_TAG),
+            "live capture must resolve a row filter for tag {LIVE_SAMPLE_FILTER_TAG}; got {:?}",
+            filters.iter().map(|(t, _)| t).collect::<Vec<_>>()
         );
     }
 }
