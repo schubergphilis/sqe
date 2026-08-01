@@ -1362,6 +1362,12 @@ async fn unknown_tag_state_denies() {
     // security control. plan_rewriter logs
     // "Tag state unknown (cache miss or disabled); denying access" and injects a
     // deny-all row filter.
+    //
+    // This case rests on the cold handler staying cold for the ONE query below.
+    // Do not "improve" `setup_ranger_handler` to pre-populate the table cache:
+    // the deny would stop happening and this test would pass by no longer
+    // exercising the contract. A test that needs a warm second handler should
+    // ask for one explicitly with `setup_ranger_handler_sharing`.
     let (cold, _cache) = crate::common::setup_ranger_handler().await;
     let denied = cold
         .execute(&ctx.bob, &sql, None)
