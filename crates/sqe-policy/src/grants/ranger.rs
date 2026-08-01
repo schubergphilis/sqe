@@ -462,24 +462,35 @@ pub fn evaluate_access(
 #[async_trait]
 impl GrantBackend for RangerGrantBackend {
     async fn grant(&self, _token: &str, stmt: &GrantStatement) -> sqe_core::Result<()> {
-        let body = self.build_grant_revoke(
+        let mut body = self.build_grant_revoke(
             &stmt.privilege,
             stmt.catalog.as_deref(),
             stmt.namespace.as_deref(),
             stmt.table.as_deref(),
             &stmt.grantee,
         )?;
+        // Ranger authorizes against `grantor`, so this is the authority check,
+        // not just an audit field. WITH GRANT OPTION becomes delegateAdmin.
+        if let Some(g) = stmt.grantor.as_deref() {
+            validate_identifier(g, "grantor")?;
+            body.grantor = g.to_string();
+        }
+        body.delegate_admin = stmt.with_grant_option;
         self.post_grant_revoke("grant", &body).await
     }
 
     async fn revoke(&self, _token: &str, stmt: &RevokeStatement) -> sqe_core::Result<()> {
-        let body = self.build_grant_revoke(
+        let mut body = self.build_grant_revoke(
             &stmt.privilege,
             stmt.catalog.as_deref(),
             stmt.namespace.as_deref(),
             stmt.table.as_deref(),
             &stmt.grantee,
         )?;
+        if let Some(g) = stmt.grantor.as_deref() {
+            validate_identifier(g, "grantor")?;
+            body.grantor = g.to_string();
+        }
         self.post_grant_revoke("revoke", &body).await
     }
 
@@ -727,6 +738,69 @@ mod tests {
         assert!(body.users.is_empty());
         assert_eq!(body.resource.get("table").map(String::as_str), Some("orders"));
         assert_eq!(body.resource.get("root").map(String::as_str), Some("POLARIS"));
+    }
+
+    /// The grantor field is the AUTHORITY check, not decoration.
+    ///
+    /// Verified against a live Ranger 2.8: a POST to
+    /// `/service/plugins/services/grant/{service}` carrying `grantor: "dave"`
+    /// is refused with HTTP 403 "User doesn't have necessary permission to grant
+    /// access" EVEN THOUGH the request authenticates with admin REST
+    /// credentials. Ranger authorizes the named grantor, so sending the real
+    /// caller is what makes grant authority resource-scoped.
+    ///
+    /// This test pins the wiring: the caller's name reaches the request body,
+    /// and WITH GRANT OPTION becomes delegateAdmin. If the grantor silently fell
+    /// back to the admin user, every caller would inherit admin's authority.
+    #[test]
+    fn grantor_and_delegate_admin_reach_the_request_body() {
+        let store = test_backend();
+        let stmt = GrantStatement {
+            privilege: "SELECT".into(),
+            catalog: Some("wh".into()),
+            namespace: Some("sales".into()),
+            table: Some("orders".into()),
+            grantee: Grantee::Role("analyst".into()),
+            grantor: Some("carol".into()),
+            with_grant_option: true,
+        };
+        let mut body = store
+            .build_grant_revoke(
+                &stmt.privilege,
+                stmt.catalog.as_deref(),
+                stmt.namespace.as_deref(),
+                stmt.table.as_deref(),
+                &stmt.grantee,
+            )
+            .expect("build");
+        // Mirrors what `grant()` does with the statement.
+        if let Some(g) = stmt.grantor.as_deref() {
+            body.grantor = g.to_string();
+        }
+        body.delegate_admin = stmt.with_grant_option;
+
+        assert_eq!(
+            body.grantor, "carol",
+            "the authenticated caller must be the grantor, not the service identity"
+        );
+        assert!(
+            body.delegate_admin,
+            "WITH GRANT OPTION must map to delegateAdmin or authority can never be delegated"
+        );
+
+        // And the default stays the configured admin user, so callers with no
+        // session (tests, tooling) keep working.
+        let plain = store
+            .build_grant_revoke(
+                "SELECT",
+                Some("wh"),
+                None,
+                None,
+                &Grantee::User("bob".into()),
+            )
+            .expect("build");
+        assert_eq!(plain.grantor, "admin");
+        assert!(!plain.delegate_admin, "delegateAdmin must default to false");
     }
 
     #[test]
