@@ -76,6 +76,9 @@ pub enum StatementKind {
     Grant(Box<Statement>),
     /// REVOKE privilege statement
     Revoke(Box<Statement>),
+    /// `DENY <priv> ON <object> TO <grantee>`: an explicit denial, distinct from
+    /// revoking an allow. Ranger carries it as `denyPolicyItems`.
+    Deny(Box<Statement>),
     /// SHOW GRANTS ON resource / SHOW GRANTS TO grantee
     ShowGrants(ShowGrantsTarget),
     /// SHOW EFFECTIVE GRANTS FOR USER "name"
@@ -187,6 +190,7 @@ impl StatementKind {
             StatementKind::ShowTables(_) => "showtables",
             StatementKind::Grant(_) => "grant",
             StatementKind::Revoke(_) => "revoke",
+            StatementKind::Deny(_) => "deny",
             StatementKind::ShowGrants(_) => "showgrants",
             StatementKind::ShowEffectiveGrants(_) => "showeffectivegrants",
             StatementKind::CheckAccess(_) => "checkaccess",
@@ -247,6 +251,7 @@ impl StatementKind {
             | StatementKind::DropSchema(s)
             | StatementKind::Grant(s)
             | StatementKind::Revoke(s)
+            | StatementKind::Deny(s)
             | StatementKind::Utility(s)
             | StatementKind::ShowCreateTable(s)
             | StatementKind::Call(s)
@@ -674,6 +679,7 @@ fn classify(stmt: Statement) -> sqe_core::Result<StatementKind> {
 
         // REVOKE → dedicated variant for access control
         Statement::Revoke { .. } => Ok(StatementKind::Revoke(Box::new(stmt))),
+        Statement::Deny { .. } => Ok(StatementKind::Deny(Box::new(stmt))),
 
         // EXPLAIN → Utility
         Statement::Explain { .. } => Ok(StatementKind::Utility(Box::new(stmt))),

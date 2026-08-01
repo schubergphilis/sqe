@@ -989,6 +989,7 @@ impl QueryHandler {
 
                 StatementKind::Grant(ref stmt) => self.handle_grant(session, stmt).await,
                 StatementKind::Revoke(ref stmt) => self.handle_revoke(session, stmt).await,
+                StatementKind::Deny(ref stmt) => self.handle_deny(session, stmt).await,
                 StatementKind::ShowGrants(ref target) => self.handle_show_grants(session, target).await,
                 StatementKind::ShowEffectiveGrants(ref user) => self.handle_show_effective_grants(session, user).await,
                 StatementKind::CheckAccess(ref params) => self.handle_check_access(session, params).await,
@@ -4488,12 +4489,19 @@ impl QueryHandler {
             // separate form sqlparser models elsewhere and SQE does not map it.
             _ => false,
         };
+        // DENY carries `objects` unconditionally where GRANT/REVOKE make it
+        // optional, so it is normalised to Some here.
+        let deny_objects = match stmt {
+            Statement::Deny(d) => Some(d.objects.clone()),
+            _ => None,
+        };
         let (privileges, objects, grantees) = match stmt {
             Statement::Grant(g) => (&g.privileges, &g.objects, &g.grantees),
             Statement::Revoke(r) => (&r.privileges, &r.objects, &r.grantees),
+            Statement::Deny(d) => (&d.privileges, &deny_objects, &d.grantees),
             other => {
                 return Err(SqeError::Execution(format!(
-                    "Expected GRANT/REVOKE statement, got: {other}"
+                    "Expected GRANT/REVOKE/DENY statement, got: {other}"
                 )));
             }
         };
@@ -4688,6 +4696,26 @@ impl QueryHandler {
         backend.revoke(session.access_token().expose(), &revoke_stmt).await?;
         // Flush the policy cache only after the mutation succeeds so the
         // revoked grant stops working immediately (issue #207).
+        self.invalidate_policy_cache();
+        Ok(vec![])
+    }
+
+    /// Handle DENY by delegating to the configured grant backend.
+    ///
+    /// Same admin gate as GRANT. Note the asymmetry documented on
+    /// `RangerGrantStore::deny`: Ranger's policy API (the only way to write a
+    /// deny) authorizes the REST user rather than a `grantor`, so unlike GRANT
+    /// this is NOT additionally scoped to the caller's delegate authority.
+    async fn handle_deny(
+        &self,
+        session: &Session,
+        stmt: &Statement,
+    ) -> sqe_core::Result<Vec<RecordBatch>> {
+        self.require_admin(session, "DENY")?;
+        let backend = self.require_grant_backend()?;
+        let mut deny_stmt = Self::extract_grant_statement(stmt)?;
+        deny_stmt.grantor = Some(session.user.username.clone());
+        backend.deny(session.access_token().expose(), &deny_stmt).await?;
         self.invalidate_policy_cache();
         Ok(vec![])
     }
