@@ -14,7 +14,7 @@ The values are `none` (default), `chameleon`, `polaris`, and `ranger`, defined i
 `crates/sqe-core/src/config.rs` (`AccessControlBackend`). This document covers the
 `ranger` backend.
 
-The `ranger` backend assumes Polaris 1.5 running its embedded Ranger authorizer
+The `ranger` backend assumes Polaris running its embedded Ranger authorizer
 (`polaris.authorization.type=ranger`). Two halves are at work:
 
 - **Write path (SQE).** SQE translates each `GRANT` / `REVOKE` into a call to the
@@ -26,7 +26,7 @@ The `ranger` backend assumes Polaris 1.5 running its embedded Ranger authorizer
 
 The backend code is `crates/sqe-policy/src/grants/ranger.rs`
 (`RangerGrantBackend`). The doc-comment on that file states the design directly:
-"Enforcement is delegated to Polaris 1.5's embedded Ranger authorizer; this
+"Enforcement is delegated to Polaris's embedded Ranger authorizer; this
 backend only writes/reads Ranger policies."
 
 ## Architecture and flow
@@ -442,7 +442,7 @@ resource value. They are unrelated.
 
 ## Quickstart
 
-The reference deployment is `quickstart/polaris-ranger-keycloak/`: Polaris 1.5
+The reference deployment is `quickstart/polaris-ranger-keycloak/`: Polaris 1.7
 with its embedded Ranger authorizer, Apache Ranger 2.8, and Keycloak 26.5. The
 `OVERVIEW.md` there is the authoritative identity-model and enforcement
 reference.
@@ -493,7 +493,7 @@ The fine-grained path is configured under `[policy] engine = "ranger"` with
 
 ## Versions
 
-- Apache Polaris 1.5.0 (embedded Ranger authorizer, Beta).
+- Apache Polaris 1.7.0 (embedded Ranger authorizer, Beta).
 - Apache Ranger 2.8.0 (required by the Polaris plugin; new embedded authorizer
   API).
 - Keycloak 26.5.

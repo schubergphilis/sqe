@@ -90,6 +90,32 @@ degrades to an empty result rather than erroring. Half true.
 principal, where `SHOW SCHEMAS` returns nothing. Worth fixing on its own terms:
 the two should agree, and the empty result is the right answer for both.
 
+## Re-validated on Polaris 1.7, clean database
+
+Repeated the whole sequence after upgrading the stack to `apache/polaris:1.7.0`
+and destroying every volume, so Ranger's Postgres and the S3 bucket both started
+empty. dave held no role and no policy item at all: a true zero baseline rather
+than the leftover-strewn one above.
+
+| Step | Polaris 1.7 REST | SQE |
+|---|---|---|
+| No grant | `LOAD_TABLE` **403** | denied |
+| `GRANT SELECT ON sales_wh.ac.orders TO USER dave` | `LOAD_TABLE` **200** in ~10s | **denied** |
+| Same moment | `LIST_NAMESPACES` **403** | |
+| + namespace and catalog traversal | 200 | **4 rows** in ~8s |
+
+Same verdict. 1.7 does not change the conclusion and the traversal stays
+load-bearing.
+
+One difference worth noting, though it changes nothing here: an ungranted
+`LOAD_TABLE` answers **403** on 1.7 rather than hiding behind a 404. SQE still
+reports "table not found" to the caller, because that message comes from SQE's
+own planning path once the namespace fails to resolve, not from the Polaris
+status code. The information-hiding contract SQE presents is its own.
+
+Suites on the clean 1.7 stack: `scripts/access-control-demo.sh` 32/32,
+`make test-access-control` 23/23.
+
 ## Method
 
 dave holds no Ranger role, no group, and no wildcard or public policy item, so
