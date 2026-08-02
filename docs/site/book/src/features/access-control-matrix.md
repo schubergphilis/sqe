@@ -200,6 +200,8 @@ flush the cache on commit. The window is asserted at both edges by
 
 | Gap | Detail |
 |---|---|
+| Scope must match the privilege | A privilege binds to one resource level. Naming an object deeper than that level is refused rather than widened: `GRANT ALL ON wh.sales.orders` errors instead of writing a catalog-wide policy. Re-issue it at the level the error names. Pinned by `all_privileges_on_a_table_is_refused_rather_than_widened_to_the_catalog`. |
+| One level per privilege | A grant writes a single Ranger policy. Where Polaris also needs a traversal grant higher up the hierarchy, that policy must exist already. |
 | View-level grants | No `view` resource level and no privilege mapping, so views are admin-only. See above. |
 | Row filters through views | A filter referencing a column the view does not project fails the query with a DataFusion schema error. Fail-closed, but the message names neither the policy nor the view. Direct queries with the same projection work. |
 | Ranger glob patterns | Only exact match and bare `*` are matched. `orders*` is not, and a policy written that way silently never fires. Pinned by `ranger_glob_patterns_are_not_matched`. |
