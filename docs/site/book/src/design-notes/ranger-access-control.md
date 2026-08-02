@@ -223,6 +223,23 @@ gate: the baseline traverse set (`catalog-list`, `catalog-properties-read`,
 `table-properties-read`, so `GRANT SELECT` is what actually lets a member load
 and read a table, and `REVOKE` takes it away.
 
+## Group bindings
+
+Policy items bound to a GROUP are enforced, matched against the group
+memberships on the session.
+
+Enterprise Ranger deployments usually bind policies to directory groups rather
+than naming users, with usersync mirroring the directory into Ranger. SQE
+previously matched only the username and the token roles and skipped group-bound
+items outright, so that whole class of policy silently did not apply. The session
+already carried the memberships; the matcher ignored them.
+
+Groups come from the provider's `groups_claim`, which is separate from
+`roles_claim` and unset by default. When it is unset the session carries no
+groups and a group-bound item still cannot match: SQE logs which knob fixes that
+at debug level rather than failing silently. Users, roles and groups are OR-ed,
+so a policy naming any of the three applies.
+
 ## Views
 
 `GRANT SELECT ON VIEW cat.ns.v` works, and so do `ON ALL VIEWS IN SCHEMA` and
@@ -284,8 +301,17 @@ Two asymmetries with GRANT, both deliberate:
 - **Not scoped to the caller's delegate authority.** The policy API authorizes
   the authenticated REST user and takes no `grantor`, so `[auth] admin_roles` is
   the only check. Ranger offers no grantor-scoped deny.
-- **No `UNDENY`.** Removing a denial means editing the policy in Ranger. `REVOKE`
-  removes an allow; it does not touch deny items.
+- **`REVOKE` clears a denial too.** There is no `UNDENY` keyword; `REVOKE` removes
+  the grant whether it was an allow or a deny, which is Unity Catalog's
+  behaviour. Without this DENY would be a one-way door, since the grant endpoint
+  only touches allow items and undoing a denial would need console access.
+  Matching is on grantee plus access-type set, so the revoke removes exactly what
+  the equivalent DENY would have written.
+
+`SHOW GRANTS` lists denials with `effect = DENY` alongside allows, so a denial is
+visible to the same audit path as everything else. `DENY` is also recorded in the
+audit log as a privilege change (`AuditKind::Grant`), not as an ordinary
+statement.
 
 ## Who may grant: the caller, checked by Ranger
 
