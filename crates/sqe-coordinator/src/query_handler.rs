@@ -3754,11 +3754,8 @@ impl QueryHandler {
         // A principal that is not authorized to list this catalog's namespaces
         // gets an empty result, not a hard error -- so JDBC schema sync and
         // SHOW SCHEMAS skip catalogs the user can't see instead of aborting. (#5)
-        let namespaces = match session_catalog.list_namespaces().await {
-            Ok(ns) => ns,
-            Err(e) if e.error_code() == sqe_core::SqeErrorCode::AccessDenied => Vec::new(),
-            Err(e) => return Err(e),
-        };
+        let namespaces =
+            namespaces_or_empty_on_denial(session_catalog.list_namespaces().await)?;
 
         // Trino's `SHOW SCHEMAS` column is named `Schema`.
         let schema = Arc::new(Schema::new(vec![Field::new(
@@ -3859,7 +3856,18 @@ impl QueryHandler {
         let ns_name =
             parse_show_tables_namespace(filter).or_else(|| session.default_schema.clone());
         let namespaces = match ns_name {
-            None => session_catalog.list_namespaces().await?,
+            // Same information-hiding contract as SHOW SCHEMAS: a principal who
+            // may not list this catalog's namespaces gets an empty result, not
+            // an error. Propagating the denial here leaked the raw Polaris
+            // message, which names both the operation and the principal
+            // ("Principal 'dave' is not authorized for op 'LIST_NAMESPACES'"),
+            // while the same user running SHOW SCHEMAS got a silent 0 rows. The
+            // pair disagreeing is what made it a leak: the erroring one told an
+            // unprivileged caller that the catalog exists and that they are
+            // known to it.
+            //
+            // The per-namespace list_tables below already degrades this way.
+            None => namespaces_or_empty_on_denial(session_catalog.list_namespaces().await)?,
             Some(name) => vec![iceberg::NamespaceIdent::new(name)],
         };
 
@@ -6644,6 +6652,31 @@ fn show_tables_catalog(filter: &str) -> Option<String> {
     (!unq.is_empty()).then(|| unq.to_string())
 }
 
+/// The information-hiding contract shared by `SHOW SCHEMAS` and `SHOW TABLES`:
+/// a principal who may not list a catalog's namespaces sees an empty result,
+/// never an error.
+///
+/// One function rather than the same `match` at both call sites, because the
+/// two DID drift. `SHOW TABLES` propagated the denial and leaked the raw Polaris
+/// message, which names the operation and the principal, while `SHOW SCHEMAS`
+/// on the same catalog as the same user returned a silent 0 rows. The
+/// disagreement is what made it a leak: the erroring one confirmed to an
+/// unprivileged caller both that the catalog exists and that they are known to
+/// it.
+///
+/// Only `AccessDenied` is absorbed. A catalog that is unreachable or misconfigured
+/// still errors, because reporting "no namespaces" for a broken connection would
+/// hide a real fault behind a plausible answer.
+fn namespaces_or_empty_on_denial(
+    result: sqe_core::Result<Vec<iceberg::NamespaceIdent>>,
+) -> sqe_core::Result<Vec<iceberg::NamespaceIdent>> {
+    match result {
+        Ok(ns) => Ok(ns),
+        Err(e) if e.error_code() == sqe_core::SqeErrorCode::AccessDenied => Ok(Vec::new()),
+        Err(e) => Err(e),
+    }
+}
+
 fn parse_show_tables_namespace(filter: &str) -> Option<String> {
     let raw = filter.trim();
     if raw.is_empty() {
@@ -7228,6 +7261,55 @@ mod tests {
     // `IN "analytics_db"`, and the old code stripped the keyword but
     // not the surrounding quotes. The Polaris namespace lookup was
     // then asking for a namespace literally named `"analytics_db"`.
+
+    #[test]
+    fn a_listing_denial_becomes_an_empty_result_not_an_error() {
+        // SHOW SCHEMAS and SHOW TABLES must agree. They did not: SHOW TABLES
+        // propagated the denial and leaked the raw Polaris message naming the
+        // operation and the principal, while SHOW SCHEMAS returned 0 rows for
+        // the same user on the same catalog. Observed live against the
+        // polaris-ranger-keycloak stack:
+        //
+        //   Failed to list namespaces: 403 Principal 'dave' is not authorized
+        //   for op 'LIST_NAMESPACES'
+        //
+        // Built the way sqe-catalog's classify_listing_error builds it, so the
+        // test exercises the shape list_namespaces actually returns rather than
+        // a hand-picked variant that happens to carry the right code.
+        let denied = Err(sqe_core::SqeError::sourced(
+            sqe_core::SqeErrorCode::AccessDenied,
+            "Failed to list namespaces: Principal 'dave' is not authorized \
+             for op 'LIST_NAMESPACES'",
+            std::io::Error::other("403 Forbidden"),
+        ));
+        let out = namespaces_or_empty_on_denial(denied)
+            .expect("a listing denial must not surface as an error");
+        assert!(out.is_empty(), "a denied listing shows nothing, not a partial list");
+    }
+
+    #[test]
+    fn a_non_denial_listing_failure_still_errors() {
+        // The negative control, and the reason this is not a blanket
+        // `unwrap_or_default`. An unreachable or misconfigured catalog must not
+        // report "no namespaces": that hides a real fault behind an answer the
+        // caller cannot distinguish from an empty catalog.
+        let broken: sqe_core::Result<Vec<iceberg::NamespaceIdent>> = Err(
+            sqe_core::SqeError::Execution("connection refused".to_string()),
+        );
+        let err = namespaces_or_empty_on_denial(broken)
+            .expect_err("a non-denial failure must still propagate");
+        assert!(err.to_string().contains("connection refused"), "{err}");
+    }
+
+    #[test]
+    fn a_successful_listing_passes_through_untouched() {
+        let ns = vec![
+            iceberg::NamespaceIdent::new("sales".to_string()),
+            iceberg::NamespaceIdent::new("ac".to_string()),
+        ];
+        let out = namespaces_or_empty_on_denial(Ok(ns.clone())).expect("ok passes through");
+        assert_eq!(out, ns);
+    }
 
     #[test]
     fn parse_show_tables_namespace_empty_returns_none() {
