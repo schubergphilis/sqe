@@ -208,6 +208,31 @@ pub fn build_resource_map(
     m
 }
 
+/// Build a Ranger deny item for one grantee and access-type set.
+///
+/// Shared by DENY and by the REVOKE path that removes a denial, so the two agree
+/// on the shape by construction rather than by two similar literals.
+fn build_deny_item(grantee: &Grantee, access_types: &[String]) -> serde_json::Value {
+    let accesses: Vec<serde_json::Value> = access_types
+        .iter()
+        .map(|t| serde_json::json!({"type": t, "isAllowed": true}))
+        .collect();
+    let mut item = serde_json::Map::new();
+    match grantee {
+        Grantee::User(n) => {
+            item.insert("users".into(), serde_json::json!([n]));
+        }
+        Grantee::Role(n) => {
+            item.insert("roles".into(), serde_json::json!([n]));
+        }
+        Grantee::Group(n) => {
+            item.insert("groups".into(), serde_json::json!([n]));
+        }
+    }
+    item.insert("accesses".into(), serde_json::Value::Array(accesses));
+    serde_json::Value::Object(item)
+}
+
 /// Do two deny items name the same grantee with the same access types?
 ///
 /// Ranger returns a stored policy item with every optional field populated, so
@@ -383,6 +408,47 @@ impl RangerGrantBackend {
     }
 
     /// POST a GrantRevokeRequest to the grant or revoke endpoint.
+    /// Strip any deny item equivalent to what `DENY` would have written for this
+    /// statement. No-op when the resource has no policy or no matching item.
+    async fn remove_deny_items(&self, stmt: &RevokeStatement) -> sqe_core::Result<()> {
+        let (access_types, level) =
+            map_sql_to_ranger_access_for(stmt.object, &stmt.privilege);
+        let Some(catalog) = stmt.catalog.as_deref() else {
+            return Ok(());
+        };
+        let resource = build_resource_map(
+            &self.realm,
+            catalog,
+            stmt.namespace.as_deref(),
+            stmt.table.as_deref(),
+            level,
+        );
+        let Some(mut policy) = self.policy_by_resource(&resource).await? else {
+            return Ok(());
+        };
+        let target = build_deny_item(&stmt.grantee, &access_types);
+        let Some(items) = policy
+            .get("denyPolicyItems")
+            .and_then(serde_json::Value::as_array)
+        else {
+            return Ok(());
+        };
+        let kept: Vec<serde_json::Value> = items
+            .iter()
+            .filter(|e| !deny_items_equivalent(e, &target))
+            .cloned()
+            .collect();
+        if kept.len() == items.len() {
+            return Ok(());
+        }
+        policy["denyPolicyItems"] = serde_json::Value::Array(kept);
+        let id = policy
+            .get("id")
+            .and_then(serde_json::Value::as_i64)
+            .ok_or_else(|| sqe_core::SqeError::Execution("Ranger policy has no id".into()))?;
+        self.put_policy(id, &policy).await
+    }
+
     /// The policy whose resource map matches `want` EXACTLY, or `None`.
     ///
     /// Ranger permits only ONE policy per exact resource per service: creating a
@@ -756,7 +822,15 @@ impl GrantBackend for RangerGrantBackend {
             validate_identifier(g, "grantor")?;
             body.grantor = g.to_string();
         }
-        self.post_grant_revoke_with_privilege("revoke", &stmt.privilege, &body).await
+        self.post_grant_revoke_with_privilege("revoke", &stmt.privilege, &body)
+            .await?;
+        // REVOKE also clears a matching DENY, matching Unity Catalog, where
+        // REVOKE removes the grant whether it was an allow or a deny.
+        //
+        // Without this, DENY is a one-way door: the grant endpoint only touches
+        // allow items, so undoing a denial would need Ranger console access. That
+        // is not an acceptable operational story for a statement SQE offers.
+        self.remove_deny_items(stmt).await
     }
 
     /// DENY goes through the POLICY api, not grant/revoke.
@@ -811,24 +885,7 @@ impl GrantBackend for RangerGrantBackend {
                 .join("-")
         );
 
-        let accesses: Vec<serde_json::Value> = access_types
-            .iter()
-            .map(|t| serde_json::json!({"type": t, "isAllowed": true}))
-            .collect();
-        let mut item = serde_json::Map::new();
-        match &stmt.grantee {
-            Grantee::User(n) => {
-                item.insert("users".into(), serde_json::json!([n]));
-            }
-            Grantee::Role(n) => {
-                item.insert("roles".into(), serde_json::json!([n]));
-            }
-            Grantee::Group(n) => {
-                item.insert("groups".into(), serde_json::json!([n]));
-            }
-        }
-        item.insert("accesses".into(), serde_json::Value::Array(accesses));
-        let deny_item = serde_json::Value::Object(item);
+        let deny_item = build_deny_item(&stmt.grantee, &access_types);
 
         let existing = self.policy_by_resource(&resource).await?;
         match existing {

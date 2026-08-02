@@ -1858,7 +1858,10 @@ impl QueryHandler {
                     integrity: sqe_metrics::audit::Integrity::default(),
                 };
                 audit.log_event(event);
-            } else if matches!(&kind, StatementKind::Grant(_) | StatementKind::Revoke(_)) {
+            } else if matches!(
+                &kind,
+                StatementKind::Grant(_) | StatementKind::Revoke(_) | StatementKind::Deny(_)
+            ) {
                 // Canonical path for GRANT/REVOKE (Task 14, OCSF Account Change 3001).
                 // Build a Resource from the parsed grant statement so the target object
                 // is structured. The raw SQL travels in query.text where the worker
@@ -7663,25 +7666,57 @@ mod tests {
         assert!(matches!(stmt.grantee, Grantee::User(ref n) if n == "alice"));
     }
 
-    /// DENY is not a grant/revoke SQE understands. sqlparser 0.62 added a
-    /// dedicated `Statement::Deny` parse (older versions errored at parse
-    /// time), but SQE's classifier has no arm for it, so it is refused with a
-    /// `NotImplemented` error rather than being silently accepted. This test
-    /// documents that SQE's observable behavior is preserved: DENY is rejected,
-    /// and in particular it is NOT classified as a Grant or Revoke.
+    /// DENY is now supported, and must be classified as its OWN kind.
+    ///
+    /// This test previously asserted the opposite ("DENY must be refused by
+    /// SQE"), which was the correct contract while nothing could write a denial:
+    /// Ranger's grant endpoint cannot express one. DENY now goes through the
+    /// policy API, so the statement is accepted, and this test is inverted
+    /// deliberately.
+    ///
+    /// It must NOT be classified as Grant or Revoke. That distinction is
+    /// load-bearing in two places: `handle_deny` writes deny items rather than
+    /// allow items, and the audit path records a denial as a privilege change of
+    /// its own rather than as a grant.
     #[test]
-    fn deny_is_rejected_by_sqe() {
-        let sql = "DENY SELECT ON my_table TO alice";
-        let result = sqe_sql::parse_and_classify(sql);
-
+    fn deny_is_classified_as_its_own_kind() {
+        let kind = sqe_sql::parse_and_classify("DENY SELECT ON my_table TO alice")
+            .expect("DENY must parse and classify");
         assert!(
-            result.is_err(),
-            "DENY must be refused by SQE, got: {result:?}"
+            matches!(kind, sqe_sql::StatementKind::Deny(_)),
+            "expected StatementKind::Deny, got: {kind:?}"
         );
-        if let Ok(kind) = &result {
+        assert!(
+            !matches!(
+                kind,
+                sqe_sql::StatementKind::Grant(_) | sqe_sql::StatementKind::Revoke(_)
+            ),
+            "DENY must never be confused with a grant or a revoke"
+        );
+    }
+
+    /// A denial is a privilege change and must land in the audit log as one.
+    ///
+    /// The `AuditKind::Grant` path is gated on the statement kind, and DENY was
+    /// not in that gate when it was added, so a denial would have been recorded
+    /// as an ordinary statement. An unaudited privilege change is not acceptable.
+    #[test]
+    fn deny_is_audited_as_a_privilege_change() {
+        for sql in [
+            "GRANT SELECT ON t TO alice",
+            "REVOKE SELECT ON t FROM alice",
+            "DENY SELECT ON t TO alice",
+        ] {
+            let kind = sqe_sql::parse_and_classify(sql).expect("classify");
             assert!(
-                !matches!(kind, sqe_sql::StatementKind::Grant(_) | sqe_sql::StatementKind::Revoke(_)),
-                "DENY must never be treated as a Grant/Revoke, got: {kind:?}"
+                matches!(
+                    kind,
+                    sqe_sql::StatementKind::Grant(_)
+                        | sqe_sql::StatementKind::Revoke(_)
+                        | sqe_sql::StatementKind::Deny(_)
+                ),
+                "`{sql}` must be one of the privilege-change kinds the audit gate \
+                 recognises, got: {kind:?}"
             );
         }
     }
