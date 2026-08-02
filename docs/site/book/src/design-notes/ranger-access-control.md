@@ -93,6 +93,44 @@ types the corresponding Polaris operations check. The mapping:
 Unknown privileges pass through lowercased, so an operator can name native Ranger
 access types directly in a `GRANT` statement.
 
+### The named scope must match the privilege's level
+
+The right-hand column is not advisory. It decides which keys go into the Ranger
+resource map, and the keys below that level are dropped. Naming an object deeper
+than the level a privilege binds to used to widen the grant silently:
+
+```sql
+GRANT ALL ON wh.sales.orders TO USER alice;
+```
+
+`ALL` binds to the catalog, so the namespace and table were dropped and the
+write landed as `catalog-content-manage` on `wh`. The statement named one table,
+reported success, and gave alice every table in the catalog. Nothing in the
+response distinguished it from the narrow grant that was asked for, and the
+operator reading `SHOW GRANTS` months later found a catalog policy nobody
+remembered writing.
+
+SQE now refuses the statement and names both the level and the scope that would
+have been written:
+
+```
+Privilege 'ALL PRIVILEGES' binds to the catalog level, but the statement names
+a namespace or table. The policy would apply to 'wh' and everything under it,
+which is wider than the object named. Re-issue the statement against 'wh', or
+name a privilege that binds to the object you meant.
+```
+
+The check is general rather than an `ALL` special case, because `USAGE` on a
+table and `CREATE SCHEMA` on a namespace widen through the same path. It applies
+to `GRANT`, `REVOKE` and `DENY` alike, so the three agree on what a statement's
+scope means. A widened `DENY` over-restricts rather than over-grants, which is
+the safer direction, but locking a grantee out of a whole catalog when one table
+was named is no less surprising.
+
+Grants written before this check exists are still catalog-wide. Revoking one
+needs the statement re-issued at the level it actually landed on, which is what
+the error text tells you.
+
 ### Why the full explicit set
 
 The Polaris embedded authorizer does not honor service-def implied-grants. A
