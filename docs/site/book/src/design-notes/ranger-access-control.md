@@ -223,6 +223,96 @@ gate: the baseline traverse set (`catalog-list`, `catalog-properties-read`,
 `table-properties-read`, so `GRANT SELECT` is what actually lets a member load
 and read a table, and `REVOKE` takes it away.
 
+## Group bindings
+
+Policy items bound to a GROUP are enforced, matched against the group
+memberships on the session.
+
+Enterprise Ranger deployments usually bind policies to directory groups rather
+than naming users, with usersync mirroring the directory into Ranger. SQE
+previously matched only the username and the token roles and skipped group-bound
+items outright, so that whole class of policy silently did not apply. The session
+already carried the memberships; the matcher ignored them.
+
+Groups come from the provider's `groups_claim`, which is separate from
+`roles_claim` and unset by default. When it is unset the session carries no
+groups and a group-bound item still cannot match: SQE logs which knob fixes that
+at debug level rather than failing silently. Users, roles and groups are OR-ed,
+so a policy naming any of the three applies.
+
+## Views
+
+`GRANT SELECT ON VIEW cat.ns.v` works, and so do `ON ALL VIEWS IN SCHEMA` and
+`ON FUTURE VIEWS IN SCHEMA`. Two facts shape how, both established against a
+live Polaris 1.6 rather than inferred from the service-def.
+
+**A view has no resource level of its own.** The `polaris` service-def declares
+`root -> catalog -> namespace -> table` and no `view`. A view is addressed by
+putting its NAME in the `table` slot; only the access-type set differs. Granting
+`view-properties-read` + `view-list` on `{catalog, namespace, table: <view>}` is
+what lets a grantee load the view, so that is what `SELECT ON VIEW` emits.
+
+**A view is NOT a privilege boundary.** SQE expands the view's SQL and plans
+against the base tables, so the reader needs its own grant on those tables too.
+Granting only the view produces
+
+```
+Failed to plan view 'v' SQL: table 'cat.ns.orders' not found
+```
+
+which is the base-table denial surfacing through the view. This differs from
+Snowflake secure views and Databricks views, where the definer's privileges
+apply and the reader needs nothing on the base table. There is no definer's-
+rights mode here: a view cannot be used to expose a subset of a table to someone
+who may not read the table. Use a row filter or a column mask for that, which is
+the mechanism SQE does support.
+
+Column masks and row filters DO still apply through a view, because the rewrite
+happens on the expanded scan. A view is therefore safe (it cannot launder a
+masked column) but not sufficient (it cannot stand in for a grant).
+
+## DENY
+
+`DENY <privilege> ON <object> TO <grantee>` writes an explicit denial, which
+Ranger evaluates ahead of any allow.
+
+It does NOT go through the grant endpoint. `/services/grant` writes allow items
+only and has no field for a denial, so DENY uses the policy API and merges a
+`denyPolicyItems` entry into the policy covering the resource.
+
+**It merges into an existing policy rather than creating its own, because Ranger
+forbids the alternative.** Only one policy may exist per exact resource per
+service; a second is rejected with
+
+```
+Validation failure: error code[3010], reason[Another policy already exists for
+matching resource: policy-name=[...], service=[polaris]]
+```
+
+So a dedicated deny policy is impossible, and the deny lands on whichever policy
+already covers that resource. Repeating the statement is idempotent: items are
+deduplicated on grantee plus access-type set, not on JSON equality, because
+Ranger echoes a stored item with every optional field populated (`users: []`,
+`conditions: []`, `delegateAdmin`) and a byte comparison appended a duplicate
+every time.
+
+Two asymmetries with GRANT, both deliberate:
+
+- **Not scoped to the caller's delegate authority.** The policy API authorizes
+  the authenticated REST user and takes no `grantor`, so `[auth] admin_roles` is
+  the only check. Ranger offers no grantor-scoped deny.
+- **`REVOKE` clears a denial too.** There is no `UNDENY` keyword; `REVOKE` removes
+  the grant whether it was an allow or a deny, which is Unity Catalog's
+  behaviour. Without this DENY would be a one-way door, since the grant endpoint
+  only touches allow items and undoing a denial would need console access.
+  Matching is on grantee plus access-type set, so the revoke removes exactly what
+  the equivalent DENY would have written.
+
+`SHOW GRANTS` lists denials with `effect = DENY` alongside allows, so a denial is
+visible to the same audit path as everything else. `DENY` is also recorded in the
+audit log as a privilege change (`AuditKind::Grant`), not as an ordinary
+statement.
+
 ## Who may grant: the caller, checked by Ranger
 
 SQE sends the **authenticated caller** as the Ranger `grantor`, never its own

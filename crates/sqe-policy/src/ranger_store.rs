@@ -353,17 +353,23 @@ fn item_matches(
     groups: &[String],
     user: &SessionUser,
 ) -> bool {
-    let matched =
-        users.iter().any(|u| u == &user.username) || roles.iter().any(|r| user.roles.contains(r));
-    if !matched && !groups.is_empty() {
-        // Group-bound items are not enforced by design (SQE matches token roles
-        // only). This fires inside the per-item resolution loop on every cache
-        // miss for every user, so it is logged at `debug!` rather than `warn!`
-        // to avoid a WARN burst from a bundle with many group-bound items. The
-        // behaviour is unchanged: the item is still skipped (not enforced).
+    let matched = users.iter().any(|u| u == &user.username)
+        || roles.iter().any(|r| user.roles.contains(r))
+        || groups.iter().any(|g| user.groups.contains(g));
+    if !matched && !groups.is_empty() && user.groups.is_empty() {
+        // The item is group-bound and the session carries NO groups, which in
+        // practice means `[[auth.providers]] groups_claim` is unset so the token's
+        // group memberships were never read. That is the one case where a
+        // group-bound Ranger policy still cannot apply, and it is a configuration
+        // gap rather than a design limit, so say which knob fixes it.
+        //
+        // debug! not warn!: this runs per item, per user, on every cache miss, so
+        // a bundle with many group-bound items would produce a WARN burst.
         debug!(
             ?groups,
-            "Ranger policy item is group-bound; SQE does not enforce group bindings (Phase 2) — policy item skipped"
+            user = %user.username,
+            "Ranger policy item is group-bound but the session carries no groups; \
+             set `groups_claim` on the auth provider so group bindings resolve"
         );
     }
     matched
@@ -999,6 +1005,57 @@ mod tests {
             is_excludes: false,
         };
         assert!(!resource_matches(&empty, "orders"), "no values matches nothing");
+    }
+
+    fn user_with_groups(name: &str, roles: &[&str], groups: &[&str]) -> SessionUser {
+        SessionUser {
+            username: name.to_string(),
+            roles: roles.iter().map(|s| s.to_string()).collect(),
+            subject: None,
+            email: None,
+            groups: groups.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    /// Group-bound policy items must apply.
+    ///
+    /// Enterprise Ranger deployments bind policies to directory groups rather
+    /// than naming users, with usersync mirroring the directory. SQE matched only
+    /// the username and token roles and skipped group-bound items outright, so a
+    /// whole class of production policy silently did not apply.
+    ///
+    /// `SessionUser` already carried `groups` from the provider's `groups_claim`;
+    /// the matcher just ignored them.
+    #[test]
+    fn group_bound_items_match_the_session_groups() {
+        let g = ["data-platform".to_string()];
+        let empty: [String; 0] = [];
+
+        assert!(
+            item_matches(&empty, &empty, &g, &user_with_groups("bob", &[], &["data-platform"])),
+            "a group the session carries must match"
+        );
+        assert!(
+            !item_matches(&empty, &empty, &g, &user_with_groups("bob", &[], &["other-group"])),
+            "a group the session does not carry must not match"
+        );
+        assert!(
+            !item_matches(&empty, &empty, &g, &user_with_groups("bob", &["analyst"], &[])),
+            "no groups on the session cannot match a group-bound item"
+        );
+        // Roles and users still match on their own, and the three are OR-ed.
+        assert!(item_matches(
+            &["bob".to_string()],
+            &empty,
+            &empty,
+            &user_with_groups("bob", &[], &[])
+        ));
+        assert!(item_matches(
+            &empty,
+            &["analyst".to_string()],
+            &g,
+            &user_with_groups("bob", &["analyst"], &[])
+        ));
     }
 
     #[test]

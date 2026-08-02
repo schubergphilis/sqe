@@ -225,6 +225,7 @@ mod tests {
             grantee: Grantee::Role("analysts".into()),
             grantor: None,
             with_grant_option: false,
+            object: Default::default(),
         };
         let req = to_grant_request(&stmt);
         assert_eq!(req.privilege, "SELECT");
@@ -245,6 +246,7 @@ mod tests {
             table: Some("tbl".into()),
             grantee: Grantee::User("alice".into()),
             grantor: None,
+            object: Default::default(),
         };
         let req = to_revoke_request(&stmt);
         assert_eq!(req.privilege, "INSERT");

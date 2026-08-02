@@ -989,6 +989,7 @@ impl QueryHandler {
 
                 StatementKind::Grant(ref stmt) => self.handle_grant(session, stmt).await,
                 StatementKind::Revoke(ref stmt) => self.handle_revoke(session, stmt).await,
+                StatementKind::Deny(ref stmt) => self.handle_deny(session, stmt).await,
                 StatementKind::ShowGrants(ref target) => self.handle_show_grants(session, target).await,
                 StatementKind::ShowEffectiveGrants(ref user) => self.handle_show_effective_grants(session, user).await,
                 StatementKind::CheckAccess(ref params) => self.handle_check_access(session, params).await,
@@ -1857,7 +1858,10 @@ impl QueryHandler {
                     integrity: sqe_metrics::audit::Integrity::default(),
                 };
                 audit.log_event(event);
-            } else if matches!(&kind, StatementKind::Grant(_) | StatementKind::Revoke(_)) {
+            } else if matches!(
+                &kind,
+                StatementKind::Grant(_) | StatementKind::Revoke(_) | StatementKind::Deny(_)
+            ) {
                 // Canonical path for GRANT/REVOKE (Task 14, OCSF Account Change 3001).
                 // Build a Resource from the parsed grant statement so the target object
                 // is structured. The raw SQL travels in query.text where the worker
@@ -4488,20 +4492,43 @@ impl QueryHandler {
             // separate form sqlparser models elsewhere and SQE does not map it.
             _ => false,
         };
+        // DENY carries `objects` unconditionally where GRANT/REVOKE make it
+        // optional, so it is normalised to Some here.
+        let deny_objects = match stmt {
+            Statement::Deny(d) => Some(d.objects.clone()),
+            _ => None,
+        };
         let (privileges, objects, grantees) = match stmt {
             Statement::Grant(g) => (&g.privileges, &g.objects, &g.grantees),
             Statement::Revoke(r) => (&r.privileges, &r.objects, &r.grantees),
+            Statement::Deny(d) => (&d.privileges, &deny_objects, &d.grantees),
             other => {
                 return Err(SqeError::Execution(format!(
-                    "Expected GRANT/REVOKE statement, got: {other}"
+                    "Expected GRANT/REVOKE/DENY statement, got: {other}"
                 )));
             }
         };
 
         let privilege = format!("{privileges}");
 
+        // Views use the SAME resource shape as tables (the view name goes in the
+        // `table` slot); only the access-type set differs. Verified against a
+        // live Polaris 1.6: `view-properties-read` + `view-list` on
+        // `{catalog, namespace, table: <view>}` lets the grantee load the view.
+        let object = match objects {
+            Some(
+                sqlparser::ast::GrantObjects::Views(_)
+                | sqlparser::ast::GrantObjects::AllViewsInSchema { .. }
+                | sqlparser::ast::GrantObjects::FutureViewsInSchema { .. },
+            ) => sqe_policy::grants::GrantObjectKind::View,
+            _ => sqe_policy::grants::GrantObjectKind::Table,
+        };
+
         let (catalog, namespace, table) = match objects {
-            Some(sqlparser::ast::GrantObjects::Tables(tables)) if !tables.is_empty() => {
+            Some(
+                sqlparser::ast::GrantObjects::Tables(tables)
+                | sqlparser::ast::GrantObjects::Views(tables),
+            ) if !tables.is_empty() => {
                 let name = &tables[0];
                 let parts: Vec<String> = object_name_parts(name);
                 match parts.len() {
@@ -4514,6 +4541,13 @@ impl QueryHandler {
                     ),
                     _ => (None, None, Some(name.to_string())),
                 }
+            }
+            // `ON DATABASE cat` is a CATALOG-level resource. Without this arm it
+            // fell through to (None, None, None) and errored with "requires a
+            // catalog" despite naming one.
+            Some(sqlparser::ast::GrantObjects::Databases(dbs)) if !dbs.is_empty() => {
+                let parts: Vec<String> = object_name_parts(&dbs[0]);
+                (parts.first().cloned(), None, None)
             }
             Some(sqlparser::ast::GrantObjects::Schemas(schemas)) if !schemas.is_empty() => {
                 let name = &schemas[0];
@@ -4547,7 +4581,9 @@ impl QueryHandler {
             // it, and the docs say so.
             Some(
                 sqlparser::ast::GrantObjects::AllTablesInSchema { schemas }
-                | sqlparser::ast::GrantObjects::FutureTablesInSchema { schemas },
+                | sqlparser::ast::GrantObjects::FutureTablesInSchema { schemas }
+                | sqlparser::ast::GrantObjects::AllViewsInSchema { schemas }
+                | sqlparser::ast::GrantObjects::FutureViewsInSchema { schemas },
             ) if !schemas.is_empty() => {
                 let name = &schemas[0];
                 let parts: Vec<String> = object_name_parts(name);
@@ -4603,6 +4639,7 @@ impl QueryHandler {
             // function of the parsed statement and has no identity.
             grantor: None,
             with_grant_option,
+            object,
         })
     }
 
@@ -4657,10 +4694,31 @@ impl QueryHandler {
             // grantor too, so a caller cannot revoke what it has no authority
             // over.
             grantor: Some(session.user.username.clone()),
+            object: grant_stmt.object,
         };
         backend.revoke(session.access_token().expose(), &revoke_stmt).await?;
         // Flush the policy cache only after the mutation succeeds so the
         // revoked grant stops working immediately (issue #207).
+        self.invalidate_policy_cache();
+        Ok(vec![])
+    }
+
+    /// Handle DENY by delegating to the configured grant backend.
+    ///
+    /// Same admin gate as GRANT. Note the asymmetry documented on
+    /// `RangerGrantStore::deny`: Ranger's policy API (the only way to write a
+    /// deny) authorizes the REST user rather than a `grantor`, so unlike GRANT
+    /// this is NOT additionally scoped to the caller's delegate authority.
+    async fn handle_deny(
+        &self,
+        session: &Session,
+        stmt: &Statement,
+    ) -> sqe_core::Result<Vec<RecordBatch>> {
+        self.require_admin(session, "DENY")?;
+        let backend = self.require_grant_backend()?;
+        let mut deny_stmt = Self::extract_grant_statement(stmt)?;
+        deny_stmt.grantor = Some(session.user.username.clone());
+        backend.deny(session.access_token().expose(), &deny_stmt).await?;
         self.invalidate_policy_cache();
         Ok(vec![])
     }
@@ -7325,6 +7383,59 @@ mod tests {
 
     // ── extract_grant_statement tests ──────────────────────────────────
 
+    /// `ON VIEW` and `ON DATABASE` used to fall through to (None, None, None) and
+    /// fail with "Ranger GRANT requires a catalog" despite naming a qualified
+    /// object. Both now resolve, and a view is tagged so the backend emits view
+    /// access types against the table resource slot.
+    #[test]
+    fn extract_grant_statement_view_and_database_objects() {
+        use sqlparser::dialect::GenericDialect;
+        use sqlparser::parser::Parser;
+
+        let stmts = Parser::parse_sql(
+            &GenericDialect {},
+            "GRANT SELECT ON VIEW my_catalog.my_schema.my_view TO alice",
+        )
+        .unwrap();
+        let v = QueryHandler::extract_grant_statement(&stmts[0]).unwrap();
+        assert_eq!(v.catalog.as_deref(), Some("my_catalog"));
+        assert_eq!(v.namespace.as_deref(), Some("my_schema"));
+        assert_eq!(v.table.as_deref(), Some("my_view"));
+        assert_eq!(v.object, sqe_policy::grants::GrantObjectKind::View);
+
+        // ALL VIEWS IN SCHEMA gets the same table wildcard as ALL TABLES, and
+        // stays tagged as a view.
+        let stmts = Parser::parse_sql(
+            &GenericDialect {},
+            "GRANT SELECT ON ALL VIEWS IN SCHEMA my_catalog.my_schema TO alice",
+        )
+        .unwrap();
+        let av = QueryHandler::extract_grant_statement(&stmts[0]).unwrap();
+        assert_eq!(av.table.as_deref(), Some("*"));
+        assert_eq!(av.object, sqe_policy::grants::GrantObjectKind::View);
+
+        // ON DATABASE is a catalog-level resource: catalog only, no namespace.
+        let stmts = Parser::parse_sql(
+            &GenericDialect {},
+            "GRANT USAGE ON DATABASE my_catalog TO alice",
+        )
+        .unwrap();
+        let d = QueryHandler::extract_grant_statement(&stmts[0]).unwrap();
+        assert_eq!(d.catalog.as_deref(), Some("my_catalog"));
+        assert_eq!(d.namespace, None);
+        assert_eq!(d.table, None);
+        assert_eq!(d.object, sqe_policy::grants::GrantObjectKind::Table);
+
+        // A plain table is unchanged and still tagged as a table.
+        let stmts = Parser::parse_sql(
+            &GenericDialect {},
+            "GRANT SELECT ON my_catalog.my_schema.t TO alice",
+        )
+        .unwrap();
+        let t = QueryHandler::extract_grant_statement(&stmts[0]).unwrap();
+        assert_eq!(t.object, sqe_policy::grants::GrantObjectKind::Table);
+    }
+
     #[test]
     fn extract_grant_statement_basic_table() {
         use sqe_policy::grants::Grantee;
@@ -7555,25 +7666,57 @@ mod tests {
         assert!(matches!(stmt.grantee, Grantee::User(ref n) if n == "alice"));
     }
 
-    /// DENY is not a grant/revoke SQE understands. sqlparser 0.62 added a
-    /// dedicated `Statement::Deny` parse (older versions errored at parse
-    /// time), but SQE's classifier has no arm for it, so it is refused with a
-    /// `NotImplemented` error rather than being silently accepted. This test
-    /// documents that SQE's observable behavior is preserved: DENY is rejected,
-    /// and in particular it is NOT classified as a Grant or Revoke.
+    /// DENY is now supported, and must be classified as its OWN kind.
+    ///
+    /// This test previously asserted the opposite ("DENY must be refused by
+    /// SQE"), which was the correct contract while nothing could write a denial:
+    /// Ranger's grant endpoint cannot express one. DENY now goes through the
+    /// policy API, so the statement is accepted, and this test is inverted
+    /// deliberately.
+    ///
+    /// It must NOT be classified as Grant or Revoke. That distinction is
+    /// load-bearing in two places: `handle_deny` writes deny items rather than
+    /// allow items, and the audit path records a denial as a privilege change of
+    /// its own rather than as a grant.
     #[test]
-    fn deny_is_rejected_by_sqe() {
-        let sql = "DENY SELECT ON my_table TO alice";
-        let result = sqe_sql::parse_and_classify(sql);
-
+    fn deny_is_classified_as_its_own_kind() {
+        let kind = sqe_sql::parse_and_classify("DENY SELECT ON my_table TO alice")
+            .expect("DENY must parse and classify");
         assert!(
-            result.is_err(),
-            "DENY must be refused by SQE, got: {result:?}"
+            matches!(kind, sqe_sql::StatementKind::Deny(_)),
+            "expected StatementKind::Deny, got: {kind:?}"
         );
-        if let Ok(kind) = &result {
+        assert!(
+            !matches!(
+                kind,
+                sqe_sql::StatementKind::Grant(_) | sqe_sql::StatementKind::Revoke(_)
+            ),
+            "DENY must never be confused with a grant or a revoke"
+        );
+    }
+
+    /// A denial is a privilege change and must land in the audit log as one.
+    ///
+    /// The `AuditKind::Grant` path is gated on the statement kind, and DENY was
+    /// not in that gate when it was added, so a denial would have been recorded
+    /// as an ordinary statement. An unaudited privilege change is not acceptable.
+    #[test]
+    fn deny_is_audited_as_a_privilege_change() {
+        for sql in [
+            "GRANT SELECT ON t TO alice",
+            "REVOKE SELECT ON t FROM alice",
+            "DENY SELECT ON t TO alice",
+        ] {
+            let kind = sqe_sql::parse_and_classify(sql).expect("classify");
             assert!(
-                !matches!(kind, sqe_sql::StatementKind::Grant(_) | sqe_sql::StatementKind::Revoke(_)),
-                "DENY must never be treated as a Grant/Revoke, got: {kind:?}"
+                matches!(
+                    kind,
+                    sqe_sql::StatementKind::Grant(_)
+                        | sqe_sql::StatementKind::Revoke(_)
+                        | sqe_sql::StatementKind::Deny(_)
+                ),
+                "`{sql}` must be one of the privilege-change kinds the audit gate \
+                 recognises, got: {kind:?}"
             );
         }
     }
