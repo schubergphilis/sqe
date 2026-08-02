@@ -24,6 +24,22 @@ pub trait GrantBackend: Send + Sync {
     /// Remove a privilege grant.
     async fn revoke(&self, token: &str, stmt: &RevokeStatement) -> sqe_core::Result<()>;
 
+    /// Write an explicit DENY.
+    ///
+    /// Separate from `grant` because the backends express it differently: Ranger
+    /// carries deny as `denyPolicyItems` on a policy, which its grant/revoke
+    /// endpoint cannot write at all, so this goes through the policy API.
+    ///
+    /// Defaults to unsupported so a backend without a deny concept says so
+    /// instead of silently doing nothing, which for a deny would be the
+    /// dangerous direction: the caller would believe access was blocked.
+    async fn deny(&self, _token: &str, _stmt: &GrantStatement) -> sqe_core::Result<()> {
+        Err(sqe_core::SqeError::NotImplemented(format!(
+            "DENY is not supported by the {} access-control backend",
+            self.backend_name()
+        )))
+    }
+
     /// List grants matching a filter (by resource or by grantee).
     async fn show_grants(
         &self,
@@ -76,6 +92,9 @@ pub struct GrantStatement {
     /// Ranger's `delegateAdmin`. Without this, only principals seeded with
     /// delegate authority at bootstrap can ever grant.
     pub with_grant_option: bool,
+    /// Whether the named object is a table or a view. Selects the access-type
+    /// set; the resource shape is the same either way.
+    pub object: GrantObjectKind,
 }
 
 /// A parsed REVOKE statement ready for backend dispatch.
@@ -89,6 +108,25 @@ pub struct RevokeStatement {
     /// See `GrantStatement::grantor`. Revoking is also authorized against the
     /// grantor, so a caller can only revoke what it has authority over.
     pub grantor: Option<String>,
+    /// See `GrantStatement::object`.
+    pub object: GrantObjectKind,
+}
+
+/// What kind of object a GRANT names.
+///
+/// Polaris models views with their own access types (`view-properties-read`,
+/// `view-list`, `view-create`, `view-drop`, ...) but with NO separate resource
+/// level: a view is addressed by putting its name in the `table` resource slot.
+/// Verified against a live Polaris 1.6 -- granting `view-properties-read` on
+/// `{catalog, namespace, table: <view name>}` lets the grantee load the view.
+///
+/// So the resource shape is identical to a table's and only the access-type set
+/// differs, which is why this is a separate axis from `ResourceLevel`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GrantObjectKind {
+    #[default]
+    Table,
+    View,
 }
 
 /// Backend-neutral grantee. Each backend maps this to its own model.

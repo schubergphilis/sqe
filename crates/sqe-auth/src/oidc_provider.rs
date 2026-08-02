@@ -302,7 +302,23 @@ impl AuthProvider for OidcPasswordProvider {
             Err(e) => return Err(e),
         };
 
-        let user_id = Self::extract_sub(&token_response.access_token)
+        // Identity precedence: `preferred_username`, then `sub`, then the login
+        // name the caller supplied.
+        //
+        // `preferred_username` FIRST is deliberate and load-bearing, not
+        // cosmetic. Polaris federates its principal from `preferred_username`,
+        // and Ranger users/roles are named the same way. Keycloak's `sub` is a
+        // UUID, so preferring it made SQE's own notion of "who you are" disagree
+        // with both the catalog and the policy store. Observed symptom: a GRANT
+        // issued as the authenticated caller was refused by Ranger with
+        // "Grantor user dd76fc2e-... doesn't exist", and any Ranger policy bound
+        // to a USER (rather than a role) could never match the session.
+        //
+        // `sub` remains the fallback for providers that do not issue
+        // `preferred_username`.
+        let user_id = Self::extract_claim_str(&token_response.access_token, "preferred_username")
+            .filter(|s| !s.is_empty())
+            .or_else(|| Self::extract_sub(&token_response.access_token))
             .unwrap_or_else(|| username.clone());
 
         let roles =
@@ -465,6 +481,30 @@ mod tests {
     // -----------------------------------------------------------------------
     // extract_sub
     // -----------------------------------------------------------------------
+
+    /// Identity must be `preferred_username`, not `sub`.
+    ///
+    /// Polaris federates its principal from `preferred_username` and Ranger
+    /// names users the same way, while Keycloak's `sub` is a UUID. Preferring
+    /// `sub` made SQE disagree with both: a GRANT as the caller was refused
+    /// ("Grantor user dd76fc2e-... doesn't exist") and USER-bound Ranger policies
+    /// could never match the session.
+    #[test]
+    fn identity_prefers_preferred_username_over_sub() {
+        let token = fake_jwt(&serde_json::json!({
+            "sub": "dd76fc2e-367a-48fd-882d-e53b3c5c90d0",
+            "preferred_username": "carol",
+        }));
+        assert_eq!(
+            OidcPasswordProvider::extract_claim_str(&token, "preferred_username").as_deref(),
+            Some("carol")
+        );
+        assert_eq!(
+            OidcPasswordProvider::extract_sub(&token).as_deref(),
+            Some("dd76fc2e-367a-48fd-882d-e53b3c5c90d0"),
+            "sub is still readable; it is the fallback, not the primary"
+        );
+    }
 
     #[test]
     fn extract_sub_from_valid_jwt() {
