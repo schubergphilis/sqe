@@ -27,6 +27,18 @@ pub enum ResourceLevel {
     Table,
 }
 
+impl ResourceLevel {
+    /// The name to use when telling an operator which level a privilege binds
+    /// to. Matches the Ranger resource key.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ResourceLevel::Catalog => "catalog",
+            ResourceLevel::Namespace => "namespace",
+            ResourceLevel::Table => "table",
+        }
+    }
+}
+
 /// A SQL read (SELECT) through SQE loads the table then reads data files. The
 /// Polaris embedded Ranger authorizer does NOT honor service-def impliedGrants,
 /// so each required access type is listed explicitly.
@@ -206,6 +218,52 @@ pub fn build_resource_map(
         }
     }
     m
+}
+
+/// Refuse a statement that names an object DEEPER than the level its privilege
+/// binds to, instead of silently widening it.
+///
+/// `build_resource_map` drops the components a level does not use. That is
+/// correct for building the map and wrong as a response to the user: a
+/// privilege bound to the catalog level, named against a table, drops both the
+/// namespace and the table and writes a CATALOG-WIDE policy. `GRANT ALL ON
+/// wh.sales.orders TO alice` reports success on one table and hands alice
+/// `catalog-content-manage` over every table in `wh`.
+///
+/// Widening is silent in both directions: nothing in the response distinguishes
+/// it from the narrow grant that was asked for, and the operator who reads
+/// `SHOW GRANTS` later sees a catalog policy nobody remembers writing. Failing
+/// is the only safe answer, because the alternative is granting more than was
+/// asked for.
+///
+/// Deliberately general rather than special-cased to `ALL`: `USAGE` and
+/// `CREATE SCHEMA` widen through exactly the same path.
+fn reject_scope_deeper_than_level(
+    privilege: &str,
+    level: ResourceLevel,
+    catalog: &str,
+    namespace: Option<&str>,
+    table: Option<&str>,
+) -> sqe_core::Result<()> {
+    let (extra, honoured) = match level {
+        ResourceLevel::Table => return Ok(()),
+        ResourceLevel::Namespace if table.is_some() => ("a table", format!(
+            "{catalog}.{}",
+            namespace.unwrap_or("<namespace>")
+        )),
+        ResourceLevel::Namespace => return Ok(()),
+        ResourceLevel::Catalog if namespace.is_some() || table.is_some() => {
+            ("a namespace or table", catalog.to_string())
+        }
+        ResourceLevel::Catalog => return Ok(()),
+    };
+    Err(sqe_core::SqeError::Execution(format!(
+        "Privilege '{privilege}' binds to the {} level, but the statement names {extra}. \
+         The policy would apply to '{honoured}' and everything under it, which is wider \
+         than the object named. Re-issue the statement against '{honoured}', or name a \
+         privilege that binds to the object you meant.",
+        level.as_str(),
+    )))
 }
 
 /// Build a Ranger deny item for one grantee and access-type set.
@@ -390,6 +448,7 @@ impl RangerGrantBackend {
         validate_identifier(grantee.name(), "grantee")?;
 
         let (access, level) = map_sql_to_ranger_access_for(object, privilege);
+        reject_scope_deeper_than_level(privilege, level, catalog, namespace, table)?;
         let resource = build_resource_map(&self.realm, catalog, namespace, table, level);
         let (users, roles) = grantee_to_fields(grantee)?;
 
@@ -865,6 +924,17 @@ impl GrantBackend for RangerGrantBackend {
             validate_identifier(t, "table")?;
         }
         validate_identifier(stmt.grantee.name(), "grantee")?;
+        // A widened DENY over-restricts rather than over-grants, so it is the
+        // safer direction, but it is just as surprising: DENY on one table would
+        // silently lock the grantee out of the whole catalog. Same guard, so
+        // GRANT, REVOKE and DENY agree on what a statement's scope means.
+        reject_scope_deeper_than_level(
+            &stmt.privilege,
+            level,
+            catalog,
+            stmt.namespace.as_deref(),
+            stmt.table.as_deref(),
+        )?;
 
         let resource = build_resource_map(
             &self.realm,
@@ -1281,6 +1351,115 @@ mod tests {
             .expect("build table grant");
         assert!(tbl.access_types.contains(&"table-data-read".to_string()));
         assert!(!tbl.access_types.contains(&"view-properties-read".to_string()));
+    }
+
+    #[test]
+    fn all_privileges_on_a_table_is_refused_rather_than_widened_to_the_catalog() {
+        // The bug this guards: ALL binds to the catalog level, so
+        // build_resource_map drops the namespace and table and the write lands
+        // as catalog-wide `catalog-content-manage`. The statement names one
+        // table and reports success, and alice ends up able to manage every
+        // table in `wh`. Silent scope widening on a GRANT is the worst
+        // direction for it to fail in.
+        let b = test_backend();
+        let err = b
+            .build_grant_revoke_for(
+                "ALL PRIVILEGES",
+                GrantObjectKind::Table,
+                Some("wh"),
+                Some("sales"),
+                Some("orders"),
+                &Grantee::User("alice".into()),
+            )
+            .expect_err("ALL on a table must not silently become a catalog grant");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("catalog level"),
+            "the error must name the level the privilege binds to: {msg}"
+        );
+        assert!(
+            msg.contains("'wh'"),
+            "the error must name the scope that WOULD have been written: {msg}"
+        );
+
+        // Named at the level it binds to, the same privilege still works.
+        let ok = b
+            .build_grant_revoke_for(
+                "ALL PRIVILEGES",
+                GrantObjectKind::Table,
+                Some("wh"),
+                None,
+                None,
+                &Grantee::User("alice".into()),
+            )
+            .expect("ALL against the catalog itself is a legitimate grant");
+        assert!(ok.access_types.contains(&"catalog-content-manage".to_string()));
+        assert!(!ok.resource.contains_key("namespace"));
+    }
+
+    #[test]
+    fn namespace_privileges_named_against_a_table_are_refused() {
+        // Same defect class, different level: USAGE binds to the namespace, so
+        // naming a table drops it and writes a namespace-wide policy. The guard
+        // is general rather than an ALL special case because this path widens
+        // too, just less spectacularly.
+        let b = test_backend();
+        let err = b
+            .build_grant_revoke_for(
+                "USAGE",
+                GrantObjectKind::Table,
+                Some("wh"),
+                Some("sales"),
+                Some("orders"),
+                &Grantee::User("alice".into()),
+            )
+            .expect_err("USAGE on a table must not silently become a namespace grant");
+        assert!(
+            err.to_string().contains("wh.sales"),
+            "the error must name the namespace that would have been written: {err}"
+        );
+
+        // CREATE SCHEMA binds to the catalog, so naming a namespace widens it.
+        let err = b
+            .build_grant_revoke_for(
+                "CREATE SCHEMA",
+                GrantObjectKind::Table,
+                Some("wh"),
+                Some("sales"),
+                None,
+                &Grantee::User("alice".into()),
+            )
+            .expect_err("CREATE SCHEMA on a namespace must not become a catalog grant");
+        assert!(err.to_string().contains("catalog level"), "{err}");
+    }
+
+    #[test]
+    fn table_level_privileges_are_untouched_by_the_scope_guard() {
+        // The guard must not fire on the common path. A table-level privilege
+        // named against a table, a namespace-level privilege named against a
+        // namespace, and a wildcard ON ALL TABLES grant all stay legal.
+        let b = test_backend();
+        for (privilege, ns, tbl) in [
+            ("SELECT", Some("sales"), Some("orders")),
+            ("INSERT", Some("sales"), Some("orders")),
+            ("SELECT", Some("sales"), Some("*")),
+            ("CREATE TABLE", Some("sales"), None),
+            ("USAGE", Some("sales"), None),
+            ("CREATE SCHEMA", None, None),
+        ] {
+            assert!(
+                b.build_grant_revoke_for(
+                    privilege,
+                    GrantObjectKind::Table,
+                    Some("wh"),
+                    ns,
+                    tbl,
+                    &Grantee::User("alice".into()),
+                )
+                .is_ok(),
+                "GRANT {privilege} on {ns:?}.{tbl:?} is correctly scoped and must be allowed"
+            );
+        }
     }
 
     #[test]
