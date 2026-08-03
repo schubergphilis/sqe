@@ -155,7 +155,7 @@ _To be filled in Task 12_
 Add to the top of `docs/features.md`:
 
 ```markdown
-> For a detailed function-by-function Trino compatibility matrix, see [trino-compatibility.md](trino-compatibility.md).
+> For a detailed function-by-function Trino compatibility matrix, see [trino-compatibility.md](../../site/compare/trino-compatibility.md).
 ```
 
 - [ ] **Step 3: Commit**

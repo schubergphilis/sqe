@@ -178,7 +178,7 @@ scripts/integration-test.sh
 ## License
 
 By contributing to SQE, you agree that your contributions will be licensed
-under the [Apache License 2.0](LICENSE).
+under the [Apache License 2.0](../../../LICENSE).
 ```
 
 - [ ] **Step 2: Verify**
@@ -1348,7 +1348,7 @@ Mark Step 1 sections with ✅:
 ```markdown
 ## ~~Step 1: Security and Functional Audit~~ ✅
 
-See [AUDIT.md](AUDIT.md) for the full report. Completed 2026-04-08.
+See [AUDIT.md](../../../AUDIT.md) for the full report. Completed 2026-04-08.
 ```
 
 - [ ] **Step 2: Update README.md roadmap**

@@ -8,7 +8,7 @@ Copy-paste the content below into the tracking issue (GitLab/GitHub) when filing
 
 ## Summary
 
-SQE scores 58/189 (31%) on the [public Iceberg compatibility matrix](https://icebergmatrix.org/) rubric, tied with AWS Athena and below DuckDB. The matrix is the de facto engineer reference when evaluating Iceberg engines, so the score is visible to every evaluator. The openspec change [`iceberg-matrix-parity`](../openspec/changes/iceberg-matrix-parity/proposal.md) lifts SQE to 156/189 (83%) across 8 phases in 4 to 6 months, and submits SQE as an OSS entry to the public matrix.
+SQE scores 58/189 (31%) on the [public Iceberg compatibility matrix](https://icebergmatrix.org/) rubric, tied with AWS Athena and below DuckDB. The matrix is the de facto engineer reference when evaluating Iceberg engines, so the score is visible to every evaluator. The openspec change [`iceberg-matrix-parity`](../../../openspec/changes/iceberg-matrix-parity/proposal.md) lifts SQE to 156/189 (83%) across 8 phases in 4 to 6 months, and submits SQE as an OSS entry to the public matrix.
 
 ## Target scoreboard
 
