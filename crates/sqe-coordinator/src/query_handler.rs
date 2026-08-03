@@ -350,47 +350,54 @@ impl QueryHandler {
     }
 
     /// Resolve the catalog whose metadata a `SHOW SCHEMAS/TABLES FROM <catalog>`
-    /// should read. When `catalog` names a non-default warehouse and
-    /// `catalog_discovery = polaris-auto`, discover THAT catalog via Polaris
-    /// (same resolution the write path uses), so `SHOW SCHEMAS FROM ws_team_a`
-    /// lists `ws_team_a`'s namespaces rather than the default warehouse's. An
-    /// unqualified SHOW (or a reference to the default warehouse) uses the
-    /// default session catalog as before.
+    /// should read.
+    ///
+    /// The decision itself is `show_catalog_target`, which is pure and tested;
+    /// this only carries it out.
     async fn show_catalog(
         &self,
         session: &Session,
         catalog: Option<&str>,
     ) -> sqe_core::Result<Arc<SessionCatalog>> {
-        // An explicit catalog in the SHOW statement wins; otherwise fall back to
-        // the session catalog (the connection's X-Trino-Catalog / Flight
-        // catalog). Without this, `SHOW TABLES` / `SHOW TABLES FROM <schema>`
-        // and `SHOW SCHEMAS` (no catalog qualifier) resolved against the default
-        // warehouse and ignored the session catalog, so a BI client syncing
-        // against a polaris-auto-discovered catalog saw 0 tables -- while the
-        // SELECT path worked because its explicit 3-part name triggered
-        // discovery. This aligns the SHOW path with the SELECT path. (#6/#2)
-        let catalog = catalog.or(session.default_catalog.as_deref());
-        if let Some(cat) = catalog {
-            if cat != self.config.catalog.warehouse
-                && self.config.query.catalog_discovery
-                    == sqe_core::config::CatalogDiscovery::PolarisAuto
-            {
-                return crate::session_context::discover_session_catalog(
-                    cat,
+        match show_catalog_target(catalog, session.default_catalog.as_deref(), &self.config) {
+            ShowCatalogTarget::Session => self.session_catalog(session).await,
+            ShowCatalogTarget::Named(name) => {
+                // A catalog declared in `[catalogs.*]` is built from ITS OWN config.
+                // Not via the discovery template: that clones one catalog's config
+                // and overrides only `warehouse`, so a catalog with a different
+                // `polaris_url`, auth or cache TTL would be read with another
+                // catalog's settings.
+                if let Some(sc) = crate::session_context::configured_session_catalog(
+                    &name,
                     &self.config,
                     session,
                     self.table_cache.as_ref(),
                 )
                 .await
-                .ok_or_else(|| {
-                    sqe_core::SqeError::Catalog(format!(
-                        "Unknown catalog '{cat}': not resolvable via Polaris \
-                         (nonexistent or not authorized for this user)"
-                    ))
-                });
+                {
+                    return Ok(sc);
+                }
+                if let Some(sc) = crate::session_context::discover_session_catalog(
+                    &name,
+                    &self.config,
+                    session,
+                    self.table_cache.as_ref(),
+                )
+                .await
+                {
+                    return Ok(sc);
+                }
+                // Deliberately an error, not a fallback to the session catalog.
+                // Falling back is what produced the bug this replaces: the answer
+                // described a DIFFERENT catalog than the one named, and reported
+                // success. `SHOW SCHEMAS` is how an operator confirms a grant
+                // landed, so a confidently wrong answer is worse than a refusal.
+                Err(sqe_core::SqeError::Catalog(format!(
+                    "Unknown catalog '{name}': not declared in configuration and not \
+                     resolvable via Polaris (nonexistent, or not authorized for this user)"
+                )))
             }
         }
-        self.session_catalog(session).await
     }
 
     /// List `(namespace, table_name)` pairs reachable by `session` across the
@@ -6629,6 +6636,64 @@ fn unquote_segment(s: &str) -> &str {
 
 /// Catalog named by `SHOW SCHEMAS FROM <catalog>`: the leading dotted segment.
 /// `None` when there is no FROM/IN clause (lists the default catalog).
+/// Which catalog a `SHOW` should read: the session's own, or a specific named one.
+#[derive(Debug, PartialEq, Eq)]
+enum ShowCatalogTarget {
+    /// Use the session catalog. Correct only when the session ALREADY resolves to
+    /// the catalog the statement names (or the statement names none).
+    Session,
+    /// Resolve this catalog by name, independently of the session.
+    Named(String),
+}
+
+/// Decide the target for `SHOW SCHEMAS/TABLES [FROM <catalog>]`.
+///
+/// The bug this replaces: the old guard asked whether the named catalog differed
+/// from `config.catalog.warehouse`, the legacy single-catalog field, and used the
+/// session catalog when it matched. But the session resolves to
+/// `query.default_catalog`, or failing that the alphabetically FIRST entry of
+/// `[catalogs.*]` -- which is a different catalog whenever the legacy `warehouse`
+/// is not also the first entry.
+///
+/// Live consequence, with `[catalogs.ops_wh]`, `[catalogs.sales_wh]` and
+/// `[catalog] warehouse = "sales_wh"`: the session default sorts to `ops_wh`, so
+/// `SHOW SCHEMAS FROM sales_wh` matched the guard, fell through to the session
+/// catalog, and listed **ops_wh's** namespaces. `SHOW SCHEMAS FROM ops_wh`
+/// returned the same rows by a different route, so the two were
+/// indistinguishable, both reported success, and neither named the catalog it had
+/// actually read.
+///
+/// So the question is not "is this the legacy warehouse" but "is this the catalog
+/// the session already resolves to". A name is matched against both the catalog's
+/// KEY and its `warehouse`, because a legacy single-catalog deployment is keyed
+/// `iceberg` while operators name it by its warehouse.
+fn show_catalog_target(
+    named: Option<&str>,
+    session_default: Option<&str>,
+    config: &sqe_core::config::SqeConfig,
+) -> ShowCatalogTarget {
+    let Some(named) = named.or(session_default) else {
+        return ShowCatalogTarget::Session;
+    };
+    let effective_default = session_default
+        .map(str::to_string)
+        .unwrap_or_else(|| config.resolve_default_catalog());
+    if named == effective_default {
+        return ShowCatalogTarget::Session;
+    }
+    // The same catalog reached by its warehouse rather than its config key.
+    let default_warehouse = config
+        .flattened_catalogs()
+        .into_iter()
+        .find(|(n, _)| *n == effective_default)
+        .map(|(_, c)| c.warehouse.clone())
+        .unwrap_or_else(|| config.catalog.warehouse.clone());
+    if named == default_warehouse {
+        return ShowCatalogTarget::Session;
+    }
+    ShowCatalogTarget::Named(named.to_string())
+}
+
 fn show_schemas_catalog(filter: &str) -> Option<String> {
     let after = strip_show_in_keyword(filter);
     if after.is_empty() {
@@ -7350,6 +7415,124 @@ mod tests {
     }
 
     // ─── read-side catalog extraction (SHOW SCHEMAS/TABLES FROM <catalog>) ──
+    /// Config shaped like the quickstart, which is where the bug was observed:
+    /// two declared catalogs, no `query.default_catalog`, and a legacy
+    /// `[catalog] warehouse` that is NOT the alphabetically first entry.
+    fn two_catalog_config() -> sqe_core::config::SqeConfig {
+        // Verbatim shape of quickstart/polaris-ranger-keycloak/sqe.toml, which is
+        // where this was observed: two declared catalogs, no
+        // `query.default_catalog`, and a legacy `[catalog] warehouse` that is NOT
+        // the alphabetically first entry.
+        toml::from_str(
+            r#"
+[coordinator]
+[auth]
+
+[catalogs.sales_wh]
+catalog_url = "http://localhost:8181/api/catalog"
+warehouse = "sales_wh"
+
+[catalogs.ops_wh]
+catalog_url = "http://localhost:8181/api/catalog"
+warehouse = "ops_wh"
+
+[catalog]
+catalog_url = "http://localhost:8181/api/catalog"
+warehouse = "sales_wh"
+"#,
+        )
+        .expect("parse two-catalog config")
+    }
+
+    fn legacy_single_catalog_config() -> sqe_core::config::SqeConfig {
+        toml::from_str(
+            r#"
+[coordinator]
+[auth]
+
+[catalog]
+catalog_url = "http://localhost:8181/api/catalog"
+warehouse = "wh1"
+"#,
+        )
+        .expect("parse legacy config")
+    }
+
+    #[test]
+    fn the_session_default_is_the_first_catalog_not_the_legacy_warehouse() {
+        // Guards the precondition the next test depends on. If this ever stops
+        // holding, that test would pass for the wrong reason.
+        let config = two_catalog_config();
+        assert_eq!(config.resolve_default_catalog(), "ops_wh");
+        assert_eq!(config.catalog.warehouse, "sales_wh");
+    }
+
+    #[test]
+    fn show_from_the_legacy_warehouse_does_not_answer_about_another_catalog() {
+        // THE BUG. The old guard compared the named catalog to
+        // `config.catalog.warehouse` and used the session catalog when they
+        // matched -- but the session resolves to ops_wh here, so
+        // `SHOW SCHEMAS FROM sales_wh` listed ops_wh's namespaces and reported
+        // success. Both catalogs answered identically and neither named the one it
+        // had read.
+        let config = two_catalog_config();
+        assert_eq!(
+            show_catalog_target(Some("sales_wh"), None, &config),
+            ShowCatalogTarget::Named("sales_wh".to_string()),
+            "a named catalog that is not the session default must be resolved by \
+             name, never served from the session catalog"
+        );
+    }
+
+    #[test]
+    fn show_from_the_session_default_uses_the_session_catalog() {
+        let config = two_catalog_config();
+        // By config key ...
+        assert_eq!(
+            show_catalog_target(Some("ops_wh"), None, &config),
+            ShowCatalogTarget::Session
+        );
+        // ... and unqualified.
+        assert_eq!(show_catalog_target(None, None, &config), ShowCatalogTarget::Session);
+        // A session that overrides the default is honoured over the config.
+        assert_eq!(
+            show_catalog_target(Some("sales_wh"), Some("sales_wh"), &config),
+            ShowCatalogTarget::Session
+        );
+        assert_eq!(
+            show_catalog_target(None, Some("sales_wh"), &config),
+            ShowCatalogTarget::Session
+        );
+        // ... and a catalog that is NOT the session's override is named.
+        assert_eq!(
+            show_catalog_target(Some("ops_wh"), Some("sales_wh"), &config),
+            ShowCatalogTarget::Named("ops_wh".to_string())
+        );
+    }
+
+    #[test]
+    fn a_legacy_single_catalog_named_by_its_warehouse_is_the_session_catalog() {
+        // A legacy deployment declares no `[catalogs.*]`, so the flattened key is
+        // `iceberg` while operators name the catalog by its warehouse. Resolving
+        // that by name would go looking for a catalog called `wh1` and fail, so
+        // `SHOW SCHEMAS FROM wh1` must still mean "the session catalog".
+        let config = legacy_single_catalog_config();
+        assert_eq!(config.resolve_default_catalog(), "iceberg");
+        assert_eq!(
+            show_catalog_target(Some("wh1"), None, &config),
+            ShowCatalogTarget::Session,
+            "the legacy warehouse name is the session catalog, not a foreign one"
+        );
+        assert_eq!(
+            show_catalog_target(Some("iceberg"), None, &config),
+            ShowCatalogTarget::Session
+        );
+        assert_eq!(
+            show_catalog_target(Some("somewhere_else"), None, &config),
+            ShowCatalogTarget::Named("somewhere_else".to_string())
+        );
+    }
+
     #[test]
     fn show_schemas_catalog_extracts_from_clause() {
         assert_eq!(show_schemas_catalog("FROM ws_team_a"), Some("ws_team_a".to_string()));
