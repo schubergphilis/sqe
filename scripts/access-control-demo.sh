@@ -19,7 +19,7 @@
 #   4  data gate     -- row filter
 #   5  data gate     -- tag-based mask via SET TAGS
 #   6  introspection -- SHOW GRANTS, CHECK ACCESS
-#   7  the view gap  -- shown as the error it actually produces
+#   7  views         -- GRANT ON VIEW writes view access types on the view name
 #
 # Usage:
 #   scripts/access-control-demo.sh                          # bring the stack up, run all
@@ -434,17 +434,32 @@ JSON
   run ok carol "ALTER TABLE $T UNSET TAGS (region)" "remove the tag again"
 
   echo; bold "═══ 6. Introspection ═══"
-  run ok carol "SHOW GRANTS ON $T" "who holds what on this table" 'table-data-read.*analyst|analyst' 
-  run ok carol "CHECK ACCESS SELECT ON $T FOR USER \"alice\"" "does alice have SELECT on this table" 'alice|true|ALLOW' 
+  # These two matchers used to be ERE ALTERNATIONS ('alice|true|ALLOW'), so they
+  # passed on any output containing "alice". CHECK ACCESS was answering `false`
+  # for alice the whole time, while alice could read the table, and the step
+  # still reported PASS. Anchor on the value, never on a word that appears in
+  # the reason text.
+  run ok carol "SHOW GRANTS ON $T" "who holds what on this table" \
+    'table-data-read.*ROLE.*analyst'
+  run ok carol "CHECK ACCESS SELECT ON $T FOR USER \"alice\"" \
+    "alice holds SELECT through the analyst role, and CHECK ACCESS must say so" \
+    'true.*Allowed via ROLE' 'false'
+  run ok carol "CHECK ACCESS SELECT ON $T FOR USER \"dave\"" \
+    "dave is in no role: the same question must answer no (control)" \
+    'false.*No matching grant' 'true'
 
-  echo; bold "═══ 7. The view gap (expected to fail) ═══"
-  dim "The polaris service-def has no view resource level and no privilege maps to a"
-  dim "view access type. The statement parses, then loses the object identity."
-  run ok    carol "CREATE OR REPLACE VIEW $V AS SELECT id, region FROM $T WHERE region = 'EU'" \
+  echo; bold "═══ 7. Views ═══"
+  dim "A view has no resource level of its own. Its NAME goes in the table slot and"
+  dim "the access types are view-*, which is what GRANT ... ON VIEW now writes."
+  dim "A view is NOT a privilege boundary: SQE expands it and plans against the"
+  dim "base tables, so the reader still needs a grant there."
+  run ok carol "CREATE OR REPLACE VIEW $V AS SELECT id, region FROM $T WHERE region = 'EU'" \
     "carol can create a view (admin holds the view-* access types)"
-  run error carol "GRANT SELECT ON VIEW $V TO ROLE \"analyst\"" \
-    "GRANT ON VIEW fails with 'requires a catalog' despite the qualified name" \
-    'requires a catalog' 
+  run ok carol "GRANT SELECT ON VIEW $V TO ROLE \"analyst\"" \
+    "GRANT ON VIEW writes a view-scoped policy"
+  run ok carol "SHOW GRANTS ON $V" \
+    "the policy carries view access types on the view NAME, not table ones" \
+    'view-properties-read' 'table-data-read'
 
   echo
   bold "─────────────────────────────────────────────"
