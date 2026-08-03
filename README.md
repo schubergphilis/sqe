@@ -214,7 +214,7 @@ Same binary against external infrastructure (Glue, S3 Tables, HMS, JDBC, Hadoop)
 
 Docker, Kubernetes, TLS, and auth provider setup: [`docs/site/book/src/deployment/configuration.md`](docs/site/book/src/deployment/configuration.md).
 
-Production operator guide (memory, observability, scaling): [`docs/production.md`](docs/production.md).
+Production operator guide (memory, observability, scaling): [`operations/production-guide.md`](docs/site/book/src/operations/production-guide.md).
 
 ## Documentation
 

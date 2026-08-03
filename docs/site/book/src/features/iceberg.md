@@ -171,4 +171,4 @@ V3 features still blocked upstream:
 - **Geometry**: pending DataFusion UDT [#12644](https://github.com/apache/datafusion/issues/12644).
 - **Vector / Embedding**: V3 spec not finalised.
 
-The deferred list is tracked in [docs/iceberg-matrix-state.json](../../../iceberg-matrix-state.json) under `caveats` for each cell.
+The deferred list is tracked in `docs/evidence/iceberg-matrix-state.json` under `caveats` for each cell.

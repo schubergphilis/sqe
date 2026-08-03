@@ -511,22 +511,22 @@ snapshot ID, policy decision ID, credential scope hash, and expiry.
 ## Code-specific findings for SQE
 
 These recommendations reinforce the detailed
-[production-readiness review](sqlengine-production-readiness-review-2026-07-25.md):
+[production-readiness review](../reviews/2026-07-25-production-readiness-review.md):
 
-1. [`crates/sqe-worker/src/shuffle.rs`](../crates/sqe-worker/src/shuffle.rs)
+1. [`crates/sqe-worker/src/shuffle.rs`](../../../crates/sqe-worker/src/shuffle.rs)
    bounds partition queues by record-batch count and has no durable spill/reload
    lifecycle. This is the largest execution blocker for multi-TB joins and
    aggregates.
 2. The worker already has local spill and credential-refresh building blocks,
    but the entire scan-to-Flight-to-shuffle path is not byte-bounded.
-3. [`crates/sqe-coordinator/src/query_handler.rs`](../crates/sqe-coordinator/src/query_handler.rs)
+3. [`crates/sqe-coordinator/src/query_handler.rs`](../../../crates/sqe-coordinator/src/query_handler.rs)
    currently constructs read scan tasks from shared storage configuration rather
    than consistently propagating table-vended credentials.
-4. [`crates/sqe-worker/src/executor.rs`](../crates/sqe-worker/src/executor.rs)
+4. [`crates/sqe-worker/src/executor.rs`](../../../crates/sqe-worker/src/executor.rs)
    already understands session tokens and credential refresh, so the read-path
    gap is primarily coordinator extraction, scoped caching, fail-closed
    validation, and refresh wiring.
-5. [`docs/site/book/src/design-notes/s3vending.md`](site/book/src/design-notes/s3vending.md)
+5. [`docs/site/book/src/design-notes/s3vending.md`](../../site/book/src/design-notes/s3vending.md)
    correctly separates flow testing from real session-policy enforcement. The
    production-mode invariant and release gate should now be made executable.
 6. Existing scan/runtime-filter/late-materialization work is aligned with the

@@ -601,7 +601,7 @@ Other findings were smaller but cumulative. Nine Flight SQL metadata endpoints w
 
 We fixed all 43. Thirty-three files changed. +1,272 / -372 lines. Every unit test still passed. All sixty integration tests passed.
 
-The audit doc lives at `docs/issues.md`. It lists every finding by severity, with file:line references, what was wrong, how it was fixed, and why it matters. The document is not a badge. It is a maintenance artifact. When someone changes the session cache or the auth chain or the sort logic, they can check the audit doc to understand why the code looks the way it does.
+The audit doc lives at `docs/internal/audit/issues.md`. It lists every finding by severity, with file:line references, what was wrong, how it was fixed, and why it matters. The document is not a badge. It is a maintenance artifact. When someone changes the session cache or the auth chain or the sort logic, they can check the audit doc to understand why the code looks the way it does.
 
 ::: {.sovereignty}
 **Sovereignty principle:** A production security audit is not optional for sovereign infrastructure. If you skip it, you are deploying hope. The 43 findings were not surprising. They are the normal output of building software quickly and then reviewing it carefully. The difference between a prototype and a production system is not the code. It is the review.

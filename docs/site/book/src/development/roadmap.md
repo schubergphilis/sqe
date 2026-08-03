@@ -252,7 +252,7 @@ Not yet wired:
 
 ## Phase 7 - Iceberg V3 (Done)
 
-Iceberg V3 table format support landed end-to-end. The vendored fork at `vendor/iceberg-rust/` is rebased onto DataFusion 54 and carries V3 spec coverage. SQE Iceberg matrix score: 167/189 = 88.4% (per `docs/iceberg-matrix.md`).
+Iceberg V3 table format support landed end-to-end. The vendored fork at `vendor/iceberg-rust/` is rebased onto DataFusion 54 and carries V3 spec coverage. SQE Iceberg matrix score: 167/189 = 88.4% (per `docs/internal/design-archive/iceberg-matrix.md`).
 
 ### V3 Features Shipped
 
@@ -306,7 +306,7 @@ Coordinator-side OpenLineage 2-0-2 emitter with column-level lineage. Off by def
 - `sqe-lineage` crate: event types, observer, emitter task, file/HTTP/spool sinks, multi-catalog dataset extractor, column-lineage trace rules across 11 LogicalPlan node types
 - `OpenLineageConfig` in `sqe-core` with TOML + env-var overrides + startup validation
 - Hooks in `QueryHandler::execute_statement` (START / COMPLETE / FAIL)
-- Documented at `docs/book/src/operations/openlineage.md`
+- Documented at `docs/site/book/src/operations/openlineage.md`
 
 Deferrals (documented): mTLS, per-event user-OIDC bearer forwarding, MERGE per-branch column annotations, embedded CLI emit, DDL hint extraction.
 
