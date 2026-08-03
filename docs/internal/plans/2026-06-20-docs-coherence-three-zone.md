@@ -214,7 +214,7 @@ git mv docs/runbook.md docs/site/book/src/operations/runbook.md
 ```
 Then add to `docs/site/book/src/SUMMARY.md` under the Operations section:
 ```markdown
-- [On-Call Runbook](./operations/runbook.md)
+- [On-Call Runbook](../../site/book/src/operations/runbook.md)
 ```
 
 - [ ] **Step 3: Relocate the working roadmap into the book development section**
@@ -225,7 +225,7 @@ git mv docs/roadmap.md docs/site/book/src/development/roadmap.md
 ```
 Then add to `docs/site/book/src/SUMMARY.md` under the Development section (if not already present):
 ```markdown
-- [Roadmap](./development/roadmap.md)
+- [Roadmap](../../site/book/src/development/roadmap.md)
 ```
 
 - [ ] **Step 4: Rebuild and commit**
@@ -293,27 +293,27 @@ Edit `docs/site/book/src/SUMMARY.md`, adding a new top-level section after Devel
 ```markdown
 # Design Notes
 
-- [Overview](./design-notes/index.md)
-- [DataFusion Architecture](./design-notes/datafusion-architecture.md)
-- [Ballista Evaluation](./design-notes/ballista-evaluation-learnings.md)
-- [dbt Compatibility](./design-notes/dbt-sqe.md)
-- [Fine-grained Policy](./design-notes/fine-grained-policy.md)
-- [Ranger Access Control](./design-notes/ranger-access-control.md)
-  - [Fine-grained Enforcement](./design-notes/ranger-fine-grained-enforcement.md)
-  - [Service Type](./design-notes/ranger-fine-grained-service-type.md)
-  - [Tag Storage Decision](./design-notes/ranger-tag-storage-decision.md)
-- [Spark / Ranger Parity](./design-notes/sqe-spark-ranger-parity.md)
-- [S3 Credential Vending](./design-notes/s3vending.md)
-- [Polaris Principal Provisioning](./design-notes/polaris-principal-provisioning.md)
-- [Row-level Writes](./design-notes/row-level-writes.md)
-- [Iceberg Caching Strategy](./design-notes/iceberg-caching-strategy.md)
-- [Change Data Capture](./design-notes/cdc.md)
-- [Merge-on-Read vs Copy-on-Write](./design-notes/mor-vs-cow.md)
-- [Runtime Filter Pushdown](./design-notes/runtime-filter-pushdown.md)
-- [SSB SF1 Trace](./design-notes/ssb-sf1-trace.md)
-- [Quack Protocol](./design-notes/quack-protocol.md)
-- [Trino Client Compatibility](./design-notes/trino-client-compatibility.md)
-- [HuggingFace Glob Research](./design-notes/hf-glob-research.md)
+- [Overview](../../site/book/src/design-notes/index.md)
+- [DataFusion Architecture](../../site/book/src/design-notes/datafusion-architecture.md)
+- [Ballista Evaluation](../../site/book/src/design-notes/ballista-evaluation-learnings.md)
+- [dbt Compatibility](../../site/book/src/design-notes/dbt-sqe.md)
+- [Fine-grained Policy](../../site/book/src/design-notes/fine-grained-policy.md)
+- [Ranger Access Control](../../site/book/src/design-notes/ranger-access-control.md)
+  - [Fine-grained Enforcement](../../site/book/src/design-notes/ranger-fine-grained-enforcement.md)
+  - [Service Type](../../site/book/src/design-notes/ranger-fine-grained-service-type.md)
+  - [Tag Storage Decision](../../site/book/src/design-notes/ranger-tag-storage-decision.md)
+- [Spark / Ranger Parity](../../site/book/src/design-notes/sqe-spark-ranger-parity.md)
+- [S3 Credential Vending](../../site/book/src/design-notes/s3vending.md)
+- [Polaris Principal Provisioning](../../site/book/src/design-notes/polaris-principal-provisioning.md)
+- [Row-level Writes](../../site/book/src/design-notes/row-level-writes.md)
+- [Iceberg Caching Strategy](../../site/book/src/design-notes/iceberg-caching-strategy.md)
+- [Change Data Capture](../../site/book/src/design-notes/cdc.md)
+- [Merge-on-Read vs Copy-on-Write](../../site/book/src/design-notes/mor-vs-cow.md)
+- [Runtime Filter Pushdown](../../site/book/src/design-notes/runtime-filter-pushdown.md)
+- [SSB SF1 Trace](../../site/book/src/design-notes/ssb-sf1-trace.md)
+- [Quack Protocol](../../site/book/src/design-notes/quack-protocol.md)
+- [Trino Client Compatibility](../../site/book/src/design-notes/trino-client-compatibility.md)
+- [HuggingFace Glob Research](../../site/book/src/design-notes/hf-glob-research.md)
 ```
 
 - [ ] **Step 4: Fix any cross-links broken by the move**
