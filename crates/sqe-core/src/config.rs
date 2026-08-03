@@ -2501,7 +2501,7 @@ pub enum AccessControlBackend {
     Chameleon,
     /// Apache Polaris 1.3 native (`PRINCIPAL` / `PRINCIPAL_ROLE` / `CATALOG_ROLE`).
     Polaris,
-    /// Apache Ranger via Polaris 1.5 embedded authorizer. SQE writes grants to
+    /// Apache Ranger via the Polaris embedded authorizer. SQE writes grants to
     /// Ranger Admin; Polaris enforces. Requires `[access_control.ranger]`.
     Ranger,
 }
@@ -2563,7 +2563,8 @@ impl Default for AccessControlConfig {
 
 fn default_access_control_timeout() -> u64 { 30 }
 
-/// Apache Ranger backend configuration (Polaris 1.5 embedded authorizer).
+/// Apache Ranger backend configuration (Polaris embedded authorizer,
+/// validated against 1.7).
 ///
 /// The Ranger Admin base URL is taken from `access_control.url`
 /// (e.g. `http://ranger-admin:6080`), consistent with the Polaris backend.
