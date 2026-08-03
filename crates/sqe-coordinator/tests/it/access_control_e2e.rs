@@ -1881,3 +1881,97 @@ async fn all_tables_in_schema_grant_covers_the_namespace() {
         .execute(&ctx.carol, &format!("DROP TABLE IF EXISTS {second}"), None)
         .await;
 }
+
+/// Revoking one privilege must not destroy another the grantee still holds.
+///
+/// Ranger permits ONE policy per resource, so every grant on a table lands in
+/// the same policy item and the access types union. `WRITE_ACCESS` is a strict
+/// superset of `READ_ACCESS`, so revoking INSERT verbatim removed every access
+/// type SELECT needs. Reproduced live before the fix: after the write revoke
+/// alice had no policy item at all, meaning an admin narrowing write access
+/// silently took away read access too.
+///
+/// The fix records a provenance label per grant and holds back the access types
+/// another labelled privilege still requires.
+///
+/// The write is proven by alice actually inserting a row while she holds INSERT,
+/// rather than by `assert_denied_but_valid`, whose admin control would itself
+/// insert one and move the row count this test asserts on.
+#[tokio::test]
+#[ignore]
+async fn revoking_write_leaves_an_independent_read_grant_intact() {
+    ac_gate!();
+    let _guard = crate::common::serial().lock().await;
+    let ctx = ac_setup().await;
+
+    assert_denied_but_valid(&ctx, &ctx.alice, &format!("SELECT id FROM {ORDERS}")).await;
+
+    exec_ok(&ctx, &ctx.carol, &format!("GRANT SELECT ON {ORDERS} TO ROLE \"analyst\"")).await;
+    exec_ok(&ctx, &ctx.carol, &format!("GRANT INSERT ON {ORDERS} TO ROLE \"analyst\"")).await;
+
+    // Both grants live: alice can read, and can write.
+    let probe = format!(
+        "INSERT INTO {ORDERS} VALUES (91,'EU',1.0,'999-99-9999','z@x',DATE '2021-01-01')"
+    );
+    crate::common::eventually("both grants to land for alice", || async {
+        match ctx.handler.execute(&ctx.alice, &probe, None).await {
+            Ok(_) => Ok(()),
+            Err(e) => Err(format!("insert failed: {e}")),
+        }
+    })
+    .await;
+    let baseline = total_rows(
+        &ctx.handler
+            .execute(&ctx.alice, &format!("SELECT id FROM {ORDERS}"), None)
+            .await
+            .expect("alice holds SELECT"),
+    );
+    assert!(baseline >= 4, "alice's own insert should be visible, got {baseline} rows");
+
+    exec_ok(&ctx, &ctx.carol, &format!("REVOKE INSERT ON {ORDERS} FROM ROLE \"analyst\"")).await;
+
+    // The write stops.
+    crate::common::eventually("alice's INSERT to be denied after REVOKE INSERT", || async {
+        match ctx.handler.execute(&ctx.alice, &probe, None).await {
+            Err(_) => Ok(()),
+            Ok(_) => Err("insert still allowed".to_string()),
+        }
+    })
+    .await;
+
+    // The read survives. THIS is the regression: before the fix alice had no
+    // policy item at all here and this query failed outright.
+    //
+    // Deliberately NOT an exact row-count equality. The denial loop above keeps
+    // retrying alice's INSERT until it fails, and every attempt made before the
+    // revoke propagates succeeds, so the table legitimately grows by an
+    // unpredictable amount. What matters is that SELECT still works.
+    let after = ctx
+        .handler
+        .execute(&ctx.alice, &format!("SELECT id FROM {ORDERS}"), None)
+        .await
+        .expect("REVOKE INSERT must not remove the independent SELECT grant");
+    assert!(
+        total_rows(&after) >= baseline,
+        "alice still holds SELECT; revoking INSERT must not have stripped the read \
+         access types (got {} rows, baseline {baseline})",
+        total_rows(&after)
+    );
+
+    // The control that keeps this honest: revoke must still REVOKE. Without it,
+    // holding back every access type would satisfy the assertion above while
+    // turning REVOKE into a no-op.
+    exec_ok(&ctx, &ctx.carol, &format!("REVOKE SELECT ON {ORDERS} FROM ROLE \"analyst\"")).await;
+    crate::common::eventually("the SELECT revoke to take effect", || async {
+        match ctx.handler.execute(&ctx.alice, &format!("SELECT id FROM {ORDERS}"), None).await {
+            Err(_) => Ok(()),
+            Ok(b) => Err(format!("still readable with {} rows", total_rows(&b))),
+        }
+    })
+    .await;
+
+    let _ = ctx
+        .handler
+        .execute(&ctx.carol, &format!("DELETE FROM {ORDERS} WHERE id = 91"), None)
+        .await;
+}
