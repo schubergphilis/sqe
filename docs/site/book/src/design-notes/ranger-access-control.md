@@ -192,8 +192,20 @@ into many fine-grained Polaris operations. The constants are `READ_ACCESS` and
 - `GRANT ... TO USER "alice"` writes to the `users` array.
 - `GRANT ... TO ROLE "analyst"` writes to the `roles` array.
 - `GRANT ... TO GROUP ...` is rejected with `NotImplemented`. Polaris does not
-  deliver groups to Ranger unless Ranger usersync runs, so the backend does not
-  support group grantees.
+  deliver groups to Ranger unless Ranger usersync runs, so the backend will not
+  write a grant whose grantee it cannot confirm exists.
+
+The write and read paths are deliberately asymmetric here, and the asymmetry is
+worth knowing before it surprises you. SQE will not WRITE a group grant, but it
+does ENFORCE one: a group-bound policy authored in the Ranger console is matched
+against the session's groups on the fine-grained read path (`ranger_store`,
+pinned by `group_bound_items_match_the_session_groups`). Before that, such a
+policy was skipped outright, which meant a mask an operator could see in the
+Ranger UI quietly did nothing.
+
+`CHECK ACCESS` does not resolve groups either, for the same reason the write path
+refuses them, so a grant held only through a group is invisible to introspection
+while still being enforced.
 
 The request body is `GrantRevokeRequest`, serialized with Ranger's exact JSON
 field names (`accessTypes`, `delegateAdmin`, `enableAudit`,

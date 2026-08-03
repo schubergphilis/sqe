@@ -9,7 +9,11 @@ Access control splits into a write path and an enforcement path.
 (`POST /service/plugins/services/grant/polaris`). `SHOW GRANTS` reads Ranger
 policies back. SQE never enforces anything itself on this path.
 
-**Enforcement path (Polaris).** Polaris 1.5 runs its embedded Ranger authorizer
+> Learning the model rather than the stack? The
+> [access control tutorial](../features/access-control-tutorial.md) walks through
+> both gates against this quickstart, statement by statement.
+
+**Enforcement path (Polaris).** Polaris runs its embedded Ranger authorizer
 (`polaris.authorization.type=ranger`). When SQE asks Polaris to load a table
 (carrying the user's Keycloak token), Polaris asks Ranger whether that principal
 may perform the operation. An ungranted operation fails at Polaris with a 403,
@@ -272,7 +276,7 @@ tag-to-column association is authored with `ALTER TABLE ... SET TAGS` and stored
 
 ## Versions
 
-- Apache Polaris 1.5.0 (embedded Ranger authorizer, Beta).
+- Apache Polaris 1.7.0 (embedded Ranger authorizer, Beta).
 - Apache Ranger 2.8.0 (required by the Polaris plugin; it uses the new embedded
   authorizer API).
 - Keycloak 26.5.
