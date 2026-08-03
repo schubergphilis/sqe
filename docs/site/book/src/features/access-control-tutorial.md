@@ -112,15 +112,14 @@ REVOKE USAGE ON DATABASE sales_wh        FROM ROLE "analyst";
 REVOKE USAGE ON SCHEMA   sales_wh.acdemo FROM ROLE "analyst";
 ```
 
-The order matters, and not for tidiness. A principal left holding catalog
-discovery while every namespace under it is invisible currently **hangs** instead
-of being denied: every probe 403s and SQE's catalog provider blocks in its
-sync-to-async bridge rather than reporting "table not found". Revoking discovery
-first never passes through that state. The hang is a known defect in the read
-path, recorded in
-`docs/internal/research/2026-08-02-catalog-traversal-gate.md`, and it is not
-specific to revoking: any principal configured with catalog discovery and no
-visible namespace can reach it.
+Revoking discovery first is the tidier order, and it also avoids a known defect.
+A principal left holding catalog discovery while every namespace under it is
+invisible gets an empty schema list, and on a current-thread tokio runtime SQE's
+catalog provider blocks in its sync-to-async bridge instead of reporting "table not
+found". A deployed coordinator runs a multi-thread runtime and denies normally, so
+this is not something a served query hits; it shows up in tests and would affect an
+embedded single-threaded host. Recorded in
+`docs/internal/research/2026-08-02-catalog-traversal-gate.md`.
 
 ## 1.2 A grant is what enables a read
 

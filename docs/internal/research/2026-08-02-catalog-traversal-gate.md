@@ -252,3 +252,95 @@ the `impliedGrants` closure, never held out of the seeds, because
 drags in `table-location-set`, which `INSERT` must not confer. SQE's hand-written
 `WRITE_ACCESS` still carries `table-location-set`, so that divergence closes with
 profile adoption rather than separately.
+
+---
+
+# The read-path wedge has TWO causes, 2026-08-03
+
+The hang recorded above (`contains_namespace` -> `block_on_compat` ->
+`pthread_join` -> `__ulock_wait`) is not one bug. Fixing the obvious one leaves the
+hang in place, so both are written down here.
+
+## Cause 1: core contention. FIXED.
+
+`block_on_compat`'s current-thread branch spawned an OS thread and called
+`handle.block_on(fut)` on the CALLER'S runtime, then blocked the parent in
+`join()`. A current-thread runtime has one core. Every real call site is a
+synchronous DataFusion hook (`CatalogProvider::schema`, `SchemaProvider::table`, a
+TVF's `call`) reached from inside a task being polled, so the caller already holds
+that core and keeps holding it while it waits. The child waits for the core the
+parent holds; the parent waits for the child. A pure deadlock, independent of any
+I/O.
+
+Fixed by giving the spawned thread a runtime of its own.
+
+**Why no test caught it:** `block_on_compat_works_on_current_thread` calls the
+bridge from a thread OUTSIDE the runtime, so the core is free. That is not the
+shape of any production call site. The test passed for months while the
+production path deadlocked, and it still passes against the broken implementation
+today. The replacement,
+`does_not_deadlock_when_the_caller_holds_the_current_thread_core`, drives a
+current-thread runtime from a scratch thread and calls the bridge INLINE from the
+task body, then bounds the wait with `recv_timeout` so a regression fails with a
+message instead of hanging the suite. Mutation-verified against the old code.
+
+## Cause 2: the future's I/O belongs to the parked runtime. NOT FIXED.
+
+With cause 1 fixed the query still hangs, and a `sample` of the child thread shows
+why: it is running its own runtime and parked in its own IO driver, waiting for a
+connection whose hyper task lives on the PARENT runtime's reactor. The parent is
+blocked in `join()`, so that reactor is not being driven and the response can never
+arrive.
+
+This is not fixable inside `block_on_compat`. Parking the caller's runtime is the
+whole strategy, and on a current-thread runtime the caller IS the only thread, so
+any future that awaits I/O owned by that runtime cannot complete while the bridge
+is blocking on it. The observable symptom is identical to cause 1, which is why
+one looked like the whole story.
+
+The shape of a real fix is a dedicated, always-running IO runtime that owns catalog
+and object-store futures and the clients they use, so that parking a session's
+runtime never stalls the I/O those futures depend on. That is an architectural
+change with its own blast radius (where clients are constructed, connection-pool
+ownership, shutdown), so it wants its own spec rather than being bolted onto this.
+
+Until then the state remains reachable: catalog discovery with no visible namespace
+hangs rather than denying. `tokio::time::timeout` around the query does NOT bound
+it, which is worth knowing before someone reaches for that mitigation: the bridge
+blocks the runtime thread synchronously, so the timer is never polled and the
+timeout never fires. That also rules out an e2e regression test for now, since a
+test that reproduces the state cannot fail cleanly, only hang.
+
+## Reachability: NOT the server. Corrected.
+
+An earlier draft of this note called the wedge production-reachable and ranked it
+above everything else queued. That was wrong, and the correction matters because it
+was used to set priorities.
+
+Both coordinator entry points build `new_multi_thread` runtimes
+(`sqe-coordinator/src/main.rs`, `bin/sqe_server.rs`), and `sqe-cli` uses
+`#[tokio::main]`, which is also multi-thread. The multi-thread branch of
+`block_on_compat` uses `block_in_place` + `handle.block_on`, which neither
+contends for a single core nor parks the reactor: other worker threads keep
+driving it. So neither cause reaches a deployed SQE.
+
+The only current-thread runtimes in the tree are in tests. Exposure is therefore:
+
+- `#[tokio::test]`, whose default flavor is current-thread. This is what made the
+  access-control e2e suite hang, twice, and it will bite any future test that
+  reaches a sync catalog hook.
+- any future embedding that chooses a current-thread runtime. The bridge exists
+  precisely to support that (issue #83), so the trap is latent rather than absent.
+
+Cause 1 is worth fixing on its own terms: it is a real defect in a bridge whose
+whole purpose is to make current-thread work, and it was masked by a test that
+called it from outside the runtime. Cause 2 keeps the current-thread branch unsafe
+for I/O futures regardless, so the bridge should not be treated as
+flavor-agnostic until a dedicated IO runtime exists.
+
+Related prior art in this repo, and the same lesson: the `#195` guard on
+`persistent_warehouse_survives_client_restart` (`sqe-cli/src/embedded.rs`) records
+that `tokio::time::timeout` cannot bound a blocking wedge because the timer never
+runs, and that the only workable guard is an OS-level one -- a sacrificial thread
+with its own runtime, joined with a hard deadline. The unit test added here uses
+that same pattern.
