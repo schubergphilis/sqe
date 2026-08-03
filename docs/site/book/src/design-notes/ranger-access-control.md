@@ -95,9 +95,8 @@ access types directly in a `GRANT` statement.
 
 ### A table grant alone does not make a table readable
 
-`GRANT SELECT ON cat.ns.tbl` writes ONE policy, at the table level. That is not
-enough to read the table through SQE, and the reason is on SQE's side rather than
-Polaris's.
+`GRANT SELECT ON cat.ns.tbl` needs catalog-level discovery already in place to be
+readable through SQE, and the reason is on SQE's side rather than Polaris's.
 
 Polaris will serve the table: a direct `LOAD_TABLE` carrying only the table-level
 grant returns 200. But `SqeCatalogProvider::schema()` answers only for a namespace
@@ -114,25 +113,50 @@ Either failure leaves an empty schema list, `schema()` returns `None`, and
 planning ends at `table not found` with `LOAD_TABLE` never attempted. Nothing in
 the SQE log shows a 403, because there is no denial to report.
 
-So the minimum for one readable table is three grants:
+A table-level privilege therefore expands into a two-policy plan
+(`build_grant_plan`), namespace ancestor first:
 
 ```sql
 GRANT USAGE  ON DATABASE cat        TO ROLE r;  -- catalog-level discovery
-GRANT USAGE  ON SCHEMA   cat.ns     TO ROLE r;  -- namespace visibility
-GRANT SELECT ON cat.ns.tbl          TO ROLE r;  -- the data
+GRANT SELECT ON cat.ns.tbl          TO ROLE r;  -- the data + visibility on cat.ns
 ```
 
 `GRANT USAGE ON DATABASE` is the catalog-level form: `USAGE` binds to the
 namespace level, and with no namespace named the resource map degrades to
 `{root, catalog}`, which is what `LIST_NAMESPACES` is authorized against.
 
-The quickstart's bootstrap seeds wildcard discovery for `analyst` and `engineer`,
-which is why a single `GRANT SELECT` looks sufficient there. It is not sufficient
-for a principal outside those roles.
+Three properties of the expansion, each load-bearing:
 
-The tradeoff is deliberate and should be understood: the catalog-level grant lets
-its holder enumerate every namespace name in the catalog. Verified on Polaris 1.7
-with a clean database; full transcript in
+**Only the namespace, never the catalog.** The namespace policy is an ancestor on
+the path to the named table: required to reach it, conferring nothing about
+objects outside that path. Catalog-level `namespace-list` is categorically
+different, because it exposes sibling namespace NAMES unrelated to the table being
+granted. Auto-adding it would be the same silent widening
+`reject_scope_deeper_than_level` refuses, except it would report success. So it
+stays explicit, and it is granted once per role rather than once per table.
+
+**Ancestor first.** Ranger has no transaction spanning two calls. Ancestor-first
+fails to "namespace visible, no table access", which is inert; table-first would
+fail to "has table access, table invisible", which is the exact symptom being
+removed. On a primary-level failure the error says the namespace grant was left in
+place.
+
+**Revoke does not release it.** One namespace policy serves every table granted
+under it, so releasing it on the first `REVOKE` would break the grantee's access
+to the others. The residue is visibility only, marked with the label
+`sqe:traversal:<GRANTEE_TYPE>:<name>`; `retained_access_types` skips that label
+rather than reading it as grant provenance. Refcounting it per originating table
+(`sqe:USER:u:SELECT@cat.ns.tbl`) would let revoke release it exactly when the last
+dependent goes away; that is the upgrade, not shipped.
+
+The quickstart's bootstrap seeds wildcard discovery for `analyst` and `engineer`,
+which is why a single `GRANT SELECT` looks sufficient there. A principal outside
+those roles still needs the catalog grant.
+
+Verified on Polaris 1.7 with a clean database, one variable at a time: with
+catalog discovery and a table `SELECT` grant but no namespace visibility, the read
+failed `table not found`; adding ONLY `namespace-properties-read` at
+`{catalog, namespace}` returned rows. Full transcript in
 `docs/internal/research/2026-08-02-catalog-traversal-gate.md`.
 
 ### The named scope must match the privilege's level

@@ -51,25 +51,11 @@ observe is a mask you cannot debug.
 
 # Part 1: the Polaris gate
 
-## 1.1 Three grants, not one
+## 1.1 Two grants, not one
 
-Start with the thing that trips up every first attempt. This does **not** let
-alice read the table:
-
-```sql
-GRANT SELECT ON sales_wh.acdemo.orders TO USER alice;
-```
-
-She gets:
-
-```
-table 'sales_wh.acdemo.orders' not found
-```
-
-The table exists and Polaris would serve it. A direct `LOAD_TABLE` with only that
-grant returns HTTP 200. SQE never asks, because it resolves a table through its
-catalog provider, which answers only for namespaces in its cached namespace list.
-Building that list needs two calls that both have to succeed:
+Start with the thing that trips up every first attempt. A table grant on its own
+is not enough to read the table. Reaching `sales_wh.acdemo.orders` needs two
+things to succeed, and only one of them is about the table:
 
 - `LIST_NAMESPACES`, authorized at the **catalog** level. Polaris does not use
   Ranger's `SELF_OR_DESCENDANTS` matching, so a namespace-scoped `namespace-list`
@@ -79,24 +65,44 @@ Building that list needs two calls that both have to succeed:
   deliberately, so ungranted namespace names do not leak.
 
 Either failure gives an empty schema list, and planning stops at "table not
-found" without attempting `LOAD_TABLE`. So the minimum to read one table is:
+found" without ever attempting `LOAD_TABLE`. The table exists and Polaris would
+serve it; SQE never asks.
+
+SQE writes the namespace half for you. `GRANT SELECT ON sales_wh.acdemo.orders`
+also grants `namespace-properties-read` on `sales_wh.acdemo`, so the minimum to
+read one table is two statements:
 
 ```sql
-GRANT USAGE ON DATABASE sales_wh          TO ROLE "analyst";  -- discovery
-GRANT USAGE ON SCHEMA   sales_wh.acdemo   TO ROLE "analyst";  -- visibility
+GRANT USAGE  ON DATABASE sales_wh         TO ROLE "analyst";  -- discovery
 GRANT SELECT ON sales_wh.acdemo.orders    TO ROLE "analyst";  -- the data
 ```
 
-In the quickstart the first two already exist: the bootstrap seeds wildcard
-discovery for `analyst` and `engineer`, which is why a lone `GRANT SELECT` looks
-sufficient there. Any user outside those two roles needs the traversal spelled
+The namespace grant is an ancestor **on the path** to the table you named. It is
+required to reach that table and confers nothing about anything else, so adding
+it is completing the statement rather than widening it. It grants visibility, not
+data: a second table in the same namespace stays unreadable without its own
+grant.
+
+**The catalog grant stays yours to make, deliberately.** Catalog-level
+`namespace-list` lets its holder enumerate every namespace name in the catalog,
+including ones with no relation to the table being granted. A namespace called
+`pii_customer_health` becomes visible even though not one of its rows is. Adding
+that as a side effect of a table grant would widen the blast radius of every
+`GRANT SELECT`, so SQE refuses to guess. Grant discovery per role, once, and
+expect `SHOW SCHEMAS` to be the leak surface.
+
+In the quickstart both halves already exist for `analyst` and `engineer`: the
+bootstrap seeds wildcard discovery, which is why a lone `GRANT SELECT` looks
+sufficient there. Any user outside those two roles needs the catalog grant spelled
 out.
 
-**Know what you are paying for.** The catalog-level grant lets its holder
-enumerate every namespace name in the catalog. A namespace called
-`pii_customer_health` becomes visible even though not one of its rows is. If that
-matters to you, grant discovery per role rather than broadly, and expect
-`SHOW SCHEMAS` to be the leak surface.
+**Revoke is asymmetric here, on purpose.** `REVOKE SELECT` on the table does not
+take back namespace visibility. One namespace policy serves every table granted
+under it, so releasing it on the first revoke would break the grantee's access to
+the others. A namespace whose tables have all been revoked leaves the grantee able
+to see that the namespace exists and nothing more. Remove it explicitly with
+`REVOKE USAGE ON SCHEMA` when that matters. Policies SQE added this way carry the
+label `sqe:traversal:<GRANTEE_TYPE>:<name>` in the Ranger console.
 
 ## 1.2 A grant is what enables a read
 
