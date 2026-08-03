@@ -777,6 +777,95 @@ pub fn entry_matches_grantee(entry: &GrantEntry, grantee: &Grantee) -> bool {
     entry.grantee_type == want_type && entry.grantee_name == grantee.name()
 }
 
+/// Prefix marking a Ranger policy label as access provenance.
+///
+/// `chm`, NOT `sqe`, and that is load-bearing rather than cosmetic. SQE and the
+/// data-platform control plane write to the SAME Ranger `polaris` service, and
+/// both consult these labels to decide what a REVOKE must hold back. A private
+/// prefix would make each tool blind to the other's provenance and fall straight
+/// back to the cascade this mechanism exists to prevent: SQE would strip a grant
+/// the platform had made, and the platform would strip SQE's.
+///
+/// Mirrors `data-platform/backend/data_platform/access/provenance.py`
+/// (`LABEL_PREFIX = "chm"`). Ranger labels are a shared namespace; keep the two
+/// in lockstep.
+const LABEL_PREFIX: &str = "chm";
+
+/// Grantee types a provenance label may name.
+///
+/// USER and ROLE only, matching `provenance.py`'s `_GRANTEE_TYPES`. A GROUP is
+/// NOT a third kind: the platform materialises every Keycloak group as a Ranger
+/// role of the identical name, so a group grantee is labelled `ROLE`.
+const LABEL_GRANTEE_TYPES: &[&str] = &["USER", "ROLE"];
+
+/// The provenance label recording that ONE `GRANT` statement is responsible for
+/// part of a policy: `sqe:<GRANTEE_TYPE>:<name>:<PRIVILEGE>`.
+///
+/// Ranger permits only one policy per resource, so every grant on a table lands
+/// in the same policy and their access types union together. Without a record of
+/// which statement contributed what, revoke cannot tell them apart, and the
+/// overlap is total rather than partial: `WRITE_ACCESS` contains all three of
+/// `READ_ACCESS`'s types, so
+///
+///   GRANT SELECT ON t TO USER dave;
+///   GRANT INSERT ON t TO USER dave;
+///   REVOKE INSERT ON t FROM USER dave;
+///
+/// used to leave dave with NOTHING. Reproduced live before this was written: the
+/// third statement removed dave's policy item outright, so an admin narrowing a
+/// user's write access silently took away their read access as well.
+fn grant_label(grantee: &Grantee, privilege: &str) -> String {
+    // A GROUP is labelled ROLE, not GROUP. The platform materialises every
+    // Keycloak group as a Ranger role of the identical name, so the two tools must
+    // agree that a group grantee's provenance lives under ROLE, or a revoke on one
+    // side cannot see what the other granted.
+    let kind = match grantee {
+        Grantee::User(_) => "USER",
+        Grantee::Role(_) | Grantee::Group(_) => "ROLE",
+    };
+    format!(
+        "{LABEL_PREFIX}:{kind}:{}:{}",
+        grantee.name(),
+        privilege.trim().to_uppercase()
+    )
+}
+
+/// Parse a provenance label back into (grantee-kind, name, privilege).
+///
+/// A grantee name may itself contain `:`, so the type is split off the front and
+/// the privilege off the back; whatever is left in the middle is the name.
+/// Anything that does not round-trip is rejected rather than guessed: labels are
+/// editable strings in the Ranger console, and a mis-parse here would silently
+/// under-revoke, which is worse than the cascade it replaces.
+fn parse_grant_label(label: &str) -> Option<(String, String, String)> {
+    let rest = label.strip_prefix(&format!("{LABEL_PREFIX}:"))?;
+    let (kind, rest) = rest.split_once(':')?;
+    let kind = kind.trim().to_uppercase();
+    if !LABEL_GRANTEE_TYPES.contains(&kind.as_str()) {
+        return None;
+    }
+    let (name, privilege) = rest.rsplit_once(':')?;
+    if name.is_empty() || privilege.is_empty() {
+        return None;
+    }
+    // The privilege must round-trip to one SQE actually maps. Without this a
+    // label naming anything at all reaches `map_sql_to_ranger_access_for`, whose
+    // pass-through arm turns an unrecognised privilege into a literal access type
+    // -- so a forged or hand-edited label could make revoke hold back an access
+    // type nobody granted, forever. That is an UNDER-revoke, the one direction
+    // worse than the cascade this mechanism replaces, so it fails closed to "no
+    // provenance" and the caller cascades.
+    //
+    // Deliberately stricter than the grant path, which allows a native Polaris
+    // access type to be named directly: such a grant simply gets no provenance.
+    let privilege = privilege.trim().to_uppercase();
+    if !MAPPED_PRIVILEGES.contains(&privilege.as_str()) {
+        warn!(%label, "ignoring access-provenance label: unknown privilege");
+        return None;
+    }
+    Some((kind, name.to_string(), privilege))
+}
+
 /// Every Ranger role the named user belongs to, following nested roles.
 ///
 /// Ranger's role objects carry `users`, `groups` and `roles`. A role listing a
@@ -854,6 +943,115 @@ impl RangerGrantBackend {
         resp.json().await.map_err(|e| {
             sqe_core::SqeError::Execution(format!("Ranger role parse failed: {e}"))
         })
+    }
+
+    /// Record on the policy covering `resource` that this grant happened.
+    ///
+    /// Best-effort by design. The grant itself already succeeded, so failing the
+    /// statement here would report failure for access the user now has. A missing
+    /// label degrades revoke to the old cascade, which is logged and visible,
+    /// rather than losing the grant.
+    async fn add_grant_label(
+        &self,
+        resource: &BTreeMap<String, String>,
+        grantee: &Grantee,
+        privilege: &str,
+    ) {
+        let label = grant_label(grantee, privilege);
+        let Ok(Some(mut policy)) = self.policy_by_resource(resource).await else {
+            warn!(%label, "no policy found after grant; provenance label not written");
+            return;
+        };
+        let mut labels: Vec<String> = policy
+            .get("policyLabels")
+            .and_then(serde_json::Value::as_array)
+            .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+            .unwrap_or_default();
+        if labels.iter().any(|l| l == &label) {
+            return; // idempotent: re-granting must not stack labels
+        }
+        labels.push(label.clone());
+        policy["policyLabels"] = serde_json::json!(labels);
+        let Some(id) = policy.get("id").and_then(serde_json::Value::as_i64) else {
+            return;
+        };
+        if let Err(e) = self.put_policy(id, &policy).await {
+            warn!(%label, error = %e, "could not write provenance label; revoke will fall back to the cascade");
+        }
+    }
+
+    /// Access types the grantee must KEEP because another privilege they still
+    /// hold on this resource requires them, plus this statement's label removed.
+    ///
+    /// Returns `None` when the policy carries no usable provenance, which means
+    /// we cannot know what else is owed and must revoke exactly what was asked
+    /// for (the old behaviour).
+    async fn retained_access_types(
+        &self,
+        resource: &BTreeMap<String, String>,
+        stmt_grantee: &Grantee,
+        privilege: &str,
+        object: GrantObjectKind,
+    ) -> Option<Vec<String>> {
+        let policy = self.policy_by_resource(resource).await.ok()??;
+        let labels: Vec<String> = policy
+            .get("policyLabels")
+            .and_then(serde_json::Value::as_array)?
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect();
+        let mine = grant_label(stmt_grantee, privilege);
+        if !labels.iter().any(|l| l == &mine) {
+            // This grant was never labelled (written before labels existed, or
+            // the label write failed). No provenance to reason from.
+            return None;
+        }
+        let mut keep: Vec<String> = Vec::new();
+        for label in labels.iter().filter(|l| *l != &mine) {
+            let Some((_, name, other_priv)) = parse_grant_label(label) else {
+                warn!(%label, "unparseable provenance label ignored");
+                continue;
+            };
+            if name != stmt_grantee.name() {
+                continue; // another grantee's grant; their items are separate
+            }
+            let (access, _) = map_sql_to_ranger_access_for(object, &other_priv);
+            keep.extend(access);
+        }
+        keep.sort();
+        keep.dedup();
+        Some(keep)
+    }
+
+    /// Drop this statement's provenance label. Called after a successful revoke.
+    async fn remove_grant_label(
+        &self,
+        resource: &BTreeMap<String, String>,
+        grantee: &Grantee,
+        privilege: &str,
+    ) {
+        let label = grant_label(grantee, privilege);
+        let Ok(Some(mut policy)) = self.policy_by_resource(resource).await else {
+            return;
+        };
+        let Some(labels) = policy.get("policyLabels").and_then(serde_json::Value::as_array) else {
+            return;
+        };
+        let kept: Vec<String> = labels
+            .iter()
+            .filter_map(|v| v.as_str())
+            .filter(|l| *l != label.as_str())
+            .map(str::to_string)
+            .collect();
+        if kept.len() == labels.len() {
+            return;
+        }
+        policy["policyLabels"] = serde_json::json!(kept);
+        if let Some(id) = policy.get("id").and_then(serde_json::Value::as_i64) {
+            if let Err(e) = self.put_policy(id, &policy).await {
+                warn!(%label, error = %e, "could not remove provenance label");
+            }
+        }
     }
 
     /// Fetch all policies for this service from Ranger Admin.
@@ -943,7 +1141,14 @@ impl GrantBackend for RangerGrantBackend {
             body.grantor = g.to_string();
         }
         body.delegate_admin = stmt.with_grant_option;
-        self.post_grant_revoke_with_privilege("grant", &stmt.privilege, &body).await
+        let resource = body.resource.clone();
+        self.post_grant_revoke_with_privilege("grant", &stmt.privilege, &body)
+            .await?;
+        // Record WHICH statement contributed these access types, so a later
+        // REVOKE of a different privilege on the same resource does not take
+        // them away. Best-effort: the grant already succeeded.
+        self.add_grant_label(&resource, &stmt.grantee, &stmt.privilege).await;
+        Ok(())
     }
 
     async fn revoke(&self, _token: &str, stmt: &RevokeStatement) -> sqe_core::Result<()> {
@@ -959,8 +1164,44 @@ impl GrantBackend for RangerGrantBackend {
             validate_identifier(g, "grantor")?;
             body.grantor = g.to_string();
         }
+
+        // Narrow the revoke to the access types no OTHER privilege this grantee
+        // holds on this resource still needs. Ranger allows one policy per
+        // resource, so `GRANT SELECT` + `GRANT INSERT` share one item and
+        // WRITE_ACCESS is a strict superset of READ_ACCESS: revoking INSERT
+        // verbatim used to leave the grantee with nothing at all.
+        //
+        // With no provenance to reason from we revoke exactly what was asked,
+        // which is the previous behaviour: a cascade is wrong, but inventing a
+        // narrower revoke from a guess would silently leave access in place.
+        if let Some(keep) = self
+            .retained_access_types(&body.resource, &stmt.grantee, &stmt.privilege, stmt.object)
+            .await
+        {
+            let before = body.access_types.len();
+            body.access_types.retain(|t| !keep.contains(t));
+            if body.access_types.len() != before {
+                debug!(
+                    privilege = %stmt.privilege,
+                    grantee = %stmt.grantee.name(),
+                    held_back = before - body.access_types.len(),
+                    "revoke narrowed: access types still required by another privilege"
+                );
+            }
+            if body.access_types.is_empty() {
+                // Everything this privilege confers is also owed to another one.
+                // Drop only the provenance, so a later revoke of that other
+                // privilege releases the access types.
+                self.remove_grant_label(&body.resource, &stmt.grantee, &stmt.privilege)
+                    .await;
+                return self.remove_deny_items(stmt).await;
+            }
+        }
+
         self.post_grant_revoke_with_privilege("revoke", &stmt.privilege, &body)
             .await?;
+        self.remove_grant_label(&body.resource, &stmt.grantee, &stmt.privilege)
+            .await;
         // REVOKE also clears a matching DENY, matching Unity Catalog, where
         // REVOKE removes the grant whether it was an allow or a deny.
         //
@@ -1737,6 +1978,128 @@ mod tests {
         let r = evaluate_access(&entries, "alice", &["analyst".into()], "table-data-read", "wh.sales.orders");
         assert!(!r.allowed);
         assert!(r.reason.as_deref().unwrap_or("").to_lowercase().contains("deny"));
+    }
+
+    #[test]
+    fn a_provenance_label_round_trips() {
+        let l = grant_label(&Grantee::User("dave".into()), "select");
+        assert_eq!(l, "chm:USER:dave:SELECT", "privilege is normalised upward");
+        assert_eq!(
+            parse_grant_label(&l),
+            Some(("USER".into(), "dave".into(), "SELECT".into()))
+        );
+        assert_eq!(
+            parse_grant_label(&grant_label(&Grantee::Role("analyst".into()), "INSERT")),
+            Some(("ROLE".into(), "analyst".into(), "INSERT".into()))
+        );
+    }
+
+    #[test]
+    fn the_label_format_mirrors_the_platforms_byte_for_byte() {
+        // SQE and the data-platform control plane write to the SAME Ranger
+        // `polaris` service and both read these labels to decide what a REVOKE
+        // must hold back. A private prefix makes each blind to the other and both
+        // fall back to the cascade, which is the bug this mechanism exists to
+        // prevent -- SQE would strip a grant the platform made, and vice versa.
+        //
+        // These literals are copied from
+        // data-platform/backend/data_platform/access/provenance.py.
+        assert_eq!(
+            grant_label(&Grantee::User("alice".into()), "SELECT"),
+            "chm:USER:alice:SELECT"
+        );
+        assert_eq!(
+            grant_label(&Grantee::Role("ws-sales-members".into()), "MODIFY"),
+            "chm:ROLE:ws-sales-members:MODIFY"
+        );
+    }
+
+    #[test]
+    fn a_group_grantee_is_labelled_role() {
+        // The platform materialises every Keycloak group as a Ranger role of the
+        // identical name, so there is no GROUP provenance type. Labelling a group
+        // grant "GROUP" would hide it from the platform's parser (its
+        // _GRANTEE_TYPES is {USER, ROLE}) and from ours.
+        assert_eq!(
+            grant_label(&Grantee::Group("ws-sales-members".into()), "SELECT"),
+            "chm:ROLE:ws-sales-members:SELECT",
+            "a group is a Ranger role by the same name"
+        );
+        assert_eq!(
+            grant_label(&Grantee::Group("g".into()), "SELECT"),
+            grant_label(&Grantee::Role("g".into()), "SELECT"),
+            "a group and a role of the same name must share provenance"
+        );
+    }
+
+    #[test]
+    fn a_label_naming_an_unmapped_privilege_is_dropped() {
+        // The grant path deliberately lets an operator name a native Polaris
+        // access type directly. Accepting that back on the READ path would let a
+        // forged or hand-edited label push an arbitrary string through
+        // map_sql_to_ranger_access_for's pass-through arm, so revoke would hold
+        // back an access type nobody granted -- an under-revoke, which is worse
+        // than the cascade. Fails closed to "no provenance" instead.
+        assert_eq!(parse_grant_label("chm:USER:dave:TABLE-SNAPSHOT-ADD"), None);
+        assert_eq!(parse_grant_label("chm:USER:dave:NONSENSE"), None);
+        // Every mapped privilege still round-trips, so the guard is not simply
+        // rejecting everything.
+        for p in MAPPED_PRIVILEGES {
+            let l = grant_label(&Grantee::User("dave".into()), p);
+            assert!(
+                parse_grant_label(&l).is_some(),
+                "mapped privilege {p} must round-trip through its label"
+            );
+        }
+    }
+
+    #[test]
+    fn a_grantee_name_containing_a_colon_still_parses() {
+        // Ranger accepts names with colons, and the label format uses colons as
+        // separators. The type comes off the front and the privilege off the
+        // back; everything between is the name. Getting this wrong would mean
+        // attributing one grantee's access types to another.
+        let g = Grantee::User("realm:dave".into());
+        let l = grant_label(&g, "SELECT");
+        assert_eq!(l, "chm:USER:realm:dave:SELECT");
+        assert_eq!(
+            parse_grant_label(&l),
+            Some(("USER".into(), "realm:dave".into(), "SELECT".into()))
+        );
+    }
+
+    #[test]
+    fn a_malformed_label_is_rejected_not_guessed() {
+        // Labels are editable strings in the Ranger console. A mis-parse would
+        // hold back access types the grantee is not owed, which reads as a
+        // successful revoke that did nothing.
+        for bad in [
+            "chm:USER:dave",           // no privilege
+            "chm:WIZARD:dave:SELECT",  // unknown grantee kind
+            "other:USER:dave:SELECT",  // not ours
+            "sqe:USER::SELECT",        // empty name
+            "sqe:USER:dave:",          // empty privilege
+            "",
+        ] {
+            assert!(
+                parse_grant_label(bad).is_none(),
+                "{bad:?} must not parse into provenance"
+            );
+        }
+    }
+
+    #[test]
+    fn write_access_fully_contains_read_access() {
+        // This containment is WHY provenance is needed, so pin it. If INSERT
+        // ever stops implying the read types, the revoke-narrowing logic still
+        // works but this test should be revisited deliberately.
+        for t in READ_ACCESS {
+            assert!(
+                WRITE_ACCESS.contains(t),
+                "{t} is in READ_ACCESS but not WRITE_ACCESS; revoking INSERT \
+                 would no longer strip SELECT and the comments here are stale"
+            );
+        }
     }
 
     #[test]

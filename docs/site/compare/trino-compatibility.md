@@ -64,7 +64,7 @@ noting semantic differences and gaps.
 > The remaining gaps are unchanged: structural (Trino sketch types, Arrow type
 > limits, Iceberg/ORC). (Separately, the DF 54 re-check found the DuckDB doc's
 > `QUALIFY` row was stale: `QUALIFY` works via DataFusion's SQL planner. See
-> `docs/duckdb-comparision.md` and test `sql_compat 06_qualify`.)
+> `docs/site/compare/duckdb-comparision.md` and test `sql_compat 06_qualify`.)
 
 ## Summary
 

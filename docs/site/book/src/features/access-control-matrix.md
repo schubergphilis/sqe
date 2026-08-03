@@ -40,46 +40,81 @@ The `polaris` service-def resource hierarchy is
 | Deny precedence | Ranger deny item overrides an allow | Yes | Yes |
 | Revoke | `REVOKE SELECT ON cat.ns.tbl FROM ROLE r` | Yes | Yes |
 | Introspection | `SHOW GRANTS`, `CHECK ACCESS` | Yes | Yes |
-| **View** | `GRANT SELECT ON VIEW cat.ns.v` | **No** | n/a |
+| View | `GRANT SELECT ON VIEW cat.ns.v TO ROLE r` | Yes | Yes |
+| All / future views in schema | `GRANT SELECT ON ALL VIEWS IN SCHEMA cat.ns` | Yes, as a wildcard | Yes |
+| Deny | `DENY SELECT ON cat.ns.tbl TO USER u` | Yes | Yes |
+| Group grantee | `GRANT SELECT ON cat.ns.tbl TO GROUP g` | Read path only, see gaps | Yes, for enforcement |
 
-### Views are not covered by the SQL grant surface
+### Three grants, not one: the traversal is load-bearing
 
-This is the one gap worth stating on its own, because the syntax parses and the
-failure is not self-explanatory.
+`GRANT SELECT ON cat.ns.tbl TO USER alice` on its own does **not** let alice read
+the table through SQE. This surprises everyone, so it is worth the space.
 
-The `polaris` service-def declares no `view` resource level. It does declare six
-view access types (`view-create`, `view-drop`, `view-list`,
-`view-metadata-full`, `view-properties-read`, `view-properties-write`), and the
-quickstart's admin bootstrap grants all of them, so an admin principal can work
-with views. But SQE's privilege mapping never emits any of them: `SELECT`
-expands to `table-data-read`, `table-properties-read`, `table-list`, and there
-is no privilege that maps to a view access type.
+Polaris will serve the table: a direct `LOAD_TABLE` with only the table-level
+grant returns 200. But SQE resolves a table through its catalog provider, which
+answers only for a namespace present in its cached namespace list, and building
+that list takes two calls that must both succeed:
 
-`GRANT SELECT ON VIEW cat.ns.v TO alice` is worse than unsupported, it is
-misleading. The parser produces a `Views` object that SQE's
-`extract_grant_statement` has no arm for, so catalog, namespace and table all
-resolve to `None` and the statement fails with
+1. `LIST_NAMESPACES`, authorized at the **catalog** level. A namespace-scoped
+   `namespace-list` does not satisfy it, because Polaris does not use Ranger's
+   `SELF_OR_DESCENDANTS` matching. Listing is denied outright, never filtered.
+2. A per-namespace visibility probe (`LOAD_NAMESPACE_METADATA`), needing
+   **namespace**-level `namespace-properties-read`. On 403 the namespace is
+   hidden, deliberately, so ungranted namespace names do not leak.
 
+Either failure yields an empty schema list, and planning ends at
+`table 'cat.ns.tbl' not found` with `LOAD_TABLE` never attempted. So the minimum
+to read one table is three levels:
+
+```sql
+-- catalog: discovery
+GRANT USAGE ON DATABASE cat TO ROLE analyst;
+-- namespace: visibility
+GRANT USAGE ON SCHEMA cat.ns TO ROLE analyst;
+-- table: the data
+GRANT SELECT ON cat.ns.tbl TO ROLE analyst;
 ```
-Ranger GRANT requires a catalog (use catalog.namespace.table)
+
+In the quickstart the first two are already in place: the bootstrap seeds
+wildcard discovery for the `analyst` and `engineer` roles, which is why a single
+`GRANT SELECT` appears to be enough there. A user outside those roles gets
+`table not found` until the traversal exists.
+
+The cost of the catalog-level grant is real and worth stating: any grantee who
+holds it can enumerate **every** namespace name in the catalog, so a name like
+`pii_customer_health` is visible even though its rows are not. Verified on
+Polaris 1.7 with a clean database; recorded in
+`docs/internal/research/2026-08-02-catalog-traversal-gate.md`.
+
+### A grant must be scoped at the privilege's own level
+
+Each privilege binds to exactly one resource level, shown in the mapping table
+in [Ranger access control](../design-notes/ranger-access-control.md). Naming an
+object deeper than that level is refused rather than widened:
+
+```sql
+GRANT ALL PRIVILEGES ON wh.sales.orders TO USER alice;
 ```
 
-even though a fully-qualified name was supplied. The same holds for
-`ON ALL VIEWS IN SCHEMA` and `ON DATABASE`. Fail-safe, since nothing is written,
-but the message points at the wrong thing.
+`ALL` binds to the catalog, so this used to drop the namespace and table and
+write `catalog-content-manage` on `wh`. One table was named, success was
+reported, and alice got every table in the catalog. SQE now errors and names the
+scope that would have been written. `USAGE` on a table and `CREATE SCHEMA` on a
+namespace widen through the same path and are refused the same way.
 
-Dropping the `VIEW` keyword (`GRANT SELECT ON cat.ns.v`) does write a policy,
-with the view name in the `table` resource slot and table access types. Do not
-rely on it: it grants table operations on a name that Polaris handles as a view.
+### Views work, and are not a privilege boundary
 
-To gate views today, author the policy directly in Ranger against the access
-types you need.
+A view has no resource level of its own. Its NAME goes in the `table` slot and
+the access types are the `view-*` set, which is what `GRANT ... ON VIEW` writes.
+Verified live: the resulting policy carries `view-properties-read` and
+`view-list` on the view coordinate and no `table-data-read`.
 
-### What DOES work on views, verified
+**A view is not a security boundary.** SQE expands the view and plans against
+its base tables, so the reader needs a grant there too. That is the opposite of
+a Snowflake secure view, where the view's owner privileges stand in for the
+reader's. Do not use a view to grant indirect access to a table.
 
-Views are supported objects: an admin can create and query them. Two questions
-matter more than the grant surface, and both were tested live against the
-quickstart stack.
+What a view DOES give you is masking and filtering that cannot be dodged.
 
 **Column masks survive a view. There is no bypass.** A view that projects a
 masked column returns the MASKED value, because the view expands to a
@@ -87,11 +122,6 @@ masked column returns the MASKED value, because the view expands to a
 with a user who is both an admin (so the view loads) and a member of the masked
 role: `xxx-xx-1111` reading the base table, `xxx-xx-1111` reading the view.
 Creating a view over a protected table is not a way around masking.
-
-**A non-admin cannot read a view at all.** Because no SQL privilege emits a
-`view-*` access type, a user without the admin grant gets "table not found"
-(Polaris hides rather than 403s). So the practical position today is: views are
-an admin-only surface, and masking still applies there.
 
 **Row filters break on views when the filter references an unprojected column.**
 This is a real defect, and it is view-specific. A row filter on `region` against
@@ -201,14 +231,15 @@ flush the cache on commit. The window is asserted at both edges by
 | Gap | Detail |
 |---|---|
 | Scope must match the privilege | A privilege binds to one resource level. Naming an object deeper than that level is refused rather than widened: `GRANT ALL ON wh.sales.orders` errors instead of writing a catalog-wide policy. Re-issue it at the level the error names. Pinned by `all_privileges_on_a_table_is_refused_rather_than_widened_to_the_catalog`. |
-| One level per privilege | A grant writes a single Ranger policy. Where Polaris also needs a traversal grant higher up the hierarchy, that policy must exist already. |
-| View-level grants | No `view` resource level and no privilege mapping, so views are admin-only. See above. |
+| Revoke narrows, it does not cascade | Ranger allows one policy per resource, so grants share an item and `WRITE_ACCESS` contains all of `READ_ACCESS`. `REVOKE INSERT` used to strip the grantee's independent `SELECT` too. SQE now labels each grant (`chm:<TYPE>:<name>:<PRIVILEGE>`) and holds back access types another labelled privilege still needs. The `chm` prefix is shared with the data-platform control plane deliberately: both write to the same Ranger service and both read these labels, so a private prefix would leave each blind to the other's grants and cascading over them. A label naming a privilege SQE does not map is dropped and logged rather than trusted, because an under-revoke is worse than the cascade. Grants written before labels existed fall back to the old behaviour, logged. Pinned by `revoking_write_leaves_an_independent_read_grant_intact`. |
+| One grant is not enough to read a table | A grant writes ONE Ranger policy at the privilege's level. Reaching a table through SQE also needs catalog `namespace-list` and namespace `namespace-properties-read`. See "Three grants, not one" below. |
+| Views are not a boundary | `GRANT ... ON VIEW` works, but SQE expands the view and plans against its base tables, so the reader needs a grant there too. Not a Snowflake secure view. |
+| Group grantees, write path | `GRANT ... TO GROUP g` is rejected by the Ranger write path (`grantee_to_fields`) because Ranger only learns a user's groups under usersync. Group-bound policies authored in the Ranger console ARE enforced on the read path. |
 | Row filters through views | A filter referencing a column the view does not project fails the query with a DataFusion schema error. Fail-closed, but the message names neither the policy nor the view. Direct queries with the same projection work. |
 | Ranger glob patterns | Only exact match and bare `*` are matched. `orders*` is not, and a policy written that way silently never fires. Pinned by `ranger_glob_patterns_are_not_matched`. |
 | Namespace flattening | `resolve_policy_key` passes only the LAST dotted component as the Ranger `database`, so `a.b.sales` and `sales` collide. Pinned by `resolve_policy_key_multilevel_takes_last_namespace_component`. |
 | Tag parity with Spark | Spark reads tag associations from the Ranger or Atlas tag store, not from Iceberg properties. Masks are shared; associations are not. |
 | ALL vs FUTURE tables | Ranger has no future-only resource, so both collapse to one wildcard policy. Snowflake distinguishes them. |
-| `opa` and `cedar` engines | Legacy config values from an earlier design, superseded by `ranger`. Not wired, and selecting one errors rather than degrading to passthrough (pinned by `unwired_policy_engines_fail_loudly_rather_than_degrade`). They are not planned work; `ranger` is the backend. |
 | Tag propagation | A column derived from a tagged column in a CTAS starts untagged. |
 
 ## Where to go next

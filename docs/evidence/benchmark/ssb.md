@@ -40,5 +40,5 @@ SSB still trails Trino at SF10, the same pattern as SF1. On the level rig (Trino
 
 - Queries: `crates/sqe-bench/queries/ssb/`
 - Star-schema reorder: `crates/sqe-planner/src/star_schema_reorder.rs`
-- Runtime filter: `docs/features/runtime-filter-pushdown.md`
+- Runtime filter: `docs/site/book/src/design-notes/runtime-filter-pushdown.md`
 - Runner: `scripts/benchmark-test.sh ssb`

@@ -33,6 +33,7 @@
 - [Iceberg Integration](./features/iceberg.md)
 - [Write Path](./features/write-path.md)
 - [Autonomous Compaction](./features/autonomous-compaction.md)
+- [Access control tutorial (Polaris gate + SQE row/column/mask/tags)](./features/access-control-tutorial.md)
 - [Fine-grained access control (row filters, masking)](./features/fine-grained-access-control.md)
 - [Access control: support matrix](./features/access-control-matrix.md)
 - [read\_parquet TVF](./features/read-parquet.md)
@@ -130,6 +131,7 @@
 - [Audit Logging (OCSF)](./operations/audit-logging.md)
 - [Web UI](./operations/web-ui.md)
 - [On-Call Runbook](./operations/runbook.md)
+- [Production guide (scaling phases)](./operations/production-guide.md)
 
 ---
 

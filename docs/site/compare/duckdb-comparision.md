@@ -136,7 +136,7 @@ Items 7, 10, 11.
 - AWS provider chain: when `[storage]` has no `s3_access_key`, falls back to
   env vars, `~/.aws/credentials`, IMDS, IRSA.
 - JSON UDF surface verified against DuckDB; documented at
-  [docs/features/json.md](features/json.md).
+  [docs/features/json.md](../book/src/sql-reference/json.md).
 
 ### V11: Delta Lake reader (disabled pending delta-rs DF 54)
 
@@ -193,7 +193,7 @@ as the prerequisite. Next: a custom `HfObjectStore` that implements
 standard DataFusion glob-expansion path. The V12 SQL pre-rewriter retires
 when V12.2 lands.
 
-See [`hf-glob-research.md`](./hf-glob-research.md) for the design.
+See [`hf-glob-research.md`](../book/src/design-notes/hf-glob-research.md) for the design.
 
 V11 shipped the `read_delta()` TVF rather than a catalog backend, letting
 CLI users query a Delta root directly:
@@ -305,18 +305,18 @@ benchmark claim, just a smoke test that says "embedded mode is at least as
 fast as DuckDB on basic file load."
 
 The full V8-V12 narrative lives in
-[the blog post](blog/2026-05-07-accidentally-duckdb.md) and ebook chapter
-[16d "The DuckDB Drift"](ebook/chapters/16d-the-duckdb-drift.md).
+[the blog post](../blog/2026-05-07-accidentally-duckdb.md) and ebook chapter
+[16d "The DuckDB Drift"](../ebook/chapters/16d-the-duckdb-drift.md).
 
 ## Related docs
 
 - [Embedded CLI reference](https://docs.getsqe.com/getting-started/cli.html): all flags, dot-commands, TVFs,
   catalog backends, storage backends, write paths in one place
-- [Architecture](architecture.md): overall SQE design
-- [Catalogs](book/src/getting-started/catalogs.md): multi-catalog config
+- [Architecture](../book/src/architecture/overview.md): overall SQE design
+- [Catalogs](../book/src/getting-started/catalogs.md): multi-catalog config
   reference
-- [CLI](book/src/getting-started/cli.md): cluster-mode CLI usage
+- [CLI](../book/src/getting-started/cli.md): cluster-mode CLI usage
 - [Trino compatibility](trino-compatibility.md): separate compatibility track
-- [Roadmap](roadmap.md): phase-by-phase plan
-- [HF glob research](hf-glob-research.md): V12.2 design
-- [The DuckDB drift (blog)](blog/2026-05-07-accidentally-duckdb.md): the V8-V12 narrative
+- [Roadmap](../book/src/development/roadmap.md): phase-by-phase plan
+- [HF glob research](../book/src/design-notes/hf-glob-research.md): V12.2 design
+- [The DuckDB drift (blog)](../blog/2026-05-07-accidentally-duckdb.md): the V8-V12 narrative

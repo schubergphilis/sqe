@@ -2,7 +2,7 @@
 
 Status: DECIDED (2026-06-19). Scopes the storage layer for tag-based masking
 (the Snowflake tag-masking parity pillar). Pairs with
-`docs/ranger-fine-grained-service-type.md` and `docs/fine-grained-policy.md`.
+[ranger-fine-grained-service-type.md](./ranger-fine-grained-service-type.md) and [fine-grained-policy.md](./fine-grained-policy.md).
 
 ## The two halves of a tag system
 
@@ -40,7 +40,7 @@ mistake.
 
 Four deciding factors, in order:
 
-1. **Federated catalogs.** Per `docs/ranger-fine-grained-service-type.md`, SQE's
+1. **Federated catalogs.** Per [ranger-fine-grained-service-type.md](./ranger-fine-grained-service-type.md), SQE's
    engine-side enforcement is the ONLY fine-grained layer that covers external /
    federated catalogs (Polaris cannot gate those). Tags-as-table-properties work
    for ANY Iceberg table SQE can read, federated included. Populating Ranger's

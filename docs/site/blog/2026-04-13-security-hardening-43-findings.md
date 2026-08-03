@@ -68,4 +68,4 @@ After:
 
 **Adaptive defaults beat conservative defaults.** `partition_only` is the safest sort mode. It is also wrong for every developer running integration tests and every dbt model that uses ORDER BY. The right default is the one that works correctly in the common case and degrades gracefully in the extreme case. Adaptive sort does both.
 
-The full audit is in `docs/issues.md`. The code is in MR !61.
+The full audit is in `docs/internal/audit/issues.md`. The code is in MR !61.

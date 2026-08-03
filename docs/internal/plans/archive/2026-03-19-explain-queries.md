@@ -1050,10 +1050,10 @@ EXPLAIN FULL SELECT * FROM orders WHERE amount > 100;
 
 Add `explain.md` under Features:
 ```markdown
-- [Query Plan Inspection](./features/explain.md)
+- [Query Plan Inspection](../../../site/book/src/features/explain.md)
 ```
 
-Place it after `- [SQL Support](./features/sql-support.md)`.
+Place it after `- [SQL Support](../../../site/book/src/features/sql-support.md)`.
 
 - [ ] **Step 6: Commit all docs**
 

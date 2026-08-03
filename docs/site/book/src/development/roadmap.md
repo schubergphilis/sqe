@@ -232,7 +232,7 @@ Shipped:
 
 Landed June 2026 across five sub-phases; the end-to-end demo is `quickstart/polaris-ranger-keycloak/`.
 
-- **GRANT/REVOKE to Ranger**: `access_control.backend = "ranger"` translates `GRANT`/`REVOKE`/`SHOW GRANTS` into Ranger Admin REST calls; Polaris 1.5's embedded Ranger authorizer enforces the coarse gate
+- **GRANT/REVOKE to Ranger**: `access_control.backend = "ranger"` translates `GRANT`/`REVOKE`/`SHOW GRANTS` into Ranger Admin REST calls; Polaris's embedded Ranger authorizer enforces the coarse gate
 - **Row filters + column masks** (Phase 1): `RangerStore` downloads the `hive` service policy set and feeds the plan rewriter; a query must pass both the Polaris gate and the SQE-side rewrite
 - **Full mask vocabulary** (Phase 2A): MASK_NULL, full redact, show-first-4 / show-last-4, hash, date-show-year, and CUSTOM expressions, all type-preserving through the physical planner
 - **Session-context functions** (Phase 2B): `current_user()`, `is_role_in_session(role)`, `current_database()`, `current_schema()` usable in policy expressions and user SQL; they const-fold to literals before plan distribution, so no session state ships to workers
@@ -244,7 +244,7 @@ Landed June 2026 across five sub-phases; the end-to-end demo is `quickstart/pola
 
 Not yet wired:
 
-- OPA (Rego) and Cedar policy engines are present as configuration options but remain experimental
+- OPA (Rego) and Cedar were removed: `opa` had a policy store nothing constructed, `cedar` had no implementation, and both only ever failed at startup. Apache Ranger is the policy engine
 - Iceberg-to-Ranger tag sync (so Spark sees SQE-authored column tags) and `SHOW TAGS` read-back
 - See the "Known gaps" in [GRANT and REVOKE](../sql-reference/grant-revoke.md) for SQL-surface limits (no `WITH GRANT OPTION`, table-level INSERT only, scalar-only masks)
 
@@ -252,7 +252,7 @@ Not yet wired:
 
 ## Phase 7 - Iceberg V3 (Done)
 
-Iceberg V3 table format support landed end-to-end. The vendored fork at `vendor/iceberg-rust/` is rebased onto DataFusion 54 and carries V3 spec coverage. SQE Iceberg matrix score: 167/189 = 88.4% (per `docs/iceberg-matrix.md`).
+Iceberg V3 table format support landed end-to-end. The vendored fork at `vendor/iceberg-rust/` is rebased onto DataFusion 54 and carries V3 spec coverage. SQE Iceberg matrix score: 167/189 = 88.4% (per `docs/internal/design-archive/iceberg-matrix.md`).
 
 ### V3 Features Shipped
 
@@ -306,7 +306,7 @@ Coordinator-side OpenLineage 2-0-2 emitter with column-level lineage. Off by def
 - `sqe-lineage` crate: event types, observer, emitter task, file/HTTP/spool sinks, multi-catalog dataset extractor, column-lineage trace rules across 11 LogicalPlan node types
 - `OpenLineageConfig` in `sqe-core` with TOML + env-var overrides + startup validation
 - Hooks in `QueryHandler::execute_statement` (START / COMPLETE / FAIL)
-- Documented at `docs/book/src/operations/openlineage.md`
+- Documented at `docs/site/book/src/operations/openlineage.md`
 
 Deferrals (documented): mTLS, per-event user-OIDC bearer forwarding, MERGE per-branch column annotations, embedded CLI emit, DDL hint extraction.
 

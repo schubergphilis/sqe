@@ -458,7 +458,7 @@ The V12.x roadmap and parser-blocked items both feed this list. None of these ar
 5. **Glob expansion on `hf://` URLs (`**/*.parquet`)**: V12.2 in progress; the HF tree-API cache prerequisite shipped on `feat/hf-tree-cache`.
 6. **Smart-CSV inference deeper than extension**: DuckDB samples bytes to detect delimiter, quote, header. SQE's V12 follow-up uses extension-based heuristics; byte-sampling is a future enhancement.
 
-For the audit-driven detail with per-item status, see [`duckdb-comparision.md`](duckdb-comparision.md). For the user-facing "how did we get here" narrative, see [the blog](blog/2026-05-07-accidentally-duckdb.md) and ebook chapter [16d "The DuckDB Drift"](ebook/chapters/16d-the-duckdb-drift.md).
+For the audit-driven detail with per-item status, see [`duckdb-comparision.md`](duckdb-comparision.md). For the user-facing "how did we get here" narrative, see [the blog](../blog/2026-05-07-accidentally-duckdb.md) and ebook chapter [16d "The DuckDB Drift"](../ebook/chapters/16d-the-duckdb-drift.md).
 
 ## Key Limitations vs Trino
 
