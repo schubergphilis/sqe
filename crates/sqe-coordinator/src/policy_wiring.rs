@@ -23,9 +23,8 @@ use sqe_policy::{PassthroughEnforcer, PolicyEnforcer, PolicyStore};
 /// `Passthrough` engine), `NoopTagSource` is used (no tag masking).
 ///
 /// `metrics`, when present, is attached to the Ranger store so policy resolve
-/// latency, cache hit/miss, and circuit-breaker state are exported (mirrors how
-/// `OpaStore::with_metrics` is wired). Pass `None` in tests that do not serve
-/// metrics.
+/// latency, cache hit/miss, and circuit-breaker state are exported. Pass `None`
+/// in tests that do not serve metrics.
 #[allow(clippy::type_complexity)]
 pub fn build_policy_enforcer(
     config: &PolicyConfig,
@@ -42,15 +41,6 @@ pub fn build_policy_enforcer(
         PolicyEngine::Passthrough => None,
         PolicyEngine::InMemory => {
             Some(Arc::new(sqe_policy::policy_store::InMemoryPolicyStore::new()))
-        }
-        PolicyEngine::Opa => {
-            anyhow::bail!(
-                "policy.engine = opa selected but OPA wiring is not part of this change; \
-                 use ranger or in-memory"
-            )
-        }
-        PolicyEngine::Cedar => {
-            anyhow::bail!("policy.engine = cedar is not implemented")
         }
         PolicyEngine::Ranger => {
             let rc = &config.ranger;
@@ -268,36 +258,33 @@ catalog_url = "http://localhost:59997"
         );
     }
 
-    /// `opa` and `cedar` are LEGACY config values from an earlier design.
-    /// `ranger` is the policy backend; neither of the other two is planned work.
-    /// They remain accepted by the config parser for compatibility, and
-    /// selecting one must error rather than degrade.
+    /// `opa` and `cedar` are GONE, not merely unwired.
     ///
-    /// Pinned so the docs cannot drift from the code in either direction: if one
-    /// is ever implemented, this test fails and the matrix row has to be updated
-    /// in the same change.
+    /// They were config values from an earlier design that never shipped: OPA
+    /// had a `PolicyStore` implementation nothing ever constructed, and Cedar
+    /// had no implementation at all. Both used to parse and then fail at
+    /// startup. Removing the variants makes the bad state unrepresentable
+    /// instead of representable-and-rejected, and moves the error from "your
+    /// coordinator will not boot" to "your config file is wrong", which is a
+    /// better place for it.
     ///
-    /// Erroring is the right behaviour rather than silently degrading to
-    /// passthrough. A governance backend that quietly enforces nothing is worse
-    /// than one that refuses to start.
+    /// The error must name what IS valid, because an operator who typed `opa`
+    /// needs to know the answer is `ranger`, not just that `opa` failed.
     #[test]
-    fn unwired_policy_engines_fail_loudly_rather_than_degrade() {
-        for engine in [PolicyEngine::Opa, PolicyEngine::Cedar] {
-            let config = PolicyConfig {
-                engine,
-                ..Default::default()
-            };
-            let msg = match build_policy_enforcer(&config, None, None) {
-                Ok(_) => panic!(
-                    "an unwired policy engine must not build an enforcer; \
-                     {engine:?} silently succeeded"
-                ),
-                Err(e) => format!("{e}"),
-            };
+    fn opa_and_cedar_are_not_valid_policy_engines() {
+        for gone in ["opa", "cedar", "Cedar", "OPA"] {
+            let err = gone
+                .parse::<PolicyEngine>()
+                .expect_err("a removed engine must not parse");
             assert!(
-                msg.contains("opa") || msg.contains("cedar"),
-                "the error must name the engine that is unavailable, got: {msg}"
+                err.contains("ranger") && err.contains("in-memory"),
+                "the error must name the engines that DO exist, got: {err}"
             );
+        }
+        // The negative control: the engines that remain still parse, so the
+        // test is not passing because everything fails.
+        for ok in ["passthrough", "in-memory", "ranger"] {
+            assert!(ok.parse::<PolicyEngine>().is_ok(), "{ok} must still parse");
         }
     }
 

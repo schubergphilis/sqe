@@ -231,6 +231,7 @@ flush the cache on commit. The window is asserted at both edges by
 | Gap | Detail |
 |---|---|
 | Scope must match the privilege | A privilege binds to one resource level. Naming an object deeper than that level is refused rather than widened: `GRANT ALL ON wh.sales.orders` errors instead of writing a catalog-wide policy. Re-issue it at the level the error names. Pinned by `all_privileges_on_a_table_is_refused_rather_than_widened_to_the_catalog`. |
+| Revoke narrows, it does not cascade | Ranger allows one policy per resource, so grants share an item and `WRITE_ACCESS` contains all of `READ_ACCESS`. `REVOKE INSERT` used to strip the grantee's independent `SELECT` too. SQE now labels each grant (`chm:<TYPE>:<name>:<PRIVILEGE>`) and holds back access types another labelled privilege still needs. The `chm` prefix is shared with the data-platform control plane deliberately: both write to the same Ranger service and both read these labels, so a private prefix would leave each blind to the other's grants and cascading over them. A label naming a privilege SQE does not map is dropped and logged rather than trusted, because an under-revoke is worse than the cascade. Grants written before labels existed fall back to the old behaviour, logged. Pinned by `revoking_write_leaves_an_independent_read_grant_intact`. |
 | One grant is not enough to read a table | A grant writes ONE Ranger policy at the privilege's level. Reaching a table through SQE also needs catalog `namespace-list` and namespace `namespace-properties-read`. See "Three grants, not one" below. |
 | Views are not a boundary | `GRANT ... ON VIEW` works, but SQE expands the view and plans against its base tables, so the reader needs a grant there too. Not a Snowflake secure view. |
 | Group grantees, write path | `GRANT ... TO GROUP g` is rejected by the Ranger write path (`grantee_to_fields`) because Ranger only learns a user's groups under usersync. Group-bound policies authored in the Ranger console ARE enforced on the read path. |
@@ -239,7 +240,6 @@ flush the cache on commit. The window is asserted at both edges by
 | Namespace flattening | `resolve_policy_key` passes only the LAST dotted component as the Ranger `database`, so `a.b.sales` and `sales` collide. Pinned by `resolve_policy_key_multilevel_takes_last_namespace_component`. |
 | Tag parity with Spark | Spark reads tag associations from the Ranger or Atlas tag store, not from Iceberg properties. Masks are shared; associations are not. |
 | ALL vs FUTURE tables | Ranger has no future-only resource, so both collapse to one wildcard policy. Snowflake distinguishes them. |
-| `opa` and `cedar` engines | Legacy config values from an earlier design, superseded by `ranger`. Not wired, and selecting one errors rather than degrading to passthrough (pinned by `unwired_policy_engines_fail_loudly_rather_than_degrade`). They are not planned work; `ranger` is the backend. |
 | Tag propagation | A column derived from a tagged column in a CTAS starts untagged. |
 
 ## Where to go next
