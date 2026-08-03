@@ -130,6 +130,20 @@ SELECT id, region FROM sales_wh.acdemo.orders ORDER BY id;
 REVOKE SELECT ON sales_wh.acdemo.orders FROM ROLE "analyst";
 ```
 
+**Revoking one privilege does not disturb another.** Ranger permits a single
+policy per resource, so every grant on a table shares one item and their access
+types union. `INSERT` requires everything `SELECT` does, which means a literal
+`REVOKE INSERT` would strip the read access too. SQE labels each grant
+(`chm:<GRANTEE_TYPE>:<name>:<PRIVILEGE>`) and holds back the access types
+another labelled privilege still needs, so narrowing a user from read-write to
+read-only does what it says.
+
+The `chm` prefix is not SQE's own. The data-platform control plane writes to the
+same Ranger service and reads the same labels, so both tools have to agree on the
+format or each is blind to the other's grants and cascades over them. A group
+grantee is labelled `ROLE`, because a Keycloak group is materialised as a Ranger
+role of the identical name.
+
 Two properties worth internalising:
 
 **A role grant reaches only role members.** dave is in no role, so the grant

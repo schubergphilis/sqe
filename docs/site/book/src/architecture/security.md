@@ -2,7 +2,7 @@
 
 SQE enforces fine-grained security through **LogicalPlan rewriting**, injecting row filters and column masks into the query plan before DataFusion's optimizer runs.
 
-> **Status:** The plan-rewriting policy enforcer is implemented and pluggable, and it is **off by default**. The default policy engine is `passthrough` (`PassthroughEnforcer`), which returns plans unmodified, so enforcement is opt-in. The shipped, wired enforcement backend is Apache Ranger (with an in-memory store for dev and tests); OPA and Cedar are experimental and not yet wired. A default open-source deployment runs without any of this. See [GRANT and REVOKE](../sql-reference/grant-revoke.md) for the SQL surface and the Chameleon / SBP note.
+> **Status:** The plan-rewriting policy enforcer is implemented and pluggable, and it is **off by default**. The default policy engine is `passthrough` (`PassthroughEnforcer`), which returns plans unmodified, so enforcement is opt-in. The one enforcement backend is Apache Ranger, with an in-memory store for dev and tests. A default open-source deployment runs without any of this. See [GRANT and REVOKE](../sql-reference/grant-revoke.md) for the SQL surface and the Chameleon / SBP note.
 
 ## Design Principle
 
@@ -43,8 +43,6 @@ Implementations:
 - **PassthroughEnforcer**: returns plan unchanged (default; enforcement opt-in)
 - **Ranger**: reads row-filter and column-mask policies from Apache Ranger and feeds the plan rewriter (shipped, wired)
 - **InMemory**: grants stored in a hash map for dev and tests (shipped, wired)
-- **OPA Enforcer**: queries Open Policy Agent for policies (experimental, not yet wired)
-- **Cedar Enforcer**: evaluates AWS Cedar policies locally (experimental, not yet wired)
 
 The Ranger enforcer reads the same `hive` service-def that Apache Spark reads through its Kyuubi authorization plugin, so one policy written once in Ranger enforces byte-identically in SQE and in Spark. See [Fine-grained access control](../features/fine-grained-access-control.md) for the how-to and [Spark / Ranger Parity](../design-notes/sqe-spark-ranger-parity.md) for the validated result.
 
