@@ -244,7 +244,7 @@ Landed June 2026 across five sub-phases; the end-to-end demo is `quickstart/pola
 
 Not yet wired:
 
-- OPA (Rego) and Cedar policy engines are present as configuration options but remain experimental
+- OPA (Rego) and Cedar were removed: `opa` had a policy store nothing constructed, `cedar` had no implementation, and both only ever failed at startup. Apache Ranger is the policy engine
 - Iceberg-to-Ranger tag sync (so Spark sees SQE-authored column tags) and `SHOW TAGS` read-back
 - See the "Known gaps" in [GRANT and REVOKE](../sql-reference/grant-revoke.md) for SQL-surface limits (no `WITH GRANT OPTION`, table-level INSERT only, scalar-only masks)
 

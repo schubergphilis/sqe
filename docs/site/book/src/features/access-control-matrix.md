@@ -239,7 +239,6 @@ flush the cache on commit. The window is asserted at both edges by
 | Namespace flattening | `resolve_policy_key` passes only the LAST dotted component as the Ranger `database`, so `a.b.sales` and `sales` collide. Pinned by `resolve_policy_key_multilevel_takes_last_namespace_component`. |
 | Tag parity with Spark | Spark reads tag associations from the Ranger or Atlas tag store, not from Iceberg properties. Masks are shared; associations are not. |
 | ALL vs FUTURE tables | Ranger has no future-only resource, so both collapse to one wildcard policy. Snowflake distinguishes them. |
-| `opa` and `cedar` engines | Legacy config values from an earlier design, superseded by `ranger`. Not wired, and selecting one errors rather than degrading to passthrough (pinned by `unwired_policy_engines_fail_loudly_rather_than_degrade`). They are not planned work; `ranger` is the backend. |
 | Tag propagation | A column derived from a tagged column in a CTAS starts untagged. |
 
 ## Where to go next

@@ -2630,10 +2630,6 @@ pub enum PolicyEngine {
     Passthrough,
     /// In-memory `PolicyStore` for tests and local dev.
     InMemory,
-    /// Open Policy Agent over HTTP. Requires `[policy.opa]`.
-    Opa,
-    /// Cedar policy engine (experimental).
-    Cedar,
     /// Apache Ranger fine-grained policies (hive service-def). Requires
     /// `[policy.ranger]`. Reads row-filter + data-mask policies and feeds the
     /// PlanRewriter. Separate from `access_control.backend = "ranger"`.
@@ -2647,11 +2643,9 @@ impl std::str::FromStr for PolicyEngine {
         match s.to_ascii_lowercase().as_str() {
             "passthrough" | "" => Ok(Self::Passthrough),
             "in-memory" | "inmemory" | "in_memory" => Ok(Self::InMemory),
-            "opa" => Ok(Self::Opa),
-            "cedar" => Ok(Self::Cedar),
             "ranger" => Ok(Self::Ranger),
             other => Err(format!(
-                "unknown policy.engine {other:?}; expected one of passthrough, in-memory, opa, cedar, ranger"
+                "unknown policy.engine {other:?}; expected one of passthrough, in-memory, ranger"
             )),
         }
     }
@@ -2670,7 +2664,7 @@ pub struct PolicyConfig {
     /// changes every masked digest, so the same key must persist across
     /// coordinator restarts and across all coordinators in an HA setup.
     ///
-    /// This applies to Ranger `MASK_HASH` and OPA `hash` column masks alike.
+    /// This applies to Ranger `MASK_HASH` column masks.
     /// We warn rather than reject on `engine = ranger` + empty key (issue #37):
     /// default-denying Hash without a key is the stronger control but is
     /// breaking for deployments already relying on the unkeyed behaviour, so it
@@ -2679,61 +2673,9 @@ pub struct PolicyConfig {
     /// Can be set via the `SQE_POLICY__MASK_KEY` environment variable.
     #[serde(default)]
     pub mask_key: String,
-    /// OPA backend tuning. Empty defaults are sensible for most deployments
-    /// (5 s timeout, 10 000 cache entries, 5 consecutive failures opens the
-    /// breaker, 30 s recovery window).
-    #[serde(default)]
-    pub opa: OpaConfig,
     /// Ranger fine-grained backend tuning. Used only when `engine = "ranger"`.
     #[serde(default)]
     pub ranger: RangerPolicyConfig,
-}
-
-#[derive(Debug, Deserialize, Clone)]
-pub struct OpaConfig {
-    /// HTTP timeout for a single OPA evaluate call in seconds.
-    #[serde(default = "default_opa_timeout_secs")]
-    pub timeout_secs: u64,
-    /// Maximum cached `ResolvedPolicy` entries.
-    #[serde(default = "default_opa_cache_max_entries")]
-    pub cache_max_entries: u64,
-    /// Cache TTL in seconds; entries older than this are revalidated.
-    #[serde(default = "default_opa_cache_ttl_secs")]
-    pub cache_ttl_secs: u64,
-    /// Consecutive OPA failures before the circuit breaker opens.
-    #[serde(default = "default_opa_breaker_failure_threshold")]
-    pub breaker_failure_threshold: u32,
-    /// How long to keep the breaker open before probing again, in seconds.
-    #[serde(default = "default_opa_breaker_recovery_secs")]
-    pub breaker_recovery_secs: u64,
-}
-
-impl Default for OpaConfig {
-    fn default() -> Self {
-        Self {
-            timeout_secs: default_opa_timeout_secs(),
-            cache_max_entries: default_opa_cache_max_entries(),
-            cache_ttl_secs: default_opa_cache_ttl_secs(),
-            breaker_failure_threshold: default_opa_breaker_failure_threshold(),
-            breaker_recovery_secs: default_opa_breaker_recovery_secs(),
-        }
-    }
-}
-
-fn default_opa_timeout_secs() -> u64 {
-    5
-}
-fn default_opa_cache_max_entries() -> u64 {
-    10_000
-}
-fn default_opa_cache_ttl_secs() -> u64 {
-    60
-}
-fn default_opa_breaker_failure_threshold() -> u32 {
-    5
-}
-fn default_opa_breaker_recovery_secs() -> u64 {
-    30
 }
 
 /// Fine-grained policy engine backed by a `hive`-type Apache Ranger service.
@@ -2776,14 +2718,23 @@ pub struct RangerPolicyConfig {
     #[serde(default = "default_ranger_policy_cache_ttl_secs")]
     pub cache_ttl_secs: u64,
     /// Consecutive failures before the circuit breaker opens.
-    #[serde(default = "default_opa_breaker_failure_threshold")]
+    #[serde(default = "default_policy_breaker_failure_threshold")]
     pub breaker_failure_threshold: u32,
     /// How long to keep the breaker open before probing again, in seconds.
-    #[serde(default = "default_opa_breaker_recovery_secs")]
+    #[serde(default = "default_policy_breaker_recovery_secs")]
     pub breaker_recovery_secs: u64,
     /// Accept self-signed TLS certs on the Ranger Admin endpoint.
     #[serde(default)]
     pub accept_invalid_certs: bool,
+}
+
+/// Circuit-breaker defaults shared by the policy backends. 5 consecutive
+/// failures opens the breaker; it probes again after 30 s.
+fn default_policy_breaker_failure_threshold() -> u32 {
+    5
+}
+fn default_policy_breaker_recovery_secs() -> u64 {
+    30
 }
 
 impl Default for RangerPolicyConfig {
@@ -2796,8 +2747,8 @@ impl Default for RangerPolicyConfig {
             timeout_secs: default_ranger_policy_timeout_secs(),
             cache_max_entries: default_ranger_policy_cache_max_entries(),
             cache_ttl_secs: default_ranger_policy_cache_ttl_secs(),
-            breaker_failure_threshold: default_opa_breaker_failure_threshold(),
-            breaker_recovery_secs: default_opa_breaker_recovery_secs(),
+            breaker_failure_threshold: default_policy_breaker_failure_threshold(),
+            breaker_recovery_secs: default_policy_breaker_recovery_secs(),
             accept_invalid_certs: false,
         }
     }
