@@ -225,6 +225,8 @@ The reference docs:
 | [Architecture](docs/site/book/src/architecture/overview.md) | Mermaid diagrams across the engine |
 | [Deployment](docs/site/book/src/deployment/configuration.md) | Docker Compose, K8s, TLS, auth providers, monitoring |
 | [Operational Runbook](docs/site/book/src/operations/runbook.md) | On-call triage: crashloops, catalog/OIDC outages, OOM, registry flap |
+| [Access control tutorial](docs/site/book/src/features/access-control-tutorial.md) | Both gates, worked end to end: the Polaris catalog gate (GRANT/REVOKE/DENY, views) and SQE's row filters, column masks and tags |
+| [Access control: support matrix](docs/site/book/src/features/access-control-matrix.md) | What is supported, what is proven, and by which test |
 | Iceberg Matrix | Per-cell SQE coverage on the public scoreboard |
 | Iceberg Matrix Comparison | V2/V3 side-by-side against 20 engines |
 | [Trino Compatibility](docs/site/compare/trino-compatibility.md) | SQL function and feature matrix vs Trino |

@@ -232,7 +232,7 @@ Shipped:
 
 Landed June 2026 across five sub-phases; the end-to-end demo is `quickstart/polaris-ranger-keycloak/`.
 
-- **GRANT/REVOKE to Ranger**: `access_control.backend = "ranger"` translates `GRANT`/`REVOKE`/`SHOW GRANTS` into Ranger Admin REST calls; Polaris 1.5's embedded Ranger authorizer enforces the coarse gate
+- **GRANT/REVOKE to Ranger**: `access_control.backend = "ranger"` translates `GRANT`/`REVOKE`/`SHOW GRANTS` into Ranger Admin REST calls; Polaris's embedded Ranger authorizer enforces the coarse gate
 - **Row filters + column masks** (Phase 1): `RangerStore` downloads the `hive` service policy set and feeds the plan rewriter; a query must pass both the Polaris gate and the SQE-side rewrite
 - **Full mask vocabulary** (Phase 2A): MASK_NULL, full redact, show-first-4 / show-last-4, hash, date-show-year, and CUSTOM expressions, all type-preserving through the physical planner
 - **Session-context functions** (Phase 2B): `current_user()`, `is_role_in_session(role)`, `current_database()`, `current_schema()` usable in policy expressions and user SQL; they const-fold to literals before plan distribution, so no session state ships to workers

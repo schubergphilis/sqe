@@ -488,6 +488,6 @@ Related references:
 
 ## Versions
 
-- Apache Polaris 1.5.0 (embedded Ranger authorizer, Beta).
+- Apache Polaris 1.7.0 (embedded Ranger authorizer, Beta).
 - Apache Ranger 2.8.0.
 - Keycloak 26.5.
