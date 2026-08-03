@@ -300,7 +300,7 @@ pre-created as a Polaris principal. The bootstrap creates `alice`, `bob`,
 "Failed to resolve principal". The token is a lookup key, not an identity source.
 This holds in `external` mode too, confirmed against Polaris source:
 `DefaultAuthenticator` is the only authenticator in Polaris 1.5, and it always
-looks the principal up in the metastore. See `docs/polaris-principal-provisioning.md`
+looks the principal up in the metastore. See [polaris-principal-provisioning.md](./polaris-principal-provisioning.md)
 for the full investigation. Eliminating per-user provisioning is not a config
 option; it would require a custom `Authenticator` bean.
 
@@ -570,8 +570,8 @@ The fine-grained path is configured under `[policy] engine = "ranger"` with
 `access_control.backend = "ranger"`. For the fine-grained model see the
 "Fine-grained enforcement" section of
 `quickstart/polaris-ranger-keycloak/OVERVIEW.md`, the design notes in
-`docs/fine-grained-policy.md`, and the service-type decision in
-`docs/ranger-fine-grained-service-type.md`.
+[fine-grained-policy.md](./fine-grained-policy.md), and the service-type decision in
+[ranger-fine-grained-service-type.md](./ranger-fine-grained-service-type.md).
 
 ## Versions
 

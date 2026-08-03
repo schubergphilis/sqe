@@ -2,7 +2,7 @@
 
 ## Iceberg matrix coverage
 
-**Score: 167/189 (88.4%)** on the public [icebergmatrix.org](https://icebergmatrix.org) scoreboard, fifth overall behind only Spark distributions (EMR, AWS Glue, OSS Spark, Dataproc). See [`docs/iceberg-matrix.md`](iceberg-matrix.md) for the per-cell breakdown and [`docs/iceberg-matrix-compare.md`](iceberg-matrix-compare.md) for the V2/V3 comparison against every other engine on the public scoreboard.
+**Score: 167/189 (88.4%)** on the public [icebergmatrix.org](https://icebergmatrix.org) scoreboard, fifth overall behind only Spark distributions (EMR, AWS Glue, OSS Spark, Dataproc). See [`docs/iceberg-matrix.md`](./design-archive/iceberg-matrix.md) for the per-cell breakdown and [`docs/iceberg-matrix-compare.md`](./design-archive/iceberg-matrix-compare.md) for the V2/V3 comparison against every other engine on the public scoreboard.
 
 ## Completed
 
@@ -99,7 +99,7 @@
 
 ## Planned
 
-- [ ] SF100 scaling. The single-node tactics that win at SF1/SF10 (broadcast build sides, in-memory hash tables, single scan stream) invert at SF100. Needs memory-pool discipline under concurrency (cap concurrent sort consumers, bound per-consumer reservations, upstream proactive spill `apache/datafusion#17334`) and a proven multi-node distributed path. Generator must also stream row groups to disk first. Predicted failure modes and evidence in [`docs/perf/sf100-scaling-risks.md`](perf/sf100-scaling-risks.md).
+- [ ] SF100 scaling. The single-node tactics that win at SF1/SF10 (broadcast build sides, in-memory hash tables, single scan stream) invert at SF100. Needs memory-pool discipline under concurrency (cap concurrent sort consumers, bound per-consumer reservations, upstream proactive spill `apache/datafusion#17334`) and a proven multi-node distributed path. Generator must also stream row groups to disk first. Predicted failure modes and evidence in [`docs/perf/sf100-scaling-risks.md`](../evidence/perf/sf100-scaling-risks.md).
 - [ ] **DataFusion 54 follow-up: ship physical dynamic filters to workers.** SQE currently ships hash-join dynamic filters to workers via a lossy physical-to-logical `Expr` conversion (`scan_pushdown.rs::physical_filter_to_logical`) that drops the hash-set membership, which is why SSB trails when distributed (the star-join selectivity lives in that membership set). DF 54 added `DynamicFilter` protobuf serialization (`datafusion-proto-54`). Gated on a feasibility spike: confirm a serialized `DynamicFilter` carries the membership set *after the build side seals it*, and that SQE can serialize at that point rather than shipping an empty placeholder. If it works, this is the direct fix for the SSB-distributed gap.
 - [ ] **DataFusion 54 follow-up: adopt native-scan wins into the vendored Iceberg reader.** `IcebergScanExec` bypasses DataFusion's native Parquet scan, so DF 54's scan-side improvements do not reach Iceberg queries: struct-field pushdown in the Parquet `RowFilter`, row-group reordering by statistics for TopK queries, and MIN/MAX resolution from Parquet metadata for single-mode aggregates. Port the worthwhile ones into `vendor/iceberg-rust/.../reader.rs`. (NDV-from-metadata is *not* replicable: Iceberg manifests carry min/max/null bounds, not distinct counts. Column min/max/null are already fed to the optimizer via `compute_table_statistics`.) Note: config-default audit (DF 53.1 vs 54) came back clean, so no default pinning is needed.
 - [ ] Full cost-based join enumeration (DataFusion upstream DF#3843)
@@ -109,7 +109,7 @@
 - [ ] Sort-on-write enforcement (writer pass after planner)
 - [ ] Semantic AI layer (RDF/SPARQL, property graph, vector search)
 - [ ] Hash join spill support (DataFusion upstream DF#17267)
-- [ ] Azure ADLS Gen2 / GCS object stores (one-line `Cargo.toml` feature flip + `register_*_store_if_needed` helpers; tracked in [`cli-embedded.md`](cli-embedded.md))
+- [ ] Azure ADLS Gen2 / GCS object stores (one-line `Cargo.toml` feature flip + `register_*_store_if_needed` helpers; tracked in [embedded mode](../site/book/src/features/embedded.md))
 - [ ] Smart-CSV byte sampling (current `read_csv` infers delimiter / codec from path extension; DuckDB samples bytes for the same)
 
 ## Blocked upstream

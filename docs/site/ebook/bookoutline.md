@@ -168,7 +168,7 @@ Shipping it. Running it. Keeping it running.
 |-----|-------|-------|---------|
 | A | **Crate Map** | 6 | All 10 crates, responsibilities, dependency graph, public API surface |
 | B | **Iceberg REST Catalog Comparison** | 8 | Polaris vs Unity vs Gravitino vs Nessie: features, auth models, deployment, Iceberg REST compliance |
-| C | **SQL Compatibility Matrix** | 10 | SQE vs Trino: ~95% coverage across 13 categories. 70+ UDFs, engine-level features (USE, SHOW CREATE TABLE, TRUNCATE, TRY, time travel). The full `docs/trino-compatibility.md` with exact gap reasons. How we went from 63% to 95% in two days. |
+| C | **SQL Compatibility Matrix** | 10 | SQE vs Trino: ~95% coverage across 13 categories. 70+ UDFs, engine-level features (USE, SHOW CREATE TABLE, TRUNCATE, TRY, time travel). The full `docs/site/compare/trino-compatibility.md` with exact gap reasons. How we went from 63% to 95% in two days. |
 | D | **Flight SQL Client Cookbook** | 6 | Connection recipes for Python, Java, Go, Rust, DBeaver, dbt |
 | E | **The OpenSpec That Started It All** | 6 | The original proposal annotated with what changed and why |
 | F | **Art of Agents Quick Reference** | 3 | The Five Constants, Promote/Pivot/Compost, and how they applied |

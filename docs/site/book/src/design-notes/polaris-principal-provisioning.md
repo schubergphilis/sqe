@@ -97,6 +97,6 @@ Keycloak users authenticate against them.
 ## Related notes
 
 - Identity model summary: `quickstart/polaris-ranger-keycloak/OVERVIEW.md`.
-- Ranger backend design: `docs/superpowers/specs/2026-06-18-ranger-access-control-backend-design.md`.
+- Ranger backend design: `docs/internal/specs/2026-06-18-ranger-access-control-backend-design.md`.
 - BFF OPA->Ranger migration (carries this finding):
   `../data-platform/docs/prompts/opa-to-ranger-migration-prompt.md`.

@@ -155,7 +155,7 @@ SQE serves them now. The cluster path and the embedded path share one binary. Th
 
 **Listen to the queries users paste.** The hf:// auto-detect bug came from a real user pasting a real URL. We did not anticipate it. We fixed it in five files. The DuckDB drift came from many small bugs of the same shape, each from a real user.
 
-**Compatibility audits beat compatibility plans.** We listed every DuckDB feature and asked, for each one, "does SQE have this and we never documented it, or do we genuinely lack it?" Two false negatives became one-line documentation fixes. Eight genuine gaps became V8-V12. The audit is at `docs/duckdb-comparision.md`.
+**Compatibility audits beat compatibility plans.** We listed every DuckDB feature and asked, for each one, "does SQE have this and we never documented it, or do we genuinely lack it?" Two false negatives became one-line documentation fixes. Eight genuine gaps became V8-V12. The audit is at `docs/site/compare/duckdb-comparision.md`.
 
 **Convergence is the default.** When the building blocks are good (DataFusion, iceberg-rust, object_store), every engine that picks them up ends up looking similar at the user level. The work is in the integration, not the engine.
 

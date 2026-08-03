@@ -38,7 +38,7 @@ Each chart below puts SF0.1, SF1, and SF10 on the same time axis (log scale on Y
 
 ![TPC-H cross-scale](./charts/tpch-cross-scale.png)
 
-22 queries, decision support. Strict comparison against Trino 465 lives in the [README's headline table](../../README.md#performance-receipts-sf1-vs-trino-465) and the [book benchmark page](../../site/book/src/features/benchmarks.md#results-sf1-vs-trino-465). Detail: [TPC-H](./tpch.md).
+22 queries, decision support. Strict comparison against Trino 465 lives in the [README's headline table](../../../README.md#performance-receipts-sf1-vs-trino-465) and the [book benchmark page](../../site/book/src/features/benchmarks.md#results-sf1-vs-trino-465). Detail: [TPC-H](./tpch.md).
 
 ### TPC-DS
 
@@ -108,7 +108,7 @@ These JSON files are committed to the repo (per `CLAUDE.md`) so the timeline is 
 
 What they show:
 
-- **Day a fix landed**: a step-change in total duration usually corresponds to a single commit landing on `main`. Cross-reference with the [Performance Roadmap](../specs/performance-roadmap.md) and the dated blog posts.
+- **Day a fix landed**: a step-change in total duration usually corresponds to a single commit landing on `main`. Cross-reference with the [Performance Roadmap](../../internal/plans/performance-roadmap.md) and the dated blog posts.
 - **Regression caught fast**: a single-run spike that the next run reverses is the common shape after a bad change is rolled back.
 - **Consistently slow queries**: rows in the heatmap that stay orange / red across the whole period are queries the planner has not yet learned to handle well. q72 in TPC-DS was the standout for a month before the 2026-05-16 dynamic-filter type-coercion fix collapsed it from 10.7s to 0.77s; the orange band on the heatmap stops there.
 - **New benchmark machine**: a step-change that affects every query the same way is usually environmental (different machine, different disk, different Trino version).
@@ -117,7 +117,7 @@ What they do not show:
 
 - **Wall-clock query latency** to a real client. Benchmarks run inside the SQE process loop with Flight SQL and capture only the engine time. Network round-trips are not included.
 - **Variance from a single run**. We do not run with repeats and confidence intervals; one point per run. Smoothing comes from running benchmarks many times across the period.
-- **Cost-per-query in the cluster mode**. Distributed execution adds shuffle / scheduling overhead that the single-node Flight SQL benchmarks do not capture. See `docs/blog/2026-04-02-distributed-execution.md` for the cluster-mode timings.
+- **Cost-per-query in the cluster mode**. Distributed execution adds shuffle / scheduling overhead that the single-node Flight SQL benchmarks do not capture. See `docs/site/book/src/quickstart/distributed.md` for the cluster-mode setup.
 
 ## Cross-suite headline (May 2026)
 
@@ -150,9 +150,9 @@ Distributed execution is validated separately on a forced-distribution rig: sing
 
 ## Related
 
-- [Performance Roadmap](../specs/performance-roadmap.md): the optimisation backlog, in order.
-- [Runtime Filter Pushdown](../features/runtime-filter-pushdown.md): the Path B+B-2 work that drove most of the April-May TPC-H speedups.
-- [Our Nemesis: TPC-DS Q72 (April)](../blog/2026-04-16-our-nemesis-q72.md): the original investigation, when the query was still 12x slower.
-- [q72, our nemesis, and the Int32 that hid for a month (May 16)](../blog/2026-05-16-q72-the-nemesis.md): the post-mortem on the fix that finally landed.
-- [Five Layers of Caching and an 8.8x Speedup](../blog/2026-04-12-caching-and-the-8x-speedup.md): the early-April caching work.
-- [The Benchmark That Lied (June 12)](../blog/2026-06-12-the-benchmark-that-lied.md): vacuous results, the DuckDB oracle, and the day Trino was the one with the wrong answer.
+- [Performance Roadmap](../../internal/plans/performance-roadmap.md): the optimisation backlog, in order.
+- [Runtime Filter Pushdown](../../site/book/src/design-notes/runtime-filter-pushdown.md): the Path B+B-2 work that drove most of the April-May TPC-H speedups.
+- [Our Nemesis: TPC-DS Q72 (April)](../../site/blog/2026-04-16-our-nemesis-q72.md): the original investigation, when the query was still 12x slower.
+- [q72, our nemesis, and the Int32 that hid for a month (May 16)](../../site/blog/2026-05-16-q72-the-nemesis.md): the post-mortem on the fix that finally landed.
+- [Five Layers of Caching and an 8.8x Speedup](../../site/blog/2026-04-12-caching-and-the-8x-speedup.md): the early-April caching work.
+- [The Benchmark That Lied (June 12)](../../site/blog/2026-06-12-the-benchmark-that-lied.md): vacuous results, the DuckDB oracle, and the day Trino was the one with the wrong answer.

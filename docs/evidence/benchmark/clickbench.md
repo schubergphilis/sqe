@@ -41,5 +41,5 @@ One run. Will fill in as more land.
 - Queries: `crates/sqe-bench/queries/clickbench/`
 - Bloom filter writer: `crates/sqe-catalog/src/parquet_writer_config.rs`
 - Footer cache: `crates/sqe-catalog/src/footer_cache.rs`
-- Caching strategy: [`docs/blog/2026-04-12-caching-and-the-8x-speedup.md`](../blog/2026-04-12-caching-and-the-8x-speedup.md)
+- Caching strategy: [`docs/site/blog/2026-04-12-caching-and-the-8x-speedup.md`](../../site/blog/2026-04-12-caching-and-the-8x-speedup.md)
 - Runner: `scripts/benchmark-test.sh clickbench`

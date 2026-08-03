@@ -6,8 +6,8 @@ mask authored once in Ranger produces byte-exact identical output in SQE and in
 standard Spark.
 
 For how SQE enforces fine-grained policies internally, see
-`docs/ranger-fine-grained-enforcement.md`. For the coarse catalog access-control
-path, see `docs/ranger-access-control.md`. This document covers only the
+[ranger-fine-grained-enforcement.md](./ranger-fine-grained-enforcement.md). For the coarse catalog access-control
+path, see [ranger-access-control.md](./ranger-access-control.md). This document covers only the
 cross-engine parity result and its scope.
 
 ## The validated result
@@ -38,7 +38,7 @@ runtime.
 
 - **SQE** rewrites the `LogicalPlan` in its `PolicyEnforcer` /
   `PolicyPlanRewriter` before DataFusion optimization. See
-  `docs/ranger-fine-grained-enforcement.md`.
+  [ranger-fine-grained-enforcement.md](./ranger-fine-grained-enforcement.md).
 - **Spark** rewrites its logical plan through Kyuubi's Spark Authz plugin
   (`RangerSparkExtension`).
 
@@ -65,7 +65,7 @@ associations from different places:
 
 - Spark Authz reads tag associations from the Ranger / Atlas tag store.
 - SQE reads them from the Iceberg table property `sqe.column-tags` (see
-  `docs/ranger-tag-storage-decision.md`).
+  [ranger-tag-storage-decision.md](./ranger-tag-storage-decision.md)).
 
 The mask-per-tag RULE is shared (both read `tagPolicies` from Ranger), but the
 ASSOCIATION source differs. Tag parity would require an Iceberg-to-Ranger tag
@@ -110,9 +110,9 @@ parity stack would need Kyuubi built from source.
 
 ## Related docs
 
-- `docs/ranger-fine-grained-enforcement.md` -- how SQE enforces the same policies.
-- `docs/ranger-access-control.md` -- the catalog access-control path.
-- `docs/ranger-fine-grained-service-type.md` -- why the `hive` service-def is the
+- [ranger-fine-grained-enforcement.md](./ranger-fine-grained-enforcement.md) -- how SQE enforces the same policies.
+- [ranger-access-control.md](./ranger-access-control.md) -- the catalog access-control path.
+- [ranger-fine-grained-service-type.md](./ranger-fine-grained-service-type.md) -- why the `hive` service-def is the
   cross-engine sharing point, and the cross-engine matching requirements.
-- `docs/ranger-tag-storage-decision.md` -- the tag-association storage decision
+- [ranger-tag-storage-decision.md](./ranger-tag-storage-decision.md) -- the tag-association storage decision
   that scopes tag parity out.

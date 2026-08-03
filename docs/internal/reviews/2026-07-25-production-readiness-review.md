@@ -55,7 +55,7 @@ The vendored `iceberg-rust` fork is a maintenance burden, but the reason for it 
 
 The benchmark harness compares query outputs with Trino and, for several suites, an independent DuckDB oracle. The existing SF1/SF10 results are useful evidence because they track pass counts and row differences, not just elapsed time.
 
-The repository is also honest about missing evidence: [the SF100 risk study](evidence/perf/sf100-scaling-risks.md) explicitly labels its conclusions as extrapolation rather than measurement.
+The repository is also honest about missing evidence: [the SF100 risk study](../../evidence/perf/sf100-scaling-risks.md) explicitly labels its conclusions as extrapolation rather than measurement.
 
 ### 3. Identity is preserved across the important boundaries
 
@@ -93,7 +93,7 @@ Severity in this report means:
 
 **Evidence**
 
-- [`crates/sqe-worker/src/shuffle.rs`](../crates/sqe-worker/src/shuffle.rs) uses one bounded Tokio channel per partition.
+- [`crates/sqe-worker/src/shuffle.rs`](../../../crates/sqe-worker/src/shuffle.rs) uses one bounded Tokio channel per partition.
 - The default capacity is 64 **record batches**, not a byte reservation.
 - There is no shuffle-file writer, disk-backed exchange, byte quota, or spill/reload lifecycle.
 - Existing SF100 notes independently identify “shuffle has no spill” as a blocker.
@@ -156,7 +156,7 @@ Run the currently failing distributed TPC-DS inventory queries with a deliberate
 
 - Public evidence is strongest at SF1 and SF10.
 - Existing distributed measurements co-locate coordinator, workers, and comparison engine on one host.
-- [`docs/evidence/perf/sf100-scaling-risks.md`](evidence/perf/sf100-scaling-risks.md) explicitly says SF100 conclusions are projections.
+- [`docs/evidence/perf/sf100-scaling-risks.md`](../../evidence/perf/sf100-scaling-risks.md) explicitly says SF100 conclusions are projections.
 - The generator/load pipeline still has suite-specific SF100 blockers.
 
 **Why this matters**
@@ -192,7 +192,7 @@ Start with SF30 if infrastructure limits SF100, but keep the plan and file count
 
 - The Helm chart defaults to one coordinator and explicitly states that the PDB does not provide HA.
 - Sessions, query tracking, cancellation state, cache state, and distributed orchestration are process-local.
-- Session snapshots intentionally omit tokens and [`SessionManager::restore_from_file`](../crates/sqe-coordinator/src/session_manager.rs) only logs that full restore is not implemented.
+- Session snapshots intentionally omit tokens and [`SessionManager::restore_from_file`](../../../crates/sqe-coordinator/src/session_manager.rs) only logs that full restore is not implemented.
 
 **Why this matters**
 
