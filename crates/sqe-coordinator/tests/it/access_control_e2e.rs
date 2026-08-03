@@ -2122,6 +2122,35 @@ async fn one_table_grant_writes_the_namespace_it_needs() {
         "the table half of the plan must still be written, got {tbl:?}"
     );
 
+    // And the payoff: dave reads, having been given one statement beyond catalog
+    // discovery, through policies this code wrote.
+    //
+    // A plain wait rather than the usual `eventually` retry loop, for a specific
+    // reason. Until the Polaris plugin polls, dave holds catalog discovery with
+    // `ac` still invisible, and a read in that window wedges
+    // `SqeCatalogProvider::schema()` (see the doc comment above) -- so the FIRST
+    // retry would hang and the loop would never get a second attempt. Waiting out
+    // the propagation window means the single read below happens after `ac` became
+    // visible. The `timeout` is what keeps this honest: if the wedge is hit anyway
+    // the test FAILS with a clear message instead of hanging the suite.
+    tokio::time::sleep(std::time::Duration::from_secs(45)).await;
+    let read = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        ctx.handler.execute(&ctx.dave, &format!("SELECT id FROM {ORDERS}"), None),
+    )
+    .await
+    .expect(
+        "dave's read neither succeeded nor failed within 60s: this is the \
+         SqeCatalogProvider::schema() wedge, not a policy problem",
+    )
+    .expect("one GRANT on the table, plus catalog discovery, must make it readable");
+    assert_eq!(
+        total_rows(&read),
+        3,
+        "dave must see the fixture's 3 rows through a namespace policy that GRANT \
+         wrote for him"
+    );
+
     // Control: the namespace policy confers VISIBILITY, not data. If it leaked
     // read access, the other table in the namespace would be readable too.
     assert!(
@@ -2146,10 +2175,22 @@ async fn one_table_grant_writes_the_namespace_it_needs() {
         "namespace visibility is deliberately NOT released by a table revoke"
     );
 
-    for stmt in [
-        "REVOKE USAGE ON SCHEMA sales_wh.ac FROM USER \"dave\"",
-        "REVOKE USAGE ON DATABASE sales_wh FROM USER \"dave\"",
-    ] {
-        let _ = ctx.handler.execute(&ctx.carol, stmt, None).await;
-    }
+    // Teardown drops CATALOG discovery and deliberately leaves the namespace
+    // visibility behind.
+    //
+    // Revoking the schema too would leave dave holding catalog discovery with
+    // every namespace probe denied, which is the state that wedges
+    // `SqeCatalogProvider::schema()` (see this test's doc comment). Polaris
+    // propagates the two revokes independently over 5 to 30s, so a teardown that
+    // issued both would pass through that state for an unbounded window, and any
+    // later test doing a read as dave would hang instead of failing.
+    // `role_grant_and_user_grant_both_apply` does exactly that.
+    //
+    // Without catalog discovery dave cannot list namespaces at all, which denies
+    // cleanly and promptly. The residue is inert visibility, the same asymmetry
+    // this test asserts is deliberate.
+    let _ = ctx
+        .handler
+        .execute(&ctx.carol, "REVOKE USAGE ON DATABASE sales_wh FROM USER \"dave\"", None)
+        .await;
 }

@@ -98,7 +98,9 @@ wildcard discovery for the `analyst` and `engineer` roles, which is why a single
 `REVOKE` on the table does not release the namespace policy. One namespace policy
 serves every table granted under it, so dropping it on the first revoke would
 break the grantee's access to the rest. The residue is visibility only, labelled
-`sqe:traversal:<GRANTEE_TYPE>:<name>`; clear it with `REVOKE USAGE ON SCHEMA`.
+`sqe:traversal:<GRANTEE_TYPE>:<name>`. To clear it, revoke `USAGE ON DATABASE`
+before `USAGE ON SCHEMA`: a principal holding catalog discovery with no visible
+namespace currently hangs rather than being denied (see the gap row below).
 
 ### A grant must be scoped at the privilege's own level
 
@@ -247,6 +249,7 @@ flush the cache on commit. The window is asserted at both edges by
 | Scope must match the privilege | A privilege binds to one resource level. Naming an object deeper than that level is refused rather than widened: `GRANT ALL ON wh.sales.orders` errors instead of writing a catalog-wide policy. Re-issue it at the level the error names. Pinned by `all_privileges_on_a_table_is_refused_rather_than_widened_to_the_catalog`. |
 | Revoke narrows, it does not cascade | Ranger allows one policy per resource, so grants share an item and `WRITE_ACCESS` contains all of `READ_ACCESS`. `REVOKE INSERT` used to strip the grantee's independent `SELECT` too. SQE now labels each grant (`sqe:<TYPE>:<name>:<PRIVILEGE>`) and holds back access types another labelled privilege still needs. Grants written before labels existed fall back to the old behaviour, logged. Pinned by `revoking_write_leaves_an_independent_read_grant_intact`. |
 | A table grant still needs catalog discovery | A table grant now writes its namespace ancestor too, but catalog-level `namespace-list` stays an explicit `GRANT USAGE ON DATABASE`: auto-adding it would expose every namespace NAME in the catalog. See "Two grants, not one" below. |
+| Catalog discovery with nothing visible HANGS | A principal who can list a catalog's namespaces while every per-namespace probe 403s blocks indefinitely instead of getting "table not found": `contains_namespace` bridges to async through `runtime_bridge::block_on_compat`, which spawns a thread and joins it, and the join never returns. Same family as #195. Revoke `USAGE ON DATABASE` before `USAGE ON SCHEMA` to avoid passing through the state. Captured with `sample`; recorded in `docs/internal/research/2026-08-02-catalog-traversal-gate.md`. |
 | Namespace visibility outlives the revoke | `REVOKE` on a table does not release the namespace policy the grant added, because one namespace policy serves every table granted under it. The residue is visibility only (`namespace-properties-read`), labelled `sqe:traversal:<TYPE>:<name>`; clear it with `REVOKE USAGE ON SCHEMA`. |
 | Views are not a boundary | `GRANT ... ON VIEW` works, but SQE expands the view and plans against its base tables, so the reader needs a grant there too. Not a Snowflake secure view. |
 | Group grantees, write path | `GRANT ... TO GROUP g` is rejected by the Ranger write path (`grantee_to_fields`) because Ranger only learns a user's groups under usersync. Group-bound policies authored in the Ranger console ARE enforced on the read path. |
