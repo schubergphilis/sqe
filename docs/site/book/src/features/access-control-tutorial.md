@@ -51,52 +51,75 @@ observe is a mask you cannot debug.
 
 # Part 1: the Polaris gate
 
-## 1.1 Three grants, not one
+## 1.1 One grant, three policies
 
-Start with the thing that trips up every first attempt. This does **not** let
-alice read the table:
+Start with the thing that trips up every first attempt, because the mechanism
+explains most of what follows. A table grant is not one policy. Reaching
+`sales_wh.acdemo.orders` needs three things to succeed, and only one of them is
+about the table:
 
-```sql
-GRANT SELECT ON sales_wh.acdemo.orders TO USER alice;
-```
-
-She gets:
-
-```
-table 'sales_wh.acdemo.orders' not found
-```
-
-The table exists and Polaris would serve it. A direct `LOAD_TABLE` with only that
-grant returns HTTP 200. SQE never asks, because it resolves a table through its
-catalog provider, which answers only for namespaces in its cached namespace list.
-Building that list needs two calls that both have to succeed:
-
-- `LIST_NAMESPACES`, authorized at the **catalog** level. Polaris does not use
-  Ranger's `SELF_OR_DESCENDANTS` matching, so a namespace-scoped `namespace-list`
-  will not do: listing is denied outright, not filtered.
+- `LIST_NAMESPACES`, authorized at the **catalog** level with `namespace-list`.
+  Polaris does not use Ranger's `SELF_OR_DESCENDANTS` matching, so a
+  namespace-scoped `namespace-list` will not do: listing is denied outright, not
+  filtered.
 - a per-namespace visibility probe (`LOAD_NAMESPACE_METADATA`) needing
   **namespace**-level `namespace-properties-read`. A 403 hides the namespace,
   deliberately, so ungranted namespace names do not leak.
+- the table's own access types, at the **table** level.
 
-Either failure gives an empty schema list, and planning stops at "table not
-found" without attempting `LOAD_TABLE`. So the minimum to read one table is:
+Either of the first two failing gives an empty schema list, and planning stops at
+"table not found" without ever attempting `LOAD_TABLE`. The table exists and
+Polaris would serve it; SQE never asks. Nothing in the log shows a 403, because
+there is no denial to report.
+
+You write one statement. SQE writes all three policies:
 
 ```sql
-GRANT USAGE ON DATABASE sales_wh          TO ROLE "analyst";  -- discovery
-GRANT USAGE ON SCHEMA   sales_wh.acdemo   TO ROLE "analyst";  -- visibility
-GRANT SELECT ON sales_wh.acdemo.orders    TO ROLE "analyst";  -- the data
+GRANT SELECT ON sales_wh.acdemo.orders TO ROLE "analyst";
 ```
 
-In the quickstart the first two already exist: the bootstrap seeds wildcard
-discovery for `analyst` and `engineer`, which is why a lone `GRANT SELECT` looks
-sufficient there. Any user outside those two roles needs the traversal spelled
-out.
+That is the same plan `grant-profile.json` v4 specifies, which is what the
+data-platform control plane generates its policies from. Matching it is
+deliberate: both write to the same Ranger service, and a SQL grant that produced
+different policies from the equivalent API call would make "who granted this"
+unanswerable.
 
-**Know what you are paying for.** The catalog-level grant lets its holder
-enumerate every namespace name in the catalog. A namespace called
-`pii_customer_health` becomes visible even though not one of its rows is. If that
-matters to you, grant discovery per role rather than broadly, and expect
-`SHOW SCHEMAS` to be the leak surface.
+**Know what the catalog level costs.** Its holder can enumerate every namespace
+NAME in the catalog, including namespaces unrelated to the table you granted. A
+namespace called `pii_customer_health` becomes visible even though not one of its
+rows is. That is a real widening and it happens on every table grant, so treat
+`SHOW SCHEMAS` as a leak surface and keep namespace names free of anything you
+would not put in a ticket title. If a catalog holds namespaces whose very
+existence is sensitive, separate catalogs are the boundary that works.
+
+**`MANAGE` and `ALL` are the exception.** They bind at the catalog level already
+and carry `catalog-content-manage`, so there is nothing above them to add and the
+plan is a single policy.
+
+**Revoke touches the deepest level only, on purpose.** `REVOKE SELECT` on the
+table removes the table policy and leaves the catalog and namespace policies
+alone. Those are shared with every other grant anyone holds in that catalog, so
+walking the whole plan backwards would strip discovery out from under unrelated
+grants: an outage dressed up as a narrow revoke. The cost is that traversal
+policies accumulate and nobody cleans them up. That is the right trade. An
+orphaned `namespace-list` is discovery on a catalog the grantee could already
+reach; over-revoking is an outage.
+
+To take discovery back, do it explicitly and **in this order**:
+
+```sql
+REVOKE USAGE ON DATABASE sales_wh        FROM ROLE "analyst";
+REVOKE USAGE ON SCHEMA   sales_wh.acdemo FROM ROLE "analyst";
+```
+
+Revoking discovery first is the tidier order, and it also avoids a known defect.
+A principal left holding catalog discovery while every namespace under it is
+invisible gets an empty schema list, and on a current-thread tokio runtime SQE's
+catalog provider blocks in its sync-to-async bridge instead of reporting "table not
+found". A deployed coordinator runs a multi-thread runtime and denies normally, so
+this is not something a served query hits; it shows up in tests and would affect an
+embedded single-threaded host. Recorded in
+`docs/internal/research/2026-08-02-catalog-traversal-gate.md`.
 
 ## 1.2 A grant is what enables a read
 
