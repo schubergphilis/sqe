@@ -13,191 +13,11 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
+use super::profile::{profile, PlannedPolicy};
 use super::{
     AccessCheck, AccessCheckResult, GrantBackend, GrantEntry, GrantFilter, GrantObjectKind,
     GrantStatement, Grantee, RevokeStatement,
 };
-
-/// Which resource levels a privilege applies to. Determines which keys go into
-/// the Ranger resource map.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ResourceLevel {
-    Catalog,
-    Namespace,
-    Table,
-}
-
-impl ResourceLevel {
-    /// The name to use when telling an operator which level a privilege binds
-    /// to. Matches the Ranger resource key.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            ResourceLevel::Catalog => "catalog",
-            ResourceLevel::Namespace => "namespace",
-            ResourceLevel::Table => "table",
-        }
-    }
-}
-
-/// A SQL read (SELECT) through SQE loads the table then reads data files. The
-/// Polaris embedded Ranger authorizer does NOT honor service-def impliedGrants,
-/// so each required access type is listed explicitly.
-const READ_ACCESS: &[&str] = &["table-data-read", "table-properties-read", "table-list"];
-
-/// A SQL write (INSERT) loads the table and commits a new snapshot, which fans
-/// out into many fine-grained Polaris operations. This is the explicit
-/// equivalent of `table-data-write`'s impliedGrants (not auto-applied).
-const WRITE_ACCESS: &[&str] = &[
-    "table-data-write",
-    "table-data-read",
-    "table-properties-read",
-    "table-properties-write",
-    "table-properties-set",
-    "table-properties-remove",
-    "table-uuid-assign",
-    "table-format-version-upgrade",
-    "table-schema-add",
-    "table-schema-set-current",
-    "table-sort-order-add",
-    "table-sort-order-set-default",
-    "table-snapshot-add",
-    "table-snapshots-remove",
-    "table-snapshot-ref-set",
-    "table-snapshot-ref-remove",
-    "table-location-set",
-    "table-statistics-set",
-    "table-statistics-remove",
-    "table-partition-spec-add",
-    "table-partition-specs-remove",
-    "table-structure-manage",
-    "table-list",
-];
-
-/// Reading a VIEW through SQE loads the view metadata and then plans its SQL.
-/// Polaris checks `view-properties-read` for the load and `view-list` for
-/// discovery. Verified live: these on `{catalog, namespace, table: <view>}` are
-/// what let a grantee load the view.
-///
-/// NOTE: this does NOT confer access to the view's base tables. SQE expands the
-/// view SQL and plans against the underlying tables, so the reader needs its own
-/// grant there. A view is therefore not a privilege boundary the way a Snowflake
-/// secure view is; see design-notes/ranger-access-control.md.
-const VIEW_READ_ACCESS: &[&str] = &["view-properties-read", "view-list"];
-
-/// The one access type that makes a namespace visible to SQE's per-namespace
-/// probe (`LOAD_NAMESPACE_METADATA`).
-///
-/// A table-level grant is not enough on its own to reach the table: SQE resolves
-/// a table through its catalog provider, which answers only for namespaces its
-/// probe could load. Without this at the namespace level, the probe 403s, the
-/// namespace is hidden, and planning stops at "table not found" without ever
-/// attempting `LOAD_TABLE`.
-///
-/// Verified live, one variable at a time: a user holding catalog-level
-/// `namespace-list` plus a table-level `SELECT` grant on
-/// `sales_wh.acdemo.orders` got "table not found"; adding ONLY this access type
-/// at `{catalog: sales_wh, namespace: acdemo}` turned the same query into 3 rows.
-const NAMESPACE_VISIBILITY_ACCESS: &str = "namespace-properties-read";
-
-/// The catalog-level access type that lets a principal LIST a catalog's
-/// namespaces (`LIST_NAMESPACES`).
-///
-/// Polaris does not use Ranger's `SELF_OR_DESCENDANTS` matching, so a
-/// namespace-scoped `namespace-list` does not satisfy it: listing is denied
-/// outright rather than filtered, which is why this has to sit at the catalog
-/// level.
-///
-/// Granting it confers enumeration of every namespace NAME in the catalog,
-/// including namespaces unrelated to the object being granted. That cost is real
-/// and is documented, but it is what `grant-profile.json` v4 specifies for every
-/// privilege that reaches into a catalog, and SQE writes the same policies as the
-/// control plane or the two disagree about what a grant means.
-const CATALOG_DISCOVERY_ACCESS: &str = "namespace-list";
-
-fn to_vec(xs: &[&str]) -> Vec<String> {
-    xs.iter().map(|s| s.to_string()).collect()
-}
-
-/// Map a SQL privilege to the Ranger access type(s) it requires and the resource
-/// level it binds to. A single SQL privilege expands to every Polaris access
-/// type the corresponding operations check (impliedGrants are not honored).
-/// Unknown privileges pass through lowercased so callers can use native Ranger
-/// access-type names directly.
-pub fn map_sql_to_ranger_access(sql_priv: &str) -> (Vec<String>, ResourceLevel) {
-    map_sql_to_ranger_access_for(GrantObjectKind::Table, sql_priv)
-}
-
-/// `map_sql_to_ranger_access`, aware of whether the object is a table or a view.
-///
-/// A view uses the same resource shape as a table (its name goes in the `table`
-/// slot) and differs only in the access types Polaris checks.
-pub fn map_sql_to_ranger_access_for(
-    object: GrantObjectKind,
-    sql_priv: &str,
-) -> (Vec<String>, ResourceLevel) {
-    if object == GrantObjectKind::View {
-        return match sql_priv.to_uppercase().as_str() {
-            "SELECT" => (to_vec(VIEW_READ_ACCESS), ResourceLevel::Table),
-            "DROP" => (to_vec(&["view-drop"]), ResourceLevel::Table),
-            "CREATE VIEW" => (to_vec(&["view-create"]), ResourceLevel::Namespace),
-            "ALL" | "ALL PRIVILEGES" => {
-                (to_vec(&["view-metadata-full"]), ResourceLevel::Table)
-            }
-            // Unknown privileges pass through as raw Ranger access types, same
-            // as the table path, so an operator can name a Polaris access type
-            // directly.
-            other => (vec![other.to_lowercase()], ResourceLevel::Table),
-        };
-    }
-    match sql_priv.to_uppercase().as_str() {
-        "SELECT" => (to_vec(READ_ACCESS), ResourceLevel::Table),
-        // Every data mutation resolves to the same Polaris access-type set.
-        // UPDATE and DELETE in SQE are copy-on-write or merge-on-read: both load
-        // the table, write new data files and commit a snapshot, which is
-        // exactly what INSERT does, so there is no narrower set to give them.
-        // MODIFY is the Databricks spelling and covers INSERT/UPDATE/DELETE.
-        //
-        // Before this, these fell through to the pass-through arm and were sent
-        // as a literal access type ("update"), which the servicedef does not
-        // declare, so Ranger answered a bare HTTP 400.
-        "INSERT" | "UPDATE" | "DELETE" | "MODIFY" => {
-            (to_vec(WRITE_ACCESS), ResourceLevel::Table)
-        }
-        "DROP" => (to_vec(&["table-drop"]), ResourceLevel::Table),
-        "CREATE TABLE" => (to_vec(&["table-create"]), ResourceLevel::Namespace),
-        "USAGE" => (
-            to_vec(&["namespace-list", "namespace-properties-read"]),
-            ResourceLevel::Namespace,
-        ),
-        "DROP SCHEMA" => (to_vec(&["namespace-drop"]), ResourceLevel::Namespace),
-        "CREATE SCHEMA" | "CREATE" => (to_vec(&["namespace-create"]), ResourceLevel::Catalog),
-        "ALL" | "ALL PRIVILEGES" => {
-            (to_vec(&["catalog-content-manage"]), ResourceLevel::Catalog)
-        }
-        // Deliberate escape hatch: an unrecognised privilege is passed through
-        // lowercased so an operator can name a Polaris access type directly
-        // (e.g. `GRANT "table-snapshot-add" ON ...`). Ranger rejects anything the
-        // servicedef does not declare, and `post_grant_revoke` turns that 400
-        // into a message naming the privilege.
-        other => (vec![other.to_lowercase()], ResourceLevel::Table),
-    }
-}
-
-/// Privileges with an explicit mapping, for error messages.
-pub const MAPPED_PRIVILEGES: &[&str] = &[
-    "SELECT",
-    "INSERT",
-    "UPDATE",
-    "DELETE",
-    "MODIFY",
-    "DROP",
-    "CREATE TABLE",
-    "CREATE VIEW",
-    "CREATE SCHEMA",
-    "DROP SCHEMA",
-    "USAGE",
-    "ALL PRIVILEGES",
-];
 
 /// The Ranger `GrantRevokeRequest` payload. Field renames match Ranger's
 /// `org.apache.ranger.plugin.model.RangerPolicy.GrantRevokeRequest` JSON.
@@ -223,77 +43,68 @@ pub struct GrantRevokeRequest {
     pub is_recursive: bool,
 }
 
-/// Build the Ranger resource map for a given level. Includes `root` only when
-/// `realm` is non-empty.
-pub fn build_resource_map(
+/// Map SQE's (object kind, SQL privilege) pair onto the profile's privilege name.
+///
+/// The profile has no separate view AXIS: a view privilege is its own name
+/// (`SELECT VIEW`, `DROP VIEW`, `CREATE VIEW`) and the view's name goes in the
+/// `table` resource slot, which is how Polaris models it and what SQE already did.
+///
+/// `ALL` on a view is deliberately NOT translated. v4 defines no view-scoped
+/// `ALL`, so it stays `ALL`, which binds at the catalog level and is therefore
+/// refused when a view is named. Inventing a view-scoped `ALL` here is exactly the
+/// kind of local divergence adopting the profile exists to remove; the operator
+/// gets an error naming the level instead of a privately-invented grant.
+fn profile_privilege(object: GrantObjectKind, sql_priv: &str) -> String {
+    let canonical = sql_priv.split_whitespace().collect::<Vec<_>>().join(" ").to_uppercase();
+    if object == GrantObjectKind::View {
+        return match canonical.as_str() {
+            "SELECT" => "SELECT VIEW".to_string(),
+            "DROP" => "DROP VIEW".to_string(),
+            other => other.to_string(),
+        };
+    }
+    canonical
+}
+
+/// The policies one statement has to write, outermost first, from the vendored
+/// profile.
+fn plan_for(
+    object: GrantObjectKind,
+    privilege: &str,
     realm: &str,
     catalog: &str,
     namespace: Option<&str>,
     table: Option<&str>,
-    level: ResourceLevel,
-) -> BTreeMap<String, String> {
-    let mut m = BTreeMap::new();
-    if !realm.is_empty() {
-        m.insert("root".to_string(), realm.to_string());
-    }
-    m.insert("catalog".to_string(), catalog.to_string());
-    if matches!(level, ResourceLevel::Namespace | ResourceLevel::Table) {
-        if let Some(ns) = namespace {
-            m.insert("namespace".to_string(), ns.to_string());
-        }
-    }
-    if matches!(level, ResourceLevel::Table) {
-        if let Some(t) = table {
-            m.insert("table".to_string(), t.to_string());
-        }
-    }
-    m
+) -> sqe_core::Result<Vec<PlannedPolicy>> {
+    profile()
+        .plan_grant(
+            &profile_privilege(object, privilege),
+            realm,
+            catalog,
+            namespace,
+            table,
+        )
+        .map_err(sqe_core::SqeError::Execution)
 }
 
-/// Refuse a statement that names an object DEEPER than the level its privilege
-/// binds to, instead of silently widening it.
+/// The policy at the level the statement NAMES, which is the deepest in the plan.
 ///
-/// `build_resource_map` drops the components a level does not use. That is
-/// correct for building the map and wrong as a response to the user: a
-/// privilege bound to the catalog level, named against a table, drops both the
-/// namespace and the table and writes a CATALOG-WIDE policy. `GRANT ALL ON
-/// wh.sales.orders TO alice` reports success on one table and hands alice
-/// `catalog-content-manage` over every table in `wh`.
-///
-/// Widening is silent in both directions: nothing in the response distinguishes
-/// it from the narrow grant that was asked for, and the operator who reads
-/// `SHOW GRANTS` later sees a catalog policy nobody remembers writing. Failing
-/// is the only safe answer, because the alternative is granting more than was
-/// asked for.
-///
-/// Deliberately general rather than special-cased to `ALL`: `USAGE` and
-/// `CREATE SCHEMA` widen through exactly the same path.
-fn reject_scope_deeper_than_level(
+/// REVOKE and DENY both act on this one only. The outer levels are traversal
+/// shared with every other grant in the catalog: revoking them would strip
+/// discovery from unrelated grants, and denying them would hide every object under
+/// the namespace rather than the one named.
+fn deepest_policy(
+    object: GrantObjectKind,
     privilege: &str,
-    level: ResourceLevel,
+    realm: &str,
     catalog: &str,
     namespace: Option<&str>,
     table: Option<&str>,
-) -> sqe_core::Result<()> {
-    let (extra, honoured) = match level {
-        ResourceLevel::Table => return Ok(()),
-        ResourceLevel::Namespace if table.is_some() => ("a table", format!(
-            "{catalog}.{}",
-            namespace.unwrap_or("<namespace>")
-        )),
-        ResourceLevel::Namespace => return Ok(()),
-        ResourceLevel::Catalog if namespace.is_some() || table.is_some() => {
-            ("a namespace or table", catalog.to_string())
-        }
-        ResourceLevel::Catalog => return Ok(()),
-    };
-    Err(sqe_core::SqeError::Execution(format!(
-        "Privilege '{privilege}' binds to the {} level, but the statement names {extra}. \
-         The policy would apply to '{honoured}' and everything under it, which is wider \
-         than the object named. Re-issue the statement against '{honoured}', or name a \
-         privilege that binds to the object you meant.",
-        level.as_str(),
-    )))
+) -> sqe_core::Result<PlannedPolicy> {
+    let mut plan = plan_for(object, privilege, realm, catalog, namespace, table)?;
+    plan.pop().ok_or_else(|| {
+        sqe_core::SqeError::Execution(format!("Privilege '{privilege}' plans no policies"))
+    })
 }
 
 /// Build a Ranger deny item for one grantee and access-type set.
@@ -385,10 +196,24 @@ fn grantee_to_fields(grantee: &Grantee) -> sqe_core::Result<(Vec<String>, Vec<St
     match grantee {
         Grantee::User(n) => Ok((vec![n.clone()], vec![])),
         Grantee::Role(n) => Ok((vec![], vec![n.clone()])),
-        Grantee::Group(_) => Err(sqe_core::SqeError::NotImplemented(
-            "Ranger backend supports USER and ROLE grantees only; GROUP requires Ranger usersync"
-                .into(),
-        )),
+        // A GROUP goes in the ROLES field, not the groups field, and that is not a
+        // workaround. Ranger usersync is not involved in this deployment: the
+        // control plane materialises every Keycloak group as a Ranger ROLE of the
+        // identical name (`access/group_sync.py`), and under Ranger no Polaris
+        // principal-roles are created at all. Verified there is no name transform
+        // on either call site, so the name typed in SQL IS the Ranger role name.
+        //
+        // The previous refusal cited usersync and was simply wrong about this
+        // deployment. It also made `GRANT ... TO GROUP` fail on the write path while
+        // group-bound policies authored in the Ranger console were enforced on the
+        // read path, which is a confusing pair of behaviours to hold at once.
+        //
+        // Deliberately NOT auto-creating the role, unlike the platform's
+        // `ensure_role_exists`: its grantee arrives from a validated API, ours from
+        // free-text SQL, where auto-creating turns a typo into an empty Ranger role
+        // and a grant that silently confers nothing. Ranger 403s on an unknown
+        // grantee instead, and `post_grant_revoke_inner` turns that into a message.
+        Grantee::Group(n) => Ok((vec![], vec![n.clone()])),
     }
 }
 
@@ -454,6 +279,8 @@ impl RangerGrantBackend {
         )
     }
 
+    /// The single request for the level the statement NAMES. Used by REVOKE, which
+    /// must not touch the traversal levels a grant also wrote.
     fn build_grant_revoke_for(
         &self,
         privilege: &str,
@@ -463,6 +290,45 @@ impl RangerGrantBackend {
         table: Option<&str>,
         grantee: &Grantee,
     ) -> sqe_core::Result<GrantRevokeRequest> {
+        let catalog = self.validated_catalog(catalog, namespace, table, grantee)?;
+        let policy = deepest_policy(object, privilege, &self.realm, catalog, namespace, table)?;
+        self.request_for(&policy, grantee)
+    }
+
+    /// Every policy one GRANT has to write, outermost level first.
+    ///
+    /// Outermost first because Ranger has no transaction across the calls: a plan
+    /// can land partially. Outermost-first leaves "can list, nothing readable",
+    /// which is inert; innermost-first would leave "has table access, table
+    /// unreachable", the failure this whole mechanism removes.
+    fn build_grant_plan(
+        &self,
+        privilege: &str,
+        object: GrantObjectKind,
+        catalog: Option<&str>,
+        namespace: Option<&str>,
+        table: Option<&str>,
+        grantee: &Grantee,
+    ) -> sqe_core::Result<Vec<GrantRevokeRequest>> {
+        let catalog = self.validated_catalog(catalog, namespace, table, grantee)?;
+        plan_for(object, privilege, &self.realm, catalog, namespace, table)?
+            .iter()
+            .map(|p| self.request_for(p, grantee))
+            .collect()
+    }
+
+    /// Validate the identifiers a statement names and return the catalog.
+    ///
+    /// Identifier validation is separate from planning on purpose: the profile
+    /// decides what a privilege MEANS, and this decides whether the names are ones
+    /// SQE will put in a Ranger resource map at all.
+    fn validated_catalog<'a>(
+        &self,
+        catalog: Option<&'a str>,
+        namespace: Option<&str>,
+        table: Option<&str>,
+        grantee: &Grantee,
+    ) -> sqe_core::Result<&'a str> {
         let catalog = catalog.ok_or_else(|| {
             sqe_core::SqeError::Execution(
                 "Ranger GRANT requires a catalog (use catalog.namespace.table)".into(),
@@ -476,19 +342,23 @@ impl RangerGrantBackend {
             validate_identifier(t, "table")?;
         }
         validate_identifier(grantee.name(), "grantee")?;
+        Ok(catalog)
+    }
 
-        let (access, level) = map_sql_to_ranger_access_for(object, privilege);
-        reject_scope_deeper_than_level(privilege, level, catalog, namespace, table)?;
-        let resource = build_resource_map(&self.realm, catalog, namespace, table, level);
+    /// Turn one planned policy into a Ranger grant/revoke request.
+    fn request_for(
+        &self,
+        policy: &PlannedPolicy,
+        grantee: &Grantee,
+    ) -> sqe_core::Result<GrantRevokeRequest> {
         let (users, roles) = grantee_to_fields(grantee)?;
-
         Ok(GrantRevokeRequest {
             grantor: self.admin_user.clone(),
-            resource,
+            resource: policy.resource.clone(),
             users,
             groups: vec![],
             roles,
-            access_types: access,
+            access_types: policy.access_types.clone(),
             delegate_admin: false,
             enable_audit: true,
             replace_existing_permissions: false,
@@ -496,121 +366,23 @@ impl RangerGrantBackend {
         })
     }
 
-    /// The full set of Ranger policies one `GRANT` has to write, outermost first.
-    ///
-    /// A privilege is not one policy. Reaching `cat.ns.tbl` needs the catalog to
-    /// be listable and the namespace to be visible as well as the table to be
-    /// readable, so `GRANT SELECT ON cat.ns.tbl` writes three policies and the
-    /// operator writes one statement. Before this, the two outer levels had to be
-    /// typed by hand, and a grant that omitted them reported success while the
-    /// grantee got "table not found".
-    ///
-    /// The shape mirrors `grant-profile.json` v4, which the data-platform control
-    /// plane generates its policies from: `SELECT` is
-    /// `catalog:[namespace-list] | namespace:[namespace-properties-read] |
-    /// table:[table-data-read]`. Matching it is the point. Both tools write to the
-    /// same Ranger service, and a SQL grant that produced different policies from
-    /// the equivalent API call would make "who granted this" unanswerable and
-    /// break the drift gate that keeps the two in step.
-    ///
-    /// The catalog level is a real cost, deliberately accepted here rather than
-    /// hidden: its holder can enumerate every namespace NAME in the catalog, so a
-    /// namespace called `pii_customer_health` becomes visible even though its rows
-    /// are not. v4 makes that trade for every privilege that reaches into a
-    /// catalog, and SQE diverging from it would be the worse failure.
-    ///
-    /// `MANAGE` and `ALL` are the exception: they bind at the catalog level
-    /// already and carry `catalog-content-manage`, so there is nothing above them
-    /// to add.
-    ///
-    /// Outermost first, deliberately. Ranger has no transaction across several
-    /// calls, so a plan can land partially. Outermost-first fails to "can list,
-    /// nothing readable", which is inert; innermost-first would fail to "has table
-    /// access, table unreachable", the exact symptom this removes.
-    ///
-    /// Access-type SETS still come from SQE's own map rather than v4's seeds plus
-    /// the servicedef `impliedGrants` closure, so this matches v4's plan SHAPE and
-    /// not yet its expansion. Closing that is profile adoption proper, with the
-    /// golden-fixture drift gate that goes with it.
-    fn build_grant_plan(
-        &self,
-        privilege: &str,
-        object: GrantObjectKind,
-        catalog: Option<&str>,
-        namespace: Option<&str>,
-        table: Option<&str>,
-        grantee: &Grantee,
-    ) -> sqe_core::Result<Vec<GrantRevokeRequest>> {
-        let primary = self.build_grant_revoke_for(
-            privilege, object, catalog, namespace, table, grantee,
-        )?;
-        let (_, level) = map_sql_to_ranger_access_for(object, privilege);
-        let Some(cat) = catalog else {
-            return Ok(vec![primary]);
-        };
-
-        let mut plan: Vec<GrantRevokeRequest> = Vec::new();
-        let ancestor = |level: ResourceLevel,
-                        ns: Option<&str>,
-                        access: &[&str]|
-         -> sqe_core::Result<GrantRevokeRequest> {
-            let (users, roles) = grantee_to_fields(grantee)?;
-            Ok(GrantRevokeRequest {
-                grantor: primary.grantor.clone(),
-                resource: build_resource_map(&self.realm, cat, ns, None, level),
-                users,
-                groups: vec![],
-                roles,
-                access_types: access.iter().map(|s| s.to_string()).collect(),
-                // NOT the statement's WITH GRANT OPTION. Traversal is not what the
-                // operator asked to hand out, so the grantee must not gain the
-                // authority to re-grant it.
-                delegate_admin: false,
-                enable_audit: true,
-                replace_existing_permissions: false,
-                is_recursive: false,
-            })
-        };
-
-        // Catalog-level discovery, for every privilege that needs to reach INTO
-        // the catalog. `MANAGE` / `ALL` already bind at the catalog level and
-        // carry `catalog-content-manage`, so they need nothing above them.
-        if level != ResourceLevel::Catalog {
-            plan.push(ancestor(ResourceLevel::Catalog, None, &[CATALOG_DISCOVERY_ACCESS])?);
-        }
-        // Namespace visibility, only when the statement names a table beneath a
-        // namespace. A namespace-level privilege already writes the namespace
-        // policy itself, so a second request for the same resource would be a
-        // duplicate.
-        if level == ResourceLevel::Table {
-            if let (Some(ns), Some(_)) = (namespace, table) {
-                plan.push(ancestor(
-                    ResourceLevel::Namespace,
-                    Some(ns),
-                    &[NAMESPACE_VISIBILITY_ACCESS],
-                )?);
-            }
-        }
-        plan.push(primary);
-        Ok(plan)
-    }
-
     /// POST a GrantRevokeRequest to the grant or revoke endpoint.
     /// Strip any deny item equivalent to what `DENY` would have written for this
     /// statement. No-op when the resource has no policy or no matching item.
     async fn remove_deny_items(&self, stmt: &RevokeStatement) -> sqe_core::Result<()> {
-        let (access_types, level) =
-            map_sql_to_ranger_access_for(stmt.object, &stmt.privilege);
         let Some(catalog) = stmt.catalog.as_deref() else {
             return Ok(());
         };
-        let resource = build_resource_map(
+        // The named level only, matching what DENY writes.
+        let policy = deepest_policy(
+            stmt.object,
+            &stmt.privilege,
             &self.realm,
             catalog,
             stmt.namespace.as_deref(),
             stmt.table.as_deref(),
-            level,
-        );
+        )?;
+        let (resource, access_types) = (policy.resource, policy.access_types);
         let Some(mut policy) = self.policy_by_resource(&resource).await? else {
             return Ok(());
         };
@@ -769,14 +541,18 @@ impl RangerGrantBackend {
             // as a literal access type the servicedef does not declare, so name
             // it and list what IS mapped.
             let hint = match (status.as_u16(), privilege) {
-                (400, Some(p)) if !MAPPED_PRIVILEGES.contains(&p.to_uppercase().as_str()) => {
+                (400, Some(p))
+                    if profile()
+                        .deepest_level(&profile().canonical_privilege(p))
+                        .is_none() =>
+                {
                     format!(
                         ". Privilege '{p}' has no mapping and was sent to Ranger as the \
                          access type '{}', which the service definition does not declare. \
                          Mapped privileges: {}. A native Polaris access type may also be \
                          named directly.",
                         p.to_lowercase(),
-                        MAPPED_PRIVILEGES.join(", ")
+                        profile().known_privileges().join(", ")
                     )
                 }
                 // Ranger answers 403 when the GRANTOR lacks delegate admin on the
@@ -988,7 +764,10 @@ fn parse_grant_label(label: &str) -> Option<(String, String, String)> {
     // Deliberately stricter than the grant path, which allows a native Polaris
     // access type to be named directly: such a grant simply gets no provenance.
     let privilege = privilege.trim().to_uppercase();
-    if !MAPPED_PRIVILEGES.contains(&privilege.as_str()) {
+    // Must round-trip to a privilege the PROFILE plans, so a hand-edited label
+    // cannot push an arbitrary string into a revoke's held-back set.
+    let canonical = profile().canonical_privilege(&privilege);
+    if profile().deepest_level(&canonical).is_none() {
         warn!(%label, "ignoring access-provenance label: unknown privilege");
         return None;
     }
@@ -1135,6 +914,12 @@ impl RangerGrantBackend {
             .iter()
             .filter_map(|v| v.as_str().map(str::to_string))
             .collect();
+        // The identifiers come back out of the resource map so this does not need
+        // them threaded in: they are exactly what the plan put there.
+        let catalog = resource.get("catalog").map(String::as_str).unwrap_or_default();
+        let namespace = resource.get("namespace").map(String::as_str);
+        let table = resource.get("table").map(String::as_str);
+
         let mine = grant_label(stmt_grantee, privilege);
         if !labels.iter().any(|l| l == &mine) {
             // This grant was never labelled (written before labels existed, or
@@ -1150,8 +935,19 @@ impl RangerGrantBackend {
             if name != stmt_grantee.name() {
                 continue; // another grantee's grant; their items are separate
             }
-            let (access, _) = map_sql_to_ranger_access_for(object, &other_priv);
-            keep.extend(access);
+            // What that OTHER privilege confers at THIS resource. Planned, not
+            // looked up in a table, so held-back sets stay consistent with what
+            // the grant actually wrote.
+            match deepest_policy(object, &other_priv, &self.realm, catalog, namespace, table) {
+                Ok(p) => keep.extend(p.access_types),
+                Err(e) => {
+                    // A label naming a privilege the profile no longer plans. Skip
+                    // it rather than guess: under-revoking is worse than the
+                    // cascade, so the caller falls back to revoking verbatim.
+                    warn!(%label, error = %e, "provenance label does not plan; ignored");
+                    continue;
+                }
+            }
         }
         keep.sort();
         keep.dedup();
@@ -1187,6 +983,31 @@ impl RangerGrantBackend {
                 warn!(%label, error = %e, "could not remove provenance label");
             }
         }
+    }
+
+    /// Undo the levels of a plan that already landed, after a later one failed.
+    ///
+    /// Innermost first, mirroring the forward order, so the intermediate states are
+    /// the harmless ones. Returns whether every rollback succeeded; the caller
+    /// reports either way rather than implying a clean failure, because a
+    /// compensation that itself fails leaves discovery the operator did not ask
+    /// for.
+    async fn compensate(&self, written: &[GrantRevokeRequest], stmt: &GrantStatement) -> bool {
+        let mut all_ok = true;
+        for body in written.iter().rev() {
+            if let Err(e) = self
+                .post_grant_revoke_with_privilege("revoke", &stmt.privilege, body)
+                .await
+            {
+                warn!(
+                    grantee = %stmt.grantee.name(),
+                    error = %e,
+                    "could not roll back a partially written grant plan"
+                );
+                all_ok = false;
+            }
+        }
+        all_ok
     }
 
     /// Fetch all policies for this service from Ranger Admin.
@@ -1269,55 +1090,76 @@ impl GrantBackend for RangerGrantBackend {
             stmt.table.as_deref(),
             &stmt.grantee,
         )?;
-        // The statement's own level is the LAST entry; anything before it is an
-        // ancestor added to complete the path (see `build_grant_plan`).
+        // Outermost first; the level the statement NAMES is last.
         let last = plan.len() - 1;
+        // What has already landed, for compensation below.
+        let mut written: Vec<GrantRevokeRequest> = Vec::new();
+
         for (i, mut body) in plan.into_iter().enumerate() {
             let is_primary = i == last;
             // Ranger authorizes against `grantor`, so this is the authority
-            // check, not just an audit field. It applies to the ancestor too: an
-            // operator who may not grant on the namespace must not acquire that
-            // authority by naming a table underneath it.
+            // check, not just an audit field. It applies to the traversal levels
+            // too: an operator who may not grant on the namespace must not acquire
+            // that authority by naming a table underneath it.
             if let Some(g) = stmt.grantor.as_deref() {
                 validate_identifier(g, "grantor")?;
                 body.grantor = g.to_string();
             }
             if is_primary {
                 // WITH GRANT OPTION becomes delegateAdmin, on the named object
-                // only. `build_grant_plan` pins the ancestor to false.
+                // only: a grantee must not gain authority to re-grant traversal.
                 body.delegate_admin = stmt.with_grant_option;
             }
-            let resource = body.resource.clone();
-            self.post_grant_revoke_with_privilege("grant", &stmt.privilege, &body)
+            if let Err(e) = self
+                .post_grant_revoke_with_privilege("grant", &stmt.privilege, &body)
                 .await
-                .map_err(|e| {
-                    if is_primary && last > 0 {
-                        // Ancestor-first means the namespace grant already
-                        // landed. Say so, or the operator retries blind and
-                        // cannot tell which half of the statement took effect.
-                        sqe_core::SqeError::Execution(format!(
-                            "{e} (namespace visibility for '{}' was already granted and \
-                             is left in place; re-running the statement is safe)",
+            {
+                // COMPENSATE. Ranger has no transaction across these calls, so a
+                // failure here leaves a partial plan, and half a plan is worse
+                // than none: the traversal levels alone confer discovery the
+                // operator never asked to grant, and they are invisible in
+                // `SHOW GRANTS` output that shows no privilege on the object.
+                //
+                // Best-effort, and reported either way. Rolling back a grant that
+                // may be shared with another statement is itself a judgement call,
+                // so the message always states what happened rather than implying
+                // a clean failure.
+                let rolled_back = self.compensate(&written, stmt).await;
+                return Err(sqe_core::SqeError::Execution(format!(
+                    "{e}{}",
+                    match (written.is_empty(), rolled_back) {
+                        (true, _) => String::new(),
+                        (false, true) => format!(
+                            " ({} outer level(s) of this grant had already been written \
+                             and were rolled back, so no partial grant remains)",
+                            written.len()
+                        ),
+                        (false, false) => format!(
+                            " (WARNING: {} outer level(s) had already been written and \
+                             could NOT be rolled back; '{}' may retain catalog or \
+                             namespace discovery. Re-run the statement, or revoke \
+                             USAGE explicitly)",
+                            written.len(),
                             stmt.grantee.name()
-                        ))
-                    } else {
-                        e
+                        ),
                     }
-                })?;
+                )));
+            }
             if is_primary {
                 // Record WHICH statement contributed these access types, so a
                 // later REVOKE of a different privilege on the same resource
                 // does not take them away. Best-effort: the grant succeeded.
                 //
-                // DEEPEST LEVEL ONLY. The catalog and namespace policies are
-                // shared with every other grant anyone holds in that catalog, so
-                // stamping them with one grantee's privilege would misrepresent
-                // shared plumbing as privately owned, and would invite a later
-                // revoke to release traversal another grant still depends on.
-                // The platform's provenance module takes the same position.
-                self.add_grant_label(&resource, &stmt.grantee, &stmt.privilege)
+                // DEEPEST LEVEL ONLY. The traversal policies are shared with every
+                // other grant anyone holds in that catalog, so stamping them with
+                // one grantee's privilege would misrepresent shared plumbing as
+                // privately owned and invite a later revoke to release traversal
+                // another grant still depends on. The platform's provenance module
+                // takes the same position.
+                self.add_grant_label(&body.resource, &stmt.grantee, &stmt.privilege)
                     .await;
             }
+            written.push(body);
         }
         Ok(())
     }
@@ -1399,8 +1241,6 @@ impl GrantBackend for RangerGrantBackend {
     /// NOT resource-scoped to the caller. The `[auth] admin_roles` gate is the
     /// only check. Ranger offers no grantor-scoped deny.
     async fn deny(&self, _token: &str, stmt: &GrantStatement) -> sqe_core::Result<()> {
-        let (access_types, level) =
-            map_sql_to_ranger_access_for(stmt.object, &stmt.privilege);
         let catalog = stmt.catalog.as_deref().ok_or_else(|| {
             sqe_core::SqeError::Execution(
                 "Ranger DENY requires a catalog (use catalog.namespace.table)".into(),
@@ -1414,25 +1254,21 @@ impl GrantBackend for RangerGrantBackend {
             validate_identifier(t, "table")?;
         }
         validate_identifier(stmt.grantee.name(), "grantee")?;
-        // A widened DENY over-restricts rather than over-grants, so it is the
-        // safer direction, but it is just as surprising: DENY on one table would
-        // silently lock the grantee out of the whole catalog. Same guard, so
-        // GRANT, REVOKE and DENY agree on what a statement's scope means.
-        reject_scope_deeper_than_level(
+        // DENY writes the NAMED level only, like REVOKE. Denying the traversal
+        // levels would hide every object under the namespace rather than the one
+        // named, and `deepest_policy` also carries the scope guard, so GRANT,
+        // REVOKE and DENY agree on what a statement's scope means. A widened DENY
+        // over-restricts rather than over-grants, which is the safer direction and
+        // just as surprising.
+        let planned = deepest_policy(
+            stmt.object,
             &stmt.privilege,
-            level,
-            catalog,
-            stmt.namespace.as_deref(),
-            stmt.table.as_deref(),
-        )?;
-
-        let resource = build_resource_map(
             &self.realm,
             catalog,
             stmt.namespace.as_deref(),
             stmt.table.as_deref(),
-            level,
-        );
+        )?;
+        let (resource, access_types) = (planned.resource, planned.access_types);
         // Deterministic, resource-derived name so a repeated DENY updates the
         // same policy instead of piling up duplicates.
         let name = format!(
@@ -1542,10 +1378,15 @@ impl GrantBackend for RangerGrantBackend {
         })?;
         validate_identifier(catalog, "catalog")?;
 
-        let (access, _) = map_sql_to_ranger_access(&check.privilege);
-        // The privilege maps to a set; the first entry is the primary access
-        // type that defines the privilege (e.g. SELECT -> table-data-read).
-        let primary = access.first().map(String::as_str).unwrap_or("");
+        // The privilege's SEED, not the first of its expanded set: the seed is the
+        // access type that defines it. Alphabetical order on the expansion would
+        // report INSERT as `table-data-read`, i.e. a write privilege as a read.
+        let canonical = profile().canonical_privilege(&check.privilege);
+        let primary = profile()
+            .deepest_seeds(&canonical)
+            .and_then(|s| s.first())
+            .map(String::as_str)
+            .unwrap_or("");
         let mut parts = vec![catalog.to_string()];
         if let Some(n) = &check.namespace { parts.push(n.clone()); }
         if let Some(t) = &check.table { parts.push(t.clone()); }
@@ -1597,94 +1438,6 @@ impl GrantBackend for RangerGrantBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn select_maps_to_table_data_read() {
-        let (a, lvl) = map_sql_to_ranger_access("SELECT");
-        // SELECT expands to the full read set; table-data-read is the primary.
-        assert!(a.contains(&"table-data-read".to_string()));
-        assert!(a.contains(&"table-properties-read".to_string()));
-        assert_eq!(a.first().map(String::as_str), Some("table-data-read"));
-        assert_eq!(lvl, ResourceLevel::Table);
-    }
-
-    #[test]
-    fn insert_maps_to_table_data_write_with_commit_grants() {
-        let (a, lvl) = map_sql_to_ranger_access("insert");
-        // INSERT expands to write + the snapshot/schema commit grants, since
-        // the embedded authorizer does not honor impliedGrants.
-        assert_eq!(a.first().map(String::as_str), Some("table-data-write"));
-        assert!(a.contains(&"table-snapshot-add".to_string()));
-        assert!(a.contains(&"table-schema-add".to_string()));
-        assert_eq!(lvl, ResourceLevel::Table);
-    }
-
-    #[test]
-    fn create_table_is_namespace_level() {
-        let (a, lvl) = map_sql_to_ranger_access("CREATE TABLE");
-        assert_eq!(a, vec!["table-create".to_string()]);
-        assert_eq!(lvl, ResourceLevel::Namespace);
-    }
-
-    #[test]
-    fn create_schema_is_catalog_level() {
-        let (a, lvl) = map_sql_to_ranger_access("CREATE SCHEMA");
-        assert_eq!(a, vec!["namespace-create".to_string()]);
-        assert_eq!(lvl, ResourceLevel::Catalog);
-    }
-
-    #[test]
-    fn unknown_passes_through_lowercased() {
-        let (a, lvl) = map_sql_to_ranger_access("table-metadata-full");
-        assert_eq!(a, vec!["table-metadata-full".to_string()]);
-        assert_eq!(lvl, ResourceLevel::Table);
-    }
-
-    #[test]
-    fn resource_map_table_level_full_path() {
-        let m = build_resource_map("POLARIS", "wh", Some("sales"), Some("orders"), ResourceLevel::Table);
-        assert_eq!(m.get("root").map(String::as_str), Some("POLARIS"));
-        assert_eq!(m.get("catalog").map(String::as_str), Some("wh"));
-        assert_eq!(m.get("namespace").map(String::as_str), Some("sales"));
-        assert_eq!(m.get("table").map(String::as_str), Some("orders"));
-    }
-
-    #[test]
-    fn build_resource_map_future_tables_emits_table_wildcard() {
-        // A FUTURE grant arrives as table = Some("*"). At table level the
-        // resource map must carry an explicit "table": "*" so Ranger applies
-        // the policy to every (existing and future) table in the namespace.
-        let m = build_resource_map(
-            "",
-            "sales_wh",
-            Some("sales"),
-            Some("*"),
-            ResourceLevel::Table,
-        );
-        assert_eq!(m.get("catalog").map(String::as_str), Some("sales_wh"));
-        assert_eq!(m.get("namespace").map(String::as_str), Some("sales"));
-        assert_eq!(m.get("table").map(String::as_str), Some("*"));
-    }
-
-    #[test]
-    fn resource_map_namespace_level_omits_table() {
-        let m = build_resource_map("POLARIS", "wh", Some("sales"), Some("orders"), ResourceLevel::Namespace);
-        assert!(!m.contains_key("table"));
-        assert_eq!(m.get("namespace").map(String::as_str), Some("sales"));
-    }
-
-    #[test]
-    fn resource_map_catalog_level_only_catalog() {
-        let m = build_resource_map("POLARIS", "wh", Some("sales"), None, ResourceLevel::Catalog);
-        assert!(!m.contains_key("namespace"));
-        assert_eq!(m.get("catalog").map(String::as_str), Some("wh"));
-    }
-
-    #[test]
-    fn resource_map_empty_realm_omits_root() {
-        let m = build_resource_map("", "wh", None, None, ResourceLevel::Catalog);
-        assert!(!m.contains_key("root"));
-    }
 
     #[test]
     fn grant_revoke_request_serializes_with_ranger_field_names() {
@@ -1751,9 +1504,21 @@ mod tests {
     }
 
     #[test]
-    fn grantee_group_is_rejected() {
-        let err = grantee_to_fields(&Grantee::Group("sg".into())).unwrap_err();
-        assert!(matches!(err, sqe_core::SqeError::NotImplemented(_)));
+    fn a_group_grantee_becomes_a_ranger_role_of_the_same_name() {
+        // Not the `groups` field. The control plane materialises every Keycloak
+        // group as a Ranger ROLE of the identical name, with no name transform, so a
+        // group grant and the same-named role grant must be the same write. The old
+        // behaviour refused GROUP outright citing Ranger usersync, which this
+        // deployment does not use.
+        let (users, roles) = grantee_to_fields(&Grantee::Group("ws-sales-members".into()))
+            .expect("a group grantee is supported");
+        assert!(users.is_empty());
+        assert_eq!(roles, vec!["ws-sales-members".to_string()]);
+        assert_eq!(
+            grantee_to_fields(&Grantee::Group("g".into())).unwrap(),
+            grantee_to_fields(&Grantee::Role("g".into())).unwrap(),
+            "a group and a role of the same name are the same Ranger write"
+        );
     }
 
     #[test]
@@ -1863,7 +1628,17 @@ mod tests {
         let ns = &plan[1];
         assert_eq!(ns.resource.get("namespace").map(String::as_str), Some("sales"));
         assert_eq!(ns.resource.get("table"), None);
-        assert_eq!(ns.access_types, vec!["namespace-properties-read".to_string()]);
+        // v4's expansion, not just the seed: `namespace-properties-read` implies
+        // `namespace-list`, so the namespace policy carries both. Scoped to THIS
+        // namespace, which is not the catalog-wide enumeration the catalog level
+        // grants.
+        assert_eq!(
+            ns.access_types,
+            vec![
+                "namespace-list".to_string(),
+                "namespace-properties-read".to_string()
+            ]
+        );
 
         let tbl = &plan[2];
         assert_eq!(tbl.resource.get("table").map(String::as_str), Some("orders"));
@@ -2368,13 +2143,13 @@ mod tests {
         // than the cascade. Fails closed to "no provenance" instead.
         assert_eq!(parse_grant_label("chm:USER:dave:TABLE-SNAPSHOT-ADD"), None);
         assert_eq!(parse_grant_label("chm:USER:dave:NONSENSE"), None);
-        // Every mapped privilege still round-trips, so the guard is not simply
-        // rejecting everything.
-        for p in MAPPED_PRIVILEGES {
-            let l = grant_label(&Grantee::User("dave".into()), p);
+        // Every privilege the PROFILE plans still round-trips, so the guard is not
+        // simply rejecting everything.
+        for p in profile().known_privileges() {
+            let l = grant_label(&Grantee::User("dave".into()), &p);
             assert!(
                 parse_grant_label(&l).is_some(),
-                "mapped privilege {p} must round-trip through its label"
+                "profile privilege {p} must round-trip through its label"
             );
         }
     }
@@ -2410,20 +2185,6 @@ mod tests {
             assert!(
                 parse_grant_label(bad).is_none(),
                 "{bad:?} must not parse into provenance"
-            );
-        }
-    }
-
-    #[test]
-    fn write_access_fully_contains_read_access() {
-        // This containment is WHY provenance is needed, so pin it. If INSERT
-        // ever stops implying the read types, the revoke-narrowing logic still
-        // works but this test should be revisited deliberately.
-        for t in READ_ACCESS {
-            assert!(
-                WRITE_ACCESS.contains(t),
-                "{t} is in READ_ACCESS but not WRITE_ACCESS; revoking INSERT \
-                 would no longer strip SELECT and the comments here are stale"
             );
         }
     }
