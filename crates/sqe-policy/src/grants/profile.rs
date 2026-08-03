@@ -205,6 +205,20 @@ impl GrantProfile {
         out.into_iter().collect()
     }
 
+    /// The SEEDS of a privilege's deepest level, before expansion.
+    ///
+    /// The first seed is the access type that DEFINES the privilege (`SELECT` ->
+    /// `table-data-read`, `INSERT` -> `table-data-write`), which is what an
+    /// introspection answer should name. Taking the first element of the expanded
+    /// set would pick alphabetically instead, and for `INSERT` that is
+    /// `table-data-read` -- reporting a write privilege as though it were a read.
+    pub fn deepest_seeds(&self, canonical: &str) -> Option<&[String]> {
+        self.privileges
+            .get(canonical)
+            .and_then(|ls| ls.last())
+            .map(|l| l.seeds.as_slice())
+    }
+
     /// The deepest level a privilege binds to.
     pub fn deepest_level(&self, canonical: &str) -> Option<Level> {
         self.privileges.get(canonical).and_then(|ls| ls.last()).map(|l| l.level)

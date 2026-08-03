@@ -1,9 +1,8 @@
 # grant-profile v4 adoption: foundation landed, rewiring next
 
-Status: the profile is vendored, parsed and proven against its own fixtures. The
-grant path still uses SQE's hand-written access-type map, so nothing has changed
-in what a GRANT writes yet. This records what will change when it is rewired,
-because the deltas are not all in the same direction.
+Status: DONE. The profile is vendored and the grant path plans from it. This
+records the deltas, which are not all in the same direction, and one migration
+gap that adoption does NOT close.
 
 ## What landed
 
@@ -100,3 +99,91 @@ should assume it does much less than its name.
 
 `ON ALL TABLES IN SCHEMA` (§9 of the handoff) is already done: `AllTablesInSchema`
 and `FutureTablesInSchema` share one match arm producing table `"*"`.
+
+
+---
+
+# Rewiring done, and the migration gap it exposed
+
+`plan_for` / `deepest_policy` in `ranger.rs` now delegate to `profile().plan_grant`,
+and the hand-written vocabulary is gone: `map_sql_to_ranger_access{,_for}`,
+`READ_ACCESS`, `WRITE_ACCESS`, `VIEW_READ_ACCESS`, `MAPPED_PRIVILEGES`,
+`ResourceLevel`, `build_resource_map` and `reject_scope_deeper_than_level`. Eleven
+unit tests went with them: their subject is now the golden fixtures, and keeping
+hand-written duplicates of the profile's own expectations is how the two drifted in
+the first place.
+
+Where the deleted pieces were still needed, they were replaced rather than
+reimplemented:
+
+- `REVOKE` and `DENY` take `deepest_policy`, the last entry of the plan. Both act on
+  the level the statement NAMES; revoking traversal would strip discovery from
+  unrelated grants, and denying it would hide every object under the namespace
+  rather than the one named. The scope guard now lives inside `plan_grant`, so all
+  three statements agree on what a statement's scope means by construction.
+- `retained_access_types` plans the OTHER privilege at the same resource instead of
+  looking it up in a table, so held-back sets cannot drift from what the grant
+  actually wrote. It recovers the identifiers from the resource map rather than
+  having them threaded in: they are exactly what the plan put there.
+- `parse_grant_label` validates against `profile().deepest_level`, so a label can
+  only name a privilege the profile plans.
+- `check_access` uses the deepest level's SEED, not the first element of the
+  expanded set. The expansion is sorted, and `INSERT`'s alphabetically-first entry
+  is `table-data-read` -- reporting a write privilege as a read.
+
+## GROUP grantees now work
+
+`grantee_to_fields` mapped `Grantee::Group` to an error citing Ranger usersync. That
+is wrong for this deployment: the control plane materialises every Keycloak group as
+a Ranger ROLE of the identical name, with no name transform on either call site, and
+under Ranger no Polaris principal-roles are created at all. A group now goes in the
+`roles` field, so a group grant and the same-named role grant are the same write.
+
+Deliberately NOT auto-creating the role, unlike the platform's `ensure_role_exists`:
+its grantee arrives from a validated API, ours from free-text SQL, where
+auto-creating would turn a typo into an empty Ranger role and a grant that silently
+confers nothing.
+
+## Compensation on partial-plan failure
+
+A three-level plan can land partially, because Ranger has no transaction across the
+calls. If a later level fails, the levels already written are now rolled back,
+innermost first. Half a plan is worse than none: the traversal levels alone confer
+discovery the operator never asked for, and they are invisible in a `SHOW GRANTS`
+that reports no privilege on the object.
+
+The rollback is best-effort and the outcome is always stated. On success the message
+says no partial grant remains; on failure it names the grantee and says discovery
+may be retained. Implying a clean failure when compensation itself failed would be
+the worse error.
+
+## THE MIGRATION GAP: adoption does not narrow EXISTING grants
+
+This is the part to know before deploying.
+
+Ranger's grant endpoint MERGES access types into whatever policy already covers a
+resource, and revoke removes only the types it names. So a policy written by the old
+code keeps the four over-broad `INSERT` types, and a `REVOKE INSERT` issued by the
+NEW code cannot clear them -- it names the narrower v4 set, and the residue is
+outside it.
+
+Concretely, on a fixture table that had been granted by the old code, `INSERT` still
+showed all 23 access types including `table-location-set` after this change. Nothing
+is wrong with the new planner; the policy predates it.
+
+Found the honest way: the first version of the assertion was placed on a shared
+fixture table and failed on residue. Moving it to a table with no policy history
+made it pass, which is the correct scope for the claim -- **adoption narrows NEW
+grants and leaves existing ones as they were.**
+
+So `table-location-set` is closed for anything granted from here on, and any
+deployment that ran the old code needs a one-off cleanup to actually lose it.
+Options, none implemented here: re-issue affected grants against freshly created
+policies, delete the `polaris` policies and re-grant, or a migration that strips the
+four types from existing items. Whichever is chosen wants its own change, because
+rewriting live access-control policies in bulk is not something to bury in a
+refactor.
+
+## Left open
+
+`scripts/check-vendored-profile.sh` is not yet wired into CI.
