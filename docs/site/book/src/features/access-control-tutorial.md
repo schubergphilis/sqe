@@ -100,9 +100,25 @@ out.
 take back namespace visibility. One namespace policy serves every table granted
 under it, so releasing it on the first revoke would break the grantee's access to
 the others. A namespace whose tables have all been revoked leaves the grantee able
-to see that the namespace exists and nothing more. Remove it explicitly with
-`REVOKE USAGE ON SCHEMA` when that matters. Policies SQE added this way carry the
-label `sqe:traversal:<GRANTEE_TYPE>:<name>` in the Ranger console.
+to see that the namespace exists and nothing more. Policies SQE added this way
+carry the label `sqe:traversal:<GRANTEE_TYPE>:<name>` in the Ranger console.
+
+To remove the residue, revoke catalog discovery **first**:
+
+```sql
+REVOKE USAGE ON DATABASE sales_wh       FROM ROLE "analyst";
+REVOKE USAGE ON SCHEMA   sales_wh.acdemo FROM ROLE "analyst";
+```
+
+That order matters right now, and not for tidiness. A principal left holding
+catalog discovery while every namespace under it is invisible currently **hangs**
+instead of being denied: the per-namespace probe returns 403 for everything, and
+SQE's catalog provider blocks in its sync-to-async bridge rather than reporting
+"table not found". Revoking discovery first never passes through that state. The
+hang is a known defect in the read path, recorded in
+`docs/internal/research/2026-08-02-catalog-traversal-gate.md`, and it is not
+specific to revoking: any principal configured with catalog discovery and no
+visible namespace can reach it.
 
 ## 1.2 A grant is what enables a read
 

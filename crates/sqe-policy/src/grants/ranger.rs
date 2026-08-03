@@ -1866,6 +1866,29 @@ mod tests {
     }
 
     #[test]
+    fn a_wildcard_table_grant_also_gets_the_namespace() {
+        // `GRANT ... ON ALL TABLES IN SCHEMA cat.ns` resolves to table `"*"` at the
+        // table level, so it picks up the ancestor too. Intended: those tables need
+        // the namespace visible exactly as a single-table grant does, and the
+        // ancestor names the REAL namespace, not a wildcard.
+        let b = test_backend();
+        let plan = b
+            .build_grant_plan(
+                "SELECT",
+                GrantObjectKind::Table,
+                Some("wh"),
+                Some("sales"),
+                Some("*"),
+                &Grantee::Role("analyst".into()),
+            )
+            .expect("build plan");
+        assert_eq!(plan.len(), 2);
+        assert_eq!(plan[0].resource.get("namespace").map(String::as_str), Some("sales"));
+        assert_eq!(plan[0].resource.get("table"), None);
+        assert_eq!(plan[1].resource.get("table").map(String::as_str), Some("*"));
+    }
+
+    #[test]
     fn multi_level_plans_did_not_reopen_the_scope_widening_hole() {
         // `ALL` binds to the CATALOG level. Naming a table must still be refused
         // rather than quietly widened -- the Vec return is about ancestors, not
@@ -1885,6 +1908,64 @@ mod tests {
             err.to_string().contains("wider than the object named"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn deny_stays_a_single_level_and_never_auto_denies_a_namespace() {
+        // `deny()` builds its own resource map and does NOT go through
+        // `build_grant_plan`. Asserted rather than left structural: auto-denying
+        // `namespace-properties-read` at the namespace level would hide EVERY
+        // table in the namespace, so a DENY on one table would lock the grantee
+        // out of all of them.
+        let src = include_str!("ranger.rs");
+        let deny_body = src
+            .split("async fn deny(")
+            .nth(1)
+            .expect("deny() present");
+        let deny_body = &deny_body[..deny_body.find("\n    }").unwrap_or(deny_body.len())];
+        // Guard against a vacuous extraction: if the slice above ever stops
+        // finding the real body, the two negative assertions below would pass on
+        // an empty string and this test would silently stop testing anything.
+        assert!(
+            deny_body.contains("denyPolicyItems") && deny_body.contains("build_deny_item"),
+            "the deny() body was not extracted; the assertions below would be vacuous"
+        );
+        assert!(
+            !deny_body.contains("build_grant_plan"),
+            "deny() must stay single-level: a namespace-level deny would hide \
+             every table under the namespace, not just the one named"
+        );
+        assert!(
+            !deny_body.contains("NAMESPACE_VISIBILITY_ACCESS"),
+            "deny() must not touch the traversal access type"
+        );
+    }
+
+    #[test]
+    fn a_traversal_label_is_skipped_when_working_out_what_revoke_must_keep() {
+        // The loop in `retained_access_types` maps every OTHER label on the policy
+        // through `map_sql_to_ranger_access_for` to decide what to hold back. A
+        // traversal marker is not a grant, and its third segment is a grantee
+        // name, not a privilege: fed through the pass-through arm it would produce
+        // a bogus access type ("dave") and hold it back forever. This pins the
+        // classification the loop depends on.
+        let traversal = traversal_label(&Grantee::User("dave".into()));
+        assert!(is_traversal_label(&traversal));
+
+        // What the loop would compute if the skip were removed.
+        let leaked = parse_grant_label(&traversal);
+        assert_eq!(
+            leaked, None,
+            "a traversal marker must not parse as a grant; got {leaked:?}"
+        );
+
+        // A real grant label on the same policy still resolves normally.
+        let real = grant_label(&Grantee::User("dave".into()), "SELECT");
+        let (_, name, privilege) = parse_grant_label(&real).expect("grant label parses");
+        assert_eq!(name, "dave");
+        assert_eq!(privilege, "SELECT");
+        let (access, _) = map_sql_to_ranger_access_for(GrantObjectKind::Table, &privilege);
+        assert!(access.contains(&"table-data-read".to_string()));
     }
 
     #[test]
