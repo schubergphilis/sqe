@@ -93,6 +93,48 @@ types the corresponding Polaris operations check. The mapping:
 Unknown privileges pass through lowercased, so an operator can name native Ranger
 access types directly in a `GRANT` statement.
 
+### A table grant alone does not make a table readable
+
+`GRANT SELECT ON cat.ns.tbl` writes ONE policy, at the table level. That is not
+enough to read the table through SQE, and the reason is on SQE's side rather than
+Polaris's.
+
+Polaris will serve the table: a direct `LOAD_TABLE` carrying only the table-level
+grant returns 200. But `SqeCatalogProvider::schema()` answers only for a namespace
+present in its cached namespace list, and `list_visible_namespace_names` builds
+that list from two calls that must both succeed. `list_namespaces` needs
+`LIST_NAMESPACES`, authorized at the CATALOG level (Polaris does not use Ranger's
+`SELF_OR_DESCENDANTS` matching, so a namespace-scoped `namespace-list` will not
+satisfy it). The visibility filter then probes each namespace with
+`get_namespace`, which is `LOAD_NAMESPACE_METADATA` and needs namespace-level
+`namespace-properties-read`; a 403 hides the namespace so ungranted names do not
+leak through `SHOW SCHEMAS`.
+
+Either failure leaves an empty schema list, `schema()` returns `None`, and
+planning ends at `table not found` with `LOAD_TABLE` never attempted. Nothing in
+the SQE log shows a 403, because there is no denial to report.
+
+So the minimum for one readable table is three grants:
+
+```sql
+GRANT USAGE  ON DATABASE cat        TO ROLE r;  -- catalog-level discovery
+GRANT USAGE  ON SCHEMA   cat.ns     TO ROLE r;  -- namespace visibility
+GRANT SELECT ON cat.ns.tbl          TO ROLE r;  -- the data
+```
+
+`GRANT USAGE ON DATABASE` is the catalog-level form: `USAGE` binds to the
+namespace level, and with no namespace named the resource map degrades to
+`{root, catalog}`, which is what `LIST_NAMESPACES` is authorized against.
+
+The quickstart's bootstrap seeds wildcard discovery for `analyst` and `engineer`,
+which is why a single `GRANT SELECT` looks sufficient there. It is not sufficient
+for a principal outside those roles.
+
+The tradeoff is deliberate and should be understood: the catalog-level grant lets
+its holder enumerate every namespace name in the catalog. Verified on Polaris 1.7
+with a clean database; full transcript in
+`docs/internal/research/2026-08-02-catalog-traversal-gate.md`.
+
 ### The named scope must match the privilege's level
 
 The right-hand column is not advisory. It decides which keys go into the Ranger
@@ -200,9 +242,37 @@ or `wholesale` (`resource_matches_prefix`).
 deny-overrides-allow against the fetched policies for a user and access type. Its
 own doc-comment is explicit: "The authoritative decision is Polaris enforcement;
 this is for `CHECK ACCESS` introspection only." It does not account for tag
-policies, conditions, or wildcard resource matching beyond exact match, and it
-matches on the user dimension only because roles are resolved by Ranger at
-enforcement, not at this layer.
+policies, conditions, or wildcard resource matching beyond exact match and bare
+`*`.
+
+It DOES resolve the target user's Ranger roles, including nested ones. That is
+worth stating because it did not, and the failure was quiet. `check_access`
+passed an empty role list, under a comment claiming roles were unknown at this
+layer, when Ranger serves them at `/service/public/v2/api/roles`. Since role
+grants are the normal way to grant, the practical result was:
+
+```
+CHECK ACCESS SELECT ON sales_wh.acdemo.orders FOR USER "alice";
+-- false | No matching grant for alice table-data-read on sales_wh.acdemo.orders
+```
+
+while `SHOW GRANTS` on the same table listed `table-data-read` for `ROLE
+analyst`, alice was a member, and alice was reading the table. The answer looked
+authoritative, so an auditor would conclude the table was closed while a user
+read from it. It now reports:
+
+```
+-- true | Allowed via ROLE 'analyst'
+```
+
+Membership follows nested roles (a role listing another role confers it), walked
+with a seen-set because Ranger does not prevent an operator creating a cycle.
+
+**Groups are not resolved.** Ranger only knows a user's groups when usersync
+runs, so a group-derived role would be a guess. A grant reachable only through a
+group does not appear in `CHECK ACCESS`, which keeps the answer conservative in
+the direction it already erred. A role-lookup failure says so in the `reason`
+rather than degrading to a confident "no".
 
 ## Identity model
 
