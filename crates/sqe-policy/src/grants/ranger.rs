@@ -777,7 +777,85 @@ pub fn entry_matches_grantee(entry: &GrantEntry, grantee: &Grantee) -> bool {
     entry.grantee_type == want_type && entry.grantee_name == grantee.name()
 }
 
+/// Every Ranger role the named user belongs to, following nested roles.
+///
+/// Ranger's role objects carry `users`, `groups` and `roles`. A role listing a
+/// role means membership is transitive, so a user in `analyst` where
+/// `senior_analyst` contains `analyst` holds both. Walked breadth-first with a
+/// seen-set, because Ranger does not stop an operator creating a cycle and a
+/// naive walk would hang the CHECK ACCESS request rather than answer it.
+///
+/// Groups are deliberately not resolved. Ranger only knows a user's groups if
+/// usersync runs, which it does not in this deployment, so a group-derived role
+/// would be a guess. A role reached only through a group is therefore missed,
+/// which keeps CHECK ACCESS conservative in the same direction it already was.
+fn roles_for_user(roles: &[serde_json::Value], user: &str) -> Vec<String> {
+    let name_of = |r: &serde_json::Value| -> Option<String> {
+        r.get("name").and_then(|n| n.as_str()).map(str::to_string)
+    };
+    let members = |r: &serde_json::Value, key: &str| -> Vec<String> {
+        r.get(key)
+            .and_then(serde_json::Value::as_array)
+            .map(|xs| {
+                xs.iter()
+                    .filter_map(|m| m.get("name").and_then(|n| n.as_str()).map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+
+    let mut held: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut queue: Vec<String> = roles
+        .iter()
+        .filter(|r| members(r, "users").iter().any(|u| u == user))
+        .filter_map(name_of)
+        .collect();
+
+    while let Some(role) = queue.pop() {
+        if !seen.insert(role.clone()) {
+            continue;
+        }
+        held.push(role.clone());
+        // Any role that lists this one as a member is also held.
+        for r in roles {
+            if members(r, "roles").iter().any(|m| m == &role) {
+                if let Some(parent) = name_of(r) {
+                    if !seen.contains(&parent) {
+                        queue.push(parent);
+                    }
+                }
+            }
+        }
+    }
+    held.sort();
+    held
+}
+
 impl RangerGrantBackend {
+    /// Fetch the service's roles so `CHECK ACCESS` can resolve a target user's
+    /// role membership. Ranger exposes roles service-wide, not per service.
+    async fn fetch_roles(&self) -> sqe_core::Result<Vec<serde_json::Value>> {
+        let url = format!("{}/service/public/v2/api/roles", self.admin_url);
+        let resp = self
+            .client
+            .get(&url)
+            .basic_auth(&self.admin_user, Some(&self.admin_password))
+            .send()
+            .await
+            .map_err(|e| sqe_core::SqeError::Execution(format!("Ranger role fetch failed: {e}")))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            warn!(http_status = %status, "Ranger role fetch failed");
+            return Err(sqe_core::SqeError::Execution(format!(
+                "Ranger role fetch failed (HTTP {status})"
+            )));
+        }
+        resp.json().await.map_err(|e| {
+            sqe_core::SqeError::Execution(format!("Ranger role parse failed: {e}"))
+        })
+    }
+
     /// Fetch all policies for this service from Ranger Admin.
     async fn fetch_policies(&self) -> sqe_core::Result<Vec<RangerPolicy>> {
         // Public v2 endpoint returns a bare JSON array of policies. (The
@@ -1063,9 +1141,40 @@ impl GrantBackend for RangerGrantBackend {
 
         let policies = self.fetch_policies().await?;
         let entries = policies_to_entries(&policies);
-        // Roles unknown at this layer; match on the user dimension only. Role
-        // grants are surfaced via SHOW GRANTS and enforced by Polaris.
-        Ok(evaluate_access(&entries, &check.user, &[], primary, &resource))
+
+        // Resolve the TARGET user's roles, not the caller's. CHECK ACCESS asks
+        // "can alice read this", so alice's membership decides it.
+        //
+        // This used to pass an empty role list, with a comment claiming roles
+        // were unknown at this layer. They are not: Ranger serves them. The
+        // result was that CHECK ACCESS answered "false" for access that plainly
+        // worked, since role grants are the normal way to grant. Worse than a
+        // missing feature, because the answer looked authoritative: an auditor
+        // reading it concluded a table was closed while the user was reading it.
+        //
+        // A role lookup failure must not turn into a confident "no". Report the
+        // degradation instead, so the caller can tell "not granted" from
+        // "could not tell".
+        let roles = match self.fetch_roles().await {
+            Ok(rs) => roles_for_user(&rs, &check.user),
+            Err(e) => {
+                warn!(error = %e, user = %check.user,
+                      "Ranger role lookup failed; CHECK ACCESS sees direct user grants only");
+                let mut result =
+                    evaluate_access(&entries, &check.user, &[], primary, &resource);
+                if !result.allowed {
+                    result.reason = Some(format!(
+                        "No matching direct grant for {} {} on {}. Role membership \
+                         could NOT be checked (Ranger role lookup failed), so a grant \
+                         held through a role would not show here.",
+                        check.user, primary, resource
+                    ));
+                }
+                return Ok(result);
+            }
+        };
+
+        Ok(evaluate_access(&entries, &check.user, &roles, primary, &resource))
     }
 
     fn backend_name(&self) -> &str {
@@ -1634,5 +1743,96 @@ mod tests {
     fn check_match_denies_when_no_grant() {
         let r = evaluate_access(&[], "alice", &[], "table-data-read", "wh.sales.orders");
         assert!(!r.allowed);
+    }
+
+    /// Ranger's `/service/public/v2/api/roles` shape, trimmed to what
+    /// `roles_for_user` reads.
+    fn role(name: &str, users: &[&str], nested: &[&str]) -> serde_json::Value {
+        serde_json::json!({
+            "name": name,
+            "users": users.iter().map(|u| serde_json::json!({"name": u})).collect::<Vec<_>>(),
+            "groups": [],
+            "roles": nested.iter().map(|r| serde_json::json!({"name": r})).collect::<Vec<_>>(),
+        })
+    }
+
+    #[test]
+    fn a_users_direct_roles_are_resolved() {
+        // The bug: CHECK ACCESS passed an empty role list, so it answered
+        // "false" for alice while alice was reading the table through the
+        // analyst role. Confirmed live against Polaris 1.7 + Ranger 2.8:
+        // SHOW GRANTS listed `table-data-read ROLE analyst`, alice returned 3
+        // rows, and CHECK ACCESS said no.
+        let roles = vec![
+            role("analyst", &["alice", "bob"], &[]),
+            role("engineer", &["bob"], &[]),
+            role("sqe_admin", &["carol"], &[]),
+        ];
+        assert_eq!(roles_for_user(&roles, "alice"), vec!["analyst"]);
+        assert_eq!(roles_for_user(&roles, "bob"), vec!["analyst", "engineer"]);
+        assert!(
+            roles_for_user(&roles, "dave").is_empty(),
+            "a user in no role holds no role"
+        );
+    }
+
+    #[test]
+    fn nested_role_membership_is_transitive() {
+        // A role that lists another role as a member confers it. Without this,
+        // a grant made to the outer role is invisible to CHECK ACCESS even
+        // though Ranger enforces it.
+        let roles = vec![
+            role("analyst", &["alice"], &[]),
+            role("senior_analyst", &[], &["analyst"]),
+            role("all_staff", &[], &["senior_analyst"]),
+            role("unrelated", &["bob"], &[]),
+        ];
+        assert_eq!(
+            roles_for_user(&roles, "alice"),
+            vec!["all_staff", "analyst", "senior_analyst"],
+            "membership follows nested roles all the way up"
+        );
+    }
+
+    #[test]
+    fn a_role_cycle_terminates_instead_of_hanging() {
+        // Ranger does not stop an operator creating a cycle. A naive walk would
+        // spin forever and hang the CHECK ACCESS request rather than answer it,
+        // which is a worse failure than a wrong answer.
+        let roles = vec![
+            role("a", &["alice"], &["b"]),
+            role("b", &[], &["a"]),
+        ];
+        let held = roles_for_user(&roles, "alice");
+        assert_eq!(held, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn a_role_grant_is_visible_once_the_users_roles_are_resolved() {
+        // End to end over the two functions: the grant is to the ROLE, the
+        // question is about the USER, and the answer must be yes.
+        let entries = vec![GrantEntry {
+            privilege: "table-data-read".into(),
+            resource: "wh.sales.orders".into(),
+            grantee_type: "ROLE".into(),
+            grantee_name: "analyst".into(),
+            effect: "ALLOW".into(),
+            granted_by: None,
+            granted_at: None,
+        }];
+        let roles = vec![role("analyst", &["alice"], &[])];
+
+        let held = roles_for_user(&roles, "alice");
+        let r = evaluate_access(&entries, "alice", &held, "table-data-read", "wh.sales.orders");
+        assert!(r.allowed, "alice holds analyst, and analyst holds the grant");
+        assert!(
+            r.reason.as_deref().unwrap_or("").contains("analyst"),
+            "the reason should name the role the access came through: {:?}",
+            r.reason
+        );
+
+        // The negative control: a user in no role still gets no.
+        let none = roles_for_user(&roles, "dave");
+        assert!(!evaluate_access(&entries, "dave", &none, "table-data-read", "wh.sales.orders").allowed);
     }
 }
