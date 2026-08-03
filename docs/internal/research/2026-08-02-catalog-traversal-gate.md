@@ -131,3 +131,74 @@ Polaris runs `in-memory` here and had restarted, so the table did not exist and
 carol got the same 404. Ranger policies live in Postgres and survive; Polaris
 state does not. Any experiment on this stack needs an admin control proving the
 object exists before a denial can be read as a denial.
+
+---
+
+# Follow-up, 2026-08-03: which half of the traversal SQE can write for you
+
+The question this raised: if the traversal is load-bearing and mechanical, why is
+the operator typing it? Answered by splitting the two levels and testing them
+separately rather than treating "the traversal" as one thing.
+
+## The namespace level is mechanical. The catalog level is a decision.
+
+Isolated live, one variable at a time, on the 1.7 stack:
+
+| dave holds | `SELECT count(*) FROM sales_wh.acdemo.orders` |
+|---|---|
+| catalog `namespace-list` + table `SELECT` | `table 'sales_wh.acdemo.orders' not found` |
+| the same, plus `{catalog, namespace}` `namespace-properties-read` | 3 rows |
+
+carol (admin) read 3 rows throughout, so the table existed for every reading. The
+second row differs from the first by ONE access type, written by hand onto the
+existing `{namespace: acdemo, catalog: sales_wh}` policy and reverted afterward.
+
+That makes the namespace level a completion of the statement: it is an ancestor on
+the path to the table the operator named, required to reach it, conferring nothing
+about anything outside that path. `build_grant_plan` now writes it.
+
+The catalog level is categorically different and stays explicit. Catalog-level
+`namespace-list` lets its holder enumerate every namespace name in the catalog,
+including ones unrelated to the granted table, so auto-adding it would widen the
+blast radius of every `GRANT SELECT` while reporting success. It is also granted
+once per role rather than once per table, so the ergonomic argument for automating
+it is weak. Three statements became two, and the one left is the one that costs
+something.
+
+## Two bugs found while establishing this, neither caused by the change
+
+**`SHOW SCHEMAS FROM <catalog>` can answer about a different catalog.** With
+`[catalog] warehouse = "sales_wh"`, `SHOW SCHEMAS FROM sales_wh` and
+`SHOW SCHEMAS FROM ops_wh` both returned `ops`, `ac` -- ops_wh's namespaces, while
+sales_wh actually holds `sales`, `ac`, `acdemo` (confirmed from Polaris's own
+`GET /v1/sales_wh/namespaces`). Cause is in `show_catalog`: the explicit name is
+preferred, then the guard `cat != self.config.catalog.warehouse` discards it for
+the one case where the named catalog IS the configured default, falling through to
+`session_catalog(session)`, which re-resolves from the session default. So the
+qualifier silently loses exactly when it names the default warehouse.
+
+This matters beyond ergonomics: `SHOW SCHEMAS` is what an operator uses to confirm
+a grant took effect, and here it reports on a catalog they did not ask about. It
+also cost real time in this investigation, first by making a fixture table look
+absent (it was not) and then by making `USAGE` look insufficient for discovery (it
+is sufficient; Polaris logged 200 on both the list and the probe).
+
+**`SqeCatalogProvider::schema()` wedges when every namespace probe denies.** A
+principal who can list a catalog's namespaces while all per-namespace probes 403
+hangs indefinitely instead of reporting "table not found". Stack captured with
+`sample`:
+
+```
+QueryHandler::execute_query -> SessionContext::sql
+  -> SqeCatalogProvider::schema -> contains_namespace
+    -> sqe_catalog::runtime_bridge::block_on_compat
+      -> std::thread::JoinHandle::join -> pthread_join -> __ulock_wait
+```
+
+Same re-entrant-`block_on` family as #195. It reproduces on a current-thread
+runtime (`#[tokio::test]`'s default) and not through the container, whose runtime
+is multi-threaded, which is why the CLI answered "table not found" promptly in the
+same state. Reachable in production by any principal holding catalog discovery and
+no namespace visibility -- a state a `REVOKE USAGE ON SCHEMA` produces. It is why
+`one_table_grant_writes_the_namespace_it_needs` asserts its pre-state from the
+Ranger policy rather than by having dave attempt a read.

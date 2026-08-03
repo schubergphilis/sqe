@@ -1975,3 +1975,181 @@ async fn revoking_write_leaves_an_independent_read_grant_intact() {
         .execute(&ctx.carol, &format!("DELETE FROM {ORDERS} WHERE id = 91"), None)
         .await;
 }
+
+
+/// Access types recorded for `user` on the `polaris` policy whose resource is
+/// exactly `{catalog}` + optional `{namespace}` + optional `{table}`.
+async fn polaris_access_types_for(
+    ctx: &AcCtx,
+    user: &str,
+    catalog: &str,
+    namespace: Option<&str>,
+    table: Option<&str>,
+) -> Vec<String> {
+    let policies = ctx.ranger.get_policies("polaris").await.expect("list polaris policies");
+    for p in policies {
+        let Some(res) = p.get("resources").and_then(|r| r.as_object()) else {
+            continue;
+        };
+        let val = |k: &str| -> Option<String> {
+            res.get(k)?
+                .get("values")?
+                .as_array()?
+                .first()?
+                .as_str()
+                .map(str::to_string)
+        };
+        if val("catalog").as_deref() != Some(catalog)
+            || val("namespace").as_deref() != namespace
+            || val("table").as_deref() != table
+        {
+            continue;
+        }
+        let mut out = Vec::new();
+        for item in p.get("policyItems").and_then(|v| v.as_array()).into_iter().flatten() {
+            let named = item
+                .get("users")
+                .and_then(|u| u.as_array())
+                .is_some_and(|us| us.iter().any(|u| u.as_str() == Some(user)));
+            if !named {
+                continue;
+            }
+            for a in item.get("accesses").and_then(|v| v.as_array()).into_iter().flatten() {
+                if let Some(t) = a.get("type").and_then(|t| t.as_str()) {
+                    out.push(t.to_string());
+                }
+            }
+        }
+        out.sort();
+        return out;
+    }
+    Vec::new()
+}
+
+/// One `GRANT` on a table writes the namespace visibility it needs, and the
+/// table becomes readable with no second statement.
+///
+/// A table-level grant used to be inert on its own. SQE resolves a table through
+/// its catalog provider, which answers only for namespaces its per-namespace
+/// probe (`LOAD_NAMESPACE_METADATA`) could load, so without namespace-level
+/// `namespace-properties-read` the probe 403s, the namespace is hidden, and
+/// planning ends at "table not found" without ever attempting `LOAD_TABLE`. The
+/// grant reported success and the grantee still could not read.
+///
+/// `GRANT` now writes the namespace ancestor alongside the table. The CATALOG
+/// level is deliberately still explicit: catalog-wide `namespace-list` exposes
+/// sibling namespace NAMES unrelated to the granted table, so auto-adding it
+/// would widen the blast radius of every table grant.
+///
+/// dave is the subject because he belongs to no role. alice and bob inherit
+/// wildcard `{namespace: *}` discovery from the quickstart bootstrap, which would
+/// make the ancestor grant invisible and this test vacuous.
+///
+/// This asserts the POLICY SQE writes, not a read by dave, and that limit is
+/// forced rather than chosen. A principal who can list a catalog's namespaces
+/// while every per-namespace probe 403s wedges `SqeCatalogProvider::schema()` on a
+/// current-thread runtime (`#[tokio::test]`'s default): it bridges to async
+/// through `runtime_bridge::block_on_compat`, which spawns a thread and joins it,
+/// and the join never returns (`pthread_join` / `__ulock_wait`, captured with
+/// `sample`). Same re-entrant-`block_on` family as #195. dave is in exactly that
+/// state until the Polaris plugin polls, so the FIRST read attempt hangs and
+/// `eventually` never gets to retry. That hang is a pre-existing read-path defect,
+/// not something this change introduced, and it does not reproduce through the
+/// container, whose runtime is multi-threaded.
+///
+/// What the read assertion would have added is covered instead by an isolated live
+/// A/B recorded in `docs/internal/research/2026-08-02-catalog-traversal-gate.md`:
+/// with catalog discovery and a table grant but no namespace visibility the read
+/// failed `table not found`, and adding ONLY `namespace-properties-read` at
+/// `{catalog, namespace}` returned rows. So this test pins that SQE writes exactly
+/// that access type at exactly that resource, and the research note pins that the
+/// access type is what unblocks the read.
+#[tokio::test]
+#[ignore]
+async fn one_table_grant_writes_the_namespace_it_needs() {
+    ac_gate!();
+    let _guard = crate::common::serial().lock().await;
+    let ctx = ac_setup().await;
+
+    // Strip BOTH halves so the grant under test is the only thing that can make
+    // the table reachable. Leftovers are likely: an earlier run of this test, or
+    // manual probing, writes exactly these.
+    for stmt in [
+        format!("REVOKE SELECT ON {ORDERS} FROM USER \"dave\""),
+        "REVOKE USAGE ON SCHEMA sales_wh.ac FROM USER \"dave\"".to_string(),
+    ] {
+        let _ = ctx.handler.execute(&ctx.carol, &stmt, None).await;
+    }
+    assert!(
+        polaris_access_types_for(&ctx, "dave", "sales_wh", Some("ac"), None).await.is_empty(),
+        "pre-state: dave must hold nothing on the ac namespace, or the ancestor \
+         grant under test cannot be observed"
+    );
+    assert!(
+        polaris_access_types_for(&ctx, "dave", "sales_wh", Some("ac"), Some("orders"))
+            .await
+            .is_empty(),
+        "pre-state: dave must hold nothing on the orders table"
+    );
+
+    // Catalog-level discovery stays an explicit statement: it is the grant that
+    // costs something (dave can enumerate every namespace name in sales_wh), so
+    // SQE will not add it on his behalf.
+    exec_ok(&ctx, &ctx.carol, "GRANT USAGE ON DATABASE sales_wh TO USER \"dave\"").await;
+    assert!(
+        polaris_access_types_for(&ctx, "dave", "sales_wh", None, None)
+            .await
+            .contains(&"namespace-list".to_string()),
+        "the catalog grant is what LIST_NAMESPACES needs"
+    );
+
+    // The statement under test names ONLY the table.
+    exec_ok(&ctx, &ctx.carol, &format!("GRANT SELECT ON {ORDERS} TO USER \"dave\"")).await;
+
+    // The ancestor landed, and carries visibility only.
+    let ns = polaris_access_types_for(&ctx, "dave", "sales_wh", Some("ac"), None).await;
+    assert_eq!(
+        ns,
+        vec!["namespace-properties-read".to_string()],
+        "a table grant must write exactly the namespace visibility it needs -- not \
+         namespace-list (catalog-wide enumeration) and not table access"
+    );
+
+    // The table grant itself is unchanged.
+    let tbl = polaris_access_types_for(&ctx, "dave", "sales_wh", Some("ac"), Some("orders")).await;
+    assert!(
+        tbl.contains(&"table-data-read".to_string()),
+        "the table half of the plan must still be written, got {tbl:?}"
+    );
+
+    // Control: the namespace policy confers VISIBILITY, not data. If it leaked
+    // read access, the other table in the namespace would be readable too.
+    assert!(
+        polaris_access_types_for(&ctx, "dave", "sales_wh", Some("ac"), Some("orders_sibling"))
+            .await
+            .is_empty(),
+        "no grant was made on the sibling table"
+    );
+
+    // Control: revoke still revokes what was granted.
+    exec_ok(&ctx, &ctx.carol, &format!("REVOKE SELECT ON {ORDERS} FROM USER \"dave\"")).await;
+    let after = polaris_access_types_for(&ctx, "dave", "sales_wh", Some("ac"), Some("orders")).await;
+    assert!(
+        !after.contains(&"table-data-read".to_string()),
+        "REVOKE must remove the table access types, got {after:?}"
+    );
+    // Documented asymmetry: the namespace policy survives the revoke on purpose,
+    // because one namespace policy serves every table granted under it.
+    assert_eq!(
+        polaris_access_types_for(&ctx, "dave", "sales_wh", Some("ac"), None).await,
+        vec!["namespace-properties-read".to_string()],
+        "namespace visibility is deliberately NOT released by a table revoke"
+    );
+
+    for stmt in [
+        "REVOKE USAGE ON SCHEMA sales_wh.ac FROM USER \"dave\"",
+        "REVOKE USAGE ON DATABASE sales_wh FROM USER \"dave\"",
+    ] {
+        let _ = ctx.handler.execute(&ctx.carol, stmt, None).await;
+    }
+}
