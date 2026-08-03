@@ -2074,8 +2074,12 @@ async fn one_table_grant_writes_the_namespace_it_needs() {
     // Strip BOTH halves so the grant under test is the only thing that can make
     // the table reachable. Leftovers are likely: an earlier run of this test, or
     // manual probing, writes exactly these.
+    // Order matters: catalog discovery first. Revoking the schema while discovery
+    // is still in place leaves dave able to list namespaces with none visible,
+    // which is the state that wedges the read path.
     for stmt in [
         format!("REVOKE SELECT ON {ORDERS} FROM USER \"dave\""),
+        "REVOKE USAGE ON DATABASE sales_wh FROM USER \"dave\"".to_string(),
         "REVOKE USAGE ON SCHEMA sales_wh.ac FROM USER \"dave\"".to_string(),
     ] {
         let _ = ctx.handler.execute(&ctx.carol, &stmt, None).await;
@@ -2091,28 +2095,35 @@ async fn one_table_grant_writes_the_namespace_it_needs() {
             .is_empty(),
         "pre-state: dave must hold nothing on the orders table"
     );
-
-    // Catalog-level discovery stays an explicit statement: it is the grant that
-    // costs something (dave can enumerate every namespace name in sales_wh), so
-    // SQE will not add it on his behalf.
-    exec_ok(&ctx, &ctx.carol, "GRANT USAGE ON DATABASE sales_wh TO USER \"dave\"").await;
+    // The catalog level too. This assertion exists because its absence let a dirty
+    // environment through once: leftover `catalog-list` / `catalog-properties-read`
+    // from hand-editing a policy during an investigation survived the revokes
+    // above (SQE never grants those, so no REVOKE removes them) and only surfaced
+    // as a confusing failure on the post-grant equality check further down.
+    let pre_catalog = polaris_access_types_for(&ctx, "dave", "sales_wh", None, None).await;
     assert!(
-        polaris_access_types_for(&ctx, "dave", "sales_wh", None, None)
-            .await
-            .contains(&"namespace-list".to_string()),
-        "the catalog grant is what LIST_NAMESPACES needs"
+        pre_catalog.is_empty(),
+        "pre-state: dave must hold nothing at the catalog level, found {pre_catalog:?} \
+         -- most likely a hand-edited Ranger policy from an earlier investigation"
     );
 
-    // The statement under test names ONLY the table.
+    // ONE statement, naming only the table. No catalog grant by hand: writing it
+    // is the behaviour under test.
     exec_ok(&ctx, &ctx.carol, &format!("GRANT SELECT ON {ORDERS} TO USER \"dave\"")).await;
 
-    // The ancestor landed, and carries visibility only.
+    // All three levels of v4's SELECT plan landed, each carrying exactly its own
+    // access type. Asserted as equality rather than `contains`: writing MORE than
+    // the profile specifies is as much a drift from the control plane as less.
+    assert_eq!(
+        polaris_access_types_for(&ctx, "dave", "sales_wh", None, None).await,
+        vec!["namespace-list".to_string()],
+        "catalog level: what LIST_NAMESPACES needs, and nothing more"
+    );
     let ns = polaris_access_types_for(&ctx, "dave", "sales_wh", Some("ac"), None).await;
     assert_eq!(
         ns,
         vec!["namespace-properties-read".to_string()],
-        "a table grant must write exactly the namespace visibility it needs -- not \
-         namespace-list (catalog-wide enumeration) and not table access"
+        "namespace level: visibility only, no table access"
     );
 
     // The table grant itself is unchanged.
@@ -2173,6 +2184,12 @@ async fn one_table_grant_writes_the_namespace_it_needs() {
         polaris_access_types_for(&ctx, "dave", "sales_wh", Some("ac"), None).await,
         vec!["namespace-properties-read".to_string()],
         "namespace visibility is deliberately NOT released by a table revoke"
+    );
+    assert_eq!(
+        polaris_access_types_for(&ctx, "dave", "sales_wh", None, None).await,
+        vec!["namespace-list".to_string()],
+        "nor is catalog discovery: both are shared with every other grant in the \
+         catalog, so a table revoke must not strip them"
     );
 
     // Teardown drops CATALOG discovery and deliberately leaves the namespace

@@ -202,3 +202,53 @@ same state. Reachable in production by any principal holding catalog discovery a
 no namespace visibility -- a state a `REVOKE USAGE ON SCHEMA` produces. It is why
 `one_table_grant_writes_the_namespace_it_needs` asserts its pre-state from the
 Ranger policy rather than by having dave attempt a read.
+
+---
+
+# Reversal, 2026-08-03: the catalog level is auto-granted after all
+
+The follow-up above concluded that SQE should write the namespace level and refuse
+the catalog level, on the grounds that catalog-wide `namespace-list` exposes
+sibling namespace names unrelated to the granted table. The reasoning holds; the
+conclusion was wrong, and this records why so the argument is not re-run.
+
+`grant-profile.json` v4 specifies the catalog level for every privilege that
+reaches into a catalog:
+
+```
+SELECT   catalog:[namespace-list] | namespace:[namespace-properties-read] | table:[table-data-read]
+INSERT   catalog:[namespace-list] | namespace:[namespace-properties-read] | table:[table-data-write]
+                                                exclude table-location-set, table-uuid-assign, table-format-version-upgrade
+MANAGE   catalog:[catalog-content-manage]
+```
+
+The data-platform control plane generates its Ranger policies from that file, and
+both it and SQE write to the same `polaris` service. Two consequences settle it:
+
+1. A SQL grant producing different policies from the equivalent API call makes
+   "who granted this, and does it confer the same thing" unanswerable. Provenance
+   labels do not help, because the divergence is in the access types, not the
+   attribution.
+2. The drift gate specified in §8 of the handoff compares `plan_grant` output to
+   the profile's fixtures byte for byte. A deliberately narrower plan fails it by
+   construction, so the narrowing could not coexist with the mechanism that keeps
+   the two implementations honest.
+
+The widening is therefore accepted and documented as a cost of every table grant,
+rather than presented as something SQE refuses. Where namespace names are
+themselves sensitive, the boundary that actually works is a separate catalog, not
+a narrower grant.
+
+Also settled by reading the same contract: the provenance prefix is `chm`, not
+`sqe` (`provenance.py:45`), and labels go on the DEEPEST level only. Catalog and
+namespace policies are shared plumbing; stamping them with one grantee's privilege
+misrepresents them as privately owned and invites a later revoke to release
+traversal another grant still depends on. The `sqe:traversal:` marker introduced
+by the earlier version is gone.
+
+`INSERT`'s `exclude` list is worth noting for the record: it is subtracted AFTER
+the `impliedGrants` closure, never held out of the seeds, because
+`table-data-write`'s closure is required to commit an Iceberg snapshot but also
+drags in `table-location-set`, which `INSERT` must not confer. SQE's hand-written
+`WRITE_ACCESS` still carries `table-location-set`, so that divergence closes with
+profile adoption rather than separately.

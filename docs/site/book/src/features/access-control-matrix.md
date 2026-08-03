@@ -45,11 +45,10 @@ The `polaris` service-def resource hierarchy is
 | Deny | `DENY SELECT ON cat.ns.tbl TO USER u` | Yes | Yes |
 | Group grantee | `GRANT SELECT ON cat.ns.tbl TO GROUP g` | Read path only, see gaps | Yes, for enforcement |
 
-### Two grants, not one: the traversal is load-bearing
+### One grant, three policies: the traversal is load-bearing
 
-`GRANT SELECT ON cat.ns.tbl TO USER alice` needs catalog-level discovery to be in
-place before alice can read the table through SQE. This surprises everyone, so it
-is worth the space.
+`GRANT SELECT ON cat.ns.tbl TO USER alice` writes THREE Ranger policies, not one,
+and the reason is on SQE's side rather than Polaris's.
 
 Polaris will serve the table: a direct `LOAD_TABLE` with only the table-level
 grant returns 200. But SQE resolves a table through its catalog provider, which
@@ -66,41 +65,37 @@ that list takes two calls that must both succeed:
 Either failure yields an empty schema list, and planning ends at
 `table 'cat.ns.tbl' not found` with `LOAD_TABLE` never attempted.
 
-SQE writes the namespace level for you. A table grant expands into two Ranger
-policies, namespace first, so the minimum to read one table is two statements:
+So one statement produces a three-level plan, written outermost first:
 
-```sql
--- catalog: discovery. Yours to make.
-GRANT USAGE ON DATABASE cat TO ROLE analyst;
--- table: the data, plus namespace visibility on cat.ns
-GRANT SELECT ON cat.ns.tbl TO ROLE analyst;
-```
+| Level | Access type | Why |
+|---|---|---|
+| catalog | `namespace-list` | `LIST_NAMESPACES` is catalog-scoped and unfiltered |
+| namespace | `namespace-properties-read` | the per-namespace visibility probe |
+| table | the privilege's own set | the data |
 
-The namespace policy is an ancestor on the path to the named table: required to
-reach it, and conferring nothing about anything else. It carries
-`namespace-properties-read` only, not `namespace-list`, so it grants visibility
-rather than data or enumeration. Pinned by
-`a_table_grant_also_makes_its_namespace_visible` and, live, by
-`one_table_grant_is_enough_when_the_catalog_is_discoverable`.
+The shape matches `grant-profile.json` v4, which the data-platform control plane
+generates from. That is the point: both write to the same Ranger service, and a
+SQL grant producing different policies from the equivalent API call makes "who
+granted this" unanswerable. Pinned by `a_table_grant_writes_v4s_three_level_plan`
+and, live, by `one_table_grant_writes_the_namespace_it_needs`.
 
-The catalog level is deliberately NOT auto-granted, and its cost is why: any
-grantee who holds it can enumerate **every** namespace name in the catalog, so a
-name like `pii_customer_health` is visible even though its rows are not. Widening
-that on the back of a single table grant would be the silent scope creep the
-level guard exists to refuse. Verified on Polaris 1.7 with a clean database;
+`MANAGE` and `ALL` bind at the catalog level already and carry
+`catalog-content-manage`, so their plan is a single policy.
+
+**The catalog level is a real widening, accepted rather than hidden.** Any grantee
+who holds it can enumerate **every** namespace name in the catalog, so a name like
+`pii_customer_health` is visible even though its rows are not, and this now
+happens on every table grant. Separate catalogs are the boundary if namespace
+names are themselves sensitive. Verified on Polaris 1.7 with a clean database;
 recorded in `docs/internal/research/2026-08-02-catalog-traversal-gate.md`.
 
-In the quickstart the catalog grant is already in place: the bootstrap seeds
-wildcard discovery for the `analyst` and `engineer` roles, which is why a single
-`GRANT SELECT` appears to be enough there. A user outside those roles gets
-`table not found` until discovery exists.
-
-`REVOKE` on the table does not release the namespace policy. One namespace policy
-serves every table granted under it, so dropping it on the first revoke would
-break the grantee's access to the rest. The residue is visibility only, labelled
-`sqe:traversal:<GRANTEE_TYPE>:<name>`. To clear it, revoke `USAGE ON DATABASE`
-before `USAGE ON SCHEMA`: a principal holding catalog discovery with no visible
-namespace currently hangs rather than being denied (see the gap row below).
+`REVOKE` touches the deepest level only. The catalog and namespace policies are
+shared with every other grant in that catalog, so walking the plan backwards would
+strip discovery from unrelated grants. Traversal policies therefore accumulate and
+are not cleaned up, which is the correct trade: an orphaned `namespace-list` is
+discovery on a catalog the grantee could already reach, whereas over-revoking is an
+outage. Clear it explicitly with `REVOKE USAGE ON DATABASE` **before**
+`REVOKE USAGE ON SCHEMA` (see the hang in the gap table below).
 
 ### A grant must be scoped at the privilege's own level
 
@@ -248,9 +243,8 @@ flush the cache on commit. The window is asserted at both edges by
 |---|---|
 | Scope must match the privilege | A privilege binds to one resource level. Naming an object deeper than that level is refused rather than widened: `GRANT ALL ON wh.sales.orders` errors instead of writing a catalog-wide policy. Re-issue it at the level the error names. Pinned by `all_privileges_on_a_table_is_refused_rather_than_widened_to_the_catalog`. |
 | Revoke narrows, it does not cascade | Ranger allows one policy per resource, so grants share an item and `WRITE_ACCESS` contains all of `READ_ACCESS`. `REVOKE INSERT` used to strip the grantee's independent `SELECT` too. SQE now labels each grant (`chm:<TYPE>:<name>:<PRIVILEGE>`) and holds back access types another labelled privilege still needs. The `chm` prefix is shared with the data-platform control plane deliberately: both write to the same Ranger service and both read these labels, so a private prefix would leave each blind to the other's grants and cascading over them. A label naming a privilege SQE does not map is dropped and logged rather than trusted, because an under-revoke is worse than the cascade. Grants written before labels existed fall back to the old behaviour, logged. Pinned by `revoking_write_leaves_an_independent_read_grant_intact`. |
-| A table grant still needs catalog discovery | A table grant now writes its namespace ancestor too, but catalog-level `namespace-list` stays an explicit `GRANT USAGE ON DATABASE`: auto-adding it would expose every namespace NAME in the catalog. See "Two grants, not one" below. |
 | Catalog discovery with nothing visible HANGS | A principal who can list a catalog's namespaces while every per-namespace probe 403s blocks indefinitely instead of getting "table not found": `contains_namespace` bridges to async through `runtime_bridge::block_on_compat`, which spawns a thread and joins it, and the join never returns. Same family as #195. Revoke `USAGE ON DATABASE` before `USAGE ON SCHEMA` to avoid passing through the state. Captured with `sample`; recorded in `docs/internal/research/2026-08-02-catalog-traversal-gate.md`. |
-| Namespace visibility outlives the revoke | `REVOKE` on a table does not release the namespace policy the grant added, because one namespace policy serves every table granted under it. The residue is visibility only (`namespace-properties-read`), labelled `sqe:traversal:<TYPE>:<name>`; clear it with `REVOKE USAGE ON SCHEMA`. |
+| Traversal policies accumulate | `REVOKE` releases the deepest level only, because the catalog and namespace policies a grant writes are shared with every other grant in that catalog. Orphaned `namespace-list` / `namespace-properties-read` are left behind and nothing cleans them up. Deliberate: over-revoking would strip discovery from unrelated grants. Clear them with `REVOKE USAGE ON DATABASE` then `REVOKE USAGE ON SCHEMA`, in that order. |
 | Views are not a boundary | `GRANT ... ON VIEW` works, but SQE expands the view and plans against its base tables, so the reader needs a grant there too. Not a Snowflake secure view. |
 | Group grantees, write path | `GRANT ... TO GROUP g` is rejected by the Ranger write path (`grantee_to_fields`) because Ranger only learns a user's groups under usersync. Group-bound policies authored in the Ranger console ARE enforced on the read path. |
 | Row filters through views | A filter referencing a column the view does not project fails the query with a DataFusion schema error. Fail-closed, but the message names neither the policy nor the view. Direct queries with the same projection work. |
