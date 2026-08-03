@@ -117,7 +117,7 @@ Eight MRs over a few days. The codec port was the biggest single chunk, but most
 
 The protocol is now feature-complete on the codec side. DECIMAL, LIST, STRUCT, MAP, ARRAY, ENUM, UNION all round-trip end-to-end against real `duckdb 1.5.3`. Nested-type queries through the TVF work. Federated joins across Iceberg and Quack work. The remaining gaps are upstream (DataFusion's planner rejects some SQL syntax like `ENUM(...)` literals) or stylistic (streaming versus eager fetch).
 
-There is a longer write-up about the type matrix in `docs/quack-datatype-matrix.md`. Every row marked ✅ has been verified against a real DuckDB CLI session.
+There is a longer write-up about the type matrix in `docs/site/book/src/quickstart/quack-datatype-matrix.md`. Every row marked ✅ has been verified against a real DuckDB CLI session.
 
 ## What it unlocks
 

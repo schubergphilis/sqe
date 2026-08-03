@@ -229,7 +229,7 @@ Run Marquez:
 docker run -p 5000:5000 -p 5001:5001 marquezproject/marquez
 ```
 
-Restart SQE. Run a query. Browse Marquez at `http://localhost:3000`. The full configuration reference lives in `docs/book/src/operations/openlineage.md`, including the DataHub setup and the troubleshooting matrix.
+Restart SQE. Run a query. Browse Marquez at `http://localhost:3000`. The full configuration reference lives in `docs/site/book/src/operations/openlineage.md`, including the DataHub setup and the troubleshooting matrix.
 
 Every TOML key has an `SQE_METRICS__OPENLINEAGE__*` env override. The config validator runs in `bin/sqe_server.rs` between config load and `QueryHandler::new`. Misconfigured blocks (enabled but no sink, bearer without api_key, spool without http_endpoint) refuse to start the server. We wanted lineage misconfigurations to fail loud, not silent.
 

@@ -106,6 +106,13 @@ Each of these is pinned by a test in `crates/sqe-coordinator/tests/it/access_con
 
 Grants issued through SQE (`GRANT`, `REVOKE`) are not affected, since those flush the cache. Lower the TTL if prompt propagation of console-authored edits matters more than fetch load against Ranger Admin. The tag path re-reads the column-to-tag map on every call and has no such window.
 
+## Walkthrough
+
+For a worked example that sets up both gates in order, with the SQL and the
+output at each step, see the
+[access control tutorial](./access-control-tutorial.md). It covers the Polaris
+catalog gate and this fine-grained path separately, then together.
+
 ## The in-engine SQL surface
 
 Independent of Ranger, SQE parses a native grant surface (`GRANT ... ROWS WHERE`, `GRANT ... MASKED WITH`, `SHOW EFFECTIVE GRANTS`, `CHECK ACCESS`) that the `in-memory` engine enforces. See [Security & Policy](../architecture/security.md) and [GRANT and REVOKE](../sql-reference/grant-revoke.md).

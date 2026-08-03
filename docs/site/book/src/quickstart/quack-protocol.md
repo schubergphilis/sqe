@@ -1,6 +1,6 @@
 # Quack Protocol Reference (as of DuckDB extension v1.5-variegata)
 
-Reference notes for implementing a Quack-compatible server and client in Rust. Extracted from the `duckdb/duckdb-quack` source (MIT, ~356 commits, May 2026) and the DuckDB v1.5.2+ release. Cross-checked against the announcement post and the in-repo `docs/usage.md`.
+Reference notes for implementing a Quack-compatible server and client in Rust. Extracted from the `duckdb/duckdb-quack` source (MIT, ~356 commits, May 2026) and the DuckDB v1.5.2+ release. Cross-checked against the announcement post and duckdb-quack's own `docs/usage.md`.
 
 The Quack protocol is **pre-release** and the DuckDB project plans to stabilise it for v2.0 in September 2026. Treat this document as a snapshot, not a stable contract.
 
@@ -9,7 +9,7 @@ The Quack protocol is **pre-release** and the DuckDB project plans to stabilise 
 The upstream documentation has two surfaces with mismatched naming:
 
 - **README + source code**: `quack_serve`, `quack_stop`, `quack:` URI scheme, HTTP endpoint `POST /quack`, content type `application/vnd.duckdb`.
-- **`docs/usage.md` and FAQ**: `rpc_start`, `rpc_stop`, `POST /rpc`, MIME type `application/duckdb`.
+- **duckdb-quack `docs/usage.md` and FAQ**: `rpc_start`, `rpc_stop`, `POST /rpc`, MIME type `application/duckdb`.
 
 The source is authoritative. The `rpc_*` doc names appear to be an older or aspirational naming. We follow the source.
 

@@ -231,7 +231,7 @@ Five MRs over a week. Phase A through Phase G:
 - **Phase F** (sqe-cli): embedded mode wiring.
 - **Phase G** (sqe-coordinator): wiremock REST integration tests + the lifecycle fix.
 
-Then Phase H: the docs you are reading now. Operator reference at `docs/book/src/operations/catalogs.md`. Narrative chapter for the ebook at `docs/ebook/chapters/06c-attaching-at-runtime.md`. This blog post.
+Then Phase H: the docs you are reading now. Operator reference at `docs/site/book/src/operations/catalogs.md`. Narrative chapter for the ebook at `docs/site/ebook/chapters/06c-attaching-at-runtime.md`. This blog post.
 
 ## The pattern that is starting to repeat
 
@@ -256,4 +256,4 @@ sqe> INSERT INTO local.tutorial.events VALUES (1, NOW());
 sqe> SELECT * FROM local.tutorial.events;
 ```
 
-That is the whole loop. Reference: [`docs/book/src/operations/catalogs.md`](https://github.com/sbp/sqe/blob/main/docs/book/src/operations/catalogs.md).
+That is the whole loop. Reference: [`docs/site/book/src/operations/catalogs.md`](https://github.com/sbp/sqe/blob/main/docs/site/book/src/operations/catalogs.md).

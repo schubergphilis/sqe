@@ -1,6 +1,6 @@
 # Public Iceberg Matrix Comparison
 
-Side-by-side comparison of every Iceberg engine on the public scoreboard at [icebergmatrix.org](https://icebergmatrix.org). Source rubric: [Neuw84/iceberg-matrix](https://github.com/Neuw84/iceberg-matrix). SQE data lives in [`docs/iceberg-matrix-state.json`](./iceberg-matrix-state.json) and is rendered in detail in [`docs/iceberg-matrix.md`](./iceberg-matrix.md).
+Side-by-side comparison of every Iceberg engine on the public scoreboard at [icebergmatrix.org](https://icebergmatrix.org). Source rubric: [Neuw84/iceberg-matrix](https://github.com/Neuw84/iceberg-matrix). SQE data lives in [`docs/iceberg-matrix-state.json`](../../evidence/iceberg-matrix-state.json) and is rendered in detail in [`docs/iceberg-matrix.md`](./iceberg-matrix.md).
 
 Each cell shows V2/V3 status. Glyphs:
 
@@ -187,7 +187,7 @@ SQE first, then Snowflake, Databricks, AWS, GCP, and Azure offerings. EMR / Glue
 
 ## How to read the cells
 
-A cell like `F/F` means full support on V2 and V3. `F/P` means full V2 with a known caveat on V3. `./F` means the feature is V3-only in the rubric. `./.` means neither version is supported (or not implemented yet). The exact caveats per engine live in the upstream platform JSONs at [`Neuw84/iceberg-matrix/src/data/platforms/`](https://github.com/Neuw84/iceberg-matrix/tree/main/src/data/platforms); SQE caveats live in [`docs/iceberg-matrix-state.json`](./iceberg-matrix-state.json).
+A cell like `F/F` means full support on V2 and V3. `F/P` means full V2 with a known caveat on V3. `./F` means the feature is V3-only in the rubric. `./.` means neither version is supported (or not implemented yet). The exact caveats per engine live in the upstream platform JSONs at [`Neuw84/iceberg-matrix/src/data/platforms/`](https://github.com/Neuw84/iceberg-matrix/tree/main/src/data/platforms); SQE caveats live in [`docs/iceberg-matrix-state.json`](../../evidence/iceberg-matrix-state.json).
 
 ## SQE specifics
 

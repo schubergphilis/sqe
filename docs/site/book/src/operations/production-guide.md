@@ -2,7 +2,7 @@
 
 How to run SQE in production when you start small but expect to scale data volume, query concurrency, and team count significantly. The goal is one honest configuration path you extend over time, not a throwaway dev stack you replace at scale.
 
-For the full security, performance, quality, and observability audit, see [`docs/internal/audit/2026-07-10-sqe-full-audit.md`](internal/audit/2026-07-10-sqe-full-audit.md).
+For the full security, performance, quality, and observability audit, see `docs/internal/audit/2026-07-10-sqe-full-audit.md`.
 
 ---
 
@@ -78,7 +78,7 @@ spool_path = "/var/spool/sqe-ol"
 emit_selects = false            # enable only when read lineage is required
 ```
 
-See [`docs/site/book/src/operations/openlineage.md`](site/book/src/operations/openlineage.md) for sink options and Marquez setup.
+See [`docs/site/book/src/operations/openlineage.md`](./openlineage.md) for sink options and Marquez setup.
 
 ### Catalog
 
@@ -215,7 +215,7 @@ allow_http = false
 allowed_object_store_prefixes = ["s3://prod-warehouse/"]
 ```
 
-Environment overrides follow the usual `SQE_*` / `SQE_METRICS__*` conventions (see [`sqe.toml.example`](../sqe.toml.example) and [`docs/site/book/src/deployment/configuration.md`](site/book/src/deployment/configuration.md)).
+Environment overrides follow the usual `SQE_*` / `SQE_METRICS__*` conventions (see `sqe.toml.example` and [`docs/site/book/src/deployment/configuration.md`](../deployment/configuration.md)).
 
 ---
 
@@ -288,11 +288,11 @@ Route audit logs and traces through an OpenTelemetry Collector when possible. Au
 
 ## Related docs
 
-- [Deployment configuration](site/book/src/deployment/configuration.md)
-- [OpenLineage operations](site/book/src/operations/openlineage.md)
-- [Full audit (2026-07-10)](internal/audit/2026-07-10-sqe-full-audit.md)
-- [Example config](../sqe.toml.example)
-- [QUICKSTART](../QUICKSTART.md) for local validation before production cutover
+- [Deployment configuration](../deployment/configuration.md)
+- [OpenLineage operations](./openlineage.md)
+- Full audit: `docs/internal/audit/2026-07-10-sqe-full-audit.md` (repo only, not published)
+- Example config: `sqe.toml.example` in the repo root
+- `QUICKSTART.md` in the repo root for local validation before production cutover
 ## Recent Audit Remediation Notes (2026-07-11)
 
 - `[rate_limit]` section and full production examples now documented in `sqe.toml.example` (see MRs !590, !591).

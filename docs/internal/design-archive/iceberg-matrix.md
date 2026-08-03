@@ -156,7 +156,7 @@ For the public matrix submission workflow see `openspec/changes/iceberg-matrix-p
 
 ## See also
 
-- [Full openspec change](../openspec/changes/iceberg-matrix-parity/proposal.md) with proposal, design, 8 spec files, and tasks
-- [Source roadmap](./superpowers/plans/2026-04-24-iceberg-matrix-parity.md) with upstream research and deferral rationale
+- [Full openspec change](../../../openspec/changes/iceberg-matrix-parity/proposal.md) with proposal, design, 8 spec files, and tasks
+- [Source roadmap](../plans/2026-04-24-iceberg-matrix-parity.md) with upstream research and deferral rationale
 - [Matrix parity workflow](./matrix-parity-workflow.md) for per-phase branching conventions
 - [Tracking issue body](./matrix-parity-tracking-issue.md)

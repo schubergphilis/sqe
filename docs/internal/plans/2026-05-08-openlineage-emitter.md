@@ -1957,7 +1957,7 @@ Voice rules: no emdash/endash/Unicode arrows, no AI-tells. Run the same `grep -n
 
 - [ ] **Step 2: Add to SUMMARY.md**
 
-Add `- [Lineage (OpenLineage)](./operations/openlineage.md)` under the existing Operations section (find the right parent in current SUMMARY.md).
+Add `- [Lineage (OpenLineage)](../../site/book/src/operations/openlineage.md)` under the existing Operations section (find the right parent in current SUMMARY.md).
 
 - [ ] **Step 3: Build the book**
 

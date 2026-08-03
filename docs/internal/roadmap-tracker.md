@@ -2,7 +2,7 @@
 
 ## Iceberg matrix coverage
 
-**Score: 167/189 (88.4%)** on the public [icebergmatrix.org](https://icebergmatrix.org) scoreboard, fifth overall behind only Spark distributions (EMR, AWS Glue, OSS Spark, Dataproc). See [`docs/iceberg-matrix.md`](iceberg-matrix.md) for the per-cell breakdown and [`docs/iceberg-matrix-compare.md`](iceberg-matrix-compare.md) for the V2/V3 comparison against every other engine on the public scoreboard.
+**Score: 167/189 (88.4%)** on the public [icebergmatrix.org](https://icebergmatrix.org) scoreboard, fifth overall behind only Spark distributions (EMR, AWS Glue, OSS Spark, Dataproc). See [`docs/internal/design-archive/iceberg-matrix.md`](./design-archive/iceberg-matrix.md) for the per-cell breakdown and [`docs/internal/design-archive/iceberg-matrix-compare.md`](./design-archive/iceberg-matrix-compare.md) for the V2/V3 comparison against every other engine on the public scoreboard.
 
 ## Completed
 
@@ -64,7 +64,7 @@
 - [x] JDBC: PostgreSQL, MySQL, SQLite (live test against `docker-compose.test.yml` postgres at V2 and V3)
 - [x] Hadoop storage-only (warehouse path scanner, read-only)
 - [x] Generic loader dispatch through upstream `iceberg-catalog-loader` factory; per-backend wrapper code deleted
-- [x] Runtime catalog mounting via SQL `ATTACH` / `DETACH` and credential management via `CREATE` / `DROP` / `SHOW SECRETS` (DuckDB-shape syntax; same six backends plus SQLite for local prototyping). See `docs/book/src/operations/catalogs.md`.
+- [x] Runtime catalog mounting via SQL `ATTACH` / `DETACH` and credential management via `CREATE` / `DROP` / `SHOW SECRETS` (DuckDB-shape syntax; same six backends plus SQLite for local prototyping). See `docs/site/book/src/operations/catalogs.md`.
 
 ### Auth and security
 
@@ -82,7 +82,7 @@
 - [x] OCSF audit logging (sub-project A): canonical `AuditEvent` + OCSF class mapping (6005/3002/3003/3001/3004), identity enrichment (subject/email/groups claims), GDPR-tag masking (tokenize/drop/keep modes), tamper-evident hash chain. Policy-decision recorded on query event (deny outcome); circuit-breaker events deferred. See `docs/site/book/src/operations/audit-logging.md`.
 - [x] SIEM export (sub-project B): canonical coverage extended to Flight streaming SELECTs + DML/DDL; durable OCSF JSONL spool; background OTLP shipper with seq-cursor at-least-once delivery; OCSF->LogRecord mapping with indexed attributes; five export metrics. Deferred: spool rotation/retention (only `max_spool_bytes` WARN), Kafka target. See `docs/site/book/src/operations/audit-logging.md`.
 - [x] Dashboard gate + client_ip (sub-project C): `web_ui` routes gated behind bearer + admin role (reuses `auth.admin_roles`); dashboard-access audited as OCSF Authentication (grant + Forbidden; anonymous probes metered via counter, not audit spool); dashboard shows `username`/`roles`/`client_ip`/`redact_pii`-masked SQL to authenticated admins; `client_ip` threaded end to end through `execute`/`execute_stream` to tracker + all audit event kinds (buffered, streaming, DML/DDL, GRANT/REVOKE). Completes the A/B/C audit-logging arc. See `docs/site/book/src/operations/audit-logging.md`.
-- [x] OpenLineage 2-0-2 emitter (`sqe-lineage` crate; column-level lineage on INSERT/CTAS/MERGE/UPDATE/DELETE/DDL; file + HTTP sinks; disk-spool fallback; off by default). See `docs/book/src/operations/openlineage.md`.
+- [x] OpenLineage 2-0-2 emitter (`sqe-lineage` crate; column-level lineage on INSERT/CTAS/MERGE/UPDATE/DELETE/DDL; file + HTTP sinks; disk-spool fallback; off by default). See `docs/site/book/src/operations/openlineage.md`.
 - [x] OSS release preparation (Apache 2.0, CONTRIBUTING.md, docs)
 
 ## In Progress
@@ -95,11 +95,11 @@
 - [ ] CoW DML scales to TPC-E SF100 (`cow-dml-parallel-streaming`: parallelise per-file rewrite + stream writes + drop double-WHERE; targets `trade_result_update_holding` under 120 s at SF100)
 - [ ] Parallel + streaming generation for the other 6 benchmarks (SSB, TPC-DS, TPC-C, TPC-E, TPC-BB, ClickBench)
 - [ ] Snowflake Horizon catalog: live integration test against a real Snowflake account (currently REST-compatible, no live test)
-- [ ] V12.2: custom `HfObjectStore` plugged into `LazyHttpObjectStoreRegistry` so `SELECT * FROM 'hf://datasets/foo/bar/**/*.parquet'` enumerates files via the HF tree API and the V12 SQL pre-rewriter retires (design in `docs/hf-glob-research.md`)
+- [ ] V12.2: custom `HfObjectStore` plugged into `LazyHttpObjectStoreRegistry` so `SELECT * FROM 'hf://datasets/foo/bar/**/*.parquet'` enumerates files via the HF tree API and the V12 SQL pre-rewriter retires (design in `docs/site/book/src/design-notes/hf-glob-research.md`)
 
 ## Planned
 
-- [ ] SF100 scaling. The single-node tactics that win at SF1/SF10 (broadcast build sides, in-memory hash tables, single scan stream) invert at SF100. Needs memory-pool discipline under concurrency (cap concurrent sort consumers, bound per-consumer reservations, upstream proactive spill `apache/datafusion#17334`) and a proven multi-node distributed path. Generator must also stream row groups to disk first. Predicted failure modes and evidence in [`docs/perf/sf100-scaling-risks.md`](perf/sf100-scaling-risks.md).
+- [ ] SF100 scaling. The single-node tactics that win at SF1/SF10 (broadcast build sides, in-memory hash tables, single scan stream) invert at SF100. Needs memory-pool discipline under concurrency (cap concurrent sort consumers, bound per-consumer reservations, upstream proactive spill `apache/datafusion#17334`) and a proven multi-node distributed path. Generator must also stream row groups to disk first. Predicted failure modes and evidence in [`docs/evidence/perf/sf100-scaling-risks.md`](../evidence/perf/sf100-scaling-risks.md).
 - [ ] **DataFusion 54 follow-up: ship physical dynamic filters to workers.** SQE currently ships hash-join dynamic filters to workers via a lossy physical-to-logical `Expr` conversion (`scan_pushdown.rs::physical_filter_to_logical`) that drops the hash-set membership, which is why SSB trails when distributed (the star-join selectivity lives in that membership set). DF 54 added `DynamicFilter` protobuf serialization (`datafusion-proto-54`). Gated on a feasibility spike: confirm a serialized `DynamicFilter` carries the membership set *after the build side seals it*, and that SQE can serialize at that point rather than shipping an empty placeholder. If it works, this is the direct fix for the SSB-distributed gap.
 - [ ] **DataFusion 54 follow-up: adopt native-scan wins into the vendored Iceberg reader.** `IcebergScanExec` bypasses DataFusion's native Parquet scan, so DF 54's scan-side improvements do not reach Iceberg queries: struct-field pushdown in the Parquet `RowFilter`, row-group reordering by statistics for TopK queries, and MIN/MAX resolution from Parquet metadata for single-mode aggregates. Port the worthwhile ones into `vendor/iceberg-rust/.../reader.rs`. (NDV-from-metadata is *not* replicable: Iceberg manifests carry min/max/null bounds, not distinct counts. Column min/max/null are already fed to the optimizer via `compute_table_statistics`.) Note: config-default audit (DF 53.1 vs 54) came back clean, so no default pinning is needed.
 - [ ] Full cost-based join enumeration (DataFusion upstream DF#3843)
@@ -109,7 +109,7 @@
 - [ ] Sort-on-write enforcement (writer pass after planner)
 - [ ] Semantic AI layer (RDF/SPARQL, property graph, vector search)
 - [ ] Hash join spill support (DataFusion upstream DF#17267)
-- [ ] Azure ADLS Gen2 / GCS object stores (one-line `Cargo.toml` feature flip + `register_*_store_if_needed` helpers; tracked in [`cli-embedded.md`](cli-embedded.md))
+- [ ] Azure ADLS Gen2 / GCS object stores (one-line `Cargo.toml` feature flip + `register_*_store_if_needed` helpers; tracked in [embedded mode](../site/book/src/features/embedded.md))
 - [ ] Smart-CSV byte sampling (current `read_csv` infers delimiter / codec from path extension; DuckDB samples bytes for the same)
 
 ## Blocked upstream

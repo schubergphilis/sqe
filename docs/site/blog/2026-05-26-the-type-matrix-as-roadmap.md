@@ -21,7 +21,7 @@ DuckDB has, depending on how you count, around forty types. We needed a plan.
 
 ## The matrix
 
-I wrote a markdown file with one row per DuckDB type, four columns: the DuckDB name, the Arrow / DataFusion equivalent, our `LogicalTypeId`, and a verification status (✅ ⚠️ ❌). The file lives at `docs/quack-datatype-matrix.md`. It looked like this after the first pass:
+I wrote a markdown file with one row per DuckDB type, four columns: the DuckDB name, the Arrow / DataFusion equivalent, our `LogicalTypeId`, and a verification status (✅ ⚠️ ❌). The file lives at `docs/site/book/src/quickstart/quack-datatype-matrix.md`. It looked like this after the first pass:
 
 ```
 | BOOLEAN     | Boolean       | Boolean   | ✅ |

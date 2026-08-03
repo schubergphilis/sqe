@@ -6,14 +6,14 @@ by rewriting the query plan. It is separate from the catalog access-control path
 
 For the coarse, catalog-level path (where SQE translates `GRANT`/`REVOKE` into
 Ranger policies on the `polaris` service and Polaris enforces them, and SQE does
-no filtering of its own) see `docs/ranger-access-control.md`. That document is the
+no filtering of its own) see [ranger-access-control.md](./ranger-access-control.md). That document is the
 companion to this one. This document does not repeat it.
 
 ## Overview
 
 The two paths use two different Ranger services and two different config blocks.
 
-- **Catalog path** (`docs/ranger-access-control.md`). `[access_control] backend
+- **Catalog path** ([ranger-access-control.md](./ranger-access-control.md)). `[access_control] backend
   = "ranger"`. SQE writes the `polaris` service; Polaris enforces. Coarse
   allow/deny per catalog operation. SQE does not filter rows or mask columns.
 - **Fine-grained path** (this document). `[policy] engine = "ranger"`. SQE reads
@@ -31,8 +31,8 @@ Why this lives in SQE and not Polaris: the `polaris` service-def declares no
 boolean allow/deny. It cannot enforce row filters or column masks even though the
 Ranger engine can compute them. Fine-grained enforcement has to happen in the
 query engine. The full service-type rationale is in
-`docs/ranger-fine-grained-service-type.md`; the design notes are in
-`docs/fine-grained-policy.md`.
+[ranger-fine-grained-service-type.md](./ranger-fine-grained-service-type.md); the design notes are in
+[fine-grained-policy.md](./fine-grained-policy.md).
 
 ## How it works
 
@@ -332,7 +332,7 @@ Tags as table properties (rather than the Ranger tag store) win on four counts:
 they cover federated catalogs that Polaris cannot gate, they need no Atlas/tagsync
 deployment, they travel with the data through clone/replicate/rename, and SQE
 already reads `table.metadata()` on every scan. The full rationale is in
-`docs/ranger-tag-storage-decision.md`.
+[ranger-tag-storage-decision.md](./ranger-tag-storage-decision.md).
 
 ### Resolution and merge
 
@@ -420,7 +420,7 @@ by `cache_ttl_bounds_policy_staleness`.
 | Does SQE filter? | No (write/read policies only) | Yes (rewrites the plan) |
 | Shared with Spark? | No (Polaris-specific service) | Yes (the `hive` service Kyuubi reads) |
 | Identity matching | Ranger role membership (resolved by Polaris) | token roles, matched directly |
-| Document | `docs/ranger-access-control.md` | this document |
+| Document | [ranger-access-control.md](./ranger-access-control.md) | this document |
 
 Both gates apply to every query. The catalog gate runs first at Polaris; the
 fine-grained rewrite runs in SQE on the loaded plan.
@@ -476,18 +476,18 @@ live setup, and `test.sh` section 5 proves a `MASK_NULL` on `orders.amount` and 
 `xxx-xx-1111` and an empty amount; alice (analyst-only) sees the raw values.
 
 For cross-engine parity with Apache Spark on the same Ranger setup, see
-`docs/sqe-spark-ranger-parity.md`.
+[sqe-spark-ranger-parity.md](./sqe-spark-ranger-parity.md).
 
 Related references:
 
-- `docs/ranger-access-control.md` -- the catalog access-control path (companion).
-- `docs/ranger-fine-grained-service-type.md` -- why the `hive` service-def, the
+- [ranger-access-control.md](./ranger-access-control.md) -- the catalog access-control path (companion).
+- [ranger-fine-grained-service-type.md](./ranger-fine-grained-service-type.md) -- why the `hive` service-def, the
   flattening sharp edge, cross-engine requirements.
-- `docs/ranger-tag-storage-decision.md` -- where tag associations are stored.
-- `docs/fine-grained-policy.md` -- design notes and Snowflake-parity mapping.
+- [ranger-tag-storage-decision.md](./ranger-tag-storage-decision.md) -- where tag associations are stored.
+- [fine-grained-policy.md](./fine-grained-policy.md) -- design notes and Snowflake-parity mapping.
 
 ## Versions
 
-- Apache Polaris 1.5.0 (embedded Ranger authorizer, Beta).
+- Apache Polaris 1.7.0 (embedded Ranger authorizer, Beta).
 - Apache Ranger 2.8.0.
 - Keycloak 26.5.

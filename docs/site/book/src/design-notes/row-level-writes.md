@@ -2,7 +2,7 @@
 
 ## Summary
 
-Row-level write operations (MERGE INTO, DELETE FROM, UPDATE) are **implemented** for Iceberg tables via Copy-on-Write using the iceberg-rust fork vendored at `vendor/iceberg-rust/`, which provides the `rewrite_files()` transaction API. The fork tracks `risingwavelabs/iceberg-rust` and is rebased onto DataFusion 53.1 + Arrow 58 (see `docs/blog/2026-04-14-datafusion-53-and-the-iceberg-fork.md`).
+Row-level write operations (MERGE INTO, DELETE FROM, UPDATE) are **implemented** for Iceberg tables via Copy-on-Write using the iceberg-rust fork vendored at `vendor/iceberg-rust/`, which provides the `rewrite_files()` transaction API. The fork tracks `risingwavelabs/iceberg-rust` and is rebased onto DataFusion 53.1 + Arrow 58 (see `docs/site/blog/2026-04-14-datafusion-53-and-the-iceberg-fork.md`).
 
 ## Motivation
 

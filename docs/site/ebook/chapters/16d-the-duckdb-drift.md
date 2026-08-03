@@ -29,7 +29,7 @@ V8 enabled `enable_url_table()` on the SQE session and added three TVFs: `read_p
 
 ## The DuckDB-shaped audit
 
-The right response to "we should be more like DuckDB" is "where, exactly?" We wrote `docs/duckdb-comparision.md`: a flat table with two columns. What DuckDB has. Whether SQE has it. We checked every line.
+The right response to "we should be more like DuckDB" is "where, exactly?" We wrote `docs/site/compare/duckdb-comparision.md`: a flat table with two columns. What DuckDB has. Whether SQE has it. We checked every line.
 
 Two findings worth quoting. First, there were features we had that we never documented. `array_append` works. `map_keys` works. `cosh`, `sinh`, `tanh` work. `QUALIFY` works (in DataFusion 53). The `->`/`->>` JSON operators work via `datafusion-functions-json`. The matrix audit had been treating these as gaps in our documentation, not gaps in our engine. That alone closed eight rows.
 
