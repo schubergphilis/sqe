@@ -131,3 +131,216 @@ Polaris runs `in-memory` here and had restarted, so the table did not exist and
 carol got the same 404. Ranger policies live in Postgres and survive; Polaris
 state does not. Any experiment on this stack needs an admin control proving the
 object exists before a denial can be read as a denial.
+
+---
+
+# Follow-up, 2026-08-03: which half of the traversal SQE can write for you
+
+The question this raised: if the traversal is load-bearing and mechanical, why is
+the operator typing it? Answered by splitting the two levels and testing them
+separately rather than treating "the traversal" as one thing.
+
+## The namespace level is mechanical. The catalog level is a decision.
+
+Isolated live, one variable at a time, on the 1.7 stack:
+
+| dave holds | `SELECT count(*) FROM sales_wh.acdemo.orders` |
+|---|---|
+| catalog `namespace-list` + table `SELECT` | `table 'sales_wh.acdemo.orders' not found` |
+| the same, plus `{catalog, namespace}` `namespace-properties-read` | 3 rows |
+
+carol (admin) read 3 rows throughout, so the table existed for every reading. The
+second row differs from the first by ONE access type, written by hand onto the
+existing `{namespace: acdemo, catalog: sales_wh}` policy and reverted afterward.
+
+That makes the namespace level a completion of the statement: it is an ancestor on
+the path to the table the operator named, required to reach it, conferring nothing
+about anything outside that path. `build_grant_plan` now writes it.
+
+The catalog level is categorically different and stays explicit. Catalog-level
+`namespace-list` lets its holder enumerate every namespace name in the catalog,
+including ones unrelated to the granted table, so auto-adding it would widen the
+blast radius of every `GRANT SELECT` while reporting success. It is also granted
+once per role rather than once per table, so the ergonomic argument for automating
+it is weak. Three statements became two, and the one left is the one that costs
+something.
+
+## Two bugs found while establishing this, neither caused by the change
+
+**`SHOW SCHEMAS FROM <catalog>` can answer about a different catalog.** With
+`[catalog] warehouse = "sales_wh"`, `SHOW SCHEMAS FROM sales_wh` and
+`SHOW SCHEMAS FROM ops_wh` both returned `ops`, `ac` -- ops_wh's namespaces, while
+sales_wh actually holds `sales`, `ac`, `acdemo` (confirmed from Polaris's own
+`GET /v1/sales_wh/namespaces`). Cause is in `show_catalog`: the explicit name is
+preferred, then the guard `cat != self.config.catalog.warehouse` discards it for
+the one case where the named catalog IS the configured default, falling through to
+`session_catalog(session)`, which re-resolves from the session default. So the
+qualifier silently loses exactly when it names the default warehouse.
+
+This matters beyond ergonomics: `SHOW SCHEMAS` is what an operator uses to confirm
+a grant took effect, and here it reports on a catalog they did not ask about. It
+also cost real time in this investigation, first by making a fixture table look
+absent (it was not) and then by making `USAGE` look insufficient for discovery (it
+is sufficient; Polaris logged 200 on both the list and the probe).
+
+**`SqeCatalogProvider::schema()` wedges when every namespace probe denies.** A
+principal who can list a catalog's namespaces while all per-namespace probes 403
+hangs indefinitely instead of reporting "table not found". Stack captured with
+`sample`:
+
+```
+QueryHandler::execute_query -> SessionContext::sql
+  -> SqeCatalogProvider::schema -> contains_namespace
+    -> sqe_catalog::runtime_bridge::block_on_compat
+      -> std::thread::JoinHandle::join -> pthread_join -> __ulock_wait
+```
+
+Same re-entrant-`block_on` family as #195. It reproduces on a current-thread
+runtime (`#[tokio::test]`'s default) and not through the container, whose runtime
+is multi-threaded, which is why the CLI answered "table not found" promptly in the
+same state. Reachable in production by any principal holding catalog discovery and
+no namespace visibility -- a state a `REVOKE USAGE ON SCHEMA` produces. It is why
+`one_table_grant_writes_the_namespace_it_needs` asserts its pre-state from the
+Ranger policy rather than by having dave attempt a read.
+
+---
+
+# Reversal, 2026-08-03: the catalog level is auto-granted after all
+
+The follow-up above concluded that SQE should write the namespace level and refuse
+the catalog level, on the grounds that catalog-wide `namespace-list` exposes
+sibling namespace names unrelated to the granted table. The reasoning holds; the
+conclusion was wrong, and this records why so the argument is not re-run.
+
+`grant-profile.json` v4 specifies the catalog level for every privilege that
+reaches into a catalog:
+
+```
+SELECT   catalog:[namespace-list] | namespace:[namespace-properties-read] | table:[table-data-read]
+INSERT   catalog:[namespace-list] | namespace:[namespace-properties-read] | table:[table-data-write]
+                                                exclude table-location-set, table-uuid-assign, table-format-version-upgrade
+MANAGE   catalog:[catalog-content-manage]
+```
+
+The data-platform control plane generates its Ranger policies from that file, and
+both it and SQE write to the same `polaris` service. Two consequences settle it:
+
+1. A SQL grant producing different policies from the equivalent API call makes
+   "who granted this, and does it confer the same thing" unanswerable. Provenance
+   labels do not help, because the divergence is in the access types, not the
+   attribution.
+2. The drift gate specified in §8 of the handoff compares `plan_grant` output to
+   the profile's fixtures byte for byte. A deliberately narrower plan fails it by
+   construction, so the narrowing could not coexist with the mechanism that keeps
+   the two implementations honest.
+
+The widening is therefore accepted and documented as a cost of every table grant,
+rather than presented as something SQE refuses. Where namespace names are
+themselves sensitive, the boundary that actually works is a separate catalog, not
+a narrower grant.
+
+Also settled by reading the same contract: the provenance prefix is `chm`, not
+`sqe` (`provenance.py:45`), and labels go on the DEEPEST level only. Catalog and
+namespace policies are shared plumbing; stamping them with one grantee's privilege
+misrepresents them as privately owned and invites a later revoke to release
+traversal another grant still depends on. The `sqe:traversal:` marker introduced
+by the earlier version is gone.
+
+`INSERT`'s `exclude` list is worth noting for the record: it is subtracted AFTER
+the `impliedGrants` closure, never held out of the seeds, because
+`table-data-write`'s closure is required to commit an Iceberg snapshot but also
+drags in `table-location-set`, which `INSERT` must not confer. SQE's hand-written
+`WRITE_ACCESS` still carries `table-location-set`, so that divergence closes with
+profile adoption rather than separately.
+
+---
+
+# The read-path wedge has TWO causes, 2026-08-03
+
+The hang recorded above (`contains_namespace` -> `block_on_compat` ->
+`pthread_join` -> `__ulock_wait`) is not one bug. Fixing the obvious one leaves the
+hang in place, so both are written down here.
+
+## Cause 1: core contention. FIXED.
+
+`block_on_compat`'s current-thread branch spawned an OS thread and called
+`handle.block_on(fut)` on the CALLER'S runtime, then blocked the parent in
+`join()`. A current-thread runtime has one core. Every real call site is a
+synchronous DataFusion hook (`CatalogProvider::schema`, `SchemaProvider::table`, a
+TVF's `call`) reached from inside a task being polled, so the caller already holds
+that core and keeps holding it while it waits. The child waits for the core the
+parent holds; the parent waits for the child. A pure deadlock, independent of any
+I/O.
+
+Fixed by giving the spawned thread a runtime of its own.
+
+**Why no test caught it:** `block_on_compat_works_on_current_thread` calls the
+bridge from a thread OUTSIDE the runtime, so the core is free. That is not the
+shape of any production call site. The test passed for months while the
+production path deadlocked, and it still passes against the broken implementation
+today. The replacement,
+`does_not_deadlock_when_the_caller_holds_the_current_thread_core`, drives a
+current-thread runtime from a scratch thread and calls the bridge INLINE from the
+task body, then bounds the wait with `recv_timeout` so a regression fails with a
+message instead of hanging the suite. Mutation-verified against the old code.
+
+## Cause 2: the future's I/O belongs to the parked runtime. NOT FIXED.
+
+With cause 1 fixed the query still hangs, and a `sample` of the child thread shows
+why: it is running its own runtime and parked in its own IO driver, waiting for a
+connection whose hyper task lives on the PARENT runtime's reactor. The parent is
+blocked in `join()`, so that reactor is not being driven and the response can never
+arrive.
+
+This is not fixable inside `block_on_compat`. Parking the caller's runtime is the
+whole strategy, and on a current-thread runtime the caller IS the only thread, so
+any future that awaits I/O owned by that runtime cannot complete while the bridge
+is blocking on it. The observable symptom is identical to cause 1, which is why
+one looked like the whole story.
+
+The shape of a real fix is a dedicated, always-running IO runtime that owns catalog
+and object-store futures and the clients they use, so that parking a session's
+runtime never stalls the I/O those futures depend on. That is an architectural
+change with its own blast radius (where clients are constructed, connection-pool
+ownership, shutdown), so it wants its own spec rather than being bolted onto this.
+
+Until then the state remains reachable: catalog discovery with no visible namespace
+hangs rather than denying. `tokio::time::timeout` around the query does NOT bound
+it, which is worth knowing before someone reaches for that mitigation: the bridge
+blocks the runtime thread synchronously, so the timer is never polled and the
+timeout never fires. That also rules out an e2e regression test for now, since a
+test that reproduces the state cannot fail cleanly, only hang.
+
+## Reachability: NOT the server. Corrected.
+
+An earlier draft of this note called the wedge production-reachable and ranked it
+above everything else queued. That was wrong, and the correction matters because it
+was used to set priorities.
+
+Both coordinator entry points build `new_multi_thread` runtimes
+(`sqe-coordinator/src/main.rs`, `bin/sqe_server.rs`), and `sqe-cli` uses
+`#[tokio::main]`, which is also multi-thread. The multi-thread branch of
+`block_on_compat` uses `block_in_place` + `handle.block_on`, which neither
+contends for a single core nor parks the reactor: other worker threads keep
+driving it. So neither cause reaches a deployed SQE.
+
+The only current-thread runtimes in the tree are in tests. Exposure is therefore:
+
+- `#[tokio::test]`, whose default flavor is current-thread. This is what made the
+  access-control e2e suite hang, twice, and it will bite any future test that
+  reaches a sync catalog hook.
+- any future embedding that chooses a current-thread runtime. The bridge exists
+  precisely to support that (issue #83), so the trap is latent rather than absent.
+
+Cause 1 is worth fixing on its own terms: it is a real defect in a bridge whose
+whole purpose is to make current-thread work, and it was masked by a test that
+called it from outside the runtime. Cause 2 keeps the current-thread branch unsafe
+for I/O futures regardless, so the bridge should not be treated as
+flavor-agnostic until a dedicated IO runtime exists.
+
+Related prior art in this repo, and the same lesson: the `#195` guard on
+`persistent_warehouse_survives_client_restart` (`sqe-cli/src/embedded.rs`) records
+that `tokio::time::timeout` cannot bound a blocking wedge because the timer never
+runs, and that the only workable guard is an OS-level one -- a sacrificial thread
+with its own runtime, joined with a hard deadline. The unit test added here uses
+that same pattern.
