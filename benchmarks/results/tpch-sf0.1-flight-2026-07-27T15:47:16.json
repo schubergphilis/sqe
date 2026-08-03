@@ -1,0 +1,151 @@
+{
+  "benchmark": "tpch",
+  "scale_factor": 0.1,
+  "protocol": "flight",
+  "timestamp": "2026-07-27T15:47:16",
+  "summary": {
+    "total": 22,
+    "pass": 20,
+    "fail": 0,
+    "diff": 0,
+    "skip": 0,
+    "error": 2,
+    "total_duration_ms": 8187
+  },
+  "queries": [
+    {
+      "id": "q01",
+      "status": "pass",
+      "duration_ms": 779,
+      "rows": 4
+    },
+    {
+      "id": "q02",
+      "status": "pass",
+      "duration_ms": 434,
+      "rows": 48
+    },
+    {
+      "id": "q03",
+      "status": "pass",
+      "duration_ms": 618,
+      "rows": 10
+    },
+    {
+      "id": "q04",
+      "status": "pass",
+      "duration_ms": 190,
+      "rows": 5
+    },
+    {
+      "id": "q05",
+      "status": "pass",
+      "duration_ms": 457,
+      "rows": 5
+    },
+    {
+      "id": "q06",
+      "status": "pass",
+      "duration_ms": 42,
+      "rows": 1
+    },
+    {
+      "id": "q07",
+      "status": "pass",
+      "duration_ms": 1271,
+      "rows": 4
+    },
+    {
+      "id": "q08",
+      "status": "pass",
+      "duration_ms": 529,
+      "rows": 2
+    },
+    {
+      "id": "q09",
+      "status": "pass",
+      "duration_ms": 623,
+      "rows": 175
+    },
+    {
+      "id": "q10",
+      "status": "pass",
+      "duration_ms": 228,
+      "rows": 20
+    },
+    {
+      "id": "q11",
+      "status": "pass",
+      "duration_ms": 188,
+      "rows": 99
+    },
+    {
+      "id": "q12",
+      "status": "error",
+      "duration_ms": 171,
+      "rows": 0,
+      "message": "Failed to collect record batches: Tonic error: code: 'Internal error', message: \"Arrow error: Invalid argument error: Invalid comparison operation: Int64 == Utf8\""
+    },
+    {
+      "id": "q13",
+      "status": "pass",
+      "duration_ms": 176,
+      "rows": 37
+    },
+    {
+      "id": "q14",
+      "status": "pass",
+      "duration_ms": 39,
+      "rows": 1
+    },
+    {
+      "id": "q15",
+      "status": "pass",
+      "duration_ms": 138,
+      "rows": 0
+    },
+    {
+      "id": "q16",
+      "status": "pass",
+      "duration_ms": 49,
+      "rows": 2826
+    },
+    {
+      "id": "q17",
+      "status": "pass",
+      "duration_ms": 330,
+      "rows": 1
+    },
+    {
+      "id": "q18",
+      "status": "pass",
+      "duration_ms": 551,
+      "rows": 100
+    },
+    {
+      "id": "q19",
+      "status": "error",
+      "duration_ms": 184,
+      "rows": 0,
+      "message": "Failed to collect record batches: Tonic error: code: 'Internal error', message: \"Arrow error: Invalid argument error: column types must match schema types, expected Decimal128(15, 2) but found Utf8 at column index 0\""
+    },
+    {
+      "id": "q20",
+      "status": "pass",
+      "duration_ms": 161,
+      "rows": 18
+    },
+    {
+      "id": "q21",
+      "status": "pass",
+      "duration_ms": 916,
+      "rows": 36
+    },
+    {
+      "id": "q22",
+      "status": "pass",
+      "duration_ms": 113,
+      "rows": 7
+    }
+  ]
+}
