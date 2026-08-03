@@ -870,8 +870,26 @@ pub fn entry_matches_grantee(entry: &GrantEntry, grantee: &Grantee) -> bool {
     entry.grantee_type == want_type && entry.grantee_name == grantee.name()
 }
 
-/// Prefix for SQE's provenance labels on a Ranger policy.
-const LABEL_PREFIX: &str = "sqe";
+/// Prefix marking a Ranger policy label as access provenance.
+///
+/// `chm`, NOT `sqe`, and that is load-bearing rather than cosmetic. SQE and the
+/// data-platform control plane write to the SAME Ranger `polaris` service, and
+/// both consult these labels to decide what a REVOKE must hold back. A private
+/// prefix would make each tool blind to the other's provenance and fall straight
+/// back to the cascade this mechanism exists to prevent: SQE would strip a grant
+/// the platform had made, and the platform would strip SQE's.
+///
+/// Mirrors `data-platform/backend/data_platform/access/provenance.py`
+/// (`LABEL_PREFIX = "chm"`). Ranger labels are a shared namespace; keep the two
+/// in lockstep.
+const LABEL_PREFIX: &str = "chm";
+
+/// Grantee types a provenance label may name.
+///
+/// USER and ROLE only, matching `provenance.py`'s `_GRANTEE_TYPES`. A GROUP is
+/// NOT a third kind: the platform materialises every Keycloak group as a Ranger
+/// role of the identical name, so a group grantee is labelled `ROLE`.
+const LABEL_GRANTEE_TYPES: &[&str] = &["USER", "ROLE"];
 
 /// The provenance label recording that ONE `GRANT` statement is responsible for
 /// part of a policy: `sqe:<GRANTEE_TYPE>:<name>:<PRIVILEGE>`.
@@ -890,15 +908,18 @@ const LABEL_PREFIX: &str = "sqe";
 /// third statement removed dave's policy item outright, so an admin narrowing a
 /// user's write access silently took away their read access as well.
 fn grant_label(grantee: &Grantee, privilege: &str) -> String {
+    // A GROUP is labelled ROLE, not GROUP. The platform materialises every
+    // Keycloak group as a Ranger role of the identical name, so the two tools must
+    // agree that a group grantee's provenance lives under ROLE, or a revoke on one
+    // side cannot see what the other granted.
     let kind = match grantee {
         Grantee::User(_) => "USER",
-        Grantee::Role(_) => "ROLE",
-        Grantee::Group(_) => "GROUP",
+        Grantee::Role(_) | Grantee::Group(_) => "ROLE",
     };
     format!(
         "{LABEL_PREFIX}:{kind}:{}:{}",
         grantee.name(),
-        privilege.to_uppercase()
+        privilege.trim().to_uppercase()
     )
 }
 
@@ -938,14 +959,30 @@ fn is_traversal_label(label: &str) -> bool {
 fn parse_grant_label(label: &str) -> Option<(String, String, String)> {
     let rest = label.strip_prefix(&format!("{LABEL_PREFIX}:"))?;
     let (kind, rest) = rest.split_once(':')?;
-    if !matches!(kind, "USER" | "ROLE" | "GROUP") {
+    let kind = kind.trim().to_uppercase();
+    if !LABEL_GRANTEE_TYPES.contains(&kind.as_str()) {
         return None;
     }
     let (name, privilege) = rest.rsplit_once(':')?;
     if name.is_empty() || privilege.is_empty() {
         return None;
     }
-    Some((kind.to_string(), name.to_string(), privilege.to_string()))
+    // The privilege must round-trip to one SQE actually maps. Without this a
+    // label naming anything at all reaches `map_sql_to_ranger_access_for`, whose
+    // pass-through arm turns an unrecognised privilege into a literal access type
+    // -- so a forged or hand-edited label could make revoke hold back an access
+    // type nobody granted, forever. That is an UNDER-revoke, the one direction
+    // worse than the cascade this mechanism replaces, so it fails closed to "no
+    // provenance" and the caller cascades.
+    //
+    // Deliberately stricter than the grant path, which allows a native Polaris
+    // access type to be named directly: such a grant simply gets no provenance.
+    let privilege = privilege.trim().to_uppercase();
+    if !MAPPED_PRIVILEGES.contains(&privilege.as_str()) {
+        warn!(%label, "ignoring access-provenance label: unknown privilege");
+        return None;
+    }
+    Some((kind, name.to_string(), privilege))
 }
 
 /// Every Ranger role the named user belongs to, following nested roles.
@@ -2305,7 +2342,7 @@ mod tests {
     #[test]
     fn a_provenance_label_round_trips() {
         let l = grant_label(&Grantee::User("dave".into()), "select");
-        assert_eq!(l, "sqe:USER:dave:SELECT", "privilege is normalised upward");
+        assert_eq!(l, "chm:USER:dave:SELECT", "privilege is normalised upward");
         assert_eq!(
             parse_grant_label(&l),
             Some(("USER".into(), "dave".into(), "SELECT".into()))
@@ -2317,6 +2354,65 @@ mod tests {
     }
 
     #[test]
+    fn the_label_format_mirrors_the_platforms_byte_for_byte() {
+        // SQE and the data-platform control plane write to the SAME Ranger
+        // `polaris` service and both read these labels to decide what a REVOKE
+        // must hold back. A private prefix makes each blind to the other and both
+        // fall back to the cascade, which is the bug this mechanism exists to
+        // prevent -- SQE would strip a grant the platform made, and vice versa.
+        //
+        // These literals are copied from
+        // data-platform/backend/data_platform/access/provenance.py.
+        assert_eq!(
+            grant_label(&Grantee::User("alice".into()), "SELECT"),
+            "chm:USER:alice:SELECT"
+        );
+        assert_eq!(
+            grant_label(&Grantee::Role("ws-sales-members".into()), "MODIFY"),
+            "chm:ROLE:ws-sales-members:MODIFY"
+        );
+    }
+
+    #[test]
+    fn a_group_grantee_is_labelled_role() {
+        // The platform materialises every Keycloak group as a Ranger role of the
+        // identical name, so there is no GROUP provenance type. Labelling a group
+        // grant "GROUP" would hide it from the platform's parser (its
+        // _GRANTEE_TYPES is {USER, ROLE}) and from ours.
+        assert_eq!(
+            grant_label(&Grantee::Group("ws-sales-members".into()), "SELECT"),
+            "chm:ROLE:ws-sales-members:SELECT",
+            "a group is a Ranger role by the same name"
+        );
+        assert_eq!(
+            grant_label(&Grantee::Group("g".into()), "SELECT"),
+            grant_label(&Grantee::Role("g".into()), "SELECT"),
+            "a group and a role of the same name must share provenance"
+        );
+    }
+
+    #[test]
+    fn a_label_naming_an_unmapped_privilege_is_dropped() {
+        // The grant path deliberately lets an operator name a native Polaris
+        // access type directly. Accepting that back on the READ path would let a
+        // forged or hand-edited label push an arbitrary string through
+        // map_sql_to_ranger_access_for's pass-through arm, so revoke would hold
+        // back an access type nobody granted -- an under-revoke, which is worse
+        // than the cascade. Fails closed to "no provenance" instead.
+        assert_eq!(parse_grant_label("chm:USER:dave:TABLE-SNAPSHOT-ADD"), None);
+        assert_eq!(parse_grant_label("chm:USER:dave:NONSENSE"), None);
+        // Every mapped privilege still round-trips, so the guard is not simply
+        // rejecting everything.
+        for p in MAPPED_PRIVILEGES {
+            let l = grant_label(&Grantee::User("dave".into()), p);
+            assert!(
+                parse_grant_label(&l).is_some(),
+                "mapped privilege {p} must round-trip through its label"
+            );
+        }
+    }
+
+    #[test]
     fn a_grantee_name_containing_a_colon_still_parses() {
         // Ranger accepts names with colons, and the label format uses colons as
         // separators. The type comes off the front and the privilege off the
@@ -2324,7 +2420,7 @@ mod tests {
         // attributing one grantee's access types to another.
         let g = Grantee::User("realm:dave".into());
         let l = grant_label(&g, "SELECT");
-        assert_eq!(l, "sqe:USER:realm:dave:SELECT");
+        assert_eq!(l, "chm:USER:realm:dave:SELECT");
         assert_eq!(
             parse_grant_label(&l),
             Some(("USER".into(), "realm:dave".into(), "SELECT".into()))
@@ -2337,8 +2433,8 @@ mod tests {
         // hold back access types the grantee is not owed, which reads as a
         // successful revoke that did nothing.
         for bad in [
-            "sqe:USER:dave",           // no privilege
-            "sqe:WIZARD:dave:SELECT",  // unknown grantee kind
+            "chm:USER:dave",           // no privilege
+            "chm:WIZARD:dave:SELECT",  // unknown grantee kind
             "other:USER:dave:SELECT",  // not ours
             "sqe:USER::SELECT",        // empty name
             "sqe:USER:dave:",          // empty privilege
