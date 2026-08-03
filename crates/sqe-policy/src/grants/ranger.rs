@@ -1,5 +1,5 @@
 //! RangerGrantBackend — translates GRANT/REVOKE/SHOW GRANTS into Apache Ranger
-//! Admin REST calls. Enforcement is delegated to Polaris 1.5's embedded Ranger
+//! Admin REST calls. Enforcement is delegated to Polaris's embedded Ranger
 //! authorizer; this backend only writes/reads Ranger policies.
 //!
 //! Ranger service-def: `polaris`. Resource hierarchy: root -> catalog ->

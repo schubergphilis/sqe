@@ -3,7 +3,7 @@
 Two independent gates run on every query.
 
 **Polaris gates the catalog.** `GRANT` and `REVOKE` in SQE become Apache Ranger
-policies on the `polaris` service, and Polaris 1.5's embedded Ranger authorizer
+policies on the `polaris` service, and Polaris's embedded Ranger authorizer
 enforces them. This answers "may this user load this object at all". SQE does no
 filtering on this axis.
 
