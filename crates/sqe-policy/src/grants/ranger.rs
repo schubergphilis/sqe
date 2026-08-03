@@ -99,6 +99,21 @@ const VIEW_READ_ACCESS: &[&str] = &["view-properties-read", "view-list"];
 /// at `{catalog: sales_wh, namespace: acdemo}` turned the same query into 3 rows.
 const NAMESPACE_VISIBILITY_ACCESS: &str = "namespace-properties-read";
 
+/// The catalog-level access type that lets a principal LIST a catalog's
+/// namespaces (`LIST_NAMESPACES`).
+///
+/// Polaris does not use Ranger's `SELF_OR_DESCENDANTS` matching, so a
+/// namespace-scoped `namespace-list` does not satisfy it: listing is denied
+/// outright rather than filtered, which is why this has to sit at the catalog
+/// level.
+///
+/// Granting it confers enumeration of every namespace NAME in the catalog,
+/// including namespaces unrelated to the object being granted. That cost is real
+/// and is documented, but it is what `grant-profile.json` v4 specifies for every
+/// privilege that reaches into a catalog, and SQE writes the same policies as the
+/// control plane or the two disagree about what a grant means.
+const CATALOG_DISCOVERY_ACCESS: &str = "namespace-list";
+
 fn to_vec(xs: &[&str]) -> Vec<String> {
     xs.iter().map(|s| s.to_string()).collect()
 }
@@ -481,31 +496,42 @@ impl RangerGrantBackend {
         })
     }
 
-    /// The full set of Ranger policies one `GRANT` has to write, ancestor first.
+    /// The full set of Ranger policies one `GRANT` has to write, outermost first.
     ///
-    /// A table-level privilege needs the namespace holding that table to be
-    /// visible, or the grant is inert: the grantee is told the table does not
-    /// exist. So `GRANT SELECT ON cat.ns.tbl` writes a namespace-level
-    /// `namespace-properties-read` as well as the table-level access types,
-    /// turning what used to be two statements into one.
+    /// A privilege is not one policy. Reaching `cat.ns.tbl` needs the catalog to
+    /// be listable and the namespace to be visible as well as the table to be
+    /// readable, so `GRANT SELECT ON cat.ns.tbl` writes three policies and the
+    /// operator writes one statement. Before this, the two outer levels had to be
+    /// typed by hand, and a grant that omitted them reported success while the
+    /// grantee got "table not found".
     ///
-    /// The CATALOG level is deliberately NOT included. Catalog-level
-    /// `namespace-list` lets its holder enumerate every namespace name in the
-    /// catalog, including ones with nothing to do with the table being granted,
-    /// so a namespace called `pii_customer_health` would become visible as a side
-    /// effect of a grant on an unrelated table. That is the same silent widening
-    /// `reject_scope_deeper_than_level` refuses, and doing it here would be worse
-    /// because it would report success. It stays an explicit `GRANT USAGE ON
-    /// DATABASE`, which is granted once per role rather than once per table.
+    /// The shape mirrors `grant-profile.json` v4, which the data-platform control
+    /// plane generates its policies from: `SELECT` is
+    /// `catalog:[namespace-list] | namespace:[namespace-properties-read] |
+    /// table:[table-data-read]`. Matching it is the point. Both tools write to the
+    /// same Ranger service, and a SQL grant that produced different policies from
+    /// the equivalent API call would make "who granted this" unanswerable and
+    /// break the drift gate that keeps the two in step.
     ///
-    /// The namespace level is different in kind: it is an ancestor ON THE PATH to
-    /// the named table, required to reach it, and it confers nothing about
-    /// objects outside that path.
+    /// The catalog level is a real cost, deliberately accepted here rather than
+    /// hidden: its holder can enumerate every namespace NAME in the catalog, so a
+    /// namespace called `pii_customer_health` becomes visible even though its rows
+    /// are not. v4 makes that trade for every privilege that reaches into a
+    /// catalog, and SQE diverging from it would be the worse failure.
     ///
-    /// Ancestor first, deliberately. Ranger has no transaction across two calls,
-    /// so one of them can land alone. Ancestor-first fails to "namespace visible,
-    /// no table access", which is harmless; table-first would fail to "has table
-    /// access, table invisible", which is the exact symptom this removes.
+    /// `MANAGE` and `ALL` are the exception: they bind at the catalog level
+    /// already and carry `catalog-content-manage`, so there is nothing above them
+    /// to add.
+    ///
+    /// Outermost first, deliberately. Ranger has no transaction across several
+    /// calls, so a plan can land partially. Outermost-first fails to "can list,
+    /// nothing readable", which is inert; innermost-first would fail to "has table
+    /// access, table unreachable", the exact symptom this removes.
+    ///
+    /// Access-type SETS still come from SQE's own map rather than v4's seeds plus
+    /// the servicedef `impliedGrants` closure, so this matches v4's plan SHAPE and
+    /// not yet its expansion. Closing that is profile adoption proper, with the
+    /// golden-fixture drift gate that goes with it.
     fn build_grant_plan(
         &self,
         privilege: &str,
@@ -518,45 +544,55 @@ impl RangerGrantBackend {
         let primary = self.build_grant_revoke_for(
             privilege, object, catalog, namespace, table, grantee,
         )?;
-
         let (_, level) = map_sql_to_ranger_access_for(object, privilege);
-        // Only a privilege that binds to a NAMED table has an ancestor to add.
-        // At the table level with no table named, the resource map already stops
-        // at the namespace, so the "ancestor" would be the primary resource and a
-        // second request for it would be a duplicate.
-        let (Some(ns), Some(_)) = (namespace, table) else {
-            return Ok(vec![primary]);
-        };
-        if level != ResourceLevel::Table {
-            return Ok(vec![primary]);
-        }
-        // `catalog` is Some: build_grant_revoke_for already rejected None.
         let Some(cat) = catalog else {
             return Ok(vec![primary]);
         };
-        let (users, roles) = grantee_to_fields(grantee)?;
-        let ancestor = GrantRevokeRequest {
-            grantor: primary.grantor.clone(),
-            resource: build_resource_map(
-                &self.realm,
-                cat,
-                Some(ns),
-                None,
-                ResourceLevel::Namespace,
-            ),
-            users,
-            groups: vec![],
-            roles,
-            access_types: vec![NAMESPACE_VISIBILITY_ACCESS.to_string()],
-            // NOT the statement's WITH GRANT OPTION. Namespace visibility is not
-            // what the operator asked to hand out, so the grantee must not gain
-            // the authority to re-grant it.
-            delegate_admin: false,
-            enable_audit: true,
-            replace_existing_permissions: false,
-            is_recursive: false,
+
+        let mut plan: Vec<GrantRevokeRequest> = Vec::new();
+        let ancestor = |level: ResourceLevel,
+                        ns: Option<&str>,
+                        access: &[&str]|
+         -> sqe_core::Result<GrantRevokeRequest> {
+            let (users, roles) = grantee_to_fields(grantee)?;
+            Ok(GrantRevokeRequest {
+                grantor: primary.grantor.clone(),
+                resource: build_resource_map(&self.realm, cat, ns, None, level),
+                users,
+                groups: vec![],
+                roles,
+                access_types: access.iter().map(|s| s.to_string()).collect(),
+                // NOT the statement's WITH GRANT OPTION. Traversal is not what the
+                // operator asked to hand out, so the grantee must not gain the
+                // authority to re-grant it.
+                delegate_admin: false,
+                enable_audit: true,
+                replace_existing_permissions: false,
+                is_recursive: false,
+            })
         };
-        Ok(vec![ancestor, primary])
+
+        // Catalog-level discovery, for every privilege that needs to reach INTO
+        // the catalog. `MANAGE` / `ALL` already bind at the catalog level and
+        // carry `catalog-content-manage`, so they need nothing above them.
+        if level != ResourceLevel::Catalog {
+            plan.push(ancestor(ResourceLevel::Catalog, None, &[CATALOG_DISCOVERY_ACCESS])?);
+        }
+        // Namespace visibility, only when the statement names a table beneath a
+        // namespace. A namespace-level privilege already writes the namespace
+        // policy itself, so a second request for the same resource would be a
+        // duplicate.
+        if level == ResourceLevel::Table {
+            if let (Some(ns), Some(_)) = (namespace, table) {
+                plan.push(ancestor(
+                    ResourceLevel::Namespace,
+                    Some(ns),
+                    &[NAMESPACE_VISIBILITY_ACCESS],
+                )?);
+            }
+        }
+        plan.push(primary);
+        Ok(plan)
     }
 
     /// POST a GrantRevokeRequest to the grant or revoke endpoint.
@@ -923,32 +959,6 @@ fn grant_label(grantee: &Grantee, privilege: &str) -> String {
     )
 }
 
-/// Marks a policy SQE wrote to complete the PATH to a granted table, rather than
-/// because an operator named that resource.
-///
-/// Deliberately carries no privilege and no originating table. It is a signal to
-/// the human reading the Ranger console ("SQE added this, and it is shared"), not
-/// input to a decision: `revoke` never releases namespace visibility, because one
-/// namespace policy serves every table granted under it and releasing it on the
-/// first revoke would break the others.
-fn traversal_label(grantee: &Grantee) -> String {
-    let kind = match grantee {
-        Grantee::User(_) => "USER",
-        Grantee::Role(_) => "ROLE",
-        Grantee::Group(_) => "GROUP",
-    };
-    format!("{LABEL_PREFIX}:traversal:{kind}:{}", grantee.name())
-}
-
-/// Is this a traversal marker rather than a grant's provenance label?
-///
-/// Checked explicitly so `retained_access_types` skips it in silence. Left to
-/// `parse_grant_label` it would come back as `None` and be logged as a corrupt
-/// label on every revoke against a namespace SQE had auto-granted.
-fn is_traversal_label(label: &str) -> bool {
-    label.starts_with(&format!("{LABEL_PREFIX}:traversal:"))
-}
-
 /// Parse a provenance label back into (grantee-kind, name, privilege).
 ///
 /// A grantee name may itself contain `:`, so the type is split off the front and
@@ -1133,9 +1143,6 @@ impl RangerGrantBackend {
         }
         let mut keep: Vec<String> = Vec::new();
         for label in labels.iter().filter(|l| *l != &mine) {
-            if is_traversal_label(label) {
-                continue; // path completion, not a grant; never revoked here
-            }
             let Some((_, name, other_priv)) = parse_grant_label(label) else {
                 warn!(%label, "unparseable provenance label ignored");
                 continue;
@@ -1301,10 +1308,14 @@ impl GrantBackend for RangerGrantBackend {
                 // Record WHICH statement contributed these access types, so a
                 // later REVOKE of a different privilege on the same resource
                 // does not take them away. Best-effort: the grant succeeded.
+                //
+                // DEEPEST LEVEL ONLY. The catalog and namespace policies are
+                // shared with every other grant anyone holds in that catalog, so
+                // stamping them with one grantee's privilege would misrepresent
+                // shared plumbing as privately owned, and would invite a later
+                // revoke to release traversal another grant still depends on.
+                // The platform's provenance module takes the same position.
                 self.add_grant_label(&resource, &stmt.grantee, &stmt.privilege)
-                    .await;
-            } else {
-                self.add_policy_label(&resource, &traversal_label(&stmt.grantee))
                     .await;
             }
         }
@@ -1823,7 +1834,12 @@ mod tests {
     }
 
     #[test]
-    fn a_table_grant_also_makes_its_namespace_visible() {
+    fn a_table_grant_writes_v4s_three_level_plan() {
+        // The shape is copied from grant-profile.json v4's SELECT entry:
+        //   catalog:[namespace-list] | namespace:[namespace-properties-read]
+        //   | table:[table-data-read ...]
+        // SQE must write the same policies as the control plane, or a SQL grant
+        // and the equivalent API call disagree about what a grant means.
         let b = test_backend();
         let plan = b
             .build_grant_plan(
@@ -1835,28 +1851,24 @@ mod tests {
                 &Grantee::User("dave".into()),
             )
             .expect("build plan");
-        assert_eq!(plan.len(), 2, "namespace ancestor plus the table itself");
+        assert_eq!(plan.len(), 3, "catalog, namespace, then the table itself");
 
-        // Ancestor FIRST: a partial failure must leave the harmless half.
-        let ns = &plan[0];
+        // OUTERMOST FIRST: a partial failure must leave the inert half.
+        let cat = &plan[0];
+        assert_eq!(cat.resource.get("catalog").map(String::as_str), Some("wh"));
+        assert_eq!(cat.resource.get("namespace"), None);
+        assert_eq!(cat.resource.get("table"), None);
+        assert_eq!(cat.access_types, vec!["namespace-list".to_string()]);
+
+        let ns = &plan[1];
         assert_eq!(ns.resource.get("namespace").map(String::as_str), Some("sales"));
-        assert_eq!(
-            ns.resource.get("table"),
-            None,
-            "the ancestor binds to the namespace, not the table"
-        );
-        assert_eq!(ns.access_types, vec![NAMESPACE_VISIBILITY_ACCESS.to_string()]);
-        assert!(
-            !ns.access_types.contains(&"namespace-list".to_string()),
-            "catalog-wide namespace enumeration is NOT auto-granted: it would expose \
-             sibling namespace names that have nothing to do with the granted table"
-        );
+        assert_eq!(ns.resource.get("table"), None);
+        assert_eq!(ns.access_types, vec!["namespace-properties-read".to_string()]);
 
-        let tbl = &plan[1];
+        let tbl = &plan[2];
         assert_eq!(tbl.resource.get("table").map(String::as_str), Some("orders"));
         assert!(tbl.access_types.contains(&"table-data-read".to_string()));
     }
-
     #[test]
     fn the_auto_added_ancestor_never_carries_grant_option() {
         let b = test_backend();
@@ -1873,35 +1885,33 @@ mod tests {
         // `grant()` sets delegate_admin on the primary from WITH GRANT OPTION and
         // leaves the ancestor alone, so the ancestor must be built false: the
         // grantee must not gain authority to re-grant namespace visibility.
-        assert!(!plan[0].delegate_admin);
+        assert!(!plan[0].delegate_admin, "catalog discovery must not be re-grantable");
+        assert!(!plan[1].delegate_admin, "namespace visibility must not be re-grantable");
+        assert_eq!(plan.len(), 3);
     }
 
     #[test]
-    fn a_namespace_or_catalog_privilege_stays_a_single_policy() {
+    fn only_a_catalog_bound_privilege_stands_alone() {
         let b = test_backend();
-        for (priv_, ns, tbl) in [
-            ("USAGE", Some("sales"), None),
-            ("CREATE TABLE", Some("sales"), None),
-            ("CREATE SCHEMA", None, None),
-        ] {
+        // v4 gives catalog discovery to everything that reaches INTO a catalog,
+        // including namespace-level privileges, so these are two-level plans.
+        for (priv_, ns, tbl) in [("USAGE", Some("sales"), None), ("CREATE TABLE", Some("sales"), None)] {
             let plan = b
-                .build_grant_plan(
-                    priv_,
-                    GrantObjectKind::Table,
-                    Some("wh"),
-                    ns,
-                    tbl,
-                    &Grantee::User("dave".into()),
-                )
+                .build_grant_plan(priv_, GrantObjectKind::Table, Some("wh"), ns, tbl, &Grantee::User("dave".into()))
                 .unwrap_or_else(|e| panic!("build plan for {priv_}: {e}"));
-            assert_eq!(
-                plan.len(),
-                1,
-                "{priv_} does not bind to a table, so it has no ancestor to add"
-            );
+            assert_eq!(plan.len(), 2, "{priv_}: catalog discovery plus its own level");
+            assert_eq!(plan[0].access_types, vec!["namespace-list".to_string()]);
+            assert_eq!(plan[0].resource.get("namespace"), None);
+        }
+        // MANAGE / ALL already bind at the catalog level and carry
+        // catalog-content-manage, so there is nothing above them to add.
+        for priv_ in ["ALL PRIVILEGES", "CREATE SCHEMA"] {
+            let plan = b
+                .build_grant_plan(priv_, GrantObjectKind::Table, Some("wh"), None, None, &Grantee::User("dave".into()))
+                .unwrap_or_else(|e| panic!("build plan for {priv_}: {e}"));
+            assert_eq!(plan.len(), 1, "{priv_} binds at the catalog level already");
         }
     }
-
     #[test]
     fn a_wildcard_table_grant_also_gets_the_namespace() {
         // `GRANT ... ON ALL TABLES IN SCHEMA cat.ns` resolves to table `"*"` at the
@@ -1919,10 +1929,10 @@ mod tests {
                 &Grantee::Role("analyst".into()),
             )
             .expect("build plan");
-        assert_eq!(plan.len(), 2);
-        assert_eq!(plan[0].resource.get("namespace").map(String::as_str), Some("sales"));
-        assert_eq!(plan[0].resource.get("table"), None);
-        assert_eq!(plan[1].resource.get("table").map(String::as_str), Some("*"));
+        assert_eq!(plan.len(), 3);
+        assert_eq!(plan[1].resource.get("namespace").map(String::as_str), Some("sales"));
+        assert_eq!(plan[1].resource.get("table"), None);
+        assert_eq!(plan[2].resource.get("table").map(String::as_str), Some("*"));
     }
 
     #[test]
@@ -1976,49 +1986,6 @@ mod tests {
             !deny_body.contains("NAMESPACE_VISIBILITY_ACCESS"),
             "deny() must not touch the traversal access type"
         );
-    }
-
-    #[test]
-    fn a_traversal_label_is_skipped_when_working_out_what_revoke_must_keep() {
-        // The loop in `retained_access_types` maps every OTHER label on the policy
-        // through `map_sql_to_ranger_access_for` to decide what to hold back. A
-        // traversal marker is not a grant, and its third segment is a grantee
-        // name, not a privilege: fed through the pass-through arm it would produce
-        // a bogus access type ("dave") and hold it back forever. This pins the
-        // classification the loop depends on.
-        let traversal = traversal_label(&Grantee::User("dave".into()));
-        assert!(is_traversal_label(&traversal));
-
-        // What the loop would compute if the skip were removed.
-        let leaked = parse_grant_label(&traversal);
-        assert_eq!(
-            leaked, None,
-            "a traversal marker must not parse as a grant; got {leaked:?}"
-        );
-
-        // A real grant label on the same policy still resolves normally.
-        let real = grant_label(&Grantee::User("dave".into()), "SELECT");
-        let (_, name, privilege) = parse_grant_label(&real).expect("grant label parses");
-        assert_eq!(name, "dave");
-        assert_eq!(privilege, "SELECT");
-        let (access, _) = map_sql_to_ranger_access_for(GrantObjectKind::Table, &privilege);
-        assert!(access.contains(&"table-data-read".to_string()));
-    }
-
-    #[test]
-    fn traversal_labels_are_not_read_as_grant_provenance() {
-        let label = traversal_label(&Grantee::User("dave".into()));
-        assert!(is_traversal_label(&label));
-        assert_eq!(
-            parse_grant_label(&label),
-            None,
-            "a traversal marker is not a grant; treating it as one would invent a \
-             privilege named 'dave' and revoke access types nobody granted"
-        );
-        // A real grant label is unaffected.
-        let g = grant_label(&Grantee::User("dave".into()), "SELECT");
-        assert!(!is_traversal_label(&g));
-        assert!(parse_grant_label(&g).is_some());
     }
 
     #[test]

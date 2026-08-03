@@ -51,71 +51,73 @@ observe is a mask you cannot debug.
 
 # Part 1: the Polaris gate
 
-## 1.1 Two grants, not one
+## 1.1 One grant, three policies
 
-Start with the thing that trips up every first attempt. A table grant on its own
-is not enough to read the table. Reaching `sales_wh.acdemo.orders` needs two
-things to succeed, and only one of them is about the table:
+Start with the thing that trips up every first attempt, because the mechanism
+explains most of what follows. A table grant is not one policy. Reaching
+`sales_wh.acdemo.orders` needs three things to succeed, and only one of them is
+about the table:
 
-- `LIST_NAMESPACES`, authorized at the **catalog** level. Polaris does not use
-  Ranger's `SELF_OR_DESCENDANTS` matching, so a namespace-scoped `namespace-list`
-  will not do: listing is denied outright, not filtered.
+- `LIST_NAMESPACES`, authorized at the **catalog** level with `namespace-list`.
+  Polaris does not use Ranger's `SELF_OR_DESCENDANTS` matching, so a
+  namespace-scoped `namespace-list` will not do: listing is denied outright, not
+  filtered.
 - a per-namespace visibility probe (`LOAD_NAMESPACE_METADATA`) needing
   **namespace**-level `namespace-properties-read`. A 403 hides the namespace,
   deliberately, so ungranted namespace names do not leak.
+- the table's own access types, at the **table** level.
 
-Either failure gives an empty schema list, and planning stops at "table not
-found" without ever attempting `LOAD_TABLE`. The table exists and Polaris would
-serve it; SQE never asks.
+Either of the first two failing gives an empty schema list, and planning stops at
+"table not found" without ever attempting `LOAD_TABLE`. The table exists and
+Polaris would serve it; SQE never asks. Nothing in the log shows a 403, because
+there is no denial to report.
 
-SQE writes the namespace half for you. `GRANT SELECT ON sales_wh.acdemo.orders`
-also grants `namespace-properties-read` on `sales_wh.acdemo`, so the minimum to
-read one table is two statements:
+You write one statement. SQE writes all three policies:
 
 ```sql
-GRANT USAGE  ON DATABASE sales_wh         TO ROLE "analyst";  -- discovery
-GRANT SELECT ON sales_wh.acdemo.orders    TO ROLE "analyst";  -- the data
+GRANT SELECT ON sales_wh.acdemo.orders TO ROLE "analyst";
 ```
 
-The namespace grant is an ancestor **on the path** to the table you named. It is
-required to reach that table and confers nothing about anything else, so adding
-it is completing the statement rather than widening it. It grants visibility, not
-data: a second table in the same namespace stays unreadable without its own
-grant.
+That is the same plan `grant-profile.json` v4 specifies, which is what the
+data-platform control plane generates its policies from. Matching it is
+deliberate: both write to the same Ranger service, and a SQL grant that produced
+different policies from the equivalent API call would make "who granted this"
+unanswerable.
 
-**The catalog grant stays yours to make, deliberately.** Catalog-level
-`namespace-list` lets its holder enumerate every namespace name in the catalog,
-including ones with no relation to the table being granted. A namespace called
-`pii_customer_health` becomes visible even though not one of its rows is. Adding
-that as a side effect of a table grant would widen the blast radius of every
-`GRANT SELECT`, so SQE refuses to guess. Grant discovery per role, once, and
-expect `SHOW SCHEMAS` to be the leak surface.
+**Know what the catalog level costs.** Its holder can enumerate every namespace
+NAME in the catalog, including namespaces unrelated to the table you granted. A
+namespace called `pii_customer_health` becomes visible even though not one of its
+rows is. That is a real widening and it happens on every table grant, so treat
+`SHOW SCHEMAS` as a leak surface and keep namespace names free of anything you
+would not put in a ticket title. If a catalog holds namespaces whose very
+existence is sensitive, separate catalogs are the boundary that works.
 
-In the quickstart both halves already exist for `analyst` and `engineer`: the
-bootstrap seeds wildcard discovery, which is why a lone `GRANT SELECT` looks
-sufficient there. Any user outside those two roles needs the catalog grant spelled
-out.
+**`MANAGE` and `ALL` are the exception.** They bind at the catalog level already
+and carry `catalog-content-manage`, so there is nothing above them to add and the
+plan is a single policy.
 
-**Revoke is asymmetric here, on purpose.** `REVOKE SELECT` on the table does not
-take back namespace visibility. One namespace policy serves every table granted
-under it, so releasing it on the first revoke would break the grantee's access to
-the others. A namespace whose tables have all been revoked leaves the grantee able
-to see that the namespace exists and nothing more. Policies SQE added this way
-carry the label `sqe:traversal:<GRANTEE_TYPE>:<name>` in the Ranger console.
+**Revoke touches the deepest level only, on purpose.** `REVOKE SELECT` on the
+table removes the table policy and leaves the catalog and namespace policies
+alone. Those are shared with every other grant anyone holds in that catalog, so
+walking the whole plan backwards would strip discovery out from under unrelated
+grants: an outage dressed up as a narrow revoke. The cost is that traversal
+policies accumulate and nobody cleans them up. That is the right trade. An
+orphaned `namespace-list` is discovery on a catalog the grantee could already
+reach; over-revoking is an outage.
 
-To remove the residue, revoke catalog discovery **first**:
+To take discovery back, do it explicitly and **in this order**:
 
 ```sql
-REVOKE USAGE ON DATABASE sales_wh       FROM ROLE "analyst";
+REVOKE USAGE ON DATABASE sales_wh        FROM ROLE "analyst";
 REVOKE USAGE ON SCHEMA   sales_wh.acdemo FROM ROLE "analyst";
 ```
 
-That order matters right now, and not for tidiness. A principal left holding
-catalog discovery while every namespace under it is invisible currently **hangs**
-instead of being denied: the per-namespace probe returns 403 for everything, and
-SQE's catalog provider blocks in its sync-to-async bridge rather than reporting
-"table not found". Revoking discovery first never passes through that state. The
-hang is a known defect in the read path, recorded in
+The order matters, and not for tidiness. A principal left holding catalog
+discovery while every namespace under it is invisible currently **hangs** instead
+of being denied: every probe 403s and SQE's catalog provider blocks in its
+sync-to-async bridge rather than reporting "table not found". Revoking discovery
+first never passes through that state. The hang is a known defect in the read
+path, recorded in
 `docs/internal/research/2026-08-02-catalog-traversal-gate.md`, and it is not
 specific to revoking: any principal configured with catalog discovery and no
 visible namespace can reach it.

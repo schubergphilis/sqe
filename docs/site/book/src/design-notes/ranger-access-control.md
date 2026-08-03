@@ -113,41 +113,57 @@ Either failure leaves an empty schema list, `schema()` returns `None`, and
 planning ends at `table not found` with `LOAD_TABLE` never attempted. Nothing in
 the SQE log shows a 403, because there is no denial to report.
 
-A table-level privilege therefore expands into a two-policy plan
-(`build_grant_plan`), namespace ancestor first:
+A privilege therefore expands into a multi-level plan (`build_grant_plan`),
+outermost first:
 
 ```sql
-GRANT USAGE  ON DATABASE cat        TO ROLE r;  -- catalog-level discovery
-GRANT SELECT ON cat.ns.tbl          TO ROLE r;  -- the data + visibility on cat.ns
+GRANT SELECT ON cat.ns.tbl TO ROLE r;   -- writes THREE policies
 ```
 
-`GRANT USAGE ON DATABASE` is the catalog-level form: `USAGE` binds to the
-namespace level, and with no namespace named the resource map degrades to
-`{root, catalog}`, which is what `LIST_NAMESPACES` is authorized against.
+| Level | Access type |
+|---|---|
+| catalog | `namespace-list` |
+| namespace | `namespace-properties-read` |
+| table | the privilege's own set |
 
-Three properties of the expansion, each load-bearing:
+`GRANT USAGE ON DATABASE cat` remains the way to write catalog discovery on its
+own: `USAGE` binds to the namespace level, and with no namespace named the
+resource map degrades to `{root, catalog}`, which is what `LIST_NAMESPACES` is
+authorized against.
 
-**Only the namespace, never the catalog.** The namespace policy is an ancestor on
-the path to the named table: required to reach it, conferring nothing about
-objects outside that path. Catalog-level `namespace-list` is categorically
-different, because it exposes sibling namespace NAMES unrelated to the table being
-granted. Auto-adding it would be the same silent widening
-`reject_scope_deeper_than_level` refuses, except it would report success. So it
-stays explicit, and it is granted once per role rather than once per table.
+Four properties of the expansion, each load-bearing:
 
-**Ancestor first.** Ranger has no transaction spanning two calls. Ancestor-first
-fails to "namespace visible, no table access", which is inert; table-first would
-fail to "has table access, table invisible", which is the exact symptom being
-removed. On a primary-level failure the error says the namespace grant was left in
-place.
+**The shape mirrors `grant-profile.json` v4.** v4's `SELECT` is
+`catalog:[namespace-list] | namespace:[namespace-properties-read] |
+table:[table-data-read]`, and the data-platform control plane generates its
+policies from the same file. SQE writing a different set for the same statement
+would make "who granted this, and does it mean the same thing" unanswerable, and
+there is a drift gate whose whole job is to keep the two in step. Access-type SETS
+still come from SQE's own map rather than v4's seeds plus the servicedef
+`impliedGrants` closure, so today this matches v4's plan shape and not yet its
+expansion; closing that is profile adoption proper.
 
-**Revoke does not release it.** One namespace policy serves every table granted
-under it, so releasing it on the first `REVOKE` would break the grantee's access
-to the others. The residue is visibility only, marked with the label
-`sqe:traversal:<GRANTEE_TYPE>:<name>`; `retained_access_types` skips that label
-rather than reading it as grant provenance. Refcounting it per originating table
-(`sqe:USER:u:SELECT@cat.ns.tbl`) would let revoke release it exactly when the last
-dependent goes away; that is the upgrade, not shipped.
+**The catalog level is a real widening, accepted rather than hidden.** Its holder
+can enumerate every namespace NAME in the catalog, unrelated ones included, and
+that now happens on every table grant. Auto-adding it was initially refused here on
+exactly that ground, and the refusal was overturned: diverging from the contract
+both tools share is the worse failure, and the leak is names rather than data.
+Separate catalogs are the boundary when namespace names are themselves sensitive.
+
+**Outermost first.** Ranger has no transaction spanning several calls.
+Outermost-first fails to "can list, nothing readable", which is inert;
+innermost-first would fail to "has table access, table unreachable", the exact
+symptom being removed. On a deepest-level failure the error says the outer grants
+were left in place.
+
+**Revoke releases the deepest level only.** The catalog and namespace policies are
+shared with every other grant anyone holds in that catalog, so walking the plan
+backwards would strip discovery out from under unrelated grants: an outage dressed
+up as a narrow revoke. Traversal policies therefore accumulate and nothing cleans
+them up. That is the correct trade, and it is the position the platform takes too.
+Provenance labels are written at the deepest level only for the same reason:
+stamping shared plumbing with one grantee's privilege would misrepresent it as
+privately owned.
 
 The quickstart's bootstrap seeds wildcard discovery for `analyst` and `engineer`,
 which is why a single `GRANT SELECT` looks sufficient there. A principal outside
