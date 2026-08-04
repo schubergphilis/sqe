@@ -184,6 +184,54 @@ four types from existing items. Whichever is chosen wants its own change, becaus
 rewriting live access-control policies in bulk is not something to bury in a
 refactor.
 
+## Cleanup for grants already written: `audit-grants`
+
+`cargo run -p sqe-policy --bin audit-grants` recomputes, for every `polaris` policy
+carrying provenance, what the current profile says each labelled grantee should hold
+at that resource, and reports anything beyond it. `--apply` writes; dry run is the
+default, because rewriting live access-control policy in bulk is not a side effect
+to have.
+
+A Rust binary rather than a shell script over the JSON, deliberately: it plans
+through `profile()`, the same code path a live GRANT uses, so it cannot drift from
+what the engine would write today. Reimplementing the closure in Python for a
+one-off tool would recreate exactly the duplication that adoption removed.
+
+It will not touch: policies with no provenance label (no basis for deciding what
+SHOULD be there, and a hand-written operator policy is not its business); items
+naming more than one grantee (an access type may be owed to one of them); or deny
+items (narrowing a deny GRANTS access).
+
+Verified live, and both problems it exposed were found by not trusting its output:
+
+**It first reported "0 over-broad items" on a stack that definitely had them.** Every
+over-broad item carried an `sqe:`-prefixed label, from before the prefix was aligned
+with the platform's `chm`, and the tool only read `chm`. So it would have reported
+nothing to do on precisely the deployments it exists to clean. It now reads both on
+READ (and writes neither).
+
+**Its second finding would have destroyed a working grant.** `sales_wh.acdemo.orders_eu`
+is a VIEW granted with `GRANT SELECT ON VIEW`, but the label recorded only `SELECT`.
+A view `SELECT` and a table `SELECT` are different privileges (`SELECT VIEW` vs
+`SELECT`) conferring disjoint access types, so planning the label produced table
+types and the grantee's legitimate `view-*` types looked like residue. With `--apply`
+that grant would have been emptied.
+
+Two fixes came out of it. The label now records the PROFILE privilege name, so a view
+grant is labelled `SELECT VIEW` and round-trips: `retained_access_types` had the same
+latent bug, computing table access types for a view grant's label. And the tool
+refuses any item whose held types are DISJOINT from what the label plans, reporting
+it as probable pre-fix provenance rather than guessing -- removal is not recoverable.
+
+Applied live to the legacy over-grant: `sales_wh.acdemo.orders` went from 23 access
+types to 19, losing `table-location-set`, `table-uuid-assign`,
+`table-format-version-upgrade` and `table-properties-write` while keeping
+`table-data-write` and `table-data-read`. The second grantee's item was untouched, and
+a re-run reports nothing, so it is idempotent.
+
 ## Left open
 
-`scripts/check-vendored-profile.sh` is not yet wired into CI.
+Nothing from the handoff. `scripts/check-vendored-profile.sh` is now wired into CI as
+the `vendored-profile-drift` job, scoped by `changes` to the vendored assets and the
+checker, and NOT `allow_failure`: the script exits 2 when it cannot find the platform
+checkout, so a job that cannot verify fails rather than reporting success.
