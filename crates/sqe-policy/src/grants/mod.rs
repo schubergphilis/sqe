@@ -4,6 +4,7 @@
 //! - `ChameleonGrantBackend` — wraps the existing Chameleon platform API client
 //! - `PolarisGrantBackend` — calls the Polaris Management REST API
 
+pub mod profile;
 pub mod polaris;
 pub mod ranger;
 
