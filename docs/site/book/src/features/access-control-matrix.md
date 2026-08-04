@@ -43,7 +43,7 @@ The `polaris` service-def resource hierarchy is
 | View | `GRANT SELECT ON VIEW cat.ns.v TO ROLE r` | Yes | Yes |
 | All / future views in schema | `GRANT SELECT ON ALL VIEWS IN SCHEMA cat.ns` | Yes, as a wildcard | Yes |
 | Deny | `DENY SELECT ON cat.ns.tbl TO USER u` | Yes | Yes |
-| Group grantee | `GRANT SELECT ON cat.ns.tbl TO GROUP g` | Read path only, see gaps | Yes, for enforcement |
+| Group grantee | `GRANT SELECT ON cat.ns.tbl TO GROUP g` | Yes, as a Ranger role of the same name | Yes, for enforcement |
 
 ### One grant, three policies: the traversal is load-bearing
 
@@ -247,7 +247,7 @@ flush the cache on commit. The window is asserted at both edges by
 | Traversal policies accumulate | `REVOKE` releases the deepest level only, because the catalog and namespace policies a grant writes are shared with every other grant in that catalog. Orphaned `namespace-list` / `namespace-properties-read` are left behind and nothing cleans them up. Deliberate: over-revoking would strip discovery from unrelated grants. Clear them with `REVOKE USAGE ON DATABASE` then `REVOKE USAGE ON SCHEMA`, in that order. |
 | Narrowing a privilege does not narrow past grants | Ranger's grant endpoint MERGES access types into the policy for a resource, and `REVOKE` removes only the types it names. So when SQE narrows what a privilege confers (as adopting `grant-profile` v4 narrowed `INSERT`), policies written by the earlier version keep the wider set, and a `REVOKE` from the new version cannot clear the residue. New grants get the narrower set; existing ones need a one-off cleanup. |
 | Views are not a boundary | `GRANT ... ON VIEW` works, but SQE expands the view and plans against its base tables, so the reader needs a grant there too. Not a Snowflake secure view. |
-| Group grantees, write path | `GRANT ... TO GROUP g` is rejected by the Ranger write path (`grantee_to_fields`) because Ranger only learns a user's groups under usersync. Group-bound policies authored in the Ranger console ARE enforced on the read path. |
+| Group grantees are Ranger roles | `GRANT ... TO GROUP g` writes to the Ranger ROLES field, not groups. The control plane materialises every Keycloak group as a Ranger role of the identical name, so a group grant and the same-named role grant are the same write. SQE does NOT auto-create the role: a typo would otherwise become an empty role and a grant conferring nothing, so an unknown grantee is refused by Ranger instead. |
 | Row filters through views | A filter referencing a column the view does not project fails the query with a DataFusion schema error. Fail-closed, but the message names neither the policy nor the view. Direct queries with the same projection work. |
 | Ranger glob patterns | Only exact match and bare `*` are matched. `orders*` is not, and a policy written that way silently never fires. Pinned by `ranger_glob_patterns_are_not_matched`. |
 | Namespace flattening | `resolve_policy_key` passes only the LAST dotted component as the Ranger `database`, so `a.b.sales` and `sales` collide. Pinned by `resolve_policy_key_multilevel_takes_last_namespace_component`. |
