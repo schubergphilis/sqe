@@ -158,12 +158,12 @@ impl PolicyEnforcer for PolicyPlanRewriter {
             };
 
             // Diagnostic: log the EXACT (database, table) lookup keys sent to the
-            // policy store. `namespace` here is the flattened last dotted
-            // component of the schema (see `resolve_policy_key`), which is what
+            // policy store. `namespace` is the FULL dotted schema, which is what
             // Ranger `database` resource values must match. When a policy silently
-            // does not fire, operators compare `lookup_database` against the
-            // Ranger policy resource to catch a multi-level-namespace mismatch
-            // (e.g. schema "ns1.ns2" flattens to "ns2"). No row values are logged.
+            // does not fire, operators compare `lookup_database` against the Ranger
+            // policy resource: a policy written against the old last-component key
+            // (`ns2` for schema `ns1.ns2`) still matches, but logs that it did so.
+            // No row values are logged.
             debug!(
                 user = %username,
                 full_ref = %table_name,
@@ -329,6 +329,14 @@ impl PolicyEnforcer for PolicyPlanRewriter {
                         // `project()` both run `normalize_col`, qualifying every
                         // column reference (including those nested inside Hash /
                         // Custom mask expressions) to the child schema.
+                        // Widen the scan's projection if a row filter needs a
+                        // column the query does not select (a narrow view). The
+                        // restore list puts the output schema back afterwards.
+                        let (node, restore) =
+                            match widen_scan_for_row_filters(scan, &policy.row_filters) {
+                                Some((wider, restore)) => (wider, Some(restore)),
+                                None => (node, None),
+                            };
                         let mut builder = LogicalPlanBuilder::from(node);
 
                         // 1. Inject row filters above the TableScan.
@@ -397,6 +405,20 @@ impl PolicyEnforcer for PolicyPlanRewriter {
                                     ))
                                 })?;
                             }
+                        }
+
+                        // 3. Restore the original output columns when the scan's
+                        //    projection was widened to give a row filter the column
+                        //    it needed. The widening must not be observable: a
+                        //    caller that selected two columns gets two, and the
+                        //    column the filter needed never reaches the result.
+                        if let Some(restore) = restore {
+                            builder = builder.project(restore).map_err(|e| {
+                                datafusion::error::DataFusionError::Internal(format!(
+                                    "Failed to restore the projection after widening it \
+                                     for a row filter: {e}"
+                                ))
+                            })?;
                         }
 
                         let current = builder.build().map_err(|e| {
@@ -476,9 +498,9 @@ fn summarise_policies(table_policies: &HashMap<String, ResolvedPolicy>) -> Polic
 /// resolve failure this returns the same deny-all sentinel (`lit(false)` row
 /// filter) the rewriter would inject, so the diagnostic never under-reports.
 ///
-/// `namespace`/`table` must be the SAME flattened policy key the rewriter uses
-/// (`resolve_policy_key` -> last dotted namespace component), or the diagnostic
-/// would describe a different policy than enforcement applies.
+/// `namespace`/`table` must be the SAME policy key the rewriter uses
+/// (`resolve_policy_key` -> the full dotted namespace), or the diagnostic would
+/// describe a different policy than enforcement applies.
 pub async fn resolve_effective_policy(
     store: &dyn PolicyStore,
     user: &sqe_core::session::SessionUser,
@@ -692,6 +714,82 @@ fn resolve_policy_key(
     };
 
     Some((namespace, table.to_string()))
+}
+
+/// Widen a `TableScan`'s projection so a row filter can reference a column the
+/// query itself does not select, returning the columns to project back to.
+///
+/// A row filter is enforced above the scan, and `LogicalPlanBuilder::filter`
+/// normalises it against the scan's schema. When the scan carries a pushed-down
+/// projection -- which is what a narrow VIEW expands to -- a filter on an
+/// unselected column failed the whole query with "Schema error: No field named
+/// region". Fail-closed, so never a leak, but it made a row filter and a narrow
+/// view over the same table mutually exclusive, and the message named neither the
+/// policy nor the view.
+///
+/// Widening is internal: the returned expression list restores the original output
+/// columns, so the caller sees exactly the schema it asked for and the extra column
+/// cannot reach the result. Returns `None` when nothing needs widening, which is
+/// every scan without a projection -- including a direct query, because the
+/// rewriter runs BEFORE projection pushdown.
+///
+/// Dropping the filter instead would turn a hard error into a silent leak, which is
+/// the one outcome worse than the error being replaced.
+fn widen_scan_for_row_filters(
+    scan: &datafusion::logical_expr::TableScan,
+    row_filters: &[Expr],
+) -> Option<(LogicalPlan, Vec<Expr>)> {
+    let projection = scan.projection.as_ref()?;
+    if row_filters.is_empty() {
+        return None;
+    }
+    let source_schema = scan.source.schema();
+
+    // Columns the filters need, by name.
+    let mut wanted: Vec<String> = Vec::new();
+    for f in row_filters {
+        for c in f.column_refs() {
+            if !wanted.contains(&c.name) {
+                wanted.push(c.name.clone());
+            }
+        }
+    }
+
+    // Which of those exist in the table but are absent from the projection.
+    let mut widened = projection.clone();
+    for name in &wanted {
+        let Ok(idx) = source_schema.index_of(name) else {
+            // Not a column of this table. Leave it alone: `filter()` will report
+            // it, and inventing a column would be worse than a clear failure.
+            continue;
+        };
+        if !widened.contains(&idx) {
+            widened.push(idx);
+        }
+    }
+    if widened.len() == projection.len() {
+        return None;
+    }
+
+    // What the caller must see afterwards: the ORIGINAL columns, qualified as the
+    // scan exposes them.
+    let restore: Vec<Expr> = scan
+        .projected_schema
+        .iter()
+        .map(|(qualifier, field)| {
+            Expr::Column(datafusion::common::Column::new(qualifier.cloned(), field.name()))
+        })
+        .collect();
+
+    let wider = datafusion::logical_expr::TableScan::try_new(
+        scan.table_name.clone(),
+        scan.source.clone(),
+        Some(widened),
+        scan.filters.clone(),
+        scan.fetch,
+    )
+    .ok()?;
+    Some((LogicalPlan::TableScan(wider), restore))
 }
 
 /// A typed NULL literal of `data_type` (so projection output type == column
