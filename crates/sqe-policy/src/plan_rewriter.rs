@@ -140,7 +140,7 @@ impl PolicyEnforcer for PolicyPlanRewriter {
             }
             // Derive the (namespace, table) policy key from the structured
             // reference. This MUST match the write path's scheme
-            // (write_handler.rs keys by `namespace().last()`), otherwise
+            // (the full dotted namespace, see `resolve_policy_key`), otherwise
             // reads and writes resolve different policies for the same table.
             let Some((namespace, table)) = resolve_policy_key(table_ref) else {
                 // FAIL CLOSED: a reference we cannot confidently map to a
@@ -158,12 +158,12 @@ impl PolicyEnforcer for PolicyPlanRewriter {
             };
 
             // Diagnostic: log the EXACT (database, table) lookup keys sent to the
-            // policy store. `namespace` here is the flattened last dotted
-            // component of the schema (see `resolve_policy_key`), which is what
+            // policy store. `namespace` is the FULL dotted schema, which is what
             // Ranger `database` resource values must match. When a policy silently
-            // does not fire, operators compare `lookup_database` against the
-            // Ranger policy resource to catch a multi-level-namespace mismatch
-            // (e.g. schema "ns1.ns2" flattens to "ns2"). No row values are logged.
+            // does not fire, operators compare `lookup_database` against the Ranger
+            // policy resource: a policy written against the old last-component key
+            // (`ns2` for schema `ns1.ns2`) still matches, but logs that it did so.
+            // No row values are logged.
             debug!(
                 user = %username,
                 full_ref = %table_name,
@@ -329,6 +329,14 @@ impl PolicyEnforcer for PolicyPlanRewriter {
                         // `project()` both run `normalize_col`, qualifying every
                         // column reference (including those nested inside Hash /
                         // Custom mask expressions) to the child schema.
+                        // Widen the scan's projection if a row filter needs a
+                        // column the query does not select (a narrow view). The
+                        // restore list puts the output schema back afterwards.
+                        let (node, restore) =
+                            match widen_scan_for_row_filters(scan, &policy.row_filters) {
+                                Some((wider, restore)) => (wider, Some(restore)),
+                                None => (node, None),
+                            };
                         let mut builder = LogicalPlanBuilder::from(node);
 
                         // 1. Inject row filters above the TableScan.
@@ -397,6 +405,20 @@ impl PolicyEnforcer for PolicyPlanRewriter {
                                     ))
                                 })?;
                             }
+                        }
+
+                        // 3. Restore the original output columns when the scan's
+                        //    projection was widened to give a row filter the column
+                        //    it needed. The widening must not be observable: a
+                        //    caller that selected two columns gets two, and the
+                        //    column the filter needed never reaches the result.
+                        if let Some(restore) = restore {
+                            builder = builder.project(restore).map_err(|e| {
+                                datafusion::error::DataFusionError::Internal(format!(
+                                    "Failed to restore the projection after widening it \
+                                     for a row filter: {e}"
+                                ))
+                            })?;
                         }
 
                         let current = builder.build().map_err(|e| {
@@ -476,9 +498,9 @@ fn summarise_policies(table_policies: &HashMap<String, ResolvedPolicy>) -> Polic
 /// resolve failure this returns the same deny-all sentinel (`lit(false)` row
 /// filter) the rewriter would inject, so the diagnostic never under-reports.
 ///
-/// `namespace`/`table` must be the SAME flattened policy key the rewriter uses
-/// (`resolve_policy_key` -> last dotted namespace component), or the diagnostic
-/// would describe a different policy than enforcement applies.
+/// `namespace`/`table` must be the SAME policy key the rewriter uses
+/// (`resolve_policy_key` -> the full dotted namespace), or the diagnostic would
+/// describe a different policy than enforcement applies.
 pub async fn resolve_effective_policy(
     store: &dyn PolicyStore,
     user: &sqe_core::session::SessionUser,
@@ -624,7 +646,7 @@ pub(crate) fn merge_tag_masks(
 /// `cat.a.b.t` lands here as schema `"a.b"`, table `"t"`.
 ///
 /// The policy key MUST match the write path, which keys by
-/// `TableIdent::namespace().last()` (`write_handler.rs`). For a schema of
+/// the full dotted namespace (see `resolve_policy_key`). For a schema of
 /// `"a.b"` the last namespace component is `"b"`. We take the last dotted
 /// component of the schema so reads and writes resolve the same policy.
 ///
@@ -672,18 +694,102 @@ fn resolve_policy_key(
         return None;
     }
 
-    // `schema()` is the (possibly multi-level) namespace string. Take its
-    // last dotted component to match the write path's `namespace().last()`.
-    // A bare table name with no schema falls back to "default", preserving
-    // the existing 1-part behavior.
+    // The FULL (possibly multi-level) namespace string.
+    //
+    // This used to take only the last dotted component, which collided: Iceberg
+    // namespaces `sales` and `a.b.sales` both resolved to the Ranger database
+    // `sales`, so a policy written for one fired on the other. `hive_database`
+    // documents the intended convention as the dotted string itself, which is also
+    // what Kyuubi uses, so the truncation was the odd one out.
+    //
+    // `policy_matches_table` still accepts a policy naming only the last component,
+    // as a logged compatibility path: policies written against the old key would
+    // otherwise stop firing, and for a mask or row filter that means protection
+    // silently disappearing on upgrade.
+    //
+    // A bare table name with no schema falls back to "default", unchanged.
     let namespace = match table_ref.schema() {
-        Some(schema) if !schema.is_empty() => {
-            schema.rsplit('.').next().unwrap_or(schema).to_string()
-        }
+        Some(schema) if !schema.is_empty() => schema.to_string(),
         _ => "default".to_string(),
     };
 
     Some((namespace, table.to_string()))
+}
+
+/// Widen a `TableScan`'s projection so a row filter can reference a column the
+/// query itself does not select, returning the columns to project back to.
+///
+/// A row filter is enforced above the scan, and `LogicalPlanBuilder::filter`
+/// normalises it against the scan's schema. When the scan carries a pushed-down
+/// projection -- which is what a narrow VIEW expands to -- a filter on an
+/// unselected column failed the whole query with "Schema error: No field named
+/// region". Fail-closed, so never a leak, but it made a row filter and a narrow
+/// view over the same table mutually exclusive, and the message named neither the
+/// policy nor the view.
+///
+/// Widening is internal: the returned expression list restores the original output
+/// columns, so the caller sees exactly the schema it asked for and the extra column
+/// cannot reach the result. Returns `None` when nothing needs widening, which is
+/// every scan without a projection -- including a direct query, because the
+/// rewriter runs BEFORE projection pushdown.
+///
+/// Dropping the filter instead would turn a hard error into a silent leak, which is
+/// the one outcome worse than the error being replaced.
+fn widen_scan_for_row_filters(
+    scan: &datafusion::logical_expr::TableScan,
+    row_filters: &[Expr],
+) -> Option<(LogicalPlan, Vec<Expr>)> {
+    let projection = scan.projection.as_ref()?;
+    if row_filters.is_empty() {
+        return None;
+    }
+    let source_schema = scan.source.schema();
+
+    // Columns the filters need, by name.
+    let mut wanted: Vec<String> = Vec::new();
+    for f in row_filters {
+        for c in f.column_refs() {
+            if !wanted.contains(&c.name) {
+                wanted.push(c.name.clone());
+            }
+        }
+    }
+
+    // Which of those exist in the table but are absent from the projection.
+    let mut widened = projection.clone();
+    for name in &wanted {
+        let Ok(idx) = source_schema.index_of(name) else {
+            // Not a column of this table. Leave it alone: `filter()` will report
+            // it, and inventing a column would be worse than a clear failure.
+            continue;
+        };
+        if !widened.contains(&idx) {
+            widened.push(idx);
+        }
+    }
+    if widened.len() == projection.len() {
+        return None;
+    }
+
+    // What the caller must see afterwards: the ORIGINAL columns, qualified as the
+    // scan exposes them.
+    let restore: Vec<Expr> = scan
+        .projected_schema
+        .iter()
+        .map(|(qualifier, field)| {
+            Expr::Column(datafusion::common::Column::new(qualifier.cloned(), field.name()))
+        })
+        .collect();
+
+    let wider = datafusion::logical_expr::TableScan::try_new(
+        scan.table_name.clone(),
+        scan.source.clone(),
+        Some(widened),
+        scan.filters.clone(),
+        scan.fetch,
+    )
+    .ok()?;
+    Some((LogicalPlan::TableScan(wider), restore))
 }
 
 /// A typed NULL literal of `data_type` (so projection output type == column
@@ -1154,13 +1260,33 @@ mod tests {
     }
 
     #[test]
-    fn resolve_policy_key_multilevel_takes_last_namespace_component() {
-        // cat.ns1.ns2.employees -> schema "ns1.ns2" -> last component "ns2".
+    fn resolve_policy_key_keeps_the_whole_multilevel_namespace() {
+        // cat.ns1.ns2.employees -> schema "ns1.ns2", kept whole.
+        //
+        // This replaces a test that pinned the last component ("ns2"). That was a
+        // collision: `sales` and `a.b.sales` both resolved to the Ranger database
+        // `sales`, so a policy written for one fired on the other.
         let r = datafusion::common::TableReference::full("cat", "ns1.ns2", "employees");
         assert_eq!(
             resolve_policy_key(&r),
-            Some(("ns2".to_string(), "employees".to_string()))
+            Some(("ns1.ns2".to_string(), "employees".to_string()))
         );
+    }
+
+    #[test]
+    fn namespaces_sharing_a_last_component_no_longer_collide() {
+        // The point of keeping the whole namespace. Before, both of these produced
+        // the key `sales`.
+        let shallow = datafusion::common::TableReference::full("cat", "sales", "orders");
+        let deep = datafusion::common::TableReference::full("cat", "a.b.sales", "orders");
+        let shallow_key = resolve_policy_key(&shallow).expect("shallow");
+        let deep_key = resolve_policy_key(&deep).expect("deep");
+        assert_ne!(
+            shallow_key, deep_key,
+            "two distinct Iceberg namespaces must not resolve to the same policy key"
+        );
+        assert_eq!(shallow_key.0, "sales");
+        assert_eq!(deep_key.0, "a.b.sales");
     }
 
     #[test]
