@@ -739,6 +739,27 @@ mod tests {
 
     #[tokio::test]
     async fn no_credentials_in_paths() {
+        // Hold the fault serial guard even though this test installs NO faults.
+        //
+        // The fault queue is process-global and CONSUMED on read, so a test doing
+        // store I/O without the guard can steal a fault another test injected: it
+        // then fails with a spurious error, AND the test that installed the fault
+        // sees none. That is exactly what happened in CI -- `s3_object_quota`
+        // panicked on `SpillDiskFull { need: 65536, available: 0 }` while
+        // `fault_disk_full_fails_create_writer_only` reported an empty `got `, two
+        // failures from one stolen fault. It passes locally, because it needs the
+        // two to overlap.
+        //
+        // The module doc already asks for this "when running store I/O that must
+        // not observe another test's faults"; these call sites had simply not been
+        // updated.
+        //
+        // `FaultSession` with an empty plan rather than `serial_test_guard()`: both
+        // take the same serial mutex and clear the queue, but the bare guard is a
+        // `MutexGuard` held across an await, which `clippy::await_holding_lock`
+        // rejects. `FaultSession` keeps it inside the struct, which is why the
+        // fault-injecting tests already use it.
+        let _fault_guard = crate::fault::FaultSession::new(vec![]);
         let tmp = tempfile::tempdir().unwrap();
         let store = LocalSegmentStore::open(tmp.path(), 1 << 30, 0, 1, 1).unwrap();
         // Scope with credential-like input is sanitized.
