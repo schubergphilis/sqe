@@ -915,6 +915,42 @@ pub(crate) async fn discover_catalog_provider(
 /// exists, or Polaris rejects the warehouse (unauthorized / nonexistent) — same
 /// semantics as [`discover_catalog_provider`], so the caller turns `None` into
 /// the existing "unknown catalog" error.
+/// `SessionCatalog` for a catalog DECLARED in configuration, built from its own
+/// `CatalogConfig`.
+///
+/// Matched by config key or by `warehouse`, because a legacy single-catalog
+/// deployment is keyed `iceberg` while operators name it by its warehouse.
+///
+/// Distinct from `discover_session_catalog` on purpose. Discovery clones a
+/// template catalog's config and overrides only `warehouse`, which is right for a
+/// warehouse that exists in Polaris but not in SQE's config, and wrong for one
+/// that IS configured: it would silently read that catalog with another's
+/// `polaris_url`, auth, backend and cache TTL. Configuration wins where it exists.
+pub(crate) async fn configured_session_catalog(
+    name: &str,
+    config: &SqeConfig,
+    session: &Session,
+    table_cache: Option<&TableMetadataCache>,
+) -> Option<Arc<SessionCatalog>> {
+    let flattened = config.flattened_catalogs();
+    let (_, cfg) = flattened
+        .iter()
+        .find(|(n, _)| n == name)
+        .or_else(|| flattened.iter().find(|(_, c)| c.warehouse == name))?;
+    let cfg = (*cfg).clone();
+    match build_session_catalog(&cfg, session, &config.storage, table_cache).await {
+        Ok((session_catalog, _storage)) => Some(session_catalog),
+        Err(e) => {
+            tracing::info!(
+                catalog = name,
+                error = %e,
+                "configured catalog did not build for this session"
+            );
+            None
+        }
+    }
+}
+
 pub(crate) async fn discover_session_catalog(
     warehouse: &str,
     config: &SqeConfig,

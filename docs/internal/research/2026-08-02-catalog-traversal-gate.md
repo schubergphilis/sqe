@@ -167,7 +167,7 @@ something.
 
 ## Two bugs found while establishing this, neither caused by the change
 
-**`SHOW SCHEMAS FROM <catalog>` can answer about a different catalog.** With
+**`SHOW SCHEMAS FROM <catalog>` can answer about a different catalog.** FIXED 2026-08-03, see the closing section. With
 `[catalog] warehouse = "sales_wh"`, `SHOW SCHEMAS FROM sales_wh` and
 `SHOW SCHEMAS FROM ops_wh` both returned `ops`, `ac` -- ops_wh's namespaces, while
 sales_wh actually holds `sales`, `ac`, `acdemo` (confirmed from Polaris's own
@@ -344,3 +344,51 @@ that `tokio::time::timeout` cannot bound a blocking wedge because the timer neve
 runs, and that the only workable guard is an OS-level one -- a sacrificial thread
 with its own runtime, joined with a hard deadline. The unit test added here uses
 that same pattern.
+
+
+---
+
+# `SHOW SCHEMAS` / `SHOW TABLES` catalog resolution, fixed 2026-08-03
+
+Root cause was one comparison. `show_catalog` asked whether the named catalog
+differed from `config.catalog.warehouse` -- the LEGACY single-catalog field -- and
+used the session catalog when it matched. But the session resolves through
+`resolve_default_catalog()`: `query.default_catalog` if set, otherwise the
+alphabetically FIRST entry of `flattened_catalogs()` (which sorts, for
+deterministic `information_schema` ordering).
+
+With the quickstart's shape -- `[catalogs.ops_wh]`, `[catalogs.sales_wh]`, no
+`query.default_catalog`, and `[catalog] warehouse = "sales_wh"` -- the session
+default sorts to `ops_wh` while the legacy field says `sales_wh`. So
+`SHOW SCHEMAS FROM sales_wh` matched the guard, fell through to the session
+catalog, and listed **ops_wh's** namespaces. `SHOW SCHEMAS FROM ops_wh` returned
+the same rows by the discovery route, so the two were indistinguishable and both
+reported success.
+
+The question is not "is this the legacy warehouse" but "is this the catalog the
+session already resolves to". `show_catalog_target` now answers exactly that, as a
+pure function, matching a name against both a catalog's config KEY and its
+`warehouse` (a legacy deployment is keyed `iceberg` while operators name it by its
+warehouse, so comparing keys alone would send `SHOW SCHEMAS FROM wh1` down the
+by-name path and fail).
+
+**A second, latent bug fixed alongside it.** The by-name path used
+`discover_session_catalog`, which clones a TEMPLATE catalog's config and overrides
+only `warehouse`. For a catalog that is actually declared in `[catalogs.*]` that
+silently reads it with another catalog's `polaris_url`, auth, backend and cache
+TTL. Invisible in the quickstart because both catalogs share a URL. Named catalogs
+now resolve from their own config first (`configured_session_catalog`), with
+discovery as the fallback for warehouses Polaris knows about and SQE's config does
+not.
+
+**Unknown catalogs now error instead of falling back.** Previously an
+unresolvable name quietly produced the session catalog's answer. Since
+`SHOW SCHEMAS` is how an operator confirms a grant landed, a confidently wrong
+answer is worse than a refusal.
+
+Verified live and mutation-checked. Restoring the old comparison makes
+`SHOW SCHEMAS FROM sales_wh` return `["ops", "ac", "only_in_ops"]`, which is the
+bug reproduced exactly. The e2e case discriminates on a namespace each catalog has
+and the other does not, plus `SHOW TABLES FROM sales_wh.ac` vs `ops_wh.ac` (both
+have an `ac` namespace holding different tables), and asserts the two lists are not
+equal -- equal lists being the precise symptom.

@@ -2211,3 +2211,110 @@ async fn one_table_grant_writes_the_namespace_it_needs() {
         .execute(&ctx.carol, "REVOKE USAGE ON DATABASE sales_wh FROM USER \"dave\"", None)
         .await;
 }
+
+/// `SHOW SCHEMAS FROM <catalog>` must describe the catalog it names.
+///
+/// It did not. The resolver asked whether the named catalog differed from
+/// `config.catalog.warehouse`, the legacy single-catalog field, and used the
+/// session catalog when it matched. But the session resolves to
+/// `query.default_catalog` or, absent that, the alphabetically FIRST entry of
+/// `[catalogs.*]`. This config declares `sales_wh` and `ops_wh` with
+/// `[catalog] warehouse = "sales_wh"`, so the session default sorts to `ops_wh`
+/// and `SHOW SCHEMAS FROM sales_wh` listed **ops_wh's** namespaces, reporting
+/// success. Both catalogs returned identical rows by different routes, so nothing
+/// in the output revealed which had been read.
+///
+/// It matters beyond ergonomics: `SHOW SCHEMAS` is how an operator confirms a
+/// grant landed, and it was answering about a catalog they had not asked about.
+///
+/// The discriminator is a namespace each catalog has and the other does not, so
+/// this cannot pass by returning the union or the wrong catalog.
+#[tokio::test]
+#[ignore]
+async fn show_schemas_describes_the_catalog_it_names() {
+    ac_gate!();
+    let _guard = crate::common::serial().lock().await;
+    let ctx = ac_setup().await;
+
+    // Distinguishing namespaces. ac_setup already made `ac` in both catalogs, so
+    // `ac` alone could not tell them apart.
+    exec_ok(&ctx, &ctx.carol, "CREATE SCHEMA IF NOT EXISTS sales_wh.only_in_sales").await;
+    exec_ok(&ctx, &ctx.carol, "CREATE SCHEMA IF NOT EXISTS ops_wh.only_in_ops").await;
+
+    let schemas = |sql: &'static str| {
+        let ctx = &ctx;
+        async move { col_strings(&exec_ok(ctx, &ctx.carol, sql).await, "Schema") }
+    };
+
+    let sales = schemas("SHOW SCHEMAS FROM sales_wh").await;
+    let ops = schemas("SHOW SCHEMAS FROM ops_wh").await;
+
+    assert!(
+        sales.iter().any(|s| s == "only_in_sales"),
+        "SHOW SCHEMAS FROM sales_wh must list sales_wh's namespaces, got {sales:?}"
+    );
+    assert!(
+        !sales.iter().any(|s| s == "only_in_ops"),
+        "and must NOT list ops_wh's, got {sales:?}"
+    );
+    assert!(
+        ops.iter().any(|s| s == "only_in_ops"),
+        "SHOW SCHEMAS FROM ops_wh must list ops_wh's namespaces, got {ops:?}"
+    );
+    assert!(
+        !ops.iter().any(|s| s == "only_in_sales"),
+        "and must NOT list sales_wh's, got {ops:?}"
+    );
+    // The control that makes the two assertions above mean something: before the
+    // fix these were EQUAL, because both routes ended at the session catalog.
+    assert_ne!(
+        sales, ops,
+        "the two catalogs must not return identical schema lists; equal lists is \
+         the exact symptom of the resolver ignoring the qualifier"
+    );
+
+    // SHOW TABLES goes through the same resolver, and its own discriminator is
+    // sharper: both catalogs have an `ac` namespace, holding different tables.
+    // This is the case that first exposed the bug -- `SHOW TABLES FROM
+    // sales_wh.ac` answered with ops_wh.ac's `audit`, which made the sales_wh
+    // fixture table look as though it had stopped existing.
+    let sales_tables = col_strings(
+        &exec_ok(&ctx, &ctx.carol, "SHOW TABLES FROM sales_wh.ac").await,
+        "Table",
+    );
+    let ops_tables = col_strings(
+        &exec_ok(&ctx, &ctx.carol, "SHOW TABLES FROM ops_wh.ac").await,
+        "Table",
+    );
+    assert!(
+        sales_tables.iter().any(|t| t == "orders"),
+        "sales_wh.ac holds the orders fixture, got {sales_tables:?}"
+    );
+    assert!(
+        ops_tables.iter().any(|t| t == "audit"),
+        "ops_wh.ac holds the audit fixture, got {ops_tables:?}"
+    );
+    assert!(
+        !sales_tables.iter().any(|t| t == "audit"),
+        "sales_wh.ac must not report ops_wh.ac's tables, got {sales_tables:?}"
+    );
+
+    // A catalog that exists in neither config nor Polaris is refused, not silently
+    // answered from the session catalog.
+    let err = ctx
+        .handler
+        .execute(&ctx.carol, "SHOW SCHEMAS FROM no_such_wh", None)
+        .await
+        .expect_err("an unknown catalog must not be served from the session catalog");
+    assert!(
+        err.to_string().contains("no_such_wh"),
+        "the error must name the catalog asked for, got: {err}"
+    );
+
+    for stmt in [
+        "DROP SCHEMA IF EXISTS sales_wh.only_in_sales",
+        "DROP SCHEMA IF EXISTS ops_wh.only_in_ops",
+    ] {
+        let _ = ctx.handler.execute(&ctx.carol, stmt, None).await;
+    }
+}
