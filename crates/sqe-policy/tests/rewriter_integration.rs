@@ -169,7 +169,7 @@ async fn row_filter_and_mask_execute_over_qualified_multilevel_scan() {
         .column_masks
         .insert("salary".to_string(), MaskType::Nullify);
     // schema "ns1.ns2" -> last dotted component "ns2" is the namespace key
-    store.add_table_policy("ns2", "employees", policy).await;
+    store.add_table_policy("ns1.ns2", "employees", policy).await;
 
     let rewriter = PolicyPlanRewriter::new(Arc::new(store));
     let (rewritten, _summary) = rewriter.evaluate(&user("alice", &[]), plan).await.unwrap();
@@ -392,8 +392,12 @@ async fn poisoned_policy_store_fails_closed_to_zero_rows() {
 // in the rewriter, leaving an empty ResolvedPolicy that passed through. Any
 // row filter / mask / restriction on a multi-level-namespace table was
 // silently bypassed. The read path now keys by the LAST namespace component
-// (matching the write path's `namespace().last()`), so a policy stored under
-// `ns2` is found.
+// The policy key is the FULL dotted namespace `ns1.ns2`.
+//
+// These used to key by the last component (`ns2`), justified as "matching the
+// write path's namespace().last()". That justification was stale: nothing outside
+// tests stores policies that way, and truncating made `sales` and `a.b.sales`
+// collide on one key, so a policy written for one fired on the other.
 
 // These four assert on rewritten plan shape rather than executing, because a
 // 4-part `cat.ns1.ns2.employees` reference cannot be registered in a default
@@ -405,12 +409,12 @@ async fn poisoned_policy_store_fails_closed_to_zero_rows() {
 async fn multilevel_namespace_row_filter_is_applied() {
     let plan = build_multilevel_scan();
 
-    // Policy keyed by the LAST namespace component, exactly as the write
-    // path stores it (write_handler keys by `namespace().last()`).
+    // Policy keyed by the FULL dotted namespace, which is what
+    // `resolve_policy_key` now produces.
     let store = InMemoryPolicyStore::new();
     let mut policy = ResolvedPolicy::default();
     policy.row_filters.push(col("region").eq(lit("EU")));
-    store.add_table_policy("ns2", "employees", policy).await;
+    store.add_table_policy("ns1.ns2", "employees", policy).await;
 
     let rewriter = PolicyPlanRewriter::new(Arc::new(store));
     let (rewritten, _summary) = rewriter
@@ -434,7 +438,7 @@ async fn multilevel_namespace_restriction_is_applied() {
         restricted_columns: vec!["ssn".to_string()],
         ..Default::default()
     };
-    store.add_table_policy("ns2", "employees", policy).await;
+    store.add_table_policy("ns1.ns2", "employees", policy).await;
 
     let rewriter = PolicyPlanRewriter::new(Arc::new(store));
     let (rewritten, _summary) = rewriter.evaluate(&user("bob", &[]), plan).await.unwrap();
@@ -525,7 +529,7 @@ async fn partial_mask_show_last4_on_ssn_over_qualified_multilevel_scan() {
             digit: 'x',
         },
     );
-    store.add_table_policy("ns2", "employees", policy).await;
+    store.add_table_policy("ns1.ns2", "employees", policy).await;
 
     let rewriter = PolicyPlanRewriter::new(Arc::new(store));
     let (rewritten, _summary) = rewriter.evaluate(&user("alice", &[]), plan).await.unwrap();
@@ -574,7 +578,7 @@ async fn date_show_year_on_timestamp_over_qualified_multilevel_scan() {
     policy
         .column_masks
         .insert("hired_at".to_string(), MaskType::DateShowYear);
-    store.add_table_policy("ns2", "employees", policy).await;
+    store.add_table_policy("ns1.ns2", "employees", policy).await;
 
     let rewriter = PolicyPlanRewriter::new(Arc::new(store));
     let (rewritten, _summary) = rewriter.evaluate(&user("bob", &[]), plan).await.unwrap();
@@ -1180,7 +1184,7 @@ async fn session_fn_row_filter_admin_sees_all_rows_and_folds_to_literal() {
     let store = InMemoryPolicyStore::new();
     let mut policy = ResolvedPolicy::default();
     policy.row_filters.push(filter_expr);
-    store.add_table_policy("ns2", "employees", policy).await;
+    store.add_table_policy("ns1.ns2", "employees", policy).await;
 
     // SessionUser roles do not affect InMemoryPolicyStore resolution; the
     // SessionIdentity baked into the UDF is what matters for fold behavior.
@@ -1235,7 +1239,7 @@ async fn session_fn_row_filter_analyst_sees_eu_only_and_folds_to_literal() {
     let store = InMemoryPolicyStore::new();
     let mut policy = ResolvedPolicy::default();
     policy.row_filters.push(filter_expr);
-    store.add_table_policy("ns2", "employees", policy).await;
+    store.add_table_policy("ns1.ns2", "employees", policy).await;
 
     let rewriter = PolicyPlanRewriter::new(Arc::new(store));
     let (rewritten, _summary) = rewriter.evaluate(&user("dave", &["analyst"]), plan).await.unwrap();
@@ -1310,7 +1314,7 @@ async fn partial_mask_on_non_string_falls_back_to_typed_null_over_qualified_mult
             digit: 'x',
         },
     );
-    store.add_table_policy("ns2", "employees", policy).await;
+    store.add_table_policy("ns1.ns2", "employees", policy).await;
 
     let rewriter = PolicyPlanRewriter::new(Arc::new(store));
     let (rewritten, _summary) = rewriter.evaluate(&user("carol", &[]), plan).await.unwrap();
@@ -1330,5 +1334,68 @@ async fn partial_mask_on_non_string_falls_back_to_typed_null_over_qualified_mult
         id_col.null_count(),
         id_col.len(),
         "every customer_id value must be NULL after non-string PartialMask fallback"
+    );
+}
+
+/// A row filter on a column the scan does not project must still be enforced.
+///
+/// The documented failure: a filter on `region` against a view declared
+/// `SELECT customer_id, ssn FROM employees` failed the whole query with
+/// "Schema error: No field named region". Fail-closed, so not a leak, but the
+/// message named neither the policy nor the view, and a row filter plus a narrow
+/// view over the same table were mutually exclusive.
+///
+/// Mechanism, confirmed by this test rather than assumed: the rewriter injects the
+/// filter directly above the `TableScan`, and a view's expanded scan carries a
+/// pushed-down PROJECTION, so the filter is normalised against the projected
+/// schema (`customer_id`, `ssn`) where `region` genuinely is absent. A direct query
+/// with the same narrow projection works because the rewriter runs BEFORE the
+/// projection-pushdown optimizer pass, so its scan still exposes every column.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn row_filter_on_an_unprojected_column_is_enforced_not_an_error() {
+    let schema = employee_schema();
+    let batch = employee_batch(schema.clone());
+    let mem = Arc::new(MemTable::try_new(schema, vec![vec![batch]]).unwrap());
+    let table_ref = TableReference::full("cat", "ns1.ns2", "employees");
+    // Projection excluding `region` (index 4): what a narrow view expands to.
+    let plan = LogicalPlanBuilder::scan(
+        table_ref,
+        provider_as_source(mem.clone()),
+        Some(vec![0, 1]),
+    )
+    .unwrap()
+    .build()
+    .unwrap();
+
+    let store = InMemoryPolicyStore::new();
+    let mut policy = ResolvedPolicy::default();
+    policy.row_filters.push(col("region").eq(lit("EU")));
+    store.add_table_policy("ns1.ns2", "employees", policy).await;
+
+    let rewriter = PolicyPlanRewriter::new(Arc::new(store));
+    let (rewritten, summary) = rewriter
+        .evaluate(&user("alice", &[]), plan)
+        .await
+        .expect("a filter on an unprojected column must not fail the query");
+
+    // The filter is applied, not dropped: dropping it would turn a fail-closed
+    // error into a silent leak, which is far worse than the error it replaces.
+    assert_eq!(
+        summary.row_filters_applied, 1,
+        "the row filter must be applied, not skipped"
+    );
+
+    // And the output schema is unchanged: the widening is internal, so a caller
+    // that asked for two columns still gets two.
+    let fields: Vec<String> = rewritten
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| f.name().to_string())
+        .collect();
+    assert_eq!(
+        fields,
+        vec!["customer_id".to_string(), "ssn".to_string()],
+        "the projection must be restored; `region` must not leak into the output"
     );
 }

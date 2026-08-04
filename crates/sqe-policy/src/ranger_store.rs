@@ -316,23 +316,102 @@ fn hive_database(namespace: &str) -> String {
     namespace.to_string()
 }
 
-/// True if a Ranger resource value list matches `target` (supports `*`
-/// wildcard and exact match; `isExcludes` inverts the result).
+/// Ranger wildcard match: `*` matches any run of characters (including none),
+/// `?` matches exactly one.
 ///
-// Only exact match and bare "*" are supported. Ranger glob patterns (e.g.
-// "orders*", "*_pii") are NOT matched in MVP — author policies with exact
-// names or "*". An empty values list matches nothing.
+/// Semantics taken from the live `hive` service definition, whose `database`,
+/// `table` and `column` resources all declare
+/// `matcherOptions: {wildCard: "true", ignoreCase: "true"}`. Ranger implements
+/// that with commons-io `FilenameUtils.wildcardMatch` and `IOCase.INSENSITIVE`,
+/// where no character other than `*` and `?` is special.
+///
+/// Case folding is part of the same contract, not a separate liberty: with
+/// `ignoreCase: true`, a policy written on `Orders` fires for `orders` in Ranger,
+/// and SQE comparing case-sensitively would silently not mask.
+///
+/// Iterative with a single backtrack point, so a pattern like `*a*a*a*a*` cannot
+/// blow up: policies are operator input reaching a per-query path.
+fn wildcard_match(pattern: &str, target: &str) -> bool {
+    let p: Vec<char> = pattern.to_lowercase().chars().collect();
+    let t: Vec<char> = target.to_lowercase().chars().collect();
+    let (mut pi, mut ti) = (0usize, 0usize);
+    let mut star: Option<usize> = None;
+    let mut resume = 0usize;
+    while ti < t.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == t[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star = Some(pi);
+            pi += 1;
+            resume = ti;
+        } else if let Some(s) = star {
+            // Backtrack: let the last `*` swallow one more character.
+            pi = s + 1;
+            resume += 1;
+            ti = resume;
+        } else {
+            return false;
+        }
+    }
+    // Trailing `*`s may match nothing.
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
+/// True if a Ranger resource value list matches `target`.
+///
+/// Wildcards and case-insensitivity per the service definition (see
+/// `wildcard_match`); `isExcludes` inverts the result. An empty values list
+/// matches nothing.
+///
+/// Previously only exact match and a bare `*` were honoured, so a policy written
+/// `orders*` or `*_pii` silently never fired. For a masking or row-filtering
+/// policy that means the protection is simply ABSENT while the console shows it
+/// as configured, which is the worst failure mode a governance tool has.
 fn resource_matches(res: &RangerResource, target: &str) -> bool {
-    let hit = res.values.iter().any(|v| v == "*" || v == target);
+    let hit = res.values.iter().any(|v| wildcard_match(v, target));
     hit ^ res.is_excludes
 }
 
 /// True if a policy's database + table resources match the target table.
+///
+/// `database` is the full dotted Iceberg namespace. A policy naming only its LAST
+/// component also matches, and says so in the log.
+///
+/// That fallback is a migration path, not the intended convention.
+/// `resolve_policy_key` used to pass only the last component, so `sales` and
+/// `a.b.sales` collided on the Ranger database `sales` and a policy written for one
+/// fired on the other. Now that the full namespace is passed, a policy authored
+/// against the old key would stop matching -- and for a mask or row filter, a
+/// policy that stops matching is protection silently disappearing. Over-matching an
+/// old policy is the safe direction while operators migrate; under-matching is a
+/// leak.
 fn policy_matches_table(p: &RangerPolicy, database: &str, table: &str) -> bool {
     let db_ok = p
         .resources
         .get("database")
-        .map(|r| resource_matches(r, database))
+        .map(|r| {
+            if resource_matches(r, database) {
+                return true;
+            }
+            let last = database.rsplit('.').next().unwrap_or(database);
+            if last != database && resource_matches(r, last) {
+                warn!(
+                    policy_id = p.id,
+                    namespace = %database,
+                    matched_as = %last,
+                    "Ranger policy matched only by the LAST namespace component. This is a \
+                     compatibility path: rewrite the policy's `database` value as the full \
+                     dotted namespace, which is also what Kyuubi uses. Two namespaces sharing \
+                     a last component are indistinguishable to a policy written this way."
+                );
+                return true;
+            }
+            false
+        })
         .unwrap_or(false);
     let tbl_ok = p
         .resources
@@ -970,41 +1049,61 @@ mod tests {
         }
     }
 
-    /// Documented limit, pinned so a change is deliberate: Ranger GLOB patterns
-    /// are not matched. Only an exact value and a bare `*` match.
+    /// Ranger wildcard and case-insensitive matching, per the `hive` service
+    /// definition's `matcherOptions: {wildCard: "true", ignoreCase: "true"}`.
     ///
-    /// This is characterization, not aspiration. An operator who writes
-    /// `orders*` in the Ranger console gets a policy that silently never fires,
-    /// which is the worst failure mode a governance tool has, so the limit is
-    /// worth an executable statement rather than a sentence in a doc. If glob
-    /// support is added, this test SHOULD fail and be rewritten.
+    /// This replaces a characterization test that pinned the OPPOSITE behaviour
+    /// (`ranger_glob_patterns_are_not_matched`) and said in its own comment that it
+    /// SHOULD fail and be rewritten when glob support landed. It has.
+    ///
+    /// Both halves matter for the same reason: a policy that does not fire is
+    /// masking or filtering that is silently ABSENT while the Ranger console shows
+    /// it as configured.
     #[test]
-    fn ranger_glob_patterns_are_not_matched() {
-        let glob = RangerResource {
-            values: vec!["orders*".to_string()],
+    fn ranger_wildcards_and_case_folding_match_the_servicedef() {
+        let r = |v: &str| RangerResource {
+            values: vec![v.to_string()],
             is_excludes: false,
         };
-        assert!(
-            !resource_matches(&glob, "orders"),
-            "a prefix glob must not match; if this fails, glob support landed"
-        );
-        assert!(!resource_matches(&glob, "orders_2024"));
-        assert!(
-            resource_matches(&glob, "orders*"),
-            "the pattern only matches its own literal text"
-        );
 
-        let star = RangerResource {
-            values: vec!["*".to_string()],
-            is_excludes: false,
-        };
-        assert!(resource_matches(&star, "anything"), "a bare * matches");
+        // Prefix, suffix and interior globs.
+        assert!(resource_matches(&r("orders*"), "orders"), "* may match nothing");
+        assert!(resource_matches(&r("orders*"), "orders_2024"));
+        assert!(!resource_matches(&r("orders*"), "sales_orders"));
+        assert!(resource_matches(&r("*_pii"), "customer_pii"));
+        assert!(!resource_matches(&r("*_pii"), "pii_customer"));
+        assert!(resource_matches(&r("a*b*c"), "axxbyyc"));
 
-        let empty = RangerResource {
-            values: vec![],
-            is_excludes: false,
+        // `?` is exactly one character.
+        assert!(resource_matches(&r("orders_20??"), "orders_2024"));
+        assert!(!resource_matches(&r("orders_20??"), "orders_204"));
+
+        // ignoreCase, both directions.
+        assert!(resource_matches(&r("Orders"), "orders"));
+        assert!(resource_matches(&r("orders"), "ORDERS"));
+        assert!(resource_matches(&r("ORD*"), "orders_2024"));
+
+        // Nothing else is special: a Ranger pattern is not a regex, so these are
+        // literals and must NOT match arbitrary text.
+        assert!(!resource_matches(&r("orders."), "ordersX"));
+        assert!(!resource_matches(&r("or.*"), "orders"));
+
+        // Bare `*` and exact match still behave.
+        assert!(resource_matches(&r("*"), "anything"));
+        assert!(resource_matches(&r("orders"), "orders"));
+        assert!(!resource_matches(&r("orders"), "invoices"));
+
+        // isExcludes inverts, and now inverts a GLOB too.
+        let excl = RangerResource {
+            values: vec!["tmp_*".to_string()],
+            is_excludes: true,
         };
-        assert!(!resource_matches(&empty, "orders"), "no values matches nothing");
+        assert!(!resource_matches(&excl, "tmp_scratch"), "excluded by the glob");
+        assert!(resource_matches(&excl, "orders"), "outside the exclusion");
+
+        // An empty values list matches nothing.
+        let empty = RangerResource { values: vec![], is_excludes: false };
+        assert!(!resource_matches(&empty, "orders"));
     }
 
     fn user_with_groups(name: &str, roles: &[&str], groups: &[&str]) -> SessionUser {
@@ -1017,15 +1116,20 @@ mod tests {
         }
     }
 
-    /// Group-bound policy items must apply.
-    ///
-    /// Enterprise Ranger deployments bind policies to directory groups rather
-    /// than naming users, with usersync mirroring the directory. SQE matched only
-    /// the username and token roles and skipped group-bound items outright, so a
-    /// whole class of production policy silently did not apply.
-    ///
-    /// `SessionUser` already carried `groups` from the provider's `groups_claim`;
-    /// the matcher just ignored them.
+    /// A pathological pattern must not blow up: policies are operator input on a
+    /// per-query path, so backtracking has to stay bounded.
+    #[test]
+    fn wildcard_matching_terminates_on_a_pathological_pattern() {
+        let start = std::time::Instant::now();
+        assert!(!wildcard_match("*a*a*a*a*a*a*a*b", &"a".repeat(64)));
+        assert!(wildcard_match(&"*".repeat(32), "anything"));
+        assert!(
+            start.elapsed() < std::time::Duration::from_millis(500),
+            "matching took {:?}; the backtracking is not bounded",
+            start.elapsed()
+        );
+    }
+
     #[test]
     fn group_bound_items_match_the_session_groups() {
         let g = ["data-platform".to_string()];
