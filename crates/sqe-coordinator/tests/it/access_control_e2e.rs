@@ -2520,3 +2520,269 @@ async fn sql_deny_blocks_a_granted_read_and_revoke_clears_it() {
         let _ = ctx.handler.execute(&ctx.carol, &stmt, None).await;
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Who may issue a GRANT: the coarse role gate vs Ranger's per-resource one
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Under the default `grant_authority = "admin-role"`, a non-admin cannot GRANT.
+///
+/// The control is carol running the identical statement: without it a refusal is
+/// indistinguishable from an invalid statement, which is how a broken parser reads
+/// as a working authz gate.
+#[tokio::test]
+#[ignore]
+async fn a_non_admin_cannot_grant_under_the_default_gate() {
+    ac_gate!();
+    let _guard = crate::common::serial().lock().await;
+    let ctx = ac_setup().await;
+
+    let sql = format!("GRANT SELECT ON {ORDERS} TO USER \"bob\"");
+    let err = ctx
+        .handler
+        .execute(&ctx.dave, &sql, None)
+        .await
+        .expect_err("dave holds no admin role, so the default gate must refuse")
+        .to_string();
+    assert!(
+        err.contains("403 Forbidden") && err.contains("GRANT"),
+        "the refusal must be an authorization error naming the statement, got: {err}"
+    );
+    assert!(
+        err.contains("admin roles"),
+        "and must name what is missing, got: {err}"
+    );
+
+    // Control: the statement itself is fine.
+    exec_ok(&ctx, &ctx.carol, &sql).await;
+    let _ = ctx
+        .handler
+        .execute(
+            &ctx.carol,
+            &format!("REVOKE SELECT ON {ORDERS} FROM USER \"bob\""),
+            None,
+        )
+        .await;
+}
+
+/// With `grant_authority = "ranger-delegate"`, a table owner grants on their own
+/// table without an admin role -- and still cannot grant on a table they do not own.
+///
+/// Why the seeding step is there, and why it is not a workaround. SQE's `GRANT`
+/// writes three policies (catalog, namespace, table) because reaching a table needs
+/// discovery at every level above it. Ranger authorizes each write against the
+/// grantor, and delegate admin does NOT cascade upward: measured against 2.8, a
+/// grantor holding it on `cat.ns.tbl` is refused 403 on both `cat.ns` and `cat`.
+/// So a delegated grant can only complete when the two traversal levels are
+/// already satisfied for the GRANTEE, which is what carol's grant-then-revoke
+/// below leaves behind (a table REVOKE deliberately keeps the ancestors; see
+/// `one_table_grant_writes_the_namespace_it_needs`). That is the real shape of the
+/// feature: admins onboard a principal to a catalog once, table owners manage their
+/// own tables from then on. Documented, not hidden -- an unseeded grantee gets an
+/// error naming the level and the statement that fixes it.
+#[tokio::test]
+#[ignore]
+async fn a_delegated_owner_grants_on_their_own_table_without_an_admin_role() {
+    ac_gate!();
+    let _guard = crate::common::serial().lock().await;
+    let ctx = ac_setup().await;
+
+    // A table with no grant history, so what dave writes is the only thing that
+    // can satisfy the assertion.
+    let table = "sales_wh.ac.orders_delegated";
+    let _ = ctx
+        .handler
+        .execute(&ctx.carol, &format!("DROP TABLE IF EXISTS {table}"), None)
+        .await;
+    exec_ok(
+        &ctx,
+        &ctx.carol,
+        &format!("CREATE TABLE {table} (id BIGINT)"),
+    )
+    .await;
+    exec_ok(
+        &ctx,
+        &ctx.carol,
+        &format!("INSERT INTO {table} VALUES (1),(2)"),
+    )
+    .await;
+
+    // A second handler differing from `ctx.handler` in exactly one config value.
+    // The warm cache comes along so catalog metadata is not part of the experiment.
+    let (delegating, _cache) =
+        crate::common::setup_ranger_handler_sharing(Some(ctx.cache.clone()), |c| {
+            c.access_control.grant_authority = sqe_core::config::GrantAuthority::RangerDelegate
+        })
+        .await;
+
+    // dave becomes the owner of this table: WITH GRANT OPTION is delegateAdmin.
+    exec_ok(
+        &ctx,
+        &ctx.carol,
+        &format!("GRANT SELECT ON {table} TO USER \"dave\" WITH GRANT OPTION"),
+    )
+    .await;
+    // bob is onboarded to the catalog and namespace by an admin, then loses the
+    // table grant again. The two traversal levels survive on purpose.
+    exec_ok(
+        &ctx,
+        &ctx.carol,
+        &format!("GRANT SELECT ON {table} TO USER \"bob\""),
+    )
+    .await;
+    exec_ok(
+        &ctx,
+        &ctx.carol,
+        &format!("REVOKE SELECT ON {table} FROM USER \"bob\""),
+    )
+    .await;
+    assert!(
+        !polaris_access_types_for(
+            &ctx,
+            "bob",
+            "sales_wh",
+            Some("ac"),
+            Some("orders_delegated")
+        )
+        .await
+        .contains(&"table-data-read".to_string()),
+        "pre-state: bob must hold no read on the table, or dave's grant proves nothing"
+    );
+    assert_eq!(
+        polaris_access_types_for(&ctx, "bob", "sales_wh", None, None).await,
+        vec!["namespace-list".to_string()],
+        "pre-state: bob keeps catalog discovery, which is what lets a delegated \
+         grant skip that level"
+    );
+
+    // The control that isolates the config value: the SAME statement by the SAME
+    // user on the default-gated handler is refused.
+    let sql = format!("GRANT SELECT ON {table} TO USER \"bob\"");
+    let gated = ctx
+        .handler
+        .execute(&ctx.dave, &sql, None)
+        .await
+        .expect_err("the default handler must still refuse dave")
+        .to_string();
+    assert!(
+        gated.contains("admin roles"),
+        "expected the role gate, got: {gated}"
+    );
+
+    // The statement under test, on the handler that differs in that one value.
+    delegating
+        .execute(&ctx.dave, &sql, None)
+        .await
+        .unwrap_or_else(|e| panic!("[dave, ranger-delegate] {sql} failed: {e}"));
+    let bob_now = polaris_access_types_for(
+        &ctx,
+        "bob",
+        "sales_wh",
+        Some("ac"),
+        Some("orders_delegated"),
+    )
+    .await;
+    assert!(
+        bob_now.contains(&"table-data-read".to_string()),
+        "dave's delegated grant must confer read on the table he owns, got {bob_now:?}"
+    );
+
+    // And Ranger is still the authority: a table dave does NOT own stays refused,
+    // under the same relaxed config. Without this the test would equally pass if
+    // the relaxation had turned into "any authenticated user may grant anything".
+    let not_his = delegating
+        .execute(
+            &ctx.dave,
+            &format!("GRANT SELECT ON {AUDIT} TO USER \"bob\""),
+            None,
+        )
+        .await
+        .expect_err("dave holds no delegate admin on the audit table")
+        .to_string();
+    assert!(
+        not_his.contains("403") || not_his.to_lowercase().contains("delegate"),
+        "the refusal must come from Ranger's per-resource check, got: {not_his}"
+    );
+
+    for stmt in [
+        format!("REVOKE SELECT ON {table} FROM USER \"bob\""),
+        format!("REVOKE SELECT ON {table} FROM USER \"dave\""),
+        format!("DROP TABLE IF EXISTS {table}"),
+    ] {
+        let _ = ctx.handler.execute(&ctx.carol, &stmt, None).await;
+    }
+}
+
+/// DENY keeps its admin gate even under `ranger-delegate`.
+///
+/// Not an oversight. Ranger's grant/revoke endpoints cannot write a deny item at
+/// all, so `DENY` goes through the policy API, which authorizes the REST user SQE
+/// connects with and takes no grantor. There is no per-resource check to hand over
+/// to, so standing the role gate down would leave the write unauthorized rather
+/// than authorized more finely.
+#[tokio::test]
+#[ignore]
+async fn deny_still_requires_an_admin_role_under_ranger_delegate() {
+    ac_gate!();
+    let _guard = crate::common::serial().lock().await;
+    let ctx = ac_setup().await;
+
+    let (delegating, _cache) =
+        crate::common::setup_ranger_handler_sharing(Some(ctx.cache.clone()), |c| {
+            c.access_control.grant_authority = sqe_core::config::GrantAuthority::RangerDelegate
+        })
+        .await;
+
+    // A table of its own: a deny item left behind on a fixture table would block a
+    // later test rather than fail this one.
+    let table = "sales_wh.ac.orders_deny_gate";
+    let _ = ctx
+        .handler
+        .execute(&ctx.carol, &format!("DROP TABLE IF EXISTS {table}"), None)
+        .await;
+    exec_ok(
+        &ctx,
+        &ctx.carol,
+        &format!("CREATE TABLE {table} (id BIGINT)"),
+    )
+    .await;
+
+    // dave owns the table, so under this config he CAN grant on it. Establishing
+    // that first is what makes the refusal below specific to DENY.
+    exec_ok(
+        &ctx,
+        &ctx.carol,
+        &format!("GRANT SELECT ON {table} TO USER \"dave\" WITH GRANT OPTION"),
+    )
+    .await;
+
+    let err = delegating
+        .execute(
+            &ctx.dave,
+            &format!("DENY SELECT ON {table} TO USER \"bob\""),
+            None,
+        )
+        .await
+        .expect_err("DENY must stay admin-only whatever grant_authority says")
+        .to_string();
+    assert!(
+        err.contains("403 Forbidden") && err.contains("DENY"),
+        "the refusal must name DENY, got: {err}"
+    );
+
+    // Control: DENY itself works on this handler, for an admin.
+    exec_ok(
+        &ctx,
+        &ctx.carol,
+        &format!("DENY SELECT ON {table} TO USER \"bob\""),
+    )
+    .await;
+
+    for stmt in [
+        format!("REVOKE SELECT ON {table} FROM USER \"bob\""),
+        format!("REVOKE SELECT ON {table} FROM USER \"dave\""),
+        format!("DROP TABLE IF EXISTS {table}"),
+    ] {
+        let _ = ctx.handler.execute(&ctx.carol, &stmt, None).await;
+    }
+}
