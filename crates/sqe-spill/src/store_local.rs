@@ -753,7 +753,13 @@ mod tests {
         // The module doc already asks for this "when running store I/O that must
         // not observe another test's faults"; these call sites had simply not been
         // updated.
-        let _fault_guard = crate::fault::serial_test_guard();
+        //
+        // `FaultSession` with an empty plan rather than `serial_test_guard()`: both
+        // take the same serial mutex and clear the queue, but the bare guard is a
+        // `MutexGuard` held across an await, which `clippy::await_holding_lock`
+        // rejects. `FaultSession` keeps it inside the struct, which is why the
+        // fault-injecting tests already use it.
+        let _fault_guard = crate::fault::FaultSession::new(vec![]);
         let tmp = tempfile::tempdir().unwrap();
         let store = LocalSegmentStore::open(tmp.path(), 1 << 30, 0, 1, 1).unwrap();
         // Scope with credential-like input is sanitized.
