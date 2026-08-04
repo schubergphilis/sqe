@@ -169,7 +169,7 @@ async fn row_filter_and_mask_execute_over_qualified_multilevel_scan() {
         .column_masks
         .insert("salary".to_string(), MaskType::Nullify);
     // schema "ns1.ns2" -> last dotted component "ns2" is the namespace key
-    store.add_table_policy("ns2", "employees", policy).await;
+    store.add_table_policy("ns1.ns2", "employees", policy).await;
 
     let rewriter = PolicyPlanRewriter::new(Arc::new(store));
     let (rewritten, _summary) = rewriter.evaluate(&user("alice", &[]), plan).await.unwrap();
@@ -392,8 +392,12 @@ async fn poisoned_policy_store_fails_closed_to_zero_rows() {
 // in the rewriter, leaving an empty ResolvedPolicy that passed through. Any
 // row filter / mask / restriction on a multi-level-namespace table was
 // silently bypassed. The read path now keys by the LAST namespace component
-// (matching the write path's `namespace().last()`), so a policy stored under
-// `ns2` is found.
+// The policy key is the FULL dotted namespace `ns1.ns2`.
+//
+// These used to key by the last component (`ns2`), justified as "matching the
+// write path's namespace().last()". That justification was stale: nothing outside
+// tests stores policies that way, and truncating made `sales` and `a.b.sales`
+// collide on one key, so a policy written for one fired on the other.
 
 // These four assert on rewritten plan shape rather than executing, because a
 // 4-part `cat.ns1.ns2.employees` reference cannot be registered in a default
@@ -405,12 +409,12 @@ async fn poisoned_policy_store_fails_closed_to_zero_rows() {
 async fn multilevel_namespace_row_filter_is_applied() {
     let plan = build_multilevel_scan();
 
-    // Policy keyed by the LAST namespace component, exactly as the write
-    // path stores it (write_handler keys by `namespace().last()`).
+    // Policy keyed by the FULL dotted namespace, which is what
+    // `resolve_policy_key` now produces.
     let store = InMemoryPolicyStore::new();
     let mut policy = ResolvedPolicy::default();
     policy.row_filters.push(col("region").eq(lit("EU")));
-    store.add_table_policy("ns2", "employees", policy).await;
+    store.add_table_policy("ns1.ns2", "employees", policy).await;
 
     let rewriter = PolicyPlanRewriter::new(Arc::new(store));
     let (rewritten, _summary) = rewriter
@@ -434,7 +438,7 @@ async fn multilevel_namespace_restriction_is_applied() {
         restricted_columns: vec!["ssn".to_string()],
         ..Default::default()
     };
-    store.add_table_policy("ns2", "employees", policy).await;
+    store.add_table_policy("ns1.ns2", "employees", policy).await;
 
     let rewriter = PolicyPlanRewriter::new(Arc::new(store));
     let (rewritten, _summary) = rewriter.evaluate(&user("bob", &[]), plan).await.unwrap();
@@ -525,7 +529,7 @@ async fn partial_mask_show_last4_on_ssn_over_qualified_multilevel_scan() {
             digit: 'x',
         },
     );
-    store.add_table_policy("ns2", "employees", policy).await;
+    store.add_table_policy("ns1.ns2", "employees", policy).await;
 
     let rewriter = PolicyPlanRewriter::new(Arc::new(store));
     let (rewritten, _summary) = rewriter.evaluate(&user("alice", &[]), plan).await.unwrap();
@@ -574,7 +578,7 @@ async fn date_show_year_on_timestamp_over_qualified_multilevel_scan() {
     policy
         .column_masks
         .insert("hired_at".to_string(), MaskType::DateShowYear);
-    store.add_table_policy("ns2", "employees", policy).await;
+    store.add_table_policy("ns1.ns2", "employees", policy).await;
 
     let rewriter = PolicyPlanRewriter::new(Arc::new(store));
     let (rewritten, _summary) = rewriter.evaluate(&user("bob", &[]), plan).await.unwrap();
@@ -1180,7 +1184,7 @@ async fn session_fn_row_filter_admin_sees_all_rows_and_folds_to_literal() {
     let store = InMemoryPolicyStore::new();
     let mut policy = ResolvedPolicy::default();
     policy.row_filters.push(filter_expr);
-    store.add_table_policy("ns2", "employees", policy).await;
+    store.add_table_policy("ns1.ns2", "employees", policy).await;
 
     // SessionUser roles do not affect InMemoryPolicyStore resolution; the
     // SessionIdentity baked into the UDF is what matters for fold behavior.
@@ -1235,7 +1239,7 @@ async fn session_fn_row_filter_analyst_sees_eu_only_and_folds_to_literal() {
     let store = InMemoryPolicyStore::new();
     let mut policy = ResolvedPolicy::default();
     policy.row_filters.push(filter_expr);
-    store.add_table_policy("ns2", "employees", policy).await;
+    store.add_table_policy("ns1.ns2", "employees", policy).await;
 
     let rewriter = PolicyPlanRewriter::new(Arc::new(store));
     let (rewritten, _summary) = rewriter.evaluate(&user("dave", &["analyst"]), plan).await.unwrap();
@@ -1310,7 +1314,7 @@ async fn partial_mask_on_non_string_falls_back_to_typed_null_over_qualified_mult
             digit: 'x',
         },
     );
-    store.add_table_policy("ns2", "employees", policy).await;
+    store.add_table_policy("ns1.ns2", "employees", policy).await;
 
     let rewriter = PolicyPlanRewriter::new(Arc::new(store));
     let (rewritten, _summary) = rewriter.evaluate(&user("carol", &[]), plan).await.unwrap();

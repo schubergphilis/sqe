@@ -140,7 +140,7 @@ impl PolicyEnforcer for PolicyPlanRewriter {
             }
             // Derive the (namespace, table) policy key from the structured
             // reference. This MUST match the write path's scheme
-            // (write_handler.rs keys by `namespace().last()`), otherwise
+            // (the full dotted namespace, see `resolve_policy_key`), otherwise
             // reads and writes resolve different policies for the same table.
             let Some((namespace, table)) = resolve_policy_key(table_ref) else {
                 // FAIL CLOSED: a reference we cannot confidently map to a
@@ -624,7 +624,7 @@ pub(crate) fn merge_tag_masks(
 /// `cat.a.b.t` lands here as schema `"a.b"`, table `"t"`.
 ///
 /// The policy key MUST match the write path, which keys by
-/// `TableIdent::namespace().last()` (`write_handler.rs`). For a schema of
+/// the full dotted namespace (see `resolve_policy_key`). For a schema of
 /// `"a.b"` the last namespace component is `"b"`. We take the last dotted
 /// component of the schema so reads and writes resolve the same policy.
 ///
@@ -672,14 +672,22 @@ fn resolve_policy_key(
         return None;
     }
 
-    // `schema()` is the (possibly multi-level) namespace string. Take its
-    // last dotted component to match the write path's `namespace().last()`.
-    // A bare table name with no schema falls back to "default", preserving
-    // the existing 1-part behavior.
+    // The FULL (possibly multi-level) namespace string.
+    //
+    // This used to take only the last dotted component, which collided: Iceberg
+    // namespaces `sales` and `a.b.sales` both resolved to the Ranger database
+    // `sales`, so a policy written for one fired on the other. `hive_database`
+    // documents the intended convention as the dotted string itself, which is also
+    // what Kyuubi uses, so the truncation was the odd one out.
+    //
+    // `policy_matches_table` still accepts a policy naming only the last component,
+    // as a logged compatibility path: policies written against the old key would
+    // otherwise stop firing, and for a mask or row filter that means protection
+    // silently disappearing on upgrade.
+    //
+    // A bare table name with no schema falls back to "default", unchanged.
     let namespace = match table_ref.schema() {
-        Some(schema) if !schema.is_empty() => {
-            schema.rsplit('.').next().unwrap_or(schema).to_string()
-        }
+        Some(schema) if !schema.is_empty() => schema.to_string(),
         _ => "default".to_string(),
     };
 
@@ -1154,13 +1162,33 @@ mod tests {
     }
 
     #[test]
-    fn resolve_policy_key_multilevel_takes_last_namespace_component() {
-        // cat.ns1.ns2.employees -> schema "ns1.ns2" -> last component "ns2".
+    fn resolve_policy_key_keeps_the_whole_multilevel_namespace() {
+        // cat.ns1.ns2.employees -> schema "ns1.ns2", kept whole.
+        //
+        // This replaces a test that pinned the last component ("ns2"). That was a
+        // collision: `sales` and `a.b.sales` both resolved to the Ranger database
+        // `sales`, so a policy written for one fired on the other.
         let r = datafusion::common::TableReference::full("cat", "ns1.ns2", "employees");
         assert_eq!(
             resolve_policy_key(&r),
-            Some(("ns2".to_string(), "employees".to_string()))
+            Some(("ns1.ns2".to_string(), "employees".to_string()))
         );
+    }
+
+    #[test]
+    fn namespaces_sharing_a_last_component_no_longer_collide() {
+        // The point of keeping the whole namespace. Before, both of these produced
+        // the key `sales`.
+        let shallow = datafusion::common::TableReference::full("cat", "sales", "orders");
+        let deep = datafusion::common::TableReference::full("cat", "a.b.sales", "orders");
+        let shallow_key = resolve_policy_key(&shallow).expect("shallow");
+        let deep_key = resolve_policy_key(&deep).expect("deep");
+        assert_ne!(
+            shallow_key, deep_key,
+            "two distinct Iceberg namespaces must not resolve to the same policy key"
+        );
+        assert_eq!(shallow_key.0, "sales");
+        assert_eq!(deep_key.0, "a.b.sales");
     }
 
     #[test]
