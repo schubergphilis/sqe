@@ -200,13 +200,16 @@ impl SchemaProvider for SqeSchemaProvider {
             catalog.list_tables(&ns_ident).await
         });
         let mut names: Vec<String> = match tables {
-            Some(Ok(t)) => t.iter().map(|t| t.name().to_string()).collect(),
-            Some(Err(e)) => {
+            Ok(Ok(t)) => t.iter().map(|t| t.name().to_string()).collect(),
+            Ok(Err(e)) => {
                 error!(namespace = %ns, error = %e, "Failed to list tables");
                 Vec::new()
             }
-            None => {
-                error!(namespace = %ns, "No tokio runtime available for table_names()");
+            Err(bridge) => {
+                // Says which failure it was. The old arm reported "no tokio
+                // runtime" for every cause, including a bridged call that timed
+                // out on a runtime that was present.
+                error!(namespace = %ns, error = %bridge, "Could not list tables");
                 return Vec::new();
             }
         };
@@ -215,11 +218,13 @@ impl SchemaProvider for SqeSchemaProvider {
             catalog_for_views.list_views(&ns_ident_views).await
         });
         match views {
-            Some(Ok(view_names)) => names.extend(view_names),
-            Some(Err(e)) => {
+            Ok(Ok(view_names)) => names.extend(view_names),
+            Ok(Err(e)) => {
                 error!(namespace = %ns_for_views, error = %e, "Failed to list views");
             }
-            None => {}
+            Err(bridge) => {
+                error!(namespace = %ns_for_views, error = %bridge, "Could not list views");
+            }
         }
 
         self.table_names_cache
