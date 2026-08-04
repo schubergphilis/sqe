@@ -816,6 +816,27 @@ mod tests {
 
     #[tokio::test]
     async fn s3_roundtrip_preserves_rows() {
+        // Hold the fault serial guard even though this test installs NO faults.
+        //
+        // The fault queue is process-global and CONSUMED on read, so a test doing
+        // store I/O without the guard can steal a fault another test injected: it
+        // then fails with a spurious error, AND the test that installed the fault
+        // sees none. That is exactly what happened in CI -- `s3_object_quota`
+        // panicked on `SpillDiskFull { need: 65536, available: 0 }` while
+        // `fault_disk_full_fails_create_writer_only` reported an empty `got `, two
+        // failures from one stolen fault. It passes locally, because it needs the
+        // two to overlap.
+        //
+        // The module doc already asks for this "when running store I/O that must
+        // not observe another test's faults"; these call sites had simply not been
+        // updated.
+        //
+        // `FaultSession` with an empty plan rather than `serial_test_guard()`: both
+        // take the same serial mutex and clear the queue, but the bare guard is a
+        // `MutexGuard` held across an await, which `clippy::await_holding_lock`
+        // rejects. `FaultSession` keeps it inside the struct, which is why the
+        // fault-injecting tests already use it.
+        let _fault_guard = crate::fault::FaultSession::new(vec![]);
         let store = memory_store();
         let scope = SpillScope::new("q-s3", "stage0", "shuffle", 0, 0);
         let schema = batch(1).schema();
@@ -840,6 +861,27 @@ mod tests {
 
     #[tokio::test]
     async fn s3_object_quota() {
+        // Hold the fault serial guard even though this test installs NO faults.
+        //
+        // The fault queue is process-global and CONSUMED on read, so a test doing
+        // store I/O without the guard can steal a fault another test injected: it
+        // then fails with a spurious error, AND the test that installed the fault
+        // sees none. That is exactly what happened in CI -- `s3_object_quota`
+        // panicked on `SpillDiskFull { need: 65536, available: 0 }` while
+        // `fault_disk_full_fails_create_writer_only` reported an empty `got `, two
+        // failures from one stolen fault. It passes locally, because it needs the
+        // two to overlap.
+        //
+        // The module doc already asks for this "when running store I/O that must
+        // not observe another test's faults"; these call sites had simply not been
+        // updated.
+        //
+        // `FaultSession` with an empty plan rather than `serial_test_guard()`: both
+        // take the same serial mutex and clear the queue, but the bare guard is a
+        // `MutexGuard` held across an await, which `clippy::await_holding_lock`
+        // rejects. `FaultSession` keeps it inside the struct, which is why the
+        // fault-injecting tests already use it.
+        let _fault_guard = crate::fault::FaultSession::new(vec![]);
         let mut cfg = test_config();
         cfg.max_objects = 1;
         let mem: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
@@ -860,6 +902,27 @@ mod tests {
 
     #[tokio::test]
     async fn no_credentials_in_object_keys() {
+        // Hold the fault serial guard even though this test installs NO faults.
+        //
+        // The fault queue is process-global and CONSUMED on read, so a test doing
+        // store I/O without the guard can steal a fault another test injected: it
+        // then fails with a spurious error, AND the test that installed the fault
+        // sees none. That is exactly what happened in CI -- `s3_object_quota`
+        // panicked on `SpillDiskFull { need: 65536, available: 0 }` while
+        // `fault_disk_full_fails_create_writer_only` reported an empty `got `, two
+        // failures from one stolen fault. It passes locally, because it needs the
+        // two to overlap.
+        //
+        // The module doc already asks for this "when running store I/O that must
+        // not observe another test's faults"; these call sites had simply not been
+        // updated.
+        //
+        // `FaultSession` with an empty plan rather than `serial_test_guard()`: both
+        // take the same serial mutex and clear the queue, but the bare guard is a
+        // `MutexGuard` held across an await, which `clippy::await_holding_lock`
+        // rejects. `FaultSession` keeps it inside the struct, which is why the
+        // fault-injecting tests already use it.
+        let _fault_guard = crate::fault::FaultSession::new(vec![]);
         let store = memory_store();
         let scope = SpillScope::new("AKIASECRET", "s", "op", 0, 0);
         let mut w = store

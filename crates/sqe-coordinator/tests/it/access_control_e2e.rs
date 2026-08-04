@@ -1979,9 +1979,33 @@ async fn revoking_write_leaves_an_independent_read_grant_intact() {
 
 /// Access types recorded for `user` on the `polaris` policy whose resource is
 /// exactly `{catalog}` + optional `{namespace}` + optional `{table}`.
+/// Access types for a ROLE grantee. Separate from the user form deliberately: a
+/// helper that searched both fields would match a role named the same as a user
+/// and quietly assert the wrong grantee's access.
+async fn polaris_access_types_for_role(
+    ctx: &AcCtx,
+    role: &str,
+    catalog: &str,
+    namespace: Option<&str>,
+    table: Option<&str>,
+) -> Vec<String> {
+    polaris_access_types_inner(ctx, "roles", role, catalog, namespace, table).await
+}
+
 async fn polaris_access_types_for(
     ctx: &AcCtx,
     user: &str,
+    catalog: &str,
+    namespace: Option<&str>,
+    table: Option<&str>,
+) -> Vec<String> {
+    polaris_access_types_inner(ctx, "users", user, catalog, namespace, table).await
+}
+
+async fn polaris_access_types_inner(
+    ctx: &AcCtx,
+    field: &str,
+    name: &str,
     catalog: &str,
     namespace: Option<&str>,
     table: Option<&str>,
@@ -2008,9 +2032,9 @@ async fn polaris_access_types_for(
         let mut out = Vec::new();
         for item in p.get("policyItems").and_then(|v| v.as_array()).into_iter().flatten() {
             let named = item
-                .get("users")
+                .get(field)
                 .and_then(|u| u.as_array())
-                .is_some_and(|us| us.iter().any(|u| u.as_str() == Some(user)));
+                .is_some_and(|us| us.iter().any(|u| u.as_str() == Some(name)));
             if !named {
                 continue;
             }
@@ -2122,8 +2146,12 @@ async fn one_table_grant_writes_the_namespace_it_needs() {
     let ns = polaris_access_types_for(&ctx, "dave", "sales_wh", Some("ac"), None).await;
     assert_eq!(
         ns,
-        vec!["namespace-properties-read".to_string()],
-        "namespace level: visibility only, no table access"
+        vec![
+            "namespace-list".to_string(),
+            "namespace-properties-read".to_string()
+        ],
+        "namespace level: v4's expansion of namespace-properties-read, which implies \
+         namespace-list scoped to THIS namespace. Visibility, no table access."
     );
 
     // The table grant itself is unchanged.
@@ -2182,7 +2210,10 @@ async fn one_table_grant_writes_the_namespace_it_needs() {
     // because one namespace policy serves every table granted under it.
     assert_eq!(
         polaris_access_types_for(&ctx, "dave", "sales_wh", Some("ac"), None).await,
-        vec!["namespace-properties-read".to_string()],
+        vec![
+            "namespace-list".to_string(),
+            "namespace-properties-read".to_string()
+        ],
         "namespace visibility is deliberately NOT released by a table revoke"
     );
     assert_eq!(
@@ -2316,5 +2347,176 @@ async fn show_schemas_describes_the_catalog_it_names() {
         "DROP SCHEMA IF EXISTS ops_wh.only_in_ops",
     ] {
         let _ = ctx.handler.execute(&ctx.carol, stmt, None).await;
+    }
+}
+
+/// `INSERT` must not confer the right to repoint a table's storage.
+///
+/// SQE's hand-written `WRITE_ACCESS` included `table-location-set`, plus
+/// `table-uuid-assign`, `table-format-version-upgrade` and
+/// `table-properties-write`. An append-only grantee could therefore move a table's
+/// data location. grant-profile v4 excludes those four AFTER expanding
+/// `table-data-write`'s closure, because the closure is what commits an Iceberg
+/// snapshot and withholding the seed would have lost the rest of it.
+///
+/// **On a FRESH resource, deliberately.** Ranger's grant endpoint MERGES access
+/// types into whatever policy already covers a resource, and a revoke can only
+/// remove the types it names. So a policy written by the old code keeps the four
+/// wider types even after this change, and a narrower `REVOKE INSERT` will not
+/// clear them: adopting the profile narrows NEW grants and does not retroactively
+/// narrow existing ones. Asserting on a shared fixture table would therefore fail
+/// on residue rather than on behaviour, which is exactly what the first version of
+/// this assertion did.
+#[tokio::test]
+#[ignore]
+async fn insert_does_not_confer_storage_relocation() {
+    ac_gate!();
+    let _guard = crate::common::serial().lock().await;
+    let ctx = ac_setup().await;
+
+    // A resource with no policy history.
+    let fresh = "sales_wh.ac.orders_fresh_grant";
+    let _ = ctx.handler.execute(&ctx.carol, &format!("DROP TABLE IF EXISTS {fresh}"), None).await;
+    exec_ok(&ctx, &ctx.carol, &format!("CREATE TABLE {fresh} (id BIGINT)")).await;
+    let pre = polaris_access_types_for_role(&ctx, "engineer", "sales_wh", Some("ac"), Some("orders_fresh_grant")).await;
+    assert!(
+        pre.is_empty(),
+        "this table must have no policy history, or the assertion below measures \
+         residue rather than what the grant wrote; got {pre:?}"
+    );
+
+    exec_ok(&ctx, &ctx.carol, &format!("GRANT INSERT ON {fresh} TO ROLE \"engineer\"")).await;
+
+    let got = polaris_access_types_for_role(&ctx, "engineer", "sales_wh", Some("ac"), Some("orders_fresh_grant")).await;
+    assert!(
+        got.contains(&"table-data-write".to_string()),
+        "the write seed must be there, got {got:?}"
+    );
+    assert!(
+        got.len() > 5,
+        "the closure must have expanded, got {got:?}"
+    );
+    for over in [
+        "table-location-set",
+        "table-uuid-assign",
+        "table-format-version-upgrade",
+        "table-properties-write",
+    ] {
+        assert!(
+            !got.contains(&over.to_string()),
+            "INSERT must not confer {over}; got {got:?}"
+        );
+    }
+
+    // The narrowing is only safe if a commit still works without them. This is the
+    // control that makes the assertions above more than a count.
+    crate::common::eventually("bob's INSERT to succeed under the narrowed set", || async {
+        match ctx.handler.execute(&ctx.bob, &format!("INSERT INTO {fresh} VALUES (1)"), None).await {
+            Ok(_) => Ok(()),
+            Err(e) => Err(format!("insert failed: {e}")),
+        }
+    })
+    .await;
+
+    let _ = ctx.handler.execute(&ctx.carol, &format!("REVOKE INSERT ON {fresh} FROM ROLE \"engineer\""), None).await;
+    let _ = ctx.handler.execute(&ctx.carol, &format!("DROP TABLE IF EXISTS {fresh}"), None).await;
+}
+
+/// `DENY` as a SQL statement, end to end against live Ranger.
+///
+/// `ranger_deny_overrides_allow` proves deny PRECEDENCE, but it injects the deny
+/// item through Ranger's REST API, so the SQL path (`handle_deny` ->
+/// `RangerGrantBackend::deny` -> the policy API) had unit and wiremock coverage
+/// only. That path was rewired onto the profile's `deepest_policy` when the
+/// hand-written access-type map was deleted, which is exactly the kind of change a
+/// mock cannot validate: whether Ranger accepts the resulting policy at all.
+///
+/// Also pins the two properties that make SQL `DENY` usable rather than a one-way
+/// door: it is idempotent, and `REVOKE` clears it.
+#[tokio::test]
+#[ignore]
+async fn sql_deny_blocks_a_granted_read_and_revoke_clears_it() {
+    ac_gate!();
+    let _guard = crate::common::serial().lock().await;
+    let ctx = ac_setup().await;
+
+    // A resource with no deny history, so a leftover item cannot make the denial
+    // below look like this statement's work.
+    let table = "sales_wh.ac.orders_deny";
+    let _ = ctx.handler.execute(&ctx.carol, &format!("DROP TABLE IF EXISTS {table}"), None).await;
+    exec_ok(&ctx, &ctx.carol, &format!("CREATE TABLE {table} (id BIGINT)")).await;
+    exec_ok(&ctx, &ctx.carol, &format!("INSERT INTO {table} VALUES (1),(2)")).await;
+    exec_ok(&ctx, &ctx.carol, &format!("GRANT SELECT ON {table} TO ROLE \"analyst\"")).await;
+
+    // The grant works first. Without this the denial afterwards proves nothing:
+    // an unreadable table is the default state.
+    let before = crate::common::eventually("alice's read to be allowed by the grant", || async {
+        match ctx.handler.execute(&ctx.alice, &format!("SELECT id FROM {table}"), None).await {
+            Ok(b) if total_rows(&b) == 2 => Ok(b),
+            Ok(b) => Err(format!("{} rows", total_rows(&b))),
+            Err(e) => Err(format!("query failed: {e}")),
+        }
+    })
+    .await;
+    assert_eq!(total_rows(&before), 2);
+
+    // The statement under test.
+    exec_ok(&ctx, &ctx.carol, &format!("DENY SELECT ON {table} TO ROLE \"analyst\"")).await;
+    crate::common::eventually("the SQL DENY to block alice", || async {
+        match ctx.handler.execute(&ctx.alice, &format!("SELECT id FROM {table}"), None).await {
+            Err(_) => Ok(()),
+            Ok(b) => Err(format!("still readable with {} rows", total_rows(&b))),
+        }
+    })
+    .await;
+
+    // Idempotent: a repeated DENY must update the same policy rather than stack a
+    // duplicate item. Ranger normalises a stored item, so an exact JSON comparison
+    // appended a duplicate on every rerun before `deny_items_equivalent`.
+    exec_ok(&ctx, &ctx.carol, &format!("DENY SELECT ON {table} TO ROLE \"analyst\"")).await;
+    let deny_items = ctx
+        .ranger
+        .get_policies("polaris")
+        .await
+        .expect("list policies")
+        .into_iter()
+        .filter(|p| {
+            p.get("resources")
+                .and_then(|r| r.get("table"))
+                .and_then(|t| t.get("values"))
+                .and_then(|v| v.as_array())
+                .is_some_and(|vs| vs.iter().any(|v| v.as_str() == Some("orders_deny")))
+        })
+        .flat_map(|p| {
+            p.get("denyPolicyItems")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default()
+        })
+        .count();
+    assert_eq!(deny_items, 1, "a repeated DENY must not stack deny items");
+
+    // REVOKE clears the deny, so DENY is not a one-way door needing console access.
+    exec_ok(&ctx, &ctx.carol, &format!("REVOKE SELECT ON {table} FROM ROLE \"analyst\"")).await;
+    exec_ok(&ctx, &ctx.carol, &format!("GRANT SELECT ON {table} TO ROLE \"analyst\"")).await;
+    let after = crate::common::eventually("the read to come back after REVOKE cleared the deny", || async {
+        match ctx.handler.execute(&ctx.alice, &format!("SELECT id FROM {table}"), None).await {
+            Ok(b) if total_rows(&b) == 2 => Ok(b),
+            Ok(b) => Err(format!("{} rows", total_rows(&b))),
+            Err(e) => Err(format!("still denied: {e}")),
+        }
+    })
+    .await;
+    assert_eq!(
+        total_rows(&after),
+        2,
+        "REVOKE must clear the deny item, or DENY is irreversible from SQL"
+    );
+
+    for stmt in [
+        format!("REVOKE SELECT ON {table} FROM ROLE \"analyst\""),
+        format!("DROP TABLE IF EXISTS {table}"),
+    ] {
+        let _ = ctx.handler.execute(&ctx.carol, &stmt, None).await;
     }
 }
