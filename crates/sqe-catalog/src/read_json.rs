@@ -291,14 +291,14 @@ impl TableFunctionImpl for ReadJsonFunction {
                 )
                 .await
             })
-            .ok_or_else(|| DataFusionError::Plan(format!("{FN_NAME}: no tokio runtime available")))?
+            .map_err(|e| DataFusionError::Plan(format!("{FN_NAME}: {e}")))?
         } else {
             let df_compression = streaming_compression(compression);
             crate::runtime_bridge::block_on_compat(async move {
                 build_json_listing_table(&args, &json_opts, df_compression, &storage, runtime_env.as_deref())
                     .await
             })
-            .ok_or_else(|| DataFusionError::Plan(format!("{FN_NAME}: no tokio runtime available")))?
+            .map_err(|e| DataFusionError::Plan(format!("{FN_NAME}: {e}")))?
         }
     }
 }

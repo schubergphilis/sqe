@@ -284,7 +284,7 @@ current-thread runtime from a scratch thread and calls the bridge INLINE from th
 task body, then bounds the wait with `recv_timeout` so a regression fails with a
 message instead of hanging the suite. Mutation-verified against the old code.
 
-## Cause 2: the future's I/O belongs to the parked runtime. NOT FIXED.
+## Cause 2: the future's I/O belongs to the parked runtime. BOUNDED, not fixed.
 
 With cause 1 fixed the query still hangs, and a `sample` of the child thread shows
 why: it is running its own runtime and parked in its own IO driver, waiting for a
@@ -304,12 +304,35 @@ runtime never stalls the I/O those futures depend on. That is an architectural
 change with its own blast radius (where clients are constructed, connection-pool
 ownership, shutdown), so it wants its own spec rather than being bolted onto this.
 
-Until then the state remains reachable: catalog discovery with no visible namespace
-hangs rather than denying. `tokio::time::timeout` around the query does NOT bound
-it, which is worth knowing before someone reaches for that mitigation: the bridge
-blocks the runtime thread synchronously, so the timer is never polled and the
-timeout never fires. That also rules out an e2e regression test for now, since a
-test that reproduces the state cannot fail cleanly, only hang.
+### Bounded, 2026-08-04. Still not fixed, but no longer a hang.
+
+The stall itself stands. What changed is that it now ENDS. `block_on_compat` drives
+the future on its worker thread and waits for the result over a channel with
+`recv_timeout` (60s) instead of `JoinHandle::join`, so the caller gets
+`BridgeError::TimedOut` and the query fails with a message naming the cause.
+
+The choice of guard is the whole point, and two others were ruled out here first.
+`tokio::time::timeout` around the query does NOT bound it: the bridge blocks the
+runtime thread synchronously, so the timer is never polled and the timeout never
+fires. `JoinHandle::join` has no deadline at all. `Receiver::recv_timeout` is an
+OS-level wait, so it fires regardless of what any runtime is or is not driving,
+which is the same conclusion the `#195` guard reached from the other direction.
+
+Cost, stated rather than hidden: on the deadline the worker thread and its runtime
+are left detached, because nothing can safely cancel a future blocked in another
+reactor. Bounded by the number of timeouts, and a timeout already means something
+is wrong.
+
+The bridge's return type changed from `Option` to `Result<_, BridgeError>` for
+this. The third state existed only to mean "could not run" with no reason attached,
+which is how a timed-out call would have reported "no tokio runtime available" on a
+runtime that was there. Ten call sites now render the real cause.
+
+A unit regression test is possible now, where before it could only hang: a future
+that cannot complete must come back as `TimedOut`, driven from a scratch thread so
+that a regression fails instead of stalling the suite
+(`a_future_that_cannot_finish_fails_loudly_instead_of_hanging`). Mutation-checked by
+restoring the unbounded wait, which makes it fail in 10s with its own message.
 
 ## Reachability: NOT the server. Corrected.
 

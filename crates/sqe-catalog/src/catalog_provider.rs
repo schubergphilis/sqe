@@ -82,7 +82,7 @@ pub(crate) fn contains_or_refresh<F>(
     relist: F,
 ) -> bool
 where
-    F: FnOnce() -> Option<sqe_core::Result<Vec<String>>>,
+    F: FnOnce() -> sqe_core::Result<Vec<String>>,
 {
     if names
         .read()
@@ -102,17 +102,13 @@ where
     }
 
     match relist() {
-        Some(Ok(fresh)) => {
+        Ok(fresh) => {
             let found = fresh.iter().any(|n| n == name);
             *names.write().unwrap_or_else(PoisonError::into_inner) = fresh;
             found
         }
-        Some(Err(e)) => {
+        Err(e) => {
             debug!(schema = name, error = %e, "live namespace re-list failed; keeping cached snapshot");
-            false
-        }
-        None => {
-            debug!(schema = name, "live namespace re-list skipped: no tokio runtime");
             false
         }
     }
@@ -501,9 +497,16 @@ impl CatalogProvider for SqeCatalogProvider {
         let relist = || {
             let catalog = Arc::clone(&self.session_catalog);
             let visibility_filter = self.namespace_visibility_filter;
-            crate::runtime_bridge::block_on_compat(async move {
+            // Flatten the bridge's own failure into the same error channel, so a
+            // timeout is reported as what it is instead of as an empty catalog.
+            match crate::runtime_bridge::block_on_compat(async move {
                 Self::list_visible_namespace_names(catalog, visibility_filter).await
-            })
+            }) {
+                Ok(inner) => inner,
+                Err(bridge) => Err(sqe_core::SqeError::Catalog(format!(
+                    "namespace re-list could not run: {bridge}"
+                ))),
+            }
         };
         if !contains_or_refresh(
             &self.cached_namespaces,
@@ -606,7 +609,7 @@ mod tests {
         let names = snapshot(&["public"]);
         let last = Mutex::new(None);
         let found = contains_or_refresh(&names, &last, Duration::from_secs(5), "bank", || {
-            Some(Ok(vec!["public".to_string(), "bank".to_string()]))
+            Ok(vec!["public".to_string(), "bank".to_string()])
         });
         assert!(found);
         assert_eq!(*names.read().unwrap(), vec!["public", "bank"]);
@@ -623,7 +626,7 @@ mod tests {
             let found =
                 contains_or_refresh(&names, &last, Duration::from_secs(60), "nope", || {
                     relists.fetch_add(1, Ordering::SeqCst);
-                    Some(Ok(vec!["public".to_string()]))
+                    Ok(vec!["public".to_string()])
                 });
             assert!(!found);
         }
@@ -640,7 +643,7 @@ mod tests {
         for _ in 0..3 {
             contains_or_refresh(&names, &last, Duration::ZERO, "nope", || {
                 relists.fetch_add(1, Ordering::SeqCst);
-                Some(Ok(Vec::new()))
+                Ok(Vec::new())
             });
         }
         assert_eq!(relists.load(Ordering::SeqCst), 3);
@@ -665,20 +668,28 @@ mod tests {
         let names = snapshot(&["public"]);
         let last = Mutex::new(None);
         let found = contains_or_refresh(&names, &last, Duration::from_secs(5), "bank", || {
-            Some(Err(sqe_core::SqeError::Catalog("polaris down".to_string())))
+            Err(sqe_core::SqeError::Catalog("polaris down".to_string()))
         });
         assert!(!found);
         assert_eq!(*names.read().unwrap(), vec!["public"]);
     }
 
-    /// `None` from the bridge (no tokio runtime) degrades to the frozen
-    /// answer, snapshot untouched.
+    /// A bridge that could not run (no runtime, or a timeout) degrades to the
+    /// frozen answer with the snapshot untouched, exactly like a catalog error.
+    ///
+    /// This used to be a third state (`None`) that carried no reason with it, which
+    /// is how a timed-out re-list logged "no tokio runtime" on a runtime that was
+    /// there. The caller now flattens the bridge failure into the error channel, so
+    /// what gets logged is what happened.
     #[test]
-    fn no_runtime_keeps_previous_snapshot() {
+    fn a_bridge_failure_keeps_previous_snapshot() {
         let names = snapshot(&["public"]);
         let last = Mutex::new(None);
-        let found =
-            contains_or_refresh(&names, &last, Duration::from_secs(5), "bank", || None);
+        let found = contains_or_refresh(&names, &last, Duration::from_secs(5), "bank", || {
+            Err(sqe_core::SqeError::Catalog(
+                "namespace re-list could not run: async work did not complete".to_string(),
+            ))
+        });
         assert!(!found);
         assert_eq!(*names.read().unwrap(), vec!["public"]);
     }
