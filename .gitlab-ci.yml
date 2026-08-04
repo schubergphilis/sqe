@@ -114,6 +114,56 @@ cargo-gate:
       changes: ["**/*.rs", "**/Cargo.toml", "**/Cargo.lock", "rust-toolchain.toml"]
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
 
+# The vendored grant profile must be the platform's current one.
+#
+# crates/sqe-policy's golden-fixture tests prove SQE's planner agrees with the
+# profile it HOLDS. They cannot notice that the profile it holds is stale, and SQE
+# and the control plane write Ranger policies to the SAME `polaris` service -- so a
+# stale copy means the same GRANT confers different access depending on which tool
+# issued it. This job is the other half.
+#
+# Deliberately NOT allow_failure. The script exits 2 (distinct from 1) when it
+# cannot find the platform checkout, precisely so a job that cannot verify fails
+# instead of reporting success: a silently-skipped drift gate is indistinguishable
+# from a clean one, which is the failure this exists to prevent.
+#
+# Scoped by `changes` so it only runs when the vendored assets or the checker move,
+# rather than gating every MR on the availability of another repository.
+vendored-profile-drift:
+  stage: test
+  image: alpine:3.20
+  variables:
+    GIT_DEPTH: "1"
+    DATA_PLATFORM_DIR: "$CI_BUILDS_DIR/data-platform"
+  before_script:
+    - apk add --no-cache git bash diffutils >/dev/null
+  script:
+    - |
+      set -euo pipefail
+      # CI_JOB_TOKEN can read sibling projects when the platform project allows
+      # this one in its CI/CD job-token allowlist. If it cannot, the clone fails
+      # here and the job fails loudly rather than skipping the check.
+      if ! git clone --depth 1           "https://gitlab-ci-token:${CI_JOB_TOKEN}@${CI_SERVER_HOST}:${CI_SERVER_PORT}/vpf-data-ai/chameleon/applications/data-platform.git"           "$DATA_PLATFORM_DIR" 2>/dev/null; then
+        echo "could not clone data-platform with CI_JOB_TOKEN." >&2
+        echo "Add this project to data-platform's CI/CD job token allowlist" >&2
+        echo "(Settings > CI/CD > Job token permissions), or run" >&2
+        echo "scripts/check-vendored-profile.sh locally before merging." >&2
+        echo "NOT passing: the vendored profile may be stale." >&2
+        exit 1
+      fi
+      bash scripts/check-vendored-profile.sh
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+      when: never
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes:
+        - "crates/sqe-policy/assets/*.json"
+        - "crates/sqe-policy/src/grants/profile.rs"
+        - "scripts/check-vendored-profile.sh"
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      changes:
+        - "crates/sqe-policy/assets/*.json"
+
 # ===== repo-specific integration suites (docker-in-docker), hosted here =====
 integration-test:
   stage: test

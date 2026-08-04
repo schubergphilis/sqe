@@ -719,6 +719,20 @@ const LABEL_GRANTEE_TYPES: &[&str] = &["USER", "ROLE"];
 /// used to leave dave with NOTHING. Reproduced live before this was written: the
 /// third statement removed dave's policy item outright, so an admin narrowing a
 /// user's write access silently took away their read access as well.
+/// `grant_label`, taking the SQL privilege plus the object kind so the label
+/// records what was actually granted.
+///
+/// A view `SELECT` and a table `SELECT` are different privileges (`SELECT VIEW` vs
+/// `SELECT`) conferring disjoint access types, but both arrive here as the SQL word
+/// "SELECT". Labelling the SQL word loses that, and anything later reasoning from
+/// the label plans the wrong privilege: a revoke computes table access types for a
+/// view grant, and the audit tool reports a legitimate view grant as over-broad.
+/// Observed live -- `sales_wh.acdemo.orders_eu` (a view, labelled `SELECT`) was
+/// reported as holding `view-properties-read` and `view-list` "beyond the profile".
+fn grant_label_for(grantee: &Grantee, object: GrantObjectKind, privilege: &str) -> String {
+    grant_label(grantee, &profile_privilege(object, privilege))
+}
+
 fn grant_label(grantee: &Grantee, privilege: &str) -> String {
     // A GROUP is labelled ROLE, not GROUP. The platform materialises every
     // Keycloak group as a Ranger role of the identical name, so the two tools must
@@ -863,9 +877,10 @@ impl RangerGrantBackend {
         &self,
         resource: &BTreeMap<String, String>,
         grantee: &Grantee,
+        object: GrantObjectKind,
         privilege: &str,
     ) {
-        self.add_policy_label(resource, &grant_label(grantee, privilege))
+        self.add_policy_label(resource, &grant_label_for(grantee, object, privilege))
             .await;
     }
 
@@ -920,7 +935,7 @@ impl RangerGrantBackend {
         let namespace = resource.get("namespace").map(String::as_str);
         let table = resource.get("table").map(String::as_str);
 
-        let mine = grant_label(stmt_grantee, privilege);
+        let mine = grant_label_for(stmt_grantee, object, privilege);
         if !labels.iter().any(|l| l == &mine) {
             // This grant was never labelled (written before labels existed, or
             // the label write failed). No provenance to reason from.
@@ -938,7 +953,17 @@ impl RangerGrantBackend {
             // What that OTHER privilege confers at THIS resource. Planned, not
             // looked up in a table, so held-back sets stay consistent with what
             // the grant actually wrote.
-            match deepest_policy(object, &other_priv, &self.realm, catalog, namespace, table) {
+            // `other_priv` is already the PROFILE name (the label records it), so
+            // it is planned as a table object: a view privilege is its own name and
+            // needs no further translation.
+            match deepest_policy(
+                GrantObjectKind::Table,
+                &other_priv,
+                &self.realm,
+                catalog,
+                namespace,
+                table,
+            ) {
                 Ok(p) => keep.extend(p.access_types),
                 Err(e) => {
                     // A label naming a privilege the profile no longer plans. Skip
@@ -959,9 +984,10 @@ impl RangerGrantBackend {
         &self,
         resource: &BTreeMap<String, String>,
         grantee: &Grantee,
+        object: GrantObjectKind,
         privilege: &str,
     ) {
-        let label = grant_label(grantee, privilege);
+        let label = grant_label_for(grantee, object, privilege);
         let Ok(Some(mut policy)) = self.policy_by_resource(resource).await else {
             return;
         };
@@ -1156,7 +1182,7 @@ impl GrantBackend for RangerGrantBackend {
                 // privately owned and invite a later revoke to release traversal
                 // another grant still depends on. The platform's provenance module
                 // takes the same position.
-                self.add_grant_label(&body.resource, &stmt.grantee, &stmt.privilege)
+                self.add_grant_label(&body.resource, &stmt.grantee, stmt.object, &stmt.privilege)
                     .await;
             }
             written.push(body);
@@ -1205,7 +1231,7 @@ impl GrantBackend for RangerGrantBackend {
                 // Everything this privilege confers is also owed to another one.
                 // Drop only the provenance, so a later revoke of that other
                 // privilege releases the access types.
-                self.remove_grant_label(&body.resource, &stmt.grantee, &stmt.privilege)
+                self.remove_grant_label(&body.resource, &stmt.grantee, stmt.object, &stmt.privilege)
                     .await;
                 return self.remove_deny_items(stmt).await;
             }
@@ -1213,7 +1239,7 @@ impl GrantBackend for RangerGrantBackend {
 
         self.post_grant_revoke_with_privilege("revoke", &stmt.privilege, &body)
             .await?;
-        self.remove_grant_label(&body.resource, &stmt.grantee, &stmt.privilege)
+        self.remove_grant_label(&body.resource, &stmt.grantee, stmt.object, &stmt.privilege)
             .await;
         // REVOKE also clears a matching DENY, matching Unity Catalog, where
         // REVOKE removes the grant whether it was an allow or a deny.

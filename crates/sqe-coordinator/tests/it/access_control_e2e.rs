@@ -2421,3 +2421,102 @@ async fn insert_does_not_confer_storage_relocation() {
     let _ = ctx.handler.execute(&ctx.carol, &format!("REVOKE INSERT ON {fresh} FROM ROLE \"engineer\""), None).await;
     let _ = ctx.handler.execute(&ctx.carol, &format!("DROP TABLE IF EXISTS {fresh}"), None).await;
 }
+
+/// `DENY` as a SQL statement, end to end against live Ranger.
+///
+/// `ranger_deny_overrides_allow` proves deny PRECEDENCE, but it injects the deny
+/// item through Ranger's REST API, so the SQL path (`handle_deny` ->
+/// `RangerGrantBackend::deny` -> the policy API) had unit and wiremock coverage
+/// only. That path was rewired onto the profile's `deepest_policy` when the
+/// hand-written access-type map was deleted, which is exactly the kind of change a
+/// mock cannot validate: whether Ranger accepts the resulting policy at all.
+///
+/// Also pins the two properties that make SQL `DENY` usable rather than a one-way
+/// door: it is idempotent, and `REVOKE` clears it.
+#[tokio::test]
+#[ignore]
+async fn sql_deny_blocks_a_granted_read_and_revoke_clears_it() {
+    ac_gate!();
+    let _guard = crate::common::serial().lock().await;
+    let ctx = ac_setup().await;
+
+    // A resource with no deny history, so a leftover item cannot make the denial
+    // below look like this statement's work.
+    let table = "sales_wh.ac.orders_deny";
+    let _ = ctx.handler.execute(&ctx.carol, &format!("DROP TABLE IF EXISTS {table}"), None).await;
+    exec_ok(&ctx, &ctx.carol, &format!("CREATE TABLE {table} (id BIGINT)")).await;
+    exec_ok(&ctx, &ctx.carol, &format!("INSERT INTO {table} VALUES (1),(2)")).await;
+    exec_ok(&ctx, &ctx.carol, &format!("GRANT SELECT ON {table} TO ROLE \"analyst\"")).await;
+
+    // The grant works first. Without this the denial afterwards proves nothing:
+    // an unreadable table is the default state.
+    let before = crate::common::eventually("alice's read to be allowed by the grant", || async {
+        match ctx.handler.execute(&ctx.alice, &format!("SELECT id FROM {table}"), None).await {
+            Ok(b) if total_rows(&b) == 2 => Ok(b),
+            Ok(b) => Err(format!("{} rows", total_rows(&b))),
+            Err(e) => Err(format!("query failed: {e}")),
+        }
+    })
+    .await;
+    assert_eq!(total_rows(&before), 2);
+
+    // The statement under test.
+    exec_ok(&ctx, &ctx.carol, &format!("DENY SELECT ON {table} TO ROLE \"analyst\"")).await;
+    crate::common::eventually("the SQL DENY to block alice", || async {
+        match ctx.handler.execute(&ctx.alice, &format!("SELECT id FROM {table}"), None).await {
+            Err(_) => Ok(()),
+            Ok(b) => Err(format!("still readable with {} rows", total_rows(&b))),
+        }
+    })
+    .await;
+
+    // Idempotent: a repeated DENY must update the same policy rather than stack a
+    // duplicate item. Ranger normalises a stored item, so an exact JSON comparison
+    // appended a duplicate on every rerun before `deny_items_equivalent`.
+    exec_ok(&ctx, &ctx.carol, &format!("DENY SELECT ON {table} TO ROLE \"analyst\"")).await;
+    let deny_items = ctx
+        .ranger
+        .get_policies("polaris")
+        .await
+        .expect("list policies")
+        .into_iter()
+        .filter(|p| {
+            p.get("resources")
+                .and_then(|r| r.get("table"))
+                .and_then(|t| t.get("values"))
+                .and_then(|v| v.as_array())
+                .is_some_and(|vs| vs.iter().any(|v| v.as_str() == Some("orders_deny")))
+        })
+        .flat_map(|p| {
+            p.get("denyPolicyItems")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default()
+        })
+        .count();
+    assert_eq!(deny_items, 1, "a repeated DENY must not stack deny items");
+
+    // REVOKE clears the deny, so DENY is not a one-way door needing console access.
+    exec_ok(&ctx, &ctx.carol, &format!("REVOKE SELECT ON {table} FROM ROLE \"analyst\"")).await;
+    exec_ok(&ctx, &ctx.carol, &format!("GRANT SELECT ON {table} TO ROLE \"analyst\"")).await;
+    let after = crate::common::eventually("the read to come back after REVOKE cleared the deny", || async {
+        match ctx.handler.execute(&ctx.alice, &format!("SELECT id FROM {table}"), None).await {
+            Ok(b) if total_rows(&b) == 2 => Ok(b),
+            Ok(b) => Err(format!("{} rows", total_rows(&b))),
+            Err(e) => Err(format!("still denied: {e}")),
+        }
+    })
+    .await;
+    assert_eq!(
+        total_rows(&after),
+        2,
+        "REVOKE must clear the deny item, or DENY is irreversible from SQL"
+    );
+
+    for stmt in [
+        format!("REVOKE SELECT ON {table} FROM ROLE \"analyst\""),
+        format!("DROP TABLE IF EXISTS {table}"),
+    ] {
+        let _ = ctx.handler.execute(&ctx.carol, &stmt, None).await;
+    }
+}
