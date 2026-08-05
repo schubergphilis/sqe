@@ -2164,25 +2164,37 @@ async fn one_table_grant_writes_the_namespace_it_needs() {
     // And the payoff: dave reads, having been given one statement beyond catalog
     // discovery, through policies this code wrote.
     //
-    // A plain wait rather than the usual `eventually` retry loop, for a specific
-    // reason. Until the Polaris plugin polls, dave holds catalog discovery with
-    // `ac` still invisible, and a read in that window wedges
-    // `SqeCatalogProvider::schema()` (see the doc comment above) -- so the FIRST
-    // retry would hang and the loop would never get a second attempt. Waiting out
-    // the propagation window means the single read below happens after `ac` became
-    // visible. The `timeout` is what keeps this honest: if the wedge is hit anyway
-    // the test FAILS with a clear message instead of hanging the suite.
-    tokio::time::sleep(std::time::Duration::from_secs(45)).await;
-    let read = tokio::time::timeout(
-        std::time::Duration::from_secs(60),
-        ctx.handler.execute(&ctx.dave, &format!("SELECT id FROM {ORDERS}"), None),
+    // A retry loop, which this test could not use until recently.
+    //
+    // Until the Polaris plugin polls, dave holds catalog discovery with `ac` still
+    // invisible, and a read in that window takes the slow path through
+    // `SqeCatalogProvider::schema()` (see the doc comment above), which on a
+    // current-thread runtime blocks the whole runtime while it waits. That used to
+    // mean the FIRST attempt hung and the loop never got a second one, so the test
+    // slept out the propagation window instead and read exactly once.
+    //
+    // `runtime_bridge::block_on_compat` now bounds that wait with an OS-level
+    // deadline and returns an error, so an attempt in the window RETURNS. Retrying
+    // is therefore possible, and better: it succeeds as soon as the plugin polls
+    // (usually 5-30s) instead of always paying a fixed sleep.
+    //
+    // The budget has to exceed the bridge deadline, or one wedged attempt would eat
+    // it whole and the loop would report a timeout having tried once. A tokio timer
+    // is deliberately NOT the guard here: it cannot fire while the runtime thread is
+    // synchronously blocked, which the repo learned at issue #195 and which an
+    // earlier version of this comment had backwards.
+    let read = crate::common::eventually_within(
+        std::time::Duration::from_secs(200),
+        "dave's read to be allowed once the Polaris plugin picks up the grant",
+        || async {
+            match ctx.handler.execute(&ctx.dave, &format!("SELECT id FROM {ORDERS}"), None).await {
+                Ok(b) if total_rows(&b) == 3 => Ok(b),
+                Ok(b) => Err(format!("{} rows, want 3", total_rows(&b))),
+                Err(e) => Err(format!("read failed: {e}")),
+            }
+        },
     )
-    .await
-    .expect(
-        "dave's read neither succeeded nor failed within 60s: this is the \
-         SqeCatalogProvider::schema() wedge, not a policy problem",
-    )
-    .expect("one GRANT on the table, plus catalog discovery, must make it readable");
+    .await;
     assert_eq!(
         total_rows(&read),
         3,

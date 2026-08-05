@@ -144,10 +144,8 @@ impl CatalogProvider for WritableIcebergCatalog {
                 anyhow::anyhow!("schema {ns_name} disappeared between create and read")
             })
         })
-        .ok_or_else(|| {
-            DataFusionError::Execution(format!(
-                "register_schema({ns_name_for_err}): no tokio runtime available"
-            ))
+        .map_err(|e| {
+            DataFusionError::Execution(format!("register_schema({ns_name_for_err}): {e}"))
         })?
         .map_err(|e| DataFusionError::Execution(e.to_string()))?;
         self.schemas.insert(name.to_string(), provider);
@@ -180,10 +178,8 @@ impl CatalogProvider for WritableIcebergCatalog {
                 .await
                 .map_err(|e| anyhow::anyhow!("drop_namespace({ns_name}): {e}"))
         })
-        .ok_or_else(|| {
-            DataFusionError::Execution(format!(
-                "deregister_schema({ns_name_for_err}): no tokio runtime available"
-            ))
+        .map_err(|e| {
+            DataFusionError::Execution(format!("deregister_schema({ns_name_for_err}): {e}"))
         })?
         .map_err(|e| DataFusionError::Execution(e.to_string()))?;
 

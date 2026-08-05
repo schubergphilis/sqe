@@ -267,9 +267,7 @@ impl TableFunctionImpl for ReadCsvFunction {
         crate::runtime_bridge::block_on_compat(async move {
             build_csv_listing_table(&args, &csv_opts, &storage, runtime_env.as_deref()).await
         })
-        .ok_or_else(|| {
-            DataFusionError::Plan(format!("{FN_NAME}: no tokio runtime available"))
-        })?
+        .map_err(|e| DataFusionError::Plan(format!("{FN_NAME}: {e}")))?
     }
 }
 
