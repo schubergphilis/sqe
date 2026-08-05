@@ -26,7 +26,12 @@ DP_DIR="${DATA_PLATFORM_DIR:-$ROOT_DIR/../data-platform}"
 SRC_DIR="$DP_DIR/quickstart/assets/ranger"
 DST_DIR="$ROOT_DIR/crates/sqe-policy/assets"
 
-FILES=(grant-profile.json servicedef-polaris.json)
+# One file since profile v5, which folded the access-type implication graph in.
+# `servicedef-polaris.json` is NOT listed: it is still the Ranger service
+# DEFINITION the quickstarts register with Ranger Admin, but it is no longer an
+# input to planning, so the platform is free to move or drop its shared copy
+# without this gate having an opinion.
+FILES=(grant-profile.json)
 
 if [ ! -d "$SRC_DIR" ]; then
     echo "check-vendored-profile: CANNOT COMPARE" >&2
