@@ -91,6 +91,17 @@ admin-password = "rangerR0cks!"
 [access_control]
 backend = "ranger"
 url = "http://ranger-admin:6080"
+# Who may issue GRANT/REVOKE. "admin-role" (the default, left in place here)
+# requires an [auth] admin_roles role first; "ranger-delegate" hands the decision
+# to Ranger's per-resource delegateAdmin, which is what makes WITH GRANT OPTION
+# usable by a table owner who holds no admin role.
+#
+# Not enabled in this quickstart on purpose. `ranger-setup` writes wildcard
+# discovery policies (catalog = *) with delegateAdmin: true for roles `analyst` and
+# `engineer`, so switching this on would let any analyst grant those discovery
+# access types anywhere in the service. Read your own policies before flipping it.
+# DENY always requires an admin role regardless.
+# grant_authority = "ranger-delegate"
 
 [access_control.ranger]
 service-name = "polaris"

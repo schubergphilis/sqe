@@ -29,10 +29,30 @@ fn grant_stmt() -> GrantStatement {
         namespace: Some("sales".to_string()),
         table: Some("orders".to_string()),
         grantee: Grantee::Role("analyst".to_string()),
-        grantor: None,
+        // Ranger authorizes against this, so it is not optional. See
+        // `a_grant_with_no_grantor_is_refused_before_any_request`.
+        grantor: Some("carol".to_string()),
         with_grant_option: false,
         object: Default::default(),
     }
+}
+
+/// POSTs the backend actually made to the grant endpoint.
+///
+/// The path matters: the grant flow also GETs the policy list and may PUT a
+/// provenance label, and counting every request would make "one grant" and "three
+/// grants" indistinguishable.
+async fn grant_posts(server: &MockServer) -> usize {
+    server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|r| {
+            r.method == wiremock::http::Method::POST
+                && r.url.path() == format!("/service/plugins/services/grant/{SERVICE}")
+        })
+        .count()
 }
 
 /// Success path: a 200 from the grant endpoint makes `grant()` return Ok.
@@ -71,6 +91,235 @@ async fn grant_fails_loudly_on_non_200() {
     assert!(
         err.to_string().contains("403") || err.to_string().to_lowercase().contains("grant"),
         "error must mention the failed grant / status, got: {err}"
+    );
+}
+
+/// A grant with no grantor is refused, and refused BEFORE anything is sent.
+///
+/// The fallback it replaces set `grantor` to the configured Ranger admin user.
+/// That is not a harmless default: Ranger authorizes against the grantor, so with
+/// `grant_authority = "ranger-delegate"` standing the role gate down, a code path
+/// leaving grantor unset would have performed the grant with SQE's own authority --
+/// full escalation from any authenticated session. Asserting zero requests is the
+/// point: refusing after the catalog level had already landed would be worse than
+/// not refusing at all.
+#[tokio::test]
+async fn a_grant_with_no_grantor_is_refused_before_any_request() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(format!("/service/plugins/services/grant/{SERVICE}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+        .mount(&server)
+        .await;
+
+    let backend = backend(&server.uri());
+    let mut stmt = grant_stmt();
+    stmt.grantor = None;
+    let err = backend
+        .grant("token", &stmt)
+        .await
+        .expect_err("a grant with no grantor must be refused, not performed as admin");
+    assert!(
+        err.to_string().contains("grantor"),
+        "the error must name what is missing, got: {err}"
+    );
+    assert_eq!(
+        grant_posts(&server).await,
+        0,
+        "nothing may be written when the authority the write would be checked \
+         against is unknown"
+    );
+}
+
+/// A traversal level the grantee already holds is not re-granted.
+///
+/// Not an optimization. Ranger's delegate admin does not cascade upward (verified
+/// against 2.8: a grantor holding it on `cat.ns.tbl` gets 403 on `cat` and on
+/// `cat.ns`), and the plan writes the catalog level FIRST, so without this every
+/// delegated table grant fails on its first call -- on a write that would have
+/// changed nothing. Ranger MERGES access types, so skipping a set already present
+/// cannot lose anything.
+#[tokio::test]
+async fn an_already_held_traversal_level_is_not_re_granted() {
+    let server = MockServer::start().await;
+    // Both ancestors of wh.sales.orders, already carrying exactly what v4's SELECT
+    // plan plans for them. `root` is the configured realm, not `*`.
+    let policies = serde_json::json!([
+        {
+            "id": 1, "name": "catalog-level",
+            "resources": {"root": {"values": ["POLARIS"]}, "catalog": {"values": ["wh"]}},
+            "policyItems": [{"roles": ["analyst"],
+                "accesses": [{"type": "namespace-list", "isAllowed": true}]}]
+        },
+        {
+            "id": 2, "name": "namespace-level",
+            "resources": {"root": {"values": ["POLARIS"]}, "catalog": {"values": ["wh"]},
+                          "namespace": {"values": ["sales"]}},
+            "policyItems": [{"roles": ["analyst"], "accesses": [
+                {"type": "namespace-list", "isAllowed": true},
+                {"type": "namespace-properties-read", "isAllowed": true}]}]
+        }
+    ]);
+    Mock::given(method("GET"))
+        .and(path("/service/public/v2/api/policy"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(policies))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!("/service/plugins/services/grant/{SERVICE}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+        .mount(&server)
+        .await;
+
+    let backend = backend(&server.uri());
+    backend
+        .grant("token", &grant_stmt())
+        .await
+        .expect("grant must succeed");
+    assert_eq!(
+        grant_posts(&server).await,
+        1,
+        "only the level the statement NAMES should be written; the two traversal \
+         levels were already held"
+    );
+}
+
+/// A DISABLED policy does not count as holding anything.
+///
+/// Ranger returns a console-disabled policy with `isEnabled: false` and its
+/// `policyItems` intact, while enforcement ignores it. Reading those items as held
+/// would skip a level the grantee does not have, and the grant would report success
+/// while conferring nothing.
+#[tokio::test]
+async fn a_disabled_policy_does_not_count_as_already_held() {
+    let server = MockServer::start().await;
+    let policies = serde_json::json!([
+        {
+            "id": 1, "name": "catalog-level", "isEnabled": false,
+            "resources": {"root": {"values": ["POLARIS"]}, "catalog": {"values": ["wh"]}},
+            "policyItems": [{"roles": ["analyst"],
+                "accesses": [{"type": "namespace-list", "isAllowed": true}]}]
+        },
+        {
+            "id": 2, "name": "namespace-level", "isEnabled": true,
+            "resources": {"root": {"values": ["POLARIS"]}, "catalog": {"values": ["wh"]},
+                          "namespace": {"values": ["sales"]}},
+            "policyItems": [{"roles": ["analyst"], "accesses": [
+                {"type": "namespace-list", "isAllowed": true},
+                {"type": "namespace-properties-read", "isAllowed": true}]}]
+        }
+    ]);
+    Mock::given(method("GET"))
+        .and(path("/service/public/v2/api/policy"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(policies))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!("/service/plugins/services/grant/{SERVICE}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+        .mount(&server)
+        .await;
+
+    let backend = backend(&server.uri());
+    backend
+        .grant("token", &grant_stmt())
+        .await
+        .expect("grant must succeed");
+    assert_eq!(
+        grant_posts(&server).await,
+        2,
+        "the disabled catalog policy must be re-granted; only the enabled namespace \
+         level counts as held"
+    );
+}
+
+/// The level the statement names is written even when it looks already-held.
+///
+/// The skip is deliberately ancestors-only. The named object's policy may still
+/// need access types added, or `delegateAdmin` set from `WITH GRANT OPTION`, and
+/// skipping it on a subset match would make `GRANT ... WITH GRANT OPTION` a silent
+/// no-op for anyone who already had plain SELECT.
+#[tokio::test]
+async fn the_named_level_is_written_even_when_already_held() {
+    let server = MockServer::start().await;
+    let policies = serde_json::json!([
+        {
+            "id": 1, "name": "catalog-level",
+            "resources": {"root": {"values": ["POLARIS"]}, "catalog": {"values": ["wh"]}},
+            "policyItems": [{"roles": ["analyst"],
+                "accesses": [{"type": "namespace-list", "isAllowed": true}]}]
+        },
+        {
+            "id": 2, "name": "namespace-level",
+            "resources": {"root": {"values": ["POLARIS"]}, "catalog": {"values": ["wh"]},
+                          "namespace": {"values": ["sales"]}},
+            "policyItems": [{"roles": ["analyst"], "accesses": [
+                {"type": "namespace-list", "isAllowed": true},
+                {"type": "namespace-properties-read", "isAllowed": true}]}]
+        },
+        {
+            "id": 3, "name": "table-level",
+            "resources": {"root": {"values": ["POLARIS"]}, "catalog": {"values": ["wh"]},
+                          "namespace": {"values": ["sales"]}, "table": {"values": ["orders"]}},
+            "policyItems": [{"roles": ["analyst"], "accesses": [
+                {"type": "table-data-read", "isAllowed": true},
+                {"type": "table-list", "isAllowed": true},
+                {"type": "table-properties-read", "isAllowed": true}]}]
+        }
+    ]);
+    Mock::given(method("GET"))
+        .and(path("/service/public/v2/api/policy"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(policies))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!("/service/plugins/services/grant/{SERVICE}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+        .mount(&server)
+        .await;
+
+    let backend = backend(&server.uri());
+    let mut stmt = grant_stmt();
+    stmt.with_grant_option = true;
+    backend.grant("token", &stmt).await.expect("grant must succeed");
+    assert_eq!(
+        grant_posts(&server).await,
+        1,
+        "the named level must still be POSTed so delegateAdmin can be set"
+    );
+}
+
+/// A 403 on a traversal level says WHICH level, and what an admin has to do.
+///
+/// "Ranger grant failed (HTTP 403)" on a statement that named a table sends the
+/// reader looking at the table's policy, which is not where the problem is.
+#[tokio::test]
+async fn a_403_on_a_traversal_level_names_the_level_and_the_fix() {
+    let server = MockServer::start().await;
+    // No GET mock: nothing is known to be already held, so the catalog level -- the
+    // first call of the plan -- is attempted and refused.
+    Mock::given(method("POST"))
+        .and(path(format!("/service/plugins/services/grant/{SERVICE}")))
+        .respond_with(ResponseTemplate::new(403).set_body_string(
+            r#"{"msgDesc":"User doesn't have necessary permission to grant access"}"#,
+        ))
+        .mount(&server)
+        .await;
+
+    let backend = backend(&server.uri());
+    let err = backend
+        .grant("token", &grant_stmt())
+        .await
+        .expect_err("a 403 must surface")
+        .to_string();
+    assert!(err.contains("catalog level"), "must name the level, got: {err}");
+    assert!(
+        err.contains("does not cascade"),
+        "must say why holding delegate admin on the table is not enough, got: {err}"
+    );
+    assert!(
+        err.contains("USAGE ON DATABASE"),
+        "must name the statement that fixes it, got: {err}"
     );
 }
 

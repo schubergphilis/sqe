@@ -64,6 +64,24 @@ pub trait GrantBackend: Send + Sync {
 
     /// Human-readable backend name for logging and error messages.
     fn backend_name(&self) -> &str;
+
+    /// Does this backend authorize a GRANT/REVOKE against the CALLER's own
+    /// authority on the named resource?
+    ///
+    /// `true` means the backend performs a per-resource check of its own on the
+    /// principal in [`GrantStatement::grantor`] -- so the coordinator's coarse
+    /// `admin_roles` gate can be stood down (see
+    /// `sqe_core::config::GrantAuthority`) without leaving the mutation
+    /// unauthorized.
+    ///
+    /// `false` means the backend acts with SQE's identity, or with an identity the
+    /// caller does not control, and the mutation is therefore only as authorized as
+    /// whatever check ran before it. Defaults to `false`: a new backend has to opt
+    /// in deliberately, because getting this wrong turns an ungated GRANT into
+    /// self-escalation.
+    fn enforces_grantor_authority(&self) -> bool {
+        false
+    }
 }
 
 // ── Shared types ─────────────────────────────────────────────────────────────
