@@ -506,12 +506,87 @@ than merely role-scoped, and Ranger's audit record names the human instead of
 is handed on. Without it nobody except the principals seeded at bootstrap could
 ever grant.
 
-The `[auth] admin_roles` gate on GRANT and REVOKE stays in place as defence in
-depth. The two checks answer different questions: the role gate is coarse and
-local ("may this session issue grant statements at all"), while Ranger's is
-per-resource. The gate also still matters for the `polaris` access-control
-backend, which swaps the caller's token for a service token (issue #204) and so
-has no equivalent check of its own.
+The `[auth] admin_roles` gate on GRANT and REVOKE stays in place by default as
+defence in depth. The two checks answer different questions: the role gate is
+coarse and local ("may this session issue grant statements at all"), while
+Ranger's is per-resource. The gate also still matters for the `polaris`
+access-control backend, which swaps the caller's token for a service token
+(issue #204) and so has no equivalent check of its own.
+
+### Delegated grants: `grant_authority`
+
+Both checks together mean a table owner holding `WITH GRANT OPTION` still cannot
+use it without an engine-wide admin role. `[access_control] grant_authority`
+decides which check applies:
+
+```toml
+[access_control]
+backend = "ranger"
+# admin-role      (default) require an [auth] admin_roles role, then Ranger
+# ranger-delegate let Ranger's per-resource delegateAdmin be the only check
+grant_authority = "ranger-delegate"
+```
+
+The default is `admin-role`, so an upgrade changes nobody's deployment. Read the
+Ranger policies before switching: `ranger-delegate` widens who may issue grants to
+everyone holding `delegateAdmin`, and a wildcard discovery policy (`catalog = *`)
+written with `delegateAdmin: true` hands its roles the authority to grant those
+access types anywhere in the service. The quickstart's `analyst` and `engineer`
+roles are exactly that shape.
+
+`ranger-delegate` is only honoured for a backend that authorizes the caller
+(`GrantBackend::enforces_grantor_authority`). Asking for it against a backend that
+acts with SQE's identity leaves the gate in place rather than removing the last
+check.
+
+`DENY` ignores the setting entirely and always requires an admin role. See the two
+asymmetries above: the policy API authorizes the REST user and takes no grantor, so
+there is nothing finer to hand over to.
+
+### Delegate admin does not cascade upward
+
+A `GRANT` on a table writes three policies, and Ranger authorizes each one
+separately against the grantor. Measured on Ranger 2.8, with a grantor holding
+`delegateAdmin` on `cat.ns.tbl` only:
+
+| Request | Result |
+|---|---|
+| grant on `cat.ns.tbl` | 200 |
+| grant on `cat.ns` | 403 |
+| grant on `cat` | 403 |
+| revoke on `cat.ns.tbl` | 200 |
+| revoke on `cat` | 403 |
+| grant `table-data-write` on `cat.ns.tbl` (outside their delegate set) | 403 |
+
+The plan writes the catalog level FIRST, so a delegated grant would fail on its
+very first call. SQE therefore **skips a traversal level the grantee already holds
+at that exact resource**: Ranger merges access types, so re-POSTing a set already
+present changes nothing, and skipping it removes the only call the delegated
+grantor was not authorized to make. The level the statement NAMES is never skipped,
+because it may still add access types or `delegateAdmin`.
+
+What follows from that is the real shape of delegated grants: an admin onboards a
+principal to a catalog and namespace once, and table owners manage their own tables
+from then on. A grantee with no discovery yet cannot be served by a delegated
+grant, and the error says so, naming the level that failed and the statements that
+fix it.
+
+The check is deliberately exact-resource. A wildcard policy can cover the same
+target, but deciding that needs Ranger's own matcher, and a wrong "already covered"
+would skip a level the grantee does not hold, leaving a grant that reports success
+and confers nothing. Being too cautious costs one redundant POST. A policy disabled
+in the console is treated as holding nothing: Ranger returns it with `isEnabled:
+false` and its items intact while enforcement ignores it.
+
+One cost worth knowing before a large deployment: Ranger's policy API has no
+by-resource query, so each lookup fetches the whole policy list for the service. A
+table `GRANT` now does that twice for the skip check plus once for the provenance
+label, where it used to do it once, and the fetch is linear in total policy count.
+Invisible at tens of policies, not at thousands.
+
+Ownership, then, is `delegateAdmin`, and `WITH GRANT OPTION` is how it is handed
+on. SQE does not yet grant it automatically to whoever creates a table; that is
+tracked separately.
 
 ### Migration note
 
