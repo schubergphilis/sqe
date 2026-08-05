@@ -235,3 +235,67 @@ Nothing from the handoff. `scripts/check-vendored-profile.sh` is now wired into 
 the `vendored-profile-drift` job, scoped by `changes` to the vendored assets and the
 checker, and NOT `allow_failure`: the script exits 2 when it cannot find the platform
 checkout, so a job that cannot verify fails rather than reporting success.
+
+---
+
+# Follow-up, 2026-08-05: v5 folds the implication graph in
+
+data-platform published v5 (`feat/grant-profile-v5-folded`), and SQE now vendors one
+file instead of two. This records what changed and, more usefully, what was checked
+before changing it.
+
+## v5 is v4 plus one key
+
+Diffed structurally rather than by eye. `privileges` (15), `aliases` (13),
+`fixtures` (26) and `rejects` (9) are byte-identical to v4 after a sorted dump. The
+only addition is a top-level `access_types`: 69 entries mapping an access type to
+what holding it implies.
+
+That map is equivalent to the servicedef's: all 69 names present in both, and zero
+shared name whose implied set differs.
+
+## The migration is mechanical, and that was verified first
+
+SQE's expansion (BTreeSet plus a stack and a seen-set, `exclude` subtracted AFTER
+expansion, plan truncated at the level the statement names) was replayed in Python
+over all 26 fixtures against BOTH sources before touching any Rust:
+
+```
+v4 + servicedef: 26/26 fixtures reproduced
+v5 folded      : 26/26 fixtures reproduced
+```
+
+So this is a change of WHERE the graph is read from, and nothing about what a GRANT
+means. Confirmed by the Rust suite passing with no fixture edits: 10 tests, the
+fixtures and rejects untouched.
+
+## What the fold does not do
+
+It does not pre-expand `privileges`. That distinction is load-bearing and was the
+original argument for two files: if the generator shipped finished access-type sets,
+the fixtures would be self-satisfying, this code asserting it read what it read.
+SQE still computes the closure and compares against `expect`, which the platform
+computed with its own code, so the property the split was protecting survives the
+fold. Pre-expansion would not, and should be resisted if it is ever proposed.
+
+## What did NOT move
+
+`servicedef-polaris.json` is still the Ranger service DEFINITION. Both quickstarts
+register it with Ranger Admin (`bootstrap-ranger.sh`, `-d @/servicedef-polaris.json`),
+and v5 does not replace that. Only the VENDORED copy under
+`crates/sqe-policy/assets/` is gone, and `scripts/check-vendored-profile.sh` no
+longer names it, so the platform can move or drop its shared copy without SQE's
+drift gate having an opinion. Worth knowing: all three copies in this repo were
+byte-identical (sha256 `e60aaa6b…`, 20091 bytes), so the two quickstart ones are now
+the only copies rather than being shadowed by a vendored twin.
+
+## The one new guard
+
+`access_types` is a REQUIRED serde field. With `#[serde(default)]` a profile missing
+it would parse and expand every seed to itself, so `INSERT` would confer
+`table-data-write` alone and every Iceberg commit would fail an authorization check
+inside Polaris, with nothing pointing at the profile. Under-granting is the safe
+direction and the undiagnosable one. Before v5 the graph lived in a file whose
+absence broke the build; now only serde stands there, which is why
+`a_profile_without_the_implication_graph_is_refused` exists. Mutation-checked by
+adding `#[serde(default)]`, which fails it.

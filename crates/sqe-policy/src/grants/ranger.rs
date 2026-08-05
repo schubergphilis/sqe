@@ -5,7 +5,7 @@
 //! Ranger service-def: `polaris`. Resource hierarchy: root -> catalog ->
 //! namespace -> table. Access types are Polaris-native hyphenated names.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -192,6 +192,39 @@ fn validate_identifier(value: &str, what: &str) -> sqe_core::Result<()> {
 
 /// Split a grantee into (users, roles) for a `GrantRevokeRequest`. Groups are
 /// rejected: Polaris does not deliver groups to Ranger unless usersync runs.
+/// Which level of a plan a resource map addresses. For error messages, so a 403
+/// can say WHICH of the three policies Ranger refused.
+fn level_name(resource: &BTreeMap<String, String>) -> &'static str {
+    if resource.contains_key("table") {
+        "table"
+    } else if resource.contains_key("namespace") {
+        "namespace"
+    } else {
+        "catalog"
+    }
+}
+
+/// The grantor a mutation must be performed as.
+///
+/// Refuses rather than falling back to the configured admin user. Ranger
+/// authorizes against this name, so the fallback is not a default -- it is a
+/// different security decision (perform the mutation with SQE's own authority),
+/// and with `grant_authority = "ranger-delegate"` it would be the only check
+/// standing between an authenticated caller and any grant they cared to write.
+/// Making it an error means "the coarse gate is off" and "acting as admin" cannot
+/// both be true on any code path.
+fn required_grantor<'a>(grantor: Option<&'a str>, op: &str) -> sqe_core::Result<&'a str> {
+    let g = grantor.ok_or_else(|| {
+        sqe_core::SqeError::Execution(format!(
+            "internal error: Ranger {op} reached the backend with no grantor. Ranger \
+             authorizes against the grantor, so performing this as SQE's admin user \
+             would skip the per-resource authority check entirely."
+        ))
+    })?;
+    validate_identifier(g, "grantor")?;
+    Ok(g)
+}
+
 fn grantee_to_fields(grantee: &Grantee) -> sqe_core::Result<(Vec<String>, Vec<String>)> {
     match grantee {
         Grantee::User(n) => Ok((vec![n.clone()], vec![])),
@@ -420,6 +453,66 @@ impl RangerGrantBackend {
     /// Compared in Rust over the service's policy list rather than with Ranger's
     /// `resource:` query parameters, because those match by prefix and
     /// containment; an exact comparison is what the uniqueness rule actually is.
+    /// The allow access types `grantee` already holds in the policy for EXACTLY
+    /// this resource. `None` when there is no such policy, or it could not be read.
+    ///
+    /// Exact resource only, and that is the safe direction rather than a shortcut.
+    /// A wildcard policy (`catalog = *`) can cover the same target, but deciding
+    /// that needs Ranger's own matcher, and a wrong "already covered" here would
+    /// skip writing a level the grantee does not hold -- a grant reporting success
+    /// while conferring nothing. Under-reporting only ever costs a redundant POST.
+    async fn held_access_types_at(
+        &self,
+        resource: &BTreeMap<String, String>,
+        grantee: &Grantee,
+    ) -> Option<BTreeSet<String>> {
+        let policy = self.policy_by_resource(resource).await.ok()??;
+        // A policy disabled in the Ranger console still returns its `policyItems`
+        // (`isEnabled: false`, everything else intact), and enforcement ignores it.
+        // Reading those items as held would skip a level the grantee does not
+        // actually have, which is the "grant succeeds and confers nothing" failure
+        // this whole check is written to avoid. Absent field means enabled, which is
+        // how Ranger treats it.
+        if policy.get("isEnabled").and_then(serde_json::Value::as_bool) == Some(false) {
+            return None;
+        }
+        let (users, roles) = grantee_to_fields(grantee).ok()?;
+        let named = |item: &serde_json::Value, field: &str| -> Vec<String> {
+            item.get(field)
+                .and_then(serde_json::Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let mut held = BTreeSet::new();
+        for item in policy
+            .get("policyItems")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let is_theirs = users.iter().any(|u| named(item, "users").contains(u))
+                || roles.iter().any(|r| named(item, "roles").contains(r));
+            if !is_theirs {
+                continue;
+            }
+            for access in item
+                .get("accesses")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                if let Some(t) = access.get("type").and_then(serde_json::Value::as_str) {
+                    held.insert(t.to_string());
+                }
+            }
+        }
+        Some(held)
+    }
+
     async fn policy_by_resource(
         &self,
         want: &BTreeMap<String, String>,
@@ -1127,19 +1220,61 @@ impl GrantBackend for RangerGrantBackend {
             // check, not just an audit field. It applies to the traversal levels
             // too: an operator who may not grant on the namespace must not acquire
             // that authority by naming a table underneath it.
-            if let Some(g) = stmt.grantor.as_deref() {
-                validate_identifier(g, "grantor")?;
-                body.grantor = g.to_string();
-            }
+            body.grantor = required_grantor(stmt.grantor.as_deref(), "grant")?.to_string();
             if is_primary {
                 // WITH GRANT OPTION becomes delegateAdmin, on the named object
                 // only: a grantee must not gain authority to re-grant traversal.
                 body.delegate_admin = stmt.with_grant_option;
             }
+            // Skip a traversal level the grantee already holds at that exact
+            // resource. Ranger MERGES access types, so re-POSTing a set already
+            // present changes nothing -- but the POST is still authorized, and
+            // delegate admin does NOT cascade upward (verified against Ranger 2.8:
+            // a grantor holding it on `cat.ns.tbl` is refused 403 on `cat` and on
+            // `cat.ns`). So without this, the first call of every delegated table
+            // grant fails on a write that would have been a no-op, and
+            // `WITH GRANT OPTION` confers nothing usable.
+            //
+            // Never skip the level the statement NAMES: that one may add access
+            // types, or delegate admin, to what is already there.
+            if !is_primary {
+                if let Some(held) = self.held_access_types_at(&body.resource, &stmt.grantee).await {
+                    if body.access_types.iter().all(|a| held.contains(a)) {
+                        debug!(
+                            level = level_name(&body.resource),
+                            grantee = stmt.grantee.name(),
+                            "traversal level already held; skipping a no-op grant"
+                        );
+                        // Deliberately NOT recorded in `written`: compensation must
+                        // not roll back access that was there before this statement.
+                        continue;
+                    }
+                }
+            }
             if let Err(e) = self
                 .post_grant_revoke_with_privilege("grant", &stmt.privilege, &body)
                 .await
             {
+                // Which level failed, when it is not the one the statement named.
+                // "Ranger grant failed (HTTP 403)" on a statement naming a table
+                // sends the reader to the table's policy, which is not where the
+                // problem is. Appended to the same message rather than wrapped in a
+                // second error, so the Display prefix appears once.
+                let level_hint = if is_primary {
+                    String::new()
+                } else {
+                    format!(
+                        " (this is the {} level of the plan, not the object the \
+                         statement names: reaching a table needs catalog and namespace \
+                         visibility as well. Delegate admin does not cascade upward in \
+                         Ranger, so holding it on the table does not confer it here. An \
+                         admin seeding discovery for '{}' once -- GRANT USAGE ON DATABASE, \
+                         GRANT USAGE ON SCHEMA -- makes this level already-held, and it \
+                         is then skipped)",
+                        level_name(&body.resource),
+                        stmt.grantee.name(),
+                    )
+                };
                 // COMPENSATE. Ranger has no transaction across these calls, so a
                 // failure here leaves a partial plan, and half a plan is worse
                 // than none: the traversal levels alone confer discovery the
@@ -1151,8 +1286,15 @@ impl GrantBackend for RangerGrantBackend {
                 // so the message always states what happened rather than implying
                 // a clean failure.
                 let rolled_back = self.compensate(&written, stmt).await;
+                // Reuse the inner message rather than its Display: both are
+                // `SqeError::Execution`, so `{e}` here would print "Query execution
+                // error:" twice in the one message operators are asked to read.
+                let base = match &e {
+                    sqe_core::SqeError::Execution(msg) => msg.clone(),
+                    other => other.to_string(),
+                };
                 return Err(sqe_core::SqeError::Execution(format!(
-                    "{e}{}",
+                    "{base}{level_hint}{}",
                     match (written.is_empty(), rolled_back) {
                         (true, _) => String::new(),
                         (false, true) => format!(
@@ -1199,10 +1341,7 @@ impl GrantBackend for RangerGrantBackend {
             stmt.table.as_deref(),
             &stmt.grantee,
         )?;
-        if let Some(g) = stmt.grantor.as_deref() {
-            validate_identifier(g, "grantor")?;
-            body.grantor = g.to_string();
-        }
+        body.grantor = required_grantor(stmt.grantor.as_deref(), "revoke")?.to_string();
 
         // Narrow the revoke to the access types no OTHER privilege this grantee
         // holds on this resource still needs. Ranger allows one policy per
@@ -1458,6 +1597,20 @@ impl GrantBackend for RangerGrantBackend {
 
     fn backend_name(&self) -> &str {
         "ranger"
+    }
+
+    /// Ranger authorizes `grant` and `revoke` against the `grantor` field, per
+    /// resource and per access type. Verified against 2.8: a grantor with no
+    /// `delegateAdmin` on the resource is refused 403 "User doesn't have necessary
+    /// permission to grant access" even when the HTTP call authenticates as the
+    /// Ranger admin, and a grantor holding it for `table-data-read` is still
+    /// refused when the request names `table-data-write`.
+    ///
+    /// Note what this does NOT cover: `deny` goes through the policy API, which
+    /// authorizes the REST user and takes no grantor. `handle_deny` keeps its own
+    /// admin gate for exactly that reason.
+    fn enforces_grantor_authority(&self) -> bool {
+        true
     }
 }
 

@@ -506,6 +506,35 @@ impl QueryHandler {
         )))
     }
 
+    /// Gate a GRANT or REVOKE, per `[access_control] grant_authority`.
+    ///
+    /// Under the default `admin-role` this is exactly `require_admin`. Under
+    /// `ranger-delegate` the coarse role check stands down in favour of the
+    /// backend's per-resource one, so a table owner holding `WITH GRANT OPTION` can
+    /// hand on access to their own table without an engine-wide admin role.
+    ///
+    /// DENY does not come through here; see `handle_deny`.
+    fn require_grant_authority(
+        &self,
+        session: &Session,
+        statement: &str,
+        backend: &dyn GrantBackend,
+    ) -> sqe_core::Result<()> {
+        if !admin_gate_required(
+            self.config.access_control.grant_authority,
+            backend.enforces_grantor_authority(),
+        ) {
+            debug!(
+                username = %session.user.username,
+                statement = statement,
+                backend = backend.backend_name(),
+                "admin-role gate stood down: the backend authorizes this per resource"
+            );
+            return Ok(());
+        }
+        self.require_admin(session, statement)
+    }
+
     /// Resolve any unknown 3-part catalog qualifiers in `stmt` against the
     /// caller's session ctx, lazily discovering Polaris warehouses when
     /// `[query] catalog_discovery = polaris-auto`. Errors with the standard
@@ -4664,14 +4693,14 @@ impl QueryHandler {
         session: &Session,
         stmt: &Statement,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
-        // Gate behind the admin allowlist BEFORE touching the backend
-        // (issue #204). In production the Polaris backend swaps the caller's
-        // token for a service token scoped PRINCIPAL_ROLE:ALL, so an
-        // ungated GRANT let any authenticated user self-escalate. The check
-        // sits here, ahead of `require_grant_backend`, so the service-token
-        // path is unreachable for non-admins.
-        self.require_admin(session, "GRANT")?;
+        // Gate BEFORE the backend is asked to do anything (issue #204). In
+        // production the Polaris backend swaps the caller's token for a service
+        // token scoped PRINCIPAL_ROLE:ALL, so an ungated GRANT let any
+        // authenticated user self-escalate. `require_grant_backend` only reads the
+        // configured backend -- no network, no token swap -- so resolving it first
+        // to ask what it enforces keeps that path unreachable for non-admins.
         let backend = self.require_grant_backend()?;
+        self.require_grant_authority(session, "GRANT", backend)?;
         let mut grant_stmt = Self::extract_grant_statement(stmt)?;
         // Always act as the authenticated caller, never as SQE's service
         // identity. Ranger authorizes the grant against this name, so a caller
@@ -4694,10 +4723,13 @@ impl QueryHandler {
         session: &Session,
         stmt: &Statement,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
-        // Same admin gate as GRANT (issue #204): REVOKE mutates grants under
-        // the service token too.
-        self.require_admin(session, "REVOKE")?;
+        // Same gate as GRANT (issue #204): REVOKE mutates grants under the service
+        // token too. Ranger authorizes the revoke endpoint against the grantor
+        // independently of the grant endpoint (verified against 2.8: 403 "User
+        // doesn't have necessary permission to revoke access"), so it earns the
+        // same relaxation.
         let backend = self.require_grant_backend()?;
+        self.require_grant_authority(session, "REVOKE", backend)?;
         let grant_stmt = Self::extract_grant_statement(stmt)?;
         let revoke_stmt = RevokeStatement {
             privilege: grant_stmt.privilege,
@@ -4720,10 +4752,12 @@ impl QueryHandler {
 
     /// Handle DENY by delegating to the configured grant backend.
     ///
-    /// Same admin gate as GRANT. Note the asymmetry documented on
-    /// `RangerGrantStore::deny`: Ranger's policy API (the only way to write a
-    /// deny) authorizes the REST user rather than a `grantor`, so unlike GRANT
-    /// this is NOT additionally scoped to the caller's delegate authority.
+    /// Always requires an admin role, and `[access_control] grant_authority`
+    /// deliberately does not apply. The asymmetry is documented on
+    /// `RangerGrantStore::deny`: Ranger's policy API (the only way to write a deny
+    /// item) authorizes the REST user SQE connects with rather than a `grantor`, so
+    /// there is no per-resource check to hand over to. Relaxing this one would
+    /// leave the write unauthorized rather than authorized more finely.
     async fn handle_deny(
         &self,
         session: &Session,
@@ -6635,6 +6669,25 @@ fn unquote_segment(s: &str) -> &str {
 }
 
 /// Catalog named by `SHOW SCHEMAS FROM <catalog>`: the leading dotted segment.
+/// Does a GRANT/REVOKE still need the coarse `[auth] admin_roles` check?
+///
+/// A pure decision so the truth table can be tested without a live backend, a
+/// session, or a config file. The dangerous cell is the last one: asking for
+/// `ranger-delegate` against a backend that does NOT authorize the caller would
+/// leave the mutation with no check at all, which escalates rather than refines.
+/// So the relaxation requires BOTH the operator's choice and a backend that can
+/// carry it.
+fn admin_gate_required(
+    authority: sqe_core::config::GrantAuthority,
+    backend_enforces_grantor: bool,
+) -> bool {
+    use sqe_core::config::GrantAuthority;
+    match authority {
+        GrantAuthority::AdminRole => true,
+        GrantAuthority::RangerDelegate => !backend_enforces_grantor,
+    }
+}
+
 /// `None` when there is no FROM/IN clause (lists the default catalog).
 /// Which catalog a `SHOW` should read: the session's own, or a specific named one.
 #[derive(Debug, PartialEq, Eq)]
@@ -7530,6 +7583,36 @@ warehouse = "wh1"
         assert_eq!(
             show_catalog_target(Some("somewhere_else"), None, &config),
             ShowCatalogTarget::Named("somewhere_else".to_string())
+        );
+    }
+
+    /// The whole truth table for the GRANT/REVOKE gate, including the cell that
+    /// must NOT relax.
+    ///
+    /// `ranger-delegate` against a backend that does not authorize the caller is
+    /// the escalation case: standing down the role check there would leave the
+    /// mutation with no authorization at all. It is a config the operator can
+    /// write, so it has to be safe by construction rather than by documentation.
+    #[test]
+    fn the_admin_gate_stands_down_only_when_something_finer_takes_over() {
+        use sqe_core::config::GrantAuthority;
+        // Default: always gated, whatever the backend can do.
+        assert!(admin_gate_required(GrantAuthority::AdminRole, true));
+        assert!(admin_gate_required(GrantAuthority::AdminRole, false));
+        // Opted in, and the backend authorizes per resource: hand over.
+        assert!(!admin_gate_required(GrantAuthority::RangerDelegate, true));
+        // Opted in, but nothing finer exists. Keep the gate.
+        assert!(admin_gate_required(GrantAuthority::RangerDelegate, false));
+    }
+
+    /// The default has to be the safe one: an upgrade must not widen who may issue
+    /// grants on a deployment whose config never mentioned this setting.
+    #[test]
+    fn grant_authority_defaults_to_the_admin_role_gate() {
+        let config = two_catalog_config();
+        assert_eq!(
+            config.access_control.grant_authority,
+            sqe_core::config::GrantAuthority::AdminRole
         );
     }
 

@@ -2543,6 +2543,9 @@ pub struct AccessControlConfig {
     /// When absent, the user's passthrough OIDC token is used.
     #[serde(default)]
     pub client_secret: Option<String>,
+    /// Who may issue `GRANT` and `REVOKE`. See [`GrantAuthority`].
+    #[serde(default, alias = "grant-authority")]
+    pub grant_authority: GrantAuthority,
     /// Apache Ranger backend tuning. Used only when `backend = "ranger"`.
     #[serde(default)]
     pub ranger: RangerConfig,
@@ -2556,9 +2559,41 @@ impl Default for AccessControlConfig {
             timeout_secs: 30,
             client_id: None,
             client_secret: None,
+            grant_authority: GrantAuthority::default(),
             ranger: RangerConfig::default(),
         }
     }
+}
+
+/// Where the authority to issue `GRANT` / `REVOKE` comes from.
+///
+/// Two different questions, and SQE can ask either one:
+///
+/// - `admin-role` (default) checks `[auth] admin_roles` before the statement
+///   reaches the backend. Coarse: it asks "may this session issue grant
+///   statements at all", not "on this table".
+/// - `ranger-delegate` skips that check and lets the backend's own per-resource
+///   check decide, which for the `ranger` backend means Ranger's `delegateAdmin`
+///   on the named resource. That is what makes `WITH GRANT OPTION` usable: a
+///   table owner can hand on access to their own table without holding an
+///   engine-wide admin role.
+///
+/// Default is `admin-role` so an upgrade changes nobody's deployment. Turning
+/// `ranger-delegate` on widens who may issue grants to everyone holding
+/// `delegateAdmin` in Ranger, which is not always a small set: a wildcard
+/// discovery policy (`catalog = *`) written with `delegateAdmin: true` hands its
+/// roles the authority to grant those access types anywhere in the service.
+/// Read the Ranger policies before flipping it.
+///
+/// `DENY` ignores this setting and always requires an admin role. Ranger's policy
+/// API (the only way to write a deny item) authorizes the REST user SQE connects
+/// with and takes no grantor, so there is no per-resource check to fall back on.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum GrantAuthority {
+    #[default]
+    AdminRole,
+    RangerDelegate,
 }
 
 fn default_access_control_timeout() -> u64 { 30 }
@@ -7881,6 +7916,33 @@ mod ranger_config_tests {
     fn access_control_config_default_includes_ranger() {
         let c = AccessControlConfig::default();
         assert_eq!(c.ranger.service_name, "polaris");
+    }
+
+    /// Both spellings, because the surrounding block mixes them: this struct's own
+    /// fields are snake_case (`timeout_secs`) while `[access_control.ranger]` is
+    /// kebab (`service-name`), so an operator will reasonably try either.
+    #[test]
+    fn grant_authority_parses_both_spellings_and_defaults_safe() {
+        let c: AccessControlConfig = toml::from_str(r#"backend = "ranger""#).unwrap();
+        assert_eq!(
+            c.grant_authority,
+            GrantAuthority::AdminRole,
+            "a config that never mentions grant authority must keep the role gate"
+        );
+        for line in [
+            r#"grant_authority = "ranger-delegate""#,
+            r#"grant-authority = "ranger-delegate""#,
+        ] {
+            let c: AccessControlConfig =
+                toml::from_str(&format!("backend = \"ranger\"\n{line}\n")).unwrap();
+            assert_eq!(c.grant_authority, GrantAuthority::RangerDelegate, "{line}");
+        }
+        // A typo must not read as the relaxed setting.
+        assert!(
+            toml::from_str::<AccessControlConfig>(r#"grant_authority = "ranger_delegate""#)
+                .is_err(),
+            "an unrecognised value must be refused, not defaulted"
+        );
     }
 
     #[test]
