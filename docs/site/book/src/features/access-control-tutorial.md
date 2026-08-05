@@ -270,9 +270,47 @@ stacking), reversible with `REVOKE`, and audited as a privilege change.
 One caveat, deliberate: DENY goes through Ranger's policy API, which authorizes
 the authenticated REST user rather than a named `grantor`. Unlike `GRANT` it is
 therefore not resource-scoped to the caller, and the `admin_roles` config gate is
-the only check. Ranger offers no grantor-scoped deny.
+the only check. Ranger offers no grantor-scoped deny, so `DENY` stays admin-only
+even under the `ranger-delegate` setting below.
 
-## 1.7 Introspection
+## 1.7 Who may grant
+
+By default a session needs a role from `[auth] admin_roles` before it may issue
+`GRANT` or `REVOKE` at all, and then Ranger checks `delegateAdmin` on the resource.
+Both have to pass, which means `WITH GRANT OPTION` on its own does nothing for a
+user without an engine-wide admin role.
+
+To let table owners manage their own tables, hand the decision to Ranger:
+
+```toml
+[access_control]
+grant_authority = "ranger-delegate"
+```
+
+Then this works, as dave, holding no admin role:
+
+```sql
+-- as an admin, once: dave owns the table, bob can see the catalog and namespace
+GRANT SELECT ON sales_wh.acdemo.orders TO USER dave WITH GRANT OPTION;
+GRANT USAGE ON DATABASE sales_wh TO USER bob;
+GRANT USAGE ON SCHEMA sales_wh.acdemo TO USER bob;
+
+-- as dave, no admin role:
+GRANT SELECT ON sales_wh.acdemo.orders TO USER bob;
+```
+
+The two `USAGE` statements are not decoration. A table grant writes three policies
+(catalog, namespace, table) because reaching a table needs discovery above it, and
+Ranger's `delegateAdmin` does not cascade upward: dave owns the table and is refused
+403 on the catalog. SQE skips a traversal level the grantee already holds, so once
+bob has discovery, dave's grant only has to write the level he owns. A grantee with
+no discovery yet gets an error naming the level and these statements.
+
+Before switching, read the Ranger policies. `ranger-delegate` widens who may grant
+to everyone holding `delegateAdmin`, and the quickstart's wildcard discovery policy
+gives roles `analyst` and `engineer` exactly that for the discovery access types.
+
+## 1.8 Introspection
 
 ```sql
 SHOW GRANTS ON sales_wh.acdemo.orders;
