@@ -1,4 +1,4 @@
-//! Profile-driven grant planning: `grant-profile.json` + `servicedef-polaris.json`.
+//! Profile-driven grant planning from the vendored `grant-profile.json`.
 //!
 //! SQE and the data-platform control plane write Ranger policies to the SAME
 //! `polaris` service. If they disagree about what a privilege confers, "who
@@ -6,16 +6,23 @@
 //! privilege vocabulary is not written in Rust: it is vendored from the platform
 //! and read at startup, and the profile's own fixtures are the test.
 //!
-//! Two files, not one, and that split is deliberate. `grant-profile.json` ships
-//! **seeds**; the `impliedGrants` closure that turns a seed into the access types
-//! Polaris actually checks lives in `servicedef-polaris.json` and is applied here,
-//! at write time. Pre-expanding in the platform's generator was considered and
-//! rejected: the fixtures would then be self-satisfying (this code echoing back
-//! what it read) instead of proving its closure matches the platform's -- and the
-//! closure is exactly what drifted before, when SQE's hand-written `WRITE_ACCESS`
-//! carried `table-properties-write`, which `table-data-write` does not imply.
+//! One file since v5. `privileges` ships **seeds**, and `access_types` carries the
+//! implication graph that turns a seed into the access types Polaris actually
+//! checks; the closure is applied here, at write time. Until v5 that graph lived in
+//! a second vendored file, `servicedef-polaris.json`, which is still the Ranger
+//! service DEFINITION (the quickstarts register it with Ranger Admin) but is no
+//! longer an input to planning.
 //!
-//! Keep both files byte-identical to data-platform's. `scripts/check-vendored-profile.sh`
+//! What the fold does NOT do is pre-expand the privileges, and that distinction is
+//! the reason the fixtures remain a test rather than an echo. If the generator
+//! shipped finished access-type sets per privilege, the fixtures would be
+//! self-satisfying: this code reading a set and asserting it read it. Instead SQE
+//! computes the closure and compares against `expect`, which the platform computed
+//! with its own code. The closure is exactly what drifted before, when SQE's
+//! hand-written `WRITE_ACCESS` carried `table-properties-write`, which
+//! `table-data-write` does not imply.
+//!
+//! Keep this file byte-identical to data-platform's. `scripts/check-vendored-profile.sh`
 //! is the gate; the fixtures only prove SQE agrees with the profile it HOLDS, not
 //! that the profile it holds is current.
 
@@ -34,7 +41,6 @@ pub fn profile() -> &'static GrantProfile {
 }
 
 const PROFILE_JSON: &str = include_str!("../../assets/grant-profile.json");
-const SERVICEDEF_JSON: &str = include_str!("../../assets/servicedef-polaris.json");
 
 /// Resource levels, ordered outermost first. Order IS the semantics: a plan is
 /// truncated at the level the statement names, and a statement naming something
@@ -75,6 +81,14 @@ struct ProfileFile {
     version: u32,
     privileges: BTreeMap<String, Vec<LevelPlan>>,
     aliases: BTreeMap<String, String>,
+    /// Access type -> what holding it implies, the graph the closure walks.
+    ///
+    /// Deliberately NOT `#[serde(default)]`. A profile missing this would expand
+    /// every seed to itself, so `INSERT` would confer `table-data-write` alone and
+    /// every Iceberg commit would fail an authorization check. Under-granting is
+    /// the safe direction but a silent one, and the whole point of vendoring is
+    /// that the two writers agree; refusing to parse says so at startup.
+    access_types: HashMap<String, Vec<String>>,
     #[serde(default)]
     fixtures: Vec<Fixture>,
     #[serde(default)]
@@ -110,19 +124,6 @@ struct Reject {
     table: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
-struct ServiceDef {
-    #[serde(rename = "accessTypes")]
-    access_types: Vec<AccessType>,
-}
-
-#[derive(Debug, Deserialize)]
-struct AccessType {
-    name: String,
-    #[serde(rename = "impliedGrants", default)]
-    implied_grants: Vec<String>,
-}
-
 /// One policy a grant has to write: a Ranger resource map and its access types.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlannedPolicy {
@@ -145,18 +146,11 @@ impl GrantProfile {
     fn load() -> Result<Self, String> {
         let p: ProfileFile =
             serde_json::from_str(PROFILE_JSON).map_err(|e| format!("grant-profile.json: {e}"))?;
-        let sd: ServiceDef = serde_json::from_str(SERVICEDEF_JSON)
-            .map_err(|e| format!("servicedef-polaris.json: {e}"))?;
-        let implied = sd
-            .access_types
-            .into_iter()
-            .map(|a| (a.name, a.implied_grants))
-            .collect();
         Ok(Self {
             version: p.version,
             privileges: p.privileges,
             aliases: p.aliases,
-            implied,
+            implied: p.access_types,
             fixtures: p.fixtures,
             rejects: p.rejects,
         })
@@ -323,7 +317,40 @@ mod tests {
         // Bumping the vendored profile is a deliberate act: the fixtures below and
         // the platform's contract move together. This fails on an accidental
         // refresh.
-        assert_eq!(profile().version(), 4);
+        assert_eq!(profile().version(), 5);
+    }
+
+    /// A profile with no `access_types` is refused at parse rather than treated as
+    /// an empty graph.
+    ///
+    /// The failure it prevents is quiet. With an empty graph every seed expands to
+    /// itself, so `INSERT` would confer `table-data-write` and nothing else, and
+    /// every Iceberg commit would fail an authorization check inside Polaris with no
+    /// hint that the profile was the cause. That is the safe direction and the
+    /// undiagnosable one. Before v5 the graph came from a second file whose absence
+    /// broke the build; now it is a field, and only `serde` stands there.
+    #[test]
+    fn a_profile_without_the_implication_graph_is_refused() {
+        let no_graph = r#"{
+            "version": 5,
+            "privileges": {"SELECT": [{"level": "table", "seeds": ["table-data-read"]}]},
+            "aliases": {}
+        }"#;
+        let err = serde_json::from_str::<ProfileFile>(no_graph)
+            .expect_err("a profile with no access_types must not parse");
+        assert!(
+            err.to_string().contains("access_types"),
+            "the error must name the missing field, got: {err}"
+        );
+        // Control: the same document parses once the graph is there, so the refusal
+        // above is about that field and not about the rest of the shape.
+        let with_graph = r#"{
+            "version": 5,
+            "privileges": {"SELECT": [{"level": "table", "seeds": ["table-data-read"]}]},
+            "aliases": {},
+            "access_types": {"table-data-read": ["table-list"]}
+        }"#;
+        serde_json::from_str::<ProfileFile>(with_graph).expect("parses with the graph");
     }
 
     #[test]

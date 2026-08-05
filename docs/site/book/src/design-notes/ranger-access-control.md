@@ -133,15 +133,25 @@ authorized against.
 
 Four properties of the expansion, each load-bearing:
 
-**The shape mirrors `grant-profile.json` v4.** v4's `SELECT` is
-`catalog:[namespace-list] | namespace:[namespace-properties-read] |
+**Both the shape and the sets come from `grant-profile.json`, now at v5.** Its
+`SELECT` is `catalog:[namespace-list] | namespace:[namespace-properties-read] |
 table:[table-data-read]`, and the data-platform control plane generates its
 policies from the same file. SQE writing a different set for the same statement
 would make "who granted this, and does it mean the same thing" unanswerable, and
-there is a drift gate whose whole job is to keep the two in step. Access-type SETS
-still come from SQE's own map rather than v4's seeds plus the servicedef
-`impliedGrants` closure, so today this matches v4's plan shape and not yet its
-expansion; closing that is profile adoption proper.
+there is a drift gate whose whole job is to keep the two in step.
+
+The sets are not in the file, and that is on purpose. `privileges` ships **seeds**;
+`access_types` carries the implication graph, and SQE walks it at write time to
+produce what Polaris actually checks. Shipping finished sets would make the
+profile's fixtures self-satisfying, this code asserting it read what it read,
+where today they compare SQE's closure against one the platform computed
+independently. The closure is exactly what drifted before v4, when SQE's
+hand-written `WRITE_ACCESS` carried `table-properties-write`, which
+`table-data-write` does not imply.
+
+v5 folded that graph in from a second vendored file. `servicedef-polaris.json` is
+still the Ranger service DEFINITION, registered with Ranger Admin by the
+quickstarts, but it is no longer an input to planning.
 
 **The catalog level is a real widening, accepted rather than hidden.** Its holder
 can enumerate every namespace NAME in the catalog, unrelated ones included, and

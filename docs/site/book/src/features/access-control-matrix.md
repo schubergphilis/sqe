@@ -73,7 +73,7 @@ So one statement produces a three-level plan, written outermost first:
 | namespace | `namespace-properties-read` | the per-namespace visibility probe |
 | table | the privilege's own set | the data |
 
-The shape matches `grant-profile.json` v4, which the data-platform control plane
+The shape matches `grant-profile.json` v5, which the data-platform control plane
 generates from. That is the point: both write to the same Ranger service, and a
 SQL grant producing different policies from the equivalent API call makes "who
 granted this" unanswerable. Pinned by `a_table_grant_writes_v4s_three_level_plan`
