@@ -113,9 +113,7 @@ impl TableFunctionImpl for ReadDeltaFunction {
         crate::runtime_bridge::block_on_compat(async move {
             build_delta_provider(args, delta_opts, storage).await
         })
-        .ok_or_else(|| {
-            DataFusionError::Plan(format!("{FN_NAME}: no tokio runtime available"))
-        })?
+        .map_err(|e| DataFusionError::Plan(format!("{FN_NAME}: {e}")))?
     }
 }
 

@@ -194,10 +194,8 @@ impl TableFunctionImpl for ReadParquetFunction {
         crate::runtime_bridge::block_on_compat(async move {
             build_listing_table(&args, &storage, runtime_env.as_deref()).await
         })
-        .ok_or_else(|| {
-            datafusion::error::DataFusionError::Plan(
-                "read_parquet: no tokio runtime available".to_string(),
-            )
+        .map_err(|e| {
+            datafusion::error::DataFusionError::Plan(format!("read_parquet: {e}"))
         })?
     }
 }
