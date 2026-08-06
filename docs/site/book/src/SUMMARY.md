@@ -36,6 +36,7 @@
 - [Access control tutorial (Polaris gate + SQE row/column/mask/tags)](./features/access-control-tutorial.md)
 - [Fine-grained access control (row filters, masking)](./features/fine-grained-access-control.md)
 - [Access control: support matrix](./features/access-control-matrix.md)
+- [Access control: evaluation order, engine by engine](./features/access-control-evaluation-order.md)
 - [read\_parquet TVF](./features/read-parquet.md)
 - [File-format TVFs (read\_csv / read\_json / read\_delta)](./features/file-format-tvfs.md)
 - [Observability](./features/observability.md)
