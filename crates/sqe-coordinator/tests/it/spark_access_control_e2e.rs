@@ -289,7 +289,7 @@ async fn spark_revoke_disables_access() {
 /// Read the row count through SQE as carol, so the count itself is never
 /// subject to the grant under test.
 async fn row_count_via_sqe(ctx: &AcCtx) -> usize {
-    let batches = exec_ok(&ctx, &ctx.carol, &format!("SELECT id FROM {ORDERS}")).await;
+    let batches = exec_ok(ctx, &ctx.carol, &format!("SELECT id FROM {ORDERS}")).await;
     batches.iter().map(|b| b.num_rows()).sum()
 }
 
