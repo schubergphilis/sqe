@@ -191,10 +191,24 @@ One more, found by asking a question we had not asked: what does DDL do to a pol
 
 Nothing in the schema-change path rewrites `sqe.column-tags`, and that property is
 keyed by column name. So `ALTER TABLE ... RENAME COLUMN ssn TO tax_id` leaves the tag
-naming a column that no longer exists. The tag matches nothing. The mask stops
-applying, and the data comes back raw under its new name.
+naming a column that no longer exists.
 
-In both engines, because the Ranger projection is keyed the same way.
+What happens next is worse than I predicted when I wrote the test. I expected the mask
+to stop applying in both engines. Measured, the two engines break DIFFERENTLY:
+
+```
+SELECT id, tax_id FROM ...
+  SQE:   [["1"], ["2"], ["3"]]                        one column, no error
+  Spark: [["1","111-11-1111"], ["2","222-22-2222"]]   the raw value
+```
+
+SQE drops the column from the result entirely, silently, without an error. Spark
+returns the data raw. So the stricter engine hides a column you asked for and the other
+hands over the unmasked value, and neither tells you anything is wrong. I do not yet
+know the mechanism on the SQE side. I know what it does.
+
+A query that returns fewer columns than it projected, with no error, is a defect
+independent of governance.
 
 The rename gap is not a Spark problem. It affects SQE on its own, it has been there as
 long as tag-based masking has, and a rename is exactly the sort of routine schema change
@@ -202,10 +216,23 @@ someone makes without thinking about governance. It is now an executable test th
 asserts the gap as current behaviour, phrased so that closing the gap makes the test
 fail loudly.
 
-Adding a column is the benign sibling: the new column is readable under the existing
-grant, because the object tier has no column level, and unmasked, because no policy
-names it. Both are intended. Both are now pinned, because "add a column to a governed
-table" should not be a matter of opinion.
+Adding a column was supposed to be the benign sibling. The new column is readable under
+the existing grant, because the object tier has no column level, and unmasked, because
+no policy names it. Both intended.
+
+It also does not work. With a mask on `ssn`, adding a column and then selecting it
+fails outright:
+
+```
+PhysicalExpr Column references column 'nickname' at index 2 (zero-based)
+but input schema only has 2 columns: ["id", "ssn"]
+```
+
+The rewritten plan and the scan schema disagree. No leak, so this one fails closed, but
+a governed table becomes unqueryable after a routine `ADD COLUMN`. Also unfixed.
+
+Two questions about DDL, two defects. We had never asked what a schema change does to a
+policy.
 
 ## Why Databricks and Snowflake do not have this class of problem
 

@@ -23,8 +23,8 @@
 //! ```
 
 use crate::access_control_e2e::{
-    ac_setup, grant_read_to_both_roles, hive_mask_policy, hive_rowfilter_policy, total_rows,
-    AcCtx, ORDERS,
+    ac_setup, col_strings, grant_read_to_both_roles, hive_mask_policy, hive_rowfilter_policy,
+    total_rows, AcCtx, ORDERS,
 };
 use crate::common::ranger_fixture::{HIVE_SERVICE, PREFIX};
 use crate::common::spark_runner::{spark_sql_on_service, DenialTier, SPARK_CATALOG};
@@ -663,22 +663,26 @@ async fn resource_and_tag_mask_precedence_diverges_across_engines() {
     );
 }
 
-/// A column ADDED after the grant is readable, and unmasked, in both engines.
+/// DEFECT, pinned: adding a column to a table that has a column mask makes the
+/// masked query FAIL in SQE.
 ///
-/// The object tier has no column level, so `table-data-read` covers columns that did
-/// not exist when it was granted. The fine-grained tier names columns explicitly, so
-/// a new column carries no mask. Both are the intended behaviour; the point of
-/// pinning them is that "add a column to a governed table" is a routine act whose
-/// blast radius should not be a matter of opinion.
+/// Measured: with a mask on `ssn`, `ALTER TABLE ADD COLUMN nickname` then
+/// `SELECT id, ssn, nickname` dies with
+/// `PhysicalExpr Column references column 'nickname' at index 2 ... but input schema
+/// only has 2 columns: ["id", "ssn"]`. The rewritten plan and the scan schema
+/// disagree.
+///
+/// It fails CLOSED, so nothing leaks, but a governed table becomes unqueryable after a
+/// routine schema change. Asserted as current behaviour so the defect is recorded and
+/// a fix trips this test.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs quickstart/polaris-ranger-keycloak plus spark; run scripts/spark-access-control-test.sh"]
-async fn a_column_added_after_the_grant_is_readable_and_unmasked() {
+async fn adding_a_column_to_a_masked_table_breaks_the_query_in_sqe() {
     spark_gate!();
     let _guard = crate::common::serial().lock().await;
     let ctx = ac_setup().await;
     grant_read_to_both_roles(&ctx).await;
 
-    // Mask ssn, so the table is genuinely governed before the schema changes.
     ctx.ranger
         .create_policy(hive_mask_policy(
             &format!("{PREFIX}ddl-mask-ssn"),
@@ -690,6 +694,20 @@ async fn a_column_added_after_the_grant_is_readable_and_unmasked() {
         ))
         .await
         .expect("create the ssn mask");
+    // Let the mask take effect before the schema changes, so the failure below is
+    // about ADD COLUMN and not about an unapplied policy.
+    crate::common::eventually("the ssn mask to apply in SQE", || async {
+        match ctx
+            .handler
+            .execute(&ctx.bob, &format!("SELECT ssn FROM {ORDERS}"), None)
+            .await
+        {
+            Ok(b) if col_strings(&b, "ssn").iter().all(|v| v.starts_with("xxx-xx-")) => Ok(()),
+            Ok(b) => Err(format!("not masked yet: {:?}", col_strings(&b, "ssn"))),
+            Err(e) => Err(format!("{e}")),
+        }
+    })
+    .await;
 
     ctx.handler
         .execute(
@@ -700,36 +718,49 @@ async fn a_column_added_after_the_grant_is_readable_and_unmasked() {
         .await
         .expect("ADD COLUMN");
 
-    // The new column is visible under the pre-existing grant, and unmasked, while
-    // ssn stays masked. Both engines agree on all of it.
-    let rows = agreed_rows(&ctx, "bob", "id, ssn, nickname", "id", |rows| {
-        rows.len() == 3
-            && rows
-                .iter()
-                .all(|r| r.get(1).is_some_and(|v| v.starts_with("xxx-xx-")))
-    })
+    // Projecting the new column ALONGSIDE the masked one fails. Retried, so a stale
+    // schema cannot be mistaken for the defect.
+    let err = crate::common::eventually(
+        "SQE to fail on the added column beside a masked one",
+        || async {
+            match ctx
+                .handler
+                .execute(
+                    &ctx.bob,
+                    &format!("SELECT id, ssn, nickname FROM {ORDERS} ORDER BY id"),
+                    None,
+                )
+                .await
+            {
+                Err(e) => Ok(e.to_string()),
+                Ok(b) => Err(format!(
+                    "the query SUCCEEDED with {} rows. If ADD COLUMN beside a mask now \
+                     works, this defect is FIXED: delete this test and update the \
+                     access-control matrix.",
+                    total_rows(&b)
+                )),
+            }
+        },
+    )
     .await;
-    assert_eq!(rows.len(), 3, "the added column must not break the read");
     assert!(
-        rows.iter().all(|r| r.len() == 3),
-        "the added column must be projectable under the existing grant: {rows:?}"
+        err.contains("input schema only has") || err.contains("PhysicalExpr"),
+        "expected the plan/scan schema mismatch, got: {err}"
     );
 }
 
-/// RENAMING a tagged column ORPHANS its tag, and the mask stops applying.
+/// DEFECT, pinned: renaming a tagged column breaks it DIFFERENTLY in each engine.
 ///
-/// Nothing in the schema-change path rewrites `sqe.column-tags`, which is keyed by
-/// column NAME, and the Ranger projection is keyed the same way. So after
-/// `RENAME COLUMN ssn TO tax_id` the tag still names `ssn`, matches nothing, and the
-/// data is returned RAW under its new name. In BOTH engines, because both key on the
-/// name.
+/// `sqe.column-tags` is keyed by column NAME and no schema-change path rewrites it, so
+/// after `RENAME COLUMN ssn TO tax_id` the association names a column that is gone.
 ///
-/// The assertion is written to FAIL if the mask survives, which is the behaviour we
-/// would want. Read a failure here as good news and a signal to update the docs: it
-/// would mean rename now carries tags across.
+/// Measured, and not what a reader would predict: SQE silently DROPS the column from
+/// the result (`SELECT id, tax_id` returns ONE column, no error) while Spark returns it
+/// RAW. The stricter engine hides a column that was asked for; the other hands over
+/// unmasked data. The mechanism on the SQE side is not confirmed. The behaviour is.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs quickstart/polaris-ranger-keycloak plus spark; run scripts/spark-access-control-test.sh"]
-async fn renaming_a_tagged_column_orphans_the_tag_in_both_engines() {
+async fn renaming_a_tagged_column_breaks_differently_in_each_engine() {
     spark_gate!();
     let _guard = crate::common::serial().lock().await;
     let ctx = ac_setup().await;
@@ -750,7 +781,7 @@ async fn renaming_a_tagged_column_orphans_the_tag_in_both_engines() {
         )
         .await
         .expect("SET TAG");
-    // Masked before the rename, in both engines.
+    // Masked in both engines first, so the rename is what changes things.
     agreed_rows(&ctx, "bob", "id, ssn", "id", |rows| {
         rows.len() == 3
             && rows
@@ -768,14 +799,32 @@ async fn renaming_a_tagged_column_orphans_the_tag_in_both_engines() {
         .await
         .expect("RENAME COLUMN");
 
-    let rows = agreed_rows(&ctx, "bob", "id, tax_id", "id", |rows| rows.len() == 3).await;
-    let first = rows.first().and_then(|r| r.get(1)).cloned().unwrap_or_default();
+    let (sqe, spark) = crate::common::eventually_within(
+        std::time::Duration::from_secs(180),
+        "both engines to settle after the rename",
+        || async {
+            let (sqe, spark) = both_engines(&ctx, "bob", "id, tax_id", "id").await?;
+            if sqe.len() == 3 && spark.len() == 3 {
+                Ok((sqe, spark))
+            } else {
+                Err(format!("sqe={sqe:?} spark={spark:?}"))
+            }
+        },
+    )
+    .await;
+
     assert_eq!(
-        first, "111-11-1111",
-        "EXPECTED the documented gap: renaming a tagged column orphans the tag \\
-         (sqe.column-tags is keyed by name and no schema-change path rewrites it), \\
-         so the data comes back RAW under the new name in both engines. If this now \\
-         reads xxx-xx-1111 the gap is CLOSED, which is an improvement: delete this \\
-         assertion and update the access-control matrix."
+        sqe.first().map(Vec::len),
+        Some(1),
+        "SQE drops the renamed column from the result entirely, returning only `id` \
+         for `SELECT id, tax_id` with no error. If it now returns two columns the \
+         behaviour changed: check whether the value is masked or raw, and update the \
+         access-control matrix either way. Got: {sqe:?}"
+    );
+    assert_eq!(
+        spark.first().and_then(|r| r.get(1)).map(String::as_str),
+        Some("111-11-1111"),
+        "Spark returns the renamed column RAW, because the projected association still \
+         names the old column. Got: {spark:?}"
     );
 }
