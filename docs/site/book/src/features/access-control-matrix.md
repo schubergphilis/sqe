@@ -237,6 +237,24 @@ through SQE do not have this window, because `GRANT`, `REVOKE` and `SET TAGS`
 flush the cache on commit. The window is asserted at both edges by
 `cache_ttl_bounds_policy_staleness`.
 
+## Cross-engine parity (SQE and Spark)
+
+One policy in the shared frontend service, two engines, output compared directly.
+Per-engine checks are not enough: they pass while the engines disagree, which is the
+failure that matters. Both engines are pointed at the same service, and the suite is
+`make test-access-control-spark`.
+
+| Property | Proven |
+|---|---|
+| A portable CUSTOM column mask renders byte-identically | Yes, `column_mask_is_byte_identical_across_engines` |
+| A role outside the masked role sees the raw value in both | Yes, `an_unmasked_role_is_unmasked_in_both_engines` |
+| A row filter selects the same rows in both | Yes, `row_filter_returns_identical_rows_across_engines` |
+| A named mask type does NOT render identically | Yes, asserted as a divergence |
+| Tag-based masks | **No.** See the tag gap below; associations do not reach Spark |
+
+Object-level parity is covered separately by `spark_access_control_e2e`: grants written
+through SQE's `GRANT` statement, asserted through Spark, for read and write.
+
 ## Known gaps
 
 | Gap | Detail |
@@ -262,7 +280,7 @@ flush the cache on commit. The window is asserted at both edges by
 | A refused write is refused at COMMIT | Polaris denies `ADD_TABLE_SNAPSHOT` rather than `LOAD_TABLE`, so an unauthorized `INSERT` can leave staged data files in object storage even though the table is untouched. Authorization holds and the row count does not move, which `spark_write_privileges_are_separate_from_read` asserts; storage hygiene does not. A denied writer can generate orphan files at will, and cleanup is the existing maintenance procedure's job. |
 | Kyuubi's policy view lags its poll interval | The Spark plugin caches the policy bundle on disk and refreshes on a 10s poll, so a short-lived `spark-sql` JVM started seconds after a policy change can still enforce the previous bundle. Object-level tests are unaffected, because the only frontend policy in play is the static defer item. Anything that changes frontend policy mid-run needs settling time, and a passing assertion taken too soon proves nothing. |
 | Spark row filters need the filter column projected | Kyuubi on Spark 3.5 throws `MISSING_ATTRIBUTES` (Kyuubi #6889) when a row filter references a column the query does not select. SQE has no such restriction, so a filter that is transparent in SQE breaks the query in Spark. |
-| Named Ranger mask types render differently per engine | `MASK_SHOW_LAST_4` gives `xxx-xx-1111` in SQE and `nnnUnnU1111` in Kyuubi, because Kyuubi ignores the servicedef transformer and applies its own mask characters. Only a CUSTOM transformer written in portable standard SQL (`concat('xxx-xx-', substr({col},8,4))`) is byte-equal, which is what `parity-test.sh` asserts. |
+| Named Ranger mask types render differently per engine | `MASK_SHOW_LAST_4` gives `xxx-xx-1111` in SQE and `nnnUnnU1111` in Kyuubi, because Kyuubi ignores the servicedef transformer and applies its own mask characters. The semantics agree (raw hidden, last four visible); only the rendering differs. Only a CUSTOM transformer written in portable standard SQL (`concat('xxx-xx-', substr({col},8,4))`) is byte-equal. Pinned in both directions by `a_named_mask_type_is_not_byte_portable` and `column_mask_is_byte_identical_across_engines`, which are each other's control: if the comparison ever reported equal regardless, the first would fail. |
 
 ## Where to go next
 

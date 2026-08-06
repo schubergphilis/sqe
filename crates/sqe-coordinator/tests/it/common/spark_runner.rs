@@ -193,18 +193,93 @@ pub async fn spark_sql(
     hadoop_user: &str,
     sql: &str,
 ) -> SparkOutcome {
+    spark_sql_inner(session, hadoop_user, sql, None).await
+}
+
+/// Same, but make Kyuubi read `frontend_service` instead of the one the container
+/// is configured with.
+///
+/// Cross-engine parity needs BOTH engines reading the SAME service: SQE's tests
+/// point at the test-owned `sqe_ac_hive`, while the container names the
+/// quickstart's `query`. Writing mask policies into `query` instead would change
+/// the bundle the demo's `parity-test.sh` cross-compares against, which is exactly
+/// what the test-owned services exist to avoid.
+pub async fn spark_sql_on_service(
+    session: &sqe_core::Session,
+    hadoop_user: &str,
+    frontend_service: &str,
+    sql: &str,
+) -> SparkOutcome {
+    spark_sql_inner(session, hadoop_user, sql, Some(frontend_service)).await
+}
+
+async fn spark_sql_inner(
+    session: &sqe_core::Session,
+    hadoop_user: &str,
+    sql: &str,
+    frontend_service: Option<&str>,
+) -> SparkOutcome {
     let token = session.access_token().expose().to_string();
     let sql = sql.to_string();
     let hadoop_user = hadoop_user.to_string();
+    let frontend = frontend_service.map(str::to_string);
     // tokio is built here without the `process` feature, so shell out on a
     // blocking thread rather than widening a workspace dependency for a test
     // helper.
-    tokio::task::spawn_blocking(move || run_blocking(&token, &hadoop_user, &sql))
-        .await
-        .expect("spark-sql blocking task panicked")
+    tokio::task::spawn_blocking(move || {
+        run_blocking(&token, &hadoop_user, &sql, frontend.as_deref())
+    })
+    .await
+    .expect("spark-sql blocking task panicked")
 }
 
-fn run_blocking(token: &str, hadoop_user: &str, sql: &str) -> SparkOutcome {
+/// Ranger plugin config naming `service`, written into the container along with a
+/// FRESH policy-cache directory.
+///
+/// The cache is wiped every call on purpose. The plugin persists the downloaded
+/// bundle and refreshes on a 10s poll, so a short-lived `spark-sql` JVM can
+/// otherwise enforce a bundle from before the policy under test existed, and a
+/// parity assertion taken too soon proves nothing.
+fn write_plugin_conf(service: &str) -> (String, String) {
+    let conf_dir = format!("/tmp/rgconf-{service}");
+    let cache_dir = format!("/tmp/rgcache-{service}");
+    let xml = format!(
+        r#"<?xml version="1.0"?>
+<configuration>
+  <property><name>ranger.plugin.spark.policy.rest.url</name><value>http://ranger-admin:6080</value></property>
+  <property><name>ranger.plugin.spark.service.name</name><value>{service}</value></property>
+  <property><name>ranger.plugin.spark.policy.cache.dir</name><value>{cache_dir}</value></property>
+  <property><name>ranger.plugin.spark.policy.pollIntervalMs</name><value>5000</value></property>
+  <property><name>ranger.plugin.spark.plugin.mode</name><value>ACTIVE</value></property>
+  <property><name>ranger.plugin.spark.enable.implicit.userstore.enricher</name><value>true</value></property>
+  <property><name>ranger.plugin.spark.policy.rest.client.username</name><value>admin</value></property>
+  <property><name>ranger.plugin.spark.policy.rest.client.password</name><value>rangerR0cks!</value></property>
+</configuration>
+"#
+    );
+    // Content goes through argv, not the shell, so the XML needs no quoting.
+    let script = r#"mkdir -p "$1" && printf '%s' "$2" > "$1"/ranger-spark-security.xml                     && rm -rf "$3" && mkdir -p "$3" && chmod -R 777 "$1" "$3""#;
+    let out = std::process::Command::new("docker")
+        .args([
+            "compose", "-f", &compose_file(), "exec", "-T", "-u", "root", "spark",
+            "sh", "-c", script, "sh", &conf_dir, &xml, &cache_dir,
+        ])
+        .output()
+        .expect("write the ranger plugin conf into the spark container");
+    assert!(
+        out.status.success(),
+        "writing {conf_dir} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    (conf_dir, cache_dir)
+}
+
+fn run_blocking(
+    token: &str,
+    hadoop_user: &str,
+    sql: &str,
+    frontend_service: Option<&str>,
+) -> SparkOutcome {
     let c = SPARK_CATALOG;
     let mut cmd = std::process::Command::new("docker");
     cmd.args([
@@ -240,6 +315,15 @@ fn run_blocking(token: &str, hadoop_user: &str, sql: &str) -> SparkOutcome {
         format!("spark.sql.catalog.{c}.s3.secret-access-key=s3adminpw"),
     ] {
         cmd.arg("--conf").arg(kv);
+    }
+    if let Some(service) = frontend_service {
+        let (conf_dir, _cache) = write_plugin_conf(service);
+        // --driver-class-path puts the written conf AHEAD of /opt/spark/conf, which
+        // is how the plugin resolves ranger-spark-security.xml as a classpath
+        // resource. The conf.dir property alone is not enough.
+        cmd.arg("--driver-class-path").arg(&conf_dir);
+        cmd.arg("--conf")
+            .arg(format!("spark.kyuubi.authz.ranger.conf.dir={conf_dir}"));
     }
     cmd.arg("-e").arg(sql);
 
