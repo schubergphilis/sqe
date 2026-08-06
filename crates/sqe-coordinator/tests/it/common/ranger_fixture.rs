@@ -348,12 +348,18 @@ impl RangerAdmin {
     /// The Spark guard test asserts this BEFORE asserting a Polaris denial. Absent
     /// the item, Kyuubi refuses first and the guard would pass while proving
     /// nothing about whether the blanket allow leaks object-level authority.
+    ///
+    /// `service` matters and is easy to get wrong. SQE reads the test-owned
+    /// [`HIVE_SERVICE`]; Kyuubi reads whatever `ranger-spark-security.xml` names
+    /// inside the Spark container, which is the quickstart's `query`. Checking the
+    /// test-owned service and then asserting a Spark denial proves nothing, since
+    /// Kyuubi never read it.
     #[allow(dead_code)]
-    pub async fn object_level_defer_item_present(&self) -> anyhow::Result<bool> {
+    pub async fn object_level_defer_item_present(&self, service: &str) -> anyhow::Result<bool> {
         let resp = self
             .req(
                 reqwest::Method::GET,
-                &format!("/service/plugins/policies/service/name/{HIVE_SERVICE}"),
+                &format!("/service/plugins/policies/service/name/{service}"),
             )
             .send()
             .await
