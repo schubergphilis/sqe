@@ -23,7 +23,9 @@
 use std::time::Duration;
 
 use crate::access_control_e2e::{ac_setup, exec_ok, AcCtx, ORDERS};
-use crate::common::spark_runner::{spark_sql, DenialTier, SPARK_CATALOG};
+use crate::common::spark_runner::{
+    kyuubi_service_in_container, spark_sql, DenialTier, KYUUBI_SERVICE, SPARK_CATALOG,
+};
 
 /// Skip-or-run gate, same contract as the SQE suite: `#[ignore]` alone is not
 /// enough because `scripts/integration-test.sh` force-runs ignored tests against
@@ -147,17 +149,28 @@ async fn object_denial_survives_the_frontend_defer_policy() {
     let _guard = crate::common::serial().lock().await;
     let ctx = ac_setup().await;
 
-    // Assert the item really is present, so a pass cannot mean "the item was
-    // missing and Kyuubi did the denying".
+    // Assert the precondition against the service KYUUBI READS, which is the
+    // quickstart's, NOT the test-owned one SQE reads. Checking the wrong service
+    // is the failure mode this whole block exists to rule out: it would pass
+    // while Kyuubi, reading a service with no defer item, did the denying.
+    let in_container = kyuubi_service_in_container()
+        .await
+        .expect("read ranger.plugin.spark.service.name from the spark container");
+    assert_eq!(
+        in_container, KYUUBI_SERVICE,
+        "the Spark container's Ranger plugin names service `{in_container}`, but this \
+         suite checks `{KYUUBI_SERVICE}`. One of them is wrong, and until they agree \
+         no Spark assertion here means what it says."
+    );
     let present = ctx
         .ranger
-        .object_level_defer_item_present()
+        .object_level_defer_item_present(KYUUBI_SERVICE)
         .await
         .expect("read the defer item");
     assert!(
         present,
-        "the blanket policyType-0 item for group `public` is absent, so this test \
-         would prove nothing: Kyuubi would refuse before Polaris was consulted"
+        "the blanket policyType-0 item for group `public` is absent from `{KYUUBI_SERVICE}`, \
+         so this test would prove nothing: Kyuubi would refuse before Polaris was consulted"
     );
 
     let out = spark_sql(&ctx.bob, "bob", &format!("SELECT * FROM {}", spark_orders())).await;

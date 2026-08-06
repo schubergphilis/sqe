@@ -147,6 +147,38 @@ impl SparkOutcome {
     }
 }
 
+/// The Ranger service KYUUBI reads, which is NOT the service SQE reads.
+///
+/// SQE's tests point at the test-owned `sqe_ac_hive`. Kyuubi reads whatever
+/// `ranger.plugin.spark.service.name` names in the Spark container's
+/// `ranger-spark-security.xml`, which the quickstart sets to `query`. The
+/// distinction is easy to miss and quietly fatal: a precondition asserted against
+/// the test-owned service says nothing about what Kyuubi will do.
+/// `kyuubi_service_in_container` re-reads the container so this constant cannot
+/// drift away from the deployed config unnoticed.
+pub const KYUUBI_SERVICE: &str = "query";
+
+/// The service name the Spark container's Ranger plugin config actually names.
+///
+/// Returns `None` when the file or the property is unreadable, which is itself
+/// worth failing on: without that config Kyuubi enforces nothing.
+pub async fn kyuubi_service_in_container() -> Option<String> {
+    let file = compose_file();
+    let out = tokio::task::spawn_blocking(move || {
+        std::process::Command::new("docker")
+            .args([
+                "compose", "-f", &file, "exec", "-T", "spark", "sh", "-c",
+                "sed -n '/ranger.plugin.spark.service.name/,/<\\/property>/p'                  /opt/spark/conf/ranger-spark-security.xml",
+            ])
+            .output()
+    })
+    .await
+    .ok()?
+    .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    between(&text, "<value>", "</value>")
+}
+
 /// The catalog name the suite registers inside Spark. Deliberately not
 /// `sales_wh`, which `spark-defaults.conf` already binds to the `root` service
 /// account: a per-user catalog must not inherit those credentials.
