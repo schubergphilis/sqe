@@ -186,7 +186,7 @@ V="$CAT.$NS.orders_eu"
 
 cleanup_policies() {
   # Remove any acdemo- policies from a previous run so masks do not stack.
-  for svc in hive "${TAG_SERVICE:-acdemo_tag}" tag; do
+  for svc in query "${TAG_SERVICE:-acdemo_tag}" tag; do
   ids="$(curl -fsS -u "admin:${RANGER_PASS}" \
     "${RANGER_URL}/service/public/v2/api/policy?serviceName=${svc}" 2>/dev/null \
     | python3 -c 'import json,sys
@@ -201,7 +201,7 @@ for p in (d if isinstance(d,list) else d.get("policies",[])):
   done
 }
 
-hive_policy() { # name json_body
+query_policy() { # name json_body
   printf '%s' "$2" > /tmp/acdemo-policy.json
   curlr -X POST "${RANGER_URL}/service/public/v2/api/policy" \
     -d @/tmp/acdemo-policy.json >/dev/null 2>&1 \
@@ -211,38 +211,38 @@ hive_policy() { # name json_body
 
 TAG_SERVICE=""
 
-# A tag policy lives on a service of TYPE tag, and the hive service must point at
+# A tag policy lives on a service of TYPE tag, and the query service must point at
 # it via `tagService` or the download bundle carries no tagPolicies block at all.
 #
-# Prefer whatever hive is ALREADY linked to. Ranger rejects creating a second tag
+# Prefer whatever the query service is ALREADY linked to. Ranger rejects creating a second tag
 # service in some states ("More than one result was returned from
 # Query.getSingleResult()"), and re-pointing the link would mutate the shared demo
 # service for no gain. Only create and link when nothing is linked yet.
 ensure_tag_service() {
-  local hive id existing
-  hive="$(curl -fsS -u "admin:${RANGER_PASS}" \
-    "${RANGER_URL}/service/public/v2/api/service/name/hive" 2>/dev/null)" || {
-    red "could not read the hive service"; return 1; }
-  existing="$(printf '%s' "$hive" \
+  local svcjson id existing
+  svcjson="$(curl -fsS -u "admin:${RANGER_PASS}" \
+    "${RANGER_URL}/service/public/v2/api/service/name/query" 2>/dev/null)" || {
+    red "could not read the query service"; return 1; }
+  existing="$(printf '%s' "$svcjson" \
     | python3 -c 'import json,sys; print(json.load(sys.stdin).get("tagService") or "")' 2>/dev/null)"
   if [ -n "$existing" ]; then
     TAG_SERVICE="$existing"
-    dim "     (hive is already linked to tag service ${TAG_SERVICE})"
+    dim "     (query is already linked to tag service ${TAG_SERVICE})"
     return 0
   fi
   TAG_SERVICE=acdemo_tag
   curlr -X POST "${RANGER_URL}/service/public/v2/api/service" \
     -d "{\"name\":\"${TAG_SERVICE}\",\"type\":\"tag\",\"configs\":{},\"isEnabled\":true}" \
     >/dev/null 2>&1 || { red "could not create tag service ${TAG_SERVICE}"; return 1; }
-  id="$(printf '%s' "$hive" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])' 2>/dev/null)"
-  printf '%s' "$hive" | python3 -c "
+  id="$(printf '%s' "$svcjson" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])' 2>/dev/null)"
+  printf '%s' "$svcjson" | python3 -c "
 import json,sys
 d=json.load(sys.stdin); d['tagService']='${TAG_SERVICE}'
-json.dump(d,open('/tmp/acdemo-hive.json','w'))"
+json.dump(d,open('/tmp/acdemo-query.json','w'))"
   curlr -X PUT "${RANGER_URL}/service/public/v2/api/service/${id}" \
-    -d @/tmp/acdemo-hive.json >/dev/null 2>&1 \
-    && dim "     (linked ${TAG_SERVICE} to hive)" \
-    || { red "could not link ${TAG_SERVICE} to hive"; return 1; }
+    -d @/tmp/acdemo-query.json >/dev/null 2>&1 \
+    && dim "     (linked ${TAG_SERVICE} to query)" \
+    || { red "could not link ${TAG_SERVICE} to query"; return 1; }
 }
 
 tag_policy() { # name json_body
@@ -334,22 +334,22 @@ main() {
   echo; bold "═══ 3. Data gate: column masks ═══"
   dim "engineer (bob, carol) gets masks; analyst-only alice is the unmasked control."
   run ok carol "GRANT SELECT ON $T TO ROLE \"engineer\"" "grant engineer read access"
-  hive_policy acdemo-mask-amount "$(cat <<JSON
-{"service":"hive","name":"acdemo-mask-amount","policyType":1,"isEnabled":true,
+  query_policy acdemo-mask-amount "$(cat <<JSON
+{"service":"query","name":"acdemo-mask-amount","policyType":1,"isEnabled":true,
  "resources":{"database":{"values":["$NS"]},"table":{"values":["orders"]},"column":{"values":["amount"]}},
  "dataMaskPolicyItems":[{"roles":["engineer"],"accesses":[{"type":"select","isAllowed":true}],
  "dataMaskInfo":{"dataMaskType":"MASK_NULL"}}]}
 JSON
 )"
-  hive_policy acdemo-mask-ssn "$(cat <<JSON
-{"service":"hive","name":"acdemo-mask-ssn","policyType":1,"isEnabled":true,
+  query_policy acdemo-mask-ssn "$(cat <<JSON
+{"service":"query","name":"acdemo-mask-ssn","policyType":1,"isEnabled":true,
  "resources":{"database":{"values":["$NS"]},"table":{"values":["orders"]},"column":{"values":["ssn"]}},
  "dataMaskPolicyItems":[{"roles":["engineer"],"accesses":[{"type":"select","isAllowed":true}],
  "dataMaskInfo":{"dataMaskType":"MASK_SHOW_LAST_4"}}]}
 JSON
 )"
-  hive_policy acdemo-mask-email "$(cat <<JSON
-{"service":"hive","name":"acdemo-mask-email","policyType":1,"isEnabled":true,
+  query_policy acdemo-mask-email "$(cat <<JSON
+{"service":"query","name":"acdemo-mask-email","policyType":1,"isEnabled":true,
  "resources":{"database":{"values":["$NS"]},"table":{"values":["orders"]},"column":{"values":["email"]}},
  "dataMaskPolicyItems":[{"roles":["engineer"],"accesses":[{"type":"select","isAllowed":true}],
  "dataMaskInfo":{"dataMaskType":"MASK_HASH"}}]}
@@ -365,8 +365,8 @@ JSON
     '111-11-1111' 'xxx-xx-'
 
   echo; bold "═══ 4. Data gate: row filter ═══"
-  hive_policy acdemo-rowfilter "$(cat <<JSON
-{"service":"hive","name":"acdemo-rowfilter","policyType":2,"isEnabled":true,
+  query_policy acdemo-rowfilter "$(cat <<JSON
+{"service":"query","name":"acdemo-rowfilter","policyType":2,"isEnabled":true,
  "resources":{"database":{"values":["$NS"]},"table":{"values":["orders"]}},
  "rowFilterPolicyItems":[{"roles":["engineer"],"accesses":[{"type":"select","isAllowed":true}],
  "rowFilterInfo":{"filterExpr":"region = 'EU'"}}]}

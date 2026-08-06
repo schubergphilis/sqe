@@ -280,7 +280,122 @@ impl RangerAdmin {
                 );
             }
         }
+
+        self.grant_object_level_defer_item().await?;
         Ok(())
+    }
+
+    /// Make Kyuubi defer object-level decisions to Polaris on the test-owned
+    /// frontend service.
+    ///
+    /// Kyuubi checks its OWN privilege before Polaris is consulted and
+    /// short-circuits without a matching `policyType-0` item, failing with
+    /// `AccessControlException: Permission denied: user [bob] does not have
+    /// [select] privilege on [...]` even where Polaris would allow the read. SQE
+    /// ignores `policyType-0` entirely, so leaving this out makes the two engines
+    /// disagree on every object-level grant and every Spark test refuse for the
+    /// wrong reason.
+    ///
+    /// It grants no data access: Polaris still decides, which
+    /// `object_denial_survives_the_frontend_defer_policy` proves.
+    ///
+    /// Written through the GRANT API rather than as a named policy because
+    /// creating a hive-type service makes Ranger auto-generate
+    /// `all - database, table, column` over exactly `database=*/table=*/column=*`
+    /// (granted to `admin` and `{OWNER}` only, so useless to a query user). That
+    /// policy owns the resource signature and a separately named one is refused
+    /// with `error code[3010] Another policy already exists for matching
+    /// resource`. The grant API merges an item into the existing match instead.
+    ///
+    /// Every access type Kyuubi may check has to be listed: `update` for INSERT,
+    /// `create` for DDL, and a missing one short-circuits exactly as above.
+    async fn grant_object_level_defer_item(&self) -> anyhow::Result<()> {
+        let body = serde_json::json!({
+            "grantor": "admin",
+            "resource": {"database": "*", "table": "*", "column": "*"},
+            "groups": ["public"],
+            "accessTypes": [
+                "select", "update", "create", "drop", "alter",
+                "index", "lock", "read", "write"
+            ],
+            "delegateAdmin": false,
+            "enableAudit": true,
+            "replaceExistingPermissions": false,
+            "isRecursive": true
+        });
+        let resp = self
+            .req(
+                reqwest::Method::POST,
+                &format!("/service/plugins/services/grant/{HIVE_SERVICE}"),
+            )
+            .json(&body)
+            .send()
+            .await
+            .context("POST defer grant")?;
+        if !resp.status().is_success() {
+            bail!(
+                "grant the object-level defer item on {HIVE_SERVICE} -> HTTP {}: {}\n\
+                 Without it Kyuubi refuses every Spark read before Polaris is consulted.",
+                resp.status(),
+                resp.text().await.unwrap_or_default()
+            );
+        }
+        Ok(())
+    }
+
+    /// True when the object-level defer item is present on the frontend service.
+    ///
+    /// The Spark guard test asserts this BEFORE asserting a Polaris denial. Absent
+    /// the item, Kyuubi refuses first and the guard would pass while proving
+    /// nothing about whether the blanket allow leaks object-level authority.
+    ///
+    /// `service` matters and is easy to get wrong. SQE reads the test-owned
+    /// [`HIVE_SERVICE`]; Kyuubi reads whatever `ranger-spark-security.xml` names
+    /// inside the Spark container, which is the quickstart's `query`. Checking the
+    /// test-owned service and then asserting a Spark denial proves nothing, since
+    /// Kyuubi never read it.
+    #[allow(dead_code)]
+    pub async fn object_level_defer_item_present(&self, service: &str) -> anyhow::Result<bool> {
+        let resp = self
+            .req(
+                reqwest::Method::GET,
+                &format!("/service/plugins/policies/service/name/{service}"),
+            )
+            .send()
+            .await
+            .context("GET frontend policies")?;
+        let body: Value = resp.json().await.context("decode frontend policies")?;
+        let policies = body
+            .get("policies")
+            .and_then(Value::as_array)
+            .or_else(|| body.as_array())
+            .cloned()
+            .unwrap_or_default();
+        // The RESOURCE has to match, not merely "some type-0 policy grants public
+        // select". Ranger seeds `Information_schema database tables columns` with
+        // exactly a public select item, so the loose form returned true with the
+        // defer item revoked and the guard test passed while proving nothing.
+        let wildcard = |p: &Value, level: &str| {
+            p["resources"][level]["values"]
+                .as_array()
+                .is_some_and(|v| v.iter().any(|x| x.as_str() == Some("*")))
+        };
+        Ok(policies.iter().any(|p| {
+            p["policyType"].as_i64() == Some(0)
+                && wildcard(p, "database")
+                && wildcard(p, "table")
+                && wildcard(p, "column")
+                && p["policyItems"].as_array().is_some_and(|items| {
+                    items.iter().any(|i| {
+                        i["groups"]
+                            .as_array()
+                            .is_some_and(|g| g.iter().any(|x| x.as_str() == Some("public")))
+                            && i["accesses"].as_array().is_some_and(|a| {
+                                a.iter().any(|x| x["type"].as_str() == Some("select"))
+                            })
+                    })
+                })
+        }))
     }
 
     /// All policies of a service.

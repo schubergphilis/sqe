@@ -90,11 +90,11 @@ assert_allow "bob (engineer) INSERT orders"             bob   "INSERT INTO sales
 assert_allow "bob (user grant) SELECT audit"            bob   "SELECT event FROM ops_wh.ops.audit LIMIT 1"
 
 echo
-echo "== 5. SQE-side fine-grained enforcement: column masks (hive Ranger service) =="
-# SQE reads the 'hive' Ranger service via GET /service/plugins/policies/download/hive
+echo "== 5. SQE-side fine-grained enforcement: column masks (query Ranger service) =="
+# SQE reads the 'query' Ranger service via GET /service/plugins/policies/download/query
 # and rewrites the query plan before DataFusion optimization: column masks block
 # predicate pushdown on raw values. This is SEPARATE from the coarse Polaris gate
-# tested above. The same hive service + the same ssn mask are read by Spark/Kyuubi
+# tested above. The same query service + the same ssn mask are read by Spark/Kyuubi
 # Authz in parity-test.sh (SQE<->Spark cross-compare).
 #
 # Policies target role 'engineer' (bob + carol). Role 'analyst' gives alice SELECT

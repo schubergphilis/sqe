@@ -4,6 +4,7 @@
 
 /// Ranger Admin REST fixtures for `access_control_e2e`.
 pub mod ranger_fixture;
+pub mod spark_runner;
 
 use std::sync::Arc;
 
