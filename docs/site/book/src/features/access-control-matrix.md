@@ -239,6 +239,18 @@ flush the cache on commit. The window is asserted at both edges by
 
 ## Cross-engine parity (SQE and Spark)
 
+Tag associations need one extra thing beyond a shared policy. They are authored into
+the Iceberg property `sqe.column-tags`, which only SQE reads, so with
+`project-tags = true` SQE ALSO writes the association into Ranger's tag store where
+Kyuubi looks. If that write fails the Iceberg property is rolled back and the
+statement fails, because keeping it would mask the column in SQE while Spark returned
+it raw, and the statement would have reported success.
+
+Tag mask types on the tag service must be component-qualified (`hive:CUSTOM`, not
+`CUSTOM`): Ranger's tag servicedef aggregates each component's mask vocabulary rather
+than defining bare names.
+
+
 One policy in the shared frontend service, two engines, output compared directly.
 Per-engine checks are not enough: they pass while the engines disagree, which is the
 failure that matters. Both engines are pointed at the same service, and the suite is
@@ -250,7 +262,8 @@ failure that matters. Both engines are pointed at the same service, and the suit
 | A role outside the masked role sees the raw value in both | Yes, `an_unmasked_role_is_unmasked_in_both_engines` |
 | A row filter selects the same rows in both | Yes, `row_filter_returns_identical_rows_across_engines` |
 | A named mask type does NOT render identically | Yes, asserted as a divergence |
-| Tag-based masks | **No.** See the tag gap below; associations do not reach Spark |
+| Tag-based masks | Yes with `project-tags = true`, `tag_column_mask_is_byte_identical_across_engines` |
+| A failed projection does not leave a half-applied tag | Yes, `a_failed_projection_rolls_back_the_tag` |
 
 Object-level parity is covered separately by `spark_access_control_e2e`: grants written
 through SQE's `GRANT` statement, asserted through Spark, for read and write.
@@ -271,7 +284,7 @@ through SQE's `GRANT` statement, asserted through Spark, for read and write.
 | Row filters work through narrow views | A filter on a column the view does not project is enforced: the scan's projection is widened internally, the filter applied, then the original output columns restored, so the extra column never reaches the result. It previously failed the query with a DataFusion `No field named` error, making a row filter and a narrow view over one table mutually exclusive. Pinned by `row_filter_on_an_unprojected_column_is_enforced_not_an_error`. |
 | Ranger wildcards | Supported: `*` matches any run, `?` exactly one, and comparison folds case, per the `query` servicedef's `matcherOptions: {wildCard: "true", ignoreCase: "true"}`. Previously only exact match and a bare `*` fired, so a policy written `orders*` or on `Orders` was silently inert. Pinned by `ranger_wildcards_and_case_folding_match_the_servicedef`. |
 | Namespace keys are the full path | `resolve_policy_key` passes the whole dotted namespace, so `a.b.sales` and `sales` no longer collide on one Ranger `database`. A policy naming only the last component still matches, and logs that it did, so policies written against the old key keep working while operators rewrite them. Pinned by `namespaces_sharing_a_last_component_no_longer_collide`. |
-| Tag parity with Spark | Spark reads tag associations from the Ranger or Atlas tag store, not from Iceberg properties. Masks are shared; associations are not. |
+| Tag parity with Spark | CLOSED by the tag projector. Spark reads associations from Ranger's tag store, not from Iceberg properties, so a tag-masked column used to be protected in SQE and returned RAW by Spark. With `[policy.ranger] project-tags = true`, `SET TAG` also writes the association into Ranger's tag store and both engines mask identically. Pinned by `tag_column_mask_is_byte_identical_across_engines`. Projection is OFF by default: a deployment with no second engine reading Ranger gains nothing and would acquire a hard dependency on the Ranger tag API in its DDL path. Left off, tag masks remain SQE-only. |
 | A SQL grant authorizes the Spark path only with the defer policy | SQE writes only the `polaris` Ranger service. Kyuubi's `RangerSparkExtension` runs in `ACTIVE` mode against the `query` service and checks its own privilege FIRST, so without a matching `policyType-0` item it default-denies before Polaris is consulted, and a `GRANT` issued in SQE is not sufficient for Spark. Measured: `AccessControlException: Permission denied: user [bob] does not have [select] privilege on [acdemo/orders/id]` on a table Polaris permitted. The `query` service therefore carries a deliberate blanket allow so Kyuubi defers and Polaris decides object level: an item for group `public` on Ranger's auto-created `all - database, table, column` policy, written by the grant API because that auto policy owns the resource signature and a separately named policy is refused with error 3010. Pinned by `object_denial_survives_the_frontend_defer_policy`, which proves the blanket allow grants no data access of its own. A Spark path that connects as a service principal bypasses the `polaris` plane entirely and is subject to neither. |
 | ALL vs FUTURE tables | Ranger has no future-only resource, so both collapse to one wildcard policy. Snowflake distinguishes them. |
 | Tag propagation | A column derived from a tagged column in a CTAS starts untagged. |

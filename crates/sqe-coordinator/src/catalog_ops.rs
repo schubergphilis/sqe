@@ -1160,8 +1160,10 @@ impl CatalogOps {
                         "column tags were committed and the Ranger projection failed \
                          ({project_err}), and the previous tag map could not be \
                          serialized to roll back ({e}). The Iceberg property and the \
-                         Ranger tag store are now inconsistent; repair with \
-                         `CALL sqe.system.reproject_column_tags('{table_ident}')`."
+                         Ranger tag store are now inconsistent, so this table's tags \
+                         apply in SQE but not in other engines. RE-RUN this statement \
+                         once Ranger is reachable: the projection is idempotent and \
+                         the property already carries the tag, so a repeat converges."
                     ))
                 })?;
                 let mut revert = HashMap::new();
@@ -1189,8 +1191,9 @@ impl CatalogOps {
                              ({project_err}), and the rollback ALSO failed \
                              ({revert_err}). The Iceberg property and the Ranger tag \
                              store are now inconsistent, so this table's tags apply in \
-                             SQE but not in other engines. Repair with \
-                             `CALL sqe.system.reproject_column_tags('{table_ident}')`."
+                             SQE but not in other engines. RE-RUN this statement once \
+                             Ranger is reachable: the projection is idempotent and the \
+                             property already carries the tag, so a repeat converges."
                         )));
                     }
                 }
