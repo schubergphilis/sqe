@@ -23,11 +23,11 @@
 //! ```
 
 use crate::access_control_e2e::{
-    ac_setup, grant_read_to_both_roles, hive_mask_policy, hive_rowfilter_policy, total_rows,
-    AcCtx, ORDERS,
+    ac_setup, col_strings, grant_read_to_both_roles, hive_mask_policy, hive_rowfilter_policy,
+    total_rows, AcCtx, ORDERS,
 };
 use crate::common::ranger_fixture::{HIVE_SERVICE, PREFIX};
-use crate::common::spark_runner::{spark_sql_on_service, SPARK_CATALOG};
+use crate::common::spark_runner::{spark_sql_on_service, DenialTier, SPARK_CATALOG};
 
 macro_rules! spark_gate {
     () => {
@@ -63,7 +63,7 @@ async fn both_engines(
     who: &str,
     projection: &str,
     order_by: &str,
-) -> (Vec<Vec<String>>, Vec<Vec<String>>) {
+) -> Result<(Vec<Vec<String>>, Vec<Vec<String>>), String> {
     let session = match who {
         "alice" => &ctx.alice,
         "bob" => &ctx.bob,
@@ -72,11 +72,13 @@ async fn both_engines(
     };
 
     let sqe_sql = format!("SELECT {projection} FROM {ORDERS} ORDER BY {order_by}");
-    let batches = ctx
-        .handler
-        .execute(session, &sqe_sql, None)
-        .await
-        .unwrap_or_else(|e| panic!("[sqe/{who}] {sqe_sql} failed: {e}"));
+    let batches = match ctx.handler.execute(session, &sqe_sql, None).await {
+        Ok(b) => b,
+        // Retryable, not fatal. After a schema change SQE can still be serving a
+        // cached schema (30s metadata TTL) and answer "No field named ...". Panicking
+        // here defeated the retry the caller wraps this in.
+        Err(e) => return Err(format!("[sqe/{who}] {sqe_sql} failed: {e}")),
+    };
     let sqe_rows = {
         let mut out = Vec::with_capacity(total_rows(&batches));
         for batch in &batches {
@@ -96,11 +98,10 @@ async fn both_engines(
         spark_orders()
     );
     let out = spark_sql_on_service(session, who, HIVE_SERVICE, &spark_sql_text).await;
-    let spark_rows = out
-        .expect_ok(&format!("[spark/{who}] {spark_sql_text}"))
-        .clone();
-
-    (sqe_rows, spark_rows)
+    if out.tier != DenialTier::None {
+        return Err(format!("[spark/{who}] {spark_sql_text}: {:?}", out.tier));
+    }
+    Ok((sqe_rows, out.rows))
 }
 
 /// Wait until BOTH engines agree, then hand back the agreed rows.
@@ -120,7 +121,7 @@ async fn agreed_rows(
         std::time::Duration::from_secs(180),
         &format!("both engines to agree on `{projection}` for {who}"),
         || async {
-            let (sqe, spark) = both_engines(ctx, who, projection, order_by).await;
+            let (sqe, spark) = both_engines(ctx, who, projection, order_by).await?;
             if !settled(&sqe) {
                 return Err(format!("sqe has not applied the policy yet: {sqe:?}"));
             }
@@ -254,7 +255,9 @@ async fn row_filter_returns_identical_rows_across_engines() {
 
     // The unfiltered user still sees everything, so the filter is not a global
     // truncation that would trivially agree.
-    let (sqe_all, spark_all) = both_engines(&ctx, "alice", "id, region", "id").await;
+    let (sqe_all, spark_all) = both_engines(&ctx, "alice", "id, region", "id")
+        .await
+        .expect("alice's unfiltered read");
     assert_eq!(sqe_all.len(), 3, "alice is unfiltered in SQE");
     assert_eq!(spark_all.len(), 3, "alice is unfiltered in Spark");
 }
@@ -300,7 +303,7 @@ async fn a_named_mask_type_is_not_byte_portable() {
         std::time::Duration::from_secs(180),
         "both engines to apply the named mask",
         || async {
-            let (sqe, spark) = both_engines(&ctx, "bob", "id, ssn", "id").await;
+            let (sqe, spark) = both_engines(&ctx, "bob", "id, ssn", "id").await?;
             if masked(&sqe) && masked(&spark) {
                 Ok((sqe, spark))
             } else {
@@ -334,4 +337,509 @@ async fn a_named_mask_type_is_not_byte_portable() {
 /// Column `i` of every row, as `&str`, for a readable assertion.
 fn col_strings_like(rows: &[Vec<String>], i: usize) -> Vec<&str> {
     rows.iter().map(|r| r[i].as_str()).collect()
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Phase 2b: tag associations projected into Ranger's tag store
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A projector that always fails, so the rollback path can be asserted.
+///
+/// A live Ranger cannot be made to fail on demand without breaking every other
+/// test sharing the stack, and the rollback is the whole reason the projection is
+/// safe to enable. So it is injected.
+struct AlwaysFailingProjector;
+
+#[async_trait::async_trait]
+impl sqe_policy::tag_projector::TagProjector for AlwaysFailingProjector {
+    async fn project(
+        &self,
+        _table: &sqe_policy::tag_projector::TagTableKey,
+        _previous: &sqe_policy::tag_projector::ColumnTags,
+        _tags: &sqe_policy::tag_projector::ColumnTags,
+    ) -> sqe_core::Result<()> {
+        Err(sqe_core::SqeError::Execution(
+            "injected projection failure".to_string(),
+        ))
+    }
+    fn enabled(&self) -> bool {
+        true
+    }
+}
+
+/// When the Ranger projection fails, `SET TAG` must leave the Iceberg property
+/// UNCHANGED and fail.
+///
+/// Keeping the property would mean SQE masks the column while Spark returns it raw,
+/// which is exactly the fail-open the projection exists to close, and it would be
+/// invisible because the statement reported success.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs quickstart/polaris-ranger-keycloak; run scripts/spark-access-control-test.sh"]
+async fn a_failed_projection_rolls_back_the_tag() {
+    spark_gate!();
+    let _guard = crate::common::serial().lock().await;
+    let ctx = ac_setup().await;
+
+    // Baseline: whatever tags the table carries before the attempt.
+    let before = ctx
+        .handler
+        .execute(&ctx.carol, &format!("SHOW TAGS ON {ORDERS}"), None)
+        .await
+        .expect("SHOW TAGS before");
+    let before_rows = total_rows(&before);
+
+    // A second handler differing in exactly one thing: the projector fails.
+    let (failing, _cache) = crate::common::setup_ranger_handler_sharing(
+        Some(ctx.cache.clone()),
+        |_cfg| {},
+    )
+    .await;
+    let failing = failing.with_tag_projector(std::sync::Arc::new(AlwaysFailingProjector));
+
+    let err = failing
+        .execute(
+            &ctx.carol,
+            &format!("ALTER TABLE {ORDERS} MODIFY COLUMN ssn SET TAG rollback_probe = 'true'"),
+            None,
+        )
+        .await
+        .expect_err("the statement must fail when the projection fails");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("rolled back") || msg.contains("inconsistent"),
+        "the error must say what happened to the tag, got: {msg}"
+    );
+
+    // The property must be untouched. A leftover tag here is the fail-open.
+    let after = ctx
+        .handler
+        .execute(&ctx.carol, &format!("SHOW TAGS ON {ORDERS}"), None)
+        .await
+        .expect("SHOW TAGS after");
+    assert_eq!(
+        before_rows,
+        total_rows(&after),
+        "a failed projection left the tag behind, so SQE would mask a column Spark \
+         returns raw: exactly the gap the projector exists to close"
+    );
+}
+
+/// A tag mask policy on the test-owned TAG service.
+///
+/// The mask type MUST be component-qualified (`hive:CUSTOM`). Ranger's tag
+/// servicedef aggregates each component's mask vocabulary rather than defining bare
+/// names, and a bare `CUSTOM` is refused with
+/// `CUSTOM: is not a valid datamask-type ... service='tag'`.
+fn tag_mask_policy_portable(name: &str, tag: &str) -> serde_json::Value {
+    serde_json::json!({
+        "service": crate::common::ranger_fixture::TAG_SERVICE,
+        "name": name,
+        "policyType": 1,
+        "isEnabled": true,
+        "resources": {"tag": {"values": [tag]}},
+        "dataMaskPolicyItems": [{
+            "roles": ["engineer"],
+            "accesses": [{"type": "hive:select", "isAllowed": true}],
+            "dataMaskInfo": {
+                "dataMaskType": "hive:CUSTOM",
+                "valueExpr": PORTABLE_SSN_MASK,
+            }
+        }]
+    })
+}
+
+/// THE phase 2b payoff: a tag authored through SQL masks the column in BOTH engines.
+///
+/// Chain under test: `SET TAG` writes the Iceberg property AND projects the
+/// association into Ranger's tag store, SQE masks from the property, Kyuubi masks
+/// from the projection, and the two render identically. Before the projector, this
+/// column was masked in SQE and RAW in Spark.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs quickstart/polaris-ranger-keycloak plus spark; run scripts/spark-access-control-test.sh"]
+async fn tag_column_mask_is_byte_identical_across_engines() {
+    spark_gate!();
+    let _guard = crate::common::serial().lock().await;
+    let ctx = ac_setup().await;
+    grant_read_to_both_roles(&ctx).await;
+
+    // No RESOURCE mask on ssn here: a passing result must come from the TAG.
+    ctx.ranger
+        .create_policy(tag_mask_policy_portable(
+            &format!("{PREFIX}parity-tagmask"),
+            "parity_pii",
+        ))
+        .await
+        .expect("create the tag mask");
+
+    // Author the tag through SQL. With project-tags on, this also writes the
+    // association into Ranger's tag store.
+    ctx.handler
+        .execute(
+            &ctx.carol,
+            &format!("ALTER TABLE {ORDERS} MODIFY COLUMN ssn SET TAG parity_pii = 'true'"),
+            None,
+        )
+        .await
+        .expect("SET TAG must succeed, including its Ranger projection");
+
+    let rows = agreed_rows(&ctx, "bob", "id, ssn", "id", |rows| {
+        rows.len() == 3
+            && rows
+                .iter()
+                .all(|r| r.get(1).is_some_and(|v| v.starts_with("xxx-xx-")))
+    })
+    .await;
+
+    assert_eq!(
+        rows,
+        vec![
+            vec!["1".to_string(), "xxx-xx-1111".to_string()],
+            vec!["2".to_string(), "xxx-xx-2222".to_string()],
+            vec!["3".to_string(), "xxx-xx-3333".to_string()],
+        ],
+        "a tag authored in SQE must mask identically in Spark"
+    );
+    let flat = rows.concat().join(" ");
+    assert!(!flat.contains("111-11-1111"), "the raw ssn leaked: {flat}");
+}
+
+/// `UNSET TAG` must stop Spark masking, not just SQE.
+///
+/// This covers the projector's DELETE path, which nothing else exercises. The
+/// projection sends `op: delete` before `op: add_or_update`, and if the delete were
+/// a no-op the association would survive: Spark would keep masking a column SQE no
+/// longer tags. That direction is fail-CLOSED rather than a leak, but it is still
+/// two engines disagreeing about the same table, which is what this suite exists to
+/// prevent.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs quickstart/polaris-ranger-keycloak plus spark; run scripts/spark-access-control-test.sh"]
+async fn unset_tag_stops_masking_in_both_engines() {
+    spark_gate!();
+    let _guard = crate::common::serial().lock().await;
+    let ctx = ac_setup().await;
+    grant_read_to_both_roles(&ctx).await;
+
+    ctx.ranger
+        .create_policy(tag_mask_policy_portable(
+            &format!("{PREFIX}parity-unset-tagmask"),
+            "parity_unset_pii",
+        ))
+        .await
+        .expect("create the tag mask");
+
+    // Tag it, and confirm BOTH engines mask. Without this the unset below would
+    // pass trivially against a column that was never masked.
+    ctx.handler
+        .execute(
+            &ctx.carol,
+            &format!("ALTER TABLE {ORDERS} MODIFY COLUMN ssn SET TAG parity_unset_pii = 'true'"),
+            None,
+        )
+        .await
+        .expect("SET TAG");
+    agreed_rows(&ctx, "bob", "id, ssn", "id", |rows| {
+        rows.len() == 3
+            && rows
+                .iter()
+                .all(|r| r.get(1).is_some_and(|v| v.starts_with("xxx-xx-")))
+    })
+    .await;
+
+    // Now remove it. Both engines must go back to the raw value.
+    ctx.handler
+        .execute(
+            &ctx.carol,
+            &format!("ALTER TABLE {ORDERS} MODIFY COLUMN ssn UNSET TAG parity_unset_pii"),
+            None,
+        )
+        .await
+        .expect("UNSET TAG");
+
+    let rows = agreed_rows(&ctx, "bob", "id, ssn", "id", |rows| {
+        rows.len() == 3 && rows.iter().all(|r| r.get(1).is_some_and(|v| v.contains("-11-") || v.contains("-22-") || v.contains("-33-")))
+    })
+    .await;
+    assert_eq!(
+        rows.first().and_then(|r| r.get(1)).map(String::as_str),
+        Some("111-11-1111"),
+        "after UNSET TAG both engines must return the raw value; a still-masked \
+         Spark means the projector's delete path did nothing"
+    );
+}
+
+/// A DOCUMENTED DIVERGENCE, measured: the two engines resolve resource-mask versus
+/// tag-mask precedence DIFFERENTLY.
+///
+/// With both a resource mask and a tag mask on the same column, SQE applies the
+/// RESOURCE mask (pinned on its own side by `resource_mask_beats_tag_mask_live`)
+/// while Kyuubi applies the TAG mask. Stock `RangerBasePlugin` evaluates tag policies
+/// before resource policies, so Kyuubi is following Ranger's own ordering and SQE is
+/// the one that differs.
+///
+/// It matters because whichever mask is WEAKER becomes the effective one for anyone
+/// who picks that engine, so the same column is governed differently depending on how
+/// it is read. Recorded here rather than papered over; aligning the two is a decision,
+/// not a bug fix, because it means changing SQE's documented precedence.
+///
+/// Both masks hide the raw value, so this is a difference in WHICH protection applies,
+/// not a leak. The assertion checks exactly that much, and that they differ.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs quickstart/polaris-ranger-keycloak plus spark; run scripts/spark-access-control-test.sh"]
+async fn resource_and_tag_mask_precedence_diverges_across_engines() {
+    spark_gate!();
+    let _guard = crate::common::serial().lock().await;
+    let ctx = ac_setup().await;
+    grant_read_to_both_roles(&ctx).await;
+
+    ctx.ranger
+        .create_policy(tag_mask_policy_portable(
+            &format!("{PREFIX}precedence-tagmask"),
+            "precedence_pii",
+        ))
+        .await
+        .expect("create the tag mask");
+    ctx.ranger
+        .create_policy(hive_mask_policy(
+            &format!("{PREFIX}precedence-resource-mask"),
+            "ssn",
+            serde_json::json!({
+                "dataMaskType": "CUSTOM",
+                "valueExpr": "concat('RES-', substr({col},8,4))",
+            }),
+        ))
+        .await
+        .expect("create the resource mask");
+    ctx.handler
+        .execute(
+            &ctx.carol,
+            &format!("ALTER TABLE {ORDERS} MODIFY COLUMN ssn SET TAG precedence_pii = 'true'"),
+            None,
+        )
+        .await
+        .expect("SET TAG");
+
+    // Wait for each engine to settle on SOME mask, without requiring agreement.
+    let (sqe, spark) = crate::common::eventually_within(
+        std::time::Duration::from_secs(180),
+        "both engines to apply a mask to ssn",
+        || async {
+            let (sqe, spark) = both_engines(&ctx, "bob", "id, ssn", "id").await?;
+            let masked = |rows: &[Vec<String>]| {
+                rows.len() == 3
+                    && rows.iter().all(|r| {
+                        r.get(1)
+                            .is_some_and(|v| v.starts_with("RES-") || v.starts_with("xxx-xx-"))
+                    })
+            };
+            if masked(&sqe) && masked(&spark) {
+                Ok((sqe, spark))
+            } else {
+                Err(format!("sqe={sqe:?} spark={spark:?}"))
+            }
+        },
+    )
+    .await;
+
+    // Neither engine leaks, whichever mask won.
+    for (label, rows) in [("sqe", &sqe), ("spark", &spark)] {
+        let flat = rows.concat().join(" ");
+        assert!(
+            !flat.contains("111-11-1111"),
+            "{label} leaked the raw ssn: {flat}"
+        );
+    }
+
+    assert_eq!(
+        sqe.first().and_then(|r| r.get(1)).map(String::as_str),
+        Some("RES-1111"),
+        "SQE applies the RESOURCE mask"
+    );
+    assert_eq!(
+        spark.first().and_then(|r| r.get(1)).map(String::as_str),
+        Some("xxx-xx-1111"),
+        "Kyuubi applies the TAG mask, following stock Ranger's tag-first ordering. \
+         If this now reads RES-1111 the engines have converged, which is an \
+         improvement: rename this test and update the access-control matrix."
+    );
+}
+
+/// DEFECT, pinned: adding a column to a table that has a column mask makes the
+/// masked query FAIL in SQE.
+///
+/// Measured: with a mask on `ssn`, `ALTER TABLE ADD COLUMN nickname` then
+/// `SELECT id, ssn, nickname` dies with
+/// `PhysicalExpr Column references column 'nickname' at index 2 ... but input schema
+/// only has 2 columns: ["id", "ssn"]`. The rewritten plan and the scan schema
+/// disagree.
+///
+/// It fails CLOSED, so nothing leaks, but a governed table becomes unqueryable after a
+/// routine schema change. Asserted as current behaviour so the defect is recorded and
+/// a fix trips this test.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs quickstart/polaris-ranger-keycloak plus spark; run scripts/spark-access-control-test.sh"]
+async fn adding_a_column_to_a_masked_table_breaks_the_query_in_sqe() {
+    spark_gate!();
+    let _guard = crate::common::serial().lock().await;
+    let ctx = ac_setup().await;
+    grant_read_to_both_roles(&ctx).await;
+
+    ctx.ranger
+        .create_policy(hive_mask_policy(
+            &format!("{PREFIX}ddl-mask-ssn"),
+            "ssn",
+            serde_json::json!({
+                "dataMaskType": "CUSTOM",
+                "valueExpr": PORTABLE_SSN_MASK,
+            }),
+        ))
+        .await
+        .expect("create the ssn mask");
+    // Let the mask take effect before the schema changes, so the failure below is
+    // about ADD COLUMN and not about an unapplied policy.
+    crate::common::eventually("the ssn mask to apply in SQE", || async {
+        match ctx
+            .handler
+            .execute(&ctx.bob, &format!("SELECT ssn FROM {ORDERS}"), None)
+            .await
+        {
+            Ok(b) if col_strings(&b, "ssn").iter().all(|v| v.starts_with("xxx-xx-")) => Ok(()),
+            Ok(b) => Err(format!("not masked yet: {:?}", col_strings(&b, "ssn"))),
+            Err(e) => Err(format!("{e}")),
+        }
+    })
+    .await;
+
+    ctx.handler
+        .execute(
+            &ctx.carol,
+            &format!("ALTER TABLE {ORDERS} ADD COLUMN nickname VARCHAR"),
+            None,
+        )
+        .await
+        .expect("ADD COLUMN");
+
+    // TWO different errors are possible here and they mean opposite things:
+    //
+    //   "No field named nickname"  -> SQE's metadata cache has not picked up the new
+    //                                column yet. TRANSIENT, must be waited out.
+    //   "input schema only has N"  -> the rewritten plan and the scan schema disagree.
+    //                                The DEFECT.
+    //
+    // A retry that accepts the first error it sees cannot tell them apart, and reports
+    // whichever the timing produced. So wait until the stale-schema error is gone, and
+    // only then classify what is left.
+    let outcome = crate::common::eventually(
+        "SQE's schema cache to catch up with ADD COLUMN",
+        || async {
+            match ctx
+                .handler
+                .execute(
+                    &ctx.bob,
+                    &format!("SELECT id, ssn, nickname FROM {ORDERS} ORDER BY id"),
+                    None,
+                )
+                .await
+            {
+                Ok(b) => Ok(format!("SUCCESS with {} rows", total_rows(&b))),
+                Err(e) => {
+                    let msg = e.to_string();
+                    if msg.contains("No field named nickname") {
+                        // Still stale. Keep waiting.
+                        Err(format!("schema not refreshed yet: {msg}"))
+                    } else {
+                        Ok(msg)
+                    }
+                }
+            }
+        },
+    )
+    .await;
+
+    assert!(
+        outcome.contains("input schema only has") || outcome.contains("PhysicalExpr"),
+        "Once the schema cache caught up, expected the plan/scan mismatch that makes a \
+         masked table unqueryable after ADD COLUMN. Got: {outcome}\n\
+         If this now says SUCCESS the defect is FIXED: delete this test and update the \
+         access-control matrix."
+    );
+}
+
+/// DEFECT, pinned: renaming a tagged column breaks it DIFFERENTLY in each engine.
+///
+/// `sqe.column-tags` is keyed by column NAME and no schema-change path rewrites it, so
+/// after `RENAME COLUMN ssn TO tax_id` the association names a column that is gone.
+///
+/// Measured, and not what a reader would predict: SQE silently DROPS the column from
+/// the result (`SELECT id, tax_id` returns ONE column, no error) while Spark returns it
+/// RAW. The stricter engine hides a column that was asked for; the other hands over
+/// unmasked data. The mechanism on the SQE side is not confirmed. The behaviour is.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs quickstart/polaris-ranger-keycloak plus spark; run scripts/spark-access-control-test.sh"]
+async fn renaming_a_tagged_column_breaks_differently_in_each_engine() {
+    spark_gate!();
+    let _guard = crate::common::serial().lock().await;
+    let ctx = ac_setup().await;
+    grant_read_to_both_roles(&ctx).await;
+
+    ctx.ranger
+        .create_policy(tag_mask_policy_portable(
+            &format!("{PREFIX}ddl-rename-tagmask"),
+            "rename_pii",
+        ))
+        .await
+        .expect("create the tag mask");
+    ctx.handler
+        .execute(
+            &ctx.carol,
+            &format!("ALTER TABLE {ORDERS} MODIFY COLUMN ssn SET TAG rename_pii = 'true'"),
+            None,
+        )
+        .await
+        .expect("SET TAG");
+    // Masked in both engines first, so the rename is what changes things.
+    agreed_rows(&ctx, "bob", "id, ssn", "id", |rows| {
+        rows.len() == 3
+            && rows
+                .iter()
+                .all(|r| r.get(1).is_some_and(|v| v.starts_with("xxx-xx-")))
+    })
+    .await;
+
+    ctx.handler
+        .execute(
+            &ctx.carol,
+            &format!("ALTER TABLE {ORDERS} RENAME COLUMN ssn TO tax_id"),
+            None,
+        )
+        .await
+        .expect("RENAME COLUMN");
+
+    let (sqe, spark) = crate::common::eventually_within(
+        std::time::Duration::from_secs(180),
+        "both engines to settle after the rename",
+        || async {
+            let (sqe, spark) = both_engines(&ctx, "bob", "id, tax_id", "id").await?;
+            if sqe.len() == 3 && spark.len() == 3 {
+                Ok((sqe, spark))
+            } else {
+                Err(format!("sqe={sqe:?} spark={spark:?}"))
+            }
+        },
+    )
+    .await;
+
+    assert_eq!(
+        sqe.first().map(Vec::len),
+        Some(1),
+        "SQE drops the renamed column from the result entirely, returning only `id` \
+         for `SELECT id, tax_id` with no error. If it now returns two columns the \
+         behaviour changed: check whether the value is masked or raw, and update the \
+         access-control matrix either way. Got: {sqe:?}"
+    );
+    assert_eq!(
+        spark.first().and_then(|r| r.get(1)).map(String::as_str),
+        Some("111-11-1111"),
+        "Spark returns the renamed column RAW, because the projected association still \
+         names the old column. Got: {spark:?}"
+    );
 }
