@@ -57,7 +57,36 @@ ForbiddenException: Principal 'dave' is not authorized for op 'LIST_TABLES'`. SQ
 follows a no-information-leakage model instead. The divergence is recorded below, not
 fixed here.
 
-A fifth observation shaped the hygiene requirements: the running stack carried 20
+**5. The two tiers compose as AND, and Kyuubi decides first.** With the Kyuubi
+extension enabled and a per-user JWT, a read that Polaris permits was refused by the
+frontend tier before Polaris was ever consulted:
+
+```
+SELECT id, ssn FROM probe.acdemo.orders    -- bob: engineer HOLDS table-data-read
+org.apache.kyuubi.plugin.spark.authz.AccessControlException:
+  Permission denied: user [bob] does not have [select] privilege on [acdemo/orders/id]
+```
+
+The frontend service had no `policyType-0` item for `database=acdemo`. SQE ignores
+`policyType-0` entirely, so the same grant works there. Left alone, Spark and SQE
+disagree on every object-level grant, and the Spark failure reads like a Polaris bug.
+Probes 1 and 2 had each disabled one tier, which is how the gap stayed hidden.
+
+**6. Polaris enforces the write tier, at commit time.** On a scratch table where
+`engineer` held `table-data-read` and not `table-data-write`, with Kyuubi disabled:
+
+```
+SELECT count(*) ...   -- allowed, 1 row
+INSERT INTO ...       -- ForbiddenException: Principal 'bob' is not authorized
+                      --   for op 'ADD_TABLE_SNAPSHOT'
+row count afterwards  -- still 1, nothing written
+```
+
+Table state is unchanged, so the write path is genuinely authorized. The denial lands
+on the snapshot commit rather than before the data is staged, which means a refused
+write can still leave files behind in object storage.
+
+A seventh observation shaped the hygiene requirements: the running stack carried 20
 policies on the `polaris` service, several of them residue from earlier suite runs,
 including a user grant to `dave` that made an unauthorized-looking read succeed. The
 first read of that result looked like a fail-open. It was not. Any new suite needs the
@@ -68,7 +97,7 @@ same pre-state assertions the SQE suite has.
 | Ranger service | Type | Enforced by | Covers |
 |---|---|---|---|
 | `polaris` | `polaris` (custom, 69 access types) | Polaris itself | catalog, namespace, table, view, principal, policy |
-| `query` (renamed from `hive`) | `hive` (built-in) | each engine: SQE PlanRewriter, Kyuubi RangerSparkExtension | row filters, column masks |
+| `query` (renamed from `hive`) | `hive` (built-in) | each engine: SQE PlanRewriter, Kyuubi RangerSparkExtension | row filters, column masks, plus one defer policy |
 | `tag` | `tag` | each engine, via the attached `tagService` on `query` | mask and filter rules per tag |
 
 The `tag` service is attached to the frontend service through Ranger's `tagService`
@@ -96,6 +125,37 @@ mode is a wholesale enforcement change. The quickstart and docs set `query` expl
 **Phase 1 covers read and write.** Write coverage is where a fail-open would actually
 hurt, because Polaris vends storage credentials on the write path.
 
+**Object level belongs to Polaris alone; the frontend service defers.** Rather than
+teaching every grant to write two places, the `query` service carries one deliberate
+`policyType-0` allow so Kyuubi's object check always passes and Polaris makes the
+decision. The frontend service then holds only what it is for: masks and row filters.
+
+```
+query service
+  policyType-0  database=*  table=*  column=*   group=public   ALLOW
+                named `defer-object-level-to-polaris`
+  policyType-1  column masks          <- the real content
+  policyType-2  row filters           <- the real content
+```
+
+The policy must enumerate every hive access type the engine may need, not just
+`select`. Kyuubi checks `update` for INSERT and `create` for DDL, and a missing one
+short-circuits exactly as probe 5 showed. Masks and row filters are unaffected, because
+they are separate policy types: probe 2 had both a `policyType-0` allow and a
+`policyType-1` mask in one service and the mask still applied.
+
+The name is load-bearing. Read out of context the policy says "everyone may select
+everything", and an operator who does not know why will either delete it, breaking
+Spark, or copy it somewhere it does not belong. Two consequences follow, and both are
+requirements rather than notes:
+
+- A guard test must prove the defer policy does not become a bypass: object-level
+  denial has to still fire end to end with the policy in place.
+- Any future engine that reads `query` must also enforce object level through Polaris.
+  An engine that trusts `query` alone would be wide open. That is a standing
+  architectural constraint on adding engines, and it belongs in the design note, not
+  only here.
+
 **Tags are projected into Ranger's tag store.** The Iceberg property
 `sqe.column-tags` stays the source of truth. `ALTER TABLE ... SET TAG` additionally
 writes the tagged resource into Ranger's tag store, so Kyuubi, and any other
@@ -117,7 +177,7 @@ The rename touches exactly these files, enumerated so the plan has no discovery 
 
 | File | Change |
 |---|---|
-| `quickstart/polaris-ranger-keycloak/ranger/bootstrap-ranger.sh` | create `query`, attach `tagService: tag`, rewrite the `"service"` field of seeded policies |
+| `quickstart/polaris-ranger-keycloak/ranger/bootstrap-ranger.sh` | create `query`, attach `tagService: tag`, rewrite the `"service"` field of seeded policies, seed `defer-object-level-to-polaris` |
 | `quickstart/polaris-ranger-keycloak/spark/ranger-spark-security.xml` | `ranger.plugin.spark.service.name` becomes `query` |
 | `quickstart/polaris-ranger-keycloak/sqe.toml` | `[policy.ranger] service-name = "query"` |
 | `quickstart/polaris-ranger-keycloak/test.sh`, `parity-test.sh`, `OVERVIEW.md` | 5 references in `parity-test.sh` alone |
@@ -139,7 +199,8 @@ Named to mirror their SQE counterparts so the pair is greppable.
 | `spark_denied_before_any_grant` | `LOAD_TABLE` 403 with no grant present |
 | `spark_grant_select_to_role_enables_exact_rows` | role grant admits exactly the seeded rows |
 | `spark_role_grant_and_user_grant_both_apply` | user-level and role-level grants both take effect |
-| `spark_write_privileges_are_separate_from_read` | a read-only grant cannot INSERT; `table-data-write` admits it |
+| `spark_write_privileges_are_separate_from_read` | a read-only grant cannot INSERT (`ADD_TABLE_SNAPSHOT` refused, row count unchanged); `table-data-write` admits it |
+| `object_denial_survives_the_frontend_defer_policy` | the guard: with `defer-object-level-to-polaris` in place, a table Polaris denies is still denied, and the error comes from Polaris rather than Kyuubi |
 | `spark_ranger_deny_overrides_allow` | a deny item beats an allow grant |
 | `spark_revoke_disables_access` | revoke closes a previously working read |
 | `spark_all_tables_in_schema_grant_covers_the_namespace` | a namespace-wide grant covers a table not named individually |
@@ -201,8 +262,11 @@ token minting, and policy builders. Reuse wins; the file name carries the distin
 A thin runner `spark_sql(user, query)` shells out to
 `docker compose exec -T -e HADOOP_USER_NAME=<u> spark /opt/spark/bin/spark-sql`, injects
 the user's JWT as `--conf spark.sql.catalog.<c>.token=`, parses tab-separated rows, and
-classifies `ForbiddenException`, `not authorized`, and `MISSING_ATTRIBUTES` distinctly
-so a Kyuubi bug never reads as a denial.
+classifies errors by tier, which is not cosmetic: `ForbiddenException ... op '...'` means
+Polaris decided, `AccessControlException: Permission denied: user [...]` means Kyuubi
+short-circuited, and `MISSING_ATTRIBUTES` is the Kyuubi row-filter bug. The guard test
+asserts on the tier, not merely on failure, because a denial from the wrong tier is how
+probe 5's gap would reappear unnoticed.
 
 Runtime control: each `spark-sql` is a fresh JVM, roughly 4 to 10 seconds warm, and a
 policy change needs one Ranger poll interval. Assertions that share a policy state run
@@ -243,12 +307,20 @@ Recorded in `docs/site/book/src/features/access-control-matrix.md`, not fixed he
 3. **Kyuubi row filters need the filter column projected** (Kyuubi #6889).
 4. **Named Ranger mask types render differently per engine.** Only portable CUSTOM
    expressions are byte-equal.
+5. **A refused write is refused at commit.** Polaris denies `ADD_TABLE_SNAPSHOT`, so an
+   unauthorized INSERT can leave staged data files in object storage even though the
+   table is untouched. Authorization holds; storage hygiene does not. Orphan-file
+   cleanup is the existing maintenance procedure's job, and the volume a denied writer
+   can generate is worth a note in the operations docs.
 
 ## Success criteria
 
 - Spark authenticates to Polaris as the end user, and `make test-access-control-spark`
   proves object-level allow and deny for read and write across catalog, namespace,
   table, and view.
+- Every object-level denial in that suite is attributed to Polaris by error shape, so
+  the defer policy is proven not to be a bypass and Kyuubi is proven not to be the
+  thing doing the denying.
 - One policy written once in the `query` service produces byte-identical output from
   SQE and Spark for column masks and identical row sets for row filters.
 - `make test-access-control` still passes unchanged at 31 cases, with the service
