@@ -120,16 +120,16 @@ async fn fixture_round_trip_creates_services_and_policies() {
 /// nothing collides with the demo's `sales` / `ops` namespaces, and so the
 /// Ranger hive `database` resource is `ac` (SQE sends the LAST namespace
 /// component as `database`; see ranger_store.rs::hive_database).
-const ORDERS: &str = "sales_wh.ac.orders";
+pub(crate) const ORDERS: &str = "sales_wh.ac.orders";
 const AUDIT: &str = "ops_wh.ac.audit";
 
-struct AcCtx {
-    handler: QueryHandler,
-    ranger: RangerAdmin,
-    carol: Session,
-    alice: Session,
-    bob: Session,
-    dave: Session,
+pub(crate) struct AcCtx {
+    pub(crate) handler: QueryHandler,
+    pub(crate) ranger: RangerAdmin,
+    pub(crate) carol: Session,
+    pub(crate) alice: Session,
+    pub(crate) bob: Session,
+    pub(crate) dave: Session,
     /// The cache the policy enforcer reads. Held so it stays alive for the
     /// test, and shared with any second handler that must differ from
     /// `handler` in exactly one config value.
@@ -171,7 +171,7 @@ async fn clear_audit_deny_items(ranger: &RangerAdmin) {
 /// Bring the suite to a known state: services present, no `sqe-ac-e2e-`
 /// policies, no leftover deny items, no test grants, fixture tables holding
 /// exactly three / two rows.
-async fn ac_setup() -> AcCtx {
+pub(crate) async fn ac_setup() -> AcCtx {
     let (handler, cache) = crate::common::setup_ranger_handler().await;
     let ranger = RangerAdmin::from_env();
     ranger.require_reachable().await;
@@ -253,6 +253,13 @@ async fn ac_setup() -> AcCtx {
         format!("REVOKE SELECT ON {ORDERS} FROM ROLE \"analyst\""),
         format!("REVOKE SELECT ON {ORDERS} FROM ROLE \"engineer\""),
         format!("REVOKE INSERT ON {ORDERS} FROM ROLE \"engineer\""),
+        // USER grants on ORDERS. The Spark suite writes these (a user grant is
+        // the only thing that can admit dave, who holds no role, and the
+        // identity-split test grants alice directly). Left behind, they leak into
+        // every later test: `spark_denied_before_any_grant` found alice still
+        // reading three rows.
+        format!("REVOKE SELECT ON {ORDERS} FROM USER \"alice\""),
+        format!("REVOKE SELECT ON {ORDERS} FROM USER \"dave\""),
         format!("REVOKE SELECT ON {AUDIT} FROM ROLE \"analyst\""),
         format!("REVOKE SELECT ON {AUDIT} FROM ROLE \"engineer\""),
         format!("REVOKE SELECT ON {AUDIT} FROM USER \"bob\""),
@@ -273,7 +280,7 @@ async fn ac_setup() -> AcCtx {
 }
 
 /// Execute and unwrap with the SQL in the panic message.
-async fn exec_ok(ctx: &AcCtx, s: &Session, sql: &str) -> Vec<RecordBatch> {
+pub(crate) async fn exec_ok(ctx: &AcCtx, s: &Session, sql: &str) -> Vec<RecordBatch> {
     ctx.handler
         .execute(s, sql, None)
         .await

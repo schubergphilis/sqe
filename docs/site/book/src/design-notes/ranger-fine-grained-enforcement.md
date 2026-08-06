@@ -17,7 +17,7 @@ The two paths use two different Ranger services and two different config blocks.
   = "ranger"`. SQE writes the `polaris` service; Polaris enforces. Coarse
   allow/deny per catalog operation. SQE does not filter rows or mask columns.
 - **Fine-grained path** (this document). `[policy] engine = "ranger"`. SQE reads
-  the `hive` service-def, the same service Apache Spark's Kyuubi Ranger plugin
+  the `query` service-def, the same service Apache Spark's Kyuubi Ranger plugin
   reads, and enforces row filters and column masks in its own `LogicalPlan`
   rewriter, between planning and optimization.
 
@@ -52,7 +52,7 @@ ResolvedPolicy  -->  PolicyPlanRewriter  -->  rewritten LogicalPlan  -->  optimi
 GET /service/plugins/policies/download/{service_name}
 ```
 
-The `{service_name}` is `hive` by default (config `policy.ranger.service-name`).
+The `{service_name}` is `hive` by default (config `policy.ranger.service-name`); the quickstarts set it to `query`.
 The call uses HTTP basic auth with the configured admin user and password. The
 response is the full `ServicePolicies` JSON bundle: the resource `policies[]`
 (each carries a `policyType`: 0 = access, 1 = DATAMASK, 2 = ROWFILTER), and an
@@ -418,7 +418,7 @@ by `cache_ttl_bounds_policy_staleness`.
 | Authored via | SQL `GRANT` / `REVOKE` | Ranger UI/REST + `ALTER TABLE SET TAGS` for tags |
 | Enforced by | Polaris embedded authorizer | SQE `PolicyPlanRewriter` (plan rewrite) |
 | Does SQE filter? | No (write/read policies only) | Yes (rewrites the plan) |
-| Shared with Spark? | No (Polaris-specific service) | Yes (the `hive` service Kyuubi reads) |
+| Shared with Spark? | No (Polaris-specific service) | Yes (the `query` service Kyuubi reads) |
 | Identity matching | Ranger role membership (resolved by Polaris) | token roles, matched directly |
 | Document | [ranger-access-control.md](./ranger-access-control.md) | this document |
 
@@ -436,7 +436,7 @@ engine = "ranger"
 
 [policy.ranger]
 url = "http://ranger-admin:6080"
-service-name = "hive"
+service-name = "query"
 admin-user = "admin"
 # Set via SQE_POLICY__RANGER__ADMIN_PASSWORD rather than in the file.
 admin-password = ""
@@ -452,7 +452,7 @@ Field reference (`RangerPolicyConfig` in `crates/sqe-core/src/config.rs`):
 |---|---|---|
 | `policy.engine` | policy backend selector; `ranger` activates this path | `passthrough` |
 | `policy.ranger.url` | Ranger Admin base URL | (empty) |
-| `service-name` | the `hive` Ranger service to read; shared with Spark/Kyuubi | `hive` |
+| `service-name` | the frontend-query Ranger instance to read; shared with Spark/Kyuubi | `hive` |
 | `admin-user` | Ranger Admin user for HTTP basic auth | `admin` |
 | `admin-password` | Ranger Admin password (a secret) | (empty) |
 | `timeout-secs` | HTTP timeout for one download call | `5` |
@@ -464,7 +464,7 @@ Field reference (`RangerPolicyConfig` in `crates/sqe-core/src/config.rs`):
 
 The two Ranger config blocks are distinct. `[access_control.ranger]` points at
 the `polaris` service for the write/enforce-at-Polaris catalog path.
-`[policy.ranger]` points at the `hive` service for the SQE-side fine-grained
+`[policy.ranger]` points at the `query` service for the SQE-side fine-grained
 path. They can target the same Ranger Admin host but read different services.
 
 ## Quickstart and related docs
@@ -481,7 +481,7 @@ For cross-engine parity with Apache Spark on the same Ranger setup, see
 Related references:
 
 - [ranger-access-control.md](./ranger-access-control.md) -- the catalog access-control path (companion).
-- [ranger-fine-grained-service-type.md](./ranger-fine-grained-service-type.md) -- why the `hive` service-def, the
+- [ranger-fine-grained-service-type.md](./ranger-fine-grained-service-type.md) -- why the `query` service-def, the
   flattening sharp edge, cross-engine requirements.
 - [ranger-tag-storage-decision.md](./ranger-tag-storage-decision.md) -- where tag associations are stored.
 - [fine-grained-policy.md](./fine-grained-policy.md) -- design notes and Snowflake-parity mapping.

@@ -92,7 +92,8 @@ BENCH_ENV       = PROFILE=$(BENCH_PROFILE) BENCH_LOG_DIR=$(BENCH_LOG_DIR)
 
 .PHONY: help all all_trino docs-and-image check dev release rustbook ebook \
         ebook-pdf ebook-epub ebook-html \
-        benchmark-charts test test-access-control audit audit-advisories \
+        benchmark-charts test test-access-control test-access-control-spark \
+        audit audit-advisories \
         audit-deny audit-licenses \
         benchmark_sf0.1 benchmark_sf1 benchmark_sf10 benchmark_all \
         benchmark_sf0.1_trino benchmark_sf1_trino benchmark_sf10_trino \
@@ -112,6 +113,7 @@ help:
 	@echo "    make release      Release build of sqe-cli + sqe-server (LTO, optimised)"
 	@echo "    make test         cargo test --workspace"
 	@echo "    make test-access-control  Ranger/Polaris access-control e2e (brings up the Ranger stack)"
+	@echo "    make test-access-control-spark  the same gates asserted through Spark (adds a JVM per query)"
 	@echo "    make clippy       cargo clippy --all-targets -- -D warnings"
 	@echo "    make fmt          cargo fmt --all"
 	@echo "    make fmt-check    cargo fmt --all --check"
@@ -220,6 +222,13 @@ test:
 # access-control suite against it. Ranger Admin's first boot takes 2-4 minutes.
 test-access-control:
 	@scripts/access-control-test.sh
+
+# ── Spark access-control parity (Polaris + Ranger + Keycloak + Spark) ─────
+# Separate from test-access-control on purpose: that target deliberately excludes
+# `spark` and `data-seed` from its dependency chain, which is what keeps it fast.
+# Every assertion here starts a JVM.
+test-access-control-spark:
+	@scripts/spark-access-control-test.sh
 # ── Supply chain: advisories, bans, sources ───────────────────────────────
 # No extra flags: the ignore lists live in .cargo/audit.toml and deny.toml and
 # deliberately differ (see the note at the top of deny.toml).
