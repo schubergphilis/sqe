@@ -67,18 +67,22 @@ s3_secret_key = "s3adminpw"
 s3_path_style = true
 s3_allow_http = true
 
-# Fine-grained ENFORCEMENT (row filters + column masks) read by SQE directly
-# from a `hive`-type Ranger service. This is separate from the coarse
-# [access_control] path below (GRANT/REVOKE -> polaris service -> Polaris
-# enforces). The hive service is the one Apache Spark / Kyuubi would also read,
-# so the same policy set is shared. admin-password also via
-# SQE_POLICY__RANGER__ADMIN_PASSWORD.
+# Fine-grained ENFORCEMENT (row filters + column masks) read by SQE directly from
+# the shared frontend-query service. Separate from the coarse [access_control]
+# path below (GRANT/REVOKE -> polaris service -> Polaris enforces).
+#
+# `query` is the SAME instance Spark's Kyuubi plugin reads
+# (spark/ranger-spark-security.xml), so one policy set drives both engines. Its
+# servicedef type is `hive`, because Kyuubi is hardwired to the hive resource
+# shape; the instance is named for what it does, not for a metastore that is not
+# there. The default when unset is still `hive`, so existing deployments are
+# unaffected. admin-password also via SQE_POLICY__RANGER__ADMIN_PASSWORD.
 [policy]
 engine = "ranger"
 
 [policy.ranger]
 url = "http://ranger-admin:6080"
-service-name = "hive"
+service-name = "query"
 admin-user = "admin"
 admin-password = "rangerR0cks!"
 

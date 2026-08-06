@@ -57,7 +57,7 @@ answer.
 ## Scope of the parity
 
 Parity is validated for RESOURCE policies: named-column masks and named-table /
-named-column row filters on the `hive` service. These are the policies both
+named-column row filters on the `query` service. These are the policies both
 engines resolve by table and column name.
 
 **Tag-based masking is NOT cross-compared.** The two engines source tag-to-column
@@ -112,7 +112,7 @@ parity stack would need Kyuubi built from source.
 
 - [ranger-fine-grained-enforcement.md](./ranger-fine-grained-enforcement.md) -- how SQE enforces the same policies.
 - [ranger-access-control.md](./ranger-access-control.md) -- the catalog access-control path.
-- [ranger-fine-grained-service-type.md](./ranger-fine-grained-service-type.md) -- why the `hive` service-def is the
+- [ranger-fine-grained-service-type.md](./ranger-fine-grained-service-type.md) -- why the `query` service-def is the
   cross-engine sharing point, and the cross-engine matching requirements.
 - [ranger-tag-storage-decision.md](./ranger-tag-storage-decision.md) -- the tag-association storage decision
   that scopes tag parity out.

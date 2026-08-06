@@ -115,23 +115,33 @@ for role in analyst engineer; do
   done
 done
 
-# ── Hive service instance for SQE fine-grained policy enforcement ────────────
-# Apache Ranger 2.8 ships the `hive` service-def built in; no servicedef POST
-# is needed. SQE reads this service via
-# GET /service/plugins/policies/download/hive and rewrites the query plan
-# (row filters above the scan, column masks). The `database` resource value
-# SQE sends is the LAST dotted component of the namespace, so for
-# `sales_wh.sales.orders` the resource is database=sales, table=orders.
-echo "Creating hive service instance for fine-grained policies (idempotent) ..."
-if curl -fsS $AUTH "${RANGER_URL}/service/public/v2/api/service/name/hive" >/dev/null 2>&1; then
-  echo "  service 'hive' already present, skipping."
+# ── `query` service instance: the shared frontend-query plane ────────────────
+# Read by BOTH engines: SQE's PlanRewriter and Spark's Kyuubi
+# RangerSparkExtension. Row filters and column masks live here; object-level
+# authorization lives in the `polaris` service and is enforced by Polaris.
+#
+# The servicedef TYPE stays `hive` (Ranger 2.8 ships it built in, no servicedef
+# POST needed) because Kyuubi is hardwired to the hive resource shape:
+# database / table / column. Only the INSTANCE is named `query`, because nothing
+# here is a Hive metastore and the old name `hive` sent every reader looking for
+# one. Both engines resolve policies by instance name, so the rename is free.
+#
+# The `database` resource value SQE sends is the whole dotted namespace, with a
+# last-component fallback that still matches older policies (see
+# `resolve_policy_key`). For the single-level namespaces here both forms are
+# `sales`, which is exactly what Kyuubi sends for `sales_wh.sales.orders`
+# (Kyuubi has no catalog level). Agreeing on that is what makes one shared
+# service work for both engines.
+echo "Creating 'query' service instance for fine-grained policies (idempotent) ..."
+if curl -fsS $AUTH "${RANGER_URL}/service/public/v2/api/service/name/query" >/dev/null 2>&1; then
+  echo "  service 'query' already present, skipping."
 else
   curl -fsS $AUTH $CSRF $CT -X POST "${RANGER_URL}/service/public/v2/api/service" \
-    -d '{"name":"hive","type":"hive","configs":{"username":"admin","password":"none","jdbc.driverClassName":"org.apache.hive.jdbc.HiveDriver","jdbc.url":"none"},"isEnabled":true}' >/dev/null \
-    && echo "  service 'hive' created." || echo "  service 'hive' creation FAILED (check ranger logs)."
+    -d '{"name":"query","type":"hive","configs":{"username":"admin","password":"none","jdbc.driverClassName":"org.apache.hive.jdbc.HiveDriver","jdbc.url":"none"},"tagService":"tag","isEnabled":true}' >/dev/null \
+    && echo "  service 'query' created." || echo "  service 'query' creation FAILED (check ranger logs)."
 fi
 
-# ── Fine-grained policies on the hive service ───────────────────────────────
+# ── Fine-grained policies on the `query` service ─────────────────────────────
 # All policies target role 'engineer' (bob + carol). Role 'analyst' (alice +
 # bob + carol) serves as the unmasked baseline in test.sh: alice (analyst-only,
 # not engineer) sees real amounts and raw ssn, while bob (engineer) gets amount
@@ -146,45 +156,61 @@ fi
 #      two engines could not both return ssn for id=1 AND id=2.
 # Mask parity is the cross-compare deliverable; row-filter parity is out of
 # scope on Spark 3.5 + Kyuubi 1.11 until #6889 is resolved.
-post_hive_policy() { # json_file
+post_policy() { # json_file
   curl -fsS $AUTH $CSRF $CT -X POST "${RANGER_URL}/service/public/v2/api/policy" \
     -d @"$1" >/dev/null 2>&1 \
     && echo "  policy created" || echo "  policy exists or failed (idempotent)"
 }
 
-echo "Creating fine-grained access + mask policies on hive service ..."
+echo "Creating the defer policy + mask policies on the 'query' service ..."
 
-# Access policy (policyType 0): grant role engineer SELECT on sales.orders.*
-# This is for the Spark/Kyuubi cross-compare ONLY. Kyuubi Authz gates table
-# ACCESS on the hive service itself (it denies the query before applying any
-# mask if no access policy grants select). SQE does NOT use hive access
-# policies (its coarse gate is the Polaris `polaris` service); SQE reads only
-# the mask (type 1) and row-filter (type 2) policies from hive and ignores
-# type-0 access policies. So this policy is a no-op for SQE and a requirement
-# for Spark -- one role (engineer) drives both Spark access and the ssn mask.
-cat > /tmp/hive-access.json <<'EOF'
-{
-  "service": "hive",
-  "name": "access-sales-orders-engineer",
-  "policyType": 0,
-  "isEnabled": true,
-  "resources": {
-    "database": {"values": ["sales"]},
-    "table":    {"values": ["orders"]},
-    "column":   {"values": ["*"]}
-  },
-  "policyItems": [{
-    "roles":   ["engineer"],
-    "accesses": [{"type": "select", "isAllowed": true}]
-  }]
-}
-EOF
-post_hive_policy /tmp/hive-access.json
+# Object-level authorization belongs to POLARIS, not to this service. Polaris
+# runs its own Ranger plugin against the `polaris` service and returns 403 at
+# LOAD_TABLE for an unauthorized read.
+#
+# Kyuubi, however, checks its OWN privilege first and short-circuits before
+# Polaris is ever consulted. Without a matching policyType-0 item it fails with
+#   AccessControlException: Permission denied: user [bob] does not have
+#   [select] privilege on [sales/orders/id]
+# even when Polaris would have allowed the read. SQE ignores policyType-0
+# entirely, so leaving this out makes the two engines disagree on every
+# object-level grant, and the Spark failure reads like a Polaris bug.
+#
+# One blanket allow makes Kyuubi defer. Masks and row filters are UNAFFECTED:
+# they are policy types 1 and 2 and are evaluated separately.
+#
+# DO NOT DELETE to "tighten security". It grants no data access; Polaris still
+# decides, and there is a test (object_denial_survives_the_frontend_defer_policy)
+# that proves it. Deleting it breaks Spark entirely.
+#
+# DO NOT copy it into a service whose engine does not ALSO authorize through
+# Polaris. There it would be a wide-open hole.
+#
+# Every access type Kyuubi may check has to be listed: it checks `update` for
+# INSERT and `create` for DDL, and a missing one short-circuits as above.
+#
+# WHY THE GRANT API AND NOT A NAMED POLICY: creating a hive-type service makes
+# Ranger auto-generate `all - database, table, column` over exactly
+# database=*/table=*/column=*, granted to `admin` and `{OWNER}` only, which does
+# nothing for a query user. That policy OWNS the resource signature, so posting a
+# self-documenting `defer-object-level-to-polaris` policy is refused:
+#   Validation failure: error code[3010], reason[Another policy already exists
+#   for matching resource: policy-name=[all - database, table, column]]
+# Every other wildcard shape is taken by a sibling auto policy. The grant API
+# MERGES a policy item into the existing match instead of colliding, so the defer
+# item lands on `all - database, table, column` as a grant to group `public`.
+# The intent therefore lives in this comment and in the docs rather than in a
+# policy name. Look for the `public` group item on that policy.
+echo "Granting the object-level DEFER item to group 'public' on 'query' ..."
+curl -fsS $AUTH $CT -X POST "${RANGER_URL}/service/plugins/services/grant/query" \
+  -d '{"grantor":"admin","resource":{"database":"*","table":"*","column":"*"},"groups":["public"],"accessTypes":["select","update","create","drop","alter","index","lock","read","write"],"delegateAdmin":false,"enableAudit":true,"replaceExistingPermissions":false,"isRecursive":true}' >/dev/null \
+  && echo "  defer item granted to group 'public'." \
+  || echo "  DEFER GRANT FAILED -- Spark will deny every read (check ranger logs)."
 
 # Column-mask policy (policyType 1): mask orders.amount -> NULL for role engineer.
-cat > /tmp/hive-mask.json <<'EOF'
+cat > /tmp/query-mask.json <<'EOF'
 {
-  "service": "hive",
+  "service": "query",
   "name": "mask-sales-orders-amount",
   "policyType": 1,
   "isEnabled": true,
@@ -200,7 +226,7 @@ cat > /tmp/hive-mask.json <<'EOF'
   }]
 }
 EOF
-post_hive_policy /tmp/hive-mask.json
+post_policy /tmp/query-mask.json
 
 # Column-mask policy (policyType 1): mask orders.ssn -> show last 4 for role
 # engineer. Uses a CUSTOM transformer with a PORTABLE standard-SQL expression
@@ -217,9 +243,9 @@ post_hive_policy /tmp/hive-mask.json
 #     in BOTH DataFusion (SQE) and Spark, so each engine injects the same
 #     expression verbatim and both render xxx-xx-1111 / xxx-xx-2222. GREEN.
 # 111-11-1111 -> substr(...,8,4)=1111 -> concat -> xxx-xx-1111.
-cat > /tmp/hive-mask-ssn.json <<'EOF'
+cat > /tmp/query-mask-ssn.json <<'EOF'
 {
-  "service": "hive",
+  "service": "query",
   "name": "mask-sales-orders-ssn",
   "policyType": 1,
   "isEnabled": true,
@@ -238,7 +264,7 @@ cat > /tmp/hive-mask-ssn.json <<'EOF'
   }]
 }
 EOF
-post_hive_policy /tmp/hive-mask-ssn.json
+post_policy /tmp/query-mask-ssn.json
 
 # NOTE: no row-filter policy is seeded here (see the comment block above the
 # mask policies). SQE supports Ranger row filters, but the SQE<->Spark mask

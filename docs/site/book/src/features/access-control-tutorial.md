@@ -13,7 +13,7 @@ something in this page disagrees with those, they are right and this is stale.
 ## The two gates
 
 ```
-        GRANT / REVOKE / DENY                 Ranger hive service
+        GRANT / REVOKE / DENY                 Ranger query service
                  |                          (row filters, masks, tags)
                  v                                    |
   ranger "polaris" service                            v
@@ -31,7 +31,7 @@ Polaris hides rather than forbids.
 
 **Gate two is SQE.** Row filters, column masks and column restriction are
 applied by rewriting the logical plan before DataFusion optimizes it, from
-policies on a Ranger `hive` service. This answers *which rows and columns may
+policies on a Ranger `query` service. This answers *which rows and columns may
 this user see*.
 
 They are independent, they use different Ranger services, and a query must pass
@@ -42,7 +42,7 @@ observe is a mask you cannot debug.
 | | Gate one | Gate two |
 |---|---|---|
 | Enforced by | Polaris | SQE |
-| Ranger service | `polaris` | `hive` |
+| Ranger service | `polaris` | `query` |
 | Authored with | `GRANT` / `REVOKE` / `DENY` in SQL | Ranger policies (console or REST) |
 | Granularity | catalog, namespace, table, view | row, column, tag |
 | Denial looks like | table not found | fewer rows, or masked values |
@@ -338,7 +338,7 @@ usersync runs. A grant reachable only through a group will not show up here.
 
 # Part 2: the SQE data gate
 
-Everything in Part 2 is enforced by SQE, from a Ranger **`hive`** service, and is
+Everything in Part 2 is enforced by SQE, from a Ranger **`query`** service, and is
 invisible to gate one. A user must already hold `SELECT` for any of it to be
 observable.
 
@@ -353,12 +353,12 @@ have that window.
 
 ## 2.1 Column masks
 
-A `policyType: 1` (datamask) policy on the `hive` service, scoped to database,
+A `policyType: 1` (datamask) policy on the `query` service, scoped to database,
 table and column:
 
 ```json
 {
-  "service": "hive",
+  "service": "query",
   "name": "acdemo-mask-ssn",
   "policyType": 1,
   "isEnabled": true,
@@ -403,7 +403,7 @@ peeled off with a filter.
 
 ```json
 {
-  "service": "hive",
+  "service": "query",
   "name": "acdemo-rowfilter-eu",
   "policyType": 2,
   "isEnabled": true,
@@ -526,7 +526,7 @@ it. The rule in Ranger is what protects it.**
 
 ### Spark parity
 
-Masks are shared with Spark through the same `hive` service. Associations are
+Masks are shared with Spark through the same `query` service. Associations are
 not: Spark reads tag associations from the Ranger or Atlas tag store, while SQE
 reads them from Iceberg table properties. One mask rule, two association
 sources.
@@ -567,7 +567,7 @@ GRANT USAGE  ON DATABASE sales_wh        TO ROLE "analyst";
 GRANT USAGE  ON SCHEMA   sales_wh.acdemo TO ROLE "analyst";
 GRANT SELECT ON sales_wh.acdemo.orders   TO ROLE "analyst";
 
--- Gate two: what they see (author on the hive service)
+-- Gate two: what they see (author on the query service)
 --   policyType 2, filterExpr "region = 'EU'",       roles ["analyst"]
 --   policyType 1, column ssn, MASK_SHOW_LAST_4,     roles ["analyst"]
 

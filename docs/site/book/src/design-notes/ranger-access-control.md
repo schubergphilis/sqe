@@ -70,7 +70,8 @@ this resource?" per catalog operation.
   These are the verbs Polaris checks at enforcement.
 - **No fine-grained constructs.** The service-def declares no `rowFilterDef` and
   no `dataMaskDef`. Row filtering and column masking are not part of this
-  service. They live on the separate `hive` service read by SQE's policy engine.
+  service. They live on the separate frontend-query service read by SQE's policy
+  engine, named `query` in the quickstarts.
 
 ## GRANT and REVOKE mapping
 
@@ -682,7 +683,7 @@ does not do any of the following.
   and no `dataMaskDef`.
 
 Those are the fine-grained path, enforced by SQE itself at the query-plan layer
-by reading a separate `hive`-type Ranger service. SQE downloads those policies and
+by reading a separate Ranger service of servicedef type `hive`. SQE downloads those policies and
 rewrites the `LogicalPlan` before DataFusion optimization: row filters inject as
 `Filter` nodes above the `TableScan`, column masks replace column references with
 masking expressions. The two paths are independent, and a query must pass both:
@@ -691,8 +692,12 @@ columns may the user see?). Revoking the coarse `SELECT` grant still denies the
 query before any fine-grained check runs.
 
 The fine-grained path is configured under `[policy] engine = "ranger"` with
-`[policy.ranger] service-name = "hive"`, a separate setting from
-`access_control.backend = "ranger"`. For the fine-grained model see the
+`[policy.ranger] service-name`, a separate setting from
+`access_control.backend = "ranger"`. The default is `hive`; the quickstarts name the
+instance `query`, because nothing in the picture is a Hive metastore and the old name
+sent every reader looking for one. Only the instance name changed: the servicedef type
+stays `hive`, since Spark's Kyuubi plugin is hardwired to the hive resource shape
+(`database` / `table` / `column`). For the fine-grained model see the
 "Fine-grained enforcement" section of
 `quickstart/polaris-ranger-keycloak/OVERVIEW.md`, the design notes in
 [fine-grained-policy.md](./fine-grained-policy.md), and the service-type decision in

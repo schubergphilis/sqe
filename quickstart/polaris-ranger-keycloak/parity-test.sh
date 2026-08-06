@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# SQE <-> Spark parity test for a Ranger `hive` MASK_SHOW_LAST_4 column mask.
+# SQE <-> Spark parity test for a Ranger `query` MASK_SHOW_LAST_4 column mask.
 #
-# Both engines share ONE Polaris 1.5 Iceberg REST catalog and ONE Ranger `hive`
+# Both engines share ONE Polaris 1.5 Iceberg REST catalog and ONE Ranger `query`
 # service. The same policy (mask sales.orders.ssn -> show-last-4 for role
 # engineer) is read by SQE's PlanRewriter and by Kyuubi's RangerSparkExtension.
 # Running the same SELECT as bob (engineer in Ranger) MUST produce identical ssn
@@ -100,7 +100,7 @@ has_raw() { echo "$1" | grep -qE '[0-9]{3}-[0-9]{2}-[0-9]{4}'; }
 shows_last4() { echo "$1" | grep -q '1111' && echo "$1" | grep -q '2222'; }
 
 # SEMANTIC checks (pass on this stack): both engines enforce the SAME Ranger
-# `hive` MASK_SHOW_LAST_4 policy -- raw hidden, last 4 visible.
+# `query` MASK_SHOW_LAST_4 policy -- raw hidden, last 4 visible.
 if ! has_raw "$SQE_SSN" && shows_last4 "$SQE_SSN"; then
   green_pass "SQE: ssn masked show-last-4, raw hidden"
 else red_fail "SQE: ssn not masked as expected (got: $SQE_SSN)"; fi
@@ -122,7 +122,7 @@ else
   cat <<'NOTE'
 
   Expected BOTH engines to render xxx-xx-1111 / xxx-xx-2222 from the shared
-  Ranger `hive` CUSTOM mask (mask_show_last_n({col},4,'x','x','x',-1,'1')).
+  Ranger `query` CUSTOM mask (mask_show_last_n({col},4,'x','x','x',-1,'1')).
   If Spark shows nnnUnnU1111 the ssn policy reverted to the NAMED
   MASK_SHOW_LAST_4 type -- Kyuubi does not honor that type's servicedef
   transformer and applies its own mask chars. If Spark errors with
