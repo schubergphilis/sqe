@@ -2,13 +2,13 @@
 
 SQE enforces row filters and column masks by rewriting the query's logical plan before DataFusion optimizes it. Filters and masks are injected above the table scan, so the optimizer cannot push a user predicate through a mask to probe raw values. The model follows PostgreSQL row-level security: denied rows are invisible, masked columns return transformed values, and there is no information leakage.
 
-The headline is where the policy comes from. SQE reads an Apache Ranger `hive` service, the same service-def that Apache Spark reads through its Kyuubi authorization plugin. One policy, written once in the Ranger console, enforces byte-identically in SQE and in Spark: an SSN masked to `xxx-xx-1111` reads the same no matter which engine ran the query. See [Spark / Ranger Parity](../design-notes/sqe-spark-ranger-parity.md) for the validated cross-engine result and its edges.
+The headline is where the policy comes from. SQE reads a Ranger service of servicedef type `hive`, named `query` in the quickstarts, the same instance Apache Spark reads through its Kyuubi authorization plugin. One policy, written once in the Ranger console, enforces byte-identically in SQE and in Spark: an SSN masked to `xxx-xx-1111` reads the same no matter which engine ran the query. See [Spark / Ranger Parity](../design-notes/sqe-spark-ranger-parity.md) for the validated cross-engine result and its edges.
 
 ## Enforcement is off by default
 
 The default `[policy] engine = "passthrough"` returns plans unmodified. Turn enforcement on by selecting an engine:
 
-- `ranger` reads row-filter and column-mask policies from an Apache Ranger `hive` service and feeds the plan rewriter. This is the production path, and the one shared with Spark/Kyuubi.
+- `ranger` reads row-filter and column-mask policies from that Ranger instance and feeds the plan rewriter. This is the production path, and the one shared with Spark/Kyuubi.
 - `in-memory` keeps grants in a hash map, for development and tests.
 - `opa` and `cedar` are defined in config but not yet wired (selecting them errors today).
 
@@ -20,18 +20,18 @@ engine = "ranger"
 
 [policy.ranger]
 url = "http://ranger-admin:6080"
-service-name = "hive"          # the Ranger service to read; shared with Spark/Kyuubi
+service-name = "query"         # the Ranger instance to read; shared with Spark/Kyuubi (default: "hive")
 admin-user = "admin"
 # Set the password via SQE_POLICY__RANGER__ADMIN_PASSWORD, not in the file.
 admin-password = ""
 cache-ttl-secs = 30            # resolved-policy cache TTL
 ```
 
-`[policy.ranger]` is distinct from `[access_control.ranger]`. The `[policy]` block points at the `hive` service for SQE-side fine-grained enforcement (row filters and masks that SQE applies). The `[access_control]` block points at the `polaris` service for the coarse GRANT-to-catalog path where Polaris enforces. They can target the same Ranger Admin host and read different services. See [GRANT and REVOKE](../sql-reference/grant-revoke.md) for the two-axis model.
+`[policy.ranger]` is distinct from `[access_control.ranger]`. The `[policy]` block points at the frontend-query service for SQE-side fine-grained enforcement (row filters and masks that SQE applies). The `[access_control]` block points at the `polaris` service for the coarse GRANT-to-catalog path where Polaris enforces. They can target the same Ranger Admin host and read different services. See [GRANT and REVOKE](../sql-reference/grant-revoke.md) for the two-axis model.
 
 ## Column masks
 
-SQE realizes the full Ranger `hive` built-in mask set. Each Ranger `dataMaskType` maps to a mask SQE applies in the rewritten plan:
+SQE realizes the full Ranger hive-servicedef built-in mask set. Each Ranger `dataMaskType` maps to a mask SQE applies in the rewritten plan:
 
 | Ranger `dataMaskType` | Effect |
 |---|---|
