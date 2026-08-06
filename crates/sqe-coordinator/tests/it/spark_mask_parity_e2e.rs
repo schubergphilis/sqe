@@ -419,3 +419,82 @@ async fn a_failed_projection_rolls_back_the_tag() {
          returns raw: exactly the gap the projector exists to close"
     );
 }
+
+/// A tag mask policy on the test-owned TAG service.
+///
+/// The mask type MUST be component-qualified (`hive:CUSTOM`). Ranger's tag
+/// servicedef aggregates each component's mask vocabulary rather than defining bare
+/// names, and a bare `CUSTOM` is refused with
+/// `CUSTOM: is not a valid datamask-type ... service='tag'`.
+fn tag_mask_policy_portable(name: &str, tag: &str) -> serde_json::Value {
+    serde_json::json!({
+        "service": crate::common::ranger_fixture::TAG_SERVICE,
+        "name": name,
+        "policyType": 1,
+        "isEnabled": true,
+        "resources": {"tag": {"values": [tag]}},
+        "dataMaskPolicyItems": [{
+            "roles": ["engineer"],
+            "accesses": [{"type": "hive:select", "isAllowed": true}],
+            "dataMaskInfo": {
+                "dataMaskType": "hive:CUSTOM",
+                "valueExpr": PORTABLE_SSN_MASK,
+            }
+        }]
+    })
+}
+
+/// THE phase 2b payoff: a tag authored through SQL masks the column in BOTH engines.
+///
+/// Chain under test: `SET TAG` writes the Iceberg property AND projects the
+/// association into Ranger's tag store, SQE masks from the property, Kyuubi masks
+/// from the projection, and the two render identically. Before the projector, this
+/// column was masked in SQE and RAW in Spark.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs quickstart/polaris-ranger-keycloak plus spark; run scripts/spark-access-control-test.sh"]
+async fn tag_column_mask_is_byte_identical_across_engines() {
+    spark_gate!();
+    let _guard = crate::common::serial().lock().await;
+    let ctx = ac_setup().await;
+    grant_read_to_both_roles(&ctx).await;
+
+    // No RESOURCE mask on ssn here: a passing result must come from the TAG.
+    ctx.ranger
+        .create_policy(tag_mask_policy_portable(
+            &format!("{PREFIX}parity-tagmask"),
+            "parity_pii",
+        ))
+        .await
+        .expect("create the tag mask");
+
+    // Author the tag through SQL. With project-tags on, this also writes the
+    // association into Ranger's tag store.
+    ctx.handler
+        .execute(
+            &ctx.carol,
+            &format!("ALTER TABLE {ORDERS} MODIFY COLUMN ssn SET TAG parity_pii = 'true'"),
+            None,
+        )
+        .await
+        .expect("SET TAG must succeed, including its Ranger projection");
+
+    let rows = agreed_rows(&ctx, "bob", "id, ssn", "id", |rows| {
+        rows.len() == 3
+            && rows
+                .iter()
+                .all(|r| r.get(1).is_some_and(|v| v.starts_with("xxx-xx-")))
+    })
+    .await;
+
+    assert_eq!(
+        rows,
+        vec![
+            vec!["1".to_string(), "xxx-xx-1111".to_string()],
+            vec!["2".to_string(), "xxx-xx-2222".to_string()],
+            vec!["3".to_string(), "xxx-xx-3333".to_string()],
+        ],
+        "a tag authored in SQE must mask identically in Spark"
+    );
+    let flat = rows.concat().join(" ");
+    assert!(!flat.contains("111-11-1111"), "the raw ssn leaked: {flat}");
+}
