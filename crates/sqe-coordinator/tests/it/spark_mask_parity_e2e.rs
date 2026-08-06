@@ -352,6 +352,7 @@ impl sqe_policy::tag_projector::TagProjector for AlwaysFailingProjector {
     async fn project(
         &self,
         _table: &sqe_policy::tag_projector::TagTableKey,
+        _previous: &sqe_policy::tag_projector::ColumnTags,
         _tags: &sqe_policy::tag_projector::ColumnTags,
     ) -> sqe_core::Result<()> {
         Err(sqe_core::SqeError::Execution(
@@ -497,4 +498,247 @@ async fn tag_column_mask_is_byte_identical_across_engines() {
     );
     let flat = rows.concat().join(" ");
     assert!(!flat.contains("111-11-1111"), "the raw ssn leaked: {flat}");
+}
+
+/// `UNSET TAG` must stop Spark masking, not just SQE.
+///
+/// This covers the projector's DELETE path, which nothing else exercises. The
+/// projection sends `op: delete` before `op: add_or_update`, and if the delete were
+/// a no-op the association would survive: Spark would keep masking a column SQE no
+/// longer tags. That direction is fail-CLOSED rather than a leak, but it is still
+/// two engines disagreeing about the same table, which is what this suite exists to
+/// prevent.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs quickstart/polaris-ranger-keycloak plus spark; run scripts/spark-access-control-test.sh"]
+async fn unset_tag_stops_masking_in_both_engines() {
+    spark_gate!();
+    let _guard = crate::common::serial().lock().await;
+    let ctx = ac_setup().await;
+    grant_read_to_both_roles(&ctx).await;
+
+    ctx.ranger
+        .create_policy(tag_mask_policy_portable(
+            &format!("{PREFIX}parity-unset-tagmask"),
+            "parity_unset_pii",
+        ))
+        .await
+        .expect("create the tag mask");
+
+    // Tag it, and confirm BOTH engines mask. Without this the unset below would
+    // pass trivially against a column that was never masked.
+    ctx.handler
+        .execute(
+            &ctx.carol,
+            &format!("ALTER TABLE {ORDERS} MODIFY COLUMN ssn SET TAG parity_unset_pii = 'true'"),
+            None,
+        )
+        .await
+        .expect("SET TAG");
+    agreed_rows(&ctx, "bob", "id, ssn", "id", |rows| {
+        rows.len() == 3
+            && rows
+                .iter()
+                .all(|r| r.get(1).is_some_and(|v| v.starts_with("xxx-xx-")))
+    })
+    .await;
+
+    // Now remove it. Both engines must go back to the raw value.
+    ctx.handler
+        .execute(
+            &ctx.carol,
+            &format!("ALTER TABLE {ORDERS} MODIFY COLUMN ssn UNSET TAG parity_unset_pii"),
+            None,
+        )
+        .await
+        .expect("UNSET TAG");
+
+    let rows = agreed_rows(&ctx, "bob", "id, ssn", "id", |rows| {
+        rows.len() == 3 && rows.iter().all(|r| r.get(1).is_some_and(|v| v.contains("-11-") || v.contains("-22-") || v.contains("-33-")))
+    })
+    .await;
+    assert_eq!(
+        rows.first().and_then(|r| r.get(1)).map(String::as_str),
+        Some("111-11-1111"),
+        "after UNSET TAG both engines must return the raw value; a still-masked \
+         Spark means the projector's delete path did nothing"
+    );
+}
+
+/// A RESOURCE mask must beat a TAG mask, and both engines must agree on that.
+///
+/// SQE pins the precedence on its own side (`resource_mask_beats_tag_mask_live`).
+/// If Kyuubi resolved it the other way, the same column would render differently per
+/// engine, and whichever mask is weaker would become the effective one for anyone
+/// who picked that engine.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs quickstart/polaris-ranger-keycloak plus spark; run scripts/spark-access-control-test.sh"]
+async fn resource_mask_beats_tag_mask_across_engines() {
+    spark_gate!();
+    let _guard = crate::common::serial().lock().await;
+    let ctx = ac_setup().await;
+    grant_read_to_both_roles(&ctx).await;
+
+    // Two masks on the same column, rendering distinguishably.
+    ctx.ranger
+        .create_policy(tag_mask_policy_portable(
+            &format!("{PREFIX}precedence-tagmask"),
+            "precedence_pii",
+        ))
+        .await
+        .expect("create the tag mask");
+    ctx.ranger
+        .create_policy(hive_mask_policy(
+            &format!("{PREFIX}precedence-resource-mask"),
+            "ssn",
+            serde_json::json!({
+                "dataMaskType": "CUSTOM",
+                "valueExpr": "concat('RES-', substr({col},8,4))",
+            }),
+        ))
+        .await
+        .expect("create the resource mask");
+    ctx.handler
+        .execute(
+            &ctx.carol,
+            &format!("ALTER TABLE {ORDERS} MODIFY COLUMN ssn SET TAG precedence_pii = 'true'"),
+            None,
+        )
+        .await
+        .expect("SET TAG");
+
+    let rows = agreed_rows(&ctx, "bob", "id, ssn", "id", |rows| {
+        rows.len() == 3 && rows.iter().all(|r| r.get(1).is_some_and(|v| v.starts_with("RES-")))
+    })
+    .await;
+    assert_eq!(
+        rows,
+        vec![
+            vec!["1".to_string(), "RES-1111".to_string()],
+            vec!["2".to_string(), "RES-2222".to_string()],
+            vec!["3".to_string(), "RES-3333".to_string()],
+        ],
+        "the RESOURCE mask must win in both engines; xxx-xx- here would mean the \
+         tag mask won and the two engines disagree on precedence"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DDL versus policy: what a schema change does to an existing mask
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A column ADDED after the grant is readable, and unmasked, in both engines.
+///
+/// The object tier has no column level, so `table-data-read` covers columns that did
+/// not exist when it was granted. The fine-grained tier names columns explicitly, so
+/// a new column carries no mask. Both are the intended behaviour; the point of
+/// pinning them is that "add a column to a governed table" is a routine act whose
+/// blast radius should not be a matter of opinion.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs quickstart/polaris-ranger-keycloak plus spark; run scripts/spark-access-control-test.sh"]
+async fn a_column_added_after_the_grant_is_readable_and_unmasked() {
+    spark_gate!();
+    let _guard = crate::common::serial().lock().await;
+    let ctx = ac_setup().await;
+    grant_read_to_both_roles(&ctx).await;
+
+    // Mask ssn, so the table is genuinely governed before the schema changes.
+    ctx.ranger
+        .create_policy(hive_mask_policy(
+            &format!("{PREFIX}ddl-mask-ssn"),
+            "ssn",
+            serde_json::json!({
+                "dataMaskType": "CUSTOM",
+                "valueExpr": PORTABLE_SSN_MASK,
+            }),
+        ))
+        .await
+        .expect("create the ssn mask");
+
+    ctx.handler
+        .execute(
+            &ctx.carol,
+            &format!("ALTER TABLE {ORDERS} ADD COLUMN nickname VARCHAR"),
+            None,
+        )
+        .await
+        .expect("ADD COLUMN");
+
+    // The new column is visible under the pre-existing grant, and unmasked, while
+    // ssn stays masked. Both engines agree on all of it.
+    let rows = agreed_rows(&ctx, "bob", "id, ssn, nickname", "id", |rows| {
+        rows.len() == 3
+            && rows
+                .iter()
+                .all(|r| r.get(1).is_some_and(|v| v.starts_with("xxx-xx-")))
+    })
+    .await;
+    assert_eq!(rows.len(), 3, "the added column must not break the read");
+    assert!(
+        rows.iter().all(|r| r.len() == 3),
+        "the added column must be projectable under the existing grant: {rows:?}"
+    );
+}
+
+/// RENAMING a tagged column ORPHANS its tag, and the mask stops applying.
+///
+/// Nothing in the schema-change path rewrites `sqe.column-tags`, which is keyed by
+/// column NAME, and the Ranger projection is keyed the same way. So after
+/// `RENAME COLUMN ssn TO tax_id` the tag still names `ssn`, matches nothing, and the
+/// data is returned RAW under its new name. In BOTH engines, because both key on the
+/// name.
+///
+/// The assertion is written to FAIL if the mask survives, which is the behaviour we
+/// would want. Read a failure here as good news and a signal to update the docs: it
+/// would mean rename now carries tags across.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs quickstart/polaris-ranger-keycloak plus spark; run scripts/spark-access-control-test.sh"]
+async fn renaming_a_tagged_column_orphans_the_tag_in_both_engines() {
+    spark_gate!();
+    let _guard = crate::common::serial().lock().await;
+    let ctx = ac_setup().await;
+    grant_read_to_both_roles(&ctx).await;
+
+    ctx.ranger
+        .create_policy(tag_mask_policy_portable(
+            &format!("{PREFIX}ddl-rename-tagmask"),
+            "rename_pii",
+        ))
+        .await
+        .expect("create the tag mask");
+    ctx.handler
+        .execute(
+            &ctx.carol,
+            &format!("ALTER TABLE {ORDERS} MODIFY COLUMN ssn SET TAG rename_pii = 'true'"),
+            None,
+        )
+        .await
+        .expect("SET TAG");
+    // Masked before the rename, in both engines.
+    agreed_rows(&ctx, "bob", "id, ssn", "id", |rows| {
+        rows.len() == 3
+            && rows
+                .iter()
+                .all(|r| r.get(1).is_some_and(|v| v.starts_with("xxx-xx-")))
+    })
+    .await;
+
+    ctx.handler
+        .execute(
+            &ctx.carol,
+            &format!("ALTER TABLE {ORDERS} RENAME COLUMN ssn TO tax_id"),
+            None,
+        )
+        .await
+        .expect("RENAME COLUMN");
+
+    let rows = agreed_rows(&ctx, "bob", "id, tax_id", "id", |rows| rows.len() == 3).await;
+    let first = rows.first().and_then(|r| r.get(1)).cloned().unwrap_or_default();
+    assert_eq!(
+        first, "111-11-1111",
+        "EXPECTED the documented gap: renaming a tagged column orphans the tag \\
+         (sqe.column-tags is keyed by name and no schema-change path rewrites it), \\
+         so the data comes back RAW under the new name in both engines. If this now \\
+         reads xxx-xx-1111 the gap is CLOSED, which is an improvement: delete this \\
+         assertion and update the access-control matrix."
+    );
 }

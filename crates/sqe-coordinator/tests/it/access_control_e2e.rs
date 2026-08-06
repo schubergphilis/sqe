@@ -145,12 +145,22 @@ pub(crate) struct AcCtx {
 /// on a second run that test would start with alice already denied and burn its
 /// 30s budget waiting for a baseline allow that can never arrive.
 async fn clear_audit_deny_items(ranger: &RangerAdmin) {
+    // Both fixture tables, not just the audit one. A deny on ORDERS is just as
+    // poisonous and for a sharper reason: the Spark suite denies role `engineer`,
+    // and CAROL IS A MEMBER of engineer, so a leftover deny locks the ADMIN out of
+    // the fixture table and every later test fails at `insert orders` with
+    // "Principal 'carol' is not authorized for op 'LOAD_TABLE'". Measured: 11 of 15
+    // cases failed that way from one uncleaned deny.
     let policies = ranger.get_policies("polaris").await.unwrap_or_default();
     for mut p in policies {
-        let is_audit_policy = p["resources"]["table"]["values"] == serde_json::json!(["audit"])
-            && p["resources"]["namespace"]["values"] == serde_json::json!(["ac"])
+        let ns_is_ac = p["resources"]["namespace"]["values"] == serde_json::json!(["ac"]);
+        let is_audit_policy = ns_is_ac
+            && p["resources"]["table"]["values"] == serde_json::json!(["audit"])
             && p["resources"]["catalog"]["values"] == serde_json::json!(["ops_wh"]);
-        if !is_audit_policy {
+        let is_orders_policy = ns_is_ac
+            && p["resources"]["table"]["values"] == serde_json::json!(["orders"])
+            && p["resources"]["catalog"]["values"] == serde_json::json!(["sales_wh"]);
+        if !is_audit_policy && !is_orders_policy {
             continue;
         }
         let has_denies = p["denyPolicyItems"]
@@ -164,7 +174,7 @@ async fn clear_audit_deny_items(ranger: &RangerAdmin) {
         ranger
             .update_policy(id, p)
             .await
-            .expect("clear denyPolicyItems on the audit policy");
+            .expect("clear denyPolicyItems on a fixture-table policy");
     }
 }
 
@@ -219,34 +229,33 @@ pub(crate) async fn ac_setup() -> AcCtx {
         Ok(())
     })
     .await;
-    handler
-        .execute(&carol, &format!("DROP TABLE IF EXISTS {ORDERS}"), None)
-        .await
-        .unwrap_or_else(|e| panic!("drop {ORDERS}: {e}"));
-    handler
-        .execute(
-            &carol,
-            &format!(
+    // Retried as a unit, for the same reason the audit fixture above is: a deny
+    // item cleared moments ago is not visible to Polaris until its policy poll
+    // (5s), and the Spark suite denies role `engineer` -- of which CAROL, the
+    // admin, is a member. Without the retry every test after a deny test failed
+    // here with "Principal 'carol' is not authorized for op 'LOAD_TABLE'".
+    // Measured: 9 of 9 object-level cases, from one deny.
+    crate::common::eventually("carol to (re)create the orders fixture", || async {
+        for stmt in [
+            format!("DROP TABLE IF EXISTS {ORDERS}"),
+            format!(
                 "CREATE TABLE {ORDERS} (id BIGINT, region VARCHAR, amount DOUBLE, \
                  ssn VARCHAR, email VARCHAR, signed_on DATE)"
             ),
-            None,
-        )
-        .await
-        .expect("create orders");
-    handler
-        .execute(
-            &carol,
-            &format!(
+            format!(
                 "INSERT INTO {ORDERS} VALUES \
                  (1,'EU',10.0,'111-11-1111','a@x',DATE '2021-05-04'), \
                  (2,'US',20.0,'222-22-2222','b@x',DATE '2022-06-05'), \
                  (3,'EU',30.0,'333-33-3333','c@x',DATE '2023-07-06')"
             ),
-            None,
-        )
-        .await
-        .expect("insert orders");
+        ] {
+            if let Err(e) = handler.execute(&carol, &stmt, None).await {
+                return Err(format!("`{stmt}` failed: {e}"));
+            }
+        }
+        Ok(())
+    })
+    .await;
     // Remove any grants a previous run left on the fixture tables, so "denied
     // before grant" starts from a true denial.
     for stmt in [
@@ -260,6 +269,12 @@ pub(crate) async fn ac_setup() -> AcCtx {
         // reading three rows.
         format!("REVOKE SELECT ON {ORDERS} FROM USER \"alice\""),
         format!("REVOKE SELECT ON {ORDERS} FROM USER \"dave\""),
+        // The SCHEMA-WIDE grant, which writes a table=* WILDCARD policy. Revoking
+        // the named table does not touch it, so a leftover granted `engineer` read on
+        // every table in `ac` and every later "denied before grant" assertion saw a
+        // successful read instead of a denial.
+        "REVOKE SELECT ON ALL TABLES IN SCHEMA sales_wh.ac FROM ROLE \"engineer\"".to_string(),
+        "REVOKE SELECT ON ALL TABLES IN SCHEMA sales_wh.ac FROM ROLE \"analyst\"".to_string(),
         format!("REVOKE SELECT ON {AUDIT} FROM ROLE \"analyst\""),
         format!("REVOKE SELECT ON {AUDIT} FROM ROLE \"engineer\""),
         format!("REVOKE SELECT ON {AUDIT} FROM USER \"bob\""),

@@ -432,3 +432,134 @@ async fn mismatched_identity_reveals_the_two_tier_trust_split() {
         "bob's token must be refused even while asserting alice's name",
     );
 }
+
+/// Add a Ranger DENY item for role `engineer` to the policy SQE wrote for ORDERS.
+///
+/// Ranger keeps ONE policy per resource, so deny precedence has to be expressed by
+/// editing that policy rather than adding a second one. Targets ORDERS rather than
+/// the audit table the SQE suite uses, because the Spark catalog is bound to the
+/// `sales_wh` warehouse.
+///
+/// `analyst` is deliberately NOT denied: alice stays as the control proving the
+/// table is still readable, so a denial cannot be confused with a broken fixture.
+async fn add_deny_item_to_orders_policy(ctx: &AcCtx) {
+    let policies = ctx
+        .ranger
+        .get_policies("polaris")
+        .await
+        .expect("list polaris policies");
+    let mut target = policies
+        .into_iter()
+        .find(|p| {
+            p["resources"]["table"]["values"] == serde_json::json!(["orders"])
+                && p["resources"]["namespace"]["values"] == serde_json::json!(["ac"])
+                && p["resources"]["catalog"]["values"] == serde_json::json!(["sales_wh"])
+        })
+        .expect("SQE's GRANT must have created a polaris policy for sales_wh.ac.orders");
+    let id = target["id"].as_i64().expect("policy id");
+    let deny = serde_json::json!({
+        "roles": ["engineer"],
+        "accesses": [
+            {"type": "table-properties-read", "isAllowed": true},
+            {"type": "table-data-read", "isAllowed": true}
+        ]
+    });
+    match target.get_mut("denyPolicyItems").and_then(|v| v.as_array_mut()) {
+        Some(items) => items.push(deny),
+        None => target["denyPolicyItems"] = serde_json::json!([deny]),
+    }
+    ctx.ranger
+        .update_policy(id, target)
+        .await
+        .expect("add denyPolicyItems to the orders policy");
+}
+
+/// A Ranger DENY beats an ALLOW on the Spark path too.
+///
+/// Both users are granted, then `engineer` is denied. bob (engineer) must lose
+/// access while alice (analyst only) keeps it, which is what proves the deny is
+/// precedence rather than the grant having failed.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs quickstart/polaris-ranger-keycloak plus spark; run scripts/spark-access-control-test.sh"]
+async fn spark_ranger_deny_overrides_allow() {
+    spark_gate!();
+    let _guard = crate::common::serial().lock().await;
+    let ctx = ac_setup().await;
+
+    for role in ["analyst", "engineer"] {
+        exec_ok(
+            &ctx,
+            &ctx.carol,
+            &format!("GRANT SELECT ON {ORDERS} TO ROLE \"{role}\""),
+        )
+        .await;
+    }
+    let sql = format!("SELECT count(*) FROM {}", spark_orders());
+    spark_eventually_ok(&ctx, "bob", &sql).await;
+
+    add_deny_item_to_orders_policy(&ctx).await;
+
+    // NOT assert_spark_denied_but_valid: that controls with carol, and carol is a
+    // MEMBER of engineer, so the deny denies the control too and the helper reports a
+    // broken fixture. alice is the control here, asserted straight after.
+    crate::common::eventually_within(
+        SPARK_BUDGET,
+        "bob to be denied once the deny item propagates",
+        || async {
+            let out = spark_sql(&ctx.bob, "bob", &sql).await;
+            match &out.tier {
+                DenialTier::Polaris { op, .. } if op == "LOAD_TABLE" => Ok(()),
+                DenialTier::None => Err(format!("still allowed: {:?}", out.rows)),
+                other => Err(format!("wrong tier: {other:?}")),
+            }
+        },
+    )
+    .await;
+
+    // alice still reads, so the deny is precedence over an allow rather than the
+    // whole grant having gone away. She is analyst-only, so the engineer deny misses
+    // her; that asymmetry is the entire control.
+    let rows = spark_eventually_ok(&ctx, "alice", &sql).await;
+    assert_eq!(
+        rows,
+        vec![vec!["3".to_string()]],
+        "an analyst-only user must be unaffected by a deny on engineer"
+    );
+}
+
+/// A schema-wide grant covers a table it never names, in Spark as in SQE.
+///
+/// The wildcard is what makes one grant cover tables created later, so a Spark path
+/// that only honored explicitly named tables would silently under-grant.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs quickstart/polaris-ranger-keycloak plus spark; run scripts/spark-access-control-test.sh"]
+async fn spark_all_tables_in_schema_grant_covers_the_namespace() {
+    spark_gate!();
+    let _guard = crate::common::serial().lock().await;
+    let ctx = ac_setup().await;
+
+    // A second table in the same namespace, created AFTER nothing is granted.
+    let extra = format!("{ORDERS}_extra");
+    exec_ok(&ctx, &ctx.carol, &format!("DROP TABLE IF EXISTS {extra}")).await;
+    exec_ok(
+        &ctx,
+        &ctx.carol,
+        &format!("CREATE TABLE {extra} (id BIGINT, note VARCHAR)"),
+    )
+    .await;
+    exec_ok(&ctx, &ctx.carol, &format!("INSERT INTO {extra} VALUES (1,'a')")).await;
+
+    exec_ok(
+        &ctx,
+        &ctx.carol,
+        "GRANT SELECT ON ALL TABLES IN SCHEMA sales_wh.ac TO ROLE \"engineer\"",
+    )
+    .await;
+
+    // The grant names no table, yet both are readable through Spark.
+    let extra_in_spark = format!("{}_extra", spark_orders());
+    for table in [spark_orders(), extra_in_spark] {
+        let rows = spark_eventually_ok(&ctx, "bob", &format!("SELECT count(*) FROM {table}")).await;
+        assert_eq!(rows.len(), 1, "{table} must be readable under the wildcard grant");
+    }
+}
