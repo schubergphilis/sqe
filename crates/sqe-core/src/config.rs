@@ -2761,6 +2761,20 @@ pub struct RangerPolicyConfig {
     /// Accept self-signed TLS certs on the Ranger Admin endpoint.
     #[serde(default)]
     pub accept_invalid_certs: bool,
+    /// Also write column-tag associations into Ranger's TAG STORE, so engines
+    /// other than SQE can see them.
+    ///
+    /// Tag associations live in the Iceberg property `sqe.column-tags`, which only
+    /// SQE reads. Spark's Kyuubi plugin reads Ranger's tag store, so without this
+    /// a tag-masked column is protected in SQE and returned RAW by Spark.
+    ///
+    /// OFF by default, deliberately. A deployment with no second engine enforcing
+    /// from Ranger gains nothing from projecting and would acquire a hard
+    /// dependency on the Ranger tag API in its `SET TAG` path. Turn it on when
+    /// another engine reads the same Ranger, which is what the
+    /// polaris-ranger-keycloak quickstart does.
+    #[serde(default)]
+    pub project_tags: bool,
 }
 
 /// Circuit-breaker defaults shared by the policy backends. 5 consecutive
@@ -2785,6 +2799,7 @@ impl Default for RangerPolicyConfig {
             breaker_failure_threshold: default_policy_breaker_failure_threshold(),
             breaker_recovery_secs: default_policy_breaker_recovery_secs(),
             accept_invalid_certs: false,
+            project_tags: false,
         }
     }
 }

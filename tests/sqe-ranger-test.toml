@@ -72,6 +72,10 @@ mask_key = "sqe-ac-e2e-mask-key"
 [policy.ranger]
 url = "http://localhost:26080"
 service-name = "sqe_ac_hive"
+# Project column-tag associations into Ranger's tag store, so the cross-engine tag
+# parity test can assert that Spark masks from a tag SQE authored. Off by default in
+# production; on here because this suite is exactly what it exists for.
+project-tags = true
 admin-user = "admin"
 admin-password = "rangerR0cks!"
 cache-ttl-secs = 2

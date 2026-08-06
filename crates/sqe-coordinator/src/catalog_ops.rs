@@ -40,15 +40,57 @@ pub struct CatalogOps {
     /// for THIS coordinator. The outer `std::Mutex` only guards map lookup and
     /// is never held across an await.
     table_locks: TableLockMap,
+    /// Projects column tags into Ranger's tag store so engines other than SQE can
+    /// see them. `NoopTagProjector` unless `[policy.ranger] project-tags` is on.
+    tag_projector: StdArc<dyn sqe_policy::tag_projector::TagProjector>,
 }
 
 impl CatalogOps {
     pub fn new(config: SqeConfig) -> Self {
+        let tag_projector = Self::build_tag_projector(&config);
         Self {
             config,
             table_cache: None,
             table_locks: StdArc::new(std::sync::Mutex::new(HashMap::new())),
+            tag_projector,
         }
+    }
+
+    /// A Ranger tag projector when `project-tags` is on, otherwise a no-op.
+    ///
+    /// A construction failure degrades to the no-op rather than failing startup: a
+    /// broken projector must not stop the engine serving queries. The consequence
+    /// is that tags stay SQE-only, which is the pre-projector behaviour, and the
+    /// log line says so.
+    fn build_tag_projector(
+        config: &SqeConfig,
+    ) -> StdArc<dyn sqe_policy::tag_projector::TagProjector> {
+        use sqe_policy::tag_projector::{NoopTagProjector, RangerTagProjector};
+        if !config.policy.ranger.project_tags {
+            return StdArc::new(NoopTagProjector);
+        }
+        match RangerTagProjector::new(&config.policy.ranger) {
+            Ok(p) => StdArc::new(p),
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "project-tags is on but the Ranger tag projector could not be \
+                     built; column tags will NOT be visible to other engines"
+                );
+                StdArc::new(NoopTagProjector)
+            }
+        }
+    }
+
+    /// Inject a projector. Tests use it to drive the rollback path without a live
+    /// Ranger, which is the only way to assert it at all.
+    #[must_use = "with_tag_projector consumes self; bind the returned ops"]
+    pub fn with_tag_projector(
+        mut self,
+        projector: StdArc<dyn sqe_policy::tag_projector::TagProjector>,
+    ) -> Self {
+        self.tag_projector = projector;
+        self
     }
 
     /// Attach a global table metadata cache so DDL operations invalidate the right entry.
@@ -1097,6 +1139,72 @@ impl CatalogOps {
         // are visible to all users immediately. Still under `_guard`, so the
         // next serialized writer's `load_table` sees the fresh map.
         self.invalidate_table_all_tokens(&table_ident).await;
+
+        // Project into Ranger's tag store so OTHER engines see the association.
+        // Still under `_guard`: the rollback below is part of the read-modify-write
+        // sequence the lock protects.
+        if self.tag_projector.enabled() {
+            let key = sqe_policy::tag_projector::TagTableKey::from_namespace(
+                &table_ident.namespace().to_url_string(),
+                table_ident.name().to_string(),
+            );
+            let projected: sqe_policy::tag_projector::ColumnTags =
+                new_map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+            let previous_projected: sqe_policy::tag_projector::ColumnTags =
+                current.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+            if let Err(project_err) = self
+                .tag_projector
+                .project(&key, &previous_projected, &projected)
+                .await
+            {
+                // ROLL BACK the property. Leaving it would mean SQE masks the column
+                // while Spark returns it raw, which is precisely the fail-open the
+                // projection exists to close, and it would be invisible because the
+                // statement reported success.
+                let previous = serde_json::to_string(&current).map_err(|e| {
+                    SqeError::Execution(format!(
+                        "column tags were committed and the Ranger projection failed \
+                         ({project_err}), and the previous tag map could not be \
+                         serialized to roll back ({e}). The Iceberg property and the \
+                         Ranger tag store are now inconsistent, so this table's tags \
+                         apply in SQE but not in other engines. RE-RUN this statement \
+                         once Ranger is reachable: the projection is idempotent and \
+                         the property already carries the tag, so a repeat converges."
+                    ))
+                })?;
+                let mut revert = HashMap::new();
+                revert.insert(crate::tag_source_impl::PROP_KEY.to_string(), previous);
+                match session_catalog
+                    .commit_schema_update(
+                        &table_ident,
+                        vec![TableUpdate::SetProperties { updates: revert }],
+                        vec![],
+                    )
+                    .await
+                {
+                    Ok(_) => {
+                        self.invalidate_table_all_tokens(&table_ident).await;
+                        return Err(SqeError::Execution(format!(
+                            "could not project column tags into Ranger \
+                             ({project_err}); the tag change was rolled back and \
+                             nothing was applied"
+                        )));
+                    }
+                    Err(revert_err) => {
+                        self.invalidate_table_all_tokens(&table_ident).await;
+                        return Err(SqeError::Execution(format!(
+                            "column tags were committed, the Ranger projection failed \
+                             ({project_err}), and the rollback ALSO failed \
+                             ({revert_err}). The Iceberg property and the Ranger tag \
+                             store are now inconsistent, so this table's tags apply in \
+                             SQE but not in other engines. RE-RUN this statement once \
+                             Ranger is reachable: the projection is idempotent and the \
+                             property already carries the tag, so a repeat converges."
+                        )));
+                    }
+                }
+            }
+        }
         Ok(())
     }
 

@@ -309,6 +309,20 @@ impl QueryHandler {
         self
     }
 
+    /// Replace the column-tag projector.
+    ///
+    /// Exists for tests. The rollback path in `set_column_tags` can only be
+    /// asserted by making the projection fail, and a live Ranger cannot be made to
+    /// fail on demand without breaking every other test sharing the stack.
+    #[must_use = "with_tag_projector consumes self; bind the returned QueryHandler"]
+    pub fn with_tag_projector(
+        mut self,
+        projector: std::sync::Arc<dyn sqe_policy::tag_projector::TagProjector>,
+    ) -> Self {
+        self.catalog_ops = self.catalog_ops.with_tag_projector(projector);
+        self
+    }
+
     /// Returns a reference to the query tracker.
     pub fn query_tracker(&self) -> &Arc<QueryTracker> {
         &self.query_tracker
