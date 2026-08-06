@@ -371,8 +371,20 @@ impl RangerAdmin {
             .or_else(|| body.as_array())
             .cloned()
             .unwrap_or_default();
+        // The RESOURCE has to match, not merely "some type-0 policy grants public
+        // select". Ranger seeds `Information_schema database tables columns` with
+        // exactly a public select item, so the loose form returned true with the
+        // defer item revoked and the guard test passed while proving nothing.
+        let wildcard = |p: &Value, level: &str| {
+            p["resources"][level]["values"]
+                .as_array()
+                .is_some_and(|v| v.iter().any(|x| x.as_str() == Some("*")))
+        };
         Ok(policies.iter().any(|p| {
             p["policyType"].as_i64() == Some(0)
+                && wildcard(p, "database")
+                && wildcard(p, "table")
+                && wildcard(p, "column")
                 && p["policyItems"].as_array().is_some_and(|items| {
                     items.iter().any(|i| {
                         i["groups"]
