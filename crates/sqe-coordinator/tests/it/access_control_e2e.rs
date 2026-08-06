@@ -289,7 +289,7 @@ pub(crate) async fn exec_ok(ctx: &AcCtx, s: &Session, sql: &str) -> Vec<RecordBa
 
 /// Values of one column across all batches, rendered with `common::fmt_val`.
 /// NULL renders as the string "NULL"; Float64 renders with two decimals.
-fn col_strings(batches: &[RecordBatch], column: &str) -> Vec<String> {
+pub(crate) fn col_strings(batches: &[RecordBatch], column: &str) -> Vec<String> {
     let mut out = Vec::new();
     for b in batches {
         let Ok(idx) = b.schema().index_of(column) else {
@@ -310,7 +310,7 @@ fn col_strings(batches: &[RecordBatch], column: &str) -> Vec<String> {
     out
 }
 
-fn total_rows(batches: &[RecordBatch]) -> usize {
+pub(crate) fn total_rows(batches: &[RecordBatch]) -> usize {
     batches.iter().map(|b| b.num_rows()).sum()
 }
 
@@ -684,7 +684,7 @@ async fn revoke_disables_access() {
 /// Both roles get plain read access on orders, so the fine-grained cases differ
 /// only in masking: alice (analyst only) is the unmasked baseline, bob
 /// (analyst + engineer) is the masked subject.
-async fn grant_read_to_both_roles(ctx: &AcCtx) {
+pub(crate) async fn grant_read_to_both_roles(ctx: &AcCtx) {
     exec_ok(
         ctx,
         &ctx.carol,
@@ -720,7 +720,11 @@ async fn grant_read_to_both_roles(ctx: &AcCtx) {
 
 /// A datamask policy on the test-owned hive service for role `engineer`.
 /// `database` is `ac` because SQE sends the LAST namespace component.
-fn hive_mask_policy(name: &str, column: &str, mask: serde_json::Value) -> serde_json::Value {
+pub(crate) fn hive_mask_policy(
+    name: &str,
+    column: &str,
+    mask: serde_json::Value,
+) -> serde_json::Value {
     serde_json::json!({
         "service": HIVE_SERVICE,
         "name": name,
@@ -740,7 +744,7 @@ fn hive_mask_policy(name: &str, column: &str, mask: serde_json::Value) -> serde_
 }
 
 /// A row-filter policy on the test-owned hive service for role `engineer`.
-fn hive_rowfilter_policy(name: &str, filter: &str) -> serde_json::Value {
+pub(crate) fn hive_rowfilter_policy(name: &str, filter: &str) -> serde_json::Value {
     serde_json::json!({
         "service": HIVE_SERVICE,
         "name": name,
