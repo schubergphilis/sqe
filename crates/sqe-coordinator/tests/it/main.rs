@@ -44,6 +44,7 @@ mod quack_e2e;
 mod rewrite_data_files_deletes;
 mod rewrite_data_files_distributed_parity;
 mod rewrite_data_files_real;
+mod spark_access_control_e2e;
 mod sql_compat_test;
 mod table_health_test;
 mod trino_describe_test;
