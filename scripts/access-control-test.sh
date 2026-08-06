@@ -121,6 +121,13 @@ if [ "$#" -gt 0 ]; then
     FILTER="access_control_e2e::$1"
 fi
 
+# `spark_access_control_e2e` CONTAINS `access_control_e2e`, so the filter above also
+# matches the Spark modules and force-runs them. They need the `spark` service,
+# which this script deliberately does NOT start, so on a stack without it every
+# Spark case fails here for a reason that has nothing to do with the SQE suite.
+# Measured: this ran 38 tests instead of 31 before the skip was added.
+SKIP_SPARK="--skip spark_access_control_e2e --skip spark_mask_parity_e2e"
+
 echo ""
 echo "Running access-control e2e suite (filter: $FILTER)..."
 SQE_AC_E2E=1 \
@@ -129,4 +136,4 @@ AC_RANGER_URL="$RANGER_URL" \
 RUST_LOG="${RUST_LOG:-sqe_coordinator=info,sqe_policy=debug,sqe_catalog=info,sqe_auth=info,warn}" \
 RUST_MIN_STACK="${RUST_MIN_STACK:-33554432}" \
     cargo test -p sqe-coordinator --test it -- \
-    --ignored --test-threads=1 --nocapture "$FILTER"
+    --ignored --test-threads=1 --nocapture $SKIP_SPARK "$FILTER"
