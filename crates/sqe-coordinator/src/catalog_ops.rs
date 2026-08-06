@@ -1150,7 +1150,13 @@ impl CatalogOps {
             );
             let projected: sqe_policy::tag_projector::ColumnTags =
                 new_map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-            if let Err(project_err) = self.tag_projector.project(&key, &projected).await {
+            let previous_projected: sqe_policy::tag_projector::ColumnTags =
+                current.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+            if let Err(project_err) = self
+                .tag_projector
+                .project(&key, &previous_projected, &projected)
+                .await
+            {
                 // ROLL BACK the property. Leaving it would mean SQE masks the column
                 // while Spark returns it raw, which is precisely the fail-open the
                 // projection exists to close, and it would be invisible because the

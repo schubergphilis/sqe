@@ -62,7 +62,17 @@ impl TagTableKey {
 #[async_trait]
 pub trait TagProjector: Send + Sync {
     /// Make Ranger's tag store match `tags` for this table.
-    async fn project(&self, table: &TagTableKey, tags: &ColumnTags) -> sqe_core::Result<()>;
+    ///
+    /// `previous` is the map BEFORE this change. It is required, not a convenience:
+    /// a column whose last tag was just unset does not appear in `tags` at all, so a
+    /// delete built from `tags` alone names nothing and the stale association
+    /// survives. Spark then keeps masking a column SQE no longer tags.
+    async fn project(
+        &self,
+        table: &TagTableKey,
+        previous: &ColumnTags,
+        tags: &ColumnTags,
+    ) -> sqe_core::Result<()>;
 
     /// False when projection is off, which lets callers skip the work and, more
     /// importantly, skip the ROLLBACK path that only exists to keep the two stores
@@ -78,7 +88,12 @@ pub struct NoopTagProjector;
 
 #[async_trait]
 impl TagProjector for NoopTagProjector {
-    async fn project(&self, _table: &TagTableKey, _tags: &ColumnTags) -> sqe_core::Result<()> {
+    async fn project(
+        &self,
+        _table: &TagTableKey,
+        _previous: &ColumnTags,
+        _tags: &ColumnTags,
+    ) -> sqe_core::Result<()> {
         Ok(())
     }
 }
@@ -203,18 +218,21 @@ impl RangerTagProjector {
 
 #[async_trait]
 impl TagProjector for RangerTagProjector {
-    #[instrument(skip(self, tags), fields(service = %self.service_name))]
-    async fn project(&self, table: &TagTableKey, tags: &ColumnTags) -> sqe_core::Result<()> {
-        // Remove first, then add. A column whose last tag was just unset has no
-        // entry in `tags`, so an add-only import would leave its association
-        // behind and Spark would keep masking a column SQE no longer tags.
-        //
-        // The delete names the columns present BEFORE this call as well as now,
-        // which the caller supplies by passing the union. Callers that only have
-        // the new map still converge, because the add_or_update below is
-        // authoritative for every column it names.
-        let delete_doc = build_import_document(&self.service_name, table, tags, "delete");
-        if !tags.is_empty() {
+    #[instrument(skip(self, previous, tags), fields(service = %self.service_name))]
+    async fn project(
+        &self,
+        table: &TagTableKey,
+        previous: &ColumnTags,
+        tags: &ColumnTags,
+    ) -> sqe_core::Result<()> {
+        // Delete what WAS there, then add what should be. The delete has to be built
+        // from `previous`: an unset column is absent from `tags`, so a delete built
+        // from `tags` names nothing, the stale association survives, and Spark keeps
+        // masking a column SQE no longer tags. Measured exactly that way before
+        // `previous` was threaded through.
+        if !previous.is_empty() {
+            let delete_doc =
+                build_import_document(&self.service_name, table, previous, "delete");
             self.import(delete_doc).await?;
         }
         let add_doc = build_import_document(&self.service_name, table, tags, "add_or_update");
@@ -347,8 +365,39 @@ mod tests {
     async fn the_noop_projector_is_disabled_and_succeeds() {
         let p = NoopTagProjector;
         assert!(!p.enabled());
-        p.project(&TagTableKey::new("ac", "orders"), &ColumnTags::new())
-            .await
-            .expect("noop never fails");
+        p.project(
+            &TagTableKey::new("ac", "orders"),
+            &ColumnTags::new(),
+            &ColumnTags::new(),
+        )
+        .await
+        .expect("noop never fails");
+    }
+
+    /// The delete document must name the column being UNSET, which only `previous`
+    /// knows about. Built from the new map it names nothing, which is how the stale
+    /// association survived and Spark kept masking an untagged column.
+    #[test]
+    fn the_delete_document_names_the_unset_column() {
+        let previous = tags(&[("ssn", &["pii"])]);
+        let now = ColumnTags::new();
+        let del = build_import_document(
+            "query",
+            &TagTableKey::new("ac", "orders"),
+            &previous,
+            "delete",
+        );
+        assert_eq!(del["op"], "delete");
+        assert_eq!(
+            del["serviceResources"][0]["resourceElements"]["column"]["values"][0],
+            "ssn",
+            "the delete must name the column that WAS tagged"
+        );
+        let add =
+            build_import_document("query", &TagTableKey::new("ac", "orders"), &now, "add_or_update");
+        assert!(
+            add["serviceResources"].as_array().unwrap().is_empty(),
+            "and the add names nothing, which is why the delete has to carry it"
+        );
     }
 }
