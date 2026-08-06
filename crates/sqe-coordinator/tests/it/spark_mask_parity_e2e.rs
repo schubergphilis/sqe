@@ -335,3 +335,87 @@ async fn a_named_mask_type_is_not_byte_portable() {
 fn col_strings_like(rows: &[Vec<String>], i: usize) -> Vec<&str> {
     rows.iter().map(|r| r[i].as_str()).collect()
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Phase 2b: tag associations projected into Ranger's tag store
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A projector that always fails, so the rollback path can be asserted.
+///
+/// A live Ranger cannot be made to fail on demand without breaking every other
+/// test sharing the stack, and the rollback is the whole reason the projection is
+/// safe to enable. So it is injected.
+struct AlwaysFailingProjector;
+
+#[async_trait::async_trait]
+impl sqe_policy::tag_projector::TagProjector for AlwaysFailingProjector {
+    async fn project(
+        &self,
+        _table: &sqe_policy::tag_projector::TagTableKey,
+        _tags: &sqe_policy::tag_projector::ColumnTags,
+    ) -> sqe_core::Result<()> {
+        Err(sqe_core::SqeError::Execution(
+            "injected projection failure".to_string(),
+        ))
+    }
+    fn enabled(&self) -> bool {
+        true
+    }
+}
+
+/// When the Ranger projection fails, `SET TAG` must leave the Iceberg property
+/// UNCHANGED and fail.
+///
+/// Keeping the property would mean SQE masks the column while Spark returns it raw,
+/// which is exactly the fail-open the projection exists to close, and it would be
+/// invisible because the statement reported success.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs quickstart/polaris-ranger-keycloak; run scripts/spark-access-control-test.sh"]
+async fn a_failed_projection_rolls_back_the_tag() {
+    spark_gate!();
+    let _guard = crate::common::serial().lock().await;
+    let ctx = ac_setup().await;
+
+    // Baseline: whatever tags the table carries before the attempt.
+    let before = ctx
+        .handler
+        .execute(&ctx.carol, &format!("SHOW TAGS ON {ORDERS}"), None)
+        .await
+        .expect("SHOW TAGS before");
+    let before_rows = total_rows(&before);
+
+    // A second handler differing in exactly one thing: the projector fails.
+    let (failing, _cache) = crate::common::setup_ranger_handler_sharing(
+        Some(ctx.cache.clone()),
+        |_cfg| {},
+    )
+    .await;
+    let failing = failing.with_tag_projector(std::sync::Arc::new(AlwaysFailingProjector));
+
+    let err = failing
+        .execute(
+            &ctx.carol,
+            &format!("ALTER TABLE {ORDERS} MODIFY COLUMN ssn SET TAG rollback_probe = 'true'"),
+            None,
+        )
+        .await
+        .expect_err("the statement must fail when the projection fails");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("rolled back") || msg.contains("inconsistent"),
+        "the error must say what happened to the tag, got: {msg}"
+    );
+
+    // The property must be untouched. A leftover tag here is the fail-open.
+    let after = ctx
+        .handler
+        .execute(&ctx.carol, &format!("SHOW TAGS ON {ORDERS}"), None)
+        .await
+        .expect("SHOW TAGS after");
+    assert_eq!(
+        before_rows,
+        total_rows(&after),
+        "a failed projection left the tag behind, so SQE would mask a column Spark \
+         returns raw: exactly the gap the projector exists to close"
+    );
+}
