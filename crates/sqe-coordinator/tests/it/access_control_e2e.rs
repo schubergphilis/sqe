@@ -133,7 +133,7 @@ pub(crate) struct AcCtx {
     /// The cache the policy enforcer reads. Held so it stays alive for the
     /// test, and shared with any second handler that must differ from
     /// `handler` in exactly one config value.
-    cache: sqe_catalog::TableMetadataCache,
+    pub(crate) cache: sqe_catalog::TableMetadataCache,
 }
 
 /// Clear `denyPolicyItems` from the polaris-service policy covering the audit

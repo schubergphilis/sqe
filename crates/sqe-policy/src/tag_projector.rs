@@ -44,6 +44,19 @@ impl TagTableKey {
             table: table.into(),
         }
     }
+
+    /// Build the key from a namespace and table name, applying the SAME
+    /// convention the mask path uses.
+    ///
+    /// `plan_rewriter::resolve_policy_key` sends the LAST dotted component of the
+    /// schema as the Ranger `database`, so a mask on `sales_wh.sales.orders` is
+    /// written against `database=sales`. A projected tag resource has to agree, or
+    /// the tag lands on a resource no engine resolves and the projection silently
+    /// protects nothing.
+    pub fn from_namespace(namespace: &str, table: impl Into<String>) -> Self {
+        let database = namespace.rsplit('.').next().unwrap_or(namespace);
+        Self::new(database, table)
+    }
 }
 
 #[async_trait]
@@ -293,6 +306,26 @@ mod tests {
         assert_eq!(
             resources[0]["resourceElements"]["column"]["values"][0],
             "email"
+        );
+    }
+
+    /// Pins the convention against the mask path. `resolve_policy_key` sends the
+    /// LAST dotted component, so a projected tag resource must too: disagreeing
+    /// would put the tag on a resource nothing resolves, and the projection would
+    /// appear to succeed while protecting nothing.
+    #[test]
+    fn the_database_key_is_the_last_namespace_component() {
+        assert_eq!(
+            TagTableKey::from_namespace("sales_wh.sales", "orders"),
+            TagTableKey::new("sales", "orders")
+        );
+        assert_eq!(
+            TagTableKey::from_namespace("sales", "orders"),
+            TagTableKey::new("sales", "orders")
+        );
+        assert_eq!(
+            TagTableKey::from_namespace("a.b.c", "t"),
+            TagTableKey::new("c", "t")
         );
     }
 
