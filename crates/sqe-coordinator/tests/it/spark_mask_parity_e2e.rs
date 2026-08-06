@@ -332,6 +332,14 @@ async fn a_named_mask_type_is_not_byte_portable() {
         vec!["xxx-xx-1111", "xxx-xx-2222", "xxx-xx-3333"],
         "SQE renders the servicedef transformer's mask characters"
     );
+    // Kyuubi's own substitution, measured rather than assumed: digit -> n,
+    // separator -> U, last four preserved. Pinned so the published comparison
+    // table cites a value this suite actually observes.
+    assert_eq!(
+        col_strings_like(&spark, 1),
+        vec!["nnnUnnU1111", "nnnUnnU2222", "nnnUnnU3333"],
+        "Kyuubi applies its own mask characters instead of the transformer"
+    );
 }
 
 /// Column `i` of every row, as `&str`, for a readable assertion.
