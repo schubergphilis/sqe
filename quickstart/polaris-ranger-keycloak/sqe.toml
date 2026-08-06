@@ -83,6 +83,13 @@ engine = "ranger"
 [policy.ranger]
 url = "http://ranger-admin:6080"
 service-name = "query"
+# Also write column-tag associations into Ranger's TAG STORE, so Spark sees them.
+# Associations otherwise live only in the Iceberg property `sqe.column-tags`, which
+# only SQE reads, and a tag-masked column would be protected in SQE and returned RAW
+# by Spark. On here because this stack runs both engines. Off by default: a
+# deployment with no second engine reading Ranger gains nothing and would acquire a
+# hard dependency on the Ranger tag API in its SET TAG path.
+project-tags = true
 admin-user = "admin"
 admin-password = "rangerR0cks!"
 

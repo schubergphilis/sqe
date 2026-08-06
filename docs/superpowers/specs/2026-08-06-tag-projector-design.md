@@ -60,17 +60,26 @@ incremental path is four calls with more failure modes. The bulk import is one.
 **On projection failure, roll back the Iceberg property.** The two writes cannot be
 atomic. Commit the property, project, and if the projection fails revert the
 property and fail the statement, so neither engine ends up masking while the other
-does not. If the revert ALSO fails, the statement reports drift and names the repair
-procedure. That narrow case is the only one that can leave the stores inconsistent.
+does not. If the revert ALSO fails, the statement reports drift and says to re-run
+the statement. That narrow case is the only one that can leave the stores
+inconsistent.
 
 Rejected: keeping the property and erroring. It ships exactly the fail-open this
 phase exists to close. Rejected: projecting first, which flips the exposure to SQE
 and can leave a live Ranger tag for a statement that then failed.
 
-**Repair is a CALL procedure**, not a read-path self-heal and not a startup sweep.
-A read-path reprojection puts a Ranger write on a read and can retry a broken
-projection forever unnoticed. The procedure doubles as the migration path for tables
-tagged before the projector existed.
+**Repair is re-running the statement, with a CALL procedure deferred.** The chosen
+design was a `CALL sqe.system.reproject_column_tags(...)` procedure, and it is still
+the right thing for bulk migration of tables tagged before the projector existed.
+It is NOT implemented here, because the remedy for the only state that needs it is
+simpler and already available: re-running the same `SET TAG` converges. The
+projection is an idempotent `add_or_update`, and in the double-failure state the
+property already carries the tag, so a repeat writes the property as a no-op and
+then projects. The error messages say exactly that rather than naming a command that
+does not exist.
+
+A read-path reprojection was rejected outright: it puts a Ranger write on a read and
+can retry a broken projection forever unnoticed.
 
 **Projection is opt-in.** A deployment with no second engine reading Ranger gains
 nothing from projecting and would acquire a hard Ranger-tag-API dependency on its
@@ -123,19 +132,21 @@ In `CatalogOps::set_column_tags` (`catalog_ops.rs`), after the existing
 2. On failure, revert by committing the PREVIOUS property value and invalidating
    again, then return a typed error naming the column and the Ranger error.
 3. If the revert fails, return an error stating both stores are now inconsistent and
-   naming the repair procedure.
+   saying to re-run the statement once Ranger is reachable.
 
 Holding the existing per-table lock across all of it matters: the lock is what makes
 the read-modify-write safe today, and the rollback is part of that sequence.
 
 ### Repair
 
-```sql
-CALL sqe.system.reproject_column_tags('cat.ns.tbl');
-```
+Re-run the `SET TAG` statement. The projection is an idempotent `add_or_update`, and
+in the drifted state the property already carries the tag, so the property write is a
+no-op and the projection then lands.
 
-Reads the Iceberg property and projects it wholesale, so it is idempotent and fixes
-both directions of drift. Admin-gated like the other maintenance procedures.
+A bulk `CALL sqe.system.reproject_column_tags('cat.ns.tbl')` is still worth having
+for tables tagged BEFORE the projector existed, since nothing re-triggers their
+projection. Deferred, and called out as such in the follow-ups rather than referenced
+by an error message.
 
 ## Testing
 
@@ -155,7 +166,7 @@ both directions of drift. Admin-gated like the other maintenance procedures.
 - With `project-tags = true`, a `SET TAG` through SQE makes Spark mask the column,
   asserted byte-identically against SQE.
 - A projection failure leaves the Iceberg property unchanged and fails the statement.
-- The repair procedure makes a drifted table consistent.
+- Re-running `SET TAG` after a failed projection makes the stores consistent.
 - With `project-tags` off, behaviour is exactly as today.
 
 ## Rollback
