@@ -703,6 +703,98 @@ stays `hive`, since Spark's Kyuubi plugin is hardwired to the hive resource shap
 [fine-grained-policy.md](./fine-grained-policy.md), and the service-type decision in
 [ranger-fine-grained-service-type.md](./ranger-fine-grained-service-type.md).
 
+## Two engines, two tiers: how Spark reaches the same gates
+
+Spark runs against the same Polaris catalog and the same Ranger instance, and it
+is subject to the same object-level policies, with no engine code on SQE's side.
+What makes that work is a credential choice, not an enforcement layer.
+
+Polaris already runs its own Ranger plugin (`polaris.authorization.type: ranger`)
+keyed on the federated OIDC identity. So Spark's Iceberg REST catalog is given a
+per-user Keycloak token, and Polaris authorizes the end user:
+
+```
+spark.sql.catalog.<c>.token=<the user's Keycloak JWT>
+spark.sql.catalog.<c>.token-refresh-enabled=false
+```
+
+The second line is load-bearing. Left at its default, Iceberg exchanges the
+external JWT against Polaris's own token endpoint and the identity silently
+reverts to the service account, at which point every access-control test passes
+for the wrong reason. Connecting as a service principal, which is the common
+Spark pattern, bypasses the object tier completely.
+
+Identity then reaches the two tiers by different routes, and the asymmetry is the
+most important property of the arrangement:
+
+```
+Keycloak token (signature verified)   ->  Polaris  ->  `polaris` service   [object]
+HADOOP_USER_NAME (asserted string)    ->  Kyuubi   ->  `query` / `tag`     [fine grained]
+```
+
+### Why the frontend service carries a blanket allow
+
+Kyuubi checks its own privilege BEFORE Polaris is consulted, and default-denies
+without a matching `policyType-0` item:
+
+```
+AccessControlException: Permission denied: user [bob] does not have
+  [select] privilege on [sales/orders/id]
+```
+
+SQE ignores `policyType-0` entirely, so a grant that works in SQE fails in Spark
+and the failure looks like a Polaris bug. Object level belongs to Polaris, so the
+`query` service carries one deliberate blanket allow that makes Kyuubi defer, and
+holds nothing else beyond masks and row filters.
+
+The item grants `select`, `update`, `create`, `drop`, `alter`, `index`, `lock`,
+`read` and `write` to group `public` on `database=*`/`table=*`/`column=*`. Every
+one of those access types has to be listed: Kyuubi checks `update` for `INSERT`
+and `create` for DDL, and a missing one short-circuits exactly as above.
+
+It is written with Ranger's grant API rather than as a self-documenting named
+policy, because creating a hive-type service makes Ranger auto-generate
+`all - database, table, column` over that exact resource signature, granted to
+`admin` and `{OWNER}` only. That policy owns the signature, so a named policy is
+refused:
+
+```
+Validation failure: error code[3010], reason[Another policy already exists for
+matching resource: policy-name=[all - database, table, column]]
+```
+
+Every other wildcard shape is taken by a sibling auto policy. The grant API
+merges an item into the existing match instead, so the defer item appears as the
+group `public` item on `all - database, table, column`.
+
+**Two consequences, both requirements rather than notes.**
+
+Read out of context the item says "everyone may select everything". It grants no
+data access, because Polaris still decides, and
+`object_denial_survives_the_frontend_defer_policy` exists to prove exactly that:
+with the item present and no Polaris grant, the read is still refused, by Polaris.
+Do not delete it to tighten security; Spark stops working and nothing is gained.
+
+**Any engine that reads the frontend service must also authorize through
+Polaris.** An engine that trusts `query` alone would be wide open. That is a
+standing constraint on adding engines, not a property of the current two.
+
+### Testing it
+
+`make test-access-control-spark` writes each grant through SQE's `GRANT`
+statement and asserts it through Spark, so one grant path is checked against two
+engines. Every denial assertion names the tier it expects: a Kyuubi denial where
+Polaris was expected means the defer item went missing and the assertion never
+reached the tier under test.
+
+Two traps are worth knowing before reading a result. Kyuubi caches the policy
+bundle on disk and refreshes on a 10s poll, so a `spark-sql` JVM started seconds
+after a policy change can still enforce the previous bundle. And
+`ranger-spark-security.xml` is a bind-mounted single file: editing it on the host
+with `sed` replaces the inode, breaks the mount, and leaves the container with
+`FileNotFoundException`, after which Kyuubi enforces nothing at all. Recover with
+`docker compose up -d --force-recreate spark`.
+
 ## Versions
 
 - Apache Polaris 1.7.0 (embedded Ranger authorizer, Beta).
