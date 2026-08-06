@@ -62,11 +62,27 @@ pub fn classify(output: &str) -> DenialTier {
         };
     }
     for marker in ["Exception", "ERROR SparkSQLDriver"] {
-        if let Some(line) = output.lines().find(|l| l.contains(marker)) {
+        if let Some(line) = output
+            .lines()
+            .find(|l| l.contains(marker) && !is_benign_noise(l))
+        {
             return DenialTier::Other(line.trim().to_string());
         }
     }
     DenialTier::None
+}
+
+/// Lines that carry an exception name but are not a query failure.
+///
+/// `PartialGroupNameException` appears on EVERY run: the container has no OS user
+/// named `bob`, so Hadoop's Unix group lookup fails. It is irrelevant, because
+/// Kyuubi resolves role membership from the Ranger user store rather than from
+/// Unix groups, and the query proceeds normally.
+fn is_benign_noise(line: &str) -> bool {
+    line.contains("PartialGroupNameException")
+        || line.contains("unable to return groups for user")
+        || line.contains("failed to create script engine")
+        || line.contains("failed to initialize condition")
 }
 
 fn between(s: &str, open: &str, close: &str) -> Option<String> {
@@ -134,7 +150,7 @@ impl SparkOutcome {
 /// The catalog name the suite registers inside Spark. Deliberately not
 /// `sales_wh`, which `spark-defaults.conf` already binds to the `root` service
 /// account: a per-user catalog must not inherit those credentials.
-pub const SPARK_CATALOG: &str = "ac";
+pub const SPARK_CATALOG: &str = "acwh";
 
 /// Run `sql` in the quickstart's Spark container as `session`'s user.
 ///
@@ -201,7 +217,14 @@ fn run_blocking(token: &str, hadoop_user: &str, sql: &str) -> SparkOutcome {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    let tier = classify(&raw);
+    // The exit code is the authority on whether the statement ran. Text
+    // classification only explains a FAILURE; used as the success signal it
+    // misreads routine log noise as a query error.
+    let tier = if out.status.success() {
+        DenialTier::None
+    } else {
+        classify(&raw)
+    };
     SparkOutcome {
         rows: parse_rows(&raw),
         tier,
@@ -227,6 +250,9 @@ fn parse_rows(raw: &str) -> Vec<Vec<String>> {
                 && !l.starts_with("SLF4J")
                 && !l.starts_with("Setting default log level")
                 && !l.starts_with("To adjust logging level")
+                && !l.contains("PartialGroupNameException")
+                && !l.starts_with("id: ")
+                && !l.starts_with("Spark ")
         })
         .map(|l| l.split('\t').map(|c| c.trim().to_string()).collect())
         .collect()
@@ -304,6 +330,18 @@ mod tests {
         let err = "org.apache.spark.sql.AnalysisException: [MISSING_ATTRIBUTES] \
                    Resolved attribute(s) region#12 missing";
         assert_eq!(classify(err), DenialTier::KyuubiRowFilterBug);
+    }
+
+    /// spark-sql logs this on every run and it is not a failure. Before the
+    /// exit-code gate, a SUCCESSFUL read was reported as a failure because the
+    /// line contains the word "Exception".
+    #[test]
+    fn the_unix_group_lookup_warning_is_not_a_failure() {
+        let noisy = "26/08/06 09:33:55 WARN ShellBasedUnixGroupsMapping: unable to \
+                     return groups for user carol\n\
+                     PartialGroupNameException The user name 'carol' is not found.\n\
+                     EU\nUS";
+        assert_eq!(classify(noisy), DenialTier::None);
     }
 
     #[test]
