@@ -124,21 +124,61 @@ sed -e "s|localhost:26080|localhost:${RANGER_PORT:-26080}|g" \
     "$ROOT_DIR/tests/sqe-ranger-test.toml" > "$RESOLVED_CONFIG"
 echo "  config: $RESOLVED_CONFIG"
 
-# Scope the filter to this module. A bare substring under `--ignored` would match
-# ignored tests in OTHER modules of the same `it` binary and force-run them
-# against a stack they do not expect.
-FILTER="spark_access_control_e2e"
+# Two modules: object-level gates, then cross-engine fine-grained parity. Each is
+# filtered by its own MODULE NAME, one cargo invocation apiece.
+#
+# A bare substring like `spark_` would be wrong, not merely broad: under
+# `--ignored` it also matches `spark_reads_sqe_mor_updated_table` and
+# `spark_reads_sqe_equality_delete_file`, which live in other modules and need the
+# separate `sqe-spark-iceberg` stack that scripts/spark-interop.sh brings up. They
+# would be force-run against THIS stack and fail for reasons that have nothing to
+# do with access control.
+MODULES="spark_access_control_e2e spark_mask_parity_e2e"
 if [ "$#" -gt 0 ]; then
-    FILTER="spark_access_control_e2e::$1"
+    # An explicit argument runs a single case. Accept either a bare test name or a
+    # module-qualified one.
+    case "$1" in
+        *::*) MODULES="$1" ;;
+        *)    MODULES="spark_access_control_e2e::$1 spark_mask_parity_e2e::$1" ;;
+    esac
 fi
 
 echo ""
-echo "Running Spark access-control e2e suite (filter: $FILTER)..."
 echo "Each assertion starts a JVM; expect minutes, not seconds."
-SQE_AC_E2E=1 \
-SQE_AC_CONFIG="$RESOLVED_CONFIG" \
-AC_RANGER_URL="$RANGER_URL" \
-RUST_LOG="${RUST_LOG:-sqe_coordinator=info,sqe_policy=debug,sqe_catalog=info,sqe_auth=info,warn}" \
-RUST_MIN_STACK="${RUST_MIN_STACK:-33554432}" \
-    cargo test -p sqe-coordinator --test it -- \
-    --ignored --test-threads=1 --nocapture "$FILTER"
+rc=0
+total_passed=0
+for filter in $MODULES; do
+    echo ""
+    echo "── Running filter: $filter"
+    # A single-case argument matches in only one of the two modules, so 0 tests
+    # there is expected and must not fail the run. What MUST fail is a filter that
+    # matches nothing anywhere -- a typo'd test name otherwise exits 0 with
+    # "0 passed", which reads exactly like success.
+    log="$(mktemp)"
+    if ! SQE_AC_E2E=1 \
+        SQE_AC_CONFIG="$RESOLVED_CONFIG" \
+        AC_RANGER_URL="$RANGER_URL" \
+        RUST_LOG="${RUST_LOG:-sqe_coordinator=info,sqe_policy=debug,sqe_catalog=info,sqe_auth=info,warn}" \
+        RUST_MIN_STACK="${RUST_MIN_STACK:-33554432}" \
+        cargo test -p sqe-coordinator --test it -- \
+        --ignored --test-threads=1 --nocapture "$filter" 2>&1 | tee "$log"; then
+        rc=1
+    fi
+    # `tee` is last in the pipe, so $? is tee's. Read the count from the report.
+    n="$(grep -oE 'test result: ok\. [0-9]+ passed' "$log" | grep -oE '[0-9]+' | head -1 || true)"
+    total_passed=$((total_passed + ${n:-0}))
+    grep -qE 'test result: FAILED' "$log" && rc=1
+    rm -f "$log"
+done
+
+if [ "$total_passed" -eq 0 ]; then
+    echo "" >&2
+    echo "ERROR: 0 tests ran across every filter ($MODULES)." >&2
+    echo "       A filter matching nothing exits 0 with '0 passed', which reads as" >&2
+    echo "       success. Check the test name." >&2
+    exit 1
+fi
+
+echo ""
+echo "Spark suites: $total_passed passed."
+exit $rc
