@@ -106,6 +106,7 @@ impl RangerAdmin {
     pub async fn bootstrap(&self) -> anyhow::Result<usize> {
         self.ensure_tag_rowfilter_support().await?;
         self.ensure_services().await?;
+        self.clear_projected_tag_resources().await?;
         self.delete_test_policies().await
     }
 
@@ -341,6 +342,77 @@ impl RangerAdmin {
             );
         }
         Ok(())
+    }
+
+    /// Delete every projected tag ASSOCIATION for the test-owned frontend service.
+    ///
+    /// Ranger's tag store is global and PERSISTS across runs, and the fixture's
+    /// policy cleanup does not touch it. Without this, a run that projected an
+    /// association leaves it behind, and the next run's tag-parity test passes from
+    /// the STALE association even with projection disabled. Verified: the parity
+    /// test passed with `project-tags = false` until this was added, which made it
+    /// prove nothing.
+    ///
+    /// Tag DEFINITIONS are left alone. They are global vocabulary shared with the
+    /// demo, and a definition with no association grants nothing.
+    async fn clear_projected_tag_resources(&self) -> anyhow::Result<()> {
+        let resp = self
+            .req(reqwest::Method::GET, "/service/tags/resources")
+            .send()
+            .await
+            .context("GET tag resources")?;
+        if !resp.status().is_success() {
+            // A Ranger without the tag store reachable is not a reason to fail
+            // every test; the parity test will fail on its own if it matters.
+            return Ok(());
+        }
+        let _ = resp;
+
+        // Delete via the BULK import with `op: delete`, feeding back Ranger's own
+        // download document. `DELETE /service/tags/resource/{id}` answers 500 while
+        // the resource still carries an association, so the obvious per-resource
+        // loop silently does nothing.
+        let bundle = self.download_tag_bundle(HIVE_SERVICE).await?;
+        let has_resources = bundle
+            .get("serviceResources")
+            .and_then(Value::as_array)
+            .is_some_and(|r| !r.is_empty());
+        if !has_resources {
+            return Ok(());
+        }
+        let mut doc = bundle;
+        doc["op"] = Value::String("delete".to_string());
+        let resp = self
+            .req(reqwest::Method::PUT, "/service/tags/importservicetags")
+            .json(&doc)
+            .send()
+            .await
+            .context("PUT importservicetags op=delete")?;
+        if !resp.status().is_success() {
+            bail!(
+                "clearing projected tag associations on {HIVE_SERVICE} -> HTTP {}: {}",
+                resp.status(),
+                resp.text().await.unwrap_or_default()
+            );
+        }
+        Ok(())
+    }
+
+    /// Ranger's tag bundle for a resource service, the same document its plugins
+    /// download.
+    async fn download_tag_bundle(&self, service: &str) -> anyhow::Result<Value> {
+        let resp = self
+            .req(
+                reqwest::Method::GET,
+                &format!("/service/tags/download/{service}"),
+            )
+            .send()
+            .await
+            .context("GET tag bundle")?;
+        if !resp.status().is_success() {
+            bail!("GET tag bundle for {service} -> HTTP {}", resp.status());
+        }
+        resp.json().await.context("decode tag bundle")
     }
 
     /// True when the object-level defer item is present on the frontend service.
