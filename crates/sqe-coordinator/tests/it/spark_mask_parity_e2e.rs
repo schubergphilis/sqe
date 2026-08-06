@@ -718,10 +718,18 @@ async fn adding_a_column_to_a_masked_table_breaks_the_query_in_sqe() {
         .await
         .expect("ADD COLUMN");
 
-    // Projecting the new column ALONGSIDE the masked one fails. Retried, so a stale
-    // schema cannot be mistaken for the defect.
-    let err = crate::common::eventually(
-        "SQE to fail on the added column beside a masked one",
+    // TWO different errors are possible here and they mean opposite things:
+    //
+    //   "No field named nickname"  -> SQE's metadata cache has not picked up the new
+    //                                column yet. TRANSIENT, must be waited out.
+    //   "input schema only has N"  -> the rewritten plan and the scan schema disagree.
+    //                                The DEFECT.
+    //
+    // A retry that accepts the first error it sees cannot tell them apart, and reports
+    // whichever the timing produced. So wait until the stale-schema error is gone, and
+    // only then classify what is left.
+    let outcome = crate::common::eventually(
+        "SQE's schema cache to catch up with ADD COLUMN",
         || async {
             match ctx
                 .handler
@@ -732,20 +740,27 @@ async fn adding_a_column_to_a_masked_table_breaks_the_query_in_sqe() {
                 )
                 .await
             {
-                Err(e) => Ok(e.to_string()),
-                Ok(b) => Err(format!(
-                    "the query SUCCEEDED with {} rows. If ADD COLUMN beside a mask now \
-                     works, this defect is FIXED: delete this test and update the \
-                     access-control matrix.",
-                    total_rows(&b)
-                )),
+                Ok(b) => Ok(format!("SUCCESS with {} rows", total_rows(&b))),
+                Err(e) => {
+                    let msg = e.to_string();
+                    if msg.contains("No field named nickname") {
+                        // Still stale. Keep waiting.
+                        Err(format!("schema not refreshed yet: {msg}"))
+                    } else {
+                        Ok(msg)
+                    }
+                }
             }
         },
     )
     .await;
+
     assert!(
-        err.contains("input schema only has") || err.contains("PhysicalExpr"),
-        "expected the plan/scan schema mismatch, got: {err}"
+        outcome.contains("input schema only has") || outcome.contains("PhysicalExpr"),
+        "Once the schema cache caught up, expected the plan/scan mismatch that makes a \
+         masked table unqueryable after ADD COLUMN. Got: {outcome}\n\
+         If this now says SUCCESS the defect is FIXED: delete this test and update the \
+         access-control matrix."
     );
 }
 
