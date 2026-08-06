@@ -61,7 +61,7 @@ Polaris 1.7, Spark 3.5.9 with Kyuubi Authz 1.11.1 shaded, Iceberg 1.8.1.
 - Produces: a Ranger service instance named `query`, type `hive`, `tagService: tag`, carrying a policy named `defer-object-level-to-polaris`.
 - Consumes: nothing.
 
-- [ ] **Step 1: Find every reference so none is missed**
+- [x] **Step 1: Find every reference so none is missed**
 
 ```bash
 grep -rn 'service.name.*hive\|service-name = "hive"\|"service": *"hive"\|"hive"' \
@@ -71,7 +71,7 @@ grep -rn 'service.name.*hive\|service-name = "hive"\|"service": *"hive"\|"hive"'
 
 Expected: hits in the 10 files listed above. `sqe_ac_hive` is the test-owned service and must NOT be renamed.
 
-- [ ] **Step 2: Rename the service instance in the bootstrap**
+- [x] **Step 2: Rename the service instance in the bootstrap**
 
 In `quickstart/polaris-ranger-keycloak/ranger/bootstrap-ranger.sh`, the service creation currently posts `{"name":"hive","type":"hive",...}`. Change the name only, and attach the tag service:
 
@@ -81,7 +81,7 @@ In `quickstart/polaris-ranger-keycloak/ranger/bootstrap-ranger.sh`, the service 
 
 Then change every seeded policy's `"service":"hive"` to `"service":"query"`.
 
-- [ ] **Step 3: Seed the defer policy**
+- [x] **Step 3: Seed the defer policy**
 
 Append to the same bootstrap, after the other policy posts. The comment is required: read
 out of context the policy says "everyone may select everything".
@@ -137,7 +137,7 @@ EOF
 post_hive_policy /tmp/query-defer.json
 ```
 
-- [ ] **Step 4: Point both engines at the renamed service**
+- [x] **Step 4: Point both engines at the renamed service**
 
 `quickstart/polaris-ranger-keycloak/spark/ranger-spark-security.xml`:
 
@@ -158,7 +158,7 @@ service-name = "query"
 Update the surrounding comments in both files: they currently say the name must match
 the `hive` service created by the bootstrap.
 
-- [ ] **Step 5: Update the remaining references**
+- [x] **Step 5: Update the remaining references**
 
 Mechanical, in `test.sh`, `parity-test.sh` (5 references), `OVERVIEW.md`,
 `polaris-ranger-service-principal/ranger/bootstrap-ranger.sh`,
@@ -166,7 +166,7 @@ Mechanical, in `test.sh`, `parity-test.sh` (5 references), `OVERVIEW.md`,
 to the architecture description with the same reasoning as Step 3, and add the standing
 constraint: any engine reading `query` must also authorize through Polaris.
 
-- [ ] **Step 6: Verify against the live stack**
+- [x] **Step 6: Verify against the live stack**
 
 ```bash
 cd quickstart/polaris-ranger-keycloak
@@ -189,7 +189,7 @@ curl -s -u "admin:${RANGER_ADMIN_PASSWORD:-rangerR0cks!}" \
 
 Expected: includes `defer-object-level-to-polaris`.
 
-- [ ] **Step 7: Prove the rename did not break fine-grained enforcement**
+- [x] **Step 7: Prove the rename did not break fine-grained enforcement**
 
 ```bash
 docker compose up -d --wait sqe spark
@@ -199,7 +199,7 @@ docker compose up -d --wait sqe spark
 Expected: PASS. Both engines still apply the ssn mask byte-identically, now through
 `query`. A failure here means the rename missed a reference.
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 git add quickstart/ scripts/access-control-demo.sh docs/site/book/src/design-notes/ranger-access-control.md docs/site/book/src/features/access-control-tutorial.md docs/site/book/src/features/fine-grained-access-control.md
@@ -229,7 +229,7 @@ types 1 and 2 and are unaffected."
 - Produces: `spark_sql(session, hadoop_user, sql) -> SparkOutcome`, `SparkOutcome::rows()`, `SparkOutcome::tier()`, `DenialTier`, and a pure `classify(&str) -> DenialTier`.
 - Consumes: `sqe_core::Session::access_token()`, which returns `&SecretString` (needs `expose_secret()`).
 
-- [ ] **Step 1: Write the failing unit tests for the classifier**
+- [x] **Step 1: Write the failing unit tests for the classifier**
 
 The classifier is the part that must not be wrong, and it needs no Docker. Add to
 `spark_runner.rs`:
@@ -286,7 +286,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run them to verify they fail**
+- [x] **Step 2: Run them to verify they fail**
 
 ```bash
 cd /Users/jjverhoeks/git/schuberg/vpf-data-ai/chameleon/Applications/sqlengine
@@ -295,7 +295,7 @@ RUST_MIN_STACK=33554432 cargo test -p sqe-coordinator --test it spark_runner 2>&
 
 Expected: compile error, `classify` not found.
 
-- [ ] **Step 3: Implement the runner**
+- [x] **Step 3: Implement the runner**
 
 ```rust
 //! Runs `spark-sql` inside the quickstart's `spark` container and attributes any
@@ -475,7 +475,7 @@ fn compose_file() -> String {
 
 Add `pub mod spark_runner;` to `crates/sqe-coordinator/tests/it/common/mod.rs`.
 
-- [ ] **Step 4: Run the unit tests to verify they pass**
+- [x] **Step 4: Run the unit tests to verify they pass**
 
 ```bash
 RUST_MIN_STACK=33554432 cargo test -p sqe-coordinator --test it spark_runner 2>&1 | tail -12
@@ -483,13 +483,13 @@ RUST_MIN_STACK=33554432 cargo test -p sqe-coordinator --test it spark_runner 2>&
 
 Expected: 5 passed.
 
-- [ ] **Step 5: Mutation-check the classifier**
+- [x] **Step 5: Mutation-check the classifier**
 
 Swap the `AccessControlException` and `ForbiddenException` branches so Kyuubi denials
 classify as Polaris. Re-run. `the_two_denials_are_never_confused` MUST fail. Revert.
 A classifier that cannot tell the tiers apart makes every later assertion vacuous.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add crates/sqe-coordinator/tests/it/common/spark_runner.rs crates/sqe-coordinator/tests/it/common/mod.rs
@@ -516,14 +516,14 @@ The suite owns `sqe_ac_hive`, not the quickstart's `query`, so Task 1's bootstra
 not cover it. Without the defer policy, every Spark object-level test fails with a
 Kyuubi denial.
 
-- [ ] **Step 1: Add the seeding call inside `bootstrap()`**
+- [x] **Step 1: Add the seeding call inside `bootstrap()`**
 
 After the block that creates `HIVE_SERVICE` and links `TAG_SERVICE`, add a
 `policyType-0` blanket allow named `{PREFIX}defer-object-level-to-polaris`, with the same
 9 access types and the same explanatory comment as Task 1 Step 3, posted idempotently the
 way the fixture posts its other policies.
 
-- [ ] **Step 2: Verify it lands**
+- [x] **Step 2: Verify it lands**
 
 ```bash
 scripts/access-control-test.sh ranger_wiring_smoke 2>&1 | tail -5
@@ -535,7 +535,7 @@ curl -s -u "admin:${RANGER_ADMIN_PASSWORD:-rangerR0cks!}" \
 
 Expected: a `policyType` 0 entry whose name ends `defer-object-level-to-polaris`.
 
-- [ ] **Step 3: Verify the SQE suite is unaffected**
+- [x] **Step 3: Verify the SQE suite is unaffected**
 
 ```bash
 RUST_MIN_STACK=33554432 scripts/access-control-test.sh 2>&1 | tail -6
@@ -545,7 +545,7 @@ Expected: 31 passed, 0 failed. SQE ignores `policyType-0`, so adding one must ch
 nothing. A failure means SQE does read them after all, which would invalidate the whole
 defer approach and must stop the plan.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add crates/sqe-coordinator/tests/it/common/ranger_fixture.rs
@@ -572,7 +572,7 @@ still passes 31/31, which is what proves SQE really does ignore policyType-0."
 Grants are issued through SQE (`ctx.handler.execute(&ctx.carol, "GRANT ...")`), then
 asserted through Spark. One grant path, two engines, which is the parity being tested.
 
-- [ ] **Step 1: Write the first test, the guard, and watch it fail**
+- [x] **Step 1: Write the first test, the guard, and watch it fail**
 
 ```rust
 //! Object-level access control for Spark against the same Polaris catalog and
@@ -638,7 +638,7 @@ async fn object_denial_survives_the_frontend_defer_policy() {
 `pub(crate) async fn ac_setup_for_spark()` there that reuses the same body, rather than
 copying the fixture. Add `mod spark_access_control_e2e;` to `main.rs`.
 
-- [ ] **Step 2: Run and confirm both fail for the right reason**
+- [x] **Step 2: Run and confirm both fail for the right reason**
 
 ```bash
 RUST_MIN_STACK=33554432 scripts/spark-access-control-test.sh spark_denied_before_any_grant 2>&1 | tail -20
@@ -648,7 +648,7 @@ Expected before Task 3's defer policy exists: a panic naming a Kyuubi denial. Th
 failure mode Task 3 removes, and seeing it here proves the assertion is not vacuous.
 With Task 3 in place: PASS.
 
-- [ ] **Step 3: Add the remaining read cases**
+- [x] **Step 3: Add the remaining read cases**
 
 Same shape. For each, issue the grant through SQE as `carol`, wait with
 `crate::common::eventually_within` (Polaris polls Ranger; 120s budget as the SQE suite
@@ -664,7 +664,7 @@ uses), then assert through Spark.
 | `spark_namespace_listing_requires_namespace_list` | no `namespace-list` grant | `SHOW NAMESPACES IN ac` refused |
 | `spark_view_read_requires_view_access_types` | grant `view-*` but not `table-*` on a view | view reads, base table does not |
 
-- [ ] **Step 4: Run the read half**
+- [x] **Step 4: Run the read half**
 
 ```bash
 RUST_MIN_STACK=33554432 scripts/spark-access-control-test.sh 2>&1 | tail -15
@@ -672,7 +672,7 @@ RUST_MIN_STACK=33554432 scripts/spark-access-control-test.sh 2>&1 | tail -15
 
 Expected: all read cases pass. Note the wall time; each `spark-sql` is a fresh JVM.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/sqe-coordinator/tests/it/spark_access_control_e2e.rs crates/sqe-coordinator/tests/it/main.rs crates/sqe-coordinator/tests/it/access_control_e2e.rs
@@ -695,7 +695,7 @@ proving the blanket defer policy grants no data access of its own."
 **Interfaces:**
 - Consumes: Task 4's fixture accessor and runner.
 
-- [ ] **Step 1: Write the write-separation test**
+- [x] **Step 1: Write the write-separation test**
 
 The measured denial op is `ADD_TABLE_SNAPSHOT`, not `LOAD_TABLE`: Polaris refuses at the
 snapshot commit. Asserting `LOAD_TABLE` here would fail.
@@ -750,7 +750,7 @@ async fn spark_write_privileges_are_separate_from_read() {
 `row_count` reads through SQE as `carol` so the count is never itself subject to the
 grant under test.
 
-- [ ] **Step 2: Add the identity-split test**
+- [x] **Step 2: Add the identity-split test**
 
 ```rust
 /// Documents a real property, not a bug to fix: the object tier verifies a JWT
@@ -766,7 +766,7 @@ Grant `SELECT` to `analyst` (alice) only, then run with alice's token and
 `HADOOP_USER_NAME=bob`. The read succeeds on alice's object rights. Assert the succeeding
 read and record in the test body that mask selection followed `bob`.
 
-- [ ] **Step 3: Run the whole suite**
+- [x] **Step 3: Run the whole suite**
 
 ```bash
 RUST_MIN_STACK=33554432 scripts/spark-access-control-test.sh 2>&1 | tail -15
@@ -774,7 +774,7 @@ RUST_MIN_STACK=33554432 scripts/spark-access-control-test.sh 2>&1 | tail -15
 
 Expected: all cases pass, 0 failed.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add crates/sqe-coordinator/tests/it/spark_access_control_e2e.rs
@@ -796,7 +796,7 @@ with another's masks."
 - Create: `scripts/spark-access-control-test.sh`
 - Modify: `Makefile`
 
-- [ ] **Step 1: Write the script**
+- [x] **Step 1: Write the script**
 
 Copy `scripts/access-control-test.sh` and change: add `spark` to the `--wait` service
 list, keep the existing two-phase bring-up and `wait_oneshot` logic verbatim, and run
@@ -804,7 +804,7 @@ list, keep the existing two-phase bring-up and `wait_oneshot` logic verbatim, an
 ports from the stack's own `.env`, as the original does: a developer with
 `RANGER_PORT=46080` must not silently hit a different Ranger.
 
-- [ ] **Step 2: Add the target**
+- [x] **Step 2: Add the target**
 
 ```makefile
 # ── Spark access-control parity (Polaris + Ranger + Keycloak + Spark) ─────
@@ -816,7 +816,7 @@ test-access-control-spark:
 
 Add it to the `help` block alongside `test-access-control`.
 
-- [ ] **Step 3: Verify from a cold stack**
+- [x] **Step 3: Verify from a cold stack**
 
 ```bash
 cd quickstart/polaris-ranger-keycloak && docker compose down -v && cd -
@@ -826,7 +826,7 @@ make test-access-control-spark 2>&1 | tail -20
 Expected: stack comes up, suite passes. A cold run is the only way to catch a missing
 dependency in the bring-up list.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add scripts/spark-access-control-test.sh Makefile
@@ -846,21 +846,21 @@ stack, the only way a missing bring-up dependency shows up."
 - Modify: `docs/site/book/src/design-notes/ranger-access-control.md`
 - Modify: `README.md`, `nextsteps.md`
 
-- [ ] **Step 1: Record the five divergences in the matrix**
+- [x] **Step 1: Record the five divergences in the matrix**
 
 Identity assurance differs by tier; Polaris denial messages name principal and op;
 Kyuubi row filters need the filter column projected; named mask types render differently
 per engine; a refused write is refused at commit and can leave staged files. The tag gap
 stays listed as open until the projector lands, with its fail-open direction stated.
 
-- [ ] **Step 2: Add the two-tier section to the design note**
+- [x] **Step 2: Add the two-tier section to the design note**
 
 The identity routes, the defer policy and why it is not a hole, and the standing
 constraint that any engine reading the frontend service must also authorize through
 Polaris. While there, fix the stale section that still describes the deleted
 `map_sql_to_ranger_access` and `build_resource_map`.
 
-- [ ] **Step 3: Style gate**
+- [x] **Step 3: Style gate**
 
 ```bash
 grep -rn '—\|–\|→\|←\|▶' docs/site/book/src/features/access-control-matrix.md docs/site/book/src/design-notes/ranger-access-control.md
@@ -868,7 +868,7 @@ grep -rn '—\|–\|→\|←\|▶' docs/site/book/src/features/access-control-ma
 
 Expected: no output.
 
-- [ ] **Step 4: Update roadmap and next steps, then commit**
+- [x] **Step 4: Update roadmap and next steps, then commit**
 
 ```bash
 git add docs/site/book/src/features/access-control-matrix.md docs/site/book/src/design-notes/ranger-access-control.md README.md nextsteps.md
@@ -879,7 +879,7 @@ git commit -m "docs(access-control): Spark parity, the defer policy, and five di
 
 ### Task 8: Full verification and MR
 
-- [ ] **Step 1: Strict clippy**
+- [x] **Step 1: Strict clippy**
 
 ```bash
 cargo clippy --all-targets --all-features -- -D warnings 2>&1 | tail -5; echo "EXIT=$?"
@@ -888,20 +888,20 @@ cargo clippy --all-targets --all-features -- -D warnings 2>&1 | tail -5; echo "E
 Read the exit code from `$?` directly. zsh uses `pipestatus`, not bash's `PIPESTATUS`,
 so a `${PIPESTATUS[0]}` check prints nothing and tells you nothing.
 
-- [ ] **Step 2: Workspace suite**
+- [x] **Step 2: Workspace suite**
 
 ```bash
 RUST_MIN_STACK=33554432 cargo test --workspace --exclude sqe-cli 2>&1 | tail -8; echo "EXIT=$?"
 ```
 
-- [ ] **Step 3: Both e2e suites**
+- [x] **Step 3: Both e2e suites**
 
 ```bash
 RUST_MIN_STACK=33554432 scripts/access-control-test.sh 2>&1 | tail -4        # expect 31 passed
 RUST_MIN_STACK=33554432 scripts/spark-access-control-test.sh 2>&1 | tail -4  # expect all passed
 ```
 
-- [ ] **Step 4: Open the MR**
+- [x] **Step 4: Open the MR**
 
 ```bash
 git push -u origin feat/spark-ranger-access-control
@@ -912,6 +912,35 @@ Never `gh pr`: the canonical remote is GitLab, and `github` is a mirror that
 `git remote -v` lists first.
 
 ---
+
+## What execution changed
+
+Recorded because the tasks above are now a historical record, and two of them
+describe something that turned out to be impossible.
+
+1. **The defer item is not a named policy.** Tasks 1 and 3 specify posting
+   `defer-object-level-to-polaris`. Ranger refuses it: creating a hive-type service
+   auto-generates `all - database, table, column` over exactly the same resource
+   signature, and a second policy on it fails with
+   `error code[3010] Another policy already exists for matching resource`. Every
+   other wildcard shape is taken by a sibling auto policy. Shipped using the GRANT
+   API instead, which merges an item into the existing match, so the item appears
+   as the group `public` item on `all - database, table, column`. The intent lives
+   in the bootstrap comment and the design note rather than in a policy name.
+2. **The guard test had to check a different service than Task 3 implies.** Kyuubi
+   reads the service its container config names (`query`), not the test-owned
+   `sqe_ac_hive`. Two mutation rounds were needed to find it, and then a second
+   defect in the same check: asking only "does some policyType-0 grant public
+   select" is satisfied by Ranger's seeded `Information_schema` policy, so it
+   passed with the defer item revoked. The check now matches the wildcard resource.
+3. **Success is spark-sql's exit code**, not the absence of the word "Exception".
+   The runner as drafted called a successful read a failure, because spark-sql logs
+   a benign `PartialGroupNameException` on every run.
+4. **`ac_setup` needed two more revokes.** The Spark suite is the first to write
+   USER grants on `ORDERS`, and unrevoked they leaked into later tests.
+5. **Post-write assertions must be eventual.** The row count is read through SQE,
+   whose `TableMetadataCache` has a 30s TTL, so a bare assert reported "the INSERT
+   did not land" for a write that had.
 
 ## Follow-on plans, deliberately not in this one
 
