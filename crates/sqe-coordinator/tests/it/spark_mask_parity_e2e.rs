@@ -786,7 +786,8 @@ async fn adding_a_column_to_a_masked_table_keeps_it_queryable() {
         col_strings(&batches, "ssn")
     );
     assert!(
-        col_strings(&batches, "nickname").iter().all(|v| v.is_empty()),
+        // `fmt_val` renders a NULL as the literal "NULL".
+        col_strings(&batches, "nickname").iter().all(|v| v == "NULL"),
         "a column added after the data files were written reads as NULL, never as \
          another column's values. Got: {:?}",
         col_strings(&batches, "nickname")
