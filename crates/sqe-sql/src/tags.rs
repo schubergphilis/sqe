@@ -94,6 +94,93 @@ pub fn try_parse_set_tags(sql: &str) -> Result<Option<SetTagsStatement>> {
     Ok(None)
 }
 
+/// `ALTER TABLE t MODIFY COLUMN c SET MASKING POLICY p` and its `UNSET` form.
+///
+/// Snowflake's spelling for binding a named masking policy to a column. `policy`
+/// is `None` for `UNSET MASKING POLICY`, which Snowflake also writes without a
+/// name because a column carries at most one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MaskingPolicyOp {
+    pub table: String,
+    pub column: String,
+    /// `None` means detach whatever is attached.
+    pub policy: Option<String>,
+}
+
+/// Try to parse the masking-policy attach/detach DDL.
+///
+/// Separate from `try_parse_set_tags` because the two cannot be resolved at the
+/// same layer: a tag name is final at parse time, while a POLICY name has to be
+/// looked up in the policy store to find the tag it is keyed on. The parser has no
+/// store, so it hands the name onward.
+pub fn try_parse_masking_policy(sql: &str) -> Result<Option<MaskingPolicyOp>> {
+    let trimmed = sql.trim().trim_end_matches(';').trim();
+    let upper = trimmed.to_uppercase();
+    if !upper.starts_with("ALTER TABLE ") {
+        return Ok(None);
+    }
+    let after_at = trimmed["ALTER TABLE ".len()..].trim_start();
+    let (table, rest) = split_identifier(after_at)?;
+    let rest = rest.trim_start();
+    let rest_upper = rest.to_uppercase();
+
+    let after_col = if rest_upper.starts_with("MODIFY COLUMN ") {
+        &rest["MODIFY COLUMN ".len()..]
+    } else if rest_upper.starts_with("ALTER COLUMN ") {
+        &rest["ALTER COLUMN ".len()..]
+    } else {
+        return Ok(None);
+    };
+    let (column, rest2) = split_identifier(after_col)?;
+    let rest2 = rest2.trim_start();
+    let rest2_upper = rest2.to_uppercase();
+
+    // UNSET is checked FIRST. "SET MASKING POLICY" is a SUFFIX of
+    // "UNSET MASKING POLICY", so testing SET first matches the UNSET form and turns
+    // a detach into an attach -- silently, and in the unsafe direction. Unlike the
+    // POLICY/POLICIES pair in the classifier, where I once claimed an ordering
+    // hazard that did not exist, this one is real: swapping these two branches
+    // fails `unset_is_never_read_as_set` and `the_detach_form_parses_...`.
+    if let Some(body) = strip_kw(rest2, &rest2_upper, "UNSET MASKING POLICY") {
+        let name = body.trim();
+        if !name.is_empty() {
+            // Snowflake allows naming the policy on a detach. The name is not
+            // needed (a column carries one policy) but it is still parsed, so a
+            // malformed one is an error rather than being ignored.
+            let (_named, _) = split_identifier(name)?;
+        }
+        return Ok(Some(MaskingPolicyOp {
+            table,
+            column,
+            policy: None,
+        }));
+    }
+    if let Some(body) = strip_kw(rest2, &rest2_upper, "SET MASKING POLICY") {
+        // Checked BEFORE split_identifier, whose own error names "SET TAGS" --
+        // accurate for the forms it was written for, misleading here. A caller who
+        // forgot the name should be told how to find one.
+        if body.trim().is_empty() {
+            return Err(SqeError::Execution(
+                "SET MASKING POLICY needs a policy name. Run SHOW MASKING POLICIES \
+                 to see what is available."
+                    .to_string(),
+            ));
+        }
+        let (name, _) = split_identifier(body)?;
+        return Ok(Some(MaskingPolicyOp {
+            table,
+            column,
+            policy: Some(name),
+        }));
+    }
+    Ok(None)
+}
+
+/// Strip a case-insensitive keyword prefix, returning the remainder.
+fn strip_kw<'a>(s: &'a str, upper: &str, keyword: &str) -> Option<&'a str> {
+    upper.starts_with(keyword).then(|| &s[keyword.len()..])
+}
+
 /// Read a leading (possibly dotted/quoted) identifier; return (cleaned, rest).
 /// `"a"."b"` and `a.b` both yield `a.b`. Quotes are stripped, dots preserved.
 fn split_identifier(s: &str) -> Result<(String, &str)> {
@@ -425,5 +512,98 @@ mod tests {
             err.to_string().contains("unterminated"),
             "error must mention the unterminated quote, got: {err}"
         );
+    }
+}
+
+#[cfg(test)]
+mod masking_policy_parse_tests {
+    use super::*;
+
+    #[test]
+    fn the_snowflake_attach_form_parses() {
+        for sql in [
+            "ALTER TABLE c.ns.t MODIFY COLUMN ssn SET MASKING POLICY mask_ssn",
+            "alter table c.ns.t alter column ssn set masking policy mask_ssn;",
+            "ALTER TABLE \"c\".\"ns\".\"t\" MODIFY COLUMN \"ssn\" SET MASKING POLICY \"mask_ssn\"",
+        ] {
+            let op = try_parse_masking_policy(sql)
+                .expect(sql)
+                .unwrap_or_else(|| panic!("not parsed: {sql}"));
+            assert_eq!(op.table, "c.ns.t", "{sql}");
+            assert_eq!(op.column, "ssn", "{sql}");
+            assert_eq!(op.policy.as_deref(), Some("mask_ssn"), "{sql}");
+        }
+    }
+
+    #[test]
+    fn the_detach_form_parses_with_and_without_a_name() {
+        for sql in [
+            "ALTER TABLE c.ns.t MODIFY COLUMN ssn UNSET MASKING POLICY",
+            "ALTER TABLE c.ns.t MODIFY COLUMN ssn UNSET MASKING POLICY mask_ssn",
+        ] {
+            let op = try_parse_masking_policy(sql).expect(sql).expect(sql);
+            assert_eq!(op.policy, None, "{sql}: UNSET always detaches");
+            assert_eq!(op.column, "ssn");
+        }
+    }
+
+    /// THE ordering test. "SET MASKING POLICY" is a SUFFIX of
+    /// "UNSET MASKING POLICY", so checking SET first matches the UNSET input and
+    /// turns a detach into an attach: it would leave the column masked when the
+    /// caller asked to unmask, or attach a garbage policy name.
+    ///
+    /// Mutation-verified: forcing the SET branch to be evaluated first fails this
+    /// test and `the_detach_form_parses_with_and_without_a_name`.
+    #[test]
+    fn unset_is_never_read_as_set() {
+        let op = try_parse_masking_policy(
+            "ALTER TABLE c.ns.t MODIFY COLUMN ssn UNSET MASKING POLICY",
+        )
+        .expect("parse")
+        .expect("recognised");
+        assert_eq!(op.policy, None, "UNSET must detach, never attach");
+    }
+
+    #[test]
+    fn an_attach_with_no_policy_name_is_an_error() {
+        let err = try_parse_masking_policy("ALTER TABLE c.ns.t MODIFY COLUMN ssn SET MASKING POLICY")
+            .expect_err("a name is required");
+        assert!(
+            err.to_string().contains("SHOW MASKING POLICIES"),
+            "the error should point at how to find a name, got: {err}"
+        );
+    }
+
+    /// Not ours: fall through to sqlparser rather than erroring.
+    #[test]
+    fn unrelated_alter_statements_are_not_claimed() {
+        for sql in [
+            "ALTER TABLE c.ns.t ADD COLUMN x VARCHAR",
+            "ALTER TABLE c.ns.t MODIFY COLUMN ssn SET TAG pii = 'true'",
+            "ALTER TABLE c.ns.t RENAME COLUMN a TO b",
+            "SELECT 1",
+        ] {
+            assert_eq!(
+                try_parse_masking_policy(sql).expect(sql),
+                None,
+                "{sql} must not be claimed as a masking-policy statement"
+            );
+        }
+    }
+
+    /// The tag parser must not claim the masking-policy forms either, or the
+    /// classifier would route them to the tag handler with "MASKING" as a tag name.
+    #[test]
+    fn the_tag_parser_does_not_claim_the_masking_policy_forms() {
+        for sql in [
+            "ALTER TABLE c.ns.t MODIFY COLUMN ssn SET MASKING POLICY mask_ssn",
+            "ALTER TABLE c.ns.t MODIFY COLUMN ssn UNSET MASKING POLICY",
+        ] {
+            assert!(
+                matches!(try_parse_set_tags(sql), Ok(None)),
+                "{sql}: the tag parser claimed a masking-policy statement: {:?}",
+                try_parse_set_tags(sql)
+            );
+        }
     }
 }
