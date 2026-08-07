@@ -2824,3 +2824,127 @@ async fn deny_still_requires_an_admin_role_under_ranger_delegate() {
         let _ = ctx.handler.execute(&ctx.carol, &stmt, None).await;
     }
 }
+
+/// `SHOW MASKING POLICIES` against a live Ranger, end to end.
+///
+/// The unit tests cover the parse and the bundle-to-rows mapping. What they cannot
+/// cover is whether the statement reads the policy an operator actually WROTE, and
+/// that is the only claim the statement makes.
+///
+/// Two policies are created and the assertions are deliberately asymmetric:
+/// the listing must CONTAIN one and the name filter must EXCLUDE the other. A test
+/// that only checks "the list is non-empty" passes on Ranger's own seeded policies
+/// without the statement working at all, which is the shape that already let one
+/// guard test through in this suite.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs quickstart/polaris-ranger-keycloak; run scripts/access-control-test.sh"]
+async fn show_masking_policies_lists_what_ranger_holds() {
+    ac_gate!();
+    let _guard = crate::common::serial().lock().await;
+    let ctx = ac_setup().await;
+
+    let ssn_policy = format!("{PREFIX}show-mask-ssn");
+    let email_policy = format!("{PREFIX}show-mask-email");
+    ctx.ranger
+        .create_policy(hive_mask_policy(
+            &ssn_policy,
+            "ssn",
+            serde_json::json!({
+                "dataMaskType": "CUSTOM",
+                "valueExpr": "concat('xxx-xx-', substr({col},8,4))",
+            }),
+        ))
+        .await
+        .expect("create the ssn mask");
+    ctx.ranger
+        .create_policy(hive_mask_policy(
+            &email_policy,
+            "email",
+            serde_json::json!({"dataMaskType": "MASK_NULL"}),
+        ))
+        .await
+        .expect("create the email mask");
+
+    // Ranger's policy bundle is polled, so the statement can legitimately answer
+    // before the new policies are in the downloaded version.
+    let rows = crate::common::eventually("both new mask policies to reach the bundle", || async {
+        let batches = ctx
+            .handler
+            .execute(&ctx.carol, "SHOW MASKING POLICIES", None)
+            .await
+            .map_err(|e| format!("{e}"))?;
+        let names = col_strings(&batches, "name");
+        if names.contains(&ssn_policy) && names.contains(&email_policy) {
+            Ok(batches)
+        } else {
+            Err(format!("not visible yet: {names:?}"))
+        }
+    })
+    .await;
+
+    // The row for the ssn policy must carry the resource and the expression, not
+    // just the name. Listing names alone would not tell an auditor anything they
+    // could act on.
+    let idx = col_strings(&rows, "name")
+        .iter()
+        .position(|n| n == &ssn_policy)
+        .expect("the ssn policy is in the listing");
+    assert_eq!(col_strings(&rows, "database")[idx], "ac");
+    assert_eq!(col_strings(&rows, "table")[idx], "orders");
+    assert_eq!(col_strings(&rows, "column")[idx], "ssn");
+    assert_eq!(col_strings(&rows, "mask_type")[idx], "CUSTOM");
+    assert_eq!(
+        col_strings(&rows, "expression")[idx],
+        "concat('xxx-xx-', substr({col},8,4))"
+    );
+    assert_eq!(col_strings(&rows, "grantees")[idx], "ROLE engineer");
+
+    // The name filter must EXCLUDE. Asserting only that the named policy is present
+    // would pass on an unfiltered listing.
+    let filtered = ctx
+        .handler
+        .execute(
+            &ctx.carol,
+            &format!("SHOW MASKING POLICY \"{ssn_policy}\""),
+            None,
+        )
+        .await
+        .expect("filtered listing");
+    let filtered_names = col_strings(&filtered, "name");
+    assert_eq!(
+        filtered_names,
+        vec![ssn_policy.clone()],
+        "the name filter must return exactly the named policy and drop every other \
+         one, including {email_policy}"
+    );
+}
+
+/// The statement is ADMIN-ONLY, live.
+///
+/// The listing is a map of where the sensitive columns are. Someone who cannot read
+/// `orders.ssn` must not learn that `orders.ssn` is the column worth masking.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs quickstart/polaris-ranger-keycloak; run scripts/access-control-test.sh"]
+async fn show_masking_policies_is_refused_for_a_non_admin() {
+    ac_gate!();
+    let _guard = crate::common::serial().lock().await;
+    let ctx = ac_setup().await;
+
+    let err = ctx
+        .handler
+        .execute(&ctx.bob, "SHOW MASKING POLICIES", None)
+        .await
+        .expect_err("bob is not an admin and must be refused");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("SHOW MASKING POLICIES"),
+        "the refusal must name the statement, got: {msg}"
+    );
+
+    // Control: the same statement works for carol on this handler, so the refusal
+    // above is the admin gate and not a broken backend.
+    ctx.handler
+        .execute(&ctx.carol, "SHOW MASKING POLICIES", None)
+        .await
+        .expect("carol is an admin");
+}
