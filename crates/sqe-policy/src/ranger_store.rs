@@ -1793,7 +1793,12 @@ mod mask_policy_listing_tests {
          "rowFilterPolicyItems":[{"roles":["engineer"],
            "rowFilterInfo":{"filterExpr":"region = 'EU'"}}]},
         {"id":4,"name":"access-orders","policyType":0,"isEnabled":true,
-         "resources":{"database":{"values":["sales"]}}}
+         "resources":{"database":{"values":["sales"]}}},
+        {"id":5,"name":"rowfilter-carrying-a-mask-item","policyType":2,"isEnabled":true,
+         "resources":{"database":{"values":["sales"]},"table":{"values":["orders"]},
+                      "column":{"values":["ssn"]}},
+         "dataMaskPolicyItems":[{"roles":["engineer"],
+           "dataMaskInfo":{"dataMaskType":"MASK_NULL"}}]}
       ]
     }"#;
 
@@ -1804,6 +1809,14 @@ mod mask_policy_listing_tests {
 
     /// Only policyType 1. A row filter or an access policy showing up under
     /// SHOW MASKING POLICIES would misreport what protects a column.
+    ///
+    /// The fixture includes a policyType-2 policy that ALSO carries
+    /// `dataMaskPolicyItems`, which is the only shape where the type check is the
+    /// thing doing the work. Without that entry this assertion was vacuous: a plain
+    /// row-filter policy has no mask items, so the loop emitted nothing for it
+    /// whether the type was checked or not, and removing the check changed no output.
+    /// Mutation-verified after adding it: dropping the guard makes
+    /// `rowfilter-carrying-a-mask-item` appear.
     #[test]
     fn only_data_mask_policies_are_listed() {
         let all = listed();

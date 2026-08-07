@@ -470,6 +470,10 @@ pub fn parse_and_classify(sql: &str) -> sqe_core::Result<StatementKind> {
     // Both spellings are accepted because operators type both, and refusing the
     // singular for a list (or vice versa) is a pointless papercut. The plural with a
     // name is also fine: the name simply filters.
+    //
+    // The order here is cosmetic, not load-bearing: "POLICIES" is "POLIC" + "IES"
+    // and the singular prefix ends "POLICY", so they diverge at that character and
+    // neither prefix can swallow the other's input.
     for prefix in ["SHOW MASKING POLICIES", "SHOW MASKING POLICY"] {
         if let Some(rest) = strip_prefix_ci(trimmed, prefix) {
             let name = rest.trim().trim_end_matches(';').trim().trim_matches('"').to_string();
@@ -2385,10 +2389,17 @@ mod show_masking_policy_tests {
         }
     }
 
-    /// The plural prefix must be tried FIRST. Checked the other way round,
-    /// "SHOW MASKING POLICIES" strips as the singular and leaves a stray "IES" as
-    /// the policy name, so the list-all form silently becomes a filter that matches
-    /// nothing and reports an empty, reassuring result.
+    /// The plural form is never read as "singular plus a name".
+    ///
+    /// I first wrote this test believing the prefix ORDER was load-bearing, and that
+    /// checking the singular first would leave a stray "IES" as the policy name.
+    /// It cannot: "POLICIES" is "POLIC" + "IES" while the singular prefix ends
+    /// "POLICY", so the two diverge at that character and the singular prefix does
+    /// not match the plural input at all. Mutation-checked, and the mutation
+    /// SURVIVED, which is what exposed the wrong reasoning.
+    ///
+    /// The assertion is kept as a plain regression guard on the list-all form. The
+    /// order of the array above is cosmetic.
     #[test]
     fn the_plural_is_not_mistaken_for_a_singular_with_a_name() {
         assert!(matches!(
