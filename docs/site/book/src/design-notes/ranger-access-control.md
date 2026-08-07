@@ -724,6 +724,18 @@ reverts to the service account, at which point every access-control test passes
 for the wrong reason. Connecting as a service principal, which is the common
 Spark pattern, bypasses the object tier completely.
 
+**A per-user token governs ONLY the catalog it is attached to.** Any other catalog
+configured for the same warehouse in that session is a SEPARATE identity, and the
+caller chooses which one by naming it. Measured: with
+`spark.sql.catalog.sales_wh.credential` set to a service account, a user denied on a
+table through his own catalog reads the same table through that alias in the same
+session.
+
+The session cannot defend itself. Overriding the alias's `token` with the user's JWT
+does not help, because Iceberg prefers `credential` when both are set (measured). The
+fix is a deployment one: **remove the service-account catalog, do not shadow it.**
+Pinned by `a_service_account_catalog_in_the_session_defeats_per_user_identity`.
+
 Identity then reaches the two tiers by different routes, and the asymmetry is the
 most important property of the arrangement:
 
