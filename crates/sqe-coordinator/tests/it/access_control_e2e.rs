@@ -2824,3 +2824,123 @@ async fn deny_still_requires_an_admin_role_under_ranger_delegate() {
         let _ = ctx.handler.execute(&ctx.carol, &stmt, None).await;
     }
 }
+
+// ── Schema-change controls ───────────────────────────────────────────────────
+//
+// Two defects were found through the Spark parity suite, both after a DDL
+// statement on a table carrying a policy:
+//
+//   ADD COLUMN    -> `SELECT id, ssn, nickname` dies with "PhysicalExpr Column
+//                    references column 'nickname' at index 2 ... input schema only
+//                    has 2 columns"
+//   RENAME COLUMN -> `SELECT id, tax_id` returns ONE column, silently, no error
+//
+// Both were observed with a mask on the table, so both LOOK like plan-rewriter
+// defects. That inference is exactly what these two tests exist to test rather
+// than assume: same DDL, same query, NO policy of any kind. If the behaviour
+// reproduces here, the fault is in the scan or the metadata cache and a fix in
+// `sqe-policy` would be aimed at the wrong crate.
+
+/// CONTROL for `adding_a_column_to_a_masked_table_breaks_the_query_in_sqe`.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs quickstart/polaris-ranger-keycloak; run scripts/access-control-test.sh"]
+async fn control_add_column_with_no_policy_at_all() {
+    ac_gate!();
+    let _guard = crate::common::serial().lock().await;
+    let ctx = ac_setup().await;
+    grant_read_to_both_roles(&ctx).await;
+
+    exec_ok(
+        &ctx,
+        &ctx.carol,
+        &format!("ALTER TABLE {ORDERS} ADD COLUMN nickname VARCHAR"),
+    )
+    .await;
+
+    // Same wait-out-the-stale-schema shape as the masked test, so the two are
+    // comparable: only the presence of a policy differs.
+    let outcome = crate::common::eventually(
+        "SQE's schema cache to catch up with ADD COLUMN",
+        || async {
+            match ctx
+                .handler
+                .execute(
+                    &ctx.bob,
+                    &format!("SELECT id, ssn, nickname FROM {ORDERS} ORDER BY id"),
+                    None,
+                )
+                .await
+            {
+                Ok(b) => Ok(format!(
+                    "SUCCESS with {} rows and {} columns",
+                    total_rows(&b),
+                    b.first().map(|x| x.num_columns()).unwrap_or(0)
+                )),
+                Err(e) => {
+                    let msg = e.to_string();
+                    if msg.contains("No field named nickname") {
+                        Err(format!("schema not refreshed yet: {msg}"))
+                    } else {
+                        Ok(msg)
+                    }
+                }
+            }
+        },
+    )
+    .await;
+
+    assert!(
+        outcome.starts_with("SUCCESS with 3 rows and 3 columns"),
+        "WITHOUT a policy, ADD COLUMN followed by a query naming the new column must \
+         simply work. Got: {outcome}\n\
+         If this shows the same PhysicalExpr/index failure as the masked case, the \
+         defect is NOT in the plan rewriter and the fix belongs in the scan or the \
+         metadata cache."
+    );
+}
+
+/// CONTROL for `renaming_a_tagged_column_breaks_differently_in_each_engine`.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs quickstart/polaris-ranger-keycloak; run scripts/access-control-test.sh"]
+async fn control_rename_column_with_no_policy_at_all() {
+    ac_gate!();
+    let _guard = crate::common::serial().lock().await;
+    let ctx = ac_setup().await;
+    grant_read_to_both_roles(&ctx).await;
+
+    exec_ok(
+        &ctx,
+        &ctx.carol,
+        &format!("ALTER TABLE {ORDERS} RENAME COLUMN ssn TO tax_id"),
+    )
+    .await;
+
+    let rows = crate::common::eventually("SQE to serve the renamed column", || async {
+        match ctx
+            .handler
+            .execute(
+                &ctx.bob,
+                &format!("SELECT id, tax_id FROM {ORDERS} ORDER BY id"),
+                None,
+            )
+            .await
+        {
+            Ok(b) if total_rows(&b) == 3 => Ok(b),
+            Ok(b) => Err(format!("expected 3 rows, got {}", total_rows(&b))),
+            Err(e) => Err(format!("{e}")),
+        }
+    })
+    .await;
+
+    let cols = rows.first().map(|b| b.num_columns()).unwrap_or(0);
+    assert_eq!(
+        cols, 2,
+        "WITHOUT a policy, `SELECT id, tax_id` after RENAME COLUMN must return both \
+         columns. Getting one back means SQE drops a projected column after a rename \
+         regardless of access control, and the defect is not the tag association going \
+         stale. Values: {:?}",
+        rows.first().map(|b| (0..b.num_columns())
+            .map(|c| crate::common::fmt_val(b.column(c).as_ref(), 0))
+            .collect::<Vec<_>>())
+    );
+}
