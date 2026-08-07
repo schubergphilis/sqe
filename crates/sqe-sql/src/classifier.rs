@@ -10,7 +10,7 @@ use crate::attach::{
 use crate::ddl::{try_parse_ref_ddl, RefDdl};
 use crate::partition_evolution::{try_parse_partition_evolution, PartitionEvolution};
 use crate::procedures::{try_parse_call, ProcedureCall};
-use crate::tags::{try_parse_set_tags, SetTagsStatement};
+use crate::tags::{try_parse_masking_policy, try_parse_set_tags, MaskingPolicyOp, SetTagsStatement};
 
 /// Target for SHOW GRANTS statements.
 #[derive(Debug)]
@@ -153,6 +153,10 @@ pub enum StatementKind {
     /// `ALTER TABLE ... SET TAGS / UNSET TAGS` and the Snowflake-compatible
     /// `MODIFY|ALTER COLUMN ... SET TAG / UNSET TAG` column-tag authoring DDL.
     SetTags(Box<SetTagsStatement>),
+    /// `ALTER TABLE ... MODIFY|ALTER COLUMN <col> SET|UNSET MASKING POLICY <name>`.
+    /// Snowflake-compatible. Resolved against the policy store, not here: the
+    /// named policy has to be looked up to find the tag it is keyed on.
+    SetMaskingPolicy(Box<MaskingPolicyOp>),
     /// `ATTACH '<location>' AS <name> (TYPE <kind>, ...)` — register a new
     /// Iceberg catalog at runtime. sqlparser-rs has no native AST for the
     /// SQE/DuckDB option list, so this variant carries the pre-parsed
@@ -220,6 +224,7 @@ impl StatementKind {
             StatementKind::SetWriteBranch(_) => "setwritebranch",
             StatementKind::PartitionEvolution(_) => "partitionevolution",
             StatementKind::SetTags(_) => "settags",
+            StatementKind::SetMaskingPolicy(_) => "setmaskingpolicy",
             StatementKind::Attach(_) => "attach",
             StatementKind::Detach(_) => "detach",
             StatementKind::CreateSecret(_) => "create_secret",
@@ -516,6 +521,15 @@ pub fn parse_and_classify(sql: &str) -> sqe_core::Result<StatementKind> {
         // only Hive-style PARTITION (col=val), so we intercept here.
         if let Some(pe) = try_parse_partition_evolution(trimmed)? {
             return Ok(StatementKind::PartitionEvolution(Box::new(pe)));
+        }
+        // ALTER TABLE ... MODIFY|ALTER COLUMN ... SET|UNSET MASKING POLICY.
+        // Tried BEFORE the tag forms. The tag parser returns Ok(None) for these
+        // (asserted by `the_tag_parser_does_not_claim_the_masking_policy_forms`),
+        // so the order is not load-bearing today -- but keeping the more specific
+        // form first means a future loosening of the tag parser cannot silently
+        // capture a masking-policy statement.
+        if let Some(op) = try_parse_masking_policy(sql)? {
+            return Ok(StatementKind::SetMaskingPolicy(Box::new(op)));
         }
         // ALTER TABLE ... SET TAGS / UNSET TAGS / MODIFY|ALTER COLUMN ... SET TAG.
         // Column-tag authoring; distinct from Iceberg snapshot CREATE/DROP TAG above.

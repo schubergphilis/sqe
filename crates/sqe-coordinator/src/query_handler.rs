@@ -1102,6 +1102,13 @@ impl QueryHandler {
                     self.invalidate_policy_cache();
                     Ok(vec![])
                 }
+                StatementKind::SetMaskingPolicy(op) => {
+                    let stmt = self.masking_policy_to_tag_op(op).await?;
+                    self.catalog_ops.set_column_tags(session, &stmt).await?;
+                    crate::session_context::invalidate_session_cache(&session.user.username).await;
+                    self.invalidate_policy_cache();
+                    Ok(vec![])
+                }
                 StatementKind::RefDdl(ddl) => {
                     self.catalog_ops.apply_ref_ddl(session, ddl).await?;
                     crate::session_context::invalidate_session_cache(&session.user.username).await;
@@ -5120,6 +5127,110 @@ impl QueryHandler {
             policies.retain(|p| p.name.eq_ignore_ascii_case(want));
         }
         Self::mask_policies_to_record_batch(&policies)
+    }
+
+    /// Turn `SET MASKING POLICY p` into the equivalent column-tag operation.
+    ///
+    /// A named Ranger masking policy is not a free-floating definition you bind to a
+    /// column: it already carries its own resource. There are two shapes, and only
+    /// one can be attached to a column safely.
+    ///
+    /// A TAG policy is keyed on a tag and names no table, so "attach p to c" means
+    /// "give c the tag p is keyed on". One rule, many columns, no rewriting of the
+    /// policy. That is what this does, and it is also exactly Snowflake's semantics
+    /// for a masking policy: a reusable definition attached in many places.
+    ///
+    /// A RESOURCE policy names `database`/`table`/`column` explicitly. Attaching
+    /// would mean appending to those lists, and Ranger evaluates them as a CROSS
+    /// PRODUCT: adding `(db2, tbl2, col2)` to a policy holding `(db1, tbl1, col1)`
+    /// starts masking `db1.tbl2.col2` too. So the statement REFUSES for a resource
+    /// policy rather than silently widening a mask to tables nobody named. The
+    /// refusal explains the alternative instead of just saying no.
+    async fn masking_policy_to_tag_op(
+        &self,
+        op: &sqe_sql::tags::MaskingPolicyOp,
+    ) -> sqe_core::Result<sqe_sql::tags::SetTagsStatement> {
+        use sqe_sql::tags::{ColumnTagOp, SetTagsStatement, TagAction};
+
+        // UNSET needs no lookup: it clears every tag on the column, which is what
+        // `UNSET TAGS` with an empty list already means. Doing this before the store
+        // check keeps a detach working on a deployment whose backend cannot list
+        // policies, because taking protection OFF must never be blocked by an
+        // inability to enumerate what is ON.
+        let Some(policy_name) = op.policy.as_deref() else {
+            return Ok(SetTagsStatement {
+                table: op.table.clone(),
+                ops: vec![ColumnTagOp {
+                    column: op.column.clone(),
+                    tags: vec![],
+                    action: TagAction::Unset,
+                }],
+            });
+        };
+
+        let store = self.policy_store.as_ref().ok_or_else(|| {
+            SqeError::Execution(
+                "SET MASKING POLICY is not available: no policy backend is \
+                 configured. It needs [policy] engine = \"ranger\"."
+                    .to_string(),
+            )
+        })?;
+        let policies = store.list_mask_policies().await?;
+        let matching: Vec<_> = policies
+            .iter()
+            .filter(|p| p.name.eq_ignore_ascii_case(policy_name))
+            .collect();
+
+        if matching.is_empty() {
+            return Err(SqeError::Execution(format!(
+                "no masking policy named `{policy_name}`. \
+                 Run SHOW MASKING POLICIES to see what is available."
+            )));
+        }
+        // A policy can produce several rows (one per grantee item). They share the
+        // resource, so any row answers "which tag", but they must AGREE -- a name
+        // matching both a tag policy and a resource policy is ambiguous.
+        let tags: std::collections::BTreeSet<&str> = matching
+            .iter()
+            .map(|p| p.tag.as_str())
+            .filter(|t| !t.is_empty())
+            .collect();
+        if tags.is_empty() {
+            let target = matching
+                .iter()
+                .map(|p| format!("{}.{}.{}", p.database, p.table, p.column))
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(SqeError::Execution(format!(
+                "`{policy_name}` is a resource masking policy: it already names the \
+                 columns it covers ({target}), so it cannot be attached to another \
+                 one. Ranger evaluates a policy's database/table/column lists as a \
+                 cross product, so adding a column here would also mask unrelated \
+                 combinations of the values already listed.\n\
+                 Use a TAG-based masking policy for something you attach in several \
+                 places, or write a policy for this column directly."
+            )));
+        }
+        if tags.len() > 1 {
+            return Err(SqeError::Execution(format!(
+                "`{policy_name}` is keyed on more than one tag ({}), so attaching it \
+                 is ambiguous. Attach the tag you want with \
+                 ALTER TABLE ... MODIFY COLUMN ... SET TAG.",
+                tags.iter().copied().collect::<Vec<_>>().join(", ")
+            )));
+        }
+        let tag = tags.iter().next().expect("exactly one tag").to_string();
+
+        Ok(SetTagsStatement {
+            table: op.table.clone(),
+            ops: vec![ColumnTagOp {
+                column: op.column.clone(),
+                tags: vec![tag],
+                action: TagAction::Set,
+            }],
+        })
     }
 
     fn mask_policies_to_record_batch(
