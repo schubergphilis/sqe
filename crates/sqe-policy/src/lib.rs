@@ -156,8 +156,13 @@ pub struct MaskPolicyInfo {
     /// False when the policy is disabled in the console, in which case it is
     /// listed and does nothing.
     pub enabled: bool,
+    /// The TAG this policy is keyed on, for a tag-service mask policy. Empty for a
+    /// resource policy, and the two are mutually exclusive: a tag policy names a
+    /// tag and no table, a resource policy the reverse. So this field is also how a
+    /// reader tells the two kinds apart.
+    pub tag: String,
     /// Resource the policy covers. Comma-joined when the policy names several
-    /// values at a level, which Ranger allows.
+    /// values at a level, which Ranger allows. Empty for a tag policy.
     pub database: String,
     pub table: String,
     pub column: String,

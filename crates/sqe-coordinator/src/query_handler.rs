@@ -5127,6 +5127,7 @@ impl QueryHandler {
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         let schema = Arc::new(Schema::new(vec![
             Field::new("name", DataType::Utf8, false),
+            Field::new("tag", DataType::Utf8, false),
             Field::new("database", DataType::Utf8, false),
             Field::new("table", DataType::Utf8, false),
             Field::new("column", DataType::Utf8, false),
@@ -5137,6 +5138,7 @@ impl QueryHandler {
         ]));
 
         let mut name_b = StringBuilder::new();
+        let mut tag_b = StringBuilder::new();
         let mut db_b = StringBuilder::new();
         let mut tbl_b = StringBuilder::new();
         let mut col_b = StringBuilder::new();
@@ -5146,6 +5148,7 @@ impl QueryHandler {
         let mut enabled_b = arrow_array::builder::BooleanBuilder::new();
         for p in policies {
             name_b.append_value(&p.name);
+            tag_b.append_value(&p.tag);
             db_b.append_value(&p.database);
             tbl_b.append_value(&p.table);
             col_b.append_value(&p.column);
@@ -5159,6 +5162,7 @@ impl QueryHandler {
             schema,
             vec![
                 Arc::new(name_b.finish()) as ArrayRef,
+                Arc::new(tag_b.finish()) as ArrayRef,
                 Arc::new(db_b.finish()) as ArrayRef,
                 Arc::new(tbl_b.finish()) as ArrayRef,
                 Arc::new(col_b.finish()) as ArrayRef,

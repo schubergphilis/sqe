@@ -1726,7 +1726,22 @@ impl RangerStore {
 fn mask_policies_from_bundle(bundle: &ServicePolicies) -> Vec<crate::MaskPolicyInfo> {
     {
         let mut out = Vec::new();
-        for p in &bundle.policies {
+        // BOTH stores. A deployment can mask by naming the column directly
+        // (resource policies, in `bundle.policies`) or by tagging it (tag policies,
+        // in the linked tag service, which Ranger ships inside the same download as
+        // `bundle.tag_policies`).
+        //
+        // Walking only the first list is what this originally did, and it made
+        // `SHOW MASKING POLICIES` answer "nothing" on a deployment that masks
+        // entirely by tag. An empty listing reads as "nothing is masked here",
+        // which is the same failure the refusing trait default exists to avoid --
+        // just arrived at from the other direction.
+        let tag_policies = bundle
+            .tag_policies
+            .as_ref()
+            .map(|tp| tp.policies.as_slice())
+            .unwrap_or_default();
+        for p in bundle.policies.iter().chain(tag_policies) {
             if p.policy_type != POLICY_TYPE_DATAMASK {
                 continue;
             }
@@ -1745,6 +1760,10 @@ fn mask_policies_from_bundle(bundle: &ServicePolicies) -> Vec<crate::MaskPolicyI
                 out.push(crate::MaskPolicyInfo {
                     name: p.name.clone(),
                     enabled: p.is_enabled,
+                    // A tag policy names a tag and no table, so these are empty and
+                    // `tag` carries the binding. Which kind a row is is therefore
+                    // readable from the output rather than implied.
+                    tag: values("tag").join(", "),
                     database: values("database").join(", "),
                     table: values("table").join(", "),
                     column: values("column").join(", "),
@@ -1757,8 +1776,9 @@ fn mask_policies_from_bundle(bundle: &ServicePolicies) -> Vec<crate::MaskPolicyI
         // Stable order: by name, then by the resource it covers, so two runs of
         // SHOW MASKING POLICIES on an unchanged service produce identical output.
         out.sort_by(|a, b| {
-            (&a.name, &a.database, &a.table, &a.column, &a.grantees).cmp(&(
+            (&a.name, &a.tag, &a.database, &a.table, &a.column, &a.grantees).cmp(&(
                 &b.name,
+                &b.tag,
                 &b.database,
                 &b.table,
                 &b.column,
@@ -1799,12 +1819,73 @@ mod mask_policy_listing_tests {
                       "column":{"values":["ssn"]}},
          "dataMaskPolicyItems":[{"roles":["engineer"],
            "dataMaskInfo":{"dataMaskType":"MASK_NULL"}}]}
-      ]
+      ],
+      "tagPolicies": {
+        "serviceName": "sqe_tag",
+        "policies": [
+          {"id":10,"name":"mask-pii-tag","policyType":1,"isEnabled":true,
+           "resources":{"tag":{"values":["PII"]}},
+           "dataMaskPolicyItems":[{"roles":["engineer"],
+             "dataMaskInfo":{"dataMaskType":"hive:CUSTOM",
+                             "valueExpr":"concat('t', {col})"}}]},
+          {"id":11,"name":"tag-rowfilter","policyType":2,"isEnabled":true,
+           "resources":{"tag":{"values":["PII"]}},
+           "rowFilterPolicyItems":[{"roles":["engineer"],
+             "rowFilterInfo":{"filterExpr":"region = 'EU'"}}]}
+        ]
+      }
     }"#;
 
     fn listed() -> Vec<crate::MaskPolicyInfo> {
         let bundle: ServicePolicies = serde_json::from_str(BUNDLE).expect("parse bundle");
         mask_policies_from_bundle(&bundle)
+    }
+
+    /// TAG-based masks must be listed too.
+    ///
+    /// This is the one that was WRONG. `mask_policies_from_bundle` walked only
+    /// `bundle.policies`, so on a deployment that masks entirely by tag --
+    /// which is the pattern the tag projector exists to support --
+    /// `SHOW MASKING POLICIES` returned an empty listing. An operator reads that
+    /// as "nothing is masked here", which is exactly the failure the refusing
+    /// trait default was written to prevent, reached from the other side.
+    ///
+    /// The tag row carries the TAG and no table; a resource row the reverse. So
+    /// the two kinds are distinguishable in the output instead of a reader having
+    /// to infer which store a row came from.
+    #[test]
+    fn tag_based_masks_are_listed_with_their_tag() {
+        let all = listed();
+        let tagged: Vec<_> = all.iter().filter(|p| p.name == "mask-pii-tag").collect();
+        assert_eq!(
+            tagged.len(),
+            1,
+            "the tag-service mask policy is missing from the listing, so a \
+             tag-masked deployment would report nothing masked. Got: {:?}",
+            all.iter().map(|p| &p.name).collect::<Vec<_>>()
+        );
+        let row = tagged[0];
+        assert_eq!(row.tag, "PII");
+        assert_eq!(row.mask_type, "hive:CUSTOM");
+        assert_eq!(row.expression, "concat('t', {col})");
+        assert_eq!(row.grantees, "ROLE engineer");
+        // A tag policy names no table, and saying so is the point: a reader can
+        // tell it applies wherever the tag is, not to one column.
+        assert_eq!((row.database.as_str(), row.table.as_str(), row.column.as_str()), ("", "", ""));
+    }
+
+    /// A tag ROW FILTER is not a mask, in the tag store either.
+    ///
+    /// The resource-side equivalent is covered by `only_data_mask_policies_are_listed`.
+    /// The tag store needed its own case: the policyType guard now runs over a
+    /// chained iterator, and a guard that is correct for one arm of a chain is not
+    /// automatically correct for the other.
+    #[test]
+    fn a_tag_row_filter_is_not_listed_as_a_mask() {
+        assert!(
+            !listed().iter().any(|p| p.name == "tag-rowfilter"),
+            "a policyType-2 tag policy is a row filter, not a mask"
+        );
     }
 
     /// Only policyType 1. A row filter or an access policy showing up under
@@ -1817,11 +1898,14 @@ mod mask_policy_listing_tests {
     /// whether the type was checked or not, and removing the check changed no output.
     /// Mutation-verified after adding it: dropping the guard makes
     /// `rowfilter-carrying-a-mask-item` appear.
+    /// `mask-pii-tag` is here because it IS a policyType-1 mask, just one living in
+    /// the tag store. `tag-rowfilter` is absent for the same reason
+    /// `filter-orders-eu` is.
     #[test]
     fn only_data_mask_policies_are_listed() {
         let all = listed();
         let names: Vec<&str> = all.iter().map(|p| p.name.as_str()).collect();
-        assert_eq!(names, vec!["mask-multi", "mask-orders-ssn"]);
+        assert_eq!(names, vec!["mask-multi", "mask-orders-ssn", "mask-pii-tag"]);
     }
 
     #[test]
