@@ -2944,3 +2944,70 @@ async fn control_rename_column_with_no_policy_at_all() {
             .collect::<Vec<_>>())
     );
 }
+
+/// The worst of the three: a projection that matches NOTHING in the data file
+/// used to return a different column's values under the projected name.
+///
+/// Measured before the fix, on a table renamed after it was written:
+///
+/// ```text
+/// SELECT classified FROM scratch.ev
+///   +------------+
+///   | classified |
+///   | 7          |     <- these are `id`'s values
+///   | 8          |
+/// ```
+///
+/// The projected name matched no parquet column, the index list came out empty,
+/// and the empty list was read as "COUNT(*)", which reads parquet column 0 for a
+/// row count. That raw column was then emitted as data because the real COUNT(*)
+/// flag is computed from the projection being empty, which it was not.
+///
+/// Separate from `control_rename_column_with_no_policy_at_all` on purpose: that
+/// one projects `id` alongside the renamed column, so the index list is non-empty
+/// and this branch is never reached.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs quickstart/polaris-ranger-keycloak; run scripts/access-control-test.sh"]
+async fn a_projection_matching_no_file_column_never_returns_another_column() {
+    ac_gate!();
+    let _guard = crate::common::serial().lock().await;
+    let ctx = ac_setup().await;
+    grant_read_to_both_roles(&ctx).await;
+
+    exec_ok(
+        &ctx,
+        &ctx.carol,
+        &format!("ALTER TABLE {ORDERS} RENAME COLUMN ssn TO tax_id"),
+    )
+    .await;
+
+    let batches = crate::common::eventually("SQE to serve the renamed column alone", || async {
+        match ctx
+            .handler
+            .execute(&ctx.bob, &format!("SELECT tax_id FROM {ORDERS}"), None)
+            .await
+        {
+            Ok(b) if total_rows(&b) == 3 => Ok(b),
+            Ok(b) => Err(format!("expected 3 rows, got {}", total_rows(&b))),
+            Err(e) => Err(format!("{e}")),
+        }
+    })
+    .await;
+
+    assert_eq!(
+        batches.first().map(|b| b.num_columns()),
+        Some(1),
+        "one projected column, one column back"
+    );
+    let values = col_strings(&batches, "tax_id");
+    // The data file still stores the values under the old name, and the field id
+    // is unchanged, so the rename is transparent and the SSNs come back.
+    // What must never appear is `id`'s values (1, 2, 3), which is what the
+    // column-0 read produced.
+    assert!(
+        values.iter().all(|v| v.contains('-')),
+        "expected the ssn values under the new name, got {values:?}. Bare integers \
+         here mean the scan fell back to reading the file's first column and \
+         returned `id` under the name `tax_id`."
+    );
+}
