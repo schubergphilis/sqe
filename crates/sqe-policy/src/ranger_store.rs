@@ -1831,7 +1831,9 @@ mod mask_policy_listing_tests {
           {"id":11,"name":"tag-rowfilter","policyType":2,"isEnabled":true,
            "resources":{"tag":{"values":["PII"]}},
            "rowFilterPolicyItems":[{"roles":["engineer"],
-             "rowFilterInfo":{"filterExpr":"region = 'EU'"}}]}
+             "rowFilterInfo":{"filterExpr":"region = 'EU'"}}],
+           "dataMaskPolicyItems":[{"roles":["engineer"],
+             "dataMaskInfo":{"dataMaskType":"hive:MASK_NULL"}}]}
         ]
       }
     }"#;
@@ -1877,9 +1879,18 @@ mod mask_policy_listing_tests {
     /// A tag ROW FILTER is not a mask, in the tag store either.
     ///
     /// The resource-side equivalent is covered by `only_data_mask_policies_are_listed`.
-    /// The tag store needed its own case: the policyType guard now runs over a
-    /// chained iterator, and a guard that is correct for one arm of a chain is not
+    /// The tag store needs its own case because the policyType guard runs over a
+    /// chained iterator, and a guard that is correct for one arm is not
     /// automatically correct for the other.
+    ///
+    /// `tag-rowfilter` carries `dataMaskPolicyItems` as well as its row filter, and
+    /// that detail is the whole test. My first version left it with only a row
+    /// filter, and the mutation survived: with no mask items the loop emits nothing
+    /// for it whether the type is checked or not, so the assertion held for a reason
+    /// that had nothing to do with the guard. The comment on
+    /// `only_data_mask_policies_are_listed` warns about exactly this shape, in this
+    /// file, and I reproduced it anyway. Mutation-verified after the fixture change:
+    /// dropping the guard makes `tag-rowfilter` appear.
     #[test]
     fn a_tag_row_filter_is_not_listed_as_a_mask() {
         assert!(
