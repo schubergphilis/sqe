@@ -220,13 +220,19 @@ pub trait PolicyStore: Send + Sync {
 
     /// List the data-mask policies as WRITTEN in the backing store.
     ///
-    /// Powers `SHOW MASKING POLICIES`. The default is empty rather than an error, so
-    /// a backend without introspection (passthrough, in-memory) answers "nothing
-    /// configured" instead of failing the statement. A store that HAS mask policies
-    /// must override this, or the statement would under-report and read as a clean
-    /// bill of health.
+    /// Powers `SHOW MASKING POLICIES`. The default REFUSES rather than returning an
+    /// empty list, and the distinction matters more than it looks: an empty result is
+    /// indistinguishable from "no masks are configured", so a backend that simply
+    /// cannot answer would hand an auditor a clean bill of health. Refusing says
+    /// "this deployment cannot tell you", which is the truth.
+    ///
+    /// A backend gains the statement by overriding this. Only the Ranger store does.
     async fn list_mask_policies(&self) -> sqe_core::Result<Vec<MaskPolicyInfo>> {
-        Ok(Vec::new())
+        Err(sqe_core::SqeError::Execution(
+            "SHOW MASKING POLICIES is not available: the configured policy backend \
+             cannot list mask policies. It needs [policy] engine = \"ranger\"."
+                .to_string(),
+        ))
     }
 
     /// Invalidate any cached policy decisions so the next `resolve()` call
