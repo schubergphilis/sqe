@@ -60,6 +60,11 @@ pub(crate) struct RangerPolicy {
     #[serde(default)]
     #[allow(dead_code)] // read only in #[cfg(test)]; present in Ranger JSON for traceability
     pub(crate) id: i64,
+    /// The policy's name in Ranger. Not used for enforcement (matching is on
+    /// resources and grantees), but it is how an operator refers to a policy in the
+    /// console, so `SHOW MASKING POLICIES` surfaces it.
+    #[serde(default)]
+    pub(crate) name: String,
     /// 0 = access, 1 = DATAMASK, 2 = ROWFILTER.
     #[serde(rename = "policyType", default)]
     pub(crate) policy_type: i32,
@@ -780,6 +785,10 @@ fn cache_key(user: &SessionUser, table: &str, namespace: &str) -> String {
 
 #[async_trait]
 impl PolicyStore for RangerStore {
+    async fn list_mask_policies(&self) -> sqe_core::Result<Vec<crate::MaskPolicyInfo>> {
+        self.list_mask_policies_impl().await
+    }
+
     async fn resolve(
         &self,
         user: &SessionUser,
@@ -1680,5 +1689,172 @@ mod tests {
             "live capture must resolve a row filter for tag {LIVE_SAMPLE_FILTER_TAG}; got {:?}",
             filters.iter().map(|(t, _)| t).collect::<Vec<_>>()
         );
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Introspection: listing the mask policies as WRITTEN
+// ─────────────────────────────────────────────────────────────────────────────
+
+impl RangerStore {
+    /// Every data-mask policy (`policyType` 1) in the configured service, as
+    /// written in Ranger.
+    ///
+    /// Deliberately NOT filtered by user or resolved against precedence. What
+    /// applies to a given user is a different question, answered by
+    /// `SHOW EFFECTIVE POLICY`, and conflating the two is how an audit reaches the
+    /// wrong conclusion: a policy listed here may be overridden by a deny, beaten
+    /// by a tag mask, or simply not match the caller's roles.
+    ///
+    /// Reads the same download bundle enforcement reads, so it cannot drift from
+    /// what the engine actually sees. It bypasses the resolve cache on purpose:
+    /// an operator asking what is configured wants the current answer, not one up
+    /// to `cache_ttl_secs` old.
+    pub async fn list_mask_policies_impl(
+        &self,
+    ) -> sqe_core::Result<Vec<crate::MaskPolicyInfo>> {
+        let bundle = self.fetch_bundle().await?;
+        Ok(mask_policies_from_bundle(&bundle))
+    }
+}
+
+/// Extract the data-mask policies from a bundle.
+///
+/// Split out from the fetch so the mapping can be tested against real Ranger JSON
+/// without a live Ranger. The mapping is where the mistakes are: a policy can name
+/// several columns, carry several grantee kinds, and be disabled.
+fn mask_policies_from_bundle(bundle: &ServicePolicies) -> Vec<crate::MaskPolicyInfo> {
+    {
+        let mut out = Vec::new();
+        for p in &bundle.policies {
+            if p.policy_type != POLICY_TYPE_DATAMASK {
+                continue;
+            }
+            let values = |key: &str| -> Vec<String> {
+                p.resources
+                    .get(key)
+                    .map(|r| r.values.clone())
+                    .unwrap_or_default()
+            };
+            for item in &p.data_mask_policy_items {
+                let mut grantees: Vec<String> = Vec::new();
+                grantees.extend(item.users.iter().map(|u| format!("USER {u}")));
+                grantees.extend(item.roles.iter().map(|r| format!("ROLE {r}")));
+                grantees.extend(item.groups.iter().map(|g| format!("GROUP {g}")));
+                grantees.sort();
+                out.push(crate::MaskPolicyInfo {
+                    name: p.name.clone(),
+                    enabled: p.is_enabled,
+                    database: values("database").join(", "),
+                    table: values("table").join(", "),
+                    column: values("column").join(", "),
+                    mask_type: item.data_mask_info.data_mask_type.clone(),
+                    expression: item.data_mask_info.value_expr.clone().unwrap_or_default(),
+                    grantees: grantees.join(", "),
+                });
+            }
+        }
+        // Stable order: by name, then by the resource it covers, so two runs of
+        // SHOW MASKING POLICIES on an unchanged service produce identical output.
+        out.sort_by(|a, b| {
+            (&a.name, &a.database, &a.table, &a.column, &a.grantees).cmp(&(
+                &b.name,
+                &b.database,
+                &b.table,
+                &b.column,
+                &b.grantees,
+            ))
+        });
+        out
+    }
+}
+
+#[cfg(test)]
+mod mask_policy_listing_tests {
+    use super::*;
+
+    /// Real Ranger bundle shape, including a row-filter policy that must NOT appear
+    /// and a disabled policy that MUST appear (listed, doing nothing).
+    const BUNDLE: &str = r#"{
+      "policyVersion": 7,
+      "policies": [
+        {"id":1,"name":"mask-orders-ssn","policyType":1,"isEnabled":true,
+         "resources":{"database":{"values":["sales"]},"table":{"values":["orders"]},
+                      "column":{"values":["ssn"]}},
+         "dataMaskPolicyItems":[{"roles":["engineer"],"users":["dave"],
+           "dataMaskInfo":{"dataMaskType":"CUSTOM","valueExpr":"concat('x', {col})"}}]},
+        {"id":2,"name":"mask-multi","policyType":1,"isEnabled":false,
+         "resources":{"database":{"values":["sales"]},"table":{"values":["orders"]},
+                      "column":{"values":["email","phone"]}},
+         "dataMaskPolicyItems":[{"groups":["public"],
+           "dataMaskInfo":{"dataMaskType":"MASK_NULL"}}]},
+        {"id":3,"name":"filter-orders-eu","policyType":2,"isEnabled":true,
+         "resources":{"database":{"values":["sales"]},"table":{"values":["orders"]}},
+         "rowFilterPolicyItems":[{"roles":["engineer"],
+           "rowFilterInfo":{"filterExpr":"region = 'EU'"}}]},
+        {"id":4,"name":"access-orders","policyType":0,"isEnabled":true,
+         "resources":{"database":{"values":["sales"]}}}
+      ]
+    }"#;
+
+    fn listed() -> Vec<crate::MaskPolicyInfo> {
+        let bundle: ServicePolicies = serde_json::from_str(BUNDLE).expect("parse bundle");
+        mask_policies_from_bundle(&bundle)
+    }
+
+    /// Only policyType 1. A row filter or an access policy showing up under
+    /// SHOW MASKING POLICIES would misreport what protects a column.
+    #[test]
+    fn only_data_mask_policies_are_listed() {
+        let all = listed();
+        let names: Vec<&str> = all.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["mask-multi", "mask-orders-ssn"]);
+    }
+
+    #[test]
+    fn the_resource_and_expression_survive_the_mapping() {
+        let p = listed()
+            .into_iter()
+            .find(|p| p.name == "mask-orders-ssn")
+            .expect("the ssn policy");
+        assert_eq!(p.database, "sales");
+        assert_eq!(p.table, "orders");
+        assert_eq!(p.column, "ssn");
+        assert_eq!(p.mask_type, "CUSTOM");
+        assert_eq!(p.expression, "concat('x', {col})");
+        assert!(p.enabled);
+    }
+
+    /// Every grantee kind is shown, and labelled. "engineer" alone would not say
+    /// whether it is a user or a role, and Ranger allows a user and a role of the
+    /// same name.
+    #[test]
+    fn grantees_are_labelled_by_kind() {
+        let p = listed()
+            .into_iter()
+            .find(|p| p.name == "mask-orders-ssn")
+            .expect("the ssn policy");
+        assert_eq!(p.grantees, "ROLE engineer, USER dave");
+    }
+
+    /// A policy disabled in the console is LISTED, with enabled = false. Hiding it
+    /// would make a mask that someone can re-enable with one click invisible to an
+    /// audit.
+    #[test]
+    fn a_disabled_policy_is_listed_and_flagged() {
+        let p = listed()
+            .into_iter()
+            .find(|p| p.name == "mask-multi")
+            .expect("the disabled policy");
+        assert!(!p.enabled);
+        assert_eq!(p.column, "email, phone", "several columns are joined");
+        assert_eq!(p.grantees, "GROUP public");
+    }
+
+    /// Deterministic order, so two runs on an unchanged service produce identical
+    /// output and a diff means something changed.
+    #[test]
+    fn the_order_is_stable() {
+        assert_eq!(listed(), listed());
     }
 }

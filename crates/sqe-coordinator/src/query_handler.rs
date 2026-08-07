@@ -1047,6 +1047,9 @@ impl QueryHandler {
                     self.handle_show_effective_policy(session, params).await
                 }
                 StatementKind::ShowTags(ref table) => self.handle_show_tags(session, table).await,
+                StatementKind::ShowMaskingPolicies(ref name) => {
+                    self.handle_show_masking_policies(session, name.as_deref()).await
+                }
 
                 // DDL/DML invalidation scope (issue #11): a 50 ms SessionContext
                 // rebuild on cache miss multiplied by every active user's next
@@ -5086,6 +5089,84 @@ impl QueryHandler {
     /// as (column, tag) rows. No extra SQE gate: `load_column_tags` loads the
     /// table with the caller's token, so the catalog enforces read access.
     /// Empty result when the table carries no tags.
+    /// `SHOW MASKING POLICIES` / `SHOW MASKING POLICY <name>`.
+    ///
+    /// ADMIN-GATED. The listing names the columns someone thought worth masking,
+    /// which is a map of where the sensitive data is. A non-admin who cannot read
+    /// `orders.ssn` should not learn that `orders.ssn` is the column under a mask.
+    ///
+    /// Reports what is CONFIGURED, not what applies to any given user. Precedence,
+    /// deny items and role membership are `SHOW EFFECTIVE POLICY`'s job, and the
+    /// column comments here say so because conflating them is the natural mistake.
+    async fn handle_show_masking_policies(
+        &self,
+        session: &Session,
+        name_filter: Option<&str>,
+    ) -> sqe_core::Result<Vec<RecordBatch>> {
+        self.require_admin(session, "SHOW MASKING POLICIES")?;
+        let store = self.policy_store.as_ref().ok_or_else(|| {
+            SqeError::Execution(
+                "SHOW MASKING POLICIES needs a policy store: set [policy] engine = \"ranger\""
+                    .to_string(),
+            )
+        })?;
+        let mut policies = store.list_mask_policies().await?;
+        if let Some(want) = name_filter {
+            policies.retain(|p| p.name.eq_ignore_ascii_case(want));
+        }
+        Self::mask_policies_to_record_batch(&policies)
+    }
+
+    fn mask_policies_to_record_batch(
+        policies: &[sqe_policy::MaskPolicyInfo],
+    ) -> sqe_core::Result<Vec<RecordBatch>> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, false),
+            Field::new("database", DataType::Utf8, false),
+            Field::new("table", DataType::Utf8, false),
+            Field::new("column", DataType::Utf8, false),
+            Field::new("mask_type", DataType::Utf8, false),
+            Field::new("expression", DataType::Utf8, false),
+            Field::new("grantees", DataType::Utf8, false),
+            Field::new("enabled", DataType::Boolean, false),
+        ]));
+
+        let mut name_b = StringBuilder::new();
+        let mut db_b = StringBuilder::new();
+        let mut tbl_b = StringBuilder::new();
+        let mut col_b = StringBuilder::new();
+        let mut type_b = StringBuilder::new();
+        let mut expr_b = StringBuilder::new();
+        let mut grantee_b = StringBuilder::new();
+        let mut enabled_b = arrow_array::builder::BooleanBuilder::new();
+        for p in policies {
+            name_b.append_value(&p.name);
+            db_b.append_value(&p.database);
+            tbl_b.append_value(&p.table);
+            col_b.append_value(&p.column);
+            type_b.append_value(&p.mask_type);
+            expr_b.append_value(&p.expression);
+            grantee_b.append_value(&p.grantees);
+            enabled_b.append_value(p.enabled);
+        }
+
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(name_b.finish()) as ArrayRef,
+                Arc::new(db_b.finish()) as ArrayRef,
+                Arc::new(tbl_b.finish()) as ArrayRef,
+                Arc::new(col_b.finish()) as ArrayRef,
+                Arc::new(type_b.finish()) as ArrayRef,
+                Arc::new(expr_b.finish()) as ArrayRef,
+                Arc::new(grantee_b.finish()) as ArrayRef,
+                Arc::new(enabled_b.finish()) as ArrayRef,
+            ],
+        )
+        .map_err(|e| SqeError::Execution(format!("Failed to build result batch: {e}")))?;
+        Ok(vec![batch])
+    }
+
     async fn handle_show_tags(
         &self,
         session: &Session,

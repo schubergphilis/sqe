@@ -93,6 +93,9 @@ pub enum StatementKind {
     /// SHOW TAGS ON <table> — read back the `sqe.column-tags` property as
     /// (column, tag) rows. Diagnostic round-trip for ALTER TABLE ... SET TAGS.
     ShowTags(String),
+    /// `SHOW MASKING POLICIES` / `SHOW MASKING POLICY <name>`. `None` lists all;
+    /// `Some(name)` filters to one policy.
+    ShowMaskingPolicies(Option<String>),
     Utility(Box<Statement>),
     ExplainFull(String), // inner SQL string (EXPLAIN FULL pre-processed)
     // Transaction stubs — no-ops for JDBC tools that use setAutoCommit(false).
@@ -196,6 +199,7 @@ impl StatementKind {
             StatementKind::CheckAccess(_) => "checkaccess",
             StatementKind::ShowEffectivePolicy(_) => "showeffectivepolicy",
             StatementKind::ShowTags(_) => "showtags",
+            StatementKind::ShowMaskingPolicies(_) => "showmaskingpolicies",
             StatementKind::Utility(_) => "utility",
             StatementKind::ExplainFull(_) => "explain_full",
             StatementKind::Begin => "begin",
@@ -460,6 +464,23 @@ pub fn parse_and_classify(sql: &str) -> sqe_core::Result<StatementKind> {
             None
         }
     });
+    // SHOW MASKING POLICIES / SHOW MASKING POLICY <name>. Handled before
+    // sqlparser, which has no notion of either.
+    //
+    // Both spellings are accepted because operators type both, and refusing the
+    // singular for a list (or vice versa) is a pointless papercut. The plural with a
+    // name is also fine: the name simply filters.
+    for prefix in ["SHOW MASKING POLICIES", "SHOW MASKING POLICY"] {
+        if let Some(rest) = strip_prefix_ci(trimmed, prefix) {
+            let name = rest.trim().trim_end_matches(';').trim().trim_matches('"').to_string();
+            return Ok(StatementKind::ShowMaskingPolicies(if name.is_empty() {
+                None
+            } else {
+                Some(name)
+            }));
+        }
+    }
+
     if let Some(rest) = show_tags_rest {
         let table = rest.trim().trim_end_matches(';').trim().to_string();
         if table.is_empty() {
@@ -2323,5 +2344,65 @@ mod tests {
         // Regression: the partition pre-scan must not steal regular ALTER TABLE.
         let kind = parse_and_classify("ALTER TABLE t ADD COLUMN x INT").unwrap();
         assert!(matches!(kind, StatementKind::AlterSchema(_)));
+    }
+}
+
+#[cfg(test)]
+mod show_masking_policy_tests {
+    use super::*;
+
+    #[test]
+    fn the_plural_with_no_name_lists_everything() {
+        for sql in ["SHOW MASKING POLICIES", "show masking policies", "SHOW MASKING POLICIES;"] {
+            match parse_and_classify(sql).expect(sql) {
+                StatementKind::ShowMaskingPolicies(None) => {}
+                other => panic!("{sql}: expected list-all, got {other:?}"),
+            }
+        }
+    }
+
+    /// The singular with no name lists everything too. Refusing it would be a
+    /// papercut: operators type both spellings and neither is ambiguous.
+    #[test]
+    fn the_singular_with_no_name_also_lists_everything() {
+        match parse_and_classify("SHOW MASKING POLICY").expect("singular") {
+            StatementKind::ShowMaskingPolicies(None) => {}
+            other => panic!("expected list-all, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_name_filters_to_one_policy() {
+        for sql in [
+            "SHOW MASKING POLICY mask_ssn",
+            "SHOW MASKING POLICY \"mask_ssn\"",
+            "SHOW MASKING POLICIES mask_ssn;",
+        ] {
+            match parse_and_classify(sql).expect(sql) {
+                StatementKind::ShowMaskingPolicies(Some(n)) => assert_eq!(n, "mask_ssn"),
+                other => panic!("{sql}: expected a name, got {other:?}"),
+            }
+        }
+    }
+
+    /// The plural prefix must be tried FIRST. Checked the other way round,
+    /// "SHOW MASKING POLICIES" strips as the singular and leaves a stray "IES" as
+    /// the policy name, so the list-all form silently becomes a filter that matches
+    /// nothing and reports an empty, reassuring result.
+    #[test]
+    fn the_plural_is_not_mistaken_for_a_singular_with_a_name() {
+        assert!(matches!(
+            parse_and_classify("SHOW MASKING POLICIES").expect("plural"),
+            StatementKind::ShowMaskingPolicies(None)
+        ));
+    }
+
+    /// SHOW TAGS must keep working; the new branch sits right beside it.
+    #[test]
+    fn show_tags_still_parses() {
+        assert!(matches!(
+            parse_and_classify("SHOW TAGS ON cat.ns.t").expect("show tags"),
+            StatementKind::ShowTags(ref t) if t == "cat.ns.t"
+        ));
     }
 }
