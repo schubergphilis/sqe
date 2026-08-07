@@ -27,7 +27,7 @@ services:
     mem_limit: 128m
 
   grafana:
-    image: grafana/grafana:11.6.16
+    image: grafana/grafana:13.1.2
     environment:
       GF_SECURITY_ADMIN_USER: admin
       GF_SECURITY_ADMIN_PASSWORD: admin

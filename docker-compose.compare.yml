@@ -24,7 +24,7 @@ services:
 
   # Trino (single-node, Iceberg connector)
   trino:
-    image: trinodb/trino:465
+    image: trinodb/trino:483
     ports:
       - "38080:8080"
     volumes:
