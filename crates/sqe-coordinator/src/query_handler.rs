@@ -5104,9 +5104,14 @@ impl QueryHandler {
         name_filter: Option<&str>,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         self.require_admin(session, "SHOW MASKING POLICIES")?;
+        // Two ways this is unavailable, and both must SAY so rather than return an
+        // empty result. `[policy] engine = "passthrough"` (the default) has no store
+        // at all; `in-memory` has one that cannot list policies and refuses via the
+        // trait default. An empty listing would read as "nothing is masked here".
         let store = self.policy_store.as_ref().ok_or_else(|| {
             SqeError::Execution(
-                "SHOW MASKING POLICIES needs a policy store: set [policy] engine = \"ranger\""
+                "SHOW MASKING POLICIES is not available: no policy backend is \
+                 configured. It needs [policy] engine = \"ranger\"."
                     .to_string(),
             )
         })?;

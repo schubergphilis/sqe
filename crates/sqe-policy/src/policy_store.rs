@@ -347,3 +347,28 @@ mod tests {
         assert!(resolved.row_filters.is_empty());
     }
 }
+
+#[cfg(test)]
+mod mask_policy_listing_availability {
+    use crate::PolicyStore;
+
+    /// A backend that cannot introspect must REFUSE, not report an empty list.
+    ///
+    /// An empty result is indistinguishable from "no masks are configured", so a
+    /// deployment on the in-memory store would answer an audit question with a clean
+    /// bill of health it has no basis for. The statement is disabled instead.
+    #[tokio::test]
+    async fn the_in_memory_store_refuses_to_list_mask_policies() {
+        let store = super::InMemoryPolicyStore::new();
+        let err = store
+            .list_mask_policies()
+            .await
+            .expect_err("a store with no introspection must refuse, not return empty");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not available") && msg.contains("ranger"),
+            "the error must say the statement is unavailable and name the backend that \
+             supports it, got: {msg}"
+        );
+    }
+}
