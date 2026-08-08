@@ -121,7 +121,24 @@ session.
 The session cannot defend itself. Overriding the alias's `token` with the user's JWT
 does not help, because Iceberg prefers `credential` when both are set (measured). The
 fix is a deployment one: **remove the service-account catalog, do not shadow it.**
-Pinned by `a_service_account_catalog_in_the_session_defeats_per_user_identity`.
+
+The quickstart used to ship exactly that hazard and no longer does: no `credential`
+and no `oauth2-server-uri`, `token-refresh-enabled` pinned off, and the caller passes
+its own token per invocation. Two guards keep it that way, and both assert the
+property rather than inspecting the config file, because a config file is easy to
+regress:
+
+- `no_service_account_catalog_can_defeat_per_user_identity` fails if naming another
+  alias reads a table the caller was just denied.
+- `parity-test.sh` fails if a `spark-sql` with no caller token can load the table at
+  all.
+
+A refusal without a credential is NOT the same refusal as a denied grant, and the
+guard asserts which one it got. With a credential the alias was a second IDENTITY. With
+none it has no identity, so the request never becomes an authorization question:
+Polaris rejects it before it can answer and Iceberg reports `Unable to parse error
+response` rather than a `ForbiddenException`. A test accepting either could not tell a
+revoked grant from a catalog nobody gave a token.
 
 **3. Kyuubi injects masks and row filters** from the `query` and `tag` services.
 
@@ -195,7 +212,7 @@ is an incident.
 | Gap | Direction | Detail |
 |---|---|---|
 | Spark's fine-grained tier trusts an asserted username | **open** | A mismatched pair gets one user's object rights and another's masks. The object tier follows the token, so it cannot be widened this way, but mask selection can be steered. Closing it means Spark behind a Kyuubi server with real authentication. |
-| A service-principal Spark bypasses the object tier | **open** | Polaris authorizes the service account. Nothing in the `query` service compensates, because object level is not its job. |
+| A service-principal Spark bypasses the object tier | **open by configuration**, guarded in the quickstart | Polaris authorizes the service account, and nothing in the `query` service compensates because object level is not its job. Unchanged as a hazard: any deployment that gives Spark a service-account `credential` gets this. What changed is that the quickstart no longer does, and two guards fail if it comes back (`no_service_account_catalog_can_defeat_per_user_identity` and the identity check in `parity-test.sh`). The mitigation is per-user tokens with `token-refresh-enabled=false`, not a policy. |
 | A leftover service-account catalog defeats per-user identity | **open** | Adding a per-user catalog does not remove an existing one. Both identities are live and the caller picks by naming the catalog. Measured: denied through the per-user catalog, allowed through the service-account alias, same session, same table. A per-user `token` cannot shadow a `credential`; Iceberg prefers the credential. Remove the other catalog. |
 | Renaming a tagged column silently UNMASKS it, in both engines | **open in both** | `sqe.column-tags` is keyed by column NAME and no schema-change path rewrites it, so after `RENAME COLUMN ssn TO tax_id` the association names a column that is gone, no tag matches, and the mask stops applying. Measured, both engines: `SELECT id, tax_id` returns the column RAW. A routine rename unmasks a governed column and nothing reports it. This row previously said the engines broke DIFFERENTLY, with SQE dropping the column entirely. That was real but it was a SCAN defect, not access control: the small-file read path resolved the projection against each data file's parquet names, so a renamed column matched nothing and was discarded. Fixed by resolving Iceberg field ids; the engines now agree and this one shared gap is what remains. |
 | A column added after a grant is readable and unmasked | **open, by design** | The object tier has no column level, so `table-data-read` covers columns that did not exist when it was granted. No policy names the new column, so nothing masks it. |
