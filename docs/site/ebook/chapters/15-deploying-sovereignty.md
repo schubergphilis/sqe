@@ -93,37 +93,34 @@ Stage 4 copies the actual source and builds only the workspace crates against th
 
 ```dockerfile
 # ── Stage 5: Runtime image ───────────────────────────────────
-FROM debian:bookworm-slim
+# glibc + libgcc + CA certs. No shell, no apt, no OpenSSL.
+FROM gcr.io/distroless/cc-debian12:nonroot
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates libssl3 curl && \
-    rm -rf /var/lib/apt/lists/* && \
-    groupadd -r sqe && useradd -r -g sqe -u 1000 sqe
+COPY --from=builder /build/out/sqe-server /usr/local/bin/
+COPY --from=builder /build/out/sqe-worker /usr/local/bin/
+COPY --from=builder /build/out/sqe-cli /usr/local/bin/
+# Static busybox wget for HEALTHCHECK / compose only.
+COPY --from=busybox:1.37.0-uclibc /bin/wget /usr/local/bin/wget
 
-COPY --from=builder /build/target/release/sqe-server /usr/local/bin/
-COPY --from=builder /build/target/release/sqe-worker /usr/local/bin/
-COPY --from=builder /build/target/release/sqe-cli /usr/local/bin/
-
-USER sqe
 EXPOSE 50051 50052 8080 9090 9091
 
 HEALTHCHECK --interval=10s --timeout=3s --start-period=10s --retries=3 \
-    CMD curl -f http://localhost:9091/healthz || exit 1
+    CMD ["/usr/local/bin/wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9091/healthz"]
 
-ENTRYPOINT ["sqe-server"]
+ENTRYPOINT ["/usr/local/bin/sqe-server"]
 ```
 
-Stage 5 is the runtime. The `debian:bookworm-slim` base carries only what the binaries need: CA certificates for TLS to Polaris, libssl for HTTPS, and curl for the health check. The three binaries total about 40MB. The final image is 47MB.
+Stage 5 is the runtime. Distroless ships glibc, libgcc, and CA certificates. That is the full list of OS dependencies SQE needs: the binaries link `libc` / `libm` / `libgcc`, and TLS is rustls end to end (no `libssl`). A static busybox `wget` is the only extra binary, and it exists only for image and compose healthchecks. Kubernetes probes `/healthz` over HTTP and never calls it.
 
-From 2.3GB to 47MB. A 98% reduction. Cold pulls on a Kubernetes node take 3 seconds instead of 45.
+The build stage is still multi-gigabyte. The runtime image is the three binaries plus a few tens of megabytes of distroless base. Cold pulls on a Kubernetes node stay short because scanners and operators only ever pull the runtime tag.
 
-We use `debian:bookworm-slim` instead of `scratch` for the runtime. The original plan was a fully static musl build running on scratch: zero runtime dependencies, zero attack surface. In practice, the Rust TLS ecosystem still has rough edges with musl static linking. OpenSSL bindings, which iceberg-rust pulls in transitively, resist static compilation on some architectures. The bookworm-slim base adds 25MB but eliminates a class of linking headaches that were consuming more debugging time than the size savings justified.
+We used to ship `debian:bookworm-slim` with `ca-certificates`, `libssl3`, and `curl`. That was the right call when the tree still touched OpenSSL. Once the stack standardized on rustls, those packages became pure CVE surface: a bookworm-slim scan was hundreds of findings, almost all unfixed, almost none reachable from SQE. Distroless cut that to a handful of low and medium OS issues without changing a line of engine code.
 
 ::: {.antipattern}
-**Antipattern: scratch images for Rust services that use OpenSSL.** It sounds clean: no base OS, just your binary. But if any dependency in your tree links dynamically against libssl, the binary will fail with a cryptic "not found" error at startup. Either commit to rustls throughout your entire dependency tree, or accept the slim base. We chose the latter and moved on.
+**Antipattern: a full userland in a Rust service image "just in case".** A shell and curl feel convenient for `docker exec` debugging. They also import perl, tar, util-linux, and every CVE those packages carry. If the binary only needs glibc and CA certs, put it on distroless (or Chainguard glibc-dynamic). Keep a separate `-debug` image if operators need a shell. Do not pay the CVE bill on every production node for a tool you use once a quarter.
 :::
 
-The non-root user matters. SQE runs as UID 1000 in the `sqe` group. This is not security theater. Kubernetes `PodSecurityStandard` policies (and the older PodSecurityPolicy) can enforce non-root containers. Running as root means your deployment will be rejected by any cluster with basic security hygiene enabled.
+The non-root user matters. Distroless `nonroot` is UID/GID 65532, and the Helm chart sets `runAsUser` / `runAsGroup` / `fsGroup` to match. This is not security theater. Kubernetes `PodSecurityStandard` policies can enforce non-root containers. Running as root means your deployment will be rejected by any cluster with basic security hygiene enabled.
 
 
 ## Helm Chart: Two Topologies, One Chart

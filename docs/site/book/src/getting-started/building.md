@@ -76,8 +76,8 @@ graph LR
     subgraph "Build Stage (rust:bookworm)"
         DEPS["Cache dependencies"] --> BUILD["cargo build --release"]
     end
-    subgraph "Runtime Stage (debian:bookworm-slim)"
-        BIN["sqe-server + sqe-cli"] --> RUN["Non-root user (sqe:1000)"]
+    subgraph "Runtime Stage (distroless/cc nonroot)"
+        BIN["sqe-server + sqe-worker + sqe-cli"] --> RUN["Non-root user (UID 65532)"]
     end
     BUILD -->|COPY binaries| BIN
 ```
