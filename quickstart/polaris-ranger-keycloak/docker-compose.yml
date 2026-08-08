@@ -102,7 +102,21 @@ services:
 
   # ── Ranger Admin database ─────────────────────────────────────────────
   ranger-db:
-    image: postgres:18.3
+    # PINNED to 13.x, and renovate is told so (see renovate.json).
+    #
+    # A bot bumped this 13.23 -> 18.3 (five majors) and it broke the whole
+    # quickstart: postgres 18 stores data in a major-version-specific
+    # subdirectory, so an existing volume is unreadable and the container exits 1
+    # with "in 18+, these Docker images are configured to store database data in a
+    # major-version-specific directory". ranger-admin then never comes up, which
+    # takes out `make test-access-control` and `make test-access-control-spark`
+    # entirely.
+    #
+    # A fresh volume might start, which is the trap: CI creates one, so the bump
+    # can look green while every developer with an existing stack is broken. Moving
+    # major versions here needs a deliberate migration (pg_upgrade or a documented
+    # volume reset) plus a check that Ranger 2.8's schema is happy on the target.
+    image: postgres:13.23
     environment:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-rangerR0cks!}
     volumes:
