@@ -142,6 +142,39 @@ pub enum TagMaskSpec {
     Custom(String),
 }
 
+/// One data-mask policy as WRITTEN in the policy store, for introspection.
+///
+/// Not a resolved decision. `SHOW MASKING POLICIES` lists these so an operator can
+/// see what is configured; what actually applies to a user is `SHOW EFFECTIVE
+/// POLICY`, which accounts for deny items, role membership, and resource-versus-tag
+/// precedence. Reading this and concluding "alice sees xxx-xx-1111" is the mistake
+/// the two statements exist to keep apart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MaskPolicyInfo {
+    /// Policy name in the backing store, which is how an operator refers to it.
+    pub name: String,
+    /// False when the policy is disabled in the console, in which case it is
+    /// listed and does nothing.
+    pub enabled: bool,
+    /// The TAG this policy is keyed on, for a tag-service mask policy. Empty for a
+    /// resource policy, and the two are mutually exclusive: a tag policy names a
+    /// tag and no table, a resource policy the reverse. So this field is also how a
+    /// reader tells the two kinds apart.
+    pub tag: String,
+    /// Resource the policy covers. Comma-joined when the policy names several
+    /// values at a level, which Ranger allows. Empty for a tag policy.
+    pub database: String,
+    pub table: String,
+    pub column: String,
+    /// Ranger `dataMaskType`, e.g. `MASK_NULL`, `CUSTOM`, or a component-qualified
+    /// `hive:CUSTOM` on a tag policy.
+    pub mask_type: String,
+    /// The `{col}` template for a CUSTOM mask; empty for a named type.
+    pub expression: String,
+    /// Who it applies to, as `USER x` / `ROLE y` / `GROUP z`, comma-joined.
+    pub grantees: String,
+}
+
 /// Trait for policy storage backends. Implementations resolve policies
 /// for a given (user, table) pair from an external system.
 #[async_trait]
@@ -188,6 +221,23 @@ pub trait PolicyStore: Send + Sync {
         _tags: &HashSet<String>,
     ) -> (HashMap<String, TagMaskSpec>, Vec<Expr>, HashSet<String>) {
         (HashMap::new(), vec![], HashSet::new())
+    }
+
+    /// List the data-mask policies as WRITTEN in the backing store.
+    ///
+    /// Powers `SHOW MASKING POLICIES`. The default REFUSES rather than returning an
+    /// empty list, and the distinction matters more than it looks: an empty result is
+    /// indistinguishable from "no masks are configured", so a backend that simply
+    /// cannot answer would hand an auditor a clean bill of health. Refusing says
+    /// "this deployment cannot tell you", which is the truth.
+    ///
+    /// A backend gains the statement by overriding this. Only the Ranger store does.
+    async fn list_mask_policies(&self) -> sqe_core::Result<Vec<MaskPolicyInfo>> {
+        Err(sqe_core::SqeError::Execution(
+            "SHOW MASKING POLICIES is not available: the configured policy backend \
+             cannot list mask policies. It needs [policy] engine = \"ranger\"."
+                .to_string(),
+        ))
     }
 
     /// Invalidate any cached policy decisions so the next `resolve()` call
