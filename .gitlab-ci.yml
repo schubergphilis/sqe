@@ -36,13 +36,9 @@ variables:
   # builder stage if stage order in Dockerfile drifts.
   AIKIDO_DOCKER_TARGET: "runtime"
 
-# Cold Rust build ceiling. aikido builds with rootless Kaniko, which does NOT
-# honor this repo's BuildKit `RUN --mount=type=cache` + sccache mounts, so the
-# full workspace + vendored iceberg-rust recompiles from scratch and can exceed
-# GitLab's default 1h job ceiling. Overlay a higher ceiling onto aikido's
-# included `aikido-build` job (same-name job merge) until the registry-backed
-# build cache lands (aikido follow-up). This is a CEILING, not a duration: a
-# warm/fast build finishes early and is unaffected.
+# Cold Rust image build. The Dockerfile is a plain multi-stage (rust bookworm
+# builder -> distroless runtime) with no chef/sccache; a full release link of
+# the engine can still exceed GitLab's 1h default. This is a CEILING only.
 #
 # Script is re-stated from aikido deploy.yml (v0.9.4) so we can pass
 # --target=$AIKIDO_DOCKER_TARGET. When bumping the aikido `ref:`, re-diff this
@@ -56,13 +52,10 @@ aikido-build:
       # ignore the values); repos add more via AIKIDO_BUILD_ARGS="K=V K2=V2".
       BA="--build-arg VERSION=${CI_COMMIT_TAG:-$CI_COMMIT_SHORT_SHA}"
       BA="$BA --build-arg BUILD_DATE=$CI_PIPELINE_CREATED_AT --build-arg GIT_REVISION=$CI_COMMIT_SHA"
-      # kaniko doesn't auto-populate BuildKit's TARGETARCH/TARGETOS, so Dockerfiles
-      # that branch on $TARGETARCH would see it empty. Default amd64 (our CI arch);
-      # override via AIKIDO_TARGETARCH.
+      # kaniko doesn't auto-populate BuildKit's TARGETARCH/TARGETOS; default amd64.
       BA="$BA --build-arg TARGETARCH=${AIKIDO_TARGETARCH:-amd64} --build-arg TARGETOS=linux"
       for kv in ${AIKIDO_BUILD_ARGS:-}; do BA="$BA --build-arg $kv"; done
-      # Distroless final stage (see Dockerfile `AS runtime`). Required: without
-      # --target, a future intermediate stage left last would ship the builder.
+      # Distroless final stage (Dockerfile `AS runtime`).
       TARGET="--target ${AIKIDO_DOCKER_TARGET:-runtime}"
       if [ "$CI_COMMIT_REF_NAME" = "$CI_DEFAULT_BRANCH" ]; then
         DEST="--destination $AIKIDO_IMAGE --digest-file image-digest.txt"
@@ -76,9 +69,6 @@ aikido-build:
         $TARGET \
         $BA \
         $DEST
-      # On MR validation builds (--no-push) kaniko writes no digest file, which makes
-      # the artifact upload log a confusing "ERROR: No files to upload". Leave a marker
-      # so the artifact exists; merge builds overwrite it with the real digest.
       [ -f image-digest.txt ] || echo "validation-only build (--no-push); no image pushed" > image-digest.txt
 
 # Container CVE gate on the image kaniko just built. Source-tree grype (aikido-scan)
