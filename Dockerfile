@@ -7,7 +7,10 @@
 #   docker build --target bench-runtime -t sqe-bench:latest .
 #
 # Final stage MUST stay named `runtime` (AIKIDO_DOCKER_TARGET in .gitlab-ci.yml).
-# Runtime is distroless (UID 65532): glibc + libgcc + CA certs only. TLS is rustls.
+# Runtime is Chainguard glibc-dynamic (UID 65532): glibc + libgcc + CA certs.
+# TLS is rustls. Chosen over distroless/cc so the Aikido image gate
+# (grype --fail-on high) stays green: distroless still ships unfixed debian
+# libc criticals.
 
 # Pin matches rust-toolchain.toml so the image and local/CI toolchains agree.
 ARG RUST_VERSION=1.97.1
@@ -38,7 +41,11 @@ RUN cargo build --release --locked --no-default-features \
          target/release/sqe-cli target/release/sqe-bench /build/out/
 
 # ── Runtime (shared base) ─────────────────────────────────────
-FROM gcr.io/distroless/cc-debian12:nonroot@sha256:fccdbb0a547c14e23fcf4ce8ad62ca5d43b4faae8d22cd292f490fef9946c96e AS runtime-base
+# Digest-pinned; Renovate bumps via the dockerfile manager.
+FROM cgr.dev/chainguard/glibc-dynamic@sha256:eaec65b25f35619be16f4992e7bae1128eafcf63c114f2859b800a7020c1ef70 AS runtime-base
+
+# Base image already runs as nonroot (65532). Explicit USER keeps trivy DS-0002 clean.
+USER 65532
 
 FROM busybox:1.37.0-uclibc@sha256:8d7b1636e974e0adfd8d945955fca609304f0a56c18799dfd032d6e661382d84 AS healthcheck-bin
 

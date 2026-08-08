@@ -76,13 +76,13 @@ graph LR
     subgraph "Build Stage (rust bookworm)"
         BUILD["cargo build --release --locked"]
     end
-    subgraph "Runtime Stage (distroless/cc nonroot)"
+    subgraph "Runtime Stage (Chainguard glibc-dynamic)"
         BIN["sqe-server + sqe-worker + sqe-cli"] --> RUN["Non-root user (UID 65532)"]
     end
     BUILD -->|COPY binaries| BIN
 ```
 
-One Dockerfile for every consumer (local, data-platform quickstart, aikido). The builder matches `rust-toolchain.toml`; the runtime is distroless.
+One Dockerfile for every consumer (local, data-platform quickstart, aikido). The builder matches `rust-toolchain.toml`; the runtime is Chainguard glibc-dynamic.
 
 ## Workspace Structure
 
