@@ -131,3 +131,30 @@ regexTarget = "line"
 regexes = [
     '''curl[^\n]*-u admin:'rangerR0cks!'''',
 ]
+
+# 6. Block 5 again, one plan doc later. The Spark/Ranger parity plan carries the
+#    same runnable Ranger recipes, in the safer defaulted form:
+#
+#      curl -s -u "admin:${RANGER_ADMIN_PASSWORD:-<the same published default>}"
+#
+#    `curl-auth-user` matches the SHAPE, so parameterising the password does not
+#    help: the literal default still sits on the line. Same published quickstart
+#    value as block 5, same reasoning, same three-way scoping, and the same reason
+#    it has to be an allowlist rather than an edit -- the finding lives in the blob
+#    at 037681b and the history scan reads every commit.
+#
+#    That this recurred one plan later says it will keep recurring: any doc quoting
+#    a runnable Ranger curl trips it. The durable fix is a rule-level exception for
+#    this one known-public value, which belongs upstream in the aikido policy
+#    rather than in a seventh per-file block here. This keeps main publishing in
+#    the meantime.
+[[allowlists]]
+description = "Quickstart default Ranger password in the Spark parity plan (history scan)"
+condition = "AND"
+paths = [
+    '''(^|/)docs/superpowers/plans/2026-08-06-spark-ranger-access-control-parity\.md$''',
+]
+regexTarget = "line"
+regexes = [
+    '''curl[^\n]*-u "admin:\$\{RANGER_ADMIN_PASSWORD:-rangerR0cks!\}"''',
+]
