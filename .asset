@@ -7,6 +7,11 @@ name = "sqlengine"
 path = "."
 criticality = "high"
 data_classification = "internal"
+# Shipped container: multi-stage root Dockerfile, final stage `runtime`
+# (gcr.io/distroless/cc-debian12:nonroot, UID 65532). Built by aikido-build
+# (kaniko --target=runtime). Container CVEs gated by aikido-image-vuln
+# (grype --fail-on high) on merge. Local/compose healthchecks use the static
+# busybox wget copied into the image; K8s uses HTTP probes and does not need it.
 
 [config]
 image_scan = true

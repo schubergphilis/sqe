@@ -92,7 +92,7 @@ services:
       - "${SQE_TRINO_PORT:-18080}:8080"
       - "${SQE_METRICS_PORT:-19090}:9090"   # Prometheus /metrics
     healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:9091/healthz || exit 1"]
+      test: ["CMD", "/usr/local/bin/wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9091/healthz"]
       interval: 10s
       timeout: 5s
       retries: 10

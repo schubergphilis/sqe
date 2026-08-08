@@ -73,18 +73,12 @@ RUN --mount=type=cache,id=sqe-cargo-registry-${TARGETARCH},sharing=locked,target
     sccache --show-stats
 
 # ── Stage 5: Minimal runtime ─────────────────────────────────
-FROM debian:bookworm-slim
+# distroless/cc: glibc + libgcc + CA certs, non-root UID 65532. See Dockerfile.
+FROM gcr.io/distroless/cc-debian12:nonroot@sha256:fccdbb0a547c14e23fcf4ce8ad62ca5d43b4faae8d22cd292f490fef9946c96e
 
 LABEL org.opencontainers.image.title="sqe-bench" \
       org.opencontainers.image.description="TPC benchmark data generator for SQE"
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates libssl3 && \
-    rm -rf /var/lib/apt/lists/* && \
-    groupadd -r sqe && useradd -r -g sqe -u 1000 sqe
-
 COPY --from=builder /build/out/sqe-bench /usr/local/bin/
 
-USER sqe
-
-ENTRYPOINT ["sqe-bench"]
+ENTRYPOINT ["/usr/local/bin/sqe-bench"]

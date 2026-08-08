@@ -71,7 +71,8 @@ RUN --mount=type=cache,id=sqe-cargo-registry-${TARGETARCH},sharing=locked,target
     cp target/release/sqe-server target/release/sqe-worker target/release/sqe-cli /build/out/ && \
     sccache --show-stats
 
-FROM debian:bookworm-slim
+# distroless/cc: glibc + libgcc + CA certs, non-root UID 65532. See Dockerfile.
+FROM gcr.io/distroless/cc-debian12:nonroot@sha256:fccdbb0a547c14e23fcf4ce8ad62ca5d43b4faae8d22cd292f490fef9946c96e
 
 ARG VERSION=dev
 ARG BUILD_DATE
@@ -84,17 +85,13 @@ LABEL org.opencontainers.image.title="sqe-full" \
       org.opencontainers.image.revision="${GIT_REVISION}" \
       org.opencontainers.image.source="https://github.com/schuberg/sqe"
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates libssl3 curl && \
-    rm -rf /var/lib/apt/lists/* && \
-    groupadd -r sqe && useradd -r -g sqe -u 1000 sqe
-
 COPY --from=builder /build/out/ /usr/local/bin/
+COPY --from=busybox:1.37.0-uclibc@sha256:8d7b1636e974e0adfd8d945955fca609304f0a56c18799dfd032d6e661382d84 \
+    /bin/wget /usr/local/bin/wget
 
-USER sqe
 EXPOSE 50051 50052 8080 9090 9091
 
 HEALTHCHECK --interval=10s --timeout=3s --start-period=10s --retries=3 \
-    CMD curl -f http://localhost:9091/healthz || exit 1
+    CMD ["/usr/local/bin/wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9091/healthz"]
 
-ENTRYPOINT ["sqe-server"]
+ENTRYPOINT ["/usr/local/bin/sqe-server"]

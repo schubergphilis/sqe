@@ -31,7 +31,7 @@ services:
       - "${SQE_FLIGHT_PORT:-60051}:50051"
       - "${SQE_TRINO_PORT:-18080}:8080"
     healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:9091/healthz || exit 1"]
+      test: ["CMD", "/usr/local/bin/wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9091/healthz"]
       interval: 10s
       timeout: 5s
       retries: 10
