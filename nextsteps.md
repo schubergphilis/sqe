@@ -20,7 +20,7 @@
 >
 > **CI was not publishing to Harbor at all.** Two guardrails failed in an early stage, so every build and publish job was SKIPPED. Both were false positives: gitleaks on a plan doc's quickstart password, and "license evidence missing" for our own crates because syft reads Cargo.lock (no licenses) and deps.dev cannot resolve a workspace member or a vendored fork.
 >
-> **NEXT:** rewrite the stale tag association on `RENAME COLUMN` so a rename cannot silently unmask a column, then decide the mask-precedence question (align SQE to Ranger's tag-first, or keep resource-first and document it).
+> **NEXT:** issue #391 tracks the open items. The rename defect is FIXED (!794): `RENAME COLUMN` and `DROP COLUMN` now carry `sqe.column-tags` with them in the same commit as the schema change. Next by weight: the worker scan path still resolves projections by parquet NAME (same class as the coordinator bug !784 fixed, unverified because the quickstart is single-node), then the mask-precedence decision (align SQE to Ranger's tag-first, or keep resource-first and document it).
 
 > Status as of 2026-08-06. **Spark is subject to the same object-level access control as SQE, and it needed no engine code.** Polaris already runs its own Ranger plugin keyed on the federated OIDC identity, so the whole thing was a credential swap: give Spark's Iceberg REST catalog a per-user Keycloak token and Polaris authorizes the end user instead of `root`. `token-refresh-enabled=false` is load-bearing, because Iceberg otherwise exchanges the external JWT against Polaris's own token endpoint and the identity silently reverts, at which point every denial test passes for the wrong reason.
 >
