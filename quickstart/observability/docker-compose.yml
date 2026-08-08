@@ -103,7 +103,7 @@ services:
 
   # ── VictoriaMetrics — scrapes SQE's /metrics (sqe:9090) ───────────────
   victoriametrics:
-    image: victoriametrics/victoria-metrics:v1.148.0
+    image: victoriametrics/victoria-metrics:v1.149.0
     command:
       - "-promscrape.config=/etc/vm/scrape.yml"
       - "-retentionPeriod=1d"
