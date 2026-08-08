@@ -383,3 +383,183 @@ mod tests {
         );
     }
 }
+
+/// One column-name change a schema evolution makes to the tag map.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TagKeyChange {
+    /// `RENAME COLUMN old TO new`: the association must follow the column.
+    Rename { old: String, new: String },
+    /// `DROP COLUMN c`: the association is gone with it.
+    Drop { column: String },
+}
+
+/// Rewrite the column-tag map to follow a schema change.
+///
+/// `sqe.column-tags` is keyed by column NAME while Iceberg identifies a column by
+/// field id, so a rename leaves the association pointing at a name that no longer
+/// exists. Nothing then matches, no mask fires, and a governed column comes back
+/// RAW. In both engines, because both resolve the association by name. A routine
+/// rename silently unmasks a column and nothing reports it.
+///
+/// Returns `None` when nothing changed, so a caller can skip the property write
+/// entirely rather than committing an identical value.
+///
+/// Deliberate choices:
+///
+/// * A rename onto a name that ALREADY carries tags UNIONS them rather than
+///   replacing. Replacing could drop a mask, which is the fail-open direction. The
+///   union can only over-mask.
+/// * A dropped column's association is REMOVED. Leaving it looks harmless because
+///   a column absent from the schema is never consulted, but re-adding a column of
+///   the same name later would silently inherit the old classification.
+/// * A rename of an UNtagged column is not a change, so a table with no tags never
+///   gets a property written by a rename.
+pub(crate) fn rewrite_tag_keys(
+    current: &HashMap<String, Vec<String>>,
+    changes: &[TagKeyChange],
+) -> Option<HashMap<String, Vec<String>>> {
+    if current.is_empty() || changes.is_empty() {
+        return None;
+    }
+    let mut map = current.clone();
+    let mut touched = false;
+
+    for change in changes {
+        match change {
+            TagKeyChange::Rename { old, new } => {
+                if old == new {
+                    continue;
+                }
+                if let Some(tags) = map.remove(old) {
+                    touched = true;
+                    let entry = map.entry(new.clone()).or_default();
+                    for tag in tags {
+                        if !entry.contains(&tag) {
+                            entry.push(tag);
+                        }
+                    }
+                }
+            }
+            TagKeyChange::Drop { column } => {
+                if map.remove(column).is_some() {
+                    touched = true;
+                }
+            }
+        }
+    }
+    touched.then_some(map)
+}
+
+#[cfg(test)]
+mod tag_key_rewrite_tests {
+    use super::*;
+
+    fn map(pairs: &[(&str, &[&str])]) -> HashMap<String, Vec<String>> {
+        pairs
+            .iter()
+            .map(|(c, tags)| {
+                (c.to_string(), tags.iter().map(|t| t.to_string()).collect())
+            })
+            .collect()
+    }
+
+    /// THE fix. Before this, the association kept naming `ssn` after the rename, so
+    /// no tag matched `tax_id` and the column came back RAW in both engines.
+    #[test]
+    fn a_rename_moves_the_association_to_the_new_name() {
+        let current = map(&[("ssn", &["pii"]), ("region", &["geo"])]);
+        let out = rewrite_tag_keys(
+            &current,
+            &[TagKeyChange::Rename { old: "ssn".into(), new: "tax_id".into() }],
+        )
+        .expect("the map changed");
+        assert_eq!(out.get("tax_id").map(Vec::as_slice), Some(&["pii".to_string()][..]));
+        assert!(!out.contains_key("ssn"), "the old key must be gone: {out:?}");
+        assert_eq!(out.get("region").map(Vec::as_slice), Some(&["geo".to_string()][..]));
+    }
+
+    /// A rename onto a name that already carries tags UNIONS. Replacing could drop
+    /// a mask, which is the fail-open direction; a union can only over-mask.
+    #[test]
+    fn a_rename_onto_a_tagged_name_unions_rather_than_replacing() {
+        let current = map(&[("ssn", &["pii"]), ("tax_id", &["sensitive"])]);
+        let out = rewrite_tag_keys(
+            &current,
+            &[TagKeyChange::Rename { old: "ssn".into(), new: "tax_id".into() }],
+        )
+        .expect("changed");
+        let mut got = out.get("tax_id").cloned().expect("tax_id present");
+        got.sort();
+        assert_eq!(got, vec!["pii".to_string(), "sensitive".to_string()]);
+    }
+
+    /// A dropped column's association goes with it. Leaving it looks inert, because
+    /// a column absent from the schema is never consulted, but re-adding the same
+    /// name later would silently inherit the old classification.
+    #[test]
+    fn a_drop_removes_the_association() {
+        let current = map(&[("ssn", &["pii"]), ("region", &["geo"])]);
+        let out = rewrite_tag_keys(&current, &[TagKeyChange::Drop { column: "ssn".into() }])
+            .expect("changed");
+        assert!(!out.contains_key("ssn"));
+        assert!(out.contains_key("region"));
+    }
+
+    /// Renaming an UNtagged column changes nothing, so no property is written.
+    /// Without this a plain rename on an untagged table would commit a redundant
+    /// SetProperties on every ALTER.
+    #[test]
+    fn renaming_an_untagged_column_is_not_a_change() {
+        let current = map(&[("ssn", &["pii"])]);
+        assert_eq!(
+            rewrite_tag_keys(
+                &current,
+                &[TagKeyChange::Rename { old: "region".into(), new: "area".into() }]
+            ),
+            None
+        );
+    }
+
+    /// A table with no tags at all is never touched.
+    #[test]
+    fn a_table_with_no_tags_is_never_touched() {
+        assert_eq!(
+            rewrite_tag_keys(
+                &HashMap::new(),
+                &[TagKeyChange::Rename { old: "a".into(), new: "b".into() }]
+            ),
+            None
+        );
+    }
+
+    /// Renaming to the same name is a no-op, not a self-move that could drop the key.
+    #[test]
+    fn renaming_to_the_same_name_is_a_no_op() {
+        let current = map(&[("ssn", &["pii"])]);
+        assert_eq!(
+            rewrite_tag_keys(
+                &current,
+                &[TagKeyChange::Rename { old: "ssn".into(), new: "ssn".into() }]
+            ),
+            None
+        );
+    }
+
+    /// Several changes in one statement all apply, including a chained rename.
+    #[test]
+    fn a_chain_of_renames_in_one_statement_lands_on_the_last_name() {
+        let current = map(&[("a", &["t1"]), ("z", &["t2"])]);
+        let out = rewrite_tag_keys(
+            &current,
+            &[
+                TagKeyChange::Rename { old: "a".into(), new: "b".into() },
+                TagKeyChange::Rename { old: "b".into(), new: "c".into() },
+                TagKeyChange::Drop { column: "z".into() },
+            ],
+        )
+        .expect("changed");
+        assert_eq!(out.get("c").map(Vec::as_slice), Some(&["t1".to_string()][..]));
+        assert!(!out.contains_key("a") && !out.contains_key("b"));
+        assert!(!out.contains_key("z"));
+    }
+}
