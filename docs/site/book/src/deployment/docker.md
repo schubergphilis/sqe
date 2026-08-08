@@ -16,12 +16,14 @@ graph TB
     end
 ```
 
-- **Base:** `gcr.io/distroless/cc-debian12:nonroot` (digest-pinned). glibc, libgcc, and CA certificates only. No shell, no package manager, no OpenSSL.
+- **Build:** one multi-stage Dockerfile. Stage 1 is `rust:<toolchain>-bookworm` and a plain `cargo build --release --locked`. No cargo-chef, no sccache. Same file for local compose, data-platform quickstart/sqe, and aikido/kaniko.
+- **Base (runtime):** `gcr.io/distroless/cc-debian12:nonroot` (digest-pinned). glibc, libgcc, and CA certificates only. No shell, no package manager, no OpenSSL.
 - **Why not Debian slim:** the binaries link only `libc` / `libm` / `libgcc` (TLS is rustls). `curl`, `libssl3`, and the rest of bookworm-slim were unused attack surface and the source of most image CVEs.
 - **User:** Non-root `nonroot` (UID/GID **65532**). Helm `securityContext` matches this UID.
 - **Healthcheck:** static busybox `wget` (exec form). Kubernetes uses HTTP probes on `/healthz` and does not need wget.
 - **Entrypoint:** `sqe-server`. Mode is selected via `--mode` or `SQE_MODE`.
 - **CI (Aikido):** `aikido-build` runs kaniko with `--target=runtime`. On merge, `aikido-image-vuln` runs `grype registry:$AIKIDO_IMAGE --fail-on high` so the distroless surface is gated, not only the source tree.
+- **Bench image:** `docker build --target bench-runtime -t sqe-bench:latest .` (same Dockerfile).
 
 There is no shell in the image. `docker exec -it <container> sqe-cli` still works (the CLI binary is present). `docker exec ... bash` does not.
 
