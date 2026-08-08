@@ -30,7 +30,11 @@ identically. That one cost me a published correction, and it is the last section
 
 Every row is a real query against a live stack: Apache Polaris 1.7, Apache Ranger 2.8,
 Keycloak 26.5, and Spark 3.5.9 with Kyuubi Authz 1.11.1. The output columns are what the
-engines printed, not a summary of them.
+engines printed, not a summary of them: each cell was transcribed from a captured run,
+not reconstructed from what a test asserts. That distinction is not pedantry. The first
+version of this post got row 20 wrong precisely because the claim was derived from a
+test's logic instead of copied from output, and I caught the same slip a second time
+while correcting it.
 
 The fixture is one table, seeded identically every run:
 
