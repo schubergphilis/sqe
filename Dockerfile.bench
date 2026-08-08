@@ -3,8 +3,7 @@
 # Prefer the shared Dockerfile:
 #   docker build --target bench-runtime -t sqe-bench:latest .
 #
-# This file exists for callers that still pass `-f Dockerfile.bench`. Same
-# simple builder + distroless runtime; only sqe-bench is linked.
+# This file exists for callers that still pass `-f Dockerfile.bench`.
 
 ARG RUST_VERSION=1.97.1
 
@@ -26,7 +25,9 @@ RUN cargo build --release --locked --no-default-features --bin sqe-bench \
     && mkdir -p /build/out \
     && cp target/release/sqe-bench /build/out/
 
-FROM gcr.io/distroless/cc-debian12:nonroot@sha256:fccdbb0a547c14e23fcf4ce8ad62ca5d43b4faae8d22cd292f490fef9946c96e
+FROM cgr.dev/chainguard/glibc-dynamic@sha256:eaec65b25f35619be16f4992e7bae1128eafcf63c114f2859b800a7020c1ef70
+
+USER 65532
 
 LABEL org.opencontainers.image.title="sqe-bench" \
       org.opencontainers.image.description="TPC benchmark data generator for SQE"

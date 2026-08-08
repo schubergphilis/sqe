@@ -29,7 +29,9 @@ RUN cargo build --release --locked \
     && cp target/release/sqe-server target/release/sqe-worker \
          target/release/sqe-cli /build/out/
 
-FROM gcr.io/distroless/cc-debian12:nonroot@sha256:fccdbb0a547c14e23fcf4ce8ad62ca5d43b4faae8d22cd292f490fef9946c96e
+FROM cgr.dev/chainguard/glibc-dynamic@sha256:eaec65b25f35619be16f4992e7bae1128eafcf63c114f2859b800a7020c1ef70
+
+USER 65532
 
 ARG VERSION=dev
 ARG BUILD_DATE
