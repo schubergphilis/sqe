@@ -8,10 +8,11 @@ path = "."
 criticality = "high"
 data_classification = "internal"
 # Shipped container: simple multi-stage root Dockerfile (rust bookworm builder
-# -> distroless runtime, final stage `runtime`, UID 65532). Same file for local
-# compose, data-platform quickstart/sqe, and aikido-build (kaniko
-# --target=runtime). Container CVEs gated by aikido-image-vuln (grype
-# --fail-on high) on merge.
+# -> Chainguard glibc-dynamic runtime, final stage `runtime`, UID 65532).
+# Same file for local compose, data-platform quickstart/sqe, and aikido-build
+# (kaniko --target=runtime). Container CVEs gated by aikido-image-vuln
+# (grype --fail-on high) on merge. Chainguard over distroless: grype finds
+# unfixed debian libc criticals on distroless/cc; Chainguard stays clean.
 
 [config]
 image_scan = true

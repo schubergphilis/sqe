@@ -107,7 +107,8 @@ RUN cargo build --release --locked --no-default-features \
 
 # ── Runtime ──────────────────────────────────────────────────
 # glibc + libgcc + CA certs. No shell, no apt, no OpenSSL.
-FROM gcr.io/distroless/cc-debian12:nonroot
+FROM cgr.dev/chainguard/glibc-dynamic
+USER 65532
 COPY --from=builder /build/target/release/sqe-server /usr/local/bin/
 COPY --from=builder /build/target/release/sqe-worker /usr/local/bin/
 COPY --from=builder /build/target/release/sqe-cli /usr/local/bin/
@@ -117,15 +118,15 @@ ENTRYPOINT ["/usr/local/bin/sqe-server"]
 
 The Dockerfile is two stages and one cargo invocation. No chef recipe, no sccache, no BuildKit cache mounts. Local compose, the data-platform quickstart, and aikido/kaniko all use the same file. The builder pin matches `rust-toolchain.toml`.
 
-The runtime is distroless: glibc, libgcc, and CA certificates. That is the full list of OS dependencies SQE needs. The binaries link `libc` / `libm` / `libgcc`, and TLS is rustls end to end (no `libssl`). A static busybox `wget` exists only for image and compose healthchecks. Kubernetes probes `/healthz` over HTTP and never calls it.
+The runtime is Chainguard glibc-dynamic: glibc, libgcc, and CA certificates. That is the full list of OS dependencies SQE needs. The binaries link `libc` / `libm` / `libgcc`, and TLS is rustls end to end (no `libssl`). A static busybox `wget` exists only for image and compose healthchecks. Kubernetes probes `/healthz` over HTTP and never calls it.
 
-We used to ship `debian:bookworm-slim` with `ca-certificates`, `libssl3`, and `curl`, and a cargo-chef/sccache build graph that only paid off under BuildKit. Kaniko ignored the mounts and paid the cold compile every time. Distroless cut the OS CVE count from hundreds to a handful. Dropping chef/sccache cut the Dockerfile to something every consumer can read in one screen.
+We used to ship `debian:bookworm-slim` with hundreds of OS CVEs, then distroless, which still failed the Aikido image gate on unfixed debian libc criticals. Chainguard is clean under `grype --fail-on high`. Dropping chef/sccache cut the Dockerfile to something every consumer can read in one screen.
 
 ::: {.antipattern}
-**Antipattern: a full userland in a Rust service image "just in case".** A shell and curl feel convenient for `docker exec` debugging. They also import perl, tar, util-linux, and every CVE those packages carry. If the binary only needs glibc and CA certs, put it on distroless. Keep a separate debug image if operators need a shell. Do not pay the CVE bill on every production node for a tool you use once a quarter.
+**Antipattern: a full userland in a Rust service image "just in case".** A shell and curl feel convenient for `docker exec` debugging. They also import perl, tar, util-linux, and every CVE those packages carry. If the binary only needs glibc and CA certs, put it on a minimal base that scanners actually clear. Keep a separate debug image if operators need a shell. Do not pay the CVE bill on every production node for a tool you use once a quarter.
 :::
 
-The non-root user matters. Distroless `nonroot` is UID/GID 65532, and the Helm chart sets `runAsUser` / `runAsGroup` / `fsGroup` to match. This is not security theater. Kubernetes `PodSecurityStandard` policies can enforce non-root containers. Running as root means your deployment will be rejected by any cluster with basic security hygiene enabled.
+The non-root user matters. Chainguard nonroot is UID/GID 65532, and the Helm chart sets `runAsUser` / `runAsGroup` / `fsGroup` to match. This is not security theater. Kubernetes `PodSecurityStandard` policies can enforce non-root containers. Running as root means your deployment will be rejected by any cluster with basic security hygiene enabled.
 
 
 ## Helm Chart: Two Topologies, One Chart

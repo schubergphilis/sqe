@@ -33,7 +33,7 @@ spec:
       terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
       securityContext:
         runAsNonRoot: true
-        # Matches distroless/cc-debian12:nonroot (UID/GID 65532).
+        # Matches Chainguard glibc-dynamic nonroot (UID/GID 65532).
         runAsUser: 65532
         runAsGroup: 65532
         fsGroup: 65532
