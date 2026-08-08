@@ -248,6 +248,57 @@ The gate on that path is "no delete files and every file under 3 MB", which is e
 small and freshly-created table and no merge-on-read table. That is why benchmarks
 never saw it and the access-control fixture hit it on every run.
 
+## Every assertion, and why only some of them compare
+
+The twenty-one rows above are the cases where the same statement can be put through
+both engines. The suite is larger than that: 31 SQE cases, 10 Spark object-level
+cases, 10 cross-engine parity cases. Most of the SQE-only ones are not oversights,
+they are things Spark structurally cannot be asked. Here is the whole inventory, so
+"we tested access control" can be checked rather than believed.
+
+### Covered by both engines (the rows above)
+
+| SQE case | Spark case | Rows |
+|---|---|---|
+| `denied_before_any_grant` | `spark_denied_before_any_grant` | 1, 3 |
+| `grant_select_to_role_enables_exact_rows` | `spark_grant_select_to_role_enables_exact_rows` | 2 |
+| `role_grant_and_user_grant_both_apply` | `spark_role_grant_and_user_grant_both_apply` | 4 |
+| `revoke_disables_access` | `spark_revoke_disables_access` | 5 |
+| `ranger_deny_overrides_allow` | `spark_ranger_deny_overrides_allow` | 6, 7 |
+| `all_tables_in_schema_grant_covers_the_namespace` | `spark_all_tables_in_schema_grant_covers_the_namespace` | 8 |
+| `write_privileges_are_separate_from_read` | `spark_write_privileges_are_separate_from_read` | 9 |
+| `resource_column_masks_apply_to_engineer_only` | `column_mask_is_byte_identical_across_engines`, `an_unmasked_role_is_unmasked_in_both_engines` | 11, 12 |
+| `resource_row_filter_restricts_rows` | `row_filter_returns_identical_rows_across_engines` | 13, 14 |
+| `tag_column_mask_applies_from_iceberg_property` | `tag_column_mask_is_byte_identical_across_engines`, `unset_tag_stops_masking_in_both_engines` | 15, 16, 19 |
+| `remaining_mask_types_apply_live` | `a_named_mask_type_is_not_byte_portable` | 17 |
+| `resource_mask_beats_tag_mask_live` | `resource_and_tag_mask_precedence_diverges_across_engines` | 18 |
+
+### SQE only, and the reason
+
+| SQE case | Why it has no Spark counterpart |
+|---|---|
+| `tag_row_filter_restricts_rows` | Kyuubi Spark 3.5 throws `MISSING_ATTRIBUTES` on a row filter over a column the query does not project (Kyuubi #6889). A Spark assertion here would be measuring their bug, not the policy. |
+| `hash_mask_is_keyed_hmac` | The HMAC key is SQE's, held engine-side. Nothing for Spark to agree or disagree with. |
+| `unmappable_tag_mask_fails_closed` | A mask type SQE cannot map must restrict the column rather than return it raw. Fail-closed on an unsupported type is an engine-internal contract. |
+| `unknown_tag_state_denies` | Same shape: what SQE does when it cannot resolve the tag state at all. |
+| `ranger_outage_fails_closed` | Ranger is taken away and SQE must deny rather than pass through. Kyuubi's behaviour under the same outage is Kyuubi's design, not a parity claim. |
+| `cache_ttl_bounds_policy_staleness` | Bounds how long SQE may serve a stale policy. The two engines refresh on independent schedules by design. |
+| `show_grants_lists_both_roles`, `check_access_reflects_user_grants`, `show_schemas_describes_the_catalog_it_names` | SQE SQL surface. Spark has no equivalent statement. |
+| `sql_deny_blocks_a_granted_read_and_revoke_clears_it` | `DENY` is an SQE SQL extension. The resulting Ranger deny item IS cross-engine, and rows 6 and 7 cover that half. |
+| `a_non_admin_cannot_grant_under_the_default_gate`, `a_delegated_owner_grants_on_their_own_table_without_an_admin_role`, `deny_still_requires_an_admin_role_under_ranger_delegate` | Who may WRITE policy. Spark writes none. |
+| `one_table_grant_writes_the_namespace_it_needs`, `revoking_write_leaves_an_independent_read_grant_intact` | Assertions about the Ranger policies SQE authors, checked against Ranger directly rather than through a query. |
+| `insert_does_not_confer_storage_relocation` | `INSERT` must not carry `table-full-metadata-relocation`. A privilege-expansion claim about SQE's own grant mapping. |
+| `ranger_wiring_smoke_carol_can_query`, `fixture_round_trip_creates_services_and_policies`, `capture_live_tag_bundle` | Fixture and wiring guards. They fail loudly when the stack is misconfigured, so a green suite means something. |
+
+### Spark only, and the reason
+
+| Spark case | Why SQE has no counterpart |
+|---|---|
+| `object_denial_survives_the_frontend_defer_policy` (row 10) | SQE ignores `policyType-0` on the frontend service entirely. The defer item exists because Kyuubi default-denies without it. There is nothing to assert on the SQE side. |
+| `mismatched_identity_reveals_the_two_tier_trust_split` | Deliberately hands the two tiers different identities: Polaris verifies a JWT signature, Kyuubi trusts an asserted OS username. SQE has one identity per session. |
+| `a_service_account_catalog_in_the_session_defeats_per_user_identity` | A leftover root-credentialed catalog alias in the Spark session. SQE has no equivalent alias mechanism. |
+| `a_failed_projection_rolls_back_the_tag` | The tag projector writes the Iceberg property AND Ranger's tag store. When the second write fails the first is rolled back, because a tag in one store and not the other is row 19 again with the statement reporting success. |
+
 ## What the table is actually worth
 
 Of twenty-one rows, two carry no comparison at all: one because I never ran the
