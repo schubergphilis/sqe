@@ -1,6 +1,6 @@
 ---
 title: "Same policy, two engines, twenty-one queries"
-description: "We wrote one Ranger policy set and ran the same SQL through SQE and through Spark, then compared the output cell by cell. Most of it matches byte for byte, including tag-based masking. Four cases do not, and each one is a different reason: Kyuubi ignores the mask transformer our engine honors, the two disagree about whether a resource mask or a tag mask wins, renaming a column breaks each engine in a different direction, and adding one to a masked table stops SQE dead. Here is the full table, with the query, both outputs, and what causes each divergence."
+description: "We wrote one Ranger policy set and ran the same SQL through SQE and through Spark, then compared the output cell by cell. Fifteen of the nineteen comparable rows match, including tag-based masking. Four do not, and each is a different reason: Kyuubi ignores the mask transformer our engine honors, the two disagree about whether a resource mask or a tag mask wins, a tag that is not projected is invisible to Spark, and a frontend tier can refuse before the one you think is deciding. The row worth acting on first is one where both engines AGREE and both are wrong: a rename silently unmasks a column. Full table, with the query and both outputs."
 pubDate: "2026-08-07"
 author: "Jacob Verhoeks"
 tags:
@@ -19,15 +19,22 @@ That is the whole promise of putting access control in Apache Ranger instead of 
 engine, and until this month we had never checked it properly. We had a demo that
 compared one column mask across SQE and Spark and called it parity.
 
-Nineteen assertions later, most of the promise holds. Four cases break it, in four
+Twenty-one assertions later, most of the promise holds. Four cases break it, in four
 different ways, and the differences are more instructive than the matches. The tables
 below give the SQL and the full output from both engines for each one.
+
+One row is an agreement that is worse than a divergence: both engines get it wrong
+identically. That one cost me a published correction, and it is the last section.
 
 ## How to read the tables
 
 Every row is a real query against a live stack: Apache Polaris 1.7, Apache Ranger 2.8,
 Keycloak 26.5, and Spark 3.5.9 with Kyuubi Authz 1.11.1. The output columns are what the
-engines printed, not a summary of them.
+engines printed, not a summary of them: each cell was transcribed from a captured run,
+not reconstructed from what a test asserts. That distinction is not pedantry. The first
+version of this post got row 20 wrong precisely because the claim was derived from a
+test's logic instead of copied from output, and I caught the same slip a second time
+while correcting it.
 
 The fixture is one table, seeded identically every run:
 
@@ -99,14 +106,14 @@ engines read.
 | 17 | **named** mask type `MASK_SHOW_LAST_4` on `ssn` | `SELECT id, ssn ...`<br>`1  xxx-xx-1111`<br>`2  xxx-xx-2222`<br>`3  xxx-xx-3333` | same statement<br>`1  nnnUnnU1111`<br>`2  nnnUnnU2222`<br>`3  nnnUnnU3333` | **no** |
 | 18 | resource mask `concat('RES-', substr({col},8,4))` AND tag mask on `ssn` at once | `SELECT id, ssn ...`<br>`1  RES-1111`<br>`2  RES-2222`<br>`3  RES-3333` | same statement<br>`1  xxx-xx-1111`<br>`2  xxx-xx-2222`<br>`3  xxx-xx-3333` | **no** |
 | 19 | tag mask, projector OFF (`project-tags = false`) | `SELECT id, ssn ...`<br>`1  xxx-xx-1111`<br>`2  xxx-xx-2222`<br>`3  xxx-xx-3333` | same statement<br>`1  111-11-1111`<br>`2  222-22-2222`<br>`3  333-33-3333` | **no** |
-| 20 | tag mask, then `ALTER TABLE sales_wh.ac.orders RENAME COLUMN ssn TO tax_id` | `SELECT id, tax_id FROM sales_wh.ac.orders ORDER BY id`<br>`1`<br>`2`<br>`3`<br>one column, `tax_id` absent, no error | `SELECT id, tax_id FROM acwh.ac.orders ORDER BY id`<br>`1  111-11-1111`<br>`2  222-22-2222`<br>`3  333-33-3333` | **no** |
-| 21 | column mask on `ssn`, then `ALTER TABLE sales_wh.ac.orders ADD COLUMN nickname VARCHAR` | `SELECT id, ssn, nickname FROM sales_wh.ac.orders ORDER BY id`<br>`Internal error: PhysicalExpr Column references column 'nickname' at index 2 (zero-based) but input schema only has 2 columns: ["id", "ssn"]` | not measured | n/a |
+| 20 | tag mask, then `ALTER TABLE sales_wh.ac.orders RENAME COLUMN ssn TO tax_id` | `SELECT id, tax_id FROM sales_wh.ac.orders ORDER BY id`<br>`1  111-11-1111`<br>`2  222-22-2222`<br>`3  333-33-3333` | `SELECT id, tax_id FROM acwh.ac.orders ORDER BY id`<br>`1  111-11-1111`<br>`2  222-22-2222`<br>`3  333-33-3333` | yes, and both WRONG |
+| 21 | column mask on `ssn`, then `ALTER TABLE sales_wh.ac.orders ADD COLUMN nickname VARCHAR` | `SELECT id, ssn, nickname FROM sales_wh.ac.orders ORDER BY id`<br>`1  xxx-xx-1111  NULL`<br>`2  xxx-xx-2222  NULL`<br>`3  xxx-xx-3333  NULL` | **not measured** | n/a |
 
 Row 15 is the headline. One tag applied through SQL, one mask rule written once against
 that tag, and both engines render the same bytes. That needed a projector to achieve,
 and row 19 is what it looks like without one.
 
-## The four divergences, and why each happens
+## The four divergences, and the one shared defect
 
 ### Row 17: the named mask type
 
@@ -166,59 +173,160 @@ success.
 
 `sqe.column-tags` is keyed by column NAME, and no schema-change path rewrites it. So
 after `RENAME COLUMN ssn TO tax_id` the association names a column that no longer
-exists.
-
-I predicted, when I wrote the test, that the mask would stop applying in both engines
-and the data would come back raw in both. That was wrong, and the test caught me:
+exists, no tag matches, and the mask stops applying:
 
 ```
 SELECT id, tax_id FROM ac.orders ORDER BY id
-  SQE:   [["1"], ["2"], ["3"]]
+  SQE:   [["1","111-11-1111"], ["2","222-22-2222"], ["3","333-33-3333"]]
   Spark: [["1","111-11-1111"], ["2","222-22-2222"], ["3","333-33-3333"]]
 ```
 
-SQE returns ONE column. It drops `tax_id` from the result, silently, with no error, for
-a query that explicitly projected it. Spark returns the raw value.
+Both engines hand back the raw value. A routine rename unmasks a governed column and
+neither engine says anything is wrong.
 
-So the stricter engine hides a column you asked for and the other hands over unmasked
-data, and neither says anything is wrong. I do not yet know the mechanism on the SQE
-side. I know exactly what it does, which is enough to write down and not enough to fix
-confidently.
+I have to correct something here, because the first version of this post got it
+wrong and the way it got it wrong is the interesting part.
 
-A query returning fewer columns than it projected, without an error, is a defect
-independent of access control.
+I originally reported that the engines broke DIFFERENTLY: that SQE silently dropped
+`tax_id` from the result while Spark returned it raw, and I wrote several paragraphs
+about the stricter engine hiding a column while the other leaked data. That
+measurement was real. It was a measurement of a different bug.
 
-## Row 21, the one that is not a divergence
+Underneath sat a scan defect with nothing to do with access control. SQE's
+small-file read path resolved a query's projection against each data FILE's parquet
+column names rather than against Iceberg field ids. A renamed column matches no name
+in a file written before the rename, and the miss was silently discarded. So the
+column vanished from the result, and it vanished whether or not any policy existed.
 
-Adding a column to a table that already has a column mask breaks SQE outright:
+The control that settled it: run the same DDL and the same query with NO policy at
+all. Both cases reproduced, with `masks=0 filters=0 restricted=0` in the log. Two
+findings I had filed as access-control defects were one scan bug.
+
+Worth being blunt: both engines returning the value raw is what I predicted before
+writing the original test. I abandoned the prediction because the measurement
+disagreed with it, which is normally the right instinct. Here the measurement was
+of a layer I had not thought to suspect.
+
+### Row 21: adding a column
+
+Adding a column to a table that already has a column mask used to break SQE outright:
 
 ```
-PhysicalExpr Column references column 'nickname' at index 2 (zero-based)
+PhysicalExpr Column references column 'nickname' at index 2
 but input schema only has 2 columns: ["id", "ssn"]
 ```
 
-The rewritten plan and the scan schema disagree. It fails closed, so nothing leaks, but
-a governed table becomes unqueryable after a routine `ADD COLUMN`. I never got a Spark
-number for it, because the comparison helper checks SQE first and never reached the
-other engine.
+Same root cause. The scan dropped `nickname`, because no file written before the
+`ALTER` contains it, and the mask projection sitting above the scan then indexed
+past the end of a batch that had quietly become narrower. The plan rewriter was
+never wrong. It was the first consumer to notice.
 
-Two questions about DDL, two defects. We had simply never asked what a schema change
-does to a policy, and that is the most uncomfortable finding in this whole exercise:
-the gaps were not in the hard parts. They were in the ordinary ones.
+Fixed the same way: resolve projected columns to Iceberg field ids, and backfill a
+typed NULL for a field id a file genuinely does not carry. The masked table is
+queryable again, `ssn` is still masked, and `nickname` reads as NULL.
+
+I did not run the identical statement through Spark in the same fixture state, so
+that cell says **not measured** rather than guessing that it matches.
+
+### The worst one, which no row shows
+
+Chasing those two turned up a third symptom of the same defect that is worse than
+either, and it never appeared in this table because no governance test would think
+to look for it:
+
+```
+SELECT classified FROM scratch.ev        -- after RENAME secret TO classified
+  +------------+
+  | classified |
+  | 7          |     <- these are `id`'s values
+  | 8          |
+```
+
+When NO projected name matched the file, the empty index list was treated as
+`COUNT(*)`, which reads parquet column 0 for a row count. The real `COUNT(*)` flag
+is computed separately, and was false, so that raw first column went out as the
+query's data. A query asking for one column received a different column's values,
+under the name it asked for, with no error.
+
+The gate on that path is "no delete files and every file under 3 MB", which is every
+small and freshly-created table and no merge-on-read table. That is why benchmarks
+never saw it and the access-control fixture hit it on every run.
+
+## Every assertion, and why only some of them compare
+
+The twenty-one rows above are the cases where the same statement can be put through
+both engines. The suite is larger than that: 31 SQE cases, 10 Spark object-level
+cases, 10 cross-engine parity cases. Most of the SQE-only ones are not oversights,
+they are things Spark structurally cannot be asked. Here is the whole inventory, so
+"we tested access control" can be checked rather than believed.
+
+### Covered by both engines (the rows above)
+
+| SQE case | Spark case | Rows |
+|---|---|---|
+| `denied_before_any_grant` | `spark_denied_before_any_grant` | 1, 3 |
+| `grant_select_to_role_enables_exact_rows` | `spark_grant_select_to_role_enables_exact_rows` | 2 |
+| `role_grant_and_user_grant_both_apply` | `spark_role_grant_and_user_grant_both_apply` | 4 |
+| `revoke_disables_access` | `spark_revoke_disables_access` | 5 |
+| `ranger_deny_overrides_allow` | `spark_ranger_deny_overrides_allow` | 6, 7 |
+| `all_tables_in_schema_grant_covers_the_namespace` | `spark_all_tables_in_schema_grant_covers_the_namespace` | 8 |
+| `write_privileges_are_separate_from_read` | `spark_write_privileges_are_separate_from_read` | 9 |
+| `resource_column_masks_apply_to_engineer_only` | `column_mask_is_byte_identical_across_engines`, `an_unmasked_role_is_unmasked_in_both_engines` | 11, 12 |
+| `resource_row_filter_restricts_rows` | `row_filter_returns_identical_rows_across_engines` | 13, 14 |
+| `tag_column_mask_applies_from_iceberg_property` | `tag_column_mask_is_byte_identical_across_engines`, `unset_tag_stops_masking_in_both_engines` | 15, 16, 19 |
+| `remaining_mask_types_apply_live` | `a_named_mask_type_is_not_byte_portable` | 17 |
+| `resource_mask_beats_tag_mask_live` | `resource_and_tag_mask_precedence_diverges_across_engines` | 18 |
+
+### SQE only, and the reason
+
+| SQE case | Why it has no Spark counterpart |
+|---|---|
+| `tag_row_filter_restricts_rows` | Kyuubi Spark 3.5 throws `MISSING_ATTRIBUTES` on a row filter over a column the query does not project (Kyuubi #6889). A Spark assertion here would be measuring their bug, not the policy. |
+| `hash_mask_is_keyed_hmac` | The HMAC key is SQE's, held engine-side. Nothing for Spark to agree or disagree with. |
+| `unmappable_tag_mask_fails_closed` | A mask type SQE cannot map must restrict the column rather than return it raw. Fail-closed on an unsupported type is an engine-internal contract. |
+| `unknown_tag_state_denies` | Same shape: what SQE does when it cannot resolve the tag state at all. |
+| `ranger_outage_fails_closed` | Ranger is taken away and SQE must deny rather than pass through. Kyuubi's behaviour under the same outage is Kyuubi's design, not a parity claim. |
+| `cache_ttl_bounds_policy_staleness` | Bounds how long SQE may serve a stale policy. The two engines refresh on independent schedules by design. |
+| `show_grants_lists_both_roles`, `check_access_reflects_user_grants`, `show_schemas_describes_the_catalog_it_names` | SQE SQL surface. Spark has no equivalent statement. |
+| `sql_deny_blocks_a_granted_read_and_revoke_clears_it` | `DENY` is an SQE SQL extension. The resulting Ranger deny item IS cross-engine, and rows 6 and 7 cover that half. |
+| `a_non_admin_cannot_grant_under_the_default_gate`, `a_delegated_owner_grants_on_their_own_table_without_an_admin_role`, `deny_still_requires_an_admin_role_under_ranger_delegate` | Who may WRITE policy. Spark writes none. |
+| `one_table_grant_writes_the_namespace_it_needs`, `revoking_write_leaves_an_independent_read_grant_intact` | Assertions about the Ranger policies SQE authors, checked against Ranger directly rather than through a query. |
+| `insert_does_not_confer_storage_relocation` | `INSERT` must not carry `table-full-metadata-relocation`. A privilege-expansion claim about SQE's own grant mapping. |
+| `ranger_wiring_smoke_carol_can_query`, `fixture_round_trip_creates_services_and_policies`, `capture_live_tag_bundle` | Fixture and wiring guards. They fail loudly when the stack is misconfigured, so a green suite means something. |
+
+### Spark only, and the reason
+
+| Spark case | Why SQE has no counterpart |
+|---|---|
+| `object_denial_survives_the_frontend_defer_policy` (row 10) | SQE ignores `policyType-0` on the frontend service entirely. The defer item exists because Kyuubi default-denies without it. There is nothing to assert on the SQE side. |
+| `mismatched_identity_reveals_the_two_tier_trust_split` | Deliberately hands the two tiers different identities: Polaris verifies a JWT signature, Kyuubi trusts an asserted OS username. SQE has one identity per session. |
+| `a_service_account_catalog_in_the_session_defeats_per_user_identity` | A leftover root-credentialed catalog alias in the Spark session. SQE has no equivalent alias mechanism. |
+| `a_failed_projection_rolls_back_the_tag` | The tag projector writes the Iceberg property AND Ranger's tag store. When the second write fails the first is rolled back, because a tag in one store and not the other is row 19 again with the statement reporting success. |
 
 ## What the table is actually worth
 
-Sixteen of the twenty-one rows match, including every row filter and every mask written
-as a portable expression. Tag-based masking matches once the association is
-projected. That is a working multi-engine governance story, and it is not a story
-Databricks or Snowflake tells, because in both of those the engine IS the policy
-authority and there is only ever one engine to ask.
+Of twenty-one rows, two carry no comparison at all: one because I never ran the
+identical statement through both engines, one because I did not measure the Spark
+side. Of the nineteen that do compare, fifteen agree, including every row filter and
+every mask written as a portable expression, and including tag-based masking once the
+association is projected. Row 1 agrees on the outcome and differs only in the message.
 
-Five do not match, and two of those carry no comparison at all: one because I did not
-run it, one because the SQE side dies first. Of the real divergences, two are
-cosmetic-but-breaking (a mask vocabulary and a precedence order), and two are defects we
-now have written down.
+Four diverge: a mask vocabulary, a precedence order, an unprojected tag, and a tier
+that answers before the one you think is deciding.
 
-If you are evaluating this pattern, the useful question is not whether the engines agree.
-It is whether you can enumerate where they do not. That is what the table is for, and it
-is why every cell that says **not measured** says it instead of guessing.
+That is a working multi-engine governance story, and it is not a story Databricks or
+Snowflake tells, because in both of those the engine IS the policy authority and
+there is only ever one engine to ask.
+
+The row I would actually act on first is none of the four. It is row 20, where both
+engines agree and both are wrong: a rename silently unmasks a column. Agreement is
+what this whole exercise was set up to look for, and it turns out agreement is not
+the same as correctness. A cross-engine comparison finds the places two
+implementations disagree. It is structurally blind to the places they share an
+assumption, and "the tag association is keyed by column name" is exactly that kind
+of shared assumption.
+
+If you are evaluating this pattern, the useful question is not whether the engines
+agree. It is whether you can enumerate where they do not, and whether you have some
+other check for the things they would get wrong together. That is what the table is
+for, and it is why every cell that says **not measured** says it instead of guessing.

@@ -1,5 +1,27 @@
 # SQE — Next Steps
 
+> Status as of 2026-08-08. **Two "access-control DDL defects" were one scan bug, and it was returning the wrong column's data.**
+>
+> **The control experiment is the whole story.** Both DDL findings were measured on a MASKED table, so both were filed against `sqe-policy`. Running the identical DDL and query with NO policy at all reproduced both, with `masks=0 filters=0 restricted=0` in the log. The fix belonged in the scan.
+>
+> **`iceberg_scan.rs` matched projections against each data FILE's parquet names, not Iceberg field ids.** Gate: no delete files and every file under 3 MB, so every small and freshly-created table and no merge-on-read table. That is why benchmarks never saw it and the access-control fixture hit it every run.
+>
+> **Three symptoms, and the third is the bad one.** `SELECT id, ssn, nickname` after ADD COLUMN returned 2 columns silently. `SELECT id, classified` after a rename reset the Flight connection. And `SELECT classified`, where NO projected name matched the file, returned `id`'s VALUES under the name `classified`: the empty index list was treated as `COUNT(*)`, which reads parquet column 0, while the real count-star flag was false. Fixed by field-id resolution plus a typed-NULL backfill.
+>
+> **The published rename finding was wrong, and the correction is instructive.** I had reported the engines breaking DIFFERENTLY (SQE dropping the column, Spark returning it raw). With the scan fixed they AGREE: both return it RAW. What remains is one shared defect, a rename silently unmasking a column, which is what I predicted BEFORE writing the original test and then abandoned because the measurement disagreed. The measurement was of a different layer.
+>
+> **A cross-engine comparison is structurally blind to what both engines get wrong together.** Agreement is not correctness. `sqe.column-tags` keyed by column name is exactly that kind of shared assumption.
+>
+> **`SHOW MASKING POLICIES` shipped blind to tag policies.** It walked only `bundle.policies`, never `bundle.tag_policies`, so a tag-masked deployment got an EMPTY listing: the same "nothing is masked here" hazard the refusing trait default was written to prevent, reached from the other side.
+>
+> **`SET MASKING POLICY` refuses resource policies on purpose.** Ranger evaluates a policy's database/table/column lists as a CROSS PRODUCT, so appending a column would widen the mask to tables nobody named. Tag policies resolve to their tag and reuse the projector.
+>
+> **The quickstart's Spark no longer runs as root.** A root-credentialed catalog alias defeats per-user identity for the whole session, because a per-user token governs only the alias it is attached to. `parity-test.sh` now asserts the property: a tokenless `spark-sql` must fail to load the table.
+>
+> **CI was not publishing to Harbor at all.** Two guardrails failed in an early stage, so every build and publish job was SKIPPED. Both were false positives: gitleaks on a plan doc's quickstart password, and "license evidence missing" for our own crates because syft reads Cargo.lock (no licenses) and deps.dev cannot resolve a workspace member or a vendored fork.
+>
+> **NEXT:** rewrite the stale tag association on `RENAME COLUMN` so a rename cannot silently unmask a column, then decide the mask-precedence question (align SQE to Ranger's tag-first, or keep resource-first and document it).
+
 > Status as of 2026-08-06. **Spark is subject to the same object-level access control as SQE, and it needed no engine code.** Polaris already runs its own Ranger plugin keyed on the federated OIDC identity, so the whole thing was a credential swap: give Spark's Iceberg REST catalog a per-user Keycloak token and Polaris authorizes the end user instead of `root`. `token-refresh-enabled=false` is load-bearing, because Iceberg otherwise exchanges the external JWT against Polaris's own token endpoint and the identity silently reverts, at which point every denial test passes for the wrong reason.
 >
 > **Six live probes before a line of design, and the last two changed it.** Probes 1 and 2 each disabled one tier, which is how the gap between them stayed hidden: run together, Kyuubi refuses BEFORE Polaris is consulted, and since SQE ignores `policyType-0` entirely the two engines disagreed on every object-level grant. Object level belongs to Polaris, so the shared `query` service carries one deliberate blanket allow that makes Kyuubi defer. It cannot be a self-documenting named policy, because Ranger auto-generates `all - database, table, column` over that exact resource signature and refuses a second one with error 3010; the grant API merges an item into the existing match instead. Probe 6: Polaris refuses an unauthorized write at `ADD_TABLE_SNAPSHOT`, not at `LOAD_TABLE`, so a refused write can leave staged files behind.
