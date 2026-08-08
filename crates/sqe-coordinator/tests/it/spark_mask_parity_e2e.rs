@@ -685,7 +685,7 @@ async fn resource_and_tag_mask_precedence_diverges_across_engines() {
 /// a fix trips this test.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs quickstart/polaris-ranger-keycloak plus spark; run scripts/spark-access-control-test.sh"]
-async fn adding_a_column_to_a_masked_table_breaks_the_query_in_sqe() {
+async fn adding_a_column_to_a_masked_table_keeps_it_queryable() {
     spark_gate!();
     let _guard = crate::common::serial().lock().await;
     let ctx = ac_setup().await;
@@ -763,27 +763,63 @@ async fn adding_a_column_to_a_masked_table_breaks_the_query_in_sqe() {
     )
     .await;
 
+    // Was: "input schema only has 2 columns", which made a governed table unqueryable
+    // after a routine ADD COLUMN. The cause was NOT the plan rewriter -- the same
+    // query failed with no policy at all. The small-file scan path resolved the
+    // projection by name against each data file, so `nickname` (absent from files
+    // written before the ALTER) was dropped, and the mask projection above the scan
+    // then indexed past the end of a narrower batch. Field-id resolution plus a NULL
+    // backfill fixes it, and the mask projection was never wrong.
     assert!(
-        outcome.contains("input schema only has") || outcome.contains("PhysicalExpr"),
-        "Once the schema cache caught up, expected the plan/scan mismatch that makes a \
-         masked table unqueryable after ADD COLUMN. Got: {outcome}\n\
-         If this now says SUCCESS the defect is FIXED: delete this test and update the \
-         access-control matrix."
+        outcome.starts_with("SUCCESS"),
+        "a masked table must stay queryable after ADD COLUMN. Got: {outcome}"
+    );
+
+    // Fail-closed check: the fix must not have widened anything. ssn is still masked,
+    // and the new column reads as NULL rather than as some other column's values.
+    let batches = ctx
+        .handler
+        .execute(
+            &ctx.bob,
+            &format!("SELECT id, ssn, nickname FROM {ORDERS} ORDER BY id"),
+            None,
+        )
+        .await
+        .expect("the masked table is queryable again");
+    assert!(
+        col_strings(&batches, "ssn")
+            .iter()
+            .all(|v| v.starts_with("xxx-xx-")),
+        "the mask must still apply after ADD COLUMN. Got: {:?}",
+        col_strings(&batches, "ssn")
+    );
+    assert!(
+        // `fmt_val` renders a NULL as the literal "NULL".
+        col_strings(&batches, "nickname").iter().all(|v| v == "NULL"),
+        "a column added after the data files were written reads as NULL, never as \
+         another column's values. Got: {:?}",
+        col_strings(&batches, "nickname")
     );
 }
 
-/// DEFECT, pinned: renaming a tagged column breaks it DIFFERENTLY in each engine.
+/// DEFECT, pinned: renaming a tagged column silently UNMASKS it, in both engines.
 ///
 /// `sqe.column-tags` is keyed by column NAME and no schema-change path rewrites it, so
 /// after `RENAME COLUMN ssn TO tax_id` the association names a column that is gone.
 ///
-/// Measured, and not what a reader would predict: SQE silently DROPS the column from
-/// the result (`SELECT id, tax_id` returns ONE column, no error) while Spark returns it
-/// RAW. The stricter engine hides a column that was asked for; the other hands over
-/// unmasked data. The mechanism on the SQE side is not confirmed. The behaviour is.
+/// Both engines return the column RAW: no tag matches the new name, so no mask fires.
+/// A routine rename silently unmasks a governed column, and nothing reports it.
+///
+/// This test previously asserted the engines broke DIFFERENTLY, with SQE dropping the
+/// column entirely. That was real but it was not an access-control behaviour: the
+/// small-file scan path resolved the projection against each data FILE's parquet
+/// names, so a renamed column matched nothing and was silently discarded. With field-id
+/// resolution in place the engines agree, and what is left is the one shared defect --
+/// which is what I predicted before writing the original test, and then talked myself
+/// out of because the measurement disagreed. The measurement was of a different bug.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs quickstart/polaris-ranger-keycloak plus spark; run scripts/spark-access-control-test.sh"]
-async fn renaming_a_tagged_column_breaks_differently_in_each_engine() {
+async fn renaming_a_tagged_column_silently_unmasks_it_in_both_engines() {
     spark_gate!();
     let _guard = crate::common::serial().lock().await;
     let ctx = ac_setup().await;
@@ -836,18 +872,29 @@ async fn renaming_a_tagged_column_breaks_differently_in_each_engine() {
     )
     .await;
 
+    // Both engines return the column, RAW. The tag association is keyed by column
+    // NAME in `sqe.column-tags` and no schema-change path rewrites it, so after the
+    // rename it names a column that no longer exists, no tag matches, and the mask
+    // silently stops applying. Identically in both engines, because both resolve the
+    // association by name.
     assert_eq!(
-        sqe.first().map(Vec::len),
-        Some(1),
-        "SQE drops the renamed column from the result entirely, returning only `id` \
-         for `SELECT id, tax_id` with no error. If it now returns two columns the \
-         behaviour changed: check whether the value is masked or raw, and update the \
-         access-control matrix either way. Got: {sqe:?}"
+        sqe, spark,
+        "the engines must agree here: the same stale association is invisible to \
+         both. sqe={sqe:?} spark={spark:?}"
     );
     assert_eq!(
-        spark.first().and_then(|r| r.get(1)).map(String::as_str),
+        sqe.first().map(Vec::len),
+        Some(2),
+        "`SELECT id, tax_id` must return BOTH columns. Getting one back was a SCAN \
+         defect, not an access-control one: the small-file read path resolved the \
+         projection against each data file's parquet names, so a renamed column \
+         matched nothing and was dropped. Fixed by resolving field ids. Got: {sqe:?}"
+    );
+    assert_eq!(
+        sqe.first().and_then(|r| r.get(1)).map(String::as_str),
         Some("111-11-1111"),
-        "Spark returns the renamed column RAW, because the projected association still \
-         names the old column. Got: {spark:?}"
+        "the renamed column comes back RAW in both engines, because the tag \
+         association still names `ssn`. THIS is the real defect: a rename silently \
+         unmasks a governed column. Got: {sqe:?}"
     );
 }
