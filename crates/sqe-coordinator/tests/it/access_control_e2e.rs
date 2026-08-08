@@ -3288,3 +3288,86 @@ async fn set_masking_policy_refuses_a_resource_policy() {
         col_strings(&tags, "column")
     );
 }
+
+/// A dropped column does not leave its classification behind for the next column
+/// of the same name.
+///
+/// `sqe.column-tags` is keyed by NAME. Leaving a dropped column's entry looks inert,
+/// because a column absent from the schema is never consulted, so this is not a leak.
+/// It is the other failure: `ADD COLUMN ssn` months later would silently inherit a
+/// mask nobody asked for, on data that has nothing to do with the original column.
+///
+/// Fails-closed rather than open, which is why it is worth a test rather than a
+/// panic: a surprising mask is much harder to explain than a missing one, and the
+/// operator has no statement that would show them why it is happening.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs quickstart/polaris-ranger-keycloak; run scripts/access-control-test.sh"]
+async fn a_dropped_column_does_not_bequeath_its_tags_to_a_new_one() {
+    ac_gate!();
+    let _guard = crate::common::serial().lock().await;
+    let ctx = ac_setup().await;
+    grant_read_to_both_roles(&ctx).await;
+
+    ctx.ranger
+        .create_policy(tag_mask_policy(
+            &format!("{PREFIX}drop-bequeath"),
+            "bequeath_pii",
+            serde_json::json!({
+                "dataMaskType": "hive:CUSTOM",
+                "valueExpr": "concat('xxx-xx-', substr({col},8,4))",
+            }),
+        ))
+        .await
+        .expect("create the tag mask");
+    set_column_tag(&ctx, "ssn", "bequeath_pii").await;
+
+    // Masked first, so the drop is what changes things.
+    crate::common::eventually("the tag mask to apply to ssn", || async {
+        let b = ctx
+            .handler
+            .execute(&ctx.bob, &format!("SELECT ssn FROM {ORDERS}"), None)
+            .await
+            .map_err(|e| format!("{e}"))?;
+        if col_strings(&b, "ssn").iter().all(|v| v.starts_with("xxx-xx-")) {
+            Ok(())
+        } else {
+            Err(format!("not masked yet: {:?}", col_strings(&b, "ssn")))
+        }
+    })
+    .await;
+
+    exec_ok(&ctx, &ctx.carol, &format!("ALTER TABLE {ORDERS} DROP COLUMN ssn")).await;
+    // The association must be gone with the column, so SHOW TAGS is the direct check.
+    let tags = ctx
+        .handler
+        .execute(&ctx.carol, &format!("SHOW TAGS ON {ORDERS}"), None)
+        .await
+        .expect("show tags");
+    assert!(
+        col_strings(&tags, "column").iter().all(|c| c != "ssn"),
+        "dropping a column must remove its tag association. Got: {:?}",
+        col_strings(&tags, "column")
+    );
+
+    // Re-add the same NAME. It is a different column with a new field id and no
+    // classification, so it must come back unmasked.
+    exec_ok(&ctx, &ctx.carol, &format!("ALTER TABLE {ORDERS} ADD COLUMN ssn VARCHAR")).await;
+    let values = crate::common::eventually("the re-added column to be readable", || async {
+        match ctx
+            .handler
+            .execute(&ctx.bob, &format!("SELECT ssn FROM {ORDERS}"), None)
+            .await
+        {
+            Ok(b) if total_rows(&b) == 3 => Ok(col_strings(&b, "ssn")),
+            Ok(b) => Err(format!("expected 3 rows, got {}", total_rows(&b))),
+            Err(e) => Err(format!("{e}")),
+        }
+    })
+    .await;
+    assert!(
+        values.iter().all(|v| v == "NULL"),
+        "a re-added column has no data and no inherited mask. Values starting \
+         `xxx-xx-` would mean the dropped column's classification was bequeathed to \
+         an unrelated new column. Got: {values:?}"
+    );
+}
