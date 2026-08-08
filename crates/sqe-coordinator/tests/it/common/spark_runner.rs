@@ -30,6 +30,16 @@ pub enum DenialTier {
     Polaris { principal: String, op: String },
     /// Kyuubi refused before Polaris was consulted.
     Kyuubi { user: String, privilege: String },
+    /// The catalog carries NO identity, so the request never became an
+    /// authorization question. Polaris rejects it before it can answer with a
+    /// structured error, and Iceberg reports an unparseable error body rather than
+    /// a `ForbiddenException`.
+    ///
+    /// Distinct from `Polaris` on purpose. A 403 on `LOAD_TABLE` means "we know who
+    /// you are and you may not"; this means "we do not know who you are". Both
+    /// refuse, and a test that accepted either could not tell a revoked grant from
+    /// a catalog that was never given a token.
+    Unauthenticated,
     /// Kyuubi cannot apply a row filter over a column the query does not project
     /// (Kyuubi #6889). A bug, not enforcement, and never counted as a denial.
     KyuubiRowFilterBug,
@@ -46,6 +56,14 @@ pub fn classify(output: &str) -> DenialTier {
     // would otherwise fall through to `Other`, reading like a real failure.
     if output.contains("MISSING_ATTRIBUTES") {
         return DenialTier::KyuubiRowFilterBug;
+    }
+    // Checked before the ForbiddenException arm: an unauthenticated catalog produces
+    // no parseable error body, so there is no `ForbiddenException` to find and this
+    // would otherwise fall through to `Other` and read like an unrelated crash.
+    if output.contains("No content to map due to end-of-input")
+        || output.contains("Unable to parse error response")
+    {
+        return DenialTier::Unauthenticated;
     }
     if let Some(rest) = output.split("AccessControlException").nth(1) {
         // Permission denied: user [bob] does not have [select] privilege on [db/t/c]
@@ -136,6 +154,18 @@ impl SparkOutcome {
                 self.raw
             ),
         }
+    }
+
+    /// Assert the catalog had NO usable identity, so the request never reached an
+    /// authorization decision.
+    pub fn expect_unauthenticated(&self, what: &str) {
+        assert_eq!(
+            self.tier,
+            DenialTier::Unauthenticated,
+            "{what}: expected an unauthenticated catalog, got {:?}\n{}",
+            self.tier,
+            self.raw
+        );
     }
 
     /// Single scalar cell, for `SELECT count(*)`.
@@ -482,5 +512,33 @@ mod tests {
                 vec!["2".to_string(), "xxx-xx-2222".to_string()],
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod unauthenticated_tests {
+    use super::*;
+
+    /// A catalog with no credential and no token cannot authenticate, so Polaris
+    /// never answers with a structured error and Iceberg reports an unparseable
+    /// body. Measured on the migrated quickstart.
+    #[test]
+    fn an_unauthenticated_catalog_is_its_own_tier() {
+        let err = "26/08/08 09:33 WARN ErrorHandlers: Unable to parse error response\n\
+                   java.io.UncheckedIOException: org.apache.iceberg.shaded.com.\
+                   fasterxml.jackson.databind.exc.MismatchedInputException: No content \
+                   to map due to end-of-input";
+        assert_eq!(classify(err), DenialTier::Unauthenticated);
+    }
+
+    /// It must NOT be confused with a real authorization denial. A 403 on
+    /// LOAD_TABLE means the caller was identified and refused; the tier above means
+    /// the caller was never identified. A test accepting either could not tell a
+    /// revoked grant from a catalog nobody gave a token.
+    #[test]
+    fn it_is_not_confused_with_a_polaris_denial() {
+        let forbidden = "org.apache.iceberg.exceptions.ForbiddenException: Forbidden: \
+                         Principal 'bob' is not authorized for op 'LOAD_TABLE'";
+        assert!(matches!(classify(forbidden), DenialTier::Polaris { .. }));
     }
 }

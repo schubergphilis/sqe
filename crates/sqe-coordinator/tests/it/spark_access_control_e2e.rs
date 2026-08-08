@@ -567,27 +567,28 @@ async fn spark_all_tables_in_schema_grant_covers_the_namespace() {
 /// SECURITY GAP, pinned: a service-account catalog left in the Spark session
 /// defeats per-user identity entirely.
 ///
-/// Handing Spark a per-user token governs ONLY the catalog that token is attached
-/// to. Every other catalog in the session is a separate identity, and the user picks
-/// which one by choosing the catalog name. `spark-defaults.conf` defines
-/// `spark.sql.catalog.sales_wh.credential = root:...`, so a session that ADDS a
-/// per-user catalog still carries a root-credentialed alias for the same warehouse.
+/// A per-user token governs ONLY the catalog it is attached to, so a second catalog
+/// alias for the same warehouse is a second identity and the caller picks by naming
+/// it. This asserts that the quickstart no longer ships one.
 ///
-/// Measured, and worth stating plainly: bob is denied on the table through his own
-/// catalog and reads it through the other alias in the same breath. No view, no
-/// trick, just a different name for the same table.
+/// The hazard was real and measured. While `spark-defaults.conf` carried
+/// `spark.sql.catalog.sales_wh.credential = root:...`, bob was denied on the table
+/// through his own catalog and read it through the other alias in the same breath.
+/// No view, no trick, just a different name for the same table.
 ///
-/// A session CANNOT defend itself. Overriding `spark.sql.catalog.sales_wh.token`
-/// with the user's JWT does not help, because Iceberg prefers `credential` when both
-/// are set (measured). The only fix is to not configure the service-account catalog
-/// at all, which is a deployment change rather than an engine one.
+/// A session could not defend itself against it either: overriding
+/// `spark.sql.catalog.sales_wh.token` with the user's JWT does not help, because
+/// Iceberg prefers `credential` when both are set (measured). The only fix was to
+/// stop configuring the service-account catalog, which is what the quickstart now
+/// does, so BOTH aliases deny.
 ///
-/// The assertion encodes today's behaviour so the hazard is executable rather than
-/// prose. When the quickstart drops the `credential` line, the second half of this
-/// test starts failing, which is the signal to invert it.
+/// This test used to assert the opposite, pinning the gap as executable prose. If it
+/// starts failing with a successful read, some credential has come back into
+/// `spark-defaults.conf` and the escalation is open again. `parity-test.sh` carries
+/// the same check for the demo path.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs quickstart/polaris-ranger-keycloak plus spark; run scripts/spark-access-control-test.sh"]
-async fn a_service_account_catalog_in_the_session_defeats_per_user_identity() {
+async fn no_service_account_catalog_can_defeat_per_user_identity() {
     spark_gate!();
     let _guard = crate::common::serial().lock().await;
     let ctx = ac_setup().await;
@@ -601,25 +602,24 @@ async fn a_service_account_catalog_in_the_session_defeats_per_user_identity() {
     .await;
     own.expect_polaris_denial("LOAD_TABLE", "bob holds no grant on the fixture table");
 
-    // The SAME table through the service-account alias from spark-defaults.conf,
-    // in the SAME session. This succeeds, which is the gap.
+    // The SAME table through the OTHER alias from spark-defaults.conf, in the SAME
+    // session. With no credential configured there it carries no identity at all, so
+    // Polaris refuses it too.
     let via_alias = spark_sql(
         &ctx.bob,
         "bob",
         &format!("SELECT count(*) FROM {ORDERS}"),
     )
     .await;
-    let rows = via_alias.expect_ok(
-        "EXPECTED the documented gap: a root-credentialed `sales_wh` catalog is \
-         configured in spark-defaults.conf, so naming it reads as the service \
-         account. If this now DENIES, the service-account catalog is gone from the \
-         session and the gap is closed: invert this assertion and update the \
-         access-control matrix.",
-    );
-    assert_eq!(
-        rows,
-        &vec![vec!["3".to_string()]],
-        "the alias returns the real row count, so it is genuinely reading the data \
-         bob was just denied"
+    // NOT a Polaris denial, and the difference is the point. With a credential the
+    // alias was a second IDENTITY (and read the data). With none it has no identity
+    // at all, so the request never becomes an authorization question: Polaris rejects
+    // it before it can answer, and Iceberg reports an unparseable error body.
+    //
+    // Asserting the specific tier rather than "it failed" is what makes this a real
+    // guard. A success means a `credential` or `oauth2-server-uri` has come back into
+    // quickstart spark-defaults.conf and the escalation is open again.
+    via_alias.expect_unauthenticated(
+        "naming the OTHER catalog alias must not read the table bob was just denied",
     );
 }
