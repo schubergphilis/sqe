@@ -45,7 +45,7 @@ LABEL org.opencontainers.image.title="sqe-full" \
       org.opencontainers.image.source="https://github.com/schuberg/sqe"
 
 COPY --from=builder /build/out/ /usr/local/bin/
-COPY --from=busybox:1.37.0-uclibc@sha256:8d7b1636e974e0adfd8d945955fca609304f0a56c18799dfd032d6e661382d84 \
+COPY --from=busybox:1.38.0-uclibc@sha256:297dda192bda2157ddf40abb47a45a1090caff1864db9cfb9ce4b901ba318a3c \
     /bin/wget /usr/local/bin/wget
 
 EXPOSE 50051 50052 8080 9090 9091

@@ -47,7 +47,7 @@ FROM cgr.dev/chainguard/glibc-dynamic@sha256:eaec65b25f35619be16f4992e7bae1128ea
 # Base image already runs as nonroot (65532). Explicit USER keeps trivy DS-0002 clean.
 USER 65532
 
-FROM busybox:1.37.0-uclibc@sha256:8d7b1636e974e0adfd8d945955fca609304f0a56c18799dfd032d6e661382d84 AS healthcheck-bin
+FROM busybox:1.38.0-uclibc@sha256:297dda192bda2157ddf40abb47a45a1090caff1864db9cfb9ce4b901ba318a3c AS healthcheck-bin
 
 # Bench generator: same builder, smaller entrypoint image.
 FROM runtime-base AS bench-runtime
