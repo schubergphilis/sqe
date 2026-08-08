@@ -7,7 +7,7 @@ use iceberg::spec::{
 };
 use iceberg::{Catalog, NamespaceIdent, TableIdent, TableRequirement, TableUpdate};
 use sqlparser::ast::{AlterColumnOperation, AlterTableOperation, Expr, ObjectName, ObjectType, SchemaName, SqlOption, Statement, Value};
-use tracing::info;
+use tracing::{error, info};
 
 use sqe_catalog::{SessionCatalog, TableMetadataCache};
 use sqe_core::{Session, SqeConfig, SqeError};
@@ -573,6 +573,13 @@ impl CatalogOps {
         // Track the maximum field ID so new fields get unique IDs
         let mut max_field_id = last_assigned_field_id;
 
+        // Column-name changes this statement makes, so the `sqe.column-tags`
+        // property can follow them in the SAME commit. The property is keyed by
+        // NAME while Iceberg identifies a column by field id, so without this a
+        // rename leaves a tag naming a column that is gone: nothing matches, no
+        // mask fires, and a governed column comes back RAW in both engines.
+        let mut tag_key_changes: Vec<crate::tag_source_impl::TagKeyChange> = Vec::new();
+
         for op in operations {
             match op {
                 AlterTableOperation::AddColumn { column_def, .. } => {
@@ -649,7 +656,14 @@ impl CatalogOps {
                         let col = col_folded.as_str();
                         let pos = fields.iter().position(|f| f.name == col);
                         match pos {
-                            Some(idx) => { fields.remove(idx); }
+                            Some(idx) => {
+                                fields.remove(idx);
+                                tag_key_changes.push(
+                                    crate::tag_source_impl::TagKeyChange::Drop {
+                                        column: col.to_string(),
+                                    },
+                                );
+                            }
                             None if *if_exists => {}
                             None => {
                                 return Err(SqeError::Execution(format!(
@@ -677,6 +691,10 @@ impl CatalogOps {
                         old_field.required,
                     );
                     fields[pos] = StdArc::new(renamed);
+                    tag_key_changes.push(crate::tag_source_impl::TagKeyChange::Rename {
+                        old: old_name.to_string(),
+                        new: fold_unquoted_ident(new_column_name),
+                    });
                 }
 
                 AlterTableOperation::AlterColumn { column_name, op } => {
@@ -749,10 +767,39 @@ impl CatalogOps {
         // Commit via SessionCatalog::commit_schema_update which makes a direct REST
         // POST call. We use this rather than TableCommit::builder().build() because
         // the TypedBuilder `build()` is pub(crate) in the upstream iceberg crate.
-        let updates = vec![
+        let mut updates = vec![
             TableUpdate::AddSchema { schema: new_schema },
             TableUpdate::SetCurrentSchema { schema_id: -1 },
         ];
+
+        // Carry the column tags across the rename/drop in the SAME commit.
+        //
+        // One commit rather than two on purpose. A separate follow-up write leaves a
+        // window in which the schema has the new column name and the tag map still
+        // has the old one, which is exactly the state that returns a governed column
+        // RAW. If the process dies in that window the table stays unmasked, and
+        // nothing reports it. Bundling makes the rename and the classification move
+        // atomically or not at all.
+        //
+        // `rewrite_tag_keys` returns None when nothing changed, so a plain ALTER on
+        // an untagged table adds no property write.
+        let rewritten_tags = crate::tag_source_impl::rewrite_tag_keys(
+            &crate::tag_source_impl::parse_column_tags(metadata.properties()),
+            &tag_key_changes,
+        );
+        if let Some(ref new_tags) = rewritten_tags {
+            let json = serde_json::to_string(new_tags).map_err(|e| {
+                SqeError::Execution(format!("failed to serialize column tags: {e}"))
+            })?;
+            let mut tag_updates = HashMap::new();
+            tag_updates.insert(crate::tag_source_impl::PROP_KEY.to_string(), json);
+            updates.push(TableUpdate::SetProperties { updates: tag_updates });
+            info!(
+                table = %table_ident,
+                changes = tag_key_changes.len(),
+                "Carrying column tags across a schema change"
+            );
+        }
         let requirements = vec![
             TableRequirement::LastAssignedFieldIdMatch { last_assigned_field_id },
             TableRequirement::CurrentSchemaIdMatch { current_schema_id },
@@ -766,6 +813,55 @@ impl CatalogOps {
             table = %table_ident,
             "Schema evolution committed successfully"
         );
+
+        // Move the association in Ranger's tag store too, or SQE masks the renamed
+        // column and every other engine returns it raw.
+        //
+        // That divergence is strictly better than the bug being fixed here (before,
+        // BOTH engines returned it raw) but it is still a fail-open for the other
+        // engine, and it is the exact shape the projector exists to close.
+        if let Some(new_tags) = rewritten_tags {
+            // Other users read tags user-independently from a per-token cache, so the
+            // writer's own eviction is not enough: without this they keep resolving
+            // the OLD map until TTL, and during that window the renamed column is
+            // unmasked for them.
+            self.invalidate_table_all_tokens(&table_ident).await;
+
+            if self.tag_projector.enabled() {
+                let key = sqe_policy::tag_projector::TagTableKey::from_namespace(
+                    &table_ident.namespace().to_url_string(),
+                    table_ident.name().to_string(),
+                );
+                let previous = crate::tag_source_impl::parse_column_tags(metadata.properties());
+                let previous_projected: sqe_policy::tag_projector::ColumnTags =
+                    previous.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                let projected: sqe_policy::tag_projector::ColumnTags =
+                    new_tags.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                if let Err(project_err) = self
+                    .tag_projector
+                    .project(&key, &previous_projected, &projected)
+                    .await
+                {
+                    // Deliberately NOT rolled back. `set_column_tags` reverts its
+                    // property on a projection failure because the property write IS
+                    // the whole statement there. Here the statement is a schema
+                    // change the caller asked for, and undoing a committed rename to
+                    // work around Ranger being unreachable is disproportionate: it
+                    // would make every ALTER TABLE depend on Ranger's availability.
+                    //
+                    // So: report it, and say plainly that the schema change stuck, or
+                    // an operator re-runs an ALTER that has already happened.
+                    error!(
+                        table = %table_ident,
+                        error = %project_err,
+                        "schema change committed but the column-tag projection failed"
+                    );
+                    return Err(SqeError::Execution(format!(
+                        "the schema change to '{table_ident}' COMMITTED, and the column                          tags moved with it in SQE, but projecting the association into                          Ranger's tag store failed ({project_err}). Do NOT re-run the                          ALTER: it already applied. Until the projection succeeds, this                          table's renamed column is masked in SQE and RAW in engines that                          read Ranger's tag store. Re-run                          `ALTER TABLE {table_ident} MODIFY COLUMN <column> SET TAG <tag> = 'true'`                          once Ranger is reachable, which is idempotent and re-projects."
+                    )));
+                }
+            }
+        }
 
         Ok(())
     }
