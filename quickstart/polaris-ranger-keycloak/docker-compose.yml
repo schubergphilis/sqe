@@ -286,30 +286,52 @@ services:
   # is healthy. carol (sqe_admin) has full catalog access. test.sh does its own
   # seeding too (idempotent CREATE TABLE IF NOT EXISTS), so running either first
   # is safe.
+  #
+  # Uses curl + Trino HTTP, not the SQE image: the production SQE image is
+  # Chainguard/distroless (no shell). Seeding must not require `sh` inside it.
   data-seed:
-    image: ${SQE_IMAGE:-sqe-quickstart:latest}
-    build:
-      context: ../..
-      dockerfile: Dockerfile
+    image: curlimages/curl:8.21.0
     entrypoint: ["sh", "-c"]
     command:
       - |
-        echo "waiting for SQE Flight port ..."
-        until sqe-cli --host sqe --port 50051 --user carol -e "SELECT 1" 2>/dev/null | grep -q '1'; do sleep 3; done
+        set -eu
+        # $$ escapes for docker-compose interpolation. Submit SQL over Trino HTTP
+        # and follow nextUri until terminal state.
+        run_sql() {
+          sql="$$1"
+          body=$$(curl -sS -u "carol:carol123" -X POST "http://sqe:8080/v1/statement" \
+            -H "X-Trino-User: carol" \
+            -H "X-Trino-Source: data-seed" \
+            --data-binary "$$sql")
+          while true; do
+            state=$$(printf '%s' "$$body" | sed -n 's/.*"state"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+            case "$$state" in
+              FINISHED|FAILED) break ;;
+            esac
+            next=$$(printf '%s' "$$body" | sed -n 's/.*"nextUri"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+            [ -n "$$next" ] || break
+            body=$$(curl -sS -u "carol:carol123" "$$next")
+          done
+          printf '%s' "$$body" | grep -q '"state":"FINISHED"' \
+            || { echo "SQL failed: $$sql"; echo "$$body"; exit 1; }
+        }
+        echo "waiting for SQE Trino HTTP ..."
+        until curl -sS -u "carol:carol123" -X POST "http://sqe:8080/v1/statement" \
+            -H "X-Trino-User: carol" --data-binary "SELECT 1" \
+            | grep -q '"state":"FINISHED"'; do
+          sleep 3
+        done
         echo "SQE ready, seeding data ..."
-        sqe-cli --host sqe --port 50051 --user carol -e "CREATE TABLE IF NOT EXISTS sales_wh.sales.orders (id BIGINT, region VARCHAR, amount DOUBLE, ssn VARCHAR)"
-        sqe-cli --host sqe --port 50051 --user carol -e "INSERT INTO sales_wh.sales.orders VALUES (1,'EU',10.0,'111-11-1111'),(2,'US',20.0,'222-22-2222')"
+        run_sql "CREATE TABLE IF NOT EXISTS sales_wh.sales.orders (id BIGINT, region VARCHAR, amount DOUBLE, ssn VARCHAR)"
+        run_sql "INSERT INTO sales_wh.sales.orders VALUES (1,'EU',10.0,'111-11-1111'),(2,'US',20.0,'222-22-2222')"
         # Grant engineer SELECT on orders so bob can LOAD the table through the
         # Polaris Ranger authorizer (the coarse gate). Without this, bob has only
         # the baseline traverse grant and the table is hidden as "not found".
-        # SQE translates this into a Ranger `polaris`-service policy. (Spark's
-        # access goes through the separate `hive`-service access policy seeded by
+        # SQE translates this into a Ranger polaris-service policy. (Spark's
+        # access goes through the separate hive-service access policy seeded by
         # bootstrap-ranger.sh -- the two engines authorize via two services.)
-        sqe-cli --host sqe --port 50051 --user carol -e "GRANT SELECT ON sales_wh.sales.orders TO ROLE \"engineer\""
+        run_sql 'GRANT SELECT ON sales_wh.sales.orders TO ROLE "engineer"'
         echo "data seed complete"
-    environment:
-      SQE_HOST: sqe
-      SQE_PASSWORD: carol123
     restart: "no"
     depends_on:
       sqe:
