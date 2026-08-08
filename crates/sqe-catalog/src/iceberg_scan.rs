@@ -1222,6 +1222,27 @@ impl ExecutionPlan for IcebergScanExec {
                 // `Arc`, `projection` is an `Option<Vec<String>>` sized O(query
                 // columns), and `resolved_filters` is wrapped in an outer `Arc`
                 // so clones are refcount bumps.
+                // Iceberg field IDs for the projected columns, resolved ONCE
+                // against the table's CURRENT schema.
+                //
+                // Column identity in Iceberg is the field ID, not the name. A
+                // data file written before `RENAME COLUMN` still stores the old
+                // name, and a file written before `ADD COLUMN` has no column for
+                // it at all. Matching the projection against each file's own
+                // parquet names therefore misses, and the miss has to be handled
+                // rather than dropped: see `resolve_projection_in_file`.
+                //
+                // `None` when the projection is absent (whole-row read) or when a
+                // projected name is not in the current schema, which cannot happen
+                // for a plan that passed analysis and simply falls back to names.
+                let projected_field_ids: Option<Vec<i32>> = projection.as_ref().and_then(|cols| {
+                    let iceberg_schema = table.metadata().current_schema();
+                    cols.iter()
+                        .map(|c| iceberg_schema.field_id_by_name(c))
+                        .collect::<Option<Vec<i32>>>()
+                });
+                let projected_field_ids = Arc::new(projected_field_ids);
+
                 let concurrency = direct_read_concurrency.max(1);
                 let resolved_filters = Arc::new(resolved_filters);
                 let bytes_scanned = bytes_scanned.clone();
@@ -1233,6 +1254,7 @@ impl ExecutionPlan for IcebergScanExec {
                         let file_io = file_io.clone();
                         let projection = projection.clone();
                         let schema = schema.clone();
+                        let projected_field_ids = Arc::clone(&projected_field_ids);
                         let resolved_filters = Arc::clone(&resolved_filters);
                         let bytes_scanned = bytes_scanned.clone();
                         let rows_prefilter = rows_prefilter.clone();
@@ -1274,22 +1296,62 @@ impl ExecutionPlan for IcebergScanExec {
                             // hand the predicate a full-schema batch, `Column(0)` reads the wrong
                             // column and the filter silently drops every row whose projected
                             // column 0 happens not to coincide with full column 0.
+                            // Where each projected column lives in THIS file, and
+                            // which parquet columns therefore need reading.
+                            //
+                            // `resolved[i] == None` means the file predates the
+                            // column (ADD COLUMN) or stores it under an older name
+                            // that no field ID could match. Those become NULL in
+                            // `conform_batch_to_projection` below. Nothing is ever
+                            // dropped: a projection of N columns yields N columns.
+                            let mut resolved: Option<Vec<Option<usize>>> = None;
                             let (builder, filter_mask) = if let Some(ref cols) = projection {
                                 let parquet_schema = builder.parquet_schema().clone();
                                 let arrow_schema = builder.schema().clone();
-                                let indices: Vec<usize> = cols
-                                    .iter()
-                                    .filter_map(|col| {
-                                        arrow_schema.fields().iter().position(|f| f.name() == col)
-                                    })
-                                    .collect();
-                                if indices.is_empty() {
-                                    // COUNT(*) or similar: no columns needed, just row count.
-                                    // Read the smallest column (first one) to get the row count.
+                                if cols.is_empty() {
+                                    // Genuine COUNT(*): no column values are wanted,
+                                    // only the row count. Read the first column.
+                                    //
+                                    // This branch is reached ONLY for an empty
+                                    // projection. It used to be shared with "no
+                                    // projected name matched this file", which made
+                                    // the raw first column of the file get emitted as
+                                    // the query's data -- measured: after RENAME
+                                    // COLUMN secret TO classified, `SELECT classified`
+                                    // returned `id`'s values under the name
+                                    // `classified`.
                                     let mask = ProjectionMask::roots(&parquet_schema, vec![0]);
                                     (builder.with_projection(mask.clone()), mask)
                                 } else {
-                                    let mask = ProjectionMask::roots(&parquet_schema, indices);
+                                    let per_column = resolve_projection_in_file(
+                                        &arrow_schema,
+                                        cols,
+                                        projected_field_ids.as_deref(),
+                                    );
+                                    let mut indices: Vec<usize> =
+                                        per_column.iter().flatten().copied().collect();
+                                    indices.sort_unstable();
+                                    indices.dedup();
+                                    let missing = per_column.iter().filter(|r| r.is_none()).count();
+                                    if missing > 0 {
+                                        debug!(
+                                            path = %path,
+                                            missing,
+                                            projected = cols.len(),
+                                            "Direct-read: file predates part of the projection; \
+                                             those columns read as NULL"
+                                        );
+                                    }
+                                    resolved = Some(per_column);
+                                    // Every projected column is absent from this file.
+                                    // Column 0 is read purely to learn the row count;
+                                    // `conform_batch_to_projection` discards it and
+                                    // emits NULLs of the right width.
+                                    let mask = if indices.is_empty() {
+                                        ProjectionMask::roots(&parquet_schema, vec![0])
+                                    } else {
+                                        ProjectionMask::roots(&parquet_schema, indices)
+                                    };
                                     (builder.with_projection(mask.clone()), mask)
                                 }
                             } else {
@@ -1309,7 +1371,17 @@ impl ExecutionPlan for IcebergScanExec {
                             // the predicate evaluates against a batch whose column layout
                             // matches `projected_schema`. That is the schema the filter's
                             // column indices were resolved against.
-                            let builder = if !resolved_filters.is_empty() {
+                            //
+                            // Skipped entirely when this file is missing part of
+                            // the projection. The mask then covers fewer columns
+                            // than `projected_schema`, so a predicate's
+                            // `Column(index=N)` would read the wrong one. These are
+                            // DYNAMIC filters -- a pushdown optimisation, with the
+                            // join above the scan still doing the real filtering --
+                            // so dropping them costs speed and never correctness.
+                            let file_is_complete =
+                                resolved.as_ref().is_none_or(|r| r.iter().all(Option::is_some));
+                            let builder = if !resolved_filters.is_empty() && file_is_complete {
                                 let mut predicates: Vec<Box<dyn ArrowPredicate>> = Vec::new();
                                 for (idx, filter_expr) in resolved_filters.iter().enumerate() {
                                     predicates.push(Box::new(PhysicalExprPredicate {
@@ -1345,6 +1417,17 @@ impl ExecutionPlan for IcebergScanExec {
                                         vec![],
                                         &arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(batch.num_rows())),
                                     ).map_err(|e| DataFusionError::External(Box::new(e)))?);
+                                } else if let Some(ref per_column) = resolved {
+                                    // Reshape to the schema the scan DECLARED.
+                                    // The reader hands back only the columns this
+                                    // file actually has, in file order; downstream
+                                    // operators index by position into
+                                    // `projected_schema`.
+                                    batches.push(conform_batch_to_projection(
+                                        &batch,
+                                        per_column,
+                                        &schema,
+                                    )?);
                                 } else {
                                     batches.push(batch);
                                 }
@@ -1719,6 +1802,125 @@ impl ExecutionPlan for IcebergScanExec {
 }
 
 // ── Internal helpers ─────────────────────────────────────────────────────────
+
+
+/// Parquet's Iceberg field-id metadata key, stamped by every Iceberg writer.
+const PARQUET_FIELD_ID_META_KEY: &str = "PARQUET:field_id";
+
+/// Locate each projected column inside ONE data file.
+///
+/// Returns one entry per projected column, in projection order. `Some(i)` is the
+/// column's index in `file_schema`; `None` means the file does not carry it and
+/// the value must be read as NULL.
+///
+/// Iceberg identifies a column by field ID, not by name, so this prefers IDs and
+/// only falls back to names for files that carry no ID metadata (written by
+/// something other than an Iceberg writer). Name matching cannot survive
+/// `RENAME COLUMN`, which is the whole reason the ID path exists.
+///
+/// A miss is DELIBERATELY not an error. By the time a scan runs, every projected
+/// name came from the table's current schema and passed analysis, so the only way
+/// a file can lack the column is schema evolution -- exactly the case Iceberg
+/// defines as "read it as NULL".
+fn resolve_projection_in_file(
+    file_schema: &arrow_schema::Schema,
+    projected_names: &[String],
+    projected_field_ids: Option<&[i32]>,
+) -> Vec<Option<usize>> {
+    // Every field must carry an ID for the ID path to be trustworthy. A file with
+    // partial stamping would silently mix two identity models.
+    let by_id: Option<std::collections::HashMap<i32, usize>> = projected_field_ids.and_then(|_| {
+        file_schema
+            .fields()
+            .iter()
+            .enumerate()
+            .map(|(idx, f)| {
+                f.metadata()
+                    .get(PARQUET_FIELD_ID_META_KEY)
+                    .and_then(|s| s.parse::<i32>().ok())
+                    .map(|id| (id, idx))
+            })
+            .collect::<Option<std::collections::HashMap<_, _>>>()
+    });
+
+    match (by_id, projected_field_ids) {
+        (Some(map), Some(ids)) => ids.iter().map(|id| map.get(id).copied()).collect(),
+        _ => projected_names
+            .iter()
+            .map(|name| file_schema.fields().iter().position(|f| f.name() == name))
+            .collect(),
+    }
+}
+
+/// Reshape a decoded batch to the schema the scan declared.
+///
+/// The parquet reader returns only the columns this file has, in FILE order.
+/// `projected_schema` is what every downstream operator plans against, and it
+/// indexes by position. Handing back a narrower or differently ordered batch is
+/// what made `SELECT id, ssn, nickname` return two columns after `ADD COLUMN`.
+///
+/// `resolved` comes from [`resolve_projection_in_file`]: one entry per column of
+/// `target`, giving that column's index in the FILE. Columns the file lacks are
+/// filled with typed NULLs.
+fn conform_batch_to_projection(
+    decoded: &RecordBatch,
+    resolved: &[Option<usize>],
+    target: &SchemaRef,
+) -> DFResult<RecordBatch> {
+    if resolved.len() != target.fields().len() {
+        return Err(DataFusionError::Internal(format!(
+            "scan projection has {} columns but the declared schema has {}",
+            resolved.len(),
+            target.fields().len()
+        )));
+    }
+
+    // The reader emits the masked columns in ascending file order, so a file
+    // index's position in the decoded batch is its rank among those read.
+    let mut read_order: Vec<usize> = resolved.iter().flatten().copied().collect();
+    read_order.sort_unstable();
+    read_order.dedup();
+
+    let rows = decoded.num_rows();
+    let mut columns: Vec<arrow::array::ArrayRef> = Vec::with_capacity(resolved.len());
+    for (i, slot) in resolved.iter().enumerate() {
+        let field = target.field(i);
+        match slot {
+            Some(file_idx) => {
+                let pos = read_order
+                    .iter()
+                    .position(|x| x == file_idx)
+                    .ok_or_else(|| {
+                        DataFusionError::Internal(format!(
+                            "column {} resolved to file index {file_idx}, which was not read",
+                            field.name()
+                        ))
+                    })?;
+                columns.push(Arc::clone(decoded.column(pos)));
+            }
+            None => {
+                // A required column absent from the file is unreadable, not
+                // nullable. Say so rather than emitting NULLs into a NOT NULL
+                // field and letting RecordBatch::try_new produce a shape error
+                // that names neither the column nor the file.
+                if !field.is_nullable() {
+                    return Err(DataFusionError::Internal(format!(
+                        "column `{}` is missing from a data file but the table schema                          declares it NOT NULL, so it cannot be read as NULL",
+                        field.name()
+                    )));
+                }
+                columns.push(arrow::array::new_null_array(field.data_type(), rows));
+            }
+        }
+    }
+
+    RecordBatch::try_new_with_options(
+        Arc::clone(target),
+        columns,
+        &arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(rows)),
+    )
+    .map_err(|e| DataFusionError::Internal(format!("failed to conform scan batch: {e}")))
+}
 
 /// Flatten a stream of per-file batch results into a single lazy batch stream.
 ///
@@ -2813,5 +3015,200 @@ mod tests {
             size,
             "covers the whole file"
         );
+    }
+}
+
+/// Projection resolution across schema evolution.
+///
+/// These guard the small-file direct-read path, which resolves the projection
+/// against each data FILE's own schema. Every case below is one where that
+/// schema differs from the table's current schema.
+#[cfg(test)]
+mod projection_evolution_tests {
+    use super::*;
+    use arrow_schema::{DataType, Field, Schema};
+
+    /// A parquet field carrying its Iceberg field ID, as an Iceberg writer stamps it.
+    fn stamped(name: &str, id: i32, nullable: bool) -> Field {
+        Field::new(name, DataType::Utf8, nullable).with_metadata(
+            [(PARQUET_FIELD_ID_META_KEY.to_string(), id.to_string())]
+                .into_iter()
+                .collect(),
+        )
+    }
+
+    fn names(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn batch_of(schema: &Schema, cols: Vec<Vec<&str>>) -> RecordBatch {
+        let arrays: Vec<arrow::array::ArrayRef> = cols
+            .into_iter()
+            .map(|c| {
+                Arc::new(arrow::array::StringArray::from(c)) as arrow::array::ArrayRef
+            })
+            .collect();
+        RecordBatch::try_new(Arc::new(schema.clone()), arrays).expect("test batch")
+    }
+
+    /// THE ONE THAT MATTERS. Every projected column is absent from the file.
+    ///
+    /// The old code collapsed this into the COUNT(*) branch and read parquet
+    /// column 0, then emitted that raw column as the query's data. Measured on a
+    /// live stack: after `RENAME COLUMN secret TO classified`,
+    /// `SELECT classified` returned `id`'s values under the name `classified`.
+    /// Wrong data, silently. A missing column must read NULL.
+    #[test]
+    fn every_projected_column_absent_reads_null_not_the_first_column() {
+        let file = Schema::new(vec![stamped("id", 1, false), stamped("secret", 2, true)]);
+        // The catalog renamed field 2 and the query projects only that column.
+        let resolved = resolve_projection_in_file(&file, &names(&["classified"]), Some(&[7]));
+        assert_eq!(resolved, vec![None], "field id 7 is not in this file");
+
+        let target = Arc::new(Schema::new(vec![Field::new(
+            "classified",
+            DataType::Utf8,
+            true,
+        )]));
+        let decoded = batch_of(
+            &Schema::new(vec![Field::new("id", DataType::Utf8, false)]),
+            vec![vec!["7", "8"]],
+        );
+        let out = conform_batch_to_projection(&decoded, &resolved, &target).expect("conform");
+        assert_eq!(out.num_columns(), 1);
+        assert_eq!(out.num_rows(), 2);
+        assert_eq!(out.schema().field(0).name(), "classified");
+        assert!(
+            out.column(0).is_null(0) && out.column(0).is_null(1),
+            "the column the file does not have must be NULL, never the first \
+             column's values"
+        );
+    }
+
+    /// ADD COLUMN: one of several projected columns is absent.
+    ///
+    /// The old code dropped it, so a three-column projection came back with two
+    /// columns and no error. With a mask above the scan that turned into
+    /// "PhysicalExpr Column references column 'nickname' at index 2 ... input
+    /// schema only has 2 columns".
+    #[test]
+    fn one_absent_column_is_null_and_the_batch_keeps_its_width() {
+        let file = Schema::new(vec![stamped("id", 1, false), stamped("ssn", 2, true)]);
+        let resolved =
+            resolve_projection_in_file(&file, &names(&["id", "ssn", "nickname"]), Some(&[1, 2, 3]));
+        assert_eq!(resolved, vec![Some(0), Some(1), None]);
+
+        let target = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("ssn", DataType::Utf8, true),
+            Field::new("nickname", DataType::Utf8, true),
+        ]));
+        let decoded = batch_of(
+            &Schema::new(vec![
+                Field::new("id", DataType::Utf8, false),
+                Field::new("ssn", DataType::Utf8, true),
+            ]),
+            vec![vec!["1", "2"], vec!["a", "b"]],
+        );
+        let out = conform_batch_to_projection(&decoded, &resolved, &target).expect("conform");
+        assert_eq!(out.num_columns(), 3, "a 3-column projection yields 3 columns");
+        let ids = out.column(0).as_any().downcast_ref::<arrow::array::StringArray>().unwrap();
+        assert_eq!(ids.value(0), "1");
+        let ssn = out.column(1).as_any().downcast_ref::<arrow::array::StringArray>().unwrap();
+        assert_eq!(ssn.value(0), "a");
+        assert!(out.column(2).is_null(0), "nickname predates this file");
+    }
+
+    /// RENAME COLUMN: the file stores the OLD name under the same field ID.
+    #[test]
+    fn a_renamed_column_resolves_by_field_id() {
+        let file = Schema::new(vec![stamped("id", 1, false), stamped("ssn", 2, true)]);
+        // The catalog now calls field 2 `tax_id`. Names cannot match; IDs do.
+        let resolved = resolve_projection_in_file(&file, &names(&["id", "tax_id"]), Some(&[1, 2]));
+        assert_eq!(
+            resolved,
+            vec![Some(0), Some(1)],
+            "field id 2 is parquet column 1 whatever the file calls it"
+        );
+    }
+
+    /// A file with no field-id metadata falls back to names, and a name that
+    /// matches nothing still resolves to None rather than shifting the others.
+    #[test]
+    fn a_file_without_field_ids_falls_back_to_names() {
+        let file = Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("ssn", DataType::Utf8, true),
+        ]);
+        let resolved =
+            resolve_projection_in_file(&file, &names(&["ssn", "id", "later"]), Some(&[2, 1, 3]));
+        assert_eq!(
+            resolved,
+            vec![Some(1), Some(0), None],
+            "positions follow the NAMES, and the unmatched one does not shift the rest"
+        );
+    }
+
+    /// Partial stamping is not trusted: one unstamped field sends the whole file
+    /// down the name path rather than mixing two identity models.
+    #[test]
+    fn partial_field_id_stamping_uses_names_for_the_whole_file() {
+        let file = Schema::new(vec![
+            stamped("id", 1, false),
+            Field::new("ssn", DataType::Utf8, true),
+        ]);
+        // By ID, `tax_id` (field 2) would be unresolvable. By name it is too, but
+        // `id` must still resolve, which proves the name path ran.
+        let resolved = resolve_projection_in_file(&file, &names(&["id", "ssn"]), Some(&[1, 2]));
+        assert_eq!(resolved, vec![Some(0), Some(1)]);
+    }
+
+    /// Projection order is the CALLER's, not the file's.
+    ///
+    /// The reader emits masked columns in ascending file order, so a projection
+    /// of [ssn, id] receives [id, ssn] and has to be put back.
+    #[test]
+    fn the_output_follows_projection_order_not_file_order() {
+        let resolved = vec![Some(1), Some(0)];
+        let target = Arc::new(Schema::new(vec![
+            Field::new("ssn", DataType::Utf8, true),
+            Field::new("id", DataType::Utf8, false),
+        ]));
+        let decoded = batch_of(
+            &Schema::new(vec![
+                Field::new("id", DataType::Utf8, false),
+                Field::new("ssn", DataType::Utf8, true),
+            ]),
+            vec![vec!["1"], vec!["a"]],
+        );
+        let out = conform_batch_to_projection(&decoded, &resolved, &target).expect("conform");
+        let first = out.column(0).as_any().downcast_ref::<arrow::array::StringArray>().unwrap();
+        assert_eq!(first.value(0), "a", "column 0 of the output is ssn");
+    }
+
+    /// A NOT NULL column missing from a file is a real error, named.
+    ///
+    /// Iceberg only permits adding OPTIONAL columns, so reaching this means the
+    /// file and the schema genuinely disagree. Emitting NULLs into a required
+    /// field would fail later with a message naming neither the column nor why.
+    #[test]
+    fn a_required_column_missing_from_the_file_is_an_error() {
+        let target = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false)]));
+        let decoded = batch_of(
+            &Schema::new(vec![Field::new("other", DataType::Utf8, true)]),
+            vec![vec!["x"]],
+        );
+        let err = conform_batch_to_projection(&decoded, &[None], &target)
+            .expect_err("a required column cannot be NULL-filled");
+        let msg = err.to_string();
+        assert!(msg.contains("id") && msg.contains("NOT NULL"), "got: {msg}");
+    }
+
+    /// The unevolved case must be untouched: same names, same order, no nulls.
+    #[test]
+    fn an_unevolved_file_resolves_straight_through() {
+        let file = Schema::new(vec![stamped("id", 1, false), stamped("ssn", 2, true)]);
+        let resolved = resolve_projection_in_file(&file, &names(&["id", "ssn"]), Some(&[1, 2]));
+        assert_eq!(resolved, vec![Some(0), Some(1)]);
     }
 }
