@@ -89,6 +89,22 @@
       "matchManagers": ["cargo"],
       "matchPackageNames": ["jsonwebtoken"],
       "allowedVersions": "<10"
+    },
+    {
+      "description": [
+        "The Ranger quickstart's postgres is held on 13.x deliberately. A bump to 18.3",
+        "broke the whole stack: postgres 18 stores data in a major-version-specific",
+        "subdirectory, so an existing volume is unreadable and the container exits 1.",
+        "ranger-admin never starts, which takes out make test-access-control and",
+        "make test-access-control-spark.",
+        "The trap is that a FRESH volume starts fine, so CI can look green while every",
+        "developer with an existing stack is broken. A bot cannot validate a data-directory",
+        "migration, so moving majors here has to be a human change: pg_upgrade or a",
+        "documented volume reset, plus a check that Ranger 2.8's schema is happy."
+      ],
+      "matchManagers": ["docker-compose"],
+      "matchPackageNames": ["postgres"],
+      "allowedVersions": "<14"
     }
   ]
 }
