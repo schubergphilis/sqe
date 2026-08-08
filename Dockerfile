@@ -40,7 +40,7 @@ RUN cargo build --release --locked --no-default-features \
 # ── Runtime (shared base) ─────────────────────────────────────
 FROM gcr.io/distroless/cc-debian12:nonroot@sha256:fccdbb0a547c14e23fcf4ce8ad62ca5d43b4faae8d22cd292f490fef9946c96e AS runtime-base
 
-FROM busybox:1.37.0-uclibc@sha256:8d7b1636e974e0adfd8d945955fca609304f0a56c18799dfd032d6e661382d84 AS healthcheck-bin
+FROM busybox:1.38.0-uclibc@sha256:297dda192bda2157ddf40abb47a45a1090caff1864db9cfb9ce4b901ba318a3c AS healthcheck-bin
 
 # Bench generator: same builder, smaller entrypoint image.
 FROM runtime-base AS bench-runtime
