@@ -110,7 +110,7 @@ prost = "0.14"
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-toml = "0.9"
+toml = "1.0"
 
 # Concurrency / Caching
 dashmap = "6"
