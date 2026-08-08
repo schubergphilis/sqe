@@ -45,6 +45,20 @@ aikido-build:
 # Exclude demo/quickstart Python trees from the source SBOM so commercial
 # EULA packages (dlthub) and docs samples are not license-gated as product deps.
 # Also keep syft focused on the engine workspace.
+#
+# The third step supplies licenses for the crates that live in THIS repo. syft's
+# Rust cataloger reads Cargo.lock, which carries no license, so every crate comes
+# out without one; `sbom_license_check.py` then recovers them from deps.dev, which
+# works for anything on crates.io and cannot work for a workspace member or a
+# vendored fork. That left 29 components in REVIEW with "license evidence
+# missing", and under --strict that fails the gate and skips every build and
+# publish job behind it.
+#
+# All 29 declare their license in their own Cargo.toml (28 Apache-2.0, jiter MIT).
+# This is not a waiver, it is the missing transport: the script only fills a
+# component whose name AND version match a crate on disk, reads the value from
+# that crate's manifest, and records CycloneDX evidence naming the file. Its
+# --selftest asserts the narrowness rules, so run it first.
 aikido-sbom:
   script:
     - |
@@ -58,6 +72,9 @@ aikido-sbom:
         --exclude '**/target/**' \
         -o "cyclonedx-json@1.6=$AIKIDO_SBOM"
       python3 "$AIKIDO_HOME/scripts/sbom_enrich.py" --sbom "$AIKIDO_SBOM" --asset "$CI_PROJECT_DIR/.asset"
+      python3 "$CI_PROJECT_DIR/ci/sbom-license-from-cargo.py" --selftest
+      python3 "$CI_PROJECT_DIR/ci/sbom-license-from-cargo.py" \
+        --sbom "$AIKIDO_SBOM" --root "$CI_PROJECT_DIR"
 
 # ===== blocking correctness gate (#386) =====
 # The shared `aikido-test-rust` job already runs `cargo test --all`, but it is
