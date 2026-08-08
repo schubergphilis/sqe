@@ -10,7 +10,7 @@ use crate::attach::{
 use crate::ddl::{try_parse_ref_ddl, RefDdl};
 use crate::partition_evolution::{try_parse_partition_evolution, PartitionEvolution};
 use crate::procedures::{try_parse_call, ProcedureCall};
-use crate::tags::{try_parse_set_tags, SetTagsStatement};
+use crate::tags::{try_parse_masking_policy, try_parse_set_tags, MaskingPolicyOp, SetTagsStatement};
 
 /// Target for SHOW GRANTS statements.
 #[derive(Debug)]
@@ -93,6 +93,9 @@ pub enum StatementKind {
     /// SHOW TAGS ON <table> — read back the `sqe.column-tags` property as
     /// (column, tag) rows. Diagnostic round-trip for ALTER TABLE ... SET TAGS.
     ShowTags(String),
+    /// `SHOW MASKING POLICIES` / `SHOW MASKING POLICY <name>`. `None` lists all;
+    /// `Some(name)` filters to one policy.
+    ShowMaskingPolicies(Option<String>),
     Utility(Box<Statement>),
     ExplainFull(String), // inner SQL string (EXPLAIN FULL pre-processed)
     // Transaction stubs — no-ops for JDBC tools that use setAutoCommit(false).
@@ -150,6 +153,10 @@ pub enum StatementKind {
     /// `ALTER TABLE ... SET TAGS / UNSET TAGS` and the Snowflake-compatible
     /// `MODIFY|ALTER COLUMN ... SET TAG / UNSET TAG` column-tag authoring DDL.
     SetTags(Box<SetTagsStatement>),
+    /// `ALTER TABLE ... MODIFY|ALTER COLUMN <col> SET|UNSET MASKING POLICY <name>`.
+    /// Snowflake-compatible. Resolved against the policy store, not here: the
+    /// named policy has to be looked up to find the tag it is keyed on.
+    SetMaskingPolicy(Box<MaskingPolicyOp>),
     /// `ATTACH '<location>' AS <name> (TYPE <kind>, ...)` — register a new
     /// Iceberg catalog at runtime. sqlparser-rs has no native AST for the
     /// SQE/DuckDB option list, so this variant carries the pre-parsed
@@ -196,6 +203,7 @@ impl StatementKind {
             StatementKind::CheckAccess(_) => "checkaccess",
             StatementKind::ShowEffectivePolicy(_) => "showeffectivepolicy",
             StatementKind::ShowTags(_) => "showtags",
+            StatementKind::ShowMaskingPolicies(_) => "showmaskingpolicies",
             StatementKind::Utility(_) => "utility",
             StatementKind::ExplainFull(_) => "explain_full",
             StatementKind::Begin => "begin",
@@ -216,6 +224,7 @@ impl StatementKind {
             StatementKind::SetWriteBranch(_) => "setwritebranch",
             StatementKind::PartitionEvolution(_) => "partitionevolution",
             StatementKind::SetTags(_) => "settags",
+            StatementKind::SetMaskingPolicy(_) => "setmaskingpolicy",
             StatementKind::Attach(_) => "attach",
             StatementKind::Detach(_) => "detach",
             StatementKind::CreateSecret(_) => "create_secret",
@@ -460,6 +469,27 @@ pub fn parse_and_classify(sql: &str) -> sqe_core::Result<StatementKind> {
             None
         }
     });
+    // SHOW MASKING POLICIES / SHOW MASKING POLICY <name>. Handled before
+    // sqlparser, which has no notion of either.
+    //
+    // Both spellings are accepted because operators type both, and refusing the
+    // singular for a list (or vice versa) is a pointless papercut. The plural with a
+    // name is also fine: the name simply filters.
+    //
+    // The order here is cosmetic, not load-bearing: "POLICIES" is "POLIC" + "IES"
+    // and the singular prefix ends "POLICY", so they diverge at that character and
+    // neither prefix can swallow the other's input.
+    for prefix in ["SHOW MASKING POLICIES", "SHOW MASKING POLICY"] {
+        if let Some(rest) = strip_prefix_ci(trimmed, prefix) {
+            let name = rest.trim().trim_end_matches(';').trim().trim_matches('"').to_string();
+            return Ok(StatementKind::ShowMaskingPolicies(if name.is_empty() {
+                None
+            } else {
+                Some(name)
+            }));
+        }
+    }
+
     if let Some(rest) = show_tags_rest {
         let table = rest.trim().trim_end_matches(';').trim().to_string();
         if table.is_empty() {
@@ -491,6 +521,15 @@ pub fn parse_and_classify(sql: &str) -> sqe_core::Result<StatementKind> {
         // only Hive-style PARTITION (col=val), so we intercept here.
         if let Some(pe) = try_parse_partition_evolution(trimmed)? {
             return Ok(StatementKind::PartitionEvolution(Box::new(pe)));
+        }
+        // ALTER TABLE ... MODIFY|ALTER COLUMN ... SET|UNSET MASKING POLICY.
+        // Tried BEFORE the tag forms. The tag parser returns Ok(None) for these
+        // (asserted by `the_tag_parser_does_not_claim_the_masking_policy_forms`),
+        // so the order is not load-bearing today -- but keeping the more specific
+        // form first means a future loosening of the tag parser cannot silently
+        // capture a masking-policy statement.
+        if let Some(op) = try_parse_masking_policy(sql)? {
+            return Ok(StatementKind::SetMaskingPolicy(Box::new(op)));
         }
         // ALTER TABLE ... SET TAGS / UNSET TAGS / MODIFY|ALTER COLUMN ... SET TAG.
         // Column-tag authoring; distinct from Iceberg snapshot CREATE/DROP TAG above.
@@ -2323,5 +2362,72 @@ mod tests {
         // Regression: the partition pre-scan must not steal regular ALTER TABLE.
         let kind = parse_and_classify("ALTER TABLE t ADD COLUMN x INT").unwrap();
         assert!(matches!(kind, StatementKind::AlterSchema(_)));
+    }
+}
+
+#[cfg(test)]
+mod show_masking_policy_tests {
+    use super::*;
+
+    #[test]
+    fn the_plural_with_no_name_lists_everything() {
+        for sql in ["SHOW MASKING POLICIES", "show masking policies", "SHOW MASKING POLICIES;"] {
+            match parse_and_classify(sql).expect(sql) {
+                StatementKind::ShowMaskingPolicies(None) => {}
+                other => panic!("{sql}: expected list-all, got {other:?}"),
+            }
+        }
+    }
+
+    /// The singular with no name lists everything too. Refusing it would be a
+    /// papercut: operators type both spellings and neither is ambiguous.
+    #[test]
+    fn the_singular_with_no_name_also_lists_everything() {
+        match parse_and_classify("SHOW MASKING POLICY").expect("singular") {
+            StatementKind::ShowMaskingPolicies(None) => {}
+            other => panic!("expected list-all, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_name_filters_to_one_policy() {
+        for sql in [
+            "SHOW MASKING POLICY mask_ssn",
+            "SHOW MASKING POLICY \"mask_ssn\"",
+            "SHOW MASKING POLICIES mask_ssn;",
+        ] {
+            match parse_and_classify(sql).expect(sql) {
+                StatementKind::ShowMaskingPolicies(Some(n)) => assert_eq!(n, "mask_ssn"),
+                other => panic!("{sql}: expected a name, got {other:?}"),
+            }
+        }
+    }
+
+    /// The plural form is never read as "singular plus a name".
+    ///
+    /// I first wrote this test believing the prefix ORDER was load-bearing, and that
+    /// checking the singular first would leave a stray "IES" as the policy name.
+    /// It cannot: "POLICIES" is "POLIC" + "IES" while the singular prefix ends
+    /// "POLICY", so the two diverge at that character and the singular prefix does
+    /// not match the plural input at all. Mutation-checked, and the mutation
+    /// SURVIVED, which is what exposed the wrong reasoning.
+    ///
+    /// The assertion is kept as a plain regression guard on the list-all form. The
+    /// order of the array above is cosmetic.
+    #[test]
+    fn the_plural_is_not_mistaken_for_a_singular_with_a_name() {
+        assert!(matches!(
+            parse_and_classify("SHOW MASKING POLICIES").expect("plural"),
+            StatementKind::ShowMaskingPolicies(None)
+        ));
+    }
+
+    /// SHOW TAGS must keep working; the new branch sits right beside it.
+    #[test]
+    fn show_tags_still_parses() {
+        assert!(matches!(
+            parse_and_classify("SHOW TAGS ON cat.ns.t").expect("show tags"),
+            StatementKind::ShowTags(ref t) if t == "cat.ns.t"
+        ));
     }
 }

@@ -3011,3 +3011,280 @@ async fn a_projection_matching_no_file_column_never_returns_another_column() {
          returned `id` under the name `tax_id`."
     );
 }
+
+/// `SHOW MASKING POLICIES` against a live Ranger, end to end.
+///
+/// The unit tests cover the parse and the bundle-to-rows mapping. What they cannot
+/// cover is whether the statement reads the policy an operator actually WROTE, and
+/// that is the only claim the statement makes.
+///
+/// Two policies are created and the assertions are deliberately asymmetric:
+/// the listing must CONTAIN one and the name filter must EXCLUDE the other. A test
+/// that only checks "the list is non-empty" passes on Ranger's own seeded policies
+/// without the statement working at all, which is the shape that already let one
+/// guard test through in this suite.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs quickstart/polaris-ranger-keycloak; run scripts/access-control-test.sh"]
+async fn show_masking_policies_lists_what_ranger_holds() {
+    ac_gate!();
+    let _guard = crate::common::serial().lock().await;
+    let ctx = ac_setup().await;
+
+    let ssn_policy = format!("{PREFIX}show-mask-ssn");
+    let email_policy = format!("{PREFIX}show-mask-email");
+    ctx.ranger
+        .create_policy(hive_mask_policy(
+            &ssn_policy,
+            "ssn",
+            serde_json::json!({
+                "dataMaskType": "CUSTOM",
+                "valueExpr": "concat('xxx-xx-', substr({col},8,4))",
+            }),
+        ))
+        .await
+        .expect("create the ssn mask");
+    ctx.ranger
+        .create_policy(hive_mask_policy(
+            &email_policy,
+            "email",
+            serde_json::json!({"dataMaskType": "MASK_NULL"}),
+        ))
+        .await
+        .expect("create the email mask");
+
+    // Ranger's policy bundle is polled, so the statement can legitimately answer
+    // before the new policies are in the downloaded version.
+    let rows = crate::common::eventually("both new mask policies to reach the bundle", || async {
+        let batches = ctx
+            .handler
+            .execute(&ctx.carol, "SHOW MASKING POLICIES", None)
+            .await
+            .map_err(|e| format!("{e}"))?;
+        let names = col_strings(&batches, "name");
+        if names.contains(&ssn_policy) && names.contains(&email_policy) {
+            Ok(batches)
+        } else {
+            Err(format!("not visible yet: {names:?}"))
+        }
+    })
+    .await;
+
+    // The row for the ssn policy must carry the resource and the expression, not
+    // just the name. Listing names alone would not tell an auditor anything they
+    // could act on.
+    let idx = col_strings(&rows, "name")
+        .iter()
+        .position(|n| n == &ssn_policy)
+        .expect("the ssn policy is in the listing");
+    assert_eq!(col_strings(&rows, "database")[idx], "ac");
+    assert_eq!(col_strings(&rows, "table")[idx], "orders");
+    assert_eq!(col_strings(&rows, "column")[idx], "ssn");
+    assert_eq!(col_strings(&rows, "mask_type")[idx], "CUSTOM");
+    assert_eq!(
+        col_strings(&rows, "expression")[idx],
+        "concat('xxx-xx-', substr({col},8,4))"
+    );
+    assert_eq!(col_strings(&rows, "grantees")[idx], "ROLE engineer");
+
+    // The name filter must EXCLUDE. Asserting only that the named policy is present
+    // would pass on an unfiltered listing.
+    let filtered = ctx
+        .handler
+        .execute(
+            &ctx.carol,
+            &format!("SHOW MASKING POLICY \"{ssn_policy}\""),
+            None,
+        )
+        .await
+        .expect("filtered listing");
+    let filtered_names = col_strings(&filtered, "name");
+    assert_eq!(
+        filtered_names,
+        vec![ssn_policy.clone()],
+        "the name filter must return exactly the named policy and drop every other \
+         one, including {email_policy}"
+    );
+}
+
+/// The statement is ADMIN-ONLY, live.
+///
+/// The listing is a map of where the sensitive columns are. Someone who cannot read
+/// `orders.ssn` must not learn that `orders.ssn` is the column worth masking.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs quickstart/polaris-ranger-keycloak; run scripts/access-control-test.sh"]
+async fn show_masking_policies_is_refused_for_a_non_admin() {
+    ac_gate!();
+    let _guard = crate::common::serial().lock().await;
+    let ctx = ac_setup().await;
+
+    let err = ctx
+        .handler
+        .execute(&ctx.bob, "SHOW MASKING POLICIES", None)
+        .await
+        .expect_err("bob is not an admin and must be refused");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("SHOW MASKING POLICIES"),
+        "the refusal must name the statement, got: {msg}"
+    );
+
+    // Control: the same statement works for carol on this handler, so the refusal
+    // above is the admin gate and not a broken backend.
+    ctx.handler
+        .execute(&ctx.carol, "SHOW MASKING POLICIES", None)
+        .await
+        .expect("carol is an admin");
+}
+
+/// `SET MASKING POLICY` attaches a NAMED tag policy and the column masks, live.
+///
+/// The unit tests cover the refusals. What they cannot show is that resolving a
+/// policy name to its tag actually reaches the tag store, writes the association,
+/// and makes the mask fire. That is the whole chain and it needs a real Ranger.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs quickstart/polaris-ranger-keycloak; run scripts/access-control-test.sh"]
+async fn set_masking_policy_attaches_a_named_tag_policy() {
+    ac_gate!();
+    let _guard = crate::common::serial().lock().await;
+    let ctx = ac_setup().await;
+    grant_read_to_both_roles(&ctx).await;
+
+    let policy = format!("{PREFIX}attach-pii");
+    ctx.ranger
+        .create_policy(tag_mask_policy(
+            &policy,
+            "attach_pii",
+            serde_json::json!({
+                "dataMaskType": "hive:CUSTOM",
+                "valueExpr": "concat('xxx-xx-', substr({col},8,4))",
+            }),
+        ))
+        .await
+        .expect("create the tag mask policy");
+
+    // Attach by POLICY name. No tag is named anywhere in this statement: the
+    // engine looks the policy up and applies the tag it is keyed on.
+    exec_ok(
+        &ctx,
+        &ctx.carol,
+        &format!("ALTER TABLE {ORDERS} MODIFY COLUMN ssn SET MASKING POLICY \"{policy}\""),
+    )
+    .await;
+
+    crate::common::eventually("the attached policy to mask ssn", || async {
+        let b = ctx
+            .handler
+            .execute(&ctx.bob, &format!("SELECT ssn FROM {ORDERS}"), None)
+            .await
+            .map_err(|e| format!("{e}"))?;
+        let vals = col_strings(&b, "ssn");
+        if vals.iter().all(|v| v.starts_with("xxx-xx-")) {
+            Ok(())
+        } else {
+            Err(format!("not masked yet: {vals:?}"))
+        }
+    })
+    .await;
+
+    // Round-trip: the attach really wrote the tag, so SHOW TAGS sees it. This is
+    // what distinguishes "the mask fired" from "the mask was already firing".
+    let tags = ctx
+        .handler
+        .execute(&ctx.carol, &format!("SHOW TAGS ON {ORDERS}"), None)
+        .await
+        .expect("show tags");
+    assert!(
+        col_strings(&tags, "tag").iter().any(|t| t == "attach_pii"),
+        "SET MASKING POLICY must write the policy's tag onto the column. Got: {:?}",
+        col_strings(&tags, "tag")
+    );
+
+    // Detach. Needs no policy name and must take the mask off.
+    exec_ok(
+        &ctx,
+        &ctx.carol,
+        &format!("ALTER TABLE {ORDERS} MODIFY COLUMN ssn UNSET MASKING POLICY"),
+    )
+    .await;
+    crate::common::eventually("the detached policy to stop masking", || async {
+        let b = ctx
+            .handler
+            .execute(&ctx.bob, &format!("SELECT ssn FROM {ORDERS}"), None)
+            .await
+            .map_err(|e| format!("{e}"))?;
+        let vals = col_strings(&b, "ssn");
+        if vals.iter().all(|v| v.contains("-11-") || v.contains("-22-") || v.contains("-33-")) {
+            Ok(())
+        } else {
+            Err(format!("still masked: {vals:?}"))
+        }
+    })
+    .await;
+}
+
+/// Attaching a RESOURCE masking policy is refused against a live Ranger too.
+///
+/// The unit test asserts the message. This asserts the statement genuinely fails
+/// rather than the refusal living only in a function nothing calls, and that the
+/// column is left alone.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs quickstart/polaris-ranger-keycloak; run scripts/access-control-test.sh"]
+async fn set_masking_policy_refuses_a_resource_policy() {
+    ac_gate!();
+    let _guard = crate::common::serial().lock().await;
+    let ctx = ac_setup().await;
+    grant_read_to_both_roles(&ctx).await;
+
+    let policy = format!("{PREFIX}attach-resource");
+    ctx.ranger
+        .create_policy(hive_mask_policy(
+            &policy,
+            "email",
+            serde_json::json!({"dataMaskType": "MASK_NULL"}),
+        ))
+        .await
+        .expect("create the resource mask policy");
+
+    // Wait for the bundle, so a refusal cannot be "the policy is not visible yet"
+    // wearing the right words.
+    crate::common::eventually("the resource policy to reach the bundle", || async {
+        let b = ctx
+            .handler
+            .execute(&ctx.carol, "SHOW MASKING POLICIES", None)
+            .await
+            .map_err(|e| format!("{e}"))?;
+        if col_strings(&b, "name").contains(&policy) {
+            Ok(())
+        } else {
+            Err("not in the bundle yet".to_string())
+        }
+    })
+    .await;
+
+    let err = ctx
+        .handler
+        .execute(
+            &ctx.carol,
+            &format!("ALTER TABLE {ORDERS} MODIFY COLUMN ssn SET MASKING POLICY \"{policy}\""),
+            None,
+        )
+        .await
+        .expect_err("attaching a resource policy must be refused");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("resource masking policy") && msg.contains("cross product"),
+        "the refusal must explain the widening hazard, got: {msg}"
+    );
+
+    // And it must be a refusal, not a partial write: ssn gains no tag.
+    let tags = ctx
+        .handler
+        .execute(&ctx.carol, &format!("SHOW TAGS ON {ORDERS}"), None)
+        .await
+        .expect("show tags");
+    assert!(
+        col_strings(&tags, "column").iter().all(|c| c != "ssn"),
+        "a refused attach must write nothing. Got: {:?}",
+        col_strings(&tags, "column")
+    );
+}
