@@ -82,7 +82,21 @@ bootstrap() {
   docker compose up -d --wait polaris || { red "polaris failed"; exit 1; }
   docker compose up -d polaris-setup >/dev/null 2>&1
   wait_oneshot polaris-setup
-  docker compose up -d --wait sqe || { red "sqe failed"; exit 1; }
+  preflight_image
+  docker compose up -d --build sqe || {
+    red "sqe failed to start"
+    docker compose logs --tail 80 sqe || true
+    exit 1
+  }
+  # Prefer health, but print actionable diagnostics when --wait fails.
+  if ! docker compose up -d --wait sqe; then
+    red "sqe failed healthcheck (compose --wait)"
+    red "common cause: image missing /usr/local/bin/wget after Chainguard/distroless"
+    red "rebuild: docker compose build --no-cache sqe && docker compose up -d --force-recreate sqe"
+    docker compose ps sqe || true
+    docker compose logs --tail 80 sqe || true
+    exit 1
+  fi
   green "stack ready"
 }
 
@@ -253,22 +267,22 @@ tag_policy() { # name json_body
     || { red "could not create tag policy '$1'"; FAIL=$((FAIL+1)); }
 }
 
-# Tag masking needs an SQE binary from 2026-07-31 or later. Before that,
-# `map_mask` matched only bare Ranger mask names while the tag servicedef emits
-# component-qualified ones (`hive:MASK`), so every tag mask fell through to the
-# unsupported arm and RESTRICTED the column instead of masking it. That is
-# fail-closed, not a leak, but a stale quickstart image will show the tag step
-# returning NULL where XX is expected. Warn early rather than let the reader
-# think tag masking is broken.
-preflight_image_age() {
+# Fail early on a stale or shell-era SQE image. After Chainguard/distroless the
+# compose healthcheck needs /usr/local/bin/wget; without it `up --wait sqe`
+# never becomes healthy even though sqe-server is fine.
+preflight_image() {
   local created
+  # Compose healthcheck needs /usr/local/bin/wget (Chainguard/distroless image).
+  if ! docker run --rm --entrypoint /usr/local/bin/wget sqe-quickstart:latest --help >/dev/null 2>&1; then
+    red "ERROR: sqe-quickstart:latest has no /usr/local/bin/wget (healthcheck will fail)."
+    red "       Rebuild: (cd $STACK_DIR && docker compose build sqe && docker compose up -d --force-recreate sqe)"
+    exit 1
+  fi
   created="$(docker inspect sqe-quickstart:latest --format '{{.Created}}' 2>/dev/null | cut -c1-10)"
   [ -n "$created" ] || return 0
   if [ "$created" \< "2026-07-31" ]; then
     red "WARNING: sqe-quickstart:latest was built $created, before the tag-mask fix"
-    red "         (normalize_mask_type, 2026-07-31). The tag masking step will"
-    red "         show a RESTRICTED column instead of a masked one."
-    red "         Rebuild with: (cd $STACK_DIR && docker compose build sqe && docker compose up -d sqe)"
+    red "         Rebuild: (cd $STACK_DIR && docker compose build sqe && docker compose up -d sqe)"
     echo
   fi
 }
@@ -306,7 +320,7 @@ fixture() {
 
 main() {
   [ "${AC_DEMO_NO_BOOTSTRAP:-0}" = "1" ] || bootstrap
-  preflight_image_age
+  preflight_image
   fixture
 
   echo; bold "═══ 1. Catalog gate: the grant is what enables the read ═══"
