@@ -802,24 +802,32 @@ async fn adding_a_column_to_a_masked_table_keeps_it_queryable() {
     );
 }
 
-/// DEFECT, pinned: renaming a tagged column silently UNMASKS it, in both engines.
+/// REGRESSION GUARD: a renamed column KEEPS its mask, in both engines.
 ///
-/// `sqe.column-tags` is keyed by column NAME and no schema-change path rewrites it, so
-/// after `RENAME COLUMN ssn TO tax_id` the association names a column that is gone.
+/// `sqe.column-tags` is keyed by column NAME while Iceberg identifies a column by field
+/// id, so `RENAME COLUMN ssn TO tax_id` used to leave the association naming a column
+/// that no longer existed. No tag matched, no mask fired, and the raw value came back
+/// in BOTH engines. A routine rename silently unmasked a governed column and nothing
+/// reported it.
 ///
-/// Both engines return the column RAW: no tag matches the new name, so no mask fires.
-/// A routine rename silently unmasks a governed column, and nothing reports it.
+/// The ALTER path now rewrites the property in the same commit as the schema change and
+/// moves the association in Ranger's tag store too, so both engines keep masking.
 ///
-/// This test previously asserted the engines broke DIFFERENTLY, with SQE dropping the
-/// column entirely. That was real but it was not an access-control behaviour: the
-/// small-file scan path resolved the projection against each data FILE's parquet
-/// names, so a renamed column matched nothing and was silently discarded. With field-id
-/// resolution in place the engines agree, and what is left is the one shared defect --
-/// which is what I predicted before writing the original test, and then talked myself
-/// out of because the measurement disagreed. The measurement was of a different bug.
+/// Two earlier versions of this test asserted two different wrong things, and the
+/// sequence is worth keeping:
+///
+/// 1. It asserted the engines broke DIFFERENTLY, with SQE dropping the column entirely.
+///    Real, but a SCAN defect: the small-file path resolved projections against each
+///    data file's parquet names, so a renamed column matched nothing and was discarded.
+/// 2. With that fixed the engines agreed, both returning the column RAW, which exposed
+///    the actual access-control defect underneath.
+///
+/// Step 2 is what a cross-engine comparison cannot find on its own: both engines shared
+/// the same assumption, so they agreed, and agreement is what the suite was built to
+/// look for. Agreement is not correctness.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs quickstart/polaris-ranger-keycloak plus spark; run scripts/spark-access-control-test.sh"]
-async fn renaming_a_tagged_column_silently_unmasks_it_in_both_engines() {
+async fn a_renamed_column_keeps_its_mask_in_both_engines() {
     spark_gate!();
     let _guard = crate::common::serial().lock().await;
     let ctx = ac_setup().await;
@@ -872,29 +880,28 @@ async fn renaming_a_tagged_column_silently_unmasks_it_in_both_engines() {
     )
     .await;
 
-    // Both engines return the column, RAW. The tag association is keyed by column
-    // NAME in `sqe.column-tags` and no schema-change path rewrites it, so after the
-    // rename it names a column that no longer exists, no tag matches, and the mask
-    // silently stops applying. Identically in both engines, because both resolve the
-    // association by name.
     assert_eq!(
         sqe, spark,
-        "the engines must agree here: the same stale association is invisible to \
-         both. sqe={sqe:?} spark={spark:?}"
+        "the engines must agree: one association, projected into both stores. \
+         sqe={sqe:?} spark={spark:?}"
     );
     assert_eq!(
         sqe.first().map(Vec::len),
         Some(2),
         "`SELECT id, tax_id` must return BOTH columns. Getting one back was a SCAN \
-         defect, not an access-control one: the small-file read path resolved the \
-         projection against each data file's parquet names, so a renamed column \
-         matched nothing and was dropped. Fixed by resolving field ids. Got: {sqe:?}"
+         defect: the small-file read path resolved the projection against each data \
+         file's parquet names, so a renamed column matched nothing and was dropped. \
+         Fixed by resolving field ids. Got: {sqe:?}"
     );
-    assert_eq!(
-        sqe.first().and_then(|r| r.get(1)).map(String::as_str),
-        Some("111-11-1111"),
-        "the renamed column comes back RAW in both engines, because the tag \
-         association still names `ssn`. THIS is the real defect: a rename silently \
-         unmasks a governed column. Got: {sqe:?}"
+    // THE fix. A raw SSN here means the rename unmasked a governed column.
+    assert!(
+        sqe.iter().all(|r| r.get(1).is_some_and(|v| v.starts_with("xxx-xx-"))),
+        "the renamed column must STAY masked. Raw values mean the tag association \
+         did not follow the rename, so a routine schema change silently unmasked a \
+         governed column. Got: {sqe:?}"
+    );
+    assert!(
+        sqe.iter().all(|r| r.get(1).is_some_and(|v| !v.contains("-11-1111"))),
+        "no raw SSN may appear. Got: {sqe:?}"
     );
 }
