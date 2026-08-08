@@ -103,7 +103,7 @@ services:
 
   # ── Ranger Admin database ─────────────────────────────────────────────
   ranger-db:
-    image: postgres:13.23
+    image: postgres:18.3
     environment:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-rangerR0cks!}
     volumes:
