@@ -92,32 +92,37 @@ RUN --mount=type=cache,id=sqe-cargo-registry-${TARGETARCH},target=/usr/local/car
 Stage 4 copies the actual source and builds only the workspace crates against the pre-built dependencies. On a warm cache, this takes 30 to 90 seconds depending on how many crates changed.
 
 ```dockerfile
-# ── Stage 5: Runtime image ───────────────────────────────────
+# ── Builder ──────────────────────────────────────────────────
+FROM rust:1.97.1-bookworm AS builder
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    cmake protobuf-compiler libprotobuf-dev pkg-config clang lld \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /build
+COPY Cargo.toml Cargo.lock ./
+COPY crates/ crates/
+COPY vendor/ vendor/
+COPY xtask/ xtask/
+RUN cargo build --release --locked --no-default-features \
+      --bin sqe-server --bin sqe-worker --bin sqe-cli
+
+# ── Runtime ──────────────────────────────────────────────────
 # glibc + libgcc + CA certs. No shell, no apt, no OpenSSL.
 FROM gcr.io/distroless/cc-debian12:nonroot
-
-COPY --from=builder /build/out/sqe-server /usr/local/bin/
-COPY --from=builder /build/out/sqe-worker /usr/local/bin/
-COPY --from=builder /build/out/sqe-cli /usr/local/bin/
-# Static busybox wget for HEALTHCHECK / compose only.
+COPY --from=builder /build/target/release/sqe-server /usr/local/bin/
+COPY --from=builder /build/target/release/sqe-worker /usr/local/bin/
+COPY --from=builder /build/target/release/sqe-cli /usr/local/bin/
 COPY --from=busybox:1.37.0-uclibc /bin/wget /usr/local/bin/wget
-
-EXPOSE 50051 50052 8080 9090 9091
-
-HEALTHCHECK --interval=10s --timeout=3s --start-period=10s --retries=3 \
-    CMD ["/usr/local/bin/wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9091/healthz"]
-
 ENTRYPOINT ["/usr/local/bin/sqe-server"]
 ```
 
-Stage 5 is the runtime. Distroless ships glibc, libgcc, and CA certificates. That is the full list of OS dependencies SQE needs: the binaries link `libc` / `libm` / `libgcc`, and TLS is rustls end to end (no `libssl`). A static busybox `wget` is the only extra binary, and it exists only for image and compose healthchecks. Kubernetes probes `/healthz` over HTTP and never calls it.
+The Dockerfile is two stages and one cargo invocation. No chef recipe, no sccache, no BuildKit cache mounts. Local compose, the data-platform quickstart, and aikido/kaniko all use the same file. The builder pin matches `rust-toolchain.toml`.
 
-The build stage is still multi-gigabyte. The runtime image is the three binaries plus a few tens of megabytes of distroless base. Cold pulls on a Kubernetes node stay short because scanners and operators only ever pull the runtime tag.
+The runtime is distroless: glibc, libgcc, and CA certificates. That is the full list of OS dependencies SQE needs. The binaries link `libc` / `libm` / `libgcc`, and TLS is rustls end to end (no `libssl`). A static busybox `wget` exists only for image and compose healthchecks. Kubernetes probes `/healthz` over HTTP and never calls it.
 
-We used to ship `debian:bookworm-slim` with `ca-certificates`, `libssl3`, and `curl`. That was the right call when the tree still touched OpenSSL. Once the stack standardized on rustls, those packages became pure CVE surface: a bookworm-slim scan was hundreds of findings, almost all unfixed, almost none reachable from SQE. Distroless cut that to a handful of low and medium OS issues without changing a line of engine code.
+We used to ship `debian:bookworm-slim` with `ca-certificates`, `libssl3`, and `curl`, and a cargo-chef/sccache build graph that only paid off under BuildKit. Kaniko ignored the mounts and paid the cold compile every time. Distroless cut the OS CVE count from hundreds to a handful. Dropping chef/sccache cut the Dockerfile to something every consumer can read in one screen.
 
 ::: {.antipattern}
-**Antipattern: a full userland in a Rust service image "just in case".** A shell and curl feel convenient for `docker exec` debugging. They also import perl, tar, util-linux, and every CVE those packages carry. If the binary only needs glibc and CA certs, put it on distroless (or Chainguard glibc-dynamic). Keep a separate `-debug` image if operators need a shell. Do not pay the CVE bill on every production node for a tool you use once a quarter.
+**Antipattern: a full userland in a Rust service image "just in case".** A shell and curl feel convenient for `docker exec` debugging. They also import perl, tar, util-linux, and every CVE those packages carry. If the binary only needs glibc and CA certs, put it on distroless. Keep a separate debug image if operators need a shell. Do not pay the CVE bill on every production node for a tool you use once a quarter.
 :::
 
 The non-root user matters. Distroless `nonroot` is UID/GID 65532, and the Helm chart sets `runAsUser` / `runAsGroup` / `fsGroup` to match. This is not security theater. Kubernetes `PodSecurityStandard` policies can enforce non-root containers. Running as root means your deployment will be rejected by any cluster with basic security hygiene enabled.

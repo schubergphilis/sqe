@@ -73,14 +73,16 @@ The Dockerfile uses a multi-stage build:
 
 ```mermaid
 graph LR
-    subgraph "Build Stage (rust:bookworm)"
-        DEPS["Cache dependencies"] --> BUILD["cargo build --release"]
+    subgraph "Build Stage (rust bookworm)"
+        BUILD["cargo build --release --locked"]
     end
     subgraph "Runtime Stage (distroless/cc nonroot)"
         BIN["sqe-server + sqe-worker + sqe-cli"] --> RUN["Non-root user (UID 65532)"]
     end
     BUILD -->|COPY binaries| BIN
 ```
+
+One Dockerfile for every consumer (local, data-platform quickstart, aikido). The builder matches `rust-toolchain.toml`; the runtime is distroless.
 
 ## Workspace Structure
 
