@@ -111,6 +111,18 @@ The second line is load-bearing. Left at its default, Iceberg exchanges the exte
 JWT against Polaris's own token endpoint and the identity silently reverts to the
 service account.
 
+**A per-user token governs ONLY the catalog it is attached to.** Any other catalog
+configured for the same warehouse in that session is a SEPARATE identity, and the
+caller chooses which one by naming it. Measured: with
+`spark.sql.catalog.sales_wh.credential` set to a service account, a user denied on a
+table through his own catalog reads the same table through that alias in the same
+session.
+
+The session cannot defend itself. Overriding the alias's `token` with the user's JWT
+does not help, because Iceberg prefers `credential` when both are set (measured). The
+fix is a deployment one: **remove the service-account catalog, do not shadow it.**
+Pinned by `a_service_account_catalog_in_the_session_defeats_per_user_identity`.
+
 **3. Kyuubi injects masks and row filters** from the `query` and `tag` services.
 
 ## Side by side
@@ -184,6 +196,7 @@ is an incident.
 |---|---|---|
 | Spark's fine-grained tier trusts an asserted username | **open** | A mismatched pair gets one user's object rights and another's masks. The object tier follows the token, so it cannot be widened this way, but mask selection can be steered. Closing it means Spark behind a Kyuubi server with real authentication. |
 | A service-principal Spark bypasses the object tier | **open** | Polaris authorizes the service account. Nothing in the `query` service compensates, because object level is not its job. |
+| A leftover service-account catalog defeats per-user identity | **open** | Adding a per-user catalog does not remove an existing one. Both identities are live and the caller picks by naming the catalog. Measured: denied through the per-user catalog, allowed through the service-account alias, same session, same table. A per-user `token` cannot shadow a `credential`; Iceberg prefers the credential. Remove the other catalog. |
 | Renaming a tagged column breaks it differently in each engine | **open in Spark, broken in SQE** | `sqe.column-tags` is keyed by column NAME and no schema-change path rewrites it. Measured after `RENAME COLUMN ssn TO tax_id`: **SQE silently DROPS the column from the result** (`SELECT id, tax_id` returns one column, no error), while **Spark returns it RAW**. The engines diverge in the worst direction: the stricter engine hides the column and the other exposes the data. The mechanism on the SQE side is not yet confirmed; the observed behaviour is. Silently returning fewer columns than were projected is a defect on its own. |
 | A column added after a grant is readable and unmasked | **open, by design** | The object tier has no column level, so `table-data-read` covers columns that did not exist when it was granted. No policy names the new column, so nothing masks it. |
 | Adding a column to a MASKED table breaks the query in SQE | closed (outage), and a real bug | Measured: with a column mask on `ssn`, `ALTER TABLE ADD COLUMN nickname` then `SELECT id, ssn, nickname` fails with `PhysicalExpr Column references column 'nickname' at index 2 ... but input schema only has 2 columns`. The rewritten plan and the scan schema disagree. Not a leak, but a governed table becomes unqueryable on a routine schema change. Unfixed; needs its own change. |

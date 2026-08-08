@@ -13,8 +13,13 @@
 #
 # SQE runs via sqe-cli (ROPC, user=bob). Spark runs via spark-sql with
 # HADOOP_USER_NAME=bob (Kyuubi Authz picks up the OS user for Ranger role
-# resolution). Spark connects to Polaris as the `root` service account; the
-# fine-grained ssn mask is Kyuubi's job, keyed on bob.
+# resolution) AND bob's own Keycloak bearer token on the Iceberg catalog.
+#
+# Both tiers therefore see bob. That was not true before: Spark used to connect to
+# Polaris as the `root` service account, so this test proved mask parity while the
+# OBJECT tier was bypassed entirely, and a reader could reasonably conclude Spark
+# was subject to Polaris's grants here. It was not. See spark/spark-defaults.conf
+# for why a leftover root credential is worse than untidy.
 #
 # Raw output of both engines is printed for inspection; the ssn column is
 # normalized (sorted) from each and diffed. Any mismatch FAILS.
@@ -56,13 +61,39 @@ echo "(waiting up to 60s for Ranger policy download + first spark-sql start...)"
 # xxx-xx-1111 as SQE -- no Hive UDF registration, no hive catalog impl, no
 # default-catalog gymnastics needed. The Iceberg catalog is referenced
 # fully-qualified (sales_wh.sales.orders) so no USE is required either.
-SPARK_CONF='--conf spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions,org.apache.kyuubi.plugin.spark.authz.ranger.RangerSparkExtension'
+#
+# bob's own bearer token goes on the catalog. Fetched inside the spark container so
+# the Keycloak hostname resolves the same way Polaris will see it.
+echo "== Fetching bob's OIDC token for the Iceberg catalog =="
+BOB_TOKEN=$(docker compose exec -T spark sh -c '
+  curl -s -X POST \
+    -d grant_type=password -d client_id=sqe-client \
+    -d client_secret=sqe-secret-change-me \
+    -d username=bob -d password=bob123 \
+    http://keycloak:8080/realms/iceberg-ranger/protocol/openid-connect/token' \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])' 2>/dev/null) || true
+if [ -z "${BOB_TOKEN:-}" ]; then
+  red "Could not obtain bob's token from Keycloak. Spark cannot reach Polaris as bob."
+  red "Without it this test would either fail to load the table or, if a service-account"
+  red "credential has crept back into spark-defaults.conf, silently pass as root."
+  exit 1
+fi
+
+# Each --conf is TWO argv entries; a combined string arrives as one argument and
+# spark-sql answers "Unrecognized option". Hence the array rather than a string.
+SPARK_CONF=(
+  --conf spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions,org.apache.kyuubi.plugin.spark.authz.ranger.RangerSparkExtension
+  --conf "spark.sql.catalog.sales_wh.token=$BOB_TOKEN"
+  # Load-bearing: with refresh ON, Iceberg exchanges this external Keycloak JWT at
+  # Polaris's own token endpoint and the identity reverts to a service account.
+  --conf spark.sql.catalog.sales_wh.token-refresh-enabled=false
+)
 SPARK_OUT=""
 for i in $(seq 1 6); do
   SPARK_OUT=$(docker compose exec -T \
     -e HADOOP_USER_NAME=bob \
     spark \
-    /opt/spark/bin/spark-sql $SPARK_CONF -e "$QUERY" 2>&1) || true
+    /opt/spark/bin/spark-sql "${SPARK_CONF[@]}" -e "$QUERY" 2>&1) || true
   # spark-sql prints "Fetched N row(s)" once the query actually executes.
   echo "$SPARK_OUT" | grep -qE 'Fetched [0-9]+ row' && break
   echo "  attempt $i/6: Spark not ready yet (policy download / first start), retrying in 10s..."
@@ -108,6 +139,32 @@ else red_fail "SQE: ssn not masked as expected (got: $SQE_SSN)"; fi
 if ! has_raw "$SPARK_SSN" && shows_last4 "$SPARK_SSN"; then
   green_pass "Spark: ssn masked show-last-4, raw hidden"
 else red_fail "Spark: ssn not masked as expected (got: $SPARK_SSN)"; fi
+
+# The identity guard. Everything above passes just as happily when Spark reaches
+# Polaris as a service account, which is how this test spent months proving mask
+# parity with the object tier bypassed. A config file is easy to regress, so assert
+# the property directly rather than trusting the file.
+#
+# With no token at all, Spark must FAIL to load the table. If it succeeds, some
+# credential is configured somewhere and the run above did not prove what it claims.
+echo "== Guard: a tokenless spark-sql must NOT be able to read the table =="
+NOTOKEN_OUT=$(docker compose exec -T -e HADOOP_USER_NAME=bob spark \
+  /opt/spark/bin/spark-sql \
+  --conf spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions,org.apache.kyuubi.plugin.spark.authz.ranger.RangerSparkExtension \
+  -e "$QUERY" 2>&1) || true
+if echo "$NOTOKEN_OUT" | grep -qE 'Fetched [0-9]+ row'; then
+  red_fail "IDENTITY: a tokenless spark-sql READ the table, so Spark is not using the caller's identity"
+  cat <<'NOTE'
+
+  Something is granting Spark access without a caller token -- most likely a
+  `credential` or `oauth2-server-uri` line has come back into
+  spark/spark-defaults.conf. While that is present, a per-user token on ANOTHER
+  catalog alias is defeated: the caller just names the credentialed alias instead.
+  See the header of spark-defaults.conf.
+NOTE
+else
+  green_pass "IDENTITY: without a token Spark cannot load the table (fails closed)"
+fi
 
 # BYTE-EXACT PARITY (the headline assertion). This is deliberately NOT loosened:
 # if the two engines render the same Ranger mask type with different mask
