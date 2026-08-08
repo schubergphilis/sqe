@@ -1,4 +1,7 @@
 # syntax=docker/dockerfile:1
+# Runtime image for aikido-build (kaniko) and local `docker build`.
+# Final stage MUST remain `AS runtime` (see AIKIDO_DOCKER_TARGET in .gitlab-ci.yml).
+# Kaniko ignores BuildKit cache mounts below; cargo-chef layers still cache deps.
 # ── Stage 1: Base builder with tools ──────────────────────────
 # Use cargo-chef official image — cargo-chef pre-installed, avoids slow cargo install
 FROM lukemathwalker/cargo-chef:latest-rust-bookworm AS chef
@@ -92,14 +95,15 @@ RUN --mount=type=cache,id=sqe-cargo-registry-${TARGETARCH},sharing=locked,target
     sccache --show-stats
 
 # ── Stage 5: Shared runtime base ──────────────────────────────
-FROM debian:bookworm-slim AS runtime-base
+# distroless/cc: glibc + libgcc + CA certs, non-root UID 65532, no shell,
+# no package manager. SQE links only libc/libm/libgcc (rustls, not OpenSSL),
+# so debian:bookworm-slim + apt packages were pure CVE surface.
+# Digest-pinned; Renovate bumps via the dockerfile manager.
+FROM gcr.io/distroless/cc-debian12:nonroot@sha256:fccdbb0a547c14e23fcf4ce8ad62ca5d43b4faae8d22cd292f490fef9946c96e AS runtime-base
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates libssl3 curl && \
-    rm -rf /var/lib/apt/lists/* && \
-    groupadd -r sqe && useradd -r -g sqe -u 1000 sqe
-
-USER sqe
+# Static busybox wget for image/compose HEALTHCHECK only. No shell, no curl,
+# no libssl. uclibc busybox is a single static binary (0 OS CVEs at pin time).
+FROM busybox:1.37.0-uclibc@sha256:8d7b1636e974e0adfd8d945955fca609304f0a56c18799dfd032d6e661382d84 AS healthcheck-bin
 
 # The two runtime targets below intentionally share the expensive `builder`
 # stage. `docker compose build` therefore compiles and links all four binaries
@@ -112,7 +116,7 @@ LABEL org.opencontainers.image.title="sqe-bench" \
 
 COPY --from=builder /build/out/sqe-bench /usr/local/bin/
 
-ENTRYPOINT ["sqe-bench"]
+ENTRYPOINT ["/usr/local/bin/sqe-bench"]
 
 # Keep the server runtime last so a plain `docker build .` remains compatible.
 FROM runtime-base AS runtime
@@ -130,10 +134,13 @@ LABEL org.opencontainers.image.title="sqe" \
 
 COPY --from=builder /build/out/sqe-server /build/out/sqe-worker \
     /build/out/sqe-cli /usr/local/bin/
+# wget is only for HEALTHCHECK / compose probes; not on the server hot path.
+COPY --from=healthcheck-bin /bin/wget /usr/local/bin/wget
 
 EXPOSE 50051 50052 8080 9090 9091
 
+# No shell in distroless: exec-form only. K8s uses HTTP probes and ignores this.
 HEALTHCHECK --interval=10s --timeout=3s --start-period=10s --retries=3 \
-    CMD curl -f http://localhost:9091/healthz || exit 1
+    CMD ["/usr/local/bin/wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9091/healthz"]
 
-ENTRYPOINT ["sqe-server"]
+ENTRYPOINT ["/usr/local/bin/sqe-server"]

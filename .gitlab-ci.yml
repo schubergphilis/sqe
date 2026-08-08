@@ -31,6 +31,10 @@ variables:
   # exception + SQE reviewed_evidence (aikido!51). After tools image digest
   # updates, this override can be removed and AIKIDO_HOME from the image used.
   AIKIDO_POLICY_REF: "v0.9.0"
+  # Final stage of the multi-stage Dockerfile (distroless/cc:nonroot runtime).
+  # Passed as --target to kaniko so we never accidentally ship an intermediate
+  # builder stage if stage order in Dockerfile drifts.
+  AIKIDO_DOCKER_TARGET: "runtime"
 
 # Cold Rust build ceiling. aikido builds with rootless Kaniko, which does NOT
 # honor this repo's BuildKit `RUN --mount=type=cache` + sccache mounts, so the
@@ -39,8 +43,77 @@ variables:
 # included `aikido-build` job (same-name job merge) until the registry-backed
 # build cache lands (aikido follow-up). This is a CEILING, not a duration: a
 # warm/fast build finishes early and is unaffected.
+#
+# Script is re-stated from aikido deploy.yml (v0.9.4) so we can pass
+# --target=$AIKIDO_DOCKER_TARGET. When bumping the aikido `ref:`, re-diff this
+# script against ci/templates/deploy.yml and keep the --target line.
 aikido-build:
   timeout: 3h
+  script:
+    - |
+      set -euo pipefail
+      # Standard provenance build-args (Dockerfiles that don't declare them just
+      # ignore the values); repos add more via AIKIDO_BUILD_ARGS="K=V K2=V2".
+      BA="--build-arg VERSION=${CI_COMMIT_TAG:-$CI_COMMIT_SHORT_SHA}"
+      BA="$BA --build-arg BUILD_DATE=$CI_PIPELINE_CREATED_AT --build-arg GIT_REVISION=$CI_COMMIT_SHA"
+      # kaniko doesn't auto-populate BuildKit's TARGETARCH/TARGETOS, so Dockerfiles
+      # that branch on $TARGETARCH would see it empty. Default amd64 (our CI arch);
+      # override via AIKIDO_TARGETARCH.
+      BA="$BA --build-arg TARGETARCH=${AIKIDO_TARGETARCH:-amd64} --build-arg TARGETOS=linux"
+      for kv in ${AIKIDO_BUILD_ARGS:-}; do BA="$BA --build-arg $kv"; done
+      # Distroless final stage (see Dockerfile `AS runtime`). Required: without
+      # --target, a future intermediate stage left last would ship the builder.
+      TARGET="--target ${AIKIDO_DOCKER_TARGET:-runtime}"
+      if [ "$CI_COMMIT_REF_NAME" = "$CI_DEFAULT_BRANCH" ]; then
+        DEST="--destination $AIKIDO_IMAGE --digest-file image-digest.txt"
+      else
+        DEST="--no-push"
+      fi
+      echo "kaniko: target=${AIKIDO_DOCKER_TARGET:-runtime} dest_mode=$( [ "$CI_COMMIT_REF_NAME" = "$CI_DEFAULT_BRANCH" ] && echo push || echo no-push )"
+      /kaniko/executor \
+        --context "$CI_PROJECT_DIR" \
+        --dockerfile "$CI_PROJECT_DIR/Dockerfile" \
+        $TARGET \
+        $BA \
+        $DEST
+      # On MR validation builds (--no-push) kaniko writes no digest file, which makes
+      # the artifact upload log a confusing "ERROR: No files to upload". Leave a marker
+      # so the artifact exists; merge builds overwrite it with the real digest.
+      [ -f image-digest.txt ] || echo "validation-only build (--no-push); no image pushed" > image-digest.txt
+
+# Container CVE gate on the image kaniko just built. Source-tree grype (aikido-scan)
+# never sees the distroless base or the static healthcheck wget; this job does.
+# Distroless/cc is expected to keep HIGH/CRITICAL at zero (measured ~0 high when
+# the runtime landed). MR validation builds do not push, so the gate is a no-op
+# there and enforces on merge when the image is in the GitLab registry.
+aikido-image-vuln:
+  stage: .post
+  image: "$AIKIDO_TOOLS_IMAGE"
+  needs:
+    - job: aikido-build
+      artifacts: true
+  before_script:
+    - mkdir -p "$HOME/.docker"
+    - |
+      AUTH=$(printf "%s:%s" "$CI_REGISTRY_USER" "$CI_REGISTRY_PASSWORD" | base64 | tr -d '\n')
+      printf '{"auths":{"%s":{"auth":"%s"}}}' "$CI_REGISTRY" "$AUTH" > "$HOME/.docker/config.json"
+  script:
+    - |
+      set -euo pipefail
+      if grep -q 'validation-only' image-digest.txt 2>/dev/null; then
+        echo "MR validation build (no image pushed); container CVE gate runs on merge to $CI_DEFAULT_BRANCH"
+        exit 0
+      fi
+      echo "grype container gate: registry:$AIKIDO_IMAGE (fail-on high)"
+      grype "registry:$AIKIDO_IMAGE" -o table --fail-on high
+  allow_failure: false
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      exists:
+        - Dockerfile
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      exists:
+        - Dockerfile
 
 # Exclude demo/quickstart Python trees from the source SBOM so commercial
 # EULA packages (dlthub) and docs samples are not license-gated as product deps.

@@ -11,18 +11,19 @@ REGISTRY="${SQE_REGISTRY:-}"
 
 echo "Building Docker images (tag: $TAG)..."
 
-docker build --target coordinator -t "sqe-coordinator:$TAG" .
-docker build --target worker -t "sqe-worker:$TAG" .
-docker build --target cli -t "sqe-cli:$TAG" .
+# Single multi-binary image (sqe-server / sqe-worker / sqe-cli) on distroless.
+docker build --target runtime -t "sqe:$TAG" .
+# Optional one-shot benchmark generator (same builder stage, distinct entrypoint).
+docker build --target bench-runtime -t "sqe-bench:$TAG" .
 
 echo ""
 echo "Images built:"
-docker images | grep -E "^sqe-(coordinator|worker|cli)" | head -6
+docker images | grep -E "^sqe(-bench)?\s" | head -6
 
 if [ -n "$REGISTRY" ]; then
     echo ""
     echo "Pushing to $REGISTRY..."
-    for img in sqe-coordinator sqe-worker sqe-cli; do
+    for img in sqe sqe-bench; do
         docker tag "$img:$TAG" "$REGISTRY/$img:$TAG"
         docker push "$REGISTRY/$img:$TAG"
     done
