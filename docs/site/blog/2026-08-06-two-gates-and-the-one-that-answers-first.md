@@ -56,6 +56,26 @@ identity reverts to the service account, every denial test passes, and you have
 proved nothing. We found that one before it cost us anything, which was luck as much
 as care.
 
+There is a second trap in the same area, and we found it later, by accident, while
+measuring something else. **A per-user token governs only the catalog it is attached
+to.** If the session still has a service-account catalog pointed at the same
+warehouse, that is a second identity sitting right there, and the user picks which one
+by naming it:
+
+```
+bob's session, per-user token on catalog `p`:
+  SELECT count(*) FROM p.ac.orders          -> denied, LOAD_TABLE
+  SELECT count(*) FROM sales_wh.ac.orders   -> 3
+```
+
+Same table, same session, one alias away. Our own quickstart ships
+`spark.sql.catalog.sales_wh.credential = root:...`, so anyone following the per-user
+recipe while leaving that in place has added an identity rather than replaced one.
+
+The session cannot defend itself either. Overriding the alias's `token` with the
+user's JWT changes nothing, because Iceberg prefers `credential` when both are set.
+Remove the service-account catalog; shadowing it does not work.
+
 Writes behave the same way, with one wrinkle. An unauthorized `INSERT` is refused at
 `ADD_TABLE_SNAPSHOT`, which is the snapshot commit, not the load. The table is
 untouched and the row count does not move. But the data files were already staged, so
