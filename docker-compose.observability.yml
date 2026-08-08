@@ -14,7 +14,7 @@
 
 services:
   victoriametrics:
-    image: victoriametrics/victoria-metrics:v1.148.0
+    image: victoriametrics/victoria-metrics:v1.149.0
     command:
       - "-promscrape.config=/etc/prometheus/scrape.yml"
       - "-retentionPeriod=7d"
