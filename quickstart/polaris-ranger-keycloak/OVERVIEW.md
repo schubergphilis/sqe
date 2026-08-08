@@ -199,10 +199,19 @@ bob --OS user---> Spark --reads query svc--> mask applied by RangerSparkExtensio
                    +-- both resolve bob -> role engineer from the SAME Ranger `query` service
 ```
 
-Spark connects to Polaris as the `root` service account (client_credentials); the per-user mask is
-Kyuubi's job, keyed on `bob` via `HADOOP_USER_NAME`. SQE's coarse Polaris gate (the embedded Ranger
-authorizer on the `polaris` service) and Kyuubi's frontend-service access policy are seeded separately
-because the two engines authorize through two different Ranger services.
+Spark reaches Polaris as **bob**, using bob's own Keycloak bearer token on the Iceberg catalog, so
+both tiers see the same identity. The mask is still Kyuubi's job, keyed on `bob` via
+`HADOOP_USER_NAME`. SQE's coarse Polaris gate (the embedded Ranger authorizer on the `polaris`
+service) and Kyuubi's frontend-service access policy are seeded separately because the two engines
+authorize through two different Ranger services.
+
+Spark used to connect as the `root` service account here, which meant this demo showed mask parity
+with the object tier bypassed. Worse, a root-credentialed catalog alias defeats per-user identity
+for the whole session: a per-user token governs only the alias it is attached to, so a caller denied
+on their own alias reads the same table by naming the credentialed one. Overriding that alias's
+`token` does not help, because Iceberg prefers `credential` when both are set. `parity-test.sh` now
+asserts the property directly: a `spark-sql` with no caller token must fail to load the table.
+See `spark/spark-defaults.conf` for the full note.
 
 **Why the ssn mask is a CUSTOM portable-SQL expression, not a named type.** Named Ranger mask types
 are NOT byte-portable between SQE and Kyuubi:
