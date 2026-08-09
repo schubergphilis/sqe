@@ -57,7 +57,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 base64 = { workspace = true }
 clap = { workspace = true }
-rustyline = "15"
+rustyline = "18"
 rpassword = "7"
 reqwest = { workspace = true }
 url = { workspace = true }
