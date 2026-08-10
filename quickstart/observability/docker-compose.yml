@@ -31,7 +31,7 @@ services:
 
   # ── bucket-init — create the warehouse bucket (RustFS needs real S3) ──
   bucket-init:
-    image: amazon/aws-cli:2.36.17
+    image: amazon/aws-cli:2.36.18
     entrypoint: ["sh", "-c"]
     command:
       - |
@@ -118,7 +118,7 @@ services:
 
   # ── Grafana — VictoriaMetrics datasource + a starter SQE dashboard ────
   grafana:
-    image: grafana/grafana:13.1.2
+    image: grafana/grafana:13.1.3
     environment:
       GF_SECURITY_ADMIN_USER: admin
       GF_SECURITY_ADMIN_PASSWORD: admin
