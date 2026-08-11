@@ -6765,6 +6765,7 @@ dependencies = [
  "sha2 0.11.0",
  "sqe-core",
  "sqe-metrics",
+ "sqe-sql",
  "tokio",
  "tracing",
  "wiremock",

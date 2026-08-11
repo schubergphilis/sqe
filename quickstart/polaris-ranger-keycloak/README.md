@@ -46,6 +46,7 @@ cp .env.example .env
 docker compose up -d --build --wait   # Ranger Admin first-boot takes 2-4 min
 ./test.sh            # SQE GRANT/REVOKE + fine-grained mask enforcement
 ./parity-test.sh     # SQE <-> Spark (Kyuubi Authz) Ranger mask cross-compare
+../../scripts/access-control-parity-demo.sh  # readable multi-policy SQE <-> Spark comparison
 ```
 
 Or run both through `run.sh`:
@@ -148,6 +149,12 @@ SQE, and the Spark container. The `ranger-setup` one-shot seeds the Ranger
 user-to-role membership (in production that membership comes from Ranger usersync
 over LDAP/AD/SCIM). The Polaris and Spark configs share the same Ranger service
 names so all three engines see one policy set.
+
+Spark SQL/Kyuubi AuthZ checks Ranger policies but does not provide SQL statements
+to create row filters, masks, or tag policies. SQE provides the shared authoring
+surface with `CREATE OR REPLACE POLICY` / `DROP POLICY`; these statements write
+Ranger policies that both SQE and Spark enforce. `GRANT`/`REVOKE` remains the SQL
+surface for coarse Polaris privileges.
 
 ## Output
 
