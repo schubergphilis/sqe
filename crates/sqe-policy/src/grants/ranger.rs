@@ -170,6 +170,13 @@ fn deny_items_equivalent(a: &serde_json::Value, b: &serde_json::Value) -> bool {
         && accesses(a) == accesses(b)
 }
 
+/// Does this privilege name mean "everything"? `ALL PRIVILEGES` is the Unity
+/// Catalog spelling and the profile aliases it to `ALL`.
+fn is_all_privileges(privilege: &str) -> bool {
+    let p = privilege.trim();
+    p.eq_ignore_ascii_case("ALL") || p.eq_ignore_ascii_case("ALL PRIVILEGES")
+}
+
 /// Reject identifier values that could inject into the Ranger resource map.
 /// Catalog/namespace/table/user/role names come from GRANT SQL and flow into
 /// the JSON `resource` map body (not URL paths; the only URL-interpolated value
@@ -1073,6 +1080,218 @@ impl RangerGrantBackend {
     }
 
     /// Drop this statement's provenance label. Called after a successful revoke.
+    /// Every access type this grantee currently holds at `resource`, across all
+    /// of the policy's items that name them.
+    ///
+    /// Read from Ranger rather than planned, so grants written before provenance
+    /// labels existed, or written straight through the Ranger console, are still
+    /// caught. `REVOKE ALL PRIVILEGES` that quietly skipped those would be the
+    /// same class of defect as a `REVOKE SELECT` that leaves the row readable.
+    async fn access_types_held(
+        &self,
+        resource: &BTreeMap<String, String>,
+        grantee: &Grantee,
+    ) -> Vec<String> {
+        let Ok(Some(policy)) = self.policy_by_resource(resource).await else {
+            return Vec::new();
+        };
+        let field = match grantee {
+            Grantee::User(_) => "users",
+            Grantee::Role(_) => "roles",
+            Grantee::Group(_) => "groups",
+        };
+        let name = grantee.name();
+        let mut held: Vec<String> = Vec::new();
+        for item in policy
+            .get("policyItems")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let is_theirs = item
+                .get(field)
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|names| {
+                    names.iter().filter_map(serde_json::Value::as_str).any(|n| n == name)
+                });
+            if !is_theirs {
+                continue;
+            }
+            for access in item
+                .get("accesses")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                if let Some(t) = access.get("type").and_then(serde_json::Value::as_str) {
+                    held.push(t.to_string());
+                }
+            }
+        }
+        held.sort();
+        held.dedup();
+        held
+    }
+
+    /// Drop every provenance label belonging to `grantee` at `resource`.
+    ///
+    /// The per-privilege `remove_grant_label` cannot be looped here: the point of
+    /// `REVOKE ALL PRIVILEGES` is not needing to know which privileges were
+    /// granted in the first place.
+    async fn remove_all_grant_labels(
+        &self,
+        resource: &BTreeMap<String, String>,
+        grantee: &Grantee,
+    ) {
+        let Ok(Some(mut policy)) = self.policy_by_resource(resource).await else {
+            return;
+        };
+        let Some(labels) = policy.get("policyLabels").and_then(serde_json::Value::as_array) else {
+            return;
+        };
+        let name = grantee.name();
+        let kept: Vec<String> = labels
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .filter(|l| match parse_grant_label(l) {
+                Some((_, label_name, _)) => label_name != name,
+                None => true, // unparseable: leave it rather than lose information
+            })
+            .map(str::to_string)
+            .collect();
+        if kept.len() == labels.len() {
+            return;
+        }
+        policy["policyLabels"] = serde_json::json!(kept);
+        if let Some(id) = policy.get("id").and_then(serde_json::Value::as_i64) {
+            if let Err(e) = self.put_policy(id, &policy).await {
+                warn!(grantee = %name, error = %e, "could not clear provenance labels");
+            }
+        }
+    }
+
+    /// Drop every DENY item naming `grantee` at `resource`.
+    ///
+    /// `remove_deny_items` matches the deny item a specific privilege would have
+    /// written, which needs that privilege planned. `ALL PRIVILEGES` has no plan
+    /// at a table coordinate by design, and "everything" should not leave a
+    /// denial behind anyway: a DENY that outlives the grant it mirrored is a
+    /// one-way door, which is the reason REVOKE clears denies at all.
+    ///
+    /// The grantee's NAME is removed from each item rather than the item being
+    /// dropped outright, because one item can name several principals and the
+    /// others' denials are not ours to lift.
+    async fn remove_all_deny_items(
+        &self,
+        resource: &BTreeMap<String, String>,
+        grantee: &Grantee,
+    ) -> sqe_core::Result<()> {
+        let Some(mut policy) = self.policy_by_resource(resource).await? else {
+            return Ok(());
+        };
+        let field = match grantee {
+            Grantee::User(_) => "users",
+            Grantee::Role(_) => "roles",
+            Grantee::Group(_) => "groups",
+        };
+        let name = grantee.name();
+        let Some(items) = policy.get("denyPolicyItems").and_then(serde_json::Value::as_array)
+        else {
+            return Ok(());
+        };
+        let mut changed = false;
+        let mut kept: Vec<serde_json::Value> = Vec::new();
+        for item in items {
+            let mut item = item.clone();
+            let names: Vec<String> = item
+                .get(field)
+                .and_then(serde_json::Value::as_array)
+                .map(|a| {
+                    a.iter().filter_map(serde_json::Value::as_str).map(str::to_string).collect()
+                })
+                .unwrap_or_default();
+            if !names.iter().any(|n| n == name) {
+                kept.push(item);
+                continue;
+            }
+            changed = true;
+            let remaining: Vec<String> = names.into_iter().filter(|n| n != name).collect();
+            let others_named = ["users", "roles", "groups"].iter().any(|f| {
+                *f != field
+                    && item
+                        .get(*f)
+                        .and_then(serde_json::Value::as_array)
+                        .is_some_and(|a| !a.is_empty())
+            });
+            if remaining.is_empty() && !others_named {
+                continue; // nothing left to deny: drop the item
+            }
+            item[field] = serde_json::json!(remaining);
+            kept.push(item);
+        }
+        if !changed {
+            return Ok(());
+        }
+        policy["denyPolicyItems"] = serde_json::json!(kept);
+        if let Some(id) = policy.get("id").and_then(serde_json::Value::as_i64) {
+            self.put_policy(id, &policy).await?;
+        }
+        Ok(())
+    }
+
+    /// `REVOKE ALL PRIVILEGES ON <object> FROM <grantee>`: leave the grantee
+    /// holding nothing at that exact coordinate.
+    ///
+    /// Deliberately asymmetric with `GRANT ALL`, which still binds no deeper than
+    /// the catalog. Granting "everything" at a coordinate needs a definition of
+    /// everything, and getting that wrong once wrote a CATALOG-WIDE policy from a
+    /// single-table grant. Revoking everything needs no such definition: it only
+    /// removes, so it cannot widen access, and "afterwards they hold nothing here"
+    /// is unambiguous at any level. Unity Catalog offers the same statement, and
+    /// it is the one an operator reaches for during an incident.
+    ///
+    /// This exists because closing a gate otherwise required knowing the
+    /// privilege implication graph: `REVOKE SELECT` leaves a grantee reading
+    /// through a surviving INSERT, since a writer must hold the metadata reads
+    /// that authorize a table load.
+    async fn revoke_all(&self, stmt: &RevokeStatement) -> sqe_core::Result<()> {
+        // The coordinate is planned with a privilege that reaches the requested
+        // level, purely to build the same resource map a normal revoke would use.
+        // Its access types are then replaced wholesale, so which privilege is
+        // borrowed here cannot affect what is revoked.
+        let coordinate_privilege = match stmt.object {
+            GrantObjectKind::View => "SELECT VIEW",
+            GrantObjectKind::Table => "SELECT",
+        };
+        let mut body = self.build_grant_revoke_for(
+            coordinate_privilege,
+            stmt.object,
+            stmt.catalog.as_deref(),
+            stmt.namespace.as_deref(),
+            stmt.table.as_deref(),
+            &stmt.grantee,
+        )?;
+        body.grantor = required_grantor(stmt.grantor.as_deref(), "revoke")?.to_string();
+
+        let held = self.access_types_held(&body.resource, &stmt.grantee).await;
+        if held.is_empty() {
+            // Nothing allowed here. Still clear provenance and any DENY, so the
+            // statement is idempotent and a denial cannot outlive the grant.
+            self.remove_all_grant_labels(&body.resource, &stmt.grantee).await;
+            return self.remove_all_deny_items(&body.resource, &stmt.grantee).await;
+        }
+        debug!(
+            grantee = %stmt.grantee.name(),
+            access_types = held.len(),
+            "REVOKE ALL PRIVILEGES: removing every access type held at this resource"
+        );
+        body.access_types = held;
+        self.post_grant_revoke_with_privilege("revoke", "ALL PRIVILEGES", &body)
+            .await?;
+        self.remove_all_grant_labels(&body.resource, &stmt.grantee).await;
+        self.remove_all_deny_items(&body.resource, &stmt.grantee).await
+    }
+
     async fn remove_grant_label(
         &self,
         resource: &BTreeMap<String, String>,
@@ -1333,6 +1552,11 @@ impl GrantBackend for RangerGrantBackend {
     }
 
     async fn revoke(&self, _token: &str, stmt: &RevokeStatement) -> sqe_core::Result<()> {
+        // `REVOKE ALL PRIVILEGES` is not a privilege expansion, it is "this
+        // grantee holds nothing here afterwards". See `revoke_all`.
+        if is_all_privileges(&stmt.privilege) {
+            return self.revoke_all(stmt).await;
+        }
         let mut body = self.build_grant_revoke_for(
             &stmt.privilege,
             stmt.object,

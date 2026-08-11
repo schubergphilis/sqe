@@ -381,3 +381,191 @@ async fn show_grants_fails_loudly_on_non_200() {
         "error must mention the failed fetch / status, got: {err}"
     );
 }
+
+// ── REVOKE ALL PRIVILEGES ────────────────────────────────────────────────
+//
+// `REVOKE ALL PRIVILEGES ON <object>` means "this grantee holds nothing here
+// afterwards", which is what Unity Catalog offers and what an operator reaches
+// for during an incident. It exists because closing a gate otherwise requires
+// knowing the privilege implication graph: `REVOKE SELECT` leaves a grantee
+// reading through a surviving INSERT, since a writer must hold the metadata
+// reads that authorize a table load.
+
+fn revoke_all_stmt() -> sqe_policy::grants::RevokeStatement {
+    sqe_policy::grants::RevokeStatement {
+        privilege: "ALL PRIVILEGES".to_string(),
+        catalog: Some("wh".to_string()),
+        namespace: Some("sales".to_string()),
+        table: Some("orders".to_string()),
+        grantee: Grantee::Role("analyst".to_string()),
+        grantor: Some("carol".to_string()),
+        object: Default::default(),
+    }
+}
+
+/// A policy at the table coordinate holding two access types for `analyst` and
+/// one for an unrelated role.
+fn policy_with_analyst_accesses() -> serde_json::Value {
+    serde_json::json!([{
+        "id": 7,
+        "isEnabled": true,
+        "policyLabels": ["table:analyst:SELECT", "table:analyst:INSERT", "table:bob:SELECT"],
+        "resources": {
+            "root": {"values": ["POLARIS"]},
+            "catalog": {"values": ["wh"]},
+            "namespace": {"values": ["sales"]},
+            "table": {"values": ["orders"]}
+        },
+        "policyItems": [
+            {"roles": ["analyst"], "accesses": [
+                {"type": "table-data-read", "isAllowed": true},
+                {"type": "table-properties-read", "isAllowed": true}
+            ]},
+            {"roles": ["auditor"], "accesses": [
+                {"type": "table-list", "isAllowed": true}
+            ]}
+        ]
+    }])
+}
+
+async fn revoke_bodies(server: &MockServer) -> Vec<serde_json::Value> {
+    server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|r| {
+            r.method == wiremock::http::Method::POST
+                && r.url.path() == format!("/service/plugins/services/revoke/{SERVICE}")
+        })
+        .filter_map(|r| serde_json::from_slice(&r.body).ok())
+        .collect()
+}
+
+/// The revoke must name every access type the grantee actually holds, read from
+/// Ranger rather than planned from the privilege. A grant written before
+/// provenance labels existed, or straight through the Ranger console, is caught
+/// this way; planning `ALL` would miss it.
+#[tokio::test]
+async fn revoke_all_privileges_removes_every_access_type_the_grantee_holds() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/service/public/v2/api/policy"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(policy_with_analyst_accesses()))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!("/service/plugins/services/revoke/{SERVICE}")))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+
+    backend(&server.uri())
+        .revoke("token", &revoke_all_stmt())
+        .await
+        .expect("REVOKE ALL PRIVILEGES must succeed");
+
+    let bodies = revoke_bodies(&server).await;
+    assert_eq!(bodies.len(), 1, "expected exactly one revoke POST: {bodies:?}");
+    let types: Vec<String> = bodies[0]["accessTypes"]
+        .as_array()
+        .expect("accessTypes array")
+        .iter()
+        .filter_map(|v| v.as_str().map(str::to_string))
+        .collect();
+    for expected in ["table-data-read", "table-properties-read"] {
+        assert!(types.contains(&expected.to_string()), "missing {expected} in {types:?}");
+    }
+    assert!(
+        !types.contains(&"table-list".to_string()),
+        "revoked another role's access type: {types:?}"
+    );
+}
+
+/// `ALL PRIVILEGES` must reach the TABLE coordinate. `GRANT ALL` deliberately
+/// binds no deeper than the catalog, because granting "everything" at a
+/// coordinate once wrote a catalog-wide policy from a single-table grant. Revoke
+/// is monotonic, so the same guard would only strand access.
+#[tokio::test]
+async fn revoke_all_privileges_targets_the_named_table_not_the_catalog() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/service/public/v2/api/policy"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(policy_with_analyst_accesses()))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!("/service/plugins/services/revoke/{SERVICE}")))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+
+    backend(&server.uri())
+        .revoke("token", &revoke_all_stmt())
+        .await
+        .expect("must succeed");
+
+    let bodies = revoke_bodies(&server).await;
+    let resource = &bodies[0]["resource"];
+    assert_eq!(resource["table"], "orders", "resource: {resource}");
+    assert_eq!(resource["namespace"], "sales", "resource: {resource}");
+    assert_eq!(resource["catalog"], "wh", "resource: {resource}");
+}
+
+/// Idempotent: with nothing allowed at the coordinate there is no revoke to post,
+/// and the statement must still succeed rather than error. An operator running it
+/// twice, or against an already-clean object, is the normal case.
+#[tokio::test]
+async fn revoke_all_privileges_on_a_clean_object_is_a_no_op_that_succeeds() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/service/public/v2/api/policy"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!("/service/plugins/services/revoke/{SERVICE}")))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+
+    backend(&server.uri())
+        .revoke("token", &revoke_all_stmt())
+        .await
+        .expect("a no-op revoke must not error");
+
+    assert!(
+        revoke_bodies(&server).await.is_empty(),
+        "nothing was held, so nothing should have been posted"
+    );
+}
+
+/// A revoke is authorized against its grantor, exactly like the per-privilege
+/// path. `ALL PRIVILEGES` must not become a way around that check.
+#[tokio::test]
+async fn revoke_all_privileges_still_requires_a_grantor() {
+    let server = MockServer::start().await;
+    let mut stmt = revoke_all_stmt();
+    stmt.grantor = None;
+
+    let err = backend(&server.uri())
+        .revoke("token", &stmt)
+        .await
+        .expect_err("a revoke with no grantor must be refused");
+    assert!(
+        err.to_string().to_lowercase().contains("grantor"),
+        "error should name the grantor: {err}"
+    );
+    assert!(
+        server.received_requests().await.unwrap_or_default().is_empty(),
+        "refusal must happen before any request"
+    );
+}

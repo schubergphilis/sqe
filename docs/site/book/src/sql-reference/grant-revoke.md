@@ -31,7 +31,7 @@ This page is the SQL surface reference.
 | `MODIFY` | table | Shorthand for INSERT + UPDATE + DELETE + MERGE. Required by maintenance procedures. |
 | `DROP` | table, schema | Required by `DROP TABLE`, `DROP SCHEMA`, `system.expire_snapshots`. |
 | `CREATE` | schema, catalog | Required to create new tables / schemas. |
-| `ALL PRIVILEGES` | any | Every privilege on the resource. |
+| `ALL PRIVILEGES` | catalog to GRANT, any to REVOKE | Every privilege on the resource. See [Closing a gate](#closing-a-gate) for why the two directions differ. |
 
 ## Grantee types
 
@@ -53,6 +53,35 @@ REVOKE INSERT ON staging.tmp FROM USER "etl";
 ```
 
 The standard form is parsed by `sqlparser-rs` and routed via `StatementKind::Grant` / `StatementKind::Revoke`.
+
+### Closing a gate
+
+`REVOKE SELECT` does not necessarily stop a principal reading. Privileges expand
+to Polaris access types, and a writer must hold the metadata reads that authorize
+a table load, so a surviving `INSERT` keeps conferring read. The statement reports
+success and the rows still come back. Measured on Polaris: stripping
+`table-data-read` alone changes nothing, and `table-properties-read` is what
+unlocks `LOAD_TABLE`.
+
+Use `REVOKE ALL PRIVILEGES` to close a gate. It means "this grantee holds nothing
+on this object afterwards", at any level, and needs no knowledge of which
+privileges were granted:
+
+```sql
+REVOKE ALL PRIVILEGES ON sales.orders FROM ROLE "analyst";
+```
+
+It reads the access types the grantee actually holds from Ranger rather than
+planning them from a privilege name, so grants written before SQE tracked
+provenance, or written straight through the Ranger console, are removed too. It
+also clears that grantee's `DENY` items at the object, and is idempotent: running
+it against an object the grantee never held is a successful no-op.
+
+**`GRANT ALL PRIVILEGES` still binds no deeper than the catalog**, and the
+asymmetry is deliberate. Granting "everything" at a coordinate requires a
+definition of everything, and getting that wrong once wrote a catalog-wide policy
+from a single-table grant. Revoking everything needs no such definition: it only
+removes, so it cannot widen access.
 
 ### Column masks (SQE extension)
 
