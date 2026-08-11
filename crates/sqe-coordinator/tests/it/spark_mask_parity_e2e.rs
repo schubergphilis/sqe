@@ -575,25 +575,25 @@ async fn unset_tag_stops_masking_in_both_engines() {
     );
 }
 
-/// A DOCUMENTED DIVERGENCE, measured: the two engines resolve resource-mask versus
-/// tag-mask precedence DIFFERENTLY.
+/// A CLOSED divergence: with both a resource mask and a tag mask on one column,
+/// the two engines now agree on the tag mask.
 ///
-/// With both a resource mask and a tag mask on the same column, SQE applies the
-/// RESOURCE mask (pinned on its own side by `resource_mask_beats_tag_mask_live`)
-/// while Kyuubi applies the TAG mask. Stock `RangerBasePlugin` evaluates tag policies
-/// before resource policies, so Kyuubi is following Ranger's own ordering and SQE is
-/// the one that differs.
+/// This used to assert the difference. SQE applied the RESOURCE mask on a
+/// most-specific-rule reading while Kyuubi applied the TAG mask, because stock
+/// `RangerBasePlugin` evaluates tag policies first. Kyuubi was following Ranger's
+/// own ordering, so SQE was the one that differed, and the same column ended up
+/// governed differently depending on how it was read.
 ///
-/// It matters because whichever mask is WEAKER becomes the effective one for anyone
-/// who picks that engine, so the same column is governed differently depending on how
-/// it is read. Recorded here rather than papered over; aligning the two is a decision,
-/// not a bug fix, because it means changing SQE's documented precedence.
+/// `policy.mask-precedence` now decides it and defaults to `tag`. SQE's own side
+/// is pinned by `tag_mask_beats_resource_mask_live`; `resource` restores the old
+/// behaviour and re-opens this divergence, which is why the assertion below names
+/// the setting rather than just the value.
 ///
-/// Both masks hide the raw value, so this is a difference in WHICH protection applies,
-/// not a leak. The assertion checks exactly that much, and that they differ.
+/// Both masks hide the raw value, so this was never a leak in either direction.
+/// The assertion still checks that much first.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs quickstart/polaris-ranger-keycloak plus spark; run scripts/spark-access-control-test.sh"]
-async fn resource_and_tag_mask_precedence_diverges_across_engines() {
+async fn resource_and_tag_mask_precedence_agrees_across_engines() {
     spark_gate!();
     let _guard = crate::common::serial().lock().await;
     let ctx = ac_setup().await;
@@ -626,20 +626,21 @@ async fn resource_and_tag_mask_precedence_diverges_across_engines() {
         .await
         .expect("SET TAG");
 
-    // Wait for each engine to settle on SOME mask, without requiring agreement.
+    // Wait for the engines to agree, not merely to mask. Settling on "some mask"
+    // each was the right condition while they diverged; now disagreement is the
+    // failure this test exists to catch, so it must not be waited out.
     let (sqe, spark) = crate::common::eventually_within(
         std::time::Duration::from_secs(180),
-        "both engines to apply a mask to ssn",
+        "both engines to apply the tag mask to ssn",
         || async {
             let (sqe, spark) = both_engines(&ctx, "bob", "id, ssn", "id").await?;
-            let masked = |rows: &[Vec<String>]| {
+            let tag_masked = |rows: &[Vec<String>]| {
                 rows.len() == 3
-                    && rows.iter().all(|r| {
-                        r.get(1)
-                            .is_some_and(|v| v.starts_with("RES-") || v.starts_with("xxx-xx-"))
-                    })
+                    && rows
+                        .iter()
+                        .all(|r| r.get(1).is_some_and(|v| v.starts_with("xxx-xx-")))
             };
-            if masked(&sqe) && masked(&spark) {
+            if tag_masked(&sqe) && tag_masked(&spark) {
                 Ok((sqe, spark))
             } else {
                 Err(format!("sqe={sqe:?} spark={spark:?}"))
@@ -659,16 +660,17 @@ async fn resource_and_tag_mask_precedence_diverges_across_engines() {
 
     assert_eq!(
         sqe.first().and_then(|r| r.get(1)).map(String::as_str),
-        Some("RES-1111"),
-        "SQE applies the RESOURCE mask"
+        Some("xxx-xx-1111"),
+        "SQE must apply the TAG mask under the default policy.mask-precedence = \"tag\". \
+         RES-1111 here means the setting is \"resource\", which re-opens the divergence \
+         deliberately: check the coordinator config before treating this as a defect."
     );
     assert_eq!(
         spark.first().and_then(|r| r.get(1)).map(String::as_str),
         Some("xxx-xx-1111"),
-        "Kyuubi applies the TAG mask, following stock Ranger's tag-first ordering. \
-         If this now reads RES-1111 the engines have converged, which is an \
-         improvement: rename this test and update the access-control matrix."
+        "Kyuubi applies the TAG mask, following stock Ranger's tag-first ordering"
     );
+    assert_eq!(sqe, spark, "the engines must agree cell for cell");
 }
 
 /// DEFECT, pinned: adding a column to a table that has a column mask makes the
