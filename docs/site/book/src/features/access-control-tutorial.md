@@ -43,7 +43,7 @@ observe is a mask you cannot debug.
 |---|---|---|
 | Enforced by | Polaris | SQE |
 | Ranger service | `polaris` | `query` |
-| Authored with | `GRANT` / `REVOKE` / `DENY` in SQL | Ranger policies (console or REST) |
+| Authored with | `GRANT` / `REVOKE` / `DENY` in SQL | `CREATE OR REPLACE POLICY` / `DROP POLICY` in SQL (or Ranger UI/REST) |
 | Granularity | catalog, namespace, table, view | row, column, tag |
 | Denial looks like | table not found | fewer rows, or masked values |
 
@@ -342,9 +342,10 @@ Everything in Part 2 is enforced by SQE, from a Ranger **`query`** service, and 
 invisible to gate one. A user must already hold `SELECT` for any of it to be
 observable.
 
-Policies here are authored in Ranger (console or REST), not in SQL. SQE reads
-them; `GRANT ... MASKED WITH` and `ROWS WHERE` parse but are only honoured by the
-in-memory engine, not the Ranger backend.
+Policies here are authored with SQE's Databricks-inspired `CREATE POLICY` SQL.
+SQE translates the statement to Ranger, which remains the shared source of truth
+for SQE and Spark/Kyuubi. Ranger's console and REST API remain available for
+external administration.
 
 Resolved policies are cached. A mask tightened in the console is not honoured
 until the cached entry expires, up to `[policy.ranger] cache-ttl-secs`. Grants
@@ -353,26 +354,12 @@ have that window.
 
 ## 2.1 Column masks
 
-A `policyType: 1` (datamask) policy on the `query` service, scoped to database,
-table and column:
+A column mask scoped to a table and column:
 
-```json
-{
-  "service": "query",
-  "name": "acdemo-mask-ssn",
-  "policyType": 1,
-  "isEnabled": true,
-  "resources": {
-    "database": {"values": ["acdemo"]},
-    "table":    {"values": ["orders"]},
-    "column":   {"values": ["ssn"]}
-  },
-  "dataMaskPolicyItems": [{
-    "roles":    ["engineer"],
-    "accesses": [{"type": "select", "isAllowed": true}],
-    "dataMaskInfo": {"dataMaskType": "MASK_SHOW_LAST_4"}
-  }]
-}
+```sql
+CREATE OR REPLACE POLICY acdemo_mask_ssn
+ON TABLE sales_wh.acdemo.orders
+COLUMN MASK MASK_SHOW_LAST_4 TO ROLE engineer ON COLUMN ssn;
 ```
 
 The `database` value is the **namespace**, not the catalog. bob (an engineer)
@@ -399,24 +386,12 @@ peeled off with a filter.
 
 ## 2.2 Row filters
 
-`policyType: 2`, with a `filterExpr` that is SQL:
+The row-filter expression is ordinary SQL:
 
-```json
-{
-  "service": "query",
-  "name": "acdemo-rowfilter-eu",
-  "policyType": 2,
-  "isEnabled": true,
-  "resources": {
-    "database": {"values": ["acdemo"]},
-    "table":    {"values": ["orders"]}
-  },
-  "rowFilterPolicyItems": [{
-    "roles":    ["engineer"],
-    "accesses": [{"type": "select", "isAllowed": true}],
-    "rowFilterInfo": {"filterExpr": "region = 'EU'"}
-  }]
-}
+```sql
+CREATE OR REPLACE POLICY acdemo_rowfilter_eu
+ON TABLE sales_wh.acdemo.orders
+ROW FILTER TO ROLE engineer USING (region = 'EU');
 ```
 
 The filter is injected above the `TableScan`, before optimization, so the user's
@@ -470,21 +445,13 @@ ALTER TABLE sales_wh.acdemo.orders UNSET TAGS (region);
 `SET TAGS` merges rather than replaces, so a previous tag on another column
 survives. Flushing the policy cache is part of the statement.
 
-**The rule: what the tag means.** A policy on the Ranger **tag** service:
+**The rule: what the tag means.** SQL writes a policy to Ranger's linked tag
+service (SQE discovers the service and component-qualified vocabulary):
 
-```json
-{
-  "service": "acdemo_tag",
-  "name": "acdemo-tag-pii",
-  "policyType": 1,
-  "isEnabled": true,
-  "resources": {"tag": {"values": ["PII"]}},
-  "dataMaskPolicyItems": [{
-    "roles":    ["engineer"],
-    "accesses": [{"type": "hive:select", "isAllowed": true}],
-    "dataMaskInfo": {"dataMaskType": "hive:MASK_SHOW_LAST_4"}
-  }]
-}
+```sql
+CREATE OR REPLACE POLICY acdemo_tag_pii
+ON TAG PII
+COLUMN MASK MASK_SHOW_LAST_4 TO ROLE engineer;
 ```
 
 Two details that will cost you an afternoon each:
@@ -531,14 +498,25 @@ not: Spark reads tag associations from the Ranger or Atlas tag store, while SQE
 reads them from Iceberg table properties. One mask rule, two association
 sources.
 
+One enforcement detail does not carry over, and it is pinned by
+`scripts/access-control-parity-demo.sh`: Kyuubi places its masking projection
+below its row-filter marker, so a row filter that reads a tag-masked column
+compares the mask value and matches nothing, where SQE matches on the stored
+value. No data leaks either way. Mask precedence used to be a second difference
+and is not any more, because `policy.mask-precedence` now defaults to `tag`.
+
 ## 2.5 Precedence
 
 1. **Restriction beats mask.** A column SQE cannot safely return is nullified,
    whatever the mask says.
-2. **A resource mask beats a tag mask.** The specific rule wins over the
-   general one.
+2. **A tag mask beats a resource mask**, by default. This matches the Ranger
+   plugin order Spark/Kyuubi uses, so the same policy set renders the same
+   value in both engines. Set `policy.mask-precedence = "resource"` for the
+   most-specific-rule-wins reading instead.
 3. **Row filters AND together.**
-4. **Deny beats allow**, on gate one.
+4. **Row filters read stored values.** A filter is evaluated before masks are
+   applied, so masking a filtered column does not change which rows survive.
+5. **Deny beats allow**, on gate one.
 
 ## 2.6 What happens when things break
 

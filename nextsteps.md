@@ -1,5 +1,136 @@
 # SQE — Next Steps
 
+> **OPEN, suite hygiene: `make test-access-control` leaks its own grants between runs, so two denial-baseline tests fail on any stack the suite has already used.**
+>
+> `denied_before_any_grant` and `all_tables_in_schema_grant_covers_the_namespace` both time out after 120 s with `still allowed for alice with 3 rows`. The cause is in Ranger, not in the assertion: a policy named `grant-1786370165684` grants role `analyst` sixteen access types on `sales_wh.ac.orders`, and alice is in `analyst`.
+>
+> `ac_setup` calls `ranger.bootstrap()`, which clears the `sqe-ac-e2e-` prefixed slate. SQE's own `GRANT` statement does not use that prefix: it writes `grant-<epoch_ms>`. So every grant the suite makes through SQL outlives the run that made it, and the next run starts pre-authorized. A test whose whole job is to prove access is denied BEFORE a grant cannot survive that.
+>
+> Proven rather than argued: deleting the leaked `grant-*` policies and re-running the three tests turns all of them green, with no code change. It leaks on EVERY run, not just historically. Of the three deleted, two survived from 2026-08-10 15:56 and one (`grant-1786440718652`) was written by the run executed minutes earlier the same day. `bootstrap-ranger.sh` seeds only wildcard admin/baseline policies and never a namespace-`ac` grant, so these can only be test residue.
+>
+> Fix: have `bootstrap()` also revoke `grant-*` policies scoped to the suite's own namespaces (`sales_wh.ac`, `ops_wh.ac`), the way the parity demo's "Security baseline" revokes do. A prefix-scoped clean is only as good as the prefix, and the SQL write path was never in it.
+
+> **Measured: there is no cache to flush. Policy propagation and table load are both sub-second, and the demo's 45 minutes were failing assertions, not latency.**
+>
+> Taken on the quickstart stack, each number the median of a direct measurement rather than an estimate:
+>
+> | What | Measured |
+> |---|---:|
+> | `sqe-cli` round trip, `SELECT 1` | 183-360 ms |
+> | `SELECT` on a 3-row governed table, repeated | 177-245 ms |
+> | `CREATE POLICY` to mask visible to another user | 227 ms |
+> | `DROP POLICY` to raw visible again | 412 ms |
+> | `REVOKE` to denial | 947 ms |
+> | `GRANT` to allow | 2365 ms |
+> | One Spark probe (token mint + cache clear + JVM + query) | 7013 ms, of which 244 ms is the token |
+>
+> **Nothing needs a flush, because SQE already flushes.** `handle_grant` and `handle_policy_ddl` both call `invalidate_policy_cache()`, so a policy authored through SQE SQL takes effect on the next query rather than waiting out the 30-second `policy.ranger.cache-ttl-secs`. That TTL bounds edits made in Ranger Admin BEHIND SQE's back, which is the case worth lowering it for. GRANT is the slowest step at ~2.4 s and that is Polaris's own embedded Ranger plugin polling at `pollIntervalMs: 5000`, outside SQE.
+>
+> **Table load is not slow either.** A repeated `SELECT` costs the same 180 ms as `SELECT 1`, so essentially all of it is `docker exec` + CLI startup + the Flight handshake, and none of it is catalog work.
+>
+> **Where the demo's time actually goes:** 25 comparisons times a 7-second Spark probe. A clean pass is 3m44s with 3 retry iterations in the entire transcript. The 45-minute runs were four failing steps each burning a 120-second `AC_PARITY_POLICY_BUDGET`, plus my own concurrent Spark probes contending for the same container. Retry budgets hide broken assertions as latency, which is exactly what happened.
+
+> **OPEN DECISION: `REVOKE SELECT` does not stop reads, and the Databricks model says to split read out of write.**
+>
+> Closing the gate on one user in the parity demo took three statements, because `grant-profile.json` expands `table-data-write` to include `table-data-read`. A user holding INSERT keeps reading after `REVOKE SELECT`, and the statement reports success. Nobody reads an implication graph before believing a revoke.
+>
+> Unity Catalog does not do this. `MODIFY` and `SELECT` are independent there: a principal with only `MODIFY` can write and cannot read, and `MERGE` requires both because it genuinely reads. Traversal is the part SQE already matches (`USE CATALOG` / `USE SCHEMA` against SQE's `namespace-list` / `namespace-properties-read` expansion).
+>
+> **MEASURED, and it kills the obvious fix: `table-data-read` is not what gates reading.** Three probes against the live stack, each waiting out both the Ranger poll (5 s) and SQE's 30-second metadata cache, because a first attempt that skipped the second wait produced a false "read still works" from cache:
+>
+> | Access types granted on the table | Can the user read? |
+> |---|---|
+> | the full INSERT expansion (19 types) | yes |
+> | the same, minus `table-data-read` (18) | **yes** |
+> | `table-data-write` alone | no, 403 `LOAD_TABLE` |
+> | `table-data-write` + `table-properties-read` | **yes** |
+>
+> `table-properties-read` is what unlocks `LOAD_TABLE`. Once that succeeds Polaris vends storage credentials and the engine reads the files directly, so `table-data-read` is decorative on the read path. Every writer must hold `table-properties-read` to commit, which means **INSERT inherently confers read at the Polaris layer, and no edit to the grant profile can change that.**
+>
+> Four changes, in the order they pay off:
+>
+> 1. ~~Drop `table-data-read` from the `table-data-write` expansion.~~ **Infeasible as stated, per the table above.** Separating read from write needs one of: Polaris gating `loadTable` / credential vending on a data-read privilege (upstream change, the correct place), or SQE enforcing the read/write split at gate TWO, its own plan rewriter over the `query` service. The rewriter can already deny (it injects `lit(false)` on every fail-closed path), but it would have to start reading `policyType-0` access policies, which it deliberately ignores today: the shared service carries one blanket allow precisely so Kyuubi defers to Polaris. Changing that is a design decision about which gate owns object access, not a config flag. It would bind both engines, since both consume that service. Note the profile change would also be cross-repo regardless: `grant-profile.json` is generated by the platform's `gen_grant_profile.py` and its `fixtures` are the cross-writer contract.
+> 2. **DONE: `REVOKE ALL PRIVILEGES ON <object> FROM <principal>`.** Closing a gate is now one statement instead of an audit of the implication graph. It reads the access types the grantee actually holds from Ranger rather than planning them from a privilege name, so grants written before provenance labels existed or straight through the Ranger console are removed too; it clears that grantee's DENY items at the coordinate; and it is idempotent. `GRANT ALL` still binds no deeper than the catalog, and that asymmetry is the point: granting everything at a coordinate needs a definition of everything and once wrote a catalog-wide policy from a single-table grant, while revoking everything only removes and cannot widen access.
+>
+>    Measured live, in sequence: analyst holds SELECT + INSERT and bob reads; `REVOKE SELECT` leaves bob reading; `REVOKE ALL PRIVILEGES` produces 403 `LOAD_TABLE`; a second run succeeds as a no-op.
+> 3. **Assert with `CHECK ACCESS`, not with a query result.** SQE already has `CHECK ACCESS SELECT ON t FOR USER x`, which answers "can this principal read this, and via which grant". It would have made this defect obvious immediately, where `SHOW GRANTS` did not: `SHOW GRANTS` lists the statements issued, and the operative fact was the expansion. The parity demo should `CHECK ACCESS` before asserting the denial.
+> 4. **Say what admin and ownership bypass.** Unity Catalog owners keep their privileges and cannot be revoked out of them. SQE's `admin_roles` behave similarly and that is nowhere in the revoke story.
+
+> Status as of 2026-08-11. **OPEN: the parser rejects dbt-trino's view DDL, and `SECURITY` is not the only token it rejects.**
+>
+> `view` is dbt's default materialization, so every dbt model that does not explicitly set `+materialized: table` fails against SQE's Trino endpoint with
+> `Parse error: sql parser error: Expected: AS, found: security`. The platform side already defaults its scaffold to `+materialized: table`, which unblocks the shipped template and nothing else, so this stays open engine-side. Telling users to avoid views is not a fix.
+>
+> **Probed SQE's parser directly (live, quickstart stack) and found TWO gaps, not one:**
+>
+> | Statement | Result |
+> |---|---|
+> | `CREATE OR REPLACE VIEW v AS SELECT 1` | accepted |
+> | `... v SECURITY DEFINER AS ...` | `Expected: AS, found: SECURITY` |
+> | `... v SECURITY INVOKER AS ...` | `Expected: AS, found: SECURITY` |
+> | `... v COMMENT 'c' AS ...` | `Expected: =, found: 'c'` |
+> | `... v COMMENT = 'c' AS ...` | accepted |
+>
+> So Trino's `COMMENT '<text>'` view clause is rejected too: SQE only accepts the `COMMENT = '<text>'` form. Fixing `SECURITY` alone still leaves any described view model failing, which matters because dbt writes view comments from model descriptions when `persist_docs` is on.
+>
+> **The `SECURITY` decision is an authorization decision, and the direction of the risk is the useful part.** Trino's `SECURITY DEFINER` runs a view with the definer's privileges, so a reader needs access to the view but not to its base tables. SQE expands views and authorizes the base table as the querying user, which is `SECURITY INVOKER` semantics (parity-demo step 33 asserts exactly that). Therefore:
+>
+> - Accepting `SECURITY INVOKER` and ignoring it is a no-op. It already describes what SQE does.
+> - Accepting `SECURITY DEFINER` and ignoring it is STRICTER than requested, not laxer: the reader who was meant to be shielded from base-table grants gets denied instead. It fails closed. That is a usability break and a support burden, not a privilege escalation.
+>
+> That asymmetry is why silently accepting `DEFINER` is defensible where silently accepting a laxer clause would not be. It still deserves a warning rather than silence, because the failure it produces (denials on a view that works in Trino) is otherwise unexplainable to the user.
+>
+> **The verbatim DDL is now captured, and it settles both unknowns.** dbt emits:
+>
+> ```sql
+> create or replace view
+>       "ws_viewrepro2_1786444430"."dev"."stg_example"
+>     security definer
+>     as
+>       with source as ( select * from "..."."dev_raw"."example_table" ),
+>       renamed as ( select * from source )
+>       select * from renamed
+> ```
+>
+> Fed to SQE verbatim it reproduces the reported error exactly: `Expected: AS, found: security at Line: 3, Column: 5`. Delete only the `security definer` line and the same statement parses and reaches catalog resolution. So `SECURITY` is the ONLY parse blocker in what dbt actually emits: the CTE body, the quoted three-part name and `create or replace` are all fine. The `COMMENT '<text>'` gap found by probing is real but latent, and bites separately once `persist_docs` is on.
+>
+> **dbt emits `definer`, so accepting only `INVOKER` unblocks nothing.** That was the fork the decision hung on, and it is now closed.
+>
+> **True `DEFINER` cannot be implemented in SQE's identity model, and that is the deciding constraint.** DEFINER means running the view body as the view's creator. SQE has no service account by design: every query runs as the authenticated user via bearer-token passthrough to Polaris and S3. There is no credential to run as the definer with, so honouring the clause would mean introducing exactly the stored-credential the architecture exists to avoid. Iceberg's view spec has nowhere to put it either: view metadata carries versions, representations, schemas and a free-form `properties` map, and no security or owner concept.
+>
+> That leaves three honest options, and only the third both unblocks dbt and keeps the record:
+>
+> 1. **Reject precisely.** Keep failing, but with `SECURITY DEFINER is not supported; SQE evaluates views with the querying user's privileges` instead of a parser error pointing at a column number. Honest, still blocks every dbt view model.
+> 2. **Accept and ignore.** Unblocks dbt. Safe in direction, because SQE's INVOKER enforcement is STRICTER than DEFINER: the reader who was meant to be shielded from base-table grants is denied rather than let in. It fails closed. But the intent is silently discarded.
+> 3. **Accept, record, warn.** Parse the clause, store it in the Iceberg view's `properties` map (`sqe.view-security = "definer"`, plus the creating principal), keep enforcing INVOKER, and warn once at creation. `create_view` in `rest_catalog.rs` already sends a `properties` object, currently `{}`, so there is a place for it. The classification then travels with the view in Iceberg metadata rather than being lost, which is the same argument as `sqe.column-tags`, and a later DEFINER implementation or another engine can honour it.
+>
+> **Option 3 is now implemented.** `sqe_sql::view_compat` folds both Trino clauses into shapes sqlparser already stores, so neither is invented and neither is dropped:
+>
+> - `COMMENT '<text>'` becomes `COMMENT = '<text>'`, landing in `CreateView::comment`
+> - `SECURITY DEFINER` becomes `WITH (sqe_view_security = 'definer')`, landing in `CreateView::options`
+>
+> `catalog_ops::view_properties` then writes `comment`, `sqe.view-security` and `sqe.view-definer` onto the Iceberg view's `properties` map (`rest_catalog::create_view` sent a hardcoded `{}` before), and warns on `definer` that SQE enforces INVOKER so readers still need the base tables. The rewrite is parse-gated like `ctas_compat`, so SQL that already parses is byte-identical and a view broken for an unrelated reason keeps its own error.
+>
+> Verified live against the quickstart, not just in unit tests: the dbt-shaped DDL creates the view, `COMMENT 'eu orders'` lands as the view's `comment`, Polaris returns `sqe.view-security: definer` and `sqe.view-definer: carol` in the view metadata, the warning reaches the log once, and the view reads back. The parity demo is 35/35 in 4m50s afterwards, which is what proves the new pre-parse stage is inert for the other 34 statements.
+>
+> Three things the tests pin, because each was a real bug during implementation: the view NAME scan must be `ident (. ident)*` rather than "any word that is not AS", or it swallows the clauses themselves; a comment-only statement must not be discarded by an early return keyed on the security clause; and the injected `WITH` must precede `COMMENT`, because sqlparser accepts `WITH (...) COMMENT = '...'` and not the reverse.
+>
+> Still open, and worth its own decision: SQE writes its view SQL with `"dialect": "sqe"`, so another engine reading the same Iceberg view has no reason to trust the representation. If dbt-on-Trino-compat is a supported path, that dialect string matters. Also still open: the clauses are accepted on BOTH endpoints, not just the Trino one, matching how `ctas_compat` and `alter_execute` already sit in the shared pre-parse pipeline. Trino's grammar is a superset here, so accepting it on Flight costs nothing, but it is a choice rather than an accident.
+
+> Status as of 2026-08-10. **Six failing comparisons in the consolidated parity demo came down to five unrelated causes, and one was a live engine regression that made every Iceberg view unreadable.** Three of the six shared a single cause, which is only visible once the plan is read rather than the retry loop watched. Now 35/35, and the last holdout needed three revokes rather than one. A clean run is 3m44s wall-clock with 3 retry iterations across the whole transcript, measured at 34 comparisons; the earlier 45-minute runs were failing steps burning their 120-second budgets, not slow policy propagation.
+>
+> **A row filter that reads a tag-masked column is a real divergence, and it looked like a timing flake.** The demo tagged `region` while `region = 'EU'` was the active row filter, and Spark returned ZERO rows for 120 seconds of "policies not settled" retries. `EXPLAIN EXTENDED` settled it: Kyuubi puts its masking `Project` BELOW `RowFilterMarker`, so the filter compares the mask literal `XX` instead of the stored value. SQE filters on stored values and masks the survivors. Nothing leaks either way. The fixture now keeps the filtered column and the tag-masked column apart (`phone` carries the tag), and section 5b re-creates the collision on purpose and asserts `2` against `0`. The count is asserted rather than the empty result set, because an empty result is also what a failed query returns.
+>
+> **`MASK_HASH` is a second non-portable named mask, and the assertion had pinned the digest length.** SQE emits a 64-character sha256, Kyuubi an unkeyed 32-character md5, so `length(email) = 64` was silently false for Spark on every masked-cell count. Masked-cell predicates now assert "not the raw value, and hash-shaped".
+>
+> **Every Iceberg view was unreadable, and a unit test was asserting a message shape production never produces.** The view path in `SqeSchemaProvider::table()` only falls back after a genuine table miss, gated on `SqeErrorCode::TableNotFound`. iceberg-rust's REST catalog says `Unexpected => Tried to load a table that does not exist`, with no "not found" and no 404, so it classified as a generic `CatalogError` and the fallback never ran. The guard's own test constructed `"HTTP 404 Not Found"` by hand and passed. `classify_catalog_error` now treats "does not exist" as absence, and the new test builds the error through `catalog_src` the way `rest_catalog.rs` does.
+>
+> **A revoke test that could never deny, and the third revoke is the one worth knowing about.** Bob holds BOTH demo roles in the quickstart realm, so revoking `engineer` left the section-1 `analyst` grant carrying him. Revoking analyst SELECT was still not enough: `grant-profile.json` expands `table-data-write` to include `table-data-read`, so the INSERT granted back in section 2 kept conferring read. `REVOKE SELECT` reported success and the rows still came back. That is correct behaviour (a writer that cannot read its own table is useless) and it means closing the gate is "revoke every privilege that implies read", not "revoke SELECT". Measured one revoke at a time: engineer SELECT gone and Bob still reads 3 rows, analyst SELECT gone and Bob still reads, analyst INSERT gone and Polaris answers 403 `LOAD_TABLE`. SQE's allow was right at every step and the assertion was wrong.
+>
+> **A token that expired 45 minutes before the test that needed it.** Keycloak issues 300-second access tokens while a full run takes tens of minutes, and the script minted them once at startup. An expired token makes Polaris answer 401 Not Authorized, which reads like a policy denial and scored as one against the loose check while failing the strict `403 LOAD_TABLE` one. Tokens are now minted per Spark probe; a curl costs nothing beside the JVM start that follows it.
+>
+> **Editing the script while a run was in flight cost the whole run.** Bash reads a script incrementally, so deleting a function mid-run shifts every later byte offset. The run finished and its output was unusable as evidence.
+>
 > Status as of 2026-08-08. **Two "access-control DDL defects" were one scan bug, and it was returning the wrong column's data.**
 >
 > **The control experiment is the whole story.** Both DDL findings were measured on a MASKED table, so both were filed against `sqe-policy`. Running the identical DDL and query with NO policy at all reproduced both, with `masks=0 filters=0 restricted=0` in the log. The fix belonged in the scan.

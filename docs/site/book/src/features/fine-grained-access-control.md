@@ -17,6 +17,7 @@ The default `[policy] engine = "passthrough"` returns plans unmodified. Turn enf
 ```toml
 [policy]
 engine = "ranger"
+mask-precedence = "tag"        # which mask wins on a column covered by both (default: "tag")
 
 [policy.ranger]
 url = "http://ranger-admin:6080"
@@ -26,6 +27,8 @@ admin-user = "admin"
 admin-password = ""
 cache-ttl-secs = 30            # resolved-policy cache TTL
 ```
+
+`mask-precedence` settles the one case where a column is covered twice, by a resource policy naming it and by a tag policy matching its classification. `tag` is the default and matches the plugin order Hive and Spark/Kyuubi implement, so a rule authored once in Ranger renders the same value whichever engine reads it. `resource` restores the narrower most-specific-rule-wins reading. The column is masked either way; only which mask applies changes.
 
 `[policy.ranger]` is distinct from `[access_control.ranger]`. The `[policy]` block points at the frontend-query service for SQE-side fine-grained enforcement (row filters and masks that SQE applies). The `[access_control]` block points at the `polaris` service for the coarse GRANT-to-catalog path where Polaris enforces. They can target the same Ranger Admin host and read different services. See [GRANT and REVOKE](../sql-reference/grant-revoke.md) for the two-axis model.
 

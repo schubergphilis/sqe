@@ -186,7 +186,7 @@ mask key reached the UDF.
 | Column restriction | column nullified in place, stays in the schema so `SELECT col` still plans | Yes |
 | Tag column mask | mask applies to every column carrying the tag, association from the Iceberg `sqe.column-tags` property | Yes |
 | Tag row filter | one rule filters every table holding a tagged column | Yes, with the Ranger property below |
-| Precedence | restriction beats mask; resource mask beats tag mask; row filters AND together | Resource-beats-tag proven live; the rest unit-tested |
+| Precedence | restriction beats mask; tag mask beats resource mask by default (`policy.mask-precedence`, set `resource` to invert); row filters AND together | Both precedence modes proven live and unit-tested; the rest unit-tested |
 | Role-conditional masking | `current_user()`, `current_role()`, `is_role_in_session()` const-folded per session | Unit-tested |
 | Masks block predicate pushdown | `WHERE ssn = '...'` evaluates the masked value, never the raw one | Unit-tested |
 
