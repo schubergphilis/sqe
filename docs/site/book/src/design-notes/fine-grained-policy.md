@@ -161,8 +161,8 @@ vocabulary is implemented and wired. Steps 3, 4, and 6 from the original list ar
 
 - `TagSource` trait + `NoopTagSource` default + `CacheTagSource` production implementation. Tags stored as Iceberg `sqe.column-tags` table property.
 - `PolicyStore::resolve_tags` default no-op; `RangerStore` overrides to fetch `tagPolicies` from the Ranger bundle and return `(tag_masks_by_tag, tag_filters, unmappable_tags)`.
-- `PolicyPlanRewriter` wired: calls `tag_source.column_tags(catalog, full-namespace-vec, table)` using the FULL namespace path (not last component), then `resolve_tags`, then `merge_tag_masks`. Precedence rules: resource mask wins, restricted stays restricted, unmappable tag fails closed.
-- Four executable integration tests prove: tag mask end-to-end, full-namespace identity (FakeTagSource capture), resource-mask-wins precedence, unmappable-tag fail-closed.
+- `PolicyPlanRewriter` wired: calls `tag_source.column_tags(catalog, full-namespace-vec, table)` using the FULL namespace path (not last component), then `resolve_tags`, then `merge_tag_masks`. Precedence rules: `policy.mask-precedence` picks the contested-column winner (default `tag`, matching Spark/Kyuubi; `resource` for most-specific-wins), restricted stays restricted, unmappable tag fails closed unless a working resource mask is already in place.
+- Four executable integration tests prove: tag mask end-to-end, full-namespace identity (FakeTagSource capture), contested-column precedence in both modes, unmappable-tag fail-closed.
 - NOT live-demoed (quickstart stack drift); the executable tests are the proof.
 - Phase 3b (shipped): CUSTOM tag masks + cache invalidation on `SET TBLPROPERTIES`.
 
