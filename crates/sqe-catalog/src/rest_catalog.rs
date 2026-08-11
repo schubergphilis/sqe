@@ -62,7 +62,9 @@ struct CachedTableEntry {
 /// Global table metadata cache shared across all sessions.
 ///
 /// Cache keys are scoped per user via the session's token fingerprint
-/// (`"{token_fingerprint}|{namespace}.{table}"`). The cached `Table` carries a
+/// (`"{token_fingerprint}|{warehouse}|{namespace}.{table}"`). The warehouse
+/// component prevents identically named tables in separate Polaris catalogs
+/// from sharing metadata. The cached `Table` carries a
 /// `FileIO` configured with vended S3 credentials returned by Polaris in the
 /// `LoadTableResponse.config` block; those credentials are per-user STS, so
 /// sharing a cache slot across users would silently hand User A's STS creds to
@@ -275,13 +277,13 @@ impl TableMetadataCache {
     /// Evict EVERY cache entry for `(namespace, table)` regardless of which
     /// token fingerprint it was cached under.
     ///
-    /// Cache keys are `{token_fingerprint}|{ns}.{table}`. `invalidate` (via
-    /// `SessionCatalog::invalidate_table`) only evicts the caller's OWN token
-    /// key, but `properties_for` reads the FIRST entry matching the suffix from
-    /// ANY token. After a tag/property write, that leaves other users (and even
-    /// the writer, via first-match) reading the stale tag map until TTL. This
-    /// scans for every key ending in `|{ns}.{table}` and evicts each so the
-    /// write is visible to all users immediately.
+    /// Cache keys are `{token_fingerprint}|{warehouse}|{ns}.{table}`.
+    /// `invalidate` (via `SessionCatalog::invalidate_table`) only evicts the
+    /// caller's OWN token key, but `properties_for` reads an entry matching the
+    /// suffix from ANY token. After a tag/property write, that leaves other
+    /// users reading the stale tag map until TTL. This scans for every key
+    /// ending in `|{ns}.{table}` and evicts each so the write is visible to all
+    /// users immediately.
     ///
     /// `ns_table_suffix` must be the key tail WITHOUT the leading `|`, i.e.
     /// `"{namespace_display}.{table_name}"` (same shape as
@@ -303,18 +305,23 @@ impl TableMetadataCache {
     /// Return the table properties for `(namespace, table_name)` if ANY user's
     /// entry is present in the cache.
     ///
-    /// Cache keys are scoped by `{token_fingerprint}|{ns}.{table}` to prevent
-    /// per-user S3 vended credentials from crossing user boundaries (issue #49).
-    /// Table *properties* (e.g. `sqe.column-tags`) are user-independent:
-    /// they live in the Iceberg table metadata, not in the vended FileIO
-    /// credentials, so reading the first matching entry is safe.
+    /// Cache keys are scoped by
+    /// `{token_fingerprint}|{warehouse}|{ns}.{table}` to prevent per-user S3
+    /// vended credentials from crossing user boundaries (issue #49). Table
+    /// *properties* (e.g. `sqe.column-tags`) are user-independent within one
+    /// warehouse: they live in the Iceberg table metadata, not in the vended
+    /// FileIO credentials.
     ///
     /// The scan is synchronous via `moka::future::Cache::iter()`, which
     /// exposes the current snapshot of the cache without blocking on async I/O.
     /// Returns `None` when no entry with a matching identity suffix exists.
     ///
-    /// Key suffix format: `"|{namespace_display}.{table_name}"` — identical to
-    /// the tail of `table_cache_key` (which prefixes the token fingerprint).
+    /// When `warehouse` is supplied, the exact suffix is
+    /// `"|{warehouse}|{namespace_display}.{table_name}"`. Without it, this
+    /// returns properties only when all matching entries belong to the same
+    /// warehouse. Multiple users normally create multiple token-scoped cache
+    /// entries for that warehouse and are not ambiguous; matches from distinct
+    /// warehouses fail closed.
     ///
     /// The `ends_with` scan is O(entries), but `entries` is bounded by the
     /// cache `max_capacity` (1000) and this runs once per table per query, so
@@ -323,31 +330,54 @@ impl TableMetadataCache {
     /// is ever raised by orders of magnitude.
     pub fn properties_for(
         &self,
+        warehouse: Option<&str>,
         namespace_display: &str,
         table_name: &str,
     ) -> Option<std::collections::HashMap<String, String>> {
-        let suffix = format!("|{}.{}", namespace_display, table_name);
-        for (key, entry) in self.inner.iter() {
-            if key.ends_with(&suffix) {
-                return Some(
-                    entry
-                        .table
-                        .metadata()
-                        .properties()
-                        .clone(),
-                );
+        let table_suffix = format!("|{}.{}", namespace_display, table_name);
+        let exact_suffix = warehouse
+            .map(|warehouse| format!("|{warehouse}{table_suffix}"));
+        if let Some(exact_suffix) = exact_suffix {
+            for (key, entry) in self.inner.iter() {
+                if key.ends_with(&exact_suffix) {
+                    return Some(entry.table.metadata().properties().clone());
+                }
             }
         }
-        None
+
+        let mut fallback = None;
+        let mut fallback_warehouse = None;
+        for (key, entry) in self.inner.iter() {
+            if key.ends_with(&table_suffix) {
+                let warehouse = key
+                    .strip_suffix(&table_suffix)
+                    .and_then(|prefix| prefix.rsplit_once('|'))
+                    .map(|(_, warehouse)| warehouse);
+                let Some(warehouse) = warehouse else {
+                    // A malformed key must not make an unqualified policy
+                    // lookup less restrictive.
+                    return None;
+                };
+                if fallback_warehouse
+                    .as_deref()
+                    .is_some_and(|cached| cached != warehouse)
+                {
+                    return None;
+                }
+                fallback_warehouse = Some(warehouse.to_string());
+                fallback = Some(entry.table.metadata().properties().clone());
+            }
+        }
+        fallback
     }
 }
 
 /// Select every cache key belonging to `(ns, table)` regardless of token
 /// fingerprint, i.e. every key ending in `|{ns_table_suffix}`.
 ///
-/// Cache keys are `{token_fingerprint}|{ns}.{table}`. The `|` boundary is
-/// included in the match so a table named `foo` never matches a key for a table
-/// named `barfoo` in the same namespace. Pure (no cache access) so the
+/// Cache keys are `{token_fingerprint}|{warehouse}|{ns}.{table}`. The final
+/// `|` boundary is included in the match so a table named `foo` never matches
+/// a key for a table named `barfoo` in the same namespace. Pure (no cache access) so the
 /// cross-token eviction contract is unit-testable without an iceberg `Table`
 /// fixture.
 fn select_keys_for_suffix<I>(keys: I, ns_table_suffix: &str) -> Vec<String>
@@ -536,18 +566,35 @@ pub(crate) fn iceberg_error_is_forbidden(e: &iceberg::Error) -> bool {
     rendered.contains("403") || rendered.contains("forbidden")
 }
 
-/// Wrap a catalog list/get failure, classifying a Forbidden (403) answer as
+fn table_metadata_cache_key(
+    token_fingerprint: &str,
+    warehouse: &str,
+    table_ident: &TableIdent,
+) -> String {
+    format!(
+        "{token_fingerprint}|{warehouse}|{}.{}",
+        table_ident.namespace(),
+        table_ident.name()
+    )
+}
+
+/// Wrap an Iceberg catalog failure, classifying a Forbidden (403) answer as
 /// [`sqe_core::SqeErrorCode::AccessDenied`] even when the status surfaces only
 /// in the error's Debug rendering (the Display string the message-based
-/// classifier sees can omit it, e.g. Polaris' `not authorized for op
-/// 'LIST_TABLES'`). This lets the metadata-sweep enumerators reliably skip
-/// namespaces the principal cannot list rather than log-spamming WARN (#318).
-fn classify_listing_error(context: &str, e: iceberg::Error) -> SqeError {
-    let message = format!("{context}: {e}");
+/// classifier sees can omit it). This is used for both listings and table loads:
+/// callers must distinguish an absent table from one Polaris refused.
+fn classify_iceberg_catalog_error(context: &str, e: iceberg::Error) -> SqeError {
     if iceberg_error_is_forbidden(&e) {
-        SqeError::sourced(sqe_core::SqeErrorCode::AccessDenied, message, e)
+        // DataFusion wraps provider errors during planning and the coordinator
+        // currently classifies that wrapper from its Display text. Keep an
+        // explicit marker when the 403 exists only in Iceberg's Debug context.
+        SqeError::sourced(
+            sqe_core::SqeErrorCode::AccessDenied,
+            format!("Access denied: {context}: {e}"),
+            e,
+        )
     } else {
-        SqeError::catalog_src(message, e)
+        SqeError::catalog_src(format!("{context}: {e}"), e)
     }
 }
 
@@ -1009,7 +1056,7 @@ impl SessionCatalog {
             .map_err(sqe_core::SqeError::Catalog)?;
         let started = Instant::now();
         let result = dispatch_catalog!(self.inner, list_namespaces(None))
-            .map_err(|e| classify_listing_error("Failed to list namespaces", e));
+            .map_err(|e| classify_iceberg_catalog_error("Failed to list namespaces", e));
         self.record_breaker_outcome(&result);
         self.record_catalog_call("list_namespaces", started, result.is_ok());
         result
@@ -1028,7 +1075,7 @@ impl SessionCatalog {
             "Getting namespace"
         );
         dispatch_catalog!(self.inner, get_namespace(namespace))
-            .map_err(|e| classify_listing_error("Failed to get namespace", e))
+            .map_err(|e| classify_iceberg_catalog_error("Failed to get namespace", e))
     }
 
     /// True when the backend is the REST/Polaris variant — the only backend
@@ -1086,7 +1133,7 @@ impl SessionCatalog {
             .map_err(sqe_core::SqeError::Catalog)?;
         let started = Instant::now();
         let result = dispatch_catalog!(self.inner, list_tables(namespace))
-            .map_err(|e| classify_listing_error("Failed to list tables", e));
+            .map_err(|e| classify_iceberg_catalog_error("Failed to list tables", e));
         self.record_breaker_outcome(&result);
         self.record_catalog_call("list_tables", started, result.is_ok());
         result
@@ -1098,12 +1145,7 @@ impl SessionCatalog {
     /// into the cached `Table` (per-user STS creds returned by Polaris) never
     /// leak across users. Issue #49.
     fn table_cache_key(&self, table_ident: &TableIdent) -> String {
-        format!(
-            "{}|{}.{}",
-            self.token_fingerprint,
-            table_ident.namespace(),
-            table_ident.name()
-        )
+        table_metadata_cache_key(&self.token_fingerprint, &self.warehouse, table_ident)
     }
 
     /// Load a table by its identifier.
@@ -1129,6 +1171,12 @@ impl SessionCatalog {
 
         // Fast path: return cached table that is still within the soft TTL.
         if let Some(cached) = self.table_cache.get_fresh(&cache_key).await {
+            // A metadata cache hit must not be an authorization cache hit.
+            // Polaris/Ranger grants can change out-of-band while the user's
+            // bearer token and this cache key stay unchanged. Re-check the
+            // cheap HEAD form of loadTable before handing back metadata whose
+            // FileIO may still carry previously vended credentials.
+            self.authorize_table_access(table_ident).await?;
             debug!(
                 token_fingerprint = %self.token_fingerprint,
                 table = ?table_ident,
@@ -1234,7 +1282,7 @@ impl SessionCatalog {
             .map_err(sqe_core::SqeError::Catalog)?;
         let started = Instant::now();
         let result = dispatch_catalog!(self.inner, load_table(table_ident))
-            .map_err(|e| sqe_core::SqeError::catalog_src(format!("Failed to load table: {e}"), e));
+            .map_err(|e| classify_iceberg_catalog_error("Failed to load table", e));
         match &result {
             Ok(table) => {
                 self.circuit_breaker.record_success();
@@ -1289,6 +1337,86 @@ impl SessionCatalog {
         }
         self.record_catalog_call("load_table", started, result.is_ok());
         result
+    }
+
+    /// Revalidate the caller's current permission to load a table without
+    /// downloading its metadata.
+    ///
+    /// Table metadata and query-result caches are performance caches, not
+    /// authorization caches. A Ranger REVOKE does not change the user's bearer
+    /// token, so cache keys alone cannot make that revoke observable. Polaris
+    /// authorizes `HEAD loadTable` exactly like `GET loadTable`; use it as the
+    /// low-bandwidth security check before serving either kind of cached data.
+    ///
+    /// Non-REST backends use a shared service identity and have no per-user
+    /// catalog authorization to revalidate here; their in-engine policy layer
+    /// remains authoritative.
+    pub async fn authorize_table_access(&self, table_ident: &TableIdent) -> sqe_core::Result<()> {
+        if !matches!(self.inner, CatalogHandle::Rest(_)) {
+            return Ok(());
+        }
+
+        self.circuit_breaker
+            .check()
+            .map_err(sqe_core::SqeError::Catalog)?;
+
+        let started = Instant::now();
+        let mut req = self
+            .http_client
+            .head(self.table_url(table_ident))
+            .bearer_auth(&self.bearer_token)
+            .header("X-Request-ID", Uuid::new_v4().to_string());
+        for (k, v) in trace_context_http_headers() {
+            req = req.header(k, v);
+        }
+
+        let response = req.send().await.map_err(|e| {
+            self.circuit_breaker.record_failure();
+            SqeError::catalog_src(format!("Failed to authorize table {table_ident}: {e}"), e)
+        })?;
+        let status = response.status();
+
+        if status.is_success() {
+            self.circuit_breaker.record_success();
+            self.record_catalog_call("authorize_table", started, true);
+            return Ok(());
+        }
+
+        // HEAD is not required by every Iceberg REST implementation. Fall
+        // back to the catalog client's fully authenticated load when the
+        // endpoint explicitly says the method is unsupported.
+        if matches!(
+            status,
+            reqwest::StatusCode::METHOD_NOT_ALLOWED | reqwest::StatusCode::NOT_IMPLEMENTED
+        ) {
+            let result = dispatch_catalog!(self.inner, load_table(table_ident))
+                .map(|_| ())
+                .map_err(|e| classify_iceberg_catalog_error("Failed to authorize table", e));
+            self.record_breaker_outcome(&result);
+            self.record_catalog_call("authorize_table", started, result.is_ok());
+            return result;
+        }
+
+        let status_code = status.as_u16();
+        if matches!(status_code, 401 | 403 | 404) {
+            // Drop the metadata carrying the no-longer-authorized principal's
+            // vended FileIO credentials before returning the denial.
+            self.table_cache
+                .invalidate(&self.table_cache_key(table_ident))
+                .await;
+        } else {
+            self.circuit_breaker.record_failure();
+        }
+        self.record_catalog_call("authorize_table", started, false);
+        Err(SqeError::CatalogHttp {
+            status: status_code,
+            op: sqe_core::CatalogOp::LoadTable,
+            body: if status == reqwest::StatusCode::FORBIDDEN {
+                format!("Access denied to table {table_ident}")
+            } else {
+                format!("Authorization check failed for table {table_ident}")
+            },
+        })
     }
 
     /// Record catalog roundtrip latency + circuit breaker state into
@@ -1420,6 +1548,7 @@ impl SessionCatalog {
         name: &str,
         sql: &str,
         schema: &serde_json::Value,
+        properties: &std::collections::HashMap<String, String>,
     ) -> sqe_core::Result<()> {
         self.require_rest_backend("create_view")?;
         let ns_str = namespace
@@ -1451,7 +1580,7 @@ impl SessionCatalog {
                 }],
                 "default-namespace": namespace.as_ref(),
             },
-            "properties": {}
+            "properties": properties,
         });
 
         debug!(url = %url, view = name, "Creating view via Polaris REST");
@@ -1869,11 +1998,10 @@ impl Catalog for SessionCatalogBridge {
     async fn update_table(&self, commit: iceberg::TableCommit) -> iceberg::Result<Table> {
         let ident = commit.identifier().clone();
         let result = dispatch_catalog!(self.session.inner, update_table(commit));
-        // Invalidate cache so any subsequent load_table sees updated metadata.
-        self.session
-            .table_cache
-            .invalidate(&self.session.table_cache_key(&ident))
-            .await;
+        // A table commit is visible to every principal. Evict every token's
+        // copy so a different user cannot rebuild a SessionContext from stale
+        // metadata after INSERT/DELETE/UPDATE/MERGE.
+        self.session.invalidate_table_all_tokens(&ident).await;
         result
     }
 }
@@ -1920,6 +2048,52 @@ mod cache_capacity_tests {
     fn select_keys_for_suffix_empty_when_no_match() {
         let keys = vec!["tokA|ns.other".to_string()];
         assert!(select_keys_for_suffix(keys, "ns.missing").is_empty());
+    }
+
+    #[tokio::test]
+    async fn table_metadata_cache_separates_warehouses() {
+        let ident = iceberg::TableIdent::new(
+            iceberg::NamespaceIdent::new("sales".to_string()),
+            "orders".to_string(),
+        );
+        let key_a = super::table_metadata_cache_key("tok", "warehouse_a", &ident);
+        let key_b = super::table_metadata_cache_key("tok", "warehouse_b", &ident);
+        assert_ne!(key_a, key_b, "the warehouse must participate in the cache key");
+
+        let cache = super::TableMetadataCache::new(30);
+        cache
+            .insert(key_a, test_table())
+            .await;
+        cache
+            .insert(key_b, test_table())
+            .await;
+
+        assert!(cache.properties_for(Some("warehouse_a"), "sales", "orders").is_some());
+        assert!(cache.properties_for(Some("warehouse_b"), "sales", "orders").is_some());
+        assert!(
+            cache.properties_for(None, "sales", "orders").is_none(),
+            "an unqualified property lookup must fail closed when two warehouses match"
+        );
+    }
+
+    #[tokio::test]
+    async fn table_metadata_cache_accepts_multiple_tokens_for_same_warehouse() {
+        let ident = iceberg::TableIdent::new(
+            iceberg::NamespaceIdent::new("sales".to_string()),
+            "orders".to_string(),
+        );
+        let key_alice = super::table_metadata_cache_key("tok_alice", "warehouse_a", &ident);
+        let key_carol = super::table_metadata_cache_key("tok_carol", "warehouse_a", &ident);
+        assert_ne!(key_alice, key_carol, "tokens must remain isolated cache entries");
+
+        let cache = super::TableMetadataCache::new(30);
+        cache.insert(key_alice, test_table()).await;
+        cache.insert(key_carol, test_table()).await;
+
+        assert!(
+            cache.properties_for(None, "sales", "orders").is_some(),
+            "multiple principals in one warehouse must share table tag metadata"
+        );
     }
 
     /// Issue #240: the REST catalog cache must hold well beyond the old cap of
@@ -2066,41 +2240,42 @@ mod cache_capacity_tests {
     /// string the message-based classifier sees) must still be classified
     /// AccessDenied, so metadata-sweep enumerators skip it quietly (#318).
     #[test]
-    fn classify_listing_error_marks_forbidden_as_access_denied() {
+    fn classify_iceberg_catalog_error_marks_forbidden_as_access_denied() {
         let e = iceberg::Error::new(
             iceberg::ErrorKind::Unexpected,
             "Received response with unexpected status code",
         )
         .with_context("status", "403 Forbidden");
-        let wrapped = super::classify_listing_error("Failed to list tables", e);
+        let wrapped = super::classify_iceberg_catalog_error("Failed to list tables", e);
         assert_eq!(wrapped.error_code(), sqe_core::SqeErrorCode::AccessDenied);
+        assert!(wrapped.client_message().starts_with("Access denied:"));
         assert!(super::listing_error_is_forbidden(&wrapped));
     }
 
     /// Polaris' typed `not authorized for op 'LIST_TABLES'` answer carries the
     /// 403 in a context entry; it must classify as AccessDenied too.
     #[test]
-    fn classify_listing_error_handles_polaris_not_authorized_shape() {
+    fn classify_iceberg_catalog_error_handles_polaris_not_authorized_shape() {
         let e = iceberg::Error::new(
             iceberg::ErrorKind::DataInvalid,
             "Principal 'energyco-viewer' is not authorized for op 'LIST_TABLES' on namespace ontology",
         )
         .with_context("type", "NotAuthorizedException")
         .with_context("code", "403");
-        let wrapped = super::classify_listing_error("Failed to list tables", e);
+        let wrapped = super::classify_iceberg_catalog_error("Failed to list tables", e);
         assert!(super::listing_error_is_forbidden(&wrapped));
     }
 
     /// A genuine failure (5xx / timeout) is NOT forbidden: enumerators still
     /// surface it (WARN), they do not silently drop the namespace.
     #[test]
-    fn classify_listing_error_keeps_server_errors_non_forbidden() {
+    fn classify_iceberg_catalog_error_keeps_server_errors_non_forbidden() {
         let e = iceberg::Error::new(
             iceberg::ErrorKind::Unexpected,
             "Received response with unexpected status code",
         )
         .with_context("status", "500 Internal Server Error");
-        let wrapped = super::classify_listing_error("Failed to list tables", e);
+        let wrapped = super::classify_iceberg_catalog_error("Failed to list tables", e);
         assert!(!super::listing_error_is_forbidden(&wrapped));
     }
 }

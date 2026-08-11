@@ -240,6 +240,26 @@ pub trait PolicyStore: Send + Sync {
         ))
     }
 
+    /// Create or replace a fine-grained row-filter / column-mask policy.
+    async fn create_policy(
+        &self,
+        _stmt: &sqe_sql::policy_ddl::CreatePolicyStatement,
+    ) -> sqe_core::Result<()> {
+        Err(sqe_core::SqeError::NotImplemented(
+            "CREATE POLICY requires [policy] engine = \"ranger\"".to_string(),
+        ))
+    }
+
+    /// Drop a fine-grained policy by name.
+    async fn drop_policy(
+        &self,
+        _stmt: &sqe_sql::policy_ddl::DropPolicyStatement,
+    ) -> sqe_core::Result<()> {
+        Err(sqe_core::SqeError::NotImplemented(
+            "DROP POLICY requires [policy] engine = \"ranger\"".to_string(),
+        ))
+    }
+
     /// Invalidate any cached policy decisions so the next `resolve()` call
     /// re-reads from the backing engine.
     ///

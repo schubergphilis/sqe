@@ -364,6 +364,62 @@ async fn assert_denied_but_valid(ctx: &AcCtx, denied: &Session, sql: &str) {
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs quickstart/polaris-ranger-keycloak; run scripts/access-control-test.sh"]
+async fn cross_user_insert_then_delete_sees_the_committed_snapshot() {
+    ac_gate!();
+    let _guard = crate::common::serial().lock().await;
+    let ctx = ac_setup().await;
+
+    exec_ok(
+        &ctx,
+        &ctx.carol,
+        &format!("GRANT SELECT ON {ORDERS} TO ROLE \"analyst\""),
+    )
+    .await;
+    exec_ok(
+        &ctx,
+        &ctx.carol,
+        &format!("GRANT INSERT ON {ORDERS} TO ROLE \"analyst\""),
+    )
+    .await;
+
+    // Populate Carol's SessionContext with the pre-INSERT table provider.
+    exec_ok(&ctx, &ctx.carol, &format!("SELECT count(*) FROM {ORDERS}")).await;
+
+    let probe = format!(
+        "INSERT INTO {ORDERS} VALUES \
+         (909,'EU',1.0,'999-99-9999','probe@x',DATE '2026-08-10')"
+    );
+    crate::common::eventually("alice's INSERT grant to propagate", || async {
+        ctx.handler
+            .execute(&ctx.alice, &probe, None)
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    })
+    .await;
+
+    // Regression: before cross-token metadata + cross-session provider
+    // invalidation, Carol retained the pre-INSERT snapshot, returned 0 here,
+    // and left Alice's newly appended data file untouched.
+    let deleted = exec_ok(
+        &ctx,
+        &ctx.carol,
+        &format!("DELETE FROM {ORDERS} WHERE id = 909"),
+    )
+    .await;
+    assert_eq!(col_strings(&deleted, "rows_affected"), ["1"]);
+
+    let remaining = exec_ok(
+        &ctx,
+        &ctx.carol,
+        &format!("SELECT id FROM {ORDERS} WHERE id = 909"),
+    )
+    .await;
+    assert_eq!(total_rows(&remaining), 0, "the cross-user probe row must be gone");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs quickstart/polaris-ranger-keycloak; run scripts/access-control-test.sh"]
 async fn denied_before_any_grant() {
     ac_gate!();
     let _guard = crate::common::serial().lock().await;
@@ -1783,16 +1839,23 @@ async fn remaining_mask_types_apply_live() {
     assert_eq!(col_strings(&alice, "email"), vec!["a@x", "b@x", "c@x"]);
 }
 
-/// Precedence: a RESOURCE mask on a column beats a TAG mask on the same column.
+/// Precedence: a TAG mask on a column beats a RESOURCE mask on the same column,
+/// which is `policy.mask-precedence = "tag"`, the default.
 ///
-/// The matrix listed precedence as unit-tested only. The two masks are chosen so
-/// the winner is unambiguous: the resource mask shows the last four digits, the
-/// tag mask would nullify. `xxx-xx-1111` can only come from the resource rule,
-/// and NULL can only come from the tag rule, so the assertion cannot pass under
-/// the wrong precedence.
+/// The two masks are chosen so the winner is unambiguous: the resource mask
+/// shows the last four digits, the tag mask nullifies. `xxx-xx-1111` can only
+/// come from the resource rule and NULL can only come from the tag rule, so the
+/// assertion cannot pass under the wrong precedence.
+///
+/// This asserted the opposite until the default flipped. Tag-first is what the
+/// standard Ranger plugin does, so it is what Spark/Kyuubi does, and one policy
+/// set rendering two values depending on the reader is the failure this whole
+/// suite exists to catch. `resource` still selects the old behaviour and is
+/// covered in-process by `contested_column_uses_the_resource_mask_when_configured`
+/// in `sqe-policy`, which does not need a live stack to be conclusive.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs quickstart/polaris-ranger-keycloak; run scripts/access-control-test.sh"]
-async fn resource_mask_beats_tag_mask_live() {
+async fn tag_mask_beats_resource_mask_live() {
     ac_gate!();
     let _guard = crate::common::serial().lock().await;
     let ctx = ac_setup().await;
@@ -1816,20 +1879,26 @@ async fn resource_mask_beats_tag_mask_live() {
         .await
         .expect("create resource mask");
 
+    // `col_strings` renders a SQL NULL as the literal "NULL", so that string is
+    // the tag mask's fingerprint here and `xxx-xx-` is the resource mask's. The
+    // two cannot be confused, which is what makes the assertion meaningful.
     let sql = format!("SELECT id, ssn FROM {ORDERS} ORDER BY id");
-    let bob = crate::common::eventually("the resource mask to win over the tag mask", || async {
+    let bob = crate::common::eventually("the tag mask to win over the resource mask", || async {
         match ctx.handler.execute(&ctx.bob, &sql, None).await {
-            Ok(b) if col_strings(&b, "ssn").iter().all(|v| v.starts_with("xxx-xx-")) => Ok(b),
+            Ok(b) if col_strings(&b, "ssn").iter().all(|v| v == "NULL") => Ok(b),
             Ok(b) => Err(format!("got {:?}", col_strings(&b, "ssn"))),
             Err(e) => Err(format!("query failed: {e}")),
         }
     })
     .await;
-    assert_eq!(
-        col_strings(&bob, "ssn"),
-        vec!["xxx-xx-1111", "xxx-xx-2222", "xxx-xx-3333"],
-        "the resource mask must win; NULL here would mean the tag mask won"
-    );
+    let ssn = col_strings(&bob, "ssn");
+    assert_eq!(ssn.len(), 3, "the row filter is not part of this case");
+    for v in &ssn {
+        assert_eq!(
+            v, "NULL",
+            "the tag MASK_NULL must win; an xxx-xx- value is the resource mask's rendering"
+        );
+    }
 }
 
 /// `GRANT SELECT ON ALL TABLES IN SCHEMA` covers every table in the namespace

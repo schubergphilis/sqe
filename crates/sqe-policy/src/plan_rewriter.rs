@@ -43,6 +43,8 @@ pub struct PolicyPlanRewriter {
     /// Defaults to `NoopTagSource` (no tag-based masking). Replaced at
     /// startup with `CacheTagSource` when a `TableMetadataCache` is available.
     tag_source: Arc<dyn TagSource>,
+    /// Which mask wins when a column has both a resource mask and a tag mask.
+    mask_precedence: sqe_core::config::MaskPrecedence,
 }
 
 impl PolicyPlanRewriter {
@@ -51,7 +53,19 @@ impl PolicyPlanRewriter {
             store,
             mask_key: None,
             tag_source: Arc::new(NoopTagSource),
+            mask_precedence: sqe_core::config::MaskPrecedence::default(),
         }
+    }
+
+    /// Choose which mask wins when a resource mask and a tag mask cover the same
+    /// column. Defaults to `Tag`, which is what Hive and Spark/Kyuubi do.
+    #[must_use = "with_mask_precedence consumes self; bind the returned rewriter"]
+    pub fn with_mask_precedence(
+        mut self,
+        precedence: sqe_core::config::MaskPrecedence,
+    ) -> Self {
+        self.mask_precedence = precedence;
+        self
     }
 
     /// Set the HMAC key used by Hash-type column masks. Pass `None` to
@@ -269,6 +283,7 @@ impl PolicyEnforcer for PolicyPlanRewriter {
                                     tag_filters,
                                     &unmappable_tags,
                                     &identity,
+                                    self.mask_precedence,
                                 );
                             }
                         }
@@ -507,6 +522,7 @@ pub async fn resolve_effective_policy(
     table: &str,
     namespace: &str,
     col_tags: &HashMap<String, Vec<String>>,
+    precedence: sqe_core::config::MaskPrecedence,
 ) -> ResolvedPolicy {
     let mut policy = match store.resolve(user, table, namespace).await {
         Ok(p) => p,
@@ -535,6 +551,7 @@ pub async fn resolve_effective_policy(
             tag_filters,
             &unmappable_tags,
             &identity,
+            precedence,
         );
     }
 
@@ -575,23 +592,37 @@ pub(crate) fn merge_tag_masks(
     tag_filters: Vec<datafusion::logical_expr::Expr>,
     unmappable_tags: &HashSet<String>,
     identity: &SessionIdentity,
+    precedence: sqe_core::config::MaskPrecedence,
 ) {
     for (column, tags) in col_tags {
-        // Restricted columns always win — tag cannot un-restrict.
+        // Restricted columns always win — tag cannot un-restrict. This is not
+        // configurable: restriction means SQE could not establish a safe value
+        // to return, and no tag rule can answer that question for it.
         if policy.restricted_columns.contains(column) {
             continue;
         }
-        // Resource mask wins — do not overwrite with a tag mask, and do NOT
-        // restrict even if an unmappable tag is present: the resource mask is
-        // more specific and is sufficient protection.
-        if policy.column_masks.contains_key(column) {
+        // A resource mask already covers this column. Under `Resource` the more
+        // specific rule stands and the tag is skipped; under `Tag` (the default,
+        // matching Hive/Kyuubi) the tag mask overwrites it below.
+        //
+        // Either way the column stays masked, so an unmappable tag must NOT
+        // restrict it: the resource mask is sufficient protection and dropping
+        // the column would be a strictly worse answer than masking it.
+        let resource_masked = policy.column_masks.contains_key(column);
+        if resource_masked && precedence == sqe_core::config::MaskPrecedence::Resource {
             continue;
         }
         // Fail-closed: if any of the column's tags is unmappable (genuinely
         // unsupported type, no resource mask above), restrict the column rather
         // than leak it raw. Mirrors the resource path's `Err(())` ->
         // restricted_columns behaviour.
-        if tags.iter().any(|t| unmappable_tags.contains(t)) {
+        //
+        // `!resource_masked` is load-bearing under `Tag` precedence, which no
+        // longer skips masked columns early: an unmappable tag on a column that
+        // already has a working resource mask must leave that mask in place.
+        // Restricting it would replace a readable masked value with NULL and
+        // call it an improvement.
+        if !resource_masked && tags.iter().any(|t| unmappable_tags.contains(t)) {
             policy.restricted_columns.push(column.clone());
             continue;
         }
@@ -616,14 +647,30 @@ pub(crate) fn merge_tag_masks(
                             // Do not log `template`: a CUSTOM mask body can embed
                             // sensitive literals or keyed values. Column + tag are
                             // enough to locate the offending Ranger policy.
-                            warn!(
-                                column = %column,
-                                tag = %tag,
-                                error = %e,
-                                "CUSTOM tag mask expression failed to parse; \
-                                 restricting column (fail-closed)"
-                            );
-                            policy.restricted_columns.push(column.clone());
+                            //
+                            // A broken tag template must not cost the column a
+                            // working resource mask. Under `Tag` precedence this
+                            // arm is now reachable with one already in place, and
+                            // restricting there would turn a readable masked value
+                            // into NULL because a DIFFERENT rule is malformed.
+                            if resource_masked {
+                                warn!(
+                                    column = %column,
+                                    tag = %tag,
+                                    error = %e,
+                                    "CUSTOM tag mask expression failed to parse; \
+                                     keeping the existing resource mask"
+                                );
+                            } else {
+                                warn!(
+                                    column = %column,
+                                    tag = %tag,
+                                    error = %e,
+                                    "CUSTOM tag mask expression failed to parse; \
+                                     restricting column (fail-closed)"
+                                );
+                                policy.restricted_columns.push(column.clone());
+                            }
                         }
                     }
                     break;
@@ -901,6 +948,7 @@ fn apply_mask(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqe_core::config::MaskPrecedence;
 
     // ── summarise_policies (audit summary) tests ──────────────────────────────
 
@@ -976,7 +1024,7 @@ mod tests {
         let mut policy = ResolvedPolicy::default();
         let col_tags = make_col_tags(&[("email", &["PII"])]);
         let tag_masks = make_tag_masks(&[("PII", MaskType::Nullify)]);
-        merge_tag_masks(&mut policy, &col_tags, &tag_masks, vec![], &no_unmappable(), &default_identity());
+        merge_tag_masks(&mut policy, &col_tags, &tag_masks, vec![], &no_unmappable(), &default_identity(), MaskPrecedence::Tag);
         assert!(
             matches!(policy.column_masks.get("email"), Some(MaskType::Nullify)),
             "tag mask must be applied when no resource mask exists"
@@ -984,18 +1032,138 @@ mod tests {
     }
 
     #[test]
-    fn merge_tag_masks_resource_mask_wins_over_tag_mask() {
+    fn merge_tag_masks_resource_mask_wins_under_resource_precedence() {
         let mut policy = ResolvedPolicy::default();
-        // Resource mask: Hash on email
         policy.column_masks.insert("email".to_string(), MaskType::Hash);
         let col_tags = make_col_tags(&[("email", &["PII"])]);
-        // Tag mask: Nullify — MUST NOT overwrite the resource mask.
         let tag_masks = make_tag_masks(&[("PII", MaskType::Nullify)]);
-        merge_tag_masks(&mut policy, &col_tags, &tag_masks, vec![], &no_unmappable(), &default_identity());
+        merge_tag_masks(
+            &mut policy,
+            &col_tags,
+            &tag_masks,
+            vec![],
+            &no_unmappable(),
+            &default_identity(),
+            MaskPrecedence::Resource,
+        );
         assert!(
             matches!(policy.column_masks.get("email"), Some(MaskType::Hash)),
-            "resource mask must win over tag mask"
+            "under Resource precedence the named-column rule must survive the tag rule"
         );
+    }
+
+    /// The default, and the reason this knob exists: Hive and Spark/Kyuubi let
+    /// the tag rule win, so SQE must too or the same Ranger policy set renders
+    /// different values in the two engines.
+    #[test]
+    fn merge_tag_masks_tag_mask_wins_under_tag_precedence() {
+        let mut policy = ResolvedPolicy::default();
+        policy.column_masks.insert("email".to_string(), MaskType::Hash);
+        let col_tags = make_col_tags(&[("email", &["PII"])]);
+        let tag_masks = make_tag_masks(&[("PII", MaskType::Nullify)]);
+        merge_tag_masks(
+            &mut policy,
+            &col_tags,
+            &tag_masks,
+            vec![],
+            &no_unmappable(),
+            &default_identity(),
+            MaskPrecedence::Tag,
+        );
+        assert!(
+            matches!(policy.column_masks.get("email"), Some(MaskType::Nullify)),
+            "under Tag precedence the tag rule must overwrite the resource mask"
+        );
+    }
+
+    /// A malformed CUSTOM tag template is a defect in the TAG rule. It must not
+    /// cost the column the resource mask that is working fine, which `Tag`
+    /// precedence makes reachable for the first time.
+    #[test]
+    fn merge_tag_masks_broken_custom_template_keeps_the_resource_mask() {
+        let mut policy = ResolvedPolicy::default();
+        policy.column_masks.insert("ssn".to_string(), MaskType::Nullify);
+        let col_tags = make_col_tags(&[("ssn", &["PII"])]);
+        let mut tag_masks = HashMap::new();
+        tag_masks.insert(
+            "PII".to_string(),
+            TagMaskSpec::Custom("this is not( a valid expression".to_string()),
+        );
+        merge_tag_masks(
+            &mut policy,
+            &col_tags,
+            &tag_masks,
+            vec![],
+            &no_unmappable(),
+            &default_identity(),
+            MaskPrecedence::Tag,
+        );
+        assert!(
+            matches!(policy.column_masks.get("ssn"), Some(MaskType::Nullify)),
+            "the working resource mask must survive a broken tag template"
+        );
+        assert!(
+            !policy.restricted_columns.contains(&"ssn".to_string()),
+            "a broken tag template must not restrict an already-masked column"
+        );
+    }
+
+    /// With no resource mask to fall back on, the same broken template must still
+    /// fail closed rather than return the column raw.
+    #[test]
+    fn merge_tag_masks_broken_custom_template_restricts_an_unmasked_column() {
+        let mut policy = ResolvedPolicy::default();
+        let col_tags = make_col_tags(&[("ssn", &["PII"])]);
+        let mut tag_masks = HashMap::new();
+        tag_masks.insert(
+            "PII".to_string(),
+            TagMaskSpec::Custom("this is not( a valid expression".to_string()),
+        );
+        merge_tag_masks(
+            &mut policy,
+            &col_tags,
+            &tag_masks,
+            vec![],
+            &no_unmappable(),
+            &default_identity(),
+            MaskPrecedence::Tag,
+        );
+        assert!(
+            policy.restricted_columns.contains(&"ssn".to_string()),
+            "an unprotected column with a broken tag mask must be restricted"
+        );
+    }
+
+    /// Whichever way precedence points, the column must never come back raw and
+    /// must never be dropped instead of masked. Restriction is strictly worse
+    /// than a working mask, and raw is a leak.
+    #[test]
+    fn merge_tag_masks_never_leaves_a_contested_column_raw_or_restricted() {
+        for precedence in [MaskPrecedence::Tag, MaskPrecedence::Resource] {
+            let mut policy = ResolvedPolicy::default();
+            policy.column_masks.insert("email".to_string(), MaskType::Hash);
+            let col_tags = make_col_tags(&[("email", &["PII"])]);
+            // The tag is unmappable: no spec for it, and it is flagged.
+            let mut unmappable = HashSet::new();
+            unmappable.insert("PII".to_string());
+            merge_tag_masks(
+                &mut policy,
+                &col_tags,
+                &make_tag_masks(&[]),
+                vec![],
+                &unmappable,
+                &default_identity(),
+                precedence,
+            );
+            assert!(
+                policy.column_masks.contains_key("email"),
+                "{precedence:?}: an unmappable tag must not strip the resource mask"
+            );
+            assert!(
+                !policy.restricted_columns.contains(&"email".to_string()),
+                "{precedence:?}: a column with a working resource mask must not be restricted"
+            );
+        }
     }
 
     #[test]
@@ -1004,7 +1172,7 @@ mod tests {
         policy.restricted_columns.push("ssn".to_string());
         let col_tags = make_col_tags(&[("ssn", &["PII"])]);
         let tag_masks = make_tag_masks(&[("PII", MaskType::Nullify)]);
-        merge_tag_masks(&mut policy, &col_tags, &tag_masks, vec![], &no_unmappable(), &default_identity());
+        merge_tag_masks(&mut policy, &col_tags, &tag_masks, vec![], &no_unmappable(), &default_identity(), MaskPrecedence::Tag);
         // No mask added; restricted stays restricted.
         assert!(
             !policy.column_masks.contains_key("ssn"),
@@ -1024,7 +1192,7 @@ mod tests {
         let col_tags = make_col_tags(&[("region", &["RESTRICTED"])]);
         let tag_masks: HashMap<String, TagMaskSpec> = HashMap::new(); // no masks
         let tag_filter = datafusion::logical_expr::col("region").eq(lit("EU"));
-        merge_tag_masks(&mut policy, &col_tags, &tag_masks, vec![tag_filter], &no_unmappable(), &default_identity());
+        merge_tag_masks(&mut policy, &col_tags, &tag_masks, vec![tag_filter], &no_unmappable(), &default_identity(), MaskPrecedence::Tag);
         assert_eq!(
             policy.row_filters.len(),
             2,
@@ -1039,7 +1207,7 @@ mod tests {
         let col_tags = make_col_tags(&[("salary", &["INTERNAL", "PII"])]);
         // Only PII has a mask.
         let tag_masks = make_tag_masks(&[("PII", MaskType::Hash)]);
-        merge_tag_masks(&mut policy, &col_tags, &tag_masks, vec![], &no_unmappable(), &default_identity());
+        merge_tag_masks(&mut policy, &col_tags, &tag_masks, vec![], &no_unmappable(), &default_identity(), MaskPrecedence::Tag);
         assert!(
             matches!(policy.column_masks.get("salary"), Some(MaskType::Hash)),
             "first matching tag mask in stored order must be applied"
@@ -1049,7 +1217,7 @@ mod tests {
     #[test]
     fn merge_tag_masks_empty_col_tags_is_noop() {
         let mut policy = ResolvedPolicy::default();
-        merge_tag_masks(&mut policy, &HashMap::new(), &HashMap::new(), vec![], &no_unmappable(), &default_identity());
+        merge_tag_masks(&mut policy, &HashMap::new(), &HashMap::new(), vec![], &no_unmappable(), &default_identity(), MaskPrecedence::Tag);
         assert!(policy.column_masks.is_empty());
         assert!(policy.row_filters.is_empty());
     }
@@ -1064,7 +1232,7 @@ mod tests {
         let col_tags = make_col_tags(&[("ssn", &["PII"])]);
         let tag_masks: HashMap<String, TagMaskSpec> = HashMap::new(); // PII produced no mask (unmappable)
         let unmappable: HashSet<String> = ["PII".to_string()].into_iter().collect();
-        merge_tag_masks(&mut policy, &col_tags, &tag_masks, vec![], &unmappable, &default_identity());
+        merge_tag_masks(&mut policy, &col_tags, &tag_masks, vec![], &unmappable, &default_identity(), MaskPrecedence::Tag);
         assert!(
             policy.restricted_columns.contains(&"ssn".to_string()),
             "column with unmappable tag mask must be restricted (fail-closed)"
@@ -1085,7 +1253,7 @@ mod tests {
         let col_tags = make_col_tags(&[("ssn", &["PII"])]);
         let tag_masks: HashMap<String, TagMaskSpec> = HashMap::new();
         let unmappable: HashSet<String> = ["PII".to_string()].into_iter().collect();
-        merge_tag_masks(&mut policy, &col_tags, &tag_masks, vec![], &unmappable, &default_identity());
+        merge_tag_masks(&mut policy, &col_tags, &tag_masks, vec![], &unmappable, &default_identity(), MaskPrecedence::Tag);
         assert!(
             matches!(policy.column_masks.get("ssn"), Some(MaskType::Hash)),
             "resource mask must win over unmappable-tag restriction"
@@ -1106,7 +1274,7 @@ mod tests {
         let col_tags = make_col_tags(&[("email", &["PII"])]);
         let mut tag_masks: HashMap<String, TagMaskSpec> = HashMap::new();
         tag_masks.insert("PII".to_string(), TagMaskSpec::Custom("concat('***', {col})".to_string()));
-        merge_tag_masks(&mut policy, &col_tags, &tag_masks, vec![], &no_unmappable(), &default_identity());
+        merge_tag_masks(&mut policy, &col_tags, &tag_masks, vec![], &no_unmappable(), &default_identity(), MaskPrecedence::Tag);
         assert!(
             matches!(policy.column_masks.get("email"), Some(MaskType::Custom(_))),
             "CUSTOM tag mask with valid expression must produce MaskType::Custom"
@@ -1126,7 +1294,7 @@ mod tests {
         let mut tag_masks: HashMap<String, TagMaskSpec> = HashMap::new();
         // Invalid SQL expression — parser will reject it.
         tag_masks.insert("PII".to_string(), TagMaskSpec::Custom("!!!INVALID SQL!!!".to_string()));
-        merge_tag_masks(&mut policy, &col_tags, &tag_masks, vec![], &no_unmappable(), &default_identity());
+        merge_tag_masks(&mut policy, &col_tags, &tag_masks, vec![], &no_unmappable(), &default_identity(), MaskPrecedence::Tag);
         assert!(
             policy.restricted_columns.contains(&"ssn".to_string()),
             "column with unparseable CUSTOM tag mask must be restricted (fail-closed)"
@@ -1459,6 +1627,7 @@ mod tests {
             "employees",
             "hr",
             &HashMap::new(),
+            MaskPrecedence::Tag,
         )
         .await;
 
@@ -1476,6 +1645,7 @@ mod tests {
             "orders",
             "sales",
             &HashMap::new(),
+            MaskPrecedence::Tag,
         )
         .await;
         assert!(got.column_masks.is_empty());
@@ -1494,7 +1664,8 @@ mod tests {
         store.add_table_policy("ns2", "t", p).await;
 
         let got =
-            resolve_effective_policy(&store, &diag_user(&[]), "t", "ns2", &HashMap::new()).await;
+            resolve_effective_policy(&store, &diag_user(&[]), "t", "ns2", &HashMap::new(), MaskPrecedence::Tag)
+                .await;
         assert!(matches!(got.column_masks.get("email"), Some(MaskType::Nullify)));
     }
 }

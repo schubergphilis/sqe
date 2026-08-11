@@ -4,7 +4,7 @@ use sqe_core::config::RangerPolicyConfig;
 use sqe_core::SessionUser;
 use sqe_policy::ranger_store::RangerStore;
 use sqe_policy::PolicyStore;
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const BUNDLE: &str = r#"{
@@ -50,6 +50,116 @@ fn analyst() -> SessionUser {
         email: None,
         groups: vec![],
     }
+}
+
+fn create_policy(sql: &str) -> sqe_sql::policy_ddl::CreatePolicyStatement {
+    let parsed = sqe_sql::policy_ddl::try_parse_policy_ddl(sql)
+        .unwrap()
+        .unwrap();
+    let sqe_sql::policy_ddl::PolicyDdlStatement::Create(stmt) = parsed else {
+        panic!("expected CREATE POLICY")
+    };
+    stmt
+}
+
+async fn mock_service_link(server: &MockServer) {
+    Mock::given(method("GET"))
+        .and(path("/service/public/v2/api/service/name/hive"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(
+            serde_json::json!({"type": "hive", "tagService": "hive_tag"}),
+        ))
+        .mount(server)
+        .await;
+}
+
+#[tokio::test]
+async fn create_policy_posts_component_policy() {
+    let server = MockServer::start().await;
+    mock_service_link(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/service/public/v2/api/policy"))
+        .and(query_param("serviceName", "hive"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/service/public/v2/api/policy"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let store = RangerStore::from_config(&cfg(&server.uri())).unwrap();
+    let stmt = create_policy(
+        "CREATE POLICY p ON TABLE c.sales.orders COLUMN MASK MASK_NULL \
+         TO ROLE analyst ON COLUMN amount",
+    );
+    store.create_policy(&stmt).await.unwrap();
+
+    let request = server.received_requests().await.unwrap().into_iter()
+        .find(|r| r.method == wiremock::http::Method::POST).unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+    assert_eq!(body["service"], "hive");
+    assert_eq!(body["resources"]["database"]["values"][0], "sales");
+}
+
+#[tokio::test]
+async fn create_or_replace_policy_puts_existing_id() {
+    let server = MockServer::start().await;
+    mock_service_link(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/service/public/v2/api/policy"))
+        .and(query_param("serviceName", "hive"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(
+            serde_json::json!([{"id": 41, "name": "p"}]),
+        ))
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/service/public/v2/api/policy/41"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let store = RangerStore::from_config(&cfg(&server.uri())).unwrap();
+    let stmt = create_policy(
+        "CREATE OR REPLACE POLICY p ON TABLE c.sales.orders ROW FILTER \
+         TO ROLE analyst USING (region = 'EU')",
+    );
+    store.create_policy(&stmt).await.unwrap();
+}
+
+#[tokio::test]
+async fn drop_policy_deletes_matching_component_policy() {
+    let server = MockServer::start().await;
+    mock_service_link(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/service/public/v2/api/policy"))
+        .and(query_param("serviceName", "hive"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(
+            serde_json::json!([{"id": 42, "name": "p"}]),
+        ))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/service/public/v2/api/policy"))
+        .and(query_param("serviceName", "hive_tag"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/service/public/v2/api/policy/42"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let store = RangerStore::from_config(&cfg(&server.uri())).unwrap();
+    store.drop_policy(&sqe_sql::policy_ddl::DropPolicyStatement {
+        name: "p".into(),
+        if_exists: false,
+    }).await.unwrap();
 }
 
 #[tokio::test]

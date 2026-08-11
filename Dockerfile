@@ -1,55 +1,105 @@
 # syntax=docker/dockerfile:1
 #
-# One image definition for local compose, data-platform quickstart/sqe, and
-# aikido/kaniko. No cargo-chef, no sccache, no BuildKit cache mounts.
+# Shared fast build for local Compose, data-platform quickstart/sqe, and CI.
+# Dependencies are isolated with cargo-chef and compiler/target state survives
+# source edits in locked BuildKit caches. Runtime and bench-runtime consume the
+# same builder, so building both targets compiles the Rust graph only once.
 #
 #   docker build -t sqe:latest .
+#   docker build --build-arg CARGO_PROFILE=dev-release -t sqe:dev .
 #   docker build --target bench-runtime -t sqe-bench:latest .
 #
 # Final stage MUST stay named `runtime` (AIKIDO_DOCKER_TARGET in .gitlab-ci.yml).
-# Runtime is Chainguard glibc-dynamic (UID 65532): glibc + libgcc + CA certs.
-# TLS is rustls. Chosen over distroless/cc so the Aikido image gate
-# (grype --fail-on high) stays green: distroless still ships unfixed debian
-# libc criticals.
+# Runtime stays Chainguard glibc-dynamic (UID 65532), with no shell.
 
-# Pin matches rust-toolchain.toml so the image and local/CI toolchains agree.
 ARG RUST_VERSION=1.97.1
 
-FROM rust:${RUST_VERSION}-bookworm AS builder
+# Reuse the packaged cargo-chef binary without surrendering the repository's
+# pinned Rust toolchain to whichever compiler the cargo-chef image currently
+# carries.
+FROM lukemathwalker/cargo-chef:latest-rust-bookworm AS cargo-chef-bin
 
-# libprotobuf-dev: well-known .proto includes for datafusion-substrait build.rs.
-# clang/lld: faster link than the default binutils ld on amd64 and arm64.
+FROM rust:${RUST_VERSION}-bookworm AS chef
+
+ARG TARGETARCH
+ARG SCCACHE_VERSION=0.9.0
+
+COPY --from=cargo-chef-bin /usr/local/cargo/bin/cargo-chef /usr/local/cargo/bin/cargo-chef
+
+# libprotobuf-dev supplies google/protobuf/*.proto for datafusion-substrait.
+# lld materially shortens the final coordinator link. The prebuilt sccache
+# binary avoids spending several minutes compiling the cache itself.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    cmake protobuf-compiler libprotobuf-dev libssl-dev pkg-config clang lld \
-    && rm -rf /var/lib/apt/lists/*
+    cmake protobuf-compiler libprotobuf-dev libssl-dev pkg-config clang lld curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && case "$TARGETARCH" in \
+         amd64) SCCACHE_ARCH=x86_64 ;; \
+         arm64) SCCACHE_ARCH=aarch64 ;; \
+         *) echo "unsupported arch: $TARGETARCH" >&2; exit 1 ;; \
+       esac \
+    && curl -fsSL \
+      "https://github.com/mozilla/sccache/releases/download/v${SCCACHE_VERSION}/sccache-v${SCCACHE_VERSION}-${SCCACHE_ARCH}-unknown-linux-musl.tar.gz" \
+      | tar xz --strip-components=1 -C /usr/local/bin \
+        "sccache-v${SCCACHE_VERSION}-${SCCACHE_ARCH}-unknown-linux-musl/sccache"
 
-ENV RUSTFLAGS="-C linker=clang -C link-arg=-fuse-ld=lld"
+ENV RUSTFLAGS="-C linker=clang -C link-arg=-fuse-ld=lld" \
+    RUSTC_WRAPPER=sccache \
+    SCCACHE_DIR=/sccache \
+    SCCACHE_CACHE_SIZE=5G
+
 WORKDIR /build
 
+# Compute a dependency-only recipe. Source edits rerun the cheap planner but
+# leave the expensive cook layer/cache reusable while manifests stay stable.
+FROM chef AS planner
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
 COPY vendor/ vendor/
-# xtask is a workspace member; cargo metadata fails if it is missing.
 COPY xtask/ xtask/
+RUN cargo chef prepare --recipe-path recipe.json
 
-# --locked: same resolution as cargo-gate. --no-default-features: REST-only slim binary
-# (Polaris/Nessie). Kitchen-sink backends: Dockerfile.full.
-RUN cargo build --release --locked --no-default-features \
+FROM chef AS deps
+ARG TARGETARCH
+ARG CARGO_PROFILE=release
+COPY --from=planner /build/recipe.json recipe.json
+COPY vendor/ vendor/
+RUN --mount=type=cache,id=sqe-cargo-registry-${TARGETARCH},sharing=locked,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=sqe-cargo-git-${TARGETARCH},sharing=locked,target=/usr/local/cargo/git \
+    --mount=type=cache,id=sqe-sccache-${TARGETARCH},sharing=locked,target=/sccache \
+    --mount=type=cache,id=sqe-target-${CARGO_PROFILE}-${TARGETARCH},sharing=locked,target=/build/target \
+    cargo chef cook --locked --profile "${CARGO_PROFILE}" \
+      --recipe-path recipe.json --no-default-features \
+      --package sqe-coordinator --package sqe-worker \
+      --package sqe-cli --package sqe-bench \
+    && sccache --show-stats
+
+FROM deps AS builder
+ARG TARGETARCH
+ARG CARGO_PROFILE=release
+COPY Cargo.toml Cargo.lock ./
+COPY crates/ crates/
+COPY vendor/ vendor/
+COPY xtask/ xtask/
+RUN --mount=type=cache,id=sqe-cargo-registry-${TARGETARCH},sharing=locked,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=sqe-cargo-git-${TARGETARCH},sharing=locked,target=/usr/local/cargo/git \
+    --mount=type=cache,id=sqe-sccache-${TARGETARCH},sharing=locked,target=/sccache \
+    --mount=type=cache,id=sqe-target-${CARGO_PROFILE}-${TARGETARCH},sharing=locked,target=/build/target \
+    cargo build --locked --profile "${CARGO_PROFILE}" --no-default-features \
       --bin sqe-server --bin sqe-worker --bin sqe-cli --bin sqe-bench \
     && mkdir -p /build/out \
-    && cp target/release/sqe-server target/release/sqe-worker \
-         target/release/sqe-cli target/release/sqe-bench /build/out/
+    && cp "target/${CARGO_PROFILE}/sqe-server" \
+      "target/${CARGO_PROFILE}/sqe-worker" \
+      "target/${CARGO_PROFILE}/sqe-cli" \
+      "target/${CARGO_PROFILE}/sqe-bench" /build/out/ \
+    && sccache --show-stats
 
-# ── Runtime (shared base) ─────────────────────────────────────
-# Digest-pinned; Renovate bumps via the dockerfile manager.
+# Digest-pinned; Renovate bumps the runtime independently of builder tooling.
 FROM cgr.dev/chainguard/glibc-dynamic@sha256:eaec65b25f35619be16f4992e7bae1128eafcf63c114f2859b800a7020c1ef70 AS runtime-base
 
-# Base image already runs as nonroot (65532). Explicit USER keeps trivy DS-0002 clean.
 USER 65532
 
 FROM busybox:1.38.0-uclibc@sha256:297dda192bda2157ddf40abb47a45a1090caff1864db9cfb9ce4b901ba318a3c AS healthcheck-bin
 
-# Bench generator: same builder, smaller entrypoint image.
 FROM runtime-base AS bench-runtime
 
 LABEL org.opencontainers.image.title="sqe-bench" \
@@ -59,7 +109,7 @@ COPY --from=builder /build/out/sqe-bench /usr/local/bin/
 
 ENTRYPOINT ["/usr/local/bin/sqe-bench"]
 
-# Default: server image (plain `docker build .`).
+# Keep runtime last so plain `docker build .` remains the server image.
 FROM runtime-base AS runtime
 
 ARG VERSION=dev

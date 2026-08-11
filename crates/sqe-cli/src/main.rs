@@ -2,6 +2,7 @@ mod client;
 mod display;
 mod dotcommands;
 mod embedded;
+mod error_render;
 mod flight;
 mod http;
 mod script;
@@ -122,6 +123,13 @@ struct Cli {
     /// errors are printed and execution continues.
     #[arg(long, default_value_t = false)]
     stop_on_error: bool,
+
+    /// Print engine errors exactly as received instead of the readable
+    /// summary. The summary keeps the operation and the catalog's own
+    /// reason and drops the transport wrapper; use this when you need the
+    /// full response (bug reports, unfamiliar error shapes).
+    #[arg(long, default_value_t = false)]
+    raw_errors: bool,
 }
 
 #[derive(Clone, ValueEnum)]
@@ -177,6 +185,7 @@ impl OutputFormat {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
+    error_render::set_raw_errors(cli.raw_errors);
 
     let scheme = if cli.tls { "https" } else { "http" };
 
@@ -310,8 +319,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if let Some(sql) = cli.execute {
-        let result = client.execute(&sql).await?;
-        display::print_query_result(&result, &cli.format);
+        // Handled here rather than propagated with `?`: the default runtime
+        // handler prints the error's Debug form, which wraps the whole string
+        // in quotes and re-escapes every nested layer. That is the shape this
+        // renderer exists to undo.
+        match client.execute(&sql).await {
+            Ok(result) => display::print_query_result(&result, &cli.format),
+            Err(e) => {
+                error_render::print_error("Error: ", &e);
+                std::process::exit(1);
+            }
+        }
         ran_non_interactive = true;
     }
 
@@ -385,7 +403,7 @@ async fn run_script(
         match client.execute(trimmed).await {
             Ok(result) => display::print_query_result(&result, &local_format),
             Err(e) => {
-                eprintln!("[stmt {}] error: {e}", idx + 1);
+                error_render::print_error(&format!("[stmt {}] error: ", idx + 1), &e);
                 failures += 1;
                 if stop_on_error {
                     return Err(format!("aborted after statement {}", idx + 1).into());
@@ -534,7 +552,7 @@ async fn run_one(
                 eprintln!("Time: {:.3}s", start.elapsed().as_secs_f64());
             }
         }
-        Err(e) => eprintln!("Error: {e}"),
+        Err(e) => error_render::print_error("Error: ", &e),
     }
 }
 

@@ -50,10 +50,10 @@ The enforcement path runs entirely inside Polaris. SQE sends the query plus the
 user's bearer token. Polaris resolves the principal, asks its embedded Ranger
 authorizer for a decision, and either serves the table metadata or refuses.
 
-A denied operation does not surface as a permission error. SQE surfaces a load
-denial as "table not found", matching the Polaris information-hiding model. A
-denied table is invisible, not forbidden. The quickstart test treats both
-"not found" and an explicit 403 as a denial for exactly this reason.
+A denied table load surfaces as an explicit permission error. SQE propagates
+Polaris' 403 instead of falling through DataFusion's table/view lookup and
+rewriting the denial as "table not found". A genuine catalog 404 remains a
+not-found error.
 
 ## The `polaris` Ranger service-def
 

@@ -145,6 +145,10 @@ const BUNDLE_KEY: &str = "__bundle__";
 /// Fine-grained policy store backed by a `hive`-type Ranger service.
 pub struct RangerStore {
     client: Client,
+    /// Ranger Admin base URL used by SQL policy DDL.
+    admin_url: String,
+    /// Component service instance (for example `query`).
+    service_name: String,
     /// Base download URL, e.g. ".../service/plugins/policies/download/hive".
     download_url: String,
     admin_user: String,
@@ -178,6 +182,8 @@ impl RangerStore {
                     ))
                 })?,
             download_url,
+            admin_url: base.to_string(),
+            service_name: cfg.service_name.clone(),
             admin_user: cfg.admin_user.clone(),
             admin_password: cfg.admin_password.clone(),
             cache: Cache::builder()
@@ -783,8 +789,292 @@ fn cache_key(user: &SessionUser, table: &str, namespace: &str) -> String {
     format!("{}:{}:{}:{}", user.username, namespace, table, roles.join(","))
 }
 
+#[derive(Debug)]
+struct RangerServiceLink {
+    component_type: String,
+    tag_service: Option<String>,
+}
+
+impl RangerStore {
+    async fn service_link(&self) -> sqe_core::Result<RangerServiceLink> {
+        let url = format!(
+            "{}/service/public/v2/api/service/name/{}",
+            self.admin_url, self.service_name
+        );
+        let response = self
+            .client
+            .get(url)
+            .basic_auth(&self.admin_user, Some(self.admin_password.expose()))
+            .send()
+            .await
+            .map_err(|e| sqe_core::SqeError::Execution(format!(
+                "Ranger service lookup failed: {e}"
+            )))?;
+        if !response.status().is_success() {
+            return Err(sqe_core::SqeError::Execution(format!(
+                "Ranger service lookup failed (HTTP {})",
+                response.status()
+            )));
+        }
+        let body: serde_json::Value = response.json().await.map_err(|e| {
+            sqe_core::SqeError::Execution(format!("Ranger service lookup parse failed: {e}"))
+        })?;
+        let component_type = body
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| sqe_core::SqeError::Execution(
+                "Ranger component service response omitted its type".to_string(),
+            ))?
+            .to_string();
+        let tag_service = body
+            .get("tagService")
+            .and_then(serde_json::Value::as_str)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string);
+        Ok(RangerServiceLink { component_type, tag_service })
+    }
+
+    async fn policies_for_service(
+        &self,
+        service: &str,
+    ) -> sqe_core::Result<Vec<serde_json::Value>> {
+        let url = format!("{}/service/public/v2/api/policy", self.admin_url);
+        let response = self
+            .client
+            .get(url)
+            .query(&[("serviceName", service)])
+            .basic_auth(&self.admin_user, Some(self.admin_password.expose()))
+            .send()
+            .await
+            .map_err(|e| sqe_core::SqeError::Execution(format!(
+                "Ranger policy list failed: {e}"
+            )))?;
+        if !response.status().is_success() {
+            return Err(sqe_core::SqeError::Execution(format!(
+                "Ranger policy list failed (HTTP {})",
+                response.status()
+            )));
+        }
+        response.json().await.map_err(|e| {
+            sqe_core::SqeError::Execution(format!("Ranger policy list parse failed: {e}"))
+        })
+    }
+
+    async fn send_policy_ddl(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<&serde_json::Value>,
+    ) -> sqe_core::Result<()> {
+        let url = format!("{}{}", self.admin_url, path);
+        let mut request = self
+            .client
+            .request(method, url)
+            .basic_auth(&self.admin_user, Some(self.admin_password.expose()))
+            .header("X-XSRF-HEADER", "x");
+        if let Some(body) = body {
+            request = request.json(body);
+        }
+        let response = request.send().await.map_err(|e| {
+            sqe_core::SqeError::Execution(format!("Ranger policy mutation failed: {e}"))
+        })?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(sqe_core::SqeError::Execution(format!(
+                "Ranger policy mutation failed (HTTP {status}){}",
+                if body.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!(". Ranger said: {}", body.trim())
+                }
+            )));
+        }
+        Ok(())
+    }
+
+    async fn create_policy_ddl(
+        &self,
+        stmt: &sqe_sql::policy_ddl::CreatePolicyStatement,
+    ) -> sqe_core::Result<()> {
+        let link = self.service_link().await?;
+        let service = match &stmt.target {
+            sqe_sql::policy_ddl::PolicyTarget::Table(_) => self.service_name.clone(),
+            sqe_sql::policy_ddl::PolicyTarget::Tag(_) => link.tag_service.clone().ok_or_else(|| {
+                sqe_core::SqeError::Execution(format!(
+                    "CREATE POLICY ON TAG requires Ranger service '{}' to have a linked tag service",
+                    self.service_name
+                ))
+            })?,
+        };
+        let body = ranger_policy_body(stmt, &service, &link.component_type)?;
+        let existing = self
+            .policies_for_service(&service)
+            .await?
+            .into_iter()
+            .find(|p| p.get("name").and_then(serde_json::Value::as_str) == Some(&stmt.name));
+        match existing {
+            Some(_) if !stmt.or_replace => Err(sqe_core::SqeError::Execution(format!(
+                "Policy '{}' is present; use CREATE OR REPLACE POLICY",
+                stmt.name
+            ))),
+            Some(policy) => {
+                let id = policy.get("id").and_then(serde_json::Value::as_i64).ok_or_else(|| {
+                    sqe_core::SqeError::Execution(format!(
+                        "Ranger policy '{}' has no numeric id",
+                        stmt.name
+                    ))
+                })?;
+                self.send_policy_ddl(
+                    reqwest::Method::PUT,
+                    &format!("/service/public/v2/api/policy/{id}"),
+                    Some(&body),
+                ).await
+            }
+            None => self.send_policy_ddl(
+                reqwest::Method::POST,
+                "/service/public/v2/api/policy",
+                Some(&body),
+            ).await,
+        }
+    }
+
+    async fn drop_policy_ddl(
+        &self,
+        stmt: &sqe_sql::policy_ddl::DropPolicyStatement,
+    ) -> sqe_core::Result<()> {
+        let link = self.service_link().await?;
+        let mut services = vec![self.service_name.clone()];
+        if let Some(tag_service) = link.tag_service {
+            services.push(tag_service);
+        }
+        let mut ids = Vec::new();
+        for service in services {
+            ids.extend(
+                self.policies_for_service(&service)
+                    .await?
+                    .into_iter()
+                    .filter(|p| p.get("name").and_then(serde_json::Value::as_str) == Some(&stmt.name))
+                    .filter_map(|p| p.get("id").and_then(serde_json::Value::as_i64)),
+            );
+        }
+        if ids.is_empty() && !stmt.if_exists {
+            return Err(sqe_core::SqeError::Execution(format!(
+                "Policy '{}' not found",
+                stmt.name
+            )));
+        }
+        for id in ids {
+            self.send_policy_ddl(
+                reqwest::Method::DELETE,
+                &format!("/service/public/v2/api/policy/{id}"),
+                None,
+            ).await?;
+        }
+        Ok(())
+    }
+}
+
+fn ranger_policy_body(
+    stmt: &sqe_sql::policy_ddl::CreatePolicyStatement,
+    service: &str,
+    component_type: &str,
+) -> sqe_core::Result<serde_json::Value> {
+    use sqe_sql::policy_ddl::{FineGrainedPolicyKind, PolicyPrincipalKind, PolicyTarget};
+
+    let is_tag = matches!(stmt.target, PolicyTarget::Tag(_));
+    let access_type = if is_tag {
+        format!("{component_type}:select")
+    } else {
+        "select".to_string()
+    };
+    let mut users = Vec::new();
+    let mut roles = Vec::new();
+    let mut groups = Vec::new();
+    match stmt.principal.kind {
+        PolicyPrincipalKind::User => users.push(stmt.principal.name.clone()),
+        PolicyPrincipalKind::Role => roles.push(stmt.principal.name.clone()),
+        PolicyPrincipalKind::Group => groups.push(stmt.principal.name.clone()),
+    }
+    let mut resources = serde_json::Map::new();
+    match &stmt.target {
+        PolicyTarget::Tag(tag) => {
+            resources.insert("tag".into(), serde_json::json!({"values": [tag]}));
+        }
+        PolicyTarget::Table(table) => {
+            let parts: Vec<&str> = table.split('.').map(|v| v.trim_matches('"')).collect();
+            if parts.len() < 2 {
+                return Err(sqe_core::SqeError::Execution(
+                    "CREATE POLICY ON TABLE requires at least <schema>.<table>".to_string(),
+                ));
+            }
+            let table_name = parts[parts.len() - 1];
+            let namespace_start = usize::from(parts.len() >= 3);
+            let namespace = parts[namespace_start..parts.len() - 1].join(".");
+            resources.insert("database".into(), serde_json::json!({"values": [namespace]}));
+            resources.insert("table".into(), serde_json::json!({"values": [table_name]}));
+        }
+    }
+    let accesses = serde_json::json!([{"type": access_type, "isAllowed": true}]);
+    let mut body = serde_json::json!({
+        "service": service,
+        "name": stmt.name,
+        "isEnabled": true,
+        "resources": resources,
+    });
+    match &stmt.kind {
+        FineGrainedPolicyKind::ColumnMask { mask_type, column, expression } => {
+            if let Some(column) = column {
+                body["resources"]["column"] = serde_json::json!({"values": [column]});
+            }
+            let mask_type = if is_tag && !mask_type.contains(':') {
+                format!("{component_type}:{mask_type}")
+            } else {
+                mask_type.clone()
+            };
+            body["policyType"] = serde_json::json!(1);
+            body["dataMaskPolicyItems"] = serde_json::json!([{
+                "users": users,
+                "roles": roles,
+                "groups": groups,
+                "accesses": accesses,
+                "dataMaskInfo": {
+                    "dataMaskType": mask_type,
+                    "valueExpr": expression,
+                }
+            }]);
+        }
+        FineGrainedPolicyKind::RowFilter { expression } => {
+            body["policyType"] = serde_json::json!(2);
+            body["rowFilterPolicyItems"] = serde_json::json!([{
+                "users": users,
+                "roles": roles,
+                "groups": groups,
+                "accesses": accesses,
+                "rowFilterInfo": {"filterExpr": expression},
+            }]);
+        }
+    }
+    Ok(body)
+}
+
 #[async_trait]
 impl PolicyStore for RangerStore {
+    async fn create_policy(
+        &self,
+        stmt: &sqe_sql::policy_ddl::CreatePolicyStatement,
+    ) -> sqe_core::Result<()> {
+        self.create_policy_ddl(stmt).await
+    }
+
+    async fn drop_policy(
+        &self,
+        stmt: &sqe_sql::policy_ddl::DropPolicyStatement,
+    ) -> sqe_core::Result<()> {
+        self.drop_policy_ddl(stmt).await
+    }
+
     async fn list_mask_policies(&self) -> sqe_core::Result<Vec<crate::MaskPolicyInfo>> {
         self.list_mask_policies_impl().await
     }
@@ -877,6 +1167,45 @@ impl PolicyStore for RangerStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn create(sql: &str) -> sqe_sql::policy_ddl::CreatePolicyStatement {
+        let parsed = sqe_sql::policy_ddl::try_parse_policy_ddl(sql)
+            .expect("valid policy SQL")
+            .expect("policy statement");
+        let sqe_sql::policy_ddl::PolicyDdlStatement::Create(stmt) = parsed else {
+            panic!("expected create")
+        };
+        stmt
+    }
+
+    #[test]
+    fn sql_resource_mask_maps_to_ranger_policy_json() {
+        let stmt = create(
+            "CREATE POLICY p ON TABLE sales_wh.ac.orders COLUMN MASK MASK_NULL \
+             TO ROLE engineer ON COLUMN amount",
+        );
+        let body = ranger_policy_body(&stmt, "query", "hive").unwrap();
+        assert_eq!(body["service"], "query");
+        assert_eq!(body["policyType"], 1);
+        assert_eq!(body["resources"]["database"]["values"][0], "ac");
+        assert_eq!(body["resources"]["table"]["values"][0], "orders");
+        assert_eq!(body["resources"]["column"]["values"][0], "amount");
+        assert_eq!(body["dataMaskPolicyItems"][0]["roles"][0], "engineer");
+        assert_eq!(body["dataMaskPolicyItems"][0]["dataMaskInfo"]["dataMaskType"], "MASK_NULL");
+    }
+
+    #[test]
+    fn sql_tag_mask_uses_component_qualified_ranger_vocabulary() {
+        let stmt = create(
+            "CREATE POLICY p ON TAG pii COLUMN MASK CUSTOM TO ROLE engineer \
+             USING (concat('x', {col}))",
+        );
+        let body = ranger_policy_body(&stmt, "query_tag", "hive").unwrap();
+        assert_eq!(body["service"], "query_tag");
+        assert_eq!(body["resources"]["tag"]["values"][0], "pii");
+        assert_eq!(body["dataMaskPolicyItems"][0]["accesses"][0]["type"], "hive:select");
+        assert_eq!(body["dataMaskPolicyItems"][0]["dataMaskInfo"]["dataMaskType"], "hive:CUSTOM");
+    }
 
     /// Tag-service mask types carry the owning component's prefix. Verified
     /// against a live Ranger 2.8 tag servicedef, which lists ONLY prefixed

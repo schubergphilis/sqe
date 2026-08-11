@@ -236,7 +236,7 @@ Landed June 2026 across five sub-phases; the end-to-end demo is `quickstart/pola
 - **Row filters + column masks** (Phase 1): `RangerStore` downloads the `hive` service policy set and feeds the plan rewriter; a query must pass both the Polaris gate and the SQE-side rewrite
 - **Full mask vocabulary** (Phase 2A): MASK_NULL, full redact, show-first-4 / show-last-4, hash, date-show-year, and CUSTOM expressions, all type-preserving through the physical planner
 - **Session-context functions** (Phase 2B): `current_user()`, `is_role_in_session(role)`, `current_database()`, `current_schema()` usable in policy expressions and user SQL; they const-fold to literals before plan distribution, so no session state ships to workers
-- **Tag-based masking** (Phase 3a): column-to-tag associations in Iceberg `sqe.column-tags` table properties, mask-per-tag rules from Ranger `tagPolicies`, resource-mask-wins precedence, unmappable tags fail closed
+- **Tag-based masking** (Phase 3a): column-to-tag associations in Iceberg `sqe.column-tags` table properties, mask-per-tag rules from Ranger `tagPolicies`, configurable contested-column precedence (`policy.mask-precedence`, default `tag`), unmappable tags fail closed
 - **Tag authoring DDL**: `ALTER TABLE ... SET TAGS (col = ('PII'))` / `UNSET TAGS`, plus the Snowflake-compatible `MODIFY COLUMN ... SET TAG` form
 - **FUTURE grants**: `GRANT ... ON FUTURE TABLES IN SCHEMA x` via Ranger table wildcards
 - **Conditional masks**: a CUSTOM mask expression can reference sibling columns of the same row; qualified references fail closed

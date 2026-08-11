@@ -10,12 +10,14 @@ pub mod paren_less_values;
 pub mod partition;
 pub mod partition_evolution;
 pub mod pipeline_types;
+pub mod policy_ddl;
 pub mod procedures;
 pub mod tags;
 pub mod time_travel;
 pub mod trino_compat;
 pub mod tvf_named_args;
 pub mod v3_types;
+pub mod view_compat;
 
 pub use attach::{
     build_secret_from_stmt, AttachStatement, CatalogKind, CreateSecretStatement, DetachStatement,
@@ -43,6 +45,7 @@ pub use trino_compat::{
     alias_anonymous_select_columns, check_expression_depth, rewrite_trino_compat,
 };
 pub use tvf_named_args::rewrite_named_tvf_args;
+pub use view_compat::{rewrite_view_compat, ViewCompat, ViewSecurity, VIEW_SECURITY_OPTION};
 pub use v3_types::{
     detect_ns_timestamp, extract_default_literal, is_tz_variant, is_v3_only_type,
     DefaultError, DefaultLiteral, NsTimestamp,
