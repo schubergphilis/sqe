@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::future::Future;
 use std::sync::Arc;
 use arrow_array::RecordBatch;
 use chrono::{DateTime, Utc};
@@ -124,6 +125,33 @@ impl ResultCache {
             if result.is_some() { m.cache_hits.inc(); } else { m.cache_misses.inc(); }
         }
         result
+    }
+
+    /// Look up a cached result and validate that it is still safe to serve.
+    ///
+    /// Authorization is deliberately outside the cache key: Ranger grants can
+    /// change while username, SQL, and bearer token remain identical. The
+    /// caller supplies the authoritative async check. A rejection evicts the
+    /// exact cached query before the error is returned, so a revoked result can
+    /// never become a hit again without being executed and stored anew.
+    pub async fn lookup_authorized<E, F, Fut>(
+        &self,
+        user: &str,
+        sql: &str,
+        authorize: F,
+    ) -> Result<Option<Arc<CachedResult>>, E>
+    where
+        F: FnOnce(Arc<CachedResult>) -> Fut,
+        Fut: Future<Output = Result<(), E>>,
+    {
+        let Some(cached) = self.lookup(user, sql) else {
+            return Ok(None);
+        };
+        if let Err(error) = authorize(Arc::clone(&cached)).await {
+            self.cache.invalidate(&Self::cache_key(user, sql));
+            return Err(error);
+        }
+        Ok(Some(cached))
     }
 
     /// Store a query result in the cache.
@@ -367,6 +395,28 @@ mod tests {
         assert_eq!(cached.batches.len(), 1);
         assert_eq!(cached.batches[0].num_rows(), 5);
         assert_eq!(cached.tables_touched, vec!["users".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn authorization_rejection_evicts_cached_result() {
+        let cache = ResultCache::new(&test_config(), None);
+        let sql = "SELECT * FROM orders";
+        cache.store(
+            "alice",
+            sql,
+            Uuid::now_v7(),
+            vec![make_batch(1)],
+            vec!["warehouse.sales.orders".into()],
+        );
+
+        let denied = cache
+            .lookup_authorized("alice", sql, |_cached| async { Err::<(), _>("revoked") })
+            .await;
+        assert!(matches!(denied, Err("revoked")));
+        assert!(
+            cache.lookup("alice", sql).is_none(),
+            "a result rejected by the authorization seam must be evicted"
+        );
     }
 
     #[test]

@@ -261,6 +261,11 @@ services:
     build:
       context: ../..
       dockerfile: Dockerfile
+      target: runtime
+      args:
+        # Optimized execution without release LTO's slow, memory-heavy link.
+        # cargo-chef + sccache keep later source rebuilds incremental.
+        CARGO_PROFILE: ${SQE_CARGO_PROFILE:-dev-release}
     command: ["--config", "/etc/sqe/sqe.toml"]
     environment:
       RUST_LOG: "info,sqe_auth=debug,sqe_policy=debug,sqe_coordinator::session_manager=debug"

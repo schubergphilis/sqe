@@ -107,8 +107,8 @@ that fact to make `GRANT` the visible gate:
   member load and read a table, and `REVOKE` takes it away. A Ranger DENY on
   `table-properties-read` (added to the same policy) overrides the allow.
 
-A denied table is invisible: SQE surfaces a load denial as "table not found"
-rather than a permission error, matching the Polaris information-hiding model.
+A denied table load surfaces the Polaris authorization failure as an explicit
+SQE permission error. A genuine catalog 404 still surfaces as "table not found".
 
 ## Why a seed admin policy
 

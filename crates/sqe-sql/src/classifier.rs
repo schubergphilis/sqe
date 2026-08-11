@@ -9,6 +9,7 @@ use crate::attach::{
 };
 use crate::ddl::{try_parse_ref_ddl, RefDdl};
 use crate::partition_evolution::{try_parse_partition_evolution, PartitionEvolution};
+use crate::policy_ddl::{try_parse_policy_ddl, PolicyDdlStatement};
 use crate::procedures::{try_parse_call, ProcedureCall};
 use crate::tags::{try_parse_masking_policy, try_parse_set_tags, MaskingPolicyOp, SetTagsStatement};
 
@@ -96,6 +97,9 @@ pub enum StatementKind {
     /// `SHOW MASKING POLICIES` / `SHOW MASKING POLICY <name>`. `None` lists all;
     /// `Some(name)` filters to one policy.
     ShowMaskingPolicies(Option<String>),
+    /// `CREATE [OR REPLACE] POLICY` / `DROP POLICY [IF EXISTS]`: SQL-managed
+    /// Ranger row filters and column masks shared with Spark/Kyuubi.
+    PolicyDdl(Box<PolicyDdlStatement>),
     Utility(Box<Statement>),
     ExplainFull(String), // inner SQL string (EXPLAIN FULL pre-processed)
     // Transaction stubs — no-ops for JDBC tools that use setAutoCommit(false).
@@ -204,6 +208,7 @@ impl StatementKind {
             StatementKind::ShowEffectivePolicy(_) => "showeffectivepolicy",
             StatementKind::ShowTags(_) => "showtags",
             StatementKind::ShowMaskingPolicies(_) => "showmaskingpolicies",
+            StatementKind::PolicyDdl(_) => "policyddl",
             StatementKind::Utility(_) => "utility",
             StatementKind::ExplainFull(_) => "explain_full",
             StatementKind::Begin => "begin",
@@ -357,6 +362,10 @@ pub fn parse_and_classify(sql: &str) -> sqe_core::Result<StatementKind> {
     // may not natively support.
     let trimmed = sql.trim();
     let upper = trimmed.to_uppercase();
+
+    if let Some(policy) = try_parse_policy_ddl(trimmed)? {
+        return Ok(StatementKind::PolicyDdl(Box::new(policy)));
+    }
 
     if upper == "SHOW CATALOGS" || upper.starts_with("SHOW CATALOGS ") {
         return Ok(StatementKind::ShowCatalogs);

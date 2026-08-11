@@ -21,16 +21,13 @@
 //!
 //! # Cache key note
 //!
-//! Cache keys are `{token_fingerprint}|{namespace}.{table}`. The
+//! Cache keys are `{token_fingerprint}|{warehouse}|{namespace}.{table}`. The
 //! `properties_for` accessor scans for any entry whose key ENDS WITH
-//! `|{namespace}.{table}`, because table properties are user-independent
+//! `|{catalog}|{namespace}.{table}`, because table properties are user-independent
 //! (user-scoping exists only to prevent S3 vended credentials baked into the
 //! `Table` from crossing sessions — issue #49). The first matching entry is
 //! used; all matching entries hold the same properties.
 //!
-//! Note: the existing key format omits warehouse/catalog, so tables with the
-//! same namespace + name in different warehouses would collide. This mirrors
-//! the existing `table_cache_key` behavior in `SessionCatalog`.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -69,7 +66,7 @@ impl CacheTagSource {
 impl TagSource for CacheTagSource {
     fn column_tags(
         &self,
-        _catalog: Option<&str>,
+        catalog: Option<&str>,
         namespace: &[String],
         table: &str,
     ) -> Option<HashMap<String, Vec<String>>> {
@@ -89,7 +86,7 @@ impl TagSource for CacheTagSource {
             }
         };
 
-        let props = match self.cache.properties_for(&ns_display, table) {
+        let props = match self.cache.properties_for(catalog, &ns_display, table) {
             Some(p) => p,
             None => {
                 debug!(
