@@ -551,13 +551,19 @@ fn classify_catalog_error(msg: &str) -> SqeErrorCode {
     if lower.contains("timeout") || lower.contains("timed out") {
         return SqeErrorCode::QueryTimeout;
     }
-    if (lower.contains("not found") || lower.contains("http 404")) && lower.contains("view") {
+    // iceberg-rust's REST catalog says "Tried to load a table that does not
+    // exist" rather than "not found" or 404. Callers that branch on
+    // TableNotFound depend on it: SqeSchemaProvider::table() only falls back to
+    // the view path on a genuine table miss, so leaving this as CatalogError
+    // makes every Iceberg view unreadable.
+    let absent = lower.contains("not found")
+        || lower.contains("http 404")
+        || lower.contains("does not exist");
+    if absent && lower.contains("view") {
         SqeErrorCode::ViewNotFound
-    } else if (lower.contains("not found") || lower.contains("http 404"))
-        && (lower.contains("schema") || lower.contains("namespace"))
-    {
+    } else if absent && (lower.contains("schema") || lower.contains("namespace")) {
         SqeErrorCode::SchemaNotFound
-    } else if lower.contains("not found") || lower.contains("http 404") {
+    } else if absent {
         SqeErrorCode::TableNotFound
     } else if lower.contains("already exists") {
         SqeErrorCode::DuplicateTable
@@ -585,7 +591,11 @@ fn classify_execution_error(msg: &str) -> SqeErrorCode {
     {
         return SqeErrorCode::AuthenticationFailed;
     }
-    if lower.contains("403 forbidden") {
+    if lower.contains("403 forbidden")
+        || lower.contains("access denied")
+        || lower.contains("permission denied")
+        || lower.contains("not authorized")
+    {
         return SqeErrorCode::AccessDenied;
     }
     // TypeMismatch must be checked BEFORE FunctionNotFound because DataFusion
@@ -943,6 +953,54 @@ mod tests {
     }
 
     #[test]
+    fn classify_catalog_does_not_exist_as_table_not_found() {
+        // iceberg-rust's REST catalog reports a missing table as
+        // `Unexpected => Tried to load a table that does not exist`, without
+        // the words "not found" or a 404. Classifying that as a generic
+        // CatalogError blocks the table-then-view fallback in
+        // SqeSchemaProvider::table(), which made every Iceberg view
+        // unreadable. See scripts/access-control-parity-demo.sh section 7.
+        let err = SqeError::Catalog(
+            "Failed to load table: Unexpected => Tried to load a table that does not exist"
+                .into(),
+        );
+        assert_eq!(err.error_code(), SqeErrorCode::TableNotFound);
+    }
+
+    #[test]
+    fn catalog_src_does_not_exist_is_table_not_found() {
+        // rest_catalog.rs builds the real error with catalog_src(), not the bare
+        // Catalog(String) variant, so assert the code on the shape production
+        // actually produces.
+        let err = SqeError::catalog_src(
+            "Failed to load table: Unexpected => Tried to load a table that does not exist",
+            DummyCause("iceberg rest miss"),
+        );
+        assert_eq!(err.error_code(), SqeErrorCode::TableNotFound);
+        assert!(err.is_not_found());
+    }
+
+    #[test]
+    fn classify_catalog_does_not_exist_keeps_more_specific_codes() {
+        // The phrasing must not outrank the view/namespace/auth branches.
+        assert_eq!(
+            SqeError::Catalog("Tried to load a view that does not exist".into()).error_code(),
+            SqeErrorCode::ViewNotFound
+        );
+        assert_eq!(
+            SqeError::Catalog("Namespace acparity does not exist".into()).error_code(),
+            SqeErrorCode::SchemaNotFound
+        );
+        assert_eq!(
+            SqeError::Catalog(
+                "Failed to load table: 403 Forbidden: table does not exist".into()
+            )
+            .error_code(),
+            SqeErrorCode::AccessDenied
+        );
+    }
+
+    #[test]
     fn classify_execution_pool_denial_as_resource_exhausted() {
         // DataFusion memory-pool denials (operator spill pressure, the
         // pool-tracked scan decode path from issue #367) must surface as
@@ -1092,6 +1150,16 @@ mod tests {
         let code = err.error_code();
         assert_eq!(code, SqeErrorCode::AccessDenied);
         assert_eq!(code.name(), "ACCESS_DENIED");
+    }
+
+    #[test]
+    fn planning_wrapper_preserves_access_denied_classification() {
+        // DataFusion's External wrapper is flattened by the coordinator today.
+        // The catalog marker must still map it to PERMISSION_DENIED.
+        let err = SqeError::Execution(
+            "SQL planning failed: External error: Access denied: Failed to load table".into(),
+        );
+        assert_eq!(err.error_code(), SqeErrorCode::AccessDenied);
     }
 
     #[test]

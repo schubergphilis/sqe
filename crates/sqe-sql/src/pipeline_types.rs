@@ -80,5 +80,11 @@ pub fn pre_parse_pipeline(sql: &UserSql) -> sqe_core::Result<ClassifiableSql> {
     // Trino `ALTER TABLE ... EXECUTE optimize` -> `CALL system.rewrite_data_files`.
     // Parse-gated; a no-op for SQL that already parses. (#331)
     let normalized = crate::alter_execute::rewrite_alter_execute(&normalized);
+    // Trino `CREATE VIEW ... [COMMENT '<text>'] [SECURITY {DEFINER|INVOKER}]`.
+    // Both fold into shapes sqlparser stores, so the clauses survive into the
+    // AST and reach the Iceberg view's properties. Parse-gated. The security
+    // mode is dropped here and read again from the AST by the CREATE VIEW
+    // handler, which is the only caller that has somewhere to put it.
+    let normalized = crate::view_compat::rewrite_view_compat(&normalized).sql;
     Ok(ClassifiableSql::from_normalized(normalized))
 }
