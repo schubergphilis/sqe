@@ -74,7 +74,9 @@ pub fn build_policy_enforcer(
     match store {
         None => Ok((Arc::new(PassthroughEnforcer), None)),
         Some(store) => {
-            let mut rewriter = PolicyPlanRewriter::new(store.clone()).with_mask_key(mask_key);
+            let mut rewriter = PolicyPlanRewriter::new(store.clone())
+                .with_mask_key(mask_key)
+                .with_mask_precedence(config.mask_precedence);
 
             // Wire the tag source. `CacheTagSource` reads `sqe.column-tags`
             // table properties from the shared metadata cache with zero extra
