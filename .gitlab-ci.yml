@@ -10,6 +10,13 @@ workflow:
     - if: '$CI_COMMIT_TAG'
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
 
+# HARBOR RELEASE MIRRORING: the `ref:` below must be an aikido release that
+# contains aikido-publish-release-image (vpf-data-ai/aikido!126). v0.9.5 does
+# NOT. Without that job a vX.Y.Z tag pipeline pushes :vX.Y.Z + :stable to the
+# GitLab registry and mirrors NEITHER to Harbor, which is why
+# repo.sovereign-data.org/chameleon/sqlengine/sqe:stable has been v0.37.0 since
+# 2026-06-24 while main moved 1110 commits. Renovate bumps this automatically;
+# do not merge the release MR until it has.
 include:
   - project: 'vpf-data-ai/aikido'
     ref: 'v0.9.5'
