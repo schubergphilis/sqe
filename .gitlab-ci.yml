@@ -245,6 +245,38 @@ vendored-profile-drift:
         - "crates/sqe-policy/assets/*.json"
 
 # ===== repo-specific integration suites (docker-in-docker), hosted here =====
+image-shape-test:
+  stage: test
+  image: docker:29
+  services:
+    - name: docker:29-dind
+      alias: docker
+      command: ["--tls=false", "--host=tcp://0.0.0.0:2375"]
+  variables:
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_TLS_CERTDIR: ""
+    DOCKER_DRIVER: overlay2
+  before_script:
+    - apk add --no-cache bash
+    - |
+      for i in $(seq 1 30); do
+        docker info >/dev/null 2>&1 && break
+        echo "waiting for docker daemon ($i/30)..."
+        sleep 2
+      done
+      docker info
+  script:
+    - ./scripts/image-shape-test.sh
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes:
+        - Dockerfile
+        - Cargo.lock
+        - crates/**/*
+        - scripts/image-shape-test.sh
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE == "push"'
+  timeout: 1h
+
 integration-test:
   stage: test
   image: docker:29

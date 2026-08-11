@@ -34,14 +34,6 @@ STACK_DIR="$ROOT_DIR/quickstart/polaris-ranger-keycloak"
 
 cd "$STACK_DIR" || { echo "missing $STACK_DIR" >&2; exit 1; }
 
-# Ports are not fixed. A developer whose 26080 is taken by another Ranger has
-# RANGER_PORT=46080 in .env, and a hardcoded value would talk to the WRONG
-# Ranger and fail with "Role name: engineer does not exist in ranger admin".
-[ -f .env ] && set -a && . ./.env && set +a
-RANGER_PORT="${RANGER_PORT:-26080}"
-RANGER_PASS="${RANGER_ADMIN_PASSWORD:-rangerR0cks!}"
-RANGER_URL="http://localhost:${RANGER_PORT}"
-
 PASS=0; FAIL=0
 STEP=0
 bold()  { printf '\033[1m%s\033[0m\n' "$*"; }
@@ -82,8 +74,16 @@ bootstrap() {
   docker compose up -d --wait polaris || { red "polaris failed"; exit 1; }
   docker compose up -d polaris-setup >/dev/null 2>&1
   wait_oneshot polaris-setup
+  # Build before inspecting the image. The local tag may legitimately still
+  # point at the pre-Chainguard image, which is exactly what this bootstrap is
+  # responsible for replacing.
+  dim "Building SQE; the first dependency build takes time, later source rebuilds reuse cargo-chef/sccache caches."
+  docker compose build sqe || {
+    red "sqe image build failed"
+    exit 1
+  }
   preflight_image
-  docker compose up -d --build sqe || {
+  docker compose up -d --force-recreate sqe || {
     red "sqe failed to start"
     docker compose logs --tail 80 sqe || true
     exit 1
@@ -92,7 +92,7 @@ bootstrap() {
   if ! docker compose up -d --wait sqe; then
     red "sqe failed healthcheck (compose --wait)"
     red "common cause: image missing /usr/local/bin/wget after Chainguard/distroless"
-    red "rebuild: docker compose build --no-cache sqe && docker compose up -d --force-recreate sqe"
+    red "rebuild: docker compose build sqe && docker compose up -d --force-recreate sqe"
     docker compose ps sqe || true
     docker compose logs --tail 80 sqe || true
     exit 1
@@ -190,81 +190,27 @@ settle() { # user sql want_error(0|1)
   done
 }
 
-curlr() { curl -fsS -u "admin:${RANGER_PASS}" -H 'X-XSRF-HEADER:x' \
-            -H 'Content-Type: application/json' "$@"; }
-
 CAT=sales_wh
 NS=acdemo
 T="$CAT.$NS.orders"
 V="$CAT.$NS.orders_eu"
 
 cleanup_policies() {
-  # Remove any acdemo- policies from a previous run so masks do not stack.
-  for svc in query "${TAG_SERVICE:-acdemo_tag}" tag; do
-  ids="$(curl -fsS -u "admin:${RANGER_PASS}" \
-    "${RANGER_URL}/service/public/v2/api/policy?serviceName=${svc}" 2>/dev/null \
-    | python3 -c 'import json,sys
-try: d=json.load(sys.stdin)
-except Exception: sys.exit()
-for p in (d if isinstance(d,list) else d.get("policies",[])):
-    if str(p.get("name","")).startswith("acdemo-"): print(p["id"])' 2>/dev/null)"
-  for id in $ids; do
-    curl -fsS -u "admin:${RANGER_PASS}" -H 'X-XSRF-HEADER:x' \
-      -X DELETE "${RANGER_URL}/service/public/v2/api/policy/${id}" >/dev/null 2>&1
+  local reason="${1:-remove the SQL-managed policy}"
+  # SQL is the policy-management interface. Ranger remains the backing store,
+  # shared with Spark/Kyuubi, but the demo never needs Ranger credentials or
+  # service-specific JSON.
+  for name in \
+    acdemo-mask-amount \
+    acdemo-mask-ssn \
+    acdemo-mask-email \
+    acdemo-rowfilter \
+    acdemo-tag-mask \
+    acdemo-tag-ssn-null \
+    acdemo-tag-broken
+  do
+    run ok carol "DROP POLICY IF EXISTS \"$name\"" "$reason"
   done
-  done
-}
-
-query_policy() { # name json_body
-  printf '%s' "$2" > /tmp/acdemo-policy.json
-  curlr -X POST "${RANGER_URL}/service/public/v2/api/policy" \
-    -d @/tmp/acdemo-policy.json >/dev/null 2>&1 \
-    && dim "     (ranger policy '$1' created)" \
-    || { red "could not create ranger policy '$1'"; FAIL=$((FAIL+1)); }
-}
-
-TAG_SERVICE=""
-
-# A tag policy lives on a service of TYPE tag, and the query service must point at
-# it via `tagService` or the download bundle carries no tagPolicies block at all.
-#
-# Prefer whatever the query service is ALREADY linked to. Ranger rejects creating a second tag
-# service in some states ("More than one result was returned from
-# Query.getSingleResult()"), and re-pointing the link would mutate the shared demo
-# service for no gain. Only create and link when nothing is linked yet.
-ensure_tag_service() {
-  local svcjson id existing
-  svcjson="$(curl -fsS -u "admin:${RANGER_PASS}" \
-    "${RANGER_URL}/service/public/v2/api/service/name/query" 2>/dev/null)" || {
-    red "could not read the query service"; return 1; }
-  existing="$(printf '%s' "$svcjson" \
-    | python3 -c 'import json,sys; print(json.load(sys.stdin).get("tagService") or "")' 2>/dev/null)"
-  if [ -n "$existing" ]; then
-    TAG_SERVICE="$existing"
-    dim "     (query is already linked to tag service ${TAG_SERVICE})"
-    return 0
-  fi
-  TAG_SERVICE=acdemo_tag
-  curlr -X POST "${RANGER_URL}/service/public/v2/api/service" \
-    -d "{\"name\":\"${TAG_SERVICE}\",\"type\":\"tag\",\"configs\":{},\"isEnabled\":true}" \
-    >/dev/null 2>&1 || { red "could not create tag service ${TAG_SERVICE}"; return 1; }
-  id="$(printf '%s' "$svcjson" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])' 2>/dev/null)"
-  printf '%s' "$svcjson" | python3 -c "
-import json,sys
-d=json.load(sys.stdin); d['tagService']='${TAG_SERVICE}'
-json.dump(d,open('/tmp/acdemo-query.json','w'))"
-  curlr -X PUT "${RANGER_URL}/service/public/v2/api/service/${id}" \
-    -d @/tmp/acdemo-query.json >/dev/null 2>&1 \
-    && dim "     (linked ${TAG_SERVICE} to query)" \
-    || { red "could not link ${TAG_SERVICE} to query"; return 1; }
-}
-
-tag_policy() { # name json_body
-  printf '%s' "$2" > /tmp/acdemo-tagpolicy.json
-  curlr -X POST "${RANGER_URL}/service/public/v2/api/policy" \
-    -d @/tmp/acdemo-tagpolicy.json >/dev/null 2>&1 \
-    && dim "     (tag policy '$1' created)" \
-    || { red "could not create tag policy '$1'"; FAIL=$((FAIL+1)); }
 }
 
 # Fail early on a stale or shell-era SQE image. After Chainguard/distroless the
@@ -291,15 +237,17 @@ preflight_image() {
 
 fixture() {
   bold "Fixture: $T with three rows, owned by carol (sqe_admin)"
-  cleanup_policies
+  cleanup_policies "security baseline: remove policy left by an earlier run"
   sqe carol "CREATE SCHEMA IF NOT EXISTS $CAT.$NS" >/dev/null 2>&1
   sqe carol "DROP TABLE IF EXISTS $T" >/dev/null 2>&1
   sqe carol "CREATE TABLE $T (id BIGINT, region VARCHAR, amount DOUBLE, ssn VARCHAR, email VARCHAR)" >/dev/null 2>&1
   sqe carol "INSERT INTO $T VALUES (1,'EU',10.0,'111-11-1111','a@x'),(2,'US',20.0,'222-22-2222','b@x'),(3,'EU',30.0,'333-33-3333','c@x')" >/dev/null 2>&1
   # Start from no grants so step 1 is a true denial.
   for r in analyst engineer; do
-    sqe carol "REVOKE SELECT ON $T FROM ROLE \"$r\"" >/dev/null 2>&1
-    sqe carol "REVOKE INSERT ON $T FROM ROLE \"$r\"" >/dev/null 2>&1
+    run ok carol "REVOKE SELECT ON $T FROM ROLE \"$r\"" \
+      "security baseline: revoke $r SELECT"
+    run ok carol "REVOKE INSERT ON $T FROM ROLE \"$r\"" \
+      "security baseline: revoke $r INSERT"
   done
   settle carol "SELECT count(*) FROM $T" 0
   # Wait for the REVOKE to actually take effect before step 1 claims "no grant
@@ -319,8 +267,11 @@ fixture() {
 # ── the transcript ───────────────────────────────────────────────────────────
 
 main() {
-  [ "${AC_DEMO_NO_BOOTSTRAP:-0}" = "1" ] || bootstrap
-  preflight_image
+  if [ "${AC_DEMO_NO_BOOTSTRAP:-0}" = "1" ]; then
+    preflight_image
+  else
+    bootstrap
+  fi
   fixture
 
   echo; bold "═══ 1. Catalog gate: the grant is what enables the read ═══"
@@ -343,32 +294,21 @@ main() {
   settle alice "INSERT INTO $T VALUES (9,'EU',1.0,'999-99-9999','z@x')" 0
   run ok alice "SELECT count(*) AS n FROM $T" \
     "the row landed, so the write privilege is real (expect 4)" '\| 4'
-  run ok carol "DELETE FROM $T WHERE id = 9" "carol removes the probe row"
+  run ok carol "DELETE FROM $T WHERE id = 9" \
+    "carol removes the probe row (cross-user read-after-write)" '\| 1[[:space:]]+\|'
 
   echo; bold "═══ 3. Data gate: column masks ═══"
   dim "engineer (bob, carol) gets masks; analyst-only alice is the unmasked control."
   run ok carol "GRANT SELECT ON $T TO ROLE \"engineer\"" "grant engineer read access"
-  query_policy acdemo-mask-amount "$(cat <<JSON
-{"service":"query","name":"acdemo-mask-amount","policyType":1,"isEnabled":true,
- "resources":{"database":{"values":["$NS"]},"table":{"values":["orders"]},"column":{"values":["amount"]}},
- "dataMaskPolicyItems":[{"roles":["engineer"],"accesses":[{"type":"select","isAllowed":true}],
- "dataMaskInfo":{"dataMaskType":"MASK_NULL"}}]}
-JSON
-)"
-  query_policy acdemo-mask-ssn "$(cat <<JSON
-{"service":"query","name":"acdemo-mask-ssn","policyType":1,"isEnabled":true,
- "resources":{"database":{"values":["$NS"]},"table":{"values":["orders"]},"column":{"values":["ssn"]}},
- "dataMaskPolicyItems":[{"roles":["engineer"],"accesses":[{"type":"select","isAllowed":true}],
- "dataMaskInfo":{"dataMaskType":"MASK_SHOW_LAST_4"}}]}
-JSON
-)"
-  query_policy acdemo-mask-email "$(cat <<JSON
-{"service":"query","name":"acdemo-mask-email","policyType":1,"isEnabled":true,
- "resources":{"database":{"values":["$NS"]},"table":{"values":["orders"]},"column":{"values":["email"]}},
- "dataMaskPolicyItems":[{"roles":["engineer"],"accesses":[{"type":"select","isAllowed":true}],
- "dataMaskInfo":{"dataMaskType":"MASK_HASH"}}]}
-JSON
-)"
+  run ok carol "CREATE OR REPLACE POLICY \"acdemo-mask-amount\" ON TABLE $T \
+COLUMN MASK MASK_NULL TO ROLE engineer ON COLUMN amount" \
+    "create the Ranger-backed amount mask through SQL"
+  run ok carol "CREATE OR REPLACE POLICY \"acdemo-mask-ssn\" ON TABLE $T \
+COLUMN MASK MASK_SHOW_LAST_4 TO ROLE engineer ON COLUMN ssn" \
+    "create the Ranger-backed SSN mask through SQL"
+  run ok carol "CREATE OR REPLACE POLICY \"acdemo-mask-email\" ON TABLE $T \
+COLUMN MASK MASK_HASH TO ROLE engineer ON COLUMN email" \
+    "create the Ranger-backed email mask through SQL"
   run ok bob "SELECT id, amount, ssn, email FROM $T ORDER BY id" \
     "bob (engineer): amount NULL, ssn xxx-xx-NNNN, email an HMAC digest, still 3 rows" \
     'xxx-xx-1111.*[0-9a-f]{64}|[0-9a-f]{64}' '111-11-1111'
@@ -379,13 +319,9 @@ JSON
     '111-11-1111' 'xxx-xx-'
 
   echo; bold "═══ 4. Data gate: row filter ═══"
-  query_policy acdemo-rowfilter "$(cat <<JSON
-{"service":"query","name":"acdemo-rowfilter","policyType":2,"isEnabled":true,
- "resources":{"database":{"values":["$NS"]},"table":{"values":["orders"]}},
- "rowFilterPolicyItems":[{"roles":["engineer"],"accesses":[{"type":"select","isAllowed":true}],
- "rowFilterInfo":{"filterExpr":"region = 'EU'"}}]}
-JSON
-)"
+  run ok carol "CREATE OR REPLACE POLICY \"acdemo-rowfilter\" ON TABLE $T \
+ROW FILTER TO ROLE engineer USING (region = 'EU')" \
+    "create the Ranger-backed EU row filter through SQL"
   run ok bob "SELECT id, region FROM $T ORDER BY id" \
     "bob sees only the EU rows (1 and 3)" '\(2 rows\)' 'US'
   run ok alice "SELECT id, region FROM $T ORDER BY id" \
@@ -396,32 +332,53 @@ JSON
   run ok carol "ALTER TABLE $T SET TAGS (region = ('GEO'))" \
     "tag the region column with GEO, stored in the sqe.column-tags property"
   run ok carol "SHOW TAGS ON $T" "read the association back"
-  ensure_tag_service || { red "tag service setup failed; skipping the tag demo"; FAIL=$((FAIL+1)); }
-  # The mask type MUST be component-qualified. Ranger's tag servicedef defines
-  # only `hive:MASK_NULL`, `trino:...` and friends, never the bare name.
-  # MASK, not MASK_NULL. A tag carrying NO rule also nullifies the column
-  # (fail-closed), so a NULL result cannot distinguish "the tag rule applied"
-  # from "there was no rule and SQE denied". Full redact makes EU -> XX, which
-  # only a working rule can produce. An earlier draft of this script used
-  # MASK_NULL and passed while the policy POST was silently failing.
-  tag_policy acdemo-tag-mask "$(cat <<JSON
-{"service":"$TAG_SERVICE","name":"acdemo-tag-mask","policyType":1,"isEnabled":true,
- "resources":{"tag":{"values":["GEO"]}},
- "dataMaskPolicyItems":[{"roles":["engineer"],"accesses":[{"type":"hive:select","isAllowed":true}],
- "dataMaskInfo":{"dataMaskType":"hive:MASK"}}]}
-JSON
-)"
+  # SQE discovers Ranger's linked tag service and component-qualifies the mask
+  # and access types when it persists this statement.
+  run ok carol "CREATE OR REPLACE POLICY \"acdemo-tag-mask\" ON TAG GEO \
+COLUMN MASK MASK TO ROLE engineer" \
+    "create a tag-based full-redaction mask through SQL"
   run ok bob "SELECT id, region FROM $T ORDER BY id" \
     "bob: region redacted to XX by the TAG rule, with no column named in the policy" \
     'XX' 'EU'
   run ok alice "SELECT id, region FROM $T ORDER BY id" \
     "alice (not engineer): region raw, so the tag rule is role-scoped too" 'EU' 'XX'
 
-  echo; bold "=== 5b. Tag fail-closed: an UNMAPPABLE rule hides the column ==="
-  dim "Two different things, easy to conflate. A tag with NO rule is inert: nothing"
-  dim "is being enforced, so the column comes back raw. A tag WITH a rule SQE"
-  dim "cannot map is a protection it cannot honour, so the column is restricted."
-  dim "Verified both ways while writing this script."
+  # One assertion over one plan: the row filter and every mask must compose.
+  # Counting each expected transformation catches a policy silently dropping
+  # out while avoiding a brittle match against the CLI's table layout.
+  run ok bob "SELECT count(*) AS rows_seen, \
+sum(CASE WHEN region = 'XX' THEN 1 ELSE 0 END) AS tag_masked, \
+sum(CASE WHEN amount IS NULL THEN 1 ELSE 0 END) AS amount_nullified, \
+sum(CASE WHEN ssn LIKE 'xxx-xx-%' THEN 1 ELSE 0 END) AS ssn_masked, \
+sum(CASE WHEN length(email) = 64 THEN 1 ELSE 0 END) AS email_hashed \
+FROM $T" \
+    "bob: row filter + three resource masks + tag mask compose in one plan" \
+    '\| 2[[:space:]]+\| 2[[:space:]]+\| 2[[:space:]]+\| 2[[:space:]]+\| 2[[:space:]]+\|'
+
+  echo; bold "=== 5a. Resource and tag mask precedence on the same column ==="
+  dim "SQE's contract is that a resource-specific mask wins over a tag mask."
+  run ok carol "ALTER TABLE $T SET TAGS (ssn = ('PII_NULL'))" \
+    "tag ssn while its resource MASK_SHOW_LAST_4 policy remains active"
+  run ok carol "CREATE OR REPLACE POLICY \"acdemo-tag-ssn-null\" ON TAG PII_NULL \
+COLUMN MASK MASK_NULL TO ROLE engineer" \
+    "create the competing tag mask through SQL"
+  run ok bob "SELECT count(*) AS rows_seen, \
+sum(CASE WHEN ssn LIKE 'xxx-xx-%' THEN 1 ELSE 0 END) AS resource_mask_wins, \
+sum(CASE WHEN ssn IS NULL THEN 1 ELSE 0 END) AS tag_mask_wins \
+FROM $T" \
+    "bob: row filter keeps two rows and the resource mask beats the tag mask" \
+    '\| 2[[:space:]]+\| 2[[:space:]]+\| 0[[:space:]]+\|'
+  run ok alice "SELECT count(*) AS rows_seen, \
+sum(CASE WHEN ssn IN ('111-11-1111','222-22-2222','333-33-3333') THEN 1 ELSE 0 END) AS raw_ssn, \
+sum(CASE WHEN ssn IS NULL THEN 1 ELSE 0 END) AS null_ssn \
+FROM $T" \
+    "alice: both masks are role-scoped, so all three SSNs remain raw" \
+    '\| 3[[:space:]]+\| 3[[:space:]]+\| 0[[:space:]]+\|'
+  run ok carol "ALTER TABLE $T UNSET TAGS (ssn)" "remove the precedence-test tag"
+
+  echo; bold "=== 5b. SQL validation rejects an incomplete CUSTOM mask ==="
+  dim "A tag with no policy is inert, so the column comes back raw. Policy SQL"
+  dim "also prevents an administrator from creating CUSTOM without USING."
   run ok carol "ALTER TABLE $T UNSET TAGS (region)" "clear the GEO tag first"
   run ok carol "ALTER TABLE $T SET TAGS (region = ('NO_RULE_FOR_THIS'))" \
     "tag region with a tag that has no policy anywhere"
@@ -430,19 +387,11 @@ JSON
   run ok bob "SELECT id, region FROM $T ORDER BY id" \
     "bob: region is RAW. A tag with no rule enforces nothing" 'EU' 'XX'
 
-  # An unmappable rule: hive:CUSTOM with no valueExpr has nothing to substitute,
-  # so SQE cannot build the mask and must restrict the column instead of
-  # returning it. Same contract as a mask type from another component's prefix.
-  tag_policy acdemo-tag-broken "$(cat <<JSON
-{"service":"$TAG_SERVICE","name":"acdemo-tag-broken","policyType":1,"isEnabled":true,
- "resources":{"tag":{"values":["NO_RULE_FOR_THIS"]}},
- "dataMaskPolicyItems":[{"roles":["engineer"],"accesses":[{"type":"hive:select","isAllowed":true}],
- "dataMaskInfo":{"dataMaskType":"hive:CUSTOM"}}]}
-JSON
-)"
+  run error carol "CREATE OR REPLACE POLICY \"acdemo-tag-broken\" ON TAG NO_RULE_FOR_THIS \
+COLUMN MASK CUSTOM TO ROLE engineer" \
+    "SQL rejects CUSTOM without the required USING expression"
   run ok bob "SELECT id, region FROM $T ORDER BY id" \
-    "bob: region NULL now. An unmappable rule restricts rather than leaking" \
-    'region' 'EU|XX'
+    "bob: rejected policy changed nothing, so region remains raw" 'EU' 'XX'
   run ok alice "SELECT id, region FROM $T ORDER BY id" \
     "alice is unaffected: the broken rule targets engineer only" 'EU' ''
   run ok carol "ALTER TABLE $T UNSET TAGS (region)" "remove the tag again"
@@ -475,13 +424,14 @@ JSON
     "the policy carries view access types on the view NAME, not table ones" \
     'view-properties-read' 'table-data-read'
 
+  cleanup_policies "security teardown: remove SQL-managed policy"
+  sqe carol "DROP VIEW IF EXISTS $V" >/dev/null 2>&1
+
   echo
   bold "─────────────────────────────────────────────"
   if [ "$FAIL" -eq 0 ]; then green "all $PASS steps behaved as documented"; else red "$FAIL of $((PASS+FAIL)) steps did NOT match the documented behaviour"; fi
   bold "─────────────────────────────────────────────"
 
-  cleanup_policies
-  sqe carol "DROP VIEW IF EXISTS $V" >/dev/null 2>&1
   dim "stack left running; tear down with: (cd $STACK_DIR && docker compose down)"
 
   [ "$FAIL" -eq 0 ] || exit 1

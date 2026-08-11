@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use datafusion::catalog::SchemaProvider;
 use datafusion::datasource::ViewTable;
 use datafusion::datasource::TableProvider;
-use datafusion::error::Result as DFResult;
+use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::prelude::{SessionConfig, SessionContext};
 use iceberg::NamespaceIdent;
 use moka::sync::Cache as SyncCache;
@@ -29,6 +29,12 @@ const TABLE_NAMES_TTL_SECS: u64 = 5;
 /// require a running Polaris). Issue #238.
 fn name_exists_in(names: &[String], name: &str) -> bool {
     names.iter().any(|n| n == name)
+}
+
+/// A view lookup is valid only when the catalog confirms the table is absent.
+/// Authorization and infrastructure failures must reach the client unchanged.
+fn should_try_view_after_table_error(error: &sqe_core::SqeError) -> bool {
+    error.error_code() == sqe_core::SqeErrorCode::TableNotFound
 }
 
 /// DataFusion `SchemaProvider` that maps an Iceberg namespace to a DataFusion schema.
@@ -297,8 +303,13 @@ impl SchemaProvider for SqeSchemaProvider {
                     }
                 }
             }
-            Err(e) => {
+            Err(e) if should_try_view_after_table_error(&e) => {
                 debug!(table = name, error = %e, "Not found as table, trying view");
+            }
+            Err(e) => {
+                // Swallowing a Polaris 403 here turns AccessDenied into
+                // DataFusion's misleading "table not found" response.
+                return Err(DataFusionError::External(Box::new(e)));
             }
         }
 
@@ -429,6 +440,21 @@ mod tests {
         // Existence is case-sensitive and exact, mirroring catalog identifiers.
         assert!(!name_exists_in(&names, "Orders"));
         assert!(!name_exists_in(&[], "orders"));
+    }
+
+    #[test]
+    fn view_fallback_is_limited_to_a_genuine_table_miss() {
+        let missing = sqe_core::SqeError::Catalog(
+            "Failed to load table: HTTP 404 Not Found: orders".into(),
+        );
+        let denied = sqe_core::SqeError::sourced(
+            sqe_core::SqeErrorCode::AccessDenied,
+            "Access denied: Failed to load table",
+            std::io::Error::new(std::io::ErrorKind::PermissionDenied, "403 Forbidden"),
+        );
+
+        assert!(should_try_view_after_table_error(&missing));
+        assert!(!should_try_view_after_table_error(&denied));
     }
 
     /// Issue #238: a warm `table_names_cache` serves repeated existence probes

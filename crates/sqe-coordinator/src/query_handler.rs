@@ -865,7 +865,24 @@ impl QueryHandler {
         // Check result cache for read queries (before execution)
         if let StatementKind::Query(_) = &kind {
             if let Some(ref cache) = self.query_cache {
-                if let Some(cached) = cache.lookup(&session.user.username, sql) {
+                let authorized = cache
+                    .lookup_authorized(&session.user.username, sql, |cached| async move {
+                        self.authorize_cached_tables(session, &cached.tables_touched)
+                            .await
+                    })
+                    .await;
+                // On denial (or an authorization-check transport failure), the
+                // cache entry has already been evicted. Continue through normal
+                // planning so the standard error/audit/metrics path reports the
+                // authoritative catalog outcome instead of returning early.
+                if let Err(ref error) = authorized {
+                    debug!(
+                        username = %session.user.username,
+                        error = %error,
+                        "Cached result failed authorization revalidation"
+                    );
+                }
+                if let Ok(Some(cached)) = authorized {
                     debug!(username = %session.user.username, "Cache hit");
                     let rows: usize = cached.batches.iter().map(|b| b.num_rows()).sum();
                     self.query_tracker.complete(&query_id, rows, 0, cached.tables_touched.clone(), 0, 0, 0, 0);
@@ -1050,15 +1067,13 @@ impl QueryHandler {
                 StatementKind::ShowMaskingPolicies(ref name) => {
                     self.handle_show_masking_policies(session, name.as_deref()).await
                 }
+                StatementKind::PolicyDdl(ref stmt) => self.handle_policy_ddl(session, stmt).await,
 
-                // DDL/DML invalidation scope (issue #11): a 50 ms SessionContext
-                // rebuild on cache miss multiplied by every active user's next
-                // query is a real cost on multi-tenant deployments running dbt.
-                // Most table mutations only need the writer's cache flushed;
-                // other users will refresh on their normal 5-minute TTL. Cross-
-                // user invalidation is reserved for changes that affect the
-                // schema/catalog name list (RENAME, CREATE/DROP SCHEMA,
-                // ATTACH/DETACH).
+                // DDL invalidation scope (issue #11): metadata-only changes
+                // generally flush the writer, while namespace/name-list changes
+                // flush every user. Successful Iceberg DML is handled separately
+                // below: snapshots are shared state, so INSERT/DELETE/UPDATE/MERGE
+                // must invalidate every user's snapshot-bound TableProvider.
                 StatementKind::Drop(stmt) => {
                     self.catalog_ops.drop_table(session, stmt).await?;
                     crate::session_context::invalidate_session_cache(&session.user.username).await;
@@ -1584,6 +1599,28 @@ impl QueryHandler {
         ) && matches!(&result, Ok(batches) if batches.is_empty())
         {
             result = Ok(crate::write_handler::affected_rows_batch(0));
+        }
+
+        // Iceberg DML changes the table snapshot for every user. A cached
+        // DataFusion TableProvider is bound to the snapshot from which it was
+        // constructed, so invalidating only the writer lets another user plan
+        // a write or read against stale files until the session-cache TTL.
+        //
+        // The catalog bridge separately evicts matching metadata entries when
+        // the commit updates the table. Both layers therefore refresh without
+        // discarding unrelated tables and catalog clients.
+        if result.is_ok()
+            && matches!(
+                kind,
+                StatementKind::Insert(_)
+                    | StatementKind::Ctas(_)
+                    | StatementKind::Merge(_)
+                    | StatementKind::Delete(_)
+                    | StatementKind::Update(_)
+                    | StatementKind::Truncate(_)
+            )
+        {
+            crate::session_context::invalidate_all_session_caches().await;
         }
 
         // Record metrics and audit
@@ -3555,6 +3592,67 @@ impl QueryHandler {
         .await
     }
 
+    /// Revalidate every physical Iceberg table behind a cached query result.
+    ///
+    /// The result cache is keyed by user + SQL, but an out-of-band Ranger
+    /// REVOKE changes neither. Polaris remains the authority: each table gets
+    /// a lightweight `HEAD loadTable` check before cached batches are served.
+    async fn authorize_cached_tables(
+        &self,
+        session: &Session,
+        tables: &[String],
+    ) -> sqe_core::Result<()> {
+        if tables.is_empty() {
+            return Ok(());
+        }
+
+        let (_ctx, fallback) = self.create_session_context(session).await?;
+        for table in tables {
+            let parts = split_qualified_identifier(table);
+            if parts.is_empty() {
+                continue;
+            }
+
+            let (catalog, namespace, bare) = match parts.as_slice() {
+                [bare] => (
+                    None,
+                    session.default_schema.as_deref().unwrap_or("default"),
+                    bare.as_str(),
+                ),
+                [namespace, bare] => (None, namespace.as_str(), bare.as_str()),
+                [.., catalog, namespace, bare] => {
+                    (Some(catalog.as_str()), namespace.as_str(), bare.as_str())
+                }
+                [] => continue,
+            };
+
+            // DataFusion scratch tables and SQE's virtual metadata schemas do
+            // not map to Polaris loadTable endpoints.
+            if matches!(catalog, Some("datafusion" | "system"))
+                || namespace.eq_ignore_ascii_case("information_schema")
+                || namespace.eq_ignore_ascii_case("runtime")
+                || namespace.eq_ignore_ascii_case("metadata")
+            {
+                continue;
+            }
+
+            let catalog = match catalog {
+                Some(name) => self.show_catalog(session, Some(name)).await?,
+                None if session.default_catalog.is_some() => {
+                    self.show_catalog(session, session.default_catalog.as_deref())
+                        .await?
+                }
+                None => Arc::clone(&fallback),
+            };
+            let ident = iceberg::TableIdent::new(
+                iceberg::NamespaceIdent::new(namespace.to_string()),
+                bare.to_string(),
+            );
+            catalog.authorize_table_access(&ident).await?;
+        }
+        Ok(())
+    }
+
     /// Handle SHOW CREATE TABLE by querying information_schema and reconstructing DDL.
     async fn handle_show_create_table(
         &self,
@@ -4738,6 +4836,9 @@ impl QueryHandler {
         // Flush the policy cache only after the mutation succeeds so the new
         // grant is visible on the next query (issue #207).
         self.invalidate_policy_cache();
+        if let Some(cache) = &self.query_cache {
+            cache.invalidate_all();
+        }
         Ok(vec![])
     }
 
@@ -4771,6 +4872,9 @@ impl QueryHandler {
         // Flush the policy cache only after the mutation succeeds so the
         // revoked grant stops working immediately (issue #207).
         self.invalidate_policy_cache();
+        if let Some(cache) = &self.query_cache {
+            cache.invalidate_all();
+        }
         Ok(vec![])
     }
 
@@ -4793,6 +4897,9 @@ impl QueryHandler {
         deny_stmt.grantor = Some(session.user.username.clone());
         backend.deny(session.access_token().expose(), &deny_stmt).await?;
         self.invalidate_policy_cache();
+        if let Some(cache) = &self.query_cache {
+            cache.invalidate_all();
+        }
         Ok(vec![])
     }
 
@@ -4983,12 +5090,16 @@ impl QueryHandler {
             }
         };
 
+        // SHOW EFFECTIVE POLICY must answer with the precedence the rewriter
+        // will actually apply, or the introspection statement becomes a second,
+        // silently divergent implementation of the contract.
         let policy = sqe_policy::plan_rewriter::resolve_effective_policy(
             store,
             &target,
             &table_name,
             &namespace,
             &col_tags,
+            self.config.policy.mask_precedence,
         )
         .await;
 
@@ -5127,6 +5238,41 @@ impl QueryHandler {
             policies.retain(|p| p.name.eq_ignore_ascii_case(want));
         }
         Self::mask_policies_to_record_batch(&policies)
+    }
+
+    /// Author Ranger masks and row filters through SQL. Ranger remains the
+    /// source of truth, so Spark/Kyuubi observes the same policy on its next
+    /// policy refresh.
+    async fn handle_policy_ddl(
+        &self,
+        session: &Session,
+        stmt: &sqe_sql::policy_ddl::PolicyDdlStatement,
+    ) -> sqe_core::Result<Vec<RecordBatch>> {
+        use sqe_sql::policy_ddl::PolicyDdlStatement;
+
+        self.require_admin(
+            session,
+            match stmt {
+                PolicyDdlStatement::Create(_) => "CREATE POLICY",
+                PolicyDdlStatement::Drop(_) => "DROP POLICY",
+            },
+        )?;
+        let store = self.policy_store.as_ref().ok_or_else(|| {
+            SqeError::Execution(
+                "Policy DDL is not available: no policy backend is configured. \
+                 It needs [policy] engine = \"ranger\"."
+                    .to_string(),
+            )
+        })?;
+        match stmt {
+            PolicyDdlStatement::Create(create) => store.create_policy(create).await?,
+            PolicyDdlStatement::Drop(drop) => store.drop_policy(drop).await?,
+        }
+        self.invalidate_policy_cache();
+        if let Some(cache) = &self.query_cache {
+            cache.invalidate_all();
+        }
+        Ok(vec![])
     }
 
     /// Turn `SET MASKING POLICY p` into the equivalent column-tag operation.

@@ -2711,6 +2711,32 @@ pub struct PolicyConfig {
     /// Ranger fine-grained backend tuning. Used only when `engine = "ranger"`.
     #[serde(default)]
     pub ranger: RangerPolicyConfig,
+    /// Which mask wins when a column carries both a resource mask and a tag mask.
+    ///
+    /// Defaults to `tag`, matching the standard Ranger plugin order that
+    /// Hive and Spark/Kyuubi implement, so the same policy set renders the same
+    /// values in SQE and Spark. Set `resource` for the narrower
+    /// most-specific-rule-wins reading SQE shipped before.
+    #[serde(default)]
+    pub mask_precedence: MaskPrecedence,
+}
+
+/// Resolution order for a column that a resource mask and a tag mask both cover.
+///
+/// This is a genuine fork in the Ranger data model rather than a bug on either
+/// side. A resource policy names the column outright, so "most specific rule
+/// wins" argues for `Resource`. Ranger's own plugin evaluates tag policies first
+/// and stops at the first mask it finds, so "same policy, same answer in every
+/// engine" argues for `Tag`. Either choice masks the column; only the rendering
+/// differs, which is why this is configurable rather than fixed.
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum MaskPrecedence {
+    /// Tag mask wins. Matches Hive and Spark/Kyuubi.
+    #[default]
+    Tag,
+    /// Resource mask wins. The most-specific-rule reading.
+    Resource,
 }
 
 /// Fine-grained policy engine backed by a `hive`-type Apache Ranger service.

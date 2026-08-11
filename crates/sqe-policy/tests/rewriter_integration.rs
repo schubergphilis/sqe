@@ -20,6 +20,7 @@ use datafusion::datasource::{provider_as_source, MemTable};
 use datafusion::logical_expr::{col, lit, Expr, LogicalPlan, LogicalPlanBuilder};
 use datafusion::prelude::SessionContext;
 
+use sqe_core::config::MaskPrecedence;
 use sqe_core::SessionUser;
 use sqe_policy::policy_store::InMemoryPolicyStore;
 use sqe_policy::tag_source::TagSource;
@@ -914,18 +915,31 @@ async fn tag_source_receives_full_multilevel_namespace() {
     );
 }
 
-/// Test 3 -- resource mask wins over tag mask.
+/// Test 3 -- a column covered by both a resource mask and a tag mask, executed
+/// end to end under each precedence setting.
 ///
-/// A resource policy (from `resolve`) already carries `ssn -> Redact("***")`.
-/// The tag source returns `{"ssn": ["PII"]}` and `resolve_tags` returns
-/// `{"PII": MaskType::Hash}`. The resource mask must win: ssn shows "***",
-/// not a 64-char SHA-256 hex string.
+/// A resource policy (from `resolve`) carries `ssn -> Redact("***")` while the
+/// tag path offers `PII -> MaskType::Hash`. Exactly one of them reaches the
+/// output, and which one is the whole question: `Tag` (the default, matching
+/// Hive and Spark/Kyuubi) yields a 64-char hex digest, `Resource` yields "***".
+/// The two renderings cannot be confused, which is what makes this a real
+/// discriminator rather than a smoke test.
 ///
-/// Proves the precedence rule: resource mask wins over tag mask (rule 2 of
-/// `merge_tag_masks` contract). A Hash result would be a 64-char hex string,
-/// so the constant "***" is an unambiguous discriminator.
+/// Whichever wins, the raw SSN must never appear.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn resource_mask_wins_over_tag_mask() {
+async fn contested_column_uses_the_tag_mask_by_default() {
+    run_contested_column(MaskPrecedence::Tag).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn contested_column_uses_the_resource_mask_when_configured() {
+    run_contested_column(MaskPrecedence::Resource).await;
+}
+
+/// First row of the shared fixture; see `build_multilevel_scan_with_mem`.
+const RAW_SSN: &str = "111-11-1111";
+
+async fn run_contested_column(precedence: MaskPrecedence) {
     let (mem, scan) = build_multilevel_scan_with_mem();
 
     let tref = TableReference::full("cat", "ns1.ns2", "employees");
@@ -954,7 +968,8 @@ async fn resource_mask_wins_over_tag_mask() {
         .with_tag_mask("PII", MaskType::Hash);
 
     let rewriter = PolicyPlanRewriter::new(Arc::new(store))
-        .with_tag_source(Arc::new(fake_source));
+        .with_tag_source(Arc::new(fake_source))
+        .with_mask_precedence(precedence);
     let (rewritten, _summary) = rewriter.evaluate(&user("bob", &[]), plan).await.unwrap();
 
     let batches = execute_multilevel(rewritten, mem).await;
@@ -969,12 +984,19 @@ async fn resource_mask_wins_over_tag_mask() {
         .unwrap()
         .clone();
     for i in 0..ssn_col.len() {
-        assert_eq!(
-            ssn_col.value(i),
-            "***",
-            "resource Redact(\"***\") must win over tag Hash (row {})",
-            i
-        );
+        let got = ssn_col.value(i);
+        assert_ne!(got, RAW_SSN, "{precedence:?}: raw SSN leaked (row {i})");
+        match precedence {
+            MaskPrecedence::Resource => assert_eq!(
+                got, "***",
+                "{precedence:?}: the named-column Redact must win (row {i})"
+            ),
+            MaskPrecedence::Tag => assert_eq!(
+                got.len(),
+                64,
+                "{precedence:?}: expected a 64-char tag Hash, got {got:?} (row {i})"
+            ),
+        }
     }
 }
 
@@ -1398,4 +1420,53 @@ async fn row_filter_on_an_unprojected_column_is_enforced_not_an_error() {
         vec!["customer_id".to_string(), "ssn".to_string()],
         "the projection must be restored; `region` must not leak into the output"
     );
+}
+
+/// `SHOW EFFECTIVE POLICY` must report the resolution the rewriter will apply.
+///
+/// The diagnostic path is a second caller of `merge_tag_masks`, reached through
+/// `resolve_effective_policy` rather than through `evaluate`. If it stops taking
+/// the precedence setting, it keeps compiling and starts telling operators that
+/// a column is masked one way while queries mask it another. An introspection
+/// statement that disagrees with enforcement is worse than none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn effective_policy_reports_the_precedence_the_rewriter_applies() {
+    for precedence in [MaskPrecedence::Tag, MaskPrecedence::Resource] {
+        let mut resource_policy = ResolvedPolicy::default();
+        resource_policy
+            .column_masks
+            .insert("ssn".to_string(), MaskType::Redact("***".to_string()));
+        let store = TagTestStore::new()
+            .with_resource_policy(resource_policy)
+            .with_tag_mask("PII", MaskType::Nullify);
+
+        let mut col_tags = HashMap::new();
+        col_tags.insert("ssn".to_string(), vec!["PII".to_string()]);
+
+        let got = sqe_policy::plan_rewriter::resolve_effective_policy(
+            &store,
+            &user("bob", &[]),
+            "employees",
+            "ns1.ns2",
+            &col_tags,
+            precedence,
+        )
+        .await;
+
+        // MaskType has no PartialEq, so match the variant the setting selects.
+        let got_mask = got
+            .column_masks
+            .get("ssn")
+            .unwrap_or_else(|| panic!("{precedence:?}: ssn must be masked"));
+        match precedence {
+            MaskPrecedence::Tag => assert!(
+                matches!(got_mask, MaskType::Nullify),
+                "{precedence:?}: expected the tag Nullify, got {got_mask:?}"
+            ),
+            MaskPrecedence::Resource => assert!(
+                matches!(got_mask, MaskType::Redact(s) if s == "***"),
+                "{precedence:?}: expected the resource Redact, got {got_mask:?}"
+            ),
+        }
+    }
 }

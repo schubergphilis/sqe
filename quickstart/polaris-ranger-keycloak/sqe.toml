@@ -79,6 +79,11 @@ s3_allow_http = true
 # unaffected. admin-password also via SQE_POLICY__RANGER__ADMIN_PASSWORD.
 [policy]
 engine = "ranger"
+# Which mask wins when a column carries both a resource mask and a tag mask.
+# "tag" matches the standard Ranger plugin order that Spark/Kyuubi implements,
+# so one policy set renders the same value in both engines. "resource" restores
+# SQE's earlier most-specific-rule-wins behaviour, at the cost of that parity.
+mask-precedence = "tag"
 
 [policy.ranger]
 url = "http://ranger-admin:6080"

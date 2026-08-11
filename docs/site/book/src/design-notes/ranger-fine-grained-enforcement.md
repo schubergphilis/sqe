@@ -98,6 +98,10 @@ expressions normalize against the real (qualified) scan schema:
 
 1. **Row filters** inject as `Filter` nodes above the `TableScan`. User
    predicates can push through these (same semantics as a user `WHERE`).
+   The filter sits *below* the masking projection, so it is evaluated against
+   stored values: masking a column that a row filter reads does not change which
+   rows survive. Kyuubi orders these two the other way around, which is why
+   `scripts/access-control-parity-demo.sh` pins the difference.
 2. **Column masks** replace the column reference in a projection with the masking
    expression, aliased back to the column's qualified name. User predicates
    cannot push through a mask expression (the expression boundary blocks
@@ -356,9 +360,14 @@ returns a three-tuple:
 locked precedence contract:
 
 1. **Restricted columns always win.** A tag cannot un-restrict a column.
-2. **Resource masks win over tag masks.** A column already carrying a mask from
-   `resolve()` keeps it; a tag mask does not overwrite it. A resource mask is
-   sufficient protection, so an unmappable tag does not also restrict it.
+2. **Tag masks win over resource masks, by default.** `policy.mask-precedence`
+   selects this: `tag` (the default) matches the standard Ranger plugin order
+   that Hive and Spark/Kyuubi implement, so one policy set renders one value in
+   every engine. `resource` keeps the narrower most-specific-rule-wins reading
+   SQE shipped earlier. Either way the column is masked, and either way an
+   unmappable tag never strips or restricts a column that already has a working
+   resource mask: replacing a readable masked value with NULL is not an
+   improvement.
 3. **Tag row filters are ANDed with resource row filters** (most restrictive).
 4. **Within a column, the first tag in stored order with a matching mask wins**
    (deterministic, since `col_tags` preserves the parsed JSON order).
@@ -379,10 +388,10 @@ There are three authoring surfaces, one per layer.
 - **Coarse catalog layer.** SQL `GRANT` / `REVOKE`. The access-control backend
   writes the `polaris` Ranger service; Polaris enforces. See
   [Ranger access control](./ranger-access-control.md).
-- **Fine-grained row filters and column masks.** Authored as policies on the
-  `hive` Ranger service (row-filter policyType 2, data-mask policyType 1),
-  through the Ranger Admin UI or REST. SQE downloads and enforces them. The same
-  policies enforce in Spark/Kyuubi.
+- **Fine-grained row filters and column masks.** SQL `CREATE OR REPLACE POLICY`
+  / `DROP POLICY` writes the `hive` Ranger service (row-filter policyType 2,
+  data-mask policyType 1). SQE downloads and enforces them. The same policies
+  enforce in Spark/Kyuubi. Ranger UI/REST remains an external authoring path.
 - **Tag-to-column associations.** `ALTER TABLE ... SET TAGS / UNSET TAGS` (the
   Snowflake `MODIFY|ALTER COLUMN ... SET TAG` forms work too). The DDL writes the
   `sqe.column-tags` table property. The mask-per-tag rule itself is a `hive`/`tag`
@@ -390,7 +399,7 @@ There are three authoring surfaces, one per layer.
 
 ### Propagation delay, per surface
 
-The two SQL surfaces take effect immediately: `GRANT`, `REVOKE` and
+The SQL surfaces take effect immediately: `GRANT`, `REVOKE`, policy DDL and
 `SET TAGS` / `UNSET TAGS` flush the resolved-policy cache after the mutation
 commits, so the next query re-resolves (issue #207).
 
@@ -415,7 +424,7 @@ by `cache_ttl_bounds_policy_staleness`.
 | Config block | `[access_control] backend = "ranger"` | `[policy] engine = "ranger"` |
 | Ranger service | `polaris` | `hive` (+ linked `tag`) |
 | Granularity | catalog / namespace / table allow-deny | row filters, column masks, restricted columns, tag masks |
-| Authored via | SQL `GRANT` / `REVOKE` | Ranger UI/REST + `ALTER TABLE SET TAGS` for tags |
+| Authored via | SQL `GRANT` / `REVOKE` | SQL `CREATE/DROP POLICY` + `ALTER TABLE SET TAGS` (Ranger UI/REST also supported) |
 | Enforced by | Polaris embedded authorizer | SQE `PolicyPlanRewriter` (plan rewrite) |
 | Does SQE filter? | No (write/read policies only) | Yes (rewrites the plan) |
 | Shared with Spark? | No (Polaris-specific service) | Yes (the `query` service Kyuubi reads) |

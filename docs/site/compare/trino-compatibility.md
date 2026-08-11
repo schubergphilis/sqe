@@ -387,6 +387,8 @@ Each section lists Trino functions with their SQE status:
 | `ALTER TABLE ... SET/DROP NOT NULL` | Same | ✅ | |
 | `ALTER TABLE ... SET PROPERTIES` | `ALTER TABLE ... SET TBLPROPERTIES` | ✅ | Iceberg TableUpdate::SetProperties |
 | `CREATE VIEW` | Same | ✅ | Iceberg views |
+| `CREATE VIEW ... COMMENT '<text>'` | Same | ✅ | Stored as the view's `comment` property |
+| `CREATE VIEW ... SECURITY DEFINER \| INVOKER` | Accepted, recorded | ⚠️ | SQE always evaluates views as INVOKER (no service account to run as the definer). Recorded in `sqe.view-security`; stricter than DEFINER, so it fails closed |
 | `DROP VIEW` | Same | ✅ | |
 | `CREATE OR REPLACE VIEW` | Same | ✅ | Drop + recreate (non-atomic) |
 | `CREATE MATERIALIZED VIEW` | — | ❌ | Not in Iceberg spec; use CTAS + scheduled refresh |
