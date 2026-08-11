@@ -123,6 +123,8 @@ SELECT * FROM analytics.events FOR VERSION AS OF 'dev_2026_05';
 | `CREATE [OR REPLACE] VIEW v AS SELECT ...` | `sqlparser-rs` + `sqe-coordinator` | Standard SQL view. Iceberg views format-version 1. | yes | yes | yes | yes |
 | `CREATE [OR REPLACE] VIEW v (col1, col2) AS SELECT ...` | `sqlparser-rs` + `sqe-coordinator` | Explicit column list. | yes | yes | yes | yes |
 | `DROP VIEW [IF EXISTS] v` | `sqlparser-rs` + `sqe-coordinator` | Remove a view. | yes | yes | yes | yes |
+| `CREATE VIEW v COMMENT '<text>' AS ...` | `sqe-sql` `view_compat` + `sqe-coordinator` | Trino's comment spelling, without `=`. Stored as the view's `comment` property. | yes | no | no | no |
+| `CREATE VIEW v SECURITY {DEFINER \| INVOKER} AS ...` | `sqe-sql` `view_compat` + `sqe-coordinator` | Accepted and recorded. See below: `DEFINER` is not enforced. | yes | no | no | no |
 
 ```sql
 CREATE OR REPLACE VIEW analytics.recent_events AS
@@ -131,6 +133,34 @@ WHERE occurred_at >= now() - INTERVAL '7' DAY;
 
 DROP VIEW IF EXISTS analytics.recent_events;
 ```
+
+### `SECURITY DEFINER` is recorded, not enforced
+
+Trino's `SECURITY DEFINER` runs a view with its creator's privileges, so a reader
+needs access to the view but not to its base tables. `SECURITY INVOKER` checks the
+querying user against the base tables instead.
+
+**SQE always behaves as `INVOKER`**, and that is architectural rather than
+unfinished. Every query runs as the authenticated user via bearer-token
+passthrough, with no service account anywhere in the engine, so there is no
+credential to run a view as its definer with. Honouring `DEFINER` would mean
+storing one.
+
+The clause is accepted because rejecting it blocks every dbt model that uses the
+default `view` materialization, and because the direction of the difference is
+safe: `INVOKER` is stricter than `DEFINER` asks for, so a reader who was meant to
+be shielded from base-table grants is denied rather than allowed. It fails closed.
+
+What SQE does with it:
+
+| | |
+|---|---|
+| Recorded as | view properties `sqe.view-security` and, for `definer`, `sqe.view-definer` |
+| Enforcement | `INVOKER` semantics: the base table is authorized as the querying user |
+| On `DEFINER` | one warning at creation, naming the reader-denial consequence |
+
+The properties live in the Iceberg view metadata, so the intent travels with the
+object and a later implementation, or another engine, can honour it.
 
 ## Drop
 
