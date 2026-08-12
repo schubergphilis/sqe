@@ -6707,6 +6707,7 @@ dependencies = [
  "arrow-array",
  "arrow-schema",
  "async-trait",
+ "chrono",
  "datafusion",
  "hex",
  "hmac 0.13.0",

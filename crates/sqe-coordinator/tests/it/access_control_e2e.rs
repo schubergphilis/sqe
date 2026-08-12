@@ -1317,6 +1317,71 @@ fn all_cells(batches: &[RecordBatch]) -> Vec<String> {
     cells
 }
 
+/// `SHOW GRANTS` must fill `granted_by` and `granted_at`, not just declare the
+/// columns.
+///
+/// It declared them and always rendered them empty. Ranger does record provenance;
+/// SQE never read it. Two layers were in the way, and only the second is obvious:
+/// `policies_to_entries` hardcoded both to `None`, AND Ranger's policy LIST
+/// endpoint (the one `show_grants` calls) omits `createdBy`/`createTime` entirely,
+/// so deserializing another field would not have helped. Measured on Ranger 2.8:
+/// the keys are absent from `/policy?serviceName=...` and present on
+/// `/service/{svc}/policy/{name}`.
+///
+/// Asserted against a LIVE Ranger rather than a mock, because the defect was in
+/// what the real endpoints return, which is exactly what a mock would have
+/// enshrined. `granted_by` is Ranger's display form of the grantor, "carol sqe"
+/// for firstName=carol lastName=sqe, so the assertion matches the first token
+/// rather than pinning the whole string.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs quickstart/polaris-ranger-keycloak; run scripts/access-control-test.sh"]
+async fn show_grants_reports_who_granted_and_when() {
+    ac_gate!();
+    let _guard = crate::common::serial().lock().await;
+    let ctx = ac_setup().await;
+
+    exec_ok(
+        &ctx,
+        &ctx.carol,
+        &format!("GRANT SELECT ON {ORDERS} TO ROLE \"analyst\""),
+    )
+    .await;
+
+    let cells = crate::common::eventually("SHOW GRANTS to report provenance", || async {
+        let batches = ctx
+            .handler
+            .execute(&ctx.carol, &format!("SHOW GRANTS ON {ORDERS}"), None)
+            .await
+            .map_err(|e| format!("SHOW GRANTS failed: {e}"))?;
+        let cells = all_cells(&batches);
+        if cells.is_empty() {
+            return Err("no grant rows yet".to_string());
+        }
+        // granted_at is rendered as UTC RFC 3339, so any row carrying provenance
+        // has a cell shaped like a timestamp.
+        if !cells.iter().any(|c| c.contains('T') && c.ends_with('Z')) {
+            return Err(format!("no granted_at timestamp in {cells:?}"));
+        }
+        Ok(cells)
+    })
+    .await;
+
+    assert!(
+        cells.iter().any(|c| c.starts_with("carol")),
+        "granted_by must name the grantor; got {cells:?}"
+    );
+    let stamp = cells
+        .iter()
+        .find(|c| c.contains('T') && c.ends_with('Z'))
+        .expect("a granted_at timestamp");
+    // Sanity-check the epoch conversion rather than just its shape: a wrong unit
+    // (seconds read as millis) lands in 1970 and would still match the shape.
+    assert!(
+        stamp.starts_with("202"),
+        "granted_at must be a plausible instant, got {stamp}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs quickstart/polaris-ranger-keycloak; run scripts/access-control-test.sh"]
 async fn show_grants_lists_both_roles() {
