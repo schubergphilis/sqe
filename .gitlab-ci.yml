@@ -252,48 +252,6 @@ vendored-profile-drift:
         - "crates/sqe-policy/assets/*.json"
 
 # ===== repo-specific integration suites (docker-in-docker), hosted here =====
-image-shape-test:
-  stage: test
-  image: docker:29
-  services:
-    - name: docker:29-dind
-      alias: docker
-      command: ["--tls=false", "--host=tcp://0.0.0.0:2375"]
-  variables:
-    DOCKER_HOST: tcp://docker:2375
-    DOCKER_TLS_CERTDIR: ""
-    DOCKER_DRIVER: overlay2
-  before_script:
-    - apk add --no-cache bash
-    - |
-      for i in $(seq 1 30); do
-        docker info >/dev/null 2>&1 && break
-        echo "waiting for docker daemon ($i/30)..."
-        sleep 2
-      done
-      docker info
-  script:
-    - ./scripts/image-shape-test.sh
-  # allow_failure on every rule: runner dind is still flaky (#387). Keep the
-  # job so a healthy runner still exercises the image shape; do not paint main
-  # red. Same treatment as integration-test / scenario-test / access-control-test,
-  # which this job missed because it landed later.
-  #
-  # The failure that prompted this never reached an assertion: 30 retries of
-  # "waiting for docker daemon", then `Cannot connect to the Docker daemon at
-  # tcp://docker:2375`. A red job here has so far meant "no dind", not "the
-  # image regressed".
-  allow_failure: true
-  rules:
-    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
-      changes:
-        - Dockerfile
-        - Cargo.lock
-        - crates/**/*
-        - scripts/image-shape-test.sh
-    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE == "push"'
-  timeout: 1h
-
 integration-test:
   stage: test
   image: docker:29
