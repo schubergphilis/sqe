@@ -677,14 +677,48 @@ impl RangerGrantBackend {
 
 // ── Ranger policy read model (subset) ─────────────────────────────────────────
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub struct RangerPolicy {
+    #[serde(default)]
+    name: Option<String>,
     #[serde(default)]
     resources: BTreeMap<String, RangerResourceValues>,
     #[serde(default, rename = "policyItems")]
     policy_items: Vec<RangerPolicyItem>,
     #[serde(default, rename = "denyPolicyItems")]
     deny_policy_items: Vec<RangerPolicyItem>,
+    /// Who Ranger recorded as the policy's creator, in its display form
+    /// ("carol sqe" for firstName=carol lastName=sqe). Ranger sets it from the
+    /// grantor SQE sends, so it is the grantor rather than the admin account.
+    ///
+    /// ABSENT from the policy LIST endpoint and present only on the per-policy
+    /// one, which is why `SHOW GRANTS` needs `fill_provenance` rather than just
+    /// deserializing another field.
+    #[serde(default, rename = "createdBy")]
+    created_by: Option<String>,
+    /// Creation time in epoch milliseconds. Same list-versus-detail caveat.
+    #[serde(default, rename = "createTime")]
+    create_time: Option<i64>,
+}
+
+/// Upper bound on per-policy provenance requests for one `SHOW GRANTS`.
+///
+/// `SHOW GRANTS ON <resource>` matches a handful of policies, but
+/// `SHOW GRANTS TO <role>` can match every policy in the service, and Ranger
+/// serves provenance one policy at a time. Rather than issue an unbounded fan-out
+/// on a statement someone typed interactively, stop here and say so in the log:
+/// the rows still come back, with `granted_by` and `granted_at` empty beyond the
+/// bound. Silently truncating would read as "nobody granted this".
+const PROVENANCE_DETAIL_LIMIT: usize = 200;
+
+/// Render Ranger's epoch-millisecond `createTime` as UTC RFC 3339.
+///
+/// Returns `None` for a value outside the representable range rather than
+/// substituting a wrong instant: an audit column that is empty is honest, one
+/// showing 1970 is not.
+fn format_grant_time(epoch_ms: i64) -> Option<String> {
+    chrono::DateTime::from_timestamp_millis(epoch_ms)
+        .map(|dt| dt.format("%Y-%m-%dT%H:%M:%SZ").to_string())
 }
 
 #[derive(Debug, Deserialize)]
@@ -727,6 +761,10 @@ pub fn policies_to_entries(policies: &[RangerPolicy]) -> Vec<GrantEntry> {
     let mut out = Vec::new();
     for p in policies {
         let resource = format_policy_resource(&p.resources);
+        // Both stay None unless `fill_provenance` fetched the per-policy record,
+        // because the list endpoint does not carry them.
+        let granted_by = p.created_by.clone();
+        let granted_at = p.create_time.and_then(format_grant_time);
         let mut push_items = |items: &[RangerPolicyItem], effect: &str| {
             for item in items {
                 for access in &item.accesses {
@@ -737,8 +775,8 @@ pub fn policies_to_entries(policies: &[RangerPolicy]) -> Vec<GrantEntry> {
                             grantee_type: "USER".into(),
                             grantee_name: u.clone(),
                             effect: effect.into(),
-                            granted_by: None,
-                            granted_at: None,
+                            granted_by: granted_by.clone(),
+                            granted_at: granted_at.clone(),
                         });
                     }
                     for r in &item.roles {
@@ -748,8 +786,8 @@ pub fn policies_to_entries(policies: &[RangerPolicy]) -> Vec<GrantEntry> {
                             grantee_type: "ROLE".into(),
                             grantee_name: r.clone(),
                             effect: effect.into(),
-                            granted_by: None,
-                            granted_at: None,
+                            granted_by: granted_by.clone(),
+                            granted_at: granted_at.clone(),
                         });
                     }
                 }
@@ -770,6 +808,39 @@ pub fn resource_matches_prefix(resource: &str, prefix: &str) -> bool {
         return true;
     }
     resource == prefix || resource.starts_with(&format!("{prefix}."))
+}
+
+/// Could this policy contribute a row for `grantee`?
+///
+/// The policy-level twin of `entry_matches_grantee`, used to decide which policies
+/// are worth a provenance request BEFORE flattening. Deliberately permissive: a
+/// false positive costs one wasted request, while a false negative would silently
+/// blank the audit columns on a row that does come back. The entry-level filter
+/// still decides what is returned.
+fn policy_names_grantee(policy: &RangerPolicy, grantee: &Grantee) -> bool {
+    let name = grantee.name();
+    policy
+        .policy_items
+        .iter()
+        .chain(policy.deny_policy_items.iter())
+        .any(|item| match grantee {
+            Grantee::User(_) => item.users.iter().any(|u| u == name),
+            Grantee::Role(_) => item.roles.iter().any(|r| r == name),
+            // RangerPolicyItem carries no groups field, so a group grantee can
+            // never produce an entry. Claim nothing rather than fetch for rows
+            // that cannot exist.
+            Grantee::Group(_) => false,
+        })
+}
+
+/// Could this policy contribute a USER row for `user`? The policy-level twin of
+/// the `show_effective` filter.
+fn policy_names_user(policy: &RangerPolicy, user: &str) -> bool {
+    policy
+        .policy_items
+        .iter()
+        .chain(policy.deny_policy_items.iter())
+        .any(|item| item.users.iter().any(|u| u == user))
 }
 
 /// Does an entry's grantee match the requested grantee (type + name)?
@@ -1349,6 +1420,60 @@ impl RangerGrantBackend {
     }
 
     /// Fetch all policies for this service from Ranger Admin.
+    /// One policy WITH its provenance, from the per-policy endpoint.
+    ///
+    /// Best effort by design: `SHOW GRANTS` answering with empty audit columns is
+    /// far better than it failing, so every error path returns `None` and leaves
+    /// the columns blank. The grants themselves already came from the list call.
+    async fn fetch_policy_provenance(&self, name: &str) -> Option<RangerPolicy> {
+        let url = format!(
+            "{}/service/public/v2/api/service/{}/policy/{}",
+            self.admin_url, self.service_name, name
+        );
+        let resp = self
+            .client
+            .get(&url)
+            .basic_auth(&self.admin_user, Some(&self.admin_password))
+            .send()
+            .await
+            .ok()?;
+        if !resp.status().is_success() {
+            debug!(
+                policy = %name,
+                status = %resp.status(),
+                "policy provenance unavailable; SHOW GRANTS will leave granted_by/granted_at empty"
+            );
+            return None;
+        }
+        resp.json::<RangerPolicy>().await.ok()
+    }
+
+    /// Copy `createdBy` / `createTime` onto the policies at `targets`.
+    ///
+    /// Ranger's policy LIST endpoint omits both fields entirely (verified against
+    /// Ranger 2.8: the keys are absent, not null), while the per-policy endpoint
+    /// carries them. `SHOW GRANTS` therefore advertised two columns it could never
+    /// fill. One request per policy is acceptable for an interactive admin
+    /// statement but not unbounded, hence `targets` (only policies the caller's
+    /// filter can return rows from) and `PROVENANCE_DETAIL_LIMIT`.
+    async fn fill_provenance(&self, policies: &mut [RangerPolicy], targets: &[usize]) {
+        if targets.len() > PROVENANCE_DETAIL_LIMIT {
+            warn!(
+                matched = targets.len(),
+                limit = PROVENANCE_DETAIL_LIMIT,
+                "too many policies match to fetch provenance for all of them; \
+                 granted_by/granted_at will be empty beyond the limit"
+            );
+        }
+        for &i in targets.iter().take(PROVENANCE_DETAIL_LIMIT) {
+            let Some(name) = policies[i].name.clone() else { continue };
+            if let Some(detail) = self.fetch_policy_provenance(&name).await {
+                policies[i].created_by = detail.created_by;
+                policies[i].create_time = detail.create_time;
+            }
+        }
+    }
+
     async fn fetch_policies(&self) -> sqe_core::Result<Vec<RangerPolicy>> {
         // Public v2 endpoint returns a bare JSON array of policies. (The
         // /service/plugins/policies/... endpoint wraps them in a paginated
@@ -1724,18 +1849,43 @@ impl GrantBackend for RangerGrantBackend {
         _token: &str,
         filter: &GrantFilter,
     ) -> sqe_core::Result<Vec<GrantEntry>> {
-        let policies = self.fetch_policies().await?;
+        let mut policies = self.fetch_policies().await?;
+
+        // Provenance costs one request per policy, so ask only about the policies
+        // this filter can actually return rows from. Every entry a policy produces
+        // carries that policy's resource, so filtering at policy level here is
+        // equivalent to the entry-level filter applied below.
+        let prefix = match filter {
+            GrantFilter::OnResource { catalog, namespace, table } => {
+                let mut parts = Vec::new();
+                if let Some(c) = catalog { parts.push(c.clone()); }
+                if let Some(n) = namespace { parts.push(n.clone()); }
+                if let Some(t) = table { parts.push(t.clone()); }
+                Some(parts.join("."))
+            }
+            GrantFilter::ToGrantee(_) => None,
+        };
+        let targets: Vec<usize> = policies
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| match filter {
+                GrantFilter::ToGrantee(g) => policy_names_grantee(p, g),
+                GrantFilter::OnResource { .. } => resource_matches_prefix(
+                    &format_policy_resource(&p.resources),
+                    prefix.as_deref().unwrap_or_default(),
+                ),
+            })
+            .map(|(i, _)| i)
+            .collect();
+        self.fill_provenance(&mut policies, &targets).await;
+
         let all = policies_to_entries(&policies);
         let filtered = match filter {
             GrantFilter::ToGrantee(g) => {
                 all.into_iter().filter(|e| entry_matches_grantee(e, g)).collect()
             }
-            GrantFilter::OnResource { catalog, namespace, table } => {
-                let mut prefix = Vec::new();
-                if let Some(c) = catalog { prefix.push(c.clone()); }
-                if let Some(n) = namespace { prefix.push(n.clone()); }
-                if let Some(t) = table { prefix.push(t.clone()); }
-                let prefix = prefix.join(".");
+            GrantFilter::OnResource { .. } => {
+                let prefix = prefix.unwrap_or_default();
                 all.into_iter()
                     .filter(|e| resource_matches_prefix(&e.resource, &prefix))
                     .collect()
@@ -1747,7 +1897,14 @@ impl GrantBackend for RangerGrantBackend {
     async fn show_effective(&self, _token: &str, user: &str) -> sqe_core::Result<Vec<GrantEntry>> {
         // Best-effort: return policies naming this user directly. Role-derived
         // grants are not expanded here (Ranger resolves roles at enforcement).
-        let policies = self.fetch_policies().await?;
+        let mut policies = self.fetch_policies().await?;
+        let targets: Vec<usize> = policies
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| policy_names_user(p, user))
+            .map(|(i, _)| i)
+            .collect();
+        self.fill_provenance(&mut policies, &targets).await;
         let all = policies_to_entries(&policies);
         Ok(all
             .into_iter()
@@ -2422,6 +2579,132 @@ mod tests {
         let deny = entries.iter().find(|e| e.effect == "DENY").unwrap();
         assert_eq!(deny.grantee_type, "USER");
         assert_eq!(deny.grantee_name, "mallory");
+    }
+
+    /// The list endpoint omits provenance, so entries built from it must show the
+    /// audit columns as empty rather than inventing a value. This is the state
+    /// `SHOW GRANTS` was permanently stuck in before `fill_provenance` existed.
+    #[test]
+    fn entries_from_the_list_endpoint_have_empty_provenance() {
+        let json = r#"[
+          {
+            "name": "grant-1786526606036",
+            "resources": {"catalog": {"values": ["wh"]}},
+            "policyItems": [
+              {"users": ["alice"], "roles": [],
+               "accesses": [{"type": "table-data-read", "isAllowed": true}]}
+            ]
+          }
+        ]"#;
+        let policies: Vec<RangerPolicy> = serde_json::from_str(json).unwrap();
+        let entries = policies_to_entries(&policies);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].granted_by, None);
+        assert_eq!(entries[0].granted_at, None);
+    }
+
+    /// The per-policy endpoint carries `createdBy` and `createTime`, and both must
+    /// reach every entry the policy produces, allow and deny alike. The values are
+    /// a real Ranger 2.8 response observed on the quickstart stack.
+    #[test]
+    fn entries_carry_provenance_from_the_detail_endpoint() {
+        let json = r#"[
+          {
+            "name": "grant-1786526606036",
+            "createdBy": "carol sqe",
+            "createTime": 1786526606039,
+            "resources": {
+              "catalog": {"values": ["sales_wh"]},
+              "namespace": {"values": ["acparity"]}
+            },
+            "policyItems": [
+              {"users": [], "roles": ["analyst"],
+               "accesses": [{"type": "view-properties-read", "isAllowed": true}]}
+            ],
+            "denyPolicyItems": [
+              {"users": ["mallory"], "roles": [],
+               "accesses": [{"type": "table-data-read", "isAllowed": true}]}
+            ]
+          }
+        ]"#;
+        let policies: Vec<RangerPolicy> = serde_json::from_str(json).unwrap();
+        let entries = policies_to_entries(&policies);
+        assert_eq!(entries.len(), 2);
+        for e in &entries {
+            assert_eq!(e.granted_by.as_deref(), Some("carol sqe"), "on {e:?}");
+            assert_eq!(
+                e.granted_at.as_deref(),
+                Some("2026-08-12T09:23:26Z"),
+                "on {e:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn grant_time_renders_as_utc_rfc3339() {
+        assert_eq!(
+            format_grant_time(1786526606039).as_deref(),
+            Some("2026-08-12T09:23:26Z")
+        );
+        assert_eq!(format_grant_time(0).as_deref(), Some("1970-01-01T00:00:00Z"));
+    }
+
+    /// An unrepresentable instant must leave the column empty. An audit column that
+    /// is blank is honest; one showing a wrong date is not.
+    #[test]
+    fn grant_time_out_of_range_is_none() {
+        assert_eq!(format_grant_time(i64::MAX), None);
+        assert_eq!(format_grant_time(i64::MIN), None);
+    }
+
+    /// `fill_provenance` is aimed with these, so a policy they miss silently loses
+    /// its audit columns while still returning a row.
+    #[test]
+    fn policy_level_predicates_match_what_the_entry_filter_returns() {
+        let json = r#"[
+          {
+            "name": "p1",
+            "resources": {"catalog": {"values": ["wh"]}},
+            "policyItems": [
+              {"users": ["alice"], "roles": ["analyst"],
+               "accesses": [{"type": "table-data-read", "isAllowed": true}]}
+            ],
+            "denyPolicyItems": [
+              {"users": ["mallory"], "roles": [],
+               "accesses": [{"type": "table-data-read", "isAllowed": true}]}
+            ]
+          }
+        ]"#;
+        let p = &serde_json::from_str::<Vec<RangerPolicy>>(json).unwrap()[0];
+
+        assert!(policy_names_grantee(p, &Grantee::Role("analyst".into())));
+        assert!(policy_names_grantee(p, &Grantee::User("alice".into())));
+        // A deny item still produces a row, so it still needs provenance.
+        assert!(policy_names_grantee(p, &Grantee::User("mallory".into())));
+        assert!(!policy_names_grantee(p, &Grantee::Role("engineer".into())));
+        assert!(!policy_names_grantee(p, &Grantee::User("bob".into())));
+        // Type matters: alice is a user here, not a role.
+        assert!(!policy_names_grantee(p, &Grantee::Role("alice".into())));
+        // RangerPolicyItem carries no groups, so a group can never produce a row.
+        assert!(!policy_names_grantee(p, &Grantee::Group("analyst".into())));
+
+        assert!(policy_names_user(p, "alice"));
+        assert!(policy_names_user(p, "mallory"));
+        assert!(!policy_names_user(p, "analyst"));
+
+        // Every grantee the policy-level predicate accepts must be a grantee the
+        // entry-level filter also accepts, or provenance is fetched for nothing.
+        let entries = policies_to_entries(std::slice::from_ref(p));
+        for g in [
+            Grantee::Role("analyst".into()),
+            Grantee::User("alice".into()),
+            Grantee::User("mallory".into()),
+        ] {
+            assert!(
+                entries.iter().any(|e| entry_matches_grantee(e, &g)),
+                "policy-level predicate accepted {g:?} but no entry matches it"
+            );
+        }
     }
 
     #[test]
