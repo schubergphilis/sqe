@@ -1,6 +1,6 @@
 # SQE — Next Steps
 
-> **OPEN, suite hygiene: `make test-access-control` leaks its own grants between runs, so two denial-baseline tests fail on any stack the suite has already used.**
+> **FIXED 2026-08-12, suite hygiene: `make test-access-control` leaked its own grants between runs, so two denial-baseline tests failed on any stack the suite had already used.**
 >
 > `denied_before_any_grant` and `all_tables_in_schema_grant_covers_the_namespace` both time out after 120 s with `still allowed for alice with 3 rows`. The cause is in Ranger, not in the assertion: a policy named `grant-1786370165684` grants role `analyst` sixteen access types on `sales_wh.ac.orders`, and alice is in `analyst`.
 >
@@ -8,7 +8,21 @@
 >
 > Proven rather than argued: deleting the leaked `grant-*` policies and re-running the three tests turns all of them green, with no code change. It leaks on EVERY run, not just historically. Of the three deleted, two survived from 2026-08-10 15:56 and one (`grant-1786440718652`) was written by the run executed minutes earlier the same day. `bootstrap-ranger.sh` seeds only wildcard admin/baseline policies and never a namespace-`ac` grant, so these can only be test residue.
 >
-> Fix: have `bootstrap()` also revoke `grant-*` policies scoped to the suite's own namespaces (`sales_wh.ac`, `ops_wh.ac`), the way the parity demo's "Security baseline" revokes do. A prefix-scoped clean is only as good as the prefix, and the SQL write path was never in it.
+> Fixed by having `bootstrap()` delete every coarse-gate (`polaris`) policy scoped inside the suite's own namespaces, in `delete_suite_grants`. Scoped by RESOURCE, not by a second name prefix: adding `grant-` would repeat the original mistake the first time Ranger changes that format or merges a grant into a policy someone else named. The resource coordinate is what makes a policy the suite's.
+>
+> Measured on the live stack, before and after one run:
+>
+> | | before | after |
+> |---|---:|---:|
+> | polaris policies scoped to namespace `ac` | 9 | **0** |
+> | bootstrap catalog-wildcard grants | 3 | 3 |
+> | parity-demo `acparity` policies | 6 | 6 |
+>
+> The nine included `grant-1786441368465` on `sales_wh.ac.orders` carrying `roles=['analyst']`, created 2026-08-11 09:42 and still alive through a run on 2026-08-12 09:04. Alice is in `analyst`, which is exactly why she read three rows in a test whose job was to prove she could not.
+>
+> **Live verdict: 41 passed, 0 failed** (`scripts/access-control-test.sh`, 612 s). `denied_before_any_grant` and `revoke_disables_access` both pass; the same run failed both beforehand. Nine unit tests pin the scoping predicate's boundaries (wildcards, catalog-level, foreign catalogs, `acparity`, multi-valued resources, malformed JSON) because it decides what gets DELETED from a service the suite does not own.
+>
+> Two things the fix deliberately does NOT do. It spares catalog-level and wildcard policies: `bootstrap-ranger.sh` seeds those and they are shared with the demo and Polaris itself. And it spares every other namespace, so the parity demo's `acparity` work is untouched, which is what lets the two suites share one Ranger.
 
 > **Measured: there is no cache to flush. Policy propagation and table load are both sub-second, and the demo's 45 minutes were failing assertions, not latency.**
 >

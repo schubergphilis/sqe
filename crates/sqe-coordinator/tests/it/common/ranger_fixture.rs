@@ -27,6 +27,16 @@ pub const HIVE_SERVICE: &str = "sqe_ac_hive";
 /// Test-owned tag service, linked to `HIVE_SERVICE`.
 pub const TAG_SERVICE: &str = "sqe_ac_tag";
 
+/// The COARSE-gate service, which this suite does NOT own. SQE's `GRANT`/`REVOKE`
+/// write here (`[access_control] service-name` in the quickstart's `sqe.toml`) and
+/// Polaris's embedded authorizer enforces it. Shared with the demo and with the
+/// Spark suite, so only the coordinates below may be cleaned from it.
+pub const COARSE_SERVICE: &str = "polaris";
+/// Catalogs in which this suite owns the `ac` namespace.
+const SUITE_CATALOGS: [&str; 2] = ["sales_wh", "ops_wh"];
+/// The namespace this suite owns inside each of those catalogs.
+const SUITE_NAMESPACE: &str = "ac";
+
 pub struct RangerAdmin {
     base: String,
     user: String,
@@ -99,15 +109,19 @@ impl RangerAdmin {
 
     /// One entry point for everything the suite needs on the Ranger side:
     /// the tag servicedef's row-filter capability, the two test-owned services
-    /// and their link, and a clean `sqe-ac-e2e-` policy slate. Idempotent, so
-    /// every test can call it in setup.
+    /// and their link, a clean `sqe-ac-e2e-` policy slate, and no coarse-gate
+    /// grant left inside the suite's own namespaces. Idempotent, so every test
+    /// can call it in setup.
     ///
-    /// Returns how many stale test policies were removed.
+    /// Returns how many stale policies were removed, across both the test-owned
+    /// services and the coarse-gate service.
     pub async fn bootstrap(&self) -> anyhow::Result<usize> {
         self.ensure_tag_rowfilter_support().await?;
         self.ensure_services().await?;
         self.clear_projected_tag_resources().await?;
-        self.delete_test_policies().await
+        let test_policies = self.delete_test_policies().await?;
+        let suite_grants = self.delete_suite_grants().await?;
+        Ok(test_policies + suite_grants)
     }
 
     /// Give the built-in `tag` servicedef a `rowFilterDef`, so tag-based ROW
@@ -559,6 +573,51 @@ impl RangerAdmin {
         Ok(removed)
     }
 
+    /// Names of every coarse-gate policy scoped inside the suite's own
+    /// namespaces. Exposed so a test can assert the slate is clean rather than
+    /// infer it from a query result.
+    ///
+    /// A coarse service that is absent or renamed yields an empty list rather
+    /// than an error: on such a stack there is nothing of ours to clean, and
+    /// failing here would break every test in the suite.
+    pub async fn suite_scoped_grants(&self) -> Vec<String> {
+        self.get_policies(COARSE_SERVICE)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(is_suite_scoped)
+            .filter_map(|p| p["name"].as_str().map(str::to_string))
+            .collect()
+    }
+
+    /// Delete every coarse-gate policy scoped inside the suite's own namespaces.
+    /// Returns how many were removed.
+    ///
+    /// WHY THIS EXISTS: `delete_test_policies` cleans by NAME PREFIX, and SQE's
+    /// own `GRANT` never carries that prefix. It posts to Ranger's grant API
+    /// (`/service/plugins/services/grant/<service>`), and Ranger names the policy
+    /// it creates `grant-<epoch_ms>`. So every grant the suite made through SQL
+    /// outlived the run that made it, and the next run started pre-authorized.
+    /// Two tests whose whole job is to prove access is denied BEFORE a grant
+    /// (`denied_before_any_grant`,
+    /// `all_tables_in_schema_grant_covers_the_namespace`) cannot survive that:
+    /// they timed out after 120 s with "still allowed for alice with 3 rows".
+    ///
+    /// A LIST failure is tolerated for the reason given on `suite_scoped_grants`.
+    /// A DELETE failure is not: a policy identified as ours that will not go away
+    /// is the exact condition this function exists to prevent.
+    pub async fn delete_suite_grants(&self) -> anyhow::Result<usize> {
+        let names = self.suite_scoped_grants().await;
+        for name in &names {
+            self.delete_policy(COARSE_SERVICE, name)
+                .await
+                .with_context(|| {
+                    format!("removing leaked coarse-gate grant `{name}` from {COARSE_SERVICE}")
+                })?;
+        }
+        Ok(names.len())
+    }
+
     /// The policy bundle SQE downloads. Used to capture a real `tagPolicies`
     /// sample for `sqe-policy`'s unit test.
     pub async fn download_bundle(&self, service: &str) -> anyhow::Result<Value> {
@@ -575,6 +634,45 @@ impl RangerAdmin {
         }
         resp.json().await.context("parse bundle json")
     }
+}
+
+/// The single `values` entry of a policy resource, or `None` when the resource is
+/// absent, empty, or carries more than one value.
+///
+/// More than one value means the policy spans coordinates beyond a single one of
+/// ours, so it is not exclusively the suite's to delete.
+fn sole_resource_value(policy: &Value, key: &str) -> Option<String> {
+    let values = policy["resources"][key]["values"].as_array()?;
+    match values.as_slice() {
+        [one] => one.as_str().map(str::to_string),
+        _ => None,
+    }
+}
+
+/// True when a coarse-gate policy is scoped INSIDE one of the suite's own
+/// namespaces (`sales_wh.ac` or `ops_wh.ac`), and is therefore the suite's to
+/// delete.
+///
+/// Scoped by RESOURCE rather than by name, deliberately. The bug this guards
+/// against was a name-prefix clean that could not see policies Ranger named
+/// itself, and adding a second prefix (`grant-`) would repeat the mistake the
+/// first time Ranger changes that format or a grant merges into a policy someone
+/// else named. The resource coordinate is what actually makes a policy ours.
+///
+/// Catalog-level and wildcard policies are deliberately NOT matched:
+///   - `bootstrap-ranger.sh` seeds admin and baseline grants at `catalog: *`,
+///     shared with the demo and with Polaris's own operation. Deleting those
+///     breaks the stack for everything, not just this suite.
+///   - a catalog-level policy confers namespace-NAME visibility, not table read,
+///     so it is not what poisons a denial baseline.
+///   - the parity demo works in namespace `acparity`, which does not match
+///     `SUITE_NAMESPACE` and is therefore untouched.
+fn is_suite_scoped(policy: &Value) -> bool {
+    if sole_resource_value(policy, "namespace").as_deref() != Some(SUITE_NAMESPACE) {
+        return false;
+    }
+    sole_resource_value(policy, "catalog")
+        .is_some_and(|catalog| SUITE_CATALOGS.contains(&catalog.as_str()))
 }
 
 /// Make Ranger's auto-generated `tag` servicedef pass Ranger's OWN validator.
@@ -705,5 +803,137 @@ impl Drop for RangerOutage {
         if let Err(e) = self.container.start() {
             eprintln!("WARNING: failed to restart ranger-admin after the outage test: {e}");
         }
+    }
+}
+
+/// `is_suite_scoped` decides what gets DELETED from a service the suite does not
+/// own, so its boundaries are unit-tested rather than trusted. Every JSON shape
+/// here is the shape Ranger actually returns: `resources.<key>.values` is always
+/// an array, and the grant API omits levels below the one granted.
+#[cfg(test)]
+mod suite_scope_tests {
+    use super::*;
+
+    /// Ranger's own shape for a policy the grant API created at a coordinate.
+    fn policy(resources: Value) -> Value {
+        serde_json::json!({"name": "grant-1786370165684", "resources": resources})
+    }
+
+    fn table_policy(catalog: &str, namespace: &str, table: &str) -> Value {
+        policy(serde_json::json!({
+            "root":      {"values": ["*"]},
+            "catalog":   {"values": [catalog]},
+            "namespace": {"values": [namespace]},
+            "table":     {"values": [table]},
+        }))
+    }
+
+    #[test]
+    fn matches_a_leaked_table_grant_in_either_suite_catalog() {
+        assert!(is_suite_scoped(&table_policy("sales_wh", "ac", "orders")));
+        assert!(is_suite_scoped(&table_policy("ops_wh", "ac", "audit")));
+    }
+
+    /// `GRANT ... ON ALL TABLES IN SCHEMA sales_wh.ac` writes a namespace-level
+    /// policy with no `table` resource. It is the leak behind
+    /// `all_tables_in_schema_grant_covers_the_namespace`, so it must match.
+    #[test]
+    fn matches_a_namespace_level_grant_with_no_table() {
+        let p = policy(serde_json::json!({
+            "root":      {"values": ["*"]},
+            "catalog":   {"values": ["sales_wh"]},
+            "namespace": {"values": ["ac"]},
+        }));
+        assert!(is_suite_scoped(&p));
+    }
+
+    /// `GRANT ... ON ALL TABLES IN SCHEMA` writes a table WILDCARD inside a named
+    /// namespace, which is not the same thing as a wildcard namespace. Observed
+    /// live as `grant-1786441479476` at `sales_wh` / `ac` / `*`, left behind by
+    /// `all_tables_in_schema_grant_covers_the_namespace`.
+    #[test]
+    fn matches_a_table_wildcard_inside_a_suite_namespace() {
+        assert!(is_suite_scoped(&table_policy("sales_wh", "ac", "*")));
+    }
+
+    /// The baseline and admin grants `bootstrap-ranger.sh` seeds. Deleting any of
+    /// these breaks the stack for the demo and for Polaris itself.
+    #[test]
+    fn spares_the_bootstrap_wildcard_and_catalog_level_grants() {
+        for resources in [
+            serde_json::json!({"root": {"values": ["*"]}}),
+            serde_json::json!({"root": {"values": ["*"]}, "catalog": {"values": ["*"]}}),
+            serde_json::json!({
+                "root": {"values": ["*"]},
+                "catalog": {"values": ["*"]},
+                "namespace": {"values": ["*"]},
+            }),
+            serde_json::json!({
+                "root": {"values": ["*"]},
+                "catalog": {"values": ["*"]},
+                "namespace": {"values": ["*"]},
+                "table": {"values": ["*"]},
+            }),
+        ] {
+            assert!(
+                !is_suite_scoped(&policy(resources.clone())),
+                "must not claim the bootstrap grant {resources}"
+            );
+        }
+    }
+
+    /// A catalog-level grant confers namespace-name visibility, not table read.
+    #[test]
+    fn spares_a_catalog_level_grant_with_no_namespace() {
+        let p = policy(serde_json::json!({
+            "root":    {"values": ["*"]},
+            "catalog": {"values": ["sales_wh"]},
+        }));
+        assert!(!is_suite_scoped(&p));
+    }
+
+    /// The parity demo lives in `acparity`, and other suites in other namespaces.
+    #[test]
+    fn spares_other_namespaces_including_the_parity_demo() {
+        assert!(!is_suite_scoped(&table_policy(
+            "sales_wh", "acparity", "customers"
+        )));
+        assert!(!is_suite_scoped(&table_policy("sales_wh", "sales", "orders")));
+    }
+
+    /// `ac` in a catalog the suite does not own is not the suite's to delete.
+    #[test]
+    fn spares_the_ac_namespace_in_a_foreign_catalog() {
+        assert!(!is_suite_scoped(&table_policy("other_wh", "ac", "orders")));
+    }
+
+    /// A multi-valued resource spans coordinates beyond one of ours.
+    #[test]
+    fn spares_a_policy_spanning_more_than_one_coordinate() {
+        let multi_ns = policy(serde_json::json!({
+            "catalog":   {"values": ["sales_wh"]},
+            "namespace": {"values": ["ac", "sales"]},
+        }));
+        assert!(!is_suite_scoped(&multi_ns));
+        let multi_cat = policy(serde_json::json!({
+            "catalog":   {"values": ["sales_wh", "other_wh"]},
+            "namespace": {"values": ["ac"]},
+        }));
+        assert!(!is_suite_scoped(&multi_cat));
+    }
+
+    /// Malformed or absent resources must not panic and must not match.
+    #[test]
+    fn spares_malformed_and_empty_resources() {
+        assert!(!is_suite_scoped(&policy(serde_json::json!({}))));
+        assert!(!is_suite_scoped(&serde_json::json!({"name": "x"})));
+        assert!(!is_suite_scoped(&policy(serde_json::json!({
+            "catalog":   {"values": []},
+            "namespace": {"values": ["ac"]},
+        }))));
+        assert!(!is_suite_scoped(&policy(serde_json::json!({
+            "catalog":   {"values": ["sales_wh"]},
+            "namespace": {"values": [42]},
+        }))));
     }
 }

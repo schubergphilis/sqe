@@ -23,7 +23,9 @@ use arrow_array::RecordBatch;
 use sqe_coordinator::QueryHandler;
 use sqe_core::Session;
 
-use crate::common::ranger_fixture::{RangerAdmin, HIVE_SERVICE, PREFIX, TAG_SERVICE};
+use crate::common::ranger_fixture::{
+    RangerAdmin, COARSE_SERVICE, HIVE_SERVICE, PREFIX, TAG_SERVICE,
+};
 
 /// Skip-or-run gate. Returns early when the suite was not opted into.
 macro_rules! ac_gate {
@@ -425,6 +427,82 @@ async fn denied_before_any_grant() {
     let _guard = crate::common::serial().lock().await;
     let ctx = ac_setup().await;
     assert_denied_but_valid(&ctx, &ctx.alice, &format!("SELECT region FROM {ORDERS}")).await;
+}
+
+/// The suite's own grants must not survive it, or every denial baseline is a lie.
+///
+/// `denied_before_any_grant` above and
+/// `all_tables_in_schema_grant_covers_the_namespace` both assert that access is
+/// denied BEFORE a grant, and both used to fail on any stack the suite had
+/// already touched: they timed out after 120 s with "still allowed for alice with
+/// 3 rows". The cause was in Ranger, not in either assertion. `ac_setup` clears
+/// the `sqe-ac-e2e-` prefixed slate, but SQE's own `GRANT` does not use that
+/// prefix; it posts to Ranger's grant API, which names the policy it creates
+/// `grant-<epoch_ms>`. So every grant made through SQL outlived its run and the
+/// next run started pre-authorized.
+///
+/// Asserted on the coarse-gate service directly rather than through a query
+/// result, because a leaked grant and a slow Polaris poll are indistinguishable
+/// from the outside. That ambiguity is what made the original failure read as
+/// latency and burn a 120-second budget.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs quickstart/polaris-ranger-keycloak; run scripts/access-control-test.sh"]
+async fn setup_removes_grants_the_suite_wrote_through_sql() {
+    ac_gate!();
+    let _guard = crate::common::serial().lock().await;
+    let ctx = ac_setup().await;
+
+    // Setup has just run, so the slate starts clean. Asserted rather than
+    // assumed: if it were not clean, the rest of this test would pass for the
+    // wrong reason.
+    assert!(
+        ctx.ranger.suite_scoped_grants().await.is_empty(),
+        "ac_setup must leave no coarse-gate grant inside the suite's namespaces"
+    );
+
+    // The leaking path: a grant authored through SQE SQL, not through the fixture.
+    exec_ok(
+        &ctx,
+        &ctx.carol,
+        &format!("GRANT SELECT ON {ORDERS} TO ROLE \"analyst\""),
+    )
+    .await;
+    let after_grant = ctx.ranger.suite_scoped_grants().await;
+    assert!(
+        !after_grant.is_empty(),
+        "GRANT through SQL must write a coarse-gate policy; without one this test \
+         proves nothing about cleaning it up"
+    );
+    // The name Ranger chose is the whole reason a prefix clean could not see it.
+    assert!(
+        after_grant.iter().all(|n| !n.starts_with(PREFIX)),
+        "the leaked grant is expected NOT to carry the fixture prefix, got {after_grant:?}"
+    );
+
+    let removed = ctx.ranger.bootstrap().await.expect("ranger bootstrap");
+    assert!(
+        removed >= after_grant.len(),
+        "bootstrap reported {removed} removed, fewer than the {} leaked grants",
+        after_grant.len()
+    );
+    assert!(
+        ctx.ranger.suite_scoped_grants().await.is_empty(),
+        "bootstrap must remove every coarse-gate grant inside the suite's namespaces"
+    );
+
+    // The bootstrap's own wildcard grants must have survived. Deleting those
+    // would break the demo and Polaris itself, and would look like success here.
+    let survivors = ctx
+        .ranger
+        .get_policies(COARSE_SERVICE)
+        .await
+        .expect("list coarse-gate policies");
+    assert!(
+        survivors.iter().any(|p| {
+            p["resources"]["catalog"]["values"] == serde_json::json!(["*"])
+        }),
+        "the baseline catalog-wildcard grants must not be collateral damage"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
