@@ -124,6 +124,38 @@ The location is a directory. SQE creates `<dir>/catalog.db`
 for table data. Useful for dbt model development without a Polaris
 deployment.
 
+## Example: a shared PostgreSQL catalog over JDBC
+
+```sql
+CREATE SECRET pg_cat (TYPE basic, USERNAME 'iceberg', PASSWORD 's3cr3t');
+
+ATTACH 'jdbc:postgresql://db.internal:5432/iceberg' AS shared (
+  TYPE jdbc,
+  WAREHOUSE 's3://lake/warehouse',
+  SECRET pg_cat
+);
+
+SELECT * FROM shared.analytics.events LIMIT 10;
+```
+
+The backend is the same SQL catalog `TYPE sqlite` uses, so PostgreSQL, MySQL,
+and SQLite all work through one code path. Write the location either as
+`jdbc:postgresql://...`, the form Java tools use, or as `postgresql://...`; the
+`jdbc:` prefix is stripped when present.
+
+`WAREHOUSE` is required because a SQL catalog stores table metadata pointers
+rather than the data itself, so the data root cannot be inferred from the
+connection URL.
+
+Credentials belong in a `basic` secret rather than inline in the URL. The secret
+wins if the URL also carries a `user:password@` pair, which keeps rotating the
+secret meaningful. Characters that would otherwise break a URL, such as `@`,
+`:`, and `/`, are percent-encoded on the way in, so a password does not need
+pre-escaping.
+
+Requires one of the `sql`, `sql-postgres`, or `sql-sqlite` cargo features. A
+binary built without them reports which feature is missing.
+
 ## SHOW CATALOGS and SHOW SECRETS
 
 `SHOW CATALOGS` includes every TOML-configured catalog plus the two
