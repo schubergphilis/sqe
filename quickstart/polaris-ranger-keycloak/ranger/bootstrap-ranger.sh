@@ -59,7 +59,7 @@ fi
 # ── Grantee users (service principal + demo users) ──────────────────────────
 # Exist purely as grantee references; login is via Keycloak, not Ranger.
 echo "Creating Ranger users ..."
-for u in root alice bob carol dave; do
+for u in root alice bob carol dave erin frank; do
   curl -fsS $AUTH $CSRF $CT -X POST "${RANGER_URL}/service/xusers/secure/users" \
     -d "{\"name\":\"$u\",\"password\":\"${USER_PASSWORD}\",\"firstName\":\"$u\",\"lastName\":\"sqe\",\"emailAddress\":\"\",\"userRoleList\":[\"ROLE_USER\"]}" >/dev/null 2>&1 \
     && echo "  user '$u' created" || echo "  user '$u' exists"
@@ -75,6 +75,12 @@ mkrole() { # name  userlist-json
 mkrole analyst   '[{"name":"alice","isAdmin":false},{"name":"bob","isAdmin":false},{"name":"carol","isAdmin":false}]'
 mkrole engineer  '[{"name":"bob","isAdmin":false},{"name":"carol","isAdmin":false}]'
 mkrole sqe_admin '[{"name":"carol","isAdmin":false}]'
+# Two single-member roles used by scripts/access-control-parity-demo.sh. They
+# exercise policy SHAPES the analyst/engineer pair cannot: a masked role with no
+# row filter (fraud desk: every jurisdiction, no identity) and an unmasked role
+# whose only restriction is a retention window on one of two tables (audit).
+mkrole fraud_analyst '[{"name":"erin","isAdmin":false}]'
+mkrole auditor       '[{"name":"frank","isAdmin":false}]'
 
 # ── Seeds ───────────────────────────────────────────────────────────────────
 # All policies carry root="*" (Polaris always sends root).
@@ -108,8 +114,12 @@ for res in '{"root":"*"}' '{"root":"*","catalog":"*"}' '{"root":"*","catalog":"*
   printf "  sqe_admin %s:" "$res"; post_grant "$res" '"roles":["sqe_admin"]' "$ADMIN_ACCESS"
 done
 
-echo "Seeding baseline traverse grants for roles 'analyst' and 'engineer' ..."
-for role in analyst engineer; do
+# EVERY demo role needs the baseline, including the two parity-demo roles. A role
+# without it cannot even list the namespace, and that failure is reported as a
+# Polaris authorization error indistinguishable from the policy denials the demo
+# asserts deliberately. Add new roles here at the same time as `mkrole` above.
+echo "Seeding baseline traverse grants for the query roles ..."
+for role in analyst engineer fraud_analyst auditor; do
   for res in '{"root":"*","catalog":"*"}' '{"root":"*","catalog":"*","namespace":"*"}' '{"root":"*","catalog":"*","namespace":"*","table":"*"}'; do
     printf "  %s %s:" "$role" "$res"; post_grant "$res" "\"roles\":[\"$role\"]" "$BASELINE"
   done
