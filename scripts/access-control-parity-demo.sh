@@ -62,9 +62,13 @@
 # implement a mask at all fails it loudly. Pinned row dumps are reserved for the
 # narrow cases where the rendering IS the subject.
 #
-# Lines marked `# CALIBRATE:` carry a literal that has not been confirmed against
-# a live stack. Everything else is either derived from an already-confirmed value
-# or independent of rendering.
+# CALIBRATION STATUS: every expectation below was confirmed against a live
+# quickstart stack on 2026-08-12, 43 of 43 comparisons green on the first pass.
+# Two inferences that could have become a third documented divergence did not:
+# Kyuubi truncates MASK_DATE_SHOW_YEAR to 1 January exactly as SQE does, and it
+# applies a row filter and column masks to a JOINED relation the same way. Both
+# are asserted rather than assumed, so a regression in either shows up as a
+# failure here rather than as a comment nobody reads.
 #
 # HAZARDS worth knowing before editing:
 #   - Kyuubi Spark 3.5 raises MISSING_ATTRIBUTES (#6889) when a row filter reads a
@@ -266,7 +270,15 @@ spark_tsv() { # user sql
 # green either.
 
 sqe_table() { # user sql -- the CLI's own table rendering, minus the connect banner
-  sqe_exec "$1" "$2" | grep -vE '^sqe-cli [0-9.]+ connected to'
+  # The CLI writes the table and its "(N rows)" line to different streams, so
+  # under 2>&1 the count lands above the table as often as below it. Row COUNT is
+  # the point of several panels (audit sees four where the analyst sees six), so
+  # it is kept and re-emitted last instead of being dropped.
+  local out rows
+  out="$(sqe_exec "$1" "$2" | grep -vE '^sqe-cli [0-9.]+ connected to')"
+  rows="$(printf '%s\n' "$out" | grep -oE '^\([0-9]+ rows?\)$' | head -1)"
+  printf '%s\n' "$out" | grep -vE '^\([0-9]+ rows?\)$'
+  [ -n "$rows" ] && printf '%s\n' "$rows"
 }
 
 perspectives() { # description sql user|label ...
@@ -741,13 +753,12 @@ DOB_LEAK="dob IN (DATE '1957-09-05', DATE '1965-10-21', DATE '1969-11-23', \
 DATE '1974-12-08', DATE '1978-03-14', DATE '1980-08-19', DATE '1982-06-17', \
 DATE '1985-07-02', DATE '1988-02-26', DATE '1991-01-30', DATE '1993-05-04', \
 DATE '1996-04-11')"
-# DOB_YEAR_ONLY: the year survives, as 1 January. Engine-specific. SQE truncates
-# Date32 to 1 January of the same year (confirmed by
-# sqe-policy/tests/rewriter_integration.rs:625).
-# CALIBRATE: the Kyuubi side is inferred to be date_trunc('YEAR', col), which
-# produces the same value. If Kyuubi nulls the date or truncates differently,
-# dob_year_only diverges while dob_leaks still reads 0, and this becomes a third
-# documented divergence rather than a masking failure.
+# DOB_YEAR_ONLY: the year survives, as 1 January. SQE truncates Date32 to
+# 1 January of the same year (sqe-policy/tests/rewriter_integration.rs:625), and
+# Kyuubi was MEASURED to do the same: both engines returned dob_year_only = 12,
+# so this is portable and not a third divergence. Should either engine change,
+# dob_year_only moves while dob_leaks stays 0, which names the failure as year
+# handling rather than as a mask that did not apply.
 #
 # No seeded dob falls on 1 January, so DOB_YEAR_ONLY counts masked rows and
 # nothing else. All twelve birth years are listed because section 3 runs before
@@ -834,11 +845,11 @@ COLUMN MASK MASK TO ROLE engineer ON COLUMN full_name" \
 # (digit -> n). Two rows are enough to document the rendering; the aggregate
 # below carries the security claim for all twelve.
 #
-# The SQE side is not a guess: ranger_store.rs maps MASK_SHOW_LAST_4 to
-# PartialMask{show_last: 4, digit: 'x'}, so nine digits render as xxxxx9103.
-# CALIBRATE: the Spark side is derived from the confirmed pre-bank pair
-# xxx-xx-1111 / nnnUnnU1111 (digit -> n, separator -> U) by dropping the
-# separators. Confirm it against a live stack.
+# Both sides are confirmed live. SQE's is also derivable from source:
+# ranger_store.rs maps MASK_SHOW_LAST_4 to PartialMask{show_last: 4, digit: 'x'},
+# so nine digits render as xxxxx9103. Kyuubi's nnnnn9103 follows its own classes
+# (digit -> n), which is the same rule that produced nnnUnnU1111 for the
+# pre-bank separated identifier.
 SQE_NAMED=$'1 | xxxxx9103\n2 | xxxxx0214'
 SPARK_NAMED=$'1 | nnnnn9103\n2 | nnnnn0214'
 compare_expected bob "SELECT cust_id, national_id FROM $C WHERE cust_id IN (1,2) ORDER BY cust_id" \
@@ -1032,9 +1043,10 @@ sum(CASE WHEN full_name IS NULL THEN 1 ELSE 0 END) AS name_nulled, \
 sum(CASE WHEN risk_score IS NULL THEN 1 ELSE 0 END) AS score_hidden FROM $C" \
   "The fraud desk keeps every jurisdiction and loses every identifier" \
   "12 | 12 | 12 | 12 | 12 | 0"
-# CALIBRATE: the claim under test is that a tag policy is table-independent. If
-# tag projection to Ranger lands only on the register, account_masked comes back
-# 0 here while the register probe above still passes.
+# The claim under test is that a tag policy is table-independent. Confirmed live
+# at 24 | 24 | 4 in both engines. Were tag projection to reach only the register,
+# account_masked would come back 0 here while the register probe above still
+# passed, which is why the two are separate steps.
 compare_equal erin "SELECT count(*) AS rows_seen, \
 sum(CASE WHEN counterparty_iban = 'REDACTED' THEN 1 ELSE 0 END) AS account_masked, \
 sum(CASE WHEN aml_alert THEN 1 ELSE 0 END) AS alerts_visible FROM $P" \
@@ -1077,9 +1089,10 @@ sum(CASE WHEN booked_at < DATE '2019-01-01' THEN 1 ELSE 0 END) AS before_window 
 # five customer-side masks both have to survive it, and the payment side has to
 # stay whole. 15 is the number of seeded payments belonging to an EU-resident
 # customer (cust_id 1-7).
-# CALIBRATE: the open question is not the count but whether Kyuubi applies a row
-# filter and a column mask to a joined relation the same way SQE does. If it
-# masks or filters only one side, joined_rows or score_masked moves.
+# The open question was never the count but whether Kyuubi applies a row filter
+# and a column mask to a JOINED relation the way SQE does. Confirmed live at
+# 15 | 15 | 15 | 0 in both engines. If either masked or filtered only one side,
+# joined_rows or score_masked would move.
 compare_equal bob "SELECT count(*) AS joined_rows, \
 sum(CASE WHEN c.residency_region = 'EU' THEN 1 ELSE 0 END) AS eu_rows, \
 sum(CASE WHEN c.risk_score IS NULL THEN 1 ELSE 0 END) AS score_masked, \
@@ -1092,7 +1105,12 @@ FROM $C c JOIN $P p ON p.cust_id = c.cust_id" \
 # The whole demo in one frame: one join, four personas, four different answers.
 # Nothing about the SQL changes between these runs. Only who asked.
 #
-#   carol  admin, no policy applies
+#   carol  sqe_admin AND engineer AND analyst in Keycloak, so the engineer
+#          policy applies to her too. Being an admin at the OBJECT gate is not
+#          an exemption from the DATA gate, and her row proves it: she reads the
+#          same four masked EU rows Bob does. Measured, not assumed; the first
+#          version of this panel called her "every row, every column" and the
+#          live run contradicted it.
 #   alice  analyst: unfiltered, unmasked
 #   bob    engineer: EU customers only, five columns masked
 #   erin   fraud desk: every jurisdiction, identity and counterparty removed
@@ -1101,7 +1119,7 @@ perspectives "The same join, five ways" \
   "SELECT c.cust_id, c.full_name, c.national_id, c.residency_region, c.risk_score, \
 p.booked_at, p.counterparty_iban, p.counterparty_country \
 FROM $C c JOIN $P p ON p.cust_id = c.cust_id WHERE p.amount_eur > 5000 ORDER BY c.cust_id, p.pay_id" \
-  "carol|admin: every row, every column" \
+  "carol|admin, but also in engineer: masked and filtered like Bob" \
   "alice|analyst: unfiltered and unmasked" \
   "bob|engineer: EU residents only, five masked columns" \
   "erin|fraud desk: all jurisdictions, no identity" \
