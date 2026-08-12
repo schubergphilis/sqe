@@ -95,6 +95,10 @@ api POST "$CAT/ops_wh/namespaces" '{"namespace":["ops"]}' || true
 # (realm_access.roles via the principal-roles-mapper) and forwards them to Ranger.
 log "creating principals (entities only; roles come from the token)"
 mkprincipal() { api POST "$MGMT/principals" "{\"principal\":{\"name\":\"$1\",\"type\":\"USER\"}}" || true; }
-for u in alice bob carol dave; do mkprincipal "$u"; done
+# erin and frank back the fraud_analyst / auditor personas in
+# scripts/access-control-parity-demo.sh. A Keycloak user with no principal ENTITY
+# here still mints a token, then fails at Polaris with 401 "Failed to resolve
+# principal", so a new demo identity has to be added in BOTH places.
+for u in alice bob carol dave erin frank; do mkprincipal "$u"; done
 
 log "bootstrap complete: catalogs=sales_wh,ops_wh"
