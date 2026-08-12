@@ -131,10 +131,11 @@ Total: seven new Spark probes, five to ten minutes of added wall clock.
 probe, unchanged). The `ACPARITY_` prefix and the `acparity-demo-` policy prefix
 stay: they are what makes teardown safe on a shared Ranger.
 
-## Deferred calibration
+## Calibration: done, 43 of 43 green
 
-Expectations are not calibrated against a live stack in this change. Two things
-keep that from turning the script's green into a guess:
+Ran against a live quickstart stack on 2026-08-12. Every comparison passed on the
+first pass, so each literal originally marked `# CALIBRATE:` was correct. Two
+things kept that from having been a guess:
 
 1. Every new assertion is an aggregate over semantics (`count(*)` plus
    `sum(CASE WHEN ...)`), the pattern already used at lines 558 and 587. No new
@@ -151,8 +152,21 @@ marked. `MASK_HASH` emitting 64 lowercase hex characters is likewise confirmed
 (`sha256_udf.rs` `hex_lower`), which is why the digest-length divergence keeps its
 pinned `64` / `32`.
 
-The script has never executed past bootstrap in this change. Not one comparison
-has run, so "uncalibrated" means unrun, not merely unconfirmed.
+Two inferences that could each have become a third documented divergence did not,
+and both are now asserted rather than commented:
+
+- `MASK_DATE_SHOW_YEAR`: Kyuubi truncates to 1 January exactly as SQE does. Both
+  engines returned `dob_year_only = 12`.
+- filter and mask over a join: both engines returned `15 | 15 | 15 | 0`, so Kyuubi
+  applies a row filter AND column masks to a joined relation the way SQE does.
+
+The derived Spark rendering `nnnnn9103` / `nnnnn0214` was exact.
+
+The run also contradicted one of the design's own captions, which is what running
+it is for. The five-way panel labelled carol "every row, every column"; carol is
+`sqe_admin` AND `engineer` AND `analyst` in the realm, so the engineer policy
+applies to her and she reads the same four masked EU rows Bob does. Being an admin
+at the object gate is not an exemption from the data gate. Relabelled to say so.
 
 `AC_PARITY_SECTIONS="3,9,10"` gates the comparisons only. Every `action` still
 runs, so grants, policies, and tags that later sections depend on are always in
@@ -185,4 +199,4 @@ fixture library for both scripts is a separate change.
   values, tags that state why a column is protected.
 - Probe count grows by seven; the two documented divergences stay two.
 - `bash -n` clean, `shellcheck` no worse than before.
-- A later calibration pass has to change only lines marked `# CALIBRATE:`.
+- Calibrated: 43 of 43 comparisons green on a live stack, first pass, exit 0.
