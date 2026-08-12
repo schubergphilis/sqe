@@ -70,6 +70,19 @@
 > 3. **Assert with `CHECK ACCESS`, not with a query result.** SQE already has `CHECK ACCESS SELECT ON t FOR USER x`, which answers "can this principal read this, and via which grant". It would have made this defect obvious immediately, where `SHOW GRANTS` did not: `SHOW GRANTS` lists the statements issued, and the operative fact was the expansion. The parity demo should `CHECK ACCESS` before asserting the denial.
 > 4. **Say what admin and ownership bypass.** Unity Catalog owners keep their privileges and cannot be revoked out of them. SQE's `admin_roles` behave similarly and that is nowhere in the revoke story.
 
+> **OPEN, dependency bumps: three renovate MRs cannot merge as written, and the reason was recorded only in a branch commit message.**
+>
+> Measured 2026-07-28 on `experiment/dep-upgrade-cost` (marked "not for merge", 275 commits behind main and now conflicting in four files, so it is not re-runnable). The finding outlives the branch:
+>
+> - **sqlx 0.9 needs rustc 1.94**, and the project pins 1.92.
+> - **rusqlite 0.40 hits a `links=sqlite3` conflict** through vendored `iceberg-catalog-sql`, which carries its own sqlx 0.8.1. Two crates claiming the same native library cannot coexist, so this is not a version-pick problem.
+> - reqwest renamed its `rustls-tls` feature to `rustls`.
+> - sha2 0.11 changes hex formatting at **ten** call sites; the experiment fixed one.
+>
+> That is what `!779` (rust 0.x breaking) is asking for, which is why it cannot go in as a bump. It also changes `Cargo.toml` WITHOUT regenerating `Cargo.lock`, the same shape that broke main twice (#386). `!733` (DataFusion/Arrow v59) and `!730` (object_store 0.14) share that defect and are 301 commits stale against a tree on DF 54.
+>
+> Order that actually works: raise the rustc pin, or drop sqlx 0.9 from the set; de-vendor or align `iceberg-catalog-sql`'s sqlx; then let renovate regenerate against current main so the lockfile comes with it.
+
 > Status as of 2026-08-12. **The parity demo now runs on an EU retail bank fixture, and adding a persona to the quickstart stack turns out to touch five places rather than three.**
 >
 > The fixture was `orders(id, region, amount, ssn, email, phone)` with three rows. The mechanics were complete; the transcript did not show what they were for. It is now a 12-row customer register and a 24-row payment ledger: `national_id`, `dob`, `iban`, `nationality`, `residency_region`, `pep_flag`, `risk_score`, and cross-border payments carrying counterparty country, channel, and AML alerts. The old policy targets map over, so sections 1 to 7 keep their probe count and gain a meaning: the row filter is GDPR data residency, `MASK_HASH` on `iban` is a pseudonymous account key, `MASK_NULL` hides an internal risk score.
