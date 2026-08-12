@@ -24,7 +24,7 @@ A larger stack than the other quickstarts, because it proves cross-engine parity
 
 | Service | Role |
 |---|---|
-| `keycloak` | Identity provider, realm `iceberg-ranger` (users carol, bob, alice, dave). |
+| `keycloak` | Identity provider, realm `iceberg-ranger` (users carol, bob, alice, dave, erin, frank). |
 | `polaris` | Iceberg REST catalog with the embedded Ranger authorizer (`mixed` auth). |
 | `ranger-admin` | Apache Ranger Admin: stores the policies SQE writes; Polaris and Spark both read it. |
 | `ranger-setup` | One-shot: seeds Ranger services, roles, and user-to-role membership. |
@@ -84,7 +84,7 @@ SQE  -- query+token  -->  Polaris  -- check -->  Ranger    (enforcement)
 The identity model is the part that needs care. Polaris federates the principal
 from the token's `preferred_username`, but federation resolves an *existing*
 principal, so each user must be pre-created as a Polaris principal (the bootstrap
-creates alice, bob, carol, dave). Polaris ignores the token's realm roles
+creates alice, bob, carol, dave, erin, frank). Polaris ignores the token's realm roles
 (missing the `PRINCIPAL_ROLE:` prefix), so the user-to-role mapping that works is
 **Ranger role membership**: Polaris sends the user to Ranger, and Ranger resolves
 that user's roles from its own store. `OVERVIEW.md` documents why, with the

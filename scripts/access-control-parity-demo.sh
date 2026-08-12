@@ -654,6 +654,26 @@ for role in fraud_analyst auditor; do
   preflight_role "$role"
 done
 
+# The token loop above proves Keycloak knows a user; it does NOT prove Polaris
+# does. Polaris federation resolves an EXISTING principal entity by
+# preferred_username and never creates one, so a user added to the realm but not
+# to polaris/bootstrap-data.sh mints a token and then fails every read with 401
+# "Failed to resolve principal". Under a role-scoped policy that reads as a
+# denial, which is why it is checked here rather than discovered in section 8.
+preflight_principal() { # user
+  local out
+  out="$(sqe_exec "$1" "SHOW SCHEMAS IN $CAT")"
+  printf '%s' "$out" | grep -qiE 'failed to resolve principal' || return 0
+  red "Polaris has no principal entity for '$1':"
+  printf '%s\n' "$out" | sed 's/^/       /'
+  red "This stack predates the erin/frank principals. Re-seed Polaris with:"
+  dim "  (cd $STACK_DIR && docker compose up -d --force-recreate polaris-setup)"
+  exit 1
+}
+for demo_user in erin frank; do
+  preflight_principal "$demo_user"
+done
+
 for role in engineer analyst fraud_analyst auditor; do
   for tbl in "$C" "$P"; do
     action "REVOKE SELECT ON $tbl FROM ROLE \"$role\"" \
@@ -671,17 +691,34 @@ done
 # A raw national_id is nine digits. Every mask either nulls it or replaces the
 # leading digits with x (SQE, Hive servicedef) or n (Kyuubi).
 NID_LEAK="national_id IS NOT NULL AND national_id NOT LIKE '%x%' AND national_id NOT LIKE '%n%'"
-# A raw IBAN is uppercase letters and digits. A hex digest is lowercase, whether
-# it came from sha256 or md5.
-IBAN_LEAK="iban = upper(iban)"
+# The seeded IBANs are 18 to 28 characters. A digest is 32 (md5) or 64 (sha256).
+# Length separates raw from hashed without depending on hex case, on which digest
+# algorithm ran, or on whether the hash is keyed.
+IBAN_LEAK="length(iban) <= 28"
 # Every seeded name contains a lowercase vowel. A masked name contains only X, x,
 # n, and separators, under either engine's replacement characters.
 NAME_LEAK="(full_name LIKE '%a%' OR full_name LIKE '%e%' OR full_name LIKE '%i%' \
 OR full_name LIKE '%o%' OR full_name LIKE '%u%')"
-# MASK_DATE_SHOW_YEAR truncates to 1 January of the same year in both engines
-# (SQE: Date32 truncation; Kyuubi: date_trunc('YEAR', col)). No seeded dob falls
-# on 1 January, so this counts masked rows and nothing else. All twelve birth
-# years are listed because section 3 runs before the residency filter exists.
+# The date mask carries two separate claims, and they are asserted separately so
+# a failure names itself.
+#
+# DOB_LEAK: the stored birth date is gone. True under ANY masking behaviour, so a
+# failure here means the mask did not apply at all.
+DOB_LEAK="dob IN (DATE '1957-09-05', DATE '1965-10-21', DATE '1969-11-23', \
+DATE '1974-12-08', DATE '1978-03-14', DATE '1980-08-19', DATE '1982-06-17', \
+DATE '1985-07-02', DATE '1988-02-26', DATE '1991-01-30', DATE '1993-05-04', \
+DATE '1996-04-11')"
+# DOB_YEAR_ONLY: the year survives, as 1 January. Engine-specific. SQE truncates
+# Date32 to 1 January of the same year (confirmed by
+# sqe-policy/tests/rewriter_integration.rs:625).
+# CALIBRATE: the Kyuubi side is inferred to be date_trunc('YEAR', col), which
+# produces the same value. If Kyuubi nulls the date or truncates differently,
+# dob_year_only diverges while dob_leaks still reads 0, and this becomes a third
+# documented divergence rather than a masking failure.
+#
+# No seeded dob falls on 1 January, so DOB_YEAR_ONLY counts masked rows and
+# nothing else. All twelve birth years are listed because section 3 runs before
+# the residency filter exists.
 DOB_YEAR_ONLY="dob IN (DATE '1957-01-01', DATE '1965-01-01', DATE '1969-01-01', \
 DATE '1974-01-01', DATE '1978-01-01', DATE '1980-01-01', DATE '1982-01-01', \
 DATE '1985-01-01', DATE '1988-01-01', DATE '1991-01-01', DATE '1993-01-01', \
@@ -786,16 +823,19 @@ sum(CASE WHEN risk_score IS NULL THEN 1 ELSE 0 END) AS score_nulled, \
 sum(CASE WHEN $NID_LEAK THEN 1 ELSE 0 END) AS id_leaks, \
 sum(CASE WHEN $IBAN_LEAK THEN 1 ELSE 0 END) AS iban_leaks, \
 sum(CASE WHEN $NAME_LEAK THEN 1 ELSE 0 END) AS name_leaks, \
+sum(CASE WHEN $DOB_LEAK THEN 1 ELSE 0 END) AS dob_leaks, \
 sum(CASE WHEN $DOB_YEAR_ONLY THEN 1 ELSE 0 END) AS dob_year_only FROM $C" \
-  "All five resource masks apply without dropping rows" "12 | 12 | 0 | 0 | 0 | 12"
+  "All five resource masks apply without dropping rows" "12 | 12 | 0 | 0 | 0 | 0 | 12"
 # The same query for a role no mask policy names. Every column flips.
 compare_equal alice "SELECT count(*) AS rows_seen, \
 sum(CASE WHEN risk_score IS NULL THEN 1 ELSE 0 END) AS score_nulled, \
 sum(CASE WHEN $NID_LEAK THEN 1 ELSE 0 END) AS id_leaks, \
 sum(CASE WHEN $IBAN_LEAK THEN 1 ELSE 0 END) AS iban_leaks, \
 sum(CASE WHEN $NAME_LEAK THEN 1 ELSE 0 END) AS name_leaks, \
+sum(CASE WHEN $DOB_LEAK THEN 1 ELSE 0 END) AS dob_leaks, \
 sum(CASE WHEN $DOB_YEAR_ONLY THEN 1 ELSE 0 END) AS dob_year_only FROM $C" \
-  "Alice is outside engineer and remains the raw-value control" "12 | 0 | 12 | 12 | 12 | 0"
+  "Alice is outside engineer and remains the raw-value control" \
+  "12 | 0 | 12 | 12 | 12 | 12 | 0"
 
 section 4 "Row filtering: GDPR data residency"
 action "CREATE OR REPLACE POLICY \"${POLICY_PREFIX}eu-rows\" ON TABLE $C \
