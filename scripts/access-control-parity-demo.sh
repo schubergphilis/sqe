@@ -109,7 +109,8 @@ POLICY_PREFIX=acparity-demo-
 # instance shared with other suites, so keep it on every new tag.
 TAG_NAME=ACPARITY_PII          # governed PII, masked to a token for engineers
 ACCOUNT_TAG=ACPARITY_ACCOUNT   # account identifiers, spans customers + payments
-SPI_TAG=ACPARITY_SPI           # GDPR article 9 special category + national id
+SPI_TAG=ACPARITY_SPI           # GDPR article 9 special category (nationality)
+IDENTITY_TAG=ACPARITY_IDENTITY # direct identifiers: the name and the national id
 NO_RULE_TAG=ACPARITY_NO_RULE   # attached but ungoverned: proves a tag is inert
 NULL_TAG=ACPARITY_NULL         # the resource-vs-tag precedence probe
 
@@ -248,6 +249,38 @@ spark_tsv() { # user sql
     --conf "spark.sql.catalog.sales_wh.token=$token" \
     --conf spark.sql.catalog.sales_wh.token-refresh-enabled=false \
     -e "$2" 2>"$TMP_DIR/spark.err"
+}
+
+# ── side-by-side perspectives (display, not assertion) ───────────────────────
+#
+# The comparisons above prove the two engines agree. They do not SHOW what a
+# policy did: a `CREATE POLICY` prints "(0 rows)", and an aggregate answers
+# "0 leaks" rather than displaying the masked value a data owner would recognise.
+#
+# These panels run one query as several users and print each result. Through SQE
+# only, deliberately: a Spark probe costs a JVM start (~7 s) while an SQE query
+# costs ~200 ms, and parity is already asserted elsewhere. Showing four
+# perspectives is therefore cheaper than one extra comparison.
+#
+# Nothing here asserts. A panel cannot fail the run, so it cannot create a false
+# green either.
+
+sqe_table() { # user sql -- the CLI's own table rendering, minus the connect banner
+  sqe_exec "$1" "$2" | grep -vE '^sqe-cli [0-9.]+ connected to'
+}
+
+perspectives() { # description sql user|label ...
+  local desc="$1" sql="$2" spec user label
+  shift 2
+  echo
+  bold "     .. $desc"
+  dim "     SQL: $sql"
+  for spec in "$@"; do
+    user="${spec%%|*}"
+    label="${spec#*|}"
+    printf '\033[1m       %s\033[0m \033[2m(%s)\033[0m\n' "$label" "$user"
+    sqe_table "$user" "$sql" | sed 's/^/         /'
+  done
 }
 
 normalize_tsv() {
@@ -545,7 +578,7 @@ best_effort_action() { # sql description
 # script is still cleaned up.
 POLICIES="amount-null ssn-last4 email-hash eu-rows geo-tag pii-tag ssn-null-tag broken \
 risk-null nid-last4 iban-hash dob-year name-mask nid-null-tag \
-account-tag-fraud spi-tag-fraud retention-rows"
+account-tag-fraud spi-tag-fraud identity-tag-fraud retention-rows"
 for policy in $POLICIES; do
   best_effort_action "DROP POLICY IF EXISTS \"${POLICY_PREFIX}${policy}\"" \
     "Remove any policy left by an interrupted run"
@@ -553,7 +586,7 @@ done
 
 # SET/UNSET TAGS is idempotent enough for an interrupted fixture. A missing table
 # is expected on the first run and is intentionally ignored here.
-best_effort_action "ALTER TABLE $C UNSET TAGS (phone, residency_region, national_id, nationality)" \
+best_effort_action "ALTER TABLE $C UNSET TAGS (phone, residency_region, national_id, nationality, full_name)" \
   "Reset projected customer tag associations left by an interrupted run"
 best_effort_action "ALTER TABLE $P UNSET TAGS (counterparty_iban)" \
   "Reset projected payment tag associations left by an interrupted run"
@@ -795,6 +828,7 @@ action "CREATE OR REPLACE POLICY \"${POLICY_PREFIX}name-mask\" ON TABLE $C \
 COLUMN MASK MASK TO ROLE engineer ON COLUMN full_name" \
   "Replace the customer name character-by-character through SQE SQL"
 
+
 # Named MASK_SHOW_LAST_4 deliberately is not byte-portable: SQE honors the Hive
 # servicedef transformer, while Kyuubi uses its own character-class replacements
 # (digit -> n). Two rows are enough to document the rendering; the aggregate
@@ -826,6 +860,15 @@ sum(CASE WHEN $NAME_LEAK THEN 1 ELSE 0 END) AS name_leaks, \
 sum(CASE WHEN $DOB_LEAK THEN 1 ELSE 0 END) AS dob_leaks, \
 sum(CASE WHEN $DOB_YEAR_ONLY THEN 1 ELSE 0 END) AS dob_year_only FROM $C" \
   "All five resource masks apply without dropping rows" "12 | 12 | 0 | 0 | 0 | 0 | 12"
+
+# What those five statements actually did, on real rows. The aggregate above
+# proves "no identifier leaked"; this shows a reviewer the values themselves.
+# Placed after that assertion on purpose: by here the policies are known to be
+# live in both engines, so the panel cannot display a pre-settle state.
+perspectives "All five masks on the same three customers" \
+  "SELECT cust_id, full_name, national_id, dob, iban, risk_score FROM $C WHERE cust_id <= 3 ORDER BY cust_id" \
+  "alice|no mask policy names her (the control)" \
+  "bob|engineer: name, national id, IBAN, date of birth, risk score"
 # The same query for a role no mask policy names. Every column flips.
 compare_equal alice "SELECT count(*) AS rows_seen, \
 sum(CASE WHEN risk_score IS NULL THEN 1 ELSE 0 END) AS score_nulled, \
@@ -961,8 +1004,8 @@ action "GRANT SELECT ON $P TO ROLE \"fraud_analyst\"" \
 action "GRANT SELECT ON $P TO ROLE \"analyst\"" \
   "Grant analyst read access to the ledger as the raw control"
 action "ALTER TABLE $C SET TAGS (phone = ('$ACCOUNT_TAG'), nationality = ('$SPI_TAG'), \
-national_id = ('$SPI_TAG'))" \
-  "Tag the register: contact detail as an account identifier, nationality and national_id as special category"
+national_id = ('$IDENTITY_TAG'), full_name = ('$IDENTITY_TAG'))" \
+  "Tag the register: contact detail as an account identifier, nationality as special category, name and national id as direct identifiers"
 action "ALTER TABLE $P SET TAGS (counterparty_iban = ('$ACCOUNT_TAG'))" \
   "Tag the counterparty account in the ledger with the SAME tag"
 sqe_assert ok "SHOW TAGS ON $P" "Read the ledger tag association back" "$ACCOUNT_TAG"
@@ -972,15 +1015,23 @@ COLUMN MASK CUSTOM TO ROLE fraud_analyst USING ('REDACTED')" \
 action "CREATE OR REPLACE POLICY \"${POLICY_PREFIX}spi-tag-fraud\" ON TAG $SPI_TAG \
 COLUMN MASK MASK_NULL TO ROLE fraud_analyst" \
   "Null special-category data for the fraud desk"
+# A separate tag rather than reusing SPI: Ranger refuses a second policy whose
+# resource signature already belongs to one, and a name is a direct identifier
+# rather than article 9 special-category data. Same mask, different reason, and
+# the reason is what an auditor asks about.
+action "CREATE OR REPLACE POLICY \"${POLICY_PREFIX}identity-tag-fraud\" ON TAG $IDENTITY_TAG \
+COLUMN MASK MASK_NULL TO ROLE fraud_analyst" \
+  "Null direct identifiers for the fraud desk"
 # score_visible proves role scoping in the other direction: the engineer's
 # MASK_NULL on risk_score must NOT reach Erin, who needs the score to work.
 compare_equal erin "SELECT count(*) AS rows_seen, \
 sum(CASE WHEN phone = 'REDACTED' THEN 1 ELSE 0 END) AS account_masked, \
 sum(CASE WHEN nationality IS NULL THEN 1 ELSE 0 END) AS nationality_nulled, \
 sum(CASE WHEN national_id IS NULL THEN 1 ELSE 0 END) AS id_nulled, \
+sum(CASE WHEN full_name IS NULL THEN 1 ELSE 0 END) AS name_nulled, \
 sum(CASE WHEN risk_score IS NULL THEN 1 ELSE 0 END) AS score_hidden FROM $C" \
   "The fraud desk keeps every jurisdiction and loses every identifier" \
-  "12 | 12 | 12 | 12 | 0"
+  "12 | 12 | 12 | 12 | 12 | 0"
 # CALIBRATE: the claim under test is that a tag policy is table-independent. If
 # tag projection to Ranger lands only on the register, account_masked comes back
 # 0 here while the register probe above still passes.
@@ -1038,6 +1089,24 @@ FROM $C c JOIN $P p ON p.cust_id = c.cust_id" \
   "Row filter and column masks both survive a join in both engines" \
   "15 | 15 | 15 | 0"
 
+# The whole demo in one frame: one join, four personas, four different answers.
+# Nothing about the SQL changes between these runs. Only who asked.
+#
+#   carol  admin, no policy applies
+#   alice  analyst: unfiltered, unmasked
+#   bob    engineer: EU customers only, five columns masked
+#   erin   fraud desk: every jurisdiction, identity and counterparty removed
+#   frank  audit: unmasked register, payments inside the retention window only
+perspectives "The same join, five ways" \
+  "SELECT c.cust_id, c.full_name, c.national_id, c.residency_region, c.risk_score, \
+p.booked_at, p.counterparty_iban, p.counterparty_country \
+FROM $C c JOIN $P p ON p.cust_id = c.cust_id WHERE p.amount_eur > 5000 ORDER BY c.cust_id, p.pay_id" \
+  "carol|admin: every row, every column" \
+  "alice|analyst: unfiltered and unmasked" \
+  "bob|engineer: EU residents only, five masked columns" \
+  "erin|fraud desk: all jurisdictions, no identity" \
+  "frank|audit: retention window on the ledger only"
+
 section 10 "REVOKE closes the catalog gate again"
 # Closing the gate takes three revokes, and the third is the interesting one.
 # Bob holds BOTH demo roles in Keycloak, so revoking `engineer` leaves the
@@ -1062,7 +1131,7 @@ sqe_assert ok "CHECK ACCESS SELECT ON $C FOR USER \"bob\"" \
   "Confirm no grant path is left before asserting the denial" 'false' 'true'
 compare_denied bob "$Q_CUST" "After REVOKE, both engines deny Bob again"
 
-action "ALTER TABLE $C UNSET TAGS (phone, residency_region, national_id, nationality)" \
+action "ALTER TABLE $C UNSET TAGS (phone, residency_region, national_id, nationality, full_name)" \
   "Security teardown: remove projected register tag associations"
 action "ALTER TABLE $P UNSET TAGS (counterparty_iban)" \
   "Security teardown: remove projected ledger tag associations"
