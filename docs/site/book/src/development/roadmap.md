@@ -241,6 +241,7 @@ Landed June 2026 across five sub-phases; the end-to-end demo is `quickstart/pola
 - **FUTURE grants**: `GRANT ... ON FUTURE TABLES IN SCHEMA x` via Ranger table wildcards
 - **Conditional masks**: a CUSTOM mask expression can reference sibling columns of the same row; qualified references fail closed
 - **Spark parity**: the same Ranger policies produce byte-exact masked output in SQE and Spark/Kyuubi (`parity-test.sh` in the quickstart)
+- **Cross-engine walkthrough**: `scripts/access-control-parity-demo.sh` runs 34 comparisons over an EU retail bank fixture (a 12-row customer register, a 24-row payment ledger) covering five resource masks, GDPR data-residency row filtering, tag masks that span both tables, and four personas: an analyst, an engineer, a fraud desk that sees every jurisdiction with no customer identity, and an auditor that reads the register unmasked but the ledger only inside a retention window. Each known divergence is asserted with both engines' expected values rather than skipped
 
 Not yet wired:
 

@@ -36,6 +36,14 @@
       {
         "name": "analyst",
         "description": "Analyst: read-only"
+      },
+      {
+        "name": "fraud_analyst",
+        "description": "Fraud desk: every jurisdiction, no customer identity (GDPR data minimisation)"
+      },
+      {
+        "name": "auditor",
+        "description": "Compliance audit: unmasked customer register, payments limited to the retention window"
       }
     ]
   },
@@ -172,6 +180,44 @@
         }
       ],
       "realmRoles": [],
+      "requiredActions": []
+    },
+    {
+      "username": "erin",
+      "email": "erin@example.com",
+      "firstName": "Erin",
+      "lastName": "FraudDesk",
+      "enabled": true,
+      "emailVerified": true,
+      "credentials": [
+        {
+          "type": "password",
+          "value": "erin123",
+          "temporary": false
+        }
+      ],
+      "realmRoles": [
+        "fraud_analyst"
+      ],
+      "requiredActions": []
+    },
+    {
+      "username": "frank",
+      "email": "frank@example.com",
+      "firstName": "Frank",
+      "lastName": "Auditor",
+      "enabled": true,
+      "emailVerified": true,
+      "credentials": [
+        {
+          "type": "password",
+          "value": "frank123",
+          "temporary": false
+        }
+      ],
+      "realmRoles": [
+        "auditor"
+      ],
       "requiredActions": []
     }
   ]

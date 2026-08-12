@@ -1,6 +1,6 @@
 # SQE — Next Steps
 
-> **OPEN, suite hygiene: `make test-access-control` leaks its own grants between runs, so two denial-baseline tests fail on any stack the suite has already used.**
+> **FIXED 2026-08-12, suite hygiene: `make test-access-control` leaked its own grants between runs, so two denial-baseline tests failed on any stack the suite had already used.**
 >
 > `denied_before_any_grant` and `all_tables_in_schema_grant_covers_the_namespace` both time out after 120 s with `still allowed for alice with 3 rows`. The cause is in Ranger, not in the assertion: a policy named `grant-1786370165684` grants role `analyst` sixteen access types on `sales_wh.ac.orders`, and alice is in `analyst`.
 >
@@ -8,7 +8,21 @@
 >
 > Proven rather than argued: deleting the leaked `grant-*` policies and re-running the three tests turns all of them green, with no code change. It leaks on EVERY run, not just historically. Of the three deleted, two survived from 2026-08-10 15:56 and one (`grant-1786440718652`) was written by the run executed minutes earlier the same day. `bootstrap-ranger.sh` seeds only wildcard admin/baseline policies and never a namespace-`ac` grant, so these can only be test residue.
 >
-> Fix: have `bootstrap()` also revoke `grant-*` policies scoped to the suite's own namespaces (`sales_wh.ac`, `ops_wh.ac`), the way the parity demo's "Security baseline" revokes do. A prefix-scoped clean is only as good as the prefix, and the SQL write path was never in it.
+> Fixed by having `bootstrap()` delete every coarse-gate (`polaris`) policy scoped inside the suite's own namespaces, in `delete_suite_grants`. Scoped by RESOURCE, not by a second name prefix: adding `grant-` would repeat the original mistake the first time Ranger changes that format or merges a grant into a policy someone else named. The resource coordinate is what makes a policy the suite's.
+>
+> Measured on the live stack, before and after one run:
+>
+> | | before | after |
+> |---|---:|---:|
+> | polaris policies scoped to namespace `ac` | 9 | **0** |
+> | bootstrap catalog-wildcard grants | 3 | 3 |
+> | parity-demo `acparity` policies | 6 | 6 |
+>
+> The nine included `grant-1786441368465` on `sales_wh.ac.orders` carrying `roles=['analyst']`, created 2026-08-11 09:42 and still alive through a run on 2026-08-12 09:04. Alice is in `analyst`, which is exactly why she read three rows in a test whose job was to prove she could not.
+>
+> **Live verdict: 41 passed, 0 failed** (`scripts/access-control-test.sh`, 612 s). `denied_before_any_grant` and `revoke_disables_access` both pass; the same run failed both beforehand. Nine unit tests pin the scoping predicate's boundaries (wildcards, catalog-level, foreign catalogs, `acparity`, multi-valued resources, malformed JSON) because it decides what gets DELETED from a service the suite does not own.
+>
+> Two things the fix deliberately does NOT do. It spares catalog-level and wildcard policies: `bootstrap-ranger.sh` seeds those and they are shared with the demo and Polaris itself. And it spares every other namespace, so the parity demo's `acparity` work is untouched, which is what lets the two suites share one Ranger.
 
 > **Measured: there is no cache to flush. Policy propagation and table load are both sub-second, and the demo's 45 minutes were failing assertions, not latency.**
 >
@@ -55,6 +69,24 @@
 >    Measured live, in sequence: analyst holds SELECT + INSERT and bob reads; `REVOKE SELECT` leaves bob reading; `REVOKE ALL PRIVILEGES` produces 403 `LOAD_TABLE`; a second run succeeds as a no-op.
 > 3. **Assert with `CHECK ACCESS`, not with a query result.** SQE already has `CHECK ACCESS SELECT ON t FOR USER x`, which answers "can this principal read this, and via which grant". It would have made this defect obvious immediately, where `SHOW GRANTS` did not: `SHOW GRANTS` lists the statements issued, and the operative fact was the expansion. The parity demo should `CHECK ACCESS` before asserting the denial.
 > 4. **Say what admin and ownership bypass.** Unity Catalog owners keep their privileges and cannot be revoked out of them. SQE's `admin_roles` behave similarly and that is nowhere in the revoke story.
+
+> Status as of 2026-08-12. **The parity demo now runs on an EU retail bank fixture, and adding a persona to the quickstart stack turns out to touch five places rather than three.**
+>
+> The fixture was `orders(id, region, amount, ssn, email, phone)` with three rows. The mechanics were complete; the transcript did not show what they were for. It is now a 12-row customer register and a 24-row payment ledger: `national_id`, `dob`, `iban`, `nationality`, `residency_region`, `pep_flag`, `risk_score`, and cross-border payments carrying counterparty country, channel, and AML alerts. The old policy targets map over, so sections 1 to 7 keep their probe count and gain a meaning: the row filter is GDPR data residency, `MASK_HASH` on `iban` is a pseudonymous account key, `MASK_NULL` hides an internal risk score.
+>
+> Two mask types join section 3 (`MASK_DATE_SHOW_YEAR` on `dob`, `MASK` on `full_name`), and two personas express shapes the analyst/engineer pair cannot: a fraud desk (`fraud_analyst`/erin) that sees every jurisdiction with no customer identity, and an auditor (`auditor`/frank) that reads the register unmasked but the ledger only inside a retention window. Their two new sections prove the things a one-table fixture cannot: one tag rule spanning both tables, a row filter staying scoped to the table its policy names, and a join carrying both a filter and five column masks. 34 comparisons, up from 27.
+>
+> **The trap: a new demo identity needs FIVE edits, and the fifth fails as a denial.** Keycloak realm role plus user, the Ranger users loop, `mkrole` membership, the baseline traverse loop, and `polaris/bootstrap-data.sh`. Polaris federation resolves an EXISTING principal by `preferred_username` and never creates one, so a realm-only user mints a token successfully and then fails every read with 401 "Failed to resolve principal". Under a role-scoped policy that is indistinguishable from the denials this demo asserts deliberately, so it would have been diagnosed as a policy bug. `preflight_role` and `preflight_principal` now name both failures in the first seconds instead of twenty minutes in.
+>
+> **Assertions are aggregates over semantics, not pinned renderings.** A `count(*)` plus `sum(CASE WHEN ...)` states the security claim without depending on how an engine prints a digest, a float, or a date, so two engines that mask correctly but print differently still agree, and one that does not mask at all fails loudly. Every derived number is checked against the seeded rows in code rather than reasoned: 12 customers / 7 EU, 24 payments / 18 in window, 4 alerts, 15 joined rows, the twelve distinct birth years, no `dob` on 1 January, all IBANs at most 28 characters. Two renderings come from source rather than guesswork: `ranger_store.rs` maps `MASK_SHOW_LAST_4` to `PartialMask{show_last: 4, digit: 'x'}`, and `sha256_udf.rs` emits 64 lowercase hex characters.
+>
+> **CALIBRATED: 43 of 43 comparisons green on a live stack, first pass, exit 0.** Both open inferences held, so neither became a third documented divergence: Kyuubi truncates `MASK_DATE_SHOW_YEAR` to 1 January exactly as SQE does (both returned `dob_year_only = 12`), and it applies a row filter AND column masks to a JOINED relation the way SQE does (both returned `15 | 15 | 15 | 0`). The derived Spark rendering `nnnnn9103` was exact. `AC_PARITY_SECTIONS="3,8,9"` gates comparisons only and never the GRANT/policy/tag actions, so a re-check of the new sections costs minutes rather than a full run.
+>
+> The run contradicted one of my own captions, which is what running it is for. The five-way panel called carol "every row, every column"; she is `sqe_admin` AND `engineer` AND `analyst` in the realm, so the engineer policy applies to her and she reads the same four masked EU rows Bob does. **Being an admin at the OBJECT gate is not an exemption from the DATA gate.** Relabelled to say so, since that is the better lesson.
+>
+> Adding a persona to this stack needs FIVE seeded sites, and a stack seeded before them needs `keycloak-config`, `ranger-setup` and `polaris-setup` force-recreated. All three are idempotent, so re-running them on a live stack is safe.
+>
+> Two dead ends worth not re-walking. `MASK_NONE` cannot serve as a break-glass exemption: matching policies are unioned, so lifting a mask needs Ranger evaluation-order priorities SQE does not implement (`ranger_store.rs:497`, and `access_control_e2e.rs:1747` already says so). Column restriction is not authorable at all: `restricted_columns` is populated only fail-closed, on an unsupported mask type, so "invisible denied columns" cannot be demonstrated through this surface.
 
 > Status as of 2026-08-11. **OPEN: the parser rejects dbt-trino's view DDL, and `SECURITY` is not the only token it rejects.**
 >
