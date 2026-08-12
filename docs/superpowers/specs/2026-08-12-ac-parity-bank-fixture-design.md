@@ -84,17 +84,27 @@ comparison between them, not two, and both are asserted by semantics:
 | `fraud_analyst` | erin | tag-driven masks, no row filter | data minimisation: identity hidden, every jurisdiction visible |
 | `auditor` | frank | no masks, retention row filter on `payments` only | right of access over a seven-year window, no leak into `customers` |
 
-Adding a persona touches four sites, and missing the last two produces a traverse
-denial that is indistinguishable from a policy denial:
+Adding a persona touches five sites, and missing any of the last three produces
+an authorization error indistinguishable from the policy denials this script
+asserts deliberately:
 
 1. `quickstart/polaris-ranger-keycloak/keycloak/realm-ranger.json` - realm role
    plus user, password `<username>123` (the convention `token_for` assumes).
-2. `ranger/bootstrap-ranger.sh` - the `for u in root alice bob ...` loop, which
+2. `polaris/bootstrap-data.sh` - the principal ENTITY. Polaris federation
+   resolves an existing principal by `preferred_username` and never creates one,
+   so a realm-only user mints a token and then fails every read with 401
+   "Failed to resolve principal".
+3. `ranger/bootstrap-ranger.sh` - the `for u in root alice bob ...` loop, which
    creates the Ranger-side grantee reference.
-3. `ranger/bootstrap-ranger.sh` - `mkrole`, the user-to-role membership Ranger
+4. `ranger/bootstrap-ranger.sh` - `mkrole`, the user-to-role membership Ranger
    actually resolves (Polaris ignores realm roles carried in the token).
-4. `ranger/bootstrap-ranger.sh` - the `for role in analyst engineer` baseline
+5. `ranger/bootstrap-ranger.sh` - the `for role in analyst engineer` baseline
    traverse loop.
+
+Sites 2, 3, and 4 fail in ways that need a preflight to be legible, so the script
+carries `preflight_role` (the Ranger grant API's grantee-exists check) and
+`preflight_principal` (the Polaris resolution error). Site 1 is already covered by
+the startup token loop, and site 5 by the same preflights.
 
 ### Two new sections
 
@@ -133,9 +143,16 @@ keep that from turning the script's green into a guess:
 2. Every literal that could not be derived from an already-calibrated value
    carries a `# CALIBRATE:` comment naming what to confirm.
 
-Two pinned renderings are derived from the existing calibrated pair
-(`xxx-xx-1111` / `nnnUnnU1111`): with a separator-free nine-digit identifier they
-become `xxxxx9103` and `nnnnn9103`. Both are marked.
+The SQE side of the `MASK_SHOW_LAST_4` rendering is confirmed from source rather
+than assumed: `ranger_store.rs` maps it to `PartialMask{show_last: 4, digit: 'x'}`,
+so a nine-digit identifier renders `xxxxx9103`. The Spark side (`nnnnn9103`) is
+derived from the previously calibrated pair `xxx-xx-1111` / `nnnUnnU1111` and is
+marked. `MASK_HASH` emitting 64 lowercase hex characters is likewise confirmed
+(`sha256_udf.rs` `hex_lower`), which is why the digest-length divergence keeps its
+pinned `64` / `32`.
+
+The script has never executed past bootstrap in this change. Not one comparison
+has run, so "uncalibrated" means unrun, not merely unconfirmed.
 
 `AC_PARITY_SECTIONS="3,9,10"` gates the comparisons only. Every `action` still
 runs, so grants, policies, and tags that later sections depend on are always in
