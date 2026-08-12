@@ -28,7 +28,8 @@ live testing. The mapping has two halves: users and roles, handled differently.
 **Users (principals).** Polaris federates the principal from the Keycloak token:
 the principal name is `preferred_username`. But federation RESOLVES an existing
 principal entity; it does not create one. So each user must be pre-created as a
-Polaris principal (the data bootstrap creates `alice`, `bob`, `carol`, `dave`).
+Polaris principal (the data bootstrap creates `alice`, `bob`, `carol`, `dave`, `erin`,
+`frank`).
 A token for a principal that does not exist is rejected with 401 "Failed to
 resolve principal". Polaris sends this principal name to Ranger as the `user`.
 
