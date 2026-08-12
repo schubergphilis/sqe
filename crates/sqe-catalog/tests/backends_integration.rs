@@ -474,7 +474,13 @@ warehouse = "{warehouse}"
         // for the JDBC backend — alias coverage in dispatch is by
         // serde, not by code in catalog_ops.
         let view_err = session_catalog
-            .create_view(&ns, "should_not_create", "SELECT 1", &serde_json::json!({}))
+            .create_view(
+                &ns,
+                "should_not_create",
+                "SELECT 1",
+                &serde_json::json!({}),
+                &std::collections::HashMap::new(),
+            )
             .await
             .expect_err("create_view should error on JDBC backend");
         let msg = format!("{view_err}");

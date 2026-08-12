@@ -1926,6 +1926,64 @@ fn is_namespace_already_exists(err: &iceberg::Error) -> bool {
         || msg.contains("conflict")
 }
 
+/// Collect the Iceberg view `properties` map from a parsed `CREATE VIEW`.
+///
+/// Trino's `COMMENT` and `SECURITY` clauses reach the AST via
+/// `sqe_sql::view_compat`, which folds them into `CreateView::comment` and a
+/// `WITH (sqe_view_security = ...)` option. Writing them onto the view means the
+/// intent travels with the object in Iceberg metadata instead of being dropped
+/// at parse time, the same argument as `sqe.column-tags`.
+///
+/// `SECURITY DEFINER` is RECORDED, NOT HONOURED, and the warning says so. Trino's
+/// DEFINER runs a view with its creator's privileges; SQE has no service account
+/// to run as, so views always evaluate as INVOKER. That is stricter than DEFINER
+/// asks for (a reader who was meant to be shielded from base-table grants is
+/// denied instead of allowed), so it fails closed. The warning exists because the
+/// resulting denials are otherwise unexplainable to someone whose view works in
+/// Trino.
+fn view_properties(
+    cv: &sqlparser::ast::CreateView,
+    username: &str,
+) -> HashMap<String, String> {
+    let mut props = HashMap::new();
+    if let Some(comment) = &cv.comment {
+        props.insert("comment".to_string(), comment.clone());
+    }
+
+    let options: &[SqlOption] = match &cv.options {
+        sqlparser::ast::CreateTableOptions::With(opts) => opts,
+        sqlparser::ast::CreateTableOptions::Options(opts) => opts,
+        _ => &[],
+    };
+    for opt in options {
+        let SqlOption::KeyValue { key, value } = opt else { continue };
+        if !key.value.eq_ignore_ascii_case(sqe_sql::VIEW_SECURITY_OPTION) {
+            continue;
+        }
+        let mode = match value {
+            Expr::Value(v) => match &v.value {
+                Value::SingleQuotedString(s) => s.clone(),
+                other => other.to_string(),
+            },
+            other => other.to_string(),
+        };
+        props.insert("sqe.view-security".to_string(), mode.clone());
+        if mode.eq_ignore_ascii_case("definer") {
+            props.insert("sqe.view-definer".to_string(), username.to_string());
+            tracing::warn!(
+                view = %cv.name,
+                definer = %username,
+                "SECURITY DEFINER recorded but not enforced: SQE evaluates views with \
+                 the querying user's privileges (INVOKER). Readers still need access to \
+                 the view's base tables, so a reader without them is denied rather than \
+                 shielded. Grant the base tables, or keep the view for users who \
+                 already have them."
+            );
+        }
+    }
+    props
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2242,62 +2300,4 @@ mod tests {
             assert!(is_namespace_already_exists(&e), "should match: {msg}");
         }
     }
-}
-
-/// Collect the Iceberg view `properties` map from a parsed `CREATE VIEW`.
-///
-/// Trino's `COMMENT` and `SECURITY` clauses reach the AST via
-/// `sqe_sql::view_compat`, which folds them into `CreateView::comment` and a
-/// `WITH (sqe_view_security = ...)` option. Writing them onto the view means the
-/// intent travels with the object in Iceberg metadata instead of being dropped
-/// at parse time, the same argument as `sqe.column-tags`.
-///
-/// `SECURITY DEFINER` is RECORDED, NOT HONOURED, and the warning says so. Trino's
-/// DEFINER runs a view with its creator's privileges; SQE has no service account
-/// to run as, so views always evaluate as INVOKER. That is stricter than DEFINER
-/// asks for (a reader who was meant to be shielded from base-table grants is
-/// denied instead of allowed), so it fails closed. The warning exists because the
-/// resulting denials are otherwise unexplainable to someone whose view works in
-/// Trino.
-fn view_properties(
-    cv: &sqlparser::ast::CreateView,
-    username: &str,
-) -> HashMap<String, String> {
-    let mut props = HashMap::new();
-    if let Some(comment) = &cv.comment {
-        props.insert("comment".to_string(), comment.clone());
-    }
-
-    let options: &[SqlOption] = match &cv.options {
-        sqlparser::ast::CreateTableOptions::With(opts) => opts,
-        sqlparser::ast::CreateTableOptions::Options(opts) => opts,
-        _ => &[],
-    };
-    for opt in options {
-        let SqlOption::KeyValue { key, value } = opt else { continue };
-        if !key.value.eq_ignore_ascii_case(sqe_sql::VIEW_SECURITY_OPTION) {
-            continue;
-        }
-        let mode = match value {
-            Expr::Value(v) => match &v.value {
-                Value::SingleQuotedString(s) => s.clone(),
-                other => other.to_string(),
-            },
-            other => other.to_string(),
-        };
-        props.insert("sqe.view-security".to_string(), mode.clone());
-        if mode.eq_ignore_ascii_case("definer") {
-            props.insert("sqe.view-definer".to_string(), username.to_string());
-            tracing::warn!(
-                view = %cv.name,
-                definer = %username,
-                "SECURITY DEFINER recorded but not enforced: SQE evaluates views with \
-                 the querying user's privileges (INVOKER). Readers still need access to \
-                 the view's base tables, so a reader without them is denied rather than \
-                 shielded. Grant the base tables, or keep the view for users who \
-                 already have them."
-            );
-        }
-    }
-    props
 }

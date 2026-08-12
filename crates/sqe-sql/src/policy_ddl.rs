@@ -216,10 +216,9 @@ fn take_parenthesized(s: &str) -> Result<(String, &str)> {
 
 fn take_name<'a>(s: &'a str, what: &str) -> Result<(String, &'a str)> {
     let s = s.trim_start();
-    if s.starts_with('"') {
-        if let Some(end) = s[1..].find('"') {
-            let end = end + 1;
-            return Ok((s[1..end].to_string(), &s[end + 1..]));
+    if let Some(quoted) = s.strip_prefix('"') {
+        if let Some(end) = quoted.find('"') {
+            return Ok((quoted[..end].to_string(), &quoted[end + 1..]));
         }
         return syntax(&format!("unterminated quoted {what}"));
     }
