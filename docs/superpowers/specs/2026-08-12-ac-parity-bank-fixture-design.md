@@ -52,7 +52,7 @@ and no unmasked row does" without pinning a date rendering.
 
 ### Existing policy targets map over
 
-Sections 1-8 keep their probe count and change only vocabulary.
+Sections 1-7 keep their probe count and change only vocabulary.
 
 | old column | new column | role in the demo |
 |---|---|---|
@@ -70,8 +70,11 @@ rendering. `amount_eur` stays DOUBLE and is never asserted by value.
 `dob` gets `MASK_DATE_SHOW_YEAR` and `full_name` gets plain `MASK`. Both add one
 comparison between them, not two, and both are asserted by semantics:
 
-- date: `sum(CASE WHEN month(dob) = 1 AND day(dob) = 1 ...)` is 7 for the masked
-  role and 0 for the control.
+- date: two separate claims. `dob_leaks` counts rows still holding a seeded birth
+  date and must be 0; `dob_year_only` counts rows reporting 1 January of the right
+  year and must be 12. Written as `dob IN (DATE '...', ...)` rather than
+  `month()`/`day()`, because those standalone date functions are not portable
+  across both engines while a DATE literal is.
 - name: masked names contain only `X`, `x`, `n`, and separators, so
   "no row still contains a vowel" holds under either engine's replacement chars.
   SQE leaves separators alone and Kyuubi maps them to `U`; the vowel test is blind
@@ -108,14 +111,18 @@ the startup token loop, and site 5 by the same preflights.
 
 ### Two new sections
 
-**9. Data minimisation for the fraud desk.** One tag policy on `ACPARITY_PII`
+**8. Data minimisation for the fraud desk.** One tag policy on `ACPARITY_ACCOUNT`
 covers `customers.phone` and `payments.counterparty_iban`, proving a tag policy is
-table-independent: one rule, two tables, no per-table authoring. A second tag,
-`ACPARITY_SPI`, carries GDPR article 9 special-category data on `nationality` and
-resolves to `MASK_NULL`. Erin sees all 12 customers and all 24 payments, with
+table-independent: one rule, two tables, no per-table authoring. `ACPARITY_SPI`
+carries GDPR article 9 special-category data on `nationality`, and
+`ACPARITY_IDENTITY` carries the direct identifiers `full_name` and `national_id`;
+both resolve to `MASK_NULL`. Three tags rather than one because Ranger refuses a
+second policy whose resource signature already belongs to another, so one tag
+cannot carry two masks for two roles, and because the REASON a column is protected
+is what an auditor asks about. Erin sees all 12 customers and all 24 payments with
 identity removed. Alice stays the raw control. Three comparisons.
 
-**10. Audit right of access with a retention window.** Frank reads `customers`
+**9. Audit right of access with a retention window.** Frank reads `customers`
 unmasked, which proves the mask policies are role-scoped, and reads `payments`
 through `booked_at >= DATE '2019-01-01'`, which proves a filter on one table does
 not reach the other. The third comparison is the join probe: Bob reads
@@ -126,10 +133,21 @@ Total: seven new Spark probes, five to ten minutes of added wall clock.
 
 ### Tag vocabulary
 
-`ACPARITY_PII` (masked to a fixed token), `ACPARITY_SPI` (nulled),
+`ACPARITY_PII` (engineer, masked to a fixed token), `ACPARITY_ACCOUNT` (fraud
+desk, account identifiers across both tables), `ACPARITY_SPI` (fraud desk, article
+9 special category), `ACPARITY_IDENTITY` (fraud desk, direct identifiers),
 `ACPARITY_NULL` (the precedence probe, unchanged), `ACPARITY_NO_RULE` (the inert
 probe, unchanged). The `ACPARITY_` prefix and the `acparity-demo-` policy prefix
 stay: they are what makes teardown safe on a shared Ranger.
+
+### Display panels
+
+Two panels run one query as several users and print each result with the CLI's own
+table rendering, through SQE only. A Spark probe costs a JVM start (~7 s) against
+~200 ms for an SQE query, and parity is asserted elsewhere, so five perspectives
+cost less than one extra comparison. Nothing in a panel asserts, so none can
+produce a false green. Section 3 shows all five masks beside the unmasked control;
+section 9 shows the same join five ways.
 
 ## Calibration: done, 43 of 43 green
 
