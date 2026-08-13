@@ -86,7 +86,15 @@ services:
   # 15432 is offset from the production default (5432) to avoid
   # collisions on dev boxes.
   postgres:
-    image: postgres:18-alpine
+    # Pinned to 13 to match renovate.json's `allowedVersions: "<14"` for
+    # postgres. 18+ stores data in a major-version-specific subdirectory, so an
+    # existing volume from an older image is unreadable and the container exits 1
+    # before pg_isready ever passes. That is what broke the Ranger quickstart on
+    # 2026-08-07; the follow-up pinned ranger-db and left this service on 18,
+    # where nobody noticed because `TYPE jdbc` was unimplemented and so nothing
+    # ever started it. If you already have a volume built by 18, reset it with
+    # `docker compose -f docker-compose.test.yml down -v`.
+    image: postgres:13-alpine
     environment:
       POSTGRES_USER: iceberg
       POSTGRES_PASSWORD: iceberg
