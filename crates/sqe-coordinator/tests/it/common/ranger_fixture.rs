@@ -447,7 +447,11 @@ impl RangerAdmin {
         let resp = self
             .req(
                 reqwest::Method::GET,
-                &format!("/service/tags/download/{service}"),
+                // SECURE path: the non-secure one is `security="none"` and serves
+                // the whole tag store to an unauthenticated caller, and Ranger
+                // 2.9.0 stops serving it without
+                // `ranger.admin.allow.unauthenticated.download.access`.
+                &format!("/service/tags/secure/download/{service}"),
             )
             .send()
             .await
@@ -653,7 +657,7 @@ impl RangerAdmin {
         let resp = self
             .req(
                 reqwest::Method::GET,
-                &format!("/service/plugins/policies/download/{service}"),
+                &format!("/service/plugins/secure/policies/download/{service}"),
             )
             .send()
             .await

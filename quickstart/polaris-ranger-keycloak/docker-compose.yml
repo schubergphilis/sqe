@@ -134,7 +134,7 @@ services:
   # runs schema DDL and can take 2-4 minutes; the port-open healthcheck just
   # gates dependents, and ranger-setup does the real REST-readiness wait.
   ranger-admin:
-    image: apache/ranger:2.8.0
+    image: apache/ranger:2.9.0
     environment:
       RANGER_VERSION: 2.8.0
       RANGER_DB_TYPE: postgres
