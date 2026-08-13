@@ -328,6 +328,9 @@ pub struct RangerGrantBackend {
     admin_password: String,
     /// Value for the `root` resource level (empty = omit).
     realm: String,
+    /// Which transport authorizes a privilege write, and therefore which one is
+    /// used. See `apply_via_policy_api` for why there are two.
+    grant_authority: sqe_core::config::GrantAuthority,
 }
 
 impl RangerGrantBackend {
@@ -340,6 +343,7 @@ impl RangerGrantBackend {
         realm: &str,
         timeout_secs: u64,
         accept_invalid_certs: bool,
+        grant_authority: sqe_core::config::GrantAuthority,
     ) -> sqe_core::Result<Self> {
         let client = Client::builder()
             .timeout(Duration::from_secs(timeout_secs))
@@ -353,7 +357,22 @@ impl RangerGrantBackend {
             admin_user: admin_user.to_string(),
             admin_password: admin_password.to_string(),
             realm: realm.to_string(),
+            grant_authority,
         })
+    }
+
+    /// Does this store delegate the authority decision to Ranger?
+    ///
+    /// True only under `grant_authority = "ranger-delegate"`, which is also the
+    /// only mode that uses the plugin endpoint. Keeping one predicate behind both
+    /// the transport choice and `enforces_grantor_authority` is what stops the two
+    /// drifting into the combination that matters: writing through a transport
+    /// that checks nothing while telling the coordinator to stand its gate down.
+    fn delegates_authority_to_ranger(&self) -> bool {
+        matches!(
+            self.grant_authority,
+            sqe_core::config::GrantAuthority::RangerDelegate
+        )
     }
 
     /// Validate the resource identifiers in a grant/revoke statement and build
@@ -808,13 +827,67 @@ impl RangerGrantBackend {
         }
     }
 
+    /// POST to Ranger's plugin grant/revoke endpoint.
+    ///
+    /// Used ONLY under `grant_authority = "ranger-delegate"`, where Ranger's
+    /// per-resource check on the `grantor` field is the authority and the
+    /// coordinator has stood its own admin gate down. Nothing else authorizes the
+    /// write in that mode, which is why the transport cannot be swapped for the
+    /// policy API there: the policy API takes no grantor and would authorize the
+    /// REST admin instead, turning an ungated GRANT into self-escalation.
+    ///
+    /// Two properties of this endpoint the operator is opting into:
+    /// Ranger declares it `security="none"`, so it accepts unauthenticated
+    /// callers, and Ranger 2.9.0 refuses it outright unless
+    /// `ranger.admin.allow.unauthenticated.access` is enabled.
+    async fn post_to_plugin_endpoint(
+        &self,
+        op: &str,
+        body: &GrantRevokeRequest,
+    ) -> sqe_core::Result<()> {
+        let url = format!(
+            "{}/service/plugins/services/{op}/{}",
+            self.admin_url, self.service_name
+        );
+        let resp = self
+            .client
+            .post(&url)
+            .basic_auth(&self.admin_user, Some(&self.admin_password))
+            .json(body)
+            .send()
+            .await
+            .map_err(|e| sqe_core::SqeError::Execution(format!("Ranger {op} request failed: {e}")))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(sqe_core::SqeError::Execution(format!(
+                "HTTP {status}{}",
+                if text.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!(". Ranger said: {}", text.trim())
+                }
+            )));
+        }
+        Ok(())
+    }
+
     async fn post_grant_revoke_inner(
         &self,
         op: &str,
         privilege: Option<&str>,
         body: &GrantRevokeRequest,
     ) -> sqe_core::Result<()> {
-        match self.apply_via_policy_api(op, body).await {
+        let attempt = if self.delegates_authority_to_ranger() {
+            // Ranger's own grantor check IS the authority in this mode, and only
+            // the plugin endpoint performs it. Note the cost: that endpoint is
+            // declared `security="none"`, and Ranger 2.9.0 refuses it unless
+            // `ranger.admin.allow.unauthenticated.access` is on.
+            self.post_to_plugin_endpoint(op, body).await
+        } else {
+            self.apply_via_policy_api(op, body).await
+        };
+        match attempt {
             Ok(()) => {
                 debug!(op, service = %self.service_name, "Ranger {op} completed");
                 Ok(())
@@ -2177,7 +2250,11 @@ impl GrantBackend for RangerGrantBackend {
     /// authorizes the REST user and takes no grantor. `handle_deny` keeps its own
     /// admin gate for exactly that reason.
     fn enforces_grantor_authority(&self) -> bool {
-        true
+        // Only the plugin endpoint authorizes the grantor, and only delegate mode
+        // uses it. Under the default `admin-role` this is false, which is what
+        // keeps the coordinator's admin gate standing over a policy-API write
+        // that authorizes the REST user rather than the caller.
+        self.delegates_authority_to_ranger()
     }
 }
 
@@ -2216,7 +2293,7 @@ mod tests {
 
     // ── Task 4: constructor + grantee split + URL guard ──────────────
 
-    fn test_backend() -> RangerGrantBackend {
+    fn backend_with(authority: sqe_core::config::GrantAuthority) -> RangerGrantBackend {
         RangerGrantBackend::new(
             "http://ranger:6080/",
             "polaris",
@@ -2225,8 +2302,47 @@ mod tests {
             "POLARIS",
             30,
             false,
+            authority,
         )
         .unwrap()
+    }
+
+    fn test_backend() -> RangerGrantBackend {
+        backend_with(sqe_core::config::GrantAuthority::AdminRole)
+    }
+
+    /// The transport and the authority claim must never disagree.
+    ///
+    /// The dangerous combination is writing through the policy API, which
+    /// authorizes the REST admin and ignores the grantor, while reporting
+    /// `enforces_grantor_authority() == true`: the coordinator stands its admin
+    /// gate down (`admin_gate_required` returns false for RangerDelegate when the
+    /// backend claims to enforce) and nothing checks the caller at all. One
+    /// predicate drives both, and this pins that they stay in step.
+    #[test]
+    fn authority_claim_matches_the_transport() {
+        use sqe_core::config::GrantAuthority;
+
+        let default_mode = backend_with(GrantAuthority::AdminRole);
+        assert!(
+            !default_mode.delegates_authority_to_ranger(),
+            "default mode must use the policy API"
+        );
+        assert!(
+            !default_mode.enforces_grantor_authority(),
+            "a policy-API write authorizes the REST user, not the grantor, so the \
+             coordinator's admin gate must stay up"
+        );
+
+        let delegate = backend_with(GrantAuthority::RangerDelegate);
+        assert!(
+            delegate.delegates_authority_to_ranger(),
+            "delegate mode must use the plugin endpoint, the only one that checks the grantor"
+        );
+        assert!(
+            delegate.enforces_grantor_authority(),
+            "delegate mode is precisely the case where Ranger performs the check"
+        );
     }
 
     #[test]

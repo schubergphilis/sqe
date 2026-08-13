@@ -16,8 +16,20 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 const SERVICE: &str = "polaris";
 
 fn backend(url: &str) -> RangerGrantBackend {
+    // RangerDelegate on purpose: these cases assert against the PLUGIN
+    // grant/revoke endpoint, which is the transport only this mode uses (it is the
+    // one that authorizes the `grantor` field, which is the whole point of the
+    // mode). The default `admin-role` writes through the authenticated policy API
+    // instead, covered by `policy_api_*` below.
     RangerGrantBackend::new(
-        url, SERVICE, "admin", "admin-pw", "POLARIS", 30, false,
+        url,
+        SERVICE,
+        "admin",
+        "admin-pw",
+        "POLARIS",
+        30,
+        false,
+        sqe_core::config::GrantAuthority::RangerDelegate,
     )
     .unwrap()
 }
@@ -567,5 +579,184 @@ async fn revoke_all_privileges_still_requires_a_grantor() {
     assert!(
         server.received_requests().await.unwrap_or_default().is_empty(),
         "refusal must happen before any request"
+    );
+}
+
+// ── default `admin-role` mode: the authenticated policy API ──────────────────
+//
+// These pin the merge semantics the plugin endpoint used to perform server-side
+// and that SQE now owns. Getting the union wrong is not a crash, it is a wrong
+// privilege set in production, so each case asserts on the body actually sent.
+
+fn policy_api_backend(url: &str) -> RangerGrantBackend {
+    RangerGrantBackend::new(
+        url,
+        SERVICE,
+        "admin",
+        "admin-pw",
+        "POLARIS",
+        30,
+        false,
+        sqe_core::config::GrantAuthority::AdminRole,
+    )
+    .unwrap()
+}
+
+/// Bodies sent to a given method+path prefix, newest last.
+async fn bodies_for(server: &MockServer, m: &str, path_contains: &str) -> Vec<serde_json::Value> {
+    server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| r.method.as_str() == m && r.url.path().contains(path_contains))
+        .filter_map(|r| serde_json::from_slice(&r.body).ok())
+        .collect()
+}
+
+/// No policy holds the resource yet, so the grant CREATES one. It must be a
+/// policyType 0 allow policy carrying exactly this grantee and access types.
+#[tokio::test]
+async fn policy_api_grant_creates_a_policy_when_the_resource_has_none() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/service/public/v2/api/policy"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/service/public/v2/api/policy"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": 7})))
+        .mount(&server)
+        .await;
+
+    policy_api_backend(&server.uri())
+        .grant("token", &grant_stmt())
+        .await
+        .expect("grant should create the policy");
+
+    let posted = bodies_for(&server, "POST", "/service/public/v2/api/policy").await;
+    assert!(!posted.is_empty(), "a policy should have been created");
+    let deepest = posted.last().expect("a body");
+    assert_eq!(deepest["policyType"], 0, "an allow policy, not deny");
+    assert_eq!(deepest["service"], SERVICE);
+    let items = deepest["policyItems"].as_array().expect("policyItems");
+    assert_eq!(items.len(), 1, "one grantee item");
+    assert_eq!(items[0]["roles"], serde_json::json!(["analyst"]));
+    assert!(
+        !items[0]["accesses"].as_array().expect("accesses").is_empty(),
+        "the item must confer something"
+    );
+    // Nothing may reach the unauthenticated plugin endpoint in this mode.
+    assert!(
+        bodies_for(&server, "POST", "/service/plugins/services/").await.is_empty(),
+        "default mode must not use the plugin grant endpoint"
+    );
+}
+
+/// A policy already grants this role one access type. The grant must UNION, not
+/// replace: `GRANT SELECT` then `GRANT INSERT` on one resource has to leave both,
+/// which is what the plugin endpoint did.
+#[tokio::test]
+async fn policy_api_grant_unions_into_an_existing_item() {
+    let server = MockServer::start().await;
+    let existing = serde_json::json!([{
+        "id": 42,
+        "name": "grant-1786526606036",
+        "policyType": 0,
+        "resources": {
+            "root":      {"values": ["POLARIS"]},
+            "catalog":   {"values": ["wh"]},
+            "namespace": {"values": ["sales"]},
+            "table":     {"values": ["orders"]}
+        },
+        "policyItems": [{
+            "roles": ["analyst"],
+            "accesses": [{"type": "table-properties-read", "isAllowed": true}]
+        }],
+        "policyLabels": ["chm:ROLE:analyst:INSERT"]
+    }]);
+    Mock::given(method("GET"))
+        .and(path("/service/public/v2/api/policy"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(existing))
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": 42})))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+        .mount(&server)
+        .await;
+
+    policy_api_backend(&server.uri())
+        .grant("token", &grant_stmt())
+        .await
+        .expect("grant should update the existing policy");
+
+    let put = bodies_for(&server, "PUT", "/service/public/v2/api/policy").await;
+    let table_put = put
+        .iter()
+        .find(|b| b["resources"]["table"]["values"] == serde_json::json!(["orders"]))
+        .expect("the table-level policy should have been updated");
+    let items = table_put["policyItems"].as_array().expect("policyItems");
+    let analyst = items
+        .iter()
+        .find(|i| i["roles"] == serde_json::json!(["analyst"]))
+        .expect("the analyst item survives");
+    let types: Vec<&str> = analyst["accesses"]
+        .as_array()
+        .expect("accesses")
+        .iter()
+        .filter_map(|a| a["type"].as_str())
+        .collect();
+    assert!(
+        types.contains(&"table-properties-read"),
+        "the pre-existing access type must survive the union, got {types:?}"
+    );
+    assert!(
+        types.len() > 1,
+        "the granted access types must be added alongside it, got {types:?}"
+    );
+    // Read-modify-write must not drop what else lives on the policy: the
+    // provenance labels are what a later REVOKE narrows from.
+    assert_eq!(
+        table_put["policyLabels"],
+        serde_json::json!(["chm:ROLE:analyst:INSERT"]),
+        "policyLabels must be preserved through the update"
+    );
+}
+
+/// Revoking with no policy for the resource is a no-op, not an error and not a
+/// stray create.
+#[tokio::test]
+async fn policy_api_revoke_with_no_policy_is_a_noop() {
+    use sqe_policy::grants::RevokeStatement;
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/service/public/v2/api/policy"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+        .mount(&server)
+        .await;
+
+    let stmt = RevokeStatement {
+        privilege: "SELECT".to_string(),
+        catalog: Some("wh".to_string()),
+        namespace: Some("sales".to_string()),
+        table: Some("orders".to_string()),
+        grantee: Grantee::Role("analyst".to_string()),
+        grantor: Some("carol".to_string()),
+        object: Default::default(),
+    };
+    policy_api_backend(&server.uri())
+        .revoke("token", &stmt)
+        .await
+        .expect("revoking what is not granted should succeed quietly");
+
+    assert!(
+        bodies_for(&server, "POST", "/service/public/v2/api/policy").await.is_empty(),
+        "a revoke must never create a policy"
     );
 }
