@@ -16,11 +16,11 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 const SERVICE: &str = "polaris";
 
 fn backend(url: &str) -> RangerGrantBackend {
-    // RangerDelegate on purpose: these cases assert against the PLUGIN
-    // grant/revoke endpoint, which is the transport only this mode uses (it is the
-    // one that authorizes the `grantor` field, which is the whole point of the
-    // mode). The default `admin-role` writes through the authenticated policy API
-    // instead, covered by `policy_api_*` below.
+    // RangerDelegate on purpose: these cases assert against the SECURE
+    // grant/revoke endpoint, the transport only this mode uses (it authorizes the
+    // `grantor` field per resource, which is the whole point of the mode). The
+    // default `admin-role` writes through the policy API instead, covered by
+    // `policy_api_*` below.
     RangerGrantBackend::new(
         url,
         SERVICE,
@@ -62,7 +62,7 @@ async fn grant_posts(server: &MockServer) -> usize {
         .iter()
         .filter(|r| {
             r.method == wiremock::http::Method::POST
-                && r.url.path() == format!("/service/plugins/services/grant/{SERVICE}")
+                && r.url.path() == format!("/service/plugins/secure/services/grant/{SERVICE}")
         })
         .count()
 }
@@ -72,7 +72,7 @@ async fn grant_posts(server: &MockServer) -> usize {
 async fn grant_succeeds_on_200() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
-        .and(path(format!("/service/plugins/services/grant/{SERVICE}")))
+        .and(path(format!("/service/plugins/secure/services/grant/{SERVICE}")))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
         .mount(&server)
         .await;
@@ -90,7 +90,7 @@ async fn grant_succeeds_on_200() {
 async fn grant_fails_loudly_on_non_200() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
-        .and(path(format!("/service/plugins/services/grant/{SERVICE}")))
+        .and(path(format!("/service/plugins/secure/services/grant/{SERVICE}")))
         .respond_with(ResponseTemplate::new(403).set_body_string("forbidden"))
         .mount(&server)
         .await;
@@ -119,7 +119,7 @@ async fn grant_fails_loudly_on_non_200() {
 async fn a_grant_with_no_grantor_is_refused_before_any_request() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
-        .and(path(format!("/service/plugins/services/grant/{SERVICE}")))
+        .and(path(format!("/service/plugins/secure/services/grant/{SERVICE}")))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
         .mount(&server)
         .await;
@@ -178,7 +178,7 @@ async fn an_already_held_traversal_level_is_not_re_granted() {
         .mount(&server)
         .await;
     Mock::given(method("POST"))
-        .and(path(format!("/service/plugins/services/grant/{SERVICE}")))
+        .and(path(format!("/service/plugins/secure/services/grant/{SERVICE}")))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
         .mount(&server)
         .await;
@@ -227,7 +227,7 @@ async fn a_disabled_policy_does_not_count_as_already_held() {
         .mount(&server)
         .await;
     Mock::given(method("POST"))
-        .and(path(format!("/service/plugins/services/grant/{SERVICE}")))
+        .and(path(format!("/service/plugins/secure/services/grant/{SERVICE}")))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
         .mount(&server)
         .await;
@@ -285,7 +285,7 @@ async fn the_named_level_is_written_even_when_already_held() {
         .mount(&server)
         .await;
     Mock::given(method("POST"))
-        .and(path(format!("/service/plugins/services/grant/{SERVICE}")))
+        .and(path(format!("/service/plugins/secure/services/grant/{SERVICE}")))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
         .mount(&server)
         .await;
@@ -311,7 +311,7 @@ async fn a_403_on_a_traversal_level_names_the_level_and_the_fix() {
     // No GET mock: nothing is known to be already held, so the catalog level -- the
     // first call of the plan -- is attempted and refused.
     Mock::given(method("POST"))
-        .and(path(format!("/service/plugins/services/grant/{SERVICE}")))
+        .and(path(format!("/service/plugins/secure/services/grant/{SERVICE}")))
         .respond_with(ResponseTemplate::new(403).set_body_string(
             r#"{"msgDesc":"User doesn't have necessary permission to grant access"}"#,
         ))
@@ -448,7 +448,7 @@ async fn revoke_bodies(server: &MockServer) -> Vec<serde_json::Value> {
         .iter()
         .filter(|r| {
             r.method == wiremock::http::Method::POST
-                && r.url.path() == format!("/service/plugins/services/revoke/{SERVICE}")
+                && r.url.path() == format!("/service/plugins/secure/services/revoke/{SERVICE}")
         })
         .filter_map(|r| serde_json::from_slice(&r.body).ok())
         .collect()
@@ -467,7 +467,7 @@ async fn revoke_all_privileges_removes_every_access_type_the_grantee_holds() {
         .mount(&server)
         .await;
     Mock::given(method("POST"))
-        .and(path(format!("/service/plugins/services/revoke/{SERVICE}")))
+        .and(path(format!("/service/plugins/secure/services/revoke/{SERVICE}")))
         .respond_with(ResponseTemplate::new(200))
         .mount(&server)
         .await;
@@ -511,7 +511,7 @@ async fn revoke_all_privileges_targets_the_named_table_not_the_catalog() {
         .mount(&server)
         .await;
     Mock::given(method("POST"))
-        .and(path(format!("/service/plugins/services/revoke/{SERVICE}")))
+        .and(path(format!("/service/plugins/secure/services/revoke/{SERVICE}")))
         .respond_with(ResponseTemplate::new(200))
         .mount(&server)
         .await;
@@ -544,7 +544,7 @@ async fn revoke_all_privileges_on_a_clean_object_is_a_no_op_that_succeeds() {
         .mount(&server)
         .await;
     Mock::given(method("POST"))
-        .and(path(format!("/service/plugins/services/revoke/{SERVICE}")))
+        .and(path(format!("/service/plugins/secure/services/revoke/{SERVICE}")))
         .respond_with(ResponseTemplate::new(200))
         .mount(&server)
         .await;
