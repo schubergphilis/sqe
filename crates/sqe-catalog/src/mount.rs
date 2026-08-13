@@ -66,7 +66,7 @@ pub async fn build_catalog(
         CatalogKind::Glue => build_glue(location, options, secrets).await,
         CatalogKind::S3Tables => build_s3tables(location, options, secrets).await,
         CatalogKind::Hms => build_hms(location, options, secrets).await,
-        CatalogKind::Jdbc => Err(error_not_yet("jdbc")),
+        CatalogKind::Jdbc => build_jdbc(location, options, secrets).await,
         CatalogKind::Hadoop => Err(error_not_yet("hadoop")),
     };
     result.map_err(|e| format!("ATTACH (TYPE {}) failed: {e}", kind.name()))
@@ -640,6 +640,140 @@ async fn build_hms(
     Err("TYPE hms requires the `hms` cargo feature on sqe-catalog".to_string())
 }
 
+/// Build a JDBC-style SQL catalog (`iceberg_catalog_sql`).
+///
+/// Uses the same upstream builder as `TYPE sqlite` but accepts an arbitrary
+/// database URL: PostgreSQL, MySQL, or SQLite. Required: `WAREHOUSE`. Optional:
+/// `SECRET <name>` referencing `Secret::Basic { username, password }`.
+///
+/// WHY THE SECRET IS SPLICED INTO THE URL rather than passed as props: sqlx
+/// parses credentials out of the connection URL itself and the catalog builder
+/// exposes no separate username/password property, so a Basic secret has
+/// nowhere else to go. A URL that already carries inline credentials is
+/// overridden by the secret, because the secret is the managed source of truth
+/// and silently preferring the inline copy would make rotation a no-op.
+///
+/// Spec form is `jdbc:postgresql://...` (the JDBC syntax familiar from Java);
+/// sqlx expects `postgresql://...` without the prefix. The `jdbc:` prefix is
+/// stripped when present so either form works in SQL.
+#[cfg(any(feature = "sql", feature = "sql-postgres", feature = "sql-sqlite"))]
+async fn build_jdbc(
+    location: &str,
+    options: &BTreeMap<String, OptionValue>,
+    secrets: &SecretStore,
+) -> Result<Arc<dyn iceberg::Catalog>, String> {
+    use std::collections::HashMap;
+
+    use iceberg::CatalogBuilder;
+    use iceberg_catalog_sql::{
+        SQL_CATALOG_PROP_URI, SQL_CATALOG_PROP_WAREHOUSE, SqlCatalogBuilder,
+    };
+
+    let trimmed = location.trim();
+    if trimmed.is_empty() {
+        return Err("location must not be empty for TYPE jdbc".to_string());
+    }
+    let url_form = trimmed.strip_prefix("jdbc:").unwrap_or(trimmed);
+
+    let warehouse = options
+        .get("WAREHOUSE")
+        .and_then(OptionValue::as_str)
+        .ok_or_else(|| "option `WAREHOUSE` is required for TYPE jdbc".to_string())?;
+
+    let final_url = if let Some(secret_ref) = options.get("SECRET").and_then(OptionValue::as_secret_ref)
+    {
+        let secret = secrets.get(secret_ref).map_err(|e| e.to_string())?;
+        match &secret {
+            Secret::Basic { username, password } => {
+                splice_basic_into_url(url_form, username, password)?
+            }
+            other => {
+                return Err(format!(
+                    "secret '{secret_ref}' is type {} but TYPE jdbc expects basic",
+                    other.type_name()
+                ));
+            }
+        }
+    } else {
+        url_form.to_string()
+    };
+
+    let mut props: HashMap<String, String> = HashMap::new();
+    props.insert(SQL_CATALOG_PROP_URI.to_string(), final_url);
+    props.insert(
+        SQL_CATALOG_PROP_WAREHOUSE.to_string(),
+        warehouse.to_string(),
+    );
+
+    let catalog = SqlCatalogBuilder::default()
+        .load("sqe-attached-jdbc".to_string(), props)
+        .await
+        .map_err(|e| format!("JDBC SQL catalog open failed: {e}"))?;
+
+    Ok(Arc::new(catalog))
+}
+
+#[cfg(not(any(feature = "sql", feature = "sql-postgres", feature = "sql-sqlite")))]
+async fn build_jdbc(
+    _location: &str,
+    _options: &BTreeMap<String, OptionValue>,
+    _secrets: &SecretStore,
+) -> Result<Arc<dyn iceberg::Catalog>, String> {
+    Err(
+        "TYPE jdbc requires the `sql`, `sql-postgres`, or `sql-sqlite` cargo feature \
+         on sqe-catalog"
+            .to_string(),
+    )
+}
+
+/// Insert (or replace) a `user:password@` segment in a URL.
+///
+/// sqlx-compatible URLs look like `postgresql://user:pass@host/db`. Existing
+/// credentials are replaced; otherwise the pair is inserted before the host.
+///
+/// The `@` search is deliberately conservative: a `/` before the `@` means the
+/// `@` belongs to the path (or a query value), not to userinfo, so the URL is
+/// left alone rather than mangled. Getting that wrong would corrupt a
+/// connection string instead of failing loudly.
+#[cfg(any(feature = "sql", feature = "sql-postgres", feature = "sql-sqlite"))]
+fn splice_basic_into_url(url: &str, username: &str, password: &str) -> Result<String, String> {
+    let scheme_end = url
+        .find("://")
+        .ok_or_else(|| format!("URL `{url}` is missing the `<scheme>://` prefix"))?;
+    let scheme_with_sep = &url[..scheme_end + 3];
+    let after_scheme = &url[scheme_end + 3..];
+
+    let host_part = match after_scheme.find('@') {
+        Some(at) if !after_scheme[..at].contains('/') => &after_scheme[at + 1..],
+        _ => after_scheme,
+    };
+
+    let user_enc = url_encode_userinfo(username);
+    let pass_enc = url_encode_userinfo(password);
+    Ok(format!("{scheme_with_sep}{user_enc}:{pass_enc}@{host_part}"))
+}
+
+/// Percent-encode everything outside the unreserved set for the userinfo part
+/// of a URL.
+///
+/// Encoding only the "obviously unsafe" characters would be the bug: a password
+/// containing `@`, `:`, `/` or `?` silently truncates or redirects the
+/// connection string. Unreserved characters pass through unchanged so
+/// credentials that already work keep working.
+#[cfg(any(feature = "sql", feature = "sql-postgres", feature = "sql-sqlite"))]
+fn url_encode_userinfo(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
 #[cfg(all(test, feature = "rest"))]
 mod s3_option_tests {
     use std::collections::BTreeMap;
@@ -686,5 +820,70 @@ mod s3_option_tests {
     fn absent_s3_options_yield_no_props() {
         let o: BTreeMap<String, OptionValue> = BTreeMap::new();
         assert!(s3_props_from_options(&o).is_empty());
+    }
+}
+
+/// `splice_basic_into_url` writes credentials into a connection string, so a
+/// mistake here either leaks them into the wrong field or silently corrupts the
+/// URL. These cover the shapes a real `ATTACH ... TYPE jdbc` can hand it.
+#[cfg(all(test, any(feature = "sql", feature = "sql-postgres", feature = "sql-sqlite")))]
+mod jdbc_url_tests {
+    use super::*;
+
+    #[test]
+    fn inserts_credentials_when_the_url_has_none() {
+        assert_eq!(
+            splice_basic_into_url("postgresql://db.example.com:5432/iceberg", "u", "p").unwrap(),
+            "postgresql://u:p@db.example.com:5432/iceberg"
+        );
+    }
+
+    /// The secret is the managed source of truth, so an inline pair is replaced
+    /// rather than preferred. Preferring the inline copy would make rotating the
+    /// secret a silent no-op.
+    #[test]
+    fn replaces_credentials_already_present() {
+        assert_eq!(
+            splice_basic_into_url("postgresql://old:stale@db:5432/ice", "new", "fresh").unwrap(),
+            "postgresql://new:fresh@db:5432/ice"
+        );
+    }
+
+    /// An `@` after a `/` belongs to the path, not to userinfo. Treating it as
+    /// credentials would truncate the host and corrupt the connection string.
+    #[test]
+    fn an_at_sign_inside_the_path_is_not_mistaken_for_credentials() {
+        assert_eq!(
+            splice_basic_into_url("postgresql://db:5432/schema@weird", "u", "p").unwrap(),
+            "postgresql://u:p@db:5432/schema@weird"
+        );
+    }
+
+    /// Characters that delimit a URL must not survive raw in userinfo, or the
+    /// password silently redirects or truncates the connection.
+    #[test]
+    fn url_delimiters_in_credentials_are_percent_encoded() {
+        let out = splice_basic_into_url("mysql://h/db", "user@corp", "p@ss:w/rd?x").unwrap();
+        assert_eq!(out, "mysql://user%40corp:p%40ss%3Aw%2Frd%3Fx@h/db");
+        // The raw forms must be gone, or a parser would split on them.
+        assert!(!out.contains("user@corp"));
+        assert!(!out.contains("p@ss"));
+    }
+
+    #[test]
+    fn unreserved_characters_pass_through_unchanged() {
+        assert_eq!(url_encode_userinfo("aZ09-_.~"), "aZ09-_.~");
+    }
+
+    #[test]
+    fn non_ascii_is_encoded_per_utf8_byte() {
+        // 'é' is two UTF-8 bytes; both must be encoded, not the char.
+        assert_eq!(url_encode_userinfo("é"), "%C3%A9");
+    }
+
+    #[test]
+    fn a_url_without_a_scheme_is_an_error_not_a_guess() {
+        let err = splice_basic_into_url("db.example.com/iceberg", "u", "p").unwrap_err();
+        assert!(err.contains("scheme"), "unexpected message: {err}");
     }
 }
