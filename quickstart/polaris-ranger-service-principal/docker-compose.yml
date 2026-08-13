@@ -85,7 +85,7 @@ services:
       start_period: 20s
 
   bucket-init:
-    image: amazon/aws-cli:2.36.18
+    image: amazon/aws-cli:2.36.19
     entrypoint: ["sh", "-c"]
     command:
       - |
@@ -103,7 +103,12 @@ services:
 
   # ── Ranger Admin database ─────────────────────────────────────────────
   ranger-db:
-    image: postgres:18.3
+    # Pinned to 13 like the sibling quickstart's ranger-db. postgres 18+ stores
+    # data in a major-version-specific subdirectory, so an existing volume from
+    # an older image is unreadable and the container exits 1 before ranger-admin
+    # can start. renovate.json holds postgres at `<14` for this reason; that pin
+    # stops new bumps but did not roll back the 18.3 already committed here.
+    image: postgres:13.23
     environment:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-rangerR0cks!}
     volumes:
@@ -121,6 +126,12 @@ services:
   # runs schema DDL and can take 2-4 minutes; the port-open healthcheck just
   # gates dependents, and ranger-setup does the real REST-readiness wait.
   ranger-admin:
+    # Held at 2.8.0 deliberately. 2.9.0 rejects the plugin grant/revoke API with
+    # HTTP 400 "Unauthenticated access not allowed" under basic auth. That is the
+    # endpoint SQE's GRANT/REVOKE posts to AND the one ranger-setup seeds through,
+    # and ranger-setup still exits 0, so the stack would come up with zero
+    # authorization policies. Measured on a fresh db: the identical POST returns
+    # 200 on 2.8.0 and 400 on 2.9.0. renovate.json carries the matching hold.
     image: apache/ranger:2.8.0
     environment:
       RANGER_VERSION: 2.8.0
