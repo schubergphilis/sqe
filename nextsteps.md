@@ -83,6 +83,33 @@
 >
 > Order that actually works: raise the rustc pin, or drop sqlx 0.9 from the set; de-vendor or align `iceberg-catalog-sql`'s sqlx; then let renovate regenerate against current main so the lockfile comes with it.
 
+> **OPEN, SECURITY: SQE's GRANT/REVOKE writes through a Ranger endpoint that requires no authentication at all, and Ranger 2.9.0 closes that hole rather than breaking an API.**
+>
+> Measured on the shipped quickstart at Ranger 2.8.0. A `POST /service/plugins/services/grant/polaris` carrying **no credentials whatsoever** returned **HTTP 200** and created a live policy granting `dave` `table-data-read`. The same request with no credentials against the public v2 API returns 401, so this is specific to the plugin grant/revoke endpoints, not a misconfigured server.
+>
+> Ranger says so itself, in `security-applicationContext.xml`:
+>
+> ```xml
+> pattern="/service/plugins/services/grant/*"  security="none"
+> pattern="/service/plugins/services/revoke/*" security="none"
+> ```
+>
+> `security="none"` bypasses Spring Security entirely, so the basic auth SQE sends on that path is not rejected, it is simply never processed. No `UserSessionBase` is created, which is why `ContextUtil.getCurrentUserSession()` is null there. `crates/sqe-policy/src/grants/ranger.rs:623` posts every GRANT and REVOKE to that endpoint, and `ranger-setup` seeds through it too. Anyone with network reach to Ranger Admin can grant themselves any privilege on any resource, no credentials needed.
+>
+> **This is why 2.9.0 answers 400.** `ServiceREST.grantAccess` calls `bizUtil.failUnauthenticatedIfNotAllowed()`, which throws when the session is null and `ranger.admin.allow.unauthenticated.access` is false (its default):
+>
+> ```java
+> if (currentUserSession == null && !allowUnauthenticatedAccessInSecureEnvironment) {
+>     throw new Exception("Unauthenticated access not allowed");
+> }
+> ```
+>
+> RANGER-5635 in the 2.9.0 notes ("`ranger.admin.allow.unauthenticated.download.access` is honored only when Kerberos is enabled") is that class of fix: the check used to be skipped when Kerberos was off, which is exactly how our stack runs (`KERBEROS_ENABLED=false`). So 2.8.0 was not authenticating these calls and not enforcing the property either. 2.9.0 enforces it.
+>
+> **So the version hold in renovate.json is a stopgap, not the fix.** Setting `ranger.admin.allow.unauthenticated.access=true` would make 2.9.0 work by keeping the hole open, which is the wrong direction for an engine whose selling point is fine-grained access control.
+>
+> Fix: move GRANT/REVOKE off the plugin endpoint onto the authenticated public v2 policy API (`/service/public/v2/api/policy`), which is behind Spring Security and already accepts the basic auth SQE holds. SQE reads policies through it today, so the credentials and plumbing exist. The cost is that the plugin API MERGES a grant into whatever policy matches the resource, so the v2 path needs read-modify-write plus the same merge semantics, including the provenance labels `REVOKE` relies on. Doing it also unblocks 2.9.0 and removes a hole rather than pinning around it.
+
 > Status as of 2026-08-12. **The parity demo now runs on an EU retail bank fixture, and adding a persona to the quickstart stack turns out to touch five places rather than three.**
 >
 > The fixture was `orders(id, region, amount, ssn, email, phone)` with three rows. The mechanics were complete; the transcript did not show what they were for. It is now a 12-row customer register and a 24-row payment ledger: `national_id`, `dob`, `iban`, `nationality`, `residency_region`, `pep_flag`, `risk_score`, and cross-border payments carrying counterparty country, channel, and AML alerts. The old policy targets map over, so sections 1 to 7 keep their probe count and gain a meaning: the row filter is GDPR data residency, `MASK_HASH` on `iban` is a pseudonymous account key, `MASK_NULL` hides an internal risk score.
