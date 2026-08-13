@@ -28,6 +28,14 @@ s3_secret_key = "s3admin"
 s3_region = "us-east-1"
 s3_path_style = true
 
+# Permit the read_parquet TVF to reach the in-stack rustfs S3 endpoint so the
+# sqe-bench bulk loader can stage demo data (TPC-H) from s3://warehouse/staging.
+# Scoped to the rustfs host only, so the SSRF guard (#46) still blocks everything
+# else, including the IMDS address at 169.254.169.254 that made the gate
+# necessary.
+[storage.tvf]
+allowed_http_hosts = ["rustfs"]
+
 [query_cache]
 enabled = true
 max_memory_mb = 128
