@@ -8,7 +8,15 @@
 >
 > So the choice is: keep Ranger as the authority and stay on 2.8.x, or move the `delegateAdmin` evaluation INTO SQE (read the policies, decide whether the caller holds delegate admin on that resource and those access types, then write through the authenticated policy API). Only the second works on 2.9.0+, and it means SQE owns a security decision Ranger used to own, including the measured fact that `delegateAdmin` does NOT cascade upward, so a delegated grantor needs the already-held-traversal skip.
 >
-> Open question under investigation: whether 2.9.0 offers an authenticated path that still authorizes a NAMED principal rather than the REST caller (`doAs`/`doAsUser` per RANGER-5539, header auth per RANGER-5499, configuration-based super users per RANGER-5627, or moving the grant endpoint out of the `security="none"` list by config).
+> **ANSWERED, and the fork closed: Ranger has an authenticated twin of the grant endpoints.** `/service/plugins/secure/services/{grant,revoke}/{service}` is covered by the catch-all `isAuthenticated()` rule rather than `security="none"`, runs Ranger's own server-side merge, and STILL authorizes the named `grantor` per resource and per access type. So neither horn of the fork was necessary: Ranger keeps the authority, SQE does not reimplement `delegateAdmin`, and delegate mode works on 2.9.0.
+>
+> Measured on 2.9.0 with admin REST credentials and a non-admin grantor: no credentials 401; grantor holding delegateAdmin for the access type 200; grantor holding none 403; grantor holding it for a DIFFERENT access type 403. Confirmed present on 2.8.0 as well, so one transport covers both. **`make test-access-control` is 42 of 42 on 2.9.0 AND on 2.8.0**, including `a_delegated_owner_grants_on_their_own_table_without_an_admin_role`.
+>
+> Two traps found while probing, both now in the code comments. The denial discriminator is the HTTP STATUS: the body carries `"statusCode":0` on success and on denial alike, so a body-based check would read a refused grant as a successful one. And `grantorGroups` is taken only from the request for a privileged caller, so group-based delegateAdmin would be ignored; that is not load-bearing here because this deployment materialises Keycloak groups as Ranger ROLES and role membership IS resolved server-side (verified: grantor delegated through role `analyst`, authorized with the field absent). A deployment delegating through real Ranger groups needs session groups threaded onto `GrantStatement`.
+>
+> What remains for "grant admin on a table": `GRANT ... WITH GRANT OPTION` already maps to `delegateAdmin: true` on the object's policy item, so the mechanism is there. The open pieces are the already-held-traversal skip (delegateAdmin does not cascade upward, so a table-level delegate cannot write the catalog/namespace traversal policies a grant plan emits) and, if non-transferable ownership is wanted, gating the `delegateAdmin` flag in the coordinator, since Ranger lets a delegate pass grant-option onward for types they hold.
+>
+> The 2.9.0 hold in renovate.json can now be lifted on this evidence.
 
 > **FIXED 2026-08-12, suite hygiene: `make test-access-control` leaked its own grants between runs, so two denial-baseline tests failed on any stack the suite had already used.**
 >
