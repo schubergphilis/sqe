@@ -149,7 +149,8 @@ pub struct RangerStore {
     admin_url: String,
     /// Component service instance (for example `query`).
     service_name: String,
-    /// Base download URL, e.g. ".../service/plugins/policies/download/hive".
+    /// Base download URL, e.g.
+    /// ".../service/plugins/secure/policies/download/hive".
     download_url: String,
     admin_user: String,
     admin_password: SecretString,
@@ -167,8 +168,22 @@ pub struct RangerStore {
 impl RangerStore {
     pub fn from_config(cfg: &RangerPolicyConfig) -> sqe_core::Result<Self> {
         let base = cfg.url.trim_end_matches('/');
+        // The SECURE download path, not `/service/plugins/policies/download/`.
+        //
+        // Both return the identical `ServicePolicies` bundle, but Ranger declares
+        // the non-secure one `security="none"`: measured on 2.8.0, it serves the
+        // complete policy set to a caller with NO credentials (HTTP 200), while the
+        // secure path answers 401. Handing the whole authorization model to any
+        // unauthenticated caller is a disclosure this store does not need, since it
+        // already sends basic auth on this request; the credentials were simply
+        // being ignored.
+        //
+        // Ranger 2.9.0 also stops serving the non-secure path unless
+        // `ranger.admin.allow.unauthenticated.download.access` is enabled
+        // (RANGER-5635 made that property honored regardless of Kerberos), so this
+        // is what lets the read path work there at all.
         let download_url = format!(
-            "{base}/service/plugins/policies/download/{}",
+            "{base}/service/plugins/secure/policies/download/{}",
             cfg.service_name
         );
         Ok(Self {
