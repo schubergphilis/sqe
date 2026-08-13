@@ -958,6 +958,11 @@ pub struct RangerPolicy {
     /// Creation time in epoch milliseconds. Same list-versus-detail caveat.
     #[serde(default, rename = "createTime")]
     create_time: Option<i64>,
+    /// Provenance labels. Carries the `chm-grantor:` entries that name the SQL
+    /// caller behind each grant, which the policy-API transport cannot record in
+    /// `createdBy`.
+    #[serde(default, rename = "policyLabels")]
+    policy_labels: Vec<String>,
 }
 
 /// Upper bound on per-policy provenance requests for one `SHOW GRANTS`.
@@ -1020,10 +1025,24 @@ pub fn policies_to_entries(policies: &[RangerPolicy]) -> Vec<GrantEntry> {
     let mut out = Vec::new();
     for p in policies {
         let resource = format_policy_resource(&p.resources);
-        // Both stay None unless `fill_provenance` fetched the per-policy record,
-        // because the list endpoint does not carry them.
-        let granted_by = p.created_by.clone();
+        // `granted_at` stays None unless `fill_provenance` fetched the per-policy
+        // record, because the list endpoint does not carry it.
         let granted_at = p.create_time.and_then(format_grant_time);
+        // Grantor labels first, `createdBy` second. Under the policy-API transport
+        // `createdBy` is SQE's REST user, so it answers "which service wrote this"
+        // where the column is asking "who granted it". The label carries the SQL
+        // caller and is keyed by grantee, so it is resolved per row below.
+        let grantors: Vec<(String, String, String)> = p
+            .policy_labels
+            .iter()
+            .filter_map(|l| parse_grantor_label(l))
+            .collect();
+        let grantor_for = |kind: &str, name: &str| -> Option<String> {
+            grantors
+                .iter()
+                .find(|(k, n, _)| k == kind && n == name)
+                .map(|(_, _, g)| g.clone())
+        };
         let mut push_items = |items: &[RangerPolicyItem], effect: &str| {
             for item in items {
                 for access in &item.accesses {
@@ -1034,7 +1053,7 @@ pub fn policies_to_entries(policies: &[RangerPolicy]) -> Vec<GrantEntry> {
                             grantee_type: "USER".into(),
                             grantee_name: u.clone(),
                             effect: effect.into(),
-                            granted_by: granted_by.clone(),
+                            granted_by: grantor_for("USER", u).or_else(|| p.created_by.clone()),
                             granted_at: granted_at.clone(),
                         });
                     }
@@ -1045,7 +1064,7 @@ pub fn policies_to_entries(policies: &[RangerPolicy]) -> Vec<GrantEntry> {
                             grantee_type: "ROLE".into(),
                             grantee_name: r.clone(),
                             effect: effect.into(),
-                            granted_by: granted_by.clone(),
+                            granted_by: grantor_for("ROLE", r).or_else(|| p.created_by.clone()),
                             granted_at: granted_at.clone(),
                         });
                     }
@@ -1186,6 +1205,46 @@ fn grant_label(grantee: &Grantee, privilege: &str) -> String {
 /// Anything that does not round-trip is rejected rather than guessed: labels are
 /// editable strings in the Ranger console, and a mis-parse here would silently
 /// under-revoke, which is worse than the cascade it replaces.
+/// Namespace for "which SQL caller issued this grant".
+///
+/// Separate from `LABEL_PREFIX` on purpose. That one is the cross-tool contract
+/// with the platform's provenance module, parsed as `chm:<TYPE>:<name>:<PRIV>`;
+/// extending it to carry a fourth field would change a format another repo reads.
+/// `chm-grantor:` does not start with `chm:`, so `parse_grant_label` ignores it.
+///
+/// WHY THIS EXISTS AT ALL: the plugin grant endpoint recorded Ranger's
+/// `createdBy` from the request's `grantor` field, so `SHOW GRANTS` could report
+/// the SQL caller. The authenticated policy API records the REST user instead, so
+/// every grant would read `granted_by = Admin`. Truthful about the transport,
+/// useless as an audit trail, which is the column's whole purpose.
+const GRANTOR_LABEL_PREFIX: &str = "chm-grantor";
+
+fn grantor_label(grantee: &Grantee, grantor: &str) -> String {
+    let kind = match grantee {
+        Grantee::User(_) => "USER",
+        Grantee::Role(_) | Grantee::Group(_) => "ROLE",
+    };
+    format!(
+        "{GRANTOR_LABEL_PREFIX}:{kind}:{}:{grantor}",
+        grantee.name()
+    )
+}
+
+/// `(grantee_kind, grantee_name, grantor)` from a grantor label.
+fn parse_grantor_label(label: &str) -> Option<(String, String, String)> {
+    let rest = label.strip_prefix(&format!("{GRANTOR_LABEL_PREFIX}:"))?;
+    let (kind, rest) = rest.split_once(':')?;
+    let kind = kind.trim().to_uppercase();
+    if !LABEL_GRANTEE_TYPES.contains(&kind.as_str()) {
+        return None;
+    }
+    let (name, grantor) = rest.rsplit_once(':')?;
+    if name.is_empty() || grantor.is_empty() {
+        return None;
+    }
+    Some((kind, name.to_string(), grantor.to_string()))
+}
+
 fn parse_grant_label(label: &str) -> Option<(String, String, String)> {
     let rest = label.strip_prefix(&format!("{LABEL_PREFIX}:"))?;
     let (kind, rest) = rest.split_once(':')?;
@@ -1929,6 +1988,14 @@ impl GrantBackend for RangerGrantBackend {
                 // takes the same position.
                 self.add_grant_label(&body.resource, &stmt.grantee, stmt.object, &stmt.privilege)
                     .await;
+                // Who issued it, so SHOW GRANTS can still answer that after the
+                // move to the policy API. Best-effort, exactly like the label
+                // above: the grant itself already succeeded.
+                self.add_policy_label(
+                    &body.resource,
+                    &grantor_label(&stmt.grantee, &body.grantor),
+                )
+                .await;
             }
             written.push(body);
         }
@@ -2886,6 +2953,92 @@ mod tests {
     /// The list endpoint omits provenance, so entries built from it must show the
     /// audit columns as empty rather than inventing a value. This is the state
     /// `SHOW GRANTS` was permanently stuck in before `fill_provenance` existed.
+    /// The grantor label is what keeps `granted_by` meaningful after the move to
+    /// the authenticated policy API, where Ranger's `createdBy` is SQE's REST user
+    /// rather than the SQL caller. Per-grantee, so two grantors on one policy do
+    /// not blur together.
+    #[test]
+    fn granted_by_prefers_the_grantor_label_over_created_by() {
+        let json = r#"[
+          {
+            "name": "sqe-grant-wh-sales-orders",
+            "createdBy": "Admin",
+            "createTime": 1786526606039,
+            "resources": {"catalog": {"values": ["wh"]}},
+            "policyItems": [
+              {"users": [], "roles": ["analyst"],
+               "accesses": [{"type": "table-data-read", "isAllowed": true}]},
+              {"users": ["dave"], "roles": [],
+               "accesses": [{"type": "table-data-read", "isAllowed": true}]}
+            ],
+            "policyLabels": [
+              "chm:ROLE:analyst:SELECT",
+              "chm-grantor:ROLE:analyst:carol",
+              "chm-grantor:USER:dave:erin"
+            ]
+          }
+        ]"#;
+        let policies: Vec<RangerPolicy> = serde_json::from_str(json).unwrap();
+        let entries = policies_to_entries(&policies);
+        let role_row = entries
+            .iter()
+            .find(|e| e.grantee_name == "analyst")
+            .expect("role row");
+        assert_eq!(
+            role_row.granted_by.as_deref(),
+            Some("carol"),
+            "the SQL caller, not the REST user"
+        );
+        let user_row = entries
+            .iter()
+            .find(|e| e.grantee_name == "dave")
+            .expect("user row");
+        assert_eq!(
+            user_row.granted_by.as_deref(),
+            Some("erin"),
+            "resolved per grantee, not per policy"
+        );
+    }
+
+    /// No label, so `createdBy` is all there is. That is the legacy case: policies
+    /// the plugin endpoint wrote, where `createdBy` IS the grantor.
+    #[test]
+    fn granted_by_falls_back_to_created_by_without_a_label() {
+        let json = r#"[
+          {
+            "name": "grant-1786526606036",
+            "createdBy": "carol sqe",
+            "createTime": 1786526606039,
+            "resources": {"catalog": {"values": ["wh"]}},
+            "policyItems": [
+              {"users": [], "roles": ["analyst"],
+               "accesses": [{"type": "table-data-read", "isAllowed": true}]}
+            ]
+          }
+        ]"#;
+        let policies: Vec<RangerPolicy> = serde_json::from_str(json).unwrap();
+        let entries = policies_to_entries(&policies);
+        assert_eq!(entries[0].granted_by.as_deref(), Some("carol sqe"));
+    }
+
+    #[test]
+    fn grantor_label_round_trips_and_ignores_the_shared_namespace() {
+        let l = grantor_label(&Grantee::Role("analyst".into()), "carol");
+        assert_eq!(l, "chm-grantor:ROLE:analyst:carol");
+        assert_eq!(
+            parse_grantor_label(&l),
+            Some(("ROLE".into(), "analyst".into(), "carol".into()))
+        );
+        // A GROUP is labelled ROLE, matching grant_label's cross-tool convention.
+        assert_eq!(
+            grantor_label(&Grantee::Group("ws-sales".into()), "carol"),
+            "chm-grantor:ROLE:ws-sales:carol"
+        );
+        // The two namespaces must not read each other's labels.
+        assert_eq!(parse_grantor_label("chm:ROLE:analyst:SELECT"), None);
+        assert_eq!(parse_grant_label("chm-grantor:ROLE:analyst:carol"), None);
+    }
+
     #[test]
     fn entries_from_the_list_endpoint_have_empty_provenance() {
         let json = r#"[
