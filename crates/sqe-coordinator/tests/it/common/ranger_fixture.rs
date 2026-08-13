@@ -325,37 +325,66 @@ impl RangerAdmin {
     /// Every access type Kyuubi may check has to be listed: `update` for INSERT,
     /// `create` for DDL, and a missing one short-circuits exactly as above.
     async fn grant_object_level_defer_item(&self) -> anyhow::Result<()> {
-        let body = serde_json::json!({
-            "grantor": "admin",
-            "resource": {"database": "*", "table": "*", "column": "*"},
+        // Authored through the AUTHENTICATED policy API, not
+        // `/service/plugins/services/grant/*`. Ranger declares that endpoint
+        // `security="none"`, so it takes no credentials at all, and Ranger 2.9.0
+        // refuses it with HTTP 400 "Unauthenticated access not allowed" unless
+        // `ranger.admin.allow.unauthenticated.access` is enabled. On 2.9.0 the old
+        // form failed here and took all 42 cases down at setup.
+        //
+        // The grant API merged an item into the auto-generated policy server-side.
+        // That merge happens here instead: find the policy owning the wildcard
+        // signature, append the `public` item, and PUT it back. Reading the whole
+        // policy first is what keeps the auto-generated `admin` / `{OWNER}` items
+        // intact.
+        let accesses: Vec<Value> = [
+            "select", "update", "create", "drop", "alter", "index", "lock", "read", "write",
+        ]
+        .iter()
+        .map(|t| serde_json::json!({"type": t, "isAllowed": true}))
+        .collect();
+        let defer_item = serde_json::json!({
             "groups": ["public"],
-            "accessTypes": [
-                "select", "update", "create", "drop", "alter",
-                "index", "lock", "read", "write"
-            ],
+            "accesses": accesses,
             "delegateAdmin": false,
-            "enableAudit": true,
-            "replaceExistingPermissions": false,
-            "isRecursive": true
         });
-        let resp = self
-            .req(
-                reqwest::Method::POST,
-                &format!("/service/plugins/services/grant/{HIVE_SERVICE}"),
-            )
-            .json(&body)
-            .send()
-            .await
-            .context("POST defer grant")?;
-        if !resp.status().is_success() {
-            bail!(
-                "grant the object-level defer item on {HIVE_SERVICE} -> HTTP {}: {}\n\
-                 Without it Kyuubi refuses every Spark read before Polaris is consulted.",
-                resp.status(),
-                resp.text().await.unwrap_or_default()
-            );
+
+        let wildcard = |p: &Value, key: &str| -> bool {
+            p["resources"][key]["values"] == serde_json::json!(["*"])
+        };
+        let mut policy = self
+            .get_policies(HIVE_SERVICE)
+            .await?
+            .into_iter()
+            .find(|p| {
+                wildcard(p, "database") && wildcard(p, "table") && wildcard(p, "column")
+            })
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no policy owns database=*/table=*/column=* on {HIVE_SERVICE}; Ranger \
+                     normally auto-generates `all - database, table, column` when the \
+                     service is created"
+                )
+            })?;
+
+        let items = policy
+            .get_mut("policyItems")
+            .and_then(Value::as_array_mut)
+            .ok_or_else(|| anyhow::anyhow!("wildcard policy has no policyItems array"))?;
+        // Idempotent: this runs in every test's setup.
+        let already = items
+            .iter()
+            .any(|i| i["groups"] == serde_json::json!(["public"]));
+        if !already {
+            items.push(defer_item);
         }
-        Ok(())
+        let id = policy["id"]
+            .as_i64()
+            .ok_or_else(|| anyhow::anyhow!("wildcard policy has no id"))?;
+        self.update_policy(id, policy).await.context(
+            "grant the object-level defer item; without it Kyuubi refuses every Spark read \
+             before Polaris is consulted",
+        )
     }
 
     /// Delete every projected tag ASSOCIATION for the test-owned frontend service.
