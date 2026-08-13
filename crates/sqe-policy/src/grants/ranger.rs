@@ -827,26 +827,53 @@ impl RangerGrantBackend {
         }
     }
 
-    /// POST to Ranger's plugin grant/revoke endpoint.
+    /// POST to Ranger's SECURE grant/revoke endpoint.
     ///
     /// Used ONLY under `grant_authority = "ranger-delegate"`, where Ranger's
     /// per-resource check on the `grantor` field is the authority and the
-    /// coordinator has stood its own admin gate down. Nothing else authorizes the
-    /// write in that mode, which is why the transport cannot be swapped for the
-    /// policy API there: the policy API takes no grantor and would authorize the
-    /// REST admin instead, turning an ungated GRANT into self-escalation.
+    /// coordinator has stood its own admin gate down. The policy API cannot serve
+    /// that mode: it takes no grantor and would authorize the REST admin instead,
+    /// turning an ungated GRANT into self-escalation.
     ///
-    /// Two properties of this endpoint the operator is opting into:
-    /// Ranger declares it `security="none"`, so it accepts unauthenticated
-    /// callers, and Ranger 2.9.0 refuses it outright unless
-    /// `ranger.admin.allow.unauthenticated.access` is enabled.
+    /// `/service/plugins/secure/services/{op}/*`, NOT
+    /// `/service/plugins/services/{op}/*`. The two do the same work and share
+    /// Ranger's server-side merge, but the non-secure one is declared
+    /// `security="none"`: it discards credentials rather than checking them, it
+    /// accepts a grant from a caller with none at all, and Ranger 2.9.0 stops
+    /// serving it unless `ranger.admin.allow.unauthenticated.access` is enabled.
+    /// The secure twin is authenticated AND still authorizes the named grantor, so
+    /// one transport covers 2.8 and 2.9 without giving up delegated authority.
+    ///
+    /// Measured on 2.9.0, admin REST credentials with a `grantor` naming a
+    /// non-admin:
+    ///
+    /// | case | result |
+    /// |---|---|
+    /// | no credentials | HTTP 401 |
+    /// | grantor holds delegateAdmin for the access type | HTTP 200 |
+    /// | grantor holds no delegateAdmin | HTTP 403 "User doesn't have necessary permission to grant access" |
+    /// | grantor holds delegateAdmin for a DIFFERENT access type | HTTP 403 |
+    ///
+    /// Note the discriminator is the HTTP status. The JSON body carries
+    /// `"statusCode":0` on success AND on denial, so a body-based check would read
+    /// a refused grant as a successful one.
+    ///
+    /// `grantorGroups` is not sent. For a privileged REST caller Ranger takes the
+    /// grantor's groups only from the request, so group-based delegateAdmin
+    /// policies would be ignored. That is not load-bearing here and was measured
+    /// rather than assumed: this deployment materialises every Keycloak group as a
+    /// Ranger ROLE of the same name, and role membership IS resolved server-side, so
+    /// a grantor delegated through a role is authorized with the field absent
+    /// (verified live: role `analyst`, grantor `alice`, HTTP 200). A deployment
+    /// using real Ranger groups for delegation would need the session's groups
+    /// threaded onto `GrantStatement` first.
     async fn post_to_plugin_endpoint(
         &self,
         op: &str,
         body: &GrantRevokeRequest,
     ) -> sqe_core::Result<()> {
         let url = format!(
-            "{}/service/plugins/services/{op}/{}",
+            "{}/service/plugins/secure/services/{op}/{}",
             self.admin_url, self.service_name
         );
         let resp = self
@@ -880,9 +907,8 @@ impl RangerGrantBackend {
     ) -> sqe_core::Result<()> {
         let attempt = if self.delegates_authority_to_ranger() {
             // Ranger's own grantor check IS the authority in this mode, and only
-            // the plugin endpoint performs it. Note the cost: that endpoint is
-            // declared `security="none"`, and Ranger 2.9.0 refuses it unless
-            // `ranger.admin.allow.unauthenticated.access` is on.
+            // the grant/revoke endpoints perform it. The SECURE spelling is used,
+            // so this is authenticated and works on 2.9.0 as well as 2.8.
             self.post_to_plugin_endpoint(op, body).await
         } else {
             self.apply_via_policy_api(op, body).await
