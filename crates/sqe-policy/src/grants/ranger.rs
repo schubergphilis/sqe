@@ -111,6 +111,67 @@ fn deepest_policy(
 ///
 /// Shared by DENY and by the REVOKE path that removes a denial, so the two agree
 /// on the shape by construction rather than by two similar literals.
+/// Build a v2 `policyItems` entry equivalent to what the plugin grant API would
+/// have merged in.
+///
+/// Shape matches `build_deny_item`: a grantee key (`users` / `groups` / `roles`)
+/// plus `accesses`. `delegateAdmin` is emitted only when set, because Ranger
+/// treats an absent key and `false` alike and a always-present `false` shows up
+/// as a spurious diff on every policy this touches.
+fn build_allow_item(body: &GrantRevokeRequest) -> serde_json::Value {
+    let accesses: Vec<serde_json::Value> = body
+        .access_types
+        .iter()
+        .map(|t| serde_json::json!({"type": t, "isAllowed": true}))
+        .collect();
+    let mut item = serde_json::Map::new();
+    if !body.users.is_empty() {
+        item.insert("users".into(), serde_json::json!(body.users));
+    }
+    if !body.groups.is_empty() {
+        item.insert("groups".into(), serde_json::json!(body.groups));
+    }
+    if !body.roles.is_empty() {
+        item.insert("roles".into(), serde_json::json!(body.roles));
+    }
+    item.insert("accesses".into(), serde_json::Value::Array(accesses));
+    if body.delegate_admin {
+        item.insert("delegateAdmin".into(), serde_json::json!(true));
+    }
+    serde_json::Value::Object(item)
+}
+
+/// The grantee triple a policy item names, sorted so ordering never decides
+/// whether two items are the same grantee.
+fn item_grantees(item: &serde_json::Value) -> (Vec<String>, Vec<String>, Vec<String>) {
+    let field = |key: &str| -> Vec<String> {
+        let mut v: Vec<String> = item
+            .get(key)
+            .and_then(serde_json::Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        v.sort();
+        v
+    };
+    (field("users"), field("groups"), field("roles"))
+}
+
+/// Access types an item currently allows.
+fn item_access_types(item: &serde_json::Value) -> Vec<String> {
+    item.get("accesses")
+        .and_then(serde_json::Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.get("type").and_then(|t| t.as_str()).map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn build_deny_item(grantee: &Grantee, access_types: &[String]) -> serde_json::Value {
     let accesses: Vec<serde_json::Value> = access_types
         .iter()
@@ -613,65 +674,190 @@ impl RangerGrantBackend {
         self.post_grant_revoke_inner(op, Some(privilege), body).await
     }
 
+    /// Apply a grant or revoke through Ranger's AUTHENTICATED policy API.
+    ///
+    /// WHY NOT THE PLUGIN GRANT ENDPOINT: Ranger declares
+    /// `/service/plugins/services/{grant,revoke}/*` with `security="none"` in
+    /// `security-applicationContext.xml`, which bypasses Spring Security
+    /// entirely. The basic auth sent there is not rejected, it is never
+    /// processed, so no `UserSessionBase` is created. Measured on Ranger 2.8.0:
+    /// that endpoint accepts a grant carrying NO credentials at all and creates
+    /// the policy (HTTP 200), while the same credential-free request to
+    /// `/service/public/v2/api/policy` is refused with 401. Writing privilege
+    /// changes through an unauthenticated endpoint is not defensible for an
+    /// engine whose purpose is access control.
+    ///
+    /// Ranger 2.9.0 closes that hole: `ServiceREST.grantAccess` now calls
+    /// `failUnauthenticatedIfNotAllowed()`, which rejects the session-less call
+    /// unless `ranger.admin.allow.unauthenticated.access` is turned on. So the
+    /// plugin endpoint stops working there, and the fix for the 2.9.0 block and
+    /// the fix for the hole are the same change rather than two.
+    ///
+    /// The public v2 API is behind Spring Security and takes the credentials this
+    /// store already holds for reads. What it does not do is MERGE, which the
+    /// plugin endpoint did server-side, so the merge happens here: read the
+    /// policy for the resource, add or subtract this grantee's access types, write
+    /// it back. Reading the whole policy first is what preserves everything else
+    /// on it, notably `denyPolicyItems` and the provenance `policyLabels` that
+    /// REVOKE reasons from.
+    async fn apply_via_policy_api(
+        &self,
+        op: &str,
+        body: &GrantRevokeRequest,
+    ) -> sqe_core::Result<()> {
+        let existing = self.policy_by_resource(&body.resource).await?;
+        match (op, existing) {
+            // Nothing to revoke: no policy holds this resource.
+            ("revoke", None) => Ok(()),
+            ("grant", None) => {
+                // Deterministic, resource-derived name so a repeated GRANT
+                // updates one policy instead of piling up duplicates, matching
+                // what the DENY path does. Policies the plugin endpoint created
+                // earlier (named `grant-<epoch_ms>`) are still found and updated,
+                // because `policy_by_resource` matches on the RESOURCE, not the
+                // name.
+                let name = format!(
+                    "sqe-grant-{}",
+                    body.resource
+                        .iter()
+                        .filter(|(k, _)| k.as_str() != "root")
+                        .map(|(_, v)| v.as_str())
+                        .collect::<Vec<_>>()
+                        .join("-")
+                );
+                let policy = serde_json::json!({
+                    "service": self.service_name,
+                    "name": name,
+                    "policyType": 0,
+                    "isEnabled": true,
+                    "resources": body.resource
+                        .iter()
+                        .map(|(k, v)| (k.clone(), serde_json::json!({"values": [v]})))
+                        .collect::<serde_json::Map<_, _>>(),
+                    "policyItems": [build_allow_item(body)],
+                    "denyPolicyItems": [],
+                });
+                self.post_policy(&policy).await
+            }
+            (_, Some(mut policy)) => {
+                let want = item_grantees(&build_allow_item(body));
+                let items = match policy.get_mut("policyItems").and_then(serde_json::Value::as_array_mut) {
+                    Some(items) => items,
+                    None => {
+                        policy["policyItems"] = serde_json::json!([]);
+                        policy["policyItems"].as_array_mut().expect("just set")
+                    }
+                };
+
+                if op == "grant" && body.replace_existing_permissions {
+                    items.retain(|it| item_grantees(it) != want);
+                }
+
+                match items.iter_mut().find(|it| item_grantees(it) == want) {
+                    Some(item) if op == "grant" => {
+                        // Union: the plugin endpoint added access types to an
+                        // existing item rather than replacing them, and
+                        // `GRANT SELECT` then `GRANT INSERT` on one resource
+                        // depends on that.
+                        let mut have = item_access_types(item);
+                        for t in &body.access_types {
+                            if !have.contains(t) {
+                                have.push(t.clone());
+                            }
+                        }
+                        item["accesses"] = serde_json::json!(
+                            have.iter()
+                                .map(|t| serde_json::json!({"type": t, "isAllowed": true}))
+                                .collect::<Vec<_>>()
+                        );
+                        if body.delegate_admin {
+                            item["delegateAdmin"] = serde_json::json!(true);
+                        }
+                    }
+                    Some(item) => {
+                        // revoke: subtract, and drop the item when it confers
+                        // nothing, so an emptied grantee does not linger as an
+                        // item allowing zero access types.
+                        let keep: Vec<String> = item_access_types(item)
+                            .into_iter()
+                            .filter(|t| !body.access_types.contains(t))
+                            .collect();
+                        item["accesses"] = serde_json::json!(
+                            keep.iter()
+                                .map(|t| serde_json::json!({"type": t, "isAllowed": true}))
+                                .collect::<Vec<_>>()
+                        );
+                    }
+                    None if op == "grant" => items.push(build_allow_item(body)),
+                    // revoke with no item for this grantee: already absent.
+                    None => {}
+                }
+                items.retain(|it| !item_access_types(it).is_empty());
+
+                let id = policy
+                    .get("id")
+                    .and_then(serde_json::Value::as_i64)
+                    .ok_or_else(|| {
+                        sqe_core::SqeError::Execution("Ranger policy has no id".into())
+                    })?;
+                self.put_policy(id, &policy).await
+            }
+            (other, _) => Err(sqe_core::SqeError::Execution(format!(
+                "unsupported Ranger policy operation '{other}'"
+            ))),
+        }
+    }
+
     async fn post_grant_revoke_inner(
         &self,
         op: &str,
         privilege: Option<&str>,
         body: &GrantRevokeRequest,
     ) -> sqe_core::Result<()> {
-        let url = format!(
-            "{}/service/plugins/services/{op}/{}",
-            self.admin_url, self.service_name
-        );
-        let resp = self
-            .client
-            .post(&url)
-            .basic_auth(&self.admin_user, Some(&self.admin_password))
-            .json(body)
-            .send()
-            .await
-            .map_err(|e| sqe_core::SqeError::Execution(format!("Ranger {op} request failed: {e}")))?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            warn!(http_status = %status, ranger_body = %text, op, "Ranger {op} failed");
-            // A bare "HTTP 400" tells the caller nothing. The overwhelmingly
-            // common cause is a privilege with no mapping, which is sent through
-            // as a literal access type the servicedef does not declare, so name
-            // it and list what IS mapped.
-            let hint = match (status.as_u16(), privilege) {
-                (400, Some(p))
-                    if profile()
-                        .deepest_level(&profile().canonical_privilege(p))
-                        .is_none() =>
-                {
-                    format!(
-                        ". Privilege '{p}' has no mapping and was sent to Ranger as the \
-                         access type '{}', which the service definition does not declare. \
-                         Mapped privileges: {}. A native Polaris access type may also be \
-                         named directly.",
-                        p.to_lowercase(),
-                        profile().known_privileges().join(", ")
-                    )
-                }
-                // Ranger answers 403 when the GRANTOR lacks delegate admin on the
-                // resource, which reads as a permissions bug unless it is named.
-                (403, _) => format!(
-                    ". The grantor '{}' needs delegate admin on this resource in Ranger \
-                     (grant it WITH GRANT OPTION, or add a Ranger policy). Ranger said: {}",
-                    body.grantor,
-                    text.trim()
-                ),
-                _ if !text.trim().is_empty() => format!(". Ranger said: {}", text.trim()),
-                _ => String::new(),
-            };
-            return Err(sqe_core::SqeError::Execution(format!(
-                "Ranger {op} failed (HTTP {status}){hint}"
-            )));
+        match self.apply_via_policy_api(op, body).await {
+            Ok(()) => {
+                debug!(op, service = %self.service_name, "Ranger {op} completed");
+                Ok(())
+            }
+            Err(e) => {
+                let text = e.to_string();
+                warn!(ranger_error = %text, op, "Ranger {op} failed");
+                // A bare transport error tells the caller nothing. The
+                // overwhelmingly common cause is a privilege with no mapping,
+                // which reaches Ranger as a literal access type the servicedef
+                // does not declare, so name it and list what IS mapped. Keyed off
+                // the message rather than a status code now: the policy API
+                // reports an undeclared access type in its own words, and this
+                // hint is worth more than the wording it replaces.
+                let hint = match privilege {
+                    Some(p)
+                        if profile()
+                            .deepest_level(&profile().canonical_privilege(p))
+                            .is_none() =>
+                    {
+                        format!(
+                            ". Privilege '{p}' has no mapping and was sent to Ranger as the \
+                             access type '{}', which the service definition does not declare. \
+                             Mapped privileges: {}. A native Polaris access type may also be \
+                             named directly.",
+                            p.to_lowercase(),
+                            profile().known_privileges().join(", ")
+                        )
+                    }
+                    // Ranger answers 403 when the caller lacks rights on the
+                    // resource, which reads as a permissions bug unless named.
+                    _ if text.contains("403") => format!(
+                        ". The grantor '{}' needs delegate admin on this resource in Ranger \
+                         (grant it WITH GRANT OPTION, or add a Ranger policy).",
+                        body.grantor
+                    ),
+                    _ => String::new(),
+                };
+                Err(sqe_core::SqeError::Execution(format!(
+                    "Ranger {op} failed: {text}{hint}"
+                )))
+            }
         }
-        debug!(op, service = %self.service_name, "Ranger {op} completed");
-        Ok(())
     }
 }
 
