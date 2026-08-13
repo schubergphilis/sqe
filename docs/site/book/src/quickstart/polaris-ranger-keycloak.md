@@ -5,9 +5,13 @@
 Access control splits into a write path and an enforcement path.
 
 **Write path (SQE).** SQE's `ranger` access-control backend turns each `GRANT` /
-`REVOKE` into a call to the Ranger Admin REST API
-(`POST /service/plugins/services/grant/polaris`). `SHOW GRANTS` reads Ranger
-policies back. SQE never enforces anything itself on this path.
+`REVOKE` into a call to the Ranger Admin REST API. By default that is the
+authenticated policy API (`POST /service/public/v2/api/policy`, or a `PUT` to
+merge into the policy already covering the resource); under
+`grant_authority = "ranger-delegate"` it is the plugin grant endpoint instead,
+because Ranger's check on the `grantor` field is the authority in that mode.
+`SHOW GRANTS` reads Ranger policies back. SQE never enforces anything itself on
+this path.
 
 > Learning the model rather than the stack? The
 > [access control tutorial](../features/access-control-tutorial.md) walks through
