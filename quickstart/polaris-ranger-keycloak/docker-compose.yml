@@ -134,9 +134,28 @@ services:
   # runs schema DDL and can take 2-4 minutes; the port-open healthcheck just
   # gates dependents, and ranger-setup does the real REST-readiness wait.
   ranger-admin:
-    image: apache/ranger:2.9.0
+    # Held at 2.8.0. SQE itself is fine on 2.9.0: `make test-access-control` is
+    # 42 of 42 there, because SQE now writes grants and reads policies through
+    # Ranger's authenticated endpoints. What breaks is SPARK.
+    #
+    # Kyuubi's Ranger plugin downloads policies from
+    # /service/plugins/policies/download/{service}, which Ranger declares
+    # security="none" and 2.9.0 refuses with HTTP 400 unless
+    # `ranger.admin.allow.unauthenticated.download.access` is enabled. The plugin
+    # only switches to the authenticated /secure/ twin in Kerberos mode
+    # (RangerAdminRESTClient picks the URL from isAuthenticationEnabled()), and this
+    # stack runs KERBEROS_ENABLED=false. So the plugin gets NO policies, Kyuubi
+    # default-denies, and the parity demo fails: measured 5 passed 2 failed with
+    # "Permission denied: user [alice] does not have [update] privilege".
+    #
+    # Not fixable from SQE: the plugin is upstream
+    # (kyuubi-spark-authz-shaded, which bundles ranger-plugins-common). Current
+    # Ranger master DOES select the secure URL when a basic-auth filter is present,
+    # so a newer plugin build should lift this. Until that is verified, renovate.json
+    # holds apache/ranger below 2.9 and this stays put.
+    image: apache/ranger:2.8.0
     environment:
-      RANGER_VERSION: 2.9.0
+      RANGER_VERSION: 2.8.0
       RANGER_DB_TYPE: postgres
       KERBEROS_ENABLED: "false"
       DEBUG_ADMIN: "false"
