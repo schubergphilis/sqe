@@ -92,6 +92,26 @@
     },
     {
       "description": [
+        "apache/ranger is held below 2.9 deliberately. 2.9.0 rejects the plugin",
+        "grant/revoke API with HTTP 400 'Unauthenticated access not allowed' under",
+        "basic auth. That endpoint (/service/plugins/services/{grant,revoke}/{svc})",
+        "is what SQE's GRANT/REVOKE posts to and what ranger-setup seeds through, so",
+        "the bump takes out access control entirely.",
+        "It fails SILENTLY, which is what makes it dangerous: ranger-setup swallows",
+        "the error and exits 0, ranger-admin reports healthy, and the stack comes up",
+        "with zero authorization policies. Measured on a fresh db, the identical POST",
+        "returns 200 on 2.8.0 and 400 on 2.9.0, and seeding produced 5 policies",
+        "versus none.",
+        "A bot cannot validate this: the container starts, the health check passes,",
+        "and `docker compose up` succeeds. Moving to 2.9+ needs whatever auth that",
+        "endpoint now demands, plus a green `make test-access-control`."
+      ],
+      "matchManagers": ["docker-compose"],
+      "matchPackageNames": ["apache/ranger"],
+      "allowedVersions": "<2.9"
+    },
+    {
+      "description": [
         "The Ranger quickstart's postgres is held on 13.x deliberately. A bump to 18.3",
         "broke the whole stack: postgres 18 stores data in a major-version-specific",
         "subdirectory, so an existing volume is unreadable and the container exits 1.",

@@ -36,11 +36,37 @@ SQE  --GRANT/REVOKE-->  Ranger Admin        (policies stored here)
 SQE  --query+token-->   Polaris  --check-->  Ranger    (enforcement)
 ```
 
-The write path is HTTP basic-auth to Ranger Admin:
+The write path is HTTP basic-auth to Ranger Admin, and which endpoint it uses
+depends on `grant_authority`:
 
-- `GRANT`  -> `POST /service/plugins/services/grant/polaris`
-- `REVOKE` -> `POST /service/plugins/services/revoke/polaris`
-- `SHOW GRANTS` -> `GET /service/public/v2/api/policy?serviceName=polaris`
+| statement | `admin-role` (default) | `ranger-delegate` |
+|---|---|---|
+| `GRANT` | `POST /service/public/v2/api/policy` (create) or `PUT .../policy/{id}` (merge) | `POST /service/plugins/services/grant/polaris` |
+| `REVOKE` | `PUT .../policy/{id}`, subtracting access types | `POST /service/plugins/services/revoke/polaris` |
+| `SHOW GRANTS` | `GET /service/public/v2/api/policy?serviceName=polaris` | same |
+
+The default goes through the authenticated policy API. Ranger declares the plugin
+grant and revoke endpoints `security="none"`, which bypasses Spring Security, so
+basic auth sent there is never processed: measured on Ranger 2.8.0, that endpoint
+accepts a grant carrying no credentials at all, while the same credential-free
+request to the policy API is refused with 401. Ranger 2.9.0 stops serving those
+endpoints altogether unless `ranger.admin.allow.unauthenticated.access` is on.
+
+`ranger-delegate` keeps the plugin endpoint because Ranger's per-resource check on
+the `grantor` field IS the authority in that mode, and only that endpoint performs
+it. One predicate drives both the transport choice and
+`enforces_grantor_authority()`, so the coordinator never stands its admin gate
+down over a write that authorizes the REST user rather than the caller.
+
+The policy API does not merge, which the plugin endpoint did server-side, so SQE
+performs the merge: read the policy for the resource, union or subtract this
+grantee's access types, write it back. Reading the whole policy is what preserves
+`denyPolicyItems` and the provenance `policyLabels` that `REVOKE` narrows from.
+
+Because the policy API records the authenticated REST user in `createdBy` rather
+than the grantor, the SQL caller is recorded separately in a `chm-grantor:` policy
+label, and `SHOW GRANTS` prefers that label over `createdBy` when reporting
+`granted_by`.
 
 The last URL component (`polaris`) is the configured `service_name`. It is the
 only URL-interpolated value, and it is operator-controlled config, not user

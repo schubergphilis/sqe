@@ -146,6 +146,7 @@ pub fn build_grant_backend(
                 &r.realm,
                 r.timeout_secs,
                 r.accept_invalid_certs,
+                config.access_control.grant_authority,
             )?)))
         }
         AccessControlBackend::None
