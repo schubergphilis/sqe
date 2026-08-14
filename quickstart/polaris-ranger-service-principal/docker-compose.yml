@@ -85,7 +85,7 @@ services:
       start_period: 20s
 
   bucket-init:
-    image: amazon/aws-cli:2.36.18
+    image: amazon/aws-cli:2.36.19
     entrypoint: ["sh", "-c"]
     command:
       - |
@@ -103,7 +103,12 @@ services:
 
   # ── Ranger Admin database ─────────────────────────────────────────────
   ranger-db:
-    image: postgres:18.3
+    # Pinned to 13 like the sibling quickstart's ranger-db. postgres 18+ stores
+    # data in a major-version-specific subdirectory, so an existing volume from
+    # an older image is unreadable and the container exits 1 before ranger-admin
+    # can start. renovate.json holds postgres at `<14` for this reason; that pin
+    # stops new bumps but did not roll back the 18.3 already committed here.
+    image: postgres:13.23
     environment:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-rangerR0cks!}
     volumes:

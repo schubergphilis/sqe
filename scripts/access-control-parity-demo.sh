@@ -451,9 +451,12 @@ compare_denied() { # user sql description
   printf '%s' "$spark_raw" \
     | grep -qE "ForbiddenException.*Principal '$user'.*not authorized for op 'LOAD_TABLE'" \
     && spark_polaris=1
-  echo "     SQE denial:"
+  # Both engines are SUPPOSED to fail here. The text is evidence, not a problem,
+  # and SQE's "not found" is deliberate: a denied table is invisible rather than
+  # forbidden, so a prober cannot map what exists.
+  echo "     SQE denial (expected):"
   printf '%s\n' "$sqe_raw" | useful_error
-  echo "     Spark denial:"
+  echo "     Spark denial (expected):"
   printf '%s\n' "$spark_raw" | useful_error
   if [ "$sqe_denied" = 1 ] && [ "$spark_denied" = 1 ] && [ "$spark_polaris" = 1 ]; then
     green "     PASS — both deny; Spark reached Polaris as $user"
@@ -479,9 +482,9 @@ compare_write_denied() { # user sql description
   printf '%s' "$sqe_raw" | is_permission_denial && sqe_denied=1
   printf '%s' "$spark_raw" | grep -qiE "ADD_TABLE_SNAPSHOT|not authorized|forbidden|permission denied" \
     && spark_denied=1
-  echo "     SQE denial:"
+  echo "     SQE denial (expected):"
   printf '%s\n' "$sqe_raw" | useful_error
-  echo "     Spark denial:"
+  echo "     Spark denial (expected):"
   printf '%s\n' "$spark_raw" | useful_error
   if [ "$sqe_denied" = 1 ] && [ "$spark_denied" = 1 ]; then
     green "     PASS — both engines refused the snapshot commit"
@@ -557,9 +560,16 @@ sqe_assert() { # expect(ok|error) sql description match [avoid]
   echo
   bold "[$STEP] $desc"
   dim "     management plane: SQE SQL (Spark has no equivalent statement)"
+  [ "$expect" = error ] && dim "     expectation: SQE REJECTS this statement; the error below is the evidence"
   echo "     SQL (SQE/carol): $sql"
   out="$(sqe_exec carol "$sql")"
-  printf '%s\n' "$out" | sed 's/^/       /'
+  # An intended rejection prints an engine error, which is indistinguishable from
+  # a real failure when someone is scanning the transcript. Label it at the line.
+  if [ "$expect" = error ]; then
+    printf '%s\n' "$out" | sed 's/^/       [expected] /'
+  else
+    printf '%s\n' "$out" | sed 's/^/       /'
+  fi
   case "$expect" in
     ok) printf '%s' "$out" | grep -qi 'error:' && verdict=FAIL ;;
     error) printf '%s' "$out" | grep -qi 'error:' || verdict=FAIL ;;
