@@ -1,5 +1,23 @@
 # SQE — Next Steps
 
+> **WANTED: object-level grant admin. Make a principal admin OF A TABLE, and let them update the grants on it without engine-wide admin.**
+>
+> The Snowflake / `WITH GRANT OPTION` shape: authority scoped to the object, not to a role that can grant anywhere. SQE has the opt-in `grant_authority = "ranger-delegate"` for this today, and it works by handing the decision to Ranger: the plugin grant endpoint authorizes the request's `grantor` field against `delegateAdmin` per resource AND per access type, so a grantor holding delegate admin for `table-data-read` is still refused when the request names `table-data-write`.
+>
+> **That mechanism does not survive Ranger 2.9.0.** The per-resource grantor check exists ONLY on `/service/plugins/services/{grant,revoke}/*`, which Ranger declares `security="none"` and 2.9.0 stops serving unless `ranger.admin.allow.unauthenticated.access` is enabled. Measured: with the write and read paths moved to authenticated endpoints, 41 of 42 access-control cases pass on 2.9.0, and the single failure is `a_delegated_owner_grants_on_their_own_table_without_an_admin_role`, HTTP 400 "Unauthenticated access not allowed". Turning that property on would restore the feature by keeping an unauthenticated write endpoint open, which is the wrong trade for a feature about tightening authority.
+>
+> So the choice is: keep Ranger as the authority and stay on 2.8.x, or move the `delegateAdmin` evaluation INTO SQE (read the policies, decide whether the caller holds delegate admin on that resource and those access types, then write through the authenticated policy API). Only the second works on 2.9.0+, and it means SQE owns a security decision Ranger used to own, including the measured fact that `delegateAdmin` does NOT cascade upward, so a delegated grantor needs the already-held-traversal skip.
+>
+> **ANSWERED, and the fork closed: Ranger has an authenticated twin of the grant endpoints.** `/service/plugins/secure/services/{grant,revoke}/{service}` is covered by the catch-all `isAuthenticated()` rule rather than `security="none"`, runs Ranger's own server-side merge, and STILL authorizes the named `grantor` per resource and per access type. So neither horn of the fork was necessary: Ranger keeps the authority, SQE does not reimplement `delegateAdmin`, and delegate mode works on 2.9.0.
+>
+> Measured on 2.9.0 with admin REST credentials and a non-admin grantor: no credentials 401; grantor holding delegateAdmin for the access type 200; grantor holding none 403; grantor holding it for a DIFFERENT access type 403. Confirmed present on 2.8.0 as well, so one transport covers both. **`make test-access-control` is 42 of 42 on 2.9.0 AND on 2.8.0**, including `a_delegated_owner_grants_on_their_own_table_without_an_admin_role`.
+>
+> Two traps found while probing, both now in the code comments. The denial discriminator is the HTTP STATUS: the body carries `"statusCode":0` on success and on denial alike, so a body-based check would read a refused grant as a successful one. And `grantorGroups` is taken only from the request for a privileged caller, so group-based delegateAdmin would be ignored; that is not load-bearing here because this deployment materialises Keycloak groups as Ranger ROLES and role membership IS resolved server-side (verified: grantor delegated through role `analyst`, authorized with the field absent). A deployment delegating through real Ranger groups needs session groups threaded onto `GrantStatement`.
+>
+> What remains for "grant admin on a table": `GRANT ... WITH GRANT OPTION` already maps to `delegateAdmin: true` on the object's policy item, so the mechanism is there. The open pieces are the already-held-traversal skip (delegateAdmin does not cascade upward, so a table-level delegate cannot write the catalog/namespace traversal policies a grant plan emits) and, if non-transferable ownership is wanted, gating the `delegateAdmin` flag in the coordinator, since Ranger lets a delegate pass grant-option onward for types they hold.
+>
+> The 2.9.0 hold in renovate.json can now be lifted on this evidence.
+
 > **FIXED 2026-08-12, suite hygiene: `make test-access-control` leaked its own grants between runs, so two denial-baseline tests failed on any stack the suite had already used.**
 >
 > `denied_before_any_grant` and `all_tables_in_schema_grant_covers_the_namespace` both time out after 120 s with `still allowed for alice with 3 rows`. The cause is in Ranger, not in the assertion: a policy named `grant-1786370165684` grants role `analyst` sixteen access types on `sales_wh.ac.orders`, and alice is in `analyst`.
