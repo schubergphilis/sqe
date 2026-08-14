@@ -136,7 +136,7 @@ services:
   ranger-admin:
     image: apache/ranger:2.9.0
     environment:
-      RANGER_VERSION: 2.8.0
+      RANGER_VERSION: 2.9.0
       RANGER_DB_TYPE: postgres
       KERBEROS_ENABLED: "false"
       DEBUG_ADMIN: "false"
