@@ -1,5 +1,23 @@
 # SQE — Next Steps
 
+> **WANTED: object-level grant admin. Make a principal admin OF A TABLE, and let them update the grants on it without engine-wide admin.**
+>
+> The Snowflake / `WITH GRANT OPTION` shape: authority scoped to the object, not to a role that can grant anywhere. SQE has the opt-in `grant_authority = "ranger-delegate"` for this today, and it works by handing the decision to Ranger: the plugin grant endpoint authorizes the request's `grantor` field against `delegateAdmin` per resource AND per access type, so a grantor holding delegate admin for `table-data-read` is still refused when the request names `table-data-write`.
+>
+> **That mechanism does not survive Ranger 2.9.0.** The per-resource grantor check exists ONLY on `/service/plugins/services/{grant,revoke}/*`, which Ranger declares `security="none"` and 2.9.0 stops serving unless `ranger.admin.allow.unauthenticated.access` is enabled. Measured: with the write and read paths moved to authenticated endpoints, 41 of 42 access-control cases pass on 2.9.0, and the single failure is `a_delegated_owner_grants_on_their_own_table_without_an_admin_role`, HTTP 400 "Unauthenticated access not allowed". Turning that property on would restore the feature by keeping an unauthenticated write endpoint open, which is the wrong trade for a feature about tightening authority.
+>
+> So the choice is: keep Ranger as the authority and stay on 2.8.x, or move the `delegateAdmin` evaluation INTO SQE (read the policies, decide whether the caller holds delegate admin on that resource and those access types, then write through the authenticated policy API). Only the second works on 2.9.0+, and it means SQE owns a security decision Ranger used to own, including the measured fact that `delegateAdmin` does NOT cascade upward, so a delegated grantor needs the already-held-traversal skip.
+>
+> **ANSWERED, and the fork closed: Ranger has an authenticated twin of the grant endpoints.** `/service/plugins/secure/services/{grant,revoke}/{service}` is covered by the catch-all `isAuthenticated()` rule rather than `security="none"`, runs Ranger's own server-side merge, and STILL authorizes the named `grantor` per resource and per access type. So neither horn of the fork was necessary: Ranger keeps the authority, SQE does not reimplement `delegateAdmin`, and delegate mode works on 2.9.0.
+>
+> Measured on 2.9.0 with admin REST credentials and a non-admin grantor: no credentials 401; grantor holding delegateAdmin for the access type 200; grantor holding none 403; grantor holding it for a DIFFERENT access type 403. Confirmed present on 2.8.0 as well, so one transport covers both. **`make test-access-control` is 42 of 42 on 2.9.0 AND on 2.8.0**, including `a_delegated_owner_grants_on_their_own_table_without_an_admin_role`.
+>
+> Two traps found while probing, both now in the code comments. The denial discriminator is the HTTP STATUS: the body carries `"statusCode":0` on success and on denial alike, so a body-based check would read a refused grant as a successful one. And `grantorGroups` is taken only from the request for a privileged caller, so group-based delegateAdmin would be ignored; that is not load-bearing here because this deployment materialises Keycloak groups as Ranger ROLES and role membership IS resolved server-side (verified: grantor delegated through role `analyst`, authorized with the field absent). A deployment delegating through real Ranger groups needs session groups threaded onto `GrantStatement`.
+>
+> What remains for "grant admin on a table": `GRANT ... WITH GRANT OPTION` already maps to `delegateAdmin: true` on the object's policy item, so the mechanism is there. The open pieces are the already-held-traversal skip (delegateAdmin does not cascade upward, so a table-level delegate cannot write the catalog/namespace traversal policies a grant plan emits) and, if non-transferable ownership is wanted, gating the `delegateAdmin` flag in the coordinator, since Ranger lets a delegate pass grant-option onward for types they hold.
+>
+> The 2.9.0 hold in renovate.json can now be lifted on this evidence.
+
 > **FIXED 2026-08-12, suite hygiene: `make test-access-control` leaked its own grants between runs, so two denial-baseline tests failed on any stack the suite had already used.**
 >
 > `denied_before_any_grant` and `all_tables_in_schema_grant_covers_the_namespace` both time out after 120 s with `still allowed for alice with 3 rows`. The cause is in Ranger, not in the assertion: a policy named `grant-1786370165684` grants role `analyst` sixteen access types on `sales_wh.ac.orders`, and alice is in `analyst`.
@@ -82,6 +100,33 @@
 > That is what `!779` (rust 0.x breaking) is asking for, which is why it cannot go in as a bump. It also changes `Cargo.toml` WITHOUT regenerating `Cargo.lock`, the same shape that broke main twice (#386). `!733` (DataFusion/Arrow v59) and `!730` (object_store 0.14) share that defect and are 301 commits stale against a tree on DF 54.
 >
 > Order that actually works: raise the rustc pin, or drop sqlx 0.9 from the set; de-vendor or align `iceberg-catalog-sql`'s sqlx; then let renovate regenerate against current main so the lockfile comes with it.
+
+> **OPEN, SECURITY: SQE's GRANT/REVOKE writes through a Ranger endpoint that requires no authentication at all, and Ranger 2.9.0 closes that hole rather than breaking an API.**
+>
+> Measured on the shipped quickstart at Ranger 2.8.0. A `POST /service/plugins/services/grant/polaris` carrying **no credentials whatsoever** returned **HTTP 200** and created a live policy granting `dave` `table-data-read`. The same request with no credentials against the public v2 API returns 401, so this is specific to the plugin grant/revoke endpoints, not a misconfigured server.
+>
+> Ranger says so itself, in `security-applicationContext.xml`:
+>
+> ```xml
+> pattern="/service/plugins/services/grant/*"  security="none"
+> pattern="/service/plugins/services/revoke/*" security="none"
+> ```
+>
+> `security="none"` bypasses Spring Security entirely, so the basic auth SQE sends on that path is not rejected, it is simply never processed. No `UserSessionBase` is created, which is why `ContextUtil.getCurrentUserSession()` is null there. `crates/sqe-policy/src/grants/ranger.rs:623` posts every GRANT and REVOKE to that endpoint, and `ranger-setup` seeds through it too. Anyone with network reach to Ranger Admin can grant themselves any privilege on any resource, no credentials needed.
+>
+> **This is why 2.9.0 answers 400.** `ServiceREST.grantAccess` calls `bizUtil.failUnauthenticatedIfNotAllowed()`, which throws when the session is null and `ranger.admin.allow.unauthenticated.access` is false (its default):
+>
+> ```java
+> if (currentUserSession == null && !allowUnauthenticatedAccessInSecureEnvironment) {
+>     throw new Exception("Unauthenticated access not allowed");
+> }
+> ```
+>
+> RANGER-5635 in the 2.9.0 notes ("`ranger.admin.allow.unauthenticated.download.access` is honored only when Kerberos is enabled") is that class of fix: the check used to be skipped when Kerberos was off, which is exactly how our stack runs (`KERBEROS_ENABLED=false`). So 2.8.0 was not authenticating these calls and not enforcing the property either. 2.9.0 enforces it.
+>
+> **So the version hold in renovate.json is a stopgap, not the fix.** Setting `ranger.admin.allow.unauthenticated.access=true` would make 2.9.0 work by keeping the hole open, which is the wrong direction for an engine whose selling point is fine-grained access control.
+>
+> Fix: move GRANT/REVOKE off the plugin endpoint onto the authenticated public v2 policy API (`/service/public/v2/api/policy`), which is behind Spring Security and already accepts the basic auth SQE holds. SQE reads policies through it today, so the credentials and plumbing exist. The cost is that the plugin API MERGES a grant into whatever policy matches the resource, so the v2 path needs read-modify-write plus the same merge semantics, including the provenance labels `REVOKE` relies on. Doing it also unblocks 2.9.0 and removes a hole rather than pinning around it.
 
 > Status as of 2026-08-12. **The parity demo now runs on an EU retail bank fixture, and adding a persona to the quickstart stack turns out to touch five places rather than three.**
 >

@@ -111,6 +111,67 @@ fn deepest_policy(
 ///
 /// Shared by DENY and by the REVOKE path that removes a denial, so the two agree
 /// on the shape by construction rather than by two similar literals.
+/// Build a v2 `policyItems` entry equivalent to what the plugin grant API would
+/// have merged in.
+///
+/// Shape matches `build_deny_item`: a grantee key (`users` / `groups` / `roles`)
+/// plus `accesses`. `delegateAdmin` is emitted only when set, because Ranger
+/// treats an absent key and `false` alike and a always-present `false` shows up
+/// as a spurious diff on every policy this touches.
+fn build_allow_item(body: &GrantRevokeRequest) -> serde_json::Value {
+    let accesses: Vec<serde_json::Value> = body
+        .access_types
+        .iter()
+        .map(|t| serde_json::json!({"type": t, "isAllowed": true}))
+        .collect();
+    let mut item = serde_json::Map::new();
+    if !body.users.is_empty() {
+        item.insert("users".into(), serde_json::json!(body.users));
+    }
+    if !body.groups.is_empty() {
+        item.insert("groups".into(), serde_json::json!(body.groups));
+    }
+    if !body.roles.is_empty() {
+        item.insert("roles".into(), serde_json::json!(body.roles));
+    }
+    item.insert("accesses".into(), serde_json::Value::Array(accesses));
+    if body.delegate_admin {
+        item.insert("delegateAdmin".into(), serde_json::json!(true));
+    }
+    serde_json::Value::Object(item)
+}
+
+/// The grantee triple a policy item names, sorted so ordering never decides
+/// whether two items are the same grantee.
+fn item_grantees(item: &serde_json::Value) -> (Vec<String>, Vec<String>, Vec<String>) {
+    let field = |key: &str| -> Vec<String> {
+        let mut v: Vec<String> = item
+            .get(key)
+            .and_then(serde_json::Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        v.sort();
+        v
+    };
+    (field("users"), field("groups"), field("roles"))
+}
+
+/// Access types an item currently allows.
+fn item_access_types(item: &serde_json::Value) -> Vec<String> {
+    item.get("accesses")
+        .and_then(serde_json::Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.get("type").and_then(|t| t.as_str()).map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn build_deny_item(grantee: &Grantee, access_types: &[String]) -> serde_json::Value {
     let accesses: Vec<serde_json::Value> = access_types
         .iter()
@@ -267,6 +328,9 @@ pub struct RangerGrantBackend {
     admin_password: String,
     /// Value for the `root` resource level (empty = omit).
     realm: String,
+    /// Which transport authorizes a privilege write, and therefore which one is
+    /// used. See `apply_via_policy_api` for why there are two.
+    grant_authority: sqe_core::config::GrantAuthority,
 }
 
 impl RangerGrantBackend {
@@ -279,6 +343,7 @@ impl RangerGrantBackend {
         realm: &str,
         timeout_secs: u64,
         accept_invalid_certs: bool,
+        grant_authority: sqe_core::config::GrantAuthority,
     ) -> sqe_core::Result<Self> {
         let client = Client::builder()
             .timeout(Duration::from_secs(timeout_secs))
@@ -292,7 +357,22 @@ impl RangerGrantBackend {
             admin_user: admin_user.to_string(),
             admin_password: admin_password.to_string(),
             realm: realm.to_string(),
+            grant_authority,
         })
+    }
+
+    /// Does this store delegate the authority decision to Ranger?
+    ///
+    /// True only under `grant_authority = "ranger-delegate"`, which is also the
+    /// only mode that uses the plugin endpoint. Keeping one predicate behind both
+    /// the transport choice and `enforces_grantor_authority` is what stops the two
+    /// drifting into the combination that matters: writing through a transport
+    /// that checks nothing while telling the coordinator to stand its gate down.
+    fn delegates_authority_to_ranger(&self) -> bool {
+        matches!(
+            self.grant_authority,
+            sqe_core::config::GrantAuthority::RangerDelegate
+        )
     }
 
     /// Validate the resource identifiers in a grant/revoke statement and build
@@ -613,14 +693,187 @@ impl RangerGrantBackend {
         self.post_grant_revoke_inner(op, Some(privilege), body).await
     }
 
-    async fn post_grant_revoke_inner(
+    /// Apply a grant or revoke through Ranger's AUTHENTICATED policy API.
+    ///
+    /// WHY NOT THE PLUGIN GRANT ENDPOINT: Ranger declares
+    /// `/service/plugins/services/{grant,revoke}/*` with `security="none"` in
+    /// `security-applicationContext.xml`, which bypasses Spring Security
+    /// entirely. The basic auth sent there is not rejected, it is never
+    /// processed, so no `UserSessionBase` is created. Measured on Ranger 2.8.0:
+    /// that endpoint accepts a grant carrying NO credentials at all and creates
+    /// the policy (HTTP 200), while the same credential-free request to
+    /// `/service/public/v2/api/policy` is refused with 401. Writing privilege
+    /// changes through an unauthenticated endpoint is not defensible for an
+    /// engine whose purpose is access control.
+    ///
+    /// Ranger 2.9.0 closes that hole: `ServiceREST.grantAccess` now calls
+    /// `failUnauthenticatedIfNotAllowed()`, which rejects the session-less call
+    /// unless `ranger.admin.allow.unauthenticated.access` is turned on. So the
+    /// plugin endpoint stops working there, and the fix for the 2.9.0 block and
+    /// the fix for the hole are the same change rather than two.
+    ///
+    /// The public v2 API is behind Spring Security and takes the credentials this
+    /// store already holds for reads. What it does not do is MERGE, which the
+    /// plugin endpoint did server-side, so the merge happens here: read the
+    /// policy for the resource, add or subtract this grantee's access types, write
+    /// it back. Reading the whole policy first is what preserves everything else
+    /// on it, notably `denyPolicyItems` and the provenance `policyLabels` that
+    /// REVOKE reasons from.
+    async fn apply_via_policy_api(
         &self,
         op: &str,
-        privilege: Option<&str>,
+        body: &GrantRevokeRequest,
+    ) -> sqe_core::Result<()> {
+        let existing = self.policy_by_resource(&body.resource).await?;
+        match (op, existing) {
+            // Nothing to revoke: no policy holds this resource.
+            ("revoke", None) => Ok(()),
+            ("grant", None) => {
+                // Deterministic, resource-derived name so a repeated GRANT
+                // updates one policy instead of piling up duplicates, matching
+                // what the DENY path does. Policies the plugin endpoint created
+                // earlier (named `grant-<epoch_ms>`) are still found and updated,
+                // because `policy_by_resource` matches on the RESOURCE, not the
+                // name.
+                let name = format!(
+                    "sqe-grant-{}",
+                    body.resource
+                        .iter()
+                        .filter(|(k, _)| k.as_str() != "root")
+                        .map(|(_, v)| v.as_str())
+                        .collect::<Vec<_>>()
+                        .join("-")
+                );
+                let policy = serde_json::json!({
+                    "service": self.service_name,
+                    "name": name,
+                    "policyType": 0,
+                    "isEnabled": true,
+                    "resources": body.resource
+                        .iter()
+                        .map(|(k, v)| (k.clone(), serde_json::json!({"values": [v]})))
+                        .collect::<serde_json::Map<_, _>>(),
+                    "policyItems": [build_allow_item(body)],
+                    "denyPolicyItems": [],
+                });
+                self.post_policy(&policy).await
+            }
+            (_, Some(mut policy)) => {
+                let want = item_grantees(&build_allow_item(body));
+                let items = match policy.get_mut("policyItems").and_then(serde_json::Value::as_array_mut) {
+                    Some(items) => items,
+                    None => {
+                        policy["policyItems"] = serde_json::json!([]);
+                        policy["policyItems"].as_array_mut().expect("just set")
+                    }
+                };
+
+                if op == "grant" && body.replace_existing_permissions {
+                    items.retain(|it| item_grantees(it) != want);
+                }
+
+                match items.iter_mut().find(|it| item_grantees(it) == want) {
+                    Some(item) if op == "grant" => {
+                        // Union: the plugin endpoint added access types to an
+                        // existing item rather than replacing them, and
+                        // `GRANT SELECT` then `GRANT INSERT` on one resource
+                        // depends on that.
+                        let mut have = item_access_types(item);
+                        for t in &body.access_types {
+                            if !have.contains(t) {
+                                have.push(t.clone());
+                            }
+                        }
+                        item["accesses"] = serde_json::json!(
+                            have.iter()
+                                .map(|t| serde_json::json!({"type": t, "isAllowed": true}))
+                                .collect::<Vec<_>>()
+                        );
+                        if body.delegate_admin {
+                            item["delegateAdmin"] = serde_json::json!(true);
+                        }
+                    }
+                    Some(item) => {
+                        // revoke: subtract, and drop the item when it confers
+                        // nothing, so an emptied grantee does not linger as an
+                        // item allowing zero access types.
+                        let keep: Vec<String> = item_access_types(item)
+                            .into_iter()
+                            .filter(|t| !body.access_types.contains(t))
+                            .collect();
+                        item["accesses"] = serde_json::json!(
+                            keep.iter()
+                                .map(|t| serde_json::json!({"type": t, "isAllowed": true}))
+                                .collect::<Vec<_>>()
+                        );
+                    }
+                    None if op == "grant" => items.push(build_allow_item(body)),
+                    // revoke with no item for this grantee: already absent.
+                    None => {}
+                }
+                items.retain(|it| !item_access_types(it).is_empty());
+
+                let id = policy
+                    .get("id")
+                    .and_then(serde_json::Value::as_i64)
+                    .ok_or_else(|| {
+                        sqe_core::SqeError::Execution("Ranger policy has no id".into())
+                    })?;
+                self.put_policy(id, &policy).await
+            }
+            (other, _) => Err(sqe_core::SqeError::Execution(format!(
+                "unsupported Ranger policy operation '{other}'"
+            ))),
+        }
+    }
+
+    /// POST to Ranger's SECURE grant/revoke endpoint.
+    ///
+    /// Used ONLY under `grant_authority = "ranger-delegate"`, where Ranger's
+    /// per-resource check on the `grantor` field is the authority and the
+    /// coordinator has stood its own admin gate down. The policy API cannot serve
+    /// that mode: it takes no grantor and would authorize the REST admin instead,
+    /// turning an ungated GRANT into self-escalation.
+    ///
+    /// `/service/plugins/secure/services/{op}/*`, NOT
+    /// `/service/plugins/services/{op}/*`. The two do the same work and share
+    /// Ranger's server-side merge, but the non-secure one is declared
+    /// `security="none"`: it discards credentials rather than checking them, it
+    /// accepts a grant from a caller with none at all, and Ranger 2.9.0 stops
+    /// serving it unless `ranger.admin.allow.unauthenticated.access` is enabled.
+    /// The secure twin is authenticated AND still authorizes the named grantor, so
+    /// one transport covers 2.8 and 2.9 without giving up delegated authority.
+    ///
+    /// Measured on 2.9.0, admin REST credentials with a `grantor` naming a
+    /// non-admin:
+    ///
+    /// | case | result |
+    /// |---|---|
+    /// | no credentials | HTTP 401 |
+    /// | grantor holds delegateAdmin for the access type | HTTP 200 |
+    /// | grantor holds no delegateAdmin | HTTP 403 "User doesn't have necessary permission to grant access" |
+    /// | grantor holds delegateAdmin for a DIFFERENT access type | HTTP 403 |
+    ///
+    /// Note the discriminator is the HTTP status. The JSON body carries
+    /// `"statusCode":0` on success AND on denial, so a body-based check would read
+    /// a refused grant as a successful one.
+    ///
+    /// `grantorGroups` is not sent. For a privileged REST caller Ranger takes the
+    /// grantor's groups only from the request, so group-based delegateAdmin
+    /// policies would be ignored. That is not load-bearing here and was measured
+    /// rather than assumed: this deployment materialises every Keycloak group as a
+    /// Ranger ROLE of the same name, and role membership IS resolved server-side, so
+    /// a grantor delegated through a role is authorized with the field absent
+    /// (verified live: role `analyst`, grantor `alice`, HTTP 200). A deployment
+    /// using real Ranger groups for delegation would need the session's groups
+    /// threaded onto `GrantStatement` first.
+    async fn post_to_plugin_endpoint(
+        &self,
+        op: &str,
         body: &GrantRevokeRequest,
     ) -> sqe_core::Result<()> {
         let url = format!(
-            "{}/service/plugins/services/{op}/{}",
+            "{}/service/plugins/secure/services/{op}/{}",
             self.admin_url, self.service_name
         );
         let resp = self
@@ -631,47 +884,79 @@ impl RangerGrantBackend {
             .send()
             .await
             .map_err(|e| sqe_core::SqeError::Execution(format!("Ranger {op} request failed: {e}")))?;
-
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
-            warn!(http_status = %status, ranger_body = %text, op, "Ranger {op} failed");
-            // A bare "HTTP 400" tells the caller nothing. The overwhelmingly
-            // common cause is a privilege with no mapping, which is sent through
-            // as a literal access type the servicedef does not declare, so name
-            // it and list what IS mapped.
-            let hint = match (status.as_u16(), privilege) {
-                (400, Some(p))
-                    if profile()
-                        .deepest_level(&profile().canonical_privilege(p))
-                        .is_none() =>
-                {
-                    format!(
-                        ". Privilege '{p}' has no mapping and was sent to Ranger as the \
-                         access type '{}', which the service definition does not declare. \
-                         Mapped privileges: {}. A native Polaris access type may also be \
-                         named directly.",
-                        p.to_lowercase(),
-                        profile().known_privileges().join(", ")
-                    )
-                }
-                // Ranger answers 403 when the GRANTOR lacks delegate admin on the
-                // resource, which reads as a permissions bug unless it is named.
-                (403, _) => format!(
-                    ". The grantor '{}' needs delegate admin on this resource in Ranger \
-                     (grant it WITH GRANT OPTION, or add a Ranger policy). Ranger said: {}",
-                    body.grantor,
-                    text.trim()
-                ),
-                _ if !text.trim().is_empty() => format!(". Ranger said: {}", text.trim()),
-                _ => String::new(),
-            };
             return Err(sqe_core::SqeError::Execution(format!(
-                "Ranger {op} failed (HTTP {status}){hint}"
+                "HTTP {status}{}",
+                if text.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!(". Ranger said: {}", text.trim())
+                }
             )));
         }
-        debug!(op, service = %self.service_name, "Ranger {op} completed");
         Ok(())
+    }
+
+    async fn post_grant_revoke_inner(
+        &self,
+        op: &str,
+        privilege: Option<&str>,
+        body: &GrantRevokeRequest,
+    ) -> sqe_core::Result<()> {
+        let attempt = if self.delegates_authority_to_ranger() {
+            // Ranger's own grantor check IS the authority in this mode, and only
+            // the grant/revoke endpoints perform it. The SECURE spelling is used,
+            // so this is authenticated and works on 2.9.0 as well as 2.8.
+            self.post_to_plugin_endpoint(op, body).await
+        } else {
+            self.apply_via_policy_api(op, body).await
+        };
+        match attempt {
+            Ok(()) => {
+                debug!(op, service = %self.service_name, "Ranger {op} completed");
+                Ok(())
+            }
+            Err(e) => {
+                let text = e.to_string();
+                warn!(ranger_error = %text, op, "Ranger {op} failed");
+                // A bare transport error tells the caller nothing. The
+                // overwhelmingly common cause is a privilege with no mapping,
+                // which reaches Ranger as a literal access type the servicedef
+                // does not declare, so name it and list what IS mapped. Keyed off
+                // the message rather than a status code now: the policy API
+                // reports an undeclared access type in its own words, and this
+                // hint is worth more than the wording it replaces.
+                let hint = match privilege {
+                    Some(p)
+                        if profile()
+                            .deepest_level(&profile().canonical_privilege(p))
+                            .is_none() =>
+                    {
+                        format!(
+                            ". Privilege '{p}' has no mapping and was sent to Ranger as the \
+                             access type '{}', which the service definition does not declare. \
+                             Mapped privileges: {}. A native Polaris access type may also be \
+                             named directly.",
+                            p.to_lowercase(),
+                            profile().known_privileges().join(", ")
+                        )
+                    }
+                    // Ranger answers 403 when the caller lacks rights on the
+                    // resource, which reads as a permissions bug unless named.
+                    _ if text.contains("403") => format!(
+                        ". The grantor '{}' needs delegate admin on this resource in Ranger \
+                         (grant it WITH GRANT OPTION, or add a Ranger policy).",
+                        body.grantor
+                    ),
+                    _ => String::new(),
+                };
+                Err(sqe_core::SqeError::Execution(format!(
+                    "Ranger {op} failed: {text}{hint}"
+                )))
+            }
+        }
     }
 }
 
@@ -699,6 +984,11 @@ pub struct RangerPolicy {
     /// Creation time in epoch milliseconds. Same list-versus-detail caveat.
     #[serde(default, rename = "createTime")]
     create_time: Option<i64>,
+    /// Provenance labels. Carries the `chm-grantor:` entries that name the SQL
+    /// caller behind each grant, which the policy-API transport cannot record in
+    /// `createdBy`.
+    #[serde(default, rename = "policyLabels")]
+    policy_labels: Vec<String>,
 }
 
 /// Upper bound on per-policy provenance requests for one `SHOW GRANTS`.
@@ -761,10 +1051,24 @@ pub fn policies_to_entries(policies: &[RangerPolicy]) -> Vec<GrantEntry> {
     let mut out = Vec::new();
     for p in policies {
         let resource = format_policy_resource(&p.resources);
-        // Both stay None unless `fill_provenance` fetched the per-policy record,
-        // because the list endpoint does not carry them.
-        let granted_by = p.created_by.clone();
+        // `granted_at` stays None unless `fill_provenance` fetched the per-policy
+        // record, because the list endpoint does not carry it.
         let granted_at = p.create_time.and_then(format_grant_time);
+        // Grantor labels first, `createdBy` second. Under the policy-API transport
+        // `createdBy` is SQE's REST user, so it answers "which service wrote this"
+        // where the column is asking "who granted it". The label carries the SQL
+        // caller and is keyed by grantee, so it is resolved per row below.
+        let grantors: Vec<(String, String, String)> = p
+            .policy_labels
+            .iter()
+            .filter_map(|l| parse_grantor_label(l))
+            .collect();
+        let grantor_for = |kind: &str, name: &str| -> Option<String> {
+            grantors
+                .iter()
+                .find(|(k, n, _)| k == kind && n == name)
+                .map(|(_, _, g)| g.clone())
+        };
         let mut push_items = |items: &[RangerPolicyItem], effect: &str| {
             for item in items {
                 for access in &item.accesses {
@@ -775,7 +1079,7 @@ pub fn policies_to_entries(policies: &[RangerPolicy]) -> Vec<GrantEntry> {
                             grantee_type: "USER".into(),
                             grantee_name: u.clone(),
                             effect: effect.into(),
-                            granted_by: granted_by.clone(),
+                            granted_by: grantor_for("USER", u).or_else(|| p.created_by.clone()),
                             granted_at: granted_at.clone(),
                         });
                     }
@@ -786,7 +1090,7 @@ pub fn policies_to_entries(policies: &[RangerPolicy]) -> Vec<GrantEntry> {
                             grantee_type: "ROLE".into(),
                             grantee_name: r.clone(),
                             effect: effect.into(),
-                            granted_by: granted_by.clone(),
+                            granted_by: grantor_for("ROLE", r).or_else(|| p.created_by.clone()),
                             granted_at: granted_at.clone(),
                         });
                     }
@@ -927,6 +1231,46 @@ fn grant_label(grantee: &Grantee, privilege: &str) -> String {
 /// Anything that does not round-trip is rejected rather than guessed: labels are
 /// editable strings in the Ranger console, and a mis-parse here would silently
 /// under-revoke, which is worse than the cascade it replaces.
+/// Namespace for "which SQL caller issued this grant".
+///
+/// Separate from `LABEL_PREFIX` on purpose. That one is the cross-tool contract
+/// with the platform's provenance module, parsed as `chm:<TYPE>:<name>:<PRIV>`;
+/// extending it to carry a fourth field would change a format another repo reads.
+/// `chm-grantor:` does not start with `chm:`, so `parse_grant_label` ignores it.
+///
+/// WHY THIS EXISTS AT ALL: the plugin grant endpoint recorded Ranger's
+/// `createdBy` from the request's `grantor` field, so `SHOW GRANTS` could report
+/// the SQL caller. The authenticated policy API records the REST user instead, so
+/// every grant would read `granted_by = Admin`. Truthful about the transport,
+/// useless as an audit trail, which is the column's whole purpose.
+const GRANTOR_LABEL_PREFIX: &str = "chm-grantor";
+
+fn grantor_label(grantee: &Grantee, grantor: &str) -> String {
+    let kind = match grantee {
+        Grantee::User(_) => "USER",
+        Grantee::Role(_) | Grantee::Group(_) => "ROLE",
+    };
+    format!(
+        "{GRANTOR_LABEL_PREFIX}:{kind}:{}:{grantor}",
+        grantee.name()
+    )
+}
+
+/// `(grantee_kind, grantee_name, grantor)` from a grantor label.
+fn parse_grantor_label(label: &str) -> Option<(String, String, String)> {
+    let rest = label.strip_prefix(&format!("{GRANTOR_LABEL_PREFIX}:"))?;
+    let (kind, rest) = rest.split_once(':')?;
+    let kind = kind.trim().to_uppercase();
+    if !LABEL_GRANTEE_TYPES.contains(&kind.as_str()) {
+        return None;
+    }
+    let (name, grantor) = rest.rsplit_once(':')?;
+    if name.is_empty() || grantor.is_empty() {
+        return None;
+    }
+    Some((kind, name.to_string(), grantor.to_string()))
+}
+
 fn parse_grant_label(label: &str) -> Option<(String, String, String)> {
     let rest = label.strip_prefix(&format!("{LABEL_PREFIX}:"))?;
     let (kind, rest) = rest.split_once(':')?;
@@ -1670,6 +2014,14 @@ impl GrantBackend for RangerGrantBackend {
                 // takes the same position.
                 self.add_grant_label(&body.resource, &stmt.grantee, stmt.object, &stmt.privilege)
                     .await;
+                // Who issued it, so SHOW GRANTS can still answer that after the
+                // move to the policy API. Best-effort, exactly like the label
+                // above: the grant itself already succeeded.
+                self.add_policy_label(
+                    &body.resource,
+                    &grantor_label(&stmt.grantee, &body.grantor),
+                )
+                .await;
             }
             written.push(body);
         }
@@ -1991,7 +2343,11 @@ impl GrantBackend for RangerGrantBackend {
     /// authorizes the REST user and takes no grantor. `handle_deny` keeps its own
     /// admin gate for exactly that reason.
     fn enforces_grantor_authority(&self) -> bool {
-        true
+        // Only the plugin endpoint authorizes the grantor, and only delegate mode
+        // uses it. Under the default `admin-role` this is false, which is what
+        // keeps the coordinator's admin gate standing over a policy-API write
+        // that authorizes the REST user rather than the caller.
+        self.delegates_authority_to_ranger()
     }
 }
 
@@ -2030,7 +2386,7 @@ mod tests {
 
     // ── Task 4: constructor + grantee split + URL guard ──────────────
 
-    fn test_backend() -> RangerGrantBackend {
+    fn backend_with(authority: sqe_core::config::GrantAuthority) -> RangerGrantBackend {
         RangerGrantBackend::new(
             "http://ranger:6080/",
             "polaris",
@@ -2039,8 +2395,47 @@ mod tests {
             "POLARIS",
             30,
             false,
+            authority,
         )
         .unwrap()
+    }
+
+    fn test_backend() -> RangerGrantBackend {
+        backend_with(sqe_core::config::GrantAuthority::AdminRole)
+    }
+
+    /// The transport and the authority claim must never disagree.
+    ///
+    /// The dangerous combination is writing through the policy API, which
+    /// authorizes the REST admin and ignores the grantor, while reporting
+    /// `enforces_grantor_authority() == true`: the coordinator stands its admin
+    /// gate down (`admin_gate_required` returns false for RangerDelegate when the
+    /// backend claims to enforce) and nothing checks the caller at all. One
+    /// predicate drives both, and this pins that they stay in step.
+    #[test]
+    fn authority_claim_matches_the_transport() {
+        use sqe_core::config::GrantAuthority;
+
+        let default_mode = backend_with(GrantAuthority::AdminRole);
+        assert!(
+            !default_mode.delegates_authority_to_ranger(),
+            "default mode must use the policy API"
+        );
+        assert!(
+            !default_mode.enforces_grantor_authority(),
+            "a policy-API write authorizes the REST user, not the grantor, so the \
+             coordinator's admin gate must stay up"
+        );
+
+        let delegate = backend_with(GrantAuthority::RangerDelegate);
+        assert!(
+            delegate.delegates_authority_to_ranger(),
+            "delegate mode must use the plugin endpoint, the only one that checks the grantor"
+        );
+        assert!(
+            delegate.enforces_grantor_authority(),
+            "delegate mode is precisely the case where Ranger performs the check"
+        );
     }
 
     #[test]
@@ -2584,6 +2979,92 @@ mod tests {
     /// The list endpoint omits provenance, so entries built from it must show the
     /// audit columns as empty rather than inventing a value. This is the state
     /// `SHOW GRANTS` was permanently stuck in before `fill_provenance` existed.
+    /// The grantor label is what keeps `granted_by` meaningful after the move to
+    /// the authenticated policy API, where Ranger's `createdBy` is SQE's REST user
+    /// rather than the SQL caller. Per-grantee, so two grantors on one policy do
+    /// not blur together.
+    #[test]
+    fn granted_by_prefers_the_grantor_label_over_created_by() {
+        let json = r#"[
+          {
+            "name": "sqe-grant-wh-sales-orders",
+            "createdBy": "Admin",
+            "createTime": 1786526606039,
+            "resources": {"catalog": {"values": ["wh"]}},
+            "policyItems": [
+              {"users": [], "roles": ["analyst"],
+               "accesses": [{"type": "table-data-read", "isAllowed": true}]},
+              {"users": ["dave"], "roles": [],
+               "accesses": [{"type": "table-data-read", "isAllowed": true}]}
+            ],
+            "policyLabels": [
+              "chm:ROLE:analyst:SELECT",
+              "chm-grantor:ROLE:analyst:carol",
+              "chm-grantor:USER:dave:erin"
+            ]
+          }
+        ]"#;
+        let policies: Vec<RangerPolicy> = serde_json::from_str(json).unwrap();
+        let entries = policies_to_entries(&policies);
+        let role_row = entries
+            .iter()
+            .find(|e| e.grantee_name == "analyst")
+            .expect("role row");
+        assert_eq!(
+            role_row.granted_by.as_deref(),
+            Some("carol"),
+            "the SQL caller, not the REST user"
+        );
+        let user_row = entries
+            .iter()
+            .find(|e| e.grantee_name == "dave")
+            .expect("user row");
+        assert_eq!(
+            user_row.granted_by.as_deref(),
+            Some("erin"),
+            "resolved per grantee, not per policy"
+        );
+    }
+
+    /// No label, so `createdBy` is all there is. That is the legacy case: policies
+    /// the plugin endpoint wrote, where `createdBy` IS the grantor.
+    #[test]
+    fn granted_by_falls_back_to_created_by_without_a_label() {
+        let json = r#"[
+          {
+            "name": "grant-1786526606036",
+            "createdBy": "carol sqe",
+            "createTime": 1786526606039,
+            "resources": {"catalog": {"values": ["wh"]}},
+            "policyItems": [
+              {"users": [], "roles": ["analyst"],
+               "accesses": [{"type": "table-data-read", "isAllowed": true}]}
+            ]
+          }
+        ]"#;
+        let policies: Vec<RangerPolicy> = serde_json::from_str(json).unwrap();
+        let entries = policies_to_entries(&policies);
+        assert_eq!(entries[0].granted_by.as_deref(), Some("carol sqe"));
+    }
+
+    #[test]
+    fn grantor_label_round_trips_and_ignores_the_shared_namespace() {
+        let l = grantor_label(&Grantee::Role("analyst".into()), "carol");
+        assert_eq!(l, "chm-grantor:ROLE:analyst:carol");
+        assert_eq!(
+            parse_grantor_label(&l),
+            Some(("ROLE".into(), "analyst".into(), "carol".into()))
+        );
+        // A GROUP is labelled ROLE, matching grant_label's cross-tool convention.
+        assert_eq!(
+            grantor_label(&Grantee::Group("ws-sales".into()), "carol"),
+            "chm-grantor:ROLE:ws-sales:carol"
+        );
+        // The two namespaces must not read each other's labels.
+        assert_eq!(parse_grantor_label("chm:ROLE:analyst:SELECT"), None);
+        assert_eq!(parse_grant_label("chm-grantor:ROLE:analyst:carol"), None);
+    }
+
     #[test]
     fn entries_from_the_list_endpoint_have_empty_provenance() {
         let json = r#"[
