@@ -84,10 +84,43 @@ mkrole auditor       '[{"name":"frank","isAdmin":false}]'
 
 # ── Seeds ───────────────────────────────────────────────────────────────────
 # All policies carry root="*" (Polaris always sends root).
-post_grant() { # resource_json  grantee_field  access_list
-  curl -fsS $AUTH $CT -X POST "${RANGER_URL}/service/plugins/services/grant/${SERVICE_NAME}" \
-    -d "{\"grantor\":\"admin\",\"resource\":$1,$2,\"accessTypes\":[$3],\"delegateAdmin\":true,\"enableAudit\":true,\"replaceExistingPermissions\":true,\"isRecursive\":true}" >/dev/null \
-    && echo "  ok" || echo "  (skipped)"
+# Seed one policy through the AUTHENTICATED policy API.
+#
+# NOT `/service/plugins/services/grant/${SERVICE_NAME}`. Ranger declares that
+# endpoint `security="none"`, so it accepts callers with no credentials at all,
+# and Ranger 2.9.0 refuses it outright with HTTP 400 "Unauthenticated access not
+# allowed" unless `ranger.admin.allow.unauthenticated.access` is enabled. On
+# 2.9.0 the old form failed for all 23 seeds while curl's failure was swallowed
+# and the script still exited 0, so the stack came up healthy with no
+# authorization policies whatsoever.
+#
+# The plugin endpoint MERGED into whatever policy matched the resource. No merge
+# is needed here: these seeds are a fixed set at distinct coordinates, so each is
+# one whole policy. Idempotency is delete-then-create rather than reading an id
+# back, because this image has no python3 or jq to parse JSON with.
+#
+# Pure sed on purpose. `curlimages/curl` is busybox; python3 is absent.
+acc_json() { # bare access-type list -> [{type,isAllowed}] entries
+  printf '%s' "$1" | sed 's/"\([^"]*\)"/{"type":"\1","isAllowed":true}/g'
+}
+
+seed_policy() { # name_suffix  resource_json  policy_items_json
+  pname="sqe-seed-$1"
+  # {"root":"*","catalog":"*"} -> {"root":{"values":["*"]},"catalog":{"values":["*"]}}
+  #
+  # NO `isRecursive`. The plugin endpoint took it once per REQUEST and resolved it
+  # server-side; the policy API validates it per resource against the servicedef,
+  # which declares no recursive resource, and answers "Recursive option not
+  # supported: resource-name=[root]".
+  res_json=$(printf '%s' "$2" \
+    | sed 's/"\([a-zA-Z_]*\)":"\([^"]*\)"/"\1":{"values":["\2"]}/g')
+
+  curl -fsS $AUTH $CSRF -X DELETE \
+    "${RANGER_URL}/service/public/v2/api/policy?servicename=${SERVICE_NAME}&policyname=${pname}" \
+    >/dev/null 2>&1 || true
+  curl -fsS $AUTH $CSRF $CT -X POST "${RANGER_URL}/service/public/v2/api/policy" \
+    -d "{\"service\":\"${SERVICE_NAME}\",\"name\":\"${pname}\",\"policyType\":0,\"isEnabled\":true,\"resources\":${res_json},\"policyItems\":[$3],\"denyPolicyItems\":[]}" \
+    >/dev/null && echo "  ok" || echo "  FAILED"
 }
 
 # Full access-type set (all 69) for admin-plane principals (root, sqe_admin
@@ -104,26 +137,48 @@ ADMIN_ACCESS='"service-access-manage","catalog-create","catalog-drop","catalog-l
 # it) the thing that actually enables a member to read a table.
 BASELINE='"catalog-list","catalog-properties-read","namespace-list","namespace-properties-read","table-list"'
 
-echo "Seeding admin grants for user 'root' (bootstrap can manage everything) ..."
-for res in '{"root":"*"}' '{"root":"*","catalog":"*"}' '{"root":"*","catalog":"*","namespace":"*"}' '{"root":"*","catalog":"*","namespace":"*","table":"*"}' '{"root":"*","principal":"*"}'; do
-  printf "  root %s:" "$res"; post_grant "$res" '"users":["root"]' "$ADMIN_ACCESS"
+# ONE POLICY PER RESOURCE COORDINATE, carrying every grantee that coordinate
+# serves. Ranger allows a single policy per resource signature and answers
+# "Another policy already exists for matching resource" otherwise. The plugin
+# endpoint hid that by merging a grantee into the existing policy server-side;
+# the policy API does not, so the merge is expressed here instead. Getting this
+# wrong is not subtle: 18 of 23 seeds failed on the first attempt at one policy
+# per grantee.
+echo "Seeding grants (one policy per resource coordinate) ..."
+
+# Clear every policy this script has ever seeded, whatever it named them, BEFORE
+# creating the current set. Ranger allows one policy per resource signature, so a
+# leftover seed occupying a coordinate makes the new POST fail with "Another
+# policy already exists for matching resource" -- which is precisely what happened
+# when the naming scheme changed under a stack that had already been seeded.
+# Deleting by name from the listing keeps this idempotent across renames without
+# needing a JSON parser, which this busybox image does not have.
+for stale in $(curl -fsS $AUTH "${RANGER_URL}/service/public/v2/api/policy?serviceName=${SERVICE_NAME}" 2>/dev/null \
+  | tr ',' '\n' | grep '"name":"sqe-seed-' | sed 's/.*"name":"\([^"]*\)".*/\1/'); do
+  curl -fsS $AUTH $CSRF -X DELETE \
+    "${RANGER_URL}/service/public/v2/api/policy?servicename=${SERVICE_NAME}&policyname=${stale}" \
+    >/dev/null 2>&1 && echo "  cleared stale seed ${stale}" || true
 done
 
-echo "Seeding admin grants for role 'sqe_admin' (carol is a member) ..."
-for res in '{"root":"*"}' '{"root":"*","catalog":"*"}' '{"root":"*","catalog":"*","namespace":"*"}' '{"root":"*","catalog":"*","namespace":"*","table":"*"}' '{"root":"*","principal":"*"}'; do
-  printf "  sqe_admin %s:" "$res"; post_grant "$res" '"roles":["sqe_admin"]' "$ADMIN_ACCESS"
-done
+ADMIN_ACC=$(acc_json "$ADMIN_ACCESS")
+BASE_ACC=$(acc_json "$BASELINE")
+
+# root (the bootstrap identity) and sqe_admin (carol) both get the full set.
+ADMIN_ITEMS="{\"users\":[\"root\"],\"accesses\":[${ADMIN_ACC}],\"delegateAdmin\":true},{\"roles\":[\"sqe_admin\"],\"accesses\":[${ADMIN_ACC}],\"delegateAdmin\":true}"
 
 # EVERY demo role needs the baseline, including the two parity-demo roles. A role
 # without it cannot even list the namespace, and that failure is reported as a
 # Polaris authorization error indistinguishable from the policy denials the demo
 # asserts deliberately. Add new roles here at the same time as `mkrole` above.
-echo "Seeding baseline traverse grants for the query roles ..."
-for role in analyst engineer fraud_analyst auditor; do
-  for res in '{"root":"*","catalog":"*"}' '{"root":"*","catalog":"*","namespace":"*"}' '{"root":"*","catalog":"*","namespace":"*","table":"*"}'; do
-    printf "  %s %s:" "$role" "$res"; post_grant "$res" "\"roles\":[\"$role\"]" "$BASELINE"
-  done
-done
+# One item with all four: they share an identical access list, so separate items
+# would only be noise.
+ROLE_ITEM="{\"roles\":[\"analyst\",\"engineer\",\"fraud_analyst\",\"auditor\"],\"accesses\":[${BASE_ACC}],\"delegateAdmin\":true}"
+
+printf "  root-level:      "; seed_policy root      '{"root":"*"}'                                           "$ADMIN_ITEMS"
+printf "  catalog-level:   "; seed_policy catalog   '{"root":"*","catalog":"*"}'                              "${ADMIN_ITEMS},${ROLE_ITEM}"
+printf "  namespace-level: "; seed_policy namespace '{"root":"*","catalog":"*","namespace":"*"}'              "${ADMIN_ITEMS},${ROLE_ITEM}"
+printf "  table-level:     "; seed_policy table     '{"root":"*","catalog":"*","namespace":"*","table":"*"}'  "${ADMIN_ITEMS},${ROLE_ITEM}"
+printf "  principal-level: "; seed_policy principal '{"root":"*","principal":"*"}'                            "$ADMIN_ITEMS"
 
 # ── `query` service instance: the shared frontend-query plane ────────────────
 # Read by BOTH engines: SQE's PlanRewriter and Spark's Kyuubi
@@ -212,10 +267,33 @@ echo "Creating the defer policy + mask policies on the 'query' service ..."
 # The intent therefore lives in this comment and in the docs rather than in a
 # policy name. Look for the `public` group item on that policy.
 echo "Granting the object-level DEFER item to group 'public' on 'query' ..."
-curl -fsS $AUTH $CT -X POST "${RANGER_URL}/service/plugins/services/grant/query" \
-  -d '{"grantor":"admin","resource":{"database":"*","table":"*","column":"*"},"groups":["public"],"accessTypes":["select","update","create","drop","alter","index","lock","read","write"],"delegateAdmin":false,"enableAudit":true,"replaceExistingPermissions":false,"isRecursive":true}' >/dev/null \
-  && echo "  defer item granted to group 'public'." \
-  || echo "  DEFER GRANT FAILED -- Spark will deny every read (check ranger logs)."
+# Through the AUTHENTICATED policy API, for the same reason as the seeds above:
+# the plugin grant endpoint is `security="none"` and Ranger 2.9.0 refuses it.
+#
+# The grant API merged this item into the auto-generated
+# `all - database, table, column` policy server-side. That merge happens here
+# instead: fetch the policy by name, insert the `public` item at the head of
+# policyItems, PUT it back. The auto-generated admin/{OWNER} items are preserved
+# because the whole policy is written back.
+#
+# sed rather than a JSON edit because this image is busybox: no python3, no jq.
+# `"policyItems":[` is an unambiguous anchor in Ranger's own serialisation.
+QUERY_ALL_ENC=$(printf '%s' "all - database, table, column" | sed 's/ /%20/g; s/,/%2C/g')
+QUERY_ALL=$(curl -fsS $AUTH "${RANGER_URL}/service/public/v2/api/service/query/policy/${QUERY_ALL_ENC}" 2>/dev/null || true)
+DEFER_ITEM='{"groups":["public"],"accesses":[{"type":"select","isAllowed":true},{"type":"update","isAllowed":true},{"type":"create","isAllowed":true},{"type":"drop","isAllowed":true},{"type":"alter","isAllowed":true},{"type":"index","isAllowed":true},{"type":"lock","isAllowed":true},{"type":"read","isAllowed":true},{"type":"write","isAllowed":true}],"delegateAdmin":false}'
+if [ -z "$QUERY_ALL" ]; then
+  echo "  DEFER GRANT FAILED -- could not read 'all - database, table, column' on 'query'."
+elif printf '%s' "$QUERY_ALL" | grep -q '"groups":\["public"\]'; then
+  echo "  defer item already present for group 'public'."
+else
+  QUERY_ALL_ID=$(printf '%s' "$QUERY_ALL" | sed 's/^{"id":\([0-9]*\).*/\1/')
+  printf '%s' "$QUERY_ALL" \
+    | sed "s/\"policyItems\":\[/\"policyItems\":[${DEFER_ITEM},/" > /tmp/query-all-policy.json
+  curl -fsS $AUTH $CSRF $CT -X PUT "${RANGER_URL}/service/public/v2/api/policy/${QUERY_ALL_ID}" \
+    -d @/tmp/query-all-policy.json >/dev/null \
+    && echo "  defer item granted to group 'public'." \
+    || echo "  DEFER GRANT FAILED -- Spark will deny every read (check ranger logs)."
+fi
 
 # Column-mask policy (policyType 1): mask orders.amount -> NULL for role engineer.
 cat > /tmp/query-mask.json <<'EOF'

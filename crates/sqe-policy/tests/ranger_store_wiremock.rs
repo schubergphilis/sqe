@@ -166,7 +166,7 @@ async fn drop_policy_deletes_matching_component_policy() {
 async fn resolves_mask_and_filter_over_http() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
-        .and(path("/service/plugins/policies/download/hive"))
+        .and(path("/service/plugins/secure/policies/download/hive"))
         .respond_with(ResponseTemplate::new(200).set_body_string(BUNDLE))
         .mount(&server)
         .await;
@@ -182,7 +182,7 @@ async fn resolves_mask_and_filter_over_http() {
 async fn fail_closed_on_server_error() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
-        .and(path("/service/plugins/policies/download/hive"))
+        .and(path("/service/plugins/secure/policies/download/hive"))
         .respond_with(ResponseTemplate::new(500))
         .mount(&server)
         .await;
@@ -196,7 +196,7 @@ async fn fail_closed_on_server_error() {
 async fn fail_closed_on_garbage_body() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
-        .and(path("/service/plugins/policies/download/hive"))
+        .and(path("/service/plugins/secure/policies/download/hive"))
         .respond_with(ResponseTemplate::new(200).set_body_string("<<not json>>"))
         .mount(&server)
         .await;
@@ -209,7 +209,7 @@ async fn fail_closed_on_garbage_body() {
 async fn non_matching_user_gets_empty_policy() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
-        .and(path("/service/plugins/policies/download/hive"))
+        .and(path("/service/plugins/secure/policies/download/hive"))
         .respond_with(ResponseTemplate::new(200).set_body_string(BUNDLE))
         .mount(&server)
         .await;
@@ -243,7 +243,7 @@ async fn non_matching_user_gets_empty_policy() {
 async fn breaker_open_denies_without_second_http_call() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
-        .and(path("/service/plugins/policies/download/hive"))
+        .and(path("/service/plugins/secure/policies/download/hive"))
         .respond_with(ResponseTemplate::new(500))
         .mount(&server)
         .await;
@@ -289,7 +289,7 @@ async fn resolve_tags_fails_closed_on_fetch_error() {
 
     let server = MockServer::start().await;
     Mock::given(method("GET"))
-        .and(path("/service/plugins/policies/download/hive"))
+        .and(path("/service/plugins/secure/policies/download/hive"))
         .respond_with(ResponseTemplate::new(500))
         .mount(&server)
         .await;
@@ -323,7 +323,7 @@ async fn resolve_tags_fails_closed_on_fetch_error() {
 async fn resolve_caches_per_user_within_ttl() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
-        .and(path("/service/plugins/policies/download/hive"))
+        .and(path("/service/plugins/secure/policies/download/hive"))
         .respond_with(ResponseTemplate::new(200).set_body_string(BUNDLE))
         .mount(&server)
         .await;
@@ -355,7 +355,7 @@ async fn resolve_tags_caches_bundle_within_ttl() {
 
     let server = MockServer::start().await;
     Mock::given(method("GET"))
-        .and(path("/service/plugins/policies/download/hive"))
+        .and(path("/service/plugins/secure/policies/download/hive"))
         .respond_with(ResponseTemplate::new(200).set_body_string(BUNDLE))
         .mount(&server)
         .await;
