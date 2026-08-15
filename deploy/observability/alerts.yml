@@ -48,10 +48,14 @@ groups:
             sorts, and coordinator.memory_limit vs the pod limit.
 
       - alert: SqeCoordinatorMemoryHigh
+        # limit=0 is the unlimited-pool sentinel from spawn_metrics_reporter.
+        # clamp_min(0, 1) would make any reserved byte look like 90%+ used.
         expr: |
+          sqe_coordinator_memory_limit_bytes > 0
+            and
           sqe_coordinator_memory_used_bytes
             /
-          clamp_min(sqe_coordinator_memory_limit_bytes, 1)
+          sqe_coordinator_memory_limit_bytes
             > 0.9
         for: 10m
         labels:
@@ -85,7 +89,7 @@ groups:
   - name: sqe.workers
     rules:
       - alert: SqeWorkerShuffleResidentHigh
-        expr: sqe_worker_shuffle_resident_bytes > 2e9
+        expr: sqe_worker_shuffle_resident_bytes > 2147483648
         for: 5m
         labels:
           severity: warning
@@ -96,7 +100,10 @@ groups:
             OOM. Check concurrent exchange-heavy queries.
 
       - alert: SqeWorkerDown
-        expr: up{job=~"sqe.*worker.*"} == 0
+        # job="sqe-worker" is set by deploy/helm/sqe/templates/servicemonitor.yaml
+        # when worker.enabled is true. Coordinator-only installs have no series
+        # and this rule stays silent.
+        expr: up{job="sqe-worker"} == 0
         for: 5m
         labels:
           severity: critical
