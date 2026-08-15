@@ -49,6 +49,25 @@ fn user_circuit_breaker(token_fingerprint: &str) -> Arc<CircuitBreaker> {
         .clone()
 }
 
+/// Apply a catalog RPC outcome to the breaker.
+///
+/// Auth answers (401/403) mean Polaris is reachable. Record success so a
+/// Half-Open probe cannot latch. Real faults still trip the breaker.
+fn record_catalog_breaker_outcome<T>(cb: &CircuitBreaker, result: &sqe_core::Result<T>) {
+    match result {
+        Ok(_) => cb.record_success(),
+        Err(e)
+            if matches!(
+                e.error_code(),
+                sqe_core::SqeErrorCode::AccessDenied | sqe_core::SqeErrorCode::AuthenticationFailed
+            ) =>
+        {
+            cb.record_success();
+        }
+        Err(_) => cb.record_failure(),
+    }
+}
+
 /// A cached table entry holding metadata, an optional ETag, and the time it was
 /// last validated against Polaris.
 #[derive(Clone)]
@@ -1039,24 +1058,15 @@ impl SessionCatalog {
         &self.warehouse
     }
 
-    /// Record a catalog-call outcome on the circuit breaker, treating a 401/403
-    /// as a non-fault. An auth failure is a per-principal authorization
-    /// decision, not a transient catalog fault: counting it would open the
-    /// breaker and turn later authorized calls into CircuitBreakerOpen errors.
-    /// During metadata enumeration that would let a forbidden namespace/table
-    /// poison the rest of the catalog. Only real faults (5xx, network, timeout)
-    /// trip the breaker. (#5)
+    /// Record a catalog-call outcome on the circuit breaker.
+    ///
+    /// A 401/403 is not a catalog fault: counting it as failure would open
+    /// the breaker and turn later authorized calls into CircuitBreakerOpen
+    /// errors. But it is still a completed RPC, so a Half-Open probe must
+    /// resolve. Treating auth as success closes the probe without tripping
+    /// the breaker. Only 5xx / network / timeout trip it. (#5, #427)
     fn record_breaker_outcome<T>(&self, result: &sqe_core::Result<T>) {
-        match result {
-            Ok(_) => self.circuit_breaker.record_success(),
-            Err(e)
-                if matches!(
-                    e.error_code(),
-                    sqe_core::SqeErrorCode::AccessDenied
-                        | sqe_core::SqeErrorCode::AuthenticationFailed
-                ) => {}
-            Err(_) => self.circuit_breaker.record_failure(),
-        }
+        record_catalog_breaker_outcome(&self.circuit_breaker, result);
     }
 
     /// List all namespaces in the catalog.
@@ -2028,8 +2038,32 @@ impl Catalog for SessionCatalogBridge {
 #[cfg(test)]
 mod cache_capacity_tests {
     use super::{
-        iceberg_error_is_forbidden, select_keys_for_suffix, REST_CATALOG_CACHE_MAX_CAPACITY,
+        iceberg_error_is_forbidden, record_catalog_breaker_outcome, select_keys_for_suffix,
+        REST_CATALOG_CACHE_MAX_CAPACITY,
     };
+
+    #[test]
+    fn access_denied_closes_half_open_probe() {
+        let cb = crate::circuit_breaker::CircuitBreaker::new(
+            "t",
+            1,
+            std::time::Duration::from_millis(0),
+        );
+        cb.record_failure();
+        assert!(cb.check().is_ok());
+        assert_eq!(cb.state_label(), "half_open");
+        let err: sqe_core::Result<()> = Err(sqe_core::SqeError::Catalog("403 Forbidden".into()));
+        assert_eq!(
+            err.as_ref().unwrap_err().error_code(),
+            sqe_core::SqeErrorCode::AccessDenied
+        );
+        record_catalog_breaker_outcome(&cb, &err);
+        assert_eq!(
+            cb.state_label(),
+            "closed",
+            "a 403 must resolve the half-open probe, not latch it"
+        );
+    }
 
     /// Cross-token invalidation must evict EVERY token's entry for the table,
     /// not just one. Two users (different token fingerprints) cached the same
