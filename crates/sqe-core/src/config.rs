@@ -166,6 +166,12 @@ pub struct QueryConfig {
     /// Maximum number of rows returned per query. Default: 1_000_000. Set to 0 for unlimited.
     #[serde(default = "default_max_result_rows")]
     pub max_result_rows: usize,
+    /// Maximum SQL statement size in bytes, checked before parse (issue #403).
+    /// Default: 1_048_576 (1 MiB). Set to 0 for unlimited; `production_mode`
+    /// refuses 0 so a production coordinator cannot be configured to accept
+    /// arbitrarily large statements.
+    #[serde(default = "default_max_sql_bytes")]
+    pub max_sql_bytes: usize,
     /// Maximum concurrent queries. Default: 100. Set to 0 for unlimited.
     #[serde(default = "default_max_concurrent_queries")]
     pub max_concurrent_queries: usize,
@@ -381,6 +387,7 @@ impl Default for QueryConfig {
             timeout_secs: default_query_timeout(),
             role_overrides: std::collections::HashMap::new(),
             max_result_rows: default_max_result_rows(),
+            max_sql_bytes: default_max_sql_bytes(),
             max_concurrent_queries: default_max_concurrent_queries(),
             max_concurrent_per_user: default_max_concurrent_per_user(),
             per_user_memory_budget: default_per_user_memory_budget(),
@@ -407,6 +414,31 @@ impl Default for QueryConfig {
             merge_target_streaming: false,
             merge_cardinality_check: default_true(),
         }
+    }
+}
+
+impl QueryConfig {
+    /// Reject `sql` when it exceeds [`Self::max_sql_bytes`].
+    ///
+    /// A limit of 0 is unlimited (forbidden in `production_mode`). Callers
+    /// must run this before parse so a client cannot burn coordinator
+    /// memory or CPU on an arbitrarily large statement (issue #403).
+    pub fn check_sql_bytes(&self, sql: &str) -> crate::error::Result<()> {
+        let limit = self.max_sql_bytes;
+        if limit > 0 && sql.len() > limit {
+            return Err(crate::error::SqeError::sourced(
+                crate::error::SqeErrorCode::InvalidArguments,
+                format!(
+                    "SQL statement is {} bytes, exceeds query.max_sql_bytes ({limit})",
+                    sql.len()
+                ),
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "SQL exceeds max_sql_bytes",
+                ),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -3853,6 +3885,9 @@ fn default_query_timeout() -> u64 {
 fn default_max_result_rows() -> usize {
     1_000_000
 }
+fn default_max_sql_bytes() -> usize {
+    1_048_576
+}
 fn default_max_concurrent_queries() -> usize {
     100
 }
@@ -4489,6 +4524,16 @@ impl SqeConfig {
             );
         }
 
+        if self.query.max_sql_bytes == 0 {
+            errors.push(
+                "production_mode: query.max_sql_bytes must be > 0 \
+                 (0 disables the pre-parse statement size cap and lets a \
+                 client burn coordinator memory/CPU on an arbitrarily large \
+                 SQL string)"
+                    .to_string(),
+            );
+        }
+
         if errors.is_empty() {
             Ok(())
         } else {
@@ -4940,6 +4985,7 @@ impl SqeConfig {
 
         // Query
         env_override_u64("SQE_QUERY__TIMEOUT_SECS", &mut self.query.timeout_secs);
+        env_override_usize("SQE_QUERY__MAX_SQL_BYTES", &mut self.query.max_sql_bytes);
     }
 }
 
@@ -7193,6 +7239,7 @@ type = "aws"
         let config = QueryConfig::default();
         assert_eq!(config.timeout_secs, 300);
         assert_eq!(config.max_result_rows, 1_000_000);
+        assert_eq!(config.max_sql_bytes, 1_048_576);
         assert_eq!(config.max_concurrent_queries, 100);
         assert_eq!(config.slow_query_threshold_secs, 30);
         assert_eq!(config.max_query_memory, "256MB");
@@ -7257,6 +7304,50 @@ type = "aws"
         assert_eq!(config.max_concurrent_queries, 50);
         assert_eq!(config.slow_query_threshold_secs, 10);
         assert_eq!(config.max_query_memory, "512MB");
+    }
+
+    #[test]
+    fn max_sql_bytes_rejects_oversize_string() {
+        let config = QueryConfig::default();
+        let oversize = "x".repeat(config.max_sql_bytes + 1);
+        let err = config.check_sql_bytes(&oversize).unwrap_err();
+        assert_eq!(
+            err.error_code(),
+            crate::error::SqeErrorCode::InvalidArguments
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("max_sql_bytes") && msg.contains(&(config.max_sql_bytes + 1).to_string()),
+            "got: {msg}"
+        );
+        // User-facing: the client must see the size, not a generic Internal.
+        assert_ne!(err.client_message(), "Internal error");
+        assert!(err.client_message().contains("max_sql_bytes"));
+    }
+
+    #[test]
+    fn max_sql_bytes_accepts_one_below_limit() {
+        let config = QueryConfig::default();
+        let just_under = "x".repeat(config.max_sql_bytes.saturating_sub(1));
+        assert!(config.check_sql_bytes(&just_under).is_ok());
+        assert!(config
+            .check_sql_bytes(&"x".repeat(config.max_sql_bytes))
+            .is_ok());
+    }
+
+    #[test]
+    fn max_sql_bytes_zero_is_unlimited_outside_production() {
+        let mut config = QueryConfig::default();
+        config.max_sql_bytes = 0;
+        assert!(config.check_sql_bytes(&"x".repeat(2_000_000)).is_ok());
+    }
+
+    #[test]
+    fn validate_production_rejects_unlimited_max_sql_bytes() {
+        let mut config = valid_production_config();
+        config.query.max_sql_bytes = 0;
+        let err = config.validate_production().unwrap_err().to_string();
+        assert!(err.contains("query.max_sql_bytes"), "got: {err}");
     }
 
     // -----------------------------------------------------------------------
