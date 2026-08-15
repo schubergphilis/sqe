@@ -139,8 +139,7 @@ fn bump_scans(
             let scan = node
                 .downcast_ref::<IcebergScanExec>()
                 .expect("target is an IcebergScanExec");
-            let bumped: Arc<dyn ExecutionPlan> =
-                Arc::new(scan.clone().with_target_partitions(n));
+            let bumped: Arc<dyn ExecutionPlan> = Arc::new(scan.clone().with_target_partitions(n));
             Ok(Transformed::yes(bumped))
         } else {
             Ok(Transformed::no(node))
@@ -257,8 +256,7 @@ pub(crate) fn reapply_erased_root_fetch(
 /// single-partition stream (a multi-partition fetch is a per-partition cap,
 /// not a global one).
 pub(crate) fn effective_root_fetch(root: &Arc<dyn ExecutionPlan>) -> Option<usize> {
-    root_spine_fetch(root)
-        .and_then(|(fetch, partitions)| (partitions <= 1).then_some(fetch))
+    root_spine_fetch(root).and_then(|(fetch, partitions)| (partitions <= 1).then_some(fetch))
 }
 
 /// Cap `plan` at `fetch` rows in final output order. A merge root folds the
@@ -283,8 +281,7 @@ fn apply_fetch_at_root(plan: Arc<dyn ExecutionPlan>, fetch: usize) -> Arc<dyn Ex
 /// `SortPreservingMergeExec` / `CoalescePartitionsExec`; any other operator
 /// (including a fetchless `FilterExec`) ends the walk with no result.
 fn find_stranded_fetch(root: &Arc<dyn ExecutionPlan>) -> Option<usize> {
-    root_spine_fetch(root)
-        .and_then(|(fetch, partitions)| (partitions > 1).then_some(fetch))
+    root_spine_fetch(root).and_then(|(fetch, partitions)| (partitions > 1).then_some(fetch))
 }
 
 /// Walk down from `root` through single-child, row-count-preserving operators
@@ -306,9 +303,7 @@ fn root_spine_fetch(root: &Arc<dyn ExecutionPlan>) -> Option<(usize, usize)> {
             // ScalarSubqueryExec lists its subquery plans as extra children;
             // the pass-through main input is always child 0 and is the only
             // stream that reaches the root.
-            [input, ..] if node.downcast_ref::<ScalarSubqueryExec>().is_some() => {
-                Arc::clone(input)
-            }
+            [input, ..] if node.downcast_ref::<ScalarSubqueryExec>().is_some() => Arc::clone(input),
             _ => return None,
         };
         node = next;
@@ -348,11 +343,7 @@ pub(crate) fn collect_probe_side_leaves(
     out
 }
 
-fn walk(
-    node: &Arc<dyn ExecutionPlan>,
-    build_tainted: bool,
-    out: &mut Vec<Arc<dyn ExecutionPlan>>,
-) {
+fn walk(node: &Arc<dyn ExecutionPlan>, build_tainted: bool, out: &mut Vec<Arc<dyn ExecutionPlan>>) {
     let children = node.children();
     if children.is_empty() {
         if !build_tainted {
@@ -616,9 +607,10 @@ mod tests {
     fn spm(input: Arc<dyn ExecutionPlan>, fetch: Option<usize>) -> Arc<dyn ExecutionPlan> {
         use datafusion::physical_expr::expressions::col;
         use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
-        let ordering =
-            LexOrdering::new(vec![PhysicalSortExpr::new_default(col("id", &input.schema()).unwrap())])
-                .unwrap();
+        let ordering = LexOrdering::new(vec![PhysicalSortExpr::new_default(
+            col("id", &input.schema()).unwrap(),
+        )])
+        .unwrap();
         Arc::new(SortPreservingMergeExec::new(ordering, input).with_fetch(fetch))
     }
 
@@ -629,9 +621,10 @@ mod tests {
         use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
         use datafusion::physical_plan::sorts::sort::SortExec;
         let input = repartitioned8();
-        let ordering =
-            LexOrdering::new(vec![PhysicalSortExpr::new_default(col("id", &input.schema()).unwrap())])
-                .unwrap();
+        let ordering = LexOrdering::new(vec![PhysicalSortExpr::new_default(
+            col("id", &input.schema()).unwrap(),
+        )])
+        .unwrap();
         Arc::new(
             SortExec::new(ordering, input)
                 .with_preserve_partitioning(true)
@@ -649,7 +642,10 @@ mod tests {
         // filter while the plan was single-partition; after the scans were bumped
         // the filter caps each of 8 partitions, and the merge above it carries no
         // fetch. The pass must re-apply the cap at the root.
-        let spine = spm(identity_projection(filter(repartitioned8(), Some(100))), None);
+        let spine = spm(
+            identity_projection(filter(repartitioned8(), Some(100))),
+            None,
+        );
         assert_eq!(spine.output_partitioning().partition_count(), 1);
         assert_eq!(spine.fetch(), None, "the fetchless merge root is the bug");
 
@@ -668,7 +664,10 @@ mod tests {
         // The bug note lists SortExec as another operator LimitPushdown can strand
         // the fetch on. SortExec surfaces its cap through the trait `fetch()`, so
         // the generic walk catches it too (covers the q10/q14 sort-strand shape).
-        let spine = spm(identity_projection(per_partition_sort_with_fetch(100)), None);
+        let spine = spm(
+            identity_projection(per_partition_sort_with_fetch(100)),
+            None,
+        );
         assert_eq!(spine.fetch(), None);
 
         let restored = restore_stranded_global_fetch(spine);

@@ -226,8 +226,7 @@ mod tests {
                 12 * 1024 * 1024,
                 2 * 1024 * 1024,
             ));
-            let (grant, guard) =
-                admit_operator(&gov, &live, &format!("q{i}"), c).expect("admit");
+            let (grant, guard) = admit_operator(&gov, &live, &format!("q{i}"), c).expect("admit");
             assert!(grant.capacity_bytes() >= 2 * 1024 * 1024);
             guards.push(guard);
         }

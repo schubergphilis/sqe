@@ -172,11 +172,12 @@ impl GrantProfile {
     /// Resolve aliases and normalise spelling: whitespace collapsed, upper-cased.
     /// Mirrors the platform's `canonical_privilege`.
     pub fn canonical_privilege(&self, sql_priv: &str) -> String {
-        let normalised = sql_priv.split_whitespace().collect::<Vec<_>>().join(" ").to_uppercase();
-        self.aliases
-            .get(&normalised)
-            .cloned()
-            .unwrap_or(normalised)
+        let normalised = sql_priv
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_uppercase();
+        self.aliases.get(&normalised).cloned().unwrap_or(normalised)
     }
 
     /// Transitive `impliedGrants` closure of `seeds`, sorted and deduped.
@@ -215,7 +216,10 @@ impl GrantProfile {
 
     /// The deepest level a privilege binds to.
     pub fn deepest_level(&self, canonical: &str) -> Option<Level> {
-        self.privileges.get(canonical).and_then(|ls| ls.last()).map(|l| l.level)
+        self.privileges
+            .get(canonical)
+            .and_then(|ls| ls.last())
+            .map(|l| l.level)
     }
 
     /// Every policy one GRANT has to write, outermost level first.
@@ -443,7 +447,9 @@ mod tests {
         // out of the seeds would have lost the rest of the closure, so it is
         // removed afterwards.
         let p = profile();
-        let insert = p.plan_grant("INSERT", "*", "wh", Some("sales"), Some("orders")).expect("plan");
+        let insert = p
+            .plan_grant("INSERT", "*", "wh", Some("sales"), Some("orders"))
+            .expect("plan");
         let table = insert.last().expect("table level");
         assert!(
             table.access_types.contains(&"table-data-write".to_string()),
@@ -454,7 +460,11 @@ mod tests {
             "the closure must have expanded, got {:?}",
             table.access_types
         );
-        for banned in ["table-location-set", "table-uuid-assign", "table-format-version-upgrade"] {
+        for banned in [
+            "table-location-set",
+            "table-uuid-assign",
+            "table-format-version-upgrade",
+        ] {
             assert!(
                 !table.access_types.contains(&banned.to_string()),
                 "INSERT must not confer {banned}"
@@ -462,9 +472,15 @@ mod tests {
         }
         // MODIFY carries no exclude, so it DOES get them. That contrast is the
         // reason INSERT and MODIFY are separate privileges.
-        let modify = p.plan_grant("MODIFY", "*", "wh", Some("sales"), Some("orders")).expect("plan");
+        let modify = p
+            .plan_grant("MODIFY", "*", "wh", Some("sales"), Some("orders"))
+            .expect("plan");
         assert!(
-            modify.last().expect("table level").access_types.contains(&"table-location-set".to_string()),
+            modify
+                .last()
+                .expect("table level")
+                .access_types
+                .contains(&"table-location-set".to_string()),
             "MODIFY is the privilege that may repoint storage"
         );
     }
@@ -472,9 +488,13 @@ mod tests {
     #[test]
     fn a_plan_is_truncated_at_the_level_the_statement_names() {
         let p = profile();
-        let three = p.plan_grant("SELECT", "*", "wh", Some("sales"), Some("orders")).expect("plan");
+        let three = p
+            .plan_grant("SELECT", "*", "wh", Some("sales"), Some("orders"))
+            .expect("plan");
         assert_eq!(three.len(), 3);
-        let two = p.plan_grant("SELECT", "*", "wh", Some("sales"), None).expect("plan");
+        let two = p
+            .plan_grant("SELECT", "*", "wh", Some("sales"), None)
+            .expect("plan");
         assert_eq!(two.len(), 2, "no table named, so no table-level policy");
         assert_eq!(two[1].resource.get("table"), None);
         let one = p.plan_grant("SELECT", "*", "wh", None, None).expect("plan");
@@ -495,7 +515,9 @@ mod tests {
     #[test]
     fn the_realm_is_omitted_when_empty() {
         let p = profile();
-        let plan = p.plan_grant("SELECT", "", "wh", Some("sales"), Some("orders")).expect("plan");
+        let plan = p
+            .plan_grant("SELECT", "", "wh", Some("sales"), Some("orders"))
+            .expect("plan");
         assert!(plan.iter().all(|x| !x.resource.contains_key("root")));
     }
 

@@ -27,7 +27,7 @@ use sqe_core::SessionUser;
 use crate::policy_expr::parse_sql_predicate;
 use crate::session_udf::SessionIdentity;
 use crate::{
-    MaskType, NoopTagSource, PolicyEnforcer, PolicySummary, PolicyStore, ResolvedPolicy,
+    MaskType, NoopTagSource, PolicyEnforcer, PolicyStore, PolicySummary, ResolvedPolicy,
     TagMaskSpec, TagSource,
 };
 
@@ -60,10 +60,7 @@ impl PolicyPlanRewriter {
     /// Choose which mask wins when a resource mask and a tag mask cover the same
     /// column. Defaults to `Tag`, which is what Hive and Spark/Kyuubi do.
     #[must_use = "with_mask_precedence consumes self; bind the returned rewriter"]
-    pub fn with_mask_precedence(
-        mut self,
-        precedence: sqe_core::config::MaskPrecedence,
-    ) -> Self {
+    pub fn with_mask_precedence(mut self, precedence: sqe_core::config::MaskPrecedence) -> Self {
         self.mask_precedence = precedence;
         self
     }
@@ -115,9 +112,7 @@ impl PolicyEnforcer for PolicyPlanRewriter {
         plan.apply(|node| {
             if let LogicalPlan::TableScan(scan) = node {
                 let table_name = scan.table_name.to_string();
-                if let Ok(provider) =
-                    datafusion::datasource::source_as_provider(&scan.source)
-                {
+                if let Ok(provider) = datafusion::datasource::source_as_provider(&scan.source) {
                     // TableProvider has `Any` as a supertrait but no `as_any()`
                     // method; upcast the reference to downcast to ViewTable.
                     let any_provider: &dyn std::any::Any = provider.as_ref();
@@ -213,9 +208,7 @@ impl PolicyEnforcer for PolicyPlanRewriter {
                     // namespaces (e.g. "ns1.ns2" -> "ns2" != cache key "ns1.ns2.t").
                     let catalog = table_ref.catalog();
                     let ns_path: Vec<String> = match table_ref.schema() {
-                        Some(s) if !s.is_empty() => {
-                            s.split('.').map(str::to_string).collect()
-                        }
+                        Some(s) if !s.is_empty() => s.split('.').map(str::to_string).collect(),
                         _ => Vec::new(),
                     };
                     // Reserved virtual schemas (information_schema, the `system`
@@ -373,8 +366,7 @@ impl PolicyEnforcer for PolicyPlanRewriter {
                         //    column gets its mask expression; everything else
                         //    passes through with its real (qualified) reference.
                         //    Restriction wins over a mask on the same column.
-                        if !policy.column_masks.is_empty()
-                            || !policy.restricted_columns.is_empty()
+                        if !policy.column_masks.is_empty() || !policy.restricted_columns.is_empty()
                         {
                             let schema = builder.schema().clone();
                             let exprs: Vec<Expr> = schema
@@ -397,13 +389,8 @@ impl PolicyEnforcer for PolicyPlanRewriter {
                                         )
                                         .alias_qualified(qualifier.cloned(), name.clone())
                                     } else if let Some(mask) = policy.column_masks.get(name) {
-                                        apply_mask(
-                                            name,
-                                            field.data_type(),
-                                            mask,
-                                            mask_key.clone(),
-                                        )
-                                        .alias_qualified(qualifier.cloned(), name.clone())
+                                        apply_mask(name, field.data_type(), mask, mask_key.clone())
+                                            .alias_qualified(qualifier.cloned(), name.clone())
                                     } else {
                                         Expr::Column(datafusion::common::Column::new(
                                             qualifier.cloned(),
@@ -641,7 +628,9 @@ pub(crate) fn merge_tag_masks(
                     let substituted = template.replace("{col}", column);
                     match parse_sql_predicate(&substituted, identity) {
                         Ok(expr) => {
-                            policy.column_masks.insert(column.clone(), MaskType::Custom(expr));
+                            policy
+                                .column_masks
+                                .insert(column.clone(), MaskType::Custom(expr));
                         }
                         Err(e) => {
                             // Do not log `template`: a CUSTOM mask body can embed
@@ -733,9 +722,7 @@ fn is_reserved_virtual_ref(table_ref: &datafusion::common::TableReference) -> bo
     )
 }
 
-fn resolve_policy_key(
-    table_ref: &datafusion::common::TableReference,
-) -> Option<(String, String)> {
+fn resolve_policy_key(table_ref: &datafusion::common::TableReference) -> Option<(String, String)> {
     let table = table_ref.table();
     if table.is_empty() {
         return None;
@@ -824,7 +811,10 @@ fn widen_scan_for_row_filters(
         .projected_schema
         .iter()
         .map(|(qualifier, field)| {
-            Expr::Column(datafusion::common::Column::new(qualifier.cloned(), field.name()))
+            Expr::Column(datafusion::common::Column::new(
+                qualifier.cloned(),
+                field.name(),
+            ))
         })
         .collect();
 
@@ -845,7 +835,10 @@ fn widen_scan_for_row_filters(
 fn typed_null(data_type: &DataType) -> Expr {
     match ScalarValue::try_from(data_type) {
         Ok(scalar) => lit(scalar),
-        Err(_) => Expr::Cast(Cast::new(Box::new(lit(ScalarValue::Utf8(None))), data_type.clone())),
+        Err(_) => Expr::Cast(Cast::new(
+            Box::new(lit(ScalarValue::Utf8(None))),
+            data_type.clone(),
+        )),
     }
 }
 
@@ -868,10 +861,7 @@ fn apply_mask(
             if matches!(data_type, DataType::Utf8 | DataType::LargeUtf8) {
                 lit(value.clone())
             } else {
-                Expr::Cast(Cast::new(
-                    Box::new(lit(value.clone())),
-                    data_type.clone(),
-                ))
+                Expr::Cast(Cast::new(Box::new(lit(value.clone())), data_type.clone()))
             }
         }
         MaskType::Hash => {
@@ -882,12 +872,11 @@ fn apply_mask(
             // when `mask_key` is `Some`, plain SHA-256 otherwise. Plain
             // mode is vulnerable to offline brute force on low-entropy
             // values (issue #37).
-            let hash = Expr::ScalarFunction(
-                datafusion::logical_expr::expr::ScalarFunction::new_udf(
+            let hash =
+                Expr::ScalarFunction(datafusion::logical_expr::expr::ScalarFunction::new_udf(
                     Arc::new(crate::sha256_udf::sha256_udf(mask_key)),
                     vec![col(column_name)],
-                ),
-            );
+                ));
             if matches!(data_type, DataType::Utf8 | DataType::LargeUtf8) {
                 hash
             } else {
@@ -895,11 +884,21 @@ fn apply_mask(
             }
         }
         MaskType::Custom(expr) => expr.clone(),
-        MaskType::PartialMask { show_first, show_last, upper, lower, digit } => {
+        MaskType::PartialMask {
+            show_first,
+            show_last,
+            upper,
+            lower,
+            digit,
+        } => {
             let mask_expr = |inner: Expr| {
                 Expr::ScalarFunction(datafusion::logical_expr::expr::ScalarFunction::new_udf(
                     Arc::new(crate::mask_udf::mask_partial_udf(
-                        *show_first, *show_last, *upper, *lower, *digit,
+                        *show_first,
+                        *show_last,
+                        *upper,
+                        *lower,
+                        *digit,
                     )),
                     vec![inner],
                 ))
@@ -928,10 +927,8 @@ fn apply_mask(
         }
         MaskType::DateShowYear => match data_type {
             DataType::Date32 | DataType::Date64 | DataType::Timestamp(_, _) => {
-                let truncated = datafusion::functions::expr_fn::date_trunc(
-                    lit("year"),
-                    col(column_name),
-                );
+                let truncated =
+                    datafusion::functions::expr_fn::date_trunc(lit("year"), col(column_name));
                 // date_trunc returns a Timestamp; cast back to the column's exact
                 // type so the projection schema matches (Date32 stays Date32).
                 Expr::Cast(Cast::new(Box::new(truncated), data_type.clone()))
@@ -956,15 +953,22 @@ mod tests {
     fn summary_counts_masks_filters_and_restrictions() {
         let mut policy = ResolvedPolicy::default();
         policy.row_filters.push(col("region").eq(lit("EU")));
-        policy.column_masks.insert("ssn".to_string(), MaskType::Hash);
-        policy.column_masks.insert("salary".to_string(), MaskType::Nullify);
+        policy
+            .column_masks
+            .insert("ssn".to_string(), MaskType::Hash);
+        policy
+            .column_masks
+            .insert("salary".to_string(), MaskType::Nullify);
         policy.restricted_columns.push("notes".to_string());
         let mut table_policies = HashMap::new();
         table_policies.insert("sales.orders".to_string(), policy);
 
         let s = summarise_policies(&table_policies);
         assert_eq!(s.row_filters_applied, 1);
-        assert_eq!(s.columns_masked, vec!["salary".to_string(), "ssn".to_string()]);
+        assert_eq!(
+            s.columns_masked,
+            vec!["salary".to_string(), "ssn".to_string()]
+        );
         assert_eq!(s.columns_restricted, vec!["notes".to_string()]);
         assert!(!s.denied, "a real row filter is not a deny");
     }
@@ -987,7 +991,10 @@ mod tests {
     #[test]
     fn summary_default_when_no_policies() {
         let table_policies: HashMap<String, ResolvedPolicy> = HashMap::new();
-        assert_eq!(summarise_policies(&table_policies), PolicySummary::default());
+        assert_eq!(
+            summarise_policies(&table_policies),
+            PolicySummary::default()
+        );
     }
 
     // ── merge_tag_masks precedence tests ──────────────────────────────────────
@@ -995,7 +1002,12 @@ mod tests {
     fn make_col_tags(pairs: &[(&str, &[&str])]) -> HashMap<String, Vec<String>> {
         pairs
             .iter()
-            .map(|(col, tags)| (col.to_string(), tags.iter().map(|t| t.to_string()).collect()))
+            .map(|(col, tags)| {
+                (
+                    col.to_string(),
+                    tags.iter().map(|t| t.to_string()).collect(),
+                )
+            })
             .collect()
     }
 
@@ -1024,7 +1036,15 @@ mod tests {
         let mut policy = ResolvedPolicy::default();
         let col_tags = make_col_tags(&[("email", &["PII"])]);
         let tag_masks = make_tag_masks(&[("PII", MaskType::Nullify)]);
-        merge_tag_masks(&mut policy, &col_tags, &tag_masks, vec![], &no_unmappable(), &default_identity(), MaskPrecedence::Tag);
+        merge_tag_masks(
+            &mut policy,
+            &col_tags,
+            &tag_masks,
+            vec![],
+            &no_unmappable(),
+            &default_identity(),
+            MaskPrecedence::Tag,
+        );
         assert!(
             matches!(policy.column_masks.get("email"), Some(MaskType::Nullify)),
             "tag mask must be applied when no resource mask exists"
@@ -1034,7 +1054,9 @@ mod tests {
     #[test]
     fn merge_tag_masks_resource_mask_wins_under_resource_precedence() {
         let mut policy = ResolvedPolicy::default();
-        policy.column_masks.insert("email".to_string(), MaskType::Hash);
+        policy
+            .column_masks
+            .insert("email".to_string(), MaskType::Hash);
         let col_tags = make_col_tags(&[("email", &["PII"])]);
         let tag_masks = make_tag_masks(&[("PII", MaskType::Nullify)]);
         merge_tag_masks(
@@ -1058,7 +1080,9 @@ mod tests {
     #[test]
     fn merge_tag_masks_tag_mask_wins_under_tag_precedence() {
         let mut policy = ResolvedPolicy::default();
-        policy.column_masks.insert("email".to_string(), MaskType::Hash);
+        policy
+            .column_masks
+            .insert("email".to_string(), MaskType::Hash);
         let col_tags = make_col_tags(&[("email", &["PII"])]);
         let tag_masks = make_tag_masks(&[("PII", MaskType::Nullify)]);
         merge_tag_masks(
@@ -1082,7 +1106,9 @@ mod tests {
     #[test]
     fn merge_tag_masks_broken_custom_template_keeps_the_resource_mask() {
         let mut policy = ResolvedPolicy::default();
-        policy.column_masks.insert("ssn".to_string(), MaskType::Nullify);
+        policy
+            .column_masks
+            .insert("ssn".to_string(), MaskType::Nullify);
         let col_tags = make_col_tags(&[("ssn", &["PII"])]);
         let mut tag_masks = HashMap::new();
         tag_masks.insert(
@@ -1141,7 +1167,9 @@ mod tests {
     fn merge_tag_masks_never_leaves_a_contested_column_raw_or_restricted() {
         for precedence in [MaskPrecedence::Tag, MaskPrecedence::Resource] {
             let mut policy = ResolvedPolicy::default();
-            policy.column_masks.insert("email".to_string(), MaskType::Hash);
+            policy
+                .column_masks
+                .insert("email".to_string(), MaskType::Hash);
             let col_tags = make_col_tags(&[("email", &["PII"])]);
             // The tag is unmappable: no spec for it, and it is flagged.
             let mut unmappable = HashSet::new();
@@ -1172,7 +1200,15 @@ mod tests {
         policy.restricted_columns.push("ssn".to_string());
         let col_tags = make_col_tags(&[("ssn", &["PII"])]);
         let tag_masks = make_tag_masks(&[("PII", MaskType::Nullify)]);
-        merge_tag_masks(&mut policy, &col_tags, &tag_masks, vec![], &no_unmappable(), &default_identity(), MaskPrecedence::Tag);
+        merge_tag_masks(
+            &mut policy,
+            &col_tags,
+            &tag_masks,
+            vec![],
+            &no_unmappable(),
+            &default_identity(),
+            MaskPrecedence::Tag,
+        );
         // No mask added; restricted stays restricted.
         assert!(
             !policy.column_masks.contains_key("ssn"),
@@ -1192,7 +1228,15 @@ mod tests {
         let col_tags = make_col_tags(&[("region", &["RESTRICTED"])]);
         let tag_masks: HashMap<String, TagMaskSpec> = HashMap::new(); // no masks
         let tag_filter = datafusion::logical_expr::col("region").eq(lit("EU"));
-        merge_tag_masks(&mut policy, &col_tags, &tag_masks, vec![tag_filter], &no_unmappable(), &default_identity(), MaskPrecedence::Tag);
+        merge_tag_masks(
+            &mut policy,
+            &col_tags,
+            &tag_masks,
+            vec![tag_filter],
+            &no_unmappable(),
+            &default_identity(),
+            MaskPrecedence::Tag,
+        );
         assert_eq!(
             policy.row_filters.len(),
             2,
@@ -1207,7 +1251,15 @@ mod tests {
         let col_tags = make_col_tags(&[("salary", &["INTERNAL", "PII"])]);
         // Only PII has a mask.
         let tag_masks = make_tag_masks(&[("PII", MaskType::Hash)]);
-        merge_tag_masks(&mut policy, &col_tags, &tag_masks, vec![], &no_unmappable(), &default_identity(), MaskPrecedence::Tag);
+        merge_tag_masks(
+            &mut policy,
+            &col_tags,
+            &tag_masks,
+            vec![],
+            &no_unmappable(),
+            &default_identity(),
+            MaskPrecedence::Tag,
+        );
         assert!(
             matches!(policy.column_masks.get("salary"), Some(MaskType::Hash)),
             "first matching tag mask in stored order must be applied"
@@ -1217,7 +1269,15 @@ mod tests {
     #[test]
     fn merge_tag_masks_empty_col_tags_is_noop() {
         let mut policy = ResolvedPolicy::default();
-        merge_tag_masks(&mut policy, &HashMap::new(), &HashMap::new(), vec![], &no_unmappable(), &default_identity(), MaskPrecedence::Tag);
+        merge_tag_masks(
+            &mut policy,
+            &HashMap::new(),
+            &HashMap::new(),
+            vec![],
+            &no_unmappable(),
+            &default_identity(),
+            MaskPrecedence::Tag,
+        );
         assert!(policy.column_masks.is_empty());
         assert!(policy.row_filters.is_empty());
     }
@@ -1232,7 +1292,15 @@ mod tests {
         let col_tags = make_col_tags(&[("ssn", &["PII"])]);
         let tag_masks: HashMap<String, TagMaskSpec> = HashMap::new(); // PII produced no mask (unmappable)
         let unmappable: HashSet<String> = ["PII".to_string()].into_iter().collect();
-        merge_tag_masks(&mut policy, &col_tags, &tag_masks, vec![], &unmappable, &default_identity(), MaskPrecedence::Tag);
+        merge_tag_masks(
+            &mut policy,
+            &col_tags,
+            &tag_masks,
+            vec![],
+            &unmappable,
+            &default_identity(),
+            MaskPrecedence::Tag,
+        );
         assert!(
             policy.restricted_columns.contains(&"ssn".to_string()),
             "column with unmappable tag mask must be restricted (fail-closed)"
@@ -1249,11 +1317,21 @@ mod tests {
         // resource mask is more specific and sufficient — the column must NOT
         // be restricted.
         let mut policy = ResolvedPolicy::default();
-        policy.column_masks.insert("ssn".to_string(), MaskType::Hash);
+        policy
+            .column_masks
+            .insert("ssn".to_string(), MaskType::Hash);
         let col_tags = make_col_tags(&[("ssn", &["PII"])]);
         let tag_masks: HashMap<String, TagMaskSpec> = HashMap::new();
         let unmappable: HashSet<String> = ["PII".to_string()].into_iter().collect();
-        merge_tag_masks(&mut policy, &col_tags, &tag_masks, vec![], &unmappable, &default_identity(), MaskPrecedence::Tag);
+        merge_tag_masks(
+            &mut policy,
+            &col_tags,
+            &tag_masks,
+            vec![],
+            &unmappable,
+            &default_identity(),
+            MaskPrecedence::Tag,
+        );
         assert!(
             matches!(policy.column_masks.get("ssn"), Some(MaskType::Hash)),
             "resource mask must win over unmappable-tag restriction"
@@ -1273,8 +1351,19 @@ mod tests {
         let mut policy = ResolvedPolicy::default();
         let col_tags = make_col_tags(&[("email", &["PII"])]);
         let mut tag_masks: HashMap<String, TagMaskSpec> = HashMap::new();
-        tag_masks.insert("PII".to_string(), TagMaskSpec::Custom("concat('***', {col})".to_string()));
-        merge_tag_masks(&mut policy, &col_tags, &tag_masks, vec![], &no_unmappable(), &default_identity(), MaskPrecedence::Tag);
+        tag_masks.insert(
+            "PII".to_string(),
+            TagMaskSpec::Custom("concat('***', {col})".to_string()),
+        );
+        merge_tag_masks(
+            &mut policy,
+            &col_tags,
+            &tag_masks,
+            vec![],
+            &no_unmappable(),
+            &default_identity(),
+            MaskPrecedence::Tag,
+        );
         assert!(
             matches!(policy.column_masks.get("email"), Some(MaskType::Custom(_))),
             "CUSTOM tag mask with valid expression must produce MaskType::Custom"
@@ -1293,8 +1382,19 @@ mod tests {
         let col_tags = make_col_tags(&[("ssn", &["PII"])]);
         let mut tag_masks: HashMap<String, TagMaskSpec> = HashMap::new();
         // Invalid SQL expression — parser will reject it.
-        tag_masks.insert("PII".to_string(), TagMaskSpec::Custom("!!!INVALID SQL!!!".to_string()));
-        merge_tag_masks(&mut policy, &col_tags, &tag_masks, vec![], &no_unmappable(), &default_identity(), MaskPrecedence::Tag);
+        tag_masks.insert(
+            "PII".to_string(),
+            TagMaskSpec::Custom("!!!INVALID SQL!!!".to_string()),
+        );
+        merge_tag_masks(
+            &mut policy,
+            &col_tags,
+            &tag_masks,
+            vec![],
+            &no_unmappable(),
+            &default_identity(),
+            MaskPrecedence::Tag,
+        );
         assert!(
             policy.restricted_columns.contains(&"ssn".to_string()),
             "column with unparseable CUSTOM tag mask must be restricted (fail-closed)"
@@ -1478,8 +1578,7 @@ mod tests {
 
     #[test]
     fn reserved_ref_matches_qualified_information_schema() {
-        let r =
-            datafusion::common::TableReference::full("cat", "information_schema", "columns");
+        let r = datafusion::common::TableReference::full("cat", "information_schema", "columns");
         assert!(is_reserved_virtual_ref(&r));
     }
 
@@ -1497,10 +1596,12 @@ mod tests {
         let r = datafusion::common::TableReference::full("cat", "ns1.ns2", "employees");
         assert!(!is_reserved_virtual_ref(&r));
         // Bare and two-part user tables too.
-        assert!(!is_reserved_virtual_ref(&datafusion::common::TableReference::bare("employees")));
-        assert!(!is_reserved_virtual_ref(&datafusion::common::TableReference::partial(
-            "hr", "employees"
-        )));
+        assert!(!is_reserved_virtual_ref(
+            &datafusion::common::TableReference::bare("employees")
+        ));
+        assert!(!is_reserved_virtual_ref(
+            &datafusion::common::TableReference::partial("hr", "employees")
+        ));
     }
 
     #[test]
@@ -1660,12 +1761,22 @@ mod tests {
         // registered under "ns2" is found when the table is cat.ns1.ns2.t.
         let store = crate::policy_store::InMemoryPolicyStore::new();
         let mut p = ResolvedPolicy::default();
-        p.column_masks.insert("email".to_string(), MaskType::Nullify);
+        p.column_masks
+            .insert("email".to_string(), MaskType::Nullify);
         store.add_table_policy("ns2", "t", p).await;
 
-        let got =
-            resolve_effective_policy(&store, &diag_user(&[]), "t", "ns2", &HashMap::new(), MaskPrecedence::Tag)
-                .await;
-        assert!(matches!(got.column_masks.get("email"), Some(MaskType::Nullify)));
+        let got = resolve_effective_policy(
+            &store,
+            &diag_user(&[]),
+            "t",
+            "ns2",
+            &HashMap::new(),
+            MaskPrecedence::Tag,
+        )
+        .await;
+        assert!(matches!(
+            got.column_masks.get("email"),
+            Some(MaskType::Nullify)
+        ));
     }
 }

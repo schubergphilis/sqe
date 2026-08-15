@@ -30,10 +30,9 @@ fn nanosec_timestamp_round_trip_through_parser_to_iceberg_type() {
     assert!(is_v3_only_type(&ct.columns[0].data_type));
 
     // Route through the write_handler conversion (re-exported for tests).
-    let arrow_type = sqe_coordinator::__test_support::sql_type_to_arrow_public(
-        &ct.columns[0].data_type,
-    )
-    .unwrap();
+    let arrow_type =
+        sqe_coordinator::__test_support::sql_type_to_arrow_public(&ct.columns[0].data_type)
+            .unwrap();
     let iceberg_type = iceberg::arrow::arrow_type_to_type(&arrow_type).unwrap();
     assert!(matches!(
         iceberg_type,
@@ -45,10 +44,9 @@ fn nanosec_timestamp_round_trip_through_parser_to_iceberg_type() {
 fn timestamptz_ns_round_trip_through_parser_to_iceberg_type() {
     let ct = parse("CREATE TABLE events (utcts TIMESTAMPTZ_NS(9))");
     assert!(is_v3_only_type(&ct.columns[0].data_type));
-    let arrow_type = sqe_coordinator::__test_support::sql_type_to_arrow_public(
-        &ct.columns[0].data_type,
-    )
-    .unwrap();
+    let arrow_type =
+        sqe_coordinator::__test_support::sql_type_to_arrow_public(&ct.columns[0].data_type)
+            .unwrap();
     let iceberg_type = iceberg::arrow::arrow_type_to_type(&arrow_type).unwrap();
     assert!(matches!(
         iceberg_type,
@@ -92,8 +90,7 @@ fn format_version_gates_to_v3_only_when_needed() {
     assert!(sqe_coordinator::__test_support::needs_v3(&v3_ns).unwrap());
 
     // DEFAULT literal: V3.
-    let v3_default =
-        parse("CREATE TABLE t (id BIGINT, status STRING DEFAULT 'pending')");
+    let v3_default = parse("CREATE TABLE t (id BIGINT, status STRING DEFAULT 'pending')");
     assert!(sqe_coordinator::__test_support::needs_v3(&v3_default).unwrap());
 }
 

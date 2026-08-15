@@ -1,8 +1,8 @@
 //! Render an `AuditEvent` as an OCSF (Open Cybersecurity Schema Framework)
 //! JSON object via [`to_ocsf`].
 
-use serde_json::{json, Value};
 use super::event::{AuditEvent, AuditKind, ObjectType, Outcome};
+use serde_json::{json, Value};
 
 /// Map a canonical `AuditEvent` to an OCSF event object. OCSF is a wire schema:
 /// SQE-specific fields that have no OCSF home travel under `unmapped`.
@@ -18,16 +18,26 @@ pub fn to_ocsf(event: &AuditEvent) -> Value {
         groups.push(json!({ "name": g }));
     }
     let mut user = json!({ "name": event.actor.username });
-    if let Some(sub) = &event.actor.subject { user["uid"] = json!(sub); }
-    if let Some(email) = &event.actor.email { user["email_addr"] = json!(email); }
-    if !groups.is_empty() { user["groups"] = json!(groups); }
-    if !event.actor.roles.is_empty() { user["roles"] = json!(event.actor.roles); }
+    if let Some(sub) = &event.actor.subject {
+        user["uid"] = json!(sub);
+    }
+    if let Some(email) = &event.actor.email {
+        user["email_addr"] = json!(email);
+    }
+    if !groups.is_empty() {
+        user["groups"] = json!(groups);
+    }
+    if !event.actor.roles.is_empty() {
+        user["roles"] = json!(event.actor.roles);
+    }
 
     let mut unmapped = serde_json::Map::new();
     if let Some(q) = &event.query {
         unmapped.insert("query_hash".into(), json!(q.query_hash));
         unmapped.insert("statement_type".into(), json!(q.statement_type));
-        if let Some(t) = &q.text { unmapped.insert("query_text".into(), json!(t)); }
+        if let Some(t) = &q.text {
+            unmapped.insert("query_text".into(), json!(t));
+        }
     }
     if let Some(s) = &event.stats {
         unmapped.insert("bytes_scanned".into(), json!(s.bytes_scanned));
@@ -40,7 +50,10 @@ pub fn to_ocsf(event: &AuditEvent) -> Value {
         }
     }
     if let Some(p) = &event.policy {
-        unmapped.insert("policy".into(), serde_json::to_value(p).unwrap_or(Value::Null));
+        unmapped.insert(
+            "policy".into(),
+            serde_json::to_value(p).unwrap_or(Value::Null),
+        );
     }
 
     let mut out = json!({
@@ -59,10 +72,15 @@ pub fn to_ocsf(event: &AuditEvent) -> Value {
         "unmapped": Value::Object(unmapped),
     });
 
-    if let Outcome::Failure { message: Some(m), .. } = &event.outcome {
+    if let Outcome::Failure {
+        message: Some(m), ..
+    } = &event.outcome
+    {
         out["message"] = json!(m);
     }
-    if let Some(ip) = &event.client_ip { out["src_endpoint"] = json!({ "ip": ip }); }
+    if let Some(ip) = &event.client_ip {
+        out["src_endpoint"] = json!({ "ip": ip });
+    }
     if !event.resources.is_empty() {
         let resources: Vec<Value> = event.resources.iter().map(|r| json!({
             "name": r.fqn(),
@@ -95,13 +113,40 @@ mod tests {
         AuditEvent {
             time: chrono::Utc.with_ymd_and_hms(2026, 6, 20, 12, 0, 0).unwrap(),
             kind: AuditKind::Query,
-            actor: Actor { username: "alice".into(), subject: Some("u1".into()), email: Some("a@x.io".into()), roles: vec!["analyst".into()], groups: vec!["hr".into()] },
+            actor: Actor {
+                username: "alice".into(),
+                subject: Some("u1".into()),
+                email: Some("a@x.io".into()),
+                roles: vec!["analyst".into()],
+                groups: vec!["hr".into()],
+            },
             outcome: Outcome::Success,
-            resources: vec![Resource { catalog: Some("polaris".into()), namespace: vec!["hr".into()], name: "employees".into(), object_type: ObjectType::Table }],
+            resources: vec![Resource {
+                catalog: Some("polaris".into()),
+                namespace: vec!["hr".into()],
+                name: "employees".into(),
+                object_type: ObjectType::Table,
+            }],
             policy: None,
-            timing: Some(Timing { duration_ms: 42, queued_ms: 0, planning_ms: 5, execution_ms: 37 }),
-            stats: Some(QueryStats { rows_returned: 10, rows_written: None, bytes_scanned: 2048, rows_scanned: 100, spill_bytes: 0, peak_memory_bytes: 0 }),
-            query: Some(QueryInfo { text: Some("SELECT 1".into()), query_hash: "abc".into(), statement_type: "query".into() }),
+            timing: Some(Timing {
+                duration_ms: 42,
+                queued_ms: 0,
+                planning_ms: 5,
+                execution_ms: 37,
+            }),
+            stats: Some(QueryStats {
+                rows_returned: 10,
+                rows_written: None,
+                bytes_scanned: 2048,
+                rows_scanned: 100,
+                spill_bytes: 0,
+                peak_memory_bytes: 0,
+            }),
+            query: Some(QueryInfo {
+                text: Some("SELECT 1".into()),
+                query_hash: "abc".into(),
+                statement_type: "query".into(),
+            }),
             session_id: Some("sess-1".into()),
             client_ip: Some("10.0.0.1".into()),
             trace_id: None,
@@ -129,7 +174,11 @@ mod tests {
     #[test]
     fn failure_outcome_sets_status_id_2() {
         let mut ev = query_event();
-        ev.outcome = Outcome::Failure { error_type: Some("PlanError".into()), error_code: Some("E1".into()), message: Some("bad".into()) };
+        ev.outcome = Outcome::Failure {
+            error_type: Some("PlanError".into()),
+            error_code: Some("E1".into()),
+            message: Some("bad".into()),
+        };
         let v = to_ocsf(&ev);
         assert_eq!(v["status_id"], 2);
     }
@@ -150,11 +199,24 @@ mod tests {
         let base = |kind: AuditKind| AuditEvent {
             time: chrono::Utc.with_ymd_and_hms(2026, 6, 20, 12, 0, 0).unwrap(),
             kind,
-            actor: Actor { username: "bob".into(), subject: None, email: None, roles: vec![], groups: vec![] },
+            actor: Actor {
+                username: "bob".into(),
+                subject: None,
+                email: None,
+                roles: vec![],
+                groups: vec![],
+            },
             outcome: Outcome::Success,
             resources: vec![],
-            policy: None, timing: None, stats: None, query: None,
-            session_id: None, client_ip: None, trace_id: None, query_id: None, integrity: Integrity::default(),
+            policy: None,
+            timing: None,
+            stats: None,
+            query: None,
+            session_id: None,
+            client_ip: None,
+            trace_id: None,
+            query_id: None,
+            integrity: Integrity::default(),
         };
         assert_eq!(to_ocsf(&base(AuditKind::Auth))["class_uid"], 3002);
         assert_eq!(to_ocsf(&base(AuditKind::Session))["class_uid"], 3003);
@@ -162,7 +224,11 @@ mod tests {
         assert_eq!(to_ocsf(&base(AuditKind::AdminDdl))["class_uid"], 3004);
         // Policy deny rides on Datastore Activity with a Failure status.
         let mut deny = base(AuditKind::PolicyDecision);
-        deny.outcome = Outcome::Failure { error_type: Some("PolicyDenied".into()), error_code: None, message: Some("deny-all".into()) };
+        deny.outcome = Outcome::Failure {
+            error_type: Some("PolicyDenied".into()),
+            error_code: None,
+            message: Some("deny-all".into()),
+        };
         let v = to_ocsf(&deny);
         assert_eq!(v["class_uid"], 6005);
         assert_eq!(v["status_id"], 2);

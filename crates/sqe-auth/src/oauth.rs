@@ -88,9 +88,7 @@ impl OAuthClient {
             .form(&params)
             .send()
             .await
-            .map_err(|e| {
-                sqe_core::SqeError::Auth(format!("OAuth token request failed: {e}"))
-            })?;
+            .map_err(|e| sqe_core::SqeError::Auth(format!("OAuth token request failed: {e}")))?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -104,12 +102,9 @@ impl OAuthClient {
             ));
         }
 
-        response
-            .json::<TokenResponse>()
-            .await
-            .map_err(|e| {
-                sqe_core::SqeError::Auth(format!("Failed to parse OAuth token response: {e}"))
-            })
+        response.json::<TokenResponse>().await.map_err(|e| {
+            sqe_core::SqeError::Auth(format!("Failed to parse OAuth token response: {e}"))
+        })
     }
 }
 
@@ -183,10 +178,7 @@ mod tests {
         let response: TokenResponse =
             serde_json::from_str(json).expect("should deserialise standard response");
 
-        assert_eq!(
-            response.access_token,
-            "eyJhbGciOiJSUzI1NiJ9.payload.sig"
-        );
+        assert_eq!(response.access_token, "eyJhbGciOiJSUzI1NiJ9.payload.sig");
         assert_eq!(response.expires_in, 3600);
         assert_eq!(response.token_type, "Bearer");
     }

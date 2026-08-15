@@ -16,18 +16,23 @@ use std::sync::Arc;
 use futures::TryStreamExt;
 use iceberg::spec::Schema as IcebergSchema;
 use iceberg::{Catalog, NamespaceIdent, TableCreation};
-use sqe_core::SecretStore;
 use sqe_coordinator::maintenance_log::{advisory_row, append_row, maintenance_log_arrow_schema};
 use sqe_coordinator::table_health::TableHealth;
+use sqe_core::SecretStore;
 use sqe_sql::CatalogKind;
 use tempfile::TempDir;
 
 /// Build a fresh SQLite-backed `Arc<dyn Catalog>` rooted at `dir`.
 async fn sqlite_catalog(dir: &TempDir) -> Arc<dyn Catalog> {
     let location = dir.path().to_str().expect("tempdir path is UTF-8");
-    sqe_catalog::mount::build_catalog(location, CatalogKind::Sqlite, &BTreeMap::new(), &SecretStore::new())
-        .await
-        .expect("sqlite catalog builds")
+    sqe_catalog::mount::build_catalog(
+        location,
+        CatalogKind::Sqlite,
+        &BTreeMap::new(),
+        &SecretStore::new(),
+    )
+    .await
+    .expect("sqlite catalog builds")
 }
 
 fn sample_health() -> TableHealth {
@@ -50,7 +55,10 @@ fn sample_health() -> TableHealth {
 /// path involved -- this test only exercises `append_row`).
 async fn create_maintenance_log_table(catalog: &Arc<dyn Catalog>) {
     catalog
-        .create_namespace(&NamespaceIdent::new("sqe_system".to_string()), HashMap::new())
+        .create_namespace(
+            &NamespaceIdent::new("sqe_system".to_string()),
+            HashMap::new(),
+        )
         .await
         .expect("create sqe_system namespace");
 
@@ -76,7 +84,12 @@ async fn append_row_writes_and_is_readable_when_table_exists() {
     let catalog = sqlite_catalog(&dir).await;
     create_maintenance_log_table(&catalog).await;
 
-    let row = advisory_row("bench.orders", "maintenance-svc", &sample_health(), 1_700_000_000_000);
+    let row = advisory_row(
+        "bench.orders",
+        "maintenance-svc",
+        &sample_health(),
+        1_700_000_000_000,
+    );
 
     append_row(&catalog, "sqe_system.maintenance_log", &row)
         .await
@@ -153,11 +166,19 @@ async fn append_row_table_absent_returns_ok() {
     // other sqe_system objects), but the ledger table itself was never
     // created by the operator.
     catalog
-        .create_namespace(&NamespaceIdent::new("sqe_system".to_string()), HashMap::new())
+        .create_namespace(
+            &NamespaceIdent::new("sqe_system".to_string()),
+            HashMap::new(),
+        )
         .await
         .expect("create sqe_system namespace");
 
-    let row = advisory_row("bench.orders", "maintenance-svc", &sample_health(), 1_700_000_000_000);
+    let row = advisory_row(
+        "bench.orders",
+        "maintenance-svc",
+        &sample_health(),
+        1_700_000_000_000,
+    );
 
     let result = append_row(&catalog, "sqe_system.maintenance_log", &row).await;
     assert!(
@@ -171,7 +192,12 @@ async fn append_row_namespace_absent_returns_ok() {
     let dir = tempfile::tempdir().expect("tempdir");
     let catalog = sqlite_catalog(&dir).await;
     // Neither the namespace nor the table exist.
-    let row = advisory_row("bench.orders", "maintenance-svc", &sample_health(), 1_700_000_000_000);
+    let row = advisory_row(
+        "bench.orders",
+        "maintenance-svc",
+        &sample_health(),
+        1_700_000_000_000,
+    );
 
     let result = append_row(&catalog, "sqe_system.maintenance_log", &row).await;
     assert!(

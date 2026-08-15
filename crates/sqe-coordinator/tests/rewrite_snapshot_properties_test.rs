@@ -40,16 +40,24 @@ use tempfile::TempDir;
 /// Build a fresh SQLite-backed `Arc<dyn Catalog>` rooted at `dir`.
 async fn sqlite_catalog(dir: &TempDir) -> Arc<dyn Catalog> {
     let location = dir.path().to_str().expect("tempdir path is UTF-8");
-    sqe_catalog::mount::build_catalog(location, CatalogKind::Sqlite, &BTreeMap::new(), &SecretStore::new())
-        .await
-        .expect("sqlite catalog builds")
+    sqe_catalog::mount::build_catalog(
+        location,
+        CatalogKind::Sqlite,
+        &BTreeMap::new(),
+        &SecretStore::new(),
+    )
+    .await
+    .expect("sqlite catalog builds")
 }
 
 fn minimal_schema() -> Schema {
     Schema::builder()
-        .with_fields(vec![
-            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
-        ])
+        .with_fields(vec![NestedField::required(
+            1,
+            "id",
+            Type::Primitive(PrimitiveType::Long),
+        )
+        .into()])
         .build()
         .expect("build schema")
 }
@@ -91,22 +99,36 @@ async fn rewrite_files_action_stamps_snapshot_properties() {
         .name("rewrite_props_test".to_string())
         .schema(minimal_schema())
         .build();
-    let table = catalog.create_table(&ns, creation).await.expect("create table");
+    let table = catalog
+        .create_table(&ns, creation)
+        .await
+        .expect("create table");
 
     let mut props = std::collections::HashMap::new();
     props.insert("sqe.maintenance.job-id".to_string(), "job-42".to_string());
-    props.insert("sqe.maintenance.principal".to_string(), "svc-compactor".to_string());
-    props.insert("sqe.maintenance.trigger".to_string(), "scheduled".to_string());
+    props.insert(
+        "sqe.maintenance.principal".to_string(),
+        "svc-compactor".to_string(),
+    );
+    props.insert(
+        "sqe.maintenance.trigger".to_string(),
+        "scheduled".to_string(),
+    );
 
     let tx = Transaction::new(&table);
     let mut action = tx
         .rewrite_files()
-        .add_data_files(vec![fabricated_data_file("mem://rewrite_props_test/data/f1.parquet")])
+        .add_data_files(vec![fabricated_data_file(
+            "mem://rewrite_props_test/data/f1.parquet",
+        )])
         .delete_files(Vec::new());
     action.set_snapshot_properties(props.clone());
 
     let tx_applied = action.apply(tx).expect("apply rewrite_files action");
-    tx_applied.commit(catalog.as_ref()).await.expect("commit rewrite_files");
+    tx_applied
+        .commit(catalog.as_ref())
+        .await
+        .expect("commit rewrite_files");
 
     let ident = TableIdent::new(ns, "rewrite_props_test".to_string());
     let reloaded = catalog.load_table(&ident).await.expect("reload table");
@@ -146,7 +168,10 @@ async fn rewrite_files_action_without_snapshot_properties_leaves_summary_unstamp
         .name("rewrite_no_props_test".to_string())
         .schema(minimal_schema())
         .build();
-    let table = catalog.create_table(&ns, creation).await.expect("create table");
+    let table = catalog
+        .create_table(&ns, creation)
+        .await
+        .expect("create table");
 
     // No `set_snapshot_properties` call at all -- mirrors the coordinator's
     // `if let Some(props) = snapshot_properties { action.set_snapshot_properties(props); }`
@@ -154,11 +179,16 @@ async fn rewrite_files_action_without_snapshot_properties_leaves_summary_unstamp
     let tx = Transaction::new(&table);
     let action = tx
         .rewrite_files()
-        .add_data_files(vec![fabricated_data_file("mem://rewrite_no_props_test/data/f1.parquet")])
+        .add_data_files(vec![fabricated_data_file(
+            "mem://rewrite_no_props_test/data/f1.parquet",
+        )])
         .delete_files(Vec::new());
 
     let tx_applied = action.apply(tx).expect("apply rewrite_files action");
-    tx_applied.commit(catalog.as_ref()).await.expect("commit rewrite_files");
+    tx_applied
+        .commit(catalog.as_ref())
+        .await
+        .expect("commit rewrite_files");
 
     let ident = TableIdent::new(ns, "rewrite_no_props_test".to_string());
     let reloaded = catalog.load_table(&ident).await.expect("reload table");

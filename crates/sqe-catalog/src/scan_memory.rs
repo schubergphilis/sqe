@@ -165,19 +165,14 @@ impl ScanDecodeGate {
 }
 
 impl DecodeGate for ScanDecodeGate {
-    fn admit(
-        &self,
-        estimated_bytes: u64,
-    ) -> BoxFuture<'_, iceberg::Result<Box<dyn Any + Send>>> {
+    fn admit(&self, estimated_bytes: u64) -> BoxFuture<'_, iceberg::Result<Box<dyn Any + Send>>> {
         Box::pin(async move {
             let admission = ScanDecodeGate::admit(self, estimated_bytes)
                 .await
                 // Carry the DataFusion message verbatim: it contains the
                 // "Resources exhausted"/"Failed to allocate" wording the
                 // coordinator classifies as RESOURCE_EXHAUSTED.
-                .map_err(|e| {
-                    iceberg::Error::new(iceberg::ErrorKind::Unexpected, e.to_string())
-                })?;
+                .map_err(|e| iceberg::Error::new(iceberg::ErrorKind::Unexpected, e.to_string()))?;
             Ok(Box::new(admission) as Box<dyn Any + Send>)
         })
     }
@@ -189,9 +184,7 @@ impl DecodeGate for ScanDecodeGate {
         Box::pin(async move {
             let admission = ScanDecodeGate::admit_fetch(self, estimated_bytes)
                 .await
-                .map_err(|e| {
-                    iceberg::Error::new(iceberg::ErrorKind::Unexpected, e.to_string())
-                })?;
+                .map_err(|e| iceberg::Error::new(iceberg::ErrorKind::Unexpected, e.to_string()))?;
             Ok(Box::new(admission) as Box<dyn Any + Send>)
         })
     }
@@ -228,7 +221,11 @@ mod tests {
     use datafusion::execution::memory_pool::GreedyMemoryPool;
     use futures::FutureExt;
 
-    fn gate(pool_bytes: usize, permits: usize, track: bool) -> (Arc<ScanDecodeGate>, Arc<dyn MemoryPool>) {
+    fn gate(
+        pool_bytes: usize,
+        permits: usize,
+        track: bool,
+    ) -> (Arc<ScanDecodeGate>, Arc<dyn MemoryPool>) {
         let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(pool_bytes));
         let gate = ScanDecodeGate::new(
             Arc::new(Semaphore::new(permits)),
@@ -288,7 +285,10 @@ mod tests {
     #[tokio::test]
     async fn admit_fetch_denies_over_budget_typed_and_frees_permit() {
         let (gate, pool) = staged_gate(64, 1, 1, true);
-        let err = gate.admit_fetch(1 << 20).await.expect_err("tiny pool denies");
+        let err = gate
+            .admit_fetch(1 << 20)
+            .await
+            .expect_err("tiny pool denies");
         assert!(
             matches!(err, DataFusionError::ResourcesExhausted(_)),
             "typed pool denial, got: {err}"
@@ -309,7 +309,10 @@ mod tests {
             admission.reserved_bytes(),
             1024 * DECODE_MEMORY_ESTIMATE_FACTOR as usize
         );
-        assert_eq!(pool.reserved(), 1024 * DECODE_MEMORY_ESTIMATE_FACTOR as usize);
+        assert_eq!(
+            pool.reserved(),
+            1024 * DECODE_MEMORY_ESTIMATE_FACTOR as usize
+        );
         // It consumed the decode permit: a decode admit must park.
         assert!(Box::pin(gate.admit(1)).now_or_never().is_none());
     }

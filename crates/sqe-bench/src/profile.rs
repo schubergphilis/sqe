@@ -151,13 +151,21 @@ pub fn resolve_s3_credentials(s3: &S3Profile) -> anyhow::Result<S3Credentials> {
     if let Some(prof) = &s3.aws_profile {
         let access_key = aws_config_get(prof, "aws_access_key_id")?;
         let secret_key = aws_config_get(prof, "aws_secret_access_key")?;
-        return Ok(S3Credentials { access_key, secret_key });
+        return Ok(S3Credentials {
+            access_key,
+            secret_key,
+        });
     }
-    let access_key = std::env::var("AWS_ACCESS_KEY_ID")
-        .map_err(|_| anyhow::anyhow!("AWS_ACCESS_KEY_ID not set (and no aws_profile in profile)"))?;
-    let secret_key = std::env::var("AWS_SECRET_ACCESS_KEY")
-        .map_err(|_| anyhow::anyhow!("AWS_SECRET_ACCESS_KEY not set (and no aws_profile in profile)"))?;
-    Ok(S3Credentials { access_key, secret_key })
+    let access_key = std::env::var("AWS_ACCESS_KEY_ID").map_err(|_| {
+        anyhow::anyhow!("AWS_ACCESS_KEY_ID not set (and no aws_profile in profile)")
+    })?;
+    let secret_key = std::env::var("AWS_SECRET_ACCESS_KEY").map_err(|_| {
+        anyhow::anyhow!("AWS_SECRET_ACCESS_KEY not set (and no aws_profile in profile)")
+    })?;
+    Ok(S3Credentials {
+        access_key,
+        secret_key,
+    })
 }
 
 fn aws_config_get(profile: &str, key: &str) -> anyhow::Result<String> {
@@ -458,7 +466,10 @@ client_secret_path = "/run/secrets/oauth"
         };
         let sql = build_attach_sql("golden", &p, &creds, "a'b");
         // Embedded quotes must be doubled so the literal stays well-formed.
-        assert!(sql.contains("S3_SECRET_KEY 'sup''er''secret'"), "got: {sql}");
+        assert!(
+            sql.contains("S3_SECRET_KEY 'sup''er''secret'"),
+            "got: {sql}"
+        );
         assert!(sql.contains("TOKEN 'a''b'"), "got: {sql}");
     }
 
@@ -474,7 +485,10 @@ client_secret_path = "/run/secrets/oauth"
 
         // The raw secret and token must not survive at all, in any form.
         assert!(!red.contains("sup'er'secret"), "secret leaked: {red}");
-        assert!(!red.contains("sup''er''secret"), "escaped secret leaked: {red}");
+        assert!(
+            !red.contains("sup''er''secret"),
+            "escaped secret leaked: {red}"
+        );
         assert!(!red.contains("a'b"), "token leaked: {red}");
         // The specific fragment the old (non-escaping-aware) bug used to
         // leave behind when a quote appeared inside the value.

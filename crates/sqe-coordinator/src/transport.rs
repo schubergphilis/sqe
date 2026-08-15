@@ -17,12 +17,8 @@ pub fn apply_grpc_transport(server: Server, cfg: &GrpcTransportConfig) -> Server
         .initial_stream_window_size(Some(cfg.initial_stream_window_size))
         .initial_connection_window_size(Some(cfg.initial_connection_window_size))
         .max_frame_size(Some(cfg.max_frame_size))
-        .http2_keepalive_interval(Some(Duration::from_secs(
-            cfg.http2_keepalive_interval_secs,
-        )))
-        .http2_keepalive_timeout(Some(Duration::from_secs(
-            cfg.http2_keepalive_timeout_secs,
-        )));
+        .http2_keepalive_interval(Some(Duration::from_secs(cfg.http2_keepalive_interval_secs)))
+        .http2_keepalive_timeout(Some(Duration::from_secs(cfg.http2_keepalive_timeout_secs)));
     if cfg.tcp_keepalive_secs > 0 {
         s = s.tcp_keepalive(Some(Duration::from_secs(cfg.tcp_keepalive_secs)));
     }

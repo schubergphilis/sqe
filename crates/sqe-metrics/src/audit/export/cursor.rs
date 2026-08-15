@@ -28,10 +28,22 @@ impl SeqCursor {
     pub fn load(path: PathBuf, _start_at_beginning: bool) -> Self {
         match std::fs::read_to_string(&path) {
             Ok(contents) => match contents.trim().parse::<u64>() {
-                Ok(seq) => SeqCursor { path, last: seq, fresh: false },
-                Err(_) => SeqCursor { path, last: 0, fresh: true },
+                Ok(seq) => SeqCursor {
+                    path,
+                    last: seq,
+                    fresh: false,
+                },
+                Err(_) => SeqCursor {
+                    path,
+                    last: 0,
+                    fresh: true,
+                },
             },
-            Err(_) => SeqCursor { path, last: 0, fresh: true },
+            Err(_) => SeqCursor {
+                path,
+                last: 0,
+                fresh: true,
+            },
         }
     }
 

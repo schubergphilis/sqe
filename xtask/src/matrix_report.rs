@@ -93,8 +93,8 @@ fn level_weight(level: &str) -> Result<u32> {
 pub fn run(args: Args) -> Result<()> {
     let raw = std::fs::read_to_string(&args.path)
         .with_context(|| format!("reading {}", args.path.display()))?;
-    let state: State = serde_json::from_str(&raw)
-        .with_context(|| format!("parsing {}", args.path.display()))?;
+    let state: State =
+        serde_json::from_str(&raw).with_context(|| format!("parsing {}", args.path.display()))?;
 
     let entries = state.support.len() as u32;
     let max = entries * 3;
@@ -119,7 +119,10 @@ pub fn run(args: Args) -> Result<()> {
     if state.score.raw != raw_score || state.score.max != max {
         bail!(
             "declared score {}/{} disagrees with computed {}/{} -- update the file",
-            state.score.raw, state.score.max, raw_score, max,
+            state.score.raw,
+            state.score.max,
+            raw_score,
+            max,
         );
     }
 
@@ -128,7 +131,8 @@ pub fn run(args: Args) -> Result<()> {
             if percent < min {
                 return Err(anyhow!(
                     "matrix score {:.1}% is below minimum {:.1}%",
-                    percent, min
+                    percent,
+                    min
                 ));
             }
         }

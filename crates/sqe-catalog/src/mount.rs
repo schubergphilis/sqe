@@ -109,7 +109,7 @@ async fn build_sqlite(
 
     use iceberg::CatalogBuilder;
     use iceberg_catalog_sql::{
-        SQL_CATALOG_PROP_URI, SQL_CATALOG_PROP_WAREHOUSE, SqlCatalogBuilder,
+        SqlCatalogBuilder, SQL_CATALOG_PROP_URI, SQL_CATALOG_PROP_WAREHOUSE,
     };
 
     let trimmed = location.trim();
@@ -135,7 +135,10 @@ async fn build_sqlite(
             )
         })?;
         let abs = path.canonicalize().map_err(|e| {
-            format!("could not canonicalise warehouse path {}: {e}", path.display())
+            format!(
+                "could not canonicalise warehouse path {}: {e}",
+                path.display()
+            )
         })?;
         let data_root = abs.join("iceberg");
         std::fs::create_dir_all(&data_root)
@@ -206,7 +209,7 @@ async fn build_iceberg_rest(
 
     use iceberg::CatalogBuilder;
     use iceberg_catalog_rest::{
-        REST_CATALOG_PROP_URI, REST_CATALOG_PROP_WAREHOUSE, RestCatalogBuilder,
+        RestCatalogBuilder, REST_CATALOG_PROP_URI, REST_CATALOG_PROP_WAREHOUSE,
     };
 
     let trimmed = location.trim();
@@ -221,7 +224,10 @@ async fn build_iceberg_rest(
 
     let mut props: HashMap<String, String> = HashMap::new();
     props.insert(REST_CATALOG_PROP_URI.to_string(), trimmed.to_string());
-    props.insert(REST_CATALOG_PROP_WAREHOUSE.to_string(), warehouse.to_string());
+    props.insert(
+        REST_CATALOG_PROP_WAREHOUSE.to_string(),
+        warehouse.to_string(),
+    );
 
     // SECRET (preferred) and TOKEN (inline) both end up in the
     // `token` prop the REST catalog reads. SECRET wins when both are
@@ -369,8 +375,8 @@ async fn build_glue(
 
     use iceberg::CatalogBuilder;
     use iceberg_catalog_glue::{
-        AWS_ACCESS_KEY_ID, AWS_PROFILE_NAME, AWS_REGION_NAME, AWS_SECRET_ACCESS_KEY,
-        AWS_SESSION_TOKEN, GLUE_CATALOG_PROP_WAREHOUSE, GlueCatalogBuilder,
+        GlueCatalogBuilder, AWS_ACCESS_KEY_ID, AWS_PROFILE_NAME, AWS_REGION_NAME,
+        AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN, GLUE_CATALOG_PROP_WAREHOUSE,
     };
 
     let trimmed = location.trim();
@@ -380,7 +386,10 @@ async fn build_glue(
         .ok_or_else(|| "option `WAREHOUSE` is required for TYPE glue".to_string())?;
 
     let mut props: HashMap<String, String> = HashMap::new();
-    props.insert(GLUE_CATALOG_PROP_WAREHOUSE.to_string(), warehouse.to_string());
+    props.insert(
+        GLUE_CATALOG_PROP_WAREHOUSE.to_string(),
+        warehouse.to_string(),
+    );
 
     // The Glue builder's `URI` prop carries the AWS endpoint. The
     // ATTACH `<location>` is the catalog ARN; we forward it as the
@@ -459,8 +468,8 @@ async fn build_s3tables(
 
     use iceberg::CatalogBuilder;
     use iceberg_catalog_s3tables::{
-        S3TABLES_CATALOG_PROP_ENDPOINT_URL, S3TABLES_CATALOG_PROP_TABLE_BUCKET_ARN,
-        S3TablesCatalogBuilder,
+        S3TablesCatalogBuilder, S3TABLES_CATALOG_PROP_ENDPOINT_URL,
+        S3TABLES_CATALOG_PROP_TABLE_BUCKET_ARN,
     };
 
     // String literals matching the s3tables crate's private utils
@@ -552,7 +561,7 @@ async fn build_hms(
 
     use iceberg::CatalogBuilder;
     use iceberg_catalog_hms::{
-        HMS_CATALOG_PROP_URI, HMS_CATALOG_PROP_WAREHOUSE, HmsCatalogBuilder,
+        HmsCatalogBuilder, HMS_CATALOG_PROP_URI, HMS_CATALOG_PROP_WAREHOUSE,
     };
 
     let trimmed = location.trim();
@@ -666,7 +675,7 @@ async fn build_jdbc(
 
     use iceberg::CatalogBuilder;
     use iceberg_catalog_sql::{
-        SQL_CATALOG_PROP_URI, SQL_CATALOG_PROP_WAREHOUSE, SqlCatalogBuilder,
+        SqlCatalogBuilder, SQL_CATALOG_PROP_URI, SQL_CATALOG_PROP_WAREHOUSE,
     };
 
     let trimmed = location.trim();
@@ -680,23 +689,23 @@ async fn build_jdbc(
         .and_then(OptionValue::as_str)
         .ok_or_else(|| "option `WAREHOUSE` is required for TYPE jdbc".to_string())?;
 
-    let final_url = if let Some(secret_ref) = options.get("SECRET").and_then(OptionValue::as_secret_ref)
-    {
-        let secret = secrets.get(secret_ref).map_err(|e| e.to_string())?;
-        match &secret {
-            Secret::Basic { username, password } => {
-                splice_basic_into_url(url_form, username, password)?
+    let final_url =
+        if let Some(secret_ref) = options.get("SECRET").and_then(OptionValue::as_secret_ref) {
+            let secret = secrets.get(secret_ref).map_err(|e| e.to_string())?;
+            match &secret {
+                Secret::Basic { username, password } => {
+                    splice_basic_into_url(url_form, username, password)?
+                }
+                other => {
+                    return Err(format!(
+                        "secret '{secret_ref}' is type {} but TYPE jdbc expects basic",
+                        other.type_name()
+                    ));
+                }
             }
-            other => {
-                return Err(format!(
-                    "secret '{secret_ref}' is type {} but TYPE jdbc expects basic",
-                    other.type_name()
-                ));
-            }
-        }
-    } else {
-        url_form.to_string()
-    };
+        } else {
+            url_form.to_string()
+        };
 
     let mut props: HashMap<String, String> = HashMap::new();
     props.insert(SQL_CATALOG_PROP_URI.to_string(), final_url);
@@ -750,7 +759,9 @@ fn splice_basic_into_url(url: &str, username: &str, password: &str) -> Result<St
 
     let user_enc = url_encode_userinfo(username);
     let pass_enc = url_encode_userinfo(password);
-    Ok(format!("{scheme_with_sep}{user_enc}:{pass_enc}@{host_part}"))
+    Ok(format!(
+        "{scheme_with_sep}{user_enc}:{pass_enc}@{host_part}"
+    ))
 }
 
 /// Percent-encode everything outside the unreserved set for the userinfo part
@@ -826,7 +837,10 @@ mod s3_option_tests {
 /// `splice_basic_into_url` writes credentials into a connection string, so a
 /// mistake here either leaks them into the wrong field or silently corrupts the
 /// URL. These cover the shapes a real `ATTACH ... TYPE jdbc` can hand it.
-#[cfg(all(test, any(feature = "sql", feature = "sql-postgres", feature = "sql-sqlite")))]
+#[cfg(all(
+    test,
+    any(feature = "sql", feature = "sql-postgres", feature = "sql-sqlite")
+))]
 mod jdbc_url_tests {
     use super::*;
 

@@ -47,9 +47,7 @@ impl WorkerHotConfig {
     ) -> Self {
         Self {
             memory_limit_bytes: Arc::new(AtomicUsize::new(memory_limit_bytes.max(1))),
-            shuffle_budget_bytes: Arc::new(AtomicUsize::new(
-                shuffle_budget_bytes.max(64 * 1024),
-            )),
+            shuffle_budget_bytes: Arc::new(AtomicUsize::new(shuffle_budget_bytes.max(64 * 1024))),
             configured_need_bytes: Arc::new(AtomicU64::new(configured_need_bytes)),
             scan_timeout_secs: Arc::new(AtomicU64::new(scan_timeout_secs)),
         }
@@ -203,7 +201,10 @@ pub fn apply_memory_hot_reload(
     let prev_gov = handles.governor.pool_bytes();
     let mut applied_gov = prev_gov;
     let mut governor_shrink_ignored = false;
-    match handles.governor.try_resize_pool(budgets.governor_pool_bytes) {
+    match handles
+        .governor
+        .try_resize_pool(budgets.governor_pool_bytes)
+    {
         Ok(()) => {
             applied_gov = handles.governor.pool_bytes();
         }
@@ -426,8 +427,12 @@ mod tests {
     fn test_handles(
         pool_bytes: usize,
         gov_bytes: usize,
-    ) -> (HotReloadHandles, Arc<ResizableFairSpillPool>, Arc<MemoryGovernor>, Arc<WorkerHotConfig>)
-    {
+    ) -> (
+        HotReloadHandles,
+        Arc<ResizableFairSpillPool>,
+        Arc<MemoryGovernor>,
+        Arc<WorkerHotConfig>,
+    ) {
         let pool = Arc::new(ResizableFairSpillPool::new(pool_bytes));
         let governor = Arc::new(MemoryGovernor::new(gov_bytes));
         let hot = Arc::new(WorkerHotConfig::new(
@@ -510,8 +515,7 @@ prometheus_port = {prometheus_port}
 
     #[test]
     fn apply_memory_hot_reload_resizes_pool_and_governor() {
-        let (handles, pool, governor, hot) =
-            test_handles(200 * 1024 * 1024, 150 * 1024 * 1024);
+        let (handles, pool, governor, hot) = test_handles(200 * 1024 * 1024, 150 * 1024 * 1024);
 
         let budgets = ResolvedMemoryBudgets {
             memory_limit_bytes: 400 * 1024 * 1024,
@@ -546,8 +550,7 @@ prometheus_port = {prometheus_port}
     fn apply_ignores_pool_shrink_when_reserved_exceeds_new_window() {
         use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool};
 
-        let (handles, pool, _governor, hot) =
-            test_handles(64 * 1024 * 1024, 32 * 1024 * 1024);
+        let (handles, pool, _governor, hot) = test_handles(64 * 1024 * 1024, 32 * 1024 * 1024);
         let dyn_pool: Arc<dyn MemoryPool> = pool.clone();
         let consumer = MemoryConsumer::new("busy").with_can_spill(true);
         let r = consumer.register(&dyn_pool);

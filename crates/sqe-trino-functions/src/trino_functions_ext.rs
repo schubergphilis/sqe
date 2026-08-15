@@ -7,7 +7,9 @@ use std::sync::{Arc, LazyLock};
 
 use serde_json;
 
-use arrow::array::{Array, ArrayRef, BooleanArray, Date32Array, Float64Array, Int64Array, StringArray};
+use arrow::array::{
+    Array, ArrayRef, BooleanArray, Date32Array, Float64Array, Int64Array, StringArray,
+};
 use arrow::datatypes::DataType;
 use chrono::{Datelike, NaiveDate, NaiveDateTime};
 use datafusion::common::Result as DFResult;
@@ -116,16 +118,18 @@ impl ScalarUDFImpl for Millisecond {
         match &args.args[0] {
             ColumnarValue::Array(arr) => {
                 if let Some(ts_arr) = arr.as_any().downcast_ref::<TimestampMicrosecondArray>() {
-                    let result: Int64Array =
-                        ts_arr.iter().map(|opt| opt.map(|us| (us / 1000) % 1000)).collect();
+                    let result: Int64Array = ts_arr
+                        .iter()
+                        .map(|opt| opt.map(|us| (us / 1000) % 1000))
+                        .collect();
                     Ok(ColumnarValue::Array(Arc::new(result) as ArrayRef))
                 } else {
                     Ok(ColumnarValue::Scalar(ScalarValue::Int64(None)))
                 }
             }
-            ColumnarValue::Scalar(ScalarValue::TimestampMicrosecond(Some(us), _)) => {
-                Ok(ColumnarValue::Scalar(ScalarValue::Int64(Some((us / 1000) % 1000))))
-            }
+            ColumnarValue::Scalar(ScalarValue::TimestampMicrosecond(Some(us), _)) => Ok(
+                ColumnarValue::Scalar(ScalarValue::Int64(Some((us / 1000) % 1000))),
+            ),
             _ => Ok(ColumnarValue::Scalar(ScalarValue::Int64(None))),
         }
     }
@@ -140,9 +144,8 @@ impl ScalarUDFImpl for Infinity {
         "infinity"
     }
     fn signature(&self) -> &Signature {
-        static SIG: LazyLock<Signature> = LazyLock::new(|| {
-            Signature::new(TypeSignature::Exact(vec![]), Volatility::Immutable)
-        });
+        static SIG: LazyLock<Signature> =
+            LazyLock::new(|| Signature::new(TypeSignature::Exact(vec![]), Volatility::Immutable));
         &SIG
     }
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
@@ -164,9 +167,8 @@ impl ScalarUDFImpl for Nan {
         "nan"
     }
     fn signature(&self) -> &Signature {
-        static SIG: LazyLock<Signature> = LazyLock::new(|| {
-            Signature::new(TypeSignature::Exact(vec![]), Volatility::Immutable)
-        });
+        static SIG: LazyLock<Signature> =
+            LazyLock::new(|| Signature::new(TypeSignature::Exact(vec![]), Volatility::Immutable));
         &SIG
     }
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
@@ -405,10 +407,7 @@ impl ScalarUDFImpl for FromBase {
     }
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         match (&args.args[0], &args.args[1]) {
-            (
-                ColumnarValue::Scalar(ScalarValue::Utf8(Some(s))),
-                ColumnarValue::Scalar(v),
-            ) => {
+            (ColumnarValue::Scalar(ScalarValue::Utf8(Some(s))), ColumnarValue::Scalar(v)) => {
                 let radix_raw = match v {
                     ScalarValue::Int64(Some(r)) => *r,
                     ScalarValue::Int32(Some(r)) => *r as i64,
@@ -441,10 +440,7 @@ impl ScalarUDFImpl for ToBase {
     }
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         match (&args.args[0], &args.args[1]) {
-            (
-                ColumnarValue::Scalar(ScalarValue::Int64(Some(n))),
-                ColumnarValue::Scalar(v),
-            ) => {
+            (ColumnarValue::Scalar(ScalarValue::Int64(Some(n))), ColumnarValue::Scalar(v)) => {
                 let radix_raw = match v {
                     ScalarValue::Int64(Some(r)) => *r,
                     ScalarValue::Int32(Some(r)) => *r as i64,
@@ -621,9 +617,8 @@ impl ScalarUDFImpl for CurrentTimezone {
         "current_timezone"
     }
     fn signature(&self) -> &Signature {
-        static SIG: LazyLock<Signature> = LazyLock::new(|| {
-            Signature::new(TypeSignature::Exact(vec![]), Volatility::Stable)
-        });
+        static SIG: LazyLock<Signature> =
+            LazyLock::new(|| Signature::new(TypeSignature::Exact(vec![]), Volatility::Stable));
         &SIG
     }
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
@@ -659,10 +654,8 @@ impl ScalarUDFImpl for HumanReadableSeconds {
             ColumnarValue::Array(arr) => {
                 // For arrays: process element-wise
                 if let Some(f_arr) = arr.as_any().downcast_ref::<Float64Array>() {
-                    let result: StringArray = f_arr
-                        .iter()
-                        .map(|opt| opt.map(format_seconds))
-                        .collect();
+                    let result: StringArray =
+                        f_arr.iter().map(|opt| opt.map(format_seconds)).collect();
                     return Ok(ColumnarValue::Array(Arc::new(result) as ArrayRef));
                 } else if let Some(i_arr) = arr.as_any().downcast_ref::<Int64Array>() {
                     let result: StringArray = i_arr
@@ -687,7 +680,10 @@ fn format_seconds(total: f64) -> String {
     let minutes = ((total % 3600.0) / 60.0) as u64;
     let seconds = total % 60.0;
     if hours > 0 {
-        format!("{} hours, {} minutes, {:.2} seconds", hours, minutes, seconds)
+        format!(
+            "{} hours, {} minutes, {:.2} seconds",
+            hours, minutes, seconds
+        )
     } else if minutes > 0 {
         format!("{} minutes, {:.2} seconds", minutes, seconds)
     } else {
@@ -855,8 +851,7 @@ impl ScalarUDFImpl for RegexpExtractAll {
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         let strings = column_strings(&args.args, 0, "regexp_extract_all", args.number_rows)?;
         let const_pattern = const_str_scalar(&args.args[1]);
-        let pattern_arr =
-            column_strings(&args.args, 1, "regexp_extract_all", args.number_rows)?;
+        let pattern_arr = column_strings(&args.args, 1, "regexp_extract_all", args.number_rows)?;
         build_regex_list_array(
             "regexp_extract_all",
             &strings,
@@ -927,7 +922,10 @@ fn column_strings(
         ColumnarValue::Array(arr) => {
             if let Some(s) = arr.as_any().downcast_ref::<StringArray>() {
                 Ok(s.clone())
-            } else if let Some(s) = arr.as_any().downcast_ref::<arrow::array::LargeStringArray>() {
+            } else if let Some(s) = arr
+                .as_any()
+                .downcast_ref::<arrow::array::LargeStringArray>()
+            {
                 let conv = arrow::compute::cast(s, &DataType::Utf8).map_err(|e| {
                     DataFusionError::Execution(format!(
                         "{fn_name}: cannot convert LargeUtf8 to Utf8: {e}"
@@ -1232,8 +1230,8 @@ fn joda_to_chrono(joda: &str) -> String {
         ("H", "%H"),
         ("hh", "%I"), // 12-hour
         ("h", "%I"),
-        ("mm", "%M"),   // minute
-        ("ss", "%S"),   // second
+        ("mm", "%M"),    // minute
+        ("ss", "%S"),    // second
         ("SSS", "%.3f"), // milliseconds
         ("SS", "%.2f"),
         ("EEEE", "%A"), // full day name (before EEE)
@@ -1275,13 +1273,12 @@ impl ScalarUDFImpl for WordStem {
     }
     fn signature(&self) -> &Signature {
         // Either 1 arg (string) or 2 args (string, lang).
-        static SIG: LazyLock<Signature> = LazyLock::new(|| Signature::one_of(
-            vec![
-                TypeSignature::Any(1),
-                TypeSignature::Any(2),
-            ],
-            Volatility::Immutable,
-        ));
+        static SIG: LazyLock<Signature> = LazyLock::new(|| {
+            Signature::one_of(
+                vec![TypeSignature::Any(1), TypeSignature::Any(2)],
+                Volatility::Immutable,
+            )
+        });
         &SIG
     }
     fn aliases(&self) -> &[String] {
@@ -1360,7 +1357,9 @@ impl ScalarUDFImpl for Arbitrary {
                         return Ok(ColumnarValue::Scalar(ScalarValue::try_from_array(arr, i)?));
                     }
                 }
-                Ok(ColumnarValue::Scalar(ScalarValue::try_from(arr.data_type())?))
+                Ok(ColumnarValue::Scalar(ScalarValue::try_from(
+                    arr.data_type(),
+                )?))
             }
             other => Ok(other.clone()),
         }
@@ -1607,14 +1606,12 @@ fn json_array_get_impl(json: &str, idx: i64) -> Option<String> {
 struct Try;
 
 impl ScalarUDFImpl for Try {
-
     fn name(&self) -> &str {
         "try"
     }
 
     fn signature(&self) -> &Signature {
-        static SIG: LazyLock<Signature> =
-            LazyLock::new(|| Signature::any(1, Volatility::Volatile));
+        static SIG: LazyLock<Signature> = LazyLock::new(|| Signature::any(1, Volatility::Volatile));
         &SIG
     }
 
@@ -1642,15 +1639,13 @@ impl ScalarUDFImpl for Try {
 struct Format;
 
 impl ScalarUDFImpl for Format {
-
     fn name(&self) -> &str {
         "format"
     }
 
     fn signature(&self) -> &Signature {
-        static SIG: LazyLock<Signature> = LazyLock::new(|| {
-            Signature::new(TypeSignature::VariadicAny, Volatility::Immutable)
-        });
+        static SIG: LazyLock<Signature> =
+            LazyLock::new(|| Signature::new(TypeSignature::VariadicAny, Volatility::Immutable));
         &SIG
     }
 
@@ -1829,7 +1824,6 @@ fn apply_format(fmt: &str, args: &[String]) -> DFResult<String> {
 struct ToJson;
 
 impl ScalarUDFImpl for ToJson {
-
     fn name(&self) -> &str {
         "to_json"
     }

@@ -101,7 +101,11 @@ async fn count_rows(
     table: &str,
 ) -> i64 {
     let b = exec(handler, session, &format!("SELECT COUNT(*) FROM {table}")).await;
-    b[0].column(0).as_any().downcast_ref::<Int64Array>().expect("Int64Array").value(0)
+    b[0].column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("Int64Array")
+        .value(0)
 }
 
 async fn max_file_size_bytes(
@@ -116,7 +120,11 @@ async fn max_file_size_bytes(
         &format!("SELECT MAX(file_size_in_bytes) FROM table_files('{ns}', '{name}')"),
     )
     .await;
-    b[0].column(0).as_any().downcast_ref::<Int64Array>().expect("Int64Array").value(0)
+    b[0].column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("Int64Array")
+        .value(0)
 }
 
 async fn seed_synthetic_fixture(
@@ -261,7 +269,14 @@ async fn distributed_rewrite_wall_clock_ratio() {
     const TARGET_RATIO: f64 = 2.5;
 
     eprintln!("\n=== distributed rewrite wall-clock benchmark (informational) ===");
-    eprintln!("mode                : {}", if synthetic { "synthetic (wiring smoke)" } else { "pre-loaded tables" });
+    eprintln!(
+        "mode                : {}",
+        if synthetic {
+            "synthetic (wiring smoke)"
+        } else {
+            "pre-loaded tables"
+        }
+    );
     eprintln!("workers registered  : {}", workers.len());
     eprintln!("dist table          : {dist_table}");
     eprintln!("local table         : {local_table}");
@@ -287,7 +302,17 @@ async fn distributed_rewrite_wall_clock_ratio() {
     // is the caller's, expensive to reload, and left alone -- the local run
     // already consolidated it in place, same as any other rewrite.
     if synthetic {
-        let _ = exec(&handler, &session, &format!("DROP TABLE IF EXISTS {dist_table}")).await;
-        let _ = exec(&handler, &session, &format!("DROP TABLE IF EXISTS {local_table}")).await;
+        let _ = exec(
+            &handler,
+            &session,
+            &format!("DROP TABLE IF EXISTS {dist_table}"),
+        )
+        .await;
+        let _ = exec(
+            &handler,
+            &session,
+            &format!("DROP TABLE IF EXISTS {local_table}"),
+        )
+        .await;
     }
 }

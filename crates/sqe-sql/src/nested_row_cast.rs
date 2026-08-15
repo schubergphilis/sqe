@@ -42,9 +42,7 @@ pub fn rewrite_nested_row_cast(sql: &str) -> String {
         return sql.to_string();
     }
     match rewrite_all_row_casts(sql) {
-        Some(candidate)
-            if candidate != sql && Parser::parse_sql(&dialect, &candidate).is_ok() =>
-        {
+        Some(candidate) if candidate != sql && Parser::parse_sql(&dialect, &candidate).is_ok() => {
             candidate
         }
         _ => sql.to_string(),
@@ -366,27 +364,31 @@ mod tests {
 
     #[test]
     fn rewrites_nested_row_cast() {
-        let out = rewrite_nested_row_cast(
-            "SELECT CAST(row(1, row(10)) AS row(a int, b row(x int)))",
-        );
+        let out =
+            rewrite_nested_row_cast("SELECT CAST(row(1, row(10)) AS row(a int, b row(x int)))");
         assert!(parses(&out), "did not parse: {out}");
         assert!(out.contains("named_struct("), "no named_struct: {out}");
         // Inner nesting must be present.
         let count = out.matches("named_struct(").count();
         assert_eq!(count, 2, "expected 2 named_struct calls: {out}");
-        assert!(out.contains("'a'") && out.contains("'b'") && out.contains("'x'"), "{out}");
+        assert!(
+            out.contains("'a'") && out.contains("'b'") && out.contains("'x'"),
+            "{out}"
+        );
     }
 
     #[test]
     fn rewrites_parameterized_field_type() {
         // decimal(10,2) is a parameterized (nested-paren) field type that the
         // single-level path cannot parse; the rewrite lifts it out.
-        let out = rewrite_nested_row_cast(
-            "SELECT CAST(row(1, 2.5) AS row(a int, b decimal(10,2)))",
-        );
+        let out =
+            rewrite_nested_row_cast("SELECT CAST(row(1, 2.5) AS row(a int, b decimal(10,2)))");
         assert!(parses(&out), "did not parse: {out}");
         assert!(out.contains("named_struct("), "{out}");
-        assert!(out.contains("decimal(10,2)") || out.contains("decimal(10, 2)"), "{out}");
+        assert!(
+            out.contains("decimal(10,2)") || out.contains("decimal(10, 2)"),
+            "{out}"
+        );
     }
 
     #[test]
@@ -399,9 +401,8 @@ mod tests {
 
     #[test]
     fn deeply_nested_row_cast() {
-        let out = rewrite_nested_row_cast(
-            "SELECT CAST(row(row(row(1))) AS row(a row(b row(c int))))",
-        );
+        let out =
+            rewrite_nested_row_cast("SELECT CAST(row(row(row(1))) AS row(a row(b row(c int))))");
         assert!(parses(&out), "did not parse: {out}");
         assert_eq!(out.matches("named_struct(").count(), 3, "{out}");
     }

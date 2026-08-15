@@ -50,11 +50,7 @@ impl GrantBackend for RecordingBackend {
         Ok(vec![])
     }
 
-    async fn show_effective(
-        &self,
-        _token: &str,
-        _user: &str,
-    ) -> sqe_core::Result<Vec<GrantEntry>> {
+    async fn show_effective(&self, _token: &str, _user: &str) -> sqe_core::Result<Vec<GrantEntry>> {
         self.show_effective_called.store(true, Ordering::SeqCst);
         Ok(vec![])
     }
@@ -65,7 +61,10 @@ impl GrantBackend for RecordingBackend {
         _check: &AccessCheck,
     ) -> sqe_core::Result<AccessCheckResult> {
         self.check_access_called.store(true, Ordering::SeqCst);
-        Ok(AccessCheckResult { allowed: true, reason: None })
+        Ok(AccessCheckResult {
+            allowed: true,
+            reason: None,
+        })
     }
 
     fn backend_name(&self) -> &str {
@@ -158,7 +157,11 @@ async fn grant_flushes_policy_cache_after_mutation() {
     let session = session_for("admin", vec!["service_admin"]);
 
     handler
-        .execute(&session, "GRANT SELECT ON sales.orders TO ROLE analyst", None)
+        .execute(
+            &session,
+            "GRANT SELECT ON sales.orders TO ROLE analyst",
+            None,
+        )
         .await
         .expect("admin GRANT should succeed");
 
@@ -181,7 +184,11 @@ async fn revoke_flushes_policy_cache_after_mutation() {
     let session = session_for("admin", vec!["catalog_admin"]);
 
     handler
-        .execute(&session, "REVOKE SELECT ON sales.orders FROM ROLE analyst", None)
+        .execute(
+            &session,
+            "REVOKE SELECT ON sales.orders FROM ROLE analyst",
+            None,
+        )
         .await
         .expect("admin REVOKE should succeed");
 
@@ -207,7 +214,11 @@ async fn rejected_grant_does_not_flush_policy_cache() {
     let session = session_for("alice", vec!["analyst"]);
 
     let err = handler
-        .execute(&session, "GRANT SELECT ON sales.orders TO ROLE analyst", None)
+        .execute(
+            &session,
+            "GRANT SELECT ON sales.orders TO ROLE analyst",
+            None,
+        )
         .await
         .expect_err("non-admin must not be able to GRANT");
     assert!(err.to_string().contains("403"), "expected 403: {err}");
@@ -290,7 +301,11 @@ async fn check_access_self_is_allowed() {
     let session = session_for("alice", vec!["analyst"]);
 
     handler
-        .execute(&session, "CHECK ACCESS SELECT ON cat.ns.tbl FOR USER \"alice\"", None)
+        .execute(
+            &session,
+            "CHECK ACCESS SELECT ON cat.ns.tbl FOR USER \"alice\"",
+            None,
+        )
         .await
         .expect("self access check must be allowed");
 
@@ -308,7 +323,11 @@ async fn check_access_other_principal_requires_admin() {
     let session = session_for("alice", vec!["analyst"]);
 
     let err = handler
-        .execute(&session, "CHECK ACCESS SELECT ON cat.ns.tbl FOR USER \"bob\"", None)
+        .execute(
+            &session,
+            "CHECK ACCESS SELECT ON cat.ns.tbl FOR USER \"bob\"",
+            None,
+        )
         .await
         .expect_err("non-admin must not check another principal's access");
     assert!(err.to_string().contains("403"), "expected 403: {err}");
@@ -333,7 +352,9 @@ async fn show_effective_policy_other_principal_requires_admin() {
     let err = handler
         .execute(
             &session,
-            "SHOW EFFECTIVE POLICY FOR USER \"bob\" ON cat.ns.orders", None)
+            "SHOW EFFECTIVE POLICY FOR USER \"bob\" ON cat.ns.orders",
+            None,
+        )
         .await
         .expect_err("non-admin must not introspect another principal's policy");
     assert!(err.to_string().contains("403"), "expected 403: {err}");
@@ -347,7 +368,11 @@ async fn check_access_admin_can_check_anyone() {
     let session = session_for("root", vec!["catalog_admin"]);
 
     handler
-        .execute(&session, "CHECK ACCESS SELECT ON cat.ns.tbl FOR USER \"bob\"", None)
+        .execute(
+            &session,
+            "CHECK ACCESS SELECT ON cat.ns.tbl FOR USER \"bob\"",
+            None,
+        )
         .await
         .expect("admin must be able to check any principal's access");
 

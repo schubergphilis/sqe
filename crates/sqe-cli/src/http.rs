@@ -12,8 +12,8 @@ pub struct HttpClient {
 
 impl HttpClient {
     pub fn new(base_url: &str, username: &str, password: &str, accept_invalid_certs: bool) -> Self {
-        let credentials = base64::engine::general_purpose::STANDARD
-            .encode(format!("{username}:{password}"));
+        let credentials =
+            base64::engine::general_purpose::STANDARD.encode(format!("{username}:{password}"));
         let auth_header = format!("Basic {credentials}");
 
         let client = reqwest::Client::builder()

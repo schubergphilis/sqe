@@ -40,8 +40,7 @@ pub const ZERO_PRUNING_TARGET_DECODED_BYTES: usize = 20 * WORKER_MEMORY_LIMIT_BY
 pub const SHUFFLE_MEMORY_BUDGET_BYTES: usize = 4 * 1024 * 1024; // 4 MiB
 
 /// Baseline artifact path relative to the workspace (sqlengine) root.
-pub const BASELINE_RELATIVE_PATH: &str =
-    "benchmarks/results/bounded-memory-phase0-baseline.json";
+pub const BASELINE_RELATIVE_PATH: &str = "benchmarks/results/bounded-memory-phase0-baseline.json";
 
 /// One Phase 0 reproducer measurement.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -91,12 +90,12 @@ pub fn local_scan_task(object_keys: Vec<String>, file_sizes: Vec<u64>) -> ScanTa
         .map(|k| format!("s3://test-bucket/{k}"))
         .collect();
     ScanTask {
-            version: 1,
-            morsel_id: None,
-            row_group_start: None,
-            row_group_end: None,
-            start_byte: None,
-            end_byte: None,
+        version: 1,
+        morsel_id: None,
+        row_group_start: None,
+        row_group_end: None,
+        start_byte: None,
+        end_byte: None,
         fragment_id: "phase0-frag".to_string(),
         data_file_paths,
         file_sizes_bytes: file_sizes,
@@ -175,8 +174,7 @@ pub fn generate_large_parquet(
     while decoded_bytes < target_decoded_bytes {
         let ids: Vec<i64> = (next_id..next_id + ROWS_PER_BATCH as i64).collect();
         next_id += ROWS_PER_BATCH as i64;
-        let payloads: Vec<&str> = std::iter::repeat_n(payload.as_str(), ROWS_PER_BATCH)
-            .collect();
+        let payloads: Vec<&str> = std::iter::repeat_n(payload.as_str(), ROWS_PER_BATCH).collect();
 
         let batch = RecordBatch::try_new(
             schema.clone(),
@@ -284,8 +282,7 @@ pub fn generate_wide_parquet(
     for _ in 0..num_batches {
         let ids: Vec<i64> = (next_id..next_id + rows_per_batch as i64).collect();
         next_id += rows_per_batch as i64;
-        let payloads: Vec<&str> = std::iter::repeat_n(payload.as_str(), rows_per_batch)
-            .collect();
+        let payloads: Vec<&str> = std::iter::repeat_n(payload.as_str(), rows_per_batch).collect();
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![

@@ -1,7 +1,9 @@
 use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
-use arrow_array::builder::{BooleanBuilder, Int64Builder, StringBuilder, TimestampMillisecondBuilder};
+use arrow_array::builder::{
+    BooleanBuilder, Int64Builder, StringBuilder, TimestampMillisecondBuilder,
+};
 use arrow_array::{ArrayRef, RecordBatch};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -135,13 +137,8 @@ impl std::fmt::Debug for RuntimeSchemaProvider {
 
 #[async_trait]
 impl SchemaProvider for RuntimeSchemaProvider {
-
     fn table_names(&self) -> Vec<String> {
-        vec![
-            "queries".into(),
-            "nodes".into(),
-            "tasks".into(),
-        ]
+        vec!["queries".into(), "nodes".into(), "tasks".into()]
     }
 
     fn table_exist(&self, name: &str) -> bool {
@@ -596,7 +593,11 @@ mod tests {
             let field = schema.field_with_name(name).unwrap();
             match field.data_type() {
                 DataType::Timestamp(TimeUnit::Millisecond, Some(tz)) => {
-                    assert_eq!(tz.as_ref(), "UTC", "timestamp column {name} must use UTC timezone");
+                    assert_eq!(
+                        tz.as_ref(),
+                        "UTC",
+                        "timestamp column {name} must use UTC timezone"
+                    );
                 }
                 other => panic!("expected Timestamp(Millisecond, UTC) for {name}, got {other:?}"),
             }
@@ -621,7 +622,13 @@ mod tests {
     fn test_nodes_table_column_names() {
         let table = build_nodes_table("wh", "http://localhost:8080", &[]).unwrap();
         let schema = table.schema();
-        let expected = ["node_id", "http_uri", "node_version", "coordinator", "state"];
+        let expected = [
+            "node_id",
+            "http_uri",
+            "node_version",
+            "coordinator",
+            "state",
+        ];
         for (i, name) in expected.iter().enumerate() {
             assert_eq!(
                 schema.field(i).name(),
@@ -669,7 +676,13 @@ mod tests {
         let table = build_tasks_table(&sample_records(), "my-wh").unwrap();
         let schema = table.schema();
         let expected = [
-            "query_id", "task_id", "node_id", "state", "elapsed_ms", "input_rows", "output_rows",
+            "query_id",
+            "task_id",
+            "node_id",
+            "state",
+            "elapsed_ms",
+            "input_rows",
+            "output_rows",
         ];
         for (i, name) in expected.iter().enumerate() {
             assert_eq!(
@@ -817,10 +830,7 @@ mod tests {
         );
         for name in &["queries", "nodes", "tasks"] {
             let result = provider.table(name).await;
-            assert!(
-                result.is_ok(),
-                "table({name}) should succeed"
-            );
+            assert!(result.is_ok(), "table({name}) should succeed");
             assert!(
                 result.unwrap().is_some(),
                 "table({name}) should return Some"

@@ -187,13 +187,21 @@ impl OtlpLogShipper {
             Ok(f) => f,
             Err(e) => {
                 tracing::warn!(err = %e, "audit shipper: cannot open spool file");
-                return ShipOutcome { shipped: 0, advanced_to: 0, failed: true };
+                return ShipOutcome {
+                    shipped: 0,
+                    advanced_to: 0,
+                    failed: true,
+                };
             }
         };
         let mut reader = std::io::BufReader::new(file);
         if let Err(e) = reader.seek(SeekFrom::Start(self.committed_offset)) {
             tracing::warn!(err = %e, "audit shipper: seek failed");
-            return ShipOutcome { shipped: 0, advanced_to: 0, failed: true };
+            return ShipOutcome {
+                shipped: 0,
+                advanced_to: 0,
+                failed: true,
+            };
         }
 
         // Read complete lines (stop at a line without a trailing newline).
@@ -249,7 +257,11 @@ impl OtlpLogShipper {
         }
 
         if records.is_empty() {
-            return ShipOutcome { shipped: 0, advanced_to: 0, failed: false };
+            return ShipOutcome {
+                shipped: 0,
+                advanced_to: 0,
+                failed: false,
+            };
         }
 
         let max_seq = records.iter().map(|r| r.seq).max().unwrap_or(0);
@@ -261,11 +273,19 @@ impl OtlpLogShipper {
                     tracing::warn!(err = %e, "audit shipper: failed to advance cursor");
                 }
                 self.committed_offset = last_record_offset;
-                ShipOutcome { shipped: count, advanced_to: max_seq, failed: false }
+                ShipOutcome {
+                    shipped: count,
+                    advanced_to: max_seq,
+                    failed: false,
+                }
             }
             Err(e) => {
                 tracing::warn!(err = %e, "audit shipper: export_batch failed; cursor not advanced");
-                ShipOutcome { shipped: 0, advanced_to: 0, failed: true }
+                ShipOutcome {
+                    shipped: 0,
+                    advanced_to: 0,
+                    failed: true,
+                }
             }
         }
     }
@@ -295,9 +315,7 @@ impl OtlpLogShipper {
                     backoff_ms,
                     "audit shipper: export failed; backing off before retry"
                 );
-                let sleep_fut = tokio::time::sleep(
-                    std::time::Duration::from_millis(backoff_ms),
-                );
+                let sleep_fut = tokio::time::sleep(std::time::Duration::from_millis(backoff_ms));
                 tokio::select! {
                     _ = sleep_fut => {}
                     _ = shutdown.changed() => {
@@ -443,7 +461,7 @@ mod tests {
             batch_max,
             u64::MAX, // max_spool_bytes: large so no warning in tests
             start_at,
-            500,      // flush_interval_ms
+            500, // flush_interval_ms
         )
     }
 
@@ -470,7 +488,10 @@ mod tests {
 
         // Pass 1: exporter is down; cursor must stay at 0.
         let o1 = shipper.ship_once().await;
-        assert!(o1.failed, "ship_once must report failed when exporter is down");
+        assert!(
+            o1.failed,
+            "ship_once must report failed when exporter is down"
+        );
         // Reload the cursor from disk; it must still be 0 (never written).
         let disk_cursor = SeqCursor::load(cursor_path.clone(), true);
         assert_eq!(disk_cursor.last(), 0, "cursor frozen on outage");
@@ -489,7 +510,11 @@ mod tests {
         assert_eq!(o2.advanced_to, 5);
 
         let seqs = stub.shipped.lock().unwrap().clone();
-        assert_eq!(seqs, vec![1, 2, 3, 4, 5], "backlog shipped in order, no loss");
+        assert_eq!(
+            seqs,
+            vec![1, 2, 3, 4, 5],
+            "backlog shipped in order, no loss"
+        );
 
         // Cursor on disk must now be 5.
         let disk_cursor2 = SeqCursor::load(cursor_path, true);
@@ -541,7 +566,10 @@ mod tests {
 
         let o2 = shipper2.ship_once().await;
         assert!(!o2.failed);
-        assert_eq!(o2.shipped, 2, "only records 4 and 5 should be shipped on resume");
+        assert_eq!(
+            o2.shipped, 2,
+            "only records 4 and 5 should be shipped on resume"
+        );
 
         let seqs = stub2.shipped.lock().unwrap().clone();
         assert_eq!(seqs, vec![4, 5], "no re-shipment of already-acked records");
@@ -576,7 +604,10 @@ mod tests {
         // First pass: cursor was fresh + StartAt::Now, so the backlog is NOT shipped.
         let o1 = shipper.ship_once().await;
         assert!(!o1.failed, "ship_once should not fail");
-        assert_eq!(o1.shipped, 0, "StartAt::Now must not backfill existing records");
+        assert_eq!(
+            o1.shipped, 0,
+            "StartAt::Now must not backfill existing records"
+        );
         assert!(
             stub.shipped.lock().unwrap().is_empty(),
             "no records should be shipped on the first pass with StartAt::Now"
@@ -588,7 +619,10 @@ mod tests {
         // Second pass: only seq 4 (the new record) should be shipped.
         let o2 = shipper.ship_once().await;
         assert!(!o2.failed);
-        assert_eq!(o2.shipped, 1, "only the post-construction record should be shipped");
+        assert_eq!(
+            o2.shipped, 1,
+            "only the post-construction record should be shipped"
+        );
         assert_eq!(o2.advanced_to, 4);
 
         let seqs = stub.shipped.lock().unwrap().clone();
@@ -619,13 +653,7 @@ mod tests {
         }
 
         let stub = StubExporter::new(false);
-        let mut shipper = make_shipper(
-            spool,
-            cursor_path,
-            stub.clone(),
-            10,
-            StartAt::Beginning,
-        );
+        let mut shipper = make_shipper(spool, cursor_path, stub.clone(), 10, StartAt::Beginning);
 
         let o = shipper.ship_once().await;
         assert!(!o.failed);

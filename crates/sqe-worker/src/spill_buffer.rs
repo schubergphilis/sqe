@@ -18,9 +18,7 @@ use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use futures::{Stream, StreamExt};
 use sqe_metrics::WorkerMetricsRegistry;
-use sqe_spill::{
-    Accounted, ByteBudget, SpillManager, SpillScope, SpillScopeGuard, SpillSegment,
-};
+use sqe_spill::{Accounted, ByteBudget, SpillManager, SpillScope, SpillScopeGuard, SpillSegment};
 use tracing::{debug, warn};
 
 /// Soft watermark: spill when in-memory bytes reach this fraction of the
@@ -74,9 +72,9 @@ impl SpillablePartitionBuffer {
         budget: ByteBudget,
         metrics: Option<Arc<WorkerMetricsRegistry>>,
     ) -> Self {
-        let soft_limit =
-            (budget.capacity_bytes().saturating_mul(SOFT_WATERMARK_NUM) / SOFT_WATERMARK_DEN)
-                .max(1);
+        let soft_limit = (budget.capacity_bytes().saturating_mul(SOFT_WATERMARK_NUM)
+            / SOFT_WATERMARK_DEN)
+            .max(1);
         let guard = SpillScopeGuard::new(manager.clone(), scope.clone());
         Self {
             scope,
@@ -127,9 +125,7 @@ impl SpillablePartitionBuffer {
         // downstream of the acquire and never runs. Flushing first frees this
         // buffer's permits so the acquire can always succeed for any batch that
         // individually fits the budget.
-        if !self.memory.is_empty()
-            && self.memory_bytes.saturating_add(logical) >= self.soft_limit
-        {
+        if !self.memory.is_empty() && self.memory_bytes.saturating_add(logical) >= self.soft_limit {
             self.spill_memory().await?;
         }
         let permit = self
@@ -142,8 +138,7 @@ impl SpillablePartitionBuffer {
         self.rows += batch.num_rows() as u64;
         self.batches += 1;
         self.logical_bytes += logical as u64;
-        self.memory
-            .push(Accounted::new(batch, permit, logical));
+        self.memory.push(Accounted::new(batch, permit, logical));
         self.publish_metrics();
 
         // A single batch at or above the watermark spills immediately so the
@@ -532,13 +527,8 @@ mod tests {
     ) {
         let guard = sqe_spill::serial_test_guard();
         let tmp = tempfile::tempdir().unwrap();
-        let store = Arc::new(
-            LocalSegmentStore::open(tmp.path(), 1 << 30, 0, 4, 4).unwrap(),
-        );
-        let manager = Arc::new(SpillManager::new(
-            store,
-            std::time::Duration::from_secs(0),
-        ));
+        let store = Arc::new(LocalSegmentStore::open(tmp.path(), 1 << 30, 0, 4, 4).unwrap());
+        let manager = Arc::new(SpillManager::new(store, std::time::Duration::from_secs(0)));
         let pool = Arc::new(FairSpillPool::new(soft_budget.max(1024 * 1024)));
         let budget = ByteBudget::new("shuffle-part", soft_budget, Some(pool));
         (manager, budget, tmp, guard)
@@ -549,13 +539,7 @@ mod tests {
         // Tiny budget forces spill after a few batches.
         let (manager, budget, _tmp, _serial) = setup(64 * 1024).await;
         let scope = SpillScope::new("q-spill", "stage0", "shuffle", 0, 0);
-        let mut buf = SpillablePartitionBuffer::new(
-            manager,
-            scope,
-            schema(),
-            budget,
-            None,
-        );
+        let mut buf = SpillablePartitionBuffer::new(manager, scope, schema(), budget, None);
 
         // Append enough rows that array memory exceeds soft limit.
         for i in 0..50 {
@@ -585,8 +569,7 @@ mod tests {
         let budget_bytes = 256 * 1024;
         let (manager, budget, _tmp, _serial) = setup(budget_bytes).await;
         let scope = SpillScope::new("q-10x", "s", "sh", 0, 0);
-        let mut buf =
-            SpillablePartitionBuffer::new(manager, scope, schema(), budget, None);
+        let mut buf = SpillablePartitionBuffer::new(manager, scope, schema(), budget, None);
 
         let mut appended = 0usize;
         // Each batch of 4096 i64 ≈ 32 KiB+; 100 batches ≈ 3+ MiB.
@@ -619,8 +602,7 @@ mod tests {
     async fn cancel_releases_memory() {
         let (manager, budget, _tmp, _serial) = setup(1024 * 1024).await;
         let scope = SpillScope::new("q-cancel", "s", "sh", 0, 0);
-        let mut buf =
-            SpillablePartitionBuffer::new(manager, scope, schema(), budget.clone(), None);
+        let mut buf = SpillablePartitionBuffer::new(manager, scope, schema(), budget.clone(), None);
         buf.append(batch(0, 100)).await.unwrap();
         assert!(buf.resident_bytes() > 0);
         buf.cancel();
@@ -708,8 +690,13 @@ mod tests {
         let (manager, budget, _tmp, _serial) = setup(64 * 1024).await;
         // Healthy partition first.
         let scope_ok = SpillScope::new("q-chaos", "s", "sh", 0, 0);
-        let mut ok =
-            SpillablePartitionBuffer::new(manager.clone(), scope_ok, schema(), budget.clone(), None);
+        let mut ok = SpillablePartitionBuffer::new(
+            manager.clone(),
+            scope_ok,
+            schema(),
+            budget.clone(),
+            None,
+        );
         ok.append(batch(0, 10)).await.unwrap();
         let m = ok.finish().await.unwrap();
         assert_eq!(m.rows, 10);
@@ -721,13 +708,8 @@ mod tests {
         // Fresh budget so this partition is independent.
         let pool = Arc::new(FairSpillPool::new(1024 * 1024));
         let budget_bad = ByteBudget::new("bad", 8 * 1024, Some(pool));
-        let mut bad = SpillablePartitionBuffer::new(
-            manager.clone(),
-            scope_bad,
-            schema(),
-            budget_bad,
-            None,
-        );
+        let mut bad =
+            SpillablePartitionBuffer::new(manager.clone(), scope_bad, schema(), budget_bad, None);
         // Force spill by filling past soft watermark with many small batches.
         let mut saw_err = false;
         for i in 0..200 {
@@ -768,8 +750,7 @@ mod tests {
         use sqe_spill::{install_faults, SpillFault};
         let (manager, budget, _tmp, _serial) = setup(16 * 1024).await;
         let scope = SpillScope::new("q-corr", "s", "sh", 0, 0);
-        let mut buf =
-            SpillablePartitionBuffer::new(manager, scope, schema(), budget, None);
+        let mut buf = SpillablePartitionBuffer::new(manager, scope, schema(), budget, None);
         for i in 0..30 {
             buf.append(batch(i * 500, 256)).await.unwrap();
         }
@@ -846,8 +827,7 @@ mod tests {
         let pool = Arc::new(FairSpillPool::new(capacity.max(1024 * 1024)));
         let budget = ByteBudget::new("deadlock-probe", capacity, Some(pool));
         let scope = SpillScope::new("q-dl", "s", "sh", 0, 0);
-        let mut buf =
-            SpillablePartitionBuffer::new(manager, scope, schema(), budget, None);
+        let mut buf = SpillablePartitionBuffer::new(manager, scope, schema(), budget, None);
 
         let run = async {
             for i in 0..4i64 {
@@ -868,13 +848,8 @@ mod tests {
         let _serial = sqe_spill::serial_test_guard();
         let budget_bytes = 128 * 1024;
         let tmp = tempfile::tempdir().unwrap();
-        let store = Arc::new(
-            LocalSegmentStore::open(tmp.path(), 1 << 30, 0, 8, 8).unwrap(),
-        );
-        let manager = Arc::new(SpillManager::new(
-            store,
-            std::time::Duration::from_secs(0),
-        ));
+        let store = Arc::new(LocalSegmentStore::open(tmp.path(), 1 << 30, 0, 8, 8).unwrap());
+        let manager = Arc::new(SpillManager::new(store, std::time::Duration::from_secs(0)));
 
         let mut handles = Vec::new();
         for p in 0..4u32 {
@@ -883,8 +858,7 @@ mod tests {
                 let pool = Arc::new(FairSpillPool::new(budget_bytes.max(1024 * 1024)));
                 let budget = ByteBudget::new(format!("p{p}"), budget_bytes, Some(pool));
                 let scope = SpillScope::new("q-conc", "s", "sh", p, 0);
-                let mut buf =
-                    SpillablePartitionBuffer::new(manager, scope, schema(), budget, None);
+                let mut buf = SpillablePartitionBuffer::new(manager, scope, schema(), budget, None);
                 let mut peak = 0usize;
                 for i in 0..40 {
                     buf.append(batch((p as i64) * 100_000 + i * 1000, 512))
@@ -921,8 +895,7 @@ mod tests {
         let budget_bytes = 256 * 1024;
         let (manager, budget, _tmp, _serial) = setup(budget_bytes).await;
         let scope = SpillScope::new("q-dx", "stage0", "do_exchange", 0, 1);
-        let mut buf =
-            SpillablePartitionBuffer::new(manager, scope, schema(), budget, None);
+        let mut buf = SpillablePartitionBuffer::new(manager, scope, schema(), budget, None);
 
         let mut appended = 0usize;
         let mut peak = 0usize;

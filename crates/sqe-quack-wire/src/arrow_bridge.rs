@@ -77,14 +77,22 @@ pub fn logical_type_to_arrow(t: &LogicalType) -> crate::Result<arrow_schema::Dat
                 Some(crate::data_chunk::ExtraTypeInfo::Decimal { precision, scale }) => {
                     (*precision, *scale)
                 }
-                _ => return Err(crate::WireError::UnsupportedLogicalType(LogicalTypeId::Decimal)),
+                _ => {
+                    return Err(crate::WireError::UnsupportedLogicalType(
+                        LogicalTypeId::Decimal,
+                    ))
+                }
             };
             A::Decimal128(precision, scale as i8)
         }
         LogicalTypeId::List => {
             let child = match &t.extra {
                 Some(crate::data_chunk::ExtraTypeInfo::List { child }) => child,
-                _ => return Err(crate::WireError::UnsupportedLogicalType(LogicalTypeId::List)),
+                _ => {
+                    return Err(crate::WireError::UnsupportedLogicalType(
+                        LogicalTypeId::List,
+                    ))
+                }
             };
             let item_dt = logical_type_to_arrow(child)?;
             A::List(std::sync::Arc::new(arrow_schema::Field::new(
@@ -94,7 +102,11 @@ pub fn logical_type_to_arrow(t: &LogicalType) -> crate::Result<arrow_schema::Dat
         LogicalTypeId::Struct => {
             let fields = match &t.extra {
                 Some(crate::data_chunk::ExtraTypeInfo::Struct { fields }) => fields,
-                _ => return Err(crate::WireError::UnsupportedLogicalType(LogicalTypeId::Struct)),
+                _ => {
+                    return Err(crate::WireError::UnsupportedLogicalType(
+                        LogicalTypeId::Struct,
+                    ))
+                }
             };
             let mut arrow_fields = Vec::with_capacity(fields.len());
             for (name, ty) in fields {
@@ -117,7 +129,11 @@ pub fn logical_type_to_arrow(t: &LogicalType) -> crate::Result<arrow_schema::Dat
         LogicalTypeId::Array => {
             let (child, size) = match &t.extra {
                 Some(crate::data_chunk::ExtraTypeInfo::Array { child, size }) => (child, *size),
-                _ => return Err(crate::WireError::UnsupportedLogicalType(LogicalTypeId::Array)),
+                _ => {
+                    return Err(crate::WireError::UnsupportedLogicalType(
+                        LogicalTypeId::Array,
+                    ))
+                }
             };
             let item_dt = logical_type_to_arrow(child)?;
             A::FixedSizeList(
@@ -130,13 +146,21 @@ pub fn logical_type_to_arrow(t: &LogicalType) -> crate::Result<arrow_schema::Dat
             // the same tier table as the wire payload (1/2/4 bytes).
             let values = match &t.extra {
                 Some(crate::data_chunk::ExtraTypeInfo::Enum { values }) => values,
-                _ => return Err(crate::WireError::UnsupportedLogicalType(LogicalTypeId::Enum)),
+                _ => {
+                    return Err(crate::WireError::UnsupportedLogicalType(
+                        LogicalTypeId::Enum,
+                    ))
+                }
             };
             let key_dt = match crate::data_chunk::enum_physical_width(values.len()) {
                 1 => A::UInt8,
                 2 => A::UInt16,
                 4 => A::UInt32,
-                _ => return Err(crate::WireError::UnsupportedLogicalType(LogicalTypeId::Enum)),
+                _ => {
+                    return Err(crate::WireError::UnsupportedLogicalType(
+                        LogicalTypeId::Enum,
+                    ))
+                }
             };
             A::Dictionary(Box::new(key_dt), Box::new(A::Utf8))
         }
@@ -282,12 +306,8 @@ fn column_to_vector(array: &dyn Array, row_count: usize) -> crate::Result<Vector
         }
         // Arrow `Time32` is i32 seconds- or millisecond-of-day; DuckDB's `TIME`
         // is i64 microseconds-of-day. Widen + scale into 8-byte LE.
-        DataType::Time32(TimeUnit::Second) => {
-            time32_second_to_time(array, row_count)?
-        }
-        DataType::Time32(TimeUnit::Millisecond) => {
-            time32_millisecond_to_time(array, row_count)?
-        }
+        DataType::Time32(TimeUnit::Second) => time32_second_to_time(array, row_count)?,
+        DataType::Time32(TimeUnit::Millisecond) => time32_millisecond_to_time(array, row_count)?,
         // Arrow `Time64(Microsecond)` already matches DuckDB `TIME` exactly.
         DataType::Time64(TimeUnit::Microsecond) => {
             fixed_from_array::<Time64MicrosecondArray>(array, LogicalTypeId::Time, row_count)?
@@ -337,8 +357,12 @@ fn column_to_vector(array: &dyn Array, row_count: usize) -> crate::Result<Vector
         }
         // Arrow interval types all widen into DuckDB's 16-byte `interval_t`
         // { months: i32, days: i32, micros: i64 }.
-        DataType::Interval(IntervalUnit::YearMonth) => interval_yearmonth_to_interval(array, row_count)?,
-        DataType::Interval(IntervalUnit::DayTime) => interval_daytime_to_interval(array, row_count)?,
+        DataType::Interval(IntervalUnit::YearMonth) => {
+            interval_yearmonth_to_interval(array, row_count)?
+        }
+        DataType::Interval(IntervalUnit::DayTime) => {
+            interval_daytime_to_interval(array, row_count)?
+        }
         DataType::Interval(IntervalUnit::MonthDayNano) => {
             interval_monthdaynano_to_interval(array, row_count)?
         }
@@ -526,9 +550,7 @@ fn interval_yearmonth_to_interval(
         .as_any()
         .downcast_ref::<IntervalYearMonthArray>()
         .ok_or_else(|| {
-            crate::WireError::UnsupportedArrowType(
-                "interval-yearmonth downcast failed".to_string(),
-            )
+            crate::WireError::UnsupportedArrowType("interval-yearmonth downcast failed".to_string())
         })?;
     let mut bytes = Vec::with_capacity(row_count * 16);
     for i in 0..row_count {
@@ -631,10 +653,9 @@ fn list_array_to_list<A: OffsetListArray>(
     array: &dyn Array,
     row_count: usize,
 ) -> crate::Result<(LogicalType, VectorData)> {
-    let typed = array
-        .as_any()
-        .downcast_ref::<A>()
-        .ok_or_else(|| crate::WireError::UnsupportedArrowType("list downcast failed".to_string()))?;
+    let typed = array.as_any().downcast_ref::<A>().ok_or_else(|| {
+        crate::WireError::UnsupportedArrowType("list downcast failed".to_string())
+    })?;
     let mut entries = Vec::with_capacity(row_count);
     for i in 0..row_count {
         let (start, end) = typed.offsets_at(i);
@@ -663,9 +684,12 @@ fn struct_array_to_struct(
     array: &dyn Array,
     row_count: usize,
 ) -> crate::Result<(LogicalType, VectorData)> {
-    let typed = array.as_any().downcast_ref::<StructArray>().ok_or_else(|| {
-        crate::WireError::UnsupportedArrowType("struct downcast failed".to_string())
-    })?;
+    let typed = array
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .ok_or_else(|| {
+            crate::WireError::UnsupportedArrowType("struct downcast failed".to_string())
+        })?;
     let fields = typed.fields();
     let mut children = Vec::with_capacity(fields.len());
     let mut field_types = Vec::with_capacity(fields.len());
@@ -737,9 +761,11 @@ fn dictionary_to_enum(
     // dictionary_keys_to_u64 monomorphizes on the Arrow key type and rejects
     // negative signed indices (ENUM indices are unsigned in DuckDB).
     let (values, keys) = match key_dt {
-        DataType::Int8 => dictionary_keys_to_u64::<arrow_types::Int8Type, _>(array, row_count, |v| {
-            check_unsigned_key(v as i64)
-        })?,
+        DataType::Int8 => {
+            dictionary_keys_to_u64::<arrow_types::Int8Type, _>(array, row_count, |v| {
+                check_unsigned_key(v as i64)
+            })?
+        }
         DataType::Int16 => {
             dictionary_keys_to_u64::<arrow_types::Int16Type, _>(array, row_count, |v| {
                 check_unsigned_key(v as i64)
@@ -750,22 +776,24 @@ fn dictionary_to_enum(
                 check_unsigned_key(v as i64)
             })?
         }
-        DataType::Int64 => {
-            dictionary_keys_to_u64::<arrow_types::Int64Type, _>(array, row_count, check_unsigned_key)?
-        }
+        DataType::Int64 => dictionary_keys_to_u64::<arrow_types::Int64Type, _>(
+            array,
+            row_count,
+            check_unsigned_key,
+        )?,
         DataType::UInt8 => {
             dictionary_keys_to_u64::<arrow_types::UInt8Type, _>(array, row_count, |v| Ok(v as u64))?
         }
-        DataType::UInt16 => {
-            dictionary_keys_to_u64::<arrow_types::UInt16Type, _>(array, row_count, |v| {
-                Ok(v as u64)
-            })?
-        }
-        DataType::UInt32 => {
-            dictionary_keys_to_u64::<arrow_types::UInt32Type, _>(array, row_count, |v| {
-                Ok(v as u64)
-            })?
-        }
+        DataType::UInt16 => dictionary_keys_to_u64::<arrow_types::UInt16Type, _>(
+            array,
+            row_count,
+            |v| Ok(v as u64),
+        )?,
+        DataType::UInt32 => dictionary_keys_to_u64::<arrow_types::UInt32Type, _>(
+            array,
+            row_count,
+            |v| Ok(v as u64),
+        )?,
         DataType::UInt64 => {
             dictionary_keys_to_u64::<arrow_types::UInt64Type, _>(array, row_count, Ok)?
         }
@@ -783,7 +811,11 @@ fn dictionary_to_enum(
             1 => bytes.push(k as u8),
             2 => bytes.extend_from_slice(&(k as u16).to_le_bytes()),
             4 => bytes.extend_from_slice(&(k as u32).to_le_bytes()),
-            _ => return Err(crate::WireError::UnsupportedLogicalType(LogicalTypeId::Enum)),
+            _ => {
+                return Err(crate::WireError::UnsupportedLogicalType(
+                    LogicalTypeId::Enum,
+                ))
+            }
         }
     }
     Ok((
@@ -1126,8 +1158,16 @@ fn vector_to_array(vector: &Vector, row_count: usize) -> crate::Result<std::sync
             Ok(Arc::new(builder.finish()))
         }
         (VectorData::Fixed(_), _) => {
-            let VectorData::Fixed(bytes) = &vector.data else { unreachable!() };
-            fixed_to_array(vector.logical_type.id, bytes, row_count, nulls, &vector.logical_type)
+            let VectorData::Fixed(bytes) = &vector.data else {
+                unreachable!()
+            };
+            fixed_to_array(
+                vector.logical_type.id,
+                bytes,
+                row_count,
+                nulls,
+                &vector.logical_type,
+            )
         }
         (
             VectorData::List {
@@ -1148,9 +1188,13 @@ fn vector_to_array(vector: &Vector, row_count: usize) -> crate::Result<std::sync
         (VectorData::Struct { children }, _) => {
             struct_to_array(&vector.logical_type, children, row_count, nulls)
         }
-        (VectorData::Array { array_size, child }, _) => {
-            fixed_size_list_to_array_arrow(&vector.logical_type, *array_size, child, row_count, nulls)
-        }
+        (VectorData::Array { array_size, child }, _) => fixed_size_list_to_array_arrow(
+            &vector.logical_type,
+            *array_size,
+            child,
+            row_count,
+            nulls,
+        ),
     }
 }
 
@@ -1508,24 +1552,42 @@ fn fixed_to_array(
         LogicalTypeId::Enum => {
             let values = match &logical_type.extra {
                 Some(crate::data_chunk::ExtraTypeInfo::Enum { values }) => values,
-                _ => return Err(crate::WireError::UnsupportedLogicalType(LogicalTypeId::Enum)),
+                _ => {
+                    return Err(crate::WireError::UnsupportedLogicalType(
+                        LogicalTypeId::Enum,
+                    ))
+                }
             };
             let value_arr = StringArray::from_iter_values(values.iter().map(|s| s.as_str()));
             let width = crate::data_chunk::enum_physical_width(values.len());
             match width {
-                1 => Ok(Arc::new(arrow_array::DictionaryArray::<arrow_array::types::UInt8Type>::new(
+                1 => Ok(Arc::new(arrow_array::DictionaryArray::<
+                    arrow_array::types::UInt8Type,
+                >::new(
                     arrow_array::UInt8Array::new(scalar_buffer_le::<u8>(bytes, row_count)?, nulls),
                     Arc::new(value_arr),
                 ))),
-                2 => Ok(Arc::new(arrow_array::DictionaryArray::<arrow_array::types::UInt16Type>::new(
-                    arrow_array::UInt16Array::new(scalar_buffer_le::<u16>(bytes, row_count)?, nulls),
+                2 => Ok(Arc::new(arrow_array::DictionaryArray::<
+                    arrow_array::types::UInt16Type,
+                >::new(
+                    arrow_array::UInt16Array::new(
+                        scalar_buffer_le::<u16>(bytes, row_count)?,
+                        nulls,
+                    ),
                     Arc::new(value_arr),
                 ))),
-                4 => Ok(Arc::new(arrow_array::DictionaryArray::<arrow_array::types::UInt32Type>::new(
-                    arrow_array::UInt32Array::new(scalar_buffer_le::<u32>(bytes, row_count)?, nulls),
+                4 => Ok(Arc::new(arrow_array::DictionaryArray::<
+                    arrow_array::types::UInt32Type,
+                >::new(
+                    arrow_array::UInt32Array::new(
+                        scalar_buffer_le::<u32>(bytes, row_count)?,
+                        nulls,
+                    ),
                     Arc::new(value_arr),
                 ))),
-                _ => Err(crate::WireError::UnsupportedLogicalType(LogicalTypeId::Enum)),
+                _ => Err(crate::WireError::UnsupportedLogicalType(
+                    LogicalTypeId::Enum,
+                )),
             }
         }
         other => Err(crate::WireError::UnsupportedLogicalType(other)),
@@ -1604,10 +1666,12 @@ fn scalar_buffer_le<T: FromLeBytesScalar>(
         let end = start.checked_add(width).ok_or_else(|| {
             crate::WireError::UnsupportedArrowType("fixed buffer offset overflow".to_string())
         })?;
-        let slice = bytes.get(start..end).ok_or(crate::WireError::CountExceedsRemaining {
-            count: end as u64,
-            remaining: bytes.len() as u64,
-        })?;
+        let slice = bytes
+            .get(start..end)
+            .ok_or(crate::WireError::CountExceedsRemaining {
+                count: end as u64,
+                remaining: bytes.len() as u64,
+            })?;
         values.push(T::from_le(slice));
     }
     Ok(arrow_buffer::ScalarBuffer::from(values))
@@ -1844,7 +1908,8 @@ mod tests {
 
     #[test]
     fn time64_nanosecond_maps_to_timens() {
-        let arr: Arc<dyn Array> = Arc::new(Time64NanosecondArray::from(vec![Some(0), None, Some(1)]));
+        let arr: Arc<dyn Array> =
+            Arc::new(Time64NanosecondArray::from(vec![Some(0), None, Some(1)]));
         let batch = batch_with(vec![("t", DataType::Time64(TimeUnit::Nanosecond), arr)]);
         let chunk = record_batch_to_data_chunk(&batch).unwrap();
         assert_eq!(chunk.columns[0].logical_type.id, LogicalTypeId::TimeNs);
@@ -1894,7 +1959,11 @@ mod tests {
     fn interval_yearmonth_widens_to_16_byte_struct() {
         // 14 months = 1 year + 2 months
         let arr: Arc<dyn Array> = Arc::new(IntervalYearMonthArray::from(vec![14]));
-        let batch = batch_with(vec![("i", DataType::Interval(IntervalUnit::YearMonth), arr)]);
+        let batch = batch_with(vec![(
+            "i",
+            DataType::Interval(IntervalUnit::YearMonth),
+            arr,
+        )]);
         let chunk = record_batch_to_data_chunk(&batch).unwrap();
         assert_eq!(chunk.columns[0].logical_type.id, LogicalTypeId::Interval);
         match &chunk.columns[0].data {
@@ -2143,7 +2212,10 @@ mod tests {
         ];
         let mut builder = StructBuilder::new(
             fields.clone(),
-            vec![Box::new(Int32Builder::new()), Box::new(StringBuilder::new())],
+            vec![
+                Box::new(Int32Builder::new()),
+                Box::new(StringBuilder::new()),
+            ],
         );
         builder
             .field_builder::<Int32Builder>(0)
@@ -2318,7 +2390,11 @@ mod tests {
             other => panic!("expected ExtraTypeInfo::List wrapping STRUCT, got {other:?}"),
         }
         match &chunk.columns[0].data {
-            VectorData::List { entries, child_count, .. } => {
+            VectorData::List {
+                entries,
+                child_count,
+                ..
+            } => {
                 assert_eq!(entries, &vec![(0, 2), (2, 0)]);
                 assert_eq!(*child_count, 2);
             }

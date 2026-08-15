@@ -17,7 +17,6 @@
 //!   -> `PrepareResponse`
 //! - The decoded `PrepareResponse` carries the expected single INT64 column
 
-
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -57,7 +56,8 @@ async fn quack_select_one_round_trip() {
     crate::common::init_tracing();
 
     // ── 1. Authenticate against the lightweight Polaris stack ─────────────
-    let config = sqe_core::SqeConfig::load(&crate::common::test_config_path()).expect("load test config");
+    let config =
+        sqe_core::SqeConfig::load(&crate::common::test_config_path()).expect("load test config");
     let authenticator = sqe_auth::Authenticator::new(&config.auth)
         .await
         .expect("create authenticator");

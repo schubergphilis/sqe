@@ -42,7 +42,9 @@ use tokio::time::Sleep;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
-use crate::query_handler::{aggregate_spill_metrics, extract_iceberg_scan_metrics, extract_plan_metrics};
+use crate::query_handler::{
+    aggregate_spill_metrics, extract_iceberg_scan_metrics, extract_plan_metrics,
+};
 use crate::query_tracker::QueryTracker;
 
 /// Hard cap on a rendered profile. Deep plans with long predicate lists can
@@ -190,12 +192,18 @@ impl StreamFinalizer {
         let scan = extract_iceberg_scan_metrics(&self.plan);
         self.query_span.record("sqe.status", status);
         self.query_span.record("sqe.rows_returned", rows as u64);
-        self.query_span.record("sqe.scan.files_total", scan.files_total);
-        self.query_span.record("sqe.scan.files_read", scan.files_read);
-        self.query_span.record("sqe.scan.files_pruned_minmax", scan.files_pruned_minmax);
-        self.query_span.record("sqe.scan.files_pruned_dynamic", scan.files_pruned_dynamic);
-        self.query_span.record("sqe.scan.bytes_read", scan.bytes_read);
-        self.query_span.record("sqe.scan.rows_decoded", scan.rows_decoded);
+        self.query_span
+            .record("sqe.scan.files_total", scan.files_total);
+        self.query_span
+            .record("sqe.scan.files_read", scan.files_read);
+        self.query_span
+            .record("sqe.scan.files_pruned_minmax", scan.files_pruned_minmax);
+        self.query_span
+            .record("sqe.scan.files_pruned_dynamic", scan.files_pruned_dynamic);
+        self.query_span
+            .record("sqe.scan.bytes_read", scan.bytes_read);
+        self.query_span
+            .record("sqe.scan.rows_decoded", scan.rows_decoded);
         if let Some(error) = error {
             self.query_span.record("error.message", error);
             self.query_span.record("otel.status_code", "ERROR");
@@ -205,20 +213,56 @@ impl StreamFinalizer {
     }
 
     fn record_scan_metrics(&self) {
-        let Some(ref metrics) = self.metrics else { return; };
+        let Some(ref metrics) = self.metrics else {
+            return;
+        };
         let scan = extract_iceberg_scan_metrics(&self.plan);
-        metrics.scan_files_total.with_label_values(&["planned"]).inc_by(scan.files_planned);
-        metrics.scan_files_total.with_label_values(&["read"]).inc_by(scan.files_read);
-        metrics.scan_files_total.with_label_values(&["pruned_minmax"]).inc_by(scan.files_pruned_minmax);
-        metrics.scan_files_total.with_label_values(&["pruned_dynamic"]).inc_by(scan.files_pruned_dynamic);
-        metrics.scan_bytes_total.with_label_values(&["planned"]).inc_by(scan.bytes_planned);
-        metrics.scan_bytes_total.with_label_values(&["read"]).inc_by(scan.bytes_read);
-        metrics.scan_rows_total.with_label_values(&["prefilter"]).inc_by(scan.rows_prefilter);
-        metrics.scan_rows_total.with_label_values(&["decoded"]).inc_by(scan.rows_decoded);
-        metrics.scan_rows_total.with_label_values(&["output"]).inc_by(scan.rows_output);
-        metrics.scan_rows_total.with_label_values(&["filtered_dynamic"]).inc_by(scan.rows_filtered_dynamic);
-        metrics.scan_row_groups_pruned_total.inc_by(scan.row_groups_pruned_bloom);
-        metrics.files_pruned_minmax.inc_by(scan.files_pruned_minmax as f64);
+        metrics
+            .scan_files_total
+            .with_label_values(&["planned"])
+            .inc_by(scan.files_planned);
+        metrics
+            .scan_files_total
+            .with_label_values(&["read"])
+            .inc_by(scan.files_read);
+        metrics
+            .scan_files_total
+            .with_label_values(&["pruned_minmax"])
+            .inc_by(scan.files_pruned_minmax);
+        metrics
+            .scan_files_total
+            .with_label_values(&["pruned_dynamic"])
+            .inc_by(scan.files_pruned_dynamic);
+        metrics
+            .scan_bytes_total
+            .with_label_values(&["planned"])
+            .inc_by(scan.bytes_planned);
+        metrics
+            .scan_bytes_total
+            .with_label_values(&["read"])
+            .inc_by(scan.bytes_read);
+        metrics
+            .scan_rows_total
+            .with_label_values(&["prefilter"])
+            .inc_by(scan.rows_prefilter);
+        metrics
+            .scan_rows_total
+            .with_label_values(&["decoded"])
+            .inc_by(scan.rows_decoded);
+        metrics
+            .scan_rows_total
+            .with_label_values(&["output"])
+            .inc_by(scan.rows_output);
+        metrics
+            .scan_rows_total
+            .with_label_values(&["filtered_dynamic"])
+            .inc_by(scan.rows_filtered_dynamic);
+        metrics
+            .scan_row_groups_pruned_total
+            .inc_by(scan.row_groups_pruned_bloom);
+        metrics
+            .files_pruned_minmax
+            .inc_by(scan.files_pruned_minmax as f64);
         metrics.s3_bytes_read_total.inc_by(scan.bytes_read);
     }
 
@@ -299,7 +343,9 @@ impl StreamFinalizer {
             pm.peak_memory_bytes,
         );
         if let Some(ref metrics) = self.metrics {
-            metrics.active_queries.set(self.tracker.active_count() as i64);
+            metrics
+                .active_queries
+                .set(self.tracker.active_count() as i64);
         }
         crate::memory::observe_query_end(&self.runtime.memory_pool, &self.query_id);
 
@@ -371,8 +417,7 @@ impl StreamFinalizer {
             ProfileMode::Off => false,
             ProfileMode::All => true,
             ProfileMode::Slow => {
-                self.slow_query_threshold_secs > 0
-                    && elapsed_secs >= self.slow_query_threshold_secs
+                self.slow_query_threshold_secs > 0 && elapsed_secs >= self.slow_query_threshold_secs
             }
         };
         if profile_due {
@@ -384,7 +429,9 @@ impl StreamFinalizer {
         let duration = self.start.elapsed();
         self.tracker.failed(&self.query_id, err);
         if let Some(ref metrics) = self.metrics {
-            metrics.active_queries.set(self.tracker.active_count() as i64);
+            metrics
+                .active_queries
+                .set(self.tracker.active_count() as i64);
         }
         crate::memory::observe_query_end(&self.runtime.memory_pool, &self.query_id);
 
@@ -448,7 +495,9 @@ impl StreamFinalizer {
         let duration = self.start.elapsed();
         self.tracker.canceled(&self.query_id);
         if let Some(ref metrics) = self.metrics {
-            metrics.active_queries.set(self.tracker.active_count() as i64);
+            metrics
+                .active_queries
+                .set(self.tracker.active_count() as i64);
         }
         crate::memory::observe_query_end(&self.runtime.memory_pool, &self.query_id);
 
@@ -751,9 +800,8 @@ impl Stream for TrackedRecordBatchStream {
             }
             Poll::Ready(Some(Err(e))) => {
                 if let Some(f) = self.finalizer.take() {
-                    let sqe_err = sqe_core::SqeError::Execution(format!(
-                        "Query execution failed: {e}"
-                    ));
+                    let sqe_err =
+                        sqe_core::SqeError::Execution(format!("Query execution failed: {e}"));
                     f.on_error(self.rows_so_far, &sqe_err);
                 }
                 Poll::Ready(Some(Err(e)))
@@ -934,7 +982,10 @@ mod tests {
         (plan, schema, runtime)
     }
 
-    fn find_record(tracker: &QueryTracker, qid: uuid::Uuid) -> Arc<crate::query_tracker::QueryRecord> {
+    fn find_record(
+        tracker: &QueryTracker,
+        qid: uuid::Uuid,
+    ) -> Arc<crate::query_tracker::QueryRecord> {
         tracker
             .records()
             .into_iter()
@@ -950,7 +1001,16 @@ mod tests {
         let metrics = Arc::new(sqe_metrics::MetricsRegistry::new().unwrap());
         fin.metrics = Some(Arc::clone(&metrics));
         let qid = fin.query_id;
-        tracker.start(qid, "test-user", None, "SELECT 1", "test-session", None, vec![], None);
+        tracker.start(
+            qid,
+            "test-user",
+            None,
+            "SELECT 1",
+            "test-session",
+            None,
+            vec![],
+            None,
+        );
         metrics.active_queries.set(1);
 
         let inner = fixed_stream(
@@ -989,9 +1049,7 @@ mod tests {
         let tracker = test_tracker();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("audit.jsonl");
-        let audit = Arc::new(
-            sqe_metrics::audit::AuditLogger::new(path.to_str().unwrap()).unwrap(),
-        );
+        let audit = Arc::new(sqe_metrics::audit::AuditLogger::new(path.to_str().unwrap()).unwrap());
 
         let mut fin = test_finalizer(Arc::clone(&tracker), plan, runtime);
         fin.audit = Some(Arc::clone(&audit));
@@ -1002,7 +1060,16 @@ mod tests {
             denied: false,
         };
         let qid = fin.query_id;
-        tracker.start(qid, "test-user", None, "SELECT 1", "test-session", None, vec![], None);
+        tracker.start(
+            qid,
+            "test-user",
+            None,
+            "SELECT 1",
+            "test-session",
+            None,
+            vec![],
+            None,
+        );
 
         let inner = fixed_stream(Arc::clone(&schema), vec![sample_batch(3)]);
         let mut stream = TrackedRecordBatchStream::new(inner, fin, None);
@@ -1018,12 +1085,26 @@ mod tests {
         assert_eq!(v["kind"], "query", "got: {v}");
         // policy fields nested under "policy" key (Task 2 migration)
         assert_eq!(v["policy"]["row_filters_applied"], 1, "got: {v}");
-        assert_eq!(v["policy"]["columns_masked"], serde_json::json!(["ssn"]), "got: {v}");
-        assert_eq!(v["policy"]["columns_restricted"], serde_json::json!(["notes"]), "got: {v}");
+        assert_eq!(
+            v["policy"]["columns_masked"],
+            serde_json::json!(["ssn"]),
+            "got: {v}"
+        );
+        assert_eq!(
+            v["policy"]["columns_restricted"],
+            serde_json::json!(["notes"]),
+            "got: {v}"
+        );
         assert_eq!(v["policy"]["denied"], false, "got: {v}");
         // legacy top-level field must no longer exist
-        assert!(v.get("policy_denied").is_none() || v["policy_denied"].is_null(), "got: {v}");
-        assert!(v.get("row_filters_applied").is_none() || v["row_filters_applied"].is_null(), "got: {v}");
+        assert!(
+            v.get("policy_denied").is_none() || v["policy_denied"].is_null(),
+            "got: {v}"
+        );
+        assert!(
+            v.get("row_filters_applied").is_none() || v["row_filters_applied"].is_null(),
+            "got: {v}"
+        );
     }
 
     #[tokio::test]
@@ -1032,7 +1113,16 @@ mod tests {
         let tracker = test_tracker();
         let fin = test_finalizer(Arc::clone(&tracker), plan, runtime);
         let qid = fin.query_id;
-        tracker.start(qid, "test-user", None, "SELECT 1", "test-session", None, vec![], None);
+        tracker.start(
+            qid,
+            "test-user",
+            None,
+            "SELECT 1",
+            "test-session",
+            None,
+            vec![],
+            None,
+        );
 
         let inner = fixed_stream(
             Arc::clone(&schema),
@@ -1055,7 +1145,16 @@ mod tests {
         let tracker = test_tracker();
         let fin = test_finalizer(Arc::clone(&tracker), plan, runtime);
         let qid = fin.query_id;
-        tracker.start(qid, "test-user", None, "SELECT 1", "test-session", None, vec![], None);
+        tracker.start(
+            qid,
+            "test-user",
+            None,
+            "SELECT 1",
+            "test-session",
+            None,
+            vec![],
+            None,
+        );
 
         let s = futures::stream::iter(vec![
             Ok(sample_batch(3)),
@@ -1081,7 +1180,16 @@ mod tests {
         let mut fin = test_finalizer(Arc::clone(&tracker), plan, runtime);
         fin.profile_mode = ProfileMode::All;
         let qid = fin.query_id;
-        tracker.start(qid, "test-user", None, "SELECT 1", "test-session", None, vec![], None);
+        tracker.start(
+            qid,
+            "test-user",
+            None,
+            "SELECT 1",
+            "test-session",
+            None,
+            vec![],
+            None,
+        );
 
         let inner = fixed_stream(Arc::clone(&schema), vec![sample_batch(7)]);
         let mut stream = TrackedRecordBatchStream::new(inner, fin, None);
@@ -1092,7 +1200,10 @@ mod tests {
 
         let record = find_record(&tracker, qid);
         assert_eq!(record.state, QueryState::Finished);
-        let profile = record.profile.as_deref().expect("mode All must store a profile");
+        let profile = record
+            .profile
+            .as_deref()
+            .expect("mode All must store a profile");
         assert!(
             profile.contains("Exec"),
             "profile must contain at least one operator name: {profile}"
@@ -1109,7 +1220,16 @@ mod tests {
         let tracker = test_tracker();
         let fin = test_finalizer(Arc::clone(&tracker), plan, runtime);
         let qid = fin.query_id;
-        tracker.start(qid, "test-user", None, "SELECT 1", "test-session", None, vec![], None);
+        tracker.start(
+            qid,
+            "test-user",
+            None,
+            "SELECT 1",
+            "test-session",
+            None,
+            vec![],
+            None,
+        );
 
         let inner = fixed_stream(Arc::clone(&schema), vec![sample_batch(7)]);
         let mut stream = TrackedRecordBatchStream::new(inner, fin, None);
@@ -1120,7 +1240,10 @@ mod tests {
 
         let record = find_record(&tracker, qid);
         assert_eq!(record.state, QueryState::Finished);
-        assert!(record.profile.is_none(), "mode Off must not store a profile");
+        assert!(
+            record.profile.is_none(),
+            "mode Off must not store a profile"
+        );
     }
 
     #[tokio::test]
@@ -1135,7 +1258,16 @@ mod tests {
         fin.profile_mode = ProfileMode::Slow;
         fin.slow_query_threshold_secs = 3600;
         let qid = fin.query_id;
-        tracker.start(qid, "test-user", None, "SELECT 1", "test-session", None, vec![], None);
+        tracker.start(
+            qid,
+            "test-user",
+            None,
+            "SELECT 1",
+            "test-session",
+            None,
+            vec![],
+            None,
+        );
 
         let s = futures::stream::iter(vec![
             Ok(sample_batch(3)),
@@ -1162,7 +1294,10 @@ mod tests {
         let (plan, _schema, _runtime) = trivial_plan().await;
         let profile = render_query_profile(&plan, 12, 34);
         assert!(profile.starts_with("elapsed_ms=12 output_rows=34 unpushed_scans="));
-        assert!(profile.contains("Exec"), "tree must list operators: {profile}");
+        assert!(
+            profile.contains("Exec"),
+            "tree must list operators: {profile}"
+        );
     }
 
     #[test]
@@ -1194,15 +1329,22 @@ mod tests {
         let tracker = test_tracker();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("audit.jsonl");
-        let audit = Arc::new(
-            sqe_metrics::audit::AuditLogger::new(path.to_str().unwrap()).unwrap(),
-        );
+        let audit = Arc::new(sqe_metrics::audit::AuditLogger::new(path.to_str().unwrap()).unwrap());
 
         let mut fin = test_finalizer(Arc::clone(&tracker), plan, runtime);
         fin.audit = Some(Arc::clone(&audit));
         fin.client_ip = Some("10.9.9.9".to_string());
         let qid = fin.query_id;
-        tracker.start(qid, "test-user", None, "SELECT 1", "test-session", None, vec![], None);
+        tracker.start(
+            qid,
+            "test-user",
+            None,
+            "SELECT 1",
+            "test-session",
+            None,
+            vec![],
+            None,
+        );
 
         let inner = fixed_stream(Arc::clone(&schema), vec![sample_batch(1)]);
         let mut stream = TrackedRecordBatchStream::new(inner, fin, None);
@@ -1213,8 +1355,7 @@ mod tests {
         audit.flush();
 
         let content = std::fs::read_to_string(&path).unwrap();
-        let v: serde_json::Value =
-            serde_json::from_str(content.lines().next().unwrap()).unwrap();
+        let v: serde_json::Value = serde_json::from_str(content.lines().next().unwrap()).unwrap();
         assert_eq!(
             v["client_ip"].as_str(),
             Some("10.9.9.9"),
@@ -1237,19 +1378,24 @@ mod tests {
         let tracker = test_tracker();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("audit_error.jsonl");
-        let audit = Arc::new(
-            sqe_metrics::audit::AuditLogger::new(path.to_str().unwrap()).unwrap(),
-        );
+        let audit = Arc::new(sqe_metrics::audit::AuditLogger::new(path.to_str().unwrap()).unwrap());
 
         let mut fin = test_finalizer(Arc::clone(&tracker), plan, runtime);
         fin.audit = Some(Arc::clone(&audit));
         fin.client_ip = Some("10.9.9.9".to_string());
         let qid = fin.query_id;
-        tracker.start(qid, "test-user", None, "SELECT 1", "test-session", None, vec![], None);
+        tracker.start(
+            qid,
+            "test-user",
+            None,
+            "SELECT 1",
+            "test-session",
+            None,
+            vec![],
+            None,
+        );
 
-        let s = futures::stream::iter(vec![
-            Err(DataFusionError::Execution("boom".to_string())),
-        ]);
+        let s = futures::stream::iter(vec![Err(DataFusionError::Execution("boom".to_string()))]);
         let inner: SendableRecordBatchStream =
             Box::pin(RecordBatchStreamAdapter::new(Arc::clone(&schema), s));
         let mut stream = TrackedRecordBatchStream::new(inner, fin, None);
@@ -1260,8 +1406,7 @@ mod tests {
         audit.flush();
 
         let content = std::fs::read_to_string(&path).unwrap();
-        let v: serde_json::Value =
-            serde_json::from_str(content.lines().next().unwrap()).unwrap();
+        let v: serde_json::Value = serde_json::from_str(content.lines().next().unwrap()).unwrap();
         assert_eq!(
             v["client_ip"].as_str(),
             Some("10.9.9.9"),
@@ -1292,15 +1437,22 @@ mod tests {
         let tracker = test_tracker();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("audit_cancel.jsonl");
-        let audit = Arc::new(
-            sqe_metrics::audit::AuditLogger::new(path.to_str().unwrap()).unwrap(),
-        );
+        let audit = Arc::new(sqe_metrics::audit::AuditLogger::new(path.to_str().unwrap()).unwrap());
 
         let mut fin = test_finalizer(Arc::clone(&tracker), plan, runtime);
         fin.audit = Some(Arc::clone(&audit));
         fin.client_ip = Some("10.9.9.9".to_string());
         let qid = fin.query_id;
-        tracker.start(qid, "test-user", None, "SELECT 1", "test-session", None, vec![], None);
+        tracker.start(
+            qid,
+            "test-user",
+            None,
+            "SELECT 1",
+            "test-session",
+            None,
+            vec![],
+            None,
+        );
 
         // Drop the stream after one batch to trigger the cancel path.
         let inner = fixed_stream(Arc::clone(&schema), vec![sample_batch(1), sample_batch(1)]);
@@ -1310,8 +1462,7 @@ mod tests {
         audit.flush();
 
         let content = std::fs::read_to_string(&path).unwrap();
-        let v: serde_json::Value =
-            serde_json::from_str(content.lines().next().unwrap()).unwrap();
+        let v: serde_json::Value = serde_json::from_str(content.lines().next().unwrap()).unwrap();
         assert_eq!(
             v["client_ip"].as_str(),
             Some("10.9.9.9"),
@@ -1336,7 +1487,16 @@ mod tests {
         let tracker = test_tracker();
         let finalizer = test_finalizer(tracker.clone(), plan, runtime);
         let qid = finalizer.query_id;
-        tracker.start(qid, "test-user", None, "SELECT 1", "test-session", None, vec![], None);
+        tracker.start(
+            qid,
+            "test-user",
+            None,
+            "SELECT 1",
+            "test-session",
+            None,
+            vec![],
+            None,
+        );
 
         // Inner stream never produces a batch: a stalled execution pipeline.
         let pending = futures::stream::pending::<Result<RecordBatch, DataFusionError>>();
@@ -1446,20 +1606,33 @@ mod tests {
     /// advance, the tracker, and the query id.
     async fn idle_test_stream(
         idle: Duration,
-    ) -> (TrackedRecordBatchStream, Count, Arc<QueryTracker>, uuid::Uuid) {
+    ) -> (
+        TrackedRecordBatchStream,
+        Count,
+        Arc<QueryTracker>,
+        uuid::Uuid,
+    ) {
         let (plan, rows) = MetricsStubExec::create();
         let schema = plan.schema();
         let runtime = SessionContext::new().runtime_env();
         let tracker = test_tracker();
         let finalizer = test_finalizer(Arc::clone(&tracker), plan, runtime);
         let qid = finalizer.query_id;
-        tracker.start(qid, "test-user", None, "SELECT 1", "test-session", None, vec![], None);
+        tracker.start(
+            qid,
+            "test-user",
+            None,
+            "SELECT 1",
+            "test-session",
+            None,
+            vec![],
+            None,
+        );
 
         let pending = futures::stream::pending::<Result<RecordBatch, DataFusionError>>();
         let inner: SendableRecordBatchStream =
             Box::pin(RecordBatchStreamAdapter::new(schema, pending));
-        let stream = TrackedRecordBatchStream::new(inner, finalizer, None)
-            .with_idle_timeout(idle);
+        let stream = TrackedRecordBatchStream::new(inner, finalizer, None).with_idle_timeout(idle);
         (stream, rows, tracker, qid)
     }
 
@@ -1468,8 +1641,7 @@ mod tests {
     /// aborted at the idle deadline — the guard extends instead.
     #[tokio::test]
     async fn idle_timeout_extends_while_operator_metrics_advance() {
-        let (mut stream, rows, _tracker, _qid) =
-            idle_test_stream(Duration::from_millis(50)).await;
+        let (mut stream, rows, _tracker, _qid) = idle_test_stream(Duration::from_millis(50)).await;
 
         let ticker = tokio::spawn(async move {
             loop {
@@ -1493,8 +1665,7 @@ mod tests {
     /// idle deadline.
     #[tokio::test]
     async fn idle_timeout_aborts_when_metrics_do_not_advance() {
-        let (mut stream, _rows, tracker, qid) =
-            idle_test_stream(Duration::from_millis(50)).await;
+        let (mut stream, _rows, tracker, qid) = idle_test_stream(Duration::from_millis(50)).await;
 
         let item = tokio::time::timeout(Duration::from_millis(300), stream.next())
             .await
@@ -1502,7 +1673,10 @@ mod tests {
         let err = item
             .expect("stream must yield an item")
             .expect_err("idle timeout must surface as an error");
-        assert!(err.to_string().contains("idle timeout"), "unexpected error: {err}");
+        assert!(
+            err.to_string().contains("idle timeout"),
+            "unexpected error: {err}"
+        );
 
         let record = find_record(&tracker, qid);
         assert_eq!(record.state, QueryState::Failed);
@@ -1529,7 +1703,10 @@ mod tests {
         let err = item
             .expect("stream must yield an item")
             .expect_err("deadline expiry must surface as an error");
-        assert!(err.to_string().contains("timed out"), "unexpected error: {err}");
+        assert!(
+            err.to_string().contains("timed out"),
+            "unexpected error: {err}"
+        );
 
         let record = find_record(&tracker, qid);
         assert_eq!(record.state, QueryState::Failed);

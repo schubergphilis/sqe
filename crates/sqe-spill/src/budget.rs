@@ -47,12 +47,19 @@ pub fn split_read_headroom(
         headroom = capacity.saturating_sub(1);
     }
     let writer = capacity.saturating_sub(headroom);
-    (writer.max(1), headroom.max(1).min(capacity.saturating_sub(writer)))
+    (
+        writer.max(1),
+        headroom.max(1).min(capacity.saturating_sub(writer)),
+    )
 }
 
 /// Convenience: default 25% read headroom.
 pub fn split_default_read_headroom(capacity: usize) -> (usize, usize) {
-    split_read_headroom(capacity, DEFAULT_READ_HEADROOM_NUM, DEFAULT_READ_HEADROOM_DEN)
+    split_read_headroom(
+        capacity,
+        DEFAULT_READ_HEADROOM_NUM,
+        DEFAULT_READ_HEADROOM_DEN,
+    )
 }
 
 /// A named byte budget with a hard capacity.

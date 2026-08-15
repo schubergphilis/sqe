@@ -45,8 +45,7 @@ impl NativeJsonlSink {
 
 impl AuditSink for NativeJsonlSink {
     fn write_line(&mut self, event: &AuditEvent) -> std::io::Result<()> {
-        let line = serde_json::to_string(event)
-            .map_err(std::io::Error::other)?;
+        let line = serde_json::to_string(event).map_err(std::io::Error::other)?;
         writeln!(self.w, "{line}")
     }
 
@@ -68,8 +67,7 @@ impl OcsfJsonlSink {
 
 impl AuditSink for OcsfJsonlSink {
     fn write_line(&mut self, event: &AuditEvent) -> std::io::Result<()> {
-        let line = serde_json::to_string(&to_ocsf(event))
-            .map_err(std::io::Error::other)?;
+        let line = serde_json::to_string(&to_ocsf(event)).map_err(std::io::Error::other)?;
         writeln!(self.w, "{line}")
     }
 

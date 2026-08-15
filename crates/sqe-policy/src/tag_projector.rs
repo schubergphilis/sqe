@@ -128,10 +128,7 @@ pub fn build_import_document(
                 id.to_string(),
                 serde_json::json!({"id": id, "name": tag, "source": "sqe"}),
             );
-            tag_instances.insert(
-                id.to_string(),
-                serde_json::json!({"id": id, "type": tag}),
-            );
+            tag_instances.insert(id.to_string(), serde_json::json!({"id": id, "type": tag}));
             ids.push(id);
         }
         if ids.is_empty() {
@@ -231,8 +228,7 @@ impl TagProjector for RangerTagProjector {
         // masking a column SQE no longer tags. Measured exactly that way before
         // `previous` was threaded through.
         if !previous.is_empty() {
-            let delete_doc =
-                build_import_document(&self.service_name, table, previous, "delete");
+            let delete_doc = build_import_document(&self.service_name, table, previous, "delete");
             self.import(delete_doc).await?;
         }
         let add_doc = build_import_document(&self.service_name, table, tags, "add_or_update");
@@ -389,12 +385,15 @@ mod tests {
         );
         assert_eq!(del["op"], "delete");
         assert_eq!(
-            del["serviceResources"][0]["resourceElements"]["column"]["values"][0],
-            "ssn",
+            del["serviceResources"][0]["resourceElements"]["column"]["values"][0], "ssn",
             "the delete must name the column that WAS tagged"
         );
-        let add =
-            build_import_document("query", &TagTableKey::new("ac", "orders"), &now, "add_or_update");
+        let add = build_import_document(
+            "query",
+            &TagTableKey::new("ac", "orders"),
+            &now,
+            "add_or_update",
+        );
         assert!(
             add["serviceResources"].as_array().unwrap().is_empty(),
             "and the add names nothing, which is why the delete has to carry it"

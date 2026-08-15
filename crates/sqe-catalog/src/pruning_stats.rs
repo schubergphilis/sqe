@@ -10,7 +10,7 @@ use arrow::array::{
 use arrow::datatypes::{DataType, Schema, SchemaRef, TimeUnit};
 use datafusion::common::pruning::PruningStatistics;
 use datafusion::common::stats::Precision;
-use datafusion::common::{ColumnStatistics, Column, ScalarValue, Statistics};
+use datafusion::common::{Column, ColumnStatistics, ScalarValue, Statistics};
 use iceberg::spec::{DataFile, Datum, PrimitiveLiteral};
 
 pub struct IcebergManifestStatistics {
@@ -20,13 +20,29 @@ pub struct IcebergManifestStatistics {
 }
 
 impl IcebergManifestStatistics {
-    pub fn new(data_files: Vec<DataFile>, schema: SchemaRef, iceberg_schema: &iceberg::spec::Schema) -> Self {
-        let name_to_field_id: Vec<(String, i32)> = iceberg_schema.as_struct().fields().iter().map(|f| (f.name.clone(), f.id)).collect();
-        Self { data_files, schema, name_to_field_id }
+    pub fn new(
+        data_files: Vec<DataFile>,
+        schema: SchemaRef,
+        iceberg_schema: &iceberg::spec::Schema,
+    ) -> Self {
+        let name_to_field_id: Vec<(String, i32)> = iceberg_schema
+            .as_struct()
+            .fields()
+            .iter()
+            .map(|f| (f.name.clone(), f.id))
+            .collect();
+        Self {
+            data_files,
+            schema,
+            name_to_field_id,
+        }
     }
 
     fn field_id(&self, column_name: &str) -> Option<i32> {
-        self.name_to_field_id.iter().find(|(name, _)| name == column_name).map(|(_, id)| *id)
+        self.name_to_field_id
+            .iter()
+            .find(|(name, _)| name == column_name)
+            .map(|(_, id)| *id)
     }
 
     pub fn count_pruned(results: &[bool]) -> usize {
@@ -42,8 +58,12 @@ fn datum_to_scalar(datum: &Datum, data_type: &DataType) -> Option<ScalarValue> {
             _ => Some(ScalarValue::Int32(Some(*v))),
         },
         PrimitiveLiteral::Long(v) => match data_type {
-            DataType::Timestamp(TimeUnit::Microsecond, None) => Some(ScalarValue::TimestampMicrosecond(Some(*v), None)),
-            DataType::Timestamp(TimeUnit::Microsecond, Some(tz)) => Some(ScalarValue::TimestampMicrosecond(Some(*v), Some(tz.clone()))),
+            DataType::Timestamp(TimeUnit::Microsecond, None) => {
+                Some(ScalarValue::TimestampMicrosecond(Some(*v), None))
+            }
+            DataType::Timestamp(TimeUnit::Microsecond, Some(tz)) => Some(
+                ScalarValue::TimestampMicrosecond(Some(*v), Some(tz.clone())),
+            ),
             _ => Some(ScalarValue::Int64(Some(*v))),
         },
         PrimitiveLiteral::Float(v) => Some(ScalarValue::Float32(Some(v.0))),
@@ -53,23 +73,112 @@ fn datum_to_scalar(datum: &Datum, data_type: &DataType) -> Option<ScalarValue> {
     }
 }
 
-fn build_bounds_array(data_files: &[DataFile], field_id: i32, data_type: &DataType, use_upper: bool) -> Option<ArrayRef> {
-    let scalars: Vec<Option<ScalarValue>> = data_files.iter().map(|df| {
-        let bounds = if use_upper { df.upper_bounds() } else { df.lower_bounds() };
-        bounds.get(&field_id).and_then(|datum| datum_to_scalar(datum, data_type))
-    }).collect();
-    if scalars.iter().all(|s| s.is_none()) { return None; }
+fn build_bounds_array(
+    data_files: &[DataFile],
+    field_id: i32,
+    data_type: &DataType,
+    use_upper: bool,
+) -> Option<ArrayRef> {
+    let scalars: Vec<Option<ScalarValue>> = data_files
+        .iter()
+        .map(|df| {
+            let bounds = if use_upper {
+                df.upper_bounds()
+            } else {
+                df.lower_bounds()
+            };
+            bounds
+                .get(&field_id)
+                .and_then(|datum| datum_to_scalar(datum, data_type))
+        })
+        .collect();
+    if scalars.iter().all(|s| s.is_none()) {
+        return None;
+    }
     match data_type {
-        DataType::Boolean => { let a: BooleanArray = scalars.iter().map(|s| match s { Some(ScalarValue::Boolean(v)) => *v, _ => None }).collect(); Some(Arc::new(a) as ArrayRef) }
-        DataType::Int32 => { let a: Int32Array = scalars.iter().map(|s| match s { Some(ScalarValue::Int32(v)) => *v, _ => None }).collect(); Some(Arc::new(a) as ArrayRef) }
-        DataType::Int64 => { let a: Int64Array = scalars.iter().map(|s| match s { Some(ScalarValue::Int64(v)) => *v, _ => None }).collect(); Some(Arc::new(a) as ArrayRef) }
-        DataType::Float32 => { let a: Float32Array = scalars.iter().map(|s| match s { Some(ScalarValue::Float32(v)) => *v, _ => None }).collect(); Some(Arc::new(a) as ArrayRef) }
-        DataType::Float64 => { let a: Float64Array = scalars.iter().map(|s| match s { Some(ScalarValue::Float64(v)) => *v, _ => None }).collect(); Some(Arc::new(a) as ArrayRef) }
-        DataType::Utf8 => { let a: StringArray = scalars.iter().map(|s| match s { Some(ScalarValue::Utf8(v)) => v.as_deref(), _ => None }).collect(); Some(Arc::new(a) as ArrayRef) }
-        DataType::Date32 => { let a: Date32Array = scalars.iter().map(|s| match s { Some(ScalarValue::Date32(v)) => *v, _ => None }).collect(); Some(Arc::new(a) as ArrayRef) }
+        DataType::Boolean => {
+            let a: BooleanArray = scalars
+                .iter()
+                .map(|s| match s {
+                    Some(ScalarValue::Boolean(v)) => *v,
+                    _ => None,
+                })
+                .collect();
+            Some(Arc::new(a) as ArrayRef)
+        }
+        DataType::Int32 => {
+            let a: Int32Array = scalars
+                .iter()
+                .map(|s| match s {
+                    Some(ScalarValue::Int32(v)) => *v,
+                    _ => None,
+                })
+                .collect();
+            Some(Arc::new(a) as ArrayRef)
+        }
+        DataType::Int64 => {
+            let a: Int64Array = scalars
+                .iter()
+                .map(|s| match s {
+                    Some(ScalarValue::Int64(v)) => *v,
+                    _ => None,
+                })
+                .collect();
+            Some(Arc::new(a) as ArrayRef)
+        }
+        DataType::Float32 => {
+            let a: Float32Array = scalars
+                .iter()
+                .map(|s| match s {
+                    Some(ScalarValue::Float32(v)) => *v,
+                    _ => None,
+                })
+                .collect();
+            Some(Arc::new(a) as ArrayRef)
+        }
+        DataType::Float64 => {
+            let a: Float64Array = scalars
+                .iter()
+                .map(|s| match s {
+                    Some(ScalarValue::Float64(v)) => *v,
+                    _ => None,
+                })
+                .collect();
+            Some(Arc::new(a) as ArrayRef)
+        }
+        DataType::Utf8 => {
+            let a: StringArray = scalars
+                .iter()
+                .map(|s| match s {
+                    Some(ScalarValue::Utf8(v)) => v.as_deref(),
+                    _ => None,
+                })
+                .collect();
+            Some(Arc::new(a) as ArrayRef)
+        }
+        DataType::Date32 => {
+            let a: Date32Array = scalars
+                .iter()
+                .map(|s| match s {
+                    Some(ScalarValue::Date32(v)) => *v,
+                    _ => None,
+                })
+                .collect();
+            Some(Arc::new(a) as ArrayRef)
+        }
         DataType::Timestamp(TimeUnit::Microsecond, tz) => {
-            let a: TimestampMicrosecondArray = scalars.iter().map(|s| match s { Some(ScalarValue::TimestampMicrosecond(v, _)) => *v, _ => None }).collect();
-            let a = if let Some(tz) = tz { a.with_timezone(tz.clone()) } else { a };
+            let a: TimestampMicrosecondArray = scalars
+                .iter()
+                .map(|s| match s {
+                    Some(ScalarValue::TimestampMicrosecond(v, _)) => *v,
+                    _ => None,
+                })
+                .collect();
+            let a = if let Some(tz) = tz {
+                a.with_timezone(tz.clone())
+            } else {
+                a
+            };
             Some(Arc::new(a) as ArrayRef)
         }
         _ => None,
@@ -149,10 +258,7 @@ pub fn aggregate_table_statistics(
     iceberg_schema: &iceberg::spec::Schema,
     row_count_exact: bool,
 ) -> Statistics {
-    let num_rows: usize = data_files
-        .iter()
-        .map(|df| df.record_count() as usize)
-        .sum();
+    let num_rows: usize = data_files.iter().map(|df| df.record_count() as usize).sum();
     let total_byte_size: usize = data_files
         .iter()
         .map(|df| df.file_size_in_bytes() as usize)
@@ -213,7 +319,11 @@ fn aggregate_bound(
                     } else {
                         ord == std::cmp::Ordering::Greater
                     };
-                    if take_new { scalar } else { prev }
+                    if take_new {
+                        scalar
+                    } else {
+                        prev
+                    }
                 }
             },
         });
@@ -232,18 +342,32 @@ impl PruningStatistics for IcebergManifestStatistics {
         let field = self.schema.field_with_name(&column.name).ok()?;
         build_bounds_array(&self.data_files, fid, field.data_type(), true)
     }
-    fn num_containers(&self) -> usize { self.data_files.len() }
+    fn num_containers(&self) -> usize {
+        self.data_files.len()
+    }
     fn null_counts(&self, column: &Column) -> Option<ArrayRef> {
         let fid = self.field_id(&column.name)?;
-        let counts: Vec<Option<u64>> = self.data_files.iter().map(|df| df.null_value_counts().get(&fid).copied()).collect();
-        if counts.iter().all(|c| c.is_none()) { return None; }
+        let counts: Vec<Option<u64>> = self
+            .data_files
+            .iter()
+            .map(|df| df.null_value_counts().get(&fid).copied())
+            .collect();
+        if counts.iter().all(|c| c.is_none()) {
+            return None;
+        }
         Some(Arc::new(UInt64Array::from(counts)) as ArrayRef)
     }
     fn row_counts(&self) -> Option<ArrayRef> {
-        let counts: Vec<Option<u64>> = self.data_files.iter().map(|df| Some(df.record_count())).collect();
+        let counts: Vec<Option<u64>> = self
+            .data_files
+            .iter()
+            .map(|df| Some(df.record_count()))
+            .collect();
         Some(Arc::new(UInt64Array::from(counts)) as ArrayRef)
     }
-    fn contained(&self, _column: &Column, _values: &HashSet<ScalarValue>) -> Option<BooleanArray> { None }
+    fn contained(&self, _column: &Column, _values: &HashSet<ScalarValue>) -> Option<BooleanArray> {
+        None
+    }
 }
 
 // ── Tier-1 clustering gate (issue #132) ──────────────────────────────────────
@@ -296,8 +420,14 @@ fn median_relative_spread(per_file: &[(f64, f64)]) -> Option<f64> {
     if per_file.is_empty() {
         return None;
     }
-    let smin = per_file.iter().map(|(lo, _)| *lo).fold(f64::INFINITY, f64::min);
-    let smax = per_file.iter().map(|(_, hi)| *hi).fold(f64::NEG_INFINITY, f64::max);
+    let smin = per_file
+        .iter()
+        .map(|(lo, _)| *lo)
+        .fold(f64::INFINITY, f64::min);
+    let smax = per_file
+        .iter()
+        .map(|(_, hi)| *hi)
+        .fold(f64::NEG_INFINITY, f64::max);
     let range = smax - smin;
     if !range.is_finite() || range <= 0.0 {
         return None;
@@ -386,7 +516,10 @@ mod tests {
         // SSB lineorder shape: every file spans (almost) the whole range.
         let per_file = [(0.0, 100.0), (0.0, 100.0), (1.0, 99.0)];
         let median = median_relative_spread(&per_file).unwrap();
-        assert!(median >= 0.8, "uniform data should report a high spread, got {median}");
+        assert!(
+            median >= 0.8,
+            "uniform data should report a high spread, got {median}"
+        );
     }
 
     #[test]
@@ -394,7 +527,10 @@ mod tests {
         // TPC-DS date-sorted shape: each file covers a narrow, disjoint slice.
         let per_file = [(0.0, 10.0), (20.0, 30.0), (45.0, 55.0), (90.0, 100.0)];
         let median = median_relative_spread(&per_file).unwrap();
-        assert!(median < 0.5, "clustered data should report a low spread, got {median}");
+        assert!(
+            median < 0.5,
+            "clustered data should report a low spread, got {median}"
+        );
     }
 
     #[test]
@@ -403,7 +539,10 @@ mod tests {
         // a single straggler file does not flip a clustered table to "uniform".
         let per_file = [(0.0, 5.0), (10.0, 15.0), (20.0, 25.0), (0.0, 100.0)];
         let median = median_relative_spread(&per_file).unwrap();
-        assert!(median < 0.5, "median should resist one wide file, got {median}");
+        assert!(
+            median < 0.5,
+            "median should resist one wide file, got {median}"
+        );
     }
 
     #[test]
@@ -457,14 +596,24 @@ mod tests {
     #[test]
     fn test_datum_to_scalar_timestamp_micros() {
         let datum = Datum::long(1_700_000_000_000_000i64);
-        let sv = datum_to_scalar(&datum, &DataType::Timestamp(TimeUnit::Microsecond, None)).unwrap();
-        assert_eq!(sv, ScalarValue::TimestampMicrosecond(Some(1_700_000_000_000_000), None));
+        let sv =
+            datum_to_scalar(&datum, &DataType::Timestamp(TimeUnit::Microsecond, None)).unwrap();
+        assert_eq!(
+            sv,
+            ScalarValue::TimestampMicrosecond(Some(1_700_000_000_000_000), None)
+        );
     }
 
     #[test]
     fn test_count_pruned() {
-        assert_eq!(IcebergManifestStatistics::count_pruned(&[true, false, true, false]), 2);
-        assert_eq!(IcebergManifestStatistics::count_pruned(&[true, true, true]), 0);
+        assert_eq!(
+            IcebergManifestStatistics::count_pruned(&[true, false, true, false]),
+            2
+        );
+        assert_eq!(
+            IcebergManifestStatistics::count_pruned(&[true, true, true]),
+            0
+        );
         assert_eq!(IcebergManifestStatistics::count_pruned(&[false, false]), 2);
         assert_eq!(IcebergManifestStatistics::count_pruned(&[]), 0);
     }
@@ -475,8 +624,16 @@ mod tests {
         use iceberg::spec::{NestedField, PrimitiveType, Type};
         let iceberg_schema = iceberg::spec::Schema::builder()
             .with_fields(vec![
-                Arc::new(NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int))),
-                Arc::new(NestedField::optional(2, "name", Type::Primitive(PrimitiveType::String))),
+                Arc::new(NestedField::required(
+                    1,
+                    "id",
+                    Type::Primitive(PrimitiveType::Int),
+                )),
+                Arc::new(NestedField::optional(
+                    2,
+                    "name",
+                    Type::Primitive(PrimitiveType::String),
+                )),
             ])
             .build()
             .unwrap();
@@ -495,7 +652,11 @@ mod tests {
     fn test_empty_containers() {
         use iceberg::spec::{NestedField, PrimitiveType, Type};
         let iceberg_schema = iceberg::spec::Schema::builder()
-            .with_fields(vec![Arc::new(NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)))])
+            .with_fields(vec![Arc::new(NestedField::required(
+                1,
+                "id",
+                Type::Primitive(PrimitiveType::Int),
+            ))])
             .build()
             .unwrap();
         let arrow_schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
@@ -573,13 +734,18 @@ mod tests {
             .build()
             .unwrap();
 
-        let stats =
-            aggregate_column_statistics(&[file_a, file_b], &arrow_schema, &iceberg_schema);
+        let stats = aggregate_column_statistics(&[file_a, file_b], &arrow_schema, &iceberg_schema);
         assert_eq!(stats.len(), 2);
 
         // id: min=10, max=99, nulls=0+1=1
-        assert_eq!(stats[0].min_value, Precision::Inexact(ScalarValue::Int32(Some(10))));
-        assert_eq!(stats[0].max_value, Precision::Inexact(ScalarValue::Int32(Some(99))));
+        assert_eq!(
+            stats[0].min_value,
+            Precision::Inexact(ScalarValue::Int32(Some(10)))
+        );
+        assert_eq!(
+            stats[0].max_value,
+            Precision::Inexact(ScalarValue::Int32(Some(99)))
+        );
         assert_eq!(stats[0].null_count, Precision::Inexact(1));
         assert_eq!(stats[0].distinct_count, Precision::Absent);
 

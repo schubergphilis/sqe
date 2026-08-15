@@ -64,10 +64,7 @@ impl ChannelPool {
     /// freshly-connected channels share one budget. Without this, a pooled
     /// channel would be killed at the 30s default even on a deployment that
     /// configured a longer rpc timeout (COORD-05 / #237).
-    pub fn shared_with_timeouts(
-        connect_timeout: Duration,
-        request_timeout: Duration,
-    ) -> Arc<Self> {
+    pub fn shared_with_timeouts(connect_timeout: Duration, request_timeout: Duration) -> Arc<Self> {
         Arc::new(Self::new(ChannelPoolConfig {
             connect_timeout,
             request_timeout,
@@ -96,7 +93,9 @@ impl ChannelPool {
             .connect_timeout(self.config.connect_timeout)
             .timeout(self.config.request_timeout);
         if let Some(ka) = self.config.keep_alive {
-            endpoint = endpoint.keep_alive_timeout(ka).http2_keep_alive_interval(ka);
+            endpoint = endpoint
+                .keep_alive_timeout(ka)
+                .http2_keep_alive_interval(ka);
         }
         let channel = endpoint.connect().await?;
         *guard = Some(channel.clone());
@@ -139,10 +138,8 @@ mod tests {
     fn shared_with_timeouts_carries_configured_request_timeout() {
         // A deployment configures a 630s rpc timeout; the pooled-channel
         // request_timeout must follow it, not fall back to the 30s default.
-        let pool = ChannelPool::shared_with_timeouts(
-            Duration::from_secs(7),
-            Duration::from_secs(630),
-        );
+        let pool =
+            ChannelPool::shared_with_timeouts(Duration::from_secs(7), Duration::from_secs(630));
         assert_eq!(pool.config.request_timeout, Duration::from_secs(630));
         assert_eq!(pool.config.connect_timeout, Duration::from_secs(7));
         assert_ne!(

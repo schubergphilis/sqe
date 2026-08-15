@@ -72,7 +72,9 @@ async fn grant_posts(server: &MockServer) -> usize {
 async fn grant_succeeds_on_200() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
-        .and(path(format!("/service/plugins/secure/services/grant/{SERVICE}")))
+        .and(path(format!(
+            "/service/plugins/secure/services/grant/{SERVICE}"
+        )))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
         .mount(&server)
         .await;
@@ -90,7 +92,9 @@ async fn grant_succeeds_on_200() {
 async fn grant_fails_loudly_on_non_200() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
-        .and(path(format!("/service/plugins/secure/services/grant/{SERVICE}")))
+        .and(path(format!(
+            "/service/plugins/secure/services/grant/{SERVICE}"
+        )))
         .respond_with(ResponseTemplate::new(403).set_body_string("forbidden"))
         .mount(&server)
         .await;
@@ -119,7 +123,9 @@ async fn grant_fails_loudly_on_non_200() {
 async fn a_grant_with_no_grantor_is_refused_before_any_request() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
-        .and(path(format!("/service/plugins/secure/services/grant/{SERVICE}")))
+        .and(path(format!(
+            "/service/plugins/secure/services/grant/{SERVICE}"
+        )))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
         .mount(&server)
         .await;
@@ -178,7 +184,9 @@ async fn an_already_held_traversal_level_is_not_re_granted() {
         .mount(&server)
         .await;
     Mock::given(method("POST"))
-        .and(path(format!("/service/plugins/secure/services/grant/{SERVICE}")))
+        .and(path(format!(
+            "/service/plugins/secure/services/grant/{SERVICE}"
+        )))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
         .mount(&server)
         .await;
@@ -227,7 +235,9 @@ async fn a_disabled_policy_does_not_count_as_already_held() {
         .mount(&server)
         .await;
     Mock::given(method("POST"))
-        .and(path(format!("/service/plugins/secure/services/grant/{SERVICE}")))
+        .and(path(format!(
+            "/service/plugins/secure/services/grant/{SERVICE}"
+        )))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
         .mount(&server)
         .await;
@@ -285,7 +295,9 @@ async fn the_named_level_is_written_even_when_already_held() {
         .mount(&server)
         .await;
     Mock::given(method("POST"))
-        .and(path(format!("/service/plugins/secure/services/grant/{SERVICE}")))
+        .and(path(format!(
+            "/service/plugins/secure/services/grant/{SERVICE}"
+        )))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
         .mount(&server)
         .await;
@@ -293,7 +305,10 @@ async fn the_named_level_is_written_even_when_already_held() {
     let backend = backend(&server.uri());
     let mut stmt = grant_stmt();
     stmt.with_grant_option = true;
-    backend.grant("token", &stmt).await.expect("grant must succeed");
+    backend
+        .grant("token", &stmt)
+        .await
+        .expect("grant must succeed");
     assert_eq!(
         grant_posts(&server).await,
         1,
@@ -311,7 +326,9 @@ async fn a_403_on_a_traversal_level_names_the_level_and_the_fix() {
     // No GET mock: nothing is known to be already held, so the catalog level -- the
     // first call of the plan -- is attempted and refused.
     Mock::given(method("POST"))
-        .and(path(format!("/service/plugins/secure/services/grant/{SERVICE}")))
+        .and(path(format!(
+            "/service/plugins/secure/services/grant/{SERVICE}"
+        )))
         .respond_with(ResponseTemplate::new(403).set_body_string(
             r#"{"msgDesc":"User doesn't have necessary permission to grant access"}"#,
         ))
@@ -324,7 +341,10 @@ async fn a_403_on_a_traversal_level_names_the_level_and_the_fix() {
         .await
         .expect_err("a 403 must surface")
         .to_string();
-    assert!(err.contains("catalog level"), "must name the level, got: {err}");
+    assert!(
+        err.contains("catalog level"),
+        "must name the level, got: {err}"
+    );
     assert!(
         err.contains("does not cascade"),
         "must say why holding delegate admin on the table is not enough, got: {err}"
@@ -363,7 +383,10 @@ async fn show_grants_parses_policies_on_200() {
 
     let backend = backend(&server.uri());
     let entries = backend
-        .show_grants("token", &GrantFilter::ToGrantee(Grantee::Role("analyst".to_string())))
+        .show_grants(
+            "token",
+            &GrantFilter::ToGrantee(Grantee::Role("analyst".to_string())),
+        )
         .await
         .expect("show_grants against a 200 endpoint must succeed");
     assert_eq!(entries.len(), 1, "one matching grant for role analyst");
@@ -385,7 +408,10 @@ async fn show_grants_fails_loudly_on_non_200() {
 
     let backend = backend(&server.uri());
     let err = backend
-        .show_grants("token", &GrantFilter::ToGrantee(Grantee::Role("analyst".to_string())))
+        .show_grants(
+            "token",
+            &GrantFilter::ToGrantee(Grantee::Role("analyst".to_string())),
+        )
         .await
         .expect_err("a 5xx from the policy API must surface as Err");
     assert!(
@@ -467,7 +493,9 @@ async fn revoke_all_privileges_removes_every_access_type_the_grantee_holds() {
         .mount(&server)
         .await;
     Mock::given(method("POST"))
-        .and(path(format!("/service/plugins/secure/services/revoke/{SERVICE}")))
+        .and(path(format!(
+            "/service/plugins/secure/services/revoke/{SERVICE}"
+        )))
         .respond_with(ResponseTemplate::new(200))
         .mount(&server)
         .await;
@@ -482,7 +510,11 @@ async fn revoke_all_privileges_removes_every_access_type_the_grantee_holds() {
         .expect("REVOKE ALL PRIVILEGES must succeed");
 
     let bodies = revoke_bodies(&server).await;
-    assert_eq!(bodies.len(), 1, "expected exactly one revoke POST: {bodies:?}");
+    assert_eq!(
+        bodies.len(),
+        1,
+        "expected exactly one revoke POST: {bodies:?}"
+    );
     let types: Vec<String> = bodies[0]["accessTypes"]
         .as_array()
         .expect("accessTypes array")
@@ -490,7 +522,10 @@ async fn revoke_all_privileges_removes_every_access_type_the_grantee_holds() {
         .filter_map(|v| v.as_str().map(str::to_string))
         .collect();
     for expected in ["table-data-read", "table-properties-read"] {
-        assert!(types.contains(&expected.to_string()), "missing {expected} in {types:?}");
+        assert!(
+            types.contains(&expected.to_string()),
+            "missing {expected} in {types:?}"
+        );
     }
     assert!(
         !types.contains(&"table-list".to_string()),
@@ -511,7 +546,9 @@ async fn revoke_all_privileges_targets_the_named_table_not_the_catalog() {
         .mount(&server)
         .await;
     Mock::given(method("POST"))
-        .and(path(format!("/service/plugins/secure/services/revoke/{SERVICE}")))
+        .and(path(format!(
+            "/service/plugins/secure/services/revoke/{SERVICE}"
+        )))
         .respond_with(ResponseTemplate::new(200))
         .mount(&server)
         .await;
@@ -544,7 +581,9 @@ async fn revoke_all_privileges_on_a_clean_object_is_a_no_op_that_succeeds() {
         .mount(&server)
         .await;
     Mock::given(method("POST"))
-        .and(path(format!("/service/plugins/secure/services/revoke/{SERVICE}")))
+        .and(path(format!(
+            "/service/plugins/secure/services/revoke/{SERVICE}"
+        )))
         .respond_with(ResponseTemplate::new(200))
         .mount(&server)
         .await;
@@ -577,7 +616,11 @@ async fn revoke_all_privileges_still_requires_a_grantor() {
         "error should name the grantor: {err}"
     );
     assert!(
-        server.received_requests().await.unwrap_or_default().is_empty(),
+        server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .is_empty(),
         "refusal must happen before any request"
     );
 }
@@ -644,12 +687,17 @@ async fn policy_api_grant_creates_a_policy_when_the_resource_has_none() {
     assert_eq!(items.len(), 1, "one grantee item");
     assert_eq!(items[0]["roles"], serde_json::json!(["analyst"]));
     assert!(
-        !items[0]["accesses"].as_array().expect("accesses").is_empty(),
+        !items[0]["accesses"]
+            .as_array()
+            .expect("accesses")
+            .is_empty(),
         "the item must confer something"
     );
     // Nothing may reach the unauthenticated plugin endpoint in this mode.
     assert!(
-        bodies_for(&server, "POST", "/service/plugins/services/").await.is_empty(),
+        bodies_for(&server, "POST", "/service/plugins/services/")
+            .await
+            .is_empty(),
         "default mode must not use the plugin grant endpoint"
     );
 }
@@ -756,7 +804,9 @@ async fn policy_api_revoke_with_no_policy_is_a_noop() {
         .expect("revoking what is not granted should succeed quietly");
 
     assert!(
-        bodies_for(&server, "POST", "/service/public/v2/api/policy").await.is_empty(),
+        bodies_for(&server, "POST", "/service/public/v2/api/policy")
+            .await
+            .is_empty(),
         "a revoke must never create a policy"
     );
 }

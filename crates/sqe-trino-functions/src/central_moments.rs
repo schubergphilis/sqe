@@ -208,7 +208,9 @@ impl CentralMomentsAccumulator {
         self.count += count_b;
         self.m1 = (na * m1a + nb * m1b) / n;
         self.m2 = m2a + m2b + delta2 * na * nb / n;
-        self.m3 = m3a + m3b + delta3 * na * nb * (na - nb) / (n * n)
+        self.m3 = m3a
+            + m3b
+            + delta3 * na * nb * (na - nb) / (n * n)
             + 3.0 * delta * (na * m2b - nb * m2a) / n;
         self.m4 = m4a
             + m4b
@@ -242,15 +244,29 @@ impl Accumulator for CentralMomentsAccumulator {
             .downcast_ref::<UInt64Array>()
             .ok_or_else(|| DataFusionError::Internal("count state must be UInt64".to_string()))?;
         let float_state = |idx: usize| -> DFResult<&Float64Array> {
-            states[idx].as_any().downcast_ref::<Float64Array>().ok_or_else(|| {
-                DataFusionError::Internal(format!("moment state {idx} must be Float64"))
-            })
+            states[idx]
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .ok_or_else(|| {
+                    DataFusionError::Internal(format!("moment state {idx} must be Float64"))
+                })
         };
-        let (m1, m2, m3, m4) = (float_state(1)?, float_state(2)?, float_state(3)?, float_state(4)?);
+        let (m1, m2, m3, m4) = (
+            float_state(1)?,
+            float_state(2)?,
+            float_state(3)?,
+            float_state(4)?,
+        );
 
         for i in 0..counts.len() {
             if counts.is_valid(i) {
-                self.merge_one(counts.value(i), m1.value(i), m2.value(i), m3.value(i), m4.value(i));
+                self.merge_one(
+                    counts.value(i),
+                    m1.value(i),
+                    m2.value(i),
+                    m3.value(i),
+                    m4.value(i),
+                );
             }
         }
         Ok(())
@@ -320,13 +336,19 @@ mod tests {
     fn skewness_matches_trino_formula() {
         // [1,2,3,4,10]: mean 4, m2=50, m3=180 -> sqrt(5)*180/50^1.5.
         let got = run(Moment::Skewness, &[1.0, 2.0, 3.0, 4.0, 10.0]).unwrap();
-        assert!((got - 1.138_419_957_660_617).abs() < 1e-8, "skewness got {got}");
+        assert!(
+            (got - 1.138_419_957_660_617).abs() < 1e-8,
+            "skewness got {got}"
+        );
     }
 
     #[test]
     fn skewness_of_symmetric_data_is_zero() {
         let got = run(Moment::Skewness, &[1.0, 2.0, 3.0, 4.0, 5.0]).unwrap();
-        assert!(got.abs() < 1e-12, "symmetric skewness should be 0, got {got}");
+        assert!(
+            got.abs() < 1e-12,
+            "symmetric skewness should be 0, got {got}"
+        );
     }
 
     #[test]

@@ -89,8 +89,8 @@ pub fn ocsf_to_ship_record(ocsf_line: &str) -> Option<ShipRecord> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::audit::{sample_query_event, Outcome, AuditKind};
     use crate::audit::ocsf::to_ocsf;
+    use crate::audit::{sample_query_event, AuditKind, Outcome};
 
     fn success_ocsf_line(seq: u64) -> String {
         let mut ev = sample_query_event();

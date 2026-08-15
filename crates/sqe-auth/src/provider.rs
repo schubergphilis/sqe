@@ -215,7 +215,10 @@ mod tests {
 
         // Identifiers and roles are fine to log.
         assert!(debug.contains("alice"), "user_id should appear: {debug}");
-        assert!(debug.contains("Alice"), "display_name should appear: {debug}");
+        assert!(
+            debug.contains("Alice"),
+            "display_name should appear: {debug}"
+        );
         assert!(debug.contains("analyst"), "role should appear: {debug}");
 
         // Secrets must NOT appear in any form.
@@ -228,7 +231,10 @@ mod tests {
             "refresh_token leaked to Debug output: {debug}"
         );
         // Presence sentinel is shown so operators can tell the field was set.
-        assert!(debug.contains("<set>"), "presence sentinel missing: {debug}");
+        assert!(
+            debug.contains("<set>"),
+            "presence sentinel missing: {debug}"
+        );
     }
 
     #[test]
@@ -252,7 +258,10 @@ mod tests {
             !debug.contains("ey-bearer-private"),
             "bearer_token leaked to Debug output: {debug}"
         );
-        assert!(debug.contains("<set>"), "presence sentinel missing: {debug}");
+        assert!(
+            debug.contains("<set>"),
+            "presence sentinel missing: {debug}"
+        );
     }
 
     #[test]
@@ -267,8 +276,14 @@ mod tests {
         // `Option<SecretString>` derives Debug as `None` (or `Some(<set>)`).
         // The presence sentinel `<set>` must not appear, and the literal
         // `None` must, when the underlying option is empty.
-        assert!(debug.contains("password: None"), "expected 'password: None': {debug}");
-        assert!(debug.contains("bearer_token: None"), "expected 'bearer_token: None': {debug}");
+        assert!(
+            debug.contains("password: None"),
+            "expected 'password: None': {debug}"
+        );
+        assert!(
+            debug.contains("bearer_token: None"),
+            "expected 'bearer_token: None': {debug}"
+        );
         assert!(
             !debug.contains("<set>"),
             "no fields should render as set in this fixture: {debug}"

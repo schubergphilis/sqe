@@ -4,17 +4,17 @@ pub mod distributed_sort;
 pub mod external_aggregate;
 pub mod grace_hash_join;
 pub mod join_strategy;
-pub mod sort_memory;
-pub mod sort_memory_rule;
 pub mod predicate_transfer;
 pub mod scan_morsel;
 pub mod scan_task;
 pub mod shuffle_exec;
 pub mod single_distinct_count;
+pub mod sort_memory;
+pub mod sort_memory_rule;
 pub mod splitter;
-pub mod stats;
 pub mod stage_planner;
 pub mod star_schema_reorder;
+pub mod stats;
 
 pub use distributed_aggregate::{
     AggregateStrategy, DistributedAggregateRule, FinalAggregateExec, PartialAggregateExec,
@@ -38,14 +38,7 @@ pub use grace_hash_join::{
     choose_local_join_strategy, grace_inner_join, GraceHashJoinConfig, GraceJoinConsumer,
     GraceJoinProfile, LocalJoinStrategy, DEFAULT_GRACE_PARTITIONS, DEFAULT_MAX_RECURSION,
 };
-pub use join_strategy::{
-    BuildSizeEstimate, JoinStrategyRule, DEFAULT_HASH_JOIN_THRESHOLD,
-};
-pub use sort_memory::{
-    SortAdmissionError, SortConsumer, SortMemoryPolicy, DEFAULT_SORT_MERGE_FANIN,
-};
-pub use sort_memory_rule::SortMemoryRule;
-pub use star_schema_reorder::{StarSchemaReorderRule, DEFAULT_MIN_RATIO};
+pub use join_strategy::{BuildSizeEstimate, JoinStrategyRule, DEFAULT_HASH_JOIN_THRESHOLD};
 pub use predicate_transfer::{
     build_predicate_transfer, extract_distinct_from_batches, extract_distinct_values,
     PredicateTransfer, MAX_PREDICATE_TRANSFER_VALUES,
@@ -58,6 +51,11 @@ pub use scan_morsel::{
 pub use scan_task::ScanTask;
 pub use shuffle_exec::{ShufflePartitioning, ShuffleReaderExec, ShuffleWriterExec};
 pub use single_distinct_count::SingleDistinctCountCompanionRule;
+pub use sort_memory::{
+    SortAdmissionError, SortConsumer, SortMemoryPolicy, DEFAULT_SORT_MERGE_FANIN,
+};
+pub use sort_memory_rule::SortMemoryRule;
 pub use splitter::bin_pack_files;
 pub use splitter::split_files;
 pub use stage_planner::{compute_waves, decompose_plan, QueryStage, ShuffleType};
+pub use star_schema_reorder::{StarSchemaReorderRule, DEFAULT_MIN_RATIO};

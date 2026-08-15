@@ -218,11 +218,7 @@ pub const SPARK_CATALOG: &str = "acwh";
 ///
 /// `session`'s bearer token gives POLARIS the identity. `hadoop_user` gives
 /// KYUUBI its (merely asserted) one. Callers normally pass the same person.
-pub async fn spark_sql(
-    session: &sqe_core::Session,
-    hadoop_user: &str,
-    sql: &str,
-) -> SparkOutcome {
+pub async fn spark_sql(session: &sqe_core::Session, hadoop_user: &str, sql: &str) -> SparkOutcome {
     spark_sql_inner(session, hadoop_user, sql, None).await
 }
 
@@ -291,8 +287,21 @@ fn write_plugin_conf(service: &str) -> (String, String) {
     let script = r#"mkdir -p "$1" && printf '%s' "$2" > "$1"/ranger-spark-security.xml                     && rm -rf "$3" && mkdir -p "$3" && chmod -R 777 "$1" "$3""#;
     let out = std::process::Command::new("docker")
         .args([
-            "compose", "-f", &compose_file(), "exec", "-T", "-u", "root", "spark",
-            "sh", "-c", script, "sh", &conf_dir, &xml, &cache_dir,
+            "compose",
+            "-f",
+            &compose_file(),
+            "exec",
+            "-T",
+            "-u",
+            "root",
+            "spark",
+            "sh",
+            "-c",
+            script,
+            "sh",
+            &conf_dir,
+            &xml,
+            &cache_dir,
         ])
         .output()
         .expect("write the ranger plugin conf into the spark container");

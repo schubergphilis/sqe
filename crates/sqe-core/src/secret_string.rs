@@ -90,7 +90,11 @@ impl SecretString {
 
 impl fmt::Debug for SecretString {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(if self.0.is_empty() { "<unset>" } else { "<set>" })
+        f.write_str(if self.0.is_empty() {
+            "<unset>"
+        } else {
+            "<set>"
+        })
     }
 }
 

@@ -70,10 +70,7 @@ pub enum SqeError {
     /// reply comes back during commit / write paths; the dispatcher gets
     /// a direct variant match instead of a substring guess on the body.
     #[error("Auth failure on execution: HTTP {status}{}", body_for_display(body))]
-    ExecutionAuth {
-        status: u16,
-        body: String,
-    },
+    ExecutionAuth { status: u16, body: String },
 
     /// Iceberg commit conflict surfaced as a typed variant so retry logic
     /// does not need to grep for "already referenced" or "commit conflict".
@@ -135,7 +132,11 @@ impl SqeError {
     ) -> Self {
         let message = message.into();
         let code = classify_catalog_error(&message);
-        SqeError::Sourced { code, message, source: Box::new(source) }
+        SqeError::Sourced {
+            code,
+            message,
+            source: Box::new(source),
+        }
     }
 
     /// Execution boundary error that keeps its cause; classified like
@@ -146,7 +147,11 @@ impl SqeError {
     ) -> Self {
         let message = message.into();
         let code = classify_execution_error(&message);
-        SqeError::Sourced { code, message, source: Box::new(source) }
+        SqeError::Sourced {
+            code,
+            message,
+            source: Box::new(source),
+        }
     }
 
     /// Auth boundary error that keeps its cause (`AuthenticationFailed`). (#268)
@@ -462,9 +467,7 @@ impl SqeErrorCode {
             SqeErrorCode::ExecutionFailed => "Query execution failed",
             SqeErrorCode::CatalogError => "Catalog operation failed",
             SqeErrorCode::CatalogUnavailable => "Catalog is unavailable (retry shortly)",
-            SqeErrorCode::CircuitBreakerOpen => {
-                "Catalog circuit breaker is open (recent failures)"
-            }
+            SqeErrorCode::CircuitBreakerOpen => "Catalog circuit breaker is open (recent failures)",
             SqeErrorCode::StorageError => "Storage operation failed",
             SqeErrorCode::CommitConflict => "Commit conflict",
             SqeErrorCode::ResourceExhausted => "Resource exhausted",
@@ -511,9 +514,7 @@ fn classify_catalog_error(msg: &str) -> SqeErrorCode {
     // breaker message was opaque. That sent users hunting for tables
     // that exist when the actual cause was an Authorization header
     // that did not reach the catalog. Surface the real cause.
-    if lower.contains("401")
-        || lower.contains("unauthorized")
-        || lower.contains("www-authenticate")
+    if lower.contains("401") || lower.contains("unauthorized") || lower.contains("www-authenticate")
     {
         return SqeErrorCode::AuthenticationFailed;
     }
@@ -819,7 +820,8 @@ mod tests {
             "Failed to create table: status: 403 Forbidden, ... Unable to \
              create table at location 's3://iceberg-warehouse/main_warehouse/\
              dev_silver/stg_customers__dbt_tmp' because it conflicts with \
-             existing table or namespace".into(),
+             existing table or namespace"
+                .into(),
         );
         let msg = err.client_message();
         assert!(msg.contains("conflicts with existing table"));
@@ -834,9 +836,7 @@ mod tests {
         // the variant-based routing change, the underlying message is shown
         // — that includes column / table names from the query the user
         // actually submitted.
-        let err = SqeError::Execution(
-            "Failed to bind variable: 'p_threshold' not provided".into(),
-        );
+        let err = SqeError::Execution("Failed to bind variable: 'p_threshold' not provided".into());
         let msg = err.client_message();
         assert!(msg.contains("p_threshold"));
         assert!(msg.contains("not provided"));
@@ -881,16 +881,14 @@ mod tests {
 
     #[test]
     fn is_not_found_true_for_catalog_http_404() {
-        let err = SqeError::Catalog(
-            "Failed to drop view (HTTP 404 Not Found): view not found".into(),
-        );
+        let err =
+            SqeError::Catalog("Failed to drop view (HTTP 404 Not Found): view not found".into());
         assert!(err.is_not_found());
     }
 
     #[test]
     fn is_not_found_false_for_catalog_other_status() {
-        let err =
-            SqeError::Catalog("Failed to drop view (HTTP 500 Internal Server Error)".into());
+        let err = SqeError::Catalog("Failed to drop view (HTTP 500 Internal Server Error)".into());
         assert!(!err.is_not_found());
     }
 
@@ -961,8 +959,7 @@ mod tests {
         // SqeSchemaProvider::table(), which made every Iceberg view
         // unreadable. See scripts/access-control-parity-demo.sh section 7.
         let err = SqeError::Catalog(
-            "Failed to load table: Unexpected => Tried to load a table that does not exist"
-                .into(),
+            "Failed to load table: Unexpected => Tried to load a table that does not exist".into(),
         );
         assert_eq!(err.error_code(), SqeErrorCode::TableNotFound);
     }
@@ -992,10 +989,8 @@ mod tests {
             SqeErrorCode::SchemaNotFound
         );
         assert_eq!(
-            SqeError::Catalog(
-                "Failed to load table: 403 Forbidden: table does not exist".into()
-            )
-            .error_code(),
+            SqeError::Catalog("Failed to load table: 403 Forbidden: table does not exist".into())
+                .error_code(),
             SqeErrorCode::AccessDenied
         );
     }
@@ -1023,7 +1018,8 @@ mod tests {
         let err = SqeError::Execution(
             "Query execution error: Failed to commit INSERT transaction: \
              Unexpected, context: { status: 401 Unauthorized, \
-             headers: {\"www-authenticate\": \"Bearer\"} }".into(),
+             headers: {\"www-authenticate\": \"Bearer\"} }"
+                .into(),
         );
         assert_eq!(err.error_code(), SqeErrorCode::AuthenticationFailed);
     }
@@ -1033,7 +1029,8 @@ mod tests {
         let err = SqeError::Execution(
             "Query execution error: Failed to create table: \
              Unexpected, context: { status: 403 Forbidden, \
-             headers: {\"content-type\": \"application/json\"} }".into(),
+             headers: {\"content-type\": \"application/json\"} }"
+                .into(),
         );
         assert_eq!(err.error_code(), SqeErrorCode::AccessDenied);
     }
@@ -1175,9 +1172,7 @@ mod tests {
     fn error_code_catalog_table_with_404_still_classifies_as_table_not_found() {
         // Regression: the new auth-first branch must not steal genuine
         // not-found errors that don't mention auth.
-        let err = SqeError::Catalog(
-            "Failed to load table: HTTP 404 Not Found: orders".into(),
-        );
+        let err = SqeError::Catalog("Failed to load table: HTTP 404 Not Found: orders".into());
         let code = err.error_code();
         assert_eq!(code, SqeErrorCode::TableNotFound);
     }
@@ -1211,9 +1206,8 @@ mod tests {
 
     #[test]
     fn classify_catalog_connection_refused_is_unavailable() {
-        let err = SqeError::Catalog(
-            "Failed to send request: connection refused (os error 61)".into(),
-        );
+        let err =
+            SqeError::Catalog("Failed to send request: connection refused (os error 61)".into());
         assert_eq!(err.error_code(), SqeErrorCode::CatalogUnavailable);
     }
 
@@ -1245,10 +1239,22 @@ mod tests {
 
     #[test]
     fn catalog_unavailable_name_and_trino_code() {
-        assert_eq!(SqeErrorCode::CatalogUnavailable.name(), "CATALOG_UNAVAILABLE");
-        assert_eq!(SqeErrorCode::CircuitBreakerOpen.name(), "CIRCUIT_BREAKER_OPEN");
-        assert_eq!(SqeErrorCode::CatalogUnavailable.trino_error_type(), "EXTERNAL");
-        assert_eq!(SqeErrorCode::CircuitBreakerOpen.trino_error_type(), "EXTERNAL");
+        assert_eq!(
+            SqeErrorCode::CatalogUnavailable.name(),
+            "CATALOG_UNAVAILABLE"
+        );
+        assert_eq!(
+            SqeErrorCode::CircuitBreakerOpen.name(),
+            "CIRCUIT_BREAKER_OPEN"
+        );
+        assert_eq!(
+            SqeErrorCode::CatalogUnavailable.trino_error_type(),
+            "EXTERNAL"
+        );
+        assert_eq!(
+            SqeErrorCode::CircuitBreakerOpen.trino_error_type(),
+            "EXTERNAL"
+        );
     }
 
     #[test]
@@ -1262,9 +1268,18 @@ mod tests {
 
         assert_eq!(SqeErrorCode::SyntaxError.trino_error_type(), "USER_ERROR");
         assert_eq!(SqeErrorCode::TableNotFound.trino_error_type(), "USER_ERROR");
-        assert_eq!(SqeErrorCode::AuthenticationFailed.trino_error_type(), "USER_ERROR");
-        assert_eq!(SqeErrorCode::ExecutionFailed.trino_error_type(), "INTERNAL_ERROR");
-        assert_eq!(SqeErrorCode::InternalError.trino_error_type(), "INTERNAL_ERROR");
+        assert_eq!(
+            SqeErrorCode::AuthenticationFailed.trino_error_type(),
+            "USER_ERROR"
+        );
+        assert_eq!(
+            SqeErrorCode::ExecutionFailed.trino_error_type(),
+            "INTERNAL_ERROR"
+        );
+        assert_eq!(
+            SqeErrorCode::InternalError.trino_error_type(),
+            "INTERNAL_ERROR"
+        );
         assert_eq!(SqeErrorCode::CatalogError.trino_error_type(), "EXTERNAL");
         assert_eq!(SqeErrorCode::StorageError.trino_error_type(), "EXTERNAL");
     }

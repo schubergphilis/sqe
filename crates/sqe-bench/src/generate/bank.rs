@@ -172,7 +172,12 @@ pub fn transaction_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
         fid(1, "t_id", DataType::Int64, false),
         fid(2, "t_day", DataType::Date32, false),
-        fid(3, "t_ts", DataType::Timestamp(TimeUnit::Microsecond, None), false),
+        fid(
+            3,
+            "t_ts",
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            false,
+        ),
         fid(4, "t_a_id", DataType::Int64, false),
         fid(5, "t_counterparty_iban", DataType::Utf8, false),
         fid(6, "t_counterparty_bic", DataType::Utf8, false),
@@ -226,18 +231,37 @@ const COUNTRIES: &[&str] = &[
     "NL", "NL", "NL", "NL", "DE", "DE", "BE", "BE", "FR", "GB", "ES", "IT", "PL", "CH", "US",
 ];
 
-const SEGMENTS: &[&str] = &["retail", "retail", "retail", "retail", "retail", "retail", "sme", "sme", "private", "corporate"];
+const SEGMENTS: &[&str] = &[
+    "retail",
+    "retail",
+    "retail",
+    "retail",
+    "retail",
+    "retail",
+    "sme",
+    "sme",
+    "private",
+    "corporate",
+];
 
 const ACCOUNT_TYPES: &[&str] = &[
-    "current", "current", "current", "current", "current", "current", "savings", "savings",
-    "savings", "brokerage",
+    "current",
+    "current",
+    "current",
+    "current",
+    "current",
+    "current",
+    "savings",
+    "savings",
+    "savings",
+    "brokerage",
 ];
 
 const CURRENCIES: &[&str] = &["EUR", "EUR", "EUR", "EUR", "USD", "GBP", "CHF"];
 
 const STATUSES: &[&str] = &[
-    "open", "open", "open", "open", "open", "open", "open", "open", "open", "open", "open",
-    "open", "dormant", "closed",
+    "open", "open", "open", "open", "open", "open", "open", "open", "open", "open", "open", "open",
+    "dormant", "closed",
 ];
 
 const RISK_RATINGS: &[&str] = &[
@@ -245,37 +269,87 @@ const RISK_RATINGS: &[&str] = &[
 ];
 
 const SOURCES_OF_FUNDS: &[&str] = &[
-    "salary", "salary", "salary", "salary", "business income", "savings", "pension",
-    "investments", "property sale", "inheritance",
+    "salary",
+    "salary",
+    "salary",
+    "salary",
+    "business income",
+    "savings",
+    "pension",
+    "investments",
+    "property sale",
+    "inheritance",
 ];
 
 const CHANNELS: &[&str] = &[
-    "sepa", "sepa", "sepa", "sepa", "sepa", "sepa", "sepa", "sepa", "card", "card", "card",
-    "card", "card", "card", "instant", "instant", "instant", "internal", "internal", "swift",
+    "sepa", "sepa", "sepa", "sepa", "sepa", "sepa", "sepa", "sepa", "card", "card", "card", "card",
+    "card", "card", "instant", "instant", "instant", "internal", "internal", "swift",
 ];
 
 const CATEGORIES: &[&str] = &[
-    "groceries", "utilities", "rent", "mortgage", "salary", "restaurants", "transport",
-    "insurance", "healthcare", "entertainment", "travel", "online retail", "fuel", "telecom",
-    "subscriptions", "cash withdrawal", "transfer", "investment", "fees", "taxes",
+    "groceries",
+    "utilities",
+    "rent",
+    "mortgage",
+    "salary",
+    "restaurants",
+    "transport",
+    "insurance",
+    "healthcare",
+    "entertainment",
+    "travel",
+    "online retail",
+    "fuel",
+    "telecom",
+    "subscriptions",
+    "cash withdrawal",
+    "transfer",
+    "investment",
+    "fees",
+    "taxes",
 ];
 
 const TXN_STATUSES_100: &[&str] = &["pending", "pending", "rejected"];
 
 const BICS: &[&str] = &[
-    "SQEBNL2A", "INGBNL2A", "RABONL2U", "ABNANL2A", "DEUTDEFF", "BNPAFRPP", "GEBABEBB",
-    "BARCGB22", "UBSWCHZH", "CAIXESBB", "UNCRITMM", "PKOPPLPW",
+    "SQEBNL2A", "INGBNL2A", "RABONL2U", "ABNANL2A", "DEUTDEFF", "BNPAFRPP", "GEBABEBB", "BARCGB22",
+    "UBSWCHZH", "CAIXESBB", "UNCRITMM", "PKOPPLPW",
 ];
 
 const DESC_VERBS: &[&str] = &[
-    "payment", "transfer", "purchase", "settlement", "refund", "invoice", "order", "donation",
-    "installment", "top-up",
+    "payment",
+    "transfer",
+    "purchase",
+    "settlement",
+    "refund",
+    "invoice",
+    "order",
+    "donation",
+    "installment",
+    "top-up",
 ];
 
 const DESC_MERCHANTS: &[&str] = &[
-    "Albert Heijn", "Shell Station", "Deutsche Bahn", "Amazon Marketplace", "IKEA", "Bol.com",
-    "Carrefour", "Zalando", "Spotify", "NS International", "Vattenfall", "KPN", "Lidl",
-    "Booking.com", "Airbnb Payments", "Uber", "Apple Services", "Steam Games", "H&M", "Decathlon",
+    "Albert Heijn",
+    "Shell Station",
+    "Deutsche Bahn",
+    "Amazon Marketplace",
+    "IKEA",
+    "Bol.com",
+    "Carrefour",
+    "Zalando",
+    "Spotify",
+    "NS International",
+    "Vattenfall",
+    "KPN",
+    "Lidl",
+    "Booking.com",
+    "Airbnb Payments",
+    "Uber",
+    "Apple Services",
+    "Steam Games",
+    "H&M",
+    "Decathlon",
 ];
 
 // ---------------------------------------------------------------------------
@@ -516,7 +590,9 @@ pub fn transaction_day_shard(
             // Ascending across the unit: each row advances by the day span
             // divided by the unit's row count. Files cut from this stream
             // cover contiguous time windows, so ts min/max stats are tight.
-            t_ts.push(day_start_micros + (row as i128 * DAY_MICROS as i128 / rows.max(1) as i128) as i64);
+            t_ts.push(
+                day_start_micros + (row as i128 * DAY_MICROS as i128 / rows.max(1) as i128) as i64,
+            );
             // Draw unconditionally so the rng sequence (and every non-ring
             // row) is identical whether or not this row joins the ring.
             let drawn_a_id =
@@ -549,7 +625,11 @@ pub fn transaction_day_shard(
             t_category.push(CATEGORIES[rng.gen_range(0..CATEGORIES.len())]);
             // 97% settled, 2% pending, 1% rejected.
             let s = rng.gen_range(0..100u32);
-            t_status.push(if s < 97 { "settled" } else { TXN_STATUSES_100[(s - 97) as usize] });
+            t_status.push(if s < 97 {
+                "settled"
+            } else {
+                TXN_STATUSES_100[(s - 97) as usize]
+            });
             // The end-to-end reference mirrors SEPA EndToEndId: unique
             // high-entropy identifiers that give the row a realistic
             // compressed footprint (all other columns dictionary-compress
@@ -807,10 +887,22 @@ mod tests {
 
     #[test]
     fn unit_seed_is_stable_and_distinct() {
-        assert_eq!(unit_seed("transaction", 3, 7), unit_seed("transaction", 3, 7));
-        assert_ne!(unit_seed("transaction", 3, 7), unit_seed("transaction", 3, 8));
-        assert_ne!(unit_seed("transaction", 3, 7), unit_seed("transaction", 4, 7));
-        assert_ne!(unit_seed("transaction", 3, 7), unit_seed("account_balance", 3, 7));
+        assert_eq!(
+            unit_seed("transaction", 3, 7),
+            unit_seed("transaction", 3, 7)
+        );
+        assert_ne!(
+            unit_seed("transaction", 3, 7),
+            unit_seed("transaction", 3, 8)
+        );
+        assert_ne!(
+            unit_seed("transaction", 3, 7),
+            unit_seed("transaction", 4, 7)
+        );
+        assert_ne!(
+            unit_seed("transaction", 3, 7),
+            unit_seed("account_balance", 3, 7)
+        );
     }
 
     #[test]
@@ -871,11 +963,17 @@ mod tests {
                 unit_seed("transaction", 0, 0),
                 day_idx as usize,
             );
-            for batch in
-                transaction_day_shard(day, per_day, t_id_start, 0..plan.accounts(), seed)
-            {
-                let a_ids = batch.column(3).as_any().downcast_ref::<Int64Array>().unwrap();
-                let dirs = batch.column(8).as_any().downcast_ref::<StringArray>().unwrap();
+            for batch in transaction_day_shard(day, per_day, t_id_start, 0..plan.accounts(), seed) {
+                let a_ids = batch
+                    .column(3)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap();
+                let dirs = batch
+                    .column(8)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
                 for i in 0..batch.num_rows() {
                     if dirs.value(i) == "debit" {
                         *debits.entry(a_ids.value(i)).or_default() += 1;
@@ -885,11 +983,17 @@ mod tests {
         }
         for acct in FRAUD_RING_START..FRAUD_RING_START + FRAUD_RING_COUNT {
             let c = debits.get(&acct).copied().unwrap_or(0);
-            assert!(c > 100, "ring account {acct} has {c} debits, expected > 100");
+            assert!(
+                c > 100,
+                "ring account {acct} has {c} debits, expected > 100"
+            );
         }
         for acct in [500i64, 5_000, 20_000] {
             let c = debits.get(&acct).copied().unwrap_or(0);
-            assert!(c <= 100, "non-ring account {acct} has {c} debits, expected <= 100");
+            assert!(
+                c <= 100,
+                "non-ring account {acct} has {c} debits, expected <= 100"
+            );
         }
     }
 

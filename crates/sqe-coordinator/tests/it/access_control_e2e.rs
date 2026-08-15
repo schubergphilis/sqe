@@ -92,7 +92,10 @@ async fn fixture_round_trip_creates_services_and_policies() {
         .await
         .expect("create policy");
 
-    let policies = ranger.get_policies(HIVE_SERVICE).await.expect("list policies");
+    let policies = ranger
+        .get_policies(HIVE_SERVICE)
+        .await
+        .expect("list policies");
     assert!(
         policies
             .iter()
@@ -103,7 +106,10 @@ async fn fixture_round_trip_creates_services_and_policies() {
     // The tag service must be linked to the hive service, otherwise the
     // downloaded bundle carries no `tagPolicies` block and every tag test would
     // fail for the wrong reason.
-    let bundle = ranger.download_bundle(HIVE_SERVICE).await.expect("download bundle");
+    let bundle = ranger
+        .download_bundle(HIVE_SERVICE)
+        .await
+        .expect("download bundle");
     assert!(
         bundle.get("tagPolicies").is_some(),
         "bundle for {HIVE_SERVICE} must contain tagPolicies once {TAG_SERVICE} is linked; got keys {:?}",
@@ -111,7 +117,10 @@ async fn fixture_round_trip_creates_services_and_policies() {
     );
 
     let removed = ranger.delete_test_policies().await.expect("cleanup");
-    assert!(removed >= 1, "cleanup must delete at least the policy we made");
+    assert!(
+        removed >= 1,
+        "cleanup must delete at least the policy we made"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -417,7 +426,11 @@ async fn cross_user_insert_then_delete_sees_the_committed_snapshot() {
         &format!("SELECT id FROM {ORDERS} WHERE id = 909"),
     )
     .await;
-    assert_eq!(total_rows(&remaining), 0, "the cross-user probe row must be gone");
+    assert_eq!(
+        total_rows(&remaining),
+        0,
+        "the cross-user probe row must be gone"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -498,9 +511,9 @@ async fn setup_removes_grants_the_suite_wrote_through_sql() {
         .await
         .expect("list coarse-gate policies");
     assert!(
-        survivors.iter().any(|p| {
-            p["resources"]["catalog"]["values"] == serde_json::json!(["*"])
-        }),
+        survivors
+            .iter()
+            .any(|p| { p["resources"]["catalog"]["values"] == serde_json::json!(["*"]) }),
         "the baseline catalog-wildcard grants must not be collateral damage"
     );
 }
@@ -568,7 +581,11 @@ async fn role_grant_and_user_grant_both_apply() {
     let orders = crate::common::eventually("bob's role grant on orders", || async {
         match ctx
             .handler
-            .execute(&ctx.bob, &format!("SELECT id FROM {ORDERS} ORDER BY id"), None)
+            .execute(
+                &ctx.bob,
+                &format!("SELECT id FROM {ORDERS} ORDER BY id"),
+                None,
+            )
             .await
         {
             Ok(b) if total_rows(&b) == 3 => Ok(b),
@@ -583,7 +600,11 @@ async fn role_grant_and_user_grant_both_apply() {
     let audit = crate::common::eventually("bob's user grant on audit", || async {
         match ctx
             .handler
-            .execute(&ctx.bob, &format!("SELECT event FROM {AUDIT} ORDER BY id"), None)
+            .execute(
+                &ctx.bob,
+                &format!("SELECT event FROM {AUDIT} ORDER BY id"),
+                None,
+            )
             .await
         {
             Ok(b) if total_rows(&b) == 2 => Ok(b),
@@ -632,7 +653,12 @@ async fn write_privileges_are_separate_from_read() {
         }
     })
     .await;
-    let after = exec_ok(&ctx, &ctx.carol, &format!("SELECT id FROM {ORDERS} ORDER BY id")).await;
+    let after = exec_ok(
+        &ctx,
+        &ctx.carol,
+        &format!("SELECT id FROM {ORDERS} ORDER BY id"),
+    )
+    .await;
     assert_eq!(col_strings(&after, "id"), vec!["1", "2", "3", "4"]);
 
     // alice (analyst) holds SELECT only: no INSERT, no DROP.
@@ -656,11 +682,18 @@ async fn write_privileges_are_separate_from_read() {
         .handler
         .execute(&ctx.alice, &format!("DROP TABLE {ORDERS}"), None)
         .await;
-    assert!(drop.is_err(), "alice holds SELECT only; DROP must be denied");
+    assert!(
+        drop.is_err(),
+        "alice holds SELECT only; DROP must be denied"
+    );
 
     // Prove the DROP really did not happen.
-    let still_there =
-        exec_ok(&ctx, &ctx.carol, &format!("SELECT id FROM {ORDERS} ORDER BY id")).await;
+    let still_there = exec_ok(
+        &ctx,
+        &ctx.carol,
+        &format!("SELECT id FROM {ORDERS} ORDER BY id"),
+    )
+    .await;
     assert_eq!(
         total_rows(&still_there),
         4,
@@ -704,7 +737,10 @@ async fn add_deny_item_to_audit_policy(ctx: &AcCtx) {
             {"type": "table-data-read", "isAllowed": true}
         ]
     });
-    match target.get_mut("denyPolicyItems").and_then(|v| v.as_array_mut()) {
+    match target
+        .get_mut("denyPolicyItems")
+        .and_then(|v| v.as_array_mut())
+    {
         Some(items) => items.push(deny),
         None => target["denyPolicyItems"] = serde_json::json!([deny]),
     }
@@ -943,7 +979,10 @@ async fn resource_column_masks_apply_to_engineer_only() {
     let bob = crate::common::eventually("bob's masks to apply", || async {
         match ctx.handler.execute(&ctx.bob, &sql, None).await {
             Ok(b) if col_strings(&b, "amount").iter().all(|v| v == "NULL") => Ok(b),
-            Ok(b) => Err(format!("amount not masked: {:?}", col_strings(&b, "amount"))),
+            Ok(b) => Err(format!(
+                "amount not masked: {:?}",
+                col_strings(&b, "amount")
+            )),
             Err(e) => Err(format!("query failed: {e}")),
         }
     })
@@ -962,7 +1001,10 @@ async fn resource_column_masks_apply_to_engineer_only() {
 
     // alice is analyst-only: the engineer policies do not apply to her.
     let alice = exec_ok(&ctx, &ctx.alice, &sql).await;
-    assert_eq!(col_strings(&alice, "amount"), vec!["10.00", "20.00", "30.00"]);
+    assert_eq!(
+        col_strings(&alice, "amount"),
+        vec!["10.00", "20.00", "30.00"]
+    );
     assert_eq!(
         col_strings(&alice, "ssn"),
         vec!["111-11-1111", "222-22-2222", "333-33-3333"]
@@ -1151,8 +1193,7 @@ async fn tag_column_mask_applies_from_iceberg_property() {
     let bob = crate::common::eventually("bob's tag mask to apply", || async {
         match ctx.handler.execute(&ctx.bob, &sql, None).await {
             Ok(b)
-                if col_strings(&b, "ssn")
-                    == vec!["xxx-xx-1111", "xxx-xx-2222", "xxx-xx-3333"] =>
+                if col_strings(&b, "ssn") == vec!["xxx-xx-1111", "xxx-xx-2222", "xxx-xx-3333"] =>
             {
                 Ok(b)
             }
@@ -1410,8 +1451,8 @@ async fn show_grants_lists_both_roles() {
         {
             Ok(b) => {
                 let cells = all_cells(&b);
-                let has_both = cells.iter().any(|c| c == "analyst")
-                    && cells.iter().any(|c| c == "engineer");
+                let has_both =
+                    cells.iter().any(|c| c == "analyst") && cells.iter().any(|c| c == "engineer");
                 if has_both {
                     Ok(cells)
                 } else {
@@ -1658,8 +1699,17 @@ async fn ranger_outage_fails_closed() {
     // pass vacuously.
     let warm = crate::common::eventually("bob's mask to apply before the outage", || async {
         match ctx.handler.execute(&ctx.bob, &sql, None).await {
-            Ok(b) if col_strings(&b, "ssn").iter().all(|v| v.starts_with("xxx-xx-")) => Ok(b),
-            Ok(b) => Err(format!("mask not applied yet: {:?}", col_strings(&b, "ssn"))),
+            Ok(b)
+                if col_strings(&b, "ssn")
+                    .iter()
+                    .all(|v| v.starts_with("xxx-xx-")) =>
+            {
+                Ok(b)
+            }
+            Ok(b) => Err(format!(
+                "mask not applied yet: {:?}",
+                col_strings(&b, "ssn")
+            )),
             Err(e) => Err(format!("query failed: {e}")),
         }
     })
@@ -1669,8 +1719,8 @@ async fn ranger_outage_fails_closed() {
     {
         // Guard restarts ranger-admin on drop, including on panic, so a failure
         // here cannot poison the rest of the suite.
-        let _outage = crate::common::ranger_fixture::RangerOutage::begin()
-            .expect("stop ranger-admin");
+        let _outage =
+            crate::common::ranger_fixture::RangerOutage::begin().expect("stop ranger-admin");
 
         // The resolved-policy cache holds for policy.ranger.cache-ttl-secs (2s in
         // the test config), so the deny appears once the cache expires and the
@@ -1713,7 +1763,9 @@ async fn ranger_outage_fails_closed() {
             match ctx.handler.execute(&ctx.bob, &sql, None).await {
                 Ok(b)
                     if total_rows(&b) == 3
-                        && col_strings(&b, "ssn").iter().all(|v| v.starts_with("xxx-xx-")) =>
+                        && col_strings(&b, "ssn")
+                            .iter()
+                            .all(|v| v.starts_with("xxx-xx-")) =>
                 {
                     Ok(b)
                 }
@@ -1796,7 +1848,11 @@ async fn cache_ttl_bounds_policy_staleness() {
     // "no mask for bob" decision. `slow` has an empty policy cache, so this is
     // necessarily a miss-then-insert: the clock below starts on the insert.
     let warm_fresh = exec_ok(&ctx, &ctx.bob, &sql).await;
-    assert_eq!(col_strings(&warm_fresh, "ssn"), raw, "precondition: no mask");
+    assert_eq!(
+        col_strings(&warm_fresh, "ssn"),
+        raw,
+        "precondition: no mask"
+    );
     let warm_slow = slow
         .execute(&ctx.bob, &sql, None)
         .await
@@ -1820,7 +1876,13 @@ async fn cache_ttl_bounds_policy_staleness() {
     // Edge 1 -- expiry: the 2s TTL lets the new mask through.
     crate::common::eventually("the short-TTL handler to pick up the new mask", || async {
         match ctx.handler.execute(&ctx.bob, &sql, None).await {
-            Ok(b) if col_strings(&b, "ssn").iter().all(|v| v.starts_with("xxx-xx-")) => Ok(()),
+            Ok(b)
+                if col_strings(&b, "ssn")
+                    .iter()
+                    .all(|v| v.starts_with("xxx-xx-")) =>
+            {
+                Ok(())
+            }
             Ok(b) => Err(format!("still raw: {:?}", col_strings(&b, "ssn"))),
             Err(e) => Err(format!("query failed: {e}")),
         }
@@ -1865,7 +1927,13 @@ async fn cache_ttl_bounds_policy_staleness() {
         "the long-TTL handler to expire its cache and apply the mask",
         || async {
             match slow.execute(&ctx.bob, &sql, None).await {
-                Ok(b) if col_strings(&b, "ssn").iter().all(|v| v.starts_with("xxx-xx-")) => Ok(()),
+                Ok(b)
+                    if col_strings(&b, "ssn")
+                        .iter()
+                        .all(|v| v.starts_with("xxx-xx-")) =>
+                {
+                    Ok(())
+                }
                 Ok(b) => Err(format!("still stale: {:?}", col_strings(&b, "ssn"))),
                 Err(e) => Err(format!("query failed: {e}")),
             }
@@ -1939,13 +2007,15 @@ async fn remaining_mask_types_apply_live() {
         .await
         .expect("create CUSTOM policy");
 
-    let sql =
-        format!("SELECT region, ssn, signed_on, email FROM {ORDERS} ORDER BY id");
+    let sql = format!("SELECT region, ssn, signed_on, email FROM {ORDERS} ORDER BY id");
 
     let bob = crate::common::eventually("all four mask types to apply", || async {
         match ctx.handler.execute(&ctx.bob, &sql, None).await {
             Ok(b) if col_strings(&b, "region").first().map(String::as_str) == Some("XX") => Ok(b),
-            Ok(b) => Err(format!("region not redacted yet: {:?}", col_strings(&b, "region"))),
+            Ok(b) => Err(format!(
+                "region not redacted yet: {:?}",
+                col_strings(&b, "region")
+            )),
             Err(e) => Err(format!("query failed: {e}")),
         }
     })
@@ -1977,8 +2047,14 @@ async fn remaining_mask_types_apply_live() {
     // the control that proves the values above are masks and not the fixture.
     let alice = exec_ok(&ctx, &ctx.alice, &sql).await;
     assert_eq!(col_strings(&alice, "region"), vec!["EU", "US", "EU"]);
-    assert_eq!(col_strings(&alice, "ssn").first().map(String::as_str), Some("111-11-1111"));
-    assert_eq!(col_strings(&alice, "signed_on").first().map(String::as_str), Some("2021-05-04"));
+    assert_eq!(
+        col_strings(&alice, "ssn").first().map(String::as_str),
+        Some("111-11-1111")
+    );
+    assert_eq!(
+        col_strings(&alice, "signed_on").first().map(String::as_str),
+        Some("2021-05-04")
+    );
     assert_eq!(col_strings(&alice, "email"), vec!["a@x", "b@x", "c@x"]);
 }
 
@@ -2077,23 +2153,44 @@ async fn all_tables_in_schema_grant_covers_the_namespace() {
     .await;
 
     // Existing table.
-    let first = crate::common::eventually("the wildcard grant to enable the existing table", || async {
-        match ctx.handler.execute(&ctx.alice, &format!("SELECT id FROM {ORDERS}"), None).await {
-            Ok(b) if total_rows(&b) == 3 => Ok(b),
-            Ok(b) => Err(format!("{} rows", total_rows(&b))),
-            Err(e) => Err(format!("query failed: {e}")),
-        }
-    })
+    let first = crate::common::eventually(
+        "the wildcard grant to enable the existing table",
+        || async {
+            match ctx
+                .handler
+                .execute(&ctx.alice, &format!("SELECT id FROM {ORDERS}"), None)
+                .await
+            {
+                Ok(b) if total_rows(&b) == 3 => Ok(b),
+                Ok(b) => Err(format!("{} rows", total_rows(&b))),
+                Err(e) => Err(format!("query failed: {e}")),
+            }
+        },
+    )
     .await;
     assert_eq!(total_rows(&first), 3);
 
     // A table created AFTER the grant. Ranger has no future-only resource, so the
     // wildcard covers it; this is the documented difference from Snowflake, where
     // ON ALL and ON FUTURE are distinct.
-    exec_ok(&ctx, &ctx.carol, &format!("CREATE TABLE {second} (id BIGINT)")).await;
-    exec_ok(&ctx, &ctx.carol, &format!("INSERT INTO {second} VALUES (7)")).await;
+    exec_ok(
+        &ctx,
+        &ctx.carol,
+        &format!("CREATE TABLE {second} (id BIGINT)"),
+    )
+    .await;
+    exec_ok(
+        &ctx,
+        &ctx.carol,
+        &format!("INSERT INTO {second} VALUES (7)"),
+    )
+    .await;
     let later = crate::common::eventually("the wildcard grant to cover a new table", || async {
-        match ctx.handler.execute(&ctx.alice, &format!("SELECT id FROM {second}"), None).await {
+        match ctx
+            .handler
+            .execute(&ctx.alice, &format!("SELECT id FROM {second}"), None)
+            .await
+        {
             Ok(b) if total_rows(&b) == 1 => Ok(b),
             Ok(b) => Err(format!("{} rows", total_rows(&b))),
             Err(e) => Err(format!("query failed: {e}")),
@@ -2144,13 +2241,22 @@ async fn revoking_write_leaves_an_independent_read_grant_intact() {
 
     assert_denied_but_valid(&ctx, &ctx.alice, &format!("SELECT id FROM {ORDERS}")).await;
 
-    exec_ok(&ctx, &ctx.carol, &format!("GRANT SELECT ON {ORDERS} TO ROLE \"analyst\"")).await;
-    exec_ok(&ctx, &ctx.carol, &format!("GRANT INSERT ON {ORDERS} TO ROLE \"analyst\"")).await;
+    exec_ok(
+        &ctx,
+        &ctx.carol,
+        &format!("GRANT SELECT ON {ORDERS} TO ROLE \"analyst\""),
+    )
+    .await;
+    exec_ok(
+        &ctx,
+        &ctx.carol,
+        &format!("GRANT INSERT ON {ORDERS} TO ROLE \"analyst\""),
+    )
+    .await;
 
     // Both grants live: alice can read, and can write.
-    let probe = format!(
-        "INSERT INTO {ORDERS} VALUES (91,'EU',1.0,'999-99-9999','z@x',DATE '2021-01-01')"
-    );
+    let probe =
+        format!("INSERT INTO {ORDERS} VALUES (91,'EU',1.0,'999-99-9999','z@x',DATE '2021-01-01')");
     crate::common::eventually("both grants to land for alice", || async {
         match ctx.handler.execute(&ctx.alice, &probe, None).await {
             Ok(_) => Ok(()),
@@ -2164,17 +2270,28 @@ async fn revoking_write_leaves_an_independent_read_grant_intact() {
             .await
             .expect("alice holds SELECT"),
     );
-    assert!(baseline >= 4, "alice's own insert should be visible, got {baseline} rows");
+    assert!(
+        baseline >= 4,
+        "alice's own insert should be visible, got {baseline} rows"
+    );
 
-    exec_ok(&ctx, &ctx.carol, &format!("REVOKE INSERT ON {ORDERS} FROM ROLE \"analyst\"")).await;
+    exec_ok(
+        &ctx,
+        &ctx.carol,
+        &format!("REVOKE INSERT ON {ORDERS} FROM ROLE \"analyst\""),
+    )
+    .await;
 
     // The write stops.
-    crate::common::eventually("alice's INSERT to be denied after REVOKE INSERT", || async {
-        match ctx.handler.execute(&ctx.alice, &probe, None).await {
-            Err(_) => Ok(()),
-            Ok(_) => Err("insert still allowed".to_string()),
-        }
-    })
+    crate::common::eventually(
+        "alice's INSERT to be denied after REVOKE INSERT",
+        || async {
+            match ctx.handler.execute(&ctx.alice, &probe, None).await {
+                Err(_) => Ok(()),
+                Ok(_) => Err("insert still allowed".to_string()),
+            }
+        },
+    )
     .await;
 
     // The read survives. THIS is the regression: before the fix alice had no
@@ -2199,9 +2316,18 @@ async fn revoking_write_leaves_an_independent_read_grant_intact() {
     // The control that keeps this honest: revoke must still REVOKE. Without it,
     // holding back every access type would satisfy the assertion above while
     // turning REVOKE into a no-op.
-    exec_ok(&ctx, &ctx.carol, &format!("REVOKE SELECT ON {ORDERS} FROM ROLE \"analyst\"")).await;
+    exec_ok(
+        &ctx,
+        &ctx.carol,
+        &format!("REVOKE SELECT ON {ORDERS} FROM ROLE \"analyst\""),
+    )
+    .await;
     crate::common::eventually("the SELECT revoke to take effect", || async {
-        match ctx.handler.execute(&ctx.alice, &format!("SELECT id FROM {ORDERS}"), None).await {
+        match ctx
+            .handler
+            .execute(&ctx.alice, &format!("SELECT id FROM {ORDERS}"), None)
+            .await
+        {
             Err(_) => Ok(()),
             Ok(b) => Err(format!("still readable with {} rows", total_rows(&b))),
         }
@@ -2210,10 +2336,13 @@ async fn revoking_write_leaves_an_independent_read_grant_intact() {
 
     let _ = ctx
         .handler
-        .execute(&ctx.carol, &format!("DELETE FROM {ORDERS} WHERE id = 91"), None)
+        .execute(
+            &ctx.carol,
+            &format!("DELETE FROM {ORDERS} WHERE id = 91"),
+            None,
+        )
         .await;
 }
-
 
 /// Access types recorded for `user` on the `polaris` policy whose resource is
 /// exactly `{catalog}` + optional `{namespace}` + optional `{table}`.
@@ -2248,7 +2377,11 @@ async fn polaris_access_types_inner(
     namespace: Option<&str>,
     table: Option<&str>,
 ) -> Vec<String> {
-    let policies = ctx.ranger.get_policies("polaris").await.expect("list polaris policies");
+    let policies = ctx
+        .ranger
+        .get_policies("polaris")
+        .await
+        .expect("list polaris policies");
     for p in policies {
         let Some(res) = p.get("resources").and_then(|r| r.as_object()) else {
             continue;
@@ -2268,7 +2401,12 @@ async fn polaris_access_types_inner(
             continue;
         }
         let mut out = Vec::new();
-        for item in p.get("policyItems").and_then(|v| v.as_array()).into_iter().flatten() {
+        for item in p
+            .get("policyItems")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+        {
             let named = item
                 .get(field)
                 .and_then(|u| u.as_array())
@@ -2276,7 +2414,12 @@ async fn polaris_access_types_inner(
             if !named {
                 continue;
             }
-            for a in item.get("accesses").and_then(|v| v.as_array()).into_iter().flatten() {
+            for a in item
+                .get("accesses")
+                .and_then(|v| v.as_array())
+                .into_iter()
+                .flatten()
+            {
                 if let Some(t) = a.get("type").and_then(|t| t.as_str()) {
                     out.push(t.to_string());
                 }
@@ -2347,7 +2490,9 @@ async fn one_table_grant_writes_the_namespace_it_needs() {
         let _ = ctx.handler.execute(&ctx.carol, &stmt, None).await;
     }
     assert!(
-        polaris_access_types_for(&ctx, "dave", "sales_wh", Some("ac"), None).await.is_empty(),
+        polaris_access_types_for(&ctx, "dave", "sales_wh", Some("ac"), None)
+            .await
+            .is_empty(),
         "pre-state: dave must hold nothing on the ac namespace, or the ancestor \
          grant under test cannot be observed"
     );
@@ -2371,7 +2516,12 @@ async fn one_table_grant_writes_the_namespace_it_needs() {
 
     // ONE statement, naming only the table. No catalog grant by hand: writing it
     // is the behaviour under test.
-    exec_ok(&ctx, &ctx.carol, &format!("GRANT SELECT ON {ORDERS} TO USER \"dave\"")).await;
+    exec_ok(
+        &ctx,
+        &ctx.carol,
+        &format!("GRANT SELECT ON {ORDERS} TO USER \"dave\""),
+    )
+    .await;
 
     // All three levels of v4's SELECT plan landed, each carrying exactly its own
     // access type. Asserted as equality rather than `contains`: writing MORE than
@@ -2425,7 +2575,11 @@ async fn one_table_grant_writes_the_namespace_it_needs() {
         std::time::Duration::from_secs(200),
         "dave's read to be allowed once the Polaris plugin picks up the grant",
         || async {
-            match ctx.handler.execute(&ctx.dave, &format!("SELECT id FROM {ORDERS}"), None).await {
+            match ctx
+                .handler
+                .execute(&ctx.dave, &format!("SELECT id FROM {ORDERS}"), None)
+                .await
+            {
                 Ok(b) if total_rows(&b) == 3 => Ok(b),
                 Ok(b) => Err(format!("{} rows, want 3", total_rows(&b))),
                 Err(e) => Err(format!("read failed: {e}")),
@@ -2450,8 +2604,14 @@ async fn one_table_grant_writes_the_namespace_it_needs() {
     );
 
     // Control: revoke still revokes what was granted.
-    exec_ok(&ctx, &ctx.carol, &format!("REVOKE SELECT ON {ORDERS} FROM USER \"dave\"")).await;
-    let after = polaris_access_types_for(&ctx, "dave", "sales_wh", Some("ac"), Some("orders")).await;
+    exec_ok(
+        &ctx,
+        &ctx.carol,
+        &format!("REVOKE SELECT ON {ORDERS} FROM USER \"dave\""),
+    )
+    .await;
+    let after =
+        polaris_access_types_for(&ctx, "dave", "sales_wh", Some("ac"), Some("orders")).await;
     assert!(
         !after.contains(&"table-data-read".to_string()),
         "REVOKE must remove the table access types, got {after:?}"
@@ -2489,7 +2649,11 @@ async fn one_table_grant_writes_the_namespace_it_needs() {
     // this test asserts is deliberate.
     let _ = ctx
         .handler
-        .execute(&ctx.carol, "REVOKE USAGE ON DATABASE sales_wh FROM USER \"dave\"", None)
+        .execute(
+            &ctx.carol,
+            "REVOKE USAGE ON DATABASE sales_wh FROM USER \"dave\"",
+            None,
+        )
         .await;
 }
 
@@ -2519,8 +2683,18 @@ async fn show_schemas_describes_the_catalog_it_names() {
 
     // Distinguishing namespaces. ac_setup already made `ac` in both catalogs, so
     // `ac` alone could not tell them apart.
-    exec_ok(&ctx, &ctx.carol, "CREATE SCHEMA IF NOT EXISTS sales_wh.only_in_sales").await;
-    exec_ok(&ctx, &ctx.carol, "CREATE SCHEMA IF NOT EXISTS ops_wh.only_in_ops").await;
+    exec_ok(
+        &ctx,
+        &ctx.carol,
+        "CREATE SCHEMA IF NOT EXISTS sales_wh.only_in_sales",
+    )
+    .await;
+    exec_ok(
+        &ctx,
+        &ctx.carol,
+        "CREATE SCHEMA IF NOT EXISTS ops_wh.only_in_ops",
+    )
+    .await;
 
     let schemas = |sql: &'static str| {
         let ctx = &ctx;
@@ -2626,26 +2800,50 @@ async fn insert_does_not_confer_storage_relocation() {
 
     // A resource with no policy history.
     let fresh = "sales_wh.ac.orders_fresh_grant";
-    let _ = ctx.handler.execute(&ctx.carol, &format!("DROP TABLE IF EXISTS {fresh}"), None).await;
-    exec_ok(&ctx, &ctx.carol, &format!("CREATE TABLE {fresh} (id BIGINT)")).await;
-    let pre = polaris_access_types_for_role(&ctx, "engineer", "sales_wh", Some("ac"), Some("orders_fresh_grant")).await;
+    let _ = ctx
+        .handler
+        .execute(&ctx.carol, &format!("DROP TABLE IF EXISTS {fresh}"), None)
+        .await;
+    exec_ok(
+        &ctx,
+        &ctx.carol,
+        &format!("CREATE TABLE {fresh} (id BIGINT)"),
+    )
+    .await;
+    let pre = polaris_access_types_for_role(
+        &ctx,
+        "engineer",
+        "sales_wh",
+        Some("ac"),
+        Some("orders_fresh_grant"),
+    )
+    .await;
     assert!(
         pre.is_empty(),
         "this table must have no policy history, or the assertion below measures \
          residue rather than what the grant wrote; got {pre:?}"
     );
 
-    exec_ok(&ctx, &ctx.carol, &format!("GRANT INSERT ON {fresh} TO ROLE \"engineer\"")).await;
+    exec_ok(
+        &ctx,
+        &ctx.carol,
+        &format!("GRANT INSERT ON {fresh} TO ROLE \"engineer\""),
+    )
+    .await;
 
-    let got = polaris_access_types_for_role(&ctx, "engineer", "sales_wh", Some("ac"), Some("orders_fresh_grant")).await;
+    let got = polaris_access_types_for_role(
+        &ctx,
+        "engineer",
+        "sales_wh",
+        Some("ac"),
+        Some("orders_fresh_grant"),
+    )
+    .await;
     assert!(
         got.contains(&"table-data-write".to_string()),
         "the write seed must be there, got {got:?}"
     );
-    assert!(
-        got.len() > 5,
-        "the closure must have expanded, got {got:?}"
-    );
+    assert!(got.len() > 5, "the closure must have expanded, got {got:?}");
     for over in [
         "table-location-set",
         "table-uuid-assign",
@@ -2661,15 +2859,29 @@ async fn insert_does_not_confer_storage_relocation() {
     // The narrowing is only safe if a commit still works without them. This is the
     // control that makes the assertions above more than a count.
     crate::common::eventually("bob's INSERT to succeed under the narrowed set", || async {
-        match ctx.handler.execute(&ctx.bob, &format!("INSERT INTO {fresh} VALUES (1)"), None).await {
+        match ctx
+            .handler
+            .execute(&ctx.bob, &format!("INSERT INTO {fresh} VALUES (1)"), None)
+            .await
+        {
             Ok(_) => Ok(()),
             Err(e) => Err(format!("insert failed: {e}")),
         }
     })
     .await;
 
-    let _ = ctx.handler.execute(&ctx.carol, &format!("REVOKE INSERT ON {fresh} FROM ROLE \"engineer\""), None).await;
-    let _ = ctx.handler.execute(&ctx.carol, &format!("DROP TABLE IF EXISTS {fresh}"), None).await;
+    let _ = ctx
+        .handler
+        .execute(
+            &ctx.carol,
+            &format!("REVOKE INSERT ON {fresh} FROM ROLE \"engineer\""),
+            None,
+        )
+        .await;
+    let _ = ctx
+        .handler
+        .execute(&ctx.carol, &format!("DROP TABLE IF EXISTS {fresh}"), None)
+        .await;
 }
 
 /// `DENY` as a SQL statement, end to end against live Ranger.
@@ -2693,15 +2905,37 @@ async fn sql_deny_blocks_a_granted_read_and_revoke_clears_it() {
     // A resource with no deny history, so a leftover item cannot make the denial
     // below look like this statement's work.
     let table = "sales_wh.ac.orders_deny";
-    let _ = ctx.handler.execute(&ctx.carol, &format!("DROP TABLE IF EXISTS {table}"), None).await;
-    exec_ok(&ctx, &ctx.carol, &format!("CREATE TABLE {table} (id BIGINT)")).await;
-    exec_ok(&ctx, &ctx.carol, &format!("INSERT INTO {table} VALUES (1),(2)")).await;
-    exec_ok(&ctx, &ctx.carol, &format!("GRANT SELECT ON {table} TO ROLE \"analyst\"")).await;
+    let _ = ctx
+        .handler
+        .execute(&ctx.carol, &format!("DROP TABLE IF EXISTS {table}"), None)
+        .await;
+    exec_ok(
+        &ctx,
+        &ctx.carol,
+        &format!("CREATE TABLE {table} (id BIGINT)"),
+    )
+    .await;
+    exec_ok(
+        &ctx,
+        &ctx.carol,
+        &format!("INSERT INTO {table} VALUES (1),(2)"),
+    )
+    .await;
+    exec_ok(
+        &ctx,
+        &ctx.carol,
+        &format!("GRANT SELECT ON {table} TO ROLE \"analyst\""),
+    )
+    .await;
 
     // The grant works first. Without this the denial afterwards proves nothing:
     // an unreadable table is the default state.
     let before = crate::common::eventually("alice's read to be allowed by the grant", || async {
-        match ctx.handler.execute(&ctx.alice, &format!("SELECT id FROM {table}"), None).await {
+        match ctx
+            .handler
+            .execute(&ctx.alice, &format!("SELECT id FROM {table}"), None)
+            .await
+        {
             Ok(b) if total_rows(&b) == 2 => Ok(b),
             Ok(b) => Err(format!("{} rows", total_rows(&b))),
             Err(e) => Err(format!("query failed: {e}")),
@@ -2711,9 +2945,18 @@ async fn sql_deny_blocks_a_granted_read_and_revoke_clears_it() {
     assert_eq!(total_rows(&before), 2);
 
     // The statement under test.
-    exec_ok(&ctx, &ctx.carol, &format!("DENY SELECT ON {table} TO ROLE \"analyst\"")).await;
+    exec_ok(
+        &ctx,
+        &ctx.carol,
+        &format!("DENY SELECT ON {table} TO ROLE \"analyst\""),
+    )
+    .await;
     crate::common::eventually("the SQL DENY to block alice", || async {
-        match ctx.handler.execute(&ctx.alice, &format!("SELECT id FROM {table}"), None).await {
+        match ctx
+            .handler
+            .execute(&ctx.alice, &format!("SELECT id FROM {table}"), None)
+            .await
+        {
             Err(_) => Ok(()),
             Ok(b) => Err(format!("still readable with {} rows", total_rows(&b))),
         }
@@ -2723,7 +2966,12 @@ async fn sql_deny_blocks_a_granted_read_and_revoke_clears_it() {
     // Idempotent: a repeated DENY must update the same policy rather than stack a
     // duplicate item. Ranger normalises a stored item, so an exact JSON comparison
     // appended a duplicate on every rerun before `deny_items_equivalent`.
-    exec_ok(&ctx, &ctx.carol, &format!("DENY SELECT ON {table} TO ROLE \"analyst\"")).await;
+    exec_ok(
+        &ctx,
+        &ctx.carol,
+        &format!("DENY SELECT ON {table} TO ROLE \"analyst\""),
+    )
+    .await;
     let deny_items = ctx
         .ranger
         .get_policies("polaris")
@@ -2747,15 +2995,32 @@ async fn sql_deny_blocks_a_granted_read_and_revoke_clears_it() {
     assert_eq!(deny_items, 1, "a repeated DENY must not stack deny items");
 
     // REVOKE clears the deny, so DENY is not a one-way door needing console access.
-    exec_ok(&ctx, &ctx.carol, &format!("REVOKE SELECT ON {table} FROM ROLE \"analyst\"")).await;
-    exec_ok(&ctx, &ctx.carol, &format!("GRANT SELECT ON {table} TO ROLE \"analyst\"")).await;
-    let after = crate::common::eventually("the read to come back after REVOKE cleared the deny", || async {
-        match ctx.handler.execute(&ctx.alice, &format!("SELECT id FROM {table}"), None).await {
-            Ok(b) if total_rows(&b) == 2 => Ok(b),
-            Ok(b) => Err(format!("{} rows", total_rows(&b))),
-            Err(e) => Err(format!("still denied: {e}")),
-        }
-    })
+    exec_ok(
+        &ctx,
+        &ctx.carol,
+        &format!("REVOKE SELECT ON {table} FROM ROLE \"analyst\""),
+    )
+    .await;
+    exec_ok(
+        &ctx,
+        &ctx.carol,
+        &format!("GRANT SELECT ON {table} TO ROLE \"analyst\""),
+    )
+    .await;
+    let after = crate::common::eventually(
+        "the read to come back after REVOKE cleared the deny",
+        || async {
+            match ctx
+                .handler
+                .execute(&ctx.alice, &format!("SELECT id FROM {table}"), None)
+                .await
+            {
+                Ok(b) if total_rows(&b) == 2 => Ok(b),
+                Ok(b) => Err(format!("{} rows", total_rows(&b))),
+                Err(e) => Err(format!("still denied: {e}")),
+            }
+        },
+    )
     .await;
     assert_eq!(
         total_rows(&after),
@@ -3071,9 +3336,8 @@ async fn control_add_column_with_no_policy_at_all() {
 
     // Same wait-out-the-stale-schema shape as the masked test, so the two are
     // comparable: only the presence of a policy differs.
-    let outcome = crate::common::eventually(
-        "SQE's schema cache to catch up with ADD COLUMN",
-        || async {
+    let outcome =
+        crate::common::eventually("SQE's schema cache to catch up with ADD COLUMN", || async {
             match ctx
                 .handler
                 .execute(
@@ -3097,9 +3361,8 @@ async fn control_add_column_with_no_policy_at_all() {
                     }
                 }
             }
-        },
-    )
-    .await;
+        })
+        .await;
 
     assert!(
         outcome.starts_with("SUCCESS with 3 rows and 3 columns"),
@@ -3146,7 +3409,8 @@ async fn control_rename_column_with_no_policy_at_all() {
 
     let cols = rows.first().map(|b| b.num_columns()).unwrap_or(0);
     assert_eq!(
-        cols, 2,
+        cols,
+        2,
         "WITHOUT a policy, `SELECT id, tax_id` after RENAME COLUMN must return both \
          columns. Getting one back means SQE drops a projected column after a rename \
          regardless of access control, and the defect is not the tag association going \
@@ -3425,7 +3689,10 @@ async fn set_masking_policy_attaches_a_named_tag_policy() {
             .await
             .map_err(|e| format!("{e}"))?;
         let vals = col_strings(&b, "ssn");
-        if vals.iter().all(|v| v.contains("-11-") || v.contains("-22-") || v.contains("-33-")) {
+        if vals
+            .iter()
+            .all(|v| v.contains("-11-") || v.contains("-22-") || v.contains("-33-"))
+        {
             Ok(())
         } else {
             Err(format!("still masked: {vals:?}"))
@@ -3540,7 +3807,10 @@ async fn a_dropped_column_does_not_bequeath_its_tags_to_a_new_one() {
             .execute(&ctx.bob, &format!("SELECT ssn FROM {ORDERS}"), None)
             .await
             .map_err(|e| format!("{e}"))?;
-        if col_strings(&b, "ssn").iter().all(|v| v.starts_with("xxx-xx-")) {
+        if col_strings(&b, "ssn")
+            .iter()
+            .all(|v| v.starts_with("xxx-xx-"))
+        {
             Ok(())
         } else {
             Err(format!("not masked yet: {:?}", col_strings(&b, "ssn")))
@@ -3548,7 +3818,12 @@ async fn a_dropped_column_does_not_bequeath_its_tags_to_a_new_one() {
     })
     .await;
 
-    exec_ok(&ctx, &ctx.carol, &format!("ALTER TABLE {ORDERS} DROP COLUMN ssn")).await;
+    exec_ok(
+        &ctx,
+        &ctx.carol,
+        &format!("ALTER TABLE {ORDERS} DROP COLUMN ssn"),
+    )
+    .await;
     // The association must be gone with the column, so SHOW TAGS is the direct check.
     let tags = ctx
         .handler
@@ -3563,7 +3838,12 @@ async fn a_dropped_column_does_not_bequeath_its_tags_to_a_new_one() {
 
     // Re-add the same NAME. It is a different column with a new field id and no
     // classification, so it must come back unmasked.
-    exec_ok(&ctx, &ctx.carol, &format!("ALTER TABLE {ORDERS} ADD COLUMN ssn VARCHAR")).await;
+    exec_ok(
+        &ctx,
+        &ctx.carol,
+        &format!("ALTER TABLE {ORDERS} ADD COLUMN ssn VARCHAR"),
+    )
+    .await;
     let values = crate::common::eventually("the re-added column to be readable", || async {
         match ctx
             .handler

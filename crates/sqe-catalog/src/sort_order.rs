@@ -46,7 +46,10 @@ pub fn iceberg_sort_to_physical(
         let iceberg_field = match iceberg_schema.field_by_id(field.source_id) {
             Some(f) => f,
             None => {
-                debug!(source_id = field.source_id, "Sort field ID not found in schema");
+                debug!(
+                    source_id = field.source_id,
+                    "Sort field ID not found in schema"
+                );
                 break;
             }
         };
@@ -143,7 +146,8 @@ mod tests {
     #[test]
     fn test_unsorted_returns_none() {
         let sort_order = SortOrder::unsorted_order();
-        let result = iceberg_sort_to_physical(&sort_order, &make_iceberg_schema(), &make_arrow_schema());
+        let result =
+            iceberg_sort_to_physical(&sort_order, &make_iceberg_schema(), &make_arrow_schema());
         assert!(result.is_none());
     }
 
@@ -158,7 +162,9 @@ mod tests {
                 null_order: NullOrder::Last,
             }],
         };
-        let exprs = iceberg_sort_to_physical(&sort_order, &make_iceberg_schema(), &make_arrow_schema()).unwrap();
+        let exprs =
+            iceberg_sort_to_physical(&sort_order, &make_iceberg_schema(), &make_arrow_schema())
+                .unwrap();
         assert_eq!(exprs.len(), 1);
         assert!(!exprs[0].options.descending);
         assert!(!exprs[0].options.nulls_first);
@@ -175,7 +181,9 @@ mod tests {
                 null_order: NullOrder::First,
             }],
         };
-        let exprs = iceberg_sort_to_physical(&sort_order, &make_iceberg_schema(), &make_arrow_schema()).unwrap();
+        let exprs =
+            iceberg_sort_to_physical(&sort_order, &make_iceberg_schema(), &make_arrow_schema())
+                .unwrap();
         assert_eq!(exprs.len(), 1);
         assert!(exprs[0].options.descending);
         assert!(exprs[0].options.nulls_first);
@@ -200,7 +208,9 @@ mod tests {
                 },
             ],
         };
-        let exprs = iceberg_sort_to_physical(&sort_order, &make_iceberg_schema(), &make_arrow_schema()).unwrap();
+        let exprs =
+            iceberg_sort_to_physical(&sort_order, &make_iceberg_schema(), &make_arrow_schema())
+                .unwrap();
         assert_eq!(exprs.len(), 2);
     }
 
@@ -223,7 +233,9 @@ mod tests {
                 },
             ],
         };
-        let exprs = iceberg_sort_to_physical(&sort_order, &make_iceberg_schema(), &make_arrow_schema()).unwrap();
+        let exprs =
+            iceberg_sort_to_physical(&sort_order, &make_iceberg_schema(), &make_arrow_schema())
+                .unwrap();
         // Only the first field (identity) should be included
         assert_eq!(exprs.len(), 1);
     }

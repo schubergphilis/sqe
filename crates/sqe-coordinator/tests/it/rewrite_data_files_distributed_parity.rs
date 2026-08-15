@@ -125,7 +125,11 @@ async fn count_rows(
     table: &str,
 ) -> i64 {
     let b = exec(handler, session, &format!("SELECT COUNT(*) FROM {table}")).await;
-    b[0].column(0).as_any().downcast_ref::<Int64Array>().expect("Int64Array").value(0)
+    b[0].column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("Int64Array")
+        .value(0)
 }
 
 /// The full surviving row set as `(id, v)` pairs, ordered by `id` so two
@@ -137,11 +141,24 @@ async fn collect_id_v_rows(
     session: &sqe_core::Session,
     table: &str,
 ) -> Vec<(i64, i64)> {
-    let b = exec(handler, session, &format!("SELECT id, v FROM {table} ORDER BY id")).await;
+    let b = exec(
+        handler,
+        session,
+        &format!("SELECT id, v FROM {table} ORDER BY id"),
+    )
+    .await;
     let mut out = Vec::new();
     for batch in &b {
-        let ids = batch.column(0).as_any().downcast_ref::<Int64Array>().expect("id Int64Array");
-        let vs = batch.column(1).as_any().downcast_ref::<Int64Array>().expect("v Int64Array");
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("id Int64Array");
+        let vs = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("v Int64Array");
         for i in 0..batch.num_rows() {
             out.push((ids.value(i), vs.value(i)));
         }
@@ -156,10 +173,19 @@ async fn collect_id_rows(
     session: &sqe_core::Session,
     table: &str,
 ) -> Vec<i64> {
-    let b = exec(handler, session, &format!("SELECT id FROM {table} ORDER BY id")).await;
+    let b = exec(
+        handler,
+        session,
+        &format!("SELECT id FROM {table} ORDER BY id"),
+    )
+    .await;
     let mut out = Vec::new();
     for batch in &b {
-        let ids = batch.column(0).as_any().downcast_ref::<Int64Array>().expect("id Int64Array");
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("id Int64Array");
         for i in 0..batch.num_rows() {
             out.push(ids.value(i));
         }
@@ -179,7 +205,11 @@ async fn live_data_file_count(
         &format!("SELECT COUNT(*) FROM table_files('{namespace}', '{table_name}')"),
     )
     .await;
-    b[0].column(0).as_any().downcast_ref::<Int64Array>().expect("Int64Array").value(0)
+    b[0].column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("Int64Array")
+        .value(0)
 }
 
 /// Largest live data-file size in bytes, used to derive a
@@ -198,7 +228,11 @@ async fn max_file_size_bytes(
         &format!("SELECT MAX(file_size_in_bytes) FROM table_files('{namespace}', '{table_name}')"),
     )
     .await;
-    b[0].column(0).as_any().downcast_ref::<Int64Array>().expect("Int64Array").value(0)
+    b[0].column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("Int64Array")
+        .value(0)
 }
 
 async fn snapshot_ids(
@@ -215,7 +249,11 @@ async fn snapshot_ids(
     .await;
     let mut out = HashSet::new();
     for batch in &b {
-        let ids = batch.column(0).as_any().downcast_ref::<Int64Array>().expect("Int64Array");
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("Int64Array");
         for i in 0..batch.num_rows() {
             out.insert(ids.value(i));
         }
@@ -239,8 +277,7 @@ async fn snapshot_operation(
         ),
     )
     .await;
-    b[0]
-        .column_by_name("operation")
+    b[0].column_by_name("operation")
         .expect("operation column")
         .as_any()
         .downcast_ref::<StringArray>()
@@ -304,7 +341,11 @@ async fn assert_one_new_replace_snapshot(
         "rewrite must commit exactly one new snapshot: before={before:?} after={after:?}"
     );
     let mut new_ids: Vec<i64> = after.difference(before).copied().collect();
-    assert_eq!(new_ids.len(), 1, "exactly one new snapshot id must appear: {new_ids:?}");
+    assert_eq!(
+        new_ids.len(),
+        1,
+        "exactly one new snapshot id must appear: {new_ids:?}"
+    );
     let new_id = new_ids.pop().unwrap();
     let op = snapshot_operation(handler, session, namespace, table_name, new_id).await;
     assert_eq!(
@@ -335,9 +376,19 @@ async fn seed_position_delete_fixture(
     )
     .await;
     for i in 1..rows {
-        exec(handler, session, &format!("INSERT INTO {table} VALUES ({i})")).await;
+        exec(
+            handler,
+            session,
+            &format!("INSERT INTO {table} VALUES ({i})"),
+        )
+        .await;
     }
-    exec(handler, session, &format!("DELETE FROM {table} WHERE id < {delete_below}")).await;
+    exec(
+        handler,
+        session,
+        &format!("DELETE FROM {table} WHERE id < {delete_below}"),
+    )
+    .await;
 }
 
 /// Seed an equality-delete MoR fixture: `rows` single-row data files (`id`,
@@ -363,7 +414,12 @@ async fn seed_equality_delete_fixture(
     )
     .await;
     for i in 0..rows {
-        exec(handler, session, &format!("INSERT INTO {table} VALUES ({i}, {})", i * 10)).await;
+        exec(
+            handler,
+            session,
+            &format!("INSERT INTO {table} VALUES ({i}, {})", i * 10),
+        )
+        .await;
     }
     exec(
         handler,
@@ -417,7 +473,12 @@ async fn seed_partitioned_position_delete_fixture(
         )
         .await;
     }
-    exec(handler, session, &format!("DELETE FROM {table} WHERE id < {delete_below}")).await;
+    exec(
+        handler,
+        session,
+        &format!("DELETE FROM {table} WHERE id < {delete_below}"),
+    )
+    .await;
 }
 
 /// Full surviving row set as `(id, region, v)` triples, ordered by `id`.
@@ -427,13 +488,29 @@ async fn collect_id_region_v_rows(
     session: &sqe_core::Session,
     table: &str,
 ) -> Vec<(i64, String, i64)> {
-    let b = exec(handler, session, &format!("SELECT id, region, v FROM {table} ORDER BY id")).await;
+    let b = exec(
+        handler,
+        session,
+        &format!("SELECT id, region, v FROM {table} ORDER BY id"),
+    )
+    .await;
     let mut out = Vec::new();
     for batch in &b {
-        let ids = batch.column(0).as_any().downcast_ref::<Int64Array>().expect("id Int64Array");
-        let regions =
-            batch.column(1).as_any().downcast_ref::<StringArray>().expect("region StringArray");
-        let vs = batch.column(2).as_any().downcast_ref::<Int64Array>().expect("v Int64Array");
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("id Int64Array");
+        let regions = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("region StringArray");
+        let vs = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("v Int64Array");
         for i in 0..batch.num_rows() {
             out.push((ids.value(i), regions.value(i).to_string(), vs.value(i)));
         }
@@ -452,8 +529,12 @@ async fn count_rows_in_region(
     table: &str,
     region: &str,
 ) -> i64 {
-    count_rows(handler, session, &format!("(SELECT * FROM {table} WHERE region = '{region}')"))
-        .await
+    count_rows(
+        handler,
+        session,
+        &format!("(SELECT * FROM {table} WHERE region = '{region}')"),
+    )
+    .await
 }
 
 /// `(partition, record_count)` for every live data file in the current
@@ -516,10 +597,16 @@ async fn position_delete_parity() {
     // Fixtures must start byte-identical (same recipe, independently seeded).
     let pre_dist = collect_id_rows(&handler, &session, &dist_table).await;
     let pre_local = collect_id_rows(&handler, &session, &local_table).await;
-    assert_eq!(pre_dist, pre_local, "both fixtures must start with identical content");
+    assert_eq!(
+        pre_dist, pre_local,
+        "both fixtures must start with identical content"
+    );
 
     let expected: Vec<i64> = (DELETE_BELOW..ROWS).collect();
-    assert_eq!(pre_dist, expected, "setup invariant: deletes must already be visible pre-rewrite");
+    assert_eq!(
+        pre_dist, expected,
+        "setup invariant: deletes must already be visible pre-rewrite"
+    );
 
     let before_files_dist = live_data_file_count(&handler, &session, namespace, dist_name).await;
     let before_files_local = live_data_file_count(&handler, &session, namespace, local_name).await;
@@ -552,7 +639,10 @@ async fn position_delete_parity() {
         post_dist, expected,
         "deleted rows must stay deleted (not resurrected) and no other row must be lost"
     );
-    assert_eq!(count_rows(&handler, &session, &dist_table).await, expected.len() as i64);
+    assert_eq!(
+        count_rows(&handler, &session, &dist_table).await,
+        expected.len() as i64
+    );
 
     // Consolidation on both paths.
     let after_files_dist = live_data_file_count(&handler, &session, namespace, dist_name).await;
@@ -567,11 +657,27 @@ async fn position_delete_parity() {
     );
 
     // Exactly one new snapshot, stamped.
-    assert_one_new_replace_snapshot(&handler, &session, namespace, dist_name, &dist_snapshots_before)
-        .await;
+    assert_one_new_replace_snapshot(
+        &handler,
+        &session,
+        namespace,
+        dist_name,
+        &dist_snapshots_before,
+    )
+    .await;
 
-    let _ = exec(&handler, &session, &format!("DROP TABLE IF EXISTS {dist_table}")).await;
-    let _ = exec(&handler, &session, &format!("DROP TABLE IF EXISTS {local_table}")).await;
+    let _ = exec(
+        &handler,
+        &session,
+        &format!("DROP TABLE IF EXISTS {dist_table}"),
+    )
+    .await;
+    let _ = exec(
+        &handler,
+        &session,
+        &format!("DROP TABLE IF EXISTS {local_table}"),
+    )
+    .await;
 }
 
 /// Equality-delete parity: same properties as [`position_delete_parity`],
@@ -595,12 +701,18 @@ async fn equality_delete_parity() {
 
     let pre_dist = collect_id_v_rows(&handler, &session, &dist_table).await;
     let pre_local = collect_id_v_rows(&handler, &session, &local_table).await;
-    assert_eq!(pre_dist, pre_local, "both fixtures must start with identical content");
+    assert_eq!(
+        pre_dist, pre_local,
+        "both fixtures must start with identical content"
+    );
 
     let expected: Vec<(i64, i64)> = (0..ROWS)
         .map(|id| (id, if id == UPDATED_ID { NEW_V } else { id * 10 }))
         .collect();
-    assert_eq!(pre_dist, expected, "setup invariant: the UPDATE must already be visible pre-rewrite");
+    assert_eq!(
+        pre_dist, expected,
+        "setup invariant: the UPDATE must already be visible pre-rewrite"
+    );
 
     let before_files_dist = live_data_file_count(&handler, &session, namespace, dist_name).await;
     let before_files_local = live_data_file_count(&handler, &session, namespace, local_name).await;
@@ -642,11 +754,27 @@ async fn equality_delete_parity() {
         "local rewrite must consolidate: {before_files_local} -> {after_files_local}"
     );
 
-    assert_one_new_replace_snapshot(&handler, &session, namespace, dist_name, &dist_snapshots_before)
-        .await;
+    assert_one_new_replace_snapshot(
+        &handler,
+        &session,
+        namespace,
+        dist_name,
+        &dist_snapshots_before,
+    )
+    .await;
 
-    let _ = exec(&handler, &session, &format!("DROP TABLE IF EXISTS {dist_table}")).await;
-    let _ = exec(&handler, &session, &format!("DROP TABLE IF EXISTS {local_table}")).await;
+    let _ = exec(
+        &handler,
+        &session,
+        &format!("DROP TABLE IF EXISTS {dist_table}"),
+    )
+    .await;
+    let _ = exec(
+        &handler,
+        &session,
+        &format!("DROP TABLE IF EXISTS {local_table}"),
+    )
+    .await;
 }
 
 /// Partitioned position-delete parity: same correctness properties as
@@ -683,16 +811,25 @@ async fn partitioned_with_deletes_parity() {
     // Fixtures must start byte-identical (same recipe, independently seeded).
     let pre_dist = collect_id_region_v_rows(&handler, &session, &dist_table).await;
     let pre_local = collect_id_region_v_rows(&handler, &session, &local_table).await;
-    assert_eq!(pre_dist, pre_local, "both fixtures must start with identical content");
+    assert_eq!(
+        pre_dist, pre_local,
+        "both fixtures must start with identical content"
+    );
 
     let expected: Vec<(i64, String, i64)> = (DELETE_BELOW..ROWS)
         .map(|id| (id, region_of(id).to_string(), id * 10))
         .collect();
-    assert_eq!(pre_dist, expected, "setup invariant: deletes must already be visible pre-rewrite");
+    assert_eq!(
+        pre_dist, expected,
+        "setup invariant: deletes must already be visible pre-rewrite"
+    );
 
     let expected_eu = expected.iter().filter(|(_, r, _)| r == "eu").count() as i64;
     let expected_us = expected.iter().filter(|(_, r, _)| r == "us").count() as i64;
-    assert!(expected_eu > 0 && expected_us > 0, "fixture must leave rows in both partitions");
+    assert!(
+        expected_eu > 0 && expected_us > 0,
+        "fixture must leave rows in both partitions"
+    );
 
     let before_files_dist = live_data_file_count(&handler, &session, namespace, dist_name).await;
     let before_files_local = live_data_file_count(&handler, &session, namespace, local_name).await;
@@ -704,8 +841,10 @@ async fn partitioned_with_deletes_parity() {
 
     let before_partitions_dist =
         partition_record_counts(&handler, &session, namespace, dist_name).await;
-    let before_distinct_partitions: HashSet<String> =
-        before_partitions_dist.iter().map(|(p, _)| p.clone()).collect();
+    let before_distinct_partitions: HashSet<String> = before_partitions_dist
+        .iter()
+        .map(|(p, _)| p.clone())
+        .collect();
     assert_eq!(
         before_distinct_partitions.len(),
         2,
@@ -735,7 +874,10 @@ async fn partitioned_with_deletes_parity() {
         post_dist, expected,
         "deleted rows must stay deleted (not resurrected) and no other row must be lost"
     );
-    assert_eq!(count_rows(&handler, &session, &dist_table).await, expected.len() as i64);
+    assert_eq!(
+        count_rows(&handler, &session, &dist_table).await,
+        expected.len() as i64
+    );
 
     // Consolidation on both paths.
     let after_files_dist = live_data_file_count(&handler, &session, namespace, dist_name).await;
@@ -750,20 +892,34 @@ async fn partitioned_with_deletes_parity() {
     );
 
     // Exactly one new snapshot, stamped.
-    assert_one_new_replace_snapshot(&handler, &session, namespace, dist_name, &dist_snapshots_before)
-        .await;
+    assert_one_new_replace_snapshot(
+        &handler,
+        &session,
+        namespace,
+        dist_name,
+        &dist_snapshots_before,
+    )
+    .await;
 
     // Partition correctness: rows must land in the correct partition after
     // the distributed rewrite, at both the read-path and manifest level.
     let post_eu = count_rows_in_region(&handler, &session, &dist_table, "eu").await;
     let post_us = count_rows_in_region(&handler, &session, &dist_table, "us").await;
-    assert_eq!(post_eu, expected_eu, "predicate-pruned read on region='eu' must match expected count");
-    assert_eq!(post_us, expected_us, "predicate-pruned read on region='us' must match expected count");
+    assert_eq!(
+        post_eu, expected_eu,
+        "predicate-pruned read on region='eu' must match expected count"
+    );
+    assert_eq!(
+        post_us, expected_us,
+        "predicate-pruned read on region='us' must match expected count"
+    );
 
     let after_partitions_dist =
         partition_record_counts(&handler, &session, namespace, dist_name).await;
-    let after_distinct_partitions: HashSet<String> =
-        after_partitions_dist.iter().map(|(p, _)| p.clone()).collect();
+    let after_distinct_partitions: HashSet<String> = after_partitions_dist
+        .iter()
+        .map(|(p, _)| p.clone())
+        .collect();
     assert_eq!(
         after_distinct_partitions.len(),
         2,
@@ -794,6 +950,16 @@ async fn partitioned_with_deletes_parity() {
          counts (order-independent): partitions={sums_by_partition:?}"
     );
 
-    let _ = exec(&handler, &session, &format!("DROP TABLE IF EXISTS {dist_table}")).await;
-    let _ = exec(&handler, &session, &format!("DROP TABLE IF EXISTS {local_table}")).await;
+    let _ = exec(
+        &handler,
+        &session,
+        &format!("DROP TABLE IF EXISTS {dist_table}"),
+    )
+    .await;
+    let _ = exec(
+        &handler,
+        &session,
+        &format!("DROP TABLE IF EXISTS {local_table}"),
+    )
+    .await;
 }

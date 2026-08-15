@@ -208,8 +208,10 @@ pub fn external_hash_aggregate(
         anyhow::bail!("at least one aggregate required");
     }
     for a in aggs {
-        if matches!(a, DecomposableAgg::SumI64 | DecomposableAgg::MinI64 | DecomposableAgg::MaxI64)
-            && measure_index.is_none()
+        if matches!(
+            a,
+            DecomposableAgg::SumI64 | DecomposableAgg::MinI64 | DecomposableAgg::MaxI64
+        ) && measure_index.is_none()
         {
             anyhow::bail!("{} requires a measure column index", a.name());
         }
@@ -220,7 +222,15 @@ pub fn external_hash_aggregate(
         return Ok((vec![], profile));
     }
 
-    let out = aggregate_recursive(batches, group_key_indices, measure_index, aggs, config, 0, &mut profile)?;
+    let out = aggregate_recursive(
+        batches,
+        group_key_indices,
+        measure_index,
+        aggs,
+        config,
+        0,
+        &mut profile,
+    )?;
     Ok((out, profile))
 }
 
@@ -276,7 +286,8 @@ fn aggregate_recursive(
                 }
                 // Spill strategy: partition *all* input batches and recurse
                 // per partition with a fresh table (releases this table).
-                let parts = radix_partition_batches(batches, group_key_indices, config.num_partitions)?;
+                let parts =
+                    radix_partition_batches(batches, group_key_indices, config.num_partitions)?;
                 // Fold already-seen table into partition 0 of a synthetic merge:
                 // instead, re-process each partition independently from original
                 // batches only (table is a subset — re-scan is correct).
@@ -305,7 +316,13 @@ fn aggregate_recursive(
         }
     }
 
-    emit_table(&table, group_key_indices.len(), aggs, batches[0].schema(), profile)
+    emit_table(
+        &table,
+        group_key_indices.len(),
+        aggs,
+        batches[0].schema(),
+        profile,
+    )
 }
 
 fn emit_table(
@@ -319,7 +336,10 @@ fn emit_table(
         return Ok(vec![]);
     }
     let mut key_cols: Vec<Vec<i64>> = vec![Vec::with_capacity(table.len()); n_keys];
-    let mut measure_cols: Vec<Vec<i64>> = aggs.iter().map(|_| Vec::with_capacity(table.len())).collect();
+    let mut measure_cols: Vec<Vec<i64>> = aggs
+        .iter()
+        .map(|_| Vec::with_capacity(table.len()))
+        .collect();
 
     for (key, st) in table {
         for (i, k) in key.iter().enumerate() {
@@ -454,7 +474,9 @@ impl std::error::Error for ExternalAggregateError {}
 pub fn ensure_decomposable(name: &str) -> Result<(), ExternalAggregateError> {
     match name.to_ascii_lowercase().as_str() {
         "count" | "sum" | "min" | "max" | "avg" => Ok(()),
-        other => Err(ExternalAggregateError::UnsupportedHolistic(other.to_string())),
+        other => Err(ExternalAggregateError::UnsupportedHolistic(
+            other.to_string(),
+        )),
     }
 }
 
@@ -505,21 +527,9 @@ mod tests {
         assert_eq!(profile.groups_emitted, 2);
         let b = &out[0];
         // Find rows by key
-        let keys = b
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
-        let counts = b
-            .column(1)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
-        let sums = b
-            .column(2)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
+        let keys = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        let counts = b.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+        let sums = b.column(2).as_any().downcast_ref::<Int64Array>().unwrap();
         let mut by_key = HashMap::new();
         for i in 0..b.num_rows() {
             by_key.insert(keys.value(i), (counts.value(i), sums.value(i)));

@@ -1,12 +1,12 @@
-use std::collections::HashSet;
-use std::future::Future;
-use std::sync::Arc;
 use arrow_array::RecordBatch;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use datafusion::logical_expr::LogicalPlan;
 use moka::sync::Cache;
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
+use std::future::Future;
+use std::sync::Arc;
 use tracing::{debug, info};
 use uuid::Uuid;
 
@@ -98,7 +98,11 @@ impl ResultCache {
 
     /// Compute a user-scoped cache key.
     pub fn cache_key(user: &str, sql: &str) -> String {
-        let normalized: String = sql.split_whitespace().collect::<Vec<_>>().join(" ").to_uppercase();
+        let normalized: String = sql
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_uppercase();
         let input = format!("{user}:{normalized}");
         let hash = Sha256::digest(input.as_bytes());
         hex::encode(hash)
@@ -108,8 +112,13 @@ impl ResultCache {
     pub fn should_bypass(sql: &str) -> bool {
         let upper = sql.to_uppercase();
         let non_deterministic = [
-            "NOW()", "CURRENT_TIMESTAMP", "CURRENT_DATE", "CURRENT_TIME",
-            "RANDOM()", "UUID()", "GEN_RANDOM_UUID()",
+            "NOW()",
+            "CURRENT_TIMESTAMP",
+            "CURRENT_DATE",
+            "CURRENT_TIME",
+            "RANDOM()",
+            "UUID()",
+            "GEN_RANDOM_UUID()",
         ];
         non_deterministic.iter().any(|f| upper.contains(f))
     }
@@ -122,7 +131,11 @@ impl ResultCache {
         let key = Self::cache_key(user, sql);
         let result = self.cache.get(&key);
         if let Some(ref m) = self.metrics {
-            if result.is_some() { m.cache_hits.inc(); } else { m.cache_misses.inc(); }
+            if result.is_some() {
+                m.cache_hits.inc();
+            } else {
+                m.cache_misses.inc();
+            }
         }
         result
     }
@@ -167,12 +180,14 @@ impl ResultCache {
             return;
         }
 
-        let size_bytes: usize = batches.iter()
-            .map(|b| b.get_array_memory_size())
-            .sum();
+        let size_bytes: usize = batches.iter().map(|b| b.get_array_memory_size()).sum();
 
         if size_bytes > self.max_entry_bytes {
-            debug!(size_bytes, max = self.max_entry_bytes, "Skipping cache: result too large");
+            debug!(
+                size_bytes,
+                max = self.max_entry_bytes,
+                "Skipping cache: result too large"
+            );
             return;
         }
 
@@ -213,7 +228,11 @@ impl ResultCache {
                 self.cache.invalidate(key);
             }
             if count > 0 {
-                info!(table = table_name, evicted = count, "Cache invalidated for table write");
+                info!(
+                    table = table_name,
+                    evicted = count,
+                    "Cache invalidated for table write"
+                );
             }
             // COORD-03: clean other index buckets that referenced the evicted
             // keys in a SINGLE pass over the index (was O(keys x index_size):
@@ -242,7 +261,10 @@ impl ResultCache {
         self.cache.invalidate_all();
         self.table_index.clear();
         if count > 0 {
-            info!(evicted = count, "ResultCache invalidated entirely after maintenance procedure");
+            info!(
+                evicted = count,
+                "ResultCache invalidated entirely after maintenance procedure"
+            );
         }
         if let Some(ref m) = self.metrics {
             m.cache_invalidations.inc_by(count as f64);
@@ -285,9 +307,7 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
 
     fn make_batch(rows: usize) -> RecordBatch {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-        ]));
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
         let arr = Int64Array::from((0..rows as i64).collect::<Vec<_>>());
         RecordBatch::try_new(schema, vec![Arc::new(arr)]).unwrap()
     }
@@ -326,14 +346,26 @@ mod tests {
     fn lookup_miss_then_hit() {
         let cache = ResultCache::new(&test_config(), None);
         assert!(cache.lookup("alice", "SELECT 1").is_none());
-        cache.store("alice", "SELECT 1", Uuid::now_v7(), vec![make_batch(5)], vec!["t1".into()]);
+        cache.store(
+            "alice",
+            "SELECT 1",
+            Uuid::now_v7(),
+            vec![make_batch(5)],
+            vec!["t1".into()],
+        );
         assert!(cache.lookup("alice", "SELECT 1").is_some());
     }
 
     #[test]
     fn user_isolation() {
         let cache = ResultCache::new(&test_config(), None);
-        cache.store("alice", "SELECT 1", Uuid::now_v7(), vec![make_batch(1)], vec![]);
+        cache.store(
+            "alice",
+            "SELECT 1",
+            Uuid::now_v7(),
+            vec![make_batch(1)],
+            vec![],
+        );
         assert!(cache.lookup("alice", "SELECT 1").is_some());
         assert!(cache.lookup("bob", "SELECT 1").is_none());
     }
@@ -341,11 +373,29 @@ mod tests {
     #[test]
     fn invalidation_evicts_matching_entries() {
         let cache = ResultCache::new(&test_config(), None);
-        cache.store("alice", "SELECT * FROM t1", Uuid::now_v7(), vec![make_batch(1)], vec!["t1".into()]);
-        cache.store("alice", "SELECT * FROM t2", Uuid::now_v7(), vec![make_batch(1)], vec!["t2".into()]);
+        cache.store(
+            "alice",
+            "SELECT * FROM t1",
+            Uuid::now_v7(),
+            vec![make_batch(1)],
+            vec!["t1".into()],
+        );
+        cache.store(
+            "alice",
+            "SELECT * FROM t2",
+            Uuid::now_v7(),
+            vec![make_batch(1)],
+            vec!["t2".into()],
+        );
         // Verify both entries are retrievable before invalidation
-        assert!(cache.lookup("alice", "SELECT * FROM t1").is_some(), "t1 should be in cache before invalidation");
-        assert!(cache.lookup("alice", "SELECT * FROM t2").is_some(), "t2 should be in cache before invalidation");
+        assert!(
+            cache.lookup("alice", "SELECT * FROM t1").is_some(),
+            "t1 should be in cache before invalidation"
+        );
+        assert!(
+            cache.lookup("alice", "SELECT * FROM t2").is_some(),
+            "t2 should be in cache before invalidation"
+        );
         cache.invalidate("t1");
         // t1 entry evicted, t2 remains
         assert!(cache.lookup("alice", "SELECT * FROM t1").is_none());
@@ -370,7 +420,13 @@ mod tests {
             ttl_secs: 60,
         };
         let cache = ResultCache::new(&config, None);
-        cache.store("alice", "SELECT 1", Uuid::now_v7(), vec![make_batch(100)], vec![]);
+        cache.store(
+            "alice",
+            "SELECT 1",
+            Uuid::now_v7(),
+            vec![make_batch(100)],
+            vec![],
+        );
         assert!(cache.lookup("alice", "SELECT 1").is_none());
     }
 
@@ -387,7 +443,13 @@ mod tests {
         assert!(cache.lookup("alice", sql).is_none());
 
         // Store the result
-        cache.store("alice", sql, query_id, vec![batch.clone()], vec!["users".into()]);
+        cache.store(
+            "alice",
+            sql,
+            query_id,
+            vec![batch.clone()],
+            vec!["users".into()],
+        );
 
         // Second lookup should hit and return the same data
         let cached = cache.lookup("alice", sql).expect("should be a cache hit");
@@ -469,7 +531,9 @@ mod tests {
         // layer), and we also verify bypass of non-deterministic system queries.
 
         // Non-deterministic system queries should be bypassed
-        assert!(ResultCache::should_bypass("SELECT NOW() FROM information_schema.tables"));
+        assert!(ResultCache::should_bypass(
+            "SELECT NOW() FROM information_schema.tables"
+        ));
         assert!(ResultCache::should_bypass("SELECT CURRENT_TIMESTAMP"));
 
         // For deterministic system-table queries, the cache itself does not
@@ -477,12 +541,19 @@ mod tests {
         // and SQL, so coordinator-level bypass logic can decide.
         let k1 = ResultCache::cache_key("alice", "SELECT * FROM information_schema.tables");
         let k2 = ResultCache::cache_key("alice", "SELECT * FROM information_schema.columns");
-        assert_ne!(k1, k2, "different system table queries should have different keys");
+        assert_ne!(
+            k1, k2,
+            "different system table queries should have different keys"
+        );
 
         // Verify that system table queries are still not bypass-able by should_bypass
         // (unless they contain non-deterministic functions)
-        assert!(!ResultCache::should_bypass("SELECT * FROM information_schema.tables"));
-        assert!(!ResultCache::should_bypass("SELECT * FROM system.runtime.nodes"));
+        assert!(!ResultCache::should_bypass(
+            "SELECT * FROM information_schema.tables"
+        ));
+        assert!(!ResultCache::should_bypass(
+            "SELECT * FROM system.runtime.nodes"
+        ));
     }
 
     #[test]
@@ -542,7 +613,10 @@ mod tests {
 
     #[test]
     fn coord01_canonical_key_is_case_and_prefix_insensitive() {
-        assert_eq!(ResultCache::canonical_table_key("iceberg.public.Sales"), "sales");
+        assert_eq!(
+            ResultCache::canonical_table_key("iceberg.public.Sales"),
+            "sales"
+        );
         assert_eq!(ResultCache::canonical_table_key("SALES"), "sales");
         assert_eq!(ResultCache::canonical_table_key("ns.orders"), "orders");
         assert_eq!(ResultCache::canonical_table_key("orders"), "orders");
@@ -585,6 +659,8 @@ mod tests {
         // customers-only query should remain
         assert!(cache.lookup("alice", "SELECT * FROM customers").is_some());
         // join query should be gone (it touched orders)
-        assert!(cache.lookup("alice", "SELECT * FROM orders JOIN customers ON true").is_none());
+        assert!(cache
+            .lookup("alice", "SELECT * FROM orders JOIN customers ON true")
+            .is_none());
     }
 }

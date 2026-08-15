@@ -28,9 +28,7 @@
 
 use std::sync::Arc;
 
-use arrow::array::{
-    Array, ArrayRef, Int64Array, Int64Builder, MapArray, StructArray,
-};
+use arrow::array::{Array, ArrayRef, Int64Array, Int64Builder, MapArray, StructArray};
 use arrow::buffer::OffsetBuffer;
 use arrow::datatypes::{DataType, Field, FieldRef, Fields};
 use datafusion::common::{Result as DFResult, ScalarValue};
@@ -82,7 +80,6 @@ impl std::hash::Hash for Histogram {
 }
 
 impl AggregateUDFImpl for Histogram {
-
     fn name(&self) -> &str {
         "histogram"
     }
@@ -217,7 +214,10 @@ impl Accumulator for HistogramAccumulator {
         let key_field = Arc::new(Field::new("key", self.key_type.clone(), false));
         let value_field = Arc::new(Field::new("value", DataType::Int64, true));
         let entries_struct = StructArray::new(
-            Fields::from(vec![key_field.as_ref().clone(), value_field.as_ref().clone()]),
+            Fields::from(vec![
+                key_field.as_ref().clone(),
+                value_field.as_ref().clone(),
+            ]),
             vec![keys_arr, counts_arr],
             None,
         );
@@ -251,8 +251,7 @@ impl Accumulator for HistogramAccumulator {
         // Empty groups produce a zero-row list of the right type.
         let n_entries = self.entries.len();
 
-        let key_scalars: Vec<ScalarValue> =
-            self.entries.iter().map(|(k, _)| k.clone()).collect();
+        let key_scalars: Vec<ScalarValue> = self.entries.iter().map(|(k, _)| k.clone()).collect();
         let keys_arr: ArrayRef = if key_scalars.is_empty() {
             arrow::array::new_empty_array(&self.key_type)
         } else {
@@ -279,18 +278,10 @@ impl Accumulator for HistogramAccumulator {
         );
 
         // Wrap in a single-element ListArray.
-        let item_field = Arc::new(Field::new(
-            "item",
-            entries_struct.data_type().clone(),
-            true,
-        ));
+        let item_field = Arc::new(Field::new("item", entries_struct.data_type().clone(), true));
         let offsets = OffsetBuffer::new(vec![0i32, n_entries as i32].into());
-        let list_array = arrow::array::ListArray::new(
-            item_field,
-            offsets,
-            Arc::new(entries_struct),
-            None,
-        );
+        let list_array =
+            arrow::array::ListArray::new(item_field, offsets, Arc::new(entries_struct), None);
 
         Ok(vec![ScalarValue::List(Arc::new(list_array))])
     }
@@ -361,9 +352,7 @@ mod tests {
     #[test]
     fn counts_distinct_string_values() {
         let mut acc = make_acc(DataType::Utf8);
-        let arr: ArrayRef = Arc::new(StringArray::from(vec![
-            "a", "b", "a", "c", "a", "b",
-        ]));
+        let arr: ArrayRef = Arc::new(StringArray::from(vec!["a", "b", "a", "c", "a", "b"]));
         acc.update_batch(&[arr]).unwrap();
         // Internal state: a→3, b→2, c→1.
         let lookup = |key: &str| -> i64 {
@@ -381,12 +370,7 @@ mod tests {
     #[test]
     fn nulls_are_skipped() {
         let mut acc = make_acc(DataType::Utf8);
-        let arr: ArrayRef = Arc::new(StringArray::from(vec![
-            Some("a"),
-            None,
-            Some("a"),
-            None,
-        ]));
+        let arr: ArrayRef = Arc::new(StringArray::from(vec![Some("a"), None, Some("a"), None]));
         acc.update_batch(&[arr]).unwrap();
         assert_eq!(acc.entries.len(), 1, "only 'a' should be counted");
         assert_eq!(acc.entries[0].1, 2);
@@ -447,8 +431,7 @@ mod tests {
             ScalarValue::List(l) => Arc::clone(l),
             other => panic!("expected List state, got {other:?}"),
         };
-        let combined =
-            arrow::compute::concat(&[list1.as_ref(), list2.as_ref()]).unwrap();
+        let combined = arrow::compute::concat(&[list1.as_ref(), list2.as_ref()]).unwrap();
 
         let mut final_acc = make_acc(DataType::Utf8);
         final_acc.merge_batch(&[combined]).unwrap();

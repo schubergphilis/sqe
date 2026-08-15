@@ -125,7 +125,9 @@ use sqe_core::SqeError;
 use crate::catalog_ops::is_namespace_not_found;
 use crate::table_health::TableHealth;
 use crate::write_handler::commit_with_retry;
-use crate::writer::{new_upload_tracker, parse_parquet_compression, write_data_files, WriteCleanupGuard};
+use crate::writer::{
+    new_upload_tracker, parse_parquet_compression, write_data_files, WriteCleanupGuard,
+};
 
 /// Default `ns.table` for the ledger, matching
 /// `sqe_core::config::MaintenanceSchedulerConfig::state_table`'s default.
@@ -186,7 +188,12 @@ pub struct MaintenanceLogRow {
 /// belongs to `CALL system.table_health`, not this fixed-shape ledger row.
 /// `files_out` / `bytes_out` / `rows_removed` are `0` and `snapshot_id` /
 /// `error` are `None`: no rewrite happened.
-pub fn advisory_row(table: &str, principal: &str, health: &TableHealth, ts_ms: i64) -> MaintenanceLogRow {
+pub fn advisory_row(
+    table: &str,
+    principal: &str,
+    health: &TableHealth,
+    ts_ms: i64,
+) -> MaintenanceLogRow {
     MaintenanceLogRow {
         job_id: Uuid::now_v7().to_string(),
         table: table.to_string(),
@@ -354,7 +361,13 @@ pub fn partial_row(
 /// `error` column -- the fixed schema has no dedicated "reason" column, and
 /// "why nothing happened" is exactly what that column is for on a
 /// non-`success` row.
-pub fn skipped_row(job_id: &str, table: &str, principal: &str, ts_ms: i64, reason: &str) -> MaintenanceLogRow {
+pub fn skipped_row(
+    job_id: &str,
+    table: &str,
+    principal: &str,
+    ts_ms: i64,
+    reason: &str,
+) -> MaintenanceLogRow {
     MaintenanceLogRow {
         job_id: job_id.to_string(),
         table: table.to_string(),
@@ -489,13 +502,18 @@ pub async fn append_row(
     }
 
     let table = catalog.load_table(&ident).await.map_err(|e| {
-        SqeError::Catalog(format!("maintenance_log: failed to load state table '{ident}': {e}"))
+        SqeError::Catalog(format!(
+            "maintenance_log: failed to load state table '{ident}': {e}"
+        ))
     })?;
 
     let batch = row_to_record_batch(row)?;
     let tracker = new_upload_tracker();
-    let cleanup_guard =
-        WriteCleanupGuard::new(table.file_io().clone(), tracker.clone(), "maintenance-log-append");
+    let cleanup_guard = WriteCleanupGuard::new(
+        table.file_io().clone(),
+        tracker.clone(),
+        "maintenance-log-append",
+    );
     let compression = parse_parquet_compression("zstd");
 
     let data_files =
@@ -515,16 +533,21 @@ pub async fn append_row(
     // exceptional).
     let files_for_retry = data_files;
     let catalog_for_commit = catalog.clone();
-    commit_with_retry(catalog.as_ref(), &ident, "maintenance-log-append", move |fresh_table| {
-        let files = files_for_retry.clone();
-        let cat = catalog_for_commit.clone();
-        async move {
-            let tx = Transaction::new(&fresh_table);
-            let action = tx.fast_append().add_data_files(files);
-            let tx = action.apply(tx)?;
-            tx.commit(cat.as_ref()).await
-        }
-    })
+    commit_with_retry(
+        catalog.as_ref(),
+        &ident,
+        "maintenance-log-append",
+        move |fresh_table| {
+            let files = files_for_retry.clone();
+            let cat = catalog_for_commit.clone();
+            async move {
+                let tx = Transaction::new(&fresh_table);
+                let action = tx.fast_append().add_data_files(files);
+                let tx = action.apply(tx)?;
+                tx.commit(cat.as_ref()).await
+            }
+        },
+    )
     .await
     .map_err(|e| SqeError::Execution(format!("maintenance_log: failed to commit append: {e}")))?;
     cleanup_guard.mark_committed();
@@ -573,7 +596,10 @@ mod tests {
         // average file size.
         let health = sample_health();
         let row = advisory_row("ns.t", "svc", &health, 1_000);
-        assert_eq!(row.bytes_in, (health.avg_file_bytes * health.live_data_files) as i64);
+        assert_eq!(
+            row.bytes_in,
+            (health.avg_file_bytes * health.live_data_files) as i64
+        );
         assert_ne!(
             row.bytes_in, health.est_rewrite_bytes as i64,
             "sample_health's est_rewrite_bytes must differ from the total footprint for this test to be meaningful"
@@ -678,7 +704,10 @@ mod tests {
         assert_eq!(files_in.value(0), 5);
 
         let snapshot_id = batch.column_by_name("snapshot_id").unwrap();
-        assert!(snapshot_id.is_null(0), "None must round-trip as a null cell");
+        assert!(
+            snapshot_id.is_null(0),
+            "None must round-trip as a null cell"
+        );
 
         let error = batch.column_by_name("error").unwrap();
         assert!(error.is_null(0), "None must round-trip as a null cell");
@@ -773,7 +802,19 @@ mod tests {
 
     #[test]
     fn success_row_maps_status_trigger_and_all_counts() {
-        let row = success_row("job-2", "ns.orders", "svc", 100, 200, 10, 3, 1000, 300, 42, Some(99));
+        let row = success_row(
+            "job-2",
+            "ns.orders",
+            "svc",
+            100,
+            200,
+            10,
+            3,
+            1000,
+            300,
+            42,
+            Some(99),
+        );
         assert_eq!(row.status, "success");
         assert_eq!(row.trigger, "scheduled");
         assert_eq!(row.job_id, "job-2");
@@ -795,7 +836,19 @@ mod tests {
         // Defensive: a caller could construct a success row before it has
         // resolved a snapshot id (should not happen in practice, but the
         // constructor must not silently coerce None into something else).
-        let row = success_row("job-2", "ns.orders", "svc", 100, 200, 10, 3, 1000, 300, 42, None);
+        let row = success_row(
+            "job-2",
+            "ns.orders",
+            "svc",
+            100,
+            200,
+            10,
+            3,
+            1000,
+            300,
+            42,
+            None,
+        );
         assert_eq!(row.snapshot_id, None);
     }
 

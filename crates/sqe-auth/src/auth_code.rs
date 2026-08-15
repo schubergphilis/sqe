@@ -12,7 +12,7 @@
 
 use std::sync::Arc;
 
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use rand::Rng;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -201,15 +201,12 @@ impl AuthCodeService {
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
             warn!(status = %status, body = %body, "Token endpoint rejected auth code exchange");
-            return Err(AuthError::AuthFailed(
-                "Authentication failed".to_string(),
-            ));
+            return Err(AuthError::AuthFailed("Authentication failed".to_string()));
         }
 
-        let token_response: TokenResponse = response
-            .json()
-            .await
-            .map_err(|e| AuthError::Internal(anyhow::anyhow!("failed to parse token response: {e}")))?;
+        let token_response: TokenResponse = response.json().await.map_err(|e| {
+            AuthError::Internal(anyhow::anyhow!("failed to parse token response: {e}"))
+        })?;
 
         Ok(token_response.into())
     }
@@ -265,11 +262,18 @@ mod tests {
     fn code_verifier_is_correct_length() {
         let verifier = generate_code_verifier();
         // 32 bytes → 43 base64url chars (no padding)
-        assert_eq!(verifier.len(), 43, "expected 43 chars, got {}", verifier.len());
+        assert_eq!(
+            verifier.len(),
+            43,
+            "expected 43 chars, got {}",
+            verifier.len()
+        );
         // Only unreserved chars: A-Z a-z 0-9 - _ . ~
         // base64url (no pad) uses A-Z a-z 0-9 + - _
         assert!(
-            verifier.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_'),
+            verifier
+                .chars()
+                .all(|c| c.is_alphanumeric() || c == '-' || c == '_'),
             "verifier contains reserved characters: {verifier}"
         );
     }
@@ -288,7 +292,9 @@ mod tests {
         assert_eq!(challenge, expected);
         // Must only contain base64url chars
         assert!(
-            challenge.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_'),
+            challenge
+                .chars()
+                .all(|c| c.is_alphanumeric() || c == '-' || c == '_'),
             "challenge contains invalid characters: {challenge}"
         );
     }
@@ -324,11 +330,17 @@ mod tests {
     #[test]
     fn urlencoding_spaces_and_special_chars() {
         let encoded = urlencoding("hello world");
-        assert!(encoded.contains('+') || encoded.contains("%20"), "space not encoded: {encoded}");
+        assert!(
+            encoded.contains('+') || encoded.contains("%20"),
+            "space not encoded: {encoded}"
+        );
 
         let encoded_special = urlencoding("a=b&c=d");
         assert!(
-            !encoded_special.contains('=') || !encoded_special.contains('&') || encoded_special.contains("%3D") || encoded_special.contains("%26"),
+            !encoded_special.contains('=')
+                || !encoded_special.contains('&')
+                || encoded_special.contains("%3D")
+                || encoded_special.contains("%26"),
             "special chars not encoded: {encoded_special}"
         );
     }

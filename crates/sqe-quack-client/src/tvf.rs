@@ -56,19 +56,13 @@ impl TableFunctionImpl for QuackQueryTvf {
             }
         };
 
-        let provider = QuackTableProvider::new(&uri, token.as_deref(), &sql).map_err(|e| {
-            DataFusionError::Execution(format!("quack_query: client error: {e}"))
-        })?;
+        let provider = QuackTableProvider::new(&uri, token.as_deref(), &sql)
+            .map_err(|e| DataFusionError::Execution(format!("quack_query: client error: {e}")))?;
         Ok(Arc::new(provider))
     }
 }
 
-fn extract_string_arg(
-    fn_name: &str,
-    exprs: &[Expr],
-    pos: usize,
-    label: &str,
-) -> DFResult<String> {
+fn extract_string_arg(fn_name: &str, exprs: &[Expr], pos: usize, label: &str) -> DFResult<String> {
     match exprs.get(pos) {
         Some(Expr::Literal(ScalarValue::Utf8(Some(s)), _)) => Ok(s.clone()),
         Some(Expr::Literal(ScalarValue::LargeUtf8(Some(s)), _)) => Ok(s.clone()),

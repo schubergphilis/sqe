@@ -17,7 +17,6 @@
 //! not up, so plain `cargo test` on a developer box without the stack
 //! still passes.
 
-
 use std::process::Command;
 
 // ---------------------------------------------------------------------------
@@ -102,7 +101,10 @@ fn spark_stack_skip_reason() -> Option<String> {
                 None
             }
         }
-        Ok(o) => Some(format!("docker ps failed: {}", String::from_utf8_lossy(&o.stderr))),
+        Ok(o) => Some(format!(
+            "docker ps failed: {}",
+            String::from_utf8_lossy(&o.stderr)
+        )),
         Err(e) => Some(format!("could not spawn docker: {e}")),
     }
 }
@@ -205,12 +207,9 @@ fn spark_reads_sqe_equality_delete_file() {
     );
     spark_sql(&setup).expect("spark setup + delete");
 
-    let count_all =
-        spark_sql(&format!("SELECT COUNT(*) FROM {table}")).expect("count all");
-    let count_deleted = spark_sql(&format!(
-        "SELECT COUNT(*) FROM {table} WHERE id IN (1,2,3)"
-    ))
-    .expect("count deleted");
+    let count_all = spark_sql(&format!("SELECT COUNT(*) FROM {table}")).expect("count all");
+    let count_deleted = spark_sql(&format!("SELECT COUNT(*) FROM {table} WHERE id IN (1,2,3)"))
+        .expect("count deleted");
 
     let _ = spark_sql(&format!("DROP TABLE IF EXISTS {table}"));
 

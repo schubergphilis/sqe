@@ -2,21 +2,21 @@
 //! chaining, PII/GDPR redaction, pluggable sinks, and async export to
 //! OTLP/SIEM backends.
 
-pub mod export;
 mod chain;
 mod event;
+pub mod export;
 mod logger;
 mod ocsf;
 mod redact;
 mod sink;
 mod tag_lookup;
 
-pub use export::SeqCursor;
 pub use chain::{verify_chain, ChainError, HashChain};
 pub use event::{
     Actor, AuditEvent, AuditKind, Integrity, ObjectType, Outcome, PolicyAudit, QueryInfo,
     QueryStats, Resource, Timing,
 };
+pub use export::SeqCursor;
 pub use logger::{query_hash, AuditEntry, AuditLogger};
 pub use ocsf::to_ocsf;
 pub use redact::{mask_gdpr_columns, redact_pii, strip_sql_literals, GdprIdentifierMode};

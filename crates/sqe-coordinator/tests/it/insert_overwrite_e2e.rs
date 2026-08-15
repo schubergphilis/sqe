@@ -103,8 +103,7 @@ async fn latest_snapshot(
         .expect("summary column")
         .value(0)
         .to_string();
-    let summary: HashMap<String, String> =
-        serde_json::from_str(&summary_json).unwrap_or_default();
+    let summary: HashMap<String, String> = serde_json::from_str(&summary_json).unwrap_or_default();
     (op, summary)
 }
 
@@ -123,12 +122,30 @@ async fn overwrite_replaces_unpartitioned_and_retains_history() {
     let fq = format!("{ns}.{name}");
 
     exec(&handler, &session, &format!("DROP TABLE IF EXISTS {fq}")).await;
-    exec(&handler, &session, &format!("CREATE TABLE {fq} AS SELECT 1 AS id, 10 AS v")).await;
-    exec(&handler, &session, &format!("INSERT INTO {fq} VALUES (2, 20), (3, 30)")).await;
-    assert_eq!(scalar_i64(&handler, &session, &format!("SELECT COUNT(*) FROM {fq}")).await, 3);
+    exec(
+        &handler,
+        &session,
+        &format!("CREATE TABLE {fq} AS SELECT 1 AS id, 10 AS v"),
+    )
+    .await;
+    exec(
+        &handler,
+        &session,
+        &format!("INSERT INTO {fq} VALUES (2, 20), (3, 30)"),
+    )
+    .await;
+    assert_eq!(
+        scalar_i64(&handler, &session, &format!("SELECT COUNT(*) FROM {fq}")).await,
+        3
+    );
     let snaps_before = snapshot_count(&handler, &session, ns, name).await;
 
-    exec(&handler, &session, &format!("INSERT OVERWRITE {fq} SELECT 99 AS id, 990 AS v")).await;
+    exec(
+        &handler,
+        &session,
+        &format!("INSERT OVERWRITE {fq} SELECT 99 AS id, 990 AS v"),
+    )
+    .await;
 
     // Not appended: exactly the overwrite result remains.
     assert_eq!(
@@ -136,7 +153,10 @@ async fn overwrite_replaces_unpartitioned_and_retains_history() {
         1,
         "INSERT OVERWRITE must replace, not append"
     );
-    assert_eq!(scalar_i64(&handler, &session, &format!("SELECT id FROM {fq}")).await, 99);
+    assert_eq!(
+        scalar_i64(&handler, &session, &format!("SELECT id FROM {fq}")).await,
+        99
+    );
     // A new snapshot was committed and the prior ones are retained (time travel).
     assert!(
         snapshot_count(&handler, &session, ns, name).await > snaps_before,
@@ -154,14 +174,32 @@ async fn overwrite_is_idempotent() {
     let (ns, name) = ("default", "iow_idem_378");
     let fq = format!("{ns}.{name}");
     exec(&handler, &session, &format!("DROP TABLE IF EXISTS {fq}")).await;
-    exec(&handler, &session, &format!("CREATE TABLE {fq} AS SELECT 1 AS id")).await;
+    exec(
+        &handler,
+        &session,
+        &format!("CREATE TABLE {fq} AS SELECT 1 AS id"),
+    )
+    .await;
 
-    exec(&handler, &session, &format!("INSERT OVERWRITE {fq} SELECT 5 AS id UNION ALL SELECT 6")).await;
+    exec(
+        &handler,
+        &session,
+        &format!("INSERT OVERWRITE {fq} SELECT 5 AS id UNION ALL SELECT 6"),
+    )
+    .await;
     let first = scalar_i64(&handler, &session, &format!("SELECT COUNT(*) FROM {fq}")).await;
-    exec(&handler, &session, &format!("INSERT OVERWRITE {fq} SELECT 5 AS id UNION ALL SELECT 6")).await;
+    exec(
+        &handler,
+        &session,
+        &format!("INSERT OVERWRITE {fq} SELECT 5 AS id UNION ALL SELECT 6"),
+    )
+    .await;
     let second = scalar_i64(&handler, &session, &format!("SELECT COUNT(*) FROM {fq}")).await;
     assert_eq!(first, 2);
-    assert_eq!(second, 2, "re-running the same overwrite must not double rows");
+    assert_eq!(
+        second, 2,
+        "re-running the same overwrite must not double rows"
+    );
 
     exec(&handler, &session, &format!("DROP TABLE IF EXISTS {fq}")).await;
 }
@@ -180,8 +218,16 @@ async fn overwrite_dynamic_preserves_untouched_partitions() {
         &format!("CREATE TABLE {fq} (id BIGINT, region STRING, v BIGINT) PARTITIONED BY (region)"),
     )
     .await;
-    exec(&handler, &session, &format!("INSERT INTO {fq} VALUES (1,'eu',10),(2,'us',20)")).await;
-    assert_eq!(scalar_i64(&handler, &session, &format!("SELECT COUNT(*) FROM {fq}")).await, 2);
+    exec(
+        &handler,
+        &session,
+        &format!("INSERT INTO {fq} VALUES (1,'eu',10),(2,'us',20)"),
+    )
+    .await;
+    assert_eq!(
+        scalar_i64(&handler, &session, &format!("SELECT COUNT(*) FROM {fq}")).await,
+        2
+    );
 
     // Overwrite only the 'eu' partition with two new rows.
     exec(
@@ -198,12 +244,22 @@ async fn overwrite_dynamic_preserves_untouched_partitions() {
         "untouched 'us' partition must survive; 'eu' replaced"
     );
     assert_eq!(
-        scalar_i64(&handler, &session, &format!("SELECT COUNT(*) FROM {fq} WHERE region='us'")).await,
+        scalar_i64(
+            &handler,
+            &session,
+            &format!("SELECT COUNT(*) FROM {fq} WHERE region='us'")
+        )
+        .await,
         1,
         "untouched partition over-deleted - CATASTROPHIC"
     );
     assert_eq!(
-        scalar_i64(&handler, &session, &format!("SELECT COUNT(*) FROM {fq} WHERE region='eu'")).await,
+        scalar_i64(
+            &handler,
+            &session,
+            &format!("SELECT COUNT(*) FROM {fq} WHERE region='eu'")
+        )
+        .await,
         2,
     );
 
@@ -218,10 +274,25 @@ async fn overwrite_empty_select_truncates_unpartitioned() {
     let (ns, name) = ("default", "iow_trunc_378");
     let fq = format!("{ns}.{name}");
     exec(&handler, &session, &format!("DROP TABLE IF EXISTS {fq}")).await;
-    exec(&handler, &session, &format!("CREATE TABLE {fq} AS SELECT 1 AS id")).await;
-    exec(&handler, &session, &format!("INSERT INTO {fq} VALUES (2),(3)")).await;
+    exec(
+        &handler,
+        &session,
+        &format!("CREATE TABLE {fq} AS SELECT 1 AS id"),
+    )
+    .await;
+    exec(
+        &handler,
+        &session,
+        &format!("INSERT INTO {fq} VALUES (2),(3)"),
+    )
+    .await;
 
-    exec(&handler, &session, &format!("INSERT OVERWRITE {fq} SELECT 1 AS id WHERE 1=0")).await;
+    exec(
+        &handler,
+        &session,
+        &format!("INSERT OVERWRITE {fq} SELECT 1 AS id WHERE 1=0"),
+    )
+    .await;
     assert_eq!(
         scalar_i64(&handler, &session, &format!("SELECT COUNT(*) FROM {fq}")).await,
         0,
@@ -255,12 +326,27 @@ async fn overwrite_drops_covered_position_deletes() {
         ),
     )
     .await;
-    exec(&handler, &session, &format!("INSERT INTO {fq} VALUES (2, 20)")).await;
-    exec(&handler, &session, &format!("INSERT INTO {fq} VALUES (3, 30)")).await;
+    exec(
+        &handler,
+        &session,
+        &format!("INSERT INTO {fq} VALUES (2, 20)"),
+    )
+    .await;
+    exec(
+        &handler,
+        &session,
+        &format!("INSERT INTO {fq} VALUES (3, 30)"),
+    )
+    .await;
     assert_eq!(live_data_file_count(&handler, &session, ns, name).await, 3);
 
     // MoR DELETE: data files untouched, a position-delete file is added.
-    exec(&handler, &session, &format!("DELETE FROM {fq} WHERE id = 1")).await;
+    exec(
+        &handler,
+        &session,
+        &format!("DELETE FROM {fq} WHERE id = 1"),
+    )
+    .await;
     assert_eq!(
         live_data_file_count(&handler, &session, ns, name).await,
         3,
@@ -271,11 +357,19 @@ async fn overwrite_drops_covered_position_deletes() {
         summary_count(&del_summary, "added-delete-files") >= 1,
         "MoR DELETE must commit a position-delete file; summary={del_summary:?}"
     );
-    assert_eq!(scalar_i64(&handler, &session, &format!("SELECT COUNT(*) FROM {fq}")).await, 2);
+    assert_eq!(
+        scalar_i64(&handler, &session, &format!("SELECT COUNT(*) FROM {fq}")).await,
+        2
+    );
 
     // Full-table INSERT OVERWRITE (unpartitioned): every current data file is
     // replaced, including the one the still-live delete file covers.
-    exec(&handler, &session, &format!("INSERT OVERWRITE {fq} SELECT 99 AS id, 990 AS v")).await;
+    exec(
+        &handler,
+        &session,
+        &format!("INSERT OVERWRITE {fq} SELECT 99 AS id, 990 AS v"),
+    )
+    .await;
 
     assert_eq!(
         live_data_file_count(&handler, &session, ns, name).await,
@@ -286,7 +380,10 @@ async fn overwrite_drops_covered_position_deletes() {
         scalar_i64(&handler, &session, &format!("SELECT COUNT(*) FROM {fq}")).await,
         1
     );
-    assert_eq!(scalar_i64(&handler, &session, &format!("SELECT id FROM {fq}")).await, 99);
+    assert_eq!(
+        scalar_i64(&handler, &session, &format!("SELECT id FROM {fq}")).await,
+        99
+    );
 
     let (op, ow_summary) = latest_snapshot(&handler, &session, ns, name).await;
     assert!(
@@ -307,12 +404,33 @@ async fn overwrite_from_self() {
     let (ns, name) = ("default", "iow_self_378");
     let fq = format!("{ns}.{name}");
     exec(&handler, &session, &format!("DROP TABLE IF EXISTS {fq}")).await;
-    exec(&handler, &session, &format!("CREATE TABLE {fq} AS SELECT 1 AS id")).await;
-    exec(&handler, &session, &format!("INSERT INTO {fq} VALUES (2),(3)")).await;
+    exec(
+        &handler,
+        &session,
+        &format!("CREATE TABLE {fq} AS SELECT 1 AS id"),
+    )
+    .await;
+    exec(
+        &handler,
+        &session,
+        &format!("INSERT INTO {fq} VALUES (2),(3)"),
+    )
+    .await;
 
-    exec(&handler, &session, &format!("INSERT OVERWRITE {fq} SELECT id + 100 FROM {fq}")).await;
-    assert_eq!(scalar_i64(&handler, &session, &format!("SELECT COUNT(*) FROM {fq}")).await, 3);
-    assert_eq!(scalar_i64(&handler, &session, &format!("SELECT MIN(id) FROM {fq}")).await, 101);
+    exec(
+        &handler,
+        &session,
+        &format!("INSERT OVERWRITE {fq} SELECT id + 100 FROM {fq}"),
+    )
+    .await;
+    assert_eq!(
+        scalar_i64(&handler, &session, &format!("SELECT COUNT(*) FROM {fq}")).await,
+        3
+    );
+    assert_eq!(
+        scalar_i64(&handler, &session, &format!("SELECT MIN(id) FROM {fq}")).await,
+        101
+    );
 
     exec(&handler, &session, &format!("DROP TABLE IF EXISTS {fq}")).await;
 }

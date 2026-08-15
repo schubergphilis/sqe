@@ -94,8 +94,8 @@ pub fn apply_adaptive_sort(
             let input = Arc::clone(sort_exec.children()[0]);
 
             let partition_cols = find_partition_columns(&input);
-            let is_partition_sort = !sort_cols.is_empty()
-                && sort_cols.iter().all(|c| partition_cols.contains(c));
+            let is_partition_sort =
+                !sort_cols.is_empty() && sort_cols.iter().all(|c| partition_cols.contains(c));
 
             let keep = decide_sort(sort_mode, pressure, is_partition_sort, has_fetch);
 
@@ -104,8 +104,12 @@ pub fn apply_adaptive_sort(
             } else if keep {
                 match sort_mode {
                     SortMode::Strict => "strict mode — always keep".to_string(),
-                    SortMode::PartitionOnly => "partition-only mode — sort keys match partition columns".to_string(),
-                    SortMode::Adaptive => format!("adaptive mode — pressure={pressure}, partition sort"),
+                    SortMode::PartitionOnly => {
+                        "partition-only mode — sort keys match partition columns".to_string()
+                    }
+                    SortMode::Adaptive => {
+                        format!("adaptive mode — pressure={pressure}, partition sort")
+                    }
                 }
             } else {
                 match sort_mode {
@@ -114,9 +118,9 @@ pub fn apply_adaptive_sort(
                         sort_cols.join(", "),
                         partition_cols.join(", "),
                     ),
-                    SortMode::Adaptive => format!(
-                        "adaptive mode — pressure={pressure}, non-partition sort stripped",
-                    ),
+                    SortMode::Adaptive => {
+                        format!("adaptive mode — pressure={pressure}, non-partition sort stripped",)
+                    }
                     SortMode::Strict => unreachable!(),
                 }
             };
@@ -213,10 +217,7 @@ fn extract_sort_column_names(sort_exec: &SortExec) -> Vec<String> {
 /// Format a user-facing warning string when sorts were stripped.
 ///
 /// Returns `None` if no sorts were stripped (all kept or no sorts in plan).
-pub fn format_sort_warning(
-    decisions: &[SortDecision],
-    sort_mode: SortMode,
-) -> Option<String> {
+pub fn format_sort_warning(decisions: &[SortDecision], sort_mode: SortMode) -> Option<String> {
     let stripped: Vec<&SortDecision> = decisions.iter().filter(|d| !d.kept).collect();
     if stripped.is_empty() {
         return None;
@@ -245,10 +246,7 @@ pub fn format_sort_warning(
 ///
 /// When memory is critical and a query with ORDER BY is rejected,
 /// this provides specific guidance on what the user can do.
-pub fn format_pressure_rejection(
-    sort_columns: &[String],
-    pressure: MemoryPressure,
-) -> String {
+pub fn format_pressure_rejection(sort_columns: &[String], pressure: MemoryPressure) -> String {
     if sort_columns.is_empty() {
         return format!(
             "Query rejected: server memory is {pressure} (>95% utilized). Please retry later."
@@ -321,49 +319,139 @@ mod tests {
 
     #[test]
     fn test_strict_always_keeps() {
-        assert!(decide_sort(SortMode::Strict, MemoryPressure::Green, false, false));
-        assert!(decide_sort(SortMode::Strict, MemoryPressure::Red, false, false));
-        assert!(decide_sort(SortMode::Strict, MemoryPressure::Orange, true, false));
+        assert!(decide_sort(
+            SortMode::Strict,
+            MemoryPressure::Green,
+            false,
+            false
+        ));
+        assert!(decide_sort(
+            SortMode::Strict,
+            MemoryPressure::Red,
+            false,
+            false
+        ));
+        assert!(decide_sort(
+            SortMode::Strict,
+            MemoryPressure::Orange,
+            true,
+            false
+        ));
     }
 
     #[test]
     fn test_partition_only_keeps_partition_sort() {
-        assert!(decide_sort(SortMode::PartitionOnly, MemoryPressure::Green, true, false));
-        assert!(decide_sort(SortMode::PartitionOnly, MemoryPressure::Red, true, false));
+        assert!(decide_sort(
+            SortMode::PartitionOnly,
+            MemoryPressure::Green,
+            true,
+            false
+        ));
+        assert!(decide_sort(
+            SortMode::PartitionOnly,
+            MemoryPressure::Red,
+            true,
+            false
+        ));
     }
 
     #[test]
     fn test_partition_only_strips_non_partition() {
-        assert!(!decide_sort(SortMode::PartitionOnly, MemoryPressure::Green, false, false));
-        assert!(!decide_sort(SortMode::PartitionOnly, MemoryPressure::Red, false, false));
+        assert!(!decide_sort(
+            SortMode::PartitionOnly,
+            MemoryPressure::Green,
+            false,
+            false
+        ));
+        assert!(!decide_sort(
+            SortMode::PartitionOnly,
+            MemoryPressure::Red,
+            false,
+            false
+        ));
     }
 
     #[test]
     fn test_adaptive_green_keeps_all() {
-        assert!(decide_sort(SortMode::Adaptive, MemoryPressure::Green, false, false));
-        assert!(decide_sort(SortMode::Adaptive, MemoryPressure::Green, true, false));
+        assert!(decide_sort(
+            SortMode::Adaptive,
+            MemoryPressure::Green,
+            false,
+            false
+        ));
+        assert!(decide_sort(
+            SortMode::Adaptive,
+            MemoryPressure::Green,
+            true,
+            false
+        ));
     }
 
     #[test]
     fn test_adaptive_pressure_keeps_partition_sort() {
-        assert!(decide_sort(SortMode::Adaptive, MemoryPressure::Yellow, true, false));
-        assert!(decide_sort(SortMode::Adaptive, MemoryPressure::Orange, true, false));
-        assert!(decide_sort(SortMode::Adaptive, MemoryPressure::Red, true, false));
+        assert!(decide_sort(
+            SortMode::Adaptive,
+            MemoryPressure::Yellow,
+            true,
+            false
+        ));
+        assert!(decide_sort(
+            SortMode::Adaptive,
+            MemoryPressure::Orange,
+            true,
+            false
+        ));
+        assert!(decide_sort(
+            SortMode::Adaptive,
+            MemoryPressure::Red,
+            true,
+            false
+        ));
     }
 
     #[test]
     fn test_adaptive_pressure_strips_non_partition() {
-        assert!(!decide_sort(SortMode::Adaptive, MemoryPressure::Yellow, false, false));
-        assert!(!decide_sort(SortMode::Adaptive, MemoryPressure::Orange, false, false));
-        assert!(!decide_sort(SortMode::Adaptive, MemoryPressure::Red, false, false));
+        assert!(!decide_sort(
+            SortMode::Adaptive,
+            MemoryPressure::Yellow,
+            false,
+            false
+        ));
+        assert!(!decide_sort(
+            SortMode::Adaptive,
+            MemoryPressure::Orange,
+            false,
+            false
+        ));
+        assert!(!decide_sort(
+            SortMode::Adaptive,
+            MemoryPressure::Red,
+            false,
+            false
+        ));
     }
 
     #[test]
     fn test_topk_always_kept() {
         // TopK (fetch=true) should always be kept regardless of mode/pressure
-        assert!(decide_sort(SortMode::Adaptive, MemoryPressure::Red, false, true));
-        assert!(decide_sort(SortMode::PartitionOnly, MemoryPressure::Green, false, true));
-        assert!(decide_sort(SortMode::Strict, MemoryPressure::Red, false, true));
+        assert!(decide_sort(
+            SortMode::Adaptive,
+            MemoryPressure::Red,
+            false,
+            true
+        ));
+        assert!(decide_sort(
+            SortMode::PartitionOnly,
+            MemoryPressure::Green,
+            false,
+            true
+        ));
+        assert!(decide_sort(
+            SortMode::Strict,
+            MemoryPressure::Red,
+            false,
+            true
+        ));
     }
 
     // ---- apply_adaptive_sort integration tests ----
@@ -374,12 +462,8 @@ mod tests {
         let input = make_memory_plan(schema);
         let plan = make_sort_plan(input, &["name"], None);
 
-        let (result, decisions) = apply_adaptive_sort(
-            plan.clone(),
-            SortMode::Strict,
-            MemoryPressure::Red,
-            None,
-        );
+        let (result, decisions) =
+            apply_adaptive_sort(plan.clone(), SortMode::Strict, MemoryPressure::Red, None);
 
         // Strict mode skips the tree walk entirely
         assert!(decisions.is_empty());
@@ -393,12 +477,8 @@ mod tests {
         let input = make_memory_plan(schema);
         let plan = make_sort_plan(input.clone(), &["name"], None);
 
-        let (result, decisions) = apply_adaptive_sort(
-            plan,
-            SortMode::PartitionOnly,
-            MemoryPressure::Green,
-            None,
-        );
+        let (result, decisions) =
+            apply_adaptive_sort(plan, SortMode::PartitionOnly, MemoryPressure::Green, None);
 
         // "name" is not a partition column (no IcebergScanExec in the tree)
         assert_eq!(decisions.len(), 1);
@@ -413,12 +493,8 @@ mod tests {
         let input = make_memory_plan(schema);
         let plan = make_sort_plan(input, &["name"], None);
 
-        let (result, decisions) = apply_adaptive_sort(
-            plan,
-            SortMode::Adaptive,
-            MemoryPressure::Green,
-            None,
-        );
+        let (result, decisions) =
+            apply_adaptive_sort(plan, SortMode::Adaptive, MemoryPressure::Green, None);
 
         assert_eq!(decisions.len(), 1);
         assert!(decisions[0].kept);
@@ -431,12 +507,8 @@ mod tests {
         let input = make_memory_plan(schema);
         let plan = make_sort_plan(input, &["name"], None);
 
-        let (result, decisions) = apply_adaptive_sort(
-            plan,
-            SortMode::Adaptive,
-            MemoryPressure::Yellow,
-            None,
-        );
+        let (result, decisions) =
+            apply_adaptive_sort(plan, SortMode::Adaptive, MemoryPressure::Yellow, None);
 
         assert_eq!(decisions.len(), 1);
         assert!(!decisions[0].kept);
@@ -449,17 +521,17 @@ mod tests {
         let input = make_memory_plan(schema);
         let plan = make_sort_plan(input, &["name"], Some(100));
 
-        let (result, decisions) = apply_adaptive_sort(
-            plan,
-            SortMode::Adaptive,
-            MemoryPressure::Red,
-            None,
-        );
+        let (result, decisions) =
+            apply_adaptive_sort(plan, SortMode::Adaptive, MemoryPressure::Red, None);
 
         assert_eq!(decisions.len(), 1);
         assert!(decisions[0].kept);
         // DataFusion names SortExec with LIMIT as "SortExec(TopK)"
-        assert!(result.name().starts_with("SortExec"), "Expected SortExec, got {}", result.name());
+        assert!(
+            result.name().starts_with("SortExec"),
+            "Expected SortExec, got {}",
+            result.name()
+        );
     }
 
     #[test]
@@ -467,12 +539,8 @@ mod tests {
         let schema = test_schema();
         let plan = make_memory_plan(schema);
 
-        let (result, decisions) = apply_adaptive_sort(
-            plan.clone(),
-            SortMode::Adaptive,
-            MemoryPressure::Red,
-            None,
-        );
+        let (result, decisions) =
+            apply_adaptive_sort(plan.clone(), SortMode::Adaptive, MemoryPressure::Red, None);
 
         assert!(decisions.is_empty());
         assert!(Arc::ptr_eq(&result, &plan));
