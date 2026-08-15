@@ -6,7 +6,7 @@ use arrow_array::{ArrayRef, RecordBatch};
 use async_trait::async_trait;
 use datafusion::catalog::SchemaProvider;
 use datafusion::datasource::{MemTable, TableProvider};
-use datafusion::error::Result as DFResult;
+use datafusion::error::{DataFusionError, Result as DFResult};
 use iceberg::NamespaceIdent;
 use tracing::{debug, warn};
 
@@ -79,20 +79,16 @@ impl SchemaProvider for MetadataSchemaProvider {
 }
 
 impl MetadataSchemaProvider {
-    /// List a single catalog's namespaces, returning an empty vec on error
-    /// (with a log message) so enumeration skips an unauthorized / unreachable
-    /// catalog instead of aborting the whole metadata listing.
-    async fn list_namespaces_safe(catalog: &SessionCatalog) -> Vec<NamespaceIdent> {
+    /// List a single catalog's namespaces. 403/forbidden stays empty (skip that
+    /// catalog). Any other error is catalog-unavailable, not an empty listing.
+    async fn list_namespaces_safe(catalog: &SessionCatalog) -> DFResult<Vec<NamespaceIdent>> {
         match catalog.list_namespaces().await {
-            Ok(namespaces) => namespaces,
+            Ok(namespaces) => Ok(namespaces),
             Err(e) if listing_error_is_forbidden(&e) => {
                 debug!(error = %e, "system.metadata: skipping catalog the principal is not authorized to list");
-                Vec::new()
+                Ok(Vec::new())
             }
-            Err(e) => {
-                warn!(error = %e, "system.metadata: skipping catalog whose namespaces could not be listed");
-                Vec::new()
-            }
+            Err(e) => Err(DataFusionError::External(Box::new(e))),
         }
     }
 
@@ -122,7 +118,8 @@ impl MetadataSchemaProvider {
         let mut prop_value_b = StringBuilder::new();
 
         for entry in &self.catalogs {
-            for ns in &Self::list_namespaces_safe(&entry.catalog).await {
+            let namespaces = Self::list_namespaces_safe(&entry.catalog).await?;
+            for ns in &namespaces {
                 let ns_str = Self::namespace_to_string(ns);
                 let tables = match entry.catalog.list_tables(ns).await {
                     Ok(t) => t,
@@ -131,8 +128,7 @@ impl MetadataSchemaProvider {
                         continue;
                     }
                     Err(e) => {
-                        warn!(catalog = %entry.name, namespace = %ns_str, error = %e, "Failed to list tables for system.metadata.table_properties");
-                        continue;
+                        return Err(DataFusionError::External(Box::new(e)));
                     }
                 };
 
@@ -190,7 +186,8 @@ impl MetadataSchemaProvider {
         let mut prop_value_b = StringBuilder::new();
 
         for entry in &self.catalogs {
-            for ns in &Self::list_namespaces_safe(&entry.catalog).await {
+            let namespaces = Self::list_namespaces_safe(&entry.catalog).await?;
+            for ns in &namespaces {
                 let ns_str = Self::namespace_to_string(ns);
                 match entry.catalog.get_namespace(ns).await {
                     Ok(namespace) => {
@@ -206,7 +203,7 @@ impl MetadataSchemaProvider {
                         debug!(catalog = %entry.name, namespace = %ns_str, "system.metadata.schema_properties: skipping namespace the principal is not authorized to access");
                     }
                     Err(e) => {
-                        warn!(catalog = %entry.name, namespace = %ns_str, error = %e, "Failed to get namespace for system.metadata.schema_properties");
+                        return Err(DataFusionError::External(Box::new(e)));
                     }
                 }
             }
@@ -243,7 +240,8 @@ impl MetadataSchemaProvider {
         let mut comment_b = StringBuilder::new();
 
         for entry in &self.catalogs {
-            for ns in &Self::list_namespaces_safe(&entry.catalog).await {
+            let namespaces = Self::list_namespaces_safe(&entry.catalog).await?;
+            for ns in &namespaces {
                 let ns_str = Self::namespace_to_string(ns);
                 let tables = match entry.catalog.list_tables(ns).await {
                     Ok(t) => t,
@@ -252,8 +250,7 @@ impl MetadataSchemaProvider {
                         continue;
                     }
                     Err(e) => {
-                        warn!(catalog = %entry.name, namespace = %ns_str, error = %e, "Failed to list tables for system.metadata.table_comments");
-                        continue;
+                        return Err(DataFusionError::External(Box::new(e)));
                     }
                 };
 

@@ -6,7 +6,7 @@ use arrow_array::{ArrayRef, RecordBatch};
 use async_trait::async_trait;
 use datafusion::catalog::SchemaProvider;
 use datafusion::datasource::{MemTable, TableProvider};
-use datafusion::error::Result as DFResult;
+use datafusion::error::{DataFusionError, Result as DFResult};
 use iceberg::NamespaceIdent;
 use tracing::{debug, warn};
 
@@ -59,9 +59,9 @@ fn dedup_entries(entries: Vec<SystemCatalogEntry>) -> Vec<SystemCatalogEntry> {
 /// List a single catalog's namespaces as dotted strings; `[]` on error
 /// (unauthorized / unreachable catalog), so enumeration skips it rather than
 /// aborting the whole metadata listing.
-async fn list_namespaces_for(catalog: &SessionCatalog) -> Vec<String> {
+async fn list_namespaces_for(catalog: &SessionCatalog) -> DFResult<Vec<String>> {
     match catalog.list_namespaces().await {
-        Ok(namespaces) => namespaces
+        Ok(namespaces) => Ok(namespaces
             .iter()
             .map(|ns| {
                 ns.as_ref()
@@ -70,17 +70,12 @@ async fn list_namespaces_for(catalog: &SessionCatalog) -> Vec<String> {
                     .collect::<Vec<_>>()
                     .join(".")
             })
-            .collect(),
-        Err(e) => {
-            // A principal that cannot LIST a catalog's namespaces just doesn't
-            // see it: skip quietly (#318). Any other failure is logged.
-            if listing_error_is_forbidden(&e) {
-                debug!(error = %e, "system.jdbc: skipping catalog the principal is not authorized to list");
-            } else {
-                warn!(error = %e, "system.jdbc: skipping catalog whose namespaces could not be listed");
-            }
-            Vec::new()
+            .collect()),
+        Err(e) if listing_error_is_forbidden(&e) => {
+            debug!(error = %e, "system.jdbc: skipping catalog the principal is not authorized to list");
+            Ok(Vec::new())
         }
+        Err(e) => Err(DataFusionError::External(Box::new(e))),
     }
 }
 
@@ -142,7 +137,7 @@ impl JdbcSchemaProvider {
             schem_builder.append_value("information_schema");
             catalog_builder.append_value(&entry.name);
 
-            for ns in list_namespaces_for(&entry.catalog).await {
+            for ns in list_namespaces_for(&entry.catalog).await? {
                 schem_builder.append_value(&ns);
                 catalog_builder.append_value(&entry.name);
             }
@@ -185,7 +180,7 @@ impl JdbcSchemaProvider {
         let mut ref_gen_b = StringBuilder::new();
 
         for entry in &self.catalogs {
-            for ns in list_namespaces_for(&entry.catalog).await {
+            for ns in list_namespaces_for(&entry.catalog).await? {
                 let ns_ident = NamespaceIdent::new(ns.clone());
                 match entry.catalog.list_tables(&ns_ident).await {
                     Ok(tables) => {
@@ -206,7 +201,7 @@ impl JdbcSchemaProvider {
                         debug!(catalog = %entry.name, namespace = %ns, "system.jdbc.tables: skipping namespace the principal is not authorized to list");
                     }
                     Err(e) => {
-                        warn!(catalog = %entry.name, namespace = %ns, error = %e, "Failed to list tables for system.jdbc.tables");
+                        return Err(DataFusionError::External(Box::new(e)));
                     }
                 }
             }
@@ -286,7 +281,7 @@ impl JdbcSchemaProvider {
         let mut is_gen_b = StringBuilder::new();
 
         for entry in &self.catalogs {
-            for ns in list_namespaces_for(&entry.catalog).await {
+            for ns in list_namespaces_for(&entry.catalog).await? {
                 let ns_ident = NamespaceIdent::new(ns.clone());
                 let tables = match entry.catalog.list_tables(&ns_ident).await {
                     Ok(t) => t,
@@ -295,8 +290,7 @@ impl JdbcSchemaProvider {
                         continue;
                     }
                     Err(e) => {
-                        warn!(catalog = %entry.name, namespace = %ns, error = %e, "Failed to list tables for system.jdbc.columns");
-                        continue;
+                        return Err(DataFusionError::External(Box::new(e)));
                     }
                 };
 

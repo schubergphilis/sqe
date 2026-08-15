@@ -7,7 +7,7 @@ use arrow_array::{ArrayRef, RecordBatch};
 use async_trait::async_trait;
 use datafusion::catalog::SchemaProvider;
 use datafusion::datasource::{MemTable, TableProvider};
-use datafusion::error::Result as DFResult;
+use datafusion::error::{DataFusionError, Result as DFResult};
 use iceberg::NamespaceIdent;
 use tracing::{debug, error, warn};
 
@@ -103,7 +103,7 @@ impl InformationSchemaProvider {
             Field::new("table_type", DataType::Utf8, false),
         ]));
 
-        let namespaces = self.list_namespaces_safe().await;
+        let namespaces = self.list_namespaces_safe().await?;
 
         let mut catalog_builder = StringBuilder::new();
         let mut schema_builder = StringBuilder::new();
@@ -125,7 +125,7 @@ impl InformationSchemaProvider {
                     debug!(namespace = %ns, "information_schema.tables: skipping namespace the principal is not authorized to list");
                 }
                 Err(e) => {
-                    warn!(namespace = %ns, error = %e, "Failed to list tables for information_schema");
+                    return Err(DataFusionError::External(Box::new(e)));
                 }
             }
         }
@@ -160,7 +160,7 @@ impl InformationSchemaProvider {
             Field::new("udt_name", DataType::Utf8, true),
         ]));
 
-        let namespaces = self.list_namespaces_safe().await;
+        let namespaces = self.list_namespaces_safe().await?;
 
         let mut cat_b = StringBuilder::new();
         let mut sch_b = StringBuilder::new();
@@ -185,8 +185,7 @@ impl InformationSchemaProvider {
                     continue;
                 }
                 Err(e) => {
-                    warn!(namespace = ?ns, error = %e, "Failed to list tables for columns");
-                    continue;
+                    return Err(DataFusionError::External(Box::new(e)));
                 }
             };
 
@@ -294,7 +293,7 @@ impl InformationSchemaProvider {
             Field::new("schema_name", DataType::Utf8, false),
         ]));
 
-        let namespaces = self.list_namespaces_safe().await;
+        let namespaces = self.list_namespaces_safe().await?;
 
         let mut cat_b = StringBuilder::new();
         let mut sch_b = StringBuilder::new();
@@ -315,12 +314,12 @@ impl InformationSchemaProvider {
         Ok(Arc::new(MemTable::try_new(schema, vec![vec![batch]])?))
     }
 
-    async fn list_namespaces_safe(&self) -> Vec<String> {
+    async fn list_namespaces_safe(&self) -> DFResult<Vec<String>> {
         if let Some(ref cached) = self.cached_namespaces {
-            return cached.clone();
+            return Ok(cached.clone());
         }
         match self.session_catalog.list_namespaces().await {
-            Ok(namespaces) => namespaces
+            Ok(namespaces) => Ok(namespaces
                 .iter()
                 .map(|ns| {
                     ns.as_ref()
@@ -329,15 +328,12 @@ impl InformationSchemaProvider {
                         .collect::<Vec<_>>()
                         .join(".")
                 })
-                .collect(),
+                .collect()),
             Err(e) if listing_error_is_forbidden(&e) => {
                 debug!(error = %e, "information_schema: skipping catalog the principal is not authorized to list");
-                Vec::new()
+                Ok(Vec::new())
             }
-            Err(e) => {
-                error!(error = %e, "Failed to list namespaces for information_schema");
-                Vec::new()
-            }
+            Err(e) => Err(DataFusionError::External(Box::new(e))),
         }
     }
 }
