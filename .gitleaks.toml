@@ -75,6 +75,10 @@ regexes = [
     # above; this is the second placeholder value used in the deployment docs
     # (historically docs/deployment.md, now under docs/site/).
     '''sqe_k?_?xyz789ghi012''',
+    # HMAC-SHA256 fixture digest in sha256_udf.rs (openssl of key=pepper / msg=SSN).
+    # Not a secret. rustfmt put the hex on its own line and generic-api-key
+    # started matching it on every pipeline.
+    '''40966d99be0fda85dac0b2f8d9f00b434b89b0d3e2b3f4bdcbf1dd31a2b7092f''',
 ]
 
 # 4. History-only false positives that cannot be expressed as a value match.
