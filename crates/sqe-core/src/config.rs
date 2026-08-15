@@ -2869,11 +2869,12 @@ pub struct RangerPolicyConfig {
     /// SQE reads. Spark's Kyuubi plugin reads Ranger's tag store, so without this
     /// a tag-masked column is protected in SQE and returned RAW by Spark.
     ///
-    /// OFF by default, deliberately. A deployment with no second engine enforcing
-    /// from Ranger gains nothing from projecting and would acquire a hard
-    /// dependency on the Ranger tag API in its `SET TAG` path. Turn it on when
-    /// another engine reads the same Ranger, which is what the
-    /// polaris-ranger-keycloak quickstart does.
+    /// OFF by default, deliberately. A Ranger-only SQE deploy that never talks
+    /// to Spark gains nothing from projecting and would acquire a hard
+    /// dependency on the Ranger tag API in its `SET TAG` path. Mixed SQE+Spark
+    /// deployments MUST set this true so Spark sees the same tags SQE masks.
+    /// `production_mode` refuses Ranger with this off unless
+    /// `security.allow_unprojected_tags = true` (issue #397).
     #[serde(default)]
     pub project_tags: bool,
 }
@@ -3319,6 +3320,15 @@ pub struct SecurityConfig {
     /// diffs. Dev (non-production) still WARNs and starts.
     #[serde(default)]
     pub allow_unkeyed_hash_masks: bool,
+    /// Opt-in escape hatch for Ranger without `policy.ranger.project-tags`
+    /// (issue #397). Leaving this `false` (the default) makes
+    /// `production_mode` refuse to start when `policy.engine = ranger` and
+    /// `project-tags` is off: `SET TAG` would write Iceberg properties that
+    /// Spark/Kyuubi cannot see, so Spark returns raw columns SQE masks.
+    /// Mixed SQE+Spark must set `policy.ranger.project-tags = true`. Set
+    /// this true only for SQE-only Ranger deploys that never talk to Spark.
+    #[serde(default)]
+    pub allow_unprojected_tags: bool,
 }
 
 impl SecurityConfig {
@@ -4558,6 +4568,20 @@ impl SqeConfig {
             );
         }
 
+        if self.policy.engine == PolicyEngine::Ranger
+            && !self.policy.ranger.project_tags
+            && !self.security.allow_unprojected_tags
+        {
+            errors.push(
+                "production_mode: policy.engine is ranger but policy.ranger.project-tags \
+                 is false (SET TAG writes Iceberg properties that Spark/Kyuubi cannot \
+                 see, so Spark returns raw columns SQE masks). Mixed SQE+Spark must set \
+                 policy.ranger.project-tags = true, or set \
+                 security.allow_unprojected_tags = true for SQE-only Ranger deploys."
+                    .to_string(),
+            );
+        }
+
         if errors.is_empty() {
             Ok(())
         } else {
@@ -4714,6 +4738,10 @@ impl SqeConfig {
         env_override_bool(
             "SQE_SECURITY__ALLOW_UNKEYED_HASH_MASKS",
             &mut self.security.allow_unkeyed_hash_masks,
+        );
+        env_override_bool(
+            "SQE_SECURITY__ALLOW_UNPROJECTED_TAGS",
+            &mut self.security.allow_unprojected_tags,
         );
 
         // Auth
@@ -6444,6 +6472,29 @@ partial_progress_batch = 5
         config.policy.mask_key.clear();
         config.policy.ranger.project_tags = true;
         config.security.allow_unkeyed_hash_masks = true;
+        assert!(config.validate_production().is_ok());
+    }
+
+    #[test]
+    fn validate_production_rejects_ranger_without_project_tags() {
+        let mut config = valid_production_config();
+        config.policy.engine = PolicyEngine::Ranger;
+        config.policy.mask_key = "test-mask-key".to_string();
+        config.policy.ranger.project_tags = false;
+        let err = config.validate_production().unwrap_err().to_string();
+        assert!(
+            err.contains("allow_unprojected_tags") && err.contains("project-tags"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_production_accepts_ranger_unprojected_tags_when_opted_in() {
+        let mut config = valid_production_config();
+        config.policy.engine = PolicyEngine::Ranger;
+        config.policy.mask_key = "test-mask-key".to_string();
+        config.policy.ranger.project_tags = false;
+        config.security.allow_unprojected_tags = true;
         assert!(config.validate_production().is_ok());
     }
 
