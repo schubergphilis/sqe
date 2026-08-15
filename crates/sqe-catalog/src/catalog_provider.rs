@@ -118,28 +118,37 @@ where
 }
 
 /// Probe-filter a namespace list with bounded concurrency, preserving the
-/// input order. `probe` answers "may this caller see the namespace?"; the
-/// fail-open decision for indeterminate probe errors lives inside the
-/// probe (see `SessionCatalog::namespace_visible`), so this function only
-/// keeps or drops on the boolean.
+/// input order. `probe` answers "may this caller see the namespace?":
+/// `Ok(true)` keeps the name, `Ok(false)` hides it (403), and `Err`
+/// (timeout/5xx/other) fails the whole listing so an indeterminate
+/// probe cannot leak the name (#401).
 pub(crate) async fn filter_visible_namespaces<F, Fut>(
     namespaces: Vec<NamespaceIdent>,
     concurrency: usize,
     probe: F,
-) -> Vec<NamespaceIdent>
+) -> sqe_core::Result<Vec<NamespaceIdent>>
 where
     F: Fn(NamespaceIdent) -> Fut,
-    Fut: std::future::Future<Output = bool>,
+    Fut: std::future::Future<Output = sqe_core::Result<bool>>,
 {
-    futures::stream::iter(namespaces)
+    let probed: Vec<(NamespaceIdent, sqe_core::Result<bool>)> = futures::stream::iter(namespaces)
         .map(|ns| {
             let visible = probe(ns.clone());
             async move { (ns, visible.await) }
         })
         .buffered(concurrency.max(1))
-        .filter_map(|(ns, visible)| async move { visible.then_some(ns) })
         .collect()
-        .await
+        .await;
+
+    let mut visible = Vec::with_capacity(probed.len());
+    for (ns, result) in probed {
+        match result {
+            Ok(true) => visible.push(ns),
+            Ok(false) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(visible)
 }
 
 /// DataFusion `CatalogProvider` that bridges Iceberg namespaces to DataFusion schemas.
@@ -256,9 +265,9 @@ impl SqeCatalogProvider {
     /// list. Every metadata surface — `SHOW SCHEMAS`,
     /// `information_schema.schemata`, Flight SQL `GetDbSchemas` — reads
     /// that one list, so they can never disagree. Probe failures other
-    /// than 403 fail open (the name stays; contents remain protected by
-    /// the per-operation checks). Single-identity backends skip the
-    /// probes entirely: there is no caller to scope the list to.
+    /// than 403 fail the listing (catalog unavailable) so a timeout or
+    /// 5xx cannot leak a namespace name. Single-identity backends skip
+    /// the probes entirely: there is no caller to scope the list to.
     pub async fn try_new_with_options(
         session_catalog: Arc<SessionCatalog>,
         storage_config: StorageConfig,
@@ -443,7 +452,7 @@ impl SqeCatalogProvider {
                 NAMESPACE_PROBE_CONCURRENCY,
                 |ns| async move { catalog.namespace_visible(&ns).await },
             )
-            .await;
+            .await?;
             if namespaces.len() < listed {
                 debug!(
                     listed,
@@ -570,9 +579,10 @@ mod tests {
         let input = vec![ns("public"), ns("limited"), ns("shared"), ns("secret")];
         let out = filter_visible_namespaces(input, 8, |n| async move {
             let name = n.as_ref().join(".");
-            name != "limited" && name != "secret"
+            Ok(name != "limited" && name != "secret")
         })
-        .await;
+        .await
+        .unwrap();
         let names: Vec<String> = out.iter().map(|n| n.as_ref().join(".")).collect();
         assert_eq!(names, vec!["public", "shared"]);
     }
@@ -582,7 +592,9 @@ mod tests {
     #[tokio::test]
     async fn filter_all_denied_yields_empty() {
         let input = vec![ns("a"), ns("b")];
-        let out = filter_visible_namespaces(input, 8, |_| async move { false }).await;
+        let out = filter_visible_namespaces(input, 8, |_| async move { Ok(false) })
+            .await
+            .unwrap();
         assert!(out.is_empty());
     }
 
@@ -595,11 +607,36 @@ mod tests {
         let input: Vec<NamespaceIdent> = (0..20).map(|i| ns(&format!("ns{i}"))).collect();
         let out = filter_visible_namespaces(input, 0, |_| {
             probes.fetch_add(1, Ordering::SeqCst);
-            async move { true }
+            async move { Ok(true) }
         })
-        .await;
+        .await
+        .unwrap();
         assert_eq!(out.len(), 20);
         assert_eq!(probes.load(Ordering::SeqCst), 20);
+    }
+
+    /// #401: a timeout/5xx probe must fail the listing, not keep the name.
+    /// Mixed success + one indeterminate probe still fails — names are
+    /// not listed when we cannot prove the probe worked.
+    #[tokio::test]
+    async fn visibility_filter_fails_listing_on_probe_error() {
+        let input = vec![ns("public"), ns("flaky"), ns("shared")];
+        let err = filter_visible_namespaces(input, 8, |n| async move {
+            let name = n.as_ref().join(".");
+            if name == "flaky" {
+                Err(sqe_core::SqeError::Catalog(
+                    "500 Internal Server Error".to_string(),
+                ))
+            } else {
+                Ok(true)
+            }
+        })
+        .await
+        .expect_err("probe failure must fail the listing, not keep the name");
+        assert_eq!(
+            err.error_code(),
+            sqe_core::SqeErrorCode::CatalogUnavailable
+        );
     }
 
     fn snapshot(names: &[&str]) -> RwLock<Vec<String>> {
