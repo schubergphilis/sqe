@@ -88,77 +88,56 @@ impl CircuitBreaker {
 
     /// Check whether a request may proceed.
     ///
-    /// * `Ok(())` — circuit is Closed or Half-Open (probe allowed); call can proceed.
-    /// * `Err(msg)` — circuit is Open; return the error without calling the service.
+    /// * `Ok(())` — circuit is Closed, or this thread won the Open → Half-Open
+    ///   CAS and is the single admitted probe.
+    /// * `Err(msg)` — circuit is Open, Half-Open with a probe already in
+    ///   flight, or in an unknown state (fail closed).
     pub fn check(&self) -> Result<(), String> {
-        loop {
-            let state = self.state.load(Ordering::Acquire);
-            match state {
-                STATE_CLOSED => return Ok(()),
-                STATE_OPEN => {
-                    // Check whether the recovery window has elapsed.
-                    let elapsed_ms =
-                        now_millis().saturating_sub(self.last_failure_ms.load(Ordering::Relaxed));
-                    let recovery_ms = self.recovery_timeout.as_millis() as u64;
-                    if elapsed_ms >= recovery_ms {
-                        // Attempt transition Open → Half-Open.
-                        if self
-                            .state
-                            .compare_exchange(
-                                STATE_OPEN,
-                                STATE_HALF_OPEN,
-                                Ordering::AcqRel,
-                                Ordering::Acquire,
-                            )
-                            .is_ok()
-                        {
-                            info!(
-                                circuit = %self.name,
-                                "Circuit breaker entering Half-Open — allowing probe request"
-                            );
-                            return Ok(()); // allow the probe
-                        }
-                        // Another thread already made the transition — re-read and retry.
-                        continue;
-                    }
-                    return Err(format!(
-                        "Circuit breaker '{}' is Open — service unavailable (retry in {}ms)",
-                        self.name,
-                        recovery_ms.saturating_sub(elapsed_ms)
-                    ));
+        let state = self.state.load(Ordering::Acquire);
+        match state {
+            STATE_CLOSED => Ok(()),
+            STATE_OPEN => {
+                // Check whether the recovery window has elapsed.
+                let elapsed_ms =
+                    now_millis().saturating_sub(self.last_failure_ms.load(Ordering::Relaxed));
+                let recovery_ms = self.recovery_timeout.as_millis() as u64;
+                if elapsed_ms >= recovery_ms
+                    && self
+                        .state
+                        .compare_exchange(
+                            STATE_OPEN,
+                            STATE_HALF_OPEN,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                {
+                    info!(
+                        circuit = %self.name,
+                        "Circuit breaker entering Half-Open — allowing probe request"
+                    );
+                    return Ok(());
                 }
-                STATE_HALF_OPEN => {
-                    // Only ONE probe is allowed while Half-Open.
-                    // Attempt Half-Open → Open to "lock out" subsequent callers.
-                    // The probe itself runs concurrently; if it succeeds we close,
-                    // if it fails we reopen. Other concurrent callers are rejected
-                    // while the probe is in flight.
-                    match self.state.compare_exchange(
-                        STATE_HALF_OPEN,
-                        STATE_OPEN, // pessimistic: lock others out while probe runs
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                    ) {
-                        Ok(_) => {
-                            // We "claimed" the probe slot. Temporarily set state
-                            // back to Half-Open so our own check_probe call works.
-                            self.state.store(STATE_HALF_OPEN, Ordering::Release);
-                            return Ok(()); // we are the probe
-                        }
-                        Err(current) => {
-                            // State changed under us — re-read.
-                            if current == STATE_CLOSED {
-                                return Ok(());
-                            }
-                            return Err(format!(
-                                "Circuit breaker '{}' is Half-Open — probe already in flight",
-                                self.name
-                            ));
-                        }
-                    }
-                }
-                _ => return Ok(()), // unknown state — fail open (safe default)
+                Err(format!(
+                    "Circuit breaker '{}' is Open — service unavailable (retry in {}ms)",
+                    self.name,
+                    recovery_ms.saturating_sub(elapsed_ms)
+                ))
             }
+            // Already half-open: a probe is in flight (admitted by the CAS
+            // winner in the STATE_OPEN arm above). Deny every other concurrent
+            // caller until that probe resolves, so only ONE probe hits the
+            // backend instead of a thundering herd. Fail closed.
+            STATE_HALF_OPEN => Err(format!(
+                "Circuit breaker '{}' is Half-Open — probe already in flight",
+                self.name
+            )),
+            // Unknown state: fail closed. A corrupted atomic must not admit
+            // traffic to an upstream we cannot reason about.
+            _ => Err(format!(
+                "Circuit breaker '{}' is in an unknown state — failing closed",
+                self.name
+            )),
         }
     }
 
@@ -316,5 +295,58 @@ mod tests {
         let err = c.check().unwrap_err();
         assert!(err.contains("Circuit breaker"));
         assert!(err.contains("Open"));
+    }
+
+    #[test]
+    fn half_open_admits_only_the_cas_winner() {
+        let c = CircuitBreaker::new("test", 1, Duration::from_millis(0));
+        c.record_failure(); // opens
+                            // First check after recovery elapses wins the OPEN->HALF_OPEN CAS and
+                            // is the single admitted probe.
+        assert!(c.check().is_ok(), "CAS winner must be admitted");
+        assert_eq!(c.state_label(), "half_open", "now half-open");
+        // Every subsequent caller while half-open is denied (no thundering herd
+        // of probes) and stays fail-closed until the probe resolves.
+        assert!(
+            c.check().is_err(),
+            "second concurrent caller must be denied"
+        );
+        assert!(c.check().is_err(), "third concurrent caller must be denied");
+        assert_eq!(
+            c.state_label(),
+            "half_open",
+            "still half-open, probe still in flight"
+        );
+    }
+
+    #[test]
+    fn half_open_concurrent_callers_only_one_ok() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Arc;
+
+        let c = Arc::new(CircuitBreaker::new("test", 1, Duration::from_millis(0)));
+        c.record_failure(); // opens; recovery_timeout=0 so the next check probes
+
+        let ok_count = Arc::new(AtomicU32::new(0));
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let c = Arc::clone(&c);
+            let ok_count = Arc::clone(&ok_count);
+            handles.push(std::thread::spawn(move || {
+                if c.check().is_ok() {
+                    ok_count.fetch_add(1, Ordering::SeqCst);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        // Exactly one caller wins the OPEN->HALF_OPEN CAS and gets Ok; the rest
+        // are denied. Without the half-open gate, all 16 would get Ok.
+        assert_eq!(
+            ok_count.load(Ordering::SeqCst),
+            1,
+            "exactly one probe must be admitted in half-open"
+        );
     }
 }
