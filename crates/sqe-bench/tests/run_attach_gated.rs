@@ -19,6 +19,13 @@ fn run_tpch_via_golden_attach() {
         .output()
         .expect("run sqe-bench");
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(out.status.success(), "run failed: {stdout}\n{}", String::from_utf8_lossy(&out.stderr));
-    assert!(stdout.contains("BENCH_SUMMARY:tpch:"), "no summary line: {stdout}");
+    assert!(
+        out.status.success(),
+        "run failed: {stdout}\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        stdout.contains("BENCH_SUMMARY:tpch:"),
+        "no summary line: {stdout}"
+    );
 }

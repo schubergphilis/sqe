@@ -231,11 +231,8 @@ fn grace_recursive(
     }
 
     // Isolate heavy hitters before re-partitioning.
-    let (hh_build, rest_build, hh_keys) = isolate_heavy_hitters(
-        build_batches,
-        build_key_indices,
-        config.heavy_hitter_frac,
-    )?;
+    let (hh_build, rest_build, hh_keys) =
+        isolate_heavy_hitters(build_batches, build_key_indices, config.heavy_hitter_frac)?;
     let mut out = Vec::new();
     if !hh_build.is_empty() {
         profile.heavy_hitters_isolated += hh_keys.len();
@@ -479,8 +476,7 @@ fn concat_batches(batches: &[RecordBatch]) -> anyhow::Result<RecordBatch> {
     for c in 0..num_cols {
         let arrays: Vec<&dyn arrow_array::Array> =
             batches.iter().map(|b| b.column(c).as_ref()).collect();
-        let concat = arrow::compute::concat(&arrays)
-            .map_err(|e| anyhow::anyhow!("concat: {e}"))?;
+        let concat = arrow::compute::concat(&arrays).map_err(|e| anyhow::anyhow!("concat: {e}"))?;
         cols.push(concat);
     }
     Ok(RecordBatch::try_new(schema, cols)?)
@@ -604,8 +600,7 @@ fn take_rows(batch: &RecordBatch, idx: &[u32]) -> anyhow::Result<RecordBatch> {
         .columns()
         .iter()
         .map(|c| {
-            arrow::compute::take(c.as_ref(), &arr, None)
-                .map_err(|e| anyhow::anyhow!("take: {e}"))
+            arrow::compute::take(c.as_ref(), &arr, None).map_err(|e| anyhow::anyhow!("take: {e}"))
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
     Ok(RecordBatch::try_new(batch.schema(), cols)?)
@@ -676,15 +671,8 @@ mod tests {
         let build = vec![batch(vec![1, 2, 3, 2], vec![10, 20, 30, 21])];
         let probe = vec![batch(vec![2, 3, 4], vec![100, 200, 300])];
         let config = cfg(64 * 1024);
-        let (out, profile) = grace_inner_join(
-            &build,
-            &probe,
-            &[0],
-            &[0],
-            JoinType::Inner,
-            &config,
-        )
-        .unwrap();
+        let (out, profile) =
+            grace_inner_join(&build, &probe, &[0], &[0], JoinType::Inner, &config).unwrap();
         let rows: usize = out.iter().map(|b| b.num_rows()).sum();
         // probe 2 matches two build rows; probe 3 matches one → 3
         assert_eq!(rows, 3);
@@ -711,15 +699,8 @@ mod tests {
             build_bytes,
             config.soft_limit()
         );
-        let (out, profile) = grace_inner_join(
-            &build,
-            &probe,
-            &[0],
-            &[0],
-            JoinType::Inner,
-            &config,
-        )
-        .unwrap();
+        let (out, profile) =
+            grace_inner_join(&build, &probe, &[0], &[0], JoinType::Inner, &config).unwrap();
         let rows: usize = out.iter().map(|b| b.num_rows()).sum();
         assert_eq!(rows, probe_ids.len());
         assert!(
@@ -747,15 +728,8 @@ mod tests {
             },
             vec![0; 105],
         )];
-        let (out, profile) = grace_inner_join(
-            &build,
-            &probe,
-            &[0],
-            &[0],
-            JoinType::Inner,
-            &config,
-        )
-        .unwrap();
+        let (out, profile) =
+            grace_inner_join(&build, &probe, &[0], &[0], JoinType::Inner, &config).unwrap();
         let rows: usize = out.iter().map(|b| b.num_rows()).sum();
         assert!(rows > 0);
         // Must finish without infinite recursion.

@@ -1,7 +1,7 @@
-use std::sync::{Arc, Mutex};
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use moka::sync::Cache;
+use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -98,7 +98,10 @@ pub struct QueryRecord {
 
 impl QueryRecord {
     pub fn fragments_snapshot(&self) -> Vec<FragmentInfo> {
-        self.fragments.lock().expect("fragments mutex poisoned").clone()
+        self.fragments
+            .lock()
+            .expect("fragments mutex poisoned")
+            .clone()
     }
 }
 
@@ -318,9 +321,9 @@ impl QueryTracker {
         if guard.is_empty() {
             return None;
         }
-        let all_done = guard.iter().all(|f| {
-            matches!(f.state, FragmentState::Finished | FragmentState::Failed)
-        });
+        let all_done = guard
+            .iter()
+            .all(|f| matches!(f.state, FragmentState::Finished | FragmentState::Failed));
         if all_done {
             Some(
                 guard
@@ -351,14 +354,26 @@ mod tests {
     use super::*;
 
     fn test_config() -> QueryHistoryConfig {
-        QueryHistoryConfig { max_entries: 100, ttl_secs: 60 }
+        QueryHistoryConfig {
+            max_entries: 100,
+            ttl_secs: 60,
+        }
     }
 
     #[tokio::test]
     async fn start_creates_queued_record() {
         let tracker = QueryTracker::new(&test_config());
         let id = Uuid::now_v7();
-        let _token = tracker.start(id, "alice", Some("cli"), "SELECT 1", "s1", None, vec![], None);
+        let _token = tracker.start(
+            id,
+            "alice",
+            Some("cli"),
+            "SELECT 1",
+            "s1",
+            None,
+            vec![],
+            None,
+        );
         let records = tracker.records();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].state, QueryState::Queued);
@@ -438,7 +453,16 @@ mod tests {
         let tracker = QueryTracker::new(&test_config());
         for i in 0..5 {
             let id = Uuid::now_v7();
-            tracker.start(id, &format!("user{i}"), None, "SELECT 1", "s", None, vec![], None);
+            tracker.start(
+                id,
+                &format!("user{i}"),
+                None,
+                "SELECT 1",
+                "s",
+                None,
+                vec![],
+                None,
+            );
         }
         assert_eq!(tracker.records().len(), 5);
     }
@@ -460,7 +484,16 @@ mod tests {
                 tracker.running(&id, (i * 5) as u64);
                 // Simulate some work
                 tokio::task::yield_now().await;
-                tracker.complete(&id, i as usize, (i * 10) as u64, vec![format!("table{i}")], 0, 0, 0, 0);
+                tracker.complete(
+                    &id,
+                    i as usize,
+                    (i * 10) as u64,
+                    vec![format!("table{i}")],
+                    0,
+                    0,
+                    0,
+                    0,
+                );
                 id
             });
         }
@@ -505,8 +538,13 @@ mod tests {
 
                 match i % 3 {
                     0 => tracker.complete(&id, 10, 100, vec![], 0, 0, 0, 0),
-                    1 => tracker.failed(&id, &sqe_core::SqeError::Execution("test error".to_string())),
-                    _ => { tracker.cancel(&id); }
+                    1 => tracker.failed(
+                        &id,
+                        &sqe_core::SqeError::Execution("test error".to_string()),
+                    ),
+                    _ => {
+                        tracker.cancel(&id);
+                    }
                 }
                 (id, i % 3)
             });
@@ -609,7 +647,10 @@ mod tests {
 
         // Finish only frag-0
         tracker.update_fragment(&id, "frag-0", FragmentState::Finished, 100, 50);
-        assert!(tracker.all_fragments_done(&id).is_none(), "frag-1 still running");
+        assert!(
+            tracker.all_fragments_done(&id).is_none(),
+            "frag-1 still running"
+        );
 
         // Finish frag-1 too
         tracker.update_fragment(&id, "frag-1", FragmentState::Finished, 500, 200);
@@ -680,7 +721,16 @@ mod tests {
         let mut ids = Vec::new();
         for i in 0..10 {
             let id = Uuid::now_v7();
-            tracker.start(id, &format!("user{i}"), None, "SELECT 1", "s", None, vec![], None);
+            tracker.start(
+                id,
+                &format!("user{i}"),
+                None,
+                "SELECT 1",
+                "s",
+                None,
+                vec![],
+                None,
+            );
             tracker.complete(&id, 0, 0, vec![], 0, 0, 0, 0);
             ids.push(id);
         }

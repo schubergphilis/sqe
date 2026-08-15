@@ -81,16 +81,24 @@ use tempfile::TempDir;
 /// Build a fresh SQLite-backed `Arc<dyn Catalog>` rooted at `dir`.
 async fn sqlite_catalog(dir: &TempDir) -> Arc<dyn Catalog> {
     let location = dir.path().to_str().expect("tempdir path is UTF-8");
-    sqe_catalog::mount::build_catalog(location, CatalogKind::Sqlite, &BTreeMap::new(), &SecretStore::new())
-        .await
-        .expect("sqlite catalog builds")
+    sqe_catalog::mount::build_catalog(
+        location,
+        CatalogKind::Sqlite,
+        &BTreeMap::new(),
+        &SecretStore::new(),
+    )
+    .await
+    .expect("sqlite catalog builds")
 }
 
 fn minimal_schema() -> Schema {
     Schema::builder()
-        .with_fields(vec![
-            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
-        ])
+        .with_fields(vec![NestedField::required(
+            1,
+            "id",
+            Type::Primitive(PrimitiveType::Long),
+        )
+        .into()])
         .build()
         .expect("build schema")
 }
@@ -104,7 +112,10 @@ fn fast_retry_properties() -> std::collections::HashMap<String, String> {
         ("commit.retry.num-retries".to_string(), "1".to_string()),
         ("commit.retry.min-wait-ms".to_string(), "1".to_string()),
         ("commit.retry.max-wait-ms".to_string(), "1".to_string()),
-        ("commit.retry.total-timeout-ms".to_string(), "1000".to_string()),
+        (
+            "commit.retry.total-timeout-ms".to_string(),
+            "1000".to_string(),
+        ),
     ])
 }
 
@@ -173,7 +184,10 @@ async fn create_table(
         .schema(minimal_schema())
         .properties(fast_retry_properties())
         .build();
-    catalog.create_table(ns, creation).await.expect("create table")
+    catalog
+        .create_table(ns, creation)
+        .await
+        .expect("create table")
 }
 
 /// THE GUARD: a rewrite planned against S0 that removes `old.parquet`, racing
@@ -201,7 +215,10 @@ async fn conflicting_new_position_delete_on_rewritten_file_is_a_retryable_confli
     let tx = Transaction::new(&table);
     let action = tx.fast_append().add_data_files(vec![data_file(old_path)]);
     let tx_applied = action.apply(tx).expect("apply fast_append");
-    tx_applied.commit(catalog.as_ref()).await.expect("commit seed append");
+    tx_applied
+        .commit(catalog.as_ref())
+        .await
+        .expect("commit seed append");
 
     let table_at_s0 = catalog.load_table(&ident).await.expect("reload at s0");
     let baseline_snapshot_id = table_at_s0
@@ -249,7 +266,10 @@ async fn conflicting_new_position_delete_on_rewritten_file_is_a_retryable_confli
 
     // The table must still be at S1 (the position delete's snapshot) -- the
     // stale compacted output must never have been committed.
-    let reloaded = catalog.load_table(&ident).await.expect("reload after rejected commit");
+    let reloaded = catalog
+        .load_table(&ident)
+        .await
+        .expect("reload after rejected commit");
     let final_snapshot = reloaded
         .metadata()
         .current_snapshot()
@@ -262,7 +282,10 @@ async fn conflicting_new_position_delete_on_rewritten_file_is_a_retryable_confli
         .expect("load manifest list");
     let mut live_data_paths = std::collections::HashSet::new();
     for manifest_file in manifest_list.entries() {
-        let manifest = manifest_file.load_manifest(reloaded.file_io()).await.expect("load manifest");
+        let manifest = manifest_file
+            .load_manifest(reloaded.file_io())
+            .await
+            .expect("load manifest");
         for entry in manifest.entries() {
             if entry.is_alive() && entry.content_type() == DataContentType::Data {
                 live_data_paths.insert(entry.file_path().to_string());
@@ -306,7 +329,10 @@ async fn same_scenario_without_baseline_silently_resurrects_rows() {
     let tx = Transaction::new(&table);
     let action = tx.fast_append().add_data_files(vec![data_file(old_path)]);
     let tx_applied = action.apply(tx).expect("apply fast_append");
-    tx_applied.commit(catalog.as_ref()).await.expect("commit seed append");
+    tx_applied
+        .commit(catalog.as_ref())
+        .await
+        .expect("commit seed append");
 
     let table_at_s0 = catalog.load_table(&ident).await.expect("reload at s0");
 
@@ -334,7 +360,10 @@ async fn same_scenario_without_baseline_silently_resurrects_rows() {
         .await
         .expect("commit succeeds silently without baseline validation (the bug)");
 
-    let reloaded = catalog.load_table(&ident).await.expect("reload after commit");
+    let reloaded = catalog
+        .load_table(&ident)
+        .await
+        .expect("reload after commit");
     let final_snapshot = reloaded
         .metadata()
         .current_snapshot()
@@ -345,7 +374,10 @@ async fn same_scenario_without_baseline_silently_resurrects_rows() {
         .expect("load manifest list");
     let mut live_data_paths = std::collections::HashSet::new();
     for manifest_file in manifest_list.entries() {
-        let manifest = manifest_file.load_manifest(reloaded.file_io()).await.expect("load manifest");
+        let manifest = manifest_file
+            .load_manifest(reloaded.file_io())
+            .await
+            .expect("load manifest");
         for entry in manifest.entries() {
             if entry.is_alive() && entry.content_type() == DataContentType::Data {
                 live_data_paths.insert(entry.file_path().to_string());
@@ -393,7 +425,10 @@ async fn unrelated_new_delete_does_not_block_rewrite() {
         .fast_append()
         .add_data_files(vec![data_file(old_path), data_file(other_path)]);
     let tx_applied = action.apply(tx).expect("apply fast_append");
-    tx_applied.commit(catalog.as_ref()).await.expect("commit seed append");
+    tx_applied
+        .commit(catalog.as_ref())
+        .await
+        .expect("commit seed append");
 
     let table_at_s0 = catalog.load_table(&ident).await.expect("reload at s0");
     let baseline_snapshot_id = table_at_s0
@@ -449,7 +484,10 @@ async fn no_new_delete_commits_cleanly_with_baseline_set() {
     let tx = Transaction::new(&table);
     let action = tx.fast_append().add_data_files(vec![data_file(old_path)]);
     let tx_applied = action.apply(tx).expect("apply fast_append");
-    tx_applied.commit(catalog.as_ref()).await.expect("commit seed append");
+    tx_applied
+        .commit(catalog.as_ref())
+        .await
+        .expect("commit seed append");
 
     let table_at_s0 = catalog.load_table(&ident).await.expect("reload at s0");
     let baseline_snapshot_id = table_at_s0
@@ -514,7 +552,10 @@ async fn multi_file_position_delete_with_no_referenced_path_is_a_conflict() {
         .fast_append()
         .add_data_files(vec![data_file(old1_path), data_file(old2_path)]);
     let tx_applied = action.apply(tx).expect("apply fast_append");
-    tx_applied.commit(catalog.as_ref()).await.expect("commit seed append");
+    tx_applied
+        .commit(catalog.as_ref())
+        .await
+        .expect("commit seed append");
 
     let table_at_s0 = catalog.load_table(&ident).await.expect("reload at s0");
     let baseline_snapshot_id = table_at_s0
@@ -566,7 +607,10 @@ async fn multi_file_position_delete_with_no_referenced_path_is_a_conflict() {
     // have been committed, so neither old file was replaced and the
     // multi-path position delete still applies to both of them (no
     // resurrection).
-    let reloaded = catalog.load_table(&ident).await.expect("reload after rejected commit");
+    let reloaded = catalog
+        .load_table(&ident)
+        .await
+        .expect("reload after rejected commit");
     let final_snapshot = reloaded
         .metadata()
         .current_snapshot()
@@ -577,7 +621,10 @@ async fn multi_file_position_delete_with_no_referenced_path_is_a_conflict() {
         .expect("load manifest list");
     let mut live_data_paths = std::collections::HashSet::new();
     for manifest_file in manifest_list.entries() {
-        let manifest = manifest_file.load_manifest(reloaded.file_io()).await.expect("load manifest");
+        let manifest = manifest_file
+            .load_manifest(reloaded.file_io())
+            .await
+            .expect("load manifest");
         for entry in manifest.entries() {
             if entry.is_alive() && entry.content_type() == DataContentType::Data {
                 live_data_paths.insert(entry.file_path().to_string());

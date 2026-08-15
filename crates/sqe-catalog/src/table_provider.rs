@@ -188,7 +188,6 @@ impl SqeTableProvider {
 
 #[async_trait]
 impl TableProvider for SqeTableProvider {
-
     fn schema(&self) -> ArrowSchemaRef {
         self.schema.clone()
     }

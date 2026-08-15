@@ -34,23 +34,14 @@ pub fn redact_pii(sql: &str) -> String {
     static SECRET_RE: OnceLock<regex::Regex> = OnceLock::new();
 
     let email_re = EMAIL_RE.get_or_init(|| {
-        regex::Regex::new(
-            r"'[^']*[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}[^']*'",
-        )
-        .unwrap()
+        regex::Regex::new(r"'[^']*[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}[^']*'").unwrap()
     });
-    let ssn_re = SSN_RE.get_or_init(|| {
-        regex::Regex::new(r"'\d{3}-\d{2}-\d{4}'").unwrap()
-    });
+    let ssn_re = SSN_RE.get_or_init(|| regex::Regex::new(r"'\d{3}-\d{2}-\d{4}'").unwrap());
     let phone_re = PHONE_RE.get_or_init(|| {
-        regex::Regex::new(
-            r"'(?:\+?\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}'",
-        )
-        .unwrap()
+        regex::Regex::new(r"'(?:\+?\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}'").unwrap()
     });
-    let card_re = CARD_RE.get_or_init(|| {
-        regex::Regex::new(r"'\d{4}[-\s]?\d{4}[-\s]?\d{4}[-\s]?\d{1,7}'").unwrap()
-    });
+    let card_re = CARD_RE
+        .get_or_init(|| regex::Regex::new(r"'\d{4}[-\s]?\d{4}[-\s]?\d{4}[-\s]?\d{1,7}'").unwrap());
     let secret_re = SECRET_RE.get_or_init(|| {
         regex::Regex::new(
             r"(?i)\b(TOKEN|PASSWORD|PASSWD|SECRET|ACCESS_KEY_ID|SECRET_ACCESS_KEY|SESSION_TOKEN|API_KEY|CLIENT_SECRET|BEARER)\b(\s*=\s*|\s+|\s*\(\s*)'[^']*'",
@@ -63,7 +54,9 @@ pub fn redact_pii(sql: &str) -> String {
     result = ssn_re.replace_all(&result, "'[SSN]'").to_string();
     result = phone_re.replace_all(&result, "'[PHONE]'").to_string();
     result = card_re.replace_all(&result, "'[CARD]'").to_string();
-    result = secret_re.replace_all(&result, "$1$2'[REDACTED]'").to_string();
+    result = secret_re
+        .replace_all(&result, "$1$2'[REDACTED]'")
+        .to_string();
     result
 }
 
@@ -168,9 +161,7 @@ pub fn strip_sql_literals(sql: &str) -> String {
                 }
                 i += 1;
             }
-        } else if c.is_ascii_digit()
-            && (i == 0 || !is_ident_byte(bytes[i - 1]))
-        {
+        } else if c.is_ascii_digit() && (i == 0 || !is_ident_byte(bytes[i - 1])) {
             // Numeric literal not part of an identifier (e.g. not `col1`).
             // Consume digits, decimal point, and exponent.
             out.push('?');
@@ -261,8 +252,6 @@ mod tests {
         assert_eq!(out, sql);
     }
 
-
-
     #[test]
     fn redact_email_in_where_clause() {
         let sql = "SELECT * FROM users WHERE email = 'alice@example.com'";
@@ -333,7 +322,10 @@ mod tests {
             SESSION_TOKEN 'FQoDYXdzEPv...EXAMPLE')";
         let redacted = redact_pii(sql);
         assert!(!redacted.contains("AKIAIOSFODNN7EXAMPLE"), "{redacted}");
-        assert!(!redacted.contains("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"), "{redacted}");
+        assert!(
+            !redacted.contains("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"),
+            "{redacted}"
+        );
         assert!(!redacted.contains("FQoDYXdzEPv...EXAMPLE"), "{redacted}");
         assert!(redacted.matches("[REDACTED]").count() >= 3);
     }
@@ -369,8 +361,14 @@ mod tests {
         // The exact case redact_pii misses: a non-pattern sensitive literal.
         let sql = "SELECT * FROM patients WHERE patient_id = 'P-998877'";
         let stripped = strip_sql_literals(sql);
-        assert!(!stripped.contains("P-998877"), "freeform literal leaked: {stripped}");
-        assert!(stripped.contains("'?'"), "string literal must become a placeholder");
+        assert!(
+            !stripped.contains("P-998877"),
+            "freeform literal leaked: {stripped}"
+        );
+        assert!(
+            stripped.contains("'?'"),
+            "string literal must become a placeholder"
+        );
         // Structure (table + column) is preserved for debugging.
         assert!(stripped.contains("patients"));
         assert!(stripped.contains("patient_id"));
@@ -380,18 +378,33 @@ mod tests {
     fn strip_literals_removes_numbers_but_keeps_identifiers() {
         let sql = "SELECT col1, col2 FROM t WHERE balance > 50000 AND year = 2026";
         let stripped = strip_sql_literals(sql);
-        assert!(!stripped.contains("50000"), "numeric literal leaked: {stripped}");
-        assert!(!stripped.contains("2026"), "numeric literal leaked: {stripped}");
+        assert!(
+            !stripped.contains("50000"),
+            "numeric literal leaked: {stripped}"
+        );
+        assert!(
+            !stripped.contains("2026"),
+            "numeric literal leaked: {stripped}"
+        );
         // `col1`/`col2` are identifiers with trailing digits, not literals.
-        assert!(stripped.contains("col1"), "identifier must survive: {stripped}");
-        assert!(stripped.contains("col2"), "identifier must survive: {stripped}");
+        assert!(
+            stripped.contains("col1"),
+            "identifier must survive: {stripped}"
+        );
+        assert!(
+            stripped.contains("col2"),
+            "identifier must survive: {stripped}"
+        );
     }
 
     #[test]
     fn strip_literals_handles_escaped_quotes() {
         let sql = "SELECT * FROM t WHERE name = 'O''Brien'";
         let stripped = strip_sql_literals(sql);
-        assert!(!stripped.contains("Brien"), "escaped-quote literal leaked: {stripped}");
+        assert!(
+            !stripped.contains("Brien"),
+            "escaped-quote literal leaked: {stripped}"
+        );
         assert!(stripped.contains("'?'"));
     }
 

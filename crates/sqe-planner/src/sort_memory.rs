@@ -9,7 +9,7 @@
 //! This module is the gate + policy. Wiring into DF sort construction lands
 //! when the worker governor (Phase 7) owns the FairSpillPool replacement.
 
-use sqe_spill::{MemoryGrant, ReclaimableConsumer, split_default_read_headroom};
+use sqe_spill::{split_default_read_headroom, MemoryGrant, ReclaimableConsumer};
 
 /// Default max runs merged in one pass. Higher fan-in needs more simultaneous
 /// buffer reservations; keep this modest for laptop 64 MiB workers.

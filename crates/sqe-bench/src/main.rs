@@ -67,11 +67,8 @@ async fn main() -> anyhow::Result<()> {
             clean,
             ..
         } => {
-            let config = generate::GenerateConfig::resolve(
-                threads,
-                compression.as_deref(),
-                row_group_size,
-            )?;
+            let config =
+                generate::GenerateConfig::resolve(threads, compression.as_deref(), row_group_size)?;
 
             if let cli::Sink::Iceberg = sink {
                 if benchmark == "bank" {
@@ -166,7 +163,13 @@ async fn main() -> anyhow::Result<()> {
                     let file_size = sink::plan::parse_size(&target_file_size)? as usize;
                     let gen = generate::get_generator(&benchmark)?;
                     return sink::iceberg::run_direct(
-                        &target, gen.as_ref(), scale, &config, clean, resume, file_size,
+                        &target,
+                        gen.as_ref(),
+                        scale,
+                        &config,
+                        clean,
+                        resume,
+                        file_size,
                     )
                     .await;
                 }
@@ -284,11 +287,9 @@ async fn main() -> anyhow::Result<()> {
             )
             .await?;
 
-            let trino_client = client::trino::TrinoBenchClient::new(
-                &trino_url,
-                Some(&trino_user),
-                None,
-            ).with_catalog("iceberg");
+            let trino_client =
+                client::trino::TrinoBenchClient::new(&trino_url, Some(&trino_user), None)
+                    .with_catalog("iceberg");
 
             comparison::run_comparison(
                 &benchmark,
@@ -354,8 +355,7 @@ async fn main() -> anyhow::Result<()> {
 
             report::print_summary(&benchmark, scale, protocol_str, &results);
 
-            let report_path =
-                report::write_json_report(&benchmark, scale, protocol_str, &results)?;
+            let report_path = report::write_json_report(&benchmark, scale, protocol_str, &results)?;
             println!("\nReport written to: {report_path}");
 
             Ok(())

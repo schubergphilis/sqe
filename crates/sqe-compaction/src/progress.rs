@@ -74,7 +74,11 @@ mod tests {
             reporter.on_batch(rows);
         }
         let seen = seen.lock().unwrap();
-        assert_eq!(*seen, vec![4, 8], "must fire at batch 4 and batch 8, not before/after");
+        assert_eq!(
+            *seen,
+            vec![4, 8],
+            "must fire at batch 4 and batch 8, not before/after"
+        );
     }
 
     #[test]
@@ -106,7 +110,10 @@ mod tests {
         for rows in 1..=10u64 {
             reporter.on_batch(rows);
         }
-        assert!(seen.lock().unwrap().is_empty(), "must not fire before the interval is reached");
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "must not fire before the interval is reached"
+        );
     }
 
     #[test]

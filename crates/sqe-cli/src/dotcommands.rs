@@ -322,10 +322,16 @@ mod tests {
     #[test]
     fn timer_on_off_aliases() {
         for s in [".timer on", ".timer true", ".timer 1"] {
-            assert_eq!(parse_dot_command(s).unwrap().unwrap(), DotCommand::Timer(true));
+            assert_eq!(
+                parse_dot_command(s).unwrap().unwrap(),
+                DotCommand::Timer(true)
+            );
         }
         for s in [".timer off", ".timer false", ".timer 0"] {
-            assert_eq!(parse_dot_command(s).unwrap().unwrap(), DotCommand::Timer(false));
+            assert_eq!(
+                parse_dot_command(s).unwrap().unwrap(),
+                DotCommand::Timer(false)
+            );
         }
     }
 

@@ -100,7 +100,10 @@ impl GenerateConfig {
             (None, None) => CompressionKind::default(),
         };
 
-        let row_group_size = match (row_group_size_cli, std::env::var("BENCH_GEN_ROW_GROUP_SIZE").ok()) {
+        let row_group_size = match (
+            row_group_size_cli,
+            std::env::var("BENCH_GEN_ROW_GROUP_SIZE").ok(),
+        ) {
             (Some(n), _) => Some(n),
             (None, Some(s)) => Some(
                 s.parse::<usize>()
@@ -167,12 +170,30 @@ mod tests {
 
     #[test]
     fn compression_parses_all_accepted_forms() {
-        assert_eq!(CompressionKind::parse_cli("zstd1").unwrap(), CompressionKind::Zstd1);
-        assert_eq!(CompressionKind::parse_cli("ZSTD3").unwrap(), CompressionKind::Zstd3);
-        assert_eq!(CompressionKind::parse_cli("zstd").unwrap(), CompressionKind::Zstd3);
-        assert_eq!(CompressionKind::parse_cli("Snappy").unwrap(), CompressionKind::Snappy);
-        assert_eq!(CompressionKind::parse_cli("none").unwrap(), CompressionKind::None);
-        assert_eq!(CompressionKind::parse_cli("uncompressed").unwrap(), CompressionKind::None);
+        assert_eq!(
+            CompressionKind::parse_cli("zstd1").unwrap(),
+            CompressionKind::Zstd1
+        );
+        assert_eq!(
+            CompressionKind::parse_cli("ZSTD3").unwrap(),
+            CompressionKind::Zstd3
+        );
+        assert_eq!(
+            CompressionKind::parse_cli("zstd").unwrap(),
+            CompressionKind::Zstd3
+        );
+        assert_eq!(
+            CompressionKind::parse_cli("Snappy").unwrap(),
+            CompressionKind::Snappy
+        );
+        assert_eq!(
+            CompressionKind::parse_cli("none").unwrap(),
+            CompressionKind::None
+        );
+        assert_eq!(
+            CompressionKind::parse_cli("uncompressed").unwrap(),
+            CompressionKind::None
+        );
     }
 
     #[test]

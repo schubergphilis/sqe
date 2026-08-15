@@ -91,10 +91,7 @@ struct TvfNamedArgsVisitor {
 impl VisitorMut for TvfNamedArgsVisitor {
     type Break = ();
 
-    fn post_visit_table_factor(
-        &mut self,
-        factor: &mut TableFactor,
-    ) -> ControlFlow<Self::Break> {
+    fn post_visit_table_factor(&mut self, factor: &mut TableFactor) -> ControlFlow<Self::Break> {
         if rewrite_named_args_in_factor(factor) {
             self.rewrites += 1;
         }
@@ -234,7 +231,10 @@ mod tests {
         let out = rewrite_named_tvf_args(
             "CREATE TABLE t AS SELECT * FROM read_parquet('s3://b/p.parquet', access_key => 'k')",
         );
-        assert!(out.contains("'access_key=k'"), "CTAS inner TVF rewritten: {out}");
+        assert!(
+            out.contains("'access_key=k'"),
+            "CTAS inner TVF rewritten: {out}"
+        );
     }
 
     #[test]
@@ -294,8 +294,7 @@ mod tests {
     fn numeric_value_rendered_without_quotes() {
         // A numeric arg value should be rendered as a bare number inside the
         // combined string literal, not double-quoted.
-        let out =
-            rewrite_named_tvf_args("SELECT * FROM read_csv('/x.csv', skip_rows => 2)");
+        let out = rewrite_named_tvf_args("SELECT * FROM read_csv('/x.csv', skip_rows => 2)");
         assert!(out.contains("'skip_rows=2'"), "got: {out}");
     }
 
@@ -305,7 +304,10 @@ mod tests {
         let out = rewrite_named_tvf_args(
             "SELECT * FROM READ_PARQUET('s3://b/x.parquet', region => 'eu')",
         );
-        assert!(out.contains("'region=eu'"), "case-insensitive tvf match: {out}");
+        assert!(
+            out.contains("'region=eu'"),
+            "case-insensitive tvf match: {out}"
+        );
     }
 
     #[test]

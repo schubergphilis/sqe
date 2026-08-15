@@ -146,8 +146,7 @@ fn find_needle(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if haystack.len() < needle.len() {
         return None;
     }
-    (0..=haystack.len() - needle.len())
-        .find(|&i| &haystack[i..i + needle.len()] == needle)
+    (0..=haystack.len() - needle.len()).find(|&i| &haystack[i..i + needle.len()] == needle)
 }
 
 /// Walk back over a table reference. Supports:
@@ -261,9 +260,7 @@ fn parse_timestamp_token(input: &str) -> Result<(VersionRef, usize)> {
 
     // Optional `TIMESTAMP` keyword prefix (Trino: `TIMESTAMP '...'`).
     let upper = trimmed.to_uppercase();
-    let body_off = if upper.starts_with("TIMESTAMP")
-        && trimmed[9..].starts_with([' ', '\''])
-    {
+    let body_off = if upper.starts_with("TIMESTAMP") && trimmed[9..].starts_with([' ', '\'']) {
         let mut k = 9;
         while trimmed[k..].starts_with(' ') {
             k += 1;
@@ -448,10 +445,7 @@ mod tests {
         assert_eq!(sql, "SELECT * FROM ns.t");
         assert_eq!(specs.len(), 1);
         assert_eq!(specs[0].table, "ns.t");
-        assert_eq!(
-            specs[0].version,
-            VersionRef::Named("feature_x".to_string())
-        );
+        assert_eq!(specs[0].version, VersionRef::Named("feature_x".to_string()));
     }
 
     #[test]
@@ -593,7 +587,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(specs[0].table, "t");
-        assert_eq!(specs[0].version, VersionRef::Timestamp("'2026-01-01'".to_string()));
+        assert_eq!(
+            specs[0].version,
+            VersionRef::Timestamp("'2026-01-01'".to_string())
+        );
         assert_eq!(sql, "SELECT a FROM t WHERE a > 1");
     }
 
@@ -601,7 +598,10 @@ mod tests {
     fn extracts_for_timestamp_as_of_epoch_millis() {
         let (_sql, specs) =
             extract_time_travel_spec("SELECT * FROM t FOR TIMESTAMP AS OF 1700000000000").unwrap();
-        assert_eq!(specs[0].version, VersionRef::Timestamp("1700000000000".to_string()));
+        assert_eq!(
+            specs[0].version,
+            VersionRef::Timestamp("1700000000000".to_string())
+        );
     }
 
     #[test]

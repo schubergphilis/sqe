@@ -1,5 +1,8 @@
 use sqe_lineage::*;
-use std::sync::{atomic::{AtomicUsize, Ordering}, Arc};
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
 
 struct Counting {
     count: AtomicUsize,
@@ -16,7 +19,9 @@ impl Sink for Counting {
             Ok(())
         }
     }
-    fn name(&self) -> &'static str { "counting" }
+    fn name(&self) -> &'static str {
+        "counting"
+    }
 }
 
 fn dummy_event() -> event::RunEvent {
@@ -26,7 +31,11 @@ fn dummy_event() -> event::RunEvent {
         producer: "test".into(),
         schemaURL: event::SCHEMA_URL.into(),
         run: event::Run::new(uuid::Uuid::nil()),
-        job: event::Job { namespace: "sqe".into(), name: "query:test".into(), facets: Default::default() },
+        job: event::Job {
+            namespace: "sqe".into(),
+            name: "query:test".into(),
+            facets: Default::default(),
+        },
         inputs: vec![],
         outputs: vec![],
     }
@@ -34,9 +43,18 @@ fn dummy_event() -> event::RunEvent {
 
 #[tokio::test]
 async fn multi_sink_fans_out_and_isolates_failures() {
-    let a = Arc::new(Counting { count: AtomicUsize::new(0), fail: false });
-    let b = Arc::new(Counting { count: AtomicUsize::new(0), fail: true  });
-    let c = Arc::new(Counting { count: AtomicUsize::new(0), fail: false });
+    let a = Arc::new(Counting {
+        count: AtomicUsize::new(0),
+        fail: false,
+    });
+    let b = Arc::new(Counting {
+        count: AtomicUsize::new(0),
+        fail: true,
+    });
+    let c = Arc::new(Counting {
+        count: AtomicUsize::new(0),
+        fail: false,
+    });
 
     let multi = MultiSink::new(vec![
         a.clone() as Arc<dyn Sink>,
@@ -47,6 +65,14 @@ async fn multi_sink_fans_out_and_isolates_failures() {
     multi.send(&dummy_event()).await;
 
     assert_eq!(a.count.load(Ordering::SeqCst), 1);
-    assert_eq!(b.count.load(Ordering::SeqCst), 1, "b ran even though it returns an error");
-    assert_eq!(c.count.load(Ordering::SeqCst), 1, "c ran even though b failed before it");
+    assert_eq!(
+        b.count.load(Ordering::SeqCst),
+        1,
+        "b ran even though it returns an error"
+    );
+    assert_eq!(
+        c.count.load(Ordering::SeqCst),
+        1,
+        "c ran even though b failed before it"
+    );
 }

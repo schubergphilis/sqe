@@ -182,7 +182,9 @@ impl Extractor for HeaderMapExtractor<'_> {
 /// Extract W3C TraceContext (`traceparent`/`tracestate`) from incoming HTTP headers.
 ///
 /// Intended for Trino-compat and Quack HTTP surfaces (O6).
-pub fn extract_trace_context_from_headers(headers: &axum::http::HeaderMap) -> opentelemetry::Context {
+pub fn extract_trace_context_from_headers(
+    headers: &axum::http::HeaderMap,
+) -> opentelemetry::Context {
     opentelemetry::global::get_text_map_propagator(|propagator| {
         propagator.extract(&HeaderMapExtractor(headers))
     })
@@ -260,8 +262,7 @@ mod tests {
             true,
             Default::default(),
         );
-        let cx =
-            opentelemetry::Context::new().with_remote_span_context(span_context.clone());
+        let cx = opentelemetry::Context::new().with_remote_span_context(span_context.clone());
 
         // Inject into metadata
         let mut metadata = MetadataMap::new();
@@ -325,7 +326,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn correlation_ids_accept_only_bounded_safe_values() {
         let mut headers = axum::http::HeaderMap::new();
@@ -354,8 +354,8 @@ mod tests {
         install_propagator();
         let provider = SdkTracerProvider::builder().build();
         let tracer = provider.tracer("concurrent-propagation-test");
-        let subscriber = tracing_subscriber::registry()
-            .with(tracing_opentelemetry::layer().with_tracer(tracer));
+        let subscriber =
+            tracing_subscriber::registry().with(tracing_opentelemetry::layer().with_tracer(tracer));
         let _subscriber = tracing::subscriber::set_default(subscriber);
 
         async fn observe(trace_id: &str) -> Option<String> {
@@ -417,8 +417,14 @@ mod tests {
             injector.set("tracestate", "vendor=value".to_string());
         }
         assert_eq!(headers.len(), 2);
-        assert_eq!(headers[0], ("traceparent".to_string(), "00-abc-def-01".to_string()));
-        assert_eq!(headers[1], ("tracestate".to_string(), "vendor=value".to_string()));
+        assert_eq!(
+            headers[0],
+            ("traceparent".to_string(), "00-abc-def-01".to_string())
+        );
+        assert_eq!(
+            headers[1],
+            ("tracestate".to_string(), "vendor=value".to_string())
+        );
     }
 
     #[test]
@@ -433,8 +439,7 @@ mod tests {
             true,
             Default::default(),
         );
-        let cx =
-            opentelemetry::Context::new().with_remote_span_context(span_context);
+        let cx = opentelemetry::Context::new().with_remote_span_context(span_context);
 
         // Inject into metadata, then extract as HTTP headers via the same context
         let mut metadata = MetadataMap::new();

@@ -22,7 +22,6 @@
 //! single output. The assertion loosens the upper bound to 10 to leave room
 //! for the writer's rolling cutoff.
 
-
 use arrow_array::{Array, Int64Array};
 
 /// Helper: fetch the live data-file count from a table via the table_files TVF.
@@ -40,7 +39,9 @@ async fn live_data_file_count(
     let batches = handler
         .execute(
             session,
-            &format!("SELECT COUNT(*) FROM table_files('{namespace}', '{table_name}')"), None)
+            &format!("SELECT COUNT(*) FROM table_files('{namespace}', '{table_name}')"),
+            None,
+        )
         .await
         .expect("files metadata scan");
     let col = batches[0].column(0);
@@ -98,7 +99,9 @@ async fn rewrite_merges_small_files_preserves_rows() {
     let summary = handler
         .execute(
             &session,
-            &format!("CALL system.rewrite_data_files(table => '{table}')"), None)
+            &format!("CALL system.rewrite_data_files(table => '{table}')"),
+            None,
+        )
         .await
         .expect("rewrite_data_files");
     assert!(!summary.is_empty(), "summary row expected");
@@ -131,7 +134,11 @@ async fn rewrite_merges_small_files_preserves_rows() {
 
     // Value invariant: SELECT * must return the same set of ids.
     let rows_batches = handler
-        .execute(&session, &format!("SELECT id FROM {table} ORDER BY id"), None)
+        .execute(
+            &session,
+            &format!("SELECT id FROM {table} ORDER BY id"),
+            None,
+        )
         .await
         .expect("SELECT id");
     let mut observed: Vec<i64> = Vec::new();
@@ -162,7 +169,11 @@ async fn read_i64_col(
     let batches = handler.execute(session, sql, None).await.expect("query");
     let mut out = Vec::new();
     for b in &batches {
-        let col = b.column(0).as_any().downcast_ref::<Int64Array>().expect("Int64");
+        let col = b
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("Int64");
         for i in 0..col.len() {
             out.push(col.value(i));
         }
@@ -190,9 +201,15 @@ async fn rewrite_sort_strategy_orders_rows() {
     let namespace = "default";
     let table_name = "rewrite_real_sort";
     let table = format!("{namespace}.{table_name}");
-    let _ = handler.execute(&session, &format!("DROP TABLE IF EXISTS {table}"), None).await;
+    let _ = handler
+        .execute(&session, &format!("DROP TABLE IF EXISTS {table}"), None)
+        .await;
     handler
-        .execute(&session, &format!("CREATE TABLE {table} (id BIGINT, v BIGINT)"), None)
+        .execute(
+            &session,
+            &format!("CREATE TABLE {table} (id BIGINT, v BIGINT)"),
+            None,
+        )
         .await
         .expect("CREATE");
 
@@ -200,12 +217,19 @@ async fn rewrite_sort_strategy_orders_rows() {
     let scrambled = [9i64, 3, 7, 1, 11, 5, 0, 8, 2, 10, 4, 6];
     for id in scrambled {
         handler
-            .execute(&session, &format!("INSERT INTO {table} VALUES ({id}, {})", id * 10), None)
+            .execute(
+                &session,
+                &format!("INSERT INTO {table} VALUES ({id}, {})", id * 10),
+                None,
+            )
             .await
             .expect("INSERT");
     }
     let before_files = live_data_file_count(&handler, &session, namespace, table_name).await;
-    assert!(before_files >= 12, "setup: expected >= 12 files, got {before_files}");
+    assert!(
+        before_files >= 12,
+        "setup: expected >= 12 files, got {before_files}"
+    );
 
     let summary = handler
         .execute(
@@ -225,11 +249,23 @@ async fn rewrite_sort_strategy_orders_rows() {
     );
 
     let after_files = live_data_file_count(&handler, &session, namespace, table_name).await;
-    assert!(after_files < before_files, "must consolidate: {before_files} -> {after_files}");
+    assert!(
+        after_files < before_files,
+        "must consolidate: {before_files} -> {after_files}"
+    );
 
     // Row set preserved.
-    let sorted = read_i64_col(&handler, &session, &format!("SELECT id FROM {table} ORDER BY id")).await;
-    assert_eq!(sorted, (0..12).collect::<Vec<_>>(), "row set must be preserved");
+    let sorted = read_i64_col(
+        &handler,
+        &session,
+        &format!("SELECT id FROM {table} ORDER BY id"),
+    )
+    .await;
+    assert_eq!(
+        sorted,
+        (0..12).collect::<Vec<_>>(),
+        "row set must be preserved"
+    );
 
     // When the result is a single file, the scan returns file order, so a
     // sorted rewrite must yield physically ascending ids (proves the sort ran,
@@ -242,7 +278,9 @@ async fn rewrite_sort_strategy_orders_rows() {
         );
     }
 
-    let _ = handler.execute(&session, &format!("DROP TABLE IF EXISTS {table}"), None).await;
+    let _ = handler
+        .execute(&session, &format!("DROP TABLE IF EXISTS {table}"), None)
+        .await;
 }
 
 /// Z-order-strategy compaction runs and preserves the row set (physical
@@ -254,16 +292,26 @@ async fn rewrite_zorder_strategy_preserves_rows() {
     let namespace = "default";
     let table_name = "rewrite_real_zorder";
     let table = format!("{namespace}.{table_name}");
-    let _ = handler.execute(&session, &format!("DROP TABLE IF EXISTS {table}"), None).await;
+    let _ = handler
+        .execute(&session, &format!("DROP TABLE IF EXISTS {table}"), None)
+        .await;
     handler
-        .execute(&session, &format!("CREATE TABLE {table} (id BIGINT, v BIGINT)"), None)
+        .execute(
+            &session,
+            &format!("CREATE TABLE {table} (id BIGINT, v BIGINT)"),
+            None,
+        )
         .await
         .expect("CREATE");
 
     let scrambled = [9i64, 3, 7, 1, 11, 5, 0, 8, 2, 10, 4, 6];
     for id in scrambled {
         handler
-            .execute(&session, &format!("INSERT INTO {table} VALUES ({id}, {})", 120 - id), None)
+            .execute(
+                &session,
+                &format!("INSERT INTO {table} VALUES ({id}, {})", 120 - id),
+                None,
+            )
             .await
             .expect("INSERT");
     }
@@ -281,15 +329,32 @@ async fn rewrite_zorder_strategy_preserves_rows() {
         )
         .await
         .expect("rewrite zorder");
-    assert!(!status_col(&summary).contains("skipped"), "zorder compaction must run");
+    assert!(
+        !status_col(&summary).contains("skipped"),
+        "zorder compaction must run"
+    );
 
     let after_files = live_data_file_count(&handler, &session, namespace, table_name).await;
-    assert!(after_files < before_files, "must consolidate: {before_files} -> {after_files}");
+    assert!(
+        after_files < before_files,
+        "must consolidate: {before_files} -> {after_files}"
+    );
 
-    let sorted = read_i64_col(&handler, &session, &format!("SELECT id FROM {table} ORDER BY id")).await;
-    assert_eq!(sorted, (0..12).collect::<Vec<_>>(), "row set must be preserved");
+    let sorted = read_i64_col(
+        &handler,
+        &session,
+        &format!("SELECT id FROM {table} ORDER BY id"),
+    )
+    .await;
+    assert_eq!(
+        sorted,
+        (0..12).collect::<Vec<_>>(),
+        "row set must be preserved"
+    );
 
-    let _ = handler.execute(&session, &format!("DROP TABLE IF EXISTS {table}"), None).await;
+    let _ = handler
+        .execute(&session, &format!("DROP TABLE IF EXISTS {table}"), None)
+        .await;
 }
 
 /// Read per-file `(lower, upper)` id bounds from `table_files` in a single
@@ -314,8 +379,16 @@ async fn read_id_ranges(
         .expect("bounds query");
     let mut out = Vec::new();
     for b in &batches {
-        let lo = b.column(0).as_any().downcast_ref::<StringArray>().expect("Utf8 lower");
-        let hi = b.column(1).as_any().downcast_ref::<StringArray>().expect("Utf8 upper");
+        let lo = b
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("Utf8 lower");
+        let hi = b
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("Utf8 upper");
         for i in 0..b.num_rows() {
             let l = parse_bound(lo.value(i), 1)
                 .unwrap_or_else(|| panic!("missing lower bound for id in {}", lo.value(i)));
@@ -359,9 +432,15 @@ async fn rewrite_sort_produces_disjoint_file_ranges() {
     let namespace = "default";
     let table_name = "rewrite_disjoint_ranges";
     let table = format!("{namespace}.{table_name}");
-    let _ = handler.execute(&session, &format!("DROP TABLE IF EXISTS {table}"), None).await;
+    let _ = handler
+        .execute(&session, &format!("DROP TABLE IF EXISTS {table}"), None)
+        .await;
     handler
-        .execute(&session, &format!("CREATE TABLE {table} (id BIGINT, v BIGINT)"), None)
+        .execute(
+            &session,
+            &format!("CREATE TABLE {table} (id BIGINT, v BIGINT)"),
+            None,
+        )
         .await
         .expect("CREATE");
 
@@ -380,7 +459,11 @@ async fn rewrite_sort_produces_disjoint_file_ranges() {
             })
             .collect();
         handler
-            .execute(&session, &format!("INSERT INTO {table} VALUES {}", values.join(", ")), None)
+            .execute(
+                &session,
+                &format!("INSERT INTO {table} VALUES {}", values.join(", ")),
+                None,
+            )
             .await
             .expect("INSERT");
     }
@@ -404,8 +487,17 @@ async fn rewrite_sort_produces_disjoint_file_ranges() {
     );
 
     // Row set preserved and complete.
-    let ids = read_i64_col(&handler, &session, &format!("SELECT id FROM {table} ORDER BY id")).await;
-    assert_eq!(ids, (0..TOTAL).collect::<Vec<_>>(), "row set must be preserved exactly");
+    let ids = read_i64_col(
+        &handler,
+        &session,
+        &format!("SELECT id FROM {table} ORDER BY id"),
+    )
+    .await;
+    assert_eq!(
+        ids,
+        (0..TOTAL).collect::<Vec<_>>(),
+        "row set must be preserved exactly"
+    );
 
     // Read per-file id bounds. `id` is field id 1 (first column). Fetch both
     // bound columns in ONE query so each row keeps its own (lower, upper) pair;
@@ -431,10 +523,15 @@ async fn rewrite_sort_produces_disjoint_file_ranges() {
         );
     }
     for (lo, hi) in &ranges {
-        assert!(lo <= hi, "each file range must be well-formed, got ({lo}, {hi})");
+        assert!(
+            lo <= hi,
+            "each file range must be well-formed, got ({lo}, {hi})"
+        );
     }
 
-    let _ = handler.execute(&session, &format!("DROP TABLE IF EXISTS {table}"), None).await;
+    let _ = handler
+        .execute(&session, &format!("DROP TABLE IF EXISTS {table}"), None)
+        .await;
 }
 
 /// The two features this branch touches, combined: sort compaction on a
@@ -450,7 +547,9 @@ async fn rewrite_sort_applies_deletes_and_keeps_disjoint_ranges() {
     let namespace = "default";
     let table_name = "rewrite_sort_mor_deletes";
     let table = format!("{namespace}.{table_name}");
-    let _ = handler.execute(&session, &format!("DROP TABLE IF EXISTS {table}"), None).await;
+    let _ = handler
+        .execute(&session, &format!("DROP TABLE IF EXISTS {table}"), None)
+        .await;
     handler
         .execute(
             &session,
@@ -475,19 +574,32 @@ async fn rewrite_sort_applies_deletes_and_keeps_disjoint_ranges() {
             })
             .collect();
         handler
-            .execute(&session, &format!("INSERT INTO {table} VALUES {}", values.join(", ")), None)
+            .execute(
+                &session,
+                &format!("INSERT INTO {table} VALUES {}", values.join(", ")),
+                None,
+            )
             .await
             .expect("INSERT");
     }
 
     // MoR DELETE -> position deletes spread across the interleaved files.
     handler
-        .execute(&session, &format!("DELETE FROM {table} WHERE id < {DELETED_BELOW}"), None)
+        .execute(
+            &session,
+            &format!("DELETE FROM {table} WHERE id < {DELETED_BELOW}"),
+            None,
+        )
         .await
         .expect("DELETE");
     let survivors = TOTAL - DELETED_BELOW;
-    let count_before = read_i64_col(&handler, &session, &format!("SELECT COUNT(*) FROM {table}")).await;
-    assert_eq!(count_before, vec![survivors], "setup: DELETE must take effect");
+    let count_before =
+        read_i64_col(&handler, &session, &format!("SELECT COUNT(*) FROM {table}")).await;
+    assert_eq!(
+        count_before,
+        vec![survivors],
+        "setup: DELETE must take effect"
+    );
 
     // Sort-compact with a tiny target to force multiple output files.
     let summary = handler
@@ -508,7 +620,12 @@ async fn rewrite_sort_applies_deletes_and_keeps_disjoint_ranges() {
     );
 
     // Correctness: deleted rows stay gone, survivors are complete and exact.
-    let ids = read_i64_col(&handler, &session, &format!("SELECT id FROM {table} ORDER BY id")).await;
+    let ids = read_i64_col(
+        &handler,
+        &session,
+        &format!("SELECT id FROM {table} ORDER BY id"),
+    )
+    .await;
     assert_eq!(
         ids,
         (DELETED_BELOW..TOTAL).collect::<Vec<_>>(),
@@ -535,7 +652,9 @@ async fn rewrite_sort_applies_deletes_and_keeps_disjoint_ranges() {
         "no output file may carry a deleted id, got {ranges:?}"
     );
 
-    let _ = handler.execute(&session, &format!("DROP TABLE IF EXISTS {table}"), None).await;
+    let _ = handler
+        .execute(&session, &format!("DROP TABLE IF EXISTS {table}"), None)
+        .await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -569,7 +688,9 @@ async fn rewrite_skips_below_min_input_files() {
     let summary = handler
         .execute(
             &session,
-            &format!("CALL system.rewrite_data_files(table => '{table}')"), None)
+            &format!("CALL system.rewrite_data_files(table => '{table}')"),
+            None,
+        )
         .await
         .expect("rewrite_data_files");
 
@@ -609,7 +730,9 @@ async fn rewrite_all_forces_below_min_input() {
     let namespace = "default";
     let table_name = "rewrite_all_force";
     let table = format!("{namespace}.{table_name}");
-    let _ = handler.execute(&session, &format!("DROP TABLE IF EXISTS {table}"), None).await;
+    let _ = handler
+        .execute(&session, &format!("DROP TABLE IF EXISTS {table}"), None)
+        .await;
     handler
         .execute(&session, &format!("CREATE TABLE {table} (id BIGINT)"), None)
         .await
@@ -669,8 +792,15 @@ async fn rewrite_all_forces_below_min_input() {
         after_files < before_files,
         "rewrite_all must consolidate: {before_files} -> {after_files}"
     );
-    let ids = read_i64_col(&handler, &session, &format!("SELECT id FROM {table} ORDER BY id")).await;
+    let ids = read_i64_col(
+        &handler,
+        &session,
+        &format!("SELECT id FROM {table} ORDER BY id"),
+    )
+    .await;
     assert_eq!(ids, vec![0, 1, 2], "row set must be preserved");
 
-    let _ = handler.execute(&session, &format!("DROP TABLE IF EXISTS {table}"), None).await;
+    let _ = handler
+        .execute(&session, &format!("DROP TABLE IF EXISTS {table}"), None)
+        .await;
 }

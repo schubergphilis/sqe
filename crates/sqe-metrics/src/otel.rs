@@ -5,14 +5,14 @@ use opentelemetry::trace::TracerProvider;
 use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
 use opentelemetry_otlp::{LogExporter, MetricExporter, SpanExporter, WithExportConfig};
 use opentelemetry_sdk::{
-    logs::SdkLoggerProvider, metrics::SdkMeterProvider,
-    propagation::TraceContextPropagator, trace::SdkTracerProvider, Resource,
+    logs::SdkLoggerProvider, metrics::SdkMeterProvider, propagation::TraceContextPropagator,
+    trace::SdkTracerProvider, Resource,
 };
 use tracing_opentelemetry::OpenTelemetryLayer;
-use tracing_subscriber::Layer;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::Layer;
 
 /// Initialize the full observability stack.
 ///
@@ -44,7 +44,11 @@ pub fn init_telemetry_with_sampling(
         .with_current_span(true)
         .with_span_list(true);
 
-    let trace_endpoint = if traces_otlp_endpoint.is_empty() { otlp_endpoint } else { traces_otlp_endpoint };
+    let trace_endpoint = if traces_otlp_endpoint.is_empty() {
+        otlp_endpoint
+    } else {
+        traces_otlp_endpoint
+    };
 
     if trace_endpoint.is_empty() {
         // No OTel — just structured JSON logs
@@ -214,9 +218,7 @@ mod tests {
 
     #[test]
     fn json_events_include_trace_span_and_safe_correlation_fields() {
-        use opentelemetry::trace::{
-            SpanContext, SpanId, TraceContextExt, TraceFlags, TraceId,
-        };
+        use opentelemetry::trace::{SpanContext, SpanId, TraceContextExt, TraceFlags, TraceId};
         use tracing_opentelemetry::OpenTelemetrySpanExt;
 
         let capture = Capture::default();

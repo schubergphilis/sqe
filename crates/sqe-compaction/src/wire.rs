@@ -263,8 +263,8 @@ pub struct CompactGroupResponse {
 /// caller (e.g. the worker action bypasses `verify` up front when its
 /// configured secret is empty), not in this function.
 pub fn sign(bytes: &[u8], secret: &str) -> String {
-    let mut mac = <Hmac<Sha256>>::new_from_slice(secret.as_bytes())
-        .expect("HMAC accepts keys of any length");
+    let mut mac =
+        <Hmac<Sha256>>::new_from_slice(secret.as_bytes()).expect("HMAC accepts keys of any length");
     mac.update(bytes);
     hex_encode(&mac.finalize().into_bytes())
 }
@@ -279,8 +279,7 @@ pub fn verify(bytes: &[u8], sig: &str, secret: &str) -> bool {
     let expected = sign(bytes, secret);
     let provided_bytes = sig.as_bytes();
     let expected_bytes = expected.as_bytes();
-    provided_bytes.len() == expected_bytes.len()
-        && bool::from(provided_bytes.ct_eq(expected_bytes))
+    provided_bytes.len() == expected_bytes.len() && bool::from(provided_bytes.ct_eq(expected_bytes))
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -313,8 +312,7 @@ mod tests {
             job_id: "job-001".to_string(),
             group_id: 3,
             table_ident: "catalog.ns.orders".to_string(),
-            metadata_location: "s3://bucket/warehouse/orders/metadata/v3.metadata.json"
-                .to_string(),
+            metadata_location: "s3://bucket/warehouse/orders/metadata/v3.metadata.json".to_string(),
             snapshot_id: 42,
             group_file_paths: vec![
                 "s3://bucket/data/f1.parquet".to_string(),
@@ -376,7 +374,10 @@ mod tests {
         let bytes = frame.to_bytes().unwrap();
         let decoded = CompactGroupFrame::from_bytes(&bytes).unwrap();
         match decoded {
-            CompactGroupFrame::Progress { group_id, rows_read } => {
+            CompactGroupFrame::Progress {
+                group_id,
+                rows_read,
+            } => {
                 assert_eq!(group_id, 7);
                 assert_eq!(rows_read, 12345);
             }
@@ -467,10 +468,7 @@ mod tests {
 
     #[test]
     fn sort_spec_wire_roundtrips_columns() {
-        let spec = SortSpec::Columns(vec![
-            ("a".to_string(), true),
-            ("b".to_string(), false),
-        ]);
+        let spec = SortSpec::Columns(vec![("a".to_string(), true), ("b".to_string(), false)]);
         let wire: SortSpecWire = (&spec).into();
         let back: SortSpec = wire.to_sort_spec();
         assert_eq!(back, spec);

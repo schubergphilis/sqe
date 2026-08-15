@@ -58,9 +58,9 @@ fn parse_config(toml_text: &str) -> SqeConfig {
 
 fn handler(config: SqeConfig) -> sqe_coordinator::QueryHandler {
     let policy: Arc<dyn sqe_policy::PolicyEnforcer> = Arc::new(sqe_policy::PassthroughEnforcer);
-    let query_tracker = Arc::new(
-        sqe_coordinator::query_tracker::QueryTracker::new(&config.query_history),
-    );
+    let query_tracker = Arc::new(sqe_coordinator::query_tracker::QueryTracker::new(
+        &config.query_history,
+    ));
     sqe_coordinator::QueryHandler::new(
         policy,
         None,
@@ -105,7 +105,9 @@ async fn unknown_catalog_qualifier_errors_clearly() {
     let err = h
         .execute(
             &session,
-            "SELECT * FROM tf_main_warehouse.tf_demo_namespace.demo_t", None)
+            "SELECT * FROM tf_main_warehouse.tf_demo_namespace.demo_t",
+            None,
+        )
         .await
         .expect_err("3-part name with unknown catalog must error");
 
@@ -148,7 +150,9 @@ async fn known_catalog_qualifier_passes_pre_flight() {
     let err = h
         .execute(
             &session,
-            "SELECT * FROM tf_main_warehouse.tf_demo_namespace.demo_t", None)
+            "SELECT * FROM tf_main_warehouse.tf_demo_namespace.demo_t",
+            None,
+        )
         .await
         .expect_err("placeholder Polaris URL must fail somewhere");
 

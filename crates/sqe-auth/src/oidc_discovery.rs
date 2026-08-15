@@ -68,7 +68,8 @@ impl OidcDiscovery {
 
         if !resp.status().is_success() {
             return Err(AuthError::Internal(anyhow::anyhow!(
-                "OIDC discovery returned HTTP {}", resp.status()
+                "OIDC discovery returned HTTP {}",
+                resp.status()
             )));
         }
 
@@ -104,7 +105,9 @@ impl OidcDiscovery {
     pub async fn device_authorization_endpoint(&self) -> Result<&str, AuthError> {
         let ep = self.endpoints().await?;
         ep.device_authorization_endpoint.as_deref().ok_or_else(|| {
-            AuthError::Internal(anyhow::anyhow!("IdP does not support device authorization grant"))
+            AuthError::Internal(anyhow::anyhow!(
+                "IdP does not support device authorization grant"
+            ))
         })
     }
 
@@ -133,9 +136,15 @@ mod tests {
         });
         let endpoints: DiscoveredEndpoints = serde_json::from_value(json).unwrap();
         assert_eq!(endpoints.issuer, "https://idp.example.com");
-        assert_eq!(endpoints.authorization_endpoint, "https://idp.example.com/authorize");
+        assert_eq!(
+            endpoints.authorization_endpoint,
+            "https://idp.example.com/authorize"
+        );
         assert_eq!(endpoints.token_endpoint, "https://idp.example.com/token");
-        assert_eq!(endpoints.device_authorization_endpoint.as_deref(), Some("https://idp.example.com/device"));
+        assert_eq!(
+            endpoints.device_authorization_endpoint.as_deref(),
+            Some("https://idp.example.com/device")
+        );
         assert_eq!(endpoints.jwks_uri, "https://idp.example.com/certs");
     }
 

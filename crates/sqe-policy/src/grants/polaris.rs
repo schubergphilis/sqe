@@ -14,8 +14,8 @@ use tokio::sync::Mutex;
 use tracing::{debug, warn};
 
 use super::{
-    AccessCheck, AccessCheckResult, GrantBackend, GrantEntry, GrantFilter, GrantStatement,
-    Grantee, RevokeStatement,
+    AccessCheck, AccessCheckResult, GrantBackend, GrantEntry, GrantFilter, GrantStatement, Grantee,
+    RevokeStatement,
 };
 
 /// Safety margin subtracted from the token's `expires_in` so we refresh
@@ -34,9 +34,10 @@ fn validate_url_identifier(value: &str, what: &str) -> sqe_core::Result<()> {
             "{what} must not be empty"
         )));
     }
-    if let Some(bad) = value.chars().find(|c| {
-        matches!(c, '/' | '?' | '#' | '%' | '\\') || c.is_whitespace() || c.is_control()
-    }) {
+    if let Some(bad) = value
+        .chars()
+        .find(|c| matches!(c, '/' | '?' | '#' | '%' | '\\') || c.is_whitespace() || c.is_control())
+    {
         return Err(sqe_core::SqeError::Execution(format!(
             "{what} '{value}' contains invalid character {bad:?}"
         )));
@@ -130,9 +131,7 @@ impl PolarisGrantBackend {
         let client = Client::builder()
             .timeout(Duration::from_secs(30))
             .build()
-            .map_err(|e| {
-                sqe_core::SqeError::Config(format!("Failed to build HTTP client: {e}"))
-            })?;
+            .map_err(|e| sqe_core::SqeError::Config(format!("Failed to build HTTP client: {e}")))?;
 
         let management_url = management_url.trim_end_matches('/').to_string();
 
@@ -140,8 +139,8 @@ impl PolarisGrantBackend {
             (Some(id), Some(secret)) => {
                 // Derive token URL from management URL:
                 // http://polaris:8181/api/management/v1 -> http://polaris:8181/api/catalog/v1/oauth/tokens
-                let token_url = management_url
-                    .replace("/api/management/v1", "/api/catalog/v1/oauth/tokens");
+                let token_url =
+                    management_url.replace("/api/management/v1", "/api/catalog/v1/oauth/tokens");
                 Some(ServiceTokenSource {
                     token_url,
                     client_id: id,
@@ -191,9 +190,7 @@ impl PolarisGrantBackend {
             ])
             .send()
             .await
-            .map_err(|e| {
-                sqe_core::SqeError::Auth(format!("Polaris token fetch failed: {e}"))
-            })?;
+            .map_err(|e| sqe_core::SqeError::Auth(format!("Polaris token fetch failed: {e}")))?;
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -212,8 +209,8 @@ impl PolarisGrantBackend {
 
         // Honor the IdP's advertised lifetime with a safety margin, so the
         // token is refreshed before the server rejects it.
-        let ttl = Duration::from_secs(token_resp.expires_in)
-            .saturating_sub(TOKEN_EXPIRY_SAFETY_MARGIN);
+        let ttl =
+            Duration::from_secs(token_resp.expires_in).saturating_sub(TOKEN_EXPIRY_SAFETY_MARGIN);
         let expires_at = Instant::now() + ttl;
         let token = token_resp.access_token;
 
@@ -310,10 +307,7 @@ impl GrantBackend for PolarisGrantBackend {
         let (polaris_priv, resource_type) = map_sql_to_polaris_privilege(&stmt.privilege);
 
         // Step 1: Ensure catalog role exists (409 = already exists, OK)
-        let url = format!(
-            "{}/catalogs/{}/catalog-roles",
-            self.management_url, catalog
-        );
+        let url = format!("{}/catalogs/{}/catalog-roles", self.management_url, catalog);
         let resp = self
             .client
             .post(&url)
@@ -326,9 +320,7 @@ impl GrantBackend for PolarisGrantBackend {
             .send()
             .await
             .map_err(|e| {
-                sqe_core::SqeError::Execution(format!(
-                    "Polaris management API request failed: {e}"
-                ))
+                sqe_core::SqeError::Execution(format!("Polaris management API request failed: {e}"))
             })?;
 
         if !resp.status().is_success() && resp.status().as_u16() != 409 {
@@ -361,9 +353,7 @@ impl GrantBackend for PolarisGrantBackend {
             .send()
             .await
             .map_err(|e| {
-                sqe_core::SqeError::Execution(format!(
-                    "Polaris management API request failed: {e}"
-                ))
+                sqe_core::SqeError::Execution(format!("Polaris management API request failed: {e}"))
             })?;
 
         if !resp.status().is_success() {
@@ -392,9 +382,7 @@ impl GrantBackend for PolarisGrantBackend {
             .send()
             .await
             .map_err(|e| {
-                sqe_core::SqeError::Execution(format!(
-                    "Polaris management API request failed: {e}"
-                ))
+                sqe_core::SqeError::Execution(format!("Polaris management API request failed: {e}"))
             })?;
 
         if !resp.status().is_success() {
@@ -460,9 +448,7 @@ impl GrantBackend for PolarisGrantBackend {
             .send()
             .await
             .map_err(|e| {
-                sqe_core::SqeError::Execution(format!(
-                    "Polaris management API request failed: {e}"
-                ))
+                sqe_core::SqeError::Execution(format!("Polaris management API request failed: {e}"))
             })?;
 
         if !resp.status().is_success() {
@@ -506,10 +492,7 @@ impl GrantBackend for PolarisGrantBackend {
                 validate_url_identifier(catalog, "catalog")?;
 
                 // List all catalog roles, then get grants for each
-                let url = format!(
-                    "{}/catalogs/{}/catalog-roles",
-                    self.management_url, catalog
-                );
+                let url = format!("{}/catalogs/{}/catalog-roles", self.management_url, catalog);
                 let resp = self
                     .client
                     .get(&url)
@@ -564,10 +547,10 @@ impl GrantBackend for PolarisGrantBackend {
                         continue;
                     }
 
-                    let grants: ListGrantsResponse =
-                        resp.json().await.unwrap_or(ListGrantsResponse {
-                            grants: Vec::new(),
-                        });
+                    let grants: ListGrantsResponse = resp
+                        .json()
+                        .await
+                        .unwrap_or(ListGrantsResponse { grants: Vec::new() });
 
                     for grant in &grants.grants {
                         // Filter by namespace/table if provided
@@ -623,11 +606,7 @@ impl GrantBackend for PolarisGrantBackend {
         }
     }
 
-    async fn show_effective(
-        &self,
-        token: &str,
-        user: &str,
-    ) -> sqe_core::Result<Vec<GrantEntry>> {
+    async fn show_effective(&self, token: &str, user: &str) -> sqe_core::Result<Vec<GrantEntry>> {
         validate_url_identifier(user, "user")?;
         let token = self.resolve_token(token).await?;
 
@@ -643,9 +622,7 @@ impl GrantBackend for PolarisGrantBackend {
             .send()
             .await
             .map_err(|e| {
-                sqe_core::SqeError::Execution(format!(
-                    "Polaris management API request failed: {e}"
-                ))
+                sqe_core::SqeError::Execution(format!("Polaris management API request failed: {e}"))
             })?;
 
         if !resp.status().is_success() {
@@ -662,12 +639,9 @@ impl GrantBackend for PolarisGrantBackend {
             )));
         }
 
-        let principal_roles: ListPrincipalRolesResponse =
-            resp.json().await.map_err(|e| {
-                sqe_core::SqeError::Execution(format!(
-                    "Failed to parse principal roles response: {e}"
-                ))
-            })?;
+        let principal_roles: ListPrincipalRolesResponse = resp.json().await.map_err(|e| {
+            sqe_core::SqeError::Execution(format!("Failed to parse principal roles response: {e}"))
+        })?;
 
         // Step 2+3: For each principal-role, get catalog-role assignments
         // and for each catalog-role get grants. Flatten into GrantEntry list.
@@ -703,8 +677,10 @@ impl GrantBackend for PolarisGrantBackend {
                 name: String,
             }
 
-            let catalog_list: CatalogList =
-                resp.json().await.unwrap_or(CatalogList { catalogs: vec![] });
+            let catalog_list: CatalogList = resp
+                .json()
+                .await
+                .unwrap_or(CatalogList { catalogs: vec![] });
 
             for cat in &catalog_list.catalogs {
                 let assign_url = format!(
@@ -723,10 +699,10 @@ impl GrantBackend for PolarisGrantBackend {
                     _ => continue,
                 };
 
-                let assigned: ListCatalogRolesResponse =
-                    resp.json().await.unwrap_or(ListCatalogRolesResponse {
-                        roles: vec![],
-                    });
+                let assigned: ListCatalogRolesResponse = resp
+                    .json()
+                    .await
+                    .unwrap_or(ListCatalogRolesResponse { roles: vec![] });
 
                 for cr in &assigned.roles {
                     let grants_url = format!(
@@ -745,10 +721,10 @@ impl GrantBackend for PolarisGrantBackend {
                         _ => continue,
                     };
 
-                    let grants: ListGrantsResponse =
-                        resp.json().await.unwrap_or(ListGrantsResponse {
-                            grants: vec![],
-                        });
+                    let grants: ListGrantsResponse = resp
+                        .json()
+                        .await
+                        .unwrap_or(ListGrantsResponse { grants: vec![] });
 
                     for grant in &grants.grants {
                         let resource = format_polaris_resource(
@@ -905,11 +881,8 @@ mod tests {
 
     #[test]
     fn format_polaris_resource_full() {
-        let result = format_polaris_resource(
-            "warehouse",
-            Some(&["ns".to_string()]),
-            Some("orders"),
-        );
+        let result =
+            format_polaris_resource("warehouse", Some(&["ns".to_string()]), Some("orders"));
         assert_eq!(result, "warehouse.ns.orders");
     }
 
@@ -921,24 +894,19 @@ mod tests {
 
     #[test]
     fn format_polaris_resource_namespace_only() {
-        let result = format_polaris_resource(
-            "warehouse",
-            Some(&["ns".to_string()]),
-            None,
-        );
+        let result = format_polaris_resource("warehouse", Some(&["ns".to_string()]), None);
         assert_eq!(result, "warehouse.ns");
     }
 
     #[test]
     fn constructor_passthrough_mode() {
-        let backend = PolarisGrantBackend::new(
-            "http://polaris:8181/api/management/v1",
-            None,
-            None,
-        )
-        .unwrap();
+        let backend =
+            PolarisGrantBackend::new("http://polaris:8181/api/management/v1", None, None).unwrap();
         assert!(backend.service_token.is_none());
-        assert_eq!(backend.management_url, "http://polaris:8181/api/management/v1");
+        assert_eq!(
+            backend.management_url,
+            "http://polaris:8181/api/management/v1"
+        );
         assert_eq!(backend.backend_name(), "polaris");
     }
 
@@ -952,20 +920,22 @@ mod tests {
         .unwrap();
         assert!(backend.service_token.is_some());
         // URL should be trimmed
-        assert_eq!(backend.management_url, "http://polaris:8181/api/management/v1");
+        assert_eq!(
+            backend.management_url,
+            "http://polaris:8181/api/management/v1"
+        );
         let source = backend.service_token.as_ref().unwrap();
-        assert_eq!(source.token_url, "http://polaris:8181/api/catalog/v1/oauth/tokens");
+        assert_eq!(
+            source.token_url,
+            "http://polaris:8181/api/catalog/v1/oauth/tokens"
+        );
         assert_eq!(source.client_id, "client-id");
     }
 
     #[tokio::test]
     async fn resolve_token_passthrough_returns_user_token() {
-        let backend = PolarisGrantBackend::new(
-            "http://polaris:8181/api/management/v1",
-            None,
-            None,
-        )
-        .unwrap();
+        let backend =
+            PolarisGrantBackend::new("http://polaris:8181/api/management/v1", None, None).unwrap();
         let token = backend.resolve_token("user-jwt-token").await.unwrap();
         assert_eq!(token, "user-jwt-token");
     }
@@ -1042,7 +1012,9 @@ mod tests {
 
     #[test]
     fn validate_identifier_rejects_path_separators_and_control() {
-        for bad in &["foo/bar", "foo\\bar", "foo?q", "foo#frag", "foo%20", "foo bar", "foo\nbar"] {
+        for bad in &[
+            "foo/bar", "foo\\bar", "foo?q", "foo#frag", "foo%20", "foo bar", "foo\nbar",
+        ] {
             assert!(
                 validate_url_identifier(bad, "catalog").is_err(),
                 "expected {bad:?} to be rejected"
@@ -1054,12 +1026,8 @@ mod tests {
 
     #[tokio::test]
     async fn check_access_requires_catalog() {
-        let backend = PolarisGrantBackend::new(
-            "http://polaris:8181/api/management/v1",
-            None,
-            None,
-        )
-        .unwrap();
+        let backend =
+            PolarisGrantBackend::new("http://polaris:8181/api/management/v1", None, None).unwrap();
 
         let check = AccessCheck {
             user: "alice".into(),
@@ -1083,12 +1051,8 @@ mod tests {
 
     #[tokio::test]
     async fn check_access_rejects_invalid_catalog_identifier() {
-        let backend = PolarisGrantBackend::new(
-            "http://polaris:8181/api/management/v1",
-            None,
-            None,
-        )
-        .unwrap();
+        let backend =
+            PolarisGrantBackend::new("http://polaris:8181/api/management/v1", None, None).unwrap();
 
         let check = AccessCheck {
             user: "alice".into(),

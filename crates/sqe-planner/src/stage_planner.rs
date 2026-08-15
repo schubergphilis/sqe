@@ -348,9 +348,7 @@ fn decompose_recursive(
 fn extract_smj_key_columns(smj: &SortMergeJoinExec) -> Vec<String> {
     smj.on()
         .iter()
-        .flat_map(|(left, right)| {
-            vec![format!("{left}"), format!("{right}")]
-        })
+        .flat_map(|(left, right)| vec![format!("{left}"), format!("{right}")])
         .collect()
 }
 
@@ -358,9 +356,7 @@ fn extract_smj_key_columns(smj: &SortMergeJoinExec) -> Vec<String> {
 fn extract_hj_key_columns(hj: &HashJoinExec) -> Vec<String> {
     hj.on()
         .iter()
-        .flat_map(|(left, right)| {
-            vec![format!("{left}"), format!("{right}")]
-        })
+        .flat_map(|(left, right)| vec![format!("{left}"), format!("{right}")])
         .collect()
 }
 
@@ -434,9 +430,7 @@ mod tests {
     use datafusion::execution::{SendableRecordBatchStream, TaskContext};
     use datafusion::physical_expr::EquivalenceProperties;
     use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
-    use datafusion::physical_plan::{
-        DisplayAs, DisplayFormatType, Partitioning, PlanProperties,
-    };
+    use datafusion::physical_plan::{DisplayAs, DisplayFormatType, Partitioning, PlanProperties};
 
     fn test_schema() -> SchemaRef {
         Arc::new(Schema::new(vec![
@@ -560,10 +554,8 @@ mod tests {
         let right_ordering =
             datafusion::physical_expr::LexOrdering::new(vec![right_sort_expr]).unwrap();
 
-        let sorted_left: Arc<dyn ExecutionPlan> =
-            Arc::new(SortExec::new(left_ordering, left));
-        let sorted_right: Arc<dyn ExecutionPlan> =
-            Arc::new(SortExec::new(right_ordering, right));
+        let sorted_left: Arc<dyn ExecutionPlan> = Arc::new(SortExec::new(left_ordering, left));
+        let sorted_right: Arc<dyn ExecutionPlan> = Arc::new(SortExec::new(right_ordering, right));
 
         Arc::new(
             SortMergeJoinExec::try_new(
@@ -658,8 +650,7 @@ mod tests {
 
         let schema = test_schema();
         // Create a plan with multiple partitions
-        let input: Arc<dyn ExecutionPlan> =
-            Arc::new(MockScanExec::new(schema.clone(), 4));
+        let input: Arc<dyn ExecutionPlan> = Arc::new(MockScanExec::new(schema.clone(), 4));
 
         let sort_expr = PhysicalSortExpr::new(
             datafusion::physical_expr::expressions::col("id", &schema).unwrap(),
@@ -692,8 +683,7 @@ mod tests {
 
         let schema = test_schema();
         // Single-partition input — no shuffle needed
-        let input: Arc<dyn ExecutionPlan> =
-            Arc::new(MockScanExec::new(schema.clone(), 1));
+        let input: Arc<dyn ExecutionPlan> = Arc::new(MockScanExec::new(schema.clone(), 1));
 
         let sort_expr = PhysicalSortExpr::new(
             datafusion::physical_expr::expressions::col("id", &schema).unwrap(),

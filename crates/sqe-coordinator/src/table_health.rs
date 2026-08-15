@@ -203,7 +203,11 @@ mod tests {
         Schema, Struct, Type,
     };
 
-    fn cfg(target_bytes: u64, min_input_files: usize, delete_file_threshold: usize) -> MaintenanceCompactionConfig {
+    fn cfg(
+        target_bytes: u64,
+        min_input_files: usize,
+        delete_file_threshold: usize,
+    ) -> MaintenanceCompactionConfig {
         MaintenanceCompactionConfig {
             target_file_size_bytes: target_bytes,
             min_input_files,
@@ -257,9 +261,12 @@ mod tests {
     fn minimal_schema() -> std::sync::Arc<Schema> {
         std::sync::Arc::new(
             Schema::builder()
-                .with_fields(vec![
-                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
-                ])
+                .with_fields(vec![NestedField::required(
+                    1,
+                    "id",
+                    Type::Primitive(PrimitiveType::Long),
+                )
+                .into()])
                 .build()
                 .expect("build schema"),
         )
@@ -390,8 +397,12 @@ mod tests {
             scan_task("heavy", &["d1", "d2"]),
             scan_task("light", &["d1"]),
         ]);
-        let files = vec![data_file_of_size("heavy", 100), data_file_of_size("light", 100)];
-        let health = analyze_table_health(&files, &[], &tasks, &cfg(1000, 5, 2), &HashMap::new(), None);
+        let files = vec![
+            data_file_of_size("heavy", 100),
+            data_file_of_size("light", 100),
+        ];
+        let health =
+            analyze_table_health(&files, &[], &tasks, &cfg(1000, 5, 2), &HashMap::new(), None);
         assert_eq!(health.delete_heavy_files, 1);
     }
 
@@ -401,7 +412,8 @@ mod tests {
         // rewrite_data_files_once guard).
         let tasks = tasks_by_path(vec![scan_task("a", &["d1"])]);
         let files = vec![data_file_of_size("a", 100)];
-        let health = analyze_table_health(&files, &[], &tasks, &cfg(1000, 5, 0), &HashMap::new(), None);
+        let health =
+            analyze_table_health(&files, &[], &tasks, &cfg(1000, 5, 0), &HashMap::new(), None);
         assert_eq!(health.delete_heavy_files, 0);
     }
 
@@ -424,11 +436,8 @@ mod tests {
             None,
         );
 
-        let expected_groups = crate::maintenance::pack_file_groups_partition_aware(
-            &files,
-            target,
-            &HashSet::new(),
-        );
+        let expected_groups =
+            crate::maintenance::pack_file_groups_partition_aware(&files, target, &HashSet::new());
         let expected_eligible = expected_groups
             .iter()
             .filter(|g| g.len() >= min_input)
@@ -441,10 +450,7 @@ mod tests {
     fn eligible_groups_below_min_input_excluded() {
         let target = 1000u64;
         // 2 tiny files in one partition: one group of 2, below min_input=5.
-        let files = vec![
-            data_file_part("f0", 10, 0),
-            data_file_part("f1", 10, 0),
-        ];
+        let files = vec![data_file_part("f0", 10, 0), data_file_part("f1", 10, 0)];
         let health = analyze_table_health(
             &files,
             &[],
@@ -499,15 +505,22 @@ mod tests {
         let files = vec![data_file_of_size("a", 100)];
         let mut props = HashMap::new();
         props.insert("sqe.maintenance.enabled".to_string(), "true".to_string());
-        let health = analyze_table_health(&files, &[], &HashMap::new(), &cfg(1000, 5, 2), &props, None);
+        let health =
+            analyze_table_health(&files, &[], &HashMap::new(), &cfg(1000, 5, 2), &props, None);
         assert!(health.maintenance_enabled);
     }
 
     #[test]
     fn maintenance_enabled_defaults_false() {
         let files = vec![data_file_of_size("a", 100)];
-        let health =
-            analyze_table_health(&files, &[], &HashMap::new(), &cfg(1000, 5, 2), &HashMap::new(), None);
+        let health = analyze_table_health(
+            &files,
+            &[],
+            &HashMap::new(),
+            &cfg(1000, 5, 2),
+            &HashMap::new(),
+            None,
+        );
         assert!(!health.maintenance_enabled);
     }
 
@@ -516,15 +529,22 @@ mod tests {
         let files = vec![data_file_of_size("a", 100)];
         let mut props = HashMap::new();
         props.insert("sqe.maintenance.enabled".to_string(), "false".to_string());
-        let health = analyze_table_health(&files, &[], &HashMap::new(), &cfg(1000, 5, 2), &props, None);
+        let health =
+            analyze_table_health(&files, &[], &HashMap::new(), &cfg(1000, 5, 2), &props, None);
         assert!(!health.maintenance_enabled);
     }
 
     #[test]
     fn last_compaction_snapshot_ms_absent_when_no_compaction_ever_ran() {
         let files = vec![data_file_of_size("a", 100)];
-        let health =
-            analyze_table_health(&files, &[], &HashMap::new(), &cfg(1000, 5, 2), &HashMap::new(), None);
+        let health = analyze_table_health(
+            &files,
+            &[],
+            &HashMap::new(),
+            &cfg(1000, 5, 2),
+            &HashMap::new(),
+            None,
+        );
         assert_eq!(health.last_compaction_snapshot_ms, None);
     }
 
@@ -572,10 +592,11 @@ mod tests {
             .unwrap();
         assert_eq!(live.value(0), 10);
 
-        let snapshot_col = batch
-            .column_by_name("last_compaction_snapshot_ms")
-            .unwrap();
-        assert!(snapshot_col.is_null(0), "None must round-trip as a null cell");
+        let snapshot_col = batch.column_by_name("last_compaction_snapshot_ms").unwrap();
+        assert!(
+            snapshot_col.is_null(0),
+            "None must round-trip as a null cell"
+        );
 
         let enabled = batch
             .column_by_name("maintenance_enabled")

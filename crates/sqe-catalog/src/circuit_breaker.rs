@@ -71,7 +71,11 @@ impl CircuitBreaker {
     /// * `name` — label used in log messages
     /// * `failure_threshold` — consecutive failures before opening circuit
     /// * `recovery_timeout` — how long to keep circuit Open before probing
-    pub fn new(name: impl Into<String>, failure_threshold: u32, recovery_timeout: Duration) -> Self {
+    pub fn new(
+        name: impl Into<String>,
+        failure_threshold: u32,
+        recovery_timeout: Duration,
+    ) -> Self {
         Self {
             failure_count: AtomicU32::new(0),
             failure_threshold,
@@ -93,8 +97,8 @@ impl CircuitBreaker {
                 STATE_CLOSED => return Ok(()),
                 STATE_OPEN => {
                     // Check whether the recovery window has elapsed.
-                    let elapsed_ms = now_millis()
-                        .saturating_sub(self.last_failure_ms.load(Ordering::Relaxed));
+                    let elapsed_ms =
+                        now_millis().saturating_sub(self.last_failure_ms.load(Ordering::Relaxed));
                     let recovery_ms = self.recovery_timeout.as_millis() as u64;
                     if elapsed_ms >= recovery_ms {
                         // Attempt transition Open → Half-Open.

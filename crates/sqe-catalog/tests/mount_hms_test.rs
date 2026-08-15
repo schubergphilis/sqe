@@ -28,13 +28,7 @@ async fn hms_accepts_basic_options_without_panic() {
     // returns a usable catalog handle without dialing the thrift
     // endpoint. We're testing that all option threading runs without
     // panicking and the builder accepts the props.
-    let result = build_catalog(
-        "127.0.0.1:9083",
-        CatalogKind::Hms,
-        &options,
-        &secrets,
-    )
-    .await;
+    let result = build_catalog("127.0.0.1:9083", CatalogKind::Hms, &options, &secrets).await;
     assert!(
         result.is_ok(),
         "HMS builder should accept basic options, got: {:?}",
@@ -47,14 +41,9 @@ async fn hms_requires_warehouse() {
     let secrets = SecretStore::new();
     let options: BTreeMap<String, OptionValue> = BTreeMap::new();
 
-    let err = build_catalog(
-        "127.0.0.1:9083",
-        CatalogKind::Hms,
-        &options,
-        &secrets,
-    )
-    .await
-    .expect_err("missing WAREHOUSE must error");
+    let err = build_catalog("127.0.0.1:9083", CatalogKind::Hms, &options, &secrets)
+        .await
+        .expect_err("missing WAREHOUSE must error");
     assert!(
         err.contains("WAREHOUSE"),
         "expected WAREHOUSE error, got: {err}"
@@ -92,14 +81,9 @@ async fn hms_plain_auth_requires_secret() {
         OptionValue::String("plain".to_string()),
     );
 
-    let err = build_catalog(
-        "127.0.0.1:9083",
-        CatalogKind::Hms,
-        &options,
-        &secrets,
-    )
-    .await
-    .expect_err("AUTH_MODE plain without SECRET must error");
+    let err = build_catalog("127.0.0.1:9083", CatalogKind::Hms, &options, &secrets)
+        .await
+        .expect_err("AUTH_MODE plain without SECRET must error");
     assert!(
         err.contains("SECRET") && err.contains("plain"),
         "expected plain-without-secret error, got: {err}"
@@ -136,14 +120,9 @@ async fn hms_plain_auth_rejects_wrong_secret_kind() {
         OptionValue::SecretRef("aws_creds".to_string()),
     );
 
-    let err = build_catalog(
-        "127.0.0.1:9083",
-        CatalogKind::Hms,
-        &options,
-        &secrets,
-    )
-    .await
-    .expect_err("AWS secret must be rejected for HMS plain auth");
+    let err = build_catalog("127.0.0.1:9083", CatalogKind::Hms, &options, &secrets)
+        .await
+        .expect_err("AWS secret must be rejected for HMS plain auth");
     assert!(
         err.contains("type aws") && err.contains("basic"),
         "expected kind-mismatch message, got: {err}"
@@ -177,13 +156,7 @@ async fn hms_plain_auth_with_basic_secret_accepted() {
         OptionValue::SecretRef("hms_creds".to_string()),
     );
 
-    let result = build_catalog(
-        "127.0.0.1:9083",
-        CatalogKind::Hms,
-        &options,
-        &secrets,
-    )
-    .await;
+    let result = build_catalog("127.0.0.1:9083", CatalogKind::Hms, &options, &secrets).await;
     assert!(
         result.is_ok(),
         "AUTH_MODE plain + Basic secret should be accepted, got: {:?}",
@@ -230,14 +203,9 @@ async fn hms_unknown_auth_mode_errors() {
         OptionValue::String("oauth2".to_string()),
     );
 
-    let err = build_catalog(
-        "127.0.0.1:9083",
-        CatalogKind::Hms,
-        &options,
-        &secrets,
-    )
-    .await
-    .expect_err("unknown AUTH_MODE must error");
+    let err = build_catalog("127.0.0.1:9083", CatalogKind::Hms, &options, &secrets)
+        .await
+        .expect_err("unknown AUTH_MODE must error");
     assert!(
         err.contains("oauth2") && err.contains("none"),
         "expected unsupported-auth-mode error, got: {err}"

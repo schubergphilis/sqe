@@ -538,10 +538,10 @@ mod tests {
             .unwrap();
         if let ColumnarValue::Array(arr) = result {
             let bool_arr = arr.as_any().downcast_ref::<BooleanArray>().unwrap();
-            assert!(bool_arr.value(0));            // admin found
-            assert!(!bool_arr.value(1));           // engineer not found
-            assert!(bool_arr.is_null(2));          // null -> null
-            assert!(bool_arr.value(3));            // analyst found
+            assert!(bool_arr.value(0)); // admin found
+            assert!(!bool_arr.value(1)); // engineer not found
+            assert!(bool_arr.is_null(2)); // null -> null
+            assert!(bool_arr.value(3)); // analyst found
         } else {
             panic!("expected Boolean array");
         }
@@ -691,8 +691,18 @@ mod tests {
 
     #[test]
     fn test_current_user_different_identities_not_equal() {
-        let id_alice = Arc::new(SessionIdentity::new("alice", vec![] as Vec<String>, None, None));
-        let id_bob = Arc::new(SessionIdentity::new("bob", vec![] as Vec<String>, None, None));
+        let id_alice = Arc::new(SessionIdentity::new(
+            "alice",
+            vec![] as Vec<String>,
+            None,
+            None,
+        ));
+        let id_bob = Arc::new(SessionIdentity::new(
+            "bob",
+            vec![] as Vec<String>,
+            None,
+            None,
+        ));
         let func_a = CurrentUserFunc::new(id_alice);
         let func_b = CurrentUserFunc::new(id_bob);
         assert_ne!(func_a, func_b);
@@ -735,12 +745,7 @@ mod tests {
 
     #[test]
     fn test_session_identity_sorts_and_deduplicates_roles() {
-        let id = SessionIdentity::new(
-            "x",
-            vec!["c", "a", "b", "a", "c"],
-            None,
-            None,
-        );
+        let id = SessionIdentity::new("x", vec!["c", "a", "b", "a", "c"], None, None);
         assert_eq!(id.roles, vec!["a", "b", "c"]);
     }
 }

@@ -2,9 +2,9 @@
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use opentelemetry::logs::{Logger as _, LogRecord as _, LoggerProvider as _};
-use opentelemetry::logs::Severity as OtelSeverity;
 use opentelemetry::logs::AnyValue;
+use opentelemetry::logs::Severity as OtelSeverity;
+use opentelemetry::logs::{LogRecord as _, Logger as _, LoggerProvider as _};
 use opentelemetry::InstrumentationScope;
 use opentelemetry_otlp::{LogExporter, WithExportConfig};
 // Bring the LogExporter trait into scope for `.export()` without a name clash
@@ -13,7 +13,7 @@ use opentelemetry_sdk::logs::LogExporter as _;
 use opentelemetry_sdk::logs::{LogBatch, SdkLogger, SdkLoggerProvider};
 use opentelemetry_sdk::Resource;
 
-use super::record::{LogShipExporter, ShipRecord, Severity};
+use super::record::{LogShipExporter, Severity, ShipRecord};
 
 /// Map an OCSF `class_uid` to a human-readable kind string.
 fn class_uid_to_kind(class_uid: i64) -> &'static str {
@@ -52,9 +52,7 @@ impl OtlpExporter {
     ///
     /// Returns an error string if the OTLP exporter or provider cannot be built.
     pub fn new(endpoint: &str) -> Result<Self, String> {
-        let resource = Resource::builder()
-            .with_service_name("sqe-audit")
-            .build();
+        let resource = Resource::builder().with_service_name("sqe-audit").build();
 
         let mut log_exporter = LogExporter::builder()
             .with_tonic()
@@ -74,7 +72,11 @@ impl OtlpExporter {
 
         let scope = InstrumentationScope::builder("sqe-audit").build();
 
-        Ok(Self { log_exporter, factory_logger, scope })
+        Ok(Self {
+            log_exporter,
+            factory_logger,
+            scope,
+        })
     }
 }
 
@@ -121,8 +123,10 @@ impl LogShipExporter for OtlpExporter {
         }
 
         // Build the borrow slice that LogBatch::new expects.
-        let pairs: Vec<(&opentelemetry_sdk::logs::SdkLogRecord, &InstrumentationScope)> =
-            sdk_records.iter().map(|r| (r, &self.scope)).collect();
+        let pairs: Vec<(
+            &opentelemetry_sdk::logs::SdkLogRecord,
+            &InstrumentationScope,
+        )> = sdk_records.iter().map(|r| (r, &self.scope)).collect();
 
         let batch = LogBatch::new(&pairs);
 
@@ -146,7 +150,10 @@ mod tests {
     async fn otlp_exporter_constructs_without_panic() {
         // Use a syntactically valid endpoint; connection is lazy so no network activity.
         let exporter = OtlpExporter::new("http://localhost:4317");
-        assert!(exporter.is_ok(), "OtlpExporter::new should succeed: {exporter:?}");
+        assert!(
+            exporter.is_ok(),
+            "OtlpExporter::new should succeed: {exporter:?}"
+        );
     }
 
     /// Regression guard for MUST-FIX 1 (at-least-once guarantee).
@@ -161,8 +168,8 @@ mod tests {
     /// so the test completes fast even if the OS takes a moment to refuse.
     #[tokio::test]
     async fn export_batch_returns_err_when_collector_unreachable() {
-        use serde_json::json;
         use crate::audit::export::record::ShipRecord;
+        use serde_json::json;
 
         let resource = Resource::builder().with_service_name("sqe-audit").build();
         let mut log_exporter = LogExporter::builder()
@@ -175,7 +182,11 @@ mod tests {
         let factory_provider = SdkLoggerProvider::builder().build();
         let factory_logger = factory_provider.logger("sqe-audit");
         let scope = InstrumentationScope::builder("sqe-audit").build();
-        let exporter = OtlpExporter { log_exporter, factory_logger, scope };
+        let exporter = OtlpExporter {
+            log_exporter,
+            factory_logger,
+            scope,
+        };
 
         let record = ShipRecord {
             body: json!({"class_uid": 6005, "activity_name": "Query"}),

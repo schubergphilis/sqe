@@ -113,7 +113,6 @@ impl ArgExtremum {
 }
 
 impl AggregateUDFImpl for ArgExtremum {
-
     fn name(&self) -> &str {
         self.direction.primary_name()
     }
@@ -182,11 +181,7 @@ struct ArgExtremumAccumulator {
 }
 
 impl ArgExtremumAccumulator {
-    fn try_new(
-        direction: Direction,
-        x_type: DataType,
-        y_type: DataType,
-    ) -> DFResult<Self> {
+    fn try_new(direction: Direction, x_type: DataType, y_type: DataType) -> DFResult<Self> {
         Ok(Self {
             direction,
             best_x: None,
@@ -205,8 +200,7 @@ impl ArgExtremumAccumulator {
         let cmp = y.partial_cmp(current);
         matches!(
             (self.direction, cmp),
-            (Direction::Max, Some(Ordering::Greater))
-                | (Direction::Min, Some(Ordering::Less))
+            (Direction::Max, Some(Ordering::Greater)) | (Direction::Min, Some(Ordering::Less))
         )
     }
 
@@ -303,7 +297,10 @@ mod tests {
         let x: ArrayRef = Arc::new(StringArray::from(vec!["a", "b", "c"]));
         let y: ArrayRef = Arc::new(Float64Array::from(vec![1.0, 3.0, 2.0]));
         acc.update_batch(&[x, y]).unwrap();
-        assert_eq!(acc.evaluate().unwrap(), ScalarValue::Utf8(Some("a".to_string())));
+        assert_eq!(
+            acc.evaluate().unwrap(),
+            ScalarValue::Utf8(Some("a".to_string()))
+        );
     }
 
     #[test]
@@ -313,7 +310,10 @@ mod tests {
         let y: ArrayRef = Arc::new(Float64Array::from(vec![Some(1.0), None, Some(2.0)]));
         acc.update_batch(&[x, y]).unwrap();
         // The NULL y at index 1 should be skipped; max y is 2.0 -> x = "c".
-        assert_eq!(acc.evaluate().unwrap(), ScalarValue::Utf8(Some("c".to_string())));
+        assert_eq!(
+            acc.evaluate().unwrap(),
+            ScalarValue::Utf8(Some("c".to_string()))
+        );
     }
 
     #[test]
@@ -366,18 +366,18 @@ mod tests {
         let mut final_acc = make_acc(Direction::Max);
         final_acc.merge_batch(&[merged_x, merged_y]).unwrap();
         // Best y across both partials is 5.0 -> x = "b".
-        assert_eq!(final_acc.evaluate().unwrap(), ScalarValue::Utf8(Some("b".to_string())));
+        assert_eq!(
+            final_acc.evaluate().unwrap(),
+            ScalarValue::Utf8(Some("b".to_string()))
+        );
     }
 
     #[test]
     fn integer_value_type_works() {
         // Integer y is the common dbt case (max_by(name, last_seen_at)).
-        let mut acc = ArgExtremumAccumulator::try_new(
-            Direction::Max,
-            DataType::Utf8,
-            DataType::Int64,
-        )
-        .unwrap();
+        let mut acc =
+            ArgExtremumAccumulator::try_new(Direction::Max, DataType::Utf8, DataType::Int64)
+                .unwrap();
         let x: ArrayRef = Arc::new(StringArray::from(vec!["alice", "bob", "carol"]));
         let y: ArrayRef = Arc::new(Int64Array::from(vec![100, 300, 200]));
         acc.update_batch(&[x, y]).unwrap();

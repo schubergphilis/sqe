@@ -137,25 +137,37 @@ fn prod_stack_1k() {
 }
 
 #[test]
-#[cfg_attr(debug_assertions, ignore = "release-only: deep OR planning overflows 8 MiB + is very slow in debug")]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "release-only: deep OR planning overflows 8 MiB + is very slow in debug"
+)]
 fn prod_stack_4k() {
     run_on_prod_worker(4_000);
 }
 
 #[test]
-#[cfg_attr(debug_assertions, ignore = "release-only: deep OR planning overflows 8 MiB + is very slow in debug")]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "release-only: deep OR planning overflows 8 MiB + is very slow in debug"
+)]
 fn prod_stack_8k() {
     run_on_prod_worker(8_000);
 }
 
 #[test]
-#[cfg_attr(debug_assertions, ignore = "release-only: deep OR planning overflows 8 MiB + is very slow in debug")]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "release-only: deep OR planning overflows 8 MiB + is very slow in debug"
+)]
 fn prod_stack_16k() {
     run_on_prod_worker(16_000);
 }
 
 #[test]
-#[cfg_attr(debug_assertions, ignore = "release-only: deep OR planning overflows 8 MiB + is very slow in debug")]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "release-only: deep OR planning overflows 8 MiB + is very slow in debug"
+)]
 fn prod_stack_32k() {
     run_on_prod_worker(32_000);
 }

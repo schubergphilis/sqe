@@ -68,7 +68,9 @@ use std::sync::Arc;
 
 use croner::Cron;
 use iceberg::{Catalog, TableIdent};
-use sqe_core::config::{LeaseMode, MaintenanceCompactionConfig, MaintenanceConfig, MaintenanceMode};
+use sqe_core::config::{
+    LeaseMode, MaintenanceCompactionConfig, MaintenanceConfig, MaintenanceMode,
+};
 use sqe_core::{Session, SqeError};
 use sqe_sql::TableRef;
 use tracing::{debug, info, warn};
@@ -108,8 +110,9 @@ pub fn default_catalog_factory(
         let table_cache = table_cache.clone();
         let token = session.access_token().expose().to_string();
         Box::pin(async move {
-            let session_catalog =
-                Arc::new(sqe_catalog::SessionCatalog::for_session(&config, table_cache, &token).await?);
+            let session_catalog = Arc::new(
+                sqe_catalog::SessionCatalog::for_session(&config, table_cache, &token).await?,
+            );
             Ok(session_catalog.as_catalog() as Arc<dyn Catalog>)
         })
     })
@@ -130,7 +133,11 @@ pub fn stable_holder_id() -> String {
     let hostname = std::env::var("HOSTNAME")
         .ok()
         .filter(|h| !h.trim().is_empty())
-        .or_else(|| std::env::var("POD_NAME").ok().filter(|h| !h.trim().is_empty()));
+        .or_else(|| {
+            std::env::var("POD_NAME")
+                .ok()
+                .filter(|h| !h.trim().is_empty())
+        });
     match hostname {
         Some(h) => format!("{}-{}", h.trim(), std::process::id()),
         None => crate::maintenance_lease::generate_holder_id(),
@@ -287,7 +294,10 @@ impl MaintenanceScheduler {
 
         for name in enabled {
             let empty_props = HashMap::new();
-            let table_props = props_by_name.get(name.as_str()).copied().unwrap_or(&empty_props);
+            let table_props = props_by_name
+                .get(name.as_str())
+                .copied()
+                .unwrap_or(&empty_props);
             let schedule = resolve_schedule(&self.cfg.scheduler.schedule, table_props);
             if !table_due(
                 &name,
@@ -312,7 +322,10 @@ impl MaintenanceScheduler {
                     self.active_one_table(&catalog, ident, now_ms).await;
                 }
                 _ => {
-                    if let Err(e) = self.analyze_one_table(&catalog, ident, &job_id, now_ms).await {
+                    if let Err(e) = self
+                        .analyze_one_table(&catalog, ident, &job_id, now_ms)
+                        .await
+                    {
                         warn!(
                             table = %name,
                             error = %e,
@@ -374,7 +387,8 @@ impl MaintenanceScheduler {
             ));
         }
 
-        let row = crate::maintenance_log::advisory_row(&name, &self.principal.user_id, &health, now_ms);
+        let row =
+            crate::maintenance_log::advisory_row(&name, &self.principal.user_id, &health, now_ms);
         if let Err(e) =
             crate::maintenance_log::append_row(catalog, &self.cfg.scheduler.state_table, &row).await
         {
@@ -498,8 +512,14 @@ impl MaintenanceScheduler {
         let has_eligible_work = health.eligible_groups > 0 || health.delete_heavy_files > 0;
         if !has_eligible_work {
             info!(table = %name, "active_tick: skipped, no eligible compaction debt");
-            self.record_skipped_job(catalog, &job_id, ident, started_at_ms, "no eligible compaction debt")
-                .await;
+            self.record_skipped_job(
+                catalog,
+                &job_id,
+                ident,
+                started_at_ms,
+                "no eligible compaction debt",
+            )
+            .await;
             return;
         }
 
@@ -583,8 +603,14 @@ impl MaintenanceScheduler {
         };
         let snapshot_properties = HashMap::from([
             ("sqe.maintenance.job-id".to_string(), job_id.clone()),
-            ("sqe.maintenance.principal".to_string(), self.principal.user_id.clone()),
-            ("sqe.maintenance.trigger".to_string(), "scheduled".to_string()),
+            (
+                "sqe.maintenance.principal".to_string(),
+                self.principal.user_id.clone(),
+            ),
+            (
+                "sqe.maintenance.trigger".to_string(),
+                "scheduled".to_string(),
+            ),
         ]);
 
         // Phase 4c Task 5: `distribution.mode` routing. `resolve_execution`
@@ -604,15 +630,25 @@ impl MaintenanceScheduler {
         let dist = &self.cfg.distribution;
         let healthy = self.handler.healthy_worker_count().await;
         let plan = crate::maintenance::resolve_execution(dist.mode, healthy, dist.min_workers);
-        if matches!(plan, crate::maintenance::ExecutionPlan::SkipInsufficientWorkers) {
+        if matches!(
+            plan,
+            crate::maintenance::ExecutionPlan::SkipInsufficientWorkers
+        ) {
             warn!(
                 table = %name,
                 healthy_workers = healthy,
                 min_workers = dist.min_workers,
                 "active_tick: skipped, distribution.mode=require but the fleet is below min_workers"
             );
-            self.record_skipped_insufficient_workers(catalog, &job_id, ident, started_at_ms, healthy, dist.min_workers)
-                .await;
+            self.record_skipped_insufficient_workers(
+                catalog,
+                &job_id,
+                ident,
+                started_at_ms,
+                healthy,
+                dist.min_workers,
+            )
+            .await;
             return;
         }
 
@@ -661,8 +697,18 @@ impl MaintenanceScheduler {
                             // `try_acquire`, surfaced for exactly this) is
                             // what makes that possible without re-deriving
                             // it here.
-                            let action = if handle.stolen_from.is_some() { "stolen" } else { "acquired" };
-                            audit.log_event(build_lease_audit_event(ident, &self.principal.user_id, &job_id, action, &handle));
+                            let action = if handle.stolen_from.is_some() {
+                                "stolen"
+                            } else {
+                                "acquired"
+                            };
+                            audit.log_event(build_lease_audit_event(
+                                ident,
+                                &self.principal.user_id,
+                                &job_id,
+                                action,
+                                &handle,
+                            ));
                         }
                         Some(handle)
                     }
@@ -701,7 +747,11 @@ impl MaintenanceScheduler {
         };
 
         let rewrite_future: Pin<
-            Box<dyn Future<Output = sqe_core::Result<crate::maintenance::RewriteOutcome>> + Send + '_>,
+            Box<
+                dyn Future<Output = sqe_core::Result<crate::maintenance::RewriteOutcome>>
+                    + Send
+                    + '_,
+            >,
         > = match plan {
             crate::maintenance::ExecutionPlan::SkipInsufficientWorkers => {
                 unreachable!("handled above, before the lease was acquired")
@@ -761,7 +811,14 @@ impl MaintenanceScheduler {
             // `run_with_lease_renewal`) already uses `commit_catalog`, and a
             // long job's discovery-time token can be stale by the time it
             // finishes, same rationale as the commit-catalog rebuild above.
-            match maintenance_lease::release(handle, &commit_catalog, &self.cfg.scheduler.state_table, release_now_ms).await {
+            match maintenance_lease::release(
+                handle,
+                &commit_catalog,
+                &self.cfg.scheduler.state_table,
+                release_now_ms,
+            )
+            .await
+            {
                 Ok(()) => {
                     if let Some(audit) = &self.audit {
                         audit.log_event(build_lease_audit_event(
@@ -945,7 +1002,13 @@ impl MaintenanceScheduler {
         reason: &str,
     ) {
         let name = ident.to_string();
-        let row = maintenance_log::skipped_row(job_id, &name, &self.principal.user_id, started_at_ms, reason);
+        let row = maintenance_log::skipped_row(
+            job_id,
+            &name,
+            &self.principal.user_id,
+            started_at_ms,
+            reason,
+        );
         self.append_job_row(catalog, &row).await;
         self.metrics
             .maintenance_job_total
@@ -995,7 +1058,11 @@ impl MaintenanceScheduler {
     /// terminal row. Mirrors `analyze_one_table`'s advisory-row append: a
     /// failure to write the ledger is logged, never propagated, and never
     /// blocks the next table.
-    async fn append_job_row(&self, catalog: &Arc<dyn Catalog>, row: &maintenance_log::MaintenanceLogRow) {
+    async fn append_job_row(
+        &self,
+        catalog: &Arc<dyn Catalog>,
+        row: &maintenance_log::MaintenanceLogRow,
+    ) {
         if let Err(e) =
             maintenance_log::append_row(catalog, &self.cfg.scheduler.state_table, row).await
         {
@@ -1074,12 +1141,12 @@ fn build_maintenance_audit_event(
             text: Some(format!(
                 "advisory_tick: table_health small_files={} delete_files={} \
                  eligible_groups={} est_rewrite_bytes={}",
-                health.small_files, health.delete_files, health.eligible_groups, health.est_rewrite_bytes
+                health.small_files,
+                health.delete_files,
+                health.eligible_groups,
+                health.est_rewrite_bytes
             )),
-            query_hash: sqe_metrics::audit::query_hash(&format!(
-                "maintenance-advisory:{}",
-                ident
-            )),
+            query_hash: sqe_metrics::audit::query_hash(&format!("maintenance-advisory:{}", ident)),
             statement_type: "maintenance_advisory".to_string(),
         }),
         session_id: Some(job_id.to_string()),
@@ -1125,7 +1192,11 @@ fn build_active_audit_event(
             text: Some(format!(
                 "active_tick: rewrite_data_files committed files_in={} files_out={} \
                  bytes_out={} rows_removed={} snapshot_id={:?}",
-                outcome.files_in, outcome.files_out, outcome.bytes_out, outcome.rows_removed, outcome.snapshot_id
+                outcome.files_in,
+                outcome.files_out,
+                outcome.bytes_out,
+                outcome.rows_removed,
+                outcome.snapshot_id
             )),
             query_hash: sqe_metrics::audit::query_hash(&format!("maintenance-active:{}", ident)),
             statement_type: "maintenance_active".to_string(),
@@ -1178,9 +1249,16 @@ fn build_partial_audit_event(
             text: Some(format!(
                 "active_tick: rewrite_data_files partial: committed files_in={} files_out={} \
                  bytes_out={} rows_removed={} snapshot_id={:?}, then stopped: {reason}",
-                outcome.files_in, outcome.files_out, outcome.bytes_out, outcome.rows_removed, outcome.snapshot_id
+                outcome.files_in,
+                outcome.files_out,
+                outcome.bytes_out,
+                outcome.rows_removed,
+                outcome.snapshot_id
             )),
-            query_hash: sqe_metrics::audit::query_hash(&format!("maintenance-active-partial:{}", ident)),
+            query_hash: sqe_metrics::audit::query_hash(&format!(
+                "maintenance-active-partial:{}",
+                ident
+            )),
             statement_type: "maintenance_active".to_string(),
         }),
         session_id: Some(job_id.to_string()),
@@ -1231,7 +1309,10 @@ fn build_failed_audit_event(
         stats: None,
         query: Some(sqe_metrics::audit::QueryInfo {
             text: Some(format!("active_tick: rewrite_data_files failed: {error}")),
-            query_hash: sqe_metrics::audit::query_hash(&format!("maintenance-active-failed:{}", ident)),
+            query_hash: sqe_metrics::audit::query_hash(&format!(
+                "maintenance-active-failed:{}",
+                ident
+            )),
             statement_type: "maintenance_active".to_string(),
         }),
         session_id: Some(job_id.to_string()),
@@ -1277,7 +1358,10 @@ fn build_skipped_audit_event(
         stats: None,
         query: Some(sqe_metrics::audit::QueryInfo {
             text: Some(format!("active_tick: rewrite_data_files skipped: {reason}")),
-            query_hash: sqe_metrics::audit::query_hash(&format!("maintenance-active-skipped:{}", ident)),
+            query_hash: sqe_metrics::audit::query_hash(&format!(
+                "maintenance-active-skipped:{}",
+                ident
+            )),
             statement_type: "maintenance_active".to_string(),
         }),
         session_id: Some(job_id.to_string()),
@@ -1502,7 +1586,11 @@ fn resolve_u64_override(table_props: &HashMap<String, String>, key: &str, defaul
     }
 }
 
-fn resolve_usize_override(table_props: &HashMap<String, String>, key: &str, default: usize) -> usize {
+fn resolve_usize_override(
+    table_props: &HashMap<String, String>,
+    key: &str,
+    default: usize,
+) -> usize {
     match table_props.get(key) {
         None => default,
         Some(raw) => match raw.parse::<usize>() {
@@ -1642,7 +1730,13 @@ fn warn_invalid_schedule_once(ident: &str, schedule: &str, error: &croner::error
 /// (e.g. an unsatisfiable pattern) is logged once per `(ident, schedule)`
 /// pair and treated as "never due" -- this function never panics and never
 /// falls back to "always due" on a bad schedule.
-pub fn table_due(ident: &str, schedule: &str, jitter_secs: u64, tick_secs: u64, now_ms: i64) -> bool {
+pub fn table_due(
+    ident: &str,
+    schedule: &str,
+    jitter_secs: u64,
+    tick_secs: u64,
+    now_ms: i64,
+) -> bool {
     let cron = match Cron::from_str(schedule) {
         Ok(c) => c,
         Err(e) => {
@@ -1656,7 +1750,9 @@ pub fn table_due(ident: &str, schedule: &str, jitter_secs: u64, tick_secs: u64, 
     // yields zero jitter delay rather than bypassing the schedule check.
     let offset_secs = jitter_offset_secs(ident, jitter_secs);
     let adjusted_now_ms = now_ms - (offset_secs as i64) * 1000;
-    let Some(adjusted_now) = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(adjusted_now_ms) else {
+    let Some(adjusted_now) =
+        chrono::DateTime::<chrono::Utc>::from_timestamp_millis(adjusted_now_ms)
+    else {
         return false;
     };
 
@@ -1710,7 +1806,10 @@ mod tests {
     fn resolve_compaction_params_per_table_override_wins_min_input_files() {
         let cfg = default_compaction_cfg();
         let mut props = HashMap::new();
-        props.insert(COMPACTION_MIN_INPUT_FILES_PROPERTY.to_string(), "3".to_string());
+        props.insert(
+            COMPACTION_MIN_INPUT_FILES_PROPERTY.to_string(),
+            "3".to_string(),
+        );
         let params = resolve_compaction_params(&cfg, &props);
         assert_eq!(params.min_input_files, 3);
     }
@@ -1744,12 +1843,18 @@ mod tests {
             COMPACTION_TARGET_FILE_SIZE_BYTES_PROPERTY.to_string(),
             "2048".to_string(),
         );
-        props.insert(COMPACTION_MIN_INPUT_FILES_PROPERTY.to_string(), "7".to_string());
+        props.insert(
+            COMPACTION_MIN_INPUT_FILES_PROPERTY.to_string(),
+            "7".to_string(),
+        );
         props.insert(
             COMPACTION_DELETE_FILE_THRESHOLD_PROPERTY.to_string(),
             "4".to_string(),
         );
-        props.insert(COMPACTION_STRATEGY_PROPERTY.to_string(), "zorder".to_string());
+        props.insert(
+            COMPACTION_STRATEGY_PROPERTY.to_string(),
+            "zorder".to_string(),
+        );
         let params = resolve_compaction_params(&cfg, &props);
         assert_eq!(
             params,
@@ -1778,7 +1883,10 @@ mod tests {
     fn resolve_compaction_params_malformed_usize_falls_back_to_global() {
         let cfg = default_compaction_cfg();
         let mut props = HashMap::new();
-        props.insert(COMPACTION_MIN_INPUT_FILES_PROPERTY.to_string(), "-3".to_string());
+        props.insert(
+            COMPACTION_MIN_INPUT_FILES_PROPERTY.to_string(),
+            "-3".to_string(),
+        );
         let params = resolve_compaction_params(&cfg, &props);
         assert_eq!(params.min_input_files, cfg.min_input_files);
     }
@@ -1818,7 +1926,10 @@ mod tests {
 
     #[test]
     fn table_ref_from_ident_round_trips_ns_dot_table() {
-        let ident = TableIdent::new(iceberg::NamespaceIdent::new("ns".to_string()), "t".to_string());
+        let ident = TableIdent::new(
+            iceberg::NamespaceIdent::new("ns".to_string()),
+            "t".to_string(),
+        );
         let table_ref = table_ref_from_ident(&ident).expect("parses");
         assert_eq!(table_ref.namespace, "ns");
         assert_eq!(table_ref.name, "t");
@@ -1829,7 +1940,10 @@ mod tests {
     fn table_due_is_deterministic_for_same_inputs() {
         let a = table_due("ns.t1", "0 2 * * *", 900, 60, 1_700_000_000_000);
         let b = table_due("ns.t1", "0 2 * * *", 900, 60, 1_700_000_000_000);
-        assert_eq!(a, b, "same ident/schedule/jitter/tick/now must always agree");
+        assert_eq!(
+            a, b,
+            "same ident/schedule/jitter/tick/now must always agree"
+        );
     }
 
     #[test]
@@ -1849,7 +1963,13 @@ mod tests {
         // "never due", not "always due". This is the exact regression this
         // fix closes (Task 4 review).
         assert!(!table_due("ns.t1", "not a cron expression", 0, 60, 0));
-        assert!(!table_due("ns.t1", "not a cron expression", 0, 60, 123_456_789));
+        assert!(!table_due(
+            "ns.t1",
+            "not a cron expression",
+            0,
+            60,
+            123_456_789
+        ));
     }
 
     #[test]
@@ -1934,7 +2054,13 @@ mod tests {
         let effective_fire_ms = fire_ms + (offset_secs as i64) * 1000;
 
         assert!(
-            !table_due(ident, schedule, jitter_secs, tick_secs, effective_fire_ms - 1_000),
+            !table_due(
+                ident,
+                schedule,
+                jitter_secs,
+                tick_secs,
+                effective_fire_ms - 1_000
+            ),
             "table must not be due one second before its tick window opens"
         );
     }
@@ -2012,10 +2138,22 @@ mod tests {
     #[test]
     fn table_due_invalid_cron_is_skipped_not_panicked() {
         let now_ms = utc_ms(2026, 3, 5, 2, 0, 0);
-        assert!(!table_due("ns.bad_schedule", "not a cron expression", 900, 60, now_ms));
+        assert!(!table_due(
+            "ns.bad_schedule",
+            "not a cron expression",
+            900,
+            60,
+            now_ms
+        ));
         // Calling it again (exercising the warn-once dedup path) must still
         // just return false, never panic.
-        assert!(!table_due("ns.bad_schedule", "not a cron expression", 900, 60, now_ms));
+        assert!(!table_due(
+            "ns.bad_schedule",
+            "not a cron expression",
+            900,
+            60,
+            now_ms
+        ));
     }
 
     #[test]
@@ -2026,7 +2164,10 @@ mod tests {
     #[test]
     fn resolve_schedule_per_table_override_wins() {
         let mut props = HashMap::new();
-        props.insert(COMPACTION_SCHEDULE_PROPERTY.to_string(), "0 3 * * *".to_string());
+        props.insert(
+            COMPACTION_SCHEDULE_PROPERTY.to_string(),
+            "0 3 * * *".to_string(),
+        );
         assert_eq!(resolve_schedule("0 2 * * *", &props), "0 3 * * *");
     }
 
@@ -2047,7 +2188,10 @@ mod tests {
         let jitter_secs = 900;
         let tick_secs = 60;
         let mut props = HashMap::new();
-        props.insert(COMPACTION_SCHEDULE_PROPERTY.to_string(), "0 3 * * *".to_string());
+        props.insert(
+            COMPACTION_SCHEDULE_PROPERTY.to_string(),
+            "0 3 * * *".to_string(),
+        );
 
         let global_schedule = "0 2 * * *".to_string();
         let resolved = resolve_schedule(&global_schedule, &props);
@@ -2061,7 +2205,13 @@ mod tests {
             "resolved (per-table override) schedule must be due at its own 03:00 fire"
         );
         assert!(
-            !table_due(ident, &global_schedule, jitter_secs, tick_secs, override_fire_ms),
+            !table_due(
+                ident,
+                &global_schedule,
+                jitter_secs,
+                tick_secs,
+                override_fire_ms
+            ),
             "the unresolved global 02:00 schedule must not be due at the override's 03:00 fire"
         );
     }
@@ -2075,7 +2225,10 @@ mod tests {
             ),
             (
                 "ns.off".to_string(),
-                HashMap::from([(MAINTENANCE_ENABLED_PROPERTY.to_string(), "false".to_string())]),
+                HashMap::from([(
+                    MAINTENANCE_ENABLED_PROPERTY.to_string(),
+                    "false".to_string(),
+                )]),
             ),
             ("ns.missing".to_string(), HashMap::new()),
         ];

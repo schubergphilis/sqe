@@ -69,14 +69,10 @@ impl ExchangeDescriptor {
     pub fn stage_key(&self) -> (String, String) {
         match self {
             ExchangeDescriptor::HashPartition {
-                query_id,
-                stage_id,
-                ..
+                query_id, stage_id, ..
             } => (query_id.clone(), stage_id.clone()),
             ExchangeDescriptor::RangePartition {
-                query_id,
-                stage_id,
-                ..
+                query_id, stage_id, ..
             } => (query_id.clone(), stage_id.clone()),
         }
     }
@@ -139,11 +135,7 @@ impl AttemptGate {
         partition_id: u32,
         attempt_id: u32,
     ) -> bool {
-        let key = (
-            query_id.to_string(),
-            stage_id.to_string(),
-            partition_id,
-        );
+        let key = (query_id.to_string(), stage_id.to_string(), partition_id);
         let mut map = self.winners.lock().await;
         match map.get(&key).copied() {
             Some(winner) if attempt_id < winner => false,
@@ -156,17 +148,8 @@ impl AttemptGate {
     }
 
     /// Current winner for a partition, if any.
-    pub async fn winner(
-        &self,
-        query_id: &str,
-        stage_id: &str,
-        partition_id: u32,
-    ) -> Option<u32> {
-        let key = (
-            query_id.to_string(),
-            stage_id.to_string(),
-            partition_id,
-        );
+    pub async fn winner(&self, query_id: &str, stage_id: &str, partition_id: u32) -> Option<u32> {
+        let key = (query_id.to_string(), stage_id.to_string(), partition_id);
         self.winners.lock().await.get(&key).copied()
     }
 }
@@ -276,10 +259,7 @@ impl ShuffleReceiver {
     ///
     /// Returns `None` if the receiver was already taken or the partition doesn't exist.
     /// The returned stream decrements resident-byte accounting as batches are pulled.
-    pub async fn take_receiver(
-        &self,
-        partition_id: u32,
-    ) -> Option<TrackedPartitionReceiver> {
+    pub async fn take_receiver(&self, partition_id: u32) -> Option<TrackedPartitionReceiver> {
         let rx = self.receivers.lock().await.remove(&partition_id)?;
         Some(TrackedPartitionReceiver {
             inner: rx,
@@ -321,11 +301,11 @@ impl TrackedPartitionReceiver {
     pub async fn recv(&mut self) -> Option<RecordBatch> {
         let batch = self.inner.recv().await?;
         let bytes = batch.get_array_memory_size();
-        let _ = self.resident_bytes.fetch_update(
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-            |cur| Some(cur.saturating_sub(bytes)),
-        );
+        let _ = self
+            .resident_bytes
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                Some(cur.saturating_sub(bytes))
+            });
         if let Some(ref m) = self.metrics {
             m.shuffle_resident_bytes
                 .set(self.resident_bytes.load(Ordering::Relaxed) as f64);
@@ -364,12 +344,7 @@ impl ShuffleManager {
     }
 
     /// Register a new ShuffleReceiver for a (query_id, stage_id).
-    pub async fn register(
-        &self,
-        query_id: &str,
-        stage_id: &str,
-        receiver: Arc<ShuffleReceiver>,
-    ) {
+    pub async fn register(&self, query_id: &str, stage_id: &str, receiver: Arc<ShuffleReceiver>) {
         let key = (query_id.to_string(), stage_id.to_string());
         debug!(
             query_id = %query_id,
@@ -835,7 +810,12 @@ mod tests {
     fn test_hash_partitioner_4_partitions_distributes() {
         let batch = make_batch(
             (0..100).collect(),
-            (0..100).map(|i| format!("name_{i}")).collect::<Vec<_>>().iter().map(|s| s.as_str()).collect(),
+            (0..100)
+                .map(|i| format!("name_{i}"))
+                .collect::<Vec<_>>()
+                .iter()
+                .map(|s| s.as_str())
+                .collect(),
         );
 
         let partitioner = HashPartitioner::new(vec!["id".to_string()], 4);
@@ -928,10 +908,7 @@ mod tests {
         //   partition 0: key < 10        (strictly less than first boundary)
         //   partition 1: 10 <= key < 20  (between boundaries)
         //   partition 2: key >= 20       (at or above last boundary)
-        let batch = make_range_batch(
-            vec![5, 10, 15, 20, 25],
-            vec!["a", "b", "c", "d", "e"],
-        );
+        let batch = make_range_batch(vec![5, 10, 15, 20, 25], vec!["a", "b", "c", "d", "e"]);
 
         let partitioner = RangePartitioner::new("id".to_string(), vec![10, 20]);
         let result = partitioner.partition(&batch).unwrap();
@@ -939,11 +916,7 @@ mod tests {
         // Verify partitions
         let mut partition_map: HashMap<u32, Vec<i64>> = HashMap::new();
         for (pid, b) in &result {
-            let ids = b
-                .column(0)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .unwrap();
+            let ids = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
             let vals: Vec<i64> = (0..ids.len()).map(|i| ids.value(i)).collect();
             partition_map.insert(*pid, vals);
         }
@@ -1049,18 +1022,15 @@ mod tests {
     #[test]
     fn test_hash_partitioner_multi_column_key() {
         // Hash on both id and name columns
-        let batch = make_batch(
-            vec![1, 1, 2, 2],
-            vec!["a", "b", "a", "b"],
-        );
-        let partitioner = HashPartitioner::new(
-            vec!["id".to_string(), "name".to_string()],
-            4,
-        );
+        let batch = make_batch(vec![1, 1, 2, 2], vec!["a", "b", "a", "b"]);
+        let partitioner = HashPartitioner::new(vec!["id".to_string(), "name".to_string()], 4);
         let result = partitioner.partition(&batch).unwrap();
 
         let total_rows: usize = result.iter().map(|(_, b)| b.num_rows()).sum();
-        assert_eq!(total_rows, 4, "All rows accounted for with multi-column key");
+        assert_eq!(
+            total_rows, 4,
+            "All rows accounted for with multi-column key"
+        );
 
         // Rows with same (id, name) must land in same partition
         // (1, "a") and (2, "a") have different id, may differ
@@ -1178,7 +1148,10 @@ mod tests {
         for g in &groups {
             assert!(!g.is_empty());
             for (pid, _) in g {
-                assert!(seen.insert(*pid), "partition {pid} appears in multiple groups");
+                assert!(
+                    seen.insert(*pid),
+                    "partition {pid} appears in multiple groups"
+                );
             }
         }
         assert_eq!(seen.len(), flat.len());
@@ -1218,7 +1191,11 @@ mod tests {
         // Force assignments: use enough partitions that each row likely lands alone.
         let indices = vec![vec![0u32], vec![1u32], vec![]];
         let groups = group_partition_ids(&batch, &indices, 1);
-        assert_eq!(groups.len(), 2, "each non-empty partition should be its own group");
+        assert_eq!(
+            groups.len(),
+            2,
+            "each non-empty partition should be its own group"
+        );
         assert_eq!(groups[0], vec![0]);
         assert_eq!(groups[1], vec![1]);
     }

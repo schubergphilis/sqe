@@ -91,9 +91,6 @@ mod tests {
     #[test]
     fn relative_dir_layout() {
         let s = SpillScope::new("q1", "stage-a", "join", 3, 1);
-        assert_eq!(
-            s.relative_dir(),
-            PathBuf::from("q1/stage-a/join/p3/a1")
-        );
+        assert_eq!(s.relative_dir(), PathBuf::from("q1/stage-a/join/p3/a1"));
     }
 }

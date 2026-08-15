@@ -153,14 +153,14 @@ impl SegmentStore for LocalSegmentStore {
         sequence: u64,
         schema: SchemaRef,
     ) -> Result<Box<dyn SegmentWriter>> {
-        let _permit = self
-            .write_sem
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| BudgetError::Cancelled {
-                budget: "spill-write".into(),
-            })?;
+        let _permit =
+            self.write_sem
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|_| BudgetError::Cancelled {
+                    budget: "spill-write".into(),
+                })?;
         let dir = self.ensure_scope(scope).await?;
         let partial = dir.join(SpillSegment::partial_file_name(sequence));
         let final_path = dir.join(SpillSegment::segment_file_name(sequence));
@@ -190,9 +190,8 @@ impl SegmentStore for LocalSegmentStore {
                 path: partial.display().to_string(),
                 source: e,
             })?;
-        let ipc = StreamWriter::try_new(writer, &schema).map_err(|e| {
-            BudgetError::Config(format!("Arrow IPC writer init failed: {e}"))
-        })?;
+        let ipc = StreamWriter::try_new(writer, &schema)
+            .map_err(|e| BudgetError::Config(format!("Arrow IPC writer init failed: {e}")))?;
 
         Ok(Box::new(LocalSegmentWriter {
             scope: scope.clone(),
@@ -209,14 +208,14 @@ impl SegmentStore for LocalSegmentStore {
     }
 
     async fn open_reader(&self, segment: &SpillSegment) -> Result<Box<dyn SegmentReader>> {
-        let _permit = self
-            .read_sem
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| BudgetError::Cancelled {
-                budget: "spill-read".into(),
-            })?;
+        let _permit =
+            self.read_sem
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|_| BudgetError::Cancelled {
+                    budget: "spill-read".into(),
+                })?;
         if take_fault(SpillFault::CorruptOnRead) {
             return Err(BudgetError::SegmentCorrupt {
                 path: segment.path.display().to_string(),
@@ -272,11 +271,9 @@ impl SegmentStore for LocalSegmentStore {
         // The IPC stream starts after the 8-byte magic + 4-byte version header.
         let mut cursor = std::io::Cursor::new(body);
         cursor.set_position(12);
-        let ipc = StreamReader::try_new(cursor, None).map_err(|e| {
-            BudgetError::SegmentCorrupt {
-                path: path.display().to_string(),
-                reason: format!("IPC open: {e}"),
-            }
+        let ipc = StreamReader::try_new(cursor, None).map_err(|e| BudgetError::SegmentCorrupt {
+            path: path.display().to_string(),
+            reason: format!("IPC open: {e}"),
         })?;
         let schema = ipc.schema();
         // Schema fingerprint guard: a descriptor paired with a wrong-schema
@@ -408,10 +405,7 @@ impl SegmentWriter for LocalSegmentWriter {
         if take_fault(SpillFault::ShortWrite) {
             return Err(BudgetError::SpillIo {
                 path: self.partial_path.display().to_string(),
-                source: std::io::Error::new(
-                    std::io::ErrorKind::WriteZero,
-                    "injected short write",
-                ),
+                source: std::io::Error::new(std::io::ErrorKind::WriteZero, "injected short write"),
             });
         }
         let ipc = self
@@ -720,7 +714,10 @@ mod tests {
         let detail = err
             .err()
             .map_or_else(|| "Ok(reader)".to_string(), |e| format!("{e:?}"));
-        assert!(is_corrupt, "truncated segment must be rejected, got {detail}");
+        assert!(
+            is_corrupt,
+            "truncated segment must be rejected, got {detail}"
+        );
     }
 
     #[tokio::test]
@@ -828,7 +825,10 @@ mod tests {
             .await
             .unwrap();
         let err = w.write_batch(&batch(1)).await;
-        assert!(matches!(err, Err(BudgetError::SpillIo { .. })), "got {err:?}");
+        assert!(
+            matches!(err, Err(BudgetError::SpillIo { .. })),
+            "got {err:?}"
+        );
         // Abort path: no published segment file.
         let _ = w.abort().await;
         let final_path = scope

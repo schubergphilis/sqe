@@ -127,8 +127,7 @@ mod tests {
 
     #[test]
     fn join_with_two_three_part_identifiers_extracts_both() {
-        let stmt =
-            parse("SELECT * FROM cat_a.ns.t1 JOIN cat_b.ns.t2 ON t1.id = t2.id");
+        let stmt = parse("SELECT * FROM cat_a.ns.t1 JOIN cat_b.ns.t2 ON t1.id = t2.id");
         let mut got = extract_catalog_qualifiers(&stmt);
         got.sort();
         assert_eq!(got, vec!["cat_a".to_string(), "cat_b".to_string()]);
@@ -136,8 +135,7 @@ mod tests {
 
     #[test]
     fn duplicate_qualifiers_are_deduplicated() {
-        let stmt =
-            parse("SELECT * FROM cat.ns.t1 JOIN cat.ns.t2 ON t1.id = t2.id");
+        let stmt = parse("SELECT * FROM cat.ns.t1 JOIN cat.ns.t2 ON t1.id = t2.id");
         assert_eq!(extract_catalog_qualifiers(&stmt), vec!["cat".to_string()]);
     }
 
@@ -167,9 +165,7 @@ mod tests {
 
     #[test]
     fn cte_with_three_part_table_extracts_catalog() {
-        let stmt = parse(
-            "WITH x AS (SELECT * FROM cat.ns.t) SELECT * FROM x",
-        );
+        let stmt = parse("WITH x AS (SELECT * FROM cat.ns.t) SELECT * FROM x");
         assert_eq!(extract_catalog_qualifiers(&stmt), vec!["cat".to_string()]);
     }
 

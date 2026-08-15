@@ -92,8 +92,8 @@ use futures::TryStreamExt;
 use iceberg::spec::Schema as IcebergSchema;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg::{Catalog, ErrorKind, NamespaceIdent, TableCreation, TableIdent};
-use sqe_core::SecretStore;
 use sqe_coordinator::writer::{new_upload_tracker, parse_parquet_compression, write_data_files};
+use sqe_core::SecretStore;
 use sqe_sql::CatalogKind;
 use tempfile::TempDir;
 
@@ -101,9 +101,14 @@ use tempfile::TempDir;
 /// `maintenance_log_test.rs`'s harness.
 async fn sqlite_catalog(dir: &TempDir) -> Arc<dyn Catalog> {
     let location = dir.path().to_str().expect("tempdir path is UTF-8");
-    sqe_catalog::mount::build_catalog(location, CatalogKind::Sqlite, &BTreeMap::new(), &SecretStore::new())
-        .await
-        .expect("sqlite catalog builds")
+    sqe_catalog::mount::build_catalog(
+        location,
+        CatalogKind::Sqlite,
+        &BTreeMap::new(),
+        &SecretStore::new(),
+    )
+    .await
+    .expect("sqlite catalog builds")
 }
 
 /// Minimal state-table-shaped schema: one STRING column naming the claimant.
@@ -111,12 +116,20 @@ async fn sqlite_catalog(dir: &TempDir) -> Arc<dyn Catalog> {
 /// (`maintenance_log.rs`), but nothing about this spike depends on that
 /// shape -- only on whether a commit action conflicts.
 fn claim_arrow_schema() -> Arc<ArrowSchema> {
-    Arc::new(ArrowSchema::new(vec![Field::new("claim_owner", DataType::Utf8, false)]))
+    Arc::new(ArrowSchema::new(vec![Field::new(
+        "claim_owner",
+        DataType::Utf8,
+        false,
+    )]))
 }
 
 async fn create_claim_table(catalog: &Arc<dyn Catalog>, table_name: &str) -> TableIdent {
     let ns = NamespaceIdent::new("sqe_system".to_string());
-    if !catalog.namespace_exists(&ns).await.expect("namespace_exists check") {
+    if !catalog
+        .namespace_exists(&ns)
+        .await
+        .expect("namespace_exists check")
+    {
         catalog
             .create_namespace(&ns, HashMap::new())
             .await
@@ -124,8 +137,9 @@ async fn create_claim_table(catalog: &Arc<dyn Catalog>, table_name: &str) -> Tab
     }
 
     let arrow_schema = claim_arrow_schema();
-    let iceberg_schema: IcebergSchema = iceberg::arrow::arrow_schema_to_schema_auto_assign_ids(&arrow_schema)
-        .expect("arrow schema converts to iceberg schema");
+    let iceberg_schema: IcebergSchema =
+        iceberg::arrow::arrow_schema_to_schema_auto_assign_ids(&arrow_schema)
+            .expect("arrow schema converts to iceberg schema");
 
     let creation = TableCreation::builder()
         .name(table_name.to_string())
@@ -141,8 +155,11 @@ async fn create_claim_table(catalog: &Arc<dyn Catalog>, table_name: &str) -> Tab
 }
 
 fn claim_row(owner: &str) -> RecordBatch {
-    RecordBatch::try_new(claim_arrow_schema(), vec![Arc::new(StringArray::from(vec![owner]))])
-        .expect("build one-row claim batch")
+    RecordBatch::try_new(
+        claim_arrow_schema(),
+        vec![Arc::new(StringArray::from(vec![owner]))],
+    )
+    .expect("build one-row claim batch")
 }
 
 /// Write one claim row as a Parquet data file and return its `DataFile`
@@ -154,12 +171,19 @@ async fn write_claim_file(table: &iceberg::table::Table, owner: &str) -> iceberg
     let mut files = write_data_files(table, vec![batch], "lease-cas-spike", compression, tracker)
         .await
         .expect("write claim data file");
-    assert_eq!(files.len(), 1, "one-row batch must produce exactly one data file");
+    assert_eq!(
+        files.len(),
+        1,
+        "one-row batch must produce exactly one data file"
+    );
     files.remove(0)
 }
 
 async fn scan_owners(catalog: &Arc<dyn Catalog>, ident: &TableIdent) -> Vec<String> {
-    let table = catalog.load_table(ident).await.expect("reload table for scan");
+    let table = catalog
+        .load_table(ident)
+        .await
+        .expect("reload table for scan");
     let batches: Vec<_> = table
         .scan()
         .build()
@@ -174,7 +198,10 @@ async fn scan_owners(catalog: &Arc<dyn Catalog>, ident: &TableIdent) -> Vec<Stri
     let mut owners = Vec::new();
     for batch in &batches {
         if let Some(col) = batch.column_by_name("claim_owner") {
-            let arr = col.as_any().downcast_ref::<StringArray>().expect("claim_owner is Utf8");
+            let arr = col
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("claim_owner is Utf8");
             for i in 0..arr.len() {
                 owners.push(arr.value(i).to_string());
             }
@@ -195,8 +222,14 @@ async fn fast_append_claim_gives_no_exclusion_both_racers_land() {
     // Two independent `Table` handles loaded at the SAME base snapshot
     // (the table has no snapshot yet at this point -- both start from
     // "no current snapshot").
-    let table_a = catalog.load_table(&ident).await.expect("load table for racer A");
-    let table_b = catalog.load_table(&ident).await.expect("load table for racer B");
+    let table_a = catalog
+        .load_table(&ident)
+        .await
+        .expect("load table for racer A");
+    let table_b = catalog
+        .load_table(&ident)
+        .await
+        .expect("load table for racer B");
 
     let file_a = write_claim_file(&table_a, "coordinator-a").await;
     let file_b = write_claim_file(&table_b, "coordinator-b").await;
@@ -206,7 +239,10 @@ async fn fast_append_claim_gives_no_exclusion_both_racers_land() {
     let action_a = tx_a.fast_append().add_data_files(vec![file_a]);
     let tx_a = action_a.apply(tx_a).expect("apply fast_append for A");
     let result_a = tx_a.commit(catalog.as_ref()).await;
-    assert!(result_a.is_ok(), "racer A's fast_append must succeed, got: {result_a:?}");
+    assert!(
+        result_a.is_ok(),
+        "racer A's fast_append must succeed, got: {result_a:?}"
+    );
 
     // Racer B commits from its now-STALE base (built before A landed).
     // `Transaction::commit` reloads the table and rebuilds the fast_append
@@ -245,17 +281,31 @@ async fn rewrite_files_check_existence_claim_gives_hard_exclusion() {
 
     // Seed a "lease sentinel" row/file with a single fast_append. This is
     // the file both racers will race to delete-and-replace.
-    let seed_table = catalog.load_table(&ident).await.expect("load table to seed sentinel");
+    let seed_table = catalog
+        .load_table(&ident)
+        .await
+        .expect("load table to seed sentinel");
     let sentinel_file = write_claim_file(&seed_table, "unclaimed").await;
     let seed_tx = Transaction::new(&seed_table);
-    let seed_action = seed_tx.fast_append().add_data_files(vec![sentinel_file.clone()]);
+    let seed_action = seed_tx
+        .fast_append()
+        .add_data_files(vec![sentinel_file.clone()]);
     let seed_tx = seed_action.apply(seed_tx).expect("apply seed fast_append");
-    seed_tx.commit(catalog.as_ref()).await.expect("seed commit succeeds");
+    seed_tx
+        .commit(catalog.as_ref())
+        .await
+        .expect("seed commit succeeds");
 
     // Two independent `Table` handles loaded at the SAME base snapshot
     // (post-seed), simulating two coordinators racing to claim the lease.
-    let table_c = catalog.load_table(&ident).await.expect("load table for racer C");
-    let table_d = catalog.load_table(&ident).await.expect("load table for racer D");
+    let table_c = catalog
+        .load_table(&ident)
+        .await
+        .expect("load table for racer C");
+    let table_d = catalog
+        .load_table(&ident)
+        .await
+        .expect("load table for racer D");
 
     let claim_c = write_claim_file(&table_c, "coordinator-c").await;
     let claim_d = write_claim_file(&table_d, "coordinator-d").await;
@@ -269,7 +319,10 @@ async fn rewrite_files_check_existence_claim_gives_hard_exclusion() {
         .set_check_file_existence(true);
     let tx_c = action_c.apply(tx_c).expect("apply rewrite_files for C");
     let result_c = tx_c.commit(catalog.as_ref()).await;
-    assert!(result_c.is_ok(), "racer C must win the claim, got: {result_c:?}");
+    assert!(
+        result_c.is_ok(),
+        "racer C must win the claim, got: {result_c:?}"
+    );
 
     // Racer D races the SAME sentinel from its now-stale base. Its
     // `Transaction::commit` reloads to the fresh (post-C) table and rebuilds
@@ -284,7 +337,8 @@ async fn rewrite_files_check_existence_claim_gives_hard_exclusion() {
     let tx_d = action_d.apply(tx_d).expect("apply rewrite_files for D");
     let result_d = tx_d.commit(catalog.as_ref()).await;
 
-    let err = result_d.expect_err("racer D must lose the claim and get a hard conflict, not silently succeed");
+    let err = result_d
+        .expect_err("racer D must lose the claim and get a hard conflict, not silently succeed");
 
     // Classify the same way `write_handler::commit_with_retry` /
     // `is_conflict_message` would. This is the headline finding: it is
@@ -320,5 +374,9 @@ async fn rewrite_files_check_existence_claim_gives_hard_exclusion() {
     // Exactly one claim row landed: the sentinel was replaced by C's claim,
     // D's claim never made it in.
     let owners = scan_owners(&catalog, &ident).await;
-    assert_eq!(owners, vec!["coordinator-c".to_string()], "exactly one claimant must win: {owners:?}");
+    assert_eq!(
+        owners,
+        vec!["coordinator-c".to_string()],
+        "exactly one claimant must win: {owners:?}"
+    );
 }

@@ -55,7 +55,11 @@ pub struct GrantRevokeRequest {
 /// kind of local divergence adopting the profile exists to remove; the operator
 /// gets an error naming the level instead of a privately-invented grant.
 fn profile_privilege(object: GrantObjectKind, sql_priv: &str) -> String {
-    let canonical = sql_priv.split_whitespace().collect::<Vec<_>>().join(" ").to_uppercase();
+    let canonical = sql_priv
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_uppercase();
     if object == GrantObjectKind::View {
         return match canonical.as_str() {
             "SELECT" => "SELECT VIEW".to_string(),
@@ -246,11 +250,14 @@ fn is_all_privileges(privilege: &str) -> bool {
 /// resource-map injection, matching the Polaris backend's `validate_url_identifier`.
 fn validate_identifier(value: &str, what: &str) -> sqe_core::Result<()> {
     if value.is_empty() {
-        return Err(sqe_core::SqeError::Execution(format!("{what} must not be empty")));
+        return Err(sqe_core::SqeError::Execution(format!(
+            "{what} must not be empty"
+        )));
     }
-    if let Some(bad) = value.chars().find(|c| {
-        matches!(c, '/' | '?' | '#' | '%' | '\\') || c.is_whitespace() || c.is_control()
-    }) {
+    if let Some(bad) = value
+        .chars()
+        .find(|c| matches!(c, '/' | '?' | '#' | '%' | '\\') || c.is_whitespace() || c.is_control())
+    {
         return Err(sqe_core::SqeError::Execution(format!(
             "{what} '{value}' contains invalid character {bad:?}"
         )));
@@ -644,12 +651,14 @@ impl RangerGrantBackend {
 
     async fn post_policy(&self, body: &serde_json::Value) -> sqe_core::Result<()> {
         let url = format!("{}/service/public/v2/api/policy", self.admin_url);
-        self.send_policy(self.client.post(&url), body, "create").await
+        self.send_policy(self.client.post(&url), body, "create")
+            .await
     }
 
     async fn put_policy(&self, id: i64, body: &serde_json::Value) -> sqe_core::Result<()> {
         let url = format!("{}/service/public/v2/api/policy/{id}", self.admin_url);
-        self.send_policy(self.client.put(&url), body, "update").await
+        self.send_policy(self.client.put(&url), body, "update")
+            .await
     }
 
     async fn send_policy(
@@ -690,7 +699,8 @@ impl RangerGrantBackend {
         privilege: &str,
         body: &GrantRevokeRequest,
     ) -> sqe_core::Result<()> {
-        self.post_grant_revoke_inner(op, Some(privilege), body).await
+        self.post_grant_revoke_inner(op, Some(privilege), body)
+            .await
     }
 
     /// Apply a grant or revoke through Ranger's AUTHENTICATED policy API.
@@ -760,7 +770,10 @@ impl RangerGrantBackend {
             }
             (_, Some(mut policy)) => {
                 let want = item_grantees(&build_allow_item(body));
-                let items = match policy.get_mut("policyItems").and_then(serde_json::Value::as_array_mut) {
+                let items = match policy
+                    .get_mut("policyItems")
+                    .and_then(serde_json::Value::as_array_mut)
+                {
                     Some(items) => items,
                     None => {
                         policy["policyItems"] = serde_json::json!([]);
@@ -784,11 +797,10 @@ impl RangerGrantBackend {
                                 have.push(t.clone());
                             }
                         }
-                        item["accesses"] = serde_json::json!(
-                            have.iter()
-                                .map(|t| serde_json::json!({"type": t, "isAllowed": true}))
-                                .collect::<Vec<_>>()
-                        );
+                        item["accesses"] = serde_json::json!(have
+                            .iter()
+                            .map(|t| serde_json::json!({"type": t, "isAllowed": true}))
+                            .collect::<Vec<_>>());
                         if body.delegate_admin {
                             item["delegateAdmin"] = serde_json::json!(true);
                         }
@@ -801,11 +813,10 @@ impl RangerGrantBackend {
                             .into_iter()
                             .filter(|t| !body.access_types.contains(t))
                             .collect();
-                        item["accesses"] = serde_json::json!(
-                            keep.iter()
-                                .map(|t| serde_json::json!({"type": t, "isAllowed": true}))
-                                .collect::<Vec<_>>()
-                        );
+                        item["accesses"] = serde_json::json!(keep
+                            .iter()
+                            .map(|t| serde_json::json!({"type": t, "isAllowed": true}))
+                            .collect::<Vec<_>>());
                     }
                     None if op == "grant" => items.push(build_allow_item(body)),
                     // revoke with no item for this grantee: already absent.
@@ -883,7 +894,9 @@ impl RangerGrantBackend {
             .json(body)
             .send()
             .await
-            .map_err(|e| sqe_core::SqeError::Execution(format!("Ranger {op} request failed: {e}")))?;
+            .map_err(|e| {
+                sqe_core::SqeError::Execution(format!("Ranger {op} request failed: {e}"))
+            })?;
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
@@ -1250,10 +1263,7 @@ fn grantor_label(grantee: &Grantee, grantor: &str) -> String {
         Grantee::User(_) => "USER",
         Grantee::Role(_) | Grantee::Group(_) => "ROLE",
     };
-    format!(
-        "{GRANTOR_LABEL_PREFIX}:{kind}:{}:{grantor}",
-        grantee.name()
-    )
+    format!("{GRANTOR_LABEL_PREFIX}:{kind}:{}:{grantor}", grantee.name())
 }
 
 /// `(grantee_kind, grantee_name, grantor)` from a grantor label.
@@ -1377,9 +1387,9 @@ impl RangerGrantBackend {
                 "Ranger role fetch failed (HTTP {status})"
             )));
         }
-        resp.json().await.map_err(|e| {
-            sqe_core::SqeError::Execution(format!("Ranger role parse failed: {e}"))
-        })
+        resp.json()
+            .await
+            .map_err(|e| sqe_core::SqeError::Execution(format!("Ranger role parse failed: {e}")))
     }
 
     /// Record on the policy covering `resource` that this grant happened.
@@ -1409,7 +1419,11 @@ impl RangerGrantBackend {
         let mut labels: Vec<String> = policy
             .get("policyLabels")
             .and_then(serde_json::Value::as_array)
-            .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
             .unwrap_or_default();
         if labels.iter().any(|l| l.as_str() == label) {
             return; // idempotent: re-granting must not stack labels
@@ -1446,7 +1460,10 @@ impl RangerGrantBackend {
             .collect();
         // The identifiers come back out of the resource map so this does not need
         // them threaded in: they are exactly what the plan put there.
-        let catalog = resource.get("catalog").map(String::as_str).unwrap_or_default();
+        let catalog = resource
+            .get("catalog")
+            .map(String::as_str)
+            .unwrap_or_default();
         let namespace = resource.get("namespace").map(String::as_str);
         let table = resource.get("table").map(String::as_str);
 
@@ -1527,7 +1544,10 @@ impl RangerGrantBackend {
                 .get(field)
                 .and_then(serde_json::Value::as_array)
                 .is_some_and(|names| {
-                    names.iter().filter_map(serde_json::Value::as_str).any(|n| n == name)
+                    names
+                        .iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .any(|n| n == name)
                 });
             if !is_theirs {
                 continue;
@@ -1561,7 +1581,10 @@ impl RangerGrantBackend {
         let Ok(Some(mut policy)) = self.policy_by_resource(resource).await else {
             return;
         };
-        let Some(labels) = policy.get("policyLabels").and_then(serde_json::Value::as_array) else {
+        let Some(labels) = policy
+            .get("policyLabels")
+            .and_then(serde_json::Value::as_array)
+        else {
             return;
         };
         let name = grantee.name();
@@ -1610,7 +1633,9 @@ impl RangerGrantBackend {
             Grantee::Group(_) => "groups",
         };
         let name = grantee.name();
-        let Some(items) = policy.get("denyPolicyItems").and_then(serde_json::Value::as_array)
+        let Some(items) = policy
+            .get("denyPolicyItems")
+            .and_then(serde_json::Value::as_array)
         else {
             return Ok(());
         };
@@ -1622,7 +1647,10 @@ impl RangerGrantBackend {
                 .get(field)
                 .and_then(serde_json::Value::as_array)
                 .map(|a| {
-                    a.iter().filter_map(serde_json::Value::as_str).map(str::to_string).collect()
+                    a.iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .map(str::to_string)
+                        .collect()
                 })
                 .unwrap_or_default();
             if !names.iter().any(|n| n == name) {
@@ -1692,8 +1720,11 @@ impl RangerGrantBackend {
         if held.is_empty() {
             // Nothing allowed here. Still clear provenance and any DENY, so the
             // statement is idempotent and a denial cannot outlive the grant.
-            self.remove_all_grant_labels(&body.resource, &stmt.grantee).await;
-            return self.remove_all_deny_items(&body.resource, &stmt.grantee).await;
+            self.remove_all_grant_labels(&body.resource, &stmt.grantee)
+                .await;
+            return self
+                .remove_all_deny_items(&body.resource, &stmt.grantee)
+                .await;
         }
         debug!(
             grantee = %stmt.grantee.name(),
@@ -1703,8 +1734,10 @@ impl RangerGrantBackend {
         body.access_types = held;
         self.post_grant_revoke_with_privilege("revoke", "ALL PRIVILEGES", &body)
             .await?;
-        self.remove_all_grant_labels(&body.resource, &stmt.grantee).await;
-        self.remove_all_deny_items(&body.resource, &stmt.grantee).await
+        self.remove_all_grant_labels(&body.resource, &stmt.grantee)
+            .await;
+        self.remove_all_deny_items(&body.resource, &stmt.grantee)
+            .await
     }
 
     async fn remove_grant_label(
@@ -1718,7 +1751,10 @@ impl RangerGrantBackend {
         let Ok(Some(mut policy)) = self.policy_by_resource(resource).await else {
             return;
         };
-        let Some(labels) = policy.get("policyLabels").and_then(serde_json::Value::as_array) else {
+        let Some(labels) = policy
+            .get("policyLabels")
+            .and_then(serde_json::Value::as_array)
+        else {
             return;
         };
         let kept: Vec<String> = labels
@@ -1810,7 +1846,9 @@ impl RangerGrantBackend {
             );
         }
         for &i in targets.iter().take(PROVENANCE_DETAIL_LIMIT) {
-            let Some(name) = policies[i].name.clone() else { continue };
+            let Some(name) = policies[i].name.clone() else {
+                continue;
+            };
             if let Some(detail) = self.fetch_policy_provenance(&name).await {
                 policies[i].created_by = detail.created_by;
                 policies[i].create_time = detail.create_time;
@@ -1832,7 +1870,9 @@ impl RangerGrantBackend {
             .basic_auth(&self.admin_user, Some(&self.admin_password))
             .send()
             .await
-            .map_err(|e| sqe_core::SqeError::Execution(format!("Ranger policy fetch failed: {e}")))?;
+            .map_err(|e| {
+                sqe_core::SqeError::Execution(format!("Ranger policy fetch failed: {e}"))
+            })?;
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -1842,9 +1882,9 @@ impl RangerGrantBackend {
                 "Ranger policy fetch failed (HTTP {status})"
             )));
         }
-        resp.json().await.map_err(|e| {
-            sqe_core::SqeError::Execution(format!("Ranger policy parse failed: {e}"))
-        })
+        resp.json()
+            .await
+            .map_err(|e| sqe_core::SqeError::Execution(format!("Ranger policy parse failed: {e}")))
     }
 }
 
@@ -1868,21 +1908,34 @@ pub fn evaluate_access(
         e.privilege == access_type && e.resource == resource && principal_matches(e)
     };
 
-    if entries.iter().filter(|e| e.effect == "DENY").any(|e| relevant(&e)) {
+    if entries
+        .iter()
+        .filter(|e| e.effect == "DENY")
+        .any(|e| relevant(&e))
+    {
         return AccessCheckResult {
             allowed: false,
             reason: Some(format!("Denied by a DENY policy on {resource}")),
         };
     }
-    if let Some(e) = entries.iter().filter(|e| e.effect == "ALLOW").find(|e| relevant(e)) {
+    if let Some(e) = entries
+        .iter()
+        .filter(|e| e.effect == "ALLOW")
+        .find(|e| relevant(e))
+    {
         return AccessCheckResult {
             allowed: true,
-            reason: Some(format!("Allowed via {} '{}'", e.grantee_type, e.grantee_name)),
+            reason: Some(format!(
+                "Allowed via {} '{}'",
+                e.grantee_type, e.grantee_name
+            )),
         };
     }
     AccessCheckResult {
         allowed: false,
-        reason: Some(format!("No matching grant for {user} {access_type} on {resource}")),
+        reason: Some(format!(
+            "No matching grant for {user} {access_type} on {resource}"
+        )),
     }
 }
 
@@ -1926,7 +1979,10 @@ impl GrantBackend for RangerGrantBackend {
             // Never skip the level the statement NAMES: that one may add access
             // types, or delegate admin, to what is already there.
             if !is_primary {
-                if let Some(held) = self.held_access_types_at(&body.resource, &stmt.grantee).await {
+                if let Some(held) = self
+                    .held_access_types_at(&body.resource, &stmt.grantee)
+                    .await
+                {
                     if body.access_types.iter().all(|a| held.contains(a)) {
                         debug!(
                             level = level_name(&body.resource),
@@ -2017,11 +2073,8 @@ impl GrantBackend for RangerGrantBackend {
                 // Who issued it, so SHOW GRANTS can still answer that after the
                 // move to the policy API. Best-effort, exactly like the label
                 // above: the grant itself already succeeded.
-                self.add_policy_label(
-                    &body.resource,
-                    &grantor_label(&stmt.grantee, &body.grantor),
-                )
-                .await;
+                self.add_policy_label(&body.resource, &grantor_label(&stmt.grantee, &body.grantor))
+                    .await;
             }
             written.push(body);
         }
@@ -2071,8 +2124,13 @@ impl GrantBackend for RangerGrantBackend {
                 // Everything this privilege confers is also owed to another one.
                 // Drop only the provenance, so a later revoke of that other
                 // privilege releases the access types.
-                self.remove_grant_label(&body.resource, &stmt.grantee, stmt.object, &stmt.privilege)
-                    .await;
+                self.remove_grant_label(
+                    &body.resource,
+                    &stmt.grantee,
+                    stmt.object,
+                    &stmt.privilege,
+                )
+                .await;
                 return self.remove_deny_items(stmt).await;
             }
         }
@@ -2208,11 +2266,21 @@ impl GrantBackend for RangerGrantBackend {
         // carries that policy's resource, so filtering at policy level here is
         // equivalent to the entry-level filter applied below.
         let prefix = match filter {
-            GrantFilter::OnResource { catalog, namespace, table } => {
+            GrantFilter::OnResource {
+                catalog,
+                namespace,
+                table,
+            } => {
                 let mut parts = Vec::new();
-                if let Some(c) = catalog { parts.push(c.clone()); }
-                if let Some(n) = namespace { parts.push(n.clone()); }
-                if let Some(t) = table { parts.push(t.clone()); }
+                if let Some(c) = catalog {
+                    parts.push(c.clone());
+                }
+                if let Some(n) = namespace {
+                    parts.push(n.clone());
+                }
+                if let Some(t) = table {
+                    parts.push(t.clone());
+                }
                 Some(parts.join("."))
             }
             GrantFilter::ToGrantee(_) => None,
@@ -2233,9 +2301,10 @@ impl GrantBackend for RangerGrantBackend {
 
         let all = policies_to_entries(&policies);
         let filtered = match filter {
-            GrantFilter::ToGrantee(g) => {
-                all.into_iter().filter(|e| entry_matches_grantee(e, g)).collect()
-            }
+            GrantFilter::ToGrantee(g) => all
+                .into_iter()
+                .filter(|e| entry_matches_grantee(e, g))
+                .collect(),
             GrantFilter::OnResource { .. } => {
                 let prefix = prefix.unwrap_or_default();
                 all.into_iter()
@@ -2286,8 +2355,12 @@ impl GrantBackend for RangerGrantBackend {
             .map(String::as_str)
             .unwrap_or("");
         let mut parts = vec![catalog.to_string()];
-        if let Some(n) = &check.namespace { parts.push(n.clone()); }
-        if let Some(t) = &check.table { parts.push(t.clone()); }
+        if let Some(n) = &check.namespace {
+            parts.push(n.clone());
+        }
+        if let Some(t) = &check.table {
+            parts.push(t.clone());
+        }
         let resource = parts.join(".");
 
         let policies = self.fetch_policies().await?;
@@ -2311,8 +2384,7 @@ impl GrantBackend for RangerGrantBackend {
             Err(e) => {
                 warn!(error = %e, user = %check.user,
                       "Ranger role lookup failed; CHECK ACCESS sees direct user grants only");
-                let mut result =
-                    evaluate_access(&entries, &check.user, &[], primary, &resource);
+                let mut result = evaluate_access(&entries, &check.user, &[], primary, &resource);
                 if !result.allowed {
                     result.reason = Some(format!(
                         "No matching direct grant for {} {} on {}. Role membership \
@@ -2325,7 +2397,13 @@ impl GrantBackend for RangerGrantBackend {
             }
         };
 
-        Ok(evaluate_access(&entries, &check.user, &roles, primary, &resource))
+        Ok(evaluate_access(
+            &entries,
+            &check.user,
+            &roles,
+            primary,
+            &resource,
+        ))
     }
 
     fn backend_name(&self) -> &str {
@@ -2480,15 +2558,31 @@ mod tests {
     fn build_grant_revoke_select_to_role() {
         let b = test_backend();
         let body = b
-            .build_grant_revoke("SELECT", Some("wh"), Some("sales"), Some("orders"),
-                &Grantee::Role("analyst".into()))
+            .build_grant_revoke(
+                "SELECT",
+                Some("wh"),
+                Some("sales"),
+                Some("orders"),
+                &Grantee::Role("analyst".into()),
+            )
             .unwrap();
-        assert_eq!(body.access_types.first().map(String::as_str), Some("table-data-read"));
-        assert!(body.access_types.contains(&"table-properties-read".to_string()));
+        assert_eq!(
+            body.access_types.first().map(String::as_str),
+            Some("table-data-read")
+        );
+        assert!(body
+            .access_types
+            .contains(&"table-properties-read".to_string()));
         assert_eq!(body.roles, vec!["analyst".to_string()]);
         assert!(body.users.is_empty());
-        assert_eq!(body.resource.get("table").map(String::as_str), Some("orders"));
-        assert_eq!(body.resource.get("root").map(String::as_str), Some("POLARIS"));
+        assert_eq!(
+            body.resource.get("table").map(String::as_str),
+            Some("orders")
+        );
+        assert_eq!(
+            body.resource.get("root").map(String::as_str),
+            Some("POLARIS")
+        );
     }
 
     /// The grantor field is the AUTHORITY check, not decoration.
@@ -2534,7 +2628,10 @@ mod tests {
                 {"type": "table-data-read", "isAllowed": true}
             ]
         });
-        assert_ne!(fresh, stored, "byte equality must not hold, else the test is moot");
+        assert_ne!(
+            fresh, stored,
+            "byte equality must not hold, else the test is moot"
+        );
         assert!(
             deny_items_equivalent(&fresh, &stored),
             "normalisation and access-type order must not defeat dedup"
@@ -2544,13 +2641,19 @@ mod tests {
             "roles": ["engineer"],
             "accesses": [{"type": "table-data-read", "isAllowed": true}]
         });
-        assert!(!deny_items_equivalent(&fresh, &other_role), "a different grantee is a different item");
+        assert!(
+            !deny_items_equivalent(&fresh, &other_role),
+            "a different grantee is a different item"
+        );
 
         let fewer = serde_json::json!({
             "roles": ["analyst"],
             "accesses": [{"type": "table-data-read", "isAllowed": true}]
         });
-        assert!(!deny_items_equivalent(&fresh, &fewer), "a different access set is a different item");
+        assert!(
+            !deny_items_equivalent(&fresh, &fewer),
+            "a different access set is a different item"
+        );
     }
 
     #[test]
@@ -2581,7 +2684,10 @@ mod tests {
         assert_eq!(cat.access_types, vec!["namespace-list".to_string()]);
 
         let ns = &plan[1];
-        assert_eq!(ns.resource.get("namespace").map(String::as_str), Some("sales"));
+        assert_eq!(
+            ns.resource.get("namespace").map(String::as_str),
+            Some("sales")
+        );
         assert_eq!(ns.resource.get("table"), None);
         // v4's expansion, not just the seed: `namespace-properties-read` implies
         // `namespace-list`, so the namespace policy carries both. Scoped to THIS
@@ -2596,7 +2702,10 @@ mod tests {
         );
 
         let tbl = &plan[2];
-        assert_eq!(tbl.resource.get("table").map(String::as_str), Some("orders"));
+        assert_eq!(
+            tbl.resource.get("table").map(String::as_str),
+            Some("orders")
+        );
         assert!(tbl.access_types.contains(&"table-data-read".to_string()));
     }
     #[test]
@@ -2615,8 +2724,14 @@ mod tests {
         // `grant()` sets delegate_admin on the primary from WITH GRANT OPTION and
         // leaves the ancestor alone, so the ancestor must be built false: the
         // grantee must not gain authority to re-grant namespace visibility.
-        assert!(!plan[0].delegate_admin, "catalog discovery must not be re-grantable");
-        assert!(!plan[1].delegate_admin, "namespace visibility must not be re-grantable");
+        assert!(
+            !plan[0].delegate_admin,
+            "catalog discovery must not be re-grantable"
+        );
+        assert!(
+            !plan[1].delegate_admin,
+            "namespace visibility must not be re-grantable"
+        );
         assert_eq!(plan.len(), 3);
     }
 
@@ -2625,11 +2740,25 @@ mod tests {
         let b = test_backend();
         // v4 gives catalog discovery to everything that reaches INTO a catalog,
         // including namespace-level privileges, so these are two-level plans.
-        for (priv_, ns, tbl) in [("USAGE", Some("sales"), None), ("CREATE TABLE", Some("sales"), None)] {
+        for (priv_, ns, tbl) in [
+            ("USAGE", Some("sales"), None),
+            ("CREATE TABLE", Some("sales"), None),
+        ] {
             let plan = b
-                .build_grant_plan(priv_, GrantObjectKind::Table, Some("wh"), ns, tbl, &Grantee::User("dave".into()))
+                .build_grant_plan(
+                    priv_,
+                    GrantObjectKind::Table,
+                    Some("wh"),
+                    ns,
+                    tbl,
+                    &Grantee::User("dave".into()),
+                )
                 .unwrap_or_else(|e| panic!("build plan for {priv_}: {e}"));
-            assert_eq!(plan.len(), 2, "{priv_}: catalog discovery plus its own level");
+            assert_eq!(
+                plan.len(),
+                2,
+                "{priv_}: catalog discovery plus its own level"
+            );
             assert_eq!(plan[0].access_types, vec!["namespace-list".to_string()]);
             assert_eq!(plan[0].resource.get("namespace"), None);
         }
@@ -2637,7 +2766,14 @@ mod tests {
         // catalog-content-manage, so there is nothing above them to add.
         for priv_ in ["ALL PRIVILEGES", "CREATE SCHEMA"] {
             let plan = b
-                .build_grant_plan(priv_, GrantObjectKind::Table, Some("wh"), None, None, &Grantee::User("dave".into()))
+                .build_grant_plan(
+                    priv_,
+                    GrantObjectKind::Table,
+                    Some("wh"),
+                    None,
+                    None,
+                    &Grantee::User("dave".into()),
+                )
                 .unwrap_or_else(|e| panic!("build plan for {priv_}: {e}"));
             assert_eq!(plan.len(), 1, "{priv_} binds at the catalog level already");
         }
@@ -2660,7 +2796,10 @@ mod tests {
             )
             .expect("build plan");
         assert_eq!(plan.len(), 3);
-        assert_eq!(plan[1].resource.get("namespace").map(String::as_str), Some("sales"));
+        assert_eq!(
+            plan[1].resource.get("namespace").map(String::as_str),
+            Some("sales")
+        );
         assert_eq!(plan[1].resource.get("table"), None);
         assert_eq!(plan[2].resource.get("table").map(String::as_str), Some("*"));
     }
@@ -2695,10 +2834,7 @@ mod tests {
         // table in the namespace, so a DENY on one table would lock the grantee
         // out of all of them.
         let src = include_str!("ranger.rs");
-        let deny_body = src
-            .split("async fn deny(")
-            .nth(1)
-            .expect("deny() present");
+        let deny_body = src.split("async fn deny(").nth(1).expect("deny() present");
         let deny_body = &deny_body[..deny_body.find("\n    }").unwrap_or(deny_body.len())];
         // Guard against a vacuous extraction: if the slice above ever stops
         // finding the real body, the two negative assertions below would pass on
@@ -2736,7 +2872,9 @@ mod tests {
             Some("v_orders"),
             "the view name goes in the table slot; there is no view resource level"
         );
-        assert!(body.access_types.contains(&"view-properties-read".to_string()));
+        assert!(body
+            .access_types
+            .contains(&"view-properties-read".to_string()));
         assert!(body.access_types.contains(&"view-list".to_string()));
         assert!(
             !body.access_types.contains(&"table-data-read".to_string()),
@@ -2756,7 +2894,9 @@ mod tests {
             )
             .expect("build table grant");
         assert!(tbl.access_types.contains(&"table-data-read".to_string()));
-        assert!(!tbl.access_types.contains(&"view-properties-read".to_string()));
+        assert!(!tbl
+            .access_types
+            .contains(&"view-properties-read".to_string()));
     }
 
     #[test]
@@ -2799,7 +2939,9 @@ mod tests {
                 &Grantee::User("alice".into()),
             )
             .expect("ALL against the catalog itself is a legitimate grant");
-        assert!(ok.access_types.contains(&"catalog-content-manage".to_string()));
+        assert!(ok
+            .access_types
+            .contains(&"catalog-content-manage".to_string()));
         assert!(!ok.resource.contains_key("namespace"));
     }
 
@@ -2933,7 +3075,13 @@ mod tests {
     fn build_grant_revoke_rejects_bad_identifier() {
         let b = test_backend();
         let err = b
-            .build_grant_revoke("SELECT", Some("wh/../x"), None, None, &Grantee::User("a".into()))
+            .build_grant_revoke(
+                "SELECT",
+                Some("wh/../x"),
+                None,
+                None,
+                &Grantee::User("a".into()),
+            )
             .unwrap_err();
         assert!(matches!(err, sqe_core::SqeError::Execution(_)));
     }
@@ -3127,7 +3275,10 @@ mod tests {
             format_grant_time(1786526606039).as_deref(),
             Some("2026-08-12T09:23:26Z")
         );
-        assert_eq!(format_grant_time(0).as_deref(), Some("1970-01-01T00:00:00Z"));
+        assert_eq!(
+            format_grant_time(0).as_deref(),
+            Some("1970-01-01T00:00:00Z")
+        );
     }
 
     /// An unrepresentable instant must leave the column empty. An audit column that
@@ -3224,11 +3375,15 @@ mod tests {
 
     #[test]
     fn check_match_allows_when_user_has_access() {
-        let entries = vec![
-            GrantEntry { privilege: "table-data-read".into(), resource: "wh.sales.orders".into(),
-                grantee_type: "USER".into(), grantee_name: "alice".into(), effect: "ALLOW".into(),
-                granted_by: None, granted_at: None },
-        ];
+        let entries = vec![GrantEntry {
+            privilege: "table-data-read".into(),
+            resource: "wh.sales.orders".into(),
+            grantee_type: "USER".into(),
+            grantee_name: "alice".into(),
+            effect: "ALLOW".into(),
+            granted_by: None,
+            granted_at: None,
+        }];
         let r = evaluate_access(&entries, "alice", &[], "table-data-read", "wh.sales.orders");
         assert!(r.allowed);
     }
@@ -3236,16 +3391,39 @@ mod tests {
     #[test]
     fn check_match_deny_overrides_allow() {
         let entries = vec![
-            GrantEntry { privilege: "table-data-read".into(), resource: "wh.sales.orders".into(),
-                grantee_type: "ROLE".into(), grantee_name: "analyst".into(), effect: "ALLOW".into(),
-                granted_by: None, granted_at: None },
-            GrantEntry { privilege: "table-data-read".into(), resource: "wh.sales.orders".into(),
-                grantee_type: "USER".into(), grantee_name: "alice".into(), effect: "DENY".into(),
-                granted_by: None, granted_at: None },
+            GrantEntry {
+                privilege: "table-data-read".into(),
+                resource: "wh.sales.orders".into(),
+                grantee_type: "ROLE".into(),
+                grantee_name: "analyst".into(),
+                effect: "ALLOW".into(),
+                granted_by: None,
+                granted_at: None,
+            },
+            GrantEntry {
+                privilege: "table-data-read".into(),
+                resource: "wh.sales.orders".into(),
+                grantee_type: "USER".into(),
+                grantee_name: "alice".into(),
+                effect: "DENY".into(),
+                granted_by: None,
+                granted_at: None,
+            },
         ];
-        let r = evaluate_access(&entries, "alice", &["analyst".into()], "table-data-read", "wh.sales.orders");
+        let r = evaluate_access(
+            &entries,
+            "alice",
+            &["analyst".into()],
+            "table-data-read",
+            "wh.sales.orders",
+        );
         assert!(!r.allowed);
-        assert!(r.reason.as_deref().unwrap_or("").to_lowercase().contains("deny"));
+        assert!(r
+            .reason
+            .as_deref()
+            .unwrap_or("")
+            .to_lowercase()
+            .contains("deny"));
     }
 
     #[test]
@@ -3342,11 +3520,11 @@ mod tests {
         // hold back access types the grantee is not owed, which reads as a
         // successful revoke that did nothing.
         for bad in [
-            "chm:USER:dave",           // no privilege
-            "chm:WIZARD:dave:SELECT",  // unknown grantee kind
-            "other:USER:dave:SELECT",  // not ours
-            "sqe:USER::SELECT",        // empty name
-            "sqe:USER:dave:",          // empty privilege
+            "chm:USER:dave",          // no privilege
+            "chm:WIZARD:dave:SELECT", // unknown grantee kind
+            "other:USER:dave:SELECT", // not ours
+            "sqe:USER::SELECT",       // empty name
+            "sqe:USER:dave:",         // empty privilege
             "",
         ] {
             assert!(
@@ -3416,10 +3594,7 @@ mod tests {
         // Ranger does not stop an operator creating a cycle. A naive walk would
         // spin forever and hang the CHECK ACCESS request rather than answer it,
         // which is a worse failure than a wrong answer.
-        let roles = vec![
-            role("a", &["alice"], &["b"]),
-            role("b", &[], &["a"]),
-        ];
+        let roles = vec![role("a", &["alice"], &["b"]), role("b", &[], &["a"])];
         let held = roles_for_user(&roles, "alice");
         assert_eq!(held, vec!["a", "b"]);
     }
@@ -3440,8 +3615,17 @@ mod tests {
         let roles = vec![role("analyst", &["alice"], &[])];
 
         let held = roles_for_user(&roles, "alice");
-        let r = evaluate_access(&entries, "alice", &held, "table-data-read", "wh.sales.orders");
-        assert!(r.allowed, "alice holds analyst, and analyst holds the grant");
+        let r = evaluate_access(
+            &entries,
+            "alice",
+            &held,
+            "table-data-read",
+            "wh.sales.orders",
+        );
+        assert!(
+            r.allowed,
+            "alice holds analyst, and analyst holds the grant"
+        );
         assert!(
             r.reason.as_deref().unwrap_or("").contains("analyst"),
             "the reason should name the role the access came through: {:?}",
@@ -3450,6 +3634,15 @@ mod tests {
 
         // The negative control: a user in no role still gets no.
         let none = roles_for_user(&roles, "dave");
-        assert!(!evaluate_access(&entries, "dave", &none, "table-data-read", "wh.sales.orders").allowed);
+        assert!(
+            !evaluate_access(
+                &entries,
+                "dave",
+                &none,
+                "table-data-read",
+                "wh.sales.orders"
+            )
+            .allowed
+        );
     }
 }

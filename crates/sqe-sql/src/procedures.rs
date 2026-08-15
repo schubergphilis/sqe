@@ -218,10 +218,7 @@ impl ProcedureCall {
     pub fn target_label(&self) -> String {
         match self {
             ProcedureCall::PurgeOrphanLocations { namespace, .. } => namespace.as_string(),
-            _ => self
-                .table()
-                .map(|t| t.as_string())
-                .unwrap_or_default(),
+            _ => self.table().map(|t| t.as_string()).unwrap_or_default(),
         }
     }
 }
@@ -414,9 +411,9 @@ fn expect_i64(expr: &Expr, field: &str) -> sqe_core::Result<i64> {
         Expr::Value(ValueWithSpan {
             value: Value::Number(n, _),
             ..
-        }) => n.parse::<i64>().map_err(|e| {
-            SqeError::Execution(format!("Invalid integer for '{field}': {n} ({e})"))
-        }),
+        }) => n
+            .parse::<i64>()
+            .map_err(|e| SqeError::Execution(format!("Invalid integer for '{field}': {n} ({e})"))),
         Expr::UnaryOp {
             op: UnaryOperator::Minus,
             expr: inner,
@@ -439,13 +436,9 @@ fn expect_i64(expr: &Expr, field: &str) -> sqe_core::Result<i64> {
 /// to actually delete.
 fn parse_purge_orphan_locations(mut args: Vec<(String, Expr)>) -> sqe_core::Result<ProcedureCall> {
     let namespace = take_namespace(&mut args)?;
-    let dry_run = take_option(&mut args, "dry_run", |e| expect_bool(e, "dry_run"))?
-        .unwrap_or(true);
+    let dry_run = take_option(&mut args, "dry_run", |e| expect_bool(e, "dry_run"))?.unwrap_or(true);
     expect_no_remaining(&args, "purge_orphan_locations")?;
-    Ok(ProcedureCall::PurgeOrphanLocations {
-        namespace,
-        dry_run,
-    })
+    Ok(ProcedureCall::PurgeOrphanLocations { namespace, dry_run })
 }
 
 fn take_namespace(args: &mut Vec<(String, Expr)>) -> sqe_core::Result<NamespaceRef> {
@@ -569,10 +562,7 @@ fn positional_spec(proc: &str) -> Option<&'static [PosSlot]> {
 }
 
 /// Map positional arguments onto their procedure's named parameters.
-fn positional_to_named(
-    proc: &str,
-    exprs: Vec<Expr>,
-) -> sqe_core::Result<Vec<(String, Expr)>> {
+fn positional_to_named(proc: &str, exprs: Vec<Expr>) -> sqe_core::Result<Vec<(String, Expr)>> {
     let spec = positional_spec(proc).ok_or_else(|| {
         SqeError::Execution(format!(
             "CALL system.{proc} does not support positional arguments; use named arguments like `table => 'ns.t'`"
@@ -588,7 +578,10 @@ fn positional_to_named(
                 let table = next_positional(&mut it, proc)?;
                 let schema = expect_non_null_string(&schema, "schema")?;
                 let table = expect_non_null_string(&table, "table")?;
-                out.push(("table".to_string(), string_expr(format!("{schema}.{table}"))));
+                out.push((
+                    "table".to_string(),
+                    string_expr(format!("{schema}.{table}")),
+                ));
             }
             PosSlot::Named(key) => {
                 let expr = next_positional(&mut it, proc)?;
@@ -661,10 +654,7 @@ fn take_option<T, F>(
 where
     F: FnOnce(&Expr) -> sqe_core::Result<T>,
 {
-    if let Some(pos) = args
-        .iter()
-        .position(|(k, _)| k.eq_ignore_ascii_case(key))
-    {
+    if let Some(pos) = args.iter().position(|(k, _)| k.eq_ignore_ascii_case(key)) {
         let (_, expr) = args.remove(pos);
         let parsed = parse(&expr)?;
         Ok(Some(parsed))
@@ -699,9 +689,9 @@ fn expect_u64(expr: &Expr, field: &str) -> sqe_core::Result<u64> {
         Expr::Value(ValueWithSpan {
             value: Value::Number(n, _),
             ..
-        }) => n.parse::<u64>().map_err(|e| {
-            SqeError::Execution(format!("Invalid integer for '{field}': {n} ({e})"))
-        }),
+        }) => n
+            .parse::<u64>()
+            .map_err(|e| SqeError::Execution(format!("Invalid integer for '{field}': {n} ({e})"))),
         other => Err(SqeError::Execution(format!(
             "Expected integer for '{field}', got: {other}"
         ))),
@@ -752,21 +742,24 @@ fn expect_timestamp(expr: &Expr, field: &str) -> sqe_core::Result<DateTime<Utc>>
 
 fn parse_rewrite_data_files(mut args: Vec<(String, Expr)>) -> sqe_core::Result<ProcedureCall> {
     let table = take_table(&mut args)?;
-    let target_file_size_bytes =
-        take_option(&mut args, "target_file_size_bytes", |e| expect_u64(e, "target_file_size_bytes"))?;
-    let min_input_files =
-        take_option(&mut args, "min_input_files", |e| expect_usize(e, "min_input_files"))?;
-    let max_concurrent_file_group_rewrites = take_option(
-        &mut args,
-        "max_concurrent_file_group_rewrites",
-        |e| expect_usize(e, "max_concurrent_file_group_rewrites"),
-    )?;
+    let target_file_size_bytes = take_option(&mut args, "target_file_size_bytes", |e| {
+        expect_u64(e, "target_file_size_bytes")
+    })?;
+    let min_input_files = take_option(&mut args, "min_input_files", |e| {
+        expect_usize(e, "min_input_files")
+    })?;
+    let max_concurrent_file_group_rewrites =
+        take_option(&mut args, "max_concurrent_file_group_rewrites", |e| {
+            expect_usize(e, "max_concurrent_file_group_rewrites")
+        })?;
     let strategy = take_option(&mut args, "strategy", |e| expect_string(e, "strategy"))?;
     let sort_order = take_option(&mut args, "sort_order", |e| expect_string(e, "sort_order"))?;
     let delete_file_threshold = take_option(&mut args, "delete_file_threshold", |e| {
         expect_usize(e, "delete_file_threshold")
     })?;
-    let distributed = take_option(&mut args, "distributed", |e| expect_string(e, "distributed"))?;
+    let distributed = take_option(&mut args, "distributed", |e| {
+        expect_string(e, "distributed")
+    })?;
     let rewrite_all = take_option(&mut args, "rewrite_all", |e| expect_bool(e, "rewrite_all"))?;
     expect_no_remaining(&args, "rewrite_data_files")?;
 
@@ -785,9 +778,10 @@ fn parse_rewrite_data_files(mut args: Vec<(String, Expr)>) -> sqe_core::Result<P
 
 fn parse_expire_snapshots(mut args: Vec<(String, Expr)>) -> sqe_core::Result<ProcedureCall> {
     let table = take_table(&mut args)?;
-    let older_than = take_option(&mut args, "older_than", |e| expect_timestamp(e, "older_than"))?;
-    let retain_last =
-        take_option(&mut args, "retain_last", |e| expect_usize(e, "retain_last"))?;
+    let older_than = take_option(&mut args, "older_than", |e| {
+        expect_timestamp(e, "older_than")
+    })?;
+    let retain_last = take_option(&mut args, "retain_last", |e| expect_usize(e, "retain_last"))?;
     expect_no_remaining(&args, "expire_snapshots")?;
 
     Ok(ProcedureCall::ExpireSnapshots {
@@ -799,7 +793,9 @@ fn parse_expire_snapshots(mut args: Vec<(String, Expr)>) -> sqe_core::Result<Pro
 
 fn parse_remove_orphan_files(mut args: Vec<(String, Expr)>) -> sqe_core::Result<ProcedureCall> {
     let table = take_table(&mut args)?;
-    let older_than = take_option(&mut args, "older_than", |e| expect_timestamp(e, "older_than"))?;
+    let older_than = take_option(&mut args, "older_than", |e| {
+        expect_timestamp(e, "older_than")
+    })?;
     expect_no_remaining(&args, "remove_orphan_files")?;
 
     Ok(ProcedureCall::RemoveOrphanFiles { table, older_than })
@@ -1031,9 +1027,8 @@ mod tests {
 
     #[test]
     fn unknown_option_is_error() {
-        let stmt = parse_first(
-            "CALL system.rewrite_data_files(table => 'ns.t', bogus_flag => 'x')",
-        );
+        let stmt =
+            parse_first("CALL system.rewrite_data_files(table => 'ns.t', bogus_flag => 'x')");
         let err = try_parse_call(&stmt).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("Unknown argument 'bogus_flag'"), "{msg}");
@@ -1123,9 +1118,8 @@ mod tests {
 
     #[test]
     fn purge_orphan_locations_rejects_unknown_arg() {
-        let stmt = parse_first(
-            "CALL system.purge_orphan_locations(namespace => 'ns', force => true)",
-        );
+        let stmt =
+            parse_first("CALL system.purge_orphan_locations(namespace => 'ns', force => true)");
         let err = try_parse_call(&stmt).expect_err("unknown arg should reject");
         assert!(
             err.to_string().contains("force"),
@@ -1163,9 +1157,9 @@ mod tests {
         );
         let call = try_parse_call(&stmt).unwrap().expect("match");
         match call {
-            ProcedureCall::SuggestBloomFilterColumns {
-                history_limit, ..
-            } => assert_eq!(history_limit, Some(500)),
+            ProcedureCall::SuggestBloomFilterColumns { history_limit, .. } => {
+                assert_eq!(history_limit, Some(500))
+            }
             other => panic!("unexpected: {other:?}"),
         }
     }
@@ -1278,9 +1272,8 @@ mod tests {
     fn snapshot_id_accepts_negative() {
         // Iceberg snapshot ids are i64 and can be negative when generated
         // by hashing. The parser must accept the unary-minus form.
-        let stmt = parse_first(
-            "CALL system.set_current_snapshot(table => 'ns.t', snapshot_id => -42)",
-        );
+        let stmt =
+            parse_first("CALL system.set_current_snapshot(table => 'ns.t', snapshot_id => -42)");
         let call = try_parse_call(&stmt).unwrap().expect("match");
         match call {
             ProcedureCall::SetCurrentSnapshot { snapshot_id, .. } => assert_eq!(snapshot_id, -42),
@@ -1300,9 +1293,7 @@ mod tests {
     fn positional_rollback_to_snapshot() {
         // Trino sends positional args (schema, table, snapshot_id). SQE folds
         // schema+table into its single `table` ref. See issue #316.
-        let stmt = parse_first(
-            "CALL system.rollback_to_snapshot('default', 'orders', 9876543210)",
-        );
+        let stmt = parse_first("CALL system.rollback_to_snapshot('default', 'orders', 9876543210)");
         let call = try_parse_call(&stmt).unwrap().expect("match");
         match call {
             ProcedureCall::RollbackToSnapshot { table, snapshot_id } => {
@@ -1316,10 +1307,10 @@ mod tests {
     #[test]
     fn positional_rollback_null_args_match_trino_messages() {
         // testRollbackToSnapshotWithNullArgument asserts these exact phrases.
-        assert!(
-            call_err("CALL system.rollback_to_snapshot(NULL, 'customer_orders', 8954597067493422955)")
-                .contains("schema cannot be null")
-        );
+        assert!(call_err(
+            "CALL system.rollback_to_snapshot(NULL, 'customer_orders', 8954597067493422955)"
+        )
+        .contains("schema cannot be null"));
         assert!(
             call_err("CALL system.rollback_to_snapshot('testdb', NULL, 8954597067493422955)")
                 .contains("table cannot be null")
@@ -1403,9 +1394,7 @@ mod tests {
 
     #[test]
     fn table_health_rejects_unknown_arg() {
-        let stmt = parse_first(
-            "CALL system.table_health(table => 'ns.t', history_limit => 500)",
-        );
+        let stmt = parse_first("CALL system.table_health(table => 'ns.t', history_limit => 500)");
         let err = try_parse_call(&stmt).expect_err("unknown arg should reject");
         assert!(err.to_string().contains("history_limit"));
     }

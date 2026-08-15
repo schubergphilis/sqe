@@ -188,7 +188,10 @@ mod tests {
     use super::*;
 
     fn map(pairs: &[(&str, &str)]) -> HashMap<String, String> {
-        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
     }
 
     #[test]
@@ -196,7 +199,10 @@ mod tests {
         // "SELECT * FROM t WHERE x = ?" url-encoded.
         let h = vec!["q1=SELECT+%2A+FROM+t+WHERE+x+%3D+%3F".to_string()];
         let m = parse_prepared_statements(&h);
-        assert_eq!(m.get("q1").map(String::as_str), Some("SELECT * FROM t WHERE x = ?"));
+        assert_eq!(
+            m.get("q1").map(String::as_str),
+            Some("SELECT * FROM t WHERE x = ?")
+        );
     }
 
     #[test]
@@ -227,20 +233,29 @@ mod tests {
     fn non_execute_returns_none() {
         let m = HashMap::new();
         assert_eq!(rewrite_execute("SELECT 1", &m).unwrap(), None);
-        assert_eq!(rewrite_execute("INSERT INTO t VALUES (1)", &m).unwrap(), None);
+        assert_eq!(
+            rewrite_execute("INSERT INTO t VALUES (1)", &m).unwrap(),
+            None
+        );
     }
 
     #[test]
     fn execute_named_substitutes_using_args() {
         let m = map(&[("q1", "SELECT * FROM t WHERE a = ? AND b = ?")]);
         let out = rewrite_execute("EXECUTE q1 USING 1, 'foo'", &m).unwrap();
-        assert_eq!(out.as_deref(), Some("SELECT * FROM t WHERE a = 1 AND b = 'foo'"));
+        assert_eq!(
+            out.as_deref(),
+            Some("SELECT * FROM t WHERE a = 1 AND b = 'foo'")
+        );
     }
 
     #[test]
     fn execute_named_without_using() {
         let m = map(&[("q1", "SELECT 1")]);
-        assert_eq!(rewrite_execute("EXECUTE q1", &m).unwrap().as_deref(), Some("SELECT 1"));
+        assert_eq!(
+            rewrite_execute("EXECUTE q1", &m).unwrap().as_deref(),
+            Some("SELECT 1")
+        );
     }
 
     #[test]
@@ -273,12 +288,18 @@ mod tests {
     #[test]
     fn execute_keyword_is_case_insensitive() {
         let m = map(&[("q", "SELECT 1")]);
-        assert_eq!(rewrite_execute("execute q", &m).unwrap().as_deref(), Some("SELECT 1"));
+        assert_eq!(
+            rewrite_execute("execute q", &m).unwrap().as_deref(),
+            Some("SELECT 1")
+        );
     }
 
     #[test]
     fn trailing_semicolon_tolerated() {
         let m = map(&[("q", "SELECT 1")]);
-        assert_eq!(rewrite_execute("EXECUTE q;", &m).unwrap().as_deref(), Some("SELECT 1"));
+        assert_eq!(
+            rewrite_execute("EXECUTE q;", &m).unwrap().as_deref(),
+            Some("SELECT 1")
+        );
     }
 }

@@ -96,8 +96,7 @@ impl AttemptManifest {
         self.batches += 1;
         self.logical_bytes += segment.logical_bytes;
         self.physical_bytes += segment.physical_bytes;
-        self.segments
-            .push(segment.path.display().to_string());
+        self.segments.push(segment.path.display().to_string());
         self.checksum = self.checksum.wrapping_add(segment.checksum);
     }
 
@@ -118,12 +117,15 @@ impl AttemptManifest {
     }
 
     pub fn is_reusable(&self) -> bool {
-        matches!(self.state, AttemptState::Committed | AttemptState::Published)
-            && !self.segments.is_empty()
+        matches!(
+            self.state,
+            AttemptState::Committed | AttemptState::Published
+        ) && !self.segments.is_empty()
     }
 
     pub fn to_json(&self) -> Result<Vec<u8>> {
-        serde_json::to_vec_pretty(self).map_err(|e| BudgetError::Config(format!("manifest json: {e}")))
+        serde_json::to_vec_pretty(self)
+            .map_err(|e| BudgetError::Config(format!("manifest json: {e}")))
     }
 
     pub fn from_json(bytes: &[u8]) -> Result<Self> {
@@ -135,7 +137,9 @@ impl AttemptManifest {
     pub fn file_name(&self) -> String {
         format!(
             "manifest-p{}-a{}-task{}.json",
-            self.partition_id, self.attempt_id, sanitize(&self.task_id)
+            self.partition_id,
+            self.attempt_id,
+            sanitize(&self.task_id)
         )
     }
 }
@@ -206,7 +210,12 @@ impl ExchangeAttemptStore {
         );
         let attempt = manifest.attempt_id;
         // Reject if a higher winner already committed.
-        if let Some(w) = self.winners.lock().unwrap_or_else(|p| p.into_inner()).get(&key) {
+        if let Some(w) = self
+            .winners
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&key)
+        {
             if attempt < *w {
                 return Err(BudgetError::Config(format!(
                     "rejecting late attempt {attempt} for {:?}: winner is {w}",

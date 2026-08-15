@@ -514,9 +514,7 @@ pub fn order_predicates(
     let mut ordered: Vec<OrderedPredicate> = terms
         .into_iter()
         .map(|expr| {
-            let columns: Vec<String> = collect_column_refs(expr.as_ref())
-                .into_iter()
-                .collect();
+            let columns: Vec<String> = collect_column_refs(expr.as_ref()).into_iter().collect();
             let cost_tier = classify_predicate_cost(&columns, ctx);
             let estimated_selectivity = estimate_predicate_selectivity(&columns, ctx);
 
@@ -776,9 +774,7 @@ mod tests {
         let remapped =
             remap_predicate_columns(&expr, &predicate_schema).expect("remap should succeed");
 
-        let col = remapped
-            .downcast_ref::<Column>()
-            .expect("should be Column");
+        let col = remapped.downcast_ref::<Column>().expect("should be Column");
         assert_eq!(col.name(), "b");
         assert_eq!(col.index(), 0);
     }
@@ -815,8 +811,8 @@ mod tests {
         )
         .expect("build AND");
 
-        let remapped = remap_predicate_columns(&predicate, &predicate_schema)
-            .expect("remap should succeed");
+        let remapped =
+            remap_predicate_columns(&predicate, &predicate_schema).expect("remap should succeed");
 
         // Collect column refs from the remapped expression
         let cols = collect_column_refs(remapped.as_ref());
@@ -936,17 +932,16 @@ mod tests {
         // Write a Parquet file to memory
         let mut buf = Vec::new();
         {
-            let mut writer =
-                parquet::arrow::ArrowWriter::try_new(&mut buf, schema, None)
-                    .expect("create writer");
+            let mut writer = parquet::arrow::ArrowWriter::try_new(&mut buf, schema, None)
+                .expect("create writer");
             writer.write(&batch).expect("write batch");
             writer.close().expect("close writer");
         }
 
         // Build reader and verify with_max_predicate_cache_size is callable
         let reader = bytes::Bytes::from(buf);
-        let builder = ParquetRecordBatchReaderBuilder::try_new(reader)
-            .expect("create reader builder");
+        let builder =
+            ParquetRecordBatchReaderBuilder::try_new(reader).expect("create reader builder");
         let _builder = builder.with_max_predicate_cache_size(1024);
         // If we get here, the predicate cache API is available and functional.
     }
@@ -996,7 +991,11 @@ mod tests {
         .expect("build AND");
 
         let terms = decompose_conjunction(&combined);
-        assert_eq!(terms.len(), 2, "AND of two predicates should produce 2 terms");
+        assert_eq!(
+            terms.len(),
+            2,
+            "AND of two predicates should produce 2 terms"
+        );
     }
 
     #[test]
@@ -1035,13 +1034,8 @@ mod tests {
         )
         .expect("build a AND b");
 
-        let abc = expressions::binary(
-            ab,
-            datafusion::logical_expr::Operator::And,
-            c_pred,
-            &schema,
-        )
-        .expect("build (a AND b) AND c");
+        let abc = expressions::binary(ab, datafusion::logical_expr::Operator::And, c_pred, &schema)
+            .expect("build (a AND b) AND c");
 
         let terms = decompose_conjunction(&abc);
         assert_eq!(
@@ -1178,7 +1172,13 @@ mod tests {
 
     #[test]
     fn test_order_predicates_full_priority_chain() {
-        let schema = test_schema(&["part_col", "bloom_col", "sort_col", "stats_col", "plain_col"]);
+        let schema = test_schema(&[
+            "part_col",
+            "bloom_col",
+            "sort_col",
+            "stats_col",
+            "plain_col",
+        ]);
 
         let make_pred = |name: &str, idx: usize| {
             expressions::binary(
@@ -1197,10 +1197,15 @@ mod tests {
         let p1 = make_pred("bloom_col", 1);
         let p0 = make_pred("part_col", 0);
 
-        let and1 = expressions::binary(p4, datafusion::logical_expr::Operator::And, p3, &schema).unwrap();
-        let and2 = expressions::binary(and1, datafusion::logical_expr::Operator::And, p2, &schema).unwrap();
-        let and3 = expressions::binary(and2, datafusion::logical_expr::Operator::And, p1, &schema).unwrap();
-        let combined = expressions::binary(and3, datafusion::logical_expr::Operator::And, p0, &schema).unwrap();
+        let and1 =
+            expressions::binary(p4, datafusion::logical_expr::Operator::And, p3, &schema).unwrap();
+        let and2 = expressions::binary(and1, datafusion::logical_expr::Operator::And, p2, &schema)
+            .unwrap();
+        let and3 = expressions::binary(and2, datafusion::logical_expr::Operator::And, p1, &schema)
+            .unwrap();
+        let combined =
+            expressions::binary(and3, datafusion::logical_expr::Operator::And, p0, &schema)
+                .unwrap();
 
         let ctx = PredicateOrderingContext {
             partition_columns: HashSet::from(["part_col".to_string()]),
@@ -1362,7 +1367,9 @@ mod tests {
         )
         .expect("build phase-1 batch");
 
-        let value = remapped.evaluate(&batch).expect("evaluate remapped predicate");
+        let value = remapped
+            .evaluate(&batch)
+            .expect("evaluate remapped predicate");
         let array = value
             .into_array(batch.num_rows())
             .expect("materialize boolean result");

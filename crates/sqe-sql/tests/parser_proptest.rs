@@ -17,11 +17,8 @@
 
 use proptest::prelude::*;
 use sqe_sql::{
-    parse_and_classify,
-    attach::{
-        try_parse_attach, try_parse_create_secret, try_parse_detach, try_parse_drop_secret,
-    },
-    StatementKind,
+    attach::{try_parse_attach, try_parse_create_secret, try_parse_detach, try_parse_drop_secret},
+    parse_and_classify, StatementKind,
 };
 
 /// Identifier generator: ASCII letters, digits, and underscore. First char

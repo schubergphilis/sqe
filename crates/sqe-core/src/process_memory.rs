@@ -213,8 +213,7 @@ impl RuntimeMemoryInfo {
     /// True when a kernel/container hard limit is known and usable for
     /// fail-closed validation.
     pub fn has_enforced_limit(&self) -> bool {
-        self.enforced_memory_limit_bytes
-            .is_some_and(|n| n > 0)
+        self.enforced_memory_limit_bytes.is_some_and(|n| n > 0)
     }
 
     /// True when `configured_need` (typically `memory_limit + process_headroom`)
@@ -251,10 +250,7 @@ impl RuntimeMemoryInfo {
     }
 
     /// Classify pressure of the live cgroup limit vs working set and config.
-    pub fn assess_enforced_pressure(
-        &self,
-        configured_need_bytes: u64,
-    ) -> EnforcedLimitPressure {
+    pub fn assess_enforced_pressure(&self, configured_need_bytes: u64) -> EnforcedLimitPressure {
         let Some(enforced) = self.enforced_memory_limit_bytes.filter(|&n| n > 0) else {
             return EnforcedLimitPressure::NoEnforcedLimit;
         };
@@ -541,13 +537,10 @@ pub fn spawn_runtime_memory_watch(
                          (or raise the cgroup). Until then the pool may over-admit vs kernel."
                     );
                 }
-                EnforcedLimitPressure::WithinLimits { .. }
-                    if change.enforced_limit_changed =>
-                {
+                EnforcedLimitPressure::WithinLimits { .. } if change.enforced_limit_changed => {
                     tracing::info!(
                         configured_need_bytes,
-                        enforced_memory_limit_bytes =
-                            now.enforced_memory_limit_bytes.unwrap_or(0),
+                        enforced_memory_limit_bytes = now.enforced_memory_limit_bytes.unwrap_or(0),
                         working_set_bytes = now.working_set_bytes().unwrap_or(0),
                         enforced_source = now.enforced_memory_limit_source,
                         enforced_grew = change.enforced_grew(),
@@ -555,8 +548,8 @@ pub fn spawn_runtime_memory_watch(
                         "Live cgroup memory limit still covers working set and configured need"
                     );
                 }
-                EnforcedLimitPressure::NoEnforcedLimit | EnforcedLimitPressure::WithinLimits { .. } => {
-                }
+                EnforcedLimitPressure::NoEnforcedLimit
+                | EnforcedLimitPressure::WithinLimits { .. } => {}
             }
 
             last = now;
@@ -992,10 +985,7 @@ mod tests {
         assert_eq!(parse_memory_limit_value(""), None);
         assert_eq!(parse_memory_limit_value("0"), None);
         assert_eq!(parse_memory_limit_value("1048576"), Some(1048576));
-        assert_eq!(
-            parse_memory_limit_value(&(1u64 << 62).to_string()),
-            None
-        );
+        assert_eq!(parse_memory_limit_value(&(1u64 << 62).to_string()), None);
     }
 
     #[test]
@@ -1055,7 +1045,10 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn linux_cgroup_ancestors_include_root() {
         let a = cgroup_ancestors("/foo/bar");
-        assert_eq!(a, vec!["/foo/bar".to_string(), "/foo".to_string(), "/".to_string()]);
+        assert_eq!(
+            a,
+            vec!["/foo/bar".to_string(), "/foo".to_string(), "/".to_string()]
+        );
         assert_eq!(cgroup_ancestors("/"), vec!["/".to_string()]);
         assert_eq!(cgroup_ancestors(""), vec!["/".to_string()]);
     }

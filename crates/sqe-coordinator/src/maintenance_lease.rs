@@ -101,7 +101,9 @@ use sqe_core::SqeError;
 
 use crate::maintenance_log::{resolve_state_table_ident, row_to_record_batch, MaintenanceLogRow};
 use crate::write_handler::is_conflict_message;
-use crate::writer::{new_upload_tracker, parse_parquet_compression, write_data_files, WriteCleanupGuard};
+use crate::writer::{
+    new_upload_tracker, parse_parquet_compression, write_data_files, WriteCleanupGuard,
+};
 
 /// `trigger` value marking a `maintenance_log` row as lease bookkeeping
 /// rather than a job/advisory row.
@@ -175,7 +177,10 @@ pub enum AcquireDecision {
     /// log/audit the steal; it is `None` for "no rows" and "released".
     Acquirable { stolen_from: Option<String> },
     /// A live, unexpired claim exists, held by a DIFFERENT holder.
-    HeldByOther { holder_id: String, expires_at_ms: i64 },
+    HeldByOther {
+        holder_id: String,
+        expires_at_ms: i64,
+    },
     /// A live, unexpired claim exists, already held by THIS holder --
     /// renewable, and [`try_acquire`] treats re-acquiring it as an
     /// idempotent success rather than a fresh commit.
@@ -191,7 +196,11 @@ pub enum AcquireDecision {
 /// if it happens to be held by `holder_id` itself (a holder that let its
 /// own lease lapse re-acquires via the same steal path, not a fast-path
 /// "still mine"); only an UNEXPIRED claim can be `OwnLive`/`HeldByOther`.
-pub fn lease_acquirable(latest: Option<&LeaseState>, holder_id: &str, now_ms: i64) -> AcquireDecision {
+pub fn lease_acquirable(
+    latest: Option<&LeaseState>,
+    holder_id: &str,
+    now_ms: i64,
+) -> AcquireDecision {
     let Some(state) = latest else {
         return AcquireDecision::Acquirable { stolen_from: None };
     };
@@ -234,14 +243,17 @@ async fn collect_data_files(table: &IcebergTable) -> sqe_core::Result<Vec<DataFi
     let manifest_list = cache
         .get_manifest_list(snapshot, &metadata_ref)
         .await
-        .map_err(|e| SqeError::Execution(format!("maintenance_lease: failed to load manifest list: {e}")))?;
+        .map_err(|e| {
+            SqeError::Execution(format!(
+                "maintenance_lease: failed to load manifest list: {e}"
+            ))
+        })?;
 
     let mut data_files = Vec::new();
     for mf in manifest_list.entries() {
-        let manifest = cache
-            .get_manifest(mf)
-            .await
-            .map_err(|e| SqeError::Execution(format!("maintenance_lease: failed to load manifest: {e}")))?;
+        let manifest = cache.get_manifest(mf).await.map_err(|e| {
+            SqeError::Execution(format!("maintenance_lease: failed to load manifest: {e}"))
+        })?;
         for entry in manifest.entries() {
             if entry.status() != ManifestStatus::Deleted
                 && entry.data_file().content_type() == DataContentType::Data
@@ -257,37 +269,58 @@ async fn collect_data_files(table: &IcebergTable) -> sqe_core::Result<Vec<DataFi
 /// Every `maintenance_log` row (lease or not) is written as a one-row batch
 /// (see `maintenance_log::row_to_record_batch`), so this always expects
 /// exactly one non-empty batch back.
-async fn read_single_row_batch(table: &IcebergTable, file_path: &str) -> sqe_core::Result<RecordBatch> {
+async fn read_single_row_batch(
+    table: &IcebergTable,
+    file_path: &str,
+) -> sqe_core::Result<RecordBatch> {
     let file_io = table.file_io();
-    let input = file_io
-        .new_input(file_path)
-        .map_err(|e| SqeError::Execution(format!("maintenance_lease: failed to open '{file_path}': {e}")))?;
-    let bytes = input
-        .read()
-        .await
-        .map_err(|e| SqeError::Execution(format!("maintenance_lease: failed to read '{file_path}': {e}")))?;
-    let reader = parquet::arrow::arrow_reader::ArrowReaderBuilder::try_new(bytes).map_err(|e| {
-        SqeError::Execution(format!("maintenance_lease: failed to open parquet reader for '{file_path}': {e}"))
+    let input = file_io.new_input(file_path).map_err(|e| {
+        SqeError::Execution(format!(
+            "maintenance_lease: failed to open '{file_path}': {e}"
+        ))
     })?;
-    let reader = reader
-        .build()
-        .map_err(|e| SqeError::Execution(format!("maintenance_lease: failed to build parquet reader for '{file_path}': {e}")))?;
-    let batches: Vec<RecordBatch> = reader
-        .into_iter()
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| SqeError::Execution(format!("maintenance_lease: failed to decode '{file_path}': {e}")))?;
+    let bytes = input.read().await.map_err(|e| {
+        SqeError::Execution(format!(
+            "maintenance_lease: failed to read '{file_path}': {e}"
+        ))
+    })?;
+    let reader = parquet::arrow::arrow_reader::ArrowReaderBuilder::try_new(bytes).map_err(|e| {
+        SqeError::Execution(format!(
+            "maintenance_lease: failed to open parquet reader for '{file_path}': {e}"
+        ))
+    })?;
+    let reader = reader.build().map_err(|e| {
+        SqeError::Execution(format!(
+            "maintenance_lease: failed to build parquet reader for '{file_path}': {e}"
+        ))
+    })?;
+    let batches: Vec<RecordBatch> =
+        reader
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| {
+                SqeError::Execution(format!(
+                    "maintenance_lease: failed to decode '{file_path}': {e}"
+                ))
+            })?;
     batches
         .into_iter()
         .find(|b| b.num_rows() > 0)
-        .ok_or_else(|| SqeError::Execution(format!("maintenance_lease: '{file_path}' contains no rows")))
+        .ok_or_else(|| {
+            SqeError::Execution(format!("maintenance_lease: '{file_path}' contains no rows"))
+        })
 }
 
 fn get_str_col(batch: &RecordBatch, name: &str, file_path: &str) -> sqe_core::Result<String> {
     let col = batch.column_by_name(name).ok_or_else(|| {
-        SqeError::Execution(format!("maintenance_lease: '{file_path}' is missing column '{name}'"))
+        SqeError::Execution(format!(
+            "maintenance_lease: '{file_path}' is missing column '{name}'"
+        ))
     })?;
     let arr = col.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
-        SqeError::Execution(format!("maintenance_lease: '{file_path}' column '{name}' is not Utf8"))
+        SqeError::Execution(format!(
+            "maintenance_lease: '{file_path}' column '{name}' is not Utf8"
+        ))
     })?;
     if arr.is_null(0) {
         return Err(SqeError::Execution(format!(
@@ -299,10 +332,14 @@ fn get_str_col(batch: &RecordBatch, name: &str, file_path: &str) -> sqe_core::Re
 
 fn get_i64_col(batch: &RecordBatch, name: &str, file_path: &str) -> sqe_core::Result<i64> {
     let col = batch.column_by_name(name).ok_or_else(|| {
-        SqeError::Execution(format!("maintenance_lease: '{file_path}' is missing column '{name}'"))
+        SqeError::Execution(format!(
+            "maintenance_lease: '{file_path}' is missing column '{name}'"
+        ))
     })?;
     let arr = col.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
-        SqeError::Execution(format!("maintenance_lease: '{file_path}' column '{name}' is not Int64"))
+        SqeError::Execution(format!(
+            "maintenance_lease: '{file_path}' column '{name}' is not Int64"
+        ))
     })?;
     if arr.is_null(0) {
         return Err(SqeError::Execution(format!(
@@ -319,7 +356,10 @@ fn get_i64_col(batch: &RecordBatch, name: &str, file_path: &str) -> sqe_core::Re
 /// more than one defensively: the very first claim for a `job_key` is
 /// written via an unprotected `fast_append` (see the module docs' bootstrap
 /// gap), so a genuine race there can leave two.
-async fn read_lease_rows(table: &IcebergTable, job_key: &str) -> sqe_core::Result<Vec<LiveLeaseRow>> {
+async fn read_lease_rows(
+    table: &IcebergTable,
+    job_key: &str,
+) -> sqe_core::Result<Vec<LiveLeaseRow>> {
     let data_files = collect_data_files(table).await?;
     let mut out = Vec::new();
     for df in data_files {
@@ -412,9 +452,11 @@ async fn commit_cas(
     let tx = Transaction::new(table);
     let commit_result = if delete_targets.is_empty() {
         let action = tx.fast_append().add_data_files(vec![new_file]);
-        let tx = action
-            .apply(tx)
-            .map_err(|e| SqeError::Execution(format!("maintenance_lease: failed to apply bootstrap claim: {e}")))?;
+        let tx = action.apply(tx).map_err(|e| {
+            SqeError::Execution(format!(
+                "maintenance_lease: failed to apply bootstrap claim: {e}"
+            ))
+        })?;
         tx.commit(catalog.as_ref()).await
     } else {
         let action = tx
@@ -422,17 +464,23 @@ async fn commit_cas(
             .delete_files(delete_targets)
             .add_data_files(vec![new_file])
             .set_check_file_existence(true);
-        let tx = action
-            .apply(tx)
-            .map_err(|e| SqeError::Execution(format!("maintenance_lease: failed to apply claim rewrite: {e}")))?;
+        let tx = action.apply(tx).map_err(|e| {
+            SqeError::Execution(format!(
+                "maintenance_lease: failed to apply claim rewrite: {e}"
+            ))
+        })?;
         tx.commit(catalog.as_ref()).await
     };
 
     match commit_result {
         Ok(_) => Ok(CasOutcome::Committed),
         Err(e) if e.kind() == ErrorKind::DataInvalid => Ok(CasOutcome::Lost),
-        Err(e) if e.retryable() || is_conflict_message(&e.to_string()) => Ok(CasOutcome::Transient(e)),
-        Err(e) => Err(SqeError::Execution(format!("maintenance_lease: commit failed: {e}"))),
+        Err(e) if e.retryable() || is_conflict_message(&e.to_string()) => {
+            Ok(CasOutcome::Transient(e))
+        }
+        Err(e) => Err(SqeError::Execution(format!(
+            "maintenance_lease: commit failed: {e}"
+        ))),
     }
 }
 
@@ -483,16 +531,23 @@ pub async fn try_acquire(
 
     for attempt in 1..=MAX_LEASE_ATTEMPTS {
         let table = catalog.load_table(&ident).await.map_err(|e| {
-            SqeError::Catalog(format!("maintenance_lease: failed to load state table '{ident}': {e}"))
+            SqeError::Catalog(format!(
+                "maintenance_lease: failed to load state table '{ident}': {e}"
+            ))
         })?;
 
         let rows = read_lease_rows(&table, job_key).await?;
-        let latest_state = rows.iter().map(|r| &r.state).max_by_key(|s| s.acquired_at_ms);
+        let latest_state = rows
+            .iter()
+            .map(|r| &r.state)
+            .max_by_key(|s| s.acquired_at_ms);
 
         match lease_acquirable(latest_state, holder_id, now_ms) {
             AcquireDecision::HeldByOther { .. } => return Ok(None),
             AcquireDecision::OwnLive => {
-                let state = latest_state.expect("OwnLive implies a live row was found").clone();
+                let state = latest_state
+                    .expect("OwnLive implies a live row was found")
+                    .clone();
                 return Ok(Some(LeaseHandle {
                     job_key: job_key.to_string(),
                     holder_id: holder_id.to_string(),
@@ -506,8 +561,16 @@ pub async fn try_acquire(
                 let note = stolen_from
                     .as_deref()
                     .map(|prev| format!("stolen lease from holder '{prev}' (expired)"));
-                let row = lease_row(job_key, holder_id, now_ms, expires_at_ms, LEASE_STATUS_CLAIMED, note.as_deref());
-                let (new_file, cleanup_guard) = write_lease_file(&table, &row, "maintenance-lease-claim").await?;
+                let row = lease_row(
+                    job_key,
+                    holder_id,
+                    now_ms,
+                    expires_at_ms,
+                    LEASE_STATUS_CLAIMED,
+                    note.as_deref(),
+                );
+                let (new_file, cleanup_guard) =
+                    write_lease_file(&table, &row, "maintenance-lease-claim").await?;
                 let new_path = new_file.file_path().to_string();
                 let delete_targets: Vec<DataFile> = rows.into_iter().map(|r| r.data_file).collect();
 
@@ -515,7 +578,10 @@ pub async fn try_acquire(
                     CasOutcome::Committed => {
                         cleanup_guard.mark_committed();
                         if let Some(prev) = &stolen_from {
-                            info!(job_key, holder_id, prev, "maintenance_lease: stole expired lease");
+                            info!(
+                                job_key,
+                                holder_id, prev, "maintenance_lease: stole expired lease"
+                            );
                         }
                         return Ok(Some(LeaseHandle {
                             job_key: job_key.to_string(),
@@ -541,7 +607,9 @@ pub async fn try_acquire(
     }
 
     Err(last_err.unwrap_or_else(|| {
-        SqeError::Execution(format!("maintenance_lease: exhausted attempts acquiring '{job_key}'"))
+        SqeError::Execution(format!(
+            "maintenance_lease: exhausted attempts acquiring '{job_key}'"
+        ))
     }))
 }
 
@@ -562,11 +630,15 @@ pub async fn renew(
 
     for attempt in 1..=MAX_LEASE_ATTEMPTS {
         let table = catalog.load_table(&ident).await.map_err(|e| {
-            SqeError::Catalog(format!("maintenance_lease: failed to load state table '{ident}': {e}"))
+            SqeError::Catalog(format!(
+                "maintenance_lease: failed to load state table '{ident}': {e}"
+            ))
         })?;
 
         let rows = read_lease_rows(&table, &handle.job_key).await?;
-        let current = rows.iter().find(|r| r.state.claim_path == handle.claim_path && !r.state.released);
+        let current = rows
+            .iter()
+            .find(|r| r.state.claim_path == handle.claim_path && !r.state.released);
         let Some(current) = current else {
             return Err(SqeError::Execution(format!(
                 "maintenance_lease: lease for '{}' is no longer live (expired/released/stolen), cannot renew",
@@ -581,8 +653,16 @@ pub async fn renew(
         }
 
         let expires_at_ms = now_ms.saturating_add((ttl_secs as i64).saturating_mul(1000));
-        let row = lease_row(&handle.job_key, &handle.holder_id, now_ms, expires_at_ms, LEASE_STATUS_CLAIMED, None);
-        let (new_file, cleanup_guard) = write_lease_file(&table, &row, "maintenance-lease-renew").await?;
+        let row = lease_row(
+            &handle.job_key,
+            &handle.holder_id,
+            now_ms,
+            expires_at_ms,
+            LEASE_STATUS_CLAIMED,
+            None,
+        );
+        let (new_file, cleanup_guard) =
+            write_lease_file(&table, &row, "maintenance-lease-renew").await?;
         let new_path = new_file.file_path().to_string();
         let delete_targets: Vec<DataFile> = rows.into_iter().map(|r| r.data_file).collect();
 
@@ -613,7 +693,10 @@ pub async fn renew(
     }
 
     Err(last_err.unwrap_or_else(|| {
-        SqeError::Execution(format!("maintenance_lease: exhausted attempts renewing '{}'", handle.job_key))
+        SqeError::Execution(format!(
+            "maintenance_lease: exhausted attempts renewing '{}'",
+            handle.job_key
+        ))
     }))
 }
 
@@ -647,7 +730,9 @@ pub async fn release(
 
     for attempt in 1..=MAX_LEASE_ATTEMPTS {
         let table = catalog.load_table(&ident).await.map_err(|e| {
-            SqeError::Catalog(format!("maintenance_lease: failed to load state table '{ident}': {e}"))
+            SqeError::Catalog(format!(
+                "maintenance_lease: failed to load state table '{ident}': {e}"
+            ))
         })?;
 
         let rows = read_lease_rows(&table, &handle.job_key).await?;
@@ -676,8 +761,16 @@ pub async fn release(
         }
 
         let delete_targets: Vec<DataFile> = rows.into_iter().map(|r| r.data_file).collect();
-        let row = lease_row(&handle.job_key, &handle.holder_id, now_ms, now_ms, LEASE_STATUS_RELEASED, None);
-        let (new_file, cleanup_guard) = write_lease_file(&table, &row, "maintenance-lease-release").await?;
+        let row = lease_row(
+            &handle.job_key,
+            &handle.holder_id,
+            now_ms,
+            now_ms,
+            LEASE_STATUS_RELEASED,
+            None,
+        );
+        let (new_file, cleanup_guard) =
+            write_lease_file(&table, &row, "maintenance-lease-release").await?;
 
         match commit_cas(catalog, &table, delete_targets, new_file).await? {
             CasOutcome::Committed => {
@@ -703,7 +796,10 @@ pub async fn release(
     }
 
     Err(last_err.unwrap_or_else(|| {
-        SqeError::Execution(format!("maintenance_lease: exhausted attempts releasing '{}'", handle.job_key))
+        SqeError::Execution(format!(
+            "maintenance_lease: exhausted attempts releasing '{}'",
+            handle.job_key
+        ))
     }))
 }
 
@@ -711,7 +807,12 @@ pub async fn release(
 mod tests {
     use super::*;
 
-    fn state(holder_id: &str, acquired_at_ms: i64, expires_at_ms: i64, released: bool) -> LeaseState {
+    fn state(
+        holder_id: &str,
+        acquired_at_ms: i64,
+        expires_at_ms: i64,
+        released: bool,
+    ) -> LeaseState {
         LeaseState {
             job_key: "ns.orders".to_string(),
             holder_id: holder_id.to_string(),

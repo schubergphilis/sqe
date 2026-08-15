@@ -67,8 +67,8 @@ fn register_higher_order_aliases(ctx: &SessionContext) {
         };
         // Wrap the shipped impl with the Trino alias. `name()` still reports the
         // DataFusion name, so `array_filter` / `array_transform` keep working.
-        let aliased =
-            HigherOrderUDF::new_from_shared_impl(Arc::clone(func.inner())).with_aliases([trino_alias]);
+        let aliased = HigherOrderUDF::new_from_shared_impl(Arc::clone(func.inner()))
+            .with_aliases([trino_alias]);
         ctx.register_higher_order_function(Arc::new(aliased));
     }
 }
@@ -148,7 +148,10 @@ macro_rules! bitwise_binary {
             }
             fn signature(&self) -> &Signature {
                 static SIG: std::sync::LazyLock<Signature> = std::sync::LazyLock::new(|| {
-                    Signature::exact(vec![DataType::Int64, DataType::Int64], Volatility::Immutable)
+                    Signature::exact(
+                        vec![DataType::Int64, DataType::Int64],
+                        Volatility::Immutable,
+                    )
                 });
                 &SIG
             }
@@ -176,8 +179,9 @@ impl ScalarUDFImpl for BitwiseNot {
         "bitwise_not"
     }
     fn signature(&self) -> &Signature {
-        static SIG: std::sync::LazyLock<Signature> =
-            std::sync::LazyLock::new(|| Signature::exact(vec![DataType::Int64], Volatility::Immutable));
+        static SIG: std::sync::LazyLock<Signature> = std::sync::LazyLock::new(|| {
+            Signature::exact(vec![DataType::Int64], Volatility::Immutable)
+        });
         &SIG
     }
     fn return_type(&self, _args: &[DataType]) -> DFResult<DataType> {
@@ -335,7 +339,10 @@ mod tests {
     #[tokio::test]
     async fn bitwise_shifts_are_logical_64bit() {
         assert_eq!(scalar_i64("SELECT bitwise_left_shift(1, 3)").await, Some(8));
-        assert_eq!(scalar_i64("SELECT bitwise_right_shift(16, 2)").await, Some(4));
+        assert_eq!(
+            scalar_i64("SELECT bitwise_right_shift(16, 2)").await,
+            Some(4)
+        );
         // bigint operand: logical (zero-fill) right shift, not arithmetic.
         assert_eq!(
             scalar_i64("SELECT bitwise_right_shift(CAST(-8 AS bigint), 1)").await,
@@ -346,8 +353,14 @@ mod tests {
             Some(-2)
         );
         // shift >= width -> 0, matching Trino.
-        assert_eq!(scalar_i64("SELECT bitwise_right_shift(255, 68)").await, Some(0));
-        assert_eq!(scalar_i64("SELECT bitwise_left_shift(1, 64)").await, Some(0));
+        assert_eq!(
+            scalar_i64("SELECT bitwise_right_shift(255, 68)").await,
+            Some(0)
+        );
+        assert_eq!(
+            scalar_i64("SELECT bitwise_left_shift(1, 64)").await,
+            Some(0)
+        );
     }
 
     #[tokio::test]
@@ -371,8 +384,14 @@ mod tests {
 
     #[tokio::test]
     async fn sequence_alias_of_generate_series() {
-        assert_eq!(array_i64("SELECT sequence(1, 5)").await, vec![1, 2, 3, 4, 5]);
-        assert_eq!(array_i64("SELECT sequence(1, 7, 2)").await, vec![1, 3, 5, 7]);
+        assert_eq!(
+            array_i64("SELECT sequence(1, 5)").await,
+            vec![1, 2, 3, 4, 5]
+        );
+        assert_eq!(
+            array_i64("SELECT sequence(1, 7, 2)").await,
+            vec![1, 3, 5, 7]
+        );
         assert_eq!(array_i64("SELECT sequence(5, 1, -2)").await, vec![5, 3, 1]);
     }
 

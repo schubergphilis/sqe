@@ -185,9 +185,7 @@ impl OidcM2mProvider {
             .form(&params)
             .send()
             .await
-            .map_err(|e| {
-                AuthError::Internal(anyhow::anyhow!("M2M token request failed: {e}"))
-            })?;
+            .map_err(|e| AuthError::Internal(anyhow::anyhow!("M2M token request failed: {e}")))?;
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -210,10 +208,7 @@ impl OidcM2mProvider {
 
 #[async_trait]
 impl AuthProvider for OidcM2mProvider {
-    async fn authenticate(
-        &self,
-        _credentials: &FlightCredentials,
-    ) -> Result<Identity, AuthError> {
+    async fn authenticate(&self, _credentials: &FlightCredentials) -> Result<Identity, AuthError> {
         let token = self.get_token().await?;
         Ok(Identity {
             user_id: self.config.user_id.clone(),

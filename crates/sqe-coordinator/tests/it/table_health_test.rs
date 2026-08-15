@@ -71,7 +71,12 @@ async fn seed_mor_table(
     )
     .await;
     for i in 1..rows {
-        exec(handler, session, &format!("INSERT INTO {table} VALUES ({i})")).await;
+        exec(
+            handler,
+            session,
+            &format!("INSERT INTO {table} VALUES ({i})"),
+        )
+        .await;
     }
 }
 
@@ -87,8 +92,18 @@ async fn table_health_reports_small_and_delete_files_without_write_privilege() {
 
     // Two separate DELETE commits against a MoR table, each producing a
     // position-delete file without touching the underlying data files.
-    exec(&handler, &session, &format!("DELETE FROM {table} WHERE id = 1")).await;
-    exec(&handler, &session, &format!("DELETE FROM {table} WHERE id = 2")).await;
+    exec(
+        &handler,
+        &session,
+        &format!("DELETE FROM {table} WHERE id = 1"),
+    )
+    .await;
+    exec(
+        &handler,
+        &session,
+        &format!("DELETE FROM {table} WHERE id = 2"),
+    )
+    .await;
 
     // table_health must not require write privilege: run it through a
     // read-only-role session built from the same real credentials (the
@@ -152,7 +167,10 @@ async fn table_health_reports_small_and_delete_files_without_write_privilege() {
         .downcast_ref::<Int64Array>()
         .expect("Int64Array")
         .value(0);
-    assert_eq!(row_count, 8, "2 deletes out of 10 rows should leave 8 visible rows");
+    assert_eq!(
+        row_count, 8,
+        "2 deletes out of 10 rows should leave 8 visible rows"
+    );
 
     let _ = exec(&handler, &session, &format!("DROP TABLE IF EXISTS {table}")).await;
 }

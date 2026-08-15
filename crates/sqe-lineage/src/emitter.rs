@@ -54,12 +54,8 @@ fn build_start(c: &QueryStartCtx, cfg: &EmitterConfig) -> RunEvent {
 
 fn build_complete(c: &QueryCompleteCtx, cfg: &EmitterConfig) -> RunEvent {
     let (inputs, outputs) = match &c.plan {
-        Some(PlanOrHint::Plan(p)) => {
-            extract::extract_lineage(p.as_ref(), &cfg.catalog_lookup)
-        }
-        Some(PlanOrHint::Hint(h)) => {
-            extract::extract_from_hint(h, &cfg.catalog_lookup)
-        }
+        Some(PlanOrHint::Plan(p)) => extract::extract_lineage(p.as_ref(), &cfg.catalog_lookup),
+        Some(PlanOrHint::Hint(h)) => extract::extract_from_hint(h, &cfg.catalog_lookup),
         None => (vec![], vec![]),
     };
     RunEvent {
@@ -76,12 +72,8 @@ fn build_complete(c: &QueryCompleteCtx, cfg: &EmitterConfig) -> RunEvent {
 
 fn build_fail(c: &QueryFailCtx, cfg: &EmitterConfig) -> RunEvent {
     let (inputs, outputs) = match &c.plan {
-        Some(PlanOrHint::Plan(p)) => {
-            extract::extract_lineage(p.as_ref(), &cfg.catalog_lookup)
-        }
-        Some(PlanOrHint::Hint(h)) => {
-            extract::extract_from_hint(h, &cfg.catalog_lookup)
-        }
+        Some(PlanOrHint::Plan(p)) => extract::extract_lineage(p.as_ref(), &cfg.catalog_lookup),
+        Some(PlanOrHint::Hint(h)) => extract::extract_from_hint(h, &cfg.catalog_lookup),
         None => (vec![], vec![]),
     };
     RunEvent {
@@ -89,7 +81,12 @@ fn build_fail(c: &QueryFailCtx, cfg: &EmitterConfig) -> RunEvent {
         eventTime: c.ended_at.to_rfc3339(),
         producer: cfg.producer.clone(),
         schemaURL: SCHEMA_URL.into(),
-        run: build_run(c.run_id, c.started_at, &c.session_id, Some(&c.error_message)),
+        run: build_run(
+            c.run_id,
+            c.started_at,
+            &c.session_id,
+            Some(&c.error_message),
+        ),
         job: build_job(&cfg.job_namespace, &c.statement_kind, &c.sql),
         inputs,
         outputs,
@@ -143,9 +140,7 @@ fn build_job(namespace: &str, kind: &str, sql: &str) -> Job {
                 // reaches the sink; the exact text correlates via the job-name
                 // hash above. `redact_pii` first keeps secret-keyword literals
                 // out even from the placeholder pass.
-                query: sqe_metrics::audit::strip_sql_literals(
-                    &sqe_metrics::audit::redact_pii(sql),
-                ),
+                query: sqe_metrics::audit::strip_sql_literals(&sqe_metrics::audit::redact_pii(sql)),
                 dialect: "sqe".into(),
             }),
         },

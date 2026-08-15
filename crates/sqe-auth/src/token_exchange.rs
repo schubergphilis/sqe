@@ -158,15 +158,9 @@ impl TokenExchangeProvider {
         let mut params = vec![
             ("grant_type", GRANT_TYPE_TOKEN_EXCHANGE.to_string()),
             ("subject_token", subject_token.to_string()),
-            (
-                "subject_token_type",
-                TOKEN_TYPE_ACCESS_TOKEN.to_string(),
-            ),
+            ("subject_token_type", TOKEN_TYPE_ACCESS_TOKEN.to_string()),
             ("client_id", self.config.client_id.clone()),
-            (
-                "requested_token_type",
-                TOKEN_TYPE_ACCESS_TOKEN.to_string(),
-            ),
+            ("requested_token_type", TOKEN_TYPE_ACCESS_TOKEN.to_string()),
         ];
 
         if let Some(ref secret) = self.config.client_secret {
@@ -195,19 +189,14 @@ impl TokenExchangeProvider {
                 .unwrap_or_else(|_| "unable to read body".to_string());
             let body = truncate_for_log(&body, 500);
             warn!(status = %status, body = %body, "Token exchange endpoint rejected credentials");
-            return Err(AuthError::AuthFailed(
-                "Authentication failed".to_string(),
-            ));
+            return Err(AuthError::AuthFailed("Authentication failed".to_string()));
         }
 
-        response
-            .json::<TokenExchangeResponse>()
-            .await
-            .map_err(|e| {
-                AuthError::Internal(anyhow::anyhow!(
-                    "Failed to parse token exchange response: {e}"
-                ))
-            })
+        response.json::<TokenExchangeResponse>().await.map_err(|e| {
+            AuthError::Internal(anyhow::anyhow!(
+                "Failed to parse token exchange response: {e}"
+            ))
+        })
     }
 
     /// Decode a JWT payload (base64url middle segment) without signature verification.
@@ -380,8 +369,7 @@ mod tests {
             .encode(b"{\"alg\":\"RS256\",\"typ\":\"JWT\"}");
         let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .encode(serde_json::to_vec(claims).unwrap());
-        let signature =
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"fake-sig");
+        let signature = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"fake-sig");
         format!("{header}.{payload}.{signature}")
     }
 
@@ -463,15 +451,12 @@ mod tests {
 
     #[test]
     fn decode_jwt_payload_invalid_base64() {
-        assert!(
-            TokenExchangeProvider::decode_jwt_payload("header.!!!invalid!!!.sig").is_none()
-        );
+        assert!(TokenExchangeProvider::decode_jwt_payload("header.!!!invalid!!!.sig").is_none());
     }
 
     #[test]
     fn decode_jwt_payload_non_json() {
-        let payload =
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"not json");
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"not json");
         let token = format!("header.{payload}.sig");
         assert!(TokenExchangeProvider::decode_jwt_payload(&token).is_none());
     }
@@ -557,8 +542,7 @@ mod tests {
                 }
             }
         });
-        let roles =
-            TokenExchangeProvider::extract_roles(&claims, "resource_access.sqe.roles");
+        let roles = TokenExchangeProvider::extract_roles(&claims, "resource_access.sqe.roles");
         assert_eq!(roles, vec!["viewer", "editor"]);
     }
 
@@ -594,13 +578,19 @@ mod tests {
     #[test]
     fn navigate_claim_single_segment() {
         let val = serde_json::json!({ "sub": "alice" });
-        assert_eq!(navigate_claim(&val, "sub").unwrap(), &serde_json::json!("alice"));
+        assert_eq!(
+            navigate_claim(&val, "sub").unwrap(),
+            &serde_json::json!("alice")
+        );
     }
 
     #[test]
     fn navigate_claim_multi_segment() {
         let val = serde_json::json!({ "a": { "b": { "c": 42 } } });
-        assert_eq!(navigate_claim(&val, "a.b.c").unwrap(), &serde_json::json!(42));
+        assert_eq!(
+            navigate_claim(&val, "a.b.c").unwrap(),
+            &serde_json::json!(42)
+        );
     }
 
     #[test]

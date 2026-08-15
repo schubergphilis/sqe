@@ -16,9 +16,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use jsonwebtoken::{
-    decode, decode_header, Algorithm, DecodingKey, TokenData, Validation,
-};
+use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, TokenData, Validation};
 use moka::future::Cache;
 use serde::Deserialize;
 use tokio::sync::Mutex;
@@ -220,10 +218,7 @@ impl BearerTokenProvider {
     /// Create a new provider with a custom reqwest client (for testing).
     #[cfg(test)]
     #[allow(dead_code)]
-    fn with_client(
-        config: BearerTokenProviderConfig,
-        client: reqwest::Client,
-    ) -> Self {
+    fn with_client(config: BearerTokenProviderConfig, client: reqwest::Client) -> Self {
         let jwks_cache = Cache::builder()
             .max_capacity(1)
             .time_to_live(Duration::from_secs(15 * 60))
@@ -260,9 +255,7 @@ impl BearerTokenProvider {
             .get(&self.config.jwks_url)
             .send()
             .await
-            .map_err(|e| {
-                AuthError::Internal(anyhow::anyhow!("JWKS fetch failed: {e}"))
-            })?;
+            .map_err(|e| AuthError::Internal(anyhow::anyhow!("JWKS fetch failed: {e}")))?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -374,18 +367,14 @@ impl BearerTokenProvider {
     /// Validate and decode a JWT token against the cached JWKS.
     ///
     /// On `kid` mismatch, refetches the JWKS once and retries (handles key rotation).
-    async fn validate_jwt(
-        &self,
-        token: &str,
-    ) -> Result<TokenData<serde_json::Value>, AuthError> {
+    async fn validate_jwt(&self, token: &str) -> Result<TokenData<serde_json::Value>, AuthError> {
         // Decode the JWT header to find the `kid`.
-        let header = decode_header(token).map_err(|e| {
-            AuthError::AuthFailed(format!("Invalid JWT header: {e}"))
-        })?;
+        let header = decode_header(token)
+            .map_err(|e| AuthError::AuthFailed(format!("Invalid JWT header: {e}")))?;
 
-        let kid = header.kid.ok_or_else(|| {
-            AuthError::AuthFailed("JWT header missing `kid` field".to_string())
-        })?;
+        let kid = header
+            .kid
+            .ok_or_else(|| AuthError::AuthFailed("JWT header missing `kid` field".to_string()))?;
 
         // Build the validation configuration.
         let mut validation = Validation::new(Algorithm::RS256);
@@ -436,28 +425,21 @@ impl BearerTokenProvider {
         let jwks = self.refetch_jwks().await?;
 
         let decoding_key = jwks.get(&kid).ok_or_else(|| {
-            AuthError::AuthFailed(format!(
-                "Key ID '{kid}' not found in JWKS after refresh"
-            ))
+            AuthError::AuthFailed(format!("Key ID '{kid}' not found in JWKS after refresh"))
         })?;
 
-        decode::<serde_json::Value>(token, decoding_key, &validation)
-            .map_err(Self::map_jwt_error)
+        decode::<serde_json::Value>(token, decoding_key, &validation).map_err(Self::map_jwt_error)
     }
 
     /// Map a `jsonwebtoken::errors::Error` to an `AuthError`.
     fn map_jwt_error(err: jsonwebtoken::errors::Error) -> AuthError {
         use jsonwebtoken::errors::ErrorKind;
         match err.kind() {
-            ErrorKind::ExpiredSignature => {
-                AuthError::AuthFailed("JWT has expired".to_string())
-            }
+            ErrorKind::ExpiredSignature => AuthError::AuthFailed("JWT has expired".to_string()),
             ErrorKind::InvalidAudience => {
                 AuthError::AuthFailed("JWT audience mismatch".to_string())
             }
-            ErrorKind::InvalidIssuer => {
-                AuthError::AuthFailed("JWT issuer mismatch".to_string())
-            }
+            ErrorKind::InvalidIssuer => AuthError::AuthFailed("JWT issuer mismatch".to_string()),
             ErrorKind::InvalidSignature => {
                 AuthError::AuthFailed("JWT signature verification failed".to_string())
             }
@@ -478,10 +460,7 @@ impl BearerTokenProvider {
     }
 
     /// Extract the user ID from JWT claims using the configured `user_claim`.
-    fn extract_user_id(
-        claims: &serde_json::Value,
-        user_claim: &str,
-    ) -> Option<String> {
+    fn extract_user_id(claims: &serde_json::Value, user_claim: &str) -> Option<String> {
         Self::extract_claim_by_path(claims, user_claim)
             .and_then(|v| v.as_str())
             .map(String::from)
@@ -550,13 +529,9 @@ impl AuthProvider for BearerTokenProvider {
         let claims = &token_data.claims;
 
         // Step 4: Extract user identity and roles.
-        let user_id = Self::extract_user_id(claims, &self.config.user_claim)
-            .ok_or_else(|| {
-                AuthError::AuthFailed(format!(
-                    "JWT missing '{}' claim",
-                    self.config.user_claim
-                ))
-            })?;
+        let user_id = Self::extract_user_id(claims, &self.config.user_claim).ok_or_else(|| {
+            AuthError::AuthFailed(format!("JWT missing '{}' claim", self.config.user_claim))
+        })?;
 
         let roles = Self::extract_roles(claims, &self.config.roles_claim);
 
@@ -673,8 +648,7 @@ fGaGdPurwOnXPCbnSxiTHsQWwcx2KhPWpUsg/msrL8LU3DRravWV
     }
 
     static TEST_KEYS: LazyLock<TestKeyPair> = LazyLock::new(|| {
-        let encoding_key =
-            EncodingKey::from_rsa_pem(TEST_RSA_PRIVATE_KEY_PEM.as_bytes()).unwrap();
+        let encoding_key = EncodingKey::from_rsa_pem(TEST_RSA_PRIVATE_KEY_PEM.as_bytes()).unwrap();
         TestKeyPair {
             encoding_key,
             n: TEST_RSA_N.to_string(),
@@ -734,7 +708,9 @@ fGaGdPurwOnXPCbnSxiTHsQWwcx2KhPWpUsg/msrL8LU3DRravWV
     #[test]
     fn detect_jwt_from_bearer_token() {
         let creds = FlightCredentials {
-            bearer_token: Some(sqe_core::SecretString::new("eyJhbGciOiJSUzI1NiJ9.payload.sig".to_string())),
+            bearer_token: Some(sqe_core::SecretString::new(
+                "eyJhbGciOiJSUzI1NiJ9.payload.sig".to_string(),
+            )),
             ..Default::default()
         };
         let token = BearerTokenProvider::detect_jwt(&creds);
@@ -745,7 +721,9 @@ fGaGdPurwOnXPCbnSxiTHsQWwcx2KhPWpUsg/msrL8LU3DRravWV
     #[test]
     fn detect_jwt_from_password_field() {
         let creds = FlightCredentials {
-            password: Some(sqe_core::SecretString::new("eyJhbGciOiJSUzI1NiJ9.payload.sig".to_string())),
+            password: Some(sqe_core::SecretString::new(
+                "eyJhbGciOiJSUzI1NiJ9.payload.sig".to_string(),
+            )),
             ..Default::default()
         };
         let token = BearerTokenProvider::detect_jwt(&creds);
@@ -796,16 +774,14 @@ fGaGdPurwOnXPCbnSxiTHsQWwcx2KhPWpUsg/msrL8LU3DRravWV
                 "roles": ["admin", "user"]
             }
         });
-        let result =
-            BearerTokenProvider::extract_claim_by_path(&claims, "realm_access.roles");
+        let result = BearerTokenProvider::extract_claim_by_path(&claims, "realm_access.roles");
         assert!(result.unwrap().is_array());
     }
 
     #[test]
     fn extract_claim_missing_path() {
         let claims = json!({"sub": "alice"});
-        let result =
-            BearerTokenProvider::extract_claim_by_path(&claims, "nonexistent.path");
+        let result = BearerTokenProvider::extract_claim_by_path(&claims, "nonexistent.path");
         assert!(result.is_none());
     }
 
@@ -848,8 +824,7 @@ fGaGdPurwOnXPCbnSxiTHsQWwcx2KhPWpUsg/msrL8LU3DRravWV
                 "roles": ["admin", "user"]
             }
         });
-        let roles =
-            BearerTokenProvider::extract_roles(&claims, "realm_access.roles");
+        let roles = BearerTokenProvider::extract_roles(&claims, "realm_access.roles");
         assert_eq!(roles, vec!["admin", "user"]);
     }
 
@@ -863,8 +838,7 @@ fGaGdPurwOnXPCbnSxiTHsQWwcx2KhPWpUsg/msrL8LU3DRravWV
     #[test]
     fn extract_roles_missing_returns_empty() {
         let claims = json!({"sub": "alice"});
-        let roles =
-            BearerTokenProvider::extract_roles(&claims, "realm_access.roles");
+        let roles = BearerTokenProvider::extract_roles(&claims, "realm_access.roles");
         assert!(roles.is_empty());
     }
 
@@ -931,8 +905,11 @@ fGaGdPurwOnXPCbnSxiTHsQWwcx2KhPWpUsg/msrL8LU3DRravWV
     /// Start a mock HTTP server that tracks request counts (for JWKS refetch testing).
     async fn start_counting_jwks_server(
         jwks_json: serde_json::Value,
-    ) -> (tokio::task::JoinHandle<()>, String, Arc<std::sync::atomic::AtomicUsize>)
-    {
+    ) -> (
+        tokio::task::JoinHandle<()>,
+        String,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let url = format!("http://127.0.0.1:{}", addr.port());
@@ -1012,8 +989,8 @@ fGaGdPurwOnXPCbnSxiTHsQWwcx2KhPWpUsg/msrL8LU3DRravWV
         // Issue #26: JWT `exp` must propagate into the Identity so SessionManager
         // can evict the cached session when the underlying bearer actually
         // expires, not on a hard-coded 1h.
-        let expected_exp = chrono::DateTime::from_timestamp((now + 3600) as i64, 0)
-            .expect("valid timestamp");
+        let expected_exp =
+            chrono::DateTime::from_timestamp((now + 3600) as i64, 0).expect("valid timestamp");
         assert_eq!(identity.expires_at, Some(expected_exp));
     }
 
@@ -1046,10 +1023,7 @@ fGaGdPurwOnXPCbnSxiTHsQWwcx2KhPWpUsg/msrL8LU3DRravWV
         let result = provider.authenticate(&creds).await;
         match result {
             Err(AuthError::AuthFailed(msg)) => {
-                assert!(
-                    msg.contains("expired"),
-                    "Expected expiry error, got: {msg}"
-                );
+                assert!(msg.contains("expired"), "Expected expiry error, got: {msg}");
             }
             other => panic!("Expected AuthFailed, got: {other:?}"),
         }
@@ -1108,8 +1082,7 @@ fGaGdPurwOnXPCbnSxiTHsQWwcx2KhPWpUsg/msrL8LU3DRravWV
         // return the correct key). The key point is verifying that the JWKS
         // endpoint is called more than once when the kid is initially unknown.
         let jwks = build_jwks_json();
-        let (_handle, jwks_url, counter) =
-            start_counting_jwks_server(jwks).await;
+        let (_handle, jwks_url, counter) = start_counting_jwks_server(jwks).await;
 
         let config = test_config(&jwks_url);
         let provider = BearerTokenProvider::new(config).unwrap();
@@ -1146,8 +1119,7 @@ fGaGdPurwOnXPCbnSxiTHsQWwcx2KhPWpUsg/msrL8LU3DRravWV
         assert_eq!(identity.roles, vec!["viewer"]);
 
         // The JWKS endpoint should have been called at least once (the refetch).
-        let fetch_count =
-            counter.load(std::sync::atomic::Ordering::SeqCst);
+        let fetch_count = counter.load(std::sync::atomic::Ordering::SeqCst);
         assert!(
             fetch_count >= 1,
             "Expected at least 1 JWKS fetch, got {fetch_count}"
@@ -1267,10 +1239,7 @@ fGaGdPurwOnXPCbnSxiTHsQWwcx2KhPWpUsg/msrL8LU3DRravWV
         let result = provider.authenticate(&creds).await;
         match result {
             Err(AuthError::AuthFailed(msg)) => {
-                assert!(
-                    msg.contains("issuer"),
-                    "Expected issuer error, got: {msg}"
-                );
+                assert!(msg.contains("issuer"), "Expected issuer error, got: {msg}");
             }
             other => panic!("Expected AuthFailed for issuer mismatch, got: {other:?}"),
         }
@@ -1388,7 +1357,10 @@ fGaGdPurwOnXPCbnSxiTHsQWwcx2KhPWpUsg/msrL8LU3DRravWV
         let result = provider.authenticate(&creds).await;
         match result {
             Err(AuthError::AuthFailed(msg)) => {
-                assert!(msg.contains("email"), "Expected mention of claim, got: {msg}");
+                assert!(
+                    msg.contains("email"),
+                    "Expected mention of claim, got: {msg}"
+                );
             }
             other => panic!("Expected AuthFailed, got: {other:?}"),
         }

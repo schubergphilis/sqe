@@ -421,11 +421,17 @@ mod tests {
     #[test]
     fn test_compare_subcommand_parses() {
         let args = Cli::parse_from([
-            "sqe-bench", "compare", "tpch",
-            "--scale", "1",
-            "--sqe-host", "localhost",
-            "--sqe-port", "50051",
-            "--trino-url", "http://localhost:8080",
+            "sqe-bench",
+            "compare",
+            "tpch",
+            "--scale",
+            "1",
+            "--sqe-host",
+            "localhost",
+            "--sqe-port",
+            "50051",
+            "--trino-url",
+            "http://localhost:8080",
         ]);
         match args.command {
             Command::Compare {
@@ -455,10 +461,23 @@ mod run_cli_tests {
     #[test]
     fn parses_run_with_multiple_suites() {
         let cli = Cli::parse_from([
-            "sqe-bench", "run", "tpch", "ssb", "--profile", "local", "--scale", "10",
+            "sqe-bench",
+            "run",
+            "tpch",
+            "ssb",
+            "--profile",
+            "local",
+            "--scale",
+            "10",
         ]);
         match cli.command {
-            Command::Run { suites, profile, scale, compare_trino, .. } => {
+            Command::Run {
+                suites,
+                profile,
+                scale,
+                compare_trino,
+                ..
+            } => {
                 assert_eq!(suites, vec!["tpch", "ssb"]);
                 assert_eq!(profile, "local");
                 assert_eq!(scale, 10.0);
@@ -472,7 +491,9 @@ mod run_cli_tests {
     fn run_defaults_host_and_port() {
         let cli = Cli::parse_from(["sqe-bench", "run", "tpch", "--profile", "local"]);
         match cli.command {
-            Command::Run { host, port, scale, .. } => {
+            Command::Run {
+                host, port, scale, ..
+            } => {
                 assert_eq!(host, "localhost");
                 assert_eq!(port, 60051);
                 assert_eq!(scale, 1.0);

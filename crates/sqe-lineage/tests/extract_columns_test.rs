@@ -279,7 +279,11 @@ fn join_passes_through_each_side_with_indirect_join_on_predicate() {
         .unwrap();
 
     let trace = columns::trace_plan(&plan);
-    assert_eq!(trace.len(), 4, "left.id, left.amount, right.id, right.region");
+    assert_eq!(
+        trace.len(),
+        4,
+        "left.id, left.amount, right.id, right.region"
+    );
 
     // Each output column has an IDENTITY dep from its source side
     let id_left = &trace[0];
@@ -312,7 +316,12 @@ fn join_passes_through_each_side_with_indirect_join_on_predicate() {
     assert_eq!(region_identity.table, "customers");
 
     // Every output column has INDIRECT/JOIN deps from join predicate columns
-    for (idx, name) in [(0, "id_left"), (1, "amount"), (2, "id_right"), (3, "region")] {
+    for (idx, name) in [
+        (0, "id_left"),
+        (1, "amount"),
+        (2, "id_right"),
+        (3, "region"),
+    ] {
         let join_deps: Vec<&str> = trace[idx]
             .iter()
             .filter(|d| d.transformation.subtype == "JOIN")
@@ -480,9 +489,7 @@ fn window_args_direct_partition_indirect() {
         // Each input also picks up an INDIRECT/WINDOW dep on user_id
         let win_dep = deps
             .iter()
-            .find(|d| {
-                d.transformation.subtype == "WINDOW" && d.transformation.kind == "INDIRECT"
-            })
+            .find(|d| d.transformation.subtype == "WINDOW" && d.transformation.kind == "INDIRECT")
             .unwrap_or_else(|| panic!("input column {idx} picks up INDIRECT/WINDOW"));
         // The user_id and ts are both referenced by partition/order; at minimum
         // the partition column must show up
@@ -493,9 +500,7 @@ fn window_args_direct_partition_indirect() {
     // user_id (partition) and ts (order_by)
     let win_field_set: std::collections::HashSet<&str> = trace[0]
         .iter()
-        .filter(|d| {
-            d.transformation.subtype == "WINDOW" && d.transformation.kind == "INDIRECT"
-        })
+        .filter(|d| d.transformation.subtype == "WINDOW" && d.transformation.kind == "INDIRECT")
         .map(|d| d.field.as_str())
         .collect();
     assert!(win_field_set.contains("user_id"));
@@ -505,8 +510,10 @@ fn window_args_direct_partition_indirect() {
     // (row_number has no args, so the only deps come from partition/order_by);
     // we still expect WINDOW deps and no IDENTITY deps for the new column.
     let rn = &trace[3];
-    let rn_subtypes: std::collections::HashSet<&str> =
-        rn.iter().map(|d| d.transformation.subtype.as_str()).collect();
+    let rn_subtypes: std::collections::HashSet<&str> = rn
+        .iter()
+        .map(|d| d.transformation.subtype.as_str())
+        .collect();
     assert!(
         rn_subtypes.contains("WINDOW"),
         "row_number column has WINDOW deps"
@@ -641,8 +648,8 @@ fn dml_insert_source_plan_traces_inputs() {
     // variant; MERGE is not represented as a single node. We verify the
     // dataset-level path stays intact for INSERT by tracing the SELECT
     // subplan of an `INSERT INTO ... SELECT id, amount FROM orders`.
-    use datafusion::logical_expr::dml::InsertOp;
     use datafusion::logical_expr::col;
+    use datafusion::logical_expr::dml::InsertOp;
 
     let scan = build_simple_scan(
         "polaris",

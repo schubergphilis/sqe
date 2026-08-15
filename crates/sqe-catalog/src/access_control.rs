@@ -110,7 +110,9 @@ impl AccessControlClient {
             .json(req)
             .send()
             .await
-            .map_err(|e| SqeError::execution_src(format!("Access control API request failed: {e}"), e))?;
+            .map_err(|e| {
+                SqeError::execution_src(format!("Access control API request failed: {e}"), e)
+            })?;
 
         let status = resp.status();
         if !status.is_success() {
@@ -136,7 +138,9 @@ impl AccessControlClient {
             .json(req)
             .send()
             .await
-            .map_err(|e| SqeError::execution_src(format!("Access control API request failed: {e}"), e))?;
+            .map_err(|e| {
+                SqeError::execution_src(format!("Access control API request failed: {e}"), e)
+            })?;
 
         let status = resp.status();
         if !status.is_success() {
@@ -166,7 +170,9 @@ impl AccessControlClient {
             .query(params)
             .send()
             .await
-            .map_err(|e| SqeError::execution_src(format!("Access control API request failed: {e}"), e))?;
+            .map_err(|e| {
+                SqeError::execution_src(format!("Access control API request failed: {e}"), e)
+            })?;
 
         let status = resp.status();
         if !status.is_success() {
@@ -176,10 +182,9 @@ impl AccessControlClient {
             )));
         }
 
-        let entries: Vec<GrantEntry> = resp
-            .json()
-            .await
-            .map_err(|e| SqeError::execution_src(format!("Failed to parse grants response: {e}"), e))?;
+        let entries: Vec<GrantEntry> = resp.json().await.map_err(|e| {
+            SqeError::execution_src(format!("Failed to parse grants response: {e}"), e)
+        })?;
 
         Ok(entries)
     }
@@ -201,7 +206,9 @@ impl AccessControlClient {
             .query(&[("user", user)])
             .send()
             .await
-            .map_err(|e| SqeError::execution_src(format!("Access control API request failed: {e}"), e))?;
+            .map_err(|e| {
+                SqeError::execution_src(format!("Access control API request failed: {e}"), e)
+            })?;
 
         let status = resp.status();
         if !status.is_success() {
@@ -211,12 +218,9 @@ impl AccessControlClient {
             )));
         }
 
-        let entries: Vec<GrantEntry> = resp
-            .json()
-            .await
-            .map_err(|e| {
-                SqeError::execution_src(format!("Failed to parse effective grants response: {e}"), e)
-            })?;
+        let entries: Vec<GrantEntry> = resp.json().await.map_err(|e| {
+            SqeError::execution_src(format!("Failed to parse effective grants response: {e}"), e)
+        })?;
 
         Ok(entries)
     }
@@ -238,7 +242,9 @@ impl AccessControlClient {
             .json(req)
             .send()
             .await
-            .map_err(|e| SqeError::execution_src(format!("Access control API request failed: {e}"), e))?;
+            .map_err(|e| {
+                SqeError::execution_src(format!("Access control API request failed: {e}"), e)
+            })?;
 
         let status = resp.status();
         if !status.is_success() {
@@ -248,12 +254,9 @@ impl AccessControlClient {
             )));
         }
 
-        let response: CheckAccessResponse = resp
-            .json()
-            .await
-            .map_err(|e| {
-                SqeError::execution_src(format!("Failed to parse check access response: {e}"), e)
-            })?;
+        let response: CheckAccessResponse = resp.json().await.map_err(|e| {
+            SqeError::execution_src(format!("Failed to parse check access response: {e}"), e)
+        })?;
 
         Ok(response)
     }
@@ -303,10 +306,19 @@ mod tests {
         let json: serde_json::Value = serde_json::to_value(&req).unwrap();
 
         assert_eq!(json["privilege"], "INSERT");
-        assert!(json.get("catalog").is_none(), "None catalog should be omitted");
-        assert!(json.get("namespace").is_none(), "None namespace should be omitted");
+        assert!(
+            json.get("catalog").is_none(),
+            "None catalog should be omitted"
+        );
+        assert!(
+            json.get("namespace").is_none(),
+            "None namespace should be omitted"
+        );
         assert!(json.get("table").is_none(), "None table should be omitted");
-        assert!(json.get("effect").is_none(), "None effect should be omitted");
+        assert!(
+            json.get("effect").is_none(),
+            "None effect should be omitted"
+        );
         // grantee_type and grantee_name are always present
         assert_eq!(json["grantee_type"], "NONE");
         assert_eq!(json["grantee_name"], "alice");

@@ -28,9 +28,9 @@
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
+use sqe_coordinator::maintenance::MaintenanceHandler;
 use sqe_core::config::SqeConfig;
 use sqe_core::{SecretString, Session};
-use sqe_coordinator::maintenance::MaintenanceHandler;
 use sqe_sql::{try_parse_call, ProcedureCall};
 
 /// A minimal config that deserializes cleanly. `catalog_url` points at a
@@ -150,15 +150,13 @@ min_workers = 2
     let handler = MaintenanceHandler::new(config);
     let session = session_with_write_privilege();
 
-    let call = parse_rewrite_call(
-        "CALL system.rewrite_data_files(table => 'default.nonexistent_table')",
-    );
+    let call =
+        parse_rewrite_call("CALL system.rewrite_data_files(table => 'default.nonexistent_table')");
 
     let result = handler.handle(&session, &call).await;
 
-    let err = result.expect_err(
-        "config-level require mode below the healthy-worker floor must error too",
-    );
+    let err = result
+        .expect_err("config-level require mode below the healthy-worker floor must error too");
     let message = err.to_string();
     assert!(
         message.contains("require") && message.contains("healthy"),

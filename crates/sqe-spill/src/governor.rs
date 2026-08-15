@@ -74,7 +74,11 @@ pub struct GrantGuard {
 }
 
 impl GrantGuard {
-    pub fn new(governor: Arc<MemoryGovernor>, query_id: impl Into<String>, name: impl Into<String>) -> Self {
+    pub fn new(
+        governor: Arc<MemoryGovernor>,
+        query_id: impl Into<String>,
+        name: impl Into<String>,
+    ) -> Self {
         Self {
             governor,
             query_id: query_id.into(),
@@ -152,8 +156,7 @@ impl MemoryGovernor {
     pub fn new(pool_bytes: usize) -> Self {
         let pool_bytes = pool_bytes.max(1);
         let (distributable, headroom) = split_default_read_headroom(pool_bytes);
-        let soft_limit = distributable
-            .saturating_mul(GOVERNOR_SOFT_WATERMARK_NUM)
+        let soft_limit = distributable.saturating_mul(GOVERNOR_SOFT_WATERMARK_NUM)
             / GOVERNOR_SOFT_WATERMARK_DEN.max(1);
         Self {
             pool_bytes: AtomicUsize::new(pool_bytes),
@@ -196,8 +199,7 @@ impl MemoryGovernor {
     pub fn try_resize_pool(&self, new_pool_bytes: usize) -> Result<(), String> {
         let new_pool = new_pool_bytes.max(1);
         let (distributable, headroom) = split_default_read_headroom(new_pool);
-        let soft_limit = distributable
-            .saturating_mul(GOVERNOR_SOFT_WATERMARK_NUM)
+        let soft_limit = distributable.saturating_mul(GOVERNOR_SOFT_WATERMARK_NUM)
             / GOVERNOR_SOFT_WATERMARK_DEN.max(1);
         let soft_limit = soft_limit.max(1);
 
@@ -371,10 +373,8 @@ impl MemoryGovernor {
     /// Release all grants for a query (stage completion / cancel).
     pub fn release_query(&self, query_id: &str) {
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
-        let (keep, drop): (Vec<_>, Vec<_>) = state
-            .active
-            .drain(..)
-            .partition(|g| g.query_id != query_id);
+        let (keep, drop): (Vec<_>, Vec<_>) =
+            state.active.drain(..).partition(|g| g.query_id != query_id);
         for g in drop {
             state.granted_sum = state.granted_sum.saturating_sub(g.granted);
             state.minima_sum = state.minima_sum.saturating_sub(g.minimum);
@@ -425,10 +425,7 @@ impl MemoryGovernor {
                     continue;
                 }
                 // Take a fair slice of this grant's excess.
-                let take = excess
-                    .min(remaining)
-                    .max(1)
-                    .min(excess);
+                let take = excess.min(remaining).max(1).min(excess);
                 g.granted = g.granted.saturating_sub(take);
                 state.granted_sum = state.granted_sum.saturating_sub(take);
                 reclaimed += take;
@@ -500,10 +497,7 @@ mod tests {
             desired: 8 * 1024 * 1024,
             minimum: 4 * 1024 * 1024,
         };
-        match gov.try_admit(
-            req("q", "j", WorkloadClass::Join, d.desired, d.minimum),
-            &d,
-        ) {
+        match gov.try_admit(req("q", "j", WorkloadClass::Join, d.desired, d.minimum), &d) {
             AdmissionDecision::Granted(_) => {}
             other => panic!("expected grant, got {other:?}"),
         }
@@ -512,7 +506,13 @@ mod tests {
         assert!(err.contains("minima"), "{err}");
     }
 
-    fn req(q: &str, name: &str, class: WorkloadClass, desired: usize, minimum: usize) -> AdmissionRequest {
+    fn req(
+        q: &str,
+        name: &str,
+        class: WorkloadClass,
+        desired: usize,
+        minimum: usize,
+    ) -> AdmissionRequest {
         AdmissionRequest {
             query_id: q.into(),
             name: name.into(),
@@ -569,10 +569,7 @@ mod tests {
                 minimum: 2 * 1024 * 1024,
             };
             let q = format!("q{i}");
-            match gov.try_admit(
-                req(&q, "op", WorkloadClass::Join, d.desired, d.minimum),
-                &d,
-            ) {
+            match gov.try_admit(req(&q, "op", WorkloadClass::Join, d.desired, d.minimum), &d) {
                 AdmissionDecision::Granted(_) => grants += 1,
                 AdmissionDecision::Rejected { .. } => break,
             }
@@ -658,7 +655,13 @@ mod tests {
                 minimum: 1024 * 1024,
             };
             if let Ok((_g, guard)) = gov.try_admit_guarded(
-                req(&format!("q{i}"), "op", WorkloadClass::Join, d.desired, d.minimum),
+                req(
+                    &format!("q{i}"),
+                    "op",
+                    WorkloadClass::Join,
+                    d.desired,
+                    d.minimum,
+                ),
                 &d,
             ) {
                 guards.push(guard);

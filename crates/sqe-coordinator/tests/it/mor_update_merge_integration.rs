@@ -9,8 +9,8 @@
 //! the full round trip against Polaris and Spark 4.1.
 
 use sqe_core::table_properties::{
-    WRITE_DELETE_MODE, WRITE_MERGE_MODE, WRITE_UPDATE_MODE, WriteMode, resolve_merge_mode,
-    resolve_update_mode,
+    resolve_merge_mode, resolve_update_mode, WriteMode, WRITE_DELETE_MODE, WRITE_MERGE_MODE,
+    WRITE_UPDATE_MODE,
 };
 use std::collections::HashMap;
 
@@ -94,7 +94,10 @@ fn update_mor_shape_is_data_plus_equality_delete() {
     let data_file_count = 1;
     let equality_delete_count = 1;
     let removed_data_file_count = 0;
-    assert_eq!(data_file_count, 1, "UPDATE MoR must write 1 new data file per batch");
+    assert_eq!(
+        data_file_count, 1,
+        "UPDATE MoR must write 1 new data file per batch"
+    );
     assert_eq!(
         equality_delete_count, 1,
         "UPDATE MoR must write 1 equality-delete file per batch",

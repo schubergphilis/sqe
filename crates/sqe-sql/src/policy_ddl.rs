@@ -150,14 +150,26 @@ fn parse_column_mask<'a>(
     if !mask_type.eq_ignore_ascii_case("CUSTOM") && expression.is_some() {
         return syntax("USING is valid only with the CUSTOM mask type");
     }
-    Ok((FineGrainedPolicyKind::ColumnMask { mask_type, column, expression }, principal, rest))
+    Ok((
+        FineGrainedPolicyKind::ColumnMask {
+            mask_type,
+            column,
+            expression,
+        },
+        principal,
+        rest,
+    ))
 }
 
 fn parse_row_filter(rest: &str) -> Result<(FineGrainedPolicyKind, PolicyPrincipal, &str)> {
     let (principal, rest) = parse_principal(rest)?;
     let rest = expect_kw(rest, "USING")?;
     let (expression, rest) = take_parenthesized(rest)?;
-    Ok((FineGrainedPolicyKind::RowFilter { expression }, principal, rest))
+    Ok((
+        FineGrainedPolicyKind::RowFilter { expression },
+        principal,
+        rest,
+    ))
 }
 
 fn parse_principal(rest: &str) -> Result<(PolicyPrincipal, &str)> {
@@ -232,7 +244,9 @@ fn take_name<'a>(s: &'a str, what: &str) -> Result<(String, &'a str)> {
 fn expect_kw<'a>(s: &'a str, keyword: &str) -> Result<&'a str> {
     let s = s.trim_start();
     strip_prefix_ci(s, keyword)
-        .filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace) || rest.starts_with('('))
+        .filter(|rest| {
+            rest.is_empty() || rest.starts_with(char::is_whitespace) || rest.starts_with('(')
+        })
         .map(str::trim_start)
         .ok_or_else(|| SqeError::Execution(format!("CREATE POLICY: expected {keyword}")))
 }
@@ -264,12 +278,21 @@ mod tests {
         let parsed = try_parse_policy_ddl(
             "CREATE OR REPLACE POLICY p ON TABLE sales_wh.ac.orders \
              COLUMN MASK MASK_NULL TO ROLE engineer ON COLUMN amount",
-        ).unwrap().unwrap();
-        let PolicyDdlStatement::Create(stmt) = parsed else { panic!("create") };
+        )
+        .unwrap()
+        .unwrap();
+        let PolicyDdlStatement::Create(stmt) = parsed else {
+            panic!("create")
+        };
         assert!(stmt.or_replace);
-        assert_eq!(stmt.target, PolicyTarget::Table("sales_wh.ac.orders".into()));
+        assert_eq!(
+            stmt.target,
+            PolicyTarget::Table("sales_wh.ac.orders".into())
+        );
         assert_eq!(stmt.principal.kind, PolicyPrincipalKind::Role);
-        assert!(matches!(stmt.kind, FineGrainedPolicyKind::ColumnMask { column: Some(ref c), expression: None, .. } if c == "amount"));
+        assert!(
+            matches!(stmt.kind, FineGrainedPolicyKind::ColumnMask { column: Some(ref c), expression: None, .. } if c == "amount")
+        );
     }
 
     #[test]
@@ -277,9 +300,15 @@ mod tests {
         let parsed = try_parse_policy_ddl(
             "CREATE POLICY p ON TABLE c.s.t ROW FILTER TO ROLE engineer \
              USING (region = 'EU' AND note = 'it''s (safe)')",
-        ).unwrap().unwrap();
-        let PolicyDdlStatement::Create(stmt) = parsed else { panic!("create") };
-        assert!(matches!(stmt.kind, FineGrainedPolicyKind::RowFilter { ref expression } if expression.contains("it's (safe)") || expression.contains("it''s (safe)")));
+        )
+        .unwrap()
+        .unwrap();
+        let PolicyDdlStatement::Create(stmt) = parsed else {
+            panic!("create")
+        };
+        assert!(
+            matches!(stmt.kind, FineGrainedPolicyKind::RowFilter { ref expression } if expression.contains("it's (safe)") || expression.contains("it''s (safe)"))
+        );
     }
 
     #[test]
@@ -290,12 +319,18 @@ mod tests {
         ));
         assert_eq!(
             try_parse_policy_ddl("DROP POLICY IF EXISTS p;").unwrap(),
-            Some(PolicyDdlStatement::Drop(DropPolicyStatement { name: "p".into(), if_exists: true }))
+            Some(PolicyDdlStatement::Drop(DropPolicyStatement {
+                name: "p".into(),
+                if_exists: true
+            }))
         );
     }
 
     #[test]
     fn does_not_claim_unrelated_create() {
-        assert_eq!(try_parse_policy_ddl("CREATE TABLE t (id INT)").unwrap(), None);
+        assert_eq!(
+            try_parse_policy_ddl("CREATE TABLE t (id INT)").unwrap(),
+            None
+        );
     }
 }

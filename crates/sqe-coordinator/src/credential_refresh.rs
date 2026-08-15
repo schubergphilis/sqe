@@ -577,8 +577,7 @@ mod tests {
             expiry: Utc::now() + Duration::hours(1),
         };
 
-        let result =
-            push_credentials_to_worker("http://127.0.0.1:19999", &creds, "").await;
+        let result = push_credentials_to_worker("http://127.0.0.1:19999", &creds, "").await;
         assert!(result.is_err(), "push to unreachable worker should fail");
     }
 

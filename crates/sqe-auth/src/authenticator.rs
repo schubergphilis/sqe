@@ -5,12 +5,12 @@ use chrono::{DateTime, Duration, Utc};
 use tokio::sync::RwLock;
 use tracing::{debug, error, info};
 
+use sqe_core::config::AuthConfig;
 use sqe_core::SecretString;
 use sqe_core::Session;
-use sqe_core::config::AuthConfig;
 
-use crate::oidc_password::OidcPasswordClient;
 use crate::oauth::OAuthClient;
+use crate::oidc_password::OidcPasswordClient;
 use crate::provider::{AuthError, AuthProvider, FlightCredentials, Identity};
 use crate::token_cache::{CachedToken, TokenCache};
 
@@ -80,25 +80,17 @@ impl Authenticator {
         })
     }
 
-    pub async fn authenticate(
-        &self,
-        username: &str,
-        password: &str,
-    ) -> sqe_core::Result<Session> {
+    pub async fn authenticate(&self, username: &str, password: &str) -> sqe_core::Result<Session> {
         match &self.backend {
             AuthBackend::OidcPassword(kc) => {
                 let token_response = kc.exchange_credentials(username, password).await?;
                 let roles = kc.extract_roles(&token_response.access_token);
-                let token_expiry =
-                    Utc::now() + Duration::seconds(token_response.expires_in as i64);
+                let token_expiry = Utc::now() + Duration::seconds(token_response.expires_in as i64);
 
                 let session = Session::new(
                     username.to_string(),
                     SecretString::new(token_response.access_token.clone()),
-                    token_response
-                        .refresh_token
-                        .clone()
-                        .map(SecretString::new),
+                    token_response.refresh_token.clone().map(SecretString::new),
                     token_expiry,
                     roles,
                 );
@@ -145,8 +137,7 @@ impl Authenticator {
 
                 // Token missing or near-expiry — fetch a fresh one.
                 let token_response = oauth.get_token().await?;
-                let token_expiry =
-                    Utc::now() + Duration::seconds(token_response.expires_in as i64);
+                let token_expiry = Utc::now() + Duration::seconds(token_response.expires_in as i64);
 
                 // Cache the service token for reuse.
                 {
@@ -205,8 +196,7 @@ impl Authenticator {
                     })?;
 
                 let token_response = kc.refresh_token(&refresh_token).await?;
-                let token_expiry =
-                    Utc::now() + Duration::seconds(token_response.expires_in as i64);
+                let token_expiry = Utc::now() + Duration::seconds(token_response.expires_in as i64);
 
                 session.rotate_credentials(sqe_core::Credentials::new(
                     SecretString::new(token_response.access_token.clone()),
@@ -228,8 +218,7 @@ impl Authenticator {
             AuthBackend::ClientCredentials(oauth) => {
                 // No refresh_token in client_credentials mode, simply re-fetch.
                 let token_response = oauth.get_token().await?;
-                let token_expiry =
-                    Utc::now() + Duration::seconds(token_response.expires_in as i64);
+                let token_expiry = Utc::now() + Duration::seconds(token_response.expires_in as i64);
 
                 session.rotate_credentials(sqe_core::Credentials::new(
                     SecretString::new(token_response.access_token.clone()),

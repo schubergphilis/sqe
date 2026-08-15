@@ -161,8 +161,11 @@ pub fn build_secret_from_stmt(stmt: &CreateSecretStatement) -> Result<Secret, Sq
                 ))
             })
     };
-    let get_opt =
-        |key: &str| -> Option<String> { opts.get(key).and_then(|v| v.as_str()).map(|s| s.to_string()) };
+    let get_opt = |key: &str| -> Option<String> {
+        opts.get(key)
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    };
 
     let secret = match stmt.kind {
         SecretKind::Aws => Secret::Aws {
@@ -172,7 +175,9 @@ pub fn build_secret_from_stmt(stmt: &CreateSecretStatement) -> Result<Secret, Sq
             region: get_opt("REGION"),
             profile: get_opt("PROFILE"),
         },
-        SecretKind::Bearer => Secret::Bearer { token: get_str("TOKEN")? },
+        SecretKind::Bearer => Secret::Bearer {
+            token: get_str("TOKEN")?,
+        },
         SecretKind::Basic => Secret::Basic {
             username: get_str("USERNAME")?,
             password: get_str("PASSWORD")?,
@@ -227,8 +232,8 @@ pub fn try_parse_attach(sql: &str) -> Result<Option<AttachStatement>, SqeError> 
     let after_as = after_as.trim();
 
     // Extract the name: bare identifier up to the first whitespace or `(`.
-    let (name, after_name) = take_identifier(after_as)
-        .ok_or_else(|| err("ATTACH: expected catalog name after AS"))?;
+    let (name, after_name) =
+        take_identifier(after_as).ok_or_else(|| err("ATTACH: expected catalog name after AS"))?;
     let after_name = after_name.trim();
 
     // The remainder must be a `(...)` option list. If not, this is not the
@@ -277,7 +282,9 @@ pub fn try_parse_detach(sql: &str) -> Result<Option<DetachStatement>, SqeError> 
             "DETACH: unexpected trailing tokens after name '{name}'"
         )));
     }
-    Ok(Some(DetachStatement { name: name.to_string() }))
+    Ok(Some(DetachStatement {
+        name: name.to_string(),
+    }))
 }
 
 /// Try to parse `CREATE SECRET <name> (TYPE <kind>, <option> = <value>, ...)`.
@@ -289,11 +296,13 @@ pub fn try_parse_create_secret(sql: &str) -> Result<Option<CreateSecretStatement
     }
 
     let body = trimmed["CREATE SECRET ".len()..].trim();
-    let (name, after_name) = take_identifier(body)
-        .ok_or_else(|| err("CREATE SECRET: expected secret name"))?;
+    let (name, after_name) =
+        take_identifier(body).ok_or_else(|| err("CREATE SECRET: expected secret name"))?;
     let after_name = after_name.trim();
     if !after_name.starts_with('(') || !after_name.ends_with(')') {
-        return Err(err("CREATE SECRET: expected (TYPE <kind>, ...) option list"));
+        return Err(err(
+            "CREATE SECRET: expected (TYPE <kind>, ...) option list",
+        ));
     }
     let inner = &after_name[1..after_name.len() - 1];
     let mut options = parse_option_list(inner)?;
@@ -320,14 +329,16 @@ pub fn try_parse_drop_secret(sql: &str) -> Result<Option<DropSecretStatement>, S
         return Ok(None);
     }
     let body = trimmed["DROP SECRET ".len()..].trim();
-    let (name, rest) = take_identifier(body)
-        .ok_or_else(|| err("DROP SECRET: expected secret name"))?;
+    let (name, rest) =
+        take_identifier(body).ok_or_else(|| err("DROP SECRET: expected secret name"))?;
     if !rest.trim().is_empty() {
         return Err(err(&format!(
             "DROP SECRET: unexpected trailing tokens after name '{name}'"
         )));
     }
-    Ok(Some(DropSecretStatement { name: name.to_string() }))
+    Ok(Some(DropSecretStatement {
+        name: name.to_string(),
+    }))
 }
 
 /// Returns `true` if the SQL is `SHOW SECRETS` (case-insensitive, with or
@@ -558,7 +569,10 @@ mod tests {
 
     #[test]
     fn catalog_kind_parses_all_variants() {
-        assert_eq!(CatalogKind::parse("iceberg_rest"), Some(CatalogKind::IcebergRest));
+        assert_eq!(
+            CatalogKind::parse("iceberg_rest"),
+            Some(CatalogKind::IcebergRest)
+        );
         assert_eq!(CatalogKind::parse("rest"), Some(CatalogKind::IcebergRest));
         assert_eq!(CatalogKind::parse("glue"), Some(CatalogKind::Glue));
         assert_eq!(CatalogKind::parse("s3tables"), Some(CatalogKind::S3Tables));
@@ -571,7 +585,10 @@ mod tests {
 
     #[test]
     fn catalog_kind_parse_is_case_insensitive() {
-        assert_eq!(CatalogKind::parse("ICEBERG_REST"), Some(CatalogKind::IcebergRest));
+        assert_eq!(
+            CatalogKind::parse("ICEBERG_REST"),
+            Some(CatalogKind::IcebergRest)
+        );
         assert_eq!(CatalogKind::parse("Glue"), Some(CatalogKind::Glue));
         assert_eq!(CatalogKind::parse("HaDoOp"), Some(CatalogKind::Hadoop));
     }
@@ -595,7 +612,11 @@ mod tests {
             CatalogKind::Hadoop,
         ] {
             // Every canonical name must round-trip through parse().
-            assert_eq!(CatalogKind::parse(k.name()), Some(k), "round-trip failed for {k:?}");
+            assert_eq!(
+                CatalogKind::parse(k.name()),
+                Some(k),
+                "round-trip failed for {k:?}"
+            );
         }
     }
 
@@ -651,7 +672,9 @@ mod tests {
         };
         assert_eq!(attach.kind, CatalogKind::IcebergRest);
 
-        let detach = DetachStatement { name: "polaris".to_string() };
+        let detach = DetachStatement {
+            name: "polaris".to_string(),
+        };
         assert_eq!(detach.name, "polaris");
 
         let create = CreateSecretStatement {
@@ -661,7 +684,9 @@ mod tests {
         };
         assert_eq!(create.kind, SecretKind::Aws);
 
-        let drop_s = DropSecretStatement { name: "aws_prod".to_string() };
+        let drop_s = DropSecretStatement {
+            name: "aws_prod".to_string(),
+        };
         assert_eq!(drop_s.name, "aws_prod");
     }
 }

@@ -12,15 +12,15 @@ use sqe_core::config::{AuthConfig, AuthProviderConfig};
 
 use crate::anonymous::{AnonymousProvider, AnonymousProviderConfig};
 use crate::api_key::{ApiKeyProvider, ApiKeyProviderConfig};
+use crate::authenticator::Authenticator;
 use crate::aws_iam::{AwsIamProvider, AwsIamProviderConfig};
 use crate::bearer_token::{BearerTokenProvider, BearerTokenProviderConfig};
 use crate::chain::AuthChain;
 use crate::mtls::{MtlsProvider, MtlsProviderConfig};
 use crate::oidc_client_credentials::{OidcClientCredentialsConfig, OidcClientCredentialsProvider};
 use crate::oidc_provider::{OidcPasswordProvider, OidcPasswordProviderConfig};
-use crate::token_exchange::{TokenExchangeProvider, TokenExchangeConfig};
 use crate::provider::AuthProvider;
-use crate::authenticator::Authenticator;
+use crate::token_exchange::{TokenExchangeConfig, TokenExchangeProvider};
 
 /// Build an `AuthChain` from the given `AuthConfig`.
 ///
@@ -203,9 +203,7 @@ pub async fn build_auth_chain(config: &AuthConfig) -> sqe_core::Result<AuthChain
                         ..Default::default()
                     };
                     let provider = ApiKeyProvider::new(ak_config).map_err(|e| {
-                        sqe_core::SqeError::Config(format!(
-                            "Failed to create ApiKeyProvider: {e}"
-                        ))
+                        sqe_core::SqeError::Config(format!("Failed to create ApiKeyProvider: {e}"))
                     })?;
                     Arc::new(provider)
                 }

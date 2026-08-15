@@ -258,7 +258,10 @@ pub fn is_gcs_path(path: &str) -> bool {
 /// account in the shorthand forms must come from `[storage.azure]` or `azure_account`
 /// inline argument.
 pub fn extract_azure_container_account(path: &str) -> Option<(String, String)> {
-    if let Some(rest) = path.strip_prefix("abfss://").or_else(|| path.strip_prefix("abfs://")) {
+    if let Some(rest) = path
+        .strip_prefix("abfss://")
+        .or_else(|| path.strip_prefix("abfs://"))
+    {
         let (auth, _) = rest.split_once('/').unwrap_or((rest, ""));
         let (container, host) = auth.split_once('@')?;
         if container.is_empty() || host.is_empty() {
@@ -270,7 +273,10 @@ pub fn extract_azure_container_account(path: &str) -> Option<(String, String)> {
             .unwrap_or_else(|| host.to_string());
         return Some((container.to_string(), account));
     }
-    if let Some(rest) = path.strip_prefix("azure://").or_else(|| path.strip_prefix("az://")) {
+    if let Some(rest) = path
+        .strip_prefix("azure://")
+        .or_else(|| path.strip_prefix("az://"))
+    {
         let container = rest.split('/').next()?;
         if container.is_empty() {
             return None;
@@ -432,11 +438,7 @@ pub fn extract_bucket(path: &str) -> Option<&str> {
 /// shared path + S3 credential args; format-specific named args are routed
 /// through `extra` which is called with `(name, value)` for each unknown
 /// key. If `extra` returns `false`, the unknown key produces a plan error.
-pub fn parse_file_tvf_args<F>(
-    fn_name: &str,
-    exprs: &[Expr],
-    mut extra: F,
-) -> DFResult<FileTvfArgs>
+pub fn parse_file_tvf_args<F>(fn_name: &str, exprs: &[Expr], mut extra: F) -> DFResult<FileTvfArgs>
 where
     F: FnMut(&str, &str) -> bool,
 {
@@ -580,9 +582,10 @@ pub fn build_s3_store(
     // cover this argument, so a benign s3:// path could still be paired
     // with a hostile endpoint to pivot the S3 client at IMDS.
     if args.endpoint.as_deref().is_some_and(|s| !s.is_empty()) {
-        storage.tvf.check_endpoint(endpoint).map_err(|e| {
-            datafusion::error::DataFusionError::Plan(format!("{fn_name}: {e}"))
-        })?;
+        storage
+            .tvf
+            .check_endpoint(endpoint)
+            .map_err(|e| datafusion::error::DataFusionError::Plan(format!("{fn_name}: {e}")))?;
     }
 
     let region = args
@@ -770,8 +773,8 @@ pub fn build_azure_store(
     args: &FileTvfArgs,
     storage: &StorageConfig,
 ) -> DFResult<object_store::azure::MicrosoftAzure> {
-    let (container, account_from_url) = extract_azure_container_account(&args.path)
-        .ok_or_else(|| {
+    let (container, account_from_url) =
+        extract_azure_container_account(&args.path).ok_or_else(|| {
             DataFusionError::Plan(format!(
                 "{fn_name}: could not parse container / account from Azure URL '{}'",
                 args.path
@@ -834,13 +837,12 @@ pub fn register_azure_store_if_needed(
         return Ok(());
     }
     let store = build_azure_store(fn_name, args, storage)?;
-    let (container, _account) = extract_azure_container_account(&args.path)
-        .ok_or_else(|| {
-            DataFusionError::Plan(format!(
-                "{fn_name}: could not parse container from Azure URL '{}'",
-                args.path
-            ))
-        })?;
+    let (container, _account) = extract_azure_container_account(&args.path).ok_or_else(|| {
+        DataFusionError::Plan(format!(
+            "{fn_name}: could not parse container from Azure URL '{}'",
+            args.path
+        ))
+    })?;
     // Pick the same scheme the user gave us so DataFusion's URL matcher
     // (which keys on scheme + host) finds the store on subsequent reads.
     let scheme = if args.path.starts_with("abfss://") {
@@ -1090,7 +1092,10 @@ mod tests {
     fn tilde_expands_only_for_local_paths() {
         let home = Some("/home/u");
         // Local paths with a leading ~ expand to $HOME.
-        assert_eq!(expand_tilde("~/Downloads/x.csv", home), "/home/u/Downloads/x.csv");
+        assert_eq!(
+            expand_tilde("~/Downloads/x.csv", home),
+            "/home/u/Downloads/x.csv"
+        );
         assert_eq!(expand_tilde("~", home), "/home/u");
         // Absolute / relative local paths are untouched.
         assert_eq!(expand_tilde("/abs/x.csv", home), "/abs/x.csv");
@@ -1163,7 +1168,10 @@ mod tests {
         let err = enforce_tvf_path_policy("read_csv", &args, &storage, &caller).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("allowed_object_store_prefixes"), "got: {msg}");
-        assert!(msg.contains("alice"), "denial must name the principal: {msg}");
+        assert!(
+            msg.contains("alice"),
+            "denial must name the principal: {msg}"
+        );
     }
 
     #[test]
@@ -1435,8 +1443,7 @@ mod tests {
         // HuggingFace's path parser sees one path segment for the branch
         // ref. Otherwise the slashes would split the URL into the wrong
         // shape.
-        let out =
-            resolve_hf_url("hf://datasets/foo/bar@refs/heads/dev/data.parquet").unwrap();
+        let out = resolve_hf_url("hf://datasets/foo/bar@refs/heads/dev/data.parquet").unwrap();
         // The first slash after the @-revision belongs to the path, not
         // the revision name. Our parser is conservative: stop at the next
         // path segment.
@@ -1444,8 +1451,7 @@ mod tests {
         // with slashes need URL-encoding by the user or the ?revision form.
         // Document this by asserting the simple split-once behaviour.
         assert!(
-            out.contains("/resolve/refs/")
-                || out.contains("/resolve/refs%2Fheads%2Fdev/"),
+            out.contains("/resolve/refs/") || out.contains("/resolve/refs%2Fheads%2Fdev/"),
             "rejected behaviour ok; resolved URL was: {out}"
         );
     }
@@ -1454,9 +1460,7 @@ mod tests {
     fn resolve_hf_url_at_revision_and_query_revision_conflict_rejected() {
         // Both inline and query revision -> reject so the user sees the
         // typo rather than silent precedence.
-        let out = resolve_hf_url(
-            "hf://datasets/foo/bar@v1.0/data.parquet?revision=v2.0",
-        );
+        let out = resolve_hf_url("hf://datasets/foo/bar@v1.0/data.parquet?revision=v2.0");
         assert!(
             out.is_none(),
             "conflicting revisions must reject; got {out:?}"
@@ -1532,10 +1536,7 @@ mod tests {
 
     #[test]
     fn parse_unknown_named_arg_errors_when_extra_rejects() {
-        let exprs = vec![
-            make_str_literal("/f.csv"),
-            make_named_arg("nonsense", "x"),
-        ];
+        let exprs = vec![make_str_literal("/f.csv"), make_named_arg("nonsense", "x")];
         let result = parse_file_tvf_args("read_csv", &exprs, |_, _| false);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("nonsense"));
@@ -1580,9 +1581,7 @@ mod tests {
         // Issue #46: defense-in-depth against SSRF via inline endpoint.
         let args = FileTvfArgs {
             path: "s3://bucket/data".to_string(),
-            endpoint: Some(
-                "http://169.254.169.254/latest/meta-data/iam/".to_string(),
-            ),
+            endpoint: Some("http://169.254.169.254/latest/meta-data/iam/".to_string()),
             ..FileTvfArgs::default()
         };
         let storage = StorageConfig::default();
@@ -1640,10 +1639,8 @@ mod tests {
 
     #[test]
     fn azure_extract_container_account_from_abfs() {
-        let r = extract_azure_container_account(
-            "abfs://c@a.dfs.core.windows.net/x/y.parquet",
-        )
-        .unwrap();
+        let r =
+            extract_azure_container_account("abfs://c@a.dfs.core.windows.net/x/y.parquet").unwrap();
         assert_eq!(r, ("c".to_string(), "a".to_string()));
     }
 
@@ -1660,15 +1657,13 @@ mod tests {
     #[test]
     fn azure_extract_returns_none_on_malformed() {
         // Missing container@account separator on abfss.
-        assert!(extract_azure_container_account(
-            "abfss://account.dfs.core.windows.net/path"
-        )
-        .is_none());
+        assert!(
+            extract_azure_container_account("abfss://account.dfs.core.windows.net/path").is_none()
+        );
         // Empty container.
-        assert!(extract_azure_container_account(
-            "abfss://@account.dfs.core.windows.net/path"
-        )
-        .is_none());
+        assert!(
+            extract_azure_container_account("abfss://@account.dfs.core.windows.net/path").is_none()
+        );
         // Not an Azure URL.
         assert!(extract_azure_container_account("s3://bucket/path").is_none());
     }
@@ -1688,7 +1683,10 @@ mod tests {
 
     #[test]
     fn gcs_extract_bucket() {
-        assert_eq!(extract_gcs_bucket("gs://my-bucket/key.parquet"), Some("my-bucket"));
+        assert_eq!(
+            extract_gcs_bucket("gs://my-bucket/key.parquet"),
+            Some("my-bucket")
+        );
         assert_eq!(extract_gcs_bucket("gcs://b/x"), Some("b"));
         assert_eq!(extract_gcs_bucket("gs://"), None);
         assert_eq!(extract_gcs_bucket("s3://bucket/key"), None);
@@ -1705,10 +1703,7 @@ mod tests {
 
     #[test]
     fn hf_dataset_with_explicit_revision() {
-        let r = resolve_hf_url(
-            "hf://datasets/squad/plain/train.parquet?revision=v1.0.0",
-        )
-        .unwrap();
+        let r = resolve_hf_url("hf://datasets/squad/plain/train.parquet?revision=v1.0.0").unwrap();
         assert_eq!(
             r,
             "https://huggingface.co/datasets/squad/plain/resolve/v1.0.0/train.parquet"
@@ -1746,17 +1741,13 @@ mod tests {
 
     #[test]
     fn hf_empty_revision_is_rejected() {
-        assert!(
-            resolve_hf_url("hf://datasets/squad/plain/train.parquet?revision=").is_none()
-        );
+        assert!(resolve_hf_url("hf://datasets/squad/plain/train.parquet?revision=").is_none());
     }
 
     #[test]
     fn hf_unknown_query_param_is_rejected() {
         // Catch typos like `?rev=` instead of silently defaulting to `main`.
-        assert!(
-            resolve_hf_url("hf://datasets/squad/plain/train.parquet?rev=v1.0").is_none()
-        );
+        assert!(resolve_hf_url("hf://datasets/squad/plain/train.parquet?rev=v1.0").is_none());
     }
 
     #[test]
@@ -1766,7 +1757,9 @@ mod tests {
             ..Default::default()
         };
         rewrite_hf_path_in_place("read_parquet", &mut args).unwrap();
-        assert!(args.path.starts_with("https://huggingface.co/datasets/squad/"));
+        assert!(args
+            .path
+            .starts_with("https://huggingface.co/datasets/squad/"));
     }
 
     #[test]
@@ -1787,7 +1780,10 @@ mod tests {
         };
         let r = rewrite_hf_path_in_place("read_parquet", &mut args);
         assert!(r.is_err());
-        assert!(r.unwrap_err().to_string().contains("malformed HuggingFace URL"));
+        assert!(r
+            .unwrap_err()
+            .to_string()
+            .contains("malformed HuggingFace URL"));
     }
 
     // -----------------------------------------------------------------------

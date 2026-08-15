@@ -34,26 +34,24 @@ pub use budget::{
     DEFAULT_BUDGET_GRANULARITY, DEFAULT_READ_HEADROOM_DEN, DEFAULT_READ_HEADROOM_NUM,
 };
 pub use error::{BudgetError, Result};
-pub use fault::{
-    clear_faults, faults_injected, install_faults, serial_test_guard, take_fault, FaultSession,
-    SpillFault,
-};
-pub use manager::{SpillManager, SpillScopeGuard};
 pub use exchange::{
     exchange_scope, read_manifest, write_manifest_atomic, AttemptManifest, AttemptState,
     ExchangeAttemptStore, SharedExchangeAttemptStore, TaskKey, ATTEMPT_MANIFEST_VERSION,
+};
+pub use fault::{
+    clear_faults, faults_injected, install_faults, serial_test_guard, take_fault, FaultSession,
+    SpillFault,
 };
 pub use governor::{
     AdmissionDecision, AdmissionRequest, GrantGuard, MemoryGovernor, SharedMemoryGovernor,
     WorkloadClass,
 };
-pub use resizable_pool::{ResizableFairSpillPool, ShrinkBelowUse};
+pub use manager::{SpillManager, SpillScopeGuard};
 pub use operator_admit::{
     admit_operator, LiveConsumerRegistry, OperatorConsumer, OperatorGrantGuard,
 };
-pub use reclaim::{
-    GrantRegistry, MemoryGrant, ReclaimableConsumer, SharedGrantRegistry,
-};
+pub use reclaim::{GrantRegistry, MemoryGrant, ReclaimableConsumer, SharedGrantRegistry};
+pub use resizable_pool::{ResizableFairSpillPool, ShrinkBelowUse};
 pub use scope::SpillScope;
 pub use segment::{SpillSegment, SEGMENT_FORMAT_VERSION, SEGMENT_MAGIC};
 pub use store::{SegmentReader, SegmentStore, SegmentWriter};

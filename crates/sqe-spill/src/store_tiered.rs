@@ -68,7 +68,10 @@ impl SegmentStore for TieredSegmentStore {
                     error = %e,
                     "Local spill pressure at create_writer; falling back to S3"
                 );
-                let w = self.s3.create_writer(scope, sequence, schema.clone()).await?;
+                let w = self
+                    .s3
+                    .create_writer(scope, sequence, schema.clone())
+                    .await?;
                 Ok(Box::new(TieredWriter {
                     inner: w,
                     backend: Backend::S3,
@@ -144,7 +147,10 @@ impl SegmentWriter for TieredWriter {
     async fn finish(self: Box<Self>) -> Result<SpillSegment> {
         match self.inner.finish().await {
             Ok(seg) => Ok(seg),
-            Err(e) if matches!(self.backend, Backend::Local) && TieredSegmentStore::is_local_pressure(&e) => {
+            Err(e)
+                if matches!(self.backend, Backend::Local)
+                    && TieredSegmentStore::is_local_pressure(&e) =>
+            {
                 // Cannot seamlessly re-write already-buffered batches after
                 // finish failed; surface pressure so the operator retries
                 // the stage. Future work: dual-write buffer for seamless fail-over.

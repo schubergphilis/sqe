@@ -23,14 +23,14 @@ use futures::TryStreamExt;
 use iceberg::spec::Schema as IcebergSchema;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg::{Catalog, NamespaceIdent, TableCreation, TableIdent};
+use sqe_coordinator::maintenance_principal::MaintenancePrincipal;
+use sqe_coordinator::maintenance_scheduler::MaintenanceScheduler;
 use sqe_core::config::{
     DistributionMode, MaintenanceCompactionConfig, MaintenanceConfig,
     MaintenanceDistributionConfig, MaintenanceMode, MaintenancePrincipalConfig,
     MaintenanceSchedulerConfig,
 };
 use sqe_core::{SecretStore, SecretString};
-use sqe_coordinator::maintenance_principal::MaintenancePrincipal;
-use sqe_coordinator::maintenance_scheduler::MaintenanceScheduler;
 use sqe_metrics::audit::{AuditFormat, AuditLogger};
 use sqe_metrics::MetricsRegistry;
 use sqe_sql::CatalogKind;
@@ -42,13 +42,22 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 /// `maintenance_log_test.rs::sqlite_catalog`.
 async fn sqlite_catalog(dir: &TempDir) -> Arc<dyn Catalog> {
     let location = dir.path().to_str().expect("tempdir path is UTF-8");
-    sqe_catalog::mount::build_catalog(location, CatalogKind::Sqlite, &BTreeMap::new(), &SecretStore::new())
-        .await
-        .expect("sqlite catalog builds")
+    sqe_catalog::mount::build_catalog(
+        location,
+        CatalogKind::Sqlite,
+        &BTreeMap::new(),
+        &SecretStore::new(),
+    )
+    .await
+    .expect("sqlite catalog builds")
 }
 
 fn one_col_arrow_schema() -> Arc<ArrowSchema> {
-    Arc::new(ArrowSchema::new(vec![Field::new("id", DataType::Int64, false)]))
+    Arc::new(ArrowSchema::new(vec![Field::new(
+        "id",
+        DataType::Int64,
+        false,
+    )]))
 }
 
 /// Create a single-column (`id BIGINT`) table, optionally opted into the
@@ -60,7 +69,11 @@ async fn create_table(
     opted_in: bool,
 ) -> TableIdent {
     let ns_ident = NamespaceIdent::new(ns.to_string());
-    if !catalog.namespace_exists(&ns_ident).await.expect("namespace_exists") {
+    if !catalog
+        .namespace_exists(&ns_ident)
+        .await
+        .expect("namespace_exists")
+    {
         catalog
             .create_namespace(&ns_ident, HashMap::new())
             .await
@@ -100,7 +113,11 @@ async fn create_table_with_props(
     extra_props: HashMap<String, String>,
 ) -> TableIdent {
     let ns_ident = NamespaceIdent::new(ns.to_string());
-    if !catalog.namespace_exists(&ns_ident).await.expect("namespace_exists") {
+    if !catalog
+        .namespace_exists(&ns_ident)
+        .await
+        .expect("namespace_exists")
+    {
         catalog
             .create_namespace(&ns_ident, HashMap::new())
             .await
@@ -132,36 +149,54 @@ async fn create_table_with_props(
 /// in one `fast_append`, so `live_data_files == file_count` and every file
 /// is "small" under the default (512 MiB) target size.
 async fn seed_small_files(catalog: &Arc<dyn Catalog>, ident: &TableIdent, file_count: i64) {
-    let table = catalog.load_table(ident).await.expect("load table for seeding");
+    let table = catalog
+        .load_table(ident)
+        .await
+        .expect("load table for seeding");
     let compression = sqe_coordinator::writer::parse_parquet_compression("zstd");
     let mut all_files = Vec::new();
     for i in 0..file_count {
-        let batch = RecordBatch::try_new(one_col_arrow_schema(), vec![Arc::new(Int64Array::from(vec![i]))])
-            .expect("build one-row batch");
+        let batch = RecordBatch::try_new(
+            one_col_arrow_schema(),
+            vec![Arc::new(Int64Array::from(vec![i]))],
+        )
+        .expect("build one-row batch");
         let tracker = sqe_coordinator::writer::new_upload_tracker();
-        let files = sqe_coordinator::writer::write_data_files(&table, vec![batch], "seed", compression, tracker)
-            .await
-            .expect("write seed data file");
+        let files = sqe_coordinator::writer::write_data_files(
+            &table,
+            vec![batch],
+            "seed",
+            compression,
+            tracker,
+        )
+        .await
+        .expect("write seed data file");
         all_files.extend(files);
     }
 
     let tx = Transaction::new(&table);
     let action = tx.fast_append().add_data_files(all_files);
     let tx = action.apply(tx).expect("apply fast_append");
-    tx.commit(catalog.as_ref()).await.expect("commit seed data files");
+    tx.commit(catalog.as_ref())
+        .await
+        .expect("commit seed data files");
 }
 
 /// Create `sqe_system.maintenance_log` with the fixed schema documented in
 /// `maintenance_log.rs`. Mirrors `maintenance_log_test.rs`.
 async fn create_maintenance_log_table(catalog: &Arc<dyn Catalog>) {
     catalog
-        .create_namespace(&NamespaceIdent::new("sqe_system".to_string()), HashMap::new())
+        .create_namespace(
+            &NamespaceIdent::new("sqe_system".to_string()),
+            HashMap::new(),
+        )
         .await
         .expect("create sqe_system namespace");
 
     let arrow_schema = sqe_coordinator::maintenance_log::maintenance_log_arrow_schema();
-    let iceberg_schema: IcebergSchema = iceberg::arrow::arrow_schema_to_schema_auto_assign_ids(&arrow_schema)
-        .expect("arrow schema converts to iceberg schema");
+    let iceberg_schema: IcebergSchema =
+        iceberg::arrow::arrow_schema_to_schema_auto_assign_ids(&arrow_schema)
+            .expect("arrow schema converts to iceberg schema");
 
     let creation = TableCreation::builder()
         .name("maintenance_log".to_string())
@@ -326,7 +361,9 @@ async fn advisory_tick_reports_opted_table_and_mutates_nothing() {
             Box::pin(async move { Ok(catalog) })
         });
 
-    let handler = Arc::new(sqe_coordinator::maintenance::MaintenanceHandler::new(minimal_sqe_config()));
+    let handler = Arc::new(sqe_coordinator::maintenance::MaintenanceHandler::new(
+        minimal_sqe_config(),
+    ));
     let scheduler = MaintenanceScheduler::new(
         cfg,
         principal,
@@ -336,7 +373,10 @@ async fn advisory_tick_reports_opted_table_and_mutates_nothing() {
         handler,
     );
 
-    scheduler.advisory_tick().await.expect("advisory_tick succeeds");
+    scheduler
+        .advisory_tick()
+        .await
+        .expect("advisory_tick succeeds");
 
     // --- Gauges: the opted table's are set to the expected values ---
     assert_eq!(
@@ -350,7 +390,8 @@ async fn advisory_tick_reports_opted_table_and_mutates_nothing() {
         "opted table has no delete files"
     );
     assert!(
-        gauge_sample(&metrics, "sqe_maintenance_est_rewrite_bytes", "ns.opted").unwrap_or(0.0) > 0.0,
+        gauge_sample(&metrics, "sqe_maintenance_est_rewrite_bytes", "ns.opted").unwrap_or(0.0)
+            > 0.0,
         "3 files >= min_input_files(2) should form an eligible bin-pack group with nonzero bytes"
     );
 
@@ -398,7 +439,10 @@ async fn advisory_tick_reports_opted_table_and_mutates_nothing() {
         NamespaceIdent::new("sqe_system".to_string()),
         "maintenance_log".to_string(),
     );
-    let log_table = catalog.load_table(&log_ident).await.expect("reload log table");
+    let log_table = catalog
+        .load_table(&log_ident)
+        .await
+        .expect("reload log table");
     let batches: Vec<_> = log_table
         .scan()
         .build()
@@ -410,7 +454,10 @@ async fn advisory_tick_reports_opted_table_and_mutates_nothing() {
         .await
         .expect("collect log batches");
     let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-    assert_eq!(total_rows, 1, "exactly one advisory row must have been appended");
+    assert_eq!(
+        total_rows, 1,
+        "exactly one advisory row must have been appended"
+    );
 
     use arrow_array::{Array, StringArray};
     let mut seen_table_name = None;
@@ -459,7 +506,10 @@ async fn advisory_tick_reports_opted_table_and_mutates_nothing() {
         "expected exactly one Maintenance audit event, got: {audit_lines:?}"
     );
     let event = maintenance_events[0];
-    assert_eq!(event["actor"]["username"].as_str(), Some("svc-sqe-maintenance"));
+    assert_eq!(
+        event["actor"]["username"].as_str(),
+        Some("svc-sqe-maintenance")
+    );
     assert_eq!(event["resources"][0]["name"].as_str(), Some("opted"));
 }
 
@@ -480,7 +530,10 @@ fn active_maintenance_config(idp: &MockServer, min_input_files: usize) -> Mainte
 /// Distinct data file paths, not raw task count, in case a bare
 /// `iceberg-rust` scan ever splits one file into multiple tasks.
 async fn live_data_file_count(catalog: &Arc<dyn Catalog>, ident: &TableIdent) -> usize {
-    let table = catalog.load_table(ident).await.expect("load table for file count");
+    let table = catalog
+        .load_table(ident)
+        .await
+        .expect("load table for file count");
     let tasks: Vec<_> = table
         .scan()
         .build()
@@ -502,7 +555,10 @@ async fn live_data_file_count(catalog: &Arc<dyn Catalog>, ident: &TableIdent) ->
 /// preservation assertions (same values survive compaction, not merely the
 /// same count).
 async fn scan_id_values(catalog: &Arc<dyn Catalog>, ident: &TableIdent) -> Vec<i64> {
-    let table = catalog.load_table(ident).await.expect("load table for row scan");
+    let table = catalog
+        .load_table(ident)
+        .await
+        .expect("load table for row scan");
     let batches: Vec<RecordBatch> = table
         .scan()
         .build()
@@ -556,8 +612,14 @@ struct LogRowView {
 async fn scan_log_rows(catalog: &Arc<dyn Catalog>) -> Vec<LogRowView> {
     use arrow_array::{Array, StringArray};
 
-    let log_ident = TableIdent::new(NamespaceIdent::new("sqe_system".to_string()), "maintenance_log".to_string());
-    let log_table = catalog.load_table(&log_ident).await.expect("reload log table");
+    let log_ident = TableIdent::new(
+        NamespaceIdent::new("sqe_system".to_string()),
+        "maintenance_log".to_string(),
+    );
+    let log_table = catalog
+        .load_table(&log_ident)
+        .await
+        .expect("reload log table");
     let batches: Vec<RecordBatch> = log_table
         .scan()
         .build()
@@ -671,7 +733,10 @@ async fn active_tick_compacts_opted_table_and_leaves_others_untouched() {
     seed_small_files(&catalog, &opted_ident, 5).await;
     let rows_before = scan_id_values(&catalog, &opted_ident).await;
     let files_before = live_data_file_count(&catalog, &opted_ident).await;
-    assert_eq!(files_before, 5, "seed helper must produce exactly 5 live files");
+    assert_eq!(
+        files_before, 5,
+        "seed helper must produce exactly 5 live files"
+    );
 
     let plain_ident = create_table(&catalog, "ns", "active_plain", false).await;
     seed_small_files(&catalog, &plain_ident, 1).await;
@@ -705,7 +770,9 @@ async fn active_tick_compacts_opted_table_and_leaves_others_untouched() {
             let catalog = injected_catalog.clone();
             Box::pin(async move { Ok(catalog) })
         });
-    let handler = Arc::new(sqe_coordinator::maintenance::MaintenanceHandler::new(minimal_sqe_config()));
+    let handler = Arc::new(sqe_coordinator::maintenance::MaintenanceHandler::new(
+        minimal_sqe_config(),
+    ));
 
     let scheduler = MaintenanceScheduler::new(
         cfg,
@@ -716,7 +783,10 @@ async fn active_tick_compacts_opted_table_and_leaves_others_untouched() {
         handler,
     );
 
-    scheduler.advisory_tick().await.expect("active tick succeeds");
+    scheduler
+        .advisory_tick()
+        .await
+        .expect("active tick succeeds");
 
     // --- The opted table actually compacted: fewer live files, same rows ---
     let files_after = live_data_file_count(&catalog, &opted_ident).await;
@@ -725,10 +795,16 @@ async fn active_tick_compacts_opted_table_and_leaves_others_untouched() {
         "expected live file count to drop below {files_before}, got {files_after}"
     );
     let rows_after = scan_id_values(&catalog, &opted_ident).await;
-    assert_eq!(rows_after, rows_before, "row SET must be preserved by compaction");
+    assert_eq!(
+        rows_after, rows_before,
+        "row SET must be preserved by compaction"
+    );
 
     // --- The new snapshot's summary carries the job-identity stamp ---
-    let opted_after = catalog.load_table(&opted_ident).await.expect("reload opted table");
+    let opted_after = catalog
+        .load_table(&opted_ident)
+        .await
+        .expect("reload opted table");
     let snapshot = opted_after
         .metadata()
         .current_snapshot()
@@ -742,7 +818,10 @@ async fn active_tick_compacts_opted_table_and_leaves_others_untouched() {
         props.get("sqe.maintenance.principal"),
         Some(&"svc-sqe-maintenance".to_string())
     );
-    assert_eq!(props.get("sqe.maintenance.trigger"), Some(&"scheduled".to_string()));
+    assert_eq!(
+        props.get("sqe.maintenance.trigger"),
+        Some(&"scheduled".to_string())
+    );
 
     // --- The non-opted table is completely untouched ---
     let plain_snapshot_after = catalog
@@ -758,8 +837,15 @@ async fn active_tick_compacts_opted_table_and_leaves_others_untouched() {
 
     // --- maintenance_log: exactly one row, status="success", correct counts ---
     let rows = scan_log_rows(&catalog).await;
-    let opted_rows: Vec<&LogRowView> = rows.iter().filter(|r| r.table_name == "ns.active_opted").collect();
-    assert_eq!(opted_rows.len(), 1, "expected exactly one job row for the opted table");
+    let opted_rows: Vec<&LogRowView> = rows
+        .iter()
+        .filter(|r| r.table_name == "ns.active_opted")
+        .collect();
+    assert_eq!(
+        opted_rows.len(),
+        1,
+        "expected exactly one job row for the opted table"
+    );
     let row = opted_rows[0];
     assert_eq!(row.status, "success");
     assert_eq!(row.files_in, 5);
@@ -772,7 +858,10 @@ async fn active_tick_compacts_opted_table_and_leaves_others_untouched() {
     assert!(row.bytes_out > 0);
     assert_eq!(row.rows_removed, 0, "no deletes applied in this fixture");
     assert!(row.snapshot_id.is_some());
-    assert!(rows.iter().all(|r| r.table_name != "ns.active_plain"), "the non-opted table must never get a job row");
+    assert!(
+        rows.iter().all(|r| r.table_name != "ns.active_plain"),
+        "the non-opted table must never get a job row"
+    );
 
     // --- Metrics: one success sample, bytes_rewritten_total > 0 ---
     let job_success = metrics
@@ -783,7 +872,11 @@ async fn active_tick_compacts_opted_table_and_leaves_others_untouched() {
         .and_then(|f| {
             f.get_metric()
                 .iter()
-                .find(|m| m.get_label().iter().any(|l| l.name() == "status" && l.value() == "success"))
+                .find(|m| {
+                    m.get_label()
+                        .iter()
+                        .any(|l| l.name() == "status" && l.value() == "success")
+                })
                 .map(|m| m.get_counter().value())
         });
     assert_eq!(job_success, Some(1.0));
@@ -807,7 +900,10 @@ async fn active_tick_compacts_opted_table_and_leaves_others_untouched() {
         .filter(|l| !l.trim().is_empty())
         .filter(|l| l.contains("\"kind\":\"maintenance\"") && l.contains("committed"))
         .count();
-    assert_eq!(committed_events, 1, "expected exactly one active-mode commit audit event");
+    assert_eq!(
+        committed_events, 1,
+        "expected exactly one active-mode commit audit event"
+    );
 }
 
 /// A per-table `sqe.maintenance.compaction.min-input-files` override that
@@ -851,11 +947,23 @@ async fn active_tick_honors_per_table_override_that_global_config_would_have_ski
             let catalog = injected_catalog.clone();
             Box::pin(async move { Ok(catalog) })
         });
-    let handler = Arc::new(sqe_coordinator::maintenance::MaintenanceHandler::new(minimal_sqe_config()));
+    let handler = Arc::new(sqe_coordinator::maintenance::MaintenanceHandler::new(
+        minimal_sqe_config(),
+    ));
 
-    let scheduler = MaintenanceScheduler::new(cfg, principal, metrics.clone(), None, catalog_factory, handler);
+    let scheduler = MaintenanceScheduler::new(
+        cfg,
+        principal,
+        metrics.clone(),
+        None,
+        catalog_factory,
+        handler,
+    );
 
-    scheduler.advisory_tick().await.expect("active tick succeeds");
+    scheduler
+        .advisory_tick()
+        .await
+        .expect("active tick succeeds");
 
     let files_after = live_data_file_count(&catalog, &opted_ident).await;
     assert!(
@@ -866,7 +974,10 @@ async fn active_tick_honors_per_table_override_that_global_config_would_have_ski
     );
 
     let rows = scan_log_rows(&catalog).await;
-    let opted_rows: Vec<&LogRowView> = rows.iter().filter(|r| r.table_name == "ns.override_opted").collect();
+    let opted_rows: Vec<&LogRowView> = rows
+        .iter()
+        .filter(|r| r.table_name == "ns.override_opted")
+        .collect();
     assert_eq!(opted_rows.len(), 1);
     assert_eq!(
         opted_rows[0].status, "success",
@@ -922,7 +1033,9 @@ async fn active_tick_skips_table_with_no_eligible_debt_and_audits_it() {
             let catalog = injected_catalog.clone();
             Box::pin(async move { Ok(catalog) })
         });
-    let handler = Arc::new(sqe_coordinator::maintenance::MaintenanceHandler::new(minimal_sqe_config()));
+    let handler = Arc::new(sqe_coordinator::maintenance::MaintenanceHandler::new(
+        minimal_sqe_config(),
+    ));
 
     let scheduler = MaintenanceScheduler::new(
         cfg,
@@ -933,11 +1046,17 @@ async fn active_tick_skips_table_with_no_eligible_debt_and_audits_it() {
         handler,
     );
 
-    scheduler.advisory_tick().await.expect("active tick succeeds");
+    scheduler
+        .advisory_tick()
+        .await
+        .expect("active tick succeeds");
 
     // --- Never touched: same file count, same snapshot ---
     let files_after = live_data_file_count(&catalog, &opted_ident).await;
-    assert_eq!(files_after, files_before, "a skipped table must not be rewritten");
+    assert_eq!(
+        files_after, files_before,
+        "a skipped table must not be rewritten"
+    );
     let opted_snapshot_after = catalog
         .load_table(&opted_ident)
         .await
@@ -951,8 +1070,15 @@ async fn active_tick_skips_table_with_no_eligible_debt_and_audits_it() {
 
     // --- maintenance_log: one row, status="skipped", reason recorded ---
     let rows = scan_log_rows(&catalog).await;
-    let opted_rows: Vec<&LogRowView> = rows.iter().filter(|r| r.table_name == "ns.active_no_debt").collect();
-    assert_eq!(opted_rows.len(), 1, "expected exactly one job row for the opted table");
+    let opted_rows: Vec<&LogRowView> = rows
+        .iter()
+        .filter(|r| r.table_name == "ns.active_no_debt")
+        .collect();
+    assert_eq!(
+        opted_rows.len(),
+        1,
+        "expected exactly one job row for the opted table"
+    );
     assert_eq!(opted_rows[0].status, "skipped");
 
     // --- Metrics: one skipped sample ---
@@ -964,7 +1090,11 @@ async fn active_tick_skips_table_with_no_eligible_debt_and_audits_it() {
         .and_then(|f| {
             f.get_metric()
                 .iter()
-                .find(|m| m.get_label().iter().any(|l| l.name() == "status" && l.value() == "skipped"))
+                .find(|m| {
+                    m.get_label()
+                        .iter()
+                        .any(|l| l.name() == "status" && l.value() == "skipped")
+                })
                 .map(|m| m.get_counter().value())
         });
     assert_eq!(job_skipped, Some(1.0));
@@ -977,7 +1107,11 @@ async fn active_tick_skips_table_with_no_eligible_debt_and_audits_it() {
         .filter(|l| !l.trim().is_empty())
         .filter(|l| l.contains("\"kind\":\"maintenance\"") && l.contains("skipped"))
         .collect();
-    assert_eq!(skipped_events.len(), 1, "expected exactly one skip audit event, got: {skipped_events:?}");
+    assert_eq!(
+        skipped_events.len(),
+        1,
+        "expected exactly one skip audit event, got: {skipped_events:?}"
+    );
     assert!(
         skipped_events[0].contains("\"status\":\"success\""),
         "a skip is a correct no-op decision, not a failure: {}",
@@ -1014,7 +1148,10 @@ async fn active_tick_require_mode_skips_loudly_when_no_workers_are_healthy() {
     let opted_ident = create_table(&catalog, "ns", "require_no_workers", true).await;
     seed_small_files(&catalog, &opted_ident, 5).await;
     let files_before = live_data_file_count(&catalog, &opted_ident).await;
-    assert_eq!(files_before, 5, "seed helper must produce exactly 5 live files");
+    assert_eq!(
+        files_before, 5,
+        "seed helper must produce exactly 5 live files"
+    );
     let opted_snapshot_before = catalog
         .load_table(&opted_ident)
         .await
@@ -1053,7 +1190,9 @@ async fn active_tick_require_mode_skips_loudly_when_no_workers_are_healthy() {
     // Deliberately NOT `.with_worker_registry(...)`: this handler has no
     // registry at all, so `healthy_worker_count()` is `0` and `require`
     // mode with `min_workers = 1` must skip, never silently compact locally.
-    let handler = Arc::new(sqe_coordinator::maintenance::MaintenanceHandler::new(minimal_sqe_config()));
+    let handler = Arc::new(sqe_coordinator::maintenance::MaintenanceHandler::new(
+        minimal_sqe_config(),
+    ));
 
     let scheduler = MaintenanceScheduler::new(
         cfg,
@@ -1064,7 +1203,10 @@ async fn active_tick_require_mode_skips_loudly_when_no_workers_are_healthy() {
         handler,
     );
 
-    scheduler.advisory_tick().await.expect("active tick succeeds");
+    scheduler
+        .advisory_tick()
+        .await
+        .expect("active tick succeeds");
 
     // --- Never touched: same file count, same snapshot ---
     let files_after = live_data_file_count(&catalog, &opted_ident).await;
@@ -1085,9 +1227,15 @@ async fn active_tick_require_mode_skips_loudly_when_no_workers_are_healthy() {
 
     // --- maintenance_log: one row, status="skipped" ---
     let rows = scan_log_rows(&catalog).await;
-    let opted_rows: Vec<&LogRowView> =
-        rows.iter().filter(|r| r.table_name == "ns.require_no_workers").collect();
-    assert_eq!(opted_rows.len(), 1, "expected exactly one job row for the opted table");
+    let opted_rows: Vec<&LogRowView> = rows
+        .iter()
+        .filter(|r| r.table_name == "ns.require_no_workers")
+        .collect();
+    assert_eq!(
+        opted_rows.len(),
+        1,
+        "expected exactly one job row for the opted table"
+    );
     assert_eq!(opted_rows[0].status, "skipped");
 
     // --- Metrics: the dedicated insufficient-workers counter fires ---
@@ -1121,7 +1269,11 @@ async fn active_tick_require_mode_skips_loudly_when_no_workers_are_healthy() {
         .and_then(|f| {
             f.get_metric()
                 .iter()
-                .find(|m| m.get_label().iter().any(|l| l.name() == "status" && l.value() == "skipped"))
+                .find(|m| {
+                    m.get_label()
+                        .iter()
+                        .any(|l| l.name() == "status" && l.value() == "skipped")
+                })
                 .map(|m| m.get_counter().value())
         });
     assert_eq!(job_skipped, Some(1.0));
@@ -1134,7 +1286,11 @@ async fn active_tick_require_mode_skips_loudly_when_no_workers_are_healthy() {
         .filter(|l| !l.trim().is_empty())
         .filter(|l| l.contains("\"kind\":\"maintenance\"") && l.contains("skipped"))
         .collect();
-    assert_eq!(skipped_events.len(), 1, "expected exactly one skip audit event, got: {skipped_events:?}");
+    assert_eq!(
+        skipped_events.len(),
+        1,
+        "expected exactly one skip audit event, got: {skipped_events:?}"
+    );
     assert!(
         skipped_events[0].contains("\"status\":\"success\""),
         "a skip is a correct no-op decision, not a failure: {}",
@@ -1203,12 +1359,16 @@ async fn active_tick_records_failed_job_and_audits_it() {
                     // Every later call (the per-table commit-catalog build):
                     // fail, forcing `active_one_table`'s `record_failed_job`
                     // path.
-                    Err(sqe_core::SqeError::Catalog("injected commit-catalog failure".to_string()))
+                    Err(sqe_core::SqeError::Catalog(
+                        "injected commit-catalog failure".to_string(),
+                    ))
                 }
             })
         })
     };
-    let handler = Arc::new(sqe_coordinator::maintenance::MaintenanceHandler::new(minimal_sqe_config()));
+    let handler = Arc::new(sqe_coordinator::maintenance::MaintenanceHandler::new(
+        minimal_sqe_config(),
+    ));
 
     let scheduler = MaintenanceScheduler::new(
         cfg,
@@ -1219,16 +1379,29 @@ async fn active_tick_records_failed_job_and_audits_it() {
         handler,
     );
 
-    scheduler.advisory_tick().await.expect("active tick succeeds despite the per-table failure");
+    scheduler
+        .advisory_tick()
+        .await
+        .expect("active tick succeeds despite the per-table failure");
 
     // --- Never touched: same file count ---
     let files_after = live_data_file_count(&catalog, &opted_ident).await;
-    assert_eq!(files_after, files_before, "a failed job must not have rewritten anything");
+    assert_eq!(
+        files_after, files_before,
+        "a failed job must not have rewritten anything"
+    );
 
     // --- maintenance_log: one row, status="failed", error recorded ---
     let rows = scan_log_rows(&catalog).await;
-    let opted_rows: Vec<&LogRowView> = rows.iter().filter(|r| r.table_name == "ns.active_fails").collect();
-    assert_eq!(opted_rows.len(), 1, "expected exactly one job row for the opted table");
+    let opted_rows: Vec<&LogRowView> = rows
+        .iter()
+        .filter(|r| r.table_name == "ns.active_fails")
+        .collect();
+    assert_eq!(
+        opted_rows.len(),
+        1,
+        "expected exactly one job row for the opted table"
+    );
     assert_eq!(opted_rows[0].status, "failed");
 
     // --- Metrics: one failed sample ---
@@ -1240,7 +1413,11 @@ async fn active_tick_records_failed_job_and_audits_it() {
         .and_then(|f| {
             f.get_metric()
                 .iter()
-                .find(|m| m.get_label().iter().any(|l| l.name() == "status" && l.value() == "failed"))
+                .find(|m| {
+                    m.get_label()
+                        .iter()
+                        .any(|l| l.name() == "status" && l.value() == "failed")
+                })
                 .map(|m| m.get_counter().value())
         });
     assert_eq!(job_failed, Some(1.0));
@@ -1253,15 +1430,19 @@ async fn active_tick_records_failed_job_and_audits_it() {
         .filter(|l| !l.trim().is_empty())
         .filter(|l| l.contains("\"kind\":\"maintenance\"") && l.contains("\"status\":\"failure\""))
         .collect();
-    assert_eq!(failed_events.len(), 1, "expected exactly one failure audit event, got: {failed_events:?}");
+    assert_eq!(
+        failed_events.len(),
+        1,
+        "expected exactly one failure audit event, got: {failed_events:?}"
+    );
     assert!(
         failed_events[0].contains("injected commit-catalog failure"),
         "failure reason must be actionable in the audit line: {}",
         failed_events[0]
     );
     assert_eq!(
-        serde_json::from_str::<serde_json::Value>(failed_events[0])
-            .expect("valid JSON audit line")["resources"][0]["name"]
+        serde_json::from_str::<serde_json::Value>(failed_events[0]).expect("valid JSON audit line")
+            ["resources"][0]["name"]
             .as_str(),
         Some("active_fails"),
         "the failure event must identify the table it failed on"
@@ -1306,14 +1487,29 @@ async fn advisory_tick_on_active_fixture_still_mutates_nothing() {
             let catalog = injected_catalog.clone();
             Box::pin(async move { Ok(catalog) })
         });
-    let handler = Arc::new(sqe_coordinator::maintenance::MaintenanceHandler::new(minimal_sqe_config()));
+    let handler = Arc::new(sqe_coordinator::maintenance::MaintenanceHandler::new(
+        minimal_sqe_config(),
+    ));
 
-    let scheduler = MaintenanceScheduler::new(cfg, principal, metrics.clone(), None, catalog_factory, handler);
+    let scheduler = MaintenanceScheduler::new(
+        cfg,
+        principal,
+        metrics.clone(),
+        None,
+        catalog_factory,
+        handler,
+    );
 
-    scheduler.advisory_tick().await.expect("advisory tick succeeds");
+    scheduler
+        .advisory_tick()
+        .await
+        .expect("advisory tick succeeds");
 
     let files_after = live_data_file_count(&catalog, &opted_ident).await;
-    assert_eq!(files_after, files_before, "advisory mode must not change the live file count");
+    assert_eq!(
+        files_after, files_before,
+        "advisory mode must not change the live file count"
+    );
 
     let opted_snapshot_after = catalog
         .load_table(&opted_ident)
@@ -1332,7 +1528,10 @@ async fn advisory_tick_on_active_fixture_still_mutates_nothing() {
         .filter(|r| r.table_name == "ns.advisory_on_active_fixture")
         .collect();
     assert_eq!(opted_rows.len(), 1, "expected exactly one advisory row");
-    assert_eq!(opted_rows[0].status, "advisory", "advisory mode must never write a success/failed/skipped job row");
+    assert_eq!(
+        opted_rows[0].status, "advisory",
+        "advisory mode must never write a success/failed/skipped job row"
+    );
 
     // No active-mode job metric was ever touched.
     let job_family = metrics
@@ -1358,8 +1557,14 @@ async fn advisory_tick_on_active_fixture_still_mutates_nothing() {
 async fn count_lease_rows(catalog: &Arc<dyn Catalog>) -> usize {
     use arrow_array::{Array, StringArray};
 
-    let log_ident = TableIdent::new(NamespaceIdent::new("sqe_system".to_string()), "maintenance_log".to_string());
-    let log_table = catalog.load_table(&log_ident).await.expect("reload log table");
+    let log_ident = TableIdent::new(
+        NamespaceIdent::new("sqe_system".to_string()),
+        "maintenance_log".to_string(),
+    );
+    let log_table = catalog
+        .load_table(&log_ident)
+        .await
+        .expect("reload log table");
     let batches: Vec<RecordBatch> = log_table
         .scan()
         .build()
@@ -1436,16 +1641,34 @@ async fn active_tick_lease_none_compacts_with_zero_lease_traffic() {
             let catalog = injected_catalog.clone();
             Box::pin(async move { Ok(catalog) })
         });
-    let handler = Arc::new(sqe_coordinator::maintenance::MaintenanceHandler::new(minimal_sqe_config()));
+    let handler = Arc::new(sqe_coordinator::maintenance::MaintenanceHandler::new(
+        minimal_sqe_config(),
+    ));
 
-    let scheduler = MaintenanceScheduler::new(cfg, principal, metrics.clone(), None, catalog_factory, handler);
-    scheduler.advisory_tick().await.expect("active tick succeeds");
+    let scheduler = MaintenanceScheduler::new(
+        cfg,
+        principal,
+        metrics.clone(),
+        None,
+        catalog_factory,
+        handler,
+    );
+    scheduler
+        .advisory_tick()
+        .await
+        .expect("active tick succeeds");
 
     let files_after = live_data_file_count(&catalog, &opted_ident).await;
-    assert!(files_after < files_before, "lease=none must still compact exactly like Phase 4c");
+    assert!(
+        files_after < files_before,
+        "lease=none must still compact exactly like Phase 4c"
+    );
 
     let rows = scan_log_rows(&catalog).await;
-    let opted_rows: Vec<&LogRowView> = rows.iter().filter(|r| r.table_name == "ns.lease_none_opted").collect();
+    let opted_rows: Vec<&LogRowView> = rows
+        .iter()
+        .filter(|r| r.table_name == "ns.lease_none_opted")
+        .collect();
     assert_eq!(opted_rows.len(), 1);
     assert_eq!(opted_rows[0].status, "success");
 
@@ -1505,7 +1728,12 @@ async fn active_tick_catalog_lease_prevents_concurrent_compaction_then_recovers_
     .expect("no one else holds it yet, so this must be Some");
 
     let idp = mock_idp().await;
-    let cfg = active_maintenance_config_with_lease(&idp, 2, sqe_core::config::LeaseMode::Catalog, ttl_secs);
+    let cfg = active_maintenance_config_with_lease(
+        &idp,
+        2,
+        sqe_core::config::LeaseMode::Catalog,
+        ttl_secs,
+    );
     let principal = Arc::new(
         MaintenancePrincipal::from_config(cfg.principal.as_ref().expect("principal set"))
             .expect("build principal"),
@@ -1518,13 +1746,25 @@ async fn active_tick_catalog_lease_prevents_concurrent_compaction_then_recovers_
             let catalog = injected_catalog.clone();
             Box::pin(async move { Ok(catalog) })
         });
-    let handler = Arc::new(sqe_coordinator::maintenance::MaintenanceHandler::new(minimal_sqe_config()));
+    let handler = Arc::new(sqe_coordinator::maintenance::MaintenanceHandler::new(
+        minimal_sqe_config(),
+    ));
 
-    let scheduler_b = MaintenanceScheduler::new(cfg, principal, metrics.clone(), None, catalog_factory, handler)
-        .with_holder_id("coordinator-b");
+    let scheduler_b = MaintenanceScheduler::new(
+        cfg,
+        principal,
+        metrics.clone(),
+        None,
+        catalog_factory,
+        handler,
+    )
+    .with_holder_id("coordinator-b");
 
     // --- Window 1: coordinator-a still holds the lease; coordinator-b skips ---
-    scheduler_b.advisory_tick().await.expect("scheduler_b tick 1 succeeds (a routine skip, not an error)");
+    scheduler_b
+        .advisory_tick()
+        .await
+        .expect("scheduler_b tick 1 succeeds (a routine skip, not an error)");
 
     let files_after_tick1 = live_data_file_count(&catalog, &opted_ident).await;
     assert_eq!(
@@ -1533,7 +1773,9 @@ async fn active_tick_catalog_lease_prevents_concurrent_compaction_then_recovers_
     );
     let rows_after_tick1 = scan_log_rows(&catalog).await;
     assert!(
-        rows_after_tick1.iter().all(|r| r.table_name != "ns.lease_contended"),
+        rows_after_tick1
+            .iter()
+            .all(|r| r.table_name != "ns.lease_contended"),
         "a lease-skip must not write a maintenance_log job row: {rows_after_tick1:?}",
     );
     assert_eq!(
@@ -1549,7 +1791,10 @@ async fn active_tick_catalog_lease_prevents_concurrent_compaction_then_recovers_
         .expect("coordinator-a releases cleanly");
 
     // --- Window 2 (a later tick): coordinator-b now acquires and compacts ---
-    scheduler_b.advisory_tick().await.expect("scheduler_b tick 2 succeeds");
+    scheduler_b
+        .advisory_tick()
+        .await
+        .expect("scheduler_b tick 2 succeeds");
 
     let files_after_tick2 = live_data_file_count(&catalog, &opted_ident).await;
     assert!(
@@ -1557,9 +1802,15 @@ async fn active_tick_catalog_lease_prevents_concurrent_compaction_then_recovers_
         "after coordinator-a released, coordinator-b must acquire the lease and actually compact"
     );
     let rows_after_tick2 = scan_log_rows(&catalog).await;
-    let opted_rows: Vec<&LogRowView> =
-        rows_after_tick2.iter().filter(|r| r.table_name == "ns.lease_contended").collect();
-    assert_eq!(opted_rows.len(), 1, "exactly one job row: coordinator-b's successful compaction");
+    let opted_rows: Vec<&LogRowView> = rows_after_tick2
+        .iter()
+        .filter(|r| r.table_name == "ns.lease_contended")
+        .collect();
+    assert_eq!(
+        opted_rows.len(),
+        1,
+        "exactly one job row: coordinator-b's successful compaction"
+    );
     assert_eq!(opted_rows[0].status, "success");
 
     // `crate::maintenance_lease`'s CAS design keeps exactly one LIVE lease

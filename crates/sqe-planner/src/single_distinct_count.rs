@@ -245,11 +245,7 @@ impl OptimizerRule for SingleDistinctCountCompanionRule {
                                 );
                                 // sum/min/max re-apply themselves over the
                                 // inner partials; count's partials are summed.
-                                let outer_func = if count_companion {
-                                    sum_udaf()
-                                } else {
-                                    func
-                                };
+                                let outer_func = if count_companion { sum_udaf() } else { func };
                                 needs_zero_default.push(count_companion);
                                 Ok(Expr::AggregateFunction(AggregateFunction::new_udf(
                                     outer_func,
@@ -349,7 +345,10 @@ mod tests {
         .expect("test batch")
     }
 
-    fn ctx_with_table(rows: &[(Option<&str>, Option<i64>, &str)], with_rule: bool) -> SessionContext {
+    fn ctx_with_table(
+        rows: &[(Option<&str>, Option<i64>, &str)],
+        with_rule: bool,
+    ) -> SessionContext {
         // Single partition + no repartitioning keeps plans deterministic.
         let config = SessionConfig::new().with_target_partitions(1);
         let ctx = SessionContext::new_with_config(config);
@@ -373,13 +372,23 @@ mod tests {
 
     async fn logical_plan(ctx: &SessionContext, sql: &str) -> String {
         let df = ctx.sql(sql).await.expect("plan");
-        format!("{}", df.into_optimized_plan().expect("optimize").display_indent())
+        format!(
+            "{}",
+            df.into_optimized_plan().expect("optimize").display_indent()
+        )
     }
 
     async fn results(ctx: &SessionContext, sql: &str) -> Vec<String> {
-        let batches = ctx.sql(sql).await.expect("plan").collect().await.expect("run");
-        let formatted =
-            arrow::util::pretty::pretty_format_batches(&batches).expect("format").to_string();
+        let batches = ctx
+            .sql(sql)
+            .await
+            .expect("plan")
+            .collect()
+            .await
+            .expect("run");
+        let formatted = arrow::util::pretty::pretty_format_batches(&batches)
+            .expect("format")
+            .to_string();
         formatted.lines().map(str::to_owned).collect()
     }
 
@@ -434,7 +443,9 @@ mod tests {
         // Belt and braces against both plans agreeing on wrong numbers:
         // group a = 4 rows, 2 distinct non-NULL ibans, sum 10+20+40.
         assert!(
-            actual.iter().any(|l| l.contains("a") && l.contains("2") && l.contains("4") && l.contains("70")),
+            actual
+                .iter()
+                .any(|l| l.contains("a") && l.contains("2") && l.contains("4") && l.contains("70")),
             "unexpected group-a row in:\n{}",
             actual.join("\n")
         );

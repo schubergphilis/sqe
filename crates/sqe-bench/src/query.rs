@@ -209,7 +209,11 @@ pub fn prefix_tables(sql: &str, namespace: &str, benchmark: &str) -> String {
 
             // Check character after the match
             let end = pos + table.len();
-            let after_char = if end < remaining.len() { Some(remaining.as_bytes()[end]) } else { None };
+            let after_char = if end < remaining.len() {
+                Some(remaining.as_bytes()[end])
+            } else {
+                None
+            };
             let after_ok = match after_char {
                 None => true,
                 Some(c) if c.is_ascii_alphanumeric() || c == b'_' => false, // Part of longer identifier
@@ -406,8 +410,14 @@ mod tests {
     fn prefix_tables_comma_list() {
         let sql = "FROM catalog_returns, call_center, customer WHERE 1=1";
         let result = prefix_tables(sql, "tpcds_sf1", "tpcds");
-        assert!(result.contains("tpcds_sf1.catalog_returns"), "catalog_returns: {result}");
-        assert!(result.contains("tpcds_sf1.call_center"), "call_center: {result}");
+        assert!(
+            result.contains("tpcds_sf1.catalog_returns"),
+            "catalog_returns: {result}"
+        );
+        assert!(
+            result.contains("tpcds_sf1.call_center"),
+            "call_center: {result}"
+        );
         assert!(result.contains("tpcds_sf1.customer"), "customer: {result}");
     }
 
@@ -482,8 +492,14 @@ WHERE o.o_id = (\n\
         let sql = "FROM\n    partsupp,\n    part\nWHERE 1=1 AND ps_suppkey NOT IN (\n    SELECT s_suppkey FROM supplier\n)";
         let result = prefix_tables(sql, "tpch_sf1", "tpch");
         assert!(result.contains("tpch_sf1.partsupp"), "partsupp: {result}");
-        assert!(result.contains("tpch_sf1.part"), "part not qualified: {result}");
-        assert!(result.contains("FROM tpch_sf1.supplier"), "supplier: {result}");
+        assert!(
+            result.contains("tpch_sf1.part"),
+            "part not qualified: {result}"
+        );
+        assert!(
+            result.contains("FROM tpch_sf1.supplier"),
+            "supplier: {result}"
+        );
     }
 
     #[test]

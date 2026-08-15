@@ -44,8 +44,8 @@ fn test_target() -> IcebergTarget {
         .unwrap_or_else(|_| "http://localhost:19000".to_string());
     let s3_access_key =
         std::env::var("SQE_TEST_ICEBERG_S3_ACCESS_KEY").unwrap_or_else(|_| "s3admin".to_string());
-    let s3_secret_key = std::env::var("SQE_TEST_ICEBERG_S3_SECRET_KEY")
-        .unwrap_or_else(|_| "s3adminpw".to_string());
+    let s3_secret_key =
+        std::env::var("SQE_TEST_ICEBERG_S3_SECRET_KEY").unwrap_or_else(|_| "s3adminpw".to_string());
     let s3_region =
         std::env::var("SQE_TEST_ICEBERG_S3_REGION").unwrap_or_else(|_| "us-east-1".to_string());
 
@@ -78,14 +78,13 @@ fn test_scale() -> f64 {
 }
 
 /// Sum of `num_rows()` across every batch a full table scan produces.
-async fn count_table_rows(
-    catalog: &dyn Catalog,
-    table: &TableIdent,
-) -> anyhow::Result<u64> {
+async fn count_table_rows(catalog: &dyn Catalog, table: &TableIdent) -> anyhow::Result<u64> {
     let t = catalog.load_table(table).await?;
     let stream = t.scan().build()?.to_arrow().await?;
     let rows = stream
-        .try_fold(0u64, |acc, batch| async move { Ok(acc + batch.num_rows() as u64) })
+        .try_fold(0u64, |acc, batch| async move {
+            Ok(acc + batch.num_rows() as u64)
+        })
         .await?;
     Ok(rows)
 }
@@ -128,9 +127,17 @@ async fn tpch_direct_sink_writes_and_resumes() {
 
     // First run: clean slate, no resume. Every table gets written and
     // committed with its `sqe-bench.table.<name>=done` marker.
-    run_direct(&target, gen.as_ref(), scale, &config, true, false, target_file_size)
-        .await
-        .expect("first run_direct should write every table");
+    run_direct(
+        &target,
+        gen.as_ref(),
+        scale,
+        &config,
+        true,
+        false,
+        target_file_size,
+    )
+    .await
+    .expect("first run_direct should write every table");
 
     // Build the verify/read-back connection from the exact same property map
     // `run_direct` writes through (URI, warehouse, credential, and all
@@ -165,9 +172,17 @@ async fn tpch_direct_sink_writes_and_resumes() {
     // Second run: resume=true, clean=false. Every table is already marked
     // done, so run_direct must take the skip path: no new snapshot, no
     // duplicated rows.
-    run_direct(&target, gen.as_ref(), scale, &config, false, true, target_file_size)
-        .await
-        .expect("second (resume) run_direct should succeed via the skip path");
+    run_direct(
+        &target,
+        gen.as_ref(),
+        scale,
+        &config,
+        false,
+        true,
+        target_file_size,
+    )
+    .await
+    .expect("second (resume) run_direct should succeed via the skip path");
 
     for table_def in gen.tables() {
         let ident = TableIdent::new(ns.clone(), table_def.name.clone());
@@ -184,7 +199,9 @@ async fn tpch_direct_sink_writes_and_resumes() {
 
         let snap = current_snapshot_id(verify_catalog.as_ref(), &ident)
             .await
-            .unwrap_or_else(|e| panic!("re-loading snapshot id for {} failed: {e}", table_def.name));
+            .unwrap_or_else(|e| {
+                panic!("re-loading snapshot id for {} failed: {e}", table_def.name)
+            });
         assert_eq!(
             snap, snapshots_after_first[&table_def.name],
             "{}: resume should skip the table, so the snapshot id must not change",

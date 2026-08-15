@@ -265,10 +265,7 @@ impl HfTreeCache {
         loop {
             let (body, headers) = self.http.fetch(&url).await?;
             let entries: Vec<TreeEntry> = serde_json::from_slice(&body).map_err(|e| {
-                SqeError::catalog_src(
-                    format!("HF tree response parse failed for {url}: {e}"),
-                    e,
-                )
+                SqeError::catalog_src(format!("HF tree response parse failed for {url}: {e}"), e)
             })?;
             all.extend(entries);
             page += 1;
@@ -383,9 +380,7 @@ mod tests {
     }
 
     fn datasets_url(owner: &str, name: &str, branch: &str) -> String {
-        format!(
-            "{HF_API_BASE}/datasets/{owner}/{name}/tree/{branch}?recursive=true"
-        )
+        format!("{HF_API_BASE}/datasets/{owner}/{name}/tree/{branch}?recursive=true")
     }
 
     #[tokio::test]
@@ -436,7 +431,11 @@ mod tests {
 
         assert_eq!(main[0].path, "a.csv");
         assert_eq!(v1[0].path, "a-v1.csv");
-        assert_eq!(mock.call_count(), 2, "different branches = separate fetches");
+        assert_eq!(
+            mock.call_count(),
+            2,
+            "different branches = separate fetches"
+        );
     }
 
     #[tokio::test]
@@ -449,11 +448,7 @@ mod tests {
             r#"[{"type": "file", "path": "a.csv"}]"#,
             vec![("link", &format!(r#"<{url2}>; rel="next""#))],
         );
-        mock.enqueue(
-            &url2,
-            r#"[{"type": "file", "path": "b.csv"}]"#,
-            vec![],
-        );
+        mock.enqueue(&url2, r#"[{"type": "file", "path": "b.csv"}]"#, vec![]);
 
         let cache = HfTreeCache::with_client(mock.clone());
         let entries = cache
@@ -500,13 +495,17 @@ mod tests {
         // the URL with percent-encoded segments. The encode helper is
         // conservative, matching what HuggingFace expects.
         let mock = Arc::new(MockHttp::default());
-        let url =
-            format!("{HF_API_BASE}/datasets/foo%20bar/baz/tree/main?recursive=true");
+        let url = format!("{HF_API_BASE}/datasets/foo%20bar/baz/tree/main?recursive=true");
         mock.enqueue(&url, "[]", vec![]);
 
         let cache = HfTreeCache::with_client(mock.clone());
         let _entries = cache
-            .list(&TreeKey::new(HfRepoKind::Datasets, "foo bar", "baz", "main"))
+            .list(&TreeKey::new(
+                HfRepoKind::Datasets,
+                "foo bar",
+                "baz",
+                "main",
+            ))
             .await
             .unwrap();
         assert_eq!(mock.call_count(), 1);
@@ -547,7 +546,11 @@ mod tests {
         // Each page points at itself — without the cap we would loop.
         let url = datasets_url("foo", "bar", "main");
         for _ in 0..70 {
-            mock.enqueue(&url, "[]", vec![("link", &format!(r#"<{url}>; rel="next""#))]);
+            mock.enqueue(
+                &url,
+                "[]",
+                vec![("link", &format!(r#"<{url}>; rel="next""#))],
+            );
         }
         let cache = HfTreeCache::with_client(mock);
         let err = cache
@@ -581,7 +584,10 @@ mod tests {
 
     #[test]
     fn repo_kind_parsing() {
-        assert_eq!(HfRepoKind::from_segment("datasets"), Some(HfRepoKind::Datasets));
+        assert_eq!(
+            HfRepoKind::from_segment("datasets"),
+            Some(HfRepoKind::Datasets)
+        );
         assert_eq!(HfRepoKind::from_segment("models"), Some(HfRepoKind::Models));
         assert_eq!(HfRepoKind::from_segment("spaces"), Some(HfRepoKind::Spaces));
         assert_eq!(HfRepoKind::from_segment("foo"), None);

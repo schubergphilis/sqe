@@ -54,6 +54,12 @@ fn run_tpch_compare_via_golden_attach() {
         "run failed: {stdout}\n{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(stdout.contains("BENCH_SUMMARY:tpch:"), "no summary line: {stdout}");
-    assert!(stdout.contains("compare tpch:"), "no compare line: {stdout}");
+    assert!(
+        stdout.contains("BENCH_SUMMARY:tpch:"),
+        "no summary line: {stdout}"
+    );
+    assert!(
+        stdout.contains("compare tpch:"),
+        "no compare line: {stdout}"
+    );
 }

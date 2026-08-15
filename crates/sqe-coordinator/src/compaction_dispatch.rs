@@ -319,8 +319,8 @@ async fn dispatch_group_to_worker(
                 }
             })?;
         let Some(result) = next else { break };
-        let frame = sqe_compaction::wire::CompactGroupFrame::from_bytes(&result.body)
-            .map_err(|e| {
+        let frame =
+            sqe_compaction::wire::CompactGroupFrame::from_bytes(&result.body).map_err(|e| {
                 DispatchError::application(format!(
                     "worker {worker_url}: failed to decode CompactGroupFrame: {e}"
                 ))
@@ -758,7 +758,10 @@ mod tests {
         assert_eq!(req.group_id, 3);
         assert_eq!(req.table_ident, "catalog.ns.tbl");
         assert_eq!(req.snapshot_id, 42);
-        assert_eq!(req.group_file_paths, vec!["s3://bucket/data/f1.parquet".to_string()]);
+        assert_eq!(
+            req.group_file_paths,
+            vec!["s3://bucket/data/f1.parquet".to_string()]
+        );
         assert_eq!(req.compression, "zstd");
         assert_eq!(req.sort, Some(sort));
     }
