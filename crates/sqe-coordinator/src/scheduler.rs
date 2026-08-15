@@ -84,17 +84,32 @@ fn estimate_cost(task: &ScanTask) -> u64 {
     }
 }
 
+/// Fold a byte slice into `hash` with the same 31-multiply polynomial used
+/// for path affinity. A trailing 0 separator keeps adjacent strings from
+/// colliding (`["ab","c"]` vs `["a","bc"]`).
+fn hash_bytes(mut hash: u64, bytes: &[u8]) -> u64 {
+    for byte in bytes {
+        hash = hash.wrapping_mul(31).wrapping_add(*byte as u64);
+    }
+    hash.wrapping_mul(31)
+}
+
 /// Compute a preferred worker index for a set of files using consistent hashing.
-/// Returns the worker index that should handle these files for cache affinity.
+///
+/// Every path is hashed (not only `file_paths[0]`) so two tasks that share a
+/// first file but differ later can land on different workers. Empty input or
+/// zero workers maps to index 0.
 fn preferred_worker(file_paths: &[String], num_workers: usize) -> usize {
     if num_workers == 0 || file_paths.is_empty() {
         return 0;
     }
-    // Hash the first file path (representative of the task's data locality)
     let mut hash: u64 = 0;
-    for byte in file_paths[0].as_bytes() {
-        hash = hash.wrapping_mul(31).wrapping_add(*byte as u64);
+    for path in file_paths {
+        hash = hash_bytes(hash, path.as_bytes());
     }
+    // Mix in the count so `[a, b]` and `[a, b, a, b]` cannot collide by
+    // concatenation of the same strings.
+    hash = hash.wrapping_mul(31).wrapping_add(file_paths.len() as u64);
     (hash as usize) % num_workers
 }
 
@@ -674,6 +689,16 @@ mod tests {
     }
 
     #[test]
+    fn test_preferred_worker_same_single_path_is_stable() {
+        // Same single path must always prefer the same worker (cache affinity).
+        let paths = vec!["s3://bucket/dashboard/metrics.parquet".to_string()];
+        let first = preferred_worker(&paths, 7);
+        for _ in 0..20 {
+            assert_eq!(preferred_worker(&paths, 7), first);
+        }
+    }
+
+    #[test]
     fn test_preferred_worker_distributes() {
         // Different file paths should distribute across workers
         let mut workers_hit = std::collections::HashSet::new();
@@ -682,6 +707,27 @@ mod tests {
             workers_hit.insert(preferred_worker(&paths, 5));
         }
         assert!(workers_hit.len() >= 3, "should use at least 3 of 5 workers");
+    }
+
+    #[test]
+    fn test_preferred_worker_hashes_all_paths() {
+        // Two tasks that share the first file but differ later must be able
+        // to land on different workers. Hashing only file_paths[0] would pin
+        // every such task to the same worker.
+        let shared_first = "s3://bucket/shared/file0.parquet".to_string();
+        let mut workers_hit = std::collections::HashSet::new();
+        for i in 0..100 {
+            let paths = vec![
+                shared_first.clone(),
+                format!("s3://bucket/part-{i}/file1.parquet"),
+                format!("s3://bucket/part-{i}/file2.parquet"),
+            ];
+            workers_hit.insert(preferred_worker(&paths, 8));
+        }
+        assert!(
+            workers_hit.len() >= 3,
+            "tasks that share only the first file should spread across workers, got {workers_hit:?}"
+        );
     }
 
     #[test]
