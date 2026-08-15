@@ -1,0 +1,78 @@
+# Production overlay for the SQE Helm chart (ISSUE-404).
+#
+# Default values.yaml is the easy dev path (production_mode=false, ephemeral
+# audit, ServiceMonitor off). Overlay this file for a production install:
+#
+#   helm install sqe deploy/helm/sqe/ \
+#     -f deploy/helm/sqe/values-production.yaml
+#
+# This file contains NO credentials. You MUST supply existing Secrets,
+# TLS/ingress, and (when workers are on) workerSecret before install.
+# The chart fail-closes at template time if production_mode and
+# worker.enabled are both true with an empty workerSecret.
+
+# ── Engine production validator ─────────────────────────────
+# Enforces no anonymous/bearer_passthrough, rate_limit.enabled=true,
+# allow_insecure_transport=false, non-empty worker_secret when distributed.
+coordinator:
+  production_mode: true
+
+# ── Rate limiting (required by production_mode) ─────────────
+config:
+  rate_limit:
+    enabled: true
+
+# ── Durable audit log ───────────────────────────────────────
+# Mounts a ReadWriteOnce PVC at audit.path so records survive reschedule.
+# Point existingClaim at a PVC you manage, or let the chart create one
+# (audit.persistence.size, default 1Gi).
+audit:
+  persistence:
+    enabled: true
+
+# ── Prometheus Operator scrape ──────────────────────────────
+serviceMonitor:
+  enabled: true
+
+# ── Required: existing Secrets (do not put credentials here) ─
+# Create these out of band (sealed-secrets, external-secrets, etc.) and
+# point the chart at them. Inline `secrets:` / workerSecret.value end up
+# in `helm get values` and are not acceptable in production.
+#
+#   existingSecret: "sqe-credentials"
+#     keys: SQE_AUTH__CLIENT_SECRET, SQE_STORAGE__S3_ACCESS_KEY,
+#           SQE_STORAGE__S3_SECRET_KEY
+#
+# When worker.enabled=true you MUST also set:
+#   workerSecret:
+#     existingSecret: "sqe-worker-secret"
+#     key: "SQE_WORKER_SECRET"
+# Templating fails if production_mode=true, worker.enabled=true, and
+# neither workerSecret.existingSecret nor workerSecret.value is set.
+existingSecret: ""
+
+# ── Required: TLS / ingress ─────────────────────────────────
+# production_mode rejects allow_insecure_transport. Terminate TLS at the
+# ingress for Trino HTTP / web UI / Quack, and use [coordinator.tls]
+# (or a gRPC-aware ingress) for Flight SQL. Example:
+#
+# ingress:
+#   enabled: true
+#   className: nginx
+#   annotations:
+#     cert-manager.io/cluster-issuer: letsencrypt-prod
+#   hosts:
+#     - host: sqe.example.com
+#       paths:
+#         - path: /
+#           pathType: Prefix
+#           portName: trino-http
+#   tls:
+#     - secretName: sqe-tls
+#       hosts:
+#         - sqe.example.com
+#
+# Pin the image by digest for a reproducible install:
+#   image:
+#     tag: "0.37.0@sha256:<digest>"
+#     pullPolicy: IfNotPresent
