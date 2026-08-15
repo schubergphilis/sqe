@@ -29,12 +29,23 @@ query path.
 
 ## Security
 
-There is no login. The dashboard is network-gated, the same posture as the
-Prometheus `/metrics` endpoint: anyone who can reach the port sees every user's
-query text and the cluster state. Keep the health port on an internal network.
+The dashboard and its JSON API (`/`, `/api/v1/overview`, `/api/v1/queries*`,
+`/api/v1/workers`, `/api/v1/metrics/history`) are gated by
+`require_admin_bearer` (`crates/sqe-coordinator/src/web_auth.rs`, applied in
+`build_health_router` in `sqe_server.rs`). A request needs
+`Authorization: Bearer <token>` for an identity that holds an admin role. No
+token, a bad token, or no auth provider configured is 401. A valid non-admin
+token is 403. The UI is **off by default** (`[metrics] web_ui = false`); when
+off, those routes are not registered and return 404.
+
+`/healthz`, `/readyz`, and `/api/v1/status` stay open. They are the probe
+surface for Kubernetes and load balancers. The Prometheus `/metrics` endpoint
+on the metrics port is also ungated. Keep the metrics and health ports on an
+internal network.
+
 The UI is strictly read-only. It cannot submit queries, cancel them, or change
-configuration. The query-detail endpoint deliberately omits session id, client
-IP, and roles so the unauthenticated surface stays small.
+configuration. The query-detail endpoint omits session id, client IP, and roles
+so a leaked admin token still exposes less session metadata.
 
 ## Tabs
 
