@@ -1,0 +1,105 @@
+# Prometheus rules for SQE. Load with Prometheus `rule_files` or as a
+# PrometheusRule CRD (kube-prometheus / prometheus-operator).
+#
+# Metric names match crates/sqe-metrics. Thresholds are starting points;
+# tune after a week of production traffic.
+#
+# GitLab #418. Helm ServiceMonitor is separate (deploy/helm/sqe); this file
+# is the alert payload so a chart bump is not required to start paging.
+
+groups:
+  - name: sqe.queries
+    rules:
+      - alert: SqeQueryErrorRate
+        expr: |
+          sum(rate(sqe_query_count_total{status="error"}[5m]))
+            /
+          clamp_min(sum(rate(sqe_query_count_total[5m])), 1e-9)
+            > 0.05
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: SQE query error rate is above 5%
+          description: >
+            More than 5% of queries are failing for 10m. Check coordinator
+            logs, catalog reachability, and policy breaker state.
+
+      - alert: SqeQueryErrorsSustained
+        expr: sum(increase(sqe_query_count_total{status="error"}[15m])) > 20
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: SQE recorded more than 20 query errors in 15m
+          description: Burst of query failures. Correlate with error_code on sqe_query_count_total.
+
+  - name: sqe.memory
+    rules:
+      - alert: SqeCoordinatorMemoryRed
+        expr: sqe_coordinator_memory_pressure >= 3
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: SQE coordinator memory pool is in the red band
+          description: >
+            Admission is rejecting new queries. Check spill, concurrent
+            sorts, and coordinator.memory_limit vs the pod limit.
+
+      - alert: SqeCoordinatorMemoryHigh
+        expr: |
+          sqe_coordinator_memory_used_bytes
+            /
+          clamp_min(sqe_coordinator_memory_limit_bytes, 1)
+            > 0.9
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: SQE coordinator memory pool is above 90%
+          description: Used {{ $value | humanizePercentage }} of the DataFusion pool.
+
+  - name: sqe.policy
+    rules:
+      - alert: SqeRangerCircuitOpen
+        expr: sqe_policy_circuit_breaker_state{backend="ranger"} == 2
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: Ranger policy circuit breaker is open
+          description: >
+            Queries fail-closed (deny-all). Check Ranger Admin reachability
+            and sqe_policy_resolve_duration_seconds.
+
+      - alert: SqeOpaCircuitOpen
+        expr: sqe_policy_circuit_breaker_state{backend="opa"} == 2
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: OPA policy circuit breaker is open
+          description: Policy fetches to OPA are failing. Queries fail-closed.
+
+  - name: sqe.workers
+    rules:
+      - alert: SqeWorkerShuffleResidentHigh
+        expr: sqe_worker_shuffle_resident_bytes > 2e9
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Worker shuffle buffers above 2GiB
+          description: >
+            Shuffle is still item-bounded (#406). High resident bytes precede
+            OOM. Check concurrent exchange-heavy queries.
+
+      - alert: SqeWorkerDown
+        expr: up{job=~"sqe.*worker.*"} == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: An SQE worker scrape target is down
+          description: "{{ $labels.instance }} is not being scraped. Relabel job if your scrape config uses a different name."
