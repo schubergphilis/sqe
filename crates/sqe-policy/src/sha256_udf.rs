@@ -291,10 +291,10 @@ mod tests {
         // RFC 4231-style sanity check: HMAC-SHA256(key="pepper", msg="123-45-6789").
         // Reference computed with `printf 123-45-6789 |
         // openssl dgst -sha256 -mac HMAC -macopt key:pepper`.
-        assert_eq!(
-            keyed_hash, "40966d99be0fda85dac0b2f8d9f00b434b89b0d3e2b3f4bdcbf1dd31a2b7092f",
-            "HMAC-SHA256 output drift"
-        );
+        // HMAC-SHA256(key="pepper", msg="123-45-6789"): a fixture digest, not a secret.
+        const KEYED_PEPPER_HMAC: &str =
+            "40966d99be0fda85dac0b2f8d9f00b434b89b0d3e2b3f4bdcbf1dd31a2b7092f"; // gitleaks:allow
+        assert_eq!(keyed_hash, KEYED_PEPPER_HMAC, "HMAC-SHA256 output drift");
     }
 
     #[test]
