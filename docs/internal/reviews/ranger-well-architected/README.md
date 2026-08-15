@@ -4,13 +4,13 @@ This is a Well-Architected review of the new Apache Ranger fine-grained governan
 
 ## Top priority
 
-[`view-bypass-policy`](P0-view-bypass-policy.md) (P0) is the most urgent finding. Policy enforcement runs on the unoptimized plan before views are inlined, so any row filter, column mask, or column restriction on a base table is skipped when the table is read through a view. An analyst with no grant can read a governed table raw through a view. Fix this first, on a dedicated branch with view+policy integration tests.
+[`view-bypass-policy`](P0-view-bypass-policy.md) (P0) is Resolved. On DataFusion 54, view inlining happens at `ctx.sql` planning time, so `evaluate` already sees the base `TableScan` and the rewriter governs it. Verified in `crates/sqe-policy/tests/view_bypass_policy.rs`. Remaining open work starts at the High findings (tag-cache fail-open, stale tags across tokens, missing Ranger metrics and policy-decision audit).
 
 ## Findings
 
 | ID | Pillar | Severity | Status | One-line |
 |---|---|---|---|---|
-| [view-bypass-policy](P0-view-bypass-policy.md) | Security | P0/Critical | Open | Views bypass all policy: enforcement runs before view inlining |
+| [view-bypass-policy](P0-view-bypass-policy.md) | Security | P0/Critical | Resolved | Views bypass all policy: enforcement runs before view inlining |
 | [empty-projection-failopen](P0-empty-projection-failopen.md) | Security | P0/Critical | Resolved in commit 722d1b2 | Empty mask/restrict projection returned the raw scan |
 | [partialmask-non-ascii-leak](HIGH-partialmask-non-ascii-leak.md) | Security | High | Resolved in commit 722d1b2 | Full mask passed non-ASCII PII through unmasked |
 | [policy-expr-body-log-leak](HIGH-policy-expr-body-log-leak.md) | Operational Excellence | High | Resolved in commit 722d1b2 | WARN logs leaked row-filter and mask template literals |

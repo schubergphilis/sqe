@@ -30,7 +30,7 @@ sqe> SELECT snapshot_id, committed_at FROM s3tables.sales."orders$snapshots";
 
 **Top-five on the public [Iceberg matrix](https://icebergmatrix.org). 167/189. 88.4%.** Only non-Spark engine in the top five. Per-cell breakdown and a side-by-side against 20 other engines tracked internally.
 
-**Wins six of seven benchmark suites against Trino 465 at SF1.** TPC-H, SSB, TPC-DS, TPC-C, TPC-E, TPC-BB, ClickBench. 222 of 222 queries pass, and the results are differentially validated: every query runs against both engines and the rows are diffed, with DuckDB's official `dsdgen` as an independent data oracle. Tables and method below.
+**Wins all seven benchmark suites against Trino 465 at SF1** (measured on 2026-08-15). TPC-H, SSB, TPC-DS, TPC-C, TPC-E, TPC-BB, ClickBench. 222 of 222 queries pass, and the results are differentially validated: every query runs against both engines and the rows are diffed, with DuckDB's official `dsdgen` as an independent data oracle. Tables and method below.
 
 **One binary scales from CLI to cluster.** `sqe-cli --embedded` is a DuckDB-class single-process engine with the same SQL surface as the distributed coordinator. Persistent SQLite-backed Iceberg catalogs at `~/.sqe/warehouse/` survive restarts. Cross-catalog joins across multiple `--catalog NAME=PATH` mounts, plus runtime mounts via SQL `ATTACH` against any of the six supported backends (REST, Glue, S3 Tables, HMS, JDBC, SQLite).
 
@@ -63,17 +63,19 @@ Two longer comparison docs trace the lineage of these positions:
 
 ## Performance receipts (SF1, vs Trino 465)
 
+Measured on 2026-08-15. Both engines against the same Iceberg catalog. Compare reports in `benchmarks/results/compare-*-sf1-2026-08-15*.json`; SQE-only Flight runs in `*-sf1-flight-2026-08-15*.json`. Totals below are the compare `sqe_total_ms` / `trino_total_ms`.
+
 | Suite | SQE | Trino | Speedup | Pass |
 |---|---|---|---|---|
-| TPC-H (22) | 16.8s | 26.7s | **1.6x** | 22/22 |
-| SSB (13) | 8.3s | 5.8s | **0.70x slower** | 13/13 |
-| TPC-DS (99) | 13.4s | 45.6s | **3.4x** | 93/99 |
-| TPC-C (8 read) | 0.41s | 2.65s | **6.5x** | 8/8 |
-| TPC-E (11) | 9.3s | 172.0s | **18.5x** | 11/11 |
-| TPC-BB (10) | 28.0s | 255.7s | **9.1x** | 10/10 |
-| ClickBench (43) | 1.3s | 4.46s | **3.4x** | 43/43 |
+| TPC-H (22) | 27.5s | 55.9s | **2.0x** | 22/22 |
+| SSB (13) | 11.1s | 12.1s | **1.1x** | 13/13 |
+| TPC-DS (99) | 74.9s | 140.3s | **1.9x** | 99/99 |
+| TPC-C (8 read) | 3.31s | 6.53s | **2.0x** | 8/8 |
+| TPC-E (11) | 5.57s | 13.7s | **2.5x** | 11/11 |
+| TPC-BB (10) | 56.3s | 290.3s | **5.2x** | 10/10 |
+| ClickBench (43) | 2.26s | 4.58s | **2.0x** | 43/43 |
 
-SQE wins six of seven suites. TPC-DS collapsed from 42.5s to 13.4s after we wired DataFusion's runtime filters into iceberg-rust's scan path through the vendor's `DynamicPredicate` bridge: q82 dropped 1787ms to 113ms (16x), q80 1398ms to 103ms (14x), q13 1317ms to 220ms (6x). The fix is a two-tier pushdown: iceberg-rust samples once per file scan task for row-group / page-index pruning, and a per-batch wrapper catches filters that resolve after the task opened. Earlier in the month we landed the dynamic-filter type-coercion fix that flipped q72 from 10.7s to 0.77s ([docs/site/blog/2026-05-16-q72-the-nemesis.md](docs/site/blog/2026-05-16-q72-the-nemesis.md)). SSB is the one suite we still trail; lineorder's uniform FK distribution defeats row-group pruning, so the runtime filter only helps at row level and Trino's vectorized decoder still wins. The remaining 6/99 TPC-DS mismatches are upstream DataFusion ROLLUP / GROUPING() gaps (apache/datafusion#4763, #13993), not engine regressions. The earlier "Our Nemesis" investigation is preserved as [docs/site/blog/2026-04-16-our-nemesis-q72.md](docs/site/blog/2026-04-16-our-nemesis-q72.md).
+SQE wins all seven suites on that rig. TPC-DS compare is 99/99 match; the earlier ROLLUP / GROUPING() gaps are closed. SSB is slightly faster than Trino here (11.1s vs 12.1s), not the suite we trail. The DynamicPredicate bridge that first collapsed TPC-DS (q82 1787ms to 113ms, q80 1398ms to 103ms, q13 1317ms to 220ms) is still the two-tier pushdown in the scan path: iceberg-rust samples once per file scan task for row-group / page-index pruning, and a per-batch wrapper catches filters that resolve after the task opened. The dynamic-filter type-coercion fix that flipped q72 from 10.7s to 0.77s is in [docs/site/blog/2026-05-16-q72-the-nemesis.md](docs/site/blog/2026-05-16-q72-the-nemesis.md). The earlier "Our Nemesis" investigation is preserved as [docs/site/blog/2026-04-16-our-nemesis-q72.md](docs/site/blog/2026-04-16-our-nemesis-q72.md).
 
 ## Performance receipts (SF10, vs Trino 481)
 
