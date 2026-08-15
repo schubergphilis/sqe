@@ -141,6 +141,9 @@ absolute_timeout_secs = 28800   # 8 hours, hard session lifetime cap
 persistence = "memory"          # "memory" (default) or "file"
 persistence_path = "/tmp/sqe-sessions.json"  # Path for file-based persistence
 snapshot_interval_secs = 60     # How often file persistence snapshots sessions to disk
+# Optional CREATE SECRET snapshot (plaintext JSON, mode 0600). Empty = memory
+# only. ATTACH mounts stay process-local even when this is set.
+# secrets_path = "/var/lib/sqe/secrets.json"
 
 [query]
 timeout_secs = 300              # 5 min, max execution time per query

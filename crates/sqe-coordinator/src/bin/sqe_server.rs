@@ -1386,7 +1386,8 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
             grant_backend,
             lineage_obs,
             sqe_coordinator::RuntimeCatalogRegistry::default(),
-            sqe_core::SecretStore::default(),
+            sqe_core::SecretStore::from_optional_path(&config.session.secrets_path)
+                .map_err(|e| anyhow::anyhow!(e))?,
         )?
         .with_table_cache(table_cache)
         .with_session_manager(session_manager.clone()),
