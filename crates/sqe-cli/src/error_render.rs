@@ -106,7 +106,10 @@ fn last_json_number(flat: &str, field: &str) -> Option<u16> {
 /// the JSON body did not carry a `code`.
 fn status_from_context(flat: &str) -> Option<u16> {
     let start = flat.find("status: ")? + "status: ".len();
-    let digits: String = flat[start..].chars().take_while(char::is_ascii_digit).collect();
+    let digits: String = flat[start..]
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
     digits.parse().ok()
 }
 
@@ -172,8 +175,7 @@ pub fn render(raw: &str) -> Option<Rendered> {
     // cause tail is the fallback.
     let detail = last_json_string(inner, "message").or_else(|| cause_tail(inner));
     let kind = last_json_string(inner, "type");
-    let status =
-        last_json_number(inner, "code").or_else(|| status_from_context(inner));
+    let status = last_json_number(inner, "code").or_else(|| status_from_context(inner));
 
     if detail.is_none() && kind.is_none() && status.is_none() {
         // Nothing structured to pull out. Peeling the transport wrapper is still
@@ -192,7 +194,12 @@ pub fn render(raw: &str) -> Option<Rendered> {
         });
     }
 
-    Some(Rendered { context, detail, kind, status })
+    Some(Rendered {
+        context,
+        detail,
+        kind,
+        status,
+    })
 }
 
 /// Format an error for `eprintln!`, falling back to the raw string.
@@ -252,7 +259,13 @@ mod tests {
     fn polaris_403_display_is_two_lines_and_drops_the_plumbing() {
         let out = format_error(POLARIS_403, false);
         assert_eq!(out.lines().count(), 2, "got: {out}");
-        for noise in ["Tonic error", "headers", "content-length", "\\\"", "context: {"] {
+        for noise in [
+            "Tonic error",
+            "headers",
+            "content-length",
+            "\\\"",
+            "context: {",
+        ] {
             assert!(!out.contains(noise), "{noise} survived in: {out}");
         }
         assert!(out.contains("not authorized for op 'LOAD_TABLE'"));
@@ -280,7 +293,10 @@ mod tests {
         let raw = r#""Query failed: Tonic error: code: 'Internal error', message: \"Failed to load table: Unexpected => Tried to load a table that does not exist\"""#;
         let r = render(raw).expect("recognizable shape");
         assert_eq!(r.context, "Failed to load table");
-        assert_eq!(r.detail.as_deref(), Some("Tried to load a table that does not exist"));
+        assert_eq!(
+            r.detail.as_deref(),
+            Some("Tried to load a table that does not exist")
+        );
         assert_eq!(r.status, None);
     }
 
@@ -289,14 +305,18 @@ mod tests {
     fn plain_message_passes_through_unchanged() {
         let raw = r#""Failed to fetch results: Tonic error: code: 'Operation is not implemented or not supported', message: \"Utility statement not supported: SHOW VIEWS IN sales_wh.acparity\"""#;
         let out = format_error(raw, false);
-        assert_eq!(out, "Utility statement not supported: SHOW VIEWS IN sales_wh.acparity");
+        assert_eq!(
+            out,
+            "Utility statement not supported: SHOW VIEWS IN sales_wh.acparity"
+        );
     }
 
     /// The boilerplate tail alone is not a reason, so it must not be promoted
     /// into the detail line where it would displace nothing with noise.
     #[test]
     fn noise_tail_is_not_promoted_to_detail() {
-        let raw = "Failed to load table: Unexpected => Received response with unexpected status code";
+        let raw =
+            "Failed to load table: Unexpected => Received response with unexpected status code";
         let r = render(raw);
         assert!(
             r.as_ref().and_then(|r| r.detail.as_ref()).is_none(),
@@ -311,7 +331,10 @@ mod tests {
 
     #[test]
     fn unstructured_input_is_returned_rather_than_guessed_at() {
-        assert_eq!(format_error("connection refused", false), "connection refused");
+        assert_eq!(
+            format_error("connection refused", false),
+            "connection refused"
+        );
         assert_eq!(format_error("", false), "");
     }
 

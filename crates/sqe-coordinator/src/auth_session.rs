@@ -35,10 +35,7 @@ pub fn identity_to_session(identity: Identity, fallback_token: Option<&str>) -> 
 mod tests {
     use super::*;
 
-    fn identity(
-        token: Option<&str>,
-        expires: Option<chrono::DateTime<chrono::Utc>>,
-    ) -> Identity {
+    fn identity(token: Option<&str>, expires: Option<chrono::DateTime<chrono::Utc>>) -> Identity {
         Identity {
             user_id: "sp-reader".to_string(),
             display_name: "sp-reader".to_string(),

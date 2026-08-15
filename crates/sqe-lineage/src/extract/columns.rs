@@ -35,19 +35,45 @@ pub type ColumnTrace = Vec<Vec<ColumnDep>>;
 //              (FILTER, JOIN, GROUP_BY, SORT, WINDOW, CONDITIONAL)
 // ---------------------------------------------------------------------------
 
-pub fn direct_identity()       -> Transformation { make("DIRECT",   "IDENTITY",       false) }
-pub fn direct_transformation() -> Transformation { make("DIRECT",   "TRANSFORMATION", false) }
-pub fn direct_aggregation()    -> Transformation { make("DIRECT",   "AGGREGATION",    false) }
-pub fn direct_window()         -> Transformation { make("DIRECT",   "WINDOW",         false) }
-pub fn indirect_filter()       -> Transformation { make("INDIRECT", "FILTER",         false) }
-pub fn indirect_join()         -> Transformation { make("INDIRECT", "JOIN",           false) }
-pub fn indirect_groupby()      -> Transformation { make("INDIRECT", "GROUP_BY",       false) }
-pub fn indirect_sort()         -> Transformation { make("INDIRECT", "SORT",           false) }
-pub fn indirect_window()       -> Transformation { make("INDIRECT", "WINDOW",         false) }
-pub fn indirect_conditional()  -> Transformation { make("INDIRECT", "CONDITIONAL",    false) }
-pub fn masked()                -> Transformation { make("DIRECT",   "MASKED",         true)  }
-pub fn merge_insert()          -> Transformation { make("DIRECT",   "MERGE_INSERT",   false) }
-pub fn merge_update()          -> Transformation { make("DIRECT",   "MERGE_UPDATE",   false) }
+pub fn direct_identity() -> Transformation {
+    make("DIRECT", "IDENTITY", false)
+}
+pub fn direct_transformation() -> Transformation {
+    make("DIRECT", "TRANSFORMATION", false)
+}
+pub fn direct_aggregation() -> Transformation {
+    make("DIRECT", "AGGREGATION", false)
+}
+pub fn direct_window() -> Transformation {
+    make("DIRECT", "WINDOW", false)
+}
+pub fn indirect_filter() -> Transformation {
+    make("INDIRECT", "FILTER", false)
+}
+pub fn indirect_join() -> Transformation {
+    make("INDIRECT", "JOIN", false)
+}
+pub fn indirect_groupby() -> Transformation {
+    make("INDIRECT", "GROUP_BY", false)
+}
+pub fn indirect_sort() -> Transformation {
+    make("INDIRECT", "SORT", false)
+}
+pub fn indirect_window() -> Transformation {
+    make("INDIRECT", "WINDOW", false)
+}
+pub fn indirect_conditional() -> Transformation {
+    make("INDIRECT", "CONDITIONAL", false)
+}
+pub fn masked() -> Transformation {
+    make("DIRECT", "MASKED", true)
+}
+pub fn merge_insert() -> Transformation {
+    make("DIRECT", "MERGE_INSERT", false)
+}
+pub fn merge_update() -> Transformation {
+    make("DIRECT", "MERGE_UPDATE", false)
+}
 
 fn make(kind: &str, subtype: &str, masking: bool) -> Transformation {
     Transformation {
@@ -240,8 +266,7 @@ fn trace_aggregate(a: &Aggregate, child_trace: ColumnTrace) -> ColumnTrace {
         .iter()
         .map(|e| {
             let refs = e.column_refs();
-            let mut deps =
-                deps_for_refs(&refs, input, &child_trace, &direct_aggregation());
+            let mut deps = deps_for_refs(&refs, input, &child_trace, &direct_aggregation());
             deps.extend(group_indirect.iter().cloned());
             deps
         })
@@ -322,13 +347,8 @@ fn trace_join(j: &Join) -> ColumnTrace {
 ///
 /// Output column i merges deps from each input child's column at position i.
 fn trace_union(u: &Union) -> ColumnTrace {
-    let child_traces: Vec<ColumnTrace> =
-        u.inputs.iter().map(|child| trace_plan(child)).collect();
-    let width = child_traces
-        .iter()
-        .map(|t| t.len())
-        .max()
-        .unwrap_or(0);
+    let child_traces: Vec<ColumnTrace> = u.inputs.iter().map(|child| trace_plan(child)).collect();
+    let width = child_traces.iter().map(|t| t.len()).max().unwrap_or(0);
 
     (0..width)
         .map(|i| {
@@ -377,21 +397,11 @@ fn trace_window(w: &Window, mut child_trace: ColumnTrace) -> ColumnTrace {
             let params = &boxed.params;
             for pb in &params.partition_by {
                 let refs = pb.column_refs();
-                indirect_deps.extend(deps_for_refs(
-                    &refs,
-                    input,
-                    &child_trace,
-                    &indirect_t,
-                ));
+                indirect_deps.extend(deps_for_refs(&refs, input, &child_trace, &indirect_t));
             }
             for ob in &params.order_by {
                 let refs = ob.expr.column_refs();
-                indirect_deps.extend(deps_for_refs(
-                    &refs,
-                    input,
-                    &child_trace,
-                    &indirect_t,
-                ));
+                indirect_deps.extend(deps_for_refs(&refs, input, &child_trace, &indirect_t));
             }
         }
     }

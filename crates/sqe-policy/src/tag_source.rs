@@ -70,7 +70,10 @@ mod tests {
     #[test]
     fn noop_with_none_catalog_returns_known_empty() {
         let s = NoopTagSource;
-        assert_eq!(s.column_tags(None, &["ns".into()], "tbl"), Some(HashMap::new()));
+        assert_eq!(
+            s.column_tags(None, &["ns".into()], "tbl"),
+            Some(HashMap::new())
+        );
     }
 
     #[test]

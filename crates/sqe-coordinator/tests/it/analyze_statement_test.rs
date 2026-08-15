@@ -34,9 +34,8 @@ fn analyze_bare_table_classifies_as_analyze() {
 #[test]
 fn analyze_qualified_with_properties_classifies_as_analyze() {
     // sqlparser cannot parse the trailing WITH (...); the pre-scan must.
-    let result =
-        parse_and_classify("ANALYZE iceberg.default.t WITH (partitioning = ARRAY['x'])")
-            .expect("parse ok");
+    let result = parse_and_classify("ANALYZE iceberg.default.t WITH (partitioning = ARRAY['x'])")
+        .expect("parse ok");
     match result {
         StatementKind::Analyze(table) => assert_eq!(table, "iceberg.default.t"),
         other => panic!("expected Analyze, got {other:?}"),
@@ -85,11 +84,7 @@ async fn analyze_missing_table_errors() {
     let (session, handler) = crate::common::setup_handler().await;
 
     let result = handler
-        .execute(
-            &session,
-            "ANALYZE default.analyze_does_not_exist_zzz",
-            None,
-        )
+        .execute(&session, "ANALYZE default.analyze_does_not_exist_zzz", None)
         .await;
     assert!(
         result.is_err(),

@@ -489,7 +489,10 @@ mod tests {
         let err = try_parse_set_tags("ALTER TABLE t SET TAGS (email = ('PII'")
             .expect_err("unbalanced parens must error");
         let msg = err.to_string();
-        assert!(msg.contains("email"), "error must name the column, got: {msg}");
+        assert!(
+            msg.contains("email"),
+            "error must name the column, got: {msg}"
+        );
     }
 
     #[test]
@@ -556,18 +559,18 @@ mod masking_policy_parse_tests {
     /// test and `the_detach_form_parses_with_and_without_a_name`.
     #[test]
     fn unset_is_never_read_as_set() {
-        let op = try_parse_masking_policy(
-            "ALTER TABLE c.ns.t MODIFY COLUMN ssn UNSET MASKING POLICY",
-        )
-        .expect("parse")
-        .expect("recognised");
+        let op =
+            try_parse_masking_policy("ALTER TABLE c.ns.t MODIFY COLUMN ssn UNSET MASKING POLICY")
+                .expect("parse")
+                .expect("recognised");
         assert_eq!(op.policy, None, "UNSET must detach, never attach");
     }
 
     #[test]
     fn an_attach_with_no_policy_name_is_an_error() {
-        let err = try_parse_masking_policy("ALTER TABLE c.ns.t MODIFY COLUMN ssn SET MASKING POLICY")
-            .expect_err("a name is required");
+        let err =
+            try_parse_masking_policy("ALTER TABLE c.ns.t MODIFY COLUMN ssn SET MASKING POLICY")
+                .expect_err("a name is required");
         assert!(
             err.to_string().contains("SHOW MASKING POLICIES"),
             "the error should point at how to find a name, got: {err}"

@@ -122,11 +122,8 @@ pub fn build_worker_service_with_hot_reload(
         };
         // Detached on purpose: the watcher owns its own loop for the life of
         // the process, so the JoinHandle is dropped rather than awaited.
-        let _config_reload_task = spawn_config_reload_watch(
-            PathBuf::from(path),
-            handles,
-            DEFAULT_CONFIG_RELOAD_INTERVAL,
-        );
+        let _config_reload_task =
+            spawn_config_reload_watch(PathBuf::from(path), handles, DEFAULT_CONFIG_RELOAD_INTERVAL);
     }
 
     // Plaintext warning (config validation already fail-closes on non-loopback
@@ -276,10 +273,11 @@ fn build_spill_manager(config: &SqeConfig) -> anyhow::Result<Option<Arc<SpillMan
         tracing::info!("Worker spill substrate disabled");
         return Ok(None);
     }
-    let max_bytes = parse_memory_limit(&spill.max_bytes).map_err(|e| {
-        anyhow::anyhow!("worker.spill.max_bytes: {e}")
-    })? as u64;
-    let orphan_age = spill.orphan_age_duration().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let max_bytes = parse_memory_limit(&spill.max_bytes)
+        .map_err(|e| anyhow::anyhow!("worker.spill.max_bytes: {e}"))? as u64;
+    let orphan_age = spill
+        .orphan_age_duration()
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let store: Arc<dyn sqe_spill::SegmentStore> = match spill.backend.as_str() {
         "local" => {
@@ -292,9 +290,9 @@ fn build_spill_manager(config: &SqeConfig) -> anyhow::Result<Option<Arc<SpillMan
                      (set worker.spill.directory or worker.spill_dir)"
                 ));
             }
-            let min_free = parse_memory_limit(&spill.min_free_bytes).map_err(|e| {
-                anyhow::anyhow!("worker.spill.min_free_bytes: {e}")
-            })? as u64;
+            let min_free = parse_memory_limit(&spill.min_free_bytes)
+                .map_err(|e| anyhow::anyhow!("worker.spill.min_free_bytes: {e}"))?
+                as u64;
             Arc::new(LocalSegmentStore::open(
                 &dir,
                 max_bytes,
@@ -330,9 +328,9 @@ fn build_spill_manager(config: &SqeConfig) -> anyhow::Result<Option<Arc<SpillMan
                     "tiered spill requires worker.spill.directory (or spill_dir)"
                 ));
             }
-            let min_free = parse_memory_limit(&spill.min_free_bytes).map_err(|e| {
-                anyhow::anyhow!("worker.spill.min_free_bytes: {e}")
-            })? as u64;
+            let min_free = parse_memory_limit(&spill.min_free_bytes)
+                .map_err(|e| anyhow::anyhow!("worker.spill.min_free_bytes: {e}"))?
+                as u64;
             let local = Arc::new(LocalSegmentStore::open(
                 &dir,
                 max_bytes,
@@ -389,10 +387,7 @@ fn build_spill_manager(config: &SqeConfig) -> anyhow::Result<Option<Arc<SpillMan
 
 /// Build the Parquet footer cache and register its hit/miss counters on the
 /// worker metrics registry so the footer hit-rate is scrapeable.
-fn build_footer_cache(
-    config: &SqeConfig,
-    metrics: &WorkerMetricsRegistry,
-) -> Arc<FooterCache> {
+fn build_footer_cache(config: &SqeConfig, metrics: &WorkerMetricsRegistry) -> Arc<FooterCache> {
     let size_bytes = parse_memory_limit(&config.storage.footer_cache_size).unwrap_or_else(|e| {
         tracing::warn!(
             value = %config.storage.footer_cache_size,

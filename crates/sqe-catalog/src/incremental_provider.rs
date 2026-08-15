@@ -48,12 +48,12 @@ use datafusion::physical_plan::{
 };
 use futures::{Stream, StreamExt, TryStreamExt};
 use iceberg::io::FileIO;
-use parquet::arrow::ProjectionMask;
 use parquet::arrow::arrow_reader::{ArrowReaderOptions, ParquetRecordBatchReaderBuilder};
+use parquet::arrow::ProjectionMask;
 use tracing::debug;
 
 use crate::incremental_scan::{
-    ChangeKind, IncrementalFile, IncrementalPlan, attach_meta_columns, augment_schema_with_meta,
+    attach_meta_columns, augment_schema_with_meta, ChangeKind, IncrementalFile, IncrementalPlan,
     CHANGE_ORDINAL_COLUMN, CHANGE_TYPE_COLUMN, COMMIT_SNAPSHOT_ID_COLUMN,
 };
 
@@ -119,7 +119,6 @@ impl IncrementalTableProvider {
 
 #[async_trait]
 impl TableProvider for IncrementalTableProvider {
-
     fn schema(&self) -> ArrowSchemaRef {
         self.augmented_schema.clone()
     }
@@ -164,8 +163,7 @@ impl TableProvider for IncrementalTableProvider {
         for idx in requested {
             if idx < base_cols {
                 base_indices.push(idx);
-                output_order
-                    .push(OutputCol::Base(base_indices.len() - 1));
+                output_order.push(OutputCol::Base(base_indices.len() - 1));
                 continue;
             }
             let name = self.augmented_schema.field(idx).name().as_str();
@@ -226,9 +224,7 @@ struct MetaCols {
 
 impl MetaCols {
     fn count(self) -> usize {
-        self.change_type as usize
-            + self.change_ordinal as usize
-            + self.commit_snapshot as usize
+        self.change_type as usize + self.change_ordinal as usize + self.commit_snapshot as usize
     }
 
     fn all(self) -> bool {
@@ -392,14 +388,9 @@ impl ExecutionPlan for IncrementalScanExec {
                 if !matches!(file.kind, ChangeKind::Insert) {
                     continue;
                 }
-                let batches = read_file_batches(
-                    &file_io,
-                    file,
-                    &base_schema,
-                    &base_indices,
-                )
-                .await
-                .map_err(DataFusionError::External)?;
+                let batches = read_file_batches(&file_io, file, &base_schema, &base_indices)
+                    .await
+                    .map_err(DataFusionError::External)?;
                 for base_batch in batches {
                     let out = project_with_meta(
                         base_batch,
@@ -436,8 +427,7 @@ async fn read_file_batches(
     let input = file_io.new_input(&file.path)?;
     let bytes = input.read().await?;
     let reader_opts = ArrowReaderOptions::new();
-    let builder =
-        ParquetRecordBatchReaderBuilder::try_new_with_options(bytes, reader_opts)?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new_with_options(bytes, reader_opts)?;
     let parquet_schema = builder.parquet_schema().clone();
     let mask = if base_indices.is_empty() {
         // COUNT(*) or meta-only: read the first column for row count only.
@@ -515,10 +505,7 @@ struct IncrementalBatchStream {
 
 impl Stream for IncrementalBatchStream {
     type Item = DFResult<RecordBatch>;
-    fn poll_next(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Self::Item>> {
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let poll = self.inner.poll_next_unpin(cx);
         self.baseline.record_poll(poll)
     }
@@ -556,11 +543,7 @@ mod tests {
     async fn empty_plan_scan_produces_empty_batch() {
         use datafusion::prelude::SessionContext;
 
-        let base = Arc::new(Schema::new(vec![Field::new(
-            "id",
-            DataType::Int64,
-            false,
-        )]));
+        let base = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
         let plan = IncrementalPlan::default();
         let provider = Arc::new(IncrementalTableProvider::new(base, plan, None));
 

@@ -105,10 +105,7 @@ mod tests {
 
     #[test]
     fn config_worker() {
-        assert_eq!(
-            resolve_mode_inner("worker", None).unwrap(),
-            Mode::Worker
-        );
+        assert_eq!(resolve_mode_inner("worker", None).unwrap(), Mode::Worker);
     }
 
     #[test]
@@ -117,10 +114,7 @@ mod tests {
             resolve_mode_inner("Coordinator", None).unwrap(),
             Mode::Coordinator
         );
-        assert_eq!(
-            resolve_mode_inner("WORKER", None).unwrap(),
-            Mode::Worker
-        );
+        assert_eq!(resolve_mode_inner("WORKER", None).unwrap(), Mode::Worker);
     }
 
     #[test]
@@ -239,9 +233,8 @@ mod tests {
     fn warn_silent_when_secret_set_with_waiver() {
         // A configured secret is enforced by the heartbeat handler even with the
         // waiver, so the workers are authenticated. No false positive.
-        let coord = coord_from_toml(
-            "allow_unauthenticated_workers = true\nworker_secret = \"s3cr3t\"",
-        );
+        let coord =
+            coord_from_toml("allow_unauthenticated_workers = true\nworker_secret = \"s3cr3t\"");
         assert!(!warns_unauthenticated_workers(&coord));
     }
 }

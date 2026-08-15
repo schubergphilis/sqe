@@ -52,8 +52,7 @@ pub fn build_session_context_with_pool(
     if config.spill_to_disk {
         builder = builder.with_temp_file_path(&config.spill_dir);
     } else {
-        let disk_builder =
-            DiskManagerBuilder::default().with_mode(DiskManagerMode::Disabled);
+        let disk_builder = DiskManagerBuilder::default().with_mode(DiskManagerMode::Disabled);
         builder = builder.with_disk_manager_builder(disk_builder);
     }
 

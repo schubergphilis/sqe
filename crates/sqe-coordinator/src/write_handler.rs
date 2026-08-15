@@ -21,12 +21,10 @@ use sqlparser::ast::{ObjectName, Statement};
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use sqe_catalog::puffin_stats::{
-    puffin_stats_enabled, write_puffin_sidecar,
-};
+use sqe_catalog::puffin_stats::{puffin_stats_enabled, write_puffin_sidecar};
 use sqe_catalog::{SessionCatalog, TableMetadataCache};
 use sqe_core::table_properties::{
-    WriteMode, resolve_delete_mode, resolve_merge_mode, resolve_update_mode,
+    resolve_delete_mode, resolve_merge_mode, resolve_update_mode, WriteMode,
 };
 use sqe_core::{Session, SqeConfig, SqeError};
 use tracing::instrument;
@@ -87,10 +85,7 @@ fn reorder_insert_select(
                 "INSERT column list contains duplicate column '{name}'"
             )));
         }
-        if !target_names
-            .iter()
-            .any(|t| t.eq_ignore_ascii_case(name))
-        {
+        if !target_names.iter().any(|t| t.eq_ignore_ascii_case(name)) {
             return Err(SqeError::Execution(format!(
                 "INSERT column '{name}' does not exist in target table"
             )));
@@ -101,7 +96,10 @@ fn reorder_insert_select(
     // the value destined for `columns[i]`. Alias each output by that target
     // name in a CTE, then project the full target schema with NULLs for
     // unprovided columns.
-    let alias_list: Vec<String> = columns.iter().map(|c| quote_ident(&column_value(c))).collect();
+    let alias_list: Vec<String> = columns
+        .iter()
+        .map(|c| quote_ident(&column_value(c)))
+        .collect();
     let alias_csv = alias_list.join(", ");
 
     let projection: Vec<String> = target_names
@@ -249,9 +247,9 @@ fn delete_target_object_name(stmt: &Statement) -> sqe_core::Result<&ObjectName> 
         sqlparser::ast::FromTable::WithFromKeyword(tables) => tables,
         sqlparser::ast::FromTable::WithoutKeyword(tables) => tables,
     };
-    let first = tables.first().ok_or_else(|| {
-        SqeError::Execution("DELETE statement has no target table".to_string())
-    })?;
+    let first = tables
+        .first()
+        .ok_or_else(|| SqeError::Execution("DELETE statement has no target table".to_string()))?;
     match &first.relation {
         sqlparser::ast::TableFactor::Table { name, .. } => Ok(name),
         other => Err(SqeError::Execution(format!(
@@ -317,10 +315,7 @@ fn try_resolve_update_target_ident(stmt: &Statement, session: &Session) -> Optio
 /// in OL events. SQE's catalog name is whatever `resolve_default_catalog()`
 /// returns; the OL `catalog_lookup` falls back to `sqe://<name>` when the
 /// operator hasn't configured an explicit URL for it.
-fn lineage_target_parts(
-    config: &SqeConfig,
-    table_ident: &TableIdent,
-) -> (String, String, String) {
+fn lineage_target_parts(config: &SqeConfig, table_ident: &TableIdent) -> (String, String, String) {
     let catalog = config.resolve_default_catalog();
     // `NamespaceIdent::Display` joins parts with a literal dot, which matches
     // how the OL extractor parses `<catalog>.<schema>.<table>` (it splits on
@@ -676,10 +671,7 @@ impl WriteHandler {
 
     /// Attach the policy enforcer used for write-path source SELECTs.
     #[must_use = "with_policy_enforcer consumes self; bind the returned handler"]
-    pub fn with_policy_enforcer(
-        mut self,
-        enforcer: Arc<dyn sqe_policy::PolicyEnforcer>,
-    ) -> Self {
+    pub fn with_policy_enforcer(mut self, enforcer: Arc<dyn sqe_policy::PolicyEnforcer>) -> Self {
         self.policy_enforcer = Some(enforcer);
         self
     }
@@ -791,7 +783,11 @@ impl WriteHandler {
         let (auto_max, auto_budget) = crate::writer::auto_fanout_caps(pool_bytes);
         FanoutLimits {
             max_open: if cfg_max > 0 { cfg_max } else { auto_max },
-            byte_budget: if cfg_budget > 0 { cfg_budget } else { auto_budget },
+            byte_budget: if cfg_budget > 0 {
+                cfg_budget
+            } else {
+                auto_budget
+            },
         }
     }
 
@@ -1060,8 +1056,7 @@ impl WriteHandler {
                 // has opted in. RecordBatch clones are Arc bumps, not data
                 // copies.
                 let stats_snapshot: Option<Vec<RecordBatch>> =
-                    puffin_stats_enabled(table.metadata().properties())
-                        .then(|| batches.clone());
+                    puffin_stats_enabled(table.metadata().properties()).then(|| batches.clone());
 
                 let data_files = write_data_files_with_metrics(
                     &table,
@@ -1076,21 +1071,16 @@ impl WriteHandler {
                 if !data_files.is_empty() {
                     let files_for_retry = data_files.clone();
                     let catalog_for_commit = catalog.clone();
-                    commit_with_retry(
-                        catalog.as_ref(),
-                        &table_ident,
-                        "ctas",
-                        move |fresh_table| {
-                            let files = files_for_retry.clone();
-                            let cat = catalog_for_commit.clone();
-                            async move {
-                                let tx = Transaction::new(&fresh_table);
-                                let action = tx.fast_append().add_data_files(files);
-                                let tx = action.apply(tx)?;
-                                tx.commit(cat.as_ref()).await
-                            }
-                        },
-                    )
+                    commit_with_retry(catalog.as_ref(), &table_ident, "ctas", move |fresh_table| {
+                        let files = files_for_retry.clone();
+                        let cat = catalog_for_commit.clone();
+                        async move {
+                            let tx = Transaction::new(&fresh_table);
+                            let action = tx.fast_append().add_data_files(files);
+                            let tx = action.apply(tx)?;
+                            tx.commit(cat.as_ref()).await
+                        }
+                    })
                     .await
                     .map_err(|e| {
                         SqeError::Execution(format!("Failed to commit CTAS transaction: {e}"))
@@ -1465,14 +1455,8 @@ impl WriteHandler {
             return Ok(affected_rows_batch(0));
         }
 
-        self.commit_written_files(
-            catalog.as_ref(),
-            table,
-            &table_ident,
-            data_files,
-            overwrite,
-        )
-        .await?;
+        self.commit_written_files(catalog.as_ref(), table, &table_ident, data_files, overwrite)
+            .await?;
         cleanup_guard.mark_committed();
 
         info!(
@@ -1583,10 +1567,7 @@ impl WriteHandler {
         // UnboundPartitionSpec. Identity transforms cover bare column
         // refs; year/month/day/hour/bucket/truncate/void cover the
         // standard hidden-partitioning transforms.
-        let partition_spec = build_partition_spec(
-            ct.partition_by.as_deref(),
-            &iceberg_schema,
-        )?;
+        let partition_spec = build_partition_spec(ct.partition_by.as_deref(), &iceberg_schema)?;
 
         let location = unique_table_location(catalog.as_ref(), &namespace, &name).await;
         let table_creation = TableCreation::builder()
@@ -1652,10 +1633,12 @@ impl WriteHandler {
                 "CREATE TABLE LIKE: source table '{src_ident}' not found: {e}"
             ))
         })?;
-        let src_arrow = iceberg::arrow::schema_to_arrow_schema(src_table.metadata().current_schema())
-            .map_err(|e| {
-                SqeError::Execution(format!("CREATE TABLE LIKE: source schema conversion: {e}"))
-            })?;
+        let src_arrow = iceberg::arrow::schema_to_arrow_schema(
+            src_table.metadata().current_schema(),
+        )
+        .map_err(|e| {
+            SqeError::Execution(format!("CREATE TABLE LIKE: source schema conversion: {e}"))
+        })?;
         let iceberg_schema = arrow_schema_to_iceberg(&src_arrow)?;
 
         info!(
@@ -1957,10 +1940,11 @@ impl WriteHandler {
             )?,
         );
 
-        let mapped = batch_stream
-            .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)));
-        let stream: datafusion::execution::SendableRecordBatchStream =
-            Box::pin(RecordBatchStreamAdapter::new(arrow_schema, Box::pin(mapped)));
+        let mapped =
+            batch_stream.map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)));
+        let stream: datafusion::execution::SendableRecordBatchStream = Box::pin(
+            RecordBatchStreamAdapter::new(arrow_schema, Box::pin(mapped)),
+        );
 
         let tracker = new_upload_tracker();
         let cleanup_guard =
@@ -2034,9 +2018,11 @@ impl WriteHandler {
         let delete = match stmt {
             Statement::Delete(d) => d,
             // unreachable: resolve_delete_target_ident above already filtered.
-            other => return Err(SqeError::Execution(format!(
-                "Expected DELETE statement, got: {other}"
-            ))),
+            other => {
+                return Err(SqeError::Execution(format!(
+                    "Expected DELETE statement, got: {other}"
+                )))
+            }
         };
 
         let mut table = catalog.load_table(&table_ident).await?;
@@ -2088,7 +2074,9 @@ impl WriteHandler {
                         attempt += 1;
                     }
                     Err(e) => {
-                        return Err(SqeError::Execution(format!("Failed to commit truncate: {e}")));
+                        return Err(SqeError::Execution(format!(
+                            "Failed to commit truncate: {e}"
+                        )));
                     }
                 }
             }
@@ -2146,7 +2134,7 @@ impl WriteHandler {
             for data_file in &to_rewrite {
                 let file_path = data_file.file_path();
                 let batches = self
-                    .read_data_file_applying_deletes(&read_plan,file_path, ctx, true)
+                    .read_data_file_applying_deletes(&read_plan, file_path, ctx, true)
                     .await?;
                 if batches.is_empty() {
                     continue;
@@ -2162,7 +2150,14 @@ impl WriteHandler {
                 );
                 for batch in &batches {
                     let filtered = self
-                        .filter_batch_negate(ctx, batch, &where_sql, &joins_sql, &table_ident, &predicates)
+                        .filter_batch_negate(
+                            ctx,
+                            batch,
+                            &where_sql,
+                            &joins_sql,
+                            &table_ident,
+                            &predicates,
+                        )
                         .await?;
                     deleted_this_attempt += batch.num_rows() - filtered.num_rows();
                     if filtered.num_rows() > 0 {
@@ -2262,9 +2257,11 @@ impl WriteHandler {
         let table_ident = resolve_delete_target_ident(stmt, session)?;
         let delete = match stmt {
             Statement::Delete(d) => d,
-            other => return Err(SqeError::Execution(format!(
-                "Expected DELETE statement, got: {other}"
-            ))),
+            other => {
+                return Err(SqeError::Execution(format!(
+                    "Expected DELETE statement, got: {other}"
+                )))
+            }
         };
 
         let table = catalog.load_table(&table_ident).await?;
@@ -2336,7 +2333,9 @@ impl WriteHandler {
 
         for data_file in &old_data_files {
             let file_path = data_file.file_path().to_string();
-            let batches = self.read_parquet_via_table(&table, &file_path, ctx, true).await?;
+            let batches = self
+                .read_parquet_via_table(&table, &file_path, ctx, true)
+                .await?;
 
             if batches.is_empty() {
                 continue;
@@ -2379,7 +2378,8 @@ impl WriteHandler {
 
         // Write position delete files (sorted by (file_path, pos) inside the helper).
         let delete_files =
-            write_position_delete_files(&table, position_deletes, self.compression(session)).await?;
+            write_position_delete_files(&table, position_deletes, self.compression(session))
+                .await?;
 
         // Commit: append position delete files. FastAppendAction auto-routes DataFiles
         // with content_type=PositionDeletes into the delete manifest entry.
@@ -2435,9 +2435,11 @@ impl WriteHandler {
         let table_ident = resolve_delete_target_ident(stmt, session)?;
         let delete = match stmt {
             Statement::Delete(d) => d,
-            other => return Err(SqeError::Execution(format!(
-                "Expected DELETE statement, got: {other}"
-            ))),
+            other => {
+                return Err(SqeError::Execution(format!(
+                    "Expected DELETE statement, got: {other}"
+                )))
+            }
         };
         let table = catalog.load_table(&table_ident).await?;
 
@@ -2517,7 +2519,7 @@ impl WriteHandler {
         for data_file in &old_data_files {
             let file_path = data_file.file_path().to_string();
             let batches = self
-                .read_data_file_applying_deletes(&read_plan,&file_path, ctx, true)
+                .read_data_file_applying_deletes(&read_plan, &file_path, ctx, true)
                 .await?;
             if batches.is_empty() {
                 continue;
@@ -2626,7 +2628,8 @@ impl WriteHandler {
         let catalog = match delete_target_object_name(stmt) {
             Ok(name) => {
                 let target = resolve_target_catalog(catalog_qualifier(name), session);
-                self.resolve_session_catalog(session, target.as_deref()).await?
+                self.resolve_session_catalog(session, target.as_deref())
+                    .await?
             }
             Err(_) => catalog,
         };
@@ -2709,9 +2712,11 @@ impl WriteHandler {
         let table_ident = resolve_update_target_ident(stmt, session)?;
         let (assignments, selection) = match stmt {
             Statement::Update(update) => (&update.assignments, &update.selection),
-            other => return Err(SqeError::Execution(format!(
-                "Expected UPDATE statement, got: {other}"
-            ))),
+            other => {
+                return Err(SqeError::Execution(format!(
+                    "Expected UPDATE statement, got: {other}"
+                )))
+            }
         };
 
         let mut table = catalog.load_table(&table_ident).await?;
@@ -2780,7 +2785,7 @@ impl WriteHandler {
             for data_file in &to_rewrite {
                 let file_path = data_file.file_path();
                 let batches = self
-                    .read_data_file_applying_deletes(&read_plan,file_path, ctx, true)
+                    .read_data_file_applying_deletes(&read_plan, file_path, ctx, true)
                     .await?;
                 if batches.is_empty() {
                     continue;
@@ -2795,13 +2800,28 @@ impl WriteHandler {
                 );
                 for batch in &batches {
                     let out = self
-                        .apply_update(ctx, batch, assignments, &where_sql, &joins_sql, &table_ident, &predicates)
+                        .apply_update(
+                            ctx,
+                            batch,
+                            assignments,
+                            &where_sql,
+                            &joins_sql,
+                            &table_ident,
+                            &predicates,
+                        )
                         .await?;
                     rewritten.push(out)?;
                 }
                 for batch in &batches {
                     let count = self
-                        .count_matching_rows(ctx, batch, &where_sql, &joins_sql, &table_ident, &predicates)
+                        .count_matching_rows(
+                            ctx,
+                            batch,
+                            &where_sql,
+                            &joins_sql,
+                            &table_ident,
+                            &predicates,
+                        )
                         .await?;
                     updated_this_attempt += count;
                 }
@@ -2896,7 +2916,8 @@ impl WriteHandler {
         let catalog = match update_target_object_name(stmt) {
             Ok(name) => {
                 let target = resolve_target_catalog(catalog_qualifier(name), session);
-                self.resolve_session_catalog(session, target.as_deref()).await?
+                self.resolve_session_catalog(session, target.as_deref())
+                    .await?
             }
             Err(_) => catalog,
         };
@@ -2983,9 +3004,11 @@ impl WriteHandler {
         let table_ident = resolve_update_target_ident(stmt, session)?;
         let (assignments, selection) = match stmt {
             Statement::Update(update) => (&update.assignments, &update.selection),
-            other => return Err(SqeError::Execution(format!(
-                "Expected UPDATE statement, got: {other}"
-            ))),
+            other => {
+                return Err(SqeError::Execution(format!(
+                    "Expected UPDATE statement, got: {other}"
+                )))
+            }
         };
         let table = catalog.load_table(&table_ident).await?;
 
@@ -3051,7 +3074,7 @@ impl WriteHandler {
         for data_file in &old_data_files {
             let file_path = data_file.file_path().to_string();
             let batches = self
-                .read_data_file_applying_deletes(&read_plan,&file_path, ctx, true)
+                .read_data_file_applying_deletes(&read_plan, &file_path, ctx, true)
                 .await?;
             if batches.is_empty() {
                 continue;
@@ -3100,10 +3123,9 @@ impl WriteHandler {
                         &predicates,
                     )
                     .await?;
-                let new_rows =
-                    filter_record_batch(&full_rewrite, &match_mask).map_err(|e| {
-                        SqeError::Execution(format!("failed to filter updated rows: {e}"))
-                    })?;
+                let new_rows = filter_record_batch(&full_rewrite, &match_mask).map_err(|e| {
+                    SqeError::Execution(format!("failed to filter updated rows: {e}"))
+                })?;
                 if new_rows.num_rows() > 0 {
                     new_row_batches.push(new_rows);
                 }
@@ -3211,9 +3233,7 @@ impl WriteHandler {
         use sqlparser::ast::TableFactor;
 
         let (table_factor, source_factor, on_expr, clauses) = match stmt {
-            Statement::Merge(merge) => {
-                (&merge.table, &merge.source, &merge.on, &merge.clauses)
-            }
+            Statement::Merge(merge) => (&merge.table, &merge.source, &merge.on, &merge.clauses),
             other => {
                 return Err(SqeError::Execution(format!(
                     "Expected MERGE statement, got: {other}"
@@ -3295,12 +3315,13 @@ impl WriteHandler {
             Arc<dyn datafusion::datasource::TableProvider>,
         ) = if stream_target {
             let schema = Arc::new(
-                iceberg::arrow::schema_to_arrow_schema(table.metadata().current_schema())
-                    .map_err(|e| {
+                iceberg::arrow::schema_to_arrow_schema(table.metadata().current_schema()).map_err(
+                    |e| {
                         SqeError::Execution(format!(
                             "Failed to convert Iceberg schema to Arrow: {e}"
                         ))
-                    })?,
+                    },
+                )?,
             );
             let provider = crate::merge_target_provider::merge_target_table(
                 &table,
@@ -3326,7 +3347,7 @@ impl WriteHandler {
                 // `merge-target-buffer` just below, so tracking the decode here
                 // too would double-count the same bytes.
                 let batches = self
-                    .read_data_file_applying_deletes(&read_plan,file_path, ctx, false)
+                    .read_data_file_applying_deletes(&read_plan, file_path, ctx, false)
                     .await?;
                 for batch in batches {
                     target_buf.push(batch)?;
@@ -3500,9 +3521,10 @@ impl WriteHandler {
         // Rows removed by the MERGE (DELETE clauses, unclaimed source-only
         // rows) are filtered by the keep-column WHERE inside `select_sql`, so
         // the stream carries exactly the surviving rows.
-        let stream = df.execute_stream().await.map_err(|e| {
-            SqeError::Execution(format!("Failed to execute MERGE query: {e}"))
-        })?;
+        let stream = df
+            .execute_stream()
+            .await
+            .map_err(|e| SqeError::Execution(format!("Failed to execute MERGE query: {e}")))?;
 
         // Write new data files from the merged results (streaming).
         let tracker = new_upload_tracker();
@@ -3602,7 +3624,8 @@ impl WriteHandler {
             Statement::Merge(merge) => match &merge.table {
                 sqlparser::ast::TableFactor::Table { name, .. } => {
                     let target = resolve_target_catalog(catalog_qualifier(name), session);
-                    self.resolve_session_catalog(session, target.as_deref()).await?
+                    self.resolve_session_catalog(session, target.as_deref())
+                        .await?
                 }
                 _ => catalog,
             },
@@ -3646,12 +3669,7 @@ impl WriteHandler {
         if let Some(src_plan) = source_plan {
             let (lin_catalog, lin_namespace, lin_table) =
                 lineage_target_parts(&self.config, &table_ident);
-            match build_lineage_insert_plan(
-                src_plan,
-                &lin_catalog,
-                &lin_namespace,
-                &lin_table,
-            ) {
+            match build_lineage_insert_plan(src_plan, &lin_catalog, &lin_namespace, &lin_table) {
                 Ok(wrapper) => {
                     *plan_out = Some(sqe_lineage::PlanOrHint::Plan(Box::new(wrapper)));
                 }
@@ -3738,9 +3756,7 @@ impl WriteHandler {
         use sqlparser::ast::TableFactor;
 
         let (table_factor, source_factor, on_expr, clauses) = match stmt {
-            Statement::Merge(merge) => {
-                (&merge.table, &merge.source, &merge.on, &merge.clauses)
-            }
+            Statement::Merge(merge) => (&merge.table, &merge.source, &merge.on, &merge.clauses),
             other => {
                 return Err(SqeError::Execution(format!(
                     "Expected MERGE statement, got: {other}"
@@ -3798,7 +3814,7 @@ impl WriteHandler {
         for data_file in &old_data_files {
             let file_path = data_file.file_path();
             let batches = self
-                .read_data_file_applying_deletes(&read_plan,file_path, ctx, false)
+                .read_data_file_applying_deletes(&read_plan, file_path, ctx, false)
                 .await?;
             for batch in batches {
                 target_buf.push(batch)?;
@@ -4525,9 +4541,10 @@ impl WriteHandler {
         &self,
         table: &IcebergTable,
     ) -> sqe_core::Result<DeleteAwareReadPlan> {
-        let scan = table.scan().select_all().build().map_err(|e| {
-            SqeError::Execution(format!("Failed to build rewrite read scan: {e}"))
-        })?;
+        let scan =
+            table.scan().select_all().build().map_err(|e| {
+                SqeError::Execution(format!("Failed to build rewrite read scan: {e}"))
+            })?;
         let tasks: Vec<iceberg::scan::FileScanTask> = scan
             .plan_files()
             .await
@@ -4543,7 +4560,10 @@ impl WriteHandler {
                 .or_default()
                 .push(task);
         }
-        Ok(DeleteAwareReadPlan { scan, tasks_by_path })
+        Ok(DeleteAwareReadPlan {
+            scan,
+            tasks_by_path,
+        })
     }
 
     /// Read one data file with its delete files applied, for CoW/MoR
@@ -5866,13 +5886,10 @@ pub(crate) fn sql_type_to_arrow(
     // Route them through the sqe-sql helper so the mapping stays in one place.
     if let Some(kind) = detect_ns_timestamp(sql_type) {
         return Ok(match kind {
-            NsTimestamp::WithoutTz => {
-                DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, None)
+            NsTimestamp::WithoutTz => DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, None),
+            NsTimestamp::WithTz => {
+                DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, Some("UTC".into()))
             }
-            NsTimestamp::WithTz => DataType::Timestamp(
-                arrow_schema::TimeUnit::Nanosecond,
-                Some("UTC".into()),
-            ),
         });
     }
 
@@ -5903,18 +5920,9 @@ pub(crate) fn sql_type_to_arrow(
                 None
             };
             match p {
-                0..=3 => Ok(DataType::Timestamp(
-                    arrow_schema::TimeUnit::Millisecond,
-                    tz,
-                )),
-                4..=6 => Ok(DataType::Timestamp(
-                    arrow_schema::TimeUnit::Microsecond,
-                    tz,
-                )),
-                _ => Ok(DataType::Timestamp(
-                    arrow_schema::TimeUnit::Nanosecond,
-                    tz,
-                )),
+                0..=3 => Ok(DataType::Timestamp(arrow_schema::TimeUnit::Millisecond, tz)),
+                4..=6 => Ok(DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, tz)),
+                _ => Ok(DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, tz)),
             }
         }
         SqlType::Decimal(info) | SqlType::Numeric(info) => {
@@ -5975,7 +5983,11 @@ pub(crate) fn sql_type_to_arrow(
                         .as_ref()
                         .map(|id| id.value.clone())
                         .unwrap_or_else(|| format!("col{i}"));
-                    Ok(arrow_schema::Field::new(name, sql_type_to_arrow(&sf.field_type)?, true))
+                    Ok(arrow_schema::Field::new(
+                        name,
+                        sql_type_to_arrow(&sf.field_type)?,
+                        true,
+                    ))
                 })
                 .collect::<sqe_core::Result<Vec<_>>>()?;
             Ok(DataType::Struct(arrow_fields.into()))
@@ -6072,12 +6084,20 @@ fn extract_partition_eq_constraints(
     }
     fn walk(e: &Expr, out: &mut std::collections::HashMap<String, PartitionConstraintValue>) {
         match e {
-            Expr::BinaryOp { left, op: BinaryOperator::And, right } => {
+            Expr::BinaryOp {
+                left,
+                op: BinaryOperator::And,
+                right,
+            } => {
                 walk(left, out);
                 walk(right, out);
             }
             Expr::Nested(inner) => walk(inner, out),
-            Expr::BinaryOp { left, op: BinaryOperator::Eq, right } => {
+            Expr::BinaryOp {
+                left,
+                op: BinaryOperator::Eq,
+                right,
+            } => {
                 let pair = match (left.as_ref(), right.as_ref()) {
                     (Expr::Identifier(id), v) => Some((id, v)),
                     (v, Expr::Identifier(id)) => Some((id, v)),
@@ -6109,8 +6129,12 @@ fn partition_literal_definitely_ne(
             (*v as i64) != *w
         }
         (Literal::Primitive(PrimitiveLiteral::Long(v)), PartitionConstraintValue::Int(w)) => v != w,
-        (Literal::Primitive(PrimitiveLiteral::String(v)), PartitionConstraintValue::Str(w)) => v != w,
-        (Literal::Primitive(PrimitiveLiteral::Boolean(v)), PartitionConstraintValue::Bool(w)) => v != w,
+        (Literal::Primitive(PrimitiveLiteral::String(v)), PartitionConstraintValue::Str(w)) => {
+            v != w
+        }
+        (Literal::Primitive(PrimitiveLiteral::Boolean(v)), PartitionConstraintValue::Bool(w)) => {
+            v != w
+        }
         _ => false,
     }
 }
@@ -6174,7 +6198,9 @@ fn partition_prune_cow_files(
     let total = files.len();
     let to_rewrite: Vec<DataFile> = files
         .into_iter()
-        .filter(|df| partition_could_match(df.partition(), spec.as_ref(), schema.as_ref(), &constraints))
+        .filter(|df| {
+            partition_could_match(df.partition(), spec.as_ref(), schema.as_ref(), &constraints)
+        })
         .collect();
     let pruned = total - to_rewrite.len();
     (to_rewrite, pruned)
@@ -6323,9 +6349,7 @@ pub(crate) fn default_to_iceberg_literal(
         (DefaultLiteral::Null, _) => None,
         (DefaultLiteral::Int(i), PrimitiveType::Int) => {
             let narrowed = i32::try_from(*i).map_err(|_| {
-                format!(
-                    "DEFAULT literal {i} does not fit in INT (range -2147483648 to 2147483647)"
-                )
+                format!("DEFAULT literal {i} does not fit in INT (range -2147483648 to 2147483647)")
             })?;
             Some(Literal::int(narrowed))
         }
@@ -6462,7 +6486,9 @@ pub(crate) async fn ensure_namespace(
             Ok(())
         }
         Err(_) if catalog.namespace_exists(namespace).await.unwrap_or(false) => Ok(()),
-        Err(e) => Err(SqeError::Catalog(format!("Failed to ensure namespace: {e}"))),
+        Err(e) => Err(SqeError::Catalog(format!(
+            "Failed to ensure namespace: {e}"
+        ))),
     }
 }
 
@@ -6574,8 +6600,7 @@ pub(crate) fn build_partition_spec(
     // the wire format compatible.
     let mut fields = Vec::with_capacity(exprs.len());
     for (next_field_id, partition_expr) in (1000_i32..).zip(exprs) {
-        let (source_name, target_name, transform) =
-            parse_partition_transform(partition_expr)?;
+        let (source_name, target_name, transform) = parse_partition_transform(partition_expr)?;
         let source_id = iceberg_schema
             .as_struct()
             .fields()
@@ -6620,10 +6645,16 @@ pub(crate) fn parse_partition_transform_sql(
     let dialect = GenericDialect {};
     let mut parser = Parser::new(&dialect)
         .try_with_sql(transform_sql)
-        .map_err(|e| SqeError::Execution(format!("Failed to lex partition transform '{transform_sql}': {e}")))?;
-    let expr = parser
-        .parse_expr()
-        .map_err(|e| SqeError::Execution(format!("Failed to parse partition transform '{transform_sql}': {e}")))?;
+        .map_err(|e| {
+            SqeError::Execution(format!(
+                "Failed to lex partition transform '{transform_sql}': {e}"
+            ))
+        })?;
+    let expr = parser.parse_expr().map_err(|e| {
+        SqeError::Execution(format!(
+            "Failed to parse partition transform '{transform_sql}': {e}"
+        ))
+    })?;
     parse_partition_transform(&expr)
 }
 
@@ -6643,14 +6674,9 @@ fn parse_partition_transform(
         )),
         // Compound identifier (e.g. `t.col`) — take the last segment.
         Expr::CompoundIdentifier(parts) => {
-            let name = parts
-                .last()
-                .map(|p| p.value.clone())
-                .ok_or_else(|| {
-                    SqeError::Execution(
-                        "PARTITIONED BY: empty compound identifier".to_string(),
-                    )
-                })?;
+            let name = parts.last().map(|p| p.value.clone()).ok_or_else(|| {
+                SqeError::Execution("PARTITIONED BY: empty compound identifier".to_string())
+            })?;
             Ok((name.clone(), name, Transform::Identity))
         }
         // Function call: year(col), bucket(N, col), truncate(L, col), etc.
@@ -6662,9 +6688,7 @@ fn parse_partition_transform(
                 .and_then(|p| p.as_ident())
                 .map(|id| id.value.to_ascii_lowercase())
                 .ok_or_else(|| {
-                    SqeError::Execution(
-                        "PARTITIONED BY: function call without a name".to_string(),
-                    )
+                    SqeError::Execution("PARTITIONED BY: function call without a name".to_string())
                 })?;
             let args = match &func.args {
                 FunctionArguments::List(list) => &list.args,
@@ -6690,14 +6714,13 @@ fn parse_partition_transform(
                     // Fold the partition-by column ref so it matches the folded
                     // stored column name (#337).
                     Expr::Identifier(id) => Ok(fold_unquoted_ident(id)),
-                    Expr::CompoundIdentifier(parts) => parts
-                        .last()
-                        .map(fold_unquoted_ident)
-                        .ok_or_else(|| {
+                    Expr::CompoundIdentifier(parts) => {
+                        parts.last().map(fold_unquoted_ident).ok_or_else(|| {
                             SqeError::Execution(format!(
                                 "PARTITIONED BY {fn_name}(): empty compound identifier"
                             ))
-                        }),
+                        })
+                    }
                     other => Err(SqeError::Execution(format!(
                         "PARTITIONED BY {fn_name}(): expected column name, got {other}"
                     ))),
@@ -6775,7 +6798,8 @@ fn parse_partition_transform(
                 "truncate" => {
                     if bare_args.len() != 2 {
                         return Err(SqeError::Execution(
-                            "PARTITIONED BY truncate(L, col): expected exactly two arguments".into(),
+                            "PARTITIONED BY truncate(L, col): expected exactly two arguments"
+                                .into(),
                         ));
                     }
                     let l = int_arg(bare_args[0])?;
@@ -6895,10 +6919,16 @@ mod tests {
         let name = ObjectName::from(vec![Ident::new("s357")]);
 
         let unset = resolve_table_ident(&name, &test_session(None)).unwrap();
-        assert_eq!(unset.namespace(), &NamespaceIdent::new("default".to_string()));
+        assert_eq!(
+            unset.namespace(),
+            &NamespaceIdent::new("default".to_string())
+        );
 
         let empty = resolve_table_ident(&name, &test_session(Some(""))).unwrap();
-        assert_eq!(empty.namespace(), &NamespaceIdent::new("default".to_string()));
+        assert_eq!(
+            empty.namespace(),
+            &NamespaceIdent::new("default".to_string())
+        );
     }
 
     #[test]
@@ -6910,7 +6940,10 @@ mod tests {
 
         let two = ObjectName::from(vec![Ident::new("otherns"), Ident::new("t")]);
         let ident = resolve_table_ident(&two, &session).unwrap();
-        assert_eq!(ident.namespace(), &NamespaceIdent::new("otherns".to_string()));
+        assert_eq!(
+            ident.namespace(),
+            &NamespaceIdent::new("otherns".to_string())
+        );
         assert_eq!(ident.name(), "t");
 
         let three = ObjectName::from(vec![
@@ -6919,7 +6952,10 @@ mod tests {
             Ident::new("t"),
         ]);
         let ident = resolve_table_ident(&three, &session).unwrap();
-        assert_eq!(ident.namespace(), &NamespaceIdent::new("otherns".to_string()));
+        assert_eq!(
+            ident.namespace(),
+            &NamespaceIdent::new("otherns".to_string())
+        );
         assert_eq!(ident.name(), "t");
     }
 
@@ -7320,7 +7356,10 @@ mod tests {
 
         // The struct column's nested fields are present and carry their own IDs.
         let iceberg::spec::Type::Struct(nested) = top[1].field_type.as_ref() else {
-            panic!("payload should map to a struct type, got {:?}", top[1].field_type);
+            panic!(
+                "payload should map to a struct type, got {:?}",
+                top[1].field_type
+            );
         };
         assert_eq!(nested.fields().len(), 2, "nested struct fields preserved");
 
@@ -7328,11 +7367,18 @@ mod tests {
         // duplicate or zero nested IDs are exactly what breaks the writer.
         let mut ids = vec![top[0].id, top[1].id];
         ids.extend(nested.fields().iter().map(|f| f.id));
-        assert!(ids.iter().all(|&id| id > 0), "all field ids assigned: {ids:?}");
+        assert!(
+            ids.iter().all(|&id| id > 0),
+            "all field ids assigned: {ids:?}"
+        );
         let mut sorted = ids.clone();
         sorted.sort_unstable();
         sorted.dedup();
-        assert_eq!(sorted.len(), ids.len(), "field ids unique across nesting: {ids:?}");
+        assert_eq!(
+            sorted.len(),
+            ids.len(),
+            "field ids unique across nesting: {ids:?}"
+        );
     }
 
     #[test]
@@ -7462,7 +7508,10 @@ mod tests {
             vec!["9".to_string()],
         );
         let result_lower = sql_type_to_arrow(&custom_lower).unwrap();
-        assert_eq!(result_lower, DataType::Timestamp(TimeUnit::Nanosecond, None));
+        assert_eq!(
+            result_lower,
+            DataType::Timestamp(TimeUnit::Nanosecond, None)
+        );
     }
 
     #[test]
@@ -7488,7 +7537,9 @@ mod tests {
         use sqlparser::parser::Parser;
 
         let sql = "CREATE TABLE events (ts TIMESTAMP_NS(9), utcts TIMESTAMPTZ_NS(9))";
-        let stmt = Parser::parse_sql(&GenericDialect {}, sql).unwrap().remove(0);
+        let stmt = Parser::parse_sql(&GenericDialect {}, sql)
+            .unwrap()
+            .remove(0);
         let sqlparser::ast::Statement::CreateTable(ct) = stmt else {
             panic!("expected CreateTable");
         };
@@ -7509,11 +7560,7 @@ mod tests {
         use iceberg::spec::{PrimitiveType, Type};
 
         let arrow_schema = ArrowSchema::new(vec![
-            Field::new(
-                "ts",
-                DataType::Timestamp(TimeUnit::Nanosecond, None),
-                true,
-            ),
+            Field::new("ts", DataType::Timestamp(TimeUnit::Nanosecond, None), true),
             Field::new(
                 "utcts",
                 DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
@@ -7608,25 +7655,36 @@ mod tests {
         let long1 = Literal::Primitive(PrimitiveLiteral::Long(1));
         let bar = Literal::Primitive(PrimitiveLiteral::String("BAR".into()));
         // provably different -> prunable
-        assert!(partition_literal_definitely_ne(&int2, &PartitionConstraintValue::Int(1)));
+        assert!(partition_literal_definitely_ne(
+            &int2,
+            &PartitionConstraintValue::Int(1)
+        ));
         // equal -> not prunable
-        assert!(!partition_literal_definitely_ne(&int1, &PartitionConstraintValue::Int(1)));
-        assert!(!partition_literal_definitely_ne(&long1, &PartitionConstraintValue::Int(1)));
+        assert!(!partition_literal_definitely_ne(
+            &int1,
+            &PartitionConstraintValue::Int(1)
+        ));
+        assert!(!partition_literal_definitely_ne(
+            &long1,
+            &PartitionConstraintValue::Int(1)
+        ));
         assert!(partition_literal_definitely_ne(
             &bar,
             &PartitionConstraintValue::Str("FOO".into())
         ));
         // type mismatch -> conservatively NOT provably different (keep the file)
-        assert!(!partition_literal_definitely_ne(&int1, &PartitionConstraintValue::Str("1".into())));
+        assert!(!partition_literal_definitely_ne(
+            &int1,
+            &PartitionConstraintValue::Str("1".into())
+        ));
     }
 
     #[test]
     fn test_default_string_sets_write_default() {
         use iceberg::spec::{Literal, PrimitiveLiteral};
 
-        let ct = parse_create_table(
-            "CREATE TABLE orders (id BIGINT, status STRING DEFAULT 'pending')",
-        );
+        let ct =
+            parse_create_table("CREATE TABLE orders (id BIGINT, status STRING DEFAULT 'pending')");
         let arrow_fields: Vec<_> = ct
             .columns
             .iter()
@@ -7683,9 +7741,7 @@ mod tests {
 
     #[test]
     fn test_default_function_rejected_with_clear_error() {
-        let ct = parse_create_table(
-            "CREATE TABLE t (ts TIMESTAMP DEFAULT current_timestamp())",
-        );
+        let ct = parse_create_table("CREATE TABLE t (ts TIMESTAMP DEFAULT current_timestamp())");
         let arrow_fields: Vec<_> = ct
             .columns
             .iter()
@@ -7695,8 +7751,7 @@ mod tests {
             })
             .collect();
         let arrow_schema = ArrowSchema::new(arrow_fields);
-        let err =
-            arrow_schema_to_iceberg_with_defaults(&arrow_schema, &ct.columns).unwrap_err();
+        let err = arrow_schema_to_iceberg_with_defaults(&arrow_schema, &ct.columns).unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("current_timestamp"),
@@ -7719,19 +7774,15 @@ mod tests {
                 Field::new(c.name.value.clone(), ty, true)
             })
             .collect();
-        let iceberg = arrow_schema_to_iceberg_with_defaults(
-            &ArrowSchema::new(arrow_fields),
-            &ct.columns,
-        )
-        .unwrap();
+        let iceberg =
+            arrow_schema_to_iceberg_with_defaults(&ArrowSchema::new(arrow_fields), &ct.columns)
+                .unwrap();
         assert!(requires_v3_features(&ct.columns, &iceberg));
     }
 
     #[test]
     fn test_requires_v3_on_write_default() {
-        let ct = parse_create_table(
-            "CREATE TABLE t (id BIGINT, status STRING DEFAULT 'pending')",
-        );
+        let ct = parse_create_table("CREATE TABLE t (id BIGINT, status STRING DEFAULT 'pending')");
         let arrow_fields: Vec<_> = ct
             .columns
             .iter()
@@ -7740,11 +7791,9 @@ mod tests {
                 Field::new(c.name.value.clone(), ty, true)
             })
             .collect();
-        let iceberg = arrow_schema_to_iceberg_with_defaults(
-            &ArrowSchema::new(arrow_fields),
-            &ct.columns,
-        )
-        .unwrap();
+        let iceberg =
+            arrow_schema_to_iceberg_with_defaults(&ArrowSchema::new(arrow_fields), &ct.columns)
+                .unwrap();
         assert!(requires_v3_features(&ct.columns, &iceberg));
     }
 
@@ -7759,11 +7808,9 @@ mod tests {
                 Field::new(c.name.value.clone(), ty, true)
             })
             .collect();
-        let iceberg = arrow_schema_to_iceberg_with_defaults(
-            &ArrowSchema::new(arrow_fields),
-            &ct.columns,
-        )
-        .unwrap();
+        let iceberg =
+            arrow_schema_to_iceberg_with_defaults(&ArrowSchema::new(arrow_fields), &ct.columns)
+                .unwrap();
         assert!(!requires_v3_features(&ct.columns, &iceberg));
     }
 
@@ -7827,8 +7874,7 @@ mod tests {
         // collapse to Time64(Microsecond). Higher precisions are rejected
         // with a clear NotImplemented since Iceberg has no `time_ns` type.
         for p in 0u64..=6 {
-            let result =
-                sql_type_to_arrow(&SqlType::Time(Some(p), TimezoneInfo::None)).unwrap();
+            let result = sql_type_to_arrow(&SqlType::Time(Some(p), TimezoneInfo::None)).unwrap();
             assert_eq!(
                 result,
                 DataType::Time64(TimeUnit::Microsecond),
@@ -8022,9 +8068,21 @@ SET c = ( \
         IcebergSchema::builder()
             .with_schema_id(0)
             .with_fields(vec![
-                Arc::new(NestedField::optional(1, "a", Type::Primitive(PrimitiveType::Int))),
-                Arc::new(NestedField::optional(2, "b", Type::Primitive(PrimitiveType::Int))),
-                Arc::new(NestedField::optional(3, "c", Type::Primitive(PrimitiveType::Int))),
+                Arc::new(NestedField::optional(
+                    1,
+                    "a",
+                    Type::Primitive(PrimitiveType::Int),
+                )),
+                Arc::new(NestedField::optional(
+                    2,
+                    "b",
+                    Type::Primitive(PrimitiveType::Int),
+                )),
+                Arc::new(NestedField::optional(
+                    3,
+                    "c",
+                    Type::Primitive(PrimitiveType::Int),
+                )),
             ])
             .build()
             .unwrap()
@@ -8177,8 +8235,7 @@ s3_path_style = true
         let enforcer: Arc<dyn sqe_policy::PolicyEnforcer> =
             Arc::new(PolicyPlanRewriter::new(Arc::new(store)));
 
-        let handler =
-            WriteHandler::new(write_test_config()).with_policy_enforcer(enforcer);
+        let handler = WriteHandler::new(write_test_config()).with_policy_enforcer(enforcer);
         let session = sqe_core::Session::new(
             "u".to_string(),
             sqe_core::SecretString::new("tok".to_string()),
@@ -8234,7 +8291,12 @@ s3_path_style = true
     async fn employees_handler_with_policy(
         row_filter: Option<datafusion::logical_expr::Expr>,
         masks: Vec<(&str, sqe_policy::MaskType)>,
-    ) -> (WriteHandler, sqe_core::Session, TableIdent, DFSessionContext) {
+    ) -> (
+        WriteHandler,
+        sqe_core::Session,
+        TableIdent,
+        DFSessionContext,
+    ) {
         use sqe_policy::plan_rewriter::PolicyPlanRewriter;
         use sqe_policy::policy_store::InMemoryPolicyStore;
         use sqe_policy::ResolvedPolicy;
@@ -8289,13 +8351,9 @@ s3_path_style = true
     async fn delete_with_row_filter_keeps_rows_outside_user_view() {
         use arrow_array::Array as _;
         use datafusion::logical_expr::{col, lit};
-        let (handler, session, table_ident, ctx) = employees_handler_with_policy(
-            Some(col("region").eq(lit("EU"))),
-            vec![],
-        )
-        .await;
-        let predicates =
-            compute_predicates_for_employees(&handler, &session, &table_ident).await;
+        let (handler, session, table_ident, ctx) =
+            employees_handler_with_policy(Some(col("region").eq(lit("EU"))), vec![]).await;
+        let predicates = compute_predicates_for_employees(&handler, &session, &table_ident).await;
         assert!(predicates.row_filter_sql.is_some(), "row filter expected");
 
         // User says DELETE everything (WHERE TRUE). With the EU row filter the
@@ -8322,13 +8380,9 @@ s3_path_style = true
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn delete_count_with_row_filter_matches_admitted_rows() {
         use datafusion::logical_expr::{col, lit};
-        let (handler, session, table_ident, ctx) = employees_handler_with_policy(
-            Some(col("region").eq(lit("EU"))),
-            vec![],
-        )
-        .await;
-        let predicates =
-            compute_predicates_for_employees(&handler, &session, &table_ident).await;
+        let (handler, session, table_ident, ctx) =
+            employees_handler_with_policy(Some(col("region").eq(lit("EU"))), vec![]).await;
+        let predicates = compute_predicates_for_employees(&handler, &session, &table_ident).await;
 
         // User says DELETE WHERE TRUE. Policy restricts to EU rows. Match
         // count must be the EU rows (2), not every row (4).
@@ -8344,13 +8398,10 @@ s3_path_style = true
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn delete_match_with_column_mask_uses_masked_value_in_where() {
         use sqe_policy::MaskType;
-        let (handler, session, table_ident, ctx) = employees_handler_with_policy(
-            None,
-            vec![("ssn", MaskType::Redact("***".to_string()))],
-        )
-        .await;
-        let predicates =
-            compute_predicates_for_employees(&handler, &session, &table_ident).await;
+        let (handler, session, table_ident, ctx) =
+            employees_handler_with_policy(None, vec![("ssn", MaskType::Redact("***".to_string()))])
+                .await;
+        let predicates = compute_predicates_for_employees(&handler, &session, &table_ident).await;
         assert!(predicates.column_mask_sqls.contains_key("ssn"));
 
         // User asks to delete rows where ssn = '111-11'. The mask redacts
@@ -8375,14 +8426,7 @@ s3_path_style = true
         // the mask is in effect. Confirms the policy substitution actually
         // runs in the evaluator.
         let mask2 = handler
-            .filter_batch_match(
-                &ctx,
-                &batch,
-                "ssn = '***'",
-                "",
-                &table_ident,
-                &predicates,
-            )
+            .filter_batch_match(&ctx, &batch, "ssn = '***'", "", &table_ident, &predicates)
             .await
             .unwrap();
         let matched2: u32 = (0..mask2.len()).map(|i| mask2.value(i) as u32).sum();
@@ -8395,13 +8439,9 @@ s3_path_style = true
         use datafusion::logical_expr::{col, lit};
         use sqlparser::dialect::GenericDialect;
         use sqlparser::parser::Parser;
-        let (handler, session, table_ident, ctx) = employees_handler_with_policy(
-            Some(col("region").eq(lit("EU"))),
-            vec![],
-        )
-        .await;
-        let predicates =
-            compute_predicates_for_employees(&handler, &session, &table_ident).await;
+        let (handler, session, table_ident, ctx) =
+            employees_handler_with_policy(Some(col("region").eq(lit("EU"))), vec![]).await;
+        let predicates = compute_predicates_for_employees(&handler, &session, &table_ident).await;
 
         // UPDATE employees SET ssn = 'X' WHERE TRUE. Policy restricts to EU.
         let sql = "UPDATE employees SET ssn = 'X'";
@@ -8461,13 +8501,10 @@ s3_path_style = true
         use sqe_policy::MaskType;
         use sqlparser::dialect::GenericDialect;
         use sqlparser::parser::Parser;
-        let (handler, session, table_ident, ctx) = employees_handler_with_policy(
-            None,
-            vec![("ssn", MaskType::Redact("***".to_string()))],
-        )
-        .await;
-        let predicates =
-            compute_predicates_for_employees(&handler, &session, &table_ident).await;
+        let (handler, session, table_ident, ctx) =
+            employees_handler_with_policy(None, vec![("ssn", MaskType::Redact("***".to_string()))])
+                .await;
+        let predicates = compute_predicates_for_employees(&handler, &session, &table_ident).await;
 
         // UPDATE employees SET region = 'XX' WHERE id = 1. The ssn column is
         // masked but is NOT being assigned. The CASE-ELSE branch must write
@@ -8516,13 +8553,9 @@ s3_path_style = true
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn update_count_with_row_filter_matches_admitted_rows() {
         use datafusion::logical_expr::{col, lit};
-        let (handler, session, table_ident, ctx) = employees_handler_with_policy(
-            Some(col("region").eq(lit("EU"))),
-            vec![],
-        )
-        .await;
-        let predicates =
-            compute_predicates_for_employees(&handler, &session, &table_ident).await;
+        let (handler, session, table_ident, ctx) =
+            employees_handler_with_policy(Some(col("region").eq(lit("EU"))), vec![]).await;
+        let predicates = compute_predicates_for_employees(&handler, &session, &table_ident).await;
         let batch = make_employee_batch();
         let count = handler
             .count_matching_rows(&ctx, &batch, "TRUE", "", &table_ident, &predicates)

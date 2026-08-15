@@ -34,10 +34,7 @@ pub trait SegmentStore: Send + Sync {
     async fn delete_scope(&self, scope: &SpillScope) -> Result<()>;
 
     /// List orphaned scopes older than `max_age` for startup cleanup.
-    async fn list_orphan_scopes(
-        &self,
-        max_age: std::time::Duration,
-    ) -> Result<Vec<SpillScope>>;
+    async fn list_orphan_scopes(&self, max_age: std::time::Duration) -> Result<Vec<SpillScope>>;
 
     /// Bytes currently used under the store quota (best effort).
     async fn used_bytes(&self) -> Result<u64>;

@@ -80,9 +80,7 @@ impl SqlClient for FlightClient {
     }
 }
 
-fn batches_to_result(
-    batches: &[RecordBatch],
-) -> Result<QueryResult, Box<dyn std::error::Error>> {
+fn batches_to_result(batches: &[RecordBatch]) -> Result<QueryResult, Box<dyn std::error::Error>> {
     if batches.is_empty() {
         return Ok(QueryResult {
             columns: vec![],
@@ -104,8 +102,10 @@ fn batches_to_result(
             .collect::<Result<Vec<_>, _>>()?;
 
         for row in 0..batch.num_rows() {
-            let cells: Vec<String> =
-                formatters.iter().map(|fmt| fmt.value(row).to_string()).collect();
+            let cells: Vec<String> = formatters
+                .iter()
+                .map(|fmt| fmt.value(row).to_string())
+                .collect();
             rows.push(cells);
         }
     }

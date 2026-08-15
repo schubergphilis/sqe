@@ -92,7 +92,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let client = reqwest::Client::builder().build()?;
     let policies: Vec<serde_json::Value> = client
-        .get(format!("{url}/service/public/v2/api/policy?serviceName={service}"))
+        .get(format!(
+            "{url}/service/public/v2/api/policy?serviceName={service}"
+        ))
         .basic_auth(&user, Some(&password))
         .send()
         .await?
@@ -113,9 +115,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let labels: Vec<String> = policy
             .get("policyLabels")
             .and_then(|v| v.as_array())
-            .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
             .unwrap_or_default();
-        let provenance: Vec<(String, String)> = labels.iter().filter_map(|l| parse_label(l)).collect();
+        let provenance: Vec<(String, String)> =
+            labels.iter().filter_map(|l| parse_label(l)).collect();
         if provenance.is_empty() {
             unlabelled += 1;
             continue;
@@ -131,14 +138,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .as_str()
                 .map(str::to_string)
         };
-        let Some(catalog) = val("catalog") else { continue };
+        let Some(catalog) = val("catalog") else {
+            continue;
+        };
         let namespace = val("namespace");
         let table = val("table");
 
         // What each labelled grantee SHOULD hold here, per the current profile.
         let mut expected: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         for (name, privilege) in &provenance {
-            match profile().plan_grant(privilege, &realm, &catalog, namespace.as_deref(), table.as_deref()) {
+            match profile().plan_grant(
+                privilege,
+                &realm,
+                &catalog,
+                namespace.as_deref(),
+                table.as_deref(),
+            ) {
                 Ok(plan) => {
                     if let Some(deepest) = plan.last() {
                         expected
@@ -174,7 +189,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let named: Vec<String> = item
                         .get(field)
                         .and_then(|v| v.as_array())
-                        .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|v| v.as_str().map(str::to_string))
+                                .collect()
+                        })
                         .unwrap_or_default();
                     // Only an item naming EXACTLY one labelled grantee can be
                     // narrowed: with several, an access type may be owed to one of
@@ -191,11 +210,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .and_then(|v| v.as_array())
                         .map(|a| {
                             a.iter()
-                                .filter_map(|x| x.get("type").and_then(|t| t.as_str()).map(str::to_string))
+                                .filter_map(|x| {
+                                    x.get("type").and_then(|t| t.as_str()).map(str::to_string)
+                                })
                                 .collect()
                         })
                         .unwrap_or_default();
-                    let extra: Vec<&String> = held.iter().filter(|t| !allowed.contains(*t)).collect();
+                    let extra: Vec<&String> =
+                        held.iter().filter(|t| !allowed.contains(*t)).collect();
                     if extra.is_empty() {
                         continue;
                     }
@@ -227,7 +249,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     findings += 1;
                     println!(
                         "  !  {resource_label}  {field}={who}\n     beyond the profile: {}",
-                        extra.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+                        extra
+                            .iter()
+                            .map(|s| s.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
                     );
                     if apply {
                         if let Some(arr) = item.get_mut("accesses").and_then(|v| v.as_array_mut()) {
@@ -244,7 +270,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         if apply && changed {
-            let id = policy.get("id").and_then(|v| v.as_i64()).ok_or("policy has no id")?;
+            let id = policy
+                .get("id")
+                .and_then(|v| v.as_i64())
+                .ok_or("policy has no id")?;
             let resp = client
                 .put(format!("{url}/service/public/v2/api/policy/{id}"))
                 .basic_auth(&user, Some(&password))

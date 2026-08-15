@@ -12,12 +12,11 @@ use std::sync::Arc;
 pub fn init_tracing() {
     static TRACING_INIT: std::sync::Once = std::sync::Once::new();
     TRACING_INIT.call_once(|| {
-        let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| {
-                tracing_subscriber::EnvFilter::new(
-                    "sqe_coordinator=info,sqe_catalog=info,sqe_auth=info,warn",
-                )
-            });
+        let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+            tracing_subscriber::EnvFilter::new(
+                "sqe_coordinator=info,sqe_catalog=info,sqe_auth=info,warn",
+            )
+        });
         tracing_subscriber::fmt()
             .with_env_filter(filter)
             .with_writer(std::io::stderr)
@@ -29,8 +28,7 @@ pub fn init_tracing() {
 /// CARGO_MANIFEST_DIR points to the crate dir (crates/sqe-coordinator),
 /// so we go up two levels to reach the workspace root.
 pub fn test_config_path() -> String {
-    let manifest_dir =
-        std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
     let workspace_root = std::path::Path::new(&manifest_dir)
         .parent() // crates/
         .and_then(|p| p.parent()) // workspace root
@@ -55,21 +53,33 @@ pub async fn setup_handler() -> (sqe_core::Session, sqe_coordinator::QueryHandle
         .await
         .expect("Auth failed for root");
     let policy: Arc<dyn sqe_policy::PolicyEnforcer> = Arc::new(sqe_policy::PassthroughEnforcer);
-    let query_tracker = Arc::new(
-        sqe_coordinator::query_tracker::QueryTracker::new(&config.query_history),
-    );
+    let query_tracker = Arc::new(sqe_coordinator::query_tracker::QueryTracker::new(
+        &config.query_history,
+    ));
     let query_cache = if config.query_cache.enabled {
-        Some(Arc::new(sqe_coordinator::query_cache::ResultCache::new(&config.query_cache, None)))
+        Some(Arc::new(sqe_coordinator::query_cache::ResultCache::new(
+            &config.query_cache,
+            None,
+        )))
     } else {
         None
     };
     let handler = sqe_coordinator::QueryHandler::new(
-        policy, None, config, None, None, None, None, query_tracker, query_cache,
+        policy,
+        None,
+        config,
+        None,
+        None,
+        None,
+        None,
+        query_tracker,
+        query_cache,
         None, // grant_backend
         None, // lineage observer
         sqe_coordinator::RuntimeCatalogRegistry::default(),
         sqe_core::SecretStore::default(),
-    ).expect("Failed to create QueryHandler");
+    )
+    .expect("Failed to create QueryHandler");
     (session, handler)
 }
 
@@ -175,21 +185,33 @@ pub async fn setup_handler_with_workers(
         registry.mark_healthy(url).await;
     }
 
-    let query_tracker = Arc::new(
-        sqe_coordinator::query_tracker::QueryTracker::new(&config.query_history),
-    );
+    let query_tracker = Arc::new(sqe_coordinator::query_tracker::QueryTracker::new(
+        &config.query_history,
+    ));
     let query_cache = if config.query_cache.enabled {
-        Some(Arc::new(sqe_coordinator::query_cache::ResultCache::new(&config.query_cache, None)))
+        Some(Arc::new(sqe_coordinator::query_cache::ResultCache::new(
+            &config.query_cache,
+            None,
+        )))
     } else {
         None
     };
     let handler = sqe_coordinator::QueryHandler::new(
-        policy, None, config, Some(registry), None, None, None, query_tracker, query_cache,
+        policy,
+        None,
+        config,
+        Some(registry),
+        None,
+        None,
+        None,
+        query_tracker,
+        query_cache,
         None, // grant_backend
         None, // lineage observer
         sqe_coordinator::RuntimeCatalogRegistry::default(),
         sqe_core::SecretStore::default(),
-    ).expect("Failed to create QueryHandler");
+    )
+    .expect("Failed to create QueryHandler");
     (session, handler)
 }
 
@@ -214,8 +236,7 @@ pub fn ranger_config_path() -> String {
             return p;
         }
     }
-    let manifest_dir =
-        std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
     let workspace_root = std::path::Path::new(&manifest_dir)
         .parent()
         .and_then(|p| p.parent())
@@ -255,8 +276,10 @@ pub fn serial() -> &'static tokio::sync::Mutex<()> {
 /// column tags out of it, and a separate cache reports tag state as unknown,
 /// which fails closed.
 #[allow(dead_code)]
-pub async fn setup_ranger_handler(
-) -> (sqe_coordinator::QueryHandler, sqe_catalog::TableMetadataCache) {
+pub async fn setup_ranger_handler() -> (
+    sqe_coordinator::QueryHandler,
+    sqe_catalog::TableMetadataCache,
+) {
     setup_ranger_handler_with(|_| {}).await
 }
 
@@ -268,7 +291,10 @@ pub async fn setup_ranger_handler(
 #[allow(dead_code)]
 pub async fn setup_ranger_handler_with(
     mutate: impl FnOnce(&mut sqe_core::SqeConfig),
-) -> (sqe_coordinator::QueryHandler, sqe_catalog::TableMetadataCache) {
+) -> (
+    sqe_coordinator::QueryHandler,
+    sqe_catalog::TableMetadataCache,
+) {
     setup_ranger_handler_sharing(None, mutate).await
 }
 
@@ -285,14 +311,16 @@ pub async fn setup_ranger_handler_with(
 pub async fn setup_ranger_handler_sharing(
     existing_cache: Option<sqe_catalog::TableMetadataCache>,
     mutate: impl FnOnce(&mut sqe_core::SqeConfig),
-) -> (sqe_coordinator::QueryHandler, sqe_catalog::TableMetadataCache) {
+) -> (
+    sqe_coordinator::QueryHandler,
+    sqe_catalog::TableMetadataCache,
+) {
     init_tracing();
-    let mut config = sqe_core::SqeConfig::load(&ranger_config_path())
-        .expect("load tests/sqe-ranger-test.toml");
+    let mut config =
+        sqe_core::SqeConfig::load(&ranger_config_path()).expect("load tests/sqe-ranger-test.toml");
     mutate(&mut config);
     let config = config;
-    let table_cache =
-        existing_cache.unwrap_or_else(|| sqe_catalog::TableMetadataCache::new(30));
+    let table_cache = existing_cache.unwrap_or_else(|| sqe_catalog::TableMetadataCache::new(30));
     let (enforcer, store) = sqe_coordinator::policy_wiring::build_policy_enforcer(
         &config.policy,
         Some(table_cache.clone()),
@@ -328,8 +356,8 @@ pub async fn setup_ranger_handler_sharing(
 /// `<user>123` (alice123, bob123, carol123, dave123).
 #[allow(dead_code)]
 pub async fn ranger_session(user: &str) -> sqe_core::Session {
-    let config = sqe_core::SqeConfig::load(&ranger_config_path())
-        .expect("load tests/sqe-ranger-test.toml");
+    let config =
+        sqe_core::SqeConfig::load(&ranger_config_path()).expect("load tests/sqe-ranger-test.toml");
     let authenticator = sqe_auth::Authenticator::new(&config.auth)
         .await
         .expect("create authenticator");
@@ -374,11 +402,7 @@ where
 
 /// `eventually` with an explicit budget.
 #[allow(dead_code)]
-pub async fn eventually_within<F, Fut, T>(
-    budget: std::time::Duration,
-    what: &str,
-    mut f: F,
-) -> T
+pub async fn eventually_within<F, Fut, T>(budget: std::time::Duration, what: &str, mut f: F) -> T
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<T, String>>,
@@ -405,7 +429,12 @@ where
 pub fn fmt_val(col: &dyn arrow_array::Array, row: usize) -> String {
     #[allow(unused_imports)]
     use arrow_array::Array as _;
-    if col.is_null(row) || col.as_any().downcast_ref::<arrow_array::NullArray>().is_some() {
+    if col.is_null(row)
+        || col
+            .as_any()
+            .downcast_ref::<arrow_array::NullArray>()
+            .is_some()
+    {
         return "NULL".to_string();
     }
     if let Some(a) = col.as_any().downcast_ref::<arrow_array::Int64Array>() {

@@ -38,8 +38,17 @@ async fn file_count(
     ns: &str,
     t: &str,
 ) -> i64 {
-    let b = exec(handler, session, &format!("SELECT COUNT(*) FROM table_files('{ns}', '{t}')")).await;
-    b[0].column(0).as_any().downcast_ref::<Int64Array>().unwrap().value(0)
+    let b = exec(
+        handler,
+        session,
+        &format!("SELECT COUNT(*) FROM table_files('{ns}', '{t}')"),
+    )
+    .await;
+    b[0].column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0)
 }
 
 /// Time a filtered aggregate, returning (elapsed_ms, result).
@@ -52,7 +61,12 @@ async fn timed_filter_query(
     let start = Instant::now();
     let b = exec(handler, session, &sql).await;
     let elapsed = start.elapsed().as_millis();
-    let n = b[0].column(0).as_any().downcast_ref::<Int64Array>().unwrap().value(0);
+    let n = b[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0);
     (elapsed, n)
 }
 
@@ -123,7 +137,10 @@ async fn compaction_sort_benchmark() {
     eprintln!("===========================================\n");
 
     // Correctness guardrails so the benchmark cannot silently lie.
-    assert_eq!(before_n, after_n, "filter result must not change across compaction");
+    assert_eq!(
+        before_n, after_n,
+        "filter result must not change across compaction"
+    );
     assert_eq!(
         exec(&handler, &session, &format!("SELECT COUNT(*) FROM {table}")).await[0]
             .column(0)

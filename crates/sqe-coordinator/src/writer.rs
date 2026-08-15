@@ -16,12 +16,14 @@ use iceberg::writer::base_writer::position_delete_file_writer::{
 use iceberg::writer::file_writer::location_generator::{
     DefaultFileNameGenerator, DefaultLocationGenerator,
 };
-use iceberg::writer::file_writer::ParquetWriterBuilder;
 use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
+use iceberg::writer::file_writer::ParquetWriterBuilder;
 use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
-use sqe_catalog::parquet_writer_config::{self, writer_props_for_table as shared_writer_props_for_table};
+use sqe_catalog::parquet_writer_config::{
+    self, writer_props_for_table as shared_writer_props_for_table,
+};
 use sqe_core::SqeError;
 
 use tracing::{info, instrument};
@@ -86,10 +88,7 @@ fn writer_props(compression: Compression) -> WriterProperties {
 ///
 /// Absence of the bloom filter columns property leaves the writer with no
 /// bloom filters (matching Iceberg spec default).
-pub fn writer_props_for_table(
-    table: &Table,
-    compression: Compression,
-) -> WriterProperties {
+pub fn writer_props_for_table(table: &Table, compression: Compression) -> WriterProperties {
     shared_writer_props_for_table(table, compression)
 }
 
@@ -119,7 +118,10 @@ pub async fn write_data_files(
         return Ok(vec![]);
     }
 
-    info!(total_rows, file_prefix, "Writing data files for Iceberg table");
+    info!(
+        total_rows,
+        file_prefix, "Writing data files for Iceberg table"
+    );
 
     // DataFusion-produced RecordBatches have no Iceberg field-ID metadata on their
     // Arrow fields. The Parquet writer requires "PARQUET:field_id" in each field's
@@ -138,11 +140,8 @@ pub async fn write_data_files(
     let write_id = Uuid::now_v7();
     let unique_prefix = format!("{write_id}");
 
-    let file_name_generator = DefaultFileNameGenerator::new(
-        unique_prefix,
-        None,
-        iceberg::spec::DataFileFormat::Parquet,
-    );
+    let file_name_generator =
+        DefaultFileNameGenerator::new(unique_prefix, None, iceberg::spec::DataFileFormat::Parquet);
 
     let parquet_writer_builder = ParquetWriterBuilder::new(
         writer_props_for_table(table, compression),
@@ -173,9 +172,7 @@ pub async fn write_data_files(
         let mut writer = data_file_writer_builder
             .build(partition_key)
             .await
-            .map_err(|e| {
-                SqeError::Execution(format!("Failed to build data file writer: {e}"))
-            })?;
+            .map_err(|e| SqeError::Execution(format!("Failed to build data file writer: {e}")))?;
 
         for batch in &batches {
             if batch.num_rows() > 0 {
@@ -206,11 +203,7 @@ pub async fn write_data_files(
             schema.clone(),
             partition_spec.clone(),
         )
-        .map_err(|e| {
-            SqeError::Execution(format!(
-                "Failed to build partition splitter: {e}"
-            ))
-        })?;
+        .map_err(|e| SqeError::Execution(format!("Failed to build partition splitter: {e}")))?;
         let mut writer = TaskWriter::new_with_partition_splitter(
             data_file_writer_builder,
             true,
@@ -223,25 +216,18 @@ pub async fn write_data_files(
                 writer
                     .write(batch.clone())
                     .await
-                    .map_err(|e| {
-                        SqeError::Execution(format!(
-                            "Partitioned write error: {e}"
-                        ))
-                    })?;
+                    .map_err(|e| SqeError::Execution(format!("Partitioned write error: {e}")))?;
             }
         }
         writer
             .close()
             .await
-            .map_err(|e| {
-                SqeError::Execution(format!("Close partitioned writer error: {e}"))
-            })?
+            .map_err(|e| SqeError::Execution(format!("Close partitioned writer error: {e}")))?
     };
 
     info!(
         file_count = data_files.len(),
-        total_rows,
-        "Data files written successfully"
+        total_rows, "Data files written successfully"
     );
 
     Ok(data_files)
@@ -296,7 +282,14 @@ pub async fn write_data_files_streaming_with_metrics(
     fanout: FanoutLimits,
 ) -> sqe_core::Result<(Vec<DataFile>, usize)> {
     let (data_files, total_rows) = write_data_files_streaming(
-        table, stream, file_prefix, compression, tracker, fanout, None, None,
+        table,
+        stream,
+        file_prefix,
+        compression,
+        tracker,
+        fanout,
+        None,
+        None,
     )
     .await?;
 
@@ -519,10 +512,8 @@ fn stamp_field_ids(
 
     // Build the canonical Arrow schema from the Iceberg schema so we know the
     // expected Arrow data type for each column (e.g. Timestamp(µs) not Timestamp(ns)).
-    let expected_arrow_schema =
-        schema_to_arrow_schema(iceberg_schema).map_err(|e| {
-            SqeError::Execution(format!("Failed to derive expected Arrow schema: {e}"))
-        })?;
+    let expected_arrow_schema = schema_to_arrow_schema(iceberg_schema)
+        .map_err(|e| SqeError::Execution(format!("Failed to derive expected Arrow schema: {e}")))?;
 
     let iceberg_fields = iceberg_schema.as_struct().fields();
     let new_fields: Vec<Arc<arrow_schema::Field>> = first

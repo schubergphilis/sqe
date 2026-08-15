@@ -52,11 +52,13 @@ impl PendingAuthStore {
     }
 
     pub fn complete(&self, auth_id: &str, tokens: TokenSet) {
-        self.store.insert(auth_id.to_string(), PendingAuth::Complete(tokens));
+        self.store
+            .insert(auth_id.to_string(), PendingAuth::Complete(tokens));
     }
 
     pub fn fail(&self, auth_id: &str, error: String) {
-        self.store.insert(auth_id.to_string(), PendingAuth::Failed(error));
+        self.store
+            .insert(auth_id.to_string(), PendingAuth::Failed(error));
     }
 
     pub fn poll(&self, auth_id: &str) -> Option<PendingAuth> {
@@ -79,7 +81,11 @@ mod tests {
         let result = store.poll("auth-1");
         assert!(result.is_some());
         match result.unwrap() {
-            PendingAuth::AwaitingCallback { code_verifier, state, .. } => {
+            PendingAuth::AwaitingCallback {
+                code_verifier,
+                state,
+                ..
+            } => {
                 assert_eq!(code_verifier, "verifier");
                 assert_eq!(state, "state-abc");
             }
@@ -91,12 +97,15 @@ mod tests {
     fn complete_overwrites_pending() {
         let store = PendingAuthStore::new(Duration::from_secs(60));
         store.insert_pending("auth-1", "v".to_string(), "s".to_string());
-        store.complete("auth-1", TokenSet {
-            access_token: "at".to_string(),
-            id_token: Some("idt".to_string()),
-            refresh_token: None,
-            expires_in: 3600,
-        });
+        store.complete(
+            "auth-1",
+            TokenSet {
+                access_token: "at".to_string(),
+                id_token: Some("idt".to_string()),
+                refresh_token: None,
+                expires_in: 3600,
+            },
+        );
         match store.poll("auth-1").unwrap() {
             PendingAuth::Complete(ts) => {
                 assert_eq!(ts.access_token, "at");

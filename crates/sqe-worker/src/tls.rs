@@ -31,10 +31,7 @@ pub fn build_server_tls_config(config: &TlsConfig) -> sqe_core::Result<Option<Se
         ))
     })?;
     let key = std::fs::read(&config.key_file).map_err(|e| {
-        sqe_core::SqeError::Config(format!(
-            "Failed to read TLS key '{}': {e}",
-            config.key_file
-        ))
+        sqe_core::SqeError::Config(format!("Failed to read TLS key '{}': {e}", config.key_file))
     })?;
 
     let identity = Identity::from_pem(cert, key);
@@ -43,10 +40,7 @@ pub fn build_server_tls_config(config: &TlsConfig) -> sqe_core::Result<Option<Se
     // Optional client CA for mTLS verification.
     if !config.ca_file.is_empty() {
         let ca = std::fs::read(&config.ca_file).map_err(|e| {
-            sqe_core::SqeError::Config(format!(
-                "Failed to read TLS CA '{}': {e}",
-                config.ca_file
-            ))
+            sqe_core::SqeError::Config(format!("Failed to read TLS CA '{}': {e}", config.ca_file))
         })?;
         let ca_cert = tonic::transport::Certificate::from_pem(ca);
         tls_config = tls_config.client_ca_root(ca_cert);

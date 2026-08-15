@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow_array::builder::{BooleanBuilder, Int32Builder, StringBuilder};
 use arrow_array::{ArrayRef, RecordBatch};
+use async_trait::async_trait;
 use datafusion::catalog::SchemaProvider;
 use datafusion::datasource::{MemTable, TableProvider};
 use datafusion::error::Result as DFResult;
@@ -63,7 +63,13 @@ async fn list_namespaces_for(catalog: &SessionCatalog) -> Vec<String> {
     match catalog.list_namespaces().await {
         Ok(namespaces) => namespaces
             .iter()
-            .map(|ns| ns.as_ref().iter().map(|s| s.as_str()).collect::<Vec<_>>().join("."))
+            .map(|ns| {
+                ns.as_ref()
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join(".")
+            })
             .collect(),
         Err(e) => {
             // A principal that cannot LIST a catalog's namespaces just doesn't
@@ -81,13 +87,14 @@ async fn list_namespaces_for(catalog: &SessionCatalog) -> Vec<String> {
 impl std::fmt::Debug for JdbcSchemaProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let names: Vec<&str> = self.catalogs.iter().map(|e| e.name.as_str()).collect();
-        f.debug_struct("JdbcSchemaProvider").field("catalogs", &names).finish()
+        f.debug_struct("JdbcSchemaProvider")
+            .field("catalogs", &names)
+            .finish()
     }
 }
 
 #[async_trait]
 impl SchemaProvider for JdbcSchemaProvider {
-
     fn table_names(&self) -> Vec<String> {
         vec![
             "types".into(),
@@ -99,7 +106,10 @@ impl SchemaProvider for JdbcSchemaProvider {
     }
 
     fn table_exist(&self, name: &str) -> bool {
-        matches!(name, "types" | "catalogs" | "schemas" | "tables" | "columns")
+        matches!(
+            name,
+            "types" | "catalogs" | "schemas" | "tables" | "columns"
+        )
     }
 
     async fn table(&self, name: &str) -> DFResult<Option<Arc<dyn TableProvider>>> {
@@ -392,18 +402,138 @@ fn build_types_table() -> DFResult<Arc<dyn TableProvider>> {
     ]));
 
     let type_rows: Vec<JdbcTypeRow> = vec![
-        JdbcTypeRow { name: "boolean",   jdbc_type: 16, precision:  1, literal_prefix: None,              literal_suffix: None,       case_sensitive: false, min_scale: 0, max_scale:  0, num_prec_radix: Some(10) },
-        JdbcTypeRow { name: "tinyint",   jdbc_type: -6, precision:  3, literal_prefix: None,              literal_suffix: None,       case_sensitive: false, min_scale: 0, max_scale:  0, num_prec_radix: Some(10) },
-        JdbcTypeRow { name: "smallint",  jdbc_type:  5, precision:  5, literal_prefix: None,              literal_suffix: None,       case_sensitive: false, min_scale: 0, max_scale:  0, num_prec_radix: Some(10) },
-        JdbcTypeRow { name: "integer",   jdbc_type:  4, precision: 10, literal_prefix: None,              literal_suffix: None,       case_sensitive: false, min_scale: 0, max_scale:  0, num_prec_radix: Some(10) },
-        JdbcTypeRow { name: "bigint",    jdbc_type: -5, precision: 19, literal_prefix: None,              literal_suffix: None,       case_sensitive: false, min_scale: 0, max_scale:  0, num_prec_radix: Some(10) },
-        JdbcTypeRow { name: "real",      jdbc_type:  7, precision: 24, literal_prefix: None,              literal_suffix: None,       case_sensitive: false, min_scale: 0, max_scale:  0, num_prec_radix: Some(10) },
-        JdbcTypeRow { name: "double",    jdbc_type:  8, precision: 53, literal_prefix: None,              literal_suffix: None,       case_sensitive: false, min_scale: 0, max_scale:  0, num_prec_radix: Some(10) },
-        JdbcTypeRow { name: "decimal",   jdbc_type:  3, precision: 38, literal_prefix: None,              literal_suffix: None,       case_sensitive: false, min_scale: 0, max_scale: 38, num_prec_radix: Some(10) },
-        JdbcTypeRow { name: "varchar",   jdbc_type: 12, precision:  0, literal_prefix: Some("'"),         literal_suffix: Some("'"),  case_sensitive: true,  min_scale: 0, max_scale:  0, num_prec_radix: None     },
-        JdbcTypeRow { name: "varbinary", jdbc_type: -3, precision:  0, literal_prefix: Some("X'"),        literal_suffix: Some("'"),  case_sensitive: false, min_scale: 0, max_scale:  0, num_prec_radix: None     },
-        JdbcTypeRow { name: "date",      jdbc_type: 91, precision:  0, literal_prefix: Some("DATE '"),    literal_suffix: Some("'"),  case_sensitive: false, min_scale: 0, max_scale:  0, num_prec_radix: Some(10) },
-        JdbcTypeRow { name: "timestamp", jdbc_type: 93, precision:  0, literal_prefix: Some("TIMESTAMP '"), literal_suffix: Some("'"), case_sensitive: false, min_scale: 0, max_scale: 9, num_prec_radix: Some(10) },
+        JdbcTypeRow {
+            name: "boolean",
+            jdbc_type: 16,
+            precision: 1,
+            literal_prefix: None,
+            literal_suffix: None,
+            case_sensitive: false,
+            min_scale: 0,
+            max_scale: 0,
+            num_prec_radix: Some(10),
+        },
+        JdbcTypeRow {
+            name: "tinyint",
+            jdbc_type: -6,
+            precision: 3,
+            literal_prefix: None,
+            literal_suffix: None,
+            case_sensitive: false,
+            min_scale: 0,
+            max_scale: 0,
+            num_prec_radix: Some(10),
+        },
+        JdbcTypeRow {
+            name: "smallint",
+            jdbc_type: 5,
+            precision: 5,
+            literal_prefix: None,
+            literal_suffix: None,
+            case_sensitive: false,
+            min_scale: 0,
+            max_scale: 0,
+            num_prec_radix: Some(10),
+        },
+        JdbcTypeRow {
+            name: "integer",
+            jdbc_type: 4,
+            precision: 10,
+            literal_prefix: None,
+            literal_suffix: None,
+            case_sensitive: false,
+            min_scale: 0,
+            max_scale: 0,
+            num_prec_radix: Some(10),
+        },
+        JdbcTypeRow {
+            name: "bigint",
+            jdbc_type: -5,
+            precision: 19,
+            literal_prefix: None,
+            literal_suffix: None,
+            case_sensitive: false,
+            min_scale: 0,
+            max_scale: 0,
+            num_prec_radix: Some(10),
+        },
+        JdbcTypeRow {
+            name: "real",
+            jdbc_type: 7,
+            precision: 24,
+            literal_prefix: None,
+            literal_suffix: None,
+            case_sensitive: false,
+            min_scale: 0,
+            max_scale: 0,
+            num_prec_radix: Some(10),
+        },
+        JdbcTypeRow {
+            name: "double",
+            jdbc_type: 8,
+            precision: 53,
+            literal_prefix: None,
+            literal_suffix: None,
+            case_sensitive: false,
+            min_scale: 0,
+            max_scale: 0,
+            num_prec_radix: Some(10),
+        },
+        JdbcTypeRow {
+            name: "decimal",
+            jdbc_type: 3,
+            precision: 38,
+            literal_prefix: None,
+            literal_suffix: None,
+            case_sensitive: false,
+            min_scale: 0,
+            max_scale: 38,
+            num_prec_radix: Some(10),
+        },
+        JdbcTypeRow {
+            name: "varchar",
+            jdbc_type: 12,
+            precision: 0,
+            literal_prefix: Some("'"),
+            literal_suffix: Some("'"),
+            case_sensitive: true,
+            min_scale: 0,
+            max_scale: 0,
+            num_prec_radix: None,
+        },
+        JdbcTypeRow {
+            name: "varbinary",
+            jdbc_type: -3,
+            precision: 0,
+            literal_prefix: Some("X'"),
+            literal_suffix: Some("'"),
+            case_sensitive: false,
+            min_scale: 0,
+            max_scale: 0,
+            num_prec_radix: None,
+        },
+        JdbcTypeRow {
+            name: "date",
+            jdbc_type: 91,
+            precision: 0,
+            literal_prefix: Some("DATE '"),
+            literal_suffix: Some("'"),
+            case_sensitive: false,
+            min_scale: 0,
+            max_scale: 0,
+            num_prec_radix: Some(10),
+        },
+        JdbcTypeRow {
+            name: "timestamp",
+            jdbc_type: 93,
+            precision: 0,
+            literal_prefix: Some("TIMESTAMP '"),
+            literal_suffix: Some("'"),
+            case_sensitive: false,
+            min_scale: 0,
+            max_scale: 9,
+            num_prec_radix: Some(10),
+        },
     ];
 
     let mut name_b = StringBuilder::new();
@@ -496,10 +626,7 @@ fn build_catalogs_table(catalogs: &[String]) -> DFResult<Arc<dyn TableProvider>>
         cat_b.append_value(c);
     }
 
-    let batch = RecordBatch::try_new(
-        schema.clone(),
-        vec![Arc::new(cat_b.finish()) as ArrayRef],
-    )?;
+    let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(cat_b.finish()) as ArrayRef])?;
 
     Ok(Arc::new(MemTable::try_new(schema, vec![vec![batch]])?))
 }
@@ -545,8 +672,7 @@ mod tests {
 
     #[test]
     fn test_catalogs_table() {
-        let table =
-            build_catalogs_table(&["my_warehouse".to_string()]).unwrap();
+        let table = build_catalogs_table(&["my_warehouse".to_string()]).unwrap();
         let schema = table.schema();
         assert_eq!(schema.field(0).name(), "table_cat");
     }
@@ -556,11 +682,9 @@ mod tests {
         // The catalogs table emits one row per reachable catalog name, in the
         // order given (primary/default first). Dedup of entries happens in
         // JdbcSchemaProvider::new before this point. (#5)
-        let table = build_catalogs_table(&[
-            "main_warehouse".to_string(),
-            "ws_energy_co".to_string(),
-        ])
-        .unwrap();
+        let table =
+            build_catalogs_table(&["main_warehouse".to_string(), "ws_energy_co".to_string()])
+                .unwrap();
         assert_eq!(table.schema().field(0).name(), "table_cat");
     }
 
@@ -649,11 +773,7 @@ mod tests {
             "num_prec_radix",
         ];
         for (i, name) in expected_names.iter().enumerate() {
-            assert_eq!(
-                schema.field(i).name(),
-                *name,
-                "column {i} name mismatch"
-            );
+            assert_eq!(schema.field(i).name(), *name, "column {i} name mismatch");
         }
     }
 
@@ -716,8 +836,10 @@ mod tests {
     #[test]
     fn test_iceberg_type_to_jdbc_decimal() {
         use iceberg::spec::{PrimitiveType, Type};
-        let (code, name) =
-            iceberg_type_to_jdbc(&Type::Primitive(PrimitiveType::Decimal { precision: 38, scale: 10 }));
+        let (code, name) = iceberg_type_to_jdbc(&Type::Primitive(PrimitiveType::Decimal {
+            precision: 38,
+            scale: 10,
+        }));
         assert_eq!(code, 3, "Decimal should map to JDBC DECIMAL (3)");
         assert_eq!(name, "decimal");
     }
@@ -793,8 +915,14 @@ mod tests {
         use iceberg::spec::{ListType, NestedField, PrimitiveType, Type};
         use std::sync::Arc;
         // Build a List<string> type as a representative complex type
-        let inner_field = Arc::new(NestedField::required(1, "element", Type::Primitive(PrimitiveType::String)));
-        let list_type = Type::List(ListType { element_field: inner_field });
+        let inner_field = Arc::new(NestedField::required(
+            1,
+            "element",
+            Type::Primitive(PrimitiveType::String),
+        ));
+        let list_type = Type::List(ListType {
+            element_field: inner_field,
+        });
         let (code, name) = iceberg_type_to_jdbc(&list_type);
         assert_eq!(code, 12, "Complex types should fall back to VARCHAR (12)");
         assert_eq!(name, "varchar");

@@ -28,7 +28,6 @@ async fn main() -> anyhow::Result<()> {
         config.metrics.prometheus_port,
     );
 
-
     // Build a configured DataFusion SessionContext with a resizable memory pool.
     // The context is created early to fail fast on invalid config (e.g. bad memory_limit).
     // Pool is shared so hot config reload can change memory_limit without rebuild.

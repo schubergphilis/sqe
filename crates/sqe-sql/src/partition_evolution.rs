@@ -93,7 +93,8 @@ pub fn try_parse_partition_evolution(sql: &str) -> Result<Option<PartitionEvolut
     }
 
     // REPLACE PARTITION FIELD <old> WITH <new>
-    if let Some(after_kw) = strip_keyword(&rest_upper, rest_after_table, "REPLACE PARTITION FIELD") {
+    if let Some(after_kw) = strip_keyword(&rest_upper, rest_after_table, "REPLACE PARTITION FIELD")
+    {
         let after_kw = after_kw.trim();
         // Split on " WITH " case-insensitively.
         let (old, new) = split_with(after_kw)?;
@@ -188,8 +189,7 @@ fn split_with(input: &str) -> Result<(String, String)> {
         let abs = search_start + pos;
         let before_ok = abs == 0 || upper.as_bytes()[abs - 1].is_ascii_whitespace();
         let after_idx = abs + 4;
-        let after_ok = after_idx < upper.len()
-            && upper.as_bytes()[after_idx].is_ascii_whitespace();
+        let after_ok = after_idx < upper.len() && upper.as_bytes()[after_idx].is_ascii_whitespace();
         if before_ok && after_ok {
             // Found a real " WITH " keyword.
             let old = input[..abs].trim().to_string();
@@ -214,9 +214,11 @@ mod tests {
 
     #[test]
     fn no_match_for_unrelated_alter() {
-        assert!(try_parse_partition_evolution("ALTER TABLE t ADD COLUMN x INT")
-            .unwrap()
-            .is_none());
+        assert!(
+            try_parse_partition_evolution("ALTER TABLE t ADD COLUMN x INT")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -250,11 +252,9 @@ mod tests {
 
     #[test]
     fn add_field_with_identity() {
-        let pe = try_parse_partition_evolution(
-            "ALTER TABLE events ADD PARTITION FIELD region",
-        )
-        .unwrap()
-        .unwrap();
+        let pe = try_parse_partition_evolution("ALTER TABLE events ADD PARTITION FIELD region")
+            .unwrap()
+            .unwrap();
         assert!(matches!(
             pe,
             PartitionEvolution::AddField { transform_sql, .. } if transform_sql == "region"
@@ -263,11 +263,10 @@ mod tests {
 
     #[test]
     fn drop_field() {
-        let pe = try_parse_partition_evolution(
-            "ALTER TABLE default.events DROP PARTITION FIELD region",
-        )
-        .unwrap()
-        .unwrap();
+        let pe =
+            try_parse_partition_evolution("ALTER TABLE default.events DROP PARTITION FIELD region")
+                .unwrap()
+                .unwrap();
         assert_eq!(
             pe,
             PartitionEvolution::DropField {
@@ -296,18 +295,15 @@ mod tests {
 
     #[test]
     fn missing_transform_returns_error() {
-        let err = try_parse_partition_evolution("ALTER TABLE t ADD PARTITION FIELD")
-            .unwrap_err();
+        let err = try_parse_partition_evolution("ALTER TABLE t ADD PARTITION FIELD").unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("missing transform"));
     }
 
     #[test]
     fn replace_without_with_returns_error() {
-        let err = try_parse_partition_evolution(
-            "ALTER TABLE t REPLACE PARTITION FIELD region",
-        )
-        .unwrap_err();
+        let err = try_parse_partition_evolution("ALTER TABLE t REPLACE PARTITION FIELD region")
+            .unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("WITH"));
     }

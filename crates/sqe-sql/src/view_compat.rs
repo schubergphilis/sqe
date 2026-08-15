@@ -87,7 +87,10 @@ pub struct ViewCompat {
 
 /// Normalize Trino `CREATE VIEW` header clauses. A no-op for SQL that parses.
 pub fn rewrite_view_compat(sql: &str) -> ViewCompat {
-    let unchanged = || ViewCompat { sql: sql.to_string(), security: None };
+    let unchanged = || ViewCompat {
+        sql: sql.to_string(),
+        security: None,
+    };
 
     // Fast path: only a CREATE ... VIEW statement can carry these clauses.
     let lower = sql.to_ascii_lowercase();
@@ -102,7 +105,10 @@ pub fn rewrite_view_compat(sql: &str) -> ViewCompat {
         Some((candidate, security))
             if candidate != sql && Parser::parse_sql(&dialect, &candidate).is_ok() =>
         {
-            ViewCompat { sql: candidate, security }
+            ViewCompat {
+                sql: candidate,
+                security,
+            }
         }
         _ => unchanged(),
     }
@@ -207,11 +213,10 @@ fn rewrite(sql: &str) -> Option<(String, Option<ViewSecurity>)> {
         if word_eq(&tokens[idx], "SECURITY") {
             // `SECURITY <mode>`: drop both words and remember the mode.
             let next = meaningful.get(p + 1).copied();
-            let mode = next
-                .and_then(|n| match &tokens[n] {
-                    Token::Word(w) => ViewSecurity::from_keyword(&w.value),
-                    _ => None,
-                });
+            let mode = next.and_then(|n| match &tokens[n] {
+                Token::Word(w) => ViewSecurity::from_keyword(&w.value),
+                _ => None,
+            });
             if let (Some(mode), Some(next)) = (mode, next) {
                 edits.insert(idx, String::new());
                 edits.insert(next, String::new());
@@ -330,7 +335,11 @@ mod tests {
             "select * from renamed",
             "\"dev_raw\".\"example_table\"",
         ] {
-            assert!(got.sql.contains(fragment), "body lost {fragment:?}:\n{}", got.sql);
+            assert!(
+                got.sql.contains(fragment),
+                "body lost {fragment:?}:\n{}",
+                got.sql
+            );
         }
     }
 
@@ -370,7 +379,10 @@ mod tests {
         assert_eq!(got.sql.to_ascii_lowercase().matches("with (").count(), 1);
         let options = view_parts(&got.sql).1;
         assert!(options.contains("format"), "user option lost: {options}");
-        assert!(options.contains("definer"), "security option lost: {options}");
+        assert!(
+            options.contains("definer"),
+            "security option lost: {options}"
+        );
     }
 
     /// Parse-gating: SQL that already parses is returned byte-identical, so the

@@ -52,10 +52,9 @@ pub(crate) async fn build_buffer_table(
     let store: Arc<dyn ObjectStore> = tmp_ctx.state().runtime_env().object_store(&listing_url)?;
     let path = listing_url.prefix().clone();
 
-    let meta = store
-        .head(&path)
-        .await
-        .map_err(|e| DataFusionError::Plan(format!("{FN_NAME}: cannot stat '{}': {e}", args.path)))?;
+    let meta = store.head(&path).await.map_err(|e| {
+        DataFusionError::Plan(format!("{FN_NAME}: cannot stat '{}': {e}", args.path))
+    })?;
     if meta.size as usize > max_bytes {
         return Err(DataFusionError::Plan(format!(
             "{FN_NAME}: '{}' is {} bytes, exceeds max_buffer_bytes {} (raise max_buffer_bytes to read it)",
@@ -66,7 +65,9 @@ pub(crate) async fn build_buffer_table(
     let raw = store
         .get(&path)
         .await
-        .map_err(|e| DataFusionError::Plan(format!("{FN_NAME}: fetch '{}' failed: {e}", args.path)))?
+        .map_err(|e| {
+            DataFusionError::Plan(format!("{FN_NAME}: fetch '{}' failed: {e}", args.path))
+        })?
         .bytes()
         .await
         .map_err(|e| DataFusionError::Plan(format!("{FN_NAME}: read '{}' failed: {e}", args.path)))?
@@ -156,10 +157,7 @@ pub(crate) fn decompress(bytes: Vec<u8>, codec: JsonCompression) -> DFResult<Vec
 /// resolved framing, and concatenate into one NDJSON byte stream. Entries
 /// whose name does not end in .json/.jsonl/.ndjson are ignored. Zero JSON
 /// entries is an error.
-pub(crate) fn decompress_zip_to_ndjson(
-    bytes: Vec<u8>,
-    framing: JsonFraming,
-) -> DFResult<Vec<u8>> {
+pub(crate) fn decompress_zip_to_ndjson(bytes: Vec<u8>, framing: JsonFraming) -> DFResult<Vec<u8>> {
     use std::io::Cursor;
     let mut archive = zip::ZipArchive::new(Cursor::new(bytes))
         .map_err(|e| DataFusionError::Plan(format!("{FN_NAME}: not a valid zip: {e}")))?;
@@ -178,9 +176,9 @@ pub(crate) fn decompress_zip_to_ndjson(
             continue;
         }
         let mut raw = Vec::new();
-        entry
-            .read_to_end(&mut raw)
-            .map_err(|e| DataFusionError::Plan(format!("{FN_NAME}: zip entry decompress failed: {e}")))?;
+        entry.read_to_end(&mut raw).map_err(|e| {
+            DataFusionError::Plan(format!("{FN_NAME}: zip entry decompress failed: {e}"))
+        })?;
 
         // Resolve framing per entry when Auto.
         let entry_framing = match framing {
@@ -226,9 +224,9 @@ pub(crate) fn decode_ndjson_to_memtable(ndjson: &[u8]) -> DFResult<Arc<dyn Table
 
     let mut batches = Vec::new();
     for b in reader {
-        batches.push(b.map_err(|e| {
-            DataFusionError::Plan(format!("{FN_NAME}: JSON decode failed: {e}"))
-        })?);
+        batches.push(
+            b.map_err(|e| DataFusionError::Plan(format!("{FN_NAME}: JSON decode failed: {e}")))?,
+        );
     }
 
     let table = MemTable::try_new(schema, vec![batches])?;
@@ -336,7 +334,8 @@ mod tests {
         let mut buf = Vec::new();
         {
             let mut zw = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
-            zw.start_file("README.txt", SimpleFileOptions::default()).unwrap();
+            zw.start_file("README.txt", SimpleFileOptions::default())
+                .unwrap();
             zw.write_all(b"nope").unwrap();
             zw.finish().unwrap();
         }
@@ -351,9 +350,11 @@ mod tests {
         let mut buf = Vec::new();
         {
             let mut zw = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
-            zw.start_file("a.json", SimpleFileOptions::default()).unwrap();
+            zw.start_file("a.json", SimpleFileOptions::default())
+                .unwrap();
             zw.write_all(b"[{\"a\":1},{\"a\":2}]").unwrap();
-            zw.start_file("b.jsonl", SimpleFileOptions::default()).unwrap();
+            zw.start_file("b.jsonl", SimpleFileOptions::default())
+                .unwrap();
             zw.write_all(b"{\"a\":3}\n").unwrap();
             zw.finish().unwrap();
         }
@@ -369,9 +370,11 @@ mod tests {
         let mut buf = Vec::new();
         {
             let mut zw = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
-            zw.start_file("a.jsonl", SimpleFileOptions::default()).unwrap();
+            zw.start_file("a.jsonl", SimpleFileOptions::default())
+                .unwrap();
             zw.write_all(b"{\"a\":1}").unwrap(); // no trailing newline
-            zw.start_file("b.jsonl", SimpleFileOptions::default()).unwrap();
+            zw.start_file("b.jsonl", SimpleFileOptions::default())
+                .unwrap();
             zw.write_all(b"{\"a\":2}\n").unwrap();
             zw.finish().unwrap();
         }

@@ -278,8 +278,7 @@ mod tests {
 
     #[test]
     fn empty_row_groups_yield_whole_file_morsel() {
-        let morsels =
-            group_row_groups_into_morsels("s3://b/f.parquet", 1000, &[], 128, 256, 4);
+        let morsels = group_row_groups_into_morsels("s3://b/f.parquet", 1000, &[], 128, 256, 4);
         assert_eq!(morsels.len(), 1);
         assert_eq!(morsels[0].row_group_start, 0);
         assert!(morsels[0].row_group_end.is_none());
@@ -289,18 +288,18 @@ mod tests {
     #[test]
     fn byte_morsels_split_large_file() {
         let mb = 1024 * 1024u64;
-        let morsels = plan_file_byte_morsels(
-            "s3://b/big.parquet",
-            500 * mb,
-            128 * mb,
-            256 * mb,
-            4,
-            true,
+        let morsels =
+            plan_file_byte_morsels("s3://b/big.parquet", 500 * mb, 128 * mb, 256 * mb, 4, true);
+        assert!(
+            morsels.len() >= 3,
+            "expected multiple morsels, got {}",
+            morsels.len()
         );
-        assert!(morsels.len() >= 3, "expected multiple morsels, got {}", morsels.len());
         let total: u64 = morsels.iter().map(|m| m.compressed_bytes_estimate).sum();
         assert_eq!(total, 500 * mb);
-        assert!(morsels.iter().all(|m| m.start_byte.is_some() && m.end_byte.is_some()));
+        assert!(morsels
+            .iter()
+            .all(|m| m.start_byte.is_some() && m.end_byte.is_some()));
         // Ranges must be contiguous and non-overlapping.
         let mut cursor = 0u64;
         for m in &morsels {
@@ -337,7 +336,10 @@ mod tests {
         // small = 1, large = at least 2
         assert!(morsels.len() >= 3);
         assert_eq!(
-            morsels.iter().filter(|m| m.file_path.contains("small")).count(),
+            morsels
+                .iter()
+                .filter(|m| m.file_path.contains("small"))
+                .count(),
             1
         );
     }

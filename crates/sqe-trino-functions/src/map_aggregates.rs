@@ -29,9 +29,7 @@
 
 use std::sync::Arc;
 
-use arrow::array::{
-    Array, ArrayRef, ListArray, MapArray, StructArray,
-};
+use arrow::array::{Array, ArrayRef, ListArray, MapArray, StructArray};
 use arrow::buffer::OffsetBuffer;
 use arrow::datatypes::{DataType, Field, FieldRef, Fields};
 use datafusion::common::{Result as DFResult, ScalarValue};
@@ -121,24 +119,16 @@ fn materialize_kv_arrays(
     let keys: ArrayRef = if entries.is_empty() {
         arrow::array::new_empty_array(key_type)
     } else {
-        ScalarValue::iter_to_array(entries.iter().map(|(k, _)| k.clone())).map_err(
-            |e| {
-                DataFusionError::Execution(format!(
-                    "map aggregate: failed to materialize keys: {e}"
-                ))
-            },
-        )?
+        ScalarValue::iter_to_array(entries.iter().map(|(k, _)| k.clone())).map_err(|e| {
+            DataFusionError::Execution(format!("map aggregate: failed to materialize keys: {e}"))
+        })?
     };
     let values: ArrayRef = if entries.is_empty() {
         arrow::array::new_empty_array(value_type)
     } else {
-        ScalarValue::iter_to_array(entries.iter().map(|(_, v)| v.clone())).map_err(
-            |e| {
-                DataFusionError::Execution(format!(
-                    "map aggregate: failed to materialize values: {e}"
-                ))
-            },
-        )?
+        ScalarValue::iter_to_array(entries.iter().map(|(_, v)| v.clone())).map_err(|e| {
+            DataFusionError::Execution(format!("map aggregate: failed to materialize values: {e}"))
+        })?
     };
     Ok((keys, values))
 }
@@ -276,11 +266,7 @@ impl Accumulator for MapAggAccumulator {
             vec![keys, values],
             None,
         );
-        let item_field = Arc::new(Field::new(
-            "item",
-            entries_struct.data_type().clone(),
-            true,
-        ));
+        let item_field = Arc::new(Field::new("item", entries_struct.data_type().clone(), true));
         let offsets = OffsetBuffer::new(vec![0i32, self.entries.len() as i32].into());
         let list = ListArray::new(item_field, offsets, Arc::new(entries_struct), None);
         Ok(vec![ScalarValue::List(Arc::new(list))])
@@ -331,8 +317,7 @@ impl AggregateUDFImpl for MultimapAgg {
                 args.len()
             )));
         }
-        let value_array_type =
-            DataType::List(Arc::new(Field::new("item", args[1].clone(), true)));
+        let value_array_type = DataType::List(Arc::new(Field::new("item", args[1].clone(), true)));
         Ok(map_type_for(&args[0], &value_array_type))
     }
     fn accumulator(&self, acc_args: AccumulatorArgs) -> DFResult<Box<dyn Accumulator>> {
@@ -411,12 +396,13 @@ impl Accumulator for MultimapAggAccumulator {
         let keys: ArrayRef = if n_keys == 0 {
             arrow::array::new_empty_array(&self.key_type)
         } else {
-            ScalarValue::iter_to_array(self.entries.iter().map(|(k, _)| k.clone()))
-                .map_err(|e| {
+            ScalarValue::iter_to_array(self.entries.iter().map(|(k, _)| k.clone())).map_err(
+                |e| {
                     DataFusionError::Execution(format!(
                         "multimap_agg: keys materialize failed: {e}"
                     ))
-                })?
+                },
+            )?
         };
 
         // Flatten all per-key Vec<V> into a single contiguous values array,
@@ -433,9 +419,7 @@ impl Accumulator for MultimapAggAccumulator {
             arrow::array::new_empty_array(&self.value_type)
         } else {
             ScalarValue::iter_to_array(flat_values).map_err(|e| {
-                DataFusionError::Execution(format!(
-                    "multimap_agg: values materialize failed: {e}"
-                ))
+                DataFusionError::Execution(format!("multimap_agg: values materialize failed: {e}"))
             })?
         };
         let values_list: ArrayRef = Arc::new(ListArray::new(
@@ -454,9 +438,7 @@ impl Accumulator for MultimapAggAccumulator {
             + self
                 .entries
                 .iter()
-                .map(|(k, vs)| {
-                    k.size() + vs.iter().map(ScalarValue::size).sum::<usize>()
-                })
+                .map(|(k, vs)| k.size() + vs.iter().map(ScalarValue::size).sum::<usize>())
                 .sum::<usize>()
     }
 
@@ -502,11 +484,7 @@ impl Accumulator for MultimapAggAccumulator {
             vec![keys_arr, values_arr],
             None,
         );
-        let item_field = Arc::new(Field::new(
-            "item",
-            entries_struct.data_type().clone(),
-            true,
-        ));
+        let item_field = Arc::new(Field::new("item", entries_struct.data_type().clone(), true));
         let offsets = OffsetBuffer::new(vec![0i32, n as i32].into());
         let list = ListArray::new(item_field, offsets, Arc::new(entries_struct), None);
         Ok(vec![ScalarValue::List(Arc::new(list))])
@@ -571,8 +549,7 @@ impl AggregateUDFImpl for MapUnion {
         }))
     }
     fn state_fields(&self, args: StateFieldsArgs) -> DFResult<Vec<FieldRef>> {
-        let (key_type, value_type) =
-            decompose_map_type(args.input_fields[0].data_type())?;
+        let (key_type, value_type) = decompose_map_type(args.input_fields[0].data_type())?;
         Ok(vec![flat_state_field(
             format_state_name(args.name, "entries"),
             key_type,
@@ -611,15 +588,12 @@ impl Accumulator for MapUnionAccumulator {
                 args.len()
             )));
         }
-        let map_array = args[0]
-            .as_any()
-            .downcast_ref::<MapArray>()
-            .ok_or_else(|| {
-                DataFusionError::Plan(format!(
-                    "map_union: input must be a MAP, got {:?}",
-                    args[0].data_type()
-                ))
-            })?;
+        let map_array = args[0].as_any().downcast_ref::<MapArray>().ok_or_else(|| {
+            DataFusionError::Plan(format!(
+                "map_union: input must be a MAP, got {:?}",
+                args[0].data_type()
+            ))
+        })?;
         for i in 0..map_array.len() {
             if map_array.is_null(i) {
                 continue;
@@ -629,9 +603,7 @@ impl Accumulator for MapUnionAccumulator {
                 .as_any()
                 .downcast_ref::<StructArray>()
                 .ok_or_else(|| {
-                    DataFusionError::Internal(
-                        "map_union: map entries are not a StructArray".into(),
-                    )
+                    DataFusionError::Internal("map_union: map entries are not a StructArray".into())
                 })?;
             let keys = s.column(0);
             let values = s.column(1);
@@ -675,11 +647,7 @@ impl Accumulator for MapUnionAccumulator {
             vec![keys, values],
             None,
         );
-        let item_field = Arc::new(Field::new(
-            "item",
-            entries_struct.data_type().clone(),
-            true,
-        ));
+        let item_field = Arc::new(Field::new("item", entries_struct.data_type().clone(), true));
         let offsets = OffsetBuffer::new(vec![0i32, self.entries.len() as i32].into());
         let list = ListArray::new(item_field, offsets, Arc::new(entries_struct), None);
         Ok(vec![ScalarValue::List(Arc::new(list))])
@@ -739,11 +707,14 @@ fn merge_flat_state(
             continue;
         }
         let entries = list.value(i);
-        let s = entries.as_any().downcast_ref::<StructArray>().ok_or_else(|| {
-            DataFusionError::Internal(
-                "map aggregate merge_batch list element is not a StructArray".into(),
-            )
-        })?;
+        let s = entries
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .ok_or_else(|| {
+                DataFusionError::Internal(
+                    "map aggregate merge_batch list element is not a StructArray".into(),
+                )
+            })?;
         let keys = s.column(0);
         let values = s.column(1);
         for j in 0..keys.len() {

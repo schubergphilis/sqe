@@ -15,7 +15,9 @@
 
 use std::sync::Arc;
 
-use arrow::array::{new_null_array, Array, ArrayRef, AsArray, BooleanArray, BooleanBuilder, Int64Array};
+use arrow::array::{
+    new_null_array, Array, ArrayRef, AsArray, BooleanArray, BooleanBuilder, Int64Array,
+};
 use arrow::buffer::NullBuffer;
 use arrow::compute::kernels::zip::zip;
 use arrow::compute::{nullif, take, take_arrays};
@@ -114,16 +116,17 @@ fn list_element_lambda_params(
 }
 
 /// Shared: the result is a nullable-aware boolean scalar per row.
-fn boolean_return_field(
-    name: &str,
-    args: HigherOrderReturnFieldArgs,
-) -> DFResult<Arc<Field>> {
+fn boolean_return_field(name: &str, args: HigherOrderReturnFieldArgs) -> DFResult<Arc<Field>> {
     let [ValueOrLambda::Value(list), _] = take_function_args(name, args.arg_fields)? else {
         return Err(DataFusionError::Plan(format!(
             "{name} expects a value as first argument"
         )));
     };
-    Ok(Arc::new(Field::new("", DataType::Boolean, list.is_nullable())))
+    Ok(Arc::new(Field::new(
+        "",
+        DataType::Boolean,
+        list.is_nullable(),
+    )))
 }
 
 /// Shared evaluation: run the predicate lambda over the flattened list values,
@@ -435,7 +438,9 @@ impl HigherOrderUDFImpl for ArrayReduce {
 
         let acc_now = Arc::clone(&acc);
         let acc_cl = || Ok(Arc::clone(&acc_now));
-        let result = finish.evaluate(&[&acc_cl], identity_spread)?.into_array(n)?;
+        let result = finish
+            .evaluate(&[&acc_cl], identity_spread)?
+            .into_array(n)?;
 
         // NULL array row produces a NULL result, regardless of the finish lambda.
         let list_is_null: BooleanArray = (0..n).map(|r| Some(list_array.is_null(r))).collect();
@@ -539,12 +544,14 @@ mod tests {
         );
         // A true element dominates a NULL: false.
         assert_eq!(
-            one_bool("SELECT none_match(make_array(2, CAST(NULL AS bigint)), x -> x % 2 = 0)").await,
+            one_bool("SELECT none_match(make_array(2, CAST(NULL AS bigint)), x -> x % 2 = 0)")
+                .await,
             Some(false)
         );
         // No true, but a NULL predicate result: NULL.
         assert_eq!(
-            one_bool("SELECT none_match(make_array(1, CAST(NULL AS bigint)), x -> x % 2 = 0)").await,
+            one_bool("SELECT none_match(make_array(1, CAST(NULL AS bigint)), x -> x % 2 = 0)")
+                .await,
             None
         );
     }
@@ -565,7 +572,11 @@ mod tests {
         let ctx = crate::duckdb_test_ctx();
         register_match_predicates(&ctx);
         let b = ctx.sql(sql).await.unwrap().collect().await.unwrap();
-        let a = b[0].column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        let a = b[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
         if a.is_null(0) {
             None
         } else {

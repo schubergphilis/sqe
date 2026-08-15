@@ -32,7 +32,9 @@ use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
 use iceberg::writer::file_writer::ParquetWriterBuilder;
 use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
 use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation, TableIdent};
-use iceberg_catalog_rest::{RestCatalogBuilder, REST_CATALOG_PROP_URI, REST_CATALOG_PROP_WAREHOUSE};
+use iceberg_catalog_rest::{
+    RestCatalogBuilder, REST_CATALOG_PROP_URI, REST_CATALOG_PROP_WAREHOUSE,
+};
 use parquet::file::properties::WriterProperties;
 use tokio::sync::{Mutex, Semaphore};
 
@@ -185,8 +187,7 @@ impl Unit {
             )),
             ("transaction", Some(d)) => {
                 let day = plan.start_day + d as i32;
-                let t_id_start =
-                    d as i64 * plan.txn_rows_per_day as i64 + self.rows.start as i64;
+                let t_id_start = d as i64 * plan.txn_rows_per_day as i64 + self.rows.start as i64;
                 Box::new(bank::transaction_day_shard(
                     day,
                     self.rows.end - self.rows.start,
@@ -341,7 +342,10 @@ async fn ensure_table(
         schema_to_arrow_schema(table.metadata().current_schema())
             .with_context(|| format!("deriving {name} write schema"))?,
     );
-    Ok(TableCtx { table, write_schema })
+    Ok(TableCtx {
+        table,
+        write_schema,
+    })
 }
 
 /// Create the namespace and any missing bank tables; return handles.
@@ -410,11 +414,8 @@ async fn write_shard(
     let table = &table_ctx.table;
     let location_gen = DefaultLocationGenerator::new(table.metadata().clone())
         .context("building location generator")?;
-    let file_name_gen = DefaultFileNameGenerator::new(
-        file_prefix,
-        None,
-        iceberg::spec::DataFileFormat::Parquet,
-    );
+    let file_name_gen =
+        DefaultFileNameGenerator::new(file_prefix, None, iceberg::spec::DataFileFormat::Parquet);
     let parquet_builder = ParquetWriterBuilder::new(
         writer_props.clone(),
         table.metadata().current_schema().clone(),
@@ -625,8 +626,8 @@ pub async fn run_bank(
         );
     }
 
-    let mut props_builder = WriterProperties::builder()
-        .set_compression(config.compression.to_parquet());
+    let mut props_builder =
+        WriterProperties::builder().set_compression(config.compression.to_parquet());
     if let Some(rgs) = config.row_group_size {
         props_builder = props_builder.set_max_row_group_row_count(Some(rgs));
     }
@@ -641,11 +642,7 @@ pub async fn run_bank(
     });
     let sem = Arc::new(Semaphore::new(config.threads.max(1)));
 
-    let mut groups: Vec<(
-        &'static str,
-        Option<i32>,
-        Vec<Unit>,
-    )> = Vec::new();
+    let mut groups: Vec<(&'static str, Option<i32>, Vec<Unit>)> = Vec::new();
 
     if !dims_done {
         for (name, rows) in [
@@ -926,14 +923,12 @@ mod tests {
                 let src = gen
                     .generate_batches(&table_def.name, 0.01, &config)
                     .unwrap_or_else(|e| {
-                        panic!(
-                            "{bench}.{}: generate_batches failed: {e}",
-                            table_def.name
-                        )
+                        panic!("{bench}.{}: generate_batches failed: {e}", table_def.name)
                     });
-                let shard = src.shards.into_iter().next().unwrap_or_else(|| {
-                    panic!("{bench}.{}: no shards produced", table_def.name)
-                });
+                let shard =
+                    src.shards.into_iter().next().unwrap_or_else(|| {
+                        panic!("{bench}.{}: no shards produced", table_def.name)
+                    });
                 let batch = (shard.make)().next().unwrap_or_else(|| {
                     panic!(
                         "{bench}.{}: shard produced zero batches at scale 0.01",

@@ -96,11 +96,10 @@ mod tests {
     fn admit_three_classes() {
         let gov = Arc::new(MemoryGovernor::new(48 * 1024 * 1024));
         let live = Arc::new(LiveConsumerRegistry::new());
-        let (_j, gj) = admit_join(&gov, &live, "q", "j0", 16 * 1024 * 1024, 2 * 1024 * 1024)
-            .expect("join");
-        let (_a, ga) =
-            admit_aggregate(&gov, &live, "q", "a0", 16 * 1024 * 1024, 2 * 1024 * 1024)
-                .expect("agg");
+        let (_j, gj) =
+            admit_join(&gov, &live, "q", "j0", 16 * 1024 * 1024, 2 * 1024 * 1024).expect("join");
+        let (_a, ga) = admit_aggregate(&gov, &live, "q", "a0", 16 * 1024 * 1024, 2 * 1024 * 1024)
+            .expect("agg");
         let (_s, gs) =
             admit_sort(&gov, &live, "q", "s0", 16 * 1024 * 1024, 2 * 1024 * 1024).expect("sort");
         assert_eq!(live.len(), 3);

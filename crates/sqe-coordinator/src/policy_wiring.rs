@@ -39,9 +39,9 @@ pub fn build_policy_enforcer(
 
     let store: Option<Arc<dyn PolicyStore>> = match config.engine {
         PolicyEngine::Passthrough => None,
-        PolicyEngine::InMemory => {
-            Some(Arc::new(sqe_policy::policy_store::InMemoryPolicyStore::new()))
-        }
+        PolicyEngine::InMemory => Some(Arc::new(
+            sqe_policy::policy_store::InMemoryPolicyStore::new(),
+        )),
         PolicyEngine::Ranger => {
             let rc = &config.ranger;
             if rc.url.is_empty() {
@@ -85,9 +85,8 @@ pub fn build_policy_enforcer(
             // `NoopTagSource` (already the default; this block is explicit for
             // clarity).
             if let Some(cache) = table_cache {
-                let tag_src = Arc::new(crate::tag_source_impl::CacheTagSource::new(
-                    Arc::new(cache),
-                ));
+                let tag_src =
+                    Arc::new(crate::tag_source_impl::CacheTagSource::new(Arc::new(cache)));
                 rewriter = rewriter.with_tag_source(tag_src);
             }
             // else: NoopTagSource stays (set in PolicyPlanRewriter::new).
@@ -102,9 +101,7 @@ pub fn build_policy_enforcer(
 /// Shared by both coordinator binaries (`main.rs`, `bin/sqe_server.rs`) and by
 /// the access-control e2e test, for the same reason `build_policy_enforcer` is
 /// shared: three copies of this wiring would drift.
-pub fn build_grant_backend(
-    config: &SqeConfig,
-) -> anyhow::Result<Option<Arc<dyn GrantBackend>>> {
+pub fn build_grant_backend(config: &SqeConfig) -> anyhow::Result<Option<Arc<dyn GrantBackend>>> {
     use sqe_core::config::AccessControlBackend;
     match config.access_control.backend {
         AccessControlBackend::Chameleon if !config.access_control.url.is_empty() => {
@@ -316,8 +313,7 @@ catalog_url = "http://localhost:59997"
         };
         config.ranger.url = "http://ranger.example:6080".to_string();
         let metrics = std::sync::Arc::new(sqe_metrics::MetricsRegistry::new().unwrap());
-        let (_enforcer, store) =
-            build_policy_enforcer(&config, None, Some(metrics)).unwrap();
+        let (_enforcer, store) = build_policy_enforcer(&config, None, Some(metrics)).unwrap();
         assert!(store.is_some());
     }
 }

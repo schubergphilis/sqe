@@ -159,7 +159,12 @@ fn trino_type_to_arrow(type_name: &str) -> DataType {
         "integer" | "int" | "tinyint" | "smallint" => DataType::Int32,
         "bigint" => DataType::Int64,
         "double" | "real" | "float" => DataType::Float64,
-        "varchar" | "char" | "varbinary" | "json" | "uuid" | "interval year to month"
+        "varchar"
+        | "char"
+        | "varbinary"
+        | "json"
+        | "uuid"
+        | "interval year to month"
         | "interval day to second" => DataType::Utf8,
         "date" => DataType::Date32,
         "decimal" => DataType::Float64, // simplified — no fixed-point in arrow_array basic API
@@ -184,11 +189,7 @@ fn build_array(
         DataType::Int32 => {
             let vals: Vec<Option<i32>> = rows
                 .iter()
-                .map(|row| {
-                    row.get(col_idx)
-                        .and_then(|v| v.as_i64())
-                        .map(|n| n as i32)
-                })
+                .map(|row| row.get(col_idx).and_then(|v| v.as_i64()).map(|n| n as i32))
                 .collect();
             Ok(Arc::new(Int32Array::from(vals)))
         }
@@ -232,10 +233,7 @@ fn build_array(
                     })
                 })
                 .collect();
-            let refs: Vec<Option<&str>> = vals
-                .iter()
-                .map(|o| o.as_deref())
-                .collect();
+            let refs: Vec<Option<&str>> = vals.iter().map(|o| o.as_deref()).collect();
             Ok(Arc::new(StringArray::from(refs)))
         }
     }

@@ -137,8 +137,8 @@ async fn jdbc_attach_roundtrip_against_live_postgres() {
     // so the trait methods are already reachable through the trait object.
     use iceberg::NamespaceIdent;
 
-    let host = std::env::var("SQE_TEST_PG_HOSTPORT")
-        .unwrap_or_else(|_| "localhost:15432".to_string());
+    let host =
+        std::env::var("SQE_TEST_PG_HOSTPORT").unwrap_or_else(|_| "localhost:15432".to_string());
     let warehouse = std::env::var("SQE_TEST_PG_WAREHOUSE")
         .unwrap_or_else(|_| "/tmp/sqe-jdbc-attach-warehouse".to_string());
     std::fs::create_dir_all(&warehouse).expect("warehouse dir");
@@ -184,7 +184,10 @@ async fn jdbc_attach_roundtrip_against_live_postgres() {
         .await
         .expect("create_namespace through the attached catalog");
     assert!(
-        catalog.namespace_exists(&ns).await.expect("namespace_exists"),
+        catalog
+            .namespace_exists(&ns)
+            .await
+            .expect("namespace_exists"),
         "the namespace just created must be visible"
     );
     catalog.drop_namespace(&ns).await.expect("drop_namespace");

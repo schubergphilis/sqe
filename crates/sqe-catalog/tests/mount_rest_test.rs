@@ -37,8 +37,8 @@ async fn polaris_requests_preserve_the_incoming_trace_id() {
     opentelemetry::global::set_text_map_propagator(TraceContextPropagator::new());
     let provider = SdkTracerProvider::builder().build();
     let tracer = provider.tracer("polaris-propagation-test");
-    let subscriber = tracing_subscriber::registry()
-        .with(tracing_opentelemetry::layer().with_tracer(tracer));
+    let subscriber =
+        tracing_subscriber::registry().with(tracing_opentelemetry::layer().with_tracer(tracer));
     let _subscriber = tracing::subscriber::set_default(subscriber);
 
     let server = MockServer::start().await;

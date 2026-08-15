@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow_array::builder::StringBuilder;
 use arrow_array::{ArrayRef, RecordBatch};
+use async_trait::async_trait;
 use datafusion::catalog::SchemaProvider;
 use datafusion::datasource::{MemTable, TableProvider};
 use datafusion::error::Result as DFResult;
@@ -40,13 +40,14 @@ impl MetadataSchemaProvider {
 impl std::fmt::Debug for MetadataSchemaProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let names: Vec<&str> = self.catalogs.iter().map(|e| e.name.as_str()).collect();
-        f.debug_struct("MetadataSchemaProvider").field("catalogs", &names).finish()
+        f.debug_struct("MetadataSchemaProvider")
+            .field("catalogs", &names)
+            .finish()
     }
 }
 
 #[async_trait]
 impl SchemaProvider for MetadataSchemaProvider {
-
     fn table_names(&self) -> Vec<String> {
         vec![
             "catalogs".into(),
@@ -347,11 +348,9 @@ mod tests {
     #[test]
     fn test_catalogs_table_lists_every_reachable_catalog() {
         // One row per reachable catalog, not just the default. (#5)
-        let table = build_catalogs_table(&[
-            "main_warehouse".to_string(),
-            "ws_energy_co".to_string(),
-        ])
-        .unwrap();
+        let table =
+            build_catalogs_table(&["main_warehouse".to_string(), "ws_energy_co".to_string()])
+                .unwrap();
         assert_eq!(table.schema().fields().len(), 2);
     }
 
@@ -366,12 +365,16 @@ mod tests {
     #[test]
     fn test_namespace_to_string_single_level() {
         let ns = NamespaceIdent::new("my_schema".to_string());
-        assert_eq!(MetadataSchemaProvider::namespace_to_string(&ns), "my_schema");
+        assert_eq!(
+            MetadataSchemaProvider::namespace_to_string(&ns),
+            "my_schema"
+        );
     }
 
     #[test]
     fn test_namespace_to_string_multi_level() {
-        let ns = NamespaceIdent::from_vec(vec!["level1".to_string(), "level2".to_string()]).unwrap();
+        let ns =
+            NamespaceIdent::from_vec(vec!["level1".to_string(), "level2".to_string()]).unwrap();
         assert_eq!(
             MetadataSchemaProvider::namespace_to_string(&ns),
             "level1.level2"

@@ -28,7 +28,11 @@ async fn rewrite_and_run(input: &str) -> String {
         .await
         .unwrap_or_else(|e| panic!("execution failed for `{rewritten}` (from `{input}`): {e}"));
     assert_eq!(batches.len(), 1, "expected one batch for `{rewritten}`");
-    assert_eq!(batches[0].num_rows(), 1, "expected one row for `{rewritten}`");
+    assert_eq!(
+        batches[0].num_rows(),
+        1,
+        "expected one row for `{rewritten}`"
+    );
     let col = batches[0].column(0);
     format!("{:?}", col.data_type())
 }
@@ -44,8 +48,7 @@ async fn run_int_query(values: Vec<i64>, input: &str) -> Vec<i64> {
 
     let ctx = SessionContext::new();
     let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]));
-    let batch =
-        RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(values))]).unwrap();
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(values))]).unwrap();
     ctx.register_batch("t", batch).unwrap();
 
     let rewritten = rewrite_trino_compat(input);
@@ -132,7 +135,11 @@ async fn fetch_with_ties_order_column_absent_from_select() {
         }
     }
     got.sort_unstable();
-    assert_eq!(got, vec![100, 200, 300], "WITH TIES keeps the tied row by rank");
+    assert_eq!(
+        got,
+        vec![100, 200, 300],
+        "WITH TIES keeps the tied row by rank"
+    );
 }
 
 #[tokio::test]
@@ -143,7 +150,11 @@ async fn fetch_first_only_executes_as_limit() {
         "SELECT k FROM t ORDER BY k FETCH FIRST 2 ROWS ONLY",
     )
     .await;
-    assert_eq!(got.len(), 2, "ONLY -> LIMIT 2 returns exactly two rows: {got:?}");
+    assert_eq!(
+        got.len(),
+        2,
+        "ONLY -> LIMIT 2 returns exactly two rows: {got:?}"
+    );
 }
 
 #[tokio::test]
@@ -244,7 +255,11 @@ async fn ctas_column_alias_list_renames_output_columns() {
         "x",
     )
     .await;
-    assert_eq!(got, vec![10, 30], "alias `x` must resolve to VALUES column 0");
+    assert_eq!(
+        got,
+        vec![10, 30],
+        "alias `x` must resolve to VALUES column 0"
+    );
 }
 
 #[tokio::test]
@@ -257,7 +272,10 @@ async fn ctas_with_no_data_creates_empty_table() {
         "a",
     )
     .await;
-    assert!(got.is_empty(), "WITH NO DATA must yield zero rows, got {got:?}");
+    assert!(
+        got.is_empty(),
+        "WITH NO DATA must yield zero rows, got {got:?}"
+    );
 }
 
 #[tokio::test]
@@ -278,7 +296,10 @@ async fn uuid_literal_executes_as_string() {
     // UUID"). The compat rewrite turns it into a plain string literal (SQE
     // stores UUID as Utf8), so it plans and executes as a string column.
     let dt = rewrite_and_run("SELECT UUID 'bdeb4567-89ab-cdef-0123-456789abcdef'").await;
-    assert!(dt.starts_with("Utf8"), "UUID literal should yield a Utf8 column, got: {dt}");
+    assert!(
+        dt.starts_with("Utf8"),
+        "UUID literal should yield a Utf8 column, got: {dt}"
+    );
 }
 
 #[tokio::test]
@@ -286,7 +307,10 @@ async fn cast_as_uuid_executes_as_string() {
     // #326: CAST(.. AS uuid) is likewise rejected by DataFusion; the compat
     // rewrite maps it to VARCHAR. Locks in that the read path works.
     let dt = rewrite_and_run("SELECT CAST('bdeb4567-89ab-cdef-0123-456789abcdef' AS uuid)").await;
-    assert!(dt.starts_with("Utf8"), "CAST AS uuid should yield a Utf8 column, got: {dt}");
+    assert!(
+        dt.starts_with("Utf8"),
+        "CAST AS uuid should yield a Utf8 column, got: {dt}"
+    );
 }
 
 #[tokio::test]
@@ -305,7 +329,13 @@ async fn ctas_with_uuid_value_materializes() {
         .collect()
         .await
         .unwrap_or_else(|e| panic!("CTAS execution failed for `{ctas}`: {e}"));
-    let batches = ctx.sql("SELECT c FROM u").await.unwrap().collect().await.unwrap();
+    let batches = ctx
+        .sql("SELECT c FROM u")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
     // CAST(.. AS varchar) yields a Utf8View column; the uuid is stored as its
     // string representation.
     let col = batches[0]
@@ -336,6 +366,12 @@ async fn cast_row_to_named_row_executes_as_named_struct() {
         "named-row cast should yield a Struct column, got: {dt}"
     );
     // The declared field names must survive into the struct schema.
-    assert!(dt.contains("\"x\""), "field x missing from struct type: {dt}");
-    assert!(dt.contains("\"y\""), "field y missing from struct type: {dt}");
+    assert!(
+        dt.contains("\"x\""),
+        "field x missing from struct type: {dt}"
+    );
+    assert!(
+        dt.contains("\"y\""),
+        "field y missing from struct type: {dt}"
+    );
 }

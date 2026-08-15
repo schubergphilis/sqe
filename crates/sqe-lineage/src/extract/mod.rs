@@ -6,8 +6,8 @@
 //! return empty input/output lists so the emitter can run end-to-end with
 //! real channel + sinks plumbing.
 
-pub mod datasets;
 pub mod columns;
+pub mod datasets;
 
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::logical_expr::{DmlStatement, TableScan};
@@ -138,7 +138,12 @@ fn build_column_lineage_facet(
                 transformations: vec![d.transformation.clone()],
             })
             .collect();
-        map.insert(name.clone(), ColumnLineageEntry { inputFields: inputs });
+        map.insert(
+            name.clone(),
+            ColumnLineageEntry {
+                inputFields: inputs,
+            },
+        );
     }
     ColumnLineageFacet { fields: map }
 }

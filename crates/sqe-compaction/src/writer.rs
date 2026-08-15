@@ -65,11 +65,7 @@ impl TrackingLocationGenerator {
 }
 
 impl LocationGenerator for TrackingLocationGenerator {
-    fn generate_location(
-        &self,
-        partition_key: Option<&PartitionKey>,
-        file_name: &str,
-    ) -> String {
+    fn generate_location(&self, partition_key: Option<&PartitionKey>, file_name: &str) -> String {
         let path = self.inner.generate_location(partition_key, file_name);
         if let Ok(mut paths) = self.tracker.lock() {
             paths.push(path.clone());
@@ -339,15 +335,11 @@ pub async fn write_data_files_streaming(
         let mut writer = data_file_writer_builder
             .build(partition_key)
             .await
-            .map_err(|e| {
-                SqeError::Execution(format!(
-                    "Failed to build data file writer: {e}"
-                ))
-            })?;
+            .map_err(|e| SqeError::Execution(format!("Failed to build data file writer: {e}")))?;
 
         while let Some(batch_result) = stream.next().await {
-            let batch = batch_result
-                .map_err(|e| SqeError::Execution(format!("Stream error: {e}")))?;
+            let batch =
+                batch_result.map_err(|e| SqeError::Execution(format!("Stream error: {e}")))?;
             if batch.num_rows() == 0 {
                 continue;
             }
@@ -385,11 +377,7 @@ pub async fn write_data_files_streaming(
             iceberg_schema.clone(),
             partition_spec.clone(),
         )
-        .map_err(|e| {
-            SqeError::Execution(format!(
-                "Failed to build partition splitter: {e}"
-            ))
-        })?;
+        .map_err(|e| SqeError::Execution(format!("Failed to build partition splitter: {e}")))?;
 
         if fanout.is_bounded() {
             // Memory-bounded path: SQE's BoundedFanoutWriter caps open writers
@@ -405,8 +393,8 @@ pub async fn write_data_files_streaming(
                 None,
             );
             while let Some(batch_result) = stream.next().await {
-                let batch = batch_result
-                    .map_err(|e| SqeError::Execution(format!("Stream error: {e}")))?;
+                let batch =
+                    batch_result.map_err(|e| SqeError::Execution(format!("Stream error: {e}")))?;
                 if batch.num_rows() == 0 {
                     continue;
                 }
@@ -440,16 +428,17 @@ pub async fn write_data_files_streaming(
             );
 
             while let Some(batch_result) = stream.next().await {
-                let batch = batch_result
-                    .map_err(|e| SqeError::Execution(format!("Stream error: {e}")))?;
+                let batch =
+                    batch_result.map_err(|e| SqeError::Execution(format!("Stream error: {e}")))?;
                 if batch.num_rows() == 0 {
                     continue;
                 }
                 let stamped = apply_stamped_schema(batch, &stamped_schema)?;
                 total_rows += stamped.num_rows();
-                writer.write(stamped).await.map_err(|e| {
-                    SqeError::Execution(format!("Partitioned write error: {e}"))
-                })?;
+                writer
+                    .write(stamped)
+                    .await
+                    .map_err(|e| SqeError::Execution(format!("Partitioned write error: {e}")))?;
                 if let Some(p) = progress.as_mut() {
                     p.on_batch(total_rows as u64);
                 }
@@ -469,17 +458,13 @@ pub async fn write_data_files_streaming(
             writer
                 .close()
                 .await
-                .map_err(|e| SqeError::Execution(format!(
-                    "Close partitioned writer error: {e}"
-                )))?
+                .map_err(|e| SqeError::Execution(format!("Close partitioned writer error: {e}")))?
         }
     };
 
     info!(
         file_count = data_files.len(),
-        total_rows,
-        file_prefix,
-        "Data files written successfully (streaming)"
+        total_rows, file_prefix, "Data files written successfully (streaming)"
     );
 
     Ok((data_files, total_rows))
@@ -499,10 +484,8 @@ pub fn new_upload_tracker() -> UploadedPaths {
 /// batches to be present -- it marks all columns as nullable (the safe
 /// default for Iceberg) and takes types from the Iceberg schema directly.
 fn build_stamped_schema(iceberg_schema: &IcebergSchema) -> sqe_core::Result<Arc<ArrowSchema>> {
-    let expected_arrow_schema =
-        schema_to_arrow_schema(iceberg_schema).map_err(|e| {
-            SqeError::Execution(format!("Failed to derive expected Arrow schema: {e}"))
-        })?;
+    let expected_arrow_schema = schema_to_arrow_schema(iceberg_schema)
+        .map_err(|e| SqeError::Execution(format!("Failed to derive expected Arrow schema: {e}")))?;
 
     let iceberg_fields = iceberg_schema.as_struct().fields();
     let new_fields: Vec<Arc<arrow_schema::Field>> = expected_arrow_schema
@@ -764,10 +747,7 @@ impl<B: IcebergWriterBuilder> BoundedFanoutWriter<B> {
 
     /// Get the open writer for `partition_key`, building a fresh one if this
     /// partition has no open writer (first write, or after a cutover).
-    async fn get_or_open(
-        &mut self,
-        partition_key: &PartitionKey,
-    ) -> sqe_core::Result<&mut B::R> {
+    async fn get_or_open(&mut self, partition_key: &PartitionKey) -> sqe_core::Result<&mut B::R> {
         let key = partition_key.data().clone();
         if !self.open.contains_key(&key) {
             let writer = self
@@ -859,9 +839,7 @@ mod tests {
         )
     }
 
-    fn fanout_splitter(
-        schema: &Arc<IceSchema>,
-    ) -> iceberg::arrow::RecordBatchPartitionSplitter {
+    fn fanout_splitter(schema: &Arc<IceSchema>) -> iceberg::arrow::RecordBatchPartitionSplitter {
         let spec = Arc::new(
             PartitionSpec::builder(schema.clone())
                 .with_spec_id(0)
@@ -879,36 +857,35 @@ mod tests {
 
     fn fanout_builder(dir: &TempDir, schema: Arc<IceSchema>) -> impl IcebergWriterBuilder {
         let file_io = iceberg::io::FileIOBuilder::new_fs_io().build().unwrap();
-        let loc = DefaultLocationGenerator::with_data_location(
-            dir.path().to_str().unwrap().to_string(),
-        );
+        let loc =
+            DefaultLocationGenerator::with_data_location(dir.path().to_str().unwrap().to_string());
         let name = DefaultFileNameGenerator::new(
             "test".to_string(),
             None,
             iceberg::spec::DataFileFormat::Parquet,
         );
         let pqb = ParquetWriterBuilder::new(WriterProperties::builder().build(), schema);
-        let rwb =
-            RollingFileWriterBuilder::new_with_default_file_size(pqb, file_io, loc, name);
+        let rwb = RollingFileWriterBuilder::new_with_default_file_size(pqb, file_io, loc, name);
         DataFileWriterBuilder::new(rwb)
     }
 
     fn region_batch(ids: &[i32], regions: &[&str]) -> RecordBatch {
-        let id_field = arrow_schema::Field::new("id", arrow_schema::DataType::Int32, false)
-            .with_metadata(HashMap::from([(
-                PARQUET_FIELD_ID_META_KEY.to_string(),
-                "1".to_string(),
-            )]));
-        let region_field = arrow_schema::Field::new("region", arrow_schema::DataType::Utf8, false)
-            .with_metadata(HashMap::from([(
-                PARQUET_FIELD_ID_META_KEY.to_string(),
-                "2".to_string(),
-            )]));
+        let id_field =
+            arrow_schema::Field::new("id", arrow_schema::DataType::Int32, false).with_metadata(
+                HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), "1".to_string())]),
+            );
+        let region_field =
+            arrow_schema::Field::new("region", arrow_schema::DataType::Utf8, false).with_metadata(
+                HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), "2".to_string())]),
+            );
         let schema = Arc::new(arrow_schema::Schema::new(vec![id_field, region_field]));
-        RecordBatch::try_new(schema, vec![
-            Arc::new(Int32Array::from(ids.to_vec())),
-            Arc::new(StringArray::from(regions.to_vec())),
-        ])
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(ids.to_vec())),
+                Arc::new(StringArray::from(regions.to_vec())),
+            ],
+        )
         .unwrap()
     }
 
@@ -938,7 +915,10 @@ mod tests {
         // Tiny 256MB pool: cap floors at 8, budget floors at one row-group est.
         let (max_open, budget) = auto_fanout_caps(256 * mb);
         assert_eq!(max_open, 8, "tiny pool floors at 8");
-        assert_eq!(budget, FANOUT_PER_WRITER_EST_BYTES, "budget floors at one writer");
+        assert_eq!(
+            budget, FANOUT_PER_WRITER_EST_BYTES,
+            "budget floors at one writer"
+        );
         // Mid 4GB pool: 4GB/128MB = 32 open, 512MB budget.
         let (max_open, budget) = auto_fanout_caps(4 * gb);
         assert_eq!(max_open, 32);
@@ -947,14 +927,36 @@ mod tests {
 
     #[test]
     fn fanout_limits_gating() {
-        assert!(!FanoutLimits::unbounded().is_bounded(), "default is unbounded");
-        assert!(!FanoutLimits { max_open: 0, byte_budget: 0 }.is_bounded());
-        assert!(FanoutLimits { max_open: 8, byte_budget: 0 }.is_bounded(), "cap only");
         assert!(
-            FanoutLimits { max_open: 0, byte_budget: 1 << 20 }.is_bounded(),
+            !FanoutLimits::unbounded().is_bounded(),
+            "default is unbounded"
+        );
+        assert!(!FanoutLimits {
+            max_open: 0,
+            byte_budget: 0
+        }
+        .is_bounded());
+        assert!(
+            FanoutLimits {
+                max_open: 8,
+                byte_budget: 0
+            }
+            .is_bounded(),
+            "cap only"
+        );
+        assert!(
+            FanoutLimits {
+                max_open: 0,
+                byte_budget: 1 << 20
+            }
+            .is_bounded(),
             "budget only"
         );
-        assert!(FanoutLimits { max_open: 8, byte_budget: 1 << 20 }.is_bounded());
+        assert!(FanoutLimits {
+            max_open: 8,
+            byte_budget: 1 << 20
+        }
+        .is_bounded());
     }
 
     #[tokio::test]
@@ -1053,8 +1055,16 @@ mod tests {
         assert_eq!(w.cutovers(), 2);
         let files = w.close().await.unwrap();
         let per = by_partition(&files);
-        assert_eq!(per[&region_struct("US")], (1, 2), "US never evicted mid-run => 1 file, 2 rows");
-        assert_eq!(per[&region_struct("EU")], (2, 2), "EU evicted then reopened => 2 files");
+        assert_eq!(
+            per[&region_struct("US")],
+            (1, 2),
+            "US never evicted mid-run => 1 file, 2 rows"
+        );
+        assert_eq!(
+            per[&region_struct("EU")],
+            (2, 2),
+            "EU evicted then reopened => 2 files"
+        );
         assert_eq!(per[&region_struct("ASIA")], (1, 1));
         let total: u64 = files.iter().map(|f| f.record_count()).sum();
         assert_eq!(total, 5);
@@ -1122,7 +1132,9 @@ mod tests {
         )]));
         RecordBatch::try_new(
             schema,
-            vec![Arc::new(Int32Array::from((start..start + n).collect::<Vec<_>>()))],
+            vec![Arc::new(Int32Array::from(
+                (start..start + n).collect::<Vec<_>>(),
+            ))],
         )
         .unwrap()
     }
@@ -1179,14 +1191,24 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(total_rows, 30, "progress hooking must not change the write itself");
+        assert_eq!(
+            total_rows, 30,
+            "progress hooking must not change the write itself"
+        );
         assert!(!data_files.is_empty());
         let total_written: u64 = data_files.iter().map(|f| f.record_count()).sum();
         assert_eq!(total_written, 30);
 
         let seen = seen.lock().unwrap();
-        assert_eq!(*seen, vec![12, 24], "must fire at batch 4 (12 rows) and batch 8 (24 rows)");
-        assert!(seen.windows(2).all(|w| w[1] > w[0]), "rows_read must be monotonically increasing");
+        assert_eq!(
+            *seen,
+            vec![12, 24],
+            "must fire at batch 4 (12 rows) and batch 8 (24 rows)"
+        );
+        assert!(
+            seen.windows(2).all(|w| w[1] > w[0]),
+            "rows_read must be monotonically increasing"
+        );
     }
 
     #[tokio::test]

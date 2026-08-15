@@ -50,7 +50,6 @@
 //!    only build the session ctx + probe Polaris when discovery is on AND a
 //!    qualifier is still unknown.
 
-
 use std::sync::Arc;
 
 use chrono::{Duration, Utc};
@@ -66,9 +65,9 @@ fn parse_config(toml: &str) -> SqeConfig {
 
 fn make_handler(config: SqeConfig) -> sqe_coordinator::QueryHandler {
     let policy: Arc<dyn sqe_policy::PolicyEnforcer> = Arc::new(sqe_policy::PassthroughEnforcer);
-    let query_tracker = Arc::new(
-        sqe_coordinator::query_tracker::QueryTracker::new(&config.query_history),
-    );
+    let query_tracker = Arc::new(sqe_coordinator::query_tracker::QueryTracker::new(
+        &config.query_history,
+    ));
     sqe_coordinator::QueryHandler::new(
         policy,
         None,
@@ -340,7 +339,9 @@ async fn seed_discovery_warehouse() {
     match handler
         .execute(
             &session,
-            "CREATE TABLE disc_ns.probe_t AS SELECT 42 as id, 'discovered' as label", None)
+            "CREATE TABLE disc_ns.probe_t AS SELECT 42 as id, 'discovered' as label",
+            None,
+        )
         .await
     {
         Ok(_) => {}
@@ -377,7 +378,9 @@ async fn static_mode_rejects_undeclared_warehouse() {
     let err = handler
         .execute(
             &session,
-            "SELECT id FROM discovery_test_wh.disc_ns.probe_t", None)
+            "SELECT id FROM discovery_test_wh.disc_ns.probe_t",
+            None,
+        )
         .await
         .expect_err("static mode must reject even an existing warehouse not in [catalogs.*]");
 
@@ -414,7 +417,9 @@ async fn polaris_auto_lazy_hit() {
     let batches = handler
         .execute(
             &session,
-            "SELECT id, label FROM discovery_test_wh.disc_ns.probe_t", None)
+            "SELECT id, label FROM discovery_test_wh.disc_ns.probe_t",
+            None,
+        )
         .await
         .expect("polaris-auto should discover the warehouse and return rows");
 
@@ -463,13 +468,17 @@ async fn polaris_auto_mutations_on_discovered_catalog() {
         seed_handler
             .execute(
                 &session,
-                "CREATE TABLE disc_ns.mut_t (id BIGINT, amt BIGINT)", None)
+                "CREATE TABLE disc_ns.mut_t (id BIGINT, amt BIGINT)",
+                None,
+            )
             .await
             .expect("create disc_ns.mut_t in discovery_test_wh");
         seed_handler
             .execute(
                 &session,
-                "INSERT INTO disc_ns.mut_t VALUES (1, 10), (2, 20), (3, 30)", None)
+                "INSERT INTO disc_ns.mut_t VALUES (1, 10), (2, 20), (3, 30)",
+                None,
+            )
             .await
             .expect("insert into disc_ns.mut_t");
     }
@@ -485,14 +494,18 @@ async fn polaris_auto_mutations_on_discovered_catalog() {
     handler
         .execute(
             &session,
-            "UPDATE discovery_test_wh.disc_ns.mut_t SET amt = amt + 1 WHERE id = 1", None)
+            "UPDATE discovery_test_wh.disc_ns.mut_t SET amt = amt + 1 WHERE id = 1",
+            None,
+        )
         .await
         .expect("UPDATE on a discovered-catalog table must succeed (#334)");
 
     handler
         .execute(
             &session,
-            "DELETE FROM discovery_test_wh.disc_ns.mut_t WHERE id = 3", None)
+            "DELETE FROM discovery_test_wh.disc_ns.mut_t WHERE id = 3",
+            None,
+        )
         .await
         .expect("DELETE on a discovered-catalog table must succeed (#334)");
 
@@ -503,7 +516,9 @@ async fn polaris_auto_mutations_on_discovered_catalog() {
     let batches = handler
         .execute(
             &session,
-            "SELECT id, amt FROM discovery_test_wh.disc_ns.mut_t ORDER BY id", None)
+            "SELECT id, amt FROM discovery_test_wh.disc_ns.mut_t ORDER BY id",
+            None,
+        )
         .await
         .expect("read back after mutations");
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
@@ -541,7 +556,9 @@ async fn polaris_auto_mutations_on_discovered_catalog() {
     let _ = handler
         .execute(
             &session,
-            "DROP TABLE IF EXISTS discovery_test_wh.disc_ns.mut_t", None)
+            "DROP TABLE IF EXISTS discovery_test_wh.disc_ns.mut_t",
+            None,
+        )
         .await;
 }
 
@@ -594,7 +611,9 @@ async fn polaris_auto_nonexistent_warehouse_returns_unknown_catalog() {
     let err = handler
         .execute(
             &session,
-            "SELECT * FROM totally_nonexistent_wh_xyz.some_ns.some_tbl", None)
+            "SELECT * FROM totally_nonexistent_wh_xyz.some_ns.some_tbl",
+            None,
+        )
         .await
         .expect_err("non-existent warehouse must error");
 
@@ -630,7 +649,9 @@ async fn polaris_auto_in_session_reuse() {
     let batches1 = handler
         .execute(
             &session,
-            "SELECT id FROM discovery_test_wh.disc_ns.probe_t", None)
+            "SELECT id FROM discovery_test_wh.disc_ns.probe_t",
+            None,
+        )
         .await
         .expect("first query must succeed");
     let rows1: usize = batches1.iter().map(|b| b.num_rows()).sum();
@@ -639,7 +660,9 @@ async fn polaris_auto_in_session_reuse() {
     let batches2 = handler
         .execute(
             &session,
-            "SELECT label FROM discovery_test_wh.disc_ns.probe_t", None)
+            "SELECT label FROM discovery_test_wh.disc_ns.probe_t",
+            None,
+        )
         .await
         .expect("second query in same session must also succeed");
     let rows2: usize = batches2.iter().map(|b| b.num_rows()).sum();
@@ -673,16 +696,25 @@ async fn polaris_auto_insert_lands_in_discovered_warehouse() {
     handler
         .execute(
             &session,
-            "INSERT INTO discovery_test_wh.disc_ns.probe_t SELECT 99 as id, 'inserted' as label", None)
+            "INSERT INTO discovery_test_wh.disc_ns.probe_t SELECT 99 as id, 'inserted' as label",
+            None,
+        )
         .await
         .expect("polaris-auto INSERT must resolve the target in the discovered warehouse");
 
     let batches = handler
-        .execute(&session, "SELECT id FROM discovery_test_wh.disc_ns.probe_t", None)
+        .execute(
+            &session,
+            "SELECT id FROM discovery_test_wh.disc_ns.probe_t",
+            None,
+        )
         .await
         .expect("read back from discovered warehouse");
     let total: usize = batches.iter().map(|b| b.num_rows()).sum();
-    assert_eq!(total, 2, "seed row + inserted row both live in discovery_test_wh");
+    assert_eq!(
+        total, 2,
+        "seed row + inserted row both live in discovery_test_wh"
+    );
 }
 
 /// CatalogOps DDL into a discovered (polaris-auto) warehouse: CREATE SCHEMA +
@@ -703,7 +735,11 @@ async fn polaris_auto_ddl_resolves_discovered_warehouse() {
 
     // CREATE SCHEMA into the discovered catalog (the dbt `create_schema` path).
     handler
-        .execute(&session, "CREATE SCHEMA IF NOT EXISTS discovery_test_wh.ddl_ns", None)
+        .execute(
+            &session,
+            "CREATE SCHEMA IF NOT EXISTS discovery_test_wh.ddl_ns",
+            None,
+        )
         .await
         .expect("CREATE SCHEMA must create the namespace in the discovered warehouse");
 
@@ -712,7 +748,9 @@ async fn polaris_auto_ddl_resolves_discovered_warehouse() {
     handler
         .execute(
             &session,
-            "CREATE TABLE discovery_test_wh.ddl_ns.t AS SELECT 1 AS x", None)
+            "CREATE TABLE discovery_test_wh.ddl_ns.t AS SELECT 1 AS x",
+            None,
+        )
         .await
         .expect("CREATE TABLE into the discovered-warehouse namespace must succeed");
 

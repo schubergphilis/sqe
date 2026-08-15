@@ -143,9 +143,10 @@ impl MemoryPool for ResizableFairSpillPool {
 
     fn try_grow(&self, reservation: &MemoryReservation, additional: usize) -> Result<()> {
         let pool_size = self.pool_size();
-        let mut state = self.state.lock().map_err(|_| {
-            DataFusionError::Internal("resizable memory pool lock poisoned".into())
-        })?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| DataFusionError::Internal("resizable memory pool lock poisoned".into()))?;
 
         match reservation.consumer().can_spill() {
             true => {

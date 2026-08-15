@@ -17,7 +17,10 @@ pub fn arrow_to_trino_type(dt: &DataType) -> String {
         DataType::Float16 | DataType::Float32 => "real".to_string(),
         DataType::Float64 => "double".to_string(),
         DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => "varchar".to_string(),
-        DataType::Binary | DataType::LargeBinary | DataType::BinaryView | DataType::FixedSizeBinary(_) => "varbinary".to_string(),
+        DataType::Binary
+        | DataType::LargeBinary
+        | DataType::BinaryView
+        | DataType::FixedSizeBinary(_) => "varbinary".to_string(),
         DataType::Date32 | DataType::Date64 => "date".to_string(),
         DataType::Time32(_) | DataType::Time64(_) => "time".to_string(),
         // Report an explicit precision. SQE timestamps are microsecond-backed
@@ -26,7 +29,9 @@ pub fn arrow_to_trino_type(dt: &DataType) -> String {
         DataType::Timestamp(_, None) => "timestamp(6)".to_string(),
         DataType::Timestamp(_, Some(_)) => "timestamp(6) with time zone".to_string(),
         DataType::Duration(_) => "interval day to second".to_string(),
-        DataType::Interval(arrow_schema::IntervalUnit::YearMonth) => "interval year to month".to_string(),
+        DataType::Interval(arrow_schema::IntervalUnit::YearMonth) => {
+            "interval year to month".to_string()
+        }
         DataType::Interval(_) => "interval day to second".to_string(),
         DataType::Decimal128(p, s) | DataType::Decimal256(p, s) => format!("decimal({p},{s})"),
         DataType::List(f) | DataType::LargeList(f) | DataType::FixedSizeList(f, _) => {
@@ -86,7 +91,9 @@ fn normalize_timestamp_fraction(s: &str) -> String {
 /// (e.g. one day -> `1 00:00:00.000`), from a day count and a nanosecond
 /// remainder. Negative intervals carry a leading `-`.
 fn format_day_time_interval(days: i64, nanos: i64) -> String {
-    let total_nanos = days.saturating_mul(86_400_000_000_000).saturating_add(nanos);
+    let total_nanos = days
+        .saturating_mul(86_400_000_000_000)
+        .saturating_add(nanos);
     let neg = total_nanos < 0;
     let n = total_nanos.unsigned_abs();
     let millis_total = n / 1_000_000;
@@ -108,10 +115,7 @@ fn format_year_month_interval(months: i32) -> String {
     format!("{sign}{}-{}", m / 12, m % 12)
 }
 
-pub fn arrow_value_to_json(
-    array: &dyn arrow_array::Array,
-    row: usize,
-) -> serde_json::Value {
+pub fn arrow_value_to_json(array: &dyn arrow_array::Array, row: usize) -> serde_json::Value {
     use arrow_array::*;
 
     if array.is_null(row) {
@@ -211,25 +215,19 @@ pub fn arrow_value_to_json(
             // (#5)
             serde_json::Value::String(normalize_timestamp_fraction(&s))
         }
-        DataType::Date32 | DataType::Date64 => {
-            serde_json::Value::String(
-                arrow::util::display::array_value_to_string(array, row).unwrap_or_default(),
-            )
-        }
+        DataType::Date32 | DataType::Date64 => serde_json::Value::String(
+            arrow::util::display::array_value_to_string(array, row).unwrap_or_default(),
+        ),
         DataType::Utf8View => {
             let arr = array.as_any().downcast_ref::<StringViewArray>().unwrap();
             serde_json::Value::String(arr.value(row).to_string())
         }
-        DataType::Decimal128(_, _) | DataType::Decimal256(_, _) => {
-            serde_json::Value::String(
-                arrow::util::display::array_value_to_string(array, row).unwrap_or_default(),
-            )
-        }
-        DataType::Time32(_) | DataType::Time64(_) => {
-            serde_json::Value::String(
-                arrow::util::display::array_value_to_string(array, row).unwrap_or_default(),
-            )
-        }
+        DataType::Decimal128(_, _) | DataType::Decimal256(_, _) => serde_json::Value::String(
+            arrow::util::display::array_value_to_string(array, row).unwrap_or_default(),
+        ),
+        DataType::Time32(_) | DataType::Time64(_) => serde_json::Value::String(
+            arrow::util::display::array_value_to_string(array, row).unwrap_or_default(),
+        ),
         DataType::Binary => {
             let arr = array.as_any().downcast_ref::<BinaryArray>().unwrap();
             serde_json::Value::String(
@@ -249,7 +247,10 @@ pub fn arrow_value_to_json(
             )
         }
         DataType::FixedSizeBinary(_) => {
-            let arr = array.as_any().downcast_ref::<FixedSizeBinaryArray>().unwrap();
+            let arr = array
+                .as_any()
+                .downcast_ref::<FixedSizeBinaryArray>()
+                .unwrap();
             serde_json::Value::String(
                 base64::engine::general_purpose::STANDARD.encode(arr.value(row)),
             )
@@ -257,11 +258,17 @@ pub fn arrow_value_to_json(
         // Intervals: Trino renders day-to-second as `D HH:MM:SS.mmm` and
         // year-to-month as `Y-M`; Arrow's display ("1 days") is not Trino-valid.
         DataType::Interval(arrow_schema::IntervalUnit::YearMonth) => {
-            let arr = array.as_any().downcast_ref::<IntervalYearMonthArray>().unwrap();
+            let arr = array
+                .as_any()
+                .downcast_ref::<IntervalYearMonthArray>()
+                .unwrap();
             serde_json::Value::String(format_year_month_interval(arr.value(row)))
         }
         DataType::Interval(arrow_schema::IntervalUnit::DayTime) => {
-            let arr = array.as_any().downcast_ref::<IntervalDayTimeArray>().unwrap();
+            let arr = array
+                .as_any()
+                .downcast_ref::<IntervalDayTimeArray>()
+                .unwrap();
             let v = arr.value(row);
             serde_json::Value::String(format_day_time_interval(
                 v.days as i64,
@@ -269,7 +276,10 @@ pub fn arrow_value_to_json(
             ))
         }
         DataType::Interval(arrow_schema::IntervalUnit::MonthDayNano) => {
-            let arr = array.as_any().downcast_ref::<IntervalMonthDayNanoArray>().unwrap();
+            let arr = array
+                .as_any()
+                .downcast_ref::<IntervalMonthDayNanoArray>()
+                .unwrap();
             let v = arr.value(row);
             // A pure month interval renders year-to-month; anything with a day
             // or sub-day component renders day-to-second.
@@ -281,29 +291,35 @@ pub fn arrow_value_to_json(
         }
         DataType::Duration(unit) => {
             let nanos: i64 = match unit {
-                arrow_schema::TimeUnit::Second => {
-                    array.as_any().downcast_ref::<DurationSecondArray>().unwrap().value(row)
-                        .saturating_mul(1_000_000_000)
-                }
-                arrow_schema::TimeUnit::Millisecond => {
-                    array.as_any().downcast_ref::<DurationMillisecondArray>().unwrap().value(row)
-                        .saturating_mul(1_000_000)
-                }
-                arrow_schema::TimeUnit::Microsecond => {
-                    array.as_any().downcast_ref::<DurationMicrosecondArray>().unwrap().value(row)
-                        .saturating_mul(1_000)
-                }
-                arrow_schema::TimeUnit::Nanosecond => {
-                    array.as_any().downcast_ref::<DurationNanosecondArray>().unwrap().value(row)
-                }
+                arrow_schema::TimeUnit::Second => array
+                    .as_any()
+                    .downcast_ref::<DurationSecondArray>()
+                    .unwrap()
+                    .value(row)
+                    .saturating_mul(1_000_000_000),
+                arrow_schema::TimeUnit::Millisecond => array
+                    .as_any()
+                    .downcast_ref::<DurationMillisecondArray>()
+                    .unwrap()
+                    .value(row)
+                    .saturating_mul(1_000_000),
+                arrow_schema::TimeUnit::Microsecond => array
+                    .as_any()
+                    .downcast_ref::<DurationMicrosecondArray>()
+                    .unwrap()
+                    .value(row)
+                    .saturating_mul(1_000),
+                arrow_schema::TimeUnit::Nanosecond => array
+                    .as_any()
+                    .downcast_ref::<DurationNanosecondArray>()
+                    .unwrap()
+                    .value(row),
             };
             serde_json::Value::String(format_day_time_interval(0, nanos))
         }
-        _ => {
-            serde_json::Value::String(
-                arrow::util::display::array_value_to_string(array, row).unwrap_or_default(),
-            )
-        }
+        _ => serde_json::Value::String(
+            arrow::util::display::array_value_to_string(array, row).unwrap_or_default(),
+        ),
     }
 }
 
@@ -323,7 +339,10 @@ mod tests {
     #[test]
     fn test_arrow_to_trino_type_timestamp() {
         assert_eq!(
-            arrow_to_trino_type(&DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None)),
+            arrow_to_trino_type(&DataType::Timestamp(
+                arrow_schema::TimeUnit::Microsecond,
+                None
+            )),
             "timestamp(6)"
         );
         assert_eq!(
@@ -363,7 +382,10 @@ mod tests {
     fn test_trino_interval_formatting() {
         // day-to-second `D HH:MM:SS.mmm`
         assert_eq!(format_day_time_interval(1, 0), "1 00:00:00.000");
-        assert_eq!(format_day_time_interval(0, 90 * 60 * 1_000_000_000), "0 01:30:00.000");
+        assert_eq!(
+            format_day_time_interval(0, 90 * 60 * 1_000_000_000),
+            "0 01:30:00.000"
+        );
         assert_eq!(format_day_time_interval(0, 1_500_000_000), "0 00:00:01.500");
         assert_eq!(format_day_time_interval(-1, 0), "-1 00:00:00.000");
         // year-to-month `Y-M`
@@ -449,7 +471,10 @@ mod tests {
         let arr = arrow_array::UInt64Array::from(vec![42u64]);
         let val = arrow_value_to_json(&arr, 0);
         assert_eq!(val, serde_json::json!(42u64));
-        assert!(val.is_number(), "u64 must render as a JSON number, not a string");
+        assert!(
+            val.is_number(),
+            "u64 must render as a JSON number, not a string"
+        );
     }
 
     #[test]
@@ -472,14 +497,55 @@ mod tests {
         use std::sync::Arc;
         assert_eq!(arrow_to_trino_type(&DataType::Utf8View), "varchar");
         assert_eq!(arrow_to_trino_type(&DataType::BinaryView), "varbinary");
-        assert_eq!(arrow_to_trino_type(&DataType::Time32(arrow_schema::TimeUnit::Millisecond)), "time");
-        assert_eq!(arrow_to_trino_type(&DataType::Time64(arrow_schema::TimeUnit::Microsecond)), "time");
-        assert_eq!(arrow_to_trino_type(&DataType::Duration(arrow_schema::TimeUnit::Microsecond)), "interval day to second");
-        assert_eq!(arrow_to_trino_type(&DataType::Interval(arrow_schema::IntervalUnit::YearMonth)), "interval year to month");
-        assert_eq!(arrow_to_trino_type(&DataType::Interval(arrow_schema::IntervalUnit::DayTime)), "interval day to second");
-        assert_eq!(arrow_to_trino_type(&DataType::FixedSizeBinary(16)), "varbinary");
-        assert_eq!(arrow_to_trino_type(&DataType::List(Arc::new(arrow_schema::Field::new("item", DataType::Int32, true)))), "array(integer)");
-        assert_eq!(arrow_to_trino_type(&DataType::Map(Arc::new(arrow_schema::Field::new("entries", DataType::Struct(vec![arrow_schema::Field::new("key", DataType::Utf8, false), arrow_schema::Field::new("value", DataType::Int64, true)].into()), false)), false)), "map(varchar,bigint)");
+        assert_eq!(
+            arrow_to_trino_type(&DataType::Time32(arrow_schema::TimeUnit::Millisecond)),
+            "time"
+        );
+        assert_eq!(
+            arrow_to_trino_type(&DataType::Time64(arrow_schema::TimeUnit::Microsecond)),
+            "time"
+        );
+        assert_eq!(
+            arrow_to_trino_type(&DataType::Duration(arrow_schema::TimeUnit::Microsecond)),
+            "interval day to second"
+        );
+        assert_eq!(
+            arrow_to_trino_type(&DataType::Interval(arrow_schema::IntervalUnit::YearMonth)),
+            "interval year to month"
+        );
+        assert_eq!(
+            arrow_to_trino_type(&DataType::Interval(arrow_schema::IntervalUnit::DayTime)),
+            "interval day to second"
+        );
+        assert_eq!(
+            arrow_to_trino_type(&DataType::FixedSizeBinary(16)),
+            "varbinary"
+        );
+        assert_eq!(
+            arrow_to_trino_type(&DataType::List(Arc::new(arrow_schema::Field::new(
+                "item",
+                DataType::Int32,
+                true
+            )))),
+            "array(integer)"
+        );
+        assert_eq!(
+            arrow_to_trino_type(&DataType::Map(
+                Arc::new(arrow_schema::Field::new(
+                    "entries",
+                    DataType::Struct(
+                        vec![
+                            arrow_schema::Field::new("key", DataType::Utf8, false),
+                            arrow_schema::Field::new("value", DataType::Int64, true)
+                        ]
+                        .into()
+                    ),
+                    false
+                )),
+                false
+            )),
+            "map(varchar,bigint)"
+        );
         assert_eq!(arrow_to_trino_type(&DataType::Null), "unknown");
     }
 }

@@ -1,12 +1,12 @@
 pub mod grants;
+pub mod mask_udf;
 pub mod plan_rewriter;
 pub mod policy_breaker;
 pub mod policy_expr;
 pub mod policy_store;
 pub mod ranger_store;
-pub mod mask_udf;
-pub mod sha256_udf;
 pub mod session_udf;
+pub mod sha256_udf;
 pub mod tag_projector;
 pub mod tag_source;
 pub mod write_predicates;
@@ -361,7 +361,13 @@ mod tests {
         assert!(format!("{hash:?}").contains("Hash"));
         assert!(format!("{custom:?}").contains("Custom"));
 
-        let partial = MaskType::PartialMask { show_first: 0, show_last: 4, upper: 'x', lower: 'x', digit: 'x' };
+        let partial = MaskType::PartialMask {
+            show_first: 0,
+            show_last: 4,
+            upper: 'x',
+            lower: 'x',
+            digit: 'x',
+        };
         let date_year = MaskType::DateShowYear;
         assert!(format!("{partial:?}").contains("PartialMask"));
         assert!(format!("{date_year:?}").contains("DateShowYear"));

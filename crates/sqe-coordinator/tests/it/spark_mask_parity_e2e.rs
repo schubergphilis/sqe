@@ -159,7 +159,10 @@ async fn column_mask_is_byte_identical_across_engines() {
 
     // bob is an engineer, so the mask applies to him.
     let rows = agreed_rows(&ctx, "bob", "id, ssn", "id", |rows| {
-        rows.len() == 3 && rows.iter().all(|r| r.get(1).is_some_and(|v| v.starts_with("xxx-xx-")))
+        rows.len() == 3
+            && rows
+                .iter()
+                .all(|r| r.get(1).is_some_and(|v| v.starts_with("xxx-xx-")))
     })
     .await;
 
@@ -176,10 +179,7 @@ async fn column_mask_is_byte_identical_across_engines() {
     // Masking must not silently drop rows, and the raw value must be gone. A mask
     // that returned nothing would satisfy an equality check on two empty results.
     let flat = rows.concat().join(" ");
-    assert!(
-        !flat.contains("111-11-1111"),
-        "the raw ssn leaked: {flat}"
-    );
+    assert!(!flat.contains("111-11-1111"), "the raw ssn leaked: {flat}");
 }
 
 /// alice is an analyst and NOT an engineer, so the same policy must leave her
@@ -205,7 +205,11 @@ async fn an_unmasked_role_is_unmasked_in_both_engines() {
         .expect("create the portable ssn mask");
 
     let rows = agreed_rows(&ctx, "alice", "id, ssn", "id", |rows| {
-        rows.len() == 3 && rows.iter().all(|r| r.get(1).is_some_and(|v| v.contains("-11-") || !v.starts_with("xxx")))
+        rows.len() == 3
+            && rows.iter().all(|r| {
+                r.get(1)
+                    .is_some_and(|v| v.contains("-11-") || !v.starts_with("xxx"))
+            })
     })
     .await;
 
@@ -294,9 +298,9 @@ async fn a_named_mask_type_is_not_byte_portable() {
     let masked = |rows: &[Vec<String>]| {
         rows.len() == 3
             && rows.iter().all(|r| {
-                r.get(1)
-                    .is_some_and(|v| v.ends_with("1111") || v.ends_with("2222") || v.ends_with("3333"))
-                    && !r.get(1).is_some_and(|v| v.starts_with("111-11"))
+                r.get(1).is_some_and(|v| {
+                    v.ends_with("1111") || v.ends_with("2222") || v.ends_with("3333")
+                }) && !r.get(1).is_some_and(|v| v.starts_with("111-11"))
             })
     };
     let (sqe, spark) = crate::common::eventually_within(
@@ -316,7 +320,10 @@ async fn a_named_mask_type_is_not_byte_portable() {
     // Semantics agree: raw hidden, last four visible in both.
     for (label, rows) in [("sqe", &sqe), ("spark", &spark)] {
         let flat = rows.concat().join(" ");
-        assert!(!flat.contains("111-11-1111"), "{label} leaked the raw ssn: {flat}");
+        assert!(
+            !flat.contains("111-11-1111"),
+            "{label} leaked the raw ssn: {flat}"
+        );
         assert!(flat.contains("1111"), "{label} hid the last four: {flat}");
     }
 
@@ -397,11 +404,8 @@ async fn a_failed_projection_rolls_back_the_tag() {
     let before_rows = total_rows(&before);
 
     // A second handler differing in exactly one thing: the projector fails.
-    let (failing, _cache) = crate::common::setup_ranger_handler_sharing(
-        Some(ctx.cache.clone()),
-        |_cfg| {},
-    )
-    .await;
+    let (failing, _cache) =
+        crate::common::setup_ranger_handler_sharing(Some(ctx.cache.clone()), |_cfg| {}).await;
     let failing = failing.with_tag_projector(std::sync::Arc::new(AlwaysFailingProjector));
 
     let err = failing
@@ -564,7 +568,11 @@ async fn unset_tag_stops_masking_in_both_engines() {
         .expect("UNSET TAG");
 
     let rows = agreed_rows(&ctx, "bob", "id, ssn", "id", |rows| {
-        rows.len() == 3 && rows.iter().all(|r| r.get(1).is_some_and(|v| v.contains("-11-") || v.contains("-22-") || v.contains("-33-")))
+        rows.len() == 3
+            && rows.iter().all(|r| {
+                r.get(1)
+                    .is_some_and(|v| v.contains("-11-") || v.contains("-22-") || v.contains("-33-"))
+            })
     })
     .await;
     assert_eq!(
@@ -712,7 +720,13 @@ async fn adding_a_column_to_a_masked_table_keeps_it_queryable() {
             .execute(&ctx.bob, &format!("SELECT ssn FROM {ORDERS}"), None)
             .await
         {
-            Ok(b) if col_strings(&b, "ssn").iter().all(|v| v.starts_with("xxx-xx-")) => Ok(()),
+            Ok(b)
+                if col_strings(&b, "ssn")
+                    .iter()
+                    .all(|v| v.starts_with("xxx-xx-")) =>
+            {
+                Ok(())
+            }
             Ok(b) => Err(format!("not masked yet: {:?}", col_strings(&b, "ssn"))),
             Err(e) => Err(format!("{e}")),
         }
@@ -738,9 +752,8 @@ async fn adding_a_column_to_a_masked_table_keeps_it_queryable() {
     // A retry that accepts the first error it sees cannot tell them apart, and reports
     // whichever the timing produced. So wait until the stale-schema error is gone, and
     // only then classify what is left.
-    let outcome = crate::common::eventually(
-        "SQE's schema cache to catch up with ADD COLUMN",
-        || async {
+    let outcome =
+        crate::common::eventually("SQE's schema cache to catch up with ADD COLUMN", || async {
             match ctx
                 .handler
                 .execute(
@@ -761,9 +774,8 @@ async fn adding_a_column_to_a_masked_table_keeps_it_queryable() {
                     }
                 }
             }
-        },
-    )
-    .await;
+        })
+        .await;
 
     // Was: "input schema only has 2 columns", which made a governed table unqueryable
     // after a routine ADD COLUMN. The cause was NOT the plan rewriter -- the same
@@ -797,7 +809,9 @@ async fn adding_a_column_to_a_masked_table_keeps_it_queryable() {
     );
     assert!(
         // `fmt_val` renders a NULL as the literal "NULL".
-        col_strings(&batches, "nickname").iter().all(|v| v == "NULL"),
+        col_strings(&batches, "nickname")
+            .iter()
+            .all(|v| v == "NULL"),
         "a column added after the data files were written reads as NULL, never as \
          another column's values. Got: {:?}",
         col_strings(&batches, "nickname")
@@ -897,13 +911,15 @@ async fn a_renamed_column_keeps_its_mask_in_both_engines() {
     );
     // THE fix. A raw SSN here means the rename unmasked a governed column.
     assert!(
-        sqe.iter().all(|r| r.get(1).is_some_and(|v| v.starts_with("xxx-xx-"))),
+        sqe.iter()
+            .all(|r| r.get(1).is_some_and(|v| v.starts_with("xxx-xx-"))),
         "the renamed column must STAY masked. Raw values mean the tag association \
          did not follow the rename, so a routine schema change silently unmasked a \
          governed column. Got: {sqe:?}"
     );
     assert!(
-        sqe.iter().all(|r| r.get(1).is_some_and(|v| !v.contains("-11-1111"))),
+        sqe.iter()
+            .all(|r| r.get(1).is_some_and(|v| !v.contains("-11-1111"))),
         "no raw SSN may appear. Got: {sqe:?}"
     );
 }

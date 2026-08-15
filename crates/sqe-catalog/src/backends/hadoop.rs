@@ -194,11 +194,7 @@ impl HadoopBackend {
     ///
     /// `namespace` is a dotted path (e.g. `"sales.q1"`); empty string means
     /// the warehouse root.
-    pub async fn find_table(
-        &self,
-        namespace: &str,
-        table: &str,
-    ) -> SqeResult<Option<HadoopTable>> {
+    pub async fn find_table(&self, namespace: &str, table: &str) -> SqeResult<Option<HadoopTable>> {
         let tables = self.list_tables().await?;
         let wanted_ns: Vec<String> = if namespace.is_empty() {
             Vec::new()
@@ -249,7 +245,9 @@ mod tests {
         assert_eq!(tables[0].namespace, vec!["ns".to_string()]);
         assert_eq!(tables[0].name, "t");
         assert_eq!(tables[0].version, 2);
-        assert!(tables[0].metadata_location.ends_with("v00002.metadata.json"));
+        assert!(tables[0]
+            .metadata_location
+            .ends_with("v00002.metadata.json"));
     }
 
     #[tokio::test]
@@ -286,10 +284,7 @@ mod tests {
 
     #[tokio::test]
     async fn find_table_returns_none_when_missing() {
-        let store = seed_store(&[
-            ("warehouse/ns/t/metadata/v00001.metadata.json", "{}"),
-        ])
-        .await;
+        let store = seed_store(&[("warehouse/ns/t/metadata/v00001.metadata.json", "{}")]).await;
         let backend = HadoopBackend::new(store, ObjectPath::from("warehouse"));
         let missing = backend.find_table("ns", "other").await.unwrap();
         assert!(missing.is_none());
@@ -300,10 +295,7 @@ mod tests {
     #[tokio::test]
     async fn metadata_filename_with_random_suffix() {
         let store = seed_store(&[
-            (
-                "warehouse/ns/t/metadata/v00001-abc123.metadata.json",
-                "{}",
-            ),
+            ("warehouse/ns/t/metadata/v00001-abc123.metadata.json", "{}"),
             ("warehouse/ns/t/metadata/v00002.metadata.json", "{}"),
         ])
         .await;

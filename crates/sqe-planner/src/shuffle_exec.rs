@@ -417,13 +417,11 @@ impl ExecutionPlan for ShuffleReaderExec {
         // The mutex is uncontended in practice because each partition is
         // executed at most once.
         let receiver = {
-            let mut guard = self.receivers[partition]
-                .try_lock()
-                .map_err(|_| {
-                    DataFusionError::Internal(format!(
-                        "ShuffleReaderExec partition {partition} receiver lock contention"
-                    ))
-                })?;
+            let mut guard = self.receivers[partition].try_lock().map_err(|_| {
+                DataFusionError::Internal(format!(
+                    "ShuffleReaderExec partition {partition} receiver lock contention"
+                ))
+            })?;
             guard.take().ok_or_else(|| {
                 DataFusionError::Internal(format!(
                     "ShuffleReaderExec partition {partition} receiver already taken"
@@ -675,10 +673,7 @@ mod tests {
                 key_columns: vec!["id".to_string()],
                 num_partitions: 2,
             },
-            vec![
-                "grpc://h1:50051".to_string(),
-                "grpc://h2:50051".to_string(),
-            ],
+            vec!["grpc://h1:50051".to_string(), "grpc://h2:50051".to_string()],
             "q1".to_string(),
             "s1".to_string(),
         ));
@@ -699,10 +694,7 @@ mod tests {
                 key_columns: vec!["id".to_string()],
                 num_partitions: 2,
             },
-            vec![
-                "grpc://h1:50051".to_string(),
-                "grpc://h2:50051".to_string(),
-            ],
+            vec!["grpc://h1:50051".to_string(), "grpc://h2:50051".to_string()],
             "q1".to_string(),
             "s1".to_string(),
         ));
@@ -725,10 +717,7 @@ mod tests {
                 key_columns: vec!["id".to_string()],
                 num_partitions: 2,
             },
-            vec![
-                "grpc://h1:50051".to_string(),
-                "grpc://h2:50051".to_string(),
-            ],
+            vec!["grpc://h1:50051".to_string(), "grpc://h2:50051".to_string()],
             "q1".to_string(),
             "s1".to_string(),
         );
@@ -739,7 +728,10 @@ mod tests {
 
         // Writer returns an empty stream (data is sent, not returned)
         let next = stream.next().await;
-        assert!(next.is_none(), "ShuffleWriterExec should return empty stream");
+        assert!(
+            next.is_none(),
+            "ShuffleWriterExec should return empty stream"
+        );
     }
 
     #[test]
@@ -780,12 +772,8 @@ mod tests {
     async fn test_reader_single_partition_receives_batches() {
         let schema = test_schema();
         let (tx, rx) = mpsc::channel(16);
-        let reader = ShuffleReaderExec::new_single(
-            schema.clone(),
-            rx,
-            "q1".to_string(),
-            "s1".to_string(),
-        );
+        let reader =
+            ShuffleReaderExec::new_single(schema.clone(), rx, "q1".to_string(), "s1".to_string());
 
         let ctx = SessionContext::new();
         let task_ctx = ctx.task_ctx();
@@ -857,12 +845,7 @@ mod tests {
     async fn test_reader_partition_taken_once() {
         let schema = test_schema();
         let (_tx, rx) = mpsc::channel::<RecordBatch>(16);
-        let reader = ShuffleReaderExec::new_single(
-            schema,
-            rx,
-            "q1".to_string(),
-            "s1".to_string(),
-        );
+        let reader = ShuffleReaderExec::new_single(schema, rx, "q1".to_string(), "s1".to_string());
 
         let ctx = SessionContext::new();
 
@@ -871,19 +854,17 @@ mod tests {
 
         // Second execute on same partition fails
         let result = reader.execute(0, ctx.task_ctx());
-        assert!(result.is_err(), "Second execute on same partition should fail");
+        assert!(
+            result.is_err(),
+            "Second execute on same partition should fail"
+        );
     }
 
     #[test]
     fn test_reader_out_of_range_partition() {
         let schema = test_schema();
         let (_tx, rx) = mpsc::channel::<RecordBatch>(16);
-        let reader = ShuffleReaderExec::new_single(
-            schema,
-            rx,
-            "q1".to_string(),
-            "s1".to_string(),
-        );
+        let reader = ShuffleReaderExec::new_single(schema, rx, "q1".to_string(), "s1".to_string());
 
         let ctx = SessionContext::new();
         let result = reader.execute(5, ctx.task_ctx());
@@ -894,12 +875,8 @@ mod tests {
     fn test_reader_schema() {
         let schema = test_schema();
         let (_tx, rx) = mpsc::channel::<RecordBatch>(16);
-        let reader = ShuffleReaderExec::new_single(
-            schema.clone(),
-            rx,
-            "q1".to_string(),
-            "s1".to_string(),
-        );
+        let reader =
+            ShuffleReaderExec::new_single(schema.clone(), rx, "q1".to_string(), "s1".to_string());
 
         assert_eq!(reader.schema(), schema);
         assert_eq!(reader.name(), "ShuffleReaderExec");
@@ -909,26 +886,19 @@ mod tests {
     fn test_reader_is_leaf_node() {
         let schema = test_schema();
         let (_tx, rx) = mpsc::channel::<RecordBatch>(16);
-        let reader = ShuffleReaderExec::new_single(
-            schema,
-            rx,
-            "q1".to_string(),
-            "s1".to_string(),
-        );
+        let reader = ShuffleReaderExec::new_single(schema, rx, "q1".to_string(), "s1".to_string());
 
-        assert!(reader.children().is_empty(), "ShuffleReaderExec is a leaf node");
+        assert!(
+            reader.children().is_empty(),
+            "ShuffleReaderExec is a leaf node"
+        );
     }
 
     #[test]
     fn test_reader_properties() {
         let schema = test_schema();
         let (_tx, rx) = mpsc::channel::<RecordBatch>(16);
-        let reader = ShuffleReaderExec::new_single(
-            schema,
-            rx,
-            "q1".to_string(),
-            "s1".to_string(),
-        );
+        let reader = ShuffleReaderExec::new_single(schema, rx, "q1".to_string(), "s1".to_string());
 
         let props = reader.properties();
         assert_eq!(props.emission_type, EmissionType::Incremental);
@@ -960,12 +930,7 @@ mod tests {
     async fn test_reader_empty_channel() {
         let schema = test_schema();
         let (tx, rx) = mpsc::channel::<RecordBatch>(16);
-        let reader = ShuffleReaderExec::new_single(
-            schema,
-            rx,
-            "q1".to_string(),
-            "s1".to_string(),
-        );
+        let reader = ShuffleReaderExec::new_single(schema, rx, "q1".to_string(), "s1".to_string());
 
         // Drop sender immediately — channel closed
         drop(tx);
@@ -974,7 +939,10 @@ mod tests {
         let mut stream = reader.execute(0, ctx.task_ctx()).unwrap();
 
         let next = stream.next().await;
-        assert!(next.is_none(), "Empty channel should yield None immediately");
+        assert!(
+            next.is_none(),
+            "Empty channel should yield None immediately"
+        );
     }
 
     // ─── ShufflePartitioning tests ───
@@ -985,19 +953,13 @@ mod tests {
             key_columns: vec!["id".to_string(), "name".to_string()],
             num_partitions: 4,
         };
-        assert_eq!(
-            format!("{hash}"),
-            "Hash(keys=[id, name], partitions=4)"
-        );
+        assert_eq!(format!("{hash}"), "Hash(keys=[id, name], partitions=4)");
 
         let range = ShufflePartitioning::Range {
             key_column: "ts".to_string(),
             boundaries: vec!["10".to_string(), "20".to_string()],
         };
-        assert_eq!(
-            format!("{range}"),
-            "Range(key=ts, boundaries=2)"
-        );
+        assert_eq!(format!("{range}"), "Range(key=ts, boundaries=2)");
     }
 
     #[test]

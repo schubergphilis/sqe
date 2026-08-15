@@ -92,7 +92,11 @@ impl MaintenancePrincipal {
             token_expiry,
             identity.roles.clone(),
         )
-        .with_identity(identity.subject.clone(), identity.email.clone(), identity.groups.clone())
+        .with_identity(
+            identity.subject.clone(),
+            identity.email.clone(),
+            identity.groups.clone(),
+        )
         // Explicit in-engine write-authority marker (Phase 4b). Set here,
         // once, by the maintenance principal's own minting path only.
         // `MaintenanceHandler::authorize_or_deny` honors this independent

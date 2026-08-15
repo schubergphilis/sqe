@@ -80,14 +80,12 @@ fn attach_classifier_name_is_attach() {
 #[test]
 fn attach_option_keys_are_case_insensitive() {
     // Both `type=...` and `TYPE=...` must classify the same way.
-    let kind_lower = parse_and_classify(
-        "ATTACH 'https://polaris/api' AS p (type iceberg_rest, warehouse 'wh')",
-    )
-    .expect("lowercase parses");
-    let kind_upper = parse_and_classify(
-        "ATTACH 'https://polaris/api' AS p (TYPE iceberg_rest, WAREHOUSE 'wh')",
-    )
-    .expect("uppercase parses");
+    let kind_lower =
+        parse_and_classify("ATTACH 'https://polaris/api' AS p (type iceberg_rest, warehouse 'wh')")
+            .expect("lowercase parses");
+    let kind_upper =
+        parse_and_classify("ATTACH 'https://polaris/api' AS p (TYPE iceberg_rest, WAREHOUSE 'wh')")
+            .expect("uppercase parses");
     let lower = match kind_lower {
         StatementKind::Attach(a) => *a,
         _ => panic!("expected Attach"),
@@ -118,9 +116,7 @@ fn attach_with_unknown_type_is_rejected() {
 
 #[test]
 fn attach_without_type_option_is_rejected() {
-    let result = parse_and_classify(
-        "ATTACH 'https://polaris/api' AS polaris (WAREHOUSE 'my_wh')",
-    );
+    let result = parse_and_classify("ATTACH 'https://polaris/api' AS polaris (WAREHOUSE 'my_wh')");
     assert!(result.is_err(), "expected error for missing TYPE");
     let err = format!("{}", result.unwrap_err());
     assert!(
@@ -217,8 +213,8 @@ fn create_secret_aws_with_explicit_credentials() {
 
 #[test]
 fn create_secret_bearer_with_token() {
-    let kind = parse_and_classify("CREATE SECRET polaris_jwt (TYPE bearer, TOKEN 'xyz')")
-        .expect("parses");
+    let kind =
+        parse_and_classify("CREATE SECRET polaris_jwt (TYPE bearer, TOKEN 'xyz')").expect("parses");
     let stmt = match kind {
         StatementKind::CreateSecret(s) => *s,
         other => panic!("expected CreateSecret, got {other:?}"),
@@ -356,7 +352,6 @@ fn show_catalogs_still_classifies() {
 
 #[test]
 fn show_grants_still_classifies() {
-    let kind =
-        parse_and_classify("SHOW GRANTS ON cat.ns.tbl").expect("SHOW GRANTS still parses");
+    let kind = parse_and_classify("SHOW GRANTS ON cat.ns.tbl").expect("SHOW GRANTS still parses");
     assert!(matches!(kind, StatementKind::ShowGrants(_)));
 }

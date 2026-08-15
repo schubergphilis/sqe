@@ -52,10 +52,7 @@ impl FooterCache {
                     value.row_group(0).num_columns() as u64
                 } else {
                     // Fallback: use schema descriptor.
-                    value
-                        .file_metadata()
-                        .schema_descr()
-                        .num_columns() as u64
+                    value.file_metadata().schema_descr().num_columns() as u64
                 };
                 footer_entry_weight(num_row_groups, num_columns)
             })
@@ -96,9 +93,7 @@ impl FooterCache {
 
         let result = self
             .cache
-            .try_get_with(path.to_string(), async {
-                fetch().await.map(Arc::new)
-            })
+            .try_get_with(path.to_string(), async { fetch().await.map(Arc::new) })
             .await?;
 
         Ok(result)

@@ -279,10 +279,7 @@ mod tests {
                 .build()
                 .expect("build current-thread runtime");
             let out = rt.block_on(async {
-                block_on_compat_within(
-                    std::future::pending::<()>(),
-                    Duration::from_millis(300),
-                )
+                block_on_compat_within(std::future::pending::<()>(), Duration::from_millis(300))
             });
             let _ = tx.send(out);
         });

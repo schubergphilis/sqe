@@ -74,7 +74,10 @@ pub fn install_faults(faults: Vec<SpillFault>) {
 
 /// Clear all pending faults.
 pub fn clear_faults() {
-    FAULT_QUEUE.lock().unwrap_or_else(|p| p.into_inner()).clear();
+    FAULT_QUEUE
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clear();
 }
 
 /// Pop the next matching fault of the given kind, if it is at the head of the queue.
