@@ -1,3 +1,7 @@
+{{- /* ISSUE-404: fail closed when production_mode + workers have no secret. */ -}}
+{{- if and .Values.coordinator.production_mode .Values.worker.enabled (not (include "sqe.workerSecretConfigured" .)) }}
+{{- fail "coordinator.production_mode=true and worker.enabled=true require workerSecret.existingSecret or workerSecret.value (see values-production.yaml)" }}
+{{- end }}
 apiVersion: v1
 kind: ConfigMap
 metadata:

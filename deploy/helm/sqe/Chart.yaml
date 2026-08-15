@@ -3,7 +3,7 @@ name: sqe
 description: Sovereign Query Engine — distributed SQL over Apache Iceberg
 type: application
 version: 0.1.0
-appVersion: "0.1.0"
+appVersion: "0.37.0"
 keywords:
   - sql
   - iceberg
