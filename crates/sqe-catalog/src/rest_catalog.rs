@@ -2373,9 +2373,6 @@ mod cache_capacity_tests {
         .with_context("status", "500 Internal Server Error");
         let err = super::namespace_visible_from_probe::<()>(Err(e))
             .expect_err("5xx must fail the listing, not keep the name");
-        assert_eq!(
-            err.error_code(),
-            sqe_core::SqeErrorCode::CatalogUnavailable
-        );
+        assert_eq!(err.error_code(), sqe_core::SqeErrorCode::CatalogUnavailable);
     }
 }
