@@ -77,6 +77,8 @@ token_url = "https://auth.local/realms/iceberg/protocol/openid-connect/token"
 client_id = "sqe-client"
 client_secret = ""
 roles_claim = "realm_access.roles"
+# groups_claim = "groups"  # JWT claim carrying group membership. Required for
+#                          # Ranger policies bound only to a group (no users/roles).
 
 # Bearer token (JWT) — for pre-authenticated clients (data platform, CI/CD, Airflow)
 # IMPORTANT: issuer must match KC_HOSTNAME exactly. If KC_HOSTNAME includes a scheme
@@ -89,6 +91,8 @@ issuer = "https://auth.local/realms/iceberg"
                      # Without this, tokens issued for ANY service by this IdP are accepted.
 user_claim = "preferred_username"
 roles_claim = "realm_access.roles"
+# groups_claim = "groups"  # JWT claim carrying group membership. Required for
+#                          # Ranger policies bound only to a group (no users/roles).
 
 # ── Interactive OIDC flows (Trino SSO + CLI device code) ────────
 # Uncomment to enable browser-based SSO for Trino JDBC and device code for CLI.
