@@ -84,14 +84,15 @@ struct CachedTableEntry {
 /// structure (DROP TABLE, ALTER TABLE, INSERT, MERGE, DELETE).
 ///
 /// Process-global cache of `RestCatalog` instances, keyed by
-/// `format!("{catalog_url}-{token_fingerprint}")`. Each entry holds an
+/// `{catalog_url}-{warehouse}-{token_fingerprint}`. Each entry holds an
 /// `Arc<RestCatalog>` that bakes in the bearer token at construction
 /// time, so when Polaris-side token expiry crosses the 5-minute TTL boundary
 /// the cached entry returns 401 on every subsequent call. Issue #20 covers
-/// the symptom (dbt models 401'ing partway through a run) and the matching
-/// `invalidate_rest_catalog_cache_all` below is the error-driven escape
-/// hatch called from the query handler whenever a catalog op surfaces an
-/// `AuthenticationFailed`.
+/// the symptom (dbt models 401'ing partway through a run). The query
+/// handler now calls [`invalidate_rest_catalog_cache_for_token`] on
+/// `AuthenticationFailed` / `AccessDenied` so one expired bearer does not
+/// evict every other tenant (issue #410). [`invalidate_rest_catalog_cache_all`]
+/// stays for the admin-gated catalog-refresh hook.
 ///
 /// The cached value used to be `Arc<RwLock<RestCatalog>>` but every caller
 /// only ever took the lock for read — `RestCatalog` is `Send + Sync` and
@@ -116,22 +117,59 @@ pub(crate) static REST_CATALOG_CACHE: std::sync::LazyLock<
         .build()
 });
 
-/// Drop every cached `RestCatalog` entry. Called from the query handler when a
-/// catalog operation surfaces 401/403, so the next query rebuilds the catalog
-/// with whatever bearer the session has at that point (either a refreshed
-/// token from the background refresher, or a fresh OIDC exchange after the
-/// client re-authenticates).
+/// Drop every cached `RestCatalog` entry.
 ///
-/// Heavy hammer rather than per-entry invalidation: SQE does not maintain a
-/// `username -> token_fingerprint` reverse index, so we cannot scope the
-/// eviction to one user without a side-band map. Auth failures are rare; the
-/// rebuild cost is amortised across however many entries were cached (up to
-/// `REST_CATALOG_CACHE_MAX_CAPACITY`, ~250 ms each, but lazily on next access,
-/// not all at once).
+/// Reserved for the admin-gated catalog-refresh hook. Auth-failure recovery
+/// must use [`invalidate_rest_catalog_cache_for_token`] so one expired
+/// bearer does not evict every other user's catalog (issue #410).
 pub async fn invalidate_rest_catalog_cache_all() {
     REST_CATALOG_CACHE.invalidate_all();
     REST_CATALOG_CACHE.run_pending_tasks().await;
-    debug!("REST_CATALOG_CACHE invalidated (auth failure recovery)");
+    debug!("REST_CATALOG_CACHE invalidated (admin catalog refresh)");
+}
+
+/// SHA-256 prefix used as the last segment of a `REST_CATALOG_CACHE` key.
+///
+/// Must stay in lockstep with `SessionCatalog::new` (`{url}-{warehouse}-{fp}`).
+/// Do not use [`sqe_core::Session::token_fingerprint`]: that string also
+/// prefixes the username and will not match these keys.
+pub fn rest_catalog_token_fingerprint(bearer: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let hash = hex::encode(Sha256::digest(bearer.as_bytes()));
+    hash[..16].to_string()
+}
+
+/// Keys whose last `-` segment equals `token_fingerprint`.
+fn rest_catalog_keys_for_token(
+    keys: impl IntoIterator<Item = String>,
+    token_fingerprint: &str,
+) -> Vec<String> {
+    if token_fingerprint.is_empty() {
+        return Vec::new();
+    }
+    let suffix = format!("-{token_fingerprint}");
+    keys.into_iter().filter(|k| k.ends_with(&suffix)).collect()
+}
+
+/// Drop only the `RestCatalog` entries built with this bearer fingerprint.
+///
+/// Called from the query handler on `AuthenticationFailed` / `AccessDenied`
+/// so the next query rebuilds that identity's catalog. Other tenants stay
+/// cached (issue #410).
+pub async fn invalidate_rest_catalog_cache_for_token(token_fingerprint: &str) {
+    let keys = rest_catalog_keys_for_token(
+        REST_CATALOG_CACHE.iter().map(|(k, _)| (*k).clone()),
+        token_fingerprint,
+    );
+    let dropped = keys.len();
+    for key in keys {
+        REST_CATALOG_CACHE.invalidate(&key).await;
+    }
+    REST_CATALOG_CACHE.run_pending_tasks().await;
+    debug!(
+        token_fingerprint,
+        dropped, "REST_CATALOG_CACHE invalidated for one token"
+    );
 }
 
 #[derive(Clone)]
@@ -707,11 +745,7 @@ impl SessionCatalog {
     ) -> sqe_core::Result<Self> {
         let inner: Arc<dyn iceberg::Catalog> = Self::build_backend_catalog(backend).await?;
 
-        let token_fingerprint = {
-            use sha2::{Digest, Sha256};
-            let hash = Sha256::digest(bearer_token.as_bytes());
-            hex::encode(hash)[..16].to_string()
-        };
+        let token_fingerprint = rest_catalog_token_fingerprint(bearer_token);
 
         info!(
             backend = ?backend,
@@ -907,11 +941,7 @@ impl SessionCatalog {
         http_client: Option<reqwest::Client>,
         circuit_breaker: Option<Arc<CircuitBreaker>>,
     ) -> sqe_core::Result<Self> {
-        let token_fingerprint = {
-            use sha2::{Digest, Sha256};
-            let hash = Sha256::digest(bearer_token.as_bytes());
-            hex::encode(hash)[..16].to_string()
-        };
+        let token_fingerprint = rest_catalog_token_fingerprint(bearer_token);
 
         info!(
             catalog_url = catalog_url,
@@ -2072,6 +2102,44 @@ mod cache_capacity_tests {
     fn select_keys_for_suffix_empty_when_no_match() {
         let keys = vec!["tokA|ns.other".to_string()];
         assert!(select_keys_for_suffix(keys, "ns.missing").is_empty());
+    }
+
+    #[test]
+    fn rest_catalog_keys_for_token_drops_only_that_fingerprint() {
+        let keys = vec![
+            "http://polaris/a-whA-aaaabbbbccccdddd".to_string(),
+            "http://polaris/a-whB-aaaabbbbccccdddd".to_string(),
+            "http://polaris/a-whA-eeeeffff00001111".to_string(),
+        ];
+        let mut got = super::rest_catalog_keys_for_token(keys, "aaaabbbbccccdddd");
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                "http://polaris/a-whA-aaaabbbbccccdddd".to_string(),
+                "http://polaris/a-whB-aaaabbbbccccdddd".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn rest_catalog_keys_for_token_empty_fingerprint_is_noop() {
+        let keys = vec!["http://polaris/a-whA-aaaabbbbccccdddd".to_string()];
+        assert!(super::rest_catalog_keys_for_token(keys, "").is_empty());
+    }
+
+    #[test]
+    fn rest_catalog_token_fingerprint_is_16_hex_and_stable() {
+        let fp = super::rest_catalog_token_fingerprint("bearer-token");
+        assert_eq!(fp.len(), 16);
+        assert!(fp.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(fp, super::rest_catalog_token_fingerprint("bearer-token"));
+        assert_ne!(fp, super::rest_catalog_token_fingerprint("other-token"));
+        let key = format!("http://polaris-whA-{fp}");
+        assert_eq!(
+            super::rest_catalog_keys_for_token(vec![key.clone()], &fp),
+            vec![key]
+        );
     }
 
     #[tokio::test]

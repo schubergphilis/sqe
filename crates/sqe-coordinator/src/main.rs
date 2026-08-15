@@ -428,7 +428,8 @@ async fn async_main() -> anyhow::Result<()> {
             grant_backend,
             None, // lineage observer — wired in a later phase
             sqe_coordinator::RuntimeCatalogRegistry::default(),
-            sqe_core::SecretStore::default(),
+            sqe_core::SecretStore::from_optional_path(&config.session.secrets_path)
+                .map_err(|e| anyhow::anyhow!(e))?,
         )?
         .with_table_cache(table_cache)
         .with_session_manager(session_manager.clone()),
