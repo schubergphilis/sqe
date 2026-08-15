@@ -4,6 +4,7 @@
 //! Apache Spark / Kyuubi. See docs/ranger-fine-grained-service-type.md.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -45,7 +46,6 @@ pub(crate) struct TagPolicies {
 #[derive(Debug, Deserialize, Default)]
 pub(crate) struct ServicePolicies {
     #[serde(rename = "policyVersion", default)]
-    #[allow(dead_code)] // read only in #[cfg(test)]; used by serde and test assertions
     pub(crate) policy_version: Option<i64>,
     #[serde(default)]
     pub(crate) policies: Vec<RangerPolicy>,
@@ -163,6 +163,11 @@ pub struct RangerStore {
     /// re-parsing it on every query and every tagged table. `Arc` keeps the
     /// moka `get`/`insert` clones cheap.
     bundle_cache: Cache<&'static str, Arc<ServicePolicies>>,
+    /// Last `policyVersion` observed on a download. 0 means none yet.
+    /// When a later download reports a different version, the per-user
+    /// ResolvedPolicy cache is dropped so Ranger Admin edits take effect
+    /// on the next resolve instead of waiting out a second TTL (#425).
+    last_policy_version: AtomicI64,
     breaker: Arc<PolicyCircuitBreaker>,
     metrics: Option<Arc<MetricsRegistry>>,
 }
@@ -211,6 +216,7 @@ impl RangerStore {
                 .time_to_live(Duration::from_secs(cfg.cache_ttl_secs))
                 .max_capacity(1)
                 .build(),
+            last_policy_version: AtomicI64::new(0),
             breaker: Arc::new(PolicyCircuitBreaker::new(
                 "Ranger",
                 cfg.breaker_failure_threshold,
@@ -325,8 +331,31 @@ impl RangerStore {
             return Ok(bundle);
         }
         let bundle = Arc::new(self.fetch_bundle().await?);
+        self.drop_resolved_if_bundle_changed(&bundle);
         self.bundle_cache.insert(BUNDLE_KEY, bundle.clone()).await;
         Ok(bundle)
+    }
+
+    /// Drop per-user ResolvedPolicy entries when Ranger's `policyVersion`
+    /// moved (or is absent, so we cannot tell). GRANT through SQE already
+    /// calls `invalidate_all`. This is the Admin-behind-our-back path (#425).
+    fn drop_resolved_if_bundle_changed(&self, bundle: &ServicePolicies) {
+        match bundle.policy_version {
+            Some(version) => {
+                let previous = self.last_policy_version.swap(version, Ordering::AcqRel);
+                if previous != 0 && previous != version {
+                    self.cache.invalidate_all();
+                    warn!(
+                        previous,
+                        version,
+                        "Ranger bundle policyVersion changed; dropped resolved policy cache"
+                    );
+                }
+            }
+            None => {
+                self.cache.invalidate_all();
+            }
+        }
     }
 }
 
@@ -1277,6 +1306,7 @@ impl PolicyStore for RangerStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::Ordering;
 
     fn create(sql: &str) -> sqe_sql::policy_ddl::CreatePolicyStatement {
         let parsed = sqe_sql::policy_ddl::try_parse_policy_ddl(sql)
@@ -1648,6 +1678,90 @@ mod tests {
     fn flattens_iceberg_to_hive_database() {
         assert_eq!(hive_database("sales"), "sales");
         assert_eq!(hive_database("sales.eu"), "sales.eu");
+    }
+
+    fn db_table_policy(database: &str, table: &str) -> RangerPolicy {
+        let mut p = RangerPolicy::default();
+        p.resources.insert(
+            "database".to_string(),
+            RangerResource {
+                values: vec![database.to_string()],
+                is_excludes: false,
+            },
+        );
+        p.resources.insert(
+            "table".to_string(),
+            RangerResource {
+                values: vec![table.to_string()],
+                is_excludes: false,
+            },
+        );
+        p
+    }
+
+    #[test]
+    fn last_component_fallback_matches_and_collides_across_tenants() {
+        let policy = db_table_policy("finance", "orders");
+        assert!(
+            policy_matches_table(&policy, "finance", "orders"),
+            "exact last-component key still matches"
+        );
+        assert!(
+            policy_matches_table(&policy, "tenant_a.finance", "orders"),
+            "full namespace must still match a last-component policy"
+        );
+        assert!(
+            policy_matches_table(&policy, "tenant_b.finance", "orders"),
+            "the same last-component policy also hits the other tenant (collision)"
+        );
+        assert!(
+            !policy_matches_table(&policy, "tenant_a.other", "orders"),
+            "a different last component must not match"
+        );
+    }
+
+    #[tokio::test]
+    async fn new_bundle_version_drops_resolved_policy_cache() {
+        let store = RangerStore::from_config(&RangerPolicyConfig::default()).unwrap();
+        let u = user("alice", &["analyst"]);
+        let key = cache_key(&u, "orders", "sales");
+        store
+            .cache
+            .insert(key.clone(), ResolvedPolicy::default())
+            .await;
+        store.last_policy_version.store(1, Ordering::Relaxed);
+
+        store.drop_resolved_if_bundle_changed(&ServicePolicies {
+            policy_version: Some(2),
+            ..ServicePolicies::default()
+        });
+        store.cache.run_pending_tasks().await;
+        assert!(
+            store.cache.get(&key).await.is_none(),
+            "a newer policyVersion must drop the resolved cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn same_bundle_version_keeps_resolved_policy_cache() {
+        let store = RangerStore::from_config(&RangerPolicyConfig::default()).unwrap();
+        let u = user("alice", &["analyst"]);
+        let key = cache_key(&u, "orders", "sales");
+        store
+            .cache
+            .insert(key.clone(), ResolvedPolicy::default())
+            .await;
+        store.last_policy_version.store(7, Ordering::Relaxed);
+
+        store.drop_resolved_if_bundle_changed(&ServicePolicies {
+            policy_version: Some(7),
+            ..ServicePolicies::default()
+        });
+        store.cache.run_pending_tasks().await;
+        assert!(
+            store.cache.get(&key).await.is_some(),
+            "an unchanged policyVersion must keep the resolved cache"
+        );
     }
 
     #[test]
