@@ -101,10 +101,19 @@ impl TagSource for CacheTagSource {
             }
         };
 
-        // Cache hit: the tag state is KNOWN. `parse_column_tags` returns an
-        // empty map for a table with no `sqe.column-tags` property; that is a
-        // valid "known: no tags" answer, so wrap it in Some (never None here).
-        Some(parse_column_tags(&props))
+        // Cache hit: absent `sqe.column-tags` is known-empty (untagged).
+        // Malformed or wrong-shape JSON is UNKNOWN, same as a cache miss:
+        // return None so the rewriter fail-closes instead of unmasking.
+        match parse_column_tags(&props) {
+            Ok(map) => Some(map),
+            Err(e) => {
+                debug!(
+                    error = %e,
+                    "tag_source: malformed sqe.column-tags JSON, tag state UNKNOWN (fail closed)"
+                );
+                None
+            }
+        }
     }
 }
 
@@ -113,25 +122,20 @@ impl TagSource for CacheTagSource {
 /// Extracted as a pure function so unit tests can exercise the parsing logic
 /// without a live cache or iceberg `Table` object.
 ///
-/// Returns an empty map on any failure (absent key, malformed JSON, wrong
-/// JSON shape) — fail-safe: no tags means no extra masking.
-pub(crate) fn parse_column_tags(props: &HashMap<String, String>) -> HashMap<String, Vec<String>> {
+/// * Absent key → `Ok` empty map (known: table is untagged).
+/// * Valid JSON object mapping column → tag list → `Ok` of that map.
+/// * Malformed JSON or wrong shape → `Err` (unknown). Callers must not treat
+///   this as empty: the rewriter fail-closes, and SET/UNSET TAGS must refuse
+///   rather than wipe existing tags.
+pub(crate) fn parse_column_tags(
+    props: &HashMap<String, String>,
+) -> Result<HashMap<String, Vec<String>>, serde_json::Error> {
     let raw = match props.get(PROP_KEY) {
         Some(v) => v,
-        None => return HashMap::new(),
+        None => return Ok(HashMap::new()),
     };
 
-    match serde_json::from_str::<HashMap<String, Vec<String>>>(raw) {
-        Ok(map) => map,
-        Err(e) => {
-            debug!(
-                error = %e,
-                raw = %raw,
-                "tag_source: malformed sqe.column-tags JSON, returning empty tags"
-            );
-            HashMap::new()
-        }
-    }
+    serde_json::from_str::<HashMap<String, Vec<String>>>(raw)
 }
 
 /// Apply column-tag operations to the current tag map (merge semantics).
@@ -260,7 +264,7 @@ mod tests {
             "sqe.column-tags",
             r#"{"email":["PII","GDPR"],"salary":["PII","CONFIDENTIAL"]}"#,
         )]);
-        let got = parse_column_tags(&p);
+        let got = parse_column_tags(&p).expect("valid map must parse");
         assert_eq!(got.get("email").unwrap(), &vec!["PII", "GDPR"]);
         assert_eq!(got.get("salary").unwrap(), &vec!["PII", "CONFIDENTIAL"]);
         assert_eq!(got.len(), 2);
@@ -269,38 +273,55 @@ mod tests {
     #[test]
     fn absent_property_returns_empty() {
         let p = props(&[("other.prop", "value")]);
-        assert!(parse_column_tags(&p).is_empty());
+        let got = parse_column_tags(&p).expect("missing key is known-empty");
+        assert!(got.is_empty());
     }
 
     #[test]
     fn empty_properties_returns_empty() {
-        assert!(parse_column_tags(&HashMap::new()).is_empty());
+        let got = parse_column_tags(&HashMap::new()).expect("missing key is known-empty");
+        assert!(got.is_empty());
     }
 
     #[test]
-    fn malformed_json_returns_empty_fail_safe() {
+    fn malformed_json_is_unknown() {
         let p = props(&[("sqe.column-tags", "not-valid-json{{")]);
-        assert!(parse_column_tags(&p).is_empty());
+        assert!(
+            parse_column_tags(&p).is_err(),
+            "malformed JSON must not be treated as empty tags"
+        );
     }
 
     #[test]
-    fn wrong_json_shape_returns_empty() {
+    fn wrong_json_shape_object_value_is_unknown() {
         // JSON is valid but not HashMap<String, Vec<String>>
         let p = props(&[("sqe.column-tags", r#"{"email": "not-an-array"}"#)]);
-        assert!(parse_column_tags(&p).is_empty());
+        assert!(parse_column_tags(&p).is_err());
+    }
+
+    #[test]
+    fn wrong_json_shape_array_is_unknown() {
+        let p = props(&[("sqe.column-tags", r#"["PII","GDPR"]"#)]);
+        assert!(parse_column_tags(&p).is_err());
+    }
+
+    #[test]
+    fn wrong_json_shape_string_is_unknown() {
+        let p = props(&[("sqe.column-tags", r#""PII""#)]);
+        assert!(parse_column_tags(&p).is_err());
     }
 
     #[test]
     fn empty_tags_array_is_valid() {
         let p = props(&[("sqe.column-tags", r#"{"col": []}"#)]);
-        let got = parse_column_tags(&p);
+        let got = parse_column_tags(&p).expect("empty tag list is valid");
         assert_eq!(got.get("col").unwrap(), &Vec::<String>::new());
     }
 
     #[test]
     fn empty_json_object_returns_empty_map() {
         let p = props(&[("sqe.column-tags", "{}")]);
-        let got = parse_column_tags(&p);
+        let got = parse_column_tags(&p).expect("empty object is a valid empty map");
         assert!(got.is_empty());
     }
 
@@ -328,7 +349,7 @@ mod tests {
     #[test]
     fn set_tags_writes_property_that_reads_back_merged() {
         // No existing tags (fresh table).
-        let current = parse_column_tags(&HashMap::new());
+        let current = parse_column_tags(&HashMap::new()).expect("missing key is known-empty");
         assert!(current.is_empty());
 
         // SET TAGS ('PII','GDPR') ON COLUMN email.
@@ -345,7 +366,7 @@ mod tests {
             written.contains_key(PROP_KEY),
             "property must be written under PROP_KEY"
         );
-        let read_back = parse_column_tags(&written);
+        let read_back = parse_column_tags(&written).expect("written property must parse");
         assert_eq!(
             read_back.get("email").unwrap(),
             &vec!["PII".to_string(), "GDPR".to_string()],
@@ -367,7 +388,7 @@ mod tests {
         let persisted = serialize_to_props(&first);
 
         // Second SET TAGS reads the persisted property and merges a new tag.
-        let current = parse_column_tags(&persisted);
+        let current = parse_column_tags(&persisted).expect("persisted map must parse");
         let second = apply_tag_ops(
             &current,
             &[ColumnTagOp {
@@ -376,7 +397,8 @@ mod tests {
                 action: TagAction::Set,
             }],
         );
-        let read_back = parse_column_tags(&serialize_to_props(&second));
+        let read_back =
+            parse_column_tags(&serialize_to_props(&second)).expect("merged property must parse");
         assert_eq!(
             read_back.get("email").unwrap(),
             &vec!["PII".to_string(), "GDPR".to_string()],
