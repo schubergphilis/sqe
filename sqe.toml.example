@@ -215,9 +215,19 @@ allow_insecure_transport = true  # dev only -- enable TLS for production
 # default SessionBearer for catalog auth. Set true only for a deliberate
 # single-service deployment where every caller legitimately shares one identity.
 # allow_shared_service_identity = false
+#
+# allow_unkeyed_hash_masks (issue #402): Ranger MASK_HASH falls back to
+# unsalted SHA-256 when policy.mask_key is empty (rainbow-tableable on
+# SSN/phone/small enums). In production_mode the engine refuses to start
+# with engine = ranger and an empty mask_key unless this is set true.
+# Set policy.mask_key (or SQE_POLICY__MASK_KEY) instead.
+# allow_unkeyed_hash_masks = false
 
 [policy]
 engine = "passthrough"
+# Required in production_mode when engine = "ranger" (unless
+# security.allow_unkeyed_hash_masks = true). Upgrades MASK_HASH to HMAC.
+# mask_key = "set-via-SQE_POLICY__MASK_KEY"
 
 [session]
 idle_timeout_secs = 900       # 15 minutes — sessions idle longer than this are expired

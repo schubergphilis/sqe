@@ -2773,10 +2773,12 @@ pub struct PolicyConfig {
     /// coordinator restarts and across all coordinators in an HA setup.
     ///
     /// This applies to Ranger `MASK_HASH` column masks.
-    /// We warn rather than reject on `engine = ranger` + empty key (issue #37):
-    /// default-denying Hash without a key is the stronger control but is
-    /// breaking for deployments already relying on the unkeyed behaviour, so it
-    /// is deferred. Setting this key is the recommended hardening step.
+    /// Outside production we warn rather than reject on `engine = ranger` +
+    /// empty key (issue #37): default-denying Hash without a key is the
+    /// stronger control but is breaking for deployments already relying on
+    /// the unkeyed behaviour. `production_mode` refuses the empty key
+    /// unless `security.allow_unkeyed_hash_masks = true` (issue #402).
+    /// Setting this key is the recommended hardening step.
     ///
     /// Can be set via the `SQE_POLICY__MASK_KEY` environment variable.
     #[serde(default)]
@@ -3308,6 +3310,15 @@ pub struct SecurityConfig {
     /// config diffs.
     #[serde(default)]
     pub allow_shared_service_identity: bool,
+    /// Opt-in escape hatch for Ranger `MASK_HASH` without `policy.mask_key`
+    /// (issue #402). Leaving this `false` (the default) makes
+    /// `production_mode` refuse to start when `policy.engine = ranger` and
+    /// `policy.mask_key` is empty, because Hash then falls back to unsalted
+    /// SHA-256 (rainbow-tableable on SSN/phone/small enums). Set `true` only
+    /// to acknowledge unsalted hashes; the choice is then visible in config
+    /// diffs. Dev (non-production) still WARNs and starts.
+    #[serde(default)]
+    pub allow_unkeyed_hash_masks: bool,
 }
 
 impl SecurityConfig {
@@ -4534,6 +4545,19 @@ impl SqeConfig {
             );
         }
 
+        if self.policy.engine == PolicyEngine::Ranger
+            && self.policy.mask_key.is_empty()
+            && !self.security.allow_unkeyed_hash_masks
+        {
+            errors.push(
+                "production_mode: policy.engine is ranger but policy.mask_key is empty \
+                 (Ranger MASK_HASH would fall back to unsalted SHA-256). Set \
+                 policy.mask_key (or SQE_POLICY__MASK_KEY), or set \
+                 security.allow_unkeyed_hash_masks = true to acknowledge unsalted hashes."
+                    .to_string(),
+            );
+        }
+
         if errors.is_empty() {
             Ok(())
         } else {
@@ -4686,6 +4710,10 @@ impl SqeConfig {
         env_override_bool(
             "SQE_SECURITY__ALLOW_SHARED_SERVICE_IDENTITY",
             &mut self.security.allow_shared_service_identity,
+        );
+        env_override_bool(
+            "SQE_SECURITY__ALLOW_UNKEYED_HASH_MASKS",
+            &mut self.security.allow_unkeyed_hash_masks,
         );
 
         // Auth
@@ -6392,6 +6420,30 @@ partial_progress_batch = 5
         let mut config = valid_production_config();
         config.coordinator.worker_urls = vec!["http://worker-1:50051".to_string()];
         config.coordinator.worker_secret = SecretString::new("shared-secret-value".to_string());
+        assert!(config.validate_production().is_ok());
+    }
+
+    #[test]
+    fn validate_production_rejects_ranger_without_mask_key() {
+        let mut config = valid_production_config();
+        config.policy.engine = PolicyEngine::Ranger;
+        config.policy.mask_key.clear();
+        // Keep project-tags on so this arm stays about mask_key only.
+        config.policy.ranger.project_tags = true;
+        let err = config.validate_production().unwrap_err().to_string();
+        assert!(
+            err.contains("allow_unkeyed_hash_masks") && err.contains("mask_key"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_production_accepts_ranger_unkeyed_hash_when_opted_in() {
+        let mut config = valid_production_config();
+        config.policy.engine = PolicyEngine::Ranger;
+        config.policy.mask_key.clear();
+        config.policy.ranger.project_tags = true;
+        config.security.allow_unkeyed_hash_masks = true;
         assert!(config.validate_production().is_ok());
     }
 
