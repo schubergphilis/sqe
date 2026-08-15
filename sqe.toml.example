@@ -222,12 +222,25 @@ allow_insecure_transport = true  # dev only -- enable TLS for production
 # with engine = ranger and an empty mask_key unless this is set true.
 # Set policy.mask_key (or SQE_POLICY__MASK_KEY) instead.
 # allow_unkeyed_hash_masks = false
+#
+# allow_unprojected_tags (issue #397): SET TAG writes Iceberg
+# `sqe.column-tags` (SQE-only). Spark/Kyuubi masks from Ranger's tag store.
+# With engine = ranger and project-tags off, SQE masks and Spark returns
+# raw. Mixed SQE+Spark MUST set policy.ranger.project-tags = true.
+# production_mode refuses Ranger with project-tags off unless this is set
+# true (SQE-only Ranger deploys that never talk to Spark).
+# allow_unprojected_tags = false
 
 [policy]
 engine = "passthrough"
 # Required in production_mode when engine = "ranger" (unless
 # security.allow_unkeyed_hash_masks = true). Upgrades MASK_HASH to HMAC.
 # mask_key = "set-via-SQE_POLICY__MASK_KEY"
+#
+# [policy.ranger]
+# Mixed SQE+Spark MUST set project-tags = true so Spark sees the same
+# column tags SQE masks. Default is false (SQE-only Ranger deploys).
+# project-tags = true
 
 [session]
 idle_timeout_secs = 900       # 15 minutes — sessions idle longer than this are expired
