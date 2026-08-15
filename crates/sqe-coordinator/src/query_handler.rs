@@ -2765,6 +2765,11 @@ impl QueryHandler {
     /// its declared and actual result schemas differ. Other non-query
     /// statements remain side-effect-only and use an empty schema.
     pub async fn get_schema(&self, session: &Session, sql: &str) -> sqe_core::Result<SchemaRef> {
+        // GetFlightInfo / prepared-statement creation plan through here
+        // without calling execute(). Cap the statement first so ADBC/JDBC
+        // cannot burn the parser on an arbitrarily large query (#403).
+        reject_oversized_sql(&self.config.query, sql)?;
+
         // Run the pre-parse pipeline before handing to the classifier;
         // see `pipeline_types.rs` for the trust-boundary contract (issue #117).
         let kind = sqe_sql::parse_and_classify_typed(&sqe_sql::pre_parse_pipeline(
