@@ -9,7 +9,7 @@ use datafusion::catalog::SchemaProvider;
 use datafusion::datasource::{MemTable, TableProvider};
 use datafusion::error::{DataFusionError, Result as DFResult};
 use iceberg::NamespaceIdent;
-use tracing::{debug, error, warn};
+use tracing::{debug, warn};
 
 use sqe_core::SessionUser;
 use sqe_policy::PolicyStore;

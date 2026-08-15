@@ -122,6 +122,10 @@ where
 /// `Ok(true)` keeps the name, `Ok(false)` hides it (403), and `Err`
 /// (timeout/5xx/other) fails the whole listing so an indeterminate
 /// probe cannot leak the name (#401).
+///
+/// A single transient probe is retried once before the listing fails.
+/// Catalogs with hundreds of namespaces otherwise turn one timeout into
+/// a total metadata outage for every BI tool that lists schemas.
 pub(crate) async fn filter_visible_namespaces<F, Fut>(
     namespaces: Vec<NamespaceIdent>,
     concurrency: usize,
@@ -131,10 +135,17 @@ where
     F: Fn(NamespaceIdent) -> Fut,
     Fut: std::future::Future<Output = sqe_core::Result<bool>>,
 {
+    let probe = std::sync::Arc::new(probe);
     let probed: Vec<(NamespaceIdent, sqe_core::Result<bool>)> = futures::stream::iter(namespaces)
         .map(|ns| {
-            let visible = probe(ns.clone());
-            async move { (ns, visible.await) }
+            let probe = std::sync::Arc::clone(&probe);
+            async move {
+                let result = match probe(ns.clone()).await {
+                    Ok(v) => Ok(v),
+                    Err(_) => probe(ns.clone()).await,
+                };
+                (ns, result)
+            }
         })
         .buffered(concurrency.max(1))
         .collect()
@@ -633,9 +644,37 @@ mod tests {
         })
         .await
         .expect_err("probe failure must fail the listing, not keep the name");
+        assert_eq!(err.error_code(), sqe_core::SqeErrorCode::CatalogUnavailable);
+    }
+
+    /// A single transient probe is retried once; the listing succeeds if
+    /// the retry is Ok. Persistent errors still fail the listing.
+    #[tokio::test]
+    async fn visibility_filter_retries_transient_probe_once() {
+        let flaky_tries = std::sync::Arc::new(AtomicUsize::new(0));
+        let input = vec![ns("public"), ns("flaky")];
+        let out = filter_visible_namespaces(input, 8, {
+            let flaky_tries = std::sync::Arc::clone(&flaky_tries);
+            move |n| {
+                let name = n.as_ref().join(".");
+                let flaky_tries = std::sync::Arc::clone(&flaky_tries);
+                async move {
+                    if name == "flaky" && flaky_tries.fetch_add(1, Ordering::SeqCst) == 0 {
+                        return Err(sqe_core::SqeError::Catalog(
+                            "500 Internal Server Error".to_string(),
+                        ));
+                    }
+                    Ok(true)
+                }
+            }
+        })
+        .await
+        .expect("one retry must recover a single 5xx probe");
+        assert_eq!(out.len(), 2);
         assert_eq!(
-            err.error_code(),
-            sqe_core::SqeErrorCode::CatalogUnavailable
+            flaky_tries.load(Ordering::SeqCst),
+            2,
+            "flaky namespace must have been probed twice"
         );
     }
 
