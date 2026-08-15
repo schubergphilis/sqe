@@ -773,10 +773,14 @@ impl CatalogOps {
         //
         // `rewrite_tag_keys` returns None when nothing changed, so a plain ALTER on
         // an untagged table adds no property write.
-        let rewritten_tags = crate::tag_source_impl::rewrite_tag_keys(
-            &crate::tag_source_impl::parse_column_tags(metadata.properties()),
-            &tag_key_changes,
-        );
+        let current_tags = crate::tag_source_impl::parse_column_tags(metadata.properties())
+            .map_err(|e| {
+                SqeError::Execution(format!(
+                    "malformed sqe.column-tags JSON on table '{table_ident}': {e}"
+                ))
+            })?;
+        let rewritten_tags =
+            crate::tag_source_impl::rewrite_tag_keys(&current_tags, &tag_key_changes);
         if let Some(ref new_tags) = rewritten_tags {
             let json = serde_json::to_string(new_tags).map_err(|e| {
                 SqeError::Execution(format!("failed to serialize column tags: {e}"))
@@ -826,7 +830,7 @@ impl CatalogOps {
                     &table_ident.namespace().to_url_string(),
                     table_ident.name().to_string(),
                 );
-                let previous = crate::tag_source_impl::parse_column_tags(metadata.properties());
+                let previous = current_tags;
                 let previous_projected: sqe_policy::tag_projector::ColumnTags = previous
                     .iter()
                     .map(|(k, v)| (k.clone(), v.clone()))
@@ -1200,7 +1204,13 @@ impl CatalogOps {
         let _guard = table_lock.lock().await;
 
         let table = session_catalog.load_table(&table_ident).await?;
-        let current = crate::tag_source_impl::parse_column_tags(table.metadata().properties());
+        let current = crate::tag_source_impl::parse_column_tags(table.metadata().properties())
+            .map_err(|e| {
+                SqeError::Execution(format!(
+                    "malformed sqe.column-tags JSON on table '{table_ident}': {e}; \
+                     refusing to apply SET/UNSET TAGS so existing tags are not wiped"
+                ))
+            })?;
 
         let new_map = crate::tag_source_impl::apply_tag_ops(&current, &stmt.ops);
         let json = serde_json::to_string(&new_map)
@@ -1326,7 +1336,12 @@ impl CatalogOps {
             .await?;
 
         let table = session_catalog.load_table(&table_ident).await?;
-        let tags = crate::tag_source_impl::parse_column_tags(table.metadata().properties());
+        let tags = crate::tag_source_impl::parse_column_tags(table.metadata().properties())
+            .map_err(|e| {
+                SqeError::Execution(format!(
+                    "malformed sqe.column-tags JSON on table '{table_ident}': {e}"
+                ))
+            })?;
         Ok((table_ident, tags))
     }
 
