@@ -93,7 +93,8 @@ pub(crate) struct DataMaskPolicyItem {
     pub(crate) users: Vec<String>,
     #[serde(default)]
     pub(crate) roles: Vec<String>,
-    // groups-based binding is NOT enforced (SQE matches token roles only); see Phase 2.
+    /// Matched against `SessionUser.groups` (JWT `groups_claim`). A group-only
+    /// item never fires when that claim is unset; see `note_group_only_items`.
     #[serde(default)]
     pub(crate) groups: Vec<String>,
     #[serde(rename = "dataMaskInfo", default)]
@@ -114,7 +115,8 @@ pub(crate) struct RowFilterPolicyItem {
     pub(crate) users: Vec<String>,
     #[serde(default)]
     pub(crate) roles: Vec<String>,
-    // groups-based binding is NOT enforced (SQE matches token roles only); see Phase 2.
+    /// Matched against `SessionUser.groups` (JWT `groups_claim`). A group-only
+    /// item never fires when that claim is unset; see `note_group_only_items`.
     #[serde(default)]
     pub(crate) groups: Vec<String>,
     #[serde(rename = "rowFilterInfo", default)]
@@ -303,6 +305,9 @@ impl RangerStore {
             self.record_metric(started, "err");
             sqe_core::error::SqeError::Execution(format!("Failed to parse Ranger bundle: {e}"))
         })?;
+        // Once per download, not per query: group-only items are invisible
+        // unless `groups_claim` is set, which is a config gap not a per-row miss.
+        note_group_only_items(&bundle, self.metrics.as_deref());
         self.breaker.record_success();
         self.record_metric(started, "ok");
         Ok(bundle)
@@ -447,11 +452,14 @@ fn policy_matches_table(p: &RangerPolicy, database: &str, table: &str) -> bool {
     db_ok && tbl_ok
 }
 
-/// True if a policy-item applies to this user/roles (token roles, matched directly).
+/// True if a policy-item applies to this user, any of their roles, or any of
+/// their groups. The three lists are OR-ed.
 ///
-/// `groups` is accepted but NOT enforced (SQE has no group info; token roles
-/// only, by design — Phase 2). A policy item bound ONLY via `groups` is skipped
-/// with a warning so operators see the gap instead of a silent drop.
+/// Groups come from the JWT `groups_claim` on the auth provider. A group-only
+/// item (no users, no roles) cannot match when the session carries no groups,
+/// which is what happens when `groups_claim` is unset. That miss is logged at
+/// debug here (per item, per cache miss) and as a single warn on bundle
+/// download via `note_group_only_items`.
 fn item_matches(users: &[String], roles: &[String], groups: &[String], user: &SessionUser) -> bool {
     let matched = users.iter().any(|u| u == &user.username)
         || roles.iter().any(|r| user.roles.contains(r))
@@ -473,6 +481,60 @@ fn item_matches(users: &[String], roles: &[String], groups: &[String], user: &Se
         );
     }
     matched
+}
+
+/// True when an item binds only via `groups` (no users, no roles). Those items
+/// never fire unless the session carries groups, which requires `groups_claim`.
+fn is_group_only(users: &[String], roles: &[String], groups: &[String]) -> bool {
+    users.is_empty() && roles.is_empty() && !groups.is_empty()
+}
+
+/// Count group-only mask and row-filter items across resource and tag policies.
+///
+/// Split out so the bundle-download warn is unit-testable without HTTP.
+fn count_group_only_items(bundle: &ServicePolicies) -> usize {
+    let in_policies = |policies: &[RangerPolicy]| -> usize {
+        policies
+            .iter()
+            .map(|p| {
+                p.data_mask_policy_items
+                    .iter()
+                    .filter(|i| is_group_only(&i.users, &i.roles, &i.groups))
+                    .count()
+                    + p.row_filter_policy_items
+                        .iter()
+                        .filter(|i| is_group_only(&i.users, &i.roles, &i.groups))
+                        .count()
+            })
+            .sum()
+    };
+    let tagged = bundle
+        .tag_policies
+        .as_ref()
+        .map(|t| in_policies(&t.policies))
+        .unwrap_or(0);
+    in_policies(&bundle.policies) + tagged
+}
+
+/// Log one warn per downloaded bundle that contains group-only items, and bump
+/// `sqe_ranger_group_only_items` when a registry is attached.
+///
+/// Returns the count so tests can assert the path without capturing logs.
+fn note_group_only_items(bundle: &ServicePolicies, metrics: Option<&MetricsRegistry>) -> usize {
+    let n = count_group_only_items(bundle);
+    if n == 0 {
+        return 0;
+    }
+    warn!(
+        group_only_items = n,
+        "Ranger bundle has {n} group-only policy item(s) (groups set, no users or roles). \
+         Those items never apply unless `groups_claim` is set on the auth provider \
+         so session groups are populated from the token."
+    );
+    if let Some(metrics) = metrics {
+        metrics.ranger_group_only_items.inc_by(n as u64);
+    }
+    n
 }
 
 /// Normalize a Ranger data-mask type name.
@@ -1786,7 +1848,7 @@ mod tests {
     }
 
     #[test]
-    fn group_bound_item_is_skipped() {
+    fn group_only_item_does_not_match_empty_session_groups() {
         let mut bundle: ServicePolicies = serde_json::from_str(BUNDLE).unwrap();
         let item = &mut bundle.policies[0].data_mask_policy_items[0];
         item.roles.clear();
@@ -1795,8 +1857,51 @@ mod tests {
         let policy = resolve_from_bundle(&bundle, &user("alice", &["analyst"]), "orders", "sales");
         assert!(
             policy.column_masks.is_empty(),
-            "group-bound item must not be enforced in MVP"
+            "group-only item must not match a session with empty groups \
+             (groups_claim unset)"
         );
+    }
+
+    #[test]
+    fn group_only_item_matches_when_session_has_groups() {
+        let mut bundle: ServicePolicies = serde_json::from_str(BUNDLE).unwrap();
+        let item = &mut bundle.policies[0].data_mask_policy_items[0];
+        item.roles.clear();
+        item.users.clear();
+        item.groups = vec!["analysts_group".to_string()];
+        let policy = resolve_from_bundle(
+            &bundle,
+            &user_with_groups("alice", &[], &["analysts_group"]),
+            "orders",
+            "sales",
+        );
+        assert!(
+            policy.column_masks.contains_key("amount"),
+            "group-only item must fire when the session carries that group"
+        );
+    }
+
+    #[test]
+    fn count_group_only_items_is_the_bundle_warn_hook() {
+        let mut bundle: ServicePolicies = serde_json::from_str(BUNDLE).unwrap();
+        assert_eq!(count_group_only_items(&bundle), 0);
+        assert_eq!(note_group_only_items(&bundle, None), 0);
+
+        bundle.policies[0].data_mask_policy_items[0].roles.clear();
+        bundle.policies[0].data_mask_policy_items[0].users.clear();
+        bundle.policies[0].data_mask_policy_items[0].groups = vec!["analysts_group".into()];
+        assert_eq!(count_group_only_items(&bundle), 1);
+
+        // An item that also has roles is not group-only.
+        bundle.policies[1].row_filter_policy_items[0].groups = vec!["analysts_group".into()];
+        assert_eq!(count_group_only_items(&bundle), 1);
+
+        let metrics = MetricsRegistry::new().unwrap();
+        assert_eq!(note_group_only_items(&bundle, Some(&metrics)), 1);
+        assert_eq!(metrics.ranger_group_only_items.get(), 1);
+        // A second note (another download of the same bundle) bumps again.
+        assert_eq!(note_group_only_items(&bundle, Some(&metrics)), 1);
+        assert_eq!(metrics.ranger_group_only_items.get(), 2);
     }
 
     // --- map_mask arm tests ---
