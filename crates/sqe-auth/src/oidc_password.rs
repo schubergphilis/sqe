@@ -2,8 +2,8 @@ use std::time::Duration;
 
 use base64::Engine;
 use serde::Deserialize;
-use sqe_core::SecretString;
 use sqe_core::config::AuthConfig;
+use sqe_core::SecretString;
 use tracing::{debug, warn};
 
 use crate::provider::truncate_for_log;
@@ -96,10 +96,7 @@ impl OidcPasswordClient {
             .map_err(|e| sqe_core::SqeError::Auth(format!("Failed to parse token response: {e}")))
     }
 
-    pub async fn refresh_token(
-        &self,
-        refresh_token: &str,
-    ) -> sqe_core::Result<TokenResponse> {
+    pub async fn refresh_token(&self, refresh_token: &str) -> sqe_core::Result<TokenResponse> {
         debug!("Refreshing token via OIDC provider");
 
         let params = [
@@ -133,9 +130,7 @@ impl OidcPasswordClient {
         response
             .json::<TokenResponse>()
             .await
-            .map_err(|e| {
-                sqe_core::SqeError::Auth(format!("Failed to parse refresh response: {e}"))
-            })
+            .map_err(|e| sqe_core::SqeError::Auth(format!("Failed to parse refresh response: {e}")))
     }
 
     /// Decode JWT payload without signature verification (OIDC provider

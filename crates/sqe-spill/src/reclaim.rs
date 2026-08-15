@@ -112,11 +112,7 @@ impl GrantRegistry {
 
     /// Record a consumer's bounds and return a fixed grant of `capacity`
     /// (caller chooses capacity from operator_budget / policy).
-    pub fn register(
-        &self,
-        consumer: &dyn ReclaimableConsumer,
-        capacity: usize,
-    ) -> MemoryGrant {
+    pub fn register(&self, consumer: &dyn ReclaimableConsumer, capacity: usize) -> MemoryGrant {
         self.total_desired
             .fetch_add(consumer.desired_bytes(), Ordering::Relaxed);
         self.total_minimum

@@ -1,6 +1,6 @@
-use sqe_lineage::*;
-use sqe_lineage::sinks::http::{AuthMode, HttpConfig, HttpSink};
 use sqe_lineage::event::*;
+use sqe_lineage::sinks::http::{AuthMode, HttpConfig, HttpSink};
+use sqe_lineage::*;
 use wiremock::{matchers, Mock, MockServer, ResponseTemplate};
 
 fn dummy_event() -> RunEvent {
@@ -10,7 +10,11 @@ fn dummy_event() -> RunEvent {
         producer: "test".into(),
         schemaURL: SCHEMA_URL.into(),
         run: Run::new(uuid::Uuid::nil()),
-        job: Job { namespace: "sqe".into(), name: "query:test".into(), facets: Default::default() },
+        job: Job {
+            namespace: "sqe".into(),
+            name: "query:test".into(),
+            facets: Default::default(),
+        },
         inputs: vec![],
         outputs: vec![],
     }
@@ -118,7 +122,7 @@ async fn http_sink_returns_error_after_exhausting_retries() {
         endpoint: format!("{}/api/v1/lineage", server.uri()),
         auth: AuthMode::None,
         timeout_ms: 5000,
-        retry_attempts: 0,  // no retries; first 503 fails immediately
+        retry_attempts: 0, // no retries; first 503 fails immediately
     })
     .unwrap();
 

@@ -165,7 +165,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     let request_bytes = encode_message(&struct_header, &struct_body);
     save("prepare_request_struct.bin", &request_bytes)?;
     let response_bytes = post_quack(&client, request_bytes)?;
-    hexdump("DuckDB response to STRUCT(a INT, b VARCHAR)", &response_bytes);
+    hexdump(
+        "DuckDB response to STRUCT(a INT, b VARCHAR)",
+        &response_bytes,
+    );
     save("prepare_response_struct.bin", &response_bytes)?;
 
     // ── 6. MAP<VARCHAR, INTEGER> ──────────────────────────────────────────
@@ -220,7 +223,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     let request_bytes = encode_message(&enum_header, &enum_body);
     save("prepare_request_enum.bin", &request_bytes)?;
     let response_bytes = post_quack(&client, request_bytes)?;
-    hexdump("DuckDB response to ENUM('red','green','blue')", &response_bytes);
+    hexdump(
+        "DuckDB response to ENUM('red','green','blue')",
+        &response_bytes,
+    );
     save("prepare_response_enum.bin", &response_bytes)?;
 
     // ── 9. UNION ───────────────────────────────────────────────────────────

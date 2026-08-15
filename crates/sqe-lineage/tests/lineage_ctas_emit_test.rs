@@ -104,16 +104,15 @@ async fn ctas_complete_event_with_captured_plan_carries_column_lineage() {
     let (tx, rx) = tokio::sync::mpsc::channel(8);
     let _emitter = spawn_emitter(rx, multi, cfg());
 
-    let counter =
-        prometheus::IntCounter::new("ctas_emit_test_1", "test").unwrap();
+    let counter = prometheus::IntCounter::new("ctas_emit_test_1", "test").unwrap();
     let obs = ChannelObserver::new(tx, counter);
 
     let plan = build_ctas_wrapped_plan();
 
     let mut ctx = QueryCompleteCtx::dummy();
     ctx.statement_kind = "ctas".into();
-    ctx.sql = "CREATE TABLE polaris.sales.archive AS SELECT id, amount FROM polaris.sales.orders"
-        .into();
+    ctx.sql =
+        "CREATE TABLE polaris.sales.archive AS SELECT id, amount FROM polaris.sales.orders".into();
     ctx.plan = Some(PlanOrHint::Plan(Box::new(plan)));
 
     obs.on_query_complete(ctx);
@@ -128,9 +127,7 @@ async fn ctas_complete_event_with_captured_plan_carries_column_lineage() {
     // write plan was captured. Without the fix, plan = None and this
     // facet would be missing entirely. (Pre-spec-fix this lived under
     // outputFacets; OL 2.0 places ColumnLineageDatasetFacet in facets.)
-    let outputs = body["outputs"]
-        .as_array()
-        .expect("outputs array present");
+    let outputs = body["outputs"].as_array().expect("outputs array present");
     assert_eq!(outputs.len(), 1, "exactly one output dataset");
     assert_eq!(outputs[0]["name"], "sales.archive");
 
@@ -166,9 +163,7 @@ async fn ctas_complete_event_with_captured_plan_carries_column_lineage() {
     assert_eq!(txform["subtype"], "IDENTITY");
 
     // Inputs must also be populated.
-    let inputs = body["inputs"]
-        .as_array()
-        .expect("inputs array present");
+    let inputs = body["inputs"].as_array().expect("inputs array present");
     assert_eq!(inputs.len(), 1);
     assert_eq!(inputs[0]["name"], "sales.orders");
 }
@@ -199,8 +194,7 @@ async fn ctas_complete_event_without_plan_has_empty_lineage() {
     let (tx, rx) = tokio::sync::mpsc::channel(8);
     let _emitter = spawn_emitter(rx, multi, cfg());
 
-    let counter =
-        prometheus::IntCounter::new("ctas_emit_test_2", "test").unwrap();
+    let counter = prometheus::IntCounter::new("ctas_emit_test_2", "test").unwrap();
     let obs = ChannelObserver::new(tx, counter);
 
     let mut ctx = QueryCompleteCtx::dummy();

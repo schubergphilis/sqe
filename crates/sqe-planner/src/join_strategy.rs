@@ -233,9 +233,7 @@ fn estimate_build_side_size(hash_join: &HashJoinExec) -> BuildSizeEstimate {
 /// Returns `Ok(None)` when the join cannot be expressed as a sort-merge join
 /// and must stay a hash join -- currently only when its filter reads a
 /// `JoinSide::None` column (mark joins).
-fn convert_to_sort_merge_join(
-    hash_join: &HashJoinExec,
-) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+fn convert_to_sort_merge_join(hash_join: &HashJoinExec) -> Result<Option<Arc<dyn ExecutionPlan>>> {
     let join_type = *hash_join.join_type();
     let on = hash_join.on().to_vec();
     let filter = match hash_join.filter() {
@@ -253,16 +251,12 @@ fn convert_to_sort_merge_join(
     // Left side uses the left join key columns, right side uses the right.
     let left_sort_exprs: Vec<PhysicalSortExpr> = on
         .iter()
-        .map(|(left_col, _)| {
-            PhysicalSortExpr::new(Arc::clone(left_col), SortOptions::default())
-        })
+        .map(|(left_col, _)| PhysicalSortExpr::new(Arc::clone(left_col), SortOptions::default()))
         .collect();
 
     let right_sort_exprs: Vec<PhysicalSortExpr> = on
         .iter()
-        .map(|(_, right_col)| {
-            PhysicalSortExpr::new(Arc::clone(right_col), SortOptions::default())
-        })
+        .map(|(_, right_col)| PhysicalSortExpr::new(Arc::clone(right_col), SortOptions::default()))
         .collect();
 
     // Wrap inputs in SortExec if not already sorted on the join keys.
@@ -702,7 +696,9 @@ mod tests {
             schema,
         );
 
-        let regrouped = regroup_join_filter_for_sort_merge(&filter).unwrap().unwrap();
+        let regrouped = regroup_join_filter_for_sort_merge(&filter)
+            .unwrap()
+            .unwrap();
 
         assert_eq!(format!("{}", regrouped.expression()), "l@0 = r@1");
         assert_eq!(
@@ -738,7 +734,9 @@ mod tests {
         );
 
         assert!(
-            regroup_join_filter_for_sort_merge(&filter).unwrap().is_none(),
+            regroup_join_filter_for_sort_merge(&filter)
+                .unwrap()
+                .is_none(),
             "a mark-side filter column must block the sort-merge rewrite"
         );
     }
@@ -920,7 +918,10 @@ mod tests {
             BuildSizeEstimate::Exact(size) => size > 1,
             BuildSizeEstimate::Unknown => false,
         };
-        assert!(over, "exact 4096 bytes over a 1-byte threshold must rewrite");
+        assert!(
+            over,
+            "exact 4096 bytes over a 1-byte threshold must rewrite"
+        );
 
         let under = match BuildSizeEstimate::Exact(1) {
             BuildSizeEstimate::Exact(size) => size > DEFAULT_HASH_JOIN_THRESHOLD,
@@ -1086,8 +1087,7 @@ mod tests {
             SortOptions::default(),
         );
         let ordering = LexOrdering::new(vec![sort_expr.clone()]).unwrap();
-        let sorted_input: Arc<dyn ExecutionPlan> =
-            Arc::new(SortExec::new(ordering, input));
+        let sorted_input: Arc<dyn ExecutionPlan> = Arc::new(SortExec::new(ordering, input));
 
         // ensure_sorted should NOT add another SortExec
         let result = ensure_sorted(sorted_input.clone(), &[sort_expr]);

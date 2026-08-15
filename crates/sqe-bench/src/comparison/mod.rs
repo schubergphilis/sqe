@@ -250,7 +250,8 @@ pub async fn run_comparison(
     };
 
     // Save JSON report
-    let report_path = crate::report::write_comparison_report(&report, benchmark, scale, output_dir)?;
+    let report_path =
+        crate::report::write_comparison_report(&report, benchmark, scale, output_dir)?;
     info!("Report saved to {}", report_path);
 
     // Print markdown summary

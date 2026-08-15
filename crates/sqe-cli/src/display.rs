@@ -28,7 +28,11 @@ fn print_table(result: &QueryResult) {
         }
     }
 
-    let border: String = widths.iter().map(|w| format!("+{}", "-".repeat(w + 2))).collect::<String>() + "+";
+    let border: String = widths
+        .iter()
+        .map(|w| format!("+{}", "-".repeat(w + 2)))
+        .collect::<String>()
+        + "+";
 
     // Header
     println!("{border}");
@@ -48,7 +52,13 @@ fn print_table(result: &QueryResult) {
         let cells: Vec<String> = row
             .iter()
             .enumerate()
-            .map(|(i, v)| format!(" {:width$} ", v, width = widths.get(i).copied().unwrap_or(0)))
+            .map(|(i, v)| {
+                format!(
+                    " {:width$} ",
+                    v,
+                    width = widths.get(i).copied().unwrap_or(0)
+                )
+            })
             .collect();
         println!("|{}|", cells.join("|"));
     }

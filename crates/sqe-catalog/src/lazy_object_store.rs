@@ -90,7 +90,11 @@ impl<R: ObjectStoreRegistry> LazyHttpObjectStoreRegistry<R> {
     /// Wrap the given inner registry (lazy http/https build only; `s3` and
     /// `file` flow through the inner registry unchanged).
     pub fn new(inner: R) -> Self {
-        Self { inner, s3_storage: None, tvf_policy: None }
+        Self {
+            inner,
+            s3_storage: None,
+            tvf_policy: None,
+        }
     }
 
     /// Wrap the inner registry and additionally build `s3://` / `s3a://`
@@ -104,7 +108,11 @@ impl<R: ObjectStoreRegistry> LazyHttpObjectStoreRegistry<R> {
     /// the per-call TVF check cannot reach arbitrary hosts.
     pub fn with_s3_fallback(inner: R, storage: StorageConfig) -> Self {
         let tvf_policy = Some(storage.tvf.clone());
-        Self { inner, s3_storage: Some(storage), tvf_policy }
+        Self {
+            inner,
+            s3_storage: Some(storage),
+            tvf_policy,
+        }
     }
 
     /// Wrap the inner registry with an explicit `TvfPolicy` gating lazy
@@ -112,7 +120,11 @@ impl<R: ObjectStoreRegistry> LazyHttpObjectStoreRegistry<R> {
     /// caller wants the http allowlist enforced but pre-registers its own
     /// S3 stores.
     pub fn with_tvf_policy(inner: R, tvf_policy: TvfPolicy) -> Self {
-        Self { inner, s3_storage: None, tvf_policy: Some(tvf_policy) }
+        Self {
+            inner,
+            s3_storage: None,
+            tvf_policy: Some(tvf_policy),
+        }
     }
 }
 
@@ -137,9 +149,7 @@ impl<R: ObjectStoreRegistry> ObjectStoreRegistry for LazyHttpObjectStoreRegistry
             }
             // S3 lazy build only when a storage config was supplied
             // (`with_s3_fallback`); otherwise fall through to the inner error.
-            Err(_)
-                if matches!(url.scheme(), "s3" | "s3a") && self.s3_storage.is_some() =>
-            {
+            Err(_) if matches!(url.scheme(), "s3" | "s3a") && self.s3_storage.is_some() => {
                 build_and_register_s3_store(
                     &self.inner,
                     url,
@@ -166,17 +176,13 @@ fn build_and_register_http_store(
     // behaviour is preserved.
     if let Some(policy) = tvf_policy {
         policy
-            .check_path(
-                url.as_str(),
-                &sqe_core::config::TvfCaller::default(),
-                false,
-            )
+            .check_path(url.as_str(), &sqe_core::config::TvfCaller::default(), false)
             .map_err(DataFusionError::Plan)?;
     }
 
-    let host = url.host_str().ok_or_else(|| {
-        DataFusionError::Plan(format!("URL '{url}' is missing a host"))
-    })?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| DataFusionError::Plan(format!("URL '{url}' is missing a host")))?;
     let scheme = url.scheme();
     let base = match url.port() {
         Some(p) => format!("{scheme}://{host}:{p}"),
@@ -214,7 +220,9 @@ fn build_and_register_s3_store(
     // the bucket and the build happens at most once per session.
     let scheme = url.scheme();
     let key = Url::parse(&format!("{scheme}://{bucket}")).map_err(|e| {
-        DataFusionError::Plan(format!("failed to build object-store URL '{scheme}://{bucket}': {e}"))
+        DataFusionError::Plan(format!(
+            "failed to build object-store URL '{scheme}://{bucket}': {e}"
+        ))
     })?;
 
     inner.register_store(&key, Arc::clone(&store));
@@ -344,8 +352,7 @@ mod tests {
             .get_store(&url)
             .expect_err("non-allowlisted http host must be rejected");
         assert!(
-            err.to_string().contains("not in")
-                || err.to_string().contains("allowed_http_hosts"),
+            err.to_string().contains("not in") || err.to_string().contains("allowed_http_hosts"),
             "expected a TVF policy rejection, got: {err}"
         );
     }
@@ -356,10 +363,8 @@ mod tests {
             allowed_http_hosts: vec!["data.example.com".to_string()],
             ..Default::default()
         };
-        let lazy = LazyHttpObjectStoreRegistry::with_tvf_policy(
-            DefaultObjectStoreRegistry::new(),
-            policy,
-        );
+        let lazy =
+            LazyHttpObjectStoreRegistry::with_tvf_policy(DefaultObjectStoreRegistry::new(), policy);
         let url = Url::parse("https://data.example.com/x.parquet").unwrap();
         assert!(
             lazy.get_store(&url).is_ok(),
@@ -373,10 +378,8 @@ mod tests {
             allow_http: true,
             ..Default::default()
         };
-        let lazy = LazyHttpObjectStoreRegistry::with_tvf_policy(
-            DefaultObjectStoreRegistry::new(),
-            policy,
-        );
+        let lazy =
+            LazyHttpObjectStoreRegistry::with_tvf_policy(DefaultObjectStoreRegistry::new(), policy);
         let url = Url::parse("https://anything.internal/x.csv").unwrap();
         assert!(lazy.get_store(&url).is_ok());
     }

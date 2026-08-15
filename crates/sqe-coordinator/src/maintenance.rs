@@ -18,6 +18,7 @@ use std::sync::Arc;
 
 use arrow_array::{Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
+use futures::TryStreamExt;
 use iceberg::spec::{DataContentType, DataFile, ManifestStatus};
 use iceberg::table::Table as IcebergTable;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
@@ -26,11 +27,14 @@ use sqe_catalog::{SessionCatalog, TableMetadataCache};
 use sqe_core::{Session, SqeConfig, SqeError};
 use sqe_sql::{NamespaceRef, ProcedureCall, TableRef};
 use tracing::{info, warn};
-use futures::TryStreamExt;
 
 use crate::worker_registry::{WorkerLoadTracker, WorkerRegistry};
 use crate::writer::{new_upload_tracker, parse_parquet_compression, WriteCleanupGuard};
 
+pub(crate) use sqe_compaction::{
+    collect_live_delete_files, covered_position_deletes, delete_heavy_files,
+    pack_file_groups_partition_aware,
+};
 /// Delete-aware bin-pack/sort rewrite primitives moved to `sqe-compaction`
 /// (Phase 4c Task 1) so the worker-side `compact_file_group` action can reuse
 /// them without depending on this crate. `delete_heavy_files`,
@@ -46,10 +50,8 @@ use crate::writer::{new_upload_tracker, parse_parquet_compression, WriteCleanupG
 /// `collect_live_delete_files` needs a `pub(crate)` re-export here (used
 /// throughout this file and by `write_handler.rs`); `is_live_delete_entry`
 /// is imported directly where this file's unit tests exercise it.
-use sqe_compaction::{group_files_by_partition, plan_delete_aware_read, rewrite_group, SortCtx, SortSpec};
-pub(crate) use sqe_compaction::{
-    collect_live_delete_files, covered_position_deletes, delete_heavy_files,
-    pack_file_groups_partition_aware,
+use sqe_compaction::{
+    group_files_by_partition, plan_delete_aware_read, rewrite_group, SortCtx, SortSpec,
 };
 
 /// Callback that returns a snapshot of recent SQL query texts.
@@ -352,7 +354,10 @@ impl MaintenanceHandler {
                         .await?
                     }
                 };
-                Ok(vec![rewrite_outcome_batch(&to_table_ident(table), &outcome)?])
+                Ok(vec![rewrite_outcome_batch(
+                    &to_table_ident(table),
+                    &outcome,
+                )?])
             }
             ProcedureCall::ExpireSnapshots {
                 table,
@@ -363,12 +368,10 @@ impl MaintenanceHandler {
                 self.expire_snapshots(session, table, older_than_ms, *retain_last)
                     .await
             }
-            ProcedureCall::RemoveOrphanFiles {
-                table,
-                older_than,
-            } => {
+            ProcedureCall::RemoveOrphanFiles { table, older_than } => {
                 let older_than_ms = older_than.map(|t| t.timestamp_millis());
-                self.remove_orphan_files(session, table, older_than_ms).await
+                self.remove_orphan_files(session, table, older_than_ms)
+                    .await
             }
             ProcedureCall::RewriteManifests { table } => {
                 self.rewrite_manifests(session, table).await
@@ -377,10 +380,10 @@ impl MaintenanceHandler {
                 table,
                 history_limit,
             } => self.suggest_bloom_filter_columns(table, *history_limit),
-            ProcedureCall::PurgeOrphanLocations {
-                namespace,
-                dry_run,
-            } => self.purge_orphan_locations(session, namespace, *dry_run).await,
+            ProcedureCall::PurgeOrphanLocations { namespace, dry_run } => {
+                self.purge_orphan_locations(session, namespace, *dry_run)
+                    .await
+            }
             ProcedureCall::RegisterTable {
                 table,
                 metadata_location,
@@ -654,11 +657,7 @@ impl MaintenanceHandler {
             Some(f) => f(),
             None => Vec::new(),
         };
-        crate::suggest_bloom::suggest_bloom_filter_columns(
-            table_ref,
-            &queries,
-            history_limit,
-        )
+        crate::suggest_bloom::suggest_bloom_filter_columns(table_ref, &queries, history_limit)
     }
 
     /// Read-only compaction-debt report: `CALL system.table_health`.
@@ -862,7 +861,8 @@ impl MaintenanceHandler {
                     let msg = e.to_string().to_lowercase();
                     let retryable = msg.contains("retryable") || msg.contains("conflict");
                     if retryable && attempt < MAX_COMMIT_ATTEMPTS {
-                        let backoff = std::time::Duration::from_millis(50 * (1u64 << (attempt - 1)));
+                        let backoff =
+                            std::time::Duration::from_millis(50 * (1u64 << (attempt - 1)));
                         warn!(
                             table = %to_table_ident(table_ref),
                             attempt,
@@ -929,7 +929,10 @@ impl MaintenanceHandler {
         // path). `None` on a brand-new/empty table: there is no snapshot to
         // validate against, and `removed_data_files` is empty anyway in that
         // case (see `validate_no_new_position_deletes`'s empty-set fast path).
-        let plan_snapshot_id = table.metadata_ref().current_snapshot().map(|s| s.snapshot_id());
+        let plan_snapshot_id = table
+            .metadata_ref()
+            .current_snapshot()
+            .map(|s| s.snapshot_id());
         let read_plan = plan_delete_aware_read(&table).await?;
         let live_deletes = collect_live_delete_files(&table).await?;
 
@@ -942,8 +945,7 @@ impl MaintenanceHandler {
                     SqeError::Execution(format!("compaction schema conversion failed: {e}"))
                 })?,
         );
-        let sort_spec =
-            parse_sort_spec(strategy.as_deref(), sort_order.as_deref(), &arrow_schema)?;
+        let sort_spec = parse_sort_spec(strategy.as_deref(), sort_order.as_deref(), &arrow_schema)?;
         let sort_ctx: Option<Arc<SortCtx>> = match sort_spec {
             None => None,
             Some(spec) => {
@@ -1015,7 +1017,10 @@ impl MaintenanceHandler {
         // group (rewritten alone to apply its deletes / re-encode).
         let all_paths: std::collections::HashSet<String>;
         let force_include: &std::collections::HashSet<String> = if rewrite_all {
-            all_paths = old_data_files.iter().map(|f| f.file_path().to_string()).collect();
+            all_paths = old_data_files
+                .iter()
+                .map(|f| f.file_path().to_string())
+                .collect();
             &all_paths
         } else {
             &delete_heavy
@@ -1105,39 +1110,38 @@ impl MaintenanceHandler {
         );
         let read_plan_arc = Arc::new(read_plan);
         let live_deletes_arc = Arc::new(live_deletes);
-        let results: Vec<(Vec<DataFile>, Vec<DataFile>, u64)> =
-            stream::iter(eligible_groups)
-                .map(|group| {
-                    let table_for_group = table_arc.clone();
-                    let tracker_for_group = tracker.clone();
-                    let plan_for_group = read_plan_arc.clone();
-                    let deletes_for_group = live_deletes_arc.clone();
-                    let schema_for_group = arrow_schema.clone();
-                    let sort_for_group = sort_ctx.clone();
-                    async move {
-                        rewrite_group(
-                            &table_for_group,
-                            &plan_for_group,
-                            &deletes_for_group,
-                            &schema_for_group,
-                            sort_for_group.as_deref(),
-                            group,
-                            compression,
-                            tracker_for_group,
-                            target_bytes,
-                            // The coordinator-local `CALL system.rewrite_data_files`
-                            // path has no heartbeat to feed (there is no
-                            // dispatch RPC to bound); only the distributed
-                            // worker path (`sqe-worker::compaction`) supplies
-                            // a progress reporter.
-                            None,
-                        )
-                        .await
-                    }
-                })
-                .buffer_unordered(max_concurrent.max(1))
-                .try_collect()
-                .await?;
+        let results: Vec<(Vec<DataFile>, Vec<DataFile>, u64)> = stream::iter(eligible_groups)
+            .map(|group| {
+                let table_for_group = table_arc.clone();
+                let tracker_for_group = tracker.clone();
+                let plan_for_group = read_plan_arc.clone();
+                let deletes_for_group = live_deletes_arc.clone();
+                let schema_for_group = arrow_schema.clone();
+                let sort_for_group = sort_ctx.clone();
+                async move {
+                    rewrite_group(
+                        &table_for_group,
+                        &plan_for_group,
+                        &deletes_for_group,
+                        &schema_for_group,
+                        sort_for_group.as_deref(),
+                        group,
+                        compression,
+                        tracker_for_group,
+                        target_bytes,
+                        // The coordinator-local `CALL system.rewrite_data_files`
+                        // path has no heartbeat to feed (there is no
+                        // dispatch RPC to bound); only the distributed
+                        // worker path (`sqe-worker::compaction`) supplies
+                        // a progress reporter.
+                        None,
+                    )
+                    .await
+                }
+            })
+            .buffer_unordered(max_concurrent.max(1))
+            .try_collect()
+            .await?;
 
         for (group_new, group_old, group_rows) in results {
             new_files.extend(group_new);
@@ -1163,13 +1167,18 @@ impl MaintenanceHandler {
         }
 
         let output_count = new_files.len() as i64;
-        let output_bytes: i64 = new_files.iter().map(|f| f.file_size_in_bytes() as i64).sum();
+        let output_bytes: i64 = new_files
+            .iter()
+            .map(|f| f.file_size_in_bytes() as i64)
+            .sum();
 
         // Position delete files whose referenced data file we are removing are
         // now dangling; drop them in the same commit so the delete-file layer
         // shrinks along with the data. Equality deletes are left to age out.
-        let removed_data_paths: std::collections::HashSet<String> =
-            old_files.iter().map(|f| f.file_path().to_string()).collect();
+        let removed_data_paths: std::collections::HashSet<String> = old_files
+            .iter()
+            .map(|f| f.file_path().to_string())
+            .collect();
         let covered_deletes = covered_position_deletes(&removed_data_paths, &live_deletes_arc);
         let removed_delete_count = covered_deletes.len() as i64;
 
@@ -1405,7 +1414,8 @@ impl MaintenanceHandler {
                     let msg = e.to_string().to_lowercase();
                     let retryable = msg.contains("retryable") || msg.contains("conflict");
                     if retryable && attempt < MAX_COMMIT_ATTEMPTS {
-                        let backoff = std::time::Duration::from_millis(50 * (1u64 << (attempt - 1)));
+                        let backoff =
+                            std::time::Duration::from_millis(50 * (1u64 << (attempt - 1)));
                         warn!(
                             table = %to_table_ident(table_ref),
                             attempt,
@@ -1483,7 +1493,10 @@ impl MaintenanceHandler {
         // validator needs a true `None` in that case -- `Some(0)` would make
         // it look for a baseline snapshot that was never captured and either
         // false-positive-conflict or match the wrong snapshot by coincidence.
-        let plan_snapshot_id = table.metadata_ref().current_snapshot().map(|s| s.snapshot_id());
+        let plan_snapshot_id = table
+            .metadata_ref()
+            .current_snapshot()
+            .map(|s| s.snapshot_id());
 
         let read_plan = plan_delete_aware_read(&table).await?;
         let live_deletes = collect_live_delete_files(&table).await?;
@@ -1544,7 +1557,10 @@ impl MaintenanceHandler {
         // files already at or above target.
         let all_paths: std::collections::HashSet<String>;
         let force_include: &std::collections::HashSet<String> = if rewrite_all {
-            all_paths = old_data_files.iter().map(|f| f.file_path().to_string()).collect();
+            all_paths = old_data_files
+                .iter()
+                .map(|f| f.file_path().to_string())
+                .collect();
             &all_paths
         } else {
             &delete_heavy
@@ -1805,7 +1821,11 @@ impl MaintenanceHandler {
     ) -> sqe_core::Result<RewriteOutcome> {
         // `partial_progress` off: one chunk containing every eligible group,
         // i.e. exactly the pre-Task-3 single dispatch-then-commit call.
-        let batch_size = if partial_progress { partial_progress_batch.max(1) } else { usize::MAX };
+        let batch_size = if partial_progress {
+            partial_progress_batch.max(1)
+        } else {
+            usize::MAX
+        };
         let batches: Vec<&[Vec<DataFile>]> = eligible_groups.chunks(batch_size).collect();
         let total_batches = batches.len();
 
@@ -1972,8 +1992,10 @@ impl MaintenanceHandler {
         retry_on_conflict: bool,
     ) -> sqe_core::Result<BatchCommitResult> {
         let batch_old_files: Vec<DataFile> = batch.iter().flatten().cloned().collect();
-        let batch_old_paths: std::collections::HashSet<String> =
-            batch_old_files.iter().map(|f| f.file_path().to_string()).collect();
+        let batch_old_paths: std::collections::HashSet<String> = batch_old_files
+            .iter()
+            .map(|f| f.file_path().to_string())
+            .collect();
 
         const MAX_COMMIT_ATTEMPTS: usize = 4;
         let mut attempt: usize = 0;
@@ -2036,7 +2058,8 @@ impl MaintenanceHandler {
                     cur_live_deletes.iter().map(DataFile::file_path).collect();
                 let new_covering_delete = reload_live_deletes.iter().any(|d| {
                     d.content_type() == DataContentType::PositionDeletes
-                        && d.referenced_data_file().is_some_and(|p| batch_old_paths.contains(&p))
+                        && d.referenced_data_file()
+                            .is_some_and(|p| batch_old_paths.contains(&p))
                         && !known_paths.contains(d.file_path())
                 });
 
@@ -2064,8 +2087,10 @@ impl MaintenanceHandler {
                             .current_snapshot()
                             .map(|s| s.snapshot_id())
                             .unwrap_or(0);
-                        cur_plan_snapshot_id =
-                            reload.metadata_ref().current_snapshot().map(|s| s.snapshot_id());
+                        cur_plan_snapshot_id = reload
+                            .metadata_ref()
+                            .current_snapshot()
+                            .map(|s| s.snapshot_id());
                         cur_live_deletes = reload_live_deletes;
                         reloaded_table = Some(reload);
                         continue;
@@ -2087,8 +2112,10 @@ impl MaintenanceHandler {
                 // No new covering delete: still adopt this reload as the
                 // commit base and delete set, keeping `check_file_existence`
                 // and `covered_position_deletes` maximally current.
-                cur_plan_snapshot_id =
-                    reload.metadata_ref().current_snapshot().map(|s| s.snapshot_id());
+                cur_plan_snapshot_id = reload
+                    .metadata_ref()
+                    .current_snapshot()
+                    .map(|s| s.snapshot_id());
                 cur_live_deletes = reload_live_deletes;
                 reloaded_table = Some(reload);
             }
@@ -2148,8 +2175,10 @@ impl MaintenanceHandler {
                             .current_snapshot()
                             .map(|s| s.snapshot_id())
                             .unwrap_or(0);
-                        cur_plan_snapshot_id =
-                            reloaded.metadata_ref().current_snapshot().map(|s| s.snapshot_id());
+                        cur_plan_snapshot_id = reloaded
+                            .metadata_ref()
+                            .current_snapshot()
+                            .map(|s| s.snapshot_id());
                         cur_live_deletes = collect_live_delete_files(&reloaded).await?;
                         reloaded_table = Some(reloaded);
                         continue;
@@ -2190,8 +2219,10 @@ impl MaintenanceHandler {
         // Position delete files fully covered by THIS batch's removed data
         // files (never another batch's -- see the disjointness argument on
         // `commit_eligible_groups`).
-        let removed_data_paths: std::collections::HashSet<String> =
-            batch_old_files.iter().map(|f| f.file_path().to_string()).collect();
+        let removed_data_paths: std::collections::HashSet<String> = batch_old_files
+            .iter()
+            .map(|f| f.file_path().to_string())
+            .collect();
         let covered_deletes = covered_position_deletes(&removed_data_paths, live_deletes);
         let removed_delete_count = covered_deletes.len() as i64;
 
@@ -2212,8 +2243,11 @@ impl MaintenanceHandler {
         // leaves the coordinator: workers only produced files in object
         // storage, this is the one and only state change to the table.
         let tx = Transaction::new(table);
-        let files_to_remove: Vec<DataFile> =
-            batch_old_files.iter().cloned().chain(covered_deletes).collect();
+        let files_to_remove: Vec<DataFile> = batch_old_files
+            .iter()
+            .cloned()
+            .chain(covered_deletes)
+            .collect();
         let mut action = tx
             .rewrite_files()
             .set_enable_delete_filter_manager(true)
@@ -2241,7 +2275,8 @@ impl MaintenanceHandler {
         }
 
         let rows_removed = (aggregated.removed_rows - aggregated.added_rows) as i64;
-        let live_expected_after = live_expected_before - batch_old_files.len() as i64 + output_count;
+        let live_expected_after =
+            live_expected_before - batch_old_files.len() as i64 + output_count;
 
         // Same post-commit sanity check as the pre-Task-3 single-commit
         // path, now run once per batch: reload and confirm the live file
@@ -2367,15 +2402,16 @@ impl MaintenanceHandler {
         let table = load_table(&catalog, &ident).await?;
 
         let threshold_ms = older_than_ms.unwrap_or_else(|| {
-            chrono::Utc::now().timestamp_millis()
-                - DEFAULT_OLDER_THAN_DAYS * 24 * 60 * 60 * 1000
+            chrono::Utc::now().timestamp_millis() - DEFAULT_OLDER_THAN_DAYS * 24 * 60 * 60 * 1000
         });
 
-        let action = iceberg::actions::RemoveOrphanFilesAction::new(table).older_than_ms(threshold_ms);
+        let action =
+            iceberg::actions::RemoveOrphanFilesAction::new(table).older_than_ms(threshold_ms);
 
-        let orphans = action.execute().await.map_err(|e| {
-            SqeError::Execution(format!("remove_orphan_files execute failed: {e}"))
-        })?;
+        let orphans = action
+            .execute()
+            .await
+            .map_err(|e| SqeError::Execution(format!("remove_orphan_files execute failed: {e}")))?;
 
         info!(
             table = %ident,
@@ -2546,11 +2582,7 @@ impl MaintenanceHandler {
         let listing = file_io
             .list(format!("{ns_base}/"), false)
             .await
-            .map_err(|e| {
-                SqeError::Execution(format!(
-                    "Failed to list prefix '{ns_base}/': {e}"
-                ))
-            })?;
+            .map_err(|e| SqeError::Execution(format!("Failed to list prefix '{ns_base}/': {e}")))?;
         let entries: Vec<_> = listing.try_collect().await.map_err(|e| {
             SqeError::Execution(format!("Failed to collect listing for '{ns_base}/': {e}"))
         })?;
@@ -2752,7 +2784,9 @@ pub(crate) fn resolve_execution(
 /// "lowercase")]` on the same enum. An unrecognized value is a loud parse
 /// error rather than a silent fallback to the configured default -- a typo
 /// here must not quietly change which fleet-vs-local decision gets made.
-fn parse_distribution_mode_override(raw: &str) -> sqe_core::Result<sqe_core::config::DistributionMode> {
+fn parse_distribution_mode_override(
+    raw: &str,
+) -> sqe_core::Result<sqe_core::config::DistributionMode> {
     use sqe_core::config::DistributionMode;
     match raw.to_ascii_lowercase().as_str() {
         "auto" => Ok(DistributionMode::Auto),
@@ -2849,13 +2883,19 @@ pub(crate) struct RewriteOutcome {
 /// opted in) gets its own `"partial: ..."` text so an operator reading the
 /// `CALL` surface's summary can tell "fully committed" from "some batches
 /// committed, then a group failed" at a glance.
-fn rewrite_outcome_batch(ident: &TableIdent, outcome: &RewriteOutcome) -> sqe_core::Result<RecordBatch> {
+fn rewrite_outcome_batch(
+    ident: &TableIdent,
+    outcome: &RewriteOutcome,
+) -> sqe_core::Result<RecordBatch> {
     let status = match &outcome.skipped_reason {
         Some(reason) => format!("skipped: {reason}"),
         None if outcome.partial => format!(
             "partial: rewritten={} ({})",
             outcome.files_rewritten,
-            outcome.partial_error.as_deref().unwrap_or("terminal group failure")
+            outcome
+                .partial_error
+                .as_deref()
+                .unwrap_or("terminal group failure")
         ),
         None => format!("committed rewritten={}", outcome.files_rewritten),
     };
@@ -2897,7 +2937,11 @@ fn canonicalize_uri(s: &str) -> String {
     let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
     let path_collapsed = collapse_slashes(path);
     if path_collapsed.is_empty() {
-        format!("{}://{}", scheme.to_ascii_lowercase(), authority.to_ascii_lowercase())
+        format!(
+            "{}://{}",
+            scheme.to_ascii_lowercase(),
+            authority.to_ascii_lowercase()
+        )
     } else {
         format!(
             "{}://{}/{}",
@@ -2955,7 +2999,10 @@ fn to_table_ident(table_ref: &TableRef) -> TableIdent {
     TableIdent::new(ns, table_ref.name.clone())
 }
 
-pub(crate) async fn load_table(catalog: &Arc<dyn Catalog>, ident: &TableIdent) -> sqe_core::Result<IcebergTable> {
+pub(crate) async fn load_table(
+    catalog: &Arc<dyn Catalog>,
+    ident: &TableIdent,
+) -> sqe_core::Result<IcebergTable> {
     catalog
         .load_table(ident)
         .await
@@ -3042,8 +3089,8 @@ fn parse_sort_spec(
     }
     // A sort is requested when strategy is 'sort', or when only sort_order is
     // given (strategy omitted). 'binpack' with a sort_order ignores the order.
-    let sort_requested = matches!(strat.as_deref(), Some("sort"))
-        || (strat.is_none() && sort_order.is_some());
+    let sort_requested =
+        matches!(strat.as_deref(), Some("sort")) || (strat.is_none() && sort_order.is_some());
     if !sort_requested {
         return Ok(None);
     }
@@ -3442,10 +3489,7 @@ mod tests {
     #[test]
     fn is_strictly_under_accepts_child() {
         assert!(is_strictly_under("s3://b/wh/ns/t", "s3://b/wh/ns"));
-        assert!(is_strictly_under(
-            "s3://b/wh/ns/t/sub",
-            "s3://b/wh/ns"
-        ));
+        assert!(is_strictly_under("s3://b/wh/ns/t/sub", "s3://b/wh/ns"));
     }
 
     #[test]
@@ -3661,15 +3705,18 @@ mod tests {
         /// no longer contain the deleted row).
         async fn race_live_ids(catalog: &Arc<dyn Catalog>, ident: &TableIdent) -> Vec<i64> {
             let table = catalog.load_table(ident).await.expect("reload table");
-            let files = collect_live_data_files(&table).await.expect("collect live data files");
+            let files = collect_live_data_files(&table)
+                .await
+                .expect("collect live data files");
             let mut ids = Vec::new();
             for f in files {
                 let input = table.file_io().new_input(f.file_path()).expect("new_input");
                 let bytes = input.read().await.expect("read file bytes");
-                let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(bytes)
-                    .expect("open parquet")
-                    .build()
-                    .expect("build reader");
+                let reader =
+                    parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(bytes)
+                        .expect("open parquet")
+                        .build()
+                        .expect("build reader");
                 for batch in reader {
                     let batch = batch.expect("read batch");
                     let col = batch
@@ -3703,11 +3750,17 @@ mod tests {
                 .name("race_test".to_string())
                 .schema(iceberg_schema)
                 .build();
-            catalog.create_table(&ns, creation).await.expect("create table");
+            catalog
+                .create_table(&ns, creation)
+                .await
+                .expect("create table");
             let ident = TableIdent::new(ns.clone(), "race_test".to_string());
 
             // Seed ONE data file with three rows: id 0, 1, 2.
-            let seed_table = catalog.load_table(&ident).await.expect("load table for seeding");
+            let seed_table = catalog
+                .load_table(&ident)
+                .await
+                .expect("load table for seeding");
             let batch = RecordBatch::try_new(
                 race_one_col_arrow_schema(),
                 vec![Arc::new(Int64Array::from(vec![0i64, 1, 2]))],
@@ -3730,12 +3783,14 @@ mod tests {
             let tx = Transaction::new(&seed_table);
             let action = tx.fast_append().add_data_files(seeded);
             let tx = action.apply(tx).expect("apply fast_append");
-            tx.commit(catalog.as_ref()).await.expect("commit seed data file");
+            tx.commit(catalog.as_ref())
+                .await
+                .expect("commit seed data file");
 
             // Race machinery: attempt 1 pauses right before its commit.
             let seam = Arc::new(RewriteRaceSeam::new());
-            let handler = MaintenanceHandler::new(race_test_config())
-                .with_test_race_seam(seam.clone());
+            let handler =
+                MaintenanceHandler::new(race_test_config()).with_test_race_seam(seam.clone());
 
             let table_ref = TableRef::parse("default.race_test").expect("parse table ref");
             let catalog_for_task = catalog.clone();
@@ -3818,7 +3873,10 @@ mod tests {
                 )
                 .await
                 .expect("retry attempt must succeed against the now-current snapshot");
-            assert!(outcome.skipped_reason.is_none(), "retry must actually run, not skip");
+            assert!(
+                outcome.skipped_reason.is_none(),
+                "retry must actually run, not skip"
+            );
 
             // Correctness: id=1 must stay deleted, not resurrected by
             // attempt 1's stale (pre-delete) compacted output.
@@ -3879,7 +3937,11 @@ mod tests {
         /// against the current snapshot's MANIFESTS, not the object store,
         /// so a file only needs to be registered via a prior commit (this
         /// test's `fast_append` below), never actually written to disk.
-        fn fabricated_data_file(path: &str, record_count: u64, bytes: u64) -> iceberg::spec::DataFile {
+        fn fabricated_data_file(
+            path: &str,
+            record_count: u64,
+            bytes: u64,
+        ) -> iceberg::spec::DataFile {
             DataFileBuilder::default()
                 .content(DataContentType::Data)
                 .file_path(path.to_string())
@@ -3925,7 +3987,10 @@ mod tests {
                 .name(table_name.to_string())
                 .schema(minimal_schema())
                 .build();
-            let table = catalog.create_table(&ns, creation).await.expect("create table");
+            let table = catalog
+                .create_table(&ns, creation)
+                .await
+                .expect("create table");
 
             let paths: Vec<String> = (1..=6)
                 .map(|i| format!("mem://{table_name}/data/f{i}.parquet"))
@@ -3938,7 +4003,10 @@ mod tests {
             let tx = Transaction::new(&table);
             let action = tx.fast_append().add_data_files(initial_files.clone());
             let tx_applied = action.apply(tx).expect("apply fast_append");
-            tx_applied.commit(catalog.as_ref()).await.expect("commit fast_append");
+            tx_applied
+                .commit(catalog.as_ref())
+                .await
+                .expect("commit fast_append");
 
             let ident = TableIdent::new(ns, table_name.to_string());
             let table = catalog.load_table(&ident).await.expect("reload table");
@@ -3958,12 +4026,18 @@ mod tests {
                 .snapshot_id();
 
             // 3 groups of 2 files each, in the same order as `paths`.
-            let eligible_groups: Vec<Vec<DataFile>> = initial_files
-                .chunks(2)
-                .map(<[DataFile]>::to_vec)
-                .collect();
+            let eligible_groups: Vec<Vec<DataFile>> =
+                initial_files.chunks(2).map(<[DataFile]>::to_vec).collect();
 
-            (catalog, ident, table, eligible_groups, seq_at_start, metadata_location, snapshot_id)
+            (
+                catalog,
+                ident,
+                table,
+                eligible_groups,
+                seq_at_start,
+                metadata_location,
+                snapshot_id,
+            )
         }
 
         /// Synthetic [`crate::compaction_dispatch::GroupBatchDispatcher`]:
@@ -3984,7 +4058,11 @@ mod tests {
                 _metadata_location: &str,
                 _snapshot_id: i64,
             ) -> sqe_core::Result<Vec<sqe_compaction::dispatch::GroupOutcome>> {
-                if batch.iter().flatten().any(|f| f.file_path() == self.poison_path) {
+                if batch
+                    .iter()
+                    .flatten()
+                    .any(|f| f.file_path() == self.poison_path)
+                {
                     return Err(SqeError::Execution(format!(
                         "synthetic dispatch failure: group containing poisoned file {}",
                         self.poison_path
@@ -3994,9 +4072,14 @@ mod tests {
                     .iter()
                     .enumerate()
                     .map(|(i, group)| {
-                        let rows: u64 = group.iter().map(iceberg::spec::DataFile::record_count).sum();
-                        let bytes: u64 =
-                            group.iter().map(iceberg::spec::DataFile::file_size_in_bytes).sum();
+                        let rows: u64 = group
+                            .iter()
+                            .map(iceberg::spec::DataFile::record_count)
+                            .sum();
+                        let bytes: u64 = group
+                            .iter()
+                            .map(iceberg::spec::DataFile::file_size_in_bytes)
+                            .sum();
                         let new_path = format!(
                             "mem://partial_progress_test/data/consolidated-{}-{}.parquet",
                             i,
@@ -4062,7 +4145,9 @@ mod tests {
                     .iter()
                     .flatten()
                     .any(|f| f.file_path() == self.conflict_after_path)
-                    && !self.triggered.swap(true, std::sync::atomic::Ordering::SeqCst);
+                    && !self
+                        .triggered
+                        .swap(true, std::sync::atomic::Ordering::SeqCst);
 
                 if should_inject {
                     let fresh = self
@@ -4088,9 +4173,14 @@ mod tests {
                     .iter()
                     .enumerate()
                     .map(|(i, group)| {
-                        let rows: u64 = group.iter().map(iceberg::spec::DataFile::record_count).sum();
-                        let bytes: u64 =
-                            group.iter().map(iceberg::spec::DataFile::file_size_in_bytes).sum();
+                        let rows: u64 = group
+                            .iter()
+                            .map(iceberg::spec::DataFile::record_count)
+                            .sum();
+                        let bytes: u64 = group
+                            .iter()
+                            .map(iceberg::spec::DataFile::file_size_in_bytes)
+                            .sum();
                         let new_path = format!(
                             "mem://conflict_retry_test/data/consolidated-{}-{}.parquet",
                             i,
@@ -4121,13 +4211,22 @@ mod tests {
 
         #[tokio::test]
         async fn partial_progress_on_commits_earlier_batches_and_reports_partial() {
-            let (catalog, ident, table, eligible_groups, seq_at_start, metadata_location, snapshot_id) =
-                table_with_six_files("partial_on_test").await;
+            let (
+                catalog,
+                ident,
+                table,
+                eligible_groups,
+                seq_at_start,
+                metadata_location,
+                snapshot_id,
+            ) = table_with_six_files("partial_on_test").await;
             // Group 3 (files f5, f6) is the LAST group -- poison its first
             // file so the terminal failure lands on the last batch, exactly
             // like the brief's "forced failure on the last group" scenario.
             let poison_path = eligible_groups[2][0].file_path().to_string();
-            let dispatcher = PoisonPathDispatcher { poison_path: poison_path.clone() };
+            let dispatcher = PoisonPathDispatcher {
+                poison_path: poison_path.clone(),
+            };
 
             let outcome = MaintenanceHandler::commit_eligible_groups(
                 &catalog,
@@ -4151,17 +4250,35 @@ mod tests {
             .expect("partial_progress must report Ok, not fail the whole job");
 
             assert!(outcome.partial, "outcome must be marked partial");
-            assert!(outcome.partial_error.is_some(), "partial outcome must carry the failure reason");
-            assert_eq!(outcome.files_rewritten, 4, "2 committed batches x 2 files each");
-            assert_eq!(outcome.files_out, 2, "one consolidated file per committed batch");
-            assert!(outcome.snapshot_id.is_some(), "the 2nd batch's commit must be reported");
+            assert!(
+                outcome.partial_error.is_some(),
+                "partial outcome must carry the failure reason"
+            );
+            assert_eq!(
+                outcome.files_rewritten, 4,
+                "2 committed batches x 2 files each"
+            );
+            assert_eq!(
+                outcome.files_out, 2,
+                "one consolidated file per committed batch"
+            );
+            assert!(
+                outcome.snapshot_id.is_some(),
+                "the 2nd batch's commit must be reported"
+            );
 
             // Table reflects exactly the 2 successful batches: 2 new
             // consolidated files + the last group's 2 untouched files (f5,
             // f6, since batch 3 never committed) = 4 live files.
             let reloaded = catalog.load_table(&ident).await.expect("reload table");
-            let live_files = collect_live_data_files(&reloaded).await.expect("collect live files");
-            assert_eq!(live_files.len(), 4, "2 consolidated + 2 untouched from the failed batch");
+            let live_files = collect_live_data_files(&reloaded)
+                .await
+                .expect("collect live files");
+            assert_eq!(
+                live_files.len(),
+                4,
+                "2 consolidated + 2 untouched from the failed batch"
+            );
 
             // 3 snapshots total: the initial fast_append + 2 successful
             // batch commits. The 3rd (failed) batch never commits, so it
@@ -4176,8 +4293,15 @@ mod tests {
 
         #[tokio::test]
         async fn partial_progress_off_leaves_table_unchanged_on_the_same_forced_failure() {
-            let (catalog, ident, table, eligible_groups, seq_at_start, metadata_location, snapshot_id) =
-                table_with_six_files("partial_off_test").await;
+            let (
+                catalog,
+                ident,
+                table,
+                eligible_groups,
+                seq_at_start,
+                metadata_location,
+                snapshot_id,
+            ) = table_with_six_files("partial_off_test").await;
             let poison_path = eligible_groups[2][0].file_path().to_string();
             let dispatcher = PoisonPathDispatcher { poison_path };
 
@@ -4187,7 +4311,8 @@ mod tests {
                 &ident,
                 eligible_groups,
                 /* partial_progress */ false,
-                /* partial_progress_batch */ 1, // ignored when partial_progress is false
+                /* partial_progress_batch */
+                1, // ignored when partial_progress is false
                 seq_at_start,
                 Some(snapshot_id),
                 &metadata_location,
@@ -4210,7 +4335,9 @@ mod tests {
             // files, still exactly the one snapshot from the initial
             // fast_append -- no batch ever committed.
             let reloaded = catalog.load_table(&ident).await.expect("reload table");
-            let live_files = collect_live_data_files(&reloaded).await.expect("collect live files");
+            let live_files = collect_live_data_files(&reloaded)
+                .await
+                .expect("collect live files");
             assert_eq!(live_files.len(), 6, "no commit at all must have happened");
             assert_eq!(reloaded.metadata().snapshots().count(), 1);
             assert_eq!(total_rows(&catalog, &ident).await, 60);
@@ -4227,8 +4354,15 @@ mod tests {
 
         #[tokio::test]
         async fn batch_commit_conflict_after_first_batch_is_retried_and_job_completes() {
-            let (catalog, ident, table, eligible_groups, seq_at_start, metadata_location, snapshot_id) =
-                table_with_six_files("conflict_retry_test").await;
+            let (
+                catalog,
+                ident,
+                table,
+                eligible_groups,
+                seq_at_start,
+                metadata_location,
+                snapshot_id,
+            ) = table_with_six_files("conflict_retry_test").await;
             // Group index 1 (files f3, f4) is the 2nd batch when
             // partial_progress_batch = 1, i.e. `committed_batches == 1`
             // (> 0) at the time its commit is attempted -- exactly the case
@@ -4271,11 +4405,16 @@ mod tests {
                 outcome.partial_error.is_none(),
                 "no terminal failure occurred, so there is nothing to report as a partial error"
             );
-            assert_eq!(outcome.files_rewritten, 6, "all 3 batches x 2 files each eventually commit");
+            assert_eq!(
+                outcome.files_rewritten, 6,
+                "all 3 batches x 2 files each eventually commit"
+            );
             assert_eq!(outcome.files_out, 3, "one consolidated file per batch");
 
             let reloaded = catalog.load_table(&ident).await.expect("reload table");
-            let live_files = collect_live_data_files(&reloaded).await.expect("collect live files");
+            let live_files = collect_live_data_files(&reloaded)
+                .await
+                .expect("collect live files");
             // 3 consolidated files (one per batch) + 1 extra file from the
             // injected concurrent commit that triggered the conflict.
             assert_eq!(live_files.len(), 4);
@@ -4347,10 +4486,15 @@ mod tests {
                 _metadata_location: &str,
                 _snapshot_id: i64,
             ) -> sqe_core::Result<Vec<sqe_compaction::dispatch::GroupOutcome>> {
-                let is_victim_batch =
-                    batch.iter().flatten().any(|f| f.file_path() == self.victim_path);
+                let is_victim_batch = batch
+                    .iter()
+                    .flatten()
+                    .any(|f| f.file_path() == self.victim_path);
 
-                if is_victim_batch && !self.triggered.swap(true, std::sync::atomic::Ordering::SeqCst)
+                if is_victim_batch
+                    && !self
+                        .triggered
+                        .swap(true, std::sync::atomic::Ordering::SeqCst)
                 {
                     // Simulate a concurrent `DELETE FROM ... WHERE ...`
                     // landing a position delete on one of THIS batch's own
@@ -4404,9 +4548,14 @@ mod tests {
                     .iter()
                     .enumerate()
                     .map(|(i, group)| {
-                        let rows: u64 = group.iter().map(iceberg::spec::DataFile::record_count).sum();
-                        let bytes: u64 =
-                            group.iter().map(iceberg::spec::DataFile::file_size_in_bytes).sum();
+                        let rows: u64 = group
+                            .iter()
+                            .map(iceberg::spec::DataFile::record_count)
+                            .sum();
+                        let bytes: u64 = group
+                            .iter()
+                            .map(iceberg::spec::DataFile::file_size_in_bytes)
+                            .sum();
                         let is_victim_group =
                             group.iter().any(|f| f.file_path() == self.victim_path);
                         let effective_rows = if is_victim_group && victim_call_index > 0 {
@@ -4425,7 +4574,8 @@ mod tests {
                             i,
                             uuid::Uuid::now_v7()
                         );
-                        let new_file = fabricated_data_file(&new_path, effective_rows, bytes.max(1));
+                        let new_file =
+                            fabricated_data_file(&new_path, effective_rows, bytes.max(1));
                         sqe_compaction::dispatch::GroupOutcome {
                             group_id: i as u32,
                             new_files: vec![new_file],
@@ -4440,8 +4590,15 @@ mod tests {
 
         #[tokio::test]
         async fn batch_commit_conflict_from_own_position_delete_does_not_resurrect_rows() {
-            let (catalog, ident, table, eligible_groups, seq_at_start, metadata_location, snapshot_id) =
-                table_with_six_files("resurrection_test").await;
+            let (
+                catalog,
+                ident,
+                table,
+                eligible_groups,
+                seq_at_start,
+                metadata_location,
+                snapshot_id,
+            ) = table_with_six_files("resurrection_test").await;
             // Group index 1 (files f3, f4) is the 2nd batch when
             // partial_progress_batch = 1, i.e. `committed_batches == 1`
             // (> 0) at the time its commit is attempted -- the same
@@ -4490,7 +4647,10 @@ mod tests {
                 outcome.partial_error.is_none(),
                 "no terminal failure occurred, so there is nothing to report as a partial error"
             );
-            assert_eq!(outcome.files_rewritten, 6, "all 3 batches x 2 files each eventually commit");
+            assert_eq!(
+                outcome.files_rewritten, 6,
+                "all 3 batches x 2 files each eventually commit"
+            );
             assert_eq!(outcome.files_out, 3, "one consolidated file per batch");
 
             // The critical assertion: total live rows must reflect the
@@ -4508,8 +4668,14 @@ mod tests {
             // And no rows were incorrectly dropped either: exactly 3
             // consolidated files (one per batch), no orphaned extras.
             let reloaded = catalog.load_table(&ident).await.expect("reload table");
-            let live_files = collect_live_data_files(&reloaded).await.expect("collect live files");
-            assert_eq!(live_files.len(), 3, "one consolidated data file per batch, nothing extra");
+            let live_files = collect_live_data_files(&reloaded)
+                .await
+                .expect("collect live files");
+            assert_eq!(
+                live_files.len(),
+                3,
+                "one consolidated data file per batch, nothing extra"
+            );
         }
     }
 }

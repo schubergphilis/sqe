@@ -147,9 +147,7 @@ async fn polaris_mock(server: &MockServer, config_delay: std::time::Duration) {
     Mock::given(method("GET"))
         .and(path("/v1/namespaces"))
         .and(header_exists("Authorization"))
-        .respond_with(ResponseTemplate::new(200).set_body_string(
-            r#"{"namespaces":[]}"#,
-        ))
+        .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"namespaces":[]}"#))
         .mount(server)
         .await;
 
@@ -204,7 +202,10 @@ fn count_unauth_warns(log: &str) -> usize {
 async fn format_request_log(server: &MockServer) -> String {
     let mut out = String::new();
     let received = server.received_requests().await.unwrap_or_default();
-    out.push_str(&format!("=== wiremock saw {} request(s) ===\n", received.len()));
+    out.push_str(&format!(
+        "=== wiremock saw {} request(s) ===\n",
+        received.len()
+    ));
     for (i, req) in received.iter().enumerate() {
         let auth_present = req.headers.get("authorization").is_some()
             || req.headers.get("Authorization").is_some();
@@ -244,9 +245,8 @@ async fn drive_concurrent_calls(
         .with_ansi(false)
         .with_target(true)
         .with_writer(capture.clone());
-    let filter = tracing_subscriber::EnvFilter::new(
-        "iceberg_catalog_rest=trace,sqe_catalog=trace,warn",
-    );
+    let filter =
+        tracing_subscriber::EnvFilter::new("iceberg_catalog_rest=trace,sqe_catalog=trace,warn");
     let subscriber = Registry::default().with(filter).with(layer);
     let dispatch = tracing::dispatcher::Dispatch::new(subscriber);
 
@@ -303,8 +303,7 @@ async fn concurrent_list_namespaces_keeps_bearer_on_every_call() {
     // SessionCatalog::new doesn't return a leftover from another
     // concurrently-running test in the same `cargo test` invocation.
     let token = format!("repro-multi-{}", uuid::Uuid::new_v4());
-    let (results, log) =
-        drive_concurrent_calls(&server.uri(), &token, 8, capture).await;
+    let (results, log) = drive_concurrent_calls(&server.uri(), &token, 8, capture).await;
 
     let warn_count = count_unauth_warns(&log);
     let request_log = format_request_log(&server).await;
@@ -320,7 +319,8 @@ async fn concurrent_list_namespaces_keeps_bearer_on_every_call() {
         .collect();
 
     assert_eq!(
-        warn_count, 0,
+        warn_count,
+        0,
         "Expected zero \"Outbound REST request issued WITHOUT Authorization\" \
          warns under {n} concurrent list_namespaces calls. Got {warn_count}.\n\n\
          {request_log}\n\
@@ -356,8 +356,7 @@ async fn concurrent_list_namespaces_with_slow_config_init_keeps_bearer() {
 
     let capture = CaptureWriter::new();
     let token = format!("repro-slow-{}", uuid::Uuid::new_v4());
-    let (results, log) =
-        drive_concurrent_calls(&server.uri(), &token, 8, capture).await;
+    let (results, log) = drive_concurrent_calls(&server.uri(), &token, 8, capture).await;
 
     let warn_count = count_unauth_warns(&log);
     let request_log = format_request_log(&server).await;
@@ -406,9 +405,10 @@ async fn capture_layer_observes_unauth_warn() {
     // We don't care about the wire-level result; we just want the
     // unauthed authenticate() call to flow through and fire the warn.
     Mock::given(method("GET"))
-        .respond_with(ResponseTemplate::new(200).set_body_string(
-            r#"{"overrides":{},"defaults":{},"namespaces":[]}"#,
-        ))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(r#"{"overrides":{},"defaults":{},"namespaces":[]}"#),
+        )
         .mount(&server)
         .await;
 
@@ -417,12 +417,9 @@ async fn capture_layer_observes_unauth_warn() {
         .with_ansi(false)
         .with_target(true)
         .with_writer(capture.clone());
-    let filter = tracing_subscriber::EnvFilter::new(
-        "iceberg_catalog_rest=trace,sqe_catalog=trace,warn",
-    );
-    let dispatch = tracing::dispatcher::Dispatch::new(
-        Registry::default().with(filter).with(layer),
-    );
+    let filter =
+        tracing_subscriber::EnvFilter::new("iceberg_catalog_rest=trace,sqe_catalog=trace,warn");
+    let dispatch = tracing::dispatcher::Dispatch::new(Registry::default().with(filter).with(layer));
 
     // Build a RestCatalog with NO token, NO credential. This is the
     // exact precondition for the diagnostic warn at client.rs:281.
@@ -435,7 +432,10 @@ async fn capture_layer_observes_unauth_warn() {
 
     // One call is enough — the OnceCell init triggers authenticate
     // for the /v1/config request.
-    let _ = catalog.list_namespaces(None).with_subscriber(dispatch).await;
+    let _ = catalog
+        .list_namespaces(None)
+        .with_subscriber(dispatch)
+        .await;
 
     let log = capture.contents();
     let warns = count_unauth_warns(&log);
@@ -522,8 +522,7 @@ async fn auth_required_guard_refuses_unauthed_request_after_token_cleared() {
         .unwrap_or_default()
         .iter()
         .filter(|r| {
-            r.headers.get("authorization").is_none()
-                && r.headers.get("Authorization").is_none()
+            r.headers.get("authorization").is_none() && r.headers.get("Authorization").is_none()
         })
         .count();
     assert_eq!(
@@ -604,8 +603,7 @@ async fn concurrent_list_namespaces_current_thread_baseline() {
 
     let capture = CaptureWriter::new();
     let token = format!("repro-single-{}", uuid::Uuid::new_v4());
-    let (results, log) =
-        drive_concurrent_calls(&server.uri(), &token, 4, capture).await;
+    let (results, log) = drive_concurrent_calls(&server.uri(), &token, 4, capture).await;
 
     let warn_count = count_unauth_warns(&log);
     let request_log = format_request_log(&server).await;
@@ -657,9 +655,10 @@ async fn session_catalog_rejects_server_overriding_token_to_empty() {
     Mock::given(method("GET"))
         .and(path("/v1/config"))
         .and(header_exists("Authorization"))
-        .respond_with(ResponseTemplate::new(200).set_body_string(
-            r#"{"overrides":{"token":""},"defaults":{}}"#,
-        ))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(r#"{"overrides":{"token":""},"defaults":{}}"#),
+        )
         .mount(&server)
         .await;
 
@@ -691,12 +690,10 @@ async fn session_catalog_rejects_server_overriding_token_to_empty() {
     // surfaces as a Catalog error.
     let result = session.list_namespaces().await;
     let request_log = format_request_log(&server).await;
-    let err = result.expect_err(
-        &format!(
-            "Expected a loud merge-boundary error when /v1/config clobbers \
+    let err = result.expect_err(&format!(
+        "Expected a loud merge-boundary error when /v1/config clobbers \
              the token with empty.\n{request_log}"
-        ),
-    );
+    ));
 
     let msg = format!("{err}");
     assert!(

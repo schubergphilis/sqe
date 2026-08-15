@@ -295,8 +295,14 @@ impl TableFunctionImpl for ReadJsonFunction {
         } else {
             let df_compression = streaming_compression(compression);
             crate::runtime_bridge::block_on_compat(async move {
-                build_json_listing_table(&args, &json_opts, df_compression, &storage, runtime_env.as_deref())
-                    .await
+                build_json_listing_table(
+                    &args,
+                    &json_opts,
+                    df_compression,
+                    &storage,
+                    runtime_env.as_deref(),
+                )
+                .await
             })
             .map_err(|e| DataFusionError::Plan(format!("{FN_NAME}: {e}")))?
         }
@@ -334,12 +340,15 @@ async fn build_json_listing_table(
         .file_extension
         .as_deref()
         .unwrap_or(derived_extension.as_str());
-    let listing_options =
-        ListingOptions::new(Arc::new(format)).with_file_extension(extension);
+    let listing_options = ListingOptions::new(Arc::new(format)).with_file_extension(extension);
 
     let state = tmp_ctx.state();
     crate::file_tvf_common::ensure_local_files_exist(
-        FN_NAME, &state, &listing_url, extension, &args.path,
+        FN_NAME,
+        &state,
+        &listing_url,
+        extension,
+        &args.path,
     )
     .await?;
     let schema = listing_options.infer_schema(&state, &listing_url).await?;
@@ -405,12 +414,18 @@ mod tests {
     #[test]
     fn parse_framing_accepts_known_values() {
         assert!(matches!(parse_framing("auto").unwrap(), JsonFraming::Auto));
-        assert!(matches!(parse_framing("array").unwrap(), JsonFraming::Array));
+        assert!(matches!(
+            parse_framing("array").unwrap(),
+            JsonFraming::Array
+        ));
         assert!(matches!(
             parse_framing("newline_delimited").unwrap(),
             JsonFraming::NewlineDelimited
         ));
-        assert!(matches!(parse_framing("ARRAY").unwrap(), JsonFraming::Array));
+        assert!(matches!(
+            parse_framing("ARRAY").unwrap(),
+            JsonFraming::Array
+        ));
         assert!(parse_framing("bogus").is_err());
     }
 
@@ -434,10 +449,22 @@ mod tests {
 
     #[test]
     fn compression_from_extension_maps_suffixes() {
-        assert!(matches!(compression_from_extension("a.json.gz"), JsonCompression::Gzip));
-        assert!(matches!(compression_from_extension("a.json.zip"), JsonCompression::Zip));
-        assert!(matches!(compression_from_extension("a.json.zst"), JsonCompression::Zstd));
-        assert!(matches!(compression_from_extension("a.json"), JsonCompression::None));
+        assert!(matches!(
+            compression_from_extension("a.json.gz"),
+            JsonCompression::Gzip
+        ));
+        assert!(matches!(
+            compression_from_extension("a.json.zip"),
+            JsonCompression::Zip
+        ));
+        assert!(matches!(
+            compression_from_extension("a.json.zst"),
+            JsonCompression::Zstd
+        ));
+        assert!(matches!(
+            compression_from_extension("a.json"),
+            JsonCompression::None
+        ));
     }
 
     #[test]
@@ -455,10 +482,22 @@ mod tests {
 
     #[test]
     fn detect_framing_peeks_first_nonws_byte() {
-        assert!(matches!(detect_framing_from_bytes(b"   [ {\"a\":1} ]"), JsonFraming::Array));
-        assert!(matches!(detect_framing_from_bytes(b"\n\t[1,2]"), JsonFraming::Array));
-        assert!(matches!(detect_framing_from_bytes(b"{\"a\":1}\n"), JsonFraming::NewlineDelimited));
-        assert!(matches!(detect_framing_from_bytes(b""), JsonFraming::NewlineDelimited));
+        assert!(matches!(
+            detect_framing_from_bytes(b"   [ {\"a\":1} ]"),
+            JsonFraming::Array
+        ));
+        assert!(matches!(
+            detect_framing_from_bytes(b"\n\t[1,2]"),
+            JsonFraming::Array
+        ));
+        assert!(matches!(
+            detect_framing_from_bytes(b"{\"a\":1}\n"),
+            JsonFraming::NewlineDelimited
+        ));
+        assert!(matches!(
+            detect_framing_from_bytes(b""),
+            JsonFraming::NewlineDelimited
+        ));
     }
 
     #[tokio::test]
@@ -478,7 +517,10 @@ mod tests {
         let ctx = SessionContext::new();
         ctx.register_udtf("read_json", Arc::new(ReadJsonFunction::new(storage)));
         let df = ctx
-            .sql(&format!("SELECT count(*) AS n FROM read_json('{}')", path.display()))
+            .sql(&format!(
+                "SELECT count(*) AS n FROM read_json('{}')",
+                path.display()
+            ))
             .await
             .unwrap();
         let batches = df.collect().await.unwrap();
@@ -555,7 +597,8 @@ mod tests {
             Ok(df) => format!("{:?}", df.collect().await.err()),
         };
         assert!(
-            err.to_lowercase().contains("local filesystem paths are disabled")
+            err.to_lowercase()
+                .contains("local filesystem paths are disabled")
                 || err.to_lowercase().contains("allow_local_paths"),
             "expected a policy denial, got: {err}"
         );
@@ -617,7 +660,10 @@ mod tests {
         // `FileCompressionType::GZIP`), unlike `reads_gzipped_array` below
         // which forces the buffer path via `format => 'array'`.
         let n = ctx
-            .sql(&format!("SELECT count(*) AS n FROM read_json('{}')", path.display()))
+            .sql(&format!(
+                "SELECT count(*) AS n FROM read_json('{}')",
+                path.display()
+            ))
             .await
             .unwrap()
             .collect()
@@ -704,7 +750,10 @@ mod tests {
         // Zip always routes to the buffer path regardless of `format`, so no
         // positional arg is needed here (unlike the array case above).
         let n = ctx
-            .sql(&format!("SELECT count(*) AS n FROM read_json('{}')", path.display()))
+            .sql(&format!(
+                "SELECT count(*) AS n FROM read_json('{}')",
+                path.display()
+            ))
             .await
             .unwrap()
             .collect()

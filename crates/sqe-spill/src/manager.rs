@@ -137,9 +137,7 @@ mod tests {
     async fn manager_roundtrip_and_guard_cleanup() {
         let _serial = crate::fault::serial_test_guard();
         let tmp = tempfile::tempdir().unwrap();
-        let store = Arc::new(
-            LocalSegmentStore::open(tmp.path(), 1 << 30, 0, 2, 2).unwrap(),
-        );
+        let store = Arc::new(LocalSegmentStore::open(tmp.path(), 1 << 30, 0, 2, 2).unwrap());
         let manager = Arc::new(SpillManager::new(store, Duration::from_secs(0)));
         let scope = SpillScope::new("q-guard", "s", "agg", 0, 0);
         let guard = SpillScopeGuard::new(manager.clone(), scope.clone());
@@ -163,9 +161,6 @@ mod tests {
         drop(guard);
         // Allow cleanup task to run.
         tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(
-            !seg.path.exists(),
-            "guard should delete scope on drop"
-        );
+        assert!(!seg.path.exists(), "guard should delete scope on drop");
     }
 }

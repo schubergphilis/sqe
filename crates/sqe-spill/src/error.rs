@@ -54,7 +54,9 @@ pub enum BudgetError {
     },
 
     /// Local disk free space would fall below `min_free_bytes`.
-    #[error("spill free-space guard: need {need} free bytes after write, only {available} available")]
+    #[error(
+        "spill free-space guard: need {need} free bytes after write, only {available} available"
+    )]
     SpillDiskFull { need: u64, available: u64 },
 
     /// Segment is truncated, corrupted, or has a checksum mismatch.

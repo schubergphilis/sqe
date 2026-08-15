@@ -166,10 +166,7 @@ mod tests {
     #[test]
     fn semicolon_inside_line_comment_does_not_split() {
         let stmts = split_statements("SELECT 1 -- ;not a split\n; SELECT 2;");
-        assert_eq!(
-            stmts,
-            vec!["SELECT 1 -- ;not a split", "SELECT 2"]
-        );
+        assert_eq!(stmts, vec!["SELECT 1 -- ;not a split", "SELECT 2"]);
     }
 
     #[test]

@@ -54,7 +54,11 @@ fn ctas_wrapper_yields_inputs_outputs_and_column_lineage() {
 
     let (inputs, outputs) = extract::extract_lineage(&plan, &lookup());
 
-    assert_eq!(inputs.len(), 1, "one source dataset (the SELECT's TableScan)");
+    assert_eq!(
+        inputs.len(),
+        1,
+        "one source dataset (the SELECT's TableScan)"
+    );
     assert_eq!(inputs[0].name, "sales.orders");
     assert_eq!(inputs[0].namespace, "https://polaris.example/api/catalog");
 
@@ -68,10 +72,7 @@ fn ctas_wrapper_yields_inputs_outputs_and_column_lineage() {
         .as_ref()
         .expect("columnLineage facet must be present for CTAS write");
 
-    assert!(
-        cl.fields.contains_key("id"),
-        "target column 'id' is mapped"
-    );
+    assert!(cl.fields.contains_key("id"), "target column 'id' is mapped");
     assert!(
         cl.fields.contains_key("amount"),
         "target column 'amount' is mapped"
@@ -147,13 +148,9 @@ fn ctas_wrapper_with_aggregation_uses_correct_transformation() {
         .as_ref()
         .expect("columnLineage facet must be present");
     // customer_id passes through aggregation unchanged: IDENTITY.
-    let cust_entry = cl
-        .fields
-        .get("customer_id")
-        .expect("customer_id mapped");
+    let cust_entry = cl.fields.get("customer_id").expect("customer_id mapped");
     assert_eq!(
-        cust_entry.inputFields[0].transformations[0].subtype,
-        "IDENTITY",
+        cust_entry.inputFields[0].transformations[0].subtype, "IDENTITY",
         "GROUP BY column passes through with IDENTITY"
     );
     // The aggregated column carries DIRECT/AGGREGATION.
@@ -164,8 +161,7 @@ fn ctas_wrapper_with_aggregation_uses_correct_transformation() {
         .expect("aggregated column present");
     let sum_entry = &cl.fields[sum_key];
     assert_eq!(
-        sum_entry.inputFields[0].transformations[0].subtype,
-        "AGGREGATION",
+        sum_entry.inputFields[0].transformations[0].subtype, "AGGREGATION",
         "aggregated column carries AGGREGATION subtype"
     );
 }

@@ -4,8 +4,8 @@
 //! - `ChameleonGrantBackend` — wraps the existing Chameleon platform API client
 //! - `PolarisGrantBackend` — calls the Polaris Management REST API
 
-pub mod profile;
 pub mod polaris;
+pub mod profile;
 pub mod ranger;
 
 use async_trait::async_trait;
@@ -49,11 +49,7 @@ pub trait GrantBackend: Send + Sync {
     ) -> sqe_core::Result<Vec<GrantEntry>>;
 
     /// List effective grants for a user (resolved through role chains).
-    async fn show_effective(
-        &self,
-        token: &str,
-        user: &str,
-    ) -> sqe_core::Result<Vec<GrantEntry>>;
+    async fn show_effective(&self, token: &str, user: &str) -> sqe_core::Result<Vec<GrantEntry>>;
 
     /// Check whether a user has a specific privilege on a resource.
     async fn check_access(

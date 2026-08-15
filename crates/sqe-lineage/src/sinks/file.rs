@@ -30,10 +30,7 @@ impl Sink for FileSink {
     async fn send(&self, ev: &RunEvent) -> Result<(), SinkError> {
         let line = serde_json::to_string(ev)?;
         // Recover from poison: an earlier panic should not silence future writes.
-        let mut w = self
-            .writer
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
+        let mut w = self.writer.lock().unwrap_or_else(|p| p.into_inner());
         writeln!(w, "{line}")?;
         w.flush()?;
         Ok(())

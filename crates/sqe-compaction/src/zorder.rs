@@ -19,11 +19,11 @@
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef, BooleanArray, Date32Array, Date64Array, FixedSizeBinaryBuilder,
+    Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Date64Array, FixedSizeBinaryBuilder,
     Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, LargeBinaryArray,
-    LargeStringArray, BinaryArray, StringArray, TimestampMicrosecondArray,
-    TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt16Array,
-    UInt32Array, UInt64Array, UInt8Array,
+    LargeStringArray, StringArray, TimestampMicrosecondArray, TimestampMillisecondArray,
+    TimestampNanosecondArray, TimestampSecondArray, UInt16Array, UInt32Array, UInt64Array,
+    UInt8Array,
 };
 use arrow::datatypes::{DataType, TimeUnit};
 use datafusion::error::{DataFusionError, Result as DFResult};
@@ -329,11 +329,9 @@ mod tests {
 
     #[test]
     fn single_f64_ordering() {
-        let out = z(vec![Arc::new(Float64Array::from(vec![
-            Some(-1.5),
-            Some(0.0),
-            Some(2.5),
-        ])) as ArrayRef]);
+        let out = z(vec![
+            Arc::new(Float64Array::from(vec![Some(-1.5), Some(0.0), Some(2.5)])) as ArrayRef,
+        ]);
         assert!(out[0] < out[1]);
         assert!(out[1] < out[2]);
     }
@@ -362,7 +360,7 @@ mod tests {
     #[test]
     fn boolean_false_before_true() {
         let out = z(vec![
-            Arc::new(BooleanArray::from(vec![Some(false), Some(true)])) as ArrayRef
+            Arc::new(BooleanArray::from(vec![Some(false), Some(true)])) as ArrayRef,
         ]);
         assert!(out[0] < out[1]);
     }
@@ -375,7 +373,11 @@ mod tests {
         let a = i64col(vec![Some(7), Some(7), Some(7)]);
         let b = i64col(vec![Some(1), Some(2), Some(3)]);
         let out = z(vec![a, b]);
-        assert_eq!(out[0].len(), 16, "two 8-byte columns interleave to 16 bytes");
+        assert_eq!(
+            out[0].len(),
+            16,
+            "two 8-byte columns interleave to 16 bytes"
+        );
         assert!(out[0] < out[1]);
         assert!(out[1] < out[2]);
     }

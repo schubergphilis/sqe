@@ -165,11 +165,7 @@ impl GrantBackend for ChameleonGrantBackend {
         Ok(entries.into_iter().map(from_catalog_entry).collect())
     }
 
-    async fn show_effective(
-        &self,
-        token: &str,
-        user: &str,
-    ) -> sqe_core::Result<Vec<GrantEntry>> {
+    async fn show_effective(&self, token: &str, user: &str) -> sqe_core::Result<Vec<GrantEntry>> {
         let entries = self.client.show_effective(token, user).await?;
         Ok(entries.into_iter().map(from_catalog_entry).collect())
     }
@@ -200,17 +196,26 @@ mod tests {
 
     #[test]
     fn chameleon_maps_user_to_user() {
-        assert_eq!(chameleon_grantee_type(&Grantee::User("alice".into())), "USER");
+        assert_eq!(
+            chameleon_grantee_type(&Grantee::User("alice".into())),
+            "USER"
+        );
     }
 
     #[test]
     fn chameleon_maps_role_to_group() {
-        assert_eq!(chameleon_grantee_type(&Grantee::Role("admins".into())), "GROUP");
+        assert_eq!(
+            chameleon_grantee_type(&Grantee::Role("admins".into())),
+            "GROUP"
+        );
     }
 
     #[test]
     fn chameleon_maps_group_to_group() {
-        assert_eq!(chameleon_grantee_type(&Grantee::Group("SG-Risk".into())), "GROUP");
+        assert_eq!(
+            chameleon_grantee_type(&Grantee::Group("SG-Risk".into())),
+            "GROUP"
+        );
     }
 
     // ── to_grant_request / to_revoke_request ─────────────────────────

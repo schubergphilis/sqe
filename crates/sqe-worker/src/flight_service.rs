@@ -11,22 +11,22 @@ use arrow_flight::{
     HandshakeRequest, HandshakeResponse, PollInfo, PutResult, SchemaResult, Ticket,
 };
 use arrow_ipc::writer::IpcWriteOptions;
-use futures::{Stream, StreamExt, TryStreamExt, stream};
+use futures::{stream, Stream, StreamExt, TryStreamExt};
 use tonic::{Request, Response, Status, Streaming};
 use tracing::{debug, info, info_span, warn, Instrument};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use datafusion::prelude::SessionContext;
 use sqe_catalog::FooterCache;
-use sqe_core::FlightCompression;
-use sqe_metrics::WorkerMetricsRegistry;
-use sqe_metrics::propagation::extract_trace_context;
 use sqe_compaction::wire::{CompactGroupFrame, CompactGroupRequest};
+use sqe_core::FlightCompression;
+use sqe_metrics::propagation::extract_trace_context;
+use sqe_metrics::WorkerMetricsRegistry;
 use sqe_planner::ScanTask;
 use sqe_spill::{
     split_default_read_headroom, AdmissionRequest, AttemptManifest, ByteBudget, BytePermit,
-    ExchangeAttemptStore, LiveConsumerRegistry, MemoryGovernor, ReclaimableConsumer,
-    SpillManager, SpillScope, TaskKey, WorkloadClass,
+    ExchangeAttemptStore, LiveConsumerRegistry, MemoryGovernor, ReclaimableConsumer, SpillManager,
+    SpillScope, TaskKey, WorkloadClass,
 };
 
 use crate::compaction::compact_file_group;
@@ -323,10 +323,8 @@ impl WorkerFlightService {
     /// Set the shuffle partition byte budget used by spillable DoExchange.
     #[must_use = "with_shuffle_memory_budget consumes self; bind the returned service"]
     pub fn with_shuffle_memory_budget(self, bytes: usize) -> Self {
-        self.shuffle_memory_budget.store(
-            bytes.max(64 * 1024),
-            std::sync::atomic::Ordering::Release,
-        );
+        self.shuffle_memory_budget
+            .store(bytes.max(64 * 1024), std::sync::atomic::Ordering::Release);
         self
     }
 
@@ -483,7 +481,9 @@ impl WorkerFlightService {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
         if !sqe_compaction::wire::verify(body, provided, &self.worker_secret) {
-            return Err(Status::unauthenticated("Invalid compaction request signature"));
+            return Err(Status::unauthenticated(
+                "Invalid compaction request signature",
+            ));
         }
         Ok(())
     }
@@ -598,13 +598,7 @@ impl WorkerFlightService {
             parent_budget = budget_bytes,
             "DoExchange shuffle budget split (writer + spill-read headroom)"
         );
-        let scope = SpillScope::new(
-            query_id,
-            stage_id,
-            "do_exchange",
-            partition_id,
-            attempt_id,
-        );
+        let scope = SpillScope::new(query_id, stage_id, "do_exchange", partition_id, attempt_id);
 
         // Lazy buffer: schema comes from the first non-empty batch.
         let mut buffer: Option<SpillablePartitionBuffer> = None;
@@ -694,9 +688,8 @@ impl WorkerFlightService {
         // Empty exchange: no schema observed — return an empty Flight stream.
         let Some(schema) = schema else {
             let shuffle_opts = ipc_options_for(self.shuffle_compression)?;
-            let empty = futures::stream::empty::<
-                Result<RecordBatch, arrow_flight::error::FlightError>,
-            >();
+            let empty =
+                futures::stream::empty::<Result<RecordBatch, arrow_flight::error::FlightError>>();
             let flight_stream = FlightDataEncoderBuilder::new()
                 .with_schema(Arc::new(arrow_schema::Schema::empty()))
                 .with_options(shuffle_opts)
@@ -708,9 +701,10 @@ impl WorkerFlightService {
         };
 
         let mut buffer = buffer.expect("schema implies buffer");
-        let manifest = buffer.finish().await.map_err(|e| {
-            Status::internal(format!("shuffle spill finish failed: {e}"))
-        })?;
+        let manifest = buffer
+            .finish()
+            .await
+            .map_err(|e| Status::internal(format!("shuffle spill finish failed: {e}")))?;
         info!(
             query_id = %query_id,
             stage_id = %stage_id,
@@ -726,13 +720,8 @@ impl WorkerFlightService {
         // Phase 8: publish durable attempt manifest and commit as winner so
         // retries can reuse segments and late lower attempts are rejected.
         let task_id = format!("p{partition_id}");
-        let mut attempt_manifest = AttemptManifest::new(
-            query_id,
-            stage_id,
-            &task_id,
-            partition_id,
-            attempt_id,
-        );
+        let mut attempt_manifest =
+            AttemptManifest::new(query_id, stage_id, &task_id, partition_id, attempt_id);
         attempt_manifest.rows = manifest.rows;
         attempt_manifest.batches = manifest.batches;
         attempt_manifest.logical_bytes = manifest.logical_bytes;
@@ -762,9 +751,10 @@ impl WorkerFlightService {
             }
         }
 
-        let drain = buffer.into_drain_stream().await.map_err(|e| {
-            Status::internal(format!("shuffle spill drain open failed: {e}"))
-        })?;
+        let drain = buffer
+            .into_drain_stream()
+            .await
+            .map_err(|e| Status::internal(format!("shuffle spill drain open failed: {e}")))?;
 
         // Keep the governor grant alive until the client finishes draining
         // (or disconnects). Dropping it at the end of this function would free
@@ -824,10 +814,7 @@ where
 fn is_exchange_cancelled(err: &arrow_flight::error::FlightError) -> bool {
     match err {
         arrow_flight::error::FlightError::Tonic(status) => {
-            matches!(
-                status.code(),
-                tonic::Code::Cancelled | tonic::Code::Aborted
-            )
+            matches!(status.code(), tonic::Code::Cancelled | tonic::Code::Aborted)
         }
         other => {
             let s = other.to_string().to_ascii_lowercase();
@@ -872,12 +859,11 @@ impl FlightService for WorkerFlightService {
 
         let ticket = request.into_inner();
 
-        let scan_task = ScanTask::from_bytes(&ticket.ticket).map_err(|e| {
-            Status::invalid_argument(format!("Failed to decode ScanTask: {e}"))
-        })?;
-        scan_task.validate_version().map_err(|e| {
-            Status::invalid_argument(format!("ScanTask version rejected: {e}"))
-        })?;
+        let scan_task = ScanTask::from_bytes(&ticket.ticket)
+            .map_err(|e| Status::invalid_argument(format!("Failed to decode ScanTask: {e}")))?;
+        scan_task
+            .validate_version()
+            .map_err(|e| Status::invalid_argument(format!("ScanTask version rejected: {e}")))?;
 
         let worker_span = info_span!(
             "sqe.worker.scan",
@@ -964,9 +950,9 @@ impl FlightService for WorkerFlightService {
                 .chain(stream::once(async move {
                     drop(cleanup_guard);
                     Err::<executor::AccountedBatch, arrow_flight::error::FlightError>(
-                        arrow_flight::error::FlightError::from_external_error(
-                            Box::new(std::io::Error::other("__SQE_CLEANUP_SENTINEL__")),
-                        ),
+                        arrow_flight::error::FlightError::from_external_error(Box::new(
+                            std::io::Error::other("__SQE_CLEANUP_SENTINEL__"),
+                        )),
                     )
                 }))
                 .filter_map(|item| async move {
@@ -1000,9 +986,7 @@ impl FlightService for WorkerFlightService {
                 .map_err(Status::from);
             let flight_stream = tracing_futures::Instrument::instrument(flight_stream, stream_span);
 
-            Ok(Response::new(
-                Box::pin(flight_stream) as Self::DoGetStream
-            ))
+            Ok(Response::new(Box::pin(flight_stream) as Self::DoGetStream))
         }
         .instrument(worker_span)
         .await;
@@ -1071,9 +1055,7 @@ impl FlightService for WorkerFlightService {
                 self.verify_compaction_signature(&metadata, &action.body)?;
 
                 let request = CompactGroupRequest::from_bytes(&action.body).map_err(|e| {
-                    Status::invalid_argument(format!(
-                        "Failed to decode CompactGroupRequest: {e}"
-                    ))
+                    Status::invalid_argument(format!("Failed to decode CompactGroupRequest: {e}"))
                 })?;
                 let group_id = request.group_id;
 
@@ -1103,20 +1085,21 @@ impl FlightService for WorkerFlightService {
                     compact_file_group(&session_ctx, &request_for_task, Some(progress_tx)).await
                 });
 
-                let progress_stream =
-                    tokio_stream::wrappers::UnboundedReceiverStream::new(progress_rx).map(
-                        move |rows_read| {
-                            let frame = CompactGroupFrame::Progress { group_id, rows_read };
-                            let body = frame.to_bytes().map_err(|e| {
-                                Status::internal(format!(
-                                    "Failed to encode CompactGroupFrame: {e}"
-                                ))
-                            })?;
-                            Ok(arrow_flight::Result {
-                                body: bytes::Bytes::from(body),
-                            })
-                        },
-                    );
+                let progress_stream = tokio_stream::wrappers::UnboundedReceiverStream::new(
+                    progress_rx,
+                )
+                .map(move |rows_read| {
+                    let frame = CompactGroupFrame::Progress {
+                        group_id,
+                        rows_read,
+                    };
+                    let body = frame.to_bytes().map_err(|e| {
+                        Status::internal(format!("Failed to encode CompactGroupFrame: {e}"))
+                    })?;
+                    Ok(arrow_flight::Result {
+                        body: bytes::Bytes::from(body),
+                    })
+                });
 
                 let done_stream = stream::once(async move {
                     let response = match rewrite_task.await {
@@ -1212,21 +1195,15 @@ impl FlightService for WorkerFlightService {
             Status::invalid_argument("DoExchange stream ended before descriptor message")
         })??;
 
-        let descriptor = first_msg
-            .flight_descriptor
-            .as_ref()
-            .ok_or_else(|| {
-                Status::invalid_argument(
-                    "First DoExchange message must contain a FlightDescriptor",
-                )
-            })?;
+        let descriptor = first_msg.flight_descriptor.as_ref().ok_or_else(|| {
+            Status::invalid_argument("First DoExchange message must contain a FlightDescriptor")
+        })?;
 
-        let exchange_desc =
-            ExchangeDescriptor::from_bytes(&descriptor.cmd).map_err(|e| {
-                Status::invalid_argument(format!(
-                    "Failed to decode ExchangeDescriptor from descriptor cmd: {e}"
-                ))
-            })?;
+        let exchange_desc = ExchangeDescriptor::from_bytes(&descriptor.cmd).map_err(|e| {
+            Status::invalid_argument(format!(
+                "Failed to decode ExchangeDescriptor from descriptor cmd: {e}"
+            ))
+        })?;
 
         let (query_id, stage_id) = exchange_desc.stage_key();
         let partition_id = exchange_desc.partition_id();
@@ -1256,13 +1233,11 @@ impl FlightService for WorkerFlightService {
 
         // 3. Decode incoming RecordBatches. Chain the first message (which may
         //    also contain data) with the rest of the request stream.
-        let remaining_stream = stream.map_err(|e| {
-            arrow_flight::error::FlightError::Tonic(Box::new(e))
-        });
+        let remaining_stream =
+            stream.map_err(|e| arrow_flight::error::FlightError::Tonic(Box::new(e)));
         let first_stream = futures::stream::once(async move { Ok(first_msg) });
         let combined = first_stream.chain(remaining_stream);
-        let flight_batch_stream =
-            FlightRecordBatchStream::new_from_flight_data(combined);
+        let flight_batch_stream = FlightRecordBatchStream::new_from_flight_data(combined);
 
         // Prefer spillable intake when a SpillManager is configured: bounded
         // resident memory under shuffle_memory_budget with soft-watermark

@@ -96,55 +96,58 @@ pub fn spawn_sampler(
     tracker: Arc<QueryTracker>,
     interval: Duration,
 ) -> TaskGuard {
-    sqe_core::spawn_supervised("metrics-sampler", move |token: CancellationToken| async move {
-        let mut ticker = tokio::time::interval(interval);
-        ticker.tick().await; // skip first immediate tick
-        loop {
-            tokio::select! {
-                _ = token.cancelled() => break,
-                _ = ticker.tick() => {}
+    sqe_core::spawn_supervised(
+        "metrics-sampler",
+        move |token: CancellationToken| async move {
+            let mut ticker = tokio::time::interval(interval);
+            ticker.tick().await; // skip first immediate tick
+            loop {
+                tokio::select! {
+                    _ = token.cancelled() => break,
+                    _ = ticker.tick() => {}
+                }
+
+                let pool = &runtime.memory_pool;
+                let mem_used = crate::memory::used_bytes(pool) as u64;
+                let mem_limit = crate::memory::limit_bytes(pool) as u64;
+                let active_queries = tracker.active_count();
+
+                let records = tracker.records();
+                let total_queries = records.len();
+                let failed_queries = records
+                    .iter()
+                    .filter(|r| r.state == crate::query_tracker::QueryState::Failed)
+                    .count();
+                let total_output_rows: u64 = records.iter().map(|r| r.output_rows as u64).sum();
+                let finished_queries = records
+                    .iter()
+                    .filter(|r| r.state == crate::query_tracker::QueryState::Finished)
+                    .count();
+                let exec_ms_sum: u64 = records
+                    .iter()
+                    .filter(|r| r.state == crate::query_tracker::QueryState::Finished)
+                    .map(|r| r.execution_ms)
+                    .sum();
+
+                let unix_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+
+                history.record(MetricsSample {
+                    unix_ms,
+                    active_queries,
+                    mem_used_bytes: mem_used,
+                    mem_limit_bytes: mem_limit,
+                    total_queries,
+                    failed_queries,
+                    total_output_rows,
+                    finished_queries,
+                    exec_ms_sum,
+                });
             }
-
-            let pool = &runtime.memory_pool;
-            let mem_used = crate::memory::used_bytes(pool) as u64;
-            let mem_limit = crate::memory::limit_bytes(pool) as u64;
-            let active_queries = tracker.active_count();
-
-            let records = tracker.records();
-            let total_queries = records.len();
-            let failed_queries = records
-                .iter()
-                .filter(|r| r.state == crate::query_tracker::QueryState::Failed)
-                .count();
-            let total_output_rows: u64 = records.iter().map(|r| r.output_rows as u64).sum();
-            let finished_queries = records
-                .iter()
-                .filter(|r| r.state == crate::query_tracker::QueryState::Finished)
-                .count();
-            let exec_ms_sum: u64 = records
-                .iter()
-                .filter(|r| r.state == crate::query_tracker::QueryState::Finished)
-                .map(|r| r.execution_ms)
-                .sum();
-
-            let unix_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64;
-
-            history.record(MetricsSample {
-                unix_ms,
-                active_queries,
-                mem_used_bytes: mem_used,
-                mem_limit_bytes: mem_limit,
-                total_queries,
-                failed_queries,
-                total_output_rows,
-                finished_queries,
-                exec_ms_sum,
-            });
-        }
-    })
+        },
+    )
 }
 
 // ── Bucketing ──────────────────────────────────────────────────
@@ -244,16 +247,12 @@ pub fn bucket_samples(samples: &[MetricsSample]) -> HistoryResponse {
         // The moka cache is NOT monotonic (entries evict), so clamp all deltas to 0.
         let first = group.first().unwrap();
         let last = group.last().unwrap();
-        let total =
-            (last.total_queries as i64 - first.total_queries as i64).max(0) as u64;
-        let finished =
-            (last.finished_queries as i64 - first.finished_queries as i64).max(0) as u64;
-        let failed =
-            (last.failed_queries as i64 - first.failed_queries as i64).max(0) as u64;
+        let total = (last.total_queries as i64 - first.total_queries as i64).max(0) as u64;
+        let finished = (last.finished_queries as i64 - first.finished_queries as i64).max(0) as u64;
+        let failed = (last.failed_queries as i64 - first.failed_queries as i64).max(0) as u64;
         let rows_out =
             (last.total_output_rows as i64 - first.total_output_rows as i64).max(0) as u64;
-        let delta_exec_ms =
-            (last.exec_ms_sum as i64 - first.exec_ms_sum as i64).max(0) as u64;
+        let delta_exec_ms = (last.exec_ms_sum as i64 - first.exec_ms_sum as i64).max(0) as u64;
         let avg_latency_ms = if finished == 0 {
             0.0
         } else {
@@ -336,7 +335,10 @@ mod tests {
         let snap = h.snapshot();
         // Oldest 2 entries (unix_ms 0 and 1000) must have been evicted.
         assert_eq!(snap.len(), 3);
-        assert_eq!(snap[0].unix_ms, 2000, "oldest surviving entry should be unix_ms=2000");
+        assert_eq!(
+            snap[0].unix_ms, 2000,
+            "oldest surviving entry should be unix_ms=2000"
+        );
         assert_eq!(snap[2].unix_ms, 4000);
     }
 
@@ -448,10 +450,22 @@ mod tests {
         };
         let r = bucket_samples(&[s1, s2]);
         assert_eq!(r.buckets.len(), 1);
-        assert_eq!(r.buckets[0].total, 0, "negative delta should be clamped to 0");
-        assert_eq!(r.buckets[0].failed, 0, "negative delta should be clamped to 0");
-        assert_eq!(r.buckets[0].rows_out, 0, "negative delta should be clamped to 0");
-        assert_eq!(r.buckets[0].avg_latency_ms, 0.0, "zero Δfinished -> 0 latency");
+        assert_eq!(
+            r.buckets[0].total, 0,
+            "negative delta should be clamped to 0"
+        );
+        assert_eq!(
+            r.buckets[0].failed, 0,
+            "negative delta should be clamped to 0"
+        );
+        assert_eq!(
+            r.buckets[0].rows_out, 0,
+            "negative delta should be clamped to 0"
+        );
+        assert_eq!(
+            r.buckets[0].avg_latency_ms, 0.0,
+            "zero Δfinished -> 0 latency"
+        );
     }
 
     #[test]
@@ -483,11 +497,11 @@ mod tests {
         let r = bucket_samples(&[s1, s2]);
         assert_eq!(r.buckets.len(), 1);
         let b = &r.buckets[0];
-        assert_eq!(b.total, 5);      // Δtotal_queries
-        assert_eq!(b.finished, 3);   // Δfinished_queries
-        assert_eq!(b.failed, 2);     // Δfailed_queries
+        assert_eq!(b.total, 5); // Δtotal_queries
+        assert_eq!(b.finished, 3); // Δfinished_queries
+        assert_eq!(b.failed, 2); // Δfailed_queries
         assert_eq!(b.rows_out, 250); // Δtotal_output_rows
-        // avg_latency_ms = Δexec_ms_sum / Δfinished = (3500-2000) / 3 = 500.0
+                                     // avg_latency_ms = Δexec_ms_sum / Δfinished = (3500-2000) / 3 = 500.0
         assert!((b.avg_latency_ms - 500.0).abs() < 0.001);
         assert_eq!(b.max_active, 3);
         assert!((b.avg_active - 2.0).abs() < 0.001);

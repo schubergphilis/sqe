@@ -104,7 +104,9 @@ impl OidcClientCredentialsProvider {
             .connect_timeout(Duration::from_secs(5))
             .danger_accept_invalid_certs(config.accept_invalid_certs)
             .build()
-            .map_err(|e| AuthError::Internal(anyhow::anyhow!("Failed to build HTTP client: {e}")))?;
+            .map_err(|e| {
+                AuthError::Internal(anyhow::anyhow!("Failed to build HTTP client: {e}"))
+            })?;
         Ok(Self {
             client,
             config,
@@ -119,7 +121,10 @@ impl OidcClientCredentialsProvider {
         client_id: &str,
         client_secret: &str,
     ) -> Result<TokenResponse, AuthError> {
-        debug!(client_id = client_id, "Exchanging client credentials via client_credentials grant");
+        debug!(
+            client_id = client_id,
+            "Exchanging client credentials via client_credentials grant"
+        );
 
         let mut params = vec![
             ("grant_type", "client_credentials".to_string()),
@@ -149,10 +154,9 @@ impl OidcClientCredentialsProvider {
             return Err(AuthError::AuthFailed("Authentication failed".to_string()));
         }
 
-        response
-            .json::<TokenResponse>()
-            .await
-            .map_err(|e| AuthError::Internal(anyhow::anyhow!("Failed to parse token response: {e}")))
+        response.json::<TokenResponse>().await.map_err(|e| {
+            AuthError::Internal(anyhow::anyhow!("Failed to parse token response: {e}"))
+        })
     }
 
     /// Extract a scalar string claim by dot-separated path from a JWT payload.
@@ -205,7 +209,12 @@ impl OidcClientCredentialsProvider {
 
     /// Build an `Identity` from a freshly issued access token and the connecting
     /// `client_id`.
-    fn identity_from_token(&self, client_id: &str, access_token: String, expires_in: u64) -> Identity {
+    fn identity_from_token(
+        &self,
+        client_id: &str,
+        access_token: String,
+        expires_in: u64,
+    ) -> Identity {
         let roles = Self::extract_roles_from_claim(&access_token, &self.config.roles_claim);
         let subject = if self.config.subject_claim.is_empty() {
             None
@@ -218,8 +227,8 @@ impl OidcClientCredentialsProvider {
         // and the key under which the secret is cached for refresh).
         let display_name = Self::extract_claim_str(&access_token, "preferred_username")
             .unwrap_or_else(|| client_id.to_string());
-        let expires_at = chrono::Utc::now()
-            .checked_add_signed(chrono::Duration::seconds(expires_in as i64));
+        let expires_at =
+            chrono::Utc::now().checked_add_signed(chrono::Duration::seconds(expires_in as i64));
 
         Identity {
             user_id: client_id.to_string(),
@@ -319,11 +328,13 @@ mod tests {
 
     #[test]
     fn new_succeeds_with_valid_config() {
-        assert!(OidcClientCredentialsProvider::new(OidcClientCredentialsConfig {
-            token_url: "http://localhost:8080/token".to_string(),
-            ..Default::default()
-        })
-        .is_ok());
+        assert!(
+            OidcClientCredentialsProvider::new(OidcClientCredentialsConfig {
+                token_url: "http://localhost:8080/token".to_string(),
+                ..Default::default()
+            })
+            .is_ok()
+        );
     }
 
     // --- credential detection short-circuits (chain-friendly) ---
@@ -336,7 +347,10 @@ mod tests {
             password: Some(SecretString::new("secret".to_string())),
             ..Default::default()
         };
-        assert!(matches!(p.authenticate(&creds).await, Err(AuthError::NotMyCredentials)));
+        assert!(matches!(
+            p.authenticate(&creds).await,
+            Err(AuthError::NotMyCredentials)
+        ));
     }
 
     #[tokio::test]
@@ -347,7 +361,10 @@ mod tests {
             password: None,
             ..Default::default()
         };
-        assert!(matches!(p.authenticate(&creds).await, Err(AuthError::NotMyCredentials)));
+        assert!(matches!(
+            p.authenticate(&creds).await,
+            Err(AuthError::NotMyCredentials)
+        ));
     }
 
     #[tokio::test]
@@ -358,7 +375,10 @@ mod tests {
             password: Some(SecretString::new("secret".to_string())),
             ..Default::default()
         };
-        assert!(matches!(p.authenticate(&creds).await, Err(AuthError::NotMyCredentials)));
+        assert!(matches!(
+            p.authenticate(&creds).await,
+            Err(AuthError::NotMyCredentials)
+        ));
     }
 
     #[tokio::test]
@@ -366,10 +386,15 @@ mod tests {
         let p = provider_with("http://localhost:8080/token");
         let creds = FlightCredentials {
             username: Some("sp-reader".to_string()),
-            password: Some(SecretString::new("eyJhbGciOiJSUzI1NiJ9.payload.sig".to_string())),
+            password: Some(SecretString::new(
+                "eyJhbGciOiJSUzI1NiJ9.payload.sig".to_string(),
+            )),
             ..Default::default()
         };
-        assert!(matches!(p.authenticate(&creds).await, Err(AuthError::NotMyCredentials)));
+        assert!(matches!(
+            p.authenticate(&creds).await,
+            Err(AuthError::NotMyCredentials)
+        ));
     }
 
     #[tokio::test]

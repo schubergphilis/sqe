@@ -32,7 +32,10 @@ async fn session(server: &MockServer) -> SessionCatalog {
 }
 
 fn orders() -> TableIdent {
-    TableIdent::new(NamespaceIdent::new("sales".to_string()), "orders".to_string())
+    TableIdent::new(
+        NamespaceIdent::new("sales".to_string()),
+        "orders".to_string(),
+    )
 }
 
 #[tokio::test]

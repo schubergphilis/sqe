@@ -37,8 +37,8 @@ fn hash_value(key: Option<&[u8]>, val: &[u8]) -> String {
         Some(k) => {
             // new_from_slice never errors for HMAC-SHA256; the API permits
             // any key length so the .expect is correct here.
-            let mut mac = HmacSha256::new_from_slice(k)
-                .expect("HMAC-SHA256 accepts any key length");
+            let mut mac =
+                HmacSha256::new_from_slice(k).expect("HMAC-SHA256 accepts any key length");
             mac.update(val);
             let result = mac.finalize().into_bytes();
             hex_lower(&result)
@@ -102,7 +102,6 @@ impl Sha256Func {
 }
 
 impl ScalarUDFImpl for Sha256Func {
-
     fn name(&self) -> &str {
         "sha256"
     }
@@ -123,14 +122,15 @@ impl ScalarUDFImpl for Sha256Func {
         let key = self.key.as_deref().map(Vec::as_slice);
         match arg {
             ColumnarValue::Array(array) => {
-                let string_array = array
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .ok_or_else(|| {
-                        datafusion::error::DataFusionError::Internal(
-                            "sha256: expected Utf8 array".to_string(),
-                        )
-                    })?;
+                let string_array =
+                    array
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .ok_or_else(|| {
+                            datafusion::error::DataFusionError::Internal(
+                                "sha256: expected Utf8 array".to_string(),
+                            )
+                        })?;
 
                 let result: StringArray = string_array
                     .iter()
@@ -191,8 +191,7 @@ mod tests {
     use datafusion::logical_expr::ColumnarValue;
 
     fn make_args(args: Vec<ColumnarValue>, num_rows: usize) -> ScalarFunctionArgs {
-        let return_field =
-            Arc::new(Field::new("sha256", DataType::Utf8, true));
+        let return_field = Arc::new(Field::new("sha256", DataType::Utf8, true));
         ScalarFunctionArgs {
             args,
             arg_fields: vec![Arc::new(Field::new("input", DataType::Utf8, true))],
@@ -225,11 +224,8 @@ mod tests {
     #[test]
     fn test_sha256_array_unkeyed_matches_legacy() {
         let func = Sha256Func::new(None);
-        let array = Arc::new(StringArray::from(vec![
-            Some("hello"),
-            None,
-            Some("world"),
-        ])) as ArrayRef;
+        let array =
+            Arc::new(StringArray::from(vec![Some("hello"), None, Some("world")])) as ArrayRef;
         let input = ColumnarValue::Array(array);
         let result = func.invoke_with_args(make_args(vec![input], 3)).unwrap();
         if let ColumnarValue::Array(arr) = result {
@@ -272,8 +268,12 @@ mod tests {
             )))
         };
 
-        let plain_result = plain.invoke_with_args(make_args(vec![make_input()], 1)).unwrap();
-        let keyed_result = keyed.invoke_with_args(make_args(vec![make_input()], 1)).unwrap();
+        let plain_result = plain
+            .invoke_with_args(make_args(vec![make_input()], 1))
+            .unwrap();
+        let keyed_result = keyed
+            .invoke_with_args(make_args(vec![make_input()], 1))
+            .unwrap();
 
         let plain_hash = match plain_result {
             ColumnarValue::Scalar(datafusion::scalar::ScalarValue::Utf8(Some(h))) => h,
@@ -284,13 +284,15 @@ mod tests {
             other => panic!("expected Utf8 scalar, got {other:?}"),
         };
 
-        assert_ne!(plain_hash, keyed_hash, "HMAC must differ from plain SHA-256");
+        assert_ne!(
+            plain_hash, keyed_hash,
+            "HMAC must differ from plain SHA-256"
+        );
         // RFC 4231-style sanity check: HMAC-SHA256(key="pepper", msg="123-45-6789").
         // Reference computed with `printf 123-45-6789 |
         // openssl dgst -sha256 -mac HMAC -macopt key:pepper`.
         assert_eq!(
-            keyed_hash,
-            "40966d99be0fda85dac0b2f8d9f00b434b89b0d3e2b3f4bdcbf1dd31a2b7092f",
+            keyed_hash, "40966d99be0fda85dac0b2f8d9f00b434b89b0d3e2b3f4bdcbf1dd31a2b7092f",
             "HMAC-SHA256 output drift"
         );
     }
@@ -298,12 +300,10 @@ mod tests {
     #[test]
     fn test_sha256_keyed_deterministic_within_run() {
         let func = Sha256Func::new(Some(Arc::new(b"k".to_vec())));
-        let input1 = ColumnarValue::Scalar(datafusion::scalar::ScalarValue::Utf8(Some(
-            "x".to_string(),
-        )));
-        let input2 = ColumnarValue::Scalar(datafusion::scalar::ScalarValue::Utf8(Some(
-            "x".to_string(),
-        )));
+        let input1 =
+            ColumnarValue::Scalar(datafusion::scalar::ScalarValue::Utf8(Some("x".to_string())));
+        let input2 =
+            ColumnarValue::Scalar(datafusion::scalar::ScalarValue::Utf8(Some("x".to_string())));
         let r1 = func.invoke_with_args(make_args(vec![input1], 1)).unwrap();
         let r2 = func.invoke_with_args(make_args(vec![input2], 1)).unwrap();
         let h1 = match r1 {
@@ -327,11 +327,17 @@ mod tests {
         let input_b = ColumnarValue::Scalar(datafusion::scalar::ScalarValue::Utf8(Some(
             "value".to_string(),
         )));
-        let ha = match func_a.invoke_with_args(make_args(vec![input_a], 1)).unwrap() {
+        let ha = match func_a
+            .invoke_with_args(make_args(vec![input_a], 1))
+            .unwrap()
+        {
             ColumnarValue::Scalar(datafusion::scalar::ScalarValue::Utf8(Some(h))) => h,
             _ => panic!(),
         };
-        let hb = match func_b.invoke_with_args(make_args(vec![input_b], 1)).unwrap() {
+        let hb = match func_b
+            .invoke_with_args(make_args(vec![input_b], 1))
+            .unwrap()
+        {
             ColumnarValue::Scalar(datafusion::scalar::ScalarValue::Utf8(Some(h))) => h,
             _ => panic!(),
         };

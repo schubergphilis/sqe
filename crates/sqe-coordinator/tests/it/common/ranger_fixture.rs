@@ -356,9 +356,7 @@ impl RangerAdmin {
             .get_policies(HIVE_SERVICE)
             .await?
             .into_iter()
-            .find(|p| {
-                wildcard(p, "database") && wildcard(p, "table") && wildcard(p, "column")
-            })
+            .find(|p| wildcard(p, "database") && wildcard(p, "table") && wildcard(p, "column"))
             .ok_or_else(|| {
                 anyhow::anyhow!(
                     "no policy owns database=*/table=*/column=* on {HIVE_SERVICE}; Ranger \
@@ -596,7 +594,9 @@ impl RangerAdmin {
         let mut removed = 0;
         for service in [HIVE_SERVICE, TAG_SERVICE] {
             for p in self.get_policies(service).await? {
-                let Some(name) = p["name"].as_str() else { continue };
+                let Some(name) = p["name"].as_str() else {
+                    continue;
+                };
                 if name.starts_with(PREFIX) {
                     self.delete_policy(service, name).await?;
                     removed += 1;
@@ -929,9 +929,13 @@ mod suite_scope_tests {
     #[test]
     fn spares_other_namespaces_including_the_parity_demo() {
         assert!(!is_suite_scoped(&table_policy(
-            "sales_wh", "acparity", "customers"
+            "sales_wh",
+            "acparity",
+            "customers"
         )));
-        assert!(!is_suite_scoped(&table_policy("sales_wh", "sales", "orders")));
+        assert!(!is_suite_scoped(&table_policy(
+            "sales_wh", "sales", "orders"
+        )));
     }
 
     /// `ac` in a catalog the suite does not own is not the suite's to delete.

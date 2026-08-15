@@ -54,10 +54,8 @@ impl SortMemoryRule {
     }
 
     fn policy(&self) -> SortMemoryPolicy {
-        let mut p = SortMemoryPolicy::from_grant(MemoryGrant::new(
-            "sort-gate",
-            self.sort_grant_bytes,
-        ));
+        let mut p =
+            SortMemoryPolicy::from_grant(MemoryGrant::new("sort-gate", self.sort_grant_bytes));
         p.max_fan_in = self.max_fan_in;
         p
     }
@@ -134,9 +132,9 @@ impl PhysicalOptimizerRule for SortMemoryRule {
 mod tests {
     use super::*;
     use arrow_schema::{DataType, Field, Schema};
+    use datafusion::physical_expr::expressions::col;
     use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
     use datafusion::physical_plan::empty::EmptyExec;
-    use datafusion::physical_expr::expressions::col;
 
     fn sort_plan() -> Arc<dyn ExecutionPlan> {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
@@ -166,7 +164,9 @@ mod tests {
         let err = rule.optimize(plan, &ConfigOptions::new()).unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.contains("sort merge") || msg.contains("ResourcesExhausted") || msg.contains("headroom"),
+            msg.contains("sort merge")
+                || msg.contains("ResourcesExhausted")
+                || msg.contains("headroom"),
             "unexpected: {msg}"
         );
     }

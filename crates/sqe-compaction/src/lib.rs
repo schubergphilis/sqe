@@ -20,16 +20,16 @@ pub mod writer;
 pub mod zorder;
 
 pub use dispatch::{
-    aggregate_group_outcomes, decode_group_response, least_loaded_worker,
-    next_group_assignment, place_groups_largest_first, AggregatedRewrite, GroupOutcome,
-    GroupPlacement, PendingSlot, PlacementPlan, WorkerLoad,
+    aggregate_group_outcomes, decode_group_response, least_loaded_worker, next_group_assignment,
+    place_groups_largest_first, AggregatedRewrite, GroupOutcome, GroupPlacement, PendingSlot,
+    PlacementPlan, WorkerLoad,
 };
 pub use progress::ProgressReporter;
 pub use rewrite::{
     collect_live_delete_files, covered_position_deletes, delete_heavy_files,
-    expected_rows_after_deletes, group_files_by_partition, is_live_delete_entry,
-    pack_file_groups, pack_file_groups_partition_aware, plan_delete_aware_read, rewrite_group,
-    sort_group_stream, DeleteAwareReadPlan, SortCtx, SortSpec,
+    expected_rows_after_deletes, group_files_by_partition, is_live_delete_entry, pack_file_groups,
+    pack_file_groups_partition_aware, plan_delete_aware_read, rewrite_group, sort_group_stream,
+    DeleteAwareReadPlan, SortCtx, SortSpec,
 };
 pub use wire::{
     sign, verify, CompactGroupFrame, CompactGroupRequest, CompactGroupResponse, S3Conn,

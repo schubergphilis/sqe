@@ -50,11 +50,10 @@ pub struct DeleteAwareReadPlan {
 /// after loading the table, so the task set matches the snapshot whose files the
 /// rewrite deletes.
 pub async fn plan_delete_aware_read(table: &IcebergTable) -> sqe_core::Result<DeleteAwareReadPlan> {
-    let scan = table
-        .scan()
-        .select_all()
-        .build()
-        .map_err(|e| SqeError::Execution(format!("Failed to build compaction read scan: {e}")))?;
+    let scan =
+        table.scan().select_all().build().map_err(|e| {
+            SqeError::Execution(format!("Failed to build compaction read scan: {e}"))
+        })?;
     let tasks: Vec<iceberg::scan::FileScanTask> = scan
         .plan_files()
         .await
@@ -225,9 +224,7 @@ pub fn pack_file_groups(
     // up anchoring its own group (nothing else fits), so it is rewritten alone.
     let mut small: Vec<DataFile> = files
         .iter()
-        .filter(|f| {
-            f.file_size_in_bytes() < target_bytes || force_include.contains(f.file_path())
-        })
+        .filter(|f| f.file_size_in_bytes() < target_bytes || force_include.contains(f.file_path()))
         .cloned()
         .collect();
     // Descending by size.
@@ -384,14 +381,16 @@ impl datafusion::physical_plan::streaming::PartitionStream for OneShotStream {
     ) -> datafusion::execution::SendableRecordBatchStream {
         match self.inner.lock().expect("OneShotStream poisoned").take() {
             Some(s) => s,
-            None => Box::pin(datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
-                self.schema.clone(),
-                futures::stream::once(async {
-                    Err(datafusion::error::DataFusionError::Execution(
-                        "compaction sort source polled more than once".into(),
-                    ))
-                }),
-            )),
+            None => Box::pin(
+                datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
+                    self.schema.clone(),
+                    futures::stream::once(async {
+                        Err(datafusion::error::DataFusionError::Execution(
+                            "compaction sort source polled more than once".into(),
+                        ))
+                    }),
+                ),
+            ),
         }
     }
 }
@@ -423,7 +422,9 @@ pub async fn sort_group_stream(
     const SRC: &str = "__sqe_compact_src";
     session
         .register_table(SRC, Arc::new(provider))
-        .map_err(|e| SqeError::Execution(format!("compaction sort: register source failed: {e}")))?;
+        .map_err(|e| {
+            SqeError::Execution(format!("compaction sort: register source failed: {e}"))
+        })?;
     let df = session
         .table(SRC)
         .await
@@ -443,7 +444,9 @@ pub async fn sort_group_stream(
             // schema matches the table. Iceberg's SortOrder cannot express
             // z-order, so no sort-order metadata is stamped (matches Spark).
             let zargs = cols.iter().map(|c| col(c.as_str())).collect::<Vec<_>>();
-            let zexpr = crate::zorder::zorder_udf().call(zargs).alias("__sqe_zvalue");
+            let zexpr = crate::zorder::zorder_udf()
+                .call(zargs)
+                .alias("__sqe_zvalue");
             let passthrough = schema
                 .fields()
                 .iter()
@@ -531,12 +534,10 @@ pub async fn rewrite_group(
     let scan_result = plan
         .scan
         .read_tasks_to_arrow_with_metrics(task_stream)
-        .map_err(|e| {
-            SqeError::Execution(format!("delete-aware compaction read failed: {e}"))
-        })?;
-    let df_stream = scan_result.stream().map(|item| {
-        item.map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))
-    });
+        .map_err(|e| SqeError::Execution(format!("delete-aware compaction read failed: {e}")))?;
+    let df_stream = scan_result
+        .stream()
+        .map(|item| item.map_err(|e| datafusion::error::DataFusionError::External(Box::new(e))));
     let sendable: datafusion::execution::SendableRecordBatchStream = Box::pin(
         datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
             arrow_schema.clone(),
@@ -650,7 +651,11 @@ mod tests {
         let b = data_file_part("b", 10, 0, 2);
         let c = data_file_part("c", 10, 1, 1);
         assert_eq!(partition_key(&a), partition_key(&a));
-        assert_ne!(partition_key(&a), partition_key(&b), "different partition value");
+        assert_ne!(
+            partition_key(&a),
+            partition_key(&b),
+            "different partition value"
+        );
         assert_ne!(partition_key(&a), partition_key(&c), "different spec id");
     }
 
@@ -665,7 +670,11 @@ mod tests {
         let groups = pack_file_groups_partition_aware(&files, 1024, &no_force());
         for g in &groups {
             let keys: HashSet<String> = g.iter().map(partition_key).collect();
-            assert_eq!(keys.len(), 1, "each group must be single-partition, got {keys:?}");
+            assert_eq!(
+                keys.len(),
+                1,
+                "each group must be single-partition, got {keys:?}"
+            );
         }
         let total: usize = groups.iter().map(|g| g.len()).sum();
         assert_eq!(total, 4);
@@ -686,19 +695,25 @@ mod tests {
         ];
         let groups = group_files_by_partition(&files);
         // Exactly one group per partition.
-        assert_eq!(groups.len(), 2, "one group per partition, got {}", groups.len());
+        assert_eq!(
+            groups.len(),
+            2,
+            "one group per partition, got {}",
+            groups.len()
+        );
         // Every group is single-partition and no file was dropped.
         for g in &groups {
             let keys: HashSet<String> = g.iter().map(partition_key).collect();
-            assert_eq!(keys.len(), 1, "each group must be single-partition, got {keys:?}");
+            assert_eq!(
+                keys.len(),
+                1,
+                "each group must be single-partition, got {keys:?}"
+            );
         }
         let total: usize = groups.iter().map(|g| g.len()).sum();
         assert_eq!(total, 4, "no file may be dropped, including the large one");
         // The large file must be present (bin-pack would have excluded it).
-        let has_huge = groups
-            .iter()
-            .flatten()
-            .any(|f| f.file_path() == "p1-huge");
+        let has_huge = groups.iter().flatten().any(|f| f.file_path() == "p1-huge");
         assert!(has_huge, "sort grouping must keep files at/above target");
     }
 
@@ -777,7 +792,10 @@ mod tests {
         let d = data_file_rows("s3://b/d1.parquet", 100);
         let pd = pos_delete_file("s3://b/pd1.parquet", 10, "s3://b/d1.parquet");
         // Same delete file listed twice must only subtract once.
-        assert_eq!(expected_rows_after_deletes(&[d], &[pd.clone(), pd]), Some(90));
+        assert_eq!(
+            expected_rows_after_deletes(&[d], &[pd.clone(), pd]),
+            Some(90)
+        );
     }
 
     #[test]

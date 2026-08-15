@@ -452,12 +452,7 @@ fn policy_matches_table(p: &RangerPolicy, database: &str, table: &str) -> bool {
 /// `groups` is accepted but NOT enforced (SQE has no group info; token roles
 /// only, by design — Phase 2). A policy item bound ONLY via `groups` is skipped
 /// with a warning so operators see the gap instead of a silent drop.
-fn item_matches(
-    users: &[String],
-    roles: &[String],
-    groups: &[String],
-    user: &SessionUser,
-) -> bool {
+fn item_matches(users: &[String], roles: &[String], groups: &[String], user: &SessionUser) -> bool {
     let matched = users.iter().any(|u| u == &user.username)
         || roles.iter().any(|r| user.roles.contains(r))
         || groups.iter().any(|g| user.groups.contains(g));
@@ -506,7 +501,11 @@ fn normalize_mask_type(mask_type: &str) -> &str {
 ///  - `Ok(Some(mask))` supported,
 ///  - `Ok(None)` for MASK_NONE (explicit exemption: no mask, not restricted),
 ///  - `Err(())` for not-yet-supported types (caller restricts the column, fail-closed).
-fn map_mask(info: &DataMaskInfo, column: &str, identity: &SessionIdentity) -> Result<Option<MaskType>, ()> {
+fn map_mask(
+    info: &DataMaskInfo,
+    column: &str,
+    identity: &SessionIdentity,
+) -> Result<Option<MaskType>, ()> {
     match normalize_mask_type(info.data_mask_type.as_str()) {
         "MASK_NULL" => Ok(Some(MaskType::Nullify)),
         "MASK_NONE" => Ok(None),
@@ -581,7 +580,9 @@ fn resolve_from_bundle(
         // resource can list several columns that all receive the same mask;
         // iterate ALL of them so multi-column policies don't leak.
         if p.policy_type == POLICY_TYPE_DATAMASK {
-            let Some(col_res) = p.resources.get("column") else { continue };
+            let Some(col_res) = p.resources.get("column") else {
+                continue;
+            };
             if col_res.is_excludes {
                 // "mask all columns EXCEPT these" cannot be honored on the
                 // resource path: the column complement needs the table schema,
@@ -684,7 +685,11 @@ pub(crate) fn resolve_tag_policies(
     bundle: &ServicePolicies,
     identity: &SessionIdentity,
     tags: &HashSet<String>,
-) -> (HashMap<String, TagMaskSpec>, Vec<(String, Expr)>, HashSet<String>) {
+) -> (
+    HashMap<String, TagMaskSpec>,
+    Vec<(String, Expr)>,
+    HashSet<String>,
+) {
     let mut masks: HashMap<String, TagMaskSpec> = HashMap::new();
     let mut filters: Vec<(String, Expr)> = Vec::new();
     let mut unmappable: HashSet<String> = HashSet::new();
@@ -801,7 +806,13 @@ pub(crate) fn resolve_tag_policies(
 fn cache_key(user: &SessionUser, table: &str, namespace: &str) -> String {
     let mut roles = user.roles.clone();
     roles.sort();
-    format!("{}:{}:{}:{}", user.username, namespace, table, roles.join(","))
+    format!(
+        "{}:{}:{}:{}",
+        user.username,
+        namespace,
+        table,
+        roles.join(",")
+    )
 }
 
 #[derive(Debug)]
@@ -822,9 +833,9 @@ impl RangerStore {
             .basic_auth(&self.admin_user, Some(self.admin_password.expose()))
             .send()
             .await
-            .map_err(|e| sqe_core::SqeError::Execution(format!(
-                "Ranger service lookup failed: {e}"
-            )))?;
+            .map_err(|e| {
+                sqe_core::SqeError::Execution(format!("Ranger service lookup failed: {e}"))
+            })?;
         if !response.status().is_success() {
             return Err(sqe_core::SqeError::Execution(format!(
                 "Ranger service lookup failed (HTTP {})",
@@ -838,16 +849,21 @@ impl RangerStore {
             .get("type")
             .and_then(serde_json::Value::as_str)
             .filter(|v| !v.is_empty())
-            .ok_or_else(|| sqe_core::SqeError::Execution(
-                "Ranger component service response omitted its type".to_string(),
-            ))?
+            .ok_or_else(|| {
+                sqe_core::SqeError::Execution(
+                    "Ranger component service response omitted its type".to_string(),
+                )
+            })?
             .to_string();
         let tag_service = body
             .get("tagService")
             .and_then(serde_json::Value::as_str)
             .filter(|v| !v.is_empty())
             .map(str::to_string);
-        Ok(RangerServiceLink { component_type, tag_service })
+        Ok(RangerServiceLink {
+            component_type,
+            tag_service,
+        })
     }
 
     async fn policies_for_service(
@@ -862,9 +878,9 @@ impl RangerStore {
             .basic_auth(&self.admin_user, Some(self.admin_password.expose()))
             .send()
             .await
-            .map_err(|e| sqe_core::SqeError::Execution(format!(
-                "Ranger policy list failed: {e}"
-            )))?;
+            .map_err(|e| {
+                sqe_core::SqeError::Execution(format!("Ranger policy list failed: {e}"))
+            })?;
         if !response.status().is_success() {
             return Err(sqe_core::SqeError::Execution(format!(
                 "Ranger policy list failed (HTTP {})",
@@ -935,23 +951,30 @@ impl RangerStore {
                 stmt.name
             ))),
             Some(policy) => {
-                let id = policy.get("id").and_then(serde_json::Value::as_i64).ok_or_else(|| {
-                    sqe_core::SqeError::Execution(format!(
-                        "Ranger policy '{}' has no numeric id",
-                        stmt.name
-                    ))
-                })?;
+                let id = policy
+                    .get("id")
+                    .and_then(serde_json::Value::as_i64)
+                    .ok_or_else(|| {
+                        sqe_core::SqeError::Execution(format!(
+                            "Ranger policy '{}' has no numeric id",
+                            stmt.name
+                        ))
+                    })?;
                 self.send_policy_ddl(
                     reqwest::Method::PUT,
                     &format!("/service/public/v2/api/policy/{id}"),
                     Some(&body),
-                ).await
+                )
+                .await
             }
-            None => self.send_policy_ddl(
-                reqwest::Method::POST,
-                "/service/public/v2/api/policy",
-                Some(&body),
-            ).await,
+            None => {
+                self.send_policy_ddl(
+                    reqwest::Method::POST,
+                    "/service/public/v2/api/policy",
+                    Some(&body),
+                )
+                .await
+            }
         }
     }
 
@@ -970,7 +993,9 @@ impl RangerStore {
                 self.policies_for_service(&service)
                     .await?
                     .into_iter()
-                    .filter(|p| p.get("name").and_then(serde_json::Value::as_str) == Some(&stmt.name))
+                    .filter(|p| {
+                        p.get("name").and_then(serde_json::Value::as_str) == Some(&stmt.name)
+                    })
                     .filter_map(|p| p.get("id").and_then(serde_json::Value::as_i64)),
             );
         }
@@ -985,7 +1010,8 @@ impl RangerStore {
                 reqwest::Method::DELETE,
                 &format!("/service/public/v2/api/policy/{id}"),
                 None,
-            ).await?;
+            )
+            .await?;
         }
         Ok(())
     }
@@ -1027,7 +1053,10 @@ fn ranger_policy_body(
             let table_name = parts[parts.len() - 1];
             let namespace_start = usize::from(parts.len() >= 3);
             let namespace = parts[namespace_start..parts.len() - 1].join(".");
-            resources.insert("database".into(), serde_json::json!({"values": [namespace]}));
+            resources.insert(
+                "database".into(),
+                serde_json::json!({"values": [namespace]}),
+            );
             resources.insert("table".into(), serde_json::json!({"values": [table_name]}));
         }
     }
@@ -1039,7 +1068,11 @@ fn ranger_policy_body(
         "resources": resources,
     });
     match &stmt.kind {
-        FineGrainedPolicyKind::ColumnMask { mask_type, column, expression } => {
+        FineGrainedPolicyKind::ColumnMask {
+            mask_type,
+            column,
+            expression,
+        } => {
             if let Some(column) = column {
                 body["resources"]["column"] = serde_json::json!({"values": [column]});
             }
@@ -1206,7 +1239,10 @@ mod tests {
         assert_eq!(body["resources"]["table"]["values"][0], "orders");
         assert_eq!(body["resources"]["column"]["values"][0], "amount");
         assert_eq!(body["dataMaskPolicyItems"][0]["roles"][0], "engineer");
-        assert_eq!(body["dataMaskPolicyItems"][0]["dataMaskInfo"]["dataMaskType"], "MASK_NULL");
+        assert_eq!(
+            body["dataMaskPolicyItems"][0]["dataMaskInfo"]["dataMaskType"],
+            "MASK_NULL"
+        );
     }
 
     #[test]
@@ -1218,8 +1254,14 @@ mod tests {
         let body = ranger_policy_body(&stmt, "query_tag", "hive").unwrap();
         assert_eq!(body["service"], "query_tag");
         assert_eq!(body["resources"]["tag"]["values"][0], "pii");
-        assert_eq!(body["dataMaskPolicyItems"][0]["accesses"][0]["type"], "hive:select");
-        assert_eq!(body["dataMaskPolicyItems"][0]["dataMaskInfo"]["dataMaskType"], "hive:CUSTOM");
+        assert_eq!(
+            body["dataMaskPolicyItems"][0]["accesses"][0]["type"],
+            "hive:select"
+        );
+        assert_eq!(
+            body["dataMaskPolicyItems"][0]["dataMaskInfo"]["dataMaskType"],
+            "hive:CUSTOM"
+        );
     }
 
     /// Tag-service mask types carry the owning component's prefix. Verified
@@ -1237,10 +1279,7 @@ mod tests {
         assert_eq!(normalize_mask_type("hive:CUSTOM"), "CUSTOM");
         // Another engine's mask stays unmatched, so the caller fails closed
         // rather than applying a policy authored for Trino.
-        assert_eq!(
-            normalize_mask_type("trino:MASK_NULL"),
-            "trino:MASK_NULL"
-        );
+        assert_eq!(normalize_mask_type("trino:MASK_NULL"), "trino:MASK_NULL");
     }
 
     const BUNDLE: &str = r#"{
@@ -1280,7 +1319,9 @@ mod tests {
         assert_eq!(sp.policies[0].policy_type, 1);
         assert!(sp.policies[0].is_enabled);
         assert_eq!(
-            sp.policies[0].data_mask_policy_items[0].data_mask_info.data_mask_type,
+            sp.policies[0].data_mask_policy_items[0]
+                .data_mask_info
+                .data_mask_type,
             "MASK_NULL"
         );
         assert_eq!(
@@ -1323,7 +1364,9 @@ mod tests {
             ..RangerPolicyConfig::default()
         };
         let metrics = Arc::new(MetricsRegistry::new().unwrap());
-        let store = RangerStore::from_config(&cfg).unwrap().with_metrics(metrics.clone());
+        let store = RangerStore::from_config(&cfg)
+            .unwrap()
+            .with_metrics(metrics.clone());
 
         // First fetch fails (transport error) -> record_failure opens the
         // breaker (threshold 1) and record_metric writes the gauge.
@@ -1344,7 +1387,10 @@ mod tests {
             .policy_resolve_duration_seconds
             .with_label_values(&["ranger", "err"])
             .get_sample_count();
-        assert!(observed >= 1, "fetch failure must record a resolve-duration sample");
+        assert!(
+            observed >= 1,
+            "fetch failure must record a resolve-duration sample"
+        );
     }
 
     /// Fix 1: per-user cache hit/miss counters increment via `resolve`. We seed
@@ -1377,10 +1423,7 @@ mod tests {
     async fn cached_bundle_serves_warm_copy_without_fetch() {
         let store = RangerStore::from_config(&RangerPolicyConfig::default()).unwrap();
         let seeded: Arc<ServicePolicies> = Arc::new(serde_json::from_str(BUNDLE).unwrap());
-        store
-            .bundle_cache
-            .insert(BUNDLE_KEY, seeded.clone())
-            .await;
+        store.bundle_cache.insert(BUNDLE_KEY, seeded.clone()).await;
 
         let got = store
             .cached_bundle()
@@ -1420,7 +1463,10 @@ mod tests {
         };
 
         // Prefix, suffix and interior globs.
-        assert!(resource_matches(&r("orders*"), "orders"), "* may match nothing");
+        assert!(
+            resource_matches(&r("orders*"), "orders"),
+            "* may match nothing"
+        );
         assert!(resource_matches(&r("orders*"), "orders_2024"));
         assert!(!resource_matches(&r("orders*"), "sales_orders"));
         assert!(resource_matches(&r("*_pii"), "customer_pii"));
@@ -1451,11 +1497,17 @@ mod tests {
             values: vec!["tmp_*".to_string()],
             is_excludes: true,
         };
-        assert!(!resource_matches(&excl, "tmp_scratch"), "excluded by the glob");
+        assert!(
+            !resource_matches(&excl, "tmp_scratch"),
+            "excluded by the glob"
+        );
         assert!(resource_matches(&excl, "orders"), "outside the exclusion");
 
         // An empty values list matches nothing.
-        let empty = RangerResource { values: vec![], is_excludes: false };
+        let empty = RangerResource {
+            values: vec![],
+            is_excludes: false,
+        };
         assert!(!resource_matches(&empty, "orders"));
     }
 
@@ -1489,15 +1541,30 @@ mod tests {
         let empty: [String; 0] = [];
 
         assert!(
-            item_matches(&empty, &empty, &g, &user_with_groups("bob", &[], &["data-platform"])),
+            item_matches(
+                &empty,
+                &empty,
+                &g,
+                &user_with_groups("bob", &[], &["data-platform"])
+            ),
             "a group the session carries must match"
         );
         assert!(
-            !item_matches(&empty, &empty, &g, &user_with_groups("bob", &[], &["other-group"])),
+            !item_matches(
+                &empty,
+                &empty,
+                &g,
+                &user_with_groups("bob", &[], &["other-group"])
+            ),
             "a group the session does not carry must not match"
         );
         assert!(
-            !item_matches(&empty, &empty, &g, &user_with_groups("bob", &["analyst"], &[])),
+            !item_matches(
+                &empty,
+                &empty,
+                &g,
+                &user_with_groups("bob", &["analyst"], &[])
+            ),
             "no groups on the session cannot match a group-bound item"
         );
         // Roles and users still match on their own, and the three are OR-ed.
@@ -1524,12 +1591,7 @@ mod tests {
     #[test]
     fn mask_null_maps_to_nullify() {
         let bundle: ServicePolicies = serde_json::from_str(BUNDLE).unwrap();
-        let policy = resolve_from_bundle(
-            &bundle,
-            &user("alice", &["analyst"]),
-            "orders",
-            "sales",
-        );
+        let policy = resolve_from_bundle(&bundle, &user("alice", &["analyst"]), "orders", "sales");
         assert!(matches!(
             policy.column_masks.get("amount"),
             Some(MaskType::Nullify)
@@ -1539,24 +1601,14 @@ mod tests {
     #[test]
     fn row_filter_applied_for_matching_role() {
         let bundle: ServicePolicies = serde_json::from_str(BUNDLE).unwrap();
-        let policy = resolve_from_bundle(
-            &bundle,
-            &user("alice", &["analyst"]),
-            "orders",
-            "sales",
-        );
+        let policy = resolve_from_bundle(&bundle, &user("alice", &["analyst"]), "orders", "sales");
         assert_eq!(policy.row_filters.len(), 1);
     }
 
     #[test]
     fn no_match_for_other_role() {
         let bundle: ServicePolicies = serde_json::from_str(BUNDLE).unwrap();
-        let policy = resolve_from_bundle(
-            &bundle,
-            &user("bob", &["engineer"]),
-            "orders",
-            "sales",
-        );
+        let policy = resolve_from_bundle(&bundle, &user("bob", &["engineer"]), "orders", "sales");
         assert!(policy.column_masks.is_empty());
         assert!(policy.row_filters.is_empty());
     }
@@ -1566,8 +1618,7 @@ mod tests {
         let mut bundle: ServicePolicies = serde_json::from_str(BUNDLE).unwrap();
         bundle.policies[0].data_mask_policy_items[0].roles.clear();
         bundle.policies[0].data_mask_policy_items[0].users = vec!["alice".to_string()];
-        let policy =
-            resolve_from_bundle(&bundle, &user("alice", &[]), "orders", "sales");
+        let policy = resolve_from_bundle(&bundle, &user("alice", &[]), "orders", "sales");
         assert!(policy.column_masks.contains_key("amount"));
     }
 
@@ -1577,12 +1628,7 @@ mod tests {
         bundle.policies[0].data_mask_policy_items[0]
             .data_mask_info
             .data_mask_type = "MASK_FUTURE_UNSUPPORTED".to_string();
-        let policy = resolve_from_bundle(
-            &bundle,
-            &user("alice", &["analyst"]),
-            "orders",
-            "sales",
-        );
+        let policy = resolve_from_bundle(&bundle, &user("alice", &["analyst"]), "orders", "sales");
         assert!(policy.restricted_columns.contains(&"amount".to_string()));
         assert!(!policy.column_masks.contains_key("amount"));
     }
@@ -1600,12 +1646,7 @@ mod tests {
         bundle.policies[0].data_mask_policy_items[0]
             .data_mask_info
             .value_expr = Some("t.department".to_string());
-        let policy = resolve_from_bundle(
-            &bundle,
-            &user("alice", &["analyst"]),
-            "orders",
-            "sales",
-        );
+        let policy = resolve_from_bundle(&bundle, &user("alice", &["analyst"]), "orders", "sales");
         assert!(
             policy.restricted_columns.contains(&"amount".to_string()),
             "unparseable CUSTOM mask must restrict the column (fail-closed)"
@@ -1624,13 +1665,12 @@ mod tests {
         // an include list, leaving every intended-masked column raw. It must
         // now fail closed: deny the table.
         let mut bundle: ServicePolicies = serde_json::from_str(BUNDLE).unwrap();
-        bundle.policies[0].resources.get_mut("column").unwrap().is_excludes = true;
-        let policy = resolve_from_bundle(
-            &bundle,
-            &user("alice", &["analyst"]),
-            "orders",
-            "sales",
-        );
+        bundle.policies[0]
+            .resources
+            .get_mut("column")
+            .unwrap()
+            .is_excludes = true;
+        let policy = resolve_from_bundle(&bundle, &user("alice", &["analyst"]), "orders", "sales");
         assert!(
             policy.row_filters.contains(&lit(false)),
             "column isExcludes datamask must inject a deny (lit(false)) row filter"
@@ -1647,12 +1687,7 @@ mod tests {
         bundle.policies[0].data_mask_policy_items[0]
             .data_mask_info
             .data_mask_type = "MASK_NONE".to_string();
-        let policy = resolve_from_bundle(
-            &bundle,
-            &user("alice", &["analyst"]),
-            "orders",
-            "sales",
-        );
+        let policy = resolve_from_bundle(&bundle, &user("alice", &["analyst"]), "orders", "sales");
         assert!(!policy.column_masks.contains_key("amount"));
         assert!(!policy.restricted_columns.contains(&"amount".to_string()));
     }
@@ -1661,24 +1696,15 @@ mod tests {
     fn disabled_policy_is_skipped() {
         let mut bundle: ServicePolicies = serde_json::from_str(BUNDLE).unwrap();
         bundle.policies[0].is_enabled = false; // the datamask policy
-        let policy = resolve_from_bundle(
-            &bundle,
-            &user("alice", &["analyst"]),
-            "orders",
-            "sales",
-        );
+        let policy = resolve_from_bundle(&bundle, &user("alice", &["analyst"]), "orders", "sales");
         assert!(policy.column_masks.is_empty());
     }
 
     #[test]
     fn wrong_table_does_not_match() {
         let bundle: ServicePolicies = serde_json::from_str(BUNDLE).unwrap();
-        let policy = resolve_from_bundle(
-            &bundle,
-            &user("alice", &["analyst"]),
-            "customers",
-            "sales",
-        );
+        let policy =
+            resolve_from_bundle(&bundle, &user("alice", &["analyst"]), "customers", "sales");
         assert!(policy.column_masks.is_empty());
         assert!(policy.row_filters.is_empty());
     }
@@ -1689,12 +1715,7 @@ mod tests {
         bundle.policies[1].row_filter_policy_items[0]
             .row_filter_info
             .filter_expr = Some("this is not sql !!!".to_string());
-        let policy = resolve_from_bundle(
-            &bundle,
-            &user("alice", &["analyst"]),
-            "orders",
-            "sales",
-        );
+        let policy = resolve_from_bundle(&bundle, &user("alice", &["analyst"]), "orders", "sales");
         // Fail-closed: a broken filter must NOT result in zero filters (which
         // would expose all rows). Expect a lit(false) deny filter instead.
         assert_eq!(policy.row_filters.len(), 1);
@@ -1709,8 +1730,11 @@ mod tests {
     #[test]
     fn masks_all_columns_in_multi_column_policy() {
         let mut bundle: ServicePolicies = serde_json::from_str(BUNDLE).unwrap();
-        bundle.policies[0].resources.get_mut("column").unwrap().values =
-            vec!["amount".to_string(), "discount".to_string()];
+        bundle.policies[0]
+            .resources
+            .get_mut("column")
+            .unwrap()
+            .values = vec!["amount".to_string(), "discount".to_string()];
         let policy = resolve_from_bundle(&bundle, &user("alice", &["analyst"]), "orders", "sales");
         assert!(policy.column_masks.contains_key("amount"));
         assert!(policy.column_masks.contains_key("discount"));
@@ -1719,8 +1743,13 @@ mod tests {
     #[test]
     fn wildcard_table_matches() {
         let mut bundle: ServicePolicies = serde_json::from_str(BUNDLE).unwrap();
-        bundle.policies[0].resources.get_mut("table").unwrap().values = vec!["*".to_string()];
-        let policy = resolve_from_bundle(&bundle, &user("alice", &["analyst"]), "anything", "sales");
+        bundle.policies[0]
+            .resources
+            .get_mut("table")
+            .unwrap()
+            .values = vec!["*".to_string()];
+        let policy =
+            resolve_from_bundle(&bundle, &user("alice", &["analyst"]), "anything", "sales");
         assert!(policy.column_masks.contains_key("amount"));
     }
 
@@ -1747,7 +1776,10 @@ mod tests {
                     .unwrap()
                     .to_string()
                     .to_lowercase();
-                assert!(s.contains("amount"), "custom expr must reference the real column: {s}");
+                assert!(
+                    s.contains("amount"),
+                    "custom expr must reference the real column: {s}"
+                );
             }
             other => panic!("expected Custom mask, got {other:?}"),
         }
@@ -1761,32 +1793,52 @@ mod tests {
         item.users.clear();
         item.groups = vec!["analysts_group".to_string()];
         let policy = resolve_from_bundle(&bundle, &user("alice", &["analyst"]), "orders", "sales");
-        assert!(policy.column_masks.is_empty(), "group-bound item must not be enforced in MVP");
+        assert!(
+            policy.column_masks.is_empty(),
+            "group-bound item must not be enforced in MVP"
+        );
     }
 
     // --- map_mask arm tests ---
 
     #[test]
     fn maps_show_last_4() {
-        let info = DataMaskInfo { data_mask_type: "MASK_SHOW_LAST_4".into(), ..Default::default() };
+        let info = DataMaskInfo {
+            data_mask_type: "MASK_SHOW_LAST_4".into(),
+            ..Default::default()
+        };
         match map_mask(&info, "ssn", &SessionIdentity::default()) {
-            Ok(Some(MaskType::PartialMask { show_last: 4, show_first: 0, .. })) => {}
+            Ok(Some(MaskType::PartialMask {
+                show_last: 4,
+                show_first: 0,
+                ..
+            })) => {}
             other => panic!("expected show-last-4 PartialMask, got {other:?}"),
         }
     }
 
     #[test]
     fn maps_show_first_4() {
-        let info = DataMaskInfo { data_mask_type: "MASK_SHOW_FIRST_4".into(), ..Default::default() };
+        let info = DataMaskInfo {
+            data_mask_type: "MASK_SHOW_FIRST_4".into(),
+            ..Default::default()
+        };
         assert!(matches!(
             map_mask(&info, "ssn", &SessionIdentity::default()),
-            Ok(Some(MaskType::PartialMask { show_first: 4, show_last: 0, .. }))
+            Ok(Some(MaskType::PartialMask {
+                show_first: 4,
+                show_last: 0,
+                ..
+            }))
         ));
     }
 
     #[test]
     fn maps_full_mask_uses_hive_default_chars() {
-        let info = DataMaskInfo { data_mask_type: "MASK".into(), ..Default::default() };
+        let info = DataMaskInfo {
+            data_mask_type: "MASK".into(),
+            ..Default::default()
+        };
         match map_mask(&info, "name", &SessionIdentity::default()) {
             Ok(Some(MaskType::PartialMask {
                 upper: 'X',
@@ -1801,13 +1853,22 @@ mod tests {
 
     #[test]
     fn maps_date_show_year() {
-        let info = DataMaskInfo { data_mask_type: "MASK_DATE_SHOW_YEAR".into(), ..Default::default() };
-        assert!(matches!(map_mask(&info, "hired_at", &SessionIdentity::default()), Ok(Some(MaskType::DateShowYear))));
+        let info = DataMaskInfo {
+            data_mask_type: "MASK_DATE_SHOW_YEAR".into(),
+            ..Default::default()
+        };
+        assert!(matches!(
+            map_mask(&info, "hired_at", &SessionIdentity::default()),
+            Ok(Some(MaskType::DateShowYear))
+        ));
     }
 
     #[test]
     fn truly_unknown_mask_is_err() {
-        let info = DataMaskInfo { data_mask_type: "MASK_FUTURE_UNSUPPORTED".into(), ..Default::default() };
+        let info = DataMaskInfo {
+            data_mask_type: "MASK_FUTURE_UNSUPPORTED".into(),
+            ..Default::default()
+        };
         assert!(map_mask(&info, "x", &SessionIdentity::default()).is_err());
     }
 
@@ -1850,18 +1911,28 @@ mod tests {
     fn tag_mask_resolved_for_matching_role() {
         let sp: ServicePolicies = serde_json::from_str(TAG_BUNDLE).unwrap();
         let tags: HashSet<String> = ["PII".to_string()].into_iter().collect();
-        let id = SessionIdentity { username: "bob".into(), roles: vec!["engineer".into()], ..Default::default() };
+        let id = SessionIdentity {
+            username: "bob".into(),
+            roles: vec!["engineer".into()],
+            ..Default::default()
+        };
         let (masks, filters, unmappable) = resolve_tag_policies(&sp, &id, &tags);
         // tag PII -> a PartialMask (MASK_SHOW_LAST_4) for engineer, wrapped in TagMaskSpec::Ready
         assert!(masks.contains_key("PII"));
         assert!(
             matches!(
                 masks.get("PII"),
-                Some(TagMaskSpec::Ready(crate::MaskType::PartialMask { show_last: 4, .. }))
+                Some(TagMaskSpec::Ready(crate::MaskType::PartialMask {
+                    show_last: 4,
+                    ..
+                }))
             ),
             "supported mask must be wrapped in TagMaskSpec::Ready"
         );
-        assert!(unmappable.is_empty(), "supported mask must not be unmappable");
+        assert!(
+            unmappable.is_empty(),
+            "supported mask must not be unmappable"
+        );
         let _ = filters; // not the focus of this test
     }
 
@@ -1869,7 +1940,11 @@ mod tests {
     fn tag_mask_not_resolved_for_other_role() {
         let sp: ServicePolicies = serde_json::from_str(TAG_BUNDLE).unwrap();
         let tags: HashSet<String> = ["PII".to_string()].into_iter().collect();
-        let id = SessionIdentity { username: "x".into(), roles: vec!["other".into()], ..Default::default() };
+        let id = SessionIdentity {
+            username: "x".into(),
+            roles: vec!["other".into()],
+            ..Default::default()
+        };
         let (masks, _f, _u) = resolve_tag_policies(&sp, &id, &tags);
         assert!(masks.is_empty());
     }
@@ -1878,7 +1953,11 @@ mod tests {
     fn tag_row_filter_resolved() {
         let sp: ServicePolicies = serde_json::from_str(TAG_BUNDLE).unwrap();
         let tags: HashSet<String> = ["RESTRICTED".to_string()].into_iter().collect();
-        let id = SessionIdentity { username: "a".into(), roles: vec!["analyst".into()], ..Default::default() };
+        let id = SessionIdentity {
+            username: "a".into(),
+            roles: vec!["analyst".into()],
+            ..Default::default()
+        };
         let (_m, filters, _u) = resolve_tag_policies(&sp, &id, &tags);
         assert_eq!(filters.len(), 1); // one (tag, Expr) row filter
     }
@@ -1897,15 +1976,24 @@ mod tests {
     #[test]
     fn unsupported_tag_mask_is_unmappable() {
         let mut sp: ServicePolicies = serde_json::from_str(TAG_BUNDLE).unwrap();
-        sp.tag_policies.as_mut().unwrap().policies[0]
-            .data_mask_policy_items[0]
+        sp.tag_policies.as_mut().unwrap().policies[0].data_mask_policy_items[0]
             .data_mask_info
             .data_mask_type = "MASK_FUTURE_UNSUPPORTED".to_string();
         let tags: HashSet<String> = ["PII".to_string()].into_iter().collect();
-        let id = SessionIdentity { username: "bob".into(), roles: vec!["engineer".into()], ..Default::default() };
+        let id = SessionIdentity {
+            username: "bob".into(),
+            roles: vec!["engineer".into()],
+            ..Default::default()
+        };
         let (masks, _f, unmappable) = resolve_tag_policies(&sp, &id, &tags);
-        assert!(!masks.contains_key("PII"), "unsupported mask must not produce a mask");
-        assert!(unmappable.contains("PII"), "unsupported mask must mark tag unmappable");
+        assert!(
+            !masks.contains_key("PII"),
+            "unsupported mask must not produce a mask"
+        );
+        assert!(
+            unmappable.contains("PII"),
+            "unsupported mask must mark tag unmappable"
+        );
     }
 
     /// A CUSTOM tag mask with a value_expr must be stored as `TagMaskSpec::Custom`
@@ -1913,13 +2001,16 @@ mod tests {
     #[test]
     fn custom_tag_mask_stored_as_custom_spec() {
         let mut sp: ServicePolicies = serde_json::from_str(TAG_BUNDLE).unwrap();
-        let mi = &mut sp.tag_policies.as_mut().unwrap().policies[0]
-            .data_mask_policy_items[0]
+        let mi = &mut sp.tag_policies.as_mut().unwrap().policies[0].data_mask_policy_items[0]
             .data_mask_info;
         mi.data_mask_type = "CUSTOM".to_string();
         mi.value_expr = Some("concat('x', {col})".to_string());
         let tags: HashSet<String> = ["PII".to_string()].into_iter().collect();
-        let id = SessionIdentity { username: "bob".into(), roles: vec!["engineer".into()], ..Default::default() };
+        let id = SessionIdentity {
+            username: "bob".into(),
+            roles: vec!["engineer".into()],
+            ..Default::default()
+        };
         let (masks, _f, unmappable) = resolve_tag_policies(&sp, &id, &tags);
         assert!(
             !unmappable.contains("PII"),
@@ -1927,7 +2018,10 @@ mod tests {
         );
         match masks.get("PII") {
             Some(TagMaskSpec::Custom(template)) => {
-                assert_eq!(template, "concat('x', {col})", "template must be stored verbatim");
+                assert_eq!(
+                    template, "concat('x', {col})",
+                    "template must be stored verbatim"
+                );
             }
             other => panic!("expected TagMaskSpec::Custom for PII, got {:?}", other),
         }
@@ -1938,13 +2032,16 @@ mod tests {
     #[test]
     fn custom_tag_mask_no_value_expr_is_unmappable() {
         let mut sp: ServicePolicies = serde_json::from_str(TAG_BUNDLE).unwrap();
-        let mi = &mut sp.tag_policies.as_mut().unwrap().policies[0]
-            .data_mask_policy_items[0]
+        let mi = &mut sp.tag_policies.as_mut().unwrap().policies[0].data_mask_policy_items[0]
             .data_mask_info;
         mi.data_mask_type = "CUSTOM".to_string();
         mi.value_expr = None; // no template
         let tags: HashSet<String> = ["PII".to_string()].into_iter().collect();
-        let id = SessionIdentity { username: "bob".into(), roles: vec!["engineer".into()], ..Default::default() };
+        let id = SessionIdentity {
+            username: "bob".into(),
+            roles: vec!["engineer".into()],
+            ..Default::default()
+        };
         let (masks, _f, unmappable) = resolve_tag_policies(&sp, &id, &tags);
         assert!(
             !masks.contains_key("PII"),
@@ -2054,9 +2151,7 @@ impl RangerStore {
     /// what the engine actually sees. It bypasses the resolve cache on purpose:
     /// an operator asking what is configured wants the current answer, not one up
     /// to `cache_ttl_secs` old.
-    pub async fn list_mask_policies_impl(
-        &self,
-    ) -> sqe_core::Result<Vec<crate::MaskPolicyInfo>> {
+    pub async fn list_mask_policies_impl(&self) -> sqe_core::Result<Vec<crate::MaskPolicyInfo>> {
         let bundle = self.fetch_bundle().await?;
         Ok(mask_policies_from_bundle(&bundle))
     }
@@ -2120,14 +2215,22 @@ fn mask_policies_from_bundle(bundle: &ServicePolicies) -> Vec<crate::MaskPolicyI
         // Stable order: by name, then by the resource it covers, so two runs of
         // SHOW MASKING POLICIES on an unchanged service produce identical output.
         out.sort_by(|a, b| {
-            (&a.name, &a.tag, &a.database, &a.table, &a.column, &a.grantees).cmp(&(
-                &b.name,
-                &b.tag,
-                &b.database,
-                &b.table,
-                &b.column,
-                &b.grantees,
-            ))
+            (
+                &a.name,
+                &a.tag,
+                &a.database,
+                &a.table,
+                &a.column,
+                &a.grantees,
+            )
+                .cmp(&(
+                    &b.name,
+                    &b.tag,
+                    &b.database,
+                    &b.table,
+                    &b.column,
+                    &b.grantees,
+                ))
         });
         out
     }
@@ -2217,7 +2320,14 @@ mod mask_policy_listing_tests {
         assert_eq!(row.grantees, "ROLE engineer");
         // A tag policy names no table, and saying so is the point: a reader can
         // tell it applies wherever the tag is, not to one column.
-        assert_eq!((row.database.as_str(), row.table.as_str(), row.column.as_str()), ("", "", ""));
+        assert_eq!(
+            (
+                row.database.as_str(),
+                row.table.as_str(),
+                row.column.as_str()
+            ),
+            ("", "", "")
+        );
     }
 
     /// A tag ROW FILTER is not a mask, in the tag store either.

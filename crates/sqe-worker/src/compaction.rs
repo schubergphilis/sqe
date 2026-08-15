@@ -195,7 +195,9 @@ async fn compact_pinned_table(
     }
 
     let plan = plan_delete_aware_read(&table).await.map_err(|e| {
-        SqeError::Execution(format!("compact_file_group: failed to plan delete-aware read: {e}"))
+        SqeError::Execution(format!(
+            "compact_file_group: failed to plan delete-aware read: {e}"
+        ))
     })?;
 
     let group = resolve_group_data_files(&plan.tasks_by_path, &request.group_file_paths)?;
@@ -255,12 +257,17 @@ async fn compact_pinned_table(
     let partition_type = table.metadata().default_partition_type().clone();
     let format_version = table.metadata().format_version();
     let mut avro_buf = Vec::new();
-    write_data_files_to_avro(&mut avro_buf, new_files.clone(), &partition_type, format_version)
-        .map_err(|e| {
-            SqeError::Execution(format!(
-                "compact_file_group: failed to encode data files to avro: {e}"
-            ))
-        })?;
+    write_data_files_to_avro(
+        &mut avro_buf,
+        new_files.clone(),
+        &partition_type,
+        format_version,
+    )
+    .map_err(|e| {
+        SqeError::Execution(format!(
+            "compact_file_group: failed to encode data files to avro: {e}"
+        ))
+    })?;
 
     let uploaded_paths = tracker
         .lock()
@@ -306,15 +313,14 @@ pub async fn compact_file_group(
     let file_io = build_file_io(&request.s3)?;
     let ident = parse_table_ident(&request.table_ident)?;
 
-    let static_table =
-        StaticTable::from_metadata_file(&request.metadata_location, ident, file_io)
-            .await
-            .map_err(|e| {
-                SqeError::Execution(format!(
-                    "compact_file_group: failed to load table metadata '{}': {e}",
-                    request.metadata_location
-                ))
-            })?;
+    let static_table = StaticTable::from_metadata_file(&request.metadata_location, ident, file_io)
+        .await
+        .map_err(|e| {
+            SqeError::Execution(format!(
+                "compact_file_group: failed to load table metadata '{}': {e}",
+                request.metadata_location
+            ))
+        })?;
 
     compact_pinned_table(session_ctx, static_table.into_table(), request, progress_tx).await
 }
@@ -322,7 +328,9 @@ pub async fn compact_file_group(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use iceberg::spec::{DataContentType, DataFileFormat, FormatVersion, NestedField, PrimitiveType};
+    use iceberg::spec::{
+        DataContentType, DataFileFormat, FormatVersion, NestedField, PrimitiveType,
+    };
     use sqe_compaction::wire::SortSpecWire;
     use std::io::Write as _;
 
@@ -330,10 +338,12 @@ mod tests {
         let schema = Arc::new(
             iceberg::spec::Schema::builder()
                 .with_schema_id(0)
-                .with_fields(vec![
-                    NestedField::required(1, "id", iceberg::spec::Type::Primitive(PrimitiveType::Long))
-                        .into(),
-                ])
+                .with_fields(vec![NestedField::required(
+                    1,
+                    "id",
+                    iceberg::spec::Type::Primitive(PrimitiveType::Long),
+                )
+                .into()])
                 .build()
                 .unwrap(),
         );
@@ -391,11 +401,9 @@ mod tests {
             "s3://bucket/data/f1.parquet".to_string(),
             vec![sample_task("s3://bucket/data/f1.parquet", Some(100), 4096)],
         );
-        let group = resolve_group_data_files(
-            &tasks_by_path,
-            &["s3://bucket/data/f1.parquet".to_string()],
-        )
-        .unwrap();
+        let group =
+            resolve_group_data_files(&tasks_by_path, &["s3://bucket/data/f1.parquet".to_string()])
+                .unwrap();
         assert_eq!(group.len(), 1);
         assert_eq!(group[0].file_path(), "s3://bucket/data/f1.parquet");
         assert_eq!(group[0].record_count(), 100);
@@ -421,8 +429,14 @@ mod tests {
         )
         .unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("GHOST.parquet"), "error must name the missing path: {msg}");
-        assert!(msg.contains("resurrection guard") || msg.contains("missing"), "error must explain the guard: {msg}");
+        assert!(
+            msg.contains("GHOST.parquet"),
+            "error must name the missing path: {msg}"
+        );
+        assert!(
+            msg.contains("resurrection guard") || msg.contains("missing"),
+            "error must explain the guard: {msg}"
+        );
     }
 
     #[test]
@@ -503,10 +517,18 @@ mod tests {
         let table = local_table_with_snapshot(555);
         let request = sample_request(vec!["s3://bucket/data/f1.parquet".to_string()], 999);
         let ctx = SessionContext::new();
-        let err = compact_pinned_table(&ctx, table, &request, None).await.unwrap_err();
+        let err = compact_pinned_table(&ctx, table, &request, None)
+            .await
+            .unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("snapshot mismatch"), "error must name the mismatch: {msg}");
-        assert!(msg.contains("999") && msg.contains("555"), "error must cite both ids: {msg}");
+        assert!(
+            msg.contains("snapshot mismatch"),
+            "error must name the mismatch: {msg}"
+        );
+        assert!(
+            msg.contains("999") && msg.contains("555"),
+            "error must cite both ids: {msg}"
+        );
     }
 
     #[tokio::test]
@@ -517,7 +539,9 @@ mod tests {
         let table = local_table_with_snapshot(555);
         let request = sample_request(vec!["s3://bucket/data/f1.parquet".to_string()], 555);
         let ctx = SessionContext::new();
-        let err = compact_pinned_table(&ctx, table, &request, None).await.unwrap_err();
+        let err = compact_pinned_table(&ctx, table, &request, None)
+            .await
+            .unwrap_err();
         assert!(
             !err.to_string().contains("snapshot mismatch"),
             "matching snapshot must pass the pin guard: {err}"
@@ -555,16 +579,23 @@ mod tests {
             .unwrap();
 
         let mut buf = Vec::new();
-        write_data_files_to_avro(&mut buf, vec![file.clone()], &partition_type, FormatVersion::V2)
-            .unwrap();
+        write_data_files_to_avro(
+            &mut buf,
+            vec![file.clone()],
+            &partition_type,
+            FormatVersion::V2,
+        )
+        .unwrap();
         buf.flush().unwrap();
 
         let schema = iceberg::spec::Schema::builder()
             .with_schema_id(0)
-            .with_fields(vec![
-                NestedField::required(1, "id", iceberg::spec::Type::Primitive(PrimitiveType::Long))
-                    .into(),
-            ])
+            .with_fields(vec![NestedField::required(
+                1,
+                "id",
+                iceberg::spec::Type::Primitive(PrimitiveType::Long),
+            )
+            .into()])
             .build()
             .unwrap();
 
@@ -636,8 +667,9 @@ mod tests {
         };
 
         let ctx = SessionContext::new();
-        let response =
-            compact_file_group(&ctx, &request, None).await.expect("compaction failed");
+        let response = compact_file_group(&ctx, &request, None)
+            .await
+            .expect("compaction failed");
 
         // Schema/partition_type here are placeholders: a real manual run
         // should load them from the same table's metadata.json used above
@@ -646,10 +678,12 @@ mod tests {
         // exercises the actual table shape.
         let schema = iceberg::spec::Schema::builder()
             .with_schema_id(0)
-            .with_fields(vec![
-                NestedField::required(1, "id", iceberg::spec::Type::Primitive(PrimitiveType::Long))
-                    .into(),
-            ])
+            .with_fields(vec![NestedField::required(
+                1,
+                "id",
+                iceberg::spec::Type::Primitive(PrimitiveType::Long),
+            )
+            .into()])
             .build()
             .unwrap();
         let partition_type = iceberg::spec::StructType::new(vec![]);
@@ -661,6 +695,9 @@ mod tests {
             FormatVersion::V2,
         )
         .expect("avro decode of returned data files must round-trip");
-        assert!(!decoded.is_empty(), "expected at least one rewritten data file");
+        assert!(
+            !decoded.is_empty(),
+            "expected at least one rewritten data file"
+        );
     }
 }

@@ -13,9 +13,9 @@ use std::sync::Arc;
 
 use iceberg::spec::Schema as IcebergSchema;
 use iceberg::{Catalog, NamespaceIdent, TableCreation};
-use sqe_core::SecretStore;
 use sqe_coordinator::maintenance_lease::{release, renew, try_acquire};
 use sqe_coordinator::maintenance_log::maintenance_log_arrow_schema;
+use sqe_core::SecretStore;
 use sqe_sql::CatalogKind;
 use tempfile::TempDir;
 
@@ -25,16 +25,24 @@ const JOB_KEY: &str = "bench.orders";
 /// Build a fresh SQLite-backed `Arc<dyn Catalog>` rooted at `dir`.
 async fn sqlite_catalog(dir: &TempDir) -> Arc<dyn Catalog> {
     let location = dir.path().to_str().expect("tempdir path is UTF-8");
-    sqe_catalog::mount::build_catalog(location, CatalogKind::Sqlite, &BTreeMap::new(), &SecretStore::new())
-        .await
-        .expect("sqlite catalog builds")
+    sqe_catalog::mount::build_catalog(
+        location,
+        CatalogKind::Sqlite,
+        &BTreeMap::new(),
+        &SecretStore::new(),
+    )
+    .await
+    .expect("sqlite catalog builds")
 }
 
 /// Create `sqe_system.maintenance_log` with the fixed schema, via the raw
 /// `Catalog` trait (mirrors `maintenance_log_test.rs`).
 async fn create_maintenance_log_table(catalog: &Arc<dyn Catalog>) {
     catalog
-        .create_namespace(&NamespaceIdent::new("sqe_system".to_string()), HashMap::new())
+        .create_namespace(
+            &NamespaceIdent::new("sqe_system".to_string()),
+            HashMap::new(),
+        )
         .await
         .expect("create sqe_system namespace");
 
@@ -69,7 +77,10 @@ async fn first_ever_claim_bootstraps_and_is_acquired() {
     assert_eq!(handle.holder_id, "holder-1");
     assert_eq!(handle.expires_at_ms, 1_000 + 60_000);
     assert!(!handle.claim_path.is_empty());
-    assert_eq!(handle.stolen_from, None, "a first-ever (non-steal) claim must not carry a stolen_from");
+    assert_eq!(
+        handle.stolen_from, None,
+        "a first-ever (non-steal) claim must not carry a stolen_from"
+    );
 }
 
 #[tokio::test]
@@ -86,7 +97,10 @@ async fn live_claim_denies_a_different_holder() {
     let denied = try_acquire(&catalog, STATE_TABLE, JOB_KEY, "holder-2", 60, 2_000)
         .await
         .expect("try_acquire succeeds");
-    assert!(denied.is_none(), "a live claim by holder-1 must deny holder-2");
+    assert!(
+        denied.is_none(),
+        "a live claim by holder-1 must deny holder-2"
+    );
 }
 
 #[tokio::test]
@@ -182,14 +196,20 @@ async fn renew_extends_expiry_and_keeps_other_holders_out() {
     renew(&mut h1, &catalog, STATE_TABLE, 60, 50_000)
         .await
         .expect("renew succeeds while holder-1 still owns the live claim");
-    assert_eq!(h1.expires_at_ms, 110_000, "renew must extend from the renew-time now_ms, not the original acquire time");
+    assert_eq!(
+        h1.expires_at_ms, 110_000,
+        "renew must extend from the renew-time now_ms, not the original acquire time"
+    );
 
     // Without the renew this would already have expired (original expiry
     // was 61_000); the renewed expiry (110_000) must still deny holder-2.
     let denied = try_acquire(&catalog, STATE_TABLE, JOB_KEY, "holder-2", 60, 90_000)
         .await
         .expect("try_acquire succeeds");
-    assert!(denied.is_none(), "renewed lease must still be live at t=90_000");
+    assert!(
+        denied.is_none(),
+        "renewed lease must still be live at t=90_000"
+    );
 }
 
 #[tokio::test]
@@ -214,7 +234,9 @@ async fn renew_after_lease_lost_to_a_steal_returns_err() {
         .expect_err("holder-1 must not be able to renew a lease holder-2 now owns");
     let msg = format!("{err}");
     assert!(
-        msg.contains("holder-1") || msg.to_lowercase().contains("no longer live") || msg.to_lowercase().contains("held by"),
+        msg.contains("holder-1")
+            || msg.to_lowercase().contains("no longer live")
+            || msg.to_lowercase().contains("held by"),
         "error should explain the lost lease, got: {msg}"
     );
 }
@@ -259,7 +281,9 @@ async fn release_after_lease_stolen_does_not_clobber_new_holder() {
     // row is genuinely still holder-2's (not just "some non-empty row").
     renew(&mut h2, &catalog, STATE_TABLE, 60, 7_000)
         .await
-        .expect("holder-2 must still hold and be able to renew its lease after holder-1's stale release");
+        .expect(
+        "holder-2 must still hold and be able to renew its lease after holder-1's stale release",
+    );
 }
 
 #[tokio::test]

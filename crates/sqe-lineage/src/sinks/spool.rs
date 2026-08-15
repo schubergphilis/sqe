@@ -136,10 +136,12 @@ async fn drain_once(spool_dir: &Path, inner: Arc<dyn Sink>) -> std::io::Result<(
         let content = std::fs::read_to_string(&file)?;
         let mut all_ok = true;
         for line in content.lines() {
-            if line.is_empty() { continue; }
+            if line.is_empty() {
+                continue;
+            }
             let ev: RunEvent = match serde_json::from_str(line) {
                 Ok(e) => e,
-                Err(_) => continue,  // skip malformed line
+                Err(_) => continue, // skip malformed line
             };
             if inner.send(&ev).await.is_err() {
                 all_ok = false;

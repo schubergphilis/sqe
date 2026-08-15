@@ -148,20 +148,20 @@ impl ScalarUDFImpl for MaskPartialFunc {
 
         match arg {
             ColumnarValue::Array(array) => {
-                let string_array = array
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .ok_or_else(|| {
-                        datafusion::error::DataFusionError::Internal(
-                            "sqe_mask_partial: expected Utf8 array".to_string(),
-                        )
-                    })?;
+                let string_array =
+                    array
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .ok_or_else(|| {
+                            datafusion::error::DataFusionError::Internal(
+                                "sqe_mask_partial: expected Utf8 array".to_string(),
+                            )
+                        })?;
 
                 let result: StringArray = string_array
                     .iter()
                     .map(|opt_val| {
-                        opt_val
-                            .map(|val| mask_str(val, show_first, show_last, upper, lower, digit))
+                        opt_val.map(|val| mask_str(val, show_first, show_last, upper, lower, digit))
                     })
                     .collect();
 
@@ -207,7 +207,9 @@ pub fn mask_partial_udf(
     lower: char,
     digit: char,
 ) -> ScalarUDF {
-    ScalarUDF::from(MaskPartialFunc::new(show_first, show_last, upper, lower, digit))
+    ScalarUDF::from(MaskPartialFunc::new(
+        show_first, show_last, upper, lower, digit,
+    ))
 }
 
 #[cfg(test)]
@@ -264,7 +266,9 @@ mod tests {
         let masked = mask_str("Иван", 0, 0, 'X', 'x', 'n');
         assert_ne!(masked, "Иван", "non-ASCII letters must be masked");
         assert!(
-            !masked.chars().any(|c| c.is_alphabetic() && c != 'X' && c != 'x'),
+            !masked
+                .chars()
+                .any(|c| c.is_alphabetic() && c != 'X' && c != 'x'),
             "every letter must be replaced by a mask char, got {masked:?}"
         );
     }
@@ -274,7 +278,10 @@ mod tests {
         // CJK has no case -> maps to `lower`. show_last keeps the tail visible.
         let masked = mask_str("北京1", 0, 1, 'X', 'x', 'n');
         assert!(masked.ends_with('1'), "show_last tail kept: {masked:?}");
-        assert!(!masked.contains('北') && !masked.contains('京'), "CJK masked: {masked:?}");
+        assert!(
+            !masked.contains('北') && !masked.contains('京'),
+            "CJK masked: {masked:?}"
+        );
     }
 
     #[test]

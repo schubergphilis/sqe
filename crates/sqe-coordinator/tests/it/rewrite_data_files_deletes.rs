@@ -45,8 +45,7 @@ async fn count_rows(
     table: &str,
 ) -> i64 {
     let b = exec(handler, session, &format!("SELECT COUNT(*) FROM {table}")).await;
-    b[0]
-        .column(0)
+    b[0].column(0)
         .as_any()
         .downcast_ref::<Int64Array>()
         .expect("Int64Array")
@@ -60,8 +59,7 @@ async fn scalar_i64(
     sql: &str,
 ) -> i64 {
     let b = exec(handler, session, sql).await;
-    b[0]
-        .column(0)
+    b[0].column(0)
         .as_any()
         .downcast_ref::<Int64Array>()
         .expect("Int64Array")
@@ -82,8 +80,7 @@ async fn live_data_file_count(
         &format!("SELECT COUNT(*) FROM table_files('{namespace}', '{table_name}')"),
     )
     .await;
-    b[0]
-        .column(0)
+    b[0].column(0)
         .as_any()
         .downcast_ref::<Int64Array>()
         .expect("Int64Array")
@@ -121,7 +118,12 @@ async fn seed_mor_table(
     .await;
     // One INSERT per remaining id -> one small data file each.
     for i in 1..rows {
-        exec(handler, session, &format!("INSERT INTO {table} VALUES ({i})")).await;
+        exec(
+            handler,
+            session,
+            &format!("INSERT INTO {table} VALUES ({i})"),
+        )
+        .await;
     }
 }
 
@@ -137,7 +139,12 @@ async fn rewrite_applies_position_deletes_and_consolidates() {
     let table = format!("{namespace}.{table_name}");
 
     seed_mor_table(&handler, &session, &table, 10).await;
-    exec(&handler, &session, &format!("DELETE FROM {table} WHERE id < 3")).await;
+    exec(
+        &handler,
+        &session,
+        &format!("DELETE FROM {table} WHERE id < 3"),
+    )
+    .await;
     assert_eq!(count_rows(&handler, &session, &table).await, 7);
 
     let before_files = live_data_file_count(&handler, &session, namespace, table_name).await;
@@ -185,7 +192,12 @@ async fn rewrite_preserves_deletes() {
     let table = format!("{namespace}.{table_name}");
 
     seed_mor_table(&handler, &session, &table, 20).await;
-    exec(&handler, &session, &format!("DELETE FROM {table} WHERE id < 5")).await;
+    exec(
+        &handler,
+        &session,
+        &format!("DELETE FROM {table} WHERE id < 5"),
+    )
+    .await;
     assert_eq!(count_rows(&handler, &session, &table).await, 15);
 
     let before_files = live_data_file_count(&handler, &session, namespace, table_name).await;
@@ -236,7 +248,12 @@ async fn rewrite_delete_file_threshold_triggers_on_delete_heavy_file() {
     )
     .await;
     let values: Vec<String> = (0..10).map(|i| format!("({i})")).collect();
-    exec(&handler, &session, &format!("INSERT INTO {table} VALUES {}", values.join(", "))).await;
+    exec(
+        &handler,
+        &session,
+        &format!("INSERT INTO {table} VALUES {}", values.join(", ")),
+    )
+    .await;
     assert_eq!(
         live_data_file_count(&handler, &session, namespace, table_name).await,
         1,
@@ -246,7 +263,12 @@ async fn rewrite_delete_file_threshold_triggers_on_delete_heavy_file() {
     // Three separate DELETE commits -> three position delete files, all
     // referencing that one data file. Distinct rows so no DELETE is a no-op.
     for id in 0..3i64 {
-        exec(&handler, &session, &format!("DELETE FROM {table} WHERE id = {id}")).await;
+        exec(
+            &handler,
+            &session,
+            &format!("DELETE FROM {table} WHERE id = {id}"),
+        )
+        .await;
     }
     assert_eq!(count_rows(&handler, &session, &table).await, 7);
 
@@ -334,13 +356,28 @@ async fn rewrite_applies_equality_deletes() {
     .await;
     // One data file per INSERT.
     for i in 0..8i64 {
-        exec(&handler, &session, &format!("INSERT INTO {table} VALUES ({i}, {})", i * 10)).await;
+        exec(
+            &handler,
+            &session,
+            &format!("INSERT INTO {table} VALUES ({i}, {})", i * 10),
+        )
+        .await;
     }
     // MoR UPDATE: equality delete on id=5 + a new data file (id=5, v=99).
-    exec(&handler, &session, &format!("UPDATE {table} SET v = 99 WHERE id = 5")).await;
+    exec(
+        &handler,
+        &session,
+        &format!("UPDATE {table} SET v = 99 WHERE id = 5"),
+    )
+    .await;
     assert_eq!(count_rows(&handler, &session, &table).await, 8);
     assert_eq!(
-        scalar_i64(&handler, &session, &format!("SELECT v FROM {table} WHERE id = 5")).await,
+        scalar_i64(
+            &handler,
+            &session,
+            &format!("SELECT v FROM {table} WHERE id = 5")
+        )
+        .await,
         99,
         "setup: UPDATE must take effect through the equality delete"
     );
@@ -368,12 +405,22 @@ async fn rewrite_applies_equality_deletes() {
         "row count must be preserved after compaction"
     );
     assert_eq!(
-        scalar_i64(&handler, &session, &format!("SELECT v FROM {table} WHERE id = 5")).await,
+        scalar_i64(
+            &handler,
+            &session,
+            &format!("SELECT v FROM {table} WHERE id = 5")
+        )
+        .await,
         99,
         "equality delete must be applied: updated value must survive, stale value must not return"
     );
     assert_eq!(
-        scalar_i64(&handler, &session, &format!("SELECT COUNT(*) FROM {table} WHERE v = 50")).await,
+        scalar_i64(
+            &handler,
+            &session,
+            &format!("SELECT COUNT(*) FROM {table} WHERE v = 50")
+        )
+        .await,
         0,
         "the pre-update value must not be resurrected"
     );

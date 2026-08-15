@@ -13,8 +13,7 @@
 /// a partial bind. Each value in `params` is inserted verbatim, so callers must
 /// pass already-quoted SQL literals (e.g. `'foo'`, `42`, `DATE '2020-01-01'`).
 pub fn substitute_placeholders(sql: &str, params: &[String]) -> Result<String, String> {
-    let mut out =
-        String::with_capacity(sql.len() + params.iter().map(|s| s.len()).sum::<usize>());
+    let mut out = String::with_capacity(sql.len() + params.iter().map(|s| s.len()).sum::<usize>());
     let mut next: usize = 0;
     let mut in_single = false;
     let mut in_double = false;

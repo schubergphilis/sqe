@@ -78,7 +78,6 @@ fn seed_salt() -> u64 {
         .unwrap_or(0)
 }
 
-
 // ---------------------------------------------------------------------------
 // Random helpers
 // ---------------------------------------------------------------------------
@@ -230,22 +229,14 @@ fn generate_web_clickstreams(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
                 REFERRER_DOMAINS[rng.gen_range(0..REFERRER_DOMAINS.len())].to_string(),
             ));
             wcs_search_keywords.push(if has_keyword {
-                Some(
-                    SEARCH_KEYWORDS[rng.gen_range(0..SEARCH_KEYWORDS.len())].to_string(),
-                )
+                Some(SEARCH_KEYWORDS[rng.gen_range(0..SEARCH_KEYWORDS.len())].to_string())
             } else {
                 None
             });
         }
 
-        let ref_refs: Vec<Option<&str>> = wcs_referrer_url
-            .iter()
-            .map(|o| o.as_deref())
-            .collect();
-        let kw_refs: Vec<Option<&str>> = wcs_search_keywords
-            .iter()
-            .map(|o| o.as_deref())
-            .collect();
+        let ref_refs: Vec<Option<&str>> = wcs_referrer_url.iter().map(|o| o.as_deref()).collect();
+        let kw_refs: Vec<Option<&str>> = wcs_search_keywords.iter().map(|o| o.as_deref()).collect();
 
         batches.push(
             RecordBatch::try_new(
@@ -315,12 +306,10 @@ fn generate_product_reviews(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
             ));
         }
 
-        let time_refs: Vec<Option<&str>> =
-            pr_review_time.iter().map(|o| o.as_deref()).collect();
+        let time_refs: Vec<Option<&str>> = pr_review_time.iter().map(|o| o.as_deref()).collect();
         let content_refs: Vec<Option<&str>> =
             pr_review_content.iter().map(|o| o.as_deref()).collect();
-        let title_refs: Vec<Option<&str>> =
-            pr_title.iter().map(|o| o.as_deref()).collect();
+        let title_refs: Vec<Option<&str>> = pr_title.iter().map(|o| o.as_deref()).collect();
 
         batches.push(
             RecordBatch::try_new(
@@ -409,7 +398,11 @@ impl BenchmarkGenerator for TpcbbGenerator {
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         let make: Box<dyn FnOnce() -> Box<dyn Iterator<Item = RecordBatch> + Send> + Send> =
             Box::new(move || Box::new(batches.into_iter()));
-        Ok(BatchSource { schema, total_rows, shards: vec![BatchShard { make }] })
+        Ok(BatchSource {
+            schema,
+            total_rows,
+            shards: vec![BatchShard { make }],
+        })
     }
 }
 
@@ -498,7 +491,10 @@ mod tests {
         // Verify nulls are present in wcs_sales_sk (col 2) — not every click is a sale
         let first_batch = &batches[0];
         let sales_col = first_batch.column(2);
-        assert!(sales_col.null_count() > 0, "expected some null sales_sk values");
+        assert!(
+            sales_col.null_count() > 0,
+            "expected some null sales_sk values"
+        );
     }
 
     #[test]

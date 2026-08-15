@@ -209,10 +209,7 @@ pub struct S3SegmentStore {
 
 impl S3SegmentStore {
     /// Open against a pre-built object store (production S3 or test InMemory).
-    pub fn new(
-        store: Arc<dyn ObjectStore>,
-        config: &S3SpillConfig,
-    ) -> Result<Self> {
+    pub fn new(store: Arc<dyn ObjectStore>, config: &S3SpillConfig) -> Result<Self> {
         config.validate()?;
         Ok(Self {
             store,
@@ -258,10 +255,7 @@ impl S3SegmentStore {
 
     fn reserve_quota(&self, need: u64) -> Result<()> {
         if take_fault(SpillFault::DiskFull) {
-            return Err(BudgetError::SpillDiskFull {
-                need,
-                available: 0,
-            });
+            return Err(BudgetError::SpillDiskFull { need, available: 0 });
         }
         if take_fault(SpillFault::QuotaExceeded) {
             return Err(BudgetError::SpillQuotaExceeded {
@@ -291,7 +285,6 @@ impl S3SegmentStore {
         }
         Ok(())
     }
-
 }
 
 fn build_amazon_s3(config: &S3SpillConfig) -> Result<Arc<dyn ObjectStore>> {
@@ -343,14 +336,14 @@ impl SegmentStore for S3SegmentStore {
         sequence: u64,
         schema: SchemaRef,
     ) -> Result<Box<dyn SegmentWriter>> {
-        let permit = self
-            .write_sem
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| BudgetError::Cancelled {
-                budget: "spill-write-s3".into(),
-            })?;
+        let permit =
+            self.write_sem
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|_| BudgetError::Cancelled {
+                    budget: "spill-write-s3".into(),
+                })?;
         self.reserve_quota(64 * 1024)?;
 
         let partial_key = self.key(scope, &SpillSegment::partial_file_name(sequence));
@@ -363,9 +356,8 @@ impl SegmentStore for S3SegmentStore {
         body.extend_from_slice(&SEGMENT_FORMAT_VERSION.to_le_bytes());
         let mut cursor = Cursor::new(body);
         cursor.set_position(cursor.get_ref().len() as u64);
-        let ipc = StreamWriter::try_new(cursor, &schema).map_err(|e| {
-            BudgetError::Config(format!("Arrow IPC writer init failed: {e}"))
-        })?;
+        let ipc = StreamWriter::try_new(cursor, &schema)
+            .map_err(|e| BudgetError::Config(format!("Arrow IPC writer init failed: {e}")))?;
 
         Ok(Box::new(S3SegmentWriter {
             store: self.store.clone(),
@@ -385,14 +377,14 @@ impl SegmentStore for S3SegmentStore {
     }
 
     async fn open_reader(&self, segment: &SpillSegment) -> Result<Box<dyn SegmentReader>> {
-        let permit = self
-            .read_sem
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| BudgetError::Cancelled {
-                budget: "spill-read-s3".into(),
-            })?;
+        let permit =
+            self.read_sem
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|_| BudgetError::Cancelled {
+                    budget: "spill-read-s3".into(),
+                })?;
         if take_fault(SpillFault::CorruptOnRead) {
             return Err(BudgetError::SegmentCorrupt {
                 path: segment.path.display().to_string(),
@@ -468,11 +460,9 @@ impl SegmentStore for S3SegmentStore {
                 reason: format!("seek past header: {e}"),
             }
         })?;
-        let ipc = StreamReader::try_new(cursor, None).map_err(|e| {
-            BudgetError::SegmentCorrupt {
-                path: segment.path.display().to_string(),
-                reason: format!("IPC open: {e}"),
-            }
+        let ipc = StreamReader::try_new(cursor, None).map_err(|e| BudgetError::SegmentCorrupt {
+            path: segment.path.display().to_string(),
+            reason: format!("IPC open: {e}"),
         })?;
         let schema = ipc.schema();
         Ok(Box::new(S3SegmentReader {
@@ -507,10 +497,7 @@ impl SegmentStore for S3SegmentStore {
         Ok(())
     }
 
-    async fn list_orphan_scopes(
-        &self,
-        max_age: Duration,
-    ) -> Result<Vec<SpillScope>> {
+    async fn list_orphan_scopes(&self, max_age: Duration) -> Result<Vec<SpillScope>> {
         let prefix = ObjectPath::from(self.prefix.as_str());
         let mut list = self.store.list(Some(&prefix));
         let now = SystemTime::now();
@@ -587,10 +574,7 @@ impl SegmentWriter for S3SegmentWriter {
         if take_fault(SpillFault::ShortWrite) {
             return Err(BudgetError::SpillIo {
                 path: self.partial_key.to_string(),
-                source: std::io::Error::new(
-                    std::io::ErrorKind::WriteZero,
-                    "injected short write",
-                ),
+                source: std::io::Error::new(std::io::ErrorKind::WriteZero, "injected short write"),
             });
         }
         let ipc = self
@@ -632,8 +616,7 @@ impl SegmentWriter for S3SegmentWriter {
 
         // Stage partial with lifecycle tags (short-lived purpose).
         let mut partial_opts = PutOptions::from(lifecycle_tags_for_partial(&self.scope));
-        partial_opts.attributes =
-            lifecycle_attributes(&self.scope, LIFECYCLE_PURPOSE_PARTIAL);
+        partial_opts.attributes = lifecycle_attributes(&self.scope, LIFECYCLE_PURPOSE_PARTIAL);
         self.store
             .put_opts(
                 &self.partial_key,
@@ -645,8 +628,7 @@ impl SegmentWriter for S3SegmentWriter {
 
         // Publish: put final with segment tags (copy not always tagged on all backends).
         let mut final_opts = PutOptions::from(lifecycle_tags_for_segment(&self.scope));
-        final_opts.attributes =
-            lifecycle_attributes(&self.scope, LIFECYCLE_PURPOSE_SEGMENT);
+        final_opts.attributes = lifecycle_attributes(&self.scope, LIFECYCLE_PURPOSE_SEGMENT);
         self.store
             .put_opts(
                 &self.final_key,
@@ -659,8 +641,7 @@ impl SegmentWriter for S3SegmentWriter {
         // Delete partial staging object.
         let _ = self.store.delete(&self.partial_key).await;
 
-        self.used_bytes
-            .fetch_add(physical_bytes, Ordering::Relaxed);
+        self.used_bytes.fetch_add(physical_bytes, Ordering::Relaxed);
         self.used_objects.fetch_add(1, Ordering::Relaxed);
 
         let schema_fingerprint = schema_fingerprint(&self.schema);
@@ -845,7 +826,10 @@ mod tests {
         w.write_batch(&batch(10)).await.unwrap();
         let seg = w.finish().await.unwrap();
         assert_eq!(seg.row_count, 6);
-        assert!(seg.path.to_string_lossy().starts_with("s3://sqe-spill-test/"));
+        assert!(seg
+            .path
+            .to_string_lossy()
+            .starts_with("s3://sqe-spill-test/"));
 
         let r = store.open_reader(&seg).await.unwrap();
         let mut stream = r.into_stream();
@@ -894,9 +878,7 @@ mod tests {
         w.write_batch(&batch(1)).await.unwrap();
         let _ = w.finish().await.unwrap();
         // Second object should fail quota at create (reserve counts +1).
-        let err = store
-            .create_writer(&scope, 1, batch(1).schema())
-            .await;
+        let err = store.create_writer(&scope, 1, batch(1).schema()).await;
         assert!(err.is_err());
     }
 

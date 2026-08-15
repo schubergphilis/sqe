@@ -158,10 +158,7 @@ mod tests {
             "platform".to_string(),
             vec!["admin".to_string(), "reader".to_string()],
         );
-        role_mappings.insert(
-            "services".to_string(),
-            vec!["reader".to_string()],
-        );
+        role_mappings.insert("services".to_string(), vec!["reader".to_string()]);
         MtlsProviderConfig {
             extract_ou: true,
             extract_san: true,
@@ -315,7 +312,11 @@ mod tests {
             expires_at: None,
         };
 
-        assert!(provider.refresh_catalog_token(&identity).await.unwrap().is_none());
+        assert!(provider
+            .refresh_catalog_token(&identity)
+            .await
+            .unwrap()
+            .is_none());
     }
 
     // -----------------------------------------------------------------------

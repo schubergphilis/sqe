@@ -1,5 +1,5 @@
-use sqe_lineage::*;
 use sqe_lineage::sinks::file::FileSink;
+use sqe_lineage::*;
 use std::sync::Arc;
 use std::time::Duration;
 use tempfile::tempdir;
@@ -44,7 +44,8 @@ async fn emitter_drains_channel_and_writes_events_to_file_sink() {
     assert_eq!(content.lines().count(), 2, "two events written");
 
     // Both events parse as RunEvents.
-    let events: Vec<event::RunEvent> = content.lines()
+    let events: Vec<event::RunEvent> = content
+        .lines()
         .map(|l| serde_json::from_str(l).unwrap())
         .collect();
     assert_eq!(events[0].eventType, event::EventType::Start);

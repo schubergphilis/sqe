@@ -65,7 +65,10 @@ impl CredentialStore {
     ///
     /// If the fragment already has a channel (e.g. from a previous registration),
     /// a new receiver is created from the existing sender.
-    pub async fn subscribe(&self, fragment_id: &str) -> watch::Receiver<Option<RefreshableCredentials>> {
+    pub async fn subscribe(
+        &self,
+        fragment_id: &str,
+    ) -> watch::Receiver<Option<RefreshableCredentials>> {
         let mut map = self.inner.write().await;
         if let Some(sender) = map.get(fragment_id) {
             debug!(fragment_id = %fragment_id, "Reusing existing credential channel");
@@ -235,14 +238,8 @@ mod tests {
         rx1.changed().await.unwrap();
         rx2.changed().await.unwrap();
 
-        assert_eq!(
-            rx1.borrow().as_ref().unwrap().access_key_id,
-            "AKID_NEW"
-        );
-        assert_eq!(
-            rx2.borrow().as_ref().unwrap().access_key_id,
-            "AKID_NEW"
-        );
+        assert_eq!(rx1.borrow().as_ref().unwrap().access_key_id, "AKID_NEW");
+        assert_eq!(rx2.borrow().as_ref().unwrap().access_key_id, "AKID_NEW");
     }
 
     #[tokio::test]

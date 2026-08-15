@@ -18,8 +18,7 @@ use tonic::Status;
 
 /// Boxed, pinned stream of `FlightData` items used as the body of most
 /// Flight responses.
-pub(crate) type FlightStream =
-    Pin<Box<dyn Stream<Item = Result<FlightData, Status>> + Send>>;
+pub(crate) type FlightStream = Pin<Box<dyn Stream<Item = Result<FlightData, Status>> + Send>>;
 
 // ---------------------------------------------------------------------------
 // FetchResults — custom protobuf ticket payload
@@ -91,8 +90,9 @@ pub(crate) fn sqe_error_to_status(
         // these arms, every 5xx / network reset / circuit-open from
         // Polaris arrived at the client as opaque `INTERNAL` with no
         // retry hint, sending operators hunting for coordinator bugs.
-        sqe_core::SqeErrorCode::CatalogUnavailable
-        | sqe_core::SqeErrorCode::StorageError => tonic::Code::Unavailable,
+        sqe_core::SqeErrorCode::CatalogUnavailable | sqe_core::SqeErrorCode::StorageError => {
+            tonic::Code::Unavailable
+        }
         sqe_core::SqeErrorCode::CircuitBreakerOpen => tonic::Code::FailedPrecondition,
         sqe_core::SqeErrorCode::CommitConflict => tonic::Code::Aborted,
         // Explicit arm for `CatalogError` (previously fell through to the

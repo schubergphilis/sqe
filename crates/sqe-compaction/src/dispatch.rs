@@ -327,8 +327,7 @@ mod tests {
         assert_eq!(plan.placed.len(), 3, "capacity for exactly 3 groups");
         assert_eq!(plan.deferred, vec![3, 4], "the two smallest groups defer");
 
-        let placed_indices: HashSet<usize> =
-            plan.placed.iter().map(|p| p.group_index).collect();
+        let placed_indices: HashSet<usize> = plan.placed.iter().map(|p| p.group_index).collect();
         assert_eq!(
             placed_indices,
             HashSet::from([0, 1, 2]),
@@ -336,14 +335,19 @@ mod tests {
         );
 
         // Every worker got exactly one group: the cap was respected.
-        let mut per_worker: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        let mut per_worker: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::new();
         for p in &plan.placed {
             *per_worker.entry(p.worker_url.as_str()).or_default() += 1;
         }
         for count in per_worker.values() {
             assert_eq!(*count, 1, "no worker should exceed the cap of 1");
         }
-        assert_eq!(per_worker.len(), 3, "all three workers should have been used");
+        assert_eq!(
+            per_worker.len(),
+            3,
+            "all three workers should have been used"
+        );
     }
 
     #[test]
@@ -356,12 +360,16 @@ mod tests {
         assert_eq!(plan.placed.len(), 4);
         assert_eq!(plan.deferred.len(), 6);
 
-        let mut per_worker: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        let mut per_worker: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::new();
         for p in &plan.placed {
             *per_worker.entry(p.worker_url.as_str()).or_default() += 1;
         }
         for count in per_worker.values() {
-            assert!(*count <= 2, "no worker may exceed max_inflight_per_worker=2");
+            assert!(
+                *count <= 2,
+                "no worker may exceed max_inflight_per_worker=2"
+            );
         }
     }
 
@@ -552,10 +560,12 @@ mod tests {
     fn test_schema() -> Schema {
         Schema::builder()
             .with_schema_id(0)
-            .with_fields(vec![
-                NestedField::required(1, "id", iceberg::spec::Type::Primitive(PrimitiveType::Long))
-                    .into(),
-            ])
+            .with_fields(vec![NestedField::required(
+                1,
+                "id",
+                iceberg::spec::Type::Primitive(PrimitiveType::Long),
+            )
+            .into()])
             .build()
             .unwrap()
     }
@@ -608,11 +618,17 @@ mod tests {
 
         assert_eq!(outcome.group_id, 7);
         assert_eq!(outcome.new_files.len(), 1);
-        assert_eq!(outcome.new_files[0].file_path(), "s3://bucket/out-0.parquet");
+        assert_eq!(
+            outcome.new_files[0].file_path(),
+            "s3://bucket/out-0.parquet"
+        );
         assert_eq!(outcome.new_files[0].record_count(), 42);
         assert_eq!(outcome.rows_written, 42);
         assert_eq!(outcome.bytes_written, 2048);
-        assert_eq!(outcome.uploaded_paths, vec!["s3://bucket/out-0.parquet".to_string()]);
+        assert_eq!(
+            outcome.uploaded_paths,
+            vec!["s3://bucket/out-0.parquet".to_string()]
+        );
     }
 
     #[test]
@@ -626,9 +642,8 @@ mod tests {
         };
         let schema = test_schema();
         let partition_type = StructType::new(vec![]);
-        let err =
-            decode_group_response(&response, &schema, 0, &partition_type, FormatVersion::V2)
-                .unwrap_err();
+        let err = decode_group_response(&response, &schema, 0, &partition_type, FormatVersion::V2)
+            .unwrap_err();
         assert!(err.to_string().contains("failed to decode"));
     }
 
@@ -678,7 +693,10 @@ mod tests {
         let err = aggregate_group_outcomes(vec![g0], &old_files).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("invariant violated"), "{msg}");
-        assert!(msg.contains("added=200") && msg.contains("removed=100"), "{msg}");
+        assert!(
+            msg.contains("added=200") && msg.contains("removed=100"),
+            "{msg}"
+        );
     }
 
     #[test]

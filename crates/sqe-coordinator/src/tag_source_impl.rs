@@ -115,9 +115,7 @@ impl TagSource for CacheTagSource {
 ///
 /// Returns an empty map on any failure (absent key, malformed JSON, wrong
 /// JSON shape) — fail-safe: no tags means no extra masking.
-pub(crate) fn parse_column_tags(
-    props: &HashMap<String, String>,
-) -> HashMap<String, Vec<String>> {
+pub(crate) fn parse_column_tags(props: &HashMap<String, String>) -> HashMap<String, Vec<String>> {
     let raw = match props.get(PROP_KEY) {
         Some(v) => v,
         None => return HashMap::new(),
@@ -179,7 +177,10 @@ mod tests {
     use sqe_sql::tags::{ColumnTagOp, TagAction};
 
     fn props(pairs: &[(&str, &str)]) -> HashMap<String, String> {
-        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
     }
 
     fn map(pairs: &[(&str, &[&str])]) -> std::collections::HashMap<String, Vec<String>> {
@@ -198,7 +199,10 @@ mod tests {
             action: TagAction::Set,
         }];
         let got = apply_tag_ops(&cur, &ops);
-        assert_eq!(got.get("email").unwrap(), &vec!["PII".to_string(), "GDPR".to_string()]);
+        assert_eq!(
+            got.get("email").unwrap(),
+            &vec!["PII".to_string(), "GDPR".to_string()]
+        );
     }
 
     #[test]
@@ -258,10 +262,7 @@ mod tests {
         )]);
         let got = parse_column_tags(&p);
         assert_eq!(got.get("email").unwrap(), &vec!["PII", "GDPR"]);
-        assert_eq!(
-            got.get("salary").unwrap(),
-            &vec!["PII", "CONFIDENTIAL"]
-        );
+        assert_eq!(got.get("salary").unwrap(), &vec!["PII", "CONFIDENTIAL"]);
         assert_eq!(got.len(), 2);
     }
 
@@ -340,7 +341,10 @@ mod tests {
 
         // Serialize under PROP_KEY (what set_column_tags commits) and read back.
         let written = serialize_to_props(&merged);
-        assert!(written.contains_key(PROP_KEY), "property must be written under PROP_KEY");
+        assert!(
+            written.contains_key(PROP_KEY),
+            "property must be written under PROP_KEY"
+        );
         let read_back = parse_column_tags(&written);
         assert_eq!(
             read_back.get("email").unwrap(),
@@ -454,9 +458,7 @@ mod tag_key_rewrite_tests {
     fn map(pairs: &[(&str, &[&str])]) -> HashMap<String, Vec<String>> {
         pairs
             .iter()
-            .map(|(c, tags)| {
-                (c.to_string(), tags.iter().map(|t| t.to_string()).collect())
-            })
+            .map(|(c, tags)| (c.to_string(), tags.iter().map(|t| t.to_string()).collect()))
             .collect()
     }
 
@@ -467,12 +469,24 @@ mod tag_key_rewrite_tests {
         let current = map(&[("ssn", &["pii"]), ("region", &["geo"])]);
         let out = rewrite_tag_keys(
             &current,
-            &[TagKeyChange::Rename { old: "ssn".into(), new: "tax_id".into() }],
+            &[TagKeyChange::Rename {
+                old: "ssn".into(),
+                new: "tax_id".into(),
+            }],
         )
         .expect("the map changed");
-        assert_eq!(out.get("tax_id").map(Vec::as_slice), Some(&["pii".to_string()][..]));
-        assert!(!out.contains_key("ssn"), "the old key must be gone: {out:?}");
-        assert_eq!(out.get("region").map(Vec::as_slice), Some(&["geo".to_string()][..]));
+        assert_eq!(
+            out.get("tax_id").map(Vec::as_slice),
+            Some(&["pii".to_string()][..])
+        );
+        assert!(
+            !out.contains_key("ssn"),
+            "the old key must be gone: {out:?}"
+        );
+        assert_eq!(
+            out.get("region").map(Vec::as_slice),
+            Some(&["geo".to_string()][..])
+        );
     }
 
     /// A rename onto a name that already carries tags UNIONS. Replacing could drop
@@ -482,7 +496,10 @@ mod tag_key_rewrite_tests {
         let current = map(&[("ssn", &["pii"]), ("tax_id", &["sensitive"])]);
         let out = rewrite_tag_keys(
             &current,
-            &[TagKeyChange::Rename { old: "ssn".into(), new: "tax_id".into() }],
+            &[TagKeyChange::Rename {
+                old: "ssn".into(),
+                new: "tax_id".into(),
+            }],
         )
         .expect("changed");
         let mut got = out.get("tax_id").cloned().expect("tax_id present");
@@ -496,8 +513,13 @@ mod tag_key_rewrite_tests {
     #[test]
     fn a_drop_removes_the_association() {
         let current = map(&[("ssn", &["pii"]), ("region", &["geo"])]);
-        let out = rewrite_tag_keys(&current, &[TagKeyChange::Drop { column: "ssn".into() }])
-            .expect("changed");
+        let out = rewrite_tag_keys(
+            &current,
+            &[TagKeyChange::Drop {
+                column: "ssn".into(),
+            }],
+        )
+        .expect("changed");
         assert!(!out.contains_key("ssn"));
         assert!(out.contains_key("region"));
     }
@@ -511,7 +533,10 @@ mod tag_key_rewrite_tests {
         assert_eq!(
             rewrite_tag_keys(
                 &current,
-                &[TagKeyChange::Rename { old: "region".into(), new: "area".into() }]
+                &[TagKeyChange::Rename {
+                    old: "region".into(),
+                    new: "area".into()
+                }]
             ),
             None
         );
@@ -523,7 +548,10 @@ mod tag_key_rewrite_tests {
         assert_eq!(
             rewrite_tag_keys(
                 &HashMap::new(),
-                &[TagKeyChange::Rename { old: "a".into(), new: "b".into() }]
+                &[TagKeyChange::Rename {
+                    old: "a".into(),
+                    new: "b".into()
+                }]
             ),
             None
         );
@@ -536,7 +564,10 @@ mod tag_key_rewrite_tests {
         assert_eq!(
             rewrite_tag_keys(
                 &current,
-                &[TagKeyChange::Rename { old: "ssn".into(), new: "ssn".into() }]
+                &[TagKeyChange::Rename {
+                    old: "ssn".into(),
+                    new: "ssn".into()
+                }]
             ),
             None
         );
@@ -549,13 +580,22 @@ mod tag_key_rewrite_tests {
         let out = rewrite_tag_keys(
             &current,
             &[
-                TagKeyChange::Rename { old: "a".into(), new: "b".into() },
-                TagKeyChange::Rename { old: "b".into(), new: "c".into() },
+                TagKeyChange::Rename {
+                    old: "a".into(),
+                    new: "b".into(),
+                },
+                TagKeyChange::Rename {
+                    old: "b".into(),
+                    new: "c".into(),
+                },
                 TagKeyChange::Drop { column: "z".into() },
             ],
         )
         .expect("changed");
-        assert_eq!(out.get("c").map(Vec::as_slice), Some(&["t1".to_string()][..]));
+        assert_eq!(
+            out.get("c").map(Vec::as_slice),
+            Some(&["t1".to_string()][..])
+        );
         assert!(!out.contains_key("a") && !out.contains_key("b"));
         assert!(!out.contains_key("z"));
     }

@@ -51,23 +51,14 @@ fn table_scan_yields_one_input_dataset_with_multi_catalog_namespace() {
     let schema = input.facets.schema.as_ref().expect("schema facet present");
     assert_eq!(schema.fields.len(), 2);
     assert_eq!(schema.fields[0].name, "id");
-    let ds = input
-        .facets
-        .dataSource
-        .as_ref()
-        .expect("dataSource facet");
+    let ds = input.facets.dataSource.as_ref().expect("dataSource facet");
     assert_eq!(ds.name, "polaris");
     assert_eq!(ds.uri, "https://polaris.example/api/catalog");
 }
 
 #[test]
 fn unknown_catalog_falls_back_to_sqe_namespace() {
-    let plan = build_simple_scan(
-        "nessie",
-        "archive",
-        "orders",
-        &[("id", DataType::Int64)],
-    );
+    let plan = build_simple_scan("nessie", "archive", "orders", &[("id", DataType::Int64)]);
     let lookup = lookup_polaris();
     let inputs = datasets::extract_inputs(&plan, &lookup);
 

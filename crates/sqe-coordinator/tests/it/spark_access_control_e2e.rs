@@ -173,7 +173,12 @@ async fn object_denial_survives_the_frontend_defer_policy() {
          so this test would prove nothing: Kyuubi would refuse before Polaris was consulted"
     );
 
-    let out = spark_sql(&ctx.bob, "bob", &format!("SELECT * FROM {}", spark_orders())).await;
+    let out = spark_sql(
+        &ctx.bob,
+        "bob",
+        &format!("SELECT * FROM {}", spark_orders()),
+    )
+    .await;
     out.expect_polaris_denial(
         "LOAD_TABLE",
         "the defer item must grant no data access of its own",
@@ -201,7 +206,11 @@ async fn spark_grant_select_to_role_enables_exact_rows() {
         &format!("SELECT count(*) FROM {}", spark_orders()),
     )
     .await;
-    assert_eq!(rows, vec![vec!["3".to_string()]], "row count after the grant");
+    assert_eq!(
+        rows,
+        vec![vec!["3".to_string()]],
+        "row count after the grant"
+    );
 
     // alice is an analyst only, so the same grant must not admit her.
     let out = spark_sql(
@@ -210,7 +219,10 @@ async fn spark_grant_select_to_role_enables_exact_rows() {
         &format!("SELECT count(*) FROM {}", spark_orders()),
     )
     .await;
-    out.expect_polaris_denial("LOAD_TABLE", "a grant to engineer must not admit an analyst");
+    out.expect_polaris_denial(
+        "LOAD_TABLE",
+        "a grant to engineer must not admit an analyst",
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -326,10 +338,7 @@ async fn spark_write_privileges_are_separate_from_read() {
         spark_orders()
     );
     let out = spark_sql(&ctx.bob, "bob", &insert).await;
-    out.expect_polaris_denial(
-        "ADD_TABLE_SNAPSHOT",
-        "a read grant must not confer a write",
-    );
+    out.expect_polaris_denial("ADD_TABLE_SNAPSHOT", "a read grant must not confer a write");
     assert_eq!(
         before,
         row_count_via_sqe(&ctx).await,
@@ -464,7 +473,10 @@ async fn add_deny_item_to_orders_policy(ctx: &AcCtx) {
             {"type": "table-data-read", "isAllowed": true}
         ]
     });
-    match target.get_mut("denyPolicyItems").and_then(|v| v.as_array_mut()) {
+    match target
+        .get_mut("denyPolicyItems")
+        .and_then(|v| v.as_array_mut())
+    {
         Some(items) => items.push(deny),
         None => target["denyPolicyItems"] = serde_json::json!([deny]),
     }
@@ -547,7 +559,12 @@ async fn spark_all_tables_in_schema_grant_covers_the_namespace() {
         &format!("CREATE TABLE {extra} (id BIGINT, note VARCHAR)"),
     )
     .await;
-    exec_ok(&ctx, &ctx.carol, &format!("INSERT INTO {extra} VALUES (1,'a')")).await;
+    exec_ok(
+        &ctx,
+        &ctx.carol,
+        &format!("INSERT INTO {extra} VALUES (1,'a')"),
+    )
+    .await;
 
     exec_ok(
         &ctx,
@@ -560,7 +577,11 @@ async fn spark_all_tables_in_schema_grant_covers_the_namespace() {
     let extra_in_spark = format!("{}_extra", spark_orders());
     for table in [spark_orders(), extra_in_spark] {
         let rows = spark_eventually_ok(&ctx, "bob", &format!("SELECT count(*) FROM {table}")).await;
-        assert_eq!(rows.len(), 1, "{table} must be readable under the wildcard grant");
+        assert_eq!(
+            rows.len(),
+            1,
+            "{table} must be readable under the wildcard grant"
+        );
     }
 }
 
@@ -605,12 +626,7 @@ async fn no_service_account_catalog_can_defeat_per_user_identity() {
     // The SAME table through the OTHER alias from spark-defaults.conf, in the SAME
     // session. With no credential configured there it carries no identity at all, so
     // Polaris refuses it too.
-    let via_alias = spark_sql(
-        &ctx.bob,
-        "bob",
-        &format!("SELECT count(*) FROM {ORDERS}"),
-    )
-    .await;
+    let via_alias = spark_sql(&ctx.bob, "bob", &format!("SELECT count(*) FROM {ORDERS}")).await;
     // NOT a Polaris denial, and the difference is the point. With a credential the
     // alias was a second IDENTITY (and read the data). With none it has no identity
     // at all, so the request never becomes an authorization question: Polaris rejects

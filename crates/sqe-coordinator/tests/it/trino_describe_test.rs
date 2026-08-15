@@ -42,8 +42,9 @@ fn handler(catalog_url: &str) -> sqe_coordinator::QueryHandler {
     );
     let config: SqeConfig = toml::from_str(&toml).expect("config parses");
     let policy: Arc<dyn sqe_policy::PolicyEnforcer> = Arc::new(sqe_policy::PassthroughEnforcer);
-    let query_tracker =
-        Arc::new(sqe_coordinator::query_tracker::QueryTracker::new(&config.query_history));
+    let query_tracker = Arc::new(sqe_coordinator::query_tracker::QueryTracker::new(
+        &config.query_history,
+    ));
     sqe_coordinator::QueryHandler::new(
         policy,
         None,
@@ -85,14 +86,27 @@ async fn show_results_use_trino_column_shape() {
     let server = mount_empty_polaris().await;
     let h = handler(&server.uri());
 
-    let tables = h.execute(&session(), "SHOW TABLES FROM gold", None).await.expect("show tables");
-    assert_eq!(tables[0].schema().fields().len(), 1, "SHOW TABLES is single-column");
+    let tables = h
+        .execute(&session(), "SHOW TABLES FROM gold", None)
+        .await
+        .expect("show tables");
+    assert_eq!(
+        tables[0].schema().fields().len(),
+        1,
+        "SHOW TABLES is single-column"
+    );
     assert_eq!(tables[0].schema().field(0).name(), "Table");
 
-    let schemas = h.execute(&session(), "SHOW SCHEMAS", None).await.expect("show schemas");
+    let schemas = h
+        .execute(&session(), "SHOW SCHEMAS", None)
+        .await
+        .expect("show schemas");
     assert_eq!(schemas[0].schema().field(0).name(), "Schema");
 
-    let catalogs = h.execute(&session(), "SHOW CATALOGS", None).await.expect("show catalogs");
+    let catalogs = h
+        .execute(&session(), "SHOW CATALOGS", None)
+        .await
+        .expect("show catalogs");
     assert_eq!(catalogs[0].schema().field(0).name(), "Catalog");
 }
 

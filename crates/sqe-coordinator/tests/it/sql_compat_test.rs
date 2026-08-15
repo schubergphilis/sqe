@@ -16,7 +16,6 @@
 //!
 //! Run with: ./scripts/integration-test.sh
 
-
 use std::path::PathBuf;
 
 // ---------------------------------------------------------------------------
@@ -138,8 +137,7 @@ fn parse_sql_file(content: &str) -> Vec<SqlBlock> {
 // ---------------------------------------------------------------------------
 
 fn sql_dir() -> PathBuf {
-    let manifest_dir =
-        std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
     // CARGO_MANIFEST_DIR = crates/sqe-coordinator
     // SQL files live in crates/sqe-coordinator/tests/sql/
     PathBuf::from(manifest_dir).join("tests").join("sql")
@@ -166,7 +164,11 @@ async fn run_sql_file(filename: &str) {
                 failed += 1;
             }
             Ok(batches) => {
-                crate::common::print_results(&format!("{filename}::{}", block.name), &block.sql, &batches);
+                crate::common::print_results(
+                    &format!("{filename}::{}", block.name),
+                    &block.sql,
+                    &batches,
+                );
 
                 let actual_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
 
@@ -183,7 +185,11 @@ async fn run_sql_file(filename: &str) {
                 // Check values if expected rows were provided
                 if let Some(expected) = &block.expected {
                     // expected[0] is the header (column names), expected[1..] are data rows
-                    let data_rows = if expected.len() > 1 { &expected[1..] } else { &[] };
+                    let data_rows = if expected.len() > 1 {
+                        &expected[1..]
+                    } else {
+                        &[]
+                    };
 
                     if actual_rows != data_rows.len() {
                         eprintln!(
@@ -212,10 +218,7 @@ async fn run_sql_file(filename: &str) {
                             if actual_cols != *expected_cols {
                                 eprintln!(
                                     "[FAIL] {filename}::{} row {} — expected {:?}, got {:?}",
-                                    block.name,
-                                    row_idx,
-                                    expected_cols,
-                                    actual_cols
+                                    block.name, row_idx, expected_cols, actual_cols
                                 );
                                 failed += 1;
                             }
@@ -228,8 +231,7 @@ async fn run_sql_file(filename: &str) {
     }
 
     assert_eq!(
-        failed,
-        0,
+        failed, 0,
         "{failed} test block(s) failed in {filename} — see stderr for details"
     );
 }

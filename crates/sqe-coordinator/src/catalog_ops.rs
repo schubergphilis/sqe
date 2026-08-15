@@ -3,10 +3,13 @@ use std::sync::Arc as StdArc;
 use std::sync::Arc;
 
 use iceberg::spec::{
-    MAIN_BRANCH, NestedField, Schema as IcebergSchema, SnapshotReference, SnapshotRetention,
+    NestedField, Schema as IcebergSchema, SnapshotReference, SnapshotRetention, MAIN_BRANCH,
 };
 use iceberg::{Catalog, NamespaceIdent, TableIdent, TableRequirement, TableUpdate};
-use sqlparser::ast::{AlterColumnOperation, AlterTableOperation, Expr, ObjectName, ObjectType, SchemaName, SqlOption, Statement, Value};
+use sqlparser::ast::{
+    AlterColumnOperation, AlterTableOperation, Expr, ObjectName, ObjectType, SchemaName, SqlOption,
+    Statement, Value,
+};
 use tracing::{error, info};
 
 use sqe_catalog::{SessionCatalog, TableMetadataCache};
@@ -127,11 +130,7 @@ impl CatalogOps {
     /// the catalog's `drop_table` method. If `IF EXISTS` is specified
     /// and the table is not found, this returns `Ok(())`.
     #[instrument(skip(self, session, stmt), fields(username = %session.user.username))]
-    pub async fn drop_table(
-        &self,
-        session: &Session,
-        stmt: &Statement,
-    ) -> sqe_core::Result<()> {
+    pub async fn drop_table(&self, session: &Session, stmt: &Statement) -> sqe_core::Result<()> {
         let (names, if_exists) = match stmt {
             Statement::Drop {
                 names, if_exists, ..
@@ -168,13 +167,11 @@ impl CatalogOps {
             // typically points at an upstream CREATE SCHEMA that didn't
             // land — surfacing it here saves the operator from chasing a
             // mysterious downstream CTAS error.
-            Err(e) if if_exists && is_namespace_not_found(&e) => {
-                Err(SqeError::Catalog(format!(
-                    "Failed to drop table {table_ident}: namespace is missing. \
+            Err(e) if if_exists && is_namespace_not_found(&e) => Err(SqeError::Catalog(format!(
+                "Failed to drop table {table_ident}: namespace is missing. \
                      IF EXISTS does not cover missing namespaces. \
                      Verify CREATE SCHEMA succeeded. Underlying error: {e}"
-                )))
-            }
+            ))),
             Err(e) if if_exists && is_table_not_found(&e) => {
                 info!(
                     table = %table_ident,
@@ -190,11 +187,7 @@ impl CatalogOps {
     ///
     /// Maps SQL `CREATE SCHEMA` to Iceberg `create_namespace`.
     #[instrument(skip(self, session, stmt), fields(username = %session.user.username))]
-    pub async fn create_schema(
-        &self,
-        session: &Session,
-        stmt: &Statement,
-    ) -> sqe_core::Result<()> {
+    pub async fn create_schema(&self, session: &Session, stmt: &Statement) -> sqe_core::Result<()> {
         let (schema_name, if_not_exists) = match stmt {
             Statement::CreateSchema {
                 schema_name,
@@ -215,9 +208,10 @@ impl CatalogOps {
         // two-level namespace in the DEFAULT warehouse, so the later CREATE TABLE
         // into the discovered `ws_team_a` catalog failed "namespace does not exist".
         let (explicit_catalog, namespace) = match schema_name {
-            SchemaName::Simple(obj) | SchemaName::NamedAuthorization(obj, _) => {
-                (schema_catalog_qualifier(obj), namespace_without_catalog(obj)?)
-            }
+            SchemaName::Simple(obj) | SchemaName::NamedAuthorization(obj, _) => (
+                schema_catalog_qualifier(obj),
+                namespace_without_catalog(obj)?,
+            ),
             SchemaName::UnnamedAuthorization(ident) => {
                 (None, NamespaceIdent::new(ident.value.clone()))
             }
@@ -240,10 +234,7 @@ impl CatalogOps {
             .create_catalog_bridge(session, target_catalog.as_deref())
             .await?;
 
-        match catalog
-            .create_namespace(&namespace, HashMap::new())
-            .await
-        {
+        match catalog.create_namespace(&namespace, HashMap::new()).await {
             Ok(_) => {
                 info!(
                     namespace = ?namespace,
@@ -266,11 +257,7 @@ impl CatalogOps {
     ///
     /// Maps SQL `DROP SCHEMA` to Iceberg `drop_namespace`.
     #[instrument(skip(self, session, stmt), fields(username = %session.user.username))]
-    pub async fn drop_schema(
-        &self,
-        session: &Session,
-        stmt: &Statement,
-    ) -> sqe_core::Result<()> {
+    pub async fn drop_schema(&self, session: &Session, stmt: &Statement) -> sqe_core::Result<()> {
         let (names, if_exists) = match stmt {
             Statement::Drop {
                 names,
@@ -322,11 +309,7 @@ impl CatalogOps {
     ///
     /// Extracts the source and destination table names from an
     /// `ALTER TABLE ... RENAME TO` statement.
-    pub async fn rename_table(
-        &self,
-        session: &Session,
-        stmt: &Statement,
-    ) -> sqe_core::Result<()> {
+    pub async fn rename_table(&self, session: &Session, stmt: &Statement) -> sqe_core::Result<()> {
         let (source_name, operations) = match stmt {
             Statement::AlterTable(at) => (&at.name, &at.operations),
             other => {
@@ -362,7 +345,10 @@ impl CatalogOps {
         let parsed_dest = parse_table_ref(dest_obj_name)?;
         let dest_ident = if dest_obj_name.0.len() == 1 {
             // Inherit source namespace
-            TableIdent::new(src_ident.namespace().clone(), parsed_dest.name().to_string())
+            TableIdent::new(
+                src_ident.namespace().clone(),
+                parsed_dest.name().to_string(),
+            )
         } else {
             parsed_dest
         };
@@ -474,11 +460,7 @@ impl CatalogOps {
     /// `SessionCatalog::drop_view()`. If `IF EXISTS` is specified and the
     /// view is not found, this returns `Ok(())`.
     #[instrument(skip(self, session, stmt), fields(username = %session.user.username))]
-    pub async fn drop_view(
-        &self,
-        session: &Session,
-        stmt: &Statement,
-    ) -> sqe_core::Result<()> {
+    pub async fn drop_view(&self, session: &Session, stmt: &Statement) -> sqe_core::Result<()> {
         let (names, if_exists) = match stmt {
             Statement::Drop {
                 names,
@@ -594,38 +576,31 @@ impl CatalogOps {
                         .any(|opt| matches!(opt.option, sqlparser::ast::ColumnOption::NotNull));
 
                     let arrow_type = sql_type_to_arrow(&column_def.data_type)?;
-                    let iceberg_type = iceberg::arrow::arrow_type_to_type(&arrow_type)
-                        .map_err(|e| SqeError::Execution(format!(
-                            "Cannot convert type for column '{}': {e}",
-                            column_def.name.value
-                        )))?;
+                    let iceberg_type =
+                        iceberg::arrow::arrow_type_to_type(&arrow_type).map_err(|e| {
+                            SqeError::Execution(format!(
+                                "Cannot convert type for column '{}': {e}",
+                                column_def.name.value
+                            ))
+                        })?;
 
                     max_field_id += 1;
                     // Fold the new column name (unquoted -> lowercase) so it is
                     // consistent with CREATE TABLE and query-side folding (#337).
                     let col_name = fold_unquoted_ident(&column_def.name);
                     let mut new_field = if not_null {
-                        NestedField::required(
-                            max_field_id,
-                            &col_name,
-                            iceberg_type.clone(),
-                        )
+                        NestedField::required(max_field_id, &col_name, iceberg_type.clone())
                     } else {
-                        NestedField::optional(
-                            max_field_id,
-                            &col_name,
-                            iceberg_type.clone(),
-                        )
+                        NestedField::optional(max_field_id, &col_name, iceberg_type.clone())
                     };
 
                     // Extract a DEFAULT literal, if any, and set both defaults.
                     // `initial_default` fills existing rows retroactively;
                     // `write_default` applies to new inserts.
-                    let default_expr =
-                        column_def.options.iter().find_map(|o| match &o.option {
-                            sqlparser::ast::ColumnOption::Default(e) => Some(e),
-                            _ => None,
-                        });
+                    let default_expr = column_def.options.iter().find_map(|o| match &o.option {
+                        sqlparser::ast::ColumnOption::Default(e) => Some(e),
+                        _ => None,
+                    });
                     if let Some(expr) = default_expr {
                         let sql_literal = sqe_sql::extract_default_literal(expr).map_err(|e| {
                             SqeError::Execution(format!(
@@ -652,7 +627,11 @@ impl CatalogOps {
                     fields.push(StdArc::new(new_field));
                 }
 
-                AlterTableOperation::DropColumn { column_names, if_exists, .. } => {
+                AlterTableOperation::DropColumn {
+                    column_names,
+                    if_exists,
+                    ..
+                } => {
                     // sqlparser 0.62 carries a Vec of column names (the old
                     // single `column_name` field). Drop each in turn, keeping
                     // the same not-found / IF EXISTS semantics per column.
@@ -663,11 +642,9 @@ impl CatalogOps {
                         match pos {
                             Some(idx) => {
                                 fields.remove(idx);
-                                tag_key_changes.push(
-                                    crate::tag_source_impl::TagKeyChange::Drop {
-                                        column: col.to_string(),
-                                    },
-                                );
+                                tag_key_changes.push(crate::tag_source_impl::TagKeyChange::Drop {
+                                    column: col.to_string(),
+                                });
                             }
                             None if *if_exists => {}
                             None => {
@@ -679,15 +656,21 @@ impl CatalogOps {
                     }
                 }
 
-                AlterTableOperation::RenameColumn { old_column_name, new_column_name } => {
+                AlterTableOperation::RenameColumn {
+                    old_column_name,
+                    new_column_name,
+                } => {
                     // Fold both: the source lookup and the destination name (#337).
                     let old_name_folded = fold_unquoted_ident(old_column_name);
                     let old_name = old_name_folded.as_str();
-                    let pos = fields.iter().position(|f| f.name == old_name).ok_or_else(|| {
-                        SqeError::Execution(format!(
-                            "Column '{old_name}' not found in table '{table_ident}'"
-                        ))
-                    })?;
+                    let pos = fields
+                        .iter()
+                        .position(|f| f.name == old_name)
+                        .ok_or_else(|| {
+                            SqeError::Execution(format!(
+                                "Column '{old_name}' not found in table '{table_ident}'"
+                            ))
+                        })?;
                     let old_field = &fields[pos];
                     let renamed = NestedField::new(
                         old_field.id,
@@ -727,9 +710,11 @@ impl CatalogOps {
                         AlterColumnOperation::SetDataType { data_type, .. } => {
                             let arrow_type = sql_type_to_arrow(data_type)?;
                             let iceberg_type = iceberg::arrow::arrow_type_to_type(&arrow_type)
-                                .map_err(|e| SqeError::Execution(format!(
-                                    "Cannot convert type for column '{col}': {e}"
-                                )))?;
+                                .map_err(|e| {
+                                    SqeError::Execution(format!(
+                                        "Cannot convert type for column '{col}': {e}"
+                                    ))
+                                })?;
                             NestedField::new(
                                 old_field.id,
                                 old_field.name.clone(),
@@ -798,7 +783,9 @@ impl CatalogOps {
             })?;
             let mut tag_updates = HashMap::new();
             tag_updates.insert(crate::tag_source_impl::PROP_KEY.to_string(), json);
-            updates.push(TableUpdate::SetProperties { updates: tag_updates });
+            updates.push(TableUpdate::SetProperties {
+                updates: tag_updates,
+            });
             info!(
                 table = %table_ident,
                 changes = tag_key_changes.len(),
@@ -806,7 +793,9 @@ impl CatalogOps {
             );
         }
         let requirements = vec![
-            TableRequirement::LastAssignedFieldIdMatch { last_assigned_field_id },
+            TableRequirement::LastAssignedFieldIdMatch {
+                last_assigned_field_id,
+            },
             TableRequirement::CurrentSchemaIdMatch { current_schema_id },
         ];
 
@@ -838,10 +827,14 @@ impl CatalogOps {
                     table_ident.name().to_string(),
                 );
                 let previous = crate::tag_source_impl::parse_column_tags(metadata.properties());
-                let previous_projected: sqe_policy::tag_projector::ColumnTags =
-                    previous.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-                let projected: sqe_policy::tag_projector::ColumnTags =
-                    new_tags.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                let previous_projected: sqe_policy::tag_projector::ColumnTags = previous
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+                let projected: sqe_policy::tag_projector::ColumnTags = new_tags
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
                 if let Err(project_err) = self
                     .tag_projector
                     .project(&key, &previous_projected, &projected)
@@ -955,7 +948,9 @@ impl CatalogOps {
             TableUpdate::SetCurrentSchema { schema_id: -1 },
         ];
         let requirements = vec![
-            TableRequirement::LastAssignedFieldIdMatch { last_assigned_field_id },
+            TableRequirement::LastAssignedFieldIdMatch {
+                last_assigned_field_id,
+            },
             TableRequirement::CurrentSchemaIdMatch { current_schema_id },
         ];
         session_catalog
@@ -1055,16 +1050,14 @@ impl CatalogOps {
     /// and commits it via the Iceberg REST API. Rejects DROP BRANCH on main
     /// and CREATE TAG on a duplicate name (unless `CREATE OR REPLACE`).
     #[instrument(skip(self, session, ddl), fields(username = %session.user.username))]
-    pub async fn apply_ref_ddl(
-        &self,
-        session: &Session,
-        ddl: &RefDdl,
-    ) -> sqe_core::Result<()> {
+    pub async fn apply_ref_ddl(&self, session: &Session, ddl: &RefDdl) -> sqe_core::Result<()> {
         let (table_ref, ref_name, is_drop) = match ddl {
-            RefDdl::CreateBranch { table, name, .. }
-            | RefDdl::CreateTag { table, name, .. } => (table.as_str(), name.as_str(), false),
-            RefDdl::DropBranch { table, name, .. }
-            | RefDdl::DropTag { table, name, .. } => (table.as_str(), name.as_str(), true),
+            RefDdl::CreateBranch { table, name, .. } | RefDdl::CreateTag { table, name, .. } => {
+                (table.as_str(), name.as_str(), false)
+            }
+            RefDdl::DropBranch { table, name, .. } | RefDdl::DropTag { table, name, .. } => {
+                (table.as_str(), name.as_str(), true)
+            }
         };
 
         // Reject drop of the reserved main branch early, before any round-trip.
@@ -1123,12 +1116,7 @@ impl CatalogOps {
                     },
                 }]
             }
-            RefDdl::DropBranch {
-                if_exists, ..
-            }
-            | RefDdl::DropTag {
-                if_exists, ..
-            } => {
+            RefDdl::DropBranch { if_exists, .. } | RefDdl::DropTag { if_exists, .. } => {
                 if existing.is_none() {
                     if *if_exists {
                         info!(
@@ -1215,9 +1203,8 @@ impl CatalogOps {
         let current = crate::tag_source_impl::parse_column_tags(table.metadata().properties());
 
         let new_map = crate::tag_source_impl::apply_tag_ops(&current, &stmt.ops);
-        let json = serde_json::to_string(&new_map).map_err(|e| {
-            SqeError::Execution(format!("failed to serialize column tags: {e}"))
-        })?;
+        let json = serde_json::to_string(&new_map)
+            .map_err(|e| SqeError::Execution(format!("failed to serialize column tags: {e}")))?;
 
         let mut updates = HashMap::new();
         updates.insert(crate::tag_source_impl::PROP_KEY.to_string(), json);
@@ -1230,7 +1217,11 @@ impl CatalogOps {
         );
 
         session_catalog
-            .commit_schema_update(&table_ident, vec![TableUpdate::SetProperties { updates }], vec![])
+            .commit_schema_update(
+                &table_ident,
+                vec![TableUpdate::SetProperties { updates }],
+                vec![],
+            )
             .await?;
         // Tags are read user-independently via `properties_for`, which returns
         // the first entry matching `|{ns}.{table}` from ANY token. The single
@@ -1249,10 +1240,14 @@ impl CatalogOps {
                 &table_ident.namespace().to_url_string(),
                 table_ident.name().to_string(),
             );
-            let projected: sqe_policy::tag_projector::ColumnTags =
-                new_map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-            let previous_projected: sqe_policy::tag_projector::ColumnTags =
-                current.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+            let projected: sqe_policy::tag_projector::ColumnTags = new_map
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            let previous_projected: sqe_policy::tag_projector::ColumnTags = current
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
             if let Err(project_err) = self
                 .tag_projector
                 .project(&key, &previous_projected, &projected)
@@ -1393,11 +1388,10 @@ impl CatalogOps {
 
         // Resolve a transform-SQL fragment to `(source_id, target_name, transform)`,
         // verifying the source column exists in the current schema.
-        let resolve_transform =
-            |transform_sql: &str| -> sqe_core::Result<UnboundPartitionField> {
-                let (source_name, target_name, transform) =
-                    parse_partition_transform_sql(transform_sql)?;
-                let source_id = schema
+        let resolve_transform = |transform_sql: &str| -> sqe_core::Result<UnboundPartitionField> {
+            let (source_name, target_name, transform) =
+                parse_partition_transform_sql(transform_sql)?;
+            let source_id = schema
                     .as_struct()
                     .fields()
                     .iter()
@@ -1408,13 +1402,13 @@ impl CatalogOps {
                             "ALTER TABLE PARTITION FIELD: column '{source_name}' not found in table schema"
                         ))
                     })?;
-                Ok(UnboundPartitionField {
-                    source_id,
-                    field_id: None, // assigned below
-                    name: target_name,
-                    transform,
-                })
-            };
+            Ok(UnboundPartitionField {
+                source_id,
+                field_id: None, // assigned below
+                name: target_name,
+                transform,
+            })
+        };
 
         // Locate an existing field by transform-SQL fragment, matching on the
         // canonical Iceberg field name produced by `parse_partition_transform_sql`.
@@ -1826,10 +1820,7 @@ fn ddl_action_label(ddl: &RefDdl) -> &'static str {
 /// Resolve a user-provided snapshot id, falling back to the current snapshot
 /// when `given` is None. Fails when the snapshot id does not exist in the
 /// table's history, or when the table has no snapshots at all.
-fn resolve_snapshot_id(
-    table: &iceberg::table::Table,
-    given: Option<i64>,
-) -> sqe_core::Result<i64> {
+fn resolve_snapshot_id(table: &iceberg::table::Table, given: Option<i64>) -> sqe_core::Result<i64> {
     match given {
         Some(id) => {
             if table.metadata().snapshot_by_id(id).is_none() {
@@ -1841,8 +1832,7 @@ fn resolve_snapshot_id(
         }
         None => table.metadata().current_snapshot_id().ok_or_else(|| {
             SqeError::Execution(
-                "cannot create a ref on a table with no snapshots; run INSERT first"
-                    .to_string(),
+                "cannot create a ref on a table with no snapshots; run INSERT first".to_string(),
             )
         }),
     }
@@ -1921,9 +1911,7 @@ fn is_namespace_not_found_msg(msg: &str) -> bool {
 /// Check if an iceberg error indicates a namespace already exists.
 fn is_namespace_already_exists(err: &iceberg::Error) -> bool {
     let msg = err.to_string().to_lowercase();
-    msg.contains("already exists")
-        || msg.contains("409")
-        || msg.contains("conflict")
+    msg.contains("already exists") || msg.contains("409") || msg.contains("conflict")
 }
 
 /// Collect the Iceberg view `properties` map from a parsed `CREATE VIEW`.
@@ -1941,10 +1929,7 @@ fn is_namespace_already_exists(err: &iceberg::Error) -> bool {
 /// denied instead of allowed), so it fails closed. The warning exists because the
 /// resulting denials are otherwise unexplainable to someone whose view works in
 /// Trino.
-fn view_properties(
-    cv: &sqlparser::ast::CreateView,
-    username: &str,
-) -> HashMap<String, String> {
+fn view_properties(cv: &sqlparser::ast::CreateView, username: &str) -> HashMap<String, String> {
     let mut props = HashMap::new();
     if let Some(comment) = &cv.comment {
         props.insert("comment".to_string(), comment.clone());
@@ -1956,8 +1941,13 @@ fn view_properties(
         _ => &[],
     };
     for opt in options {
-        let SqlOption::KeyValue { key, value } = opt else { continue };
-        if !key.value.eq_ignore_ascii_case(sqe_sql::VIEW_SECURITY_OPTION) {
+        let SqlOption::KeyValue { key, value } = opt else {
+            continue;
+        };
+        if !key
+            .value
+            .eq_ignore_ascii_case(sqe_sql::VIEW_SECURITY_OPTION)
+        {
             continue;
         }
         let mode = match value {
@@ -2023,7 +2013,10 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(
-            out.fields().iter().map(|f| f.name.as_str()).collect::<Vec<_>>(),
+            out.fields()
+                .iter()
+                .map(|f| f.name.as_str())
+                .collect::<Vec<_>>(),
             vec!["a"]
         );
         assert_eq!(out.fields()[0].id, 2, "retained field keeps its id");
@@ -2050,10 +2043,18 @@ mod tests {
             panic!("s should still be a struct");
         };
         assert_eq!(
-            inner.fields().iter().map(|f| f.name.as_str()).collect::<Vec<_>>(),
+            inner
+                .fields()
+                .iter()
+                .map(|f| f.name.as_str())
+                .collect::<Vec<_>>(),
             vec!["x"]
         );
-        assert_eq!(inner.fields()[0].id, 6, "nested retained field keeps its id");
+        assert_eq!(
+            inner.fields()[0].id,
+            6,
+            "nested retained field keeps its id"
+        );
     }
 
     #[test]
@@ -2071,7 +2072,10 @@ mod tests {
         let a = keyed_lock(&locks, "sales.orders".to_string());
         let b = keyed_lock(&locks, "sales.customers".to_string());
         // Different tables get independent locks => no false contention.
-        assert!(!StdArc::ptr_eq(&a, &b), "different keys must not share a lock");
+        assert!(
+            !StdArc::ptr_eq(&a, &b),
+            "different keys must not share a lock"
+        );
     }
 
     /// Two tasks contending on the SAME keyed lock observe mutual exclusion:
@@ -2111,7 +2115,10 @@ mod tests {
     fn test_parse_table_ref_one_part() {
         let name = ObjectName::from(vec![Ident::new("my_table")]);
         let ident = parse_table_ref(&name).unwrap();
-        assert_eq!(ident.namespace(), &NamespaceIdent::new("default".to_string()));
+        assert_eq!(
+            ident.namespace(),
+            &NamespaceIdent::new("default".to_string())
+        );
         assert_eq!(ident.name(), "my_table");
     }
 
@@ -2119,7 +2126,10 @@ mod tests {
     fn test_parse_table_ref_two_parts() {
         let name = ObjectName::from(vec![Ident::new("my_schema"), Ident::new("my_table")]);
         let ident = parse_table_ref(&name).unwrap();
-        assert_eq!(ident.namespace(), &NamespaceIdent::new("my_schema".to_string()));
+        assert_eq!(
+            ident.namespace(),
+            &NamespaceIdent::new("my_schema".to_string())
+        );
         assert_eq!(ident.name(), "my_table");
     }
 
@@ -2131,7 +2141,10 @@ mod tests {
             Ident::new("my_table"),
         ]);
         let ident = parse_table_ref(&name).unwrap();
-        assert_eq!(ident.namespace(), &NamespaceIdent::new("my_schema".to_string()));
+        assert_eq!(
+            ident.namespace(),
+            &NamespaceIdent::new("my_schema".to_string())
+        );
         assert_eq!(ident.name(), "my_table");
     }
 
@@ -2195,7 +2208,10 @@ mod tests {
     #[test]
     fn test_schema_catalog_qualifier_two_parts_returns_catalog() {
         let name = ObjectName::from(vec![Ident::new("ws_team_a"), Ident::new("dev_raw")]);
-        assert_eq!(schema_catalog_qualifier(&name), Some("ws_team_a".to_string()));
+        assert_eq!(
+            schema_catalog_qualifier(&name),
+            Some("ws_team_a".to_string())
+        );
     }
 
     #[test]

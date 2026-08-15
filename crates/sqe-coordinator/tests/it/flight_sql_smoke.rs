@@ -85,8 +85,7 @@ impl FlightServer {
         // the identity provider, which has its own tests.
         let provider = Arc::new(AnonymousProvider::new(AnonymousProviderConfig::default()));
         let session_manager = Arc::new(SessionManager::with_provider(provider));
-        let service =
-            SqeFlightSqlService::new(session_manager, Arc::new(handler), config);
+        let service = SqeFlightSqlService::new(session_manager, Arc::new(handler), config);
 
         // Port 0 plus `serve_with_incoming`: the OS picks a free port and the
         // listener reports it, so concurrent test binaries cannot collide the
