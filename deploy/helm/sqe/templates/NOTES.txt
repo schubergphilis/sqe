@@ -1,5 +1,17 @@
 SQE has been deployed!
 
+{{- if not .Values.coordinator.production_mode }}
+
+This install used the dev defaults (production_mode=false). For production:
+
+  helm upgrade --install {{ .Release.Name }} deploy/helm/sqe/ \
+    -f deploy/helm/sqe/values-production.yaml
+
+That overlay turns on production_mode, rate limiting, durable audit, and
+ServiceMonitor. You still must supply existing Secrets, TLS/ingress, and
+workerSecret when workers are on. Do not put credentials in values files.
+{{- end }}
+
 Coordinator: {{ include "sqe.fullname" . }}-coordinator
 {{- if .Values.worker.enabled }}
 Workers:     {{ .Values.worker.replicas }} replicas

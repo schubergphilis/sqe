@@ -1,11 +1,15 @@
+# Default values: easy `helm install` for development (production_mode=false).
+# For production overlay values-production.yaml (ISSUE-404):
+#   helm install sqe deploy/helm/sqe/ -f deploy/helm/sqe/values-production.yaml
+
 image:
   repository: sqe
   # DEP-08: leave `tag` empty so it resolves to the chart appVersion (a
-  # concrete version, currently 0.1.0) via the `sqe.image` helper, instead of
+  # concrete version, currently 0.37.0) via the `sqe.image` helper, instead of
   # the floating `latest` (non-reproducible: two installs a day apart could run
   # different binaries with no record, and IfNotPresent never re-pulls a cached
   # `latest`). For production, pin by digest:
-  #   tag: "0.1.0@sha256:<digest>"
+  #   tag: "0.37.0@sha256:<digest>"
   # and keep pullPolicy: IfNotPresent (safe for an immutable digest).
   tag: ""
   pullPolicy: IfNotPresent
@@ -29,7 +33,8 @@ coordinator:
   tolerations: []
   affinity: {}
 
-  # Production checklist (see full-audit 2026-07-10 P0):
+  # Production checklist (see full-audit 2026-07-10 P0 and ISSUE-404):
+  # Overlay values-production.yaml rather than flipping these one by one.
   # - Set coordinator.production_mode = true (via config or SQE_PRODUCTION_MODE)
   #   to enforce no anonymous/bearer_passthrough, rate_limit.enabled=true,
   #   allow_insecure_transport=false, non-empty worker_secret, etc.
