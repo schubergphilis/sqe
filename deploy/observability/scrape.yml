@@ -1,6 +1,9 @@
 # VictoriaMetrics scrape config for SQE benchmarks
 # Scrapes all possible SQE endpoints (single-node + distributed)
 # Targets that are down are silently skipped.
+#
+# Alert rules live in alerts.yml (#418). Point Prometheus `rule_files` at
+# that file, or wrap it in a PrometheusRule CRD.
 
 scrape_configs:
   # Single-node coordinator (native, port 19090)
