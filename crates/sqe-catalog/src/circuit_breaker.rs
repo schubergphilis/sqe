@@ -35,6 +35,10 @@ pub struct CircuitBreaker {
     /// Timestamp (epoch ms) of the most recent failure. Used to compute
     /// when the recovery window expires.
     last_failure_ms: AtomicU64,
+    /// When the current Half-Open probe was admitted. A dropped or
+    /// unanswered probe cannot latch the breaker: after one recovery
+    /// window (at least 1 ms) the next caller may replace it.
+    half_open_since_ms: AtomicU64,
     /// Current state: 0=Closed, 1=Open, 2=Half-Open.
     state: AtomicU32,
     /// Human-readable name for logging.
@@ -81,6 +85,7 @@ impl CircuitBreaker {
             failure_threshold,
             recovery_timeout,
             last_failure_ms: AtomicU64::new(0),
+            half_open_since_ms: AtomicU64::new(0),
             state: AtomicU32::new(STATE_CLOSED),
             name: name.into(),
         }
@@ -112,6 +117,8 @@ impl CircuitBreaker {
                         )
                         .is_ok()
                 {
+                    self.half_open_since_ms
+                        .store(now_millis(), Ordering::Release);
                     info!(
                         circuit = %self.name,
                         "Circuit breaker entering Half-Open — allowing probe request"
@@ -124,14 +131,35 @@ impl CircuitBreaker {
                     recovery_ms.saturating_sub(elapsed_ms)
                 ))
             }
-            // Already half-open: a probe is in flight (admitted by the CAS
-            // winner in the STATE_OPEN arm above). Deny every other concurrent
-            // caller until that probe resolves, so only ONE probe hits the
-            // backend instead of a thundering herd. Fail closed.
-            STATE_HALF_OPEN => Err(format!(
-                "Circuit breaker '{}' is Half-Open — probe already in flight",
-                self.name
-            )),
+            // A probe is in flight. Deny concurrent callers so we do not
+            // stampede the backend. If that probe never records an outcome
+            // (dropped future, or a 403 that used to record nothing), the
+            // lease expires after one recovery window and a replacement
+            // probe is admitted. Lease is at least 1 ms so a 0-timeout
+            // test still serializes the first probe.
+            STATE_HALF_OPEN => {
+                let started = self.half_open_since_ms.load(Ordering::Acquire);
+                let now = now_millis();
+                let elapsed_ms = now.saturating_sub(started);
+                let lease_ms = (self.recovery_timeout.as_millis() as u64).max(1);
+                if elapsed_ms >= lease_ms
+                    && self
+                        .half_open_since_ms
+                        .compare_exchange(started, now, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                {
+                    info!(
+                        circuit = %self.name,
+                        elapsed_ms,
+                        "Circuit breaker Half-Open probe lease expired — admitting replacement"
+                    );
+                    return Ok(());
+                }
+                Err(format!(
+                    "Circuit breaker '{}' is Half-Open — probe already in flight",
+                    self.name
+                ))
+            }
             // Unknown state: fail closed. A corrupted atomic must not admit
             // traffic to an upstream we cannot reason about.
             _ => Err(format!(
@@ -347,6 +375,29 @@ mod tests {
             ok_count.load(Ordering::SeqCst),
             1,
             "exactly one probe must be admitted in half-open"
+        );
+    }
+
+    #[test]
+    fn stale_half_open_probe_is_replaced_after_lease() {
+        let c = CircuitBreaker::new("test", 1, Duration::from_millis(5));
+        c.record_failure();
+        // Force the open recovery window to have elapsed.
+        c.last_failure_ms.store(0, Ordering::Relaxed);
+        assert!(c.check().is_ok(), "first probe admitted");
+        assert_eq!(c.state_label(), "half_open");
+        assert!(c.check().is_err(), "in-flight probe still exclusive");
+        // Expire the probe lease without recording success or failure
+        // (the latch the review found: dropped future / unanswered 403).
+        c.half_open_since_ms.store(0, Ordering::Relaxed);
+        assert!(
+            c.check().is_ok(),
+            "expired half-open lease must admit a replacement probe"
+        );
+        assert_eq!(c.state_label(), "half_open");
+        assert!(
+            c.check().is_err(),
+            "the replacement probe must still be exclusive"
         );
     }
 }
