@@ -5,6 +5,7 @@ metadata:
   name: {{ include "sqe.fullname" . }}
   labels:
     {{- include "sqe.labels" . | nindent 4 }}
+    app.kubernetes.io/component: coordinator
     {{- with .Values.serviceMonitor.labels }}
     {{- toYaml . | nindent 4 }}
     {{- end }}
@@ -12,7 +13,37 @@ spec:
   selector:
     matchLabels:
       {{- include "sqe.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: coordinator
   endpoints:
     - port: metrics
       interval: {{ .Values.serviceMonitor.interval }}
+      relabelings:
+        - action: replace
+          targetLabel: job
+          replacement: sqe-coordinator
+{{- if .Values.worker.enabled }}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "sqe.fullname" . }}-worker
+  labels:
+    {{- include "sqe.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker
+    {{- with .Values.serviceMonitor.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "sqe.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: worker
+  endpoints:
+    - port: metrics
+      interval: {{ .Values.serviceMonitor.interval }}
+      relabelings:
+        - action: replace
+          targetLabel: job
+          replacement: sqe-worker
+{{- end }}
 {{- end }}
