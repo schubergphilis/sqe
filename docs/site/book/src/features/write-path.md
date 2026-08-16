@@ -26,6 +26,8 @@ Flow:
 
 Add `PARTITIONED BY (year(ts), bucket(16, id), ...)` to partition on write. The standard Iceberg transforms (`year`, `month`, `day`, `hour`, `bucket`, `truncate`, `identity`) are parsed and applied. Partitioned writes use an unbounded writer by default; set `fanout_max_open_writers` or `fanout_buffer_budget` to opt into a bounded fanout writer that caps open per-partition writers and flushes the least-recently-written one when a limit is hit.
 
+Do not combine `PARTITIONED BY` with a sort-on-write `ORDER BY` on a large table. A partitioned CTAS fans the sort into one merge buffer per output partition, and DataFusion's `ExternalSorterMerge` cannot spill (`can_spill=false`). At SF10, monthly-partitioned TPC-H lineitem (~84 partitions) exhausted the pool. `SortMemoryRule` fails the plan with `ResourcesExhausted` when a single sort cannot reserve merge headroom; it does not yet account for N partition merges. Omit the sort hint when the partition key already clusters the files (the bench loader does this). Unpartitioned `ORDER BY` uses one sort stream and spills. Issue #412.
+
 ### CREATE OR REPLACE TABLE
 
 ```sql
