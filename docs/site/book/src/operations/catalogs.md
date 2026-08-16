@@ -181,19 +181,28 @@ errors at policy enforcement time, not at catalog build time.
 
 ## Lifecycle and persistence
 
-The runtime catalog registry is process-local and in-memory. A
-restart wipes every attached catalog and every created secret. There
-is no on-disk persistence in v1.
+ATTACH mounts are process-local and in-memory. A coordinator restart
+forgets every catalog attached via SQL. Static TOML catalogs (the
+`[catalog]` and `[catalogs.*]` blocks) are the right shape for "this
+is part of the deployment." ATTACH is the right shape for "this is
+part of this session."
 
-This is intentional. Persistent ATTACH (where catalogs survive a
-restart) is a feature operators ask for but most do not want once
-they think it through. A catalog attached at 9 AM on Monday is in
-the system at 3 AM on Sunday because someone forgot to DETACH it.
-The credentials behind it have rotated. Queries against it return
-401. The on-call engineer wakes up to a query failure for a catalog
-they did not know existed. Static TOML is the right place for
-"part of the deployment." ATTACH is the right place for "part of
-this session."
+`CREATE SECRET` is memory-only by default. Set
+`[session] secrets_path` (or `SQE_SESSION__SECRETS_PATH`) to snapshot
+the store as plaintext JSON after every create or drop. The file is
+written at mode 0600. Startup logs a warning because the bytes are
+credentials. Do not put the file on a shared volume.
+
+The snapshot restores secrets after a restart. It does not restore
+ATTACH mounts. Re-issue ATTACH after boot, or keep shared catalogs
+in TOML.
+
+Persistent ATTACH is a feature operators ask for but most do not
+want once they think it through. A catalog attached at 9 AM on
+Monday is in the system at 3 AM on Sunday because someone forgot
+to DETACH it. The credentials behind it have rotated. Queries
+against it return 401. The on-call engineer wakes up to a query
+failure for a catalog they did not know existed.
 
 ## Troubleshooting
 

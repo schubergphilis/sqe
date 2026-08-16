@@ -33,6 +33,9 @@ pub enum SecretStoreError {
     /// recovery code can react to it explicitly.
     #[error("secret store poisoned")]
     Poisoned,
+    /// File persist / restore failed.
+    #[error("secret store I/O: {0}")]
+    Io(String),
 }
 
 impl From<SecretStoreError> for crate::error::SqeError {
@@ -43,9 +46,9 @@ impl From<SecretStoreError> for crate::error::SqeError {
                 // `error_code() == DuplicateTable` classifier working.
                 crate::error::SqeError::Catalog(err.to_string())
             }
-            SecretStoreError::InUseBy(..) | SecretStoreError::NotFound(_) => {
-                crate::error::SqeError::Execution(err.to_string())
-            }
+            SecretStoreError::InUseBy(..)
+            | SecretStoreError::NotFound(_)
+            | SecretStoreError::Io(_) => crate::error::SqeError::Execution(err.to_string()),
             SecretStoreError::Poisoned => crate::error::SqeError::Internal(anyhow::anyhow!(err)),
         }
     }
@@ -53,13 +56,15 @@ impl From<SecretStoreError> for crate::error::SqeError {
 
 /// Credential material, scoped to the running process.
 ///
-/// Stored in [`SecretStore`] keyed by name. Memory only; not persisted.
+/// Stored in [`SecretStore`] keyed by name. Optionally snapshotted to a
+/// 0600 JSON file when [`SecretStore::with_persistence`] is used.
 /// Sensitive bytes are zeroized on drop.
 ///
 /// `Debug` is hand-implemented so a stray `{:?}` in a panic handler or
 /// `anyhow!` chain prints only the variant name and field presence — never
 /// the raw token, access key, or password (issue #16).
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
 pub enum Secret {
     /// AWS credentials. Any subset can be `None` to defer to the AWS
     /// credential chain (env, shared credentials, IMDS, ECS, EKS Pod
@@ -154,19 +159,140 @@ impl Drop for Secret {
     }
 }
 
-/// Process-global, in-memory secret store.
+/// Process-global secret store.
 ///
 /// Cloning a `SecretStore` shares the same backing map; the store is
 /// designed to be cloned cheaply into [`crate::QueryHandler`] and
 /// [`crate::EmbeddedClient`] alike.
+///
+/// Default is memory-only. [`SecretStore::with_persistence`] loads from and
+/// writes to a JSON file (mode 0600) so `CREATE SECRET` survives a
+/// coordinator restart (issue #409). `ATTACH` catalog mounts are still
+/// process-local and must be re-issued after restart.
 #[derive(Debug, Default, Clone)]
 pub struct SecretStore {
     inner: Arc<RwLock<HashMap<String, Secret>>>,
+    persist_path: Option<std::path::PathBuf>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PersistFile {
+    version: u32,
+    secrets: HashMap<String, Secret>,
 }
 
 impl SecretStore {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Memory store with no file. Empty `path` is treated as memory-only.
+    pub fn from_optional_path(path: &str) -> Result<Self, SecretStoreError> {
+        let trimmed = path.trim();
+        if trimmed.is_empty() {
+            Ok(Self::new())
+        } else {
+            Self::with_persistence(trimmed)
+        }
+    }
+
+    /// Load secrets from `path` if it exists; persist there after every
+    /// create/drop. Missing file starts empty. Warns: the file holds
+    /// plaintext credentials and must be mode 0600.
+    pub fn with_persistence(path: impl AsRef<std::path::Path>) -> Result<Self, SecretStoreError> {
+        let path = path.as_ref().to_path_buf();
+        tracing::warn!(
+            path = %path.display(),
+            "CREATE SECRET persistence is ON: the file stores credentials in \
+             plaintext JSON. chmod 0600; do not put it on a shared volume"
+        );
+        let store = Self {
+            inner: Arc::new(RwLock::new(HashMap::new())),
+            persist_path: Some(path.clone()),
+        };
+        if path.exists() {
+            let raw = std::fs::read_to_string(&path)
+                .map_err(|e| SecretStoreError::Io(format!("read {}: {e}", path.display())))?;
+            let file: PersistFile = serde_json::from_str(&raw)
+                .map_err(|e| SecretStoreError::Io(format!("parse {}: {e}", path.display())))?;
+            if file.version != 1 {
+                return Err(SecretStoreError::Io(format!(
+                    "unsupported secret snapshot version {} in {}",
+                    file.version,
+                    path.display()
+                )));
+            }
+            let count = file.secrets.len();
+            *store
+                .inner
+                .write()
+                .map_err(|_| SecretStoreError::Poisoned)? = file.secrets;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = std::fs::metadata(&path)
+                    .map(|m| m.permissions().mode() & 0o777)
+                    .unwrap_or(0);
+                if mode != 0o600 {
+                    tracing::warn!(
+                        path = %path.display(),
+                        mode = format!("{mode:03o}"),
+                        "CREATE SECRET snapshot was not mode 0600; chmod'ing"
+                    );
+                    let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+                }
+            }
+            tracing::info!(
+                path = %path.display(),
+                count,
+                "Restored CREATE SECRET snapshot"
+            );
+        }
+        Ok(store)
+    }
+
+    fn persist_locked(&self, map: &HashMap<String, Secret>) -> Result<(), SecretStoreError> {
+        let Some(path) = self.persist_path.as_ref() else {
+            return Ok(());
+        };
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    SecretStoreError::Io(format!("mkdir {}: {e}", parent.display()))
+                })?;
+            }
+        }
+        let file = PersistFile {
+            version: 1,
+            secrets: map.clone(),
+        };
+        let json = serde_json::to_string_pretty(&file)
+            .map_err(|e| SecretStoreError::Io(format!("serialize secrets: {e}")))?;
+        let tmp = match path.file_name() {
+            Some(name) => path.with_file_name(format!("{}.tmp", name.to_string_lossy())),
+            None => {
+                return Err(SecretStoreError::Io(format!(
+                    "secrets_path {} has no file name",
+                    path.display()
+                )));
+            }
+        };
+        std::fs::write(&tmp, json)
+            .map_err(|e| SecretStoreError::Io(format!("write {}: {e}", tmp.display())))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
+                .map_err(|e| SecretStoreError::Io(format!("chmod {}: {e}", tmp.display())))?;
+        }
+        std::fs::rename(&tmp, path).map_err(|e| {
+            SecretStoreError::Io(format!(
+                "rename {} -> {}: {e}",
+                tmp.display(),
+                path.display()
+            ))
+        })?;
+        Ok(())
     }
 
     /// Create a new secret. Errors if the name already exists.
@@ -176,6 +302,10 @@ impl SecretStore {
             return Err(SecretStoreError::AlreadyExists(name.to_string()));
         }
         w.insert(name.to_string(), secret);
+        if let Err(e) = self.persist_locked(&w) {
+            w.remove(name);
+            return Err(e);
+        }
         Ok(())
     }
 
@@ -189,8 +319,13 @@ impl SecretStore {
             ));
         }
         let mut w = self.inner.write().map_err(|_| SecretStoreError::Poisoned)?;
-        w.remove(name)
+        let removed = w
+            .remove(name)
             .ok_or_else(|| SecretStoreError::NotFound(name.to_string()))?;
+        if let Err(e) = self.persist_locked(&w) {
+            w.insert(name.to_string(), removed);
+            return Err(e);
+        }
         Ok(())
     }
 
@@ -424,6 +559,132 @@ mod tests {
         store.drop_secret("bearer_test", &[]).unwrap();
         // If Drop misbehaves, the test process aborts. Reaching this line is
         // the assertion.
+    }
+
+    fn temp_secrets_dir() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "sqe-secrets-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn persist_round_trips_across_new_store() {
+        let dir = temp_secrets_dir();
+        let path = dir.join("secrets.json");
+        {
+            let store = SecretStore::with_persistence(&path).unwrap();
+            store
+                .create(
+                    "rest",
+                    Secret::Bearer {
+                        token: "tok-persist".to_string(),
+                    },
+                )
+                .unwrap();
+            store.create("aws", aws_full()).unwrap();
+        }
+        let restored = SecretStore::with_persistence(&path).unwrap();
+        match &restored.get("rest").unwrap() {
+            Secret::Bearer { token } => assert_eq!(token, "tok-persist"),
+            other => panic!("expected bearer, got {}", other.type_name()),
+        }
+        match &restored.get("aws").unwrap() {
+            Secret::Aws {
+                access_key, region, ..
+            } => {
+                assert_eq!(access_key.as_deref(), Some("AKIAEXAMPLE"));
+                assert_eq!(region.as_deref(), Some("us-east-1"));
+            }
+            other => panic!("expected aws, got {}", other.type_name()),
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "snapshot must be mode 0600");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn persist_drop_removes_secret_from_snapshot() {
+        let dir = temp_secrets_dir();
+        let path = dir.join("secrets.json");
+        let store = SecretStore::with_persistence(&path).unwrap();
+        store
+            .create(
+                "rest",
+                Secret::Bearer {
+                    token: "tok-persist".to_string(),
+                },
+            )
+            .unwrap();
+        store.drop_secret("rest", &[]).unwrap();
+        let restored = SecretStore::with_persistence(&path).unwrap();
+        assert!(matches!(
+            restored.get("rest"),
+            Err(SecretStoreError::NotFound(_))
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn persist_create_rolls_back_memory_on_io_error() {
+        let dir = temp_secrets_dir();
+        let blocker = dir.join("not-a-dir");
+        std::fs::write(&blocker, b"x").unwrap();
+        let path = blocker.join("secrets.json");
+        let store = SecretStore::with_persistence(&path).unwrap();
+        let err = store
+            .create(
+                "rest",
+                Secret::Bearer {
+                    token: "tok-persist".to_string(),
+                },
+            )
+            .expect_err("persist must fail when parent is a file");
+        assert!(matches!(err, SecretStoreError::Io(_)), "got {err:?}");
+        assert!(matches!(
+            store.get("rest"),
+            Err(SecretStoreError::NotFound(_))
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn persist_rejects_unsupported_snapshot_version() {
+        let dir = temp_secrets_dir();
+        let path = dir.join("secrets.json");
+        std::fs::write(&path, r#"{"version":99,"secrets":{}}"#).unwrap();
+        let err = SecretStore::with_persistence(&path).expect_err("version 99 must fail");
+        assert!(
+            err.to_string()
+                .contains("unsupported secret snapshot version 99"),
+            "got {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn from_optional_path_empty_is_memory_only() {
+        let store = SecretStore::from_optional_path("").unwrap();
+        store
+            .create(
+                "rest",
+                Secret::Bearer {
+                    token: "tok".to_string(),
+                },
+            )
+            .unwrap();
+        assert_eq!(store.get("rest").unwrap().type_name(), "bearer");
+        let blank = SecretStore::from_optional_path("   ").unwrap();
+        assert!(blank.list().unwrap().is_empty());
     }
 
     #[test]

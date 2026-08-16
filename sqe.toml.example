@@ -245,6 +245,9 @@ engine = "passthrough"
 [session]
 idle_timeout_secs = 900       # 15 minutes — sessions idle longer than this are expired
 absolute_timeout_secs = 28800  # 8 hours — sessions older than this are expired regardless of activity
+# Optional CREATE SECRET snapshot (plaintext JSON, chmod 0600). Empty = memory
+# only (lost on restart). ATTACH mounts are still process-local. #409
+# secrets_path = "/var/lib/sqe/secrets.json"
 
 [metrics]
 prometheus_port = 9090

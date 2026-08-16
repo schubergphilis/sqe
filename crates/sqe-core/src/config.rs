@@ -3463,6 +3463,10 @@ pub struct SessionConfig {
     /// Path for file-based session persistence. Default: "/tmp/sqe-sessions.json"
     #[serde(default = "default_session_persistence_path")]
     pub persistence_path: String,
+    /// Optional path for a CREATE SECRET snapshot (plaintext JSON, mode 0600).
+    /// Empty (default) keeps the store memory-only. Issue #409.
+    #[serde(default)]
+    pub secrets_path: String,
     /// How often to snapshot sessions to disk (seconds). Default: 60.
     #[serde(default = "default_session_snapshot_interval")]
     pub snapshot_interval_secs: u64,
@@ -3478,6 +3482,7 @@ impl Default for SessionConfig {
             absolute_timeout_secs: default_absolute_timeout(),
             persistence: default_session_persistence(),
             persistence_path: default_session_persistence_path(),
+            secrets_path: String::new(),
             snapshot_interval_secs: default_session_snapshot_interval(),
             expiry_sweep_interval_secs: default_session_expiry_sweep_interval(),
         }
@@ -5038,6 +5043,7 @@ impl SqeConfig {
             "SQE_SESSION__EXPIRY_SWEEP_INTERVAL_SECS",
             &mut self.session.expiry_sweep_interval_secs,
         );
+        env_override_str("SQE_SESSION__SECRETS_PATH", &mut self.session.secrets_path);
 
         // Query
         env_override_u64("SQE_QUERY__TIMEOUT_SECS", &mut self.query.timeout_secs);

@@ -1645,12 +1645,15 @@ impl QueryHandler {
                 err.error_code(),
                 sqe_core::SqeErrorCode::AuthenticationFailed | sqe_core::SqeErrorCode::AccessDenied
             ) {
+                let token_fp =
+                    sqe_catalog::rest_catalog_token_fingerprint(session.access_token().expose());
                 warn!(
                     username = %session.user.username,
+                    token_fingerprint = %token_fp,
                     error_code = ?err.error_code(),
-                    "Auth failure on catalog; evicting REST_CATALOG_CACHE and SESSION_CONTEXT_CACHE for the user"
+                    "Auth failure on catalog; evicting this token's REST_CATALOG_CACHE entries and SESSION_CONTEXT_CACHE"
                 );
-                sqe_catalog::invalidate_rest_catalog_cache_all().await;
+                sqe_catalog::invalidate_rest_catalog_cache_for_token(&token_fp).await;
                 crate::session_context::invalidate_session_cache(&session.user.username).await;
             }
         }
