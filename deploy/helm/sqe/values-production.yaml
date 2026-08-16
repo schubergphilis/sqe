@@ -21,6 +21,11 @@ coordinator:
 config:
   rate_limit:
     enabled: true
+  # FileIO must not fall back to the shared [storage] S3 keys after
+  # LOAD_TABLE. production_mode refuses to start if this is false on a
+  # REST catalog (issue #395).
+  catalog:
+    require_vended_credentials: true
 
 # ── Durable audit log ───────────────────────────────────────
 # Mounts a ReadWriteOnce PVC at audit.path so records survive reschedule.
