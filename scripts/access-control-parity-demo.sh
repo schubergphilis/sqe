@@ -38,9 +38,12 @@
 #
 # Covered:
 #   1. catalog denial, role GRANT, user outside the role, and REVOKE
-#   2. SELECT versus INSERT, including successful writes seen by both engines
+#   2. SELECT versus INSERT, including a denied INSERT in both engines
+#      (compare_write_denied) and successful writes seen by both engines
+#      (#426 cell 1)
 #   3. five resource masks: MASK_NULL, MASK_SHOW_LAST_4, MASK_HASH,
-#      MASK_DATE_SHOW_YEAR, and MASK on a name
+#      MASK_DATE_SHOW_YEAR, and MASK on a name; then ADD COLUMN on that
+#      masked table through SQE and through Spark (#426 cell 2)
 #   4. GDPR data-residency row filtering and its unfiltered-role control
 #   5. tag masking, mask composition, resource/tag precedence, and a row filter
 #      that reads a tag-masked column
@@ -62,8 +65,12 @@
 # implement a mask at all fails it loudly. Pinned row dumps are reserved for the
 # narrow cases where the rendering IS the subject.
 #
-# CALIBRATION STATUS: every expectation below was confirmed against a live
-# quickstart stack on 2026-08-12, 43 of 43 comparisons green on the first pass.
+# CALIBRATION STATUS: 43 of 43 comparisons were green against a live
+# quickstart stack on 2026-08-12. Issue #426 adds two compare_equal probes
+# (45 total). Those two are uncalibrated: if Spark ADD COLUMN diverges,
+# keep the probe and document the rendering or error the same way as the
+# named-mask cells. The Spark ADD uses a non-fatal helper so an uncalibrated
+# step cannot abort sections 4 through 7.
 # Two inferences that could have become a third documented divergence did not:
 # Kyuubi truncates MASK_DATE_SHOW_YEAR to 1 January exactly as SQE does, and it
 # applies a row filter and column masks to a JOINED relation the same way. Both
@@ -593,6 +600,29 @@ best_effort_action() { # sql description
   fi
 }
 
+# Same contract as spark_action_as, but a failure records and continues.
+# Use this for uncalibrated Spark probes. spark_action_as aborts the demo.
+spark_best_effort_action_as() { # user sql description
+  local user="$1" sql="$2" desc="$3" out rc=0 deadline
+  echo
+  bold "$desc"
+  echo "     SQL (Spark/$user): $sql"
+  deadline=$(( $(date +%s) + POLICY_BUDGET ))
+  while :; do
+    rc=0
+    out="$(spark_tsv "$user" "$sql" 2>&1)" || rc=$?
+    [ "$rc" -eq 0 ] && break
+    [ "$(date +%s)" -ge "$deadline" ] && break
+    dim "     waiting for the grant to reach Polaris ..."
+    sleep 5
+  done
+  printf '%s\n' "$out" | sed 's/^/       /'
+  if [ "$rc" -ne 0 ]; then
+    [ -f "$TMP_DIR/spark.err" ] && sed 's/^/       /' "$TMP_DIR/spark.err"
+    dim "     ignored: uncalibrated Spark action diverged; later sections still run"
+  fi
+}
+
 # ── fixture and transcript ───────────────────────────────────────────────────
 
 # The first six names are pre-bank-fixture policy names (amount/ssn/email/geo).
@@ -608,6 +638,8 @@ done
 
 # SET/UNSET TAGS is idempotent enough for an interrupted fixture. A missing table
 # is expected on the first run and is intentionally ignored here.
+best_effort_action "ALTER TABLE $C DROP COLUMN acparity_nick" \
+  "Drop the #426 ADD COLUMN probe if an interrupted run left it"
 best_effort_action "ALTER TABLE $C UNSET TAGS (phone, residency_region, national_id, nationality, full_name)" \
   "Reset projected customer tag associations left by an interrupted run"
 best_effort_action "ALTER TABLE $P UNSET TAGS (counterparty_iban)" \
@@ -810,6 +842,9 @@ section 2 "Role membership and write authority"
 compare_denied dave "$Q_CUST" "Dave is in no role, so the analyst grant does not reach him"
 INSERT_PROBE="INSERT INTO $C VALUES (9001,'Probe Row','999999999',DATE '2000-01-02',\
 'NL00PROBE0000000000','NL','EU','AMS-01',false,false,0,'+31-20-555-9001')"
+# #426 cell 1: the same denied INSERT in both engines, same fixture state.
+# Spark refuses at ADD_TABLE_SNAPSHOT (files may already be staged). SQE must
+# refuse too, not only the Spark side.
 compare_write_denied alice "$INSERT_PROBE" "SELECT does not imply INSERT"
 action "GRANT INSERT ON $C TO ROLE \"analyst\"" \
   "Grant INSERT separately to the analyst role"
@@ -900,6 +935,28 @@ sum(CASE WHEN $DOB_LEAK THEN 1 ELSE 0 END) AS dob_leaks, \
 sum(CASE WHEN $DOB_YEAR_ONLY THEN 1 ELSE 0 END) AS dob_year_only FROM $C" \
   "Alice is outside engineer and remains the raw-value control" \
   "12 | 0 | 12 | 12 | 12 | 12 | 0"
+
+# #426 cell 2: ADD COLUMN on a table that already has column masks.
+# SQE used to become unqueryable (scan schema vs mask projection). That is
+# fixed and guarded in spark_mask_parity_e2e. Spark was never run. Add the
+# column through each engine in turn and assert the masked SELECT still
+# returns twelve rows, twelve NULLs in the new column, and no national-id leak.
+action "ALTER TABLE $C ADD COLUMN acparity_nick VARCHAR" \
+  "Add a nullable column to the already-masked register through SQE"
+compare_equal bob "SELECT count(*) AS rows_seen, \
+sum(CASE WHEN acparity_nick IS NULL THEN 1 ELSE 0 END) AS nick_nulls, \
+sum(CASE WHEN $NID_LEAK THEN 1 ELSE 0 END) AS id_leaks FROM $C" \
+  "Masked SELECT stays queryable after SQE ADD COLUMN" "12 | 12 | 0"
+action "ALTER TABLE $C DROP COLUMN acparity_nick" \
+  "Remove the SQE-added column before the Spark-authored ADD"
+spark_best_effort_action_as carol "ALTER TABLE $C ADD COLUMN acparity_nick STRING" \
+  "Add the same column through Spark on the masked table"
+compare_equal bob "SELECT count(*) AS rows_seen, \
+sum(CASE WHEN acparity_nick IS NULL THEN 1 ELSE 0 END) AS nick_nulls, \
+sum(CASE WHEN $NID_LEAK THEN 1 ELSE 0 END) AS id_leaks FROM $C" \
+  "Masked SELECT stays queryable after Spark ADD COLUMN" "12 | 12 | 0"
+best_effort_action "ALTER TABLE $C DROP COLUMN acparity_nick" \
+  "Drop the Spark-added column so later sections see the original schema"
 
 section 4 "Row filtering: GDPR data residency"
 action "CREATE OR REPLACE POLICY \"${POLICY_PREFIX}eu-rows\" ON TABLE $C \
@@ -1159,6 +1216,8 @@ sqe_assert ok "CHECK ACCESS SELECT ON $C FOR USER \"bob\"" \
   "Confirm no grant path is left before asserting the denial" 'false' 'true'
 compare_denied bob "$Q_CUST" "After REVOKE, both engines deny Bob again"
 
+best_effort_action "ALTER TABLE $C DROP COLUMN acparity_nick" \
+  "Security teardown: drop the #426 ADD COLUMN probe if still present"
 action "ALTER TABLE $C UNSET TAGS (phone, residency_region, national_id, nationality, full_name)" \
   "Security teardown: remove projected register tag associations"
 action "ALTER TABLE $P UNSET TAGS (counterparty_iban)" \
