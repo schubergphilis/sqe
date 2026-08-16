@@ -28,7 +28,7 @@
 
 > **DOCUMENTED 2026-08-16, issue #396:** `REVOKE SELECT` is not a read gate. `table-properties-read` unlocks `LOAD_TABLE`; INSERT keeps that type, so a surviving writer still reads. Direction 3 for the release: document the implication graph, tell operators to use `REVOKE ALL PRIVILEGES` + `CHECK ACCESS`. A profile rewrite cannot split SELECT from INSERT without breaking writer `LOAD_TABLE`. See grant-revoke.md "Closing a gate" and limitations.md "Grant model gaps".
 
-> **IN PROGRESS 2026-08-16, issue #426:** Denied INSERT was already `compare_write_denied` in both engines. The missing cell is ADD COLUMN on a masked table through Spark as well as SQE. Probes added to `scripts/access-control-parity-demo.sh`; re-calibrate on the Ranger + Spark stack.
+> **IN PROGRESS 2026-08-16, issue #426:** Denied INSERT was already `compare_write_denied` in both engines. The missing cell is ADD COLUMN on a masked table through Spark as well as SQE. Probes added to `scripts/access-control-parity-demo.sh`; Spark ADD COLUMN is non-fatal so an uncalibrated probe cannot abort later sections. Re-calibrate on the Ranger + Spark stack.
 
 > **FIXED 2026-08-12, suite hygiene: `make test-access-control` leaked its own grants between runs, so two denial-baseline tests failed on any stack the suite had already used.**
 >

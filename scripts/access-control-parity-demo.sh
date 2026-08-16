@@ -65,10 +65,12 @@
 # implement a mask at all fails it loudly. Pinned row dumps are reserved for the
 # narrow cases where the rendering IS the subject.
 #
-# CALIBRATION STATUS: every expectation below was confirmed against a live
-# quickstart stack on 2026-08-12, 43 of 43 comparisons green on the first pass.
-# Issue #426 adds two probes (denied INSERT was already both engines;
-# ADD COLUMN on a masked table is new and must be re-calibrated live).
+# CALIBRATION STATUS: 43 of 43 comparisons were green against a live
+# quickstart stack on 2026-08-12. Issue #426 adds two compare_equal probes
+# (45 total). Those two are uncalibrated: if Spark ADD COLUMN diverges,
+# keep the probe and document the rendering or error the same way as the
+# named-mask cells. The Spark ADD uses a non-fatal helper so an uncalibrated
+# step cannot abort sections 4 through 7.
 # Two inferences that could have become a third documented divergence did not:
 # Kyuubi truncates MASK_DATE_SHOW_YEAR to 1 January exactly as SQE does, and it
 # applies a row filter and column masks to a JOINED relation the same way. Both
@@ -598,6 +600,29 @@ best_effort_action() { # sql description
   fi
 }
 
+# Same contract as spark_action_as, but a failure records and continues.
+# Use this for uncalibrated Spark probes. spark_action_as aborts the demo.
+spark_best_effort_action_as() { # user sql description
+  local user="$1" sql="$2" desc="$3" out rc=0 deadline
+  echo
+  bold "$desc"
+  echo "     SQL (Spark/$user): $sql"
+  deadline=$(( $(date +%s) + POLICY_BUDGET ))
+  while :; do
+    rc=0
+    out="$(spark_tsv "$user" "$sql" 2>&1)" || rc=$?
+    [ "$rc" -eq 0 ] && break
+    [ "$(date +%s)" -ge "$deadline" ] && break
+    dim "     waiting for the grant to reach Polaris ..."
+    sleep 5
+  done
+  printf '%s\n' "$out" | sed 's/^/       /'
+  if [ "$rc" -ne 0 ]; then
+    [ -f "$TMP_DIR/spark.err" ] && sed 's/^/       /' "$TMP_DIR/spark.err"
+    dim "     ignored: uncalibrated Spark action diverged; later sections still run"
+  fi
+}
+
 # ── fixture and transcript ───────────────────────────────────────────────────
 
 # The first six names are pre-bank-fixture policy names (amount/ssn/email/geo).
@@ -924,13 +949,13 @@ sum(CASE WHEN $NID_LEAK THEN 1 ELSE 0 END) AS id_leaks FROM $C" \
   "Masked SELECT stays queryable after SQE ADD COLUMN" "12 | 12 | 0"
 action "ALTER TABLE $C DROP COLUMN acparity_nick" \
   "Remove the SQE-added column before the Spark-authored ADD"
-spark_action_as carol "ALTER TABLE $C ADD COLUMN acparity_nick STRING" \
+spark_best_effort_action_as carol "ALTER TABLE $C ADD COLUMN acparity_nick STRING" \
   "Add the same column through Spark on the masked table"
 compare_equal bob "SELECT count(*) AS rows_seen, \
 sum(CASE WHEN acparity_nick IS NULL THEN 1 ELSE 0 END) AS nick_nulls, \
 sum(CASE WHEN $NID_LEAK THEN 1 ELSE 0 END) AS id_leaks FROM $C" \
   "Masked SELECT stays queryable after Spark ADD COLUMN" "12 | 12 | 0"
-action "ALTER TABLE $C DROP COLUMN acparity_nick" \
+best_effort_action "ALTER TABLE $C DROP COLUMN acparity_nick" \
   "Drop the Spark-added column so later sections see the original schema"
 
 section 4 "Row filtering: GDPR data residency"
