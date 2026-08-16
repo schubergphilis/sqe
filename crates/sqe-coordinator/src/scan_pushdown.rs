@@ -77,11 +77,21 @@ pub fn is_trivially_true(expr: &Arc<dyn PhysicalExpr>) -> bool {
 /// Convert a dynamic-filter snapshot, keeping whatever top-level AND
 /// conjuncts are expressible as logical `Expr`s and dropping the rest.
 ///
-/// DataFusion 53's hash-join filter snapshots look like
-/// `lo_partkey >= 8 AND lo_partkey <= 79984 AND hash_lookup` — min/max key
-/// bounds plus an opaque hash-set membership probe that has no logical
-/// equivalent. All-or-nothing conversion threw away the usable range bounds
-/// because of that last term. Dropping a CONJUNCT only widens a filter, so
+/// DataFusion 53/54 hash-join filter snapshots look like
+/// `lo_partkey >= 8 AND lo_partkey <= 79984 AND hash_lookup` -- min/max key
+/// bounds plus an opaque `HashTableLookupExpr` membership probe that has no
+/// logical equivalent and no public key iterator. DF 54's
+/// `PhysicalDynamicFilterNode` proto serializes that probe as `lit(true)`
+/// (datafusion-proto `to_proto.rs`: the runtime hash table cannot leave the
+/// process). Shipping the proto to a worker would therefore drop membership
+/// the same way this converter does. Issue #415.
+///
+/// Below `query.runtime_filter_inlist_max_values` (default 65536) DataFusion
+/// materializes an `InListExpr` instead; that path converts and rides
+/// `ScanTask::predicate_proto`. Above the cap, only bounds survive.
+///
+/// All-or-nothing conversion threw away the usable range bounds because of
+/// the hash_lookup term. Dropping a CONJUNCT only widens a filter, so
 /// pushing the survivors to a worker is always sound (the coordinator's
 /// join stays authoritative); dropping inside OR/NOT would not be, which is
 /// why the split happens only at top-level ANDs and the strict converter
@@ -394,6 +404,25 @@ mod tests {
         .unwrap();
         let logical = physical_filter_to_logical(&in_list).expect("convertible");
         assert_eq!(logical, col("b").in_list(vec![lit(1i64), lit(2i64)], false));
+    }
+
+    /// The InList path is how membership reaches workers (issue #415).
+    /// HashTableLookupExpr (used above runtime_filter_inlist_max_values)
+    /// has no logical form and DF proto rewrites it to lit(true).
+    #[test]
+    fn large_inlist_membership_converts_to_logical() {
+        let s = schema();
+        let values: Vec<Arc<dyn PhysicalExpr>> = (0..512).map(|i| plit(i as i64)).collect();
+        let expected: Vec<Expr> = (0..512).map(|i| lit(i as i64)).collect();
+        let in_list = datafusion::physical_expr::expressions::in_list(
+            pcol("b", &s).unwrap(),
+            values,
+            &false,
+            &s,
+        )
+        .unwrap();
+        let logical = physical_filter_to_logical(&in_list).expect("convertible");
+        assert_eq!(logical, col("b").in_list(expected, false));
     }
 
     /// Unsupported shapes (e.g. a CASE expression) must yield None — the
