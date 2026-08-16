@@ -22,6 +22,8 @@
 >
 > Two ways out were considered and neither was taken. Enabling `ranger.admin.allow.unauthenticated.download.access` (a property distinct from `...unauthenticated.access`, and defaulting to it) would reopen anonymous READ of the whole policy set while keeping grant/revoke authenticated: narrower than 2.8.0, still a real concession. A rewriting proxy in front of Ranger, mapping `/service/{x}/download/` to `/service/{x}/secure/download/` and passing the plugin's existing basic auth through, relaxes nothing but puts a shim into a reference quickstart and would weaken the parity claim, since SQE needs no such shim. Decision 2026-08-14: stay on 2.8.0, which is measured at 43 of 43.
 
+> **DOCUMENTED 2026-08-16, issue #412:** Partitioned CTAS + sort-on-write still cannot spill. `SortMemoryRule` fails a single sort that cannot reserve merge headroom; it does not yet budget N partition merges. Workaround: omit `ORDER BY` when `PARTITIONED BY` already clusters. Engine-level bounded/spillable partition writers remain open.
+
 > **FIXED 2026-08-12, suite hygiene: `make test-access-control` leaked its own grants between runs, so two denial-baseline tests failed on any stack the suite had already used.**
 >
 > `denied_before_any_grant` and `all_tables_in_schema_grant_covers_the_namespace` both time out after 120 s with `still allowed for alice with 3 rows`. The cause is in Ranger, not in the assertion: a policy named `grant-1786370165684` grants role `analyst` sixteen access types on `sales_wh.ac.orders`, and alice is in `analyst`.
