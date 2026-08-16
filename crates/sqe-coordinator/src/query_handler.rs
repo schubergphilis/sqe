@@ -89,6 +89,15 @@ pub fn timeout_for_session(config: &QueryConfig, session: &Session) -> u64 {
     override_timeout.unwrap_or(config.timeout_secs)
 }
 
+/// Reject SQL larger than `query.max_sql_bytes` before parse (issue #403).
+///
+/// A user-facing `InvalidArguments` error, not Internal: the client sent
+/// too much text and must see the cap so they can shorten the statement
+/// or raise the limit.
+fn reject_oversized_sql(query: &QueryConfig, sql: &str) -> sqe_core::Result<()> {
+    query.check_sql_bytes(sql)
+}
+
 /// Handles query execution by routing parsed SQL through the appropriate
 /// pipeline: DataFusion for queries, catalog metadata for SHOW commands,
 /// and policy enforcement for all plans.
@@ -666,6 +675,10 @@ impl QueryHandler {
         sql: &str,
         client_ip: Option<String>,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
+        // Issue #403: reject oversized SQL before parse so a client cannot
+        // burn coordinator memory/CPU on an arbitrarily large statement.
+        reject_oversized_sql(&self.config.query, sql)?;
+
         // Memory pressure admission control: reject new queries when the
         // coordinator's FairSpillPool is >95% utilized (Red).
         let pressure = crate::memory::check_pressure(&self.runtime.memory_pool);
@@ -2271,6 +2284,9 @@ impl QueryHandler {
         sql: &str,
         client_ip: Option<String>,
     ) -> sqe_core::Result<(SchemaRef, SendableRecordBatchStream)> {
+        // Issue #403: same pre-parse size cap as execute().
+        reject_oversized_sql(&self.config.query, sql)?;
+
         // --- Admission control -------------------------------------------------
         let pressure = crate::memory::check_pressure(&self.runtime.memory_pool);
         if let Some(ref metrics) = self.metrics {
@@ -2749,6 +2765,11 @@ impl QueryHandler {
     /// its declared and actual result schemas differ. Other non-query
     /// statements remain side-effect-only and use an empty schema.
     pub async fn get_schema(&self, session: &Session, sql: &str) -> sqe_core::Result<SchemaRef> {
+        // GetFlightInfo / prepared-statement creation plan through here
+        // without calling execute(). Cap the statement first so ADBC/JDBC
+        // cannot burn the parser on an arbitrarily large query (#403).
+        reject_oversized_sql(&self.config.query, sql)?;
+
         // Run the pre-parse pipeline before handing to the classifier;
         // see `pipeline_types.rs` for the trust-boundary contract (issue #117).
         let kind = sqe_sql::parse_and_classify_typed(&sqe_sql::pre_parse_pipeline(
@@ -7301,6 +7322,24 @@ mod tests {
     use super::*;
     use sqe_core::config::QueryConfig;
     use sqe_core::session::Session;
+
+    #[test]
+    fn max_sql_bytes_rejects_oversize_string() {
+        let query = QueryConfig::default();
+        let oversize = "x".repeat(query.max_sql_bytes + 1);
+        let err = reject_oversized_sql(&query, &oversize).unwrap_err();
+        assert_eq!(err.error_code(), sqe_core::SqeErrorCode::InvalidArguments);
+        assert_ne!(err.client_message(), "Internal error");
+        assert!(err.client_message().contains("max_sql_bytes"));
+    }
+
+    #[test]
+    fn max_sql_bytes_accepts_one_below_limit() {
+        let query = QueryConfig::default();
+        let just_under = "x".repeat(query.max_sql_bytes.saturating_sub(1));
+        assert!(reject_oversized_sql(&query, &just_under).is_ok());
+        assert!(reject_oversized_sql(&query, &"x".repeat(query.max_sql_bytes)).is_ok());
+    }
 
     fn parse_one(sql: &str) -> Statement {
         use sqlparser::dialect::GenericDialect;
