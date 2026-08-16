@@ -215,9 +215,32 @@ allow_insecure_transport = true  # dev only -- enable TLS for production
 # default SessionBearer for catalog auth. Set true only for a deliberate
 # single-service deployment where every caller legitimately shares one identity.
 # allow_shared_service_identity = false
+#
+# allow_unkeyed_hash_masks (issue #402): Ranger MASK_HASH falls back to
+# unsalted SHA-256 when policy.mask_key is empty (rainbow-tableable on
+# SSN/phone/small enums). In production_mode the engine refuses to start
+# with engine = ranger and an empty mask_key unless this is set true.
+# Set policy.mask_key (or SQE_POLICY__MASK_KEY) instead.
+# allow_unkeyed_hash_masks = false
+#
+# allow_unprojected_tags (issue #397): SET TAG writes Iceberg
+# `sqe.column-tags` (SQE-only). Spark/Kyuubi masks from Ranger's tag store.
+# With engine = ranger and project-tags off, SQE masks and Spark returns
+# raw. Mixed SQE+Spark MUST set policy.ranger.project-tags = true.
+# production_mode refuses Ranger with project-tags off unless this is set
+# true (SQE-only Ranger deploys that never talk to Spark).
+# allow_unprojected_tags = false
 
 [policy]
 engine = "passthrough"
+# Required in production_mode when engine = "ranger" (unless
+# security.allow_unkeyed_hash_masks = true). Upgrades MASK_HASH to HMAC.
+# mask_key = "set-via-SQE_POLICY__MASK_KEY"
+#
+# [policy.ranger]
+# Mixed SQE+Spark MUST set project-tags = true so Spark sees the same
+# column tags SQE masks. Default is false (SQE-only Ranger deploys).
+# project-tags = true
 
 [session]
 idle_timeout_secs = 900       # 15 minutes — sessions idle longer than this are expired
@@ -292,6 +315,10 @@ channel_capacity = 10000
 # OOM on large joins. Default: "2GB". Set to "0" to always use hash join.
 # Supports: B, KB, MB, GB, TB.
 hash_join_memory_threshold = "2GB"
+# Maximum SQL statement size in bytes, checked before parse (issue #403).
+# Default: 1048576 (1 MiB). Set to 0 for unlimited; production_mode refuses
+# 0 so a production coordinator cannot accept arbitrarily large statements.
+# max_sql_bytes = 1048576
 
 # ── Query result cache ────────────────────────────────────────
 [query_cache]

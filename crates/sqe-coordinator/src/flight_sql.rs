@@ -860,6 +860,14 @@ impl SqeFlightSqlService {
         sql: &str,
         client_ip: Option<String>,
     ) -> Result<Response<FlightStream>, Status> {
+        // Issue #403: Flight SQL classifies (parses) before query_handler,
+        // so the size cap must fire here or a huge statement still burns
+        // the parser. execute/execute_stream re-check for the other paths.
+        self.config
+            .query
+            .check_sql_bytes(sql)
+            .map_err(|e| sqe_error_to_status(&e, None))?;
+
         // Classify through the pre-parse pipeline (strips FOR INCREMENTAL /
         // VERSION AS OF, rewrites Hive `PARTITIONED BY` -> sqlparser `PARTITION
         // BY`) so routing matches the execute path. Classifying raw SQL here

@@ -166,6 +166,12 @@ pub struct QueryConfig {
     /// Maximum number of rows returned per query. Default: 1_000_000. Set to 0 for unlimited.
     #[serde(default = "default_max_result_rows")]
     pub max_result_rows: usize,
+    /// Maximum SQL statement size in bytes, checked before parse (issue #403).
+    /// Default: 1_048_576 (1 MiB). Set to 0 for unlimited; `production_mode`
+    /// refuses 0 so a production coordinator cannot be configured to accept
+    /// arbitrarily large statements.
+    #[serde(default = "default_max_sql_bytes")]
+    pub max_sql_bytes: usize,
     /// Maximum concurrent queries. Default: 100. Set to 0 for unlimited.
     #[serde(default = "default_max_concurrent_queries")]
     pub max_concurrent_queries: usize,
@@ -381,6 +387,7 @@ impl Default for QueryConfig {
             timeout_secs: default_query_timeout(),
             role_overrides: std::collections::HashMap::new(),
             max_result_rows: default_max_result_rows(),
+            max_sql_bytes: default_max_sql_bytes(),
             max_concurrent_queries: default_max_concurrent_queries(),
             max_concurrent_per_user: default_max_concurrent_per_user(),
             per_user_memory_budget: default_per_user_memory_budget(),
@@ -407,6 +414,31 @@ impl Default for QueryConfig {
             merge_target_streaming: false,
             merge_cardinality_check: default_true(),
         }
+    }
+}
+
+impl QueryConfig {
+    /// Reject `sql` when it exceeds [`Self::max_sql_bytes`].
+    ///
+    /// A limit of 0 is unlimited (forbidden in `production_mode`). Callers
+    /// must run this before parse so a client cannot burn coordinator
+    /// memory or CPU on an arbitrarily large statement (issue #403).
+    pub fn check_sql_bytes(&self, sql: &str) -> crate::error::Result<()> {
+        let limit = self.max_sql_bytes;
+        if limit > 0 && sql.len() > limit {
+            return Err(crate::error::SqeError::sourced(
+                crate::error::SqeErrorCode::InvalidArguments,
+                format!(
+                    "SQL statement is {} bytes, exceeds query.max_sql_bytes ({limit})",
+                    sql.len()
+                ),
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "SQL exceeds max_sql_bytes",
+                ),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -2741,10 +2773,12 @@ pub struct PolicyConfig {
     /// coordinator restarts and across all coordinators in an HA setup.
     ///
     /// This applies to Ranger `MASK_HASH` column masks.
-    /// We warn rather than reject on `engine = ranger` + empty key (issue #37):
-    /// default-denying Hash without a key is the stronger control but is
-    /// breaking for deployments already relying on the unkeyed behaviour, so it
-    /// is deferred. Setting this key is the recommended hardening step.
+    /// Outside production we warn rather than reject on `engine = ranger` +
+    /// empty key (issue #37): default-denying Hash without a key is the
+    /// stronger control but is breaking for deployments already relying on
+    /// the unkeyed behaviour. `production_mode` refuses the empty key
+    /// unless `security.allow_unkeyed_hash_masks = true` (issue #402).
+    /// Setting this key is the recommended hardening step.
     ///
     /// Can be set via the `SQE_POLICY__MASK_KEY` environment variable.
     #[serde(default)]
@@ -2835,11 +2869,12 @@ pub struct RangerPolicyConfig {
     /// SQE reads. Spark's Kyuubi plugin reads Ranger's tag store, so without this
     /// a tag-masked column is protected in SQE and returned RAW by Spark.
     ///
-    /// OFF by default, deliberately. A deployment with no second engine enforcing
-    /// from Ranger gains nothing from projecting and would acquire a hard
-    /// dependency on the Ranger tag API in its `SET TAG` path. Turn it on when
-    /// another engine reads the same Ranger, which is what the
-    /// polaris-ranger-keycloak quickstart does.
+    /// OFF by default, deliberately. A Ranger-only SQE deploy that never talks
+    /// to Spark gains nothing from projecting and would acquire a hard
+    /// dependency on the Ranger tag API in its `SET TAG` path. Mixed SQE+Spark
+    /// deployments MUST set this true so Spark sees the same tags SQE masks.
+    /// `production_mode` refuses Ranger with this off unless
+    /// `security.allow_unprojected_tags = true` (issue #397).
     #[serde(default)]
     pub project_tags: bool,
 }
@@ -3276,6 +3311,24 @@ pub struct SecurityConfig {
     /// config diffs.
     #[serde(default)]
     pub allow_shared_service_identity: bool,
+    /// Opt-in escape hatch for Ranger `MASK_HASH` without `policy.mask_key`
+    /// (issue #402). Leaving this `false` (the default) makes
+    /// `production_mode` refuse to start when `policy.engine = ranger` and
+    /// `policy.mask_key` is empty, because Hash then falls back to unsalted
+    /// SHA-256 (rainbow-tableable on SSN/phone/small enums). Set `true` only
+    /// to acknowledge unsalted hashes; the choice is then visible in config
+    /// diffs. Dev (non-production) still WARNs and starts.
+    #[serde(default)]
+    pub allow_unkeyed_hash_masks: bool,
+    /// Opt-in escape hatch for Ranger without `policy.ranger.project-tags`
+    /// (issue #397). Leaving this `false` (the default) makes
+    /// `production_mode` refuse to start when `policy.engine = ranger` and
+    /// `project-tags` is off: `SET TAG` would write Iceberg properties that
+    /// Spark/Kyuubi cannot see, so Spark returns raw columns SQE masks.
+    /// Mixed SQE+Spark must set `policy.ranger.project-tags = true`. Set
+    /// this true only for SQE-only Ranger deploys that never talk to Spark.
+    #[serde(default)]
+    pub allow_unprojected_tags: bool,
 }
 
 impl SecurityConfig {
@@ -3852,6 +3905,9 @@ fn default_query_timeout() -> u64 {
 } // 5 minutes
 fn default_max_result_rows() -> usize {
     1_000_000
+}
+fn default_max_sql_bytes() -> usize {
+    1_048_576
 }
 fn default_max_concurrent_queries() -> usize {
     100
@@ -4489,6 +4545,43 @@ impl SqeConfig {
             );
         }
 
+        if self.query.max_sql_bytes == 0 {
+            errors.push(
+                "production_mode: query.max_sql_bytes must be > 0 \
+                 (0 disables the pre-parse statement size cap and lets a \
+                 client burn coordinator memory/CPU on an arbitrarily large \
+                 SQL string)"
+                    .to_string(),
+            );
+        }
+
+        if self.policy.engine == PolicyEngine::Ranger
+            && self.policy.mask_key.is_empty()
+            && !self.security.allow_unkeyed_hash_masks
+        {
+            errors.push(
+                "production_mode: policy.engine is ranger but policy.mask_key is empty \
+                 (Ranger MASK_HASH would fall back to unsalted SHA-256). Set \
+                 policy.mask_key (or SQE_POLICY__MASK_KEY), or set \
+                 security.allow_unkeyed_hash_masks = true to acknowledge unsalted hashes."
+                    .to_string(),
+            );
+        }
+
+        if self.policy.engine == PolicyEngine::Ranger
+            && !self.policy.ranger.project_tags
+            && !self.security.allow_unprojected_tags
+        {
+            errors.push(
+                "production_mode: policy.engine is ranger but policy.ranger.project-tags \
+                 is false (SET TAG writes Iceberg properties that Spark/Kyuubi cannot \
+                 see, so Spark returns raw columns SQE masks). Mixed SQE+Spark must set \
+                 policy.ranger.project-tags = true, or set \
+                 security.allow_unprojected_tags = true for SQE-only Ranger deploys."
+                    .to_string(),
+            );
+        }
+
         if errors.is_empty() {
             Ok(())
         } else {
@@ -4641,6 +4734,14 @@ impl SqeConfig {
         env_override_bool(
             "SQE_SECURITY__ALLOW_SHARED_SERVICE_IDENTITY",
             &mut self.security.allow_shared_service_identity,
+        );
+        env_override_bool(
+            "SQE_SECURITY__ALLOW_UNKEYED_HASH_MASKS",
+            &mut self.security.allow_unkeyed_hash_masks,
+        );
+        env_override_bool(
+            "SQE_SECURITY__ALLOW_UNPROJECTED_TAGS",
+            &mut self.security.allow_unprojected_tags,
         );
 
         // Auth
@@ -4940,6 +5041,7 @@ impl SqeConfig {
 
         // Query
         env_override_u64("SQE_QUERY__TIMEOUT_SECS", &mut self.query.timeout_secs);
+        env_override_usize("SQE_QUERY__MAX_SQL_BYTES", &mut self.query.max_sql_bytes);
     }
 }
 
@@ -6350,6 +6452,53 @@ partial_progress_batch = 5
     }
 
     #[test]
+    fn validate_production_rejects_ranger_without_mask_key() {
+        let mut config = valid_production_config();
+        config.policy.engine = PolicyEngine::Ranger;
+        config.policy.mask_key.clear();
+        // Keep project-tags on so this arm stays about mask_key only.
+        config.policy.ranger.project_tags = true;
+        let err = config.validate_production().unwrap_err().to_string();
+        assert!(
+            err.contains("allow_unkeyed_hash_masks") && err.contains("mask_key"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_production_accepts_ranger_unkeyed_hash_when_opted_in() {
+        let mut config = valid_production_config();
+        config.policy.engine = PolicyEngine::Ranger;
+        config.policy.mask_key.clear();
+        config.policy.ranger.project_tags = true;
+        config.security.allow_unkeyed_hash_masks = true;
+        assert!(config.validate_production().is_ok());
+    }
+
+    #[test]
+    fn validate_production_rejects_ranger_without_project_tags() {
+        let mut config = valid_production_config();
+        config.policy.engine = PolicyEngine::Ranger;
+        config.policy.mask_key = "test-mask-key".to_string();
+        config.policy.ranger.project_tags = false;
+        let err = config.validate_production().unwrap_err().to_string();
+        assert!(
+            err.contains("allow_unprojected_tags") && err.contains("project-tags"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_production_accepts_ranger_unprojected_tags_when_opted_in() {
+        let mut config = valid_production_config();
+        config.policy.engine = PolicyEngine::Ranger;
+        config.policy.mask_key = "test-mask-key".to_string();
+        config.policy.ranger.project_tags = false;
+        config.security.allow_unprojected_tags = true;
+        assert!(config.validate_production().is_ok());
+    }
+
+    #[test]
     fn env_overrides_apply_to_production_mode() {
         let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
 
@@ -7193,6 +7342,7 @@ type = "aws"
         let config = QueryConfig::default();
         assert_eq!(config.timeout_secs, 300);
         assert_eq!(config.max_result_rows, 1_000_000);
+        assert_eq!(config.max_sql_bytes, 1_048_576);
         assert_eq!(config.max_concurrent_queries, 100);
         assert_eq!(config.slow_query_threshold_secs, 30);
         assert_eq!(config.max_query_memory, "256MB");
@@ -7257,6 +7407,50 @@ type = "aws"
         assert_eq!(config.max_concurrent_queries, 50);
         assert_eq!(config.slow_query_threshold_secs, 10);
         assert_eq!(config.max_query_memory, "512MB");
+    }
+
+    #[test]
+    fn max_sql_bytes_rejects_oversize_string() {
+        let config = QueryConfig::default();
+        let oversize = "x".repeat(config.max_sql_bytes + 1);
+        let err = config.check_sql_bytes(&oversize).unwrap_err();
+        assert_eq!(
+            err.error_code(),
+            crate::error::SqeErrorCode::InvalidArguments
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("max_sql_bytes") && msg.contains(&(config.max_sql_bytes + 1).to_string()),
+            "got: {msg}"
+        );
+        // User-facing: the client must see the size, not a generic Internal.
+        assert_ne!(err.client_message(), "Internal error");
+        assert!(err.client_message().contains("max_sql_bytes"));
+    }
+
+    #[test]
+    fn max_sql_bytes_accepts_one_below_limit() {
+        let config = QueryConfig::default();
+        let just_under = "x".repeat(config.max_sql_bytes.saturating_sub(1));
+        assert!(config.check_sql_bytes(&just_under).is_ok());
+        assert!(config
+            .check_sql_bytes(&"x".repeat(config.max_sql_bytes))
+            .is_ok());
+    }
+
+    #[test]
+    fn max_sql_bytes_zero_is_unlimited_outside_production() {
+        let mut config = QueryConfig::default();
+        config.max_sql_bytes = 0;
+        assert!(config.check_sql_bytes(&"x".repeat(2_000_000)).is_ok());
+    }
+
+    #[test]
+    fn validate_production_rejects_unlimited_max_sql_bytes() {
+        let mut config = valid_production_config();
+        config.query.max_sql_bytes = 0;
+        let err = config.validate_production().unwrap_err().to_string();
+        assert!(err.contains("query.max_sql_bytes"), "got: {err}");
     }
 
     // -----------------------------------------------------------------------
