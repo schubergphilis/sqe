@@ -39,8 +39,10 @@ single broad key. Production object store is AWS S3 or NetApp StorageGRID.
 - WRITES already consume vended creds: INSERT/MERGE/DELETE use `table.file_io()`,
   which carries the loadTable vended credentials. Likely works end-to-end today.
 - FileIO reads honour `require_vended_credentials` (issue #395): the catalog
-  props omit `s3.access-key-id` / `s3.secret-access-key`, so iceberg-rust
-  cannot fall back to the engine identity after LOAD_TABLE.
+  props omit `s3.access-key-id` / `s3.secret-access-key` and set
+  `s3.disable-config-load` / `s3.disable-ec2-metadata`, so iceberg-rust
+  cannot fall back to `[storage]`, `AWS_*` env, IRSA, or IMDSv2 after
+  LOAD_TABLE.
 - Distributed READS still discard vended creds. The coordinator hardcodes
   `s3_session_token: ""` in every `ScanTask` and fills the access/secret
   from the static `[storage]` key

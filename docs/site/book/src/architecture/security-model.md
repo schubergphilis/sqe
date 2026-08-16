@@ -16,7 +16,7 @@ Catalog operations carry the user's bearer token. Listing namespaces, loading a 
 
 Writes use per-table credentials vended by the catalog. INSERT, MERGE, and DELETE go through the loaded table's file IO, which carries the credentials the catalog returned for that table.
 
-Iceberg FileIO used to fall back to the static `[storage]` key whenever Polaris did not vend credentials. That is now a switch. `[catalog] require_vended_credentials = true` omits those keys from FileIO, so a table load that does not return STS or remote signing cannot read objects as the coordinator. `production_mode` refuses to start unless every REST catalog has the flag on (issue #395). Leave it off only for single-tenant and local stacks that still need the fallback.
+Iceberg FileIO used to fall back to the static `[storage]` key whenever Polaris did not vend credentials. That is now a switch. `[catalog] require_vended_credentials = true` omits those keys from FileIO and sets `s3.disable-config-load` / `s3.disable-ec2-metadata`, so a table load that does not return STS or remote signing cannot read objects as the coordinator, the pod IAM role, `AWS_*` env, or IMDSv2. `production_mode` refuses to start unless every REST catalog has the flag on (issue #395). Leave it off only for single-tenant and local stacks that still need the fallback.
 
 Distributed workers are a separate path. `ScanTask` still ships the configured `[storage]` key on the Flight ticket. Per-user vending on that ticket is designed and not yet built. See [S3 Credential Vending](../design-notes/s3vending.md) and [Limitations](../reference/limitations.md#read-path-s3-access-and-require_vended_credentials).
 
