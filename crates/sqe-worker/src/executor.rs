@@ -22,7 +22,7 @@ use parquet::arrow::ParquetRecordBatchStreamBuilder;
 use parquet::file::metadata::ParquetMetaData;
 use sqe_catalog::late_materialize;
 use sqe_spill::{Accounted, ByteBudget};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, watch, Notify};
 use tracing::{debug, info, warn};
 use url::Url;
 
@@ -67,6 +67,7 @@ type PendingOpen = Pin<Box<dyn std::future::Future<Output = OpenedParquet> + Sen
 struct QueueTrackedScanStream {
     inner: tokio_stream::wrappers::ReceiverStream<anyhow::Result<AccountedBatch>>,
     queue_bytes: Arc<AtomicUsize>,
+    space: Arc<Notify>,
     metrics: Option<Arc<WorkerMetricsRegistry>>,
     scan_budget: ByteBudget,
 }
@@ -83,6 +84,7 @@ impl Stream for QueueTrackedScanStream {
                         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
                             Some(cur.saturating_sub(sz))
                         });
+                self.space.notify_waiters();
                 if let Some(ref m) = self.metrics {
                     m.scan_queue_resident_bytes
                         .set(self.queue_bytes.load(Ordering::Relaxed) as f64);
@@ -294,6 +296,7 @@ pub async fn execute_scan_streaming_with_store(
 
     let (tx, rx) = mpsc::channel::<anyhow::Result<AccountedBatch>>(SCAN_CHANNEL_ITEM_CAPACITY);
     let queue_bytes = Arc::new(AtomicUsize::new(0));
+    let queue_space = Arc::new(Notify::new());
 
     let task = Arc::new(task);
     let task_for_producer = task.clone();
@@ -303,6 +306,7 @@ pub async fn execute_scan_streaming_with_store(
     let predicate_clone = predicate.clone();
     let credential_rx_clone = credential_rx.clone();
     let queue_bytes_producer = queue_bytes.clone();
+    let queue_space_producer = queue_space.clone();
     let scan_budget_producer = scan_budget.clone();
 
     tokio::spawn(async move {
@@ -313,12 +317,42 @@ pub async fn execute_scan_streaming_with_store(
         let predicate = predicate_clone;
         let credential_rx = credential_rx_clone;
         let queue_bytes = queue_bytes_producer;
+        let queue_space = queue_space_producer;
         let scan_budget = scan_budget_producer;
 
         let initial_store: Arc<dyn ObjectStore> = initial_store;
         let mut total_rows: usize = 0;
         let mut total_bytes: u64 = first_bytes;
         let mut fetch_permit = initial_fetch_permit;
+
+        /// Wait until the outbound queue is at or below `watermark`, or the
+        /// Flight consumer is gone. Registers on `space` before the load so
+        /// a decrement's `notify_waiters` cannot be lost. Returns `false`
+        /// when `tx` is closed so a detached producer cannot spin forever
+        /// holding a fetch permit (issue #407 hold).
+        async fn wait_queue_below(
+            queue_bytes: &AtomicUsize,
+            space: &Notify,
+            watermark: usize,
+            tx: &mpsc::Sender<anyhow::Result<AccountedBatch>>,
+        ) -> bool {
+            let future = space.notified();
+            tokio::pin!(future);
+            loop {
+                if tx.is_closed() {
+                    return false;
+                }
+                future.as_mut().enable();
+                if queue_bytes.load(Ordering::Relaxed) <= watermark {
+                    return true;
+                }
+                tokio::select! {
+                    _ = future.as_mut() => {}
+                    _ = tx.closed() => return false,
+                }
+                future.set(space.notified());
+            }
+        }
 
         /// Admit one decoded batch against the scan budget (waits for capacity),
         /// wrap it in [`Accounted`], and send it. Returns `false` on fatal error
@@ -327,6 +361,7 @@ pub async fn execute_scan_streaming_with_store(
             tx: &mpsc::Sender<anyhow::Result<AccountedBatch>>,
             scan_budget: &ByteBudget,
             queue_bytes: &AtomicUsize,
+            queue_space: &Notify,
             metrics: &Option<Arc<WorkerMetricsRegistry>>,
             batch: RecordBatch,
         ) -> bool {
@@ -355,6 +390,7 @@ pub async fn execute_scan_streaming_with_store(
                 let _ = queue_bytes.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
                     Some(cur.saturating_sub(charged))
                 });
+                queue_space.notify_waiters();
                 if let Some(m) = metrics {
                     m.scan_queue_resident_bytes
                         .set(queue_bytes.load(Ordering::Relaxed) as f64);
@@ -373,7 +409,9 @@ pub async fn execute_scan_streaming_with_store(
                 Ok(batch) => {
                     total_rows += batch.num_rows();
                     first_file_bytes += batch.get_array_memory_size();
-                    if !emit_batch(&tx, &scan_budget, &queue_bytes, &metrics, batch).await {
+                    if !emit_batch(&tx, &scan_budget, &queue_bytes, &queue_space, &metrics, batch)
+                        .await
+                    {
                         return;
                     }
                 }
@@ -431,9 +469,11 @@ pub async fn execute_scan_streaming_with_store(
         };
 
         let mut pending = if idx < task.data_file_paths.len() {
+            // After the first file is decoded, the queue may still be full.
+            // Wait for the consumer before opening the next parquet file.
             let watermark = scan_budget.capacity_bytes().saturating_div(2);
-            while queue_bytes.load(Ordering::Relaxed) > watermark {
-                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            if !wait_queue_below(&queue_bytes, &queue_space, watermark, &tx).await {
+                return;
             }
             let fut = start_next_open(idx, store.clone());
             idx += 1;
@@ -458,6 +498,9 @@ pub async fn execute_scan_streaming_with_store(
             let fetch_charge = (bytes as usize)
                 .min(scan_budget.capacity_bytes() / 8)
                 .max(1);
+            // Drop the previous permit before acquire so the file boundary
+            // never holds 2 x (capacity/8) against the scan budget.
+            drop(fetch_permit.take());
             fetch_permit = match scan_budget.acquire(fetch_charge).await {
                 Ok(p) => Some(p),
                 Err(e) => {
@@ -478,7 +521,9 @@ pub async fn execute_scan_streaming_with_store(
                 match batch_res {
                     Ok(batch) => {
                         total_rows += batch.num_rows();
-                        if !emit_batch(&tx, &scan_budget, &queue_bytes, &metrics, batch).await {
+                        if !emit_batch(&tx, &scan_budget, &queue_bytes, &queue_space, &metrics, batch)
+                        .await
+                    {
                             return;
                         }
                     }
@@ -512,8 +557,8 @@ pub async fn execute_scan_streaming_with_store(
             // outbound channel is full is what OOM'd SF10 inventory queries.
             if idx < task.data_file_paths.len() {
                 let watermark = scan_budget.capacity_bytes().saturating_div(2);
-                while queue_bytes.load(Ordering::Relaxed) > watermark {
-                    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                if !wait_queue_below(&queue_bytes, &queue_space, watermark, &tx).await {
+                    return;
                 }
                 if let Some(ref mut rx) = credential_rx {
                     if rx.has_changed().unwrap_or(false) {
@@ -565,6 +610,7 @@ pub async fn execute_scan_streaming_with_store(
     let out_stream: ScanBatchStream = Box::pin(QueueTrackedScanStream {
         inner: tokio_stream::wrappers::ReceiverStream::new(rx),
         queue_bytes,
+        space: queue_space,
         metrics,
         scan_budget,
     });
