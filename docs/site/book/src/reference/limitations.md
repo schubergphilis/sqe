@@ -6,7 +6,9 @@ Every engine has edges. This page collects the ones SQE already documents elsewh
 
 ### The coordinator is a single point of failure
 
-The coordinator runs as a single replica. Session state, the worker registry, and in-flight query state are process-local. There is no shared store. A coordinator restart drops every in-flight query and invalidates client sessions, so connected clients re-authenticate and re-run. A node drain that moves the coordinator pod is a brief outage, not a transparent failover.
+**Service level we ship: restartable, not HA.** One active instance. Client retry. No query survival across a restart (issue #405). Do not scale `coordinator.replicas` above 1.
+
+The coordinator runs as a single replica. Sessions, the query tracker, cancellation, caches, `CREATE SECRET`, `ATTACH`, and shuffle orchestration are process-local. Session-file restore omits tokens, so it is not a live session. There is no shared store. A coordinator restart drops every in-flight query and invalidates client sessions, so connected clients re-authenticate and re-run. A node drain that moves the coordinator pod is a brief outage, not a transparent failover.
 
 Running more than one coordinator replica is not yet safe. Two replicas do not share sessions or the registry, so a client would land on a coordinator that never saw its session. Keep `coordinator.replicas: 1`. Full coordinator HA with shared session and registry state is a separate design, not yet built.
 
@@ -87,4 +89,4 @@ The cutoff is a guideline, not a hard limit. Spill-to-disk lets a memory-constra
 
 Spill-to-disk covers sorts and sort-merge joins. Hash aggregation spill is limited by what DataFusion supports upstream. The documented edge is TPC-H q18: a high-cardinality `GROUP BY` with `HAVING` that produces millions of intermediate groups overruns a 512MB single-node budget, because the grouped hash aggregate does not yet spill. The fix is distribution. Phase B two-phase aggregation spreads the groups across workers and q18 passes. On a single node, raise `memory_limit` or distribute. See [Streaming Execution, Benchmark Results](../architecture/streaming-execution.md#benchmark-results).
 
-Hash joins are not spillable upstream either. SQE rewrites a hash join to a sort-merge join when the estimated build side exceeds `hash_join_memory_threshold`, trading speed for survival. See [Streaming Execution, SortMergeJoin Fallback](../architecture/streaming-execution.md#sortmergejoin-fallback).
+Hash joins are not spillable upstream (DataFusion #17267). SQE rewrites a hash join to a sort-merge join only when the build-side estimate is **exact** and above `hash_join_memory_threshold`. Iceberg scans usually report unknown stats, so those joins stay as HashJoin and a large build fails the query instead of slowing down (issue #411). Rewriting on `Unknown` was tried and doubled TPC-DS wall time at SF1 because each SMJ coalesced to one partition. Workaround: raise `query.hash_join_memory_threshold` only when you have exact stats you trust, or distribute. See [Streaming Execution, SortMergeJoin Fallback](../architecture/streaming-execution.md#sortmergejoin-fallback).
