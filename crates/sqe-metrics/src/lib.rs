@@ -199,6 +199,9 @@ pub struct MetricsRegistry {
     pub policy_cache_hits_total: IntCounterVec,
     pub policy_cache_misses_total: IntCounterVec,
     pub policy_circuit_breaker_state: GaugeVec,
+    /// Group-only Ranger policy items (groups set, no users/roles) observed on
+    /// bundle download. These never apply unless `groups_claim` is set.
+    pub ranger_group_only_items: IntCounter,
 
     // Audit export (OTLP shipper) metrics
     pub audit_export_records_total: IntCounterVec,
@@ -625,6 +628,13 @@ impl MetricsRegistry {
             &["backend"],
         )?;
 
+        let ranger_group_only_items = register_int_counter(
+            &registry,
+            "sqe_ranger_group_only_items",
+            "Group-only Ranger policy items (no users/roles) seen on bundle download. \
+             These never apply unless groups_claim is set on the auth provider.",
+        )?;
+
         let write_orphan_files_total = register_int_counter_vec(
             &registry,
             "sqe_write_orphan_files_total",
@@ -792,6 +802,7 @@ impl MetricsRegistry {
             policy_cache_hits_total,
             policy_cache_misses_total,
             policy_circuit_breaker_state,
+            ranger_group_only_items,
             write_orphan_files_total,
             audit_export_records_total,
             audit_export_batch_failures_total,
