@@ -38,6 +38,8 @@ The numbers below are the latest SF1 run, as of 2026-06-12, against Trino 465 on
 
 Run-to-run variance is real, so treat each figure as approximate. The rank order is stable across the last month of runs.
 
+TPC-BB is lopsided. On the 2026-08-15 Flight SF1 run the suite is 63.1s and q01 alone is 35.5s (20 rows). The other nine queries share the remaining half. Quote q01 when you quote a TPC-BB total (issue #417). The README compare envelope that day is 56.3s vs Trino 290.3s, still 10/10.
+
 ### Where SQE trails
 
 SSB is the one suite SQE loses at SF1: 8.3s against Trino's 5.8s, a 0.70x result. SSB is a denormalized star schema built for fast star-join filtering. Trino ships build-side key sets (bloom filters) into its scans, which prunes the `lineorder` fact table before it is read. SQE's equivalent, shipping build-side key sets to distributed workers, is in progress. The `lineorder` fact has a uniform foreign-key distribution that defeats row-group min/max pruning, so the runtime filter only helps at row level today.

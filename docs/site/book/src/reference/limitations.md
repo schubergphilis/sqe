@@ -90,3 +90,13 @@ The cutoff is a guideline, not a hard limit. Spill-to-disk lets a memory-constra
 Spill-to-disk covers sorts and sort-merge joins. Hash aggregation spill is limited by what DataFusion supports upstream. The documented edge is TPC-H q18: a high-cardinality `GROUP BY` with `HAVING` that produces millions of intermediate groups overruns a 512MB single-node budget, because the grouped hash aggregate does not yet spill. The fix is distribution. Phase B two-phase aggregation spreads the groups across workers and q18 passes. On a single node, raise `memory_limit` or distribute. See [Streaming Execution, Benchmark Results](../architecture/streaming-execution.md#benchmark-results).
 
 Hash joins are not spillable upstream (DataFusion #17267). SQE rewrites a hash join to a sort-merge join only when the build-side estimate is **exact** and above `hash_join_memory_threshold`. Iceberg scans usually report unknown stats, so those joins stay as HashJoin and a large build fails the query instead of slowing down (issue #411). Rewriting on `Unknown` was tried and doubled TPC-DS wall time at SF1 because each SMJ coalesced to one partition. Workaround: raise `query.hash_join_memory_threshold` only when you have exact stats you trust, or distribute. See [Streaming Execution, SortMergeJoin Fallback](../architecture/streaming-execution.md#sortmergejoin-fallback).
+
+### IcebergScanExec advertises one output partition
+
+Parallel I/O already happens inside a scan (prefetch, manifest concurrency). The plan still advertises a single output partition so broadcast / CollectLeft joins stay cheap. Wiring `target_partitions` to the DataFusion default flipped joins to CollectLeft and regressed TPC-DS q72 5-6x (issue #414, related #87 / #131).
+
+`parallel_probe_scan` exists and stays **opt-in**. It helps SSB-style scan-bound shapes and costs TPC-DS about +26% at SF1. Default-on waits for a cost gate that keeps CollectLeft on the build side. Leave the flag off unless you have measured the workload.
+
+### TPC-BB wall time is mostly q01
+
+On the 2026-08-15 Flight SF1 run (`tpcbb-sf1-flight-2026-08-15T14:31:10.json`) the suite is 63.1s and **q01 is 35.5s** of that, 20 rows. The suite still passes 10/10. Do not quote a TPC-BB total without naming q01 (issue #417). Compare totals on the same day (`README.md`) use a different envelope and are 56.3s vs Trino 290.3s.

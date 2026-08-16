@@ -276,7 +276,9 @@ impl TableProvider for SqeTableProvider {
         // effect: parallel I/O, then immediate serialisation, then a
         // single-threaded hash build that is also fragmented into many tiny
         // round-robin batches. tpcds q72 SF1 regressed 5-6x (~17s -> ~100s)
-        // until the wiring was removed; see issue #131.
+        // until the wiring was removed; see issue #131 and the 2026-08-15
+        // audit follow-up #414. Default-on waits for a cost gate that keeps
+        // CollectLeft on the build side. `parallel_probe_scan` stays opt-in.
         //
         // The `with_target_partitions` setter on IcebergScanExec is kept so a
         // follow-up can re-introduce parallel scan once a proper hash-aware
