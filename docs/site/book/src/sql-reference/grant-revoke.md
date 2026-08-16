@@ -56,16 +56,33 @@ The standard form is parsed by `sqlparser-rs` and routed via `StatementKind::Gra
 
 ### Closing a gate
 
-`REVOKE SELECT` does not necessarily stop a principal reading. Privileges expand
-to Polaris access types, and a writer must hold the metadata reads that authorize
-a table load, so a surviving `INSERT` keeps conferring read. The statement reports
-success and the rows still come back. Measured on Polaris: stripping
-`table-data-read` alone changes nothing, and `table-properties-read` is what
-unlocks `LOAD_TABLE`.
+`REVOKE SELECT` does not stop a principal reading while any remaining privilege
+still confers `table-properties-read`. The statement reports success and the
+rows still come back. That is the release limitation, not a failed revoke
+(issue #396).
+
+Privileges expand to Polaris access types. A writer must load the table before
+it can write, so the INSERT profile includes `table-properties-read`. After
+`LOAD_TABLE` succeeds, SQE reads parquet with FileIO (vended STS, or the
+engine `[storage]` key when vending is off). Polaris `table-data-read` is
+not the SQE read gate.
+
+Measured on the live Ranger + Polaris stack:
+
+| Remaining access types | `SELECT` after `REVOKE SELECT` |
+|---|---|
+| Full INSERT expansion (19 types) | reads succeed |
+| Same expansion minus `table-data-read` (18) | reads still succeed |
+| `table-data-write` alone | 403 `LOAD_TABLE` |
+| `table-data-write` + `table-properties-read` | reads succeed |
+
+Unity Catalog keeps SELECT and MODIFY independent. SQE cannot match that with
+a `grant-profile.json` edit: dropping `table-properties-read` from INSERT
+breaks `LOAD_TABLE` for writers.
 
 Use `REVOKE ALL PRIVILEGES` to close a gate. It means "this grantee holds nothing
 on this object afterwards", at any level, and needs no knowledge of which
-privileges were granted:
+privileges were granted. Follow it with `CHECK ACCESS` for that principal.
 
 ```sql
 REVOKE ALL PRIVILEGES ON sales.orders FROM ROLE "analyst";
@@ -201,5 +218,6 @@ A short rationale:
 - No `WITH GRANT OPTION`. Grants are non-delegating; only an admin can grant.
 - No column-level INSERT (`GRANT INSERT (col1, col2) ON ...`). The granularity is table-level for INSERT today.
 - Mask expressions are scalar only; aggregate / table-valued mask expressions are not allowed.
+- `REVOKE SELECT` is not a read gate while `table-properties-read` remains (INSERT is the common leftover). Use `REVOKE ALL PRIVILEGES` and `CHECK ACCESS`. See [Closing a gate](#closing-a-gate). This is a documented release limitation (issue #396), not something a profile rewrite can fix.
 
 File an issue if any of these block your use case.

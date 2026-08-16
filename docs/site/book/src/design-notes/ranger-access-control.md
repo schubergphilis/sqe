@@ -410,15 +410,28 @@ user would still be denied. A precise realm string can replace `"*"` for tighter
 scoping if you confirm the exact value Polaris sends (Ranger Admin audit tab or
 `docker compose logs polaris`) and restart SQE.
 
-**The LOAD_TABLE read gate.** SQE reads parquet with its own configured S3
-credentials. So once a user can load a table's metadata it can read the data, and
+**The LOAD_TABLE read gate.** SQE reads parquet with FileIO after the catalog
+load. So once a user can load a table's metadata it can read the data, and
 Polaris's `table-data-read` (vended-credential) check never fires for this
 deployment. The effective read gate is `LOAD_TABLE` / `table-properties-read`,
 not credential vending. The quickstart uses that fact to make `GRANT` the visible
 gate: the baseline traverse set (`catalog-list`, `catalog-properties-read`,
 `namespace-list`, `namespace-properties-read`, `table-list`) deliberately omits
 `table-properties-read`, so `GRANT SELECT` is what actually lets a member load
-and read a table, and `REVOKE` takes it away.
+and read a table.
+
+`REVOKE SELECT` does not take that away if INSERT (or any leftover privilege
+that still carries `table-properties-read`) remains. Measured:
+
+- full INSERT expansion: can read
+- same minus `table-data-read`: can still read
+- `table-data-write` alone: 403 `LOAD_TABLE`
+- `table-data-write` + `table-properties-read`: can read
+
+Unity Catalog keeps SELECT and MODIFY independent. SQE cannot, because a
+writer has to `LOAD_TABLE` before it writes, and that privilege is also the
+read gate. Operators close a gate with `REVOKE ALL PRIVILEGES` and confirm
+with `CHECK ACCESS` (issue #396).
 
 ## Group bindings
 
