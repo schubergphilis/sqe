@@ -17,7 +17,9 @@ use tracing::Instrument;
 use tracing::{debug, info, warn, Span};
 
 use sqe_catalog::{IcebergScanExec, SessionCatalog};
-use sqe_core::{QueryConfig, SecretStore, Session, SortMode, SqeConfig, SqeError};
+use sqe_core::{
+    QueryConfig, SecretStore, Session, SortMode, SqeConfig, SqeError, SqeErrorCode,
+};
 use sqlparser::ast::{Statement, TableFactor};
 
 use crate::adaptive_sort;
@@ -98,6 +100,27 @@ fn reject_oversized_sql(query: &QueryConfig, sql: &str) -> sqe_core::Result<()> 
     query.check_sql_bytes(sql)
 }
 
+/// True for CTAS / INSERT whose *query* has a top-level ORDER BY
+/// (the ExternalSorterMerge cliff on a greedy pool, issue #408).
+///
+/// Window `ORDER BY`, `CREATE VIEW`, comments, and string literals do
+/// not match. Classification uses the parsed statement, not a substring.
+fn is_sorted_write(kind: &StatementKind) -> bool {
+    match kind {
+        StatementKind::Ctas(stmt) => match stmt.as_ref() {
+            Statement::CreateTable(ct) => {
+                ct.query.as_ref().is_some_and(|q| q.order_by.is_some())
+            }
+            _ => false,
+        },
+        StatementKind::Insert(stmt) => match stmt.as_ref() {
+            Statement::Insert(ins) => ins.source.as_ref().is_some_and(|q| q.order_by.is_some()),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
 /// Handles query execution by routing parsed SQL through the appropriate
 /// pipeline: DataFusion for queries, catalog metadata for SHOW commands,
 /// and policy enforcement for all plans.
@@ -124,6 +147,8 @@ pub struct QueryHandler {
     query_cache: Option<Arc<ResultCache>>,
     /// Semaphore limiting global concurrent query execution.
     query_semaphore: Option<Arc<tokio::sync::Semaphore>>,
+    /// Caps concurrent sorted CTAS / INSERT (issue #408). `None` means unlimited.
+    sorted_write_semaphore: Option<Arc<tokio::sync::Semaphore>>,
     /// Per-user concurrency semaphores. Lazily created on first query per
     /// username. Each entry caps how many simultaneous queries one user can
     /// hold against the global pool, preventing a single tenant from
@@ -231,6 +256,13 @@ impl QueryHandler {
         } else {
             None
         };
+        let sorted_write_semaphore = if config.query.max_concurrent_sorted_writes > 0 {
+            Some(Arc::new(tokio::sync::Semaphore::new(
+                config.query.max_concurrent_sorted_writes,
+            )))
+        } else {
+            None
+        };
 
         // Build shared DataFusion runtime with FairSpillPool for memory management
         // and optional spill-to-disk. This is built once and shared across all queries.
@@ -280,6 +312,7 @@ impl QueryHandler {
             query_tracker,
             query_cache,
             query_semaphore,
+            sorted_write_semaphore,
             per_user_semaphores: Arc::new(dashmap::DashMap::new()),
             per_user_memory: Arc::new(crate::memory::PerUserMemoryRegistry::new()),
             per_user_memory_budget_bytes,
@@ -657,6 +690,33 @@ impl QueryHandler {
     }
 
     /// Execute a SQL statement for the given session and return collected RecordBatches.
+    fn try_acquire_sorted_write(
+        &self,
+        kind: &StatementKind,
+    ) -> sqe_core::Result<Option<tokio::sync::OwnedSemaphorePermit>> {
+        if !is_sorted_write(kind) {
+            return Ok(None);
+        }
+        let Some(sem) = &self.sorted_write_semaphore else {
+            return Ok(None);
+        };
+        match Arc::clone(sem).try_acquire_owned() {
+            Ok(p) => Ok(Some(p)),
+            Err(_) => Err(SqeError::sourced(
+                SqeErrorCode::ResourceExhausted,
+                format!(
+                    "Too many concurrent sorted writes ({} active). Retry or raise \
+                     query.max_concurrent_sorted_writes.",
+                    self.config.query.max_concurrent_sorted_writes
+                ),
+                std::io::Error::new(
+                    std::io::ErrorKind::ResourceBusy,
+                    "sorted write concurrency cap",
+                ),
+            )),
+        }
+    }
+
     #[tracing::instrument(
         skip(self, session, sql),
         fields(
@@ -781,6 +841,12 @@ impl QueryHandler {
             &sqe_sql::UserSql::from(sql),
         )?)?;
         let kind_name = kind.name().to_string();
+
+        // Issue #408: cap concurrent sorted writes so several CTAS ORDER BY
+        // cannot starve ExternalSorterMerge on a greedy pool. Classify from
+        // the parsed statement so a window ORDER BY or a VIEW is not a hit.
+        // Extra writers are rejected (ResourceExhausted), not queued.
+        let _sorted_write_permit = self.try_acquire_sorted_write(&kind)?;
 
         // Pre-flight: when a 3-part identifier names a catalog that the
         // coordinator has not registered, fail fast with a clear error
@@ -8532,6 +8598,44 @@ warehouse = "wh1"
     /// load-bearing in two places: `handle_deny` writes deny items rather than
     /// allow items, and the audit path records a denial as a privilege change of
     /// its own rather than as a grant.
+    #[test]
+    fn sorted_write_detection() {
+        fn kind(sql: &str) -> StatementKind {
+            sqe_sql::parse_and_classify(sql).expect(sql)
+        }
+        assert!(is_sorted_write(&kind(
+            "CREATE TABLE t AS SELECT * FROM src ORDER BY id"
+        )));
+        assert!(is_sorted_write(&kind(
+            "INSERT INTO t SELECT * FROM src ORDER BY k"
+        )));
+        assert!(is_sorted_write(&kind(
+            "INSERT\nINTO t SELECT * FROM src ORDER BY k"
+        )));
+        assert!(is_sorted_write(&kind(
+            "CREATE OR REPLACE TABLE t AS SELECT * FROM src ORDER BY id"
+        )));
+        assert!(!is_sorted_write(&kind("SELECT * FROM t ORDER BY id")));
+        assert!(!is_sorted_write(&kind(
+            "CREATE TABLE t AS SELECT * FROM src"
+        )));
+        assert!(
+            !is_sorted_write(&kind(
+                "CREATE TABLE t AS SELECT row_number() OVER (ORDER BY id) AS rn FROM src"
+            )),
+            "window ORDER BY is not a sorted write"
+        );
+        assert!(
+            !is_sorted_write(&kind(
+                "CREATE OR REPLACE VIEW v AS SELECT * FROM src ORDER BY x"
+            )),
+            "CREATE VIEW does not sort on write"
+        );
+        assert!(!is_sorted_write(&kind(
+            "SELECT * FROM t WHERE note = 'order by' AND kind = 'insert '"
+        )));
+    }
+
     #[test]
     fn deny_is_classified_as_its_own_kind() {
         let kind = sqe_sql::parse_and_classify("DENY SELECT ON my_table TO alice")
