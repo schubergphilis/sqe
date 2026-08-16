@@ -254,10 +254,15 @@ impl ShuffleReceiver {
 
     /// Send a batch into a partition, updating the resident-byte gauge.
     ///
-    /// Waits while `resident + batch` would exceed `max_resident_bytes`,
-    /// except when the receiver is empty: a single oversized batch is still
-    /// admitted so a wide row cannot deadlock. Returns `Err(batch)` if the
-    /// channel is closed (receiver dropped).
+    /// Waits while `resident + batch` would exceed `max_resident_bytes`.
+    /// `resident` is summed across **all** partitions of this receiver.
+    /// A single batch larger than the cap is admitted only when that
+    /// sum is already 0 (every partition empty). Returns `Err(batch)` if
+    /// the channel is closed (receiver dropped).
+    ///
+    /// Waiters register with [`Notify::enable`] *before* the cap check so
+    /// a `notify_waiters()` that lands in the window cannot be dropped
+    /// (`Notify::notify_waiters` stores no permit).
     pub async fn send_batch(
         &self,
         partition_id: u32,
@@ -269,12 +274,18 @@ impl ShuffleReceiver {
         };
         let bytes = batch.get_array_memory_size();
         if self.max_resident_bytes > 0 {
+            let future = self.space.notified();
+            tokio::pin!(future);
             loop {
+                // Register before the load so a drain's notify_waiters
+                // cannot be lost (tokio's "Make sure that no wakeup is lost").
+                future.as_mut().enable();
                 let cur = self.resident_bytes.load(Ordering::Relaxed);
                 if cur == 0 || cur.saturating_add(bytes) <= self.max_resident_bytes {
                     break;
                 }
-                self.space.notified().await;
+                future.as_mut().await;
+                future.set(self.space.notified());
             }
         }
         match sender.send(batch).await {
@@ -822,7 +833,7 @@ mod tests {
         assert!(receiver.take_receiver(0).await.is_none());
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn send_batch_waits_when_over_byte_cap() {
         let schema = test_schema();
         let receiver = ShuffleReceiver::new(1, schema, 8).with_max_resident_bytes(1);
@@ -836,14 +847,35 @@ mod tests {
             .expect("first batch admitted on empty receiver");
         assert!(receiver.resident_bytes() > 1);
 
-        let drain = async {
-            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-            rx.recv().await
-        };
+        // No sleep: drain/notify and send race. Either drain wins (cur==0
+        // admits) or send waits and enable() catches notify_waiters.
+        let drain = rx.recv();
         let send = receiver.send_batch(0, second);
         let (got, sent) = tokio::join!(drain, send);
         assert!(got.is_some(), "first batch drained");
         sent.expect("second send after drain");
+    }
+
+    #[tokio::test]
+    async fn send_batch_completes_when_notify_fires_before_wait() {
+        // Opposite ordering of the wait test: drain (and notify_waiters)
+        // with no waiter registered, then send. enable() plus the cur==0
+        // admit must still complete; a lost notify must not park forever.
+        let schema = test_schema();
+        let receiver = ShuffleReceiver::new(1, schema, 8).with_max_resident_bytes(1);
+        let first = make_batch(vec![1, 2, 3], vec!["a", "b", "c"]);
+        let second = make_batch(vec![4, 5, 6], vec!["d", "e", "f"]);
+        let mut rx = receiver.take_receiver(0).await.expect("rx");
+        receiver
+            .send_batch(0, first)
+            .await
+            .expect("first batch admitted");
+        assert!(rx.recv().await.is_some());
+        assert_eq!(receiver.resident_bytes(), 0);
+        receiver
+            .send_batch(0, second)
+            .await
+            .expect("send after drain-first notify");
     }
 
     // ─── ShuffleManager tests ───
