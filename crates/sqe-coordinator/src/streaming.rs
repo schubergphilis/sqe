@@ -1643,6 +1643,10 @@ mod tests {
     async fn idle_timeout_extends_while_operator_metrics_advance() {
         let (mut stream, rows, _tracker, _qid) = idle_test_stream(Duration::from_millis(50)).await;
 
+        // Seed one increment before polling. On a loaded CI runner the
+        // ticker task can lose the first 50ms slice, the idle guard
+        // fires, and the test fails with "no results for 0s".
+        rows.add(1);
         let ticker = tokio::spawn(async move {
             loop {
                 rows.add(1);
