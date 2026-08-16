@@ -51,7 +51,7 @@ helm install sqe deploy/helm/sqe/ \
 
 Workers are **disabled by default**. The coordinator runs queries locally.
 
-`values.yaml` is the easy dev path (`production_mode: false`). For production, overlay `values-production.yaml`: it turns on `production_mode`, rate limiting, a durable audit PVC, and ServiceMonitor. You must still supply existing Secrets, TLS/ingress, and `workerSecret` when workers are on. Templating fails if `production_mode` and `worker.enabled` are both true with an empty worker secret.
+`values.yaml` is the easy dev path (`production_mode: false`). For production, overlay `values-production.yaml`: it turns on `production_mode`, rate limiting, `catalog.require_vended_credentials`, a durable audit PVC, and ServiceMonitor. You must still supply existing Secrets, TLS/ingress, and `workerSecret` when workers are on. Templating fails if `production_mode` and `worker.enabled` are both true with an empty worker secret. The engine also refuses to start if a REST catalog still has `require_vended_credentials = false`.
 
 ```bash
 helm install sqe deploy/helm/sqe/ \

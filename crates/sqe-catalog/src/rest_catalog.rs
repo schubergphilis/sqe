@@ -49,6 +49,46 @@ fn user_circuit_breaker(token_fingerprint: &str) -> Arc<CircuitBreaker> {
         .clone()
 }
 
+fn insert_s3_location_props(props: &mut HashMap<String, String>, storage: &StorageConfig) {
+    if !storage.s3_endpoint.is_empty() {
+        props.insert("s3.endpoint".to_string(), storage.s3_endpoint.clone());
+    }
+    if !storage.s3_region.is_empty() {
+        props.insert("s3.region".to_string(), storage.s3_region.clone());
+    }
+    if storage.s3_path_style {
+        props.insert("s3.path-style-access".to_string(), "true".to_string());
+    }
+}
+
+fn insert_s3_credential_props(props: &mut HashMap<String, String>, storage: &StorageConfig) {
+    if !storage.s3_access_key.is_empty() {
+        props.insert(
+            "s3.access-key-id".to_string(),
+            storage.s3_access_key.clone(),
+        );
+    }
+    if !storage.s3_secret_key.is_empty() {
+        props.insert(
+            "s3.secret-access-key".to_string(),
+            storage.s3_secret_key.expose().to_string(),
+        );
+    }
+}
+
+/// Block env / profile / IRSA / IMDSv2 so FileIO cannot pick up the
+/// coordinator identity when vended STS is missing (#395 hold).
+fn insert_s3_vended_isolation_props(props: &mut HashMap<String, String>) {
+    props.insert(
+        iceberg::io::S3_DISABLE_CONFIG_LOAD.to_string(),
+        "true".to_string(),
+    );
+    props.insert(
+        iceberg::io::S3_DISABLE_EC2_METADATA.to_string(),
+        "true".to_string(),
+    );
+}
+
 /// Apply a catalog RPC outcome to the breaker.
 ///
 /// Auth answers (401/403) mean Polaris is reachable. Record success so a
@@ -536,6 +576,9 @@ pub struct SessionCatalog {
     http_client: reqwest::Client,
     /// Shared circuit breaker for Polaris REST calls.
     circuit_breaker: Arc<CircuitBreaker>,
+    /// When true, catalog FileIO must use Polaris-vended credentials.
+    /// Configured `[storage]` access/secret keys are not injected (#395).
+    require_vended_credentials: bool,
     /// Shared table metadata cache.
     ///
     /// When a global `TableMetadataCache` is provided at construction time it is
@@ -749,6 +792,7 @@ impl SessionCatalog {
                     table_cache,
                     None,
                     None,
+                    catalog.require_vended_credentials,
                 )
                 .await
             }
@@ -813,6 +857,7 @@ impl SessionCatalog {
             storage_config: storage.clone(),
             http_client: SHARED_HTTP_CLIENT.clone(),
             circuit_breaker,
+            require_vended_credentials: catalog.require_vended_credentials,
             table_cache,
         })
     }
@@ -966,6 +1011,7 @@ impl SessionCatalog {
             Some(self.table_cache.clone()),
             Some(self.http_client.clone()),
             Some(self.circuit_breaker.clone()),
+            self.require_vended_credentials,
         )
         .await
     }
@@ -978,6 +1024,7 @@ impl SessionCatalog {
         table_cache: Option<TableMetadataCache>,
         http_client: Option<reqwest::Client>,
         circuit_breaker: Option<Arc<CircuitBreaker>>,
+        require_vended_credentials: bool,
     ) -> sqe_core::Result<Self> {
         let token_fingerprint = rest_catalog_token_fingerprint(bearer_token);
 
@@ -1008,31 +1055,15 @@ impl SessionCatalog {
         props.insert("uri".to_string(), catalog_url.to_string());
         props.insert("warehouse".to_string(), warehouse.to_string());
 
-        // Inject S3 storage config as properties so that FileIO can be configured
-        // when loading tables (fallback when credential vending is not available).
-        if !storage_config.s3_endpoint.is_empty() {
-            props.insert(
-                "s3.endpoint".to_string(),
-                storage_config.s3_endpoint.clone(),
-            );
-        }
-        if !storage_config.s3_region.is_empty() {
-            props.insert("s3.region".to_string(), storage_config.s3_region.clone());
-        }
-        if !storage_config.s3_access_key.is_empty() {
-            props.insert(
-                "s3.access-key-id".to_string(),
-                storage_config.s3_access_key.clone(),
-            );
-        }
-        if !storage_config.s3_secret_key.is_empty() {
-            props.insert(
-                "s3.secret-access-key".to_string(),
-                storage_config.s3_secret_key.expose().to_string(),
-            );
-        }
-        if storage_config.s3_path_style {
-            props.insert("s3.path-style-access".to_string(), "true".to_string());
+        // Endpoint / region / path-style are location, not identity.
+        // Access keys are the engine-wide fallback. When vended-only,
+        // also disable opendal config/IMDS load so FileIO cannot fall
+        // back to AWS_ACCESS_KEY_ID, ~/.aws/config, IRSA, or IMDSv2.
+        insert_s3_location_props(&mut props, storage_config);
+        if require_vended_credentials {
+            insert_s3_vended_isolation_props(&mut props);
+        } else {
+            insert_s3_credential_props(&mut props, storage_config);
         }
 
         // RisingWave fork uses CatalogBuilder::load(name, props) pattern.
@@ -1046,7 +1077,13 @@ impl SessionCatalog {
         // `catalog_url`+token would reuse the first warehouse's cached context
         // and silently resolve to the wrong warehouse. Issue: lazy Polaris
         // catalog discovery + static multi-warehouse-same-URL configs.
-        let catalog_key = format!("{}-{}-{}", catalog_url, warehouse, token_fingerprint);
+        // Include the FileIO identity mode. A catalog built with static
+        // keys must not be reused when a later session asks for vended-only
+        // FileIO (same URL, warehouse, and bearer).
+        let catalog_key = format!(
+            "{}-{}-{}-vended{}",
+            catalog_url, warehouse, token_fingerprint, require_vended_credentials as u8
+        );
         let inner = if let Some(cached) = REST_CATALOG_CACHE.get(&catalog_key).await {
             debug!(token_fingerprint = %token_fingerprint, "REST catalog cache hit");
             cached
@@ -1083,6 +1120,7 @@ impl SessionCatalog {
             storage_config: storage_config.clone(),
             http_client,
             circuit_breaker,
+            require_vended_credentials,
             table_cache,
         })
     }
@@ -2086,9 +2124,91 @@ impl Catalog for SessionCatalogBridge {
 #[cfg(test)]
 mod cache_capacity_tests {
     use super::{
-        iceberg_error_is_forbidden, record_catalog_breaker_outcome, select_keys_for_suffix,
+        iceberg_error_is_forbidden, insert_s3_credential_props, insert_s3_location_props,
+        insert_s3_vended_isolation_props, record_catalog_breaker_outcome, select_keys_for_suffix,
         REST_CATALOG_CACHE_MAX_CAPACITY,
     };
+    use sqe_core::config::StorageConfig;
+    use std::collections::HashMap;
+
+    fn storage_with_keys() -> StorageConfig {
+        let mut s = StorageConfig::default();
+        s.s3_endpoint = "http://s3.local".to_string();
+        s.s3_region = "us-east-1".to_string();
+        s.s3_access_key = "AKIAEXAMPLE".to_string();
+        s.s3_secret_key = sqe_core::SecretString::new("secret".to_string());
+        s.s3_path_style = true;
+        s
+    }
+
+    #[test]
+    fn vended_mode_omits_static_s3_keys_keeps_location() {
+        let storage = storage_with_keys();
+        let mut props = HashMap::new();
+        insert_s3_location_props(&mut props, &storage);
+        insert_s3_vended_isolation_props(&mut props);
+        assert_eq!(
+            props.get("s3.endpoint").map(String::as_str),
+            Some("http://s3.local")
+        );
+        assert_eq!(
+            props.get("s3.region").map(String::as_str),
+            Some("us-east-1")
+        );
+        assert_eq!(
+            props.get("s3.path-style-access").map(String::as_str),
+            Some("true")
+        );
+        assert!(!props.contains_key("s3.access-key-id"));
+        assert!(!props.contains_key("s3.secret-access-key"));
+        assert_eq!(
+            props
+                .get(iceberg::io::S3_DISABLE_CONFIG_LOAD)
+                .map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            props
+                .get(iceberg::io::S3_DISABLE_EC2_METADATA)
+                .map(String::as_str),
+            Some("true")
+        );
+    }
+
+    #[test]
+    fn vended_mode_disables_config_load_and_ec2_metadata() {
+        let mut props = HashMap::new();
+        insert_s3_vended_isolation_props(&mut props);
+        assert_eq!(
+            props
+                .get(iceberg::io::S3_DISABLE_CONFIG_LOAD)
+                .map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            props
+                .get(iceberg::io::S3_DISABLE_EC2_METADATA)
+                .map(String::as_str),
+            Some("true")
+        );
+        assert!(!props.contains_key("s3.access-key-id"));
+        assert!(!props.contains_key("s3.secret-access-key"));
+    }
+
+    #[test]
+    fn fallback_mode_injects_static_s3_keys() {
+        let storage = storage_with_keys();
+        let mut props = HashMap::new();
+        insert_s3_credential_props(&mut props, &storage);
+        assert_eq!(
+            props.get("s3.access-key-id").map(String::as_str),
+            Some("AKIAEXAMPLE")
+        );
+        assert_eq!(
+            props.get("s3.secret-access-key").map(String::as_str),
+            Some("secret")
+        );
+    }
 
     #[test]
     fn access_denied_closes_half_open_probe() {

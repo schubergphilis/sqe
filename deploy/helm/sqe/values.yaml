@@ -157,6 +157,9 @@ config:
     catalog_url: "http://polaris:8181/api/catalog"
     warehouse: "iceberg"
     metadata_cache_ttl_secs: 30
+    # Dev default. Overlay values-production.yaml sets this true so FileIO
+    # cannot fall back to the shared [storage] keys (issue #395).
+    require_vended_credentials: false
 
   storage:
     s3_endpoint: "http://s3:9000"
