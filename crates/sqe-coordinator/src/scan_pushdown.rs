@@ -406,11 +406,12 @@ mod tests {
         assert_eq!(logical, col("b").in_list(vec![lit(1i64), lit(2i64)], false));
     }
 
-    /// The InList path is how membership reaches workers (issue #415).
-    /// HashTableLookupExpr (used above runtime_filter_inlist_max_values)
-    /// has no logical form and DF proto rewrites it to lit(true).
+    /// InList below `runtime_filter_inlist_max_values` is the membership
+    /// shape that still converts. `HashTableLookupExpr` is not
+    /// constructible from SQE tests (private to DataFusion); DF proto
+    /// rewrites it to `lit(true)` — see runtime-filter-pushdown.md.
     #[test]
-    fn large_inlist_membership_converts_to_logical() {
+    fn inlist_below_cap_converts_to_logical() {
         let s = schema();
         let values: Vec<Arc<dyn PhysicalExpr>> = (0..512).map(|i| plit(i as i64)).collect();
         let expected: Vec<Expr> = (0..512).map(|i| lit(i as i64)).collect();
