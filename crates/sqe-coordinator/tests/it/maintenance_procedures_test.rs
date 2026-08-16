@@ -116,6 +116,21 @@ fn table_health_classifies_as_procedure() {
 }
 
 #[test]
+fn reproject_column_tags_classifies_as_procedure() {
+    let result = parse_and_classify("CALL sqe.system.reproject_column_tags(table => 'ns.t')")
+        .expect("parse ok");
+    match result {
+        StatementKind::Procedure(p) => match *p {
+            ProcedureCall::ReprojectColumnTags {
+                scope: sqe_sql::ReprojectScope::Table(table),
+            } => assert_eq!(table.as_string(), "ns.t"),
+            other => panic!("expected ReprojectColumnTags, got {other:?}"),
+        },
+        other => panic!("expected Procedure, got {other:?}"),
+    }
+}
+
+#[test]
 fn unknown_procedure_falls_through_to_call_error() {
     let result =
         parse_and_classify("CALL system.not_a_real_procedure(table => 'ns.t')").expect("parse ok");

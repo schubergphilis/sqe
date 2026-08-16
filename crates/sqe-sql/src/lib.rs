@@ -37,7 +37,7 @@ pub use paren_less_values::rewrite_paren_less_values;
 pub use partition::normalize_partitioned_by;
 pub use partition_evolution::{try_parse_partition_evolution, PartitionEvolution};
 pub use pipeline_types::{pre_parse_pipeline, ClassifiableSql, UserSql};
-pub use procedures::{try_parse_call, NamespaceRef, ProcedureCall, TableRef};
+pub use procedures::{try_parse_call, NamespaceRef, ProcedureCall, ReprojectScope, TableRef};
 pub use time_travel::{
     extract_incremental_spec, extract_time_travel_spec, IncrementalSpec, TimeTravelSpec, VersionRef,
 };

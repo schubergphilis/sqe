@@ -14,7 +14,7 @@ use tracing::{error, info};
 
 use sqe_catalog::{SessionCatalog, TableMetadataCache};
 use sqe_core::{Session, SqeConfig, SqeError};
-use sqe_sql::{BranchRetention, PartitionEvolution, RefDdl};
+use sqe_sql::{BranchRetention, PartitionEvolution, RefDdl, ReprojectScope, TableRef};
 use tracing::instrument;
 
 use crate::write_handler::{
@@ -1345,6 +1345,93 @@ impl CatalogOps {
         Ok((table_ident, tags))
     }
 
+    /// Project existing Iceberg `sqe.column-tags` into Ranger for tables
+    /// tagged before the projector existed (issue #421).
+    ///
+    /// Does not write Iceberg, so there is no SET TAG rollback. One failed
+    /// table is reported as a row, not a CALL-wide error. Requires
+    /// `project-tags = true`; with it off the CALL fails rather than
+    /// silently walking tables.
+    #[instrument(skip(self, session), fields(username = %session.user.username))]
+    pub async fn reproject_column_tags(
+        &self,
+        session: &Session,
+        scope: &ReprojectScope,
+    ) -> sqe_core::Result<Vec<arrow_array::RecordBatch>> {
+        if !self.tag_projector.enabled() {
+            return Err(SqeError::Execution(
+                "CALL system.reproject_column_tags requires [policy.ranger] \
+                 project-tags = true; with it off, tags stay in Iceberg only \
+                 and other engines cannot see them"
+                    .into(),
+            ));
+        }
+
+        let catalog_name = match scope {
+            ReprojectScope::Table(t) => t.catalog.as_deref(),
+            ReprojectScope::Namespace(ns) => ns.catalog.as_deref(),
+            ReprojectScope::Catalog(c) => Some(c.as_str()),
+        };
+        let session_catalog = self.session_catalog_for(session, catalog_name).await?;
+        let targets = collect_reproject_targets(&session_catalog, session, scope).await?;
+
+        let mut tables = Vec::with_capacity(targets.len());
+        let mut statuses = Vec::with_capacity(targets.len());
+        let mut columns = Vec::with_capacity(targets.len());
+        let mut messages = Vec::with_capacity(targets.len());
+
+        for ident in targets {
+            let table_lock = self.table_lock_for(&ident);
+            let _guard = table_lock.lock().await;
+            let row = self.reproject_one_table(&session_catalog, &ident).await;
+            tables.push(row.table);
+            statuses.push(row.status);
+            columns.push(row.columns_projected);
+            messages.push(row.message);
+        }
+
+        let schema = std::sync::Arc::new(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("table_identifier", arrow_schema::DataType::Utf8, false),
+            arrow_schema::Field::new("status", arrow_schema::DataType::Utf8, false),
+            arrow_schema::Field::new("columns_projected", arrow_schema::DataType::Int64, false),
+            arrow_schema::Field::new("message", arrow_schema::DataType::Utf8, false),
+        ]));
+        let batch = arrow_array::RecordBatch::try_new(
+            schema,
+            vec![
+                std::sync::Arc::new(arrow_array::StringArray::from(tables)),
+                std::sync::Arc::new(arrow_array::StringArray::from(statuses)),
+                std::sync::Arc::new(arrow_array::Int64Array::from(columns)),
+                std::sync::Arc::new(arrow_array::StringArray::from(messages)),
+            ],
+        )
+        .map_err(|e| SqeError::Execution(format!("reproject_column_tags summary: {e}")))?;
+        Ok(vec![batch])
+    }
+
+    async fn reproject_one_table(
+        &self,
+        session_catalog: &SessionCatalog,
+        ident: &TableIdent,
+    ) -> ReprojectRow {
+        let table = match session_catalog.load_table(ident).await {
+            Ok(t) => t,
+            Err(e) => {
+                return ReprojectRow::error(ident.to_string(), format!("load_table failed: {e}"));
+            }
+        };
+        let tags = match crate::tag_source_impl::parse_column_tags(table.metadata().properties()) {
+            Ok(t) => t,
+            Err(e) => {
+                return ReprojectRow::error(
+                    ident.to_string(),
+                    format!("malformed sqe.column-tags JSON: {e}"),
+                );
+            }
+        };
+        reproject_loaded_tags(self.tag_projector.as_ref(), ident, &tags).await
+    }
+
     /// Execute a parsed `PartitionEvolution` (ALTER TABLE ... ADD/DROP/REPLACE
     /// PARTITION FIELD) against the catalog.
     ///
@@ -1582,6 +1669,123 @@ impl CatalogOps {
                 )
                 .await?,
             )),
+        }
+    }
+}
+
+/// One result row of `CALL system.reproject_column_tags`.
+struct ReprojectRow {
+    table: String,
+    status: String,
+    columns_projected: i64,
+    message: String,
+}
+
+impl ReprojectRow {
+    fn projected(table: String, columns: i64) -> Self {
+        Self {
+            table,
+            status: "projected".into(),
+            columns_projected: columns,
+            message: String::new(),
+        }
+    }
+
+    fn skipped(table: String) -> Self {
+        Self {
+            table,
+            status: "skipped".into(),
+            columns_projected: 0,
+            message: "no column tags".into(),
+        }
+    }
+
+    fn error(table: String, message: String) -> Self {
+        Self {
+            table,
+            status: "error".into(),
+            columns_projected: 0,
+            message,
+        }
+    }
+}
+
+/// Project a already-loaded tag map. Isolated so tests can drive the
+/// projector without a live catalog.
+async fn reproject_loaded_tags(
+    projector: &dyn sqe_policy::tag_projector::TagProjector,
+    ident: &TableIdent,
+    tags: &HashMap<String, Vec<String>>,
+) -> ReprojectRow {
+    let table = ident.to_string();
+    if tags.is_empty() {
+        return ReprojectRow::skipped(table);
+    }
+    let key = sqe_policy::tag_projector::TagTableKey::from_namespace(
+        &ident.namespace().to_url_string(),
+        ident.name().to_string(),
+    );
+    let projected: sqe_policy::tag_projector::ColumnTags =
+        tags.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    // previous is empty: this is a first-time (or idempotent add_or_update)
+    // projection of the Iceberg source of truth. Deleting-then-adding the
+    // current map would briefly unmask Spark on a repair of a live table.
+    match projector
+        .project(
+            &key,
+            &sqe_policy::tag_projector::ColumnTags::new(),
+            &projected,
+        )
+        .await
+    {
+        Ok(()) => ReprojectRow::projected(table, tags.len() as i64),
+        Err(e) => ReprojectRow::error(table, e.to_string()),
+    }
+}
+
+fn table_ref_to_ident(table: &TableRef, session: &Session) -> TableIdent {
+    let ns = if table.catalog.is_none() && table.namespace == "default" {
+        session
+            .default_schema
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .unwrap_or(table.namespace.as_str())
+    } else {
+        table.namespace.as_str()
+    };
+    TableIdent::new(NamespaceIdent::new(ns.to_string()), table.name.clone())
+}
+
+async fn collect_reproject_targets(
+    session_catalog: &SessionCatalog,
+    session: &Session,
+    scope: &ReprojectScope,
+) -> sqe_core::Result<Vec<TableIdent>> {
+    match scope {
+        ReprojectScope::Table(table) => Ok(vec![table_ref_to_ident(table, session)]),
+        ReprojectScope::Namespace(ns) => {
+            let ns_ident = NamespaceIdent::new(ns.namespace.clone());
+            session_catalog.list_tables(&ns_ident).await
+        }
+        ReprojectScope::Catalog(_) => {
+            let namespaces = session_catalog.list_namespaces().await?;
+            let mut out = Vec::new();
+            for ns in namespaces {
+                match session_catalog.list_tables(&ns).await {
+                    Ok(mut tables) => out.append(&mut tables),
+                    Err(e) => {
+                        // A 403 on one namespace must not abort a catalog-wide
+                        // repair; skip it the same way SHOW TABLES hides denied
+                        // names.
+                        tracing::warn!(
+                            namespace = %ns,
+                            error = %e,
+                            "reproject_column_tags: skipping namespace"
+                        );
+                    }
+                }
+            }
+            Ok(out)
         }
     }
 }
@@ -2330,5 +2534,98 @@ mod tests {
             let e = unexpected(msg);
             assert!(is_namespace_already_exists(&e), "should match: {msg}");
         }
+    }
+
+    struct RecordingProjector {
+        calls: std::sync::Mutex<Vec<(String, String, usize)>>,
+        fail: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl sqe_policy::tag_projector::TagProjector for RecordingProjector {
+        async fn project(
+            &self,
+            table: &sqe_policy::tag_projector::TagTableKey,
+            _previous: &sqe_policy::tag_projector::ColumnTags,
+            tags: &sqe_policy::tag_projector::ColumnTags,
+        ) -> sqe_core::Result<()> {
+            if self.fail {
+                return Err(SqeError::Execution("ranger down".into()));
+            }
+            self.calls.lock().unwrap().push((
+                table.database.clone(),
+                table.table.clone(),
+                tags.len(),
+            ));
+            Ok(())
+        }
+
+        fn enabled(&self) -> bool {
+            true
+        }
+    }
+
+    fn ident(ns: &str, name: &str) -> TableIdent {
+        TableIdent::new(NamespaceIdent::new(ns.to_string()), name.to_string())
+    }
+
+    #[tokio::test]
+    async fn reproject_loaded_tags_skips_empty_map() {
+        let projector = RecordingProjector {
+            calls: std::sync::Mutex::new(Vec::new()),
+            fail: false,
+        };
+        let row =
+            reproject_loaded_tags(&projector, &ident("sales", "orders"), &HashMap::new()).await;
+        assert_eq!(row.status, "skipped");
+        assert_eq!(row.columns_projected, 0);
+        assert!(projector.calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn reproject_loaded_tags_projects_and_reports_error() {
+        let ok = RecordingProjector {
+            calls: std::sync::Mutex::new(Vec::new()),
+            fail: false,
+        };
+        let mut tags = HashMap::new();
+        tags.insert("ssn".into(), vec!["PII".into()]);
+        tags.insert("email".into(), vec!["PII".into(), "GDPR".into()]);
+        let row = reproject_loaded_tags(&ok, &ident("sales", "orders"), &tags).await;
+        assert_eq!(row.status, "projected");
+        assert_eq!(row.columns_projected, 2);
+        assert_eq!(
+            ok.calls.lock().unwrap().as_slice(),
+            &[("sales".into(), "orders".into(), 2)]
+        );
+
+        let fail = RecordingProjector {
+            calls: std::sync::Mutex::new(Vec::new()),
+            fail: true,
+        };
+        let row = reproject_loaded_tags(&fail, &ident("sales", "orders"), &tags).await;
+        assert_eq!(row.status, "error");
+        assert!(row.message.contains("ranger down"), "got: {}", row.message);
+        assert_eq!(row.columns_projected, 0);
+    }
+
+    #[test]
+    fn table_ref_to_ident_honours_session_schema_for_default_ns() {
+        let mut session = Session::new(
+            "alice".into(),
+            sqe_core::SecretString::new("tok".into()),
+            None,
+            chrono::Utc::now(),
+            vec![],
+        );
+        session.default_schema = Some("tpch_demo".into());
+        let table = TableRef::parse("orders").unwrap();
+        let ident = table_ref_to_ident(&table, &session);
+        assert_eq!(ident.namespace().to_string(), "tpch_demo");
+        assert_eq!(ident.name(), "orders");
+
+        let qualified = TableRef::parse("sales.orders").unwrap();
+        let ident = table_ref_to_ident(&qualified, &session);
+        assert_eq!(ident.namespace().to_string(), "sales");
     }
 }

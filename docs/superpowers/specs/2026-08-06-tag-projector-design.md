@@ -143,10 +143,11 @@ Re-run the `SET TAG` statement. The projection is an idempotent `add_or_update`,
 in the drifted state the property already carries the tag, so the property write is a
 no-op and the projection then lands.
 
-A bulk `CALL sqe.system.reproject_column_tags('cat.ns.tbl')` is still worth having
-for tables tagged BEFORE the projector existed, since nothing re-triggers their
-projection. Deferred, and called out as such in the follow-ups rather than referenced
-by an error message.
+A bulk `CALL system.reproject_column_tags(...)` (also `CALL sqe.system....`) is
+implemented for tables tagged BEFORE the projector existed (issue #421). Scope
+is `table`, `namespace`, or `catalog`. Admin-only. Requires `project-tags`.
+Returns one row per table. Iceberg is not written. A failed SET TAG projection
+is still repaired by re-running SET TAG.
 
 ## Testing
 
