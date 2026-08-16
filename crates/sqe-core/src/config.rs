@@ -1890,6 +1890,12 @@ pub struct CatalogConfig {
     /// global block.
     #[serde(default)]
     pub storage: Option<StorageConfig>,
+    /// When true, never inject the configured `[storage]` access/secret
+    /// keys into Iceberg FileIO. Reads then require Polaris-vended STS
+    /// (or remote signing). Default false for single-tenant / local
+    /// stacks. `production_mode` requires this to be true (issue #395).
+    #[serde(default)]
+    pub require_vended_credentials: bool,
 }
 
 /// Tuning for the two-tier dynamic runtime-filter pushdown (MR #220, issue #132).
@@ -4560,6 +4566,20 @@ impl SqeConfig {
             );
         }
 
+        let rest_missing_vended = |c: &CatalogConfig| {
+            matches!(c.backend, CatalogBackend::Rest) && !c.require_vended_credentials
+        };
+        if rest_missing_vended(&self.catalog) || self.catalogs.values().any(rest_missing_vended) {
+            errors.push(
+                "production_mode: catalog.require_vended_credentials must be true \
+                 on every REST catalog (otherwise FileIO falls back to the shared \
+                 [storage] S3 keys after LOAD_TABLE and Polaris table-data-read \
+                 is not the data gate). Set it on [catalog] and every REST \
+                 [catalogs.*] block."
+                    .to_string(),
+            );
+        }
+
         if self.policy.engine == PolicyEngine::Ranger
             && self.policy.mask_key.is_empty()
             && !self.security.allow_unkeyed_hash_masks
@@ -4829,6 +4849,10 @@ impl SqeConfig {
         env_override_str("SQE_CATALOG__POLARIS_URL", &mut self.catalog.catalog_url);
         env_override_str("SQE_CATALOG__CATALOG_URL", &mut self.catalog.catalog_url);
         env_override_str("SQE_CATALOG__WAREHOUSE", &mut self.catalog.warehouse);
+        env_override_bool(
+            "SQE_CATALOG__REQUIRE_VENDED_CREDENTIALS",
+            &mut self.catalog.require_vended_credentials,
+        );
         env_override_u64(
             "SQE_CATALOG__METADATA_CACHE_TTL_SECS",
             &mut self.catalog.metadata_cache_ttl_secs,
@@ -5921,6 +5945,7 @@ partial_progress_batch = 5
                 runtime_filters: RuntimeFiltersConfig::default(),
                 auth: None,
                 storage: None,
+                require_vended_credentials: false,
             },
             catalogs: HashMap::new(),
             storage: StorageConfig::default(),
@@ -6305,6 +6330,7 @@ partial_progress_batch = 5
         config.rate_limit.enabled = true;
         config.security.allow_insecure_transport = false;
         config.auth.providers = vec![oidc_provider_for_validate()];
+        config.catalog.require_vended_credentials = true;
         config
     }
 
@@ -6632,6 +6658,7 @@ partial_progress_batch = 5
                 runtime_filters: RuntimeFiltersConfig::default(),
                 auth: None,
                 storage: None,
+                require_vended_credentials: false,
             },
         );
         let flat = cfg.flattened_catalogs();
@@ -6663,6 +6690,7 @@ partial_progress_batch = 5
                     runtime_filters: RuntimeFiltersConfig::default(),
                     auth: None,
                     storage: None,
+                    require_vended_credentials: false,
                 },
             );
         }
@@ -6701,6 +6729,7 @@ partial_progress_batch = 5
                 runtime_filters: RuntimeFiltersConfig::default(),
                 auth: None,
                 storage: None,
+                require_vended_credentials: false,
             },
         );
         let flat = cfg.flattened_catalogs();
@@ -7457,6 +7486,24 @@ type = "aws"
         config.query.max_sql_bytes = 0;
         let err = config.validate_production().unwrap_err().to_string();
         assert!(err.contains("query.max_sql_bytes"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_production_rejects_shared_storage_fallback() {
+        let mut config = valid_production_config();
+        config.catalog.require_vended_credentials = false;
+        let err = config.validate_production().unwrap_err().to_string();
+        assert!(err.contains("require_vended_credentials"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_production_rejects_named_catalog_without_vended_flag() {
+        let mut config = valid_production_config();
+        let mut extra = config.catalog.clone();
+        extra.require_vended_credentials = false;
+        config.catalogs.insert("partner".to_string(), extra);
+        let err = config.validate_production().unwrap_err().to_string();
+        assert!(err.contains("require_vended_credentials"), "got: {err}");
     }
 
     // -----------------------------------------------------------------------

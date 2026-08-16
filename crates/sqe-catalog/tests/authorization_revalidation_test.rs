@@ -26,6 +26,7 @@ async fn session(server: &MockServer) -> SessionCatalog {
         None,
         None,
         None,
+        false,
     )
     .await
     .expect("construct session catalog")

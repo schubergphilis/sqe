@@ -1,7 +1,13 @@
 # S3 credential vending (next-steps notes)
 
-Future phase, not yet built. Captures the research and the local-test decision so
-we can pick it up after the Ranger work. Design/brainstorm only at this point.
+Issue #395 shipped the FileIO gate: `[catalog] require_vended_credentials`
+stops the coordinator injecting the shared `[storage]` keys into Iceberg
+FileIO, and `production_mode` requires that flag on every REST catalog.
+This note is the remaining work: put loadTable STS credentials on the
+distributed `ScanTask` instead of the static key.
+
+Future phase for the worker ticket. Captures the research and the local-test
+decision so we can pick it up after the Ranger work.
 
 ## Goal
 
@@ -32,11 +38,14 @@ single broad key. Production object store is AWS S3 or NetApp StorageGRID.
 
 - WRITES already consume vended creds: INSERT/MERGE/DELETE use `table.file_io()`,
   which carries the loadTable vended credentials. Likely works end-to-end today.
-- READS discard them. The coordinator hardcodes `s3_session_token: ""` in every
-  `ScanTask` and reads with the static `[storage]` key
-  (`crates/sqe-coordinator/src/query_handler.rs` ~2277). Vending for reads is
-  explicitly deferred ("Step 5 / Pluggable Catalogs"): the
-  `credential_refresh` callback in `sqe_server.rs` returns `None`.
+- FileIO reads honour `require_vended_credentials` (issue #395): the catalog
+  props omit `s3.access-key-id` / `s3.secret-access-key`, so iceberg-rust
+  cannot fall back to the engine identity after LOAD_TABLE.
+- Distributed READS still discard vended creds. The coordinator hardcodes
+  `s3_session_token: ""` in every `ScanTask` and fills the access/secret
+  from the static `[storage]` key
+  (`crates/sqe-coordinator/src/query_handler.rs` `try_distribute`).
+  The `credential_refresh` callback in `sqe_server.rs` still returns `None`.
 - Worker side is READY: `build_object_store_with_creds` already applies
   `.with_token(session_token)` and there is a credential-refresh channel for
   mid-scan rotation (`crates/sqe-worker/src/executor.rs` ~836, ~549).

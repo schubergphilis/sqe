@@ -180,6 +180,7 @@ async fn make_session(server_uri: &str, token: &str) -> SessionCatalog {
         None, // no shared TableMetadataCache
         None, // default reqwest client
         None, // default circuit breaker
+        false,
     )
     .await
     .expect("SessionCatalog::new should succeed against the wiremock server")
@@ -681,6 +682,7 @@ async fn session_catalog_rejects_server_overriding_token_to_empty() {
         None,
         None,
         None,
+        false,
     )
     .await
     .expect("SessionCatalog::new returns Ok; the merge guard fires on first use");
