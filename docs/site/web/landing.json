@@ -1,40 +1,48 @@
 {
   "heroEyebrow": "Sovereign Query Engine",
-  "heroTitle": "Iceberg-first SQL that scales.",
-  "heroLede": "Run SQE embedded as one binary on your laptop, or distributed across a cluster of stateless workers behind Arrow Flight SQL or Trino HTTP. Same SQL surface, same Iceberg semantics, same identity model. Every query runs as the authenticated user, <strong>no service account, no shared root.</strong>",
+  "heroTitle": "The query engine for the Iceberg lakehouse.",
+  "heroLede": "One binary. Embedded like DuckDB, or a server that scales out like Trino — same SQL, same Iceberg semantics, same per-query identity. Every query runs as the authenticated user, <strong>no service account, no shared root.</strong>",
   "heroNote": "Build from source: <code>cargo install --path crates/sqe-cli</code>, Apache-2.0, Rust, no JVM.",
   "features": [
     {
       "title": "One binary, two modes",
-      "body": "Embedded single-process engine <em>and</em> distributed coordinator + stateless workers, the same SQL surface, the same binary."
+      "body": "Embedded single-process engine <em>and</em> distributed coordinator + stateless workers, the same SQL surface, the same binary.",
+      "pillar": "open"
     },
     {
       "title": "Native Iceberg V2 + V3",
-      "body": "Read <em>and</em> write, not read-only. Position &amp; equality deletes, merge-on-read, copy-on-write, schema evolution."
+      "body": "Read <em>and</em> write, not read-only. Position &amp; equality deletes, merge-on-read, copy-on-write, schema evolution.",
+      "pillar": "iceberg"
     },
     {
       "title": "Per-query identity",
-      "body": "OIDC password grant; the user's bearer token is passed through to the catalog and S3 on <em>every</em> query."
+      "body": "OIDC password grant; the user's bearer token is passed through to the catalog and S3 on <em>every</em> query.",
+      "pillar": "identity"
     },
     {
       "title": "Policy as plan rewriting",
-      "body": "Row filters and column masks via OPA or Cedar, enforced at the LogicalPlan layer before the optimizer runs."
+      "body": "Row filters and column masks via OPA or Cedar, enforced at the LogicalPlan layer before the optimizer runs.",
+      "pillar": "identity"
     },
     {
       "title": "7 catalog backends",
-      "body": "Polaris, Nessie, Unity Catalog OSS, AWS Glue, S3 Tables, Hive Metastore, JDBC, plus Hadoop storage. Multi-cloud."
+      "body": "Polaris, Nessie, Unity Catalog OSS, AWS Glue, S3 Tables, Hive Metastore, JDBC, plus Hadoop storage. Multi-cloud.",
+      "pillar": "iceberg"
     },
     {
       "title": "Two wire protocols",
-      "body": "Arrow Flight SQL and Trino HTTP from the same coordinator. Connect existing Trino clients unchanged."
+      "body": "Arrow Flight SQL and Trino HTTP from the same coordinator. Connect existing Trino clients unchanged.",
+      "pillar": "open"
     },
     {
       "title": "Rust, no JVM",
-      "body": "Sub-second cold start. A C++/DuckDB-class footprint with a distributed story the JVM engines charge for."
+      "body": "Sub-second cold start. A C++/DuckDB-class footprint with a distributed story the JVM engines charge for.",
+      "pillar": "open"
     },
     {
       "title": "Column-level lineage",
-      "body": "Native OpenLineage 2-0-2 emitter with column-level lineage on writes. File and HTTP sinks, disk-spool fallback."
+      "body": "Native OpenLineage 2-0-2 emitter with column-level lineage on writes. File and HTTP sinks, disk-spool fallback.",
+      "pillar": "identity"
     }
   ],
   "compareHead": [
@@ -267,5 +275,77 @@
       "pass": "8/8",
       "win": true
     }
+  ],
+  "heroModes": [
+    {
+      "key": "embedded",
+      "name": "Embedded",
+      "tagline": "DuckDB-shaped local SQL. One binary, no server, no JVM.",
+      "termTitle": "laptop — embedded",
+      "lines": [
+        {
+          "t": "cmd",
+          "s": "sqe-cli --embedded"
+        },
+        {
+          "t": "out",
+          "s": "SQE 0.15.0 · local warehouse"
+        },
+        {
+          "t": "sql",
+          "s": "sqe> SELECT kind, count(*)"
+        },
+        {
+          "t": "sql",
+          "s": "  ...> FROM orders GROUP BY 1;"
+        },
+        {
+          "t": "out",
+          "s": "| purchase | 128 | · 47ms"
+        }
+      ]
+    },
+    {
+      "key": "server",
+      "name": "Server",
+      "tagline": "Coordinator + workers. Any Trino client connects unchanged.",
+      "termTitle": "server — trino client → sqe-server",
+      "lines": [
+        {
+          "t": "cmd",
+          "s": "sqe-server --config sqe.toml"
+        },
+        {
+          "t": "out",
+          "s": "up · flight :50051 · trino :8080"
+        },
+        {
+          "t": "cmd",
+          "s": "trino --server sqe:8080"
+        },
+        {
+          "t": "out",
+          "s": "authenticated as maria (OIDC)"
+        },
+        {
+          "t": "sql",
+          "s": "trino> SELECT kind, count(*)"
+        },
+        {
+          "t": "sql",
+          "s": "   ...> FROM orders GROUP BY 1;"
+        },
+        {
+          "t": "out",
+          "s": "| purchase | 128 | · same result"
+        }
+      ]
+    }
+  ],
+  "quickstartTeaser": [
+    "embedded-files",
+    "polaris-keycloak-client-id",
+    "aws-s3-tables",
+    "benchmark"
   ]
 }
