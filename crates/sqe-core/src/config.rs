@@ -181,6 +181,12 @@ pub struct QueryConfig {
     /// every global permit; set to 0 to disable per-user accounting entirely.
     #[serde(default = "default_max_concurrent_per_user")]
     pub max_concurrent_per_user: usize,
+    /// Cap on concurrent CTAS / INSERT statements that include `ORDER BY`.
+    /// Greedy pools let several sorted writes starve `ExternalSorterMerge`
+    /// reservations and crash the process (issue #408). Default 2. Set to 0
+    /// for unlimited (the pre-#408 behaviour).
+    #[serde(default = "default_max_concurrent_sorted_writes")]
+    pub max_concurrent_sorted_writes: usize,
     /// Maximum reserved memory per authenticated user, summed across all of
     /// their in-flight queries. When a new query would push the user above
     /// this limit, it is rejected with a per-user pressure error even if
@@ -390,6 +396,7 @@ impl Default for QueryConfig {
             max_sql_bytes: default_max_sql_bytes(),
             max_concurrent_queries: default_max_concurrent_queries(),
             max_concurrent_per_user: default_max_concurrent_per_user(),
+            max_concurrent_sorted_writes: default_max_concurrent_sorted_writes(),
             per_user_memory_budget: default_per_user_memory_budget(),
             slow_query_threshold_secs: default_slow_query_threshold(),
             query_profile: default_query_profile(),
@@ -3926,6 +3933,9 @@ fn default_max_concurrent_queries() -> usize {
 fn default_max_concurrent_per_user() -> usize {
     20
 }
+fn default_max_concurrent_sorted_writes() -> usize {
+    2
+}
 fn default_per_user_memory_budget() -> String {
     "1GB".to_string()
 }
@@ -7379,6 +7389,7 @@ type = "aws"
         assert_eq!(config.max_result_rows, 1_000_000);
         assert_eq!(config.max_sql_bytes, 1_048_576);
         assert_eq!(config.max_concurrent_queries, 100);
+        assert_eq!(config.max_concurrent_sorted_writes, 2);
         assert_eq!(config.slow_query_threshold_secs, 30);
         assert_eq!(config.max_query_memory, "256MB");
         assert_eq!(config.query_profile, "off");
