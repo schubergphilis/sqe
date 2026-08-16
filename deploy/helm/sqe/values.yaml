@@ -18,6 +18,8 @@ imagePullSecrets: []
 
 # ── Coordinator ─────────────────────────────────────────────
 coordinator:
+  # Must stay 1. Two replicas do not share sessions, query tracker, secrets,
+  # or ATTACH state (issue #405). The PDB only blocks eviction of this one pod.
   replicas: 1
   resources:
     requests:

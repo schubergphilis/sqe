@@ -38,6 +38,10 @@
 
 > **SPIKED 2026-08-16, issue #415:** DF 54 `PhysicalDynamicFilterNode` serializes `HashTableLookupExpr` as `lit(true)`. Membership cannot ride proto to workers. InList below `runtime_filter_inlist_max_values` already converts. Join-order (part on the probe side) is the remaining distributed SSB gap.
 
+> **DOCUMENTED 2026-08-16, issue #405:** Service level is restartable, not HA. One coordinator. Restart kills in-flight queries and live sessions. PDB `minAvailable: 1` only blocks eviction. `CREATE SECRET`, `ATTACH`, query tracker, and session restore (tokens omitted) are process-local. Do not set `coordinator.replicas` above 1.
+
+> **DOCUMENTED 2026-08-16, issue #411:** HashJoin cannot spill (DF#17267). `JoinStrategyRule` rewrites to SMJ only on an exact over-threshold build estimate. Unknown Iceberg stats keep HashJoin. Rewriting on Unknown doubled TPC-DS at SF1.
+
 > **FIXED 2026-08-12, suite hygiene: `make test-access-control` leaked its own grants between runs, so two denial-baseline tests failed on any stack the suite had already used.**
 >
 > `denied_before_any_grant` and `all_tables_in_schema_grant_covers_the_namespace` both time out after 120 s with `still allowed for alice with 3 rows`. The cause is in Ranger, not in the assertion: a policy named `grant-1786370165684` grants role `analyst` sixteen access types on `sales_wh.ac.orders`, and alice is in `analyst`.

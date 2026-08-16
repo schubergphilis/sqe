@@ -251,6 +251,8 @@ Toggle the budgets with `podDisruptionBudget.enabled` (default `true`) and tune 
 
 ### The coordinator is a single point of failure
 
-The coordinator runs as a single replica. Session state, the worker registry, and in-flight query state are process-local; there is no shared store. A coordinator restart drops every in-flight query and invalidates client sessions, so connected clients must re-authenticate and re-run. A node drain that moves the coordinator pod is a brief outage, not a transparent failover.
+**Service level we ship: restartable, not HA.** One active coordinator. A restart kills in-flight queries and live sessions. Clients retry. Queries do not survive the process. That is the production contract (issue #405). Do not advertise multiple coordinators as HA until there is an external session and query store, plus fencing.
 
-Running more than one coordinator replica is not yet safe. Two replicas do not share sessions or the registry, so clients would land on a coordinator that has never seen their session. Keep `coordinator.replicas: 1`. Full coordinator HA with shared session and registry state is a separate design.
+The coordinator runs as a single replica. Sessions, the query tracker, cancellation, caches, `CREATE SECRET`, `ATTACH`, and shuffle orchestration are process-local. Session-file restore is incomplete: tokens are omitted, so a restored session is not a live one. There is no shared store. A coordinator restart drops every in-flight query and invalidates client sessions, so connected clients must re-authenticate and re-run. A node drain that moves the coordinator pod is a brief outage, not a transparent failover.
+
+The Helm PDB `minAvailable: 1` only blocks an unforced eviction. Two replicas behind a generic load balancer are unsafe: they do not share sessions or the registry, so a client would land on a coordinator that never saw its session. Keep `coordinator.replicas: 1`. Full coordinator HA is a later design.
