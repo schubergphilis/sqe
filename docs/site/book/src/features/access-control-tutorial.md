@@ -443,7 +443,13 @@ ALTER TABLE sales_wh.acdemo.orders UNSET TAGS (region);
 ```
 
 `SET TAGS` merges rather than replaces, so a previous tag on another column
-survives. Flushing the policy cache is part of the statement.
+survives. Flushing the policy cache is part of the statement. With
+`project-tags = true`, the same statement also writes Ranger's tag store. Tables
+tagged before that flag existed need an admin CALL:
+
+```sql
+CALL system.reproject_column_tags(table => 'sales_wh.acdemo.orders');
+```
 
 **The rule: what the tag means.** SQL writes a policy to Ranger's linked tag
 service (SQE discovers the service and component-qualified vocabulary):
@@ -494,9 +500,9 @@ it. The rule in Ranger is what protects it.**
 ### Spark parity
 
 Masks are shared with Spark through the same `query` service. Associations are
-not: Spark reads tag associations from the Ranger or Atlas tag store, while SQE
-reads them from Iceberg table properties. One mask rule, two association
-sources.
+projected: SQE reads Iceberg `sqe.column-tags`, Spark reads Ranger's tag store.
+With `project-tags = true`, `SET TAG` writes both. `CALL system.reproject_column_tags`
+covers tables tagged before the projector existed.
 
 One enforcement detail does not carry over, and it is pinned by
 `scripts/access-control-parity-demo.sh`: Kyuubi places its masking projection

@@ -408,6 +408,10 @@ impl MaintenanceHandler {
                 "refresh_catalog_cache is handled by the query router, not the maintenance handler"
                     .to_string(),
             )),
+            ProcedureCall::ReprojectColumnTags { .. } => Err(SqeError::Execution(
+                "reproject_column_tags is handled by the query router, not the maintenance handler"
+                    .to_string(),
+            )),
         }
     }
 
@@ -724,6 +728,18 @@ impl MaintenanceHandler {
             ProcedureCall::SuggestBloomFilterColumns { .. } | ProcedureCall::TableHealth { .. }
         ) {
             return Ok(());
+        }
+        // Catalog-wide Ranger write. Admin-only; a table writer must not
+        // reproject someone else's tags.
+        if matches!(call, ProcedureCall::ReprojectColumnTags { .. }) {
+            if self.config.auth.has_admin_role(&session.user.roles) {
+                return Ok(());
+            }
+            return Err(SqeError::Catalog(format!(
+                "403 Forbidden: CALL system.reproject_column_tags requires one of \
+                 admin roles {:?}; caller has roles {:?}",
+                self.config.auth.admin_roles, session.user.roles
+            )));
         }
         // `purge_orphan_locations` in dry_run mode is also read-only.
         if let ProcedureCall::PurgeOrphanLocations { dry_run: true, .. } = call {

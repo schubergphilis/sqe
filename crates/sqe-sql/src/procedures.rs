@@ -21,6 +21,10 @@
 //!   report (small/delete-heavy file counts, eligible rewrite groups,
 //!   estimated rewrite bytes). Never mutates the table and never requires
 //!   write privilege (Phase 4a advisory compaction, task 3).
+//! - `system.reproject_column_tags(table => 'ns.t' | namespace => 'ns' |
+//!   catalog => 'cat')` -- admin-only. Project existing Iceberg
+//!   `sqe.column-tags` into Ranger for tables tagged before the projector
+//!   existed. Also accepted as `CALL sqe.system.reproject_column_tags(...)`.
 //!
 //! Options use Iceberg's named-argument syntax (`name => value`). Unknown
 //! options produce a parse error so typos fail fast instead of being silently
@@ -173,6 +177,31 @@ pub enum ProcedureCall {
     /// also drops the shared REST-catalog cache for the rebind case) is
     /// `POST /api/v1/catalogs/refresh`.
     RefreshCatalogCache,
+    /// Project existing Iceberg `sqe.column-tags` into Ranger's tag store
+    /// for tables tagged before the projector existed (issue #421).
+    /// Admin-only. Does not write Iceberg; a failed SET TAG projection is
+    /// still repaired by re-running SET TAG.
+    ReprojectColumnTags { scope: ReprojectScope },
+}
+
+/// Target of [`ProcedureCall::ReprojectColumnTags`]. Exactly one of table,
+/// namespace, or catalog.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReprojectScope {
+    Table(TableRef),
+    Namespace(NamespaceRef),
+    Catalog(String),
+}
+
+impl ReprojectScope {
+    /// Display label for audit logs and result rows that name the request.
+    pub fn as_string(&self) -> String {
+        match self {
+            ReprojectScope::Table(t) => t.as_string(),
+            ReprojectScope::Namespace(ns) => ns.as_string(),
+            ReprojectScope::Catalog(c) => c.clone(),
+        }
+    }
 }
 
 impl ProcedureCall {
@@ -191,6 +220,7 @@ impl ProcedureCall {
             ProcedureCall::RollbackToSnapshot { .. } => "rollback_to_snapshot",
             ProcedureCall::TableHealth { .. } => "table_health",
             ProcedureCall::RefreshCatalogCache => "refresh_catalog_cache",
+            ProcedureCall::ReprojectColumnTags { .. } => "reproject_column_tags",
         }
     }
 
@@ -208,7 +238,12 @@ impl ProcedureCall {
             | ProcedureCall::SetCurrentSnapshot { table, .. }
             | ProcedureCall::RollbackToSnapshot { table, .. }
             | ProcedureCall::TableHealth { table } => Some(table),
-            ProcedureCall::PurgeOrphanLocations { .. } | ProcedureCall::RefreshCatalogCache => None,
+            ProcedureCall::ReprojectColumnTags {
+                scope: ReprojectScope::Table(table),
+            } => Some(table),
+            ProcedureCall::PurgeOrphanLocations { .. }
+            | ProcedureCall::RefreshCatalogCache
+            | ProcedureCall::ReprojectColumnTags { .. } => None,
         }
     }
 
@@ -218,6 +253,7 @@ impl ProcedureCall {
     pub fn target_label(&self) -> String {
         match self {
             ProcedureCall::PurgeOrphanLocations { namespace, .. } => namespace.as_string(),
+            ProcedureCall::ReprojectColumnTags { scope } => scope.as_string(),
             _ => self.table().map(|t| t.as_string()).unwrap_or_default(),
         }
     }
@@ -342,6 +378,7 @@ pub fn try_parse_call(stmt: &Statement) -> sqe_core::Result<Option<ProcedureCall
         // Table-less, argument-less. Any positional/named args are ignored
         // rather than rejected so callers can pass a harmless no-op.
         "refresh_catalog_cache" => Ok(Some(ProcedureCall::RefreshCatalogCache)),
+        "reproject_column_tags" => parse_reproject_column_tags(args).map(Some),
         _ => Ok(None),
     }
 }
@@ -477,6 +514,11 @@ fn split_system_name(name: &ObjectName) -> Option<(String, String)> {
         .collect();
     match parts.as_slice() {
         [a, b] => Some((a.clone(), b.clone())),
+        // Spark-style `CALL <catalog>.system.<proc>(...)`. The catalog prefix
+        // is display-only; handlers resolve against the session catalog.
+        [_, schema, proc] if schema.eq_ignore_ascii_case("system") => {
+            Some((schema.clone(), proc.clone()))
+        }
         _ => None,
     }
 }
@@ -813,6 +855,40 @@ fn parse_table_health(mut args: Vec<(String, Expr)>) -> sqe_core::Result<Procedu
     let table = take_table(&mut args)?;
     expect_no_remaining(&args, "table_health")?;
     Ok(ProcedureCall::TableHealth { table })
+}
+
+/// Parse `CALL system.reproject_column_tags(table => ... | namespace => ... | catalog => ...)`.
+/// Exactly one scope argument is required so a typo cannot silently widen the
+/// blast radius from one table to a whole catalog.
+fn parse_reproject_column_tags(mut args: Vec<(String, Expr)>) -> sqe_core::Result<ProcedureCall> {
+    let table = take_option(&mut args, "table", |e| {
+        TableRef::parse(&expect_string(e, "table")?)
+    })?;
+    let namespace = take_option(&mut args, "namespace", |e| {
+        NamespaceRef::parse(&expect_string(e, "namespace")?)
+    })?;
+    let catalog = take_option(&mut args, "catalog", |e| expect_string(e, "catalog"))?;
+    expect_no_remaining(&args, "reproject_column_tags")?;
+
+    let filled = usize::from(table.is_some())
+        + usize::from(namespace.is_some())
+        + usize::from(catalog.is_some());
+    if filled != 1 {
+        return Err(SqeError::Execution(
+            "CALL system.reproject_column_tags requires exactly one of \
+             `table => 'ns.t'`, `namespace => 'ns'`, or `catalog => 'cat'`"
+                .into(),
+        ));
+    }
+
+    let scope = if let Some(table) = table {
+        ReprojectScope::Table(table)
+    } else if let Some(namespace) = namespace {
+        ReprojectScope::Namespace(namespace)
+    } else {
+        ReprojectScope::Catalog(catalog.expect("filled == 1 and not table/namespace"))
+    };
+    Ok(ProcedureCall::ReprojectColumnTags { scope })
 }
 
 fn parse_suggest_bloom_filter_columns(
@@ -1383,6 +1459,78 @@ mod tests {
         assert_eq!(call.name(), "refresh_catalog_cache");
         // Table-less: no maintenance target.
         assert!(call.table().is_none());
+    }
+
+    #[test]
+    fn parses_reproject_column_tags_table() {
+        let stmt = parse_first("CALL system.reproject_column_tags(table => 'ns.t')");
+        let call = try_parse_call(&stmt).unwrap().expect("match");
+        match &call {
+            ProcedureCall::ReprojectColumnTags {
+                scope: ReprojectScope::Table(table),
+            } => assert_eq!(table.as_string(), "ns.t"),
+            other => panic!("unexpected: {other:?}"),
+        }
+        assert_eq!(call.name(), "reproject_column_tags");
+        assert_eq!(call.table().unwrap().as_string(), "ns.t");
+        assert_eq!(call.target_label(), "ns.t");
+    }
+
+    #[test]
+    fn parses_reproject_column_tags_namespace_and_catalog() {
+        let ns = try_parse_call(&parse_first(
+            "CALL system.reproject_column_tags(namespace => 'sales')",
+        ))
+        .unwrap()
+        .expect("match");
+        match ns {
+            ProcedureCall::ReprojectColumnTags {
+                scope: ReprojectScope::Namespace(namespace),
+            } => {
+                assert_eq!(namespace.as_string(), "sales");
+                assert!(namespace.catalog.is_none());
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        let cat = try_parse_call(&parse_first(
+            "CALL sqe.system.reproject_column_tags(catalog => 'sales_wh')",
+        ))
+        .unwrap()
+        .expect("match");
+        match cat {
+            ProcedureCall::ReprojectColumnTags {
+                scope: ReprojectScope::Catalog(ref name),
+            } => assert_eq!(name, "sales_wh"),
+            other => panic!("unexpected: {other:?}"),
+        }
+        assert!(cat.table().is_none());
+        assert_eq!(cat.target_label(), "sales_wh");
+    }
+
+    #[test]
+    fn reproject_column_tags_requires_exactly_one_scope() {
+        let missing = try_parse_call(&parse_first("CALL system.reproject_column_tags()"))
+            .expect_err("missing scope");
+        assert!(
+            missing.to_string().contains("exactly one of"),
+            "got: {missing}"
+        );
+
+        let both = try_parse_call(&parse_first(
+            "CALL system.reproject_column_tags(table => 'ns.t', catalog => 'c')",
+        ))
+        .expect_err("two scopes");
+        assert!(both.to_string().contains("exactly one of"), "got: {both}");
+    }
+
+    #[test]
+    fn reproject_column_tags_rejects_unknown_arg() {
+        let err = try_parse_call(&parse_first(
+            "CALL system.reproject_column_tags(table => 'ns.t', dry_run => true)",
+        ))
+        .expect_err("unknown arg");
+        assert!(err.to_string().contains("dry_run"), "got: {err}");
     }
 
     #[test]
