@@ -328,6 +328,11 @@ hash_join_memory_threshold = "2GB"
 # Default: 1048576 (1 MiB). Set to 0 for unlimited; production_mode refuses
 # 0 so a production coordinator cannot accept arbitrarily large statements.
 # max_sql_bytes = 1048576
+# Cap concurrent CTAS/INSERT with a top-level ORDER BY (issue #408). Extra
+# sorted writes are rejected with ResourceExhausted, not queued. Default 2.
+# A dbt or bench run that used to fire 4 parallel sorted loads will fail 2
+# of them at this default; raise the cap or drop ORDER BY on the write.
+# max_concurrent_sorted_writes = 2
 
 # ── Query result cache ────────────────────────────────────────
 [query_cache]
