@@ -55,6 +55,7 @@ data:
     catalog_url = {{ .Values.config.catalog.catalog_url | quote }}
     warehouse = {{ .Values.config.catalog.warehouse | quote }}
     metadata_cache_ttl_secs = {{ .Values.config.catalog.metadata_cache_ttl_secs }}
+    require_vended_credentials = {{ .Values.config.catalog.require_vended_credentials }}
 
     [storage]
     s3_endpoint = {{ .Values.config.storage.s3_endpoint | quote }}

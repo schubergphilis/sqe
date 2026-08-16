@@ -16,13 +16,15 @@ See [Kubernetes & Helm](../deployment/kubernetes.md#the-coordinator-is-a-single-
 
 ## Security and data path
 
-### Read-path S3 access uses the static storage key, not a per-user credential
+### Read-path S3 access and `require_vended_credentials`
 
-Writes already consume per-table credentials vended by the catalog: INSERT, MERGE, and DELETE go through the loaded table's file IO, which carries the vended credentials. Reads do not. The coordinator reads data files with the static key configured in the `[storage]` section, the same key for every user. Per-user read credential vending (the catalog returns short-lived, table-scoped S3 credentials and SQE reads with those) is designed but not yet built.
+Writes already consume per-table credentials vended by the catalog: INSERT, MERGE, and DELETE go through the loaded table's file IO, which carries the vended credentials.
 
-The practical consequence: the metadata path is gated per user (the catalog enforces table and namespace permission via the user's bearer token), but the data path is not gated per user on reads. Scope the `[storage]` key to the minimum the engine needs.
+For Iceberg FileIO (single-node scans, metadata, writes), set `[catalog] require_vended_credentials = true` so the engine never injects the configured `[storage]` access and secret keys, and so FileIO does not load `AWS_*` env, `~/.aws/config`, IRSA, or IMDSv2. FileIO then needs Polaris-vended STS or remote signing. `production_mode` requires the flag on every REST catalog (issue #395). Dev and single-tenant stacks can leave it false and keep the static-key fallback.
 
-See [S3 Credential Vending](../design-notes/s3vending.md) for the full design and the phase shape, and the [security model](../architecture/security-model.md) for where this sits in the trust boundary.
+Distributed `ScanTask`s still carry the configured `[storage]` key to workers. Per-user read credential vending on that path (put the loadTable STS triple on the ticket instead of the static key) is designed but not yet built. Multi-tenant clusters with workers still need that work; the FileIO flag does not close the worker ticket.
+
+See [S3 Credential Vending](../design-notes/s3vending.md) for the remaining ScanTask work, and the [security model](../architecture/security-model.md) for where this sits in the trust boundary.
 
 ### Fine-grained policy enforcement is off by default
 

@@ -139,6 +139,12 @@ default_table_format_version = 2  # 2 (default) or 3 for Iceberg v3 tables
 # Fails open on any other probe error. Set false to restore unfiltered
 # listings.
 # namespace_visibility_filter = true
+#
+# When true, Iceberg FileIO never receives the configured [storage]
+# access/secret keys. Reads then need Polaris-vended STS (or remote
+# signing). Default false for single-tenant / local stacks.
+# production_mode requires this on every REST catalog (issue #395).
+# require_vended_credentials = false
 
 [storage]
 s3_endpoint = "http://s3:9000"

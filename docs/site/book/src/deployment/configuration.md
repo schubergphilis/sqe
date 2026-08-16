@@ -65,6 +65,7 @@ default_table_format_version = 2 # Iceberg table format version (2 or 3)
 trust_sort_order = false        # Trust Iceberg sort order for all columns, not just partition keys
 small_file_threshold_mb = 3     # Max file size for the direct-read fast path (0 to disable)
 parquet_compression = "zstd"    # Write-path Parquet codec: zstd, lz4, snappy, none
+require_vended_credentials = false # When true, FileIO never gets [storage] keys (issue #395)
 
 # `catalog_url` accepts any Iceberg REST endpoint. SQE has been
 # verified live against Apache Polaris, Project Nessie 0.107+,
@@ -269,6 +270,7 @@ Every config field can be overridden via environment variable. Convention: `SQE_
 | `SQE_CATALOG__CATALOG_URL` | `catalog.catalog_url` | string |
 | `SQE_CATALOG__POLARIS_URL` | `catalog.catalog_url` (legacy alias) | string |
 | `SQE_CATALOG__WAREHOUSE` | `catalog.warehouse` | string |
+| `SQE_CATALOG__REQUIRE_VENDED_CREDENTIALS` | `catalog.require_vended_credentials` | bool |
 | `SQE_CATALOG__METADATA_CACHE_TTL_SECS` | `catalog.metadata_cache_ttl_secs` | u64 |
 | `SQE_CATALOG__DEFAULT_TABLE_FORMAT_VERSION` | `catalog.default_table_format_version` | u8 |
 | **Storage** | | |
