@@ -431,6 +431,10 @@ pub async fn execute_scan_streaming_with_store(
         };
 
         let mut pending = if idx < task.data_file_paths.len() {
+            let watermark = scan_budget.capacity_bytes().saturating_div(2);
+            while queue_bytes.load(Ordering::Relaxed) > watermark {
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
             let fut = start_next_open(idx, store.clone());
             idx += 1;
             Some(fut)
@@ -449,10 +453,18 @@ pub async fn execute_scan_streaming_with_store(
             total_bytes += bytes;
 
             // Cap fetch charge so a multi-GB file cannot monopolise the scan budget.
+            // Wait for capacity before decoding batches (issue #407): try_acquire
+            // used to skip the charge and let parquet decode run unbounded.
             let fetch_charge = (bytes as usize)
                 .min(scan_budget.capacity_bytes() / 8)
                 .max(1);
-            fetch_permit = scan_budget.try_acquire(fetch_charge).ok();
+            fetch_permit = match scan_budget.acquire(fetch_charge).await {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    let _ = tx.send(Err(anyhow::anyhow!(e))).await;
+                    return;
+                }
+            };
             if let Some(ref m) = metrics {
                 m.scan_fetch_resident_bytes.set(
                     fetch_permit
@@ -460,36 +472,6 @@ pub async fn execute_scan_streaming_with_store(
                         .map(|p| p.charged_bytes())
                         .unwrap_or(0) as f64,
                 );
-            }
-
-            if idx < task.data_file_paths.len() {
-                if let Some(ref mut rx) = credential_rx {
-                    if rx.has_changed().unwrap_or(false) {
-                        let new_creds = rx.borrow_and_update().clone();
-                        if let Some(creds) = new_creds {
-                            info!(
-                                fragment_id = %task.fragment_id,
-                                expiry = %creds.expiry,
-                                "Applying refreshed credentials for next file read"
-                            );
-                            match build_object_store_with_creds(
-                                &task,
-                                &creds.access_key_id,
-                                &creds.secret_access_key,
-                                &creds.session_token,
-                            ) {
-                                Ok(s) => store = Arc::new(s),
-                                Err(e) => warn!(
-                                    fragment_id = %task.fragment_id,
-                                    error = %e,
-                                    "Failed to rebuild object store with refreshed credentials"
-                                ),
-                            }
-                        }
-                    }
-                }
-                pending = Some(start_next_open(idx, store.clone()));
-                idx += 1;
             }
 
             while let Some(batch_res) = file_stream.next().await {
@@ -522,6 +504,44 @@ pub async fn execute_scan_streaming_with_store(
                     );
                     break 'files;
                 }
+            }
+
+            // Issue #407: open the next file only after this one is drained
+            // and the Flight consumer has pulled the queue below half the
+            // scan budget. Prefetching the next parquet decode while the
+            // outbound channel is full is what OOM'd SF10 inventory queries.
+            if idx < task.data_file_paths.len() {
+                let watermark = scan_budget.capacity_bytes().saturating_div(2);
+                while queue_bytes.load(Ordering::Relaxed) > watermark {
+                    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                }
+                if let Some(ref mut rx) = credential_rx {
+                    if rx.has_changed().unwrap_or(false) {
+                        let new_creds = rx.borrow_and_update().clone();
+                        if let Some(creds) = new_creds {
+                            info!(
+                                fragment_id = %task.fragment_id,
+                                expiry = %creds.expiry,
+                                "Applying refreshed credentials for next file read"
+                            );
+                            match build_object_store_with_creds(
+                                &task,
+                                &creds.access_key_id,
+                                &creds.secret_access_key,
+                                &creds.session_token,
+                            ) {
+                                Ok(s) => store = Arc::new(s),
+                                Err(e) => warn!(
+                                    fragment_id = %task.fragment_id,
+                                    error = %e,
+                                    "Failed to rebuild object store with refreshed credentials"
+                                ),
+                            }
+                        }
+                    }
+                }
+                pending = Some(start_next_open(idx, store.clone()));
+                idx += 1;
             }
         }
 
