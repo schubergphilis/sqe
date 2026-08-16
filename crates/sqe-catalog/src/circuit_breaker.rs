@@ -32,12 +32,17 @@ pub struct CircuitBreaker {
     failure_threshold: u32,
     /// How long to stay Open before allowing a probe (Half-Open).
     recovery_timeout: Duration,
+    /// How long a Half-Open probe holds its slot before the next caller may
+    /// replace it. Defaults to `recovery_timeout` (floored at 1 ms) and is
+    /// settable independently via [`CircuitBreaker::with_probe_lease`], so a
+    /// breaker can have a zero recovery window and still serialize probes.
+    probe_lease: Duration,
     /// Timestamp (epoch ms) of the most recent failure. Used to compute
     /// when the recovery window expires.
     last_failure_ms: AtomicU64,
     /// When the current Half-Open probe was admitted. A dropped or
-    /// unanswered probe cannot latch the breaker: after one recovery
-    /// window (at least 1 ms) the next caller may replace it.
+    /// unanswered probe cannot latch the breaker: after one probe lease
+    /// the next caller may replace it.
     half_open_since_ms: AtomicU64,
     /// Current state: 0=Closed, 1=Open, 2=Half-Open.
     state: AtomicU32,
@@ -84,11 +89,30 @@ impl CircuitBreaker {
             failure_count: AtomicU32::new(0),
             failure_threshold,
             recovery_timeout,
+            probe_lease: recovery_timeout.max(Duration::from_millis(1)),
             last_failure_ms: AtomicU64::new(0),
             half_open_since_ms: AtomicU64::new(0),
             state: AtomicU32::new(STATE_CLOSED),
             name: name.into(),
         }
+    }
+
+    /// Override how long a Half-Open probe holds its slot.
+    ///
+    /// The lease exists so a probe that never records an outcome (a dropped
+    /// future, or a 403 that `record_breaker_outcome` deliberately ignores)
+    /// cannot latch the breaker Half-Open forever. It defaults to
+    /// `recovery_timeout`, which is right in production, where that value is
+    /// seconds.
+    ///
+    /// It is separate from `recovery_timeout` because the two windows answer
+    /// different questions — "when may we probe again?" versus "how long do we
+    /// wait for this probe?" — and a caller that wants to probe immediately
+    /// (`recovery_timeout` of zero) still needs probes serialized. Floored at
+    /// 1 ms so a zero lease cannot re-admit every caller.
+    pub fn with_probe_lease(mut self, probe_lease: Duration) -> Self {
+        self.probe_lease = probe_lease.max(Duration::from_millis(1));
+        self
     }
 
     /// Check whether a request may proceed.
@@ -134,14 +158,14 @@ impl CircuitBreaker {
             // A probe is in flight. Deny concurrent callers so we do not
             // stampede the backend. If that probe never records an outcome
             // (dropped future, or a 403 that used to record nothing), the
-            // lease expires after one recovery window and a replacement
-            // probe is admitted. Lease is at least 1 ms so a 0-timeout
-            // test still serializes the first probe.
+            // lease expires and a replacement probe is admitted. The lease is
+            // `probe_lease`, not `recovery_timeout`: a breaker configured to
+            // probe immediately must still serialize its probes.
             STATE_HALF_OPEN => {
                 let started = self.half_open_since_ms.load(Ordering::Acquire);
                 let now = now_millis();
                 let elapsed_ms = now.saturating_sub(started);
-                let lease_ms = (self.recovery_timeout.as_millis() as u64).max(1);
+                let lease_ms = (self.probe_lease.as_millis() as u64).max(1);
                 if elapsed_ms >= lease_ms
                     && self
                         .half_open_since_ms
@@ -327,14 +351,15 @@ mod tests {
 
     #[test]
     fn half_open_admits_only_the_cas_winner() {
-        // Long lease so sequential checks cannot expire the probe on a
-        // loaded CI runner. recovery_timeout=0 made the lease 1 ms and
-        // cargo-gate flake-failed the third assertion (job 5171931).
-        let c = CircuitBreaker::new("test", 1, Duration::from_secs(60));
+        // Zero recovery timeout so the first check probes immediately, but a
+        // long probe lease so the assertions below cannot race the lease
+        // clock. With the lease tied to recovery_timeout this test failed
+        // whenever a millisecond ticked between two checks (#429).
+        let c = CircuitBreaker::new("test", 1, Duration::from_millis(0))
+            .with_probe_lease(Duration::from_secs(60));
         c.record_failure(); // opens
-        c.last_failure_ms.store(0, Ordering::Relaxed);
-        // First check after recovery elapses wins the OPEN->HALF_OPEN CAS and
-        // is the single admitted probe.
+                            // First check after recovery elapses wins the OPEN->HALF_OPEN CAS and
+                            // is the single admitted probe.
         assert!(c.check().is_ok(), "CAS winner must be admitted");
         assert_eq!(c.state_label(), "half_open", "now half-open");
         // Every subsequent caller while half-open is denied (no thundering herd
@@ -356,11 +381,15 @@ mod tests {
         use std::sync::atomic::{AtomicU32, Ordering};
         use std::sync::Arc;
 
-        let c = Arc::new(CircuitBreaker::new("test", 1, Duration::from_secs(60)));
-        c.record_failure();
-        // Recovery elapsed, lease still 60 s so a slow thread spawn cannot
-        // admit a second probe.
-        c.last_failure_ms.store(0, Ordering::Relaxed);
+        // recovery_timeout=0 so the next check probes; a 60s probe lease so
+        // spawning 16 OS threads cannot outlast it and admit a replacement.
+        // Tying the lease to recovery_timeout made this test fail on CI with
+        // `left: 2` (#429).
+        let c = Arc::new(
+            CircuitBreaker::new("test", 1, Duration::from_millis(0))
+                .with_probe_lease(Duration::from_secs(60)),
+        );
+        c.record_failure(); // opens; recovery_timeout=0 so the next check probes
 
         let ok_count = Arc::new(AtomicU32::new(0));
         let mut handles = Vec::new();
@@ -387,7 +416,11 @@ mod tests {
 
     #[test]
     fn stale_half_open_probe_is_replaced_after_lease() {
-        let c = CircuitBreaker::new("test", 1, Duration::from_millis(5));
+        // Long lease, expired deliberately below by rewinding the clock field
+        // rather than by sleeping. A short lease made the "still exclusive"
+        // assertion depend on how fast the test ran (#429).
+        let c = CircuitBreaker::new("test", 1, Duration::from_millis(5))
+            .with_probe_lease(Duration::from_secs(60));
         c.record_failure();
         // Force the open recovery window to have elapsed.
         c.last_failure_ms.store(0, Ordering::Relaxed);
