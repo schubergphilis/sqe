@@ -327,10 +327,14 @@ mod tests {
 
     #[test]
     fn half_open_admits_only_the_cas_winner() {
-        let c = CircuitBreaker::new("test", 1, Duration::from_millis(0));
+        // Long lease so sequential checks cannot expire the probe on a
+        // loaded CI runner. recovery_timeout=0 made the lease 1 ms and
+        // cargo-gate flake-failed the third assertion (job 5171931).
+        let c = CircuitBreaker::new("test", 1, Duration::from_secs(60));
         c.record_failure(); // opens
-                            // First check after recovery elapses wins the OPEN->HALF_OPEN CAS and
-                            // is the single admitted probe.
+        c.last_failure_ms.store(0, Ordering::Relaxed);
+        // First check after recovery elapses wins the OPEN->HALF_OPEN CAS and
+        // is the single admitted probe.
         assert!(c.check().is_ok(), "CAS winner must be admitted");
         assert_eq!(c.state_label(), "half_open", "now half-open");
         // Every subsequent caller while half-open is denied (no thundering herd
@@ -352,8 +356,11 @@ mod tests {
         use std::sync::atomic::{AtomicU32, Ordering};
         use std::sync::Arc;
 
-        let c = Arc::new(CircuitBreaker::new("test", 1, Duration::from_millis(0)));
-        c.record_failure(); // opens; recovery_timeout=0 so the next check probes
+        let c = Arc::new(CircuitBreaker::new("test", 1, Duration::from_secs(60)));
+        c.record_failure();
+        // Recovery elapsed, lease still 60 s so a slow thread spawn cannot
+        // admit a second probe.
+        c.last_failure_ms.store(0, Ordering::Relaxed);
 
         let ok_count = Arc::new(AtomicU32::new(0));
         let mut handles = Vec::new();
