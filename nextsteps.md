@@ -30,6 +30,14 @@
 
 > **IN PROGRESS 2026-08-16, issue #426:** Denied INSERT was already `compare_write_denied` in both engines. The missing cell is ADD COLUMN on a masked table through Spark as well as SQE. Probes added to `scripts/access-control-parity-demo.sh`; Spark ADD COLUMN is non-fatal so an uncalibrated probe cannot abort later sections. Re-calibrate on the Ranger + Spark stack.
 
+> **FIXED 2026-08-16, issue #406 (first slice):** legacy `ShuffleReceiver::send_batch` waits when resident bytes would exceed 64 MiB. Waiters `enable()` before the cap check so `notify_waiters` cannot be lost. DoExchange still prefers SpillablePartitionBuffer when spill is on. Full per-partition disk spill on the mpsc path remains open.
+
+> **FIXED 2026-08-16, issue #407 (first slice):** worker scan waits to acquire the fetch charge before decoding batches, and does not open the next parquet file until the outbound queue is under half the scan budget. Watermark wait is Notify-driven and exits if the Flight consumer drops. Full Flight-frame release + adaptive decode concurrency remain open.
+
+> **FIXED 2026-08-16, issue #408 (first slice):** `query.max_concurrent_sorted_writes` (default 2) rejects extra CTAS/INSERT with a top-level ORDER BY so several greedy-pool sorted writes cannot starve ExternalSorterMerge. Detection is from the parsed statement; the error is ResourceExhausted. Adaptive pool / DF#17334 remain open.
+
+> **SPIKED 2026-08-16, issue #415:** DF 54 `PhysicalDynamicFilterNode` serializes `HashTableLookupExpr` as `lit(true)`. Membership cannot ride proto to workers. InList below `runtime_filter_inlist_max_values` already converts. Join-order (part on the probe side) is the remaining distributed SSB gap.
+
 > **FIXED 2026-08-12, suite hygiene: `make test-access-control` leaked its own grants between runs, so two denial-baseline tests failed on any stack the suite had already used.**
 >
 > `denied_before_any_grant` and `all_tables_in_schema_grant_covers_the_namespace` both time out after 120 s with `still allowed for alice with 3 rows`. The cause is in Ranger, not in the assertion: a policy named `grant-1786370165684` grants role `analyst` sixteen access types on `sales_wh.ac.orders`, and alice is in `analyst`.

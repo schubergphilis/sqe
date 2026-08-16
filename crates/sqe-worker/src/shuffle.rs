@@ -16,7 +16,7 @@ use arrow_schema::SchemaRef;
 use datafusion::common::hash_utils::create_hashes;
 use serde::{Deserialize, Serialize};
 use sqe_metrics::WorkerMetricsRegistry;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex, Notify};
 use tracing::debug;
 
 // ───────────────────────────── ExchangeDescriptor ─────────────────────────────
@@ -158,10 +158,17 @@ impl AttemptGate {
 
 /// Default bounded channel capacity per partition.
 ///
-/// Phase 0 documents that a batch-count bound does **not** bound resident
-/// bytes. Phase 4 replaces each partition buffer with a spillable,
-/// byte-budgeted `SpillablePartitionBuffer`.
+/// A batch-count bound does **not** bound resident bytes. `send_batch`
+/// also waits on [`DEFAULT_MAX_RESIDENT_BYTES`] (issue #406). DoExchange
+/// prefers `SpillablePartitionBuffer` when a SpillManager is configured.
 pub const DEFAULT_CHANNEL_CAPACITY: usize = 64;
+
+/// Default resident-byte cap across all partitions of one `ShuffleReceiver`.
+///
+/// One 64-slot channel of 8 MiB batches is 512 MiB *outside* the DataFusion
+/// pool. 64 MiB backpressures the producer before that cliff. A single batch
+/// larger than the cap is still admitted so a wide row is not wedged.
+pub const DEFAULT_MAX_RESIDENT_BYTES: usize = 64 * 1024 * 1024;
 
 /// Holds per-partition mpsc channels for receiving shuffled RecordBatches.
 ///
@@ -170,8 +177,9 @@ pub const DEFAULT_CHANNEL_CAPACITY: usize = 64;
 ///
 /// Resident bytes across all partitions are tracked in `resident_bytes` and
 /// published to [`WorkerMetricsRegistry::shuffle_resident_bytes`] when metrics
-/// are attached. Tracking is best-effort Phase 0 instrumentation: the channel
-/// itself remains item-bounded, not byte-bounded.
+/// are attached. `send_batch` waits when adding a batch would exceed
+/// `max_resident_bytes` (issue #406). Disk spill remains the DoExchange
+/// SpillManager path; this cap is the legacy mpsc safety net.
 pub struct ShuffleReceiver {
     /// Per-partition senders — DoExchange handler writes here.
     senders: HashMap<u32, mpsc::Sender<RecordBatch>>,
@@ -182,6 +190,10 @@ pub struct ShuffleReceiver {
     /// Sum of `get_array_memory_size()` across batches currently in any
     /// partition channel. Incremented on successful send, decremented on recv.
     resident_bytes: Arc<AtomicUsize>,
+    /// Byte cap for [`Self::send_batch`]. 0 disables the wait (item bound only).
+    max_resident_bytes: usize,
+    /// Wakes `send_batch` waiters when a recv frees bytes.
+    space: Arc<Notify>,
     /// Optional worker metrics for the shuffle_resident_bytes gauge.
     metrics: Option<Arc<WorkerMetricsRegistry>>,
 }
@@ -215,8 +227,16 @@ impl ShuffleReceiver {
             receivers: Mutex::new(receivers),
             schema,
             resident_bytes: Arc::new(AtomicUsize::new(0)),
+            max_resident_bytes: DEFAULT_MAX_RESIDENT_BYTES,
+            space: Arc::new(Notify::new()),
             metrics,
         }
+    }
+
+    /// Override the resident-byte cap. `0` disables the wait (item bound only).
+    pub fn with_max_resident_bytes(mut self, max_resident_bytes: usize) -> Self {
+        self.max_resident_bytes = max_resident_bytes;
+        self
     }
 
     /// Create a ShuffleReceiver with default channel capacity.
@@ -234,7 +254,15 @@ impl ShuffleReceiver {
 
     /// Send a batch into a partition, updating the resident-byte gauge.
     ///
-    /// Returns `Err(batch)` if the channel is closed (receiver dropped).
+    /// Waits while `resident + batch` would exceed `max_resident_bytes`.
+    /// `resident` is summed across **all** partitions of this receiver.
+    /// A single batch larger than the cap is admitted only when that
+    /// sum is already 0 (every partition empty). Returns `Err(batch)` if
+    /// the channel is closed (receiver dropped).
+    ///
+    /// Waiters register with [`Notify::enable`] *before* the cap check so
+    /// a `notify_waiters()` that lands in the window cannot be dropped
+    /// (`Notify::notify_waiters` stores no permit).
     pub async fn send_batch(
         &self,
         partition_id: u32,
@@ -245,6 +273,21 @@ impl ShuffleReceiver {
             None => return Err(batch),
         };
         let bytes = batch.get_array_memory_size();
+        if self.max_resident_bytes > 0 {
+            let future = self.space.notified();
+            tokio::pin!(future);
+            loop {
+                // Register before the load so a drain's notify_waiters
+                // cannot be lost (tokio's "Make sure that no wakeup is lost").
+                future.as_mut().enable();
+                let cur = self.resident_bytes.load(Ordering::Relaxed);
+                if cur == 0 || cur.saturating_add(bytes) <= self.max_resident_bytes {
+                    break;
+                }
+                future.as_mut().await;
+                future.set(self.space.notified());
+            }
+        }
         match sender.send(batch).await {
             Ok(()) => {
                 self.resident_bytes.fetch_add(bytes, Ordering::Relaxed);
@@ -264,6 +307,7 @@ impl ShuffleReceiver {
         Some(TrackedPartitionReceiver {
             inner: rx,
             resident_bytes: self.resident_bytes.clone(),
+            space: self.space.clone(),
             metrics: self.metrics.clone(),
         })
     }
@@ -293,6 +337,7 @@ impl ShuffleReceiver {
 pub struct TrackedPartitionReceiver {
     inner: mpsc::Receiver<RecordBatch>,
     resident_bytes: Arc<AtomicUsize>,
+    space: Arc<Notify>,
     metrics: Option<Arc<WorkerMetricsRegistry>>,
 }
 
@@ -310,6 +355,7 @@ impl TrackedPartitionReceiver {
             m.shuffle_resident_bytes
                 .set(self.resident_bytes.load(Ordering::Relaxed) as f64);
         }
+        self.space.notify_waiters();
         Some(batch)
     }
 }
@@ -785,6 +831,51 @@ mod tests {
         assert!(receiver.take_receiver(0).await.is_some());
         // Second take returns None
         assert!(receiver.take_receiver(0).await.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn send_batch_waits_when_over_byte_cap() {
+        let schema = test_schema();
+        let receiver = ShuffleReceiver::new(1, schema, 8).with_max_resident_bytes(1);
+        let first = make_batch(vec![1, 2, 3], vec!["a", "b", "c"]);
+        let second = make_batch(vec![4, 5, 6], vec!["d", "e", "f"]);
+        assert!(first.get_array_memory_size() > 1);
+        let mut rx = receiver.take_receiver(0).await.expect("rx");
+        receiver
+            .send_batch(0, first)
+            .await
+            .expect("first batch admitted on empty receiver");
+        assert!(receiver.resident_bytes() > 1);
+
+        // No sleep: drain/notify and send race. Either drain wins (cur==0
+        // admits) or send waits and enable() catches notify_waiters.
+        let drain = rx.recv();
+        let send = receiver.send_batch(0, second);
+        let (got, sent) = tokio::join!(drain, send);
+        assert!(got.is_some(), "first batch drained");
+        sent.expect("second send after drain");
+    }
+
+    #[tokio::test]
+    async fn send_batch_completes_when_notify_fires_before_wait() {
+        // Opposite ordering of the wait test: drain (and notify_waiters)
+        // with no waiter registered, then send. enable() plus the cur==0
+        // admit must still complete; a lost notify must not park forever.
+        let schema = test_schema();
+        let receiver = ShuffleReceiver::new(1, schema, 8).with_max_resident_bytes(1);
+        let first = make_batch(vec![1, 2, 3], vec!["a", "b", "c"]);
+        let second = make_batch(vec![4, 5, 6], vec!["d", "e", "f"]);
+        let mut rx = receiver.take_receiver(0).await.expect("rx");
+        receiver
+            .send_batch(0, first)
+            .await
+            .expect("first batch admitted");
+        assert!(rx.recv().await.is_some());
+        assert_eq!(receiver.resident_bytes(), 0);
+        receiver
+            .send_batch(0, second)
+            .await
+            .expect("send after drain-first notify");
     }
 
     // ─── ShuffleManager tests ───
