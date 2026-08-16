@@ -171,7 +171,17 @@ cargo-gate:
   # rustup in the image honours rust-toolchain.toml, so the pinned toolchain is
   # used rather than whatever the base image ships. Keeps the gate honest if the
   # pin moves.
-  image: rust:slim
+  #
+  # Digest-pinned (#393). The floating `rust:slim` tag meant two runs a week
+  # apart could sit on different base images with no record of the change, and
+  # a compromised or retagged upstream would land silently. The digest is the
+  # multi-arch OCI index, so linux/amd64 still resolves on the shared runners.
+  # `1.97.1-slim` matches rust-toolchain.toml; `rust:slim` and `rust:1.97.1-slim`
+  # resolved to this same digest when it was pinned. Renovate's `gitlabci`
+  # manager reads `image:` here and will raise digest bumps, grouped under
+  # "aikido ci templates" by the existing packageRule. Refresh this by hand if
+  # the rust-toolchain.toml channel moves first.
+  image: rust:1.97.1-slim@sha256:8e8cf8f7fd54a2d23d5a743b3a03f56e26b6c774276c33fa0595111704ebb15c
   variables:
     # Deep async state machines in the scan path overflow the default 2MB test
     # thread stack (see docs: write e2e tests need this too).
