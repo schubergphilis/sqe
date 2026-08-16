@@ -30,6 +30,8 @@
 
 > **IN PROGRESS 2026-08-16, issue #426:** Denied INSERT was already `compare_write_denied` in both engines. The missing cell is ADD COLUMN on a masked table through Spark as well as SQE. Probes added to `scripts/access-control-parity-demo.sh`; Spark ADD COLUMN is non-fatal so an uncalibrated probe cannot abort later sections. Re-calibrate on the Ranger + Spark stack.
 
+> **FIXED 2026-08-16, issue #406 (first slice):** legacy `ShuffleReceiver::send_batch` waits when resident bytes would exceed 64 MiB. DoExchange still prefers SpillablePartitionBuffer when spill is on. Full per-partition disk spill on the mpsc path remains open.
+
 > **FIXED 2026-08-12, suite hygiene: `make test-access-control` leaked its own grants between runs, so two denial-baseline tests failed on any stack the suite had already used.**
 >
 > `denied_before_any_grant` and `all_tables_in_schema_grant_covers_the_namespace` both time out after 120 s with `still allowed for alice with 3 rows`. The cause is in Ranger, not in the assertion: a policy named `grant-1786370165684` grants role `analyst` sixteen access types on `sales_wh.ac.orders`, and alice is in `analyst`.
