@@ -13,6 +13,18 @@
 > log fed into, live in `docs/evidence/perf/ssb-sf10-root-cause-sf100-prep.md`.
 > Treat the code as authoritative where the two disagree.
 
+> **Update 2026-08-16, issue #415.** DataFusion 54 added
+> `PhysicalDynamicFilterNode` protobuf. A sealed `DynamicFilterPhysicalExpr`
+> serializes its inner tree. `HashTableLookupExpr` (the membership set above
+> `runtime_filter_inlist_max_values`) is rewritten to `lit(true)` in
+> `datafusion-proto` because the hash table is a process-local `Arc`. Shipping
+> that proto to a worker would drop membership, same as today's
+> `physical_filter_to_logical_lenient` path. The working path remains InList
+> below the cap (default 65536 / 4MB). Large-build membership cannot leave the
+> coordinator until DataFusion serializes the key set. Distributed SSB q4.1/q4.2
+> still lose partkey because part sits on the probe side; that is join order,
+> not this converter.
+
 ## Problem
 
 DataFusion 53 has a runtime / dynamic filter pushdown path: a `HashJoinExec`
