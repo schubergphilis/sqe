@@ -44,6 +44,19 @@ Ranger Admin  --download bundle-->  RangerStore (resolve)  -->  ResolvedPolicy
 ResolvedPolicy  -->  PolicyPlanRewriter  -->  rewritten LogicalPlan  -->  optimizer
 ```
 
+### Namespace matching and the last-component fallback
+
+`resolve` is keyed on the full dotted Iceberg namespace. A Ranger policy
+whose `database` resource is only the last component (`finance`) still
+matches `tenant_a.finance` and `tenant_b.finance`. That is a migration
+path from the old last-component lookup key, not the intended convention.
+
+Over-matching is the safe direction for a mask or row filter: the policy
+keeps firing instead of silently disappearing. The cost is tenant
+collision. Two namespaces that share a last component cannot tell those
+policies apart. Rewrite the Ranger `database` value as the full dotted
+namespace (the same key Kyuubi uses) and the fallback no longer applies.
+
 ### Download bundle
 
 `RangerStore::fetch_bundle` calls one endpoint:
@@ -60,6 +73,15 @@ optional nested `tagPolicies` block when a `tag` service is linked. This is the
 same bundle the JVM Ranger plugin downloads, which is why the policy set is shared
 with Spark/Kyuubi. The public-v2 `/api/policy` endpoint returns a flat
 resource-only array and is insufficient.
+
+The bundle and the per-user `ResolvedPolicy` cache share
+`policy.ranger.cache_ttl_secs` (default 30s). `GRANT` / `REVOKE` / policy
+DDL through SQE call `invalidate_policy_cache()`, so the next query sees
+the edit. Edits made in Ranger Admin behind SQE's back wait until the
+bundle TTL expires. When that download reports a new `policyVersion`,
+the resolved-policy cache is dropped too, so the Admin edit is visible
+on the next resolve instead of waiting out a second 30s. Operators who
+need the change sooner can hit the admin catalog-refresh hook.
 
 ### Resolve
 
