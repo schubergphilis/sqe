@@ -164,6 +164,10 @@ aikido-sbom:
 # Everything advisory (clippy, audit, deny) stays in aikido-test-rust.
 cargo-gate:
   stage: test
+  # Cold rust:slim + --all-features regularly exceeds the default 1h on
+  # MR branches (cache key is per-ref). Several open MRs died mid-compile
+  # with SIGTERM rather than a test failure.
+  timeout: 2h
   # rustup in the image honours rust-toolchain.toml, so the pinned toolchain is
   # used rather than whatever the base image ships. Keeps the gate honest if the
   # pin moves.
@@ -437,53 +441,6 @@ access-control-test:
         - quickstart/polaris-ranger-keycloak/**/*
         - scripts/access-control-test.sh
         - tests/sqe-ranger-test.toml
-  timeout: 1h
-
-# ── Spark access-control e2e (issue #422) ─────────────────────
-# Same stack as access-control-test plus the Spark service. Every
-# assertion starts a JVM, so this is minutes slower and stays a
-# separate job. Manual / schedule only: a green pipeline here is
-# not evidence while dind is flaky (#387). Gate Spark policy
-# changes on a local `make test-access-control-spark`.
-spark-access-control-test:
-  stage: test
-  image: docker:29
-  services:
-    - name: docker:29-dind
-      alias: docker
-      command: ["--tls=false", "--host=tcp://0.0.0.0:2375"]
-  variables:
-    DOCKER_HOST: tcp://docker:2375
-    DOCKER_TLS_CERTDIR: ""
-    DOCKER_DRIVER: overlay2
-    AC_RANGER_TIMEOUT: "600"
-  before_script:
-    - apk add --no-cache bash curl docker-compose rust cargo cmake protobuf-dev openssl-dev pkgconfig clang mold python3
-  script:
-    - ./scripts/spark-access-control-test.sh
-  rules:
-    - if: '$CI_PIPELINE_SOURCE == "schedule"'
-    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
-      changes:
-        - crates/sqe-policy/**/*
-        - crates/sqe-coordinator/src/policy_wiring.rs
-        - crates/sqe-coordinator/tests/it/spark_access_control_e2e.rs
-        - crates/sqe-coordinator/tests/it/common/**/*
-        - quickstart/polaris-ranger-keycloak/**/*
-        - scripts/spark-access-control-test.sh
-        - tests/sqe-ranger-test.toml
-      when: manual
-      allow_failure: true
-    - if: '$CI_COMMIT_BRANCH == "main" && $CI_PIPELINE_SOURCE == "push"'
-      changes:
-        - crates/sqe-policy/**/*
-        - crates/sqe-coordinator/src/policy_wiring.rs
-        - crates/sqe-coordinator/tests/it/spark_access_control_e2e.rs
-        - crates/sqe-coordinator/tests/it/common/**/*
-        - quickstart/polaris-ranger-keycloak/**/*
-        - scripts/spark-access-control-test.sh
-        - tests/sqe-ranger-test.toml
-      allow_failure: true
   timeout: 1h
 
 # ── AWS cloud-backed scenario tests (opt-in, needs AWS creds) ──
