@@ -488,7 +488,14 @@ user = "other"
 
     #[tokio::test]
     async fn reload_picks_up_new_key() {
-        let dir = std::env::temp_dir().join(format!("sqe-api-key-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "sqe-api-key-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let keys_path = dir.join("keys.toml");
 
@@ -502,12 +509,13 @@ user = "original-user"
 "#,
         )
         .unwrap();
+        let initial_mtime = std::fs::metadata(&keys_path).unwrap().modified().unwrap();
 
         let config = ApiKeyProviderConfig {
             keys_file: keys_path.clone(),
             key_prefix: "sqe_".to_string(),
             role_mappings: HashMap::new(),
-            reload_interval: Duration::from_millis(50),
+            reload_interval: Duration::from_millis(20),
         };
 
         let provider = ApiKeyProvider::new(config).unwrap();
@@ -521,8 +529,11 @@ user = "original-user"
         let id = provider.authenticate(&creds).await.unwrap();
         assert_eq!(id.user_id, "original-user");
 
-        // Sleep to ensure mtime differs, then write new file.
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // The watcher samples mtime on first poll. Yield so that sample
+        // happens against the original file; if it starts after the rewrite
+        // it never sees a change.
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
         std::fs::write(
             &keys_path,
             r#"
@@ -536,16 +547,34 @@ user = "new-user"
 "#,
         )
         .unwrap();
+        // Some CI filesystems have 1s mtime granularity. A 100ms sleep is
+        // not enough for the watcher to see a change, so bump mtime past
+        // the value it already sampled.
+        let later = initial_mtime + Duration::from_secs(2);
+        std::fs::File::open(&keys_path)
+            .unwrap()
+            .set_modified(later)
+            .unwrap();
 
-        // Wait for reload.
-        tokio::time::sleep(Duration::from_millis(200)).await;
-
-        // New key should work now.
         let creds2 = FlightCredentials {
             password: Some(sqe_core::SecretString::new("sqe_newkey".to_string())),
             ..Default::default()
         };
-        let id2 = provider.authenticate(&creds2).await.unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let id2 = loop {
+            match provider.authenticate(&creds2).await {
+                Ok(id) => break id,
+                Err(e) if tokio::time::Instant::now() < deadline => {
+                    let _ = e;
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Err(e) => {
+                    watcher.abort();
+                    let _ = std::fs::remove_dir_all(&dir);
+                    panic!("new key never became valid after reload: {e}");
+                }
+            }
+        };
         assert_eq!(id2.user_id, "new-user");
 
         watcher.abort();
