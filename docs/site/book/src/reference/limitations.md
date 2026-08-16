@@ -34,13 +34,14 @@ The gap to know about is the default, not the capability: enforcement does nothi
 
 ### Grant model gaps
 
-Within the grant SQL surface itself, three things are not supported:
+Within the grant SQL surface itself, these things are not supported:
 
 - No `WITH GRANT OPTION`. Grants are non-delegating. Only an admin can grant.
 - No column-level `INSERT`. INSERT granularity is table-level.
 - Mask expressions are scalar only. Aggregate and table-valued mask expressions are rejected.
+- `REVOKE SELECT` does not stop reads. Privileges expand to Polaris access types, and `INSERT` keeps `table-properties-read`, which is what unlocks `LOAD_TABLE`. After the load, SQE reads files directly, so `table-data-read` is not the read gate. Unity Catalog keeps SELECT and MODIFY independent. SQE cannot match that with a grant-profile edit, because a writer has to load the table. Close a gate with `REVOKE ALL PRIVILEGES` and confirm with `CHECK ACCESS` (issue #396).
 
-See [GRANT and REVOKE, Known gaps](../sql-reference/grant-revoke.md#known-gaps).
+See [GRANT and REVOKE, Closing a gate](../sql-reference/grant-revoke.md#closing-a-gate) and [Known gaps](../sql-reference/grant-revoke.md#known-gaps).
 
 ## Iceberg and types
 
