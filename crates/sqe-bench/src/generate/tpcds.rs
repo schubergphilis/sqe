@@ -1486,6 +1486,37 @@ const Q24_ZIP: &str = "10144"; // a ZIP_POOL entry
 /// there are only a handful of stores below SF1. Plant store sk 1 mid-band.
 const Q79_STORE_EMPLOYEES: i32 = 250;
 
+/// q17: one (customer, item) in store_sales 2001Q1, a store return in
+/// 2001Q1-Q3, and catalog_sales in 2001Q1-Q3. Independent baskets, so plant.
+/// Free slots: q25 uses customer 3/item 2, q24 uses customer 4/item 3.
+/// OUR date_dim: sk 1130 = year 2001 moy 2 (Q1); sk 1200 = year 2001 moy 4.
+const Q17_STORE_TICKET: i32 = 5;
+const Q17_CATALOG_ORDER: i32 = 5;
+const Q17_CUSTOMER: i32 = 5;
+const Q17_ITEM: i32 = 4;
+const Q17_2001Q1_DATE_SK: i32 = 1130;
+const Q17_CATALOG_DATE_SK: i32 = 1200;
+
+/// q29: same three-leg shape on 1999 windows. Sale Sep-1999 (sk 615);
+/// return window moy 9..=12 (sk 601..=720) so the planted return date is
+/// forced to 650 (Oct-1999). Catalog leg `d_year IN (1999,2000,2001)` -> 700.
+const Q29_STORE_TICKET: i32 = 6;
+const Q29_CATALOG_ORDER: i32 = 6;
+const Q29_CUSTOMER: i32 = 6;
+const Q29_ITEM: i32 = 5;
+const Q29_SALE_DATE_SK: i32 = 615;
+const Q29_RETURN_DATE_SK: i32 = 650;
+const Q29_CATALOG_DATE_SK: i32 = 700;
+
+/// q85: cdemo marital/education must match across refunded and returning
+/// aliases, plus ws_sales_price in 100..150 in year 2000. Marital/education
+/// are sk-derived (see generate_customer_demographics). sk 15 is
+/// ('M', 'Advanced Degree'). Web order 1 is planted into 2000 at $125.
+const Q85_WEB_ORDER: i32 = 1;
+const Q85_CDEMO_SK: i32 = 15;
+const Q85_2000_DATE_SK: i32 = 800;
+const Q85_SALES_PRICE: f64 = 125.0;
+
 /// Maximum line items per ticket/order. Lines are uniform in 1..=25 so the
 /// `HAVING count(*) BETWEEN 15 AND 20` windows in q34/q46/q68/q73/q79 match
 /// a healthy fraction of tickets. The old generator emitted exactly one line
@@ -1635,6 +1666,36 @@ fn basket(salt: u64, ticket: i32, channel_upper: i32, dims: FkDims) -> Basket {
         b.customer_sk = Some(Q24_CUSTOMER);
         b.channel_sk = Q24_STORE_SK;
         b.items[0] = Q24_ITEM;
+    }
+    // q17: store 2001Q1 + catalog 2001Q2 (still inside Q1-Q3).
+    if dims.customers >= Q17_CUSTOMER && dims.items >= Q17_ITEM {
+        if salt == STORE_TICKET_SALT && ticket == Q17_STORE_TICKET {
+            b.date_sk = Q17_2001Q1_DATE_SK;
+            b.customer_sk = Some(Q17_CUSTOMER);
+            b.items[0] = Q17_ITEM;
+        } else if salt == CATALOG_ORDER_SALT && ticket == Q17_CATALOG_ORDER {
+            b.date_sk = Q17_CATALOG_DATE_SK;
+            b.customer_sk = Some(Q17_CUSTOMER);
+            b.items[0] = Q17_ITEM;
+        }
+    }
+    // q29: store Sep-1999 + catalog Dec-1999.
+    if dims.customers >= Q29_CUSTOMER && dims.items >= Q29_ITEM {
+        if salt == STORE_TICKET_SALT && ticket == Q29_STORE_TICKET {
+            b.date_sk = Q29_SALE_DATE_SK;
+            b.customer_sk = Some(Q29_CUSTOMER);
+            b.items[0] = Q29_ITEM;
+        } else if salt == CATALOG_ORDER_SALT && ticket == Q29_CATALOG_ORDER {
+            b.date_sk = Q29_CATALOG_DATE_SK;
+            b.customer_sk = Some(Q29_CUSTOMER);
+            b.items[0] = Q29_ITEM;
+        }
+    }
+    // q85: web sale in 2000 with a cdemo sk whose marital/education pair
+    // is ('M', 'Advanced Degree').
+    if salt == WEB_ORDER_SALT && ticket == Q85_WEB_ORDER && dims.cdemos >= Q85_CDEMO_SK {
+        b.date_sk = Q85_2000_DATE_SK;
+        b.cdemo_sk = Some(Q85_CDEMO_SK);
     }
     b
 }
@@ -1879,6 +1940,8 @@ fn generate_store_returns(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     let q25_active = dims.customers >= Q25_CUSTOMER && dims.items >= Q25_ITEM;
     let q24_active =
         stores >= Q24_STORE_SK && dims.customers >= Q24_CUSTOMER && dims.items >= Q24_ITEM;
+    let q17_active = dims.customers >= Q17_CUSTOMER && dims.items >= Q17_ITEM;
+    let q29_active = dims.customers >= Q29_CUSTOMER && dims.items >= Q29_ITEM;
     generate_batches(
         store_returns_schema(),
         total,
@@ -1898,6 +1961,12 @@ fn generate_store_returns(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
             } else if row == 1 && q24_active {
                 ticket = Q24_STORE_TICKET;
                 line_override = Some(0);
+            } else if row == 2 && q17_active {
+                ticket = Q17_STORE_TICKET;
+                line_override = Some(0);
+            } else if row == 3 && q29_active {
+                ticket = Q29_STORE_TICKET;
+                line_override = Some(0);
             }
             let b = basket(STORE_TICKET_SALT, ticket, stores, dims);
             let line = line_override.unwrap_or(rng.gen_range(0..b.lines));
@@ -1907,7 +1976,12 @@ fn generate_store_returns(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
             // sales are returned within the next 6 months). Drawing uniformly over
             // the remaining calendar piled returns into 2003 and starved 1998,
             // emptying q91 (Nov-1998) and q25 (Apr-Oct 2001 return window).
-            let ret_date = (b.date_sk + rng.gen_range(1..=120i32)).min(DS_DATE_RANGE);
+            let mut ret_date = (b.date_sk + rng.gen_range(1..=120i32)).min(DS_DATE_RANGE);
+            // q29's return window is moy 9..=12 of 1999. A 1..=120 lag from
+            // Sep-1999 can miss, so force the planted row onto Oct-1999.
+            if row == 3 && q29_active {
+                ret_date = Q29_RETURN_DATE_SK;
+            }
             let amt = rng.gen_range(10..500i32) as f64;
             let tax = amt * 0.08;
             vec![
@@ -2103,7 +2177,12 @@ fn generate_web_sales(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
             // price arms structurally empty.
             let wc = rng.gen_range(100..10_000i32) as f64 / 100.0;
             let lp = ((wc * rng.gen_range(100..300i32) as f64 / 100.0) * 100.0).round() / 100.0;
-            let sp = ((lp * rng.gen_range(0..=100i32) as f64 / 100.0) * 100.0).round() / 100.0;
+            let mut sp = ((lp * rng.gen_range(0..=100i32) as f64 / 100.0) * 100.0).round() / 100.0;
+            // q85 filters ws_sales_price BETWEEN 100 AND 150. Draw after the
+            // rng so non-planted lines keep parity; then pin the planted order.
+            if order == Q85_WEB_ORDER && line == 1 {
+                sp = Q85_SALES_PRICE;
+            }
             let tax = sp * 0.08;
             let ship = sp * 0.05 * qty as f64;
             let ship_date = (b.date_sk + rng.gen_range(1..=120i32)).min(DS_DATE_RANGE);
@@ -2160,8 +2239,11 @@ fn generate_web_returns(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
         web_returns_schema(),
         total,
         seed_for_table("web_returns"),
-        move |_row, rng| {
-            let order = rng.gen_range(1..=max_order);
+        move |row, rng| {
+            let mut order = rng.gen_range(1..=max_order);
+            if row == 0 && dims.cdemos >= Q85_CDEMO_SK {
+                order = Q85_WEB_ORDER;
+            }
             let b = basket(WEB_ORDER_SALT, order, wsites, dims);
             let line = rng.gen_range(0..b.lines);
             let item_sk = b.items[line];
@@ -2529,11 +2611,17 @@ fn generate_customer_demographics(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
         total,
         seed_for_table("customer_demographics"),
         |row, rng| {
+            // dsdgen's customer_demographics is a deterministic cross product
+            // (gender x marital x education x ...), not a random draw. Random
+            // marital/education made q85's cd1=cd2 equality on both attributes
+            // salt-fragile. Stride: education fastest, then marital.
+            let marital = MARITAL[(row / EDUCATION.len()) % MARITAL.len()];
+            let education = EDUCATION[row % EDUCATION.len()];
             vec![
                 i!((row + 1) as i32),
                 s!(random_str(rng, GENDERS)),
-                s!(random_str(rng, MARITAL)),
-                s!(random_str(rng, EDUCATION)),
+                s!(marital),
+                s!(education),
                 i!(rng.gen_range(0..10_000i32) / 100 * 100),
                 s!(random_str(rng, CREDIT)),
                 i!(rng.gen_range(0..6i32)),
@@ -3884,6 +3972,103 @@ mod tests {
         assert!(
             col_i32(&batches, &sch, "sr_ticket_number").contains(&Some(Q25_STORE_TICKET)),
             "no store return for the q25 planted ticket"
+        );
+    }
+
+    #[test]
+    fn q17_coincidence_is_planted() {
+        let scale = 1.0;
+        let dims = FkDims::at(scale);
+        let st = basket(
+            STORE_TICKET_SALT,
+            Q17_STORE_TICKET,
+            store_rows(scale) as i32,
+            dims,
+        );
+        assert_eq!(st.customer_sk, Some(Q17_CUSTOMER), "q17 store customer");
+        assert_eq!(st.items[0], Q17_ITEM, "q17 store item");
+        assert_eq!(st.date_sk, Q17_2001Q1_DATE_SK, "q17 store date");
+        let co = basket(
+            CATALOG_ORDER_SALT,
+            Q17_CATALOG_ORDER,
+            call_center_rows(scale) as i32,
+            dims,
+        );
+        assert_eq!(co.customer_sk, Some(Q17_CUSTOMER), "q17 catalog customer");
+        assert_eq!(co.items[0], Q17_ITEM, "q17 catalog item");
+        assert_eq!(co.date_sk, Q17_CATALOG_DATE_SK, "q17 catalog date");
+        let (sch, batches) = generate_store_returns(scale);
+        assert!(
+            col_i32(&batches, &sch, "sr_ticket_number").contains(&Some(Q17_STORE_TICKET)),
+            "no store return for the q17 planted ticket"
+        );
+    }
+
+    #[test]
+    fn q29_coincidence_is_planted() {
+        let scale = 1.0;
+        let dims = FkDims::at(scale);
+        let st = basket(
+            STORE_TICKET_SALT,
+            Q29_STORE_TICKET,
+            store_rows(scale) as i32,
+            dims,
+        );
+        assert_eq!(st.customer_sk, Some(Q29_CUSTOMER), "q29 store customer");
+        assert_eq!(st.items[0], Q29_ITEM, "q29 store item");
+        assert_eq!(st.date_sk, Q29_SALE_DATE_SK, "q29 store date");
+        let co = basket(
+            CATALOG_ORDER_SALT,
+            Q29_CATALOG_ORDER,
+            call_center_rows(scale) as i32,
+            dims,
+        );
+        assert_eq!(co.customer_sk, Some(Q29_CUSTOMER), "q29 catalog customer");
+        assert_eq!(co.items[0], Q29_ITEM, "q29 catalog item");
+        assert_eq!(co.date_sk, Q29_CATALOG_DATE_SK, "q29 catalog date");
+        let (sch, batches) = generate_store_returns(scale);
+        let tickets = col_i32(&batches, &sch, "sr_ticket_number");
+        let dates = col_i32(&batches, &sch, "sr_returned_date_sk");
+        let planted = tickets
+            .iter()
+            .zip(dates.iter())
+            .any(|(t, d)| *t == Some(Q29_STORE_TICKET) && *d == Some(Q29_RETURN_DATE_SK));
+        assert!(
+            planted,
+            "no store return for the q29 planted ticket on Oct-1999"
+        );
+    }
+
+    #[test]
+    fn q85_cdemo_and_web_price_are_planted() {
+        let scale = 1.0;
+        let (dsch, db) = generate_customer_demographics(scale);
+        let marital = col_str(&db, &dsch, "cd_marital_status");
+        let education = col_str(&db, &dsch, "cd_education_status");
+        let idx = (Q85_CDEMO_SK - 1) as usize;
+        assert_eq!(marital[idx], "M", "cdemo sk 15 marital");
+        assert_eq!(education[idx], "Advanced Degree", "cdemo sk 15 education");
+        let dims = FkDims::at(scale);
+        let wb = basket(
+            WEB_ORDER_SALT,
+            Q85_WEB_ORDER,
+            web_site_rows(scale) as i32,
+            dims,
+        );
+        assert_eq!(wb.date_sk, Q85_2000_DATE_SK, "q85 web date");
+        assert_eq!(wb.cdemo_sk, Some(Q85_CDEMO_SK), "q85 web cdemo");
+        let (sch, batches) = generate_web_sales(scale);
+        let orders = col_i32(&batches, &sch, "ws_order_number");
+        let prices = col_f64(&batches, &sch, "ws_sales_price");
+        let priced = orders
+            .iter()
+            .zip(prices.iter())
+            .any(|(o, p)| *o == Some(Q85_WEB_ORDER) && (*p - Q85_SALES_PRICE).abs() < 1e-9);
+        assert!(priced, "no web sale for q85 order at $125");
+        let (rsch, rb) = generate_web_returns(scale);
+        assert!(
+            col_i32(&rb, &rsch, "wr_order_number").contains(&Some(Q85_WEB_ORDER)),
+            "no web return for the q85 planted order"
         );
     }
 
