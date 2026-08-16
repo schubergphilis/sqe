@@ -44,6 +44,12 @@
 
 > **FIXED 2026-08-16, issue #390:** TPC-DS q17/q29/q85 no longer depend on RNG luck. q17 and q29 plant the three-leg (store, return, catalog) coincidence; q29 forces the return date. `customer_demographics` marital/education is sk-derived; web order 1 is planted at $125 in 2000 for q85.
 
+> **DOCUMENTED 2026-08-16, issue #414:** IcebergScanExec still advertises one output partition. Parallel I/O is inside the scan. Wiring `target_partitions` flipped joins to CollectLeft and regressed TPC-DS q72 5-6x. `parallel_probe_scan` stays opt-in (TPC-DS +26% at SF1). Default-on waits for a cost gate.
+
+> **DOCUMENTED 2026-08-16, issue #417:** TPC-BB Flight SF1 2026-08-15 is 63.1s, q01 35.5s (20 rows), 10/10. Do not quote a TPC-BB total without naming q01.
+
+> **DOCUMENTED 2026-08-16, issue #428 leftovers:** #405/#411 shipped as restartable-not-HA and HashJoin-cannot-spill. #396 documented. #406/#407 first slices landed. #390 planted in !857. #412/#415 remain documented/spiked engine work, not leftover tracking. Remaining #428 items stay on the GitLab issue.
+
 > **FIXED 2026-08-12, suite hygiene: `make test-access-control` leaked its own grants between runs, so two denial-baseline tests failed on any stack the suite had already used.**
 >
 > `denied_before_any_grant` and `all_tables_in_schema_grant_covers_the_namespace` both time out after 120 s with `still allowed for alice with 3 rows`. The cause is in Ranger, not in the assertion: a policy named `grant-1786370165684` grants role `analyst` sixteen access types on `sales_wh.ac.orders`, and alice is in `analyst`.

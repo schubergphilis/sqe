@@ -168,7 +168,7 @@ These are reliability fixes, not optional optimizations:
 
 1. Honest `memory_limit` + `spill_to_disk` on NVMe
 2. Add workers (2, then 4, then N)
-3. Enable `parallel_probe_scan` only after memory clamp is validated (TPC-DS regresses without clamp)
+3. Enable `parallel_probe_scan` only after memory clamp is validated (TPC-DS regresses without clamp). IcebergScanExec still advertises one output partition by default; do not flip that wiring without a TPC-DS rerun (issue #414).
 4. jemalloc A/B for glibc RSS parking after large sorts
 5. Do **not** move coordinator to `memory_pool = "fair"`
 
