@@ -76,6 +76,19 @@ fn insert_s3_credential_props(props: &mut HashMap<String, String>, storage: &Sto
     }
 }
 
+/// Block env / profile / IRSA / IMDSv2 so FileIO cannot pick up the
+/// coordinator identity when vended STS is missing (#395 hold).
+fn insert_s3_vended_isolation_props(props: &mut HashMap<String, String>) {
+    props.insert(
+        iceberg::io::S3_DISABLE_CONFIG_LOAD.to_string(),
+        "true".to_string(),
+    );
+    props.insert(
+        iceberg::io::S3_DISABLE_EC2_METADATA.to_string(),
+        "true".to_string(),
+    );
+}
+
 /// Apply a catalog RPC outcome to the breaker.
 ///
 /// Auth answers (401/403) mean Polaris is reachable. Record success so a
@@ -1043,11 +1056,13 @@ impl SessionCatalog {
         props.insert("warehouse".to_string(), warehouse.to_string());
 
         // Endpoint / region / path-style are location, not identity.
-        // Access keys are the engine-wide fallback: skip them when
-        // require_vended_credentials is set so FileIO cannot silently
-        // read as the coordinator (#395).
+        // Access keys are the engine-wide fallback. When vended-only,
+        // also disable opendal config/IMDS load so FileIO cannot fall
+        // back to AWS_ACCESS_KEY_ID, ~/.aws/config, IRSA, or IMDSv2.
         insert_s3_location_props(&mut props, storage_config);
-        if !require_vended_credentials {
+        if require_vended_credentials {
+            insert_s3_vended_isolation_props(&mut props);
+        } else {
             insert_s3_credential_props(&mut props, storage_config);
         }
 
@@ -2110,7 +2125,8 @@ impl Catalog for SessionCatalogBridge {
 mod cache_capacity_tests {
     use super::{
         iceberg_error_is_forbidden, insert_s3_credential_props, insert_s3_location_props,
-        record_catalog_breaker_outcome, select_keys_for_suffix, REST_CATALOG_CACHE_MAX_CAPACITY,
+        insert_s3_vended_isolation_props, record_catalog_breaker_outcome, select_keys_for_suffix,
+        REST_CATALOG_CACHE_MAX_CAPACITY,
     };
     use sqe_core::config::StorageConfig;
     use std::collections::HashMap;
@@ -2130,6 +2146,7 @@ mod cache_capacity_tests {
         let storage = storage_with_keys();
         let mut props = HashMap::new();
         insert_s3_location_props(&mut props, &storage);
+        insert_s3_vended_isolation_props(&mut props);
         assert_eq!(
             props.get("s3.endpoint").map(String::as_str),
             Some("http://s3.local")
@@ -2140,6 +2157,38 @@ mod cache_capacity_tests {
         );
         assert_eq!(
             props.get("s3.path-style-access").map(String::as_str),
+            Some("true")
+        );
+        assert!(!props.contains_key("s3.access-key-id"));
+        assert!(!props.contains_key("s3.secret-access-key"));
+        assert_eq!(
+            props
+                .get(iceberg::io::S3_DISABLE_CONFIG_LOAD)
+                .map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            props
+                .get(iceberg::io::S3_DISABLE_EC2_METADATA)
+                .map(String::as_str),
+            Some("true")
+        );
+    }
+
+    #[test]
+    fn vended_mode_disables_config_load_and_ec2_metadata() {
+        let mut props = HashMap::new();
+        insert_s3_vended_isolation_props(&mut props);
+        assert_eq!(
+            props
+                .get(iceberg::io::S3_DISABLE_CONFIG_LOAD)
+                .map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            props
+                .get(iceberg::io::S3_DISABLE_EC2_METADATA)
+                .map(String::as_str),
             Some("true")
         );
         assert!(!props.contains_key("s3.access-key-id"));

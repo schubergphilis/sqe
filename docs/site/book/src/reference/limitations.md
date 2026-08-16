@@ -20,7 +20,7 @@ See [Kubernetes & Helm](../deployment/kubernetes.md#the-coordinator-is-a-single-
 
 Writes already consume per-table credentials vended by the catalog: INSERT, MERGE, and DELETE go through the loaded table's file IO, which carries the vended credentials.
 
-For Iceberg FileIO (single-node scans, metadata, writes), set `[catalog] require_vended_credentials = true` so the engine never injects the configured `[storage]` access and secret keys. FileIO then needs Polaris-vended STS or remote signing. `production_mode` requires the flag on every REST catalog (issue #395). Dev and single-tenant stacks can leave it false and keep the static-key fallback.
+For Iceberg FileIO (single-node scans, metadata, writes), set `[catalog] require_vended_credentials = true` so the engine never injects the configured `[storage]` access and secret keys, and so FileIO does not load `AWS_*` env, `~/.aws/config`, IRSA, or IMDSv2. FileIO then needs Polaris-vended STS or remote signing. `production_mode` requires the flag on every REST catalog (issue #395). Dev and single-tenant stacks can leave it false and keep the static-key fallback.
 
 Distributed `ScanTask`s still carry the configured `[storage]` key to workers. Per-user read credential vending on that path (put the loadTable STS triple on the ticket instead of the static key) is designed but not yet built. Multi-tenant clusters with workers still need that work; the FileIO flag does not close the worker ticket.
 
