@@ -580,7 +580,8 @@ fn warn_shared_backend_identity_once(backend: &sqe_core::config::CatalogBackend)
 /// `iceberg::Error`'s kind cannot distinguish 403 from 500, so matching on
 /// the Debug rendering is the only detection that covers both. Timeouts,
 /// 5xx, and auth-refresh failures contain neither marker and therefore
-/// read as NOT forbidden — the callers fail open on those.
+/// read as NOT forbidden — visibility probes must fail the listing on
+/// those rather than leak the namespace name (#401).
 pub(crate) fn iceberg_error_is_forbidden(e: &iceberg::Error) -> bool {
     let rendered = format!("{e:?}").to_ascii_lowercase();
     rendered.contains("403") || rendered.contains("forbidden")
@@ -623,6 +624,24 @@ fn classify_iceberg_catalog_error(context: &str, e: iceberg::Error) -> SqeError 
 /// quietly; any other error is still surfaced/logged.
 pub(crate) fn listing_error_is_forbidden(e: &SqeError) -> bool {
     e.error_code() == sqe_core::SqeErrorCode::AccessDenied
+}
+
+/// Classify a `get_namespace` visibility-probe outcome without a live catalog.
+///
+/// * `Ok(true)`  — probe succeeded; the name is visible
+/// * `Ok(false)` — 403/Forbidden; hide the name
+/// * `Err`       — timeout, 5xx, or other failure; caller must fail the listing
+pub(crate) fn namespace_visible_from_probe<T>(
+    result: Result<T, iceberg::Error>,
+) -> sqe_core::Result<bool> {
+    match result {
+        Ok(_) => Ok(true),
+        Err(e) if iceberg_error_is_forbidden(&e) => Ok(false),
+        Err(e) => Err(classify_iceberg_catalog_error(
+            "Namespace visibility probe failed",
+            e,
+        )),
+    }
 }
 
 impl SessionCatalog {
@@ -1111,32 +1130,31 @@ impl SessionCatalog {
     /// Probe whether this session's caller may see `namespace` at all.
     ///
     /// Issues `get_namespace` (Polaris `LOAD_NAMESPACE_METADATA`) on the
-    /// session bearer. `Ok` means visible. A Forbidden/403-shaped error
-    /// means Polaris+OPA denied this caller, so the NAME must be hidden
-    /// from metadata listings. Every other failure (timeout, 5xx, expired
-    /// token) fails OPEN: the name stays listed, and the per-operation
-    /// checks keep protecting the namespace contents regardless — the same
-    /// posture as the platform's browse-API filtering.
-    pub async fn namespace_visible(&self, namespace: &NamespaceIdent) -> bool {
-        match dispatch_catalog!(self.inner, get_namespace(namespace)) {
-            Ok(_) => true,
-            Err(e) => {
-                if iceberg_error_is_forbidden(&e) {
-                    debug!(
-                        namespace = ?namespace,
-                        "Namespace hidden from listings: visibility probe was denied (403)"
-                    );
-                    false
-                } else {
-                    debug!(
-                        namespace = ?namespace,
-                        error = %e,
-                        "Namespace visibility probe failed with a non-403 error; failing open"
-                    );
-                    true
-                }
-            }
+    /// session bearer.
+    ///
+    /// * `Ok(true)`  — probe succeeded; the name is visible
+    /// * `Ok(false)` — Forbidden/403: Polaris+OPA denied this caller, so
+    ///   the NAME must be hidden from metadata listings
+    /// * `Err`       — timeout, 5xx, expired token, or other failure.
+    ///   Callers (`list_visible_namespace_names` /
+    ///   `filter_visible_namespaces`) must fail the listing as catalog
+    ///   unavailable rather than leak the name. (#401)
+    pub async fn namespace_visible(&self, namespace: &NamespaceIdent) -> sqe_core::Result<bool> {
+        let decision =
+            namespace_visible_from_probe(dispatch_catalog!(self.inner, get_namespace(namespace)));
+        match &decision {
+            Ok(false) => debug!(
+                namespace = ?namespace,
+                "Namespace hidden from listings: visibility probe was denied (403)"
+            ),
+            Err(e) => debug!(
+                namespace = ?namespace,
+                error = %e,
+                "Namespace visibility probe failed; failing the listing"
+            ),
+            Ok(true) => {}
         }
+        decision
     }
 
     /// List all tables in the given namespace.
@@ -2283,7 +2301,7 @@ mod cache_capacity_tests {
     }
 
     /// Timeout- and 5xx-shaped errors must NOT read as forbidden: the
-    /// visibility probe fails open on them and keeps the namespace listed.
+    /// visibility probe propagates them so the listing fails (#401).
     #[test]
     fn timeout_and_5xx_shapes_are_not_forbidden() {
         let timeout = iceberg::Error::new(
@@ -2348,5 +2366,47 @@ mod cache_capacity_tests {
         .with_context("status", "500 Internal Server Error");
         let wrapped = super::classify_iceberg_catalog_error("Failed to list tables", e);
         assert!(!super::listing_error_is_forbidden(&wrapped));
+    }
+
+    /// #401: a successful probe is visible; 403 hides the name; timeout/5xx
+    /// propagate so the listing fails instead of leaking the name.
+    #[test]
+    fn namespace_visible_from_probe_ok_is_true() {
+        let visible = super::namespace_visible_from_probe(Ok(())).unwrap();
+        assert!(visible);
+    }
+
+    #[test]
+    fn namespace_visible_from_probe_403_is_false() {
+        let e = iceberg::Error::new(
+            iceberg::ErrorKind::Unexpected,
+            "Received response with unexpected status code",
+        )
+        .with_context("status", "403 Forbidden");
+        let visible = super::namespace_visible_from_probe::<()>(Err(e)).unwrap();
+        assert!(!visible);
+    }
+
+    #[test]
+    fn namespace_visible_from_probe_timeout_propagates() {
+        let e = iceberg::Error::new(
+            iceberg::ErrorKind::Unexpected,
+            "error sending request: operation timed out",
+        );
+        let err = super::namespace_visible_from_probe::<()>(Err(e))
+            .expect_err("timeout must fail the listing, not keep the name");
+        assert_ne!(err.error_code(), sqe_core::SqeErrorCode::AccessDenied);
+    }
+
+    #[test]
+    fn namespace_visible_from_probe_5xx_propagates() {
+        let e = iceberg::Error::new(
+            iceberg::ErrorKind::Unexpected,
+            "Received response with unexpected status code",
+        )
+        .with_context("status", "500 Internal Server Error");
+        let err = super::namespace_visible_from_probe::<()>(Err(e))
+            .expect_err("5xx must fail the listing, not keep the name");
+        assert_eq!(err.error_code(), sqe_core::SqeErrorCode::CatalogUnavailable);
     }
 }
