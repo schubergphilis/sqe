@@ -245,8 +245,9 @@ recorded in [Ranger tag storage](./ranger-tag-storage-decision.md).
    bundle's `tagPolicies` block. Shared with Spark/Kyuubi like resource policies.
 2. **The tag-to-column ASSOCIATION** ("column `ssn` has tag `PII`") lives in the
    Iceberg/Polaris table property `sqe.column-tags`, a JSON object mapping column
-   name to a list of tags. The mask RULE is shared with Spark/Kyuubi; the
-   association is not yet, pending the Iceberg-to-Ranger tag sync.
+   name to a list of tags. The mask RULE is shared with Spark/Kyuubi. The
+   association is projected into Ranger's tag store when
+   `[policy.ranger] project-tags = true` (off by default).
 
 ### Authoring column tags
 
@@ -263,6 +264,23 @@ ALTER TABLE sales.orders UNSET TAGS (salary);
 Snowflake's column-tag syntax works too. The tag name becomes the label; SQE has
 no tag values, so the assigned value is ignored. `ALTER COLUMN` is accepted as a
 synonym for `MODIFY COLUMN`.
+
+With `project-tags` on, `SET TAGS` also writes the association into Ranger so
+Spark sees it. Tables tagged before that flag existed stay SQE-only until an
+admin runs:
+
+```sql
+CALL system.reproject_column_tags(table => 'sales.orders');
+CALL system.reproject_column_tags(namespace => 'sales');
+CALL system.reproject_column_tags(catalog => 'sales_wh');
+```
+
+`CALL sqe.system.reproject_column_tags(...)` is the same procedure. Exactly one
+scope argument is required. The call is admin-only (`[auth] admin_roles`) and
+refuses to run when `project-tags` is off. Each table returns a row:
+`projected`, `skipped` (no Iceberg tags), or `error`. Iceberg is not written, so
+there is no SET TAG rollback. A failed SET TAG projection is still repaired by
+re-running SET TAG.
 
 ### Authoring the tag policy: mask types carry a component prefix
 
