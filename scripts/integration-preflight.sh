@@ -56,7 +56,12 @@ for port in "${PORTS[@]}"; do
         'index($2, p) { print $1; exit }')"
 
     if [ -n "$holder" ]; then
-        if printf '%s\n' "$OWN_CONTAINERS" | grep -qxF "$holder"; then
+        # Guard on OWN_CONTAINERS being non-empty explicitly: on a clean machine
+        # it is the empty string, and `printf '%s\n' ""` emits one BLANK line, so
+        # a blank holder would match it and a foreign port would be accepted.
+        # `holder` is only set when awk matched, so that cannot happen today;
+        # this makes the safety designed rather than incidental.
+        if [ -n "$OWN_CONTAINERS" ] && printf '%s\n' "$OWN_CONTAINERS" | grep -qxF "$holder"; then
             continue  # our own stack, still up from a previous run
         fi
         echo "ERROR: host port $port is held by container '$holder'," >&2
