@@ -100,8 +100,12 @@ cargo test --all
 # Clippy (strict)
 cargo clippy --all-targets --all-features -- -D warnings
 
-# Integration tests (requires running quickstart stack: Polaris + S3-compatible storage)
-scripts/integration-test.sh
+# Integration tests: LOCAL ONLY, no CI equivalent (issue #387 removed the dind
+# jobs). Brings up its own Polaris + RustFS stack; preflights the fixed ports.
+make test-integration                             # full suite
+make test-integration FILTER=test_ctas_roundtrip  # one test
+make test-distributed                             # coordinator + 2 workers
+make test-integration-down                        # tear the stack down
 
 # Security advisory scan
 cargo audit
