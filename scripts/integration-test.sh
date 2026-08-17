@@ -64,6 +64,14 @@ if [ "$#" -eq 0 ] && [ "$DISTRIBUTED" != "1" ]; then
     # via `cargo test --release -p sqe-coordinator --test
     # in_subquery_or_stack_overflow`.
     SKIP_ARGS+=(--skip prod_stack_4k --skip prod_stack_8k --skip prod_stack_16k --skip prod_stack_32k)
+    # Tests that need live sqe-worker processes, not just the test stack. They
+    # were added after the test_distributed_select skip above was written, so a
+    # default run reported four failures that no healthy machine could avoid.
+    # rewrite_data_files_distributed_parity wants TWO workers on :50052 and
+    # :50053 (see that file's header for the env overrides);
+    # compaction_distributed_benchmark measures a distributed-vs-local ratio.
+    SKIP_ARGS+=(--skip rewrite_data_files_distributed_parity)
+    SKIP_ARGS+=(--skip compaction_distributed_benchmark)
 fi
 RUST_LOG="${RUST_LOG:-sqe_coordinator=info,sqe_catalog=info,sqe_auth=info,warn}" \
 RUST_MIN_STACK="${RUST_MIN_STACK:-8388608}" \
