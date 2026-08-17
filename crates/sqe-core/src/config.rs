@@ -842,18 +842,20 @@ pub struct WorkerMemoryConfig {
     #[serde(default = "default_process_headroom")]
     pub process_headroom: String,
     /// Byte budget for decoded scan batches in the worker pipeline. Default:
-    /// 25% of `worker.memory_limit`.
+    /// 20% of `worker.memory_limit`.
     #[serde(default)]
     pub scan_budget: String,
-    /// Byte budget for Flight encode / in-flight encoded data. Default: 12.5%
-    /// of `worker.memory_limit`.
+    /// Byte budget for encoded Flight frames awaiting shipment to the
+    /// coordinator. Default: 10% of `worker.memory_limit`. Charged per frame,
+    /// worker-wide, so it bounds the SUM across concurrent DoGet streams
+    /// (issue #407).
     #[serde(default)]
     pub flight_budget: String,
     /// Byte budget for blocking operator state (joins/aggs/sorts). Default:
-    /// 50% of `worker.memory_limit`.
+    /// 40% of `worker.memory_limit`.
     #[serde(default)]
     pub operator_budget: String,
-    /// Byte budget for shuffle partition buffers. Default: 12.5% of
+    /// Byte budget for shuffle partition buffers. Default: 20% of
     /// `worker.memory_limit`.
     #[serde(default)]
     pub shuffle_memory_budget: String,
