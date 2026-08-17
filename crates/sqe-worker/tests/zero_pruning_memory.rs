@@ -218,7 +218,11 @@ async fn phase0_reproducer_shuffle_exceeds_byte_budget() {
         schema,
         DEFAULT_CHANNEL_CAPACITY,
         Some(metrics.clone()),
-    );
+    )
+    // This reproducer measures the old item-only bound. The production
+    // receiver now has a byte cap; leaving it enabled would correctly
+    // backpressure this producer, which has no consumer, and hang the test.
+    .with_max_resident_bytes(0);
 
     const ROWS: usize = 256;
     const PAYLOAD: usize = 4_096;
@@ -228,10 +232,13 @@ async fn phase0_reproducer_shuffle_exceeds_byte_budget() {
     for _ in 0..DEFAULT_CHANNEL_CAPACITY {
         let batch = wide_batch(ROWS, PAYLOAD);
         let sz = batch.get_array_memory_size();
-        receiver
-            .send_batch(0, batch)
-            .await
-            .expect("channel should accept up to capacity");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            receiver.send_batch(0, batch),
+        )
+        .await
+        .expect("item-only reproducer send must not block")
+        .expect("channel should accept up to capacity");
         sent += 1;
         buffered_bytes += sz;
     }
