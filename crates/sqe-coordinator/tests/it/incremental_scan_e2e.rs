@@ -237,7 +237,7 @@ async fn incremental_scan_three_snapshots_returns_45_rows() {
         .execute(
             &session,
             &format!(
-                "SELECT snapshot_id FROM table_snapshots('{ns}', 'orders') ORDER BY timestamp_ms"
+                "SELECT snapshot_id FROM table_snapshots('{ns}', 'orders') ORDER BY committed_at"
             ),
             None,
         )
@@ -308,7 +308,7 @@ async fn incremental_scan_meta_columns_are_populated() {
         .execute(
             &session,
             &format!(
-                "SELECT snapshot_id FROM table_snapshots('{ns}', 'events') ORDER BY timestamp_ms"
+                "SELECT snapshot_id FROM table_snapshots('{ns}', 'events') ORDER BY committed_at"
             ),
             None,
         )
