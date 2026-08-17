@@ -3,7 +3,7 @@ use std::sync::Arc;
 use arrow_array::{Date32Array, Decimal128Array, Int32Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 
 use super::{parquet_writer, BenchmarkGenerator, GenerateStats, TableDef};
 
@@ -181,7 +181,7 @@ const DATE_START: i32 = 18262; // days since 1970-01-01 for 2020-01-01
 const DATE_RANGE: i32 = 1827; // ~5 years in days
 
 fn random_date(rng: &mut StdRng) -> i32 {
-    DATE_START + rng.gen_range(0..DATE_RANGE)
+    DATE_START + rng.random_range(0..DATE_RANGE)
 }
 
 // ---------------------------------------------------------------------------
@@ -225,23 +225,23 @@ const CHARS_DIGIT: &[u8] = b"0123456789";
 
 fn random_str(rng: &mut StdRng, chars: &[u8], len: usize) -> String {
     (0..len)
-        .map(|_| chars[rng.gen_range(0..chars.len())] as char)
+        .map(|_| chars[rng.random_range(0..chars.len())] as char)
         .collect()
 }
 
 fn random_name(rng: &mut StdRng) -> String {
-    let len = rng.gen_range(6..=10usize);
+    let len = rng.random_range(6..=10usize);
     random_str(rng, CHARS_ALPHA, len)
 }
 
 fn random_street(rng: &mut StdRng) -> String {
-    let num = rng.gen_range(1..=999i32);
-    let len = rng.gen_range(4..=10usize);
+    let num = rng.random_range(1..=999i32);
+    let len = rng.random_range(4..=10usize);
     format!("{} {}", num, random_str(rng, CHARS_ALPHA, len))
 }
 
 fn random_city(rng: &mut StdRng) -> String {
-    let len = rng.gen_range(6..=12usize);
+    let len = rng.random_range(6..=12usize);
     random_str(rng, CHARS_ALPHA, len)
 }
 
@@ -250,7 +250,7 @@ fn random_state(rng: &mut StdRng) -> String {
 }
 
 fn random_zip(rng: &mut StdRng) -> String {
-    format!("{:05}1111", rng.gen_range(0..=99999i32))
+    format!("{:05}1111", rng.random_range(0..=99999i32))
 }
 
 fn random_phone(rng: &mut StdRng) -> String {
@@ -258,7 +258,7 @@ fn random_phone(rng: &mut StdRng) -> String {
 }
 
 fn random_data(rng: &mut StdRng) -> String {
-    let len = rng.gen_range(26..=50usize);
+    let len = rng.random_range(26..=50usize);
     random_str(rng, CHARS_ALNUM, len)
 }
 
@@ -316,7 +316,7 @@ fn generate_warehouse(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
             w_city.push(random_city(&mut rng));
             w_state.push(random_state(&mut rng));
             w_zip.push(random_zip(&mut rng));
-            w_tax.push((rng.gen_range(0..=2000i32) as f64) / 10000.0);
+            w_tax.push((rng.random_range(0..=2000i32) as f64) / 10000.0);
             w_ytd.push(300_000.0_f64);
         }
 
@@ -390,7 +390,7 @@ fn generate_district(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
             d_city.push(random_city(&mut rng));
             d_state.push(random_state(&mut rng));
             d_zip.push(random_zip(&mut rng));
-            d_tax.push((rng.gen_range(0..=2000i32) as f64) / 10000.0);
+            d_tax.push((rng.random_range(0..=2000i32) as f64) / 10000.0);
             d_ytd.push(30_000.0_f64);
             // next order id starts at 3001 (per TPC-C spec: 3000 orders loaded)
             d_next_o_id.push(3001i32);
@@ -474,7 +474,7 @@ fn generate_customer(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
             let wid = ((idx / 30_000) as i32 + 1).min(num_warehouses);
 
             // 10% bad credit
-            let credit = if rng.gen_range(0..10) == 0 {
+            let credit = if rng.random_range(0..10) == 0 {
                 "BC"
             } else {
                 "GC"
@@ -483,7 +483,7 @@ fn generate_customer(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
             let last = if cid <= 1000 {
                 make_last_name((cid - 1) as usize)
             } else {
-                make_last_name(rng.gen_range(0..1000usize))
+                make_last_name(rng.random_range(0..1000usize))
             };
 
             c_id.push(cid);
@@ -501,7 +501,7 @@ fn generate_customer(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
             c_since.push(random_date(&mut rng));
             c_credit.push(credit.to_string());
             c_credit_lim.push(50_000.0_f64);
-            c_discount.push((rng.gen_range(0..=5000i32) as f64) / 10000.0);
+            c_discount.push((rng.random_range(0..=5000i32) as f64) / 10000.0);
             c_balance.push(-10.0_f64);
             c_ytd_payment.push(10.0_f64);
             c_payment_cnt.push(1i32);
@@ -655,7 +655,7 @@ fn generate_orders(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
 
             // Last 900 orders per district are new orders (no carrier yet)
             let carrier = if oid <= 2100 {
-                Some(rng.gen_range(1..=10i32))
+                Some(rng.random_range(1..=10i32))
             } else {
                 None
             };
@@ -663,10 +663,10 @@ fn generate_orders(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
             o_id.push(oid);
             o_d_id.push(did);
             o_w_id.push(wid);
-            o_c_id.push(rng.gen_range(1..=num_customers_per_district));
+            o_c_id.push(rng.random_range(1..=num_customers_per_district));
             o_entry_d.push(random_date(&mut rng));
             o_carrier_id.push(carrier);
-            o_ol_cnt.push(rng.gen_range(5..=15i32));
+            o_ol_cnt.push(rng.random_range(5..=15i32));
             o_all_local.push(1i32);
         }
 
@@ -786,7 +786,7 @@ fn generate_order_line(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
             };
             // new orders have amount 0, delivered orders have non-zero amount
             let amount = if oid <= 2100 {
-                (rng.gen_range(1..=999999i32) as f64) / 100.0
+                (rng.random_range(1..=999999i32) as f64) / 100.0
             } else {
                 0.0
             };
@@ -795,7 +795,7 @@ fn generate_order_line(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
             ol_d_id.push(did);
             ol_w_id.push(wid);
             ol_number.push(line_num);
-            ol_i_id.push(rng.gen_range(1..=num_items));
+            ol_i_id.push(rng.random_range(1..=num_items));
             ol_supply_w_id.push(wid);
             ol_delivery_d.push(delivery_d);
             ol_quantity.push(5i32);
@@ -848,12 +848,12 @@ fn generate_item() -> (SchemaRef, Vec<RecordBatch>) {
         for i in 0..n {
             let id = (offset + i + 1) as i32;
             i_id.push(id);
-            i_im_id.push(rng.gen_range(1..=10_000i32));
+            i_im_id.push(rng.random_range(1..=10_000i32));
             i_name.push(random_name(&mut rng));
-            i_price.push((rng.gen_range(100..=10_000i32) as f64) / 100.0);
+            i_price.push((rng.random_range(100..=10_000i32) as f64) / 100.0);
             // 10% of items have "ORIGINAL" in data (TPC-C spec)
-            let data = if rng.gen_range(0..10) == 0 {
-                let pos = rng.gen_range(0..=14usize);
+            let data = if rng.random_range(0..10) == 0 {
+                let pos = rng.random_range(0..=14usize);
                 let base = random_data(&mut rng);
                 format!(
                     "{}ORIGINAL{}",
@@ -930,7 +930,7 @@ fn generate_stock(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
 
             s_i_id.push(item_id);
             s_w_id.push(wid.min(num_warehouses));
-            s_quantity.push(rng.gen_range(10..=100i32));
+            s_quantity.push(rng.random_range(10..=100i32));
             s_dist_01.push(random_dist_info(&mut rng));
             s_dist_02.push(random_dist_info(&mut rng));
             s_dist_03.push(random_dist_info(&mut rng));
@@ -945,8 +945,8 @@ fn generate_stock(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
             s_order_cnt.push(0i32);
             s_remote_cnt.push(0i32);
             // 10% have ORIGINAL in data
-            let data = if rng.gen_range(0..10) == 0 {
-                let pos = rng.gen_range(0..=14usize);
+            let data = if rng.random_range(0..10) == 0 {
+                let pos = rng.random_range(0..=14usize);
                 let base = random_data(&mut rng);
                 format!(
                     "{}ORIGINAL{}",

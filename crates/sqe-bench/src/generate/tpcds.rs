@@ -3,7 +3,7 @@ use std::sync::Arc;
 use arrow_array::{Date32Array, Float64Array, Int32Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 
 use super::{parquet_writer, BenchmarkGenerator, GenerateStats, TableDef};
 
@@ -719,7 +719,7 @@ fn seed_salt() -> u64 {
 }
 
 fn random_date(rng: &mut StdRng) -> i32 {
-    DS_DATE_START + rng.gen_range(0..DS_DATE_RANGE)
+    DS_DATE_START + rng.random_range(0..DS_DATE_RANGE)
 }
 
 /// Random `d_date_sk` surrogate key for fact tables, constrained to the
@@ -728,7 +728,7 @@ fn random_date(rng: &mut StdRng) -> i32 {
 /// rows. Fact tables must reference date_dim by surrogate key, not by date
 /// value: writing dates here is what NULLed every *_date_sk column.
 fn random_date_sk(rng: &mut StdRng) -> i32 {
-    rng.gen_range(1..=DS_DATE_RANGE)
+    rng.random_range(1..=DS_DATE_RANGE)
 }
 
 /// dsdgen emits SCD-2 dimensions (item, store, call_center, web_site,
@@ -751,11 +751,13 @@ fn scd2_rec_end_date(row: usize, rng: &mut StdRng) -> ColVal {
 
 fn random_id(rng: &mut StdRng) -> String {
     const HEX: &[u8] = b"0123456789abcdef";
-    (0..16).map(|_| HEX[rng.gen_range(0..16)] as char).collect()
+    (0..16)
+        .map(|_| HEX[rng.random_range(0..16)] as char)
+        .collect()
 }
 
 fn random_str<'a>(rng: &mut StdRng, choices: &[&'a str]) -> &'a str {
-    choices[rng.gen_range(0..choices.len())]
+    choices[rng.random_range(0..choices.len())]
 }
 
 /// Draw one string from a `(value, weight)` table with probability
@@ -763,7 +765,7 @@ fn random_str<'a>(rng: &mut StdRng, choices: &[&'a str]) -> &'a str {
 /// `random_str` call without shifting downstream draw parity.
 fn weighted_str<'a>(rng: &mut StdRng, table: &[(&'a str, u32)]) -> &'a str {
     let total: u32 = table.iter().map(|(_, w)| *w).sum();
-    let mut pick = rng.gen_range(0..total);
+    let mut pick = rng.random_range(0..total);
     for (value, weight) in table {
         if pick < *weight {
             return value;
@@ -776,12 +778,12 @@ fn weighted_str<'a>(rng: &mut StdRng, table: &[(&'a str, u32)]) -> &'a str {
 fn random_word(rng: &mut StdRng, len: usize) -> String {
     const CHARS: &[u8] = b"abcdefghijklmnopqrstuvwxyz";
     (0..len)
-        .map(|_| CHARS[rng.gen_range(0..CHARS.len())] as char)
+        .map(|_| CHARS[rng.random_range(0..CHARS.len())] as char)
         .collect()
 }
 
 fn random_name(rng: &mut StdRng) -> String {
-    let len = rng.gen_range(4..10);
+    let len = rng.random_range(4..10);
     random_word(rng, len)
 }
 
@@ -1586,10 +1588,10 @@ impl FkDims {
 }
 
 fn nullable_fk(rng: &mut StdRng, upper: i32) -> Option<i32> {
-    if rng.gen_bool(FK_NULL_RATE) {
+    if rng.random_bool(FK_NULL_RATE) {
         None
     } else {
-        Some(rng.gen_range(1..=upper))
+        Some(rng.random_range(1..=upper))
     }
 }
 
@@ -1598,8 +1600,8 @@ fn nullable_fk(rng: &mut StdRng, upper: i32) -> Option<i32> {
 /// this independently and rely on identical output.
 fn basket(salt: u64, ticket: i32, channel_upper: i32, dims: FkDims) -> Basket {
     let mut rng = StdRng::seed_from_u64(salt ^ ticket as u64);
-    let lines = rng.gen_range(1..=MAX_BASKET_LINES);
-    let date_sk = rng.gen_range(1..=DS_DATE_RANGE);
+    let lines = rng.random_range(1..=MAX_BASKET_LINES);
+    let date_sk = rng.random_range(1..=DS_DATE_RANGE);
     let customer_sk = nullable_fk(&mut rng, dims.customers);
     let cdemo_sk = nullable_fk(&mut rng, dims.cdemos);
     let hdemo_sk = nullable_fk(&mut rng, dims.hdemos);
@@ -1608,10 +1610,12 @@ fn basket(salt: u64, ticket: i32, channel_upper: i32, dims: FkDims) -> Basket {
     let ship_cdemo_sk = nullable_fk(&mut rng, dims.cdemos);
     let ship_hdemo_sk = nullable_fk(&mut rng, dims.hdemos);
     let ship_addr_sk = nullable_fk(&mut rng, dims.addrs);
-    let channel_sk = rng.gen_range(1..=channel_upper);
+    let channel_sk = rng.random_range(1..=channel_upper);
     let promo_sk = nullable_fk(&mut rng, dims.promos);
-    let items: Vec<i32> = (0..lines).map(|_| rng.gen_range(1..=dims.items)).collect();
-    let quantities: Vec<i32> = (0..lines).map(|_| rng.gen_range(1..100)).collect();
+    let items: Vec<i32> = (0..lines)
+        .map(|_| rng.random_range(1..=dims.items))
+        .collect();
+    let quantities: Vec<i32> = (0..lines).map(|_| rng.random_range(1..100)).collect();
     let mut b = Basket {
         lines,
         date_sk,
@@ -1895,13 +1899,13 @@ fn generate_store_sales(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
             let item_sk = b.items[line];
             let qty = b.quantities[line];
             line += 1;
-            let wc = rng.gen_range(10..500i32) as f64 / 10.0;
+            let wc = rng.random_range(10..500i32) as f64 / 10.0;
             let lp = wc * 1.5;
-            let sp = lp * rng.gen_range(50..100i32) as f64 / 100.0;
+            let sp = lp * rng.random_range(50..100i32) as f64 / 100.0;
             let tax = sp * 0.08;
             vec![
                 i!(b.date_sk),
-                i!(rng.gen_range(0..86400i32)),
+                i!(rng.random_range(0..86400i32)),
                 i!(item_sk),
                 ColVal::I32(b.customer_sk),
                 ColVal::I32(b.cdemo_sk),
@@ -1950,7 +1954,7 @@ fn generate_store_returns(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
             // Pick a fully-emitted sales ticket, recompute its basket, and return
             // one of its actual line items so (sr_ticket_number, sr_item_sk)
             // joins store_sales (q01/q17/q24/q25/q29/q50/q64/q85).
-            let mut ticket = rng.gen_range(1..=max_ticket);
+            let mut ticket = rng.random_range(1..=max_ticket);
             let mut line_override: Option<usize> = None;
             // Force the first rows onto the q25/q24 planted store tickets so the
             // planted sales get a matching return; item/customer/date still derive
@@ -1969,31 +1973,31 @@ fn generate_store_returns(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
                 line_override = Some(0);
             }
             let b = basket(STORE_TICKET_SALT, ticket, stores, dims);
-            let line = line_override.unwrap_or(rng.gen_range(0..b.lines));
+            let line = line_override.unwrap_or(rng.random_range(0..b.lines));
             let item_sk = b.items[line];
-            let qty = rng.gen_range(1..=b.quantities[line]);
+            let qty = rng.random_range(1..=b.quantities[line]);
             // Returns lag the sale by <=120 days (official: 98% of a month's
             // sales are returned within the next 6 months). Drawing uniformly over
             // the remaining calendar piled returns into 2003 and starved 1998,
             // emptying q91 (Nov-1998) and q25 (Apr-Oct 2001 return window).
-            let mut ret_date = (b.date_sk + rng.gen_range(1..=120i32)).min(DS_DATE_RANGE);
+            let mut ret_date = (b.date_sk + rng.random_range(1..=120i32)).min(DS_DATE_RANGE);
             // q29's return window is moy 9..=12 of 1999. A 1..=120 lag from
             // Sep-1999 can miss, so force the planted row onto Oct-1999.
             if row == 3 && q29_active {
                 ret_date = Q29_RETURN_DATE_SK;
             }
-            let amt = rng.gen_range(10..500i32) as f64;
+            let amt = rng.random_range(10..500i32) as f64;
             let tax = amt * 0.08;
             vec![
                 i!(ret_date),
-                i!(rng.gen_range(0..86400i32)),
+                i!(rng.random_range(0..86400i32)),
                 i!(item_sk),
                 ColVal::I32(b.customer_sk),
                 ColVal::I32(b.cdemo_sk),
                 ColVal::I32(b.hdemo_sk),
                 ColVal::I32(b.addr_sk),
                 i!(b.channel_sk),
-                i!(rng.gen_range(1..=reasons)),
+                i!(rng.random_range(1..=reasons)),
                 i!(ticket),
                 i!(qty),
                 f!(amt),
@@ -2038,15 +2042,15 @@ fn generate_catalog_sales(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
             let item_sk = b.items[line];
             let qty = b.quantities[line];
             line += 1;
-            let wc = rng.gen_range(10..500i32) as f64 / 10.0;
+            let wc = rng.random_range(10..500i32) as f64 / 10.0;
             let lp = wc * 1.5;
-            let sp = lp * rng.gen_range(50..100i32) as f64 / 100.0;
+            let sp = lp * rng.random_range(50..100i32) as f64 / 100.0;
             let tax = sp * 0.08;
             let ship = sp * 0.05 * qty as f64;
-            let ship_date = (b.date_sk + rng.gen_range(1..=120i32)).min(DS_DATE_RANGE);
+            let ship_date = (b.date_sk + rng.random_range(1..=120i32)).min(DS_DATE_RANGE);
             vec![
                 i!(b.date_sk),
-                i!(rng.gen_range(0..86400i32)),
+                i!(rng.random_range(0..86400i32)),
                 i!(ship_date),
                 ColVal::I32(b.customer_sk),
                 ColVal::I32(b.cdemo_sk),
@@ -2057,9 +2061,9 @@ fn generate_catalog_sales(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
                 ColVal::I32(b.ship_hdemo_sk),
                 ColVal::I32(b.ship_addr_sk),
                 i!(b.channel_sk),
-                i!(rng.gen_range(1..11_718i32)),
-                i!(rng.gen_range(1..20i32)),
-                i!(rng.gen_range(1..=whs)),
+                i!(rng.random_range(1..11_718i32)),
+                i!(rng.random_range(1..20i32)),
+                i!(rng.random_range(1..=whs)),
                 i!(item_sk),
                 ColVal::I32(b.promo_sk),
                 i!(order),
@@ -2098,20 +2102,20 @@ fn generate_catalog_returns(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
         total,
         seed_for_table("catalog_returns"),
         move |_row, rng| {
-            let order = rng.gen_range(1..=max_order);
+            let order = rng.random_range(1..=max_order);
             let b = basket(CATALOG_ORDER_SALT, order, ccs, dims);
-            let line = rng.gen_range(0..b.lines);
+            let line = rng.random_range(0..b.lines);
             let item_sk = b.items[line];
-            let qty = rng.gen_range(1..=b.quantities[line]);
+            let qty = rng.random_range(1..=b.quantities[line]);
             // Returns lag the sale by <=120 days; a uniform draw over the rest of
             // the calendar starved the early years and emptied q91's Nov-1998
             // catalog-returns window. Same bound as the ship_date fields above.
-            let ret_date = (b.date_sk + rng.gen_range(1..=120i32)).min(DS_DATE_RANGE);
-            let amt = rng.gen_range(10..500i32) as f64;
+            let ret_date = (b.date_sk + rng.random_range(1..=120i32)).min(DS_DATE_RANGE);
+            let amt = rng.random_range(10..500i32) as f64;
             let tax = amt * 0.08;
             vec![
                 i!(ret_date),
-                i!(rng.gen_range(0..86400i32)),
+                i!(rng.random_range(0..86400i32)),
                 i!(item_sk),
                 ColVal::I32(b.customer_sk),
                 ColVal::I32(b.cdemo_sk),
@@ -2122,10 +2126,10 @@ fn generate_catalog_returns(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
                 ColVal::I32(b.ship_hdemo_sk),
                 ColVal::I32(b.ship_addr_sk),
                 i!(b.channel_sk),
-                i!(rng.gen_range(1..11_718i32)),
-                i!(rng.gen_range(1..20i32)),
-                i!(rng.gen_range(1..=whs)),
-                i!(rng.gen_range(1..=reasons)),
+                i!(rng.random_range(1..11_718i32)),
+                i!(rng.random_range(1..20i32)),
+                i!(rng.random_range(1..=whs)),
+                i!(rng.random_range(1..=reasons)),
                 i!(order),
                 i!(qty),
                 f!(amt),
@@ -2175,9 +2179,10 @@ fn generate_web_sales(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
             // 1..300 (avg 101), sales 0..299 (avg 50.6). The old wc/10 model
             // capped ws_sales_price at ~$74, leaving q85's 100-150 and 150-200
             // price arms structurally empty.
-            let wc = rng.gen_range(100..10_000i32) as f64 / 100.0;
-            let lp = ((wc * rng.gen_range(100..300i32) as f64 / 100.0) * 100.0).round() / 100.0;
-            let mut sp = ((lp * rng.gen_range(0..=100i32) as f64 / 100.0) * 100.0).round() / 100.0;
+            let wc = rng.random_range(100..10_000i32) as f64 / 100.0;
+            let lp = ((wc * rng.random_range(100..300i32) as f64 / 100.0) * 100.0).round() / 100.0;
+            let mut sp =
+                ((lp * rng.random_range(0..=100i32) as f64 / 100.0) * 100.0).round() / 100.0;
             // q85 filters ws_sales_price BETWEEN 100 AND 150. Draw after the
             // rng so non-planted lines keep parity; then pin the planted order.
             if order == Q85_WEB_ORDER && line == 1 {
@@ -2185,10 +2190,10 @@ fn generate_web_sales(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
             }
             let tax = sp * 0.08;
             let ship = sp * 0.05 * qty as f64;
-            let ship_date = (b.date_sk + rng.gen_range(1..=120i32)).min(DS_DATE_RANGE);
+            let ship_date = (b.date_sk + rng.random_range(1..=120i32)).min(DS_DATE_RANGE);
             vec![
                 i!(b.date_sk),
-                i!(rng.gen_range(0..86400i32)),
+                i!(rng.random_range(0..86400i32)),
                 i!(ship_date),
                 i!(item_sk),
                 ColVal::I32(b.customer_sk),
@@ -2199,10 +2204,10 @@ fn generate_web_sales(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
                 ColVal::I32(b.ship_cdemo_sk),
                 ColVal::I32(b.ship_hdemo_sk),
                 ColVal::I32(b.ship_addr_sk),
-                i!(rng.gen_range(1..=wpages)),
+                i!(rng.random_range(1..=wpages)),
                 i!(b.channel_sk),
-                i!(rng.gen_range(1..20i32)),
-                i!(rng.gen_range(1..=whs)),
+                i!(rng.random_range(1..20i32)),
+                i!(rng.random_range(1..=whs)),
                 ColVal::I32(b.promo_sk),
                 i!(order),
                 i!(qty),
@@ -2240,18 +2245,18 @@ fn generate_web_returns(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
         total,
         seed_for_table("web_returns"),
         move |row, rng| {
-            let mut order = rng.gen_range(1..=max_order);
+            let mut order = rng.random_range(1..=max_order);
             if row == 0 && dims.cdemos >= Q85_CDEMO_SK {
                 order = Q85_WEB_ORDER;
             }
             let b = basket(WEB_ORDER_SALT, order, wsites, dims);
-            let line = rng.gen_range(0..b.lines);
+            let line = rng.random_range(0..b.lines);
             let item_sk = b.items[line];
-            let qty = rng.gen_range(1..=b.quantities[line]);
+            let qty = rng.random_range(1..=b.quantities[line]);
             // Returns lag the sale by <=120 days; a uniform draw over the rest of
             // the calendar starved the early years (q85 filters d_year = 2000).
-            let ret_date = (b.date_sk + rng.gen_range(1..=120i32)).min(DS_DATE_RANGE);
-            let amt = rng.gen_range(10..500i32) as f64;
+            let ret_date = (b.date_sk + rng.random_range(1..=120i32)).min(DS_DATE_RANGE);
+            let amt = rng.random_range(10..500i32) as f64;
             let tax = amt * 0.08;
             // In official data the returning party equals the refunded party 100%
             // of the time; q85 correlates cd1 (refunded) with cd2 (returning) on
@@ -2259,7 +2264,7 @@ fn generate_web_returns(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
             // parties are drawn independently.
             vec![
                 i!(ret_date),
-                i!(rng.gen_range(0..86400i32)),
+                i!(rng.random_range(0..86400i32)),
                 i!(item_sk),
                 ColVal::I32(b.customer_sk),
                 ColVal::I32(b.cdemo_sk),
@@ -2269,8 +2274,8 @@ fn generate_web_returns(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
                 ColVal::I32(b.cdemo_sk),
                 ColVal::I32(b.hdemo_sk),
                 ColVal::I32(b.addr_sk),
-                i!(rng.gen_range(1..=wpages)),
-                i!(rng.gen_range(1..=reasons)),
+                i!(rng.random_range(1..=wpages)),
+                i!(rng.random_range(1..=reasons)),
                 i!(order),
                 i!(qty),
                 f!(amt),
@@ -2313,8 +2318,8 @@ fn generate_inventory(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
             let date_sk = (week * 7 + 2).min(73_048) as i32;
             // Draw the quantity first (keeps the value distribution uniform), then
             // decide NULL, matching dsdgen's ~5% nNullPct. See INV_QTY_NULL_RATE.
-            let qty = rng.gen_range(0..=1000i32);
-            let inv_qty = if rng.gen_bool(INV_QTY_NULL_RATE) {
+            let qty = rng.random_range(0..=1000i32);
+            let inv_qty = if rng.random_bool(INV_QTY_NULL_RATE) {
                 ColVal::I32(None)
             } else {
                 i!(qty)
@@ -2428,7 +2433,7 @@ fn generate_item(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
         // 0.09..99.89); a uniform draw put only 1.3% of items in the
         // 1.00..2.00 band that q72's qualification parameters probe
         // (dsdgen: ~11%). Log-uniform reproduces the skew.
-        let price_ln = rng.gen_range(0.09_f64.ln()..99.99_f64.ln());
+        let price_ln = rng.random_range(0.09_f64.ln()..99.99_f64.ln());
         let price = (price_ln.exp() * 100.0).round() / 100.0;
         let wc = price * 0.6;
         // i_manufact is derived from a neighborhood of i_manufact_id (spread
@@ -2436,17 +2441,17 @@ fn generate_item(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
         // and vice versa; q41's correlated subquery bridges items on
         // `i_manufact = i1.i_manufact`, which collapses to id equality (0 rows)
         // when the string is a bijection with the id.
-        let manufact_id = rng.gen_range(1..1000i32);
+        let manufact_id = rng.random_range(1..1000i32);
         let manufact_label = ((manufact_id
-            + rng.gen_range(0..MANUFACT_LABEL_SPREAD) * MANUFACT_LABEL_STRIDE)
+            + rng.random_range(0..MANUFACT_LABEL_SPREAD) * MANUFACT_LABEL_STRIDE)
             % 1000)
             + 1;
         // i_category_id and i_category are consistent (1=Women ..
         // 10=Electronics) and i_class draws from that category's official
         // class vocabulary; i_class_id stays independent like dsdgen's.
-        let cat = rng.gen_range(0..CATEGORIES.len());
-        let class_idx = rng.gen_range(0..CATEGORY_CLASSES[cat].len());
-        let class_id = rng.gen_range(1..16i32);
+        let cat = rng.random_range(0..CATEGORIES.len());
+        let class_idx = rng.random_range(0..CATEGORY_CLASSES[cat].len());
+        let class_id = rng.random_range(1..16i32);
         // Plant i_item_sk 1 as a Women/maternity item (CATEGORIES[0] /
         // CATEGORY_CLASSES[0][2]) for the q54 coincidence (see
         // PLANTED_Q54_TICKETS); the draws above are kept for parity.
@@ -2458,11 +2463,11 @@ fn generate_item(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
         // dsdgen i_brand_id encodes <category><class:3><brand:3> (e.g.
         // 1002001 = category 1, class 2, brand 1); the brand NAME is fully
         // determined by (category, class) with only the #N suffix varying.
-        let brand_id = (cat as i32 + 1) * 1_000_000 + class_id * 1000 + rng.gen_range(1..=17i32);
+        let brand_id = (cat as i32 + 1) * 1_000_000 + class_id * 1000 + rng.random_range(1..=17i32);
         let brand = format!(
             "{} #{}",
             CATEGORY_CLASS_BRANDS[cat][class_idx],
-            rng.gen_range(1..=17i32)
+            rng.random_range(1..=17i32)
         );
         vec![
             i!(sk),
@@ -2494,7 +2499,7 @@ fn generate_item(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
             }),
             s!(random_str(rng, ITEM_UNITS)),
             s!(random_str(rng, ITEM_SIZES)),
-            i!(rng.gen_range(1..100i32)),
+            i!(rng.random_range(1..100i32)),
             s!(random_name(rng)),
         ]
     })
@@ -2512,7 +2517,7 @@ fn generate_customer(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
         seed_for_table("customer"),
         |row, rng| {
             let sk = (row + 1) as i32;
-            let addr_draw = rng.gen_range(1..=addrs);
+            let addr_draw = rng.random_range(1..=addrs);
             // Customers 1..=PLANTED_Q54_TICKETS point at the planted Williamson
             // County, TN addresses for q54, and customer Q24_CUSTOMER points at the
             // Q24_ZIP address Q24_ADDR_SK for q24 (both use addr = customer sk); the
@@ -2526,8 +2531,8 @@ fn generate_customer(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
             vec![
                 i!(sk),
                 s!(random_id(rng)),
-                i!(rng.gen_range(1..=cdemos)),
-                i!(rng.gen_range(1..7200i32)),
+                i!(rng.random_range(1..=cdemos)),
+                i!(rng.random_range(1..7200i32)),
                 i!(addr_sk),
                 i!(random_date_sk(rng)),
                 i!(random_date_sk(rng)),
@@ -2535,13 +2540,13 @@ fn generate_customer(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
                 s!(random_name(rng)),
                 s!(random_name(rng)),
                 s!(random_str(rng, YN)),
-                i!(rng.gen_range(1..28i32)),
-                i!(rng.gen_range(1..12i32)),
-                i!(rng.gen_range(1920..2000i32)),
+                i!(rng.random_range(1..28i32)),
+                i!(rng.random_range(1..12i32)),
+                i!(rng.random_range(1920..2000i32)),
                 s!("US"),
                 s!(random_id(rng)),
                 s!(format!("{}@{}.com", random_name(rng), random_name(rng))),
-                i!(rng.gen_range(1..73049i32)),
+                i!(rng.random_range(1..73049i32)),
             ]
         },
     )
@@ -2565,7 +2570,7 @@ fn generate_customer_address(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
         seed_for_table("customer_address"),
         move |row, rng| {
             let sk = (row + 1) as i32;
-            let county_idx = rng.gen_range(0..COUNTIES.len());
+            let county_idx = rng.random_range(0..COUNTIES.len());
             // Plant addresses 1..=PLANTED_Q54_TICKETS in Williamson County, TN so
             // customers 1..=N (whose c_current_addr_sk points here) satisfy q54.
             let (county, state) = if (row as i32) < PLANTED_Q54_TICKETS {
@@ -2579,10 +2584,10 @@ fn generate_customer_address(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
             vec![
                 i!(sk),
                 s!(random_id(rng)),
-                s!(format!("{}", rng.gen_range(1..9999i32))),
+                s!(format!("{}", rng.random_range(1..9999i32))),
                 s!(random_name(rng)),
                 s!(random_str(rng, STREET_TYPES)),
-                s!(format!("Suite {}", rng.gen_range(1..999i32))),
+                s!(format!("Suite {}", rng.random_range(1..999i32))),
                 s!(random_str(rng, CA_CITIES)),
                 s!(county),
                 // ca_address_sk 4 (row 3) is forced to Q24_ZIP so it matches store
@@ -2597,7 +2602,7 @@ fn generate_customer_address(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
                     }
                 }),
                 s!("United States"),
-                f!(GMT_OFFSETS[rng.gen_range(0..GMT_OFFSETS.len())]),
+                f!(GMT_OFFSETS[rng.random_range(0..GMT_OFFSETS.len())]),
                 s!(random_str(rng, &["city", "suburb", "rural", "unknown"])),
             ]
         },
@@ -2622,11 +2627,11 @@ fn generate_customer_demographics(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
                 s!(random_str(rng, GENDERS)),
                 s!(marital),
                 s!(education),
-                i!(rng.gen_range(0..10_000i32) / 100 * 100),
+                i!(rng.random_range(0..10_000i32) / 100 * 100),
                 s!(random_str(rng, CREDIT)),
-                i!(rng.gen_range(0..6i32)),
-                i!(rng.gen_range(0..4i32)),
-                i!(rng.gen_range(0..4i32)),
+                i!(rng.random_range(0..6i32)),
+                i!(rng.random_range(0..4i32)),
+                i!(rng.random_range(0..4i32)),
             ]
         },
     )
@@ -2667,7 +2672,7 @@ fn generate_store(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
             // Official sf1: s_closed_date_sk is set on 3 of every 12 rows
             // (positions 0, 3, 4), NULL elsewhere; the single sf0.01 row has one.
             let closed = if matches!(row % 12, 0 | 3 | 4) {
-                i!(rng.gen_range(1..73049i32))
+                i!(rng.random_range(1..73049i32))
             } else {
                 ColVal::I32(None)
             };
@@ -2687,14 +2692,14 @@ fn generate_store(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
                 i!(if row == 0 {
                     Q79_STORE_EMPLOYEES
                 } else {
-                    rng.gen_range(10..500i32)
+                    rng.random_range(10..500i32)
                 }),
-                i!(rng.gen_range(1000..100_000i32)),
+                i!(rng.random_range(1000..100_000i32)),
                 s!(random_str(rng, CC_HOURS)),
                 s!(random_name(rng)),
                 // s_store_sk 3 (row 2) is forced to market 8 for the q24 plant.
                 i!({
-                    let m = rng.gen_range(1..10i32);
+                    let m = rng.random_range(1..10i32);
                     if row == 2 {
                         8
                     } else {
@@ -2704,14 +2709,14 @@ fn generate_store(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
                 s!("Unknown"),
                 s!(random_name(rng)),
                 s!(random_name(rng)),
-                i!(rng.gen_range(1..10i32)),
+                i!(rng.random_range(1..10i32)),
                 s!("Division"),
-                i!(rng.gen_range(1..6i32)),
+                i!(rng.random_range(1..6i32)),
                 s!("Company"),
-                s!(format!("{}", rng.gen_range(1..999i32))),
+                s!(format!("{}", rng.random_range(1..999i32))),
                 s!(random_name(rng)),
                 s!(random_str(rng, STREET_TYPES)),
-                s!(format!("Suite {}", rng.gen_range(1..99i32))),
+                s!(format!("Suite {}", rng.random_range(1..99i32))),
                 // dsdgen stores at sf <= 1 all sit in Midway/Fairview,
                 // Williamson County, TN; q01 filters s_state = 'TN' and
                 // q34/q46/q68/q79 probe these exact city/county names.
@@ -2730,7 +2735,7 @@ fn generate_store(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
                 }),
                 s!("United States"),
                 f!(GMT_OFFSETS[row % GMT_OFFSETS.len()]),
-                f!(rng.gen_range(0..15i32) as f64 / 100.0),
+                f!(rng.random_range(0..15i32) as f64 / 100.0),
             ]
         },
     )
@@ -2747,10 +2752,10 @@ fn generate_catalog_page(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
             vec![
                 i!(sk),
                 s!(random_id(rng)),
-                i!(rng.gen_range(1..73049i32)),
-                i!(rng.gen_range(1..73049i32)),
+                i!(rng.random_range(1..73049i32)),
+                i!(rng.random_range(1..73049i32)),
                 s!(random_str(rng, DEPT)),
-                i!(rng.gen_range(1..100i32)),
+                i!(rng.random_range(1..100i32)),
                 i!(sk),
                 s!(random_name(rng)),
                 s!(random_str(rng, WP_TYPES)),
@@ -2772,7 +2777,7 @@ fn generate_web_site(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
             let close = if row % 6 == 0 {
                 ColVal::I32(None)
             } else {
-                i!(rng.gen_range(1..73049i32))
+                i!(rng.random_range(1..73049i32))
             };
             vec![
                 i!(sk),
@@ -2780,27 +2785,27 @@ fn generate_web_site(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
                 d!(random_date(rng)),
                 scd2_rec_end_date(row, rng),
                 s!(random_name(rng)),
-                i!(rng.gen_range(1..73049i32)),
+                i!(rng.random_range(1..73049i32)),
                 close,
                 s!("Unknown"),
                 s!(random_name(rng)),
-                i!(rng.gen_range(1..10i32)),
+                i!(rng.random_range(1..10i32)),
                 s!(random_name(rng)),
                 s!(random_name(rng)),
                 s!(random_name(rng)),
-                i!(rng.gen_range(1..6i32)),
+                i!(rng.random_range(1..6i32)),
                 s!("web"),
-                s!(format!("{}", rng.gen_range(1..999i32))),
+                s!(format!("{}", rng.random_range(1..999i32))),
                 s!(random_name(rng)),
                 s!(random_str(rng, STREET_TYPES)),
-                s!(format!("Suite {}", rng.gen_range(1..99i32))),
+                s!(format!("Suite {}", rng.random_range(1..99i32))),
                 s!(random_name(rng)),
                 s!(random_name(rng)),
                 s!(random_str(rng, STATES)),
-                s!(format!("{:05}", rng.gen_range(10000..99999i32))),
+                s!(format!("{:05}", rng.random_range(10000..99999i32))),
                 s!("United States"),
                 f!(GMT_OFFSETS[row % GMT_OFFSETS.len()]),
-                f!(rng.gen_range(0..15i32) as f64 / 100.0),
+                f!(rng.random_range(0..15i32) as f64 / 100.0),
             ]
         },
     )
@@ -2825,7 +2830,7 @@ fn generate_web_page(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
             // draw has far too much variance on 6 rows.
             let non_null_stride = if total <= 30 { 6 } else { 3 };
             let customer = if row % non_null_stride == 0 {
-                i!(rng.gen_range(1..=customers))
+                i!(rng.random_range(1..=customers))
             } else {
                 ColVal::I32(None)
             };
@@ -2834,16 +2839,16 @@ fn generate_web_page(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
                 s!(random_id(rng)),
                 d!(random_date(rng)),
                 scd2_rec_end_date(row, rng),
-                i!(rng.gen_range(1..73049i32)),
-                i!(rng.gen_range(1..73049i32)),
+                i!(rng.random_range(1..73049i32)),
+                i!(rng.random_range(1..73049i32)),
                 s!(random_str(rng, YN)),
                 customer,
                 s!(format!("http://{}.com/{}", random_name(rng), sk)),
                 s!(random_str(rng, WP_TYPES)),
-                i!(rng.gen_range(0..100_000i32)),
-                i!(rng.gen_range(0..25i32)),
-                i!(rng.gen_range(0..20i32)),
-                i!(rng.gen_range(0..4i32)),
+                i!(rng.random_range(0..100_000i32)),
+                i!(rng.random_range(0..25i32)),
+                i!(rng.random_range(0..20i32)),
+                i!(rng.random_range(0..4i32)),
             ]
         },
     )
@@ -2862,12 +2867,12 @@ fn generate_warehouse(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
             // row % 5 == 4 reproduces both).
             let sparse = row % 5 == 4;
             let name = random_name(rng);
-            let sq_ft = rng.gen_range(50_000..1_000_000i32);
-            let street_no = format!("{}", rng.gen_range(1..999i32));
+            let sq_ft = rng.random_range(50_000..1_000_000i32);
+            let street_no = format!("{}", rng.random_range(1..999i32));
             let street_name = random_name(rng);
             let street_type = random_str(rng, STREET_TYPES).to_string();
-            let suite = format!("Suite {}", rng.gen_range(1..99i32));
-            let gmt = rng.gen_range(-12..12i32) as f64;
+            let suite = format!("Suite {}", rng.random_range(1..99i32));
+            let gmt = rng.random_range(-12..12i32) as f64;
             let opt = |v: String| {
                 if sparse {
                     ColVal::Str(None)
@@ -2887,7 +2892,7 @@ fn generate_warehouse(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
                 s!(random_name(rng)),
                 s!(random_name(rng)),
                 s!(random_str(rng, STATES)),
-                s!(format!("{:05}", rng.gen_range(10000..99999i32))),
+                s!(format!("{:05}", rng.random_range(10000..99999i32))),
                 s!("United States"),
                 if sparse { ColVal::F64(None) } else { f!(gmt) },
             ]
@@ -2906,10 +2911,10 @@ fn generate_promotion(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
             vec![
                 i!(sk),
                 s!(random_id(rng)),
-                i!(rng.gen_range(1..73049i32)),
-                i!(rng.gen_range(1..73049i32)),
-                i!(rng.gen_range(1..18_000i32)),
-                f!(rng.gen_range(0..1_000_000i32) as f64 / 100.0),
+                i!(rng.random_range(1..73049i32)),
+                i!(rng.random_range(1..73049i32)),
+                i!(rng.random_range(1..18_000i32)),
+                f!(rng.random_range(0..1_000_000i32) as f64 / 100.0),
                 i!(1),
                 s!(random_name(rng)),
                 s!(random_str(rng, YN)),
@@ -2993,32 +2998,32 @@ fn generate_call_center(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
                 d!(random_date(rng)),
                 scd2_rec_end_date(row, rng),
                 ColVal::I32(None),
-                i!(rng.gen_range(1..73049i32)),
+                i!(rng.random_range(1..73049i32)),
                 s!(random_name(rng)),
                 s!(random_str(rng, CC_CLASSES)),
-                i!(rng.gen_range(100..5000i32)),
-                i!(rng.gen_range(1000..100_000i32)),
+                i!(rng.random_range(100..5000i32)),
+                i!(rng.random_range(1000..100_000i32)),
                 s!(random_str(rng, CC_HOURS)),
                 s!(random_name(rng)),
-                i!(rng.gen_range(1..10i32)),
+                i!(rng.random_range(1..10i32)),
                 s!(random_name(rng)),
                 s!(random_name(rng)),
                 s!(random_name(rng)),
-                i!(rng.gen_range(1..6i32)),
+                i!(rng.random_range(1..6i32)),
                 s!("Division"),
-                i!(rng.gen_range(1..6i32)),
+                i!(rng.random_range(1..6i32)),
                 s!("Company"),
-                s!(format!("{}", rng.gen_range(1..999i32))),
+                s!(format!("{}", rng.random_range(1..999i32))),
                 s!(random_name(rng)),
                 s!(random_str(rng, STREET_TYPES)),
-                s!(format!("Suite {}", rng.gen_range(1..99i32))),
+                s!(format!("Suite {}", rng.random_range(1..99i32))),
                 s!(random_name(rng)),
                 s!(random_name(rng)),
                 s!(random_str(rng, STATES)),
-                s!(format!("{:05}", rng.gen_range(10000..99999i32))),
+                s!(format!("{:05}", rng.random_range(10000..99999i32))),
                 s!("United States"),
                 f!(GMT_OFFSETS[row % GMT_OFFSETS.len()]),
-                f!(rng.gen_range(0..15i32) as f64 / 100.0),
+                f!(rng.random_range(0..15i32) as f64 / 100.0),
             ]
         },
     )
