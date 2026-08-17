@@ -2940,10 +2940,25 @@ async fn test_error_classification_live() {
             "SELECT lower(true)",
             "TYPE_MISMATCH",
         ),
+        // Was asserting CATALOG_ERROR, which contradicted this test's own thesis
+        // (issue #431). A DELETE naming a table that is not there is the same
+        // user mistake as the SELECT case above and the MERGE case below, and it
+        // must classify the same way. Three independent reasons, so do not flip
+        // this back:
+        //   1. CATALOG_ERROR is Trino code 65600, inside the INTERNAL_ERROR
+        //      range; TABLE_NOT_FOUND is 11, a standard user error. Reporting a
+        //      missing table as an internal error tells a BI client SQE is broken.
+        //   2. `classify_catalog_message` maps "does not exist" to TableNotFound
+        //      deliberately, and `SqeSchemaProvider::table()` depends on it: the
+        //      view-path fallback only triggers on a genuine table miss, so
+        //      CatalogError here would make every Iceberg view unreadable.
+        //   3. The docstring above asks for "a specific SqeErrorCode, not
+        //      ExecutionFailed" -- CATALOG_ERROR is the generic bucket this whole
+        //      classification effort exists to move away from.
         (
-            "DELETE on non-existent table gives catalog error",
+            "DELETE on non-existent table gives table not found",
             "DELETE FROM test_ns.nonexistent_delete_target WHERE id = 1",
-            "CATALOG_ERROR",
+            "TABLE_NOT_FOUND",
         ),
         (
             "MERGE with non-existent source gives table not found",
