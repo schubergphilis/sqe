@@ -242,7 +242,12 @@ cargo-gate:
 # rather than gating every MR on the availability of another repository.
 vendored-profile-drift:
   stage: test
-  image: alpine:3.24
+  # Digest-pinned for the same reason as the cargo-gate rust image above: the
+  # tag is mutable, so two runs a week apart could sit on different bases with
+  # no record. The digest is the multi-arch OCI index, so linux/amd64 still
+  # resolves on the shared runners. Renovate's `gitlabci` manager reads
+  # `image:` and raises digest bumps.
+  image: alpine:3.24@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b
   variables:
     GIT_DEPTH: "1"
     DATA_PLATFORM_DIR: "$CI_BUILDS_DIR/data-platform"
@@ -278,7 +283,7 @@ vendored-profile-drift:
 # ===== repo-specific integration suites (docker-in-docker), hosted here =====
 integration-test:
   stage: test
-  image: docker:29
+  image: docker:29@sha256:12e683a161823b2a839aeea999b9d960e6e1f9a97b1679ad6b441982e2d9cf07
   # docker-in-docker. The job's `docker compose up` against
   # docker-compose.test.yml needs a real Docker daemon, which the sibling
   # `docker:24-dind` service provides. Explicit `alias: docker` ensures the
@@ -332,7 +337,7 @@ integration-test:
 # system.runtime.tasks visibility do not regress.
 distributed-smoke:
   stage: test
-  image: docker:29
+  image: docker:29@sha256:12e683a161823b2a839aeea999b9d960e6e1f9a97b1679ad6b441982e2d9cf07
   services:
     - name: docker:29-dind
       alias: docker
@@ -372,7 +377,7 @@ distributed-smoke:
 # distributed`. Generous timeout: each scenario builds or pulls images.
 scenario-test:
   stage: test
-  image: docker:29
+  image: docker:29@sha256:12e683a161823b2a839aeea999b9d960e6e1f9a97b1679ad6b441982e2d9cf07
   services:
     - name: docker:29-dind
       alias: docker
@@ -420,7 +425,7 @@ scenario-test:
 # a local `make test-access-control` until dind is trustworthy again.
 access-control-test:
   stage: test
-  image: docker:29
+  image: docker:29@sha256:12e683a161823b2a839aeea999b9d960e6e1f9a97b1679ad6b441982e2d9cf07
   services:
     - name: docker:29-dind
       alias: docker
@@ -482,7 +487,7 @@ access-control-test:
 # stack). This job invokes them with `--check` so the gated run actually asserts.
 scenario-test-aws:
   stage: test
-  image: docker:29
+  image: docker:29@sha256:12e683a161823b2a839aeea999b9d960e6e1f9a97b1679ad6b441982e2d9cf07
   services:
     - name: docker:29-dind
       alias: docker
