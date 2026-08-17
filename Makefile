@@ -93,6 +93,7 @@ BENCH_ENV       = PROFILE=$(BENCH_PROFILE) BENCH_LOG_DIR=$(BENCH_LOG_DIR)
 .PHONY: help all all_trino docs-and-image check dev release rustbook ebook \
         ebook-pdf ebook-epub ebook-html \
         benchmark-charts test test-access-control test-access-control-spark \
+        test-integration test-distributed test-integration-down \
         audit audit-advisories \
         audit-deny audit-licenses \
         benchmark_sf0.1 benchmark_sf1 benchmark_sf10 benchmark_all \
@@ -112,6 +113,11 @@ help:
 	@echo "    make dev          Debug build of sqe-cli + sqe-server (fast compile)"
 	@echo "    make release      Release build of sqe-cli + sqe-server (LTO, optimised)"
 	@echo "    make test         cargo test --workspace"
+	@echo "    make test-integration     Integration suite vs the Polaris + RustFS test stack"
+	@echo "                              (local gate: no CI equivalent, see issue #387)"
+	@echo "                              Knob: FILTER=test_ctas_roundtrip to run one test"
+	@echo "    make test-distributed     The same suite with coordinator + 2 workers"
+	@echo "    make test-integration-down  Tear the integration stack back down"
 	@echo "    make test-access-control  Ranger/Polaris access-control e2e (brings up the Ranger stack)"
 	@echo "    make test-access-control-spark  the same gates asserted through Spark (adds a JVM per query)"
 	@echo "    make clippy       cargo clippy --all-targets -- -D warnings"
@@ -216,6 +222,40 @@ test:
 	@echo "==> Running unit tests"
 	$(CARGO) test --workspace --exclude sqe-cli
 	$(CARGO) test --package sqe-cli --no-default-features
+
+# ── Integration suites (LOCAL ONLY — see issue #387) ──────────────────────
+# The `integration-test` and `distributed-smoke` CI jobs are gone: they needed a
+# privileged docker:dind sidecar the shared runners do not provide, so they never
+# executed SQE code. These targets are the gate now. Run them before merging
+# anything that touches the read or write path.
+#
+#   make test-integration                             full suite (Polaris + RustFS)
+#   make test-integration FILTER=test_ctas_roundtrip   one test by substring
+#   make test-distributed                             coordinator + 2 workers
+#   make test-integration-down                        tear the stack back down
+#
+# RUST_MIN_STACK is 32 MiB here, deliberately NOT the 8 MiB the script defaults
+# to (which mirrors production WORKER_STACK_BYTES). An unfiltered run passes
+# `--ignored`, which force-runs the write e2e suites, and those SIGABRT below
+# 32 MiB. 32 MiB is what every other coordinator suite in the repo uses.
+IT_RUST_MIN_STACK ?= 33554432
+FILTER            ?=
+
+test-integration:
+	@echo "==> Integration suite (stack: docker-compose.test.yml)"
+	@scripts/integration-preflight.sh
+	@RUST_MIN_STACK=$(IT_RUST_MIN_STACK) scripts/integration-test.sh $(FILTER)
+
+test-distributed:
+	@echo "==> Distributed suite (stack: test.yml + distributed.yml overlay)"
+	@scripts/integration-preflight.sh --distributed
+	@DISTRIBUTED=1 RUST_MIN_STACK=$(IT_RUST_MIN_STACK) scripts/integration-test.sh $(FILTER)
+
+# The suites leave their stack up on purpose: bootstrap is idempotent, so a
+# rerun skips the 30-60s bring-up. Add `-v` by hand for a volume-clean slate.
+test-integration-down:
+	@echo "==> Tearing down the integration stack"
+	-@docker compose -f docker-compose.test.yml -f docker-compose.distributed.yml down
 
 # ── Access-control e2e (Polaris + Ranger + Keycloak) ──────────────────────
 # Brings up a subset of quickstart/polaris-ranger-keycloak and runs the Rust

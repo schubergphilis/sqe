@@ -95,16 +95,35 @@ cargo audit
 # Dependency policy check
 cargo deny check advisories
 
-# Integration tests (requires running quickstart stack: Polaris + S3)
-scripts/integration-test.sh
+# Integration tests (brings up its own Polaris + RustFS stack via Docker)
+make test-integration
 ```
+
+The integration suites have **no CI equivalent** (issue #387: the shared runners
+have no working docker-in-docker sidecar, so those jobs were removed rather than
+left permanently yellow). Run them locally before merging anything that touches
+the read or write path:
+
+```bash
+make test-integration                             # full suite
+make test-integration FILTER=test_ctas_roundtrip  # one test by substring
+make test-distributed                             # coordinator + 2 workers
+make test-integration-down                        # tear the stack back down
+```
+
+The stack is deliberately left running afterwards: bootstrap is idempotent, so a
+rerun skips the bring-up. A preflight names any container holding one of the
+fixed host ports, which is the usual failure when a bench or parity rig is still
+up from an earlier session.
 
 ### Test Suite Overview
 
 | Suite | Location | Requires |
 |---|---|---|
 | Unit tests | `crates/*/src/` (`#[cfg(test)]` modules) | Nothing |
-| Integration tests | `tests/` | Polaris + S3 stack |
+| Integration tests | `crates/sqe-coordinator/tests/` | `make test-integration` (Docker) |
+| Access-control e2e | `crates/sqe-coordinator/tests/it/` | `make test-access-control` (Ranger stack) |
+| Quickstart scenarios | `quickstart/*/run.sh --check` | `scripts/test.sh scenario all` |
 | E2E tests | `scripts/e2e-test.sh` | Full stack |
 | Benchmarks | `sqe-bench` crate | Polaris + S3 stack |
 

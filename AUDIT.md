@@ -142,7 +142,7 @@ When the `audience` config field is absent or empty, `validation.validate_aud = 
 
 | Item | Tracking |
 |---|---|
-| Integration test full run | Requires Polaris + S3 stack. Run via `scripts/integration-test.sh`. |
+| Integration test full run | Requires Docker. Run via `make test-integration` (local only: #387 removed the CI jobs). |
 | Docker build verification | Requires Docker daemon. |
 | Rate limiting load test | Rate limiting implemented (governor crate). Full load test deferred. |
 | EXPLAIN FULL metrics accuracy | Requires live query execution. Deferred to integration phase. |

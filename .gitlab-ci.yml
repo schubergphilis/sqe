@@ -281,100 +281,42 @@ vendored-profile-drift:
         - "crates/sqe-policy/assets/*.json"
 
 # ===== repo-specific integration suites (docker-in-docker), hosted here =====
-integration-test:
-  stage: test
-  image: docker:29@sha256:12e683a161823b2a839aeea999b9d960e6e1f9a97b1679ad6b441982e2d9cf07
-  # docker-in-docker. The job's `docker compose up` against
-  # docker-compose.test.yml needs a real Docker daemon, which the sibling
-  # `docker:24-dind` service provides. Explicit `alias: docker` ensures the
-  # DNS name the job container connects to (`tcp://docker:2375`) lines up
-  # with the service hostname regardless of GitLab Runner version, and
-  # `--tls=false --host=tcp://0.0.0.0:2375` makes dind listen on the
-  # non-TLS port instead of the default TLS-only :2376. Without the
-  # explicit command the daemon binds to 2376 with self-signed certs and
-  # the job hits `Cannot connect to the Docker daemon at tcp://docker:2375`.
-  services:
-    - name: docker:29-dind
-      alias: docker
-      command: ["--tls=false", "--host=tcp://0.0.0.0:2375"]
-  variables:
-    DOCKER_HOST: tcp://docker:2375
-    DOCKER_TLS_CERTDIR: ""
-    DOCKER_DRIVER: overlay2
-  before_script:
-    # `clang` + `mold` mirror the rust:bookworm jobs above: .cargo/config.toml
-    # pins them as the Linux linker, so the Alpine-based integration job must
-    # install them as well. `mold` lives in the community repo (on by default
-    # in docker:24's apk index).
-    - apk add --no-cache bash curl docker-compose rust cargo cmake protobuf-dev openssl-dev pkgconfig clang mold
-    # Wait for dind (issue #387). Failures still surface as a yellow job while
-    # allow_failure is set; do not hang forever.
-    - |
-      for i in $(seq 1 30); do
-        docker info >/dev/null 2>&1 && break
-        echo "waiting for docker daemon ($i/30)..."
-        sleep 2
-      done
-      docker info
-  script:
-    - ./scripts/integration-test.sh
-  # allow_failure on every rule: runner dind is still flaky (#387). Keep the
-  # job so a healthy runner still exercises the stack; do not paint main red.
-  allow_failure: true
-  rules:
-    - if: '$CI_PIPELINE_SOURCE == "schedule"'
-    - if: '$CI_COMMIT_BRANCH == "main" && $CI_PIPELINE_SOURCE == "push"'
-    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
-      when: manual
-  timeout: 1h
-
-# ── Distributed smoke (Q-05) ───────────────────────────────────
-# Runs the distributed dispatch test (test_distributed_select) against
-# the coordinator + 2 workers stack. Uses the same dind + Alpine setup
-# as integration-test but overlays docker-compose.distributed.yml and
-# sets DISTRIBUTED=1 so the integration script brings up workers and
-# does not skip the distributed test. This ensures worker dispatch and
-# system.runtime.tasks visibility do not regress.
-distributed-smoke:
-  stage: test
-  image: docker:29@sha256:12e683a161823b2a839aeea999b9d960e6e1f9a97b1679ad6b441982e2d9cf07
-  services:
-    - name: docker:29-dind
-      alias: docker
-      command: ["--tls=false", "--host=tcp://0.0.0.0:2375"]
-  variables:
-    DOCKER_HOST: tcp://docker:2375
-    DOCKER_TLS_CERTDIR: ""
-    DOCKER_DRIVER: overlay2
-    DISTRIBUTED: "1"
-  before_script:
-    - apk add --no-cache bash curl docker-compose rust cargo cmake protobuf-dev openssl-dev pkgconfig clang mold
-    - |
-      for i in $(seq 1 30); do
-        docker info >/dev/null 2>&1 && break
-        echo "waiting for docker daemon ($i/30)..."
-        sleep 2
-      done
-      docker info
-  script:
-    - ./scripts/integration-test.sh test_distributed_select
-  allow_failure: true
-  rules:
-    - if: '$CI_PIPELINE_SOURCE == "schedule"'
-    - if: '$CI_COMMIT_BRANCH == "main" && $CI_PIPELINE_SOURCE == "push"'
-    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
-      when: manual
-  timeout: 1h
+#
+# REMOVED (issue #387): `integration-test` and `distributed-smoke`.
+#
+# Both jobs needed a privileged `docker:dind` sidecar to bring up
+# docker-compose.test.yml. The shared runners answer `no route to host` on
+# tcp://docker:2375, so neither job ever executed a line of SQE code. They were
+# carried as `allow_failure: true` for a while, which is worse than absent: a
+# permanently-yellow job reads as coverage and there is none. Two real main
+# breakages hid behind them.
+#
+# The suites themselves are unchanged and are now LOCAL gates:
+#
+#   make test-integration                          # full suite, test stack
+#   make test-integration FILTER=test_ctas_roundtrip
+#   make test-distributed                          # coordinator + 2 workers
+#   make test-integration-down                     # tear the stack back down
+#
+# Run them locally before merging anything touching the read or write path.
+# Re-adding a CI job here requires a runner with a working dind sidecar (or a
+# socket-mounted shell runner); until then, do not reintroduce an
+# allow_failure-only variant.
 
 # ── Quickstart scenario tests (Tier 2) ─────────────────────────
 # Tier 2 of scripts/test.sh: runs every SELF_CONTAINED quickstart through its
 # run.sh --check. Each scenario brings up its own docker-compose stack (Polaris,
 # Nessie, Unity, etc.) and asserts the demo invariants with the shared
-# _shared/lib.sh helpers. Mirrors the integration-test docker-in-docker setup:
-# same image, same dind service, same Alpine toolchain install. The heavy
-# `distributed` scenario is deliberately NOT in the self-contained set, so it
-# does not run here; invoke it on demand with `scripts/test.sh scenario
-# distributed`. Generous timeout: each scenario builds or pulls images.
+# _shared/lib.sh helpers. The heavy `distributed` scenario is deliberately NOT
+# in the self-contained set, so it does not run here; invoke it on demand with
+# `scripts/test.sh scenario distributed`. Generous timeout: each scenario builds
+# or pulls images.
+#
+# NOTE ON SIGNAL: this job needs the same dind sidecar that #387 documents as
+# unreachable on the shared runners, so it cannot fail meaningfully there
+# either. Unlike the removed integration jobs it is kept, because it is the only
+# CI-side coverage of the quickstarts and it does run on a healthy runner. Gate
+# quickstart changes on a local `scripts/test.sh scenario all`.
 scenario-test:
   stage: test
   image: docker:29@sha256:12e683a161823b2a839aeea999b9d960e6e1f9a97b1679ad6b441982e2d9cf07
