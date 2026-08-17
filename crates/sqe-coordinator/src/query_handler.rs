@@ -17,9 +17,7 @@ use tracing::Instrument;
 use tracing::{debug, info, warn, Span};
 
 use sqe_catalog::{IcebergScanExec, SessionCatalog};
-use sqe_core::{
-    QueryConfig, SecretStore, Session, SortMode, SqeConfig, SqeError, SqeErrorCode,
-};
+use sqe_core::{QueryConfig, SecretStore, Session, SortMode, SqeConfig, SqeError, SqeErrorCode};
 use sqlparser::ast::{Statement, TableFactor};
 
 use crate::adaptive_sort;
@@ -108,9 +106,7 @@ fn reject_oversized_sql(query: &QueryConfig, sql: &str) -> sqe_core::Result<()> 
 fn is_sorted_write(kind: &StatementKind) -> bool {
     match kind {
         StatementKind::Ctas(stmt) => match stmt.as_ref() {
-            Statement::CreateTable(ct) => {
-                ct.query.as_ref().is_some_and(|q| q.order_by.is_some())
-            }
+            Statement::CreateTable(ct) => ct.query.as_ref().is_some_and(|q| q.order_by.is_some()),
             _ => false,
         },
         StatementKind::Insert(stmt) => match stmt.as_ref() {
@@ -1500,7 +1496,14 @@ impl QueryHandler {
                             },
                         ));
                     }
-                    if matches!(**call, sqe_sql::ProcedureCall::RefreshCatalogCache) {
+                    if let sqe_sql::ProcedureCall::ReprojectColumnTags { ref scope } = **call {
+                        // Admin-only Ranger write. Iceberg is not mutated, so
+                        // the maintenance write-privilege + snapshot-cache
+                        // invalidation path is the wrong gate and the wrong
+                        // follow-up. require_admin uses [auth] admin_roles.
+                        self.require_admin(session, "CALL system.reproject_column_tags")?;
+                        self.catalog_ops.reproject_column_tags(session, scope).await
+                    } else if matches!(**call, sqe_sql::ProcedureCall::RefreshCatalogCache) {
                         // Self-scoped catalog refresh. NOT a table maintenance
                         // op: it skips the table-scoped maintenance
                         // authorization + lineage path, and it must NOT touch
