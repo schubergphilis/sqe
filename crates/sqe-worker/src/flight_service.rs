@@ -94,6 +94,82 @@ impl<S> Drop for AccountedEncodeStream<S> {
     }
 }
 
+/// Flight-frame budget for a service built without `[worker.memory]`
+/// (tests, embedded use). Mirrors `executor::default_scan_budget`: a tenth of
+/// the pool, matching the `flight_budget` config default, and finite even on an
+/// unbounded pool so `ItemTooLarge` still has a threshold to compare against.
+///
+/// No pool reservation. Encoded IPC frames are not DataFusion allocations, so
+/// charging them to the pool would fail queries on operator pressure; the
+/// capacity is already reserved via `configured_need_bytes` at startup.
+fn default_flight_budget(session_ctx: &SessionContext) -> ByteBudget {
+    use datafusion::execution::memory_pool::MemoryLimit;
+    let limit = match session_ctx.runtime_env().memory_pool.memory_limit() {
+        MemoryLimit::Finite(n) => n,
+        _ => 512 * 1024 * 1024,
+    };
+    ByteBudget::new("flight", (limit / 10).max(64 * 1024), None)
+}
+
+/// Charge encoded Flight frames against `budget` so the encoded copy of a batch
+/// is bounded, not merely observed (issue #407).
+///
+/// The Arrow-side permit (`AccountedEncodeStream`) releases as soon as the
+/// encoder is done with a batch, which leaves the *encoded* IPC bytes -- the
+/// copy tonic hands to h2 -- charged to nothing. Under concurrency that is the
+/// unbounded term: N streams x one encoded frame each, outside the DataFusion
+/// pool. `flight_inflight_bytes` reported it and nothing gated on it.
+///
+/// Each frame's charge is held until the transport polls for the NEXT frame,
+/// which is the same idiom `AccountedEncodeStream` uses for batches: being
+/// polled again is the observable proof the previous item was consumed. Dropping
+/// the stream (client disconnect) releases through the state tuple.
+///
+/// The charge is per-stream-at-a-time, so the budget bounds the SUM across
+/// concurrent DoGet streams. That is where it bites: one stream never blocks
+/// itself, but the 50th concurrent scan waits for the 49 ahead of it.
+///
+/// A frame larger than the whole budget is passed through UNCHARGED rather than
+/// failed. `ByteBudget::acquire` returns `ItemTooLarge` instead of hanging, and
+/// failing a query that works today (unaccounted) would be a regression. Same
+/// non-fatal treatment as the scan fetch charge in `executor.rs`.
+fn accounted_frame_stream<S>(
+    inner: S,
+    budget: ByteBudget,
+    metrics: Arc<WorkerMetricsRegistry>,
+) -> impl Stream<Item = Result<FlightData, arrow_flight::error::FlightError>>
+where
+    S: Stream<Item = Result<FlightData, arrow_flight::error::FlightError>> + Send + 'static,
+{
+    stream::unfold(
+        (Box::pin(inner), None::<BytePermit>, budget, metrics),
+        |(mut inner, held, budget, metrics)| async move {
+            // Being polled again is the observable proof the transport took the
+            // previous frame. Release BEFORE acquiring: holding two charges at
+            // once would deadlock a budget sized for a single frame.
+            drop(held);
+            let item = inner.next().await?;
+            let permit = match &item {
+                Ok(frame) => {
+                    let bytes = frame.data_body.len() + frame.data_header.len();
+                    match budget.acquire(bytes).await {
+                        Ok(p) => Some(p),
+                        Err(e) => {
+                            debug!(error = %e, frame_bytes = bytes, "flight frame charge skipped");
+                            None
+                        }
+                    }
+                }
+                Err(_) => None,
+            };
+            metrics
+                .flight_inflight_bytes
+                .set(budget.used_bytes() as f64);
+            Some((item, (inner, permit, budget, metrics)))
+        },
+    )
+}
+
 /// Build [`IpcWriteOptions`] for a given compression setting.
 fn ipc_options_for(compression: FlightCompression) -> Result<IpcWriteOptions, Status> {
     let codec = match compression {
@@ -180,6 +256,11 @@ pub struct WorkerFlightService {
     live_consumers: Arc<LiveConsumerRegistry>,
     /// Durable exchange attempt manifests (Phase 8).
     exchange_store: Arc<ExchangeAttemptStore>,
+    /// Byte budget for encoded Flight frames in flight to the coordinator
+    /// (`worker.memory.flight_budget`, issue #407). `None` means "not
+    /// configured": `do_get` then falls back to [`default_flight_budget`], so
+    /// frames are charged either way.
+    flight_budget: Option<ByteBudget>,
 }
 
 /// Lightweight reclaimable consumer for one DoExchange partition grant.
@@ -221,6 +302,7 @@ impl WorkerFlightService {
             shuffle_compression: FlightCompression::Zstd,
             worker_secret: String::new(),
             spill_manager: None,
+            flight_budget: None,
             shuffle_memory_budget: Arc::new(std::sync::atomic::AtomicUsize::new(
                 DEFAULT_SHUFFLE_MEMORY_BUDGET,
             )),
@@ -251,6 +333,7 @@ impl WorkerFlightService {
             shuffle_compression: FlightCompression::Zstd,
             worker_secret: String::new(),
             spill_manager: None,
+            flight_budget: None,
             shuffle_memory_budget: Arc::new(std::sync::atomic::AtomicUsize::new(
                 DEFAULT_SHUFFLE_MEMORY_BUDGET,
             )),
@@ -317,6 +400,19 @@ impl WorkerFlightService {
     #[must_use = "with_spill_manager consumes self; bind the returned service"]
     pub fn with_spill_manager(mut self, manager: Arc<SpillManager>) -> Self {
         self.spill_manager = Some(manager);
+        self
+    }
+
+    /// Set the byte budget for encoded Flight frames awaiting shipment
+    /// (`worker.memory.flight_budget`, issue #407).
+    ///
+    /// Worker-wide on purpose: one stream never fills this budget by itself, so
+    /// what it bounds is the SUM of encoded frames across concurrent DoGet
+    /// streams. That sum is the term that exhausted the 4 GB worker pool on
+    /// SF10 inventory queries.
+    #[must_use = "with_flight_budget consumes self; bind the returned service"]
+    pub fn with_flight_budget(mut self, budget: ByteBudget) -> Self {
+        self.flight_budget = Some(budget);
         self
     }
 
@@ -883,6 +979,13 @@ impl FlightService for WorkerFlightService {
         let footer_cache = self.footer_cache.clone();
         let scan_timeout = self.live_scan_timeout();
         let flight_compression = self.flight_compression;
+        // Cloned (not Option-matched at the call site) so every DoGet charges
+        // its frames: an unconfigured worker gets the pool-derived default
+        // rather than silently reverting to the ungated path (#407).
+        let flight_budget = self
+            .flight_budget
+            .clone()
+            .unwrap_or_else(|| default_flight_budget(&self.session_ctx));
         let stream_span = worker_span.clone();
         let result_span = worker_span.clone();
         let result = async move {
@@ -971,19 +1074,21 @@ impl FlightService for WorkerFlightService {
 
             let schema_arc = Arc::new((*schema).clone());
             let ipc_opts = ipc_options_for(flight_compression)?;
-            let flight_metrics = metrics.clone();
-            let flight_stream = FlightDataEncoderBuilder::new()
-                .with_schema(schema_arc)
-                .with_options(ipc_opts)
-                .build(batch_for_encoder)
-                .map(move |item| {
-                    if let Ok(ref flight_data) = item {
-                        let n = flight_data.data_body.len() + flight_data.data_header.len();
-                        flight_metrics.flight_inflight_bytes.set(n as f64);
-                    }
-                    item
-                })
-                .map_err(Status::from);
+            // #407: charge the ENCODED frame, not just gauge it. The previous
+            // `.map` set flight_inflight_bytes to the last frame's size and
+            // gated on nothing, so N concurrent streams could hold N encoded
+            // frames outside the DataFusion pool. Backpressure propagates:
+            // waiting for a frame permit stops polling the encoder, which stops
+            // draining AccountedEncodeStream, which stops the scan queue.
+            let flight_stream = accounted_frame_stream(
+                FlightDataEncoderBuilder::new()
+                    .with_schema(schema_arc)
+                    .with_options(ipc_opts)
+                    .build(batch_for_encoder),
+                flight_budget,
+                metrics.clone(),
+            )
+            .map_err(Status::from);
             let flight_stream = tracing_futures::Instrument::instrument(flight_stream, stream_span);
 
             Ok(Response::new(Box::pin(flight_stream) as Self::DoGetStream))
@@ -1394,6 +1499,154 @@ mod tests {
     use chrono::{Duration, Utc};
     use datafusion::prelude::SessionContext;
     use tonic::Request;
+
+    // ── #407: encoded Flight frames are charged, not just observed ──────────
+
+    /// One frame carrying `body` bytes. Only the two length fields matter to the
+    /// accounting, so a body of zeros is a faithful stand-in for an encoded
+    /// RecordBatch here.
+    fn frame(body: usize) -> FlightData {
+        FlightData::new().with_data_body(vec![0u8; body])
+    }
+
+    /// Budget with a 1 KiB accounting unit so the arithmetic in these tests is
+    /// exact (the 64 KiB production granularity would round every frame to one
+    /// unit and hide over- and under-charging alike).
+    fn frame_budget(capacity: usize) -> ByteBudget {
+        ByteBudget::with_granularity("flight-test", capacity, 1024, None)
+    }
+
+    fn test_metrics() -> Arc<WorkerMetricsRegistry> {
+        Arc::new(WorkerMetricsRegistry::new().unwrap())
+    }
+
+    /// A worker built without `[worker.memory] flight_budget` (tests, embedded
+    /// use) must still charge frames. `do_get` wraps unconditionally, so the
+    /// fallback has to be finite: an infinite one would silently restore the
+    /// ungated behavior #407 is about, and `ItemTooLarge` would stop working.
+    #[test]
+    fn default_flight_budget_is_finite_and_pool_derived() {
+        use datafusion::execution::memory_pool::FairSpillPool;
+        use datafusion::execution::runtime_env::RuntimeEnvBuilder;
+
+        let unbounded = default_flight_budget(&SessionContext::new());
+        assert!(
+            unbounded.capacity_bytes() > 0,
+            "unbounded pool must still yield a finite flight budget"
+        );
+
+        let pool = Arc::new(FairSpillPool::new(400 * 1024 * 1024));
+        let env = RuntimeEnvBuilder::new()
+            .with_memory_pool(pool)
+            .build_arc()
+            .expect("runtime env");
+        let ctx = SessionContext::new_with_config_rt(Default::default(), env);
+        let sized = default_flight_budget(&ctx);
+        assert_eq!(
+            sized.capacity_bytes(),
+            40 * 1024 * 1024,
+            "fallback must match the config default of a tenth of the pool"
+        );
+    }
+
+    /// The charge must follow the frame the transport currently holds: one
+    /// frame's worth outstanding while streaming, zero once drained. A stream
+    /// that charged on encode without releasing would climb to 3 frames.
+    #[tokio::test]
+    async fn frame_charge_tracks_one_frame_at_a_time() {
+        let budget = frame_budget(64 * 1024);
+        let frames = stream::iter(vec![Ok(frame(1024)), Ok(frame(1024)), Ok(frame(1024))]);
+        let mut s = Box::pin(accounted_frame_stream(
+            frames,
+            budget.clone(),
+            test_metrics(),
+        ));
+
+        assert!(s.next().await.is_some(), "first frame");
+        let after_first = budget.used_bytes();
+        assert!(
+            after_first >= 1024,
+            "frame 1 must be charged, used={after_first}"
+        );
+
+        assert!(s.next().await.is_some(), "second frame");
+        assert_eq!(
+            budget.used_bytes(),
+            after_first,
+            "frame 1's charge must be released when the transport polls for \
+             frame 2; charge is per-frame-in-flight, not cumulative"
+        );
+
+        assert!(s.next().await.is_some(), "third frame");
+        assert!(s.next().await.is_none(), "end of stream");
+        assert_eq!(
+            budget.used_bytes(),
+            0,
+            "draining the stream must release the last frame's charge"
+        );
+    }
+
+    /// The point of the budget: encoded frames from CONCURRENT streams cannot
+    /// all be resident at once. One stream never blocks itself, so this is the
+    /// only shape that proves backpressure exists.
+    #[tokio::test]
+    async fn full_budget_blocks_a_second_stream_until_the_first_releases() {
+        // Room for exactly one 4 KiB frame.
+        let budget = frame_budget(4 * 1024);
+        let metrics = test_metrics();
+
+        let mut first = Box::pin(accounted_frame_stream(
+            stream::iter(vec![Ok(frame(4096)), Ok(frame(4096))]),
+            budget.clone(),
+            metrics.clone(),
+        ));
+        assert!(first.next().await.is_some(), "first stream takes the budget");
+        assert_eq!(budget.used_bytes(), 4096);
+
+        let mut second = Box::pin(accounted_frame_stream(
+            stream::iter(vec![Ok(frame(4096))]),
+            budget.clone(),
+            metrics,
+        ));
+        let blocked = tokio::time::timeout(std::time::Duration::from_millis(150), second.next());
+        assert!(
+            blocked.await.is_err(),
+            "second stream must wait: the budget is fully held by the first"
+        );
+
+        // Releasing the first stream's frame admits the second.
+        drop(first);
+        let admitted = tokio::time::timeout(std::time::Duration::from_secs(5), second.next());
+        assert!(
+            admitted.await.expect("must not time out").is_some(),
+            "second stream proceeds once the budget frees"
+        );
+    }
+
+    /// A frame wider than the whole budget must still ship. `acquire` reports
+    /// ItemTooLarge rather than blocking, and failing a query that works today
+    /// (unaccounted) would be a regression, so the charge is skipped.
+    #[tokio::test]
+    async fn oversized_frame_ships_uncharged_instead_of_failing() {
+        let budget = frame_budget(4 * 1024);
+        let mut s = Box::pin(accounted_frame_stream(
+            stream::iter(vec![Ok(frame(64 * 1024))]),
+            budget.clone(),
+            test_metrics(),
+        ));
+        let item = tokio::time::timeout(std::time::Duration::from_secs(5), s.next())
+            .await
+            .expect("must not hang on an oversized frame");
+        assert!(
+            matches!(item, Some(Ok(_))),
+            "oversized frame must be yielded, not turned into an error"
+        );
+        assert_eq!(
+            budget.used_bytes(),
+            0,
+            "an unchargeable frame must not leak a charge"
+        );
+    }
 
     fn make_service(secret: &str) -> WorkerFlightService {
         let metrics = Arc::new(WorkerMetricsRegistry::new().unwrap());
