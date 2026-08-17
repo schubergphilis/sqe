@@ -38,7 +38,7 @@ services:
 
   # ── bucket-init — create the warehouse bucket (RustFS needs real S3) ──
   bucket-init:
-    image: amazon/aws-cli:2.36.22
+    image: amazon/aws-cli:2.36.23
     entrypoint: ["sh", "-c"]
     command:
       - |
